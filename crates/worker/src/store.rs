@@ -3,7 +3,9 @@ use crate::{api, auth, dev, jobs};
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use terminal_worker_core::devices::PRESENT;
-use terminal_worker_core::permissions::{EXEC, GUEST, GUEST_HOME, Node, READ, Store, User};
+use terminal_worker_core::permissions::{
+    EXEC, GUEST, GUEST_HOME, Node, READ, Store, User, is_guest_id,
+};
 use worker::*;
 
 /// The R2 object that marks the bucket as managed by an authority, so that a lost authority is
@@ -186,9 +188,9 @@ impl TerminalAuthority {
         let (uid, sid) = transact(&self.state, {
             let key = key.clone();
             move |db| {
-                let id = auth::identity(db, key.as_deref()).id;
+                let id = auth::identity_of(db, key.as_deref(), guest.as_deref()).id;
                 let sid = auth::sid(db, key.as_deref(), guest.as_deref());
-                ((Some(id).filter(|id| *id != GUEST), sid), false)
+                ((Some(id).filter(|id| !is_guest_id(*id)), sid), false)
             }
         })?;
         pair.server.serialize_attachment(Line {
@@ -248,8 +250,12 @@ impl TerminalAuthority {
             let visible: Vec<(bool, Vec<serde_json::Value>, Vec<serde_json::Value>)> = asked
                 .iter()
                 .map(|(key, sid, follows)| {
-                    let who = auth::identity(db, key.as_deref());
-                    let gone = ended && key.is_some() && who.id == GUEST;
+                    let who = if key.is_some() {
+                        auth::identity_of(db, key.as_deref(), None)
+                    } else {
+                        auth::identity_of(db, None, sid.as_deref())
+                    };
+                    let gone = ended && key.is_some() && is_guest_id(who.id);
                     // What changed in the directories its session watches, those its account
                     // may still list; a watch of one it may not, or that went, is told so.
                     let watches = sid

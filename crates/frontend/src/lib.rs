@@ -429,10 +429,13 @@ fn App() -> impl IntoView {
                 if after == before {
                     return;
                 }
-                // A session that ended leaves the cookie a guest's: one with an account after it
-                // is the new session another window of this browser signed in with, replacing it.
+                // A session that ended leaves the cookie a guest's (guest or guest-<uuid>): one
+                // with an account after it is the new session another window of this browser
+                // signed in with, replacing it.
                 let reason = match reason.as_deref() {
-                    Some("ended") if after != "guest" => Some("window"),
+                    Some("ended") if after != "guest" && !after.starts_with("guest-") => {
+                        Some("window")
+                    }
                     reason => reason,
                 };
                 for shell in tabs.get_untracked() {

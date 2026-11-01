@@ -295,6 +295,8 @@ impl HttpSys {
             calls,
             umask: self.umask,
             sudo: self.sudo,
+            pid: None,
+            process: None,
         };
         let sent = async {
             let response = gloo_net::http::Request::post("/api/sys")

@@ -25,7 +25,7 @@ fn root(who: &Identity) -> Result<(), String> {
 
 /// The useradd system call, as useradd's options say.
 pub fn useradd(db: &mut Db, who: &Identity, useradd: args::Useradd) -> Result<String, String> {
-    if who.id == GUEST {
+    if is_guest_id(who.id) {
         return Err(
             "useradd: signed out, useradd NAME makes an account of your own; options need root"
                 .into(),
@@ -158,7 +158,7 @@ pub fn delete_account(
     remove: bool,
 ) -> Result<Option<String>, String> {
     let user = db.user(name).ok_or("User does not exist")?;
-    if user.id == 0 || user.id == GUEST {
+    if user.id == 0 || is_guest_id(user.id) {
         return Err(format!("Cannot delete {name}"));
     }
     let mut kept = None;

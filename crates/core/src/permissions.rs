@@ -7,6 +7,15 @@ use crate::{parent, resolve};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 pub const GUEST: u32 = 65534;
+/// Signed-out browsers' own uids: below the accounts a system makes, so that each guest owns
+/// what it creates and /etc/passwd can name it. `GUEST` itself is the group and the fallback.
+pub const GUEST_UID_MIN: u32 = 1_000_000;
+pub const GUEST_UID_MAX: u32 = 1_999_999;
+/// Whether `id` is a signed-out browser's (or the fallback guest): not an account one signs in
+/// to.
+pub fn is_guest_id(id: u32) -> bool {
+    id == GUEST || (GUEST_UID_MIN..=GUEST_UID_MAX).contains(&id)
+}
 /// The guest account's home: a shared, sticky directory, where the accounts guests make have
 /// theirs.
 pub const GUEST_HOME: &str = "/guest";

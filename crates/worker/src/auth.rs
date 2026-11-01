@@ -2,7 +2,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use terminal_worker_core::permissions::{GUEST, Identity, Session, Store, User};
+use terminal_worker_core::permissions::{Identity, Session, Store, User, is_guest_id};
 use wasm_bindgen::prelude::*;
 use worker::*;
 pub const COOKIE: &str = "terminal_session";
@@ -38,7 +38,11 @@ pub fn cookie_token(req: &Request, name: &str) -> Option<String> {
 }
 /// The stored key of the request's session token: its hash, so stored keys cannot sign in.
 pub fn token_key(req: &Request) -> Option<String> {
-    cookie_token(req, COOKIE).map(|token| URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes())))
+    cookie_token(req, COOKIE).map(|token| token_hash(&token))
+}
+/// A token as stored: its SHA-256, so a store's contents cannot be replayed as a capability.
+pub fn token_hash(token: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
 }
 /// The key of the request's signed-out browser (`GUEST_COOKIE`), which no session's key can be.
 pub fn guest_key(req: &Request) -> Option<String> {
@@ -75,6 +79,38 @@ pub fn identity(c: &impl Store, key: Option<&str>) -> Identity {
         .map(|(_, u)| Identity::of(&u))
         .unwrap_or_else(Identity::guest)
 }
+/// Who the request is: its signed-in account, or, signed out, the browser's own guest account
+/// (`guest-<uuid>`), made if this browser has not been here. A locked account is nobody's.
+pub fn identity_of(c: &mut crate::db::Db, key: Option<&str>, guest: Option<&str>) -> Identity {
+    let who = identity(c, key);
+    if !is_guest_id(who.id) {
+        return who;
+    }
+    guest
+        .map(|guest| c.guest_identity(guest, now()))
+        .unwrap_or_else(Identity::guest)
+}
+/// The same, under sudo when `requested` and the account may (a signed-in wheel member's
+/// timestamp). A guest has nothing to elevate to.
+pub fn elevated_of(
+    c: &mut crate::db::Db,
+    key: Option<&str>,
+    guest: Option<&str>,
+    requested: bool,
+) -> std::result::Result<Identity, String> {
+    if !requested {
+        return Ok(identity_of(c, key, guest));
+    }
+    let who = identity(c, key);
+    if is_guest_id(who.id) {
+        return Ok(Identity::guest());
+    }
+    elevated(c, key, true)
+}
+/// Whether the request's session is signed in (not a signed-out browser's guest).
+pub fn signed_in(c: &impl Store, key: Option<&str>) -> bool {
+    live_session(c, key).is_some()
+}
 pub fn elevated(
     c: &impl Store,
     key: Option<&str>,
@@ -104,7 +140,7 @@ pub fn session_view(c: &impl Store, key: Option<&str>) -> Value {
         .user_by_id(who.id)
         .map(|(_, u)| u.home)
         .unwrap_or_else(|| "/".into());
-    json!({"writable":who.id!=GUEST,"authenticated":who.id!=GUEST,"username":c.username(who.id),"uid":who.id,"group":c.groupname(who.group),"groups":who.groups.iter().map(|g|c.groupname(*g)).collect::<Vec<_>>(),"home":home,"can_sudo":c.can_sudo(&who),"sudo_active":who.id==0||live_session(c,key).is_some_and(|s|s.sudo_until>now())})
+    json!({"writable":signed_in(c,key),"authenticated":signed_in(c,key),"username":c.username(who.id),"uid":who.id,"group":c.groupname(who.group),"groups":who.groups.iter().map(|g|c.groupname(*g)).collect::<Vec<_>>(),"home":home,"can_sudo":c.can_sudo(&who),"sudo_active":who.id==0||live_session(c,key).is_some_and(|s|s.sudo_until>now())})
 }
 /// Replace the request's session with a new one for `uid`, returning the reply and the new
 /// token for the cookie.

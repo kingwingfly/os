@@ -71,8 +71,11 @@ pub fn actor(db: &Db, job: &Job) -> Result<Identity, String> {
     if job.actor == 0 {
         return Ok(Identity::root());
     }
-    if job.actor == GUEST {
-        return Ok(Identity::guest());
+    if is_guest_id(job.actor) {
+        return Ok(db
+            .user_by_id(job.actor)
+            .map(|(_, user)| Identity::of(&user))
+            .unwrap_or_else(Identity::guest));
     }
     match db.user_by_id(job.actor) {
         Some((_, user)) if !user.locked => Ok(Identity::of(&user)),
@@ -550,7 +553,7 @@ pub fn call(
             db.set_expiry("fd", &crate::db::fd_key(sid, stdin), now + crate::fds::IDLE);
             Ok(json!({ "pid": pid, "kind": started["kind"], "stdin": stdin }))
         }
-        Call::Kill { pid } => {
+        Call::Kill { pid, .. } => {
             let job = theirs(db, &pid)?;
             if !job.finished() {
                 db.set_job(&pid, JobColumn::State, Some("cancelling"));

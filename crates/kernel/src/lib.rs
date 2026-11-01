@@ -93,6 +93,18 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
         | Call::Spawn { .. }
         | Call::Kill { .. }
         | Call::Wait { .. }
+        | Call::ProcInit { .. }
+        | Call::Execve { .. }
+        | Call::Fork { .. }
+        | Call::Exit { .. }
+        | Call::Getpid
+        | Call::ProcPoll { .. }
+        | Call::CgroupCreate { .. }
+        | Call::CgroupRemove { .. }
+        | Call::CgroupSet { .. }
+        | Call::CgroupAttach { .. }
+        | Call::CgroupStat { .. }
+        | Call::CgroupList { .. }
         | Call::Login { .. }
         | Call::Logout
         | Call::Sudo { .. }
@@ -361,6 +373,36 @@ pub fn open(fs: &impl Fs, process: &Process, path: &str, flags: u32, mode: u16) 
             })
         }
     }
+}
+
+/// What execve(2) found: the real path, its node, and the content the loader reads. The file
+/// must be regular and whole (one still uploading is ETXTBSY), and `cred` must have execute
+/// permission: the X rule, not read, so an x-only file runs; root too needs an x bit. The
+/// setuid and setgid bits stay descriptive: this kernel does not elevate.
+#[derive(Clone, Debug)]
+pub struct Executable {
+    pub path: String,
+    pub node: Node,
+    pub content: String,
+}
+pub fn executable(fs: &impl Fs, cred: &Identity, path: &str) -> Result<Executable> {
+    let (real, node) = existing(fs, cred, path, true)?;
+    if node.directory {
+        return Err(Errno::EISDIR.into());
+    }
+    if !node.is_file() {
+        return Err(Errno::EACCES.into());
+    }
+    if node.file.as_deref().is_some_and(|id| fs.uploading(id)) {
+        return Err(Errno::ETXTBSY.into());
+    }
+    require(cred, &node, EXEC)?;
+    let content = node.file.clone().ok_or(Errno::EIO)?;
+    Ok(Executable {
+        path: real,
+        node,
+        content,
+    })
 }
 
 pub fn mkdir(fs: &mut impl Fs, process: &Process, path: &str, mode: u16) -> Result<()> {

@@ -31,6 +31,9 @@ pub struct Files {
     account: Account,
     /// Which listing was asked for last: one answered after it is old news.
     asked: StoredValue<u64>,
+    /// The number of the latest navigation: a refresh that began before one, or while one was
+    /// in flight, does not undo it.
+    navs: StoredValue<u64>,
 }
 
 thread_local! {
@@ -62,6 +65,7 @@ impl Files {
             typed: RwSignal::new(None),
             account,
             asked: StoredValue::new(0),
+            navs: StoredValue::new(0),
         };
         FILES.with(|cell| cell.set(Some(files)));
         files
@@ -69,27 +73,43 @@ impl Files {
 
     /// Go into the directory `path`, if the account may, and list it.
     pub fn go(self, path: String) {
+        // This navigation is newer than any refresh already in flight.
+        let nav = self.navs.get_value() + 1;
+        self.navs.set_value(nav);
         spawn_local(async move {
             if let Err(error) = crate::enterable(&path).await {
                 self.notice.set(format!("{path}: {error}"));
                 return;
             }
             self.notice.set(String::new());
-            self.show(path).await;
+            let listed = crate::listing(&path).await;
+            // A later navigation wins; a refresh does not.
+            if self.navs.get_value() != nav {
+                return;
+            }
+            self.show(path, listed);
         });
     }
-    /// List its directory again, as it is now.
+    /// List its directory again, as it is now: unless a navigation began meanwhile, which the
+    /// refresh would undo.
     pub fn refresh(self) {
-        spawn_local(async move { self.show(self.cwd.get_untracked()).await });
+        let navs = self.navs.get_value();
+        spawn_local(async move {
+            let path = self.cwd.get_untracked();
+            let asked = self.asked.get_value() + 1;
+            self.asked.set_value(asked);
+            let listed = crate::listing(&path).await;
+            if self.asked.get_value() != asked
+                || self.navs.get_value() != navs
+                || self.cwd.get_untracked() != path
+            {
+                return;
+            }
+            self.show(path, listed);
+        });
     }
-    /// Show the directory `path`, listed; a listing asked for later wins.
-    async fn show(self, path: String) {
-        let asked = self.asked.get_value() + 1;
-        self.asked.set_value(asked);
-        let listed = crate::listing(&path).await;
-        if self.asked.get_value() != asked {
-            return;
-        }
+    /// Show the directory `path`, listed.
+    fn show(self, path: String, listed: Result<Vec<Entry>, String>) {
         if let Some(storage) = storage() {
             let _ = storage.set_item(SAVED, &path);
         }
