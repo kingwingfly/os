@@ -63,11 +63,16 @@ function request(method, url, body, headers = {}, binary = false) {
   return xhr;
 }
 // A batch of calls: each one's result, {ok} or {err}. Descriptors to close go after them, so
-// that a call's {ref: i} names the i-th of `calls`.
+// that a call's {ref: i} names the i-th of `calls`. A process's batch carries the pid and token
+// its exec gave it (crates/client-kernel): the kernel runs it as that process, with the
+// credentials snapshotted at exec.
 function batch(calls) {
   const sent = [...calls, ...closing.map(fd => ({ close: { fd } }))];
   closing = [];
-  const xhr = request('POST', '/api/sys', JSON.stringify({ calls: sent, umask: process.umask, sudo: process.sudo }), { 'Content-Type': 'application/json' });
+  const body = { calls: sent, umask: process.umask, sudo: process.sudo };
+  if (process.pid) body.pid = process.pid;
+  if (process.proc) body.proc = process.proc;
+  const xhr = request('POST', '/api/sys', JSON.stringify(body), { 'Content-Type': 'application/json' });
   if (xhr.status !== 200) return calls.map(() => ({ err: { errno: 'EIO' } }));
   return JSON.parse(xhr.responseText).results.slice(0, calls.length);
 }

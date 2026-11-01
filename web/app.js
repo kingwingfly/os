@@ -4,6 +4,7 @@ import { record, clock } from './record.mjs';
 import { speak, listen as hearLive } from './sound.mjs';
 import * as dev from './dev.mjs';
 import { exec } from './wasi/exec.mjs';
+import { kernelCall } from './kernel/protocol.js';
 import { answered as resultOf, call, sys } from './http.mjs';
 
 let configuration;
@@ -228,6 +229,9 @@ function followAgain(name, presentation, sound) {
 // A speaker view, which a deck's S opened (viewer.rs): it shows the deck its address names once
 // the terminal runs.
 export function started() {
+  // The browser's client kernel: one SharedWorker per browser, its PID 1 this page's boot.
+  // A browser without SharedWorkers still runs the page; its commands then cannot execve.
+  void kernelCall('init').catch(() => {});
   const files = $('window-files');
   if (files) new ResizeObserver(measureNames).observe(files);
   const deck = new URLSearchParams(location.search).get('speaker');

@@ -3838,6 +3838,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "terminal-worker-client-kernel"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "serde",
+ "serde_json",
+ "terminal-worker-abi",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "terminal-worker-core"
 version = "0.1.0"
 dependencies = [
