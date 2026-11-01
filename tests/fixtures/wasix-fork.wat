@@ -1,0 +1,28 @@
+(module
+  (import "wasix_32v1" "proc_fork" (func $proc_fork (param i32 i32) (result i32)))
+  (import "wasix_32v1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (import "wasix_32v1" "proc_exit" (func $proc_exit (param i32)))
+  (memory (export "memory") 2)
+  (global $stack (export "__stack_pointer") (mut i32) (i32.const 65536))
+  (global $data (export "__data_end") i32 (i32.const 4096))
+  (data (i32.const 1024) "parent\0a")
+  (data (i32.const 1032) "child\0a")
+  (func (export "_start")
+    (local $pid i32)
+    ;; iovec at 2048, nwritten at 2056, pid at 2060
+    (i32.store (i32.const 2048) (i32.const 1024))
+    (i32.store (i32.const 2052) (i32.const 7))
+    (i32.store (i32.const 2060) (i32.const 0))
+    (drop (call $proc_fork (i32.const 1) (i32.const 2060)))
+    (local.set $pid (i32.load (i32.const 2060)))
+    (if (i32.eqz (local.get $pid))
+      (then
+        (i32.store (i32.const 2048) (i32.const 1032))
+        (i32.store (i32.const 2052) (i32.const 6)))
+      (else
+        (i32.store (i32.const 2048) (i32.const 1024))
+        (i32.store (i32.const 2052) (i32.const 7))))
+    (drop (call $fd_write (i32.const 1) (i32.const 2048) (i32.const 1) (i32.const 2056)))
+    (call $proc_exit (i32.const 0))
+  )
+)

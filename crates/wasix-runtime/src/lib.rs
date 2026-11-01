@@ -236,7 +236,7 @@ impl Runtime {
     fn memory_stack(&self, pid: u32) -> Option<Vec<u8>> {
         let (_, upper) = self.layout(pid)?;
         let stack_pointer = guest_stack_pointer(pid);
-        if stack_pointer >= upper || stack_pointer < self.procs.get(&pid)?.stack_lower {
+        if stack_pointer > upper || stack_pointer < self.procs.get(&pid)?.stack_lower {
             return None;
         }
         Some(mem_read(pid, stack_pointer, upper - stack_pointer))
