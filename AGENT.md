@@ -95,7 +95,14 @@ feasibility gate; these are its measurements, not built features.
   `stack_restore`/`proc_fork` call `asyncify_start_rewind` with a snapshot. Our own client
   kernel needs this asyncify engine (and asyncify-at-load for arbitrary modules) before the
   owner's “fork must work for any wasm” bar is met. Do not start Phase 1 until the route is
-  chosen: our own asyncify engine, or Wasmer's SDK/runtime for WASIX.
+  chosen: our own asyncify engine in Rust, or Wasmer's SDK/runtime for WASIX.
+- **Runtime language:** the client runtime is Rust→wasm. `crates/client-kernel` runs in the
+  SharedWorker (PID/process/cgroup/IPC state); `crates/wasix-runtime` runs in the page host
+  (`wasix_32v1` imports, asyncify checkpoint/restore/fork, waker). `web/kernel/host.js` is only
+  the browser engine/transport bridge (Workers, `WebAssembly.Module`/`Instance`, MessagePort,
+  fetch/sync XHR, FSA handles) and holds no policy. A wasm module cannot instantiate another
+  wasm module and provide its imports without an engine, so the thin JS bridge is the practical
+  boundary; embedding wasmi/Wasmtime-in-wasm is the larger pure-Rust alternative.
 
 ## Required account semantics
 
