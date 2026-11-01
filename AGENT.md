@@ -103,6 +103,11 @@ feasibility gate; these are its measurements, not built features.
   fetch/sync XHR, FSA handles) and holds no policy. A wasm module cannot instantiate another
   wasm module and provide its imports without an engine, so the thin JS bridge is the practical
   boundary; embedding wasmi/Wasmtime-in-wasm is the larger pure-Rust alternative.
+- **Compio-shaped runtime:** the waker is a completion-based proactor (`submit(call) ->
+  completion`, `poll()`, `wake(pid, completion)`), not a thread-per-call model. The browser
+  implementation uses `/api/sys` batches, MessagePort and SAB; native/container executors can
+  use compio/io_uring behind the same trait later. The batch is already the submission queue; a
+  completion queue is the future-proofing hook.
 
 ## Required account semantics
 
