@@ -367,8 +367,8 @@ terminal input. Phase 0 measured the limits: SharedWorkers are not cross-origin 
 Chromium or Firefox, so they cannot use `SharedArrayBuffer`; File System Access and WebGPU are
 Chromium-only. The Rust WASIX runtime now runs and forks a prebuilt `dash` in the Node harness
 (`scripts/wasix-phase0.mjs`) and in a cross-origin-isolated module Worker
-(`tests/wasix-browser.spec.js`); asyncify-at-load transforms an uninstrumented WAT module in
-Node. Wiring binaryen.js into the browser host is the remaining Phase 0 work. Details and the
+(`tests/wasix-browser.spec.js`); asyncify-at-load transforms an uninstrumented WAT module with
+binaryen in both Node and the browser Worker. The Phase 0 fork gate is met. Details and the
 gate are in `AGENT.md` and issue #20.
 
 ## Storage and project boundaries

@@ -40,12 +40,26 @@ globalThis.wasixGuest = {
   },
   clone(parent, child, stackPointer) {
     const source = guests.get(parent);
-    const pages = source.memory.buffer.byteLength / 65536;
-    const memory = new WebAssembly.Memory({ initial: pages, maximum: 65536, shared: true });
-    new Uint8Array(memory.buffer).set(new Uint8Array(source.memory.buffer));
-    const instance = new WebAssembly.Instance(source.module, importsFor(child, memory));
+    let instance;
+    let memory;
+    if (source.importsMemory) {
+      const pages = source.memory.buffer.byteLength / 65536;
+      memory = new WebAssembly.Memory({ initial: pages, maximum: 65536, shared: source.shared });
+      new Uint8Array(memory.buffer).set(new Uint8Array(source.memory.buffer));
+      instance = new WebAssembly.Instance(source.module, importsFor(child, memory));
+    } else {
+      instance = new WebAssembly.Instance(source.module, importsFor(child));
+      memory = instance.exports.memory;
+      new Uint8Array(memory.buffer).set(new Uint8Array(source.memory.buffer));
+    }
     instance.exports.__stack_pointer.value = stackPointer;
-    guests.set(child, { instance, memory, module: source.module });
+    guests.set(child, {
+      instance,
+      memory,
+      module: source.module,
+      shared: source.shared,
+      importsMemory: source.importsMemory,
+    });
     return instance.exports.__data_end.value;
   },
 };
@@ -71,7 +85,7 @@ function importsFor(pid, memory) {
       return result.errno;
     };
   }
-  return { env: { memory }, wasix_32v1: wasix };
+  return { env: memory ? { memory } : {}, wasix_32v1: wasix };
 }
 
 function run(pid) {
@@ -103,22 +117,54 @@ function run(pid) {
   throw new Error(`unsupported asyncify action: ${JSON.stringify(next)}`);
 }
 
-async function main({ dash, argv }) {
+async function main({ dash, wat, asyncify, argv }) {
+  post('progress', { step: 'init' });
   await init();
   runtime = new Runtime();
-  const bytes = await (await fetch(dash)).arrayBuffer();
-  const command = argv ?? ['dash', '-c', 'echo one; (echo two); echo three'];
+  let bytes;
+  let command;
+  if (wat) {
+    post('progress', { step: 'binaryen-import' });
+    const binaryen = (await import('/binaryen.js')).default;
+    post('progress', { step: 'binaryen-ready' });
+    const text = await (await fetch(wat)).text();
+    const module = binaryen.parseText(text);
+    module.runPasses(['asyncify']);
+    bytes = module.emitBinary();
+    post('progress', { step: 'binaryen-done' });
+    command = argv ?? ['wasix-fork'];
+  } else {
+    bytes = new Uint8Array(await (await fetch(dash)).arrayBuffer());
+    if (asyncify) {
+      const binaryen = (await import('/binaryen.js')).default;
+      const module = binaryen.readBinary(bytes);
+      module.runPasses(['asyncify']);
+      bytes = module.emitBinary();
+    }
+    command = argv ?? ['dash', '-c', 'echo one; (echo two); echo three'];
+    runtime.add_file('/dash', bytes);
+    for (const path of ['/etc/profile', '/.profile', '/profile']) {
+      runtime.add_file(path, new Uint8Array(0));
+    }
+  }
   const env = ['PWD=/', 'HOME=/', 'PATH=/usr/bin', 'TERM=xterm', 'LANG=C.UTF-8'];
   runtime.register(rootPid, 0, JSON.stringify(command), JSON.stringify(env), '/');
-  runtime.add_file('/dash', new Uint8Array(bytes));
-  for (const path of ['/etc/profile', '/.profile', '/profile']) {
-    runtime.add_file(path, new Uint8Array(0));
-  }
-  const memory = new WebAssembly.Memory({ initial: 2, maximum: 65536, shared: true });
   const module = await WebAssembly.compile(bytes);
-  const instance = new WebAssembly.Instance(module, importsFor(rootPid, memory));
-  guests.set(rootPid, { instance, memory, module });
-  runtime.set_layout(rootPid, instance.exports.__data_end.value, instance.exports.__stack_pointer.value);
+  const importsMemory = WebAssembly.Module.imports(module).some(
+    entry => entry.kind === 'memory' && entry.module === 'env' && entry.name === 'memory',
+  );
+  const shared = importsMemory;
+  const imported = importsMemory
+    ? new WebAssembly.Memory({ initial: 2, maximum: 65536, shared: true })
+    : undefined;
+  const instance = new WebAssembly.Instance(module, importsFor(rootPid, imported));
+  const guestMemory = instance.exports.memory ?? imported;
+  guests.set(rootPid, { instance, memory: guestMemory, module, shared, importsMemory });
+  runtime.set_layout(
+    rootPid,
+    instance.exports.__data_end.value,
+    instance.exports.__stack_pointer.value,
+  );
   run(rootPid);
   post('done', {});
 }

@@ -25,37 +25,49 @@ test.beforeAll(async () => {
   const host = readFileSync(join(root, 'web/kernel/host.js'));
   const runtimeJs = readFileSync(join(bindings, 'wasix_runtime.js'));
   const runtimeWasm = readFileSync(join(bindings, 'wasix_runtime_bg.wasm'));
+  const binaryen = readFileSync(join(root, 'node_modules/binaryen/index.js'));
+  const wat = readFileSync(join(root, 'tests/fixtures/wasix-fork.wat'));
   const dashBytes = readFileSync(dash);
   const page = `<!doctype html><meta charset="utf-8"><title>wasix</title><script>
-    window.results = { out: [], exits: [], error: null, done: false };
+    window.results = { out: [], exits: [], error: null, done: false, progress: [] };
     const worker = new Worker('/host.js', { type: 'module' });
     worker.onmessage = event => {
       const message = event.data;
       if (message.type === 'output') window.results.out.push(message.text);
       else if (message.type === 'exit') window.results.exits.push({ pid: message.pid, code: message.code });
       else if (message.type === 'error') window.results.error = message.error;
+      else if (message.type === 'progress') window.results.progress.push(message.step);
       else if (message.type === 'done') window.results.done = true;
     };
-    worker.onerror = event => { window.results.error = event.message; };
-    worker.postMessage({ type: 'start', dash: '/dash.wasm' });
+    worker.onerror = event => { window.results.error = event.message || 'worker error'; };
+    worker.onmessageerror = () => { window.results.error = 'worker message error'; };
+    const wat = new URLSearchParams(location.search).has('wat');
+    worker.postMessage(wat ? { type: 'start', wat: '/fork.wat' } : { type: 'start', dash: '/dash.wasm' });
   </script>`;
   server = http.createServer((req, res) => {
+    const pathname = new URL(req.url, 'http://worker').pathname;
     res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
     res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
     res.setHeader('Cache-Control', 'no-store');
-    if (req.url === '/') {
+    if (pathname === '/') {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.end(page);
-    } else if (req.url === '/host.js') {
+    } else if (pathname === '/host.js') {
       res.setHeader('Content-Type', 'text/javascript');
       res.end(host);
-    } else if (req.url === '/wasix_runtime.js') {
+    } else if (pathname === '/wasix_runtime.js') {
       res.setHeader('Content-Type', 'text/javascript');
       res.end(runtimeJs);
-    } else if (req.url === '/wasix_runtime_bg.wasm') {
+    } else if (pathname === '/wasix_runtime_bg.wasm') {
       res.setHeader('Content-Type', 'application/wasm');
       res.end(runtimeWasm);
-    } else if (req.url === '/dash.wasm') {
+    } else if (pathname === '/binaryen.js') {
+      res.setHeader('Content-Type', 'text/javascript');
+      res.end(binaryen);
+    } else if (pathname === '/fork.wat') {
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.end(wat);
+    } else if (pathname === '/dash.wasm') {
       res.setHeader('Content-Type', 'application/wasm');
       res.end(dashBytes);
     } else {
@@ -81,6 +93,27 @@ test('the Rust WASIX runtime forks dash in a Worker', async ({ page }) => {
   expect(output).toContain('one');
   expect(output).toContain('two');
   expect(output).toContain('three');
+  expect(results.exits).toEqual(expect.arrayContaining([
+    expect.objectContaining({ pid: 2, code: 0 }),
+    expect.objectContaining({ pid: 1, code: 0 }),
+  ]));
+});
+
+test('asyncify-at-load forks an uninstrumented module in a Worker', async ({ page }) => {
+  test.skip(!dash, 'set WASIX_DASH to a WASIX dash binary');
+  test.setTimeout(180_000);
+  await page.goto(origin + '/?wat');
+  try {
+    await page.waitForFunction(() => window.results?.done || window.results?.error, null, { timeout: 30_000 });
+  } catch (error) {
+    console.log('DEBUG ' + JSON.stringify(await page.evaluate(() => window.results)));
+    throw error;
+  }
+  const results = await page.evaluate(() => window.results);
+  expect(results.error).toBeNull();
+  const output = results.out.join('');
+  expect(output).toContain('child');
+  expect(output).toContain('parent');
   expect(results.exits).toEqual(expect.arrayContaining([
     expect.objectContaining({ pid: 2, code: 0 }),
     expect.objectContaining({ pid: 1, code: 0 }),

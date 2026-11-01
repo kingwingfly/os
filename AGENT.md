@@ -93,18 +93,21 @@ feasibility gate; these are its measurements, not built features.
   module Worker (`web/kernel/host.js`, `tests/wasix-browser.spec.js`). The asyncify
   `stack_checkpoint`/`stack_restore` engine and `proc_fork` are working: the parent and child
   each rewind their own snapshot, the child gets pid 0, the parent gets the child pid, and the
-  output is `one`, `two`, `three`. Wiring binaryen.js into the browser host is the remaining
-  Phase 0 step.
+  output is `one`, `two`, `three`.
 - **Asyncify-at-load:** `tests/fixtures/wasix-fork.wat` is an uninstrumented module that imports
   `wasix_32v1.proc_fork`; `scripts/wasix-phase0.mjs` runs binaryen's asyncify pass on it at load,
   then the Rust runtime forks it. `tests/wasix-asyncify.test.mjs` checks the child and parent
-  output and exits. The Node proof is done; the browser host still needs the same binaryen
-  transform at load.
+  output and exits. The same transform now runs in the browser Worker:
+  `web/kernel/host.js` imports `binaryen.js`, calls `parseText`/`runPasses(['asyncify'])`/
+  `emitBinary`, and `tests/wasix-browser.spec.js` forks the transformed module. The host also
+  handles modules that define their own memory (the WAT fixture) as well as ones importing
+  `env.memory` (dash).
 - **Fork gate:** Wasmer's `stack_checkpoint` captures the used stack, calls
   `asyncify_start_unwind`, and captures the unwind stack after `_start` returns;
   `stack_restore`/`proc_fork` call `asyncify_start_rewind` with a snapshot. The Rust runtime
   implements this for dash in Node and in a browser Worker, and for an uninstrumented WAT
-  module after binaryen's asyncify pass; the remaining gate is the browser-side transformer.
+  module after binaryen's asyncify pass in both Node and the browser. The Phase 0 fork gate is
+  met.
 - **Runtime language:** the client runtime is Rust→wasm. `crates/client-kernel` runs in the
   SharedWorker (PID/process/cgroup/IPC state); `crates/wasix-runtime` runs in the page host
   (`wasix_32v1` imports, asyncify checkpoint/restore/fork, waker). `web/kernel/host.js` is only
