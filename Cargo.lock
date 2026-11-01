@@ -3967,6 +3967,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "terminal-worker-wasix-runtime"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"

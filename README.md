@@ -365,9 +365,9 @@ The next kernel split puts a client kernel in the browser: a SharedWorker holds 
 `execve`/`fork`, signals and waits, while a page-owned worker hosts processes, SAB pipes and
 terminal input. Phase 0 measured the limits: SharedWorkers are not cross-origin isolated in
 Chromium or Firefox, so they cannot use `SharedArrayBuffer`; File System Access and WebGPU are
-Chromium-only. A prebuilt WASIX `dash` runs under our own `wasix_32v1` import layer, but `fork`
-needs an asyncify checkpoint/restore engine before it can be called complete. Details and the
-gate are in `AGENT.md` and issue #20.
+Chromium-only. The Rust WASIX runtime now runs and forks a prebuilt `dash` in the Node harness
+(`scripts/wasix-phase0.mjs`); the browser Worker port and asyncify-at-load for arbitrary modules
+are the remaining Phase 0 work. Details and the gate are in `AGENT.md` and issue #20.
 
 ## Storage and project boundaries
 

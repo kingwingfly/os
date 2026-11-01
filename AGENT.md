@@ -86,16 +86,19 @@ feasibility gate; these are its measurements, not built features.
   `proc_fork`, `proc_exec`, `proc_join`, `proc_signal`, `stack_checkpoint`, `stack_restore`,
   `callback_signal`) plus a shared `env.memory`. It exports `_start`, `__wasm_init_tls`,
   `wasi_thread_start`, and the asyncify start/stop/get-state functions.
-- **Own import layer:** a Node harness (`/home/ai/tw-tools/wasix-run.mjs`, outside the repo)
-  runs `dash -c 'echo hello; echo $((1+2))'` and prints correctly. A subshell calls
-  `proc_fork(1, pid_ptr)`, dash says “Cannot fork”, and its exit path traps at
-  `stack_restore(0,1)`. Non-forking WASIX is proven with our own shim; **fork is not**.
+- **Own import layer:** the Rust runtime `crates/wasix-runtime` runs
+  `dash -c 'echo hello; echo $((1+2))'` and forks a subshell
+  (`dash -c 'echo one; (echo two); echo three'`) in Node through
+  `scripts/wasix-phase0.mjs`; `tests/wasix-phase0.test.mjs` checks it. The asyncify
+  `stack_checkpoint`/`stack_restore` engine and `proc_fork` are working: the parent and child
+  each rewind their own snapshot, the child gets pid 0, the parent gets the child pid, and the
+  output is `one`, `two`, `three`. The browser Worker port of the same bridge is the remaining
+  Phase 0 step.
 - **Fork gate:** Wasmer's `stack_checkpoint` captures the used stack, calls
   `asyncify_start_unwind`, and captures the unwind stack after `_start` returns;
-  `stack_restore`/`proc_fork` call `asyncify_start_rewind` with a snapshot. Our own client
-  kernel needs this asyncify engine (and asyncify-at-load for arbitrary modules) before the
-  owner's “fork must work for any wasm” bar is met. Do not start Phase 1 until the route is
-  chosen: our own asyncify engine in Rust, or Wasmer's SDK/runtime for WASIX.
+  `stack_restore`/`proc_fork` call `asyncify_start_rewind` with a snapshot. The Rust runtime
+  implements this for dash in Node; the owner's “fork must work for any wasm” bar still needs a
+  browser proof and asyncify-at-load for arbitrary modules.
 - **Runtime language:** the client runtime is Rust→wasm. `crates/client-kernel` runs in the
   SharedWorker (PID/process/cgroup/IPC state); `crates/wasix-runtime` runs in the page host
   (`wasix_32v1` imports, asyncify checkpoint/restore/fork, waker). `web/kernel/host.js` is only
