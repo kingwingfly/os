@@ -65,6 +65,38 @@ See README for prerequisites and commands. The known toolchain uses `worker-buil
 - File creation needs parent w+x; overwriting needs file w; deletion needs parent w+x. Recursive operations validate the entire affected tree before mutation.
 - Some HTTP error classification currently matches English message fragments. Preserve 401/403/404/409 semantics when editing messages; permission/API tests cover these paths. A future typed-error refactor must preserve behavior.
 
+## Phase 0 findings (2026-11-01)
+
+The next architecture (worker kernel + browser client kernel, WASIX `execve`/`fork`, arbitrary
+uploaded wasm, live mounts, cgroups, cluster map/reduce) is recorded in issue #20. Phase 0 is the
+feasibility gate; these are its measurements, not built features.
+
+- **Browser capabilities** (`web/kernel/probe.js`, `tests/kernel-capabilities.spec.js`, Chromium
+  and Firefox under Playwright with COOP/COEP):
+  - Page: cross-origin isolated, `SharedArrayBuffer`, OffscreenCanvas; Chromium has File System
+    Access and WebGPU; Firefox headless has neither (OPFS is available in both).
+  - Dedicated Worker: isolated, SAB, `Atomics.wait`, sync XHR, cookies, nested Worker, and
+    `WebAssembly.Module` postMessage; Chromium has WebGPU.
+  - SharedWorker: **not** cross-origin isolated in either browser, so no SAB and no
+    `Atomics.wait`; sync XHR and cookies work. Chromium SharedWorkers cannot create Workers;
+    Firefox can. Therefore the client kernel's PID state lives in the SharedWorker, while
+    process hosting, SAB pipes and terminal input live in a page-owned host.
+- **WASIX surface:** the prebuilt `sharrattj/dash@1.0.19` (GNU; approved fixture) imports only
+  `wasix_32v1` (40 functions: args/env, fds, paths, pipes, clock, futex/threads,
+  `proc_fork`, `proc_exec`, `proc_join`, `proc_signal`, `stack_checkpoint`, `stack_restore`,
+  `callback_signal`) plus a shared `env.memory`. It exports `_start`, `__wasm_init_tls`,
+  `wasi_thread_start`, and the asyncify start/stop/get-state functions.
+- **Own import layer:** a Node harness (`/home/ai/tw-tools/wasix-run.mjs`, outside the repo)
+  runs `dash -c 'echo hello; echo $((1+2))'` and prints correctly. A subshell calls
+  `proc_fork(1, pid_ptr)`, dash says “Cannot fork”, and its exit path traps at
+  `stack_restore(0,1)`. Non-forking WASIX is proven with our own shim; **fork is not**.
+- **Fork gate:** Wasmer's `stack_checkpoint` captures the used stack, calls
+  `asyncify_start_unwind`, and captures the unwind stack after `_start` returns;
+  `stack_restore`/`proc_fork` call `asyncify_start_rewind` with a snapshot. Our own client
+  kernel needs this asyncify engine (and asyncify-at-load for arbitrary modules) before the
+  owner's “fork must work for any wasm” bar is met. Do not start Phase 1 until the route is
+  chosen: our own asyncify engine, or Wasmer's SDK/runtime for WASIX.
+
 ## Required account semantics
 
 These were explicitly chosen by the owner; do not silently replace them with full Linux semantics.

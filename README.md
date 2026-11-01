@@ -359,6 +359,16 @@ A pipeline's processes run at once, each one's output the next one's input throu
 
 A name runs the terminal's program, or uutils' where it has none; `/usr/bin/NAME`, and `/bin/NAME`, `/sbin/NAME` and `/usr/sbin/NAME` through the links, run what NAME does, and `coreutils NAME` uutils' NAME whatever the terminal has. `help` lists uutils'; `NAME --help` tells how to use one.
 
+### The client kernel (Phase 0, roadmap)
+
+The next kernel split puts a client kernel in the browser: a SharedWorker holds the PID table,
+`execve`/`fork`, signals and waits, while a page-owned worker hosts processes, SAB pipes and
+terminal input. Phase 0 measured the limits: SharedWorkers are not cross-origin isolated in
+Chromium or Firefox, so they cannot use `SharedArrayBuffer`; File System Access and WebGPU are
+Chromium-only. A prebuilt WASIX `dash` runs under our own `wasix_32v1` import layer, but `fork`
+needs an asyncify checkpoint/restore engine before it can be called complete. Details and the
+gate are in `AGENT.md` and issue #20.
+
 ## Storage and project boundaries
 
 | Path | Responsibility |
