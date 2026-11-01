@@ -32,8 +32,15 @@ const ELSEWHERE: &str = "the upload goes on from another tab or device";
 
 type Result<T> = std::result::Result<T, Error>;
 
-/// The descriptor calls of the session `sid`, as `process`.
-pub fn call(db: &mut Db, sid: Option<&str>, process: &Process, call: Call) -> Result<Value> {
+/// The descriptor calls of the session `sid`, as `process`. `caller` is the calling process's
+/// key ("ns pid"), or none for a page's batch: a process's own descriptor answers it alone.
+pub fn call(
+    db: &mut Db,
+    sid: Option<&str>,
+    process: &Process,
+    caller: Option<&str>,
+    call: Call,
+) -> Result<Value> {
     let sid = sid.ok_or_else(|| Error::because(Errno::EBADF, "no session to keep descriptors"))?;
     match call {
         Call::Open {
@@ -52,7 +59,7 @@ pub fn call(db: &mut Db, sid: Option<&str>, process: &Process, call: Call) -> Re
             }
             Ok(json!(opened))
         }
-        Call::Close { fd } => close(db, sid, &process.cred, fd.number()).map(|c| json!(c)),
+        Call::Close { fd } => close(db, sid, &process.cred, fd.number(), caller).map(|c| json!(c)),
         Call::Ioctl { fd, request, arg } => match crate::dev::request(db, sid, fd.number())? {
             Some(device) => crate::dev::ioctl(db, process, device, request, arg),
             None if request == FICLONE => clone(
@@ -61,11 +68,22 @@ pub fn call(db: &mut Db, sid: Option<&str>, process: &Process, call: Call) -> Re
                 &process.cred,
                 fd.number(),
                 arg.as_u64().unwrap_or(u64::MAX),
+                caller,
             )
             .map(|()| Value::Null),
             None => Err(Errno::ENOTTY.into()),
         },
         _ => Err(Errno::ENOSYS.into()),
+    }
+}
+
+/// A process's descriptor answers its process alone: a page, or another process, naming it
+/// gets EBADF, as if it were not open.
+fn owned(found: &crate::db::Fd, caller: Option<&str>) -> Result<()> {
+    match (&found.proc, caller) {
+        (Some(owner), Some(caller)) if owner == caller => Ok(()),
+        (Some(_), _) => Err(Errno::EBADF.into()),
+        (None, _) => Ok(()),
     }
 }
 
@@ -79,9 +97,16 @@ fn acting(found: &crate::db::Fd, who: &Identity) -> Identity {
     }
 }
 
-/// The descriptor `fd` of `sid`, and the file it still reads or writes.
-fn descriptor(db: &Db, sid: &str, fd: u32) -> Result<(crate::db::Fd, String)> {
+/// The descriptor `fd` of `sid`, and the file it still reads or writes. A process's own
+/// descriptor answers its process alone.
+fn descriptor(
+    db: &Db,
+    sid: &str,
+    fd: u32,
+    caller: Option<&str>,
+) -> Result<(crate::db::Fd, String)> {
     let found = db.fd(sid, fd).ok_or(Errno::EBADF)?;
+    owned(&found, caller)?;
     let file = found
         .file
         .clone()
@@ -350,8 +375,9 @@ pub fn writable(db: &mut Db, who: &Identity, file: &File) -> Result<(String, Nod
 /// close(2). A writer's file is complete once every chunk is there; if one is missing, the
 /// descriptor goes all the same, with EIO, and the file waits for a writer to go on with it. A
 /// recording is complete with what arrived.
-fn close(db: &mut Db, sid: &str, who: &Identity, fd: u32) -> Result<Closed> {
+fn close(db: &mut Db, sid: &str, who: &Identity, fd: u32, caller: Option<&str>) -> Result<Closed> {
     let found = db.fd(sid, fd).ok_or(Errno::EBADF)?;
+    owned(&found, caller)?;
     release(db, sid, fd);
     if found.file.is_none() {
         return match found.device {
@@ -478,11 +504,19 @@ pub fn renew(db: &mut Db, sid: &str, now: u64) {
 
 /// ioctl(fd, FICLONE, source): the file `fd` writes, nothing of it written yet, takes the
 /// content `source` reads, shared, at once, as a reflink copy does.
-fn clone(db: &mut Db, sid: &str, who: &Identity, fd: u32, source: u64) -> Result<()> {
+fn clone(
+    db: &mut Db,
+    sid: &str,
+    who: &Identity,
+    fd: u32,
+    source: u64,
+    caller: Option<&str>,
+) -> Result<()> {
     let source = u32::try_from(source).map_err(|_| Errno::EBADF)?;
     // What the kernel makes as it is read (/etc/passwd, /proc, a device's state) has no content
     // to share: a copy reads it, as cp does where it cannot clone.
     let reading = db.fd(sid, source).ok_or(Errno::EBADF)?;
+    owned(&reading, caller)?;
     if reading.device.is_some()
         || crate::procfs::is(&reading.path)
         || crate::sys::generated(db, &reading.path).is_some()
@@ -492,8 +526,8 @@ fn clone(db: &mut Db, sid: &str, who: &Identity, fd: u32, source: u64) -> Result
             "its content is made as it is read",
         ));
     }
-    let (writer, target) = descriptor(db, sid, fd)?;
-    let (reader, content) = descriptor(db, sid, source)?;
+    let (writer, target) = descriptor(db, sid, fd, caller)?;
+    let (reader, content) = descriptor(db, sid, source, caller)?;
     if !writer.writes() || reader.flags & O_ACCMODE == abi::O_WRONLY {
         return Err(Errno::EBADF.into());
     }
@@ -547,7 +581,9 @@ pub enum Read {
 }
 
 /// pread(2) of `count` bytes from `offset`, through the descriptor `fd` of `sid`, or of the file
-/// at `path`, which `process` must be able to open for reading.
+/// at `path`, which `process` must be able to open for reading. A process's own descriptor
+/// (`caller`) answers its process alone.
+#[allow(clippy::too_many_arguments)]
 pub fn pread(
     db: &Db,
     sid: Option<&str>,
@@ -556,6 +592,7 @@ pub fn pread(
     path: Option<&str>,
     offset: u64,
     count: u64,
+    caller: Option<&str>,
 ) -> Result<Read> {
     let state = |value: Option<Value>| {
         let bytes = value.ok_or(Errno::ENXIO)?.to_string().into_bytes();
@@ -565,6 +602,7 @@ pub fn pread(
         (Some(fd), None) => {
             let sid = sid.ok_or(Errno::EBADF)?;
             let found = db.fd(sid, fd).ok_or(Errno::EBADF)?;
+            owned(&found, caller)?;
             if found.flags & O_ACCMODE == abi::O_WRONLY {
                 return Err(Errno::EBADF.into());
             }
@@ -663,23 +701,45 @@ fn window(bytes: Vec<u8>, offset: u64, count: u64) -> Vec<u8> {
 /// What the Worker reads by the token `token`, for the session `sid` reading it now: the
 /// file's content, if the descriptor is still open, its session `sid`'s, and its account may
 /// still read the file at a name it shows at; the descriptor is kept, as it is used.
-pub fn by_token(db: &mut Db, sid: Option<&str>, who: &Identity, token: &str) -> Result<File> {
+/// A process's own descriptor answers its process alone (`caller`, from the request's process
+/// token), with the process's snapshot credentials; an exec image is revalidated with the X
+/// rule, not R: an x-only file runs, as Linux exec reveals the image.
+pub fn by_token(
+    db: &mut Db,
+    sid: Option<&str>,
+    who: &Identity,
+    token: &str,
+    caller: Option<&crate::procs::Row>,
+) -> Result<File> {
     let (of, found) = db.fd_by_token(token).ok_or(Errno::EBADF)?;
     if sid != Some(of.as_str()) {
         return Err(Errno::EBADF.into());
     }
-    let who = &acting(&found, who);
+    let (who, mask) = match &found.proc {
+        Some(owner) => {
+            let row = caller
+                .filter(|row| format!("{} {}", row.ns, row.pid) == *owner)
+                .ok_or(Errno::EBADF)?;
+            let mask = if found.exec {
+                terminal_worker_core::permissions::EXEC
+            } else {
+                terminal_worker_core::permissions::READ
+            };
+            (row.identity(), mask)
+        }
+        None => (acting(&found, who), terminal_worker_core::permissions::READ),
+    };
     let file = found
         .file
         .as_deref()
         .and_then(|file| db.file(file))
         .filter(File::complete)
         .ok_or(Errno::EBADF)?;
-    let readable = db.showing(&file.id).iter().any(|path| {
-        db.access(who, path, terminal_worker_core::permissions::READ)
-            .is_ok()
-    });
-    if !readable {
+    let permitted = db
+        .showing(&file.id)
+        .iter()
+        .any(|path| db.access(&who, path, mask).is_ok());
+    if !permitted {
         return Err(Errno::EACCES.into());
     }
     let now = auth::now();
@@ -707,8 +767,9 @@ pub fn pwrite(
     fd: u32,
     index: u64,
     length: u64,
+    caller: Option<&str>,
 ) -> Result<(String, String)> {
-    let (found, file) = descriptor(db, sid, fd)?;
+    let (found, file) = descriptor(db, sid, fd, caller)?;
     if !found.writes() {
         return Err(Errno::EBADF.into());
     }
@@ -759,12 +820,13 @@ pub fn written(
     key: &str,
     sha256: Option<&str>,
     length: u64,
+    caller: Option<&str>,
 ) -> Result<Value> {
     let refused = |db: &mut Db, error: Error| {
         db.discard(key);
         Err(error)
     };
-    let (found, file) = match descriptor(db, sid, fd) {
+    let (found, file) = match descriptor(db, sid, fd, caller) {
         Ok(found) => found,
         Err(error) => return refused(db, error),
     };

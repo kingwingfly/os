@@ -19,10 +19,12 @@ pub fn error_response(message: &str, status: u16) -> Result<Response> {
     Ok(Response::from_json(&json!({"error":message}))?.with_status(status))
 }
 
-/// Ask the authority, as the client whose session cookie is `cookie`.
+/// Ask the authority, as the client whose session cookie is `cookie`, for the process whose
+/// token is `proc`, if a process's request it is.
 async fn authority_as(
     env: &Env,
     cookie: Option<&str>,
+    proc: Option<&str>,
     method: Method,
     path_and_query: &str,
     body: Option<Value>,
@@ -30,6 +32,9 @@ async fn authority_as(
     let headers = Headers::new();
     if let Some(cookie) = cookie {
         headers.set("Cookie", cookie)?;
+    }
+    if let Some(proc) = proc {
+        headers.set("X-Process-Token", proc)?;
     }
     let mut init = RequestInit::new();
     init.with_method(method);
@@ -45,7 +50,7 @@ async fn authority_as(
         .fetch_with_request(Request::new_with_init(&url, &init)?)
         .await
 }
-/// Ask the authority, as the client of `req`.
+/// Ask the authority, as the client of `req`, its process token carried if it gives one.
 async fn authority(
     env: &Env,
     req: &Request,
@@ -54,7 +59,16 @@ async fn authority(
     body: Option<Value>,
 ) -> Result<Response> {
     let cookie = req.headers().get("Cookie")?;
-    authority_as(env, cookie.as_deref(), method, path_and_query, body).await
+    let proc = req.headers().get("X-Process-Token")?;
+    authority_as(
+        env,
+        cookie.as_deref(),
+        proc.as_deref(),
+        method,
+        path_and_query,
+        body,
+    )
+    .await
 }
 
 fn param(req: &Request, name: &str) -> Result<String> {
@@ -97,12 +111,21 @@ thread_local! {
 }
 
 /// The session a request comes from, as its cookies say: a signed-in one's, or a browser's own.
+/// A process's request (its token) is a reader of its own: its cached grants never serve a
+/// page, nor another process.
 fn session(req: &Request) -> String {
     let cookie = |name| crate::auth::cookie_token(req, name).unwrap_or_default();
+    let proc = req
+        .headers()
+        .get("X-Process-Token")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     format!(
-        "{} {}",
+        "{} {} {}",
         cookie(crate::auth::COOKIE),
-        cookie(crate::auth::GUEST_COOKIE)
+        cookie(crate::auth::GUEST_COOKIE),
+        proc
     )
 }
 
@@ -235,6 +258,7 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
         bucket: env.bucket("FILES")?,
         env: env.clone(),
         cookie: req.headers().get("Cookie")?,
+        proc: req.headers().get("X-Process-Token")?,
         query,
         complete: grant.state == "complete",
         chunks: grant.chunks.iter().cloned().collect(),
@@ -251,6 +275,7 @@ struct Reader {
     bucket: Bucket,
     env: Env,
     cookie: Option<String>,
+    proc: Option<String>,
     /// The file's path, as the authority's query.
     query: String,
     file: String,
@@ -327,6 +352,7 @@ impl Reader {
         let mut grant = authority_as(
             &self.env,
             self.cookie.as_deref(),
+            self.proc.as_deref(),
             Method::Get,
             &format!("/internal/read?{}", self.query),
             None,

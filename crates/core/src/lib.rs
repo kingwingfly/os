@@ -191,6 +191,8 @@ pub fn mime(path: &str) -> &'static str {
         "zip" => "application/zip",
         "gz" | "tgz" => "application/gzip",
         "tar" => "application/x-tar",
+        // A wasm module, as compileStreaming asks for it.
+        "wasm" => "application/wasm",
         _ if !name.contains('.') || matches!(kind(path), "text" | "markdown" | "slides") => {
             "text/plain; charset=utf-8"
         }
@@ -349,6 +351,7 @@ mod tests {
         assert_eq!(mime("/song.aac"), "audio/aac");
         assert_eq!(mime("/voice.opus"), "audio/ogg");
         assert_eq!(mime("/report.docx"), "application/octet-stream");
+        assert_eq!(mime("/bin/hello.wasm"), "application/wasm");
         assert_eq!(mime("/notes/README"), "text/plain; charset=utf-8");
         assert_eq!(mime("/src/main.rs"), "text/plain; charset=utf-8");
         assert_eq!(mime("/v1.2/Makefile"), "text/plain; charset=utf-8");

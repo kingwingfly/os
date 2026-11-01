@@ -228,29 +228,39 @@ struct Session {
     token: Option<String>,
 }
 impl Session {
-    /// Its process and session id, as the store `db` knows them: a process token runs as the
-    /// process's snapshot, a page's batch as the session's account.
-    fn of(&self, db: &mut Db) -> std::result::Result<(Process, Option<String>), Error> {
-        let process = match self.token.as_deref() {
+    /// Its process, session id and process key ("ns pid"), as the store `db` knows them: a
+    /// process token runs as the process's snapshot, a page's batch as the session's account.
+    fn of(
+        &self,
+        db: &mut Db,
+    ) -> std::result::Result<(Process, Option<String>, Option<String>), Error> {
+        let (process, proc) = match self.token.as_deref() {
             Some(token) => {
                 let row = db
                     .process_token(token, self.pid)
                     .ok_or_else(|| Error::because(Errno::EPERM, "not this process's token"))?;
-                Process {
-                    cred: row.identity(),
-                    umask: row.umask,
-                }
+                let proc = format!("{} {}", row.ns, row.pid);
+                (
+                    Process {
+                        cred: row.identity(),
+                        umask: row.umask,
+                    },
+                    Some(proc),
+                )
             }
-            None => process(
-                db,
-                self.key.as_deref(),
-                self.guest.as_deref(),
-                self.sudo,
-                self.umask,
-            )?,
+            None => (
+                process(
+                    db,
+                    self.key.as_deref(),
+                    self.guest.as_deref(),
+                    self.sudo,
+                    self.umask,
+                )?,
+                None,
+            ),
         };
         let sid = auth::sid(db, self.key.as_deref(), self.guest.as_deref());
-        Ok((process, sid))
+        Ok((process, sid, proc))
     }
 }
 
@@ -308,7 +318,7 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
             }
             let asking = session.clone();
             let read = transact(state, move |db| {
-                let read = asking.of(db).and_then(|(process, sid)| {
+                let read = asking.of(db).and_then(|(process, sid, proc)| {
                     crate::fds::pread(
                         db,
                         sid.as_deref(),
@@ -317,6 +327,7 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
                         path.as_deref(),
                         offset,
                         count,
+                        proc.as_deref(),
                     )
                 });
                 (read, false)
@@ -364,7 +375,7 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
             let asking = session.clone();
             let bytes = data.0.clone();
             let target = transact(state, move |db| {
-                let target = asking.of(db).and_then(|(process, sid)| {
+                let target = asking.of(db).and_then(|(process, sid, proc)| {
                     let sid = sid.ok_or(Errno::EBADF)?;
                     let stdin = db
                         .fd(&sid, fd)
@@ -375,8 +386,16 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
                             crate::jobs::answer(db, owner, &process, &pid, &bytes)
                                 .map(|value| Target::Stdin(pid, value))
                         }
-                        None => crate::fds::pwrite(db, &sid, &process.cred, fd, index, length)
-                            .map(|(object, mime)| Target::Chunk(object, mime)),
+                        None => crate::fds::pwrite(
+                            db,
+                            &sid,
+                            &process.cred,
+                            fd,
+                            index,
+                            length,
+                            proc.as_deref(),
+                        )
+                        .map(|(object, mime)| Target::Chunk(object, mime)),
                     }
                 });
                 let commit = target.is_ok();
@@ -401,9 +420,19 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
                 .await
                 .map_err(io)?;
             transact(state, move |db| {
-                let written = session.of(db).and_then(|(process, sid)| {
+                let written = session.of(db).and_then(|(process, sid, proc)| {
                     let sid = sid.ok_or(Errno::EBADF)?;
-                    crate::fds::written(db, &sid, &process.cred, fd, index, &object, None, length)
+                    crate::fds::written(
+                        db,
+                        &sid,
+                        &process.cred,
+                        fd,
+                        index,
+                        &object,
+                        None,
+                        length,
+                        proc.as_deref(),
+                    )
                 });
                 (written, true)
             })
@@ -582,6 +611,7 @@ fn run(
             let target = caller.as_ref().map(|row| row.pid).or(target);
             let exec = db.execve(
                 &ns,
+                sid,
                 &process.cred,
                 target,
                 &path,
@@ -745,7 +775,8 @@ fn run(
             crate::jobs::call(db, process.cred.id, &home, sid, &process, call)
         }
         call @ (Call::Open { .. } | Call::Close { .. } | Call::Ioctl { .. }) => {
-            crate::fds::call(db, sid, &process, call)
+            let caller = caller.as_ref().map(|row| format!("{} {}", row.ns, row.pid));
+            crate::fds::call(db, sid, &process, caller.as_deref(), call)
         }
         call => kernel::call(db, &process, call),
     }

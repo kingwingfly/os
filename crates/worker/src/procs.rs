@@ -123,6 +123,7 @@ impl Db {
             // Nothing of the old boot's processes can be waited for or signalled any more: its
             // pages are gone. The new boot starts with init alone.
             self.run("DELETE FROM processes WHERE ns = ?", vec![text(ns)]);
+            self.close_ns_proc_fds(ns);
         }
         self.run(
             "INSERT INTO namespaces(id, guest, boot, next_pid, created, last_seen) VALUES(?, ?, ?, 2, ?, ?) ON CONFLICT(id) DO UPDATE SET boot = excluded.boot, last_seen = excluded.last_seen",
@@ -249,11 +250,12 @@ impl Db {
         )
     }
     /// Start (or replace) the process `pid` with the image and credentials given, returning the
-    /// token its calls carry.
+    /// token its calls carry. `sid` is the browser session the image's descriptor belongs to.
     #[allow(clippy::too_many_arguments)]
     pub fn execve(
         &mut self,
         ns: &str,
+        sid: Option<&str>,
         cred: &Identity,
         pid: Option<u32>,
         path: &str,
@@ -278,26 +280,19 @@ impl Db {
             ));
         }
         let executable = kernel::executable(&*self, cred, path)?;
-        if !usr::is(&executable.path) {
-            // Uploaded wasm is Phase 2; its read token and loader come with it.
-            return Err(Error::because(
-                abi::Errno::ENOEXEC,
-                format!(
-                    "{} is not a system binary; uploaded wasm runs from Phase 2",
-                    executable.path
-                ),
-            ));
-        }
-        let Some(asset) = usr::asset(&executable.content) else {
-            return Err(Error::because(
-                abi::Errno::ENOEXEC,
-                format!("{} is not an executable image", executable.path),
-            ));
-        };
         if executable.node.size > EXEC_MAX {
             return Err(Error::because(
                 abi::Errno::E2BIG,
                 format!("{} is larger than an executable may be", executable.path),
+            ));
+        }
+        // The image: a binary of /usr, the build's asset, or an uploaded file, which the loader
+        // reads by a token of the process's own descriptor, revalidated with the X rule.
+        let uploaded = !usr::is(&executable.path);
+        if !uploaded && usr::asset(&executable.content).is_none() {
+            return Err(Error::because(
+                abi::Errno::ENOEXEC,
+                format!("{} is not an executable image", executable.path),
             ));
         }
         let cgroup = cgroup.unwrap_or("/user");
@@ -360,15 +355,38 @@ impl Db {
                 ],
             );
         }
+        let (fd, asset, token_read, size) = if uploaded {
+            let sid = sid.ok_or_else(|| {
+                Error::because(abi::Errno::EBADF, "no session to keep descriptors")
+            })?;
+            let read = crate::auth::random_token();
+            let fd = self.add_exec_fd(
+                sid,
+                &executable.content,
+                &executable.path,
+                &format!("{ns} {pid}"),
+                &crate::auth::token_hash(&read),
+                now,
+            );
+            self.set_expiry("fd", &crate::db::fd_key(sid, fd), now + crate::fds::IDLE);
+            (Some(fd), None, Some(read), executable.node.size)
+        } else {
+            (
+                None,
+                usr::asset(&executable.content).map(str::to_string),
+                None,
+                usr::size(&executable.content),
+            )
+        };
         Ok(Exec {
             pid,
             token,
-            fd: None,
-            asset: Some(asset.to_string()),
+            fd,
+            asset,
             path: Some(executable.path.clone()),
-            size: usr::size(&executable.content),
-            token_read: None,
-            version: None,
+            size,
+            token_read,
+            version: Some(executable.content.clone()),
             cgroup: cgroup.to_string(),
         })
     }
@@ -453,6 +471,7 @@ impl Db {
                 int(row.pid),
             ],
         );
+        self.close_proc_fds(&row.ns, row.pid);
         Ok(())
     }
     /// waitpid(2): the zombie `pid`, now reaped, or EAGAIN while it runs, or ECHILD when it is
@@ -471,6 +490,7 @@ impl Db {
             "DELETE FROM processes WHERE ns = ? AND pid = ?",
             vec![text(ns), int(pid)],
         );
+        self.close_proc_fds(ns, pid);
         Ok(row.proc())
     }
     /// kill(2) in the namespace: SIGKILL and SIGTERM end the process; SIGSTOP stops it;
@@ -503,6 +523,7 @@ impl Db {
                         int(pid),
                     ],
                 );
+                self.close_proc_fds(ns, pid);
                 Ok(())
             }
             SIGSTOP => {
