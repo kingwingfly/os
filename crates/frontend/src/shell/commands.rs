@@ -203,7 +203,9 @@ impl TerminalCommand for Asking {
                 if !shell.authenticated().await? {
                     return Err("sudo canceled".into());
                 }
-                return shell.bin(args[1..].to_vec(), stdin, piped, true).await;
+                return shell
+                    .bin((None, args[1..].to_vec()), stdin, piped, true)
+                    .await;
             }
             shell.manage(&args, piped).await
         }
