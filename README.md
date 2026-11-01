@@ -366,8 +366,9 @@ The next kernel split puts a client kernel in the browser: a SharedWorker holds 
 terminal input. Phase 0 measured the limits: SharedWorkers are not cross-origin isolated in
 Chromium or Firefox, so they cannot use `SharedArrayBuffer`; File System Access and WebGPU are
 Chromium-only. The Rust WASIX runtime now runs and forks a prebuilt `dash` in the Node harness
-(`scripts/wasix-phase0.mjs`); the browser Worker port and asyncify-at-load for arbitrary modules
-are the remaining Phase 0 work. Details and the gate are in `AGENT.md` and issue #20.
+(`scripts/wasix-phase0.mjs`) and in a cross-origin-isolated module Worker
+(`tests/wasix-browser.spec.js`); asyncify-at-load for arbitrary uploaded modules is the
+remaining Phase 0 work. Details and the gate are in `AGENT.md` and issue #20.
 
 ## Storage and project boundaries
 

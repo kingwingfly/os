@@ -88,17 +88,18 @@ feasibility gate; these are its measurements, not built features.
   `wasi_thread_start`, and the asyncify start/stop/get-state functions.
 - **Own import layer:** the Rust runtime `crates/wasix-runtime` runs
   `dash -c 'echo hello; echo $((1+2))'` and forks a subshell
-  (`dash -c 'echo one; (echo two); echo three'`) in Node through
-  `scripts/wasix-phase0.mjs`; `tests/wasix-phase0.test.mjs` checks it. The asyncify
+  (`dash -c 'echo one; (echo two); echo three'`) both in Node
+  (`scripts/wasix-phase0.mjs`, `tests/wasix-phase0.test.mjs`) and in a cross-origin-isolated
+  module Worker (`web/kernel/host.js`, `tests/wasix-browser.spec.js`). The asyncify
   `stack_checkpoint`/`stack_restore` engine and `proc_fork` are working: the parent and child
   each rewind their own snapshot, the child gets pid 0, the parent gets the child pid, and the
-  output is `one`, `two`, `three`. The browser Worker port of the same bridge is the remaining
-  Phase 0 step.
+  output is `one`, `two`, `three`. Asyncify-at-load for arbitrary uploaded modules is the
+  remaining Phase 0 work.
 - **Fork gate:** Wasmer's `stack_checkpoint` captures the used stack, calls
   `asyncify_start_unwind`, and captures the unwind stack after `_start` returns;
   `stack_restore`/`proc_fork` call `asyncify_start_rewind` with a snapshot. The Rust runtime
-  implements this for dash in Node; the owner's “fork must work for any wasm” bar still needs a
-  browser proof and asyncify-at-load for arbitrary modules.
+  implements this for dash in Node and in a browser Worker; the owner's “fork must work for any
+  wasm” bar still needs asyncify-at-load for arbitrary modules.
 - **Runtime language:** the client runtime is Rust→wasm. `crates/client-kernel` runs in the
   SharedWorker (PID/process/cgroup/IPC state); `crates/wasix-runtime` runs in the page host
   (`wasix_32v1` imports, asyncify checkpoint/restore/fork, waker). `web/kernel/host.js` is only
