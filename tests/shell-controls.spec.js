@@ -54,7 +54,7 @@ test('force skips only the minimum password length, preserving identity checks a
   for(const value of ['', 'x'.repeat(513)])expect((await api(f.user, 'passwd',{data:{password:value,current_password:password,force:true}})).status()).toBe(400);
   const cookie=(await f.user.storageState()).cookies.find(c=>c.name==='terminal_session').value;
   await ok(await api(f.user, 'passwd',{data:{password:'1',current_password:password,force:true}}));
-  expect((await(await api(f.guest, 'session',{headers:{Cookie:'terminal_session='+cookie}})).json()).username).toBe('guest');
+  expect((await(await api(f.guest, 'session',{headers:{Cookie:'terminal_session='+cookie}})).json()).username).toMatch(/^guest-[0-9a-f]{16}$/);
   await ok(await api(f.guest, 'login',{data:{username:f.name,password:'1'}}));
   expect((await(await api(f.user, 'session')).json()).username).toBe(f.name);
  }finally{await f.cleanup();}
@@ -91,8 +91,18 @@ test('touch integrates with completion, help, preview and editing extensionless 
  const f=await fixture();try {
   await page.setExtraHTTPHeaders({'CF-Connecting-IP':'touch-ui-'+Date.now()});await page.goto('/');
   await run(page,'su - '+f.name);await page.locator('#password').fill(password);await page.locator('#auth button[type=submit]').click();await expect(page.locator('.lock')).toContainText(f.name);
-  await page.locator('#command').fill('touc');await page.keyboard.press('Tab');await expect(page.locator('#command')).toHaveValue('touch ');
+  // Completion is asynchronous: pressing Tab before its candidates arrive does nothing, so ask
+  // until it completes (the only command beginning "touc" is touch).
+  const command = page.locator('#command');
+  await command.fill('touc');
+  await expect.poll(async () => {
+    if (await command.inputValue() !== 'touch ') await page.keyboard.press('Tab');
+    return command.inputValue();
+  }, { timeout: 15_000, intervals: [250, 500, 1_000] }).toBe('touch ');
   await run(page,'touch README notes.md');
+  await expect.poll(async () => await entry(f.user, f.home + '/README')).not.toBeNull();
+  // The Files keep a directory of their own (7db1224): go where the shell made the file.
+  await page.getByLabel('Location').fill(f.home); await page.getByLabel('Location').press('Enter');
   await expect(page.locator('.filename').filter({hasText:'README'})).toBeVisible();
   await run(page,'vim README');await expect(page.locator('.cm-content')).toBeVisible();await page.locator('.cm-content').fill('hello terminal');await page.keyboard.press('Control+s');await expect(page.locator('#editor-status')).toHaveText('Saved');await page.keyboard.press('Escape');
   await run(page,'touch README');await expect(page.locator('.busy')).toHaveText('↵');

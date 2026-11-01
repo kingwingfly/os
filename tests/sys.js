@@ -343,7 +343,7 @@ export async function program(request, args, { cwd = '/', sudo = false, ...extra
     }
   }
   const status = failure === null ? 200
-    : ['EACCES', 'EPERM'].includes(failure) ? (creds.uid === 65534 ? 401 : 403)
+    : ['EACCES', 'EPERM'].includes(failure) ? (creds.signed_in ? 403 : 401)
     : failure === 'ENOENT' ? 404 : ['EEXIST', 'ENOTEMPTY', 'EISDIR', 'EBUSY'].includes(failure) ? 409 : 400;
   return { status: () => status, ok: () => status === 200, json: async () => ({ errno: failure }), text: async () => failure ?? '' };
 }

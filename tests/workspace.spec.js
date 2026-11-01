@@ -35,7 +35,7 @@ test('manual, large terminal, the dock, prompt/listing colors, icons and keyboar
  await page.setViewportSize({width:1440,height:1000});
  await run(page,'ls');await expect(page.locator('.listing-output .entry-directory').first()).toBeVisible();await expect(page.locator('.listing-output svg').first()).toBeVisible();
  expect(await page.locator('.entry-directory').first().evaluate(e=>getComputedStyle(e).color)).not.toBe(await page.locator('.entry-file').first().evaluate(e=>getComputedStyle(e).color));
- await expect(page.locator('.command-echo .prompt-user').last()).toHaveText('guest');
+ await expect(page.locator('.command-echo .prompt-user').last()).toHaveText(/^guest-[0-9a-f]{16}$/);
  await run(page,'man chmod');await expect(page.locator('.manual h1')).toHaveText('chmod — change permissions');await expect(page.locator('.manual')).toContainText('o+r');
  // Pages have sections; options are a table.
  await expect(page.locator('.manual h2')).toHaveText(['Options','Permissions','Examples','See also']);await expect(page.locator('.manual table td').first()).toHaveText('-R, --recursive');

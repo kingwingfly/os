@@ -121,6 +121,42 @@ feasibility gate; these are its measurements, not built features.
   use compio/io_uring behind the same trait later. The batch is already the submission queue; a
   completion queue is the future-proofing hook.
 
+## Phase 1 findings (2026-11-01)
+
+The kernel split and the first process model are in place; these are built features, not
+roadmap.
+
+- **Client kernel:** `crates/client-kernel` is Rust→wasm, built `--target no-modules` and
+  imported by `web/kernel/client.js`, a classic SharedWorker. It holds the browser's process
+  token table and asks `/api/sys` through the `self.kernelSys` transport that page script
+  installs. `web/kernel/protocol.js` is the page's versioned envelope (`v: 1`, one reply per
+  request id); `web/app.js` starts it at `started()`, and `web/wasi/exec.mjs` asks it for every
+  coreutils process. Two tabs of one browser share the namespace and see each other's pids.
+- **Process registry:** `crates/worker/src/procs.rs` owns `namespaces`, `processes`, `cgroups`
+  and the process token. A namespace is the browser's guest key (`session.<key>` with no guest
+  cookie). `ProcInit` creates PID 1 and the root cgroups; a new boot id reaps what the old one
+  left running as zombies. `Execve` checks with `kernel::executable` (regular, whole, X rule,
+  root's x rule, no setuid), snapshots uid/gid/groups/umask/cgroup, and answers an asset plus a
+  64-hex token. `Fork`, `Exit`, `Wait`, `Kill`, `Getpid`, `ProcPoll` and the `Cgroup*` calls are
+  registry decisions; `/proc/PID/{status,cmdline}` projects them beside job records.
+- **Batch identity:** `abi::Batch` gains `pid` and `proc`. A process's batch runs as the
+  credentials snapshotted at exec, never as the page signed in later; it cannot login, logout,
+  sudo or change the session. Page batches omit both and keep the old meaning.
+- **Guest identity:** signed-out browsers are `guest-<uuid>:guest`, uuid the first 16 hex digits
+  of the cookie key's SHA-256, uid from 1,000,000–1,999,999 (`guests` table, `users` lookup
+  falls back to it), gid `guest`. No home is made; `HOME` is the shared `/guest` (1777 sticky);
+  `/etc/passwd` names guests and `useradd` still makes real accounts and homes. `is_guest_id`
+  distinguishes them wherever code means "signed out", not `uid == GUEST`.
+- **Cgroups:** a cgroup-v2-like hierarchy per namespace (`/init`, `/user`, `/system`, `/cluster`
+  and subtrees), with `cpu.max`, `cpu.weight`, `memory.max`, `pids.max`, `io.max`,
+  `cgroup.freeze` and `devices.allow/deny` stored and checked. Enforcement (CPU slicing,
+  memory limits, freeze at syscall boundaries) is Phase 6.
+- **What is not done yet:** uploaded wasm still answers `ENOEXEC` (Phase 2); descriptors are
+  still the browser session's, not per-process (Phase 4); the WASIX asyncify runtime is not yet
+  wired to `Fork`/`Execve` (Phase 3); there is no pty, init program, GUI device, mount or
+  cluster executor yet.
+
+
 ## Required account semantics
 
 These were explicitly chosen by the owner; do not silently replace them with full Linux semantics.
@@ -133,6 +169,9 @@ These were explicitly chosen by the owner; do not silently replace them with ful
 - Permission checks must never implicitly log guest or a normal account in as root.
 - `passwd --force` skips only the 12-character minimum. It still requires a nonempty password, at most 512 bytes, and normal identity/authorization checks.
 - Account changes revoke old sessions; a self-password change issues a new current session. Locking revokes sessions. Unlocking does not resurrect them.
+- A signed-out browser is `guest-<uuid>:guest`, not the single uid 65534: its uid comes from 1,000,000–1,999,999, it owns what it creates in the shared `/guest`, and no home is made until `useradd -m`. Use `is_guest_id` (never `uid == GUEST`) for "signed out"; `GUEST` remains the group and the fallback identity.
+- A process batch carries `pid` and `proc` (the token `Execve` answered). It runs as the credentials snapshotted at exec, with the process's umask and cgroup; it cannot login, logout, sudo or change the browser session. A page batch carries neither and keeps the old session semantics. Tokens are stored hashed.
+- `execve` requires a regular, whole file and the X permission (root too needs an x bit); setuid/setgid never elevate. `/usr` binaries answer their asset; uploaded wasm answers `ENOEXEC` until Phase 2.
 
 ## UX requirements and fragile areas
 
