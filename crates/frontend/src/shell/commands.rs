@@ -44,6 +44,8 @@ pub static COMMANDS: &[&dyn TerminalCommand] = &[
     &Xargs,
     &Fd,
     &Jobs,
+    &Fg,
+    &Bg,
     &Asking("sudo"),
     &Cd,
     &Pwd,
@@ -171,6 +173,48 @@ impl TerminalCommand for Jobs {
         async move {
             let jobs = cli::parse::<cli::archives::Jobs>(rest(&args))?;
             shell.jobs(jobs.id.as_deref()).await
+        }
+        .boxed_local()
+    }
+}
+
+/// fg: a job of the terminal's, continued in the foreground (shell/jobs.rs).
+struct Fg;
+impl TerminalCommand for Fg {
+    fn name(&self) -> &'static str {
+        "fg"
+    }
+    fn run(
+        &self,
+        shell: Shell,
+        args: Vec<String>,
+        _: Option<String>,
+        _: bool,
+    ) -> LocalBoxFuture<'static, Result<Output, String>> {
+        async move {
+            let fg = cli::parse::<cli::archives::Fg>(rest(&args))?;
+            shell.fg(fg.job.as_deref()).await
+        }
+        .boxed_local()
+    }
+}
+
+/// bg: a stopped job of the terminal's, continued in the background.
+struct Bg;
+impl TerminalCommand for Bg {
+    fn name(&self) -> &'static str {
+        "bg"
+    }
+    fn run(
+        &self,
+        shell: Shell,
+        args: Vec<String>,
+        _: Option<String>,
+        _: bool,
+    ) -> LocalBoxFuture<'static, Result<Output, String>> {
+        async move {
+            let bg = cli::parse::<cli::archives::Bg>(rest(&args))?;
+            shell.bg(bg.job.as_deref())
         }
         .boxed_local()
     }

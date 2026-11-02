@@ -32,6 +32,15 @@ const reap = async (pid, { status, signal }) => {
 const encoder = new TextEncoder();
 // Status of a process killed by a signal: 128 and its number.
 const SIGINT = 130, SIGPIPE = 141;
+// Signals, by Linux's numbers: those that end a process by default, and those that stop and
+// continue one.
+const SIG = { HUP: 1, INT: 2, QUIT: 3, KILL: 9, PIPE: 13, TERM: 15, CONT: 18, STOP: 19, TSTP: 20 };
+const ENDING = new Set([SIG.HUP, SIG.INT, SIG.QUIT, SIG.KILL, SIG.PIPE, SIG.TERM]);
+
+// The processes this tab hosts, by pid: a signal to one, from any tab or device, is told on the
+// page's events line (app.js `terminal:signal`), and the tab that hosts it acts on it.
+const hosted = new Map();
+globalThis.addEventListener?.('terminal:signal', ({ detail }) => hosted.get(detail?.pid)?.signal(detail.signal));
 
 // How many columns the terminal's transcript has, for programs that lay out their output.
 function columns() {
@@ -77,10 +86,14 @@ function terminalInput() {
 // asked now and then (Ctrl+C); onOutput(fd, text), what the last writes to the terminal and any
 // writes to standard error, as they write it; onTty(input), the terminal's input
 // ({write(text), eof()}) while the pipeline may read it, and null after; onReading(), as the
-// first waits on it}. The last's exit status, and what it wrote if not to the terminal.
+// first waits on it; onJob(group), the pipeline's process group as it starts: {pids, signal(n),
+// stoppable}, by which the shell stops, continues and ends it; onState(state), 'stopped' once
+// every process of it is, 'running' as one goes on}. The last's exit status, and what it wrote
+// if not to the terminal.
 export async function exec(stages, options = {}) {
   const { cwd = '/', home = '/', user = 'guest', stdin = null, sudo = false, umask = 0o022, tty = false, enough = null,
-    cancelled = () => false, onOutput = () => {}, onTty = () => {}, onReading = () => {} } = options;
+    cancelled = () => false, onOutput = () => {}, onTty = () => {}, onReading = () => {}, onJob = () => {},
+    onState = () => {} } = options;
   const env = piped => ({
     PWD: cwd, HOME: home, USER: user, LOGNAME: user, PATH: '/usr/bin', SHELL: '/usr/bin/sh', LANG: 'C.UTF-8',
     TERM: piped ? 'dumb' : 'xterm-256color', COLUMNS: String(columns()),
@@ -96,6 +109,24 @@ export async function exec(stages, options = {}) {
   let stopStatus = SIGINT;
   // Stop every process still running, as `status` would end it.
   const stop = status => { stopped = true; stopStatus = status; for (const process of processes) process.kill(status); };
+  // The pipeline as a process group: a signal to it is to each of its processes; one that ends
+  // a process ends the pipeline. Stopping needs memory shared with the processes.
+  const group = {
+    get pids() { return processes.map(process => process.pid); },
+    stoppable: !!isolated,
+    signal: signal => {
+      if (ENDING.has(signal)) return stop(128 + signal);
+      for (const process of processes) process.signal(signal);
+    },
+  };
+  // Stopped once every process still running is; running as one goes on.
+  let state = 'running';
+  const changed = () => {
+    const live = processes.filter(process => !process.ended);
+    const now = live.length && live.every(process => process.stopped) ? 'stopped' : 'running';
+    if (now !== state) { state = now; onState(now); }
+  };
+  onJob(group);
   // What a process writes when not to the terminal: the next one's, or the last's reader's,
   // which may want only so much.
   const collect = (text, isLast) => {
@@ -133,11 +164,17 @@ export async function exec(stages, options = {}) {
       worker = new Worker('/wasi-process.js');
       let settle, status = null;
       const exited = new Promise(resolve => { settle = resolve; });
+      // The word that stops it, set by SIGSTOP and SIGTSTP, cleared by SIGCONT.
+      const control = isolated ? new Int32Array(new SharedArrayBuffer(4)) : null;
+      const process = { stopped: false, ended: false };
       const write = (fd, text) => { if (!text) return; if (fd === 1 && !io.stdout.tty) collect(text, index === last); else onOutput(fd, text); };
       const end = code => {
         if (status != null) return;
         status = code;
+        process.ended = true;
+        hosted.delete(image.pid);
         worker.terminate();
+        changed();
         // What a killed process leaves open, its pipes, closes as it goes.
         io.stdin.reader?.closeReader(); io.stdout.writer?.closeWriter();
         for (const fd of [1, 2]) write(fd, decoders[fd].decode());
@@ -149,12 +186,23 @@ export async function exec(stages, options = {}) {
       worker.onmessage = ({ data }) => {
         if (data.out) write(data.fd, decoders[data.fd].decode(data.out, { stream: true }));
         else if (data.reading) onReading();
+        else if (data.stopped || data.continued) { process.stopped = !!data.stopped; changed(); }
         else if (data.truncated) truncated = true;
         else if ('exit' in data) end(data.exit);
       };
       worker.onerror = event => { onOutput(2, `${argv[0]}: ${event.message}\n`); end(126); };
-      worker.postMessage({ module, memory, argv, env: environment, umask, sudo, pid: image.pid, proc: image.token, stdin: io.stdin.message, stdout: io.stdout.message, stderr: { tty: true } });
-      const process = { pid: image.pid, kill: end, exited };
+      worker.postMessage({ module, memory, argv, env: environment, umask, sudo, pid: image.pid, proc: image.token, stdin: io.stdin.message, stdout: io.stdout.message, stderr: { tty: true }, control: control?.buffer });
+      // A signal, as its default action has it: ended, stopped at its next system call, or
+      // continued.
+      const signal = number => {
+        if (ENDING.has(number)) return end(128 + number);
+        if (!control) return;
+        // Stopped: one asleep on its word wakes to stop.
+        if (number === SIG.STOP || number === SIG.TSTP) { Atomics.store(control, 0, 1); Atomics.notify(control, 0); }
+        else if (number === SIG.CONT) { Atomics.store(control, 0, 0); Atomics.notify(control, 0); }
+      };
+      Object.assign(process, { pid: image.pid, kill: end, exited, signal });
+      hosted.set(image.pid, process);
       processes.push(process);
       return process;
     } catch (error) {

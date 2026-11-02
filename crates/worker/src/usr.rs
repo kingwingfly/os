@@ -11,7 +11,8 @@
 //! Here the bit says, rather than grants: the page cannot be trusted with a setuid program, so
 //! the kernel's calls hold each one's policy. uutils' utilities the terminal has none of its own
 //! for are links to their binary, `coreutils` (wasm32-wasip1, run by the page's WASI engine), as
-//! busybox installs its own. The shell's builtins (cd, exit, logout, jobs, help) are not there.
+//! busybox installs its own. The shell's builtins (cd, exit, logout, jobs, fg, bg, help) are not
+//! there.
 //!
 //! The store answers for these names itself (db.rs), so that the kernel resolves, lists, stats
 //! and permits them as it does any; changing any of them fails with EROFS (sys.rs).
@@ -41,7 +42,7 @@ pub fn size(content: &str) -> u64 {
 /// What the build says of the binaries: their sizes (scripts/build.mjs).
 pub const MANIFEST: &str = "/usr/manifest.json";
 /// The shell's builtins, which no file is.
-const BUILTINS: &[&str] = &["cd", "exit", "logout", "jobs", "help"];
+const BUILTINS: &[&str] = &["cd", "exit", "logout", "jobs", "fg", "bg", "help"];
 /// The programs setuid root.
 const SETUID: &[&str] = &["passwd", "su", "sudo", "useradd", "userdel"];
 /// The inodes of /usr, above any the store numbers.

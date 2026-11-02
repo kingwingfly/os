@@ -9,6 +9,16 @@ pub struct Word {
     pub pattern: Option<String>,
 }
 
+/// The line `line` without its last `&`, if that runs it in the background, as a shell's job:
+/// an `&` at its end, outside quotes. `&&`, and an `&` alone, are not.
+pub fn background(line: &str) -> Option<&str> {
+    let stripped = line.trim_end().strip_suffix('&')?.trim_end();
+    if stripped.is_empty() || stripped.ends_with('&') || words(line).is_ok() {
+        return None;
+    }
+    words(stripped).is_ok().then_some(stripped)
+}
+
 /// The stages of the pipeline `input`, each its words with their patterns, quoted as
 /// [`crate::split_command`] quotes them. An unquoted `|` separates stages; the shell's other
 /// operators are refused rather than taken as words.
@@ -282,6 +292,18 @@ mod tests {
             .into_iter()
             .map(|stage| stage.into_iter().map(|word| word.text).collect())
             .collect())
+    }
+
+    #[test]
+    fn an_ampersand_at_the_end_runs_a_line_in_the_background() {
+        assert_eq!(background("coreutils sleep 3 &"), Some("coreutils sleep 3"));
+        assert_eq!(background("seq 3 | tr 1 x&  "), Some("seq 3 | tr 1 x"));
+        // Quoted or escaped, it is text; doubled, or alone, it is no job.
+        assert_eq!(background("echo 'a &'"), None);
+        assert_eq!(background("echo a\\&"), None);
+        assert_eq!(background("a &&"), None);
+        assert_eq!(background("&"), None);
+        assert_eq!(background("ls"), None);
     }
 
     #[test]

@@ -185,6 +185,7 @@ impl TerminalAuthority {
         // signed out is a session all the same (auth::sid), which a driver's news may be for.
         let key = auth::token_key(req);
         let guest = auth::guest_key(req);
+        let ns = db::Db::namespace(key.as_deref(), guest.as_deref());
         let (uid, sid) = transact(&self.state, {
             let key = key.clone();
             move |db| {
@@ -197,6 +198,7 @@ impl TerminalAuthority {
             session: key.filter(|_| uid.is_some()),
             uid,
             sid,
+            ns: Some(ns),
             follows: Vec::new(),
         })?;
         if self.state.get_websocket_auto_response().is_none()
@@ -378,6 +380,7 @@ impl TerminalAuthority {
                 let theirs = match &whom {
                     db::Told::Account(owner) => line.uid == Some(*owner) && *uid == Some(*owner),
                     db::Told::Session(sid) => line.sid.as_deref() == Some(sid.as_str()),
+                    db::Told::Namespace(ns) => line.ns.as_deref() == Some(ns.as_str()),
                 };
                 if theirs {
                     let _ = ws.send_with_str(message.to_string());
@@ -696,6 +699,10 @@ struct Line {
     uid: Option<u32>,
     #[serde(default)]
     sid: Option<String>,
+    /// The browser's process namespace, whose processes its tabs host: a signal to one of them
+    /// is told on it.
+    #[serde(default)]
+    ns: Option<String>,
     #[serde(default)]
     follows: Vec<String>,
 }

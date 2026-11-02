@@ -28,13 +28,14 @@ export class Pipe {
   changed() { Atomics.add(this.state, CHANGES, 1); Atomics.notify(this.state, CHANGES); }
 
   // Read at most `count` bytes, waiting for some: none at the end, or where Ctrl+D ended a read.
-  read(count) {
+  // `meanwhile`, if given, is called now and then as it waits (a stop to heed).
+  read(count, meanwhile) {
     for (;;) {
       const seen = Atomics.load(this.state, CHANGES), queued = this.queued;
       if (queued > 0) return this.take(Math.min(count, queued));
       if (this.ending) { Atomics.sub(this.state, EOF, 1); return new Uint8Array(0); }
       if (this.writerGone) return new Uint8Array(0);
-      Atomics.wait(this.state, CHANGES, seen);
+      if (Atomics.wait(this.state, CHANGES, seen, meanwhile ? 200 : Infinity) === 'timed-out') meanwhile?.();
     }
   }
   // Whether a read would wait; whether one is to end with nothing (Ctrl+D) before more is read.

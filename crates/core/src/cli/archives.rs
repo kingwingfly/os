@@ -198,10 +198,12 @@ impl Manual for Faststart {
 
 /// list processes and this browser's unfinished uploads
 ///
-/// Lists your processes (zip, unzip, tar and faststart, as ps does) and the files this browser
-/// is writing (uploads and recordings, by their descriptors, fdN), with their state and
-/// progress. Processes go on when their tab or the page closes. jobs cancel ID stops one: a
-/// process by the first characters of its PID, a descriptor as fdN, which closes it.
+/// Lists the terminal's own jobs (pipelines of /usr/bin run with &, or stopped with Ctrl+Z: %N,
+/// which fg, bg and kill take), your processes (zip, unzip, tar and faststart, as ps does) and
+/// the files this browser is writing (uploads and recordings, by their descriptors, fdN), with
+/// their state and progress. Processes go on when their tab or the page closes. jobs cancel ID
+/// stops one: a process by the first characters of its PID, a descriptor as fdN, which closes
+/// it.
 #[derive(Parser, Debug)]
 #[command(name = "jobs", override_usage = "jobs\n       jobs cancel ID")]
 pub struct Jobs {
@@ -218,6 +220,42 @@ impl Manual for Jobs {
         ("jobs cancel fd3", "stop an upload, or a recording"),
     ];
     const SEE: &'static [&'static str] = &["zip", "unzip", "tar", "upload"];
+}
+
+/// bring a job to the foreground
+///
+/// Continues the terminal's job JOB (%N, as jobs lists it; the latest if none) in the
+/// foreground: its output shows, the terminal's input is its, Ctrl+C ends it, and Ctrl+Z stops
+/// it again.
+#[derive(Parser, Debug)]
+#[command(name = "fg")]
+pub struct Fg {
+    #[arg(value_name = "JOB")]
+    pub job: Option<String>,
+}
+impl Manual for Fg {
+    const SECTION: Section = Section::Archives;
+    const EXAMPLES: &'static [(&'static str, &'static str)] =
+        &[("fg", "the latest job"), ("fg %2", "job 2")];
+    const SEE: &'static [&'static str] = &["bg", "jobs", "kill"];
+}
+
+/// continue a job in the background
+///
+/// Continues the terminal's stopped job JOB (%N, as jobs lists it; the latest if none) in the
+/// background, as if it had been started with &: its output still shows, and the terminal's
+/// input is the shell's.
+#[derive(Parser, Debug)]
+#[command(name = "bg")]
+pub struct Bg {
+    #[arg(value_name = "JOB")]
+    pub job: Option<String>,
+}
+impl Manual for Bg {
+    const SECTION: Section = Section::Archives;
+    const EXAMPLES: &'static [(&'static str, &'static str)] =
+        &[("bg", "the latest job"), ("bg %1", "job 1")];
+    const SEE: &'static [&'static str] = &["fg", "jobs", "kill"];
 }
 
 /// list the account's processes
@@ -237,18 +275,35 @@ impl Manual for Ps {
     const SEE: &'static [&'static str] = &["kill", "jobs"];
 }
 
-/// stop a process
+/// signal a process
 ///
-/// Signals each process named by its PID (or the start of it, as ps shows it), which stops
-/// between steps: what it wrote is kept. Yours, or anyone's as root.
+/// Sends each process named by its PID (or the start of it, as ps shows it), or each job the
+/// terminal runs (%N, as jobs lists it), a signal: TERM, unless another is named. TERM, INT,
+/// HUP, QUIT, PIPE and KILL end a process; STOP and TSTP stop it at its next system call, and
+/// CONT continues it. An archive process stops between steps, keeping what it wrote. Yours, or
+/// anyone's as root.
 #[derive(Parser, Debug)]
-#[command(name = "kill")]
+#[command(
+    name = "kill",
+    override_usage = "kill [-s SIGNAL | -SIGNAL] PID|%JOB...\n       kill -l"
+)]
 pub struct Kill {
-    #[arg(value_name = "PID", required = true)]
+    /// the signal to send, by name (TERM, SIGTERM) or number (15); -SIGNAL says it too
+    #[arg(short = 's', long = "signal", value_name = "SIGNAL")]
+    pub signal: Option<String>,
+    /// list the signals' names
+    #[arg(short = 'l', long = "list")]
+    pub list: bool,
+    #[arg(value_name = "PID", required_unless_present = "list")]
     pub pids: Vec<String>,
 }
 impl Manual for Kill {
     const SECTION: Section = Section::Archives;
-    const EXAMPLES: &'static [(&'static str, &'static str)] = &[("kill 3fa9", "stop it")];
-    const SEE: &'static [&'static str] = &["ps", "jobs"];
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("kill 3fa9", "end it"),
+        ("kill %1", "end the terminal's job 1"),
+        ("kill -STOP 7", "stop process 7; kill -CONT 7 continues it"),
+        ("kill -l", "the signals"),
+    ];
+    const SEE: &'static [&'static str] = &["ps", "jobs", "fg", "bg"];
 }

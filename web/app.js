@@ -126,6 +126,9 @@ function listen() {
     // This page's session ended elsewhere, not by its own sign in or out: it is a guest's now.
     if (message.session === 'ended') { if (!changingSession) void identityChanged('ended'); return; }
     if (message.present) { presented(message.present); return; }
+    // A signal to a process of this browser's namespace: the tab that hosts it acts on it
+    // (web/wasi/exec.mjs).
+    if (message.signal) { window.dispatchEvent(new CustomEvent('terminal:signal', { detail: message.signal })); return; }
     // A live sound, or a listener's voice, started in a presentation this page follows or
     // presents; listeners asking to speak, and the answers to this page's ask.
     if (message.sound) { soundStarted(message.sound); return; }

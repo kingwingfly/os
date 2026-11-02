@@ -177,6 +177,38 @@ pub const SIGCHLD: u8 = 17;
 pub const SIGCONT: u8 = 18;
 pub const SIGSTOP: u8 = 19;
 pub const SIGTSTP: u8 = 20;
+/// The signals by name, in number order, as `kill -l` lists them.
+pub const SIGNALS: [(u8, &str); 10] = [
+    (SIGHUP, "HUP"),
+    (SIGINT, "INT"),
+    (SIGQUIT, "QUIT"),
+    (SIGKILL, "KILL"),
+    (SIGPIPE, "PIPE"),
+    (SIGTERM, "TERM"),
+    (SIGCHLD, "CHLD"),
+    (SIGCONT, "CONT"),
+    (SIGSTOP, "STOP"),
+    (SIGTSTP, "TSTP"),
+];
+/// The signal `name` names: by its name, with or without SIG, in any case, or its number.
+pub fn signal_named(name: &str) -> Option<u8> {
+    if let Ok(number) = name.parse::<u8>() {
+        return SIGNALS.iter().find(|(n, _)| *n == number).map(|(n, _)| *n);
+    }
+    let upper = name.to_ascii_uppercase();
+    let bare = upper.strip_prefix("SIG").unwrap_or(&upper);
+    SIGNALS
+        .iter()
+        .find(|(_, signal)| *signal == bare)
+        .map(|(n, _)| *n)
+}
+/// The name of the signal `number`, without SIG.
+pub fn signal_name(number: u8) -> Option<&'static str> {
+    SIGNALS
+        .iter()
+        .find(|(n, _)| *n == number)
+        .map(|(_, name)| *name)
+}
 
 /// A process's state, as /proc/PID/status tells it: running, sleeping in a system call, stopped
 /// by a signal, or a zombie whose parent has not waited for it.
@@ -1067,6 +1099,11 @@ mod tests {
                 seat: None,
             }
         );
+        assert_eq!(signal_named("SIGTSTP"), Some(SIGTSTP));
+        assert_eq!(signal_named("kill"), Some(SIGKILL));
+        assert_eq!(signal_named("15"), Some(SIGTERM));
+        assert_eq!(signal_named("BOGUS"), None);
+        assert_eq!(signal_name(SIGCONT), Some("CONT"));
         let batch: Batch =
             serde_json::from_str(r#"{"calls":["getpid"],"proc":"ab","pid":7}"#).unwrap();
         assert_eq!(batch.process.as_deref(), Some("ab"));

@@ -724,6 +724,11 @@ fn run(
             let target: u32 = target.parse().unwrap_or_default();
             let signal = signal.unwrap_or(abi::SIGTERM);
             db.kill(&ns, &process.cred, target, signal, now)?;
+            // The tab that hosts it acts on it (web/wasi/exec.mjs): it is told on its line.
+            db.tell(
+                crate::db::Told::Namespace(ns.clone()),
+                json!({ "signal": { "pid": target, "signal": signal } }),
+            );
             return Ok(serde_json::Value::Null);
         }
         Call::Wait { pid: target, .. } if target.parse::<u32>().is_ok() => {

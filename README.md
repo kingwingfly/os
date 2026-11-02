@@ -357,6 +357,17 @@ uutils' run as processes of their own in the page's WASI engine (`web/wasi/`). T
 
 A pipeline's processes run at once, each one's output the next one's input through a pipe: 64 KiB of memory the page and its processes share (`web/wasi/pipe.js`), where a reader waits while it is empty and a writer while it is full. A write to a pipe whose reader has gone ends its process, as SIGPIPE does (status 141), so `yes | head -n 3` ends at once: the terminal's `head` closes its input once it has its lines, as GNU head does. What the last writes shows in the transcript as it is written, and so do errors, a line at a time. The first reads the terminal, unless given its input: the command line then says `Input ↵`, a line typed goes to it (echoed, and kept out of the history), Ctrl+D ends a read (after what is typed, if anything is), and Ctrl+C kills the pipeline. Sharing memory needs a page isolated from other sites (`web/_headers`: `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: credentialless`, which lets other sites' images load without cookies); where a browser does not isolate it (Safari has no `credentialless`), the processes run one after another, each given what the one before wrote, and nothing reads the terminal. A pipeline joining the terminal's own programs passes text between stages as before. The terminal's own programs run in the page itself, which draws what they give (`ls`'s listing, its icons, colours and uploads' progress) rather than text.
 
+**Job control.** The pipeline's processes are a process group, and the terminal keeps jobs as a shell does.
+- **Background:** a line ending in `&` runs as a job in the background and says `[N] PID`. What it writes still shows, its end says how it ended (`Done`, `Exit N`, `Terminated`…), and it reads nothing of the terminal. Only programs of `/usr/bin`, or uploaded ones, run so.
+- **Ctrl+Z:** it stops the pipeline in the foreground, which becomes a job, `Stopped`.
+- **Commands:**
+  - `jobs` lists the jobs first.
+  - `fg [%N]` continues one in the foreground, the terminal's input its own again.
+  - `bg [%N]` continues one in the background.
+  - `kill [-s SIGNAL | -SIGNAL] PID|%N` sends a signal, and `kill -l` names them.
+- **Signals:** a signal reaches the process wherever it runs, from any tab or device of the browser. The kernel records it (`ps` shows a stopped process as `T`) and tells the browser's pages on their events line; the tab that hosts the process acts on it.
+- **What signals do:** TERM, INT, HUP, QUIT, PIPE and KILL end a process. STOP and TSTP stop it at its next system call (a sleep wakes to stop, and a blocked read heeds a stop within a fifth of a second), and CONT continues it. A loop that makes no system call can only be ended. Stopping needs memory the page shares with its processes, so it needs an isolated page.
+
 A name runs the terminal's program, or uutils' where it has none; `/usr/bin/NAME`, and `/bin/NAME`, `/sbin/NAME` and `/usr/sbin/NAME` through the links, run what NAME does, and `coreutils NAME` uutils' NAME whatever the terminal has. `help` lists uutils'; `NAME --help` tells how to use one. A typed path with a slash (`./prog`) execs the file it names, as on Linux (below).
 
 ### The client kernel
