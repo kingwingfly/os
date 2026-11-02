@@ -86,8 +86,9 @@ export async function exec(stages, options = {}) {
   // shares, where the page may share it; else the page ends it).
   const closed = isolated && enough != null && !tty ? new Int32Array(new SharedArrayBuffer(4)) : null;
   const processes = [];
+  let stopStatus = SIGINT;
   // Stop every process still running, as `status` would end it.
-  const stop = status => { stopped = true; for (const process of processes) process.kill(status); };
+  const stop = status => { stopped = true; stopStatus = status; for (const process of processes) process.kill(status); };
   // What a process writes when not to the terminal: the next one's, or the last's reader's,
   // which may want only so much.
   const collect = (text, isLast) => {
@@ -99,49 +100,76 @@ export async function exec(stages, options = {}) {
     if (closed) Atomics.store(closed, 0, 1);
     else stop(SIGPIPE);
   };
+  // A process made for a stage whose pipeline ends before the stage starts runs no image: it
+  // exits as a hostless process would, and is reaped, so that no process is left in the
+  // registry. The stage's place in the pipeline takes the status that ended it.
+  const abandon = async image => {
+    try {
+      await kernelCall('exit', { pid: image.pid, status: 126 });
+      await kernelCall('wait', { pid: image.pid });
+    } catch {
+      // Killed, or already reaped: nothing left to do.
+    }
+  };
   const start = async (index, io) => {
     const stage = stages[index], argv = stage.argv ?? stage;
     const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
     const environment = env(!io.stdout.tty);
-    // execve: the worker kernel checks the image and snapshots the credentials; the process's
-    // token goes with each batch the host makes for it. A stage may name its own image (an
-    // uploaded wasm); the loader compiles it once per content.
-    const image = await kernelCall('exec', {
-      path: stage.path ?? COREUTILS,
-      argv,
-      env: Object.entries(environment).map(([name, value]) => `${name}=${value}`),
-      cwd,
-    }).catch(error => { throw refused(argv[0], error); });
-    const module = await load(image).catch(error => { throw refused(argv[0], error); });
-    const worker = new Worker('/wasi-process.js');
-    let settle, status = null;
-    const exited = new Promise(resolve => { settle = resolve; });
-    const write = (fd, text) => { if (!text) return; if (fd === 1 && !io.stdout.tty) collect(text, index === last); else onOutput(fd, text); };
-    const end = code => {
-      if (status != null) return;
-      status = code;
-      worker.terminate();
-      // What a killed process leaves open, its pipes, closes as it goes.
-      io.stdin.reader?.closeReader(); io.stdout.writer?.closeWriter();
-      for (const fd of [1, 2]) write(fd, decoders[fd].decode());
-      // exit(2), then wait for it: the registry reaps the zombie at once, as init would.
-      const signal = code >= 128 ? code - 128 : undefined;
-      kernelCall('exit', { pid: image.pid, status: code, signal })
-        .then(() => kernelCall('wait', { pid: image.pid }))
-        .catch(() => { /* it may have ended already */ });
-      settle(code);
-    };
-    worker.onmessage = ({ data }) => {
-      if (data.out) write(data.fd, decoders[data.fd].decode(data.out, { stream: true }));
-      else if (data.reading) onReading();
-      else if (data.truncated) truncated = true;
-      else if ('exit' in data) end(data.exit);
-    };
-    worker.onerror = event => { onOutput(2, `${argv[0]}: ${event.message}\n`); end(126); };
-    worker.postMessage({ module, argv, env: environment, umask, sudo, pid: image.pid, proc: image.token, stdin: io.stdin.message, stdout: io.stdout.message, stderr: { tty: true } });
-    const process = { pid: image.pid, kill: end, exited };
-    processes.push(process);
-    return process;
+    let image, worker;
+    try {
+      // execve: the worker kernel checks the image and snapshots the credentials; the process's
+      // token goes with each batch the host makes for it. A stage may name its own image (an
+      // uploaded wasm); the loader compiles it once per content.
+      image = await kernelCall('exec', {
+        path: stage.path ?? COREUTILS,
+        argv,
+        env: Object.entries(environment).map(([name, value]) => `${name}=${value}`),
+        cwd,
+        sudo,
+      }).catch(error => { throw refused(argv[0], error); });
+      if (stopped) return await canceled(image);
+      const { module, memory } = await load(image).catch(error => { throw refused(argv[0], error); });
+      if (stopped) return await canceled(image);
+      worker = new Worker('/wasi-process.js');
+      let settle, status = null;
+      const exited = new Promise(resolve => { settle = resolve; });
+      const write = (fd, text) => { if (!text) return; if (fd === 1 && !io.stdout.tty) collect(text, index === last); else onOutput(fd, text); };
+      const end = code => {
+        if (status != null) return;
+        status = code;
+        worker.terminate();
+        // What a killed process leaves open, its pipes, closes as it goes.
+        io.stdin.reader?.closeReader(); io.stdout.writer?.closeWriter();
+        for (const fd of [1, 2]) write(fd, decoders[fd].decode());
+        // exit(2), then wait for it: the registry reaps the zombie at once, as init would.
+        const signal = code >= 128 ? code - 128 : undefined;
+        kernelCall('exit', { pid: image.pid, status: code, signal })
+          .then(() => kernelCall('wait', { pid: image.pid }))
+          .catch(() => { /* it may have ended already */ });
+        settle(code);
+      };
+      worker.onmessage = ({ data }) => {
+        if (data.out) write(data.fd, decoders[data.fd].decode(data.out, { stream: true }));
+        else if (data.reading) onReading();
+        else if (data.truncated) truncated = true;
+        else if ('exit' in data) end(data.exit);
+      };
+      worker.onerror = event => { onOutput(2, `${argv[0]}: ${event.message}\n`); end(126); };
+      worker.postMessage({ module, memory, argv, env: environment, umask, sudo, pid: image.pid, proc: image.token, stdin: io.stdin.message, stdout: io.stdout.message, stderr: { tty: true } });
+      const process = { pid: image.pid, kill: end, exited };
+      processes.push(process);
+      return process;
+    } catch (error) {
+      // Whatever was made for the stage ends here: no process may outlive a host that never
+      // started, and none may wait for the next boot to be reaped.
+      worker?.terminate();
+      if (image) await abandon(image);
+      throw error;
+    }
+  };
+  const canceled = async image => {
+    await abandon(image);
+    return { pid: image.pid, kill: () => {}, exited: Promise.resolve(stopStatus) };
   };
   const watch = setInterval(() => { if (cancelled()) stop(SIGINT); }, 100);
   const statuses = [];
@@ -162,8 +190,19 @@ export async function exec(stages, options = {}) {
           stdout: to ? { message: { pipe: to }, writer: new Pipe(to) } : { message: { tty, closed: closed?.buffer }, tty },
         }));
       }
-      await Promise.all(starting);
-      statuses.push(...await Promise.all(processes.map(process => process.exited)));
+      let started;
+      try {
+        started = await Promise.all(starting);
+      } catch (error) {
+        // A stage that failed ends the pipeline: stop the ones running, and wait for the ones
+        // still being given a process to abandon theirs, so nothing outlives this run.
+        stop(SIGINT);
+        await Promise.allSettled(starting);
+        throw error;
+      }
+      // Each stage's status is its own, whatever order the processes end in.
+      const exited = await Promise.all(started.map(process => process.exited));
+      started.forEach((_, index) => { statuses[index] = exited[index]; });
     } else {
       // One after another, each given what the one before wrote.
       let given = stdin ?? '';

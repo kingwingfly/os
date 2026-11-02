@@ -735,10 +735,21 @@ pub fn by_token(
         .and_then(|file| db.file(file))
         .filter(File::complete)
         .ok_or(Errno::EBADF)?;
-    let permitted = db
-        .showing(&file.id)
-        .iter()
-        .any(|path| db.access(&who, path, mask).is_ok());
+    let permitted = {
+        let paths = db.showing(&file.id);
+        if mask == terminal_worker_core::permissions::EXEC {
+            // The kernel's X rule, not Identity::allows: root too needs an x bit, so a chmod
+            // from 0755 to 0644 revokes the image for root as it does for anyone else.
+            paths.iter().any(|path| {
+                kernel::namei(db, &who, path, true)
+                    .ok()
+                    .and_then(|name| name.node)
+                    .is_some_and(|node| kernel::permission(&who, &node, mask))
+            })
+        } else {
+            paths.iter().any(|path| db.access(&who, path, mask).is_ok())
+        }
+    };
     if !permitted {
         return Err(Errno::EACCES.into());
     }

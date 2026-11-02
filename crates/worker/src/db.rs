@@ -32,9 +32,9 @@ extern "C" {
 const ROLLBACK: &str = "rollback";
 
 /// The version of the tables below, which local state made by an older one does not have.
-pub const SCHEMA_VERSION: &str = "5";
+pub const SCHEMA_VERSION: &str = "6";
 
-const SCHEMA: [&str; 35] = [
+const SCHEMA: [&str; 36] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
@@ -67,6 +67,7 @@ const SCHEMA: [&str; 35] = [
     "CREATE INDEX IF NOT EXISTS fds_token ON fds(token)",
     "CREATE INDEX IF NOT EXISTS fds_device ON fds(device)",
     "CREATE INDEX IF NOT EXISTS fds_file ON fds(file)",
+    "CREATE INDEX IF NOT EXISTS fds_proc ON fds(proc)",
     // Directories a session watches (inotify), by its watch numbers: what changes in them is
     // told on its lines of the events socket.
     "CREATE TABLE IF NOT EXISTS watches(sid TEXT NOT NULL, wd INTEGER NOT NULL, path TEXT NOT NULL, mask INTEGER NOT NULL, PRIMARY KEY(sid, wd))",
@@ -251,14 +252,6 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     if sql.exec("SELECT root FROM fds LIMIT 0", None).is_err() {
         sql.exec(
             "ALTER TABLE fds ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
-            None,
-        )?;
-    }
-    // Descriptors made before processes had their own belong to their session alone.
-    if sql.exec("SELECT proc FROM fds LIMIT 0", None).is_err() {
-        sql.exec("ALTER TABLE fds ADD COLUMN proc TEXT", None)?;
-        sql.exec(
-            "ALTER TABLE fds ADD COLUMN exec INTEGER NOT NULL DEFAULT 0",
             None,
         )?;
     }
@@ -945,9 +938,10 @@ impl Db {
             fd: u32,
         }
         let prefix = format!("{ns} ");
+        let upper = format!("{prefix}\u{10ffff}");
         let owned = self.rows::<Owned>(
-            "SELECT sid, fd FROM fds WHERE substr(proc, 1, ?) = ?",
-            vec![int(prefix.len()), text(&prefix)],
+            "SELECT sid, fd FROM fds WHERE proc >= ? AND proc < ?",
+            vec![text(&prefix), text(&upper)],
         );
         for owned in owned {
             self.close_fd(&owned.sid, owned.fd);

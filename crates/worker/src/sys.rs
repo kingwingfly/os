@@ -236,8 +236,9 @@ impl Session {
     ) -> std::result::Result<(Process, Option<String>, Option<String>), Error> {
         let (process, proc) = match self.token.as_deref() {
             Some(token) => {
+                let ns = Db::namespace(self.key.as_deref(), self.guest.as_deref());
                 let row = db
-                    .process_token(token, self.pid)
+                    .process_token(token, self.pid, &ns)
                     .ok_or_else(|| Error::because(Errno::EPERM, "not this process's token"))?;
                 let proc = format!("{} {}", row.ns, row.pid);
                 (
@@ -573,7 +574,7 @@ fn run(
     let ns = Db::namespace(key, guest);
     let caller = match token {
         Some(token) => Some(
-            db.process_token(token, pid)
+            db.process_token(token, pid, &ns)
                 .ok_or_else(|| Error::because(Errno::EPERM, "not this process's token"))?,
         ),
         None => None,
@@ -608,7 +609,15 @@ fn run(
             cwd,
             cgroup,
         } => {
-            let target = caller.as_ref().map(|row| row.pid).or(target);
+            // A process cannot replace itself: the page host would keep the old process token
+            // and could never exit or wait the new image. The client kernel execs a new process
+            // (or a child); process-side execve comes with the fork/exec handshake in Phase 3.
+            if caller.is_some() {
+                return Err(Error::because(
+                    Errno::EPERM,
+                    "a process cannot replace itself; the client kernel must execve a new process",
+                ));
+            }
             let exec = db.execve(
                 &ns,
                 sid,

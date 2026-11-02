@@ -78,7 +78,8 @@ impl Kernel {
     }
 
     /// execve: ask the worker kernel for the image at `path`, run as this browser's account.
-    /// `argv`, `env` and `pids` are JSON arrays; `cgroup` is empty for the default.
+    /// `argv`, `env` and `pids` are JSON arrays; `cgroup` is empty for the default; `sudo`
+    /// snapshots root for the new process, once the page has authenticated it.
     pub async fn exec(
         &self,
         path: &str,
@@ -86,10 +87,11 @@ impl Kernel {
         env: &str,
         cwd: &str,
         cgroup: &str,
+        sudo: bool,
     ) -> Result<String, JsValue> {
         let argv: Vec<String> = parse(argv, "argv")?;
         let env: Vec<String> = parse(env, "env")?;
-        let value = one(
+        let value = one_as(
             vec![Call::Execve {
                 pid: None,
                 path: path.into(),
@@ -100,6 +102,7 @@ impl Kernel {
             }],
             None,
             None,
+            sudo,
         )
         .await?;
         let exec: Exec = from_value(value, "execve")?;
@@ -247,7 +250,16 @@ async fn one(
     pid: Option<u32>,
     token: Option<&str>,
 ) -> Result<serde_json::Value, JsValue> {
-    let results = sys(calls, pid, token).await.map_err(fail)?;
+    one_as(calls, pid, token, false).await
+}
+
+async fn one_as(
+    calls: Vec<Call>,
+    pid: Option<u32>,
+    token: Option<&str>,
+    sudo: bool,
+) -> Result<serde_json::Value, JsValue> {
+    let results = sys(calls, pid, token, sudo).await.map_err(fail)?;
     match results.into_iter().next() {
         Some(Return::Ok(value)) => Ok(value),
         Some(Return::Err(error)) => Err(fail(error)),
@@ -262,11 +274,12 @@ async fn sys(
     calls: Vec<Call>,
     pid: Option<u32>,
     token: Option<&str>,
+    sudo: bool,
 ) -> std::result::Result<Vec<Return>, Error> {
     let batch = Batch {
         calls,
         umask: 0o022,
-        sudo: false,
+        sudo,
         pid,
         process: token.map(str::to_string),
     };

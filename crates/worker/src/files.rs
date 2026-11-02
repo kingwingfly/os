@@ -160,13 +160,18 @@ async fn by_token(
         return Ok(Err(asked));
     }
     let grant: Value = asked.json().await?;
-    TOKENS.with(|tokens| {
-        let mut tokens = tokens.borrow_mut();
-        if tokens.len() > 4096 {
-            tokens.retain(|_, (_, at, _)| now < *at + abi::TOKEN_FRESH);
-        }
-        tokens.insert(token.to_string(), (session, now, grant.clone()));
-    });
+    // An exec image's leave dies with its process descriptor. Caching it for TOKEN_FRESH would
+    // keep serving the image after exit/kill/wait closed the descriptor; only read tokens,
+    // whose lifetime already includes that grace, are cached.
+    if grant["exec"].as_bool() != Some(true) {
+        TOKENS.with(|tokens| {
+            let mut tokens = tokens.borrow_mut();
+            if tokens.len() > 4096 {
+                tokens.retain(|_, (_, at, _)| now < *at + abi::TOKEN_FRESH);
+            }
+            tokens.insert(token.to_string(), (session, now, grant.clone()));
+        });
+    }
     Ok(Ok(grant))
 }
 

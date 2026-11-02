@@ -208,9 +208,9 @@ fn call(object: &JsValue, name: &str, argument: &JsValue) {
 /// The process the stage `args` runs, if it is one: a utility of /usr/bin's coreutils the
 /// terminal has no program of its own for (by name, by its path, or as `coreutils NAME`), or
 /// the executable at a path with a slash (`./prog`, `dir/prog`), which runs as on Linux, by
-/// execve. The pair is (its own path, resolved against the working directory, if it has one)
-/// and the argv. [`Shell::invoke`] runs a single one so, and a pipeline at once with the
-/// processes beside it.
+/// execve. The pair is (its own path, as typed but with `~` expanded, if it has one) and the
+/// argv. The kernel resolves the path, physically, against the process's cwd.
+/// [`Shell::invoke`] runs a single one so, and a pipeline at once with the processes beside it.
 fn process(shell: &Shell, args: &[String]) -> Option<(Option<String>, Vec<String>)> {
     let mut args = args.to_vec();
     // A path with a slash execs what it names, after the system directories' own meaning
@@ -219,9 +219,15 @@ fn process(shell: &Shell, args: &[String]) -> Option<(Option<String>, Vec<String
         if let Some(named) = cli_bin::named(first) {
             args[0] = named.to_string();
         } else {
-            let path = terminal_worker_core::resolve(&shell.cwd.get_untracked(), first)
-                .unwrap_or_else(|_| first.to_string());
-            return Some((Some(path), args));
+            let home = shell.account.home.get_untracked();
+            let typed = if first == "~" {
+                home
+            } else if let Some(rest) = first.strip_prefix("~/") {
+                format!("{}/{}", home.trim_end_matches('/'), rest)
+            } else {
+                first.clone()
+            };
+            return Some((Some(typed), args));
         }
     }
     let name = args[0].clone();

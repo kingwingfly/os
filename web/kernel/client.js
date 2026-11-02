@@ -56,6 +56,7 @@ async function dispatch(message) {
       JSON.stringify(args.env ?? []),
       args.cwd ?? '/',
       args.cgroup ?? '',
+      !!args.sudo,
     ));
     case 'fork': return JSON.parse(await kernel.fork(args.pid));
     case 'exit': return JSON.parse(await kernel.exit(args.pid, args.status ?? 0, args.signal ?? undefined));

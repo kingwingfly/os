@@ -595,11 +595,16 @@ onmessage = async ({ data }) => {
   fds.set(3, { kind: 'dir', path: '/' });
   let code = 0;
   try {
-    // A module importing its memory (WASIX's do) gets one; its own otherwise, as wasip1's.
-    const importsMemory = WebAssembly.Module.imports(data.module).some(entry => entry.kind === 'memory');
-    const env = importsMemory ? { memory: new WebAssembly.Memory({ initial: 2 }) } : {};
+    // A module importing its memory (WASIX's do) gets one of the type it declared, so that a
+    // shared or larger memory links; its own otherwise, as wasip1's, exported as `memory`.
+    const env = data.memory ? { memory: new WebAssembly.Memory({
+      initial: data.memory.initial,
+      ...(data.memory.maximum == null ? {} : { maximum: data.memory.maximum }),
+      ...(data.memory.shared ? { shared: true } : {}),
+    }) } : {};
     const instance = await WebAssembly.instantiate(data.module, { wasi_snapshot_preview1: preview1, terminal, wasix_32v1: wasix, env });
-    memory = instance.exports.memory ?? env.memory;
+    memory = data.memory ? env.memory : instance.exports.memory;
+    if (!(memory instanceof WebAssembly.Memory)) throw new Error('the module exports no memory');
     instance.exports._start();
   } catch (err) {
     if (err instanceof Exit) code = err.code;

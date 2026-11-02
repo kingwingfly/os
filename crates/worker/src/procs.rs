@@ -93,13 +93,16 @@ impl Db {
         .into_iter()
         .next()
     }
-    /// The process whose token is `token`, which must be the `pid` it says. Tokens are stored
-    /// hashed, so a copy of the store is not a set of capabilities.
-    pub fn process_token(&self, token: &str, pid: Option<u32>) -> Option<Row> {
+    /// The live process whose token is `token`, in namespace `ns`, which must be the `pid` it
+    /// says. Tokens are stored hashed, so a copy of the store is not a set of capabilities; a
+    /// zombie's token is dead with the process.
+    pub fn process_token(&self, token: &str, pid: Option<u32>, ns: &str) -> Option<Row> {
         let row = self
             .rows::<Row>(
-                &format!("SELECT {COLUMNS} FROM processes WHERE token = ?"),
-                vec![text(&crate::auth::token_hash(token))],
+                &format!(
+                    "SELECT {COLUMNS} FROM processes WHERE token = ? AND ns = ? AND state != 'zombie'"
+                ),
+                vec![text(&crate::auth::token_hash(token)), text(ns)],
             )
             .into_iter()
             .next()?;
@@ -279,22 +282,39 @@ impl Db {
                 "the environment is too long",
             ));
         }
-        let executable = kernel::executable(&*self, cred, path)?;
+        let path = if path.starts_with('/') {
+            path.to_string()
+        } else if cwd == "/" {
+            format!("/{path}")
+        } else {
+            format!("{}/{}", cwd.trim_end_matches('/'), path)
+        };
+        let executable = kernel::executable(&*self, cred, &path)?;
         if executable.node.size > EXEC_MAX {
             return Err(Error::because(
                 abi::Errno::E2BIG,
                 format!("{} is larger than an executable may be", executable.path),
             ));
         }
-        // The image: a binary of /usr, the build's asset, or an uploaded file, which the loader
-        // reads by a token of the process's own descriptor, revalidated with the X rule.
-        let uploaded = !usr::is(&executable.path);
-        if !uploaded && usr::asset(&executable.content).is_none() {
+        // The image: a binary of /usr, or any file whose content is one (a FICLONE copy or a
+        // hard link of /usr/bin/coreutils), is the build's asset; anything else is uploaded,
+        // and the loader reads it by a token of the process's own descriptor, revalidated with
+        // the X rule.
+        let asset = usr::asset(&executable.content);
+        if usr::is(&executable.path) && asset.is_none() {
             return Err(Error::because(
                 abi::Errno::ENOEXEC,
                 format!("{} is not an executable image", executable.path),
             ));
         }
+        let uploaded = asset.is_none();
+        let sid = if uploaded {
+            Some(sid.ok_or_else(|| {
+                Error::because(abi::Errno::EBADF, "no session to keep descriptors")
+            })?)
+        } else {
+            None
+        };
         let cgroup = cgroup.unwrap_or("/user");
         if self.cgroup(ns, cgroup).is_none() {
             return Err(Error::because(
@@ -315,6 +335,9 @@ impl Db {
         };
         let token = crate::auth::random_token();
         if self.process(ns, pid).is_some() {
+            // The image the process ran before is replaced: its descriptor and read token die
+            // with the exec, not only when the process ends.
+            self.close_proc_fds(ns, pid);
             self.run(
                 "UPDATE processes SET uid = ?, gid = ?, groups = ?, umask = ?, cgroup = ?, path = ?, argv = ?, env = ?, cwd = ?, state = 'running', status = 0, signal = NULL, token = ?, started = ?, ended = 0 WHERE ns = ? AND pid = ?",
                 vec![
@@ -356,9 +379,7 @@ impl Db {
             );
         }
         let (fd, asset, token_read, size) = if uploaded {
-            let sid = sid.ok_or_else(|| {
-                Error::because(abi::Errno::EBADF, "no session to keep descriptors")
-            })?;
+            let sid = sid.expect("an uploaded image needs a session");
             let read = crate::auth::random_token();
             let fd = self.add_exec_fd(
                 sid,
@@ -373,9 +394,9 @@ impl Db {
         } else {
             (
                 None,
-                usr::asset(&executable.content).map(str::to_string),
+                asset.map(str::to_string),
                 None,
-                usr::size(&executable.content),
+                asset.map_or(executable.node.size, usr::size),
             )
         };
         Ok(Exec {
