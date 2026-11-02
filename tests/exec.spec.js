@@ -128,22 +128,25 @@ test('the loader and the X rule refuse as Linux refuses, with its words', async 
 test('setuid on an upload does not elevate, and a process cannot sign the browser out', async ({ page, request }) => {
   const name = 'execann' + Date.now().toString(36), annPassword = 'exec-password-' + Date.now();
   expect((await program(request, ['useradd', name])).ok()).toBe(true);
-  expect((await api(request, 'passwd', { headers, data: { username: name, password: annPassword } })).ok()).toBe(true);
-  // root's upload, made setuid by root, still runs as whom it was executed by, not as root.
-  expect(await call(request, { chmod: { path: `${base}/coreutils`, mode: 0o4755 } }, { headers })).toBeNull();
-  await terminal(page);
-  await run(page, `su ${name}`);
-  await run(page, `cd ${base}`);
-  await run(page, `./coreutils syscall '["getcreds"]'`);
-  await expect(page.locator('.transcript pre').last()).toContainText(`"user":"${name}"`);
-  await expect(page.locator('.transcript pre').last()).not.toContainText('"user":"root"');
-  // A process cannot mutate the browser's session.
-  await run(page, `./coreutils syscall '[{"logout":null}]'`);
-  await expect(page.locator('.transcript pre').last()).toContainText('"errno":"EPERM"');
-  await run(page, 'whoami');
-  await expect(page.locator('.transcript pre').last()).toHaveText(name);
-  await run(page, 'exit');
-  await program(request, ['userdel', name]);
+  try {
+    expect((await api(request, 'passwd', { headers, data: { username: name, password: annPassword } })).ok()).toBe(true);
+    // root's upload, made setuid by root, still runs as whom it was executed by, not as root.
+    expect(await call(request, { chmod: { path: `${base}/coreutils`, mode: 0o4755 } }, { headers })).toBeNull();
+    await terminal(page);
+    await run(page, `su ${name}`);
+    await run(page, `cd ${base}`);
+    await run(page, `./coreutils syscall '["getcreds"]'`);
+    await expect(page.locator('.transcript pre').last()).toContainText(`"user":"${name}"`);
+    await expect(page.locator('.transcript pre').last()).not.toContainText('"user":"root"');
+    // A process cannot mutate the browser's session.
+    await run(page, `./coreutils syscall '[{"logout":null}]'`);
+    await expect(page.locator('.transcript pre').last()).toContainText('"errno":"EPERM"');
+    await run(page, 'whoami');
+    await expect(page.locator('.transcript pre').last()).toHaveText(name);
+    await run(page, 'exit');
+  } finally {
+    await program(request, ['userdel', name]);
+  }
 });
 
 test('a pipeline answers its last stage\'s status, in whatever order its processes end', async ({ page }) => {

@@ -6,7 +6,32 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use sha2::{Digest, Sha256};
-use wasm_bindgen::{JsValue, closure::Closure};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use wasm_bindgen_futures::JsFuture;
+
+use crate::shell::js_message;
+
+/// Upload `files` into the directory `path`, telling `progress` how each goes: a line for each
+/// file, or why the upload failed. The terminal's `upload` and the Files both drive it.
+pub async fn upload(
+    files: &JsValue,
+    path: &str,
+    progress: impl Fn(String) + 'static,
+) -> Result<Vec<String>, String> {
+    let progress = Closure::<dyn Fn(String)>::new(progress);
+    let result = JsFuture::from(crate::upload_files(
+        files,
+        path,
+        progress.as_ref().unchecked_ref(),
+    ))
+    .await;
+    drop(progress);
+    Ok(result
+        .map_err(js_message)?
+        .dyn_into::<js_sys::Array>()
+        .map(|lines| lines.iter().filter_map(|line| line.as_string()).collect())
+        .unwrap_or_default())
+}
 
 fn hex(digest: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()

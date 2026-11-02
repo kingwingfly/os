@@ -156,7 +156,7 @@ fn show(db: &mut Db, who: &Identity, request: &Request, path: &str) -> Result<Va
 /// hear so, until it is answered, withdrawn, or its session's pages go (store.rs).
 fn ask(db: &mut Db, who: &Identity, request: &Request) -> Result<Value> {
     let device = &request.device;
-    if device.owner == who.id && who.id != GUEST {
+    if device.owner == who.id && !is_guest_id(who.id) {
         return Err(Error::because(Errno::EINVAL, "you present it"));
     }
     withdraw(db, &device.name, &request.sid);
@@ -221,7 +221,9 @@ fn answer(db: &mut Db, who: &Identity, request: &Request, id: &str, allow: bool)
         return Ok(ok());
     }
     let mut granted = json!({ "presentation": device.name, "id": id });
-    if asked.uid == GUEST {
+    // Signed out (each browser its own guest-<uuid>): the leave is its session's, a descriptor
+    // passed to it, not an entry that would outlast the session.
+    if is_guest_id(asked.uid) {
         let fd = db.add_device_fd(&asked.sid, &device.name, O_WRONLY, auth::now());
         db.set_expiry(
             "fd",
@@ -273,7 +275,7 @@ pub fn silenced(db: &mut Db, presentation: &str, media: &Value) {
         return;
     };
     let uid = media["uid"].as_u64().map(|uid| uid as u32);
-    if uid == Some(GUEST) {
+    if uid.is_some_and(is_guest_id) {
         for fd in db.fds_of(sid) {
             if fd.device.as_deref() == Some(presentation) && fd.writes() {
                 db.close_fd(sid, fd.fd);

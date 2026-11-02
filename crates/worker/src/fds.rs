@@ -57,33 +57,68 @@ pub fn call(
             if process.cred.id == 0 {
                 db.set_fd_root(sid, opened.fd);
             }
+            // A process's open is its own descriptor, as on Linux: it answers that process
+            // alone (`owned`), and closes as the process ends.
+            if let Some(caller) = caller {
+                db.set_fd_proc(sid, opened.fd, caller);
+            }
             Ok(json!(opened))
         }
         Call::Close { fd } => close(db, sid, &process.cred, fd.number(), caller).map(|c| json!(c)),
-        Call::Ioctl { fd, request, arg } => match crate::dev::request(db, sid, fd.number())? {
-            Some(device) => crate::dev::ioctl(db, process, device, request, arg),
-            None if request == FICLONE => clone(
-                db,
-                sid,
-                &process.cred,
-                fd.number(),
-                arg.as_u64().unwrap_or(u64::MAX),
-                caller,
-            )
-            .map(|()| Value::Null),
-            None => Err(Errno::ENOTTY.into()),
-        },
+        Call::Ioctl { fd, request, arg } => {
+            yours(db, sid, fd.number(), caller)?;
+            let device = crate::dev::request(db, sid, fd.number())?;
+            ioctl(db, sid, process, caller, fd.number(), device, request, arg)
+        }
         _ => Err(Errno::ENOSYS.into()),
     }
 }
 
-/// A process's descriptor answers its process alone: a page, or another process, naming it
-/// gets EBADF, as if it were not open.
+/// ioctl(2) on the descriptor `fd`: its device's driver's, or FICLONE on a file.
+#[allow(clippy::too_many_arguments)]
+fn ioctl(
+    db: &mut Db,
+    sid: &str,
+    process: &Process,
+    caller: Option<&str>,
+    fd: u32,
+    device: Option<crate::dev::Request>,
+    request: u32,
+    arg: Value,
+) -> Result<Value> {
+    match device {
+        Some(device) => crate::dev::ioctl(db, process, device, request, arg),
+        None if request == FICLONE => clone(
+            db,
+            sid,
+            &process.cred,
+            fd,
+            arg.as_u64().unwrap_or(u64::MAX),
+            caller,
+        )
+        .map(|()| Value::Null),
+        None => Err(Errno::ENOTTY.into()),
+    }
+}
+
+/// A process's descriptor answers its process alone, and a page's its pages alone: a page, or
+/// another process, naming one gets EBADF, as if it were not open. A process does not reach the
+/// page's descriptors, those it opened as root under sudo included, as a process has only the
+/// descriptors it opened or was given.
 fn owned(found: &crate::db::Fd, caller: Option<&str>) -> Result<()> {
     match (&found.proc, caller) {
         (Some(owner), Some(caller)) if owner == caller => Ok(()),
-        (Some(_), _) => Err(Errno::EBADF.into()),
-        (None, _) => Ok(()),
+        (None, None) => Ok(()),
+        _ => Err(Errno::EBADF.into()),
+    }
+}
+
+/// Whether the descriptor `fd` of `sid` is `caller`'s to use (`owned`), if it is open: a device's
+/// requests ask it before their driver does.
+pub fn yours(db: &Db, sid: &str, fd: u32, caller: Option<&str>) -> Result<()> {
+    match db.fd(sid, fd) {
+        Some(found) => owned(&found, caller),
+        None => Ok(()),
     }
 }
 
@@ -587,6 +622,7 @@ pub enum Read {
 pub fn pread(
     db: &Db,
     sid: Option<&str>,
+    ns: &str,
     process: &Process,
     fd: Option<u32>,
     path: Option<&str>,
@@ -613,7 +649,7 @@ pub fn pread(
                 return Ok(made(text.into_bytes(), offset, count));
             }
             if found.file.is_none() && crate::procfs::is(&found.path) {
-                return proc(db, Some(sid), process, &found.path, offset, count);
+                return proc(db, Some(sid), ns, process, &found.path, offset, count);
             }
             if found.file.is_none() && !found.writes() {
                 return Err(Errno::EISDIR.into());
@@ -625,7 +661,7 @@ pub fn pread(
         (None, Some(path)) => {
             let path = &crate::procfs::follow(db, sid, path, true)?;
             if crate::procfs::is(path) {
-                return proc(db, sid, process, path, offset, count);
+                return proc(db, sid, ns, process, path, offset, count);
             }
             let Opening::Existing { path, node } = kernel::open(db, process, path, O_RDONLY, 0)?
             else {
@@ -675,12 +711,13 @@ pub fn pread(
 fn proc(
     db: &Db,
     sid: Option<&str>,
+    ns: &str,
     process: &Process,
     path: &str,
     offset: u64,
     count: u64,
 ) -> Result<Read> {
-    let text = crate::procfs::read(db, sid, &process.cred, path)?;
+    let text = crate::procfs::read(db, sid, ns, &process.cred, path)?;
     Ok(made(text.into_bytes(), offset, count))
 }
 /// pread(2) of what the kernel makes as it is read: `count` bytes of `bytes` from `offset`, and
@@ -710,7 +747,7 @@ pub fn by_token(
     who: &Identity,
     token: &str,
     caller: Option<&crate::procs::Row>,
-) -> Result<File> {
+) -> Result<(File, bool)> {
     let (of, found) = db.fd_by_token(token).ok_or(Errno::EBADF)?;
     if sid != Some(of.as_str()) {
         return Err(Errno::EBADF.into());
@@ -727,6 +764,8 @@ pub fn by_token(
             };
             (row.identity(), mask)
         }
+        // A page's descriptor is its pages' alone, as `owned` has it: not a process's.
+        None if caller.is_some() => return Err(Errno::EBADF.into()),
         None => (acting(&found, who), terminal_worker_core::permissions::READ),
     };
     let file = found
@@ -756,7 +795,7 @@ pub fn by_token(
     let now = auth::now();
     db.lease_fd(&of, found.fd, now);
     db.set_expiry("fd", &fd_key(&of, found.fd), now + IDLE);
-    Ok(file)
+    Ok((file, found.exec))
 }
 
 /// The most a file written in order may grow to.

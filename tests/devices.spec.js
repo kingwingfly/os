@@ -1,12 +1,7 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { api, mkdirp, program, put, rmrf } from './sys.js';
-// The Files go to `path` of their own: its location typed (files.rs).
-async function browse(page, path) {
-  const location = page.getByRole('textbox', { name: 'Location' });
-  await location.fill(path); await location.press('Enter');
-  await expect(location).toHaveValue(path);
-}
+import { browse } from './ui.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);

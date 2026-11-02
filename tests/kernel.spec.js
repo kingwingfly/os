@@ -179,3 +179,51 @@ test('a tab signed out is guest-<uuid>:guest, and its process runs as that accou
   expect(gone.err.errno).toBe('ENOENT');
   await context.close();
 });
+
+// Through the terminal, as a person runs a command, and what ps lists after.
+async function command(page, text, { wait = true } = {}) {
+  const input = page.getByRole('combobox', { name: 'Terminal command' });
+  const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
+  await expect(busy).toHaveText('↵');
+  await input.fill(text); await input.press('Enter');
+  if (wait) await expect(busy).toHaveText('↵', { timeout: 30_000 });
+}
+async function listed(page) {
+  await command(page, 'ps');
+  return page.locator('.transcript pre').last().innerText();
+}
+
+test('a tab that goes leaves no process running: the kernel reaps it by the tab\'s lock', async ({ browser }) => {
+  const context = await browser.newContext();
+  try {
+    const [one, two] = [await context.newPage(), await context.newPage()];
+    await one.goto('/'); await two.goto('/');
+    await command(one, 'coreutils sleep 120', { wait: false });
+    await expect.poll(() => listed(two), { timeout: 15_000 }).toContain('sleep 120');
+    // The tab that ran it closes while it runs: its lock is let go, and the kernel reaps it.
+    await one.close();
+    await expect.poll(() => listed(two), { timeout: 15_000 }).not.toContain('sleep 120');
+  } finally { await context.close(); }
+});
+
+test('without SharedWorker, each tab runs a kernel of its own, reaping only what gone tabs left', async ({ browser }) => {
+  const context = await browser.newContext();
+  await context.addInitScript(() => { delete globalThis.SharedWorker; });
+  try {
+    const [one, two] = [await context.newPage(), await context.newPage()];
+    await one.goto('/'); await two.goto('/');
+    expect(await one.evaluate(() => typeof SharedWorker)).toBe('undefined');
+    // Pipes and processes work as before, through this tab's own kernel.
+    await command(one, 'seq 3 | tr 123 abc');
+    await expect(one.locator('.transcript pre').last()).toHaveText('a\nb\nc');
+    // Another tab's kernel, starting, does not reap what a live tab runs.
+    await command(one, 'coreutils sleep 120', { wait: false });
+    await command(two, 'seq 1');
+    await expect.poll(() => listed(two), { timeout: 15_000 }).toContain('sleep 120');
+    // Once its tab is gone, the next kernel to start reaps it.
+    await one.close();
+    const three = await context.newPage();
+    await three.goto('/');
+    await expect.poll(() => listed(three), { timeout: 15_000 }).not.toContain('sleep 120');
+  } finally { await context.close(); }
+});

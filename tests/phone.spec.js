@@ -1,12 +1,7 @@
 import { test, expect, devices } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { api, mkdirp, put, rmrf } from './sys.js';
-// The Files go to `path` of their own: its location typed (files.rs).
-async function browse(page, path) {
-  const location = page.getByRole('textbox', { name: 'Location' });
-  await location.fill(path); await location.press('Enter');
-  await expect(location).toHaveValue(path);
-}
+import { browse, promptPath } from './ui.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const { defaultBrowserType, ...pixel } = devices['Pixel 7'];
@@ -63,7 +58,7 @@ test('keys a phone lacks are buttons, and Upload opens the chooser at once, befo
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await expect(page.locator('.busy')).toHaveText('↵');
   await input.fill('cd ' + base); await input.press('Enter');
-  await expect(page.locator('label[for=command] .prompt-path')).toHaveText(base);
+  await expect(promptPath(page)).toHaveText(base);
   // Tab completes, ↑ recalls, ^C clears.
   await input.fill('mkd');
   await page.getByRole('button', { name: 'Tab: complete' }).tap();

@@ -6,14 +6,19 @@
 use std::cell::Cell;
 
 use leptos::prelude::*;
-use terminal_worker_core::{Entry, resolve};
-use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use terminal_worker_core::Entry;
+use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
-use crate::shell::{Account, js_message};
+use crate::session_storage as storage;
+use crate::shell::{Account, js_message, located};
 
-/// Where its directory is kept, for this browser tab, across reloads.
+/// Where its directory is kept, for this browser tab, across reloads: a key of its own, as the
+/// Files are no tab of the terminal's (whose state is `terminal-tabs`).
 const SAVED: &str = "terminal-files";
+/// Why an upload is not started: one goes on in this page, or the directory is still opening.
+const BUSY: &str = "An upload is going on in this page; wait for it, or cancel it";
+const OPENING: &str = "The directory is still opening; upload once it is open";
 
 #[derive(Clone, Copy)]
 pub struct Files {
@@ -26,6 +31,10 @@ pub struct Files {
     /// What an upload into it says as it goes, and when it is done.
     pub progress: RwSignal<String>,
     pub uploading: RwSignal<bool>,
+    /// Whether the chooser it opened is still open, which Cancel closes.
+    choosing: StoredValue<bool>,
+    /// Whether a navigation is going on: an upload waits for the directory it goes into.
+    pub navigating: RwSignal<bool>,
     /// The location being typed, while it is.
     pub typed: RwSignal<Option<String>>,
     account: Account,
@@ -45,10 +54,6 @@ pub fn files() -> Option<Files> {
     FILES.with(Cell::get)
 }
 
-fn storage() -> Option<web_sys::Storage> {
-    web_sys::window()?.session_storage().ok().flatten()
-}
-
 impl Files {
     /// The Files app, in the directory it was in, or at `start`.
     pub fn new(account: Account, start: String) -> Self {
@@ -62,6 +67,8 @@ impl Files {
             notice: RwSignal::new(String::new()),
             progress: RwSignal::new(String::new()),
             uploading: RwSignal::new(false),
+            choosing: StoredValue::new(false),
+            navigating: RwSignal::new(false),
             typed: RwSignal::new(None),
             account,
             asked: StoredValue::new(0),
@@ -76,18 +83,24 @@ impl Files {
         // This navigation is newer than any refresh already in flight.
         let nav = self.navs.get_value() + 1;
         self.navs.set_value(nav);
+        self.navigating.set(true);
         spawn_local(async move {
+            let latest = move || self.navs.get_value() == nav;
             if let Err(error) = crate::enterable(&path).await {
+                if latest() {
+                    self.navigating.set(false);
+                }
                 self.notice.set(format!("{path}: {error}"));
                 return;
             }
             self.notice.set(String::new());
             let listed = crate::listing(&path).await;
             // A later navigation wins; a refresh does not.
-            if self.navs.get_value() != nav {
+            if !latest() {
                 return;
             }
             self.show(path, listed);
+            self.navigating.set(false);
         });
     }
     /// List its directory again, as it is now: unless a navigation began meanwhile, which the
@@ -133,16 +146,12 @@ impl Files {
     /// Go to the location typed: a path, from its directory, or from the account's home (~).
     pub fn locate(self, typed: &str) {
         self.typed.set(None);
+        let typed = typed.trim();
+        if typed.is_empty() {
+            return;
+        }
         let home = self.account.home.get_untracked();
-        let expanded = match typed.trim() {
-            "" => return,
-            "~" => home,
-            value => match value.strip_prefix("~/") {
-                Some(rest) => format!("{home}/{rest}"),
-                None => value.to_string(),
-            },
-        };
-        match resolve(&self.cwd.get_untracked(), &expanded) {
+        match located(&self.cwd.get_untracked(), &home, typed) {
             Ok(path) => self.go(path),
             Err(error) => self.notice.set(error),
         }
@@ -153,12 +162,16 @@ impl Files {
         if entry.directory {
             return self.go(entry.path.clone());
         }
-        let (path, name) = (entry.path.clone(), entry.name.clone());
+        // The listing says what a file is; only a link is asked what it leads to now, if to
+        // anything: a dangling one says so, rather than open a preview of nothing.
+        let (path, name, linked) = (entry.path.clone(), entry.name.clone(), entry.link.is_some());
         spawn_local(async move {
-            match crate::stat(&path).await {
-                Err(error) => return self.notice.set(format!("{name}: {error}")),
-                Ok(stat) if stat.is_dir() => return self.go(path),
-                Ok(_) => {}
+            if linked {
+                match crate::stat(&path).await {
+                    Err(error) => return self.notice.set(format!("{name}: {error}")),
+                    Ok(stat) if stat.is_dir() => return self.go(path),
+                    Ok(_) => {}
+                }
             }
             let opened =
                 JsFuture::from(crate::open_file(&path, terminal_worker_core::kind(&path))).await;
@@ -175,79 +188,115 @@ impl Files {
         if self.busy() {
             return;
         }
-        self.upload(crate::choose_files());
+        self.upload(crate::choose_files(), true);
     }
     /// Upload `files`, dropped on it, into its directory.
     pub fn dropped(self, files: JsValue) {
         if self.busy() {
             return;
         }
-        self.upload(js_sys::Promise::resolve(&files));
+        self.upload(js_sys::Promise::resolve(&files), false);
     }
+    /// Whether an upload cannot start now, saying why: one goes on in this page (the Files' or
+    /// the terminal's: one at a time), or the directory it would go into is still opening.
     fn busy(self) -> bool {
-        let busy = self.uploading.get_untracked();
-        if busy {
-            self.notice
-                .set("An upload into Files is going on; wait for it, or cancel it".into());
+        let why = if self.navigating.get_untracked() {
+            Some(OPENING)
+        } else if self.uploading.get_untracked() || crate::uploading() {
+            Some(BUSY)
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            self.notice.set(why.into());
         }
-        busy
+        why.is_some()
     }
-    fn upload(self, chosen: js_sys::Promise) {
+    /// Upload what `chosen` gives into its directory; a chooser that is still open (`choosing`)
+    /// shows, so that Cancel can close it.
+    fn upload(self, chosen: js_sys::Promise, choosing: bool) {
         let path = self.cwd.get_untracked();
         self.uploading.set(true);
+        self.choosing.set_value(choosing);
+        if choosing {
+            self.progress.set("↑ choosing files".into());
+        }
         spawn_local(async move {
-            let files = JsFuture::from(chosen).await.unwrap_or(JsValue::NULL);
-            if js_sys::Array::from(&files).length() == 0 {
-                self.uploading.set(false);
-                return;
-            }
+            let files = JsFuture::from(chosen).await;
+            self.choosing.set_value(false);
+            let files = match files {
+                Ok(files) if js_sys::Array::from(&files).length() > 0 => files,
+                Ok(_) => {
+                    self.progress.set(String::new());
+                    return self.done();
+                }
+                Err(error) => {
+                    self.progress.set(format!("✕ {}", js_message(error)));
+                    return self.done();
+                }
+            };
             self.notice.set(String::new());
             self.progress.set("↑ starting".into());
-            let progress =
-                Closure::<dyn Fn(String)>::new(move |text: String| self.progress.set(text));
-            let result = JsFuture::from(crate::upload_files(
-                &files,
-                &path,
-                progress.as_ref().unchecked_ref(),
-            ))
-            .await;
-            drop(progress);
-            self.uploading.set(false);
+            let result =
+                crate::uploads::upload(&files, &path, move |text| self.progress.set(text)).await;
+            self.done();
             match result {
-                Ok(results) => {
-                    let lines: Vec<String> = results
-                        .dyn_into::<js_sys::Array>()
-                        .map(|a| a.iter().filter_map(|r| r.as_string()).collect())
-                        .unwrap_or_default();
-                    self.progress.set(lines.join("\n"));
-                }
-                Err(error) => self.progress.set(format!("✕ {}", js_message(error))),
+                Ok(lines) => self.progress.set(lines.join("\n")),
+                Err(error) => self.progress.set(format!("✕ {error}")),
             }
             self.refresh();
         });
     }
-    /// Stop the upload going on, keeping nothing of what was not done.
+    /// An upload is over: another may start, and what said one went on is old news.
+    fn done(self) {
+        self.uploading.set(false);
+        self.notice.update(|notice| {
+            if notice == BUSY {
+                notice.clear();
+            }
+        });
+    }
+    /// Stop what it uploads: a chooser still open closes with nothing; an upload under way
+    /// stops, keeping nothing of what was not done. Only its own: while its chooser is open, no
+    /// upload of the page is its to stop.
     pub fn cancel(self) {
-        let _ = crate::cancel_uploads();
+        if self.choosing.get_value() {
+            crate::cancel_choosing();
+        } else {
+            crate::cancel_uploads();
+        }
     }
 }
 
 /// The Files app's window content: its location, its directory listed, what it says.
 pub fn view(files: Files) -> impl IntoView {
     let location = move || files.typed.get().unwrap_or_else(|| files.cwd.get());
+    // iOS corrects what is typed unless told not to, with an attribute Leptos does not name, as
+    // the terminal's command line is told.
+    let input = NodeRef::<leptos::html::Input>::new();
+    Effect::new(move || {
+        if let Some(input) = input.get() {
+            let _ = input.set_attribute("autocorrect", "off");
+        }
+    });
     view! {
         <section class="file-panel" aria-label="File manager">
         <div class="directory-bar">
             <input class="location" aria-label="Location" autocomplete="off" spellcheck="false" autocapitalize="off" enterkeyhint="go"
+                node_ref=input
                 prop:value=location
                 on:input=move |e| files.typed.set(Some(event_target_value(&e)))
-                on:keydown=move |e| match e.key().as_str() {
-                    "Enter" => { e.prevent_default(); files.locate(&event_target_value(&e)); }
-                    "Escape" => { e.prevent_default(); files.typed.set(None); }
-                    _ => {}
+                on:keydown=move |e| {
+                    // What an input method is still composing is not the location yet.
+                    if e.is_composing() { return; }
+                    match e.key().as_str() {
+                        "Enter" => { e.prevent_default(); files.locate(&event_target_value(&e)); }
+                        "Escape" => { e.prevent_default(); files.typed.set(None); }
+                        _ => {}
+                    }
                 }
                 on:blur=move |_| files.typed.set(None)/>
-            <button on:click=move |_| files.choose() disabled=move || files.uploading.get()>"↑ Upload files"</button>
+            <button on:click=move |_| files.choose() disabled=move || files.uploading.get() || files.navigating.get()>"↑ Upload files"</button>
         </div>
         <p class="file-notice" role="status">{move || files.notice.get()}</p>
         <Show when=move || !files.progress.get().is_empty()>

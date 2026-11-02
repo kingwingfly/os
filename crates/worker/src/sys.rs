@@ -101,10 +101,14 @@ pub async fn handle(
             && crate::dev::networked(*request)
         {
             let asked = Asked {
-                key,
-                guest,
-                sudo,
-                umask,
+                session: Session {
+                    key,
+                    guest,
+                    sudo,
+                    umask,
+                    pid: procs_pid,
+                    token: procs_token.clone(),
+                },
                 fd: fd.number(),
                 op: *request,
                 arg: arg.clone(),
@@ -116,9 +120,10 @@ pub async fn handle(
             continue;
         }
         let logout = matches!(call, Call::Logout);
-        // A process spawned or signalled: its runner wakes.
+        // A job spawned or signalled: its runner wakes. A numeric pid is a registry process's,
+        // which has no runner.
         let wakes = match &call {
-            Call::Kill { pid, .. } => Some(pid.clone()),
+            Call::Kill { pid, .. } if pid.parse::<u32>().is_err() => Some(pid.clone()),
             Call::Spawn { .. } => Some(String::new()),
             _ => None,
         };
@@ -319,10 +324,12 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
             }
             let asking = session.clone();
             let read = transact(state, move |db| {
+                let ns = Db::namespace(asking.key.as_deref(), asking.guest.as_deref());
                 let read = asking.of(db).and_then(|(process, sid, proc)| {
                     crate::fds::pread(
                         db,
                         sid.as_deref(),
+                        &ns,
                         &process,
                         fd.map(FdRef::number),
                         path.as_deref(),
@@ -383,7 +390,14 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
                         .and_then(|found| crate::jobs::stdin_pid(&found.path).map(str::to_string));
                     match stdin {
                         Some(pid) => {
-                            let owner = auth::identity(db, asking.key.as_deref()).id;
+                            // The job's owner as Spawn made it: a guest's own uid, not 65534.
+                            let owner = owner(
+                                db,
+                                asking.key.as_deref(),
+                                asking.guest.as_deref(),
+                                proc.is_some(),
+                                &process,
+                            );
                             crate::jobs::answer(db, owner, &process, &pid, &bytes)
                                 .map(|value| Target::Stdin(pid, value))
                         }
@@ -541,20 +555,33 @@ fn process(
     sudo: bool,
     umask: u16,
 ) -> std::result::Result<Process, Error> {
-    let who = auth::identity_of(db, key, guest);
-    let may_sudo = db.can_sudo(&who);
     let cred = auth::elevated_of(db, key, guest, sudo).map_err(|why| {
-        // Not a wheel member: never. One that has not authenticated lately: not yet.
-        Error::because(
-            if may_sudo {
-                Errno::EACCES
-            } else {
-                Errno::EPERM
-            },
-            why,
-        )
+        // Not a wheel member: never. One that has not authenticated lately: not yet. (A guest
+        // is never a wheel member, so the session's own account is enough to tell.)
+        let errno = if db.can_sudo(&auth::identity(db, key)) {
+            Errno::EACCES
+        } else {
+            Errno::EPERM
+        };
+        Error::because(errno, why)
     })?;
     Ok(Process { cred, umask })
+}
+
+/// Whose a job is: the calling process's snapshot, or the page's account without sudo (its own
+/// guest account, signed out), as the tab that follows the job asks without sudo.
+fn owner(
+    db: &mut Db,
+    key: Option<&str>,
+    guest: Option<&str>,
+    by_process: bool,
+    process: &Process,
+) -> u32 {
+    if by_process {
+        process.cred.id
+    } else {
+        auth::identity_of(db, key, guest).id
+    }
 }
 
 /// The call `call`, as the process `token` (a process's own snapshot), or, with none, as the
@@ -608,6 +635,7 @@ fn run(
             env,
             cwd,
             cgroup,
+            seat,
         } => {
             // A process cannot replace itself: the page host would keep the old process token
             // and could never exit or wait the new image. The client kernel execs a new process
@@ -628,6 +656,7 @@ fn run(
                 &env,
                 &cwd,
                 cgroup.as_deref(),
+                seat.as_deref(),
                 process.umask,
                 now,
             )?;
@@ -713,7 +742,13 @@ fn run(
         proc |= crate::procfs::is(path);
     }
     if proc {
-        return crate::procfs::call(db, sid, &process.cred, call);
+        let opening = matches!(call, Call::Open { .. });
+        let value = crate::procfs::call(db, sid, &ns, &process.cred, call)?;
+        // A process's open of /proc is its own descriptor, as any open of its is (fds.rs).
+        if opening && let (Some(sid), Some(row), Some(fd)) = (sid, &caller, value["fd"].as_u64()) {
+            db.set_fd_proc(sid, fd as u32, &format!("{} {}", row.ns, row.pid));
+        }
+        return Ok(value);
     }
     // The image (/usr, /bin) is read-only: what would change it fails, as on a read-only mount.
     if changes(&call) {
@@ -777,11 +812,14 @@ fn run(
         | Call::Groupdel { .. }) => account(db, &process.cred, call),
         Call::Getcreds => Ok(json!(creds(db, key, &process.cred))),
         call @ (Call::Spawn { .. } | Call::Kill { .. } | Call::Wait { .. }) => {
+            // A job is its account's, not root's under sudo: the tab follows it, answers it and
+            // cancels it without sudo, and `~` is the account's home.
+            let owner = owner(db, key, guest, caller.is_some(), &process);
             let home = db
-                .user_by_id(process.cred.id)
+                .user_by_id(owner)
                 .map(|(_, user)| user.home)
                 .unwrap_or_else(|| "/".into());
-            crate::jobs::call(db, process.cred.id, &home, sid, &process, call)
+            crate::jobs::call(db, owner, &home, sid, &process, call)
         }
         call @ (Call::Open { .. } | Call::Close { .. } | Call::Ioctl { .. }) => {
             let caller = caller.as_ref().map(|row| format!("{} {}", row.ns, row.pid));
@@ -871,9 +909,13 @@ fn statfs(db: &Db) -> abi::StatFs {
 /// The files the kernel writes as they are read, as /proc's are: /etc/passwd and /etc/group,
 /// what libc's getpwnam and getgrnam read, which user space's programs do to name accounts.
 pub fn generated(db: &Db, path: &str) -> Option<String> {
+    // Every read of a path asks this: the accounts are looked up only for the two files made
+    // of them, and the guests for /etc/passwd alone.
+    if !matches!(path, "/etc/passwd" | "/etc/group") {
+        return None;
+    }
     let mut users = db.users();
     users.sort_by_key(|(_, user)| user.id);
-    let guests = db.guests();
     match path {
         "/etc/passwd" => {
             let mut text: String = users
@@ -885,7 +927,7 @@ pub fn generated(db: &Db, path: &str) -> Option<String> {
                     )
                 })
                 .collect();
-            for guest in guests {
+            for guest in db.guests() {
                 text.push_str(&format!(
                     "{}:x:{}:{}::/guest:/bin/sh\n",
                     guest.name(),
@@ -970,10 +1012,8 @@ fn creds(db: &Db, key: Option<&str>, cred: &Identity) -> Creds {
 
 /// A driver's request that asks Realtime, as the session asks it.
 struct Asked {
-    key: Option<String>,
-    guest: Option<String>,
-    sudo: bool,
-    umask: u16,
+    /// Who asks: a page's session, or a process by its token, which acts as its snapshot.
+    session: Session,
     fd: u32,
     op: u32,
     arg: serde_json::Value,
@@ -1033,20 +1073,19 @@ async fn networked(
         ));
     }
     let Asked {
-        key,
-        guest,
-        sudo,
-        umask,
+        session: asker,
         fd,
         op,
         arg,
     } = asked;
+    let asker = Rc::new(asker);
     let decided = {
-        let (key, guest, arg) = (key.clone(), guest.clone(), arg.clone());
+        let (asker, arg) = (asker.clone(), arg.clone());
         transact(state, move |db| {
             let plan = (|| {
-                let process = process(db, key.as_deref(), guest.as_deref(), sudo, umask)?;
-                let sid = auth::sid(db, key.as_deref(), guest.as_deref()).ok_or(Errno::EBADF)?;
+                let (process, sid, caller) = asker.of(db)?;
+                let sid = sid.ok_or(Errno::EBADF)?;
+                crate::fds::yours(db, &sid, fd, caller.as_deref())?;
                 let request = dev::request(db, &sid, fd)?.ok_or(Errno::ENOTTY)?;
                 let rdev = request.node.rdev.clone().unwrap_or_default();
                 Ok(match (op, rdev.as_str()) {
@@ -1106,9 +1145,8 @@ async fn networked(
                 .map_err(unreached)?;
             let made = transact(state, move |db| {
                 let made = (|| {
-                    let process = process(db, key.as_deref(), guest.as_deref(), sudo, umask)?;
-                    let sid =
-                        auth::sid(db, key.as_deref(), guest.as_deref()).ok_or(Errno::EBADF)?;
+                    let (process, sid, _) = asker.of(db)?;
+                    let sid = sid.ok_or(Errno::EBADF)?;
                     let request = dev::request(db, &sid, fd)?.ok_or(Errno::ENOTTY)?;
                     match &voice {
                         Some(voice) => dev::present::spoken(

@@ -22,6 +22,13 @@ const refused = (name, error) => {
   const why = error.errno && error.message === error.errno ? (STRERROR[error.errno] ?? error.errno) : error.message;
   return Object.assign(new Error(`${name}: ${why}`), { errno: error.errno });
 };
+// exit(2) of the process `pid`, then waitpid for it, so no zombie stays in the registry. The
+// wait goes even when the exit fails: a process the registry already ended (kill(2) from
+// another tab, whose token is then dead) is a zombie the exit cannot reach but the wait reaps.
+const reap = async (pid, { status, signal }) => {
+  try { await kernelCall('exit', { pid, status, signal }); } catch { /* ended already */ }
+  try { await kernelCall('wait', { pid }); } catch { /* reaped already, or still running */ }
+};
 const encoder = new TextEncoder();
 // Status of a process killed by a signal: 128 and its number.
 const SIGINT = 130, SIGPIPE = 141;
@@ -103,14 +110,7 @@ export async function exec(stages, options = {}) {
   // A process made for a stage whose pipeline ends before the stage starts runs no image: it
   // exits as a hostless process would, and is reaped, so that no process is left in the
   // registry. The stage's place in the pipeline takes the status that ended it.
-  const abandon = async image => {
-    try {
-      await kernelCall('exit', { pid: image.pid, status: 126 });
-      await kernelCall('wait', { pid: image.pid });
-    } catch {
-      // Killed, or already reaped: nothing left to do.
-    }
-  };
+  const abandon = image => reap(image.pid, { status: 126 });
   const start = async (index, io) => {
     const stage = stages[index], argv = stage.argv ?? stage;
     const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
@@ -143,9 +143,7 @@ export async function exec(stages, options = {}) {
         for (const fd of [1, 2]) write(fd, decoders[fd].decode());
         // exit(2), then wait for it: the registry reaps the zombie at once, as init would.
         const signal = code >= 128 ? code - 128 : undefined;
-        kernelCall('exit', { pid: image.pid, status: code, signal })
-          .then(() => kernelCall('wait', { pid: image.pid }))
-          .catch(() => { /* it may have ended already */ });
+        void reap(image.pid, { status: code, signal });
         settle(code);
       };
       worker.onmessage = ({ data }) => {

@@ -1061,6 +1061,9 @@ pub fn valid_name(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
         && name != "guest"
+        // guest-<uuid> names signed-out browsers (/etc/passwd lists them): an account or group
+        // of that name would pass for one.
+        && !name.starts_with("guest-")
 }
 /// `drwxr-xr-x`, `-rwsr-x---`, `drwxrwxrwt` ...: `kind` first (`d`, `-`, `l`), then the
 /// permission bits, with setuid and setgid as `s` (or `S` without execute) and sticky as `t`

@@ -46,7 +46,9 @@ pub struct Kernel {
 #[wasm_bindgen]
 impl Kernel {
     /// A kernel for one browser boot. The page gives the boot id; the SharedWorker keeps it
-    /// across that boot's tabs.
+    /// across that boot's tabs. An empty one reaps nothing by boot: where tabs hold Web Locks,
+    /// what a gone tab left is reaped by its seat (client.js), and a kernel of one tab alone
+    /// must not reap the processes of the browser's other tabs.
     #[wasm_bindgen(constructor)]
     pub fn new(boot: &str) -> Kernel {
         Kernel {
@@ -71,7 +73,8 @@ impl Kernel {
     /// proc_init: begin (or continue) this browser's namespace, as init does.
     pub async fn init(&self) -> Result<String, JsValue> {
         let boot = self.state.borrow().boot.clone();
-        let value = one(vec![Call::ProcInit { boot: Some(boot) }], None, None).await?;
+        let boot = (!boot.is_empty()).then_some(boot);
+        let value = one(vec![Call::ProcInit { boot }], None, None).await?;
         let namespace = value["namespace"].as_str().unwrap_or_default().to_string();
         self.state.borrow_mut().namespace = namespace;
         Ok(value.to_string())
@@ -79,7 +82,9 @@ impl Kernel {
 
     /// execve: ask the worker kernel for the image at `path`, run as this browser's account.
     /// `argv`, `env` and `pids` are JSON arrays; `cgroup` is empty for the default; `sudo`
-    /// snapshots root for the new process, once the page has authenticated it.
+    /// snapshots root for the new process, once the page has authenticated it; `seat` is the
+    /// tab that runs it, empty if none said.
+    #[allow(clippy::too_many_arguments)]
     pub async fn exec(
         &self,
         path: &str,
@@ -88,6 +93,7 @@ impl Kernel {
         cwd: &str,
         cgroup: &str,
         sudo: bool,
+        seat: &str,
     ) -> Result<String, JsValue> {
         let argv: Vec<String> = parse(argv, "argv")?;
         let env: Vec<String> = parse(env, "env")?;
@@ -99,6 +105,7 @@ impl Kernel {
                 env,
                 cwd: cwd.into(),
                 cgroup: (!cgroup.is_empty()).then(|| cgroup.to_string()),
+                seat: (!seat.is_empty()).then(|| seat.to_string()),
             }],
             None,
             None,
