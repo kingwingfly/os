@@ -416,6 +416,30 @@ test('execve runs /usr binaries, snapshots the caller, and refuses what Linux re
   expect(waited.status).toBe(5 << 8);
   expect(waited.pid).toBe(exec.pid);
 
+  // A clone of /usr/bin/coreutils, and a hard link of that clone, are the same content:
+  // execve answers the build's asset, and the loader's cache key stays the content id, not the
+  // path. (/usr itself is read-only: link(2) from it is EROFS, as on Linux.)
+  const FICLONE = 0x40049409, O_WRONLY = 1, O_CREAT = 0o100, O_EXCL = 0o200;
+  const copied = base + '/copied-coreutils', hard = copied + '-hard';
+  await root.batch([{ mkdir: { path: base + '/linked', mode: 0o755 } }]);
+  const [source, target] = await root.batch([
+    { open: { path: '/usr/bin/coreutils', flags: 0 } },
+    { open: { path: copied, flags: O_WRONLY | O_CREAT | O_EXCL, mode: 0o755 } },
+  ]);
+  expect(source.ok).toBeTruthy();
+  expect(target.ok).toBeTruthy();
+  expect(await root.sys({ ioctl: { fd: target.ok.fd, request: FICLONE, arg: source.ok.fd } })).toBeNull();
+  await root.batch([{ close: { fd: target.ok.fd } }, { close: { fd: source.ok.fd } }]);
+  const [made] = await root.batch([{ link: { from: copied, to: hard } }]);
+  expect(made).toEqual({ ok: null });
+  for (const path of [copied, hard]) {
+    const clone = await root.sys({ execve: { path, argv: ['coreutils', 'true'], env: [], cwd: '/' } });
+    expect(clone.asset).toBe('/usr/bin/coreutils.wasm');
+    expect(clone.version).toBe(exec.version);
+    expect(await root.sys({ exit: { status: 0 } }, { pid: clone.pid, proc: clone.token })).toBeNull();
+    expect((await root.sys({ wait: { pid: String(clone.pid) } })).pid).toBe(clone.pid);
+  }
+
   const dir = base + '/execve';
   await root.batch([{ mkdir: { path: dir, mode: 0o755 } }, { mknod: { path: dir + '/plain', mode: 0o644 } }, { mknod: { path: dir + '/xonly', mode: 0o111 } }, { mkdir: { path: dir + '/sub', mode: 0o755 } }]);
   // A directory is EISDIR, a missing path ENOENT, and the X rule holds for root too: 0644 is
@@ -454,6 +478,8 @@ test('proc_init begins a browser namespace, and a new boot reaps what the old on
 test('uploaded wasm execves, its image read by the process token alone', async () => {
   const WASM = Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x00, 0x00, 0x00, 0x00]);
   const dir = base + '/wasm';
+  // The test's directory, when only this test is selected.
+  await root.batch([{ mkdir: { path: base, mode: 0o777 } }, { chmod: { path: base, mode: 0o1777 } }]);
   await ann.batch([{ mkdir: { path: dir, mode: 0o755 } }]);
   // ann's uploaded wasm, executable by its mode; a plain 0644 file is EACCES, for root too.
   expect((await put(ann.context, `${origin}/api/file?path=${dir}/hello.wasm&overwrite=true`, { data: WASM })).status()).toBe(201);
@@ -476,17 +502,29 @@ test('uploaded wasm execves, its image read by the process token alone', async (
   expect(image.status()).toBe(200);
   expect(Buffer.from(await image.body())).toEqual(WASM);
   expect((await ann.context.get(`${origin}/api/file?token=${exec.token_read}`)).status()).toBe(409);
-  // Another browser session cannot use either token, however it names them.
-  expect((await root.context.get(`${origin}/api/file?token=${exec.token_read}`, { headers: { 'X-Process-Token': exec.token } })).status()).toBe(409);
+  // Another browser session cannot use either token, however it names them: its namespace has
+  // no such process, so the request is EPERM, never served as its page.
+  expect((await root.context.get(`${origin}/api/file?token=${exec.token_read}`, { headers: { 'X-Process-Token': exec.token } })).status()).toBe(403);
+  // Nor can a token that does not resolve be treated as no header: the page itself may not read
+  // a process-owned image with a made-up token.
+  expect((await ann.context.get(`${origin}/api/file?token=${exec.token_read}`, { headers: { 'X-Process-Token': 'f'.repeat(64) } })).status()).toBe(403);
+  // A process token is the namespace's too: another browser's batch gets EPERM, as does a
+  // token the namespace does not know.
+  const [foreign] = await root.batch([{ getpid: null }], { pid: exec.pid, proc: exec.token });
+  expect(foreign.err.errno).toBe('EPERM');
+  const [unknown] = await ann.batch([{ getpid: null }], { pid: exec.pid, proc: 'f'.repeat(64) });
+  expect(unknown.err.errno).toBe('EPERM');
   // The image's descriptor is the process's: the page cannot pread or close it.
   const [pread] = await ann.batch([{ pread: { fd: exec.fd, count: 8 } }]);
   expect(pread.err.errno).toBe('EBADF');
   const [close] = await ann.batch([{ close: { fd: exec.fd } }]);
   expect(close.err.errno).toBe('EBADF');
-  // exit and wait reap it: its token reads no more.
+  // exit and wait reap it: its token reads no more, and no call of it runs.
   expect(await ann.sys({ exit: { status: 0 } }, { pid: exec.pid, proc: exec.token })).toBeNull();
   expect((await ann.sys({ wait: { pid: String(exec.pid) } })).pid).toBe(exec.pid);
-  expect((await ann.context.get(`${origin}/api/file?token=${exec.token_read}`, { headers: { 'X-Process-Token': exec.token } })).status()).toBe(409);
+  expect((await ann.context.get(`${origin}/api/file?token=${exec.token_read}`, { headers: { 'X-Process-Token': exec.token } })).status()).toBe(403);
+  const [reaped] = await ann.batch([{ getpid: null }], { pid: exec.pid, proc: exec.token });
+  expect(reaped.err.errno).toBe('EPERM');
 
   // x-only: the X rule lets it exec; a path read is denied, the exec token reads.
   expect((await put(ann.context, `${origin}/api/file?path=${dir}/xonly.wasm&overwrite=true`, { data: WASM })).status()).toBe(201);
@@ -496,6 +534,16 @@ test('uploaded wasm execves, its image read by the process token alone', async (
   expect(xonly.token_read).toMatch(/^[0-9a-f]{64}$/);
   expect((await ann.context.get(`${origin}/api/file?token=${xonly.token_read}`, { headers: { 'X-Process-Token': xonly.token } })).status()).toBe(200);
   expect(await ann.sys({ exit: { status: 0 } }, { pid: xonly.pid, proc: xonly.token })).toBeNull();
+
+  // The exec token's X rule is root's too: a 0755 image read by its token, then chmod 0644,
+  // is EACCES although root may otherwise read anything.
+  expect((await put(ann.context, `${origin}/api/file?path=${dir}/rootx.wasm&overwrite=true`, { data: WASM })).status()).toBe(201);
+  expect(await ann.sys({ chmod: { path: dir + '/rootx.wasm', mode: 0o755 } })).toBe(null);
+  const rootx = await root.sys({ execve: { path: dir + '/rootx.wasm', argv: ['rootx'], env: [], cwd: '/' } });
+  expect((await root.context.get(`${origin}/api/file?token=${rootx.token_read}`, { headers: { 'X-Process-Token': rootx.token } })).status()).toBe(200);
+  expect(await root.sys({ chmod: { path: dir + '/rootx.wasm', mode: 0o644 } })).toBe(null);
+  expect((await root.context.get(`${origin}/api/file?token=${rootx.token_read}`, { headers: { 'X-Process-Token': rootx.token } })).status()).toBe(403);
+  expect(await root.sys({ exit: { status: 0 } }, { pid: rootx.pid, proc: rootx.token })).toBeNull();
 
   // One still uploading is ETXTBSY.
   const [opened] = await ann.batch([{ open: { path: dir + '/busy.wasm', flags: 0o1 | 0o100, mode: 0o755, size: WASM.length } }]);

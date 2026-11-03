@@ -195,17 +195,15 @@ impl TerminalCommand for Asking {
             if program.is_some_and(|name| userland::PROGRAMS.contains(&name.as_str())) {
                 return shell.sudo_program(args[1..].to_vec(), stdin, piped).await;
             }
-            // /bin's, as root: its system calls go under sudo.
-            if let Some(name) = program
-                && terminal_worker_core::bin::program(name).is_some()
-                && cli::definition(name).is_none()
+            // A coreutils applet or a path with a slash, as root: the same exec stage the
+            // non-sudo shell would resolve, with sudo snapshotted by execve.
+            if program.is_some()
+                && let Some(stage) = super::process(&shell, &args[1..])
             {
                 if !shell.authenticated().await? {
                     return Err("sudo canceled".into());
                 }
-                return shell
-                    .bin((None, args[1..].to_vec()), stdin, piped, true)
-                    .await;
+                return shell.bin(stage, stdin, piped, true).await;
             }
             shell.manage(&args, piped).await
         }

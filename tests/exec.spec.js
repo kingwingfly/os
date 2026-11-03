@@ -16,6 +16,11 @@ let base, headers;
 const BAD_IMPORT = assemble('(module (import "foo" "bar" (func)) (memory 1) (func (export "_start")))');
 const NO_START = assemble('(module (memory 1))');
 const NO_MEMORY = assemble('(module (func (export "_start")))');
+// WASIX's shape: an imported memory with its own limits, rather than an exported one. The
+// loader must give the process a memory of that type (initial 3), not a fixed two pages.
+const IMPORTED_MEMORY = assemble('(module (import "env" "memory" (memory 3 4)) (func (export "_start")))');
+const WRONG_MEMORY_NAME = assemble('(module (memory 1) (export "mem" (memory 0)) (func (export "_start")))');
+const MEMORY_AS_FUNCTION = assemble('(module (import "env" "memory" (func)) (memory 1) (func (export "_start")))');
 const SCRIPT = Buffer.from('#!/bin/sh\necho no\n');
 
 test.beforeEach(async ({ request, page }) => {
@@ -33,6 +38,9 @@ test.beforeEach(async ({ request, page }) => {
   await upload('bad-import', BAD_IMPORT);
   await upload('no-start', NO_START);
   await upload('no-memory', NO_MEMORY);
+  await upload('import-memory', IMPORTED_MEMORY);
+  await upload('wrong-memory', WRONG_MEMORY_NAME);
+  await upload('memory-func', MEMORY_AS_FUNCTION);
   await upload('plain', coreutils, 0o644);
   await mkdirp(request, `${base}/x`, 0o755);
   await upload('x/coreutils', coreutils, 0o111);
@@ -136,4 +144,72 @@ test('setuid on an upload does not elevate, and a process cannot sign the browse
   await expect(page.locator('.transcript pre').last()).toHaveText(name);
   await run(page, 'exit');
   await program(request, ['userdel', name]);
+});
+
+test('a pipeline answers its last stage\'s status, in whatever order its processes end', async ({ page }) => {
+  await page.goto('/');
+  const status = stages => page.evaluate(async stages => {
+    const options = { cwd: '/', home: '/root', user: 'root', tty: false };
+    return (await window.terminal.exec(stages, options)).status;
+  }, stages);
+  // The last stage ends first: its status is the last's, not the one that finished first.
+  expect(await status([{ argv: ['false'] }, { argv: ['sleep', '0.4'] }])).toBe(0);
+  expect(await status([{ argv: ['sleep', '0.4'] }, { argv: ['false'] }])).toBe(1);
+});
+
+test('a stage that cannot load leaves no process, and its siblings end with the pipeline', async ({ page }) => {
+  await terminal(page);
+  // The first stage's image is not a program: the load fails after execve. The second, already
+  // given a process, must not run on unkilled, and neither may stay for the next boot.
+  await run(page, './bad-import | ./coreutils sleep 5');
+  await expect(transcript(page)).toContainText('./bad-import: cannot execute binary file: Exec format error');
+  await page.waitForTimeout(1_000);
+  await run(page, 'ps');
+  const listed = await page.locator('.transcript pre').last().innerText();
+  expect(listed).not.toContain('bad-import');
+  expect(listed).not.toContain('sleep 5');
+});
+
+test('the loader reads a memory import\'s own limits, and refuses wrong names and kinds', async ({ page }) => {
+  await page.goto('/');
+  const load = path => page.evaluate(async path => {
+    try {
+      return { status: (await window.terminal.exec([{ path, argv: [path] }], {})).status };
+    } catch (error) {
+      return { error: error.message };
+    }
+  }, path);
+  // An imported memory of three pages links: a fixed two-page memory of the old loader did not.
+  expect(await load(`${base}/import-memory`)).toEqual({ status: 0 });
+  // The only memory is env.memory, and only as a memory; a module exports one as exactly
+  // `memory` to be run.
+  expect((await load(`${base}/wrong-memory`)).error).toContain('Exec format error (no memory)');
+  expect((await load(`${base}/memory-func`)).error).toContain('Exec format error (unknown import env.memory)');
+});
+
+test('sudo snapshots root for an exec of a path or a coreutils applet', async ({ page, request }) => {
+  const name = 'execwheel' + Date.now().toString(36);
+  expect((await program(request, ['useradd', '-m', '-G', 'wheel', name])).ok()).toBe(true);
+  try {
+    expect((await api(request, 'passwd', { headers, data: { username: name, password } })).ok()).toBe(true);
+    await page.goto('/');
+    await run(page, `su ${name}`, { wait: false });
+    await page.getByLabel('Password', { exact: true }).fill(password);
+    await page.locator('#auth button[type=submit]').click();
+    await expect(page.locator('#auth')).not.toBeVisible();
+    await run(page, 'cd ' + base);
+    // A path with a slash: the stage the non-sudo shell runs, with sudo snapshotted at exec.
+    await run(page, `sudo ./coreutils syscall '["getcreds"]'`, { wait: false });
+    await expect(page.locator('#auth-title')).toContainText('sudo');
+    await page.getByLabel('Password', { exact: true }).fill(password);
+    await page.locator('#auth button[type=submit]').click();
+    const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
+    await expect(busy).toHaveText('↵', { timeout: 30_000 });
+    await expect(page.locator('.transcript pre').last()).toContainText('"user":"root"');
+    // A bare coreutils applet goes the same way, with sudo already active.
+    await run(page, `sudo syscall '["getcreds"]'`);
+    await expect(page.locator('.transcript pre').last()).toContainText('"user":"root"');
+  } finally {
+    await program(request, ['userdel', '-r', name]);
+  }
 });

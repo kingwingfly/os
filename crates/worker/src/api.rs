@@ -83,6 +83,24 @@ pub fn errno_reply(error: &abi::Error) -> Reply {
     reply.body["errno"] = json!(error.errno);
     reply
 }
+
+/// The live process a request's `X-Process-Token` names, in the request's own namespace. A
+/// token that does not resolve (or names another browser's process) is refused, never treated
+/// as no header: a process request must act as its snapshot, not as the page signed in later.
+fn process_caller(
+    db: &Db,
+    token: Option<&str>,
+    key: Option<&str>,
+    guest: Option<&str>,
+) -> std::result::Result<Option<crate::procs::Row>, abi::Error> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let ns = Db::namespace(key, guest);
+    db.process_token(token, None, &ns)
+        .map(Some)
+        .ok_or_else(|| abi::Error::because(abi::Errno::EPERM, "not this browser's process"))
+}
 pub fn denied(message: &str, who: &Identity) -> Reply {
     let status = if commands::is_permission_error(message) {
         if is_guest_id(who.id) { 401 } else { 403 }
@@ -156,9 +174,15 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             run(state, move |db| {
                 // A process's byte request carries its token: it reads as its snapshot, never
                 // as the page signed in later.
-                let row = proc_token
-                    .as_deref()
-                    .and_then(|token| db.process_token(token, None));
+                let row = match process_caller(
+                    db,
+                    proc_token.as_deref(),
+                    key.as_deref(),
+                    guest.as_deref(),
+                ) {
+                    Ok(row) => row,
+                    Err(error) => return errno_reply(&error).keep(),
+                };
                 let who = row.as_ref().map_or_else(
                     || auth::identity_of(db, key.as_deref(), guest.as_deref()),
                     |row| row.identity(),
@@ -218,9 +242,15 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let guest = auth::guest_key(req);
             let proc_token = req.headers().get("X-Process-Token")?;
             run(state, move |db| {
-                let row = proc_token
-                    .as_deref()
-                    .and_then(|token| db.process_token(token, None));
+                let row = match process_caller(
+                    db,
+                    proc_token.as_deref(),
+                    key.as_deref(),
+                    guest.as_deref(),
+                ) {
+                    Ok(row) => row,
+                    Err(error) => return errno_reply(&error).keep(),
+                };
                 let who = row.as_ref().map_or_else(
                     || auth::identity_of(db, key.as_deref(), guest.as_deref()),
                     |row| row.identity(),
@@ -234,10 +264,19 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                             .map(|c| json!([c.idx, c.key]))
                             .collect();
                         let path = db.showing(&file.id).pop().unwrap_or(file.target.clone());
+                        let exec = db
+                            .fd_by_token(&token)
+                            .map(|(_, found)| found.exec)
+                            .unwrap_or(false);
+                        let content_type = if exec {
+                            "application/wasm"
+                        } else {
+                            mime(&path)
+                        };
                         Reply::ok(json!({
                             "file": file.id, "size": file.size, "chunk_size": file.chunk_size,
-                            "state": file.state, "etag": file.etag(), "mime": mime(&path), "chunks": chunks,
-                            "readable": file.size,
+                            "state": file.state, "etag": file.etag(), "mime": content_type, "chunks": chunks,
+                            "readable": file.size, "exec": exec,
                         }))
                     }
                     Err(error) => errno_reply(&error).keep(),
@@ -253,9 +292,15 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let guest = auth::guest_key(req);
             let proc_token = req.headers().get("X-Process-Token")?;
             run(state, move |db| {
-                let row = proc_token
-                    .as_deref()
-                    .and_then(|token| db.process_token(token, None));
+                let row = match process_caller(
+                    db,
+                    proc_token.as_deref(),
+                    key.as_deref(),
+                    guest.as_deref(),
+                ) {
+                    Ok(row) => row,
+                    Err(error) => return errno_reply(&error).keep(),
+                };
                 let who = row.as_ref().map_or_else(
                     || auth::identity_of(db, key.as_deref(), guest.as_deref()),
                     |row| row.identity(),
@@ -283,9 +328,15 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let guest = auth::guest_key(req);
             let proc_token = req.headers().get("X-Process-Token")?;
             run(state, move |db| {
-                let row = proc_token
-                    .as_deref()
-                    .and_then(|token| db.process_token(token, None));
+                let row = match process_caller(
+                    db,
+                    proc_token.as_deref(),
+                    key.as_deref(),
+                    guest.as_deref(),
+                ) {
+                    Ok(row) => row,
+                    Err(error) => return errno_reply(&error).keep(),
+                };
                 let who = row.as_ref().map_or_else(
                     || auth::identity_of(db, key.as_deref(), guest.as_deref()),
                     |row| row.identity(),
