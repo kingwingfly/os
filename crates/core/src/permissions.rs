@@ -153,7 +153,7 @@ pub struct Session {
     pub expires: u64,
     pub sudo_until: u64,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Identity {
     pub id: u32,
     pub group: u32,

@@ -46,6 +46,12 @@ class_name = "TerminalAuthority"
 tag = "v1-users-permissions"
 new_sqlite_classes = ["TerminalAuthority"]
 
+# Each browser's machine (machine.rs): its process namespace, one Durable Object per browser,
+# by its name, so that processes do not wait on the filesystem's one authority.
+[[durable_objects.bindings]]
+name = "MACHINE"
+class_name = "Machine"
+
 # Jobs (zip, unzip, tar, faststart): one JobRunner Durable Object, and its container, a job.
 [[durable_objects.bindings]]
 name = "JOBS"
@@ -54,6 +60,10 @@ class_name = "JobRunner"
 [[migrations]]
 tag = "v2-job-runner"
 new_sqlite_classes = ["JobRunner"]
+
+[[migrations]]
+tag = "v3-machine"
+new_sqlite_classes = ["Machine"]
 
 [[containers]]
 class_name = "JobRunner"

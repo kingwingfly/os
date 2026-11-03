@@ -132,16 +132,42 @@ roadmap.
   installs. `web/kernel/protocol.js` is the page's versioned envelope (`v: 1`, one reply per
   request id); `web/app.js` starts it at `started()`, and `web/wasi/exec.mjs` asks it for every
   coreutils process. Two tabs of one browser share the namespace and see each other's pids.
-- **Process registry:** `crates/worker/src/procs.rs` owns `namespaces`, `processes`, `cgroups`
-  and the process token. A namespace is the browser's guest key (`session.<key>` with no guest
-  cookie). `ProcInit` creates PID 1 and the root cgroups; a new boot id reaps what the old one
-  left running as zombies. `Execve` checks with `kernel::executable` (regular, whole, X rule,
-  root's x rule, no setuid), snapshots uid/gid/groups/umask/cgroup, and answers an asset for a
-  build binary (by content, so a copy of one is its asset too) or, for an uploaded image, a
-  process-owned descriptor and read token — plus the 64-hex process token. Tokens are looked up
-  in the caller's namespace only, and a zombie's token is dead with the process. `Fork`, `Exit`,
-  `Wait`, `Kill`, `Getpid`, `ProcPoll` and the `Cgroup*` calls are registry decisions;
-  `/proc/PID/{status,cmdline}` projects them beside job records.
+- **Process registry (moved 2026-11-03, change request 1):** each browser's namespace is a
+  `Machine` Durable Object of its own (`MACHINE`, `id_from_name(ns)`, `machine.rs`), whose
+  SQLite has `namespaces`, `processes`, `cgroups`, `spare` (lent pids) and `revoked` (tokens
+  the authority is still to revoke); `procs.rs` is its registry. A namespace is the browser's
+  guest key (`session.<key>` with no guest cookie). `ProcInit` creates PID 1 (root's, as
+  Linux's; signals to it do nothing) and the root cgroups; a new boot id reaps what the old one
+  left running. Rules:
+  - **Routing:** `Call::is_registry` names the registry's calls (a Kill or Wait of a number
+    too). The client kernel marks its batches `X-Registry: 1`, and the Worker sends them to the
+    machine by the cookies' namespace; the machine refuses any other call (ENOSYS). A page's
+    batch to the authority that carries registry calls has them forwarded (`machine::forward`,
+    `/internal/sys`) with the caller the authority found.
+  - **execve is the one authority call:** the machine gives each stage a pid (`exec_begin`), asks
+    the authority once for the whole pipeline (`/internal/exec`, with the browser's cookies), and
+    records each row (`exec_end`). The authority (`creds.rs`) checks with `kernel::executable`
+    (regular, whole, X rule, root's x rule, no setuid), snapshots uid/gid/groups/umask into
+    `credentials` by the token's hash, and answers an asset for a build binary (by content) or,
+    for an uploaded image, a process-owned descriptor and read token.
+  - **Credentials, not rows, at the authority:** a process's file calls and byte requests are
+    checked by `Db::credential` in the caller's namespace. A fork carries its parent's token (it
+    keeps its credentials and shares its descriptors, owned by the exec's `"ns pid token-prefix"`). The
+    machine revokes a token once no live process holds it (`revoked`), at the end of the batch
+    that ended it (`/internal/revoke`, which closes its descriptors), the alarm retrying; a
+    replaced image's token is revoked by the exec itself.
+  - **Local fork, exit and wait:** the client kernel forks with a lent pid (`Pids`, at most
+    `PIDS_MAX`, within `PROC_MAX`), keeps exits and waits in its own table, and tells the machine
+    in order (`Fork`/`Exit` naming the process by `pid` and `proc`), with its next request or
+    25 ms after (`client.js` `report`); its requests go one at a time (`serially`). `wait`
+    returns after the machine heard, so `/proc` agrees. An exit reparents children to init;
+    zombie orphans are reaped at once.
+  - **Signals:** a machine `Kill` is told to the hosting tab through the authority's events
+    line (`/internal/tell`, `Told::Namespace`). `Gone { seat }` ends a gone tab's processes as
+    SIGKILL; `Seats` lists the seats still running.
+  - **/proc** lists the machine's processes (`machine::list`), fetched before the transaction;
+    a pread through a descriptor that turns out to be /proc's asks again with them
+    (`fds::Read::Processes`). Init is listed for everyone.
 - **Batch identity:** `abi::Batch` gains `pid` and `proc`. A process's batch runs as the
   credentials snapshotted at exec, never as the page signed in later; it cannot login, logout,
   sudo or change the session. Page batches omit both and keep the old meaning.
@@ -225,7 +251,7 @@ These were explicitly chosen by the owner; do not silently replace them with ful
 - A signed-out browser is `guest-<uuid>:guest`, not the single uid 65534: its uid comes from 1,000,000–1,999,999, it owns what it creates in the shared `/guest`, and no home is made until `useradd -m`. Use `is_guest_id` (never `uid == GUEST`) for "signed out"; `GUEST` remains the group and the fallback identity.
 - A process batch carries `pid` and `proc` (the token `Execve` answered). It runs as the credentials snapshotted at exec, with the process's umask and cgroup; it cannot login, logout, sudo or change the browser session. A page batch carries neither and keeps the old session semantics. Tokens are stored hashed, scoped to their namespace, and dead once their process is a zombie.
 - `execve` requires a regular, whole file and the X permission (root too needs an x bit); setuid/setgid never elevate. Build binaries answer their asset, recognized by content so a copy or hard link of `/usr/bin/coreutils` is one too; uploaded wasm answers a descriptor of the process's own and an exec read token, revalidated with the X rule (not R) and usable only with the process's token on `GET /api/file` (`X-Process-Token`). A process token cannot `Execve` itself: the client kernel execs a new process, and process-side `execve` waits for the Phase 3 handshake.
-- The client kernel runs as the browser's SharedWorker, or, where `SharedWorker` is missing, as each tab's dedicated Worker (`web/kernel/protocol.js` `kernelPort`; `client.js` serves both, its port `self` when dedicated). A tab holds the Web Lock `tw-tab-<tab>` from before its first request, and every request carries `tab`; `execve` records it as the process's `seat` (`processes.seat`, `Proc.seat`). The kernel reaps (SIGKILL, then wait) a process whose seat's lock is free: at once where a SharedWorker waits on a tab's lock (`watch`), and at boot and on EAGAIN by `locks.query()` (`reapGone`). Only a SharedWorker without Web Locks reaps by boot id (`ProcInit { boot }`); never a tab's own kernel, which would reap other tabs' processes. `tests/kernel.spec.js` covers a closed tab and the no-SharedWorker fallback.
+- The client kernel runs as the browser's SharedWorker, or, where `SharedWorker` is missing, as each tab's dedicated Worker (`web/kernel/protocol.js` `kernelPort`; `client.js` serves both, its port `self` when dedicated). A tab holds the Web Lock `tw-tab-<tab>` from before its first request, and every request carries `tab`; `execve` records it as the process's `seat` (`processes.seat`, `Proc.seat`). The kernel reaps a process whose seat's lock is free (`Gone`, SIGKILL then init's reap): at once where a SharedWorker waits on a tab's lock (`watch`), and at boot and on EAGAIN by `Seats` and `locks.query()` (`reapGone`). Only a SharedWorker without Web Locks reaps by boot id (`ProcInit { boot }`); never a tab's own kernel, which would reap other tabs' processes. `tests/kernel.spec.js` covers a closed tab and the no-SharedWorker fallback.
 - `/proc` lists the caller's namespace (`procfs` takes `ns`, `Db::namespace(key, guest)`): PIDs are per namespace. A process names only its own descriptors and a page only the page's (`fds::owned`, and `by_token` for read tokens): a process never reaches a page's descriptor, those opened as root under sudo included.
 
 ## UX requirements and fragile areas
@@ -321,7 +347,7 @@ Report what changed, what was tested, and any real limitation. Do not claim depl
     - `grammar::background` finds a trailing `&`, and `start_job` runs it.
     - A run's `cancelled` and terminal input belong to it only while `Run::foreground` is true.
     - `fg`, `bg` and `kill %N` are the shell's. `kill %N` signals the group here and records each pid's signal in the kernel (`jobs::signal`).
-  - **Delivery:** a registry `Kill` tells the namespace's lines (`Told::Namespace`, the events socket's `Line.ns`) `{signal: {pid, signal}}`. app.js turns that into `terminal:signal`, and the tab hosting the pid applies it (`exec.mjs` `hosted`).
+  - **Delivery:** a registry `Kill` (the machine's) tells the namespace's lines through the authority (`/internal/tell`, `Told::Namespace`, the events socket's `Line.ns`) `{signal: {pid, signal}}`. app.js turns that into `terminal:signal`, and the tab hosting the pid applies it (`exec.mjs` `hosted`).
   - **Listings:** `jobs` lists the shell's jobs, then archive processes (non-numeric pids) and uploads; numbered processes are `ps`'s.
 - The transcript renders ANSI (owner, 2026-10-29: "ANSI color support is necessary, now"): core `ansi.rs` parses SGR (16, 256, 24-bit colours; bold, dim, italic, underline, inverse, strike) and OSC 8 links into runs, dropping other CSI/OSC sequences; frontend `render_line` draws them, the 16 colours as `--ansi-N` in style.css. The WASI engine tells a program its stdout is a terminal unless piped.
 - The tree is Arch's (owner: "mine is /sbin -> /usr/bin … change to the same"): usr.rs `TREE` (bin, sbin, lib, lib64 links; /usr's directories; /sys empty and 555), and sys.rs `ensure` (/boot, /mnt, /opt, /run, /srv, /var 755; /tmp 1777); /root is made 750. A typed /bin, /sbin, /usr/sbin or /usr/bin path runs its name (`bin::named`).

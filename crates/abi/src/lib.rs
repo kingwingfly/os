@@ -873,17 +873,41 @@ pub enum Call {
         seat: Option<String>,
     },
     /// fork(2)'s registry half: a child of `pid`, with its credentials, cgroup and descriptors
-    /// copied. The client kernel clones the guest's wasm state (asyncify snapshot).
+    /// copied. The client kernel clones the guest's wasm state (asyncify snapshot). The child
+    /// is `child`, a pid the kernel was lent (`Pids`), when it forked at once and tells of it
+    /// after; with none, the registry gives one.
     Fork {
         pid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child: Option<u32>,
+        /// The parent's token, when its kernel tells of the fork in a batch of others' calls.
+        #[serde(default, rename = "proc", skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
     /// exit(2): the calling process (its token) ends with `status`, or by `signal`. It becomes a
-    /// zombie until its parent waits for it; init reaps orphans.
+    /// zombie until its parent waits for it; init reaps orphans. The kernel that hosts several
+    /// tells of their ends in one batch, each naming its process by `pid` and token (`proc`).
     Exit {
         #[serde(default)]
         status: i32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signal: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+        #[serde(default, rename = "proc", skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    /// Lend the client kernel `count` pids of its namespace, which its forks take at once,
+    /// without asking (`Fork`'s `child`).
+    Pids {
+        count: u32,
+    },
+    /// The tabs (seats) whose processes still run, which the client kernel checks are there.
+    Seats,
+    /// The tab `seat` is gone (its Web Lock is free): what it ran ended with it, as by SIGKILL,
+    /// and init reaps it.
+    Gone {
+        seat: String,
     },
     /// getpid(2), of the calling process.
     Getpid,
@@ -946,6 +970,36 @@ pub enum Call {
         arg: serde_json::Value,
     },
 }
+impl Call {
+    /// Whether the call is the process registry's (each browser's own, not the filesystem's):
+    /// the namespace, its processes and cgroups. A Kill or Wait of a number names a process; of
+    /// a word, an archive job.
+    pub fn is_registry(&self) -> bool {
+        match self {
+            Call::ProcInit { .. }
+            | Call::Execve { .. }
+            | Call::Fork { .. }
+            | Call::Exit { .. }
+            | Call::Pids { .. }
+            | Call::Seats
+            | Call::Gone { .. }
+            | Call::Getpid
+            | Call::ProcPoll { .. }
+            | Call::CgroupCreate { .. }
+            | Call::CgroupRemove { .. }
+            | Call::CgroupSet { .. }
+            | Call::CgroupAttach { .. }
+            | Call::CgroupStat { .. }
+            | Call::CgroupList { .. } => true,
+            Call::Kill { pid, .. } | Call::Wait { pid, .. } => pid.parse::<u32>().is_ok(),
+            _ => false,
+        }
+    }
+}
+
+/// The most pids `Pids` lends at once.
+pub const PIDS_MAX: u32 = 64;
+
 fn root() -> String {
     "root".into()
 }
@@ -1116,5 +1170,43 @@ mod tests {
         assert_eq!(signaled(9), Some(SIGKILL));
         assert_eq!(signaled(3 << 8), None);
         assert_eq!(Errno::ENOEXEC.text(), "Exec format error");
+        // A kernel tells of several processes' ends in one batch, each by its pid and token.
+        let exit: Call =
+            serde_json::from_str(r#"{"exit":{"status":3,"pid":9,"proc":"cd"}}"#).unwrap();
+        assert_eq!(
+            exit,
+            Call::Exit {
+                status: 3,
+                signal: None,
+                pid: Some(9),
+                token: Some("cd".into()),
+            }
+        );
+        let old: Call = serde_json::from_str(r#"{"fork":{"pid":4}}"#).unwrap();
+        assert_eq!(
+            old,
+            Call::Fork {
+                pid: 4,
+                child: None,
+                token: None,
+            }
+        );
+        // The registry's calls, and a Kill or Wait of a number, are the browser's own.
+        assert!(Call::Seats.is_registry());
+        assert!(
+            Call::Kill {
+                pid: "12".into(),
+                signal: None
+            }
+            .is_registry()
+        );
+        assert!(
+            !Call::Kill {
+                pid: "a1b2".into(),
+                signal: None
+            }
+            .is_registry()
+        );
+        assert!(!Call::Getcreds.is_registry());
     }
 }

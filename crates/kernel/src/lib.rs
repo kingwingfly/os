@@ -97,6 +97,9 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
         | Call::Execve { .. }
         | Call::Fork { .. }
         | Call::Exit { .. }
+        | Call::Pids { .. }
+        | Call::Seats
+        | Call::Gone { .. }
         | Call::Getpid
         | Call::ProcPoll { .. }
         | Call::CgroupCreate { .. }

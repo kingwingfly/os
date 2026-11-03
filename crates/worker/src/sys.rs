@@ -57,7 +57,27 @@ pub async fn handle(
         ((), false)
     })?;
     let mut results = Vec::with_capacity(batch.calls.len());
-    for mut call in batch.calls {
+    let mut calls = batch.calls.into_iter().peekable();
+    while let Some(mut call) = calls.next() {
+        // The process registry's calls are the browser's machine's (machine.rs): those in a row
+        // go there at once, with the caller found here.
+        if call.is_registry() {
+            let mut registry = vec![call];
+            while calls.peek().is_some_and(Call::is_registry) {
+                registry.extend(calls.next());
+            }
+            let session = Session {
+                key: key.clone(),
+                guest: guest.clone(),
+                sudo,
+                umask,
+                pid: procs_pid,
+                token: procs_token.clone(),
+            };
+            let cookie = req.headers().get("Cookie")?;
+            results.extend(crate::machine::forward(env, state, &session, cookie, registry).await?);
+            continue;
+        }
         if let Err(error) = resolve(&mut call, &results) {
             results.push(Return::Err(error));
             continue;
@@ -128,6 +148,13 @@ pub async fn handle(
             _ => None,
         };
         let procs_token = procs_token.clone();
+        // A listing or file of /proc tells of the browser's processes, as its machine has them.
+        let procs = if lists_processes(&mut call) {
+            let ns = Db::namespace(key.as_deref(), guest.as_deref());
+            crate::machine::list(env, &ns).await?
+        } else {
+            Vec::new()
+        };
         let result = transact(state, move |db| {
             // A descriptor call stands as it ends, failed or not: a close that fails closes.
             let descriptors = matches!(
@@ -140,10 +167,10 @@ pub async fn handle(
                 key.as_deref(),
                 guest.as_deref(),
                 sid.as_deref(),
-                procs_pid,
                 procs_token.as_deref(),
                 sudo,
                 umask,
+                &procs,
                 call,
             );
             let commit = result.is_ok() || descriptors;
@@ -224,13 +251,13 @@ fn resolve(call: &mut Call, results: &[Return]) -> std::result::Result<(), Error
 }
 
 /// The process a batch runs as, before a transaction finds its account.
-struct Session {
-    key: Option<String>,
-    guest: Option<String>,
-    sudo: bool,
-    umask: u16,
-    pid: Option<u32>,
-    token: Option<String>,
+pub struct Session {
+    pub key: Option<String>,
+    pub guest: Option<String>,
+    pub sudo: bool,
+    pub umask: u16,
+    pub pid: Option<u32>,
+    pub token: Option<String>,
 }
 impl Session {
     /// Its process, session id and process key ("ns pid"), as the store `db` knows them: a
@@ -242,16 +269,15 @@ impl Session {
         let (process, proc) = match self.token.as_deref() {
             Some(token) => {
                 let ns = Db::namespace(self.key.as_deref(), self.guest.as_deref());
-                let row = db
-                    .process_token(token, self.pid, &ns)
+                let credential = db
+                    .credential(token, &ns)
                     .ok_or_else(|| Error::because(Errno::EPERM, "not this process's token"))?;
-                let proc = format!("{} {}", row.ns, row.pid);
                 (
                     Process {
-                        cred: row.identity(),
-                        umask: row.umask,
+                        cred: credential.identity(),
+                        umask: credential.umask,
                     },
-                    Some(proc),
+                    Some(credential.owner()),
                 )
             }
             None => (
@@ -322,25 +348,33 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
             if count > INLINE_MAX {
                 return Err(too_many());
             }
-            let asking = session.clone();
-            let read = transact(state, move |db| {
-                let ns = Db::namespace(asking.key.as_deref(), asking.guest.as_deref());
-                let read = asking.of(db).and_then(|(process, sid, proc)| {
-                    crate::fds::pread(
-                        db,
-                        sid.as_deref(),
-                        &ns,
-                        &process,
-                        fd.map(FdRef::number),
-                        path.as_deref(),
-                        offset,
-                        count,
-                        proc.as_deref(),
-                    )
-                });
-                (read, false)
-            })
-            .map_err(io)??;
+            // A file of /proc that tells of processes is read again with its machine's list.
+            let mut procs: Option<Rc<Vec<crate::procs::Row>>> = None;
+            let read = loop {
+                let (asking, path, listed) = (session.clone(), path.clone(), procs.clone());
+                let read = transact(state, move |db| {
+                    let read = asking.of(db).and_then(|(process, sid, proc)| {
+                        crate::fds::pread(
+                            db,
+                            sid.as_deref(),
+                            listed.as_deref().map(Vec::as_slice),
+                            &process,
+                            fd.map(FdRef::number),
+                            path.as_deref(),
+                            offset,
+                            count,
+                            proc.as_deref(),
+                        )
+                    });
+                    (read, false)
+                })
+                .map_err(io)??;
+                if !matches!(read, crate::fds::Read::Processes) || procs.is_some() {
+                    break read;
+                }
+                let ns = Db::namespace(session.key.as_deref(), session.guest.as_deref());
+                procs = Some(Rc::new(crate::machine::list(env, &ns).await.map_err(io)?));
+            };
             let (data, size) = match read {
                 crate::fds::Read::Bytes(data, size) => (data, size),
                 crate::fds::Read::Chunks(parts, size) => {
@@ -362,6 +396,7 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
                 crate::fds::Read::Asset(asset, offset, length, size) => {
                     (asset_range(env, &asset, offset, length).await?, size)
                 }
+                crate::fds::Read::Processes => return Err(Errno::EIO.into()),
             };
             Ok(json!(Data {
                 data: data.into(),
@@ -555,7 +590,21 @@ fn process(
     sudo: bool,
     umask: u16,
 ) -> std::result::Result<Process, Error> {
-    let cred = auth::elevated_of(db, key, guest, sudo).map_err(|why| {
+    Ok(Process {
+        cred: caller(db, key, guest, sudo)?,
+        umask,
+    })
+}
+
+/// A page's session's account, root under sudo if it may: as whom its batch acts, and whose
+/// credentials an execve snapshots (creds.rs).
+pub fn caller(
+    db: &mut Db,
+    key: Option<&str>,
+    guest: Option<&str>,
+    sudo: bool,
+) -> std::result::Result<Identity, Error> {
+    auth::elevated_of(db, key, guest, sudo).map_err(|why| {
         // Not a wheel member: never. One that has not authenticated lately: not yet. (A guest
         // is never a wheel member, so the session's own account is enough to tell.)
         let errno = if db.can_sudo(&auth::identity(db, key)) {
@@ -564,8 +613,7 @@ fn process(
             Errno::EPERM
         };
         Error::because(errno, why)
-    })?;
-    Ok(Process { cred, umask })
+    })
 }
 
 /// Whose a job is: the calling process's snapshot, or the page's account without sudo (its own
@@ -585,23 +633,24 @@ fn owner(
 }
 
 /// The call `call`, as the process `token` (a process's own snapshot), or, with none, as the
-/// session `key`'s process (`sid`, signed in or not), under sudo if `sudo`.
+/// session `key`'s process (`sid`, signed in or not), under sudo if `sudo`. `procs` are the
+/// browser's processes, as its machine listed them, for a call on /proc.
 #[allow(clippy::too_many_arguments)]
 fn run(
     db: &mut Db,
     key: Option<&str>,
     guest: Option<&str>,
     sid: Option<&str>,
-    pid: Option<u32>,
     token: Option<&str>,
     sudo: bool,
     umask: u16,
+    procs: &[crate::procs::Row],
     call: Call,
 ) -> std::result::Result<serde_json::Value, Error> {
     let ns = Db::namespace(key, guest);
     let caller = match token {
         Some(token) => Some(
-            db.process_token(token, pid, &ns)
+            db.credential(token, &ns)
                 .ok_or_else(|| Error::because(Errno::EPERM, "not this process's token"))?,
         ),
         None => None,
@@ -609,136 +658,20 @@ fn run(
     // A process token acts as the process, with its snapshot's credentials, never as the page
     // signed in later; it cannot sign the browser in or out, or mint sudo.
     let process = match &caller {
-        Some(row) => {
-            if matches!(call, Call::Logout | Call::ProcInit { .. }) {
+        Some(credential) => {
+            if matches!(call, Call::Logout) {
                 return Err(Error::because(
                     Errno::EPERM,
                     "a process cannot change its browser's session",
                 ));
             }
             Process {
-                cred: row.identity(),
-                umask: row.umask,
+                cred: credential.identity(),
+                umask: credential.umask,
             }
         }
         None => process(db, key, guest, sudo, umask)?,
     };
-    let now = auth::now();
-    match call {
-        Call::ProcInit { boot } => {
-            return Ok(db.proc_init(&ns, boot.as_deref(), &process.cred, now));
-        }
-        Call::Execve {
-            pid: target,
-            path,
-            argv,
-            env,
-            cwd,
-            cgroup,
-            seat,
-        } => {
-            // A process cannot replace itself: the page host would keep the old process token
-            // and could never exit or wait the new image. The client kernel execs a new process
-            // (or a child); process-side execve comes with the fork/exec handshake in Phase 3.
-            if caller.is_some() {
-                return Err(Error::because(
-                    Errno::EPERM,
-                    "a process cannot replace itself; the client kernel must execve a new process",
-                ));
-            }
-            let exec = db.execve(
-                &ns,
-                sid,
-                &process.cred,
-                target,
-                &path,
-                &argv,
-                &env,
-                &cwd,
-                cgroup.as_deref(),
-                seat.as_deref(),
-                process.umask,
-                now,
-            )?;
-            return Ok(json!(exec));
-        }
-        Call::Fork { pid } => {
-            let row = caller
-                .as_ref()
-                .ok_or_else(|| Error::because(Errno::EPERM, "fork is a process's call"))?;
-            if pid != row.pid {
-                return Err(Error::because(
-                    Errno::EINVAL,
-                    "fork is called by its parent",
-                ));
-            }
-            return Ok(json!(db.fork(row, now)?));
-        }
-        Call::Exit { status, signal } => {
-            let row = caller
-                .as_ref()
-                .ok_or_else(|| Error::because(Errno::EPERM, "exit is a process's call"))?;
-            db.exit(row, status, signal, now)?;
-            return Ok(serde_json::Value::Null);
-        }
-        Call::Getpid => {
-            let row = caller
-                .as_ref()
-                .ok_or_else(|| Error::because(Errno::EPERM, "getpid is a process's call"))?;
-            return Ok(json!({ "pid": row.pid, "ppid": row.ppid }));
-        }
-        Call::ProcPoll { pids } => {
-            if pids.len() > abi::PROC_POLL_MAX {
-                return Err(Error::because(
-                    Errno::E2BIG,
-                    format!("at most {} processes at a time", abi::PROC_POLL_MAX),
-                ));
-            }
-            return Ok(json!(db.poll(&ns, &pids, &process.cred)));
-        }
-        Call::CgroupCreate {
-            path,
-            controllers: _,
-        } => {
-            db.cgroup_create(&ns, &path)?;
-            return Ok(serde_json::Value::Null);
-        }
-        Call::CgroupRemove { path } => {
-            db.cgroup_remove(&ns, &path)?;
-            return Ok(serde_json::Value::Null);
-        }
-        Call::CgroupSet { path, key, value } => {
-            db.cgroup_set(&ns, &path, &key, &value)?;
-            return Ok(serde_json::Value::Null);
-        }
-        Call::CgroupAttach { pid, path } => {
-            db.cgroup_attach(&ns, pid, &path)?;
-            return Ok(serde_json::Value::Null);
-        }
-        Call::CgroupStat { path } => return db.cgroup_stat(&ns, &path),
-        Call::CgroupList { path } => return Ok(json!(db.cgroup_list(&ns, &path))),
-        Call::Kill {
-            pid: target,
-            signal,
-        } if target.parse::<u32>().is_ok() => {
-            let target: u32 = target.parse().unwrap_or_default();
-            let signal = signal.unwrap_or(abi::SIGTERM);
-            db.kill(&ns, &process.cred, target, signal, now)?;
-            // The tab that hosts it acts on it (web/wasi/exec.mjs): it is told on its line.
-            db.tell(
-                crate::db::Told::Namespace(ns.clone()),
-                json!({ "signal": { "pid": target, "signal": signal } }),
-            );
-            return Ok(serde_json::Value::Null);
-        }
-        Call::Wait { pid: target, .. } if target.parse::<u32>().is_ok() => {
-            let want: u32 = target.parse().unwrap_or_default();
-            let parent = caller.as_ref().map(|row| row.pid);
-            let waited = db.wait(&ns, parent, want)?;
-            return Ok(json!(waited));
-        }
-        _ => {}
-    }
     // /proc/self/fd/N names what the descriptor has open; /proc is procfs's.
     let mut call = call;
     let mut proc = false;
@@ -748,10 +681,12 @@ fn run(
     }
     if proc {
         let opening = matches!(call, Call::Open { .. });
-        let value = crate::procfs::call(db, sid, &ns, &process.cred, call)?;
+        let value = crate::procfs::call(db, sid, procs, &process.cred, call)?;
         // A process's open of /proc is its own descriptor, as any open of its is (fds.rs).
-        if opening && let (Some(sid), Some(row), Some(fd)) = (sid, &caller, value["fd"].as_u64()) {
-            db.set_fd_proc(sid, fd as u32, &format!("{} {}", row.ns, row.pid));
+        if opening
+            && let (Some(sid), Some(credential), Some(fd)) = (sid, &caller, value["fd"].as_u64())
+        {
+            db.set_fd_proc(sid, fd as u32, &credential.owner());
         }
         return Ok(value);
     }
@@ -827,11 +762,18 @@ fn run(
             crate::jobs::call(db, owner, &home, sid, &process, call)
         }
         call @ (Call::Open { .. } | Call::Close { .. } | Call::Ioctl { .. }) => {
-            let caller = caller.as_ref().map(|row| format!("{} {}", row.ns, row.pid));
+            let caller = caller.as_ref().map(crate::creds::Credential::owner);
             crate::fds::call(db, sid, &process, caller.as_deref(), call)
         }
         call => kernel::call(db, &process, call),
     }
+}
+
+/// Whether `call` names /proc's processes (not only /proc/self's descriptors).
+fn lists_processes(call: &mut Call) -> bool {
+    paths(call)
+        .iter()
+        .any(|(path, _)| crate::procfs::of_processes(path))
 }
 
 /// Whether `call` would change what it names.

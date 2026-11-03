@@ -84,20 +84,20 @@ pub fn errno_reply(error: &abi::Error) -> Reply {
     reply
 }
 
-/// The live process a request's `X-Process-Token` names, in the request's own namespace. A
-/// token that does not resolve (or names another browser's process) is refused, never treated
+/// The credentials a request's `X-Process-Token` carries, in the request's own namespace. A
+/// token that does not resolve (or is another browser's process's) is refused, never treated
 /// as no header: a process request must act as its snapshot, not as the page signed in later.
 fn process_caller(
     db: &Db,
     token: Option<&str>,
     key: Option<&str>,
     guest: Option<&str>,
-) -> std::result::Result<Option<crate::procs::Row>, abi::Error> {
+) -> std::result::Result<Option<crate::creds::Credential>, abi::Error> {
     let Some(token) = token else {
         return Ok(None);
     };
     let ns = Db::namespace(key, guest);
-    db.process_token(token, None, &ns)
+    db.credential(token, &ns)
         .map(Some)
         .ok_or_else(|| abi::Error::because(abi::Errno::EPERM, "not this browser's process"))
 }
@@ -168,9 +168,23 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
     match (method.clone(), endpoint.as_str()) {
         // System calls (sys.rs): what user space, the page, asks of the kernel.
         (Method::Post, "/api/sys") => crate::sys::handle(req, env, state, key).await,
+        // What each browser's machine asks of the authority (creds.rs): never a browser's.
+        (
+            Method::Post,
+            "/internal/exec" | "/internal/identity" | "/internal/revoke" | "/internal/tell",
+        ) => Ok(crate::creds::internal(req, state, &endpoint)
+            .await?
+            .unwrap_or_else(|| Reply::error("Not found", 404))),
         (Method::Get, "/internal/read") => {
             let guest = auth::guest_key(req);
             let proc_token = req.headers().get("X-Process-Token")?;
+            // /proc's files tell of the browser's processes, as its machine has them.
+            let procs = if crate::procfs::of_processes(&path) {
+                let ns = Db::namespace(key.as_deref(), guest.as_deref());
+                crate::machine::list(env, &ns).await?
+            } else {
+                Vec::new()
+            };
             run(state, move |db| {
                 // A process's byte request carries its token: it reads as its snapshot, never
                 // as the page signed in later.
@@ -195,8 +209,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     Err(error) => return errno_reply(&error),
                 };
                 if crate::procfs::is(&path) {
-                    let ns = Db::namespace(key.as_deref(), guest.as_deref());
-                    return match crate::procfs::read(db, sid.as_deref(), &ns, &who, &path) {
+                    return match crate::procfs::read(db, sid.as_deref(), &procs, &who, &path) {
                         Ok(text) => Reply::ok(json!({ "generated": text })),
                         Err(error) => errno_reply(&error),
                     };

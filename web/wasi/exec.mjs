@@ -14,17 +14,19 @@ import { STRERROR } from '../http.mjs';
 
 // Executables are the build's own /usr/bin images by default; a stage may name its own path
 // (an uploaded wasm the shell resolved against the working directory). Each process is a
-// registry process: the client kernel asks the worker kernel for it (execve), and its token
-// goes with every batch the process makes. The loader compiles once per immutable content.
+// registry process: the client kernel asks for the pipeline's stages at once (execve, one
+// request), and each one's token goes with every batch the process makes. The loader compiles
+// once per immutable content.
 const COREUTILS = '/usr/bin/coreutils';
 // Why execve or the loader said no, as the shell says it: the name as typed, then glibc's words.
 const refused = (name, error) => {
   const why = error.errno && error.message === error.errno ? (STRERROR[error.errno] ?? error.errno) : error.message;
   return Object.assign(new Error(`${name}: ${why}`), { errno: error.errno });
 };
-// exit(2) of the process `pid`, then waitpid for it, so no zombie stays in the registry. The
-// wait goes even when the exit fails: a process the registry already ended (kill(2) from
-// another tab, whose token is then dead) is a zombie the exit cannot reach but the wait reaps.
+// exit(2) of the process `pid`, then waitpid for it, so no zombie stays in the registry: both
+// happen in the client kernel, which tells the browser's machine in a batch. The wait goes even
+// when the exit fails: a process the machine already ended (kill(2) from another tab) is a
+// zombie the exit cannot reach but the wait reaps.
 const reap = async (pid, { status, signal }) => {
   try { await kernelCall('exit', { pid, status, signal }); } catch { /* ended already */ }
   try { await kernelCall('wait', { pid }); } catch { /* reaped already, or still running */ }
@@ -142,22 +144,39 @@ export async function exec(stages, options = {}) {
   // exits as a hostless process would, and is reaped, so that no process is left in the
   // registry. The stage's place in the pipeline takes the status that ended it.
   const abandon = image => reap(image.pid, { status: 126 });
+  // Each stage's environment: a terminal's for the last one when it writes to the terminal.
+  const environments = stages.map((_, index) => env(!(index === last && tty)));
+  // execve of every stage at once: the worker kernel checks each image and snapshots the
+  // credentials, in one request; each process's token goes with each batch the host makes for
+  // it. A stage may name its own image (an uploaded wasm); the loader compiles it once per
+  // content.
+  const asked = kernelCall('execs', {
+    stages: stages.map((stage, index) => ({
+      path: stage.path ?? COREUTILS,
+      argv: stage.argv ?? stage,
+      env: Object.entries(environments[index]).map(([name, value]) => `${name}=${value}`),
+      cwd,
+    })),
+    sudo,
+  });
+  const images = stages.map((stage, index) => asked.then(results => {
+    const result = results[index];
+    if (result?.ok) return result.ok;
+    const error = result?.err ?? { errno: 'EIO', detail: 'no process was made' };
+    throw Object.assign(new Error(error.detail ?? error.errno), error);
+  }).catch(error => { throw refused((stage.argv ?? stage)[0], error); }));
+  // A stage's refusal is its own to throw, when it starts, if it does.
+  for (const image of images) image.catch(() => {});
+  // What each stage was given, once it is used: a stage never started gives its process back.
+  const taken = new Set();
   const start = async (index, io) => {
     const stage = stages[index], argv = stage.argv ?? stage;
     const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
-    const environment = env(!io.stdout.tty);
+    const environment = environments[index];
     let image, worker;
+    taken.add(index);
     try {
-      // execve: the worker kernel checks the image and snapshots the credentials; the process's
-      // token goes with each batch the host makes for it. A stage may name its own image (an
-      // uploaded wasm); the loader compiles it once per content.
-      image = await kernelCall('exec', {
-        path: stage.path ?? COREUTILS,
-        argv,
-        env: Object.entries(environment).map(([name, value]) => `${name}=${value}`),
-        cwd,
-        sudo,
-      }).catch(error => { throw refused(argv[0], error); });
+      image = await images[index];
       if (stopped) return await canceled(image);
       const { module, memory } = await load(image).catch(error => { throw refused(argv[0], error); });
       if (stopped) return await canceled(image);
@@ -263,8 +282,10 @@ export async function exec(stages, options = {}) {
       }
     }
   } finally {
-    // What still runs, if starting one failed, ends with the pipeline.
+    // What still runs, if starting one failed, ends with the pipeline; what was made for a
+    // stage that never started is given back.
     for (const process of processes) process.kill(SIGINT);
+    images.forEach((image, index) => { if (!taken.has(index)) image.then(abandon, () => {}); });
     clearInterval(watch);
     if (input) { input.close(); onTty(null); }
   }

@@ -1,8 +1,12 @@
 // The client kernel: a classic worker, so it can importScripts the no-modules wasm-bindgen
-// build, with the Rust kernel (crates/client-kernel) holding the process tokens. It runs as the
-// browser's SharedWorker, one for every tab, or, where a browser has none (Chrome for Android
-// before 148), as a dedicated Worker of one tab, which speaks through itself as its port. Every
-// decision is the worker kernel's, reached by the Rust kernel through /api/sys.
+// build, with the Rust kernel (crates/client-kernel) holding the processes its tabs host and
+// their tokens. It runs as the browser's SharedWorker, one for every tab, or, where a browser
+// has none (Chrome for Android before 148), as a dedicated Worker of one tab, which speaks
+// through itself as its port. Its requests go to the browser's machine (a Durable Object of
+// its own, by a batch marked X-Registry), which asks the filesystem's authority only of execve.
+// Forks, exits and waits happen in the Rust kernel and are told to the machine in batches:
+// with its next request, or a moment after. Requests go one at a time, so that the machine
+// hears of a fork before the exit of what it made.
 //
 // Each tab holds a Web Lock, `tw-tab-<tab>`, for as long as it lives (web/kernel/protocol.js),
 // and each process says which tab runs it (its seat). A process whose seat's lock is free was
@@ -19,13 +23,37 @@ const locks = self.navigator?.locks;
 const watched = new Set();
 let kernel;
 let starting;
+// What the kernel does, one thing at a time.
+let queue = Promise.resolve();
+const serially = task => {
+  const done = queue.then(task);
+  queue = done.catch(() => {});
+  return done;
+};
+// What happened here goes to the machine a moment after, if nothing took it sooner: the
+// exits and waits of a pipeline's stages, which end together, go together.
+const REPORT_AFTER = 25;
+let reporting = null;
+function report() {
+  if (!kernel?.pending()) return reporting ?? Promise.resolve();
+  reporting ??= new Promise(resolve => setTimeout(resolve, REPORT_AFTER))
+    .then(() => serially(() => kernel.flush()))
+    .catch(() => {})
+    .finally(() => { reporting = null; void report(); });
+  return reporting;
+}
+// Once the machine heard what happened here so far (a few tries, if it cannot be reached).
+async function heard() {
+  const mine = kernel.queued();
+  for (let tries = 0; kernel.reported() < mine && tries < 5; tries++) await report();
+}
 
-// The Rust kernel's transport: one POST, its status and text. Same-origin, so the browser's
-// cookies go with it; the kernel never sees them.
+// The Rust kernel's transport: one POST to the browser's machine, its status and text.
+// Same-origin, so the browser's cookies go with it; the kernel never sees them.
 self.kernelSys = async body => {
   const response = await fetch('/api/sys', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-Registry': '1' },
     body,
   });
   return JSON.stringify({ status: response.status, text: await response.text() });
@@ -39,7 +67,7 @@ function boot() {
     kernel = new wasm_bindgen.Kernel(id);
     const value = JSON.parse(await kernel.init());
     broadcast({ v: VERSION, type: 'event', event: 'started', value });
-    void reapGone().catch(() => {});
+    void serially(() => reapGone()).catch(() => {});
     return value;
   }).catch(error => {
     // A boot that failed (offline, a 5xx) is tried again by the next request, not kept as
@@ -57,19 +85,14 @@ function broadcast(message) {
 
 // The lock a tab holds while it lives.
 const tabLock = seat => `tw-tab-${seat}`;
-// End and reap the process `process`, as SIGKILL would end it, unless it ended already.
-async function reap(process) {
-  try { if (process.state !== 'zombie') await kernel.kill(process.pid, 9); } catch { /* gone already */ }
-  try { await kernel.wait(process.pid); } catch { /* reaped already */ }
-}
 // Reap the processes whose tab is gone: those of `seat`, or of any seat whose lock is free.
+// The machine ends them as SIGKILL would, and init reaps them.
 async function reapGone(seat) {
   if (!locks || !kernel) return;
+  if (seat) { await kernel.gone(seat); return; }
   const held = new Set(((await locks.query()).held ?? []).map(lock => lock.name));
-  const processes = JSON.parse(await kernel.poll('[]'));
-  for (const process of processes) {
-    if (process.pid === 1 || !process.seat) continue;
-    if (seat ? process.seat === seat : !held.has(tabLock(process.seat))) await reap(process);
+  for (const running of JSON.parse(await kernel.seats())) {
+    if (!held.has(tabLock(running))) await kernel.gone(running);
   }
 }
 // Wait for the tab `seat` to go, and reap what it left: its lock is granted here once the tab
@@ -80,28 +103,32 @@ function watch(seat) {
   void locks.request(tabLock(seat), async () => {
     watched.delete(seat);
     await boot();
-    await reapGone(seat);
+    await serially(() => reapGone(seat));
   }).catch(() => watched.delete(seat));
 }
-// execve, as the tab `seat` asks it: where the namespace has no room (EAGAIN), what gone tabs
-// left is reaped, and it is asked once more.
-async function exec(args, seat) {
-  const call = () => kernel.exec(
-    args.path,
-    JSON.stringify(args.argv ?? []),
-    JSON.stringify(args.env ?? []),
-    args.cwd ?? '/',
-    args.cgroup ?? '',
-    !!args.sudo,
-    seat ?? '',
-  );
-  try {
-    return JSON.parse(await call());
-  } catch (error) {
-    if (failure(error).errno !== 'EAGAIN' || !locks) throw error;
-    await reapGone();
-    return JSON.parse(await call());
+// execve of a pipeline's stages, in one request, as the tab `seat` asks it: each stage's
+// process, or its error. Where the namespace has no room (EAGAIN), what gone tabs left is
+// reaped, and it is asked once more.
+async function execs(args, seat) {
+  const stages = (args.stages ?? []).map(stage => ({
+    path: stage.path, argv: stage.argv ?? [], env: stage.env ?? [], cwd: stage.cwd ?? '/', cgroup: stage.cgroup ?? '',
+  }));
+  const call = async () => JSON.parse(await kernel.execs(JSON.stringify(stages), !!args.sudo, seat ?? ''));
+  const results = await call();
+  if (!locks || !results.some(result => result.err?.errno === 'EAGAIN')) return results;
+  // The stages that were given processes give them back before the pipeline is asked again.
+  for (const result of results) {
+    if (!result.ok) continue;
+    try { await kernel.exit(result.ok.pid, 126); await kernel.wait(result.ok.pid); } catch { /* gone already */ }
   }
+  await reapGone();
+  return call();
+}
+// execve of one image: a pipeline of one stage.
+async function exec(args, seat) {
+  const [result] = await execs({ stages: [args], sudo: args.sudo }, seat);
+  if (result.err) throw result.err;
+  return result.ok;
 }
 
 function failure(error) {
@@ -119,6 +146,7 @@ async function dispatch(message) {
     case 'version': return kernel.version();
     case 'namespace': return kernel.namespace();
     case 'exec': return exec(args, tab);
+    case 'execs': return execs(args, tab);
     case 'fork': return JSON.parse(await kernel.fork(args.pid));
     case 'exit': return JSON.parse(await kernel.exit(args.pid, args.status ?? 0, args.signal ?? undefined));
     case 'wait': return JSON.parse(await kernel.wait(args.pid));
@@ -146,11 +174,14 @@ async function handle(port, message) {
   if (sharing) watch(message.tab);
   try {
     await boot();
-    const value = await dispatch(message);
+    const value = await serially(() => dispatch(message));
+    // A wait answers once the machine heard of it, so that /proc agrees.
+    if (message.type === 'wait') await heard();
     port.postMessage({ v: VERSION, id: message.id, ok: value });
   } catch (error) {
     port.postMessage({ v: VERSION, id: message.id, err: failure(error) });
   }
+  void report();
 }
 
 self.onconnect = event => {
