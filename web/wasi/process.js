@@ -93,10 +93,12 @@ function sendSync({ method, url, body, headers, binary }) {
   try { xhr.send(body ?? null); } catch { throw new Errno(EIO); }
   return { status: xhr.status, text: binary ? '' : xhr.responseText, bytes: binary ? new Uint8Array(xhr.response) : null };
 }
+// A transfer that fails, sent or read back, is EIO, as XHR's is.
 async function send({ method, url, body, headers, binary }) {
-  let response;
-  try { response = await fetch(url, { method, body: body ?? undefined, headers }); } catch { throw new Errno(EIO); }
-  return { status: response.status, text: binary ? '' : await response.text(), bytes: binary ? new Uint8Array(await response.arrayBuffer()) : null };
+  try {
+    const response = await fetch(url, { method, body: body ?? undefined, headers });
+    return { status: response.status, text: binary ? '' : await response.text(), bytes: binary ? new Uint8Array(await response.arrayBuffer()) : null };
+  } catch { throw new Errno(EIO); }
 }
 // Whether a call may suspend the image (JSPI: WebAssembly.Suspending and promising).
 let suspending = false;
@@ -982,11 +984,24 @@ async function instantiate(module, type, snapshot) {
   process.wasix = WebAssembly.Module.imports(module).some(entry => entry.module === 'wasix_32v1');
   engine = snapshot ? Engine.child(instance, () => memory, snapshot) : new Engine(instance, () => memory);
 }
-// The imports a module asks for of `namespace`, each one able to suspend the image (JSPI).
+// The calls that never ask the kernel (arguments, clocks, randomness, descriptors' numbers,
+// the working directory, fork and setjmp, and those its host answers in shared memory): they
+// are not wrapped to suspend, as they never do.
+const NEVER_SUSPENDS = new Set([
+  'args_get', 'args_sizes_get', 'environ_get', 'environ_sizes_get', 'clock_res_get', 'clock_time_get',
+  'fd_advise', 'fd_allocate', 'fd_datasync', 'fd_sync', 'fd_fdstat_get', 'fd_fdstat_set_flags',
+  'fd_fdstat_set_rights', 'fd_prestat_get', 'fd_prestat_dir_name', 'fd_seek', 'fd_tell', 'fd_dup',
+  'fd_dup2', 'fd_pipe', 'poll_oneoff', 'proc_exit', 'proc_raise', 'random_get', 'sched_yield', 'getcwd',
+  'proc_id', 'proc_parent', 'proc_signal', 'proc_join', 'proc_fork', 'stack_checkpoint', 'stack_restore',
+  'callback_signal', 'thread_id', 'thread_signal', 'thread_exit', 'futex_wait', 'futex_wake',
+  'futex_wake_all', 'reply',
+]);
+// The imports a module asks for of `namespace`: those that may ask the kernel, able to suspend
+// the image (JSPI).
 function suspendable(namespace) {
   return new Proxy({}, { get: (_, name) => {
     const call = namespace[name];
-    return typeof call === 'function' ? new WebAssembly.Suspending(call) : call;
+    return typeof call === 'function' && !NEVER_SUSPENDS.has(name) ? new WebAssembly.Suspending(call) : call;
   } });
 }
 // Run the image, and what replaces it: its exit status, if `_start` returns. Where calls may
