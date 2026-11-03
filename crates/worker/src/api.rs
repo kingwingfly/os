@@ -152,8 +152,17 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         (Method::Post, "/api/sys") => crate::sys::handle(req, env, state, key).await,
         (Method::Get, "/internal/read") => {
             let guest = auth::guest_key(req);
+            let proc_token = req.headers().get("X-Process-Token")?;
             run(state, move |db| {
-                let who = auth::identity_of(db, key.as_deref(), guest.as_deref());
+                // A process's byte request carries its token: it reads as its snapshot, never
+                // as the page signed in later.
+                let row = proc_token
+                    .as_deref()
+                    .and_then(|token| db.process_token(token, None));
+                let who = row.as_ref().map_or_else(
+                    || auth::identity_of(db, key.as_deref(), guest.as_deref()),
+                    |row| row.identity(),
+                );
                 // /proc's files are written as they are read; /proc/self/fd/N names what the
                 // descriptor has open.
                 let sid = auth::sid(db, key.as_deref(), guest.as_deref());
@@ -207,10 +216,17 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         (Method::Get, "/internal/token") => {
             let token = param("token");
             let guest = auth::guest_key(req);
+            let proc_token = req.headers().get("X-Process-Token")?;
             run(state, move |db| {
-                let who = auth::identity_of(db, key.as_deref(), guest.as_deref());
+                let row = proc_token
+                    .as_deref()
+                    .and_then(|token| db.process_token(token, None));
+                let who = row.as_ref().map_or_else(
+                    || auth::identity_of(db, key.as_deref(), guest.as_deref()),
+                    |row| row.identity(),
+                );
                 let sid = auth::sid(db, key.as_deref(), guest.as_deref());
-                match crate::fds::by_token(db, sid.as_deref(), &who, &token) {
+                match crate::fds::by_token(db, sid.as_deref(), &who, &token, row.as_ref()) {
                     Ok(file) => {
                         let chunks: Vec<_> = db
                             .chunks(&file.id)
@@ -235,10 +251,18 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let index = param("index").parse::<u64>().unwrap_or(u64::MAX);
             let length = param("length").parse::<u64>().unwrap_or(0);
             let guest = auth::guest_key(req);
+            let proc_token = req.headers().get("X-Process-Token")?;
             run(state, move |db| {
-                let who = auth::identity_of(db, key.as_deref(), guest.as_deref());
+                let row = proc_token
+                    .as_deref()
+                    .and_then(|token| db.process_token(token, None));
+                let who = row.as_ref().map_or_else(
+                    || auth::identity_of(db, key.as_deref(), guest.as_deref()),
+                    |row| row.identity(),
+                );
+                let caller = row.map(|row| format!("{} {}", row.ns, row.pid));
                 let sid = auth::sid(db, key.as_deref(), guest.as_deref()).unwrap_or_default();
-                match crate::fds::pwrite(db, &sid, &who, fd, index, length) {
+                match crate::fds::pwrite(db, &sid, &who, fd, index, length, caller.as_deref()) {
                     Ok((key, mime)) => Reply::ok(json!({"key": key, "mime": mime})),
                     Err(error) => errno_reply(&error).keep(),
                 }
@@ -257,8 +281,16 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 return Ok(Reply::error("Invalid write", 400));
             };
             let guest = auth::guest_key(req);
+            let proc_token = req.headers().get("X-Process-Token")?;
             run(state, move |db| {
-                let who = auth::identity_of(db, key.as_deref(), guest.as_deref());
+                let row = proc_token
+                    .as_deref()
+                    .and_then(|token| db.process_token(token, None));
+                let who = row.as_ref().map_or_else(
+                    || auth::identity_of(db, key.as_deref(), guest.as_deref()),
+                    |row| row.identity(),
+                );
+                let caller = row.map(|row| format!("{} {}", row.ns, row.pid));
                 let sid = auth::sid(db, key.as_deref(), guest.as_deref()).unwrap_or_default();
                 let written = crate::fds::written(
                     db,
@@ -269,6 +301,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     &chunk.key,
                     chunk.sha256.as_deref(),
                     chunk.length,
+                    caller.as_deref(),
                 );
                 match written {
                     Ok(value) => Reply::ok(value),

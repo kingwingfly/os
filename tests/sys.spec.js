@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { api, program, rmrf } from './sys.js';
+import { api, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 let sequence = 0;
@@ -419,11 +419,15 @@ test('execve runs /usr binaries, snapshots the caller, and refuses what Linux re
   const dir = base + '/execve';
   await root.batch([{ mkdir: { path: dir, mode: 0o755 } }, { mknod: { path: dir + '/plain', mode: 0o644 } }, { mknod: { path: dir + '/xonly', mode: 0o111 } }, { mkdir: { path: dir + '/sub', mode: 0o755 } }]);
   // A directory is EISDIR, a missing path ENOENT, and the X rule holds for root too: 0644 is
-  // EACCES. An x-only file passes the check, and is ENOEXEC until uploaded wasm runs (Phase 2).
+  // EACCES. An x-only file passes the check: its exec read token revalidates with X, not R.
   expect(await root.sys({ execve: { path: dir, argv: [dir], env: [], cwd: '/' } })).toBe('EISDIR');
   expect(await root.sys({ execve: { path: dir + '/missing', argv: ['missing'], env: [], cwd: '/' } })).toBe('ENOENT');
   expect(await root.sys({ execve: { path: dir + '/plain', argv: ['plain'], env: [], cwd: '/' } })).toBe('EACCES');
-  expect(await root.sys({ execve: { path: dir + '/xonly', argv: ['xonly'], env: [], cwd: '/' } })).toBe('ENOEXEC');
+  const xonly = await root.sys({ execve: { path: dir + '/xonly', argv: ['xonly'], env: [], cwd: '/' } });
+  expect(xonly.token_read).toMatch(/^[0-9a-f]{64}$/);
+  expect(xonly.asset).toBeUndefined();
+  expect(await root.sys({ exit: { status: 0 } }, { pid: xonly.pid, proc: xonly.token })).toBeNull();
+  expect((await root.sys({ wait: { pid: String(xonly.pid) } })).pid).toBe(xonly.pid);
   // An argument vector over Linux's limit is E2BIG before the image is looked at.
   expect(await root.sys({ execve: { path: '/usr/bin/coreutils', argv: ['x'.repeat(129 * 1024)], env: [], cwd: '/' } })).toBe('E2BIG');
 });
@@ -445,4 +449,57 @@ test('proc_init begins a browser namespace, and a new boot reaps what the old on
   expect(init.ok[0].state).toBe('running');
   const [gone] = await ann.batch([{ proc_poll: { pids: [exec.pid] } }]);
   expect(gone.ok).toEqual([]);
+});
+
+test('uploaded wasm execves, its image read by the process token alone', async () => {
+  const WASM = Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x00, 0x00, 0x00, 0x00]);
+  const dir = base + '/wasm';
+  await ann.batch([{ mkdir: { path: dir, mode: 0o755 } }]);
+  // ann's uploaded wasm, executable by its mode; a plain 0644 file is EACCES, for root too.
+  expect((await put(ann.context, `${origin}/api/file?path=${dir}/hello.wasm&overwrite=true`, { data: WASM })).status()).toBe(201);
+  expect((await put(ann.context, `${origin}/api/file?path=${dir}/plain.wasm&overwrite=true`, { data: WASM })).status()).toBe(201);
+  expect(await ann.sys({ execve: { path: dir + '/plain.wasm', argv: ['plain'], env: [], cwd: '/' } })).toBe('EACCES');
+  expect(await root.sys({ execve: { path: dir + '/plain.wasm', argv: ['plain'], env: [], cwd: '/' } })).toBe('EACCES');
+  expect(await ann.sys({ chmod: { path: dir + '/hello.wasm', mode: 0o755 } })).toBe(null);
+  // execve gives the image's descriptor and read token, the process's token, and the content
+  // id as the loader's cache key; /usr's asset stays the system binaries'.
+  const exec = await ann.sys({ execve: { path: dir + '/hello.wasm', argv: ['hello'], env: [], cwd: '/' } });
+  expect(exec.asset).toBeUndefined();
+  expect(exec.pid).toBeGreaterThan(1);
+  expect(exec.fd).toBeGreaterThanOrEqual(3);
+  expect(exec.token).toMatch(/^[0-9a-f]{64}$/);
+  expect(exec.token_read).toMatch(/^[0-9a-f]{64}$/);
+  expect(exec.version).toBeTruthy();
+  expect(exec.size).toBe(WASM.length);
+  // The loader reads the image by the exec token with the process's token; a page cannot.
+  const image = await ann.context.get(`${origin}/api/file?token=${exec.token_read}`, { headers: { 'X-Process-Token': exec.token } });
+  expect(image.status()).toBe(200);
+  expect(Buffer.from(await image.body())).toEqual(WASM);
+  expect((await ann.context.get(`${origin}/api/file?token=${exec.token_read}`)).status()).toBe(409);
+  // Another browser session cannot use either token, however it names them.
+  expect((await root.context.get(`${origin}/api/file?token=${exec.token_read}`, { headers: { 'X-Process-Token': exec.token } })).status()).toBe(409);
+  // The image's descriptor is the process's: the page cannot pread or close it.
+  const [pread] = await ann.batch([{ pread: { fd: exec.fd, count: 8 } }]);
+  expect(pread.err.errno).toBe('EBADF');
+  const [close] = await ann.batch([{ close: { fd: exec.fd } }]);
+  expect(close.err.errno).toBe('EBADF');
+  // exit and wait reap it: its token reads no more.
+  expect(await ann.sys({ exit: { status: 0 } }, { pid: exec.pid, proc: exec.token })).toBeNull();
+  expect((await ann.sys({ wait: { pid: String(exec.pid) } })).pid).toBe(exec.pid);
+  expect((await ann.context.get(`${origin}/api/file?token=${exec.token_read}`, { headers: { 'X-Process-Token': exec.token } })).status()).toBe(409);
+
+  // x-only: the X rule lets it exec; a path read is denied, the exec token reads.
+  expect((await put(ann.context, `${origin}/api/file?path=${dir}/xonly.wasm&overwrite=true`, { data: WASM })).status()).toBe(201);
+  expect(await ann.sys({ chmod: { path: dir + '/xonly.wasm', mode: 0o111 } })).toBe(null);
+  expect((await ann.context.get(`${origin}/api/file?path=${dir}/xonly.wasm`)).status()).toBe(403);
+  const xonly = await ann.sys({ execve: { path: dir + '/xonly.wasm', argv: ['xonly'], env: [], cwd: '/' } });
+  expect(xonly.token_read).toMatch(/^[0-9a-f]{64}$/);
+  expect((await ann.context.get(`${origin}/api/file?token=${xonly.token_read}`, { headers: { 'X-Process-Token': xonly.token } })).status()).toBe(200);
+  expect(await ann.sys({ exit: { status: 0 } }, { pid: xonly.pid, proc: xonly.token })).toBeNull();
+
+  // One still uploading is ETXTBSY.
+  const [opened] = await ann.batch([{ open: { path: dir + '/busy.wasm', flags: 0o1 | 0o100, mode: 0o755, size: WASM.length } }]);
+  expect(opened.ok).toBeTruthy();
+  expect(await ann.sys({ execve: { path: dir + '/busy.wasm', argv: ['busy'], env: [], cwd: '/' } })).toBe('ETXTBSY');
+  await ann.batch([{ close: { fd: opened.ok.fd } }]);
 });

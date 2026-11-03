@@ -32,7 +32,7 @@ extern "C" {
 const ROLLBACK: &str = "rollback";
 
 /// The version of the tables below, which local state made by an older one does not have.
-pub const SCHEMA_VERSION: &str = "4";
+pub const SCHEMA_VERSION: &str = "5";
 
 const SCHEMA: [&str; 35] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
@@ -59,7 +59,7 @@ const SCHEMA: [&str; 35] = [
     // File descriptors (fds.rs): a session's (each browser is one), by number; the content it
     // reads or writes (none once another writer took it over), where, its open(2) flags,
     // whether it made the file, and when it was last kept (its lease).
-    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, token TEXT, root INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(sid, fd))",
+    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, token TEXT, root INTEGER NOT NULL DEFAULT 0, proc TEXT, exec INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(sid, fd))",
     // The next descriptor number of each session: numbers are not given again, as a session's
     // pages share its descriptors, and one may go on using a number another closed.
     "CREATE TABLE IF NOT EXISTS fd_numbers(sid TEXT PRIMARY KEY, next INTEGER NOT NULL)",
@@ -251,6 +251,14 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     if sql.exec("SELECT root FROM fds LIMIT 0", None).is_err() {
         sql.exec(
             "ALTER TABLE fds ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
+            None,
+        )?;
+    }
+    // Descriptors made before processes had their own belong to their session alone.
+    if sql.exec("SELECT proc FROM fds LIMIT 0", None).is_err() {
+        sql.exec("ALTER TABLE fds ADD COLUMN proc TEXT", None)?;
+        sql.exec(
+            "ALTER TABLE fds ADD COLUMN exec INTEGER NOT NULL DEFAULT 0",
             None,
         )?;
     }
@@ -470,6 +478,14 @@ pub struct Fd {
     /// as a descriptor keeps the access it was opened with.
     #[serde(deserialize_with = "flag", default)]
     pub root: bool,
+    /// The process it belongs to ("ns pid"), or none: the browser session's. A process's
+    /// descriptor answers its process alone.
+    #[serde(default)]
+    pub proc: Option<String>,
+    /// Whether it is an exec image: its read token revalidates with the X rule, not R, so an
+    /// x-only file runs.
+    #[serde(deserialize_with = "flag", default)]
+    pub exec: bool,
 }
 impl Fd {
     pub fn writes(&self) -> bool {
@@ -648,7 +664,7 @@ impl Db {
     /// The descriptor `fd` of the session `sid`.
     pub fn fd(&self, sid: &str, fd: u32) -> Option<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased, root FROM fds WHERE sid = ? AND fd = ?",
+            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec FROM fds WHERE sid = ? AND fd = ?",
             vec![text(sid), int(fd)],
         )
         .pop()
@@ -656,14 +672,14 @@ impl Db {
     /// The descriptors of the session `sid`.
     pub fn fds_of(&self, sid: &str) -> Vec<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased, root FROM fds WHERE sid = ? ORDER BY fd",
+            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec FROM fds WHERE sid = ? ORDER BY fd",
             vec![text(sid)],
         )
     }
     /// The descriptor writing `file`, if one is.
     pub fn writer(&self, file: &str) -> Option<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased, root FROM fds WHERE file = ? AND flags & 3 != 0",
+            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec FROM fds WHERE file = ? AND flags & 3 != 0",
             vec![text(file)],
         )
         .pop()
@@ -772,6 +788,22 @@ impl Db {
         created: bool,
         now: u64,
     ) -> u32 {
+        let fd = self.next_fd(sid);
+        self.run(
+            "INSERT INTO fds(sid, fd, file, path, flags, created, leased) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                text(sid),
+                int(fd),
+                file.into(),
+                text(path),
+                int(flags),
+                int(created as u8),
+                int(now),
+            ],
+        );
+        fd
+    }
+    fn next_fd(&mut self, sid: &str) -> u32 {
         #[derive(Deserialize)]
         struct Next {
             next: u32,
@@ -786,16 +818,32 @@ impl Db {
             "INSERT INTO fd_numbers(sid, next) VALUES(?, ?) ON CONFLICT(sid) DO UPDATE SET next = excluded.next",
             vec![text(sid), int(fd.saturating_add(1))],
         );
+        fd
+    }
+    /// A new descriptor of the process `proc` ("ns pid"), open for reading the executable `file`
+    /// execve(2) found (fds::open_exec): its read token, stored hashed, revalidates with the X
+    /// rule, so an x-only file runs; the page cannot name it.
+    pub fn add_exec_fd(
+        &mut self,
+        sid: &str,
+        file: &str,
+        path: &str,
+        proc: &str,
+        token_hash: &str,
+        now: u64,
+    ) -> u32 {
+        let fd = self.next_fd(sid);
         self.run(
-            "INSERT INTO fds(sid, fd, file, path, flags, created, leased) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO fds(sid, fd, file, path, flags, created, leased, token, proc, exec) VALUES(?, ?, ?, ?, ?, 0, ?, ?, ?, 1)",
             vec![
                 text(sid),
                 int(fd),
-                file.into(),
+                text(file),
                 text(path),
-                int(flags),
-                int(created as u8),
+                int(abi::O_RDONLY),
                 int(now),
+                text(token_hash),
+                text(proc),
             ],
         );
         fd
@@ -814,7 +862,8 @@ impl Db {
             vec![text(token), text(sid), int(fd)],
         );
     }
-    /// The descriptor whose token is `token`, and its session.
+    /// The descriptor whose token is `token`, and its session: a read token, stored as given,
+    /// or an exec token, stored hashed as a capability.
     pub fn fd_by_token(&self, token: &str) -> Option<(String, Fd)> {
         #[derive(Deserialize)]
         struct Of {
@@ -822,7 +871,10 @@ impl Db {
             fd: u32,
         }
         let of = self
-            .rows::<Of>("SELECT sid, fd FROM fds WHERE token = ?", vec![text(token)])
+            .rows::<Of>(
+                "SELECT sid, fd FROM fds WHERE token = ? OR token = ?",
+                vec![text(token), text(&crate::auth::token_hash(token))],
+            )
             .pop()?;
         let found = self.fd(&of.sid, of.fd)?;
         Some((of.sid, found))
@@ -865,6 +917,40 @@ impl Db {
             if closed.flags & abi::O_ACCMODE == abi::O_RDONLY {
                 self.release(closed.file);
             }
+        }
+    }
+    /// Close every descriptor of the process `pid` of namespace `ns` (its exec image): the
+    /// process ended, and its loader already has what it read.
+    pub fn close_proc_fds(&mut self, ns: &str, pid: u32) {
+        #[derive(Deserialize)]
+        struct Owned {
+            sid: String,
+            fd: u32,
+        }
+        let owned = self.rows::<Owned>(
+            "SELECT sid, fd FROM fds WHERE proc = ?",
+            vec![text(&format!("{ns} {pid}"))],
+        );
+        for owned in owned {
+            self.close_fd(&owned.sid, owned.fd);
+        }
+    }
+    /// Close every process descriptor of the namespace `ns`: a new boot reaps the old boot's
+    /// processes, and their images go with them. (A prefix match, not a pattern: LIKE and GLOB
+    /// choke on the long namespace keys.)
+    pub fn close_ns_proc_fds(&mut self, ns: &str) {
+        #[derive(Deserialize)]
+        struct Owned {
+            sid: String,
+            fd: u32,
+        }
+        let prefix = format!("{ns} ");
+        let owned = self.rows::<Owned>(
+            "SELECT sid, fd FROM fds WHERE substr(proc, 1, ?) = ?",
+            vec![int(prefix.len()), text(&prefix)],
+        );
+        for owned in owned {
+            self.close_fd(&owned.sid, owned.fd);
         }
     }
     /// Delete the sessions `condition` selects, and their expiries; the pages holding them hear

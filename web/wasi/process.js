@@ -91,10 +91,13 @@ function stat(path, follow = true) {
   return found;
 }
 // Bytes `start`..`end` of the file at `path`, by a ranged GET: by its descriptor's token, which
-// the Worker serves without asking the kernel each time, if it has one.
+// the Worker serves without asking the kernel each time, if it has one. A process's request
+// carries the process's token: the kernel answers as whom it was executed.
 function range(path, start, end, token) {
   const url = token ? '/api/file?token=' + encodeURIComponent(token) : '/api/file?path=' + encodeURIComponent(path);
-  const xhr = request('GET', url, null, { Range: `bytes=${start}-${end - 1}` }, true);
+  const headers = { Range: `bytes=${start}-${end - 1}` };
+  if (process.proc) headers['X-Process-Token'] = process.proc;
+  const xhr = request('GET', url, null, headers, true);
   if (xhr.status === 416) return new Uint8Array(0);
   if (xhr.status !== 200 && xhr.status !== 206) throw new Errno(xhr.status === 404 ? ENOENT : xhr.status === 403 ? ERRNO.EACCES : EIO);
   return new Uint8Array(xhr.response);
@@ -261,7 +264,9 @@ function flushChunk(found) {
   const count = Math.min(found.chunk, found.length);
   const chunk = found.buffer.slice(0, count);
   const index = found.flushed / found.chunk;
-  const xhr = request('PUT', `/api/pwrite?fd=${found.kfd}&index=${index}`, chunk, { 'Content-Type': 'application/octet-stream' });
+  const headers = { 'Content-Type': 'application/octet-stream' };
+  if (process.proc) headers['X-Process-Token'] = process.proc;
+  const xhr = request('PUT', `/api/pwrite?fd=${found.kfd}&index=${index}`, chunk, headers);
   if (xhr.status >= 300) throw new Errno(errnoOf(safeJson(xhr.responseText)));
   found.buffer.copyWithin(0, count, found.length);
   found.length -= count;
@@ -546,6 +551,9 @@ const wasi = {
 };
 // What WASI has that a program here cannot do (sockets): not implemented.
 const preview1 = new Proxy(wasi, { get: (target, name) => target[name] ?? (() => ENOSYS) });
+// WASIX, which an uploaded module may ask for (its runtime lands with fork, phase 3): every
+// call not implemented, as ENOSYS says.
+const wasix = new Proxy({}, { get: () => () => ENOSYS });
 
 // utimensat(2), as WASI asks it: each time given, now, or left.
 function times(path, atim, mtim, flags) {
@@ -587,8 +595,11 @@ onmessage = async ({ data }) => {
   fds.set(3, { kind: 'dir', path: '/' });
   let code = 0;
   try {
-    const instance = await WebAssembly.instantiate(data.module, { wasi_snapshot_preview1: preview1, terminal });
-    memory = instance.exports.memory;
+    // A module importing its memory (WASIX's do) gets one; its own otherwise, as wasip1's.
+    const importsMemory = WebAssembly.Module.imports(data.module).some(entry => entry.kind === 'memory');
+    const env = importsMemory ? { memory: new WebAssembly.Memory({ initial: 2 }) } : {};
+    const instance = await WebAssembly.instantiate(data.module, { wasi_snapshot_preview1: preview1, terminal, wasix_32v1: wasix, env });
+    memory = instance.exports.memory ?? env.memory;
     instance.exports._start();
   } catch (err) {
     if (err instanceof Exit) code = err.code;

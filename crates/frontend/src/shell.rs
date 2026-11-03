@@ -206,13 +206,23 @@ fn call(object: &JsValue, name: &str, argument: &JsValue) {
     }
 }
 /// The process the stage `args` runs, if it is one: a utility of /usr/bin's coreutils the
-/// terminal has no program of its own for (by name, by its path, or as `coreutils NAME`), with
-/// the arguments it is given. [`Shell::invoke`] runs it so, and a pipeline at once with the
+/// terminal has no program of its own for (by name, by its path, or as `coreutils NAME`), or
+/// the executable at a path with a slash (`./prog`, `dir/prog`), which runs as on Linux, by
+/// execve. The pair is (its own path, resolved against the working directory, if it has one)
+/// and the argv. [`Shell::invoke`] runs a single one so, and a pipeline at once with the
 /// processes beside it.
-fn process(args: &[String]) -> Option<Vec<String>> {
+fn process(shell: &Shell, args: &[String]) -> Option<(Option<String>, Vec<String>)> {
     let mut args = args.to_vec();
-    if let Some(named) = cli_bin::named(args.first()?) {
-        args[0] = named.to_string();
+    // A path with a slash execs what it names, after the system directories' own meaning
+    // (/usr/bin/cut runs coreutils' cut; /bin and /sbin link there).
+    if let Some(first) = args.first().filter(|first| first.contains('/')) {
+        if let Some(named) = cli_bin::named(first) {
+            args[0] = named.to_string();
+        } else {
+            let path = terminal_worker_core::resolve(&shell.cwd.get_untracked(), first)
+                .unwrap_or_else(|_| first.to_string());
+            return Some((Some(path), args));
+        }
     }
     let name = args[0].clone();
     if cli::wants_help(&args) && cli::help(&name).is_some() {
@@ -221,12 +231,12 @@ fn process(args: &[String]) -> Option<Vec<String>> {
     if name == "coreutils" {
         args.remove(0);
         cli_bin::program(args.first()?)?;
-        return Some(args);
+        return Some((None, args));
     }
     let own = commands::find(&name).is_some()
         || cli::definition(&name).is_some()
         || userland::PROGRAMS.contains(&name.as_str());
-    (cli_bin::program(&name).is_some() && !own).then_some(args)
+    (cli_bin::program(&name).is_some() && !own).then_some((None, args))
 }
 pub(crate) fn js_message(error: JsValue) -> String {
     js_sys::Reflect::get(&error, &JsValue::from_str("message"))
@@ -935,12 +945,12 @@ impl Shell {
     /// transcript. Ctrl+C kills it.
     pub async fn bin(
         self,
-        args: Vec<String>,
+        stage: (Option<String>, Vec<String>),
         stdin: Option<String>,
         piped: bool,
         sudo: bool,
     ) -> Result<Output, String> {
-        self.processes(vec![args], stdin, false, piped, sudo, None)
+        self.processes(vec![stage], stdin, false, piped, sudo, None)
             .await
     }
     /// Run `stages`, each a utility of coreutils and its arguments, as a pipeline of processes
@@ -951,15 +961,17 @@ impl Shell {
     /// line at a time. Ctrl+C kills them.
     pub async fn processes(
         self,
-        mut stages: Vec<Vec<String>>,
+        mut stages: Vec<(Option<String>, Vec<String>)>,
         stdin: Option<String>,
         terminal: bool,
         piped: bool,
         sudo: bool,
         enough: Option<usize>,
     ) -> Result<Output, String> {
-        for args in &mut stages {
-            args[0] = cli_bin::program(&args[0]).unwrap_or_default().to_string();
+        for (path, args) in &mut stages {
+            if path.is_none() {
+                args[0] = cli_bin::program(&args[0]).unwrap_or_default().to_string();
+            }
         }
         let set = |options: &js_sys::Object, key: &str, value: JsValue| {
             let _ = js_sys::Reflect::set(options, &JsValue::from_str(key), &value);
@@ -1040,15 +1052,24 @@ impl Shell {
             }
         });
         set(&options, "onReading", reading.as_ref().clone());
-        let names: Vec<String> = stages.iter().map(|args| args[0].clone()).collect();
+        let names: Vec<String> = stages.iter().map(|(_, args)| args[0].clone()).collect();
+        // An uploaded program's writes are its own: refresh after one ran, as after coreutils'.
+        let execed = stages.iter().any(|(path, _)| path.is_some());
         let argvs = js_sys::Array::new();
-        for args in stages {
-            argvs.push(
-                &args
-                    .into_iter()
+        for (path, args) in stages {
+            let stage = js_sys::Object::new();
+            if let Some(path) = path {
+                set(&stage, "path", path.into());
+            }
+            set(
+                &stage,
+                "argv",
+                args.into_iter()
                     .map(JsValue::from)
-                    .collect::<js_sys::Array>(),
+                    .collect::<js_sys::Array>()
+                    .into(),
             );
+            argvs.push(&stage);
         }
         let exited = JsFuture::from(crate::exec(&argvs, &options.into())).await;
         self.terminal.set_value(None);
@@ -1085,7 +1106,7 @@ impl Shell {
                 "{name}: output larger than 10 MB was cut short, and {name} stopped"
             ));
         }
-        if names.iter().any(|name| cli_bin::writes(name)) {
+        if execed || names.iter().any(|name| cli_bin::writes(name)) {
             self.refresh().await?;
         }
         Ok(Output {
@@ -1223,7 +1244,7 @@ impl Shell {
             }
             // A name the terminal has nothing of its own for runs coreutils', as PATH finds it,
             // and `coreutils NAME` uutils' NAME.
-            if let Some(argv) = process(&args) {
+            if let Some(argv) = process(&self, &args) {
                 return self.bin(argv, stdin, piped, false).await;
             }
             if name == "coreutils" {
@@ -1358,14 +1379,14 @@ impl Shell {
             // first of a line reads the terminal.
             let mut run = Vec::new();
             if let Ok(args) = &args
-                && let Some(argv) = process(args)
+                && let Some(stage) = process(&self, args)
             {
-                run.push(argv);
+                run.push(stage);
                 while index < last {
                     let next = self.expand(std::mem::take(&mut stages[index + 1])).await;
-                    match next.as_ref().ok().and_then(|args| process(args)) {
-                        Some(argv) => {
-                            run.push(argv);
+                    match next.as_ref().ok().and_then(|args| process(&self, args)) {
+                        Some(stage) => {
+                            run.push(stage);
                             index += 1;
                         }
                         None => {

@@ -1,0 +1,139 @@
+import { test, expect } from '@playwright/test';
+import { readFile } from 'node:fs/promises';
+import { api, call, mkdirp, program, put, rmrf } from './sys.js';
+const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const binaryen = (await import('binaryen')).default;
+const coreutils = await readFile('dist/usr/bin/coreutils.wasm');
+const file = path => '/api/file?path=' + encodeURIComponent(path);
+const assemble = wat => Buffer.from(binaryen.parseText(wat).emitBinary());
+let base, headers;
+
+// Uploaded wasm, execve'd by its path (issue #20, phase 2): any path with the execute bit runs,
+// the loader compiles it once per content, and the kernel's rules hold as for any file: the X
+// rule, no setuid, no session of its own. The fixtures are the build's own coreutils, WAT
+// modules assembled here, and plain text.
+const BAD_IMPORT = assemble('(module (import "foo" "bar" (func)) (memory 1) (func (export "_start")))');
+const NO_START = assemble('(module (memory 1))');
+const NO_MEMORY = assemble('(module (func (export "_start")))');
+const SCRIPT = Buffer.from('#!/bin/sh\necho no\n');
+
+test.beforeEach(async ({ request, page }) => {
+  base = '/exec-' + Date.now().toString(36);
+  headers = { Origin: origin, 'CF-Connecting-IP': 'exec-' + base };
+  await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'exec-ui-' + base });
+  expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
+  await mkdirp(request, base, 0o755);
+  const upload = async (name, data, mode = 0o755) => {
+    expect((await put(request, file(`${base}/${name}`), { headers, data })).status()).toBe(201);
+    expect(await call(request, { chmod: { path: `${base}/${name}`, mode } }, { headers })).toBeNull();
+  };
+  await upload('coreutils', coreutils);
+  await upload('script.sh', SCRIPT);
+  await upload('bad-import', BAD_IMPORT);
+  await upload('no-start', NO_START);
+  await upload('no-memory', NO_MEMORY);
+  await upload('plain', coreutils, 0o644);
+  await mkdirp(request, `${base}/x`, 0o755);
+  await upload('x/coreutils', coreutils, 0o111);
+  await mkdirp(request, `${base}/sub`, 0o755);
+});
+test.afterEach(async ({ request }) => { await rmrf(request, base); });
+
+const transcript = page => page.locator('.transcript');
+// Run `text` to its end, as bin.spec's does.
+async function run(page, text, { wait = true } = {}) {
+  const input = page.getByRole('combobox', { name: 'Terminal command' });
+  const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
+  await expect(busy).toHaveText('↵');
+  await input.fill(text); await input.press('Enter');
+  if (wait) await expect(busy).toHaveText('↵', { timeout: 30_000 });
+}
+async function terminal(page) {
+  await page.goto('/');
+  await run(page, 'su root', { wait: false });
+  await page.getByLabel('Password', { exact: true }).fill(password); await page.locator('#auth button[type=submit]').click();
+  await expect(page.locator('#auth')).not.toBeVisible();
+  await run(page, 'cd ' + base);
+}
+
+test('an uploaded wasm runs by its path, with the working directory, environment and pipes', async ({ page }) => {
+  await terminal(page);
+  await run(page, './coreutils seq 3');
+  await expect(page.locator('.transcript pre').last()).toHaveText('1\n2\n3');
+  // Its argv, its working directory and its account's environment are the process's.
+  await run(page, './coreutils pwd');
+  await expect(page.locator('.transcript pre').last()).toHaveText(base);
+  await run(page, './coreutils printenv USER');
+  await expect(page.locator('.transcript pre').last()).toHaveText('root');
+  // Full terminal.sys as the caller: getcreds says whom it was executed as.
+  await run(page, `./coreutils syscall '["getcreds"]'`);
+  await expect(page.locator('.transcript pre').last()).toContainText('"user":"root"');
+  // Two of them in one pipeline, each a process, and an in-page head closing the pipe.
+  await run(page, './coreutils seq 9 | ./coreutils tail -n 2');
+  await expect(page.locator('.transcript pre').last()).toHaveText('8\n9');
+  await run(page, './coreutils seq 3 | head -n 2');
+  await expect(page.locator('.transcript pre').last()).toHaveText('1\n2');
+  // Its module is compiled once per content: the same file runs again from the cache.
+  const before = await page.evaluate(() => window.loaderStats.compiled);
+  await run(page, './coreutils seq 1');
+  await run(page, './coreutils seq 2');
+  expect(await page.evaluate(() => window.loaderStats.compiled)).toBe(before);
+  // A nonzero status is the process's; the next command still runs.
+  await run(page, './coreutils false');
+  await run(page, './coreutils echo alive');
+  await expect(page.locator('.transcript pre').last()).toHaveText('alive');
+  // Ctrl+C kills it, as a process's.
+  const input = page.getByRole('combobox', { name: 'Terminal command' });
+  const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
+  await input.fill('./coreutils sleep 30'); await input.press('Enter');
+  await expect(busy).not.toHaveText('↵');
+  await page.waitForTimeout(500);
+  await input.press('Control+c');
+  await expect(busy).toHaveText('↵', { timeout: 5_000 });
+});
+
+test('the loader and the X rule refuse as Linux refuses, with its words', async ({ page }) => {
+  await terminal(page);
+  // A text file with the execute bit is not a program; a wasm-looking name does not help it.
+  await run(page, './script.sh');
+  await expect(transcript(page)).toContainText('./script.sh: cannot execute binary file: Exec format error');
+  // Imports the engine does not give, no entry point, no memory: ENOEXEC, saying why.
+  await run(page, './bad-import');
+  await expect(transcript(page)).toContainText('./bad-import: cannot execute binary file: Exec format error (unknown import foo.bar)');
+  await run(page, './no-start');
+  await expect(transcript(page)).toContainText('./no-start: cannot execute binary file: Exec format error (no _start)');
+  await run(page, './no-memory');
+  await expect(transcript(page)).toContainText('./no-memory: cannot execute binary file: Exec format error (no memory)');
+  // The X rule, for root too: 0644 is EACCES, a directory EISDIR, a missing name ENOENT.
+  await run(page, './plain');
+  await expect(transcript(page)).toContainText('./plain: Permission denied');
+  await run(page, './sub');
+  await expect(transcript(page)).toContainText('./sub: Is a directory');
+  await run(page, './missing');
+  await expect(transcript(page)).toContainText('./missing: No such file or directory');
+  // An x-only file runs: its image is read by the exec token, never by path.
+  await run(page, './x/coreutils seq 2');
+  await expect(page.locator('.transcript pre').last()).toHaveText('1\n2');
+});
+
+test('setuid on an upload does not elevate, and a process cannot sign the browser out', async ({ page, request }) => {
+  const name = 'execann' + Date.now().toString(36), annPassword = 'exec-password-' + Date.now();
+  expect((await program(request, ['useradd', name])).ok()).toBe(true);
+  expect((await api(request, 'passwd', { headers, data: { username: name, password: annPassword } })).ok()).toBe(true);
+  // root's upload, made setuid by root, still runs as whom it was executed by, not as root.
+  expect(await call(request, { chmod: { path: `${base}/coreutils`, mode: 0o4755 } }, { headers })).toBeNull();
+  await terminal(page);
+  await run(page, `su ${name}`);
+  await run(page, `cd ${base}`);
+  await run(page, `./coreutils syscall '["getcreds"]'`);
+  await expect(page.locator('.transcript pre').last()).toContainText(`"user":"${name}"`);
+  await expect(page.locator('.transcript pre').last()).not.toContainText('"user":"root"');
+  // A process cannot mutate the browser's session.
+  await run(page, `./coreutils syscall '[{"logout":null}]'`);
+  await expect(page.locator('.transcript pre').last()).toContainText('"errno":"EPERM"');
+  await run(page, 'whoami');
+  await expect(page.locator('.transcript pre').last()).toHaveText(name);
+  await run(page, 'exit');
+  await program(request, ['userdel', name]);
+});

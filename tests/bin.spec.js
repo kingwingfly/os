@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { api, call, mkdirp, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const coreutilsImage = await readFile('dist/usr/bin/coreutils.wasm');
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 let base, headers;
 
@@ -35,7 +36,7 @@ async function terminal(page) {
   await run(page, 'cd ' + base);
 }
 
-test('uutils runs as programs of /bin: arguments, the working directory, pipes and exit statuses', async ({ page }) => {
+test('uutils runs as programs of /bin: arguments, the working directory, pipes and exit statuses', async ({ page, request }) => {
   await terminal(page);
   await run(page, 'seq 3');
   await expect(transcript(page)).toContainText('1\n2\n3');
@@ -61,6 +62,14 @@ test('uutils runs as programs of /bin: arguments, the working directory, pipes a
   await expect(page.locator('.transcript pre').last()).toHaveText('3\n1\n2');
   await run(page, '/usr/bin/nothing');
   await expect(transcript(page)).toContainText('/usr/bin/nothing: No such file or directory');
+  // An uploaded copy of the same image runs by its path (execve of uploaded wasm, phase 2);
+  // /usr/bin/ls stays the page's own program.
+  expect((await put(request, file(base + '/coreutils'), { headers, data: coreutilsImage })).status()).toBe(201);
+  await call(request, { chmod: { path: base + '/coreutils', mode: 0o755 } }, { headers });
+  await run(page, './coreutils seq 3');
+  await expect(page.locator('.transcript pre').last()).toHaveText('1\n2\n3');
+  await run(page, '/usr/bin/ls');
+  await expect(transcript(page)).toContainText('names.txt');
   // A program of /bin reaches the kernel's own calls too, which WASI has no words for, through
   // the engine's terminal.sys: the batch goes as it is.
   await run(page, `syscall '["getcreds",{"lstat":{"path":"names.txt"}},{"stat":{"path":"${base}/names.txt"}}]'`);

@@ -357,7 +357,7 @@ uutils' run as processes of their own in the page's WASI engine (`web/wasi/`). T
 
 A pipeline's processes run at once, each one's output the next one's input through a pipe: 64 KiB of memory the page and its processes share (`web/wasi/pipe.js`), where a reader waits while it is empty and a writer while it is full. A write to a pipe whose reader has gone ends its process, as SIGPIPE does (status 141), so `yes | head -n 3` ends at once: the terminal's `head` closes its input once it has its lines, as GNU head does. What the last writes shows in the transcript as it is written, and so do errors, a line at a time. The first reads the terminal, unless given its input: the command line then says `Input ↵`, a line typed goes to it (echoed, and kept out of the history), Ctrl+D ends a read (after what is typed, if anything is), and Ctrl+C kills the pipeline. Sharing memory needs a page isolated from other sites (`web/_headers`: `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: credentialless`, which lets other sites' images load without cookies); where a browser does not isolate it (Safari has no `credentialless`), the processes run one after another, each given what the one before wrote, and nothing reads the terminal. A pipeline joining the terminal's own programs passes text between stages as before. The terminal's own programs run in the page itself, which draws what they give (`ls`'s listing, its icons, colours and uploads' progress) rather than text.
 
-A name runs the terminal's program, or uutils' where it has none; `/usr/bin/NAME`, and `/bin/NAME`, `/sbin/NAME` and `/usr/sbin/NAME` through the links, run what NAME does, and `coreutils NAME` uutils' NAME whatever the terminal has. `help` lists uutils'; `NAME --help` tells how to use one.
+A name runs the terminal's program, or uutils' where it has none; `/usr/bin/NAME`, and `/bin/NAME`, `/sbin/NAME` and `/usr/sbin/NAME` through the links, run what NAME does, and `coreutils NAME` uutils' NAME whatever the terminal has. `help` lists uutils'; `NAME --help` tells how to use one. A typed path with a slash (`./prog`) execs the file it names, as on Linux (below).
 
 ### The client kernel
 
@@ -379,6 +379,17 @@ A signed-out browser is now `guest-<uuid>:guest`, with a uid of its own from the
 cgroup-v2-like hierarchy per namespace (`/init`, `/user`, `/system`, `/cluster`), with
 `cpu.max`, `memory.max`, `pids.max`, `io.max`, `cgroup.freeze` and device rules; enforcement is
 Phase 6.
+
+**Uploaded wasm is the ELF counterpart** (Phase 2): any path with the execute bit runs by its
+name as typed — `./prog`, `dir/prog` — resolved against the working directory. The kernel
+checks the X rule (root needs an x bit too; setuid never elevates) and opens the image as a
+descriptor of the process's own; the loader reads it by an exec token, revalidated with X, not
+R, so an x-only file runs while a path read stays denied. The loader compiles once per content
+id, and admits only WASI preview 1, `terminal.sys`, WASIX (stubbed until Phase 3) and
+`env.memory` imports, a `_start` and a memory — anything else is `Exec format error`, as Linux
+says. The process runs with the credentials snapshotted at exec; its byte requests carry its
+token (`X-Process-Token`), and it cannot sign the browser in or out. `.wasm` files serve as
+`application/wasm`.
 
 Phase 0 measured the limits: SharedWorkers are not cross-origin isolated in Chromium or
 Firefox, so they cannot use `SharedArrayBuffer`; File System Access and WebGPU are

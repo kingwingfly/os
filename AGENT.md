@@ -151,10 +151,46 @@ roadmap.
   and subtrees), with `cpu.max`, `cpu.weight`, `memory.max`, `pids.max`, `io.max`,
   `cgroup.freeze` and `devices.allow/deny` stored and checked. Enforcement (CPU slicing,
   memory limits, freeze at syscall boundaries) is Phase 6.
-- **What is not done yet:** uploaded wasm still answers `ENOEXEC` (Phase 2); descriptors are
-  still the browser session's, not per-process (Phase 4); the WASIX asyncify runtime is not yet
-  wired to `Fork`/`Execve` (Phase 3); there is no pty, init program, GUI device, mount or
-  cluster executor yet.
+- **What is not done yet:** descriptors are still the browser session's, not per-process
+  (Phase 4); the WASIX asyncify runtime is not yet wired to `Fork`/`Execve` (Phase 3); there is
+  no pty, init program, GUI device, mount or cluster executor yet.
+
+## Phase 2 findings (2026-11-01)
+
+Uploaded wasm runs, as the roadmap's execve requires; these are built features, not roadmap.
+
+- **Exec of an uploaded file:** `execve` of a non-`/usr` path that passes `kernel::executable`
+  (regular, whole, X rule — root too needs an x bit) opens the image as a descriptor of the
+  process's own (`fds.proc` = "ns pid", `fds.exec`) and answers `{fd, token_read, version}` with
+  no `asset`. `version` is the immutable content id: the loader's cache key. The exec fd dies
+  with the process (exit, kill, wait) or its boot.
+- **The exec read token, x-only:** `token_read` is stored hashed (a capability, like process
+  tokens; read tokens stay plaintext). `GET /api/file?token=` of an exec descriptor revalidates
+  with the **X rule, not R** (`fds::by_token`), so an x-only 0111 file runs while a path read
+  stays denied, as Linux exec reveals the image. The request must carry the owning process's
+  token (`X-Process-Token`); a page, another process or another browser session gets EBADF, and
+  the Worker's `TOKENS` cache keys grants by session plus process token, so one never serves
+  another.
+- **Process-owned descriptors:** a `proc` fd answers its process alone (`fds::owned`): a page
+  batch or another process naming it (pread, pwrite, close, FICLONE) gets EBADF. Session fds
+  are unchanged. A process's byte requests (`/api/sys` batches, ranged `GET /api/file`,
+  `PUT /api/pwrite`) carry `X-Process-Token`; `api.rs` resolves it to the process's snapshot
+  identity, as `sys.rs` does for batches.
+- **The loader (`web/kernel/loader.js`):** compiles once per content id (LRU 8, shared
+  promises), by `compileStreaming` when the type says wasm (`core::mime` maps `.wasm` to
+  `application/wasm`), and validates: imports only `wasi_snapshot_preview1`, `terminal`,
+  `wasix_32v1` (stubbed NOSYS in process.js until Phase 3) and `env.memory`, plus `_start` and
+  a memory; anything else is ENOEXEC naming the offending import, and a non-wasm file is
+  ENOEXEC. Refusals print glibc's words (`web/http.mjs` STRERROR, reused).
+- **The shell's exec stage:** a stage's first word with a slash (after the system dirs' own
+  meaning: `/usr/bin/NAME` and its links still run the build's) resolves against the tab's
+  directory and execs (`Shell::process`, the `(path, argv)` pair through `Shell::processes` and
+  `web/wasi/exec.mjs`'s per-stage `path`). Bare names keep the builtin/terminal/coreutils
+  tables. A failing exec says `./x: Permission denied` and the like, as Linux does.
+- **Proven by tests:** `tests/sys.spec.js` (exec-token lifecycle, x-only, cross-session and
+  page refusals, ETXTBSY, fd reaping) and `tests/exec.spec.js` (`./coreutils seq 3`, argv/env/
+  cwd, pipeline, compile-once, 0644/0755-text/directory denials, x-only, 4755 no elevation,
+  logout EPERM, Ctrl+C).
 
 
 ## Required account semantics
@@ -171,7 +207,7 @@ These were explicitly chosen by the owner; do not silently replace them with ful
 - Account changes revoke old sessions; a self-password change issues a new current session. Locking revokes sessions. Unlocking does not resurrect them.
 - A signed-out browser is `guest-<uuid>:guest`, not the single uid 65534: its uid comes from 1,000,000–1,999,999, it owns what it creates in the shared `/guest`, and no home is made until `useradd -m`. Use `is_guest_id` (never `uid == GUEST`) for "signed out"; `GUEST` remains the group and the fallback identity.
 - A process batch carries `pid` and `proc` (the token `Execve` answered). It runs as the credentials snapshotted at exec, with the process's umask and cgroup; it cannot login, logout, sudo or change the browser session. A page batch carries neither and keeps the old session semantics. Tokens are stored hashed.
-- `execve` requires a regular, whole file and the X permission (root too needs an x bit); setuid/setgid never elevate. `/usr` binaries answer their asset; uploaded wasm answers `ENOEXEC` until Phase 2.
+- `execve` requires a regular, whole file and the X permission (root too needs an x bit); setuid/setgid never elevate. `/usr` binaries answer their asset; uploaded wasm answers a descriptor of the process's own and an exec read token, revalidated with the X rule (not R) and usable only with the process's token (`X-Process-Token`).
 
 ## UX requirements and fragile areas
 

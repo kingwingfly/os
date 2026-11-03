@@ -17,11 +17,12 @@ export async function sys(calls, options = {}) {
 // open(2)'s flags, as Linux numbers them (abi::O_*).
 export const O_WRONLY = 0o1, O_CREAT = 0o100, O_EXCL = 0o200, O_TRUNC = 0o1000, O_APPEND = 0o2000;
 // glibc's words for the errnos a page meets, for a failure the kernel gave no words of its own.
-const STRERROR = {
+export const STRERROR = {
   EPERM: 'Operation not permitted', ENOENT: 'No such file or directory', EIO: 'Input/output error',
   EBADF: 'Bad file descriptor', EACCES: 'Permission denied', EBUSY: 'Device or resource busy',
   EEXIST: 'File exists', ENOTDIR: 'Not a directory', EISDIR: 'Is a directory', EINVAL: 'Invalid argument',
-  EFBIG: 'File too large', ESTALE: 'Stale file handle',
+  EFBIG: 'File too large', ESTALE: 'Stale file handle', ENOEXEC: 'Exec format error',
+  ETXTBSY: 'Text file busy', E2BIG: 'Argument list too long', ESRCH: 'No such process',
 };
 // What one call answered: its value, or, failed, an error that carries its errno.
 export function answered(answer) {

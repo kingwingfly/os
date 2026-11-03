@@ -9,18 +9,18 @@
 // another, each given what the one before wrote, and nothing reads the terminal.
 import { Pipe, pipeBuffer } from './pipe.js';
 import { kernelCall } from '../kernel/protocol.js';
+import { load } from '../kernel/loader.js';
+import { STRERROR } from '../http.mjs';
 
-// Executables are the build's own /usr/bin images, each compiled once by its asset path, and
-// each process is a registry process: the client kernel asks the worker kernel for it (execve),
-// and its token goes with every batch the process makes.
+// Executables are the build's own /usr/bin images by default; a stage may name its own path
+// (an uploaded wasm the shell resolved against the working directory). Each process is a
+// registry process: the client kernel asks the worker kernel for it (execve), and its token
+// goes with every batch the process makes. The loader compiles once per immutable content.
 const COREUTILS = '/usr/bin/coreutils';
-const compiled = new Map();
-const compile = asset => {
-  if (!compiled.has(asset)) {
-    const module = WebAssembly.compileStreaming(fetch(asset)).catch(error => { compiled.delete(asset); throw error; });
-    compiled.set(asset, module);
-  }
-  return compiled.get(asset);
+// Why execve or the loader said no, as the shell says it: the name as typed, then glibc's words.
+const refused = (name, error) => {
+  const why = error.errno && error.message === error.errno ? (STRERROR[error.errno] ?? error.errno) : error.message;
+  return Object.assign(new Error(`${name}: ${why}`), { errno: error.errno });
 };
 const encoder = new TextEncoder();
 // Status of a process killed by a signal: 128 and its number.
@@ -100,19 +100,19 @@ export async function exec(stages, options = {}) {
     else stop(SIGPIPE);
   };
   const start = async (index, io) => {
-    const argv = stages[index], decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
+    const stage = stages[index], argv = stage.argv ?? stage;
+    const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
     const environment = env(!io.stdout.tty);
     // execve: the worker kernel checks the image and snapshots the credentials; the process's
-    // token goes with each batch the host makes for it.
+    // token goes with each batch the host makes for it. A stage may name its own image (an
+    // uploaded wasm); the loader compiles it once per content.
     const image = await kernelCall('exec', {
-      path: COREUTILS,
+      path: stage.path ?? COREUTILS,
       argv,
       env: Object.entries(environment).map(([name, value]) => `${name}=${value}`),
       cwd,
-    });
-    const module = await compile(image.asset).catch(error => {
-      throw new Error(`${image.path}: ${error.message} (image ${image.asset})`);
-    });
+    }).catch(error => { throw refused(argv[0], error); });
+    const module = await load(image).catch(error => { throw refused(argv[0], error); });
     const worker = new Worker('/wasi-process.js');
     let settle, status = null;
     const exited = new Promise(resolve => { settle = resolve; });
