@@ -96,9 +96,10 @@ const SCHEMA: [&str; 33] = [
     // uid it owns files as, from the anonymous range. No home is made for it.
     "CREATE TABLE IF NOT EXISTS guests(key TEXT PRIMARY KEY, uuid TEXT NOT NULL UNIQUE, uid INTEGER NOT NULL UNIQUE, gid INTEGER NOT NULL, created INTEGER NOT NULL, last_seen INTEGER NOT NULL)",
     // Each exec's credentials (creds.rs), by the hash of the token its process's calls carry:
-    // its browser's namespace, the process that executed, and as whom it acts. The process
-    // table is each browser's own Durable Object's (machine.rs).
-    "CREATE TABLE IF NOT EXISTS credentials(token TEXT PRIMARY KEY, ns TEXT NOT NULL, pid INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, groups TEXT NOT NULL, umask INTEGER NOT NULL, started INTEGER NOT NULL)",
+    // its browser's namespace, the process that executed, as whom it acts, and the key its
+    // process's descriptors are owned by (that of the image it replaced, which it keeps). The
+    // process table is each browser's own Durable Object's (machine.rs).
+    "CREATE TABLE IF NOT EXISTS credentials(token TEXT PRIMARY KEY, ns TEXT NOT NULL, pid INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, groups TEXT NOT NULL, umask INTEGER NOT NULL, started INTEGER NOT NULL, owner TEXT)",
     "CREATE INDEX IF NOT EXISTS credentials_ns ON credentials(ns, pid)",
 ];
 
@@ -248,6 +249,13 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     // the processes of boots that are gone.
     for table in ["processes", "namespaces", "cgroups"] {
         sql.exec(&format!("DROP TABLE IF EXISTS {table}"), None)?;
+    }
+    // Credentials made before they named their descriptors' owner own them by their own key.
+    if sql
+        .exec("SELECT owner FROM credentials LIMIT 0", None)
+        .is_err()
+    {
+        sql.exec("ALTER TABLE credentials ADD COLUMN owner TEXT", None)?;
     }
     // Descriptors made before they said as whom they were opened were not opened as root.
     if sql.exec("SELECT root FROM fds LIMIT 0", None).is_err() {

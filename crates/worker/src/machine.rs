@@ -269,11 +269,20 @@ impl Machine {
                 .map(|call| match call {
                     Call::Execve {
                         pid,
+                        token,
                         argv,
                         env,
                         cgroup,
                         ..
-                    } => db.exec_begin(&ns, *pid, argv, env, cgroup.as_deref(), now),
+                    } => db.exec_begin(
+                        &ns,
+                        *pid,
+                        token.as_deref(),
+                        argv,
+                        env,
+                        cgroup.as_deref(),
+                        now,
+                    ),
                     _ => Err(Errno::EINVAL.into()),
                 })
                 .collect();
@@ -295,6 +304,7 @@ impl Machine {
                     "cwd": cwd,
                     "replacing": begun.replacing,
                     "old": begun.old,
+                    "current": begun.current,
                 }))
             })
             .collect();
@@ -368,7 +378,12 @@ impl Machine {
                     continue;
                 }
             };
-            let cgroup = cgroup.unwrap_or_else(|| "/user".into());
+            // A replaced process stays in its cgroup.
+            let cgroup = begun
+                .cgroup
+                .clone()
+                .or(cgroup)
+                .unwrap_or_else(|| "/user".into());
             let path = image["path"].as_str().unwrap_or_default().to_string();
             let (ns, hash) = (caller.ns.clone(), auth::token_hash(&token));
             let row = (begun.clone(), path.clone(), cgroup.clone());

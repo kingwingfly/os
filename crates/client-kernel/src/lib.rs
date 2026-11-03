@@ -43,12 +43,15 @@ const LEND: u32 = 8;
 /// Linux's init.
 const INIT: u32 = 1;
 
+/// How a process ended: its exit status, or the signal that ended it.
+type Ended = (i32, Option<u8>);
+
 /// A process this kernel hosts: its parent, the token its calls carry (a fork's is its
 /// parent's), and, once it ended, its wait status until its parent waits.
 struct Local {
     ppid: u32,
     token: String,
-    ended: Option<(i32, Option<u8>)>,
+    ended: Option<Ended>,
 }
 
 struct State {
@@ -149,6 +152,38 @@ impl Kernel {
         Ok(Value::Array(results).to_string())
     }
 
+    /// execve of the process `pid` itself, as its own image calls it: the image at `path`
+    /// replaces its own, with its pid, its credentials and its open descriptors; the process
+    /// carries a new token from now on (its forks keep the old one). `argv` and `env` are JSON
+    /// arrays.
+    pub async fn reexec(
+        &self,
+        pid: u32,
+        path: &str,
+        argv: &str,
+        env: &str,
+        cwd: &str,
+        seat: &str,
+    ) -> Result<String, JsValue> {
+        let token = self.token(pid)?;
+        let call = Call::Execve {
+            pid: Some(pid),
+            token: Some(token),
+            path: path.into(),
+            argv: parse(argv, "argv")?,
+            env: parse(env, "env")?,
+            cwd: cwd.into(),
+            cgroup: None,
+            seat: (!seat.is_empty()).then(|| seat.to_string()),
+        };
+        let value = self.one(call, false).await?;
+        let exec: Exec = from_value(value, "execve")?;
+        if let Some(local) = self.state.borrow_mut().processes.get_mut(&pid) {
+            local.token = exec.token.clone();
+        }
+        to_json(&exec)
+    }
+
     /// fork: a child of `pid`, at once, with a pid lent ahead (one request when none is left);
     /// the machine hears of it after. The page clones the wasm state.
     pub async fn fork(&self, pid: u32) -> Result<String, JsValue> {
@@ -181,7 +216,8 @@ impl Kernel {
     }
 
     /// exit: the process `pid` ends with `status`, or by `signal`: a zombie until its parent
-    /// waits; its children are init's, and those that ended, init reaps.
+    /// waits; its children are init's, and those that ended, init reaps. Its parent, which is
+    /// to wait for it: init's are their host's to reap, as init would.
     pub async fn exit(&self, pid: u32, status: i32, signal: Option<u8>) -> Result<String, JsValue> {
         let mut state = self.state.borrow_mut();
         let local = state
@@ -192,7 +228,7 @@ impl Kernel {
             return Err(fail(Errno::ESRCH.into()));
         }
         local.ended = Some((status, signal));
-        let token = local.token.clone();
+        let (token, ppid) = (local.token.clone(), local.ppid);
         let orphans: Vec<u32> = state
             .processes
             .iter()
@@ -212,7 +248,7 @@ impl Kernel {
             pid: Some(pid),
             token: Some(token),
         });
-        Ok("null".into())
+        Ok(json!({ "ppid": ppid }).to_string())
     }
 
     /// waitpid: the zombie `pid`, now reaped, told to the machine with the next batch; EAGAIN
@@ -251,6 +287,46 @@ impl Kernel {
             }
         };
         Ok(value.to_string())
+    }
+
+    /// wait4(2), as the process `ppid` asks it: its child `pid`, or any of its children with
+    /// none, once ended, reaped now (told to the machine with the next batch), with its exit
+    /// status (`code`) or the signal that ended it; EAGAIN while those it may wait for run;
+    /// ECHILD when it has none of them.
+    pub async fn waitchild(&self, ppid: u32, pid: Option<u32>) -> Result<String, JsValue> {
+        let found = {
+            let state = self.state.borrow();
+            let mut children: Vec<(u32, Option<Ended>)> = state
+                .processes
+                .iter()
+                .filter(|(child, local)| local.ppid == ppid && pid.is_none_or(|pid| **child == pid))
+                .map(|(child, local)| (*child, local.ended))
+                .collect();
+            if children.is_empty() {
+                return Err(fail(Errno::ECHILD.into()));
+            }
+            children.sort_unstable_by_key(|(child, _)| *child);
+            children
+                .into_iter()
+                .find_map(|(child, ended)| ended.map(|ended| (child, ended)))
+        };
+        let Some((child, (code, signal))) = found else {
+            return Err(fail(Errno::EAGAIN.into()));
+        };
+        let mut state = self.state.borrow_mut();
+        state.processes.remove(&child);
+        state.report(Call::Wait {
+            pid: child.to_string(),
+            since: 0,
+        });
+        let wait = match signal {
+            Some(signal) => abi::signal_status(signal),
+            None => abi::exit_status(code),
+        };
+        Ok(
+            json!({ "pid": child, "ppid": ppid, "status": wait, "code": code, "signal": signal })
+                .to_string(),
+        )
     }
 
     /// kill: send `signal` (SIGTERM by default) to `pid`, as the page's account.
@@ -410,6 +486,7 @@ impl Kernel {
                 let cgroup = stage["cgroup"].as_str().unwrap_or_default();
                 Ok(Call::Execve {
                     pid: None,
+                    token: None,
                     path: stage["path"].as_str().unwrap_or_default().into(),
                     argv: from_value(stage["argv"].clone(), "argv")?,
                     env: from_value(stage["env"].clone(), "env")?,

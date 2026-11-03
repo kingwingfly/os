@@ -762,8 +762,9 @@ pub fn by_token(
     }
     let (who, mask) = match &found.proc {
         Some(owner) => {
+            // Its process's (and its line's), or its image's alone.
             let row = caller
-                .filter(|credential| credential.owner() == *owner)
+                .filter(|credential| credential.owner() == *owner || credential.image() == *owner)
                 .ok_or(Errno::EBADF)?;
             let mask = if found.exec {
                 terminal_worker_core::permissions::EXEC

@@ -7,7 +7,7 @@
 // a line at a time. Pipes are memory the page and its processes share, which a page may have
 // only when isolated from other sites (web/_headers); where it is not, they run one after
 // another, each given what the one before wrote, and nothing reads the terminal.
-import { Pipe, pipeBuffer } from './pipe.js';
+import { PAGE, Pipe, pipeBuffer } from './pipe.js';
 import { kernelCall } from '../kernel/protocol.js';
 import { load } from '../kernel/loader.js';
 import { STRERROR } from '../http.mjs';
@@ -26,11 +26,60 @@ const refused = (name, error) => {
 // exit(2) of the process `pid`, then waitpid for it, so no zombie stays in the registry: both
 // happen in the client kernel, which tells the browser's machine in a batch. The wait goes even
 // when the exit fails: a process the machine already ended (kill(2) from another tab) is a
-// zombie the exit cannot reach but the wait reaps.
-const reap = async (pid, { status, signal }) => {
-  try { await kernelCall('exit', { pid, status, signal }); } catch { /* ended already */ }
-  try { await kernelCall('wait', { pid }); } catch { /* reaped already, or still running */ }
+// zombie the exit cannot reach but the wait reaps. A forked process is its parent's to wait
+// for: only once it is init's (its parent ended first) does its host reap it, as init would.
+const reap = async (pid, { status, signal }, forked = false) => {
+  let parent = null;
+  try { parent = (await kernelCall('exit', { pid, status, signal }))?.ppid ?? null; } catch { /* ended already */ }
+  if (!forked || parent === 1) {
+    try { await kernelCall('wait', { pid }); } catch { /* reaped already, or still running */ }
+  }
+  // A wait that waits on it hears it ended.
+  exits++;
+  for (const wake of [...exited]) wake();
+  exited.clear();
 };
+// How many processes hosted here ended, and the waits that wait for the next: a wait4 that
+// found its children running waits for one to end, and misses none that ended meanwhile.
+let exits = 0;
+const exited = new Set();
+// wait4(2) of the process `ppid` for its child `pid`, or any: its status once it ends, or,
+// with `nohang`, none if none ended yet.
+async function join(ppid, pid, nohang) {
+  for (;;) {
+    const seen = exits;
+    try {
+      return await kernelCall('waitchild', { ppid, pid: pid ?? undefined });
+    } catch (error) {
+      if (error.errno !== 'EAGAIN') return { errno: error.errno ?? 'EIO' };
+      if (nohang) return { nothing: true };
+    }
+    if (exits === seen) await new Promise(resolve => exited.add(resolve));
+  }
+}
+// The pipes this page's processes hold: what a process it ends held of them, it lets go, as a
+// process's descriptors close when it dies (a killed Worker closes nothing itself).
+const pipes = new Map();
+const known = buffer => {
+  if (!pipes.has(buffer)) pipes.set(buffer, new Pipe(buffer));
+  return pipes.get(buffer);
+};
+function release(pid) {
+  for (const [buffer, pipe] of pipes) {
+    pipe.release(pid);
+    if (pipe.writerGone && pipe.readerGone) pipes.delete(buffer);
+  }
+}
+// What a process's waiting call is answered with, in the memory it waits on: a JSON reply.
+const CHANNEL = 64 * 1024;
+function respond(channel, reply) {
+  const data = new TextEncoder().encode(JSON.stringify(reply ?? {}));
+  const state = new Int32Array(channel, 0, 2);
+  new Uint8Array(channel, 8).set(data.length <= CHANNEL - 8 ? data : new TextEncoder().encode('{"errno":"E2BIG"}'));
+  Atomics.store(state, 1, data.length <= CHANNEL - 8 ? data.length : 17);
+  Atomics.store(state, 0, 1);
+  Atomics.notify(state, 0);
+}
 const encoder = new TextEncoder();
 // Status of a process killed by a signal: 128 and its number.
 const SIGINT = 130, SIGPIPE = 141;
@@ -63,6 +112,8 @@ function columns() {
 // Ctrl+D ends a read after what was typed before it, and before what is typed after it.
 function terminalInput() {
   const pipe = new Pipe(pipeBuffer()), queue = [];
+  // The page writes it, as long as the pipeline may read it.
+  pipe.hold(PAGE, 'w');
   let timer = 0;
   const pump = () => {
     timer = 0;
@@ -94,8 +145,13 @@ function terminalInput() {
 // if not to the terminal.
 export async function exec(stages, options = {}) {
   const { cwd = '/', home = '/', user = 'guest', stdin = null, sudo = false, umask = 0o022, tty = false, enough = null,
-    cancelled = () => false, onOutput = () => {}, onTty = () => {}, onReading = () => {}, onJob = () => {},
-    onState = () => {} } = options;
+    cancelled = () => false, onTty = () => {}, onJob = () => {} } = options;
+  // The shell's callbacks last as long as the run: a process that outlives it (a child left in
+  // the background) is heard no more.
+  let finished = false;
+  const onOutput = (fd, text) => { if (!finished) options.onOutput?.(fd, text); };
+  const onReading = () => { if (!finished) options.onReading?.(); };
+  const onState = state => { if (!finished) options.onState?.(state); };
   const env = piped => ({
     PWD: cwd, HOME: home, USER: user, LOGNAME: user, PATH: '/usr/bin', SHELL: '/usr/bin/sh', LANG: 'C.UTF-8',
     TERM: piped ? 'dumb' : 'xterm-256color', COLUMNS: String(columns()),
@@ -107,28 +163,30 @@ export async function exec(stages, options = {}) {
   // SIGPIPE at its next write and ends as a process does, closing what it has open (memory it
   // shares, where the page may share it; else the page ends it).
   const closed = isolated && enough != null && !tty ? new Int32Array(new SharedArrayBuffer(4)) : null;
-  const processes = [];
+  // The stages' processes, and those they forked: the job's process group.
+  const processes = [], forks = [];
+  const group = () => [...processes, ...forks];
   let stopStatus = SIGINT;
   // Stop every process still running, as `status` would end it.
-  const stop = status => { stopped = true; stopStatus = status; for (const process of processes) process.kill(status); };
+  const stop = status => { stopped = true; stopStatus = status; for (const process of group()) process.kill(status); };
   // The pipeline as a process group: a signal to it is to each of its processes; one that ends
   // a process ends the pipeline. Stopping needs memory shared with the processes.
-  const group = {
-    get pids() { return processes.map(process => process.pid); },
+  const job = {
+    get pids() { return group().filter(process => !process.ended).map(process => process.pid); },
     stoppable: !!isolated,
     signal: signal => {
       if (ENDING.has(signal)) return stop(128 + signal);
-      for (const process of processes) process.signal(signal);
+      for (const process of group()) process.signal(signal);
     },
   };
   // Stopped once every process still running is; running as one goes on.
   let state = 'running';
   const changed = () => {
-    const live = processes.filter(process => !process.ended);
+    const live = group().filter(process => !process.ended);
     const now = live.length && live.every(process => process.stopped) ? 'stopped' : 'running';
     if (now !== state) { state = now; onState(now); }
   };
-  onJob(group);
+  onJob(job);
   // What a process writes when not to the terminal: the next one's, or the last's reader's,
   // which may want only so much.
   const collect = (text, isLast) => {
@@ -169,65 +227,131 @@ export async function exec(stages, options = {}) {
   for (const image of images) image.catch(() => {});
   // What each stage was given, once it is used: a stage never started gives its process back.
   const taken = new Set();
+  // A process this job hosts, in a Worker of its own: a stage's, or one a process of it forked
+  // (`forked`, its start the parent's snapshot). `write` is where its output goes, as its
+  // stage's does.
+  const host = ({ pid, token, ppid, module, memory, argv, write, forked, start, transfer = [] }) => {
+    const worker = new Worker('/wasi-process.js');
+    const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
+    let settle, status = null;
+    const exited = new Promise(resolve => { settle = resolve; });
+    // The word that stops it, set by SIGSTOP and SIGTSTP, cleared by SIGCONT; the memory its
+    // waiting calls are answered in.
+    const control = isolated ? new Int32Array(new SharedArrayBuffer(4)) : null;
+    const channel = isolated ? new SharedArrayBuffer(8 + CHANNEL) : null;
+    const process = { pid, stopped: false, ended: false, forked, exited, image: { module, memory } };
+    const end = code => {
+      if (status != null) return;
+      status = code;
+      process.ended = true;
+      hosted.delete(pid);
+      worker.terminate();
+      changed();
+      // What a killed process leaves open, its pipes, closes as it goes.
+      release(pid);
+      for (const fd of [1, 2]) write(fd, decoders[fd].decode());
+      // exit(2); its parent waits for it, or, init's, it is reaped at once, as init would.
+      const signal = code >= 128 ? code - 128 : undefined;
+      void reap(pid, { status: code, signal }, forked);
+      settle(code);
+    };
+    // A call it waits on: answered in its channel.
+    const answer = async ({ type, args }) => {
+      let reply;
+      try {
+        if (type === 'join') reply = await join(pid, args.pid, args.nohang);
+        else if (type === 'getpid') reply = await kernelCall('getpid', { pid: args.pid });
+        else if (type === 'kill') reply = (await kernelCall('kill', { pid: args.pid, signal: args.signal })) ?? {};
+        else if (type === 'exec') reply = await replace(args);
+        else reply = { errno: 'ENOSYS' };
+      } catch (error) {
+        reply = { errno: error.errno ?? 'EIO' };
+      }
+      if (reply) respond(channel, reply);
+    };
+    // execve(2) of the process itself: the image the kernel allows, loaded, replaces its own. A
+    // format the loader refuses once the kernel replaced the image ends the process, as an
+    // execve past its point of no return does.
+    const replace = async ({ path, argv: args, env, cwd }) => {
+      const image = await kernelCall('reexec', { pid, path, argv: args, env, cwd });
+      let loaded;
+      try {
+        loaded = await load(image);
+      } catch (error) {
+        write(2, `${refused(args[0] ?? path, error).message}\n`);
+        end(126);
+        return null;
+      }
+      process.image = loaded;
+      worker.postMessage({ image: { module: loaded.module, memory: loaded.memory, token: image.token, argv: args, env } });
+      return {};
+    };
+    // fork(2): a child with a pid the client kernel gives, its parent's snapshot, and its pipes'
+    // ends held for it before it starts.
+    const fork = async state => {
+      let child;
+      try {
+        child = await kernelCall('fork', { pid });
+      } catch (error) {
+        worker.postMessage({ forked: { errno: error.errno ?? 'EIO' } });
+        return;
+      }
+      for (const description of state.descriptions) {
+        if (description.kind === 'pipe-in') known(description.buffer).hold(child.pid, 'r', description.refs);
+        else if (description.kind === 'pipe-out') known(description.buffer).hold(child.pid, 'w', description.refs);
+      }
+      const made = host({ pid: child.pid, token: child.token, ppid: pid, ...process.image, argv: state.argv, write, forked: true, start: { fork: state }, transfer: [state.snapshot.memory] });
+      forks.push(made);
+      changed();
+      worker.postMessage({ forked: { pid: child.pid } });
+    };
+    worker.onmessage = ({ data }) => {
+      if (data.out) write(data.fd, decoders[data.fd].decode(data.out, { stream: true }));
+      else if (data.reading) onReading();
+      else if (data.stopped || data.continued) { process.stopped = !!data.stopped; changed(); }
+      else if (data.truncated) truncated = true;
+      else if (data.host) void answer(data.host);
+      else if (data.fork) void fork(data.fork);
+      else if ('exit' in data) end(data.exit);
+    };
+    worker.onerror = event => { onOutput(2, `${argv[0]}: ${event.message}\n`); end(126); };
+    worker.postMessage({ ...start, module, memory, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: true }, control: control?.buffer, channel }, transfer);
+    // A signal, as its default action has it: ended, stopped at its next system call, or
+    // continued.
+    const signal = number => {
+      if (ENDING.has(number)) return end(128 + number);
+      if (!control) return;
+      // Stopped: one asleep on its word wakes to stop.
+      if (number === SIG.STOP || number === SIG.TSTP) { Atomics.store(control, 0, 1); Atomics.notify(control, 0); }
+      else if (number === SIG.CONT) { Atomics.store(control, 0, 0); Atomics.notify(control, 0); }
+    };
+    Object.assign(process, { kill: end, signal });
+    hosted.set(pid, process);
+    return process;
+  };
   const start = async (index, io) => {
     const stage = stages[index], argv = stage.argv ?? stage;
-    const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
     const environment = environments[index];
-    let image, worker;
+    let image;
     taken.add(index);
     try {
       image = await images[index];
       if (stopped) return await canceled(image);
       const { module, memory } = await load(image).catch(error => { throw refused(argv[0], error); });
       if (stopped) return await canceled(image);
-      worker = new Worker('/wasi-process.js');
-      let settle, status = null;
-      const exited = new Promise(resolve => { settle = resolve; });
-      // The word that stops it, set by SIGSTOP and SIGTSTP, cleared by SIGCONT.
-      const control = isolated ? new Int32Array(new SharedArrayBuffer(4)) : null;
-      const process = { stopped: false, ended: false };
       const write = (fd, text) => { if (!text) return; if (fd === 1 && !io.stdout.tty) collect(text, index === last); else onOutput(fd, text); };
-      const end = code => {
-        if (status != null) return;
-        status = code;
-        process.ended = true;
-        hosted.delete(image.pid);
-        worker.terminate();
-        changed();
-        // What a killed process leaves open, its pipes, closes as it goes.
-        io.stdin.reader?.closeReader(); io.stdout.writer?.closeWriter();
-        for (const fd of [1, 2]) write(fd, decoders[fd].decode());
-        // exit(2), then wait for it: the registry reaps the zombie at once, as init would.
-        const signal = code >= 128 ? code - 128 : undefined;
-        void reap(image.pid, { status: code, signal });
-        settle(code);
-      };
-      worker.onmessage = ({ data }) => {
-        if (data.out) write(data.fd, decoders[data.fd].decode(data.out, { stream: true }));
-        else if (data.reading) onReading();
-        else if (data.stopped || data.continued) { process.stopped = !!data.stopped; changed(); }
-        else if (data.truncated) truncated = true;
-        else if ('exit' in data) end(data.exit);
-      };
-      worker.onerror = event => { onOutput(2, `${argv[0]}: ${event.message}\n`); end(126); };
-      worker.postMessage({ module, memory, argv, env: environment, umask, sudo, pid: image.pid, proc: image.token, stdin: io.stdin.message, stdout: io.stdout.message, stderr: { tty: true }, control: control?.buffer });
-      // A signal, as its default action has it: ended, stopped at its next system call, or
-      // continued.
-      const signal = number => {
-        if (ENDING.has(number)) return end(128 + number);
-        if (!control) return;
-        // Stopped: one asleep on its word wakes to stop.
-        if (number === SIG.STOP || number === SIG.TSTP) { Atomics.store(control, 0, 1); Atomics.notify(control, 0); }
-        else if (number === SIG.CONT) { Atomics.store(control, 0, 0); Atomics.notify(control, 0); }
-      };
-      Object.assign(process, { pid: image.pid, kill: end, exited, signal });
-      hosted.set(image.pid, process);
+      // Its pipes' ends are its own from the start: held for it before it runs.
+      io.stdin.reader?.hold(image.pid, 'r');
+      io.stdout.writer?.hold(image.pid, 'w');
+      const process = host({ pid: image.pid, token: image.token, ppid: 1, module, memory, argv, write, forked: false,
+        start: { env: environment, cwd, stdin: io.stdin.message, stdout: io.stdout.message } });
       processes.push(process);
       return process;
     } catch (error) {
       // Whatever was made for the stage ends here: no process may outlive a host that never
-      // started, and none may wait for the next boot to be reaped.
-      worker?.terminate();
+      // started, and none may wait for the next boot to be reaped. The ends of its pipes it
+      // was to hold are gone.
+      io.stdin.reader?.closeReader(); io.stdout.writer?.closeWriter();
       if (image) await abandon(image);
       throw error;
     }
@@ -244,15 +368,15 @@ export async function exec(stages, options = {}) {
       // At once, through pipes; the first reads the terminal unless given its input.
       input = stdin == null ? terminalInput() : null;
       if (input) onTty(input);
-      const pipes = stages.slice(1).map(() => pipeBuffer());
+      const links = stages.slice(1).map(() => pipeBuffer());
       const starting = [];
       for (let index = 0; index <= last; index++) {
-        const from = index === 0 ? null : pipes[index - 1], to = index === last ? null : pipes[index];
+        const from = index === 0 ? null : links[index - 1], to = index === last ? null : links[index];
         starting.push(start(index, {
-          stdin: from ? { message: { pipe: from }, reader: new Pipe(from) }
-            : input ? { message: { pipe: input.pipe.state.buffer, tty: true }, reader: null }
+          stdin: from ? { message: { pipe: from }, reader: known(from) }
+            : input ? { message: { pipe: input.pipe.buffer, tty: true }, reader: known(input.pipe.buffer) }
             : { message: { data: encoder.encode(stdin) } },
-          stdout: to ? { message: { pipe: to }, writer: new Pipe(to) } : { message: { tty, closed: closed?.buffer }, tty },
+          stdout: to ? { message: { pipe: to }, writer: known(to) } : { message: { tty, closed: closed?.buffer }, tty },
         }));
       }
       let started;
@@ -288,6 +412,7 @@ export async function exec(stages, options = {}) {
     images.forEach((image, index) => { if (!taken.has(index)) image.then(abandon, () => {}); });
     clearInterval(watch);
     if (input) { input.close(); onTty(null); }
+    finished = true;
   }
   return { status: statuses[last] ?? SIGINT, stdout, truncated };
 }

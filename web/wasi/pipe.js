@@ -1,22 +1,38 @@
 // pipe(2), between processes (web/wasi/process.js) and the page: bytes from one end to the other
 // through memory both share, as the kernel's pipe buffer is. A reader waits while it is empty, a
-// writer while it is full; a read at its end, once the writer is gone, reads nothing (end of
-// file), and a write once the reader is gone fails (EPIPE, which a process hears as SIGPIPE). A
-// terminal's input is one too, which the page writes typed lines to: there, Ctrl+D ends a read
+// writer while it is full; a read at its end, once every writer is gone, reads nothing (end of
+// file), and a write once every reader is gone fails (EPIPE, which a process hears as SIGPIPE).
+// A terminal's input is one too, which the page writes typed lines to: there, Ctrl+D ends a read
 // without ending the input, as a terminal's line discipline does.
+//
+// Each end may be held by several processes, as fork(2) and dup(2) share an open pipe: the
+// pipe counts each holder's references to each end (`hold`, `drop`), by pid, so that an end is
+// gone once its last holder closed it, and the page can let go of what a process it killed
+// held (`release`), as a process's descriptors close when it dies. Writers write, and readers
+// read, one at a time: a write that fits is not mixed with another's.
 //
 // Waiting (Atomics.wait) is for Workers; the page only ever writes what fits, and tries again.
 
-// The buffer a pipe holds, as Linux's: 64 KiB.
+// The buffer a pipe holds, as Linux's: 64 KiB; and the most a write writes at once (POSIX's
+// PIPE_BUF, Linux's 4 KiB).
 export const PIPE_BUF = 65536;
+const ATOMIC = 4096;
 // Its state, as 32-bit words before the bytes: where reading and writing are (counts that wrap),
-// whether each end is gone, ends of file pending (Ctrl+D), and a count of changes to wait on.
-const READ = 0, WRITE = 1, WRITER_GONE = 2, READER_GONE = 3, EOF = 4, CHANGES = 5, WORDS = 8;
+// whether each end is gone, ends of file pending (Ctrl+D), a count of changes to wait on, the
+// writers' and the readers' locks, then each holder's pid and how many references it holds to
+// the reading and the writing end.
+const READ = 0, WRITE = 1, WRITER_GONE = 2, READER_GONE = 3, EOF = 4, CHANGES = 5, WRITING = 6, READING = 7;
+const HOLDERS = 8, HOLDER = 3, HOLDERS_MAX = 32, WORDS = HOLDERS + HOLDERS_MAX * HOLDER;
+// The ends, as a holder's words count them.
+const ENDS = { r: 1, w: 2 };
+// The page, as a holder of the ends it writes (the terminal's input).
+export const PAGE = 0x7fffffff;
 
 export const pipeBuffer = (capacity = PIPE_BUF) => new SharedArrayBuffer(WORDS * 4 + capacity);
 
 export class Pipe {
   constructor(buffer) {
+    this.buffer = buffer;
     this.state = new Int32Array(buffer, 0, WORDS);
     this.data = new Uint8Array(buffer, WORDS * 4);
   }
@@ -27,14 +43,76 @@ export class Pipe {
   get writerGone() { return Atomics.load(this.state, WRITER_GONE) === 1; }
   changed() { Atomics.add(this.state, CHANGES, 1); Atomics.notify(this.state, CHANGES); }
 
+  // ---- Holders ----
+
+  // The word of `pid`'s holding, claimed if it holds nothing yet: -1 where every slot is taken.
+  slot(pid, claim) {
+    for (let index = 0; index < HOLDERS_MAX; index++) {
+      const at = HOLDERS + index * HOLDER;
+      if (Atomics.load(this.state, at) === pid) return at;
+    }
+    if (!claim) return -1;
+    for (let index = 0; index < HOLDERS_MAX; index++) {
+      const at = HOLDERS + index * HOLDER;
+      if (Atomics.compareExchange(this.state, at, 0, pid) === 0) return at;
+      if (Atomics.load(this.state, at) === pid) return at;
+    }
+    return -1;
+  }
+  // `pid` holds `count` more references to the end `end` ('r' or 'w').
+  hold(pid, end, count = 1) {
+    const at = this.slot(pid, true);
+    if (at >= 0) Atomics.add(this.state, at + ENDS[end], count);
+  }
+  // `pid` closed `count` of its references to `end`: the end is gone once none holds it.
+  drop(pid, end, count = 1) {
+    const at = this.slot(pid, false);
+    if (at < 0) return;
+    const word = at + ENDS[end], taken = Math.min(count, Atomics.load(this.state, word));
+    if (Atomics.sub(this.state, word, taken) - taken > 0) return;
+    // A holder of nothing gives its slot back.
+    if (Atomics.load(this.state, at + ENDS.r) === 0 && Atomics.load(this.state, at + ENDS.w) === 0) Atomics.compareExchange(this.state, at, pid, 0);
+    this.settle(end);
+  }
+  // What `pid` held goes, as a process's descriptors close when it ends: by its own closes, or
+  // by its host's, for one it killed.
+  release(pid) {
+    const at = this.slot(pid, false);
+    if (at < 0) return;
+    const held = ['r', 'w'].filter(end => Atomics.exchange(this.state, at + ENDS[end], 0) > 0);
+    Atomics.store(this.state, at, 0);
+    for (const end of held) this.settle(end);
+  }
+  // How many references every holder has to `end`.
+  held(end) {
+    let count = 0;
+    for (let index = 0; index < HOLDERS_MAX; index++) count += Atomics.load(this.state, HOLDERS + index * HOLDER + ENDS[end]);
+    return count;
+  }
+  // The end `end`, which a holder let go of, is gone if no holder holds it any more. Only that
+  // end: the other may have a writer that holds nothing here (the page, writing the terminal).
+  settle(end) {
+    if (this.held(end) > 0) return;
+    if (end === 'w' && !this.writerGone) this.closeWriter();
+    if (end === 'r' && !this.readerGone) this.closeReader();
+  }
+
+  // ---- Reading ----
+
   // Read at most `count` bytes, waiting for some: none at the end, or where Ctrl+D ended a read.
   // `meanwhile`, if given, is called now and then as it waits (a stop to heed).
   read(count, meanwhile) {
     for (;;) {
       const seen = Atomics.load(this.state, CHANGES), queued = this.queued;
-      if (queued > 0) return this.take(Math.min(count, queued));
-      if (this.ending) { Atomics.sub(this.state, EOF, 1); return new Uint8Array(0); }
-      if (this.writerGone) return new Uint8Array(0);
+      if (queued > 0 && this.lock(READING)) {
+        try {
+          const now = this.queued;
+          if (now > 0) return this.take(Math.min(count, now));
+        } finally { this.unlock(READING); }
+        continue;
+      }
+      if (queued === 0 && this.ending) { Atomics.sub(this.state, EOF, 1); return new Uint8Array(0); }
+      if (queued === 0 && this.writerGone) return new Uint8Array(0);
       if (Atomics.wait(this.state, CHANGES, seen, meanwhile ? 200 : Infinity) === 'timed-out') meanwhile?.();
     }
   }
@@ -51,21 +129,32 @@ export class Pipe {
     return out;
   }
 
-  // Write all of `bytes`, waiting for room: false if the reader is gone.
+  // ---- Writing ----
+
+  // Write all of `bytes`, waiting for room: false if every reader is gone. A write of at most
+  // ATOMIC bytes goes at once, not mixed with another writer's, as POSIX has it; a longer one
+  // goes as room comes.
   write(bytes) {
     let done = 0;
     while (done < bytes.length) {
       const seen = Atomics.load(this.state, CHANGES);
       if (this.readerGone) return false;
-      const room = this.room;
-      if (room === 0) { Atomics.wait(this.state, CHANGES, seen); continue; }
-      done += this.put(bytes.subarray(done, done + room));
+      const want = bytes.length <= ATOMIC ? bytes.length : 1;
+      if (this.room < want || !this.lock(WRITING)) { Atomics.wait(this.state, CHANGES, seen, 200); continue; }
+      try {
+        const room = this.room;
+        if (room >= want) done += this.copy(bytes.subarray(done, done + room));
+      } finally { this.unlock(WRITING); }
     }
     return true;
   }
-  // Write what fits of `bytes`, waiting for nothing: how much.
+  // Write what fits of `bytes`, waiting for nothing: how much (none while another writes).
   put(bytes) {
-    const count = Math.min(bytes.length, this.room);
+    if (!this.lock(WRITING)) return 0;
+    try { return this.copy(bytes.subarray(0, Math.min(bytes.length, this.room))); } finally { this.unlock(WRITING); }
+  }
+  copy(bytes) {
+    const count = bytes.length;
     const write = Atomics.load(this.state, WRITE), at = (write >>> 0) % this.data.length;
     const first = Math.min(count, this.data.length - at);
     this.data.set(bytes.subarray(0, first), at);
@@ -74,9 +163,12 @@ export class Pipe {
     this.changed();
     return count;
   }
+  lock(word) { return Atomics.compareExchange(this.state, word, 0, 1) === 0; }
+  unlock(word) { Atomics.store(this.state, word, 0); this.changed(); }
 
   // Ctrl+D: the read waiting, or the next, ends with nothing.
   endOfFile() { Atomics.add(this.state, EOF, 1); this.changed(); }
+  // An end gone at once, whoever holds it: one its process never started to hold.
   closeWriter() { Atomics.store(this.state, WRITER_GONE, 1); this.changed(); }
   closeReader() { Atomics.store(this.state, READER_GONE, 1); this.changed(); }
 }

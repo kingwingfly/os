@@ -851,13 +851,19 @@ pub enum Call {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         boot: Option<String>,
     },
-    /// execve(2): run the executable at `path` as the process `pid` (one just forked), or, with
-    /// none, as a child of the namespace's init. The kernel checks the path, regular and whole,
-    /// and execute permission (X, not read: an x-only file runs), snapshots the caller's
-    /// credentials, and gives the loader the image's descriptor or asset and the process token.
+    /// execve(2): run the executable at `path` as a new child of the namespace's init, or, with
+    /// `pid` and that process's own token (`proc`), as that process, its image replaced. The
+    /// kernel checks the path, regular and whole, and execute permission (X, not read: an
+    /// x-only file runs), and gives the loader the image's descriptor or asset and the process's
+    /// new token. A new process runs as the caller (root under sudo); a replaced one keeps its
+    /// credentials and its open descriptors, as Linux's execve does.
     Execve {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pid: Option<u32>,
+        /// The token of the process `pid`, which only that process holds: the proof that it
+        /// replaces itself.
+        #[serde(default, rename = "proc", skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
         path: String,
         #[serde(default)]
         argv: Vec<String>,
@@ -1145,6 +1151,7 @@ mod tests {
             call,
             Call::Execve {
                 pid: None,
+                token: None,
                 path: "/usr/bin/coreutils".into(),
                 argv: vec!["seq".into(), "3".into()],
                 env: vec!["LANG=C".into()],

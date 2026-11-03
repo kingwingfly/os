@@ -1,25 +1,41 @@
 // A process (owner's design, 2026-10-29: the page is user space, the API its system calls): a
-// program built for wasm32-wasip1, run in a Worker of its own. Its WASI calls are made here over
-// the kernel's (POST /api/sys, GET /api/file, PUT /api/pwrite), synchronously, as a program's
-// calls block: the Worker waits on each request. `terminal.sys` reaches the kernel's own calls,
-// which WASI has no words for (modes, owners, ACLs, devices, accounts).
+// program built for wasm32-wasip1, or for WASIX, run in a Worker of its own. Its WASI calls are
+// made here over the kernel's (POST /api/sys, GET /api/file, PUT /api/pwrite), synchronously,
+// as a program's calls block: the Worker waits on each request. `terminal.sys` reaches the
+// kernel's own calls, which WASI has no words for (modes, owners, ACLs, devices, accounts).
+// WASIX's (`wasix_32v1`) are WASI's and a process's own: fork, execve, wait, pipe, dup, the
+// working directory, setjmp and longjmp (phase 3).
 //
-// Started with {module, argv, env, umask, sudo, stdin, stdout, stderr}: standard input is
-// {data} (bytes given whole) or {pipe} (a pipe's buffer, web/wasi/pipe.js), the terminal if
-// {tty}; standard output {pipe}, or the page's, a terminal if {tty}, whose reader may close it
-// ({closed}, a word of shared memory); standard error {tty}; {control}, a word the page sets to
-// stop it. It posts {out, fd} as it writes to the page, {reading} as it waits on the terminal,
-// {stopped} and {continued}, and {exit} as it ends.
-import { Pipe } from './pipe.js';
+// Started with {module, memory, argv, env, cwd, pid, ppid, proc, umask, sudo, stdin, stdout,
+// stderr, control, channel}: standard input is {data} (bytes given whole) or {pipe} (a pipe's
+// buffer, web/wasi/pipe.js), the terminal if {tty}; standard output {pipe}, or the page's, a
+// terminal if {tty}, whose reader may close it ({closed}, a word of shared memory); standard
+// error {tty}; {control}, a word the page sets to stop it; {channel}, memory its host answers
+// its waiting calls in (wait, execve). A fork's child is started with {fork}: its parent's
+// memory, globals, descriptors and stack, rewound in it. It posts {out, fd} as it writes to the
+// page, {reading} as it waits on the terminal, {stopped} and {continued}, {fork} as it forks,
+// {host} as it asks its host, and {exit} as it ends.
+//
+// fork(2) is binaryen's asyncify (web/wasi/fork.js): the loader adds it to an image that
+// imports fork, setjmp or longjmp, and a fork unwinds the image, copies it into a child, and
+// rewinds both. The pid, the child's registration and the reaping are the client kernel's
+// (crates/client-kernel); the open files the child shares are memory both share
+// (web/wasi/shared.js), and pipes count their holders (web/wasi/pipe.js).
+import { Pipe, pipeBuffer } from './pipe.js';
+import { Engine } from './fork.js';
+import { Bytes, Shares } from './shared.js';
 
 // WASI's errno numbers, by Linux's names, as the kernel answers.
 const ERRNO = {
-  E2BIG: 1, EACCES: 2, EAGAIN: 6, EBADF: 8, EBUSY: 10, ECANCELED: 11, EEXIST: 20, EFBIG: 22, EINVAL: 28, EIO: 29,
-  EISDIR: 31, ELOOP: 32, EMFILE: 33, EMLINK: 34, ENAMETOOLONG: 37, ENODEV: 43, ENOENT: 44, ENOSPC: 51,
-  ENOSYS: 52, ENOTDIR: 54, ENOTEMPTY: 55, ENOTSUP: 58, EOPNOTSUPP: 58, ENOTTY: 59, ENXIO: 60, EPERM: 63,
-  ERANGE: 68, EROFS: 69, ESPIPE: 70, ESRCH: 71, ESTALE: 72, ETIMEDOUT: 73, ETXTBSY: 74, EXDEV: 75, ENODATA: 44,
+  E2BIG: 1, EACCES: 2, EAGAIN: 6, EBADF: 8, EBUSY: 10, ECANCELED: 11, ECHILD: 12, EEXIST: 20, EFBIG: 22, EINTR: 27,
+  EINVAL: 28, EIO: 29, EISDIR: 31, ELOOP: 32, EMFILE: 33, EMLINK: 34, ENAMETOOLONG: 37, ENODEV: 43, ENOENT: 44,
+  ENOEXEC: 45, ENOMEM: 48, ENOSPC: 51, ENOSYS: 52, ENOTDIR: 54, ENOTEMPTY: 55, ENOTSUP: 58, EOPNOTSUPP: 58,
+  ENOTTY: 59, ENXIO: 60, EPERM: 63, EPIPE: 64, ERANGE: 68, EROFS: 69, ESPIPE: 70, ESRCH: 71, ESTALE: 72,
+  ETIMEDOUT: 73, ETXTBSY: 74, EXDEV: 75, ENODATA: 44,
 };
 const { EBADF, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, ENOTDIR, ESPIPE, EFBIG } = ERRNO;
+// What an execve that fails says, as a shell says it.
+const STRERROR = { 2: 'Permission denied', 44: 'No such file or directory', 45: 'Exec format error', 54: 'Not a directory', 31: 'Is a directory' };
 // The kinds of descriptor standard input and output are: bytes given, the page's, a pipe's end.
 const STDIO = new Set(['in', 'out', 'pipe-in', 'pipe-out']);
 // What a file is, as WASI numbers it.
@@ -36,10 +52,13 @@ const ALL_RIGHTS = (1n << 30n) - 1n;
 const INLINE = 256 * 1024, WINDOW = 4 << 20, REWRITE_MAX = 64 << 20;
 
 class Exit { constructor(code) { this.code = code; } }
+// execve(2) went through: the image ends here, and the new one starts in its place.
+class Replaced {}
 class Errno extends Error { constructor(errno) { super(String(errno)); this.errno = errno; } }
 const errnoOf = err => ERRNO[err?.errno] ?? EIO;
 
-let memory, process = {};
+// The image running, its memory, and its fork engine; the process.
+let memory, instance, engine, process = {};
 const view = () => new DataView(memory.buffer);
 const bytes = () => new Uint8Array(memory.buffer);
 const encoder = new TextEncoder(), decoder = new TextDecoder();
@@ -116,9 +135,38 @@ const clean = path => path.length > 1 ? path.replace(/\/+$/, '').replace(/\/\/+/
 
 // What each descriptor is: the terminal or a pipe (in, out), a directory, or a file read through
 // a kernel descriptor (kfd), one written (in order, in chunks), or one rewritten here whole.
+// Several descriptors may be one open file (dup, fork): `refs` counts this process's; a fork
+// line's table (`shares`) counts every process's, and holds its offset.
 const fds = new Map();
-let nextFd = 4;
+// The descriptors an execve closes (FD_CLOEXEC).
+const cloexec = new Set();
+let shares = null;
 function descriptor(fd) { const found = fds.get(fd); if (!found) throw new Errno(EBADF); return found; }
+// The lowest descriptor free from `min` on, as open(2) and dup(2) take.
+function lowest(min = 0) { let fd = min; while (fds.has(fd)) fd++; return fd; }
+// `fd` is `found`, one more descriptor of it; a pipe's end is held once more, a shared open
+// file counted once more (unless what started this process counted it already: its host, for
+// the pipes it gave, or its parent, for what it forked with).
+function install(fd, found, counted = false) {
+  found.refs = (found.refs ?? 0) + 1;
+  fds.set(fd, found);
+  if (counted) return;
+  if (found.kind === 'pipe-in') found.pipe.hold(process.pid, 'r');
+  else if (found.kind === 'pipe-out') found.pipe.hold(process.pid, 'w');
+  else if (found.share != null) shares.add(found.share, 1);
+}
+// close(2) of `fd`: its open file closes once no descriptor of it is left, here or in another
+// process.
+function uninstall(fd) {
+  const found = descriptor(fd);
+  fds.delete(fd);
+  cloexec.delete(fd);
+  found.refs--;
+  if (found.kind === 'pipe-in') return found.pipe.drop(process.pid, 'r');
+  if (found.kind === 'pipe-out') return found.pipe.drop(process.pid, 'w');
+  if (found.share != null ? shares.drop(found.share) > 0 : found.refs > 0) return;
+  closeFd(found);
+}
 function filetype(found) {
   if (STDIO.has(found.kind)) return found.tty ? CHARACTER_DEVICE : UNKNOWN;
   if (found.kind === 'dir') return DIRECTORY;
@@ -154,7 +202,7 @@ function fstat(found) {
   }
   return found.stat ?? stat(found.path);
 }
-const size = found => found.rewrite ? found.data.length : found.writer ? found.flushed + found.length : found.size;
+const size = found => found.rewrite ? found.bytes.length : found.writer ? found.bytes.from + found.bytes.length : found.size;
 
 // Open the file at `path` for reading: the descriptor, its first bytes and its stat, in one
 // request.
@@ -171,11 +219,13 @@ function openRead(path) {
   const first = read.ok;
   return { kind: 'file', path, kfd: fd, token, read: true, pos: 0, size: first.size, window: { start: 0, data: unbase64(first.data) }, stat: stated.ok };
 }
-// Open it for writing in order: a growing file, truncated or new.
+// Open it for writing in order: a growing file, truncated or new. What is not sent yet is held
+// in memory a fork shares (shared.js): at most two chunks and an inline write.
 function openWriter(path, flags, read) {
   const opened = call({ open: { path, flags: flags | O_WRONLY } });
   forget();
-  return { kind: 'file', path, kfd: opened.fd, writer: true, read, chunk: opened.chunk_size || (8 << 20), flushed: 0, buffer: new Uint8Array(64 * 1024), length: 0, pos: 0 };
+  const chunk = opened.chunk_size || (8 << 20);
+  return { kind: 'file', path, kfd: opened.fd, writer: true, read, chunk, bytes: Bytes.create(chunk * 2 + INLINE), pos: 0 };
 }
 // Open an existing file to change in place, or append to: its content, written back whole when
 // it closes, if it changed.
@@ -183,7 +233,11 @@ function openRewrite(path, found, append, read) {
   const [allowed] = batch([{ access: { path, mode: W_OK } }]);
   ok(allowed);
   const data = whole(path, found.size);
-  return { kind: 'file', path, rewrite: true, read, data, pos: append ? data.length : 0, append, dirty: false, stat: found };
+  const bytes = Bytes.create(REWRITE_MAX, Math.max(data.length, 64 * 1024));
+  bytes.ensure(data.length);
+  bytes.view.set(data);
+  bytes.length = data.length;
+  return { kind: 'file', path, rewrite: true, read, bytes, pos: append ? data.length : 0, append, stat: found };
 }
 
 function readFrom(found, at, count) {
@@ -203,10 +257,11 @@ function readFrom(found, at, count) {
   }
   if (found.kind === 'out' || found.kind === 'pipe-out') throw new Errno(EBADF);
   if (!found.read) throw new Errno(EBADF);
-  if (found.rewrite) return found.data.subarray(at, at + count);
+  if (found.rewrite) return found.bytes.bytes(at, Math.min(found.bytes.length, at + count)).slice();
   if (found.writer) {
-    if (at < found.flushed) throw new Errno(ESPIPE);
-    return found.buffer.subarray(at - found.flushed, Math.min(found.length, at - found.flushed + count));
+    const { from, length } = found.bytes;
+    if (at < from) throw new Errno(ESPIPE);
+    return found.bytes.bytes(at - from, Math.min(length, at - from + count)).slice();
   }
   const window = found.window;
   if (at < window.start || at >= window.start + window.data.length) {
@@ -240,68 +295,81 @@ function writeTo(found, at, data) {
   }
   if (found.kind === 'pipe-in') throw new Errno(EBADF);
   if (found.kind !== 'file' || (!found.writer && !found.rewrite)) throw new Errno(EBADF);
-  if (found.rewrite) {
-    if (found.append) at = found.data.length;
-    const end = at + data.length;
-    if (end > REWRITE_MAX) throw new Errno(EFBIG);
-    if (end > found.data.length) { const grown = new Uint8Array(end); grown.set(found.data); found.data = grown; }
-    found.data.set(data, at);
-    found.dirty = true;
+  const bytes = found.bytes;
+  bytes.lock();
+  try {
+    if (found.rewrite) {
+      if (found.append) at = bytes.length;
+      const end = at + data.length;
+      if (end > REWRITE_MAX || !bytes.ensure(end)) throw new Errno(EFBIG);
+      // A hole is zeros, whatever a truncation left.
+      if (at > bytes.length) bytes.view.fill(0, bytes.length, at);
+      bytes.view.set(data, at);
+      bytes.length = Math.max(bytes.length, end);
+      bytes.dirty = true;
+      return data.length;
+    }
+    // Written in order: whole chunks go before more is held, and at most a chunk at a time is
+    // added, so that what is held stays within two chunks.
+    for (let done = 0; done < data.length;) {
+      while (bytes.length > found.chunk) flushChunk(found);
+      const offset = at + done - bytes.from;
+      if (offset < 0) throw new Errno(ESPIPE);
+      const piece = data.subarray(done, done + found.chunk);
+      if (!bytes.ensure(offset + piece.length)) throw new Errno(EFBIG);
+      if (offset > bytes.length) bytes.view.fill(0, bytes.length, offset);
+      bytes.view.set(piece, offset);
+      bytes.length = Math.max(bytes.length, offset + piece.length);
+      done += piece.length;
+    }
     return data.length;
-  }
-  if (at < found.flushed) throw new Errno(ESPIPE);
-  const end = at - found.flushed + data.length;
-  if (end > found.buffer.length) {
-    const grown = new Uint8Array(Math.max(end, found.buffer.length * 2));
-    grown.set(found.buffer.subarray(0, found.length));
-    found.buffer = grown;
-  }
-  found.buffer.set(data, at - found.flushed);
-  found.length = Math.max(found.length, end);
-  // Whole chunks go as they fill: what is left stays to be written on, or with the close.
-  while (found.length >= found.chunk + found.chunk) flushChunk(found);
-  return data.length;
+  } finally { bytes.unlock(); }
 }
-// Send the next chunk, whole, or the last, short.
+// Send the next chunk, whole, or the last, short (its bytes' lock held).
 function flushChunk(found) {
-  const count = Math.min(found.chunk, found.length);
-  const chunk = found.buffer.slice(0, count);
-  const index = found.flushed / found.chunk;
+  const bytes = found.bytes;
+  const count = Math.min(found.chunk, bytes.length);
+  const chunk = bytes.bytes(0, count).slice();
+  const index = bytes.from / found.chunk;
   const headers = { 'Content-Type': 'application/octet-stream' };
   if (process.proc) headers['X-Process-Token'] = process.proc;
   const xhr = request('PUT', `/api/pwrite?fd=${found.kfd}&index=${index}`, chunk, headers);
   if (xhr.status >= 300) throw new Errno(errnoOf(safeJson(xhr.responseText)));
-  found.buffer.copyWithin(0, count, found.length);
-  found.length -= count;
-  found.flushed += count;
+  bytes.view.copyWithin(0, count, bytes.length);
+  bytes.length -= count;
+  bytes.from += count;
 }
 const safeJson = text => { try { return JSON.parse(text); } catch { return {}; } };
 
-// Close a descriptor: what it wrote goes, with the close, in one request where it can.
+// Close an open file, its last descriptor gone: what it wrote goes, with the close, in one
+// request where it can.
 function closeFd(found) {
-  if (found.kind === 'pipe-in') found.pipe.closeReader();
-  else if (found.kind === 'pipe-out') found.pipe.closeWriter();
-  else if (found.kind === 'file' && found.writer) {
-    while (found.length > found.chunk) flushChunk(found);
-    const calls = [];
-    if (found.length > INLINE) flushChunk(found);
-    if (found.length > 0) calls.push({ pwrite: { fd: found.kfd, index: found.flushed / found.chunk, data: base64(found.buffer.subarray(0, found.length)) } });
-    calls.push({ close: { fd: found.kfd } });
-    const results = batch(calls);
+  if (found.kind === 'file' && found.writer) {
+    const bytes = found.bytes;
+    bytes.lock();
+    try {
+      while (bytes.length > found.chunk) flushChunk(found);
+      const calls = [];
+      if (bytes.length > INLINE) flushChunk(found);
+      if (bytes.length > 0) calls.push({ pwrite: { fd: found.kfd, index: bytes.from / found.chunk, data: base64(bytes.bytes(0, bytes.length)) } });
+      calls.push({ close: { fd: found.kfd } });
+      const results = batch(calls);
+      forget();
+      for (const result of results) ok(result);
+    } finally { bytes.unlock(); }
+  } else if (found.kind === 'file' && found.rewrite && found.bytes.dirty) {
     forget();
-    for (const result of results) ok(result);
-  } else if (found.kind === 'file' && found.rewrite && found.dirty) {
-    forget();
-    if (found.data.length <= INLINE) {
+    const data = found.bytes.bytes(0, found.bytes.length).slice();
+    if (data.length <= INLINE) {
       const results = batch([
         { open: { path: found.path, flags: O_WRONLY | O_TRUNC } },
-        ...(found.data.length ? [{ pwrite: { fd: { ref: 0 }, index: 0, data: base64(found.data) } }] : []),
+        ...(data.length ? [{ pwrite: { fd: { ref: 0 }, index: 0, data: base64(data) } }] : []),
         { close: { fd: { ref: 0 } } },
       ]);
       for (const result of results) ok(result);
     } else {
       const writer = openWriter(found.path, O_TRUNC, false);
-      writeTo(writer, 0, found.data);
+      writeTo(writer, 0, data);
       closeFd(writer);
     }
   } else if (found.kind === 'file' && found.kfd !== undefined) {
@@ -377,7 +445,7 @@ const wasi = {
   fd_allocate: () => 0,
   fd_datasync: () => 0,
   fd_sync: () => 0,
-  fd_close: fd => attempt(() => { const found = descriptor(fd); if (fd > 2) fds.delete(fd); closeFd(found); }),
+  fd_close: fd => attempt(() => uninstall(fd)),
   fd_fdstat_get: (fd, ptr) => attempt(() => {
     const found = descriptor(fd), v = view();
     v.setUint8(ptr, filetype(found));
@@ -392,13 +460,20 @@ const wasi = {
   fd_filestat_get: (fd, ptr) => attempt(() => writeFilestat(ptr, fstat(descriptor(fd)))),
   fd_filestat_set_size: (fd, len) => attempt(() => {
     const found = descriptor(fd), length = Number(len);
-    if (found.rewrite) {
-      const data = new Uint8Array(length); data.set(found.data.subarray(0, length)); found.data = data; found.dirty = true;
-    } else if (found.writer) {
-      if (length < found.flushed) throw new Errno(EINVAL);
-      writeTo(found, found.flushed + found.length, new Uint8Array(Math.max(0, length - found.flushed - found.length)));
-      found.length = length - found.flushed;
-    } else throw new Errno(EINVAL);
+    if (!found.rewrite && !found.writer) throw new Errno(EINVAL);
+    const bytes = found.bytes;
+    if (found.writer) {
+      if (length < bytes.from) throw new Errno(EINVAL);
+      if (length > size(found)) writeTo(found, size(found), new Uint8Array(length - size(found)));
+    }
+    bytes.lock();
+    try {
+      const keep = length - (found.writer ? bytes.from : 0);
+      if (!bytes.ensure(keep)) throw new Errno(EFBIG);
+      if (keep > bytes.length) bytes.view.fill(0, bytes.length, keep);
+      bytes.length = keep;
+      if (found.rewrite) bytes.dirty = true;
+    } finally { bytes.unlock(); }
   }),
   fd_filestat_set_times: (fd, atim, mtim, flags) => attempt(() => { times(descriptor(fd).path, atim, mtim, flags); }),
   fd_pread: (fd, iovs, count, offset, nread) => attempt(() => {
@@ -412,11 +487,11 @@ const wasi = {
     view().setUint32(nread, total, true);
   }),
   fd_prestat_get: (fd, ptr) => {
-    if (fd !== 3) return EBADF;
+    if (!preopen(fd)) return EBADF;
     view().setUint8(ptr, 0); view().setUint32(ptr + 4, 1, true);
     return 0;
   },
-  fd_prestat_dir_name: (fd, ptr, len) => { if (fd !== 3) return EBADF; bytes().set(encoder.encode('/').subarray(0, len), ptr); return 0; },
+  fd_prestat_dir_name: (fd, ptr, len) => { if (!preopen(fd)) return EBADF; bytes().set(encoder.encode('/').subarray(0, len), ptr); return 0; },
   fd_pwrite: (fd, iovs, count, offset, nwritten) => attempt(() => {
     const found = descriptor(fd);
     let at = Number(offset), total = 0;
@@ -467,7 +542,15 @@ const wasi = {
     for (const record of out) { const part = record.subarray(0, Math.min(record.length, buf + len - at)); bytes().set(part, at); at += part.length; }
     view().setUint32(used, at - buf, true);
   }),
-  fd_renumber: (from, to) => attempt(() => { const found = descriptor(from); if (fds.has(to)) closeFd(fds.get(to)); fds.set(to, found); fds.delete(from); }),
+  // WASI's renumber moves a descriptor: `from` is closed, `to` is what it was.
+  fd_renumber: (from, to) => attempt(() => {
+    const found = descriptor(from);
+    if (from === to) return;
+    if (fds.has(to)) uninstall(to);
+    fds.set(to, found);
+    fds.delete(from);
+    if (cloexec.delete(from)) cloexec.add(to);
+  }),
   fd_seek: (fd, offset, whence, ptr) => attempt(() => {
     const found = descriptor(fd);
     if (found.kind !== 'file') throw new Errno(ESPIPE);
@@ -515,8 +598,8 @@ const wasi = {
       else found = openRewrite(path, there, append, read);
     }
     found.append ||= append && found.kind === 'file';
-    const number = nextFd++;
-    fds.set(number, found);
+    const number = lowest();
+    install(number, found);
     view().setUint32(out, number, true);
   }),
   path_readlink: (fd, ptr, len, buf, bufLen, used) => attempt(() => {
@@ -549,7 +632,8 @@ const wasi = {
   }),
   proc_exit: code => { throw new Exit(code); },
   proc_raise: () => ENOSYS,
-  random_get: (ptr, len) => { for (let at = 0; at < len; at += 65536) crypto.getRandomValues(bytes().subarray(ptr + at, ptr + Math.min(len, at + 65536))); return 0; },
+  // Into memory of its own first: shared memory (WASIX's) is not the crypto's to fill.
+  random_get: (ptr, len) => { for (let at = 0; at < len; at += 65536) bytes().set(crypto.getRandomValues(new Uint8Array(Math.min(65536, len - at))), ptr + at); return 0; },
   sched_yield: () => 0,
 };
 // What WASI has that a program here cannot do (sockets): not implemented.
@@ -573,9 +657,324 @@ function pause() {
   while (Atomics.load(control, 0) !== 0) Atomics.wait(control, 0, 1);
   postMessage({ continued: true });
 }
-// WASIX, which an uploaded module may ask for (its runtime lands with fork, phase 3): every
-// call not implemented, as ENOSYS says.
-const wasix = new Proxy({}, { get: () => () => ENOSYS });
+
+// ---- WASIX ----
+
+// The root directory WASI's libc finds its paths under, as long as the program keeps it open.
+const preopen = fd => fds.get(fd)?.kind === 'dir' && fds.get(fd)?.path === '/' && fd === 3;
+// The host's answer to a call that waits on it (wait, execve, getppid, kill): the page
+// (web/wasi/exec.mjs) answers in memory both share, as the kernel answers a blocking call.
+let channel = null;
+function host(type, args) {
+  if (!channel) throw new Errno(ENOSYS);
+  flush();
+  Atomics.store(channel.state, 0, 0);
+  postMessage({ host: { type, args } });
+  // A stop while it waits, it heeds.
+  while (Atomics.load(channel.state, 0) === 0) {
+    if (Atomics.wait(channel.state, 0, 0, 200) === 'timed-out') pause();
+  }
+  return JSON.parse(decoder.decode(channel.data.slice(0, Atomics.load(channel.state, 1))));
+}
+const hostErrno = reply => { if (reply?.errno) throw new Errno(ERRNO[reply.errno] ?? EIO); return reply; };
+// Lines of a string WASIX passes a list as (arguments, environment).
+const lines = (ptr, len) => string(ptr, len).split(/[\n\r]/).filter(line => line !== '');
+// Signals whose default is to end the process, by Linux's numbers.
+const ENDING = new Set([1, 2, 3, 6, 9, 11, 13, 14, 15]);
+// setjmp's saved stacks, by the jmp_buf's address: what longjmp goes back to.
+let snapshots = new Map(), saved = 0;
+
+// execve(2) of `name` (a path, or a name PATH finds): it does not return, if it goes through;
+// the new image starts in this process once this one is unwound (`Replaced`).
+function execve(name, argv, env, search = !name.includes('/')) {
+  let path = name;
+  if (search) {
+    const PATH = env.find(entry => entry.startsWith('PATH='))?.slice(5) || '/usr/bin';
+    path = undefined;
+    for (const dir of PATH.split(':').filter(Boolean)) {
+      const candidate = clean(join(join(process.cwd, dir), name));
+      try { if (kindOf(stat(candidate).mode) === REGULAR_FILE) { path = candidate; break; } } catch { /* not there */ }
+    }
+    if (!path) throw new Errno(ENOENT);
+  } else path = clean(join(process.cwd, name));
+  // The working directory goes with the process, which a WASI program learns from PWD.
+  const environment = [...env.filter(entry => !entry.startsWith('PWD=')), `PWD=${process.cwd}`];
+  hostErrno(host('exec', { path, argv, env: environment, cwd: process.cwd }));
+  throw new Replaced();
+}
+// The old execve, which cannot fail: what fails ends the process, as a shell would say it.
+function execOrExit(name, argv, env) {
+  try { execve(name, argv, env); } catch (err) {
+    if (!(err instanceof Errno)) throw err;
+    output(2, encoder.encode(`${name}: ${STRERROR[err.errno] ?? 'cannot execute'}\n`));
+    flush();
+    throw new Exit(err.errno === ENOENT ? 127 : 126);
+  }
+}
+
+const wasixCalls = {
+  ...wasi,
+  // WASIX's renumber is dup2(2): `from` stays open.
+  fd_renumber: (from, to) => attempt(() => {
+    const found = descriptor(from);
+    if (from === to) return;
+    if (fds.has(to)) uninstall(to);
+    install(to, found);
+  }),
+  fd_dup: (fd, out) => attempt(() => { const found = descriptor(fd), number = lowest(); install(number, found); view().setUint32(out, number, true); }),
+  fd_dup2: (fd, min, closeOnExec, out) => attempt(() => {
+    const found = descriptor(fd), number = lowest(min);
+    install(number, found);
+    if (closeOnExec) cloexec.add(number);
+    view().setUint32(out, number, true);
+  }),
+  fd_pipe: (readEnd, writeEnd) => attempt(() => {
+    if (typeof SharedArrayBuffer !== 'function') throw new Errno(ENOSYS);
+    const pipe = new Pipe(pipeBuffer());
+    const r = lowest();
+    install(r, { kind: 'pipe-in', pipe });
+    const w = lowest();
+    install(w, { kind: 'pipe-out', pipe });
+    view().setUint32(readEnd, r, true);
+    view().setUint32(writeEnd, w, true);
+  }),
+  getcwd: (ptr, lengthPtr) => {
+    const cwd = encoder.encode(process.cwd), room = view().getUint32(lengthPtr, true);
+    view().setUint32(lengthPtr, cwd.length, true);
+    if (cwd.length >= room) return ERRNO.ERANGE;
+    bytes().set(cwd, ptr);
+    bytes()[ptr + cwd.length] = 0;
+    return 0;
+  },
+  chdir: (ptr, len) => attempt(() => {
+    const path = clean(join(process.cwd, string(ptr, len)));
+    const [found, searchable] = batch([{ stat: { path } }, { access: { path, mode: 1 } }]);
+    if (kindOf(ok(found).mode) !== DIRECTORY) throw new Errno(ENOTDIR);
+    ok(searchable);
+    process.cwd = path;
+  }),
+  proc_id: ptr => { view().setUint32(ptr, process.pid, true); return 0; },
+  // getppid: its parent now (init's, once its parent ended), as its kernel has it.
+  proc_parent: (pid, ptr) => attempt(() => {
+    const found = hostErrno(host('getpid', { pid }));
+    view().setUint32(ptr, found.ppid, true);
+  }),
+  proc_signal: (pid, signal) => attempt(() => { hostErrno(host('kill', { pid, signal })); }),
+  // fork(2): unwound, copied into a child by the host, and rewound (the run loop below).
+  proc_fork: (copy, pidPtr) => {
+    if (engine?.rewinding) {
+      const answer = engine.resume();
+      if (answer.errno) return answer.errno;
+      view().setUint32(pidPtr, answer.pid, true);
+      return 0;
+    }
+    if (!engine?.able || !channel) return ENOSYS;
+    flush();
+    try { engine.unwind({ kind: 'fork' }); } catch { return ERRNO.ENOMEM; }
+    return 0;
+  },
+  proc_exec: (name, nameLen, args, argsLen) => execOrExit(string(name, nameLen), lines(args, argsLen), environ),
+  proc_exec2: (name, nameLen, args, argsLen, envs, envsLen) => execOrExit(string(name, nameLen), lines(args, argsLen), lines(envs, envsLen)),
+  proc_exec3: (name, nameLen, args, argsLen, envs, envsLen, search, path, pathLen) => attempt(() => {
+    const env = lines(envs, envsLen);
+    const PATH = string(path, pathLen);
+    execve(string(name, nameLen), lines(args, argsLen), search && PATH ? [...env.filter(entry => !entry.startsWith('PATH=')), `PATH=${PATH}`] : env, !!search && !string(name, nameLen).includes('/'));
+  }),
+  // wait4(2): a child of this process (or the one named) once it ended, reaped; with
+  // NON_BLOCKING, none if none ended yet.
+  proc_join: (pidPtr, flags, statusPtr) => attempt(() => {
+    const v = view(), tag = v.getUint8(pidPtr);
+    if (tag > 1) throw new Errno(EINVAL);
+    const reply = hostErrno(host('join', { pid: tag === 1 ? v.getUint32(pidPtr + 4, true) : null, nohang: (flags & 1) !== 0 }));
+    for (let at = 0; at < 6; at++) v.setUint8(statusPtr + at, 0);
+    if (reply.nothing) { v.setUint8(pidPtr, 0); v.setUint32(pidPtr + 4, 0, true); return; }
+    v.setUint8(pidPtr, 1);
+    v.setUint32(pidPtr + 4, reply.pid, true);
+    if (reply.signal != null) { v.setUint8(statusPtr, 2); v.setUint8(statusPtr + 4, reply.signal); }
+    else { v.setUint8(statusPtr, 1); v.setUint16(statusPtr + 2, reply.code & 0xffff, true); }
+  }),
+  // A program's signal handlers are not called: each signal does what it does by default.
+  callback_signal: () => {},
+  thread_id: ptr => { view().setUint32(ptr, 1, true); return 0; },
+  // raise(3), abort(3): a signal to itself, whose default ends it.
+  thread_signal: (tid, signal) => { if (ENDING.has(signal)) { flush(); throw new Exit(128 + signal); } return 0; },
+  thread_exit: code => { throw new Exit(code); },
+  // One thread: nothing else could change the word or wake it, so a wait returns at once.
+  futex_wait: (addr, expected, timeout, woken) => { view().setUint8(woken, 0); return 0; },
+  futex_wake: (addr, woken) => { view().setUint8(woken, 0); return 0; },
+  futex_wake_all: (addr, woken) => { view().setUint8(woken, 0); return 0; },
+  // setjmp: the stack saved (unwound and rewound at once); longjmp: unwound, and the saved one
+  // rewound, with its value.
+  stack_checkpoint: (snapshot, result) => {
+    if (engine?.rewinding) { view().setBigUint64(result, BigInt(engine.resume().value), true); return 0; }
+    if (!engine?.able) return ENOSYS;
+    try { engine.unwind({ kind: 'checkpoint', snapshot, sp: engine.stackPointer() }); } catch { return ERRNO.ENOMEM; }
+    return 0;
+  },
+  stack_restore: (snapshot, value) => {
+    const found = snapshots.get(snapshot);
+    if (!engine?.able || !found || found.id !== view().getBigUint64(snapshot, true)) { flush(); throw new Exit(134); }
+    engine.unwind({ kind: 'restore', found, value: value === 0n ? 1n : value });
+  },
+};
+// Each call waits first while the process is stopped, as WASI's do.
+const wasix = new Proxy(wasixCalls, {
+  get: (target, name) => {
+    const call = target[name] ?? (() => ENOSYS);
+    return (...args) => { pause(); return call(...args); };
+  },
+});
+
+// ---- Fork ----
+
+// What a child gets of this process's open files: each description, shared through the line's
+// table (`shares`), and which descriptors are which.
+function forkState() {
+  shares ??= new Shares();
+  const ids = new Map(), descriptions = [], table = [];
+  for (const [fd, found] of fds) {
+    if (!ids.has(found)) {
+      ids.set(found, descriptions.length);
+      descriptions.push(describe(found));
+    }
+    table.push([fd, ids.get(found), cloexec.has(fd)]);
+  }
+  return { fds: table, descriptions };
+}
+function describe(found) {
+  switch (found.kind) {
+    case 'in': return { kind: 'in', tty: found.tty, data: found.data.slice(found.pos) };
+    case 'out': return { kind: 'out', fd: found.fd, tty: found.tty, closed: found.closed?.buffer ?? null };
+    case 'pipe-in': case 'pipe-out': return { kind: found.kind, tty: !!found.tty, buffer: found.pipe.buffer, refs: found.refs };
+    case 'dir': return { kind: 'dir', path: found.path };
+    default: {
+      if (found.share == null) {
+        const slot = shares.claim(found.refs, found.pos ?? 0);
+        if (slot < 0) throw new Errno(ERRNO.EMFILE);
+        shares.attach(found, slot);
+      }
+      shares.add(found.share, found.refs);
+      const { kind, path, kfd, token, read, size: length, stat: stated, writer, rewrite, append, chunk, share, refs } = found;
+      return { kind, path, kfd, token, read, size: length, stat: stated, writer, rewrite, append, chunk, share, refs, bytes: found.bytes?.transferable };
+    }
+  }
+}
+// The child's descriptors, as its parent had them (its host holds its pipes' ends for it).
+function adopt(state) {
+  const made = state.descriptions.map(description => {
+    switch (description.kind) {
+      case 'in': return { kind: 'in', tty: description.tty, data: description.data, pos: 0 };
+      case 'out': return { kind: 'out', fd: description.fd, tty: description.tty, closed: description.closed ? new Int32Array(description.closed) : null };
+      case 'pipe-in': case 'pipe-out': return { kind: description.kind, tty: description.tty, pipe: new Pipe(description.buffer) };
+      case 'dir': return { kind: 'dir', path: description.path };
+      default: {
+        const { bytes, share, refs, ...rest } = description;
+        const found = { ...rest, window: { start: 0, data: new Uint8Array(0) } };
+        if (bytes) found.bytes = new Bytes(bytes);
+        shares.attach(found, share);
+        return found;
+      }
+    }
+  });
+  for (const [fd, id, closeOnExec] of state.fds) {
+    install(fd, made[id], true);
+    if (closeOnExec) cloexec.add(fd);
+  }
+}
+// The child failed to start: what it was to share is this process's alone again.
+function unshare(state) {
+  for (const description of state.descriptions) {
+    if (description.share != null) shares.add(description.share, -description.refs);
+  }
+}
+// fork(2), the image unwound: the host makes the child (a pid, a Worker) of this snapshot.
+async function fork() {
+  let state;
+  try { state = forkState(); } catch (err) { return { errno: err instanceof Errno ? err.errno : EIO }; }
+  const snapshot = engine.snapshot();
+  postMessage({ fork: { ...state, snapshot, snapshots, shares: shares.buffer, argv: process.argv, env: environ, cwd: process.cwd, wasix: process.wasix } }, [snapshot.memory]);
+  const { forked } = await next('forked');
+  if (forked.errno) {
+    unshare(state);
+    return { errno: ERRNO[forked.errno] ?? EIO };
+  }
+  return { pid: forked.pid };
+}
+
+// ---- The image ----
+
+// What the host posts after the start: a fork's answer, an execve's image.
+const inbox = [], waiting = [];
+function received(data) {
+  const at = waiting.findIndex(([key]) => key in data);
+  if (at < 0) { inbox.push(data); return; }
+  const [[, resolve]] = waiting.splice(at, 1);
+  resolve(data);
+}
+function next(key) {
+  const at = inbox.findIndex(data => key in data);
+  if (at >= 0) return Promise.resolve(inbox.splice(at, 1)[0]);
+  return new Promise(resolve => waiting.push([key, resolve]));
+}
+// Instantiate `module`: a memory of the type it imports (`type`), or its own; a fork's child's,
+// as large as its parent's (`snapshot`), which it becomes.
+async function instantiate(module, type, snapshot) {
+  const pages = snapshot ? snapshot.memory.byteLength / 65536 : 0;
+  // A module importing its memory (WASIX's do) gets one of the type it declared, so that a
+  // shared or larger memory links; its own otherwise, as wasip1's, exported as `memory`.
+  const env = type ? { memory: new WebAssembly.Memory({
+    initial: Math.max(type.initial, pages),
+    ...(type.maximum == null ? {} : { maximum: type.maximum }),
+    ...(type.shared ? { shared: true } : {}),
+  }) } : {};
+  instance = await WebAssembly.instantiate(module, { wasi_snapshot_preview1: preview1, terminal, wasix_32v1: wasix, env });
+  memory = type ? env.memory : instance.exports.memory;
+  if (!(memory instanceof WebAssembly.Memory)) throw new Error('the module exports no memory');
+  process.wasix = WebAssembly.Module.imports(module).some(entry => entry.module === 'wasix_32v1');
+  engine = snapshot ? Engine.child(instance, () => memory, snapshot) : new Engine(instance, () => memory);
+}
+// Run the image, and what replaces it: its exit status, if `_start` returns.
+async function run() {
+  for (;;) {
+    try {
+      instance.exports._start();
+    } catch (err) {
+      if (!(err instanceof Replaced)) throw err;
+      await replace();
+      continue;
+    }
+    const pending = engine.unwound();
+    if (!pending) return 0;
+    if (pending.kind === 'fork') engine.rewind(await fork());
+    else if (pending.kind === 'checkpoint') {
+      // The stack, and the shadow stack it ran on, as setjmp saw them.
+      const top = engine.top, sp = pending.sp;
+      const id = BigInt(++saved);
+      snapshots.set(pending.snapshot, { id, stack: engine.saved(), sp, memory: sp != null && top > sp ? bytes().slice(sp, top) : null });
+      view().setBigUint64(pending.snapshot, id, true);
+      bytes().fill(0, pending.snapshot + 8, pending.snapshot + 24);
+      engine.rewind({ value: 0n });
+    } else if (pending.kind === 'restore') {
+      const { found, value } = pending;
+      if (found.memory) bytes().set(found.memory, found.sp);
+      if (found.sp != null) engine.setStackPointer(found.sp);
+      engine.rewind({ value }, found.stack);
+    }
+  }
+}
+// execve(2) went through: the image the host loaded starts in this process, its descriptors
+// open but those marked close-on-exec.
+async function replace() {
+  const { image } = await next('image');
+  for (const fd of [...cloexec]) { try { uninstall(fd); } catch { /* closed already */ } }
+  flush();
+  forget();
+  snapshots = new Map();
+  Object.assign(process, { argv: image.argv, proc: image.token });
+  environ = image.env;
+  await instantiate(image.module, image.memory);
+}
+
 
 // utimensat(2), as WASI asks it: each time given, now, or left.
 function times(path, atim, mtim, flags) {
@@ -615,36 +1014,47 @@ const terminal = {
   reply: ptr => { bytes().set(reply, ptr); },
 };
 
-onmessage = async ({ data }) => {
-  process = { ...data, limit: data.limit ?? 10 << 20 };
+let started = false;
+onmessage = ({ data }) => {
+  if (started) { received(data); return; }
+  started = true;
+  void start(data);
+};
+async function start(data) {
+  process = { ...data, limit: data.limit ?? 10 << 20, ppid: data.ppid ?? 1 };
   control = data.control ? new Int32Array(data.control) : null;
-  environ = Object.entries(data.env ?? {}).map(([name, value]) => `${name}=${value}`);
-  const { stdin = {}, stdout = {}, stderr = {} } = data;
-  fds.set(0, stdin.pipe ? { kind: 'pipe-in', pipe: new Pipe(stdin.pipe), tty: !!stdin.tty } : { kind: 'in', tty: !!stdin.tty, data: stdin.data ?? new Uint8Array(0), pos: 0 });
-  fds.set(1, stdout.pipe ? { kind: 'pipe-out', pipe: new Pipe(stdout.pipe) } : { kind: 'out', fd: 1, tty: !!stdout.tty, closed: stdout.closed ? new Int32Array(stdout.closed) : null });
-  fds.set(2, { kind: 'out', fd: 2, tty: !!stderr.tty });
-  fds.set(3, { kind: 'dir', path: '/' });
+  channel = data.channel ? { state: new Int32Array(data.channel, 0, 2), data: new Uint8Array(data.channel, 8) } : null;
+  const { stdin = {}, stdout = {}, stderr = {}, fork: parent } = data;
   let code = 0;
   try {
-    // A module importing its memory (WASIX's do) gets one of the type it declared, so that a
-    // shared or larger memory links; its own otherwise, as wasip1's, exported as `memory`.
-    const env = data.memory ? { memory: new WebAssembly.Memory({
-      initial: data.memory.initial,
-      ...(data.memory.maximum == null ? {} : { maximum: data.memory.maximum }),
-      ...(data.memory.shared ? { shared: true } : {}),
-    }) } : {};
-    const instance = await WebAssembly.instantiate(data.module, { wasi_snapshot_preview1: preview1, terminal, wasix_32v1: wasix, env });
-    memory = data.memory ? env.memory : instance.exports.memory;
-    if (!(memory instanceof WebAssembly.Memory)) throw new Error('the module exports no memory');
-    instance.exports._start();
+    if (parent) {
+      // A fork's child: its parent's argument vector, environment, directory and descriptors.
+      environ = parent.env;
+      shares = new Shares(parent.shares);
+      snapshots = parent.snapshots;
+      Object.assign(process, { argv: parent.argv, cwd: parent.cwd });
+      adopt(parent);
+    } else {
+      environ = Array.isArray(data.env) ? data.env : Object.entries(data.env ?? {}).map(([name, value]) => `${name}=${value}`);
+      process.cwd ??= environ.find(entry => entry.startsWith('PWD='))?.slice(4) || '/';
+      // The page holds the pipes' ends it gives a process, for it, before it starts.
+      install(0, stdin.pipe ? { kind: 'pipe-in', pipe: new Pipe(stdin.pipe), tty: !!stdin.tty } : { kind: 'in', tty: !!stdin.tty, data: stdin.data ?? new Uint8Array(0), pos: 0 }, true);
+      install(1, stdout.pipe ? { kind: 'pipe-out', pipe: new Pipe(stdout.pipe) } : { kind: 'out', fd: 1, tty: !!stdout.tty, closed: stdout.closed ? new Int32Array(stdout.closed) : null }, true);
+      install(2, { kind: 'out', fd: 2, tty: !!stderr.tty }, true);
+      install(3, { kind: 'dir', path: '/' });
+    }
+    await instantiate(data.module, data.memory, parent?.snapshot);
+    // The child returns from fork with 0.
+    if (parent) engine.rewind({ pid: 0 });
+    code = await run();
   } catch (err) {
     if (err instanceof Exit) code = err.code;
-    else { output(2, encoder.encode(`${process.argv[0]}: ${err?.message ?? err}\n`)); code = 134; }
+    else { output(2, encoder.encode(`${process.argv?.[0] ?? 'process'}: ${err?.message ?? err}\n`)); code = 134; }
   }
   // What it left open closes as it exits, as a process's descriptors do: its pipes too, so that
   // the next reads to their end, and the one before hears SIGPIPE.
-  for (const [, found] of fds) { try { closeFd(found); } catch { /* it exits all the same */ } }
+  for (const fd of [...fds.keys()]) { try { uninstall(fd); } catch { /* it exits all the same */ } }
   if (closing.length) { try { batch([]); } catch { /* likewise */ } }
   flush();
   postMessage({ exit: code });
-};
+}

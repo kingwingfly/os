@@ -402,6 +402,28 @@ forwarded there by the authority, with the caller it found. `/proc` lists the ma
 processes. Coreutils runs through this path: the page asks the client kernel for the processes,
 then runs each as a Worker whose batches carry the process's pid and token.
 
+**Any wasm can fork** (Phase 3). A program built for WASIX runs in the terminal's own process
+Workers (`web/wasi/process.js`), with WASIX's process calls over the client kernel:
+- **fork:** the loader gives an image that imports `proc_fork`, `stack_checkpoint` or
+  `stack_restore` binaryen's asyncify as it loads (`web/kernel/asyncify.js`, in a Worker, limited
+  to those imports, kept by content in the browser's cache). A fork unwinds the image, and the
+  page starts the child in a Worker of its own with a copy of the memory and mutable globals; both
+  rewind (`web/wasi/fork.js`). The pid is the client kernel's, lent ahead.
+- **execve:** `proc_exec` replaces the process's image in place: its pid, credentials and open
+  descriptors stay, as Linux's do. Only the process can ask, by its token; the authority keeps the
+  credentials it had and hands the descriptors on (`credentials.owner`).
+- **wait:** `proc_join` waits for a child, or any, with its exit status or signal (wait4); an
+  orphan is init's, and the page reaps it as it ends.
+- **Open files a fork shares:** each open file is one, as Linux's struct file is. A table every
+  process of a fork line shares counts its descriptors and keeps its offset; only the last close
+  closes it, and a file being written keeps its bytes in memory they share (`web/wasi/shared.js`).
+  A pipe counts its holders, so its end of file comes when every writer has closed, a killed one
+  too.
+- **Also:** `fd_pipe`, `fd_dup`, `fd_dup2` and WASIX's `fd_renumber` (dup2), `getcwd`, `chdir`,
+  `proc_parent`, `proc_signal`, and setjmp and longjmp by asyncify. A forked child is in its
+  parent's job: Ctrl+C and Ctrl+Z reach it. Signal handlers are not called; each signal does what
+  it does by default.
+
 A signed-out browser is now `guest-<uuid>:guest`, with a uid of its own from the anonymous range
 (1,000,000–1,999,999) and no home; `HOME` stays the shared `/guest` (1777 sticky), and
 `/etc/passwd` names it. A real `useradd` still makes a real account and home. Cgroups are a
@@ -415,7 +437,7 @@ directory. The kernel checks the X rule (root needs an x bit too; setuid never e
 opens the image as a descriptor of the process's own; the loader reads it by an exec token,
 revalidated with X, not R, so an x-only file runs while a path read stays denied. The loader
 compiles once per content id (an LRU, refreshed on a hit), and admits only WASI preview 1,
-`terminal.sys`, WASIX (stubbed until Phase 3) and `env.memory` imports — as functions, with the
+`terminal.sys`, WASIX and `env.memory` imports — as functions, with the
 imported memory's own limits and shared flag — plus a `_start` and a memory; anything else is
 `Exec format error`, as Linux says. Refusals keep the kernel's own errno and words. The process
 runs with the credentials snapshotted at exec; its `/api/sys` batches carry `pid` and `proc` in
@@ -439,7 +461,7 @@ with binaryen in both. Details are in `AGENT.md` and issue #20.
 
 The next steps agreed in issue #20, and the ideas recorded for later.
 
-- **Fork of any wasm in the terminal:** the client kernel forks at once (above), and the WASIX runtime forks `dash` in Node and a module Worker (Phase 0). Running WASIX programs in the terminal's own process Workers joins the two, with descriptors counted across a fork so that a child's close does not close its parent's.
+- **WASIX beyond processes:** threads (`thread_spawn`, futexes that wait), signal handlers (`callback_signal`), ttys and sockets answer ENOSYS or do nothing yet. The approved `dash` fixture's libc (2023) starts at `/` whatever the process's directory, and does not flush a `printf` to a file or a pipe; a current WASIX libc asks the runtime (`getcwd`).
 - **JSPI and asyncify:** JavaScript Promise Integration (Chrome 137+, Firefox planned for 153) lets a blocking call await a promise without transforming the module, where shared memory and `Atomics.wait` need cross-origin isolation. Asyncify stays only for `fork`, which must copy a stack into a new instance, as a JSPI suspension cannot be copied. It applies to modules that import `proc_fork`, limited by `asyncify-imports`, and is transformed once per content and cached.
 - **GUI programs:** the WASI graphics proposal (`wasi:webgpu`, `wasi:surface`, `wasi:frame-buffer`), implemented in each process's Worker on WebGPU and a canvas handed over from the compositor's window. `/dev/display` is the permission gate. Web content runs in sandboxed frames, since a browser cannot run as a wasm process.
 - **Mounts and clusters:** a directory of the user's device mounted live, shared across devices and sessions peer to peer, or through a Cloudflare relay. Map/reduce across opted-in clients and Containers (the h264 to av1 example). Bytes go through a relay Durable Object per mount or cluster, never through the authority.

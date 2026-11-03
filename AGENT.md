@@ -152,10 +152,19 @@ roadmap.
     for an uploaded image, a process-owned descriptor and read token.
   - **Credentials, not rows, at the authority:** a process's file calls and byte requests are
     checked by `Db::credential` in the caller's namespace. A fork carries its parent's token (it
-    keeps its credentials and shares its descriptors, owned by the exec's `"ns pid token-prefix"`). The
-    machine revokes a token once no live process holds it (`revoked`), at the end of the batch
-    that ended it (`/internal/revoke`, which closes its descriptors), the alarm retrying; a
+    keeps its credentials and shares its descriptors). Descriptors are owned by the credentials'
+    `owner`: the exec's `"ns pid token-prefix"`, or, for an image a process replaced its own with,
+    the one it had (`credentials.owner`, a line of images with the same credentials), so an exec
+    keeps what the process opened; an image's own descriptor is owned by its token alone
+    (`Credential::image`). The machine revokes a token once no live process holds it (`revoked`),
+    at the end of the batch that ended it (`/internal/revoke`, which closes its image's
+    descriptor, and its line's once no credentials of the line are left), the alarm retrying; a
     replaced image's token is revoked by the exec itself.
+  - **A process's own execve:** `Execve` with `pid` and the process's own token (`proc`, checked
+    by `exec_begin`), which only the client kernel's `reexec` sends for its host: the image is
+    replaced, the pid, cgroup and credentials kept (the authority snapshots the old token's, not
+    the caller's), and the process carries a new token. Without the token, a pid cannot be
+    taken over (EPERM).
   - **Local fork, exit and wait:** the client kernel forks with a lent pid (`Pids`, at most
     `PIDS_MAX`, within `PROC_MAX`), keeps exits and waits in its own table, and tells the machine
     in order (`Fork`/`Exit` naming the process by `pid` and `proc`), with its next request or
@@ -181,8 +190,7 @@ roadmap.
   `cgroup.freeze` and `devices.allow/deny` stored and checked. Enforcement (CPU slicing,
   memory limits, freeze at syscall boundaries) is Phase 6.
 - **What is not done yet:** archive jobs are not yet processes of their own (they keep their
-  runner's descriptors; Phase 4); the WASIX asyncify runtime is not yet wired to
-  `Fork`/`Execve` (Phase 3); there is no pty, init program, GUI device, mount or cluster executor
+  runner's descriptors; Phase 4); there is no pty, init program, GUI device, mount or cluster executor
   yet.
 
 ## Phase 2 findings (2026-11-01)
@@ -250,7 +258,7 @@ These were explicitly chosen by the owner; do not silently replace them with ful
 - Account changes revoke old sessions; a self-password change issues a new current session. Locking revokes sessions. Unlocking does not resurrect them.
 - A signed-out browser is `guest-<uuid>:guest`, not the single uid 65534: its uid comes from 1,000,000–1,999,999, it owns what it creates in the shared `/guest`, and no home is made until `useradd -m`. Use `is_guest_id` (never `uid == GUEST`) for "signed out"; `GUEST` remains the group and the fallback identity.
 - A process batch carries `pid` and `proc` (the token `Execve` answered). It runs as the credentials snapshotted at exec, with the process's umask and cgroup; it cannot login, logout, sudo or change the browser session. A page batch carries neither and keeps the old session semantics. Tokens are stored hashed, scoped to their namespace, and dead once their process is a zombie.
-- `execve` requires a regular, whole file and the X permission (root too needs an x bit); setuid/setgid never elevate. Build binaries answer their asset, recognized by content so a copy or hard link of `/usr/bin/coreutils` is one too; uploaded wasm answers a descriptor of the process's own and an exec read token, revalidated with the X rule (not R) and usable only with the process's token on `GET /api/file` (`X-Process-Token`). A process token cannot `Execve` itself: the client kernel execs a new process, and process-side `execve` waits for the Phase 3 handshake.
+- `execve` requires a regular, whole file and the X permission (root too needs an x bit); setuid/setgid never elevate. Build binaries answer their asset, recognized by content so a copy or hard link of `/usr/bin/coreutils` is one too; uploaded wasm answers a descriptor of the process's own and an exec read token, revalidated with the X rule (not R) and usable only with the process's token on `GET /api/file` (`X-Process-Token`). A process token cannot `Execve` itself: a process's own execve goes through its client kernel (`reexec`), which sends `Execve { pid, proc }`.
 - The client kernel runs as the browser's SharedWorker, or, where `SharedWorker` is missing, as each tab's dedicated Worker (`web/kernel/protocol.js` `kernelPort`; `client.js` serves both, its port `self` when dedicated). A tab holds the Web Lock `tw-tab-<tab>` from before its first request, and every request carries `tab`; `execve` records it as the process's `seat` (`processes.seat`, `Proc.seat`). The kernel reaps a process whose seat's lock is free (`Gone`, SIGKILL then init's reap): at once where a SharedWorker waits on a tab's lock (`watch`), and at boot and on EAGAIN by `Seats` and `locks.query()` (`reapGone`). Only a SharedWorker without Web Locks reaps by boot id (`ProcInit { boot }`); never a tab's own kernel, which would reap other tabs' processes. `tests/kernel.spec.js` covers a closed tab and the no-SharedWorker fallback.
 - `/proc` lists the caller's namespace (`procfs` takes `ns`, `Db::namespace(key, guest)`): PIDs are per namespace. A process names only its own descriptors and a page only the page's (`fds::owned`, and `by_token` for read tokens): a process never reaches a page's descriptor, those opened as root under sudo included.
 
@@ -349,6 +357,15 @@ Report what changed, what was tested, and any real limitation. Do not claim depl
     - `fg`, `bg` and `kill %N` are the shell's. `kill %N` signals the group here and records each pid's signal in the kernel (`jobs::signal`).
   - **Delivery:** a registry `Kill` (the machine's) tells the namespace's lines through the authority (`/internal/tell`, `Told::Namespace`, the events socket's `Line.ns`) `{signal: {pid, signal}}`. app.js turns that into `terminal:signal`, and the tab hosting the pid applies it (`exec.mjs` `hosted`).
   - **Listings:** `jobs` lists the shell's jobs, then archive processes (non-numeric pids) and uploads; numbered processes are `ps`'s.
+- Fork in the terminal (Phase 3, part 3; issue #20's bar: fork works for any wasm):
+  - **WASIX calls:** `web/wasi/process.js` answers `wasix_32v1` with WASI's calls and a process's own: `proc_fork`, `proc_exec`/`2`/`3`, `proc_join`, `proc_id`, `proc_parent`, `proc_signal`, `fd_pipe`, `fd_dup`, `fd_dup2`, `fd_renumber` (WASIX's is dup2; preview 1's moves), `getcwd`, `chdir`, `stack_checkpoint`/`stack_restore`, and single-threaded `thread_*`/`futex_*`. Threads, signal handlers (`callback_signal`), ttys and sockets are not implemented.
+  - **Asyncify at load:** `web/kernel/loader.js` gives an image importing `proc_fork`, `stack_checkpoint` or `stack_restore` that does not export `asyncify_start_unwind` binaryen's asyncify (`web/kernel/asyncify.js`, run in the module Worker `wasi-asyncify.js`, which loads `/binaryen.js`), limited by `asyncify-imports`, with every mutable global exported (`__stack_pointer`, or `__tw_global_N` and `__tw_stack_pointer`). The result is kept in Cache Storage (`tw-asyncify-1`) by content. Only the features browsers run are enabled: binaryen's compact imports would change the binary.
+  - **The engine (`web/wasi/fork.js`):** the unwind buffer is memory grown for it once (4 pages), so no layout is guessed. A fork unwinds out of `_start`; the run loop posts `{fork}` with a copy of memory and mutable globals; the page (`exec.mjs` `host`) asks the client kernel for the pid, holds the child's pipe ends for it, and starts it in a Worker that rewinds with 0; the parent rewinds with the pid. setjmp saves the unwound stack and the shadow stack (keyed by the jmp_buf's address); longjmp restores both and rewinds.
+  - **Waiting calls:** `proc_join`, `proc_exec`, `proc_parent` and `proc_signal` post `{host}` and wait on the process's `channel` (shared memory, 64 KiB, JSON), heeding a stop every 200 ms. `join` asks the client kernel's `waitchild` (wait4 over its table: ECHILD, EAGAIN, or the zombie reaped) and waits for the next exit of a hosted process. `exec` asks `reexec`, loads the image, posts `{image}`, and the process throws out of its image (`Replaced`) and starts the new one in the same Worker, closing close-on-exec descriptors; a format refused after the kernel replaced the image ends the process (126).
+  - **Shared open files (`web/wasi/shared.js`):** a fork line shares a table (`Shares`) of each open file's descriptor count and offset; a description is counted per descriptor in every process, and only the last close closes it at the kernel or commits it. Files being written keep their bytes in `Bytes` (a growable SharedArrayBuffer and a lock). Pipes count holders by pid (`pipe.js` `hold`, `drop`, `release`); an end is gone when its holders are, and only the end a holder let go of is settled; the page holds a stage's or child's ends before it starts, the terminal's writing end itself (`PAGE`), and releases a process it ends (`exec.mjs` `release`). Stdin given as bytes is copied, not shared.
+  - **Jobs and reaping:** forks are in their stage's job (`forks`): Ctrl+C, Ctrl+Z and `fg` reach them; the pipeline's status is still its stages'. A fork's exit is only an exit (`reap(..., forked)`); its parent waits, and the page reaps it only once it is init's (the client kernel's `exit` answers the parent). Background children outlive the job, as Linux's do.
+  - **Fixture limits:** the approved `dash` (2023) keeps its own working directory, starting at `/`, until `cd`; and its `printf` into a file or pipe loses what follows the first line (its stdio is never flushed). Neither is the runtime's.
+  - **Tests:** `tests/fork.spec.js` (WAT modules that fork and wait, fork and exec, pipe, setjmp/longjmp, Ctrl+C to a forked child, an orphan reaped; with `WASIX_DASH`, dash's subshells, pipes, redirects into a file a child writes too, a shared offset, statuses, Ctrl+Z/fg) and `tests/fork-engine.test.mjs` (the engine in Node).
 - The transcript renders ANSI (owner, 2026-10-29: "ANSI color support is necessary, now"): core `ansi.rs` parses SGR (16, 256, 24-bit colours; bold, dim, italic, underline, inverse, strike) and OSC 8 links into runs, dropping other CSI/OSC sequences; frontend `render_line` draws them, the 16 colours as `--ansi-N` in style.css. The WASI engine tells a program its stdout is a terminal unless piped.
 - The tree is Arch's (owner: "mine is /sbin -> /usr/bin … change to the same"): usr.rs `TREE` (bin, sbin, lib, lib64 links; /usr's directories; /sys empty and 555), and sys.rs `ensure` (/boot, /mnt, /opt, /run, /srv, /var 755; /tmp 1777); /root is made 750. A typed /bin, /sbin, /usr/sbin or /usr/bin path runs its name (`bin::named`).
 - Touch screens: a tap in the Files runs nothing in the terminal, so no keyboard opens unasked.
