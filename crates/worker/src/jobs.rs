@@ -1,6 +1,9 @@
 //! Jobs, as the authority sees them: zip, unzip, tar and faststart start one, whose work a
-//! JobRunner Durable Object does with a container, asking the authority, as the job's account,
-//! for each file it reads or writes.
+//! JobRunner Durable Object does with a container (runner.rs). A job is a process (Phase 4,
+//! issue #20): `Spawn` snapshots who started it (root under sudo) into credentials of its own
+//! (creds.rs `JOBS`), whose token only its runner holds, and the runner makes the job's file
+//! calls through the system calls with it, checked as any process's are. What becomes of the
+//! account afterwards (locked, deleted) does not change a job that runs, as on Linux.
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -62,24 +65,6 @@ pub struct Spec {
 impl Spec {
     pub fn of(job: &Job) -> Result<Spec, String> {
         serde_json::from_str(&job.spec).map_err(|e| e.to_string())
-    }
-}
-
-/// The identity a job acts as: root if started with sudo, a guest if started by one, otherwise
-/// its account as it is now.
-pub fn actor(db: &Db, job: &Job) -> Result<Identity, String> {
-    if job.actor == 0 {
-        return Ok(Identity::root());
-    }
-    if is_guest_id(job.actor) {
-        return Ok(db
-            .user_by_id(job.actor)
-            .map(|(_, user)| Identity::of(&user))
-            .unwrap_or_else(Identity::guest));
-    }
-    match db.user_by_id(job.actor) {
-        Some((_, user)) if !user.locked => Ok(Identity::of(&user)),
-        _ => Err("The account that started this job is locked or deleted".into()),
     }
 }
 
@@ -494,11 +479,13 @@ pub fn view(db: &Db, job: &Job, since: u64) -> Value {
     })
 }
 
-/// End a job: let go of the files it read, and keep what it says.
+/// End a job: let go of the files it read, revoke its credentials, which closes what it had
+/// open, and keep what it says.
 pub fn finish(db: &mut Db, job: &str, state: &str) {
     db.set_job(job, crate::db::JobColumn::State, Some(state));
     db.set_job(job, crate::db::JobColumn::Question, None);
     db.unpin(job);
+    db.revoke_job(job);
     db.clear_expiry("job", job);
 }
 
@@ -551,7 +538,35 @@ pub fn call(
             let now = crate::auth::now();
             let stdin = db.add_fd(sid, None, &stdin_of(&pid), abi::O_WRONLY, false, now);
             db.set_expiry("fd", &crate::db::fd_key(sid, stdin), now + crate::fds::IDLE);
-            Ok(json!({ "pid": pid, "kind": started["kind"], "stdin": stdin }))
+            // Its credentials, as the caller's now (root under sudo), for its life; the token is
+            // its runner's alone (sys.rs hands it over and takes it out of the reply).
+            let token = crate::auth::random_token();
+            db.job_credential(
+                &pid,
+                &crate::auth::token_hash(&token),
+                &process.cred,
+                process.umask,
+                now,
+            );
+            // The archive it reads is open as its own, as a process holds what it reads: it
+            // shows in /proc/PID/fd, and closes as the job ends.
+            if let Some(source) = db
+                .job(&pid)
+                .and_then(|job| Spec::of(&job).ok())
+                .and_then(|spec| spec.source)
+            {
+                let session = crate::creds::job_owner(&pid);
+                let fd = db.add_fd(
+                    &session,
+                    Some(&source.file),
+                    &source.path,
+                    abi::O_RDONLY,
+                    false,
+                    now,
+                );
+                db.set_fd_proc(&session, fd, &session);
+            }
+            Ok(json!({ "pid": pid, "kind": started["kind"], "stdin": stdin, "token": token }))
         }
         Call::Kill { pid, .. } => {
             let job = theirs(db, &pid)?;

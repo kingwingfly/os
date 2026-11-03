@@ -1,7 +1,8 @@
 //! /proc (owner's design, 2026-10-29: the page is user space, its requests system calls): what
 //! the kernel tells of processes and descriptors, as files it writes as they are read, as Linux's
 //! procfs does. Each session sees its own descriptors (/proc/self/fd, /proc/self/fdinfo), and an
-//! account its own processes (/proc/PID), as procfs mounted with hidepid=invisible shows them.
+//! account its own processes (/proc/PID), as procfs mounted with hidepid=invisible shows them;
+//! a job's descriptors are /proc/PID/fd.
 //!
 //! /proc/self/fd/N is a magic link: a path through it names what the descriptor has open, as
 //! openat(2) names it from a directory's descriptor.
@@ -207,6 +208,22 @@ fn lookup(db: &Db, sid: Option<&str>, procs: &[Row], who: &Identity, path: &str)
             let process = job(pid)?;
             Entry::File(cmdline(&process), process.owner())
         }
+        // A job's descriptors, its own (creds.rs `job_owner`): what it has open, as its runner
+        // works (the archive it reads, the file it writes).
+        [pid, "fd"] => match job(pid)? {
+            process @ Proc::Job(_) => Entry::Dir(process.owner()),
+            Proc::Process(_) => return Err(Errno::ENOENT.into()),
+        },
+        [pid, "fd", number] => match job(pid)? {
+            process @ Proc::Job(_) => {
+                let fd: u32 = number.parse().map_err(|_| Errno::ENOENT)?;
+                let found = db
+                    .fd(&crate::creds::job_owner(pid), fd)
+                    .ok_or(Errno::ENOENT)?;
+                Entry::Link(opened(db, &found), process.owner())
+            }
+            Proc::Process(_) => return Err(Errno::ENOENT.into()),
+        },
         _ => return Err(Errno::ENOENT.into()),
     })
 }
@@ -268,7 +285,17 @@ fn entries(
             .into_iter()
             .map(|found| found.fd.to_string())
             .collect(),
-        _ => vec!["cmdline".into(), "status".into()],
+        other => match other
+            .strip_prefix("/proc/")
+            .and_then(|rest| rest.strip_suffix("/fd"))
+        {
+            Some(pid) => db
+                .fds_of(&crate::creds::job_owner(pid))
+                .into_iter()
+                .map(|found| found.fd.to_string())
+                .collect(),
+            None => vec!["cmdline".into(), "fd".into(), "status".into()],
+        },
     };
     Ok(names
         .into_iter()

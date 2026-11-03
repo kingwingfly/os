@@ -67,6 +67,41 @@ impl Credential {
     }
 }
 
+/// The namespace jobs' credentials are in (Phase 4): a job is no browser's process, and its
+/// token never leaves the server, as its runner alone holds it (runner.rs).
+pub const JOBS: &str = "jobs";
+
+/// The key the descriptors of the job `id` are owned by, and the session they are kept in.
+pub fn job_owner(id: &str) -> String {
+    format!("job {id}")
+}
+
+impl Credential {
+    /// The session its descriptors are kept in, where it is not its browser's: a job's own.
+    pub fn session(&self) -> Option<String> {
+        (self.ns == JOBS).then(|| self.owner())
+    }
+    /// The job these credentials are, if they are a job's.
+    pub fn job(&self) -> Option<String> {
+        (self.ns == JOBS)
+            .then(|| self.lineage.strip_prefix("job ").map(str::to_string))
+            .flatten()
+    }
+}
+
+/// The session the descriptors of a request are kept in: its process's, for a job, or else the
+/// browser's (the cookies' session).
+pub fn sid_of(
+    db: &Db,
+    key: Option<&str>,
+    guest: Option<&str>,
+    caller: Option<&Credential>,
+) -> Option<String> {
+    caller
+        .and_then(Credential::session)
+        .or_else(|| auth::sid(db, key, guest))
+}
+
 /// The key the descriptors of the credentials of token hash `token`, executed as `pid` of
 /// `ns`, are owned by.
 fn owner(ns: &str, pid: u32, token: &str) -> String {
@@ -74,9 +109,37 @@ fn owner(ns: &str, pid: u32, token: &str) -> String {
 }
 
 impl Db {
-    /// The credentials the token `token` carries, in namespace `ns`, while it is not revoked.
+    /// The credentials the token `token` carries, in namespace `ns`, while it is not revoked:
+    /// a browser's process's, or a job's, whose token only its runner has.
     pub fn credential(&self, token: &str, ns: &str) -> Option<Credential> {
-        self.credential_of(&auth::token_hash(token), ns)
+        let hash = auth::token_hash(token);
+        self.credential_of(&hash, ns)
+            .or_else(|| self.credential_of(&hash, JOBS))
+    }
+    /// The credentials of the job `id`, as `cred` spawned it with `umask`, by its token's hash
+    /// `hash`: they are the job's for its life, whatever becomes of the account.
+    pub fn job_credential(&mut self, id: &str, hash: &str, cred: &Identity, umask: u16, now: u64) {
+        self.run(
+            "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner) VALUES(?, ?, 0, ?, ?, ?, ?, ?, ?)",
+            vec![
+                text(hash),
+                text(JOBS),
+                int(cred.id),
+                int(cred.group),
+                text(&serde_json::to_string(&cred.groups).unwrap_or_default()),
+                int(umask & 0o777),
+                int(now),
+                text(&job_owner(id)),
+            ],
+        );
+    }
+    /// The job `id` ended: its credentials are revoked, and what it had open closes.
+    pub fn revoke_job(&mut self, id: &str) {
+        self.run(
+            "DELETE FROM credentials WHERE ns = ? AND owner = ?",
+            vec![text(JOBS), text(&job_owner(id))],
+        );
+        self.close_proc_fds(&job_owner(id));
     }
     /// The credentials whose token's hash is `hash`, in `ns`.
     fn credential_of(&self, hash: &str, ns: &str) -> Option<Credential> {

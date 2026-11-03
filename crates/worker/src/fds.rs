@@ -53,10 +53,8 @@ pub fn call(
         } => {
             let opened = open(db, sid, process, &path, flags, mode, size, sha256, version)?;
             // What it reads and writes later, apart from this call (the Worker's streams), it
-            // does as it was opened: as root, under sudo.
-            if process.cred.id == 0 {
-                db.set_fd_root(sid, opened.fd);
-            }
+            // does as it was opened: with its opener's credentials (root under sudo).
+            db.set_fd_cred(sid, opened.fd, &process.cred);
             // A process's open is its own descriptor, as on Linux: it answers that process
             // alone (`owned`), and closes as the process ends.
             if let Some(caller) = caller {
@@ -122,10 +120,17 @@ pub fn yours(db: &Db, sid: &str, fd: u32, caller: Option<&str>) -> Result<()> {
     }
 }
 
-/// As whom the descriptor `found` acts, for `who`, its session's account now: root if it was
-/// opened as root, as a descriptor keeps the access it was opened with.
+/// As whom the descriptor `found` acts, for `who`, its session's account now: as its opener,
+/// with the credentials it was opened with (root if under sudo), as a descriptor keeps the
+/// access it was opened with (change request 7, owner's, 2026-11-02).
 fn acting(found: &crate::db::Fd, who: &Identity) -> Identity {
-    if found.root {
+    if let Some(cred) = found
+        .cred
+        .as_deref()
+        .and_then(|cred| serde_json::from_str::<Identity>(cred).ok())
+    {
+        cred
+    } else if found.root {
         Identity::root()
     } else {
         who.clone()

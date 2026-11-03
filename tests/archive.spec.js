@@ -131,6 +131,41 @@ test('a job is a process: spawned, waited for, listed by ps, asked on its stdin,
   await expect(transcript(page).locator('pre').last()).toContainText('kill: (ffffffff) - No such process');
 });
 
+test('a job keeps the credentials it was spawned with, and its own descriptors', async ({ request }) => {
+  // Phase 4 (issue #20): a job is a process. Its spawn snapshots who started it, and its runner
+  // makes its file calls with them: locking the account afterwards does not fail it, as a
+  // running process keeps its credentials on Linux. What it has open shows in /proc/PID/fd.
+  const name = 'jobber' + Date.now().toString(36).slice(-6), secret = 'a passphrase of jobs ' + name;
+  await call(request, { useradd: { name, create_home: true } }, { sudo: true });
+  expect((await api(request, 'passwd', { data: { username: name, password: secret, force: true, sudo: true } })).ok()).toBe(true);
+  const user = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'archive-user-' + base } });
+  try {
+    expect((await api(user, 'login', { data: { username: name, password: secret } })).ok()).toBe(true);
+    const { uid, home } = await call(user, 'getcreds');
+    expect((await put(user, file(`${home}/greeting.zip`), { headers: { Origin: origin }, data: zipOf([['hello.txt', 'hello\n']]) })).status()).toBe(201);
+    const { pid } = await call(user, { spawn: { argv: ['unzip', 'greeting.zip'], cwd: home } });
+    // The archive it reads is a descriptor of its own.
+    const fds = await call(user, { getdents: { path: `/proc/${pid}/fd` } });
+    expect(fds).toHaveLength(1);
+    expect(await call(user, { readlink: { path: `/proc/${pid}/fd/${fds[0].name}` } })).toBe(`${home}/greeting.zip`);
+    // Locked while its container starts: the job goes on as it was spawned.
+    await call(request, { usermod: { name, lock: true } }, { sudo: true });
+    let state;
+    await expect.poll(async () => (state = await call(request, { wait: { pid } })).state, { timeout: 120_000 }).toMatch(/^(done|failed|cancelled)$/);
+    expect(state.state, JSON.stringify(state.lines)).toBe('done');
+    const made = await call(request, { stat: { path: `${home}/hello.txt` } });
+    expect(made.uid).toBe(uid);
+    expect(await (await request.get(file(`${home}/hello.txt`))).text()).toBe('hello\n');
+    // Ended, its credentials are revoked, and what it had open is closed.
+    await call(request, { usermod: { name, unlock: true } }, { sudo: true });
+    expect((await api(user, 'login', { data: { username: name, password: secret } })).ok()).toBe(true);
+    expect(await call(user, { getdents: { path: `/proc/${pid}/fd` } })).toEqual([]);
+  } finally {
+    await user.dispose();
+    await call(request, { userdel: { name, remove: true } }, { sudo: true }).catch(() => {});
+  }
+});
+
 test('unzip asks before replacing, -o and -n decide, tar -k keeps, and hostile members are skipped', async ({ page, request }) => {
   await terminal(page);
   await run(page, 'zip -rq notes.zip docs');

@@ -59,7 +59,7 @@ const SCHEMA: [&str; 33] = [
     // File descriptors (fds.rs): a session's (each browser is one), by number; the content it
     // reads or writes (none once another writer took it over), where, its open(2) flags,
     // whether it made the file, and when it was last kept (its lease).
-    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, token TEXT, root INTEGER NOT NULL DEFAULT 0, proc TEXT, exec INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(sid, fd))",
+    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, token TEXT, root INTEGER NOT NULL DEFAULT 0, proc TEXT, exec INTEGER NOT NULL DEFAULT 0, cred TEXT, PRIMARY KEY(sid, fd))",
     // The next descriptor number of each session: numbers are not given again, as a session's
     // pages share its descriptors, and one may go on using a number another closed.
     "CREATE TABLE IF NOT EXISTS fd_numbers(sid TEXT PRIMARY KEY, next INTEGER NOT NULL)",
@@ -249,6 +249,10 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     // the processes of boots that are gone.
     for table in ["processes", "namespaces", "cgroups"] {
         sql.exec(&format!("DROP TABLE IF EXISTS {table}"), None)?;
+    }
+    // Descriptors made before they kept their opener's credentials act as `root` says.
+    if sql.exec("SELECT cred FROM fds LIMIT 0", None).is_err() {
+        sql.exec("ALTER TABLE fds ADD COLUMN cred TEXT", None)?;
     }
     // Credentials made before they named their descriptors' owner own them by their own key.
     if sql
@@ -476,10 +480,13 @@ pub struct Fd {
     pub flags: u32,
     #[serde(deserialize_with = "flag")]
     pub created: bool,
-    /// Whether it was opened as root (or under sudo): what it reads and writes, it does as root,
-    /// as a descriptor keeps the access it was opened with.
+    /// Whether it was opened as root (or under sudo), for one made before it kept `cred`.
     #[serde(deserialize_with = "flag", default)]
     pub root: bool,
+    /// The credentials it was opened with (JSON): what it reads and writes later, it does as
+    /// its opener, as a Linux file keeps f_cred, whoever uses it then.
+    #[serde(default)]
+    pub cred: Option<String>,
     /// The process it belongs to ("ns pid"), or none: the browser session's. A process's
     /// descriptor answers its process alone.
     #[serde(default)]
@@ -666,7 +673,7 @@ impl Db {
     /// The descriptor `fd` of the session `sid`.
     pub fn fd(&self, sid: &str, fd: u32) -> Option<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec FROM fds WHERE sid = ? AND fd = ?",
+            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred FROM fds WHERE sid = ? AND fd = ?",
             vec![text(sid), int(fd)],
         )
         .pop()
@@ -674,14 +681,14 @@ impl Db {
     /// The descriptors of the session `sid`.
     pub fn fds_of(&self, sid: &str) -> Vec<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec FROM fds WHERE sid = ? ORDER BY fd",
+            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred FROM fds WHERE sid = ? ORDER BY fd",
             vec![text(sid)],
         )
     }
     /// The descriptor writing `file`, if one is.
     pub fn writer(&self, file: &str) -> Option<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec FROM fds WHERE file = ? AND flags & 3 != 0",
+            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred FROM fds WHERE file = ? AND flags & 3 != 0",
             vec![text(file)],
         )
         .pop()
@@ -850,11 +857,16 @@ impl Db {
         );
         fd
     }
-    /// Say the descriptor `fd` of `sid` was opened as root.
-    pub fn set_fd_root(&mut self, sid: &str, fd: u32) {
+    /// Keep the credentials `cred` the descriptor `fd` of `sid` was opened with.
+    pub fn set_fd_cred(&mut self, sid: &str, fd: u32, cred: &Identity) {
         self.run(
-            "UPDATE fds SET root = 1 WHERE sid = ? AND fd = ?",
-            vec![text(sid), int(fd)],
+            "UPDATE fds SET cred = ?, root = ? WHERE sid = ? AND fd = ?",
+            vec![
+                text(&serde_json::to_string(cred).unwrap_or_default()),
+                int(u32::from(cred.id == 0)),
+                text(sid),
+                int(fd),
+            ],
         );
     }
     /// Make the descriptor `fd` of `sid` the process `proc`'s ("ns pid"): it answers that
@@ -1215,21 +1227,6 @@ impl Db {
         )
         .pop()
         .map(|h| h.sha256)
-    }
-    /// The committed chunks of `file`, as (index, SHA-256).
-    pub fn chunk_hashes(&self, file: &str) -> Vec<(u64, Option<String>)> {
-        #[derive(Deserialize)]
-        struct Hash {
-            idx: u64,
-            sha256: Option<String>,
-        }
-        self.rows::<Hash>(
-            "SELECT idx, sha256 FROM chunks WHERE file = ? ORDER BY idx",
-            vec![text(file)],
-        )
-        .into_iter()
-        .map(|h| (h.idx, h.sha256))
-        .collect()
     }
 
     /// The paths of the nodes showing `file`.
