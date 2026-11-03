@@ -6,6 +6,7 @@
 //! /proc/self/fd/N is a magic link: a path through it names what the descriptor has open, as
 //! openat(2) names it from a directory's descriptor.
 use crate::db::{Db, Fd};
+use crate::procs::Row;
 use abi::{Dirent, Errno, Error, Stat};
 use serde_json::{Value, json};
 use terminal_worker_core::permissions::{Identity, Store};
@@ -15,6 +16,12 @@ type Result<T> = std::result::Result<T, Error>;
 /// Whether `path` is in /proc.
 pub fn is(path: &str) -> bool {
     path == "/proc" || path.starts_with("/proc/")
+}
+
+/// Whether `path` tells of processes: /proc and /proc/PID, not /proc/self's descriptors.
+pub fn of_processes(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    path == "/proc" || (is(path) && !path.starts_with("/proc/self"))
 }
 
 /// What a descriptor has open, where it is now: a file being written is where it shows.
@@ -60,7 +67,7 @@ enum Entry {
 /// whose work is done apart.
 enum Proc {
     Job(crate::db::Job),
-    Process(crate::procs::Row),
+    Process(Row),
 }
 impl Proc {
     fn id(&self) -> String {
@@ -77,17 +84,16 @@ impl Proc {
     }
 }
 
-/// The account's jobs and the processes of the namespace `ns`, by PID, as /proc lists them: a
-/// PID names a process of one namespace (each browser's), as a Linux PID namespace sees its
-/// own; root sees every process of it, an account its own.
-fn processes(db: &Db, who: &Identity, ns: &str) -> Vec<Proc> {
+/// The account's jobs and the browser's processes `procs` (its machine's), by PID, as /proc
+/// lists them: a PID names a process of one namespace (each browser's), as a Linux PID
+/// namespace sees its own; root sees every process of it, an account its own, and init.
+fn processes(db: &Db, who: &Identity, procs: &[Row]) -> Vec<Proc> {
     let jobs = db.jobs_of(who.id, 20).into_iter().map(Proc::Job);
-    let rows: Vec<_> = db
-        .processes(ns)
-        .into_iter()
-        .filter(|row| who.id == 0 || row.uid == who.id)
-        .collect();
-    let rows = rows.into_iter().map(Proc::Process);
+    let rows = procs
+        .iter()
+        .filter(|row| who.id == 0 || row.uid == who.id || row.pid == crate::procs::INIT)
+        .cloned()
+        .map(Proc::Process);
     jobs.chain(rows).collect()
 }
 
@@ -170,7 +176,7 @@ fn fdinfo(db: &Db, found: &Fd) -> String {
     )
 }
 
-fn lookup(db: &Db, sid: Option<&str>, ns: &str, who: &Identity, path: &str) -> Result<Entry> {
+fn lookup(db: &Db, sid: Option<&str>, procs: &[Row], who: &Identity, path: &str) -> Result<Entry> {
     let parts: Vec<&str> = path
         .trim_start_matches("/proc")
         .split('/')
@@ -182,7 +188,7 @@ fn lookup(db: &Db, sid: Option<&str>, ns: &str, who: &Identity, path: &str) -> R
             .ok_or_else(|| Error::from(Errno::ENOENT))
     };
     let job = |pid: &str| {
-        processes(db, who, ns)
+        processes(db, who, procs)
             .into_iter()
             .find(|process| process.id() == pid)
             .ok_or_else(|| Error::from(Errno::ENOENT))
@@ -240,17 +246,17 @@ fn stat_of(db: &Db, path: &str, entry: &Entry) -> Stat {
 fn entries(
     db: &Db,
     sid: Option<&str>,
-    ns: &str,
+    procs: &[Row],
     who: &Identity,
     path: &str,
 ) -> Result<Vec<Dirent>> {
-    let Entry::Dir(_) = lookup(db, sid, ns, who, path)? else {
+    let Entry::Dir(_) = lookup(db, sid, procs, who, path)? else {
         return Err(Errno::ENOTDIR.into());
     };
     let names: Vec<String> = match path.trim_end_matches('/') {
         "/proc" => std::iter::once("self".to_string())
             .chain(
-                processes(db, who, ns)
+                processes(db, who, procs)
                     .into_iter()
                     .map(|process| process.id()),
             )
@@ -268,7 +274,7 @@ fn entries(
         .into_iter()
         .filter_map(|name| {
             let at = format!("{}/{name}", path.trim_end_matches('/'));
-            let entry = lookup(db, sid, ns, who, &at).ok()?;
+            let entry = lookup(db, sid, procs, who, &at).ok()?;
             Some(Dirent {
                 stat: Some(stat_of(db, &at, &entry)),
                 name,
@@ -278,8 +284,14 @@ fn entries(
 }
 
 /// The content of the /proc file `path`, as it is now.
-pub fn read(db: &Db, sid: Option<&str>, ns: &str, who: &Identity, path: &str) -> Result<String> {
-    match lookup(db, sid, ns, who, path)? {
+pub fn read(
+    db: &Db,
+    sid: Option<&str>,
+    procs: &[Row],
+    who: &Identity,
+    path: &str,
+) -> Result<String> {
+    match lookup(db, sid, procs, who, path)? {
         Entry::File(text, _) => Ok(text),
         Entry::Dir(_) => Err(Errno::EISDIR.into()),
         Entry::Link(..) => Err(Errno::EINVAL.into()),
@@ -291,14 +303,14 @@ pub fn read(db: &Db, sid: Option<&str>, ns: &str, who: &Identity, path: &str) ->
 pub fn call(
     db: &mut Db,
     sid: Option<&str>,
-    ns: &str,
+    procs: &[Row],
     who: &Identity,
     call: abi::Call,
 ) -> Result<Value> {
     use abi::Call;
     match call {
         Call::Stat { path } | Call::Lstat { path } => {
-            let entry = lookup(db, sid, ns, who, &path)?;
+            let entry = lookup(db, sid, procs, who, &path)?;
             Ok(json!(stat_of(db, &path, &entry)))
         }
         Call::Getdents {
@@ -306,41 +318,41 @@ pub fn call(
             cookie,
             count,
         } => Ok(json!(
-            entries(db, sid, ns, who, &path)?
+            entries(db, sid, procs, who, &path)?
                 .into_iter()
                 .skip(cookie as usize)
                 .take(count.unwrap_or(u64::MAX) as usize)
                 .collect::<Vec<_>>()
         )),
         Call::Access { path, mode } => {
-            lookup(db, sid, ns, who, &path)?;
+            lookup(db, sid, procs, who, &path)?;
             if mode & abi::W_OK != 0 {
                 Err(Errno::EACCES.into())
             } else {
                 Ok(Value::Null)
             }
         }
-        Call::Readlink { path } => match lookup(db, sid, ns, who, &path)? {
+        Call::Readlink { path } => match lookup(db, sid, procs, who, &path)? {
             Entry::Link(target, _) => Ok(json!(target)),
             _ => Err(Errno::EINVAL.into()),
         },
         Call::Getxattr { path, .. } => {
-            lookup(db, sid, ns, who, &path)?;
+            lookup(db, sid, procs, who, &path)?;
             Err(Errno::ENODATA.into())
         }
         Call::Listxattr { path, .. } => {
-            lookup(db, sid, ns, who, &path)?;
+            lookup(db, sid, procs, who, &path)?;
             Ok(json!([]))
         }
         Call::Statfs { path } => {
-            lookup(db, sid, ns, who, &path)?;
+            lookup(db, sid, procs, who, &path)?;
             Ok(json!(abi::StatFs {
                 namelen: abi::NAME_MAX as u64,
                 ..abi::StatFs::default()
             }))
         }
         Call::Open { path, flags, .. } => {
-            let entry = lookup(db, sid, ns, who, &path)?;
+            let entry = lookup(db, sid, procs, who, &path)?;
             if flags & abi::O_ACCMODE != abi::O_RDONLY {
                 return Err(Errno::EACCES.into());
             }

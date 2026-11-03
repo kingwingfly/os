@@ -1,8 +1,9 @@
 import { test, expect } from '@playwright/test';
 
 // The client kernel (crates/client-kernel, web/kernel/client.js): one SharedWorker per browser,
-// a process table shared by its tabs, and execve/fork/exit/wait/cgroups asked of the worker
-// kernel through /api/sys. A page's port is the versioned envelope web/kernel/protocol.js speaks.
+// the processes its tabs host, and their record in the browser's machine (a Durable Object of
+// its own), which asks the worker kernel only of execve. A page's port is the versioned
+// envelope web/kernel/protocol.js speaks.
 
 // A page's port to the browser's one client kernel, kept on the page so calls can follow.
 async function connect(page) {

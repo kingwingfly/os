@@ -372,17 +372,35 @@ A name runs the terminal's program, or uutils' where it has none; `/usr/bin/NAME
 
 ### The client kernel
 
-The kernel split puts a client kernel in the browser: a SharedWorker holds the browser's PID
-table mirror and process tokens, while a page-owned worker hosts processes, SAB pipes and
-terminal input. The kernel is Rust (`crates/client-kernel`), built to wasm and imported by
+The kernel split puts a client kernel in the browser: a SharedWorker holds the processes its
+tabs host and their tokens, while a page-owned worker hosts processes, SAB pipes and terminal
+input. The kernel is Rust (`crates/client-kernel`), built to wasm and imported by
 `web/kernel/client.js`; the page talks to it through the versioned envelope in
 `web/kernel/protocol.js`. Two tabs of one browser are one namespace and see each other's
-processes. Every decision is still the worker kernel's: `execve` checks the path, the execute
-bit and the credentials, snapshots them into a process record, and answers a token; `fork`,
-`exit`, `wait`, `kill`, `poll` and the `Cgroup*` calls are registry operations in
-`crates/worker/src/procs.rs`, projected by `/proc`. Coreutils runs through this path: the page
-asks the client kernel for the process, then runs it as a Worker whose batches carry the
-process's pid and token.
+processes.
+
+**Each browser is a machine of its own.** The process table is not the filesystem's: each
+browser's namespace has a Durable Object of its own (`Machine`, `crates/worker/src/machine.rs`,
+with the registry in `procs.rs`), so processes never wait on the one authority that keeps the
+files. Only `execve` asks the authority (`creds.rs`): it checks the path, the execute bit and
+the caller, records the credentials the process acts with by its token's hash, and answers how
+to read the image. A pipeline's stages are one `execve` request. The rest of a process's life
+happens in the client kernel, as in a Linux kernel:
+- **fork** takes a pid the machine lent ahead of time (`Pids`), at once; the child keeps its
+  parent's credentials and token, and so its descriptors.
+- **exit** makes a zombie until the parent waits; its children become init's, and a zombie
+  orphan is reaped by init at once.
+- **wait** answers from the kernel's own table, once the machine knows, so that `/proc` no
+  longer names what was reaped.
+- **Batches:** the machine hears of forks, exits and waits together, with the kernel's next
+  request or a moment after, marked `X-Registry` so the Worker sends them straight to it.
+- **Revocation:** a batch that ended processes revokes their tokens at the authority once,
+  which closes what they opened, as Linux does at exit.
+
+`kill`, `poll` and the `Cgroup*` calls are the machine's too; a page's batch that carries one is
+forwarded there by the authority, with the caller it found. `/proc` lists the machine's
+processes. Coreutils runs through this path: the page asks the client kernel for the processes,
+then runs each as a Worker whose batches carry the process's pid and token.
 
 A signed-out browser is now `guest-<uuid>:guest`, with a uid of its own from the anonymous range
 (1,000,000–1,999,999) and no home; `HOME` stays the shared `/guest` (1777 sticky), and
@@ -415,13 +433,13 @@ with binaryen in both. Details are in `AGENT.md` and issue #20.
 - **Tab locks:** each tab holds the Web Lock `tw-tab-<tab>` while it lives, taken before it asks anything. Each process records its tab as its seat (`execve`'s `seat`).
 - **Reaping:** a process whose seat's lock is free was left by a tab that closed, crashed or reloaded while it ran. The kernel reaps it at once where it waits on that tab's lock, and at boot, or when the namespace is full (EAGAIN), by asking which locks are held.
 - **No reaping by boot:** a kernel reaps by boot id only where tabs have no Web Locks, so a tab's own kernel never reaps another tab's processes.
-- **`/proc`:** it shows the caller's namespace, as a Linux PID namespace does: every process of it for root, an account's own otherwise.
+- **`/proc`:** it shows the caller's namespace, as a Linux PID namespace does: every process of it for root, an account's own otherwise, and init, root's, for everyone.
 
 ## Roadmap
 
 The next steps agreed in issue #20, and the ideas recorded for later.
 
-- **Process lifecycle off the authority:** only `execve` needs the worker kernel (the X check, the credential snapshot, the image token). `fork`, `wait`, `exit` and signals become the client kernel's, reported to a process registry in a Durable Object per browser, in batches. A pipeline's `execve` calls go as one batch.
+- **Fork of any wasm in the terminal:** the client kernel forks at once (above), and the WASIX runtime forks `dash` in Node and a module Worker (Phase 0). Running WASIX programs in the terminal's own process Workers joins the two, with descriptors counted across a fork so that a child's close does not close its parent's.
 - **JSPI and asyncify:** JavaScript Promise Integration (Chrome 137+, Firefox planned for 153) lets a blocking call await a promise without transforming the module, where shared memory and `Atomics.wait` need cross-origin isolation. Asyncify stays only for `fork`, which must copy a stack into a new instance, as a JSPI suspension cannot be copied. It applies to modules that import `proc_fork`, limited by `asyncify-imports`, and is transformed once per content and cached.
 - **GUI programs:** the WASI graphics proposal (`wasi:webgpu`, `wasi:surface`, `wasi:frame-buffer`), implemented in each process's Worker on WebGPU and a canvas handed over from the compositor's window. `/dev/display` is the permission gate. Web content runs in sandboxed frames, since a browser cannot run as a wasm process.
 - **Mounts and clusters:** a directory of the user's device mounted live, shared across devices and sessions peer to peer, or through a Cloudflare relay. Map/reduce across opted-in clients and Containers (the h264 to av1 example). Bytes go through a relay Durable Object per mount or cluster, never through the authority.
@@ -442,7 +460,7 @@ The next steps agreed in issue #20, and the ideas recorded for later.
 | `crates/core` / `terminal-worker-core` | Every command's definition, parser, help and manual page (`cli/`, with clap); paths, pipelines, text filters, fd matching, completion, ACLs, HTTP Range |
 | `crates/frontend` / `terminal-worker-ui` | Leptos CSR terminal: tabs (`lib.rs`), the shell and its pipelines (`shell.rs`), the commands that run in the page (`shell/commands.rs`), upload hashing (`uploads.rs`), file previews (`preview.rs`, `viewer.rs`), man's pages for app.js (`manual.rs`) |
 | `crates/preview` / `terminal-worker-preview` | Preview web workers: PDF pages (hayro), Mermaid diagrams (merman), highlighted code (arborium, four language groups) |
-| `crates/worker` / `terminal-worker` | The kernel's host: the Worker streams file bytes (`files.rs`); the `TerminalAuthority` Durable Object serves the system calls (`sys.rs`), descriptors (`fds.rs`), /proc (`procfs.rs`), /usr (`usr.rs`), devices (`dev/`), processes (`jobs.rs`) and accounts (`commands/accounts.rs`, api.rs), in SQLite tables (`db.rs`) |
+| `crates/worker` / `terminal-worker` | The kernel's host: the Worker streams file bytes (`files.rs`); the `TerminalAuthority` Durable Object serves the system calls (`sys.rs`), descriptors (`fds.rs`), /proc (`procfs.rs`), /usr (`usr.rs`), devices (`dev/`), archive jobs (`jobs.rs`), exec credentials (`creds.rs`) and accounts (`commands/accounts.rs`, api.rs), in SQLite tables (`db.rs`); each browser's `Machine` Durable Object keeps its processes and cgroups (`machine.rs`, `procs.rs`) |
 | `web/app.js` | Browser bridge, authentication dialogs, the preview dialog's shell and games, focus handling |
 | `web/upload.mjs` | Chunked, resumable uploads |
 | `web/record.mjs`, `web/sound.mjs` | Recording the microphone into a growing file; live sound through Realtime |

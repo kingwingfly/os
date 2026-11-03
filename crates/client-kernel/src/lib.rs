@@ -1,21 +1,29 @@
 //! The client kernel (owner's plan, 2026-11-01): the browser's half of the kernel, in Rust→wasm
-//! inside a SharedWorker. It owns the browser's process table mirror and the tokens processes
-//! make their calls with; every decision remains the worker kernel's, through `/api/sys`.
+//! inside a SharedWorker (or one tab's dedicated Worker). It keeps the processes its tabs host,
+//! and the tokens they make their calls with; every decision on files remains the worker
+//! kernel's, and the process record is the browser's machine's (a Durable Object of its own,
+//! reached by a batch marked `X-Registry`).
 //!
-//! It holds no policy: `exec` asks for an image, the worker kernel checks the path, the execute
-//! bit and the credentials, and answers the token; `fork`, `wait`, `exit`, `kill` and `poll` are
-//! the same calls as a page makes. The page and the process hosts are untrusted user space; the
-//! tokens this kernel keeps are capabilities handed to the hosts that run the processes.
-use abi::{Batch, Call, Errno, Error, Exec, Forked, PROC_POLL_MAX, Proc, Return, SIGTERM};
+//! Only execve asks the worker kernel anything, and a pipeline's stages ask at once. A fork, an
+//! exit and a wait happen here, as they happen in a Linux kernel: a fork takes a pid the
+//! machine lent ahead of time, and each is told to the machine after, in a batch with the
+//! others (`flush`), or with the next request that goes there anyway. A wait answers here; its
+//! host replies once the machine heard (`queued`, `reported`), so that /proc no longer names
+//! what was reaped.
+//!
+//! It holds no policy. The page and the process hosts are untrusted user space; the tokens this
+//! kernel keeps are capabilities handed to the hosts that run the processes.
+use abi::{Batch, Call, Errno, Error, Exec, PROC_POLL_MAX, Return, SIGTERM};
+use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
-/// The transport the SharedWorker's script installs (`self.kernelSys(body)`): POST /api/sys,
-/// answering `{status, text}` as JSON. Fetch and cookies are the browser's; the Rust kernel
-/// holds the calls and the tokens.
+/// The transport the worker's script installs (`self.kernelSys(body)`): POST /api/sys, marked
+/// for the browser's machine, answering `{status, text}` as JSON. Fetch and cookies are the
+/// browser's; the Rust kernel holds the calls and the tokens.
 async fn kernel_sys(body: &str) -> Result<JsValue, JsValue> {
     let global = js_sys::global();
     let function = js_sys::Reflect::get(&global, &JsValue::from_str("kernelSys"))?
@@ -30,12 +38,30 @@ async fn kernel_sys(body: &str) -> Result<JsValue, JsValue> {
 
 /// The kernel's own protocol version, which the page checks at start.
 pub const VERSION: &str = "1";
+/// How many pids the kernel asks to be lent at a time, for its forks.
+const LEND: u32 = 8;
+/// Linux's init.
+const INIT: u32 = 1;
+
+/// A process this kernel hosts: its parent, the token its calls carry (a fork's is its
+/// parent's), and, once it ended, its wait status until its parent waits.
+struct Local {
+    ppid: u32,
+    token: String,
+    ended: Option<(i32, Option<u8>)>,
+}
 
 struct State {
     namespace: String,
     boot: String,
-    /// The token each running (or forked, not yet exited) process makes its calls with.
-    tokens: HashMap<u32, String>,
+    processes: HashMap<u32, Local>,
+    /// Pids the machine lent, which forks take.
+    spare: Vec<u32>,
+    /// What happened here that the machine is still to hear: forks, exits, waits, in order.
+    reports: Vec<Call>,
+    /// How many reports were made, and how many the machine heard, since the kernel started.
+    queued: u64,
+    reported: u64,
 }
 
 #[wasm_bindgen]
@@ -55,7 +81,11 @@ impl Kernel {
             state: RefCell::new(State {
                 namespace: String::new(),
                 boot: boot.to_string(),
-                tokens: HashMap::new(),
+                processes: HashMap::new(),
+                spare: Vec::new(),
+                reports: Vec::new(),
+                queued: 0,
+                reported: 0,
             }),
         }
     }
@@ -74,16 +104,16 @@ impl Kernel {
     pub async fn init(&self) -> Result<String, JsValue> {
         let boot = self.state.borrow().boot.clone();
         let boot = (!boot.is_empty()).then_some(boot);
-        let value = one(vec![Call::ProcInit { boot }], None, None).await?;
+        let value = self.one(Call::ProcInit { boot }, false).await?;
         let namespace = value["namespace"].as_str().unwrap_or_default().to_string();
         self.state.borrow_mut().namespace = namespace;
         Ok(value.to_string())
     }
 
-    /// execve: ask the worker kernel for the image at `path`, run as this browser's account.
-    /// `argv`, `env` and `pids` are JSON arrays; `cgroup` is empty for the default; `sudo`
-    /// snapshots root for the new process, once the page has authenticated it; `seat` is the
-    /// tab that runs it, empty if none said.
+    /// execve: ask for the image at `path`, run as this browser's account. `argv`, `env` and
+    /// `pids` are JSON arrays; `cgroup` is empty for the default; `sudo` snapshots root for the
+    /// new process, once the page has authenticated it; `seat` is the tab that runs it, empty
+    /// if none said.
     #[allow(clippy::too_many_arguments)]
     pub async fn exec(
         &self,
@@ -95,76 +125,142 @@ impl Kernel {
         sudo: bool,
         seat: &str,
     ) -> Result<String, JsValue> {
-        let argv: Vec<String> = parse(argv, "argv")?;
-        let env: Vec<String> = parse(env, "env")?;
-        let value = one_as(
-            vec![Call::Execve {
-                pid: None,
-                path: path.into(),
-                argv,
-                env,
-                cwd: cwd.into(),
-                cgroup: (!cgroup.is_empty()).then(|| cgroup.to_string()),
-                seat: (!seat.is_empty()).then(|| seat.to_string()),
-            }],
-            None,
-            None,
-            sudo,
-        )
-        .await?;
-        let exec: Exec = from_value(value, "execve")?;
-        self.state
-            .borrow_mut()
-            .tokens
-            .insert(exec.pid, exec.token.clone());
-        to_json(&exec)
+        let stage = json!({ "path": path, "argv": parse::<Value>(argv, "argv")?, "env": parse::<Value>(env, "env")?, "cwd": cwd, "cgroup": cgroup });
+        let mut results = self.execs_of(vec![stage], sudo, seat).await?;
+        match results.pop() {
+            Some(Ok(exec)) => to_json(&exec),
+            Some(Err(error)) => Err(fail(error)),
+            None => Err(fail(Error::because(Errno::EIO, "no process was made"))),
+        }
     }
 
-    /// fork: a child of `pid`, with its registry state copied; the page clones the wasm state.
+    /// execve of each stage of a pipeline at once (a JSON array of `{path, argv, env, cwd,
+    /// cgroup}`): one request, each stage's process or its errno, in order.
+    pub async fn execs(&self, stages: &str, sudo: bool, seat: &str) -> Result<String, JsValue> {
+        let stages: Vec<Value> = parse(stages, "stages")?;
+        let results = self.execs_of(stages, sudo, seat).await?;
+        let results: Vec<Value> = results
+            .into_iter()
+            .map(|result| match result {
+                Ok(exec) => json!({ "ok": exec }),
+                Err(error) => json!({ "err": { "errno": error.errno, "detail": error.detail } }),
+            })
+            .collect();
+        Ok(Value::Array(results).to_string())
+    }
+
+    /// fork: a child of `pid`, at once, with a pid lent ahead (one request when none is left);
+    /// the machine hears of it after. The page clones the wasm state.
     pub async fn fork(&self, pid: u32) -> Result<String, JsValue> {
         let token = self.token(pid)?;
-        let value = one(vec![Call::Fork { pid }], Some(pid), Some(&token)).await?;
-        let forked: Forked = from_value(value, "fork")?;
-        self.state
-            .borrow_mut()
-            .tokens
-            .insert(forked.pid, forked.token.clone());
-        to_json(&forked)
+        if self.state.borrow().spare.is_empty() {
+            let lent = self.one(Call::Pids { count: LEND }, false).await?;
+            let lent: Vec<u32> = from_value(lent, "pids")?;
+            self.state.borrow_mut().spare.extend(lent);
+        }
+        let mut state = self.state.borrow_mut();
+        // A fork taken while the lending was asked may have left none.
+        let child = state
+            .spare
+            .pop()
+            .ok_or_else(|| fail(Errno::EAGAIN.into()))?;
+        state.processes.insert(
+            child,
+            Local {
+                ppid: pid,
+                token: token.clone(),
+                ended: None,
+            },
+        );
+        state.report(Call::Fork {
+            pid,
+            child: Some(child),
+            token: Some(token.clone()),
+        });
+        to_json(&json!({ "pid": child, "token": token }))
     }
 
-    /// exit: the process `pid` ends with `status`, or by `signal`.
+    /// exit: the process `pid` ends with `status`, or by `signal`: a zombie until its parent
+    /// waits; its children are init's, and those that ended, init reaps.
     pub async fn exit(&self, pid: u32, status: i32, signal: Option<u8>) -> Result<String, JsValue> {
-        let token = self.token(pid)?;
-        one(vec![Call::Exit { status, signal }], Some(pid), Some(&token)).await?;
-        self.state.borrow_mut().tokens.remove(&pid);
+        let mut state = self.state.borrow_mut();
+        let local = state
+            .processes
+            .get_mut(&pid)
+            .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?;
+        if local.ended.is_some() {
+            return Err(fail(Errno::ESRCH.into()));
+        }
+        local.ended = Some((status, signal));
+        let token = local.token.clone();
+        let orphans: Vec<u32> = state
+            .processes
+            .iter()
+            .filter(|(_, child)| child.ppid == pid)
+            .map(|(child, _)| *child)
+            .collect();
+        for orphan in orphans {
+            if state.processes[&orphan].ended.is_some() {
+                state.processes.remove(&orphan);
+            } else if let Some(child) = state.processes.get_mut(&orphan) {
+                child.ppid = INIT;
+            }
+        }
+        state.report(Call::Exit {
+            status,
+            signal,
+            pid: Some(pid),
+            token: Some(token),
+        });
         Ok("null".into())
     }
 
-    /// waitpid: the zombie `pid`, now reaped; EAGAIN while it runs.
+    /// waitpid: the zombie `pid`, now reaped, told to the machine with the next batch; EAGAIN
+    /// while it runs. One this kernel does not host is the machine's to answer.
     pub async fn wait(&self, pid: u32) -> Result<String, JsValue> {
-        let value = one(
-            vec![Call::Wait {
-                pid: pid.to_string(),
-                since: 0,
-            }],
-            None,
-            None,
-        )
-        .await?;
-        let reaped: Proc = from_value(value, "wait")?;
-        self.state.borrow_mut().tokens.remove(&pid);
-        to_json(&reaped)
+        let ended = self
+            .state
+            .borrow()
+            .processes
+            .get(&pid)
+            .map(|local| (local.ppid, local.ended));
+        let value = match ended {
+            Some((_, None)) => return Err(fail(Errno::EAGAIN.into())),
+            Some((ppid, Some((status, signal)))) => {
+                let mut state = self.state.borrow_mut();
+                state.processes.remove(&pid);
+                state.report(Call::Wait {
+                    pid: pid.to_string(),
+                    since: 0,
+                });
+                let wait = match signal {
+                    Some(signal) => abi::signal_status(signal),
+                    None => abi::exit_status(status),
+                };
+                json!({ "pid": pid, "ppid": ppid, "state": "zombie", "status": wait, "signal": signal })
+            }
+            None => {
+                self.one(
+                    Call::Wait {
+                        pid: pid.to_string(),
+                        since: 0,
+                    },
+                    false,
+                )
+                .await?
+            }
+        };
+        Ok(value.to_string())
     }
 
-    /// kill: send `signal` (SIGTERM by default) to `pid`.
+    /// kill: send `signal` (SIGTERM by default) to `pid`, as the page's account.
     pub async fn kill(&self, pid: u32, signal: Option<u8>) -> Result<String, JsValue> {
-        one(
-            vec![Call::Kill {
+        self.one(
+            Call::Kill {
                 pid: pid.to_string(),
                 signal: Some(signal.unwrap_or(SIGTERM)),
-            }],
-            None,
-            None,
+            },
+            false,
         )
         .await?;
         Ok("null".into())
@@ -179,116 +275,221 @@ impl Kernel {
                 format!("at most {PROC_POLL_MAX} processes at a time"),
             )));
         }
-        let value = one(vec![Call::ProcPoll { pids }], None, None).await?;
+        let value = self.one(Call::ProcPoll { pids }, false).await?;
         Ok(value.to_string())
     }
 
-    /// getpid: what the process `pid` is, by its token.
+    /// getpid: what the process `pid`, hosted here, is.
     pub async fn getpid(&self, pid: u32) -> Result<String, JsValue> {
-        let token = self.token(pid)?;
-        let value = one(vec![Call::Getpid], Some(pid), Some(&token)).await?;
+        let state = self.state.borrow();
+        let local = state
+            .processes
+            .get(&pid)
+            .filter(|local| local.ended.is_none())
+            .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?;
+        Ok(json!({ "pid": pid, "ppid": local.ppid }).to_string())
+    }
+
+    /// The tabs whose processes still run, by the machine's record.
+    pub async fn seats(&self) -> Result<String, JsValue> {
+        Ok(self.one(Call::Seats, false).await?.to_string())
+    }
+
+    /// The tab `seat` is gone: what it ran ended with it.
+    pub async fn gone(&self, seat: &str) -> Result<String, JsValue> {
+        let value = self.one(Call::Gone { seat: seat.into() }, false).await?;
+        // What it ran that this kernel kept goes too.
+        let reaped: Vec<u32> = serde_json::from_value(value.clone()).unwrap_or_default();
+        let mut state = self.state.borrow_mut();
+        for pid in reaped {
+            state.processes.remove(&pid);
+        }
         Ok(value.to_string())
+    }
+
+    /// Whether the machine is still to hear of something.
+    pub fn pending(&self) -> bool {
+        !self.state.borrow().reports.is_empty()
+    }
+
+    /// How many reports were made since the kernel started: the machine heard the one made
+    /// last once `reported` is as many.
+    pub fn queued(&self) -> f64 {
+        self.state.borrow().queued as f64
+    }
+
+    /// How many reports the machine heard since the kernel started.
+    pub fn reported(&self) -> f64 {
+        self.state.borrow().reported as f64
+    }
+
+    /// Tell the machine what happened here since it last heard: one request, if anything did.
+    pub async fn flush(&self) -> Result<(), JsValue> {
+        if self.pending() {
+            self.send(Vec::new(), false).await.map_err(fail)?;
+        }
+        Ok(())
     }
 
     /// cgroup_create, cgroup_set, cgroup_attach, cgroup_remove and cgroup_stat, as the page
     /// asks them for this namespace.
     pub async fn cgroup_create(&self, path: &str) -> Result<String, JsValue> {
-        one(
-            vec![Call::CgroupCreate {
+        self.one(
+            Call::CgroupCreate {
                 path: path.into(),
                 controllers: None,
-            }],
-            None,
-            None,
+            },
+            false,
         )
         .await?;
         Ok("null".into())
     }
     pub async fn cgroup_set(&self, path: &str, key: &str, value: &str) -> Result<String, JsValue> {
-        one(
-            vec![Call::CgroupSet {
+        self.one(
+            Call::CgroupSet {
                 path: path.into(),
                 key: key.into(),
                 value: value.into(),
-            }],
-            None,
-            None,
+            },
+            false,
         )
         .await?;
         Ok("null".into())
     }
     pub async fn cgroup_attach(&self, pid: u32, path: &str) -> Result<String, JsValue> {
-        one(
-            vec![Call::CgroupAttach {
+        self.one(
+            Call::CgroupAttach {
                 pid,
                 path: path.into(),
-            }],
-            None,
-            None,
+            },
+            false,
         )
         .await?;
         Ok("null".into())
     }
     pub async fn cgroup_remove(&self, path: &str) -> Result<String, JsValue> {
-        one(vec![Call::CgroupRemove { path: path.into() }], None, None).await?;
+        self.one(Call::CgroupRemove { path: path.into() }, false)
+            .await?;
         Ok("null".into())
     }
     pub async fn cgroup_stat(&self, path: &str) -> Result<String, JsValue> {
-        let value = one(vec![Call::CgroupStat { path: path.into() }], None, None).await?;
+        let value = self
+            .one(Call::CgroupStat { path: path.into() }, false)
+            .await?;
         Ok(value.to_string())
     }
     pub async fn cgroup_list(&self, path: &str) -> Result<String, JsValue> {
-        let value = one(vec![Call::CgroupList { path: path.into() }], None, None).await?;
+        let value = self
+            .one(Call::CgroupList { path: path.into() }, false)
+            .await?;
         Ok(value.to_string())
     }
+}
 
+impl Kernel {
     fn token(&self, pid: u32) -> std::result::Result<String, JsValue> {
         self.state
             .borrow()
-            .tokens
+            .processes
             .get(&pid)
-            .cloned()
+            .filter(|local| local.ended.is_none())
+            .map(|local| local.token.clone())
             .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))
     }
-}
 
-async fn one(
-    calls: Vec<Call>,
-    pid: Option<u32>,
-    token: Option<&str>,
-) -> Result<serde_json::Value, JsValue> {
-    one_as(calls, pid, token, false).await
-}
+    /// execve of `stages`, in one request: each stage's process, kept here, or its error.
+    async fn execs_of(
+        &self,
+        stages: Vec<Value>,
+        sudo: bool,
+        seat: &str,
+    ) -> std::result::Result<Vec<std::result::Result<Exec, Error>>, JsValue> {
+        let calls = stages
+            .iter()
+            .map(|stage| {
+                let cgroup = stage["cgroup"].as_str().unwrap_or_default();
+                Ok(Call::Execve {
+                    pid: None,
+                    path: stage["path"].as_str().unwrap_or_default().into(),
+                    argv: from_value(stage["argv"].clone(), "argv")?,
+                    env: from_value(stage["env"].clone(), "env")?,
+                    cwd: stage["cwd"].as_str().unwrap_or("/").into(),
+                    cgroup: (!cgroup.is_empty()).then(|| cgroup.to_string()),
+                    seat: (!seat.is_empty()).then(|| seat.to_string()),
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, JsValue>>()?;
+        let results = self.send(calls, sudo).await.map_err(fail)?;
+        let mut state = self.state.borrow_mut();
+        Ok(results
+            .into_iter()
+            .map(|result| {
+                let exec: Exec = serde_json::from_value(result.into_result()?)
+                    .map_err(|error| Error::because(Errno::EIO, error.to_string()))?;
+                state.processes.insert(
+                    exec.pid,
+                    Local {
+                        ppid: INIT,
+                        token: exec.token.clone(),
+                        ended: None,
+                    },
+                );
+                Ok(exec)
+            })
+            .collect())
+    }
 
-async fn one_as(
-    calls: Vec<Call>,
-    pid: Option<u32>,
-    token: Option<&str>,
-    sudo: bool,
-) -> Result<serde_json::Value, JsValue> {
-    let results = sys(calls, pid, token, sudo).await.map_err(fail)?;
-    match results.into_iter().next() {
-        Some(Return::Ok(value)) => Ok(value),
-        Some(Return::Err(error)) => Err(fail(error)),
-        None => Err(fail(Error::because(
-            Errno::EIO,
-            "the kernel answered no call",
-        ))),
+    /// One call to the machine, its value.
+    async fn one(&self, call: Call, sudo: bool) -> Result<Value, JsValue> {
+        let results = self.send(vec![call], sudo).await.map_err(fail)?;
+        match results.into_iter().next() {
+            Some(Return::Ok(value)) => Ok(value),
+            Some(Return::Err(error)) => Err(fail(error)),
+            None => Err(fail(Error::because(
+                Errno::EIO,
+                "the kernel answered no call",
+            ))),
+        }
+    }
+
+    /// `calls`, after what the machine is still to hear, in one batch: the calls' results. What
+    /// it was to hear goes again with the next batch if this one does not arrive.
+    async fn send(&self, calls: Vec<Call>, sudo: bool) -> std::result::Result<Vec<Return>, Error> {
+        let reports = std::mem::take(&mut self.state.borrow_mut().reports);
+        let told = reports.len();
+        let mut batch = reports.clone();
+        batch.extend(calls);
+        match sys(batch, sudo).await {
+            Ok(mut results) => {
+                self.state.borrow_mut().reported += told as u64;
+                Ok(results.split_off(told.min(results.len())))
+            }
+            Err(error) => {
+                let mut state = self.state.borrow_mut();
+                let later = std::mem::take(&mut state.reports);
+                state.reports = reports;
+                state.reports.extend(later);
+                Err(error)
+            }
+        }
     }
 }
 
-async fn sys(
-    calls: Vec<Call>,
-    pid: Option<u32>,
-    token: Option<&str>,
-    sudo: bool,
-) -> std::result::Result<Vec<Return>, Error> {
+impl State {
+    /// Something the machine is to hear.
+    fn report(&mut self, call: Call) {
+        self.reports.push(call);
+        self.queued += 1;
+    }
+}
+
+async fn sys(calls: Vec<Call>, sudo: bool) -> std::result::Result<Vec<Return>, Error> {
     let batch = Batch {
         calls,
         umask: 0o022,
         sudo,
-        pid,
-        process: token.map(str::to_string),
+        pid: None,
+        process: None,
     };
     let body = serde_json::to_string(&batch)
         .map_err(|error| Error::because(Errno::EIO, error.to_string()))?;
@@ -298,7 +499,7 @@ async fn sys(
     let raw = raw
         .as_string()
         .ok_or_else(|| Error::because(Errno::EIO, "the kernel's reply is not text"))?;
-    let reply: serde_json::Value = serde_json::from_str(&raw)
+    let reply: Value = serde_json::from_str(&raw)
         .map_err(|error| Error::because(Errno::EIO, error.to_string()))?;
     let status = reply["status"].as_u64().unwrap_or(0);
     if status != 200 {
@@ -322,7 +523,7 @@ fn parse<T: serde::de::DeserializeOwned>(
 }
 
 fn from_value<T: serde::de::DeserializeOwned>(
-    value: serde_json::Value,
+    value: Value,
     what: &str,
 ) -> std::result::Result<T, JsValue> {
     serde_json::from_value(value)
@@ -337,7 +538,7 @@ fn to_json<T: serde::Serialize>(value: &T) -> std::result::Result<String, JsValu
 /// An error as the page reads it: its errno, and what it says.
 fn fail(error: Error) -> JsValue {
     JsValue::from_str(
-        &serde_json::json!({
+        &json!({
             "errno": error.errno,
             "detail": error.detail,
         })

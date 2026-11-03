@@ -1,12 +1,14 @@
 mod api;
 mod auth;
 mod commands;
+mod creds;
 mod db;
 mod dev;
 mod fds;
 mod files;
 mod guests;
 mod jobs;
+mod machine;
 mod procfs;
 mod procs;
 mod runner;
@@ -15,6 +17,7 @@ mod streams;
 mod sys;
 mod usr;
 use files::error_response;
+pub use machine::Machine;
 pub use runner::JobRunner;
 pub use store::TerminalAuthority;
 use worker::*;
@@ -55,6 +58,19 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         match (req.method(), path.as_str()) {
             (Method::Get | Method::Head, "/api/file") => files::read(req, &env).await,
             (Method::Put, "/api/pwrite") => files::pwrite(req, &env).await,
+            // The client kernel's batches of process calls go to its browser's own machine
+            // (machine.rs), not the filesystem's one authority.
+            (Method::Post, "/api/sys") if req.headers().get("X-Registry")?.is_some() => {
+                let ns = db::Db::namespace(
+                    auth::token_key(&req).as_deref(),
+                    auth::guest_key(&req).as_deref(),
+                );
+                env.durable_object("MACHINE")?
+                    .id_from_name(&ns)?
+                    .get_stub()?
+                    .fetch_with_request(req)
+                    .await
+            }
             _ => {
                 env.durable_object("AUTHORITY")?
                     .id_from_name("filesystem")?

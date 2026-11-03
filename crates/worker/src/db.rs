@@ -34,7 +34,7 @@ const ROLLBACK: &str = "rollback";
 /// The version of the tables below, which local state made by an older one does not have.
 pub const SCHEMA_VERSION: &str = "6";
 
-const SCHEMA: [&str; 36] = [
+const SCHEMA: [&str; 33] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
@@ -95,17 +95,11 @@ const SCHEMA: [&str; 36] = [
     // A signed-out browser's identity, by its guest cookie's key: the uuid it shows, and the
     // uid it owns files as, from the anonymous range. No home is made for it.
     "CREATE TABLE IF NOT EXISTS guests(key TEXT PRIMARY KEY, uuid TEXT NOT NULL UNIQUE, uid INTEGER NOT NULL UNIQUE, gid INTEGER NOT NULL, created INTEGER NOT NULL, last_seen INTEGER NOT NULL)",
-    // A browser's process namespace, one small machine: its guest, the boot it is of (a reload
-    // resets stale processes), and the next pid.
-    "CREATE TABLE IF NOT EXISTS namespaces(id TEXT PRIMARY KEY, guest TEXT NOT NULL, boot TEXT, next_pid INTEGER NOT NULL, created INTEGER NOT NULL, last_seen INTEGER NOT NULL)",
-    // Processes (procs.rs): the namespace they run in, their parent and credentials, cgroup,
-    // image, argument vector and environment, state, and the token their calls carry. A
-    // process that ended waits as a zombie until its parent reaps it.
-    "CREATE TABLE IF NOT EXISTS processes(ns TEXT NOT NULL, pid INTEGER NOT NULL, ppid INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, groups TEXT NOT NULL, umask INTEGER NOT NULL, cgroup TEXT NOT NULL, path TEXT NOT NULL, argv TEXT NOT NULL, env TEXT NOT NULL, cwd TEXT NOT NULL, state TEXT NOT NULL, status INTEGER NOT NULL DEFAULT 0, signal INTEGER, token TEXT NOT NULL, started INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0, seat TEXT, PRIMARY KEY(ns, pid))",
-    "CREATE INDEX IF NOT EXISTS processes_token ON processes(token)",
-    "CREATE INDEX IF NOT EXISTS processes_ns ON processes(ns)",
-    // cgroup v2's hierarchy per namespace: its subtree, controllers, and control files.
-    "CREATE TABLE IF NOT EXISTS cgroups(ns TEXT NOT NULL, path TEXT NOT NULL, parent TEXT NOT NULL, controllers TEXT NOT NULL, cpu_max TEXT, cpu_weight INTEGER NOT NULL DEFAULT 100, memory_max TEXT, pids_max INTEGER, io_max TEXT, freeze INTEGER NOT NULL DEFAULT 0, devices TEXT NOT NULL DEFAULT '', PRIMARY KEY(ns, path))",
+    // Each exec's credentials (creds.rs), by the hash of the token its process's calls carry:
+    // its browser's namespace, the process that executed, and as whom it acts. The process
+    // table is each browser's own Durable Object's (machine.rs).
+    "CREATE TABLE IF NOT EXISTS credentials(token TEXT PRIMARY KEY, ns TEXT NOT NULL, pid INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, groups TEXT NOT NULL, umask INTEGER NOT NULL, started INTEGER NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS credentials_ns ON credentials(ns, pid)",
 ];
 
 thread_local! {
@@ -250,12 +244,10 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
         sql.exec("ALTER TABLE fds ADD COLUMN token TEXT", None)?;
         sql.exec("CREATE INDEX IF NOT EXISTS fds_token ON fds(token)", None)?;
     }
-    // Processes made before they said which tab ran them have no seat.
-    if sql
-        .exec("SELECT seat FROM processes LIMIT 0", None)
-        .is_err()
-    {
-        sql.exec("ALTER TABLE processes ADD COLUMN seat TEXT", None)?;
+    // The process tables moved to each browser's machine: what a local state kept of them was
+    // the processes of boots that are gone.
+    for table in ["processes", "namespaces", "cgroups"] {
+        sql.exec(&format!("DROP TABLE IF EXISTS {table}"), None)?;
     }
     // Descriptors made before they said as whom they were opened were not opened as root.
     if sql.exec("SELECT root FROM fds LIMIT 0", None).is_err() {
@@ -929,37 +921,15 @@ impl Db {
             }
         }
     }
-    /// Close every descriptor of the process `pid` of namespace `ns` (its exec image): the
+    /// Close every descriptor the process credentials `owner` hold (creds.rs `owner`): the
     /// process ended, and its loader already has what it read.
-    pub fn close_proc_fds(&mut self, ns: &str, pid: u32) {
+    pub fn close_proc_fds(&mut self, owner: &str) {
         #[derive(Deserialize)]
         struct Owned {
             sid: String,
             fd: u32,
         }
-        let owned = self.rows::<Owned>(
-            "SELECT sid, fd FROM fds WHERE proc = ?",
-            vec![text(&format!("{ns} {pid}"))],
-        );
-        for owned in owned {
-            self.close_fd(&owned.sid, owned.fd);
-        }
-    }
-    /// Close every process descriptor of the namespace `ns`: a new boot reaps the old boot's
-    /// processes, and their images go with them. (A prefix match, not a pattern: LIKE and GLOB
-    /// choke on the long namespace keys.)
-    pub fn close_ns_proc_fds(&mut self, ns: &str) {
-        #[derive(Deserialize)]
-        struct Owned {
-            sid: String,
-            fd: u32,
-        }
-        let prefix = format!("{ns} ");
-        let upper = format!("{prefix}\u{10ffff}");
-        let owned = self.rows::<Owned>(
-            "SELECT sid, fd FROM fds WHERE proc >= ? AND proc < ?",
-            vec![text(&prefix), text(&upper)],
-        );
+        let owned = self.rows::<Owned>("SELECT sid, fd FROM fds WHERE proc = ?", vec![text(owner)]);
         for owned in owned {
             self.close_fd(&owned.sid, owned.fd);
         }
