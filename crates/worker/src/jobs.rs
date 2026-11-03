@@ -450,7 +450,7 @@ pub fn start(
     );
     // A job left waiting for a runner is cancelled after a week.
     db.set_expiry("job", &id, now + WAITING);
-    Ok(json!({"job": id, "kind": cmd}))
+    Ok(json!({"job": id, "kind": cmd, "source": spec.source}))
 }
 
 /// The most lines one view of a job carries.
@@ -550,11 +550,7 @@ pub fn call(
             );
             // The archive it reads is open as its own, as a process holds what it reads: it
             // shows in /proc/PID/fd, and closes as the job ends.
-            if let Some(source) = db
-                .job(&pid)
-                .and_then(|job| Spec::of(&job).ok())
-                .and_then(|spec| spec.source)
-            {
+            if let Ok(source) = serde_json::from_value::<Source>(started["source"].clone()) {
                 let session = crate::creds::job_owner(&pid);
                 let fd = db.add_fd(
                     &session,

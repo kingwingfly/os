@@ -43,6 +43,8 @@ const ATTEMPTS: u32 = 5;
 pub struct JobRunner {
     state: State,
     env: Env,
+    /// The directories a step made or found, which it does not make again.
+    made: RefCell<std::collections::BTreeSet<String>>,
 }
 
 /// What a step leaves to do.
@@ -55,7 +57,8 @@ enum Step {
 }
 
 /// A file the job writes: its descriptor, its path, whether the job made it (or writes over
-/// one there), the member it is (extraction), and how many of its chunks are recorded.
+/// one there), the member it is (extraction), how many of its chunks are recorded, and their
+/// SHA-256 (a new archive's), so that a rebuild after a restart goes on only if it is the same.
 #[derive(serde::Serialize, Deserialize)]
 struct Writing {
     fd: u32,
@@ -63,6 +66,8 @@ struct Writing {
     created: bool,
     index: Option<u64>,
     written: u64,
+    #[serde(default)]
+    hashes: Vec<Option<String>>,
 }
 
 /// Lines a step writes to its job: to standard output, or with `err`, to standard error.
@@ -109,7 +114,11 @@ fn extracted_mode(cmd: &str, root: bool, mode: Option<u32>, directory: bool) -> 
 
 impl DurableObject for JobRunner {
     fn new(state: State, env: Env) -> Self {
-        Self { state, env }
+        Self {
+            state,
+            env,
+            made: RefCell::default(),
+        }
     }
     /// `{job, token}`: the job to work on, and, as it spawned, its token, kept here alone.
     async fn fetch(&self, mut req: Request) -> Result<Response> {
@@ -127,10 +136,14 @@ impl DurableObject for JobRunner {
             return Response::error("Unknown runner request", 404);
         }
         let storage = self.state.storage();
-        storage.put("job", &start.job).await?;
         if let Some(token) = start.token {
             storage.put("token", &token).await?;
+        } else if storage.get::<String>("token").await?.is_none() {
+            // Woken with no token, and given none before: its job ended (a runner that finished
+            // forgets it), or never reached it. There is nothing to do.
+            return Response::ok("idle");
         }
+        storage.put("job", &start.job).await?;
         storage.set_alarm(1).await?;
         Response::ok("started")
     }
@@ -257,17 +270,17 @@ impl JobRunner {
         }
         let _ = self.state.storage().delete_all().await;
     }
-    /// Let go of the file being written, if any: its descriptor closes, unfinished, and a file
-    /// the job made for it goes, as a process's half-written file is removed by its tool.
+    /// Let go of the file being written, if any: its descriptor closes, and the unfinished file
+    /// with it (`Discard`): one the job made goes, one it wrote over keeps its old content.
     async fn abort_upload(&self) -> Result<()> {
         if let Some(writing) = self.writing().await? {
-            let mut calls = vec![Call::Close {
+            // The kernel lets go of the file by its content, not its name: what is at the name
+            // now may be another's.
+            self.one(Call::Discard {
                 fd: writing.fd.into(),
-            }];
-            if writing.created {
-                calls.push(Call::Unlink { path: writing.path });
-            }
-            self.sys(calls).await?;
+            })
+            .await?
+            .ok();
             self.state.storage().delete("writing").await?;
         }
         Ok(())
@@ -335,9 +348,10 @@ impl JobRunner {
     }
     /// mkdir -p of `path`, below `base`, which is there: each directory on the way that is not
     /// there yet, made with the job's umask.
+    /// Those this step made or found already are not asked again.
     async fn mkdirs(&self, base: &str, path: &str) -> Result<std::result::Result<(), String>> {
         let mut at = base.trim_end_matches('/').to_string();
-        let mut calls = Vec::new();
+        let mut wanted = Vec::new();
         for part in path
             .strip_prefix(base)
             .unwrap_or(path)
@@ -345,16 +359,26 @@ impl JobRunner {
             .filter(|part| !part.is_empty())
         {
             at = format!("{at}/{part}");
-            calls.push(Call::Mkdir {
-                path: at.clone(),
-                mode: 0o777,
-            });
+            if !self.made.borrow().contains(&at) {
+                wanted.push(at.clone());
+            }
         }
-        for made in self.sys(calls).await? {
-            if let Err(error) = made
-                && error.errno != Errno::EEXIST
-            {
-                return Ok(Err(error.to_string()));
+        if wanted.is_empty() {
+            return Ok(Ok(()));
+        }
+        let calls = wanted
+            .iter()
+            .map(|path| Call::Mkdir {
+                path: path.clone(),
+                mode: 0o777,
+            })
+            .collect();
+        for (path, made) in wanted.into_iter().zip(self.sys(calls).await?) {
+            match made {
+                Err(error) if error.errno != Errno::EEXIST => return Ok(Err(error.to_string())),
+                _ => {
+                    self.made.borrow_mut().insert(path);
+                }
             }
         }
         Ok(Ok(()))
@@ -398,9 +422,11 @@ impl JobRunner {
             sha256: None,
             version: None,
         }];
+        // Through the descriptor the open made, in the same batch, as fchmod(2): nothing is
+        // changed if the open failed, and no name is followed to another file.
         if let (false, Some(mode)) = (overwrite, mode) {
-            calls.push(Call::Chmod {
-                path: path.into(),
+            calls.push(Call::Fchmod {
+                fd: abi::FdRef::Ref { call: 0 },
                 mode: (mode & 0o7777) as u16,
             });
         }
@@ -416,6 +442,7 @@ impl JobRunner {
             created: !overwrite,
             index: None,
             written: 0,
+            hashes: Vec::new(),
         })))
     }
     /// pwrite(2) of chunk `index` of what `writing` writes: `length` bytes the container serves
@@ -452,15 +479,48 @@ impl JobRunner {
         Ok(())
     }
     /// close(2) of what `writing` writes, which completes it.
+    /// What is being written is forgotten only once the kernel answered the close: a close
+    /// that did not arrive is sent again by the next step.
     async fn close_write(&self, writing: &Writing) -> Result<std::result::Result<(), String>> {
-        self.state.storage().delete("writing").await?;
-        Ok(self
+        let closed = self
             .one(Call::Close {
                 fd: writing.fd.into(),
             })
+            .await?;
+        self.state.storage().delete("writing").await?;
+        Ok(closed.map(|_| ()).map_err(|error| error.to_string()))
+    }
+    /// Whether the descriptor `writing` writes through is still open (a descriptor not used for
+    /// an hour, or whose file another took over, is not). Asking keeps the job's descriptors.
+    async fn open_still(&self, writing: &Writing) -> Result<bool> {
+        Ok(self
+            .one(Call::Readlink {
+                path: format!("/proc/self/fd/{}", writing.fd),
+            })
             .await?
-            .map(|_| ())
-            .map_err(|error| error.to_string()))
+            .is_ok())
+    }
+    /// The file being written, if a step after a restart may go on with it on its descriptor:
+    /// else, what it made is let go of (by its descriptor, or, the descriptor gone, by its name,
+    /// for a file the job made), and the file is written again.
+    async fn resumable(&self, writing: Writing, same: bool) -> Result<Option<Writing>> {
+        let open = self.open_still(&writing).await?;
+        if open && same {
+            return Ok(Some(writing));
+        }
+        if open {
+            self.abort_upload().await?;
+        } else {
+            if writing.created {
+                self.one(Call::Unlink {
+                    path: writing.path.clone(),
+                })
+                .await?
+                .ok();
+            }
+            self.state.storage().delete("writing").await?;
+        }
+        Ok(None)
     }
     /// The file being written, kept so that a step after a restart goes on with it.
     async fn writing(&self) -> Result<Option<Writing>> {
@@ -600,7 +660,14 @@ impl JobRunner {
     }
 
     async fn work(&self, id: &str) -> Result<Step> {
-        // A job that ended has no credentials any more: its token opens nothing.
+        // A runner given no token has nothing it may do.
+        if self.state.storage().get::<String>("token").await?.is_none() {
+            return Ok(Step::Done);
+        }
+        // What a step made or found of directories, the next one asks again.
+        self.made.borrow_mut().clear();
+        // A job that ended (done, failed, cancelled) has no credentials any more: its token
+        // opens nothing.
         let (status, job) = self.call(Method::Get, "/internal/job", None).await?;
         if status == 403 {
             return Ok(Step::Done);
@@ -622,7 +689,6 @@ impl JobRunner {
             )));
         }
         match job.state.as_str() {
-            "done" | "failed" | "cancelled" => return Ok(Step::Done),
             "question" => return Ok(Step::Wait),
             "cancelling" => {
                 self.abort_upload().await?;
@@ -1219,10 +1285,9 @@ impl JobRunner {
     ) -> Result<std::result::Result<Option<u32>, String>> {
         let member = row.idx;
         let mut writing = match self.writing().await? {
-            Some(writing) if writing.index == Some(member) => Some(writing),
-            Some(_) => {
-                self.abort_upload().await?;
-                None
+            Some(writing) => {
+                let same = writing.index == Some(member);
+                self.resumable(writing, same).await?
             }
             None => None,
         };
@@ -1320,17 +1385,23 @@ impl JobRunner {
         if let Err(error) = self.one(call).await? {
             return Ok(Err(error.to_string()));
         }
-        if made != row.target
-            && let Err(error) = self
-                .one(Call::Rename {
-                    from: made.clone(),
-                    to: row.target.clone(),
-                    noreplace: false,
-                })
+        if made != row.target {
+            // The name beside goes either way: rename(2) of a name onto another of the same
+            // inode (a hard link made again) does nothing, and leaves both.
+            let mut results = self
+                .sys(vec![
+                    Call::Rename {
+                        from: made.clone(),
+                        to: row.target.clone(),
+                        noreplace: false,
+                    },
+                    Call::Unlink { path: made },
+                ])
                 .await?
-        {
-            self.one(Call::Unlink { path: made }).await?.ok();
-            return Ok(Err(error.to_string()));
+                .into_iter();
+            if let Some(Err(error)) = results.next() {
+                return Ok(Err(error.to_string()));
+            }
         }
         Ok(Ok(true))
     }
@@ -1452,13 +1523,18 @@ impl JobRunner {
         }
         // Go on with the archive begun before, on its descriptor, if it is this one (the build
         // is deterministic: its size says); else begin it.
+        // The same archive is the same size, and its chunks stored so far are the new build's,
+        // SHA-256 by SHA-256 (a container image that changed builds other bytes).
         let resumed = match self.writing().await? {
-            Some(writing) if storage.get::<u64>("upload_size").await? == Some(size) => {
-                Some(writing)
-            }
-            Some(_) => {
-                self.abort_upload().await?;
-                None
+            Some(writing) => {
+                let same = storage.get::<u64>("upload_size").await? == Some(size)
+                    && writing.hashes.len() as u64 == writing.written
+                    && writing
+                        .hashes
+                        .iter()
+                        .enumerate()
+                        .all(|(index, sha)| hashes.get(index) == sha.as_ref());
+                self.resumable(writing, same).await?
             }
             None => None,
         };
@@ -1496,6 +1572,8 @@ impl JobRunner {
             )
             .await?;
             writing.written = index + 1;
+            writing.hashes.truncate(index as usize);
+            writing.hashes.push(sha);
             self.keep_writing(&writing).await?;
             let state = self
                 .update(

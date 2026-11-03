@@ -717,6 +717,18 @@ pub enum Call {
     Close {
         fd: FdRef,
     },
+    /// close(2) of a descriptor that writes, and the unfinished file it wrote with it: a new
+    /// file disappears, an overwritten one keeps its old content, its chunks freed at once. An
+    /// extension: what a cancelled upload, or a cancelled job, leaves is nobody's to finish.
+    Discard {
+        fd: FdRef,
+    },
+    /// fchmod(2): the mode of the file the descriptor `fd` has open, whatever name it has now
+    /// (none followed), as its owner or root may change it.
+    Fchmod {
+        fd: FdRef,
+        mode: u16,
+    },
     /// pread(2): at most `count` bytes (`INLINE_MAX`), from `offset`, of the file the
     /// descriptor `fd` reads, or that `path` names, which needs read permission as open does: a
     /// short read at its end, or at what has arrived of a file still being written.

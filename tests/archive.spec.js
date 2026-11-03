@@ -295,6 +295,11 @@ test('tar keeps symbolic and hard links, zip follows them unless -y, and extract
   expect(await (await request.get(file(base + '/out/docs/to-a'))).text()).toBe('alpha\n'.repeat(2000));
   // The two names are one file again, as ls -l counts them.
   await run(page, 'ls -l out/docs | grep a-too'); await expect(transcript(page).locator('pre').last()).toContainText(' 2 root root');
+  // Extracted again over itself, a link replaces what is there, and leaves nothing beside it: a
+  // hard link made again names the same file it names already.
+  await run(page, 'tar -xf links.tar -C out');
+  expect((await ls(request, base + '/out/docs')).map(entry => entry.name).filter(name => name.startsWith('.'))).toEqual([]);
+  await run(page, 'ls -l out/docs | grep a-too'); await expect(transcript(page).locator('pre').last()).toContainText(' 2 root root');
   // zip stores what a link leads to; -y the link.
   await run(page, 'zip -r followed.zip docs'); await run(page, 'zip -ry kept.zip docs');
   await run(page, 'mkdir z1 z2'); await run(page, 'unzip -q followed.zip -d z1'); await run(page, 'unzip -q kept.zip -d z2');

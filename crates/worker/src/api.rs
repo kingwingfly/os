@@ -482,9 +482,10 @@ fn job_reply(
 
 /// Run one command as the session `key`, elevated if it asks for sudo.
 /// Wake the runner of the job a reply started or changed, if any.
-pub async fn kick(env: &Env, reply: &Value) {
+/// Whether the runner heard.
+pub async fn kick(env: &Env, reply: &Value) -> bool {
     let Some(job) = reply["job"].as_str() else {
-        return;
+        return false;
     };
     // A job just spawned hands its runner its token, which the runner keeps; one woken again
     // (an answer, a signal) has it already.
@@ -503,8 +504,20 @@ pub async fn kick(env: &Env, reply: &Value) {
             .await
     }
     .await;
-    if let Err(e) = woken {
-        console_error!("cannot start the runner of job {}: {}", job, e);
+    match woken {
+        Ok(response) if response.status_code() < 400 => true,
+        Ok(response) => {
+            console_error!(
+                "the runner of job {} refused to start: {}",
+                job,
+                response.status_code()
+            );
+            false
+        }
+        Err(e) => {
+            console_error!("cannot start the runner of job {}: {}", job, e);
+            false
+        }
     }
 }
 

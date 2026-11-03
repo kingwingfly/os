@@ -70,6 +70,8 @@ impl Credential {
 /// The namespace jobs' credentials are in (Phase 4): a job is no browser's process, and its
 /// token never leaves the server, as its runner alone holds it (runner.rs).
 pub const JOBS: &str = "jobs";
+/// The namespace of a request with no browser's cookies (procs.rs `Db::namespace`).
+const ANONYMOUS: &str = "anonymous";
 
 /// The key the descriptors of the job `id` are owned by, and the session they are kept in.
 pub fn job_owner(id: &str) -> String {
@@ -113,8 +115,10 @@ impl Db {
     /// a browser's process's, or a job's, whose token only its runner has.
     pub fn credential(&self, token: &str, ns: &str) -> Option<Credential> {
         let hash = auth::token_hash(token);
+        // A job's token comes from its runner alone, whose requests carry no browser's cookies
+        // (the anonymous namespace): a browser's request never finds a job's.
         self.credential_of(&hash, ns)
-            .or_else(|| self.credential_of(&hash, JOBS))
+            .or_else(|| (ns == ANONYMOUS).then(|| self.credential_of(&hash, JOBS))?)
     }
     /// The credentials of the job `id`, as `cred` spawned it with `umask`, by its token's hash
     /// `hash`: they are the job's for its life, whatever becomes of the account.
@@ -140,6 +144,8 @@ impl Db {
             vec![text(JOBS), text(&job_owner(id))],
         );
         self.close_proc_fds(&job_owner(id));
+        // Its session of descriptors is gone with it, numbers and all.
+        self.forget_fd_numbers(&job_owner(id));
     }
     /// The credentials whose token's hash is `hash`, in `ns`.
     fn credential_of(&self, hash: &str, ns: &str) -> Option<Credential> {

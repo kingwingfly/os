@@ -84,6 +84,8 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
         Call::Getcreds
         | Call::Open { .. }
         | Call::Close { .. }
+        | Call::Discard { .. }
+        | Call::Fchmod { .. }
         | Call::Pread { .. }
         | Call::Pwrite { .. }
         | Call::Statfs { .. }

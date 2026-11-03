@@ -168,7 +168,7 @@ pub async fn handle(
             // A descriptor call stands as it ends, failed or not: a close that fails closes.
             let descriptors = matches!(
                 call,
-                Call::Open { .. } | Call::Close { .. } | Call::Ioctl { .. }
+                Call::Open { .. } | Call::Close { .. } | Call::Discard { .. } | Call::Ioctl { .. }
             );
             let ns = Db::namespace(key.as_deref(), guest.as_deref());
             let caller = procs_token
@@ -199,11 +199,24 @@ pub async fn handle(
         let mut result = result;
         if let (Some(pid), Return::Ok(value)) = (wakes, &mut result) {
             let pid = value["pid"].as_str().map(str::to_string).unwrap_or(pid);
-            // A job spawned: its token is its runner's alone, not the page's.
+            // A job spawned: its token is its runner's alone, not the page's. A runner that did
+            // not hear of it never will, as nobody else has the token: the job fails now,
+            // rather than wait a week to be cancelled.
             let token = value
                 .as_object_mut()
                 .and_then(|value| value.remove("token"));
-            crate::api::kick(env, &json!({ "job": pid, "token": token })).await;
+            let spawned = token.is_some();
+            if !crate::api::kick(env, &json!({ "job": pid, "token": token })).await && spawned {
+                let pid = pid.clone();
+                transact(state, move |db| {
+                    db.add_lines(
+                        &pid,
+                        &[(true, "The job's runner could not be started".into())],
+                    );
+                    crate::jobs::finish(db, &pid, "failed");
+                    ((), true)
+                })?;
+            }
         }
         results.push(result);
     }
@@ -244,6 +257,8 @@ fn heard(sid: &str) -> bool {
 fn resolve(call: &mut Call, results: &[Return]) -> std::result::Result<(), Error> {
     let fd = match call {
         Call::Close { fd }
+        | Call::Discard { fd }
+        | Call::Fchmod { fd, .. }
         | Call::Ioctl { fd, .. }
         | Call::Pwrite { fd, .. }
         | Call::Pread { fd: Some(fd), .. } => fd,
@@ -788,7 +803,11 @@ fn run(
                 .unwrap_or_else(|| "/".into());
             crate::jobs::call(db, owner, &home, sid, &process, call)
         }
-        call @ (Call::Open { .. } | Call::Close { .. } | Call::Ioctl { .. }) => {
+        call @ (Call::Open { .. }
+        | Call::Close { .. }
+        | Call::Discard { .. }
+        | Call::Fchmod { .. }
+        | Call::Ioctl { .. }) => {
             let caller = caller.as_ref().map(crate::creds::Credential::owner);
             crate::fds::call(db, sid, &process, caller.as_deref(), call)
         }

@@ -63,6 +63,21 @@ pub fn call(
             Ok(json!(opened))
         }
         Call::Close { fd } => close(db, sid, &process.cred, fd.number(), caller).map(|c| json!(c)),
+        Call::Discard { fd } => discard(db, sid, &process.cred, fd.number(), caller),
+        Call::Fchmod { fd, mode } => {
+            let (found, file) = descriptor(db, sid, fd.number(), caller)?;
+            // The file it has open, where it shows: the one it writes, or reads.
+            let path = match db.file(&file) {
+                Some(file) if found.writes() => {
+                    writable(db, &acting(&found, &process.cred), &file)?.0
+                }
+                _ => db
+                    .showing(&file)
+                    .pop()
+                    .ok_or_else(|| Error::because(Errno::EBADF, ELSEWHERE))?,
+            };
+            kernel::call(db, process, Call::Chmod { path, mode })
+        }
         Call::Ioctl { fd, request, arg } => {
             yours(db, sid, fd.number(), caller)?;
             let device = crate::dev::request(db, sid, fd.number())?;
@@ -410,6 +425,24 @@ pub fn writable(db: &mut Db, who: &Identity, file: &File) -> Result<(String, Nod
         }
         (None, _) => Err(Errno::EACCES.into()),
     }
+}
+
+/// close(2) of `fd`, and, if it wrote a file still unfinished, that file with it (`Discard`): a
+/// new one disappears, an overwrite's replacement is dropped, the old content kept.
+fn discard(db: &mut Db, sid: &str, who: &Identity, fd: u32, caller: Option<&str>) -> Result<Value> {
+    let found = db.fd(sid, fd).ok_or(Errno::EBADF)?;
+    owned(&found, caller)?;
+    let unfinished = found
+        .file
+        .as_deref()
+        .and_then(|file| db.file(file))
+        .filter(|file| found.writes() && !file.complete());
+    let Some(file) = unfinished else {
+        return close(db, sid, who, fd, caller).map(|closed| json!(closed));
+    };
+    release(db, sid, fd);
+    crate::api::cancel(db, &file);
+    Ok(json!({ "path": found.path, "discarded": true }))
 }
 
 /// close(2). A writer's file is complete once every chunk is there; if one is missing, the
