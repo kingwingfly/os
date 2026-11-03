@@ -91,7 +91,7 @@ pub fn identity_of(c: &mut crate::db::Db, key: Option<&str>, guest: Option<&str>
         .unwrap_or_else(Identity::guest)
 }
 /// The same, under sudo when `requested` and the account may (a signed-in wheel member's
-/// timestamp). A guest has nothing to elevate to.
+/// timestamp). A guest is no wheel member: its sudo is refused, never run as another identity.
 pub fn elevated_of(
     c: &mut crate::db::Db,
     key: Option<&str>,
@@ -100,10 +100,6 @@ pub fn elevated_of(
 ) -> std::result::Result<Identity, String> {
     if !requested {
         return Ok(identity_of(c, key, guest));
-    }
-    let who = identity(c, key);
-    if is_guest_id(who.id) {
-        return Ok(Identity::guest());
     }
     elevated(c, key, true)
 }

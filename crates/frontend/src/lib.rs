@@ -35,6 +35,9 @@ extern "C" {
     fn upload_files(files: &JsValue, path: &str, progress: &js_sys::Function) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = cancelUploads)]
     fn cancel_uploads() -> bool;
+    /// Whether an upload goes on in this page, the terminal's or the Files': one at a time.
+    #[wasm_bindgen(js_namespace = terminal)]
+    fn uploading() -> bool;
     #[wasm_bindgen(js_namespace = terminal, js_name = recordSound)]
     fn record_sound(
         path: Option<String>,
@@ -189,7 +192,7 @@ thread_local! {
 }
 /// Where the tabs are kept for this browser tab, across reloads.
 const SAVED: &str = "terminal-tabs";
-fn session_storage() -> Option<web_sys::Storage> {
+pub(crate) fn session_storage() -> Option<web_sys::Storage> {
     // Storage can be missing or refused, as in private windows; tabs then are not kept.
     web_sys::window()?.session_storage().ok().flatten()
 }
@@ -417,25 +420,22 @@ fn App() -> impl IntoView {
             let before = account.username.get_untracked();
             // Why, if it changed from elsewhere (app.js `changed`).
             let reason = e.detail().as_string();
+            // The Files list once, and the account, every tab's, is asked once.
             files.refresh();
             spawn_local(async move {
-                for shell in tabs.get_untracked() {
-                    if let Err(e) = shell.refresh().await {
-                        shell.log(e);
-                    }
+                if let Some(shell) = tabs.get_untracked().first().copied() {
+                    shell.refresh_account().await;
                 }
                 // The account is the browser session's, so every tab changes with it.
                 let after = account.username.get_untracked();
                 if after == before {
                     return;
                 }
-                // A session that ended leaves the cookie a guest's (guest or guest-<uuid>): one
-                // with an account after it is the new session another window of this browser
-                // signed in with, replacing it.
+                // A session that ended leaves the cookie a guest's: one signed in after it is the
+                // new session another window of this browser signed in with, replacing it. (By
+                // whether it is signed in, not by its name: an account's name says nothing.)
                 let reason = match reason.as_deref() {
-                    Some("ended") if after != "guest" && !after.starts_with("guest-") => {
-                        Some("window")
-                    }
+                    Some("ended") if account.writable.get_untracked() => Some("window"),
                     reason => reason,
                 };
                 for shell in tabs.get_untracked() {

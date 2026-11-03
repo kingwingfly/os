@@ -13,6 +13,7 @@ const FAULT: u16 = 21;
 const INVAL: u16 = 28;
 const NOENT: u16 = 44;
 const NOSYS: u16 = 52;
+const SPIPE: u16 = 70;
 
 #[wasm_bindgen]
 extern "C" {
@@ -463,17 +464,28 @@ impl Runtime {
             }
             "fd_seek" => {
                 let fd = arg(0);
-                let offset = arg(1) as usize;
+                // The host passes an i64 as its low 32 bits: the offset is signed (SEEK_CUR -1).
+                let offset = i64::from(arg(1) as i32);
                 match proc.fds.get_mut(&fd) {
                     Some(Fd::File { data, offset: at }) => {
-                        *at = offset.min(data.len());
+                        // WASI's whence: from the start, from where it is, from the end.
+                        let base = match arg(2) {
+                            0 => 0,
+                            1 => *at as i64,
+                            2 => data.len() as i64,
+                            _ => return Outcome::ready(INVAL),
+                        };
+                        let Some(to) = base.checked_add(offset).filter(|to| *to >= 0) else {
+                            return Outcome::ready(INVAL);
+                        };
+                        // Past the end is allowed, as lseek(2) allows it; a read there reads
+                        // nothing.
+                        *at = to as usize;
                         write_u64(pid, arg(3), *at as u64);
                         Outcome::ready(SUCCESS)
                     }
-                    Some(_) => {
-                        write_u64(pid, arg(3), 0);
-                        Outcome::ready(SUCCESS)
-                    }
+                    // A pipe or a terminal does not seek.
+                    Some(_) => Outcome::ready(SPIPE),
                     None => Outcome::ready(BADF),
                 }
             }

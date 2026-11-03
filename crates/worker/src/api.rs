@@ -195,7 +195,8 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     Err(error) => return errno_reply(&error),
                 };
                 if crate::procfs::is(&path) {
-                    return match crate::procfs::read(db, sid.as_deref(), &who, &path) {
+                    let ns = Db::namespace(key.as_deref(), guest.as_deref());
+                    return match crate::procfs::read(db, sid.as_deref(), &ns, &who, &path) {
                         Ok(text) => Reply::ok(json!({ "generated": text })),
                         Err(error) => errno_reply(&error),
                     };
@@ -257,17 +258,13 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 );
                 let sid = auth::sid(db, key.as_deref(), guest.as_deref());
                 match crate::fds::by_token(db, sid.as_deref(), &who, &token, row.as_ref()) {
-                    Ok(file) => {
+                    Ok((file, exec)) => {
                         let chunks: Vec<_> = db
                             .chunks(&file.id)
                             .into_iter()
                             .map(|c| json!([c.idx, c.key]))
                             .collect();
                         let path = db.showing(&file.id).pop().unwrap_or(file.target.clone());
-                        let exec = db
-                            .fd_by_token(&token)
-                            .map(|(_, found)| found.exec)
-                            .unwrap_or(false);
                         let content_type = if exec {
                             "application/wasm"
                         } else {

@@ -399,6 +399,25 @@ Chromium-only. The Rust WASIX runtime runs and forks a prebuilt `dash` in Node a
 cross-origin-isolated module Worker; asyncify-at-load transforms an uninstrumented WAT module
 with binaryen in both. Details are in `AGENT.md` and issue #20.
 
+**Where the kernel runs, and what a gone tab leaves.**
+- **One kernel, either worker:** the client kernel is the browser's SharedWorker where it has one. Where it has none (Chrome for Android before 148), it is each tab's own dedicated Worker, on the same namespace, so commands run either way.
+- **Tab locks:** each tab holds the Web Lock `tw-tab-<tab>` while it lives, taken before it asks anything. Each process records its tab as its seat (`execve`'s `seat`).
+- **Reaping:** a process whose seat's lock is free was left by a tab that closed, crashed or reloaded while it ran. The kernel reaps it at once where it waits on that tab's lock, and at boot, or when the namespace is full (EAGAIN), by asking which locks are held.
+- **No reaping by boot:** a kernel reaps by boot id only where tabs have no Web Locks, so a tab's own kernel never reaps another tab's processes.
+- **`/proc`:** it shows the caller's namespace, as a Linux PID namespace does: every process of it for root, an account's own otherwise.
+
+## Roadmap
+
+The next steps agreed in issue #20, and the ideas recorded for later.
+
+- **Process lifecycle off the authority:** only `execve` needs the worker kernel (the X check, the credential snapshot, the image token). `fork`, `wait`, `exit` and signals become the client kernel's, reported to a process registry in a Durable Object per browser, in batches. A pipeline's `execve` calls go as one batch.
+- **JSPI and asyncify:** JavaScript Promise Integration (Chrome 137+, Firefox planned for 153) lets a blocking call await a promise without transforming the module, where shared memory and `Atomics.wait` need cross-origin isolation. Asyncify stays only for `fork`, which must copy a stack into a new instance, as a JSPI suspension cannot be copied. It applies to modules that import `proc_fork`, limited by `asyncify-imports`, and is transformed once per content and cached.
+- **GUI programs:** the WASI graphics proposal (`wasi:webgpu`, `wasi:surface`, `wasi:frame-buffer`), implemented in each process's Worker on WebGPU and a canvas handed over from the compositor's window. `/dev/display` is the permission gate. Web content runs in sandboxed frames, since a browser cannot run as a wasm process.
+- **Mounts and clusters:** a directory of the user's device mounted live, shared across devices and sessions peer to peer, or through a Cloudflare relay. Map/reduce across opted-in clients and Containers (the h264 to av1 example). Bytes go through a relay Durable Object per mount or cluster, never through the authority.
+- **io_uring-style queues:** a batch is already a submission queue of calls. A completion ring in shared memory, with calls completing out of order, would let a program keep many calls in flight without waiting on each, as `ls` over uutils makes tens of calls.
+- **JIT and AOT:** the module cache keyed by content is where compiled and transformed code (asyncify, fuel for CPU limits, ahead-of-time builds) can be kept and reused.
+- **eBPF-style hooks:** small verified programs the kernel runs at syscall boundaries, for tracing, accounting and policy (cgroups, seccomp-like filters), without trusting user space.
+
 ## Storage and project boundaries
 
 | Path | Responsibility |

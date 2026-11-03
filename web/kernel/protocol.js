@@ -6,14 +6,34 @@ export const VERSION = 1;
 
 let shared;
 
-// The page's port to the browser's client kernel, one SharedWorker for every tab.
+// This tab, as the kernel knows it (a process's seat): it holds the Web Lock `tw-tab-<tab>` for
+// as long as it lives, taken before it asks anything, which the kernel waits on to reap what
+// the tab ran once it is gone (client.js).
+export const tab = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+const holding = globalThis.navigator?.locks
+  ? new Promise(held => {
+    globalThis.navigator.locks.request(`tw-tab-${tab}`, () => { held(); return new Promise(() => {}); }).catch(() => held());
+  })
+  : Promise.resolve();
+
+// The page's port to the client kernel: the browser's SharedWorker, one for every tab, or, where
+// a browser has none (Chrome for Android before 148), a dedicated Worker of this tab alone.
 export function kernelPort() {
   if (shared) return shared;
-  const worker = new SharedWorker('/client-kernel.js');
-  const port = worker.port;
+  const sharing = typeof SharedWorker === 'function';
+  const worker = sharing ? new SharedWorker('/client-kernel.js') : new Worker('/client-kernel.js');
+  const port = sharing ? worker.port : worker;
   const pending = new Map();
   const listeners = new Map();
   let next = 0;
+  // A kernel whose script failed to load or run answers nothing: what waits fails (EIO) rather
+  // than hang the command that asked, and the next call starts the worker again.
+  worker.onerror = event => {
+    if (shared?.port === port) shared = undefined;
+    const error = Object.assign(new Error(event?.message || 'the client kernel failed'), { errno: 'EIO' });
+    for (const waiting of pending.values()) waiting.reject(error);
+    pending.clear();
+  };
   port.onmessage = ({ data }) => {
     if (data?.v !== VERSION) return;
     if (data.id != null) {
@@ -29,12 +49,13 @@ export function kernelPort() {
       for (const listener of listeners.get('*') ?? []) listener(data);
     }
   };
-  port.start();
-  const request = (type, args = {}) => new Promise((resolve, reject) => {
+  if (sharing) port.start();
+  // Each request says which tab asks, once the tab holds its lock.
+  const request = (type, args = {}) => holding.then(() => new Promise((resolve, reject) => {
     const id = ++next;
     pending.set(id, { resolve, reject });
-    port.postMessage({ v: VERSION, id, type, args });
-  });
+    port.postMessage({ v: VERSION, id, type, args, tab });
+  }));
   const on = (event, listener) => {
     if (!listeners.has(event)) listeners.set(event, new Set());
     listeners.get(event).add(listener);

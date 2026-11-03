@@ -229,7 +229,7 @@ test('a listener asks to speak; allowed, everyone following hears them, until th
     await expect(ask).toHaveAttribute('aria-pressed', 'true');
     await expect(listeners).toHaveAttribute('aria-label', 'Listeners: 1 asking to speak, 0 speaking');
     await listeners.click();
-    await expect(laptop.page.locator('.live-person')).toHaveText(/guest asks to speak/);
+    await expect(laptop.page.locator('.live-person')).toHaveText(/guest-[0-9a-f]{16} asks to speak/);
     await laptop.page.getByRole('menuitem', { name: 'Dismiss' }).click();
     await expect(asker.page.locator('.live-note')).toHaveText('Not now, says the presenter');
     await expect(listeners).toBeHidden();
@@ -249,23 +249,25 @@ test('a listener asks to speak; allowed, everyone following hears them, until th
     await listeners.click();
     await laptop.page.getByRole('menuitem', { name: 'Allow' }).click();
     await expect(ask).toHaveAttribute('title', /^Speaking/, { timeout: 20_000 });
-    await expect.poll(() => listed('/dev/snd'), { timeout: 10_000 }).toContain(`${stem}-guest`);
+    // A voice is named after the deck and its speaker, a signed-out browser's guest-<uuid>.
+    const voices = async () => (await listed('/dev/snd')).filter(name => /^guest-[0-9a-f]{16}$/.test(name.slice(stem.length + 1)) && name.startsWith(`${stem}-`));
+    await expect.poll(async () => (await voices()).length, { timeout: 10_000 }).toBe(1);
     // The presenter's, a device that whoever follows the presentation hears.
-    const voice = await entry(root, `/dev/snd/${stem}-guest`);
+    const voice = await entry(root, `/dev/snd/${(await voices())[0]}`);
     expect([voice.owner, voice.mode]).toEqual([name, 0o644]);
-    await expect(other.page.locator('#listening-name')).toHaveText('guest speaking', { timeout: 20_000 });
+    await expect(other.page.locator('#listening-name')).toHaveText(/^guest-[0-9a-f]{16} speaking$/, { timeout: 20_000 });
     await expect(player(other.page)).toHaveAttribute('data-state', /live|paused/);
     await expect.poll(() => laptop.page.evaluate(() => document.querySelectorAll('.voice-audio').length), { timeout: 20_000 }).toBe(1);
-    await expect(asker.page.locator('#listening-name')).not.toHaveText(/guest speaking/);
-    // Two guest browsers are one account, two sessions: the one allowed writes the
-    // presentation through the descriptor passed to it; the other may not.
+    await expect(asker.page.locator('#listening-name')).not.toHaveText(/guest-[0-9a-f]{16} speaking/);
+    // Two guest browsers are two accounts (guest-<uuid>), each a session of its own: the one
+    // allowed writes the presentation through the descriptor passed to it; the other may not.
     expect(await errno(other.context.request, { open: { path: `/dev/present/${stem}`, flags: 1 } })).toBe('EACCES');
     expect((await descriptors(asker.context.request)).filter(fd => fd.path === `/dev/present/${stem}` && fd.flags & 1)).toHaveLength(1);
     // Ended by the presenter, the bars shown again by the pointer: the listener's microphone
     // stops, and the others hear it no more.
     await laptop.page.mouse.move(400, 300); await laptop.page.mouse.move(410, 310);
     await listeners.click();
-    await expect(laptop.page.locator('.live-person.speaking')).toHaveText(/guest speaking/);
+    await expect(laptop.page.locator('.live-person.speaking')).toHaveText(/guest-[0-9a-f]{16} speaking/);
     await laptop.page.getByRole('menuitem', { name: 'End' }).click();
     await expect(ask).toHaveAttribute('aria-pressed', 'false', { timeout: 10_000 });
     await expect(ask).toHaveAttribute('title', 'Ask to speak');

@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { api, listing, mkdirp, put, rmrf } from './sys.js';
+import { browse, promptPath } from './ui.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 
@@ -8,11 +9,8 @@ const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.
 // what is done in them is not a command of the terminal.
 const location = page => page.getByRole('textbox', { name: 'Location' });
 const names = page => page.locator('.files .filename');
-const cwd = page => page.locator('label[for=command] .prompt-path');
-async function go(page, path) {
-  await location(page).fill(path); await location(page).press('Enter');
-  await expect(location(page)).toHaveValue(path);
-}
+const cwd = promptPath;
+const go = browse;
 async function run(page, text) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await expect(page.locator('.busy')).toHaveText('↵');

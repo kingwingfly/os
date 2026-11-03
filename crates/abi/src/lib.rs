@@ -237,6 +237,9 @@ pub struct Proc {
     pub started: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub ended: u64,
+    /// The tab that runs it, if a client kernel said (`Execve`'s `seat`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
 }
 
 /// A process's wait status, as waitpid(2) encodes it: exit code in the high byte, or the signal
@@ -832,6 +835,10 @@ pub enum Call {
         cwd: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cgroup: Option<String>,
+        /// The tab that runs it (the client kernel's "seat"), which holds a Web Lock while it
+        /// lives: a process whose seat's lock is free was left by a tab that is gone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seat: Option<String>,
     },
     /// fork(2)'s registry half: a child of `pid`, with its credentials, cgroup and descriptors
     /// copied. The client kernel clones the guest's wasm state (asyncify snapshot).
@@ -1057,6 +1064,7 @@ mod tests {
                 env: vec!["LANG=C".into()],
                 cwd: "/work".into(),
                 cgroup: None,
+                seat: None,
             }
         );
         let batch: Batch =

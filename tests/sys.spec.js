@@ -551,3 +551,25 @@ test('uploaded wasm execves, its image read by the process token alone', async (
   expect(await ann.sys({ execve: { path: dir + '/busy.wasm', argv: ['busy'], env: [], cwd: '/' } })).toBe('ETXTBSY');
   await ann.batch([{ close: { fd: opened.ok.fd } }]);
 });
+
+test('a process uses its own descriptors, and a page its own: neither reaches the other\'s', async () => {
+  const [mine] = await root.batch([{ open: { path: '/etc/passwd', flags: 0 } }]);
+  const exec = await root.sys({ execve: { path: '/usr/bin/coreutils', argv: ['coreutils', 'true'], env: [], cwd: '/' } });
+  const as = { pid: exec.pid, proc: exec.token };
+  // The page's descriptor, root's at that, is not the process's to read.
+  const [stolen] = await root.batch([{ pread: { fd: mine.ok.fd, count: 4 } }], as);
+  expect(stolen.err.errno).toBe('EBADF');
+  // What the process opens is its own: the page cannot read it, the process can.
+  const [own] = await root.batch([{ open: { path: '/etc/group', flags: 0 } }], as);
+  const [peek] = await root.batch([{ pread: { fd: own.ok.fd, count: 4 } }]);
+  expect(peek.err.errno).toBe('EBADF');
+  const [read] = await root.batch([{ pread: { fd: own.ok.fd, count: 4 } }], as);
+  expect(Buffer.from(read.ok.data, 'base64').toString()).toBe('root');
+  // It closes as the process ends, as a process's descriptors do.
+  expect(await root.sys({ exit: { status: 0 } }, as)).toBeNull();
+  expect((await root.sys({ wait: { pid: String(exec.pid) } })).pid).toBe(exec.pid);
+  const open = (await root.sys({ getdents: { path: '/proc/self/fd' } })).map(entry => entry.name);
+  expect(open).not.toContain(String(own.ok.fd));
+  expect(open).toContain(String(mine.ok.fd));
+  await root.batch([{ close: { fd: mine.ok.fd } }]);
+});

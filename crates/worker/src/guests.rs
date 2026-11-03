@@ -14,6 +14,8 @@ use terminal_worker_core::permissions::{
 /// The uids signed-out browsers draw from, below the accounts a system makes.
 pub const UID_MIN: u32 = GUEST_UID_MIN;
 pub const UID_MAX: u32 = GUEST_UID_MAX;
+/// How often a guest's last sight is written down, in seconds.
+const SEEN_EVERY: u64 = 60 * 60;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Guest {
@@ -122,6 +124,10 @@ impl Db {
     /// the first free uid of the anonymous range (EMFILE if there is none, as a full table is).
     pub fn ensure_guest(&mut self, key: &str, now: u64) -> Option<Guest> {
         if let Some(guest) = self.guest(key) {
+            // When it was last seen is kept to the hour: not a write on every request.
+            if guest.last_seen + SEEN_EVERY > now {
+                return Some(guest);
+            }
             self.run(
                 "UPDATE guests SET last_seen = ? WHERE key = ?",
                 vec![int(now), text(key)],
@@ -159,9 +165,21 @@ impl Db {
         struct Next {
             uid: Option<u32>,
         }
-        let taken: Vec<Next> = self.rows("SELECT uid FROM guests ORDER BY uid", vec![]);
-        let used: BTreeSet<u32> = taken.into_iter().filter_map(|row| row.uid).collect();
-        (UID_MIN..=UID_MAX).find(|uid| !used.contains(uid))
+        // The one after the highest given; past the range's end, the first gap.
+        let highest = self
+            .rows::<Next>("SELECT MAX(uid) AS uid FROM guests", vec![])
+            .into_iter()
+            .next()
+            .and_then(|row| row.uid);
+        match highest {
+            None => Some(UID_MIN),
+            Some(uid) if uid < UID_MAX => Some(uid.max(UID_MIN - 1) + 1),
+            Some(_) => {
+                let taken: Vec<Next> = self.rows("SELECT uid FROM guests ORDER BY uid", vec![]);
+                let used: BTreeSet<u32> = taken.into_iter().filter_map(|row| row.uid).collect();
+                (UID_MIN..=UID_MAX).find(|uid| !used.contains(uid))
+            }
+        }
     }
     /// The identity of the guest `key`, made if new.
     pub fn guest_identity(&mut self, key: &str, now: u64) -> Identity {

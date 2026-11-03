@@ -6,8 +6,8 @@
 use crate::db::{Db, int, text};
 use crate::usr;
 use abi::{
-    ARG_MAX, ENV_MAX, EXEC_MAX, Error, Exec, Forked, PROC_MAX, Proc, ProcState, SIGCONT, SIGKILL,
-    SIGSTOP, SIGTERM,
+    ARG_MAX, ENV_MAX, EXEC_MAX, Error, Exec, Forked, PROC_MAX, Proc, ProcState, SIGCONT, SIGHUP,
+    SIGINT, SIGKILL, SIGPIPE, SIGQUIT, SIGSTOP, SIGTERM, SIGTSTP,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -41,6 +41,7 @@ pub struct Row {
     pub signal: Option<i64>,
     pub started: u64,
     pub ended: u64,
+    pub seat: Option<String>,
 }
 impl Row {
     pub fn proc(&self) -> Proc {
@@ -57,6 +58,7 @@ impl Row {
             argv: serde_json::from_str(&self.argv).unwrap_or_default(),
             started: self.started,
             ended: self.ended,
+            seat: self.seat.clone(),
         }
     }
     pub fn identity(&self) -> Identity {
@@ -81,7 +83,7 @@ fn state_of(state: &str) -> ProcState {
     }
 }
 
-const COLUMNS: &str = "ns, pid, ppid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, started, ended";
+const COLUMNS: &str = "ns, pid, ppid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, started, ended, seat";
 
 impl Db {
     /// The process `pid` of namespace `ns`.
@@ -140,7 +142,7 @@ impl Db {
                 cred,
                 0o022,
                 "/init",
-                "/user",
+                "/init",
                 &[INIT.to_string()],
                 &[],
                 "/",
@@ -172,7 +174,7 @@ impl Db {
                 cred,
                 0o022,
                 "/init",
-                "/user",
+                "/init",
                 &[INIT.to_string()],
                 &[],
                 "/",
@@ -237,21 +239,6 @@ impl Db {
             vec![text(ns)],
         )
     }
-    /// The processes the account `uid` runs, across its browser namespaces: what its /proc
-    /// shows, as procfs mounted hidepid=invisible shows an account its own.
-    pub fn processes_of_uid(&self, uid: u32) -> Vec<Row> {
-        self.rows::<Row>(
-            &format!("SELECT {COLUMNS} FROM processes WHERE uid = ? ORDER BY pid"),
-            vec![int(uid)],
-        )
-    }
-    /// Every process of every namespace, as root's /proc shows them.
-    pub fn all_processes(&self) -> Vec<Row> {
-        self.rows::<Row>(
-            &format!("SELECT {COLUMNS} FROM processes ORDER BY pid"),
-            vec![],
-        )
-    }
     /// Start (or replace) the process `pid` with the image and credentials given, returning the
     /// token its calls carry. `sid` is the browser session the image's descriptor belongs to.
     #[allow(clippy::too_many_arguments)]
@@ -266,6 +253,7 @@ impl Db {
         env: &[String],
         cwd: &str,
         cgroup: Option<&str>,
+        seat: Option<&str>,
         umask: u16,
         now: u64,
     ) -> Result<Exec> {
@@ -329,6 +317,11 @@ impl Db {
                 if existing.zombie() {
                     return Err(abi::Errno::ESRCH.into());
                 }
+                // Only one's own process may be replaced (root's any but init): another
+                // account's, or init, is not the caller's to take over.
+                if pid == INIT || (cred.id != 0 && existing.uid != cred.id) {
+                    return Err(abi::Errno::EPERM.into());
+                }
                 pid
             }
             None => self.new_pid(ns)?,
@@ -339,7 +332,7 @@ impl Db {
             // with the exec, not only when the process ends.
             self.close_proc_fds(ns, pid);
             self.run(
-                "UPDATE processes SET uid = ?, gid = ?, groups = ?, umask = ?, cgroup = ?, path = ?, argv = ?, env = ?, cwd = ?, state = 'running', status = 0, signal = NULL, token = ?, started = ?, ended = 0 WHERE ns = ? AND pid = ?",
+                "UPDATE processes SET uid = ?, gid = ?, groups = ?, umask = ?, cgroup = ?, path = ?, argv = ?, env = ?, cwd = ?, state = 'running', status = 0, signal = NULL, token = ?, started = ?, ended = 0, seat = COALESCE(?, seat) WHERE ns = ? AND pid = ?",
                 vec![
                     int(cred.id),
                     int(cred.group),
@@ -352,6 +345,7 @@ impl Db {
                     text(cwd),
                     text(&crate::auth::token_hash(&token)),
                     int(now),
+                    seat.map_or(SqlStorageValue::Null, text),
                     text(ns),
                     int(pid),
                 ],
@@ -359,7 +353,7 @@ impl Db {
         } else {
             let ppid = INIT;
             self.run(
-                "INSERT INTO processes(ns, pid, ppid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, token, started, ended) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 0, NULL, ?, ?, 0)",
+                "INSERT INTO processes(ns, pid, ppid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, token, started, ended, seat) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 0, NULL, ?, ?, 0, ?)",
                 vec![
                     text(ns),
                     int(pid),
@@ -375,6 +369,7 @@ impl Db {
                     text(cwd),
                     text(&crate::auth::token_hash(&token)),
                     int(now),
+                    seat.map_or(SqlStorageValue::Null, text),
                 ],
             );
         }
@@ -412,11 +407,17 @@ impl Db {
         })
     }
     fn new_pid(&mut self, ns: &str) -> Result<u32> {
+        #[derive(Deserialize)]
+        struct Alive {
+            n: usize,
+        }
         let alive = self
-            .processes(ns)
-            .iter()
-            .filter(|row| !row.zombie())
-            .count();
+            .rows::<Alive>(
+                "SELECT COUNT(*) AS n FROM processes WHERE ns = ? AND state != 'zombie'",
+                vec![text(ns)],
+            )
+            .first()
+            .map_or(0, |row| row.n);
         if alive >= PROC_MAX {
             return Err(abi::Errno::EAGAIN.into());
         }
@@ -514,8 +515,9 @@ impl Db {
         self.close_proc_fds(ns, pid);
         Ok(row.proc())
     }
-    /// kill(2) in the namespace: SIGKILL and SIGTERM end the process; SIGSTOP stops it;
-    /// SIGCONT resumes it. A signal from another account needs root.
+    /// kill(2) in the namespace, by each signal's default action (a process here installs no
+    /// handlers): SIGHUP, SIGINT, SIGQUIT, SIGKILL, SIGPIPE and SIGTERM end the process;
+    /// SIGSTOP and SIGTSTP stop it; SIGCONT resumes it. A signal from another account needs root.
     pub fn kill(
         &mut self,
         ns: &str,
@@ -532,7 +534,7 @@ impl Db {
             return Err(abi::Errno::ESRCH.into());
         }
         match signal {
-            SIGKILL | SIGTERM => {
+            SIGHUP | SIGINT | SIGQUIT | SIGKILL | SIGPIPE | SIGTERM => {
                 let wait = abi::signal_status(signal);
                 self.run(
                     "UPDATE processes SET state = 'zombie', status = ?, signal = ?, ended = ? WHERE ns = ? AND pid = ?",
@@ -547,7 +549,7 @@ impl Db {
                 self.close_proc_fds(ns, pid);
                 Ok(())
             }
-            SIGSTOP => {
+            SIGSTOP | SIGTSTP => {
                 self.run(
                     "UPDATE processes SET state = 'stopped' WHERE ns = ? AND pid = ?",
                     vec![text(ns), int(pid)],
@@ -591,8 +593,13 @@ impl Db {
         .next()
     }
     fn ensure_cgroup(&mut self, ns: &str, path: &str, now: u64) {
-        let parent = terminal_worker_core::parent(path);
-        let parent = if path == "/" { "/" } else { parent };
+        // The root's parent is the empty string, so that it is nobody's child, its own included
+        // (a listing of "/" would otherwise name "/" among its children).
+        let parent = if path == "/" {
+            ""
+        } else {
+            terminal_worker_core::parent(path)
+        };
         if self.cgroup(ns, path).is_none() {
             self.run(
                 "INSERT INTO cgroups(ns, path, parent, controllers, cpu_max, cpu_weight, memory_max, pids_max, io_max, freeze, devices) VALUES(?, ?, ?, '', NULL, 100, NULL, NULL, NULL, 0, '')",
@@ -648,14 +655,16 @@ impl Db {
         match key {
             "cpu.max" => {
                 let value = value.trim();
-                if value != "max" {
-                    let parts: Vec<&str> = value.split_whitespace().collect();
-                    if parts.len() != 2
-                        || parts[0].parse::<u64>().is_err()
-                        || parts[1].parse::<u64>().is_err()
-                    {
-                        return Err(abi::Errno::EINVAL.into());
-                    }
+                // cgroup v2's "$MAX [$PERIOD]": a quota or "max", and a period, if given.
+                let parts: Vec<&str> = value.split_whitespace().collect();
+                let quota = parts
+                    .first()
+                    .is_some_and(|quota| *quota == "max" || quota.parse::<u64>().is_ok());
+                let period = parts
+                    .get(1)
+                    .is_none_or(|period| period.parse::<u64>().is_ok());
+                if !quota || !period || parts.len() > 2 {
+                    return Err(abi::Errno::EINVAL.into());
                 }
                 updated.cpu_max = Some(value.to_string());
             }

@@ -1,12 +1,7 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { api, mkdirp, program, put, rmrf } from './sys.js';
-// The Files go to `path` of their own: its location typed (files.rs).
-async function browse(page, path) {
-  const location = page.getByRole('textbox', { name: 'Location' });
-  await location.fill(path); await location.press('Enter');
-  await expect(location).toHaveValue(path);
-}
+import { browse, promptPath } from './ui.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -74,7 +69,7 @@ test('removing a file another device is uploading stops that upload, as rm does 
     const input = page.getByRole('combobox', { name: 'Terminal command' });
     await expect(page.locator('.busy')).toHaveText('↵');
     await input.fill('cd ' + base); await input.press('Enter');
-    await expect(page.locator('label[for=command] .prompt-path')).toHaveText(base);
+    await expect(promptPath(page)).toHaveText(base);
     await browse(page, base);
     // Slow chunks leave the other device time to remove the file.
     // A chunk the stopped upload aborted meanwhile is handled already, and continues nowhere.

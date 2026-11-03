@@ -229,8 +229,8 @@ function followAgain(name, presentation, sound) {
 // A speaker view, which a deck's S opened (viewer.rs): it shows the deck its address names once
 // the terminal runs.
 export function started() {
-  // The browser's client kernel: one SharedWorker per browser, its PID 1 this page's boot.
-  // A browser without SharedWorkers still runs the page; its commands then cannot execve.
+  // The client kernel: the browser's SharedWorker, or, where a browser has none, this tab's own
+  // dedicated Worker (web/kernel/protocol.js).
   void kernelCall('init').catch(() => {});
   const files = $('window-files');
   if (files) new ResizeObserver(measureNames).observe(files);
@@ -385,7 +385,7 @@ let uploading = null;
 // the batch and removes the unfinished file.
 async function uploadFiles(files, path, progress) {
   if (!files.length) return [];
-  if (uploading) throw new Error('An upload is already in progress in another tab; wait for it, or cancel it there');
+  if (uploading) throw new Error('An upload is already going on in this page; wait for it, or cancel it');
   const controller = uploading = new AbortController();
   const results = [];
   try {
@@ -936,7 +936,7 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.terminal = { config: () => configuration.branding, exec, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
+window.terminal = { config: () => configuration.branding, exec, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionFocus: (value, insideQuote) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]:modal')) return;

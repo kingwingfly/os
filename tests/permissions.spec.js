@@ -2,6 +2,7 @@ import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { api, call, entry, errno, mkdirp, program, put, rmrf, sys } from './sys.js';
+import { promptPath } from './ui.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const password = 'testing-long-passphrase-8274';
@@ -222,7 +223,7 @@ test('terminal account workflow uses password dialogs, su homes and a caller-aut
   await expect(page.locator('.lock')).toContainText('root');
   await run('useradd -m -G wheel '+username);await expect(last()).toContainText('Created user');
   await run('passwd '+username);await page.getByLabel('New password',{exact:true}).fill(password);await page.getByLabel('Confirm new password',{exact:true}).fill(password);await page.locator('#auth button[type=submit]').click();await expect(last()).toContainText('Password updated');
-  await run('su - '+username);await expect(page.locator('label[for=command] .prompt-path')).toContainText(home);await expect(page.locator('.lock')).toContainText(username);
+  await run('su - '+username);await expect(promptPath(page)).toContainText(home);await expect(page.locator('.lock')).toContainText(username);
   await run('pwd');await expect(last()).toHaveText(home);
   // Silent on success, as GNU's are; ls -l shows what they did.
   await run('mkdir secrets');await run('chmod 700 secrets');
@@ -234,13 +235,13 @@ test('terminal account workflow uses password dialogs, su homes and a caller-aut
   await run('sudo -u root');
   await expect(page.locator('#auth-title')).toContainText('sudo');
   await page.getByLabel('Password',{exact:true}).fill(password);await page.locator('#auth button[type=submit]').click();
-  await expect(page.locator('.lock')).toContainText('root');await expect(page.locator('label[for=command] .prompt-path')).toContainText('/root');
+  await expect(page.locator('.lock')).toContainText('root');await expect(promptPath(page)).toContainText('/root');
   await run('whoami');await expect(last()).toHaveText('root');
-  await run('exit');await expect(page.locator('.lock')).toContainText('guest');await expect(page.locator('label[for=command] .prompt-path')).not.toContainText(home);
+  await run('exit');await expect(page.locator('.lock')).toContainText('guest');await expect(promptPath(page)).not.toContainText(home);
   expect(await page.locator('.transcript').innerText()).not.toContain(password);
   // Login as a non-root user through the same modal; su - selects their home.
-  await run('su - '+username);await page.getByLabel('Password',{exact:true}).fill(password);await page.locator('#auth button[type=submit]').click();await expect(page.locator('label[for=command] .prompt-path')).toContainText(home);
-  await run('cd ~');await expect(page.locator('label[for=command] .prompt-path')).toContainText(home);
+  await run('su - '+username);await page.getByLabel('Password',{exact:true}).fill(password);await page.locator('#auth button[type=submit]').click();await expect(promptPath(page)).toContainText(home);
+  await run('cd ~');await expect(promptPath(page)).toContainText(home);
   await run('exit');await expect(page.locator('.lock')).toContainText('guest');
   await run('sudo users');await expect(last()).toContainText('guest cannot use sudo');
   await expect(page.locator('#auth')).not.toBeVisible();

@@ -101,7 +101,7 @@ const SCHEMA: [&str; 36] = [
     // Processes (procs.rs): the namespace they run in, their parent and credentials, cgroup,
     // image, argument vector and environment, state, and the token their calls carry. A
     // process that ended waits as a zombie until its parent reaps it.
-    "CREATE TABLE IF NOT EXISTS processes(ns TEXT NOT NULL, pid INTEGER NOT NULL, ppid INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, groups TEXT NOT NULL, umask INTEGER NOT NULL, cgroup TEXT NOT NULL, path TEXT NOT NULL, argv TEXT NOT NULL, env TEXT NOT NULL, cwd TEXT NOT NULL, state TEXT NOT NULL, status INTEGER NOT NULL DEFAULT 0, signal INTEGER, token TEXT NOT NULL, started INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(ns, pid))",
+    "CREATE TABLE IF NOT EXISTS processes(ns TEXT NOT NULL, pid INTEGER NOT NULL, ppid INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, groups TEXT NOT NULL, umask INTEGER NOT NULL, cgroup TEXT NOT NULL, path TEXT NOT NULL, argv TEXT NOT NULL, env TEXT NOT NULL, cwd TEXT NOT NULL, state TEXT NOT NULL, status INTEGER NOT NULL DEFAULT 0, signal INTEGER, token TEXT NOT NULL, started INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0, seat TEXT, PRIMARY KEY(ns, pid))",
     "CREATE INDEX IF NOT EXISTS processes_token ON processes(token)",
     "CREATE INDEX IF NOT EXISTS processes_ns ON processes(ns)",
     // cgroup v2's hierarchy per namespace: its subtree, controllers, and control files.
@@ -247,6 +247,13 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     if sql.exec("SELECT token FROM fds LIMIT 0", None).is_err() {
         sql.exec("ALTER TABLE fds ADD COLUMN token TEXT", None)?;
         sql.exec("CREATE INDEX IF NOT EXISTS fds_token ON fds(token)", None)?;
+    }
+    // Processes made before they said which tab ran them have no seat.
+    if sql
+        .exec("SELECT seat FROM processes LIMIT 0", None)
+        .is_err()
+    {
+        sql.exec("ALTER TABLE processes ADD COLUMN seat TEXT", None)?;
     }
     // Descriptors made before they said as whom they were opened were not opened as root.
     if sql.exec("SELECT root FROM fds LIMIT 0", None).is_err() {
@@ -846,6 +853,14 @@ impl Db {
         self.run(
             "UPDATE fds SET root = 1 WHERE sid = ? AND fd = ?",
             vec![text(sid), int(fd)],
+        );
+    }
+    /// Make the descriptor `fd` of `sid` the process `proc`'s ("ns pid"): it answers that
+    /// process alone, and closes as it ends.
+    pub fn set_fd_proc(&mut self, sid: &str, fd: u32, proc: &str) {
+        self.run(
+            "UPDATE fds SET proc = ? WHERE sid = ? AND fd = ?",
+            vec![text(proc), text(sid), int(fd)],
         );
     }
     /// Give the read descriptor `fd` of `sid` the token `token`.
@@ -1801,12 +1816,17 @@ impl Store for Db {
             .pop()
             .map(UserRow::pair)
             .or_else(|| {
-                self.guest_by_uid(id)
+                // Only a uid of the guests' range is a guest's: no query for the rest.
+                terminal_worker_core::permissions::is_guest_id(id)
+                    .then(|| self.guest_by_uid(id))
+                    .flatten()
                     .map(|guest| (guest.name(), guest.user()))
             })
     }
     fn username(&self, id: u32) -> String {
-        if let Some(guest) = self.guest_by_uid(id) {
+        if terminal_worker_core::permissions::is_guest_id(id)
+            && let Some(guest) = self.guest_by_uid(id)
+        {
             return guest.name();
         }
         if id == GUEST {

@@ -1,6 +1,7 @@
 import { test, expect, request } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { api, entry, program, put } from './sys.js';
+import { browse } from './ui.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const password = 'shell-testing-password-621';
@@ -102,8 +103,9 @@ test('touch integrates with completion, help, preview and editing extensionless 
   await run(page,'touch README notes.md');
   await expect.poll(async () => await entry(f.user, f.home + '/README')).not.toBeNull();
   // The Files keep a directory of their own (7db1224): go where the shell made the file.
-  await page.getByLabel('Location').fill(f.home); await page.getByLabel('Location').press('Enter');
-  await expect(page.locator('.filename').filter({hasText:'README'})).toBeVisible();
+  await browse(page, f.home);
+  // Exactly the file made: a string would match the seeded /readme.txt too, case aside.
+  await expect(page.locator('.filename').filter({hasText:/^README$/})).toBeVisible();
   await run(page,'vim README');await expect(page.locator('.cm-content')).toBeVisible();await page.locator('.cm-content').fill('hello terminal');await page.keyboard.press('Control+s');await expect(page.locator('#editor-status')).toHaveText('Saved');await page.keyboard.press('Escape');
   await run(page,'touch README');await expect(page.locator('.busy')).toHaveText('↵');
   await run(page,'open README');await expect(page.locator('.text-preview')).toHaveText('hello terminal');await page.getByRole('button',{name:'Close preview'}).click();

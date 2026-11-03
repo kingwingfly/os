@@ -50,6 +50,9 @@ globalThis.wasixGuest = {
     } else {
       instance = new WebAssembly.Instance(source.module, importsFor(child));
       memory = instance.exports.memory;
+      // The parent's memory may have grown past what a new instance starts with.
+      const grown = (source.memory.buffer.byteLength - memory.buffer.byteLength) / 65536;
+      if (grown > 0) memory.grow(grown);
       new Uint8Array(memory.buffer).set(new Uint8Array(source.memory.buffer));
     }
     instance.exports.__stack_pointer.value = stackPointer;

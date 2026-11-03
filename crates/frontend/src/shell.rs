@@ -196,6 +196,18 @@ async fn sleep(ms: i32) {
     });
     let _ = JsFuture::from(promise).await;
 }
+/// The path `typed` names from the directory `cwd`: `~` and `~/` from the account's `home`, as
+/// a shell expands them. The shell and the Files' location go by it alike.
+pub(crate) fn located(cwd: &str, home: &str, typed: &str) -> Result<String, String> {
+    let expanded = if typed == "~" {
+        home.to_string()
+    } else if let Some(rest) = typed.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        typed.into()
+    };
+    resolve(cwd, &expanded)
+}
 /// Call `object`'s method `name` with `argument`, as JavaScript would.
 fn call(object: &JsValue, name: &str, argument: &JsValue) {
     if let Some(method) = js_sys::Reflect::get(object, &JsValue::from_str(name))
@@ -407,7 +419,17 @@ impl Shell {
     }
     /// Learn the account again, which a command may have changed, and let the Files list their
     /// directory again, which it may have changed too.
+    /// What a command changed shows: the account, as the kernel says it now, and the Files.
     pub async fn refresh(self) -> Result<(), String> {
+        self.refresh_account().await;
+        if let Some(files) = crate::files::files() {
+            files.refresh();
+        }
+        Ok(())
+    }
+    /// The account, as the kernel says it now (getcreds): every tab's, as the browser session
+    /// is.
+    pub async fn refresh_account(self) {
         if let Ok(creds) =
             userland::sys::call::<abi::Creds>(&crate::sys::HttpSys::default(), abi::Call::Getcreds)
                 .await
@@ -416,20 +438,13 @@ impl Shell {
             self.account.username.set(creds.user);
             self.account.home.set(creds.home);
         }
-        if let Some(files) = crate::files::files() {
-            files.refresh();
-        }
-        Ok(())
     }
     pub fn path(self, value: &str) -> Result<String, String> {
-        let expanded = if value == "~" {
-            self.account.home.get_untracked()
-        } else if let Some(rest) = value.strip_prefix("~/") {
-            format!("{}/{rest}", self.account.home.get_untracked())
-        } else {
-            value.into()
-        };
-        resolve(&self.cwd.get_untracked(), &expanded)
+        located(
+            &self.cwd.get_untracked(),
+            &self.account.home.get_untracked(),
+            value,
+        )
     }
     fn cancelled(self) -> bool {
         self.cancelled.get_untracked()

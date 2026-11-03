@@ -14,7 +14,7 @@ use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 
 use super::{LogLine, Output, Shell, js_message};
-use crate::{choose_files, enterable, open_file, record_sound, set_directory, stat, upload_files};
+use crate::{choose_files, enterable, open_file, record_sound, set_directory, stat};
 
 /// A command the tab runs.
 pub trait TerminalCommand: Sync {
@@ -461,22 +461,10 @@ impl TerminalCommand for Upload {
             // A line that follows the upload, here rather than over the page.
             let line = RwSignal::new(String::from("↑ starting"));
             shell.push(LogLine::Live(line));
-            let progress = Closure::<dyn Fn(String)>::new(move |text: String| line.set(text));
             shell.uploading.set(true);
-            let result = JsFuture::from(upload_files(
-                &files,
-                &path,
-                progress.as_ref().unchecked_ref(),
-            ))
-            .await;
+            let result = crate::uploads::upload(&files, &path, move |text| line.set(text)).await;
             shell.uploading.set(false);
-            drop(progress);
-            let results: Vec<String> = result
-                .map_err(js_message)
-                .inspect_err(|e| line.set(format!("✕ {e}")))?
-                .dyn_into::<js_sys::Array>()
-                .map(|a| a.iter().filter_map(|r| r.as_string()).collect())
-                .unwrap_or_default();
+            let results = result.inspect_err(|e| line.set(format!("✕ {e}")))?;
             let failed = results.iter().any(|r| r.starts_with('✕'));
             line.set(results.join("\n"));
             shell.refresh().await?;

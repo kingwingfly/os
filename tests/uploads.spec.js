@@ -2,12 +2,7 @@ import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { api, call, descriptors, errno, listing, mkdirp, rmrf, sys } from './sys.js';
-// The Files go to `path` of their own: its location typed (files.rs).
-async function browse(page, path) {
-  const location = page.getByRole('textbox', { name: 'Location' });
-  await location.fill(path); await location.press('Enter');
-  await expect(location).toHaveValue(path);
-}
+import { browse } from './ui.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const CHUNK = 8 * 1024 * 1024;
