@@ -203,25 +203,38 @@ const WAIT_CHILD = `(i32.store8 (i32.const 2064) (i32.const 1))
     (i32.store (i32.const 2068) (i32.load (i32.const 2060)))
     (drop (call $join (i32.const 2064) (i32.const 0) (i32.const 2080)))`;
 // The child says "child" and exits 7; the parent waits for it, and says "parent 7" if its
-// status says it exited 7, else "wrong".
-const FORK_WAIT = wasix(`${FORK} ${JOIN}`, `
+// status says it exited 7, else "wrong". Then, rewound from the fork, it asks the kernel (a
+// stat of /usr/bin/coreutils, which JSPI suspends it on), and says "stat" if it is there.
+const FORK_WAIT = wasix(`${FORK} ${JOIN}
+  (import "wasix_32v1" "path_filestat_get" (func $stat (param i32 i32 i32 i32 i32) (result i32)))`, `
     (drop (call $fork (i32.const 1) (i32.const 2060)))
     (if (i32.eqz (i32.load (i32.const 2060)))
       (then (call $say (i32.const 1024) (i32.const 6)) (call $exit (i32.const 7))))
     ${WAIT_CHILD}
     (if (i32.and (i32.eq (i32.load8_u (i32.const 2080)) (i32.const 1)) (i32.eq (i32.load16_u (i32.const 2082)) (i32.const 7)))
       (then (call $say (i32.const 1040) (i32.const 9)))
-      (else (call $say (i32.const 1056) (i32.const 6))))`,
-'(data (i32.const 1024) "child\\n") (data (i32.const 1040) "parent 7\\n") (data (i32.const 1056) "wrong\\n")');
-// The child executes coreutils' echo; the parent waits, and says "parent".
+      (else (call $say (i32.const 1056) (i32.const 6))))
+    (if (i32.eqz (call $stat (i32.const 3) (i32.const 1) (i32.const 1104) (i32.const 17) (i32.const 3000)))
+      (then (call $say (i32.const 1072) (i32.const 5))))`,
+'(data (i32.const 1024) "child\\n") (data (i32.const 1040) "parent 7\\n") (data (i32.const 1056) "wrong\\n") (data (i32.const 1072) "stat\\n") (data (i32.const 1104) "usr/bin/coreutils")');
+// The child executes coreutils' echo, by its bare name, as PATH finds it (a stat for each of
+// PATH's directories, which JSPI suspends it on, before the image is replaced); the parent waits,
+// and says "parent". A second child executes a name PATH has not: it ends with 127, as a shell's
+// child does, and its parent says "missing" if its status says so.
 const FORK_EXEC = wasix(`${FORK} ${JOIN}
   (import "wasix_32v1" "proc_exec" (func $exec (param i32 i32 i32 i32)))`, `
     (drop (call $fork (i32.const 1) (i32.const 2060)))
     (if (i32.eqz (i32.load (i32.const 2060)))
-      (then (call $exec (i32.const 1024) (i32.const 18) (i32.const 1104) (i32.const 23))))
+      (then (call $exec (i32.const 1104) (i32.const 9) (i32.const 1104) (i32.const 23))))
     ${WAIT_CHILD}
-    (call $say (i32.const 1200) (i32.const 7))`,
-'(data (i32.const 1024) "/usr/bin/coreutils") (data (i32.const 1104) "coreutils\\necho\\nexecuted") (data (i32.const 1200) "parent\\n")');
+    (call $say (i32.const 1200) (i32.const 7))
+    (drop (call $fork (i32.const 1) (i32.const 2060)))
+    (if (i32.eqz (i32.load (i32.const 2060)))
+      (then (call $exec (i32.const 1300) (i32.const 15) (i32.const 1300) (i32.const 15))))
+    ${WAIT_CHILD}
+    (if (i32.and (i32.eq (i32.load8_u (i32.const 2080)) (i32.const 1)) (i32.eq (i32.load16_u (i32.const 2082)) (i32.const 127)))
+      (then (call $say (i32.const 1216) (i32.const 8))))`,
+'(data (i32.const 1104) "coreutils\\necho\\nexecuted") (data (i32.const 1200) "parent\\n") (data (i32.const 1216) "missing\\n") (data (i32.const 1300) "no-such-program")');
 // A pipe: the child writes into it and exits; the parent closes its writing end, reads what
 // came, says it, and waits.
 const FORK_PIPE = wasix(`${FORK} ${JOIN}
@@ -295,6 +308,21 @@ async function uploads(request, files) {
   }
 }
 const last = page => page.locator('.transcript pre').last();
+// How a page's processes ask the kernel, as the browser sends it: by fetch, suspended on it
+// (JSPI), or by synchronous XHR.
+function processCalls(page) {
+  const kinds = new Set();
+  page.context().on('request', request => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/sys' && (request.postData() ?? '').includes('"proc":')) kinds.add(request.resourceType());
+  });
+  return kinds;
+}
+// A browser without JSPI, as a process's Worker sees it.
+const withoutJspi = page => page.route('**/wasi-process.js', async route => {
+  const response = await route.fetch();
+  await route.fulfill({ response, body: 'delete WebAssembly.Suspending; delete WebAssembly.promising;\n' + await response.text() });
+});
+const hasJspi = page => page.evaluate(() => typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function');
 
 test.describe('fork in the terminal', () => {
   test.afterEach(async ({ request }) => { if (base) await rmrf(request, base); });
@@ -302,15 +330,20 @@ test.describe('fork in the terminal', () => {
   // Each way a process makes its calls (request 4): suspended on fetch (JSPI), where the browser
   // has it, and by synchronous XHR, where it does not.
   for (const jspi of [true, false]) test(`an uploaded module that forks (${jspi ? 'JSPI' : 'synchronous XHR'}): the child runs in a process of its own, and its parent waits for its status`, async ({ page, request }) => {
-    if (!jspi) await page.addInitScript(() => { window.terminalJspi = false; });
+    if (!jspi) await withoutJspi(page);
+    const calls = processCalls(page);
     await uploads(request, { 'fork-wait': FORK_WAIT, 'fork-exec': FORK_EXEC, 'fork-pipe': FORK_PIPE, jump: JUMP });
     await page.goto('/');
+    test.skip(jspi && !await hasJspi(page), 'this browser has no JSPI');
     await command(page, `cd ${base}`);
     await command(page, './fork-wait');
-    await expect(last(page)).toHaveText('child\nparent 7');
+    await expect(last(page)).toHaveText('child\nparent 7\nstat');
     // fork, then execve in the child: its image replaced, its pid kept, its parent waiting.
     await command(page, './fork-exec');
-    await expect(last(page)).toHaveText('executed\nparent');
+    const transcript = page.locator('.transcript');
+    await expect(transcript).toContainText('executed\nparent');
+    await expect(transcript).toContainText('no-such-program: No such file or directory');
+    await expect(last(page)).toHaveText('missing');
     // A pipe between them: what the child wrote, then the end of file once it closed.
     await command(page, './fork-pipe');
     await expect(last(page)).toHaveText('through pipe\neof');
@@ -320,10 +353,8 @@ test.describe('fork in the terminal', () => {
     // Nothing of them is left in the machine: every child was waited for.
     await command(page, 'ps');
     await expect(last(page)).not.toContainText('fork-');
-    // They made their calls the way asked.
-    const engines = await page.evaluate(() => window.processEngines);
-    expect(engines[jspi ? 'jspi' : 'sync']).toBeGreaterThan(0);
-    expect(engines[jspi ? 'sync' : 'jspi']).toBe(0);
+    // Their calls to the kernel went as the browser can make them.
+    expect([...calls]).toEqual([jspi ? 'fetch' : 'xhr']);
   });
 
   test('a forked child is of its parent\'s job: Ctrl+C ends both; an orphan is init\'s, and reaped as it ends', async ({ page, request }) => {

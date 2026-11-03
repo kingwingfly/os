@@ -1,24 +1,29 @@
 // A process (owner's design, 2026-10-29: the page is user space, the API its system calls): a
 // program built for wasm32-wasip1, or for WASIX, run in a Worker of its own. Its WASI calls are
 // made here over the kernel's (POST /api/sys, GET /api/file, PUT /api/pwrite), and block, as a
-// program's calls do: where the engine can suspend the image on a promise (JSPI: the imports
-// are WebAssembly.Suspending, `_start` WebAssembly.promising), a call that asks the kernel is a
-// fetch the image waits on, and the Worker waits on nothing; elsewhere, a synchronous XHR (change
-// request 4). The code is the same for both: what may ask the kernel is a generator that yields
-// its requests (`request`), and `drive` sends them. `terminal.sys` reaches the kernel's own
-// calls, which WASI has no words for (modes, owners, ACLs, devices, accounts).
-// WASIX's (`wasix_32v1`) are WASI's and a process's own: fork, execve, wait, pipe, dup, the
-// working directory, setjmp and longjmp (phase 3).
+// program's calls do (change request 4): where the engine can suspend the image on a promise
+// (JSPI: the imports that may ask the kernel are WebAssembly.Suspending, `_start` runs
+// WebAssembly.promising), a call that asks the kernel is a fetch the image is suspended on, and
+// the Worker is free while it is answered; elsewhere, and for an image with a start function
+// (which runs as it is instantiated, outside promising), a synchronous XHR. The code is the same
+// for both: what may ask the kernel is a generator that yields its requests (`request`), and
+// `drive` sends them. What waits on shared memory still blocks the Worker either way
+// (`Atomics.wait`): a pipe's read or write, a sleep, the stop word, the host's answer to a call
+// it waits on. `terminal.sys` reaches the kernel's own calls, which WASI has no words for
+// (modes, owners, ACLs, devices, accounts). WASIX's (`wasix_32v1`) are WASI's and a process's
+// own: fork, execve, wait, pipe, dup, the working directory, setjmp and longjmp (phase 3).
 //
-// Started with {module, memory, argv, env, cwd, pid, ppid, proc, umask, sudo, stdin, stdout,
-// stderr, control, channel}: standard input is {data} (bytes given whole) or {pipe} (a pipe's
-// buffer, web/wasi/pipe.js), the terminal if {tty}; standard output {pipe}, or the page's, a
-// terminal if {tty}, whose reader may close it ({closed}, a word of shared memory); standard
-// error {tty}; {control}, a word the page sets to stop it; {channel}, memory its host answers
-// its waiting calls in (wait, execve). A fork's child is started with {fork}: its parent's
-// memory, globals, descriptors and stack, rewound in it. It posts {out, fd} as it writes to the
-// page, {reading} as it waits on the terminal, {stopped} and {continued}, {fork} as it forks,
-// {host} as it asks its host, and {exit} as it ends.
+// Started with {module, memory, startSection, argv, env, cwd, pid, ppid, proc, umask, sudo,
+// stdin, stdout, stderr, control, channel}: `startSection`, the loader's word that the image has
+// a start function; standard input is {data} (bytes given whole) or {pipe} (a pipe's buffer,
+// web/wasi/pipe.js), the terminal if {tty}; standard output {pipe}, or the page's, a terminal
+// if {tty}, whose reader may close it ({closed}, a word of shared memory); standard error
+// {tty}; {control}, a word the page sets to stop it; {channel}, memory its host answers its
+// waiting calls in (wait, execve). A fork's child is started with {fork}: its parent's memory,
+// globals, descriptors and stack, rewound in it. It posts {out, fd} as it writes to the page,
+// {reading} as it waits on the terminal, {stopped} and {continued}, {fork} as it forks, {host}
+// as it asks its host, and {exit} as it ends; it is posted {forked} (a fork's answer) and
+// {image} (an execve's: module, memory, startSection, token, argv, env).
 //
 // fork(2) is binaryen's asyncify (web/wasi/fork.js): the loader adds it to an image that
 // imports fork, setjmp or longjmp, and a fork unwinds the image, copies it into a child, and
@@ -100,7 +105,11 @@ async function send({ method, url, body, headers, binary }) {
     return { status: response.status, text: binary ? '' : await response.text(), bytes: binary ? new Uint8Array(await response.arrayBuffer()) : null };
   } catch { throw new Errno(EIO); }
 }
-// Whether a call may suspend the image (JSPI: WebAssembly.Suspending and promising).
+// Whether the engine can suspend an image on a promise (JSPI: WebAssembly.Suspending and
+// promising), and whether the image running is suspended so: not one with a start function,
+// which runs as it is instantiated, outside any promising frame (a suspendable call there fails,
+// SuspendError, whatever it returns).
+const capable = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function';
 let suspending = false;
 // Run `work`, a generator of the kernel's requests, to its end: its value, at once if it asked
 // nothing (a write to the terminal, a pipe), else as the driver has it: at once by synchronous
@@ -965,7 +974,8 @@ function next(key) {
 }
 // Instantiate `module`: a memory of the type it imports (`type`), or its own; a fork's child's,
 // as large as its parent's (`snapshot`), which it becomes.
-async function instantiate(module, type, snapshot) {
+async function instantiate(module, type, snapshot, startSection = false) {
+  suspending = capable && !startSection;
   const pages = snapshot ? snapshot.memory.byteLength / 65536 : 0;
   // A module importing its memory (WASIX's do) gets one of the type it declared, so that a
   // shared or larger memory links; its own otherwise, as wasip1's, exported as `memory`.
@@ -978,6 +988,10 @@ async function instantiate(module, type, snapshot) {
   const imports = suspending
     ? { wasi_snapshot_preview1: suspendable(preview1), terminal: suspendable(terminal), wasix_32v1: suspendable(wasix), env }
     : { wasi_snapshot_preview1: preview1, terminal, wasix_32v1: wasix, env };
+  // An imported memory is this process's before the instance is: a start function, which runs
+  // as it is instantiated, may already write through it (a memory of the module's own is not
+  // there to reach until the instance is).
+  if (type) memory = env.memory;
   instance = await WebAssembly.instantiate(module, imports);
   memory = type ? env.memory : instance.exports.memory;
   if (!(memory instanceof WebAssembly.Memory)) throw new Error('the module exports no memory');
@@ -1045,7 +1059,7 @@ async function replace() {
   snapshots = new Map();
   Object.assign(process, { argv: image.argv, proc: image.token });
   environ = image.env;
-  await instantiate(image.module, image.memory);
+  await instantiate(image.module, image.memory, undefined, image.startSection);
 }
 
 
@@ -1097,9 +1111,6 @@ onmessage = ({ data }) => {
 };
 async function start(data) {
   process = { ...data, limit: data.limit ?? 10 << 20, ppid: data.ppid ?? 1 };
-  // JSPI where the engine has it, unless its host said not to (a test of the other way).
-  suspending = data.jspi !== false && typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function';
-  postMessage({ engine: suspending ? 'jspi' : 'sync' });
   control = data.control ? new Int32Array(data.control) : null;
   channel = data.channel ? { state: new Int32Array(data.channel, 0, 2), data: new Uint8Array(data.channel, 8) } : null;
   const { stdin = {}, stdout = {}, stderr = {}, fork: parent } = data;
@@ -1121,7 +1132,7 @@ async function start(data) {
       install(2, { kind: 'out', fd: 2, tty: !!stderr.tty }, true);
       install(3, { kind: 'dir', path: '/' });
     }
-    await instantiate(data.module, data.memory, parent?.snapshot);
+    await instantiate(data.module, data.memory, parent?.snapshot, data.startSection);
     // The child returns from fork with 0.
     if (parent) engine.rewind({ pid: 0 });
     code = await run();

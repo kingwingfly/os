@@ -101,14 +101,32 @@ test('an uploaded wasm runs by its path, with the working directory, environment
   await expect(busy).toHaveText('↵', { timeout: 5_000 });
 });
 
+// How a page's processes ask the kernel, as the browser sends it: by fetch, suspended on it
+// (JSPI), or by synchronous XHR.
+function processCalls(page) {
+  const kinds = new Set();
+  page.context().on('request', request => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/sys' && (request.postData() ?? '').includes('"proc":')) kinds.add(request.resourceType());
+  });
+  return kinds;
+}
+// A browser without JSPI, as a process's Worker sees it.
+const withoutJspi = page => page.route('**/wasi-process.js', async route => {
+  const response = await route.fetch();
+  await route.fulfill({ response, body: 'delete WebAssembly.Suspending; delete WebAssembly.promising;\n' + await response.text() });
+});
+const hasJspi = page => page.evaluate(() => typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function');
+
 for (const jspi of [true, false]) test(`a process writes a file larger than a batch carries, through its own descriptor (${jspi ? 'JSPI' : 'synchronous XHR'})`, async ({ page, request }) => {
   // Past abi::INLINE_MAX (256 KiB), a process's write goes as a chunk (PUT /api/pwrite, with
   // its token): the descriptor is its own, as its credentials name it. Its calls are fetches
   // its image is suspended on (JSPI), or, where the browser has no JSPI, synchronous requests.
-  if (!jspi) await page.addInitScript(() => { window.terminalJspi = false; });
+  if (!jspi) await withoutJspi(page);
+  const calls = processCalls(page);
   const big = 'abcdefghijklmnopqrstuvwxyz0123456789\n'.repeat(10_000);
   expect((await put(request, file(`${base}/big.txt`), { headers, data: big })).status()).toBe(201);
   await terminal(page);
+  test.skip(jspi && !await hasJspi(page), 'this browser has no JSPI');
   await run(page, './coreutils cp big.txt copy.txt');
   await expect(page.locator('.transcript')).not.toContainText('Bad file descriptor');
   expect(await (await request.get(file(`${base}/copy.txt`))).text()).toBe(big);
@@ -117,9 +135,33 @@ for (const jspi of [true, false]) test(`a process writes a file larger than a ba
   await expect(page.locator('.transcript pre').last()).toHaveText('abcdefghijklmnopqrstuvwxyz0123456789');
   await run(page, './coreutils cat copy.txt | ./coreutils wc -l');
   await expect(page.locator('.transcript pre').last()).toHaveText('10000');
-  const engines = await page.evaluate(() => window.processEngines);
-  expect(engines[jspi ? 'jspi' : 'sync']).toBeGreaterThan(0);
-  expect(engines[jspi ? 'sync' : 'jspi']).toBe(0);
+  expect([...calls]).toEqual([jspi ? 'fetch' : 'xhr']);
+});
+
+test('an image with a start function runs it as it is instantiated, by synchronous requests', async ({ page, request }) => {
+  // A start section runs inside WebAssembly.instantiate, outside JSPI's promising frame, where
+  // no call may suspend: such an image makes its calls by synchronous XHR, JSPI or not. Its
+  // start function writes through the memory it imports, as WASIX's do.
+  const started = assemble(`(module
+    (import "env" "memory" (memory 1 2))
+    (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "path_filestat_get" (func $stat (param i32 i32 i32 i32 i32) (result i32)))
+    (data (i32.const 1024) "started\\n") (data (i32.const 1040) "ran\\n") (data (i32.const 1056) "usr/bin/coreutils")
+    (func $say (param $ptr i32) (param $len i32)
+      (i32.store (i32.const 2048) (local.get $ptr)) (i32.store (i32.const 2052) (local.get $len))
+      (drop (call $write (i32.const 1) (i32.const 2048) (i32.const 1) (i32.const 2056))))
+    (func $begin (call $say (i32.const 1024) (i32.const 8)))
+    (start $begin)
+    (func (export "_start")
+      (if (i32.eqz (call $stat (i32.const 3) (i32.const 1) (i32.const 1056) (i32.const 17) (i32.const 3000)))
+        (then (call $say (i32.const 1040) (i32.const 4))))))`);
+  expect((await put(request, file(`${base}/started`), { headers, data: started })).status()).toBe(201);
+  expect(await call(request, { chmod: { path: `${base}/started`, mode: 0o755 } }, { headers })).toBeNull();
+  const calls = processCalls(page);
+  await terminal(page);
+  await run(page, './started');
+  await expect(page.locator('.transcript pre').last()).toHaveText('started\nran');
+  expect([...calls]).toEqual(['xhr']);
 });
 
 test('the loader and the X rule refuse as Linux refuses, with its words', async ({ page }) => {

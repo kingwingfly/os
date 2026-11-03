@@ -70,11 +70,6 @@ function release(pid) {
     if (pipe.writerGone && pipe.readerGone) pipes.delete(buffer);
   }
 }
-// How processes make their calls: suspended on fetch (JSPI) where the engine can, or by
-// synchronous XHR; a page may ask for the second (`terminalJspi = false`), as a test does. The
-// processes say which, counted here for the tests.
-const engines = { jspi: 0, sync: 0 };
-globalThis.processEngines = engines;
 // What a process's waiting call is answered with, in the memory it waits on: a JSON reply.
 const CHANNEL = 64 * 1024;
 function respond(channel, reply) {
@@ -235,7 +230,7 @@ export async function exec(stages, options = {}) {
   // A process this job hosts, in a Worker of its own: a stage's, or one a process of it forked
   // (`forked`, its start the parent's snapshot). `write` is where its output goes, as its
   // stage's does.
-  const host = ({ pid, token, ppid, module, memory, argv, write, forked, start, transfer = [] }) => {
+  const host = ({ pid, token, ppid, module, memory, startSection = false, argv, write, forked, start, transfer = [] }) => {
     const worker = new Worker('/wasi-process.js');
     const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
     let settle, status = null;
@@ -244,7 +239,7 @@ export async function exec(stages, options = {}) {
     // waiting calls are answered in.
     const control = isolated ? new Int32Array(new SharedArrayBuffer(4)) : null;
     const channel = isolated ? new SharedArrayBuffer(8 + CHANNEL) : null;
-    const process = { pid, stopped: false, ended: false, forked, exited, image: { module, memory } };
+    const process = { pid, stopped: false, ended: false, forked, exited, image: { module, memory, startSection } };
     const end = code => {
       if (status != null) return;
       status = code;
@@ -288,7 +283,7 @@ export async function exec(stages, options = {}) {
         return null;
       }
       process.image = loaded;
-      worker.postMessage({ image: { module: loaded.module, memory: loaded.memory, token: image.token, argv: args, env } });
+      worker.postMessage({ image: { module: loaded.module, memory: loaded.memory, startSection: loaded.startSection, token: image.token, argv: args, env } });
       return {};
     };
     // fork(2): a child with a pid the client kernel gives, its parent's snapshot, and its pipes'
@@ -317,12 +312,10 @@ export async function exec(stages, options = {}) {
       else if (data.truncated) truncated = true;
       else if (data.host) void answer(data.host);
       else if (data.fork) void fork(data.fork);
-      else if (data.engine) engines[data.engine] = (engines[data.engine] ?? 0) + 1;
       else if ('exit' in data) end(data.exit);
     };
     worker.onerror = event => { onOutput(2, `${argv[0]}: ${event.message}\n`); end(126); };
-    worker.postMessage({ ...start, module, memory, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: true }, control: control?.buffer, channel,
-      jspi: globalThis.terminalJspi !== false }, transfer);
+    worker.postMessage({ ...start, module, memory, startSection, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: true }, control: control?.buffer, channel }, transfer);
     // A signal, as its default action has it: ended, stopped at its next system call, or
     // continued.
     const signal = number => {
@@ -344,13 +337,13 @@ export async function exec(stages, options = {}) {
     try {
       image = await images[index];
       if (stopped) return await canceled(image);
-      const { module, memory } = await load(image).catch(error => { throw refused(argv[0], error); });
+      const { module, memory, startSection } = await load(image).catch(error => { throw refused(argv[0], error); });
       if (stopped) return await canceled(image);
       const write = (fd, text) => { if (!text) return; if (fd === 1 && !io.stdout.tty) collect(text, index === last); else onOutput(fd, text); };
       // Its pipes' ends are its own from the start: held for it before it runs.
       io.stdin.reader?.hold(image.pid, 'r');
       io.stdout.writer?.hold(image.pid, 'w');
-      const process = host({ pid: image.pid, token: image.token, ppid: 1, module, memory, argv, write, forked: false,
+      const process = host({ pid: image.pid, token: image.token, ppid: 1, module, memory, startSection, argv, write, forked: false,
         start: { env: environment, cwd, stdin: io.stdin.message, stdout: io.stdout.message } });
       processes.push(process);
       return process;
