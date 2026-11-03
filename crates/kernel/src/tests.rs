@@ -597,3 +597,35 @@ fn calls_dispatch_with_their_values_and_errors() {
     );
     assert_eq!(failed.unwrap_err().errno, Errno::ENOENT);
 }
+
+#[test]
+fn execve_runs_regular_whole_files_the_caller_may_execute() {
+    let mut fs = fs();
+    let ann = user(1000, &[]);
+    dir(&mut fs, "/bin", 0, 0o755);
+    // The owner may execute an 0700 file, and root needs an x bit too.
+    file(&mut fs, "/bin/own", 1000, 0o700);
+    assert_eq!(
+        executable(&fs, &ann, "/bin/own").unwrap().content,
+        "empty:/bin/own"
+    );
+    file(&mut fs, "/bin/closed", 1000, 0o600);
+    assert_eq!(errno(executable(&fs, &ann, "/bin/closed")), Errno::EACCES);
+    assert_eq!(
+        errno(executable(&fs, &Identity::root(), "/bin/closed")),
+        Errno::EACCES
+    );
+    // A file with no x bit for the caller is denied, even when it may read it.
+    file(&mut fs, "/bin/readable", 0, 0o644);
+    assert_eq!(errno(executable(&fs, &ann, "/bin/readable")), Errno::EACCES);
+    // x-only runs: exec reveals the image, as Linux does.
+    file(&mut fs, "/bin/xonly", 0, 0o111);
+    assert!(executable(&fs, &ann, "/bin/xonly").is_ok());
+    // A directory, a device, a link followed, and a file still uploading.
+    dir(&mut fs, "/bin/sub", 0, 0o755);
+    assert_eq!(errno(executable(&fs, &ann, "/bin/sub")), Errno::EISDIR);
+    symlink(&mut fs, &Identity::root(), "own", "/bin/link").unwrap();
+    assert_eq!(executable(&fs, &ann, "/bin/link").unwrap().path, "/bin/own");
+    fs.incomplete.insert("empty:/bin/own".into());
+    assert_eq!(errno(executable(&fs, &ann, "/bin/own")), Errno::ETXTBSY);
+}

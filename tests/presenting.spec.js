@@ -283,7 +283,7 @@ test('present makes /dev/present/NAME, which whoever may read the file follows, 
   // Readable by the presenter and by guests, as their ACL says, and by nobody else.
   const stem = 'talk' + Date.now().toString(36), talk = `${base}/${stem}.slides.md`;
   expect((await put(root, file(talk), { data: deck })).status()).toBe(201);
-  for (const args of [['chmod', '600', talk], ['setfacl', '-m', `u:${name}:r,u:guest:r`, talk], ['setfacl', '-m', `u:${name}:r,u:guest:r`, base + '/pages.pdf']]) expect((await command(args)).ok()).toBe(true);
+  for (const args of [['chmod', '600', talk], ['setfacl', '-m', `u:${name}:r,g:guest:r`, talk], ['setfacl', '-m', `u:${name}:r,g:guest:r`, base + '/pages.pdf']]) expect((await command(args)).ok()).toBe(true);
   const laptop = await device(browser, name, password), phone = await device(browser, name, password);
   const guest = await device(browser), other = await device(browser, outsider, password);
   const transcript = page => page.locator('.terminal-panel:not([hidden]) .transcript');

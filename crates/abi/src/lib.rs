@@ -49,6 +49,8 @@ pub enum Errno {
     ESTALE,
     ETIMEDOUT,
     ECANCELED,
+    ENOEXEC,
+    ECHILD,
 }
 impl Errno {
     /// What glibc's strerror says of it.
@@ -89,6 +91,8 @@ impl Errno {
             ESTALE => "Stale file handle",
             ETIMEDOUT => "Connection timed out",
             ECANCELED => "Operation canceled",
+            ENOEXEC => "Exec format error",
+            ECHILD => "No child processes",
         }
     }
 }
@@ -150,6 +154,105 @@ pub const NAME_MAX: usize = 255;
 pub const PATH_MAX: usize = 4096;
 /// How many symbolic links one path's resolution follows before it fails with ELOOP.
 pub const MAXSYMLINKS: usize = 40;
+
+/// The most one argument, all of a process's arguments, and all of its environment take, and
+/// the most its executable image may: Linux's limits, so that an uploaded module cannot ask the
+/// host to hold more than a process should.
+pub const ARG_MAX: usize = 128 * 1024;
+pub const ENV_MAX: usize = 128 * 1024;
+pub const EXEC_MAX: u64 = 128 * 1024 * 1024;
+/// The most processes a namespace runs at once (a browser is one small machine).
+pub const PROC_MAX: usize = 64;
+/// How many processes an exec may replace, or a wait reap, in one call.
+pub const PROC_POLL_MAX: usize = 256;
+
+/// Signals, as Linux numbers them: what a process may be sent, and what ended it.
+pub const SIGHUP: u8 = 1;
+pub const SIGINT: u8 = 2;
+pub const SIGQUIT: u8 = 3;
+pub const SIGKILL: u8 = 9;
+pub const SIGPIPE: u8 = 13;
+pub const SIGTERM: u8 = 15;
+pub const SIGCHLD: u8 = 17;
+pub const SIGCONT: u8 = 18;
+pub const SIGSTOP: u8 = 19;
+pub const SIGTSTP: u8 = 20;
+
+/// A process's state, as /proc/PID/status tells it: running, sleeping in a system call, stopped
+/// by a signal, or a zombie whose parent has not waited for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcState {
+    #[default]
+    Running,
+    Sleeping,
+    Stopped,
+    Zombie,
+}
+
+/// What start_execve tells the loader: the process it made or replaced, the token that process
+/// makes its calls with, how to read its image, and where it runs.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Exec {
+    pub pid: u32,
+    /// The process's token, which it sends as the batch's `proc`, with its `pid`.
+    pub token: String,
+    /// The image, as a descriptor of the process's own for a file, or an asset path for /usr.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_read: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub cgroup: String,
+}
+
+/// What fork(2)'s registry half gives: the child, and the token its calls carry.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Forked {
+    pub pid: u32,
+    pub token: String,
+}
+
+/// A process, as /proc and wait tell of it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Proc {
+    pub pid: u32,
+    pub ppid: u32,
+    pub state: ProcState,
+    /// The wait status waitpid(2) gives: exit code << 8, or the signal that ended it.
+    pub status: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<u8>,
+    pub uid: u32,
+    pub gid: u32,
+    pub cgroup: String,
+    pub path: String,
+    pub argv: Vec<String>,
+    pub started: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ended: u64,
+}
+
+/// A process's wait status, as waitpid(2) encodes it: exit code in the high byte, or the signal
+/// that ended it.
+pub fn exit_status(code: i32) -> i32 {
+    (code & 0xff) << 8
+}
+pub fn signal_status(signal: u8) -> i32 {
+    signal as i32
+}
+pub fn exited(status: i32) -> Option<i32> {
+    (status & 0x7f == 0).then_some((status >> 8) & 0xff)
+}
+pub fn signaled(status: i32) -> Option<u8> {
+    (status & 0x7f != 0 && status & 0x7f != 0x7f).then_some((status & 0x7f) as u8)
+}
 
 /// What stat(2) tells of a node.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -706,9 +809,86 @@ pub enum Call {
         argv: Vec<String>,
         cwd: String,
     },
+    /// Begin a browser's process namespace, as init does: stale processes of a boot that is gone
+    /// are reaped, and the namespace's first process may start. The caller's browser, by its
+    /// guest cookie, is the namespace; `boot` tells one page load from the next.
+    ProcInit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boot: Option<String>,
+    },
+    /// execve(2): run the executable at `path` as the process `pid` (one just forked), or, with
+    /// none, as a child of the namespace's init. The kernel checks the path, regular and whole,
+    /// and execute permission (X, not read: an x-only file runs), snapshots the caller's
+    /// credentials, and gives the loader the image's descriptor or asset and the process token.
+    Execve {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+        path: String,
+        #[serde(default)]
+        argv: Vec<String>,
+        #[serde(default)]
+        env: Vec<String>,
+        #[serde(default = "root")]
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cgroup: Option<String>,
+    },
+    /// fork(2)'s registry half: a child of `pid`, with its credentials, cgroup and descriptors
+    /// copied. The client kernel clones the guest's wasm state (asyncify snapshot).
+    Fork {
+        pid: u32,
+    },
+    /// exit(2): the calling process (its token) ends with `status`, or by `signal`. It becomes a
+    /// zombie until its parent waits for it; init reaps orphans.
+    Exit {
+        #[serde(default)]
+        status: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<u8>,
+    },
+    /// getpid(2), of the calling process.
+    Getpid,
+    /// What those processes are now, as waitid(2) with WNOHANG tells it, for the caller's
+    /// namespace and account.
+    ProcPoll {
+        #[serde(default)]
+        pids: Vec<u32>,
+    },
+    /// A cgroup of the namespace's hierarchy, as cgroup v2 makes one.
+    CgroupCreate {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controllers: Option<String>,
+    },
+    CgroupRemove {
+        path: String,
+    },
+    /// Write one of cgroup v2's control files: `cpu.max`, `cpu.weight`, `memory.max`,
+    /// `pids.max`, `io.max`, `cgroup.freeze`, `devices.allow`, `devices.deny`.
+    CgroupSet {
+        path: String,
+        key: String,
+        value: String,
+    },
+    /// Move a process into a cgroup (`cgroup.procs`).
+    CgroupAttach {
+        pid: u32,
+        path: String,
+    },
+    /// What a cgroup's control files say, and its processes.
+    CgroupStat {
+        path: String,
+    },
+    /// The cgroups below `path`, or the root's, as getdents lists a directory.
+    CgroupList {
+        #[serde(default = "root")]
+        path: String,
+    },
     /// Signal the process `pid`: it stops, between steps (SIGTERM).
     Kill {
         pid: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<u8>,
     },
     /// What the process `pid` is now, and what it wrote after line `since`, as waitid(2) with
     /// WNOHANG and a read of its output: its state (`running`, `question`, `done`, `failed`,
@@ -747,6 +927,13 @@ pub struct Batch {
     /// Whether it runs under sudo: as root, if its account may and has authenticated lately.
     #[serde(default)]
     pub sudo: bool,
+    /// The process the batch runs for, with the token its exec gave (`proc`): a process does
+    /// not act as whoever holds the browser, but as whom it was executed. A page's batch names
+    /// neither, and acts as the session's account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, rename = "proc", skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
 }
 fn umask() -> u16 {
     0o022
@@ -853,5 +1040,36 @@ mod tests {
             Error::because(Errno::EACCES, "/guest/ann is another account's home").to_string(),
             "/guest/ann is another account's home"
         );
+    }
+
+    #[test]
+    fn process_calls_carry_linuxs_values_and_old_batches_still_parse() {
+        let call: Call = serde_json::from_str(
+            r#"{"execve":{"path":"/usr/bin/coreutils","argv":["seq","3"],"env":["LANG=C"],"cwd":"/work"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            call,
+            Call::Execve {
+                pid: None,
+                path: "/usr/bin/coreutils".into(),
+                argv: vec!["seq".into(), "3".into()],
+                env: vec!["LANG=C".into()],
+                cwd: "/work".into(),
+                cgroup: None,
+            }
+        );
+        let batch: Batch =
+            serde_json::from_str(r#"{"calls":["getpid"],"proc":"ab","pid":7}"#).unwrap();
+        assert_eq!(batch.process.as_deref(), Some("ab"));
+        assert_eq!(batch.pid, Some(7));
+        let old: Batch = serde_json::from_str(r#"{"calls":[]}"#).unwrap();
+        assert_eq!((old.pid, old.process), (None, None));
+        assert_eq!(exit_status(3), 3 << 8);
+        assert_eq!(exited(3 << 8), Some(3));
+        assert_eq!(signal_status(SIGKILL), 9);
+        assert_eq!(signaled(9), Some(SIGKILL));
+        assert_eq!(signaled(3 << 8), None);
+        assert_eq!(Errno::ENOEXEC.text(), "Exec format error");
     }
 }

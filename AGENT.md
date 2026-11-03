@@ -65,6 +65,98 @@ See README for prerequisites and commands. The known toolchain uses `worker-buil
 - File creation needs parent w+x; overwriting needs file w; deletion needs parent w+x. Recursive operations validate the entire affected tree before mutation.
 - Some HTTP error classification currently matches English message fragments. Preserve 401/403/404/409 semantics when editing messages; permission/API tests cover these paths. A future typed-error refactor must preserve behavior.
 
+## Phase 0 findings (2026-11-01)
+
+The next architecture (worker kernel + browser client kernel, WASIX `execve`/`fork`, arbitrary
+uploaded wasm, live mounts, cgroups, cluster map/reduce) is recorded in issue #20. Phase 0 is the
+feasibility gate; these are its measurements, not built features.
+
+- **Browser capabilities** (`web/kernel/probe.js`, `tests/kernel-capabilities.spec.js`, Chromium
+  and Firefox under Playwright with COOP/COEP):
+  - Page: cross-origin isolated, `SharedArrayBuffer`, OffscreenCanvas; Chromium has File System
+    Access and WebGPU; Firefox headless has neither (OPFS is available in both).
+  - Dedicated Worker: isolated, SAB, `Atomics.wait`, sync XHR, cookies, nested Worker, and
+    `WebAssembly.Module` postMessage; Chromium has WebGPU.
+  - SharedWorker: **not** cross-origin isolated in either browser, so no SAB and no
+    `Atomics.wait`; sync XHR and cookies work. Chromium SharedWorkers cannot create Workers;
+    Firefox can. Therefore the client kernel's PID state lives in the SharedWorker, while
+    process hosting, SAB pipes and terminal input live in a page-owned host.
+- **WASIX surface:** the prebuilt `sharrattj/dash@1.0.19` (GNU; approved fixture) imports only
+  `wasix_32v1` (40 functions: args/env, fds, paths, pipes, clock, futex/threads,
+  `proc_fork`, `proc_exec`, `proc_join`, `proc_signal`, `stack_checkpoint`, `stack_restore`,
+  `callback_signal`) plus a shared `env.memory`. It exports `_start`, `__wasm_init_tls`,
+  `wasi_thread_start`, and the asyncify start/stop/get-state functions.
+- **Own import layer:** the Rust runtime `crates/wasix-runtime` runs
+  `dash -c 'echo hello; echo $((1+2))'` and forks a subshell
+  (`dash -c 'echo one; (echo two); echo three'`) both in Node
+  (`scripts/wasix-phase0.mjs`, `tests/wasix-phase0.test.mjs`) and in a cross-origin-isolated
+  module Worker (`web/kernel/host.js`, `tests/wasix-browser.spec.js`). The asyncify
+  `stack_checkpoint`/`stack_restore` engine and `proc_fork` are working: the parent and child
+  each rewind their own snapshot, the child gets pid 0, the parent gets the child pid, and the
+  output is `one`, `two`, `three`.
+- **Asyncify-at-load:** `tests/fixtures/wasix-fork.wat` is an uninstrumented module that imports
+  `wasix_32v1.proc_fork`; `scripts/wasix-phase0.mjs` runs binaryen's asyncify pass on it at load,
+  then the Rust runtime forks it. `tests/wasix-asyncify.test.mjs` checks the child and parent
+  output and exits. The same transform now runs in the browser Worker:
+  `web/kernel/host.js` imports `binaryen.js`, calls `parseText`/`runPasses(['asyncify'])`/
+  `emitBinary`, and `tests/wasix-browser.spec.js` forks the transformed module. The host also
+  handles modules that define their own memory (the WAT fixture) as well as ones importing
+  `env.memory` (dash).
+- **Fork gate:** Wasmer's `stack_checkpoint` captures the used stack, calls
+  `asyncify_start_unwind`, and captures the unwind stack after `_start` returns;
+  `stack_restore`/`proc_fork` call `asyncify_start_rewind` with a snapshot. The Rust runtime
+  implements this for dash in Node and in a browser Worker, and for an uninstrumented WAT
+  module after binaryen's asyncify pass in both Node and the browser. The Phase 0 fork gate is
+  met.
+- **Runtime language:** the client runtime is Rust→wasm. `crates/client-kernel` runs in the
+  SharedWorker (PID/process/cgroup/IPC state); `crates/wasix-runtime` runs in the page host
+  (`wasix_32v1` imports, asyncify checkpoint/restore/fork, waker). `web/kernel/host.js` is only
+  the browser engine/transport bridge (Workers, `WebAssembly.Module`/`Instance`, MessagePort,
+  fetch/sync XHR, FSA handles) and holds no policy. A wasm module cannot instantiate another
+  wasm module and provide its imports without an engine, so the thin JS bridge is the practical
+  boundary; embedding wasmi/Wasmtime-in-wasm is the larger pure-Rust alternative.
+- **Compio-shaped runtime:** the waker is a completion-based proactor (`submit(call) ->
+  completion`, `poll()`, `wake(pid, completion)`), not a thread-per-call model. The browser
+  implementation uses `/api/sys` batches, MessagePort and SAB; native/container executors can
+  use compio/io_uring behind the same trait later. The batch is already the submission queue; a
+  completion queue is the future-proofing hook.
+
+## Phase 1 findings (2026-11-01)
+
+The kernel split and the first process model are in place; these are built features, not
+roadmap.
+
+- **Client kernel:** `crates/client-kernel` is Rust→wasm, built `--target no-modules` and
+  imported by `web/kernel/client.js`, a classic SharedWorker. It holds the browser's process
+  token table and asks `/api/sys` through the `self.kernelSys` transport that page script
+  installs. `web/kernel/protocol.js` is the page's versioned envelope (`v: 1`, one reply per
+  request id); `web/app.js` starts it at `started()`, and `web/wasi/exec.mjs` asks it for every
+  coreutils process. Two tabs of one browser share the namespace and see each other's pids.
+- **Process registry:** `crates/worker/src/procs.rs` owns `namespaces`, `processes`, `cgroups`
+  and the process token. A namespace is the browser's guest key (`session.<key>` with no guest
+  cookie). `ProcInit` creates PID 1 and the root cgroups; a new boot id reaps what the old one
+  left running as zombies. `Execve` checks with `kernel::executable` (regular, whole, X rule,
+  root's x rule, no setuid), snapshots uid/gid/groups/umask/cgroup, and answers an asset plus a
+  64-hex token. `Fork`, `Exit`, `Wait`, `Kill`, `Getpid`, `ProcPoll` and the `Cgroup*` calls are
+  registry decisions; `/proc/PID/{status,cmdline}` projects them beside job records.
+- **Batch identity:** `abi::Batch` gains `pid` and `proc`. A process's batch runs as the
+  credentials snapshotted at exec, never as the page signed in later; it cannot login, logout,
+  sudo or change the session. Page batches omit both and keep the old meaning.
+- **Guest identity:** signed-out browsers are `guest-<uuid>:guest`, uuid the first 16 hex digits
+  of the cookie key's SHA-256, uid from 1,000,000–1,999,999 (`guests` table, `users` lookup
+  falls back to it), gid `guest`. No home is made; `HOME` is the shared `/guest` (1777 sticky);
+  `/etc/passwd` names guests and `useradd` still makes real accounts and homes. `is_guest_id`
+  distinguishes them wherever code means "signed out", not `uid == GUEST`.
+- **Cgroups:** a cgroup-v2-like hierarchy per namespace (`/init`, `/user`, `/system`, `/cluster`
+  and subtrees), with `cpu.max`, `cpu.weight`, `memory.max`, `pids.max`, `io.max`,
+  `cgroup.freeze` and `devices.allow/deny` stored and checked. Enforcement (CPU slicing,
+  memory limits, freeze at syscall boundaries) is Phase 6.
+- **What is not done yet:** uploaded wasm still answers `ENOEXEC` (Phase 2); descriptors are
+  still the browser session's, not per-process (Phase 4); the WASIX asyncify runtime is not yet
+  wired to `Fork`/`Execve` (Phase 3); there is no pty, init program, GUI device, mount or
+  cluster executor yet.
+
+
 ## Required account semantics
 
 These were explicitly chosen by the owner; do not silently replace them with full Linux semantics.
@@ -77,6 +169,9 @@ These were explicitly chosen by the owner; do not silently replace them with ful
 - Permission checks must never implicitly log guest or a normal account in as root.
 - `passwd --force` skips only the 12-character minimum. It still requires a nonempty password, at most 512 bytes, and normal identity/authorization checks.
 - Account changes revoke old sessions; a self-password change issues a new current session. Locking revokes sessions. Unlocking does not resurrect them.
+- A signed-out browser is `guest-<uuid>:guest`, not the single uid 65534: its uid comes from 1,000,000–1,999,999, it owns what it creates in the shared `/guest`, and no home is made until `useradd -m`. Use `is_guest_id` (never `uid == GUEST`) for "signed out"; `GUEST` remains the group and the fallback identity.
+- A process batch carries `pid` and `proc` (the token `Execve` answered). It runs as the credentials snapshotted at exec, with the process's umask and cgroup; it cannot login, logout, sudo or change the browser session. A page batch carries neither and keeps the old session semantics. Tokens are stored hashed.
+- `execve` requires a regular, whole file and the X permission (root too needs an x bit); setuid/setgid never elevate. `/usr` binaries answer their asset; uploaded wasm answers `ENOEXEC` until Phase 2.
 
 ## UX requirements and fragile areas
 

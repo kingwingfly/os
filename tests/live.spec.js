@@ -124,14 +124,20 @@ test('a presentation is a character device: ls -l and cat tell of it; chmod deci
     await expect(transcript(guest.page)).toContainText(`"path":"${path}"`);
     // Its mode says who follows it: chmod 600, and guests may not.
     await run(laptop.page, `chmod 600 ${device_}`);
+    await expect.poll(async () => ((await sys(guest.context.request, [{ stat: { path: device_ } }]))[0].ok?.mode ?? 0) & 0o777).toBe(0o600);
     await run(guest.page, `open ${device_}`);
     await expect(transcript(guest.page)).toContainText('Permission denied');
     await run(laptop.page, `chmod 644 ${device_}`);
+    await expect.poll(async () => ((await sys(guest.context.request, [{ stat: { path: device_ } }]))[0].ok?.mode ?? 0) & 0o777).toBe(0o644);
     await run(guest.page, `open ${device_}`);
     await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
     // An ACL entry that lets another account write it makes a co-host, whose turns are the
     // presentation's.
     await run(laptop.page, `setfacl -m u:${cohost}:rw ${device_}`);
+    await expect.poll(async () => {
+      const state = await helper.context.request.get(origin + file(device_));
+      return state.ok() && (await state.json()).device?.controller === true;
+    }).toBe(true);
     await run(helper.page, `open ${device_}`);
     await expect(shown(helper.page).locator('h1')).toHaveText('One');
     await expect(helper.page.locator('.presentation-badge')).toHaveCount(0);

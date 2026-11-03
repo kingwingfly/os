@@ -64,6 +64,11 @@ await build({ absWorkingDir: root, entryPoints: { bridge: 'web/app.js' },
 // The WASI engine's process, a Worker of its own (web/wasi/process.js), and /usr/bin's binary:
 // uutils' coreutils, built for wasm32-wasip1 (rustup target add wasm32-wasip1).
 await build({ absWorkingDir: root, entryPoints: { 'wasi-process': 'web/wasi/process.js' }, bundle: true, format: 'iife', outdir: out, minify: true });
+// The client kernel (crates/client-kernel), a classic SharedWorker: no-modules wasm-bindgen,
+// imported by web/kernel/client.js, with the page's protocol module bundled into the bridge.
+run('cargo', ['build', '-p', 'terminal-worker-client-kernel', '--target', 'wasm32-unknown-unknown', '--release']);
+run('wasm-bindgen', ['--target', 'no-modules', '--no-typescript', '--out-dir', out, '--out-name', 'client_kernel', join(target, 'wasm32-unknown-unknown/release/terminal_worker_client_kernel.wasm')]);
+await copy('web/kernel/client.js', join(out, 'client-kernel.js'));
 run('cargo', ['build', '--release', '--target', 'wasm32-wasip1', '--manifest-path', 'crates/coreutils/Cargo.toml', '--target-dir', join(target, 'coreutils')]);
 await mkdir(join(out, 'usr/bin'), { recursive: true });
 await copy(join(target, 'coreutils/wasm32-wasip1/release/coreutils.wasm'), join(out, 'usr/bin/coreutils.wasm'));

@@ -73,7 +73,7 @@ pub fn mknod(db: &mut Db, process: &Process, path: &str, mode: u16, rdev: &str) 
             format!("{path}: Invalid device name"),
         ));
     }
-    if who.id == GUEST {
+    if is_guest_id(who.id) {
         return Err(Error::because(
             Errno::EPERM,
             if rdev == "present" {
@@ -204,7 +204,7 @@ pub fn unlink(db: &mut Db, who: &Identity, path: &str) -> Option<Result<()>> {
     let device = db.device(path)?;
     if device.owner != who.id && who.id != 0 {
         return Some(Err(Error::because(
-            if who.id == GUEST {
+            if is_guest_id(who.id) {
                 Errno::EACCES
             } else {
                 Errno::EPERM

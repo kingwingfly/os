@@ -56,39 +56,103 @@ enum Entry {
     Link(String, u32),
 }
 
-/// The account's processes, by PID, as /proc lists them.
-fn processes(db: &Db, who: &Identity) -> Vec<crate::db::Job> {
-    db.jobs_of(who.id, 20)
+/// What /proc lists as a process: one of the client kernel's processes (procs.rs), or a job
+/// whose work is done apart.
+enum Proc {
+    Job(crate::db::Job),
+    Process(crate::procs::Row),
+}
+impl Proc {
+    fn id(&self) -> String {
+        match self {
+            Self::Job(job) => job.id.clone(),
+            Self::Process(row) => row.pid.to_string(),
+        }
+    }
+    fn owner(&self) -> u32 {
+        match self {
+            Self::Job(job) => job.owner,
+            Self::Process(row) => row.uid,
+        }
+    }
 }
 
-/// /proc/PID/status: as Linux's, its name, state and who it runs as; and how far it is.
-fn status(db: &Db, job: &crate::db::Job) -> String {
-    let progress: Value = serde_json::from_str(&job.progress).unwrap_or_default();
-    format!(
-        "Name:\t{}\nState:\t{}\nUid:\t{}\nProgress:\t{}/{}\nStarted:\t{}\n",
-        job.kind,
-        job.state,
-        db.username(job.actor),
-        progress["done"].as_u64().unwrap_or(0),
-        progress["total"].as_u64().unwrap_or(0),
-        job.created
-    )
+/// The account's processes and jobs, by PID, as /proc lists them; root's, every process.
+fn processes(db: &Db, who: &Identity) -> Vec<Proc> {
+    let jobs = db.jobs_of(who.id, 20).into_iter().map(Proc::Job);
+    let rows = if who.id == 0 {
+        db.all_processes()
+    } else {
+        db.processes_of_uid(who.id)
+    };
+    let rows = rows.into_iter().map(Proc::Process);
+    jobs.chain(rows).collect()
+}
+
+/// /proc/PID/status: as Linux's, its name, state and who it runs as; and, for a job, how far
+/// it is.
+fn status(db: &Db, process: &Proc) -> String {
+    match process {
+        Proc::Job(job) => {
+            let progress: Value = serde_json::from_str(&job.progress).unwrap_or_default();
+            format!(
+                "Name:\t{}\nState:\t{}\nUid:\t{}\nProgress:\t{}/{}\nStarted:\t{}\n",
+                job.kind,
+                job.state,
+                db.username(job.actor),
+                progress["done"].as_u64().unwrap_or(0),
+                progress["total"].as_u64().unwrap_or(0),
+                job.created
+            )
+        }
+        Proc::Process(row) => {
+            let name = row.path.rsplit('/').next().unwrap_or(&row.path);
+            let state = match row.state.as_str() {
+                "zombie" => "Z (zombie)",
+                "stopped" => "T (stopped)",
+                "sleeping" => "S (sleeping)",
+                _ => "R (running)",
+            };
+            format!(
+                "Name:\t{name}\nState:\t{state}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nCgroup:\t{}\n",
+                row.pid,
+                row.ppid,
+                row.uid,
+                row.uid,
+                row.uid,
+                row.uid,
+                row.gid,
+                row.gid,
+                row.gid,
+                row.gid,
+                row.cgroup
+            )
+        }
+    }
 }
 
 /// /proc/PID/cmdline: its program and what it works on, each ended by a NUL.
-fn cmdline(job: &crate::db::Job) -> String {
-    let command = crate::jobs::Spec::of(job)
-        .map(|spec| json!(spec.command))
-        .unwrap_or_default();
-    let on = command["archive"]
-        .as_str()
-        .or(command["file"].as_str())
-        .unwrap_or_default();
-    [job.kind.as_str(), on]
-        .iter()
-        .filter(|part| !part.is_empty())
-        .map(|part| format!("{part}\0"))
-        .collect()
+fn cmdline(process: &Proc) -> String {
+    match process {
+        Proc::Job(job) => {
+            let command = crate::jobs::Spec::of(job)
+                .map(|spec| json!(spec.command))
+                .unwrap_or_default();
+            let on = command["archive"]
+                .as_str()
+                .or(command["file"].as_str())
+                .unwrap_or_default();
+            [job.kind.as_str(), on]
+                .iter()
+                .filter(|part| !part.is_empty())
+                .map(|part| format!("{part}\0"))
+                .collect()
+        }
+        Proc::Process(row) => {
+            let argv: Vec<String> = serde_json::from_str(&row.argv).unwrap_or_default();
+            argv.iter().map(|arg| format!("{arg}\0")).collect()
+        }
+    }
 }
 
 /// /proc/self/fdinfo/N: as Linux's, where it is and how it was opened (its flags in octal); and
@@ -118,7 +182,7 @@ fn lookup(db: &Db, sid: Option<&str>, who: &Identity, path: &str) -> Result<Entr
     let job = |pid: &str| {
         processes(db, who)
             .into_iter()
-            .find(|job| job.id == pid)
+            .find(|process| process.id() == pid)
             .ok_or_else(|| Error::from(Errno::ENOENT))
     };
     Ok(match parts.as_slice() {
@@ -126,14 +190,14 @@ fn lookup(db: &Db, sid: Option<&str>, who: &Identity, path: &str) -> Result<Entr
         ["self"] | ["self", "fd" | "fdinfo"] => Entry::Dir(who.id),
         ["self", "fd", number] => Entry::Link(opened(db, &fd(number)?), who.id),
         ["self", "fdinfo", number] => Entry::File(fdinfo(db, &fd(number)?), who.id),
-        [pid] => Entry::Dir(job(pid)?.owner),
+        [pid] => Entry::Dir(job(pid)?.owner()),
         [pid, "status"] => {
-            let job = job(pid)?;
-            Entry::File(status(db, &job), job.owner)
+            let process = job(pid)?;
+            Entry::File(status(db, &process), process.owner())
         }
         [pid, "cmdline"] => {
-            let job = job(pid)?;
-            Entry::File(cmdline(&job), job.owner)
+            let process = job(pid)?;
+            Entry::File(cmdline(&process), process.owner())
         }
         _ => return Err(Errno::ENOENT.into()),
     })
@@ -177,7 +241,7 @@ fn entries(db: &Db, sid: Option<&str>, who: &Identity, path: &str) -> Result<Vec
     };
     let names: Vec<String> = match path.trim_end_matches('/') {
         "/proc" => std::iter::once("self".to_string())
-            .chain(processes(db, who).into_iter().map(|job| job.id))
+            .chain(processes(db, who).into_iter().map(|process| process.id()))
             .collect(),
         "/proc/self" => vec!["fd".into(), "fdinfo".into()],
         "/proc/self/fd" | "/proc/self/fdinfo" => sid

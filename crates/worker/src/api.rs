@@ -85,7 +85,7 @@ pub fn errno_reply(error: &abi::Error) -> Reply {
 }
 pub fn denied(message: &str, who: &Identity) -> Reply {
     let status = if commands::is_permission_error(message) {
-        if who.id == GUEST { 401 } else { 403 }
+        if is_guest_id(who.id) { 401 } else { 403 }
     } else if message.contains("does not exist") {
         404
     } else if message.contains("already exists")
@@ -153,7 +153,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         (Method::Get, "/internal/read") => {
             let guest = auth::guest_key(req);
             run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
+                let who = auth::identity_of(db, key.as_deref(), guest.as_deref());
                 // /proc's files are written as they are read; /proc/self/fd/N names what the
                 // descriptor has open.
                 let sid = auth::sid(db, key.as_deref(), guest.as_deref());
@@ -208,7 +208,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let token = param("token");
             let guest = auth::guest_key(req);
             run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
+                let who = auth::identity_of(db, key.as_deref(), guest.as_deref());
                 let sid = auth::sid(db, key.as_deref(), guest.as_deref());
                 match crate::fds::by_token(db, sid.as_deref(), &who, &token) {
                     Ok(file) => {
@@ -236,7 +236,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let length = param("length").parse::<u64>().unwrap_or(0);
             let guest = auth::guest_key(req);
             run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
+                let who = auth::identity_of(db, key.as_deref(), guest.as_deref());
                 let sid = auth::sid(db, key.as_deref(), guest.as_deref()).unwrap_or_default();
                 match crate::fds::pwrite(db, &sid, &who, fd, index, length) {
                     Ok((key, mime)) => Reply::ok(json!({"key": key, "mime": mime})),
@@ -258,7 +258,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             };
             let guest = auth::guest_key(req);
             run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
+                let who = auth::identity_of(db, key.as_deref(), guest.as_deref());
                 let sid = auth::sid(db, key.as_deref(), guest.as_deref()).unwrap_or_default();
                 let written = crate::fds::written(
                     db,
@@ -902,7 +902,7 @@ pub async fn sudo(
             (who, can_sudo, account)
         }
     })?;
-    if who.id == GUEST {
+    if is_guest_id(who.id) {
         return Ok(Reply::error("Sign in first", 401));
     }
     if !can_sudo {
@@ -950,7 +950,7 @@ pub async fn passwd(
         let key = key.clone();
         move |db| auth::identity(db, key.as_deref())
     })?;
-    if who.id == GUEST {
+    if is_guest_id(who.id) {
         return Ok(Reply::error("Sign in first", 401));
     }
     if auth::limited(req, env, "passwd").await? {
@@ -990,7 +990,7 @@ pub async fn passwd(
         Ok(checked) => checked,
         Err(message) => return Ok(denied(&message, &who)),
     };
-    if target.id == GUEST {
+    if is_guest_id(target.id) {
         return Ok(Reply::error(
             "guest has no password: it is who is signed out",
             400,
@@ -1070,7 +1070,7 @@ pub async fn unregister(
         let key = key.clone();
         move |db| auth::identity(db, key.as_deref())
     })?;
-    if who.id == GUEST {
+    if is_guest_id(who.id) {
         return Ok(Reply::error("Sign in first", 401));
     }
     if who.id == 0 || !who.groups.contains(&GUEST) {
@@ -1136,7 +1136,7 @@ pub async fn register(
         let key = key.clone();
         move |db| auth::identity(db, key.as_deref())
     })?;
-    if who.id != GUEST {
+    if !is_guest_id(who.id) {
         return Ok(Reply::error(
             "useradd NAME makes an account for one who is signed out; signed in, use sudo useradd",
             409,
@@ -1216,7 +1216,7 @@ pub async fn register(
     let salt = auth::random_token();
     let hash = auth::hash(&wanted.password, &salt, env).await?;
     run(state, move |db| {
-        if auth::identity(db, key.as_deref()).id != GUEST {
+        if !is_guest_id(auth::identity(db, key.as_deref()).id) {
             return Reply::error("Signed in meanwhile; please try again", 409);
         }
         if let Some(reply) = taken(db, &name) {

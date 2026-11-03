@@ -100,10 +100,12 @@ test('ACLs are extended attributes, set by the owner, that decide as setfacl\'s 
   await root.batch([{ unlink: { path: dir + '/secret' } }, { rmdir: { path: dir } }]);
 });
 
-test('a guest is uid guest; sudo runs a batch as root only once its account has authenticated', async () => {
+test('a guest is guest-<uuid>:guest; sudo runs a batch as root only once its account has authenticated', async () => {
   const guest = await session();
   const creds = await guest.sys('getcreds');
-  expect([creds.user, creds.signed_in, creds.can_sudo]).toEqual(['guest', false, false]);
+  expect(creds.user).toMatch(/^guest-[0-9a-f]{16}$/);
+  expect(creds.uid).toBeGreaterThanOrEqual(1_000_000);
+  expect([creds.signed_in, creds.can_sudo, creds.home]).toEqual([false, false, '/guest']);
   expect(await guest.sys({ mkdir: { path: '/nope-' + Date.now(), mode: 0o777 } })).toBe('EACCES');
   // ann is no wheel member: sudo is refused, whatever the call.
   const refused = await ann.batch([{ stat: { path: '/' } }], { sudo: true });
@@ -388,4 +390,59 @@ test('a session\'s numbers are given once; sudo\'s descriptors stream as root; w
   expect(far.ok.data).toBe('');
   // /sys is the image's, read-only, what is below it too.
   expect(await root.sys({ mkdir: { path: '/sys/x', mode: 0o755 } })).toBe('EROFS');
+});
+
+test('execve runs /usr binaries, snapshots the caller, and refuses what Linux refuses', async () => {
+  // The test's directory, when only this test is selected.
+  await root.batch([{ mkdir: { path: base, mode: 0o777 } }]);
+  // A system binary is the build's asset; execve gives the loader its path and the process's
+  // token, and the process's calls run as whom it was executed.
+  const exec = await root.sys({ execve: { path: '/usr/bin/coreutils', argv: ['coreutils', 'seq', '3'], env: ['LANG=C'], cwd: '/' } });
+  expect(exec.asset).toBe('/usr/bin/coreutils.wasm');
+  expect(exec.pid).toBeGreaterThan(1);
+  expect(exec.token).toMatch(/^[0-9a-f]{64}$/);
+  const [self] = await root.batch([{ getpid: null }], { pid: exec.pid, proc: exec.token });
+  expect(self.ok).toEqual({ pid: exec.pid, ppid: 1 });
+  // A process token cannot sign the browser out.
+  const [logout] = await root.batch([{ logout: null }], { pid: exec.pid, proc: exec.token });
+  expect(logout.err.errno).toBe('EPERM');
+  // Its calls run as its snapshot: root here, and what it makes is root's.
+  const [created] = await root.batch([{ mknod: { path: base + '/from-process', mode: 0o644 } }], { pid: exec.pid, proc: exec.token });
+  expect(created.ok).toBeNull();
+  expect((await root.sys({ stat: { path: base + '/from-process' } })).user).toBe('root');
+  // exit and wait: the status is waitpid's 5 << 8.
+  expect(await root.sys({ exit: { status: 5 } }, { pid: exec.pid, proc: exec.token })).toBeNull();
+  const waited = await root.sys({ wait: { pid: String(exec.pid) } });
+  expect(waited.status).toBe(5 << 8);
+  expect(waited.pid).toBe(exec.pid);
+
+  const dir = base + '/execve';
+  await root.batch([{ mkdir: { path: dir, mode: 0o755 } }, { mknod: { path: dir + '/plain', mode: 0o644 } }, { mknod: { path: dir + '/xonly', mode: 0o111 } }, { mkdir: { path: dir + '/sub', mode: 0o755 } }]);
+  // A directory is EISDIR, a missing path ENOENT, and the X rule holds for root too: 0644 is
+  // EACCES. An x-only file passes the check, and is ENOEXEC until uploaded wasm runs (Phase 2).
+  expect(await root.sys({ execve: { path: dir, argv: [dir], env: [], cwd: '/' } })).toBe('EISDIR');
+  expect(await root.sys({ execve: { path: dir + '/missing', argv: ['missing'], env: [], cwd: '/' } })).toBe('ENOENT');
+  expect(await root.sys({ execve: { path: dir + '/plain', argv: ['plain'], env: [], cwd: '/' } })).toBe('EACCES');
+  expect(await root.sys({ execve: { path: dir + '/xonly', argv: ['xonly'], env: [], cwd: '/' } })).toBe('ENOEXEC');
+  // An argument vector over Linux's limit is E2BIG before the image is looked at.
+  expect(await root.sys({ execve: { path: '/usr/bin/coreutils', argv: ['x'.repeat(129 * 1024)], env: [], cwd: '/' } })).toBe('E2BIG');
+});
+
+test('proc_init begins a browser namespace, and a new boot reaps what the old one left running', async () => {
+  const boot = 'sys-boot-' + Date.now().toString(36);
+  const first = await ann.sys({ proc_init: { boot } });
+  expect(first.pid).toBe(1);
+  expect(first.pids).toContain(1);
+  const exec = await ann.sys({ execve: { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '30'], env: [], cwd: '/' } });
+  const same = await ann.sys({ proc_init: { boot } });
+  expect(same.pids).toContain(exec.pid);
+  const [running] = await ann.batch([{ proc_poll: { pids: [exec.pid] } }]);
+  expect(running.ok[0].state).toBe('running');
+  // A reload's boot id reaps the processes of the boot that is gone: only init remains.
+  const reset = await ann.sys({ proc_init: { boot: boot + '-new' } });
+  expect(reset.pids).toEqual([1]);
+  const [init] = await ann.batch([{ proc_poll: { pids: [1] } }]);
+  expect(init.ok[0].state).toBe('running');
+  const [gone] = await ann.batch([{ proc_poll: { pids: [exec.pid] } }]);
+  expect(gone.ok).toEqual([]);
 });

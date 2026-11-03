@@ -42,6 +42,8 @@ pub async fn handle(
         ));
     }
     let (sudo, umask) = (batch.sudo, batch.umask & 0o777);
+    let procs_pid = batch.pid;
+    let procs_token = batch.process.clone();
     let guest = auth::guest_key(req);
     // The session was heard from: its descriptors are kept.
     let (renewing, guest_renewing) = (key.clone(), guest.clone());
@@ -68,6 +70,8 @@ pub async fn handle(
                 guest,
                 sudo,
                 umask,
+                pid: procs_pid,
+                token: procs_token.clone(),
             };
             results.push(match bytes(env, state, process, call).await {
                 Ok(value) => Return::Ok(value),
@@ -76,8 +80,15 @@ pub async fn handle(
             continue;
         }
         // What takes a password (its KDF, and a rate limit) waits outside a transaction too,
-        // and may give the session a new cookie.
+        // and may give the session a new cookie. A process token cannot touch the session.
         if let Some(asked) = passworded(&call, sudo) {
+            if procs_token.is_some() {
+                results.push(Return::Err(Error::because(
+                    Errno::EPERM,
+                    "a process cannot sign the browser in or out",
+                )));
+                continue;
+            }
             let reply = asked.run(req, env, state, key, https).await?;
             if let Some(made) = &reply.cookie {
                 cookie = Some(made.clone());
@@ -107,10 +118,11 @@ pub async fn handle(
         let logout = matches!(call, Call::Logout);
         // A process spawned or signalled: its runner wakes.
         let wakes = match &call {
-            Call::Kill { pid } => Some(pid.clone()),
+            Call::Kill { pid, .. } => Some(pid.clone()),
             Call::Spawn { .. } => Some(String::new()),
             _ => None,
         };
+        let procs_token = procs_token.clone();
         let result = transact(state, move |db| {
             // A descriptor call stands as it ends, failed or not: a close that fails closes.
             let descriptors = matches!(
@@ -118,7 +130,17 @@ pub async fn handle(
                 Call::Open { .. } | Call::Close { .. } | Call::Ioctl { .. }
             );
             let sid = auth::sid(db, key.as_deref(), guest.as_deref());
-            let result = run(db, key.as_deref(), sid.as_deref(), sudo, umask, call);
+            let result = run(
+                db,
+                key.as_deref(),
+                guest.as_deref(),
+                sid.as_deref(),
+                procs_pid,
+                procs_token.as_deref(),
+                sudo,
+                umask,
+                call,
+            );
             let commit = result.is_ok() || descriptors;
             let result = match result {
                 Ok(value) => Return::Ok(value),
@@ -202,11 +224,31 @@ struct Session {
     guest: Option<String>,
     sudo: bool,
     umask: u16,
+    pid: Option<u32>,
+    token: Option<String>,
 }
 impl Session {
-    /// Its process and session id, as the store `db` knows them.
-    fn of(&self, db: &Db) -> std::result::Result<(Process, Option<String>), Error> {
-        let process = process(db, self.key.as_deref(), self.sudo, self.umask)?;
+    /// Its process and session id, as the store `db` knows them: a process token runs as the
+    /// process's snapshot, a page's batch as the session's account.
+    fn of(&self, db: &mut Db) -> std::result::Result<(Process, Option<String>), Error> {
+        let process = match self.token.as_deref() {
+            Some(token) => {
+                let row = db
+                    .process_token(token, self.pid)
+                    .ok_or_else(|| Error::because(Errno::EPERM, "not this process's token"))?;
+                Process {
+                    cred: row.identity(),
+                    umask: row.umask,
+                }
+            }
+            None => process(
+                db,
+                self.key.as_deref(),
+                self.guest.as_deref(),
+                self.sudo,
+                self.umask,
+            )?,
+        };
         let sid = auth::sid(db, self.key.as_deref(), self.guest.as_deref());
         Ok((process, sid))
     }
@@ -460,36 +502,170 @@ fn returned(reply: Reply) -> Return {
     Return::Err(Error::because(errno, detail))
 }
 
-/// The process the session `key` runs as: its account, root under sudo if it may.
+/// The process a page's session runs as: its account, root under sudo if it may. A signed-out
+/// browser is its own guest account.
 fn process(
-    db: &Db,
+    db: &mut Db,
     key: Option<&str>,
+    guest: Option<&str>,
     sudo: bool,
     umask: u16,
 ) -> std::result::Result<Process, Error> {
-    let cred = auth::elevated(db, key, sudo).map_err(|why| {
+    let who = auth::identity_of(db, key, guest);
+    let may_sudo = db.can_sudo(&who);
+    let cred = auth::elevated_of(db, key, guest, sudo).map_err(|why| {
         // Not a wheel member: never. One that has not authenticated lately: not yet.
-        let errno = if db.can_sudo(&auth::identity(db, key)) {
-            Errno::EACCES
-        } else {
-            Errno::EPERM
-        };
-        Error::because(errno, why)
+        Error::because(
+            if may_sudo {
+                Errno::EACCES
+            } else {
+                Errno::EPERM
+            },
+            why,
+        )
     })?;
     Ok(Process { cred, umask })
 }
 
-/// The call `call`, as the session `key`'s process (`sid`, signed in or not), under sudo if
-/// `sudo`.
+/// The call `call`, as the process `token` (a process's own snapshot), or, with none, as the
+/// session `key`'s process (`sid`, signed in or not), under sudo if `sudo`.
+#[allow(clippy::too_many_arguments)]
 fn run(
     db: &mut Db,
     key: Option<&str>,
+    guest: Option<&str>,
     sid: Option<&str>,
+    pid: Option<u32>,
+    token: Option<&str>,
     sudo: bool,
     umask: u16,
     call: Call,
 ) -> std::result::Result<serde_json::Value, Error> {
-    let process = process(db, key, sudo, umask)?;
+    let ns = Db::namespace(key, guest);
+    let caller = match token {
+        Some(token) => Some(
+            db.process_token(token, pid)
+                .ok_or_else(|| Error::because(Errno::EPERM, "not this process's token"))?,
+        ),
+        None => None,
+    };
+    // A process token acts as the process, with its snapshot's credentials, never as the page
+    // signed in later; it cannot sign the browser in or out, or mint sudo.
+    let process = match &caller {
+        Some(row) => {
+            if matches!(call, Call::Logout | Call::ProcInit { .. }) {
+                return Err(Error::because(
+                    Errno::EPERM,
+                    "a process cannot change its browser's session",
+                ));
+            }
+            Process {
+                cred: row.identity(),
+                umask: row.umask,
+            }
+        }
+        None => process(db, key, guest, sudo, umask)?,
+    };
+    let now = auth::now();
+    match call {
+        Call::ProcInit { boot } => {
+            return Ok(db.proc_init(&ns, boot.as_deref(), &process.cred, now));
+        }
+        Call::Execve {
+            pid: target,
+            path,
+            argv,
+            env,
+            cwd,
+            cgroup,
+        } => {
+            let target = caller.as_ref().map(|row| row.pid).or(target);
+            let exec = db.execve(
+                &ns,
+                &process.cred,
+                target,
+                &path,
+                &argv,
+                &env,
+                &cwd,
+                cgroup.as_deref(),
+                process.umask,
+                now,
+            )?;
+            return Ok(json!(exec));
+        }
+        Call::Fork { pid } => {
+            let row = caller
+                .as_ref()
+                .ok_or_else(|| Error::because(Errno::EPERM, "fork is a process's call"))?;
+            if pid != row.pid {
+                return Err(Error::because(
+                    Errno::EINVAL,
+                    "fork is called by its parent",
+                ));
+            }
+            return Ok(json!(db.fork(row, now)?));
+        }
+        Call::Exit { status, signal } => {
+            let row = caller
+                .as_ref()
+                .ok_or_else(|| Error::because(Errno::EPERM, "exit is a process's call"))?;
+            db.exit(row, status, signal, now)?;
+            return Ok(serde_json::Value::Null);
+        }
+        Call::Getpid => {
+            let row = caller
+                .as_ref()
+                .ok_or_else(|| Error::because(Errno::EPERM, "getpid is a process's call"))?;
+            return Ok(json!({ "pid": row.pid, "ppid": row.ppid }));
+        }
+        Call::ProcPoll { pids } => {
+            if pids.len() > abi::PROC_POLL_MAX {
+                return Err(Error::because(
+                    Errno::E2BIG,
+                    format!("at most {} processes at a time", abi::PROC_POLL_MAX),
+                ));
+            }
+            return Ok(json!(db.poll(&ns, &pids, &process.cred)));
+        }
+        Call::CgroupCreate {
+            path,
+            controllers: _,
+        } => {
+            db.cgroup_create(&ns, &path)?;
+            return Ok(serde_json::Value::Null);
+        }
+        Call::CgroupRemove { path } => {
+            db.cgroup_remove(&ns, &path)?;
+            return Ok(serde_json::Value::Null);
+        }
+        Call::CgroupSet { path, key, value } => {
+            db.cgroup_set(&ns, &path, &key, &value)?;
+            return Ok(serde_json::Value::Null);
+        }
+        Call::CgroupAttach { pid, path } => {
+            db.cgroup_attach(&ns, pid, &path)?;
+            return Ok(serde_json::Value::Null);
+        }
+        Call::CgroupStat { path } => return db.cgroup_stat(&ns, &path),
+        Call::CgroupList { path } => return Ok(json!(db.cgroup_list(&ns, &path))),
+        Call::Kill {
+            pid: target,
+            signal,
+        } if target.parse::<u32>().is_ok() => {
+            let target: u32 = target.parse().unwrap_or_default();
+            let signal = signal.unwrap_or(abi::SIGTERM);
+            db.kill(&ns, &process.cred, target, signal, now)?;
+            return Ok(serde_json::Value::Null);
+        }
+        Call::Wait { pid: target, .. } if target.parse::<u32>().is_ok() => {
+            let want: u32 = target.parse().unwrap_or_default();
+            let parent = caller.as_ref().map(|row| row.pid);
+            let waited = db.wait(&ns, parent, want)?;
+            return Ok(json!(waited));
+        }
+        _ => {}
+    }
     // /proc/self/fd/N names what the descriptor has open; /proc is procfs's.
     let mut call = call;
     let mut proc = false;
@@ -562,12 +738,11 @@ fn run(
         | Call::Groupdel { .. }) => account(db, &process.cred, call),
         Call::Getcreds => Ok(json!(creds(db, key, &process.cred))),
         call @ (Call::Spawn { .. } | Call::Kill { .. } | Call::Wait { .. }) => {
-            let account = auth::identity(db, key);
             let home = db
-                .user_by_id(account.id)
+                .user_by_id(process.cred.id)
                 .map(|(_, user)| user.home)
                 .unwrap_or_else(|| "/".into());
-            crate::jobs::call(db, account.id, &home, sid, &process, call)
+            crate::jobs::call(db, process.cred.id, &home, sid, &process, call)
         }
         call @ (Call::Open { .. } | Call::Close { .. } | Call::Ioctl { .. }) => {
             crate::fds::call(db, sid, &process, call)
@@ -658,9 +833,10 @@ fn statfs(db: &Db) -> abi::StatFs {
 pub fn generated(db: &Db, path: &str) -> Option<String> {
     let mut users = db.users();
     users.sort_by_key(|(_, user)| user.id);
+    let guests = db.guests();
     match path {
-        "/etc/passwd" => Some(
-            users
+        "/etc/passwd" => {
+            let mut text: String = users
                 .iter()
                 .map(|(name, user)| {
                     format!(
@@ -668,8 +844,17 @@ pub fn generated(db: &Db, path: &str) -> Option<String> {
                         user.id, user.group, user.home
                     )
                 })
-                .collect(),
-        ),
+                .collect();
+            for guest in guests {
+                text.push_str(&format!(
+                    "{}:x:{}:{}::/guest:/bin/sh\n",
+                    guest.name(),
+                    guest.uid,
+                    guest.gid
+                ));
+            }
+            Some(text)
+        }
         "/etc/group" => {
             let mut groups = db.groups();
             groups.sort_by_key(|(_, id)| *id);
@@ -737,7 +922,7 @@ fn creds(db: &Db, key: Option<&str>, cred: &Identity) -> Creds {
         group: db.groupname(cred.group),
         group_names: cred.groups.iter().map(|id| db.groupname(*id)).collect(),
         home,
-        signed_in: cred.id != GUEST,
+        signed_in: auth::signed_in(db, key),
         can_sudo: db.can_sudo(cred),
         sudo_active: view["sudo_active"].as_bool().unwrap_or(false),
     }
@@ -820,7 +1005,7 @@ async fn networked(
         let (key, guest, arg) = (key.clone(), guest.clone(), arg.clone());
         transact(state, move |db| {
             let plan = (|| {
-                let process = process(db, key.as_deref(), sudo, umask)?;
+                let process = process(db, key.as_deref(), guest.as_deref(), sudo, umask)?;
                 let sid = auth::sid(db, key.as_deref(), guest.as_deref()).ok_or(Errno::EBADF)?;
                 let request = dev::request(db, &sid, fd)?.ok_or(Errno::ENOTTY)?;
                 let rdev = request.node.rdev.clone().unwrap_or_default();
@@ -881,7 +1066,7 @@ async fn networked(
                 .map_err(unreached)?;
             let made = transact(state, move |db| {
                 let made = (|| {
-                    let process = process(db, key.as_deref(), sudo, umask)?;
+                    let process = process(db, key.as_deref(), guest.as_deref(), sudo, umask)?;
                     let sid =
                         auth::sid(db, key.as_deref(), guest.as_deref()).ok_or(Errno::EBADF)?;
                     let request = dev::request(db, &sid, fd)?.ok_or(Errno::ENOTTY)?;

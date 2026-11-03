@@ -522,9 +522,15 @@ impl Shell {
             }
             if self.cancelled() && !cancelling {
                 cancelling = true;
-                userland::sys::call::<Value>(&sys, Call::Kill { pid: id.into() })
-                    .await
-                    .map_err(|error| error.to_string())?;
+                userland::sys::call::<Value>(
+                    &sys,
+                    Call::Kill {
+                        pid: id.into(),
+                        signal: None,
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
             }
             let view: Value = userland::sys::call(
                 &sys,
@@ -684,6 +690,7 @@ impl Shell {
                         &sys,
                         Call::Kill {
                             pid: job.pid.clone(),
+                            signal: None,
                         },
                     )
                     .await

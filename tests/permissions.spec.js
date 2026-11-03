@@ -261,7 +261,7 @@ test('sudo account switching checks live membership, replaces sessions and clear
   await ok(await api(alice, 'login',{data:{username:b,sudo:true}}));
   const current=await (await api(alice, 'session')).json();
   expect(current.username).toBe(b);expect(current.sudo_active).toBe(false);
-  expect((await (await api(guest, 'session',{headers:{Cookie:'terminal_session='+cookie}})).json()).username).toBe('guest');
+  expect((await (await api(guest, 'session',{headers:{Cookie:'terminal_session='+cookie}})).json()).username).toMatch(/^guest-[0-9a-f]{16}$/);
   expect((await api(alice, 'login',{data:{username:'root',sudo:true}})).status()).toBe(403);
   await login(alice,a);await ok(await api(alice, 'sudo',{data:{password}}));
   await ok(await command(root,['usermod','-G',f.team,a]));

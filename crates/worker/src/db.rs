@@ -5,7 +5,7 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use terminal_worker_core::permissions::{Id, Identity, Node, Session, Store, User};
+use terminal_worker_core::permissions::{GUEST, Id, Identity, Node, Session, Store, User};
 use wasm_bindgen::prelude::*;
 use worker::{Error, Result, SqlStorage, SqlStorageValue, State};
 
@@ -32,9 +32,9 @@ extern "C" {
 const ROLLBACK: &str = "rollback";
 
 /// The version of the tables below, which local state made by an older one does not have.
-pub const SCHEMA_VERSION: &str = "3";
+pub const SCHEMA_VERSION: &str = "4";
 
-const SCHEMA: [&str; 29] = [
+const SCHEMA: [&str; 35] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
@@ -91,6 +91,20 @@ const SCHEMA: [&str; 29] = [
     // Listeners asking to speak in a presentation (dev/present.rs): a session at a time, by
     // the id its presenter answers, as whom.
     "CREATE TABLE IF NOT EXISTS asks(device TEXT NOT NULL, sid TEXT NOT NULL, id TEXT NOT NULL, uid INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY(device, sid))",
+    // A signed-out browser's identity, by its guest cookie's key: the uuid it shows, and the
+    // uid it owns files as, from the anonymous range. No home is made for it.
+    "CREATE TABLE IF NOT EXISTS guests(key TEXT PRIMARY KEY, uuid TEXT NOT NULL UNIQUE, uid INTEGER NOT NULL UNIQUE, gid INTEGER NOT NULL, created INTEGER NOT NULL, last_seen INTEGER NOT NULL)",
+    // A browser's process namespace, one small machine: its guest, the boot it is of (a reload
+    // resets stale processes), and the next pid.
+    "CREATE TABLE IF NOT EXISTS namespaces(id TEXT PRIMARY KEY, guest TEXT NOT NULL, boot TEXT, next_pid INTEGER NOT NULL, created INTEGER NOT NULL, last_seen INTEGER NOT NULL)",
+    // Processes (procs.rs): the namespace they run in, their parent and credentials, cgroup,
+    // image, argument vector and environment, state, and the token their calls carry. A
+    // process that ended waits as a zombie until its parent reaps it.
+    "CREATE TABLE IF NOT EXISTS processes(ns TEXT NOT NULL, pid INTEGER NOT NULL, ppid INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, groups TEXT NOT NULL, umask INTEGER NOT NULL, cgroup TEXT NOT NULL, path TEXT NOT NULL, argv TEXT NOT NULL, env TEXT NOT NULL, cwd TEXT NOT NULL, state TEXT NOT NULL, status INTEGER NOT NULL DEFAULT 0, signal INTEGER, token TEXT NOT NULL, started INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(ns, pid))",
+    "CREATE INDEX IF NOT EXISTS processes_token ON processes(token)",
+    "CREATE INDEX IF NOT EXISTS processes_ns ON processes(ns)",
+    // cgroup v2's hierarchy per namespace: its subtree, controllers, and control files.
+    "CREATE TABLE IF NOT EXISTS cgroups(ns TEXT NOT NULL, path TEXT NOT NULL, parent TEXT NOT NULL, controllers TEXT NOT NULL, cpu_max TEXT, cpu_weight INTEGER NOT NULL DEFAULT 100, memory_max TEXT, pids_max INTEGER, io_max TEXT, freeze INTEGER NOT NULL DEFAULT 0, devices TEXT NOT NULL DEFAULT '', PRIMARY KEY(ns, path))",
 ];
 
 thread_local! {
@@ -494,10 +508,10 @@ pub struct Chunk {
     pub key: String,
 }
 
-fn int(value: impl TryInto<i64>) -> SqlStorageValue {
+pub(crate) fn int(value: impl TryInto<i64>) -> SqlStorageValue {
     SqlStorageValue::Integer(value.try_into().unwrap_or(i64::MAX))
 }
-fn text(value: &str) -> SqlStorageValue {
+pub(crate) fn text(value: &str) -> SqlStorageValue {
     value.into()
 }
 /// Note that the listing of the directory holding `path` changes.
@@ -524,7 +538,11 @@ pub struct Db {
     sql: SqlStorage,
 }
 impl Db {
-    fn rows<T: DeserializeOwned>(&self, query: &str, args: Vec<SqlStorageValue>) -> Vec<T> {
+    pub(crate) fn rows<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        args: Vec<SqlStorageValue>,
+    ) -> Vec<T> {
         self.sql
             .exec(query, args)
             .and_then(|c| c.to_array())
@@ -533,7 +551,7 @@ impl Db {
                 Vec::new()
             })
     }
-    fn run(&mut self, query: &str, args: Vec<SqlStorageValue>) {
+    pub(crate) fn run(&mut self, query: &str, args: Vec<SqlStorageValue>) {
         if let Err(error) = self
             .sql
             .exec(query, args)
@@ -1702,6 +1720,22 @@ impl Store for Db {
         self.rows::<UserRow>(&format!("{USER} WHERE id = ?"), vec![int(id)])
             .pop()
             .map(UserRow::pair)
+            .or_else(|| {
+                self.guest_by_uid(id)
+                    .map(|guest| (guest.name(), guest.user()))
+            })
+    }
+    fn username(&self, id: u32) -> String {
+        if let Some(guest) = self.guest_by_uid(id) {
+            return guest.name();
+        }
+        if id == GUEST {
+            "guest".into()
+        } else {
+            self.rows::<UserRow>(&format!("{USER} WHERE id = ?"), vec![int(id)])
+                .pop()
+                .map_or_else(|| id.to_string(), |row| row.name)
+        }
     }
     fn home_of(&self, path: &str) -> Option<u32> {
         #[derive(Deserialize)]

@@ -190,7 +190,7 @@ pub async fn kill(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
                 continue;
             }
         };
-        if let Err(error) = call::<Value>(sys, Call::Kill { pid }).await {
+        if let Err(error) = call::<Value>(sys, Call::Kill { pid, signal: None }).await {
             let error = if error.errno == Errno::ESRCH {
                 "No such process".to_string()
             } else {

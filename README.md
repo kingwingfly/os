@@ -285,7 +285,7 @@ Every window and device that shows a deck shows the same slide: the other window
 
 The bar of the slides, or of a PDF, has the same at hand, signed in: **Present** (the screen with waves) makes `/dev/present/NAME` of the file shown, or stops it; **Go live** (the microphone) sends the microphone as `stream` does, **Live** only or **Live + record**, recorded beside the file as `NAME-YYYYMMDD-HHMM.weba`, and shows how long it has gone, a click stopping it. A listener's bar has **Ask to speak** (the raised hand) instead. The presenter's bar then shows a hand with how many ask: **Allow** lets one speak, as Linux would let them: an account gets an ACL entry that lets it write the presentation (`u:NAME:rw`); a guest, as everyone signed out is one account, gets a descriptor that writes it, passed to their browser's session alone, as Linux passes an open file. Through it their microphone goes live as a voice of the presentation, `/dev/snd/NAME-SPEAKER`, the presenter's, with the presentation's mode, which everyone following hears, and the presenter's page that allowed it; **End** removes the voice, and with it the leave to speak, as does the listener's own button. At most two speak at once.
 
-So for a talk whose files are `u:guest:r` (`setfacl -R -m u:guest:rX DIR`, so that its images may be read too): the laptop runs `present talk.slides.md` and presses S for the speaker view; the phone, signed in to the same account, opens the deck and turns it; the audience opens `/dev/present/talk` on their phones, signed in or not.
+So for a talk whose files are `g:guest:r` (`setfacl -R -m g:guest:rX DIR`, so that its images may be read too): the laptop runs `present talk.slides.md` and presses S for the speaker view; the phone, signed in to the same account, opens the deck and turns it; the audience opens `/dev/present/talk` on their phones, signed in or not.
 
 #### Live sound: stream and /dev/snd
 
@@ -358,6 +358,33 @@ uutils' run as processes of their own in the page's WASI engine (`web/wasi/`). T
 A pipeline's processes run at once, each one's output the next one's input through a pipe: 64 KiB of memory the page and its processes share (`web/wasi/pipe.js`), where a reader waits while it is empty and a writer while it is full. A write to a pipe whose reader has gone ends its process, as SIGPIPE does (status 141), so `yes | head -n 3` ends at once: the terminal's `head` closes its input once it has its lines, as GNU head does. What the last writes shows in the transcript as it is written, and so do errors, a line at a time. The first reads the terminal, unless given its input: the command line then says `Input ↵`, a line typed goes to it (echoed, and kept out of the history), Ctrl+D ends a read (after what is typed, if anything is), and Ctrl+C kills the pipeline. Sharing memory needs a page isolated from other sites (`web/_headers`: `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: credentialless`, which lets other sites' images load without cookies); where a browser does not isolate it (Safari has no `credentialless`), the processes run one after another, each given what the one before wrote, and nothing reads the terminal. A pipeline joining the terminal's own programs passes text between stages as before. The terminal's own programs run in the page itself, which draws what they give (`ls`'s listing, its icons, colours and uploads' progress) rather than text.
 
 A name runs the terminal's program, or uutils' where it has none; `/usr/bin/NAME`, and `/bin/NAME`, `/sbin/NAME` and `/usr/sbin/NAME` through the links, run what NAME does, and `coreutils NAME` uutils' NAME whatever the terminal has. `help` lists uutils'; `NAME --help` tells how to use one.
+
+### The client kernel
+
+The kernel split puts a client kernel in the browser: a SharedWorker holds the browser's PID
+table mirror and process tokens, while a page-owned worker hosts processes, SAB pipes and
+terminal input. The kernel is Rust (`crates/client-kernel`), built to wasm and imported by
+`web/kernel/client.js`; the page talks to it through the versioned envelope in
+`web/kernel/protocol.js`. Two tabs of one browser are one namespace and see each other's
+processes. Every decision is still the worker kernel's: `execve` checks the path, the execute
+bit and the credentials, snapshots them into a process record, and answers a token; `fork`,
+`exit`, `wait`, `kill`, `poll` and the `Cgroup*` calls are registry operations in
+`crates/worker/src/procs.rs`, projected by `/proc`. Coreutils runs through this path: the page
+asks the client kernel for the process, then runs it as a Worker whose batches carry the
+process's pid and token.
+
+A signed-out browser is now `guest-<uuid>:guest`, with a uid of its own from the anonymous range
+(1,000,000–1,999,999) and no home; `HOME` stays the shared `/guest` (1777 sticky), and
+`/etc/passwd` names it. A real `useradd` still makes a real account and home. Cgroups are a
+cgroup-v2-like hierarchy per namespace (`/init`, `/user`, `/system`, `/cluster`), with
+`cpu.max`, `memory.max`, `pids.max`, `io.max`, `cgroup.freeze` and device rules; enforcement is
+Phase 6.
+
+Phase 0 measured the limits: SharedWorkers are not cross-origin isolated in Chromium or
+Firefox, so they cannot use `SharedArrayBuffer`; File System Access and WebGPU are
+Chromium-only. The Rust WASIX runtime runs and forks a prebuilt `dash` in Node and in a
+cross-origin-isolated module Worker; asyncify-at-load transforms an uninstrumented WAT module
+with binaryen in both. Details are in `AGENT.md` and issue #20.
 
 ## Storage and project boundaries
 

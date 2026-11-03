@@ -8,10 +8,20 @@
 // only when isolated from other sites (web/_headers); where it is not, they run one after
 // another, each given what the one before wrote, and nothing reads the terminal.
 import { Pipe, pipeBuffer } from './pipe.js';
+import { kernelCall } from '../kernel/protocol.js';
 
-const BINARY = '/usr/bin/coreutils.wasm';
-let compiled = null;
-const compile = () => compiled ??= WebAssembly.compileStreaming(fetch(BINARY)).catch(err => { compiled = null; throw err; });
+// Executables are the build's own /usr/bin images, each compiled once by its asset path, and
+// each process is a registry process: the client kernel asks the worker kernel for it (execve),
+// and its token goes with every batch the process makes.
+const COREUTILS = '/usr/bin/coreutils';
+const compiled = new Map();
+const compile = asset => {
+  if (!compiled.has(asset)) {
+    const module = WebAssembly.compileStreaming(fetch(asset)).catch(error => { compiled.delete(asset); throw error; });
+    compiled.set(asset, module);
+  }
+  return compiled.get(asset);
+};
 const encoder = new TextEncoder();
 // Status of a process killed by a signal: 128 and its number.
 const SIGINT = 130, SIGPIPE = 141;
@@ -64,7 +74,6 @@ function terminalInput() {
 export async function exec(stages, options = {}) {
   const { cwd = '/', home = '/', user = 'guest', stdin = null, sudo = false, umask = 0o022, tty = false, enough = null,
     cancelled = () => false, onOutput = () => {}, onTty = () => {}, onReading = () => {} } = options;
-  const module = await compile();
   const env = piped => ({
     PWD: cwd, HOME: home, USER: user, LOGNAME: user, PATH: '/usr/bin', SHELL: '/usr/bin/sh', LANG: 'C.UTF-8',
     TERM: piped ? 'dumb' : 'xterm-256color', COLUMNS: String(columns()),
@@ -90,8 +99,20 @@ export async function exec(stages, options = {}) {
     if (closed) Atomics.store(closed, 0, 1);
     else stop(SIGPIPE);
   };
-  const start = (index, io) => {
+  const start = async (index, io) => {
     const argv = stages[index], decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
+    const environment = env(!io.stdout.tty);
+    // execve: the worker kernel checks the image and snapshots the credentials; the process's
+    // token goes with each batch the host makes for it.
+    const image = await kernelCall('exec', {
+      path: COREUTILS,
+      argv,
+      env: Object.entries(environment).map(([name, value]) => `${name}=${value}`),
+      cwd,
+    });
+    const module = await compile(image.asset).catch(error => {
+      throw new Error(`${image.path}: ${error.message} (image ${image.asset})`);
+    });
     const worker = new Worker('/wasi-process.js');
     let settle, status = null;
     const exited = new Promise(resolve => { settle = resolve; });
@@ -103,6 +124,11 @@ export async function exec(stages, options = {}) {
       // What a killed process leaves open, its pipes, closes as it goes.
       io.stdin.reader?.closeReader(); io.stdout.writer?.closeWriter();
       for (const fd of [1, 2]) write(fd, decoders[fd].decode());
+      // exit(2), then wait for it: the registry reaps the zombie at once, as init would.
+      const signal = code >= 128 ? code - 128 : undefined;
+      kernelCall('exit', { pid: image.pid, status: code, signal })
+        .then(() => kernelCall('wait', { pid: image.pid }))
+        .catch(() => { /* it may have ended already */ });
       settle(code);
     };
     worker.onmessage = ({ data }) => {
@@ -112,8 +138,8 @@ export async function exec(stages, options = {}) {
       else if ('exit' in data) end(data.exit);
     };
     worker.onerror = event => { onOutput(2, `${argv[0]}: ${event.message}\n`); end(126); };
-    worker.postMessage({ module, argv, env: env(!io.stdout.tty), umask, sudo, stdin: io.stdin.message, stdout: io.stdout.message, stderr: { tty: true } });
-    const process = { kill: end, exited };
+    worker.postMessage({ module, argv, env: environment, umask, sudo, pid: image.pid, proc: image.token, stdin: io.stdin.message, stdout: io.stdout.message, stderr: { tty: true } });
+    const process = { pid: image.pid, kill: end, exited };
     processes.push(process);
     return process;
   };
@@ -126,22 +152,24 @@ export async function exec(stages, options = {}) {
       input = stdin == null ? terminalInput() : null;
       if (input) onTty(input);
       const pipes = stages.slice(1).map(() => pipeBuffer());
+      const starting = [];
       for (let index = 0; index <= last; index++) {
         const from = index === 0 ? null : pipes[index - 1], to = index === last ? null : pipes[index];
-        start(index, {
+        starting.push(start(index, {
           stdin: from ? { message: { pipe: from }, reader: new Pipe(from) }
             : input ? { message: { pipe: input.pipe.state.buffer, tty: true }, reader: null }
             : { message: { data: encoder.encode(stdin) } },
           stdout: to ? { message: { pipe: to }, writer: new Pipe(to) } : { message: { tty, closed: closed?.buffer }, tty },
-        });
+        }));
       }
+      await Promise.all(starting);
       statuses.push(...await Promise.all(processes.map(process => process.exited)));
     } else {
       // One after another, each given what the one before wrote.
       let given = stdin ?? '';
       for (let index = 0; index <= last && !stopped; index++) {
         const piped = index < last;
-        const process = start(index, {
+        const process = await start(index, {
           stdin: { message: { data: encoder.encode(given), tty: index === 0 && stdin == null } },
           stdout: { message: { tty: !piped && tty }, tty: !piped && tty },
         });
