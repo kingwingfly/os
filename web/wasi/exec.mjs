@@ -7,7 +7,7 @@
 // a line at a time. Pipes are memory the page and its processes share, which a page may have
 // only when isolated from other sites (web/_headers); where it is not, they run one after
 // another, each given what the one before wrote, and nothing reads the terminal.
-import { Pipe, pipeBuffer } from './pipe.js';
+import { PAGE, Pipe, pipeBuffer } from './pipe.js';
 import { kernelCall } from '../kernel/protocol.js';
 import { load } from '../kernel/loader.js';
 import { STRERROR } from '../http.mjs';
@@ -112,6 +112,8 @@ function columns() {
 // Ctrl+D ends a read after what was typed before it, and before what is typed after it.
 function terminalInput() {
   const pipe = new Pipe(pipeBuffer()), queue = [];
+  // The page writes it, as long as the pipeline may read it.
+  pipe.hold(PAGE, 'w');
   let timer = 0;
   const pump = () => {
     timer = 0;

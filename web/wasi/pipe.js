@@ -72,17 +72,16 @@ export class Pipe {
     if (Atomics.sub(this.state, word, taken) - taken > 0) return;
     // A holder of nothing gives its slot back.
     if (Atomics.load(this.state, at + ENDS.r) === 0 && Atomics.load(this.state, at + ENDS.w) === 0) Atomics.compareExchange(this.state, at, pid, 0);
-    this.settle();
+    this.settle(end);
   }
   // What `pid` held goes, as a process's descriptors close when it ends: by its own closes, or
   // by its host's, for one it killed.
   release(pid) {
     const at = this.slot(pid, false);
     if (at < 0) return;
-    Atomics.store(this.state, at + ENDS.r, 0);
-    Atomics.store(this.state, at + ENDS.w, 0);
+    const held = ['r', 'w'].filter(end => Atomics.exchange(this.state, at + ENDS[end], 0) > 0);
     Atomics.store(this.state, at, 0);
-    this.settle();
+    for (const end of held) this.settle(end);
   }
   // How many references every holder has to `end`.
   held(end) {
@@ -90,10 +89,12 @@ export class Pipe {
     for (let index = 0; index < HOLDERS_MAX; index++) count += Atomics.load(this.state, HOLDERS + index * HOLDER + ENDS[end]);
     return count;
   }
-  // An end no holder holds any more is gone.
-  settle() {
-    if (this.held('w') === 0 && !this.writerGone) this.closeWriter();
-    if (this.held('r') === 0 && !this.readerGone) this.closeReader();
+  // The end `end`, which a holder let go of, is gone if no holder holds it any more. Only that
+  // end: the other may have a writer that holds nothing here (the page, writing the terminal).
+  settle(end) {
+    if (this.held(end) > 0) return;
+    if (end === 'w' && !this.writerGone) this.closeWriter();
+    if (end === 'r' && !this.readerGone) this.closeReader();
   }
 
   // ---- Reading ----

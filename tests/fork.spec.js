@@ -269,6 +269,17 @@ const sleeper = (seconds, wait) => {
   `(data (i32.const 1024) "/usr/bin/coreutils") (data (i32.const 1104) "${args}")`);
 };
 const FORK_SLEEP = sleeper(30, true), FORK_ORPHAN = sleeper(3, false);
+// The child ends at once, closing what it inherited, the terminal's input with it; the parent
+// still reads a line typed there, and says it.
+const FORK_READ = wasix(`${FORK} ${JOIN}
+  (import "wasix_32v1" "fd_read" (func $read (param i32 i32 i32 i32) (result i32)))`, `
+    (drop (call $fork (i32.const 1) (i32.const 2060)))
+    (if (i32.eqz (i32.load (i32.const 2060))) (then (call $exit (i32.const 0))))
+    ${WAIT_CHILD}
+    (i32.store (i32.const 2200) (i32.const 3000))
+    (i32.store (i32.const 2204) (i32.const 100))
+    (drop (call $read (i32.const 0) (i32.const 2200) (i32.const 1) (i32.const 2208)))
+    (call $say (i32.const 3000) (i32.load (i32.const 2208)))`);
 
 let base, headers;
 async function uploads(request, files) {
@@ -309,7 +320,7 @@ test.describe('fork in the terminal', () => {
   });
 
   test('a forked child is of its parent\'s job: Ctrl+C ends both; an orphan is init\'s, and reaped as it ends', async ({ page, request }) => {
-    await uploads(request, { 'fork-sleep': FORK_SLEEP, 'fork-orphan': FORK_ORPHAN });
+    await uploads(request, { 'fork-sleep': FORK_SLEEP, 'fork-orphan': FORK_ORPHAN, 'fork-read': FORK_READ });
     await page.goto('/');
     await command(page, `cd ${base}`);
     await connect(page);
@@ -322,6 +333,12 @@ test.describe('fork in the terminal', () => {
     await input.press('Control+c');
     await expect(page.locator('#command').locator('xpath=ancestor::form').locator('.busy')).toHaveText('↵');
     await expect.poll(async () => (await sleeping()).length).toBe(0);
+    // A child's close of the terminal's input closes its own descriptor: its parent reads on.
+    await input.fill('./fork-read'); await input.press('Enter');
+    await expect(page.locator('#command').locator('xpath=ancestor::form').locator('.busy')).toHaveText('Input ↵');
+    await input.fill('typed'); await input.press('Enter');
+    await expect(page.locator('#command').locator('xpath=ancestor::form').locator('.busy')).toHaveText('↵');
+    await expect(page.locator('.transcript pre').last()).toHaveText('typed');
     // The parent ends first: its child is init's, runs on, and is reaped as it ends.
     await command(page, './fork-orphan');
     const orphan = () => call(page, 'poll', { pids: [] }).then(reply => value(reply).find(process => process.argv.join(' ') === 'coreutils sleep 3'));
@@ -350,8 +367,18 @@ test.describe('fork in the terminal', () => {
     // A child's exit status, as its parent waited for it.
     await command(page, `./dash -c 'coreutils false; echo status $?; coreutils true; echo status $?'`);
     await expect(last(page)).toHaveText('status 1\nstatus 0');
-    // Ctrl+Z stops the shell and its child, which waits on it; fg continues both.
+    // Interactive: lines typed into the terminal, a forked child's among them, until exit.
     const input = page.getByRole('combobox', { name: 'Terminal command' });
+    await input.fill('./dash'); await input.press('Enter');
+    const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
+    await expect(busy).toHaveText('Input ↵');
+    await input.fill(`cd ${base}; coreutils echo forked`); await input.press('Enter');
+    await expect(page.locator('.transcript')).toContainText('forked');
+    await input.fill('echo still here'); await input.press('Enter');
+    await expect(page.locator('.transcript')).toContainText('still here');
+    await input.fill('exit'); await input.press('Enter');
+    await expect(busy).toHaveText('↵');
+    // Ctrl+Z stops the shell and its child, which waits on it; fg continues both.
     await input.fill(`./dash -c 'coreutils sleep 2; echo slept'`); await input.press('Enter');
     await page.waitForTimeout(500);
     await input.press('Control+z');
