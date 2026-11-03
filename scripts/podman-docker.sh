@@ -1,6 +1,6 @@
 #!/bin/sh
-# Docker's command line, as far as wrangler uses it, over Podman, for `wrangler dev` (npm run dev
-# sets it up) and `wrangler deploy`:
+# Docker's command line, as far as wrangler uses it, over Podman, for `wrangler dev` and
+# `wrangler deploy` (npm run dev and npm run deploy set it up), or by hand:
 #
 #   WRANGLER_DOCKER_BIN="$PWD/scripts/podman-docker.sh" npx wrangler deploy
 #

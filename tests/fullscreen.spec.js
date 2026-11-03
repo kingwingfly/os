@@ -54,6 +54,14 @@ test('slides remain interactive inside the fullscreen surface', async ({ page })
   expect(await shown()).toBe('1');
   await page.keyboard.press('ArrowRight');
   await expect(page.locator('.slides-current .slide:visible')).toContainText('One filesystem');
+  // The speaker view's clock is under no bar: it may be clicked, to start again, with the bars
+  // shown.
+  await page.mouse.move(640, 300);
+  await page.getByRole('button', { name: 'Speaker view' }).click();
+  const clock = await page.locator('.slides-elapsed').boundingBox();
+  await page.mouse.move(clock.x + clock.width / 2, clock.y + clock.height / 2);
+  await expect.poll(shown).toBe('1');
+  expect(await page.evaluate(([x, y]) => !!document.elementFromPoint(x, y)?.closest('.slides-elapsed'), [clock.x + clock.width / 2, clock.y + clock.height / 2])).toBe(true);
   await page.getByRole('button', { name: 'Close preview' }).click();
   await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
 });

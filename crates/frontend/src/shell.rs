@@ -1,26 +1,43 @@
 //! One terminal tab: its directory, transcript, history and completion, and the commands it
-//! runs. A line is a pipeline: each stage's output is the next one's input. The server runs
-//! file and account commands; text filters, xargs and fd -x run here, as do browser
-//! interactions such as open and upload.
+//! runs. A line is a pipeline: each stage's output is the next one's input. The programs of
+//! user space (crates/userland: ls, rm, chmod...) run here, over system calls; so do text
+//! filters, xargs and fd -x, and browser interactions such as open and upload. The server
+//! still runs what has not moved yet (cp, accounts, archives).
 
 mod commands;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use abi::Call;
 use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt, StreamExt};
 use leptos::prelude::*;
 use serde_json::{Value, json};
+use terminal_worker_core::bin as cli_bin;
 use terminal_worker_core::completion::{self, Candidate, Query};
 use terminal_worker_core::glob::{self, Part};
 use terminal_worker_core::shell::{self as grammar, Delimiter, Word};
 use terminal_worker_core::{Entry, cli, find, resolve, split_command, text};
-use wasm_bindgen::JsValue;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::{
     account_command, cancel_choosing, cancel_uploads, choose_files, completion_focus, endpoint,
-    focus_input, listing, request, set_directory, stop_recording,
+    focus_input, listing, set_directory, stop_recording, sudo,
 };
+
+/// What a program of user space left: its exit status, its output and errors, its listing,
+/// and what fd found.
+struct Exited {
+    status: i32,
+    out: String,
+    err: Vec<String>,
+    view: Option<userland::View>,
+    found: Vec<String>,
+}
 
 /// The most transcript lines kept, ...
 const KEPT: usize = 100;
@@ -30,19 +47,11 @@ const SHOWN: usize = 2000;
 const PIPED_MAX: usize = 10_000_000;
 /// How many paths xargs passes to one command, at most.
 const XARGS_MAX: usize = 1000;
-/// How many commands one batch request runs, at most.
-const BATCH: usize = 100;
 /// How many filesystem lookups one wildcard pattern makes, and paths it expands to, at most.
 const GLOB_LOOKUPS: usize = 1000;
 const GLOB_PATHS: usize = 10_000;
 /// How many of a wildcard's lookups run at once.
 const GLOB_CONCURRENCY: usize = 8;
-
-/// Server commands that xargs and fd -x may run many of in one request.
-const BATCHED: &[&str] = &[
-    "touch", "rm", "mv", "cp", "chmod", "chown", "chgrp", "mkdir", "ls", "whoami", "id", "groups",
-    "ln", "readlink", "getfacl", "setfacl", "getfattr", "setfattr",
-];
 
 #[derive(Clone)]
 pub enum LogLine {
@@ -81,7 +90,9 @@ pub struct CompletionSession {
     pub original: String,
     pub cwd: String,
     pub candidates: Vec<Candidate>,
-    pub selected: usize,
+    /// The candidate in the line, if one is: the first Tab only lists them, so that more may be
+    /// typed to narrow them down (owner's request, 2026-10-28), unless there is only one.
+    pub selected: Option<usize>,
 }
 
 /// Who is signed in, which every tab shares, since it is one session.
@@ -92,21 +103,18 @@ pub struct Account {
     pub home: RwSignal<String>,
 }
 
+/// The programs web/app.js asks for a password for first, in a dialog: a guest's own useradd,
+/// an account's own userdel.
+const DIALOGS: &[&str] = &["useradd", "userdel"];
+
 #[derive(Clone, Copy)]
 pub struct Shell {
     pub id: u64,
     pub account: Account,
     pub cwd: RwSignal<String>,
-    pub entries: RwSignal<Vec<Entry>>,
     pub lines: RwSignal<Vec<LogLine>>,
     pub input: RwSignal<String>,
     pub busy: RwSignal<bool>,
-    pub directory_error: RwSignal<String>,
-    /// What the file panel says of the last thing clicked in it, which the terminal, perhaps
-    /// hidden, would say alone: a refusal, or the error of the line it ran ...
-    pub notice: RwSignal<String>,
-    /// ... while the running line is one the panel started.
-    panel: RwSignal<bool>,
     pub history: RwSignal<Vec<String>>,
     pub history_index: RwSignal<usize>,
     pub completion: RwSignal<Option<CompletionSession>>,
@@ -129,6 +137,54 @@ pub struct Shell {
     /// The answer a running command waits for, if any.
     prompt: StoredValue<Option<oneshot::Sender<String>>>,
     pub asking: RwSignal<bool>,
+    /// The terminal's input, while the running line's first process may read it
+    /// (web/wasi/exec.mjs): the lines typed go to it, and Ctrl+D ends a read ...
+    terminal: StoredValue<Option<JsValue>, LocalStorage>,
+    /// ... which it waits on now.
+    pub reading: RwSignal<bool>,
+}
+
+/// What a pipeline of processes showed in the transcript as they wrote: the line of the last's
+/// output, how many lines it shows (up to [`SHOWN`]) and how many more there were; and the
+/// part of an error line written so far.
+#[derive(Default)]
+struct Shown {
+    line: Option<RwSignal<String>>,
+    lines: usize,
+    hidden: usize,
+    partial: String,
+}
+impl Shown {
+    /// What of `text`, written to standard output, shows: up to [`SHOWN`] lines in all.
+    fn output(&mut self, text: &str) -> Option<String> {
+        if self.lines >= SHOWN {
+            self.hidden += text.matches('\n').count();
+            return None;
+        }
+        for (at, _) in text.match_indices('\n') {
+            self.lines += 1;
+            if self.lines >= SHOWN {
+                self.hidden += text[at + 1..].matches('\n').count();
+                return Some(text[..=at].to_string());
+            }
+        }
+        Some(text.to_string())
+    }
+    /// The lines `text`, written to standard error, completes, after what was written before.
+    fn error(&mut self, text: &str) -> Vec<String> {
+        self.partial.push_str(text);
+        let mut lines = Vec::new();
+        while let Some(at) = self.partial.find('\n') {
+            lines.push(self.partial[..at].to_string());
+            self.partial.drain(..=at);
+        }
+        lines
+    }
+}
+
+/// What an output says of the `count` lines past [`SHOWN`] that it does not show.
+fn more_lines(count: usize) -> String {
+    format!("… {count} more lines; pipe the output into head, tail or grep to see them")
 }
 
 /// Wait `ms` milliseconds.
@@ -140,27 +196,44 @@ async fn sleep(ms: i32) {
     });
     let _ = JsFuture::from(promise).await;
 }
-fn js_message(error: JsValue) -> String {
+/// Call `object`'s method `name` with `argument`, as JavaScript would.
+fn call(object: &JsValue, name: &str, argument: &JsValue) {
+    if let Some(method) = js_sys::Reflect::get(object, &JsValue::from_str(name))
+        .ok()
+        .and_then(|method| method.dyn_into::<js_sys::Function>().ok())
+    {
+        let _ = method.call1(object, argument);
+    }
+}
+/// The process the stage `args` runs, if it is one: a utility of /usr/bin's coreutils the
+/// terminal has no program of its own for (by name, by its path, or as `coreutils NAME`), with
+/// the arguments it is given. [`Shell::invoke`] runs it so, and a pipeline at once with the
+/// processes beside it.
+fn process(args: &[String]) -> Option<Vec<String>> {
+    let mut args = args.to_vec();
+    if let Some(named) = cli_bin::named(args.first()?) {
+        args[0] = named.to_string();
+    }
+    let name = args[0].clone();
+    if cli::wants_help(&args) && cli::help(&name).is_some() {
+        return None;
+    }
+    if name == "coreutils" {
+        args.remove(0);
+        cli_bin::program(args.first()?)?;
+        return Some(args);
+    }
+    let own = commands::find(&name).is_some()
+        || cli::definition(&name).is_some()
+        || userland::PROGRAMS.contains(&name.as_str());
+    (cli_bin::program(&name).is_some() && !own).then_some(args)
+}
+pub(crate) fn js_message(error: JsValue) -> String {
     js_sys::Reflect::get(&error, &JsValue::from_str("message"))
         .ok()
         .and_then(|v| v.as_string())
         .or_else(|| error.as_string())
         .unwrap_or_else(|| "Operation failed".into())
-}
-/// Whether `args` are mv or cp -i, under sudo or not, which ask before replacing a file: run
-/// one by one, never in a batch, however xargs or fd -x start them. As on Linux, the last of -i,
-/// -n and -f is what counts.
-fn asks(args: &[String]) -> bool {
-    let args = &args[usize::from(args.first().is_some_and(|a| a == "sudo"))..];
-    match args.split_first() {
-        Some((name, rest)) if name == "cp" => {
-            cli::parse::<cli::files::Cp>(rest).is_ok_and(|cp| cp.interactive)
-        }
-        Some((name, rest)) if name == "mv" => {
-            cli::parse::<cli::files::Mv>(rest).is_ok_and(|mv| mv.interactive)
-        }
-        _ => false,
-    }
 }
 /// `args`, a command line clap accepts, as web/app.js reads it for the commands it runs itself,
 /// with their dialogs: as clap read them, options before operands and -- gone (sudo -ubob is
@@ -218,12 +291,13 @@ fn listing_text(entries: &[Entry], long: bool) -> String {
         .map(|e| {
             if long {
                 format!(
-                    "{} {:>2} {} {} {:>8} {}{}\n",
+                    "{} {:>2} {} {} {:>8} {} {}{}\n",
                     e.mode_line(),
                     e.links,
                     e.owner,
                     e.group,
                     e.size,
+                    crate::listed(e.mtime),
                     e.name,
                     e.link
                         .as_ref()
@@ -269,13 +343,9 @@ impl Shell {
             id,
             account,
             cwd: RwSignal::new(cwd),
-            entries: RwSignal::new(Vec::new()),
             lines: RwSignal::new(Vec::new()),
             input: RwSignal::new(String::new()),
             busy: RwSignal::new(false),
-            directory_error: RwSignal::new(String::new()),
-            notice: RwSignal::new(String::new()),
-            panel: RwSignal::new(false),
             history: RwSignal::new(history),
             history_index: RwSignal::new(index),
             completion: RwSignal::new(None),
@@ -291,6 +361,8 @@ impl Shell {
             detached: RwSignal::new(false),
             prompt: StoredValue::new(None),
             asking: RwSignal::new(false),
+            terminal: StoredValue::new_local(None),
+            reading: RwSignal::new(false),
         }
     }
     fn push(self, line: LogLine) {
@@ -306,10 +378,8 @@ impl Shell {
         let count = value.lines().count();
         let value = if count > SHOWN {
             let mut kept: String = value.lines().take(SHOWN).collect::<Vec<_>>().join("\n");
-            kept.push_str(&format!(
-                "\n… {} more lines; pipe the output into head, tail or grep to see them",
-                count - SHOWN
-            ));
+            kept.push('\n');
+            kept.push_str(&more_lines(count - SHOWN));
             kept
         } else {
             value
@@ -317,42 +387,21 @@ impl Shell {
         self.push(LogLine::Text(value));
     }
     fn error(self, message: impl AsRef<str>) {
-        if self.panel.get_untracked() {
-            self.notice.set(message.as_ref().into());
-        }
         self.log(format!("! {}", message.as_ref()));
     }
-    /// Run `command` for the file panel, which shows its errors, and says so when the tab is
-    /// busy, rather than leave a click unanswered while the terminal may be hidden.
-    pub fn run_from_panel(self, command: String) {
-        if self.busy.get_untracked() || self.asking.get_untracked() {
-            self.notice.set(
-                "A command is running in this tab; wait for it, or stop it with Ctrl+C".into(),
-            );
-            return;
-        }
-        self.panel.set(true);
-        self.run(command);
-    }
+    /// Learn the account again, which a command may have changed, and let the Files list their
+    /// directory again, which it may have changed too.
     pub async fn refresh(self) -> Result<(), String> {
-        if let Ok(value) = request("/api/session", "GET").await {
-            self.account.writable.set(value["authenticated"] == true);
-            self.account
-                .username
-                .set(value["username"].as_str().unwrap_or("guest").into());
-            self.account
-                .home
-                .set(value["home"].as_str().unwrap_or("/").into());
+        if let Ok(creds) =
+            userland::sys::call::<abi::Creds>(&crate::sys::HttpSys::default(), abi::Call::Getcreds)
+                .await
+        {
+            self.account.writable.set(creds.signed_in);
+            self.account.username.set(creds.user);
+            self.account.home.set(creds.home);
         }
-        match listing(&self.cwd.get_untracked()).await {
-            Ok(entries) => {
-                self.entries.set(entries);
-                self.directory_error.set(String::new());
-            }
-            Err(error) => {
-                self.entries.set(Vec::new());
-                self.directory_error.set(error);
-            }
+        if let Some(files) = crate::files::files() {
+            files.refresh();
         }
         Ok(())
     }
@@ -415,31 +464,77 @@ impl Shell {
         Ok(out)
     }
     async fn manage(self, args: &[String], piped: bool) -> Result<Output, String> {
+        let sudo = args.first().is_some_and(|a| a == "sudo");
+        let argv = &args[usize::from(sudo)..];
+        // zip, unzip, tar and faststart are processes (spawn), done apart; the tab follows one.
+        if matches!(
+            argv.first().map(String::as_str),
+            Some("zip" | "unzip" | "tar" | "faststart")
+        ) {
+            cli::check(argv)?;
+            if sudo
+                && JsFuture::from(crate::sudo())
+                    .await
+                    .map_err(js_message)?
+                    .as_bool()
+                    != Some(true)
+            {
+                return Err("sudo canceled".into());
+            }
+            let sys = crate::sys::HttpSys {
+                sudo,
+                ..Default::default()
+            };
+            let spawn = abi::Call::Spawn {
+                argv: argv.to_vec(),
+                cwd: self.cwd.get_untracked(),
+            };
+            let spawned: Value = userland::sys::call(&sys, spawn)
+                .await
+                .map_err(|error| error.to_string())?;
+            let pid = spawned["pid"].as_str().unwrap_or_default().to_string();
+            let stdin = spawned["stdin"].as_u64().unwrap_or(u64::from(u32::MAX)) as u32;
+            let followed = self.follow(&pid, stdin, piped).await;
+            // Its standard input is let go of as it ends, or as this tab stops following it.
+            userland::sys::calls::<Value>(&sys, vec![Call::Close { fd: stdin.into() }]).await;
+            return followed;
+        }
         let value = self.call(args).await?;
-        // zip, unzip and tar start a job on the server; the tab follows it.
-        if let Some(job) = value["job"].as_str() {
-            return self.follow(job, piped).await;
+        // Not one of web/app.js's dialogs: a program of user space.
+        if value["program"] == true {
+            return self.program(argv.to_vec(), None, piped, sudo).await;
         }
         let out = self.output(&value, piped)?;
         self.refresh().await?;
         Ok(out)
     }
-    /// Follow the job `id` to its end: write its lines as they come, answer its question in
-    /// this tab, and cancel it on Ctrl+C.
-    async fn follow(self, id: &str, piped: bool) -> Result<Output, String> {
+    /// Follow the process `id` to its end: write its lines as they come, answer its question in
+    /// this tab (its stdin), and signal it on Ctrl+C.
+    async fn follow(self, id: &str, stdin: u32, piped: bool) -> Result<Output, String> {
+        let sys = crate::sys::HttpSys::default();
         let mut out = Output::default();
         let mut since = 0;
         let mut cancelling = false;
         loop {
-            // A closed tab stops following; the job goes on, and jobs lists it.
+            // A closed tab stops following; the process goes on, and jobs lists it.
             if self.detached.get_untracked() {
                 return Ok(out);
             }
             if self.cancelled() && !cancelling {
                 cancelling = true;
-                request(&format!("/api/jobs?id={id}"), "DELETE").await?;
+                userland::sys::call::<Value>(&sys, Call::Kill { pid: id.into() })
+                    .await
+                    .map_err(|error| error.to_string())?;
             }
-            let view = request(&format!("/api/jobs?id={id}&since={since}"), "GET").await?;
+            let view: Value = userland::sys::call(
+                &sys,
+                Call::Wait {
+                    pid: id.into(),
+                    since,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             for line in view["lines"].as_array().into_iter().flatten() {
                 since = line[0].as_u64().unwrap_or(since);
                 let text = line[2].as_str().unwrap_or_default();
@@ -452,7 +547,7 @@ impl Shell {
                     self.log(text);
                 }
             }
-            // A page at a time: what a job wrote before it ended is all read before it is
+            // A page at a time: what a process wrote before it ended is all read before it is
             // taken to have ended.
             if view["more"] == true {
                 continue;
@@ -471,12 +566,18 @@ impl Shell {
                     if self.cancelled() {
                         continue;
                     }
-                    let body = json!({"decisions": decisions});
-                    let request =
-                        gloo_net::http::Request::post(&format!("/api/jobs/answer?id={id}"))
-                            .json(&body)
-                            .map_err(|e| e.to_string())?;
-                    request.send().await.map_err(|e| e.to_string())?;
+                    // Its answer goes to its standard input.
+                    let answer = Call::Pwrite {
+                        fd: stdin.into(),
+                        index: 0,
+                        data: json!({ "decisions": decisions })
+                            .to_string()
+                            .into_bytes()
+                            .into(),
+                    };
+                    userland::sys::call::<Value>(&sys, answer)
+                        .await
+                        .map_err(|error| error.to_string())?;
                     continue;
                 }
                 _ => {}
@@ -522,47 +623,54 @@ impl Shell {
         }
         decisions
     }
-    /// The jobs and unfinished uploads of this account, or, given the ID of `jobs cancel ID`,
-    /// cancel that one.
+    /// The jobs of this account, and the files this browser is writing (its descriptors, as
+    /// /proc/self/fd lists them), or, given `jobs cancel ID`, cancel that one: a job, or a
+    /// descriptor (`fdN`), closed, which completes a recording with what arrived and leaves an
+    /// upload, removed if it was making the file.
     async fn jobs(self, cancel: Option<&str>) -> Result<Output, String> {
-        let value = request("/api/jobs", "GET").await?;
-        let jobs = value["jobs"].as_array().cloned().unwrap_or_default();
-        let uploads = value["uploads"].as_array().cloned().unwrap_or_default();
+        use abi::O_APPEND;
+        use userland::procs::{Descriptor, descriptors, processes};
+        let sys = crate::sys::HttpSys::default();
+        let jobs = processes(&sys).await.unwrap_or_default();
+        // Uploads and recordings: descriptors writing files, not a process's standard input
+        // (/proc/PID/fd/0) nor a device.
+        let fds: Vec<Descriptor> = descriptors(&sys)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|fd| {
+                fd.flags & 3 != 0 && !fd.path.starts_with("/proc/") && !fd.path.starts_with("/dev/")
+            })
+            .collect();
+        let recording = |fd: &Descriptor| fd.flags & O_APPEND != 0;
         match cancel {
             None => {
                 let mut text = String::new();
                 for job in &jobs {
-                    let command = &job["command"];
-                    let archive = command["archive"]
-                        .as_str()
-                        .or(command["file"].as_str())
-                        .unwrap_or_default();
-                    let progress = &job["progress"];
                     text.push_str(&format!(
-                        "{}  {:<10} {} {}  {}/{}\n",
-                        &job["id"].as_str().unwrap_or_default()[..8],
-                        job["state"].as_str().unwrap_or_default(),
-                        job["kind"].as_str().unwrap_or_default(),
-                        archive,
-                        progress["done"].as_u64().unwrap_or(0),
-                        progress["total"].as_u64().unwrap_or(0),
+                        "{}  {:<10} {}  {}/{}\n",
+                        job.pid.get(..8).unwrap_or(&job.pid),
+                        job.state,
+                        job.command(),
+                        job.done,
+                        job.total,
                     ));
                 }
-                for upload in &uploads {
-                    let id = &upload["id"].as_str().unwrap_or_default()[..8];
-                    let path = upload["path"].as_str().unwrap_or_default();
-                    let size = upload["size"].as_u64().unwrap_or(0);
+                for fd in &fds {
+                    let id = format!("fd{}", fd.fd);
                     // A recording has as many bytes as have arrived, and grows.
-                    if upload["recording"] == true {
+                    if recording(fd) {
                         text.push_str(&format!(
-                            "{id}  recording  {path}  {}\n",
-                            crate::viewer::size(size)
+                            "{id:<8}  recording  {}  {}\n",
+                            fd.path,
+                            crate::viewer::size(fd.size)
                         ));
                         continue;
                     }
                     text.push_str(&format!(
-                        "{id}  uploading  {path}  {}%\n",
-                        upload["received"].as_u64().unwrap_or(0) * 100 / size.max(1),
+                        "{id:<8}  uploading  {}  {}%\n",
+                        fd.path,
+                        fd.received * 100 / fd.size.max(1),
                     ));
                 }
                 if text.is_empty() {
@@ -571,21 +679,36 @@ impl Shell {
                 Ok(Output::text(text))
             }
             Some(wanted) => {
-                let starts = |v: &Value| v["id"].as_str().is_some_and(|id| id.starts_with(wanted));
-                if let Some(job) = jobs.iter().find(|j| starts(j)) {
-                    let id = job["id"].as_str().unwrap_or_default();
-                    request(&format!("/api/jobs?id={id}"), "DELETE").await?;
-                    Ok(Output::text(format!("Cancelling job {}\n", &id[..8])))
-                } else if let Some(upload) = uploads.iter().find(|u| starts(u)) {
-                    let id = upload["id"].as_str().unwrap_or_default();
-                    let path = upload["path"].as_str().unwrap_or_default();
-                    request(&format!("/api/uploads?id={id}"), "DELETE").await?;
+                if let Some(job) = jobs.iter().find(|job| job.pid.starts_with(wanted)) {
+                    userland::sys::call::<Value>(
+                        &sys,
+                        Call::Kill {
+                            pid: job.pid.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    Ok(Output::text(format!(
+                        "Cancelling job {}\n",
+                        job.pid.get(..8).unwrap_or(&job.pid)
+                    )))
+                } else if let Some(fd) = fds.iter().find(|fd| format!("fd{}", fd.fd) == wanted) {
+                    let mut calls = vec![Call::Close { fd: fd.fd.into() }];
+                    if fd.created && !recording(fd) {
+                        calls.push(Call::Unlink {
+                            path: fd.path.clone(),
+                        });
+                    }
+                    userland::sys::calls::<Value>(&sys, calls).await;
                     self.refresh().await?;
                     // A recording stops, keeping what arrived; an upload is cancelled.
-                    Ok(Output::text(if upload["recording"] == true {
-                        format!("Stopped the recording of {path}; what arrived is kept\n")
+                    Ok(Output::text(if recording(fd) {
+                        format!(
+                            "Stopped the recording of {}; what arrived is kept\n",
+                            fd.path
+                        )
                     } else {
-                        format!("Cancelled the upload of {path}\n")
+                        format!("Cancelled the upload of {}\n", fd.path)
                     }))
                 } else {
                     Err(format!("jobs: no job or upload {wanted}"))
@@ -593,69 +716,9 @@ impl Shell {
             }
         }
     }
-    /// Run commands on the server, a batch a request, each in its own transaction.
-    async fn batch(self, commands: Vec<Vec<String>>, trace: bool) -> Output {
-        let mut out = Output::default();
-        for group in commands.chunks(BATCH) {
-            if self.cancelled() {
-                break;
-            }
-            if trace {
-                for command in group {
-                    self.log(format!("+ {}", command.join(" ")));
-                }
-            }
-            let cwd = self.cwd.get_untracked();
-            let body = json!({"batch": group.iter().map(|args| json!({"args": args, "cwd": cwd})).collect::<Vec<_>>()});
-            let reply = match gloo_net::http::Request::post("/api/command").json(&body) {
-                Ok(request) => request.send().await.map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            };
-            let value: Result<Value, String> = match reply {
-                Ok(response) if response.ok() => response.json().await.map_err(|e| e.to_string()),
-                Ok(response) => Err(response
-                    .json::<Value>()
-                    .await
-                    .ok()
-                    .and_then(|v| v["error"].as_str().map(String::from))
-                    .unwrap_or_else(|| format!("Request failed ({})", response.status()))),
-                Err(e) => Err(e),
-            };
-            match value {
-                Ok(value) => {
-                    for result in value["results"].as_array().into_iter().flatten() {
-                        if let Some(error) = result["error"].as_str() {
-                            self.error(error);
-                            out.failed = true;
-                        } else if let Ok(o) = self.output(result, true) {
-                            out.stdout.push_str(&o.stdout);
-                            out.failed |= o.failed;
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.error(e);
-                    out.failed = true;
-                    break;
-                }
-            }
-        }
-        let _ = self.refresh().await;
-        out
-    }
-    /// Run each of `commands` as xargs or fd -x would: the server's in batches, others one by
-    /// one. Their output joins in order; a failure does not stop the next.
+    /// Run each of `commands` as xargs or fd -x would, one by one. Their output joins in order;
+    /// a failure does not stop the next.
     async fn run_all(self, commands: Vec<Vec<String>>, trace: bool) -> Output {
-        let Some(first) = commands.first() else {
-            return Output::default();
-        };
-        if BATCHED.contains(&first[0].as_str())
-            && commands
-                .iter()
-                .all(|c| c[0] == first[0] && !cli::wants_help(c) && !asks(c))
-        {
-            return self.batch(commands, trace).await;
-        }
         let mut out = Output::default();
         for command in commands {
             if self.cancelled() {
@@ -789,17 +852,13 @@ impl Shell {
         out.failed |= self.cancelled();
         Ok(out)
     }
-    /// fd with -x or -X: the server searches, and this runs the command on what it found.
+    /// fd with -x or -X: fd searches, and this runs the command on what it found.
     async fn fd_exec(self, args: &[String]) -> Result<Output, String> {
         let search = find::parse(&args[1..])?;
         let Some((all, template)) = search.exec else {
-            return self.manage(args, true).await;
+            return self.program(args.to_vec(), None, true, false).await;
         };
-        // The server searches as the line says, leaving the command to this.
-        let value = self.call(args).await?;
-        let found = self.output(&value, true)?;
-        let results: Vec<String> =
-            serde_json::from_value(value["results"].clone()).unwrap_or_default();
+        let (found, results) = self.find(args).await;
         if results.is_empty() {
             return Ok(Output {
                 failed: found.failed,
@@ -829,62 +888,290 @@ impl Shell {
         self.asking.set(false);
         answer
     }
-    /// mv or cp -i, under sudo too: the server does what replaces nothing, and names each file
-    /// that exists, which this asks about, in turn, before replacing it as the same account.
-    async fn interactive(self, args: &[String]) -> Result<Output, String> {
-        let sudo = usize::from(args[0] == "sudo");
-        let command = args[sudo].clone();
-        // The options again, for each replacement, long ones too (--archive), less -i, which may
-        // come with others, as in -ri; the -f after them overrides any -n.
-        let mut options = Vec::new();
-        for arg in args[sudo + 1..].iter().take_while(|a| a.as_str() != "--") {
-            if arg.starts_with("--") {
-                if arg != "--interactive" {
-                    options.push(arg.clone());
+    /// Run the program of user space `args[0]`, under sudo if `sudo`, with `stdin`: what it
+    /// left. Its questions (mv -i) go to this tab's next line, and Ctrl+C stops it between
+    /// steps.
+    async fn exec(self, args: Vec<String>, stdin: Option<String>, sudo: bool) -> Exited {
+        let cancelled = move || self.cancelled();
+        let ask = move |question: String| {
+            Box::pin(async move { Some(self.ask(question).await) })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>>>>
+        };
+        let mut io = userland::Io {
+            args,
+            cwd: self.cwd.get_untracked(),
+            home: self.account.home.get_untracked(),
+            now: (js_sys::Date::now() / 1000.0) as u64,
+            stdin,
+            out: String::new(),
+            err: Vec::new(),
+            view: None,
+            found: Vec::new(),
+            cancelled: &cancelled,
+            ask: &ask,
+        };
+        let sys = crate::sys::HttpSys {
+            sudo,
+            ..Default::default()
+        };
+        let status = userland::run(&sys, &mut io).await.unwrap_or(127);
+        Exited {
+            status,
+            out: io.out,
+            err: io.err,
+            view: io.view,
+            found: io.found,
+        }
+    }
+    /// Run coreutils' utility `args[0]` (a name the terminal has no program of its own for, or
+    /// `coreutils NAME`), as a process of its own: what it writes goes on, its errors to the
+    /// transcript. Ctrl+C kills it.
+    pub async fn bin(
+        self,
+        args: Vec<String>,
+        stdin: Option<String>,
+        piped: bool,
+        sudo: bool,
+    ) -> Result<Output, String> {
+        self.processes(vec![args], stdin, false, piped, sudo, None)
+            .await
+    }
+    /// Run `stages`, each a utility of coreutils and its arguments, as a pipeline of processes
+    /// (web/wasi/exec.mjs), given `stdin`, or reading the terminal if `terminal` says so: the
+    /// lines typed then go to the first, and Ctrl+D ends its reads. What the last writes goes on
+    /// if `piped`, of which its reader takes `enough` lines, if it says; to the transcript
+    /// otherwise, as it writes it. What any writes to standard error goes to the transcript, a
+    /// line at a time. Ctrl+C kills them.
+    pub async fn processes(
+        self,
+        mut stages: Vec<Vec<String>>,
+        stdin: Option<String>,
+        terminal: bool,
+        piped: bool,
+        sudo: bool,
+        enough: Option<usize>,
+    ) -> Result<Output, String> {
+        for args in &mut stages {
+            args[0] = cli_bin::program(&args[0]).unwrap_or_default().to_string();
+        }
+        let set = |options: &js_sys::Object, key: &str, value: JsValue| {
+            let _ = js_sys::Reflect::set(options, &JsValue::from_str(key), &value);
+        };
+        let options = js_sys::Object::new();
+        set(&options, "cwd", self.cwd.get_untracked().into());
+        set(&options, "home", self.account.home.get_untracked().into());
+        set(
+            &options,
+            "user",
+            self.account.username.get_untracked().into(),
+        );
+        // None is the terminal's input; nothing to read is an empty one.
+        let stdin = match stdin {
+            Some(text) => JsValue::from(text),
+            None if terminal => JsValue::NULL,
+            None => JsValue::from(""),
+        };
+        set(&options, "stdin", stdin);
+        set(&options, "sudo", sudo.into());
+        set(&options, "tty", (!piped).into());
+        if let Some(enough) = enough {
+            set(&options, "enough", (enough as f64).into());
+        }
+        let cancelled = Closure::<dyn Fn() -> bool>::new(move || self.cancelled());
+        set(&options, "cancelled", cancelled.as_ref().clone());
+        // What they write to the terminal shows as they write it: the last's output, a line of
+        // the transcript that grows, a new one after anything else shows; errors a line at a time.
+        let shown = Rc::new(RefCell::new(Shown::default()));
+        let output = Closure::<dyn Fn(u32, String)>::new({
+            let shown = shown.clone();
+            move |fd: u32, text: String| {
+                if fd == 2 {
+                    let lines = shown.borrow_mut().error(&text);
+                    for line in lines {
+                        self.error(line);
+                    }
+                    return;
                 }
-            } else if arg.starts_with('-') && arg.len() > 1 {
-                let rest: String = arg[1..].chars().filter(|c| *c != 'i').collect();
-                if !rest.is_empty() {
-                    options.push(format!("-{rest}"));
+                // NULs end lines, as the transcript shows any stage's output.
+                let Some(text) = shown.borrow_mut().output(&text.replace('\0', "\n")) else {
+                    return;
+                };
+                let current = shown.borrow().line;
+                let live = self.lines.with_untracked(
+                    |lines| matches!(lines.last(), Some(LogLine::Live(line)) if Some(*line) == current),
+                );
+                let line = match current {
+                    Some(line) if live => line,
+                    _ => {
+                        let line = RwSignal::new(String::new());
+                        self.push(LogLine::Live(line));
+                        shown.borrow_mut().line = Some(line);
+                        line
+                    }
+                };
+                line.update(|line| line.push_str(&text));
+            }
+        });
+        set(&options, "onOutput", output.as_ref().clone());
+        let tty = Closure::<dyn Fn(JsValue)>::new(move |input: JsValue| {
+            let input = (!input.is_null() && !input.is_undefined()).then_some(input);
+            if input.is_none() {
+                self.reading.set(false);
+            }
+            self.terminal.set_value(input);
+        });
+        set(&options, "onTty", tty.as_ref().clone());
+        let reading = Closure::<dyn Fn()>::new({
+            let shown = shown.clone();
+            move || {
+                // A prompt written to standard error, its line not ended, shows as it waits.
+                let prompt = std::mem::take(&mut shown.borrow_mut().partial);
+                if !prompt.is_empty() {
+                    self.error(prompt);
                 }
+                self.reading.set(true);
+            }
+        });
+        set(&options, "onReading", reading.as_ref().clone());
+        let names: Vec<String> = stages.iter().map(|args| args[0].clone()).collect();
+        let argvs = js_sys::Array::new();
+        for args in stages {
+            argvs.push(
+                &args
+                    .into_iter()
+                    .map(JsValue::from)
+                    .collect::<js_sys::Array>(),
+            );
+        }
+        let exited = JsFuture::from(crate::exec(&argvs, &options.into())).await;
+        self.terminal.set_value(None);
+        self.reading.set(false);
+        drop((cancelled, output, tty, reading));
+        let exited = exited.map_err(js_message)?;
+        // What is left of an error line, and how much output was not shown.
+        let Shown {
+            line,
+            hidden,
+            partial,
+            ..
+        } = shown.take();
+        if !partial.is_empty() {
+            self.error(partial);
+        }
+        if hidden > 0
+            && let Some(line) = line
+        {
+            line.update(|line| {
+                line.truncate(line.trim_end_matches('\n').len());
+                line.push('\n');
+                line.push_str(&more_lines(hidden));
+            });
+        }
+        let field = |key: &str| js_sys::Reflect::get(&exited, &JsValue::from_str(key)).ok();
+        let status = field("status").and_then(|v| v.as_f64()).unwrap_or(1.0) as i32;
+        let stdout = field("stdout")
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        let name = names.last().cloned().unwrap_or_default();
+        if field("truncated").and_then(|v| v.as_bool()) == Some(true) {
+            self.error(format!(
+                "{name}: output larger than 10 MB was cut short, and {name} stopped"
+            ));
+        }
+        if names.iter().any(|name| cli_bin::writes(name)) {
+            self.refresh().await?;
+        }
+        Ok(Output {
+            stdout,
+            failed: status != 0,
+            ..Default::default()
+        })
+    }
+    /// End of input, Ctrl+D, for the process reading the terminal, if one may: what is typed goes
+    /// as it is, without a newline, or, if nothing is, its read ends with nothing.
+    pub fn end_of_input(self) -> bool {
+        let Some(input) = self.terminal.get_value() else {
+            return false;
+        };
+        let typed = self.input.get_untracked();
+        self.input.set(String::new());
+        self.reading.set(false);
+        if typed.is_empty() {
+            call(&input, "eof", &JsValue::UNDEFINED);
+        } else {
+            self.log(typed.clone());
+            call(&input, "write", &typed.into());
+        }
+        true
+    }
+    /// Run the program of user space `args[0]` as a stage: its errors go to the transcript, and
+    /// its listing as a view of its own unless piped.
+    pub async fn program(
+        self,
+        args: Vec<String>,
+        stdin: Option<String>,
+        piped: bool,
+        sudo: bool,
+    ) -> Result<Output, String> {
+        let changes = !matches!(
+            args[0].as_str(),
+            "ls" | "stat" | "readlink" | "realpath" | "getfacl" | "getfattr" | "fd"
+        );
+        let io = self.exec(args, stdin, sudo).await;
+        let status = io.status;
+        for line in io.err {
+            self.error(line);
+        }
+        let mut out = Output {
+            stdout: io.out,
+            failed: status != 0,
+            ..Default::default()
+        };
+        if let Some(userland::View::Listing { entries, long }) = io.view {
+            if piped {
+                out.stdout = listing_text(&entries, long);
+            } else if entries.is_empty() {
+                out.stdout = "(empty directory)\n".into();
+            } else {
+                out.view = Some(LogLine::Listing { entries, long });
             }
         }
-        let value = self.call(args).await?;
-        let mut out = self.output(&value, true)?;
-        for pair in value["existing"].as_array().into_iter().flatten() {
-            if self.cancelled() {
-                break;
-            }
-            let (Some(src), Some(target)) = (pair[0].as_str(), pair[1].as_str()) else {
-                continue;
-            };
-            let answer = self
-                .ask(format!("{command}: overwrite '{target}'? (y/n)"))
-                .await;
-            if self.cancelled() || !answer.trim().to_lowercase().starts_with('y') {
-                continue;
-            }
-            let run: Vec<String> = args[..sudo]
-                .iter()
-                .cloned()
-                .chain([command.clone()])
-                .chain(options.iter().cloned())
-                .chain(["-f", "--", src, target].map(String::from))
-                .collect();
-            match self.call(&run).await.and_then(|v| self.output(&v, true)) {
-                Ok(o) => {
-                    out.stdout.push_str(&o.stdout);
-                    out.failed |= o.failed;
-                }
-                Err(e) => {
-                    self.error(e);
-                    out.failed = true;
-                }
-            }
+        if changes {
+            self.refresh().await?;
         }
-        out.failed |= self.cancelled();
-        self.refresh().await?;
         Ok(out)
+    }
+    /// sudo PROGRAM ...: a program of user space, run as root once the account has authenticated
+    /// (sudo's password, asked for if it has not lately).
+    pub async fn sudo_program(
+        self,
+        args: Vec<String>,
+        stdin: Option<String>,
+        piped: bool,
+    ) -> Result<Output, String> {
+        if !self.authenticated().await? {
+            return Err("sudo canceled".into());
+        }
+        self.program(args, stdin, piped, true).await
+    }
+    /// Whether the account may act as root now: sudo's password, asked for if it has not been
+    /// lately.
+    pub async fn authenticated(self) -> Result<bool, String> {
+        let allowed = JsFuture::from(sudo()).await.map_err(js_message)?;
+        Ok(allowed.as_bool() == Some(true))
+    }
+    /// What fd finds, as `args` say: whether it failed, and its results, by path.
+    async fn find(self, args: &[String]) -> (Output, Vec<String>) {
+        let io = self.exec(args.to_vec(), None, false).await;
+        let status = io.status;
+        for line in io.err {
+            self.error(line);
+        }
+        let out = Output {
+            failed: status != 0,
+            ..Default::default()
+        };
+        (out, io.found)
     }
 
     /// Run one command, with what the previous stage wrote, if any. `piped`: whether its output
@@ -896,9 +1183,18 @@ impl Shell {
         piped: bool,
     ) -> LocalBoxFuture<'static, Result<Output, String>> {
         async move {
-            let Some(name) = args.first().cloned() else {
+            let Some(mut name) = args.first().cloned() else {
                 return Ok(Output::default());
             };
+            let mut args = args;
+            // A path to /usr/bin runs what its name does, as PATH would have found it.
+            if let Some(named) = cli_bin::named(&name) {
+                if cli::definition(named).is_none() && cli_bin::program(named).is_none() {
+                    return Err(format!("{name}: No such file or directory"));
+                }
+                name = named.to_string();
+                args[0] = name.clone();
+            }
             // Help is the tab's, made from the command's definition: nothing is asked of the
             // server. Under sudo, it is the command sudo runs that is asked about.
             if cli::wants_help(&args) {
@@ -910,6 +1206,28 @@ impl Shell {
                     return Ok(Output::text(help + "\n"));
                 }
             }
+            // A guest's own useradd and an account's own userdel take a password, in web/app.js's
+            // dialog, which hands back what is not that to run here.
+            if userland::PROGRAMS.contains(&name.as_str())
+                && commands::find(&name).is_none()
+                && !DIALOGS.contains(&name.as_str())
+            {
+                return self.program(args, stdin, piped, false).await;
+            }
+            // A name the terminal has nothing of its own for runs coreutils', as PATH finds it,
+            // and `coreutils NAME` uutils' NAME.
+            if let Some(argv) = process(&args) {
+                return self.bin(argv, stdin, piped, false).await;
+            }
+            if name == "coreutils" {
+                return match args.get(1) {
+                    None => Ok(Output::text(format!(
+                        "coreutils (uutils): {}\n",
+                        cli_bin::PROGRAMS.join(" ")
+                    ))),
+                    Some(utility) => Err(format!("coreutils: {utility}: no such utility")),
+                };
+            }
             match commands::find(&name) {
                 Some(command) => command.run(self, args, stdin, piped).await,
                 // What the server runs, or web/app.js with its dialogs.
@@ -918,6 +1236,19 @@ impl Shell {
             }
         }
         .boxed_local()
+    }
+
+    /// The line `line`, entered on the command line: the input of the process reading the
+    /// terminal, if one may, echoed as a terminal's line discipline echoes it; else the pipeline
+    /// to run. Buttons run theirs with [`Shell::run`], which gives a process nothing.
+    pub fn enter(self, line: String) {
+        let Some(input) = self.terminal.get_value() else {
+            return self.run(line);
+        };
+        self.input.set(String::new());
+        self.log(line.clone());
+        self.reading.set(false);
+        call(&input, "write", &format!("{line}\n").into());
     }
 
     /// Run the pipeline `command`, typed into this tab.
@@ -953,8 +1284,6 @@ impl Shell {
         }
         self.reset_completion();
         self.input.set(String::new());
-        // What the panel said of the last click is old news once another line runs.
-        self.notice.set(String::new());
         self.push(LogLine::Command {
             user: self.account.username.get_untracked(),
             cwd: self.cwd.get_untracked(),
@@ -972,9 +1301,8 @@ impl Shell {
             }
             self.busy.set(false);
             self.cancelled.set(false);
-            self.panel.set(false);
             crate::persist();
-            focus_input();
+            crate::focus_input();
         });
     }
     /// The previous command in the history, or with `up` false the next, into the command line.
@@ -1003,20 +1331,66 @@ impl Shell {
             .set_value(Some(js_sys::Promise::resolve(&files)));
         self.run("upload".into());
     }
-    async fn pipeline(self, stages: Vec<Vec<Word>>) {
+    async fn pipeline(self, mut stages: Vec<Vec<Word>>) {
         let last = stages.len().saturating_sub(1);
         let mut stdin = None;
-        for (index, words) in stages.into_iter().enumerate() {
+        // A stage expanded ahead, as a run of processes was looked for its end.
+        let mut ahead = None;
+        let mut index = 0;
+        while index <= last && !stages.is_empty() {
             // Wildcards expand as the stage starts, as a shell expands them.
-            let args = self.expand(words).await;
+            let args = match ahead.take() {
+                Some(args) => args,
+                None => self.expand(std::mem::take(&mut stages[index])).await,
+            };
             if self.cancelled() {
                 break;
             }
+            let first = index == 0;
+            // A run of processes runs at once, each reading the one before through a pipe; the
+            // first of a line reads the terminal.
+            let mut run = Vec::new();
+            if let Ok(args) = &args
+                && let Some(argv) = process(args)
+            {
+                run.push(argv);
+                while index < last {
+                    let next = self.expand(std::mem::take(&mut stages[index + 1])).await;
+                    match next.as_ref().ok().and_then(|args| process(args)) {
+                        Some(argv) => {
+                            run.push(argv);
+                            index += 1;
+                        }
+                        None => {
+                            ahead = Some(next);
+                            break;
+                        }
+                    }
+                }
+            }
             let piped = index < last;
             let result = match args {
+                Ok(_) if !run.is_empty() => {
+                    // head reads only the lines it shows: then it closes the pipe.
+                    let enough = match &ahead {
+                        Some(Ok(next))
+                            if next.first().is_some_and(|name| {
+                                cli_bin::named(name).unwrap_or(name) == "head"
+                            }) =>
+                        {
+                            text::parse("head", &next[1..])
+                                .ok()
+                                .and_then(|filter| filter.reads())
+                        }
+                        _ => None,
+                    };
+                    self.processes(run, stdin.take(), first, piped, false, enough)
+                        .await
+                }
                 Ok(args) => self.invoke(args, stdin.take(), piped).await,
                 Err(e) => Err(e),
             };
+            index += 1;
             match result {
                 Ok(out) if piped => {
                     let mut text = out.stdout;
@@ -1114,11 +1488,7 @@ impl Shell {
                     Part::Name(name) => {
                         // Literal names need search permission, not a listing. Dot components
                         // are not listing entries; check traversal before resolving them away.
-                        if navigation
-                            && request(&(endpoint("stat", &directory) + "&enter=true"), "GET")
-                                .await
-                                .is_err()
-                        {
+                        if navigation && crate::enterable(&directory).await.is_err() {
                             return Vec::new();
                         }
                         let target = joined(&typed, name);
@@ -1128,10 +1498,8 @@ impl Shell {
                         let Ok(path) = self.path(&target) else {
                             return Vec::new();
                         };
-                        match request(&endpoint("stat", &path), "GET").await {
-                            Ok(entry) if entry["directory"] == true || last && !directories => {
-                                vec![target]
-                            }
+                        match crate::stat(&path).await {
+                            Ok(node) if node.is_dir() || last && !directories => vec![target],
                             _ => Vec::new(),
                         }
                     }
@@ -1212,8 +1580,9 @@ impl Shell {
     }
     pub fn select_completion(self, index: usize) {
         if let Some(mut session) = self.completion.get_untracked() {
-            session.selected = index % session.candidates.len();
-            let value = session.candidates[session.selected].value.clone();
+            let index = index % session.candidates.len();
+            session.selected = Some(index);
+            let value = session.candidates[index].value.clone();
             self.input.set(value.clone());
             self.completion.set(Some(session));
             completion_focus(&value, false);
@@ -1221,10 +1590,9 @@ impl Shell {
     }
     pub fn accept_completion(self) {
         let inside_quote = self.completion.with_untracked(|s| {
-            s.as_ref().is_some_and(|s| {
-                let c = &s.candidates[s.selected];
-                c.descend && c.kind != "command"
-            })
+            s.as_ref()
+                .and_then(|s| s.selected.map(|index| &s.candidates[index]))
+                .is_some_and(|c| c.descend && c.kind != "command")
         });
         let value = self.input.get_untracked();
         self.reset_completion();
@@ -1243,17 +1611,25 @@ impl Shell {
             return;
         }
         self.completion_status.set(String::new());
-        let selected = self
-            .completion_offset
-            .get_untracked()
-            .rem_euclid(candidates.len() as i64) as usize;
+        // One completes at once; of several, the Tabs pressed while they were listed pick one.
+        let len = candidates.len() as i64;
+        let selected = match self.completion_offset.get_untracked() {
+            _ if len == 1 => Some(0),
+            0 => None,
+            ahead if ahead > 0 => Some((ahead - 1).rem_euclid(len) as usize),
+            back => Some(back.rem_euclid(len) as usize),
+        };
+        let shown = original.clone();
         self.completion.set(Some(CompletionSession {
             original,
             cwd,
             candidates,
-            selected,
+            selected: None,
         }));
-        self.select_completion(selected);
+        match selected {
+            Some(index) => self.select_completion(index),
+            None => completion_focus(&shown, false),
+        }
     }
     pub fn complete(self, backwards: bool) {
         if self.busy.get_untracked() {
@@ -1269,17 +1645,23 @@ impl Shell {
         let cwd = self.cwd.get_untracked();
         if let Some(session) = self.completion.get_untracked()
             && session.cwd == cwd
-            && session.candidates[session.selected].value == input
+            && session.selected.map_or(&session.original, |index| &session.candidates[index].value)
+                == &input
             // A sole command/directory can continue into its arguments/children.
             && (session.candidates.len() != 1 || !session.candidates[0].descend)
         {
-            let index = (session.selected as i64 + step).rem_euclid(session.candidates.len() as i64)
-                as usize;
-            self.select_completion(index);
+            // From the list alone, Tab picks the first, Shift+Tab the last.
+            let len = session.candidates.len() as i64;
+            let index = match session.selected {
+                Some(index) => (index as i64 + step).rem_euclid(len),
+                None if backwards => len - 1,
+                None => 0,
+            };
+            self.select_completion(index as usize);
             return;
         }
         self.reset_completion();
-        self.completion_offset.set(if backwards { -1 } else { 0 });
+        self.completion_offset.set(0);
         let epoch = self.completion_epoch.get_untracked();
         match completion::query(&input) {
             Query::Commands(candidates) => self.finish_completion(input, cwd, candidates),

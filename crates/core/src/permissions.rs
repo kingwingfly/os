@@ -50,6 +50,11 @@ pub struct Node {
     /// A symbolic link's target, as written.
     #[serde(default)]
     pub link: Option<String>,
+    /// A character device's driver, as Linux's `i_rdev` names one (`present`, `snd`): what
+    /// reading, writing and its other operations do is the driver's; who may is its mode's
+    /// and ACL's, as for any file.
+    #[serde(default)]
+    pub rdev: Option<String>,
     /// How many names it has: for a directory, 2 and one for each directory in it. A store
     /// says; storing ignores it.
     #[serde(default)]
@@ -73,9 +78,18 @@ impl Node {
             file: None,
             size: 0,
             link: None,
+            rdev: None,
             links: 0,
             acl: None,
             default_acl: None,
+        }
+    }
+    /// A character device of the driver `driver`, as mknod(2) makes one.
+    pub fn device(owner: u32, group: u32, mode: u16, driver: &str) -> Self {
+        Self {
+            directory: false,
+            rdev: Some(driver.into()),
+            ..Self::directory(owner, group, mode)
         }
     }
     pub fn file(owner: u32, group: u32, mode: u16, file: String, size: u64) -> Self {
@@ -98,9 +112,12 @@ impl Node {
     pub fn is_link(&self) -> bool {
         self.link.is_some()
     }
-    /// A regular file: neither a directory nor a link.
+    /// A regular file: neither a directory, nor a link, nor a device.
     pub fn is_file(&self) -> bool {
-        !self.directory && !self.is_link()
+        !self.directory && !self.is_link() && !self.is_device()
+    }
+    pub fn is_device(&self) -> bool {
+        self.rdev.is_some()
     }
     /// The same, as a new inode, which storing creates.
     pub fn fresh(&self) -> Self {
@@ -203,25 +220,6 @@ impl Identity {
 pub enum Id {
     User,
     Group,
-}
-
-/// What `cp` keeps and follows, beyond what it copies.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CopyOptions {
-    /// Directories too: -r, -R.
-    pub recursive: bool,
-    /// Replace a file that exists, rather than leave it, as -n and -i do.
-    pub replace: bool,
-    /// Remove a file that exists and cannot be written, and copy anew: -f.
-    pub force: bool,
-    /// Follow symbolic links below what is copied: -L.
-    pub dereference: bool,
-    /// Copy files with several names among those copied as one file with as many: -d, -a.
-    pub links: bool,
-    /// Keep the mode and ACLs, and, as far as the copier may, the owner and group: -p, -a.
-    pub preserve: bool,
-    /// Keep extended attributes: -a.
-    pub xattrs: bool,
 }
 
 /// A new node in the directory `parent`, made by `who` asking for the permission bits
@@ -699,265 +697,6 @@ pub trait Store {
             self.delete_node(&p);
         }
         Ok(true)
-    }
-    /// Copy `src` to `dst`, as cp does, sharing content: no bytes are copied. Directories need
-    /// `recursive`, and merge into existing ones. A new node belongs to `who`, with the source's
-    /// mode less the umask, or what the directory's default ACL gives, unless `preserve`. An
-    /// existing file is written as it is, keeping its owner, mode and other names, which needs
-    /// w on it, or, with `force`, removed and made anew; it is left if not `replace`. A link
-    /// is copied as a link, unless `dereference`. Returns the files left.
-    fn copy(
-        &mut self,
-        who: &Identity,
-        src: &str,
-        dst: &str,
-        options: &CopyOptions,
-    ) -> Result<Vec<String>, String> {
-        let node = self.access(
-            who,
-            src,
-            if self.node(src).is_some_and(|n| n.is_link()) {
-                0
-            } else {
-                READ
-            },
-        )?;
-        if node.directory && !options.recursive {
-            return Err(format!("-r not specified; omitting directory '{src}'"));
-        }
-        if src == dst {
-            return Err(format!("'{src}' and '{dst}' are the same file"));
-        }
-        if dst.starts_with(&format!("{src}/")) {
-            return Err(format!("Cannot copy '{src}' into itself"));
-        }
-        // What to copy, parents before their children, each with where it goes.
-        let mut sources: Vec<(String, Node, String)> = Vec::new();
-        let mut stack = vec![(src.to_string(), node, dst.to_string())];
-        // Where each directory goes, and what it is: one met again above itself, through a link,
-        // would be copied without end; one met twice side by side is copied twice, as cp -L does.
-        let mut entered: BTreeMap<String, String> = BTreeMap::new();
-        while let Some((path, node, target)) = stack.pop() {
-            if node.directory {
-                let mut above = target.clone();
-                while above.len() > dst.len() {
-                    above = parent(&above).to_string();
-                    if entered.get(&above) == Some(&path) {
-                        return Err(format!("'{path}' is a directory it is copied into"));
-                    }
-                }
-                entered.insert(target.clone(), path.clone());
-                self.access(who, &path, READ | EXEC)?;
-                let mut children = self.children(&path);
-                children.reverse();
-                for (child, n) in children {
-                    let name = child.rsplit('/').next().unwrap_or_default().to_string();
-                    let (from, n) = if n.is_link() && options.dereference {
-                        let real = self.physical(who, &child, true)?;
-                        let n = self.node(&real).ok_or_else(|| {
-                            format!("cannot stat '{child}': No such file or directory")
-                        })?;
-                        (real, n)
-                    } else {
-                        (child, n)
-                    };
-                    stack.push((from, n, format!("{target}/{name}")));
-                }
-            }
-            sources.push((path, node, target));
-        }
-        enum Write {
-            Name(String, Node),
-            Unname(String),
-            /// Another name for the file copied first to this path.
-            Link(String, String),
-            Xattrs(String, BTreeMap<String, Vec<u8>>),
-        }
-        // Validate everything before writing anything.
-        let mut writes = Vec::new();
-        let mut skipped = Vec::new();
-        let mut made: BTreeMap<String, Node> = BTreeMap::new();
-        let mut first: BTreeMap<u64, String> = BTreeMap::new();
-        for (path, source, target) in &sources {
-            if source.is_file() {
-                self.access(who, path, READ)?;
-                // Also one met through a link (-L): it is copied once it is whole.
-                if source.file.as_deref().is_some_and(|id| self.uploading(id)) {
-                    return Err(format!(
-                        "'{path}' is still uploading; copy it once it completes"
-                    ));
-                }
-            }
-            resolve("/", target)?;
-            let in_made = made.contains_key(parent(target));
-            // Only where `who` may look is it told what is there, also deep in a merge: in a
-            // directory this copy makes, nothing is. A directory on the way may be a link.
-            let mut target = target.clone();
-            let mut existing = None;
-            if !in_made {
-                target = self.physical(who, &target, false)?;
-                self.traverse(who, &target)?;
-                existing = self.node(&target);
-                // A file is written through a link to one, as open(2) writes; a directory merges
-                // into what a link to one leads to.
-                if existing.as_ref().is_some_and(|e| e.is_link()) && !source.is_link() {
-                    let real = self.physical(who, &target, true)?;
-                    match self.node(&real) {
-                        Some(n) => {
-                            self.traverse(who, &real)?;
-                            target = real;
-                            existing = Some(n);
-                        }
-                        None => {
-                            return Err(format!("not writing through dangling symlink '{target}'"));
-                        }
-                    }
-                }
-            }
-            let parent_node = match made.get(parent(&target)) {
-                Some(n) => n.clone(),
-                None => self
-                    .node(parent(&target))
-                    .unwrap_or_else(|| Node::directory(0, 0, 0)),
-            };
-            let new = |who: &Identity, source: &Node| -> Node {
-                let mut node = if source.is_link() {
-                    let group = if parent_node.mode & SETGID != 0 {
-                        parent_node.group
-                    } else {
-                        who.group
-                    };
-                    Node::symlink(who.id, group, source.link.as_deref().unwrap_or_default())
-                } else {
-                    let mut node = created(who, &parent_node, source.mode, source.directory, UMASK);
-                    node.file = source.file.clone();
-                    node.size = source.size;
-                    node
-                };
-                if options.preserve && !source.is_link() {
-                    node.mode = source.mode;
-                    node.acl = source.acl.clone();
-                    if source.directory {
-                        node.default_acl = source.default_acl.clone();
-                    }
-                    if who.id == 0 {
-                        node.owner = source.owner;
-                        node.group = source.group;
-                    } else if who.groups.contains(&source.group) {
-                        node.group = source.group;
-                    }
-                    // What could not keep its owner does not keep setuid or setgid.
-                    if node.owner != source.owner || node.group != source.group {
-                        node.mode &= !(SETUID | SETGID);
-                    }
-                }
-                node
-            };
-            match existing {
-                Some(e) if e.directory && source.directory => {
-                    // Only its owner or root may change an existing directory's mode, as
-                    // chmod(2) allows; cp -p leaves another account's as it is.
-                    if options.preserve && (who.id == 0 || who.id == e.owner) {
-                        let mut kept = e.clone();
-                        kept.mode = (kept.mode & !0o7777) | source.mode;
-                        if who.id != 0 && !who.groups.contains(&kept.group) {
-                            kept.mode &= !SETGID;
-                        }
-                        writes.push(Write::Name(target.clone(), kept));
-                    }
-                }
-                Some(e) if e.directory || source.directory => {
-                    return Err(format!(
-                        "Cannot overwrite '{target}' with a {}",
-                        if source.directory {
-                            "directory"
-                        } else {
-                            "file"
-                        }
-                    ));
-                }
-                Some(e) => {
-                    if e.ino == source.ino {
-                        return Err(format!("'{path}' and '{target}' are the same file"));
-                    }
-                    if !options.replace {
-                        skipped.push(target);
-                        continue;
-                    }
-                    if source.is_link() || !who.allows(&e, WRITE) && options.force {
-                        // Made anew: removed first, as cp -f and a link copied do.
-                        self.writable_parent(who, &target)?;
-                        self.unlinkable(who, &target, &e)?;
-                        writes.push(Write::Unname(target.clone()));
-                        writes.push(Write::Name(target.clone(), new(who, source)));
-                    } else {
-                        self.access(who, &target, WRITE)?;
-                        let mut written = Node {
-                            file: source.file.clone(),
-                            size: source.size,
-                            ..e
-                        };
-                        // Keeping the mode and ACL is chmod(2) on the file written: its owner's or
-                        // root's to do; another account's file only gets the content.
-                        if options.preserve && (who.id == 0 || who.id == e.owner) {
-                            written.mode = source.mode;
-                            written.acl = source.acl.clone();
-                            if who.id != 0 && !who.groups.contains(&written.group) {
-                                written.mode &= !SETGID;
-                            }
-                        } else if who.id != 0 {
-                            // Writing drops setuid, as it does on Linux without CAP_FSETID.
-                            written.mode &= !SETUID;
-                        }
-                        writes.push(Write::Name(target.clone(), written));
-                    }
-                }
-                None => {
-                    // A directory this copy creates is the copier's to write into.
-                    if !in_made {
-                        self.writable_parent(who, &target)?;
-                    }
-                    match first.get(&source.ino) {
-                        Some(earlier) if options.links && !source.directory => {
-                            writes.push(Write::Link(target.clone(), earlier.clone()));
-                        }
-                        _ => {
-                            let node = new(who, source);
-                            if source.directory {
-                                made.insert(target.clone(), node.clone());
-                            }
-                            if options.links && !source.directory && source.links > 1 {
-                                first.insert(source.ino, target.clone());
-                            }
-                            writes.push(Write::Name(target.clone(), node));
-                        }
-                    }
-                }
-            }
-            if options.xattrs && !source.is_link() {
-                let attrs = self.xattrs(source.ino);
-                if !attrs.is_empty() {
-                    writes.push(Write::Xattrs(target.clone(), attrs));
-                }
-            }
-        }
-        for write in writes {
-            match write {
-                Write::Name(path, node) => self.set_node(&path, &node),
-                Write::Unname(path) => self.delete_node(&path),
-                Write::Link(path, earlier) => {
-                    if let Some(node) = self.node(&earlier) {
-                        self.set_node(&path, &node);
-                    }
-                }
-                Write::Xattrs(path, attrs) => {
-                    if let Some(node) = self.node(&path) {
-                        self.set_xattrs(node.ino, &attrs);
-                    }
-                }
-            }
-        }
-        Ok(skipped)
     }
     /// A hard link `dst` to `src`, which link(2) makes: not to a directory; it needs w+x on the
     /// directory `dst` goes in. Without root, one may link only what one owns, or a regular file
@@ -1455,13 +1194,6 @@ mod tests {
             hash: String::new(),
         })
     }
-    fn opts(recursive: bool, replace: bool) -> CopyOptions {
-        CopyOptions {
-            recursive,
-            replace,
-            ..CopyOptions::default()
-        }
-    }
     fn file(owner: u32, mode: u16, content: &str) -> Node {
         Node::file(owner, owner, mode, content.into(), 1)
     }
@@ -1679,98 +1411,6 @@ mod tests {
             .is_err()
         );
     }
-    #[test]
-    fn copies_share_content_merge_directories_and_keep_existing_files_modes() {
-        let mut c = home();
-        let bob = Identity {
-            id: 1001,
-            group: 1001,
-            groups: BTreeSet::from([1001]),
-        };
-        c.set_node("/tmp", &Node::directory(0, 0, 0o777));
-        // A directory needs -r; bob may not read alice's private directory.
-        assert!(
-            c.copy(&bob, "/home/alice/docs", "/tmp/docs", &opts(false, true))
-                .is_err()
-        );
-        assert!(
-            c.copy(&bob, "/home/alice", "/tmp/alice", &opts(true, true))
-                .is_err()
-        );
-        assert!(!c.names.contains_key("/tmp/alice"));
-        assert!(
-            c.copy(&bob, "/home/alice/docs", "/tmp/docs", &opts(true, true))
-                .unwrap()
-                .is_empty()
-        );
-        let copied = &c.at("/tmp/docs/b.md");
-        assert_eq!(
-            (copied.owner, copied.mode, copied.file.as_deref()),
-            (1001, 0o644, Some("b"))
-        );
-        assert_eq!(c.at("/tmp/docs").owner, 1001);
-        // The group write bit is masked, as umask 022 would.
-        assert!(
-            c.copy(
-                &bob,
-                "/home/alice/a.txt",
-                "/tmp/docs/a.txt",
-                &opts(false, true)
-            )
-            .is_ok()
-        );
-        assert_eq!(c.at("/tmp/docs/a.txt").mode, 0o644);
-        // Copying again merges, replaces files keeping their mode, or skips them with -n.
-        let mut kept = c.at("/tmp/docs/b.md");
-        kept.mode = 0o600;
-        c.set_node("/tmp/docs/b.md", &kept);
-        c.set_node("/home/alice/docs/new.md", &file(1000, 0o644, "new"));
-        let skipped = c
-            .copy(&bob, "/home/alice/docs", "/tmp/docs", &opts(true, false))
-            .unwrap();
-        assert_eq!(skipped, ["/tmp/docs/b.md"]);
-        assert!(c.names.contains_key("/tmp/docs/new.md"));
-        c.set_node("/home/alice/docs/b.md", &file(1000, 0o644, "b2"));
-        c.copy(&bob, "/home/alice/docs", "/tmp/docs", &opts(true, true))
-            .unwrap();
-        assert_eq!(c.at("/tmp/docs/b.md").file.as_deref(), Some("b2"));
-        assert_eq!(c.at("/tmp/docs/b.md").mode, 0o600);
-        // Removing the original keeps a copy's content.
-        c.remove(&Identity::root(), "/home/alice/docs", true)
-            .unwrap();
-        assert!(!c.freed.contains(&"b2".to_string()));
-        assert!(
-            c.copy(
-                &alice(),
-                "/home/alice",
-                "/home/alice/inner",
-                &opts(true, true)
-            )
-            .is_err()
-        );
-        // A merge says nothing of what lies below a directory bob may not search: there or not,
-        // the copy is refused alike, and nothing is skipped or written.
-        c.set_node("/tmp/docs/private", &Node::directory(0, 0, 0o700));
-        c.set_node("/home/alice/docs", &Node::directory(1000, 1000, 0o755));
-        c.set_node(
-            "/home/alice/docs/private",
-            &Node::directory(1000, 1000, 0o755),
-        );
-        for leaf in [true, false] {
-            if leaf {
-                c.set_node("/tmp/docs/private/probe.md", &file(0, 0o644, "probe"));
-                c.set_node("/home/alice/docs/private/probe.md", &file(1000, 0o644, "p"));
-            } else {
-                c.delete_node("/tmp/docs/private/probe.md");
-            }
-            for replace in [true, false] {
-                assert_eq!(
-                    c.copy(&bob, "/home/alice/docs", "/tmp/docs", &opts(true, replace)),
-                    Err("Permission denied: cannot traverse /tmp/docs/private".to_string())
-                );
-            }
-        }
-    }
     fn bob() -> Identity {
         Identity {
             id: 1001,
@@ -1903,49 +1543,6 @@ mod tests {
         c.remove(&Identity::root(), "/tmp/target", false).unwrap();
     }
     #[test]
-    fn cp_p_keeps_modes_only_where_the_copier_may_chmod() {
-        let mut c = store();
-        c.set_node("/shared", &Node::directory(0, 0, 0o777));
-        c.set_node("/shared/docs", &Node::directory(0, 0, 0o755));
-        c.set_node("/shared/docs/a.txt", &file(0, 0o666, "a"));
-        c.set_node("/shared/mine", &Node::directory(1001, 1001, 0o777));
-        c.set_node("/shared/mine/a.txt", &file(1001, 0o4755, "b"));
-        let preserve = CopyOptions {
-            preserve: true,
-            ..opts(true, true)
-        };
-        c.copy(&bob(), "/shared/mine", "/shared/docs", &preserve)
-            .unwrap();
-        // root's directory and file keep their modes; the file gets the content.
-        assert_eq!(c.at("/shared/docs").mode, 0o755);
-        let written = c.at("/shared/docs/a.txt");
-        assert_eq!((written.mode, written.file.as_deref()), (0o666, Some("b")));
-    }
-    #[test]
-    fn cp_l_copies_a_directory_two_links_lead_to_twice() {
-        let mut c = home();
-        let follow = CopyOptions {
-            dereference: true,
-            ..opts(true, true)
-        };
-        c.mkdir(&alice(), "/home/alice/set", false).unwrap();
-        c.symlink(&alice(), "/home/alice/docs", "/home/alice/set/one", false)
-            .unwrap();
-        c.symlink(&alice(), "/home/alice/docs", "/home/alice/set/two", false)
-            .unwrap();
-        c.copy(&alice(), "/home/alice/set", "/home/alice/copied", &follow)
-            .unwrap();
-        assert!(c.at("/home/alice/copied/one").directory);
-        assert!(c.at("/home/alice/copied/two").directory);
-        // A link to a directory above is still refused.
-        c.symlink(&alice(), "/home/alice/set", "/home/alice/set/up", false)
-            .unwrap();
-        assert!(
-            c.copy(&alice(), "/home/alice/set", "/home/alice/again", &follow)
-                .is_err()
-        );
-    }
-    #[test]
     fn hard_links_share_one_inode() {
         let mut c = home();
         c.link(
@@ -2074,115 +1671,6 @@ mod tests {
         assert!(!bob().allows(&node, WRITE));
     }
     #[test]
-    fn cp_follows_and_keeps_links_and_owners_as_gnu_cp_does() {
-        let mut c = home();
-        c.set_node("/tmp", &Node::directory(0, 0, 0o777));
-        c.symlink(&alice(), "b.md", "/home/alice/docs/link.md", false)
-            .unwrap();
-        c.link(
-            &alice(),
-            "/home/alice/docs/b.md",
-            "/home/alice/docs/b-too.md",
-            false,
-        )
-        .unwrap();
-        // -r copies links as links, and names of one file as files of their own.
-        c.copy(
-            &alice(),
-            "/home/alice/docs",
-            "/tmp/plain",
-            &opts(true, true),
-        )
-        .unwrap();
-        assert_eq!(c.at("/tmp/plain/link.md").link.as_deref(), Some("b.md"));
-        assert_ne!(c.at("/tmp/plain/b.md").ino, c.at("/tmp/plain/b-too.md").ino);
-        // -d keeps them one file; -L follows links.
-        let links = CopyOptions {
-            links: true,
-            ..opts(true, true)
-        };
-        c.copy(&alice(), "/home/alice/docs", "/tmp/linked", &links)
-            .unwrap();
-        assert_eq!(
-            c.at("/tmp/linked/b.md").ino,
-            c.at("/tmp/linked/b-too.md").ino
-        );
-        let followed = CopyOptions {
-            dereference: true,
-            ..opts(true, true)
-        };
-        c.copy(&alice(), "/home/alice/docs", "/tmp/followed", &followed)
-            .unwrap();
-        assert_eq!(c.at("/tmp/followed/link.md").file.as_deref(), Some("b"));
-        // A file and a name of the same file are the same file.
-        assert!(
-            c.copy(
-                &alice(),
-                "/home/alice/docs/b.md",
-                "/home/alice/docs/b-too.md",
-                &opts(false, true)
-            )
-            .unwrap_err()
-            .contains("same file")
-        );
-        // Without w on an existing file, -f removes it and copies anew.
-        c.set_node("/tmp/locked.txt", &file(1000, 0o444, "old"));
-        assert!(
-            c.copy(
-                &alice(),
-                "/home/alice/a.txt",
-                "/tmp/locked.txt",
-                &opts(false, true)
-            )
-            .is_err()
-        );
-        let forced = CopyOptions {
-            force: true,
-            ..opts(false, true)
-        };
-        c.copy(&alice(), "/home/alice/a.txt", "/tmp/locked.txt", &forced)
-            .unwrap();
-        assert_eq!(
-            (
-                c.at("/tmp/locked.txt").file.as_deref(),
-                c.at("/tmp/locked.txt").mode
-            ),
-            (Some("a"), 0o644)
-        );
-        // -p keeps the mode; ownership only as far as the copier may.
-        let kept = CopyOptions {
-            preserve: true,
-            ..opts(false, true)
-        };
-        c.copy(&bob(), "/home/alice/a.txt", "/tmp/bobs.txt", &kept)
-            .unwrap();
-        let bobs = c.at("/tmp/bobs.txt");
-        assert_eq!((bobs.owner, bobs.group, bobs.mode), (1001, 1001, 0o664));
-        // A file is written through a link to one; not through one leading nowhere.
-        c.symlink(&alice(), "/tmp/locked.txt", "/tmp/via", false)
-            .unwrap();
-        c.copy(
-            &alice(),
-            "/home/alice/docs/b.md",
-            "/tmp/via",
-            &opts(false, true),
-        )
-        .unwrap();
-        assert_eq!(c.at("/tmp/locked.txt").file.as_deref(), Some("b"));
-        c.symlink(&alice(), "/tmp/nowhere", "/tmp/dangling", false)
-            .unwrap();
-        assert!(
-            c.copy(
-                &alice(),
-                "/home/alice/a.txt",
-                "/tmp/dangling",
-                &opts(false, true)
-            )
-            .unwrap_err()
-            .contains("dangling")
-        );
-    }
-    #[test]
     fn ln_f_replaces_only_once_the_link_can_be_made() {
         let mut c = home();
         c.set_node("/home/alice/docs/old.md", &file(1000, 0o644, "old"));
@@ -2238,47 +1726,6 @@ mod tests {
             )
             .unwrap_err()
             .contains("same file")
-        );
-    }
-    #[test]
-    fn what_is_still_uploading_is_neither_copied_nor_linked_however_it_is_reached() {
-        let mut c = home();
-        c.set_node("/home/alice/docs/up.bin", &file(1000, 0o644, "up"));
-        c.incomplete.insert("up".into());
-        c.symlink(&alice(), "../docs/up.bin", "/home/alice/private/l", false)
-            .unwrap();
-        let followed = CopyOptions {
-            dereference: true,
-            ..opts(true, true)
-        };
-        assert!(
-            c.copy(
-                &alice(),
-                "/home/alice/private",
-                "/home/alice/copied",
-                &followed
-            )
-            .unwrap_err()
-            .contains("still uploading")
-        );
-        assert!(!c.names.contains_key("/home/alice/copied"));
-        // Without -L, the link is copied, which is not the file.
-        c.copy(
-            &alice(),
-            "/home/alice/private",
-            "/home/alice/copied",
-            &opts(true, true),
-        )
-        .unwrap();
-        assert!(
-            c.link(
-                &alice(),
-                "/home/alice/docs/up.bin",
-                "/home/alice/up2",
-                false
-            )
-            .unwrap_err()
-            .contains("still uploading")
         );
     }
     #[test]

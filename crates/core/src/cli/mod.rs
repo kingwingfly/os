@@ -1,7 +1,7 @@
 //! Every command's definition: what it takes, as clap parses it, and its manual. A command is a
 //! clap `Parser` whose doc comments are its summary, description and options, and whose
 //! [`Manual`] adds what it needs, examples and related commands. [`DEFINITIONS`] registers them
-//! all; the server and the terminal each run them from a registry of their own, and `-h`, `man`
+//! all; user space's programs (crates/userland) and the terminal run them, and `-h`, `man`
 //! and `help` are made from these definitions alone, so that what a page says is what parsing
 //! accepts.
 
@@ -134,6 +134,10 @@ pub static DEFINITIONS: &[&dyn Definition] = &[
     &Def::<files::Cp>::NEW,
     &Def::<files::Ln>::NEW,
     &Def::<files::Readlink>::NEW,
+    &Def::<files::Realpath>::NEW,
+    &Def::<files::Stat>::NEW,
+    &Def::<files::Df>::NEW,
+    &Def::<files::Rmdir>::NEW,
     &Def::<files::Fd>::NEW,
     &Def::<files::Upload>::NEW,
     &Def::<accounts::Whoami>::NEW,
@@ -173,6 +177,8 @@ pub static DEFINITIONS: &[&dyn Definition] = &[
     &Def::<archives::Tar>::NEW,
     &Def::<archives::Faststart>::NEW,
     &Def::<archives::Jobs>::NEW,
+    &Def::<archives::Ps>::NEW,
+    &Def::<archives::Kill>::NEW,
 ];
 
 /// Every command's name, in the order of [`DEFINITIONS`].
@@ -294,27 +300,32 @@ pub fn wants_help(args: &[String]) -> bool {
     let Some(name) = args.first() else {
         return false;
     };
-    // Whether each command has an -h of its own, worked out once: xargs and fd -x ask this of
-    // every command line they run.
-    static OWN_H: OnceLock<Vec<bool>> = OnceLock::new();
+    // Whether each command has an -h of its own, and whether it runs with that alone, worked
+    // out once: xargs and fd -x ask this of every command line they run. Alone, -h is help,
+    // unless the command runs so (df -h).
+    static OWN_H: OnceLock<Vec<(bool, bool)>> = OnceLock::new();
     let own_h = OWN_H.get_or_init(|| {
         DEFINITIONS
             .iter()
             .map(|d| {
-                d.command()
+                let command = d.command();
+                let own = command
                     .get_arguments()
-                    .any(|arg| arg.get_short() == Some('h'))
+                    .any(|arg| arg.get_short() == Some('h'));
+                let name = command.get_name().to_string();
+                let alone = own && command.try_get_matches_from([name, "-h".into()]).is_ok();
+                (own, alone)
             })
             .collect()
     });
-    let own_h = names()
+    let (own_h, alone) = names()
         .iter()
         .position(|n| n == name)
-        .is_some_and(|i| own_h[i]);
+        .map_or((false, false), |i| own_h[i]);
     args.iter()
         .skip(1)
         .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| arg == "--help" || arg == "-h" && (!own_h || args.len() == 2))
+        .any(|arg| arg == "--help" || arg == "-h" && (!own_h || args.len() == 2 && !alone))
 }
 
 /// How an option is written: `-r, -R, --recursive`, and its value, as in `-n N`.
@@ -560,6 +571,30 @@ pub fn commands() -> String {
         }
         out.push(String::new());
     }
+    // /usr/bin's programs the shell has no command of its own for: uutils'.
+    let names = names();
+    let bin: Vec<&str> = crate::bin::PROGRAMS
+        .iter()
+        .copied()
+        .filter(|program| !names.iter().any(|name| name == program))
+        .collect();
+    out.push("/usr/bin, from uutils' coreutils (processes of their own)".to_string());
+    let mut line = String::new();
+    for program in bin {
+        if !line.is_empty() && line.len() + 1 + program.len() > 76 {
+            out.push(format!("  {line}"));
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(program);
+    }
+    out.push(format!("  {line}"));
+    out.push(
+        "  /bin/NAME runs /bin's NAME where the shell has its own; NAME --help says how.".into(),
+    );
+    out.push(String::new());
     out.extend(
         [
             "COMMAND -h shows how to use one; man COMMAND its manual page; man, the index.",

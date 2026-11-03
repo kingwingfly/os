@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { crc32, gzipSync } from 'node:zlib';
+import { api, mkdirp, put, rmrf } from './sys.js';
 const origin=process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password=(await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const headers={Origin:origin,'CF-Connecting-IP':'preview-regression'};
@@ -37,7 +38,7 @@ function pdf(){
 }
 
 test('Rust previews: highlighted code, diagrams, maths, links within the filesystem, tables, archives, cards, diffs, SVG and slides',async({page,request})=>{
- const base='/previews-'+Date.now();await request.post('/api/login',{headers,data:{password}});await request.post('/api/mkdir?path='+base,{headers});
+ const base='/previews-'+Date.now();await api(request, 'login',{headers,data:{password}});await mkdirp(request, base);
  try{
   const files={
    'doc.md':'# Previews\n\n[Other notes](other.md) and [the web](https://example.com).\n\n![pixel](img/pixel.png) ![logo](logo.svg)\n\n```rust\nfn main() {\n    println!("hi");\n}\n```\n\n```mermaid\nflowchart LR\n  A[Alice] --> B[Bob]\n```\n\nInline $a^2 + b^2 = c^2$.\n\n- [x] done\n',
@@ -50,12 +51,12 @@ test('Rust previews: highlighted code, diagrams, maths, links within the filesys
    'logo.svg':'<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><script>window.svgRan=true</script><rect width="40" height="20" fill="#9ae6b5"/></svg>',
    'deck.slides.md':'# One\n\n```yaml\n---\nkey: value\n```\n\n---\n\n# Two\n\n--\n\n# Two, below\n\nNote: not shown\n',
   };
-  for(const [name,text] of Object.entries(files))expect((await request.put(file(base+'/'+name),{headers,data:Buffer.from(text)})).status()).toBe(201);
-  await request.post('/api/mkdir?path='+base+'/img',{headers});
-  expect((await request.put(file(base+'/img/pixel.png'),{headers,data:await readFile('tests/fixtures/pixel.png')})).status()).toBe(201);
-  expect((await request.put(file(base+'/bundle.zip'),{headers,data:zip([['src/main.rs','fn main() {}'],['notes.txt','hello']])})).status()).toBe(201);
-  expect((await request.put(file(base+'/bundle.tar.gz'),{headers,data:gzipSync(tar([['docs/a.txt','alpha']]))})).status()).toBe(201);
-  expect((await request.put(file(base+'/one.pdf'),{headers,data:pdf()})).status()).toBe(201);
+  for(const [name,text] of Object.entries(files))expect((await put(request, file(base+'/'+name),{headers,data:Buffer.from(text)})).status()).toBe(201);
+  await mkdirp(request, base+'/img');
+  expect((await put(request, file(base+'/img/pixel.png'),{headers,data:await readFile('tests/fixtures/pixel.png')})).status()).toBe(201);
+  expect((await put(request, file(base+'/bundle.zip'),{headers,data:zip([['src/main.rs','fn main() {}'],['notes.txt','hello']])})).status()).toBe(201);
+  expect((await put(request, file(base+'/bundle.tar.gz'),{headers,data:gzipSync(tar([['docs/a.txt','alpha']]))})).status()).toBe(201);
+  expect((await put(request, file(base+'/one.pdf'),{headers,data:pdf()})).status()).toBe(201);
 
   const errors=[],loaded=[];page.on('pageerror',e=>errors.push(e.message));
   page.on('request',r=>{const worker=r.url().match(/\/(preview_[a-z_]+)_loader\.js$/);if(worker)loaded.push(worker[1]);});
@@ -114,14 +115,14 @@ test('Rust previews: highlighted code, diagrams, maths, links within the filesys
   await expect(page.getByRole('button',{name:'Next page'})).toBeDisabled();await close(page);
   expect(loaded).toContain('preview_pdf');
   expect(errors).toEqual([]);
- }finally{await request.delete(file(base)+'&recursive=true',{headers});}
+ }finally{await rmrf(request, base);}
 });
 
 test('a link opens another file with a way back; slides, PDFs and text open where they were left; slide themes',async({page,request})=>{
- const base='/viewer-'+Date.now();await request.post('/api/login',{headers,data:{password}});await request.post('/api/mkdir?path='+base,{headers});
+ const base='/viewer-'+Date.now();await api(request, 'login',{headers,data:{password}});await mkdirp(request, base);
  try{
   const files={'deck.slides.md':'# One\n\n[notes](notes.md)\n\n---\n\n# Two\n\n---\n\n# Three\n','notes.md':'# Notes\n\nReached by a link.\n','long.txt':'line\n'.repeat(400)};
-  for(const [name,text] of Object.entries(files))expect((await request.put(file(base+'/'+name),{headers,data:Buffer.from(text)})).status()).toBe(201);
+  for(const [name,text] of Object.entries(files))expect((await put(request, file(base+'/'+name),{headers,data:Buffer.from(text)})).status()).toBe(201);
   await page.goto('/');
   const status=page.locator('.slides-bar [role=status]'),theme=page.getByRole('combobox',{name:'Slide theme'});
   await run(page,'open '+base+'/deck.slides.md');await expect(page.locator('.slides-current .slide:visible')).toContainText('One');
@@ -146,7 +147,7 @@ test('a link opens another file with a way back; slides, PDFs and text open wher
   await run(page,'open '+base+'/long.txt');await expect(page.locator('.text-preview')).toBeVisible();
   await expect.poll(()=>page.locator('#viewer-content').evaluate(content=>content.scrollTop)).toBeGreaterThan(1500);
   await close(page);
- }finally{await request.delete(file(base)+'&recursive=true',{headers});}
+ }finally{await rmrf(request, base);}
 });
 
 // A gzipped tar of one member of `size` zero bytes: gzip members of a mebibyte each, which a
@@ -160,10 +161,10 @@ function expanding(size){
 }
 
 test('an archive is listed off the page, within what it may expand to; a worker that cannot start says so, and starts again',async({page,context,request})=>{
- const base='/preview-workers-'+Date.now();await request.post('/api/login',{headers,data:{password}});await request.post('/api/mkdir?path='+base,{headers});
+ const base='/preview-workers-'+Date.now();await api(request, 'login',{headers,data:{password}});await mkdirp(request, base);
  try{
-  expect((await request.put(file(base+'/expanded.tgz'),{headers,data:expanding(1_200_000_000)})).status()).toBe(201);
-  expect((await request.put(file(base+'/one.pdf'),{headers,data:pdf()})).status()).toBe(201);
+  expect((await put(request, file(base+'/expanded.tgz'),{headers,data:expanding(1_200_000_000)})).status()).toBe(201);
+  expect((await put(request, file(base+'/one.pdf'),{headers,data:pdf()})).status()).toBe(201);
   await context.route('**/preview_pdf_bg.wasm',route=>route.fulfill({status:404,body:'gone'}));
   await page.goto('/');
   await page.evaluate(()=>{window.longest=0;new PerformanceObserver(list=>{for(const task of list.getEntries())window.longest=Math.max(window.longest,task.duration);}).observe({type:'longtask'});});
@@ -181,5 +182,5 @@ test('an archive is listed off the page, within what it may expand to; a worker 
   await context.unroute('**/preview_pdf_bg.wasm');
   await run(page,'open '+base+'/one.pdf');await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('1 / 1');await expect(page.locator('.pdf-page')).toBeVisible();
   await close(page);
- }finally{await request.delete(file(base)+'&recursive=true',{headers});}
+ }finally{await rmrf(request, base);}
 });

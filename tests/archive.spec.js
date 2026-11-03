@@ -1,10 +1,11 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { crc32 } from 'node:zlib';
+import { api, call, errno, listing, mkdirp, processes, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
-const ls = async (request, path) => ((await (await request.get('/api/ls?path=' + encodeURIComponent(path))).json()).entries || []);
+const ls = (request, path) => listing(request, path).catch(() => []);
 // Archive jobs start a container; give them time.
 test.setTimeout(240_000);
 let base, headers;
@@ -13,16 +14,16 @@ test.beforeEach(async ({ request, page }) => {
   base = '/archive-' + Date.now().toString(36);
   headers = { Origin: origin, 'CF-Connecting-IP': 'archive-' + base };
   await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'archive-ui-' + base });
-  expect((await request.post('/api/login', { headers, data: { password } })).ok()).toBe(true);
-  for (const dir of ['/docs/deep', '/ro']) expect((await request.post('/api/mkdir?path=' + encodeURIComponent(base + dir), { headers })).ok()).toBe(true);
+  expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
+  for (const dir of ['/docs/deep', '/ro']) await mkdirp(request, base + dir);
   const files = { 'docs/a.md': 'alpha\n'.repeat(2000), 'docs/deep/spéctrum notes.txt': 'γάμμα\n', 'docs/run.sh': '#!/bin/sh\necho hi\n' };
-  for (const [name, text] of Object.entries(files)) expect((await request.put(file(base + '/' + name), { headers, data: text })).status()).toBe(201);
-  expect((await request.post('/api/command', { headers, data: { args: ['chmod', '755', base + '/docs/run.sh'] } })).ok()).toBe(true);
-  expect((await request.post('/api/command', { headers, data: { args: ['chmod', '555', base + '/ro'] } })).ok()).toBe(true);
+  for (const [name, text] of Object.entries(files)) expect((await put(request, file(base + '/' + name), { headers, data: text })).status()).toBe(201);
+  expect((await program(request, ['chmod', '755', base + '/docs/run.sh'])).ok()).toBe(true);
+  expect((await program(request, ['chmod', '555', base + '/ro'])).ok()).toBe(true);
 });
 test.afterEach(async ({ request }) => {
-  await request.post('/api/command', { headers, data: { args: ['chmod', '755', base + '/ro'] } });
-  await request.delete(file(base) + '&recursive=true', { headers });
+  await program(request, ['chmod', '755', base + '/ro']);
+  await rmrf(request, base);
 });
 
 // A ZIP of stored files, as a system without Unix modes makes one, and a tar of
@@ -93,11 +94,48 @@ test('zip, unzip and tar round-trip files, names and modes through the container
   await run(page, 'jobs'); await expect(transcript(page).locator('pre').last()).toContainText('done');
 });
 
+test('a job is a process: spawned, waited for, listed by ps, asked on its stdin, and signalled by kill', async ({ page, request }) => {
+  const O = { cwd: base };
+  // spawn runs it apart, as the caller; wait reads what it wrote, and how it ended.
+  const { pid } = await call(request, { spawn: { argv: ['zip', '-r', 'docs.zip', 'docs'], ...O } });
+  const finished = async () => {
+    let state;
+    await expect.poll(async () => (state = await call(request, { wait: { pid } })).state, { timeout: 120_000 }).toMatch(/^(done|failed|cancelled)$/);
+    return state;
+  };
+  expect((await finished()).state).toBe('done');
+  expect((await ls(request, base)).map(entry => entry.name)).toContain('docs.zip');
+  expect((await processes(request)).map(process => process.pid)).toContain(pid);
+  // A question goes to its stdin: unzip asks before replacing what is there.
+  const { pid: asking, stdin } = await call(request, { spawn: { argv: ['unzip', 'docs.zip'], ...O } });
+  await expect.poll(async () => (await call(request, { wait: { pid: asking } })).state, { timeout: 120_000 }).toBe('question');
+  const { question } = await call(request, { wait: { pid: asking } });
+  const decisions = Object.fromEntries(question.replace.map(path => [path, false]));
+  // Its standard input is a descriptor of the session, written as a pipe is.
+  expect(await call(request, { readlink: { path: `/proc/self/fd/${stdin}` } })).toBe(`/proc/${asking}/fd/0`);
+  const answer = Buffer.from(JSON.stringify({ decisions })).toString('base64');
+  expect((await call(request, { pwrite: { fd: stdin, index: 0, data: answer } })).state).toBe('queued');
+  expect((await call(request, { close: { fd: stdin } })).path).toBe(`/proc/${asking}/fd/0`);
+  await expect.poll(async () => (await call(request, { wait: { pid: asking } })).state, { timeout: 120_000 }).toBe('done');
+  // Only programs are spawned; signals go to what is there, and its owner's (or root's).
+  expect(await errno(request, { spawn: { argv: ['sh', '-c', 'true'], ...O } })).toBe('ENOENT');
+  expect(await errno(request, { kill: { pid: 'f'.repeat(32) } })).toBe('ESRCH');
+  const stranger = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'archive-stranger-' + base } });
+  try { expect(await errno(stranger, { kill: { pid } })).toBe('EPERM'); }
+  finally { await stranger.dispose(); }
+  // ps and kill, in the terminal, as procps' are.
+  await terminal(page);
+  await run(page, 'ps');
+  await expect(transcript(page).locator('pre').last()).toContainText(`${pid.slice(0, 8)}  done        zip`);
+  await run(page, 'kill ffffffff');
+  await expect(transcript(page).locator('pre').last()).toContainText('kill: (ffffffff) - No such process');
+});
+
 test('unzip asks before replacing, -o and -n decide, tar -k keeps, and hostile members are skipped', async ({ page, request }) => {
   await terminal(page);
   await run(page, 'zip -rq notes.zip docs');
   await run(page, 'unzip -q notes.zip -d copy');
-  for (const name of ['a.md', 'run.sh']) await request.put(file(`${base}/copy/docs/${name}`) + '&overwrite=true', { headers, data: 'changed\n' });
+  for (const name of ['a.md', 'run.sh']) await put(request, file(`${base}/copy/docs/${name}`) + '&overwrite=true', { headers, data: 'changed\n' });
   // Asked: no for the first, then None for the rest.
   await run(page, 'unzip notes.zip -d copy', { wait: false });
   await expect(form(page).locator('.busy')).toHaveText('Answer ↵', { timeout: 120_000 });
@@ -113,14 +151,14 @@ test('unzip asks before replacing, -o and -n decide, tar -k keeps, and hostile m
   await run(page, 'unzip -qo notes.zip -d copy');
   expect(await (await request.get(file(base + '/copy/docs/run.sh'))).text()).toBe('#!/bin/sh\necho hi\n');
   await run(page, 'tar -cf notes.tar docs');
-  await request.put(file(base + '/copy/docs/a.md') + '&overwrite=true', { headers, data: 'kept\n' });
+  await put(request, file(base + '/copy/docs/a.md') + '&overwrite=true', { headers, data: 'kept\n' });
   await run(page, 'tar -xkf notes.tar -C copy');
   await expect(transcript(page)).toContainText('copy/docs/a.md: Cannot open: File exists');
   expect(await (await request.get(file(base + '/copy/docs/a.md'))).text()).toBe('kept\n');
   await run(page, 'tar -xf notes.tar -C copy');
   expect(await (await request.get(file(base + '/copy/docs/a.md'))).text()).toBe('alpha\n'.repeat(2000));
   // A hostile archive: .. is skipped, a leading / removed, the rest extracted, its link as one.
-  expect((await request.put(file(base + '/slip.zip'), { headers, data: await readFile('tests/fixtures/slip.zip') })).status()).toBe(201);
+  expect((await put(request, file(base + '/slip.zip'), { headers, data: await readFile('tests/fixtures/slip.zip') })).status()).toBe(201);
   await run(page, 'unzip slip.zip -d out');
   await expect(transcript(page)).toContainText("skipping ../evil.txt: its name contains '..'");
   await expect(transcript(page)).toContainText(`linking: ${base}/out/safe/link  -> ok.txt`);
@@ -136,8 +174,8 @@ test('unzip asks before replacing, -o and -n decide, tar -k keeps, and hostile m
 });
 
 test('Ctrl+C stops an extraction between files, and a closed tab leaves its job running', async ({ page, request }) => {
-  expect((await request.post('/api/mkdir?path=' + encodeURIComponent(base + '/docs/many'), { headers })).ok()).toBe(true);
-  for (let i = 0; i < 40; i++) expect((await request.put(file(`${base}/docs/many/f${String(i).padStart(2, '0')}.txt`), { headers, data: 'x'.repeat(1000 + i) })).status()).toBe(201);
+  await mkdirp(request, base + '/docs/many');
+  for (let i = 0; i < 40; i++) expect((await put(request, file(`${base}/docs/many/f${String(i).padStart(2, '0')}.txt`), { headers, data: 'x'.repeat(1000 + i) })).status()).toBe(201);
   await terminal(page);
   await run(page, 'zip -rq many.zip docs/many');
   await run(page, 'unzip many.zip -d stopped', { wait: false });
@@ -160,10 +198,10 @@ test('Ctrl+C stops an extraction between files, and a closed tab leaves its job 
 });
 
 test('extracting nothing ends at once and says why; modes are those archived, 000 too; long listings come whole', async ({ page, request }) => {
-  const put = async (name, data) => expect((await request.put(file(base + '/' + name), { headers, data })).status()).toBe(201);
-  await put('empty.zip', zipOf([])); await put('empty.tar', tarOf([])); await put('one.zip', zipOf([['a.txt', 'a']]));
-  await put('modes.tar', tarOf([['normal.txt', 'new', 0o644], ['private.txt', 'new', 0], ['private-dir', '', 0, true], ['open', '', 0o755, true], ['closed', '', 0o755, true]]));
-  await put('many.zip', zipOf(Array.from({ length: 700 }, (_, i) => [String(i).padStart(4, '0') + '.txt', 'x'])));
+  const make = async (name, data) => expect((await put(request, file(base + '/' + name), { headers, data })).status()).toBe(201);
+  await make('empty.zip', zipOf([])); await make('empty.tar', tarOf([])); await make('one.zip', zipOf([['a.txt', 'a']]));
+  await make('modes.tar', tarOf([['normal.txt', 'new', 0o644], ['private.txt', 'new', 0], ['private-dir', '', 0, true], ['open', '', 0o755, true], ['closed', '', 0o755, true]]));
+  await make('many.zip', zipOf(Array.from({ length: 700 }, (_, i) => [String(i).padStart(4, '0') + '.txt', 'x'])));
   await terminal(page);
   // Each ends once, rather than plan again and again.
   const ends = async text => { await run(page, text, { wait: false }); await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 120_000 }); };
@@ -178,15 +216,15 @@ test('extracting nothing ends at once and says why; modes are those archived, 00
   // The modes archived, less group and other write, also for files and directories that were
   // there; 644 for a file a zip says none of.
   await run(page, 'mkdir dest dest/open dest/closed');
-  for (const [dir, mode] of [['open', '777'], ['closed', '700']]) expect((await request.post('/api/command', { headers, data: { args: ['chmod', mode, base + '/dest/' + dir] } })).ok()).toBe(true);
-  expect((await request.put(file(base + '/dest/normal.txt'), { headers, data: 'old' })).status()).toBe(201);
-  expect((await request.post('/api/command', { headers, data: { args: ['chmod', '755', base + '/dest/normal.txt'] } })).ok()).toBe(true);
+  for (const [dir, mode] of [['open', '777'], ['closed', '700']]) expect((await program(request, ['chmod', mode, base + '/dest/' + dir])).ok()).toBe(true);
+  expect((await put(request, file(base + '/dest/normal.txt'), { headers, data: 'old' })).status()).toBe(201);
+  expect((await program(request, ['chmod', '755', base + '/dest/normal.txt'])).ok()).toBe(true);
   await ends('tar -xf modes.tar -C dest'); await ends('unzip -q one.zip -d dest');
   const modes = Object.fromEntries((await ls(request, base + '/dest')).map(e => [e.name, e.mode]));
   expect(modes).toEqual({ 'normal.txt': 0o644, 'private.txt': 0, 'private-dir': 0, 'open': 0o755, 'closed': 0o755, 'a.txt': 0o644 });
   const guest = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { 'CF-Connecting-IP': 'archive-guest-' + base } });
   expect((await guest.get(file(base + '/dest/private.txt'))).status()).toBe(401);
-  expect((await guest.put(file(base + '/dest/open/guest.txt'), { headers: { Origin: origin }, data: 'x' })).status()).toBe(401);
+  expect((await put(guest, file(base + '/dest/open/guest.txt'), { headers: { Origin: origin }, data: 'x' })).status()).toBe(401);
   await guest.dispose();
   // A job's output comes page after page, to its end.
   await ends('unzip -l many.zip | wc -l');
@@ -194,11 +232,11 @@ test('extracting nothing ends at once and says why; modes are those archived, 00
 });
 
 test('extraction tells a guest nothing of what lies where it may not look', async ({ page, request }) => {
-  expect((await request.post('/api/mkdir?path=' + encodeURIComponent(base + '/shared/private'), { headers })).ok()).toBe(true);
-  expect((await request.post('/api/command', { headers, data: { args: ['chmod', '777', base + '/shared'] } })).ok()).toBe(true);
-  expect((await request.post('/api/command', { headers, data: { args: ['chmod', '700', base + '/shared/private'] } })).ok()).toBe(true);
-  expect((await request.put(file(base + '/shared/private/exists.txt'), { headers, data: 'kept' })).status()).toBe(201);
-  expect((await request.put(file(base + '/probe.zip'), { headers, data: zipOf([['private/exists.txt', 'x'], ['private/missing.txt', 'y']]) })).status()).toBe(201);
+  await mkdirp(request, base + '/shared/private');
+  expect((await program(request, ['chmod', '777', base + '/shared'])).ok()).toBe(true);
+  expect((await program(request, ['chmod', '700', base + '/shared/private'])).ok()).toBe(true);
+  expect((await put(request, file(base + '/shared/private/exists.txt'), { headers, data: 'kept' })).status()).toBe(201);
+  expect((await put(request, file(base + '/probe.zip'), { headers, data: zipOf([['private/exists.txt', 'x'], ['private/missing.txt', 'y']]) })).status()).toBe(201);
   await page.goto('/');
   // Not asked whether to replace the file that is there: both fail alike.
   await run(page, `unzip ${base}/probe.zip -d ${base}/shared`, { wait: false });
@@ -232,8 +270,8 @@ test('tar keeps symbolic and hard links, zip follows them unless -y, and extract
 
 test('faststart moves a video\'s index before its media, in place, once', async ({ page, request }) => {
   const video = await readFile('tests/fixtures/tail-moov.mp4');
-  expect((await request.put(file(base + '/clip.mp4'), { headers, data: video })).status()).toBe(201);
-  expect((await request.post('/api/command', { headers, data: { args: ['chmod', '640', base + '/clip.mp4'] } })).ok()).toBe(true);
+  expect((await put(request, file(base + '/clip.mp4'), { headers, data: video })).status()).toBe(201);
+  expect((await program(request, ['chmod', '640', base + '/clip.mp4'])).ok()).toBe(true);
   const boxes = bytes => { const kinds = []; for (let i = 0; i < bytes.length; i += bytes.readUInt32BE(i)) kinds.push(bytes.toString('latin1', i + 4, i + 8)); return kinds; };
   expect(boxes(video).indexOf('moov')).toBeGreaterThan(boxes(video).indexOf('mdat'));
   await terminal(page);

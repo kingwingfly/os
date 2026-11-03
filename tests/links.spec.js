@@ -1,5 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { api, entry, errno, mkdirp, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -9,11 +10,11 @@ test.beforeEach(async ({ request, page }) => {
   base = '/links-' + Date.now().toString(36);
   headers = { Origin: origin, 'CF-Connecting-IP': 'links-' + base };
   await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'links-ui-' + base });
-  expect((await request.post('/api/login', { headers, data: { password } })).ok()).toBe(true);
-  for (const dir of ['', '/docs']) expect((await request.post('/api/mkdir?path=' + encodeURIComponent(base + dir), { headers })).ok()).toBe(true);
-  for (const [name, text] of Object.entries({ 'a.md': 'alpha\n', 'docs/b.md': 'beta\n' })) expect((await request.put(file(base + '/' + name), { headers, data: text })).status()).toBe(201);
+  expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
+  for (const dir of ['', '/docs']) await mkdirp(request, base + dir);
+  for (const [name, text] of Object.entries({ 'a.md': 'alpha\n', 'docs/b.md': 'beta\n' })) expect((await put(request, file(base + '/' + name), { headers, data: text })).status()).toBe(201);
 });
-test.afterEach(async ({ request }) => { await request.delete(file(base) + '&recursive=true', { headers }); });
+test.afterEach(async ({ request }) => { await rmrf(request, base); });
 
 const busy = page => page.locator('.terminal-panel:not([hidden]) .busy');
 const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
@@ -42,13 +43,13 @@ test('ln makes symbolic and hard links that behave as on Linux', async ({ page, 
   // ls -l shows where a link points, and how many names a file has.
   // Piped, a listing is text, a line an entry.
   const long = await output(page, 'ls -l | cat');
-  expect(long).toMatch(/^lrwxrwxrwx +1 root root +9 link\.md -> docs\/b\.md$/m);
-  expect(long).toMatch(/^-rw-r--r-- +2 root root +6 a-too\.md$/m);
+  expect(long).toMatch(/^lrwxrwxrwx +1 root root +9 [A-Z][a-z]{2} [ \d]\d [ \d:]{5} link\.md -> docs\/b\.md$/m);
+  expect(long).toMatch(/^-rw-r--r-- +2 root root +6 [A-Z][a-z]{2} [ \d]\d [ \d:]{5} a-too\.md$/m);
   expect(await output(page, 'cat link.md')).toBe('beta');
   expect(await output(page, 'readlink link.md')).toBe('docs/b.md');
   expect(await output(page, 'readlink -f link.md')).toBe(base + '/docs/b.md');
   // Writing through one name of a file changes it under every name; chmod too.
-  expect((await request.put(file(base + '/a-too.md') + '&overwrite=true', { headers, data: 'changed\n' })).ok()).toBe(true);
+  expect((await put(request, file(base + '/a-too.md') + '&overwrite=true', { headers, data: 'changed\n' })).ok()).toBe(true);
   expect(await (await request.get(file(base + '/a.md'), { headers })).text()).toBe('changed\n');
   await run(page, 'chmod 600 a-too.md');
   expect(await output(page, 'ls -l a.md')).toMatch(/^-rw------- +2 /);
@@ -80,19 +81,19 @@ test('ln makes symbolic and hard links that behave as on Linux', async ({ page, 
   expect(await output(page, `readlink ../copy-${base.slice(1)}/d`)).toBe('a-too.md');
   await run(page, 'cp -a . ../kept-' + base.slice(1));
   expect(await output(page, `ls -l ../kept-${base.slice(1)}/docs/a3.md`)).toMatch(/^-rw------- +2 /);
-  for (const dir of ['copy', 'kept']) await request.delete(file(`/${dir}-${base.slice(1)}`) + '&recursive=true', { headers });
+  for (const dir of ['copy', 'kept']) await rmrf(request, `/${dir}-${base.slice(1)}`);
   // ln -f replaces a name only once its link can be made: one that cannot leaves what was there.
   await run(page, 'mkdir t');
-  for (const name of ['docs', 'a-too.md']) expect((await request.put(file(`${base}/t/${name}`), { headers, data: 'keep\n' })).status()).toBe(201);
+  for (const name of ['docs', 'a-too.md']) expect((await put(request, file(`${base}/t/${name}`), { headers, data: 'keep\n' })).status()).toBe(201);
   await run(page, 'ln -f a-too.md docs t');
   await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText('hard link not allowed for directory');
   expect(await (await request.get(file(base + '/t/docs'), { headers })).text()).toBe('keep\n');
   expect(await (await request.get(file(base + '/t/a-too.md'), { headers })).text()).toBe('changed\n');
   // A file still uploading is copied once whole, also when a link leads to it.
-  expect((await request.post('/api/uploads?path=' + encodeURIComponent(base + '/up.bin'), { headers, data: { size: 4 } })).ok()).toBe(true);
+  expect(await errno(request, { open: { path: base + '/up.bin', flags: 0o101, size: 4 } })).toBe(null);
   await run(page, 'mkdir withlink'); await run(page, 'ln -s ../up.bin withlink/l');
   await run(page, 'cp -rL withlink taken'); await expect(last(page)).toContainText('still uploading');
-  expect((await request.get('/api/stat?path=' + encodeURIComponent(base + '/taken'), { headers })).status()).toBe(404);
+  expect(await entry(request, base + '/taken')).toBe(null);
   await run(page, 'ln up.bin up-too.bin'); await expect(last(page)).toContainText('still uploading');
 });
 
@@ -116,10 +117,10 @@ test('a visitor makes an account in /guest, which is sticky, and shares files wi
   // Another visitor makes another account through the API, signed in by it.
   const other = await visitor();
   try {
-    const made = await other.post('/api/register', { data: { username: bob, password: pass } });
+    const made = await api(other, 'register', { data: { username: bob, password: pass } });
     expect(made.status(), await made.text()).toBe(201);
-    expect((await other.post('/api/register', { data: { username: bob + 'x', password: pass } })).status()).toBe(409);
-    expect((await (await visitor()).post('/api/register', { data: { username: ada, password: pass } })).status()).toBe(409);
+    expect((await api(other, 'register', { data: { username: bob + 'x', password: pass } })).status()).toBe(409);
+    expect((await api(await visitor(), 'register', { data: { username: ada, password: pass } })).status()).toBe(409);
     // Homes are their owners' only.
     await run(page, 'touch note.txt');
     expect((await other.get(file(`/guest/${ada}/note.txt`))).status()).toBe(403);
@@ -129,14 +130,13 @@ test('a visitor makes an account in /guest, which is sticky, and shares files wi
     expect(await output(page, 'ls -l note.txt')).toMatch(/^-rw-rw-r--\+ /);
     await run(page, 'chmod g-w note.txt');
     expect(await output(page, 'getfacl note.txt')).toBe(`# file: guest/${ada}/note.txt\n# owner: ${ada}\n# group: ${ada}\nuser::rw-\nuser:${bob}:rw-\t#effective:r--\ngroup::r--\nmask::r--\nother::r--`);
-    expect((await other.put(file(`/guest/${ada}/note.txt`) + '&overwrite=true', { data: 'x' })).status()).toBe(403);
+    expect((await put(other, file(`/guest/${ada}/note.txt`) + '&overwrite=true', { data: 'x' })).status()).toBe(403);
     // A default ACL is what new files get.
     await run(page, `setfacl -d -m u:${bob}:rw .`); await run(page, 'touch later.txt');
     expect(await output(page, `getfacl -c later.txt`)).toContain(`user:${bob}:rw-`);
     // /guest is sticky: anyone may put a file there, and only its owner remove it.
     await run(page, `touch /guest/${ada}-shared.txt`);
-    const removal = await other.delete(file(`/guest/${ada}-shared.txt`));
-    expect(removal.status()).toBe(403); expect((await removal.json()).error).toContain('Operation not permitted');
+    expect(await rmrf(other, `/guest/${ada}-shared.txt`)).toBe('EPERM');
     await run(page, `rm /guest/${ada}-shared.txt`);
     // Extended attributes go with the file, for whoever may write it.
     await run(page, 'setfattr -n user.status -v reviewed note.txt');
@@ -144,12 +144,12 @@ test('a visitor makes an account in /guest, which is sticky, and shares files wi
     await run(page, 'setfattr -n trusted.tag -v x note.txt'); await expect(last(page)).toContainText('Operation not permitted');
     // guest cannot get a password, nor be changed.
     await run(page, 'exit');
-    expect((await request.post('/api/passwd', { headers, data: { username: 'guest', password: pass, sudo: true } })).status()).toBe(400);
-    expect((await request.post('/api/command', { headers, data: { args: ['userdel', 'guest'] } })).status()).toBe(400);
+    expect((await api(request, 'passwd', { headers, data: { username: 'guest', password: pass, sudo: true } })).status()).toBe(400);
+    expect((await program(request, ['userdel', 'guest'])).status()).toBe(400);
   } finally {
     for (const name of [ada, bob]) {
-      await request.post('/api/command', { headers, data: { args: ['userdel', '-r', name] } });
-      await request.post('/api/command', { headers, data: { args: ['groupdel', name] } });
+      await program(request, ['userdel', '-r', name]);
+      await program(request, ['groupdel', name]);
     }
     await other.dispose();
   }

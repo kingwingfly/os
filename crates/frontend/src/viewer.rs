@@ -44,6 +44,24 @@ extern "C" {
     /// (`open /dev/present/NAME`): `{device, owner, controller}`.
     #[wasm_bindgen(js_namespace = terminal, js_name = attending)]
     fn attending(path: &str) -> JsValue;
+    /// The bar shows the file at `path` now: what it shows of it comes as `terminal:bar`.
+    #[wasm_bindgen(js_namespace = terminal, js_name = barOf)]
+    fn bar_of(path: &str);
+    /// Present the file at `path` to others, as /dev/present/NAME, or stop presenting it.
+    #[wasm_bindgen(js_namespace = terminal, js_name = togglePresenting)]
+    fn toggle_presenting(path: &str);
+    /// Go live, as stream does, and record too (`keep`) beside the file at `path`; or stop.
+    #[wasm_bindgen(js_namespace = terminal, js_name = goLive)]
+    fn go_live(path: &str, keep: bool);
+    /// Ask to speak in the presentation followed, or withdraw the ask, or stop speaking.
+    #[wasm_bindgen(js_namespace = terminal, js_name = askToSpeak)]
+    fn ask_to_speak();
+    /// Allow, or dismiss, a listener's ask to speak.
+    #[wasm_bindgen(js_namespace = terminal, js_name = answerAsk)]
+    fn answer_ask(id: &str, allow: bool);
+    /// End a listener's voice, as its presenter.
+    #[wasm_bindgen(js_namespace = terminal, js_name = endVoice)]
+    fn end_voice(device: &str);
 }
 
 /// Where the preview of `path` was left, as web/app.js keeps it: `{"slide": [column, row]}`,
@@ -117,9 +135,21 @@ async fn show(
     version: String,
 ) -> Result<JsValue, String> {
     let url = file_url(&path);
-    let size = head(&url).await?;
+    // A player asks for many ranges: it plays from a read descriptor's token, which the Worker
+    // serves without asking the kernel each time; closing the preview closes it.
+    let held = if matches!(listed.as_str(), "video" | "audio") {
+        playing(&path).await
+    } else {
+        None
+    };
+    let size = if held.is_some() { 0 } else { head(&url).await? };
     let preview = match listed.as_str() {
-        "image" | "video" | "audio" => Preview::Media(listed, url),
+        "image" | "video" | "audio" => Preview::Media(
+            listed,
+            held.as_ref().map_or(url, |(_, token)| {
+                format!("/api/file?token={}", js_sys::encode_uri_component(token))
+            }),
+        ),
         _ => {
             let archive = [".zip", ".tar", ".tar.gz", ".tgz"]
                 .iter()
@@ -145,12 +175,54 @@ async fn show(
             }
         }
     };
+    let fd = held.map(|(fd, _)| fd);
     if content.get_attribute("data-version").as_deref() != Some(version.as_str()) {
+        let _ = close(fd);
         return Ok(Closure::once_into_js(|| {}));
     }
     content.set_text_content(None);
     let handle = mount_to(content, move || render(preview, path));
-    Ok(Closure::once_into_js(move || drop(handle)))
+    Ok(Closure::once_into_js(move || {
+        drop(handle);
+        let _ = close(fd);
+    }))
+}
+
+/// A read descriptor of the file at `path`, and its token, if it has one.
+async fn playing(path: &str) -> Option<(u32, String)> {
+    let opened: abi::Opened = userland::sys::call(
+        &crate::sys::HttpSys::default(),
+        abi::Call::Open {
+            path: path.to_string(),
+            flags: abi::O_RDONLY,
+            mode: 0o666,
+            size: None,
+            sha256: None,
+            version: None,
+        },
+    )
+    .await
+    .ok()?;
+    match opened.token {
+        Some(token) => Some((opened.fd, token)),
+        None => {
+            let _ = close(Some(opened.fd));
+            None
+        }
+    }
+}
+
+/// Let go of the descriptor `fd`, if there is one, in the background.
+fn close(fd: Option<u32>) -> Option<()> {
+    let fd = fd?;
+    spawn_local(async move {
+        let _ = userland::sys::calls::<serde_json::Value>(
+            &crate::sys::HttpSys::default(),
+            vec![abi::Call::Close { fd: fd.into() }],
+        )
+        .await;
+    });
+    Some(())
 }
 
 /// The size of the file at `url`, which the viewer may read.
@@ -706,6 +778,253 @@ impl Audience {
     }
 }
 
+/// What the bar's live controls show (web/app.js `bar`): who is signed in, this account's
+/// presentations of the file, the sound this page sends, listeners asking to speak and speaking,
+/// and, following another's presentation, this page's ask; and a note, what failed or was saved.
+#[derive(Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+struct Bar {
+    path: Option<String>,
+    user: Option<String>,
+    presented: Vec<String>,
+    asks: Vec<Ask>,
+    voices: Vec<Voice>,
+    sound: Option<Sending>,
+    asking: Option<Asking>,
+    note: String,
+}
+#[derive(Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+struct Ask {
+    id: String,
+    name: String,
+}
+#[derive(Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+struct Voice {
+    device: String,
+    speaker: String,
+}
+#[derive(Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+struct Sending {
+    device: Option<String>,
+    recording: Option<String>,
+    since: f64,
+    progress: String,
+}
+#[derive(Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+struct Asking {
+    state: String,
+    error: Option<String>,
+}
+
+const PRESENT_TO_OTHERS: &str = "M3 8V6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6M3 12a8 8 0 0 1 8 8M3 16a4 4 0 0 1 4 4M3 20h.01";
+const MICROPHONE: &str =
+    "M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM5 11a7 7 0 0 0 14 0M12 18v3M8 21h8";
+const RAISED_HAND: &str = "M8 13V5.5a1.5 1.5 0 0 1 3 0V11M11 10.5V4a1.5 1.5 0 0 1 3 0v6.5M14 10V5.5a1.5 1.5 0 0 1 3 0V13M17 9.5a1.5 1.5 0 0 1 3 0V15a7 7 0 0 1-7 7h-1a7 7 0 0 1-5.6-2.8l-3.1-3.6a1.5 1.5 0 0 1 2.3-1.9L8 16";
+
+/// The bar's live controls of the file at `path` (owner's request, 2026-10-28). Signed in:
+/// Present, which makes /dev/present/NAME for others to follow, or stops it; Go live, Live or
+/// Live + record, as stream does; and the listeners asking to speak, whom the presenter allows
+/// or not, and those speaking, whom it ends. Following another's presentation: Ask to speak.
+#[component]
+fn LiveControls(path: StoredValue<String>, audience: Option<Audience>) -> impl IntoView {
+    let bar = RwSignal::new(Bar::default());
+    // Which popover is open: the Go live choice, or the listeners.
+    let menu = RwSignal::new(None::<&'static str>);
+    let listener = window_event_listener_untyped("terminal:bar", move |event| {
+        let Some(detail) = event.dyn_ref::<web_sys::CustomEvent>().map(|e| e.detail()) else {
+            return;
+        };
+        let shown: Option<Bar> = js_sys::JSON::stringify(&detail)
+            .ok()
+            .and_then(|text| text.as_string())
+            .and_then(|text| serde_json::from_str(&text).ok());
+        if let Some(shown) = shown
+            && path.with_value(|path| shown.path.as_ref() == Some(path))
+        {
+            bar.set(shown);
+        }
+    });
+    on_cleanup(move || listener.remove());
+    path.with_value(|path| bar_of(path));
+    let note = move || {
+        let note = bar.with(|bar| bar.note.clone());
+        (!note.is_empty()).then(|| view! { <span class="live-note" role="status">{note}</span> })
+    };
+    if let Some(audience) = audience {
+        let state = move || bar.with(|bar| bar.asking.as_ref().map(|asking| asking.state.clone()));
+        let label = move || match state().as_deref() {
+            Some("asking") => "Asking to speak · click to withdraw".to_string(),
+            Some("connecting") => "Starting your microphone".to_string(),
+            Some("speaking") => {
+                "Speaking: everyone following hears you · click to stop".to_string()
+            }
+            Some("denied") => "Not now, says the presenter".to_string(),
+            Some("error") => bar.with(|bar| {
+                bar.asking
+                    .as_ref()
+                    .and_then(|asking| asking.error.clone())
+                    .unwrap_or_default()
+            }),
+            _ => "Ask to speak".to_string(),
+        };
+        return view! {
+            <span class="live-controls">
+                <button
+                    class="preview-button live-ask"
+                    class:waiting=move || matches!(state().as_deref(), Some("asking" | "connecting"))
+                    class:on=move || state().as_deref() == Some("speaking")
+                    aria-label="Ask to speak"
+                    aria-pressed=move || state().is_some_and(|state| matches!(state.as_str(), "asking" | "connecting" | "speaking")).to_string()
+                    title=label
+                    disabled=move || audience.ended.get()
+                    on:click=move |_| ask_to_speak()
+                >
+                    {icon(RAISED_HAND)}
+                </button>
+                {move || (!matches!(state().as_deref(), None | Some("speaking"))).then(|| view! { <span class="live-note" role="status">{label}</span> })}
+                {note}
+            </span>
+        }
+        .into_any();
+    }
+    let presented = move || bar.with(|bar| bar.presented.first().cloned());
+    let sending = move || bar.with(|bar| bar.sound.clone());
+    let people = move || bar.with(|bar| (bar.asks.clone(), bar.voices.clone()));
+    // A popover closes once it has nothing to choose: live already, or no one left; and on a
+    // click elsewhere.
+    Effect::new(move |_| {
+        let live = sending().is_some();
+        let alone = bar.with(|bar| bar.asks.is_empty() && bar.voices.is_empty());
+        if (live && menu.get_untracked() == Some("live"))
+            || (alone && menu.get_untracked() == Some("people"))
+        {
+            menu.set(None);
+        }
+    });
+    let outside = window_event_listener(ev::pointerdown, move |event| {
+        let inside = event
+            .target()
+            .and_then(|target| target.dyn_into::<Element>().ok())
+            .and_then(|target| target.closest(".live-controls").ok().flatten());
+        if inside.is_none() && menu.get_untracked().is_some() {
+            menu.set(None);
+        }
+    });
+    on_cleanup(move || outside.remove());
+    let toggle = move |which: &'static str| {
+        menu.update(|open| *open = (*open != Some(which)).then_some(which))
+    };
+    let live = move |keep: bool| {
+        menu.set(None);
+        path.with_value(|path| go_live(path, keep));
+    };
+    let clock = move |since: f64| {
+        let seconds = ((js_sys::Date::now() - since) / 1000.0).max(0.0) as u64;
+        format!("{:02}:{:02}", seconds / 60, seconds % 60)
+    };
+    view! {
+        <span class="live-controls" class:signed-out=move || bar.with(|bar| bar.user.is_none())>
+            <button
+                class="preview-button"
+                class:on=move || presented().is_some()
+                aria-label="Present to others"
+                aria-pressed=move || presented().is_some().to_string()
+                title=move || match presented() {
+                    Some(device) => format!("Presented as {device}: others follow it with open {device} · click to stop"),
+                    None => "Present to others: they follow it with open /dev/present/NAME".to_string(),
+                }
+                on:click=move |_| path.with_value(|path| toggle_presenting(path))
+            >
+                {icon(PRESENT_TO_OTHERS)}
+            </button>
+            {move || match sending() {
+                Some(sound) => {
+                    let title = match (&sound.device, &sound.recording) {
+                        (Some(device), Some(file)) => format!("Live as {device}, recording into {file} · click to stop"),
+                        (Some(device), None) => format!("Live as {device} · click to stop"),
+                        (None, Some(file)) => format!("Recording into {file} · click to stop"),
+                        (None, None) => "Starting the microphone · click to stop".to_string(),
+                    };
+                    let title = if sound.progress.is_empty() { title } else { format!("{title}\n{}", sound.progress) };
+                    view! {
+                        <button class="live-on" aria-label="Stop the live sound" title=title on:click=move |_| live(false)>
+                            {format!("● {}", clock(sound.since))}
+                        </button>
+                    }
+                    .into_any()
+                }
+                None => view! {
+                    <button
+                        class="preview-button"
+                        aria-label="Go live"
+                        aria-haspopup="menu"
+                        aria-expanded=move || (menu.get() == Some("live")).to_string()
+                        title="Go live: send your microphone to those following"
+                        on:click=move |_| toggle("live")
+                    >
+                        {icon(MICROPHONE)}
+                    </button>
+                }
+                .into_any(),
+            }}
+            {move || (menu.get() == Some("live") && sending().is_none()).then(|| view! {
+                <span class="live-menu" role="menu" aria-label="Go live">
+                    <button role="menuitem" title="Live only: nothing is kept" on:click=move |_| live(false)>"Live"</button>
+                    <button role="menuitem" title="Live, and recorded beside this file as NAME-DATE-TIME.weba" on:click=move |_| live(true)>"Live + record"</button>
+                </span>
+            })}
+            {move || {
+                let (asks, voices) = people();
+                (!asks.is_empty() || !voices.is_empty()).then(|| view! {
+                    <button
+                        class="preview-button live-hands"
+                        class:asked=!asks.is_empty()
+                        aria-label=format!("Listeners: {} asking to speak, {} speaking", asks.len(), voices.len())
+                        aria-haspopup="menu"
+                        aria-expanded=move || (menu.get() == Some("people")).to_string()
+                        on:click=move |_| toggle("people")
+                    >
+                        {icon(RAISED_HAND)}
+                        {(!asks.is_empty()).then(|| view! { <span class="live-count">{asks.len()}</span> })}
+                    </button>
+                })
+            }}
+            {move || (menu.get() == Some("people")).then(|| {
+                let (asks, voices) = people();
+                view! {
+                    <span class="live-menu live-people" role="menu" aria-label="Listeners">
+                        {asks.into_iter().map(|ask| {
+                            let (allow, dismiss) = (ask.id.clone(), ask.id.clone());
+                            view! {
+                                <span class="live-person">
+                                    <span>{format!("{} asks to speak", ask.name)}</span>
+                                    <button role="menuitem" on:click=move |_| answer_ask(&allow, true)>"Allow"</button>
+                                    <button role="menuitem" on:click=move |_| answer_ask(&dismiss, false)>"Dismiss"</button>
+                                </span>
+                            }
+                        }).collect_view()}
+                        {voices.into_iter().map(|voice| {
+                            let device = voice.device.clone();
+                            view! {
+                                <span class="live-person speaking">
+                                    <span>{format!("{} speaking", voice.speaker)}</span>
+                                    <button role="menuitem" on:click=move |_| end_voice(&device)>"End"</button>
+                                </span>
+                            }
+                        }).collect_view()}
+                    </span>
+                }
+            })}
+            {note}
+        </span>
+    }
+    .into_any()
+}
+
 thread_local! {
     /// The speaker view this page opened last, and the deck it was opened for, which S shows
     /// again rather than open another.
@@ -1235,6 +1554,7 @@ fn Slides(source: String, path: String) -> impl IntoView {
                         {icon(SPEAKER_VIEW)}
                     </button>
                     {audience.map(|audience| audience.badge(resume))}
+                    <LiveControls path=path audience=audience />
                 </div>
                 {button("Previous slide", PREVIOUS, -1, 0)}
                 {vertical.then(|| button("Slide above", UP, 0, -1))}
@@ -1699,7 +2019,19 @@ fn PdfView(data: Arc<Vec<u8>>, path: String) -> impl IntoView {
     view! {
         <div class="pdf-view" class:presenting=move || presenting.get()>
             <div class="pdf-toolbar">
-                {audience.map(|audience| audience.badge(resume))}
+                <div class="pdf-tools">
+                    {audience.map(|audience| audience.badge(resume))}
+                    <button
+                        class="pdf-present-button"
+                        title=present_label
+                        aria-label=present_label
+                        aria-pressed=move || presenting.get().to_string()
+                        on:click=move |_| presenting.update(|presenting| *presenting = !*presenting)
+                    >
+                        {move || icon(if presenting.get() { AS_DOCUMENT } else { AS_SLIDES })}
+                    </button>
+                    <LiveControls path=path audience=audience />
+                </div>
                 <button
                     aria-label="Previous page"
                     disabled=move || current.get() == 0
@@ -1729,15 +2061,6 @@ fn PdfView(data: Arc<Vec<u8>>, path: String) -> impl IntoView {
                     <button aria-label="Fit width" on:click=move |_| zoom.set(1.0)>{move || format!("{:.0}%", zoom.get() * 100.0)}</button>
                     <button aria-label="Zoom in" disabled=move || { zoom.get() >= PDF_ZOOM.1 } on:click=move |_| zoom_by(1.25)>"+"</button>
                 </span>
-                <button
-                    class="pdf-present-button"
-                    title=present_label
-                    aria-label=present_label
-                    aria-pressed=move || presenting.get().to_string()
-                    on:click=move |_| presenting.update(|presenting| *presenting = !*presenting)
-                >
-                    {move || icon(if presenting.get() { AS_DOCUMENT } else { AS_SLIDES })}
-                </button>
             </div>
             <div
                 class="pdf-present"

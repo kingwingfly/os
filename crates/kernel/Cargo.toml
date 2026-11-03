@@ -1,0 +1,10 @@
+[package]
+name = "terminal-worker-kernel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+abi = { package = "terminal-worker-abi", path = "../abi" }
+terminal-worker-core = { path = "../core" }

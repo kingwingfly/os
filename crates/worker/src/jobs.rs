@@ -291,6 +291,24 @@ fn inputs(
 }
 
 /// Start the archive job `command` asks for, as `who`; it is the reply's `job`.
+/// Refuse to write `path`, as `who` resolves it (its directory, if it is not there yet), if it is
+/// the image's (/usr), read-only, as the kernel's calls refuse with EROFS (sys.rs).
+fn read_only(db: &Db, who: &Identity, cmd: &str, path: &str) -> Result<(), String> {
+    let real = kernel::namei(db, who, path, true)
+        .map(|name| name.path)
+        .or_else(|_| {
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+            let parent = if parent.is_empty() { "/" } else { parent };
+            kernel::namei(db, who, parent, true)
+                .map(|dir| format!("{}/{name}", dir.path.trim_end_matches('/')))
+        })
+        .unwrap_or_else(|_| path.to_string());
+    if crate::usr::is(&real) {
+        return Err(format!("{cmd}: {path}: Read-only file system"));
+    }
+    Ok(())
+}
+
 pub fn start(
     db: &mut Db,
     who: &Identity,
@@ -331,6 +349,7 @@ pub fn start(
             // Only where `who` may look is it told what is there.
             db.traverse(who, &output)
                 .map_err(|e| format!("{cmd}: {e}"))?;
+            read_only(db, who, cmd, &output)?;
             match db.node(&output) {
                 Some(node) if node.directory => {
                     return Err(format!("{cmd}: {output} is a directory"));
@@ -379,6 +398,7 @@ pub fn start(
             {
                 return Err(format!("{cmd}: {e}"));
             }
+            read_only(db, who, cmd, &dest)?;
             match db.node(&dest) {
                 Some(node) if node.directory => {
                     db.access(who, &dest, WRITE | EXEC)
@@ -404,6 +424,7 @@ pub fn start(
         // keeps its owner, mode, ACLs and other names, and shows its old content until done.
         Command::Faststart { file } => {
             let target = path(db, file)?;
+            read_only(db, who, cmd, &target)?;
             let found = source(db, who, cmd, &target)?;
             let node = db
                 .access(who, &target, READ | WRITE)
@@ -476,4 +497,117 @@ pub fn finish(db: &mut Db, job: &str, state: &str) {
     db.set_job(job, crate::db::JobColumn::Question, None);
     db.unpin(job);
     db.clear_expiry("job", job);
+}
+
+/// The process calls (owner's design, 2026-10-29): a job is a process of the account signed in
+/// (`owner`), run as `process` (root under sudo).
+pub fn call(
+    db: &mut Db,
+    owner: u32,
+    home: &str,
+    sid: Option<&str>,
+    process: &kernel::Process,
+    call: abi::Call,
+) -> std::result::Result<Value, abi::Error> {
+    use crate::db::JobColumn;
+    use abi::{Call, Errno, Error};
+    let refused = |why: String| {
+        let errno = if commands::is_permission_error(&why) {
+            Errno::EACCES
+        } else {
+            Errno::EINVAL
+        };
+        Error::because(errno, why)
+    };
+    // Its owner's, or root's, to see and signal.
+    let theirs = |db: &Db, pid: &str| -> std::result::Result<Job, Error> {
+        let job = db.job(pid).ok_or(Errno::ESRCH)?;
+        if job.owner != owner && process.cred.id != 0 {
+            return Err(Errno::EPERM.into());
+        }
+        Ok(job)
+    };
+    match call {
+        Call::Spawn { argv, cwd } => {
+            if !matches!(
+                argv.first().map(String::as_str),
+                Some("zip" | "unzip" | "tar" | "faststart")
+            ) {
+                return Err(Errno::ENOENT.into());
+            }
+            let command = commands::Command {
+                args: argv,
+                cwd,
+                sudo: process.cred.id == 0,
+                home: Some(home.to_string()),
+            };
+            let started = start(db, &process.cred, owner, &command).map_err(refused)?;
+            let pid = started["job"].as_str().unwrap_or_default().to_string();
+            // Its standard input, a descriptor of the session that writes it, as a pipe.
+            let sid = sid.ok_or(Errno::EBADF)?;
+            let now = crate::auth::now();
+            let stdin = db.add_fd(sid, None, &stdin_of(&pid), abi::O_WRONLY, false, now);
+            db.set_expiry("fd", &crate::db::fd_key(sid, stdin), now + crate::fds::IDLE);
+            Ok(json!({ "pid": pid, "kind": started["kind"], "stdin": stdin }))
+        }
+        Call::Kill { pid } => {
+            let job = theirs(db, &pid)?;
+            if !job.finished() {
+                db.set_job(&pid, JobColumn::State, Some("cancelling"));
+            }
+            Ok(json!({ "pid": pid, "state": db.job(&pid).map(|job| job.state) }))
+        }
+        Call::Wait { pid, since } => {
+            let job = theirs(db, &pid)?;
+            Ok(view(db, &job, since))
+        }
+        _ => Err(Errno::ENOSYS.into()),
+    }
+}
+
+/// Where a process's standard input is, as its descriptor names it.
+pub fn stdin_of(pid: &str) -> String {
+    format!("/proc/{pid}/fd/0")
+}
+
+/// The process whose standard input `path` is, if it is one's.
+pub fn stdin_pid(path: &str) -> Option<&str> {
+    path.strip_prefix("/proc/")?.strip_suffix("/fd/0")
+}
+
+/// Write `data` to the standard input of the process `pid`, the account `owner`'s (or anyone's
+/// as root): unzip's answers to its question, `{"decisions": {PATH: true|false}}`.
+pub fn answer(
+    db: &mut Db,
+    owner: u32,
+    process: &kernel::Process,
+    pid: &str,
+    data: &[u8],
+) -> std::result::Result<Value, abi::Error> {
+    use crate::db::JobColumn;
+    use abi::{Errno, Error};
+    let job = db.job(pid).ok_or(Errno::EPIPE)?;
+    if job.owner != owner && process.cred.id != 0 {
+        return Err(Errno::EPERM.into());
+    }
+    if job.state != "question" {
+        return Err(Error::because(
+            Errno::EAGAIN,
+            "the process is not waiting for an answer",
+        ));
+    }
+    let data: Value = serde_json::from_slice(data).unwrap_or_default();
+    let mut spec = Spec::of(&job).map_err(|why| Error::because(Errno::EIO, why))?;
+    spec.decisions = serde_json::from_value(data["decisions"].clone()).ok();
+    if spec.decisions.is_none() {
+        return Err(Error::because(
+            Errno::EINVAL,
+            "answer with {\"decisions\": {PATH: true|false}}",
+        ));
+    }
+    db.set_job(pid, JobColumn::Spec, Some(&json!(spec).to_string()));
+    db.set_job(pid, JobColumn::Question, None);
+    db.set_job(pid, JobColumn::State, Some("queued"));
+    db.set_expiry("job", pid, crate::auth::now() + WAITING);
+    Ok(json!({ "pid": pid, "state": "queued" }))
 }

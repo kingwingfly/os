@@ -1,12 +1,11 @@
 // Recording sound into a file that grows as it is heard (`stream FILE`): Opus in WebM, which
-// every browser records. The authority makes the file at once, empty, readable while it grows,
-// with chunks smaller than an upload's (api::RECORDING_CHUNK); this page holds it as it holds an
-// upload (upload.mjs), and sends each chunk in order as soon as it is whole. Stopping sends the
-// rest as the last, short, chunk and completes the file. If the page goes, the authority keeps
-// what arrived (api::RECORDING_IDLE).
-import { json } from './http.mjs';
+// every browser records. It is a new file opened to append (O_APPEND), there at once, empty,
+// readable while it grows, in chunks smaller than an upload's (api::RECORDING_CHUNK); this page
+// keeps its descriptor as an upload's (upload.mjs), and writes each chunk in order as soon as
+// it is whole. Stopping writes the rest as the last, short, chunk and closes the file, which is
+// then complete. If the page goes, the kernel keeps what arrived (api::RECORDING_IDLE).
+import { O_APPEND, O_CREAT, O_EXCL, O_WRONLY, call, closeOnLeaving, hold, pwrite, sys } from './http.mjs';
 
-const HEARTBEAT = 5000;
 const RETRIES = 3;
 export const RECORDED = 'audio/webm;codecs=opus';
 
@@ -20,10 +19,18 @@ export const clock = seconds => `${String(Math.floor(seconds / 60)).padStart(2, 
  * file is there. Settles with what was saved. */
 export async function record(destination, microphone, { acl = null, progress = () => {}, begun: there = () => {}, signal }) {
   if (!window.MediaRecorder?.isTypeSupported(RECORDED)) throw new Error('This browser cannot record Opus in WebM');
-  const rust = window.terminalUploads, whole = rust.hasher();
-  const begun = await json(await fetch('/api/uploads?path=' + encodeURIComponent(destination), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ record: true, acl }) }));
-  const held = `id=${encodeURIComponent(begun.id)}&hold=${encodeURIComponent(begun.hold)}`;
-  const chunkSize = begun.chunk_size;
+  const rust = window.terminalUploads;
+  let begun;
+  try { begun = await call('open', { path: destination, flags: O_WRONLY | O_CREAT | O_EXCL | O_APPEND, mode: 0o666 }); }
+  catch (error) { throw error.errno === 'EEXIST' ? new Error('File already exists; rename it before recording') : error; }
+  const fd = begun.fd, chunkSize = begun.chunk_size;
+  // Who may hear it, as it is made (stream -m), or it is not made.
+  if (acl) {
+    const why = await rust.setfacl(destination, acl);
+    if (why) { await sys([{ close: { fd } }, { unlink: { path: destination } }]).catch(() => {}); throw new Error(why.replace(/^setfacl:/, 'stream -m:')); }
+  }
+  const leaving = () => closeOnLeaving([fd]);
+  addEventListener('pagehide', leaving);
   there(begun);
   // `full`: the file reached the largest a file may be, and takes no more.
   let failure = null, full = false, sent = 0, index = 0, pending = new Uint8Array(0);
@@ -36,9 +43,7 @@ export async function record(destination, microphone, { acl = null, progress = (
         // Failed meanwhile (the hold lost, say), or full: nothing more goes.
         if (failure || full) return;
         try {
-          const response = await fetch(`/api/uploads/chunk?id=${encodeURIComponent(begun.id)}&index=${at}`, { method: 'PUT', headers: { 'X-Chunk-SHA256': rust.sha256(bytes), 'X-Upload-Hold': begun.hold }, body: bytes });
-          // Its hash is of what arrived, in order.
-          await json(response); sent += bytes.length; whole.update(bytes); return;
+          await pwrite(fd, at, bytes, rust.sha256(bytes)); sent += bytes.length; return;
         } catch (error) {
           // Refused, it is over; a 400 says R2 did not take it (files.rs), which goes again a few
           // times, as an upload's chunk does. Unreachable, it goes again for as long as the
@@ -71,11 +76,9 @@ export async function record(destination, microphone, { acl = null, progress = (
   const started = performance.now();
   const say = () => progress(`● ${clock((performance.now() - started) / 1000)} · ${size(sent + pending.length)}`);
   const ticking = setInterval(say, 1000); say();
-  // Still here, while it records: the page keeps its hold.
-  const heartbeat = setInterval(async () => {
-    try { await json(await fetch('/api/uploads/hold?' + held, { method: 'POST' })); }
-    catch (error) { if ([401, 403, 409].includes(error.status)) failure ??= error; }
-  }, HEARTBEAT);
+  // Still here, while it records: the page keeps its descriptor, and hears if it was closed
+  // elsewhere (jobs cancel).
+  const lease = hold(fd, () => { failure ??= Object.assign(new Error('closed elsewhere'), { errno: 'EBADF', status: 409 }); });
   try {
     recorder.start(1000);
     // Until stopped, here or by the recorder itself, or a chunk or the hold fails.
@@ -89,10 +92,10 @@ export async function record(destination, microphone, { acl = null, progress = (
     await queue;
     // Stopped elsewhere (jobs cancel), or taken from this page: the file is what arrived.
     if (failure) throw failure.status === 409 ? new Error('stopped elsewhere; what arrived is kept') : failure;
-    const done = await json(await fetch(`/api/uploads/complete?${held}&sha256=${whole.hex()}`, { method: 'POST' }));
+    const done = await call('close', { fd });
     return { ...done, seconds: (performance.now() - started) / 1000, ...(full ? { stopped: 'it reached the largest a file may be (1 GB)' } : itself ? { stopped: 'the microphone stopped' } : {}) };
   } finally {
-    clearInterval(ticking); clearInterval(heartbeat);
+    clearInterval(ticking); lease(); removeEventListener('pagehide', leaving);
     if (recorder.state !== 'inactive') recorder.stop();
   }
 }

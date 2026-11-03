@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
+import { fakeKernel } from './sys.js';
 
 // Exercise the real Rust preview and shipped CSS without accounts, an R2 upload or a dev server.
 test('image-only slides fit the preview and fullscreen without shrinking into Markdown', async ({ page }) => {
@@ -10,8 +11,7 @@ test('image-only slides fit the preview and fullscreen without shrinking into Ma
   await page.route('**/*',async route=>{
     const url=new URL(route.request().url());
     if(url.pathname==='/api/session')return route.fulfill({json:{authenticated:false,username:'guest',uid:65534,home:'/guest',can_write:false}});
-    if(url.pathname==='/api/ls')return route.fulfill({json:{path:'/',entries:[entry]}});
-    if(url.pathname==='/api/stat')return route.fulfill({json:entry});
+    if(url.pathname==='/api/sys')return fakeKernel({'/fit.slides.md':{size:source.length}})(route);
     if(url.pathname==='/api/file'){
       const path=url.searchParams.get('path');
       if(path==='/fit.slides.md')return route.fulfill({body:source,contentType:'text/markdown'});

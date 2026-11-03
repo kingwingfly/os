@@ -11,6 +11,9 @@ worker = "=0.8.7"
 serde.workspace = true
 serde_json.workspace = true
 terminal-worker-core = { path = "../core" }
+# The system-call interface, and the kernel's file system (owner's design, 2026-10-29).
+abi = { package = "terminal-worker-abi", path = "../abi" }
+kernel = { package = "terminal-worker-kernel", path = "../kernel" }
 # getfattr -m patterns, with the regular expressions fd takes.
 regex = { version = "1.13", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
 hmac = "0.12"

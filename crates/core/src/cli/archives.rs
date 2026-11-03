@@ -6,8 +6,8 @@ use super::{Manual, Section};
 
 /// make a zip archive
 ///
-/// Writes PATHs into the new archive ARCHIVE (.zip is added to a name without an extension), on
-/// the server, from the files as they were when it started. It appears at once and can be read
+/// Writes PATHs into the new archive ARCHIVE (.zip is added to a name without an extension), as
+/// a process of its own, from the files as they were when it started. It appears at once and can be read
 /// while it is written.
 ///
 /// Names are stored as typed, without a leading / or ../. Links are followed, their files
@@ -176,7 +176,7 @@ impl Manual for Tar {
 /// Without that, a player must fetch the end of the file before it starts, and cannot play it at
 /// all while it is still uploading. upload warns of such a file; this fixes it where it is.
 ///
-/// It runs on the server, in a container, as zip and tar do (see jobs). FILE is written in
+/// It runs apart, in a container, as zip and tar do (see ps). FILE is written in
 /// place, as it would be by an editor: it keeps its owner, mode, ACLs and other names, and shows
 /// its old content until the new one is whole. A file already faststart is left as it is; one
 /// that is not an MP4 or QuickTime file, or a fragmented one, is refused.
@@ -196,11 +196,12 @@ impl Manual for Faststart {
     const SEE: &'static [&'static str] = &["upload", "jobs"];
 }
 
-/// list archive jobs and unfinished uploads
+/// list processes and this browser's unfinished uploads
 ///
-/// Lists your zip, unzip, tar and faststart jobs and your unfinished uploads, with their state
-/// and progress. Jobs run on the server, and go on when their tab or the page closes. jobs cancel
-/// ID stops one, by the first characters of its ID.
+/// Lists your processes (zip, unzip, tar and faststart, as ps does) and the files this browser
+/// is writing (uploads and recordings, by their descriptors, fdN), with their state and
+/// progress. Processes go on when their tab or the page closes. jobs cancel ID stops one: a
+/// process by the first characters of its PID, a descriptor as fdN, which closes it.
 #[derive(Parser, Debug)]
 #[command(name = "jobs", override_usage = "jobs\n       jobs cancel ID")]
 pub struct Jobs {
@@ -213,7 +214,41 @@ impl Manual for Jobs {
     const SECTION: Section = Section::Archives;
     const EXAMPLES: &'static [(&'static str, &'static str)] = &[
         ("jobs", "what is running"),
-        ("jobs cancel 3fa9", "stop one"),
+        ("jobs cancel 3fa9", "stop a process"),
+        ("jobs cancel fd3", "stop an upload, or a recording"),
     ];
     const SEE: &'static [&'static str] = &["zip", "unzip", "tar", "upload"];
+}
+
+/// list the account's processes
+///
+/// Lists your processes, the zip, unzip, tar and faststart you started, from any tab or device,
+/// the latest first: its PID, state and command. They run apart, and go on when their tab or
+/// the page closes.
+#[derive(Parser, Debug)]
+#[command(name = "ps")]
+pub struct Ps {}
+impl Manual for Ps {
+    const SECTION: Section = Section::Archives;
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("ps", "what runs, and what ran"),
+        ("ps | grep unzip", "the unzips"),
+    ];
+    const SEE: &'static [&'static str] = &["kill", "jobs"];
+}
+
+/// stop a process
+///
+/// Signals each process named by its PID (or the start of it, as ps shows it), which stops
+/// between steps: what it wrote is kept. Yours, or anyone's as root.
+#[derive(Parser, Debug)]
+#[command(name = "kill")]
+pub struct Kill {
+    #[arg(value_name = "PID", required = true)]
+    pub pids: Vec<String>,
+}
+impl Manual for Kill {
+    const SECTION: Section = Section::Archives;
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[("kill 3fa9", "stop it")];
+    const SEE: &'static [&'static str] = &["ps", "jobs"];
 }

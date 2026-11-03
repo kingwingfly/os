@@ -1,6 +1,5 @@
 //! File bytes, which go between the client and R2 in the Worker, outside the authority: it only
 //! says whether a request may read or write them, and records what was written.
-use crate::api::chunk_key;
 use crate::streams::{concatenate, fixed_length, object_range};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -8,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
-use terminal_worker_core::{MAX_UPLOAD, byte_range, mime};
+use terminal_worker_core::byte_range;
 use wasm_bindgen::prelude::*;
 use worker::wasm_bindgen_futures::future_to_promise;
 use worker::*;
@@ -91,23 +90,113 @@ struct Grant {
     chunks: Vec<(u64, String)>,
 }
 
-/// GET or HEAD a file: authorization precedes every HEAD, Range and conditional response,
-/// including 304. A file still uploading is read as it arrives: the response waits for each
-/// chunk not uploaded yet.
-pub async fn read(req: Request, env: &Env) -> Result<Response> {
-    let query = format!("path={}", encode(&param(&req, "path")?));
-    let mut grant = authority(
+thread_local! {
+    /// What the kernel last said of read tokens, by token: the session reading by it, when it
+    /// said so, and the file's content to read.
+    static TOKENS: RefCell<HashMap<String, (String, u64, Value)>> = RefCell::default();
+}
+
+/// The session a request comes from, as its cookies say: a signed-in one's, or a browser's own.
+fn session(req: &Request) -> String {
+    let cookie = |name| crate::auth::cookie_token(req, name).unwrap_or_default();
+    format!(
+        "{} {}",
+        cookie(crate::auth::COOKIE),
+        cookie(crate::auth::GUEST_COOKIE)
+    )
+}
+
+/// What a read by the token `token` reads: what the kernel last said of it, if it said so
+/// lately to the same session, or what it says now; or why not, as its reply.
+async fn by_token(
+    req: &Request,
+    env: &Env,
+    token: &str,
+) -> Result<std::result::Result<Value, Response>> {
+    let (session, now) = (session(req), crate::auth::now());
+    let known = TOKENS.with(|tokens| {
+        tokens
+            .borrow()
+            .get(token)
+            .filter(|(of, at, _)| *of == session && now < at + abi::TOKEN_FRESH)
+            .map(|(_, _, grant)| grant.clone())
+    });
+    if let Some(grant) = known {
+        return Ok(Ok(grant));
+    }
+    let mut asked = authority(
         env,
-        &req,
+        req,
         Method::Get,
-        &format!("/internal/read?{query}"),
+        &format!("/internal/token?token={}", encode(token)),
         None,
     )
     .await?;
-    if grant.status_code() >= 400 {
-        return Ok(grant);
+    if asked.status_code() >= 400 {
+        TOKENS.with(|tokens| tokens.borrow_mut().remove(token));
+        return Ok(Err(asked));
     }
-    let grant: Grant = grant.json().await?;
+    let grant: Value = asked.json().await?;
+    TOKENS.with(|tokens| {
+        let mut tokens = tokens.borrow_mut();
+        if tokens.len() > 4096 {
+            tokens.retain(|_, (_, at, _)| now < *at + abi::TOKEN_FRESH);
+        }
+        tokens.insert(token.to_string(), (session, now, grant.clone()));
+    });
+    Ok(Ok(grant))
+}
+
+/// GET or HEAD a file, by its path or by a read descriptor's token: authorization precedes
+/// every HEAD, Range and conditional response, including 304; by a token, the kernel's word is
+/// taken for `TOKEN_FRESH` seconds. A file still uploading is read as it arrives: the response
+/// waits for each chunk not uploaded yet.
+pub async fn read(req: Request, env: &Env) -> Result<Response> {
+    let token = param(&req, "token")?;
+    let query = format!("path={}", encode(&param(&req, "path")?));
+    let grant: serde_json::Value = if token.is_empty() {
+        let mut grant = authority(
+            env,
+            &req,
+            Method::Get,
+            &format!("/internal/read?{query}"),
+            None,
+        )
+        .await?;
+        if grant.status_code() >= 400 {
+            return Ok(grant);
+        }
+        grant.json().await?
+    } else {
+        match by_token(&req, env, &token).await? {
+            Ok(grant) => grant,
+            Err(refused) => return Ok(refused),
+        }
+    };
+    // A file the kernel writes as it is read (/etc/passwd): all of it, as it is now.
+    if let Some(text) = grant["generated"].as_str() {
+        let headers = Headers::new();
+        headers.set("Content-Type", "text/plain; charset=utf-8")?;
+        return Ok(Response::ok(text)?.with_headers(headers));
+    }
+    // A device's content is its driver's state, as it is now (cat /dev/present/NAME).
+    if grant["device"].is_object() {
+        return Response::from_json(&grant);
+    }
+    // A binary of /usr is the build's: the assets serve it, ranges and all.
+    if let Some(asset) = grant["asset"].as_str() {
+        let headers = Headers::new();
+        for name in ["Range", "If-None-Match", "If-Range"] {
+            if let Some(value) = req.headers().get(name)? {
+                headers.set(name, &value)?;
+            }
+        }
+        let mut init = RequestInit::new();
+        init.with_method(req.method()).with_headers(headers);
+        let request = Request::new_with_init(&format!("https://assets{asset}"), &init)?;
+        return env.assets("ASSETS")?.fetch_request(request).await;
+    }
+    let grant: Grant = serde_json::from_value(grant)?;
     let headers = Headers::new();
     headers.set("Content-Type", &grant.mime)?;
     headers.set("Accept-Ranges", "bytes")?;
@@ -289,76 +378,17 @@ async fn store(
     put.execute().await.map(|_| ())
 }
 
-/// PUT a whole file in one request: the authority opens an upload, the body streams to R2 as
-/// the file's only chunk, and the authority completes the upload.
-pub async fn write(req: Request, env: &Env) -> Result<Response> {
-    let path = param(&req, "path")?;
-    let Some(length) = content_length(&req)? else {
-        return error_response("Upload must include a content length", 411);
-    };
-    if length > MAX_UPLOAD {
-        return error_response("Maximum file size is 100 MB", 413);
-    }
-    let overwrite = param(&req, "overwrite")? == "true";
-    let mut begin = authority(
-        env,
-        &req,
-        Method::Post,
-        &format!("/internal/upload/begin?path={}", encode(&path)),
-        Some(json!({
-            "size": length, "chunk_size": length.max(1), "overwrite": overwrite,
-            "if_match": req.headers().get("If-Match")?,
-            "if_none_match": req.headers().get("If-None-Match")?,
-        })),
-    )
-    .await?;
-    if begin.status_code() >= 400 {
-        return Ok(begin);
-    }
-    let id = begin.json::<Value>().await?["id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let key = chunk_key(&id, 0);
-    let index = if length == 0 {
-        None
-    } else {
-        if let Err(error) = store(env, &req, &key, length, mime(&path), None).await {
-            console_error!("upload failed: {}", error);
-            authority(
-                env,
-                &req,
-                Method::Post,
-                "/internal/upload/abort",
-                Some(json!({"id":id})),
-            )
-            .await?;
-            return error_response("Upload failed or was interrupted", 400);
-        }
-        Some(0)
-    };
-    authority(
-        env,
-        &req,
-        Method::Post,
-        "/internal/upload/commit",
-        Some(json!({"id":id,"index":index,"key":key,"complete":true})),
-    )
-    .await
-}
-
-/// PUT chunk `index` of upload `id`, with its SHA-256 in `X-Chunk-SHA256`, which R2 checks.
-/// Sending a chunk again is harmless: the copy committed first stays, so an interrupted upload
-/// resumes by sending what is missing.
-pub async fn chunk(req: Request, env: &Env) -> Result<Response> {
-    let id = param(&req, "id")?;
+/// pwrite(2) of chunk `index` through the descriptor `fd` (open, a system call): the body
+/// streams to R2, which checks it against `X-Chunk-SHA256` if given, and the kernel records it.
+/// Writing a chunk again is harmless: the copy committed first stays, so an interrupted write
+/// goes on by sending what is missing.
+pub async fn pwrite(req: Request, env: &Env) -> Result<Response> {
+    let fd = param(&req, "fd")?;
     let index = param(&req, "index")?;
     let Some(length) = content_length(&req)? else {
-        return error_response("Upload must include a content length", 411);
+        return error_response("A write must say its length (Content-Length)", 411);
     };
     let sha256 = req.headers().get("X-Chunk-SHA256")?;
-    // The token of the page sending the upload, which holds it.
-    let hold = req.headers().get("X-Upload-Hold")?.unwrap_or_default();
     let digest = match &sha256 {
         Some(hex) => match decode_hex(hex) {
             Some(bytes) if bytes.len() == 32 => Some(bytes),
@@ -371,10 +401,9 @@ pub async fn chunk(req: Request, env: &Env) -> Result<Response> {
         &req,
         Method::Get,
         &format!(
-            "/internal/upload/chunk?id={}&index={}&length={length}&hold={}",
-            encode(&id),
-            encode(&index),
-            encode(&hold)
+            "/internal/pwrite?fd={}&index={}&length={length}",
+            encode(&fd),
+            encode(&index)
         ),
         None,
     )
@@ -386,20 +415,21 @@ pub async fn chunk(req: Request, env: &Env) -> Result<Response> {
     let key = grant["key"].as_str().unwrap_or_default();
     let content_type = grant["mime"].as_str().unwrap_or_default();
     if let Err(error) = store(env, &req, key, length, content_type, digest).await {
-        console_error!("chunk upload failed: {}", error);
-        return error_response(
-            "Chunk upload failed, or the chunk does not match its SHA-256; send it again",
-            400,
-        );
+        console_error!("pwrite failed: {}", error);
+        return Ok(Response::from_json(&json!({
+            "error": "The chunk did not arrive whole, or does not match its SHA-256; write it again",
+            "errno": "EIO",
+        }))?
+        .with_status(400));
     }
     authority(
         env,
         &req,
         Method::Post,
-        "/internal/upload/commit",
+        "/internal/pwrite/commit",
         Some(json!({
-            "id": id, "index": index.parse::<u64>().ok(), "key": key, "sha256": sha256,
-            "complete": false, "hold": hold, "length": length,
+            "fd": fd.parse::<u32>().unwrap_or(u32::MAX), "index": index.parse::<u64>().unwrap_or(u64::MAX),
+            "key": key, "sha256": sha256, "length": length,
         })),
     )
     .await

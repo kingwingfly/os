@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { api, mkdirp, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -9,16 +10,16 @@ test.beforeEach(async ({ request, page }) => {
   base = '/search-' + Date.now().toString(36);
   headers = { Origin: origin, 'CF-Connecting-IP': 'search-' + base };
   await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'search-ui-' + base });
-  expect((await request.post('/api/login', { headers, data: { password } })).ok()).toBe(true);
-  expect((await request.post('/api/mkdir?path=' + encodeURIComponent(base), { headers })).ok()).toBe(true);
+  expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
+  await mkdirp(request, base);
   const files = {
     'main.rs': 'fn main() {\n    let spéctrum = "γάμμα";\n    helper(spéctrum);\n}\n\nfn helper(x: &str) {}\nfn Other() {}\n',
     'notes.txt': 'a.b axb A.B\nsecond line\n',
     'guide.md': '# Guide\n\nSearch **this** text, and this `code`.\n',
   };
-  for (const [name, text] of Object.entries(files)) expect((await request.put(file(`${base}/${name}`), { headers, data: text })).status()).toBe(201);
+  for (const [name, text] of Object.entries(files)) expect((await put(request, file(`${base}/${name}`), { headers, data: text })).status()).toBe(201);
 });
-test.afterEach(async ({ request }) => { await request.delete(file(base) + '&recursive=true', { headers }); });
+test.afterEach(async ({ request }) => { await rmrf(request, base); });
 
 async function open(page, name) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });

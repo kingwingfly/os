@@ -236,8 +236,8 @@ impl Manual for Uniq {
 /// Runs COMMAND (echo) with the items read from standard input added as arguments. Items are
 /// separated by blanks and newlines, with quotes and backslashes as in GNU xargs.
 ///
-/// File commands run many at a time on the server; a failed run does not stop the next. Ctrl+C
-/// stops between runs.
+/// Each run is a program of its own; a failed run does not stop the next. Ctrl+C stops between
+/// runs.
 #[derive(Parser, Debug)]
 #[command(name = "xargs")]
 pub struct Xargs {

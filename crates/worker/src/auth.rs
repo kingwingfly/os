@@ -6,6 +6,8 @@ use terminal_worker_core::permissions::{GUEST, Identity, Session, Store, User};
 use wasm_bindgen::prelude::*;
 use worker::*;
 pub const COOKIE: &str = "terminal_session";
+/// A browser signed out, each its own session, all acting as guest: what keeps its descriptors.
+pub const GUEST_COOKIE: &str = "terminal_guest";
 pub const TTL: u64 = 8 * 60 * 60;
 #[wasm_bindgen(inline_js = "
 export function randomToken() { const bytes=crypto.getRandomValues(new Uint8Array(32)); return Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join(''); }
@@ -20,17 +22,48 @@ extern "C" {
 pub fn now() -> u64 {
     Date::now().as_millis() / 1000
 }
-/// The stored key of the request's session token: its hash, so stored keys cannot sign in.
-pub fn token_key(req: &Request) -> Option<String> {
+/// Seconds since 1970 and nanoseconds past them, to the millisecond the clock gives.
+pub fn clock() -> (u64, u32) {
+    let ms = Date::now().as_millis();
+    (ms / 1000, (ms % 1000) as u32 * 1_000_000)
+}
+/// The token of the cookie `name` the request carries, if it is one (64 hexadecimal digits).
+pub fn cookie_token(req: &Request, name: &str) -> Option<String> {
     let cookies = req.headers().get("Cookie").ok()??;
     let token = cookies
         .split(';')
         .map(str::trim)
-        .find_map(|s| s.strip_prefix(&format!("{COOKIE}=")))?;
-    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
+        .find_map(|s| s.strip_prefix(&format!("{name}=")))?;
+    (token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())).then(|| token.to_string())
+}
+/// The stored key of the request's session token: its hash, so stored keys cannot sign in.
+pub fn token_key(req: &Request) -> Option<String> {
+    cookie_token(req, COOKIE).map(|token| URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes())))
+}
+/// The key of the request's signed-out browser (`GUEST_COOKIE`), which no session's key can be.
+pub fn guest_key(req: &Request) -> Option<String> {
+    cookie_token(req, GUEST_COOKIE).map(|token| {
+        format!(
+            "guest.{}",
+            URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
+        )
+    })
+}
+/// The session a request is of, as its descriptors are kept: the signed-in one, `key`, or,
+/// signed out, the browser's own, `guest`.
+pub fn sid(c: &impl Store, key: Option<&str>, guest: Option<&str>) -> Option<String> {
+    match live_session(c, key) {
+        Some(_) => key.map(str::to_string),
+        None => guest.map(str::to_string),
     }
-    Some(URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes())))
+}
+/// The cookie that makes a signed-out browser a session of its own.
+pub fn guest_cookie(https: bool, token: &str) -> String {
+    format!(
+        "{GUEST_COOKIE}={token}; Path=/api; HttpOnly; SameSite=Strict; Max-Age={}{}",
+        400 * 24 * 60 * 60,
+        if https { "; Secure" } else { "" }
+    )
 }
 fn live_session(c: &impl Store, key: Option<&str>) -> Option<Session> {
     key.and_then(|k| c.session(k)).filter(|s| s.expires > now())

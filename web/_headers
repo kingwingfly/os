@@ -1,0 +1,6 @@
+# The page, isolated from other sites, may share memory with its processes (SharedArrayBuffer):
+# their pipes and the terminal's input (web/wasi/pipe.js). credentialless lets other sites'
+# images in previews load, without cookies.
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: credentialless

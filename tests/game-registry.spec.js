@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
+import { fakeKernel } from './sys.js';
 test('uploaded manifests cannot select unregistered or prototype game entries', async ({ page }) => {
-  await page.route('**/api/ls?*', route => route.fulfill({ json: { path: '/', entries: [{ name: 'unregistered.game', path: '/unregistered.game', directory: false, size: 64, kind: 'game' }] } }));
-  await page.route('**/api/stat?*', route => route.fulfill({ json: { name: 'unregistered.game', path: '/unregistered.game', directory: false, size: 64, kind: 'game' } }));
+  await page.route('**/api/sys', fakeKernel({ '/unregistered.game': { size: 64 } }));
   await page.goto('/');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   for (const entry of ['signal', '__proto__', 'constructor', 'https://example.com/game.html']) {

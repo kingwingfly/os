@@ -1,21 +1,18 @@
-// Chunked, resumable uploads. A file is hashed first: its SHA-256, size and destination name the
-// upload on the server, so choosing the same file again, on this device or another signed in to
-// the same account, resumes it from the chunks the server already has. One page sends an upload
-// at a time: it holds it, saying every few seconds that it is still there, and no other page
-// resumes it until it has not for a while (api::HOLD). Each chunk carries its own SHA-256, which
-// R2 checks. Others can read a file while it uploads.
-import { json } from './http.mjs';
+// Chunked, resumable uploads, through a file descriptor (system calls: open, pwrite, close). A
+// file is hashed first: its SHA-256 and size, opened at its destination, go on with the chunks
+// the kernel already has of it, so choosing the same file again, on this device or another
+// signed in to the same account, resumes it. One descriptor writes a file at a time: its page
+// keeps it (http.mjs hold), and no other session goes on with it until this one has not been
+// heard from for a while (fds::LEASE). Each chunk carries its own SHA-256, which R2 checks.
+// Others can read a file while it uploads.
+import { O_CREAT, O_WRONLY, call, closeOnLeaving, hold, sys } from './http.mjs';
 
 const PARALLEL = 3;
 const RETRIES = 3;
-const HEARTBEAT = 5000;
 
-// The uploads this page holds, which it lets go of as it closes, so that another may resume them.
-const holding = new Set();
-addEventListener('pagehide', () => { for (const query of holding) navigator.sendBeacon('/api/uploads/release?' + query); });
-
-// Records of the uploads this browser made, kept before the server resumed by itself.
-try { for (const key of Object.keys(localStorage)) if (key.startsWith('terminal-upload:')) localStorage.removeItem(key); } catch {}
+// The descriptors this page writes, closed as it goes, so that another may go on with them.
+const writing = new Set();
+addEventListener('pagehide', () => closeOnLeaving([...writing]));
 
 export class Cancelled extends Error { constructor() { super('Upload cancelled'); this.name = 'Cancelled'; } }
 
@@ -35,18 +32,18 @@ async function hash(file, size, progress, signal) {
   return { sha256: whole.hex(), parts };
 }
 
-function send(id, hold, index, blob, sha256, requests) {
+// pwrite(2) of chunk `index`, as an XMLHttpRequest, which stops when asked.
+function send(fd, index, blob, sha256, requests) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest(); requests.add(xhr);
-    xhr.open('PUT', `/api/uploads/chunk?id=${encodeURIComponent(id)}&index=${index}`);
+    xhr.open('PUT', `/api/pwrite?fd=${fd}&index=${index}`);
     xhr.setRequestHeader('X-Chunk-SHA256', sha256);
-    xhr.setRequestHeader('X-Upload-Hold', hold);
     const done = () => requests.delete(xhr);
     xhr.onload = () => {
       done();
       if (xhr.status >= 200 && xhr.status < 300) return resolve();
-      let message = `Chunk ${index} failed (${xhr.status})`; try { message = JSON.parse(xhr.responseText).error || message; } catch {}
-      const error = new Error(message); error.status = xhr.status; reject(error);
+      let reply = {}; try { reply = JSON.parse(xhr.responseText); } catch {}
+      const error = new Error(reply.error || `Chunk ${index} failed (${xhr.status})`); error.status = xhr.status; error.errno = reply.errno; reject(error);
     };
     xhr.onerror = () => { done(); reject(new Error('Network connection failed')); };
     xhr.onabort = () => { done(); reject(new Cancelled()); };
@@ -55,9 +52,9 @@ function send(id, hold, index, blob, sha256, requests) {
 }
 // Send a chunk, again after a moment if the network or the server failed; a refusal is final.
 // `halted` says whether the upload stopped meanwhile, as another chunk failed.
-async function sendWithRetries(id, hold, index, blob, sha256, requests, signal, halted) {
+async function sendWithRetries(fd, index, blob, sha256, requests, signal, halted) {
   for (let attempt = 0; ; attempt++) {
-    try { return await send(id, hold, index, blob, sha256, requests); }
+    try { return await send(fd, index, blob, sha256, requests); }
     catch (error) {
       if (signal.aborted || error instanceof Cancelled) throw new Cancelled();
       if (attempt + 1 >= RETRIES || (error.status >= 400 && error.status < 500 && error.status !== 400)) throw error;
@@ -67,18 +64,26 @@ async function sendWithRetries(id, hold, index, blob, sha256, requests, signal, 
   }
 }
 
+// Why opening `destination` was refused, as the uploader is told.
+function refused(error) {
+  if (error.errno === 'EEXIST') return new Error('File already exists; rename it before uploading');
+  if (error.errno === 'EISDIR') return new Error('A directory with this name already exists');
+  return error;
+}
+
 /** Upload `file` to `destination`, reporting progress, until done or `signal` cancels it. */
 export async function uploadFile(file, destination, { progress = () => {}, signal = new AbortController().signal } = {}) {
   const size = window.terminalUploads.chunkSize;
   const count = Math.ceil(file.size / size);
   const { sha256, parts } = await hash(file, size, progress, signal);
   if (signal.aborted) throw new Cancelled();
-  // A new upload, or the same file's, resumed: the server refuses one another page is sending.
-  const upload = await json(await fetch('/api/uploads?path=' + encodeURIComponent(destination), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ size: file.size, sha256 }) }));
-  const id = encodeURIComponent(upload.id), hold = upload.hold || '';
-  const held = `id=${id}&hold=${encodeURIComponent(hold)}`;
-  const committed = new Set(upload.committed || []);
-  const resumed = committed.size;
+  // A new file, or the same one, gone on with: refused while another page writes it.
+  let opened;
+  try { opened = await call('open', { path: destination, flags: O_WRONLY | O_CREAT, mode: 0o666, size: file.size, sha256 }); }
+  catch (error) { throw refused(error); }
+  const fd = opened.fd;
+  const committed = new Set(opened.committed || []);
+  const resumed = Boolean(opened.resumed);
   const length = index => Math.min(size, file.size - index * size);
   let arrived = 0; committed.forEach(index => { arrived += length(index); });
   progress(percent(arrived, file.size));
@@ -88,45 +93,41 @@ export async function uploadFile(file, destination, { progress = () => {}, signa
   let halted = false, failure;
   const requests = new Set(), abort = () => { halted = true; requests.forEach(xhr => xhr.abort()); };
   signal.addEventListener('abort', abort, { once: true });
-  holding.add(held);
-  // Still here, while it sends: the page keeps its hold, or stops once the upload went on
-  // elsewhere or was cancelled (jobs cancel).
-  const heartbeat = setInterval(async () => {
-    try { await json(await fetch('/api/uploads/hold?' + held, { method: 'POST' })); }
-    catch (error) { if ([401, 403, 409].includes(error.status)) { failure ??= error; abort(); } }
-  }, HEARTBEAT);
+  writing.add(fd);
+  // Still here, while it sends: the page keeps its descriptor; another page going on with the
+  // file, or its removal, stops the next chunk (EBADF).
+  const lease = hold(fd);
   try {
     await Promise.all(Array.from({ length: Math.min(PARALLEL, pending.length) }, async () => {
       while (pending.length && !halted) {
         if (signal.aborted) throw new Cancelled();
         const index = pending.shift();
         try {
-          await sendWithRetries(upload.id, hold, index, file.slice(index * size, Math.min((index + 1) * size, file.size)), parts[index], requests, signal, () => halted);
+          await sendWithRetries(fd, index, file.slice(index * size, Math.min((index + 1) * size, file.size)), parts[index], requests, signal, () => halted);
         } catch (error) { if (!(error instanceof Cancelled)) failure ??= error; abort(); throw error; }
         committed.add(index); arrived += length(index);
         progress(percent(arrived, file.size));
       }
     }));
     if (signal.aborted) throw new Cancelled();
-    // The heartbeat may stop the upload between chunks, when none is in flight to fail.
+    // The lease may stop the upload between chunks, when none is in flight to fail.
     if (failure) throw failure;
   } catch (error) {
-    // Not heard from again once it lets go, which a heartbeat after would take back.
-    clearInterval(heartbeat); abort();
-    // Only Cancel cancels the upload, and only the one this page holds; chunks stopped because
-    // another failed keep it to resume.
+    lease(); abort();
+    // Only Cancel cancels the upload, and only while this page writes it: a file it made goes.
     if (signal.aborted || (error instanceof Cancelled && !failure)) {
-      await fetch('/api/uploads?' + held, { method: 'DELETE' }).catch(() => {});
+      const [closed] = await sys([{ close: { fd } }]).catch(() => [{}]);
+      if (opened.created && closed && (closed.ok || closed.err?.errno === 'EIO')) await sys([{ unlink: { path: destination } }]).catch(() => {});
       throw new Cancelled();
     }
-    // Let go, so that choosing the file again resumes it now, here or elsewhere.
-    await fetch('/api/uploads/release?' + held, { method: 'POST' }).catch(() => {});
-    // Nothing to go on with here: the upload went on from another page, someone removed the
-    // file or cancelled the upload, or it expired.
+    // Let go, so that choosing the file again goes on with it now, here or elsewhere.
+    await sys([{ close: { fd } }]).catch(() => {});
+    // Nothing to go on with here: another page went on with it, someone removed it, or it
+    // expired.
     const reason = failure || error;
-    if (reason.status === 409) throw new Error('stopped: ' + (/another tab or device/.test(reason.message) ? reason.message : 'the file was removed, or its upload cancelled, elsewhere'));
+    if (reason.errno === 'EBADF') throw new Error('stopped: ' + (/another tab or device/.test(reason.message) ? reason.message : 'the file was removed, or its upload cancelled, elsewhere'));
     throw new Error(reason.message + '; choose the same file again to resume');
-  } finally { clearInterval(heartbeat); holding.delete(held); signal.removeEventListener('abort', abort); }
-  const done = await json(await fetch('/api/uploads/complete?' + held, { method: 'POST' }));
+  } finally { lease(); writing.delete(fd); signal.removeEventListener('abort', abort); }
+  const done = await call('close', { fd });
   return { ...done, resumed };
 }

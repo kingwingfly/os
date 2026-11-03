@@ -278,10 +278,18 @@ fn query_words(context: &str, words: &[String], typed: &[String], first: bool) -
     let command = words[0].as_str();
     let auto_open = words.len() == 1 && first;
     if words.len() == 1 && (!command.is_empty() || !first) {
-        // Every command defined, as help lists them.
-        let mut commands: Vec<_> = crate::cli::names()
+        // Every command defined, as help lists them, and /bin's programs the shell has none
+        // of its own for.
+        let names = crate::cli::names();
+        let mut commands: Vec<_> = names
             .iter()
             .map(String::as_str)
+            .chain(
+                crate::bin::PROGRAMS
+                    .iter()
+                    .copied()
+                    .filter(|program| !names.iter().any(|name| name == program)),
+            )
             .filter_map(|name| {
                 fuzzy_score(command, name).map(|score| {
                     (

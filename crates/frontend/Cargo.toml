@@ -18,6 +18,7 @@ web-sys = { workspace = true, features = [
     "CssStyleDeclaration",
     "CustomEvent",
     "Document",
+    "DomRect",
     "DomRectReadOnly",
     "Element",
     "Event",
@@ -32,6 +33,9 @@ web-sys = { workspace = true, features = [
     "Location",
     "MessageEvent",
     "MouseEvent",
+    "MutationObserver",
+    "MutationObserverInit",
+    "MutationRecord",
     "Node",
     "NodeList",
     "PointerEvent",
@@ -44,6 +48,8 @@ web-sys = { workspace = true, features = [
     "Storage",
     "Url",
     "UrlSearchParams",
+    "ResizeObserver",
+    "VisualViewport",
     "Window",
     "Worker",
 ] }
@@ -52,6 +58,9 @@ serde_json.workspace = true
 serde-wasm-bindgen = "0.6"
 gloo-net = "0.6"
 terminal-worker-core = { path = "../core" }
+# User space: the programs, over system calls (owner's design, 2026-10-29).
+abi = { package = "terminal-worker-abi", path = "../abi" }
+userland = { package = "terminal-worker-userland", path = "../userland" }
 console_error_panic_hook = "0.1"
 # Pipelines run commands that run commands (xargs, fd -x), and wait for answers to prompts.
 futures = "0.3"

@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { fakeKernel } from './sys.js';
 
 // Keep this regression independent of local accounts, passwords and stored files.
 test('editor close restores actual typing after Escape, close button and discarded changes', async ({ page }) => {
@@ -7,12 +8,15 @@ test('editor close restores actual typing after Escape, close button and discard
   await page.route('**/api/**', async route => {
     const request = route.request(), url = new URL(request.url());
     if (url.pathname === '/api/session') return route.fulfill({json:{authenticated:true,username:'editor',uid:1000,home:'/',can_write:true}});
-    if (url.pathname === '/api/ls') return route.fulfill({json:{path:'/',entries:[entry()]}});
-    if (url.pathname === '/api/stat') return route.fulfill({json:entry()});
-    if (url.pathname === '/api/file') {
-      if (request.method() === 'PUT') { content = request.postData(); revision++; return route.fulfill({json:{etag:`"${revision}"`}}); }
-      return route.fulfill({body:request.method() === 'HEAD' ? '' : content,headers:{'Content-Type':'text/plain','ETag':`"${revision}"`}});
+    if (url.pathname === '/api/sys') {
+      // A save: open, a pwrite, close, which makes the new version.
+      const [name] = Object.keys(JSON.parse(request.postData()).calls[0]);
+      if (name === 'open') return route.fulfill({json:{results:[{ok:{fd:3,size:0,chunk_size:8388608}}]}});
+      if (name === 'close') { revision++; return route.fulfill({json:{results:[{ok:{path:'/focus.txt',size:content.length,version:`"${revision}"`}}]}}); }
+      return fakeKernel(() => ({'/focus.txt': {size: content.length, user: 'editor'}}))(route);
     }
+    if (url.pathname === '/api/pwrite') { content = request.postData(); return route.fulfill({json:{committed:0}}); }
+    if (url.pathname === '/api/file') return route.fulfill({body:request.method() === 'HEAD' ? '' : content,headers:{'Content-Type':'text/plain','ETag':`"${revision}"`}});
     return route.fulfill({status:404,json:{error:'unexpected test request'}});
   });
   await page.goto('/');

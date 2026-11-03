@@ -1,5 +1,7 @@
 pub mod acl;
+pub mod ansi;
 pub mod archive;
+pub mod bin;
 pub mod cli;
 pub mod completion;
 pub mod devices;
@@ -41,6 +43,12 @@ pub struct Entry {
     /// A symbolic link's target, as written; `directory` then says whether it leads to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
+    /// A character device's driver (`present`, `snd`), for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// When its content last changed, in seconds since 1970, as ls -l shows it.
+    #[serde(default)]
+    pub mtime: u64,
     /// How many names it has, as ls -l counts them.
     #[serde(default)]
     pub links: u32,
@@ -60,6 +68,8 @@ impl Entry {
             'l'
         } else if self.directory {
             'd'
+        } else if self.device.is_some() {
+            'c'
         } else {
             '-'
         };
@@ -281,6 +291,26 @@ pub fn byte_range(value: &str, size: u64) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn listings_write_each_type_as_ls_does() {
+        let entry = |directory, link: Option<&str>, device: Option<&str>, mode| Entry {
+            directory,
+            link: link.map(String::from),
+            device: device.map(String::from),
+            mode,
+            ..Entry::default()
+        };
+        assert_eq!(entry(true, None, None, 0o755).mode_line(), "drwxr-xr-x ");
+        assert_eq!(
+            entry(false, Some("/a"), None, 0o777).mode_line(),
+            "lrwxrwxrwx "
+        );
+        assert_eq!(
+            entry(false, None, Some("snd"), 0o644).mode_line(),
+            "crw-r--r-- "
+        );
+        assert_eq!(entry(false, None, None, 0o640).mode_line(), "-rw-r----- ");
+    }
     #[test]
     fn paths_stay_virtual_and_preserve_unicode() {
         assert_eq!(

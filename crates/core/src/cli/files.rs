@@ -7,16 +7,28 @@ use super::{Manual, Section};
 /// list a directory, or show one file
 ///
 /// Lists what the directory PATH, or the working directory, holds: directories in green with a
-/// slash, executables in amber, links in cyan with where they point.
+/// slash, executables in amber, links in cyan with where they point. Directories come first,
+/// then by name; -t sorts by when content changed, newest first, -S by size, largest first, and
+/// -r the other way.
 ///
 /// A file is shown by itself. A link to a directory lists that directory, but with -l or -d the
-/// link itself is shown; a trailing slash (ls -l link/) follows it.
+/// link itself is shown; a trailing slash (ls -l link/) follows it. Times are UTC: the month,
+/// day and time for what changed within half a year, the year for older.
 #[derive(Parser, Debug)]
 #[command(name = "ls")]
 pub struct Ls {
-    /// long format: type and mode (+ marks an ACL), names (links), owner, group, size
+    /// long format: type and mode (+ marks an ACL), names (links), owner, group, size, time
     #[arg(short = 'l')]
     pub long: bool,
+    /// by when content changed, newest first
+    #[arg(short = 't', overrides_with = "size")]
+    pub time: bool,
+    /// by size, largest first
+    #[arg(short = 'S', overrides_with = "time")]
+    pub size: bool,
+    /// in the other order
+    #[arg(short = 'r', long = "reverse")]
+    pub reverse: bool,
     /// show a directory itself, not what it holds
     #[arg(short = 'd', long = "directory")]
     pub directory: bool,
@@ -100,14 +112,19 @@ impl Manual for Open {
 /// present slides or a PDF for others to follow
 ///
 /// Shows FILE, slides (*.slides.md, or Markdown) or a PDF presented a page at a time, and makes
-/// /dev/present/NAME, a link to it. Whoever may read FILE follows the presentation with
-/// `open /dev/present/NAME`, guests too: each sees the slide shown here as it turns, until they
-/// turn elsewhere themselves, which pauses following until they follow again. Your own windows
-/// and devices turn it, as remotes, and open it where it is. Presenting again under the same
-/// name takes over your presentation of it.
+/// /dev/present/NAME, a character device, yours, with FILE's mode and ACL. Whoever may read it
+/// follows the presentation with `open /dev/present/NAME`, guests too: each sees the slide shown
+/// here as it turns, until they turn elsewhere themselves, which pauses following until they
+/// follow again. Whoever may write it turns it too: your own windows and devices, as remotes,
+/// and a co-host you let (setfacl -m u:NAME:rw /dev/present/NAME). chmod and setfacl on it say
+/// who may do what; cat tells what it shows. Presenting again under the same name takes over
+/// your presentation of it. Its followers hear your live sound (stream) with it, and may ask to
+/// speak: once you allow them, everyone following hears them too.
 ///
-/// It lasts until present --stop NAME, or 12 hours after its last turn. Guests cannot present:
-/// guest is everyone signed out, who could all turn the slides.
+/// It lasts until present --stop NAME, rm /dev/present/NAME, or 12 hours after its last turn.
+/// The bar of the slides or PDF shown has buttons for it too: Present, Go live, and, following,
+/// Ask to speak. Guests cannot present: guest is everyone signed out, who could all turn the
+/// slides.
 #[derive(Parser, Debug)]
 #[command(name = "present")]
 pub struct Present {
@@ -131,38 +148,34 @@ impl Manual for Present {
             "follows it, from anywhere FILE may be read",
         ),
         ("present --stop talk", "ends it"),
+        ("rm /dev/present/talk", "ends it too"),
     ];
-    const SEE: &'static [&'static str] = &["open"];
+    const SEE: &'static [&'static str] = &["open", "stream"];
 }
 
 /// send the microphone live, and record it into a file
 ///
-/// Signed in, the sound is live as /dev/snd/NAME: whoever may hear it does with
-/// open /dev/snd/NAME, guests too, and whoever follows a presentation of the same name,
-/// /dev/present/NAME, hears it with the slides. Ctrl+C stops it. Live sound needs the site's
-/// Cloudflare Realtime app.
+/// Signed in, the sound is live as /dev/snd/NAME, your account's name unless -n names it:
+/// whoever may hear it does with open /dev/snd/NAME, guests too, and whoever follows a
+/// presentation of yours hears it with the slides (the sound of the presentation's name, if you
+/// send one, or else your latest). Ctrl+C, or rm /dev/snd/NAME, stops it. Live sound needs the
+/// site's Cloudflare Realtime app.
 ///
 /// With FILE, the sound is also recorded into it, a new file: Opus in WebM (.weba or .webm),
 /// which every browser records. FILE grows as you speak, and may be read meanwhile; when stopped,
 /// it is complete, and a recording whose page goes away keeps what arrived. Those who may read
-/// FILE may hear the sound. Without the Realtime app, stream only records.
+/// FILE may read the recording. Without the Realtime app, stream only records.
 ///
-/// Without FILE, nothing is kept: /dev/snd/NAME is a file of its own, yours, and those who may
-/// read it may hear the sound.
+/// /dev/snd/NAME is a character device, yours, made as a file is (the umask): those who may
+/// read it may hear the sound. Without FILE, nothing is kept.
 ///
-/// -m gives entries as setfacl -m takes them to what decides who may hear, FILE or
-/// /dev/snd/NAME, as it is made: -m o::- lets no one else hear, -m u:ada:r,o::- only ada.
+/// -m gives entries as setfacl -m takes them to FILE and /dev/snd/NAME, as they are made: -m
+/// o::- lets no one else hear, -m u:ada:r,o::- only ada.
 #[derive(Parser, Debug)]
 #[command(name = "stream")]
 pub struct Stream {
-    /// the live sound's name, /dev/snd/NAME; with FILE, by default, FILE's name without its
-    /// extension
-    #[arg(
-        short = 'n',
-        long = "name",
-        value_name = "NAME",
-        required_unless_present = "file"
-    )]
+    /// the live sound's name, /dev/snd/NAME; by default, your account's name
+    #[arg(short = 'n', long = "name", value_name = "NAME")]
     pub name: Option<String>,
     /// ACL entries, as setfacl -m takes them, for FILE, or /dev/snd/NAME without it
     #[arg(short = 'm', long = "modify", value_name = "ENTRIES")]
@@ -174,13 +187,15 @@ impl Manual for Stream {
     const SECTION: Section = Section::Files;
     const NEEDS: &'static str = "a microphone; live, an account of your own; with FILE, w and x on its directory. Hearing it, r on FILE, or on /dev/snd/NAME without FILE.";
     const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("stream", "live as /dev/snd/USER, your account's name"),
         (
             "stream talk.weba",
-            "records into talk.weba, live as /dev/snd/talk",
+            "records into talk.weba, live as /dev/snd/USER",
         ),
         ("stream -n talk", "live as /dev/snd/talk, kept nowhere"),
         ("stream -n talk -m o::-,g:lab:r", "only group lab hears it"),
         ("open /dev/snd/talk", "hears it"),
+        ("rm /dev/snd/talk", "stops it"),
     ];
     const SEE: &'static [&'static str] = &["present", "open"];
 }
@@ -203,7 +218,7 @@ pub struct Vim {
 impl Manual for Vim {
     const SECTION: Section = Section::Files;
     const NEEDS: &'static str =
-        "r to open; w to save, else the file opens read-only. The server checks every save.";
+        "r to open; w to save, else the file opens read-only. The kernel checks every save.";
     const EXAMPLES: &'static [(&'static str, &'static str)] =
         &[("vim notes.md", "edit, or create on save")];
     const SEE: &'static [&'static str] = &["open", "touch"];
@@ -236,19 +251,43 @@ impl Manual for Mkdir {
     const SEE: &'static [&'static str] = &["rm", "chmod", "setfacl"];
 }
 
-/// make empty files
+/// make empty files, or set their times
 ///
-/// Makes each FILE that does not exist, empty, owned by you, with mode 644 (666 less the umask
-/// 022), or what the directory's default ACL gives. A file that exists keeps its content and
-/// mode: this terminal keeps no times. Through a link, the file it points to is made.
+/// Sets each FILE's access and modification times to now, or makes it, empty, owned by you,
+/// with mode 644 (666 less the umask 022), or what the directory's default ACL gives. Through a
+/// link, the file it points to is touched, unless -h, which touches the link and makes nothing.
 ///
+/// -d DATE, -t STAMP and -r FILE set another time than now: DATE as `2026-10-29`, `2026-10-29
+/// 14:30[:05[.5]]`, with `Z` or `+01:00`, `@SECONDS`, or `now`; STAMP as `[[CC]YY]MMDDhhmm[.ss]`;
+/// FILE's own times. Times are UTC unless DATE says otherwise. -a or -m sets only the access or
+/// the modification time.
+///
+/// Now is yours to set if you own the file or may write it; another time, only if you own it.
 /// Use -- before a name that starts with a hyphen.
 #[derive(Parser, Debug)]
 #[command(name = "touch")]
 pub struct Touch {
-    /// make nothing; only check those that exist
+    /// make nothing; only touch those that exist
     #[arg(short = 'c', long = "no-create")]
     pub no_create: bool,
+    /// set only the access time
+    #[arg(short = 'a')]
+    pub access: bool,
+    /// set only the modification time
+    #[arg(short = 'm')]
+    pub modification: bool,
+    /// set DATE rather than now
+    #[arg(short = 'd', long = "date", value_name = "DATE", conflicts_with_all = ["stamp", "reference"])]
+    pub date: Option<String>,
+    /// set STAMP rather than now
+    #[arg(short = 't', value_name = "STAMP", conflicts_with_all = ["date", "reference"])]
+    pub stamp: Option<String>,
+    /// set FILE's times rather than now
+    #[arg(value_hint = ValueHint::AnyPath, short = 'r', long = "reference", value_name = "FILE", conflicts_with_all = ["date", "stamp"])]
+    pub reference: Option<String>,
+    /// touch a link itself, not what it leads to
+    #[arg(short = 'h', long = "no-dereference")]
+    pub no_dereference: bool,
     #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "FILE")]
     pub files: Vec<String>,
 }
@@ -258,9 +297,11 @@ impl Manual for Touch {
         "w and x on the directory a new file goes in; w on a file that exists.";
     const EXAMPLES: &'static [(&'static str, &'static str)] = &[
         ("touch notes.md main.rs README", "three files"),
+        ("touch -d '2026-01-01 09:00' notes.md", "as of a date"),
+        ("touch -r notes.md copy.md", "as another is"),
         ("touch -- -h", "a file named -h"),
     ];
-    const SEE: &'static [&'static str] = &["vim", "mkdir"];
+    const SEE: &'static [&'static str] = &["vim", "mkdir", "stat"];
 }
 
 /// remove files and directories
@@ -344,7 +385,7 @@ impl Manual for Mv {
 /// once, and editing either later leaves the other as it was.
 ///
 /// A new copy is yours, with the source's mode less the umask (022), or what the directory's
-/// default ACL gives; -p keeps the mode, ACLs and, as far as you may, owner and group. A file that
+/// default ACL gives; -p keeps the mode, ACLs, times and, as far as you may, owner and group. A file that
 /// exists is written as it is, keeping its owner, mode and other names; -f removes one you may
 /// not write and copies anew.
 ///
@@ -364,7 +405,7 @@ pub struct Cp {
     /// copy links as links, and keep a file's names together
     #[arg(short = 'd')]
     pub links: bool,
-    /// keep mode, ACLs, owner and group
+    /// keep mode, ACLs, times, owner and group
     #[arg(short = 'p')]
     pub preserve: bool,
     /// follow every link
@@ -489,6 +530,119 @@ impl Manual for Readlink {
         ("readlink -f current", "where it leads"),
     ];
     const SEE: &'static [&'static str] = &["ln", "ls"];
+}
+
+/// print the absolute path a path leads to
+///
+/// Prints each FILE as the absolute path it leads to, every link followed, `.` and `..` gone.
+/// All of it but the last part must exist, unless -e (all) or -m (none) says otherwise.
+#[derive(Parser, Debug)]
+#[command(name = "realpath")]
+pub struct Realpath {
+    /// all of it must exist
+    #[arg(
+        short = 'e',
+        long = "canonicalize-existing",
+        overrides_with = "missing"
+    )]
+    pub existing: bool,
+    /// nothing need exist
+    #[arg(
+        short = 'm',
+        long = "canonicalize-missing",
+        overrides_with = "existing"
+    )]
+    pub missing: bool,
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "FILE")]
+    pub files: Vec<String>,
+}
+impl Manual for Realpath {
+    const SECTION: Section = Section::Files;
+    const NEEDS: &'static str = "x on the directories on the way.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] =
+        &[("realpath current/../notes.md", "where it is, really")];
+    const SEE: &'static [&'static str] = &["readlink", "ln"];
+}
+
+/// show what a file is
+///
+/// Shows what each FILE is: its type, size, inode and links, its mode, owner and group, and
+/// when it was last read, its content changed, and it changed at all, to the nanosecond (UTC).
+/// Reading a file does not change its access time: the store is mounted noatime, so it is when
+/// the file was made, or what touch set. A link is shown as itself, unless -L.
+///
+/// -c FORMAT shows what FORMAT says instead, a line a file, as GNU's: %n name, %N name with
+/// where a link leads, %s size, %b blocks of %B bytes, %a mode in octal, %A as ls shows it, %F
+/// type, %u %U owner, %g %G group, %h links, %i inode, %x %y %z the access, modify and change
+/// times (%X %Y %Z in seconds), %w %W birth (unknown), %% a %. --printf takes \n and \t too,
+/// and ends no line of its own.
+#[derive(Parser, Debug)]
+#[command(name = "stat")]
+pub struct Stat {
+    /// what a link leads to, not the link
+    #[arg(short = 'L', long = "dereference")]
+    pub dereference: bool,
+    /// show FORMAT, and a newline
+    #[arg(short = 'c', long = "format", value_name = "FORMAT")]
+    pub format: Option<String>,
+    /// show FORMAT, its backslash escapes read, and no newline
+    #[arg(long = "printf", value_name = "FORMAT")]
+    pub printf: Option<String>,
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "FILE")]
+    pub files: Vec<String>,
+}
+impl Manual for Stat {
+    const SECTION: Section = Section::Files;
+    const NEEDS: &'static str = "x on the directories on the way.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("stat notes.md", "what it is"),
+        ("stat -c '%A %U %s %n' *.md", "one line each"),
+    ];
+    const SEE: &'static [&'static str] = &["ls", "chmod", "touch"];
+}
+
+/// show how much the file system holds
+///
+/// Shows the file system each FILE is on, or /'s: its size, what is used and what is free, in
+/// 1K blocks, or with -h in K, M, G and the like. The store is R2's, which holds as much as it
+/// is given: what is free is a petabyte. /proc is the kernel's own, and takes no space.
+#[derive(Parser, Debug)]
+#[command(name = "df")]
+pub struct Df {
+    /// sizes in powers of 1024 (1.5G)
+    #[arg(short = 'h', long = "human-readable")]
+    pub human: bool,
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE")]
+    pub files: Vec<String>,
+}
+impl Manual for Df {
+    const SECTION: Section = Section::Files;
+    const NEEDS: &'static str = "x on the directories on the way.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[("df -h", "how much is stored")];
+    const SEE: &'static [&'static str] = &["ls", "stat"];
+}
+
+/// remove empty directories
+///
+/// Removes each DIR, which must be empty; with -p, then each directory above it, as written,
+/// while one goes. rm -r removes a directory with what is in it.
+#[derive(Parser, Debug)]
+#[command(name = "rmdir")]
+pub struct Rmdir {
+    /// then the directories above each, as written
+    #[arg(short = 'p', long = "parents")]
+    pub parents: bool,
+    #[arg(value_hint = ValueHint::DirPath, required = true, value_name = "DIR")]
+    pub dirs: Vec<String>,
+}
+impl Manual for Rmdir {
+    const SECTION: Section = Section::Files;
+    const NEEDS: &'static str = "w and x on the directory holding each DIR.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("rmdir old", "an empty directory"),
+        ("rmdir -p a/b/c", "c, then b, then a"),
+    ];
+    const SEE: &'static [&'static str] = &["rm", "mkdir"];
 }
 
 /// find files by name

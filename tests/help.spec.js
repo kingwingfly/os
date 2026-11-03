@@ -9,10 +9,20 @@ test('every command has side-effect-free help, including privileged and interact
   await page.goto('/');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   const requests = [];
-  page.on('request', request => { if (request.method() !== 'GET' && request.method() !== 'HEAD') requests.push(request.url()); });
+  // Whatever changes something: a request other than a read, and system calls other than those
+  // that only look (a listing the panel makes again is no side effect).
+  // A watch of a directory listed (the page's cache) changes nothing either.
+  const looking = new Set(['getcreds', 'stat', 'lstat', 'getdents', 'access', 'readlink', 'getxattr', 'listxattr', 'inotify_add_watch', 'inotify_rm_watch']);
+  const changes = request => {
+    if (request.method() === 'GET' || request.method() === 'HEAD') return false;
+    if (!request.url().endsWith('/api/sys')) return true;
+    return JSON.parse(request.postData() || '{}').calls?.some(call => !looking.has(typeof call === 'string' ? call : Object.keys(call)[0])) ?? true;
+  };
+  page.on('request', request => { if (changes(request)) requests.push(request.url()); });
   for (const command of commands) {
     await expect(page.locator('.busy')).toHaveText('↵');
-    await input.fill(command + ' -h'); await input.press('Enter');
+    // df -h is df's own (human sizes), as in GNU's df: its help is --help.
+    await input.fill(command + (command === 'df' ? ' --help' : ' -h')); await input.press('Enter');
     await expect(page.locator('.transcript pre').last()).toContainText('Usage: ');
     await expect(page.locator('.transcript pre').last()).toContainText('man ' + command);
     await expect(page.locator('#auth')).not.toBeVisible();
@@ -28,7 +38,7 @@ test('every command has side-effect-free help, including privileged and interact
   // Explicit -- keeps -h a path instead of interpreting it as help.
   await expect(page.locator('.busy')).toHaveText('↵');
   await input.fill('rm -- -h'); await input.press('Enter');
-  await expect(page.locator('.transcript pre').last()).toContainText('Permission denied');
+  await expect(page.locator('.transcript pre').last()).toContainText("rm: cannot remove '-h': No such file or directory");
   await expect(page.locator('#auth')).not.toBeVisible();
 });
 

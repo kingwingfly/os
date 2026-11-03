@@ -2,6 +2,9 @@ import { inspectFaststart } from './faststart.mjs';
 import { uploadFile, Cancelled } from './upload.mjs';
 import { record, clock } from './record.mjs';
 import { speak, listen as hearLive } from './sound.mjs';
+import * as dev from './dev.mjs';
+import { exec } from './wasi/exec.mjs';
+import { answered as resultOf, call, sys } from './http.mjs';
 
 let configuration;
 export const ready = fetch('/terminal-config.json').then(async response => {
@@ -24,9 +27,16 @@ async function api(url, options) {
   if (!response.ok) { let error; try { error = (await response.json()).error; } catch {} const failure = new Error(error || `Request failed (${response.status})`); failure.status = response.status; throw failure; }
   return response;
 }
-async function session(path = directory) { return (await api('/api/session?path=' + encodeURIComponent(path))).json(); }
-// Endpoints that change this browser's session. The session one replaces ends as it answers,
-// which this page hears of before its own identityChanged: until then, that is not news.
+// Who this session is (getcreds), and whether it may write in the directory `path` (access).
+async function session(path = directory) {
+  const [creds, writable] = await sys(['getcreds', { access: { path, mode: 3 } }]);
+  const who = resultOf(creds);
+  return { authenticated: who.signed_in, writable: who.signed_in, username: who.user, uid: who.uid, group: who.group,
+    groups: who.group_names, home: who.home, can_sudo: who.can_sudo, sudo_active: who.sudo_active, can_write: 'ok' in writable };
+}
+// The account calls that change this browser's session. The session one replaces ends as it
+// answers, which this page hears of before its own identityChanged: until then, that is not
+// news.
 const SESSION_CHANGES = new Set(['login', 'logout', 'passwd', 'register', 'unregister']);
 let changingSession = 0;
 async function post(endpoint, data) {
@@ -34,8 +44,17 @@ async function post(endpoint, data) {
   if (changes) changingSession++;
   try { return await postJson(endpoint, data); } catch (error) { if (changes) changingSession--; throw error; }
 }
+// The account system calls, as the dialogs below ask them (crates/worker/src/sys.rs).
 async function postJson(endpoint, data) {
-  return (await api('/api/' + endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) })).json();
+  switch (endpoint) {
+    case 'login': return call('login', { username: data.username ?? 'root', password: data.password ?? '' }, { sudo: !!data.sudo });
+    case 'logout': return call('logout');
+    case 'sudo': return call('sudo', { password: data.password ?? '', revoke: !!data.revoke });
+    case 'passwd': return call('passwd', { username: data.username ?? null, password: data.password ?? '', current_password: data.current_password ?? null, force: !!data.force }, { sudo: !!data.sudo });
+    case 'register': return call('useradd', { name: data.username, password: data.password ?? '', short_password: !!data.short_password, create_home: !!data.create_home });
+    case 'unregister': return call('userdel', { name: (await call('getcreds')).user, remove: !!data.remove, password: data.password ?? '' });
+  }
+  throw new Error('no such account call: ' + endpoint);
 }
 // One dialog at a time: a request made while another is open, as from another tab, waits for it
 // to close and then asks its own question, rather than receiving the other's answer.
@@ -77,11 +96,12 @@ function askCredentials({ title, description, username, chooseUser = false, newP
     dialog.showModal(); (currentPassword ? $('current-password') : password).focus();
   });
 }
-// What others change, as it happens: the authority tells this page which directories changed
-// that its account may list (/api/events), and the tabs that show one list it again. A burst of
-// changes comes as one. Pings keep proxies and tunnels from closing a quiet line; a line that
+// What others change, as it happens: the kernel tells this page what changed in the directories
+// its session watches (inotify, the watches its Rust side makes as it lists them; crates/frontend
+// sys.rs), which forget what they knew of them at once, and the tabs that show one list it again,
+// a burst of changes as one. Pings keep proxies and tunnels from closing a quiet line; a line that
 // drops opens again, and what was missed meanwhile is listed again.
-let events, eventsRetry = 0, pendingDirs = new Set(), pendingTimer;
+let events, eventsRetry = 0, pendingTimer;
 function listen() {
   events?.close();
   const socket = events = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/events`);
@@ -105,6 +125,11 @@ function listen() {
     // This page's session ended elsewhere, not by its own sign in or out: it is a guest's now.
     if (message.session === 'ended') { if (!changingSession) void identityChanged('ended'); return; }
     if (message.present) { presented(message.present); return; }
+    // A live sound, or a listener's voice, started in a presentation this page follows or
+    // presents; listeners asking to speak, and the answers to this page's ask.
+    if (message.sound) { soundStarted(message.sound); return; }
+    if (message.asking) { asksChanged(message.asking); return; }
+    if (message.asked || message.granted || message.denied) { answered(message); return; }
     // A device followed shows something else now: followed again, if it still may be.
     if (message.device?.replaced) { followAgain(message.device.name, true, true); return; }
     // What a device followed is, as the authority says on following it: one replaced while this
@@ -114,22 +139,27 @@ function listen() {
       followAgain(name, following?.device === name && following.version !== version, hearing?.device === name && hearing.version !== version);
       return;
     }
-    // The presentation followed ended, or may not be followed.
+    // The presentation followed ended, or may not be followed; a sound heard ended; or a device
+    // of this page's account ended, which its bar shows, or this page sends (rm /dev/snd/NAME).
     if (message.device) {
-      if (following?.device === message.device.name) following.ended = true;
-      if (hearing?.device === message.device.name) stopHearing();
+      const { name, version } = message.device;
+      if (following?.device === name) following.ended = true;
+      if (hearing?.device === name) stopHearing();
+      if (voices.has(name)) stopVoice(name);
+      if (message.device.ended) deviceEnded(name, version);
       window.dispatchEvent(new CustomEvent('terminal:device', { detail: message.device }));
       return;
     }
-    const dirs = message.changed;
-    if (!Array.isArray(dirs)) return;
-    dirs.forEach(dir => pendingDirs.add(dir));
+    if (!Array.isArray(message.inotify)) return;
+    window.dispatchEvent(new CustomEvent('terminal:inotify', { detail: message.inotify }));
     clearTimeout(pendingTimer);
-    pendingTimer = setTimeout(() => { const detail = [...pendingDirs]; pendingDirs = new Set(); window.dispatchEvent(new CustomEvent('terminal-remote', { detail })); }, 250);
+    pendingTimer = setTimeout(() => window.dispatchEvent(new CustomEvent('terminal-remote')), 250);
   };
   socket.onclose = () => { clearInterval(ping); if (events === socket) setTimeout(listen, Math.min(30000, 1000 * 2 ** eventsRetry++)); };
 }
-listen();
+// The line opens once the browser has its session, signed out too (its terminal_guest cookie,
+// which the first request is given): a driver's news to it is for that session.
+sys(['getcreds']).catch(() => {}).finally(listen);
 // Slides and PDFs presented follow each other (owner's request, 2026-10-28): the place a page
 // presents (viewer.rs calls present) shows in this browser's other windows showing that file,
 // and in the account's pages signed in elsewhere, which the authority tells (store.rs relay).
@@ -160,25 +190,34 @@ let following = null;
 // Each attend, and each unfollow, starts anew: an answer for an older one is not applied, as the
 // page has left the presentation, or gone to another, meanwhile.
 let followings = 0;
-// The devices this page follows, which the authority tells it the end of.
-const followed = () => [following?.device, hearing?.device].filter(Boolean);
+// The devices this page follows, which the authority tells it the end of: a presentation, its
+// sound and voices, and the voice this page sends.
+const followed = () => [following?.device, hearing?.device, ...voices.keys(), speaking?.device].filter(Boolean);
 const follows = () => say({ follow: followed() });
 async function attend(device) {
   const turn = ++followings;
   // An answer, or a failure, for an attend the page has left since says nothing.
   let info;
-  try { info = await (await api('/api/device?path=' + encodeURIComponent(device))).json(); }
+  try { info = await dev.attend(device); }
   catch (error) { if (turn === followings) throw error; return; }
   if (turn !== followings) return;
+  if (following?.device !== info.device) declined = null;
   following = info; follows();
-  // Slides and sound together: the presenter's live sound of the same name, if any.
-  if (info.sound && hearing?.device !== info.sound) hear(info.sound).catch(error => console.warn('No live sound', error));
+  // Slides and sound together: the presenter's live sound, and the listeners speaking.
+  if (info.sound && hearing?.device !== info.sound && declined !== info.device) hear(info.sound).catch(error => console.warn('No live sound', error));
+  for (const voice of info.voices ?? []) if (voice.ask !== bar.asking?.id) void hearVoice(voice);
   // Shown as the presenter shows it, from where they are.
   if (info.kind === 'pdf') setPlace(info.path, { present: true, ...(info.place ? { page: info.place[0] } : {}) });
   else setPlace(info.path, { slides: true, ...(info.place ? { slide: info.place } : {}) });
   return open(info.path, info.kind, false, true);
 }
-function unfollow() { followings++; if (!following) return; following = null; follows(); }
+function unfollow() {
+  followings++;
+  if (!following) return;
+  // Leaving the presentation withdraws an ask to speak, and ends the voice sent.
+  if (bar.asking) { if (bar.asking.state === 'asking') void dev.ask(bar.asking.presentation, true).catch(() => {}); void stopSpeaking(); }
+  following = null; follows();
+}
 // Follow the device `name` again, as it shows something else now: the presentation followed, the
 // sound heard, or both; if that may no longer be, the page says so.
 function followAgain(name, presentation, sound) {
@@ -189,6 +228,8 @@ function followAgain(name, presentation, sound) {
 // A speaker view, which a deck's S opened (viewer.rs): it shows the deck its address names once
 // the terminal runs.
 export function started() {
+  const files = $('window-files');
+  if (files) new ResizeObserver(measureNames).observe(files);
   const deck = new URLSearchParams(location.search).get('speaker');
   if (!deck) return;
   document.title = 'Speaker view · ' + deck.split('/').pop();
@@ -237,12 +278,13 @@ async function accountCommand(args, cwd) {
   if (args[0] === 'man') {
     if (args.length > 2) throw new Error('Usage: man [COMMAND]');
     const text = args[1] ? window.terminalManual.page(args[1]) : window.terminalManual.index();
+    if ((text === undefined || text === null) && window.terminalManual.bin(args[1])) throw new Error(`${args[1]} is /bin's (uutils): ${args[1]} --help says how to use it`);
     if (text === undefined || text === null) throw new Error(`No manual entry for ${args[1]}. Enter man for the index.`);
     const version = await cleanupViewer(); if (version !== viewerVersion) return {};
     trail.length = 0; showTrail();
     viewerTitle(args[1] ? 'man · ' + args[1] : 'Terminal Worker · Manual'); $('download').hidden = true;
     const article = document.createElement('article'); article.className = 'markdown manual'; article.innerHTML = window.terminalPreview.markdown(text, '/'); $('viewer-content').replaceChildren(article);
-    if (!$('viewer').open) { opener = document.activeElement; $('viewer').showModal(); placePlayer(); }
+    if (!$('viewer').open) { opener = document.activeElement; showWindow($('viewer')); placePlayer(); }
     return {};
   }
   if (args[0] === 'vim') {
@@ -330,8 +372,8 @@ async function accountCommand(args, cwd) {
     if (sudo || args.length !== 1) throw new Error(`Usage: ${args[0]}`);
     await post('logout', {}); await identityChanged(); return { output: 'Signed out as guest (access depends on directory permissions)', home: '/' };
   }
-  const result = await post('command', { args, cwd, sudo });
-  changed(); return result;
+  // The rest are user space's programs, which the shell runs (crates/userland).
+  return { program: true };
 }
 let uploading = null;
 // Upload `files` into `path`, one after another, in chunks that resume if interrupted;
@@ -384,16 +426,20 @@ function cancelUploads() { if (!uploading) return false; uploading.abort(); retu
 // when it may (sound.mjs); `progress` hears how it goes. Ctrl+C in its tab stops it
 // (stopRecording), which saves what was recorded. Settles with what was saved.
 let recording = null;
-async function recordSound(path, name, acl, progress) {
+async function recordSound(path, name, acl, told) {
   if (recording) throw new Error('This page is recording already; stop it with Ctrl+C in its tab');
   const controller = recording = new AbortController();
+  // The bar shows it too (viewer.rs LiveControls), and stops it.
+  bar.sound = { device: null, version: null, recording: path, since: Date.now(), progress: '' }; barChanged();
+  const progress = text => { if (bar.sound) { bar.sound.progress = text; barChanged(); } told(text); };
+  const sending = sent => { live = sent; if (bar.sound) Object.assign(bar.sound, { device: sent.device, version: sent.version }); barChanged(); };
   let microphone, live = null, liveNote = '', speaking = Promise.resolve();
   try {
     try { microphone = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
     catch (error) { throw new Error('No microphone: ' + error.message); }
     // Live only, kept nowhere: until Ctrl+C, or the microphone ends.
     if (!path) {
-      live = await speak(null, name, microphone, acl);
+      sending(await speak(name, microphone, { acl }));
       const started = performance.now(), track = microphone.getAudioTracks()[0];
       const seconds = () => (performance.now() - started) / 1000;
       const say = () => progress(`● live as ${live.device} · ${clock(seconds())}`);
@@ -404,11 +450,11 @@ async function recordSound(path, name, acl, progress) {
     }
     const saved = await record(path, microphone, { acl, signal: controller.signal, progress: text => progress(text + liveNote),
       // Live once the file is there, which its device links to; a recording all the same if not.
-      begun: () => { speaking = speak(path, name, microphone).then(sent => { live = sent; liveNote = ` · live as ${sent.device}`; }, error => { liveNote = ` · not live: ${error.message}`; }); } });
+      begun: () => { speaking = speak(name, microphone, { acl }).then(sent => { sending(sent); liveNote = ` · live as ${sent.device}`; }, error => { liveNote = ` · not live: ${error.message}`; }); } });
     await speaking;
     return { ...saved, device: live?.device ?? null, note: liveNote + (saved.stopped ? ` · ${saved.stopped}` : '') };
   } finally {
-    recording = null;
+    recording = null; bar.sound = null; barChanged();
     microphone?.getTracks().forEach(track => track.stop());
     // A recording that failed may still be connecting its live sound, which ends with it.
     await speaking;
@@ -418,38 +464,248 @@ async function recordSound(path, name, acl, progress) {
 }
 function stopRecording() { if (!recording) return false; recording.abort(); return true; }
 // What this page hears live (/dev/snd/NAME), in a small player of its own, which goes on playing
-// whatever the viewer shows; one sound at a time.
+// whatever the viewer shows: a sound, and the voices of the listeners let speak in the
+// presentation it follows (owner's request, 2026-10-28), each in an audio element of its own.
 let hearing = null;
+// The sound the player shows, heard or connecting.
+let tuned = null;
 // Which hear() is the latest: one stopped, or replaced by another, while it connects is let go.
 let hearings = 0;
-async function hear(device) {
-  stopHearing();
+// The voices heard, by device: who speaks, and what stops it.
+const voices = new Map();
+// The presentation whose sound this page's reader stopped, which its sound starting again does
+// not bring back.
+let declined = null;
+let muted = false;
+// A sound whose connection failed, once made, is heard again after these waits, while it may be.
+const AGAIN = [1000, 2000, 5000, 10000, 20000];
+async function hear(device, again = 0) {
+  stopHearing(again > 0);
   const turn = ++hearings;
+  tuned = device;
   // The sound plays from outside the player and the viewer, so that moving them never stops it.
-  const player = $('listening'), audio = Object.assign(document.createElement('audio'), { id: 'listening-audio', autoplay: true, hidden: true });
+  const player = $('listening'), audio = Object.assign(document.createElement('audio'), { id: 'listening-audio', autoplay: true, hidden: true, muted });
   document.body.append(audio);
-  player.hidden = false; player.dataset.state = 'connecting'; $('listening-mute').textContent = 'Mute';
-  $('listening-name').textContent = device;
+  player.dataset.state = 'connecting'; showPlayer();
   // A sound, or a failure, for a hear the page has left since says nothing.
   let heard;
-  try { heard = await hearLive(device, audio); }
-  catch (error) { if (turn !== hearings) { audio.remove(); return; } stopHearing(); throw error; }
+  const lost = () => { if (turn === hearings) hearAgain(device, 0); };
+  try { heard = await hearLive(device, audio, lost); }
+  catch (error) {
+    if (turn !== hearings) { audio.remove(); return; }
+    // Heard again, it is tried again, unless it is gone or may not be heard.
+    if (again && again < AGAIN.length && !(error.status >= 400 && error.status < 500)) { audio.remove(); hearAgain(device, again); return; }
+    stopHearing(); throw error;
+  }
   if (turn !== hearings) { heard.stop(); audio.remove(); return; }
   hearing = { device, stop: heard.stop, version: heard.version }; player.dataset.state = 'live'; follows();
   // A browser that wants a tap to play sound shows Listen.
   try { await audio.play(); } catch { if (turn === hearings) player.dataset.state = 'paused'; }
 }
-function stopHearing() {
-  hearings++;
-  hearing?.stop(); hearing = null; follows();
-  $('listening-audio')?.remove();
-  const player = $('listening'); player.hidden = true; delete player.dataset.state;
+function hearAgain(device, again) {
+  if (again >= AGAIN.length) { stopHearing(); return; }
+  const turn = hearings;
+  $('listening').dataset.state = 'connecting';
+  setTimeout(() => { if (turn === hearings) hear(device, again + 1).catch(error => console.warn('The sound could not be heard again', error)); }, AGAIN[again]);
 }
-$('listening-play').onclick = () => { $('listening-audio')?.play().then(() => { $('listening').dataset.state = 'live'; }, () => {}); };
-$('listening-mute').onclick = () => { const audio = $('listening-audio'); if (!audio) return; audio.muted = !audio.muted; $('listening-mute').textContent = audio.muted ? 'Unmute' : 'Mute'; };
-$('listening-stop').onclick = stopHearing;
-// The player goes where it can be used: in the viewer while it is open, as the page around a
-// modal dialog takes no clicks, and full screen with it. The sound plays from outside both.
+// Stop the sound; `keep`: to hear it again at once, the player as it is.
+function stopHearing(keep = false) {
+  hearings++;
+  hearing?.stop(); hearing = null;
+  $('listening-audio')?.remove();
+  if (keep) return;
+  tuned = null; follows(); showPlayer();
+}
+async function hearVoice(voice, again = 0) {
+  if (voices.has(voice.device) && !again) return;
+  stopVoice(voice.device, true);
+  const audio = Object.assign(document.createElement('audio'), { className: 'voice-audio', autoplay: true, hidden: true, muted });
+  document.body.append(audio);
+  const heard = { ...voice, audio, stop: () => {} };
+  voices.set(voice.device, heard); showPlayer();
+  const lost = () => { if (voices.get(voice.device) === heard && again < AGAIN.length) setTimeout(() => { if (voices.get(voice.device) === heard) void hearVoice(voice, again + 1); }, AGAIN[again]); };
+  try {
+    const sound = await hearLive(voice.device, audio, lost);
+    if (voices.get(voice.device) !== heard) { sound.stop(); return; }
+    heard.stop = sound.stop; follows();
+    if (!$('listening').dataset.state || $('listening').dataset.state === 'connecting' && !tuned) $('listening').dataset.state = 'live';
+    await audio.play().catch(() => { $('listening').dataset.state = 'paused'; });
+  } catch (error) {
+    if (voices.get(voice.device) === heard) stopVoice(voice.device);
+    console.warn('No voice', error);
+  }
+}
+function stopVoice(device, quietly = false) {
+  const heard = voices.get(device);
+  if (!heard) return;
+  voices.delete(device); heard.stop(); heard.audio.remove();
+  if (!quietly) { follows(); showPlayer(); }
+}
+// The player shows the sound and the voices heard, while there are any.
+function showPlayer() {
+  const player = $('listening'), names = [tuned, ...[...voices.values()].map(voice => `${voice.speaker} speaking`)].filter(Boolean);
+  player.hidden = !names.length;
+  if (!names.length) delete player.dataset.state;
+  else if (!player.dataset.state) player.dataset.state = 'connecting';
+  $('listening-name').textContent = names.join(' · ');
+}
+const audios = () => [$('listening-audio'), ...[...voices.values()].map(voice => voice.audio)].filter(Boolean);
+$('listening-play').onclick = () => { Promise.all(audios().map(audio => audio.play())).then(() => { $('listening').dataset.state = 'live'; }, () => {}); };
+$('listening-mute').onclick = () => { muted = !muted; for (const audio of audios()) audio.muted = muted; $('listening-mute').textContent = muted ? 'Unmute' : 'Mute'; };
+// Stopped by its reader, the presentation's sound does not come back by itself.
+$('listening-stop').onclick = () => { declined = following?.device ?? null; for (const device of [...voices.keys()]) stopVoice(device); stopHearing(); };
+
+// The bar of the deck or PDF the viewer shows (viewer.rs LiveControls; owner's request,
+// 2026-10-28): what this account presents of it, the sound this page sends, the listeners asking
+// to speak in its presentations and speaking; and, following another's presentation, this
+// page's ask to speak. It hears of each change (terminal:bar).
+const bar = { path: null, user: null, presented: [], asks: [], voices: [], sound: null, asking: null, note: '' };
+// The asks this page allowed, whose voices it hears.
+const allowed = new Set();
+let barTurns = 0, noteTimer;
+function barChanged() {
+  const presented = bar.presented.map(presentation => presentation.device), sound = bar.sound;
+  const detail = { path: bar.path, user: bar.user, presented, note: bar.note, asking: bar.asking && { state: bar.asking.state, error: bar.asking.error ?? null },
+    asks: bar.asks.filter(ask => presented.includes(ask.presentation)), voices: bar.voices.filter(voice => presented.includes(voice.presentation)),
+    sound: sound && { device: sound.device, recording: sound.recording, since: sound.since, progress: sound.progress } };
+  window.dispatchEvent(new CustomEvent('terminal:bar', { detail }));
+}
+// Say `note` in the bar a while: what failed, or what was saved.
+function barNote(note) { bar.note = note; barChanged(); clearTimeout(noteTimer); noteTimer = setTimeout(() => { bar.note = ''; barChanged(); }, 8000); }
+// The bar now shows the file at `path`: what this account presents of it, as the authority says.
+async function barOf(path) {
+  const turn = ++barTurns;
+  Object.assign(bar, { path, presented: [], asks: [], voices: [], note: '' });
+  barChanged();
+  try {
+    const presented = await dev.presented(path);
+    if (turn !== barTurns) return;
+    Object.assign(bar, { user: presented.user, presented: presented.devices, asks: presented.asks, voices: presented.voices });
+  } catch (error) { if (turn === barTurns) bar.note = error.message; }
+  barChanged();
+}
+// Present the file to others, as /dev/present/NAME, or stop presenting it.
+async function togglePresenting(path) {
+  try {
+    if (bar.presented.length) {
+      for (const { device } of bar.presented) await dev.stop(device);
+      bar.presented = [];
+    } else {
+      const made = await dev.present(path);
+      bar.presented = [{ device: made.device, version: made.version }];
+    }
+    barChanged();
+  } catch (error) { barNote(error.message); }
+}
+// Send the microphone live, as stream does, the account's name its device's; `keep`: recorded
+// too, beside the file shown, as NAME-DATE-TIME.weba. Live already, it stops.
+function goLive(path, keep) {
+  if (stopRecording()) return;
+  const slash = path.lastIndexOf('/'), file = path.slice(slash + 1);
+  const stem = file.replace(/\.slides\.md$/i, '').replace(/\.[^.]*$/, '') || file;
+  const now = new Date(), two = number => String(number).padStart(2, '0');
+  const stamp = `${now.getFullYear()}${two(now.getMonth() + 1)}${two(now.getDate())}-${two(now.getHours())}${two(now.getMinutes())}`;
+  const destination = keep ? `${path.slice(0, slash)}/${stem}-${stamp}.weba` : null;
+  recordSound(destination, null, null, () => {}).then(
+    saved => { if (destination) barNote(`Saved ${destination} · ${clock(saved.seconds ?? 0)}`); },
+    error => barNote(error.message));
+}
+// The account's device `name` ended: presented no more, or a sound this page sends stops, as
+// rm /dev/snd/NAME stops stream (owner's request, 2026-10-28), unless it is another of that name.
+function deviceEnded(name, version) {
+  if (bar.sound?.device === name && (!version || bar.sound.version === version)) stopRecording();
+  if (bar.asking?.presentation === name || speaking?.device === name) void stopSpeaking();
+  bar.presented = bar.presented.filter(presentation => presentation.device !== name);
+  bar.voices = bar.voices.filter(voice => voice.device !== name);
+  barChanged();
+}
+// A live sound started: the presentation followed has its sound, unless its reader stopped it;
+// a voice, which the presentation's listeners hear, and the presenter's page that allowed it.
+function soundStarted(sound) {
+  if ('speaker' in sound) {
+    if (bar.presented.some(presentation => presentation.device === sound.presentation)) {
+      bar.voices = [...bar.voices.filter(voice => voice.device !== sound.device), sound]; barChanged();
+      if (allowed.has(sound.ask)) void hearVoice(sound);
+    } else if (following?.device === sound.presentation && sound.ask !== bar.asking?.id) void hearVoice(sound);
+    return;
+  }
+  if (following?.device === sound.presentation && !hearing && !tuned && declined !== following.device) hear(sound.device).catch(error => console.warn('No live sound', error));
+}
+// Listeners asking to speak in this account's presentations, or no longer.
+function asksChanged(asking) {
+  bar.asks = bar.asks.filter(ask => ask.id !== asking.id);
+  if (!asking.gone && !asking.error) bar.asks.push(asking);
+  if (asking.error) barNote(asking.error);
+  barChanged();
+  // Full screen, the bars show, to be seen by a presenter mid-talk.
+  if (fullscreen()) showChrome();
+}
+// Ask to speak in the presentation followed; asking, withdraw; speaking, stop.
+function askToSpeak() {
+  const presentation = following?.device;
+  if (!presentation) return;
+  if (bar.asking?.state === 'asking') { void dev.ask(presentation, true).catch(() => {}); bar.asking = null; }
+  else if (bar.asking && ['connecting', 'speaking'].includes(bar.asking.state)) { void stopSpeaking(); return; }
+  else {
+    bar.asking = { presentation, state: 'asking' };
+    dev.ask(presentation).then(asked => answered({ asked }), error => answered({ asked: { presentation, error: error.message } }));
+  }
+  barChanged();
+}
+// The presenter answers an ask to speak: allowed, everyone following hears them.
+function answerAsk(id, allow) {
+  const asked = bar.asks.find(ask => ask.id === id);
+  if (!asked) return;
+  if (allow) allowed.add(id);
+  dev.answer(asked.presentation, id, allow).catch(error => barNote(error.message));
+  bar.asks = bar.asks.filter(ask => ask.id !== id); barChanged();
+}
+// End a listener's voice, as its presenter.
+async function endVoice(device) {
+  try { await dev.stop(device); }
+  catch (error) { barNote(error.message); }
+}
+// What the presenter said to this page's ask: noted, allowed (with a descriptor to speak through, a guest's), or
+// not now.
+function answered({ asked, granted, denied }) {
+  const answer = asked ?? granted ?? denied;
+  if (bar.asking?.presentation !== answer.presentation) return;
+  if (asked?.error) bar.asking = { ...bar.asking, state: 'error', error: asked.error };
+  else if (asked) bar.asking.id = asked.id;
+  else if (granted) { void startSpeaking(granted); return; }
+  else { bar.asking = { ...bar.asking, state: 'denied' }; setTimeout(() => { if (bar.asking?.state === 'denied') { bar.asking = null; barChanged(); } }, 5000); }
+  barChanged();
+  if (fullscreen()) showChrome();
+}
+// The voice this page sends, allowed: what it is, what ends it, and the microphone. A guest
+// speaks through the descriptor its presenter passed to its session (`granted.fd`); an
+// account, through one it opens, its presenter's ACL entry letting it.
+let speaking = null;
+async function startSpeaking(granted) {
+  bar.asking = { ...bar.asking, state: 'connecting' }; barChanged();
+  let microphone;
+  try {
+    microphone = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const sent = await speak(null, microphone, { presentation: granted.presentation, fd: granted.fd ?? null, ask: granted.id });
+    // Withdrawn meanwhile.
+    if (bar.asking?.state !== 'connecting') { microphone.getTracks().forEach(track => track.stop()); await sent.end(); return; }
+    speaking = { ...sent, microphone };
+    bar.asking = { ...bar.asking, state: 'speaking' }; follows();
+    microphone.getAudioTracks()[0].addEventListener('ended', () => void stopSpeaking(), { once: true });
+  } catch (error) {
+    microphone?.getTracks().forEach(track => track.stop());
+    bar.asking = bar.asking && { ...bar.asking, state: 'error', error: error.message };
+  }
+  barChanged();
+}
+async function stopSpeaking() {
+  const sent = speaking; speaking = null;
+  bar.asking = null; barChanged();
+  if (!sent) return;
+  follows();
+  sent.microphone.getTracks().forEach(track => track.stop());
+  await sent.end();
+}
 function placePlayer() { ($('viewer').open ? $('viewer-surface') : document.body).append($('listening')); }
 // Open the file chooser now, while the tap or the key that asked for it lets a page open one:
 // phones refuse once a request has been awaited. Settles with the files chosen; none if closed.
@@ -473,7 +729,8 @@ window.addEventListener('dragenter', e => { if (e.dataTransfer?.types.includes('
 window.addEventListener('dragover', e => { if (e.dataTransfer?.types.includes('Files')) e.preventDefault(); });
 window.addEventListener('dragleave', () => { if (--depth <= 0) { depth = 0; $('dropzone').hidden = true; } });
 // Dropped files go to the active tab, which uploads them as its upload command would.
-window.addEventListener('drop', e => { e.preventDefault(); depth = 0; $('dropzone').hidden = true; if (e.dataTransfer?.files.length) window.dispatchEvent(new CustomEvent('terminal-files', { detail: [...e.dataTransfer.files] })); });
+// Dropped on the Files, files go into its directory; anywhere else, the terminal's.
+window.addEventListener('drop', e => { e.preventDefault(); depth = 0; $('dropzone').hidden = true; if (e.dataTransfer?.files.length) window.dispatchEvent(new CustomEvent(e.target?.closest?.('#window-files') ? 'files-dropped' : 'terminal-files', { detail: [...e.dataTransfer.files] })); });
 
 // Where each file's preview was left, by path, kept in this browser for the last 200 files, so
 // that opening one again continues there: the page code records how far it was scrolled and
@@ -495,6 +752,9 @@ function showTrail() { $('viewer-back').hidden = !trail.length; $('viewer-back')
 async function follow(path, kind) { if (shown) trail.push(shown); return open(path, kind, true); }
 $('viewer-back').onclick = () => { const previous = trail.pop(); if (previous) void open(previous.path, previous.kind, true); };
 // The viewer's title. A path too long for the bar loses its start, not its file name: the title
+// A window of the desktop opened, the preview's or the editor's (a non-modal dialog, which the
+// compositor lays out): it has the keyboard.
+function showWindow(dialog) { dialog.show(); dialog.focus({ preventScroll: true }); }
 // overflows right to left (style.css), and <bdi> keeps the path's own order.
 function viewerTitle(text) { const title = document.createElement('bdi'); title.textContent = text; $('viewer-title').replaceChildren(title); }
 async function cleanupViewer() {
@@ -530,14 +790,16 @@ async function closeViewer() {
   if (version === viewerVersion) $('viewer').close();
 }
 $('viewer').addEventListener('cancel', event => { event.preventDefault(); void closeViewer(); });
-// Escape closes a dialog, and nothing else. Left to the browser, Safari also leaves its full-screen
-// window, so the page takes the key and asks the dialog to cancel, which each one handles as its
-// own Escape (the viewer closes, the editor asks about unsaved changes). Keys handled inside a
-// dialog first, as the preview search's and the editor's, are left alone.
+// Escape closes a modal dialog (a password asked), or else the window that has the keyboard (the
+// preview, the editor: windows of the desktop, crates/frontend/src/desktop.rs), and nothing else.
+// Left to the browser, Safari also leaves its full-screen window, so the page takes the key and
+// asks the dialog to cancel, which each one handles as its own Escape (the viewer closes, the
+// editor asks about unsaved changes). Keys handled inside a dialog first, as the preview search's
+// and the editor's, are left alone.
 document.addEventListener('keydown', event => {
   // A preview shown full screen leaves that first, as the browser does with Escape.
   if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || document.fullscreenElement) return;
-  const dialog = document.querySelector('dialog[open]');
+  const dialog = document.querySelector('dialog[open]:modal') ?? document.activeElement?.closest?.('dialog[open]');
   if (!dialog) return;
   event.preventDefault();
   if (dialog.dispatchEvent(new Event('cancel', { cancelable: true }))) dialog.close();
@@ -572,14 +834,14 @@ $('fullscreen').onclick = async () => {
 };
 // Full screen, the preview's bars float over the content, hidden until the pointer moves, as a
 // video player's controls are; they stay while the pointer, or the keyboard's focus, is on one
-// (a button clicked keeps the focus, but not :focus-visible).
+// (a button clicked keeps the focus, but not :focus-visible), and while a listener asks to speak.
 const bars = ':is(.viewer-bar, .preview-bar, .slides-bar, .pdf-toolbar)';
 let chromeTimer;
 function showChrome() {
   const surface = $('viewer-surface');
   surface.classList.add('chrome'); clearTimeout(chromeTimer);
   chromeTimer = setTimeout(() => {
-    if (surface.querySelector(`${bars}:hover, ${bars}:has(:focus-visible)`)) showChrome();
+    if (surface.querySelector(`${bars}:hover, ${bars}:has(:focus-visible), .live-hands.asked`)) showChrome();
     else surface.classList.remove('chrome');
   }, 2000);
 }
@@ -610,7 +872,7 @@ async function open(path, kind, followed = false, attending = false) {
   const content = $('viewer-content'), dialog = $('viewer');
   $('download').hidden = false;
   viewerTitle(path); $('download').href = fileUrl(path); $('download').download = path.split('/').pop();
-  if (!dialog.open) { opener = document.activeElement; dialog.showModal(); placePlayer(); }
+  if (!dialog.open) { opener = document.activeElement; showWindow(dialog); placePlayer(); }
   content.textContent = 'Loading...';
   try {
     if (kind === 'game') {
@@ -670,10 +932,12 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, present, presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, attending: path => following?.path === path ? following : null, unlock, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
+window.terminal = { config: () => configuration.branding, exec, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
   requestAnimationFrame(() => {
     const input = $('command');
-    if (input?.value !== value || document.querySelector('dialog[open]')) return;
+    if (input?.value !== value || document.querySelector('dialog[open]:modal')) return;
+    // Text selected since (the line chosen whole, to type over) is the typist's: the caret stays.
+    if (document.activeElement === input && input.selectionStart !== input.selectionEnd) return;
     input.focus({ preventScroll: true });
     const end = value.length - (insideQuote && value.endsWith('"') ? 1 : 0);
     input.setSelectionRange(end, end);
@@ -685,8 +949,8 @@ window.terminal = { config: () => configuration.branding, open, follow, place, s
 } };
 
 // A file name keeps to one line; one that does not fit slides to show the rest (style.css). Each
-// gets how far it overflows, measured as the list changes, a pane is shown or hidden, or the
-// window resizes.
+// gets how far it overflows, measured as the list changes, and as the Files window is shown,
+// hidden or resized (started()).
 let namesFrame;
 function measureNames() {
   cancelAnimationFrame(namesFrame);
@@ -701,17 +965,20 @@ function measureNames() {
     }
   });
 }
-new MutationObserver(changes => { if (changes.some(change => change.target.closest?.('.files') || change.attributeName)) measureNames(); })
-  .observe($('app'), { childList: true, subtree: true, characterData: true, attributeFilter: ['data-files', 'data-terminal', 'data-layout'] });
-window.addEventListener('resize', measureNames);
+new MutationObserver(changes => { if (changes.some(change => change.target.closest?.('.files'))) measureNames(); })
+  .observe($('app'), { childList: true, subtree: true, characterData: true });
 
 // Dialog focus restoration and Leptos updates may finish after the command promise.
 // Wait for the browser's next layout; never steal focus from another open modal.
 let resetTerminalFocus = false;
+// The window up (crates/frontend/src/desktop.rs), if not the terminal: the keyboard is its.
+const otherWindow = () => document.querySelector('.window-focused:not(#window-terminal)');
 function restoreTerminalFocus() {
   requestAnimationFrame(() => {
     const input = $('command');
-    if (document.querySelector('dialog[open]') || !['↵', 'Answer ↵'].includes(input?.closest('form')?.querySelector('.busy')?.textContent)) return;
+    // Not while a password is asked, nor from another window that has the keyboard (the Files,
+    // the preview, the editor), nor while a command runs.
+    if (document.querySelector('dialog[open]:modal') || otherWindow() || document.activeElement?.closest?.('dialog[open], .window:not(#window-terminal)') || !['↵', 'Answer ↵', 'Input ↵'].includes(input?.closest('form')?.querySelector('.busy')?.textContent)) return;
     // After closing a modal Chromium can report this input as active while its
     // native text-editing focus still belongs to the closed dialog. Reacquire it.
     if (resetTerminalFocus && document.activeElement === input) input.blur();
@@ -724,13 +991,18 @@ for (const id of ['auth', 'editor']) {
 }
 
 // Redirect ordinary typing only when the surrounding shell is idle. Preserve
-// selection, shortcuts, button activation, IME and every modal/editor input.
+// selection, shortcuts, button activation, IME and every modal/editor input; what is typed in
+// another window is that window's.
 document.addEventListener('keydown', event => {
-  if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey || document.querySelector('dialog[open]')) return;
+  if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey || document.querySelector('dialog[open]:modal') || event.target?.closest?.('dialog[open], .window:not(#window-terminal)')) return;
   const target = event.target;
+  // Another window up, whose focus fell to the page as what had it went (a box closed, a mode
+  // changed): the key is its, and so is the focus again.
+  const up = otherWindow();
+  if (up) { if (!up.contains(document.activeElement)) up.focus({ preventScroll: true }); return; }
   if (!(target instanceof Element) || (target.closest('input,textarea,select,[contenteditable="true"]') && target.getClientRects().length) || window.getSelection()?.toString()) return;
   if (target.closest('button,a') && ['Enter', ' ', 'Tab'].includes(event.key)) return;
-  const input = $('command'); if (!input || !['↵', 'Answer ↵'].includes(input.closest('form')?.querySelector('.busy')?.textContent)) return;
+  const input = $('command'); if (!input || !['↵', 'Answer ↵', 'Input ↵'].includes(input.closest('form')?.querySelector('.busy')?.textContent)) return;
   if (event.key.length === 1) {
     event.preventDefault(); input.focus({ preventScroll: true });
     input.setRangeText(event.key, input.selectionStart ?? input.value.length, input.selectionEnd ?? input.value.length, 'end');
@@ -742,5 +1014,5 @@ document.addEventListener('keydown', event => {
   }
 });
 document.addEventListener('click', event => {
-  if (!document.querySelector('dialog[open]') && !window.getSelection()?.toString() && event.target instanceof Element && event.target.closest('.terminal-panel') && !event.target.closest('button,a,input,textarea,select,[contenteditable="true"]')) $('command')?.focus({preventScroll:true});
+  if (!document.querySelector('dialog[open]:modal') && !window.getSelection()?.toString() && event.target instanceof Element && event.target.closest('.terminal-panel') && !event.target.closest('button,a,input,textarea,select,[contenteditable="true"]')) $('command')?.focus({preventScroll:true});
 });

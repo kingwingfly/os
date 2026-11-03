@@ -61,7 +61,18 @@ for (const [feature, profile, bins] of [
 await build({ absWorkingDir: root, entryPoints: { bridge: 'web/app.js' },
   splitting: true,
   chunkNames: 'chunks/[name]-[hash]', bundle: true, format: 'esm', outdir: out, minify: true });
-for (const name of ['index.html', 'style.css']) await copy('web/' + name, join(out, name));
+// The WASI engine's process, a Worker of its own (web/wasi/process.js), and /usr/bin's binary:
+// uutils' coreutils, built for wasm32-wasip1 (rustup target add wasm32-wasip1).
+await build({ absWorkingDir: root, entryPoints: { 'wasi-process': 'web/wasi/process.js' }, bundle: true, format: 'iife', outdir: out, minify: true });
+run('cargo', ['build', '--release', '--target', 'wasm32-wasip1', '--manifest-path', 'crates/coreutils/Cargo.toml', '--target-dir', join(target, 'coreutils')]);
+await mkdir(join(out, 'usr/bin'), { recursive: true });
+await copy(join(target, 'coreutils/wasm32-wasip1/release/coreutils.wasm'), join(out, 'usr/bin/coreutils.wasm'));
+// What the kernel's /usr says of its binaries (crates/worker/src/usr.rs), which it cannot ask the
+// assets: their sizes.
+const sizes = {};
+for (const asset of ['/usr/bin/coreutils.wasm', '/pkg/frontend_bg.wasm']) sizes[asset] = (await stat(join(out, asset))).size;
+await writeFile(join(out, 'usr/manifest.json'), JSON.stringify(sizes));
+for (const name of ['index.html', 'style.css', '_headers']) await copy('web/' + name, join(out, name));
 if (assets) await copyTree(assets, join(out, 'content'));
 await writeFile(join(out, 'terminal-config.json'), JSON.stringify({ branding, games }));
 console.log('Terminal built: ' + out);

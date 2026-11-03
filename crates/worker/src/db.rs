@@ -5,7 +5,7 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use terminal_worker_core::permissions::{Id, Node, Session, Store, User};
+use terminal_worker_core::permissions::{Id, Identity, Node, Session, Store, User};
 use wasm_bindgen::prelude::*;
 use worker::{Error, Result, SqlStorage, SqlStorageValue, State};
 
@@ -34,7 +34,7 @@ const ROLLBACK: &str = "rollback";
 /// The version of the tables below, which local state made by an older one does not have.
 pub const SCHEMA_VERSION: &str = "3";
 
-const SCHEMA: [&str; 22] = [
+const SCHEMA: [&str; 29] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
@@ -45,8 +45,10 @@ const SCHEMA: [&str; 22] = [
     "CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent)",
     "CREATE INDEX IF NOT EXISTS nodes_ino ON nodes(ino)",
     // An inode: a directory, a file showing content, or a symbolic link to `link`; its ACLs as
-    // JSON (crate::acl).
-    "CREATE TABLE IF NOT EXISTS inodes(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, grp INTEGER NOT NULL, mode INTEGER NOT NULL, directory INTEGER NOT NULL, file TEXT, size INTEGER NOT NULL, link TEXT, acl TEXT, default_acl TEXT)",
+    // JSON (crate::acl); when its content (a directory's entries) last changed, when it did at
+    // all, and when it was last read as far as anything says (reading does not: noatime), each
+    // in seconds and the nanoseconds past them.
+    "CREATE TABLE IF NOT EXISTS inodes(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, grp INTEGER NOT NULL, mode INTEGER NOT NULL, directory INTEGER NOT NULL, file TEXT, size INTEGER NOT NULL, link TEXT, acl TEXT, default_acl TEXT, mtime INTEGER NOT NULL DEFAULT 0, ctime INTEGER NOT NULL DEFAULT 0, rdev TEXT, mtime_ns INTEGER NOT NULL DEFAULT 0, ctime_ns INTEGER NOT NULL DEFAULT 0, atime INTEGER NOT NULL DEFAULT 0, atime_ns INTEGER NOT NULL DEFAULT 0)",
     "CREATE INDEX IF NOT EXISTS inodes_file ON inodes(file)",
     // Extended attributes, their values in hexadecimal.
     "CREATE TABLE IF NOT EXISTS xattrs(ino INTEGER NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(ino, name))",
@@ -54,9 +56,21 @@ const SCHEMA: [&str; 22] = [
     // last one short. An upload names its target path, and the file it replaces there, if any.
     "CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY, size INTEGER NOT NULL, chunk_size INTEGER NOT NULL, state TEXT NOT NULL, sha256 TEXT, uploader INTEGER NOT NULL, target TEXT NOT NULL, base TEXT, touched INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS chunks(file TEXT NOT NULL, idx INTEGER NOT NULL, key TEXT NOT NULL, sha256 TEXT, PRIMARY KEY(file, idx))",
-    // The page sending an upload in chunks, by the token it was given, and when it was last
-    // heard from: one page at a time (api::HOLD). A table of its own, made where it is missing.
-    "CREATE TABLE IF NOT EXISTS upload_holds(file TEXT PRIMARY KEY, token TEXT NOT NULL, held INTEGER NOT NULL)",
+    // File descriptors (fds.rs): a session's (each browser is one), by number; the content it
+    // reads or writes (none once another writer took it over), where, its open(2) flags,
+    // whether it made the file, and when it was last kept (its lease).
+    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, token TEXT, root INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(sid, fd))",
+    // The next descriptor number of each session: numbers are not given again, as a session's
+    // pages share its descriptors, and one may go on using a number another closed.
+    "CREATE TABLE IF NOT EXISTS fd_numbers(sid TEXT PRIMARY KEY, next INTEGER NOT NULL)",
+    // A read descriptor's token: what the Worker reads its file by without asking each time.
+    "CREATE INDEX IF NOT EXISTS fds_token ON fds(token)",
+    "CREATE INDEX IF NOT EXISTS fds_device ON fds(device)",
+    "CREATE INDEX IF NOT EXISTS fds_file ON fds(file)",
+    // Directories a session watches (inotify), by its watch numbers: what changes in them is
+    // told on its lines of the events socket.
+    "CREATE TABLE IF NOT EXISTS watches(sid TEXT NOT NULL, wd INTEGER NOT NULL, path TEXT NOT NULL, mask INTEGER NOT NULL, PRIMARY KEY(sid, wd))",
+    "CREATE INDEX IF NOT EXISTS watches_path ON watches(path)",
     // R2 objects nothing refers to any more, which the alarm deletes.
     "CREATE TABLE IF NOT EXISTS garbage(key TEXT PRIMARY KEY)",
     "CREATE TABLE IF NOT EXISTS expiries(kind TEXT NOT NULL, id TEXT NOT NULL, due INTEGER NOT NULL, PRIMARY KEY(kind, id))",
@@ -74,6 +88,9 @@ const SCHEMA: [&str; 22] = [
     // What /dev holds (devices.rs): presentations others follow, whose they are, and the file
     // presented; `media`, what a live sound has to be heard by.
     "CREATE TABLE IF NOT EXISTS devices(name TEXT PRIMARY KEY, owner INTEGER NOT NULL, path TEXT NOT NULL, media TEXT, started INTEGER NOT NULL)",
+    // Listeners asking to speak in a presentation (dev/present.rs): a session at a time, by
+    // the id its presenter answers, as whom.
+    "CREATE TABLE IF NOT EXISTS asks(device TEXT NOT NULL, sid TEXT NOT NULL, id TEXT NOT NULL, uid INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY(device, sid))",
 ];
 
 thread_local! {
@@ -87,12 +104,43 @@ thread_local! {
     static CHANGED: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
     /// Whether a transaction ended sessions, which the pages holding them hear of.
     static ENDED: Cell<bool> = const { Cell::new(false) };
-    /// The devices the running transaction removed, or replaced (true) with one of the same name
-    /// that shows something else, ...
-    static REMOVING: RefCell<Vec<(String, bool)>> = const { RefCell::new(Vec::new()) };
-    /// ... and those committed transactions removed or replaced, which the pages following them
-    /// hear of.
-    static REMOVED: RefCell<Vec<(String, bool)>> = const { RefCell::new(Vec::new()) };
+    /// The devices the running transaction removed, or replaced with one of the same name that
+    /// shows something else, ...
+    static REMOVING: RefCell<Vec<Removed>> = const { RefCell::new(Vec::new()) };
+    /// ... and those committed transactions removed or replaced, which the pages following them,
+    /// and their account's, hear of.
+    static REMOVED: RefCell<Vec<Removed>> = const { RefCell::new(Vec::new()) };
+    /// The live sounds the running transaction started, ...
+    static STARTING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// ... and those committed transactions started, which the pages following a presentation
+    /// of their account hear of, to hear them (owner's request, 2026-10-28).
+    static STARTED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// What the running transaction has for some pages to hear (a driver's news: an ask to
+    /// speak, its answer), ...
+    static TELLING: RefCell<Vec<(Told, serde_json::Value)>> = const { RefCell::new(Vec::new()) };
+    /// ... and what committed transactions had, which store.rs sends.
+    static TOLD: RefCell<Vec<(Told, serde_json::Value)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Whose pages hear something: an account's signed in as it, or a session's (auth::sid).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Told {
+    Account(u32),
+    Session(String),
+}
+
+/// What committed transactions had for pages to hear since this was last asked.
+pub fn take_told() -> Vec<(Told, serde_json::Value)> {
+    TOLD.take()
+}
+
+/// A device removed, or replaced (`replaced`), as it was: whose, and which (devices::version).
+#[derive(Clone, Debug)]
+pub struct Removed {
+    pub name: String,
+    pub replaced: bool,
+    pub owner: u32,
+    pub version: String,
 }
 
 /// The directories whose listings committed transactions changed since this was last asked.
@@ -105,9 +153,14 @@ pub fn take_ended() -> bool {
     ENDED.replace(false)
 }
 
-/// The devices committed transactions removed, or replaced (true), since this was last asked.
-pub fn take_removed() -> Vec<(String, bool)> {
+/// The devices committed transactions removed, or replaced, since this was last asked.
+pub fn take_removed() -> Vec<Removed> {
     REMOVED.take()
+}
+
+/// The live sounds committed transactions started since this was last asked.
+pub fn take_started() -> Vec<String> {
+    STARTED.take()
 }
 
 /// Whether the alarm should run soon, clearing the request.
@@ -149,6 +202,44 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     for statement in SCHEMA {
         sql.exec(statement, None)?;
     }
+    // Inodes made before they had times get them, as of 1970.
+    if sql.exec("SELECT mtime FROM inodes LIMIT 0", None).is_err() {
+        for column in ["mtime", "ctime"] {
+            sql.exec(
+                &format!("ALTER TABLE inodes ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
+                None,
+            )?;
+        }
+    }
+    // Inodes made before times had nanoseconds and an access time get them, as of 1970.
+    if sql.exec("SELECT atime FROM inodes LIMIT 0", None).is_err() {
+        for column in ["mtime_ns", "ctime_ns", "atime", "atime_ns"] {
+            sql.exec(
+                &format!("ALTER TABLE inodes ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
+                None,
+            )?;
+        }
+    }
+    // Inodes made before devices were nodes of their own have no driver, and descriptors
+    // made before then open no device.
+    if sql.exec("SELECT rdev FROM inodes LIMIT 0", None).is_err() {
+        sql.exec("ALTER TABLE inodes ADD COLUMN rdev TEXT", None)?;
+    }
+    if sql.exec("SELECT device FROM fds LIMIT 0", None).is_err() {
+        sql.exec("ALTER TABLE fds ADD COLUMN device TEXT", None)?;
+    }
+    // Descriptors made before read tokens have none.
+    if sql.exec("SELECT token FROM fds LIMIT 0", None).is_err() {
+        sql.exec("ALTER TABLE fds ADD COLUMN token TEXT", None)?;
+        sql.exec("CREATE INDEX IF NOT EXISTS fds_token ON fds(token)", None)?;
+    }
+    // Descriptors made before they said as whom they were opened were not opened as root.
+    if sql.exec("SELECT root FROM fds LIMIT 0", None).is_err() {
+        sql.exec(
+            "ALTER TABLE fds ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
+            None,
+        )?;
+    }
     // Tables made just now are this version's, said at once: initialization may fail (a
     // missing ADMIN_PASSWORD), and the next start must not take them for an older version's.
     if !tables.iter().any(|t| t.name == "users") {
@@ -179,17 +270,23 @@ pub fn transact<T: 'static>(
         FAILED.with(|f| f.borrow_mut().take());
         CHANGING.take();
         REMOVING.take();
+        STARTING.take();
+        TELLING.take();
         let mut db = Db { sql: sql.clone() };
         let (value, commit) = work(&mut db);
         *slot.borrow_mut() = Some(value);
         let changing = CHANGING.take();
         let removing = REMOVING.take();
+        let starting = STARTING.take();
+        let telling = TELLING.take();
         match FAILED.with(|f| f.borrow_mut().take()) {
             Some(error) => JsValue::from_str(&error),
             None if !commit => JsValue::from_str(ROLLBACK),
             None => {
                 CHANGED.with(|changed| changed.borrow_mut().extend(changing));
                 REMOVED.with(|removed| removed.borrow_mut().extend(removing));
+                STARTED.with(|started| started.borrow_mut().extend(starting));
+                TOLD.with(|told| told.borrow_mut().extend(telling));
                 JsValue::UNDEFINED
             }
         }
@@ -218,6 +315,7 @@ struct NodeRow {
     file: Option<String>,
     size: u64,
     link: Option<String>,
+    rdev: Option<String>,
     acl: Option<String>,
     default_acl: Option<String>,
     links: u32,
@@ -235,6 +333,7 @@ impl NodeRow {
                 file: self.file,
                 size: self.size,
                 link: self.link,
+                rdev: self.rdev,
                 links: self.links,
                 acl: self.acl.and_then(|a| serde_json::from_str(&a).ok()),
                 default_acl: self.default_acl.and_then(|a| serde_json::from_str(&a).ok()),
@@ -316,6 +415,15 @@ impl File {
     pub fn recording(&self) -> bool {
         self.state == "recording"
     }
+    /// Whether it is written in order by a writer that did not say its size (a program's
+    /// output): it has what was written, readable as it grows, and is whole once closed.
+    pub fn growing(&self) -> bool {
+        self.state == "growing"
+    }
+    /// Whether its chunks come in order, each the next: a recording's, or a growing file's.
+    pub fn sequential(&self) -> bool {
+        self.recording() || self.growing()
+    }
     /// How many chunks the whole file has.
     pub fn chunk_count(&self) -> u64 {
         self.size.div_ceil(self.chunk_size)
@@ -332,6 +440,35 @@ impl File {
 pub fn etag(file: &str) -> String {
     format!("\"{file}\"")
 }
+/// A file descriptor (fds.rs).
+#[derive(Clone, Debug, Deserialize)]
+pub struct Fd {
+    pub fd: u32,
+    /// What it reads or writes; none once another writer took the file over.
+    pub file: Option<String>,
+    /// The device it opens, if it is one (dev/).
+    pub device: Option<String>,
+    pub path: String,
+    pub flags: u32,
+    #[serde(deserialize_with = "flag")]
+    pub created: bool,
+    /// Whether it was opened as root (or under sudo): what it reads and writes, it does as root,
+    /// as a descriptor keeps the access it was opened with.
+    #[serde(deserialize_with = "flag", default)]
+    pub root: bool,
+}
+impl Fd {
+    pub fn writes(&self) -> bool {
+        self.flags & abi::O_ACCMODE != abi::O_RDONLY
+    }
+}
+fn flag<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<bool, D::Error> {
+    Ok(u8::deserialize(d)? != 0)
+}
+/// How the alarm names a descriptor's expiry.
+pub fn fd_key(sid: &str, fd: u32) -> String {
+    format!("{sid} {fd}")
+}
 /// A device of /dev: its path there, whose it is, the file it presents, and what its live sound
 /// is heard by, if it has one.
 #[derive(Clone, Debug, Deserialize)]
@@ -340,6 +477,16 @@ pub struct Device {
     pub owner: u32,
     pub path: String,
     pub media: Option<String>,
+}
+/// A listener asking to speak in the presentation `device` (dev/present.rs): its session, the
+/// id its presenter answers, and as whom.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Ask {
+    pub device: String,
+    pub sid: String,
+    pub id: String,
+    pub uid: u32,
+    pub name: String,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct Chunk {
@@ -468,26 +615,239 @@ impl Db {
             .map(|chunk| file.chunk_len(chunk.idx))
             .sum()
     }
-    /// The token of the page sending upload `file`, and when it was last heard from.
-    pub fn hold(&self, file: &str) -> Option<(String, u64)> {
+    /// What the store holds: the bytes of its complete files, and its inodes.
+    pub fn usage(&self) -> (u64, u64) {
         #[derive(Deserialize)]
-        struct Hold {
-            token: String,
-            held: u64,
+        struct Count {
+            n: u64,
         }
-        self.rows::<Hold>(
-            "SELECT token, held FROM upload_holds WHERE file = ?",
+        let count = |query: &str| self.rows::<Count>(query, vec![]).pop().map_or(0, |c| c.n);
+        (
+            count("SELECT COALESCE(SUM(size), 0) AS n FROM files WHERE state = 'complete'"),
+            count("SELECT COUNT(*) AS n FROM inodes"),
+        )
+    }
+    /// The descriptor `fd` of the session `sid`.
+    pub fn fd(&self, sid: &str, fd: u32) -> Option<Fd> {
+        self.rows(
+            "SELECT fd, file, device, path, flags, created, leased, root FROM fds WHERE sid = ? AND fd = ?",
+            vec![text(sid), int(fd)],
+        )
+        .pop()
+    }
+    /// The descriptors of the session `sid`.
+    pub fn fds_of(&self, sid: &str) -> Vec<Fd> {
+        self.rows(
+            "SELECT fd, file, device, path, flags, created, leased, root FROM fds WHERE sid = ? ORDER BY fd",
+            vec![text(sid)],
+        )
+    }
+    /// The descriptor writing `file`, if one is.
+    pub fn writer(&self, file: &str) -> Option<Fd> {
+        self.rows(
+            "SELECT fd, file, device, path, flags, created, leased, root FROM fds WHERE file = ? AND flags & 3 != 0",
             vec![text(file)],
         )
         .pop()
-        .map(|hold| (hold.token, hold.held))
     }
-    /// Let go of upload `file`, if `token` holds it.
-    pub fn release_hold(&mut self, file: &str, token: &str) {
+    /// The session that writes `file`, if one does, and when it was last heard from.
+    pub fn writing_session(&self, file: &str) -> Option<(String, u64)> {
+        #[derive(Deserialize)]
+        struct Writer {
+            sid: String,
+            leased: u64,
+        }
+        self.rows::<Writer>(
+            "SELECT sid, leased FROM fds WHERE file = ? AND flags & 3 != 0",
+            vec![text(file)],
+        )
+        .pop()
+        .map(|writer| (writer.sid, writer.leased))
+    }
+    /// The watch of the session `sid` on `path`, made if it has none: its number, or None if it
+    /// has as many as it may.
+    pub fn add_watch(&mut self, sid: &str, path: &str, mask: u32) -> Option<u32> {
+        #[derive(Deserialize)]
+        struct Wd {
+            wd: u32,
+        }
+        if let Some(found) = self
+            .rows::<Wd>(
+                "SELECT wd FROM watches WHERE sid = ? AND path = ?",
+                vec![text(sid), text(path)],
+            )
+            .pop()
+        {
+            self.run(
+                "UPDATE watches SET mask = ? WHERE sid = ? AND wd = ?",
+                vec![int(mask), text(sid), int(found.wd)],
+            );
+            return Some(found.wd);
+        }
+        let watches = self.watches_of(sid);
+        if watches.len() >= abi::WATCHES_MAX {
+            return None;
+        }
+        let wd = watches.iter().map(|(wd, _)| *wd).max().unwrap_or(0) + 1;
         self.run(
-            "DELETE FROM upload_holds WHERE file = ? AND token = ?",
-            vec![text(file), text(token)],
+            "INSERT INTO watches(sid, wd, path, mask) VALUES(?, ?, ?, ?)",
+            vec![text(sid), int(wd), text(path), int(mask)],
         );
+        Some(wd)
+    }
+    /// Remove the watch `wd` of `sid`: whether it had one.
+    pub fn rm_watch(&mut self, sid: &str, wd: u32) -> bool {
+        let had = self
+            .watches_of(sid)
+            .iter()
+            .any(|(watched, _)| *watched == wd);
+        self.run(
+            "DELETE FROM watches WHERE sid = ? AND wd = ?",
+            vec![text(sid), int(wd)],
+        );
+        had
+    }
+    /// The watches of `sid`: each one's number and directory.
+    pub fn watches_of(&self, sid: &str) -> Vec<(u32, String)> {
+        #[derive(Deserialize)]
+        struct Watch {
+            wd: u32,
+            path: String,
+        }
+        self.rows::<Watch>(
+            "SELECT wd, path FROM watches WHERE sid = ? ORDER BY wd",
+            vec![text(sid)],
+        )
+        .into_iter()
+        .map(|watch| (watch.wd, watch.path))
+        .collect()
+    }
+    /// Forget every watch of `sid`, a session not heard from for long.
+    /// Forget what the session `sid` watches, and when it would have: it is not heard from.
+    pub fn drop_watches(&mut self, sid: &str) {
+        self.run("DELETE FROM watches WHERE sid = ?", vec![text(sid)]);
+        self.clear_expiry("watches", sid);
+    }
+    /// Forget the next descriptor number of the session `sid`, once it has none open.
+    pub fn forget_fd_numbers(&mut self, sid: &str) {
+        self.run(
+            "DELETE FROM fd_numbers WHERE sid = ?1 AND NOT EXISTS (SELECT 1 FROM fds WHERE sid = ?1)",
+            vec![text(sid)],
+        );
+    }
+    /// Keep every descriptor of the session `sid`, as of `now`.
+    pub fn lease_fds(&mut self, sid: &str, now: u64) {
+        self.run(
+            "UPDATE fds SET leased = ? WHERE sid = ?",
+            vec![int(now), text(sid)],
+        );
+    }
+    /// A new descriptor of the session `sid`, numbered from 3 on, each number given once: a
+    /// session's pages share its descriptors, so a page may still use a number another page
+    /// closed, which must then name nothing rather than another file. It is kept from `now`.
+    pub fn add_fd(
+        &mut self,
+        sid: &str,
+        file: Option<&str>,
+        path: &str,
+        flags: u32,
+        created: bool,
+        now: u64,
+    ) -> u32 {
+        #[derive(Deserialize)]
+        struct Next {
+            next: u32,
+        }
+        let taken: BTreeSet<u32> = self.fds_of(sid).into_iter().map(|fd| fd.fd).collect();
+        let next = self
+            .rows::<Next>("SELECT next FROM fd_numbers WHERE sid = ?", vec![text(sid)])
+            .pop()
+            .map_or(3, |n| n.next);
+        let fd = (next.max(3)..).find(|n| !taken.contains(n)).unwrap_or(next);
+        self.run(
+            "INSERT INTO fd_numbers(sid, next) VALUES(?, ?) ON CONFLICT(sid) DO UPDATE SET next = excluded.next",
+            vec![text(sid), int(fd.saturating_add(1))],
+        );
+        self.run(
+            "INSERT INTO fds(sid, fd, file, path, flags, created, leased) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                text(sid),
+                int(fd),
+                file.into(),
+                text(path),
+                int(flags),
+                int(created as u8),
+                int(now),
+            ],
+        );
+        fd
+    }
+    /// Say the descriptor `fd` of `sid` was opened as root.
+    pub fn set_fd_root(&mut self, sid: &str, fd: u32) {
+        self.run(
+            "UPDATE fds SET root = 1 WHERE sid = ? AND fd = ?",
+            vec![text(sid), int(fd)],
+        );
+    }
+    /// Give the read descriptor `fd` of `sid` the token `token`.
+    pub fn set_fd_token(&mut self, sid: &str, fd: u32, token: &str) {
+        self.run(
+            "UPDATE fds SET token = ? WHERE sid = ? AND fd = ?",
+            vec![text(token), text(sid), int(fd)],
+        );
+    }
+    /// The descriptor whose token is `token`, and its session.
+    pub fn fd_by_token(&self, token: &str) -> Option<(String, Fd)> {
+        #[derive(Deserialize)]
+        struct Of {
+            sid: String,
+            fd: u32,
+        }
+        let of = self
+            .rows::<Of>("SELECT sid, fd FROM fds WHERE token = ?", vec![text(token)])
+            .pop()?;
+        let found = self.fd(&of.sid, of.fd)?;
+        Some((of.sid, found))
+    }
+    /// Keep the descriptor `fd` of `sid`, from `now`.
+    pub fn lease_fd(&mut self, sid: &str, fd: u32, now: u64) {
+        self.run(
+            "UPDATE fds SET leased = ? WHERE sid = ? AND fd = ?",
+            vec![int(now), text(sid), int(fd)],
+        );
+    }
+    /// The descriptor `fd` of `sid` now reads or writes `file`.
+    pub fn set_fd_file(&mut self, sid: &str, fd: u32, file: &str) {
+        self.run(
+            "UPDATE fds SET file = ? WHERE sid = ? AND fd = ?",
+            vec![text(file), text(sid), int(fd)],
+        );
+    }
+    /// The descriptors writing `file` write it no more: another took it over.
+    pub fn revoke_writers(&mut self, file: &str) {
+        self.run(
+            "UPDATE fds SET file = NULL WHERE file = ? AND flags & 3 != 0",
+            vec![text(file)],
+        );
+    }
+    /// Close the descriptor `fd` of `sid`: what it read goes, if nothing else keeps it. What a
+    /// writer leaves unfinished waits for another to go on with it, until it expires.
+    pub fn close_fd(&mut self, sid: &str, fd: u32) {
+        #[derive(Deserialize)]
+        struct Closed {
+            file: Option<String>,
+            flags: u32,
+        }
+        let closed = self.rows::<Closed>(
+            "DELETE FROM fds WHERE sid = ? AND fd = ? RETURNING file, flags",
+            vec![text(sid), int(fd)],
+        );
+        self.clear_expiry("fd", &fd_key(sid, fd));
+        for closed in closed {
+            if closed.flags & abi::O_ACCMODE == abi::O_RDONLY {
+                self.release(closed.file);
+            }
+        }
     }
     /// Delete the sessions `condition` selects, and their expiries; the pages holding them hear
     /// that they ended, if any did.
@@ -502,16 +862,14 @@ impl Db {
         );
         for session in &ended {
             self.clear_expiry("session", &session.key);
+            for fd in self.fds_of(&session.key) {
+                self.close_fd(&session.key, fd.fd);
+            }
+            self.forget_fd_numbers(&session.key);
         }
         if !ended.is_empty() {
             ENDED.set(true);
         }
-    }
-    pub fn set_hold(&mut self, file: &str, token: &str, now: u64) {
-        self.run(
-            "INSERT OR REPLACE INTO upload_holds(file, token, held) VALUES(?, ?, ?)",
-            vec![text(file), text(token), int(now)],
-        );
     }
     pub fn file(&self, id: &str) -> Option<File> {
         self.rows(
@@ -547,6 +905,13 @@ impl Db {
             vec![text(file)],
         );
     }
+    /// Make `file` one written in order, as it grows (File::growing).
+    pub fn grow_in_order(&mut self, file: &str) {
+        self.run(
+            "UPDATE files SET state = 'growing' WHERE id = ?",
+            vec![text(file)],
+        );
+    }
     /// Set the size of the recording `file`, and of the nodes showing it, as it grows; and its
     /// SHA-256 once it is whole, if known.
     pub fn grow_file(&mut self, file: &str, size: u64, sha256: Option<&str>) {
@@ -572,7 +937,11 @@ impl Db {
             "UPDATE files SET state = 'complete' WHERE id = ?",
             vec![text(file)],
         );
-        self.run("DELETE FROM upload_holds WHERE file = ?", vec![text(file)]);
+        // Its writers are done: one closing it, or one whose page went (a recording).
+        self.run(
+            "DELETE FROM fds WHERE file = ? AND flags & 3 != 0",
+            vec![text(file)],
+        );
         self.clear_expiry("upload", file);
     }
     /// Delete `file` and send its chunks to the garbage, whatever refers to it: every object
@@ -581,7 +950,7 @@ impl Db {
         self.discard(&format!("chunks/{file}/"));
         self.run("DELETE FROM chunks WHERE file = ?", vec![text(file)]);
         self.run("DELETE FROM files WHERE id = ?", vec![text(file)]);
-        self.run("DELETE FROM upload_holds WHERE file = ?", vec![text(file)]);
+        self.run("DELETE FROM fds WHERE file = ?", vec![text(file)]);
         self.clear_expiry("upload", file);
         ALARM.set(true);
     }
@@ -596,10 +965,10 @@ impl Db {
     }
     fn release(&mut self, file: Option<String>) {
         let Some(file) = file else { return };
-        // A job still reading it keeps it too.
+        // A job still reading it keeps it too, and so does a descriptor.
         let referenced = !self
             .rows::<Key>(
-                "SELECT CAST(id AS TEXT) AS key FROM inodes WHERE file = ?1 UNION ALL SELECT job AS key FROM job_files WHERE file = ?1 LIMIT 1",
+                "SELECT CAST(id AS TEXT) AS key FROM inodes WHERE file = ?1 UNION ALL SELECT job AS key FROM job_files WHERE file = ?1 UNION ALL SELECT sid AS key FROM fds WHERE file = ?1 LIMIT 1",
                 vec![text(&file)],
             )
             .is_empty();
@@ -741,20 +1110,6 @@ impl Db {
             self.release(Some(file));
         }
     }
-    /// The unfinished uploads that nodes in directory `dir` show.
-    pub fn uploading_in(&self, dir: &str) -> Vec<File> {
-        self.rows(
-            "SELECT DISTINCT f.id, f.size, f.chunk_size, f.state, f.sha256, f.uploader, f.target, f.base FROM files f JOIN inodes i ON i.file = f.id JOIN nodes n ON n.ino = i.id WHERE n.parent = ? AND f.state IN ('uploading', 'recording')",
-            vec![text(dir)],
-        )
-    }
-    /// The uploads `uploader` has not finished.
-    pub fn uploads_of(&self, uploader: u32) -> Vec<File> {
-        self.rows(
-            "SELECT id, size, chunk_size, state, sha256, uploader, target, base FROM files WHERE uploader = ? AND state IN ('uploading', 'recording') ORDER BY touched DESC LIMIT 50",
-            vec![int(uploader)],
-        )
-    }
     /// The SHA-256 chunk `index` of `file` was committed with, or `None` if it is not committed.
     pub fn committed_hash(&self, file: &str, index: u64) -> Option<Option<String>> {
         #[derive(Deserialize)]
@@ -837,22 +1192,53 @@ impl Db {
         )
         .pop()
     }
-    /// The devices of `owner` presenting the file at `path`.
+    /// The devices of `owner` presenting the file at `path`, or sending it live; not the voices
+    /// of listeners speaking in its presentations, which link to it too.
     pub fn presenting(&self, owner: u32, path: &str) -> Vec<Device> {
         self.rows::<Device>(
-            "SELECT name, owner, path, media FROM devices WHERE owner = ? AND path = ?",
+            "SELECT name, owner, path, media FROM devices WHERE owner = ? AND path = ? AND json_extract(media, '$.for') IS NULL",
             vec![int(owner), text(path)],
         )
     }
-    /// The names of `owner`'s live sounds.
+    /// The names of `owner`'s live sounds, not the voices of listeners it let speak.
     pub fn sounds_of(&self, owner: u32) -> Vec<String> {
+        self.sounds_by(owner)
+            .into_iter()
+            .map(|device| device.name)
+            .collect()
+    }
+    /// `owner`'s live sounds, not the voices of listeners it let speak, the latest first.
+    pub fn sounds_by(&self, owner: u32) -> Vec<Device> {
         self.rows::<Device>(
-            "SELECT name, owner, path, media FROM devices WHERE owner = ? AND media IS NOT NULL",
+            "SELECT name, owner, path, media FROM devices WHERE owner = ? AND media IS NOT NULL AND json_extract(media, '$.for') IS NULL ORDER BY started DESC, name",
             vec![int(owner)],
         )
-        .into_iter()
-        .map(|device| device.name)
-        .collect()
+    }
+    /// The voices of listeners let speak in the presentation `presentation`, the first first.
+    pub fn voices_for(&self, presentation: &str) -> Vec<Device> {
+        self.rows::<Device>(
+            "SELECT name, owner, path, media FROM devices WHERE json_extract(media, '$.for') = ? ORDER BY started, name",
+            vec![text(presentation)],
+        )
+    }
+    /// The presentations of the file at `path`, whoever's.
+    pub fn presentations_of(&self, path: &str) -> Vec<Device> {
+        self.rows::<Device>(
+            "SELECT name, owner, path, media FROM devices WHERE path = ? AND name LIKE '/dev/present/%'",
+            vec![text(path)],
+        )
+    }
+    /// The devices in the directory `directory` (/dev/present, /dev/snd).
+    pub fn devices_in(&self, directory: &str) -> Vec<Device> {
+        self.rows::<Device>(
+            "SELECT name, owner, path, media FROM devices WHERE name LIKE ? ORDER BY name",
+            vec![text(&format!("{directory}/%"))],
+        )
+    }
+    /// Remove the device `name` with no word to its followers: one of the same name replaces it,
+    /// which they hear of (`replaced_device`).
+    pub fn forget_device(&mut self, name: &str) {
+        self.run("DELETE FROM devices WHERE name = ?", vec![text(name)]);
     }
     /// The names of `owner`'s devices.
     pub fn devices_of(&self, owner: u32) -> Vec<String> {
@@ -878,13 +1264,87 @@ impl Db {
     }
     /// Remove the device `name`, whose followers hear so once this commits.
     pub fn delete_device(&mut self, name: &str) {
+        self.removing(name, false);
         self.run("DELETE FROM devices WHERE name = ?", vec![text(name)]);
-        REMOVING.with(|removing| removing.borrow_mut().push((name.to_string(), false)));
     }
     /// Note that the device `name` now shows something else, which its followers hear once this
     /// commits, to follow it again, if they still may.
     pub fn replaced_device(&mut self, name: &str) {
-        REMOVING.with(|removing| removing.borrow_mut().push((name.to_string(), true)));
+        self.removing(name, true);
+    }
+    fn removing(&self, name: &str, replaced: bool) {
+        let Some(device) = self.device(name) else {
+            return;
+        };
+        let removed = Removed {
+            name: name.to_string(),
+            replaced,
+            owner: device.owner,
+            version: crate::dev::version(&device),
+        };
+        REMOVING.with(|removing| removing.borrow_mut().push(removed));
+    }
+    /// Note that the live sound `name` started, which the pages following a presentation of its
+    /// account hear once this commits.
+    pub fn started_sound(&mut self, name: &str) {
+        STARTING.with(|starting| starting.borrow_mut().push(name.to_string()));
+    }
+    /// The asks to speak in the presentation `device`, in the order asked.
+    pub fn asks(&self, device: &str) -> Vec<Ask> {
+        self.rows(
+            "SELECT device, sid, id, uid, name FROM asks WHERE device = ? ORDER BY rowid",
+            vec![text(device)],
+        )
+    }
+    /// The asks of the session `sid`.
+    pub fn asks_of(&self, sid: &str) -> Vec<Ask> {
+        self.rows(
+            "SELECT device, sid, id, uid, name FROM asks WHERE sid = ?",
+            vec![text(sid)],
+        )
+    }
+    pub fn set_ask(&mut self, ask: &Ask) {
+        self.run(
+            "INSERT OR REPLACE INTO asks(device, sid, id, uid, name) VALUES(?, ?, ?, ?, ?)",
+            vec![
+                text(&ask.device),
+                text(&ask.sid),
+                text(&ask.id),
+                int(ask.uid),
+                text(&ask.name),
+            ],
+        );
+    }
+    pub fn delete_ask(&mut self, device: &str, sid: &str) {
+        self.run(
+            "DELETE FROM asks WHERE device = ? AND sid = ?",
+            vec![text(device), text(sid)],
+        );
+    }
+    /// Forget the asks of the presentation `device`, which ended.
+    pub fn delete_asks_of(&mut self, device: &str) {
+        self.run("DELETE FROM asks WHERE device = ?", vec![text(device)]);
+    }
+    /// A new descriptor of the session `sid` that opens the device `device` at `path`: the
+    /// lowest number free from 3.
+    pub fn add_device_fd(&mut self, sid: &str, device: &str, flags: u32, now: u64) -> u32 {
+        let fd = self.add_fd(sid, None, device, flags, false, now);
+        self.run(
+            "UPDATE fds SET device = ? WHERE sid = ? AND fd = ?",
+            vec![text(device), text(sid), int(fd)],
+        );
+        fd
+    }
+    /// The descriptors of the device `device`, which went, open nothing any more (EBADF).
+    pub fn revoke_device(&mut self, device: &str) {
+        self.run(
+            "UPDATE fds SET device = NULL WHERE device = ?",
+            vec![text(device)],
+        );
+    }
+    /// Have the pages of `whom` hear `message`, once this commits.
+    pub fn tell(&mut self, whom: Told, message: serde_json::Value) {
+        TELLING.with(|telling| telling.borrow_mut().push((whom, message)));
     }
     pub fn set_expiry(&mut self, kind: &str, id: &str, due: u64) {
         self.run(
@@ -941,7 +1401,7 @@ impl Db {
 
 /// Names and their inodes, with how many names each has: a directory, 2 and one for each
 /// directory in it.
-const NODE: &str = "SELECT n.path, i.id AS ino, i.owner, i.grp, i.mode, i.directory, i.file, i.size, i.link, i.acl, i.default_acl, CASE WHEN i.directory = 1 THEN 2 + (SELECT COUNT(*) FROM nodes c JOIN inodes ci ON ci.id = c.ino WHERE c.parent = n.path AND ci.directory = 1) ELSE (SELECT COUNT(*) FROM nodes m WHERE m.ino = i.id) END AS links FROM nodes n JOIN inodes i ON i.id = n.ino";
+const NODE: &str = "SELECT n.path, i.id AS ino, i.owner, i.grp, i.mode, i.directory, i.file, i.size, i.link, i.rdev, i.acl, i.default_acl, CASE WHEN i.directory = 1 THEN 2 + (SELECT COUNT(*) FROM nodes c JOIN inodes ci ON ci.id = c.ino WHERE c.parent = n.path AND ci.directory = 1) ELSE (SELECT COUNT(*) FROM nodes m WHERE m.ino = i.id) END AS links FROM nodes n JOIN inodes i ON i.id = n.ino";
 const JOB: &str =
     "SELECT id, owner, actor, kind, spec, state, progress, question, created FROM jobs";
 
@@ -974,20 +1434,116 @@ pub enum JobColumn {
 }
 const USER: &str = "SELECT id, name, gid, groups, home, locked, salt, hash FROM users";
 
+impl Db {
+    /// The entries of the directory holding `path` changed: its times are now.
+    fn entries_changed(&mut self, path: &str) {
+        if path == "/" {
+            return;
+        }
+        let (now, nanos) = crate::auth::clock();
+        self.run(
+            "UPDATE inodes SET mtime = ?1, mtime_ns = ?2, ctime = ?1, ctime_ns = ?2 WHERE id = (SELECT ino FROM nodes WHERE path = ?3)",
+            vec![int(now), int(nanos), text(terminal_worker_core::parent(path))],
+        );
+    }
+}
+
+/// What the kernel's file system keeps beyond names: the time, inodes' times, empty content,
+/// and what has arrived of content still being written.
+impl kernel::Fs for Db {
+    fn now(&self) -> (u64, u32) {
+        crate::auth::clock()
+    }
+    fn times(&self, ino: u64) -> kernel::Times {
+        if let Some(times) = crate::usr::times(ino) {
+            return times;
+        }
+        #[derive(Deserialize)]
+        struct Times {
+            atime: u64,
+            atime_ns: u32,
+            mtime: u64,
+            mtime_ns: u32,
+            ctime: u64,
+            ctime_ns: u32,
+        }
+        self.rows::<Times>(
+            "SELECT atime, atime_ns, mtime, mtime_ns, ctime, ctime_ns FROM inodes WHERE id = ?",
+            vec![int(ino)],
+        )
+        .pop()
+        .map_or_else(kernel::Times::default, |t| kernel::Times {
+            atime: (t.atime, t.atime_ns),
+            mtime: (t.mtime, t.mtime_ns),
+            ctime: (t.ctime, t.ctime_ns),
+        })
+    }
+    fn set_times(&mut self, ino: u64, atime: Option<(u64, u32)>, mtime: Option<(u64, u32)>) {
+        let (now, nanos) = crate::auth::clock();
+        let given = |time: Option<(u64, u32)>| match time {
+            Some((sec, nsec)) => [int(sec), int(nsec)],
+            None => [SqlStorageValue::Null, SqlStorageValue::Null],
+        };
+        let mut values = given(atime).to_vec();
+        values.extend(given(mtime));
+        values.extend([int(now), int(nanos), int(ino)]);
+        self.run(
+            "UPDATE inodes SET atime = COALESCE(?1, atime), atime_ns = COALESCE(?2, atime_ns), mtime = COALESCE(?3, mtime), mtime_ns = COALESCE(?4, mtime_ns), ctime = ?5, ctime_ns = ?6 WHERE id = ?7",
+            values,
+        );
+        for name in self.names(ino) {
+            changes(&name);
+        }
+    }
+    fn empty(&mut self, owner: u32, path: &str) -> String {
+        let file = self.create_file(0, 1, None, owner, path, None, crate::auth::now());
+        self.finish_file(&file);
+        file
+    }
+    fn writing(&self, file: &str) -> Option<(u64, bool)> {
+        let file = self.file(file).filter(|file| !file.complete())?;
+        Some((self.received(&file), file.recording()))
+    }
+    fn unlink_device(
+        &mut self,
+        cred: &Identity,
+        path: &str,
+    ) -> Option<std::result::Result<(), abi::Error>> {
+        crate::dev::unlink(self, cred, path)
+    }
+}
+
 impl Store for Db {
     fn node(&self, path: &str) -> Option<Node> {
+        // /usr and /bin are the image's (usr.rs), over any of the store's.
+        if crate::usr::is(path) {
+            return crate::usr::node(path);
+        }
         self.rows::<NodeRow>(&format!("{NODE} WHERE n.path = ?"), vec![text(path)])
             .pop()
             .map(|r| r.pair().1)
     }
     fn children(&self, path: &str) -> Vec<(String, Node)> {
-        self.rows::<NodeRow>(
-            &format!("{NODE} WHERE n.parent = ? ORDER BY n.path"),
-            vec![text(path)],
-        )
-        .into_iter()
-        .map(NodeRow::pair)
-        .collect()
+        let image = crate::usr::children(path);
+        if path != "/"
+            && let Some(image) = image
+        {
+            return image;
+        }
+        let mut children: Vec<(String, Node)> = self
+            .rows::<NodeRow>(
+                &format!("{NODE} WHERE n.parent = ? ORDER BY n.path"),
+                vec![text(path)],
+            )
+            .into_iter()
+            .map(NodeRow::pair)
+            .filter(|(child, _)| !crate::usr::is(child))
+            .collect();
+        if let Some(image) = image {
+            children.extend(image);
+            children.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        children
     }
     fn subtree(&self, path: &str) -> Vec<(String, Node)> {
         let rows = if path == "/" {
@@ -1013,8 +1569,11 @@ impl Store for Db {
         #[derive(Deserialize)]
         struct Shown {
             file: Option<String>,
+            mtime: u64,
+            mtime_ns: u32,
         }
         changes(path);
+        let (now, nanos) = crate::auth::clock();
         let json = |value: Option<String>| -> SqlStorageValue { value.into() };
         let values = vec![
             int(node.owner),
@@ -1024,6 +1583,7 @@ impl Store for Db {
             node.file.as_deref().into(),
             int(node.size),
             node.link.as_deref().into(),
+            node.rdev.as_deref().into(),
             json(node.acl.as_ref().map(|a| serde_json::json!(a).to_string())),
             json(
                 node.default_acl
@@ -1032,21 +1592,39 @@ impl Store for Db {
             ),
         ];
         let ino = if node.ino == 0 {
+            let mut values = values;
+            values.extend([int(now), int(nanos)]);
             self.rows::<Id>(
-                "INSERT INTO inodes(owner, grp, mode, directory, file, size, link, acl, default_acl) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                "INSERT INTO inodes(owner, grp, mode, directory, file, size, link, rdev, acl, default_acl, mtime, mtime_ns, ctime, ctime_ns, atime, atime_ns) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?11, ?12, ?11, ?12, ?11, ?12) RETURNING id",
                 values,
             )
             .pop()
             .map_or(0, |i| i.id)
         } else {
-            let before = self
-                .rows::<Shown>("SELECT file FROM inodes WHERE id = ?", vec![int(node.ino)])
-                .pop()
-                .and_then(|s| s.file);
+            let shown = self
+                .rows::<Shown>(
+                    "SELECT file, mtime, mtime_ns FROM inodes WHERE id = ?",
+                    vec![int(node.ino)],
+                )
+                .pop();
+            let (before, mtime) = shown.map_or((None, (0, 0)), |s| (s.file, (s.mtime, s.mtime_ns)));
+            // Its content changed (an upload completed over it): its mtime too; anything, its
+            // ctime.
+            let mtime = if before != node.file {
+                (now, nanos)
+            } else {
+                mtime
+            };
             let mut values = values;
-            values.push(int(node.ino));
+            values.extend([
+                int(mtime.0),
+                int(mtime.1),
+                int(now),
+                int(nanos),
+                int(node.ino),
+            ]);
             self.run(
-                "UPDATE inodes SET owner = ?, grp = ?, mode = ?, directory = ?, file = ?, size = ?, link = ?, acl = ?, default_acl = ? WHERE id = ?",
+                "UPDATE inodes SET owner = ?, grp = ?, mode = ?, directory = ?, file = ?, size = ?, link = ?, rdev = ?, acl = ?, default_acl = ?, mtime = ?, mtime_ns = ?, ctime = ?, ctime_ns = ? WHERE id = ?",
                 values,
             );
             // Every name of it shows the change.
@@ -1066,6 +1644,9 @@ impl Store for Db {
             "INSERT INTO nodes(path, parent, ino) VALUES(?, ?, ?) ON CONFLICT(path) DO UPDATE SET ino = excluded.ino",
             vec![text(path), text(parent_of(path)), int(ino)],
         );
+        if old != Some(ino) {
+            self.entries_changed(path);
+        }
         if let Some(old) = old
             && old != ino
         {
@@ -1079,6 +1660,7 @@ impl Store for Db {
             .pop()
             .map(|r| r.ino);
         self.run("DELETE FROM nodes WHERE path = ?", vec![text(path)]);
+        self.entries_changed(path);
         if let Some(old) = old {
             self.forget(old);
         }

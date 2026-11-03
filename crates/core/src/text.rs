@@ -46,6 +46,20 @@ pub enum Kind {
     },
 }
 
+impl Filter {
+    /// How many lines of standard input it reads, if it stops before its end: `head -n N`, as
+    /// GNU head closes its input once it has its lines, and a process writing to it hears SIGPIPE.
+    pub fn reads(&self) -> Option<usize> {
+        match self.kind {
+            Kind::Head {
+                lines,
+                all_but: false,
+            } if self.files.is_empty() => Some(lines),
+            _ => None,
+        }
+    }
+}
+
 fn count(command: &str, value: &str) -> Result<usize, String> {
     value
         .parse()
@@ -369,6 +383,21 @@ mod tests {
         apply(&filter, &inputs)
     }
     const LINES: &str = "beta\nalpha\nGamma\nalpha\nspéctrum 10\nspéctrum 9\n";
+
+    #[test]
+    fn head_alone_says_how_much_of_its_input_it_reads() {
+        let reads = |command: &str, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            parse(command, &args).unwrap().reads()
+        };
+        assert_eq!(reads("head", &["-n", "3"]), Some(3));
+        assert_eq!(reads("head", &["-5"]), Some(5));
+        assert_eq!(reads("head", &[]), Some(10));
+        // All but the last lines, files, or another filter: all of it.
+        assert_eq!(reads("head", &["-n", "-3"]), None);
+        assert_eq!(reads("head", &["file"]), None);
+        assert_eq!(reads("tail", &["-n", "3"]), None);
+    }
 
     #[test]
     fn head_tail_and_cat() {

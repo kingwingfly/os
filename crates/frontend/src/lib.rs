@@ -1,7 +1,10 @@
+mod desktop;
+mod files;
 mod manual;
 mod preview;
 mod search;
 mod shell;
+mod sys;
 mod uploads;
 mod viewer;
 mod workers;
@@ -10,9 +13,9 @@ use std::cell::RefCell;
 
 use leptos::prelude::*;
 use shell::{Account, LogLine, Shell};
-use terminal_worker_core::{Entry, Listing};
+use terminal_worker_core::Entry;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+use wasm_bindgen_futures::spawn_local;
 
 #[wasm_bindgen]
 extern "C" {
@@ -20,10 +23,12 @@ extern "C" {
     fn config() -> JsValue;
     #[wasm_bindgen(js_namespace = terminal, js_name = open)]
     pub(crate) fn open_file(path: &str, kind: &str) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal)]
-    fn unlock(path: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = accountCommand)]
     fn account_command(args: JsValue, cwd: &str) -> js_sys::Promise;
+    /// sudo's authentication: whether the account may act as root now, its password asked for
+    /// if it has not lately.
+    #[wasm_bindgen(js_namespace = terminal)]
+    fn sudo() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = chooseFiles)]
     fn choose_files() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = uploadFiles)]
@@ -39,6 +44,11 @@ extern "C" {
     ) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = stopRecording)]
     fn stop_recording() -> bool;
+    /// present: /dev/present/NAME made of system calls (web/dev.mjs).
+    #[wasm_bindgen(js_namespace = terminal, js_name = presentFile)]
+    fn present_file(path: &str, name: Option<String>) -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = terminal, js_name = stopPresenting)]
+    fn stop_presenting(name: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = cancelChoosing)]
     fn cancel_choosing() -> bool;
     #[wasm_bindgen(js_namespace = terminal, js_name = setDirectory)]
@@ -47,43 +57,40 @@ extern "C" {
     fn focus_input();
     #[wasm_bindgen(js_namespace = terminal, js_name = completionFocus)]
     fn completion_focus(value: &str, inside_quote: bool);
+    /// exec(2) of programs of /usr/bin, a pipeline of processes (web/wasi/exec.mjs), each
+    /// stage an argv: the last's exit status, and what it wrote if not to the terminal.
+    #[wasm_bindgen(js_namespace = terminal)]
+    fn exec(stages: &JsValue, options: &JsValue) -> js_sys::Promise;
 }
 
-async fn request(url: &str, method: &str) -> Result<serde_json::Value, String> {
-    let response = match method {
-        "POST" => gloo_net::http::Request::post(url).send().await,
-        "DELETE" => gloo_net::http::Request::delete(url).send().await,
-        _ => gloo_net::http::Request::get(url).send().await,
-    }
-    .map_err(|e| e.to_string())?;
-    let value: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-    if response.ok() {
-        Ok(value)
-    } else {
-        Err(value["error"].as_str().unwrap_or("Request failed").into())
-    }
-}
 fn endpoint(api: &str, path: &str) -> String {
     format!("/api/{api}?path={}", js_sys::encode_uri_component(path))
 }
-async fn listing(path: &str) -> Result<Vec<Entry>, String> {
-    let value = request(&endpoint("ls", path), "GET").await?;
-    serde_json::from_value::<Listing>(value)
-        .map(|l| l.entries)
-        .map_err(|e| e.to_string())
+/// What stat(2) says of `path`, a link at its end followed.
+async fn stat(path: &str) -> Result<abi::Stat, abi::Error> {
+    userland::sys::stat(&sys::HttpSys::default(), path).await
 }
-async fn authorize(path: &str) -> Result<(), String> {
-    let value = JsFuture::from(unlock(path)).await.map_err(|error| {
-        js_sys::Reflect::get(&error, &JsValue::from_str("message"))
-            .ok()
-            .and_then(|value| value.as_string())
-            .unwrap_or_else(|| "Authorization failed".into())
-    })?;
-    if value.as_bool() == Some(true) {
-        Ok(())
-    } else {
-        Err("Write canceled".into())
+/// Whether `path` is a directory the account may enter (search), as cd and chdir(2) need.
+async fn enterable(path: &str) -> Result<(), abi::Error> {
+    if !stat(path).await?.is_dir() {
+        return Err(abi::Errno::ENOTDIR.into());
     }
+    let access = abi::Call::Access {
+        path: path.into(),
+        mode: abi::X_OK,
+    };
+    userland::sys::done(&sys::HttpSys::default(), access).await
+}
+thread_local! {
+    /// Directories the kernel said changed, which tabs showing them have yet to list again.
+    static CHANGED: std::cell::RefCell<std::collections::BTreeSet<String>> = Default::default();
+}
+
+/// The entries of the directory `path`, as ls lists them: through system calls, as user space.
+async fn listing(path: &str) -> Result<Vec<Entry>, String> {
+    userland::entries(&sys::HttpSys::default(), path, path)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn file_icon(kind: &str, directory: bool) -> impl IntoView + use<> {
@@ -128,10 +135,33 @@ fn upload_progress(entry: &Entry) -> Option<String> {
         (uploaded * 100).checked_div(entry.size).unwrap_or(100)
     ))
 }
+/// When an entry's content changed, as ls -l shows it, as of now.
+pub(crate) fn listed(mtime: u64) -> String {
+    userland::time::listed(mtime, (js_sys::Date::now() / 1000.0) as u64)
+}
+/// What programs write for a terminal: colours, styles and links show as they mean them.
+fn styled(text: String) -> AnyView {
+    if !terminal_worker_core::ansi::escaped(&text) {
+        return text.into_any();
+    }
+    terminal_worker_core::ansi::parse(&text)
+        .into_iter()
+        .map(|run| {
+            let style = run.style.css();
+            match run.link.filter(|link| link.starts_with("https://") || link.starts_with("http://")) {
+                Some(link) => view! { <a href=link target="_blank" rel="noopener noreferrer" style=style>{run.text}</a> }.into_any(),
+                None => view! { <span style=style>{run.text}</span> }.into_any(),
+            }
+        })
+        .collect_view()
+        .into_any()
+}
+
 fn render_line(line: LogLine) -> AnyView {
     match line {
-        LogLine::Text(text) => view! { <pre class="output-line">{text}</pre> }.into_any(),
-        LogLine::Live(text) => view! { <pre class="output-line">{move || text.get()}</pre> }.into_any(),
+        LogLine::Text(text) => view! { <pre class="output-line">{styled(text)}</pre> }.into_any(),
+        // A program's output as it writes it, its last line ended or not.
+        LogLine::Live(text) => view! { <pre class="output-line">{move || text.with(|text| styled(text.trim_end_matches('\n').to_string()))}</pre> }.into_any(),
         LogLine::Command { user, cwd, command } => {
             let symbol = if user == "root" { " # " } else { " $ " };
             view! { <pre class="command-echo"><span class="prompt-user">{user}</span><span class="prompt-separator">":"</span><span class="prompt-path">{cwd}</span><span class="prompt-symbol">{symbol}</span><span class="prompt-command">{command}</span></pre> }.into_any()
@@ -141,7 +171,7 @@ fn render_line(line: LogLine) -> AnyView {
                 {entries.into_iter().map(|entry| {
                     let class = if entry.link.is_some() { "listing-entry entry-link" } else if entry.directory { "listing-entry entry-directory" } else if entry.mode & 0o111 != 0 { "listing-entry entry-executable" } else { "listing-entry entry-file" };
                     let class = if entry.denied { format!("{class} entry-denied") } else { class.to_string() };
-                    let meta = if long { format!("{} {:>2} {}:{} {:>6} ", entry.mode_line(), entry.links, entry.owner, entry.group, entry.size) } else { String::new() };
+                    let meta = if long { format!("{} {:>2} {}:{} {:>6} {} ", entry.mode_line(), entry.links, entry.owner, entry.group, entry.size, listed(entry.mtime)) } else { String::new() };
                     let uploading = upload_progress(&entry).map(|p| format!(" {p}"));
                     let suffix = entry.suffix();
                     view! { <span class=class>{file_icon(&entry.kind, entry.directory)}<span class="ls-meta">{meta}</span><span class="ls-name">{entry.name}{suffix}</span><span class="ls-uploading">{uploading}</span></span> }
@@ -227,10 +257,13 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
         }>{move || shell.lines.get().into_iter().map(render_line).collect_view()}</div>
         <Show when=move || shell.completion.get().is_some() || !shell.completion_status.get().is_empty()>
             <div class="completion-pager">
-                <p class="completion-hint" role="status">{move || shell.completion.get().map(|s| format!("{} / {} · Tab next · Shift+Tab previous · → accept · Esc cancel", s.selected+1, s.candidates.len())).unwrap_or_else(|| shell.completion_status.get())}</p>
+                <p class="completion-hint" role="status">{move || shell.completion.get().map(|s| match s.selected {
+                    Some(index) => format!("{} / {} · Tab next · Shift+Tab previous · → accept · Esc cancel", index + 1, s.candidates.len()),
+                    None => format!("{} matches · type to narrow · Tab pick · Esc close", s.candidates.len()),
+                }).unwrap_or_else(|| shell.completion_status.get())}</p>
                 <div id=move || current().then_some("completions") class="completion-options" role="listbox" aria-label="Completions">
                     {move || shell.completion.get().map(|s| s.candidates.into_iter().enumerate().map(|(index, candidate)| {
-                        view! { <button type="button" role="option" tabindex="-1" id=format!("completion-{id}-{index}") aria-selected=move || shell.completion.with(|s| s.as_ref().is_some_and(|s| s.selected == index)).to_string()
+                        view! { <button type="button" role="option" tabindex="-1" id=format!("completion-{id}-{index}") aria-selected=move || shell.completion.with(|s| s.as_ref().is_some_and(|s| s.selected == Some(index))).to_string()
                             on:mousedown=move |e| e.prevent_default()
                             on:click=move |_| { shell.select_completion(index); shell.accept_completion(); }>
                             <span>{candidate.label}</span><small>{candidate.kind}</small>
@@ -239,12 +272,12 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
                 </div>
             </div>
         </Show>
-        <form class="command-line" on:submit=move |event| { event.prevent_default(); shell.run(shell.input.get_untracked()); }>
+        <form class="command-line" on:submit=move |event| { event.prevent_default(); shell.enter(shell.input.get_untracked()); }>
             <label for=move || current().then_some("command")><span class="prompt-user">{move || shell.account.username.get()}</span><span class="prompt-separator">":"</span><span class="prompt-path">{move || shell.cwd.get()}</span><span class="prompt-symbol">{move || if shell.asking.get() { " ?" } else if shell.account.username.get() == "root" { " #" } else { " $" }}</span></label>
             <input id=move || current().then_some("command") class="command-input" aria-label="Terminal command" autocomplete="off" spellcheck="false" autocapitalize="off" enterkeyhint="go" prop:value=move || shell.input.get()
                 role="combobox" aria-autocomplete="list" aria-controls=move || current().then_some("completions")
                 aria-expanded=move || shell.completion.get().is_some().to_string()
-                aria-activedescendant=move || shell.completion.get().map(|s| format!("completion-{id}-{}", s.selected))
+                aria-activedescendant=move || shell.completion.get().and_then(|s| s.selected).map(|index| format!("completion-{id}-{index}"))
                 on:input=move |e| { shell.reset_completion(); shell.input.set(event_target_value(&e)); }
                 on:keydown=move |e| {
                     if e.is_composing() { return; }
@@ -253,17 +286,22 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
                         shell.interrupt();
                         return;
                     }
+                    // Ctrl+D: the end of what a program reading the terminal is given.
+                    if e.ctrl_key() && !e.alt_key() && !e.meta_key() && !e.shift_key() && e.key().eq_ignore_ascii_case("d") && shell.end_of_input() {
+                        e.prevent_default();
+                        return;
+                    }
                     match e.key().as_str() {
                         "Tab" => { e.prevent_default(); shell.complete(e.shift_key()); },
                         "Escape" => { e.prevent_default(); shell.cancel_completion(); },
-                        "ArrowRight" if shell.completion.get_untracked().is_some() => { e.prevent_default(); shell.accept_completion(); },
+                        "ArrowRight" if shell.completion.get_untracked().is_some_and(|s| s.selected.is_some()) => { e.prevent_default(); shell.accept_completion(); },
                         "ArrowUp" | "ArrowDown" if shell.completion.get_untracked().is_some() => { e.prevent_default(); shell.complete(e.key() == "ArrowUp"); },
                         "ArrowUp" | "ArrowDown" => { e.prevent_default(); shell.recall(e.key() == "ArrowUp"); },
                         _ => {},
                     }
                 }
                 node_ref=command_input/>
-            <span class="busy">{move || if shell.asking.get() { "Answer ↵" } else if shell.busy.get() { "Working..." } else { "↵" }}</span>
+            <span class="busy">{move || if shell.asking.get() { "Answer ↵" } else if shell.reading.get() { "Input ↵" } else if shell.busy.get() { "Working..." } else { "↵" }}</span>
         </form>
         // The keys a phone's keyboard lacks. Pressing one keeps the focus, and the keyboard, where
         // they are.
@@ -271,6 +309,7 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
             <button type="button" aria-label="Tab: complete" on:click=move |_| { focus_input(); shell.complete(false); }>"Tab"</button>
             <button type="button" aria-label="Previous command" on:click=move |_| { focus_input(); if shell.completion.get_untracked().is_some() { shell.complete(true) } else { shell.recall(true) } }>"↑"</button>
             <button type="button" aria-label="Next command" on:click=move |_| { focus_input(); if shell.completion.get_untracked().is_some() { shell.complete(false) } else { shell.recall(false) } }>"↓"</button>
+            <button type="button" aria-label="Ctrl+D: end of input" on:click=move |_| { focus_input(); shell.end_of_input(); }>"^D"</button>
             <button type="button" aria-label="Ctrl+C: stop" class="touch-stop" on:click=move |_| { focus_input(); shell.interrupt(); }>"^C"</button>
         </div>
         </section>
@@ -288,18 +327,9 @@ fn App() -> impl IntoView {
     let subtitle = branding["subtitle"].as_str().unwrap_or("").to_owned();
     let heading = branding["heading"].as_str().unwrap_or("").to_owned();
     let description = branding["description"].as_str().unwrap_or("").to_owned();
-    let layout = RwSignal::new(None::<bool>);
-    let files_visible = RwSignal::new(true);
-    let terminal_visible = RwSignal::new(true);
-    // Either pane may be hidden, never both: hiding one shows the other.
-    let toggle = move |this: RwSignal<bool>, other: RwSignal<bool>| {
-        if this.get_untracked() {
-            this.set(false);
-            other.set(true);
-        } else {
-            this.set(true);
-        }
-    };
+    // The compositor: the Files, the Terminal, the preview and the editor are its windows.
+    let desktop = desktop::Desktop::new();
+    let launcher = RwSignal::new(false);
     let account = Account {
         writable: RwSignal::new(false),
         username: RwSignal::new("guest".into()),
@@ -322,6 +352,9 @@ fn App() -> impl IntoView {
         .collect();
     first[0].log("Connected as guest. Access follows account and rwx permissions.\nEnter help or open a file.");
     let active = RwSignal::new(first[saved_active].id);
+    // The Files app keeps a directory of its own, from where the terminal starts.
+    let files = files::Files::new(account, first[saved_active].cwd.get_untracked());
+    files.refresh();
     let tabs = RwSignal::new(first);
     TABS.with(|t| *t.borrow_mut() = Some((tabs, active)));
     let current = Signal::derive(move || {
@@ -379,9 +412,12 @@ fn App() -> impl IntoView {
     }
     let listener = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(
         move |e: web_sys::CustomEvent| {
+            // Its account changed, or its socket opened again: what the page knew may be old.
+            sys::forget(true);
             let before = account.username.get_untracked();
             // Why, if it changed from elsewhere (app.js `changed`).
             let reason = e.detail().as_string();
+            files.refresh();
             spawn_local(async move {
                 for shell in tabs.get_untracked() {
                     if let Err(e) = shell.refresh().await {
@@ -417,22 +453,30 @@ fn App() -> impl IntoView {
         .add_event_listener_with_callback("terminal:changed", listener.as_ref().unchecked_ref())
         .unwrap();
     listener.forget();
-    // Directories others changed, which tabs showing them list again.
-    let remote = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
-        let dirs: Vec<String> = serde_wasm_bindgen::from_value(e.detail()).unwrap_or_default();
-        for shell in tabs.get_untracked() {
-            if dirs.contains(&shell.cwd.get_untracked()) {
-                spawn_local(async move {
-                    let _ = shell.refresh().await;
-                });
-            }
+    // What the kernel told of the directories this page watches: their answers go at once,
+    // and, a burst of changes later, tabs showing one list it again.
+    let told = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
+        let events: Vec<serde_json::Value> =
+            serde_wasm_bindgen::from_value(e.detail()).unwrap_or_default();
+        let dirs = sys::heard(&events);
+        CHANGED.with(|changed| changed.borrow_mut().extend(dirs));
+    });
+    window
+        .add_event_listener_with_callback("terminal:inotify", told.as_ref().unchecked_ref())
+        .unwrap();
+    told.forget();
+    let remote = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_: web_sys::CustomEvent| {
+        let dirs = CHANGED.with(|changed| std::mem::take(&mut *changed.borrow_mut()));
+        if dirs.contains(&files.cwd.get_untracked()) {
+            files.refresh();
         }
     });
     window
         .add_event_listener_with_callback("terminal-remote", remote.as_ref().unchecked_ref())
         .unwrap();
     remote.forget();
-    // Files dropped on the page upload in the active tab.
+    // Files dropped on the page upload in the active tab; dropped on the Files, into its
+    // directory.
     let dropped =
         Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
             current.get_untracked().upload_dropped(e.detail());
@@ -441,15 +485,27 @@ fn App() -> impl IntoView {
         .add_event_listener_with_callback("terminal-files", dropped.as_ref().unchecked_ref())
         .unwrap();
     dropped.forget();
+    let dropped_on_files =
+        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
+            files.dropped(e.detail());
+        });
+    window
+        .add_event_listener_with_callback(
+            "files-dropped",
+            dropped_on_files.as_ref().unchecked_ref(),
+        )
+        .unwrap();
+    dropped_on_files.forget();
     // Alt+T opens a tab, Alt+W closes it, Alt+1…9 switch; browsers keep Ctrl+T and Ctrl+W.
     let keys =
         Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
             if !e.alt_key() || e.ctrl_key() || e.meta_key() || e.is_composing() {
                 return;
             }
+            // A modal dialog (a password asked) has the keyboard; windows do not.
             let dialog = web_sys::window()
                 .and_then(|w| w.document())
-                .and_then(|d| d.query_selector("dialog[open]").ok().flatten());
+                .and_then(|d| d.query_selector("dialog[open]:modal").ok().flatten());
             if dialog.is_some() {
                 return;
             }
@@ -477,57 +533,50 @@ fn App() -> impl IntoView {
         .unwrap();
     keys.forget();
     let numbered = move || tabs.get().into_iter().enumerate().collect::<Vec<_>>();
+    // The dock: the launcher, then each app, shown, focused, or to be opened.
+    let dock_item = move |id: &'static str, title: &'static str, icon: &'static str| {
+        let shown = move || {
+            desktop
+                .windows
+                .with(|w| w.iter().any(|w| w.id == id && w.shown()))
+        };
+        let open = move || {
+            desktop
+                .windows
+                .with(|w| w.iter().any(|w| w.id == id && w.open))
+        };
+        let focused = move || desktop.focused.get() == Some(id) && shown();
+        view! {
+            <button type="button" class="dock-item" class:dock-open=open class:dock-focused=focused
+                aria-label=title title=title aria-pressed=move || focused().to_string()
+                on:click=move |_| desktop.toggle(id)>
+                <span class="dock-icon" aria-hidden="true">{icon}</span><span class="dock-label">{title}</span>
+            </button>
+        }
+    };
+    let launch = move |id: &'static str| {
+        launcher.set(false);
+        desktop.show(id);
+    };
     view! {
-        <main class="terminal-shell">
-            <header><div class="wordmark"><span class="signal"></span>{title}<span class="subtitle">{subtitle}</span></div>
+        <main class="desktop">
+            <header class="topbar"><div class="wordmark"><span class="signal"></span>{title}<span class="subtitle">{subtitle}</span></div>
                 <button class="lock" on:click=move |_| current.get_untracked().run(if account.writable.get_untracked() { "logout".into() } else { "login".into() })>
                     // Kept to one line: a long name shortens, the action stays.
                     <span class="lock-name">{move || if account.writable.get() { format!("● {}", account.username.get()) } else { "○ guest".into() }}</span>
                     <span class="lock-action">{move || if account.writable.get() { " · Sign out" } else { " · Sign in" }}</span>
                 </button>
             </header>
-            <section class="intro"><span class="eyebrow">"PUBLIC ARCHIVE / 001"</span><h1>{heading}</h1><p>{description}</p></section>
-            <section class="workspace" aria-label="File terminal"
-                data-files=move || if files_visible.get() { "visible" } else { "hidden" }
-                data-terminal=move || if terminal_visible.get() { "visible" } else { "hidden" }
-                data-layout=move || match layout.get() { Some(true) => "columns", Some(false) => "rows", None => "auto" }>
-                <div class="workspace-toolbar"><div class="pane-toggles">
-                    <button class="files-toggle" aria-label="Toggle file panel" aria-expanded=move || files_visible.get().to_string() on:click=move |_| toggle(files_visible, terminal_visible)>{move || if files_visible.get() { "◂ Hide files" } else { "▸ Show files" }}</button>
-                    <button class="terminal-toggle" aria-label="Toggle terminal" aria-expanded=move || terminal_visible.get().to_string() on:click=move |_| toggle(terminal_visible, files_visible)>{move || if terminal_visible.get() { "◂ Hide terminal" } else { "▸ Show terminal" }}</button>
-                </div>
-                    <button class="layout-toggle" aria-label="Toggle workspace layout" title="Toggle workspace layout"
-                        on:click=move |_| {
-                            let horizontal = layout.get_untracked().unwrap_or_else(|| {
-                                web_sys::window().and_then(|w| w.inner_width().ok()).and_then(|v| v.as_f64()).unwrap_or(0.0) >= 900.0
-                            });
-                            layout.set(Some(!horizontal));
-                        }>
-                        <span class="layout-to-rows">"▤ Stacked layout"</span>
-                        <span class="layout-to-columns">"◫ Side-by-side layout"</span>
-                    </button>
-                </div>
-                <div class="workspace-panes">
-                <section class="file-panel" aria-label="File manager">
-                <div class="directory-bar"><span>{move || current.get().cwd.get()}</span>
-                    <button on:click=move |_| current.get_untracked().run_from_panel("upload".into())>"↑ Upload files"</button></div>
-                <p class="file-notice" role="status">{move || current.get().notice.get()}</p>
-                <div class="files" aria-label="Current directory">
-                    <Show when=move || current.get().cwd.get() != "/"><button class="file" on:click=move |_| current.get_untracked().run_from_panel("cd ..".into())><span class="file-kind">{file_icon("directory", true)}</span><span>"../"</span></button></Show>
-                    {move || current.get().entries.get().into_iter().map(|entry| {
-                        let command = format!("{} \"{}\"", if entry.directory { "cd" } else { "open" }, entry.path.replace('"', "\\\""));
-                        let size = if entry.directory { String::new() } else { upload_progress(&entry).unwrap_or_else(|| format!("{:.1} KB", entry.size as f64 / 1000.0)) };
-                        let title = format!("{} {}:{}{}", entry.mode_line(), entry.owner, entry.group, entry.link.as_ref().map(|t| format!(" -> {t}")).unwrap_or_default());
-                        let linked = entry.link.is_some();
-                        // What the account may not open shows dimmed, and says why when clicked.
-                        let denied = entry.denied;
-                        let refusal = denied.then(|| format!("Permission denied: {} is {} {}:{}", entry.name, entry.mode_line().trim_end(), entry.owner, entry.group));
-                        let title = if denied { format!("{title} · permission denied") } else { title };
-                        view! { <button class="file" class:link=linked class:denied=denied aria-disabled=denied.then_some("true") data-kind=if entry.directory { "directory".to_string() } else { entry.kind.clone() } title=title on:click=move |_| { let shell = current.get_untracked(); match &refusal { Some(refusal) => shell.notice.set(refusal.clone()), None => shell.run_from_panel(command.clone()) } }><span class="file-kind">{file_icon(&entry.kind, entry.directory)}</span><span class="filename"><span class="filename-text">{entry.name}{if entry.directory { "/" } else { "" }}</span></span><span class="file-size">{if linked { "→".to_string() } else { size }}</span></button> }
-                    }).collect_view()}
-                    <p class="directory-error" role="status">{move || current.get().directory_error.get()}</p>
-                    <Show when=move || current.get().entries.get().is_empty() && current.get().directory_error.get().is_empty()><p class="empty">"This directory is empty. Drop files here or use mkdir to create a directory."</p></Show>
-                </div>
-                </section>
+            <div class="desktop-area">
+            // The wallpaper: what the site says of itself.
+            <section class="intro wallpaper"><span class="eyebrow">"PUBLIC ARCHIVE / 001"</span><h1>{heading}</h1><p>{description}</p></section>
+            <section class="window" id="window-files" data-window="files" aria-label="Files window" tabindex="-1">
+                <div class="window-bar" data-window-bar><span class="window-title">{file_icon("directory", true)}"Files"</span>{desktop::controls("files", "Files")}</div>
+                {files::view(files)}
+                {desktop::handles()}
+            </section>
+            <section class="window" id="window-terminal" data-window="terminal" aria-label="Terminal window">
+                <div class="window-bar" data-window-bar><span class="window-title"><span class="window-glyph" aria-hidden="true">">_"</span>{move || format!("Terminal · {}", current.get().cwd.get())}</span>{desktop::controls("terminal", "Terminal")}</div>
                 <div class="terminal-tabs">
                     <div class="tab-bar" role="tablist" aria-label="Terminal tabs">
                         <For each=numbered key=|(index, shell)| (*index, shell.id) let:item>
@@ -552,9 +601,26 @@ fn App() -> impl IntoView {
                         {terminal_view(shell, active)}
                     </For>
                 </div>
-                </div>
+                {desktop::handles()}
             </section>
-            <footer><span>"TAB / SHIFT+TAB complete   ↑↓ history   | pipes   ALT+T new tab   Drop files to upload"</span><span>"ACCESS: USER / GROUP / OTHER"</span></footer>
+            </div>
+            <nav class="dock" aria-label="Dock">
+                <button type="button" class="dock-item dock-launcher" aria-label="Applications" title="Applications" aria-expanded=move || launcher.get().to_string() on:click=move |_| launcher.update(|open| *open = !*open)>
+                    <span class="dock-icon" aria-hidden="true">"⋮⋮"</span>
+                </button>
+                {dock_item("terminal", "Terminal", ">_")}
+                {dock_item("files", "Files", "▤")}
+                <Show when=move || desktop.windows.with(|w| w.iter().any(|w| w.id == "viewer" && w.open))>{dock_item("viewer", "Preview", "◫")}</Show>
+                <Show when=move || desktop.windows.with(|w| w.iter().any(|w| w.id == "editor" && w.open))>{dock_item("editor", "Editor", "✎")}</Show>
+                <Show when=move || launcher.get()>
+                    <div class="launcher" role="menu" aria-label="Applications">
+                        <button type="button" role="menuitem" on:click=move |_| launch("terminal")><span aria-hidden="true">">_"</span>"Terminal"</button>
+                        <button type="button" role="menuitem" on:click=move |_| launch("files")><span aria-hidden="true">"▤"</span>"Files"</button>
+                        <button type="button" role="menuitem" on:click=move |_| { launcher.set(false); current.get_untracked().run("man".into()); }><span aria-hidden="true">"?"</span>"Manual"</button>
+                        <button type="button" role="menuitem" on:click=move |_| { launcher.set(false); desktop.show("files"); files.choose(); }><span aria-hidden="true">"↑"</span>"Upload files"</button>
+                    </div>
+                </Show>
+            </nav>
         </main>
     }
 }
@@ -572,5 +638,8 @@ pub fn start() {
         .unwrap();
     root.set_text_content(None);
     leptos::mount::mount_to(root.unchecked_into(), App).forget();
+    if let Some(desktop) = desktop::desktop() {
+        desktop::run(desktop);
+    }
     focus_input();
 }
