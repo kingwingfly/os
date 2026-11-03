@@ -147,9 +147,13 @@ async function dispatch(message) {
     case 'namespace': return kernel.namespace();
     case 'exec': return exec(args, tab);
     case 'execs': return execs(args, tab);
+    // A process's own execve: its image replaced, its pid, credentials and descriptors kept.
+    case 'reexec': return JSON.parse(await kernel.reexec(args.pid, args.path, JSON.stringify(args.argv ?? []), JSON.stringify(args.env ?? []), args.cwd ?? '/', tab ?? ''));
     case 'fork': return JSON.parse(await kernel.fork(args.pid));
     case 'exit': return JSON.parse(await kernel.exit(args.pid, args.status ?? 0, args.signal ?? undefined));
     case 'wait': return JSON.parse(await kernel.wait(args.pid));
+    // wait4 of a process for its children (`pid`, or any).
+    case 'waitchild': return JSON.parse(await kernel.waitchild(args.ppid, args.pid ?? undefined));
     case 'kill': return JSON.parse(await kernel.kill(args.pid, args.signal ?? undefined));
     case 'poll': return JSON.parse(await kernel.poll(JSON.stringify(args.pids ?? [])));
     case 'getpid': return JSON.parse(await kernel.getpid(args.pid));
@@ -176,7 +180,7 @@ async function handle(port, message) {
     await boot();
     const value = await serially(() => dispatch(message));
     // A wait answers once the machine heard of it, so that /proc agrees.
-    if (message.type === 'wait') await heard();
+    if (message.type === 'wait' || message.type === 'waitchild') await heard();
     port.postMessage({ v: VERSION, id: message.id, ok: value });
   } catch (error) {
     port.postMessage({ v: VERSION, id: message.id, err: failure(error) });

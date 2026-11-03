@@ -64,6 +64,10 @@ await build({ absWorkingDir: root, entryPoints: { bridge: 'web/app.js' },
 // The WASI engine's process, a Worker of its own (web/wasi/process.js), and /usr/bin's binary:
 // uutils' coreutils, built for wasm32-wasip1 (rustup target add wasm32-wasip1).
 await build({ absWorkingDir: root, entryPoints: { 'wasi-process': 'web/wasi/process.js' }, bundle: true, format: 'iife', outdir: out, minify: true });
+// The loader's asyncify, a module Worker (web/kernel/asyncify-worker.js), and binaryen, which it
+// loads only when an image that forks is first run.
+await build({ absWorkingDir: root, entryPoints: { 'wasi-asyncify': 'web/kernel/asyncify-worker.js' }, bundle: true, format: 'esm', outdir: out, minify: true, external: ['/binaryen.js'] });
+await copy('node_modules/binaryen/index.js', join(out, 'binaryen.js'));
 // The client kernel (crates/client-kernel), a classic SharedWorker: no-modules wasm-bindgen,
 // imported by web/kernel/client.js, with the page's protocol module bundled into the bridge.
 run('cargo', ['build', '-p', 'terminal-worker-client-kernel', '--target', 'wasm32-unknown-unknown', '--release']);

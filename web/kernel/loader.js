@@ -8,14 +8,23 @@
 // A load is what instantiation needs: the compiled module, and, for a module that imports its
 // memory (WASIX's do, as env.memory), the memory's declared limits and shared flag, so every
 // process creates one of exactly that type. A module of its own exports `memory`.
+//
+// An image that imports WASIX's fork, setjmp or longjmp and was not built for them is given
+// binaryen's asyncify (web/kernel/asyncify.js) as it loads, off the page, once per content: fork
+// must work for any wasm (issue #20). What it made is kept in the browser's cache, by content,
+// for the next page.
 
 // How many modules stay compiled at once; the oldest goes past that (LRU).
 const CACHE_MAX = 8;
 // The import namespaces a process may ask for (web/wasi/process.js, the WASIX runtime): WASI
-// preview 1 and the kernel's own terminal.sys; WASIX, stubbed until its runtime lands (its
-// calls answer NOSYS). env's memory, which WASIX modules import.
+// preview 1 and the kernel's own terminal.sys; WASIX's (what a process here has no words for,
+// threads and sockets, answers ENOSYS). env's memory, which WASIX modules import.
 const NAMESPACES = new Set(['wasi_snapshot_preview1', 'terminal', 'wasix_32v1']);
 const MEMORY = { module: 'env', name: 'memory' };
+// The imports that unwind the stack, which asyncify is for.
+const UNWINDS = new Set(['proc_fork', 'stack_checkpoint', 'stack_restore']);
+// The browser's cache of images made forkable, by content; its name says how they were made.
+const FORKABLE = 'tw-asyncify-1';
 
 const compiled = new Map();
 // For the tests: how many modules were really compiled (a cache hit compiles none).
@@ -45,6 +54,7 @@ export function load(image) {
 }
 
 async function compile(image) {
+  let module;
   const response = image.asset
     ? await fetch(image.asset)
     : await fetch(`/api/file?token=${encodeURIComponent(image.token_read)}`, { headers: { 'X-Process-Token': image.token } });
@@ -53,7 +63,7 @@ async function compile(image) {
   // A module that imports its memory names its type before anything runs, so a copy of the
   // response serves that prefix while the compiler reads the original.
   const streamed = response.headers.get('Content-Type') === 'application/wasm';
-  let module, prefix;
+  let prefix;
   if (streamed) {
     prefix = response.clone();
     module = await WebAssembly.compileStreaming(response).catch(error => { throw formatError(error); });
@@ -77,8 +87,50 @@ async function compile(image) {
     prefix.body?.cancel().catch(() => { /* the compiler is done with it */ });
   }
   validateExports(module, memoryImport);
+  const unwinding = imports.filter(entry => entry.module === 'wasix_32v1' && UNWINDS.has(entry.name)).map(entry => `${entry.module}.${entry.name}`);
+  const built = WebAssembly.Module.exports(module).some(entry => entry.name === 'asyncify_start_unwind');
+  if (unwinding.length && !built) module = await forkable(image, unwinding);
   stats.compiled++;
   return { module, memory };
+}
+
+// The image made forkable: asyncify's pass, in a Worker, its result kept by content.
+async function forkable(image, unwinding) {
+  const key = `/asyncify/${encodeURIComponent(image.version ?? image.asset)}`;
+  const cache = await globalThis.caches?.open(FORKABLE).catch(() => null);
+  const kept = await cache?.match(key).catch(() => null);
+  if (kept) return WebAssembly.compile(await kept.arrayBuffer()).catch(error => { throw formatError(error); });
+  const response = image.asset
+    ? await fetch(image.asset)
+    : await fetch(`/api/file?token=${encodeURIComponent(image.token_read)}`, { headers: { 'X-Process-Token': image.token } });
+  if (!response.ok) throw await refusal(response);
+  const bytes = await transform(await response.arrayBuffer(), unwinding).catch(error => { throw formatError(error); });
+  const module = await WebAssembly.compile(bytes).catch(error => { throw formatError(error); });
+  await cache?.put(key, new Response(bytes, { headers: { 'Content-Type': 'application/wasm' } })).catch(() => {});
+  return module;
+}
+let asyncifier, asked = 0;
+const answers = new Map();
+function transform(bytes, imports) {
+  if (!asyncifier) {
+    asyncifier = new Worker('/wasi-asyncify.js', { type: 'module' });
+    asyncifier.onmessage = ({ data }) => {
+      const answer = answers.get(data.id);
+      answers.delete(data.id);
+      if (data.error) answer?.reject(new Error(data.error));
+      else answer?.resolve(data.bytes);
+    };
+    asyncifier.onerror = event => {
+      for (const answer of answers.values()) answer.reject(new Error(event.message || 'asyncify failed'));
+      answers.clear();
+      asyncifier = undefined;
+    };
+  }
+  const id = ++asked;
+  return new Promise((resolve, reject) => {
+    answers.set(id, { resolve, reject });
+    asyncifier.postMessage({ id, bytes, imports }, [bytes]);
+  });
 }
 
 // What may not run, said as the kernel would: ENOEXEC, with what was wrong. The caller names

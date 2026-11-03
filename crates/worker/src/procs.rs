@@ -122,12 +122,16 @@ const COLUMNS: &str = "ns, pid, ppid, uid, gid, groups, umask, cgroup, path, arg
 #[derive(Clone, Debug)]
 pub struct Begun {
     pub pid: u32,
-    /// The account of the process it replaces, if it replaces one: only that account's caller,
-    /// or root, may.
+    /// The account of the process it replaces, if it replaces one.
     pub replacing: Option<u32>,
     /// The token hash the replaced image held, which dies with it: none while a process forked
     /// from it (or that forked it) still holds it.
     pub old: Option<String>,
+    /// The token hash the replaced process proved itself with: the credentials the new image
+    /// keeps, and the descriptors it keeps open.
+    pub current: Option<String>,
+    /// The cgroup the replaced process is in, which it stays in.
+    pub cgroup: Option<String>,
 }
 
 /// The credentials an execve snapshotted (the authority's answer).
@@ -254,11 +258,14 @@ impl Db {
         )
     }
     /// execve(2)'s first half, before the authority checks the image: its arguments' sizes,
-    /// its cgroup, and its pid, a new one or the process it replaces (one just forked).
+    /// its cgroup, and its pid, a new one or the process it replaces, which proves itself by
+    /// its token (`token`): only a process replaces itself, as only it can call execve.
+    #[allow(clippy::too_many_arguments)]
     pub fn exec_begin(
         &mut self,
         ns: &str,
         pid: Option<u32>,
+        token: Option<&str>,
         argv: &[String],
         env: &[String],
         cgroup: Option<&str>,
@@ -286,15 +293,18 @@ impl Db {
         }
         match pid {
             Some(pid) => {
-                let existing = self.process(ns, pid).ok_or(abi::Errno::ESRCH)?;
                 // Init is not the caller's to take over.
-                if existing.zombie() || pid == INIT {
-                    return Err(if pid == INIT {
-                        abi::Errno::EPERM.into()
-                    } else {
-                        abi::Errno::ESRCH.into()
-                    });
+                if pid == INIT {
+                    return Err(abi::Errno::EPERM.into());
                 }
+                self.process(ns, pid)
+                    .filter(|existing| !existing.zombie())
+                    .ok_or(abi::Errno::ESRCH)?;
+                let existing = token
+                    .and_then(|token| self.process_token(token, Some(pid), ns))
+                    .ok_or_else(|| {
+                        Error::because(abi::Errno::EPERM, "only a process replaces its own image")
+                    })?;
                 // The token the image held dies with it, unless a process forked from it, or
                 // forked it, holds it still.
                 let token = self.token_of(ns, pid).unwrap_or_default();
@@ -304,13 +314,17 @@ impl Db {
                 Ok(Begun {
                     pid,
                     replacing: Some(existing.uid),
-                    old: (!shared).then_some(token),
+                    old: (!shared).then(|| token.clone()),
+                    current: Some(token),
+                    cgroup: Some(existing.cgroup),
                 })
             }
             None => Ok(Begun {
                 pid: self.new_pid(ns)?,
                 replacing: None,
                 old: None,
+                current: None,
+                cgroup: None,
             }),
         }
     }

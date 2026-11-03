@@ -31,6 +31,19 @@ pub struct Credential {
     pub gid: u32,
     pub groups: String,
     pub umask: u16,
+    /// The key its process's descriptors are owned by: its own exec's (`owner`), or, for an
+    /// image a process replaced its own with, the one that process had, as execve keeps a
+    /// process's open files.
+    #[serde(rename = "owner")]
+    lineage: String,
+}
+
+/// A credential's descriptors' owner, in SQL: an exec made before credentials named it owns
+/// them by its own key (`owner`).
+const OWNER: &str = "COALESCE(owner, ns || ' ' || pid || ' ' || substr(token, 1, 16))";
+/// The columns a `Credential` is read from.
+fn columns() -> String {
+    format!("token, ns, pid, uid, gid, groups, umask, {OWNER} AS owner")
 }
 impl Credential {
     pub fn identity(&self) -> Identity {
@@ -41,9 +54,15 @@ impl Credential {
                 .unwrap_or_else(|_| BTreeSet::from([self.gid])),
         }
     }
-    /// The key its descriptors are owned by (fds.rs): its process's, and its forks', but not
-    /// those of another image the process executed later while a fork kept this one.
+    /// The key its descriptors are owned by (fds.rs): its process's and its forks', and those
+    /// of the images they replace their own with, which keep them open. A process whose image
+    /// another of the line replaced, while a fork kept this one, shares them: they hold the
+    /// same credentials, which an execve does not change.
     pub fn owner(&self) -> String {
+        self.lineage.clone()
+    }
+    /// The key of what this exec alone owns: its image's descriptor, which closes with it.
+    pub fn image(&self) -> String {
         owner(&self.ns, self.pid, &self.token)
     }
 }
@@ -57,21 +76,44 @@ fn owner(ns: &str, pid: u32, token: &str) -> String {
 impl Db {
     /// The credentials the token `token` carries, in namespace `ns`, while it is not revoked.
     pub fn credential(&self, token: &str, ns: &str) -> Option<Credential> {
+        self.credential_of(&auth::token_hash(token), ns)
+    }
+    /// The credentials whose token's hash is `hash`, in `ns`.
+    fn credential_of(&self, hash: &str, ns: &str) -> Option<Credential> {
         self.rows::<Credential>(
-            "SELECT token, ns, pid, uid, gid, groups, umask FROM credentials WHERE token = ? AND ns = ?",
-            vec![text(&auth::token_hash(token)), text(ns)],
+            &format!(
+                "SELECT {} FROM credentials WHERE token = ? AND ns = ?",
+                columns()
+            ),
+            vec![text(hash), text(ns)],
         )
         .into_iter()
         .next()
     }
-    /// Revoke the credentials whose token's hash is `hash`: what its processes opened closes.
+    /// Revoke the credentials whose token's hash is `hash`: its image's descriptor closes, and
+    /// what its processes opened, once no image of theirs holds the credentials still.
     pub fn revoke(&mut self, ns: &str, hash: &str) {
         let found = self.rows::<Credential>(
-            "DELETE FROM credentials WHERE token = ? AND ns = ? RETURNING token, ns, pid, uid, gid, groups, umask",
+            &format!(
+                "DELETE FROM credentials WHERE token = ? AND ns = ? RETURNING {}",
+                columns()
+            ),
             vec![text(hash), text(ns)],
         );
         for credential in found {
-            self.close_proc_fds(&credential.owner());
+            self.close_proc_fds(&credential.image());
+            let held = !self
+                .rows::<Credential>(
+                    &format!(
+                        "SELECT {} FROM credentials WHERE ns = ? AND {OWNER} = ? LIMIT 1",
+                        columns()
+                    ),
+                    vec![text(ns), text(&credential.owner())],
+                )
+                .is_empty();
+            if !held {
+                self.close_proc_fds(&credential.owner());
+            }
         }
     }
 }
@@ -90,6 +132,10 @@ struct Asked {
     /// The hash of the token the replaced image held, which dies with it.
     #[serde(default)]
     old: Option<String>,
+    /// The hash of the token the replacing process proved itself with (the registry checked
+    /// it): the credentials the new image keeps, and the descriptors it keeps open.
+    #[serde(default)]
+    current: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -228,10 +274,11 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
     }))
 }
 
-/// execve(2), as the authority decides it: the caller (root under sudo, if it may), the image
-/// (a regular, whole file it may execute: X, not R), how the loader reads it (the build's asset
-/// for /usr, a descriptor of the process's own for an uploaded one), and the credentials its
-/// process carries from now on.
+/// execve(2), as the authority decides it: the caller (root under sudo, if it may) for a new
+/// process, the process's own credentials for one replacing its image; the image (a regular,
+/// whole file it may execute: X, not R); how the loader reads it (the build's asset for /usr, a
+/// descriptor of the process's own for an uploaded one); and the credentials its process
+/// carries from now on.
 #[allow(clippy::too_many_arguments)]
 fn exec(
     db: &mut Db,
@@ -243,11 +290,21 @@ fn exec(
     asked: Asked,
     now: u64,
 ) -> std::result::Result<Value, Error> {
-    let cred = crate::sys::caller(db, key, guest, sudo)?;
+    // A process replacing its image keeps its credentials, as execve keeps them (there is no
+    // setuid), and its open descriptors; a new process is the caller's.
+    let current = match &asked.current {
+        Some(hash) => Some(db.credential_of(hash, ns).ok_or(Errno::ESRCH)?),
+        None => None,
+    };
+    let (cred, umask) = match &current {
+        Some(current) => (current.identity(), current.umask),
+        None => (crate::sys::caller(db, key, guest, sudo)?, umask),
+    };
     // Only one's own process may be replaced (root's any).
-    if asked
-        .replacing
-        .is_some_and(|uid| cred.id != 0 && uid != cred.id)
+    if current.is_none()
+        && asked
+            .replacing
+            .is_some_and(|uid| cred.id != 0 && uid != cred.id)
     {
         return Err(Errno::EPERM.into());
     }
@@ -283,13 +340,11 @@ fn exec(
             "no session to keep descriptors",
         ));
     }
-    // The image the process ran before is replaced: its credentials, descriptor and read token
-    // die with the exec, not only when the process ends.
-    if let Some(old) = &asked.old {
-        db.revoke(ns, old);
-    }
+    let lineage = current
+        .as_ref()
+        .map_or_else(|| owner(ns, asked.pid, &asked.token), Credential::owner);
     db.run(
-        "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
         vec![
             text(&asked.token),
             text(ns),
@@ -299,8 +354,15 @@ fn exec(
             text(&serde_json::to_string(&cred.groups).unwrap_or_default()),
             int(umask),
             int(now),
+            text(&lineage),
         ],
     );
+    // The image the process ran before is replaced: its token and its image's descriptor die
+    // with the exec, not only when the process ends; what it opened stays open for the new one.
+    if let Some(old) = &asked.old {
+        db.revoke(ns, old);
+    }
+    // The new image's own descriptor is its exec's alone.
     let owner = owner(ns, asked.pid, &asked.token);
     let (fd, token_read, size) = match (asset, sid) {
         (None, Some(sid)) => {
