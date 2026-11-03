@@ -137,11 +137,13 @@ thread_local! {
     static TOLD: RefCell<Vec<(Told, serde_json::Value)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Whose pages hear something: an account's signed in as it, or a session's (auth::sid).
+/// Whose pages hear something: an account's signed in as it, a session's (auth::sid), or a
+/// browser's process namespace's (`Db::namespace`), whose tabs host its processes.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Told {
     Account(u32),
     Session(String),
+    Namespace(String),
 }
 
 /// What committed transactions had for pages to hear since this was last asked.

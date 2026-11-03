@@ -5,13 +5,14 @@
 //! still runs what has not moved yet (cp, accounts, archives).
 
 mod commands;
+mod jobs;
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use abi::Call;
 use futures::channel::oneshot;
-use futures::future::LocalBoxFuture;
+use futures::future::{Either, LocalBoxFuture, select};
 use futures::{FutureExt, StreamExt};
 use leptos::prelude::*;
 use serde_json::{Value, json};
@@ -142,11 +143,28 @@ pub struct Shell {
     terminal: StoredValue<Option<JsValue>, LocalStorage>,
     /// ... which it waits on now.
     pub reading: RwSignal<bool>,
+    /// The terminal's jobs: pipelines run with `&`, or stopped with Ctrl+Z (shell/jobs.rs) ...
+    jobs: StoredValue<Vec<jobs::Job>, LocalStorage>,
+    /// ... and the run in the foreground, which Ctrl+Z stops.
+    foreground: StoredValue<Option<jobs::Foreground>, LocalStorage>,
+    /// The line running now, which names the job it may become.
+    line: StoredValue<String>,
 }
 
 /// What a pipeline of processes showed in the transcript as they wrote: the line of the last's
 /// output, how many lines it shows (up to [`SHOWN`]) and how many more there were; and the
 /// part of an error line written so far.
+/// A pipeline of processes started (`Shell::launch`): what to await, the handlers that must
+/// outlive it, and what it shares with the job it may become.
+struct Launched {
+    exec: JsFuture,
+    handlers: Box<dyn std::any::Any>,
+    run: jobs::Run,
+    shown: Rc<RefCell<Shown>>,
+    names: Vec<String>,
+    execed: bool,
+}
+
 #[derive(Default)]
 struct Shown {
     line: Option<RwSignal<String>>,
@@ -391,6 +409,9 @@ impl Shell {
             asking: RwSignal::new(false),
             terminal: StoredValue::new_local(None),
             reading: RwSignal::new(false),
+            jobs: StoredValue::new_local(Vec::new()),
+            foreground: StoredValue::new_local(None),
+            line: StoredValue::new(String::new()),
         }
     }
     fn push(self, line: LogLine) {
@@ -668,7 +689,14 @@ impl Shell {
         use abi::O_APPEND;
         use userland::procs::{Descriptor, descriptors, processes};
         let sys = crate::sys::HttpSys::default();
-        let jobs = processes(&sys).await.unwrap_or_default();
+        // The archive processes (zip, unzip, tar, faststart), by their long ids: the numbered
+        // processes of the browser's namespace are ps's to list, and the terminal's jobs its own.
+        let jobs: Vec<_> = processes(&sys)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|process| !process.pid.bytes().all(|b| b.is_ascii_digit()))
+            .collect();
         // Uploads and recordings: descriptors writing files, not a process's standard input
         // (/proc/PID/fd/0) nor a device.
         let fds: Vec<Descriptor> = descriptors(&sys)
@@ -682,7 +710,12 @@ impl Shell {
         let recording = |fd: &Descriptor| fd.flags & O_APPEND != 0;
         match cancel {
             None => {
-                let mut text = String::new();
+                // The terminal's own jobs first, as a shell lists them.
+                let mut text: String = self
+                    .job_lines()
+                    .into_iter()
+                    .map(|line| line + "\n")
+                    .collect();
                 for job in &jobs {
                     text.push_str(&format!(
                         "{}  {:<10} {}  {}/{}\n",
@@ -974,13 +1007,135 @@ impl Shell {
         self.processes(vec![stage], stdin, false, piped, sudo, None)
             .await
     }
-    /// Run `stages`, each a utility of coreutils and its arguments, as a pipeline of processes
-    /// (web/wasi/exec.mjs), given `stdin`, or reading the terminal if `terminal` says so: the
-    /// lines typed then go to the first, and Ctrl+D ends its reads. What the last writes goes on
-    /// if `piped`, of which its reader takes `enough` lines, if it says; to the transcript
-    /// otherwise, as it writes it. What any writes to standard error goes to the transcript, a
-    /// line at a time. Ctrl+C kills them.
+    /// Run `stages`, each a utility of coreutils and its arguments, or an image by its path, as
+    /// a pipeline of processes (web/wasi/exec.mjs), given `stdin`, or reading the terminal if
+    /// `terminal` says so: the lines typed then go to the first, and Ctrl+D ends its reads. What
+    /// the last writes goes on if `piped`, of which its reader takes `enough` lines, if it says;
+    /// to the transcript otherwise, as it writes it. What any writes to standard error goes to
+    /// the transcript, a line at a time. Ctrl+C kills them; Ctrl+Z stops them, and they are a
+    /// job of the terminal's from then on (shell/jobs.rs).
     pub async fn processes(
+        self,
+        stages: Vec<(Option<String>, Vec<String>)>,
+        stdin: Option<String>,
+        terminal: bool,
+        piped: bool,
+        sudo: bool,
+        enough: Option<usize>,
+    ) -> Result<Output, String> {
+        let launched = self.launch(stages, stdin, terminal, piped, sudo, enough);
+        let Launched {
+            exec,
+            handlers,
+            run,
+            shown,
+            names,
+            execed,
+        } = launched;
+        let (stopping, stopped) = oneshot::channel();
+        self.foreground.set_value(Some(jobs::Foreground {
+            group: run.group.borrow().clone(),
+            stopped: stopping,
+        }));
+        let exited = match select(exec, stopped).await {
+            Either::Left((exited, _)) => exited,
+            Either::Right((Err(_), exec)) => exec.await,
+            // Ctrl+Z: a job, stopped, which goes on, and ends, apart from this line.
+            Either::Right((Ok(()), exec)) => {
+                run.foreground.set(false);
+                let reading = self.reading.get_untracked();
+                self.terminal.set_value(None);
+                self.reading.set(false);
+                let command = self.line.get_value();
+                let number = self.add_job(command.clone(), &run, jobs::State::Stopped, reading);
+                self.log(format!("[{number}]+  {:<24}{command}", "Stopped"));
+                spawn_local(async move {
+                    let exited = exec.await;
+                    drop(handlers);
+                    let status = self
+                        .ended_run(exited, shown, names, execed)
+                        .await
+                        .map_or(1, |(status, _)| status);
+                    self.job_ended(number, status);
+                });
+                return Ok(Output {
+                    failed: true,
+                    ..Default::default()
+                });
+            }
+        };
+        self.foreground.set_value(None);
+        self.terminal.set_value(None);
+        self.reading.set(false);
+        drop(handlers);
+        let (status, stdout) = self.ended_run(exited, shown, names, execed).await?;
+        Ok(Output {
+            stdout,
+            failed: status != 0,
+            ..Default::default()
+        })
+    }
+    /// Run `line`, ended with `&`, as a job in the background: a pipeline of /usr/bin's programs,
+    /// or uploaded ones, which reads nothing of the terminal's and whose output still shows; the
+    /// line says `[N] PID`, and the job's end says how it ended.
+    async fn start_job(self, line: String) {
+        let stages = match grammar::words(&line) {
+            Ok(stages) => stages,
+            Err(error) => return self.error(error),
+        };
+        let mut run = Vec::new();
+        for words in stages {
+            let args = match self.expand(words).await {
+                Ok(args) => args,
+                Err(error) => return self.error(error),
+            };
+            match process(&self, &args) {
+                Some(stage) => run.push(stage),
+                None => {
+                    let name = args.first().cloned().unwrap_or_default();
+                    return self.error(format!(
+                        "{name}: & runs programs of /usr/bin, or uploaded ones, in the background; {name} is the terminal's own"
+                    ));
+                }
+            }
+        }
+        let Launched {
+            exec,
+            handlers,
+            run,
+            shown,
+            names,
+            execed,
+        } = self.launch(run, Some(String::new()), false, false, false, None);
+        run.foreground.set(false);
+        let number = self.add_job(line, &run, jobs::State::Running, false);
+        let said = RwSignal::new(format!("[{number}]"));
+        self.push(LogLine::Live(said));
+        spawn_local(async move {
+            // `[N] PID`, the last's, once its processes have pids.
+            let mut exec = exec;
+            let exited = loop {
+                let pids = jobs::pids(&run.group.borrow());
+                if let Some(pid) = pids.last() {
+                    said.set(format!("[{number}] {pid}"));
+                    break exec.await;
+                }
+                match select(exec, Box::pin(sleep(30))).await {
+                    Either::Left((exited, _)) => break exited,
+                    Either::Right((_, rest)) => exec = rest,
+                }
+            };
+            drop(handlers);
+            let status = self
+                .ended_run(exited, shown, names, execed)
+                .await
+                .map_or(1, |(status, _)| status);
+            self.job_ended(number, status);
+        });
+    }
+    /// Start the pipeline `stages` (as [`Shell::processes`] says): what to await, the handlers
+    /// that must outlive it, and what it shares with the job it may become.
+    fn launch(
         self,
         mut stages: Vec<(Option<String>, Vec<String>)>,
         stdin: Option<String>,
@@ -988,7 +1143,7 @@ impl Shell {
         piped: bool,
         sudo: bool,
         enough: Option<usize>,
-    ) -> Result<Output, String> {
+    ) -> Launched {
         for (path, args) in &mut stages {
             if path.is_none() {
                 args[0] = cli_bin::program(&args[0]).unwrap_or_default().to_string();
@@ -1017,8 +1172,39 @@ impl Shell {
         if let Some(enough) = enough {
             set(&options, "enough", (enough as f64).into());
         }
-        let cancelled = Closure::<dyn Fn() -> bool>::new(move || self.cancelled());
+        // A run may become a job: it shares its group, the terminal's input, and whether it is
+        // in the foreground, with the job. Ctrl+C ends it only in the foreground.
+        let run = jobs::Run::new();
+        let cancelled = Closure::<dyn Fn() -> bool>::new({
+            let foreground = run.foreground.clone();
+            move || foreground.get() && self.cancelled()
+        });
         set(&options, "cancelled", cancelled.as_ref().clone());
+        let on_job = Closure::<dyn Fn(JsValue)>::new({
+            let group = run.group.clone();
+            move |given: JsValue| *group.borrow_mut() = given
+        });
+        set(&options, "onJob", on_job.as_ref().clone());
+        // Stopped, or going on, as its processes say: a kill from elsewhere stops a run in the
+        // foreground as Ctrl+Z does, and a job's state shows.
+        let on_state = Closure::<dyn Fn(String)>::new({
+            let run = run.clone();
+            move |state: String| {
+                let state = if state == "stopped" {
+                    jobs::State::Stopped
+                } else {
+                    jobs::State::Running
+                };
+                match run.number.get() {
+                    Some(number) => self.job_state(number, state),
+                    None if state == jobs::State::Stopped && run.foreground.get() => {
+                        self.stopped_elsewhere()
+                    }
+                    None => {}
+                }
+            }
+        });
+        set(&options, "onState", on_state.as_ref().clone());
         // What they write to the terminal shows as they write it: the last's output, a line of
         // the transcript that grows, a new one after anything else shows; errors a line at a time.
         let shown = Rc::new(RefCell::new(Shown::default()));
@@ -1053,23 +1239,33 @@ impl Shell {
             }
         });
         set(&options, "onOutput", output.as_ref().clone());
-        let tty = Closure::<dyn Fn(JsValue)>::new(move |input: JsValue| {
-            let input = (!input.is_null() && !input.is_undefined()).then_some(input);
-            if input.is_none() {
-                self.reading.set(false);
+        // The terminal's input is the job's to keep; only the run in the foreground has it.
+        let tty = Closure::<dyn Fn(JsValue)>::new({
+            let run = run.clone();
+            move |input: JsValue| {
+                let input = (!input.is_null() && !input.is_undefined()).then_some(input);
+                *run.input.borrow_mut() = input.clone();
+                if run.foreground.get() {
+                    if input.is_none() {
+                        self.reading.set(false);
+                    }
+                    self.terminal.set_value(input);
+                }
             }
-            self.terminal.set_value(input);
         });
         set(&options, "onTty", tty.as_ref().clone());
         let reading = Closure::<dyn Fn()>::new({
             let shown = shown.clone();
+            let foreground = run.foreground.clone();
             move || {
                 // A prompt written to standard error, its line not ended, shows as it waits.
                 let prompt = std::mem::take(&mut shown.borrow_mut().partial);
                 if !prompt.is_empty() {
                     self.error(prompt);
                 }
-                self.reading.set(true);
+                if foreground.get() {
+                    self.reading.set(true);
+                }
             }
         });
         set(&options, "onReading", reading.as_ref().clone());
@@ -1092,12 +1288,26 @@ impl Shell {
             );
             argvs.push(&stage);
         }
-        let exited = JsFuture::from(crate::exec(&argvs, &options.into())).await;
-        self.terminal.set_value(None);
-        self.reading.set(false);
-        drop((cancelled, output, tty, reading));
+        let exec = JsFuture::from(crate::exec(&argvs, &options.into()));
+        Launched {
+            exec,
+            handlers: Box::new((cancelled, on_job, on_state, output, tty, reading)),
+            run,
+            shown,
+            names,
+            execed,
+        }
+    }
+    /// What a run of processes left, once it ended: the last's status and what it wrote if not
+    /// to the terminal; what is left of an error line, and how much output was not shown, said.
+    async fn ended_run(
+        self,
+        exited: Result<JsValue, JsValue>,
+        shown: Rc<RefCell<Shown>>,
+        names: Vec<String>,
+        execed: bool,
+    ) -> Result<(i32, String), String> {
         let exited = exited.map_err(js_message)?;
-        // What is left of an error line, and how much output was not shown.
         let Shown {
             line,
             hidden,
@@ -1130,11 +1340,7 @@ impl Shell {
         if execed || names.iter().any(|name| cli_bin::writes(name)) {
             self.refresh().await?;
         }
-        Ok(Output {
-            stdout,
-            failed: status != 0,
-            ..Default::default()
-        })
+        Ok((status, stdout))
     }
     /// End of input, Ctrl+D, for the process reading the terminal, if one may: what is typed goes
     /// as it is, without a newline, or, if nothing is, its read ends with nothing.
@@ -1255,6 +1461,14 @@ impl Shell {
                     return Ok(Output::text(help + "\n"));
                 }
             }
+            // kill %N: the job's processes, signalled here at once, and named by their pids to
+            // the program, which tells the kernel.
+            if name == "kill" && args.iter().skip(1).any(|arg| arg.starts_with('%')) {
+                match self.kill_jobs(args)? {
+                    Some(rest) => args = rest,
+                    None => return Ok(Output::default()),
+                }
+            }
             // A guest's own useradd and an account's own userdel take a password, in web/app.js's
             // dialog, which hands back what is not that to run here.
             if userland::PROGRAMS.contains(&name.as_str())
@@ -1341,6 +1555,12 @@ impl Shell {
         self.history.update(|h| h.push(command.clone()));
         self.history_index
             .set(self.history.with_untracked(Vec::len));
+        // `&` at its end: a job in the background, and the line is the shell's again at once.
+        if let Some(line) = grammar::background(&command) {
+            spawn_local(self.start_job(line.to_string()));
+            return;
+        }
+        self.line.set_value(command.clone());
         self.busy.set(true);
         self.cancelled.set(false);
         spawn_local(async move {

@@ -171,15 +171,44 @@ pub async fn ps(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
 }
 
 pub async fn kill(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
+    // kill -9 PID, kill -STOP PID: the signal as the first word, as kill has always taken it.
+    if let Some(first) = io.args.get(1).cloned()
+        && let Some(name) = first.strip_prefix('-')
+        && !matches!(name, "l" | "s" | "-" | "-list" | "-signal")
+        && !name.starts_with("-")
+        && abi::signal_named(name).is_some()
+    {
+        io.args.splice(1..2, ["-s".to_string(), name.to_string()]);
+    }
     let kill = parsed!(io, args::Kill);
+    if kill.list {
+        let names: Vec<&str> = abi::SIGNALS.iter().map(|(_, name)| *name).collect();
+        io.say(names.join(" "));
+        return 0;
+    }
+    let signal = match kill.signal.as_deref() {
+        None => abi::SIGTERM,
+        Some(name) => match abi::signal_named(name) {
+            Some(signal) => signal,
+            None => {
+                io.fail(format!("kill: {name}: invalid signal specification"));
+                return 1;
+            }
+        },
+    };
     let processes = processes(sys).await.unwrap_or_default();
     let mut status = 0;
     for given in &kill.pids {
-        let matching: Vec<&str> = processes
-            .iter()
-            .map(|process| process.pid.as_str())
-            .filter(|pid| pid.starts_with(given.as_str()))
-            .collect();
+        // A number is a process's PID exactly; a job's is a long word, named by its start.
+        let matching: Vec<&str> = if given.bytes().all(|b| b.is_ascii_digit()) {
+            Vec::new()
+        } else {
+            processes
+                .iter()
+                .map(|process| process.pid.as_str())
+                .filter(|pid| pid.starts_with(given.as_str()))
+                .collect()
+        };
         let pid = match matching.as_slice() {
             [pid] => pid.to_string(),
             // Not one of the account's: the kernel says whose, if anyone's.
@@ -190,7 +219,11 @@ pub async fn kill(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
                 continue;
             }
         };
-        if let Err(error) = call::<Value>(sys, Call::Kill { pid, signal: None }).await {
+        let sent = Call::Kill {
+            pid,
+            signal: Some(signal),
+        };
+        if let Err(error) = call::<Value>(sys, sent).await {
             let error = if error.errno == Errno::ESRCH {
                 "No such process".to_string()
             } else {

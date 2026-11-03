@@ -7,8 +7,9 @@
 // Started with {module, argv, env, umask, sudo, stdin, stdout, stderr}: standard input is
 // {data} (bytes given whole) or {pipe} (a pipe's buffer, web/wasi/pipe.js), the terminal if
 // {tty}; standard output {pipe}, or the page's, a terminal if {tty}, whose reader may close it
-// ({closed}, a word of shared memory); standard error {tty}. It posts {out, fd} as it writes to
-// the page, {reading} as it waits on the terminal, and {exit} as it ends.
+// ({closed}, a word of shared memory); standard error {tty}; {control}, a word the page sets to
+// stop it. It posts {out, fd} as it writes to the page, {reading} as it waits on the terminal,
+// {stopped} and {continued}, and {exit} as it ends.
 import { Pipe } from './pipe.js';
 
 // WASI's errno numbers, by Linux's names, as the kernel answers.
@@ -196,7 +197,9 @@ function readFrom(found, at, count) {
     if (count === 0) return new Uint8Array(0);
     // A read that waits shows what was written first; on the terminal, the page hears it asks.
     if (found.pipe.empty) { flush(); if (found.tty) postMessage({ reading: true }); }
-    return found.pipe.read(count);
+    const read = found.pipe.read(count, pause);
+    pause();
+    return read;
   }
   if (found.kind === 'out' || found.kind === 'pipe-out') throw new Errno(EBADF);
   if (!found.read) throw new Errno(EBADF);
@@ -550,7 +553,26 @@ const wasi = {
   sched_yield: () => 0,
 };
 // What WASI has that a program here cannot do (sockets): not implemented.
-const preview1 = new Proxy(wasi, { get: (target, name) => target[name] ?? (() => ENOSYS) });
+// Each call waits first while the process is stopped (`pause`).
+const preview1 = new Proxy(wasi, {
+  get: (target, name) => {
+    const call = target[name] ?? (() => ENOSYS);
+    return (...args) => { pause(); return call(...args); };
+  },
+});
+
+// Stopped (SIGSTOP, SIGTSTP, Ctrl+Z): a word of memory the page shares (web/wasi/exec.mjs), 1
+// while the process is stopped. It waits at its next system call, and as a blocking read
+// returns, until continued (SIGCONT), as a stopped process runs no further; the page hears it
+// stop and go on. A loop that makes no call cannot be stopped this way, only killed.
+let control = null;
+function pause() {
+  if (!control || Atomics.load(control, 0) === 0) return;
+  flush();
+  postMessage({ stopped: true });
+  while (Atomics.load(control, 0) !== 0) Atomics.wait(control, 0, 1);
+  postMessage({ continued: true });
+}
 // WASIX, which an uploaded module may ask for (its runtime lands with fork, phase 3): every
 // call not implemented, as ENOSYS says.
 const wasix = new Proxy({}, { get: () => () => ENOSYS });
@@ -564,11 +586,18 @@ function times(path, atim, mtim, flags) {
 // Wait, as a sleeping process does: on a lock nobody releases, where the page may share memory;
 // on the clock otherwise.
 function sleepUntil(until) {
-  const left = until - performance.now();
-  if (left <= 0) return;
+  if (until - performance.now() <= 0) return;
   // What it wrote shows while it sleeps.
   flush();
-  if (typeof SharedArrayBuffer === 'function') { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, left); return; }
+  // On its stop word: a stop wakes it, and it waits stopped, then sleeps out what is left.
+  if (control) {
+    for (let left = until - performance.now(); left > 0; left = until - performance.now()) {
+      if (Atomics.load(control, 0) !== 0) pause();
+      else Atomics.wait(control, 0, 0, left);
+    }
+    return;
+  }
+  if (typeof SharedArrayBuffer === 'function') { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, until - performance.now()); return; }
   while (performance.now() < until) { /* the clock is the only thing to wait on */ }
 }
 
@@ -577,6 +606,7 @@ function sleepUntil(until) {
 let reply = new Uint8Array(0);
 const terminal = {
   sys: (ptr, len) => {
+    pause();
     const calls = JSON.parse(string(ptr, len));
     forget();
     reply = encoder.encode(JSON.stringify({ results: batch(calls) }));
@@ -587,6 +617,7 @@ const terminal = {
 
 onmessage = async ({ data }) => {
   process = { ...data, limit: data.limit ?? 10 << 20 };
+  control = data.control ? new Int32Array(data.control) : null;
   environ = Object.entries(data.env ?? {}).map(([name, value]) => `${name}=${value}`);
   const { stdin = {}, stdout = {}, stderr = {} } = data;
   fds.set(0, stdin.pipe ? { kind: 'pipe-in', pipe: new Pipe(stdin.pipe), tty: !!stdin.tty } : { kind: 'in', tty: !!stdin.tty, data: stdin.data ?? new Uint8Array(0), pos: 0 });

@@ -289,6 +289,11 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
                         shell.interrupt();
                         return;
                     }
+                    // Ctrl+Z: the program in the foreground stops, a job from then on.
+                    if e.ctrl_key() && !e.alt_key() && !e.meta_key() && !e.shift_key() && e.key().eq_ignore_ascii_case("z") && shell.suspend() {
+                        e.prevent_default();
+                        return;
+                    }
                     // Ctrl+D: the end of what a program reading the terminal is given.
                     if e.ctrl_key() && !e.alt_key() && !e.meta_key() && !e.shift_key() && e.key().eq_ignore_ascii_case("d") && shell.end_of_input() {
                         e.prevent_default();
