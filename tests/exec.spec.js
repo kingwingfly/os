@@ -101,15 +101,25 @@ test('an uploaded wasm runs by its path, with the working directory, environment
   await expect(busy).toHaveText('↵', { timeout: 5_000 });
 });
 
-test('a process writes a file larger than a batch carries, through its own descriptor', async ({ page, request }) => {
+for (const jspi of [true, false]) test(`a process writes a file larger than a batch carries, through its own descriptor (${jspi ? 'JSPI' : 'synchronous XHR'})`, async ({ page, request }) => {
   // Past abi::INLINE_MAX (256 KiB), a process's write goes as a chunk (PUT /api/pwrite, with
-  // its token): the descriptor is its own, as its credentials name it.
+  // its token): the descriptor is its own, as its credentials name it. Its calls are fetches
+  // its image is suspended on (JSPI), or, where the browser has no JSPI, synchronous requests.
+  if (!jspi) await page.addInitScript(() => { window.terminalJspi = false; });
   const big = 'abcdefghijklmnopqrstuvwxyz0123456789\n'.repeat(10_000);
   expect((await put(request, file(`${base}/big.txt`), { headers, data: big })).status()).toBe(201);
   await terminal(page);
   await run(page, './coreutils cp big.txt copy.txt');
   await expect(page.locator('.transcript')).not.toContainText('Bad file descriptor');
   expect(await (await request.get(file(`${base}/copy.txt`))).text()).toBe(big);
+  // What it reads comes back as written: a range of it past the first window, and a pipeline.
+  await run(page, './coreutils tail -c 37 copy.txt');
+  await expect(page.locator('.transcript pre').last()).toHaveText('abcdefghijklmnopqrstuvwxyz0123456789');
+  await run(page, './coreutils cat copy.txt | ./coreutils wc -l');
+  await expect(page.locator('.transcript pre').last()).toHaveText('10000');
+  const engines = await page.evaluate(() => window.processEngines);
+  expect(engines[jspi ? 'jspi' : 'sync']).toBeGreaterThan(0);
+  expect(engines[jspi ? 'sync' : 'jspi']).toBe(0);
 });
 
 test('the loader and the X rule refuse as Linux refuses, with its words', async ({ page }) => {

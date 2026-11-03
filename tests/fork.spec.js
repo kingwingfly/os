@@ -299,7 +299,10 @@ const last = page => page.locator('.transcript pre').last();
 test.describe('fork in the terminal', () => {
   test.afterEach(async ({ request }) => { if (base) await rmrf(request, base); });
 
-  test('an uploaded module that forks: the child runs in a process of its own, and its parent waits for its status', async ({ page, request }) => {
+  // Each way a process makes its calls (request 4): suspended on fetch (JSPI), where the browser
+  // has it, and by synchronous XHR, where it does not.
+  for (const jspi of [true, false]) test(`an uploaded module that forks (${jspi ? 'JSPI' : 'synchronous XHR'}): the child runs in a process of its own, and its parent waits for its status`, async ({ page, request }) => {
+    if (!jspi) await page.addInitScript(() => { window.terminalJspi = false; });
     await uploads(request, { 'fork-wait': FORK_WAIT, 'fork-exec': FORK_EXEC, 'fork-pipe': FORK_PIPE, jump: JUMP });
     await page.goto('/');
     await command(page, `cd ${base}`);
@@ -317,6 +320,10 @@ test.describe('fork in the terminal', () => {
     // Nothing of them is left in the machine: every child was waited for.
     await command(page, 'ps');
     await expect(last(page)).not.toContainText('fork-');
+    // They made their calls the way asked.
+    const engines = await page.evaluate(() => window.processEngines);
+    expect(engines[jspi ? 'jspi' : 'sync']).toBeGreaterThan(0);
+    expect(engines[jspi ? 'sync' : 'jspi']).toBe(0);
   });
 
   test('a forked child is of its parent\'s job: Ctrl+C ends both; an orphan is init\'s, and reaped as it ends', async ({ page, request }) => {

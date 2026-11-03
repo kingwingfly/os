@@ -70,6 +70,11 @@ function release(pid) {
     if (pipe.writerGone && pipe.readerGone) pipes.delete(buffer);
   }
 }
+// How processes make their calls: suspended on fetch (JSPI) where the engine can, or by
+// synchronous XHR; a page may ask for the second (`terminalJspi = false`), as a test does. The
+// processes say which, counted here for the tests.
+const engines = { jspi: 0, sync: 0 };
+globalThis.processEngines = engines;
 // What a process's waiting call is answered with, in the memory it waits on: a JSON reply.
 const CHANNEL = 64 * 1024;
 function respond(channel, reply) {
@@ -312,10 +317,12 @@ export async function exec(stages, options = {}) {
       else if (data.truncated) truncated = true;
       else if (data.host) void answer(data.host);
       else if (data.fork) void fork(data.fork);
+      else if (data.engine) engines[data.engine] = (engines[data.engine] ?? 0) + 1;
       else if ('exit' in data) end(data.exit);
     };
     worker.onerror = event => { onOutput(2, `${argv[0]}: ${event.message}\n`); end(126); };
-    worker.postMessage({ ...start, module, memory, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: true }, control: control?.buffer, channel }, transfer);
+    worker.postMessage({ ...start, module, memory, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: true }, control: control?.buffer, channel,
+      jspi: globalThis.terminalJspi !== false }, transfer);
     // A signal, as its default action has it: ended, stopped at its next system call, or
     // continued.
     const signal = number => {

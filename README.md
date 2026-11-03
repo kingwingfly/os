@@ -421,6 +421,10 @@ Workers (`web/wasi/process.js`), with WASIX's process calls over the client kern
   closes it, and a file being written keeps its bytes in memory they share (`web/wasi/shared.js`).
   A pipe counts its holders, so its end of file comes when every writer has closed, a killed one
   too.
+- **Blocking calls on JSPI** (change request 4): where the browser has JavaScript Promise
+  Integration (Chrome 137+, Firefox), a call that asks the kernel suspends the image on a
+  fetch, and the Worker waits on nothing; elsewhere it is a synchronous XHR, as before. Asyncify
+  stays only for fork, setjmp and longjmp, as a JSPI suspension cannot be copied into a child.
 - **Also:** `fd_pipe`, `fd_dup`, `fd_dup2` and WASIX's `fd_renumber` (dup2), `getcwd`, `chdir`,
   `proc_parent`, `proc_signal`, and setjmp and longjmp by asyncify. A forked child is in its
   parent's job: Ctrl+C and Ctrl+Z reach it. Signal handlers are not called; each signal does what
@@ -464,7 +468,7 @@ with binaryen in both. Details are in `AGENT.md` and issue #20.
 The next steps agreed in issue #20, and the ideas recorded for later.
 
 - **WASIX beyond processes:** threads (`thread_spawn`, futexes that wait), signal handlers (`callback_signal`), ttys and sockets answer ENOSYS or do nothing yet. The approved `dash` fixture's libc (2023) starts at `/` whatever the process's directory, and does not flush a `printf` to a file or a pipe; a current WASIX libc asks the runtime (`getcwd`).
-- **JSPI and asyncify:** JavaScript Promise Integration (Chrome 137+, Firefox planned for 153) lets a blocking call await a promise without transforming the module, where shared memory and `Atomics.wait` need cross-origin isolation. Asyncify stays only for `fork`, which must copy a stack into a new instance, as a JSPI suspension cannot be copied. It applies to modules that import `proc_fork`, limited by `asyncify-imports`, and is transformed once per content and cached.
+- **Asyncify on the server:** asyncify is made once per content in each browser and kept in its cache; making it once per content on the server, for every browser, would spare each its first load of binaryen.
 - **GUI programs:** the WASI graphics proposal (`wasi:webgpu`, `wasi:surface`, `wasi:frame-buffer`), implemented in each process's Worker on WebGPU and a canvas handed over from the compositor's window. `/dev/display` is the permission gate. Web content runs in sandboxed frames, since a browser cannot run as a wasm process.
 - **Mounts and clusters:** a directory of the user's device mounted live, shared across devices and sessions peer to peer, or through a Cloudflare relay. Map/reduce across opted-in clients and Containers (the h264 to av1 example). Bytes go through a relay Durable Object per mount or cluster, never through the authority.
 - **io_uring-style queues:** a batch is already a submission queue of calls. A completion ring in shared memory, with calls completing out of order, would let a program keep many calls in flight without waiting on each, as `ls` over uutils makes tens of calls.

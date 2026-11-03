@@ -1,8 +1,12 @@
 // A process (owner's design, 2026-10-29: the page is user space, the API its system calls): a
 // program built for wasm32-wasip1, or for WASIX, run in a Worker of its own. Its WASI calls are
-// made here over the kernel's (POST /api/sys, GET /api/file, PUT /api/pwrite), synchronously,
-// as a program's calls block: the Worker waits on each request. `terminal.sys` reaches the
-// kernel's own calls, which WASI has no words for (modes, owners, ACLs, devices, accounts).
+// made here over the kernel's (POST /api/sys, GET /api/file, PUT /api/pwrite), and block, as a
+// program's calls do: where the engine can suspend the image on a promise (JSPI: the imports
+// are WebAssembly.Suspending, `_start` WebAssembly.promising), a call that asks the kernel is a
+// fetch the image waits on, and the Worker waits on nothing; elsewhere, a synchronous XHR (change
+// request 4). The code is the same for both: what may ask the kernel is a generator that yields
+// its requests (`request`), and `drive` sends them. `terminal.sys` reaches the kernel's own
+// calls, which WASI has no words for (modes, owners, ACLs, devices, accounts).
 // WASIX's (`wasix_32v1`) are WASI's and a process's own: fork, execve, wait, pipe, dup, the
 // working directory, setjmp and longjmp (phase 3).
 //
@@ -74,59 +78,96 @@ let closing = [];
 const cache = new Map();
 const forget = () => cache.clear();
 
-function request(method, url, body, headers = {}, binary = false) {
+// A request to the kernel, as the code that needs it yields it (each function that may make one
+// is a generator, `yield*` from the one that calls it): the driver (`drive`) sends it and goes on
+// with the answer, {status, text, bytes}. Where the engine can suspend a call (JSPI), it is a
+// fetch, and the Worker waits on nothing while it is answered; elsewhere, synchronous XHR.
+function* request(method, url, body, headers = {}, binary = false) {
+  return yield { method, url, body, headers, binary };
+}
+function sendSync({ method, url, body, headers, binary }) {
   const xhr = new XMLHttpRequest();
   xhr.open(method, url, false);
   if (binary) xhr.responseType = 'arraybuffer';
   for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
   try { xhr.send(body ?? null); } catch { throw new Errno(EIO); }
-  return xhr;
+  return { status: xhr.status, text: binary ? '' : xhr.responseText, bytes: binary ? new Uint8Array(xhr.response) : null };
+}
+async function send({ method, url, body, headers, binary }) {
+  let response;
+  try { response = await fetch(url, { method, body: body ?? undefined, headers }); } catch { throw new Errno(EIO); }
+  return { status: response.status, text: binary ? '' : await response.text(), bytes: binary ? new Uint8Array(await response.arrayBuffer()) : null };
+}
+// Whether a call may suspend the image (JSPI: WebAssembly.Suspending and promising).
+let suspending = false;
+// Run `work`, a generator of the kernel's requests, to its end: its value, at once if it asked
+// nothing (a write to the terminal, a pipe), else as the driver has it: at once by synchronous
+// XHR, or a promise of it, by fetch, where the image is suspended meanwhile.
+function drive(work) {
+  let step = work.next();
+  if (step.done) return step.value;
+  if (!suspending) {
+    while (!step.done) {
+      let answer;
+      try { answer = sendSync(step.value); } catch (error) { step = work.throw(error); continue; }
+      step = work.next(answer);
+    }
+    return step.value;
+  }
+  return (async () => {
+    while (!step.done) {
+      let answer;
+      try { answer = await send(step.value); } catch (error) { step = work.throw(error); continue; }
+      step = work.next(answer);
+    }
+    return step.value;
+  })();
 }
 // A batch of calls: each one's result, {ok} or {err}. Descriptors to close go after them, so
 // that a call's {ref: i} names the i-th of `calls`. A process's batch carries the pid and token
 // its exec gave it (crates/client-kernel): the kernel runs it as that process, with the
 // credentials snapshotted at exec.
-function batch(calls) {
+function* batch(calls) {
   const sent = [...calls, ...closing.map(fd => ({ close: { fd } }))];
   closing = [];
   const body = { calls: sent, umask: process.umask, sudo: process.sudo };
   if (process.pid) body.pid = process.pid;
   if (process.proc) body.proc = process.proc;
-  const xhr = request('POST', '/api/sys', JSON.stringify(body), { 'Content-Type': 'application/json' });
-  if (xhr.status !== 200) return calls.map(() => ({ err: { errno: 'EIO' } }));
-  return JSON.parse(xhr.responseText).results.slice(0, calls.length);
+  const answer = yield* request('POST', '/api/sys', JSON.stringify(body), { 'Content-Type': 'application/json' });
+  if (answer.status !== 200) return calls.map(() => ({ err: { errno: 'EIO' } }));
+  return JSON.parse(answer.text).results.slice(0, calls.length);
 }
 // One call: its value, or an Errno thrown.
-function call(one) {
-  const [result] = batch([one]);
+function* call(one) {
+  const [result] = yield* batch([one]);
   if ('err' in result) throw new Errno(errnoOf(result.err));
   return result.ok;
 }
 const ok = result => { if ('err' in result) throw new Errno(errnoOf(result.err)); return result.ok; };
-function stat(path, follow = true) {
+function* stat(path, follow = true) {
   const key = (follow ? 's:' : 'l:') + path;
   if (cache.has(key)) return cache.get(key);
-  const found = call(follow ? { stat: { path } } : { lstat: { path } });
+  const found = yield* call(follow ? { stat: { path } } : { lstat: { path } });
   cache.set(key, found);
   return found;
 }
 // Bytes `start`..`end` of the file at `path`, by a ranged GET: by its descriptor's token, which
 // the Worker serves without asking the kernel each time, if it has one. A process's request
 // carries the process's token: the kernel answers as whom it was executed.
-function range(path, start, end, token) {
+function* range(path, start, end, token) {
   const url = token ? '/api/file?token=' + encodeURIComponent(token) : '/api/file?path=' + encodeURIComponent(path);
   const headers = { Range: `bytes=${start}-${end - 1}` };
   if (process.proc) headers['X-Process-Token'] = process.proc;
-  const xhr = request('GET', url, null, headers, true);
-  if (xhr.status === 416) return new Uint8Array(0);
-  if (xhr.status !== 200 && xhr.status !== 206) throw new Errno(xhr.status === 404 ? ENOENT : xhr.status === 403 ? ERRNO.EACCES : EIO);
-  return new Uint8Array(xhr.response);
+  const answer = yield* request('GET', url, null, headers, true);
+  if (answer.status === 416) return new Uint8Array(0);
+  if (answer.status !== 200 && answer.status !== 206) throw new Errno(answer.status === 404 ? ENOENT : answer.status === 403 ? ERRNO.EACCES : EIO);
+  return answer.bytes;
 }
 // The whole of a file, for one written here anew.
-function whole(path, size) {
+function* whole(path, size) {
   if (size > REWRITE_MAX) throw new Errno(EFBIG);
-  if (size <= INLINE) return unbase64(call({ pread: { path, count: INLINE } }).data);
-  return range(path, 0, size);
+  if (size <= INLINE) return unbase64((yield* call({ pread: { path, count: INLINE } })).data);
+  return yield* range(path, 0, size);
 }
 const join = (dir, path) => path.startsWith('/') ? path : (dir === '/' ? '' : dir) + '/' + (path === '.' ? '' : path).replace(/^\.\//, '');
 const clean = path => path.length > 1 ? path.replace(/\/+$/, '').replace(/\/\/+/g, '/') || '/' : path;
@@ -157,7 +198,7 @@ function install(fd, found, counted = false) {
 }
 // close(2) of `fd`: its open file closes once no descriptor of it is left, here or in another
 // process.
-function uninstall(fd) {
+function* uninstall(fd) {
   const found = descriptor(fd);
   fds.delete(fd);
   cloexec.delete(fd);
@@ -165,7 +206,7 @@ function uninstall(fd) {
   if (found.kind === 'pipe-in') return found.pipe.drop(process.pid, 'r');
   if (found.kind === 'pipe-out') return found.pipe.drop(process.pid, 'w');
   if (found.share != null ? shares.drop(found.share) > 0 : found.refs > 0) return;
-  closeFd(found);
+  yield* closeFd(found);
 }
 function filetype(found) {
   if (STDIO.has(found.kind)) return found.tty ? CHARACTER_DEVICE : UNKNOWN;
@@ -193,21 +234,21 @@ function writeFilestat(ptr, found) {
   v.setBigUint64(ptr + 56, nanos(found.ctime, found.ctime_nsec), true);
 }
 // What a descriptor's file is now, as fstat says.
-function fstat(found) {
+function* fstat(found) {
   if (STDIO.has(found.kind)) return { filetype: filetype(found), mode: found.tty ? 0o020620 : 0o010600 };
-  if (found.kind === 'dir') return stat(found.path);
+  if (found.kind === 'dir') return yield* stat(found.path);
   if (found.writer || found.rewrite) {
     const now = Math.floor(Date.now() / 1000);
     return { ...(found.stat ?? {}), filetype: REGULAR_FILE, size: size(found), mtime: now, ctime: now };
   }
-  return found.stat ?? stat(found.path);
+  return found.stat ?? (yield* stat(found.path));
 }
 const size = found => found.rewrite ? found.bytes.length : found.writer ? found.bytes.from + found.bytes.length : found.size;
 
 // Open the file at `path` for reading: the descriptor, its first bytes and its stat, in one
 // request.
-function openRead(path) {
-  const [opened, read, stated] = batch([{ open: { path, flags: O_RDONLY } }, { pread: { fd: { ref: 0 }, count: INLINE } }, { stat: { path } }]);
+function* openRead(path) {
+  const [opened, read, stated] = yield* batch([{ open: { path, flags: O_RDONLY } }, { pread: { fd: { ref: 0 }, count: INLINE } }, { stat: { path } }]);
   if (opened.err?.errno === 'EISDIR') return { kind: 'dir', path };
   const { fd, token } = ok(opened);
   // What cannot be read closes, as it goes: a directory, opened as open(2) opens one, is one.
@@ -221,18 +262,18 @@ function openRead(path) {
 }
 // Open it for writing in order: a growing file, truncated or new. What is not sent yet is held
 // in memory a fork shares (shared.js): at most two chunks and an inline write.
-function openWriter(path, flags, read) {
-  const opened = call({ open: { path, flags: flags | O_WRONLY } });
+function* openWriter(path, flags, read) {
+  const opened = yield* call({ open: { path, flags: flags | O_WRONLY } });
   forget();
   const chunk = opened.chunk_size || (8 << 20);
   return { kind: 'file', path, kfd: opened.fd, writer: true, read, chunk, bytes: Bytes.create(chunk * 2 + INLINE), pos: 0 };
 }
 // Open an existing file to change in place, or append to: its content, written back whole when
 // it closes, if it changed.
-function openRewrite(path, found, append, read) {
-  const [allowed] = batch([{ access: { path, mode: W_OK } }]);
+function* openRewrite(path, found, append, read) {
+  const [allowed] = yield* batch([{ access: { path, mode: W_OK } }]);
   ok(allowed);
-  const data = whole(path, found.size);
+  const data = yield* whole(path, found.size);
   const bytes = Bytes.create(REWRITE_MAX, Math.max(data.length, 64 * 1024));
   bytes.ensure(data.length);
   bytes.view.set(data);
@@ -240,7 +281,7 @@ function openRewrite(path, found, append, read) {
   return { kind: 'file', path, rewrite: true, read, bytes, pos: append ? data.length : 0, append, stat: found };
 }
 
-function readFrom(found, at, count) {
+function* readFrom(found, at, count) {
   if (found.kind === 'dir') throw new Errno(EISDIR);
   if (found.kind === 'in') {
     const out = found.data.subarray(found.pos, found.pos + count);
@@ -268,18 +309,18 @@ function readFrom(found, at, count) {
     if (at >= found.size) return new Uint8Array(0);
     const want = Math.max(count, INLINE);
     if (want <= INLINE) {
-      const read = call({ pread: { fd: found.kfd, offset: at, count: want } });
+      const read = yield* call({ pread: { fd: found.kfd, offset: at, count: want } });
       found.size = read.size;
       found.window = { start: at, data: unbase64(read.data) };
     } else {
-      found.window = { start: at, data: range(found.path, at, Math.min(found.size, at + Math.min(want, WINDOW)), found.token) };
+      found.window = { start: at, data: (yield* range(found.path, at, Math.min(found.size, at + Math.min(want, WINDOW)), found.token)) };
     }
   }
   const from = at - found.window.start;
   return found.window.data.subarray(from, from + count);
 }
 
-function writeTo(found, at, data) {
+function* writeTo(found, at, data) {
   // A pipe whose reader is gone, or the page's whose reader has closed its end (head, with its
   // lines): SIGPIPE, whose default is to end the process, quietly.
   if (found.kind === 'out') {
@@ -312,7 +353,7 @@ function writeTo(found, at, data) {
     // Written in order: whole chunks go before more is held, and at most a chunk at a time is
     // added, so that what is held stays within two chunks.
     for (let done = 0; done < data.length;) {
-      while (bytes.length > found.chunk) flushChunk(found);
+      while (bytes.length > found.chunk) (yield* flushChunk(found));
       const offset = at + done - bytes.from;
       if (offset < 0) throw new Errno(ESPIPE);
       const piece = data.subarray(done, done + found.chunk);
@@ -326,15 +367,15 @@ function writeTo(found, at, data) {
   } finally { bytes.unlock(); }
 }
 // Send the next chunk, whole, or the last, short (its bytes' lock held).
-function flushChunk(found) {
+function* flushChunk(found) {
   const bytes = found.bytes;
   const count = Math.min(found.chunk, bytes.length);
   const chunk = bytes.bytes(0, count).slice();
   const index = bytes.from / found.chunk;
   const headers = { 'Content-Type': 'application/octet-stream' };
   if (process.proc) headers['X-Process-Token'] = process.proc;
-  const xhr = request('PUT', `/api/pwrite?fd=${found.kfd}&index=${index}`, chunk, headers);
-  if (xhr.status >= 300) throw new Errno(errnoOf(safeJson(xhr.responseText)));
+  const answer = yield* request('PUT', `/api/pwrite?fd=${found.kfd}&index=${index}`, chunk, headers);
+  if (answer.status >= 300) throw new Errno(errnoOf(safeJson(answer.text)));
   bytes.view.copyWithin(0, count, bytes.length);
   bytes.length -= count;
   bytes.from += count;
@@ -343,17 +384,17 @@ const safeJson = text => { try { return JSON.parse(text); } catch { return {}; }
 
 // Close an open file, its last descriptor gone: what it wrote goes, with the close, in one
 // request where it can.
-function closeFd(found) {
+function* closeFd(found) {
   if (found.kind === 'file' && found.writer) {
     const bytes = found.bytes;
     bytes.lock();
     try {
-      while (bytes.length > found.chunk) flushChunk(found);
+      while (bytes.length > found.chunk) (yield* flushChunk(found));
       const calls = [];
-      if (bytes.length > INLINE) flushChunk(found);
+      if (bytes.length > INLINE) (yield* flushChunk(found));
       if (bytes.length > 0) calls.push({ pwrite: { fd: found.kfd, index: bytes.from / found.chunk, data: base64(bytes.bytes(0, bytes.length)) } });
       calls.push({ close: { fd: found.kfd } });
-      const results = batch(calls);
+      const results = yield* batch(calls);
       forget();
       for (const result of results) ok(result);
     } finally { bytes.unlock(); }
@@ -361,16 +402,16 @@ function closeFd(found) {
     forget();
     const data = found.bytes.bytes(0, found.bytes.length).slice();
     if (data.length <= INLINE) {
-      const results = batch([
+      const results = yield* batch([
         { open: { path: found.path, flags: O_WRONLY | O_TRUNC } },
         ...(data.length ? [{ pwrite: { fd: { ref: 0 }, index: 0, data: base64(data) } }] : []),
         { close: { fd: { ref: 0 } } },
       ]);
       for (const result of results) ok(result);
     } else {
-      const writer = openWriter(found.path, O_TRUNC, false);
-      writeTo(writer, 0, data);
-      closeFd(writer);
+      const writer = yield* openWriter(found.path, O_TRUNC, false);
+      yield* writeTo(writer, 0, data);
+      yield* closeFd(writer);
     }
   } else if (found.kind === 'file' && found.kfd !== undefined) {
     closing.push(found.kfd);
@@ -419,9 +460,13 @@ function sizes(list, countPtr, sizePtr) {
   view().setUint32(sizePtr, list.reduce((n, item) => n + encoder.encode(item).length + 1, 0), true);
   return 0;
 }
-// Run `work`: 0, or its errno.
+// Run `work`, a generator of the kernel's requests: 0, or its errno, or, where the call
+// suspends the image (JSPI), a promise of that.
 function attempt(work) {
-  try { return work() ?? 0; } catch (err) { if (err instanceof Errno) return err.errno; throw err; }
+  const failed = err => { if (err instanceof Errno) return err.errno; throw err; };
+  let done;
+  try { done = drive(work()); } catch (err) { return failed(err); }
+  return done instanceof Promise ? done.then(value => value ?? 0, failed) : done ?? 0;
 }
 function pathAt(fd, ptr, len) {
   const dir = descriptor(fd);
@@ -445,8 +490,8 @@ const wasi = {
   fd_allocate: () => 0,
   fd_datasync: () => 0,
   fd_sync: () => 0,
-  fd_close: fd => attempt(() => uninstall(fd)),
-  fd_fdstat_get: (fd, ptr) => attempt(() => {
+  fd_close: fd => attempt(function* () { return yield* uninstall(fd); }),
+  fd_fdstat_get: (fd, ptr) => attempt(function* () {
     const found = descriptor(fd), v = view();
     v.setUint8(ptr, filetype(found));
     v.setUint16(ptr + 2, found.append ? FDFLAG_APPEND : 0, true);
@@ -457,14 +502,14 @@ const wasi = {
   }),
   fd_fdstat_set_flags: () => 0,
   fd_fdstat_set_rights: () => 0,
-  fd_filestat_get: (fd, ptr) => attempt(() => writeFilestat(ptr, fstat(descriptor(fd)))),
-  fd_filestat_set_size: (fd, len) => attempt(() => {
+  fd_filestat_get: (fd, ptr) => attempt(function* () { return writeFilestat(ptr, (yield* fstat(descriptor(fd)))); }),
+  fd_filestat_set_size: (fd, len) => attempt(function* () {
     const found = descriptor(fd), length = Number(len);
     if (!found.rewrite && !found.writer) throw new Errno(EINVAL);
     const bytes = found.bytes;
     if (found.writer) {
       if (length < bytes.from) throw new Errno(EINVAL);
-      if (length > size(found)) writeTo(found, size(found), new Uint8Array(length - size(found)));
+      if (length > size(found)) yield* writeTo(found, size(found), new Uint8Array(length - size(found)));
     }
     bytes.lock();
     try {
@@ -475,12 +520,12 @@ const wasi = {
       if (found.rewrite) bytes.dirty = true;
     } finally { bytes.unlock(); }
   }),
-  fd_filestat_set_times: (fd, atim, mtim, flags) => attempt(() => { times(descriptor(fd).path, atim, mtim, flags); }),
-  fd_pread: (fd, iovs, count, offset, nread) => attempt(() => {
+  fd_filestat_set_times: (fd, atim, mtim, flags) => attempt(function* () { yield* times(descriptor(fd).path, atim, mtim, flags); }),
+  fd_pread: (fd, iovs, count, offset, nread) => attempt(function* () {
     const found = descriptor(fd);
     let at = Number(offset), total = 0;
     for (const [ptr, len] of iovecs(iovs, count)) {
-      const data = readFrom(found, at, len);
+      const data = yield* readFrom(found, at, len);
       bytes().set(data, ptr); total += data.length; at += data.length;
       if (data.length < len) break;
     }
@@ -492,18 +537,18 @@ const wasi = {
     return 0;
   },
   fd_prestat_dir_name: (fd, ptr, len) => { if (!preopen(fd)) return EBADF; bytes().set(encoder.encode('/').subarray(0, len), ptr); return 0; },
-  fd_pwrite: (fd, iovs, count, offset, nwritten) => attempt(() => {
+  fd_pwrite: (fd, iovs, count, offset, nwritten) => attempt(function* () {
     const found = descriptor(fd);
     let at = Number(offset), total = 0;
-    for (const [ptr, len] of iovecs(iovs, count)) { total += writeTo(found, at, bytes().slice(ptr, ptr + len)); at += len; }
+    for (const [ptr, len] of iovecs(iovs, count)) { total += yield* writeTo(found, at, bytes().slice(ptr, ptr + len)); at += len; }
     view().setUint32(nwritten, total, true);
   }),
-  fd_read: (fd, iovs, count, nread) => attempt(() => {
+  fd_read: (fd, iovs, count, nread) => attempt(function* () {
     const found = descriptor(fd);
     let total = 0;
     for (const [ptr, len] of iovecs(iovs, count)) {
       const at = found.pos ?? 0;
-      const data = readFrom(found, at, len);
+      const data = yield* readFrom(found, at, len);
       bytes().set(data, ptr); total += data.length;
       if (!STDIO.has(found.kind)) found.pos = at + data.length;
       if (data.length < len) break;
@@ -512,11 +557,11 @@ const wasi = {
     }
     view().setUint32(nread, total, true);
   }),
-  fd_readdir: (fd, buf, len, cookie, used) => attempt(() => {
+  fd_readdir: (fd, buf, len, cookie, used) => attempt(function* () {
     const found = descriptor(fd);
     if (found.kind !== 'dir') throw new Errno(ENOTDIR);
     if (!found.entries) {
-      const listed = call({ getdents: { path: found.path } });
+      const listed = yield* call({ getdents: { path: found.path } });
       for (const entry of listed) {
         if (!entry.stat) continue;
         const path = clean(join(found.path, entry.name));
@@ -543,15 +588,15 @@ const wasi = {
     view().setUint32(used, at - buf, true);
   }),
   // WASI's renumber moves a descriptor: `from` is closed, `to` is what it was.
-  fd_renumber: (from, to) => attempt(() => {
+  fd_renumber: (from, to) => attempt(function* () {
     const found = descriptor(from);
     if (from === to) return;
-    if (fds.has(to)) uninstall(to);
+    if (fds.has(to)) yield* uninstall(to);
     fds.set(to, found);
     fds.delete(from);
     if (cloexec.delete(from)) cloexec.add(to);
   }),
-  fd_seek: (fd, offset, whence, ptr) => attempt(() => {
+  fd_seek: (fd, offset, whence, ptr) => attempt(function* () {
     const found = descriptor(fd);
     if (found.kind !== 'file') throw new Errno(ESPIPE);
     const base = whence === 0 ? 0 : whence === 1 ? found.pos : size(found);
@@ -560,59 +605,59 @@ const wasi = {
     found.pos = pos;
     view().setBigUint64(ptr, BigInt(pos), true);
   }),
-  fd_tell: (fd, ptr) => attempt(() => { const found = descriptor(fd); if (found.kind !== 'file') throw new Errno(ESPIPE); view().setBigUint64(ptr, BigInt(found.pos), true); }),
-  fd_write: (fd, iovs, count, nwritten) => attempt(() => {
+  fd_tell: (fd, ptr) => attempt(function* () { const found = descriptor(fd); if (found.kind !== 'file') throw new Errno(ESPIPE); view().setBigUint64(ptr, BigInt(found.pos), true); }),
+  fd_write: (fd, iovs, count, nwritten) => attempt(function* () {
     const found = descriptor(fd);
     let total = 0;
     for (const [ptr, len] of iovecs(iovs, count)) {
       const data = bytes().slice(ptr, ptr + len);
-      if (found.kind !== 'file') { total += writeTo(found, 0, data); continue; }
+      if (found.kind !== 'file') { total += yield* writeTo(found, 0, data); continue; }
       const at = found.append ? size(found) : found.pos;
-      total += writeTo(found, at, data);
+      total += yield* writeTo(found, at, data);
       found.pos = at + len;
     }
     view().setUint32(nwritten, total, true);
   }),
-  path_create_directory: (fd, ptr, len) => attempt(() => { call({ mkdir: { path: pathAt(fd, ptr, len), mode: 0o777 } }); forget(); }),
-  path_filestat_get: (fd, flags, ptr, len, out) => attempt(() => writeFilestat(out, stat(pathAt(fd, ptr, len), (flags & FOLLOW) !== 0))),
-  path_filestat_set_times: (fd, flags, ptr, len, atim, mtim, fst) => attempt(() => times(pathAt(fd, ptr, len), atim, mtim, fst)),
-  path_link: (fd, flags, ptr, len, fd2, ptr2, len2) => attempt(() => { call({ link: { from: pathAt(fd, ptr, len), to: pathAt(fd2, ptr2, len2), follow: (flags & FOLLOW) !== 0 } }); forget(); }),
-  path_open: (fd, dirflags, ptr, len, oflags, base, inheriting, fdflags, out) => attempt(() => {
+  path_create_directory: (fd, ptr, len) => attempt(function* () { yield* call({ mkdir: { path: pathAt(fd, ptr, len), mode: 0o777 } }); forget(); }),
+  path_filestat_get: (fd, flags, ptr, len, out) => attempt(function* () { return writeFilestat(out, (yield* stat(pathAt(fd, ptr, len), (flags & FOLLOW) !== 0))); }),
+  path_filestat_set_times: (fd, flags, ptr, len, atim, mtim, fst) => attempt(function* () { return yield* times(pathAt(fd, ptr, len), atim, mtim, fst); }),
+  path_link: (fd, flags, ptr, len, fd2, ptr2, len2) => attempt(function* () { yield* call({ link: { from: pathAt(fd, ptr, len), to: pathAt(fd2, ptr2, len2), follow: (flags & FOLLOW) !== 0 } }); forget(); }),
+  path_open: (fd, dirflags, ptr, len, oflags, base, inheriting, fdflags, out) => attempt(function* () {
     const path = pathAt(fd, ptr, len);
     const write = (base & RIGHT_WRITE) !== 0n, read = (base & RIGHT_READ) !== 0n || !write;
     const append = (fdflags & FDFLAG_APPEND) !== 0;
     let found;
     if (oflags & OFLAG_DIRECTORY) {
-      if (kindOf(stat(path, (dirflags & FOLLOW) !== 0).mode) !== DIRECTORY) throw new Errno(ENOTDIR);
+      if (kindOf((yield* stat(path, (dirflags & FOLLOW) !== 0)).mode) !== DIRECTORY) throw new Errno(ENOTDIR);
       found = { kind: 'dir', path };
     } else if (!write) {
-      found = openRead(path);
+      found = yield* openRead(path);
     } else if (oflags & (OFLAG_TRUNC | OFLAG_EXCL)) {
-      found = openWriter(path, (oflags & OFLAG_CREAT ? O_CREAT : 0) | (oflags & OFLAG_EXCL ? O_EXCL : 0) | (oflags & OFLAG_TRUNC ? O_TRUNC : 0), read);
+      found = yield* openWriter(path, (oflags & OFLAG_CREAT ? O_CREAT : 0) | (oflags & OFLAG_EXCL ? O_EXCL : 0) | (oflags & OFLAG_TRUNC ? O_TRUNC : 0), read);
     } else {
       // Written without truncating: a new file is written in order; one there is changed here.
       let there;
-      try { there = stat(path); } catch (err) { if (!(err instanceof Errno) || err.errno !== ENOENT || !(oflags & OFLAG_CREAT)) throw err; }
-      if (!there) found = openWriter(path, O_CREAT, read);
+      try { there = yield* stat(path); } catch (err) { if (!(err instanceof Errno) || err.errno !== ENOENT || !(oflags & OFLAG_CREAT)) throw err; }
+      if (!there) found = yield* openWriter(path, O_CREAT, read);
       else if (kindOf(there.mode) === DIRECTORY) throw new Errno(EISDIR);
-      else found = openRewrite(path, there, append, read);
+      else found = yield* openRewrite(path, there, append, read);
     }
     found.append ||= append && found.kind === 'file';
     const number = lowest();
     install(number, found);
     view().setUint32(out, number, true);
   }),
-  path_readlink: (fd, ptr, len, buf, bufLen, used) => attempt(() => {
-    const target = encoder.encode(call({ readlink: { path: pathAt(fd, ptr, len) } }));
+  path_readlink: (fd, ptr, len, buf, bufLen, used) => attempt(function* () {
+    const target = encoder.encode((yield* call({ readlink: { path: pathAt(fd, ptr, len) } })));
     const part = target.subarray(0, bufLen);
     bytes().set(part, buf);
     view().setUint32(used, part.length, true);
   }),
-  path_remove_directory: (fd, ptr, len) => attempt(() => { call({ rmdir: { path: pathAt(fd, ptr, len) } }); forget(); }),
-  path_rename: (fd, ptr, len, fd2, ptr2, len2) => attempt(() => { call({ rename: { from: pathAt(fd, ptr, len), to: pathAt(fd2, ptr2, len2) } }); forget(); }),
-  path_symlink: (ptr, len, fd, ptr2, len2) => attempt(() => { call({ symlink: { target: string(ptr, len), path: pathAt(fd, ptr2, len2) } }); forget(); }),
-  path_unlink_file: (fd, ptr, len) => attempt(() => { call({ unlink: { path: pathAt(fd, ptr, len) } }); forget(); }),
-  poll_oneoff: (input, output, count, events) => attempt(() => {
+  path_remove_directory: (fd, ptr, len) => attempt(function* () { yield* call({ rmdir: { path: pathAt(fd, ptr, len) } }); forget(); }),
+  path_rename: (fd, ptr, len, fd2, ptr2, len2) => attempt(function* () { yield* call({ rename: { from: pathAt(fd, ptr, len), to: pathAt(fd2, ptr2, len2) } }); forget(); }),
+  path_symlink: (ptr, len, fd, ptr2, len2) => attempt(function* () { yield* call({ symlink: { target: string(ptr, len), path: pathAt(fd, ptr2, len2) } }); forget(); }),
+  path_unlink_file: (fd, ptr, len) => attempt(function* () { yield* call({ unlink: { path: pathAt(fd, ptr, len) } }); forget(); }),
+  poll_oneoff: (input, output, count, events) => attempt(function* () {
     const v = view();
     let until = 0, ready = 0;
     for (let i = 0; i < count; i++) {
@@ -686,14 +731,14 @@ let snapshots = new Map(), saved = 0;
 
 // execve(2) of `name` (a path, or a name PATH finds): it does not return, if it goes through;
 // the new image starts in this process once this one is unwound (`Replaced`).
-function execve(name, argv, env, search = !name.includes('/')) {
+function* execve(name, argv, env, search = !name.includes('/')) {
   let path = name;
   if (search) {
     const PATH = env.find(entry => entry.startsWith('PATH='))?.slice(5) || '/usr/bin';
     path = undefined;
     for (const dir of PATH.split(':').filter(Boolean)) {
       const candidate = clean(join(join(process.cwd, dir), name));
-      try { if (kindOf(stat(candidate).mode) === REGULAR_FILE) { path = candidate; break; } } catch { /* not there */ }
+      try { if (kindOf((yield* stat(candidate)).mode) === REGULAR_FILE) { path = candidate; break; } } catch { /* not there */ }
     }
     if (!path) throw new Errno(ENOENT);
   } else path = clean(join(process.cwd, name));
@@ -703,8 +748,8 @@ function execve(name, argv, env, search = !name.includes('/')) {
   throw new Replaced();
 }
 // The old execve, which cannot fail: what fails ends the process, as a shell would say it.
-function execOrExit(name, argv, env) {
-  try { execve(name, argv, env); } catch (err) {
+function* execOrExit(name, argv, env) {
+  try { yield* execve(name, argv, env); } catch (err) {
     if (!(err instanceof Errno)) throw err;
     output(2, encoder.encode(`${name}: ${STRERROR[err.errno] ?? 'cannot execute'}\n`));
     flush();
@@ -715,20 +760,20 @@ function execOrExit(name, argv, env) {
 const wasixCalls = {
   ...wasi,
   // WASIX's renumber is dup2(2): `from` stays open.
-  fd_renumber: (from, to) => attempt(() => {
+  fd_renumber: (from, to) => attempt(function* () {
     const found = descriptor(from);
     if (from === to) return;
-    if (fds.has(to)) uninstall(to);
+    if (fds.has(to)) yield* uninstall(to);
     install(to, found);
   }),
-  fd_dup: (fd, out) => attempt(() => { const found = descriptor(fd), number = lowest(); install(number, found); view().setUint32(out, number, true); }),
-  fd_dup2: (fd, min, closeOnExec, out) => attempt(() => {
+  fd_dup: (fd, out) => attempt(function* () { const found = descriptor(fd), number = lowest(); install(number, found); view().setUint32(out, number, true); }),
+  fd_dup2: (fd, min, closeOnExec, out) => attempt(function* () {
     const found = descriptor(fd), number = lowest(min);
     install(number, found);
     if (closeOnExec) cloexec.add(number);
     view().setUint32(out, number, true);
   }),
-  fd_pipe: (readEnd, writeEnd) => attempt(() => {
+  fd_pipe: (readEnd, writeEnd) => attempt(function* () {
     if (typeof SharedArrayBuffer !== 'function') throw new Errno(ENOSYS);
     const pipe = new Pipe(pipeBuffer());
     const r = lowest();
@@ -746,20 +791,20 @@ const wasixCalls = {
     bytes()[ptr + cwd.length] = 0;
     return 0;
   },
-  chdir: (ptr, len) => attempt(() => {
+  chdir: (ptr, len) => attempt(function* () {
     const path = clean(join(process.cwd, string(ptr, len)));
-    const [found, searchable] = batch([{ stat: { path } }, { access: { path, mode: 1 } }]);
+    const [found, searchable] = yield* batch([{ stat: { path } }, { access: { path, mode: 1 } }]);
     if (kindOf(ok(found).mode) !== DIRECTORY) throw new Errno(ENOTDIR);
     ok(searchable);
     process.cwd = path;
   }),
   proc_id: ptr => { view().setUint32(ptr, process.pid, true); return 0; },
   // getppid: its parent now (init's, once its parent ended), as its kernel has it.
-  proc_parent: (pid, ptr) => attempt(() => {
+  proc_parent: (pid, ptr) => attempt(function* () {
     const found = hostErrno(host('getpid', { pid }));
     view().setUint32(ptr, found.ppid, true);
   }),
-  proc_signal: (pid, signal) => attempt(() => { hostErrno(host('kill', { pid, signal })); }),
+  proc_signal: (pid, signal) => attempt(function* () { hostErrno(host('kill', { pid, signal })); }),
   // fork(2): unwound, copied into a child by the host, and rewound (the run loop below).
   proc_fork: (copy, pidPtr) => {
     if (engine?.rewinding) {
@@ -773,16 +818,16 @@ const wasixCalls = {
     try { engine.unwind({ kind: 'fork' }); } catch { return ERRNO.ENOMEM; }
     return 0;
   },
-  proc_exec: (name, nameLen, args, argsLen) => execOrExit(string(name, nameLen), lines(args, argsLen), environ),
-  proc_exec2: (name, nameLen, args, argsLen, envs, envsLen) => execOrExit(string(name, nameLen), lines(args, argsLen), lines(envs, envsLen)),
-  proc_exec3: (name, nameLen, args, argsLen, envs, envsLen, search, path, pathLen) => attempt(() => {
+  proc_exec: (name, nameLen, args, argsLen) => drive(execOrExit(string(name, nameLen), lines(args, argsLen), environ)),
+  proc_exec2: (name, nameLen, args, argsLen, envs, envsLen) => drive(execOrExit(string(name, nameLen), lines(args, argsLen), lines(envs, envsLen))),
+  proc_exec3: (name, nameLen, args, argsLen, envs, envsLen, search, path, pathLen) => attempt(function* () {
     const env = lines(envs, envsLen);
     const PATH = string(path, pathLen);
-    execve(string(name, nameLen), lines(args, argsLen), search && PATH ? [...env.filter(entry => !entry.startsWith('PATH=')), `PATH=${PATH}`] : env, !!search && !string(name, nameLen).includes('/'));
+    yield* execve(string(name, nameLen), lines(args, argsLen), search && PATH ? [...env.filter(entry => !entry.startsWith('PATH=')), `PATH=${PATH}`] : env, !!search && !string(name, nameLen).includes('/'));
   }),
   // wait4(2): a child of this process (or the one named) once it ended, reaped; with
   // NON_BLOCKING, none if none ended yet.
-  proc_join: (pidPtr, flags, statusPtr) => attempt(() => {
+  proc_join: (pidPtr, flags, statusPtr) => attempt(function* () {
     const v = view(), tag = v.getUint8(pidPtr);
     if (tag > 1) throw new Errno(EINVAL);
     const reply = hostErrno(host('join', { pid: tag === 1 ? v.getUint32(pidPtr + 4, true) : null, nohang: (flags & 1) !== 0 }));
@@ -927,17 +972,30 @@ async function instantiate(module, type, snapshot) {
     ...(type.maximum == null ? {} : { maximum: type.maximum }),
     ...(type.shared ? { shared: true } : {}),
   }) } : {};
-  instance = await WebAssembly.instantiate(module, { wasi_snapshot_preview1: preview1, terminal, wasix_32v1: wasix, env });
+  // Where calls may suspend, each import may: one that answers at once returns at once.
+  const imports = suspending
+    ? { wasi_snapshot_preview1: suspendable(preview1), terminal: suspendable(terminal), wasix_32v1: suspendable(wasix), env }
+    : { wasi_snapshot_preview1: preview1, terminal, wasix_32v1: wasix, env };
+  instance = await WebAssembly.instantiate(module, imports);
   memory = type ? env.memory : instance.exports.memory;
   if (!(memory instanceof WebAssembly.Memory)) throw new Error('the module exports no memory');
   process.wasix = WebAssembly.Module.imports(module).some(entry => entry.module === 'wasix_32v1');
   engine = snapshot ? Engine.child(instance, () => memory, snapshot) : new Engine(instance, () => memory);
 }
-// Run the image, and what replaces it: its exit status, if `_start` returns.
+// The imports a module asks for of `namespace`, each one able to suspend the image (JSPI).
+function suspendable(namespace) {
+  return new Proxy({}, { get: (_, name) => {
+    const call = namespace[name];
+    return typeof call === 'function' ? new WebAssembly.Suspending(call) : call;
+  } });
+}
+// Run the image, and what replaces it: its exit status, if `_start` returns. Where calls may
+// suspend, `_start` runs as a promise (WebAssembly.promising), awaited.
 async function run() {
   for (;;) {
     try {
-      instance.exports._start();
+      const start = suspending ? WebAssembly.promising(instance.exports._start) : instance.exports._start;
+      await start();
     } catch (err) {
       if (!(err instanceof Replaced)) throw err;
       await replace();
@@ -966,7 +1024,7 @@ async function run() {
 // open but those marked close-on-exec.
 async function replace() {
   const { image } = await next('image');
-  for (const fd of [...cloexec]) { try { uninstall(fd); } catch { /* closed already */ } }
+  for (const fd of [...cloexec]) { try { await drive(uninstall(fd)); } catch { /* closed already */ } }
   flush();
   forget();
   snapshots = new Map();
@@ -977,9 +1035,9 @@ async function replace() {
 
 
 // utimensat(2), as WASI asks it: each time given, now, or left.
-function times(path, atim, mtim, flags) {
+function* times(path, atim, mtim, flags) {
   const time = (value, set, now) => flags & now ? 'now' : flags & set ? { sec: Number(value / 1000000000n), nsec: Number(value % 1000000000n) } : 'omit';
-  call({ utimens: { path, atime: time(atim, 1, 2), mtime: time(mtim, 4, 8) } });
+  yield* call({ utimens: { path, atime: time(atim, 1, 2), mtime: time(mtim, 4, 8) } });
   forget();
 }
 // Wait, as a sleeping process does: on a lock nobody releases, where the page may share memory;
@@ -1008,8 +1066,10 @@ const terminal = {
     pause();
     const calls = JSON.parse(string(ptr, len));
     forget();
-    reply = encoder.encode(JSON.stringify({ results: batch(calls) }));
-    return reply.length;
+    return drive((function* () {
+      reply = encoder.encode(JSON.stringify({ results: yield* batch(calls) }));
+      return reply.length;
+    })());
   },
   reply: ptr => { bytes().set(reply, ptr); },
 };
@@ -1022,6 +1082,9 @@ onmessage = ({ data }) => {
 };
 async function start(data) {
   process = { ...data, limit: data.limit ?? 10 << 20, ppid: data.ppid ?? 1 };
+  // JSPI where the engine has it, unless its host said not to (a test of the other way).
+  suspending = data.jspi !== false && typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function';
+  postMessage({ engine: suspending ? 'jspi' : 'sync' });
   control = data.control ? new Int32Array(data.control) : null;
   channel = data.channel ? { state: new Int32Array(data.channel, 0, 2), data: new Uint8Array(data.channel, 8) } : null;
   const { stdin = {}, stdout = {}, stderr = {}, fork: parent } = data;
@@ -1053,8 +1116,8 @@ async function start(data) {
   }
   // What it left open closes as it exits, as a process's descriptors do: its pipes too, so that
   // the next reads to their end, and the one before hears SIGPIPE.
-  for (const fd of [...fds.keys()]) { try { uninstall(fd); } catch { /* it exits all the same */ } }
-  if (closing.length) { try { batch([]); } catch { /* likewise */ } }
+  for (const fd of [...fds.keys()]) { try { await drive(uninstall(fd)); } catch { /* it exits all the same */ } }
+  if (closing.length) { try { await drive(batch([])); } catch { /* likewise */ } }
   flush();
   postMessage({ exit: code });
 }
