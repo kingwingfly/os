@@ -60,8 +60,8 @@ async function compile(image) {
     : await fetch(`/api/file?token=${encodeURIComponent(image.token_read)}`, { headers: { 'X-Process-Token': image.token } });
   if (!response.ok) throw await refusal(response);
   // compileStreaming compiles as the bytes arrive, when the type says wasm; bytes always work.
-  // A module that imports its memory names its type before anything runs, so a copy of the
-  // response serves that prefix while the compiler reads the original.
+  // What a module says before its code (the memory it imports, a start section) is read from a
+  // copy of the response while the compiler reads the original.
   const streamed = response.headers.get('Content-Type') === 'application/wasm';
   let prefix;
   if (streamed) {
@@ -73,25 +73,25 @@ async function compile(image) {
   }
   const imports = WebAssembly.Module.imports(module);
   const memoryImport = validateImports(imports);
-  let memory;
+  // What the module says before its code: the memory it imports, and whether it has a start
+  // function, which runs as it is instantiated (a process runs such an image by synchronous
+  // requests: nothing can be suspended before `_start`, JSPI's promising frame).
+  const { memory, start } = await heading(prefix).catch(error => {
+    throw formatError(error);
+  });
   if (memoryImport) {
-    memory = await importedMemory(prefix).catch(error => {
-      throw formatError(error);
-    });
     if (!memory) throw formatError(new Error('no env.memory type'));
     // Shared memory must declare its maximum: the engine cannot grow it past one.
     if (memory.shared && memory.maximum == null) {
       throw formatError(new Error('shared memory without a maximum'));
     }
-  } else if (streamed) {
-    prefix.body?.cancel().catch(() => { /* the compiler is done with it */ });
   }
   validateExports(module, memoryImport);
   const unwinding = imports.filter(entry => entry.module === 'wasix_32v1' && UNWINDS.has(entry.name)).map(entry => `${entry.module}.${entry.name}`);
   const built = WebAssembly.Module.exports(module).some(entry => entry.name === 'asyncify_start_unwind');
   if (unwinding.length && !built) module = await forkable(image, unwinding);
   stats.compiled++;
-  return { module, memory };
+  return { module, memory: memoryImport ? memory : undefined, startSection: start };
 }
 
 // The image made forkable: asyncify's pass, in a Worker, its result kept by content.
@@ -185,11 +185,13 @@ async function refusal(response) {
   throw Object.assign(new Error(message), { errno });
 }
 
-// The memory `env.memory` declares, as the image's import section says: {initial, maximum,
-// shared}. Only that section's prefix is read, and only for images that import a memory.
-async function importedMemory(prefix) {
+// What the image's sections before its code say: the memory `env.memory` declares, as its
+// import section has it ({initial, maximum, shared}), and whether it has a start section. Only
+// that prefix is read, the sections' contents skipped but the imports'.
+async function heading(prefix) {
   const { pull, close } = sourceOf(prefix);
   const cursor = new Cursor(pull);
+  let memory, start = false;
   try {
     const magic = await cursor.bytes(4);
     if (magic[0] !== 0x00 || magic[1] !== 0x61 || magic[2] !== 0x73 || magic[3] !== 0x6d) {
@@ -204,19 +206,19 @@ async function importedMemory(prefix) {
       try {
         id = await cursor.u8();
       } catch {
-        // The sections ended before an import section: there is none.
-        return undefined;
+        // The sections ended.
+        return { memory, start };
       }
-      // Sections ascend: types (1) precede imports (2), and nothing but custom sections (0)
-      // may come before them. Past 2, there is no import section at all.
-      if (id > 2) return undefined;
+      // Sections ascend (custom ones, 0, anywhere): past the start section (8), the elements,
+      // data count, code and data follow, and nothing this asks of.
+      if (id > 8) return { memory, start };
       const size = await cursor.u32();
+      if (id === 8) start = true;
       if (id !== 2) {
         await cursor.skip(size);
         continue;
       }
       const count = await cursor.u32();
-      let memory;
       for (let index = 0; index < count; index++) {
         const module = await cursor.string();
         const name = await cursor.string();
@@ -239,7 +241,6 @@ async function importedMemory(prefix) {
           throw new Error(`unknown import kind ${kind}`);
         }
       }
-      return memory;
     }
   } finally {
     close();
