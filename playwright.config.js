@@ -10,7 +10,7 @@ export default defineConfig({
     { name: 'chromium', use: { browserName: 'chromium',
       launchOptions: { env: browserEnv, args: ['--ozone-platform=headless', '--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'] } } },
     // The process engine in a second browser: its calls by JSPI and by synchronous XHR, fork,
-    // exec and pipes.
-    { name: 'firefox', testMatch: ['exec.spec.js', 'fork.spec.js'], use: { browserName: 'firefox', launchOptions: { env: browserEnv } } },
+    // exec, pipes and process authorization.
+    { name: 'firefox', testMatch: ['exec.spec.js', 'fork.spec.js', 'process-security.spec.js'], use: { browserName: 'firefox', launchOptions: { env: browserEnv } } },
   ],
 });

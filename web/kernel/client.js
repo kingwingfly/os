@@ -15,9 +15,10 @@
 // process, by asking which locks are held. Each kernel holds one too, `tw-kernel-<id>`: the pids
 // a kernel that is gone was lent go back the same way.
 //
-// A process is its host's: the port that executed it, bound to the tab it first said it was.
-// Only that port forks it, replaces its image, ends it, waits for its children, or signals as
-// it; another tab's page learns nothing of its token.
+// A process is its host's: the port that executed it, under an identity of the port's own (not
+// the tab it said it was, whose lock any same-origin page can see). Only that port forks it,
+// replaces its image, ends it, waits for its children, or signals as it; another tab's page
+// learns nothing of its token.
 importScripts('/client_kernel.js');
 
 const VERSION = 1;
@@ -32,7 +33,9 @@ let starting;
 const kernelId = self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 const kernelLock = id => `tw-kernel-${id}`;
 if (locks) void locks.request(kernelLock(kernelId), () => new Promise(() => {})).catch(() => {});
-// Each port's host: the tab it said it was first, or a name of its own.
+// Each port's host: an identity of its own, made here, and the tab it first said it was. A tab
+// id is a Web Lock's name, which any same-origin page can read: it says whose lock ends the
+// port's processes, never which port owns them.
 const hosts = new WeakMap();
 // What the kernel does, one thing at a time.
 let queue = Promise.resolve();
@@ -155,8 +158,8 @@ function failure(error) {
   return { errno: 'EIO', detail: String(error?.message ?? error) };
 }
 
-async function dispatch(message, host) {
-  const { type, args = {}, tab } = message;
+async function dispatch(message, host, tab) {
+  const { type, args = {} } = message;
   switch (type) {
     case 'init': return boot();
     case 'version': return kernel.version();
@@ -190,19 +193,23 @@ async function handle(port, message) {
     return;
   }
   ports.add(port);
-  // A port is the tab it said it was first, and no other.
-  if (!hosts.has(port)) hosts.set(port, message.tab ?? `port-${self.crypto?.randomUUID?.() ?? Math.random()}`);
+  // A port's authority is an identity of its own, not the tab it names: another port that says
+  // the same tab is still another host. The tab it first said it was cannot change.
+  if (!hosts.has(port)) hosts.set(port, {
+    id: `port-${self.crypto?.randomUUID?.() ?? Math.random()}`,
+    tab: message.tab,
+  });
   const host = hosts.get(port);
-  if (message.tab != null && message.tab !== host) {
+  if (message.tab != null && message.tab !== host.tab) {
     port.postMessage({ v: VERSION, id: message.id, err: { errno: 'EPERM', detail: 'a port speaks for the tab it first said it was' } });
     return;
   }
   // The browser's kernel outlives its tabs, and reaps what each leaves; a tab's own kernel goes
   // with its tab.
-  if (sharing) watch(message.tab);
+  if (sharing) watch(host.tab);
   try {
     await boot();
-    const value = await serially(() => dispatch(message, host));
+    const value = await serially(() => dispatch(message, host.id, host.tab));
     // A wait answers once the machine heard of it, so that /proc agrees.
     if (message.type === 'wait' || message.type === 'waitchild') await heard();
     port.postMessage({ v: VERSION, id: message.id, ok: value });
