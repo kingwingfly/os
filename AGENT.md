@@ -292,6 +292,12 @@ Settled while resolving the two reviews of phases 0–4; keep them as later phas
   described to the host (`{described}`, `{closed}`, checked by generation). Offsets are locked
   per description from choice to update (`exclusive`). Exits carry `{exit, signal}` explicitly;
   128+n is never read back as a signal.
+- **Holder tables (#36):** `Shares` and `Pipe` keep a place for every process a namespace may
+  have (`PROC_MAX`; a pipe one more, for the page). A holder's place is freed once it holds
+  nothing, so children one after another never fill it. A reference is only ever counted as some
+  holder's (`add` and `hold` refuse, counting nothing, when no place is free; a fork checks
+  `holdable` first and fails with EAGAIN), so a description's total is what its holders hold and a
+  killed holder's `release` takes all of its share.
 - **Fork state includes tables:** the transform exports every table and `__tw_functions` (every
   function, in order); `Engine.snapshot` records entries by function number and `Engine.child`
   sets them. Built images get the export pass without asyncify. The cache is `tw-asyncify-2`,

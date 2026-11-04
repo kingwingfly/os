@@ -294,6 +294,34 @@ const FORK_READ = wasix(`${FORK} ${JOIN}
     (drop (call $read (i32.const 0) (i32.const 2200) (i32.const 1) (i32.const 2208)))
     (call $say (i32.const 3000) (i32.load (i32.const 2208)))`);
 
+// A file a line shares, then many children of it: it opens `holdersOut` (from /, its preopen),
+// and forks 16 children one after another, each ending at once, closing what it inherited. It
+// forks one more, which makes no call and is ended by SIGKILL (its host ends it outright, and
+// lets go of what it held). Its own write then goes to the file with its close, the last, and it
+// says "closed".
+const holdersOut = 'tmp/fork-holders-' + Date.now().toString(36);
+const FORK_HOLDERS = wasix(`${FORK} ${JOIN}
+  (import "wasix_32v1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+  (import "wasix_32v1" "fd_close" (func $close (param i32) (result i32)))
+  (import "wasix_32v1" "proc_signal" (func $signal (param i32 i32) (result i32)))`, `
+    (local $i i32)
+    (drop (call $open (i32.const 3) (i32.const 0) (i32.const 1100) (i32.const ${holdersOut.length}) (i32.const 9) (i64.const -1) (i64.const -1) (i32.const 0) (i32.const 2300)))
+    (loop $children
+      (drop (call $fork (i32.const 1) (i32.const 2060)))
+      (if (i32.eqz (i32.load (i32.const 2060))) (then (call $exit (i32.const 0))))
+      ${WAIT_CHILD}
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $children (i32.lt_u (local.get $i) (i32.const 16))))
+    (drop (call $fork (i32.const 1) (i32.const 2060)))
+    (if (i32.eqz (i32.load (i32.const 2060))) (then (loop $spin (br $spin))))
+    (drop (call $signal (i32.load (i32.const 2060)) (i32.const 9)))
+    ${WAIT_CHILD}
+    (i32.store (i32.const 2048) (i32.const 1040))
+    (i32.store (i32.const 2052) (i32.const 5))
+    (drop (call $write (i32.load (i32.const 2300)) (i32.const 2048) (i32.const 1) (i32.const 2056)))
+    (if (i32.eqz (call $close (i32.load (i32.const 2300)))) (then (call $say (i32.const 1056) (i32.const 7))))`,
+`(data (i32.const 1040) "done\\n") (data (i32.const 1056) "closed\\n") (data (i32.const 1100) "${holdersOut}")`);
+
 let base, headers;
 async function uploads(request, files) {
   base = '/fork-' + Date.now().toString(36);
@@ -382,6 +410,22 @@ test.describe('fork in the terminal', () => {
     const orphan = () => call(page, 'poll', { pids: [] }).then(reply => value(reply).find(process => process.argv.join(' ') === 'coreutils sleep 3'));
     await expect.poll(async () => (await orphan())?.ppid).toBe(1);
     await expect.poll(orphan, { timeout: 15_000 }).toBeUndefined();
+  });
+
+  // A file's holders (web/wasi/shared.js), one after another, and then one killed outright: the
+  // last close is still the last, and what was written goes to the file with it.
+  test('a file shared by many children, one after another, then one killed, still closes with its writer', async ({ page, request }) => {
+    await uploads(request, { 'fork-holders': FORK_HOLDERS });
+    try {
+      await page.goto('/');
+      await command(page, `cd ${base}`);
+      await command(page, './fork-holders');
+      await expect(last(page)).toHaveText('closed', { timeout: 60_000 });
+      await command(page, `cat /${holdersOut}`);
+      await expect(last(page)).toHaveText('done');
+    } finally {
+      await rmrf(request, '/' + holdersOut);
+    }
   });
 
   test('dash forks, pipes, executes and redirects', async ({ page, request }) => {
