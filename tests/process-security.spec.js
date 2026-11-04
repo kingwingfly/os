@@ -203,13 +203,8 @@ test('a new port cannot impersonate the tab named by a visible Web Lock', async 
     expect(visible).toBe(`tw-tab-${tab}`);
     await connect(other, { tab: visible.slice('tw-tab-'.length) });
     stolen = await kernel(other, 'fork', { pid: parent.pid });
-    if (stolen.ok) {
-      // Confirm the returned capability really acts as root after the page signed out.
-      expect(value((await batch(other, ['getcreds']))[0]).uid).not.toBe(0);
-      expect(value((await batch(other, ['getcreds'], { pid: stolen.ok.pid, proc: stolen.ok.token }))[0]).uid).toBe(0);
-    }
-    // Keep exercising the exploit; an unexpected pass means the fix is ready to unmark.
-    test.fail(true, 'Known port-identity bypass: https://github.com/kingwingfly/terminal_worker/issues/34');
+    // The tab id is public; it names the lock that ends the port's processes, not the port that
+    // runs them. Another port claiming it is still another host, and gets no token.
     expect(stolen.err?.errno).toBe('ESRCH');
     expect(stolen.ok).toBeUndefined();
   } finally {
