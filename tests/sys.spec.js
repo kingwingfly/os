@@ -1,5 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { api, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
@@ -446,7 +447,8 @@ test('execve runs /usr binaries, snapshots the caller, and refuses what Linux re
   expect((await root.sys({ stat: { path: base + '/from-process' } })).user).toBe('root');
   // exit and wait: the status is waitpid's 5 << 8.
   expect(await root.sys({ exit: { status: 5 } }, { pid: exec.pid, proc: exec.token })).toBeNull();
-  const waited = await root.sys({ wait: { pid: String(exec.pid) } });
+  expect(await root.sys({ wait: { pid: String(exec.pid) } })).toBe('EPERM');
+  const waited = await root.sys({ wait: { pid: String(exec.pid) } }, {}, true);
   expect(waited.status).toBe(5 << 8);
   expect(waited.pid).toBe(exec.pid);
 
@@ -471,7 +473,7 @@ test('execve runs /usr binaries, snapshots the caller, and refuses what Linux re
     expect(clone.asset).toBe('/usr/bin/coreutils.wasm');
     expect(clone.version).toBe(exec.version);
     expect(await root.sys({ exit: { status: 0 } }, { pid: clone.pid, proc: clone.token })).toBeNull();
-    expect((await root.sys({ wait: { pid: String(clone.pid) } })).pid).toBe(clone.pid);
+    expect((await root.sys({ wait: { pid: String(clone.pid) } }, {}, true)).pid).toBe(clone.pid);
   }
 
   const dir = base + '/execve';
@@ -485,7 +487,7 @@ test('execve runs /usr binaries, snapshots the caller, and refuses what Linux re
   expect(xonly.token_read).toMatch(/^[0-9a-f]{64}$/);
   expect(xonly.asset).toBeUndefined();
   expect(await root.sys({ exit: { status: 0 } }, { pid: xonly.pid, proc: xonly.token })).toBeNull();
-  expect((await root.sys({ wait: { pid: String(xonly.pid) } })).pid).toBe(xonly.pid);
+  expect((await root.sys({ wait: { pid: String(xonly.pid) } }, {}, true)).pid).toBe(xonly.pid);
   // An argument vector over Linux's limit is E2BIG before the image is looked at.
   expect(await root.sys({ execve: { path: '/usr/bin/coreutils', argv: ['x'.repeat(129 * 1024)], env: [], cwd: '/' } })).toBe('E2BIG');
 });
@@ -557,7 +559,7 @@ test('uploaded wasm execves, its image read by the process token alone', async (
   expect(close.err.errno).toBe('EBADF');
   // exit and wait reap it: its token reads no more, and no call of it runs.
   expect(await ann.sys({ exit: { status: 0 } }, { pid: exec.pid, proc: exec.token })).toBeNull();
-  expect((await ann.sys({ wait: { pid: String(exec.pid) } })).pid).toBe(exec.pid);
+  expect((await ann.sys({ wait: { pid: String(exec.pid) } }, {}, true)).pid).toBe(exec.pid);
   expect((await ann.context.get(`${origin}/api/file?token=${exec.token_read}`, { headers: { 'X-Process-Token': exec.token } })).status()).toBe(403);
   const [reaped] = await ann.batch([{ getpid: null }], { pid: exec.pid, proc: exec.token });
   expect(reaped.err.errno).toBe('EPERM');
@@ -570,6 +572,7 @@ test('uploaded wasm execves, its image read by the process token alone', async (
   expect(xonly.token_read).toMatch(/^[0-9a-f]{64}$/);
   expect((await ann.context.get(`${origin}/api/file?token=${xonly.token_read}`, { headers: { 'X-Process-Token': xonly.token } })).status()).toBe(200);
   expect(await ann.sys({ exit: { status: 0 } }, { pid: xonly.pid, proc: xonly.token })).toBeNull();
+  expect((await ann.sys({ wait: { pid: String(xonly.pid) } }, {}, true)).pid).toBe(xonly.pid);
 
   // The exec token's X rule is root's too: a 0755 image read by its token, then chmod 0644,
   // is EACCES although root may otherwise read anything.
@@ -580,6 +583,7 @@ test('uploaded wasm execves, its image read by the process token alone', async (
   expect(await root.sys({ chmod: { path: dir + '/rootx.wasm', mode: 0o644 } })).toBe(null);
   expect((await root.context.get(`${origin}/api/file?token=${rootx.token_read}`, { headers: { 'X-Process-Token': rootx.token } })).status()).toBe(403);
   expect(await root.sys({ exit: { status: 0 } }, { pid: rootx.pid, proc: rootx.token })).toBeNull();
+  expect((await root.sys({ wait: { pid: String(rootx.pid) } }, {}, true)).pid).toBe(rootx.pid);
 
   // One still uploading is ETXTBSY.
   const [opened] = await ann.batch([{ open: { path: dir + '/busy.wasm', flags: 0o1 | 0o100, mode: 0o755, size: WASM.length } }]);
@@ -589,23 +593,74 @@ test('uploaded wasm execves, its image read by the process token alone', async (
 });
 
 test('a process uses its own descriptors, and a page its own: neither reaches the other\'s', async () => {
-  const [mine] = await root.batch([{ open: { path: '/etc/passwd', flags: 0 } }]);
-  const exec = await root.sys({ execve: { path: '/usr/bin/coreutils', argv: ['coreutils', 'true'], env: [], cwd: '/' } });
-  const as = { pid: exec.pid, proc: exec.token };
-  // The page's descriptor, root's at that, is not the process's to read.
-  const [stolen] = await root.batch([{ pread: { fd: mine.ok.fd, count: 4 } }], as);
-  expect(stolen.err.errno).toBe('EBADF');
-  // What the process opens is its own: the page cannot read it, the process can.
-  const [own] = await root.batch([{ open: { path: '/etc/group', flags: 0 } }], as);
-  const [peek] = await root.batch([{ pread: { fd: own.ok.fd, count: 4 } }]);
-  expect(peek.err.errno).toBe('EBADF');
-  const [read] = await root.batch([{ pread: { fd: own.ok.fd, count: 4 } }], as);
-  expect(Buffer.from(read.ok.data, 'base64').toString()).toBe('root');
-  // It closes as the process ends, as a process's descriptors do.
-  expect(await root.sys({ exit: { status: 0 } }, as)).toBeNull();
-  expect((await root.sys({ wait: { pid: String(exec.pid) } })).pid).toBe(exec.pid);
-  const open = (await root.sys({ getdents: { path: '/proc/self/fd' } })).map(entry => entry.name);
-  expect(open).not.toContain(String(own.ok.fd));
-  expect(open).toContain(String(mine.ok.fd));
-  await root.batch([{ close: { fd: mine.ok.fd } }]);
+  // Fresh sessions deliberately allocate the same number for two different files.
+  const page = await session('root', rootPassword);
+  const path = '/tmp/process-close-' + Date.now().toString(36);
+  try {
+    const mine = await page.sys({ open: { path: '/etc/passwd', flags: 0 } });
+    const exec = await page.sys({ execve: { path: '/usr/bin/coreutils', argv: ['coreutils', 'true'], env: [], cwd: '/' } });
+    const as = { pid: exec.pid, proc: exec.token };
+    expect(await page.sys({ pread: { fd: mine.fd, count: 64 } }, as)).toBe('EBADF');
+    const own = await page.sys({ open: { path: '/etc/group', flags: 0 } }, as);
+    expect(own.fd).toBe(mine.fd);
+    const link = { readlink: { path: `/proc/self/fd/${own.fd}` } };
+    expect(await page.sys(link)).toBe('/etc/passwd');
+    expect(await page.sys(link, as)).toBe('/etc/group');
+    const read = options => page.sys({ pread: { fd: own.fd, offset: 0, count: 64 } }, options);
+    expect(Buffer.from((await read(as)).data, 'base64').toString()).toMatch(/^root:x:0:/);
+    expect(Buffer.from((await read()).data, 'base64').toString()).toMatch(/^root:x:0:0:/);
+
+    // Ending the line releases its writer's lease, so the page can resume and close it.
+    const writing = { path, flags: 0o1 | 0o100, mode: 0o600, size: 8, sha256: createHash('sha256').update('finished').digest('hex') };
+    const writer = await page.sys({ open: writing }, as);
+    expect(await page.sys({ pwrite: { fd: writer.fd, index: 0, data: Buffer.from('finished').toString('base64') } }, as)).toBeTruthy();
+    expect((await page.sys({ stat: { path } })).writing).toBeTruthy();
+    expect(await page.sys({ open: writing })).toBe('EBUSY');
+    expect(await page.sys({ exit: { status: 0 } }, as)).toBeNull();
+    expect((await page.sys({ wait: { pid: String(exec.pid) } }, {}, true)).pid).toBe(exec.pid);
+    const resumed = await page.sys({ open: writing });
+    expect(resumed, JSON.stringify(resumed)).toMatchObject({ resumed: true });
+    expect(await page.sys({ close: { fd: resumed.fd } })).toMatchObject({ size: 8 });
+    expect((await page.sys({ stat: { path } })).writing).toBeUndefined();
+    expect(await (await page.context.get(`/api/file?path=${path}`)).text()).toBe('finished');
+    expect(await read(as)).toBe('EPERM');
+    expect(await page.sys(link)).toBe('/etc/passwd');
+    expect((await page.sys({ getdents: { path: '/proc/self/fd' } })).map(entry => entry.name)).toEqual([String(mine.fd)]);
+    expect(await page.sys({ close: { fd: mine.fd } })).toBeTruthy();
+  } finally {
+    await rmrf(page.context, path);
+    await page.context.dispose();
+  }
+});
+
+test('a process keeps its descriptors and credentials when its page changes account', async () => {
+  const page = await session('root', rootPassword);
+  const path = '/tmp/process-account-' + Date.now().toString(36);
+  try {
+    expect((await put(page.context, `/api/file?path=${path}`, { data: 'root-only content' })).ok()).toBe(true);
+    expect(await page.sys({ chmod: { path, mode: 0o600 } })).toBeNull();
+    const exec = await page.sys({ execve: { path: '/usr/bin/coreutils', argv: ['coreutils', 'true'], env: [], cwd: '/' } });
+    const as = { pid: exec.pid, proc: exec.token };
+    const opened = await page.sys({ open: { path, flags: 0 } }, as);
+    const before = await page.sys('getcreds', as);
+    const read = () => page.sys({ pread: { fd: opened.fd, offset: 0, count: 64 } }, as);
+    expect(Buffer.from((await read()).data, 'base64').toString()).toBe('root-only content');
+    expect((await api(page.context, 'login', { data: { username: name, password } })).ok()).toBe(true);
+    expect((await page.sys('getcreds')).user).toBe(name);
+    expect(await page.sys({ open: { path, flags: 0 } })).toBe('EACCES');
+    expect(await page.sys('getcreds', as)).toMatchObject({
+      uid: before.uid, user: before.user, gid: before.gid, group: before.group,
+      groups: before.groups, home: before.home,
+    });
+    expect(Buffer.from((await read()).data, 'base64').toString()).toBe('root-only content');
+    const streamed = await page.context.get(`/api/file?token=${opened.token}`, { headers: { 'X-Process-Token': exec.token } });
+    expect(streamed.status()).toBe(200);
+    expect(await streamed.text()).toBe('root-only content');
+    expect(await page.sys({ exit: { status: 0 } }, as)).toBeNull();
+    expect((await page.sys({ wait: { pid: String(exec.pid) } }, {}, true)).pid).toBe(exec.pid);
+    expect(await read()).toBe('EPERM');
+  } finally {
+    await rmrf(root.context, path);
+    await page.context.dispose();
+  }
 });
