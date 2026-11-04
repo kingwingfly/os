@@ -336,6 +336,12 @@ export async function exec(stages, options = {}) {
     const fork = async state => {
       let child;
       try {
+        // Each pipe and open file it shares must have a place for another holder (as many as a
+        // namespace has processes): EAGAIN otherwise, as fork(2) says, before a pid is taken.
+        const full = description => description.kind === 'pipe-in' || description.kind === 'pipe-out'
+          ? !known(description.buffer).holdable(0)
+          : description.share != null && !files?.shares.holdable(description.share);
+        if (state.descriptions.some(full)) throw Object.assign(new Error('no holder free'), { errno: 'EAGAIN' });
         child = await kernelCall('fork', { pid });
       } catch (error) {
         worker.postMessage({ forked: { errno: error.errno ?? 'EIO' } });

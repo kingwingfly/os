@@ -20,9 +20,10 @@ const ATOMIC = 4096;
 // Its state, as 32-bit words before the bytes: where reading and writing are (counts that wrap),
 // whether each end is gone, ends of file pending (Ctrl+D), a count of changes to wait on, the
 // writers' and the readers' locks (the pid holding each), then each holder's pid and how many
-// references it holds to the reading and the writing end.
+// references it holds to the reading and the writing end: as many holders as a namespace has
+// processes (abi::PROC_MAX), and the page; one is never held uncounted.
 const READ = 0, WRITE = 1, WRITER_GONE = 2, READER_GONE = 3, EOF = 4, CHANGES = 5, WRITING = 6, READING = 7;
-const HOLDERS = 8, HOLDER = 3, HOLDERS_MAX = 32, WORDS = HOLDERS + HOLDERS_MAX * HOLDER;
+const HOLDERS = 8, HOLDER = 3, HOLDERS_MAX = 65, WORDS = HOLDERS + HOLDERS_MAX * HOLDER;
 // The ends, as a holder's words count them.
 const ENDS = { r: 1, w: 2 };
 // The page, as a holder of the ends it writes (the terminal's input).
@@ -61,10 +62,22 @@ export class Pipe {
     }
     return -1;
   }
-  // `pid` holds `count` more references to the end `end` ('r' or 'w').
+  // Whether `pid` may hold an end (unlike `room`, the space left to write): it holds one, or a
+  // holder's slot is free.
+  holdable(pid) {
+    for (let index = 0; index < HOLDERS_MAX; index++) {
+      const holder = Atomics.load(this.state, HOLDERS + index * HOLDER);
+      if (holder === 0 || holder === pid) return true;
+    }
+    return false;
+  }
+  // `pid` holds `count` more references to the end `end` ('r' or 'w'): false, and nothing
+  // counted, if no slot is free for it.
   hold(pid, end, count = 1) {
     const at = this.slot(pid, true);
-    if (at >= 0) Atomics.add(this.state, at + ENDS[end], count);
+    if (at < 0) return false;
+    Atomics.add(this.state, at + ENDS[end], count);
+    return true;
   }
   // `pid` closed `count` of its references to `end`: the end is gone once none holds it.
   drop(pid, end, count = 1) {

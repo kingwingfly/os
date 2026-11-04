@@ -15,8 +15,12 @@
 
 // A description's words: in use, references, offset (low and high halves), the pid holding its
 // lock, its generation (a slot used again is another description), then its holders, each a
-// pid and how many references it holds.
-const USED = 0, REFS = 1, POS = 2, LOCK = 4, GEN = 5, HOLDERS = 6, HOLDERS_MAX = 16;
+// pid and how many references it holds. A holder's place is free again once it holds none, and
+// there are as many as a namespace has processes (abi::PROC_MAX), so that every process of a
+// line can hold every description; references are only ever counted as some holder's, so that
+// the total is what the holders hold.
+export const HOLDERS_MAX = 64;
+const USED = 0, REFS = 1, POS = 2, LOCK = 4, GEN = 5, HOLDERS = 6;
 const SLOT = HOLDERS + HOLDERS_MAX * 2, SLOTS = 512;
 
 // Wait on `words[at]` while it is `value`, for at most `ms`, where a Worker may; `meanwhile`
@@ -50,7 +54,7 @@ export class Shares {
   }
   gen(slot) { return Atomics.load(this.words, this.at(slot, GEN)); }
   // The word counting `pid`'s references to `slot`, claimed if it holds none yet: -1 if every
-  // holder's place is taken (its references are then counted, but not as its).
+  // holder's place is taken.
   holder(slot, pid, claim) {
     const first = this.at(slot, HOLDERS);
     for (let index = 0; index < HOLDERS_MAX; index++) {
@@ -63,17 +67,29 @@ export class Shares {
     }
     return -1;
   }
-  // `pid` holds `count` more references to `slot` (a fork's child, its parent's).
+  // Whether another process may hold `slot`: a holder's place is free.
+  holdable(slot) {
+    const first = this.at(slot, HOLDERS);
+    for (let index = 0; index < HOLDERS_MAX; index++) {
+      if (Atomics.load(this.words, first + index * 2) === 0) return true;
+    }
+    return false;
+  }
+  // `pid` holds `count` more references to `slot` (a fork's child, its parent's): false, and
+  // nothing counted, if no holder's place is free for it.
   add(slot, pid, count) {
     const at = this.holder(slot, pid, true);
-    if (at >= 0) Atomics.add(this.words, at, count);
+    if (at < 0) return false;
+    Atomics.add(this.words, at, count);
     Atomics.add(this.words, this.at(slot, REFS), count);
+    return true;
   }
-  // `pid` closed one of its references: how many are left, of everyone's; the slot is free
-  // once none is.
+  // `pid` closed one of its references: how many are left, of everyone's; its place is free
+  // once it holds none, and the slot once nobody does. A pid that holds none takes nothing.
   drop(slot, pid) {
     const at = this.holder(slot, pid, false);
-    if (at >= 0 && Atomics.load(this.words, at) > 0) Atomics.sub(this.words, at, 1);
+    if (at < 0 || Atomics.load(this.words, at) <= 0) return Atomics.load(this.words, this.at(slot, REFS));
+    if (Atomics.sub(this.words, at, 1) === 1) Atomics.compareExchange(this.words, at - 1, pid, 0);
     return this.left(slot, Atomics.sub(this.words, this.at(slot, REFS), 1) - 1);
   }
   left(slot, refs) {

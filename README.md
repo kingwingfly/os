@@ -438,6 +438,8 @@ Workers (`web/wasi/process.js`), with WASIX's process calls over the client kern
   read or a write holds a lock of from choosing it to moving it; only the last close closes it,
   and a file being written keeps its bytes in memory they share (`web/wasi/shared.js`). A pipe
   counts its holders, so its end of file comes when every writer has closed, a killed one too.
+  Both have a place for every process a namespace may have, freed as a holder closes its last
+  descriptor; a fork that would leave one uncounted fails with EAGAIN.
 - **Signals that end a process** are heeded at its next call: it exits by the signal, closing
   what it has open, so what it wrote is kept, as a killed process's writes are on Linux. One that
   makes no call for a second is ended outright; its host then lets go of what it held and closes

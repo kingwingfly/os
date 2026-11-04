@@ -123,3 +123,58 @@ test('a line\'s open files are counted by holder: a killed process\'s go, and th
   bytes.lock(10);
   bytes.unlock();
 });
+
+test('a holder\'s place is free once it holds nothing: children one after another never fill it', async () => {
+  const { Shares } = await import('../web/wasi/shared.js');
+  const shares = new Shares();
+  const slot = shares.claim(1, 1, 0);
+  // Each child inherits the description and closes it as it exits.
+  for (let pid = 2; pid < 200; pid++) {
+    assert.equal(shares.add(slot, pid, 1), true);
+    assert.equal(shares.drop(slot, pid), 1);
+  }
+  // One killed after them all is still counted as its own, and goes with its host's release.
+  assert.equal(shares.add(slot, 200, 1), true);
+  assert.deepEqual(shares.release(200), []);
+  // The parent's close is the last.
+  assert.equal(shares.drop(slot, 1), 0);
+});
+
+test('a pipe has a place for each process and the page, and never holds an end uncounted', async () => {
+  const { Pipe, PAGE, pipeBuffer } = await import('../web/wasi/pipe.js');
+  const pipe = new Pipe(pipeBuffer(64));
+  assert.equal(pipe.hold(PAGE, 'w'), true);
+  for (let pid = 1; pid <= 64; pid++) assert.equal(pipe.hold(pid, 'r'), true);
+  assert.equal(pipe.holdable(65), false);
+  assert.equal(pipe.hold(65, 'r'), false);
+  // Holding is not the room to write: what is written is there to read.
+  assert.equal(pipe.room, 64);
+  pipe.write(new TextEncoder().encode('held'));
+  assert.equal(new TextDecoder().decode(pipe.read(64)), 'held');
+  // Its readers close, one after another: the end is gone with the last, not before.
+  for (let pid = 1; pid < 64; pid++) pipe.drop(pid, 'r');
+  assert.equal(pipe.readerGone, false);
+  assert.equal(pipe.holdable(65), true);
+  pipe.drop(64, 'r');
+  assert.equal(pipe.readerGone, true);
+});
+
+test('a table with no place for another holder refuses it, and counts nothing for it', async () => {
+  const { Shares, HOLDERS_MAX } = await import('../web/wasi/shared.js');
+  // As many holders as a namespace has processes.
+  assert.ok(HOLDERS_MAX >= 64);
+  const shares = new Shares();
+  const slot = shares.claim(1, 1, 0);
+  for (let pid = 2; pid <= HOLDERS_MAX; pid++) assert.equal(shares.add(slot, pid, 1), true);
+  assert.equal(shares.holdable(slot), false);
+  assert.equal(shares.add(slot, 1000, 1), false);
+  // What it did not count, its close does not take from the others'.
+  assert.equal(shares.drop(slot, 1000), HOLDERS_MAX);
+  // One holder gone, another may come.
+  assert.equal(shares.drop(slot, 2), HOLDERS_MAX - 1);
+  assert.equal(shares.holdable(slot), true);
+  assert.equal(shares.add(slot, 1000, 1), true);
+  for (let pid = 3; pid <= HOLDERS_MAX; pid++) shares.drop(slot, pid);
+  assert.equal(shares.drop(slot, 1000), 1);
+  assert.equal(shares.drop(slot, 1), 0);
+});
