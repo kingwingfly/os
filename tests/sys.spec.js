@@ -167,6 +167,39 @@ test('descriptors are their session\'s, a browser signed out its own; a clone sh
   expect((await ann.sys({ close: { fd: held.ok.fd } })).path).toBe(dir + '/a.txt');
 });
 
+test('fchmod changes the file a descriptor has open; discard lets go of what it was writing', async () => {
+  const O_WRONLY = 0o1, O_CREAT = 0o100, O_EXCL = 0o200, O_TRUNC = 0o1000;
+  const dir = base + '/fchmod';
+  await root.batch([{ mkdir: { path: base, mode: 0o777 } }, { mkdir: { path: dir, mode: 0o777 } }, { chmod: { path: dir, mode: 0o1777 } }]);
+  // A new file's mode, past the umask, through the descriptor its open made, in one batch.
+  const made = await ann.batch([
+    { open: { path: `${dir}/new`, flags: O_WRONLY | O_CREAT | O_EXCL, mode: 0o644, size: 1 } },
+    { fchmod: { fd: { ref: 0 }, mode: 0o4775 } },
+  ]);
+  expect(made[1], JSON.stringify(made)).toEqual({ ok: null });
+  expect((await ann.sys({ lstat: { path: `${dir}/new` } })).mode & 0o7777).toBe(0o4775);
+  // An open that failed (EEXIST) leaves nothing for the fchmod after it to change.
+  const refused = await ann.batch([
+    { open: { path: `${dir}/new`, flags: O_WRONLY | O_CREAT | O_EXCL, mode: 0o644, size: 1 } },
+    { fchmod: { fd: { ref: 0 }, mode: 0o777 } },
+  ]);
+  expect(refused.map(result => result.err?.errno)).toEqual(['EEXIST', 'EEXIST']);
+  expect((await ann.sys({ lstat: { path: `${dir}/new` } })).mode & 0o7777).toBe(0o4775);
+  // discard: a new file the descriptor was writing goes, by its content, whatever its name now.
+  expect((await ann.sys({ discard: { fd: made[0].ok.fd } })).discarded).toBe(true);
+  expect(await ann.sys({ lstat: { path: `${dir}/new` } })).toBe('ENOENT');
+  // A file written over keeps its old content.
+  const old = await ann.sys({ open: { path: `${dir}/kept`, flags: O_WRONLY | O_CREAT | O_EXCL, mode: 0o644, size: 3 } });
+  expect((await ann.context.put(`/api/pwrite?fd=${old.fd}&index=0`, { data: 'old' })).ok()).toBe(true);
+  await ann.sys({ close: { fd: old.fd } });
+  const over = await ann.sys({ open: { path: `${dir}/kept`, flags: O_WRONLY | O_TRUNC, size: 3 } });
+  expect((await ann.sys({ discard: { fd: over.fd } })).discarded).toBe(true);
+  expect(await (await ann.context.get(`/api/file?path=${encodeURIComponent(dir + '/kept')}`)).text()).toBe('old');
+  // A descriptor whose file is complete, or that only reads, closes as close(2) does.
+  const read = await ann.sys({ open: { path: `${dir}/kept`, flags: 0 } });
+  expect((await ann.sys({ discard: { fd: read.fd } })).path).toBe(`${dir}/kept`);
+});
+
 test('a batch has a limit, and what is not a batch is refused', async () => {
   const response = await root.context.post('/api/sys', { data: { calls: Array.from({ length: 257 }, () => 'getcreds') } });
   expect(response.status()).toBe(400);

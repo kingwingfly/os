@@ -9,13 +9,16 @@
 //!   deterministic, so after an interruption the chunks already stored are checked against
 //!   the new build's, and the upload starts over only if one differs.
 //!
-//! Bytes go between R2 and the container as streams, and every file written is written through
-//! the authority, as the job's account.
+//! Bytes go between R2 and the container as streams. The job is a process (Phase 4): its spawn
+//! handed this runner the job's token, the one key to its credentials, and every file the job
+//! looks at or writes goes through the system calls with it (`sys`, and pwrite's two halves for
+//! a chunk), checked as any process's are, as who started it was then.
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Duration;
 
+use abi::{Call, Errno, O_CREAT, O_EXCL, O_TRUNC, O_WRONLY, Return};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use terminal_worker_core::CHUNK_SIZE;
@@ -24,7 +27,6 @@ use terminal_worker_core::permissions::{mode_text, type_mode_text};
 use wasm_bindgen::JsValue;
 use worker::*;
 
-use crate::api::chunk_key;
 use crate::db::Job;
 use crate::files::decode_hex;
 use crate::jobs::Spec;
@@ -41,6 +43,8 @@ const ATTEMPTS: u32 = 5;
 pub struct JobRunner {
     state: State,
     env: Env,
+    /// The directories a step made or found, which it does not make again.
+    made: RefCell<std::collections::BTreeSet<String>>,
 }
 
 /// What a step leaves to do.
@@ -50,6 +54,20 @@ enum Step {
     /// Nothing until someone answers the job's question.
     Wait,
     Done,
+}
+
+/// A file the job writes: its descriptor, its path, whether the job made it (or writes over
+/// one there), the member it is (extraction), how many of its chunks are recorded, and their
+/// SHA-256 (a new archive's), so that a rebuild after a restart goes on only if it is the same.
+#[derive(serde::Serialize, Deserialize)]
+struct Writing {
+    fd: u32,
+    path: String,
+    created: bool,
+    index: Option<u64>,
+    written: u64,
+    #[serde(default)]
+    hashes: Vec<Option<String>>,
 }
 
 /// Lines a step writes to its job: to standard output, or with `err`, to standard error.
@@ -96,20 +114,37 @@ fn extracted_mode(cmd: &str, root: bool, mode: Option<u32>, directory: bool) -> 
 
 impl DurableObject for JobRunner {
     fn new(state: State, env: Env) -> Self {
-        Self { state, env }
+        Self {
+            state,
+            env,
+            made: RefCell::default(),
+        }
     }
-    async fn fetch(&self, req: Request) -> Result<Response> {
+    /// `{job, token}`: the job to work on, and, as it spawned, its token, kept here alone.
+    async fn fetch(&self, mut req: Request) -> Result<Response> {
+        #[derive(Deserialize)]
+        struct Start {
+            job: String,
+            #[serde(default)]
+            token: Option<String>,
+        }
         let url = req.url()?;
-        let job = url
-            .query_pairs()
-            .find(|(k, _)| k == "job")
-            .map(|(_, v)| v.into_owned())
-            .unwrap_or_default();
-        if url.path() != "/start" || job.is_empty() {
+        let Ok(start) = req.json::<Start>().await else {
+            return Response::error("Unknown runner request", 404);
+        };
+        if url.path() != "/start" || start.job.is_empty() {
             return Response::error("Unknown runner request", 404);
         }
-        self.state.storage().put("job", &job).await?;
-        self.state.storage().set_alarm(1).await?;
+        let storage = self.state.storage();
+        if let Some(token) = start.token {
+            storage.put("token", &token).await?;
+        } else if storage.get::<String>("token").await?.is_none() {
+            // Woken with no token, and given none before: its job ended (a runner that finished
+            // forgets it), or never reached it. There is nothing to do.
+            return Response::ok("idle");
+        }
+        storage.put("job", &start.job).await?;
+        storage.set_alarm(1).await?;
         Response::ok("started")
     }
     async fn alarm(&self) -> Result<Response> {
@@ -137,15 +172,15 @@ impl DurableObject for JobRunner {
                     let _ = self
                         .call(
                             Method::Post,
-                            &format!("/internal/job/update?id={job}"),
+                            "/internal/job/update",
                             Some(json!({"lines": [[true, format!("The job failed: {e}")]]})),
                         )
                         .await;
-                    let _ = self.abort_upload(&job).await;
+                    let _ = self.abort_upload().await;
                     let _ = self
                         .call(
                             Method::Post,
-                            &format!("/internal/job/finish?id={job}"),
+                            "/internal/job/finish",
                             Some(json!({"state": "failed"})),
                         )
                         .await;
@@ -155,7 +190,7 @@ impl DurableObject for JobRunner {
                     let _ = self
                         .call(
                             Method::Post,
-                            &format!("/internal/job/update?id={job}"),
+                            "/internal/job/update",
                             Some(json!({"lines": [[true, format!(
                                 "Attempt {failures} of {ATTEMPTS} failed, trying again: {e}"
                             )]]})),
@@ -171,9 +206,18 @@ impl DurableObject for JobRunner {
 }
 
 impl JobRunner {
-    /// Ask the authority, for the job.
+    /// The job's token, which its spawn handed over.
+    async fn token(&self) -> Result<String> {
+        self.state
+            .storage()
+            .get::<String>("token")
+            .await?
+            .ok_or_else(|| Error::RustError("the job was given no token".into()))
+    }
+    /// Ask the authority, as the job: its token goes with the request.
     async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<(u16, Value)> {
         let headers = Headers::new();
+        headers.set("X-Process-Token", &self.token().await?)?;
         let mut init = RequestInit::new();
         init.with_method(method);
         if let Some(body) = body {
@@ -207,18 +251,14 @@ impl JobRunner {
         }
         Ok(value)
     }
-    async fn update(&self, job: &str, lines: Lines, progress: Option<Value>) -> Result<String> {
+    async fn update(&self, lines: Lines, progress: Option<Value>) -> Result<String> {
         let mut body =
             json!({"lines": lines.0.iter().map(|(e, l)| json!([e, l])).collect::<Vec<_>>()});
         if let Some(progress) = progress {
             body["progress"] = progress;
         }
         let value = self
-            .ask(
-                Method::Post,
-                &format!("/internal/job/update?id={job}"),
-                Some(body),
-            )
+            .ask(Method::Post, "/internal/job/update", Some(body))
             .await?;
         Ok(value["state"].as_str().unwrap_or_default().to_string())
     }
@@ -230,18 +270,275 @@ impl JobRunner {
         }
         let _ = self.state.storage().delete_all().await;
     }
-    /// Cancel the upload in progress, if any.
-    async fn abort_upload(&self, job: &str) -> Result<()> {
-        if let Some(upload) = self.state.storage().get::<String>("upload").await? {
-            self.ask(
-                Method::Post,
-                &format!("/internal/job/abort?id={job}"),
-                Some(json!({"upload": upload})),
-            )
-            .await?;
-            self.state.storage().delete("upload").await?;
+    /// Let go of the file being written, if any: its descriptor closes, and the unfinished file
+    /// with it (`Discard`): one the job made goes, one it wrote over keeps its old content.
+    async fn abort_upload(&self) -> Result<()> {
+        if let Some(writing) = self.writing().await? {
+            // The kernel lets go of the file by its content, not its name: what is at the name
+            // now may be another's.
+            self.one(Call::Discard {
+                fd: writing.fd.into(),
+            })
+            .await?
+            .ok();
+            self.state.storage().delete("writing").await?;
         }
         Ok(())
+    }
+
+    // ---- The job's system calls ----
+
+    /// `calls`, as the job makes them (its token), a batch at a time: each one's result.
+    async fn sys(&self, calls: Vec<Call>) -> Result<Vec<std::result::Result<Value, abi::Error>>> {
+        let token = self.token().await?;
+        let mut results = Vec::with_capacity(calls.len());
+        for batch in calls.chunks(abi::BATCH_MAX) {
+            let body = json!({"calls": batch, "proc": token}).to_string();
+            let headers = Headers::new();
+            headers.set("Content-Type", "application/json")?;
+            // A batch says its length (sys.rs), as a browser's request does.
+            headers.set("Content-Length", &body.len().to_string())?;
+            let mut init = RequestInit::new();
+            init.with_method(Method::Post);
+            init.with_headers(headers);
+            init.with_body(Some(body.into()));
+            let mut response = self
+                .env
+                .durable_object("AUTHORITY")?
+                .id_from_name("filesystem")?
+                .get_stub()?
+                .fetch_with_request(Request::new_with_init("https://authority/api/sys", &init)?)
+                .await?;
+            if response.status_code() != 200 {
+                return Err(Error::RustError(format!(
+                    "the kernel refused the job's calls ({})",
+                    response.status_code()
+                )));
+            }
+            let answered: abi::Results = response.json().await?;
+            results.extend(answered.results.into_iter().map(Return::into_result));
+        }
+        Ok(results)
+    }
+    /// One call, as the job makes it.
+    async fn one(&self, call: Call) -> Result<std::result::Result<Value, abi::Error>> {
+        Ok(self
+            .sys(vec![call])
+            .await?
+            .pop()
+            .unwrap_or_else(|| Err(Errno::EIO.into())))
+    }
+    /// lstat(2) of each of `paths`: the mode of those there where the job may look. What lies
+    /// where it may not is not told, not even whether it is there: writing it fails, as for a
+    /// path that is not.
+    async fn modes(&self, paths: &[&String]) -> Result<BTreeMap<String, u32>> {
+        let calls = paths
+            .iter()
+            .map(|path| Call::Lstat {
+                path: path.to_string(),
+            })
+            .collect();
+        Ok(paths
+            .iter()
+            .zip(self.sys(calls).await?)
+            .filter_map(|(path, found)| {
+                Some((path.to_string(), found.ok()?["mode"].as_u64()? as u32))
+            })
+            .collect())
+    }
+    /// mkdir -p of `path`, below `base`, which is there: each directory on the way that is not
+    /// there yet, made with the job's umask.
+    /// Those this step made or found already are not asked again.
+    async fn mkdirs(&self, base: &str, path: &str) -> Result<std::result::Result<(), String>> {
+        let mut at = base.trim_end_matches('/').to_string();
+        let mut wanted = Vec::new();
+        for part in path
+            .strip_prefix(base)
+            .unwrap_or(path)
+            .split('/')
+            .filter(|part| !part.is_empty())
+        {
+            at = format!("{at}/{part}");
+            if !self.made.borrow().contains(&at) {
+                wanted.push(at.clone());
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(Ok(()));
+        }
+        let calls = wanted
+            .iter()
+            .map(|path| Call::Mkdir {
+                path: path.clone(),
+                mode: 0o777,
+            })
+            .collect();
+        for (path, made) in wanted.into_iter().zip(self.sys(calls).await?) {
+            match made {
+                Err(error) if error.errno != Errno::EEXIST => return Ok(Err(error.to_string())),
+                _ => {
+                    self.made.borrow_mut().insert(path);
+                }
+            }
+        }
+        Ok(Ok(()))
+    }
+    /// Open `path` to write `size` bytes, as open(2) with O_CREAT: a new file with `mode`, as an
+    /// archive gives it (the umask takes nothing from it, and root's keeps setuid, setgid and
+    /// sticky), or, with `replace`, over the one there: removed first if `unlink` (extraction,
+    /// so that it is the extractor's and other names keep the old one) or a link, written over
+    /// in place otherwise (a new archive, faststart). Its descriptor, or none if one is there
+    /// and is kept.
+    async fn open_write(
+        &self,
+        path: &str,
+        size: u64,
+        replace: bool,
+        unlink: bool,
+        mode: Option<u32>,
+    ) -> Result<std::result::Result<Option<Writing>, String>> {
+        let there = self.modes(&[&path.to_string()]).await?.remove(path);
+        let mut overwrite = false;
+        if let Some(had) = there {
+            if had & 0o170000 == 0o040000 {
+                return Ok(Err("a directory with this name already exists".into()));
+            }
+            if !replace {
+                return Ok(Ok(None));
+            }
+            if unlink || had & 0o170000 == 0o120000 {
+                if let Err(error) = self.one(Call::Unlink { path: path.into() }).await? {
+                    return Ok(Err(error.to_string()));
+                }
+            } else {
+                overwrite = true;
+            }
+        }
+        let mut calls = vec![Call::Open {
+            path: path.into(),
+            flags: O_WRONLY | O_CREAT | if overwrite { O_TRUNC } else { O_EXCL },
+            mode: mode.map_or(0o666, |mode| (mode & 0o777) as u16),
+            size: Some(size),
+            sha256: None,
+            version: None,
+        }];
+        // Through the descriptor the open made, in the same batch, as fchmod(2): nothing is
+        // changed if the open failed, and no name is followed to another file.
+        if let (false, Some(mode)) = (overwrite, mode) {
+            calls.push(Call::Fchmod {
+                fd: abi::FdRef::Ref { call: 0 },
+                mode: (mode & 0o7777) as u16,
+            });
+        }
+        let mut results = self.sys(calls).await?.into_iter();
+        let opened = match results.next() {
+            Some(Ok(opened)) => opened,
+            Some(Err(error)) => return Ok(Err(error.to_string())),
+            None => return Ok(Err("cannot be written".into())),
+        };
+        Ok(Ok(Some(Writing {
+            fd: opened["fd"].as_u64().unwrap_or(u64::from(u32::MAX)) as u32,
+            path: path.into(),
+            created: !overwrite,
+            index: None,
+            written: 0,
+            hashes: Vec::new(),
+        })))
+    }
+    /// pwrite(2) of chunk `index` of what `writing` writes: `length` bytes the container serves
+    /// at `url`, stored where the kernel says, then recorded, as a process's pwrite is.
+    async fn pwrite(
+        &self,
+        fetcher: &Fetcher,
+        writing: &Writing,
+        index: u64,
+        url: &str,
+        length: u64,
+        sha256: Option<&str>,
+    ) -> Result<()> {
+        let grant = self
+            .ask(
+                Method::Get,
+                &format!(
+                    "/internal/pwrite?fd={}&index={index}&length={length}",
+                    writing.fd
+                ),
+                None,
+            )
+            .await?;
+        let key = grant["key"].as_str().unwrap_or_default().to_string();
+        self.store(fetcher, url, &key, length, sha256).await?;
+        self.ask(
+            Method::Post,
+            "/internal/pwrite/commit",
+            Some(json!({
+                "fd": writing.fd, "index": index, "key": key, "sha256": sha256, "length": length,
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+    /// close(2) of what `writing` writes, which completes it.
+    /// What is being written is forgotten only once the kernel answered the close: a close
+    /// that did not arrive is sent again by the next step.
+    async fn close_write(&self, writing: &Writing) -> Result<std::result::Result<(), String>> {
+        let closed = self
+            .one(Call::Close {
+                fd: writing.fd.into(),
+            })
+            .await?;
+        self.state.storage().delete("writing").await?;
+        Ok(closed.map(|_| ()).map_err(|error| error.to_string()))
+    }
+    /// Whether the descriptor `writing` writes through is still open (a descriptor not used for
+    /// an hour, or whose file another took over, is not). Asking keeps the job's descriptors.
+    async fn open_still(&self, writing: &Writing) -> Result<bool> {
+        Ok(self
+            .one(Call::Readlink {
+                path: format!("/proc/self/fd/{}", writing.fd),
+            })
+            .await?
+            .is_ok())
+    }
+    /// The file being written, if a step after a restart may go on with it on its descriptor:
+    /// else, what it made is let go of (by its descriptor, or, the descriptor gone, by its name,
+    /// for a file the job made), and the file is written again.
+    async fn resumable(&self, writing: Writing, same: bool) -> Result<Option<Writing>> {
+        let open = self.open_still(&writing).await?;
+        if open && same {
+            return Ok(Some(writing));
+        }
+        if open {
+            self.abort_upload().await?;
+        } else {
+            if writing.created {
+                self.one(Call::Unlink {
+                    path: writing.path.clone(),
+                })
+                .await?
+                .ok();
+            }
+            self.state.storage().delete("writing").await?;
+        }
+        Ok(None)
+    }
+    /// The file being written, kept so that a step after a restart goes on with it.
+    async fn writing(&self) -> Result<Option<Writing>> {
+        Ok(self
+            .state
+            .storage()
+            .get::<String>("writing")
+            .await?
+            .and_then(|text| serde_json::from_str(&text).ok()))
+    }
+    async fn keep_writing(&self, writing: &Writing) -> Result<()> {
+        self.state
+            .storage()
+            .put(
+                "writing",
+                serde_json::to_string(writing).unwrap_or_default(),
+            )
+            .await
     }
 
     /// The container's server, started if need be.
@@ -294,11 +591,11 @@ impl JobRunner {
         })
     }
     /// Send the file the job pins, `file`, to the container at `url`.
-    async fn send(&self, fetcher: &Fetcher, job: &str, file: &str, url: &str) -> Result<()> {
+    async fn send(&self, fetcher: &Fetcher, file: &str, url: &str) -> Result<()> {
         let grant = self
             .ask(
                 Method::Get,
-                &format!("/internal/job/file?id={job}&file={file}"),
+                &format!("/internal/job/file?file={file}"),
                 None,
             )
             .await?;
@@ -363,19 +660,41 @@ impl JobRunner {
     }
 
     async fn work(&self, id: &str) -> Result<Step> {
-        let job: Job = serde_json::from_value(
-            self.ask(Method::Get, &format!("/internal/job?id={id}"), None)
-                .await?,
-        )
-        .map_err(|e| Error::RustError(e.to_string()))?;
+        // A runner given no token has nothing it may do.
+        if self.state.storage().get::<String>("token").await?.is_none() {
+            return Ok(Step::Done);
+        }
+        // What a step made or found of directories, the next one asks again.
+        self.made.borrow_mut().clear();
+        // A job that ended (done, failed, cancelled) has no credentials any more: its token
+        // opens nothing.
+        let (status, job) = self.call(Method::Get, "/internal/job", None).await?;
+        if status == 403 {
+            return Ok(Step::Done);
+        }
+        if status >= 400 {
+            return Err(Error::RustError(
+                job["error"]
+                    .as_str()
+                    .unwrap_or("the job cannot be read")
+                    .into(),
+            ));
+        }
+        let job: Job = serde_json::from_value(job).map_err(|e| Error::RustError(e.to_string()))?;
+        // The token it was handed is its job's: a runner works on no other.
+        if job.id != id {
+            return Err(Error::RustError(format!(
+                "the job's token is job {}'s, not {id}'s",
+                job.id
+            )));
+        }
         match job.state.as_str() {
-            "done" | "failed" | "cancelled" => return Ok(Step::Done),
             "question" => return Ok(Step::Wait),
             "cancelling" => {
-                self.abort_upload(id).await?;
+                self.abort_upload().await?;
                 self.ask(
                     Method::Post,
-                    &format!("/internal/job/finish?id={id}"),
+                    "/internal/job/finish",
                     Some(json!({"state": "cancelled"})),
                 )
                 .await?;
@@ -386,7 +705,7 @@ impl JobRunner {
         if job.state == "queued" {
             self.ask(
                 Method::Post,
-                &format!("/internal/job/update?id={id}"),
+                "/internal/job/update",
                 Some(json!({"state": "running"})),
             )
             .await?;
@@ -403,7 +722,7 @@ impl JobRunner {
         if matches!(step, Step::Done) {
             self.ask(
                 Method::Post,
-                &format!("/internal/job/finish?id={id}"),
+                "/internal/job/finish",
                 Some(json!({"state": "done"})),
             )
             .await?;
@@ -425,7 +744,7 @@ impl JobRunner {
             .as_ref()
             .ok_or_else(|| Error::RustError("the job has no archive".into()))?;
         if status["archive"] != true {
-            self.send(fetcher, job, &source.file, &format!("/archive?job={job}"))
+            self.send(fetcher, &source.file, &format!("/archive?job={job}"))
                 .await?;
         }
         let mut response = fetcher
@@ -512,7 +831,6 @@ impl JobRunner {
             }
         }
         self.update(
-            &job.id,
             lines,
             Some(json!({"done": members.len(), "total": members.len()})),
         )
@@ -570,9 +888,7 @@ impl JobRunner {
             let listing = self.prepare(&fetcher, id, spec, true).await?;
             if !planned {
                 return self
-                    .plan(
-                        id, cmd, spec, &directory, *existing, wanted, *verbose, &listing,
-                    )
+                    .plan(cmd, spec, &directory, *existing, wanted, *verbose, &listing)
                     .await;
             }
         }
@@ -590,7 +906,7 @@ impl JobRunner {
                 // before its question reached the job, so ask it now.
                 self.ask(
                     Method::Post,
-                    &format!("/internal/job/update?id={id}"),
+                    "/internal/job/update",
                     Some(json!({"question": {"replace": asking}, "state": "question"})),
                 )
                 .await?;
@@ -600,8 +916,7 @@ impl JobRunner {
         let decisions = spec.decisions.clone().unwrap_or_default();
         let total = self.count("1")?;
         let mut done = self.count("done = 1")?;
-        // A member that a restart interrupted starts again.
-        self.abort_upload(id).await?;
+        // A member that a restart interrupted goes on (`write`), on the descriptor it had.
         let mut lines = Lines::default();
         // Those of the steps before, planning's included, go on counting.
         let mut errors = serde_json::from_str::<Value>(&job.progress).unwrap_or_default()["errors"]
@@ -635,20 +950,9 @@ impl JobRunner {
             };
             match row.action.as_str() {
                 "mkdir" => {
-                    let (status, reply) = self
-                        .call(
-                            Method::Post,
-                            &format!("/internal/job/mkdir?id={id}"),
-                            Some(json!({"path": row.target})),
-                        )
-                        .await?;
-                    if status >= 400 {
+                    if let Err(message) = self.mkdirs(&directory, &row.target).await? {
                         errors += 1;
-                        lines.err(format!(
-                            "{cmd}: {}: {}",
-                            row.target,
-                            reply["error"].as_str().unwrap_or("cannot create")
-                        ));
+                        lines.err(format!("{cmd}: {}: {message}", row.target));
                     } else if *verbose {
                         lines.out(if *zip {
                             format!("   creating: {}/", row.target)
@@ -667,7 +971,7 @@ impl JobRunner {
                             .await?
                             .map(|made| made.is_some())
                     } else {
-                        self.link(id, &row, &directory, replace).await?
+                        self.link(&row, &directory, replace).await?
                     };
                     match written {
                         Ok(true) => {
@@ -699,7 +1003,6 @@ impl JobRunner {
             done += 1;
             let state = self
                 .update(
-                    id,
                     std::mem::take(&mut lines),
                     Some(json!({"done": done, "total": total, "errors": errors})),
                 )
@@ -719,41 +1022,32 @@ impl JobRunner {
             vec![],
         )?;
         let paths: Vec<&String> = directories.iter().map(|row| &row.target).collect();
-        let found = self
-            .ask(
-                Method::Post,
-                &format!("/internal/job/exists?id={id}"),
-                Some(json!({"paths": paths})),
-            )
-            .await?;
+        let found = self.modes(&paths).await?;
         for row in &directories {
             let mode = extracted_mode(cmd, job.actor == 0, row.mode, true);
-            let Some(had) = found["modes"][&row.target].as_u64() else {
+            let Some(had) = found.get(&row.target) else {
                 continue;
             };
-            if had == u64::from(mode) {
+            if had & 0o7777 == mode {
                 continue;
             }
-            let (status, reply) = self
-                .call(
-                    Method::Post,
-                    &format!("/internal/job/chmod?id={id}"),
-                    Some(json!({"path": row.target, "mode": mode})),
-                )
-                .await?;
-            if status >= 400 {
+            if let Err(error) = self
+                .one(Call::Chmod {
+                    path: row.target.clone(),
+                    mode: mode as u16,
+                })
+                .await?
+            {
                 errors += 1;
                 lines.err(format!(
-                    "{cmd}: {}: Cannot change mode to {}: {}",
+                    "{cmd}: {}: Cannot change mode to {}: {error}",
                     row.target,
                     &mode_text(mode as u16, true)[1..],
-                    reply["error"].as_str().unwrap_or("not permitted")
                 ));
             }
         }
         if !lines.0.is_empty() {
             self.update(
-                id,
                 lines,
                 Some(json!({"done": done, "total": total, "errors": errors})),
             )
@@ -767,7 +1061,6 @@ impl JobRunner {
     #[allow(clippy::too_many_arguments)]
     async fn plan(
         &self,
-        id: &str,
         cmd: &str,
         spec: &Spec,
         directory: &str,
@@ -881,17 +1174,16 @@ impl JobRunner {
             ));
         }
         let paths: Vec<&String> = rows.iter().map(|r| &r.5).collect();
-        let found = self
-            .ask(
-                Method::Post,
-                &format!("/internal/job/exists?id={id}"),
-                Some(json!({"paths": paths})),
-            )
-            .await?;
+        let found = self.modes(&paths).await?;
         let mut conflicts = Vec::new();
         for row in &mut rows {
-            let Some(there) = found["existing"][&row.5].as_str() else {
+            let Some(had) = found.get(&row.5) else {
                 continue;
+            };
+            let there = if had & 0o170000 == 0o040000 {
+                "directory"
+            } else {
+                "file"
             };
             match (row.4.as_str(), there) {
                 ("directory", "directory") => {}
@@ -966,12 +1258,8 @@ impl JobRunner {
             body["question"] = json!({"replace": conflicts});
             body["state"] = json!("question");
         }
-        self.ask(
-            Method::Post,
-            &format!("/internal/job/update?id={id}"),
-            Some(body),
-        )
-        .await?;
+        self.ask(Method::Post, "/internal/job/update", Some(body))
+            .await?;
         self.state.storage().put("planned", true).await?;
         Ok(if asking {
             Step::Wait
@@ -983,8 +1271,9 @@ impl JobRunner {
         })
     }
 
-    /// Write one member, through an upload of its own, a new file with `mode`: Ok with the mode
-    /// the file has if written, Ok(None) if left as it was, Err with a message if refused.
+    /// Write one member, a new file with `mode`, through a descriptor of the job's own: Ok with
+    /// the mode it has if written, Ok(None) if left as it was, Err with a message if refused.
+    /// What a restart interrupted of it goes on, on the descriptor it had.
     async fn write(
         &self,
         fetcher: &Fetcher,
@@ -994,128 +1283,127 @@ impl JobRunner {
         replace: bool,
         mode: u32,
     ) -> Result<std::result::Result<Option<u32>, String>> {
-        let parent = terminal_worker_core::parent(&row.target);
-        if parent != directory {
-            let (status, reply) = self
-                .call(
-                    Method::Post,
-                    &format!("/internal/job/mkdir?id={id}"),
-                    Some(json!({"path": parent})),
-                )
-                .await?;
-            if status >= 400 {
-                return Ok(Err(reply["error"]
-                    .as_str()
-                    .unwrap_or("cannot create its directory")
-                    .into()));
+        let member = row.idx;
+        let mut writing = match self.writing().await? {
+            Some(writing) => {
+                let same = writing.index == Some(member);
+                self.resumable(writing, same).await?
+            }
+            None => None,
+        };
+        if writing.is_none() {
+            let parent = terminal_worker_core::parent(&row.target);
+            if parent != directory
+                && let Err(message) = self.mkdirs(directory, parent).await?
+            {
+                return Ok(Err(message));
+            }
+            match self
+                .open_write(&row.target, row.size, replace, true, Some(mode))
+                .await?
+            {
+                Err(message) => return Ok(Err(message)),
+                Ok(None) => return Ok(Ok(None)),
+                Ok(Some(mut opened)) => {
+                    opened.index = Some(member);
+                    self.keep_writing(&opened).await?;
+                    writing = Some(opened);
+                }
             }
         }
-        let (status, begin) = self
-            .call(
-                Method::Post,
-                &format!("/internal/job/begin?id={id}"),
-                Some(json!({
-                    "path": row.target, "size": row.size, "replace": replace, "mode": mode,
-                    "unlink": true,
-                })),
-            )
-            .await?;
-        if status >= 400 {
-            return Ok(Err(begin["error"]
-                .as_str()
-                .unwrap_or("cannot be written")
-                .into()));
-        }
-        if begin["skipped"] == true {
+        let Some(mut writing) = writing else {
             return Ok(Ok(None));
-        }
-        let had = begin["mode"].as_u64().map_or(0o644, |m| m as u32);
-        let upload = begin["id"].as_str().unwrap_or_default().to_string();
-        self.state.storage().put("upload", &upload).await?;
+        };
         let count = row.size.div_ceil(CHUNK_SIZE);
-        for index in 0..count {
+        for index in writing.written..count {
             let offset = index * CHUNK_SIZE;
             let length = CHUNK_SIZE.min(row.size - offset);
-            let key = chunk_key(&upload, index);
-            self.store(
+            self.pwrite(
                 fetcher,
+                &writing,
+                index,
                 &format!(
                     "/entry?job={id}&index={}&offset={offset}&length={length}",
                     row.idx
                 ),
-                &key,
                 length,
                 None,
             )
             .await?;
-            self.ask(
-                Method::Post,
-                &format!("/internal/job/commit?id={id}"),
-                Some(json!({"upload": upload, "index": index, "key": key})),
-            )
-            .await?;
+            writing.written = index + 1;
+            self.keep_writing(&writing).await?;
         }
-        let (status, done) = self
-            .call(
-                Method::Post,
-                &format!("/internal/job/commit?id={id}"),
-                Some(json!({"upload": upload, "complete": true})),
-            )
-            .await?;
-        self.state.storage().delete("upload").await?;
-        if status >= 400 {
-            return Ok(Err(done["error"]
-                .as_str()
-                .unwrap_or("cannot be written")
-                .into()));
-        }
-        Ok(Ok(Some(had)))
+        Ok(self.close_write(&writing).await?.map(|()| Some(mode)))
     }
 
     /// Make the symbolic or hard link `row` is: Ok(true) if made, Ok(false) if left as it was,
-    /// Err with a message if refused.
+    /// Err with a message if refused. One that replaces what is there is made beside it and
+    /// renamed over it, so that what was there gives way only once the link is made.
     async fn link(
         &self,
-        id: &str,
         row: &Row,
         directory: &str,
         replace: bool,
     ) -> Result<std::result::Result<bool, String>> {
         let parent = terminal_worker_core::parent(&row.target);
-        if parent != directory {
-            let (status, reply) = self
-                .call(
-                    Method::Post,
-                    &format!("/internal/job/mkdir?id={id}"),
-                    Some(json!({"path": parent})),
-                )
-                .await?;
-            if status >= 400 {
-                return Ok(Err(reply["error"]
-                    .as_str()
-                    .unwrap_or("cannot create its directory")
-                    .into()));
+        if parent != directory
+            && let Err(message) = self.mkdirs(directory, parent).await?
+        {
+            return Ok(Err(message));
+        }
+        let there = self.modes(&[&row.target]).await?.remove(&row.target);
+        if let Some(had) = there {
+            if had & 0o170000 == 0o040000 {
+                return Ok(Err("a directory with this name already exists".into()));
+            }
+            if !replace {
+                return Ok(Ok(false));
             }
         }
-        let endpoint = if row.kind == "symlink" {
-            "symlink"
-        } else {
-            "link"
+        let made = match there {
+            Some(_) => format!(
+                "{}/.{}.{}",
+                parent.trim_end_matches('/'),
+                row.target.rsplit('/').next().unwrap_or_default(),
+                &crate::auth::random_token()[..8]
+            ),
+            None => row.target.clone(),
         };
-        let (status, reply) = self
-            .call(
-                Method::Post,
-                &format!("/internal/job/{endpoint}?id={id}"),
-                Some(json!({"path": row.target, "target": row.link, "replace": replace})),
-            )
-            .await?;
-        if status >= 400 {
-            return Ok(Err(reply["error"]
-                .as_str()
-                .unwrap_or("cannot be linked")
-                .into()));
+        let link = row.link.clone().unwrap_or_default();
+        let call = if row.kind == "symlink" {
+            Call::Symlink {
+                target: link,
+                path: made.clone(),
+            }
+        } else {
+            Call::Link {
+                from: link,
+                to: made.clone(),
+                follow: false,
+            }
+        };
+        if let Err(error) = self.one(call).await? {
+            return Ok(Err(error.to_string()));
         }
-        Ok(Ok(reply["skipped"] != true))
+        if made != row.target {
+            // The name beside goes either way: rename(2) of a name onto another of the same
+            // inode (a hard link made again) does nothing, and leaves both.
+            let mut results = self
+                .sys(vec![
+                    Call::Rename {
+                        from: made.clone(),
+                        to: row.target.clone(),
+                        noreplace: false,
+                    },
+                    Call::Unlink { path: made },
+                ])
+                .await?
+                .into_iter();
+            if let Some(Err(error)) = results.next() {
+                return Ok(Err(error.to_string()));
+            }
+        }
+        Ok(Ok(true))
     }
 
     async fn create(&self, job: &Job, spec: &Spec, deadline: f64) -> Result<Step> {
@@ -1138,13 +1426,8 @@ impl JobRunner {
             if let Some(file) = &input.file
                 && !present.contains(&index.to_string())
             {
-                self.send(
-                    &fetcher,
-                    id,
-                    file,
-                    &format!("/input?job={id}&index={index}"),
-                )
-                .await?;
+                self.send(&fetcher, file, &format!("/input?job={id}&index={index}"))
+                    .await?;
                 if Date::now().as_millis() as f64 > deadline {
                     return Ok(Step::More);
                 }
@@ -1198,7 +1481,7 @@ impl JobRunner {
                 if format.is_none() && response.status_code() == 422 {
                     let mut lines = Lines::default();
                     lines.err(format!("faststart: {output}: {error}"));
-                    self.update(id, lines, Some(json!({"done": 0, "total": 0, "errors": 1})))
+                    self.update(lines, Some(json!({"done": 0, "total": 0, "errors": 1})))
                         .await?;
                     return Ok(Step::Done);
                 }
@@ -1214,7 +1497,7 @@ impl JobRunner {
             lines.out(format!(
                 "faststart: {output} is already faststart; left as it was"
             ));
-            self.update(id, lines, Some(json!({"done": 0, "total": 0})))
+            self.update(lines, Some(json!({"done": 0, "total": 0})))
                 .await?;
             return Ok(Step::Done);
         }
@@ -1234,86 +1517,66 @@ impl JobRunner {
                     );
                 }
             }
-            self.update(id, lines, Some(json!({"done": 0, "total": hashes.len()})))
+            self.update(lines, Some(json!({"done": 0, "total": hashes.len()})))
                 .await?;
             storage.put("announced", true).await?;
         }
-        // Resume the upload begun before, if what is stored of it is what was built now.
-        let mut upload = storage.get::<String>("upload").await?;
-        let mut committed = Vec::new();
-        if let Some(previous) = &upload {
-            let stored = self
-                .ask(
-                    Method::Get,
-                    &format!("/internal/job/chunks?id={id}&upload={previous}"),
-                    None,
-                )
-                .await?;
-            let same = stored["exists"] == true
-                && storage.get::<u64>("upload_size").await? == Some(size)
-                && stored["chunks"].as_array().into_iter().flatten().all(|c| {
-                    let index = c[0].as_u64().unwrap_or(u64::MAX) as usize;
-                    hashes.get(index).map(String::as_str) == c[1].as_str()
-                });
-            if same {
-                committed = stored["chunks"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|c| c[0].as_u64())
-                    .collect();
-            } else {
-                self.abort_upload(id).await?;
-                upload = None;
+        // Go on with the archive begun before, on its descriptor, if it is this one (the build
+        // is deterministic: its size says); else begin it.
+        // The same archive is the same size, and its chunks stored so far are the new build's,
+        // SHA-256 by SHA-256 (a container image that changed builds other bytes).
+        let resumed = match self.writing().await? {
+            Some(writing) => {
+                let same = storage.get::<u64>("upload_size").await? == Some(size)
+                    && writing.hashes.len() as u64 == writing.written
+                    && writing
+                        .hashes
+                        .iter()
+                        .enumerate()
+                        .all(|(index, sha)| hashes.get(index) == sha.as_ref());
+                self.resumable(writing, same).await?
             }
-        }
-        let upload = match upload {
-            Some(upload) => upload,
-            None => {
-                let begin = self
-                    .ask(
-                        Method::Post,
-                        &format!("/internal/job/begin?id={id}"),
-                        Some(json!({"path": output, "size": size, "replace": spec.replace})),
-                    )
-                    .await?;
-                if begin["skipped"] == true {
+            None => None,
+        };
+        let mut writing = match resumed {
+            Some(writing) => writing,
+            None => match self
+                .open_write(&output, size, spec.replace, false, None)
+                .await?
+            {
+                Ok(Some(opened)) => {
+                    self.keep_writing(&opened).await?;
+                    storage.put("upload_size", size).await?;
+                    opened
+                }
+                Ok(None) => {
                     return Err(Error::RustError(format!(
                         "{output} appeared while the archive was made"
                     )));
                 }
-                let upload = begin["id"].as_str().unwrap_or_default().to_string();
-                storage.put("upload", &upload).await?;
-                storage.put("upload_size", size).await?;
-                upload
-            }
+                Err(message) => return Err(Error::RustError(format!("{output}: {message}"))),
+            },
         };
         let count = size.div_ceil(CHUNK_SIZE);
-        for index in 0..count {
-            if committed.contains(&index) {
-                continue;
-            }
+        for index in writing.written..count {
             let offset = index * CHUNK_SIZE;
             let length = CHUNK_SIZE.min(size - offset);
             let sha = hashes.get(index as usize).cloned();
-            let key = chunk_key(&upload, index);
-            self.store(
+            self.pwrite(
                 &fetcher,
+                &writing,
+                index,
                 &format!("/output?job={id}&offset={offset}&length={length}"),
-                &key,
                 length,
                 sha.as_deref(),
             )
             .await?;
-            self.ask(
-                Method::Post,
-                &format!("/internal/job/commit?id={id}"),
-                Some(json!({"upload": upload, "index": index, "key": key, "sha256": sha})),
-            )
-            .await?;
+            writing.written = index + 1;
+            writing.hashes.truncate(index as usize);
+            writing.hashes.push(sha);
+            self.keep_writing(&writing).await?;
             let state = self
                 .update(
-                    id,
                     Lines::default(),
                     Some(json!({"done": index + 1, "total": count})),
                 )
@@ -1322,20 +1585,17 @@ impl JobRunner {
                 return Ok(Step::More);
             }
         }
-        self.ask(
-            Method::Post,
-            &format!("/internal/job/commit?id={id}"),
-            Some(json!({"upload": upload, "complete": true})),
-        )
-        .await?;
-        storage.delete("upload").await?;
+        if let Err(message) = self.close_write(&writing).await? {
+            return Err(Error::RustError(format!("{output}: {message}")));
+        }
+        storage.delete("upload_size").await?;
         if format.is_none() {
             let mut lines = Lines::default();
             lines.out(format!(
                 "faststart: {output}: its index ({} bytes) now comes before its media; it plays as it downloads",
                 built["moov"].as_u64().unwrap_or(0)
             ));
-            self.update(id, lines, None).await?;
+            self.update(lines, None).await?;
         }
         Ok(Step::Done)
     }

@@ -101,6 +101,17 @@ test('an uploaded wasm runs by its path, with the working directory, environment
   await expect(busy).toHaveText('↵', { timeout: 5_000 });
 });
 
+test('a process writes a file larger than a batch carries, through its own descriptor', async ({ page, request }) => {
+  // Past abi::INLINE_MAX (256 KiB), a process's write goes as a chunk (PUT /api/pwrite, with
+  // its token): the descriptor is its own, as its credentials name it.
+  const big = 'abcdefghijklmnopqrstuvwxyz0123456789\n'.repeat(10_000);
+  expect((await put(request, file(`${base}/big.txt`), { headers, data: big })).status()).toBe(201);
+  await terminal(page);
+  await run(page, './coreutils cp big.txt copy.txt');
+  await expect(page.locator('.transcript')).not.toContainText('Bad file descriptor');
+  expect(await (await request.get(file(`${base}/copy.txt`))).text()).toBe(big);
+});
+
 test('the loader and the X rule refuse as Linux refuses, with its words', async ({ page }) => {
   await terminal(page);
   // A text file with the execute bit is not a program; a wasm-looking name does not help it.

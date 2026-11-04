@@ -114,10 +114,11 @@ export async function uploadFile(file, destination, { progress = () => {}, signa
     if (failure) throw failure;
   } catch (error) {
     lease(); abort();
-    // Only Cancel cancels the upload, and only while this page writes it: a file it made goes.
+    // Only Cancel cancels the upload, and only while this page writes it: the file it was
+    // writing goes with its descriptor (discard), by its content, not by a name another file may
+    // have now; a file it was writing over keeps its old content.
     if (signal.aborted || (error instanceof Cancelled && !failure)) {
-      const [closed] = await sys([{ close: { fd } }]).catch(() => [{}]);
-      if (opened.created && closed && (closed.ok || closed.err?.errno === 'EIO')) await sys([{ unlink: { path: destination } }]).catch(() => {});
+      await sys([{ discard: { fd } }]).catch(() => {});
       throw new Cancelled();
     }
     // Let go, so that choosing the file again goes on with it now, here or elsewhere.

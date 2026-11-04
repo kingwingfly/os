@@ -5,7 +5,7 @@ use crate::db::{Db, File, transact};
 use crate::{auth, commands, jobs};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use terminal_worker_core::{CHUNK_SIZE, MAX_FILE, mime, permissions::*, resolve};
+use terminal_worker_core::{mime, permissions::*, resolve};
 use worker::*;
 
 /// How long an upload may go without a new chunk before it is cancelled, in seconds.
@@ -203,7 +203,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 );
                 // /proc's files are written as they are read; /proc/self/fd/N names what the
                 // descriptor has open.
-                let sid = auth::sid(db, key.as_deref(), guest.as_deref());
+                let sid = crate::creds::sid_of(db, key.as_deref(), guest.as_deref(), row.as_ref());
                 let path = match crate::procfs::follow(db, sid.as_deref(), &path, true) {
                     Ok(path) => path,
                     Err(error) => return errno_reply(&error),
@@ -222,7 +222,6 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     return Reply::ok(json!({ "generated": text }));
                 }
                 if node.is_device() {
-                    let sid = auth::sid(db, key.as_deref(), guest.as_deref());
                     return match crate::dev::read(db, &who, sid.as_deref(), &real) {
                         Some(state) => Reply::ok(json!({ "device": state })),
                         None => Reply::error("No such device or address", 404),
@@ -269,7 +268,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     || auth::identity_of(db, key.as_deref(), guest.as_deref()),
                     |row| row.identity(),
                 );
-                let sid = auth::sid(db, key.as_deref(), guest.as_deref());
+                let sid = crate::creds::sid_of(db, key.as_deref(), guest.as_deref(), row.as_ref());
                 match crate::fds::by_token(db, sid.as_deref(), &who, &token, row.as_ref()) {
                     Ok((file, exec)) => {
                         let chunks: Vec<_> = db
@@ -315,8 +314,9 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     || auth::identity_of(db, key.as_deref(), guest.as_deref()),
                     |row| row.identity(),
                 );
-                let caller = row.map(|row| format!("{} {}", row.ns, row.pid));
-                let sid = auth::sid(db, key.as_deref(), guest.as_deref()).unwrap_or_default();
+                let sid = crate::creds::sid_of(db, key.as_deref(), guest.as_deref(), row.as_ref())
+                    .unwrap_or_default();
+                let caller = row.map(|row| row.owner());
                 match crate::fds::pwrite(db, &sid, &who, fd, index, length, caller.as_deref()) {
                     Ok((key, mime)) => Reply::ok(json!({"key": key, "mime": mime})),
                     Err(error) => errno_reply(&error).keep(),
@@ -351,8 +351,9 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     || auth::identity_of(db, key.as_deref(), guest.as_deref()),
                     |row| row.identity(),
                 );
-                let caller = row.map(|row| format!("{} {}", row.ns, row.pid));
-                let sid = auth::sid(db, key.as_deref(), guest.as_deref()).unwrap_or_default();
+                let sid = crate::creds::sid_of(db, key.as_deref(), guest.as_deref(), row.as_ref())
+                    .unwrap_or_default();
+                let caller = row.map(|row| row.owner());
                 let written = crate::fds::written(
                     db,
                     &sid,
@@ -371,21 +372,18 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             })
         }
         (_, endpoint) if endpoint.starts_with("/internal/job") => {
-            let id = param("id");
+            let token = req.headers().get("X-Process-Token")?.unwrap_or_default();
             let body: Value = if matches!(method, Method::Post) {
                 req.json().await.unwrap_or_default()
             } else {
                 Value::Null
             };
-            let reply = run(state, {
+            run(state, {
                 let endpoint = endpoint.to_string();
                 let method = method.clone();
-                let upload = param("upload");
                 let file = param("file");
-                move |db| job_reply(db, &method, &endpoint, &id, &upload, &file, body)
-            })?;
-            kick(env, &reply.body).await;
-            Ok(reply)
+                move |db| job_reply(db, &method, &endpoint, &token, &file, body)
+            })
         }
         _ => Ok(Reply::error(
             "Unknown endpoint or unsupported request method",
@@ -394,79 +392,76 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
     }
 }
 
-/// The jobs' endpoints for their runners, which act as the job's account: a process's own way to
-/// the kernel (its owners reach it by the process calls, jobs::call).
-#[allow(clippy::too_many_arguments)]
+/// What a job's runner asks of the job itself, by the job's token (its credentials, creds.rs):
+/// the job, its output and progress, its end, and the contents it pinned as it started (the
+/// archive it reads, the files it archives), as exec hands a process its image. Its file calls
+/// are the system calls, made with the same token, checked as any process's are.
 fn job_reply(
     db: &mut Db,
     method: &Method,
     endpoint: &str,
-    id: &str,
-    upload: &str,
+    token: &str,
     file: &str,
     body: Value,
 ) -> Reply {
     use crate::db::JobColumn;
+    let Some(id) = db
+        .credential(token, crate::creds::JOBS)
+        .and_then(|credential| credential.job())
+    else {
+        return Reply::error("not a job's token, or its job has ended", 403);
+    };
+    let id = id.as_str();
     let Some(job) = db.job(id) else {
         return Reply::error("Job does not exist", 404);
     };
-    // The runner's requests, as the job's account.
-    if (method, endpoint) == (&Method::Get, "/internal/job") {
-        return Reply::ok(json!(job));
-    }
-    if (method, endpoint) == (&Method::Post, "/internal/job/update") {
-        if let Some(lines) = body["lines"].as_array() {
-            let lines: Vec<(bool, String)> = lines
-                .iter()
-                .filter_map(|l| Some((l[0].as_bool()?, l[1].as_str()?.to_string())))
-                .collect();
-            db.add_lines(id, &lines);
-        }
-        if let Some(progress) = body.get("progress") {
-            db.set_job(id, JobColumn::Progress, Some(&progress.to_string()));
-        }
-        if let Some(question) = body.get("question") {
-            db.set_job(
-                id,
-                JobColumn::Question,
-                (!question.is_null())
-                    .then(|| question.to_string())
-                    .as_deref(),
-            );
-        }
-        // A job being cancelled stays so; the runner finishes it.
-        if let Some(state) = body["state"].as_str()
-            && !job.finished()
-            && job.state != "cancelling"
-        {
-            db.set_job(id, JobColumn::State, Some(state));
-            if state == "question" {
-                db.set_expiry("job", id, auth::now() + jobs::UNANSWERED);
-            }
-        }
-        return Reply::ok(json!({"state": db.job(id).map(|j| j.state)}));
-    }
-    if (method, endpoint) == (&Method::Post, "/internal/job/finish") {
-        let state = body["state"].as_str().unwrap_or("done");
-        jobs::finish(
-            db,
-            id,
-            if job.state == "cancelling" {
-                "cancelled"
-            } else {
-                state
-            },
-        );
-        return Reply::ok(json!({"finished": true}));
-    }
-    if job.finished() {
-        return Reply::error("The job has ended", 409);
-    }
-    let actor = match jobs::actor(db, &job) {
-        Ok(actor) => actor,
-        Err(e) => return Reply::error(&e, 403),
-    };
     match (method, endpoint) {
+        (Method::Get, "/internal/job") => Reply::ok(json!(job)),
+        (Method::Post, "/internal/job/update") => {
+            if let Some(lines) = body["lines"].as_array() {
+                let lines: Vec<(bool, String)> = lines
+                    .iter()
+                    .filter_map(|l| Some((l[0].as_bool()?, l[1].as_str()?.to_string())))
+                    .collect();
+                db.add_lines(id, &lines);
+            }
+            if let Some(progress) = body.get("progress") {
+                db.set_job(id, JobColumn::Progress, Some(&progress.to_string()));
+            }
+            if let Some(question) = body.get("question") {
+                db.set_job(
+                    id,
+                    JobColumn::Question,
+                    (!question.is_null())
+                        .then(|| question.to_string())
+                        .as_deref(),
+                );
+            }
+            // A job being cancelled stays so; the runner finishes it.
+            if let Some(state) = body["state"].as_str()
+                && !job.finished()
+                && job.state != "cancelling"
+            {
+                db.set_job(id, JobColumn::State, Some(state));
+                if state == "question" {
+                    db.set_expiry("job", id, auth::now() + jobs::UNANSWERED);
+                }
+            }
+            Reply::ok(json!({"state": db.job(id).map(|j| j.state)}))
+        }
+        (Method::Post, "/internal/job/finish") => {
+            let state = body["state"].as_str().unwrap_or("done");
+            jobs::finish(
+                db,
+                id,
+                if job.state == "cancelling" {
+                    "cancelled"
+                } else {
+                    state
+                },
+            );
+            Reply::ok(json!({"finished": true}))
+        }
         (Method::Get, "/internal/job/file") => {
             if !db.pinned(id, file) {
                 return Reply::error("The job does not read that file", 403);
@@ -481,156 +476,48 @@ fn job_reply(
                 .collect();
             Reply::ok(json!({"size": f.size, "chunk_size": f.chunk_size, "chunks": chunks}))
         }
-        (Method::Post, "/internal/job/exists") => {
-            // What each path is, and its mode, the link itself for a link, as lstat(2).
-            let mut existing = serde_json::Map::new();
-            let mut modes = serde_json::Map::new();
-            for path in body["paths"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-            {
-                // What lies where the job may not look is never told, not even whether it is
-                // there: writing it fails, as for a path that is not.
-                if let Ok(real) = db.physical(&actor, path, false)
-                    && db.traverse(&actor, &real).is_ok()
-                    && let Some(node) = db.node(&real)
-                {
-                    existing.insert(
-                        path.into(),
-                        json!(if node.directory { "directory" } else { "file" }),
-                    );
-                    modes.insert(path.into(), json!(node.mode));
-                }
-            }
-            Reply::ok(json!({"existing": existing, "modes": modes}))
-        }
-        (Method::Post, "/internal/job/mkdir") => {
-            let path = body["path"].as_str().unwrap_or_default();
-            let real = real!(db, &actor, path, false);
-            acl!(db.mkdir(&actor, &real, true), &actor);
-            Reply::ok(json!({"path": path}))
-        }
-        (Method::Post, "/internal/job/begin") => {
-            let path = body["path"].as_str().unwrap_or_default().to_string();
-            let replace = body["replace"] == true;
-            // Extraction removes a file in the way and makes it anew, as tar and unzip do, so
-            // that it is the extractor's, with the archive's mode, and other names of the old
-            // file keep it; a new archive (tar -c) writes over one, as open(2) does.
-            let unlink = body["unlink"] == true;
-            let real = real!(db, &actor, &path, false);
-            // Only where the job may look is it told what is there.
-            acl!(db.traverse(&actor, &real), &actor);
-            let mut overwrite = replace;
-            if let Some(node) = db.node(&real) {
-                if node.directory {
-                    return Reply::error(
-                        &format!("{path}: a directory with this name already exists"),
-                        409,
-                    );
-                }
-                if !replace {
-                    return Reply::ok(json!({"skipped": true}));
-                }
-                if unlink || node.is_link() {
-                    acl!(db.remove(&actor, &real, false), &actor);
-                    overwrite = false;
-                }
-            }
-            begin_upload(
-                db,
-                &actor,
-                &real,
-                Begun {
-                    size: body["size"].as_u64().unwrap_or(0),
-                    overwrite,
-                    mode: body["mode"].as_u64().map(|m| (m & 0o7777) as u16),
-                },
-            )
-        }
-        (Method::Post, "/internal/job/link") | (Method::Post, "/internal/job/symlink") => {
-            let path = body["path"].as_str().unwrap_or_default();
-            let target = body["target"].as_str().unwrap_or_default();
-            let real = real!(db, &actor, path, false);
-            acl!(db.traverse(&actor, &real), &actor);
-            if let Some(node) = db.node(&real) {
-                if node.directory {
-                    return Reply::error(
-                        &format!("{path}: a directory with this name already exists"),
-                        409,
-                    );
-                }
-                if body["replace"] != true {
-                    return Reply::ok(json!({"skipped": true}));
-                }
-            }
-            // What is there gives way only once the link can be made.
-            if endpoint == "/internal/job/symlink" {
-                acl!(db.symlink(&actor, target, &real, true), &actor);
-            } else {
-                let source = real!(db, &actor, target, false);
-                acl!(db.link(&actor, &source, &real, true), &actor);
-            }
-            Reply::ok(json!({"path": path}))
-        }
-        (Method::Post, "/internal/job/commit") => commit_upload(
-            db,
-            &actor,
-            body["upload"].as_str().unwrap_or_default(),
-            body["index"]
-                .as_u64()
-                .zip(body["key"].as_str().map(String::from)),
-            body["sha256"].as_str().map(String::from),
-            body["complete"] == true,
-        ),
-        (Method::Post, "/internal/job/abort") => {
-            if let Some(file) = db.file(body["upload"].as_str().unwrap_or_default())
-                && file.uploader == actor.id
-                && !file.complete()
-            {
-                cancel(db, &file);
-            }
-            Reply::ok(json!({"cancelled": true}))
-        }
-        (Method::Get, "/internal/job/chunks") => {
-            let hashes: Vec<Value> = db
-                .chunk_hashes(upload)
-                .into_iter()
-                .map(|(i, h)| json!([i, h]))
-                .collect();
-            Reply::ok(
-                json!({"chunks": hashes, "exists": db.file(upload).is_some_and(|f| !f.complete())}),
-            )
-        }
-        (Method::Post, "/internal/job/chmod") => {
-            let path = body["path"].as_str().unwrap_or_default();
-            let real = real!(db, &actor, path, true);
-            // Five digits: exactly this mode, a directory's setgid bit too.
-            let mode = format!("{:05o}", body["mode"].as_u64().unwrap_or(0o644) & 0o7777);
-            acl!(db.chmod(&actor, &real, &mode, false), &actor);
-            Reply::ok(json!({"path": path}))
-        }
         _ => Reply::error("Unknown endpoint or unsupported request method", 404),
     }
 }
 
 /// Run one command as the session `key`, elevated if it asks for sudo.
 /// Wake the runner of the job a reply started or changed, if any.
-pub async fn kick(env: &Env, reply: &Value) {
+/// Whether the runner heard.
+pub async fn kick(env: &Env, reply: &Value) -> bool {
     let Some(job) = reply["job"].as_str() else {
-        return;
+        return false;
     };
+    // A job just spawned hands its runner its token, which the runner keeps; one woken again
+    // (an answer, a signal) has it already.
     let woken = async {
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post);
+        init.with_body(Some(
+            json!({"job": job, "token": reply["token"]})
+                .to_string()
+                .into(),
+        ));
         env.durable_object("JOBS")?
             .id_from_name(job)?
             .get_stub()?
-            .fetch_with_str(&format!("https://runner/start?job={job}"))
+            .fetch_with_request(Request::new_with_init("https://runner/start", &init)?)
             .await
     }
     .await;
-    if let Err(e) = woken {
-        console_error!("cannot start the runner of job {}: {}", job, e);
+    match woken {
+        Ok(response) if response.status_code() < 400 => true,
+        Ok(response) => {
+            console_error!(
+                "the runner of job {} refused to start: {}",
+                job,
+                response.status_code()
+            );
+            false
+        }
+        Err(e) => {
+            console_error!("cannot start the runner of job {}: {}", job, e);
+            false
+        }
     }
 }
 
@@ -643,219 +530,6 @@ pub fn chunk_key(file: &str, index: u64) -> String {
 pub fn chunk_of(key: &str, file: &str, index: u64) -> bool {
     key.strip_prefix(&format!("chunks/{file}/{index}-"))
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
-/// A file an archive job writes: `size` bytes, written over one there if `overwrite`, with the
-/// archive's mode for a new one. Jobs write as their process; they move onto descriptors with
-/// processes (phase 5 of the system calls).
-struct Begun {
-    size: u64,
-    overwrite: bool,
-    mode: Option<u16>,
-}
-
-/// Start writing to `path`: a new file appears at once, still uploading, and can be read as it
-/// arrives; an overwritten file keeps showing its old content until the upload completes.
-fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply {
-    let Begun {
-        size,
-        overwrite,
-        mode,
-    } = begin;
-    // A link is written through, as open(2) does: one leading nowhere makes what it names.
-    let real = real!(db, who, path, true);
-    let path = real.as_str();
-    acl!(db.traverse(who, path), who);
-    if path == "/" {
-        return Reply::error("Cannot write to the root directory", 400);
-    }
-    if size > MAX_FILE {
-        return Reply::error(
-            &format!("Maximum file size is {} MB", MAX_FILE / 1_000_000),
-            413,
-        );
-    }
-    let old = db.node(path);
-    let now = auth::now();
-    let base = if let Some(old) = &old {
-        acl!(db.access(who, path, WRITE), who);
-        if old.directory {
-            return Reply::error("A directory with this name already exists", 409);
-        }
-        if !overwrite {
-            return Reply::error("File already exists; rename it before uploading", 409);
-        }
-        old.file.clone()
-    } else {
-        acl!(db.writable_parent(who, path), who);
-        None
-    };
-    let id = db.create_file(size, CHUNK_SIZE, None, who.id, path, base.as_deref(), now);
-    db.set_expiry("upload", &id, now + UPLOAD_TTL);
-    // A new file has its mode from the start, so that nobody reads it as it arrives who may not
-    // once it is there; an overwritten one keeps its own.
-    let mode = match &old {
-        Some(old) => old.mode,
-        None => {
-            let Some(above) = db.node(terminal_worker_core::parent(path)) else {
-                return Reply::error("Parent directory does not exist", 404);
-            };
-            // Asked for rw-rw-rw-, less the umask; a mode from an archive is as it is.
-            let mut node = match mode {
-                // `created` takes permission bits only; an archive's setuid, setgid and sticky
-                // bits (root's tar -x) are kept as given.
-                Some(mode) => {
-                    let mut node = created(who, &above, mode, false, 0);
-                    node.mode |= mode & 0o7000;
-                    node
-                }
-                None => created(who, &above, 0o666, false, UMASK),
-            };
-            node.file = Some(id.clone());
-            node.size = size;
-            db.set_node(path, &node);
-            node.mode
-        }
-    };
-    Reply::ok(json!({
-        "id": id, "created": old.is_none(), "size": size, "chunk_size": CHUNK_SIZE,
-        "mode": mode,
-    }))
-}
-
-/// Record `chunk`, an index and the object written for it, as part of the job's upload `id`,
-/// and complete the upload if asked. A chunk is committed once: what readers have seen of it
-/// never changes, and an object written for nothing goes to the garbage.
-fn commit_upload(
-    db: &mut Db,
-    who: &Identity,
-    id: &str,
-    chunk: Option<(u64, String)>,
-    sha256: Option<String>,
-    complete: bool,
-) -> Reply {
-    let Some((index, key)) = chunk else {
-        return finish_upload(db, who, id, complete);
-    };
-    if !chunk_of(&key, id, index) {
-        return Reply::error("Chunk key does not belong to this upload", 400);
-    }
-    let refused = match db.file(id) {
-        None => Some(Reply::error("Upload was cancelled or has expired", 409)),
-        Some(file) if file.uploader != who.id => Some(denied(
-            "Permission denied: this upload belongs to another account",
-            who,
-        )),
-        Some(file) if file.complete() => Some(Reply::error("Upload is already complete", 409)),
-        Some(file) if index >= file.chunk_count() => {
-            Some(Reply::error("Chunk index is out of range", 400))
-        }
-        Some(file) => match destination(db, who, &file) {
-            Err(reply) => Some(reply),
-            Ok(_) => match db.committed_hash(id, index) {
-                // Sent again: the chunk committed first stays.
-                Some(hash) if hash.is_none() || sha256.is_none() || hash == sha256 => {
-                    Some(Reply::ok(json!({"committed":index})))
-                }
-                Some(_) => Some(Reply::error(
-                    &format!("Chunk {index} was already committed with other content"),
-                    409,
-                )),
-                None => None,
-            },
-        },
-    };
-    if let Some(reply) = refused {
-        db.discard(&key);
-        return reply.keep();
-    }
-    let now = auth::now();
-    db.add_chunk(id, index, &key, sha256.as_deref(), now);
-    db.set_expiry("upload", id, now + UPLOAD_TTL);
-    if !complete {
-        return Reply::ok(json!({"committed":index}));
-    }
-    finish_upload(db, who, id, true)
-}
-/// Complete the job's upload `id` if asked and every chunk is committed.
-fn finish_upload(db: &mut Db, who: &Identity, id: &str, complete: bool) -> Reply {
-    let Some(file) = db.file(id) else {
-        return Reply::error("Upload was cancelled or has expired", 409);
-    };
-    if file.uploader != who.id {
-        return denied(
-            "Permission denied: this upload belongs to another account",
-            who,
-        );
-    }
-    if file.complete() {
-        return Reply::error("Upload is already complete", 409);
-    }
-    if !complete {
-        return Reply::ok(json!({"committed":null}));
-    }
-    let (path, node) = match destination(db, who, &file) {
-        Ok(found) => found,
-        Err(reply) => return reply,
-    };
-    if db.chunks(id).len() as u64 != file.chunk_count() {
-        return Reply::error("Upload is missing chunks", 409);
-    }
-    if file.base.is_some() {
-        db.set_node(
-            &path,
-            &Node {
-                file: Some(id.into()),
-                size: file.size,
-                ..node
-            },
-        );
-    }
-    db.finish_file(id);
-    Reply::ok(json!({"path":path,"size":file.size,"etag":file.etag()}))
-        .status(if file.base.is_none() { 201 } else { 200 })
-}
-
-/// Where upload `file` writes, and the node there, if `who` may still write it: every chunk and
-/// the completion ask again, as permissions may have changed since the upload began. A new file
-/// is written at its node, wherever it was moved, while `who` may reach it, and owns it, as one
-/// who created a file goes on writing it, or may write it. An overwrite is written while `who`
-/// may write the file at its target, and that file is still the one it replaces; once it is not,
-/// the upload can never complete, and is dropped.
-fn destination(
-    db: &mut Db,
-    who: &Identity,
-    file: &File,
-) -> std::result::Result<(String, Node), Reply> {
-    let path = match &file.base {
-        Some(_) => file.target.clone(),
-        None => db
-            .showing(&file.id)
-            .pop()
-            .ok_or_else(|| Reply::error("Upload was cancelled or has expired", 409))?,
-    };
-    // What is there is not for those who may not reach it.
-    db.traverse(who, &path)
-        .map_err(|message| denied(&message, who))?;
-    let denial = || denied(&format!("Permission denied: {path}"), who);
-    match (&file.base, db.node(&path)) {
-        (Some(base), Some(node)) if node.file.as_ref() == Some(base) => {
-            if !who.allows(&node, WRITE) {
-                return Err(denial());
-            }
-            Ok((path, node))
-        }
-        (Some(_), _) => {
-            db.drop_file(&file.id);
-            Err(Reply::error(
-                "File changed in another session during the upload; reopen it",
-                412,
-            )
-            .keep())
-        }
-        (None, Some(node)) if node.owner == who.id || who.allows(&node, WRITE) => Ok((path, node)),
-        (None, _) => Err(denial()),
-    }
 }
 
 /// A recording whose page went away: it is complete with what arrived, in order; one with

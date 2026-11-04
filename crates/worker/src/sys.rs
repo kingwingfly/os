@@ -45,11 +45,20 @@ pub async fn handle(
     let procs_pid = batch.pid;
     let procs_token = batch.process.clone();
     let guest = auth::guest_key(req);
-    // The session was heard from: its descriptors are kept.
+    // The session was heard from: its descriptors are kept (a job's, its own).
     let (renewing, guest_renewing) = (key.clone(), guest.clone());
+    let renewing_token = procs_token.clone();
     transact(state, move |db| {
-        if let Some(sid) = auth::sid(db, renewing.as_deref(), guest_renewing.as_deref())
-            && heard(&sid)
+        let ns = Db::namespace(renewing.as_deref(), guest_renewing.as_deref());
+        let caller = renewing_token
+            .as_deref()
+            .and_then(|token| db.credential(token, &ns));
+        if let Some(sid) = crate::creds::sid_of(
+            db,
+            renewing.as_deref(),
+            guest_renewing.as_deref(),
+            caller.as_ref(),
+        ) && heard(&sid)
         {
             crate::fds::renew(db, &sid, auth::now());
             return ((), true);
@@ -159,9 +168,13 @@ pub async fn handle(
             // A descriptor call stands as it ends, failed or not: a close that fails closes.
             let descriptors = matches!(
                 call,
-                Call::Open { .. } | Call::Close { .. } | Call::Ioctl { .. }
+                Call::Open { .. } | Call::Close { .. } | Call::Discard { .. } | Call::Ioctl { .. }
             );
-            let sid = auth::sid(db, key.as_deref(), guest.as_deref());
+            let ns = Db::namespace(key.as_deref(), guest.as_deref());
+            let caller = procs_token
+                .as_deref()
+                .and_then(|token| db.credential(token, &ns));
+            let sid = crate::creds::sid_of(db, key.as_deref(), guest.as_deref(), caller.as_ref());
             let result = run(
                 db,
                 key.as_deref(),
@@ -183,9 +196,27 @@ pub async fn handle(
         if logout && matches!(result, Return::Ok(_)) {
             cookie = Some(auth::cookie(https, "", 0));
         }
-        if let (Some(pid), Return::Ok(value)) = (wakes, &result) {
+        let mut result = result;
+        if let (Some(pid), Return::Ok(value)) = (wakes, &mut result) {
             let pid = value["pid"].as_str().map(str::to_string).unwrap_or(pid);
-            crate::api::kick(env, &json!({ "job": pid })).await;
+            // A job spawned: its token is its runner's alone, not the page's. A runner that did
+            // not hear of it never will, as nobody else has the token: the job fails now,
+            // rather than wait a week to be cancelled.
+            let token = value
+                .as_object_mut()
+                .and_then(|value| value.remove("token"));
+            let spawned = token.is_some();
+            if !crate::api::kick(env, &json!({ "job": pid, "token": token })).await && spawned {
+                let pid = pid.clone();
+                transact(state, move |db| {
+                    db.add_lines(
+                        &pid,
+                        &[(true, "The job's runner could not be started".into())],
+                    );
+                    crate::jobs::finish(db, &pid, "failed");
+                    ((), true)
+                })?;
+            }
         }
         results.push(result);
     }
@@ -226,6 +257,8 @@ fn heard(sid: &str) -> bool {
 fn resolve(call: &mut Call, results: &[Return]) -> std::result::Result<(), Error> {
     let fd = match call {
         Call::Close { fd }
+        | Call::Discard { fd }
+        | Call::Fchmod { fd, .. }
         | Call::Ioctl { fd, .. }
         | Call::Pwrite { fd, .. }
         | Call::Pread { fd: Some(fd), .. } => fd,
@@ -266,7 +299,7 @@ impl Session {
         &self,
         db: &mut Db,
     ) -> std::result::Result<(Process, Option<String>, Option<String>), Error> {
-        let (process, proc) = match self.token.as_deref() {
+        let (process, credential) = match self.token.as_deref() {
             Some(token) => {
                 let ns = Db::namespace(self.key.as_deref(), self.guest.as_deref());
                 let credential = db
@@ -277,7 +310,7 @@ impl Session {
                         cred: credential.identity(),
                         umask: credential.umask,
                     },
-                    Some(credential.owner()),
+                    Some(credential),
                 )
             }
             None => (
@@ -291,8 +324,17 @@ impl Session {
                 None,
             ),
         };
-        let sid = auth::sid(db, self.key.as_deref(), self.guest.as_deref());
-        Ok((process, sid, proc))
+        let sid = crate::creds::sid_of(
+            db,
+            self.key.as_deref(),
+            self.guest.as_deref(),
+            credential.as_ref(),
+        );
+        Ok((
+            process,
+            sid,
+            credential.as_ref().map(crate::creds::Credential::owner),
+        ))
     }
 }
 
@@ -761,7 +803,11 @@ fn run(
                 .unwrap_or_else(|| "/".into());
             crate::jobs::call(db, owner, &home, sid, &process, call)
         }
-        call @ (Call::Open { .. } | Call::Close { .. } | Call::Ioctl { .. }) => {
+        call @ (Call::Open { .. }
+        | Call::Close { .. }
+        | Call::Discard { .. }
+        | Call::Fchmod { .. }
+        | Call::Ioctl { .. }) => {
             let caller = caller.as_ref().map(crate::creds::Credential::owner);
             crate::fds::call(db, sid, &process, caller.as_deref(), call)
         }
