@@ -12,7 +12,10 @@
 //! what was reaped.
 //!
 //! It holds no policy. The page and the process hosts are untrusted user space; the tokens this
-//! kernel keeps are capabilities handed to the hosts that run the processes.
+//! kernel keeps are capabilities handed to the hosts that run the processes, and each process is
+//! its host's (the tab, or port, that executed it): only that host forks it, replaces its image,
+//! ends it, waits for its children, or signals as it. A signal a process sends is the machine's
+//! to allow as that process, by its token; one the page sends, as the page's account.
 use abi::{Batch, Call, Errno, Error, Exec, PROC_POLL_MAX, Return, SIGTERM};
 use serde_json::{Value, json};
 use std::cell::RefCell;
@@ -47,16 +50,21 @@ const INIT: u32 = 1;
 type Ended = (i32, Option<u8>);
 
 /// A process this kernel hosts: its parent, the token its calls carry (a fork's is its
-/// parent's), and, once it ended, its wait status until its parent waits.
+/// parent's), the host that runs it, and, once it ended, its wait status until its parent
+/// waits.
 struct Local {
     ppid: u32,
     token: String,
+    host: String,
     ended: Option<Ended>,
 }
 
 struct State {
     namespace: String,
     boot: String,
+    /// This kernel's own id, which it holds a Web Lock of while it runs: the pids it is lent
+    /// are its, and go back once it is gone.
+    id: String,
     processes: HashMap<u32, Local>,
     /// Pids the machine lent, which forks take.
     spare: Vec<u32>,
@@ -77,13 +85,14 @@ impl Kernel {
     /// A kernel for one browser boot. The page gives the boot id; the SharedWorker keeps it
     /// across that boot's tabs. An empty one reaps nothing by boot: where tabs hold Web Locks,
     /// what a gone tab left is reaped by its seat (client.js), and a kernel of one tab alone
-    /// must not reap the processes of the browser's other tabs.
+    /// must not reap the processes of the browser's other tabs. `id` is this kernel's own.
     #[wasm_bindgen(constructor)]
-    pub fn new(boot: &str) -> Kernel {
+    pub fn new(boot: &str, id: &str) -> Kernel {
         Kernel {
             state: RefCell::new(State {
                 namespace: String::new(),
                 boot: boot.to_string(),
+                id: id.to_string(),
                 processes: HashMap::new(),
                 spare: Vec::new(),
                 reports: Vec::new(),
@@ -116,7 +125,7 @@ impl Kernel {
     /// execve: ask for the image at `path`, run as this browser's account. `argv`, `env` and
     /// `pids` are JSON arrays; `cgroup` is empty for the default; `sudo` snapshots root for the
     /// new process, once the page has authenticated it; `seat` is the tab that runs it, empty
-    /// if none said.
+    /// if none said; `host`, the host (tab or port) whose process it is.
     #[allow(clippy::too_many_arguments)]
     pub async fn exec(
         &self,
@@ -127,9 +136,10 @@ impl Kernel {
         cgroup: &str,
         sudo: bool,
         seat: &str,
+        host: &str,
     ) -> Result<String, JsValue> {
         let stage = json!({ "path": path, "argv": parse::<Value>(argv, "argv")?, "env": parse::<Value>(env, "env")?, "cwd": cwd, "cgroup": cgroup });
-        let mut results = self.execs_of(vec![stage], sudo, seat).await?;
+        let mut results = self.execs_of(vec![stage], sudo, seat, host).await?;
         match results.pop() {
             Some(Ok(exec)) => to_json(&exec),
             Some(Err(error)) => Err(fail(error)),
@@ -139,9 +149,15 @@ impl Kernel {
 
     /// execve of each stage of a pipeline at once (a JSON array of `{path, argv, env, cwd,
     /// cgroup}`): one request, each stage's process or its errno, in order.
-    pub async fn execs(&self, stages: &str, sudo: bool, seat: &str) -> Result<String, JsValue> {
+    pub async fn execs(
+        &self,
+        stages: &str,
+        sudo: bool,
+        seat: &str,
+        host: &str,
+    ) -> Result<String, JsValue> {
         let stages: Vec<Value> = parse(stages, "stages")?;
-        let results = self.execs_of(stages, sudo, seat).await?;
+        let results = self.execs_of(stages, sudo, seat, host).await?;
         let results: Vec<Value> = results
             .into_iter()
             .map(|result| match result {
@@ -156,6 +172,7 @@ impl Kernel {
     /// replaces its own, with its pid, its credentials and its open descriptors; the process
     /// carries a new token from now on (its forks keep the old one). `argv` and `env` are JSON
     /// arrays.
+    #[allow(clippy::too_many_arguments)]
     pub async fn reexec(
         &self,
         pid: u32,
@@ -164,8 +181,9 @@ impl Kernel {
         env: &str,
         cwd: &str,
         seat: &str,
+        host: &str,
     ) -> Result<String, JsValue> {
-        let token = self.token(pid)?;
+        let token = self.token(pid, host)?;
         let call = Call::Execve {
             pid: Some(pid),
             token: Some(token),
@@ -186,10 +204,19 @@ impl Kernel {
 
     /// fork: a child of `pid`, at once, with a pid lent ahead (one request when none is left);
     /// the machine hears of it after. The page clones the wasm state.
-    pub async fn fork(&self, pid: u32) -> Result<String, JsValue> {
-        let token = self.token(pid)?;
+    pub async fn fork(&self, pid: u32, host: &str) -> Result<String, JsValue> {
+        let token = self.token(pid, host)?;
         if self.state.borrow().spare.is_empty() {
-            let lent = self.one(Call::Pids { count: LEND }, false).await?;
+            let kernel = Some(self.state.borrow().id.clone()).filter(|id| !id.is_empty());
+            let lent = self
+                .one(
+                    Call::Pids {
+                        count: LEND,
+                        kernel,
+                    },
+                    false,
+                )
+                .await?;
             let lent: Vec<u32> = from_value(lent, "pids")?;
             self.state.borrow_mut().spare.extend(lent);
         }
@@ -204,6 +231,7 @@ impl Kernel {
             Local {
                 ppid: pid,
                 token: token.clone(),
+                host: host.to_string(),
                 ended: None,
             },
         );
@@ -218,11 +246,18 @@ impl Kernel {
     /// exit: the process `pid` ends with `status`, or by `signal`: a zombie until its parent
     /// waits; its children are init's, and those that ended, init reaps. Its parent, which is
     /// to wait for it: init's are their host's to reap, as init would.
-    pub async fn exit(&self, pid: u32, status: i32, signal: Option<u8>) -> Result<String, JsValue> {
+    pub async fn exit(
+        &self,
+        pid: u32,
+        status: i32,
+        signal: Option<u8>,
+        host: &str,
+    ) -> Result<String, JsValue> {
         let mut state = self.state.borrow_mut();
         let local = state
             .processes
             .get_mut(&pid)
+            .filter(|local| local.host == host)
             .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?;
         if local.ended.is_some() {
             return Err(fail(Errno::ESRCH.into()));
@@ -293,7 +328,14 @@ impl Kernel {
     /// none, once ended, reaped now (told to the machine with the next batch), with its exit
     /// status (`code`) or the signal that ended it; EAGAIN while those it may wait for run;
     /// ECHILD when it has none of them.
-    pub async fn waitchild(&self, ppid: u32, pid: Option<u32>) -> Result<String, JsValue> {
+    pub async fn waitchild(
+        &self,
+        ppid: u32,
+        pid: Option<u32>,
+        host: &str,
+    ) -> Result<String, JsValue> {
+        // Only the parent's host waits for its children.
+        self.token(ppid, host)?;
         let found = {
             let state = self.state.borrow();
             let mut children: Vec<(u32, Option<Ended>)> = state
@@ -329,17 +371,42 @@ impl Kernel {
         )
     }
 
-    /// kill: send `signal` (SIGTERM by default) to `pid`, as the page's account.
-    pub async fn kill(&self, pid: u32, signal: Option<u8>) -> Result<String, JsValue> {
-        self.one(
-            Call::Kill {
-                pid: pid.to_string(),
-                signal: Some(signal.unwrap_or(SIGTERM)),
-            },
-            false,
-        )
-        .await?;
-        Ok("null".into())
+    /// kill: send `signal` (SIGTERM by default) to `pid`: as the page's account, or, `from` a
+    /// process `host` runs, as that process (its token: its snapshot's credentials, whoever the
+    /// page is signed in as now). What the machine is still to hear goes first, as this
+    /// kernel's: the signal may be to a child it has not heard of yet.
+    pub async fn kill(
+        &self,
+        pid: u32,
+        signal: Option<u8>,
+        from: Option<u32>,
+        host: &str,
+    ) -> Result<String, JsValue> {
+        let call = Call::Kill {
+            pid: pid.to_string(),
+            signal: Some(signal.unwrap_or(SIGTERM)),
+        };
+        let Some(from) = from else {
+            self.one(call, false).await?;
+            return Ok("null".into());
+        };
+        let token = self.token(from, host)?;
+        self.flush().await?;
+        let batch = Batch {
+            calls: vec![call],
+            umask: 0o022,
+            sudo: false,
+            pid: Some(from),
+            process: Some(token),
+        };
+        match sys(batch).await.map_err(fail)?.into_iter().next() {
+            Some(Return::Ok(_)) => Ok("null".into()),
+            Some(Return::Err(error)) => Err(fail(error)),
+            None => Err(fail(Error::because(
+                Errno::EIO,
+                "the kernel answered no call",
+            ))),
+        }
     }
 
     /// What those processes (JSON array of pids; none for all) are now.
@@ -366,14 +433,28 @@ impl Kernel {
         Ok(json!({ "pid": pid, "ppid": local.ppid }).to_string())
     }
 
-    /// The tabs whose processes still run, by the machine's record.
+    /// The tabs whose processes still run, and the kernels holding pids they were lent, by the
+    /// machine's record: `{seats, kernels}`.
     pub async fn seats(&self) -> Result<String, JsValue> {
         Ok(self.one(Call::Seats, false).await?.to_string())
     }
 
+    /// The kernel `kernel` is gone: the pids it was lent and did not take go back.
+    pub async fn reclaim(&self, kernel: &str) -> Result<String, JsValue> {
+        let call = Call::Gone {
+            seat: None,
+            kernel: Some(kernel.into()),
+        };
+        Ok(self.one(call, false).await?.to_string())
+    }
+
     /// The tab `seat` is gone: what it ran ended with it.
     pub async fn gone(&self, seat: &str) -> Result<String, JsValue> {
-        let value = self.one(Call::Gone { seat: seat.into() }, false).await?;
+        let call = Call::Gone {
+            seat: Some(seat.into()),
+            kernel: None,
+        };
+        let value = self.one(call, false).await?;
         // What it ran that this kernel kept goes too.
         let reaped: Vec<u32> = serde_json::from_value(value.clone()).unwrap_or_default();
         let mut state = self.state.borrow_mut();
@@ -463,12 +544,14 @@ impl Kernel {
 }
 
 impl Kernel {
-    fn token(&self, pid: u32) -> std::result::Result<String, JsValue> {
+    /// The token of the live process `pid`, which `host` runs: ESRCH for another host's, as
+    /// for none, so that a page learns nothing of processes it does not run.
+    fn token(&self, pid: u32, host: &str) -> std::result::Result<String, JsValue> {
         self.state
             .borrow()
             .processes
             .get(&pid)
-            .filter(|local| local.ended.is_none())
+            .filter(|local| local.ended.is_none() && local.host == host)
             .map(|local| local.token.clone())
             .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))
     }
@@ -479,6 +562,7 @@ impl Kernel {
         stages: Vec<Value>,
         sudo: bool,
         seat: &str,
+        host: &str,
     ) -> std::result::Result<Vec<std::result::Result<Exec, Error>>, JsValue> {
         let calls = stages
             .iter()
@@ -508,6 +592,7 @@ impl Kernel {
                     Local {
                         ppid: INIT,
                         token: exec.token.clone(),
+                        host: host.to_string(),
                         ended: None,
                     },
                 );
@@ -536,7 +621,14 @@ impl Kernel {
         let told = reports.len();
         let mut batch = reports.clone();
         batch.extend(calls);
-        match sys(batch, sudo).await {
+        let batch = Batch {
+            calls: batch,
+            umask: 0o022,
+            sudo,
+            pid: None,
+            process: None,
+        };
+        match sys(batch).await {
             Ok(mut results) => {
                 self.state.borrow_mut().reported += told as u64;
                 Ok(results.split_off(told.min(results.len())))
@@ -560,14 +652,8 @@ impl State {
     }
 }
 
-async fn sys(calls: Vec<Call>, sudo: bool) -> std::result::Result<Vec<Return>, Error> {
-    let batch = Batch {
-        calls,
-        umask: 0o022,
-        sudo,
-        pid: None,
-        process: None,
-    };
+/// One batch to the machine: the calls' results.
+async fn sys(batch: Batch) -> std::result::Result<Vec<Return>, Error> {
     let body = serde_json::to_string(&batch)
         .map_err(|error| Error::because(Errno::EIO, error.to_string()))?;
     let raw = kernel_sys(&body)

@@ -5,6 +5,7 @@
 //! the authority's SQLite.
 use crate::api::Reply;
 use crate::auth;
+use crate::creds::Credential;
 use crate::db::{Db, transact};
 use abi::{BATCH_MAX, Batch, Call, Creds, Data, Errno, Error, FdRef, INLINE_MAX, Results, Return};
 use kernel::Process;
@@ -22,7 +23,7 @@ pub async fn handle(
     let content = req.headers().get("Content-Length")?;
     if content
         .and_then(|length| length.parse::<u64>().ok())
-        .is_none_or(|length| length > BATCH_BYTES)
+        .is_none_or(|length| length > abi::BATCH_BYTES)
     {
         return Ok(Reply::error(
             "A batch says its length, and is at most 4 MB",
@@ -41,29 +42,32 @@ pub async fn handle(
             400,
         ));
     }
-    let (sudo, umask) = (batch.sudo, batch.umask & 0o777);
-    let procs_pid = batch.pid;
-    let procs_token = batch.process.clone();
     let guest = auth::guest_key(req);
-    // The session was heard from: its descriptors are kept (a job's, its own).
-    let (renewing, guest_renewing) = (key.clone(), guest.clone());
-    let renewing_token = procs_token.clone();
+    // As whom each call is made: the page's session, or the process the batch names.
+    let session = Rc::new(Session {
+        key: key.clone(),
+        guest: guest.clone(),
+        sudo: batch.sudo,
+        umask: batch.umask & 0o777,
+        pid: batch.pid,
+        token: batch.process.clone(),
+    });
+    // The session was heard from: its descriptors are kept (a process's, its line's), and a
+    // page's keeps those of the processes its tabs run, whatever account they run as.
+    let renewing = session.clone();
     transact(state, move |db| {
-        let ns = Db::namespace(renewing.as_deref(), guest_renewing.as_deref());
-        let caller = renewing_token
-            .as_deref()
-            .and_then(|token| db.credential(token, &ns));
-        if let Some(sid) = crate::creds::sid_of(
-            db,
-            renewing.as_deref(),
-            guest_renewing.as_deref(),
-            caller.as_ref(),
-        ) && heard(&sid)
-        {
-            crate::fds::renew(db, &sid, auth::now());
-            return ((), true);
+        let Ok(acting) = renewing.of(db) else {
+            return ((), false);
+        };
+        let Some(sid) = acting.sid.filter(|sid| heard(sid)) else {
+            return ((), false);
+        };
+        let now = auth::now();
+        crate::fds::renew(db, &sid, now);
+        if acting.credential.is_none() {
+            db.renew_lines(&renewing.namespace(), now);
         }
-        ((), false)
+        ((), true)
     })?;
     let mut results = Vec::with_capacity(batch.calls.len());
     let mut calls = batch.calls.into_iter().peekable();
@@ -75,14 +79,6 @@ pub async fn handle(
             while calls.peek().is_some_and(Call::is_registry) {
                 registry.extend(calls.next());
             }
-            let session = Session {
-                key: key.clone(),
-                guest: guest.clone(),
-                sudo,
-                umask,
-                pid: procs_pid,
-                token: procs_token.clone(),
-            };
             let cookie = req.headers().get("Cookie")?;
             results.extend(crate::machine::forward(env, state, &session, cookie, registry).await?);
             continue;
@@ -91,18 +87,9 @@ pub async fn handle(
             results.push(Return::Err(error));
             continue;
         }
-        let (key, guest) = (key.clone(), guest.clone());
         // Bytes that go with the call move to or from R2 outside a transaction.
         if matches!(call, Call::Pread { .. } | Call::Pwrite { .. }) {
-            let process = Session {
-                key,
-                guest,
-                sudo,
-                umask,
-                pid: procs_pid,
-                token: procs_token.clone(),
-            };
-            results.push(match bytes(env, state, process, call).await {
+            results.push(match bytes(env, state, session.clone(), call).await {
                 Ok(value) => Return::Ok(value),
                 Err(error) => Return::Err(error),
             });
@@ -110,15 +97,15 @@ pub async fn handle(
         }
         // What takes a password (its KDF, and a rate limit) waits outside a transaction too,
         // and may give the session a new cookie. A process token cannot touch the session.
-        if let Some(asked) = passworded(&call, sudo) {
-            if procs_token.is_some() {
+        if let Some(asked) = passworded(&call, session.sudo) {
+            if session.token.is_some() {
                 results.push(Return::Err(Error::because(
                     Errno::EPERM,
                     "a process cannot sign the browser in or out",
                 )));
                 continue;
             }
-            let reply = asked.run(req, env, state, key, https).await?;
+            let reply = asked.run(req, env, state, key.clone(), https).await?;
             if let Some(made) = &reply.cookie {
                 cookie = Some(made.clone());
             }
@@ -130,14 +117,7 @@ pub async fn handle(
             && crate::dev::networked(*request)
         {
             let asked = Asked {
-                session: Session {
-                    key,
-                    guest,
-                    sudo,
-                    umask,
-                    pid: procs_pid,
-                    token: procs_token.clone(),
-                },
+                session: session.clone(),
                 fd: fd.number(),
                 op: *request,
                 arg: arg.clone(),
@@ -152,40 +132,28 @@ pub async fn handle(
         // A job spawned or signalled: its runner wakes. A numeric pid is a registry process's,
         // which has no runner.
         let wakes = match &call {
-            Call::Kill { pid, .. } if pid.parse::<u32>().is_err() => Some(pid.clone()),
+            Call::Kill { pid, .. } if matches!(abi::Target::of(pid), abi::Target::Job(_)) => {
+                Some(pid.clone())
+            }
             Call::Spawn { .. } => Some(String::new()),
             _ => None,
         };
-        let procs_token = procs_token.clone();
         // A listing or file of /proc tells of the browser's processes, as its machine has them.
         let procs = if lists_processes(&mut call) {
-            let ns = Db::namespace(key.as_deref(), guest.as_deref());
-            crate::machine::list(env, &ns).await?
+            crate::machine::list(env, &session.namespace()).await?
         } else {
             Vec::new()
         };
+        let asking = session.clone();
         let result = transact(state, move |db| {
             // A descriptor call stands as it ends, failed or not: a close that fails closes.
             let descriptors = matches!(
                 call,
                 Call::Open { .. } | Call::Close { .. } | Call::Discard { .. } | Call::Ioctl { .. }
             );
-            let ns = Db::namespace(key.as_deref(), guest.as_deref());
-            let caller = procs_token
-                .as_deref()
-                .and_then(|token| db.credential(token, &ns));
-            let sid = crate::creds::sid_of(db, key.as_deref(), guest.as_deref(), caller.as_ref());
-            let result = run(
-                db,
-                key.as_deref(),
-                guest.as_deref(),
-                sid.as_deref(),
-                procs_token.as_deref(),
-                sudo,
-                umask,
-                &procs,
-                call,
-            );
+            let result = asking
+                .of(db)
+                .and_then(|acting| run(db, &asking, &acting, &procs, call));
             let commit = result.is_ok() || descriptors;
             let result = match result {
                 Ok(value) => Return::Ok(value),
@@ -226,9 +194,6 @@ pub async fn handle(
         None => reply,
     })
 }
-
-/// The most a batch's request may be.
-const BATCH_BYTES: u64 = 4 << 20;
 
 thread_local! {
     /// When each session's descriptors were last kept, by this instance.
@@ -292,18 +257,35 @@ pub struct Session {
     pub pid: Option<u32>,
     pub token: Option<String>,
 }
+
+/// As whom a call acts, once a transaction found it: its process (credentials and umask), the
+/// session its descriptors are in, and, a process calling, its exec's credentials.
+pub struct Acting {
+    pub process: Process,
+    pub sid: Option<String>,
+    pub credential: Option<Credential>,
+}
+impl Acting {
+    /// The key a process's own descriptors answer to (fds::owned): its line's; none for a page.
+    pub fn owner(&self) -> Option<String> {
+        self.credential.as_ref().map(Credential::owner)
+    }
+}
+
 impl Session {
-    /// Its process, session id and process key ("ns pid"), as the store `db` knows them: a
-    /// process token runs as the process's snapshot, a page's batch as the session's account.
-    fn of(
-        &self,
-        db: &mut Db,
-    ) -> std::result::Result<(Process, Option<String>, Option<String>), Error> {
+    /// The browser's process namespace.
+    pub fn namespace(&self) -> String {
+        Db::namespace(self.key.as_deref(), self.guest.as_deref())
+    }
+    /// As whom its calls act, as the store `db` knows it: a process token runs as the
+    /// process's snapshot, never as the page signed in later; a page's batch as the session's
+    /// account (root under sudo, if it may). A token that names no process is EPERM, never
+    /// taken for the page's.
+    fn of(&self, db: &mut Db) -> std::result::Result<Acting, Error> {
         let (process, credential) = match self.token.as_deref() {
             Some(token) => {
-                let ns = Db::namespace(self.key.as_deref(), self.guest.as_deref());
                 let credential = db
-                    .credential(token, &ns)
+                    .credential(token, &self.namespace())
                     .ok_or_else(|| Error::because(Errno::EPERM, "not this process's token"))?;
                 (
                     Process {
@@ -330,11 +312,11 @@ impl Session {
             self.guest.as_deref(),
             credential.as_ref(),
         );
-        Ok((
+        Ok(Acting {
             process,
             sid,
-            credential.as_ref().map(crate::creds::Credential::owner),
-        ))
+            credential,
+        })
     }
 }
 
@@ -371,7 +353,12 @@ async fn asset_range(env: &Env, asset: &str, offset: u64, length: u64) -> Sys<Ve
     Ok(body[start..end].to_vec())
 }
 
-async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<serde_json::Value> {
+async fn bytes(
+    env: &Env,
+    state: &State,
+    session: Rc<Session>,
+    call: Call,
+) -> Sys<serde_json::Value> {
     let io = |e: worker::Error| Error::because(Errno::EIO, e.to_string());
     let too_many = || {
         Error::because(
@@ -379,7 +366,6 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
             format!("a batch carries at most {INLINE_MAX} bytes a call"),
         )
     };
-    let session = Rc::new(session);
     match call {
         Call::Pread {
             fd,
@@ -395,17 +381,17 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
             let read = loop {
                 let (asking, path, listed) = (session.clone(), path.clone(), procs.clone());
                 let read = transact(state, move |db| {
-                    let read = asking.of(db).and_then(|(process, sid, proc)| {
+                    let read = asking.of(db).and_then(|acting| {
                         crate::fds::pread(
                             db,
-                            sid.as_deref(),
+                            acting.sid.as_deref(),
                             listed.as_deref().map(Vec::as_slice),
-                            &process,
+                            &acting.process,
                             fd.map(FdRef::number),
                             path.as_deref(),
                             offset,
                             count,
-                            proc.as_deref(),
+                            acting.owner().as_deref(),
                         )
                     });
                     (read, false)
@@ -414,8 +400,11 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
                 if !matches!(read, crate::fds::Read::Processes) || procs.is_some() {
                     break read;
                 }
-                let ns = Db::namespace(session.key.as_deref(), session.guest.as_deref());
-                procs = Some(Rc::new(crate::machine::list(env, &ns).await.map_err(io)?));
+                procs = Some(Rc::new(
+                    crate::machine::list(env, &session.namespace())
+                        .await
+                        .map_err(io)?,
+                ));
             };
             let (data, size) = match read {
                 crate::fds::Read::Bytes(data, size) => (data, size),
@@ -460,8 +449,9 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
             let asking = session.clone();
             let bytes = data.0.clone();
             let target = transact(state, move |db| {
-                let target = asking.of(db).and_then(|(process, sid, proc)| {
-                    let sid = sid.ok_or(Errno::EBADF)?;
+                let target = asking.of(db).and_then(|acting| {
+                    let (process, proc) = (&acting.process, acting.owner());
+                    let sid = acting.sid.clone().ok_or(Errno::EBADF)?;
                     let stdin = db
                         .fd(&sid, fd)
                         .and_then(|found| crate::jobs::stdin_pid(&found.path).map(str::to_string));
@@ -473,9 +463,9 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
                                 asking.key.as_deref(),
                                 asking.guest.as_deref(),
                                 proc.is_some(),
-                                &process,
+                                process,
                             );
-                            crate::jobs::answer(db, owner, &process, &pid, &bytes)
+                            crate::jobs::answer(db, owner, process, &pid, &bytes)
                                 .map(|value| Target::Stdin(pid, value))
                         }
                         None => crate::fds::pwrite(
@@ -512,18 +502,18 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
                 .await
                 .map_err(io)?;
             transact(state, move |db| {
-                let written = session.of(db).and_then(|(process, sid, proc)| {
-                    let sid = sid.ok_or(Errno::EBADF)?;
+                let written = session.of(db).and_then(|acting| {
+                    let sid = acting.sid.clone().ok_or(Errno::EBADF)?;
                     crate::fds::written(
                         db,
                         &sid,
-                        &process.cred,
+                        &acting.process.cred,
                         fd,
                         index,
                         &object,
                         None,
                         length,
-                        proc.as_deref(),
+                        acting.owner().as_deref(),
                     )
                 });
                 (written, true)
@@ -674,46 +664,25 @@ fn owner(
     }
 }
 
-/// The call `call`, as the process `token` (a process's own snapshot), or, with none, as the
-/// session `key`'s process (`sid`, signed in or not), under sudo if `sudo`. `procs` are the
-/// browser's processes, as its machine listed them, for a call on /proc.
-#[allow(clippy::too_many_arguments)]
+/// The call `call`, as `acting` found it: a process's own snapshot, or the session's account
+/// (signed in or not, under sudo if it asked). `procs` are the browser's processes, as its
+/// machine listed them, for a call on /proc.
 fn run(
     db: &mut Db,
-    key: Option<&str>,
-    guest: Option<&str>,
-    sid: Option<&str>,
-    token: Option<&str>,
-    sudo: bool,
-    umask: u16,
+    session: &Session,
+    acting: &Acting,
     procs: &[crate::procs::Row],
     call: Call,
 ) -> std::result::Result<serde_json::Value, Error> {
-    let ns = Db::namespace(key, guest);
-    let caller = match token {
-        Some(token) => Some(
-            db.credential(token, &ns)
-                .ok_or_else(|| Error::because(Errno::EPERM, "not this process's token"))?,
-        ),
-        None => None,
-    };
-    // A process token acts as the process, with its snapshot's credentials, never as the page
-    // signed in later; it cannot sign the browser in or out, or mint sudo.
-    let process = match &caller {
-        Some(credential) => {
-            if matches!(call, Call::Logout) {
-                return Err(Error::because(
-                    Errno::EPERM,
-                    "a process cannot change its browser's session",
-                ));
-            }
-            Process {
-                cred: credential.identity(),
-                umask: credential.umask,
-            }
-        }
-        None => process(db, key, guest, sudo, umask)?,
-    };
+    let (key, guest) = (session.key.as_deref(), session.guest.as_deref());
+    let (process, sid, caller) = (&acting.process, acting.sid.as_deref(), &acting.credential);
+    // A process acts as itself: it cannot sign the browser in or out, or mint sudo.
+    if caller.is_some() && matches!(call, Call::Logout) {
+        return Err(Error::because(
+            Errno::EPERM,
+            "a process cannot change its browser's session",
+        ));
+    }
     // /proc/self/fd/N names what the descriptor has open; /proc is procfs's.
     let mut call = call;
     let mut proc = false;
@@ -779,7 +748,7 @@ fn run(
             path,
             mode,
             rdev: Some(rdev),
-        } => crate::dev::mknod(db, &process, &path, mode, &rdev).map(|()| serde_json::Value::Null),
+        } => crate::dev::mknod(db, process, &path, mode, &rdev).map(|()| serde_json::Value::Null),
         Call::Logout => {
             if let Some(key) = key {
                 db.delete_session(key);
@@ -796,22 +765,21 @@ fn run(
         call @ (Call::Spawn { .. } | Call::Kill { .. } | Call::Wait { .. }) => {
             // A job is its account's, not root's under sudo: the tab follows it, answers it and
             // cancels it without sudo, and `~` is the account's home.
-            let owner = owner(db, key, guest, caller.is_some(), &process);
+            let owner = owner(db, key, guest, caller.is_some(), process);
             let home = db
                 .user_by_id(owner)
                 .map(|(_, user)| user.home)
                 .unwrap_or_else(|| "/".into());
-            crate::jobs::call(db, owner, &home, sid, &process, call)
+            crate::jobs::call(db, owner, &home, sid, process, call)
         }
         call @ (Call::Open { .. }
         | Call::Close { .. }
         | Call::Discard { .. }
         | Call::Fchmod { .. }
         | Call::Ioctl { .. }) => {
-            let caller = caller.as_ref().map(crate::creds::Credential::owner);
-            crate::fds::call(db, sid, &process, caller.as_deref(), call)
+            crate::fds::call(db, sid, process, acting.owner().as_deref(), call)
         }
-        call => kernel::call(db, &process, call),
+        call => kernel::call(db, process, call),
     }
 }
 
@@ -1006,7 +974,7 @@ fn creds(db: &Db, key: Option<&str>, cred: &Identity) -> Creds {
 /// A driver's request that asks Realtime, as the session asks it.
 struct Asked {
     /// Who asks: a page's session, or a process by its token, which acts as its snapshot.
-    session: Session,
+    session: Rc<Session>,
     fd: u32,
     op: u32,
     arg: serde_json::Value,
@@ -1071,14 +1039,14 @@ async fn networked(
         op,
         arg,
     } = asked;
-    let asker = Rc::new(asker);
     let decided = {
         let (asker, arg) = (asker.clone(), arg.clone());
         transact(state, move |db| {
             let plan = (|| {
-                let (process, sid, caller) = asker.of(db)?;
-                let sid = sid.ok_or(Errno::EBADF)?;
-                crate::fds::yours(db, &sid, fd, caller.as_deref())?;
+                let acting = asker.of(db)?;
+                let process = &acting.process;
+                let sid = acting.sid.clone().ok_or(Errno::EBADF)?;
+                crate::fds::yours(db, &sid, fd, acting.owner().as_deref())?;
                 let request = dev::request(db, &sid, fd)?.ok_or(Errno::ENOTTY)?;
                 let rdev = request.node.rdev.clone().unwrap_or_default();
                 Ok(match (op, rdev.as_str()) {
@@ -1138,8 +1106,9 @@ async fn networked(
                 .map_err(unreached)?;
             let made = transact(state, move |db| {
                 let made = (|| {
-                    let (process, sid, _) = asker.of(db)?;
-                    let sid = sid.ok_or(Errno::EBADF)?;
+                    let acting = asker.of(db)?;
+                    let process = &acting.process;
+                    let sid = acting.sid.clone().ok_or(Errno::EBADF)?;
                     let request = dev::request(db, &sid, fd)?.ok_or(Errno::ENOTTY)?;
                     match &voice {
                         Some(voice) => dev::present::spoken(

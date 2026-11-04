@@ -12,7 +12,12 @@
 // and each process says which tab runs it (its seat). A process whose seat's lock is free was
 // left by a tab that closed, crashed or reloaded while it ran: the kernel reaps it, at once
 // where it waits on that tab's lock, and at boot, or when the namespace has no room for another
-// process, by asking which locks are held.
+// process, by asking which locks are held. Each kernel holds one too, `tw-kernel-<id>`: the pids
+// a kernel that is gone was lent go back the same way.
+//
+// A process is its host's: the port that executed it, bound to the tab it first said it was.
+// Only that port forks it, replaces its image, ends it, waits for its children, or signals as
+// it; another tab's page learns nothing of its token.
 importScripts('/client_kernel.js');
 
 const VERSION = 1;
@@ -23,6 +28,12 @@ const locks = self.navigator?.locks;
 const watched = new Set();
 let kernel;
 let starting;
+// This kernel's id, and the lock it holds of it while it runs.
+const kernelId = self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+const kernelLock = id => `tw-kernel-${id}`;
+if (locks) void locks.request(kernelLock(kernelId), () => new Promise(() => {})).catch(() => {});
+// Each port's host: the tab it said it was first, or a name of its own.
+const hosts = new WeakMap();
 // What the kernel does, one thing at a time.
 let queue = Promise.resolve();
 const serially = task => {
@@ -64,7 +75,7 @@ function boot() {
     // A boot id reaps what the browser's last boot left; only the browser's one shared kernel,
     // and only where tabs cannot say they are gone, may do so.
     const id = sharing && !locks ? self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}` : '';
-    kernel = new wasm_bindgen.Kernel(id);
+    kernel = new wasm_bindgen.Kernel(id, locks ? kernelId : '');
     const value = JSON.parse(await kernel.init());
     broadcast({ v: VERSION, type: 'event', event: 'started', value });
     void serially(() => reapGone()).catch(() => {});
@@ -86,13 +97,18 @@ function broadcast(message) {
 // The lock a tab holds while it lives.
 const tabLock = seat => `tw-tab-${seat}`;
 // Reap the processes whose tab is gone: those of `seat`, or of any seat whose lock is free.
-// The machine ends them as SIGKILL would, and init reaps them.
+// The machine ends them as SIGKILL would, and init reaps them. The pids lent to kernels whose
+// lock is free go back.
 async function reapGone(seat) {
   if (!locks || !kernel) return;
   if (seat) { await kernel.gone(seat); return; }
   const held = new Set(((await locks.query()).held ?? []).map(lock => lock.name));
-  for (const running of JSON.parse(await kernel.seats())) {
+  const { seats = [], kernels = [] } = JSON.parse(await kernel.seats());
+  for (const running of seats) {
     if (!held.has(tabLock(running))) await kernel.gone(running);
+  }
+  for (const lender of kernels) {
+    if (lender !== kernelId && !held.has(kernelLock(lender))) await kernel.reclaim(lender);
   }
 }
 // Wait for the tab `seat` to go, and reap what it left: its lock is granted here once the tab
@@ -109,24 +125,24 @@ function watch(seat) {
 // execve of a pipeline's stages, in one request, as the tab `seat` asks it: each stage's
 // process, or its error. Where the namespace has no room (EAGAIN), what gone tabs left is
 // reaped, and it is asked once more.
-async function execs(args, seat) {
+async function execs(args, seat, host) {
   const stages = (args.stages ?? []).map(stage => ({
     path: stage.path, argv: stage.argv ?? [], env: stage.env ?? [], cwd: stage.cwd ?? '/', cgroup: stage.cgroup ?? '',
   }));
-  const call = async () => JSON.parse(await kernel.execs(JSON.stringify(stages), !!args.sudo, seat ?? ''));
+  const call = async () => JSON.parse(await kernel.execs(JSON.stringify(stages), !!args.sudo, seat ?? '', host));
   const results = await call();
   if (!locks || !results.some(result => result.err?.errno === 'EAGAIN')) return results;
   // The stages that were given processes give them back before the pipeline is asked again.
   for (const result of results) {
     if (!result.ok) continue;
-    try { await kernel.exit(result.ok.pid, 126); await kernel.wait(result.ok.pid); } catch { /* gone already */ }
+    try { await kernel.exit(result.ok.pid, 126, undefined, host); await kernel.wait(result.ok.pid); } catch { /* gone already */ }
   }
   await reapGone();
   return call();
 }
 // execve of one image: a pipeline of one stage.
-async function exec(args, seat) {
-  const [result] = await execs({ stages: [args], sudo: args.sudo }, seat);
+async function exec(args, seat, host) {
+  const [result] = await execs({ stages: [args], sudo: args.sudo }, seat, host);
   if (result.err) throw result.err;
   return result.ok;
 }
@@ -139,22 +155,23 @@ function failure(error) {
   return { errno: 'EIO', detail: String(error?.message ?? error) };
 }
 
-async function dispatch(message) {
+async function dispatch(message, host) {
   const { type, args = {}, tab } = message;
   switch (type) {
     case 'init': return boot();
     case 'version': return kernel.version();
     case 'namespace': return kernel.namespace();
-    case 'exec': return exec(args, tab);
-    case 'execs': return execs(args, tab);
+    case 'exec': return exec(args, tab, host);
+    case 'execs': return execs(args, tab, host);
     // A process's own execve: its image replaced, its pid, credentials and descriptors kept.
-    case 'reexec': return JSON.parse(await kernel.reexec(args.pid, args.path, JSON.stringify(args.argv ?? []), JSON.stringify(args.env ?? []), args.cwd ?? '/', tab ?? ''));
-    case 'fork': return JSON.parse(await kernel.fork(args.pid));
-    case 'exit': return JSON.parse(await kernel.exit(args.pid, args.status ?? 0, args.signal ?? undefined));
+    case 'reexec': return JSON.parse(await kernel.reexec(args.pid, args.path, JSON.stringify(args.argv ?? []), JSON.stringify(args.env ?? []), args.cwd ?? '/', tab ?? '', host));
+    case 'fork': return JSON.parse(await kernel.fork(args.pid, host));
+    case 'exit': return JSON.parse(await kernel.exit(args.pid, args.status ?? 0, args.signal ?? undefined, host));
     case 'wait': return JSON.parse(await kernel.wait(args.pid));
     // wait4 of a process for its children (`pid`, or any).
-    case 'waitchild': return JSON.parse(await kernel.waitchild(args.ppid, args.pid ?? undefined));
-    case 'kill': return JSON.parse(await kernel.kill(args.pid, args.signal ?? undefined));
+    case 'waitchild': return JSON.parse(await kernel.waitchild(args.ppid, args.pid ?? undefined, host));
+    // kill(2): as the page's account, or `from` a process this port runs, as that process.
+    case 'kill': return JSON.parse(await kernel.kill(args.pid, args.signal ?? undefined, args.from ?? undefined, host));
     case 'poll': return JSON.parse(await kernel.poll(JSON.stringify(args.pids ?? [])));
     case 'getpid': return JSON.parse(await kernel.getpid(args.pid));
     case 'cgroup_create': return JSON.parse(await kernel.cgroup_create(args.path));
@@ -173,12 +190,19 @@ async function handle(port, message) {
     return;
   }
   ports.add(port);
+  // A port is the tab it said it was first, and no other.
+  if (!hosts.has(port)) hosts.set(port, message.tab ?? `port-${self.crypto?.randomUUID?.() ?? Math.random()}`);
+  const host = hosts.get(port);
+  if (message.tab != null && message.tab !== host) {
+    port.postMessage({ v: VERSION, id: message.id, err: { errno: 'EPERM', detail: 'a port speaks for the tab it first said it was' } });
+    return;
+  }
   // The browser's kernel outlives its tabs, and reaps what each leaves; a tab's own kernel goes
   // with its tab.
   if (sharing) watch(message.tab);
   try {
     await boot();
-    const value = await serially(() => dispatch(message));
+    const value = await serially(() => dispatch(message, host));
     // A wait answers once the machine heard of it, so that /proc agrees.
     if (message.type === 'wait' || message.type === 'waitchild') await heard();
     port.postMessage({ v: VERSION, id: message.id, ok: value });

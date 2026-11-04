@@ -11,9 +11,11 @@
 //! is revoked there in a batch (`revoked`, flushed with the next execve or by the alarm).
 use crate::db::{Db, int, text};
 use abi::{
-    ARG_MAX, ENV_MAX, Error, Forked, PIDS_MAX, PROC_MAX, Proc, ProcState, SIGCONT, SIGHUP, SIGINT,
-    SIGKILL, SIGPIPE, SIGQUIT, SIGSTOP, SIGTERM, SIGTSTP,
+    ARG_MAX, ENV_MAX, Errno, Error, Forked, PIDS_MAX, PROC_MAX, Proc, ProcState, SIGCONT, SIGHUP,
+    SIGINT, SIGKILL, SIGPIPE, SIGQUIT, SIGSTOP, SIGTERM, SIGTSTP,
 };
+use kernel::registry;
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -36,10 +38,12 @@ const SCHEMA: [&str; 6] = [
     // state, the hash of the token their calls carry (a forked child's is its parent's, as its
     // credentials are), and the tab that runs them.
     "CREATE TABLE IF NOT EXISTS processes(ns TEXT NOT NULL, pid INTEGER NOT NULL, ppid INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, groups TEXT NOT NULL, umask INTEGER NOT NULL, cgroup TEXT NOT NULL, path TEXT NOT NULL, argv TEXT NOT NULL, env TEXT NOT NULL, cwd TEXT NOT NULL, state TEXT NOT NULL, status INTEGER NOT NULL DEFAULT 0, signal INTEGER, token TEXT NOT NULL, started INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0, seat TEXT, PRIMARY KEY(ns, pid))",
-    // cgroup v2's hierarchy: its subtree, controllers, and control files.
-    "CREATE TABLE IF NOT EXISTS cgroups(ns TEXT NOT NULL, path TEXT NOT NULL, parent TEXT NOT NULL, controllers TEXT NOT NULL, cpu_max TEXT, cpu_weight INTEGER NOT NULL DEFAULT 100, memory_max TEXT, pids_max INTEGER, io_max TEXT, freeze INTEGER NOT NULL DEFAULT 0, devices TEXT NOT NULL DEFAULT '', PRIMARY KEY(ns, path))",
-    // Pids lent to a client kernel, which its forks take at once and tell of after.
-    "CREATE TABLE IF NOT EXISTS spare(pid INTEGER PRIMARY KEY)",
+    // cgroup v2's hierarchy: its subtree, controllers, control files, and the account that
+    // made it (root's for the namespace's own), which may write it.
+    "CREATE TABLE IF NOT EXISTS cgroups(ns TEXT NOT NULL, path TEXT NOT NULL, parent TEXT NOT NULL, controllers TEXT NOT NULL, cpu_max TEXT, cpu_weight INTEGER NOT NULL DEFAULT 100, memory_max TEXT, pids_max INTEGER, io_max TEXT, freeze INTEGER NOT NULL DEFAULT 0, devices TEXT NOT NULL DEFAULT '', owner INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(ns, path))",
+    // Pids lent to a client kernel (its id), which its forks take at once and tell of after;
+    // what a kernel that is gone did not take goes back.
+    "CREATE TABLE IF NOT EXISTS spare(pid INTEGER PRIMARY KEY, kernel TEXT)",
     // Tokens no process holds any more, which the authority is still to revoke.
     "CREATE TABLE IF NOT EXISTS revoked(token TEXT PRIMARY KEY)",
     "CREATE INDEX IF NOT EXISTS processes_token ON processes(token)",
@@ -49,6 +53,17 @@ const SCHEMA: [&str; 6] = [
 pub fn create(sql: &SqlStorage) -> worker::Result<()> {
     for statement in SCHEMA {
         sql.exec(statement, None)?;
+    }
+    // Pids lent before a kernel said who it was are no kernel's, and cgroups made before they
+    // had an owner are root's.
+    if sql.exec("SELECT kernel FROM spare LIMIT 0", None).is_err() {
+        sql.exec("ALTER TABLE spare ADD COLUMN kernel TEXT", None)?;
+    }
+    if sql.exec("SELECT owner FROM cgroups LIMIT 0", None).is_err() {
+        sql.exec(
+            "ALTER TABLE cgroups ADD COLUMN owner INTEGER NOT NULL DEFAULT 0",
+            None,
+        )?;
     }
     Ok(())
 }
@@ -196,12 +211,14 @@ impl Db {
             && existing.as_deref() != Some(boot)
         {
             // Nothing of the old boot's processes can be waited for or signalled any more: its
-            // pages are gone. The new boot starts with init alone.
+            // pages are gone, and its kernel with what it was lent. The new boot starts with
+            // init alone.
             for row in self.processes(ns) {
                 if row.pid != INIT {
                     self.remove(&row);
                 }
             }
+            self.run("DELETE FROM spare", vec![]);
         }
         self.run(
             "INSERT INTO namespaces(id, guest, boot, next_pid, created, last_seen) VALUES(?, ?, ?, 2, ?, ?) ON CONFLICT(id) DO UPDATE SET boot = excluded.boot, last_seen = excluded.last_seen",
@@ -223,6 +240,20 @@ impl Db {
         );
         self.ensure_init(ns, now);
     }
+    /// Whether `query` finds a row.
+    fn any(&self, query: &str, args: Vec<SqlStorageValue>) -> bool {
+        !self.rows::<IgnoredAny>(query, args).is_empty()
+    }
+    /// The count `query` selects, as `n`.
+    fn count(&self, query: &str, args: Vec<SqlStorageValue>) -> usize {
+        #[derive(Deserialize)]
+        struct Count {
+            n: usize,
+        }
+        self.rows::<Count>(query, args)
+            .first()
+            .map_or(0, |row| row.n)
+    }
     fn ensure_init(&mut self, ns: &str, now: u64) {
         if self.process(ns, INIT).is_none() {
             self.run(
@@ -235,9 +266,9 @@ impl Db {
                 ],
             );
         }
-        self.ensure_cgroup(ns, "/");
+        self.ensure_cgroup(ns, "/", 0);
         for path in ROOT_CGROUPS {
-            self.ensure_cgroup(ns, path);
+            self.ensure_cgroup(ns, path, 0);
         }
     }
     fn namespace_boot(&self, ns: &str) -> Option<String> {
@@ -259,7 +290,9 @@ impl Db {
     }
     /// execve(2)'s first half, before the authority checks the image: its arguments' sizes,
     /// its cgroup, and its pid, a new one or the process it replaces, which proves itself by
-    /// its token (`token`): only a process replaces itself, as only it can call execve.
+    /// its token (`token`): only a process replaces itself, as only it can call execve. A new
+    /// pid counts against the namespace's processes with the `reserved` ones other execs were
+    /// given and have not started yet.
     #[allow(clippy::too_many_arguments)]
     pub fn exec_begin(
         &mut self,
@@ -269,25 +302,23 @@ impl Db {
         argv: &[String],
         env: &[String],
         cgroup: Option<&str>,
+        reserved: usize,
         now: u64,
     ) -> Result<Begun> {
         if argv.iter().map(|arg| arg.len() + 1).sum::<usize>() > ARG_MAX {
             return Err(Error::because(
-                abi::Errno::E2BIG,
+                Errno::E2BIG,
                 "the argument vector is too long",
             ));
         }
         if env.iter().map(|entry| entry.len() + 1).sum::<usize>() > ENV_MAX {
-            return Err(Error::because(
-                abi::Errno::E2BIG,
-                "the environment is too long",
-            ));
+            return Err(Error::because(Errno::E2BIG, "the environment is too long"));
         }
         self.ensure_namespace(ns, now);
         let cgroup = cgroup.unwrap_or("/user");
         if self.cgroup(ns, cgroup).is_none() {
             return Err(Error::because(
-                abi::Errno::ENOENT,
+                Errno::ENOENT,
                 format!("{cgroup} is not a cgroup of this namespace"),
             ));
         }
@@ -295,15 +326,15 @@ impl Db {
             Some(pid) => {
                 // Init is not the caller's to take over.
                 if pid == INIT {
-                    return Err(abi::Errno::EPERM.into());
+                    return Err(Errno::EPERM.into());
                 }
                 self.process(ns, pid)
                     .filter(|existing| !existing.zombie())
-                    .ok_or(abi::Errno::ESRCH)?;
+                    .ok_or(Errno::ESRCH)?;
                 let existing = token
                     .and_then(|token| self.process_token(token, Some(pid), ns))
                     .ok_or_else(|| {
-                        Error::because(abi::Errno::EPERM, "only a process replaces its own image")
+                        Error::because(Errno::EPERM, "only a process replaces its own image")
                     })?;
                 // The token the image held dies with it, unless a process forked from it, or
                 // forked it, holds it still.
@@ -320,7 +351,7 @@ impl Db {
                 })
             }
             None => Ok(Begun {
-                pid: self.new_pid(ns)?,
+                pid: self.new_pid(ns, reserved)?,
                 replacing: None,
                 old: None,
                 current: None,
@@ -329,7 +360,10 @@ impl Db {
         }
     }
     /// execve(2)'s second half: the process, with the credentials the authority snapshotted
-    /// and its new token's hash, runs the image.
+    /// and its new token's hash, runs the image. A process replacing its image does so only if
+    /// it still holds the token it proved itself with, alive: one that ended, or that another
+    /// execve replaced first, meanwhile, does not, and the new token is revoked (false). The
+    /// token it held goes once no process holds it, as a fork may still.
     #[allow(clippy::too_many_arguments)]
     pub fn exec_end(
         &mut self,
@@ -344,14 +378,15 @@ impl Db {
         cgroup: &str,
         seat: Option<&str>,
         now: u64,
-    ) {
+    ) -> bool {
         let groups = serde_json::to_string(&cred.groups).unwrap_or_default();
         let argv = serde_json::to_string(argv).unwrap_or_default();
         let env = serde_json::to_string(env).unwrap_or_default();
         let seat = seat.map_or(SqlStorageValue::Null, text);
         if begun.replacing.is_some() {
-            self.run(
-                "UPDATE processes SET uid = ?, gid = ?, groups = ?, umask = ?, cgroup = ?, path = ?, argv = ?, env = ?, cwd = ?, state = 'running', status = 0, signal = NULL, token = ?, started = ?, ended = 0, seat = COALESCE(?, seat) WHERE ns = ? AND pid = ?",
+            let current = begun.current.clone().unwrap_or_default();
+            let replaced = self.any(
+                "UPDATE processes SET uid = ?, gid = ?, groups = ?, umask = ?, cgroup = ?, path = ?, argv = ?, env = ?, cwd = ?, state = 'running', status = 0, signal = NULL, token = ?, started = ?, ended = 0, seat = COALESCE(?, seat) WHERE ns = ? AND pid = ? AND token = ? AND state != 'zombie' RETURNING pid",
                 vec![
                     int(cred.uid),
                     int(cred.gid),
@@ -367,9 +402,22 @@ impl Db {
                     seat,
                     text(ns),
                     int(begun.pid),
+                    text(&current),
                 ],
             );
-            // The image it ran before died with the exec at the authority (`Begun::old`).
+            if !replaced {
+                self.run(
+                    "INSERT OR IGNORE INTO revoked(token) VALUES(?)",
+                    vec![text(token_hash)],
+                );
+                return false;
+            }
+            // The image it ran before died with the exec at the authority (`Begun::old`), or,
+            // shared then, dies once no fork of it holds it.
+            if begun.old.is_none() {
+                self.revoke_unheld(ns, &current);
+            }
+            true
         } else {
             self.run(
                 "INSERT INTO processes(ns, pid, ppid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, token, started, ended, seat) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 0, NULL, ?, ?, 0, ?)",
@@ -391,21 +439,15 @@ impl Db {
                     seat,
                 ],
             );
+            true
         }
     }
     /// Whether any process still holds the token `hash` (a fork shares its parent's).
     pub fn token_held(&self, ns: &str, hash: &str) -> bool {
-        #[derive(Deserialize)]
-        struct One {
-            #[allow(dead_code)]
-            pid: u32,
-        }
-        !self
-            .rows::<One>(
-                "SELECT pid FROM processes WHERE ns = ? AND token = ? LIMIT 1",
-                vec![text(ns), text(hash)],
-            )
-            .is_empty()
+        self.any(
+            "SELECT pid FROM processes WHERE ns = ? AND token = ? LIMIT 1",
+            vec![text(ns), text(hash)],
+        )
     }
     fn token_of(&self, ns: &str, pid: u32) -> Option<String> {
         #[derive(Deserialize)]
@@ -446,24 +488,22 @@ impl Db {
             self.run("DELETE FROM revoked WHERE token = ?", vec![text(token)]);
         }
     }
-    /// How many processes of `ns` are alive.
-    fn alive(&self, ns: &str) -> usize {
-        #[derive(Deserialize)]
-        struct Alive {
-            n: usize,
-        }
-        self.rows::<Alive>(
+    /// How many processes `ns` has, or is to have: those alive, the pids lent to its kernels
+    /// and not taken yet, and `reserved`, execs begun and not ended.
+    fn taken(&self, ns: &str, reserved: usize) -> usize {
+        let alive = self.count(
             "SELECT COUNT(*) AS n FROM processes WHERE ns = ? AND state != 'zombie'",
             vec![text(ns)],
-        )
-        .first()
-        .map_or(0, |row| row.n)
+        );
+        alive + self.count("SELECT COUNT(*) AS n FROM spare", vec![]) + reserved
     }
-    fn new_pid(&mut self, ns: &str) -> Result<u32> {
-        if self.alive(ns) >= PROC_MAX {
-            return Err(abi::Errno::EAGAIN.into());
+    /// A new pid, if the namespace has room for one more process (`reserved` others are to
+    /// start): EAGAIN, as fork(2) and execve's new process say, if not.
+    fn new_pid(&mut self, ns: &str, reserved: usize) -> Result<u32> {
+        if self.taken(ns, reserved) >= PROC_MAX {
+            return Err(Errno::EAGAIN.into());
         }
-        self.next_pids(ns, 1).pop().ok_or(abi::Errno::EAGAIN.into())
+        self.next_pids(ns, 1).pop().ok_or(Errno::EAGAIN.into())
     }
     /// The next `count` pids no process has, taken.
     fn next_pids(&mut self, ns: &str, count: usize) -> Vec<u32> {
@@ -493,37 +533,43 @@ impl Db {
         pids
     }
     fn spare(&self, pid: u32) -> bool {
-        #[derive(Deserialize)]
-        struct One {
-            #[allow(dead_code)]
-            pid: u32,
-        }
-        !self
-            .rows::<One>("SELECT pid FROM spare WHERE pid = ?", vec![int(pid)])
-            .is_empty()
+        self.any("SELECT pid FROM spare WHERE pid = ?", vec![int(pid)])
     }
-    /// Lend the client kernel up to `count` pids, as many as the namespace has room for, which
-    /// its forks take without asking. None when it has no room: EAGAIN, as fork(2) says.
-    pub fn lend(&mut self, ns: &str, count: u32, now: u64) -> Result<Vec<u32>> {
+    /// Lend the client kernel `kernel` up to `count` pids, as many as the namespace has room
+    /// for (`reserved` execs are to start), which its forks take without asking. None when it
+    /// has no room: EAGAIN, as fork(2) says.
+    pub fn lend(
+        &mut self,
+        ns: &str,
+        count: u32,
+        kernel: Option<&str>,
+        reserved: usize,
+        now: u64,
+    ) -> Result<Vec<u32>> {
         self.ensure_namespace(ns, now);
-        #[derive(Deserialize)]
-        struct Lent {
-            n: usize,
-        }
-        let lent = self
-            .rows::<Lent>("SELECT COUNT(*) AS n FROM spare", vec![])
-            .first()
-            .map_or(0, |row| row.n);
-        let room = PROC_MAX.saturating_sub(self.alive(ns) + lent);
+        let room = PROC_MAX.saturating_sub(self.taken(ns, reserved));
         let count = (count.min(PIDS_MAX) as usize).min(room);
         if count == 0 {
-            return Err(abi::Errno::EAGAIN.into());
+            return Err(Errno::EAGAIN.into());
         }
         let pids = self.next_pids(ns, count);
+        let kernel = kernel.map_or(SqlStorageValue::Null, text);
         for pid in &pids {
-            self.run("INSERT INTO spare(pid) VALUES(?)", vec![int(*pid)]);
+            self.run(
+                "INSERT INTO spare(pid, kernel) VALUES(?, ?)",
+                vec![int(*pid), kernel.clone()],
+            );
         }
         Ok(pids)
+    }
+    /// The kernel `kernel` is gone (its Web Lock is free): what it was lent and did not take
+    /// goes back. A kernel that never said who it was is "".
+    pub fn reclaim(&mut self, kernel: &str) -> usize {
+        self.rows::<IgnoredAny>(
+            "DELETE FROM spare WHERE COALESCE(kernel, '') = ? RETURNING pid",
+            vec![text(kernel)],
+        )
+        .len()
     }
     /// fork(2)'s registry half: a child of `parent`, with its credentials, cgroup, image,
     /// environment and token copied (a child acts as its parent was executed, and shares its
@@ -533,14 +579,14 @@ impl Db {
             Some(child) => {
                 if !self.spare(child) {
                     return Err(Error::because(
-                        abi::Errno::EINVAL,
+                        Errno::EINVAL,
                         format!("{child} is no pid lent to this kernel"),
                     ));
                 }
                 self.run("DELETE FROM spare WHERE pid = ?", vec![int(child)]);
                 child
             }
-            None => self.new_pid(&parent.ns)?,
+            None => self.new_pid(&parent.ns, 0)?,
         };
         self.run(
             "INSERT INTO processes(ns, pid, ppid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, token, started, ended, seat) SELECT ns, ?, pid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, 'running', 0, NULL, token, ?, 0, seat FROM processes WHERE ns = ? AND pid = ?",
@@ -556,7 +602,7 @@ impl Db {
     /// parent. Its children are init's from now on, and those that ended already, init reaps.
     pub fn exit(&mut self, row: &Row, status: i32, signal: Option<u8>, now: u64) -> Result<()> {
         if row.zombie() {
-            return Err(abi::Errno::ESRCH.into());
+            return Err(Errno::ESRCH.into());
         }
         let wait = match signal {
             Some(signal) => abi::signal_status(signal),
@@ -590,17 +636,10 @@ impl Db {
     }
     /// Whether a live process holds the token `hash`.
     fn token_live(&self, ns: &str, hash: &str) -> bool {
-        #[derive(Deserialize)]
-        struct One {
-            #[allow(dead_code)]
-            pid: u32,
-        }
-        !self
-            .rows::<One>(
-                "SELECT pid FROM processes WHERE ns = ? AND token = ? AND state != 'zombie' LIMIT 1",
-                vec![text(ns), text(hash)],
-            )
-            .is_empty()
+        self.any(
+            "SELECT pid FROM processes WHERE ns = ? AND token = ? AND state != 'zombie' LIMIT 1",
+            vec![text(ns), text(hash)],
+        )
     }
     /// The children of `pid`, whose parent ended: init's now, as Linux reparents orphans, and,
     /// those that are zombies, reaped by it at once.
@@ -632,12 +671,12 @@ impl Db {
     /// waitpid(2): the zombie `pid`, now reaped, or EAGAIN while it runs, or ECHILD when it is
     /// no child of `parent` (none: the client kernel, which waits as init).
     pub fn wait(&mut self, ns: &str, parent: Option<u32>, pid: u32) -> Result<Proc> {
-        let row = self.process(ns, pid).ok_or(abi::Errno::ECHILD)?;
+        let row = self.process(ns, pid).ok_or(Errno::ECHILD)?;
         if pid == INIT || parent.is_some_and(|parent| row.ppid != parent) {
-            return Err(abi::Errno::ECHILD.into());
+            return Err(Errno::ECHILD.into());
         }
         if !row.zombie() {
-            return Err(abi::Errno::EAGAIN.into());
+            return Err(Errno::EAGAIN.into());
         }
         self.remove(&row);
         Ok(row.proc())
@@ -653,12 +692,12 @@ impl Db {
         signal: u8,
         now: u64,
     ) -> Result<()> {
-        let row = self.process(ns, pid).ok_or(abi::Errno::ESRCH)?;
+        let row = self.process(ns, pid).ok_or(Errno::ESRCH)?;
         if cred.id != 0 && cred.id != row.uid {
-            return Err(abi::Errno::EPERM.into());
+            return Err(Errno::EPERM.into());
         }
         if row.zombie() {
-            return Err(abi::Errno::ESRCH.into());
+            return Err(Errno::ESRCH.into());
         }
         // Init ignores the signals it installed no handler for, SIGKILL too, as Linux's does.
         if pid == INIT {
@@ -710,19 +749,33 @@ impl Db {
         }
         reaped
     }
-    /// The tabs whose processes still run.
-    pub fn seats(&self, ns: &str) -> Vec<String> {
+    /// The tabs whose processes still run, and the kernels that hold pids they were lent.
+    pub fn seats(&self, ns: &str) -> Value {
         #[derive(Deserialize)]
         struct Seat {
             seat: String,
         }
-        self.rows::<Seat>(
-            "SELECT DISTINCT seat FROM processes WHERE ns = ? AND seat IS NOT NULL AND state != 'zombie' ORDER BY seat",
-            vec![text(ns)],
-        )
-        .into_iter()
-        .map(|row| row.seat)
-        .collect()
+        #[derive(Deserialize)]
+        struct Kernel {
+            kernel: String,
+        }
+        let seats: Vec<String> = self
+            .rows::<Seat>(
+                "SELECT DISTINCT seat FROM processes WHERE ns = ? AND seat IS NOT NULL AND state != 'zombie' ORDER BY seat",
+                vec![text(ns)],
+            )
+            .into_iter()
+            .map(|row| row.seat)
+            .collect();
+        let kernels: Vec<String> = self
+            .rows::<Kernel>(
+                "SELECT DISTINCT COALESCE(kernel, '') AS kernel FROM spare ORDER BY kernel",
+                vec![],
+            )
+            .into_iter()
+            .map(|row| row.kernel)
+            .collect();
+        json!({ "seats": seats, "kernels": kernels })
     }
     /// What the processes `pids` (all of `ns` if none) are now, as /proc shows them. A process
     /// sees its own account's; root sees the namespace's.
@@ -744,13 +797,13 @@ impl Db {
 
     fn cgroup(&self, ns: &str, path: &str) -> Option<Cgroup> {
         self.rows::<Cgroup>(
-            "SELECT ns, path, parent, controllers, cpu_max, cpu_weight, memory_max, pids_max, io_max, freeze, devices FROM cgroups WHERE ns = ? AND path = ?",
+            "SELECT ns, path, parent, controllers, cpu_max, cpu_weight, memory_max, pids_max, io_max, freeze, devices, owner FROM cgroups WHERE ns = ? AND path = ?",
             vec![text(ns), text(path)],
         )
         .into_iter()
         .next()
     }
-    fn ensure_cgroup(&mut self, ns: &str, path: &str) {
+    fn ensure_cgroup(&mut self, ns: &str, path: &str, owner: u32) {
         // The root's parent is the empty string, so that it is nobody's child, its own included
         // (a listing of "/" would otherwise name "/" among its children).
         let parent = if path == "/" {
@@ -760,37 +813,55 @@ impl Db {
         };
         if self.cgroup(ns, path).is_none() {
             self.run(
-                "INSERT INTO cgroups(ns, path, parent, controllers, cpu_max, cpu_weight, memory_max, pids_max, io_max, freeze, devices) VALUES(?, ?, ?, '', NULL, 100, NULL, NULL, NULL, 0, '')",
-                vec![text(ns), text(path), text(parent)],
+                "INSERT INTO cgroups(ns, path, parent, controllers, cpu_max, cpu_weight, memory_max, pids_max, io_max, freeze, devices, owner) VALUES(?, ?, ?, '', NULL, 100, NULL, NULL, NULL, 0, '', ?)",
+                vec![text(ns), text(path), text(parent), int(owner)],
             );
         }
     }
-    pub fn cgroup_create(&mut self, ns: &str, path: &str) -> Result<()> {
+    /// mkdir(2) of a cgroup, as `cred`, enabling `controllers` for its subtree: it is its
+    /// maker's (`registry::may_create`).
+    pub fn cgroup_create(
+        &mut self,
+        ns: &str,
+        cred: &Identity,
+        path: &str,
+        controllers: Option<&str>,
+    ) -> Result<()> {
         self.ensure_namespace(ns, crate::auth::now());
         let path = cgroup_path(path);
         let parent = terminal_worker_core::parent(&path);
-        if self.cgroup(ns, parent).is_none() {
-            return Err(abi::Errno::ENOENT.into());
-        }
+        let Some(above) = self.cgroup(ns, parent) else {
+            return Err(Errno::ENOENT.into());
+        };
         if self.cgroup(ns, &path).is_some() {
-            return Err(abi::Errno::EEXIST.into());
+            return Err(Errno::EEXIST.into());
         }
-        self.ensure_cgroup(ns, &path);
+        if !registry::may_create(cred, parent, above.owner) {
+            return Err(Errno::EACCES.into());
+        }
+        let controllers = registry::controllers(controllers.unwrap_or_default())?;
+        self.ensure_cgroup(ns, &path, cred.id);
+        self.run(
+            "UPDATE cgroups SET controllers = ? WHERE ns = ? AND path = ?",
+            vec![text(&controllers), text(ns), text(&path)],
+        );
         Ok(())
     }
-    pub fn cgroup_remove(&mut self, ns: &str, path: &str) -> Result<()> {
+    /// rmdir(2) of a cgroup: its maker's or root's, once nothing is in it.
+    pub fn cgroup_remove(&mut self, ns: &str, cred: &Identity, path: &str) -> Result<()> {
         let path = cgroup_path(path);
         if ROOT_CGROUPS.contains(&path.as_str()) || path == "/" {
-            return Err(abi::Errno::EBUSY.into());
+            return Err(Errno::EBUSY.into());
         }
-        if self.cgroup(ns, &path).is_none() {
-            return Err(abi::Errno::ENOENT.into());
+        let cgroup = self.cgroup(ns, &path).ok_or(Errno::ENOENT)?;
+        if !registry::may_write(cred, cgroup.owner) {
+            return Err(Errno::EACCES.into());
         }
         if self.processes(ns).iter().any(|row| row.cgroup == path) {
-            return Err(abi::Errno::EBUSY.into());
+            return Err(Errno::EBUSY.into());
         }
         if !self.cgroup_list(ns, &path).is_empty() {
-            return Err(abi::Errno::ENOTEMPTY.into());
+            return Err(Errno::ENOTEMPTY.into());
         }
         self.run(
             "DELETE FROM cgroups WHERE ns = ? AND path = ?",
@@ -798,9 +869,20 @@ impl Db {
         );
         Ok(())
     }
-    pub fn cgroup_set(&mut self, ns: &str, path: &str, key: &str, value: &str) -> Result<()> {
+    /// A write of one of a cgroup's control files: its maker's or root's.
+    pub fn cgroup_set(
+        &mut self,
+        ns: &str,
+        cred: &Identity,
+        path: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
         let path = cgroup_path(path);
-        let cgroup = self.cgroup(ns, &path).ok_or(abi::Errno::ENOENT)?;
+        let cgroup = self.cgroup(ns, &path).ok_or(Errno::ENOENT)?;
+        if !registry::may_write(cred, cgroup.owner) {
+            return Err(Errno::EACCES.into());
+        }
         let mut updated = cgroup.clone();
         match key {
             "cpu.max" => {
@@ -814,21 +896,21 @@ impl Db {
                     .get(1)
                     .is_none_or(|period| period.parse::<u64>().is_ok());
                 if !quota || !period || parts.len() > 2 {
-                    return Err(abi::Errno::EINVAL.into());
+                    return Err(Errno::EINVAL.into());
                 }
                 updated.cpu_max = Some(value.to_string());
             }
             "cpu.weight" => {
-                let weight: u32 = value.trim().parse().map_err(|_| abi::Errno::EINVAL)?;
+                let weight: u32 = value.trim().parse().map_err(|_| Errno::EINVAL)?;
                 if !(1..=10000).contains(&weight) {
-                    return Err(abi::Errno::EINVAL.into());
+                    return Err(Errno::EINVAL.into());
                 }
                 updated.cpu_weight = weight;
             }
             "memory.max" => {
                 let value = value.trim();
                 if value != "max" && value.parse::<u64>().is_err() {
-                    return Err(abi::Errno::EINVAL.into());
+                    return Err(Errno::EINVAL.into());
                 }
                 updated.memory_max = Some(value.to_string());
             }
@@ -837,7 +919,7 @@ impl Db {
                 if value == "max" {
                     updated.pids_max = None;
                 } else {
-                    updated.pids_max = Some(value.parse().map_err(|_| abi::Errno::EINVAL)?);
+                    updated.pids_max = Some(value.parse().map_err(|_| Errno::EINVAL)?);
                 }
             }
             "io.max" => updated.io_max = Some(value.trim().to_string()),
@@ -845,16 +927,25 @@ impl Db {
                 updated.freeze = match value.trim() {
                     "0" => 0,
                     "1" => 1,
-                    _ => return Err(abi::Errno::EINVAL.into()),
+                    _ => return Err(Errno::EINVAL.into()),
                 };
             }
             "devices.allow" | "devices.deny" => {
+                if updated.devices.lines().count() >= registry::DEVICE_RULES_MAX {
+                    return Err(Error::because(
+                        Errno::ENOSPC,
+                        format!(
+                            "a cgroup keeps at most {} device rules",
+                            registry::DEVICE_RULES_MAX
+                        ),
+                    ));
+                }
                 updated.devices.push_str(key);
                 updated.devices.push(' ');
                 updated.devices.push_str(value.trim());
                 updated.devices.push('\n');
             }
-            _ => return Err(abi::Errno::EINVAL.into()),
+            _ => return Err(Errno::EINVAL.into()),
         }
         self.run(
             "UPDATE cgroups SET cpu_max = ?, cpu_weight = ?, memory_max = ?, pids_max = ?, io_max = ?, freeze = ?, devices = ? WHERE ns = ? AND path = ?",
@@ -872,14 +963,16 @@ impl Db {
         );
         Ok(())
     }
-    pub fn cgroup_attach(&mut self, ns: &str, pid: u32, path: &str) -> Result<()> {
+    /// A write of the process `pid` to the cgroup's `cgroup.procs`: as `registry::may_attach`.
+    pub fn cgroup_attach(&mut self, ns: &str, cred: &Identity, pid: u32, path: &str) -> Result<()> {
         let path = cgroup_path(path);
-        if self.cgroup(ns, &path).is_none() {
-            return Err(abi::Errno::ENOENT.into());
-        }
-        let row = self.process(ns, pid).ok_or(abi::Errno::ESRCH)?;
+        let cgroup = self.cgroup(ns, &path).ok_or(Errno::ENOENT)?;
+        let row = self.process(ns, pid).ok_or(Errno::ESRCH)?;
         if row.zombie() {
-            return Err(abi::Errno::ESRCH.into());
+            return Err(Errno::ESRCH.into());
+        }
+        if !registry::may_attach(cred, row.uid, &path, cgroup.owner) {
+            return Err(Errno::EACCES.into());
         }
         self.run(
             "UPDATE processes SET cgroup = ? WHERE ns = ? AND pid = ?",
@@ -889,7 +982,7 @@ impl Db {
     }
     pub fn cgroup_stat(&self, ns: &str, path: &str) -> Result<Value> {
         let path = cgroup_path(path);
-        let cgroup = self.cgroup(ns, &path).ok_or(abi::Errno::ENOENT)?;
+        let cgroup = self.cgroup(ns, &path).ok_or(Errno::ENOENT)?;
         let processes: Vec<u32> = self
             .processes(ns)
             .iter()
@@ -907,6 +1000,7 @@ impl Db {
             "io.max": cgroup.io_max,
             "cgroup.freeze": if cgroup.freeze != 0 { "1" } else { "0" },
             "devices": cgroup.devices,
+            "owner": cgroup.owner,
             "cgroup.procs": processes,
             "children": self.cgroup_list(ns, &path),
         }))
@@ -914,7 +1008,7 @@ impl Db {
     pub fn cgroup_list(&self, ns: &str, path: &str) -> Vec<String> {
         let path = cgroup_path(path);
         self.rows::<Cgroup>(
-            "SELECT ns, path, parent, controllers, cpu_max, cpu_weight, memory_max, pids_max, io_max, freeze, devices FROM cgroups WHERE ns = ? AND parent = ? ORDER BY path",
+            "SELECT ns, path, parent, controllers, cpu_max, cpu_weight, memory_max, pids_max, io_max, freeze, devices, owner FROM cgroups WHERE ns = ? AND parent = ? ORDER BY path",
             vec![text(ns), text(&path)],
         )
         .into_iter()
@@ -937,6 +1031,7 @@ struct Cgroup {
     io_max: Option<String>,
     freeze: i64,
     devices: String,
+    owner: u32,
 }
 
 /// A cgroup path as cgroup v2 writes one: absolute, its subtree's name relative to it.

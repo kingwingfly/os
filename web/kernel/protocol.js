@@ -65,7 +65,15 @@ export function kernelPort() {
   return shared;
 }
 
-// One call, its value: an error the kernel refused with is thrown with its errno.
+// One call, its value: an error the kernel refused with is thrown with its errno. What some
+// answer:
+// - `wait {pid}`: the reaped process's `{pid, ppid, status, signal}` (status as waitpid's),
+//   and, for one the kernel does not host, the machine's whole record (abi::Proc), of which
+//   those are a part; read only those.
+// - `waitchild {ppid, pid?}`: `{pid, ppid, status, code, signal}`, wait4's.
+// - `poll {pids}`: abi::Proc records, as /proc has them.
+// - `kill {pid, signal, from?}`: null; `from` names a process this tab runs, which signals as
+//   itself (its own credentials), not as the page's account.
 export async function kernelCall(type, args) {
   return kernelPort().request(type, args);
 }

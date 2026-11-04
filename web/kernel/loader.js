@@ -9,10 +9,11 @@
 // memory (WASIX's do, as env.memory), the memory's declared limits and shared flag, so every
 // process creates one of exactly that type. A module of its own exports `memory`.
 //
-// An image that imports WASIX's fork, setjmp or longjmp and was not built for them is given
-// binaryen's asyncify (web/kernel/asyncify.js) as it loads, off the page, once per content: fork
+// An image that imports WASIX's fork, setjmp or longjmp is given binaryen's asyncify
+// (web/kernel/asyncify.js) as it loads, off the page, once per content, unless it was built with
+// it, and its state is exported for a fork's child to be given (its globals and tables): fork
 // must work for any wasm (issue #20). What it made is kept in the browser's cache, by content,
-// for the next page.
+// for the next page, where it is compiled from at once.
 
 // How many modules stay compiled at once; the oldest goes past that (LRU).
 const CACHE_MAX = 8;
@@ -24,7 +25,7 @@ const MEMORY = { module: 'env', name: 'memory' };
 // The imports that unwind the stack, which asyncify is for.
 const UNWINDS = new Set(['proc_fork', 'stack_checkpoint', 'stack_restore']);
 // The browser's cache of images made forkable, by content; its name says how they were made.
-const FORKABLE = 'tw-asyncify-1';
+const FORKABLE = 'tw-asyncify-2';
 
 const compiled = new Map();
 // For the tests: how many modules were really compiled (a cache hit compiles none).
@@ -53,11 +54,17 @@ export function load(image) {
   return promise;
 }
 
+// The image's bytes, as its exec allows them to be read.
+const read = image => image.asset
+  ? fetch(image.asset)
+  : fetch(`/api/file?token=${encodeURIComponent(image.token_read)}`, { headers: { 'X-Process-Token': image.token } });
+
 async function compile(image) {
   let module;
-  const response = image.asset
-    ? await fetch(image.asset)
-    : await fetch(`/api/file?token=${encodeURIComponent(image.token_read)}`, { headers: { 'X-Process-Token': image.token } });
+  // An image made forkable before is compiled from what was made: what it imports and what it
+  // says before its code are the original's.
+  const kept = await cached(image);
+  const response = kept ?? await read(image);
   if (!response.ok) throw await refusal(response);
   // compileStreaming compiles as the bytes arrive, when the type says wasm; bytes always work.
   // What a module says before its code (the memory it imports, a start section) is read from a
@@ -89,29 +96,33 @@ async function compile(image) {
   validateExports(module, memoryImport);
   const unwinding = imports.filter(entry => entry.module === 'wasix_32v1' && UNWINDS.has(entry.name)).map(entry => `${entry.module}.${entry.name}`);
   const built = WebAssembly.Module.exports(module).some(entry => entry.name === 'asyncify_start_unwind');
-  if (unwinding.length && !built) module = await forkable(image, unwinding);
+  if (!kept && unwinding.length) module = await forkable(image, unwinding, !built);
   stats.compiled++;
   return { module, memory: memoryImport ? memory : undefined, startSection: start };
 }
 
-// The image made forkable: asyncify's pass, in a Worker, its result kept by content.
-async function forkable(image, unwinding) {
-  const key = `/asyncify/${encodeURIComponent(image.version ?? image.asset)}`;
+// The cache key of an image made forkable, by its content.
+const forkKey = image => `/asyncify/${encodeURIComponent(image.version ?? image.asset)}`;
+// What was made of the image before, if the browser kept it.
+async function cached(image) {
   const cache = await globalThis.caches?.open(FORKABLE).catch(() => null);
-  const kept = await cache?.match(key).catch(() => null);
-  if (kept) return WebAssembly.compile(await kept.arrayBuffer()).catch(error => { throw formatError(error); });
-  const response = image.asset
-    ? await fetch(image.asset)
-    : await fetch(`/api/file?token=${encodeURIComponent(image.token_read)}`, { headers: { 'X-Process-Token': image.token } });
+  const kept = await cache?.match(forkKey(image)).catch(() => null);
+  return kept ?? null;
+}
+// The image made forkable: asyncify's pass (`unwind`, unless it was built with it) and its state
+// exported, in a Worker, its result kept by content.
+async function forkable(image, unwinding, unwind) {
+  const response = await read(image);
   if (!response.ok) throw await refusal(response);
-  const bytes = await transform(await response.arrayBuffer(), unwinding).catch(error => { throw formatError(error); });
+  const bytes = await transform(await response.arrayBuffer(), unwinding, unwind).catch(error => { throw formatError(error); });
   const module = await WebAssembly.compile(bytes).catch(error => { throw formatError(error); });
-  await cache?.put(key, new Response(bytes, { headers: { 'Content-Type': 'application/wasm' } })).catch(() => {});
+  const cache = await globalThis.caches?.open(FORKABLE).catch(() => null);
+  await cache?.put(forkKey(image), new Response(bytes, { headers: { 'Content-Type': 'application/wasm' } })).catch(() => {});
   return module;
 }
 let asyncifier, asked = 0;
 const answers = new Map();
-function transform(bytes, imports) {
+function transform(bytes, imports, unwind) {
   if (!asyncifier) {
     asyncifier = new Worker('/wasi-asyncify.js', { type: 'module' });
     asyncifier.onmessage = ({ data }) => {
@@ -129,7 +140,7 @@ function transform(bytes, imports) {
   const id = ++asked;
   return new Promise((resolve, reject) => {
     answers.set(id, { resolve, reject });
-    asyncifier.postMessage({ id, bytes, imports }, [bytes]);
+    asyncifier.postMessage({ id, bytes, imports, unwind }, [bytes]);
   });
 }
 

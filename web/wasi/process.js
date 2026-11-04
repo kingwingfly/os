@@ -14,16 +14,22 @@
 // own: fork, execve, wait, pipe, dup, the working directory, setjmp and longjmp (phase 3).
 //
 // Started with {module, memory, startSection, argv, env, cwd, pid, ppid, proc, umask, sudo,
-// stdin, stdout, stderr, control, channel}: `startSection`, the loader's word that the image has
-// a start function; standard input is {data} (bytes given whole) or {pipe} (a pipe's buffer,
-// web/wasi/pipe.js), the terminal if {tty}; standard output {pipe}, or the page's, a terminal
-// if {tty}, whose reader may close it ({closed}, a word of shared memory); standard error
-// {tty}; {control}, a word the page sets to stop it; {channel}, memory its host answers its
-// waiting calls in (wait, execve). A fork's child is started with {fork}: its parent's memory,
-// globals, descriptors and stack, rewound in it. It posts {out, fd} as it writes to the page,
-// {reading} as it waits on the terminal, {stopped} and {continued}, {fork} as it forks, {host}
-// as it asks its host, and {exit} as it ends; it is posted {forked} (a fork's answer) and
-// {image} (an execve's: module, memory, startSection, token, argv, env).
+// stdin, stdout, stderr, control, channel, shares}: `startSection`, the loader's word that the
+// image has a start function; standard input is {data} (bytes given whole) or {pipe} (a pipe's
+// buffer, web/wasi/pipe.js), the terminal if {tty}; standard output {pipe}, or the page's, a
+// terminal if {tty}, whose reader may close it ({closed}, a word of shared memory); standard
+// error {tty}; {control}, the word the page signals it by (stopped, continued, or ended, which
+// it heeds at its next call, closing what it has open as an exit does); {channel}, memory its
+// host answers its waiting calls in (wait, execve); {shares}, its line's table of open files
+// (web/wasi/shared.js). A fork's child is started with {fork}: its parent's memory, globals,
+// descriptors and stack, rewound in it. It posts {out, fd} as it writes to the page, {reading}
+// as it waits on the terminal, {stopped} and {continued}, {described} as it opens a file of the
+// kernel's and {closed} as it closes one ({slot, gen}, and the description, for its host to
+// close should it be killed), {fork} as it forks, {host} as it asks its host, and {exit, signal}
+// as it ends; it is posted {forked} (a fork's answer) and {image} (an execve's: module, memory,
+// startSection, token, argv, env). Started with {close: descriptions} instead, it closes them,
+// as the process that held them last would have, and exits: what its host does for a process
+// it had to kill outright.
 //
 // fork(2) is binaryen's asyncify (web/wasi/fork.js): the loader adds it to an image that
 // imports fork, setjmp or longjmp, and a fork unwinds the image, copies it into a child, and
@@ -60,7 +66,10 @@ const ALL_RIGHTS = (1n << 30n) - 1n;
 // most of an existing file rewritten here (a write to one not truncated, an append).
 const INLINE = 256 * 1024, WINDOW = 4 << 20, REWRITE_MAX = 64 << 20;
 
-class Exit { constructor(code) { this.code = code; } }
+// The end of the process: its exit status, and the signal that ended it, if one did.
+class Exit { constructor(code, signal) { this.code = code; this.signal = signal; } }
+const killedBy = signal => new Exit(128 + signal, signal);
+const SIGABRT = 6, SIGPIPE = 13;
 // execve(2) went through: the image ends here, and the new one starts in its place.
 class Replaced {}
 class Errno extends Error { constructor(errno) { super(String(errno)); this.errno = errno; } }
@@ -187,8 +196,9 @@ const clean = path => path.length > 1 ? path.replace(/\/+$/, '').replace(/\/\/+/
 
 // What each descriptor is: the terminal or a pipe (in, out), a directory, or a file read through
 // a kernel descriptor (kfd), one written (in order, in chunks), or one rewritten here whole.
-// Several descriptors may be one open file (dup, fork): `refs` counts this process's; a fork
-// line's table (`shares`) counts every process's, and holds its offset.
+// Several descriptors may be one open file (dup, fork): `refs` counts this process's; its line's
+// table (`shares`, where memory may be shared) counts every process's, by pid, and holds its
+// offset, so that its host can close what a process it killed held last.
 const fds = new Map();
 // The descriptors an execve closes (FD_CLOEXEC).
 const cloexec = new Set();
@@ -205,7 +215,15 @@ function install(fd, found, counted = false) {
   if (counted) return;
   if (found.kind === 'pipe-in') found.pipe.hold(process.pid, 'r');
   else if (found.kind === 'pipe-out') found.pipe.hold(process.pid, 'w');
-  else if (found.share != null) shares.add(found.share, 1);
+  else if (found.share != null) shares.add(found.share, process.pid, 1);
+  else if (shares && found.kind === 'file') share(found);
+}
+// A file of the kernel's, just opened, in its line's table: its host is told of it.
+function share(found) {
+  const slot = shares.claim(process.pid, found.refs, found.pos ?? 0);
+  if (slot < 0) return;
+  shares.attach(found, slot);
+  postMessage({ described: { slot, gen: shares.gen(slot), description: describe(found) } });
 }
 // close(2) of `fd`: its open file closes once no descriptor of it is left, here or in another
 // process.
@@ -216,8 +234,19 @@ function* uninstall(fd) {
   found.refs--;
   if (found.kind === 'pipe-in') return found.pipe.drop(process.pid, 'r');
   if (found.kind === 'pipe-out') return found.pipe.drop(process.pid, 'w');
-  if (found.share != null ? shares.drop(found.share) > 0 : found.refs > 0) return;
+  if (found.share != null) {
+    const gen = shares.gen(found.share);
+    if (shares.drop(found.share, process.pid) > 0) return;
+    postMessage({ closed: { slot: found.share, gen } });
+  } else if (found.refs > 0) return;
   yield* closeFd(found);
+}
+// `work`, a generator, holding the lock of `found`'s description, where processes share it: a
+// read or write chooses its offset and moves it with no other's in between.
+function* exclusive(found, work) {
+  if (found.share == null || !shares) return yield* work();
+  shares.lock(found.share, process.pid, pause);
+  try { return yield* work(); } finally { shares.unlock(found.share); }
 }
 function filetype(found) {
   if (STDIO.has(found.kind)) return found.tty ? CHARACTER_DEVICE : UNKNOWN;
@@ -335,20 +364,20 @@ function* writeTo(found, at, data) {
   // A pipe whose reader is gone, or the page's whose reader has closed its end (head, with its
   // lines): SIGPIPE, whose default is to end the process, quietly.
   if (found.kind === 'out') {
-    if (found.closed && Atomics.load(found.closed, 0)) { flush(); throw new Exit(141); }
+    if (found.closed && Atomics.load(found.closed, 0)) { flush(); throw killedBy(SIGPIPE); }
     output(found.fd, data);
     return data.length;
   }
   if (found.kind === 'pipe-out') {
     // A write that waits for room shows what was written first.
     if (found.pipe.room < data.length) flush();
-    if (!found.pipe.write(data)) { flush(); throw new Exit(141); }
+    if (!found.pipe.write(data, pause)) { flush(); throw killedBy(SIGPIPE); }
     return data.length;
   }
   if (found.kind === 'pipe-in') throw new Errno(EBADF);
   if (found.kind !== 'file' || (!found.writer && !found.rewrite)) throw new Errno(EBADF);
   const bytes = found.bytes;
-  bytes.lock();
+  bytes.lock(process.pid, pause);
   try {
     if (found.rewrite) {
       if (found.append) at = bytes.length;
@@ -398,7 +427,7 @@ const safeJson = text => { try { return JSON.parse(text); } catch { return {}; }
 function* closeFd(found) {
   if (found.kind === 'file' && found.writer) {
     const bytes = found.bytes;
-    bytes.lock();
+    bytes.lock(process.pid);
     try {
       while (bytes.length > found.chunk) (yield* flushChunk(found));
       const calls = [];
@@ -434,7 +463,7 @@ function* closeFd(found) {
 let pending = [], pendingBytes = 0, written = 0, lastFlush = 0;
 function output(fd, data) {
   written += data.length;
-  if (written > process.limit) { flush(); postMessage({ truncated: true }); throw new Exit(141); }
+  if (written > process.limit) { flush(); postMessage({ truncated: true }); throw killedBy(SIGPIPE); }
   pending.push([fd, data.slice()]);
   pendingBytes += data.length;
   const now = performance.now();
@@ -522,7 +551,7 @@ const wasi = {
       if (length < bytes.from) throw new Errno(EINVAL);
       if (length > size(found)) yield* writeTo(found, size(found), new Uint8Array(length - size(found)));
     }
-    bytes.lock();
+    bytes.lock(process.pid, pause);
     try {
       const keep = length - (found.writer ? bytes.from : 0);
       if (!bytes.ensure(keep)) throw new Errno(EFBIG);
@@ -557,15 +586,17 @@ const wasi = {
   fd_read: (fd, iovs, count, nread) => attempt(function* () {
     const found = descriptor(fd);
     let total = 0;
-    for (const [ptr, len] of iovecs(iovs, count)) {
-      const at = found.pos ?? 0;
-      const data = yield* readFrom(found, at, len);
-      bytes().set(data, ptr); total += data.length;
-      if (!STDIO.has(found.kind)) found.pos = at + data.length;
-      if (data.length < len) break;
-      // A pipe gives what it has: once some is read, the read waits for no more.
-      if (found.kind === 'pipe-in' && total > 0 && found.pipe.queued === 0) break;
-    }
+    yield* exclusive(found, function* () {
+      for (const [ptr, len] of iovecs(iovs, count)) {
+        const at = found.pos ?? 0;
+        const data = yield* readFrom(found, at, len);
+        bytes().set(data, ptr); total += data.length;
+        if (!STDIO.has(found.kind)) found.pos = at + data.length;
+        if (data.length < len) break;
+        // A pipe gives what it has: once some is read, the read waits for no more.
+        if (found.kind === 'pipe-in' && total > 0 && found.pipe.queued === 0) break;
+      }
+    });
     view().setUint32(nread, total, true);
   }),
   fd_readdir: (fd, buf, len, cookie, used) => attempt(function* () {
@@ -610,23 +641,31 @@ const wasi = {
   fd_seek: (fd, offset, whence, ptr) => attempt(function* () {
     const found = descriptor(fd);
     if (found.kind !== 'file') throw new Errno(ESPIPE);
-    const base = whence === 0 ? 0 : whence === 1 ? found.pos : size(found);
-    const pos = base + Number(offset);
-    if (pos < 0) throw new Errno(EINVAL);
-    found.pos = pos;
-    view().setBigUint64(ptr, BigInt(pos), true);
+    yield* exclusive(found, function* () {
+      const base = whence === 0 ? 0 : whence === 1 ? found.pos : size(found);
+      const pos = base + Number(offset);
+      if (pos < 0) throw new Errno(EINVAL);
+      found.pos = pos;
+      view().setBigUint64(ptr, BigInt(pos), true);
+    });
   }),
-  fd_tell: (fd, ptr) => attempt(function* () { const found = descriptor(fd); if (found.kind !== 'file') throw new Errno(ESPIPE); view().setBigUint64(ptr, BigInt(found.pos), true); }),
+  fd_tell: (fd, ptr) => attempt(function* () {
+    const found = descriptor(fd);
+    if (found.kind !== 'file') throw new Errno(ESPIPE);
+    yield* exclusive(found, function* () { view().setBigUint64(ptr, BigInt(found.pos), true); });
+  }),
   fd_write: (fd, iovs, count, nwritten) => attempt(function* () {
     const found = descriptor(fd);
     let total = 0;
-    for (const [ptr, len] of iovecs(iovs, count)) {
-      const data = bytes().slice(ptr, ptr + len);
-      if (found.kind !== 'file') { total += yield* writeTo(found, 0, data); continue; }
-      const at = found.append ? size(found) : found.pos;
-      total += yield* writeTo(found, at, data);
-      found.pos = at + len;
-    }
+    yield* exclusive(found, function* () {
+      for (const [ptr, len] of iovecs(iovs, count)) {
+        const data = bytes().slice(ptr, ptr + len);
+        if (found.kind !== 'file') { total += yield* writeTo(found, 0, data); continue; }
+        const at = found.append ? size(found) : found.pos;
+        total += yield* writeTo(found, at, data);
+        found.pos = at + len;
+      }
+    });
     view().setUint32(nwritten, total, true);
   }),
   path_create_directory: (fd, ptr, len) => attempt(function* () { yield* call({ mkdir: { path: pathAt(fd, ptr, len), mode: 0o777 } }); forget(); }),
@@ -701,16 +740,27 @@ const preview1 = new Proxy(wasi, {
   },
 });
 
-// Stopped (SIGSTOP, SIGTSTP, Ctrl+Z): a word of memory the page shares (web/wasi/exec.mjs), 1
-// while the process is stopped. It waits at its next system call, and as a blocking read
-// returns, until continued (SIGCONT), as a stopped process runs no further; the page hears it
-// stop and go on. A loop that makes no call cannot be stopped this way, only killed.
+// Signals, as a word of memory the page shares (web/wasi/exec.mjs): 0 while the process runs, 1
+// while it is stopped (SIGSTOP, SIGTSTP, Ctrl+Z), KILLED and the signal once one ends it. It
+// heeds the word at its next system call, and as a blocking wait wakes: stopped, it waits until
+// continued (SIGCONT), as a stopped process runs no further, and the page hears it stop and go
+// on; ended, it exits by the signal, closing what it has open as an exit does. A loop that makes
+// no call cannot be stopped this way; its host ends it outright.
+const KILLED = 0x100;
 let control = null;
+// Whether it is exiting: what it has open closes then, whatever signal comes.
+let exiting = false;
 function pause() {
-  if (!control || Atomics.load(control, 0) === 0) return;
+  if (!control || exiting) return;
+  let word = Atomics.load(control, 0);
+  if (word === 0) return;
+  if (word & KILLED) { flush(); throw killedBy(word & 0xff); }
   flush();
   postMessage({ stopped: true });
-  while (Atomics.load(control, 0) !== 0) Atomics.wait(control, 0, 1);
+  while ((word = Atomics.load(control, 0)) !== 0) {
+    if (word & KILLED) { postMessage({ continued: true }); throw killedBy(word & 0xff); }
+    Atomics.wait(control, 0, word);
+  }
   postMessage({ continued: true });
 }
 
@@ -786,7 +836,7 @@ const wasixCalls = {
   }),
   fd_pipe: (readEnd, writeEnd) => attempt(function* () {
     if (typeof SharedArrayBuffer !== 'function') throw new Errno(ENOSYS);
-    const pipe = new Pipe(pipeBuffer());
+    const pipe = new Pipe(pipeBuffer(), process.pid);
     const r = lowest();
     install(r, { kind: 'pipe-in', pipe });
     const w = lowest();
@@ -853,7 +903,7 @@ const wasixCalls = {
   callback_signal: () => {},
   thread_id: ptr => { view().setUint32(ptr, 1, true); return 0; },
   // raise(3), abort(3): a signal to itself, whose default ends it.
-  thread_signal: (tid, signal) => { if (ENDING.has(signal)) { flush(); throw new Exit(128 + signal); } return 0; },
+  thread_signal: (tid, signal) => { if (ENDING.has(signal)) { flush(); throw killedBy(signal); } return 0; },
   thread_exit: code => { throw new Exit(code); },
   // One thread: nothing else could change the word or wake it, so a wait returns at once.
   futex_wait: (addr, expected, timeout, woken) => { view().setUint8(woken, 0); return 0; },
@@ -869,7 +919,7 @@ const wasixCalls = {
   },
   stack_restore: (snapshot, value) => {
     const found = snapshots.get(snapshot);
-    if (!engine?.able || !found || found.id !== view().getBigUint64(snapshot, true)) { flush(); throw new Exit(134); }
+    if (!engine?.able || !found || found.id !== view().getBigUint64(snapshot, true)) { flush(); throw killedBy(SIGABRT); }
     engine.unwind({ kind: 'restore', found, value: value === 0n ? 1n : value });
   },
 };
@@ -884,9 +934,10 @@ const wasix = new Proxy(wasixCalls, {
 // ---- Fork ----
 
 // What a child gets of this process's open files: each description, shared through the line's
-// table (`shares`), and which descriptors are which.
+// table (`shares`), and which descriptors are which. Its host counts the child's references to
+// each (and holds its pipes' ends) once it has the child's pid, before the child starts.
 function forkState() {
-  shares ??= new Shares();
+  if (!shares) throw new Errno(ENOSYS);
   const ids = new Map(), descriptions = [], table = [];
   for (const [fd, found] of fds) {
     if (!ids.has(found)) {
@@ -904,14 +955,10 @@ function describe(found) {
     case 'pipe-in': case 'pipe-out': return { kind: found.kind, tty: !!found.tty, buffer: found.pipe.buffer, refs: found.refs };
     case 'dir': return { kind: 'dir', path: found.path };
     default: {
-      if (found.share == null) {
-        const slot = shares.claim(found.refs, found.pos ?? 0);
-        if (slot < 0) throw new Errno(ERRNO.EMFILE);
-        shares.attach(found, slot);
-      }
-      shares.add(found.share, found.refs);
-      const { kind, path, kfd, token, read, size: length, stat: stated, writer, rewrite, append, chunk, share, refs } = found;
-      return { kind, path, kfd, token, read, size: length, stat: stated, writer, rewrite, append, chunk, share, refs, bytes: found.bytes?.transferable };
+      if (found.share == null) share(found);
+      if (found.share == null) throw new Errno(ERRNO.EMFILE);
+      const { kind, path, kfd, token, read, size: length, stat: stated, writer, rewrite, append, chunk, share: slot, refs } = found;
+      return { kind, path, kfd, token, read, size: length, stat: stated, writer, rewrite, append, chunk, share: slot, refs, bytes: found.bytes?.transferable };
     }
   }
 }
@@ -921,13 +968,11 @@ function adopt(state) {
     switch (description.kind) {
       case 'in': return { kind: 'in', tty: description.tty, data: description.data, pos: 0 };
       case 'out': return { kind: 'out', fd: description.fd, tty: description.tty, closed: description.closed ? new Int32Array(description.closed) : null };
-      case 'pipe-in': case 'pipe-out': return { kind: description.kind, tty: description.tty, pipe: new Pipe(description.buffer) };
+      case 'pipe-in': case 'pipe-out': return { kind: description.kind, tty: description.tty, pipe: new Pipe(description.buffer, process.pid) };
       case 'dir': return { kind: 'dir', path: description.path };
       default: {
-        const { bytes, share, refs, ...rest } = description;
-        const found = { ...rest, window: { start: 0, data: new Uint8Array(0) } };
-        if (bytes) found.bytes = new Bytes(bytes);
-        shares.attach(found, share);
+        const found = adopted(description);
+        if (shares) shares.attach(found, description.share);
         return found;
       }
     }
@@ -937,11 +982,12 @@ function adopt(state) {
     if (closeOnExec) cloexec.add(fd);
   }
 }
-// The child failed to start: what it was to share is this process's alone again.
-function unshare(state) {
-  for (const description of state.descriptions) {
-    if (description.share != null) shares.add(description.share, -description.refs);
-  }
+// A file of the kernel's another process described (`describe`): one to read or write here.
+function adopted(description) {
+  const { bytes, share, refs, ...rest } = description;
+  const found = { ...rest, window: { start: 0, data: new Uint8Array(0) } };
+  if (bytes) found.bytes = new Bytes(bytes);
+  return found;
 }
 // fork(2), the image unwound: the host makes the child (a pid, a Worker) of this snapshot.
 async function fork() {
@@ -950,10 +996,7 @@ async function fork() {
   const snapshot = engine.snapshot();
   postMessage({ fork: { ...state, snapshot, snapshots, shares: shares.buffer, argv: process.argv, env: environ, cwd: process.cwd, wasix: process.wasix } }, [snapshot.memory]);
   const { forked } = await next('forked');
-  if (forked.errno) {
-    unshare(state);
-    return { errno: ERRNO[forked.errno] ?? EIO };
-  }
+  if (forked.errno) return { errno: ERRNO[forked.errno] ?? EIO };
   return { pid: forked.pid };
 }
 
@@ -1107,6 +1150,11 @@ let started = false;
 onmessage = ({ data }) => {
   if (started) { received(data); return; }
   started = true;
+  if (data.close) {
+    process = { ...data };
+    void closeAll(data.close);
+    return;
+  }
   void start(data);
 };
 async function start(data) {
@@ -1114,7 +1162,7 @@ async function start(data) {
   control = data.control ? new Int32Array(data.control) : null;
   channel = data.channel ? { state: new Int32Array(data.channel, 0, 2), data: new Uint8Array(data.channel, 8) } : null;
   const { stdin = {}, stdout = {}, stderr = {}, fork: parent } = data;
-  let code = 0;
+  let code = 0, signal;
   try {
     if (parent) {
       // A fork's child: its parent's argument vector, environment, directory and descriptors.
@@ -1126,9 +1174,10 @@ async function start(data) {
     } else {
       environ = Array.isArray(data.env) ? data.env : Object.entries(data.env ?? {}).map(([name, value]) => `${name}=${value}`);
       process.cwd ??= environ.find(entry => entry.startsWith('PWD='))?.slice(4) || '/';
+      shares = data.shares ? new Shares(data.shares) : null;
       // The page holds the pipes' ends it gives a process, for it, before it starts.
-      install(0, stdin.pipe ? { kind: 'pipe-in', pipe: new Pipe(stdin.pipe), tty: !!stdin.tty } : { kind: 'in', tty: !!stdin.tty, data: stdin.data ?? new Uint8Array(0), pos: 0 }, true);
-      install(1, stdout.pipe ? { kind: 'pipe-out', pipe: new Pipe(stdout.pipe) } : { kind: 'out', fd: 1, tty: !!stdout.tty, closed: stdout.closed ? new Int32Array(stdout.closed) : null }, true);
+      install(0, stdin.pipe ? { kind: 'pipe-in', pipe: new Pipe(stdin.pipe, process.pid), tty: !!stdin.tty } : { kind: 'in', tty: !!stdin.tty, data: stdin.data ?? new Uint8Array(0), pos: 0 }, true);
+      install(1, stdout.pipe ? { kind: 'pipe-out', pipe: new Pipe(stdout.pipe, process.pid) } : { kind: 'out', fd: 1, tty: !!stdout.tty, closed: stdout.closed ? new Int32Array(stdout.closed) : null }, true);
       install(2, { kind: 'out', fd: 2, tty: !!stderr.tty }, true);
       install(3, { kind: 'dir', path: '/' });
     }
@@ -1137,13 +1186,27 @@ async function start(data) {
     if (parent) engine.rewind({ pid: 0 });
     code = await run();
   } catch (err) {
-    if (err instanceof Exit) code = err.code;
-    else { output(2, encoder.encode(`${process.argv?.[0] ?? 'process'}: ${err?.message ?? err}\n`)); code = 134; }
+    if (err instanceof Exit) ({ code, signal } = err);
+    else {
+      // A trap, or the engine's own failure: it ends as abort(3) ends a process.
+      output(2, encoder.encode(`${process.argv?.[0] ?? 'process'}: ${err?.message ?? err}\n`));
+      ({ code, signal } = killedBy(SIGABRT));
+    }
   }
   // What it left open closes as it exits, as a process's descriptors do: its pipes too, so that
   // the next reads to their end, and the one before hears SIGPIPE.
+  exiting = true;
   for (const fd of [...fds.keys()]) { try { await drive(uninstall(fd)); } catch { /* it exits all the same */ } }
   if (closing.length) { try { await drive(batch([])); } catch { /* likewise */ } }
   flush();
-  postMessage({ exit: code });
+  postMessage({ exit: code, signal });
+}
+// Close the open files a process its host killed held last, as it would have at its exit:
+// what they wrote goes, and their descriptors close.
+async function closeAll(descriptions) {
+  for (const description of descriptions) {
+    try { await drive(closeFd(adopted(description))); } catch { /* closed as it may be */ }
+  }
+  if (closing.length) { try { await drive(batch([])); } catch { /* likewise */ } }
+  postMessage({ exit: 0 });
 }

@@ -537,7 +537,6 @@ pub fn call(
             let sid = sid.ok_or(Errno::EBADF)?;
             let now = crate::auth::now();
             let stdin = db.add_fd(sid, None, &stdin_of(&pid), abi::O_WRONLY, false, now);
-            db.set_expiry("fd", &crate::db::fd_key(sid, stdin), now + crate::fds::IDLE);
             // Its credentials, as the caller's now (root under sudo), for its life; the token is
             // its runner's alone (sys.rs hands it over and takes it out of the reply).
             let token = crate::auth::random_token();

@@ -3,9 +3,9 @@
 // (web/kernel/loader.js). A call that forks, or saves or restores a stack, unwinds the image's
 // stack into a buffer of its memory, back out of `_start`; the host then does what the call
 // asked with nothing of the image's on the stack, and rewinds, re-entering the call, which
-// returns. A fork's child is a copy of the memory and the mutable globals in a new instance,
-// rewound from the same buffer, in a Worker of its own: the parent's call returns the child's
-// pid, the child's 0.
+// returns. A fork's child is a copy of the memory, the mutable globals and the tables' entries
+// in a new instance, rewound from the same buffer, in a Worker of its own: the parent's call
+// returns the child's pid, the child's 0.
 //
 // The buffer is memory of the image's own, grown for it once (a few pages past what its
 // allocator had), so no layout of the image's has to be guessed. Mechanism only: who may fork,
@@ -13,6 +13,8 @@
 
 // asyncify's states, as asyncify_get_state answers.
 export const NORMAL = 0, UNWINDING = 1, REWINDING = 2;
+// The loader's table of every function of the image (web/kernel/asyncify.js).
+const FUNCTIONS = '__tw_functions';
 // The buffer an unwound stack is written to: its two words (where it is, where it ends), then
 // the stack.
 const BUFFER_PAGES = 4, PAGE = 65536;
@@ -98,8 +100,9 @@ export class Engine {
 
   // ---- fork ----
 
-  // What a child needs to be this image at this point: its memory, and its mutable globals
-  // (the shadow stack's pointer, thread-local storage's base, and the like), once unwound.
+  // What a child needs to be this image at this point: its memory, its mutable globals (the
+  // shadow stack's pointer, thread-local storage's base, and the like), and what each of its
+  // tables holds, by function (the loader's `__tw_functions` table numbers them), once unwound.
   snapshot() {
     const globals = {};
     for (const [name, value] of Object.entries(this.exports)) {
@@ -112,7 +115,26 @@ export class Engine {
       } catch { /* immutable: the module's own */ }
     }
     const buffer = this.memory().buffer;
-    return { memory: new Uint8Array(buffer).slice().buffer, globals, region: this.region };
+    return { memory: new Uint8Array(buffer).slice().buffer, globals, tables: this.tables(), region: this.region };
+  }
+  // Each table's entries, as numbers of `__tw_functions`: -1 for none, -2 for what is not one
+  // of the image's functions (kept as the child has it).
+  tables() {
+    const functions = this.exports[FUNCTIONS];
+    if (!(functions instanceof WebAssembly.Table)) return {};
+    const numbers = new Map();
+    for (let index = 0; index < functions.length; index++) numbers.set(functions.get(index), index);
+    const tables = {};
+    for (const [name, table] of Object.entries(this.exports)) {
+      if (!(table instanceof WebAssembly.Table) || table === functions) continue;
+      const entries = new Int32Array(table.length);
+      for (let index = 0; index < table.length; index++) {
+        const entry = table.get(index);
+        entries[index] = entry == null ? -1 : numbers.get(entry) ?? -2;
+      }
+      tables[name] = entries;
+    }
+    return tables;
   }
   // A child: this engine's image, with the memory and globals of the parent's `snapshot`.
   static child(instance, memory, snapshot) {
@@ -124,6 +146,17 @@ export class Engine {
       const global = instance.exports[name];
       if (!(global instanceof WebAssembly.Global)) continue;
       try { global.value = typeof value === 'object' ? BigInt(value.bigint) : value; } catch { /* immutable here */ }
+    }
+    // Its tables hold what its parent's did: the same functions, this instance's own.
+    const functions = instance.exports[FUNCTIONS];
+    for (const [name, entries] of Object.entries(snapshot.tables ?? {})) {
+      const table = instance.exports[name];
+      if (!(table instanceof WebAssembly.Table) || !(functions instanceof WebAssembly.Table)) continue;
+      if (table.length < entries.length) table.grow(entries.length - table.length);
+      for (let index = 0; index < entries.length; index++) {
+        if (entries[index] === -2) continue;
+        table.set(index, entries[index] === -1 ? null : functions.get(entries[index]));
+      }
     }
     return new Engine(instance, memory, snapshot.region);
   }

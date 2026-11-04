@@ -39,7 +39,7 @@ See README for prerequisites and commands. The known toolchain uses `worker-buil
 - System calls (owner's design, 2026-10-29: the page is user space, the API its system calls; see README, Architecture): `crates/abi` is the interface, the calls (`Call`), their batch (`Batch`: the process's umask and sudo) and results, and errno with glibc's words; `crates/kernel` is the file system's syscalls, one function each, every check Linux's (namei, generic_permission with ACLs, sticky, protected links, ACLs as `system.posix_acl_*` xattrs), over the `Fs` store, tested on `MemStore`; `crates/worker/src/sys.rs` serves `POST /api/sys`, each call its own transaction. A call changes one name or inode, or fails and changes nothing; walking a tree is user space's. New file-system behaviour belongs in the kernel, as a syscall with its errno, never in a command the server runs.
 - File descriptors (`crates/worker/src/fds.rs`, the `fds` table): `open`, `pread`, `pwrite`, `close` and `ioctl(FICLONE)` are system calls; a call may name an earlier call's descriptor (`{"ref": i}`, `sys::resolve`), and `pread`/`pwrite` carry up to 256 KiB as base64 in the batch, moved to or from R2 outside a transaction (`sys::bytes`); larger chunks stream on the Worker (`PUT /api/pwrite?fd=&index=`, files.rs), as `GET /api/file` reads them. Every batch keeps its session's descriptors (`fds::renew`, at most every 5 s per session, `sys::heard`); pages holding one say so every 8 s (web/http.mjs `hold`). A writer that gives no size writes in order: the file grows (`File::growing`), truncated as it opens, whole when it closes or when its writer is gone. Directories open to read (`O_DIRECTORY`); /proc is `procfs.rs`, and `/proc/self/fd/N` is a magic link followed in every call's paths (`sys::paths`). A descriptor is its session's (`auth::sid`: a signed-in session's key, or the browser's own `terminal_guest` cookie, which the Worker gives a browser at once, `lib.rs with_guest_cookie`). Uploads (web/upload.mjs), the editor's save, recordings (web/record.mjs, `O_APPEND`), `cp` (FICLONE) and the seed script write through them; nothing writes a file otherwise, but archive jobs, until processes (phase 5). A descriptor call stands as it ends, failed or not (sys.rs): a close that fails still closes. Numbers are each given once per session (`fd_numbers`, forgotten with the session, or once it is idle with none open): pages share a session's descriptors, so a reused number could name another page's file. A descriptor opened as root (the call's cred, under sudo too) is marked `root`, and every check on it later, the Worker's streams included (`fds::acting`: pwrite, written, close, by_token), is root's. FICLONE shares /usr's binaries (`usr:*` content ids, read from the Worker's assets: `fds::Read::Asset`, `sys::asset_range`), and refuses what the kernel makes as it is read with EOPNOTSUPP, which userland cp copies by reading (`Copy::write_read`). The WASI engine sends its deferred closes after a batch's calls, so `{"ref": i}` names the caller's i-th.
 - User space (`crates/userland`): the programs, as coreutils are (ls, stat, df, mkdir, rmdir, rm, mv, cp, ln, readlink, realpath, touch, chmod, chown, chgrp, getfacl, setfacl, getfattr, setfattr, fd, ps, kill), each an async function over `Sys` and nothing else; dates as GNU's (`time.rs`, UTC); ps and the shell's jobs read /proc (`procs.rs`); GNU's messages (`rm: cannot remove 'x': Permission denied`), silent on success but with -v; trees walked a level a batch (`walk::below`), never atomically. The page runs them (`Shell::program`, over `crates/frontend/src/sys.rs`); unit tests run them over the kernel in memory (`userland/src/tests.rs`). Names come from /etc/passwd and /etc/group, which the kernel generates as they are read (`sys::generated`). E2E tests reach the kernel through `tests/sys.js` (`sys`, `errno`, `mkdirp`, `rmrf`, `listing`, `entry`, `put`, a whole file written through a descriptor, and `program`, a small user space of the setup programs; `fakeKernel` for pages without a server).
-- Core: pure Rust path resolution, the shell grammar (pipelines, xargs items, fd placeholders: `shell.rs`), text filters (`text.rs`), fd matching (`find.rs`), fuzzy completion, ranges, and the permission rules as provided methods of the `Store` trait (`permissions.rs`). `MemStore` implements it for tests; the worker's `Db` over SQLite. New file commands belong there, as validate-then-mutate methods, with MemStore tests.
+- Core: pure Rust path resolution, the shell grammar (pipelines, xargs items, fd placeholders: `shell.rs`), text filters (`text.rs`), fd matching (`find.rs`), fuzzy completion, ranges, and the `Store` trait (`permissions.rs`: names, inodes, accounts, and the helpers that still walk paths for jobs and the account commands: `physical`, `traverse`, `access`, `writable_parent`, `mkdir`, `remove` (userdel -r's home), `move_home`). `MemStore` implements it for tests; the worker's `Db` over SQLite. The file system's calls and their rules are the kernel's (`crates/kernel`, one function a call, tested on `MemStore`); the old command methods (`rename`, `link`, `symlink`, `chmod`, `chown`, `walk`) were removed as duplicates of them (2026-11-04). New file behaviour is a kernel call.
 - Frontend: Leptos tabs (`lib.rs`); each tab is a `shell::Shell` that runs pipelines stage by stage, and the programs of user space (`Shell::program`, `sudo_program`), whose questions (`mv -i`, `cp -i`) go to the tab's next line; xargs and fd -x run each command on its own, so each asks. web/app.js's `accountCommand` keeps the dialogs and hands the rest back to run as programs. Text filters, xargs and fd -x/-X run in the page. Browser bridge in web/app.js; chunked uploads in web/upload.mjs. CodeMirror loads lazily.
 - Previews render in Rust: crates/frontend/src/viewer.rs mounts each into the viewer's content through `window.terminalPreview.show(content, path, kind, version)`, and app.js calls what it returns to release it; the mount happens only if `content.dataset.version` still names that open. app.js keeps the dialog shell, fullscreen, games, and focus handling. Markdown is sanitized with ammonia; maths is substituted after sanitizing.
 - The viewer's search (`crates/frontend/src/search.rs`, the `Searchable` wrapper of text, code, diff and Markdown previews) matches Rust regular expressions over the DOM's text nodes and highlights them with the CSS Custom Highlight API, never changing the preview's markup; it searches again when the markup changes (code highlighting arrives later). It shows `#viewer-search` in the viewer bar while mounted, and its Esc must not close the viewer.
@@ -48,7 +48,7 @@ See README for prerequisites and commands. The known toolchain uses `worker-buil
 - **File bytes never pass through the authority.** The Worker (`files.rs`) asks it to authorize (`/internal/read`, `/internal/upload/begin|chunk`), streams R2 natively (no copying through wasm, `FixedLengthStream` for known lengths), then asks it to commit, which checks again. Downloads therefore never wait on uploads.
 - Files have a fixed chunk size (8 MiB for chunked uploads; a single-request PUT is one chunk), so chunk i starts at i × chunk_size; the readable length of an uploading file is its contiguous committed prefix. A new file's node exists while it uploads; an overwrite swaps at completion only if the node still shows the file it replaces. Every chunk authorization, chunk commit and completion checks the destination again (`api::destination`): a new file where its node is now (it may have moved), while the uploader can traverse to it and owns it or may write it; an overwrite while the uploader may write the target that still shows its base.
 - Storage: `nodes(path → ino)` are names, `inodes` hold owner, group, mode (with setuid/setgid/sticky), file id, link target and ACLs (JSON, core `acl`), `xattrs(ino, name, hex)`. `Store::set_node` with `ino` 0 makes an inode, otherwise updates that inode and names it; an inode goes with its last name. `Node.links` is computed (directories: 2 + subdirectories). The schema version is `meta.schema` (db::SCHEMA_VERSION); older local state is refused with a message to delete it, as nothing is migrated.
-- Paths given to the Store rules are physical up to their last part: callers resolve with `Store::physical(who, path, follow)` (`commands::command_path` follows a final link, `entry_path` does not; API endpoints use `real!`). Physical resolution stops, leaving the rest as written, where the caller may not search or nothing is, so the rule that follows reports the usual error. protected_symlinks is enforced there; protected_hardlinks in `Store::link`; the sticky rule in `Store::unlinkable` (rm, rename, cp -f, ln -f).
+- Paths given to the Store rules are physical up to their last part: callers resolve with `Store::physical(who, path, follow)` (`commands::command_path` follows a final link, `entry_path` does not; API endpoints use `real!`). Physical resolution stops, leaving the rest as written, where the caller may not search or nothing is, so the rule that follows reports the usual error. protected_symlinks is enforced there and in the kernel's namei; protected_hardlinks in `kernel::link`; the sticky rule in the kernel's `unlinkable` (unlink, rmdir, rename, and what replaces a name).
 - New nodes come from `permissions::created` (umask 022 or the parent's default ACL, setgid group inheritance); do not build `Node::file(who…, 0o644…)` for user-made files.
 - Nodes refer to immutable file ids; copies share them. A store frees a file when no node refers to it, by putting its key prefix `chunks/<file>/` in `garbage` in the same transaction; the alarm lists and deletes everything under it (also objects written but never committed) and expires uploads idle for 24 hours. Home moves, mv and cp change metadata only.
 - Every chunk write has its own R2 key (`chunks/<file>/<index>-<random>`, from `api::chunk_key`), and a chunk is committed once: a write sent again, late, or after completion is discarded, never overwriting bytes a reader, copy or completed file uses.
@@ -210,7 +210,8 @@ Uploaded wasm runs, as the roadmap's execve requires; these are built features, 
   token (`X-Process-Token`); a page or another process gets EBADF, and another browser session
   gets EPERM (the token is looked up in that request's namespace). The exec grant is never
   cached in `files.rs`'s `TOKENS`: its life ends when exit, kill or wait closes the descriptor.
-- **Process-owned descriptors:** a `proc` fd answers its process alone (`fds::owned`): a page
+- **Process-owned descriptors:** a `proc` fd answers its process's line alone (`fds::owned`), and
+  lives in the line's own session (see the rules from #30 and #31): a page
   batch or another process naming it (pread, pwrite, close, FICLONE) gets EBADF. Session fds
   are unchanged. `/api/sys` batches name their process in the batch body (`pid`, `proc`); byte
   requests (`GET /api/file`, `PUT /api/pwrite`) carry `X-Process-Token`, which `api.rs` resolves
@@ -243,6 +244,63 @@ Uploaded wasm runs, as the roadmap's execve requires; these are built features, 
   cwd, pipeline, compile-once, pipeline statuses, 0644/0755-text/directory denials, x-only, 4755
   no elevation, failed-loader cleanup, sudo of an applet and a path, logout EPERM, Ctrl+C).
 
+
+## Rules from the reviews of #30 and #31 (2026-11-03)
+
+Settled while resolving the two reviews of phases 0–4; keep them as later phases build on them.
+
+- **Registry policy is one table:** `kernel::registry::permit` (crates/kernel/src/registry.rs,
+  unit-tested) says, for every registry call, which caller may make it and as whom it acts:
+  `Kernel` (a batch by the client kernel's route, `X-Registry`, with no token), `Page` (a batch the
+  authority forwards, with no token), `Process` (any batch with a process's token, which is how
+  uploaded wasm reaches the machine through `terminal.sys`). `ProcInit`, `Pids`, `Seats` and
+  `Gone` are the kernel's; `Fork`, `Exit` and `Wait` the kernel's or the process's own; `Getpid`
+  a process's; `Execve` the kernel's or a page's; `Kill`, `ProcPoll` and the `Cgroup*` calls act
+  as an account (the snapshot, or the page's via `/internal/identity`). A new registry call
+  needs a row there, or it is refused. Tests that make a kernel's call send `X-Registry`
+  (`tests/sys.spec.js` `batch(calls, options, true)`).
+- **Cgroups have owners** (`cgroups.owner`): an account makes cgroups under `/user`
+  (`registry::DELEGATED`) or its own, writes and removes its own, moves its own processes into
+  its own or `/user`; root everything. Controllers are validated; device rules are capped
+  (`DEVICE_RULES_MAX`).
+- **Process room:** `PROC_MAX` counts live processes, pids lent and not taken (`spare`), and the
+  machine's in-memory `reserved` (execs given a pid, still asking the authority). Pids are lent
+  to a kernel by its id (`Pids.kernel`); each kernel holds the Web Lock `tw-kernel-<id>`, and one
+  that finds another's free reclaims its pids (`Gone { kernel }`). A new boot drops every lend.
+- **Exec race:** `exec_end` replaces an image only if the row still holds the token
+  `exec_begin` saw, alive (else ESRCH, and the new token is revoked); the old token is revoked
+  once no fork holds it. Revocations are cleared only on the authority's answer, and a failure to
+  revoke never fails the batch that ended processes (`Machine::settle`; the alarm retries).
+- **Process descriptors live in their line's session** (`creds::session_of`: `proc <lineage>`,
+  a job's `job <id>`), not the page's: login, logout, `su` or session expiry do not close them.
+  Page batches renew every line of their namespace (`Db::renew_lines`); a line's session goes
+  when its last credential is revoked (`end_line`). Descriptor numbers are per session, so a
+  process and its page may each have fd 3 naming different files.
+- **Descriptors keep their inode** (`fds.ino`, set by `Db::add_fd`, which also sets the idle
+  expiry): `fchmod` changes that inode by any name it has (`kernel::fchmod`), never another
+  inode sharing its content (FICLONE).
+- **Client-kernel ownership:** each process records its host (the port, bound to the tab it
+  first named); fork, reexec, exit, waitchild and kill-as-a-process need that host. A process's
+  `proc_signal` is sent as the process (`kill { from }`: the batch carries its pid and token),
+  after the kernel's pending reports.
+- **Signals and lifetimes in the page:** an ending signal sets the process's control word
+  (`KILLED | n`), heeded at its next call: it exits by the signal and closes its files itself.
+  After `GRACE` (1 s) the host terminates it, releases its pipe ends, pipe locks, shared-file
+  references (`Shares.release`, per-pid holders) and byte locks, and closes what it held last in
+  a closer Worker (process.js `{close}`), before the exit is reported. Every kernel file a process
+  opens gets a slot in its line's `Shares` (the host makes one per stage; forks inherit it) and is
+  described to the host (`{described}`, `{closed}`, checked by generation). Offsets are locked
+  per description from choice to update (`exclusive`). Exits carry `{exit, signal}` explicitly;
+  128+n is never read back as a signal.
+- **Fork state includes tables:** the transform exports every table and `__tw_functions` (every
+  function, in order); `Engine.snapshot` records entries by function number and `Engine.child`
+  sets them. Built images get the export pass without asyncify. The cache is `tw-asyncify-2`,
+  and a cached image is compiled from directly.
+- **/usr content in jobs:** `/internal/job/file` answers a `usr:*` content with its asset, which
+  the runner streams from `ASSETS`.
+- **Not taken from the reviews:** #31.8's per-pid descriptor key (a fork's child shares its
+  parent's descriptions; the lifetime problem is solved by the host's release instead), and
+  #31.9's second point (`SIGINT` there was the status 130 already).
 
 ## Required account semantics
 

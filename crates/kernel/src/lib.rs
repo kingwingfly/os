@@ -6,6 +6,7 @@
 //! It keeps nothing itself: a store (`Fs`) holds the names, inodes and accounts. The Worker's
 //! is SQLite in its Durable Object; tests use `MemStore`.
 mod namei;
+pub mod registry;
 mod xattr;
 
 use abi::{
@@ -624,7 +625,24 @@ pub fn symlink(fs: &mut impl Fs, cred: &Identity, target: &str, path: &str) -> R
 /// chmod(2): its owner's or root's. Without root, setgid needs the node's group to be one of
 /// the caller's: it is cleared otherwise, without an error, as Linux does.
 pub fn chmod(fs: &mut impl Fs, cred: &Identity, path: &str, mode: u16) -> Result<()> {
-    let (real, mut node) = existing(fs, cred, path, true)?;
+    let (real, node) = existing(fs, cred, path, true)?;
+    change_mode(fs, cred, &real, node, mode)
+}
+
+/// fchmod(2): the inode a descriptor has open, by one of its names (`real`, physical, which the
+/// descriptor's holder need not be able to reach): its owner's or root's, as chmod's.
+pub fn fchmod(fs: &mut impl Fs, cred: &Identity, real: &str, mode: u16) -> Result<()> {
+    let node = fs.node(real).ok_or(Errno::EBADF)?;
+    change_mode(fs, cred, real, node, mode)
+}
+
+fn change_mode(
+    fs: &mut impl Fs,
+    cred: &Identity,
+    real: &str,
+    mut node: Node,
+    mode: u16,
+) -> Result<()> {
     if cred.id != 0 && cred.id != node.owner {
         return Err(Errno::EPERM.into());
     }
@@ -632,7 +650,7 @@ pub fn chmod(fs: &mut impl Fs, cred: &Identity, path: &str, mode: u16) -> Result
     if cred.id != 0 && !cred.groups.contains(&node.group) {
         node.mode &= !SETGID;
     }
-    fs.set_node(&real, &node);
+    fs.set_node(real, &node);
     Ok(())
 }
 

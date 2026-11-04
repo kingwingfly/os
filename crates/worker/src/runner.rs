@@ -600,6 +600,30 @@ impl JobRunner {
             )
             .await?;
         let size = grant["size"].as_u64().unwrap_or(0);
+        // A binary of /usr streams from the Worker's assets, as its reads are served.
+        if let Some(asset) = grant["asset"].as_str() {
+            let response = self
+                .env
+                .assets("ASSETS")?
+                .fetch(format!("https://assets{asset}"), None)
+                .await?;
+            let (200, ResponseBody::Stream(stream)) = (response.status_code(), response.body())
+            else {
+                return Err(Error::RustError(format!(
+                    "the asset {asset} has no content"
+                )));
+            };
+            let mut init = RequestInit::new();
+            init.with_method(Method::Put);
+            init.with_body(Some(streams::fixed_length(stream, size as f64).into()));
+            let answer = fetcher
+                .fetch(format!("http://jobs{url}"), Some(init))
+                .await?;
+            if answer.status_code() != 200 {
+                return Err(Error::RustError(format!("the job container refused {url}")));
+            }
+            return Ok(());
+        }
         let chunk_size = grant["chunk_size"].as_u64().unwrap_or(1).max(1);
         let mut parts: Vec<(u64, String)> = grant["chunks"]
             .as_array()

@@ -389,7 +389,6 @@ pub fn call(
             let sid = sid.ok_or(Errno::EBADF)?;
             let now = crate::auth::now();
             let fd = db.add_fd(sid, None, &path, flags, false, now);
-            db.set_expiry("fd", &crate::db::fd_key(sid, fd), now + crate::fds::IDLE);
             Ok(json!(abi::Opened {
                 fd,
                 ..abi::Opened::default()

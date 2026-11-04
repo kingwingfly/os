@@ -65,18 +65,19 @@ pub fn call(
         Call::Close { fd } => close(db, sid, &process.cred, fd.number(), caller).map(|c| json!(c)),
         Call::Discard { fd } => discard(db, sid, &process.cred, fd.number(), caller),
         Call::Fchmod { fd, mode } => {
-            let (found, file) = descriptor(db, sid, fd.number(), caller)?;
-            // The file it has open, where it shows: the one it writes, or reads.
-            let path = match db.file(&file) {
-                Some(file) if found.writes() => {
-                    writable(db, &acting(&found, &process.cred), &file)?.0
-                }
-                _ => db
-                    .showing(&file)
-                    .pop()
-                    .ok_or_else(|| Error::because(Errno::EBADF, ELSEWHERE))?,
-            };
-            kernel::call(db, process, Call::Chmod { path, mode })
+            let found = db.fd(sid, fd.number()).ok_or(Errno::EBADF)?;
+            owned(&found, caller)?;
+            // The image is read-only, as its names are (sys.rs).
+            if crate::usr::is(&found.path) {
+                return Err(Errno::EROFS.into());
+            }
+            // The inode it opened, by whichever name it has now (another inode sharing its
+            // content, a FICLONE copy, is not it); one with no name left is gone.
+            let path = found
+                .ino
+                .and_then(|ino| db.name_of(ino))
+                .ok_or_else(|| Error::because(Errno::EBADF, "the file it opened is gone"))?;
+            kernel::fchmod(db, &process.cred, &path, mode).map(|()| Value::Null)
         }
         Call::Ioctl { fd, request, arg } => {
             yours(db, sid, fd.number(), caller)?;
@@ -208,7 +209,6 @@ fn open(
         && node.directory
     {
         let fd = db.add_fd(sid, None, path, flags, false, now);
-        db.set_expiry("fd", &fd_key(sid, fd), now + IDLE);
         return Ok(Opened {
             fd,
             ..Opened::default()
@@ -229,7 +229,6 @@ fn open(
             None => db.empty(cred.id, &path),
         };
         let fd = db.add_fd(sid, Some(&file), &path, flags, false, now);
-        db.set_expiry("fd", &fd_key(sid, fd), now + IDLE);
         // A file whole is read by its token too, without asking each time.
         let token = db
             .file(&file)
@@ -310,7 +309,6 @@ fn open(
                 );
                 db.set_expiry("upload", &id, now + RECORDING_IDLE);
                 let fd = db.add_fd(sid, Some(&id), &path, flags, false, now);
-                db.set_expiry("fd", &fd_key(sid, fd), now + IDLE);
                 return Ok(Opened {
                     fd,
                     chunk_size: CHUNK_SIZE,
@@ -354,7 +352,6 @@ fn open(
         db.set_expiry("upload", &id, now + UPLOAD_TTL);
     }
     let fd = db.add_fd(sid, Some(&id), &path, flags, created, now);
-    db.set_expiry("fd", &fd_key(sid, fd), now + IDLE);
     Ok(Opened {
         fd,
         size,
@@ -383,7 +380,6 @@ fn resume(db: &mut Db, sid: &str, path: &str, flags: u32, file: &File, now: u64)
     db.revoke_writers(&file.id);
     let created = file.base.is_none();
     let fd = db.add_fd(sid, Some(&file.id), path, flags, created, now);
-    db.set_expiry("fd", &fd_key(sid, fd), now + IDLE);
     db.set_expiry("upload", &file.id, now + UPLOAD_TTL);
     Ok(Opened {
         fd,
