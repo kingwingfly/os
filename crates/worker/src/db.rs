@@ -59,7 +59,7 @@ const SCHEMA: [&str; 33] = [
     // File descriptors (fds.rs): a session's (each browser is one), by number; the content it
     // reads or writes (none once another writer took it over), where, its open(2) flags,
     // whether it made the file, and when it was last kept (its lease).
-    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, token TEXT, root INTEGER NOT NULL DEFAULT 0, proc TEXT, exec INTEGER NOT NULL DEFAULT 0, cred TEXT, PRIMARY KEY(sid, fd))",
+    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, token TEXT, root INTEGER NOT NULL DEFAULT 0, proc TEXT, exec INTEGER NOT NULL DEFAULT 0, cred TEXT, ino INTEGER, PRIMARY KEY(sid, fd))",
     // The next descriptor number of each session: numbers are not given again, as a session's
     // pages share its descriptors, and one may go on using a number another closed.
     "CREATE TABLE IF NOT EXISTS fd_numbers(sid TEXT PRIMARY KEY, next INTEGER NOT NULL)",
@@ -253,6 +253,11 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     // Descriptors made before they kept their opener's credentials act as `root` says.
     if sql.exec("SELECT cred FROM fds LIMIT 0", None).is_err() {
         sql.exec("ALTER TABLE fds ADD COLUMN cred TEXT", None)?;
+    }
+    // Descriptors made before they named the inode they opened name none: fchmod of one is
+    // EBADF.
+    if sql.exec("SELECT ino FROM fds LIMIT 0", None).is_err() {
+        sql.exec("ALTER TABLE fds ADD COLUMN ino INTEGER", None)?;
     }
     // Credentials made before they named their descriptors' owner own them by their own key.
     if sql
@@ -495,6 +500,10 @@ pub struct Fd {
     /// x-only file runs.
     #[serde(deserialize_with = "flag", default)]
     pub exec: bool,
+    /// The inode it opened, whatever its names become: what fchmod changes, as Linux's file
+    /// keeps its inode.
+    #[serde(default)]
+    pub ino: Option<u64>,
 }
 impl Fd {
     pub fn writes(&self) -> bool {
@@ -673,7 +682,7 @@ impl Db {
     /// The descriptor `fd` of the session `sid`.
     pub fn fd(&self, sid: &str, fd: u32) -> Option<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred FROM fds WHERE sid = ? AND fd = ?",
+            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred, ino FROM fds WHERE sid = ? AND fd = ?",
             vec![text(sid), int(fd)],
         )
         .pop()
@@ -681,14 +690,14 @@ impl Db {
     /// The descriptors of the session `sid`.
     pub fn fds_of(&self, sid: &str) -> Vec<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred FROM fds WHERE sid = ? ORDER BY fd",
+            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred, ino FROM fds WHERE sid = ? ORDER BY fd",
             vec![text(sid)],
         )
     }
     /// The descriptor writing `file`, if one is.
     pub fn writer(&self, file: &str) -> Option<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred FROM fds WHERE file = ? AND flags & 3 != 0",
+            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred, ino FROM fds WHERE file = ? AND flags & 3 != 0",
             vec![text(file)],
         )
         .pop()
@@ -787,7 +796,8 @@ impl Db {
     }
     /// A new descriptor of the session `sid`, numbered from 3 on, each number given once: a
     /// session's pages share its descriptors, so a page may still use a number another page
-    /// closed, which must then name nothing rather than another file. It is kept from `now`.
+    /// closed, which must then name nothing rather than another file. It has the inode `path`
+    /// names now, if any, and is kept from `now` (closed if not kept for `fds::IDLE`).
     pub fn add_fd(
         &mut self,
         sid: &str,
@@ -798,8 +808,9 @@ impl Db {
         now: u64,
     ) -> u32 {
         let fd = self.next_fd(sid);
+        let ino = self.node(path).map(|node| node.ino).filter(|ino| *ino != 0);
         self.run(
-            "INSERT INTO fds(sid, fd, file, path, flags, created, leased) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO fds(sid, fd, file, path, flags, created, leased, ino) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 text(sid),
                 int(fd),
@@ -808,8 +819,10 @@ impl Db {
                 int(flags),
                 int(created as u8),
                 int(now),
+                ino.map_or(SqlStorageValue::Null, int),
             ],
         );
+        self.set_expiry("fd", &fd_key(sid, fd), now + crate::fds::IDLE);
         fd
     }
     fn next_fd(&mut self, sid: &str) -> u32 {
@@ -855,6 +868,7 @@ impl Db {
                 text(proc),
             ],
         );
+        self.set_expiry("fd", &fd_key(sid, fd), now + crate::fds::IDLE);
         fd
     }
     /// Keep the credentials `cred` the descriptor `fd` of `sid` was opened with.
@@ -868,6 +882,10 @@ impl Db {
                 int(fd),
             ],
         );
+    }
+    /// A name of the inode `ino`, if it has one left.
+    pub fn name_of(&self, ino: u64) -> Option<String> {
+        self.names(ino).into_iter().next()
     }
     /// Make the descriptor `fd` of `sid` the process `proc`'s ("ns pid"): it answers that
     /// process alone, and closes as it ends.

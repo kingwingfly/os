@@ -881,7 +881,7 @@ pub enum Call {
         argv: Vec<String>,
         #[serde(default)]
         env: Vec<String>,
-        #[serde(default = "root")]
+        #[serde(default = "slash")]
         cwd: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cgroup: Option<String>,
@@ -915,17 +915,24 @@ pub enum Call {
         #[serde(default, rename = "proc", skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
-    /// Lend the client kernel `count` pids of its namespace, which its forks take at once,
-    /// without asking (`Fork`'s `child`).
+    /// Lend the client kernel `kernel` (its own id, which it holds a Web Lock of while it runs)
+    /// `count` pids of its namespace, which its forks take at once, without asking (`Fork`'s
+    /// `child`). What a kernel was lent and did not take goes back once it is gone (`Gone`).
     Pids {
         count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kernel: Option<String>,
     },
-    /// The tabs (seats) whose processes still run, which the client kernel checks are there.
+    /// What the client kernel checks is still there: the tabs (seats) whose processes still
+    /// run, and the kernels holding lent pids (`{seats, kernels}`).
     Seats,
-    /// The tab `seat` is gone (its Web Lock is free): what it ran ended with it, as by SIGKILL,
-    /// and init reaps it.
+    /// The tab `seat`, or the kernel `kernel`, is gone (its Web Lock is free): what the tab ran
+    /// ended with it, as by SIGKILL, and init reaps it; the pids the kernel was lent go back.
     Gone {
-        seat: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seat: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kernel: Option<String>,
     },
     /// getpid(2), of the calling process.
     Getpid,
@@ -962,7 +969,7 @@ pub enum Call {
     },
     /// The cgroups below `path`, or the root's, as getdents lists a directory.
     CgroupList {
-        #[serde(default = "root")]
+        #[serde(default = "slash")]
         path: String,
     },
     /// Signal the process `pid`: it stops, between steps (SIGTERM).
@@ -988,10 +995,23 @@ pub enum Call {
         arg: serde_json::Value,
     },
 }
+/// What a `Kill` or a `Wait` names: a process of the browser's registry (a number), or an
+/// archive job (its id, a word of hexadecimal digits that is never a number).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target<'a> {
+    Pid(u32),
+    Job(&'a str),
+}
+impl<'a> Target<'a> {
+    pub fn of(pid: &'a str) -> Self {
+        pid.parse().map_or(Target::Job(pid), Target::Pid)
+    }
+}
+
 impl Call {
     /// Whether the call is the process registry's (each browser's own, not the filesystem's):
     /// the namespace, its processes and cgroups. A Kill or Wait of a number names a process; of
-    /// a word, an archive job.
+    /// a word, an archive job (`Target`).
     pub fn is_registry(&self) -> bool {
         match self {
             Call::ProcInit { .. }
@@ -1009,7 +1029,9 @@ impl Call {
             | Call::CgroupAttach { .. }
             | Call::CgroupStat { .. }
             | Call::CgroupList { .. } => true,
-            Call::Kill { pid, .. } | Call::Wait { pid, .. } => pid.parse::<u32>().is_ok(),
+            Call::Kill { pid, .. } | Call::Wait { pid, .. } => {
+                matches!(Target::of(pid), Target::Pid(_))
+            }
             _ => false,
         }
     }
@@ -1020,6 +1042,10 @@ pub const PIDS_MAX: u32 = 64;
 
 fn root() -> String {
     "root".into()
+}
+/// The root directory, or the root cgroup: where a path not given starts.
+fn slash() -> String {
+    "/".into()
 }
 fn creation_mode() -> u16 {
     0o666
@@ -1051,6 +1077,9 @@ fn umask() -> u16 {
 }
 /// The most calls a batch takes.
 pub const BATCH_MAX: usize = 256;
+/// The most bytes a batch's request may be (it says its length): the authority's and each
+/// machine's.
+pub const BATCH_BYTES: u64 = 4 << 20;
 
 /// What a call gave back: its value, or its error.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1227,5 +1256,12 @@ mod tests {
             .is_registry()
         );
         assert!(!Call::Getcreds.is_registry());
+        assert_eq!(Target::of("12"), Target::Pid(12));
+        assert_eq!(Target::of("a1b2"), Target::Job("a1b2"));
+        // A path not given is the root's, as a cgroup not given is.
+        let exec: Call = serde_json::from_str(r#"{"execve":{"path":"x"}}"#).unwrap();
+        assert!(matches!(exec, Call::Execve { ref cwd, .. } if cwd == "/"));
+        let list: Call = serde_json::from_str(r#"{"cgroup_list":{}}"#).unwrap();
+        assert_eq!(list, Call::CgroupList { path: "/".into() });
     }
 }

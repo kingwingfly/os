@@ -146,7 +146,6 @@ pub fn open(db: &mut Db, sid: &str, path: &str, flags: u32) -> Result<Opened> {
     }
     let now = auth::now();
     let fd = db.add_device_fd(sid, path, flags, now);
-    db.set_expiry("fd", &crate::db::fd_key(sid, fd), now + crate::fds::IDLE);
     Ok(Opened {
         fd,
         ..Opened::default()

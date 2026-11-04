@@ -79,9 +79,11 @@ pub fn job_owner(id: &str) -> String {
 }
 
 impl Credential {
-    /// The session its descriptors are kept in, where it is not its browser's: a job's own.
-    pub fn session(&self) -> Option<String> {
-        (self.ns == JOBS).then(|| self.owner())
+    /// The session its descriptors are kept in: its line's own, whatever the browser's page is
+    /// signed in as meanwhile, as a process's open files outlive any change to its user's
+    /// login session (a job's is the job's own).
+    pub fn session(&self) -> String {
+        session_of(&self.ns, &self.lineage)
     }
     /// The job these credentials are, if they are a job's.
     pub fn job(&self) -> Option<String> {
@@ -91,7 +93,7 @@ impl Credential {
     }
 }
 
-/// The session the descriptors of a request are kept in: its process's, for a job, or else the
+/// The session the descriptors of a request are kept in: its process's line's, or else the
 /// browser's (the cookies' session).
 pub fn sid_of(
     db: &Db,
@@ -100,8 +102,18 @@ pub fn sid_of(
     caller: Option<&Credential>,
 ) -> Option<String> {
     caller
-        .and_then(Credential::session)
+        .map(Credential::session)
         .or_else(|| auth::sid(db, key, guest))
+}
+
+/// The session of the descriptors the line of credentials `lineage` of `ns` owns: a job's is
+/// its owner key; a browser's process's, its line's.
+fn session_of(ns: &str, lineage: &str) -> String {
+    if ns == JOBS {
+        lineage.to_string()
+    } else {
+        format!("proc {lineage}")
+    }
 }
 
 /// The key the descriptors of the credentials of token hash `token`, executed as `pid` of
@@ -143,9 +155,32 @@ impl Db {
             "DELETE FROM credentials WHERE ns = ? AND owner = ?",
             vec![text(JOBS), text(&job_owner(id))],
         );
-        self.close_proc_fds(&job_owner(id));
-        // Its session of descriptors is gone with it, numbers and all.
-        self.forget_fd_numbers(&job_owner(id));
+        self.end_line(JOBS, &job_owner(id));
+    }
+    /// The line of credentials `lineage` of `ns` has none left: what its processes opened
+    /// closes, and its session of descriptors goes, numbers and all.
+    fn end_line(&mut self, ns: &str, lineage: &str) {
+        self.close_proc_fds(lineage);
+        let session = session_of(ns, lineage);
+        for fd in self.fds_of(&session) {
+            crate::fds::release(self, &session, fd.fd);
+        }
+        self.forget_fd_numbers(&session);
+    }
+    /// Keep the descriptors of every process line of the namespace `ns` (its pages were heard
+    /// from, which host its processes).
+    pub fn renew_lines(&mut self, ns: &str, now: u64) {
+        #[derive(Deserialize)]
+        struct Line {
+            owner: String,
+        }
+        let lines = self.rows::<Line>(
+            &format!("SELECT DISTINCT {OWNER} AS owner FROM credentials WHERE ns = ?"),
+            vec![text(ns)],
+        );
+        for line in lines {
+            crate::fds::renew(self, &session_of(ns, &line.owner), now);
+        }
     }
     /// The credentials whose token's hash is `hash`, in `ns`.
     fn credential_of(&self, hash: &str, ns: &str) -> Option<Credential> {
@@ -181,7 +216,7 @@ impl Db {
                 )
                 .is_empty();
             if !held {
-                self.close_proc_fds(&credential.owner());
+                self.end_line(ns, &credential.owner());
             }
         }
     }
@@ -402,16 +437,11 @@ fn exec(
             format!("{} is not an executable image", executable.path),
         ));
     }
-    let sid = auth::sid(db, key, guest);
-    if asset.is_none() && sid.is_none() {
-        return Err(Error::because(
-            Errno::EBADF,
-            "no session to keep descriptors",
-        ));
-    }
     let lineage = current
         .as_ref()
         .map_or_else(|| owner(ns, asked.pid, &asked.token), Credential::owner);
+    // The image's descriptor is kept in its process's line's session, as what it opens is.
+    let sid = session_of(ns, &lineage);
     db.run(
         "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
         vec![
@@ -433,8 +463,8 @@ fn exec(
     }
     // The new image's own descriptor is its exec's alone.
     let owner = owner(ns, asked.pid, &asked.token);
-    let (fd, token_read, size) = match (asset, sid) {
-        (None, Some(sid)) => {
+    let (fd, token_read, size) = match asset {
+        None => {
             let read = auth::random_token();
             let fd = db.add_exec_fd(
                 &sid,
@@ -444,14 +474,10 @@ fn exec(
                 &auth::token_hash(&read),
                 now,
             );
-            db.set_expiry("fd", &crate::db::fd_key(&sid, fd), now + crate::fds::IDLE);
             (Some(fd), Some(read), executable.node.size)
         }
-        _ => (
-            None,
-            None,
-            asset.map_or(executable.node.size, crate::usr::size),
-        ),
+        // A binary of /usr is as large as the build's (`usr::size` takes its content id).
+        Some(_) => (None, None, crate::usr::size(&executable.content)),
     };
     Ok(json!(Image {
         uid: cred.id,

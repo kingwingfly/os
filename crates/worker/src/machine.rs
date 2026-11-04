@@ -11,10 +11,15 @@
 //! kernel that hosts it. A batch that ended processes revokes their tokens at the authority
 //! once, as it answers, so that what they opened closes as they end, as on Linux; one that
 //! cannot is tried again by the alarm.
+//!
+//! Who may make which call, and as whom it acts, is `kernel::registry`'s table: the client
+//! kernel by its own route, a page through the authority, a process by its token (uploaded
+//! wasm reaches here through terminal.sys, and is given nothing of the kernel's).
 use crate::db::{Db, transact};
 use crate::procs::{Begun, Snapshot};
 use crate::{auth, procs};
 use abi::{BATCH_MAX, Batch, Call, Errno, Error, Exec, Forked, Return};
+use kernel::registry::{self, Acting};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
@@ -23,14 +28,27 @@ use worker::*;
 
 /// How long a revocation that failed waits to be tried again, in milliseconds.
 const REVOKE_AFTER: i64 = 10_000;
-/// The most a batch's request may be, as at the authority.
-const BATCH_BYTES: u64 = 4 << 20;
 
 #[durable_object]
 pub struct Machine {
     state: State,
     env: Env,
     ready: Cell<bool>,
+    /// New processes execs were given pids for and have not started yet, as they wait on the
+    /// authority: they count against the namespace's room (`PROC_MAX`) with those running.
+    reserved: Cell<usize>,
+}
+
+/// Pids an exec reserved, given back as it ends, however it ends.
+struct Reservation<'a> {
+    reserved: &'a Cell<usize>,
+    count: usize,
+}
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.reserved
+            .set(self.reserved.get().saturating_sub(self.count));
+    }
 }
 
 impl DurableObject for Machine {
@@ -39,6 +57,7 @@ impl DurableObject for Machine {
             state,
             env,
             ready: Cell::new(false),
+            reserved: Cell::new(0),
         }
     }
     async fn fetch(&self, mut req: Request) -> Result<Response> {
@@ -54,7 +73,7 @@ impl DurableObject for Machine {
                     .headers()
                     .get("Content-Length")?
                     .and_then(|length| length.parse::<u64>().ok())
-                    .is_none_or(|length| length > BATCH_BYTES)
+                    .is_none_or(|length| length > abi::BATCH_BYTES)
                 {
                     return Response::error("A batch says its length, and is at most 4 MB", 400);
                 }
@@ -66,6 +85,11 @@ impl DurableObject for Machine {
                     auth::guest_key(&req).as_deref(),
                 );
                 let caller = Caller {
+                    class: if batch.process.is_some() {
+                        registry::Caller::Process
+                    } else {
+                        registry::Caller::Kernel
+                    },
                     ns,
                     cookie: req.headers().get("Cookie")?,
                     sudo: batch.sudo,
@@ -82,6 +106,11 @@ impl DurableObject for Machine {
                     return Response::error("Invalid forwarded calls", 400);
                 };
                 let caller = Caller {
+                    class: if forwarded.token.is_some() {
+                        registry::Caller::Process
+                    } else {
+                        registry::Caller::Page
+                    },
                     ns: forwarded.ns,
                     cookie: forwarded.cookie,
                     sudo: forwarded.sudo,
@@ -105,9 +134,9 @@ impl DurableObject for Machine {
             }
             _ => return Response::error("Not found", 404),
         };
-        // What the batch ended closes at the authority before it answers.
-        self.flush().await?;
-        self.schedule().await?;
+        // What the batch ended closes at the authority before it answers. Its calls stand
+        // whether or not that can be done now: what cannot, the alarm does.
+        self.settle().await;
         Response::from_json(&json!(abi::Results { results: reply }))
     }
     async fn alarm(&self) -> Result<Response> {
@@ -115,8 +144,7 @@ impl DurableObject for Machine {
             procs::create(&self.state.storage().sql())?;
             self.ready.set(true);
         }
-        self.flush().await?;
-        self.schedule().await?;
+        self.settle().await;
         Response::ok("")
     }
 }
@@ -144,9 +172,11 @@ fn umask() -> u16 {
     0o022
 }
 
-/// Who a batch's calls are from: a browser (its namespace and cookies), as a page or, with a
-/// token, as one of its processes; the page's account, once asked of the authority.
+/// Who a batch's calls are from: a browser (its namespace and cookies), as its client kernel,
+/// a page or, with a token, one of its processes; the page's account, once asked of the
+/// authority.
 struct Caller {
+    class: registry::Caller,
     ns: String,
     cookie: Option<String>,
     sudo: bool,
@@ -208,34 +238,39 @@ impl Machine {
 
     /// One call that is not an execve.
     async fn call(&self, caller: &Caller, call: Call) -> Result<std::result::Result<Value, Error>> {
-        if !call.is_registry() {
-            return Ok(Err(Error::because(
-                Errno::ENOSYS,
-                "not the process registry's call: the filesystem's go to the authority",
-            )));
-        }
-        // Kill and poll act as the page's account; the rest by the process's token, or as
-        // the browser's kernel.
-        let identity = match &call {
-            Call::Kill { .. } | Call::ProcPoll { .. } if caller.token.is_none() => {
-                match self.identity(caller).await? {
-                    Ok(identity) => Some(identity),
-                    Err(error) => return Ok(Err(error)),
-                }
-            }
+        let acting = match registry::permit(caller.class, &call) {
+            Ok(acting) => acting,
+            Err(error) => return Ok(Err(error)),
+        };
+        // What acts as an account acts as the page's, unless a process's token says whose.
+        let identity = match acting {
+            Acting::Account if caller.token.is_none() => match self.identity(caller).await? {
+                Ok(identity) => Some(identity),
+                Err(error) => return Ok(Err(error)),
+            },
             _ => None,
         };
         let (ns, pid, token) = (caller.ns.clone(), caller.pid, caller.token.clone());
+        let reserved = self.reserved.get();
         let told = call.clone();
         let result = transact(&self.state, move |db| {
-            let result = run(db, &ns, pid, token.as_deref(), identity.as_ref(), call);
+            let asked = Asked {
+                ns: &ns,
+                pid,
+                token: token.as_deref(),
+                identity: identity.as_ref(),
+                reserved,
+            };
+            let result = run(db, &asked, call);
             let commit = result.is_ok();
             (result, commit)
         })?;
         // A signal is told to the tab that runs the process, on its browser's events line.
-        if let (Ok(_), Call::Kill { pid, signal }) = (&result, told) {
+        if let (Ok(_), Call::Kill { pid, signal }) = (&result, told)
+            && let abi::Target::Pid(pid) = abi::Target::of(&pid)
+        {
             let told = json!({ "ns": caller.ns, "value": { "signal": {
-                "pid": pid.parse::<u32>().unwrap_or_default(),
+                "pid": pid,
                 "signal": signal.unwrap_or(abi::SIGTERM),
             } } });
             let _ = self.authority("/internal/tell", None, &told).await;
@@ -247,23 +282,20 @@ impl Machine {
     /// authority checks each image and snapshots the caller in one request, and each process
     /// starts.
     async fn execve(&self, caller: &Caller, calls: Vec<Call>) -> Result<Vec<Return>> {
-        if caller.token.is_some() {
-            // A process replaces itself through its kernel, which holds the token.
-            return Ok(calls
-                .iter()
-                .map(|_| {
-                    Return::Err(Error::because(
-                        Errno::EPERM,
-                        "a process cannot replace itself; the client kernel must execve it",
-                    ))
-                })
-                .collect());
+        if let Some(Err(error)) = calls
+            .first()
+            .map(|call| registry::permit(caller.class, call))
+        {
+            return Ok(calls.iter().map(|_| Return::Err(error.clone())).collect());
         }
         let now = auth::now();
         let ns = caller.ns.clone();
         let asked: Vec<Call> = calls.clone();
-        // First, each stage's pid; what fails here is not asked further.
+        let reserved = self.reserved.get();
+        // First, each stage's pid; what fails here is not asked further. A new process's pid
+        // counts against the namespace's room until it starts, with those other execs hold.
         let begun: Vec<std::result::Result<Begun, Error>> = transact(&self.state, move |db| {
+            let mut new = 0;
             let begun: Vec<_> = asked
                 .iter()
                 .map(|call| match call {
@@ -274,20 +306,36 @@ impl Machine {
                         env,
                         cgroup,
                         ..
-                    } => db.exec_begin(
-                        &ns,
-                        *pid,
-                        token.as_deref(),
-                        argv,
-                        env,
-                        cgroup.as_deref(),
-                        now,
-                    ),
+                    } => {
+                        let begun = db.exec_begin(
+                            &ns,
+                            *pid,
+                            token.as_deref(),
+                            argv,
+                            env,
+                            cgroup.as_deref(),
+                            reserved + new,
+                            now,
+                        );
+                        if matches!(&begun, Ok(begun) if begun.replacing.is_none()) {
+                            new += 1;
+                        }
+                        begun
+                    }
                     _ => Err(Errno::EINVAL.into()),
                 })
                 .collect();
             (begun, true)
         })?;
+        let count = begun
+            .iter()
+            .filter(|begun| matches!(begun, Ok(begun) if begun.replacing.is_none()))
+            .count();
+        self.reserved.set(self.reserved.get() + count);
+        let _reservation = Reservation {
+            reserved: &self.reserved,
+            count,
+        };
         let tokens: Vec<String> = calls.iter().map(|_| auth::random_token()).collect();
         let execs: Vec<Value> = calls
             .iter()
@@ -325,17 +373,19 @@ impl Machine {
             )
             .await?
         };
+        // The revocations it took went with an answer, not a refusal: only then are they done.
         let mut images: Vec<Return> = match answered {
-            Ok(value) => serde_json::from_value(value["results"].clone()).unwrap_or_default(),
+            Ok(value) => {
+                let images = serde_json::from_value(value["results"].clone()).unwrap_or_default();
+                let revoked = revoke.clone();
+                transact(&self.state, move |db| {
+                    db.revoked(&revoked);
+                    ((), true)
+                })?;
+                images
+            }
             Err(error) => execs.iter().map(|_| Return::Err(error.clone())).collect(),
         };
-        if images.len() == execs.len() && !execs.is_empty() {
-            let revoked = revoke.clone();
-            transact(&self.state, move |db| {
-                db.revoked(&revoked);
-                ((), true)
-            })?;
-        }
         images.reverse();
         let mut results = Vec::with_capacity(calls.len());
         for ((call, begun), token) in calls.into_iter().zip(begun).zip(tokens) {
@@ -387,9 +437,9 @@ impl Machine {
             let path = image["path"].as_str().unwrap_or_default().to_string();
             let (ns, hash) = (caller.ns.clone(), auth::token_hash(&token));
             let row = (begun.clone(), path.clone(), cgroup.clone());
-            transact(&self.state, move |db| {
+            let started = transact(&self.state, move |db| {
                 let (begun, path, cgroup) = row;
-                db.exec_end(
+                let started = db.exec_end(
                     &ns,
                     &begun,
                     &snapshot,
@@ -402,8 +452,15 @@ impl Machine {
                     seat.as_deref(),
                     now,
                 );
-                ((), true)
+                (started, true)
             })?;
+            if !started {
+                results.push(Return::Err(Error::because(
+                    Errno::ESRCH,
+                    "the process ended, or replaced its image, as it executed",
+                )));
+                continue;
+            }
             results.push(Return::Ok(json!(Exec {
                 pid: begun.pid,
                 token,
@@ -454,6 +511,17 @@ impl Machine {
             .unwrap_or("the authority refused")
             .to_string();
         Ok(Err(Error::because(errno, detail)))
+    }
+
+    /// Revoke what waits to be revoked, and wake to try again if any of it is left: a failure
+    /// is logged, not answered, as the calls that ended the processes stand.
+    async fn settle(&self) {
+        if let Err(error) = self.flush().await {
+            console_error!("revocation failed: {error}");
+        }
+        if let Err(error) = self.schedule().await {
+            console_error!("the revocation alarm could not be set: {error}");
+        }
     }
 
     /// Revoke at the authority the tokens no process holds any more.
@@ -559,19 +627,23 @@ pub async fn list(env: &Env, ns: &str) -> Result<Vec<procs::Row>> {
     Ok(response.json().await.unwrap_or_default())
 }
 
-/// A registry call that is not an execve, as `token` (a process's, with its `pid`), or as the
-/// browser's kernel, or as the page's account (`identity`, for kill and poll).
-fn run(
-    db: &mut Db,
-    ns: &str,
+/// Who a registry call is from, as the machine found it: its namespace, the process's pid and
+/// token (a process's call), the account it acts as (the page's, for the kernel's and the
+/// page's calls that act as one), and the pids reserved by execs still asking the authority.
+struct Asked<'a> {
+    ns: &'a str,
     pid: Option<u32>,
-    token: Option<&str>,
-    identity: Option<&Identity>,
-    call: Call,
-) -> std::result::Result<Value, Error> {
-    let caller = match token {
+    token: Option<&'a str>,
+    identity: Option<&'a Identity>,
+    reserved: usize,
+}
+
+/// A registry call that is not an execve, which `registry::permit` let its caller make.
+fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Error> {
+    let ns = asked.ns;
+    let caller = match asked.token {
         Some(token) => Some(
-            db.process_token(token, pid, ns)
+            db.process_token(token, asked.pid, ns)
                 .ok_or_else(|| Error::because(Errno::EPERM, "not this process's token"))?,
         ),
         None => None,
@@ -582,16 +654,16 @@ fn run(
             .as_ref()
             .ok_or_else(|| Error::because(Errno::EPERM, "a process's call"))
     };
+    // The account a call acts as: the process's snapshot, or the page's.
+    let account = || {
+        caller
+            .as_ref()
+            .map(procs::Row::identity)
+            .or_else(|| asked.identity.cloned())
+            .ok_or(Error::from(Errno::EPERM))
+    };
     match call {
-        Call::ProcInit { boot } => {
-            if caller.is_some() {
-                return Err(Error::because(
-                    Errno::EPERM,
-                    "a process cannot change its browser's session",
-                ));
-            }
-            Ok(db.proc_init(ns, boot.as_deref(), now))
-        }
+        Call::ProcInit { boot } => Ok(db.proc_init(ns, boot.as_deref(), now)),
         Call::Fork {
             pid,
             child,
@@ -605,7 +677,10 @@ fn run(
                     })?,
                     named,
                 ),
-                None => (process()?.clone(), token.unwrap_or_default().to_string()),
+                None => (
+                    process()?.clone(),
+                    asked.token.unwrap_or_default().to_string(),
+                ),
             };
             if pid != row.pid {
                 return Err(Error::because(
@@ -638,14 +713,21 @@ fn run(
             db.exit(&row, status, signal, now)?;
             Ok(Value::Null)
         }
-        Call::Pids { count } => {
-            if caller.is_some() {
-                return Err(Error::because(Errno::EPERM, "the kernel's call"));
+        Call::Pids { count, kernel } => Ok(json!(db.lend(
+            ns,
+            count,
+            kernel.as_deref(),
+            asked.reserved,
+            now
+        )?)),
+        Call::Seats => Ok(db.seats(ns)),
+        Call::Gone { seat, kernel } => {
+            let reaped = seat.map(|seat| db.gone(ns, &seat, now)).unwrap_or_default();
+            if let Some(kernel) = kernel {
+                db.reclaim(&kernel);
             }
-            Ok(json!(db.lend(ns, count, now)?))
+            Ok(json!(reaped))
         }
-        Call::Seats => Ok(json!(db.seats(ns))),
-        Call::Gone { seat } => Ok(json!(db.gone(ns, &seat, now))),
         Call::Getpid => {
             let row = process()?;
             Ok(json!({ "pid": row.pid, "ppid": row.ppid }))
@@ -657,37 +739,37 @@ fn run(
                     format!("at most {} processes at a time", abi::PROC_POLL_MAX),
                 ));
             }
-            let cred = caller
-                .as_ref()
-                .map(|row| row.identity())
-                .or_else(|| identity.cloned())
-                .ok_or(Errno::EPERM)?;
-            Ok(json!(db.poll(ns, &pids, &cred)))
+            Ok(json!(db.poll(ns, &pids, &account()?)))
         }
         Call::Kill {
             pid: target,
             signal,
         } => {
-            let target: u32 = target.parse().map_err(|_| Errno::ESRCH)?;
-            let cred = caller
-                .as_ref()
-                .map(|row| row.identity())
-                .or_else(|| identity.cloned())
-                .ok_or(Errno::EPERM)?;
-            db.kill(ns, &cred, target, signal.unwrap_or(abi::SIGTERM), now)?;
+            let abi::Target::Pid(target) = abi::Target::of(&target) else {
+                return Err(Errno::ESRCH.into());
+            };
+            db.kill(ns, &account()?, target, signal.unwrap_or(abi::SIGTERM), now)?;
             Ok(Value::Null)
         }
         Call::Wait { pid: target, .. } => {
-            let want: u32 = target.parse().map_err(|_| Errno::ECHILD)?;
+            let abi::Target::Pid(want) = abi::Target::of(&target) else {
+                return Err(Errno::ECHILD.into());
+            };
             let parent = caller.as_ref().map(|row| row.pid);
             Ok(json!(db.wait(ns, parent, want)?))
         }
-        Call::CgroupCreate { path, .. } => db.cgroup_create(ns, &path).map(|()| Value::Null),
-        Call::CgroupRemove { path } => db.cgroup_remove(ns, &path).map(|()| Value::Null),
-        Call::CgroupSet { path, key, value } => {
-            db.cgroup_set(ns, &path, &key, &value).map(|()| Value::Null)
-        }
-        Call::CgroupAttach { pid, path } => db.cgroup_attach(ns, pid, &path).map(|()| Value::Null),
+        Call::CgroupCreate { path, controllers } => db
+            .cgroup_create(ns, &account()?, &path, controllers.as_deref())
+            .map(|()| Value::Null),
+        Call::CgroupRemove { path } => db
+            .cgroup_remove(ns, &account()?, &path)
+            .map(|()| Value::Null),
+        Call::CgroupSet { path, key, value } => db
+            .cgroup_set(ns, &account()?, &path, &key, &value)
+            .map(|()| Value::Null),
+        Call::CgroupAttach { pid, path } => db
+            .cgroup_attach(ns, &account()?, pid, &path)
+            .map(|()| Value::Null),
         Call::CgroupStat { path } => db.cgroup_stat(ns, &path),
         Call::CgroupList { path } => Ok(json!(db.cgroup_list(ns, &path))),
         _ => Err(Errno::ENOSYS.into()),

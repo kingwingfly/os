@@ -10,13 +10,14 @@ const address = name => `sys-${name}-${Date.now()}-${++sequence}`;
 async function session(username, password) {
   const context = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address(username || 'guest') } });
   if (username) expect((await api(context, 'login', { data: { username, password } })).ok()).toBe(true);
-  const batch = async (calls, options = {}) => {
-    const response = await context.post('/api/sys', { data: { calls, ...options } });
+  // A batch, as a page sends it, or as the client kernel does (`registry`: its own route).
+  const batch = async (calls, options = {}, registry = false) => {
+    const response = await context.post('/api/sys', { data: { calls, ...options }, headers: registry ? { 'X-Registry': '1' } : {} });
     expect(response.status()).toBe(200);
     return (await response.json()).results;
   };
   // One call: its value, or its errno.
-  const sys = async (call, options) => { const [result] = await batch([call], options); return 'ok' in result ? result.ok : result.err.errno; };
+  const sys = async (call, options, registry) => { const [result] = await batch([call], options, registry); return 'ok' in result ? result.ok : result.err.errno; };
   return { context, batch, sys };
 }
 
@@ -491,16 +492,18 @@ test('execve runs /usr binaries, snapshots the caller, and refuses what Linux re
 
 test('proc_init begins a browser namespace, and a new boot reaps what the old one left running', async () => {
   const boot = 'sys-boot-' + Date.now().toString(36);
-  const first = await ann.sys({ proc_init: { boot } });
+  // It is the client kernel's: a page's batch may not begin a namespace.
+  expect(await ann.sys({ proc_init: { boot } })).toBe('EPERM');
+  const first = await ann.sys({ proc_init: { boot } }, {}, true);
   expect(first.pid).toBe(1);
   expect(first.pids).toContain(1);
   const exec = await ann.sys({ execve: { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '30'], env: [], cwd: '/' } });
-  const same = await ann.sys({ proc_init: { boot } });
+  const same = await ann.sys({ proc_init: { boot } }, {}, true);
   expect(same.pids).toContain(exec.pid);
   const [running] = await ann.batch([{ proc_poll: { pids: [exec.pid] } }]);
   expect(running.ok[0].state).toBe('running');
   // A reload's boot id reaps the processes of the boot that is gone: only init remains.
-  const reset = await ann.sys({ proc_init: { boot: boot + '-new' } });
+  const reset = await ann.sys({ proc_init: { boot: boot + '-new' } }, {}, true);
   expect(reset.pids).toEqual([1]);
   const [init] = await ann.batch([{ proc_poll: { pids: [1] } }]);
   expect(init.ok[0].state).toBe('running');

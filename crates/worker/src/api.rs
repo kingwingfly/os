@@ -466,6 +466,10 @@ fn job_reply(
             if !db.pinned(id, file) {
                 return Reply::error("The job does not read that file", 403);
             }
+            // A binary of /usr (or a copy sharing it) is the build's: the Worker's asset.
+            if let Some(asset) = crate::usr::asset(file) {
+                return Reply::ok(json!({"asset": asset, "size": crate::usr::size(file)}));
+            }
             let Some(f) = db.file(file) else {
                 return Reply::error("File content does not exist", 404);
             };
