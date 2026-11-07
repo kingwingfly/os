@@ -657,7 +657,7 @@ test('a process keeps its descriptors and credentials when its page changes acco
     expect(streamed.status()).toBe(200);
     expect(await streamed.text()).toBe('root-only content');
     expect(await page.sys({ exit: { status: 0 } }, as)).toBeNull();
-    expect((await page.sys({ wait: { pid: String(exec.pid) } }, {}, true)).pid).toBe(exec.pid);
+    expect((await page.sys({ wait: { pid: String(exec.pid), proc: exec.token } }, {}, true)).pid).toBe(exec.pid);
     expect(await read()).toBe('EPERM');
   } finally {
     await rmrf(root.context, path);

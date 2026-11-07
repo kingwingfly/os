@@ -134,19 +134,21 @@ roadmap.
   coreutils process. Two tabs of one browser share the namespace and see each other's pids.
 - **Process registry (moved 2026-11-03, change request 1):** each browser's namespace is a
   `Machine` Durable Object of its own (`MACHINE`, `id_from_name(ns)`, `machine.rs`), whose
-  SQLite has `namespaces`, `processes`, `cgroups`, `spare` (lent pids) and `revoked` (tokens
+  SQLite has `namespaces`, `account_boots`, `processes`, `cgroups`, `spare` (lent pids) and `revoked` (tokens
   the authority is still to revoke); `procs.rs` is its registry. A namespace is the browser's
   guest key (`session.<key>` with no guest cookie). `ProcInit` creates PID 1 (root's, as
-  Linux's; signals to it do nothing) and the root cgroups; a new boot id reaps what the old one
-  left running. Rules:
+  Linux's; signals to it do nothing) and the root cgroups; a new boot id reaps only the
+  current account's old processes. Rules:
   - **Routing:** `Call::is_registry` names the registry's calls (a Kill or Wait of a number
     too). The client kernel marks its batches `X-Registry: 1`, and the Worker sends them to the
     machine by the cookies' namespace; the machine refuses any other call (ENOSYS). A page's
     batch to the authority that carries registry calls has them forwarded (`machine::forward`,
     `/internal/sys`) with the caller the authority found.
-  - **execve is the one authority call:** the machine gives each stage a pid (`exec_begin`), asks
-    the authority once for the whole pipeline (`/internal/exec`, with the browser's cookies), and
-    records each row (`exec_end`). The authority (`creds.rs`) checks with `kernel::executable`
+  - **execve asks the authority for credentials and an image:** the machine gives each stage
+    a pid (`exec_begin`), asks the authority once for the whole pipeline (`/internal/exec`, with the browser's cookies), and
+    records each row (`exec_end`). Tokenless registry bookkeeping also resolves the account
+    once per batch through `/internal/identity`. The authority (`creds.rs`) checks with
+    `kernel::executable`
     (regular, whole, X rule, root's x rule, no setuid), snapshots uid/gid/groups/umask into
     `credentials` by the token's hash, and answers an asset for a build binary (by content) or,
     for an uploaded image, a process-owned descriptor and read token.
@@ -249,16 +251,23 @@ Uploaded wasm runs, as the roadmap's execve requires; these are built features, 
 
 Settled while resolving the two reviews of phases 0–4; keep them as later phases build on them.
 
-- **Registry policy is one table:** `kernel::registry::permit` (crates/kernel/src/registry.rs,
-  unit-tested) says, for every registry call, which caller may make it and as whom it acts:
-  `Kernel` (a batch by the client kernel's route, `X-Registry`, with no token), `Page` (a batch the
-  authority forwards, with no token), `Process` (any batch with a process's token, which is how
-  uploaded wasm reaches the machine through `terminal.sys`). `ProcInit`, `Pids`, `Seats` and
-  `Gone` are the kernel's; `Fork`, `Exit` and `Wait` the kernel's or the process's own; `Getpid`
-  a process's; `Execve` the kernel's or a page's; `Kill`, `ProcPoll` and the `Cgroup*` calls act
-  as an account (the snapshot, or the page's via `/internal/identity`). A new registry call
-  needs a row there, or it is refused. Tests that make a kernel's call send `X-Registry`
-  (`tests/sys.spec.js` `batch(calls, options, true)`).
+- **Registry policy is one table:** `kernel::registry::permit` says which route accepts each
+  call and which identity it uses. `Registry` means a tokenless `X-Registry` batch, not a
+  privileged kernel: any page can set that header. `Page` means a forwarded tokenless batch;
+  `Process` means a batch with a process token on either route. Bookkeeping on the registry
+  route acts as the account verified by the authority; process calls use their snapshot.
+  `ProcInit` tracks boot ids per account and resets only that account's processes and lends.
+  `Seats` filters by account (root sees all); `Gone` checks every process and lend it would
+  remove before committing, with the same owner/root rule as kill. Public Web Lock names
+  are liveness hints, never credentials. A mixed-account seat cannot be reaped by its guest.
+  `Pids` accepts a process token too: the client keeps pools per lineage, and the server binds
+  reservations to the account and, when supplied, the token. Fork cannot consume another
+  account's or lineage's reservation. Unused token-bound lends expire with the last live holder.
+  Fork/exit reports prove the process token. Host wait reports carry `Wait.proc`, checked
+  against the zombie's stored hash, so logout does not break reaping; that token grants no
+  live-process authority. Without it a registry wait needs the account/root and an init child.
+  A port cannot use another host's stored token to wait. Add coverage in
+  `tests/process-security.spec.js` for changes to these boundaries.
 - **Cgroups have owners** (`cgroups.owner`): an account makes cgroups under `/user`
   (`registry::DELEGATED`) or its own, writes and removes its own, moves its own processes into
   its own or `/user`; root everything. Controllers are validated; device rules are capped
@@ -266,7 +275,8 @@ Settled while resolving the two reviews of phases 0–4; keep them as later phas
 - **Process room:** `PROC_MAX` counts live processes, pids lent and not taken (`spare`), and the
   machine's in-memory `reserved` (execs given a pid, still asking the authority). Pids are lent
   to a kernel by its id (`Pids.kernel`); each kernel holds the Web Lock `tw-kernel-<id>`, and one
-  that finds another's free reclaims its pids (`Gone { kernel }`). A new boot drops every lend.
+  that finds another's free requests reclamation (`Gone { kernel }`), subject to account
+  ownership. A new account boot drops only that account's lends.
 - **Exec race:** `exec_end` replaces an image only if the row still holds the token
   `exec_begin` saw, alive (else ESRCH, and the new token is revoked); the old token is revoked
   once no fork holds it. Revocations are cleared only on the authority's answer, and a failure to

@@ -5,16 +5,16 @@
 //! browser's cookies), and the authority forwards those a page's batch carries
 //! (`/internal/sys`), with the caller it found.
 //!
-//! Only execve asks the authority for a decision (`/internal/exec`): the image and the caller's
-//! credentials are the filesystem's. A pipeline's stages are one such request. What else a
+//! Execve asks the authority for the image and credentials (`/internal/exec`); tokenless
+//! account operations resolve the browser identity there once per batch (`/internal/identity`). A pipeline's stages are one such request. What else a
 //! process does, fork, exit, wait, signals, cgroups, stays here, told of in batches by the
 //! kernel that hosts it. A batch that ended processes revokes their tokens at the authority
 //! once, as it answers, so that what they opened closes as they end, as on Linux; one that
 //! cannot is tried again by the alarm.
 //!
-//! Who may make which call, and as whom it acts, is `kernel::registry`'s table: the client
-//! kernel by its own route, a page through the authority, a process by its token (uploaded
-//! wasm reaches here through terminal.sys, and is given nothing of the kernel's).
+//! Who may make which call, and as whom it acts, is `kernel::registry`'s table: the
+//! registry route and the page both act as the authenticated account; the routing header
+//! grants no privilege. A process acts by its token and snapshot (including terminal.sys).
 use crate::db::{Db, transact};
 use crate::procs::{Begun, Snapshot};
 use crate::{auth, procs};
@@ -67,7 +67,8 @@ impl DurableObject for Machine {
         }
         let path = req.path();
         let reply = match (req.method(), path.as_str()) {
-            // The client kernel's batch, as the Worker routed it here.
+            // A directly routed batch. Any page can set the header; account/token checks
+            // below are the authority for every operation.
             (Method::Post, "/api/sys") => {
                 if req
                     .headers()
@@ -88,7 +89,7 @@ impl DurableObject for Machine {
                     class: if batch.process.is_some() {
                         registry::Caller::Process
                     } else {
-                        registry::Caller::Kernel
+                        registry::Caller::Registry
                     },
                     ns,
                     cookie: req.headers().get("Cookie")?,
@@ -663,7 +664,7 @@ fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Err
             .ok_or(Error::from(Errno::EPERM))
     };
     match call {
-        Call::ProcInit { boot } => Ok(db.proc_init(ns, boot.as_deref(), now)),
+        Call::ProcInit { boot } => Ok(db.proc_init(ns, &account()?, boot.as_deref(), now)),
         Call::Fork {
             pid,
             child,
@@ -715,16 +716,22 @@ fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Err
         }
         Call::Pids { count, kernel } => Ok(json!(db.lend(
             ns,
+            &account()?,
+            asked.token,
             count,
             kernel.as_deref(),
             asked.reserved,
             now
         )?)),
-        Call::Seats => Ok(db.seats(ns)),
+        Call::Seats => Ok(db.seats(ns, &account()?)),
         Call::Gone { seat, kernel } => {
-            let reaped = seat.map(|seat| db.gone(ns, &seat, now)).unwrap_or_default();
+            let cred = account()?;
+            let reaped = seat
+                .map(|seat| db.gone(ns, &cred, &seat, now))
+                .transpose()?
+                .unwrap_or_default();
             if let Some(kernel) = kernel {
-                db.reclaim(&kernel);
+                db.reclaim(&kernel, &cred)?;
             }
             Ok(json!(reaped))
         }
@@ -751,12 +758,17 @@ fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Err
             db.kill(ns, &account()?, target, signal.unwrap_or(abi::SIGTERM), now)?;
             Ok(Value::Null)
         }
-        Call::Wait { pid: target, .. } => {
+        Call::Wait {
+            pid: target, token, ..
+        } => {
             let abi::Target::Pid(want) = abi::Target::of(&target) else {
                 return Err(Errno::ECHILD.into());
             };
-            let parent = caller.as_ref().map(|row| row.pid);
-            Ok(json!(db.wait(ns, parent, want)?))
+            let waited = match caller.as_ref() {
+                Some(row) => db.wait(ns, Some(row.pid), want),
+                None => db.reap(ns, asked.identity, want, token.as_deref()),
+            }?;
+            Ok(json!(waited))
         }
         Call::CgroupCreate { path, controllers } => db
             .cgroup_create(ns, &account()?, &path, controllers.as_deref())

@@ -3,7 +3,8 @@
 // their tokens. It runs as the browser's SharedWorker, one for every tab, or, where a browser
 // has none (Chrome for Android before 148), as a dedicated Worker of one tab, which speaks
 // through itself as its port. Its requests go to the browser's machine (a Durable Object of
-// its own, by a batch marked X-Registry), which asks the filesystem's authority only of execve.
+// its own, by a batch marked X-Registry). The machine verifies account identity with the
+// authority for tokenless batches; process-token calls use their stored snapshot.
 // Forks, exits and waits happen in the Rust kernel and are told to the machine in batches:
 // with its next request, or a moment after. Requests go one at a time, so that the machine
 // hears of a fork before the exit of what it made.
@@ -75,7 +76,7 @@ self.kernelSys = async body => {
 
 function boot() {
   starting ??= wasm_bindgen('/client_kernel_bg.wasm').then(async () => {
-    // A boot id reaps what the browser's last boot left; only the browser's one shared kernel,
+    // A boot id reaps what the current account's last boot left; only the browser's one shared kernel,
     // and only where tabs cannot say they are gone, may do so.
     const id = sharing && !locks ? self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}` : '';
     kernel = new wasm_bindgen.Kernel(id, locks ? kernelId : '');
@@ -138,7 +139,7 @@ async function execs(args, seat, host) {
   // The stages that were given processes give them back before the pipeline is asked again.
   for (const result of results) {
     if (!result.ok) continue;
-    try { await kernel.exit(result.ok.pid, 126, undefined, host); await kernel.wait(result.ok.pid); } catch { /* gone already */ }
+    try { await kernel.exit(result.ok.pid, 126, undefined, host); await kernel.wait(result.ok.pid, host); } catch { /* gone already */ }
   }
   await reapGone();
   return call();
@@ -170,7 +171,7 @@ async function dispatch(message, host, tab) {
     case 'reexec': return JSON.parse(await kernel.reexec(args.pid, args.path, JSON.stringify(args.argv ?? []), JSON.stringify(args.env ?? []), args.cwd ?? '/', tab ?? '', host));
     case 'fork': return JSON.parse(await kernel.fork(args.pid, host));
     case 'exit': return JSON.parse(await kernel.exit(args.pid, args.status ?? 0, args.signal ?? undefined, host));
-    case 'wait': return JSON.parse(await kernel.wait(args.pid));
+    case 'wait': return JSON.parse(await kernel.wait(args.pid, host));
     // wait4 of a process for its children (`pid`, or any).
     case 'waitchild': return JSON.parse(await kernel.waitchild(args.ppid, args.pid ?? undefined, host));
     // kill(2): as the page's account, or `from` a process this port runs, as that process.

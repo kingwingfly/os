@@ -66,8 +66,9 @@ struct State {
     /// are its, and go back once it is gone.
     id: String,
     processes: HashMap<u32, Local>,
-    /// Pids the machine lent, which forks take.
-    spare: Vec<u32>,
+    /// Pids lent for each process lineage. Never reuse another account's reservation after
+    /// login/logout; the server binds each pool to the process token that requested it.
+    spare: HashMap<String, Vec<u32>>,
     /// What happened here that the machine is still to hear: forks, exits, waits, in order.
     reports: Vec<Call>,
     /// How many reports were made, and how many the machine heard, since the kernel started.
@@ -94,7 +95,7 @@ impl Kernel {
                 boot: boot.to_string(),
                 id: id.to_string(),
                 processes: HashMap::new(),
-                spare: Vec::new(),
+                spare: HashMap::new(),
                 reports: Vec::new(),
                 queued: 0,
                 reported: 0,
@@ -199,6 +200,7 @@ impl Kernel {
         if let Some(local) = self.state.borrow_mut().processes.get_mut(&pid) {
             local.token = exec.token.clone();
         }
+        self.state.borrow_mut().retain_spare();
         to_json(&exec)
     }
 
@@ -206,25 +208,46 @@ impl Kernel {
     /// the machine hears of it after. The page clones the wasm state.
     pub async fn fork(&self, pid: u32, host: &str) -> Result<String, JsValue> {
         let token = self.token(pid, host)?;
-        if self.state.borrow().spare.is_empty() {
+        if self
+            .state
+            .borrow()
+            .spare
+            .get(&token)
+            .is_none_or(Vec::is_empty)
+        {
             let kernel = Some(self.state.borrow().id.clone()).filter(|id| !id.is_empty());
-            let lent = self
-                .one(
-                    Call::Pids {
-                        count: LEND,
-                        kernel,
-                    },
-                    false,
-                )
-                .await?;
+            self.flush().await?;
+            let lent = sys(Batch {
+                calls: vec![Call::Pids {
+                    count: LEND,
+                    kernel,
+                }],
+                umask: 0o022,
+                sudo: false,
+                pid: Some(pid),
+                process: Some(token.clone()),
+            })
+            .await
+            .map_err(fail)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| fail(Errno::EIO.into()))?
+            .into_result()
+            .map_err(fail)?;
             let lent: Vec<u32> = from_value(lent, "pids")?;
-            self.state.borrow_mut().spare.extend(lent);
+            self.state
+                .borrow_mut()
+                .spare
+                .entry(token.clone())
+                .or_default()
+                .extend(lent);
         }
         let mut state = self.state.borrow_mut();
         // A fork taken while the lending was asked may have left none.
         let child = state
             .spare
-            .pop()
+            .get_mut(&token)
+            .and_then(Vec::pop)
             .ok_or_else(|| fail(Errno::EAGAIN.into()))?;
         state.processes.insert(
             child,
@@ -283,26 +306,29 @@ impl Kernel {
             pid: Some(pid),
             token: Some(token),
         });
+        state.retain_spare();
         Ok(json!({ "ppid": ppid }).to_string())
     }
 
     /// waitpid: the zombie `pid`, now reaped, told to the machine with the next batch; EAGAIN
     /// while it runs. One this kernel does not host is the machine's to answer.
-    pub async fn wait(&self, pid: u32) -> Result<String, JsValue> {
+    pub async fn wait(&self, pid: u32, host: &str) -> Result<String, JsValue> {
         let ended = self
             .state
             .borrow()
             .processes
             .get(&pid)
+            .filter(|local| local.host == host)
             .map(|local| (local.ppid, local.ended));
         let value = match ended {
             Some((_, None)) => return Err(fail(Errno::EAGAIN.into())),
             Some((ppid, Some((status, signal)))) => {
                 let mut state = self.state.borrow_mut();
-                state.processes.remove(&pid);
+                let local = state.processes.remove(&pid).unwrap();
                 state.report(Call::Wait {
                     pid: pid.to_string(),
                     since: 0,
+                    token: Some(local.token),
                 });
                 let wait = match signal {
                     Some(signal) => abi::signal_status(signal),
@@ -311,14 +337,20 @@ impl Kernel {
                 json!({ "pid": pid, "ppid": ppid, "state": "zombie", "status": wait, "signal": signal })
             }
             None => {
-                self.one(
-                    Call::Wait {
-                        pid: pid.to_string(),
-                        since: 0,
-                    },
-                    false,
-                )
-                .await?
+                let value = self
+                    .one(
+                        Call::Wait {
+                            pid: pid.to_string(),
+                            since: 0,
+                            token: None,
+                        },
+                        false,
+                    )
+                    .await?;
+                // Another authorized account/port may have reaped an init child we kept.
+                // Do not return the cached status again to its original host afterwards.
+                self.state.borrow_mut().processes.remove(&pid);
+                value
             }
         };
         Ok(value.to_string())
@@ -356,10 +388,11 @@ impl Kernel {
             return Err(fail(Errno::EAGAIN.into()));
         };
         let mut state = self.state.borrow_mut();
-        state.processes.remove(&child);
+        let local = state.processes.remove(&child).unwrap();
         state.report(Call::Wait {
             pid: child.to_string(),
             since: 0,
+            token: Some(local.token),
         });
         let wait = match signal {
             Some(signal) => abi::signal_status(signal),
@@ -645,6 +678,15 @@ impl Kernel {
 }
 
 impl State {
+    /// The server releases unused lends when the last live holder of their token ends.
+    fn retain_spare(&mut self) {
+        self.spare.retain(|token, _| {
+            self.processes
+                .values()
+                .any(|local| local.ended.is_none() && &local.token == token)
+        });
+    }
+
     /// Something the machine is to hear.
     fn report(&mut self, call: Call) {
         self.reports.push(call);

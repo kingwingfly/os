@@ -570,7 +570,7 @@ pub fn call(
             }
             Ok(json!({ "pid": pid, "state": db.job(&pid).map(|job| job.state) }))
         }
-        Call::Wait { pid, since } => {
+        Call::Wait { pid, since, .. } => {
             let job = theirs(db, &pid)?;
             Ok(view(db, &job, since))
         }

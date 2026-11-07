@@ -856,9 +856,9 @@ pub enum Call {
         argv: Vec<String>,
         cwd: String,
     },
-    /// Begin a browser's process namespace, as init does: stale processes of a boot that is gone
-    /// are reaped, and the namespace's first process may start. The caller's browser, by its
-    /// guest cookie, is the namespace; `boot` tells one page load from the next.
+    /// Begin a browser's process namespace, as init does. A new `boot` reaps only the calling
+    /// account's old processes and lends. The browser's guest cookie names the namespace;
+    /// a caller-supplied boot id grants no authority over another account.
     ProcInit {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         boot: Option<String>,
@@ -918,16 +918,18 @@ pub enum Call {
     /// Lend the client kernel `kernel` (its own id, which it holds a Web Lock of while it runs)
     /// `count` pids of its namespace, which its forks take at once, without asking (`Fork`'s
     /// `child`). What a kernel was lent and did not take goes back once it is gone (`Gone`).
+    /// Reservations belong to the caller's account and, for a process batch, its token.
     Pids {
         count: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kernel: Option<String>,
     },
     /// What the client kernel checks is still there: the tabs (seats) whose processes still
-    /// run, and the kernels holding lent pids (`{seats, kernels}`).
+    /// run, and the kernels holding lent pids (`{seats, kernels}`), for the account or all for root.
     Seats,
     /// The tab `seat`, or the kernel `kernel`, is gone (its Web Lock is free): what the tab ran
     /// ended with it, as by SIGKILL, and init reaps it; the pids the kernel was lent go back.
+    /// Every affected row must belong to the caller's account, or the caller must be root.
     Gone {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seat: Option<String>,
@@ -985,6 +987,10 @@ pub enum Call {
         pid: String,
         #[serde(default)]
         since: u64,
+        /// A host may reap the zombie it ran by its token, even after the browser signs out.
+        /// This grants no live-process or filesystem authority to a zombie's token.
+        #[serde(default, rename = "proc", skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
     /// A request of the file or device `fd` reads or writes, about `arg`: FICLONE's the
     /// descriptor cloned from; a driver's, what its request takes.
