@@ -59,7 +59,8 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             (Method::Get | Method::Head, "/api/file") => files::read(req, &env).await,
             (Method::Put, "/api/pwrite") => files::pwrite(req, &env).await,
             // The client kernel's batches of process calls go to its browser's own machine
-            // (machine.rs), not the filesystem's one authority.
+            // (machine.rs), not the filesystem's one authority. The header is routing only:
+            // the machine authenticates the account or process and checks ownership.
             (Method::Post, "/api/sys") if req.headers().get("X-Registry")?.is_some() => {
                 let ns = db::Db::namespace(
                     auth::token_key(&req).as_deref(),

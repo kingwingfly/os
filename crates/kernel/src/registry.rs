@@ -9,9 +9,9 @@ use terminal_worker_core::permissions::Identity;
 /// Who a registry call comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Caller {
-    /// The browser's client kernel, by its own route (a batch marked `X-Registry`, with no
-    /// process's token): it hosts the processes, and tells of their forks, exits and waits.
-    Kernel,
+    /// A batch routed directly with `X-Registry`, without a process token. This is untrusted
+    /// user space too: the header selects a route, never an identity or privilege.
+    Registry,
     /// A page's batch, which the authority forwards with no process's token: user space, as
     /// the page's account.
     Page,
@@ -23,20 +23,17 @@ pub enum Caller {
 /// As whom a call the caller may make acts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Acting {
-    /// As the kernel itself: its bookkeeping (the namespace, pids lent, tabs and kernels gone,
-    /// the processes it names by their tokens), and init's waits.
-    Kernel,
     /// As an account: the page's, for the kernel's and the page's calls, or the process's
     /// snapshot, for a process's.
     Account,
-    /// As the calling process, on itself (its fork, its exit, getpid) or its children (wait).
+    /// By a process token: the calling process, or the process a host names with its token.
     Itself,
 }
 
 /// Whether `caller` may make the registry call `call`, and as whom it acts: EPERM for a call
 /// that is another caller's, ENOSYS for one that is not the registry's.
 pub fn permit(caller: Caller, call: &Call) -> Result<Acting, Error> {
-    use Caller::{Kernel, Page, Process};
+    use Caller::{Page, Process, Registry};
     if !call.is_registry() {
         return Err(Error::because(
             Errno::ENOSYS,
@@ -44,29 +41,37 @@ pub fn permit(caller: Caller, call: &Call) -> Result<Acting, Error> {
         ));
     }
     match call {
-        Call::ProcInit { .. } | Call::Pids { .. } | Call::Seats | Call::Gone { .. } => match caller
-        {
-            Kernel => Ok(Acting::Kernel),
+        Call::ProcInit { .. } | Call::Seats | Call::Gone { .. } => match caller {
+            Registry => Ok(Acting::Account),
             Page | Process => Err(Error::because(Errno::EPERM, "the client kernel's call")),
         },
+        // A kernel lends for a particular process, using its snapshot even after logout.
+        Call::Pids { .. } => match caller {
+            Registry | Process => Ok(Acting::Account),
+            Page => Err(Errno::EPERM.into()),
+        },
         Call::Execve { .. } => match caller {
-            Kernel | Page => Ok(Acting::Account),
+            Registry | Page => Ok(Acting::Account),
             Process => Err(Error::because(
                 Errno::EPERM,
                 "a process replaces itself through its kernel, which holds its token",
             )),
         },
-        Call::Fork { .. } | Call::Exit { .. } | Call::Wait { .. } => match caller {
-            Kernel => Ok(Acting::Kernel),
-            Process => Ok(Acting::Itself),
+        Call::Fork { .. } | Call::Exit { .. } => match caller {
+            Registry | Process => Ok(Acting::Itself),
             Page => Err(Error::because(
                 Errno::EPERM,
                 "the client kernel tells of forks, exits and waits",
             )),
         },
+        Call::Wait { token, .. } => match caller {
+            Registry if token.is_none() => Ok(Acting::Account),
+            Registry | Process => Ok(Acting::Itself),
+            Page => Err(Errno::EPERM.into()),
+        },
         Call::Getpid => match caller {
             Process => Ok(Acting::Itself),
-            Kernel | Page => Err(Error::because(Errno::EPERM, "a process's call")),
+            Registry | Page => Err(Error::because(Errno::EPERM, "a process's call")),
         },
         Call::ProcPoll { .. }
         | Call::Kill { .. }
@@ -97,6 +102,11 @@ pub fn may_create(cred: &Identity, parent: &str, owner: u32) -> bool {
 
 /// Whether `cred` may write the control files of, or remove, a cgroup owned by `owner`.
 pub fn may_write(cred: &Identity, owner: u32) -> bool {
+    cred.id == 0 || owner == cred.id
+}
+
+/// Process cleanup obeys the same ownership boundary as kill, regardless of its route.
+pub fn may_manage_process(cred: &Identity, owner: u32) -> bool {
     cred.id == 0 || owner == cred.id
 }
 
@@ -139,26 +149,43 @@ mod tests {
     }
 
     #[test]
-    fn the_kernels_calls_are_its_own() {
+    fn registry_bookkeeping_acts_as_the_account() {
         for call in [
             Call::ProcInit { boot: None },
-            Call::Pids {
-                count: 8,
-                kernel: None,
-            },
             Call::Seats,
             Call::Gone {
                 seat: Some("tab".into()),
                 kernel: None,
             },
         ] {
-            assert_eq!(permit(Caller::Kernel, &call), Ok(Acting::Kernel));
+            assert_eq!(permit(Caller::Registry, &call), Ok(Acting::Account));
             // Neither a page nor a process (uploaded wasm, through terminal.sys) may begin a
             // namespace, drain its pids, or end another tab's processes.
             for caller in [Caller::Page, Caller::Process] {
                 assert_eq!(permit(caller, &call).unwrap_err().errno, Errno::EPERM);
             }
         }
+    }
+
+    #[test]
+    fn lending_uses_an_account_or_process_snapshot() {
+        let call = Call::Pids {
+            count: 8,
+            kernel: Some("public-id".into()),
+        };
+        for caller in [Caller::Registry, Caller::Process] {
+            assert_eq!(permit(caller, &call), Ok(Acting::Account));
+        }
+        assert_eq!(permit(Caller::Page, &call).unwrap_err().errno, Errno::EPERM);
+        let guest = Identity {
+            id: 1_000_001,
+            group: 65534,
+            groups: BTreeSet::from([65534]),
+        };
+        assert!(may_manage_process(&guest, guest.id));
+        assert!(!may_manage_process(&guest, 0));
+        assert!(!may_manage_process(&guest, 1000));
+        assert!(may_manage_process(&Identity::root(), guest.id));
     }
 
     #[test]
@@ -172,15 +199,28 @@ mod tests {
         let wait = Call::Wait {
             pid: "3".into(),
             since: 0,
+            token: None,
         };
+        assert_eq!(permit(Caller::Registry, &exit), Ok(Acting::Itself));
+        assert_eq!(permit(Caller::Registry, &wait), Ok(Acting::Account));
+        assert_eq!(
+            permit(
+                Caller::Registry,
+                &Call::Wait {
+                    pid: "3".into(),
+                    since: 0,
+                    token: Some("host-token".into())
+                }
+            ),
+            Ok(Acting::Itself)
+        );
         for call in [exit, wait] {
-            assert_eq!(permit(Caller::Kernel, &call), Ok(Acting::Kernel));
             assert_eq!(permit(Caller::Process, &call), Ok(Acting::Itself));
             assert_eq!(permit(Caller::Page, &call).unwrap_err().errno, Errno::EPERM);
         }
         assert_eq!(permit(Caller::Process, &Call::Getpid), Ok(Acting::Itself));
         assert_eq!(
-            permit(Caller::Kernel, &Call::Getpid).unwrap_err().errno,
+            permit(Caller::Registry, &Call::Getpid).unwrap_err().errno,
             Errno::EPERM
         );
         let execve = Call::Execve {
@@ -202,7 +242,7 @@ mod tests {
 
     #[test]
     fn signals_polls_and_cgroups_act_as_the_account() {
-        for caller in [Caller::Kernel, Caller::Page, Caller::Process] {
+        for caller in [Caller::Registry, Caller::Page, Caller::Process] {
             assert_eq!(permit(caller, &kill()), Ok(Acting::Account));
             let set = Call::CgroupSet {
                 path: "/user/x".into(),
@@ -213,7 +253,7 @@ mod tests {
         }
         // Not the registry's: the filesystem's, or a job's.
         assert_eq!(
-            permit(Caller::Kernel, &Call::Getcreds).unwrap_err().errno,
+            permit(Caller::Registry, &Call::Getcreds).unwrap_err().errno,
             Errno::ENOSYS
         );
         let job = Call::Kill {

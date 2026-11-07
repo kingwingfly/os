@@ -384,9 +384,9 @@ processes.
 **Each browser is a machine of its own.** The process table is not the filesystem's: each
 browser's namespace has a Durable Object of its own (`Machine`, `crates/worker/src/machine.rs`,
 with the registry in `procs.rs`), so processes never wait on the one authority that keeps the
-files. Only `execve` asks the authority (`creds.rs`): it checks the path, the execute bit and
-the caller, records the credentials the process acts with by its token's hash, and answers how
-to read the image. A pipeline's stages are one `execve` request. The rest of a process's life
+files. Tokenless registry operations ask the authority for the current account once per
+batch. For `execve`, the authority (`creds.rs`) checks the path, execute bit and caller,
+records the process credentials by its token's hash, and answers how to read the image. A pipeline's stages are one `execve` request. The rest of a process's life
 happens in the client kernel, as in a Linux kernel:
 - **fork** takes a pid the machine lent ahead of time (`Pids`), at once; the child keeps its
   parent's credentials and token, and so its descriptors.
@@ -402,15 +402,22 @@ happens in the client kernel, as in a Linux kernel:
 - **Room:** a namespace has room for `PROC_MAX` processes: those running, the pids lent to its
   kernels and not taken yet, and those execs were given and have not started yet.
 
-**Who may make which call** is one table (`crates/kernel/src/registry.rs`, unit-tested), by
-where the call comes from: the client kernel (its own route), a page (a batch the authority
-forwards), or a process (any batch with a process's token, which is how uploaded wasm reaches
-the machine, through `terminal.sys`). Beginning a namespace (`ProcInit`), lending pids, and
-reaping what a gone tab or kernel left (`Seats`, `Gone`) are the client kernel's alone; a
-fork, an exit or a wait is the kernel's or the process's own; `kill`, `poll` and the `Cgroup*`
-calls act as an account, the process's snapshot or the page's. A call with no rule is refused.
-Cgroups are their maker's: an account makes cgroups under `/user`, writes and removes its own,
-and moves its own processes into them; the namespace's own cgroups are root's.
+**Who may make which call** is one table (`crates/kernel/src/registry.rs`, unit-tested).
+`X-Registry` selects the machine's route; it grants no kernel privileges. Tokenless requests
+act as the account verified by the authority, and process requests act as their token's
+snapshot. `ProcInit` boot ids are per account and reset only that account's old processes and
+lent pids. `Seats` lists the account's seats and lends (all for root); `Gone` applies the same
+owner/root checks as kill to every affected row before committing. A public Web Lock is only
+a liveness hint. After logout, a guest cannot clean up an earlier account's abandoned seat;
+that requires the owner or root. Explicit host exits and waits still work using process tokens.
+
+PID reservations belong to their account and, for process requests, their token. The client
+keeps separate pools per process lineage, so forks still work after login/logout without
+consuming another account's reservations. Unused token-bound reservations are released when
+no live process holds that token. Forks and exits prove the process token; host waits carry
+the zombie's token too, usable only for reaping. A tokenless registry wait needs the owning
+account or root and an init child. Cgroups are their maker's: an account makes them under
+`/user`, writes and removes its own, and moves its own processes into them.
 
 `kill`, `poll` and the `Cgroup*` calls are the machine's too; a page's batch that carries one is
 forwarded there by the authority, with the caller it found. In the client kernel, a process is
@@ -486,7 +493,7 @@ with binaryen in both. Details are in `AGENT.md` and issue #20.
 **Where the kernel runs, and what a gone tab leaves.**
 - **One kernel, either worker:** the client kernel is the browser's SharedWorker where it has one. Where it has none (Chrome for Android before 148), it is each tab's own dedicated Worker, on the same namespace, so commands run either way.
 - **Tab locks:** each tab holds the Web Lock `tw-tab-<tab>` while it lives, taken before it asks anything. Each process records its tab as its seat (`execve`'s `seat`).
-- **Reaping:** a process whose seat's lock is free was left by a tab that closed, crashed or reloaded while it ran. The kernel reaps it at once where it waits on that tab's lock, and at boot, or when the namespace is full (EAGAIN), by asking which locks are held.
+- **Reaping:** a process whose seat's lock is free was left by a tab that closed, crashed or reloaded while it ran. The kernel requests cleanup where it waits on that tab's lock, and at boot or EAGAIN, by checking held locks. The machine permits cleanup only for the current account's processes or root.
 - **No reaping by boot:** a kernel reaps by boot id only where tabs have no Web Locks, so a tab's own kernel never reaps another tab's processes.
 - **Kernel locks:** each kernel holds `tw-kernel-<id>` while it runs, and its lent pids are its own; a kernel that finds another's lock free gives what that one was lent back to the namespace.
 - **`/proc`:** it shows the caller's namespace, as a Linux PID namespace does: every process of it for root, an account's own otherwise, and init, root's, for everyone.

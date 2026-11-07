@@ -30,7 +30,7 @@ pub const ROOT_CGROUPS: [&str; 4] = ["/init", "/user", "/system", "/cluster"];
 type Result<T> = std::result::Result<T, Error>;
 
 /// The registry's tables, in its namespace's own Durable Object.
-const SCHEMA: [&str; 6] = [
+const SCHEMA: [&str; 7] = [
     // The namespace, one small machine: the browser it is (its guest, or session, key), the
     // boot it is of (a reload resets stale processes), and the next pid.
     "CREATE TABLE IF NOT EXISTS namespaces(id TEXT PRIMARY KEY, guest TEXT NOT NULL, boot TEXT, next_pid INTEGER NOT NULL, created INTEGER NOT NULL, last_seen INTEGER NOT NULL)",
@@ -43,7 +43,9 @@ const SCHEMA: [&str; 6] = [
     "CREATE TABLE IF NOT EXISTS cgroups(ns TEXT NOT NULL, path TEXT NOT NULL, parent TEXT NOT NULL, controllers TEXT NOT NULL, cpu_max TEXT, cpu_weight INTEGER NOT NULL DEFAULT 100, memory_max TEXT, pids_max INTEGER, io_max TEXT, freeze INTEGER NOT NULL DEFAULT 0, devices TEXT NOT NULL DEFAULT '', owner INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(ns, path))",
     // Pids lent to a client kernel (its id), which its forks take at once and tell of after;
     // what a kernel that is gone did not take goes back.
-    "CREATE TABLE IF NOT EXISTS spare(pid INTEGER PRIMARY KEY, kernel TEXT)",
+    "CREATE TABLE IF NOT EXISTS spare(pid INTEGER PRIMARY KEY, kernel TEXT, owner INTEGER NOT NULL DEFAULT 0, token TEXT)",
+    // Boot ids describe only an account's processes; another account cannot reset them.
+    "CREATE TABLE IF NOT EXISTS account_boots(ns TEXT NOT NULL, owner INTEGER NOT NULL, boot TEXT NOT NULL, PRIMARY KEY(ns, owner))",
     // Tokens no process holds any more, which the authority is still to revoke.
     "CREATE TABLE IF NOT EXISTS revoked(token TEXT PRIMARY KEY)",
     "CREATE INDEX IF NOT EXISTS processes_token ON processes(token)",
@@ -64,6 +66,15 @@ pub fn create(sql: &SqlStorage) -> worker::Result<()> {
             "ALTER TABLE cgroups ADD COLUMN owner INTEGER NOT NULL DEFAULT 0",
             None,
         )?;
+    }
+    if sql.exec("SELECT owner FROM spare LIMIT 0", None).is_err() {
+        sql.exec(
+            "ALTER TABLE spare ADD COLUMN owner INTEGER NOT NULL DEFAULT 0",
+            None,
+        )?;
+    }
+    if sql.exec("SELECT token FROM spare LIMIT 0", None).is_err() {
+        sql.exec("ALTER TABLE spare ADD COLUMN token TEXT", None)?;
     }
     Ok(())
 }
@@ -202,34 +213,31 @@ impl Db {
             .next()
             .map(|row| row.id)
     }
-    /// Begin (or continue) a namespace, as init does: a new boot reaps what the old one left
-    /// running, the init process exists, and the root cgroups are there. Init is root's, as
-    /// Linux's is.
-    pub fn proc_init(&mut self, ns: &str, boot: Option<&str>, now: u64) -> Value {
-        let existing = self.namespace_boot(ns);
+    /// Begin (or continue) a namespace. A new boot reaps only this account's old processes
+    /// and lends; a caller-supplied boot id proves nothing about other accounts' lifetimes.
+    pub fn proc_init(&mut self, ns: &str, cred: &Identity, boot: Option<&str>, now: u64) -> Value {
+        let existing = self.account_boot(ns, cred.id);
         if let Some(boot) = boot
             && existing.as_deref() != Some(boot)
         {
-            // Nothing of the old boot's processes can be waited for or signalled any more: its
-            // pages are gone, and its kernel with what it was lent. The new boot starts with
-            // init alone.
             for row in self.processes(ns) {
-                if row.pid != INIT {
+                if row.pid != INIT && row.uid == cred.id {
+                    self.orphan(ns, row.pid);
                     self.remove(&row);
                 }
             }
-            self.run("DELETE FROM spare", vec![]);
+            self.run("DELETE FROM spare WHERE owner = ?", vec![int(cred.id)]);
+            self.run(
+                "INSERT INTO account_boots(ns, owner, boot) VALUES(?, ?, ?) ON CONFLICT(ns, owner) DO UPDATE SET boot = excluded.boot",
+                vec![text(ns), int(cred.id), text(boot)],
+            );
         }
-        self.run(
-            "INSERT INTO namespaces(id, guest, boot, next_pid, created, last_seen) VALUES(?, ?, ?, 2, ?, ?) ON CONFLICT(id) DO UPDATE SET boot = excluded.boot, last_seen = excluded.last_seen",
-            vec![text(ns), text(ns), boot.map(text).unwrap_or(SqlStorageValue::Null), int(now), int(now)],
-        );
-        self.ensure_init(ns, now);
+        self.ensure_namespace(ns, now);
         json!({
             "namespace": ns,
             "pid": INIT,
-            "boot": self.namespace_boot(ns),
-            "pids": self.processes(ns).iter().map(|row| row.pid).collect::<Vec<_>>(),
+            "boot": self.account_boot(ns, cred.id),
+            "pids": self.poll(ns, &[], cred).iter().map(|row| row.pid).collect::<Vec<_>>(),
         })
     }
     /// A namespace that is there, without a boot's reap: its row, init, and root cgroups.
@@ -271,15 +279,18 @@ impl Db {
             self.ensure_cgroup(ns, path, 0);
         }
     }
-    fn namespace_boot(&self, ns: &str) -> Option<String> {
+    fn account_boot(&self, ns: &str, owner: u32) -> Option<String> {
         #[derive(Deserialize)]
         struct Boot {
             boot: Option<String>,
         }
-        self.rows::<Boot>("SELECT boot FROM namespaces WHERE id = ?", vec![text(ns)])
-            .into_iter()
-            .next()
-            .and_then(|row| row.boot)
+        self.rows::<Boot>(
+            "SELECT boot FROM account_boots WHERE ns = ? AND owner = ?",
+            vec![text(ns), int(owner)],
+        )
+        .into_iter()
+        .next()
+        .and_then(|row| row.boot)
     }
     /// Every process of `ns`, by pid.
     pub fn processes(&self, ns: &str) -> Vec<Row> {
@@ -465,6 +476,7 @@ impl Db {
     /// Revoke the token `hash` at the authority, unless a process still holds it.
     pub fn revoke_unheld(&mut self, ns: &str, hash: &str) {
         if !hash.is_empty() && !self.token_held(ns, hash) {
+            self.run("DELETE FROM spare WHERE token = ?", vec![text(hash)]);
             self.run(
                 "INSERT OR IGNORE INTO revoked(token) VALUES(?)",
                 vec![text(hash)],
@@ -538,9 +550,12 @@ impl Db {
     /// Lend the client kernel `kernel` up to `count` pids, as many as the namespace has room
     /// for (`reserved` execs are to start), which its forks take without asking. None when it
     /// has no room: EAGAIN, as fork(2) says.
+    #[allow(clippy::too_many_arguments)]
     pub fn lend(
         &mut self,
         ns: &str,
+        cred: &Identity,
+        token: Option<&str>,
         count: u32,
         kernel: Option<&str>,
         reserved: usize,
@@ -556,20 +571,36 @@ impl Db {
         let kernel = kernel.map_or(SqlStorageValue::Null, text);
         for pid in &pids {
             self.run(
-                "INSERT INTO spare(pid, kernel) VALUES(?, ?)",
-                vec![int(*pid), kernel.clone()],
+                "INSERT INTO spare(pid, kernel, owner, token) VALUES(?, ?, ?, ?)",
+                vec![
+                    int(*pid),
+                    kernel.clone(),
+                    int(cred.id),
+                    token
+                        .map(|token| text(&crate::auth::token_hash(token)))
+                        .unwrap_or(SqlStorageValue::Null),
+                ],
             );
         }
         Ok(pids)
     }
     /// The kernel `kernel` is gone (its Web Lock is free): what it was lent and did not take
     /// goes back. A kernel that never said who it was is "".
-    pub fn reclaim(&mut self, kernel: &str) -> usize {
-        self.rows::<IgnoredAny>(
-            "DELETE FROM spare WHERE COALESCE(kernel, '') = ? RETURNING pid",
-            vec![text(kernel)],
-        )
-        .len()
+    pub fn reclaim(&mut self, kernel: &str, cred: &Identity) -> Result<usize> {
+        if cred.id != 0
+            && self.any(
+                "SELECT pid FROM spare WHERE COALESCE(kernel, '') = ? AND owner != ? LIMIT 1",
+                vec![text(kernel), int(cred.id)],
+            )
+        {
+            return Err(Errno::EPERM.into());
+        }
+        Ok(self
+            .rows::<IgnoredAny>(
+                "DELETE FROM spare WHERE COALESCE(kernel, '') = ? RETURNING pid",
+                vec![text(kernel)],
+            )
+            .len())
     }
     /// fork(2)'s registry half: a child of `parent`, with its credentials, cgroup, image,
     /// environment and token copied (a child acts as its parent was executed, and shares its
@@ -577,7 +608,10 @@ impl Db {
     pub fn fork(&mut self, parent: &Row, child: Option<u32>, now: u64) -> Result<Forked> {
         let pid = match child {
             Some(child) => {
-                if !self.spare(child) {
+                if !self.any(
+                    "SELECT pid FROM spare WHERE pid = ? AND owner = ? AND (token IS NULL OR token = ?)",
+                    vec![int(child), int(parent.uid), text(&self.token_of(&parent.ns, parent.pid).unwrap_or_default())],
+                ) {
                     return Err(Error::because(
                         Errno::EINVAL,
                         format!("{child} is no pid lent to this kernel"),
@@ -628,6 +662,7 @@ impl Db {
         self.orphan(&row.ns, row.pid);
         // A zombie's token is dead with it, though its row keeps the hash until it is reaped.
         if !self.token_live(&row.ns, &token) {
+            self.run("DELETE FROM spare WHERE token = ?", vec![text(&token)]);
             self.run(
                 "INSERT OR IGNORE INTO revoked(token) VALUES(?)",
                 vec![text(&token)],
@@ -681,6 +716,31 @@ impl Db {
         self.remove(&row);
         Ok(row.proc())
     }
+    /// A host's wait: prove possession of this zombie's token, or act as its account/root.
+    /// Without a token the caller waits only for init's children, never another parent's.
+    pub fn reap(
+        &mut self,
+        ns: &str,
+        cred: Option<&Identity>,
+        pid: u32,
+        token: Option<&str>,
+    ) -> Result<Proc> {
+        let row = self.process(ns, pid).ok_or(Errno::ECHILD)?;
+        if let Some(token) = token {
+            if self.token_of(ns, pid).as_deref() != Some(crate::auth::token_hash(token).as_str()) {
+                return Err(Errno::EPERM.into());
+            }
+        } else {
+            let cred = cred.ok_or(Errno::EPERM)?;
+            if !registry::may_manage_process(cred, row.uid) {
+                return Err(Errno::EPERM.into());
+            }
+            if row.ppid != INIT {
+                return Err(Errno::ECHILD.into());
+            }
+        }
+        self.wait(ns, None, pid)
+    }
     /// kill(2) in the namespace, by each signal's default action (a process here installs no
     /// handlers): SIGHUP, SIGINT, SIGQUIT, SIGKILL, SIGPIPE and SIGTERM end the process;
     /// SIGSTOP and SIGTSTP stop it; SIGCONT resumes it. A signal from another account needs root.
@@ -727,11 +787,19 @@ impl Db {
     }
     /// The tab `seat` is gone: what it ran ended with it, as by SIGKILL, and is reaped (it was
     /// init's, or is now). What it forked that another tab runs goes on, init's.
-    pub fn gone(&mut self, ns: &str, seat: &str, now: u64) -> Vec<u32> {
+    pub fn gone(&mut self, ns: &str, cred: &Identity, seat: &str, now: u64) -> Result<Vec<u32>> {
         let rows = self.rows::<Row>(
             &format!("SELECT {COLUMNS} FROM processes WHERE ns = ? AND seat = ? AND pid != 1"),
             vec![text(ns), text(seat)],
         );
+        // Check the entire seat before changing anything: a tab may hold multiple accounts'
+        // processes after login/logout, and its public lock name confers no authority.
+        if rows
+            .iter()
+            .any(|row| !registry::may_manage_process(cred, row.uid))
+        {
+            return Err(Errno::EPERM.into());
+        }
         let mut reaped = Vec::new();
         for row in &rows {
             if !row.zombie() {
@@ -747,10 +815,10 @@ impl Db {
                 reaped.push(row.pid);
             }
         }
-        reaped
+        Ok(reaped)
     }
     /// The tabs whose processes still run, and the kernels that hold pids they were lent.
-    pub fn seats(&self, ns: &str) -> Value {
+    pub fn seats(&self, ns: &str, cred: &Identity) -> Value {
         #[derive(Deserialize)]
         struct Seat {
             seat: String,
@@ -761,16 +829,16 @@ impl Db {
         }
         let seats: Vec<String> = self
             .rows::<Seat>(
-                "SELECT DISTINCT seat FROM processes WHERE ns = ? AND seat IS NOT NULL AND state != 'zombie' ORDER BY seat",
-                vec![text(ns)],
+                "SELECT DISTINCT seat FROM processes WHERE ns = ? AND seat IS NOT NULL AND state != 'zombie' AND (uid = ? OR ? = 0) ORDER BY seat",
+                vec![text(ns), int(cred.id), int(cred.id)],
             )
             .into_iter()
             .map(|row| row.seat)
             .collect();
         let kernels: Vec<String> = self
             .rows::<Kernel>(
-                "SELECT DISTINCT COALESCE(kernel, '') AS kernel FROM spare ORDER BY kernel",
-                vec![],
+                "SELECT DISTINCT COALESCE(kernel, '') AS kernel FROM spare WHERE owner = ? OR ? = 0 ORDER BY kernel",
+                vec![int(cred.id), int(cred.id)],
             )
             .into_iter()
             .map(|row| row.kernel)

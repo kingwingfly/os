@@ -587,6 +587,7 @@ impl Shell {
             let view: Value = userland::sys::call(
                 &sys,
                 Call::Wait {
+                    token: None,
                     pid: id.into(),
                     since,
                 },
