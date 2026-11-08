@@ -421,6 +421,18 @@ test.describe('fork in the terminal', () => {
     expect(await error.text()).toBe('no-such-program: No such file or directory\n');
   });
 
+  test('loader rejection after exec writes through the inherited stderr descriptor', async ({ page, request }) => {
+    test.skip(!process.env.WASIX_DASH, 'set WASIX_DASH to the approved WASIX dash');
+    await uploads(request, { dash: await readFile(process.env.WASIX_DASH), 'invalid.wasm': Buffer.from('not a wasm executable') });
+    await page.goto('/');
+    await command(page, `cd ${base}`);
+    await command(page, `./dash -c 'cd ${base}; ./invalid.wasm 2> loader-error.txt; /usr/bin/printf "status %s\\n" "$?"'`);
+    await expect(last(page)).toHaveText('status 126');
+    const error = await request.get('/api/file?path=' + encodeURIComponent(base + '/loader-error.txt'));
+    expect(error.ok()).toBe(true);
+    expect(await error.text()).toContain('Exec format error');
+  });
+
   test('a forked child is of its parent\'s job: Ctrl+C ends both; an orphan is init\'s, and reaped as it ends', async ({ page, request }) => {
     await uploads(request, { 'fork-sleep': FORK_SLEEP, 'fork-orphan': FORK_ORPHAN, 'fork-read': FORK_READ });
     await page.goto('/');

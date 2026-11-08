@@ -67,6 +67,9 @@ pub fn call(
         Call::Fchmod { fd, mode } => {
             let found = db.fd(sid, fd.number()).ok_or(Errno::EBADF)?;
             owned(&found, caller)?;
+            if found.flags & abi::O_PATH != 0 {
+                return Err(Errno::EBADF.into());
+            }
             // The image is read-only, as its names are (sys.rs).
             if crate::usr::is(&found.path) {
                 return Err(Errno::EROFS.into());
@@ -81,6 +84,12 @@ pub fn call(
         }
         Call::Ioctl { fd, request, arg } => {
             yours(db, sid, fd.number(), caller)?;
+            if db
+                .fd(sid, fd.number())
+                .is_some_and(|f| f.flags & abi::O_PATH != 0)
+            {
+                return Err(Errno::EBADF.into());
+            }
             let device = crate::dev::request(db, sid, fd.number())?;
             ioctl(db, sid, process, caller, fd.number(), device, request, arg)
         }
@@ -675,7 +684,7 @@ pub fn pread(
             let sid = sid.ok_or(Errno::EBADF)?;
             let found = db.fd(sid, fd).ok_or(Errno::EBADF)?;
             owned(&found, caller)?;
-            if found.flags & O_ACCMODE == abi::O_WRONLY {
+            if found.flags & O_ACCMODE == abi::O_WRONLY || found.flags & abi::O_PATH != 0 {
                 return Err(Errno::EBADF.into());
             }
             if found.device.is_some() {

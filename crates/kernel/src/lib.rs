@@ -93,7 +93,6 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
         | Call::InotifyAddWatch { .. }
         | Call::InotifyRmWatch { .. }
         | Call::Ioctl { .. }
-        | Call::Spawn { .. }
         | Call::Kill { .. }
         | Call::Wait { .. }
         | Call::ProcInit { .. }
@@ -355,6 +354,18 @@ pub enum Opening {
 /// umask, as mknod does.
 pub fn open(fs: &impl Fs, process: &Process, path: &str, flags: u32, mode: u16) -> Result<Opening> {
     let cred = &process.cred;
+    if flags & abi::O_PATH != 0 {
+        let name = namei(fs, cred, path, true)?;
+        let node = name.node.ok_or(Errno::ENOENT)?;
+        if !node.directory {
+            return Err(Errno::ENOTDIR.into());
+        }
+        // No read grant: the handle only anchors later, separately authorized operations.
+        return Ok(Opening::Existing {
+            path: name.path,
+            node,
+        });
+    }
     let write = flags & O_ACCMODE != O_RDONLY;
     let exclusive = flags & O_CREAT != 0 && flags & O_EXCL != 0;
     let name = namei(fs, cred, path, !exclusive)?;

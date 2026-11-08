@@ -327,7 +327,6 @@ impl Kernel {
                 let local = state.processes.remove(&pid).unwrap();
                 state.report(Call::Wait {
                     pid: pid.to_string(),
-                    since: 0,
                     token: Some(local.token),
                 });
                 let wait = match signal {
@@ -341,7 +340,6 @@ impl Kernel {
                     .one(
                         Call::Wait {
                             pid: pid.to_string(),
-                            since: 0,
                             token: None,
                         },
                         false,
@@ -391,7 +389,6 @@ impl Kernel {
         let local = state.processes.remove(&child).unwrap();
         state.report(Call::Wait {
             pid: child.to_string(),
-            since: 0,
             token: Some(local.token),
         });
         let wait = match signal {

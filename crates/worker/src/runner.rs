@@ -157,7 +157,12 @@ impl DurableObject for JobRunner {
                 storage.put("failures", 0u32).await?;
                 storage.set_alarm(1).await?;
             }
-            Ok(Step::Wait) => storage.put("failures", 0u32).await?,
+            Ok(Step::Wait) => {
+                storage.put("failures", 0u32).await?;
+                // Revocation/last-close must also reach an idle executor with no page left
+                // to wake it. This lease check releases its container after cancellation.
+                storage.set_alarm(5000).await?;
+            }
             Ok(Step::Done) => self.close().await,
             Err(e) => {
                 let failures = storage.get::<u32>("failures").await?.unwrap_or(0) + 1;

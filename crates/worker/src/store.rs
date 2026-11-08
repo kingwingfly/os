@@ -1,5 +1,5 @@
 use crate::db::{self, transact};
-use crate::{api, auth, dev, jobs};
+use crate::{api, auth, dev};
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use terminal_worker_core::devices::PRESENT;
@@ -99,8 +99,9 @@ impl DurableObject for TerminalAuthority {
                             "Cancelled after waiting a week"
                         };
                         db.add_lines(&id, &[(true, why.into())]);
-                        jobs::finish(db, &id, "cancelled");
+                        crate::executor::finish(db, &id, "cancelled");
                     }
+                    ("device_task", _, _) => db.expire_device_task(&id),
                     // A session not heard from for long watches nothing any more, and once it
                     // keeps no descriptor, its numbers start again.
                     ("watches", _, _) => {

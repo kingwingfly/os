@@ -5,6 +5,7 @@ mod compiler;
 mod creds;
 mod db;
 mod dev;
+mod executor;
 mod fds;
 mod files;
 mod guests;

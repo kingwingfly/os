@@ -89,8 +89,26 @@ pub const PROGRAMS: &[&str] = &[
 
 /// Those that may change files, after which the shell looks at its directory again.
 const WRITING: &[&str] = &[
-    "cp", "mv", "rm", "rmdir", "mkdir", "touch", "ln", "link", "unlink", "truncate", "shred",
-    "split", "csplit", "tee", "dd", "mktemp",
+    "cp",
+    "mv",
+    "rm",
+    "rmdir",
+    "mkdir",
+    "touch",
+    "ln",
+    "link",
+    "unlink",
+    "truncate",
+    "shred",
+    "split",
+    "csplit",
+    "tee",
+    "dd",
+    "mktemp",
+    "zip",
+    "unzip",
+    "tar",
+    "faststart",
 ];
 
 /// The utility of coreutils named `name`.
@@ -105,9 +123,37 @@ pub fn writes(name: &str) -> bool {
 
 /// Installed OS-native programs, compiled from shared user-space code.
 pub const UTILITIES: &[&str] = &[
-    "stat", "df", "chmod", "chown", "chgrp", "getfacl", "setfacl", "getfattr", "setfattr", "ps",
-    "kill", "whoami", "id", "groups", "users", "useradd", "usermod", "userdel", "groupadd",
-    "groupmod", "groupdel", "grep", "cp", "mv", "rm", "fd", "xargs",
+    "stat",
+    "df",
+    "chmod",
+    "chown",
+    "chgrp",
+    "getfacl",
+    "setfacl",
+    "getfattr",
+    "setfattr",
+    "ps",
+    "kill",
+    "whoami",
+    "id",
+    "groups",
+    "users",
+    "useradd",
+    "usermod",
+    "userdel",
+    "groupadd",
+    "groupmod",
+    "groupdel",
+    "grep",
+    "cp",
+    "mv",
+    "rm",
+    "fd",
+    "xargs",
+    "zip",
+    "unzip",
+    "tar",
+    "faststart",
 ];
 
 /// The installed multicall image that owns a program; UI actions have no executable image.

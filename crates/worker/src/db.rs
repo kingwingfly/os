@@ -34,7 +34,9 @@ const ROLLBACK: &str = "rollback";
 /// The version of the tables below, which local state made by an older one does not have.
 pub const SCHEMA_VERSION: &str = "7";
 
-const SCHEMA: [&str; 34] = [
+const SCHEMA: [&str; 36] = [
+    "CREATE TABLE IF NOT EXISTS execution_owners(lineage TEXT PRIMARY KEY, uid INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS device_tasks(id TEXT PRIMARY KEY, lineage TEXT NOT NULL, request TEXT NOT NULL, device TEXT NOT NULL, digest TEXT NOT NULL, sid TEXT NOT NULL, fd INTEGER NOT NULL, owner INTEGER NOT NULL, detached INTEGER NOT NULL DEFAULT 0, grants TEXT NOT NULL, UNIQUE(lineage, request))",
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS observations(name TEXT PRIMARY KEY, value INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
@@ -1233,6 +1235,29 @@ impl Db {
             );
         }
     }
+    pub fn output_fits(&self, id: &str, lines: &[(bool, String)]) -> bool {
+        #[derive(Deserialize)]
+        struct Size {
+            bytes: usize,
+        }
+        let bytes = self.rows::<Size>("SELECT COALESCE(SUM(LENGTH(CAST(text AS BLOB))),0) AS bytes FROM job_lines WHERE job = ?", vec![text(id)])
+            .pop().map_or(0, |s| s.bytes);
+        lines
+            .iter()
+            .all(|(_, line)| line.len() <= abi::accelerator::MAX_REQUEST_BYTES / 8)
+            && bytes.saturating_add(lines.iter().map(|(_, line)| line.len()).sum())
+                <= abi::accelerator::MAX_OUTPUT_BYTES
+    }
+    pub fn expire_device_task(&mut self, id: &str) {
+        crate::executor::finish(self, id, "cancelled");
+        self.run("DELETE FROM job_lines WHERE job = ?", vec![text(id)]);
+        self.run("DELETE FROM jobs WHERE id = ?", vec![text(id)]);
+        // Retain a small retry tombstone: expiry never permits an old write to run again.
+        self.run(
+            "UPDATE device_tasks SET grants = '[]', detached = 1 WHERE id = ?",
+            vec![text(id)],
+        );
+    }
     /// A job's lines after `since`, as (seq, err, text).
     pub fn lines(&self, id: &str, since: u64, limit: u32) -> Vec<(u64, bool, String)> {
         #[derive(Deserialize)]
@@ -1993,5 +2018,80 @@ impl Store for Db {
             .unwrap_or(1000);
         self.set_meta(key, &(next + 1).to_string());
         next
+    }
+}
+
+/// Control ownership is separate from the immutable execution credential snapshot.
+#[derive(Clone, Debug, Deserialize)]
+pub struct DeviceTask {
+    pub id: String,
+    pub lineage: String,
+    pub request: String,
+    pub device: String,
+    pub digest: String,
+    pub sid: String,
+    pub fd: u32,
+    pub owner: u32,
+    pub detached: u8,
+    pub grants: String,
+}
+impl Db {
+    pub fn set_controller(&mut self, lineage: &str, uid: u32) {
+        self.run(
+            "INSERT OR IGNORE INTO execution_owners(lineage,uid) VALUES(?,?)",
+            vec![text(lineage), int(uid)],
+        );
+    }
+    pub fn controller(&self, lineage: &str) -> Option<u32> {
+        #[derive(Deserialize)]
+        struct Owner {
+            uid: u32,
+        }
+        self.rows::<Owner>(
+            "SELECT uid FROM execution_owners WHERE lineage = ?",
+            vec![text(lineage)],
+        )
+        .pop()
+        .map(|row| row.uid)
+    }
+    pub fn forget_controller(&mut self, lineage: &str) {
+        self.run(
+            "DELETE FROM execution_owners WHERE lineage = ?",
+            vec![text(lineage)],
+        );
+    }
+    pub fn device_task(&self, id: &str) -> Option<DeviceTask> {
+        self.rows("SELECT * FROM device_tasks WHERE id = ?", vec![text(id)])
+            .pop()
+    }
+    pub fn device_retry(&self, lineage: &str, request: &str) -> Option<DeviceTask> {
+        self.rows(
+            "SELECT * FROM device_tasks WHERE lineage = ? AND request = ?",
+            vec![text(lineage), text(request)],
+        )
+        .pop()
+    }
+    pub fn bind_device_task(&mut self, task: &DeviceTask) {
+        self.run("INSERT INTO device_tasks(id,lineage,request,device,digest,sid,fd,owner,detached,grants) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            vec![text(&task.id),text(&task.lineage),text(&task.request),text(&task.device),text(&task.digest),text(&task.sid),int(task.fd),int(task.owner),int(task.detached),text(&task.grants)]);
+    }
+    pub fn attach_device_task(&mut self, id: &str, sid: &str, fd: u32, detached: bool) {
+        self.run(
+            "UPDATE device_tasks SET sid = ?, fd = ?, detached = ? WHERE id = ?",
+            vec![text(sid), int(fd), int(detached as u8), text(id)],
+        );
+    }
+    pub fn tasks_on(&self, sid: &str, fd: u32) -> Vec<DeviceTask> {
+        self.rows(
+            "SELECT * FROM device_tasks WHERE sid = ? AND fd = ? AND detached = 0",
+            vec![text(sid), int(fd)],
+        )
+    }
+    pub fn active_tasks(&self, owner: u32) -> usize {
+        #[derive(Deserialize)]
+        struct Count {
+            n: usize,
+        }
+        self.rows::<Count>("SELECT COUNT(*) AS n FROM device_tasks JOIN jobs USING(id) WHERE device_tasks.owner = ? AND jobs.state NOT IN ('done','failed','cancelled')", vec![int(owner)]).pop().map_or(0, |n| n.n)
     }
 }

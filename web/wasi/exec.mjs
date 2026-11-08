@@ -275,7 +275,12 @@ export async function exec(stages, options = {}) {
     // waiting calls are answered in.
     const control = isolated ? new Int32Array(new SharedArrayBuffer(4)) : null;
     const channel = isolated ? new SharedArrayBuffer(8 + CHANNEL) : null;
-    const process = { pid, token, stopped: false, ended: false, forked, exited, image: { module, memory, startSection } };
+    const process = { pid, token, files, stopped: false, ended: false, forked, exited, image: { module, memory, startSection } };
+    // An external kill can revoke this image before the host hears its signal. The
+    // descriptor table belongs to its whole fork lineage: a surviving holder may close
+    // its last references. If none survives, authority revocation closes the lineage.
+    const cleanupToken = () => [...hosted.values()].find(peer => peer !== process &&
+      peer.files === files && !peer.ended && !peer.ending)?.token ?? process.token;
     // It ended, by its exit status `code` or the signal `signal`: by its own exit, which closed
     // what it had open, or outright (a Worker that could not heed a signal, or failed), whose
     // open files its host closes for it. Its parent waits for it, or, init's, it is reaped at
@@ -291,13 +296,14 @@ export async function exec(stages, options = {}) {
       // What it held of pipes goes as it goes, its locks too.
       release(pid);
       for (const fd of [1, 2]) { const text = decoders[fd].decode(); if (text) void publish(fd, text); }
-      const closing = outright ? closeHeld(files, pid, process.token, { umask, sudo }) : Promise.resolve();
+      const closing = outright ? closeHeld(files, pid, cleanupToken(), { umask, sudo }) : Promise.resolve();
       void closing.then(() => reap(pid, { status: code, signal }, forked));
       void Promise.allSettled([closing, ...displaying]).then(() => settle(code));
     };
     // A signal that ends it: heeded at its next call, as it exits; outright if it cannot.
     const kill = signal => {
       if (status != null || killing != null) return;
+      process.ending = true;
       if (!control) return end(killedBy(signal), true);
       Atomics.store(control, 0, KILLED | signal);
       Atomics.notify(control, 0);
@@ -308,6 +314,7 @@ export async function exec(stages, options = {}) {
       let reply;
       try {
         if (type === 'join') reply = await join(pid, args.pid, args.nohang);
+        else if (type === 'cleanup') reply = { token: cleanupToken() };
         else if (type === 'getpid') reply = await kernelCall('getpid', { pid: args.pid });
         // kill(2) from a process is the process's, by its own credentials.
         else if (type === 'kill') reply = (await kernelCall('kill', { pid: args.pid, signal: args.signal, from: pid })) ?? {};
@@ -330,9 +337,11 @@ export async function exec(stages, options = {}) {
       try {
         loaded = await load(image);
       } catch (error) {
-        write(2, `${refused(args[0] ?? path, error).message}\n`);
-        end({ code: 126 }, true);
-        return null;
+        // The replacement already owns the credential. Its Worker still owns stdio and
+        // must emit the loader diagnostic through fd 2 before closing/reaping normally.
+        worker.postMessage({ image: { error: refused(args[0] ?? path, error).message,
+          token: image.token, argv: args, env } });
+        return {};
       }
       process.image = loaded;
       worker.postMessage({ image: { module: loaded.module, memory: loaded.memory, startSection: loaded.startSection, token: image.token, argv: args, env } });

@@ -200,7 +200,6 @@ mod tests {
         };
         let wait = Call::Wait {
             pid: "3".into(),
-            since: 0,
             token: None,
         };
         assert_eq!(permit(Caller::Registry, &exit), Ok(Acting::Itself));
@@ -210,7 +209,6 @@ mod tests {
                 Caller::Registry,
                 &Call::Wait {
                     pid: "3".into(),
-                    since: 0,
                     token: Some("host-token".into())
                 }
             ),

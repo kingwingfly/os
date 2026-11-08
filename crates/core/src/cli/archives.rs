@@ -15,7 +15,7 @@ use super::{Manual, Section};
 /// rest deflated. What you cannot read is reported and left out. An archive that exists is not
 /// updated: remove it first.
 ///
-/// Ctrl+C cancels and removes the unfinished archive; closing the tab does not (see jobs).
+/// Ctrl+C cancels and removes the unfinished archive. Closing its terminal also cancels it.
 #[derive(Parser, Debug)]
 #[command(name = "zip")]
 pub struct Zip {
@@ -201,7 +201,7 @@ impl Manual for Faststart {
 /// Lists the terminal's own jobs (pipelines of /usr/bin run with &, or stopped with Ctrl+Z: %N,
 /// which fg, bg and kill take), your processes (zip, unzip, tar and faststart, as ps does) and
 /// the files this browser is writing (uploads and recordings, by their descriptors, fdN), with
-/// their state and progress. Processes go on when their tab or the page closes. jobs cancel ID
+/// their state and progress. Attached work ends when its terminal closes. jobs cancel ID
 /// stops one: a process by the first characters of its PID, a descriptor as fdN, which closes
 /// it.
 #[derive(Parser, Debug)]
@@ -261,8 +261,7 @@ impl Manual for Bg {
 /// list the account's processes
 ///
 /// Lists your processes, the zip, unzip, tar and faststart you started, from any tab or device,
-/// the latest first: its PID, state and command. They run apart, and go on when their tab or
-/// the page closes.
+/// the latest first: its PID, state and command. Detached remote work can outlive its terminal.
 #[derive(Parser, Debug)]
 #[command(name = "ps")]
 pub struct Ps {}

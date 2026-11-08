@@ -185,6 +185,7 @@ impl Db {
             crate::fds::release(self, &session, fd.fd);
         }
         self.forget_fd_numbers(&session);
+        self.forget_controller(lineage);
     }
     /// Keep the descriptors of every process line of the namespace `ns` (its pages were heard
     /// from, which host its processes).
@@ -490,6 +491,11 @@ fn exec(
     let lineage = current
         .as_ref()
         .map_or_else(|| owner(ns, asked.pid, &asked.token), Credential::owner);
+    let controller = match &current {
+        Some(c) => db.controller(&c.owner()).unwrap_or(c.uid),
+        None => auth::identity_of(db, key, guest).id,
+    };
+    db.set_controller(&lineage, controller);
     // The image's descriptor is kept in its process's line's session, as what it opens is.
     let sid = session_of(ns, &lineage);
     db.run(

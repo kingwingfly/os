@@ -3,6 +3,7 @@
 use std::io::{self, BufRead, Write};
 use terminal_worker_core::{bin, cli, text};
 use terminal_worker_userland::{Io, Sys};
+mod accelerator;
 mod xargs;
 
 struct Os;
@@ -66,6 +67,18 @@ fn main() {
     {
         println!("{help}");
         return;
+    }
+    if matches!(args[0].as_str(), "zip" | "unzip" | "tar" | "faststart") {
+        let status = accelerator::run(&args[0], &args[1..]).unwrap_or_else(|error| {
+            let prefix = format!("{}: ", args[0]);
+            eprintln!(
+                "{}{}",
+                prefix,
+                error.strip_prefix(&prefix).unwrap_or(&error)
+            );
+            1
+        });
+        std::process::exit(status);
     }
     if args[0] == "grep" {
         let status = match grep(&args[1..]) {

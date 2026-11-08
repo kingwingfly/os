@@ -197,6 +197,9 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     Ok(row) => row,
                     Err(error) => return errno_reply(&error).keep(),
                 };
+                if row.as_ref().and_then(|c| c.job()).is_some() {
+                    return errno_reply(&abi::Errno::EPERM.into());
+                }
                 let who = row.as_ref().map_or_else(
                     || auth::identity_of(db, key.as_deref(), guest.as_deref()),
                     |row| row.identity(),
@@ -423,6 +426,19 @@ fn job_reply(
                     .iter()
                     .filter_map(|l| Some((l[0].as_bool()?, l[1].as_str()?.to_string())))
                     .collect();
+                if !db.output_fits(id, &lines) {
+                    db.add_lines(
+                        id,
+                        &[(true, "Accelerator output exceeded its bounded spool".into())],
+                    );
+                    let mut progress: Value =
+                        serde_json::from_str(&job.progress).unwrap_or_else(|_| json!({}));
+                    progress["errno"] = json!("E2BIG");
+                    db.set_job(id, JobColumn::Progress, Some(&progress.to_string()));
+                    crate::executor::finish(db, id, "failed");
+                    return Reply::error("Accelerator output exceeds the completion budget", 413)
+                        .keep();
+                }
                 db.add_lines(id, &lines);
             }
             if let Some(progress) = body.get("progress") {
@@ -451,7 +467,7 @@ fn job_reply(
         }
         (Method::Post, "/internal/job/finish") => {
             let state = body["state"].as_str().unwrap_or("done");
-            jobs::finish(
+            crate::executor::finish(
                 db,
                 id,
                 if job.state == "cancelling" {

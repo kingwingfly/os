@@ -12,7 +12,7 @@ use futures::channel::oneshot;
 use futures::future::{Either, LocalBoxFuture, select};
 use futures::{FutureExt, StreamExt};
 use leptos::prelude::*;
-use serde_json::{Value, json};
+use serde_json::Value;
 use terminal_worker_core::ansi::screen::Screen;
 use terminal_worker_core::bin as cli_bin;
 use terminal_worker_core::completion::{self, Candidate, Query};
@@ -25,7 +25,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::{
     account_command, cancel_choosing, cancel_uploads, choose_files, completion_cursor,
-    completion_focus, focus_input, listing, set_directory, stop_recording, sudo,
+    completion_focus, listing, set_directory, stop_recording, sudo,
 };
 
 /// The most transcript lines kept, ...
@@ -118,11 +118,8 @@ pub struct Shell {
     choosing: RwSignal<bool>,
     /// The files the next upload sends: chosen as the command started, or dropped.
     chosen: StoredValue<Option<js_sys::Promise>, LocalStorage>,
-    /// Whether the tab was closed: its browser work stops, but not its server jobs.
+    /// Whether the tab was closed: its processes stop and attached device work is cancelled.
     detached: RwSignal<bool>,
-    /// The answer a running command waits for, if any.
-    prompt: StoredValue<Option<oneshot::Sender<String>>>,
-    pub asking: RwSignal<bool>,
     /// The terminal's input, while the running line's first process may read it
     /// (web/wasi/exec.mjs): the lines typed go to it, and Ctrl+D ends a read ...
     terminal: StoredValue<Option<JsValue>, LocalStorage>,
@@ -346,8 +343,6 @@ impl Shell {
             choosing: RwSignal::new(false),
             chosen: StoredValue::new_local(None),
             detached: RwSignal::new(false),
-            prompt: StoredValue::new(None),
-            asking: RwSignal::new(false),
             terminal: StoredValue::new_local(None),
             reading: RwSignal::new(false),
             tty_echo: RwSignal::new(true),
@@ -453,39 +448,6 @@ impl Shell {
     async fn manage(self, args: &[String], piped: bool) -> Result<Output, String> {
         let sudo = args.first().is_some_and(|a| a == "sudo");
         let argv = &args[usize::from(sudo)..];
-        // zip, unzip, tar and faststart are processes (spawn), done apart; the tab follows one.
-        if matches!(
-            argv.first().map(String::as_str),
-            Some("zip" | "unzip" | "tar" | "faststart")
-        ) {
-            cli::check(argv)?;
-            if sudo
-                && JsFuture::from(crate::sudo())
-                    .await
-                    .map_err(js_message)?
-                    .as_bool()
-                    != Some(true)
-            {
-                return Err("sudo canceled".into());
-            }
-            let sys = crate::sys::HttpSys {
-                sudo,
-                ..Default::default()
-            };
-            let spawn = abi::Call::Spawn {
-                argv: argv.to_vec(),
-                cwd: self.cwd.get_untracked(),
-            };
-            let spawned: Value = userland::sys::call(&sys, spawn)
-                .await
-                .map_err(|error| error.to_string())?;
-            let pid = spawned["pid"].as_str().unwrap_or_default().to_string();
-            let stdin = spawned["stdin"].as_u64().unwrap_or(u64::from(u32::MAX)) as u32;
-            let followed = self.follow(&pid, stdin, piped).await;
-            // Its standard input is let go of as it ends, or as this tab stops following it.
-            userland::sys::calls::<Value>(&sys, vec![Call::Close { fd: stdin.into() }]).await;
-            return followed;
-        }
         let value = self.call(args).await?;
         // Not one of web/app.js's dialogs: a program of user space.
         if value["program"] == true {
@@ -496,128 +458,6 @@ impl Shell {
         let out = self.output(&value);
         self.refresh().await?;
         Ok(out)
-    }
-    /// Follow the process `id` to its end: write its lines as they come, answer its question in
-    /// this tab (its stdin), and signal it on Ctrl+C.
-    async fn follow(self, id: &str, stdin: u32, piped: bool) -> Result<Output, String> {
-        let sys = crate::sys::HttpSys::default();
-        let mut out = Output::default();
-        let mut since = 0;
-        let mut cancelling = false;
-        loop {
-            // A closed tab stops following; the process goes on, and jobs lists it.
-            if self.detached.get_untracked() {
-                return Ok(out);
-            }
-            if self.cancelled() && !cancelling {
-                cancelling = true;
-                userland::sys::call::<Value>(
-                    &sys,
-                    Call::Kill {
-                        pid: id.into(),
-                        signal: None,
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            }
-            let view: Value = userland::sys::call(
-                &sys,
-                Call::Wait {
-                    token: None,
-                    pid: id.into(),
-                    since,
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            for line in view["lines"].as_array().into_iter().flatten() {
-                since = line[0].as_u64().unwrap_or(since);
-                let text = line[2].as_str().unwrap_or_default();
-                if line[1] == true {
-                    self.error(text);
-                } else if piped {
-                    out.stdout.push_str(text);
-                    out.stdout.push('\n');
-                } else {
-                    self.log(text);
-                }
-            }
-            // A page at a time: what a process wrote before it ended is all read before it is
-            // taken to have ended.
-            if view["more"] == true {
-                continue;
-            }
-            match view["state"].as_str().unwrap_or_default() {
-                "done" => {
-                    out.failed |= view["progress"]["errors"].as_u64().is_some_and(|e| e > 0);
-                    break;
-                }
-                "failed" | "cancelled" => {
-                    out.failed = true;
-                    break;
-                }
-                "question" if !cancelling => {
-                    let decisions = self.decide(&view["question"]).await;
-                    if self.cancelled() {
-                        continue;
-                    }
-                    // Its answer goes to its standard input.
-                    let answer = Call::Pwrite {
-                        fd: stdin.into(),
-                        index: 0,
-                        data: json!({ "decisions": decisions })
-                            .to_string()
-                            .into_bytes()
-                            .into(),
-                    };
-                    userland::sys::call::<Value>(&sys, answer)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    continue;
-                }
-                _ => {}
-            }
-            sleep(600).await;
-        }
-        self.refresh().await?;
-        Ok(out)
-    }
-    /// unzip's question about files that exist: replace each, or not, as Info-ZIP asks.
-    async fn decide(self, question: &Value) -> serde_json::Map<String, Value> {
-        let mut decisions = serde_json::Map::new();
-        let mut all = None;
-        for path in question["replace"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            let replace = match all {
-                Some(answer) => answer,
-                None => {
-                    let answer = self
-                        .ask(format!("replace {path}? [y]es, [n]o, [A]ll, [N]one"))
-                        .await;
-                    match answer.trim() {
-                        "A" | "All" => {
-                            all = Some(true);
-                            true
-                        }
-                        "N" | "None" => {
-                            all = Some(false);
-                            false
-                        }
-                        a => a.to_lowercase().starts_with('y'),
-                    }
-                }
-            };
-            if self.cancelled() {
-                break;
-            }
-            decisions.insert(path.into(), json!(replace));
-        }
-        decisions
     }
     /// The jobs of this account, and the files this browser is writing (its descriptors, as
     /// /proc/self/fd lists them), or, given `jobs cancel ID`, cancel that one: a job, or a
@@ -724,17 +564,6 @@ impl Shell {
                 }
             }
         }
-    }
-    /// The answer to `question`, which the next Enter in this tab gives.
-    async fn ask(self, question: String) -> String {
-        let (sender, answer) = oneshot::channel();
-        self.prompt.set_value(Some(sender));
-        self.asking.set(true);
-        self.log(question);
-        focus_input();
-        let answer = answer.await.unwrap_or_default();
-        self.asking.set(false);
-        answer
     }
     /// Run coreutils' utility `args[0]` (a name the terminal has no program of its own for, or
     /// `coreutils NAME`), as a process of its own: what it writes goes on, its errors to the
@@ -1328,15 +1157,6 @@ impl Shell {
 
     /// Run the pipeline `command`, typed into this tab.
     pub fn run(self, command: String) {
-        if self.asking.get_untracked() {
-            // The line answers the question a command is waiting on.
-            self.input.set(String::new());
-            self.log(command.clone());
-            if let Some(sender) = self.prompt.try_update_value(Option::take).flatten() {
-                let _ = sender.send(command);
-            }
-            return;
-        }
         if self.busy.get_untracked() || command.trim().is_empty() {
             return;
         }
@@ -1625,7 +1445,6 @@ impl Shell {
     pub fn detach(self) {
         self.detached.set(true);
         self.cancelled.set(true);
-        self.prompt.set_value(None);
         if self.choosing.get_untracked() {
             cancel_choosing();
         }
@@ -1648,7 +1467,6 @@ impl Shell {
                 cancel_choosing();
             }
             // A command waiting for an answer gets none.
-            self.prompt.set_value(None);
             self.log("^C");
         }
     }

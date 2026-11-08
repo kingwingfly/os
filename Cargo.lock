@@ -3856,6 +3856,7 @@ dependencies = [
  "clap",
  "regex",
  "serde",
+ "terminal-worker-abi",
  "unicode-width",
 ]
 
@@ -3992,6 +3993,7 @@ name = "terminal-worker-utilities"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "serde",
  "serde_json",
  "terminal-worker-abi",
  "terminal-worker-core",

@@ -215,9 +215,9 @@ function reportTty() {
 }
 const isTerminal = path => !!process.pty && (path === '/dev/tty' || path === `/dev/pts/${process.pty.number}`);
 const terminalFd = fd => ({ kind: 'tty', tty: true, fd, pipe: new Pipe(process.pty.input, process.pid) });
-function descriptor(fd) { const found = fds.get(fd); if (!found) throw new Errno(EBADF); return found; }
+function descriptor(fd) { const found = fd >= 0 ? fds.get(fd) : null; if (!found) throw new Errno(EBADF); return found; }
 // The lowest descriptor free from `min` on, as open(2) and dup(2) take.
-function lowest(min = 0) { let fd = min; while (fds.has(fd)) fd++; return fd; }
+function lowest(min = 0) { if (min < 0) throw new Errno(EBADF); let fd = min; while (fds.has(fd)) fd++; return fd; }
 // `fd` is `found`, one more descriptor of it; a pipe's end is held once more, a shared open
 // file counted once more (unless what started this process counted it already: its host, for
 // the pipes it gave, or its parent, for what it forked with).
@@ -246,7 +246,8 @@ function share(found) {
 // close(2) of `fd`: its open file closes once no descriptor of it is left, here or in another
 // process.
 function* uninstall(fd) {
-  const found = descriptor(fd);
+  const found = fds.get(fd);
+  if (!found) throw new Errno(EBADF);
   fds.delete(fd);
   reportTty();
   cloexec.delete(fd);
@@ -598,7 +599,7 @@ const wasi = {
   fd_allocate: () => 0,
   fd_datasync: () => 0,
   fd_sync: () => 0,
-  fd_close: fd => attempt(function* () { return yield* uninstall(fd); }),
+  fd_close: fd => attempt(function* () { descriptor(fd); return yield* uninstall(fd); }),
   fd_fdstat_get: (fd, ptr) => attempt(function* () {
     const found = descriptor(fd), v = view();
     v.setUint8(ptr, filetype(found));
@@ -700,6 +701,7 @@ const wasi = {
   // WASI's renumber moves a descriptor: `from` is closed, `to` is what it was.
   fd_renumber: (from, to) => attempt(function* () {
     const found = descriptor(from);
+    if (to < 0) throw new Errno(EBADF);
     if (from === to) return;
     if (fds.has(to)) yield* uninstall(to);
     fds.set(to, found);
@@ -940,6 +942,7 @@ const wasixCalls = {
   // WASIX's renumber is dup2(2): `from` stays open.
   fd_renumber: (from, to) => attempt(function* () {
     const found = descriptor(from);
+    if (to < 0) throw new Errno(EBADF);
     if (from === to) return;
     if (fds.has(to)) yield* uninstall(to);
     install(to, found);
@@ -1237,12 +1240,19 @@ async function run() {
 // open but those marked close-on-exec.
 async function replace() {
   const { image } = await next('image');
+  // reexec revoked the old credential; flushing close-on-exec writers uses the new image's
+  // token and the unchanged descriptor lineage.
+  process.proc = image.token;
   for (const fd of [...cloexec]) { try { await drive(uninstall(fd)); } catch { /* closed already */ } }
   flush();
   forget();
   snapshots = new Map();
   Object.assign(process, { argv: image.argv, proc: image.token });
   environ = image.env;
+  if (image.error) {
+    await drive(diagnostic(`${image.error}\n`));
+    throw new Exit(126);
+  }
   await instantiate(image.module, image.memory, undefined, image.startSection);
 }
 
@@ -1274,23 +1284,63 @@ function sleepUntil(until) {
 // Terminal ioctls use the process's local descriptor table. They cannot address another
 // run's PTY or turn a server descriptor into a device. Other calls retain their batch path.
 const ttyRequests = new Set(Object.values(IOCTL));
+// Raw ABI descriptors occupy a disjoint, private part of the process's descriptor table.
+// They consequently inherit and close with the same reference accounting as WASI files,
+// including a killed child whose parent shell keeps the credential lineage alive.
+const rawNumber = fd => -fd - 1;
+function forgetRaw(fd) {
+  const number = rawNumber(fd), found = fds.get(number);
+  if (!found) return 0;
+  fds.delete(number);
+  if (found.share == null) return 0;
+  const gen = shares.gen(found.share), left = shares.drop(found.share, process.pid);
+  if (!left) postMessage({ closed: { slot: found.share, gen } });
+  return left;
+}
+function trackRaw(calls, results, reserved = null) {
+  for (let i = 0; i < calls.length; i++) {
+    const one = calls[i], result = results[i];
+    if (one.open && Number.isInteger(result?.ok?.fd)) {
+      const fd = result.ok.fd;
+      const found = { kind: 'file', kfd: fd, path: one.open.path, pos: 0, read: false, writer: false };
+      if (reserved != null) shares.attach(found, reserved);
+      install(rawNumber(fd), found, reserved != null);
+      if (reserved != null) postMessage({ described: { slot: reserved, gen: shares.gen(reserved), description: describe(found) } });
+    } else if (one.open && reserved != null) {
+      shares.drop(reserved, process.pid);
+    }
+    if (one.close || one.discard) {
+      const arg = one.close ?? one.discard;
+      const fd = arg.fd?.ref != null ? results[arg.fd.ref]?.ok?.fd : arg.fd;
+      if (Number.isInteger(fd)) forgetRaw(fd);
+    }
+  }
+  return results;
+}
 function* terminalBatch(calls) {
-  if (!calls.some(call => ttyRequests.has(call.ioctl?.request))) return yield* batch(calls);
+  const split = calls.some(call => call.open || ttyRequests.has(call.ioctl?.request)
+    || Number.isInteger(call.close?.fd) && fds.has(rawNumber(call.close.fd)));
+  if (!split) return trackRaw(calls, yield* batch(calls));
   const results = [];
   for (const original of calls) {
     const call = structuredClone(original);
     const args = Object.values(call)[0];
-    if (args?.fd?.ref != null) {
+    for (const key of ['fd', ...(call.ioctl?.request === 0x40049409 ? ['arg'] : [])]) {
+      if (args?.[key]?.ref == null) continue;
       // Preserve the server batch contract when terminal calls split the batch:
       // forward references fail, and a failed open carries its original errno.
-      const prior = results[args.fd.ref];
+      const prior = results[args[key].ref];
       const fd = prior?.ok?.fd;
       const err = !prior ? { errno: 'EINVAL' } : prior.err ??
         (!Number.isInteger(fd) || fd < 0 || fd > 0xffffffff ? { errno: 'EBADF' } : null);
-      if (err) { results.push({ err }); continue; }
-      args.fd = fd;
+      if (err) { args.invalidReference = err; break; }
+      args[key] = fd;
     }
-    if (ttyRequests.has(call.ioctl?.request)) {
+    if (args?.invalidReference) { results.push({ err: args.invalidReference }); continue; }
+    if (call.close && fds.has(rawNumber(call.close.fd))) {
+      const remaining = forgetRaw(call.close.fd);
+      results.push(remaining ? { ok: null } : (yield* batch([call]))[0]);
+    } else if (ttyRequests.has(call.ioctl?.request)) {
       try {
         const { fd, request, arg } = call.ioctl;
         if (!descriptor(fd).tty || !ttyState) throw new Errno(ERRNO.ENOTTY);
@@ -1300,7 +1350,12 @@ function* terminalBatch(calls) {
         const errno = err instanceof Errno ? Object.keys(ERRNO).find(key => ERRNO[key] === err.errno) ?? 'EIO' : 'EIO';
         results.push({ err: { errno } });
       }
-    } else results.push(...yield* batch([call]));
+    } else {
+      const reserved = call.open && shares ? shares.claim(process.pid, 1, 0) : null;
+      if (reserved != null && reserved < 0) { results.push({ err: { errno: 'EMFILE' } }); continue; }
+      try { results.push(...trackRaw([call], yield* batch([call]), reserved)); }
+      catch (error) { if (reserved != null) shares.drop(reserved, process.pid); throw error; }
+    }
   }
   return results;
 }
@@ -1399,6 +1454,9 @@ async function start(data) {
   // What it left open closes as it exits, as a process's descriptors do: its pipes too, so that
   // the next reads to their end, and the one before hears SIGPIPE.
   exiting = true;
+  // A registry signal may already have revoked this image. The trusted host selects
+  // a surviving credential of this same open-file lineage for descriptor cleanup.
+  if (signal != null && channel) process.proc = host('cleanup', {}).token ?? process.proc;
   for (const fd of [...fds.keys()]) { try { await drive(uninstall(fd)); } catch { /* it exits all the same */ } }
   if (closing.length) { try { await drive(batch([])); } catch { /* likewise */ } }
   flush();
