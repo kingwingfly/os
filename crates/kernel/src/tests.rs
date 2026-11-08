@@ -1,7 +1,7 @@
 use super::*;
 use abi::{ACL_ACCESS, ACL_DEFAULT, O_DIRECTORY, O_TRUNC, O_WRONLY, XATTR_CREATE};
+use os_core::acl::Entries;
 use std::collections::BTreeSet;
-use terminal_worker_core::acl::Entries;
 
 fn user(id: u32, groups: &[u32]) -> Identity {
     Identity {

@@ -1,7 +1,7 @@
 import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, call, mkdirp, put, rmrf } from './sys.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const coreutilsImage = await readFile('dist/usr/bin/coreutils.wasm');
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -71,7 +71,7 @@ test('uutils runs as programs of /bin: arguments, the working directory, pipes a
   await run(page, '/usr/bin/ls');
   await expect(transcript(page)).toContainText('names.txt');
   // A program of /bin reaches the kernel's own calls too, which WASI has no words for, through
-  // the engine's terminal.sys: the batch goes as it is.
+  // the engine's os.sys: the batch goes as it is.
   await run(page, `syscall '["getcreds",{"lstat":{"path":"names.txt"}},{"stat":{"path":"${base}/names.txt"}}]'`);
   await expect(page.locator('.transcript pre').last()).toContainText('"user":"root"');
   // The kernel takes absolute paths only, as user space makes them.

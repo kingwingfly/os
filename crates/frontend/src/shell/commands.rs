@@ -5,7 +5,7 @@
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use leptos::prelude::*;
-use terminal_worker_core::cli::{self, files, terminal};
+use os_core::cli::{self, files, terminal};
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 
@@ -14,7 +14,7 @@ use crate::{choose_files, enterable, open_file, record_sound, set_directory, sta
 
 /// A command the tab runs.
 pub trait TerminalCommand: Sync {
-    /// Its name, as [`terminal_worker_core::cli`] defines it.
+    /// Its name, as [`os_core::cli`] defines it.
     fn name(&self) -> &'static str;
     /// Run `args`, its whole line, in `shell`, with what the stage before wrote, if any; `piped`
     /// if what it writes goes on to another stage.
@@ -139,9 +139,7 @@ impl TerminalCommand for Asking {
             if program.is_some()
                 && let Some(stage) = super::process(&shell, &args[1..]).or_else(|| {
                     program
-                        .filter(|name| {
-                            terminal_worker_core::bin::UTILITIES.contains(&name.as_str())
-                        })
+                        .filter(|name| os_core::bin::UTILITIES.contains(&name.as_str()))
                         .map(|name| (Some(name.clone()), args[1..].to_vec()))
                 })
             {
@@ -248,7 +246,7 @@ impl TerminalCommand for Open {
             if node.is_dir() {
                 return Err("This is a directory; use cd".into());
             }
-            JsFuture::from(open_file(&path, terminal_worker_core::kind(&path)))
+            JsFuture::from(open_file(&path, os_core::kind(&path)))
                 .await
                 .map_err(js_message)?;
             Ok(Output::default())
@@ -291,7 +289,7 @@ impl TerminalCommand for Present {
             let device = started["device"].as_str().unwrap_or_default().to_string();
             // Shown presented, a PDF a page at a time and Markdown as slides, from where the
             // account showed it last.
-            let kind = terminal_worker_core::kind(&path);
+            let kind = os_core::kind(&path);
             let place = &started["place"];
             let kept = match (kind, place.is_array()) {
                 ("pdf", true) => serde_json::json!({ "present": true, "page": place[0] }),
@@ -477,10 +475,7 @@ impl TerminalCommand for Export {
                         .get_value()
                         .iter()
                         .map(|(key, value)| {
-                            format!(
-                                "{key}={}\n",
-                                terminal_worker_core::completion::escape_path(value)
-                            )
+                            format!("{key}={}\n", os_core::completion::escape_path(value))
                         })
                         .collect::<String>(),
                 ));

@@ -1,5 +1,5 @@
-//! The worker that highlights [`Group::Apps`](terminal_worker_preview::language::Group)'s languages.
+//! The worker that highlights [`Group::Apps`](os_preview::language::Group)'s languages.
 
 fn main() {
-    terminal_worker_preview::worker::serve_code(terminal_worker_preview::code::apps());
+    os_preview::worker::serve_code(os_preview::code::apps());
 }

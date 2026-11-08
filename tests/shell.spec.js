@@ -2,7 +2,7 @@ import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, entry, listing, mkdirp, program, put, rmrf, sys } from './sys.js';
 import { promptPath } from './ui.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 // Each test signs in as its own client, so that it does not use up others' login rate limit.
 let headers;
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];

@@ -97,7 +97,7 @@ export async function send(offer, { name, acl = null, presentation = null, fd = 
   const device = `${SOUND}/${name}`;
   answered((await sys([{ mknod: { path: device, mode: 0o666, rdev: 'snd' } }]))[0]);
   if (acl) {
-    const why = await window.terminalUploads.setfacl(device, acl);
+    const why = await window.osUploads.setfacl(device, acl);
     if (why) { await sys([{ unlink: { path: device } }]); throw new Error(why.replace(/^setfacl:/, 'stream -m:')); }
   }
   const { fd: writing } = await call('open', { path: device, flags: O_WRONLY });

@@ -3,7 +3,7 @@ import binaryen from 'binaryen';
 import { readFile } from 'node:fs/promises';
 import { api, call, mkdirp, put, rmrf, processes } from './sys.js';
 
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
@@ -356,7 +356,7 @@ test('mkdir shapes a restrictive process umask for parents and explicit leaf per
   // dash from optimizing its last command into exec without a fork.
   const argv = `dash\n-c\n/usr/bin/mkdir -p -m 0777 ${base}/masked/leaf; /usr/bin/mkdir ${base}/masked/plain; echo item | xargs -I {} /usr/bin/mkdir ${base}/spawn-mask; echo done`;
   const module = binaryen.parseText(`(module
-    (import "terminal" "umask" (func $umask (param i32) (result i32)))
+    (import "os" "umask" (func $umask (param i32) (result i32)))
     (import "wasix_32v1" "proc_exec" (func $exec (param i32 i32 i32 i32) (result i32)))
     (memory (export "memory") 1)
     (data (i32.const 64) "${path}")

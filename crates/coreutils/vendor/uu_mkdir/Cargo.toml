@@ -138,5 +138,5 @@ check-cfg = [
     "cfg(wasi_runner)",
 ]
 
-[target.'cfg(target_os = "wasi")'.dependencies.terminal-worker-posix]
+[target.'cfg(target_os = "wasi")'.dependencies.os-posix]
 path = "../../../posix"

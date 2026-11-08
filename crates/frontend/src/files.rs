@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use leptos::prelude::*;
-use terminal_worker_core::Entry;
+use os_core::Entry;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
@@ -15,8 +15,8 @@ use crate::session_storage as storage;
 use crate::shell::{Account, js_message, located};
 
 /// Where its directory is kept, for this browser tab, across reloads: a key of its own, as the
-/// Files are no tab of the terminal's (whose state is `terminal-tabs`).
-const SAVED: &str = "terminal-files";
+/// Files are no tab of the terminal's (whose state is `os-tabs`).
+const SAVED: &str = "os-files";
 /// Why an upload is not started: one goes on in this page, or the directory is still opening.
 const BUSY: &str = "An upload is going on in this page; wait for it, or cancel it";
 const OPENING: &str = "The directory is still opening; upload once it is open";
@@ -183,7 +183,7 @@ impl Files {
     /// The directory above its own.
     pub fn up(self) {
         let cwd = self.cwd.get_untracked();
-        self.go(terminal_worker_core::parent(&cwd).to_string());
+        self.go(os_core::parent(&cwd).to_string());
     }
     /// Go to the location typed: a path, from its directory, or from the account's home (~).
     pub fn locate(self, typed: &str) {
@@ -206,7 +206,7 @@ impl Files {
         // The listing says what a file is; only a link is asked what it leads to now, if to
         // anything: a dangling one says so, rather than open a preview of nothing.
         let (path, name, linked) = (entry.path.clone(), entry.name.clone(), entry.link.is_some());
-        let mut runnable = terminal_worker_core::completion::runnable(entry);
+        let mut runnable = os_core::completion::runnable(entry);
         spawn_local(async move {
             if linked {
                 match crate::stat(&path).await {
@@ -220,8 +220,7 @@ impl Files {
                     .set(self.launch.run(path).err().unwrap_or_default());
                 return;
             }
-            let opened =
-                JsFuture::from(crate::open_file(&path, terminal_worker_core::kind(&path))).await;
+            let opened = JsFuture::from(crate::open_file(&path, os_core::kind(&path))).await;
             match opened {
                 Ok(_) => self.notice.set(String::new()),
                 Err(error) => self.notice.set(js_message(error)),
@@ -363,7 +362,7 @@ pub fn view(files: Files) -> impl IntoView {
                 let title = format!("{} {}:{}{}", entry.mode_line(), entry.owner, entry.group, entry.link.as_ref().map(|t| format!(" -> {t}")).unwrap_or_default());
                 let linked = entry.link.is_some();
                 // What the account may not open shows dimmed, and says why when clicked.
-                let denied = entry.denied && !terminal_worker_core::completion::runnable(&entry);
+                let denied = entry.denied && !os_core::completion::runnable(&entry);
                 let refusal = denied.then(|| format!("Permission denied: {} is {} {}:{}", entry.name, entry.mode_line().trim_end(), entry.owner, entry.group));
                 let title = if denied { format!("{title} · permission denied") } else { title };
                 let kind = if entry.directory { "directory".to_string() } else { entry.kind.clone() };

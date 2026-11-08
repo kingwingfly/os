@@ -2,7 +2,7 @@ import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, mkdirp, put, rmrf } from './sys.js';
 import { promptPath } from './ui.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787', headers = { Origin: origin };
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787', headers = { Origin: origin };
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const names = ['alpha.txt', 'alphabet.txt', 'z-alpha.txt', 'a_l_p_h_a.txt', 'GammaSpectrum.txt', 'γάμμα-spectrum.md', 'name "quote".txt'];
 let base;

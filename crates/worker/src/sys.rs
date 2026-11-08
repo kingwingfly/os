@@ -9,9 +9,9 @@ use crate::creds::Credential;
 use crate::db::{Db, transact};
 use abi::{BATCH_MAX, Batch, Call, Creds, Data, Errno, Error, FdRef, INLINE_MAX, Results, Return};
 use kernel::Process;
+use os_core::permissions::*;
 use serde_json::json;
 use std::rc::Rc;
-use terminal_worker_core::permissions::*;
 use worker::*;
 
 pub async fn handle(
@@ -1167,7 +1167,7 @@ fn account(
     call: Call,
 ) -> std::result::Result<serde_json::Value, Error> {
     use crate::commands::accounts;
-    use terminal_worker_core::cli::accounts as args;
+    use os_core::cli::accounts as args;
     let done = match call {
         Call::Useradd {
             name,

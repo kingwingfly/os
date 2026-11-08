@@ -5,11 +5,9 @@
 use crate::db::{Db, int, text};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use os_core::permissions::{GUEST, GUEST_HOME, GUEST_UID_MAX, GUEST_UID_MIN, Identity, User};
 use serde::Deserialize;
 use std::collections::BTreeSet;
-use terminal_worker_core::permissions::{
-    GUEST, GUEST_HOME, GUEST_UID_MAX, GUEST_UID_MIN, Identity, User,
-};
 
 /// The uids signed-out browsers draw from, below the accounts a system makes.
 pub const UID_MIN: u32 = GUEST_UID_MIN;

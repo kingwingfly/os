@@ -254,8 +254,8 @@ fn create_dir(path: &Path, is_parent: bool, config: &Config) -> UResult<()> {
 fn get_umask() -> u32 {
     #[cfg(target_os = "wasi")]
     {
-        let previous = terminal_worker_posix::umask(0);
-        terminal_worker_posix::umask(previous);
+        let previous = os_posix::umask(0);
+        os_posix::umask(previous);
         previous
     }
     #[cfg(not(target_os = "wasi"))]
@@ -264,9 +264,9 @@ fn get_umask() -> u32 {
 
 #[cfg(target_os = "wasi")]
 fn create_dir_with_mode(path: &Path, mode: u32, shaped_umask: u32) -> std::io::Result<()> {
-    let previous = terminal_worker_posix::umask(shaped_umask);
-    let result = terminal_worker_posix::mkdir(path, mode);
-    terminal_worker_posix::umask(previous);
+    let previous = os_posix::umask(shaped_umask);
+    let result = os_posix::mkdir(path, mode);
+    os_posix::umask(previous);
     result
 }
 
@@ -372,8 +372,8 @@ fn create_single_dir(path: &Path, is_parent: bool, config: &Config) -> UResult<(
             // those afterwards, retaining any setgid inherited from the parent.
             #[cfg(target_os = "wasi")]
             if mkdir_mode & 0o6000 != 0 {
-                let created = terminal_worker_posix::stat(path, true)?;
-                terminal_worker_posix::chmod(path, u32::from(created.mode) | (mkdir_mode & 0o6000))?;
+                let created = os_posix::stat(path, true)?;
+                os_posix::chmod(path, u32::from(created.mode) | (mkdir_mode & 0o6000))?;
             }
             if config.verbose {
                 writeln!(

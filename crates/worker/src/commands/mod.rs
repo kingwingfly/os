@@ -3,8 +3,8 @@ pub(crate) mod accounts;
 
 use crate::db::Db;
 
+use os_core::{permissions::*, resolve};
 use std::collections::BTreeSet;
-use terminal_worker_core::{permissions::*, resolve};
 
 fn group(c: &Db, name: &str) -> std::result::Result<u32, String> {
     c.group(name)

@@ -213,14 +213,14 @@ fn main() {
 // The kernel's own calls, which WASI has no words for, as this system's engine gives them: a
 // batch (abi's `calls`, as JSON) sent as it is, and its reply copied where the program says.
 #[cfg(target_os = "wasi")]
-#[link(wasm_import_module = "terminal")]
+#[link(wasm_import_module = "os")]
 unsafe extern "C" {
     fn sys(calls: *const u8, len: usize) -> usize;
     fn reply(to: *mut u8);
 }
 
 /// syscall CALLS: make the system calls CALLS, a JSON list of them, as one batch, through
-/// `terminal.sys`, and write what each gave: `syscall '[{"stat":{"path":"/"}}]'`.
+/// `os.sys`, and write what each gave: `syscall '[{"stat":{"path":"/"}}]'`.
 fn syscall(mut args: impl Iterator<Item = OsString>) -> i32 {
     let _ = args.next();
     let Some(calls) = args.next().and_then(|calls| calls.into_string().ok()) else {

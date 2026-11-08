@@ -25,5 +25,20 @@ test('server compiler transforms fixed-memory modules without running their init
     const invalid = await fetch(`http://127.0.0.1:${port}/compile`, { method: 'POST', body: 'not wasm' });
     assert.equal(invalid.status, 422);
     assert.equal((await invalid.json()).errno, 'ENOEXEC');
+    for (const namespace of ['os', 'terminal']) {
+      const probe = binaryen.parseText(`(module
+        (import "${namespace}" "umask" (func $mask (param i32) (result i32)))
+        (memory (export "memory") 1)
+        (func (export "_start") (drop (call $mask (i32.const 18)))))`);
+      try {
+        const reply = await fetch(`http://127.0.0.1:${port}/compile`, { method: 'POST', body: probe.emitBinary() });
+        assert.equal(reply.status, 200, namespace);
+        const compiled = await WebAssembly.compile(await reply.arrayBuffer());
+        let called = false;
+        const running = await WebAssembly.instantiate(compiled, { [namespace]: { umask: mask => { called = true; return mask; } } });
+        running.exports._start();
+        assert.equal(called, true);
+      } finally { probe.dispose(); }
+    }
   } finally { server.kill(); await once(server, 'exit'); }
 });

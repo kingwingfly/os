@@ -6,7 +6,7 @@
 //! `coreutils NAME` invokes the multicall binary with NAME as its own argument.
 
 /// The utilities coreutils has, as crates/coreutils builds them: uutils', and `syscall`, which
-/// makes the kernel's own calls through the engine's `terminal.sys`.
+/// makes the kernel's own calls through the engine's `os.sys`.
 pub const PROGRAMS: &[&str] = &[
     "arch",
     "base32",

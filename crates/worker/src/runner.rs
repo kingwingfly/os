@@ -19,11 +19,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use abi::{Call, Errno, O_CREAT, O_EXCL, O_TRUNC, O_WRONLY, Return};
+use os_core::CHUNK_SIZE;
+use os_core::archive::{Existing, Job as Command, member_path};
+use os_core::permissions::{mode_text, type_mode_text};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use terminal_worker_core::CHUNK_SIZE;
-use terminal_worker_core::archive::{Existing, Job as Command, member_path};
-use terminal_worker_core::permissions::{mode_text, type_mode_text};
 use wasm_bindgen::JsValue;
 use worker::*;
 
@@ -1321,7 +1321,7 @@ impl JobRunner {
             None => None,
         };
         if writing.is_none() {
-            let parent = terminal_worker_core::parent(&row.target);
+            let parent = os_core::parent(&row.target);
             if parent != directory
                 && let Err(message) = self.mkdirs(directory, parent).await?
             {
@@ -1374,7 +1374,7 @@ impl JobRunner {
         directory: &str,
         replace: bool,
     ) -> Result<std::result::Result<bool, String>> {
-        let parent = terminal_worker_core::parent(&row.target);
+        let parent = os_core::parent(&row.target);
         if parent != directory
             && let Err(message) = self.mkdirs(directory, parent).await?
         {
@@ -1537,13 +1537,11 @@ impl JobRunner {
             let mut lines = Lines::default();
             if verbose {
                 for input in &spec.inputs {
-                    lines.out(
-                        if format == Some(terminal_worker_core::archive::Format::Zip) {
-                            format!("  adding: {}", input.name)
-                        } else {
-                            input.name.clone()
-                        },
-                    );
+                    lines.out(if format == Some(os_core::archive::Format::Zip) {
+                        format!("  adding: {}", input.name)
+                    } else {
+                        input.name.clone()
+                    });
                 }
             }
             self.update(lines, Some(json!({"done": 0, "total": hashes.len()})))

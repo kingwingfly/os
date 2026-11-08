@@ -1,13 +1,13 @@
 //! Executable archive/media clients. Parsing, terminal interaction and exit status belong
 //! here; the driver sees typed operations over authorized resource handles.
 use abi::accelerator as protocol;
+use os_core::archive::{self, Job};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
-use terminal_worker_core::archive::{self, Job};
 
 fn call(call: abi::Call) -> Result<Value, String> {
-    terminal_worker_posix::batch(&[call])
+    os_posix::batch(&[call])
         .map_err(|e| e.to_string())?
         .results
         .remove(0)
@@ -35,7 +35,7 @@ impl Handles {
         Ok(fd)
     }
     fn resource(&mut self, base: &str, typed: &str) -> Result<protocol::PathAt, String> {
-        let path = terminal_worker_core::resolve(base, typed)?;
+        let path = os_core::resolve(base, typed)?;
         let (directory, name) = if path == "/" {
             ("/", ".")
         } else {
@@ -84,7 +84,7 @@ fn operation(handles: &mut Handles, cwd: &str, job: Job) -> Result<protocol::Ope
             directory,
             links,
         } => {
-            let base = terminal_worker_core::resolve(cwd, directory.as_deref().unwrap_or("."))?;
+            let base = os_core::resolve(cwd, directory.as_deref().unwrap_or("."))?;
             let output = handles.resource(cwd, &archive)?;
             let mut inputs = Vec::new();
             for path in paths {
@@ -111,12 +111,10 @@ fn operation(handles: &mut Handles, cwd: &str, job: Job) -> Result<protocol::Ope
             verbose,
         } => {
             let source = handles.resource(cwd, &archive)?;
-            let destination =
-                terminal_worker_core::resolve(cwd, directory.as_deref().unwrap_or("."))?;
+            let destination = os_core::resolve(cwd, directory.as_deref().unwrap_or("."))?;
             if zip {
                 // Creating the destination is an ordinary user-space filesystem operation.
-                std::fs::metadata(terminal_worker_core::resolve(cwd, &archive)?)
-                    .map_err(|e| e.to_string())?;
+                std::fs::metadata(os_core::resolve(cwd, &archive)?).map_err(|e| e.to_string())?;
                 std::fs::create_dir_all(&destination).map_err(|e| e.to_string())?;
             }
             Op::Extract {

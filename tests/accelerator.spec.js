@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { api, call, errno, mkdirp, program, put, rmrf } from './sys.js';
 import { device, directory, ACCEL } from './accelerator.js';
 import { zipOf } from './archive-fixtures.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 test.setTimeout(180_000);

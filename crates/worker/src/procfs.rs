@@ -9,8 +9,8 @@
 use crate::db::{Db, Fd};
 use crate::procs::Row;
 use abi::{Dirent, Errno, Error, Stat};
+use os_core::permissions::{Identity, Store};
 use serde_json::{Value, json};
-use terminal_worker_core::permissions::{Identity, Store};
 
 type Result<T> = std::result::Result<T, Error>;
 

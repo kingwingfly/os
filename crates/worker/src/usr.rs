@@ -9,29 +9,29 @@
 //!
 //! The store answers for these names itself (db.rs), so that the kernel resolves, lists, stats
 //! and permits them as it does any; changing any of them fails with EROFS (sys.rs).
+use os_core::permissions::Node;
 use std::cell::{Cell, RefCell};
-use terminal_worker_core::permissions::Node;
 
 /// What each binary's content is, as a node names it (none of R2's), and where the Worker's
 /// assets have it.
 pub const COREUTILS: &str = "usr:coreutils";
-pub const TERMINAL: &str = "usr:terminal";
+pub const OS: &str = "usr:os";
 /// Additional WASI user-space programs.
 pub const UTILITIES: &str = "usr:utilities";
 pub fn asset(content: &str) -> Option<&'static str> {
     match content {
         COREUTILS => Some("/usr/bin/coreutils.wasm"),
         UTILITIES => Some("/usr/bin/utilities.wasm"),
-        TERMINAL => Some("/pkg/frontend_bg.wasm"),
+        OS | "usr:terminal" => Some("/pkg/frontend_bg.wasm"),
         _ => None,
     }
 }
 /// How many bytes the binary `content` is.
 pub fn size(content: &str) -> u64 {
-    let (coreutils, terminal, utilities) = SIZES.with(Cell::get);
+    let (coreutils, frontend, utilities) = SIZES.with(Cell::get);
     match content {
         COREUTILS => coreutils,
-        TERMINAL => terminal,
+        OS | "usr:terminal" => frontend,
         UTILITIES => utilities,
         _ => 0,
     }
@@ -74,8 +74,8 @@ fn with_programs<R>(f: impl FnOnce(&[Program]) -> R) -> R {
                 },
             ];
             for (names, target) in [
-                (terminal_worker_core::bin::PROGRAMS, "coreutils"),
-                (terminal_worker_core::bin::UTILITIES, "utilities"),
+                (os_core::bin::PROGRAMS, "coreutils"),
+                (os_core::bin::UTILITIES, "utilities"),
             ] {
                 all.extend(names.iter().map(|name| Program {
                     name: (*name).into(),
@@ -92,8 +92,8 @@ fn with_programs<R>(f: impl FnOnce(&[Program]) -> R) -> R {
 
 /// Mount the build's images. Legacy frontend content IDs remain readable for existing clones,
 /// but no /usr/bin name advertises the frontend as an executable.
-pub fn mount(coreutils: u64, terminal: u64, utilities: u64) {
-    SIZES.with(|cell| cell.set((coreutils, terminal, utilities)));
+pub fn mount(coreutils: u64, frontend: u64, utilities: u64) {
+    SIZES.with(|cell| cell.set((coreutils, frontend, utilities)));
     MOUNTED.with(|cell| cell.set(crate::auth::clock()));
 }
 
@@ -142,9 +142,7 @@ pub fn node(path: &str) -> Option<Node> {
             },
             None => directory(
                 TREE.iter()
-                    .filter(|(name, link)| {
-                        link.is_none() && terminal_worker_core::parent(name) == path
-                    })
+                    .filter(|(name, link)| link.is_none() && os_core::parent(name) == path)
                     .count() as u32,
             ),
         };
@@ -176,7 +174,7 @@ pub fn children(path: &str) -> Option<Vec<(String, Node)>> {
     let names: Vec<String> = match path {
         "/" | "/usr" => TREE
             .iter()
-            .filter(|(name, _)| terminal_worker_core::parent(name) == path)
+            .filter(|(name, _)| os_core::parent(name) == path)
             .map(|(name, _)| name.to_string())
             .collect(),
         "/usr/bin" => with_programs(|programs| {
@@ -216,8 +214,8 @@ pub fn times(ino: u64) -> Option<kernel::Times> {
 
 /// What statfs tells of the image: its blocks, all used.
 pub fn statfs() -> abi::StatFs {
-    let (coreutils, terminal, utilities) = SIZES.with(Cell::get);
-    let _ = terminal;
+    let (coreutils, frontend, utilities) = SIZES.with(Cell::get);
+    let _ = frontend;
     let blocks = coreutils.div_ceil(4096) + utilities.div_ceil(4096);
     abi::StatFs {
         bsize: 4096,

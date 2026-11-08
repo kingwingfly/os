@@ -1542,6 +1542,118 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "os-abi"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "os-core"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "os-abi",
+ "regex",
+ "serde",
+ "unicode-width",
+]
+
+[[package]]
+name = "os-coreutils"
+version = "0.1.0"
+dependencies = [
+ "os-core",
+ "serde_json",
+ "uu_arch",
+ "uu_b2sum",
+ "uu_base32",
+ "uu_base64",
+ "uu_basename",
+ "uu_basenc",
+ "uu_cat",
+ "uu_cksum",
+ "uu_comm",
+ "uu_csplit",
+ "uu_cut",
+ "uu_date",
+ "uu_dd",
+ "uu_dir",
+ "uu_dircolors",
+ "uu_dirname",
+ "uu_echo",
+ "uu_expand",
+ "uu_expr",
+ "uu_factor",
+ "uu_false",
+ "uu_fmt",
+ "uu_fold",
+ "uu_head",
+ "uu_hostid",
+ "uu_join",
+ "uu_link",
+ "uu_ln",
+ "uu_ls",
+ "uu_md5sum",
+ "uu_mkdir",
+ "uu_mktemp",
+ "uu_nice",
+ "uu_nl",
+ "uu_nproc",
+ "uu_numfmt",
+ "uu_od",
+ "uu_paste",
+ "uu_pathchk",
+ "uu_pr",
+ "uu_printenv",
+ "uu_printf",
+ "uu_ptx",
+ "uu_pwd",
+ "uu_readlink",
+ "uu_realpath",
+ "uu_rmdir",
+ "uu_seq",
+ "uu_sha1sum",
+ "uu_sha224sum",
+ "uu_sha256sum",
+ "uu_sha384sum",
+ "uu_sha512sum",
+ "uu_shred",
+ "uu_shuf",
+ "uu_sleep",
+ "uu_sort",
+ "uu_split",
+ "uu_sum",
+ "uu_tail",
+ "uu_tee",
+ "uu_test",
+ "uu_touch",
+ "uu_tr",
+ "uu_true",
+ "uu_truncate",
+ "uu_tsort",
+ "uu_tty",
+ "uu_uname",
+ "uu_unexpand",
+ "uu_uniq",
+ "uu_unlink",
+ "uu_vdir",
+ "uu_wc",
+ "uu_yes",
+ "uucore",
+]
+
+[[package]]
+name = "os-posix"
+version = "0.1.0"
+dependencies = [
+ "os-abi",
+ "serde_json",
+]
+
+[[package]]
 name = "os_display"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2012,118 +2124,6 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
-]
-
-[[package]]
-name = "terminal-worker-abi"
-version = "0.1.0"
-dependencies = [
- "base64",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "terminal-worker-core"
-version = "0.1.0"
-dependencies = [
- "clap",
- "regex",
- "serde",
- "terminal-worker-abi",
- "unicode-width",
-]
-
-[[package]]
-name = "terminal-worker-coreutils"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "terminal-worker-core",
- "uu_arch",
- "uu_b2sum",
- "uu_base32",
- "uu_base64",
- "uu_basename",
- "uu_basenc",
- "uu_cat",
- "uu_cksum",
- "uu_comm",
- "uu_csplit",
- "uu_cut",
- "uu_date",
- "uu_dd",
- "uu_dir",
- "uu_dircolors",
- "uu_dirname",
- "uu_echo",
- "uu_expand",
- "uu_expr",
- "uu_factor",
- "uu_false",
- "uu_fmt",
- "uu_fold",
- "uu_head",
- "uu_hostid",
- "uu_join",
- "uu_link",
- "uu_ln",
- "uu_ls",
- "uu_md5sum",
- "uu_mkdir",
- "uu_mktemp",
- "uu_nice",
- "uu_nl",
- "uu_nproc",
- "uu_numfmt",
- "uu_od",
- "uu_paste",
- "uu_pathchk",
- "uu_pr",
- "uu_printenv",
- "uu_printf",
- "uu_ptx",
- "uu_pwd",
- "uu_readlink",
- "uu_realpath",
- "uu_rmdir",
- "uu_seq",
- "uu_sha1sum",
- "uu_sha224sum",
- "uu_sha256sum",
- "uu_sha384sum",
- "uu_sha512sum",
- "uu_shred",
- "uu_shuf",
- "uu_sleep",
- "uu_sort",
- "uu_split",
- "uu_sum",
- "uu_tail",
- "uu_tee",
- "uu_test",
- "uu_touch",
- "uu_tr",
- "uu_true",
- "uu_truncate",
- "uu_tsort",
- "uu_tty",
- "uu_uname",
- "uu_unexpand",
- "uu_uniq",
- "uu_unlink",
- "uu_vdir",
- "uu_wc",
- "uu_yes",
- "uucore",
-]
-
-[[package]]
-name = "terminal-worker-posix"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "terminal-worker-abi",
 ]
 
 [[package]]
@@ -2611,8 +2611,8 @@ dependencies = [
  "glob",
  "hostname",
  "lscolors",
+ "os-posix",
  "rustc-hash",
- "terminal-worker-posix",
  "terminal_size",
  "thiserror",
  "uucore",
@@ -2637,8 +2637,8 @@ version = "0.12.0"
 dependencies = [
  "clap",
  "fluent",
+ "os-posix",
  "rustix",
- "terminal-worker-posix",
  "uucore",
 ]
 

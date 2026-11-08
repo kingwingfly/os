@@ -15,10 +15,10 @@ use crate::auth;
 use crate::db::{Ask, Db, Device};
 use abi::{Errno, Error, O_WRONLY};
 use kernel::Process;
+use os_core::acl::{self, Perms, Spec, Tag};
+use os_core::devices::device_path;
+use os_core::{kind, permissions::*};
 use serde_json::{Value, json};
-use terminal_worker_core::acl::{self, Perms, Spec, Tag};
-use terminal_worker_core::devices::device_path;
-use terminal_worker_core::{kind, permissions::*};
 
 type Result<T> = std::result::Result<T, Error>;
 

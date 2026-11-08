@@ -11,7 +11,7 @@ const out = resolve(caller, values['out-dir'] || join(root, 'dist'));
 const configPath = values.content && resolve(caller, values.content);
 process.chdir(root);
 const config = configPath ? JSON.parse(await readFile(configPath, 'utf8')) : {};
-const branding = { name: 'R2 TERMINAL', subtitle: '', heading: 'Your files, right here.', description: 'An R2 terminal with accounts, groups, and file permissions.', ...config.branding };
+const branding = { name: 'OS', subtitle: '', heading: 'Your OS, in the browser.', description: 'A browser OS with processes, a filesystem, accounts, and applications.', ...config.branding };
 for (const value of Object.values(branding)) if (typeof value !== 'string') throw new Error('Branding values must be strings');
 const games = {};
 let assets;
@@ -39,8 +39,8 @@ async function copyTree(from, to) {
   }
 }
 await mkdir(join(out, 'pkg'), { recursive: true });
-run('cargo', ['build', '-p', 'terminal-worker-ui', '--target', 'wasm32-unknown-unknown', '--release']);
-run('wasm-bindgen', ['--target', 'web', '--out-dir', join(out, 'pkg'), '--out-name', 'frontend', join(target, 'wasm32-unknown-unknown/release/terminal_worker_ui.wasm')]);
+run('cargo', ['build', '-p', 'os-ui', '--target', 'wasm32-unknown-unknown', '--release']);
+run('wasm-bindgen', ['--target', 'web', '--out-dir', join(out, 'pkg'), '--out-name', 'frontend', join(target, 'wasm32-unknown-unknown/release/os_ui.wasm')]);
 // The preview workers, started by the page when a preview first needs one: PDF pages, archive
 // listings, Mermaid diagrams, and code highlighted in four groups of languages, as
 // crates/preview/src/lib.rs names their loaders. Each feature set builds on its own, so a worker
@@ -51,7 +51,7 @@ for (const [feature, profile, bins] of [
   ['diagram', 'size', ['preview_diagram']],
   ['code', 'release', ['preview_code_web', 'preview_code_systems', 'preview_code_apps', 'preview_code_scripts']],
 ]) {
-  run('cargo', ['build', '-p', 'terminal-worker-preview', '--target', 'wasm32-unknown-unknown', '--profile', profile, '--features', feature + ',worker', ...bins.flatMap(bin => ['--bin', bin])]);
+  run('cargo', ['build', '-p', 'os-preview', '--target', 'wasm32-unknown-unknown', '--profile', profile, '--features', feature + ',worker', ...bins.flatMap(bin => ['--bin', bin])]);
   for (const bin of bins) {
     run('wasm-bindgen', ['--target', 'no-modules', '--no-typescript', '--out-dir', out, '--out-name', bin, join(target, 'wasm32-unknown-unknown', profile, bin + '.wasm')]);
     // A worker whose code cannot load or start says so, as the failure of its being ready.
@@ -69,13 +69,13 @@ await build({ absWorkingDir: root, entryPoints: { 'executor-host': 'web/kernel/e
 for (const name of ['wasi-asyncify.js', 'binaryen.js']) await rm(join(out, name), { force: true });
 // The client kernel (crates/client-kernel), a classic dedicated Worker: no-modules wasm-bindgen,
 // imported by web/kernel/client.js, with the page's protocol module bundled into the bridge.
-run('cargo', ['build', '-p', 'terminal-worker-client-kernel', '--target', 'wasm32-unknown-unknown', '--release']);
-run('wasm-bindgen', ['--target', 'no-modules', '--no-typescript', '--out-dir', out, '--out-name', 'client_kernel', join(target, 'wasm32-unknown-unknown/release/terminal_worker_client_kernel.wasm')]);
+run('cargo', ['build', '-p', 'os-client-kernel', '--target', 'wasm32-unknown-unknown', '--release']);
+run('wasm-bindgen', ['--target', 'no-modules', '--no-typescript', '--out-dir', out, '--out-name', 'client_kernel', join(target, 'wasm32-unknown-unknown/release/os_client_kernel.wasm')]);
 await copy('web/kernel/client.js', join(out, 'client-kernel.js'));
 run('cargo', ['build', '--release', '--target', 'wasm32-wasip1', '--manifest-path', 'crates/coreutils/Cargo.toml', '--target-dir', join(target, 'coreutils')]);
 await mkdir(join(out, 'usr/bin'), { recursive: true });
 await copy(join(target, 'coreutils/wasm32-wasip1/release/coreutils.wasm'), join(out, 'usr/bin/coreutils.wasm'));
-run('cargo', ['build', '--release', '--target', 'wasm32-wasip1', '-p', 'terminal-worker-utilities']);
+run('cargo', ['build', '--release', '--target', 'wasm32-wasip1', '-p', 'os-utilities']);
 await copy(join(target, 'wasm32-wasip1/release/utilities.wasm'), join(out, 'usr/bin/utilities.wasm'));
 // What the kernel's /usr says of its binaries (crates/worker/src/usr.rs), which it cannot ask the
 // assets: their sizes.
@@ -84,6 +84,7 @@ for (const asset of ['/usr/bin/coreutils.wasm', '/usr/bin/utilities.wasm', '/pkg
 await writeFile(join(out, 'usr/manifest.json'), JSON.stringify(sizes));
 for (const name of ['index.html', 'style.css', '_headers']) await copy('web/' + name, join(out, name));
 if (assets) await copyTree(assets, join(out, 'content'));
-await writeFile(join(out, 'terminal-config.json'), JSON.stringify({ branding, games }));
-console.log('Terminal built: ' + out);
+await writeFile(join(out, 'os-config.json'), JSON.stringify({ branding, games }));
+await rm(join(out, 'terminal-config.json'), { force: true });
+console.log('OS built: ' + out);
 

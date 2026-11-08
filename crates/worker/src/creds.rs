@@ -13,10 +13,10 @@ use crate::api::Reply;
 use crate::auth;
 use crate::db::{Db, int, text, transact};
 use abi::{EXEC_MAX, Errno, Error, Return};
+use os_core::permissions::Identity;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use terminal_worker_core::permissions::Identity;
 use worker::*;
 
 /// An exec's credentials, as its process (and what it forked) acts.

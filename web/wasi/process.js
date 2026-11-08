@@ -9,7 +9,7 @@
 // for both: what may ask the kernel is a generator that yields its requests (`request`), and
 // `drive` sends them. What waits on shared memory still blocks the Worker either way
 // (`Atomics.wait`): a pipe's read or write, a sleep, the stop word, the host's answer to a call
-// it waits on. `terminal.sys` reaches the kernel's own calls, which WASI has no words for
+// it waits on. `os.sys` reaches the kernel's own calls, which WASI has no words for
 // (modes, owners, ACLs, devices, accounts). WASIX's (`wasix_32v1`) are WASI's and a process's
 // own: fork, execve, wait, pipe, dup, the working directory, setjmp and longjmp (phase 3).
 //
@@ -1166,8 +1166,8 @@ async function instantiate(module, type, snapshot, startSection = false) {
   }) } : {};
   // Where calls may suspend, each import may: one that answers at once returns at once.
   const imports = suspending
-    ? { wasi_snapshot_preview1: suspendable(preview1), terminal: suspendable(terminal), wasix_32v1: suspendable(wasix), env }
-    : { wasi_snapshot_preview1: preview1, terminal, wasix_32v1: wasix, env };
+    ? { wasi_snapshot_preview1: suspendable(preview1), os: suspendable(osApi), terminal: suspendable(osApi), wasix_32v1: suspendable(wasix), env }
+    : { wasi_snapshot_preview1: preview1, os: osApi, terminal: osApi, wasix_32v1: wasix, env };
   // An imported memory is this process's before the instance is: a start function, which runs
   // as it is instantiated, may already write through it (a memory of the module's own is not
   // there to reach until the instance is).
@@ -1317,7 +1317,7 @@ function trackRaw(calls, results, reserved = null) {
   }
   return results;
 }
-function* terminalBatch(calls) {
+function* osBatch(calls) {
   const split = calls.some(call => call.open || ttyRequests.has(call.ioctl?.request)
     || Number.isInteger(call.close?.fd) && fds.has(rawNumber(call.close.fd)));
   if (!split) return trackRaw(calls, yield* batch(calls));
@@ -1360,10 +1360,10 @@ function* terminalBatch(calls) {
   return results;
 }
 
-// terminal.sys: a batch of the kernel's calls (abi::Batch's `calls`, as JSON), sent as it is.
+// os.sys: a batch of the kernel's calls (abi::Batch's `calls`, as JSON), sent as it is.
 // `sys` sends it and gives the reply's length; `reply` copies the reply where the program says.
 let reply = new Uint8Array(0);
-const terminal = {
+const osApi = {
   posix_spawn: (ptr, len, result) => {
     pause();
     try {
@@ -1394,7 +1394,7 @@ const terminal = {
     const calls = JSON.parse(string(ptr, len));
     forget();
     return drive((function* () {
-      reply = encoder.encode(JSON.stringify({ results: yield* terminalBatch(calls) }));
+      reply = encoder.encode(JSON.stringify({ results: yield* osBatch(calls) }));
       return reply.length;
     })());
   },

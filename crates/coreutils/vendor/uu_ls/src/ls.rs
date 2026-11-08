@@ -810,7 +810,7 @@ pub struct PathData<'a> {
     // Result<MetaData> got from symlink_metadata() or metadata() based on config
     md: OnceCell<Option<Metadata>>,
     #[cfg(target_os = "wasi")]
-    posix: OnceCell<Option<terminal_worker_posix::Stat>>,
+    posix: OnceCell<Option<os_posix::Stat>>,
     ft: OnceCell<Option<FileType>>,
     // can be used to avoid reading the filetype. Can be also called d_type:
     // https://www.gnu.org/software/libc/manual/html_node/Directory-Entries.html
@@ -911,10 +911,10 @@ impl<'a> PathData<'a> {
     }
 
     #[cfg(target_os = "wasi")]
-    fn posix(&self) -> Option<&terminal_worker_posix::Stat> {
+    fn posix(&self) -> Option<&os_posix::Stat> {
         self.posix
             .get_or_init(|| {
-                terminal_worker_posix::stat(self.path(), self.must_dereference)
+                os_posix::stat(self.path(), self.must_dereference)
                     .map_err(|err| {
                         show!(LsError::IOErrorContext(
                             self.path().to_path_buf(),

@@ -1,7 +1,7 @@
 //! tty/stty are user-space programs over the client kernel's ioctl calls.
 use serde_json::{Value, json};
 use std::ffi::OsString;
-use terminal_worker_core::cli::{self, terminal::Stty};
+use os_core::cli::{self, terminal::Stty};
 
 fn ioctl(request: u32, arg: Value) -> Result<Value, String> {
     #[cfg(target_os = "wasi")]

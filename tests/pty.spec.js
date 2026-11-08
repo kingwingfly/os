@@ -12,7 +12,7 @@ async function run(page, command) {
   await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
 }
 async function upload(request, path, data) {
-  const response = await put(request, '/api/file?path=' + encodeURIComponent(path), { data, headers: { Origin: process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787' } });
+  const response = await put(request, '/api/file?path=' + encodeURIComponent(path), { data, headers: { Origin: process.env.OS_TEST_URL || 'http://127.0.0.1:8787' } });
   expect(response.ok(), await response.text()).toBe(true);
   expect(await errno(request, { chmod: { path, mode: 0o755 } })).toBe(null);
 }
@@ -278,10 +278,10 @@ test('foreground commands hide the shell prompt and never flash a working indica
   const prompt = busy(page).locator('label');
   await expect(prompt).toBeVisible();
   await page.evaluate(() => {
-    window.terminalStatusFlashes = [];
+    window.osStatusFlashes = [];
     new MutationObserver(() => {
       const text = document.querySelector('.terminal-panel:not([hidden])').innerText;
-      if (/Working\.\.\.|Input ↵|Answer ↵/.test(text)) window.terminalStatusFlashes.push(text);
+      if (/Working\.\.\.|Input ↵|Answer ↵/.test(text)) window.osStatusFlashes.push(text);
     }).observe(document.querySelector('.terminal-tabs'), { subtree: true, childList: true, characterData: true, attributes: true });
   });
   await input(page).fill('sleep 1'); await input(page).press('Enter');
@@ -290,7 +290,7 @@ test('foreground commands hide the shell prompt and never flash a working indica
   await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   await expect(prompt).toBeVisible();
   await run(page, 'ls /usr/bin');
-  expect(await page.evaluate(() => window.terminalStatusFlashes)).toEqual([]);
+  expect(await page.evaluate(() => window.osStatusFlashes)).toEqual([]);
   await expect(prompt).toBeVisible();
 });
 

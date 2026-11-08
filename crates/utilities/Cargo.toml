@@ -1,5 +1,5 @@
 [package]
-name = "terminal-worker-utilities"
+name = "os-utilities"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -9,10 +9,10 @@ name = "utilities"
 path = "src/main.rs"
 
 [dependencies]
-abi = { package = "terminal-worker-abi", path = "../abi" }
-terminal-worker-posix = { path = "../posix" }
-terminal-worker-core = { path = "../core" }
-terminal-worker-userland = { path = "../userland" }
+abi = { package = "os-abi", path = "../abi" }
+os-posix = { path = "../posix" }
+os-core = { path = "../core" }
+os-userland = { path = "../userland" }
 serde_json.workspace = true
 serde.workspace = true
 futures = { version = "0.3", features = ["executor"] }

@@ -9,9 +9,9 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::Path;
 
 use flate2::{Compression, GzBuilder, read::MultiGzDecoder};
+use os_core::archive::{ENTRIES_MAX, EXPANDED_MAX, Format};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use terminal_worker_core::archive::{ENTRIES_MAX, EXPANDED_MAX, Format};
 
 /// The job container's version, recorded with each archive built, since another version may build
 /// different bytes.
@@ -607,7 +607,7 @@ mod tests {
         let (_, members) = list(&out, None).unwrap();
         assert_eq!(members[0].name, "../evil.txt");
         assert_eq!(members[1].kind, Kind::Symlink);
-        assert!(terminal_worker_core::archive::member_path("/x", &members[0].name).is_err());
+        assert!(os_core::archive::member_path("/x", &members[0].name).is_err());
         fs::write(s.path("junk"), b"not an archive at all").unwrap();
         assert!(list(&s.path("junk"), None).is_err());
     }

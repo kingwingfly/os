@@ -56,7 +56,7 @@ pub fn chmod(path: &Path, mode: u32) -> io::Result<()> {
 /// The mask is process-local; the authoritative filesystem still checks every operation.
 #[cfg(target_os = "wasi")]
 pub fn umask(mask: u32) -> u32 {
-    #[link(wasm_import_module = "terminal")]
+    #[link(wasm_import_module = "os")]
     unsafe extern "C" {
         #[link_name = "umask"]
         fn host_umask(mask: u32) -> u32;
@@ -92,7 +92,7 @@ pub fn batch(calls: &[abi::Call]) -> io::Result<abi::Results> {
 
 #[cfg(target_os = "wasi")]
 fn request(calls: &[abi::Call]) -> io::Result<Vec<u8>> {
-    #[link(wasm_import_module = "terminal")]
+    #[link(wasm_import_module = "os")]
     unsafe extern "C" {
         fn sys(calls: *const u8, len: usize) -> usize;
         fn reply(to: *mut u8);

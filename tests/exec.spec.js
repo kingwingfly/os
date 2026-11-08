@@ -2,7 +2,7 @@ import { withoutJspi } from './transport.js';
 import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, call, mkdirp, program, put, rmrf } from './sys.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const binaryen = (await import('binaryen')).default;
 const coreutils = await readFile('dist/usr/bin/coreutils.wasm');
@@ -77,7 +77,7 @@ test('an uploaded wasm runs by its path, with the working directory, environment
   await expect(page.locator('.transcript pre').last()).toHaveText(base);
   await run(page, './coreutils printenv USER');
   await expect(page.locator('.transcript pre').last()).toHaveText('root');
-  // Full terminal.sys as the caller: getcreds says whom it was executed as.
+  // Full os.sys as the caller: getcreds says whom it was executed as.
   await run(page, `./coreutils syscall '["getcreds"]'`);
   expect((await processJson(page)).results[0].ok.user).toBe('root');
   // Two of them in one pipeline, each a process, and an in-page head closing the pipe.
@@ -214,7 +214,7 @@ test('a pipeline answers its last stage\'s status, in whatever order its process
   await page.goto('/');
   const status = stages => page.evaluate(async stages => {
     const options = { cwd: '/', home: '/root', user: 'root', tty: false };
-    return (await window.terminal.exec(stages, options)).status;
+    return (await window.os.exec(stages, options)).status;
   }, stages);
   // The last stage ends first: its status is the last's, not the one that finished first.
   expect(await status([{ argv: ['false'] }, { argv: ['sleep', '0.4'] }])).toBe(0);
@@ -238,7 +238,7 @@ test('the loader reads a memory import\'s own limits, and refuses wrong names an
   await page.goto('/');
   const load = path => page.evaluate(async path => {
     try {
-      return { status: (await window.terminal.exec([{ path, argv: [path] }], {})).status };
+      return { status: (await window.os.exec([{ path, argv: [path] }], {})).status };
     } catch (error) {
       return { error: error.message };
     }

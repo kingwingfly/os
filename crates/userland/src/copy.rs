@@ -10,9 +10,9 @@ use abi::{
     ACL_ACCESS, ACL_DEFAULT, Call, Errno, Error, FICLONE, FdRef, INLINE_MAX, O_CREAT, O_EXCL,
     O_RDONLY, O_TRUNC, O_WRONLY, Opened, Stat,
 };
+use os_core::cli::{files as args, parse};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use terminal_worker_core::cli::{files as args, parse};
 
 /// What cp's options ask of each copy.
 struct Options {

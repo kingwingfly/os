@@ -1,11 +1,11 @@
 //! The filesystem's metadata as tables in the Durable Object's SQLite, and the transactions that
 //! change them. File bytes are not here: chunks of files are R2 objects, which these tables name.
+use os_core::permissions::{GUEST, Id, Identity, Node, Session, Store, User};
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use terminal_worker_core::permissions::{GUEST, Id, Identity, Node, Session, Store, User};
 use wasm_bindgen::prelude::*;
 use worker::{Error, Result, SqlStorage, SqlStorageValue, State};
 
@@ -575,7 +575,7 @@ fn changes(path: &str) {
         CHANGING.with(|changing| {
             changing
                 .borrow_mut()
-                .insert(terminal_worker_core::parent(path).to_string())
+                .insert(os_core::parent(path).to_string())
         });
     }
 }
@@ -583,7 +583,7 @@ fn parent_of(path: &str) -> &str {
     if path == "/" {
         ""
     } else {
-        terminal_worker_core::parent(path)
+        os_core::parent(path)
     }
 }
 
@@ -1622,7 +1622,7 @@ impl Db {
         let (now, nanos) = crate::auth::clock();
         self.run(
             "UPDATE inodes SET mtime = ?1, mtime_ns = ?2, ctime = ?1, ctime_ns = ?2 WHERE id = (SELECT ino FROM nodes WHERE path = ?3)",
-            vec![int(now), int(nanos), text(terminal_worker_core::parent(path))],
+            vec![int(now), int(nanos), text(os_core::parent(path))],
         );
     }
 }
@@ -1883,14 +1883,14 @@ impl Store for Db {
             .map(UserRow::pair)
             .or_else(|| {
                 // Only a uid of the guests' range is a guest's: no query for the rest.
-                terminal_worker_core::permissions::is_guest_id(id)
+                os_core::permissions::is_guest_id(id)
                     .then(|| self.guest_by_uid(id))
                     .flatten()
                     .map(|guest| (guest.name(), guest.user()))
             })
     }
     fn username(&self, id: u32) -> String {
-        if terminal_worker_core::permissions::is_guest_id(id)
+        if os_core::permissions::is_guest_id(id)
             && let Some(guest) = self.guest_by_uid(id)
         {
             return guest.name();

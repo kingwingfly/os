@@ -1,0 +1,91 @@
+# Existing installations: preserve service, bucket and Durable Object storage identities.
+# Product code and branding are OS; these identifiers are retained for data continuity.
+name = "terminal-worker"
+main = "crates/worker/entry.js"
+compatibility_date = "2026-10-24"
+# Served at terminal-worker.<subdomain>.workers.dev. No preview URLs: a preview would share the
+# live R2 bucket and Durable Objects, so it would be no sandbox.
+workers_dev = true
+preview_urls = false
+
+[build]
+command = "worker-build --release"
+cwd = "crates/worker"
+watch_dir = ["crates/worker/src", "crates/core/src"]
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "terminal-worker-files"
+
+[[unsafe.bindings]]
+name = "LOGIN_LIMIT"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 12, period = 60 }
+
+# Hearing live sound (sound.rs): a room of listeners may come from one address, as venue Wi-Fi
+# does, and join at once.
+[[unsafe.bindings]]
+name = "LISTEN_LIMIT"
+type = "ratelimit"
+namespace_id = "1002"
+simple = { limit = 300, period = 60 }
+
+[dev]
+local_protocol = "http"
+port = 8787
+
+[[durable_objects.bindings]]
+name = "AUTHORITY"
+class_name = "TerminalAuthority"
+
+[[migrations]]
+tag = "v1-users-permissions"
+new_sqlite_classes = ["TerminalAuthority"]
+
+# Each browser's machine (machine.rs): its process namespace, one Durable Object per browser,
+# by its name, so that processes do not wait on the filesystem's one authority.
+[[durable_objects.bindings]]
+name = "MACHINE"
+class_name = "Machine"
+
+# Jobs (zip, unzip, tar, faststart): one JobRunner Durable Object, and its container, a job.
+[[durable_objects.bindings]]
+name = "JOBS"
+class_name = "JobRunner"
+
+[[migrations]]
+tag = "v2-job-runner"
+new_sqlite_classes = ["JobRunner"]
+
+[[migrations]]
+tag = "v3-machine"
+new_sqlite_classes = ["Machine"]
+
+[[containers]]
+class_name = "JobRunner"
+image = "./containers/jobs/Dockerfile"
+image_build_context = "."
+instance_type = "basic"
+max_instances = 4
+
+# Binaryen parses and transforms immutable executable content in a separate container.
+[[durable_objects.bindings]]
+name = "COMPILER"
+class_name = "ModuleCompiler"
+
+[[migrations]]
+tag = "v4-module-compiler"
+new_sqlite_classes = ["ModuleCompiler"]
+
+[[containers]]
+class_name = "ModuleCompiler"
+image = "./containers/compiler/Dockerfile"
+image_build_context = "."
+instance_type = "basic"
+max_instances = 4

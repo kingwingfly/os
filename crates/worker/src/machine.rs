@@ -14,16 +14,16 @@
 //!
 //! Who may make which call, and as whom it acts, is `kernel::registry`'s table: the
 //! registry route and the page both act as the authenticated account; the routing header
-//! grants no privilege. A process acts by its token and snapshot (including terminal.sys).
+//! grants no privilege. A process acts by its token and snapshot (including os.sys).
 use crate::db::{Db, transact};
 use crate::procs::{Begun, Snapshot};
 use crate::{auth, procs};
 use abi::{BATCH_MAX, Batch, Call, Errno, Error, Exec, Forked, Return};
 use kernel::registry::{self, Acting};
+use os_core::permissions::Identity;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
-use terminal_worker_core::permissions::Identity;
 use worker::*;
 
 /// How long a revocation that failed waits to be tried again, in milliseconds.

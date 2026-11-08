@@ -2,13 +2,13 @@
 use crate::{Io, Sys, run};
 use abi::{Call, Closed, Errno, Error, FICLONE, O_ACCMODE, Opened};
 use kernel::{Fs, Opening, Process, call};
+use os_core::permissions::*;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::{Pin, pin};
 use std::task::{Context, Poll, Waker};
-use terminal_worker_core::permissions::*;
 
 /// A process over the kernel in memory, as an account, with descriptors as the host keeps
 /// them: here, of whole files, whose content is an id that copies share.

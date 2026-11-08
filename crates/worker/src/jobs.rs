@@ -3,11 +3,11 @@
 //! in executable user space; generic credentials, lifetime and revocation live in executor.rs.
 use std::collections::{BTreeMap, BTreeSet};
 
+use os_core::archive::{self, ENTRIES_MAX, Job as Command};
+use os_core::permissions::*;
+use os_core::{MAX_FILE, kind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use terminal_worker_core::archive::{self, ENTRIES_MAX, Job as Command};
-use terminal_worker_core::permissions::*;
-use terminal_worker_core::{MAX_FILE, kind};
 
 use crate::commands;
 use crate::db::{Db, Job};

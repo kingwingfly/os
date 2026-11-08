@@ -1,7 +1,7 @@
 //! Bounded, streaming argument construction. Children use the generic process adapter.
+use os_core::cli::{self, text::Xargs};
+use os_posix::process::{Stdin, spawn};
 use std::io::{self, BufRead};
-use terminal_worker_core::cli::{self, text::Xargs};
-use terminal_worker_posix::process::{Stdin, spawn};
 
 const LIMIT: usize = 128 * 1024;
 #[derive(Clone, Copy)]

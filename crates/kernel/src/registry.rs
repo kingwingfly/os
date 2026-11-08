@@ -4,7 +4,7 @@
 //! rules that can be tested without it. Every registry call is in `permit`'s table: a call
 //! added to the ABI without a rule is refused.
 use abi::{Call, Errno, Error};
-use terminal_worker_core::permissions::Identity;
+use os_core::permissions::Identity;
 
 /// Who a registry call comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,7 +16,7 @@ pub enum Caller {
     /// the page's account.
     Page,
     /// A process: any batch carrying a process's token, whatever route it took. Uploaded wasm
-    /// reaches the registry this way (terminal.sys), so it is given nothing of the kernel's.
+    /// reaches the registry this way (os.sys), so it is given nothing of the kernel's.
     Process,
 }
 
@@ -161,7 +161,7 @@ mod tests {
             },
         ] {
             assert_eq!(permit(Caller::Registry, &call), Ok(Acting::Account));
-            // Neither a page nor a process (uploaded wasm, through terminal.sys) may begin a
+            // Neither a page nor a process (uploaded wasm, through os.sys) may begin a
             // namespace, drain its pids, or end another tab's processes.
             for caller in [Caller::Page, Caller::Process] {
                 assert_eq!(permit(caller, &call).unwrap_err().errno, Errno::EPERM);

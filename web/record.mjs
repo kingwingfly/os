@@ -19,7 +19,7 @@ export const clock = seconds => `${String(Math.floor(seconds / 60)).padStart(2, 
  * file is there. Settles with what was saved. */
 export async function record(destination, microphone, { acl = null, progress = () => {}, begun: there = () => {}, signal }) {
   if (!window.MediaRecorder?.isTypeSupported(RECORDED)) throw new Error('This browser cannot record Opus in WebM');
-  const rust = window.terminalUploads;
+  const rust = window.osUploads;
   let begun;
   try { begun = await call('open', { path: destination, flags: O_WRONLY | O_CREAT | O_EXCL | O_APPEND, mode: 0o666 }); }
   catch (error) { throw error.errno === 'EEXIST' ? new Error('File already exists; rename it before recording') : error; }

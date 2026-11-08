@@ -2,7 +2,7 @@ import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, errno, listing, mkdirp, put } from './sys.js';
 import { browse, promptPath } from './ui.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 // A line is typed at the prompt, once the one before has ended, as the shell takes no other.
 const prompt = page => expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
@@ -50,7 +50,7 @@ test('terminal, password modal, upload, sanitized Markdown, slides and media', a
   await expect(page.locator('.loading')).toHaveCount(0);
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill('hel'); await input.press('Tab'); await expect(input).toHaveValue('help ');
-  await run(page, 'open welcome.md'); await expect(page.locator('#viewer .markdown h1')).toContainText('R2 Terminal');
+  await run(page, 'open welcome.md'); await expect(page.locator('#viewer .markdown h1')).toContainText('OS');
   await page.getByRole('button', { name: 'Close preview' }).click();
   await run(page, 'open dem'); await expect(page.locator('.transcript')).toContainText('open: dem: No such file or directory');
   // Every command completes the paths its definition takes: faststart's file, unzip -d's directory.

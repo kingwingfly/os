@@ -4,9 +4,9 @@
 use crate::db::Db;
 use crate::db::Job;
 use abi::{Call, Errno, Error};
+use os_core::permissions::{Identity, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use terminal_worker_core::permissions::{Identity, Store};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WriteGrant {

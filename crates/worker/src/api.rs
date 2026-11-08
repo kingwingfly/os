@@ -3,9 +3,9 @@
 //! Worker asks it whether it may, and tells it what it wrote.
 use crate::db::{Db, File, transact};
 use crate::{auth, commands, jobs};
+use os_core::{mime, permissions::*, resolve};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use terminal_worker_core::{mime, permissions::*, resolve};
 use worker::*;
 
 /// How long an upload may go without a new chunk before it is cancelled, in seconds.

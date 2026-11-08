@@ -1,14 +1,14 @@
 //! The previews in the viewer dialog. web/app.js opens the dialog, hands its content to [`show`]
-//! through `window.terminalPreview.show(content, path, kind, version)`, and later calls what that
+//! through `window.osPreview.show(content, path, kind, version)`, and later calls what that
 //! returns, to release the preview: its views, its workers' documents and its listeners. The
-//! manual renders through `window.terminalPreview.markdown(text, path)`.
+//! manual renders through `window.osPreview.markdown(text, path)`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use gloo_net::http::{Method, RequestBuilder};
 use leptos::{ev, html, mount::mount_to, prelude::*, task::spawn_local};
-use terminal_worker_preview::language;
+use os_preview::language;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 use web_sys::{
@@ -23,44 +23,44 @@ use crate::workers;
 #[wasm_bindgen]
 extern "C" {
     /// Open `path` in the viewer, from a link in the file it shows, which Back returns to.
-    #[wasm_bindgen(js_namespace = terminal, js_name = follow)]
+    #[wasm_bindgen(js_namespace = os, js_name = follow)]
     fn follow_link(path: &str, kind: &str) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = place)]
+    #[wasm_bindgen(js_namespace = os, js_name = place)]
     fn saved_place(path: &str) -> JsValue;
-    #[wasm_bindgen(js_namespace = terminal, js_name = setPlace)]
+    #[wasm_bindgen(js_namespace = os, js_name = setPlace)]
     fn save_place(path: &str, value: JsValue);
     /// Tell this browser's other windows, and the account's pages signed in elsewhere, that this
     /// page presents `column`, `row` of the file at `path`: a slide, or a PDF's page and 0.
-    #[wasm_bindgen(js_namespace = terminal, js_name = present)]
+    #[wasm_bindgen(js_namespace = os, js_name = present)]
     fn tell_presenting(path: &str, column: usize, row: usize);
     /// Ask where this page's account last showed the file at `path`, on any device: the answer
-    /// comes as what another presents (`terminal:present`).
-    #[wasm_bindgen(js_namespace = terminal, js_name = ask)]
+    /// comes as what another presents (`os:present`).
+    #[wasm_bindgen(js_namespace = os, js_name = ask)]
     fn ask_where(path: &str);
     /// The last place this page heard of, or showed, in the file at `path`: `[column, row]`.
-    #[wasm_bindgen(js_namespace = terminal, js_name = presented)]
+    #[wasm_bindgen(js_namespace = os, js_name = presented)]
     fn last_presented(path: &str) -> JsValue;
     /// The presentation of the file at `path` that this page follows, if it does
     /// (`open /dev/present/NAME`): `{device, owner, controller}`.
-    #[wasm_bindgen(js_namespace = terminal, js_name = attending)]
+    #[wasm_bindgen(js_namespace = os, js_name = attending)]
     fn attending(path: &str) -> JsValue;
-    /// The bar shows the file at `path` now: what it shows of it comes as `terminal:bar`.
-    #[wasm_bindgen(js_namespace = terminal, js_name = barOf)]
+    /// The bar shows the file at `path` now: what it shows of it comes as `os:bar`.
+    #[wasm_bindgen(js_namespace = os, js_name = barOf)]
     fn bar_of(path: &str);
     /// Present the file at `path` to others, as /dev/present/NAME, or stop presenting it.
-    #[wasm_bindgen(js_namespace = terminal, js_name = togglePresenting)]
+    #[wasm_bindgen(js_namespace = os, js_name = togglePresenting)]
     fn toggle_presenting(path: &str);
     /// Go live, as stream does, and record too (`keep`) beside the file at `path`; or stop.
-    #[wasm_bindgen(js_namespace = terminal, js_name = goLive)]
+    #[wasm_bindgen(js_namespace = os, js_name = goLive)]
     fn go_live(path: &str, keep: bool);
     /// Ask to speak in the presentation followed, or withdraw the ask, or stop speaking.
-    #[wasm_bindgen(js_namespace = terminal, js_name = askToSpeak)]
+    #[wasm_bindgen(js_namespace = os, js_name = askToSpeak)]
     fn ask_to_speak();
     /// Allow, or dismiss, a listener's ask to speak.
-    #[wasm_bindgen(js_namespace = terminal, js_name = answerAsk)]
+    #[wasm_bindgen(js_namespace = os, js_name = answerAsk)]
     fn answer_ask(id: &str, allow: bool);
     /// End a listener's voice, as its presenter.
-    #[wasm_bindgen(js_namespace = terminal, js_name = endVoice)]
+    #[wasm_bindgen(js_namespace = os, js_name = endVoice)]
     fn end_voice(device: &str);
 }
 
@@ -94,7 +94,7 @@ pub fn js_error(error: JsValue) -> String {
     }
 }
 
-/// Make [`show`] and [`preview::markdown`] web/app.js's `window.terminalPreview`.
+/// Make [`show`] and [`preview::markdown`] web/app.js's `window.osPreview`.
 pub fn register() {
     let show = Closure::<dyn Fn(HtmlElement, String, String, String) -> js_sys::Promise>::new(
         |content, path, kind, version| {
@@ -114,7 +114,7 @@ pub fn register() {
     let _ = js_sys::Reflect::set(&api, &"markdown".into(), markdown.as_ref());
     show.forget();
     markdown.forget();
-    let _ = js_sys::Reflect::set(&window(), &"terminalPreview".into(), &api);
+    let _ = js_sys::Reflect::set(&window(), &"osPreview".into(), &api);
 }
 
 /// What a preview shows once its file is read.
@@ -394,7 +394,7 @@ fn follow(event: ev::MouseEvent) {
         return;
     };
     event.prevent_default();
-    let kind = terminal_worker_core::kind(&path);
+    let kind = os_core::kind(&path);
     spawn_local(async move {
         let _ = JsFuture::from(follow_link(&path, kind)).await;
     });
@@ -517,9 +517,9 @@ const SLIDE_THEMES: [(&str, &str); 4] = [
     ("sepia", "Sepia"),
     ("night", "Night"),
 ];
-const SLIDE_THEME: &str = "terminal-slide-theme";
+const SLIDE_THEME: &str = "os-slide-theme";
 /// The size of the speaker view's notes, in pixels, kept for every deck in this browser.
-const NOTES_SIZE: &str = "terminal-notes-size";
+const NOTES_SIZE: &str = "os-notes-size";
 const NOTES_SIZES: (u32, u32, u32) = (14, 24, 56);
 /// How many slides either side of the one shown are drawn ahead of it.
 const SLIDES_AHEAD: usize = 2;
@@ -643,7 +643,7 @@ fn on_resize(node: NodeRef<html::Div>, resized: impl Fn(&HtmlElement, f64, f64) 
 
 /// Follow, with `apply`, the place that another window of this browser, or a page of this account
 /// signed in elsewhere, presents in the file at `path`, as app.js hears of it
-/// (`terminal:present`), for as long as the view lasts.
+/// (`os:present`), for as long as the view lasts.
 fn follow_presenting(path: StoredValue<String>, apply: impl Fn(usize, usize) + Copy + 'static) {
     // What came while the file was read.
     let last = path.with_value(|path| last_presented(path));
@@ -652,7 +652,7 @@ fn follow_presenting(path: StoredValue<String>, apply: impl Fn(usize, usize) + C
     {
         apply(column as usize, row as usize);
     }
-    let listener = window_event_listener_untyped("terminal:present", move |event| {
+    let listener = window_event_listener_untyped("os:present", move |event| {
         let Some(detail) = event
             .dyn_ref::<web_sys::CustomEvent>()
             .map(|event| event.detail())
@@ -710,7 +710,7 @@ impl Audience {
             latest: RwSignal::new(None),
             ended: RwSignal::new(get("ended").is_some_and(|ended| ended.is_truthy())),
         };
-        let listener = window_event_listener_untyped("terminal:device", move |event| {
+        let listener = window_event_listener_untyped("os:device", move |event| {
             let Some(detail) = event.dyn_ref::<web_sys::CustomEvent>().map(|e| e.detail()) else {
                 return;
             };
@@ -834,7 +834,7 @@ fn LiveControls(path: StoredValue<String>, audience: Option<Audience>) -> impl I
     let bar = RwSignal::new(Bar::default());
     // Which popover is open: the Go live choice, or the listeners.
     let menu = RwSignal::new(None::<&'static str>);
-    let listener = window_event_listener_untyped("terminal:bar", move |event| {
+    let listener = window_event_listener_untyped("os:bar", move |event| {
         let Some(detail) = event.dyn_ref::<web_sys::CustomEvent>().map(|e| e.detail()) else {
             return;
         };

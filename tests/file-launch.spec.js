@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { api, mkdirp, put, rmrf, call as sysCall } from './sys.js';
 import { browse } from './ui.js';
 
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787', headers = { Origin: origin };
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787', headers = { Origin: origin };
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const module = binaryen.parseText(`(module
   (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))

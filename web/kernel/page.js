@@ -3,8 +3,8 @@
 import { kernelCall, kernelPort } from './protocol.js';
 
 globalThis.loaderStats = { compiled: 0 };
-globalThis.addEventListener('terminal:signal', ({ detail }) => { void kernelCall('deliver_signal', detail).catch(() => {}); });
-globalThis.addEventListener('terminal:changed', () => { void kernelCall('reconcile').catch(() => {}); });
+globalThis.addEventListener('os:signal', ({ detail }) => { void kernelCall('deliver_signal', detail).catch(() => {}); });
+globalThis.addEventListener('os:changed', () => { void kernelCall('reconcile').catch(() => {}); });
 let fallbackNotified = false;
 
 function dimensions(element) {

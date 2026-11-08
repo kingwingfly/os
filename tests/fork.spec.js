@@ -174,7 +174,7 @@ test('each browser is a machine of its own, and the machine takes only the regis
 const binaryen = (await import('binaryen')).default;
 const { readFile } = await import('node:fs/promises');
 const { api, call: sysCall, mkdirp, put, rmrf } = await import('./sys.js');
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const assemble = wat => Buffer.from(binaryen.parseText(wat).emitBinary());
 

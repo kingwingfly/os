@@ -19,7 +19,7 @@ async function drag(page, locator, dx, dy, at = 'bar') {
 }
 async function ready(page) {
   await page.goto('/');
-  await page.evaluate(() => localStorage.removeItem('terminal-desktop'));
+  await page.evaluate(() => localStorage.removeItem('os-desktop'));
   await page.reload();
   await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await expect(terminal(page)).toHaveAttribute('style', /left/);

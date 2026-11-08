@@ -1,10 +1,10 @@
 [package]
-name = "terminal-worker-core"
+name = "os-core"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-abi = { package = "terminal-worker-abi", path = "../abi" }
+abi = { package = "os-abi", path = "../abi" }
 serde.workspace = true
 unicode-width = "0.2"
 # grep and fd patterns; Unicode-aware case folding, since paths are often not ASCII.

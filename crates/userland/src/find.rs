@@ -9,7 +9,7 @@ use crate::walk;
 const FD_MAX: usize = 50_000;
 
 pub async fn fd(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
-    let find = match terminal_worker_core::find::parse(io.rest()) {
+    let find = match os_core::find::parse(io.rest()) {
         Ok(find) => find,
         Err(error) => {
             io.fail(error);

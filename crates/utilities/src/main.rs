@@ -1,15 +1,15 @@
 //! Installed WASI programs for operations not supplied by the coreutils WASI build.
 //! The shell and dash execute these same bytes, with normal process credentials and stdio.
+use os_core::{bin, cli, text};
+use os_userland::{Io, Sys};
 use std::io::{self, BufRead, Write};
-use terminal_worker_core::{bin, cli, text};
-use terminal_worker_userland::{Io, Sys};
 mod accelerator;
 mod xargs;
 
 struct Os;
 impl Sys for Os {
     async fn batch(&self, calls: Vec<abi::Call>) -> Vec<Result<serde_json::Value, abi::Error>> {
-        match terminal_worker_posix::batch(&calls) {
+        match os_posix::batch(&calls) {
             Ok(reply) => reply
                 .results
                 .into_iter()
@@ -104,7 +104,7 @@ fn main() {
     }
     let fd_exec = (args[0] == "fd")
         .then(|| {
-            terminal_worker_core::find::parse(&args[1..])
+            os_core::find::parse(&args[1..])
                 .ok()
                 .and_then(|find| find.exec)
         })
@@ -136,11 +136,10 @@ fn main() {
         cancelled: &|| false,
         ask: &ask,
     };
-    let mut status =
-        futures::executor::block_on(terminal_worker_userland::run(&Os, &mut state)).unwrap_or(127);
+    let mut status = futures::executor::block_on(os_userland::run(&Os, &mut state)).unwrap_or(127);
     if let Some((all, template)) = fd_exec {
-        use terminal_worker_core::shell::{exec_all, exec_one};
-        use terminal_worker_posix::process::{Stdin, spawn};
+        use os_core::shell::{exec_all, exec_one};
+        use os_posix::process::{Stdin, spawn};
         let commands = if state.found.is_empty() {
             Vec::new()
         } else if all {

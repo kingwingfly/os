@@ -3,10 +3,10 @@ use crate::io::{Io, basename, joined, quote};
 use crate::sys::{Sys, calls, done, getdents, lstat, stat};
 use crate::{time, walk};
 use abi::{Call, Errno, Error, MAXSYMLINKS, R_OK, Stat, X_OK};
+use os_core::cli::{files as args, parse};
+use os_core::permissions::type_mode_text;
+use os_core::{Entry, kind, resolve};
 use serde_json::Value;
-use terminal_worker_core::cli::{files as args, parse};
-use terminal_worker_core::permissions::type_mode_text;
-use terminal_worker_core::{Entry, kind, resolve};
 
 /// Parse the program's arguments as its definition says, or report why not and return 1.
 macro_rules! parsed {

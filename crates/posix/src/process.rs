@@ -85,7 +85,7 @@ impl Child {
 }
 
 #[cfg(target_os = "wasi")]
-#[link(wasm_import_module = "terminal")]
+#[link(wasm_import_module = "os")]
 unsafe extern "C" {
     #[link_name = "posix_spawn"]
     fn host_spawn(request: *const u8, len: usize, pid: *mut u32) -> u32;

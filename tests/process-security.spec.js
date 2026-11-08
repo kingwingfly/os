@@ -237,10 +237,10 @@ for (const startsRoot of [false, true]) {
       await syscall(context.request, { chmod: { path, mode: 0o755 } });
       if (!startsRoot) expect((await api(context.request, 'logout')).ok()).toBe(true);
       const before = await syscall(context.request, 'getcreds');
-      await page.waitForFunction(() => !!window.terminal?.exec);
+      await page.waitForFunction(() => !!window.os?.exec);
       await page.evaluate(path => {
         window.securityReading = false;
-        window.securityRun = window.terminal.exec([{ path, argv: [path] }], {
+        window.securityRun = window.os.exec([{ path, argv: [path] }], {
           onTty: input => { window.securityInput = input; },
           onReading: () => { window.securityReading = true; },
           onJob: job => { window.securityJob = job; },

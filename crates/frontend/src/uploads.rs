@@ -1,4 +1,4 @@
-//! What web/upload.mjs and web/record.mjs need from Rust, as `window.terminalUploads`: the
+//! What web/upload.mjs and web/record.mjs need from Rust, as `window.osUploads`: the
 //! chunk size, SHA-256 hashes of files read slice by slice, which resume uploads and let R2
 //! check every chunk, and setfacl, for a recording made with ACL entries.
 
@@ -93,7 +93,7 @@ fn setfacl(path: String, entries: String) -> js_sys::Promise {
     })
 }
 
-/// Make `window.terminalUploads`.
+/// Make `window.osUploads`.
 pub fn register() {
     let digest =
         Closure::<dyn Fn(js_sys::Uint8Array) -> String>::new(|bytes: js_sys::Uint8Array| {
@@ -108,15 +108,15 @@ pub fn register() {
     let _ = js_sys::Reflect::set(
         &api,
         &"chunkSize".into(),
-        &JsValue::from_f64(terminal_worker_core::CHUNK_SIZE as f64),
+        &JsValue::from_f64(os_core::CHUNK_SIZE as f64),
     );
     let _ = js_sys::Reflect::set(
         &api,
         &"maxFile".into(),
-        &JsValue::from_f64(terminal_worker_core::MAX_FILE as f64),
+        &JsValue::from_f64(os_core::MAX_FILE as f64),
     );
     if let Some(window) = web_sys::window() {
-        let _ = js_sys::Reflect::set(&window, &JsValue::from_str("terminalUploads"), &api);
+        let _ = js_sys::Reflect::set(&window, &JsValue::from_str("osUploads"), &api);
     }
 }
 

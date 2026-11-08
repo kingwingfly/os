@@ -20,10 +20,10 @@ use crate::auth;
 use crate::db::{Db, Device, Told};
 use abi::{Errno, Error, Opened};
 use kernel::Process;
+use os_core::devices::device_path;
+pub use os_core::devices::{PRESENT, SOUND};
+use os_core::{parent, permissions::*};
 use serde_json::{Value, json};
-use terminal_worker_core::devices::device_path;
-pub use terminal_worker_core::devices::{PRESENT, SOUND};
-use terminal_worker_core::{parent, permissions::*};
 
 type Result<T> = std::result::Result<T, Error>;
 

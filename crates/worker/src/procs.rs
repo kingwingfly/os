@@ -15,11 +15,11 @@ use abi::{
     SIGINT, SIGKILL, SIGPIPE, SIGQUIT, SIGSTOP, SIGTERM, SIGTSTP,
 };
 use kernel::registry;
+use os_core::permissions::Identity;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use terminal_worker_core::permissions::Identity;
 use worker::{SqlStorage, SqlStorageValue};
 
 /// The namespace's init, the first process of every browser.
@@ -543,7 +543,7 @@ impl Db {
                 .cgroup(ns, cgroup)
                 .ok_or(Errno::ENOENT)
                 .and_then(|group| {
-                    let identity = terminal_worker_core::permissions::Identity {
+                    let identity = os_core::permissions::Identity {
                         id: cred.uid,
                         group: cred.gid,
                         groups: cred.groups.clone(),
@@ -1064,7 +1064,7 @@ impl Db {
         let parent = if path == "/" {
             ""
         } else {
-            terminal_worker_core::parent(path)
+            os_core::parent(path)
         };
         if self.cgroup(ns, path).is_none() {
             self.run(
@@ -1084,7 +1084,7 @@ impl Db {
     ) -> Result<()> {
         self.ensure_namespace(ns, crate::auth::now());
         let path = cgroup_path(path);
-        let parent = terminal_worker_core::parent(&path);
+        let parent = os_core::parent(&path);
         let Some(above) = self.cgroup(ns, parent) else {
             return Err(Errno::ENOENT.into());
         };

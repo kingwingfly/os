@@ -34,7 +34,7 @@ const MIN_H: f64 = 180.0;
 /// The gap the default layout leaves between windows and around them.
 const GAP: f64 = 10.0;
 /// Where the layout is kept.
-const SAVED: &str = "terminal-desktop";
+const SAVED: &str = "os-desktop";
 
 /// Where a window is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

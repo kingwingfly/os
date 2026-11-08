@@ -3,10 +3,10 @@
 use abi::accelerator as protocol;
 use abi::{Errno, Error};
 use kernel::Process;
+use os_core::archive::Job as Operation;
+use os_core::permissions::Store;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use terminal_worker_core::archive::Job as Operation;
-use terminal_worker_core::permissions::Store;
 
 use super::Request;
 use crate::db::{Db, DeviceTask};
@@ -77,7 +77,7 @@ fn operation(
             links,
             verbose,
         } => {
-            if inputs.is_empty() || inputs.len() > terminal_worker_core::archive::ENTRIES_MAX {
+            if inputs.is_empty() || inputs.len() > os_core::archive::ENTRIES_MAX {
                 return Err(Errno::E2BIG.into());
             }
             let mut paths = Vec::new();
@@ -256,7 +256,7 @@ pub fn ioctl(
                 });
             }
             if let Some(output) = spec.output {
-                let directory = terminal_worker_core::parent(&output).to_string();
+                let directory = os_core::parent(&output).to_string();
                 let inode = db.node(&directory).ok_or(Errno::ENOENT)?.ino;
                 let name = output.rsplit('/').next().map(str::to_string);
                 grants.push(crate::executor::WriteGrant {

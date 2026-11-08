@@ -1,11 +1,11 @@
 [package]
-name = "terminal-worker-jobs"
+name = "os-jobs"
 version = "0.1.0"
 edition = "2024"
-description = "Reads and writes zip and tar archives for the terminal, in its container"
+description = "Reads and writes zip and tar archives for OS, in its container"
 
 [dependencies]
-terminal-worker-core = { path = "../core" }
+os-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

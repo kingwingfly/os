@@ -1,5 +1,5 @@
 [package]
-name = "terminal-worker-ui"
+name = "os-ui"
 version = "0.1.0"
 edition = "2024"
 
@@ -60,10 +60,10 @@ serde.workspace = true
 serde_json.workspace = true
 serde-wasm-bindgen = "0.6"
 gloo-net = "0.6"
-terminal-worker-core = { path = "../core" }
+os-core = { path = "../core" }
 # User space: the programs, over system calls (owner's design, 2026-10-29).
-abi = { package = "terminal-worker-abi", path = "../abi" }
-userland = { package = "terminal-worker-userland", path = "../userland" }
+abi = { package = "os-abi", path = "../abi" }
+userland = { package = "os-userland", path = "../userland" }
 console_error_panic_hook = "0.1"
 # Pipelines run commands that run commands (xargs, fd -x), and wait for answers to prompts.
 futures = "0.3"
@@ -77,4 +77,4 @@ ammonia = "4.2"
 csv = "1.4"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 pulldown-latex = "0.8"
-terminal-worker-preview = { path = "../preview" }
+os-preview = { path = "../preview" }

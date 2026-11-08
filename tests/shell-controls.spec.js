@@ -2,7 +2,7 @@ import { test, expect, request } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, entry, program, put } from './sys.js';
 import { browse } from './ui.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const password = 'shell-testing-password-621';
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -53,9 +53,9 @@ test('force skips only the minimum password length, preserving identity checks a
   expect((await api(f.user, 'passwd',{data:{username:'root',password:'1',force:true}})).status()).toBe(403);
   expect((await api(f.user, 'passwd',{data:{password:'1',current_password:'wrong',force:true}})).status()).toBe(401);
   for(const value of ['', 'x'.repeat(513)])expect((await api(f.user, 'passwd',{data:{password:value,current_password:password,force:true}})).status()).toBe(400);
-  const cookie=(await f.user.storageState()).cookies.find(c=>c.name==='terminal_session').value;
+  const cookie=(await f.user.storageState()).cookies.find(c=>c.name==='os_session').value;
   await ok(await api(f.user, 'passwd',{data:{password:'1',current_password:password,force:true}}));
-  expect((await(await api(f.guest, 'session',{headers:{Cookie:'terminal_session='+cookie}})).json()).username).toMatch(/^guest-[0-9a-f]{16}$/);
+  expect((await(await api(f.guest, 'session',{headers:{Cookie:'os_session='+cookie}})).json()).username).toMatch(/^guest-[0-9a-f]{16}$/);
   await ok(await api(f.guest, 'login',{data:{username:f.name,password:'1'}}));
   expect((await(await api(f.user, 'session')).json()).username).toBe(f.name);
  }finally{await f.cleanup();}

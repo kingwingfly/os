@@ -1,4 +1,4 @@
-# R2 Terminal
+# OS
 
 Organize content as files. Open it with commands.
 

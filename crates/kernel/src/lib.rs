@@ -12,9 +12,9 @@ mod xattr;
 use abi::{
     Call, Dirent, Errno, Error, O_ACCMODE, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, Stat, Time,
 };
+use os_core::parent;
+use os_core::permissions::*;
 use serde_json::{Value, json};
-use terminal_worker_core::parent;
-use terminal_worker_core::permissions::*;
 
 pub use namei::namei;
 

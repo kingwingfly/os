@@ -6,8 +6,8 @@ use crate::files::parsed;
 use crate::io::Io;
 use crate::sys::{Sys, call};
 use abi::{Call, Creds};
+use os_core::cli::{accounts as args, parse};
 use serde_json::Value;
-use terminal_worker_core::cli::{accounts as args, parse};
 
 /// An account as /etc/passwd lists it: its name, uid, login group and home.
 struct Account {

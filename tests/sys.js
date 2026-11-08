@@ -1,6 +1,6 @@
 // System calls from tests, as user space makes them (owner's design, 2026-10-29): what the tests
 // need to make, find and clean up files, now that the kernel's API is its system calls.
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const headers = { Origin: origin, 'Content-Type': 'application/json' };
 
 // `calls`, one batch, for the session of `request` (an APIRequestContext): each one's result,

@@ -543,7 +543,7 @@ fn listed(section: Section) -> Vec<(String, String)> {
 /// The manual's index, as Markdown: every command by section, then how the terminal works.
 pub fn index() -> String {
     let mut out = String::from(
-        "# Terminal Worker Manual\n\n`man COMMAND` opens a page; `COMMAND -h` shows it in short in the terminal; `help` lists every command. All paths are in this terminal's own filesystem: nothing runs on a host.",
+        "# OS Manual\n\n`man COMMAND` opens a page; `COMMAND -h` shows it in short in the terminal; `help` lists every command. All paths are in this terminal's own filesystem: nothing runs on a host.",
     );
     for section in Section::ALL {
         out.push_str(&format!(

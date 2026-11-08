@@ -121,7 +121,7 @@ const killedBy = signal => ({ code: 128 + signal, signal });
 const KILLED = 0x100, GRACE = 1000;
 
 // The processes this tab hosts, by pid: a signal to one, from any tab or device, is told on the
-// page's events line (app.js `terminal:signal`), and the tab that hosts it acts on it.
+// page's events line (app.js `os:signal`), and the tab that hosts it acts on it.
 const hosted = new Map();
 export const deliverSignal = ({ pid, signal }) => hosted.get(pid)?.signal(signal);
 

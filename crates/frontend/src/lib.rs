@@ -13,61 +13,61 @@ mod workers;
 use std::cell::RefCell;
 
 use leptos::prelude::*;
+use os_core::Entry;
 use shell::{Account, LogLine, Shell};
-use terminal_worker_core::Entry;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 #[wasm_bindgen]
 extern "C" {
-    #[wasm_bindgen(js_namespace = terminal)]
+    #[wasm_bindgen(js_namespace = os)]
     fn config() -> JsValue;
-    #[wasm_bindgen(js_namespace = terminal, js_name = open)]
+    #[wasm_bindgen(js_namespace = os, js_name = open)]
     pub(crate) fn open_file(path: &str, kind: &str) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = accountCommand)]
+    #[wasm_bindgen(js_namespace = os, js_name = accountCommand)]
     fn account_command(args: JsValue, cwd: &str) -> js_sys::Promise;
     /// sudo's authentication: whether the account may act as root now, its password asked for
     /// if it has not lately.
-    #[wasm_bindgen(js_namespace = terminal)]
+    #[wasm_bindgen(js_namespace = os)]
     fn sudo() -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = chooseFiles)]
+    #[wasm_bindgen(js_namespace = os, js_name = chooseFiles)]
     fn choose_files() -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = uploadFiles)]
+    #[wasm_bindgen(js_namespace = os, js_name = uploadFiles)]
     fn upload_files(files: &JsValue, path: &str, progress: &js_sys::Function) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = cancelUploads)]
+    #[wasm_bindgen(js_namespace = os, js_name = cancelUploads)]
     fn cancel_uploads() -> bool;
     /// Whether an upload goes on in this page, the terminal's or the Files': one at a time.
-    #[wasm_bindgen(js_namespace = terminal)]
+    #[wasm_bindgen(js_namespace = os)]
     fn uploading() -> bool;
-    #[wasm_bindgen(js_namespace = terminal, js_name = recordSound)]
+    #[wasm_bindgen(js_namespace = os, js_name = recordSound)]
     fn record_sound(
         path: Option<String>,
         name: Option<String>,
         acl: Option<String>,
         progress: &js_sys::Function,
     ) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = stopRecording)]
+    #[wasm_bindgen(js_namespace = os, js_name = stopRecording)]
     fn stop_recording() -> bool;
     /// present: /dev/present/NAME made of system calls (web/dev.mjs).
-    #[wasm_bindgen(js_namespace = terminal, js_name = presentFile)]
+    #[wasm_bindgen(js_namespace = os, js_name = presentFile)]
     fn present_file(path: &str, name: Option<String>) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = stopPresenting)]
+    #[wasm_bindgen(js_namespace = os, js_name = stopPresenting)]
     fn stop_presenting(name: &str) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = cancelChoosing)]
+    #[wasm_bindgen(js_namespace = os, js_name = cancelChoosing)]
     fn cancel_choosing() -> bool;
-    #[wasm_bindgen(js_namespace = terminal, js_name = setDirectory)]
+    #[wasm_bindgen(js_namespace = os, js_name = setDirectory)]
     fn set_directory(path: &str);
-    #[wasm_bindgen(js_namespace = terminal, js_name = focusInput)]
+    #[wasm_bindgen(js_namespace = os, js_name = focusInput)]
     fn focus_input();
-    #[wasm_bindgen(js_namespace = terminal, js_name = focusLaunchedProgram)]
+    #[wasm_bindgen(js_namespace = os, js_name = focusLaunchedProgram)]
     fn focus_launched_program();
-    #[wasm_bindgen(js_namespace = terminal, js_name = completionFocus)]
+    #[wasm_bindgen(js_namespace = os, js_name = completionFocus)]
     fn completion_focus(value: &str, cursor: u32);
-    #[wasm_bindgen(js_namespace = terminal, js_name = completionCursor)]
+    #[wasm_bindgen(js_namespace = os, js_name = completionCursor)]
     fn completion_cursor() -> u32;
     /// exec(2) of programs of /usr/bin, a pipeline of processes (web/wasi/exec.mjs), each
     /// stage an argv: the last's exit status, and what it wrote if not to the terminal.
-    #[wasm_bindgen(js_namespace = terminal)]
+    #[wasm_bindgen(js_namespace = os)]
     fn exec(stages: &JsValue, options: &JsValue) -> js_sys::Promise;
 }
 
@@ -142,10 +142,10 @@ fn upload_progress(entry: &Entry) -> Option<String> {
 }
 /// What programs write for a terminal: colours, styles and links show as they mean them.
 fn styled(text: String) -> AnyView {
-    if !terminal_worker_core::ansi::escaped(&text) {
+    if !os_core::ansi::escaped(&text) {
         return text.into_any();
     }
-    terminal_worker_core::ansi::parse(&text)
+    os_core::ansi::parse(&text)
         .into_iter()
         .map(|run| {
             let style = run.style.css();
@@ -179,7 +179,7 @@ thread_local! {
     static TABS: RefCell<Option<Tabs>> = const { RefCell::new(None) };
 }
 /// Where the tabs are kept for this browser tab, across reloads.
-const SAVED: &str = "terminal-tabs";
+const SAVED: &str = "os-tabs";
 pub(crate) fn session_storage() -> Option<web_sys::Storage> {
     // Storage can be missing or refused, as in private windows; tabs then are not kept.
     web_sys::window()?.session_storage().ok().flatten()
@@ -320,11 +320,8 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
 #[component]
 fn App() -> impl IntoView {
     let branding: serde_json::Value =
-        serde_wasm_bindgen::from_value(config()).expect("terminal branding");
-    let title = branding["name"]
-        .as_str()
-        .unwrap_or("R2 TERMINAL")
-        .to_owned();
+        serde_wasm_bindgen::from_value(config()).expect("OS branding");
+    let title = branding["name"].as_str().unwrap_or("OS").to_owned();
     let subtitle = branding["subtitle"].as_str().unwrap_or("").to_owned();
     let heading = branding["heading"].as_str().unwrap_or("").to_owned();
     let description = branding["description"].as_str().unwrap_or("").to_owned();
@@ -380,7 +377,7 @@ fn App() -> impl IntoView {
                 active.set(shell.id);
             }
             desktop.show("terminal");
-            shell.run(terminal_worker_core::completion::escape_path(&path));
+            shell.run(os_core::completion::escape_path(&path));
             focus_launched_program();
             Ok(())
         }),
@@ -471,7 +468,7 @@ fn App() -> impl IntoView {
     );
     let window = web_sys::window().unwrap();
     window
-        .add_event_listener_with_callback("terminal:changed", listener.as_ref().unchecked_ref())
+        .add_event_listener_with_callback("os:changed", listener.as_ref().unchecked_ref())
         .unwrap();
     listener.forget();
     // What the kernel told of the directories this page watches: their answers go at once,
@@ -483,7 +480,7 @@ fn App() -> impl IntoView {
         CHANGED.with(|changed| changed.borrow_mut().extend(dirs));
     });
     window
-        .add_event_listener_with_callback("terminal:inotify", told.as_ref().unchecked_ref())
+        .add_event_listener_with_callback("os:inotify", told.as_ref().unchecked_ref())
         .unwrap();
     told.forget();
     let remote = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_: web_sys::CustomEvent| {
@@ -493,7 +490,7 @@ fn App() -> impl IntoView {
         }
     });
     window
-        .add_event_listener_with_callback("terminal-remote", remote.as_ref().unchecked_ref())
+        .add_event_listener_with_callback("os-remote", remote.as_ref().unchecked_ref())
         .unwrap();
     remote.forget();
     // Files dropped on the page upload in the active tab; dropped on the Files, into its
@@ -503,7 +500,7 @@ fn App() -> impl IntoView {
             current.get_untracked().upload_dropped(e.detail());
         });
     window
-        .add_event_listener_with_callback("terminal-files", dropped.as_ref().unchecked_ref())
+        .add_event_listener_with_callback("os-files", dropped.as_ref().unchecked_ref())
         .unwrap();
     dropped.forget();
     let dropped_on_files =

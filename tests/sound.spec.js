@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, call, entry, errno, names, program, put, rmrf, sys } from './sys.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const vars = await readFile('.dev.vars', 'utf8');
 const rootPassword = vars.match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 // Whether the site has a Realtime app: its keys are named in .dev.vars (their values are not

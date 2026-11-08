@@ -1,6 +1,6 @@
 //! DOM rendering and keyboard encoding for the client kernel's terminal device.
 use leptos::prelude::*;
-use terminal_worker_core::ansi::screen::Screen;
+use os_core::ansi::screen::Screen;
 
 pub fn view(screen: RwSignal<Screen>, live: RwSignal<bool>) -> impl IntoView {
     view! {

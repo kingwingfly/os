@@ -3,8 +3,8 @@
 //! link led to has its own), links on the way followed, and the last one too if asked.
 use crate::{Fs, permission};
 use abi::{Errno, Error, MAXSYMLINKS, NAME_MAX, PATH_MAX};
+use os_core::permissions::*;
 use std::collections::VecDeque;
-use terminal_worker_core::permissions::*;
 
 /// What a path names: the physical path of its last part, every link on the way followed, and
 /// the last one too if asked; and the node there, if there is one.

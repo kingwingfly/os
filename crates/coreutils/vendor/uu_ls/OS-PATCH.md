@@ -7,7 +7,7 @@ The original MIT license is retained in LICENSE. Cargo selects this copy through
 
 WASI preview 1 lacks uid, gid, Unix modes and ACL metadata. Upstream's non-Unix
 fallback prints placeholder owners and synthesized permissions. The platform patch
-uses `terminal-worker-posix` to read stat/lstat through the existing OS ABI, with
+uses `os-posix` to read stat/lstat through the existing OS ABI, with
 the executable's credentials. It caches the result per PathData, reports failures
 instead of inventing ownership, and supplies ownership, link counts, permission
 bits, ACL markers and executable suffixes to upstream formatting.

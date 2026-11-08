@@ -4,7 +4,7 @@ import { api } from './sys.js';
 
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const executable = { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '60'], env: [], cwd: '/' };
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 async function batch(request, calls, options = {}) {
   calls = calls.map(call => call.kill ? { kill: { ...call.kill, pid: String(call.kill.pid) } } : call.wait ? { wait: { ...call.wait, pid: String(call.wait.pid) } } : call);
   const response = await request.post('/api/sys', { headers: { 'X-Registry': '1', Origin: origin }, data: { calls, ...options } });

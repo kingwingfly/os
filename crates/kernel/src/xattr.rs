@@ -5,9 +5,9 @@
 //! programs of user space, as on Linux. An ACL's value is its entries, as JSON.
 use crate::{Fs, existing, permission};
 use abi::{ACL_ACCESS, ACL_DEFAULT, Errno, Error, XATTR_CREATE, XATTR_REPLACE};
-use terminal_worker_core::acl::Entries;
-use terminal_worker_core::permissions::*;
-use terminal_worker_core::xattr::{NAME_MAX, TOTAL_MAX, VALUE_MAX};
+use os_core::acl::Entries;
+use os_core::permissions::*;
+use os_core::xattr::{NAME_MAX, TOTAL_MAX, VALUE_MAX};
 
 type Result<T> = std::result::Result<T, Error>;
 

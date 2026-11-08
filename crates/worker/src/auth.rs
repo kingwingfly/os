@@ -1,13 +1,15 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
+use os_core::permissions::{Identity, Session, Store, User, is_guest_id};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use terminal_worker_core::permissions::{Identity, Session, Store, User, is_guest_id};
 use wasm_bindgen::prelude::*;
 use worker::*;
-pub const COOKIE: &str = "terminal_session";
+pub const COOKIE: &str = "os_session";
 /// A browser signed out, each its own session, all acting as guest: what keeps its descriptors.
-pub const GUEST_COOKIE: &str = "terminal_guest";
+pub const GUEST_COOKIE: &str = "os_guest";
+pub const LEGACY_COOKIE: &str = "terminal_session";
+pub const LEGACY_GUEST_COOKIE: &str = "terminal_guest";
 pub const TTL: u64 = 8 * 60 * 60;
 #[wasm_bindgen(inline_js = "
 export function randomToken() { const bytes=crypto.getRandomValues(new Uint8Array(32)); return Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join(''); }
@@ -28,13 +30,41 @@ pub fn clock() -> (u64, u32) {
     (ms / 1000, (ms % 1000) as u32 * 1_000_000)
 }
 /// The token of the cookie `name` the request carries, if it is one (64 hexadecimal digits).
-pub fn cookie_token(req: &Request, name: &str) -> Option<String> {
+fn raw_cookie(req: &Request, name: &str) -> Option<String> {
     let cookies = req.headers().get("Cookie").ok()??;
     let token = cookies
         .split(';')
         .map(str::trim)
         .find_map(|s| s.strip_prefix(&format!("{name}=")))?;
-    (token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())).then(|| token.to_string())
+    Some(token.to_string())
+}
+fn valid_token(token: String) -> Option<String> {
+    (token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())).then_some(token)
+}
+/// Only migrate when the new cookie is absent. An invalid new cookie must not revive an
+/// older identity, and a login/logout response must take precedence over migration.
+pub fn legacy_cookie_token(req: &Request, name: &str) -> Option<String> {
+    if raw_cookie(req, name).is_some() {
+        return None;
+    }
+    let old = match name {
+        COOKIE => LEGACY_COOKIE,
+        GUEST_COOKIE => LEGACY_GUEST_COOKIE,
+        _ => return None,
+    };
+    raw_cookie(req, old).and_then(valid_token)
+}
+pub fn cookie_token(req: &Request, name: &str) -> Option<String> {
+    match raw_cookie(req, name) {
+        Some(token) => valid_token(token),
+        None => legacy_cookie_token(req, name),
+    }
+}
+pub fn expire_cookie(https: bool, name: &str) -> String {
+    format!(
+        "{name}=; Path=/api; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        if https { "; Secure" } else { "" }
+    )
 }
 /// The stored key of the request's session token: its hash, so stored keys cannot sign in.
 pub fn token_key(req: &Request) -> Option<String> {
