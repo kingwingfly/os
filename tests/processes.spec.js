@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './test.js';
 
 // Processes of /usr/bin (web/wasi/exec.mjs): a pipeline's run at once, through pipes in memory the
 // page shares with them, which it may only when isolated from other sites (web/_headers); the

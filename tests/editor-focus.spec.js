@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './test.js';
 import { fakeKernel } from './sys.js';
 
 // Keep this regression independent of local accounts, passwords and stored files.

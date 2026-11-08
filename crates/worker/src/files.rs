@@ -180,6 +180,10 @@ async fn by_token(
 /// taken for `TOKEN_FRESH` seconds. A file still uploading is read as it arrives: the response
 /// waits for each chunk not uploaded yet.
 pub async fn read(req: Request, env: &Env) -> Result<Response> {
+    let compile = param(&req, "compile")?;
+    if !compile.is_empty() && compile != crate::compiler::VERSION {
+        return error_response("Unknown compiler version", 400);
+    }
     let token = param(&req, "token")?;
     let query = format!("path={}", encode(&param(&req, "path")?));
     let grant: serde_json::Value = if token.is_empty() {
@@ -225,6 +229,27 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
         return env.assets("ASSETS")?.fetch_request(request).await;
     }
     let grant: Grant = serde_json::from_value(grant)?;
+    if !compile.is_empty() {
+        if req.method() != Method::Get || grant.state != "complete" || grant.size > abi::EXEC_MAX {
+            return error_response("Not a complete executable image", 400);
+        }
+        let reader = Reader {
+            bucket: env.bucket("FILES")?,
+            env: env.clone(),
+            cookie: req.headers().get("Cookie")?,
+            proc: req.headers().get("X-Process-Token")?,
+            query,
+            complete: true,
+            chunks: grant.chunks.iter().cloned().collect(),
+            file: grant.file.clone(),
+        };
+        let bytes = Response::from_body(ResponseBody::Stream(reader.stream(
+            grant.chunk_size,
+            0,
+            grant.size.saturating_sub(1),
+        )))?;
+        return crate::compiler::image(env, &grant.file, bytes).await;
+    }
     let headers = Headers::new();
     headers.set("Content-Type", &grant.mime)?;
     headers.set("Accept-Ranges", "bytes")?;

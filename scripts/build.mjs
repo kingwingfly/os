@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdir, readFile, writeFile, readdir, stat, realpath } from 'node:fs/promises';
+import { rm, mkdir, readFile, writeFile, readdir, stat, realpath } from 'node:fs/promises';
 import { resolve, dirname, join, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -64,11 +64,10 @@ await build({ absWorkingDir: root, entryPoints: { bridge: 'web/app.js' },
 // The WASI engine's process, a Worker of its own (web/wasi/process.js), and /usr/bin's binary:
 // uutils' coreutils, built for wasm32-wasip1 (rustup target add wasm32-wasip1).
 await build({ absWorkingDir: root, entryPoints: { 'wasi-process': 'web/wasi/process.js' }, bundle: true, format: 'iife', outdir: out, minify: true });
-// The loader's asyncify, a module Worker (web/kernel/asyncify-worker.js), and binaryen, which it
-// loads only when an image that forks is first run.
-await build({ absWorkingDir: root, entryPoints: { 'wasi-asyncify': 'web/kernel/asyncify-worker.js' }, bundle: true, format: 'esm', outdir: out, minify: true, external: ['/binaryen.js'] });
-await copy('node_modules/binaryen/index.js', join(out, 'binaryen.js'));
-// The client kernel (crates/client-kernel), a classic SharedWorker: no-modules wasm-bindgen,
+await build({ absWorkingDir: root, entryPoints: { 'executor-host': 'web/kernel/executor.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
+// Compiler code belongs to the server container. Remove stale browser artifacts after upgrades.
+for (const name of ['wasi-asyncify.js', 'binaryen.js']) await rm(join(out, name), { force: true });
+// The client kernel (crates/client-kernel), a classic dedicated Worker: no-modules wasm-bindgen,
 // imported by web/kernel/client.js, with the page's protocol module bundled into the bridge.
 run('cargo', ['build', '-p', 'terminal-worker-client-kernel', '--target', 'wasm32-unknown-unknown', '--release']);
 run('wasm-bindgen', ['--target', 'no-modules', '--no-typescript', '--out-dir', out, '--out-name', 'client_kernel', join(target, 'wasm32-unknown-unknown/release/terminal_worker_client_kernel.wasm')]);

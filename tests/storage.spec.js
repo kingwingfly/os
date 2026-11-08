@@ -1,4 +1,4 @@
-import { test, expect, request as playwrightRequest } from '@playwright/test';
+import { test, expect, request as playwrightRequest } from './test.js';
 import { readFile } from 'node:fs/promises';
 import http from 'node:http';
 import { api, errno, listing, mkdirp, put, rmrf, sys } from './sys.js';

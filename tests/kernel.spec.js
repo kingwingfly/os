@@ -1,14 +1,14 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './test.js';
 
-// The client kernel (crates/client-kernel, web/kernel/client.js): one SharedWorker per browser,
-// the processes its tabs host, and their record in the browser's machine (a Durable Object of
-// its own), which asks the worker kernel only of execve. A page's port is the versioned
+// The client kernel (crates/client-kernel, web/kernel/client.js): one dedicated Worker per tab,
+// its processes, and their record in the browser's machine (a Durable Object of its own),
+// which asks the authority for execve and tokenless account checks. A page's port is the versioned
 // envelope web/kernel/protocol.js speaks.
 
-// A page's port to the browser's one client kernel, kept on the page so calls can follow.
+// A page's port to its own client kernel, kept on the page so calls can follow.
 async function connect(page) {
   await page.evaluate(() => {
-    const port = new SharedWorker('/client-kernel.js').port;
+    const port = new Worker('/client-kernel.js');
     const pending = new Map();
     let next = 0;
     port.onmessage = ({ data }) => {
@@ -17,7 +17,6 @@ async function connect(page) {
         pending.delete(data.id);
       }
     };
-    port.start();
     window.__kernel = (type, args = {}) => new Promise(resolve => {
       const id = ++next;
       pending.set(id, resolve);
@@ -49,7 +48,7 @@ async function sys(page, calls, options = {}) {
 
 const ENV = ['PWD=/', 'HOME=/guest', 'PATH=/usr/bin', 'LANG=C.UTF-8'];
 
-test('two tabs share one client kernel, and each sees the other tab\'s process', async ({ browser }) => {
+test('two dedicated kernels share one machine, and each sees the other tab\'s process', async ({ browser }) => {
   const context = await browser.newContext();
   const one = await context.newPage();
   const two = await context.newPage();
@@ -75,8 +74,9 @@ test('two tabs share one client kernel, and each sees the other tab\'s process',
   expect(seen[0].uid).toBe(creds.ok.uid);
   // End it, and let the namespace reap it.
   value(await call(one, 'exit', { pid: running.pid, status: 0 }));
-  const zombie = value(await call(two, 'poll', { pids: [running.pid] }));
-  expect(zombie[0].state).toBe('zombie');
+  // Lifecycle reports are batched by the hosting kernel; another kernel observes them once
+  // the Machine receives the batch.
+  await expect.poll(async () => value(await call(two, 'poll', { pids: [running.pid] }))[0]?.state).toBe('zombie');
   const reaped = value(await call(two, 'wait', { pid: running.pid }));
   expect(reaped.status).toBe(0);
   expect(value(await call(one, 'poll', { pids: [running.pid] }))).toEqual([]);
@@ -140,9 +140,8 @@ test('the protocol is versioned: another version, an unknown call and a refusal 
   await page.goto('/');
   await connect(page);
   const foreign = await page.evaluate(() => new Promise(resolve => {
-    const port = new SharedWorker('/client-kernel.js').port;
+    const port = new Worker('/client-kernel.js');
     port.onmessage = ({ data }) => resolve(data);
-    port.start();
     port.postMessage({ v: 2, id: 1, type: 'init' });
   }));
   expect(foreign).toMatchObject({ v: 1, id: 1, err: { errno: 'EPROTO' } });

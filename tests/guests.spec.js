@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './test.js';
 
 // Signed-out browsers are each `guest-<uuid>:guest` (owner's decision, 2026-11-01): a uid of
 // their own from the anonymous range, so what they make in the shared /guest is theirs, and

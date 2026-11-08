@@ -55,7 +55,9 @@ pub async fn handle(
     // The session was heard from: its descriptors are kept (a process's, its line's), and a
     // page's keeps those of the processes its tabs run, whatever account they run as.
     let renewing = session.clone();
+    let count = batch.calls.len() as u64;
     transact(state, move |db| {
+        db.observe("syscalls", count);
         let Ok(acting) = renewing.of(db) else {
             return ((), false);
         };
@@ -366,6 +368,16 @@ async fn bytes(
             format!("a batch carries at most {INLINE_MAX} bytes a call"),
         )
     };
+    let requested = match &call {
+        Call::Pread { count, .. } => ("read_bytes_requested", *count),
+        Call::Pwrite { data, .. } => ("write_base64_bytes_requested", data.len() as u64),
+        _ => ("bytes", 0),
+    };
+    transact(state, move |db| {
+        db.observe(requested.0, requested.1);
+        ((), true)
+    })
+    .map_err(io)?;
     match call {
         Call::Pread {
             fd,

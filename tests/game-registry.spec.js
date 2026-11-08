@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './test.js';
 import { fakeKernel } from './sys.js';
 test('uploaded manifests cannot select unregistered or prototype game entries', async ({ page }) => {
   await page.route('**/api/sys', fakeKernel({ '/unregistered.game': { size: 64 } }));

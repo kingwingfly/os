@@ -994,6 +994,7 @@ async function fork() {
   let state;
   try { state = forkState(); } catch (err) { return { errno: err instanceof Errno ? err.errno : EIO }; }
   const snapshot = engine.snapshot();
+  snapshot.initializing = initializing;
   postMessage({ fork: { ...state, snapshot, snapshots, shares: shares.buffer, argv: process.argv, env: environ, cwd: process.cwd, wasix: process.wasix } }, [snapshot.memory]);
   const { forked } = await next('forked');
   if (forked.errno) return { errno: ERRNO[forked.errno] ?? EIO };
@@ -1017,6 +1018,7 @@ function next(key) {
 }
 // Instantiate `module`: a memory of the type it imports (`type`), or its own; a fork's child's,
 // as large as its parent's (`snapshot`), which it becomes.
+let initializing = false;
 async function instantiate(module, type, snapshot, startSection = false) {
   suspending = capable && !startSection;
   const pages = snapshot ? snapshot.memory.byteLength / 65536 : 0;
@@ -1040,6 +1042,7 @@ async function instantiate(module, type, snapshot, startSection = false) {
   if (!(memory instanceof WebAssembly.Memory)) throw new Error('the module exports no memory');
   process.wasix = WebAssembly.Module.imports(module).some(entry => entry.module === 'wasix_32v1');
   engine = snapshot ? Engine.child(instance, () => memory, snapshot) : new Engine(instance, () => memory);
+  initializing = snapshot ? !!snapshot.initializing : !!instance.exports.__tw_initialize;
 }
 // The calls that never ask the kernel (arguments, clocks, randomness, descriptors' numbers,
 // the working directory, fork and setjmp, and those its host answers in shared memory): they
@@ -1066,7 +1069,8 @@ function suspendable(namespace) {
 async function run() {
   for (;;) {
     try {
-      const start = suspending ? WebAssembly.promising(instance.exports._start) : instance.exports._start;
+      const entry = initializing ? instance.exports.__tw_initialize : instance.exports._start;
+      const start = suspending ? WebAssembly.promising(entry) : entry;
       await start();
     } catch (err) {
       if (!(err instanceof Replaced)) throw err;
@@ -1074,7 +1078,12 @@ async function run() {
       continue;
     }
     const pending = engine.unwound();
-    if (!pending) return 0;
+    if (!pending) {
+      if (!initializing) return 0;
+      initializing = false;
+      engine.top = engine.stackPointer();
+      continue;
+    }
     if (pending.kind === 'fork') engine.rewind(await fork());
     else if (pending.kind === 'checkpoint') {
       // The stack, and the shadow stack it ran on, as setjmp saw them.

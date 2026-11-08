@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+import { withoutJspi } from './transport.js';
+import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, call, mkdirp, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
@@ -106,15 +107,10 @@ test('an uploaded wasm runs by its path, with the working directory, environment
 function processCalls(page) {
   const kinds = new Set();
   page.context().on('request', request => {
-    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/sys' && (request.postData() ?? '').includes('"proc":')) kinds.add(request.resourceType());
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/sys' && !request.headers()['x-registry'] && JSON.parse(request.postData() || '{}').proc) kinds.add(request.resourceType());
   });
   return kinds;
 }
-// A browser without JSPI, as a process's Worker sees it.
-const withoutJspi = page => page.route('**/wasi-process.js', async route => {
-  const response = await route.fetch();
-  await route.fulfill({ response, body: 'delete WebAssembly.Suspending; delete WebAssembly.promising;\n' + await response.text() });
-});
 const hasJspi = page => page.evaluate(() => typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function');
 
 for (const jspi of [true, false]) test(`a process writes a file larger than a batch carries, through its own descriptor (${jspi ? 'JSPI' : 'synchronous XHR'})`, async ({ page, request }) => {

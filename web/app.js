@@ -3,7 +3,7 @@ import { uploadFile, Cancelled } from './upload.mjs';
 import { record, clock } from './record.mjs';
 import { speak, listen as hearLive } from './sound.mjs';
 import * as dev from './dev.mjs';
-import { exec } from './wasi/exec.mjs';
+import { exec } from './kernel/page.js';
 import { kernelCall } from './kernel/protocol.js';
 import { answered as resultOf, call, sys } from './http.mjs';
 

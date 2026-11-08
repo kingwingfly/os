@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { crc32, gzipSync } from 'node:zlib';
 import { api, mkdirp, put, rmrf } from './sys.js';

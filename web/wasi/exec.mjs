@@ -9,7 +9,7 @@
 // another, each given what the one before wrote, and nothing reads the terminal.
 import { PAGE, Pipe, pipeBuffer } from './pipe.js';
 import { Bytes, Shares } from './shared.js';
-import { kernelCall } from '../kernel/protocol.js';
+const kernelCall = (type, args) => globalThis.kernelRequest(type, args);
 import { load } from '../kernel/loader.js';
 import { STRERROR } from '../http.mjs';
 
@@ -122,21 +122,21 @@ const KILLED = 0x100, GRACE = 1000;
 // The processes this tab hosts, by pid: a signal to one, from any tab or device, is told on the
 // page's events line (app.js `terminal:signal`), and the tab that hosts it acts on it.
 const hosted = new Map();
-globalThis.addEventListener?.('terminal:signal', ({ detail }) => hosted.get(detail?.pid)?.signal(detail.signal));
+export const deliverSignal = ({ pid, signal }) => hosted.get(pid)?.signal(signal);
 
-// How many columns the terminal's transcript has, for programs that lay out their output.
-function columns() {
-  const transcript = document.querySelector('.transcript') ?? document.body;
-  // A line of the transcript's own, measured.
-  const probe = document.createElement('pre');
-  probe.textContent = '0'.repeat(10);
-  probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;width:auto';
-  transcript.append(probe);
-  const width = probe.getBoundingClientRect().width / 10 || 12;
-  probe.remove();
-  const style = getComputedStyle(transcript);
-  const inner = transcript.clientWidth - parseFloat(style.paddingLeft || 0) - parseFloat(style.paddingRight || 0);
-  return Math.max(20, Math.floor((inner || 800) / width));
+let reconciling;
+export function reconcile() {
+  if (!hosted.size) return Promise.resolve();
+  return reconciling ??= kernelCall('sync').then(rows => {
+    const found = new Map(rows.map(row => [row.pid, row]));
+    for (const [pid, process] of hosted) {
+      const row = found.get(pid);
+      if (!row) process.signal(SIG.KILL);
+      else if (row.state === 'zombie') process.signal(row.signal ?? SIG.TERM);
+      else if (row.state === 'stopped') process.signal(SIG.STOP);
+      else if (process.stopped) process.signal(SIG.CONT);
+    }
+  }).catch(() => {}).finally(() => { reconciling = null; });
 }
 
 // The terminal's input, which the page writes typed lines to: what does not fit yet waits, and
@@ -185,7 +185,7 @@ export async function exec(stages, options = {}) {
   const onState = state => { if (!finished) options.onState?.(state); };
   const env = piped => ({
     PWD: cwd, HOME: home, USER: user, LOGNAME: user, PATH: '/usr/bin', SHELL: '/usr/bin/sh', LANG: 'C.UTF-8',
-    TERM: piped ? 'dumb' : 'xterm-256color', COLUMNS: String(columns()),
+    TERM: piped ? 'dumb' : 'xterm-256color', COLUMNS: String(options.columns ?? 80),
     TZ: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
   });
   const last = stages.length - 1, isolated = globalThis.crossOriginIsolated;
@@ -216,6 +216,7 @@ export async function exec(stages, options = {}) {
     const live = group().filter(process => !process.ended);
     const now = live.length && live.every(process => process.stopped) ? 'stopped' : 'running';
     if (now !== state) { state = now; onState(now); }
+    onJob(job);
   };
   onJob(job);
   // What a process writes when not to the terminal: the next one's, or the last's reader's,
@@ -401,6 +402,7 @@ export async function exec(stages, options = {}) {
       const process = host({ pid: image.pid, token: image.token, ppid: 1, module, memory, startSection, argv, write, forked: false,
         start: { env: environment, cwd, stdin: io.stdin.message, stdout: io.stdout.message }, files: isolated ? line() : null });
       processes.push(process);
+      changed();
       return process;
     } catch (error) {
       // Whatever was made for the stage ends here: no process may outlive a host that never

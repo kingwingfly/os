@@ -374,17 +374,17 @@ A name runs the terminal's program, or uutils' where it has none; `/usr/bin/NAME
 
 ### The client kernel
 
-The kernel split puts a client kernel in the browser: a SharedWorker holds the processes its
-tabs host and their tokens, while a page-owned worker hosts processes, SAB pipes and terminal
-input. The kernel is Rust (`crates/client-kernel`), built to wasm and imported by
+Each tab runs a dedicated client-kernel Worker that owns its process Workers, tokens, SAB
+pipes and terminal input buffers. The page sends commands and input, and renders output.
+SharedWorker is optional infrastructure and owns no process state. The kernel is Rust (`crates/client-kernel`), built to wasm and imported by
 `web/kernel/client.js`; the page talks to it through the versioned envelope in
 `web/kernel/protocol.js`. Two tabs of one browser are one namespace and see each other's
 processes.
 
 **Each browser is a machine of its own.** The process table is not the filesystem's: each
 browser's namespace has a Durable Object of its own (`Machine`, `crates/worker/src/machine.rs`,
-with the registry in `procs.rs`), so processes never wait on the one authority that keeps the
-files. Tokenless registry operations ask the authority for the current account once per
+with the registry in `procs.rs`). Token-authorized process bookkeeping stays on that machine.
+Tokenless registry operations ask the authority for the current account once per
 batch. For `execve`, the authority (`creds.rs`) checks the path, execute bit and caller,
 records the process credentials by its token's hash, and answers how to read the image. A pipeline's stages are one `execve` request. The rest of a process's life
 happens in the client kernel, as in a Linux kernel:
@@ -424,22 +424,26 @@ forwarded there by the authority, with the caller it found. In the client kernel
 its host's (the tab that executed it): only that tab forks it, replaces its image, ends it,
 waits for its children, or signals as it; a process's own `proc_signal` is allowed or refused by
 its own credentials, not by whoever the page is signed in as now. `/proc` lists the machine's
-processes. Coreutils runs through this path: the page asks the client kernel for the processes,
-then runs each as a Worker whose batches carry the process's pid and token.
+processes. Coreutils runs through this path: the page asks the client kernel to run the pipeline,
+and the kernel starts process Workers whose batches carry each process's pid and token.
 
 **Any wasm can fork** (Phase 3). A program built for WASIX runs in the terminal's own process
 Workers (`web/wasi/process.js`), with WASIX's process calls over the client kernel:
 - **fork:** the loader gives an image that imports `proc_fork`, `stack_checkpoint` or
-  `stack_restore` binaryen's asyncify as it loads (`web/kernel/asyncify.js`, in a Worker, limited
-  to those imports, kept by content in the browser's cache). A fork unwinds the image, and the
-  page starts the child in a Worker of its own with a copy of the memory, the mutable globals and
+  `stack_restore` Binaryen's Asyncify through the existing `/api/file` byte route. A separate
+  compiler container transforms once per immutable content and compiler version; R2 holds
+  the result for at most seven days; deleting the original content also schedules its compiled
+  versions for deletion. Access to the original image is authorized before every cache hit. The browser
+  downloads no Binaryen bundle. Scratch occupies a separate wasm memory, preserving fixed
+  and exhausted guest memory limits. Initialization runs on exec; a fork resumes its snapshot.
+  A fork unwinds the image, and the dedicated kernel starts the child in a Worker of its own with a copy of the memory, the mutable globals and
   what its tables hold (the transform exports them, with a table of every function); both rewind
   (`web/wasi/fork.js`). The pid is the client kernel's, lent ahead.
 - **execve:** `proc_exec` replaces the process's image in place: its pid, credentials and open
   descriptors stay, as Linux's do. Only the process can ask, by its token; the authority keeps the
   credentials it had and hands the descriptors on (`credentials.owner`).
 - **wait:** `proc_join` waits for a child, or any, with its exit status or signal (wait4); an
-  orphan is init's, and the page reaps it as it ends.
+  orphan is init's, and its kernel reaps it as it ends.
 - **Open files a fork shares:** each open file is one, as Linux's struct file is. A table every
   process of a line shares counts each process's descriptors of it and keeps its offset, which a
   read or a write holds a lock of from choosing it to moving it; only the last close closes it,
@@ -454,8 +458,9 @@ Workers (`web/wasi/process.js`), with WASIX's process calls over the client kern
 - **Blocking calls on JSPI** (change request 4): where the browser has JavaScript Promise
   Integration (Chrome 137+, Firefox), a call that asks the kernel (a file's, a directory's,
   `terminal.sys`, an execve's search of PATH) suspends the image on a fetch, and the Worker is
-  free while it is answered; elsewhere, and for an image with a start function (which runs as
-  it is instantiated, where nothing can be suspended), it is a synchronous XHR. What waits on
+  free while it is answered; elsewhere, and for an untransformed image with a start function
+  (which runs as it is instantiated, where nothing can be suspended), it is a synchronous XHR.
+  Transformed fork images run initialization explicitly and can suspend it. What waits on
   shared memory still blocks the Worker either way: a pipe's read or write, a sleep, a stop, a
   wait for a child, an execve's answer from its host. Asyncify stays only for fork, setjmp and
   longjmp, as a JSPI suspension cannot be copied into a child.
@@ -491,19 +496,36 @@ cross-origin-isolated module Worker; asyncify-at-load transforms an uninstrument
 with binaryen in both. Details are in `AGENT.md` and issue #20.
 
 **Where the kernel runs, and what a gone tab leaves.**
-- **One kernel, either worker:** the client kernel is the browser's SharedWorker where it has one. Where it has none (Chrome for Android before 148), it is each tab's own dedicated Worker, on the same namespace, so commands run either way.
+- **One kernel per tab:** every tab uses a dedicated Worker on the same Machine namespace. `TW_NO_SHARED_WORKER=1` deletes SharedWorker in every test context, including contexts created by tests.
 - **Tab locks:** each tab holds the Web Lock `tw-tab-<tab>` while it lives, taken before it asks anything. Each process records its tab as its seat (`execve`'s `seat`).
-- **Reaping:** a process whose seat's lock is free was left by a tab that closed, crashed or reloaded while it ran. The kernel requests cleanup where it waits on that tab's lock, and at boot or EAGAIN, by checking held locks. The machine permits cleanup only for the current account's processes or root.
-- **No reaping by boot:** a kernel reaps by boot id only where tabs have no Web Locks, so a tab's own kernel never reaps another tab's processes.
+- **Reaping:** a process whose seat's lock is free was left by a tab that closed, crashed or reloaded while it ran. The kernel requests cleanup at boot, periodically and on EAGAIN by checking held locks. The machine permits cleanup only for the current account's processes or root.
+- **No reaping by boot:** dedicated kernels send no reset boot id. A new tab cannot reap another live tab's processes. Without Web Locks, the server lease supplies cleanup.
 - **Kernel locks:** each kernel holds `tw-kernel-<id>` while it runs, and its lent pids are its own; a kernel that finds another's lock free gives what that one was lent back to the namespace.
 - **`/proc`:** it shows the caller's namespace, as a Linux PID namespace does: every process of it for root, an account's own otherwise, and init, root's, for everyone.
+
+Process hosts reconcile registry state every five seconds and after events reconnect, using
+`ProcKeep` proofs for only the processes they own. This remains valid across login/logout.
+A host lease lasts 30 minutes; a Machine alarm kills and reaps abandoned processes. Process
+credentials expire after an hour and renew in batches every ten minutes; revoked or expired
+tokens cannot be revived. Job credentials expire after at most a week. Authority alarms close
+descriptors when credentials expire. Inactive guests are pruned after 30 days only if they own
+no inodes, live credentials or job records. Pruned guest UIDs are never assigned to another
+browser, since another owner's named ACL may still refer to them.
+
+`placement.rs` defines local browser and container placement labels. Process/exec results and
+credential snapshots carry cluster, executor and cgroup metadata; those labels grant no
+permission. Descriptors remain tied to the credential lineage that opened them. `ProcInit`
+returns feature flags, lease duration and Machine counters; the authority also counts syscall
+and inline byte requests. `abi::Completion` reserves the request/index/result representation
+for future asynchronous queues. Cluster execution and completion queues remain disabled;
+cgroup enforcement, PTYs and real init remain later phases.
 
 ## Roadmap
 
 The next steps agreed in issue #20, and the ideas recorded for later.
 
 - **WASIX beyond processes:** threads (`thread_spawn`, futexes that wait), signal handlers (`callback_signal`), ttys and sockets answer ENOSYS or do nothing yet. The approved `dash` fixture's libc (2023) starts at `/` whatever the process's directory, and does not flush a `printf` to a file or a pipe; a current WASIX libc asks the runtime (`getcwd`).
-- **Asyncify on the server:** asyncify is made once per content in each browser and kept in its cache; making it once per content on the server, for every browser, would spare each its first load of binaryen.
+- **Compile pipeline:** `ModuleCompiler` owns the server transform/cache, separately from the filesystem authority. Its container parses modules without executing them, with input/output limits and a timeout. Bump `compiler::VERSION` when changing the transform or Binaryen version.
 - **GUI programs:** the WASI graphics proposal (`wasi:webgpu`, `wasi:surface`, `wasi:frame-buffer`), implemented in each process's Worker on WebGPU and a canvas handed over from the compositor's window. `/dev/display` is the permission gate. Web content runs in sandboxed frames, since a browser cannot run as a wasm process.
 - **Mounts and clusters:** a directory of the user's device mounted live, shared across devices and sessions peer to peer, or through a Cloudflare relay. Map/reduce across opted-in clients and Containers (the h264 to av1 example). Bytes go through a relay Durable Object per mount or cluster, never through the authority.
 - **io_uring-style queues:** a batch is already a submission queue of calls. A completion ring in shared memory, with calls completing out of order, would let a program keep many calls in flight without waiting on each, as `ls` over uutils makes tens of calls.
@@ -534,7 +556,7 @@ The next steps agreed in issue #20, and the ideas recorded for later.
 | `web/editor.mjs` | Lazy-loaded CodeMirror editor |
 | `web/faststart.mjs` | MP4 structural inspection |
 | `scripts/` | Local setup, frontend build, sample seeding |
-| `wrangler.toml` | Worker, assets, FILES R2, AUTHORITY, JOBS (with its container), and rate-limit bindings (sign-ins; listening to live sound) |
+| `wrangler.toml` | Worker, assets, FILES R2, AUTHORITY, MACHINE, JOBS and COMPILER (the last two with containers), and rate-limit bindings (sign-ins; listening to live sound) |
 | `seed/` | English sample content |
 
 R2 stores bytes, as immutable chunk objects (`chunks/<file>/<index>-<random>`: each write has its own key, and the first one committed for an index is kept). `TerminalAuthority`, one Durable Object, keeps everything else in SQLite tables of its own storage (`crates/worker/src/db.rs`): accounts, groups, sessions, one row per path (`nodes`), and each file's content (`files`) with its committed chunks (`chunks`). A file has a fixed chunk size, so chunk *i* starts at *i* × the chunk size.
@@ -547,14 +569,16 @@ The R2 initialization marker (`system/terminal-authority-v2`) makes a missing au
 
 This architecture targets personal or small-team use: one authority orders all decisions, which are short.
 
-This is an independent workspace. Worker name: `terminal-worker`; bucket: `terminal-worker-files`; bindings: `FILES`, `ASSETS`, `AUTHORITY`, and `JOBS`. Content projects can reuse the build output with their own assets, configuration, data, and credentials. They must also declare the `TerminalAuthority` class with its SQLite migration `v1-users-permissions`, and for archives the `JobRunner` class (`v2-job-runner`) with its container. Never connect an empty unrelated authority to an initialized bucket.
+This is an independent workspace. Worker name: `terminal-worker`; bucket: `terminal-worker-files`; bindings: `FILES`, `ASSETS`, `AUTHORITY`, `MACHINE`, `JOBS`, and `COMPILER`. Content projects can reuse the build output with their own assets, configuration, data, and credentials. Copy the Durable Object declarations and migrations from `wrangler.toml`: `TerminalAuthority` (`v1-users-permissions`), `JobRunner` (`v2-job-runner`), `Machine` (`v3-machine`), and `ModuleCompiler` (`v4-module-compiler`), including both container images. Never connect an empty unrelated authority to an initialized bucket.
 
 ## Validation
 
 ```bash
 npm test
 cargo fmt --all --check
-cargo check --workspace --target wasm32-unknown-unknown
+cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
+npm run build:web
 npx playwright install chromium
 # With a local instance running and English samples seeded:
 npm run test:e2e
@@ -564,13 +588,21 @@ Use an isolated data directory for integration tests if your everyday root passw
 
 ```bash
 # Start from this repository; choose an unused local port and fresh temporary state.
-npx wrangler dev --ip 127.0.0.1 --port 8790 --persist-to /tmp/terminal-worker-test-state
+node scripts/dev.mjs --ip 127.0.0.1 --port 8790 --persist-to /tmp/terminal-worker-test-state
 # In another terminal:
 TERMINAL_PORT=8790 npm run seed
 TERMINAL_TEST_URL=http://127.0.0.1:8790 npm run test:e2e
+# The same complete suite with SharedWorker unavailable:
+TW_NO_SHARED_WORKER=1 TERMINAL_TEST_URL=http://127.0.0.1:8790 npm run test:e2e
 ```
 
 Integration tests use the bootstrap password in `.dev.vars`; fresh test state makes that predictable. Tests create disposable accounts/files. The editor-focus regression mocks storage and does not require credentials.
+
+The complete gate requires working container networking for archives and server-side fork
+compilation. Set `WASIX_DASH` to the approved dash fixture to include its optional tests.
+`TW_TEST_COMPILER_URL=http://127.0.0.1:PORT` is only a component-test aid: it routes authorized
+image bytes to a standalone compiler and does not validate Wrangler's container transport or
+the R2 cache. Leave it unset for the full gate.
 
 Fullscreen checks can run in Chromium and Firefox:
 

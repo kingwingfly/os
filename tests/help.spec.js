@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './test.js';
 import { readFile, readdir } from 'node:fs/promises';
 
 // Every command defined for clap in crates/core/src/cli.
@@ -6,13 +6,19 @@ const definitions = await Promise.all((await readdir('crates/core/src/cli')).fil
 const commands = definitions.flatMap(source => [...source.matchAll(/#\[command\(\s*name = "([a-z]+)"/g)].map(match => match[1]));
 
 test('every command has side-effect-free help, including privileged and interactive commands', async ({ page }) => {
+  // Wait for the page's asynchronous kernel bootstrap before observing help commands.
+  // ProcInit creates the namespace and is unrelated to any command typed afterward.
+  const initialized = page.waitForResponse(response => response.url().endsWith('/api/sys')
+    && response.request().method() === 'POST'
+    && JSON.parse(response.request().postData() || '{}').calls?.some(call => typeof call === 'object' && 'proc_init' in call));
   await page.goto('/');
+  await initialized;
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   const requests = [];
   // Whatever changes something: a request other than a read, and system calls other than those
   // that only look (a listing the panel makes again is no side effect).
-  // A watch of a directory listed (the page's cache) changes nothing either.
-  const looking = new Set(['getcreds', 'stat', 'lstat', 'getdents', 'access', 'readlink', 'getxattr', 'listxattr', 'inotify_add_watch', 'inotify_rm_watch']);
+  // Directory watches and the kernel's periodic seat listing change nothing either.
+  const looking = new Set(['getcreds', 'stat', 'lstat', 'getdents', 'access', 'readlink', 'getxattr', 'listxattr', 'inotify_add_watch', 'inotify_rm_watch', 'seats']);
   const changes = request => {
     if (request.method() === 'GET' || request.method() === 'HEAD') return false;
     if (!request.url().endsWith('/api/sys')) return true;
