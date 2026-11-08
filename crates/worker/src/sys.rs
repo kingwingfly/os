@@ -48,7 +48,7 @@ pub async fn handle(
         key: key.clone(),
         guest: guest.clone(),
         sudo: batch.sudo,
-        umask: batch.umask & 0o777,
+        umask: batch.umask.map(|mask| mask & 0o777),
         pid: batch.pid,
         token: batch.process.clone(),
     });
@@ -255,7 +255,7 @@ pub struct Session {
     pub key: Option<String>,
     pub guest: Option<String>,
     pub sudo: bool,
-    pub umask: u16,
+    pub umask: Option<u16>,
     pub pid: Option<u32>,
     pub token: Option<String>,
 }
@@ -292,7 +292,10 @@ impl Session {
                 (
                     Process {
                         cred: credential.identity(),
-                        umask: credential.umask,
+                        // The runtime owns its mutable creation mask. Identity still comes
+                        // only from the authenticated credential snapshot. Omitted masks
+                        // retain that snapshot (including archive runner requests).
+                        umask: self.umask.unwrap_or(credential.umask),
                     },
                     Some(credential),
                 )
@@ -303,7 +306,7 @@ impl Session {
                     self.key.as_deref(),
                     self.guest.as_deref(),
                     self.sudo,
-                    self.umask,
+                    self.umask.unwrap_or(0o022),
                 )?,
                 None,
             ),

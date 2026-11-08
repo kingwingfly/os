@@ -1,6 +1,7 @@
 //! uutils' coreutils as one program, as busybox is one: what it is run as (its first argument, as
 //! a link's name would be) is the utility it runs. It starts in the working directory the shell
 //! gives it as `PWD`, as WASI's libc starts every program at `/`.
+mod terminal;
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -22,7 +23,6 @@ pub const UTILITIES: &[&str] = &[
     "sha384sum",
     "sha512sum",
     "comm",
-    "cp",
     "csplit",
     "cut",
     "date",
@@ -45,7 +45,6 @@ pub const UTILITIES: &[&str] = &[
     "ls",
     "mkdir",
     "mktemp",
-    "mv",
     "nl",
     "numfmt",
     "od",
@@ -58,7 +57,6 @@ pub const UTILITIES: &[&str] = &[
     "pwd",
     "readlink",
     "realpath",
-    "rm",
     "rmdir",
     "seq",
     "shred",
@@ -76,6 +74,7 @@ pub const UTILITIES: &[&str] = &[
     "truncate",
     "tsort",
     "tty",
+    "stty",
     "uname",
     "unexpand",
     "uniq",
@@ -107,12 +106,13 @@ fn main() {
             );
             std::process::exit(0);
         }
+        uucore::set_utility_is_second_arg();
         args.remove(0);
         name = args[0].to_string_lossy().into_owned();
     }
     // Their messages are in Fluent's files, which each utility loads as it starts (uutils').
     let canonical = match name.as_str() {
-        "syscall" => "",
+        "syscall" | "stty" | "tty" => "",
         "dir" | "vdir" => "ls",
         other => other,
     };
@@ -142,7 +142,6 @@ fn main() {
         "sha384sum" => uu_sha384sum::uumain(args),
         "sha512sum" => uu_sha512sum::uumain(args),
         "comm" => uu_comm::uumain(args),
-        "cp" => uu_cp::uumain(args),
         "csplit" => uu_csplit::uumain(args),
         "cut" => uu_cut::uumain(args),
         "date" => uu_date::uumain(args),
@@ -165,7 +164,6 @@ fn main() {
         "ls" => uu_ls::uumain(args),
         "mkdir" => uu_mkdir::uumain(args),
         "mktemp" => uu_mktemp::uumain(args),
-        "mv" => uu_mv::uumain(args),
         "nl" => uu_nl::uumain(args),
         "numfmt" => uu_numfmt::uumain(args),
         "od" => uu_od::uumain(args),
@@ -178,7 +176,6 @@ fn main() {
         "pwd" => uu_pwd::uumain(args),
         "readlink" => uu_readlink::uumain(args),
         "realpath" => uu_realpath::uumain(args),
-        "rm" => uu_rm::uumain(args),
         "rmdir" => uu_rmdir::uumain(args),
         "seq" => uu_seq::uumain(args),
         "shred" => uu_shred::uumain(args),
@@ -195,7 +192,8 @@ fn main() {
         "true" => uu_true::uumain(args),
         "truncate" => uu_truncate::uumain(args),
         "tsort" => uu_tsort::uumain(args),
-        "tty" => uu_tty::uumain(args),
+        "tty" => terminal::tty(args),
+        "stty" => terminal::stty(args),
         "uname" => uu_uname::uumain(args),
         "unexpand" => uu_unexpand::uumain(args),
         "uniq" => uu_uniq::uumain(args),

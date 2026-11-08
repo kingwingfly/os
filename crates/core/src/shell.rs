@@ -1,5 +1,4 @@
-//! The shell's grammar beyond one command: pipelines, the items xargs reads, and the commands
-//! fd -x and -X run. Nothing here runs anything.
+//! Shell grammar and fd command templates. Nothing here runs anything.
 
 /// A word of a command line: its text, and, if it has wildcards outside quotes, the pattern
 /// it expands to the paths of, as [`crate::glob`] reads patterns.
@@ -122,91 +121,6 @@ fn unsupported(operator: &str) -> String {
     format!(
         "{operator} is not supported: this terminal runs one command, or commands joined by |; quote it to use it as text"
     )
-}
-
-/// How xargs separates the items it reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Delimiter {
-    /// Blanks and newlines, with quotes and backslashes as GNU xargs reads them.
-    Blank,
-    /// Lines, without their leading blanks, as `xargs -I` reads them.
-    Line,
-    /// Exactly this character, as `-d` or `-0` select.
-    Char(char),
-}
-
-/// The items xargs reads from `input`.
-pub fn xargs_items(input: &str, delimiter: Delimiter) -> Result<Vec<String>, String> {
-    match delimiter {
-        Delimiter::Char(d) => {
-            let mut items: Vec<String> = input.split(d).map(String::from).collect();
-            // A final delimiter ends the last item; it does not start an empty one.
-            if items.last().is_some_and(String::is_empty) {
-                items.pop();
-            }
-            Ok(items)
-        }
-        Delimiter::Line => Ok(input
-            .lines()
-            .map(|line| line.trim_start())
-            .filter(|line| !line.is_empty())
-            .map(String::from)
-            .collect()),
-        Delimiter::Blank => {
-            let mut items = Vec::new();
-            let mut item = String::new();
-            let mut active = false;
-            let mut quote = None;
-            let mut chars = input.chars();
-            while let Some(c) = chars.next() {
-                if let Some(q) = quote {
-                    if c == q {
-                        quote = None;
-                    } else if c == '\n' {
-                        return Err(format!(
-                            "xargs: unmatched {} quote; use -0 or -d for names with quotes",
-                            if q == '\'' { "single" } else { "double" }
-                        ));
-                    } else {
-                        item.push(c);
-                    }
-                    continue;
-                }
-                match c {
-                    '\'' | '"' => {
-                        quote = Some(c);
-                        active = true;
-                    }
-                    '\\' => {
-                        if let Some(next) = chars.next() {
-                            item.push(next);
-                        }
-                        active = true;
-                    }
-                    c if c.is_whitespace() => {
-                        if active {
-                            items.push(std::mem::take(&mut item));
-                            active = false;
-                        }
-                    }
-                    c => {
-                        item.push(c);
-                        active = true;
-                    }
-                }
-            }
-            if let Some(q) = quote {
-                return Err(format!(
-                    "xargs: unmatched {} quote; use -0 or -d for names with quotes",
-                    if q == '\'' { "single" } else { "double" }
-                ));
-            }
-            if active {
-                items.push(item);
-            }
-            Ok(items)
-        }
-    }
 }
 
 /// `template` with each placeholder of fd's replaced, for `path`: `{}` the path, `{/}` its name,
@@ -385,27 +299,6 @@ mod tests {
                 assert!(!crate::glob::matches(pattern, name), "{input}: {name}");
             }
         }
-    }
-
-    #[test]
-    fn xargs_reads_items_as_gnu_xargs_does() {
-        assert_eq!(
-            xargs_items("a b\n  'c d' \"e f\" g\\ h\n", Delimiter::Blank).unwrap(),
-            ["a", "b", "c d", "e f", "g h"]
-        );
-        assert!(xargs_items("it's\n", Delimiter::Blank).is_err());
-        assert_eq!(
-            xargs_items("spéctrum one.txt\0b\0", Delimiter::Char('\0')).unwrap(),
-            ["spéctrum one.txt", "b"]
-        );
-        assert_eq!(
-            xargs_items("a\n\nb\n", Delimiter::Char('\n')).unwrap(),
-            ["a", "", "b"]
-        );
-        assert_eq!(
-            xargs_items("  one two\n\n three\n", Delimiter::Line).unwrap(),
-            ["one two", "three"]
-        );
     }
 
     #[test]

@@ -4,8 +4,7 @@
 //! Permission denied`, nothing printed on success but with -v. Whether something may be done
 //! is never theirs to decide: the kernel says, call by call; they walk trees, a level a batch.
 //!
-//! The page runs them (crates/frontend), as the shell's commands; tests run them over the
-//! kernel in memory.
+//! Installed WASI executables run these implementations; tests run them over the kernel in memory.
 mod accounts;
 mod copy;
 mod files;
@@ -18,16 +17,15 @@ pub mod sys;
 pub mod time;
 pub mod walk;
 
-pub use io::{Ask, Io, View};
+pub use io::{Ask, Io};
 pub use names::Names;
 pub use sys::Sys;
 
 /// The programs of user space.
 pub const PROGRAMS: &[&str] = &[
-    "ls", "stat", "mkdir", "rmdir", "rm", "mv", "cp", "ln", "readlink", "realpath", "touch", "df",
-    "chmod", "chown", "chgrp", "getfacl", "setfacl", "getfattr", "setfattr", "fd", "ps", "kill",
-    "whoami", "id", "groups", "users", "useradd", "usermod", "userdel", "groupadd", "groupmod",
-    "groupdel",
+    "stat", "rm", "mv", "cp", "df", "chmod", "chown", "chgrp", "getfacl", "setfacl", "getfattr",
+    "setfattr", "fd", "ps", "kill", "whoami", "id", "groups", "users", "useradd", "usermod",
+    "userdel", "groupadd", "groupmod", "groupdel",
 ];
 
 /// Run the program `io.args[0]`, with what `io` gives it: its exit status, as a shell sees it;
@@ -35,17 +33,10 @@ pub const PROGRAMS: &[&str] = &[
 pub async fn run(sys: &impl Sys, io: &mut Io<'_>) -> Option<i32> {
     let name = io.args.first()?.clone();
     let status = match name.as_str() {
-        "ls" => files::ls(sys, io).await,
         "stat" => files::stat_program(sys, io).await,
-        "mkdir" => files::mkdir(sys, io).await,
-        "rmdir" => files::rmdir(sys, io).await,
         "rm" => files::rm(sys, io).await,
         "mv" => files::mv(sys, io).await,
         "cp" => copy::cp(sys, io).await,
-        "ln" => files::ln(sys, io).await,
-        "readlink" => files::readlink(sys, io, false).await,
-        "realpath" => files::readlink(sys, io, true).await,
-        "touch" => files::touch(sys, io).await,
         "df" => files::df(sys, io).await,
         "chmod" => perms::chmod(sys, io).await,
         "chown" => perms::chown(sys, io, false).await,

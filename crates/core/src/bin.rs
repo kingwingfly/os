@@ -1,9 +1,9 @@
 //! The programs of /usr/bin that the page runs as processes of their own, built for
 //! wasm32-wasip1 (uutils' coreutils, crates/coreutils, one binary as busybox is), in its WASI
-//! engine (web/wasi/). /usr/bin holds what a name runs (the kernel's usr.rs): the terminal's
-//! own programs, and links to `coreutils` of the utilities it has none of its own for, which a
-//! name runs at once; `coreutils NAME` runs uutils' NAME whatever the terminal has. `/usr/bin/NAME`
-//! runs what NAME does, and so do `/bin/NAME`, `/sbin/NAME` and `/usr/sbin/NAME`, links to it.
+//! engine (web/wasi/). Explicit executable paths always run their image through execve. Bare
+//! external names resolve through PATH (default /usr/bin). Shell builtins and browser actions
+//! are separate from this installed catalog.
+//! `coreutils NAME` invokes the multicall binary with NAME as its own argument.
 
 /// The utilities coreutils has, as crates/coreutils builds them: uutils', and `syscall`, which
 /// makes the kernel's own calls through the engine's `terminal.sys`.
@@ -24,7 +24,6 @@ pub const PROGRAMS: &[&str] = &[
     "sha384sum",
     "sha512sum",
     "comm",
-    "cp",
     "csplit",
     "cut",
     "date",
@@ -47,7 +46,6 @@ pub const PROGRAMS: &[&str] = &[
     "ls",
     "mkdir",
     "mktemp",
-    "mv",
     "nl",
     "numfmt",
     "od",
@@ -60,7 +58,6 @@ pub const PROGRAMS: &[&str] = &[
     "pwd",
     "readlink",
     "realpath",
-    "rm",
     "rmdir",
     "seq",
     "shred",
@@ -78,6 +75,7 @@ pub const PROGRAMS: &[&str] = &[
     "truncate",
     "tsort",
     "tty",
+    "stty",
     "uname",
     "unexpand",
     "uniq",
@@ -100,18 +98,27 @@ pub fn program(name: &str) -> Option<&'static str> {
     PROGRAMS.iter().copied().find(|program| *program == name)
 }
 
-/// The name a path to /usr/bin runs, as typed: `/usr/bin/NAME`, or through a link to it (`/bin`,
-/// `/sbin`, `/usr/sbin`).
-pub fn named(path: &str) -> Option<&str> {
-    ["/usr/bin/", "/bin/", "/sbin/", "/usr/sbin/"]
-        .iter()
-        .find_map(|dir| path.strip_prefix(dir))
-        .filter(|name| !name.is_empty() && !name.contains('/'))
-}
-
 /// Whether the utility `name` may change files.
 pub fn writes(name: &str) -> bool {
     WRITING.contains(&name)
+}
+
+/// Installed OS-native programs, compiled from shared user-space code.
+pub const UTILITIES: &[&str] = &[
+    "stat", "df", "chmod", "chown", "chgrp", "getfacl", "setfacl", "getfattr", "setfattr", "ps",
+    "kill", "whoami", "id", "groups", "users", "useradd", "usermod", "userdel", "groupadd",
+    "groupmod", "groupdel", "grep", "cp", "mv", "rm", "fd", "xargs",
+];
+
+/// The installed multicall image that owns a program; UI actions have no executable image.
+pub fn image(name: &str) -> Option<&'static str> {
+    if name == "coreutils" || PROGRAMS.contains(&name) {
+        Some("coreutils")
+    } else if name == "utilities" || UTILITIES.contains(&name) {
+        Some("utilities")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -132,9 +139,5 @@ mod tests {
         assert_eq!(built, super::PROGRAMS);
         assert_eq!(super::program("cut"), Some("cut"));
         assert_eq!(super::program("zip"), None);
-        assert_eq!(super::named("/usr/bin/ls"), Some("ls"));
-        assert_eq!(super::named("/bin/cut"), Some("cut"));
-        assert_eq!(super::named("/sbin/useradd"), Some("useradd"));
-        assert_eq!(super::named("/usr/bin/a/b"), None);
     }
 }

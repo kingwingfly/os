@@ -5,7 +5,7 @@ const origin=process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password=(await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const headers={Origin:origin,'CF-Connecting-IP':'workspace-regression'};
 const file=path=>'/api/file?path='+encodeURIComponent(path);
-const run=async(page,text)=>{await expect(page.locator('.busy')).toHaveText('↵');const input=page.getByRole('combobox',{name:'Terminal command'});await input.fill(text);await input.press('Enter');};
+const run=async(page,text)=>{await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');const input=page.getByRole('combobox',{name:'Terminal command'});await input.fill(text);await input.press('Enter');};
 const cmd=async(request,args)=>program(request,args);
 function pdfBytes(){
  const objects=['<< /Type /Catalog /Pages 2 0 R >>','<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>','<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents 4 0 R >>','<< /Length 33 >>\nstream\n0.2 0.6 0.3 rg 20 20 200 100 re f\nendstream','<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents 6 0 R >>','<< /Length 33 >>\nstream\n0.7 0.6 0.2 rg 20 20 100 200 re f\nendstream'];
@@ -33,8 +33,11 @@ test('manual, large terminal, the dock, prompt/listing colors, icons and keyboar
  const box=await page.getByRole('combobox').boundingBox();expect(box.y+box.height).toBeLessThanOrEqual(1000);
  expect(await page.locator('.lock').evaluate(e=>e.getBoundingClientRect().height<60)).toBe(true);
  await page.setViewportSize({width:1440,height:1000});
- await run(page,'ls');await expect(page.locator('.listing-output .entry-directory').first()).toBeVisible();await expect(page.locator('.listing-output svg').first()).toBeVisible();
- expect(await page.locator('.entry-directory').first().evaluate(e=>getComputedStyle(e).color)).not.toBe(await page.locator('.entry-file').first().evaluate(e=>getComputedStyle(e).color));
+ await run(page,'ls --color=always');await expect(page.locator('.terminal-screen').last()).toContainText('guest');
+ await expect(page.locator('.terminal-screen span[style*="color:"]').first()).toBeVisible();
+ await page.getByRole('navigation',{name:'Dock'}).getByRole('button',{name:'Files',exact:true}).click();
+ await expect(page.locator('.files [data-kind=directory] svg').first()).toBeVisible();
+ await page.getByRole('navigation',{name:'Dock'}).getByRole('button',{name:'Terminal',exact:true}).click();
  await expect(page.locator('.command-echo .prompt-user').last()).toHaveText(/^guest-[0-9a-f]{16}$/);
  await run(page,'man chmod');await expect(page.locator('.manual h1')).toHaveText('chmod — change permissions');await expect(page.locator('.manual')).toContainText('o+r');
  // Pages have sections; options are a table.

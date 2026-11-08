@@ -106,6 +106,7 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
         | Call::Getpid
         | Call::ProcPoll { .. }
         | Call::ProcKeep { .. }
+        | Call::ProcTty { .. }
         | Call::CgroupCreate { .. }
         | Call::CgroupRemove { .. }
         | Call::CgroupSet { .. }

@@ -603,7 +603,11 @@ impl TerminalAuthority {
                 .and_then(|asset| sizes[asset].as_u64())
                 .unwrap_or(0)
         };
-        crate::usr::mount(size(crate::usr::COREUTILS), size(crate::usr::TERMINAL));
+        crate::usr::mount(
+            size(crate::usr::COREUTILS),
+            size(crate::usr::TERMINAL),
+            size(crate::usr::UTILITIES),
+        );
         self.ready.set(true);
         Ok(())
     }

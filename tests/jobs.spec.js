@@ -5,17 +5,17 @@ import { test, expect } from './test.js';
 // kill %N take them; a signal from any tab reaches the process where it runs, over the page's
 // events line. Stopped processes wait at their next system call.
 const input = page => page.getByRole('combobox', { name: 'Terminal command' });
-const busy = page => page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
+const busy = page => page.locator('#command').locator('xpath=ancestor::form');
 const last = page => page.locator('.transcript pre').last();
 const transcript = page => page.locator('.transcript');
 async function run(page, text, { wait = true } = {}) {
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   await input(page).fill(text); await input(page).press('Enter');
-  if (wait) await expect(busy(page)).toHaveText('↵', { timeout: 30_000 });
+  if (wait) await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
 }
 async function ready(page) {
   await page.goto('/');
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
 }
 
 test('& runs a pipeline as a job: jobs lists it, kill %N ends it, and its end is said', async ({ page }) => {
@@ -32,39 +32,42 @@ test('& runs a pipeline as a job: jobs lists it, kill %N ends it, and its end is
   await run(page, 'seq 3 | tr 123 abc &');
   await expect(last(page)).toHaveText('[1]+  Done                    seq 3 | tr 123 abc');
   expect(await page.locator('.transcript pre').allInnerTexts()).toContain('a\nb\nc');
-  // The terminal's own commands do not run so.
+  // ls is an external program now, with the same background lifecycle as other executables.
   await run(page, 'ls &');
-  await expect(last(page)).toContainText('ls: & runs programs of /usr/bin');
+  await expect(last(page)).toHaveText('[1]+  Done                    ls');
+  // A shell-state builtin still belongs to this terminal.
+  await run(page, 'cd &');
+  await expect(last(page)).toContainText('cd: & runs programs of /usr/bin');
 });
 
 test('Ctrl+Z stops the program in the foreground; fg gives it the terminal again; bg goes on with one', async ({ page }) => {
   await ready(page);
   await run(page, 'tr a-z A-Z', { wait: false });
-  await expect(busy(page)).toHaveText('Input ↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'input');
   await input(page).press('Control+z');
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   await expect(last(page)).toHaveText('[1]+  Stopped                 tr a-z A-Z');
   // The kernel's record says so too.
   await run(page, 'ps');
   await expect(last(page)).toContainText(/T \(stopped\)\s+tr a-z A-Z/);
   await run(page, 'fg', { wait: false });
-  await expect(busy(page)).toHaveText('Input ↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'input');
   await input(page).fill('hello'); await input(page).press('Enter');
-  await expect(last(page)).toHaveText('HELLO');
+  await expect(last(page)).toContainText('hello\nHELLO');
   await input(page).press('Control+d');
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   await run(page, 'jobs');
   await expect(last(page)).toHaveText('No jobs or unfinished uploads');
   // A sleep stopped wakes to stop, and, continued in the background, sleeps out the rest.
   await run(page, 'coreutils sleep 2', { wait: false });
-  await expect(busy(page)).not.toHaveText('↵');
+  await expect(busy(page)).not.toHaveAttribute('data-state', 'idle');
   await input(page).press('Control+z');
   await expect(last(page)).toHaveText('[1]+  Stopped                 coreutils sleep 2');
   await run(page, 'bg');
   await expect(last(page)).toHaveText('[1]+ coreutils sleep 2 &');
   await expect(last(page)).toHaveText('[1]+  Done                    coreutils sleep 2', { timeout: 15_000 });
   await run(page, 'fg');
-  await expect(last(page)).toHaveText('! fg: current: no such job');
+  await expect(last(page)).toHaveText('fg: current: no such job');
 });
 
 test('a signal from another tab reaches the process where it runs: stopped, then ended', async ({ browser }) => {

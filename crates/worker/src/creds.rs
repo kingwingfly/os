@@ -238,7 +238,7 @@ impl Db {
             vec![text(hash), text(ns)],
         );
         for credential in found {
-            self.close_proc_fds(&credential.image());
+            self.close_exec_fds(&credential.image());
             let held = !self
                 .rows::<Credential>(
                     &format!(

@@ -6,7 +6,7 @@ const origin=process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password=(await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const headers={Origin:origin,'CF-Connecting-IP':'preview-regression'};
 const file=path=>'/api/file?path='+encodeURIComponent(path);
-const run=async(page,text)=>{await expect(page.locator('.busy')).toHaveText('↵');const input=page.getByRole('combobox',{name:'Terminal command'});await input.fill(text);await input.press('Enter');};
+const run=async(page,text)=>{await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');const input=page.getByRole('combobox',{name:'Terminal command'});await input.fill(text);await input.press('Enter');};
 const close=async page=>{await page.getByRole('button',{name:'Close preview'}).click();await expect(page.locator('#viewer')).toBeHidden();};
 // A ZIP archive of stored files, and a tar archive, as their formats lay them out.
 function zip(files){

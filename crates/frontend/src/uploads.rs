@@ -78,7 +78,6 @@ fn setfacl(path: String, entries: String) -> js_sys::Promise {
             stdin: None,
             out: String::new(),
             err: Vec::new(),
-            view: None,
             found: Vec::new(),
             cancelled: &cancelled,
             ask: &ask,

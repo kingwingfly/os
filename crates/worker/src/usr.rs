@@ -3,16 +3,9 @@
 //! /bin and /sbin are links to usr/bin, /lib and /lib64 to usr/lib, /usr/sbin to bin and
 //! /usr/lib64 to lib, as on merged-/usr distributions; /sys is sysfs's place, empty here.
 //!
-//! /usr/bin holds what a name typed runs. The terminal's own programs (ls, chmod, passwd…), built
-//! into the page's binary (`/pkg/frontend_bg.wasm`), are each a file of it, as a distribution's
-//! programs are each a file: 755, root's; those that act beyond the caller's own rights by a
-//! policy of their own, setuid root (4755), as passwd, su and sudo are on Linux, and useradd and
-//! userdel here, with which a guest makes an account of its own and an account deletes itself.
-//! Here the bit says, rather than grants: the page cannot be trusted with a setuid program, so
-//! the kernel's calls hold each one's policy. uutils' utilities the terminal has none of its own
-//! for are links to their binary, `coreutils` (wasm32-wasip1, run by the page's WASI engine), as
-//! busybox installs its own. The shell's builtins (cd, exit, logout, jobs, fg, bg, help) are not
-//! there.
+//! Only executable WASI images are installed in /usr/bin: coreutils and additional shared
+//! user-space utilities, with applet symlinks. Browser dialogs and previews are shell/UI
+//! actions, not fake executables. The kernel authorizes every exec and resource operation.
 //!
 //! The store answers for these names itself (db.rs), so that the kernel resolves, lists, stats
 //! and permits them as it does any; changing any of them fails with EROFS (sys.rs).
@@ -23,28 +16,28 @@ use terminal_worker_core::permissions::Node;
 /// assets have it.
 pub const COREUTILS: &str = "usr:coreutils";
 pub const TERMINAL: &str = "usr:terminal";
+/// Additional WASI user-space programs.
+pub const UTILITIES: &str = "usr:utilities";
 pub fn asset(content: &str) -> Option<&'static str> {
     match content {
         COREUTILS => Some("/usr/bin/coreutils.wasm"),
+        UTILITIES => Some("/usr/bin/utilities.wasm"),
         TERMINAL => Some("/pkg/frontend_bg.wasm"),
         _ => None,
     }
 }
 /// How many bytes the binary `content` is.
 pub fn size(content: &str) -> u64 {
-    let (coreutils, terminal) = SIZES.with(Cell::get);
+    let (coreutils, terminal, utilities) = SIZES.with(Cell::get);
     match content {
         COREUTILS => coreutils,
         TERMINAL => terminal,
+        UTILITIES => utilities,
         _ => 0,
     }
 }
 /// What the build says of the binaries: their sizes (scripts/build.mjs).
 pub const MANIFEST: &str = "/usr/manifest.json";
-/// The shell's builtins, which no file is.
-const BUILTINS: &[&str] = &["cd", "exit", "logout", "jobs", "fg", "bg", "help"];
-/// The programs setuid root.
-const SETUID: &[&str] = &["passwd", "su", "sudo", "useradd", "userdel"];
 /// The inodes of /usr, above any the store numbers.
 const INO: u64 = 1 << 40;
 
@@ -53,46 +46,43 @@ const INO: u64 = 1 << 40;
 struct Program {
     name: String,
     content: Option<&'static str>,
+    target: &'static str,
 }
 
 thread_local! {
     /// The binaries' sizes, and when this instance mounted /usr, as its times.
-    static SIZES: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    static SIZES: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
     static MOUNTED: Cell<(u64, u32)> = const { Cell::new((0, 0)) };
     static PROGRAMS: RefCell<Vec<Program>> = const { RefCell::new(Vec::new()) };
 }
 
-/// `f` of /usr/bin, by name: the terminal's programs, coreutils, and links to it of the
-/// utilities the terminal has no program of its own for.
+/// The installed image manifest, independent of the browser's command catalog.
 fn with_programs<R>(f: impl FnOnce(&[Program]) -> R) -> R {
     PROGRAMS.with(|programs| {
         let mut programs = programs.borrow_mut();
         if programs.is_empty() {
-            let own: Vec<String> = terminal_worker_core::cli::names()
-                .iter()
-                .filter(|name| !BUILTINS.contains(&name.as_str()))
-                .cloned()
-                .collect();
-            let mut all: Vec<Program> = own
-                .iter()
-                .map(|name| Program {
-                    name: name.clone(),
-                    content: Some(TERMINAL),
-                })
-                .chain(std::iter::once(Program {
+            let mut all = vec![
+                Program {
                     name: "coreutils".into(),
                     content: Some(COREUTILS),
-                }))
-                .chain(
-                    terminal_worker_core::bin::PROGRAMS
-                        .iter()
-                        .filter(|name| !own.iter().any(|own| own == *name))
-                        .map(|name| Program {
-                            name: name.to_string(),
-                            content: None,
-                        }),
-                )
-                .collect();
+                    target: "",
+                },
+                Program {
+                    name: "utilities".into(),
+                    content: Some(UTILITIES),
+                    target: "",
+                },
+            ];
+            for (names, target) in [
+                (terminal_worker_core::bin::PROGRAMS, "coreutils"),
+                (terminal_worker_core::bin::UTILITIES, "utilities"),
+            ] {
+                all.extend(names.iter().map(|name| Program {
+                    name: (*name).into(),
+                    content: None,
+                    target,
+                }));
+            }
             all.sort_by(|a, b| a.name.cmp(&b.name));
             *programs = all;
         }
@@ -100,9 +90,10 @@ fn with_programs<R>(f: impl FnOnce(&[Program]) -> R) -> R {
     })
 }
 
-/// Mount /usr: coreutils is `coreutils` bytes, the page's binary `terminal`, and this is when.
-pub fn mount(coreutils: u64, terminal: u64) {
-    SIZES.with(|cell| cell.set((coreutils, terminal)));
+/// Mount the build's images. Legacy frontend content IDs remain readable for existing clones,
+/// but no /usr/bin name advertises the frontend as an executable.
+pub fn mount(coreutils: u64, terminal: u64, utilities: u64) {
+    SIZES.with(|cell| cell.set((coreutils, terminal, utilities)));
     MOUNTED.with(|cell| cell.set(crate::auth::clock()));
 }
 
@@ -161,26 +152,13 @@ pub fn node(path: &str) -> Option<Node> {
     }
     // A program of /usr/bin: a file of a binary, or a link to coreutils.
     let name = path.strip_prefix("/usr/bin/")?;
-    let (at, content) = with_programs(|programs| {
+    let (at, content, target) = with_programs(|programs| {
         let at = programs.iter().position(|program| program.name == name)?;
-        Some((at, programs[at].content))
+        Some((at, programs[at].content, programs[at].target))
     })?;
-    let (coreutils, terminal) = SIZES.with(Cell::get);
     let node = match content {
-        Some(content) => {
-            let mode = if SETUID.contains(&name) {
-                0o4755
-            } else {
-                0o755
-            };
-            let size = if content == COREUTILS {
-                coreutils
-            } else {
-                terminal
-            };
-            Node::file(0, 0, mode, content.into(), size)
-        }
-        None => Node::symlink(0, 0, "coreutils"),
+        Some(content) => Node::file(0, 0, 0o755, content.into(), size(content)),
+        None => Node::symlink(0, 0, target),
     };
     Some(numbered(node, TREE.len() as u64 + at as u64))
 }
@@ -238,8 +216,9 @@ pub fn times(ino: u64) -> Option<kernel::Times> {
 
 /// What statfs tells of the image: its blocks, all used.
 pub fn statfs() -> abi::StatFs {
-    let (coreutils, terminal) = SIZES.with(Cell::get);
-    let blocks = coreutils.div_ceil(4096) + terminal.div_ceil(4096);
+    let (coreutils, terminal, utilities) = SIZES.with(Cell::get);
+    let _ = terminal;
+    let blocks = coreutils.div_ceil(4096) + utilities.div_ceil(4096);
     abi::StatFs {
         bsize: 4096,
         blocks,

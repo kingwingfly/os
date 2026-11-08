@@ -183,10 +183,10 @@ test('a tab signed out is guest-<uuid>:guest, and its process runs as that accou
 // Through the terminal, as a person runs a command, and what ps lists after.
 async function command(page, text, { wait = true } = {}) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
-  await expect(busy).toHaveText('↵');
+  const busy = page.locator('#command').locator('xpath=ancestor::form');
+  await expect(busy).toHaveAttribute('data-state', 'idle');
   await input.fill(text); await input.press('Enter');
-  if (wait) await expect(busy).toHaveText('↵', { timeout: 30_000 });
+  if (wait) await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
 }
 async function listed(page) {
   await command(page, 'ps');

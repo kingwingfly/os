@@ -3,6 +3,8 @@
 //! strike), and OSC 8's hyperlinks (`ESC ] 8 ; ; URI ESC \`). What moves a cursor or clears a
 //! screen has nothing to do in a transcript, and goes; so do other sequences.
 
+pub mod screen;
+
 /// A colour, as SGR names one: of the 256 (the first 16 the terminal's own), or red, green and
 /// blue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

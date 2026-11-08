@@ -913,10 +913,26 @@ const observedTranscripts = new WeakSet();
 function observeTranscript() {
   for (const log of document.querySelectorAll('.transcript')) {
     let frame;
-    const scroll = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; }); };
+    const scroll = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const form = log.querySelector('.command-line');
+        const cursor = log.querySelector('.terminal-screen[data-live="true"] .terminal-cursor');
+        if (form && cursor && log.closest('[data-pty="true"]')) {
+          const at = cursor.getBoundingClientRect(), bounds = log.getBoundingClientRect();
+          for (const [name, value] of [['left', at.left - bounds.left + log.scrollLeft], ['top', at.top - bounds.top + log.scrollTop]]) {
+            const position = `${value}px`;
+            if (form.style[name] !== position) form.style[name] = position;
+          }
+        } else if (form && (form.style.left || form.style.top)) {
+          form.style.removeProperty('left'); form.style.removeProperty('top');
+        }
+        log.scrollTop = log.scrollHeight;
+      });
+    };
     if (!observedTranscripts.has(log)) {
       observedTranscripts.add(log);
-      new MutationObserver(scroll).observe(log, { childList: true, subtree: true, characterData: true });
+      new MutationObserver(scroll).observe(log, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["style", "data-live", "data-alternate"] });
       new ResizeObserver(scroll).observe(log);
     }
     scroll();
@@ -939,16 +955,20 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.terminal = { config: () => configuration.branding, exec, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionFocus: (value, insideQuote) => {
+window.terminal = { config: () => configuration.branding, exec, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionCursor: () => $('command')?.selectionStart ?? 0, completionFocus: (value, cursor) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]:modal')) return;
     // Text selected since (the line chosen whole, to type over) is the typist's: the caret stays.
     if (document.activeElement === input && input.selectionStart !== input.selectionEnd) return;
     input.focus({ preventScroll: true });
-    const end = value.length - (insideQuote && value.endsWith('"') ? 1 : 0);
-    input.setSelectionRange(end, end);
+    input.setSelectionRange(cursor, cursor);
     document.querySelector('.completion-options [aria-selected="true"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  });
+}, focusLaunchedProgram: () => {
+  // Explicitly launching from Files transfers typing focus, including while the PTY starts.
+  requestAnimationFrame(() => {
+    if (!document.querySelector('dialog[open]:modal') && !otherWindow()) $('command')?.focus({ preventScroll: true });
   });
 }, setDirectory: path => { directory = path; }, focusInput: () => {
   observeTranscript();
@@ -985,7 +1005,7 @@ function restoreTerminalFocus() {
     const input = $('command');
     // Not while a password is asked, nor from another window that has the keyboard (the Files,
     // the preview, the editor), nor while a command runs.
-    if (document.querySelector('dialog[open]:modal') || otherWindow() || document.activeElement?.closest?.('dialog[open], .window:not(#window-terminal)') || !['↵', 'Answer ↵', 'Input ↵'].includes(input?.closest('form')?.querySelector('.busy')?.textContent)) return;
+    if (document.querySelector('dialog[open]:modal') || otherWindow() || document.activeElement?.closest?.('dialog[open], .window:not(#window-terminal)') || (!input?.closest('[data-pty="true"]') && !['idle', 'answer', 'input'].includes(input?.closest('form')?.dataset.state))) return;
     // After closing a modal Chromium can report this input as active while its
     // native text-editing focus still belongs to the closed dialog. Reacquire it.
     if (resetTerminalFocus && document.activeElement === input) input.blur();
@@ -1009,7 +1029,7 @@ document.addEventListener('keydown', event => {
   if (up) { if (!up.contains(document.activeElement)) up.focus({ preventScroll: true }); return; }
   if (!(target instanceof Element) || (target.closest('input,textarea,select,[contenteditable="true"]') && target.getClientRects().length) || window.getSelection()?.toString()) return;
   if (target.closest('button,a') && ['Enter', ' ', 'Tab'].includes(event.key)) return;
-  const input = $('command'); if (!input || !['↵', 'Answer ↵', 'Input ↵'].includes(input.closest('form')?.querySelector('.busy')?.textContent)) return;
+  const input = $('command'); if (!input || (!input.closest('[data-pty="true"]') && !['idle', 'answer', 'input'].includes(input.closest('form')?.dataset.state))) return;
   if (event.key.length === 1) {
     event.preventDefault(); input.focus({ preventScroll: true });
     input.setRangeText(event.key, input.selectionStart ?? input.value.length, input.selectionEnd ?? input.value.length, 'end');

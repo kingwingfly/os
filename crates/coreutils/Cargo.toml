@@ -14,6 +14,8 @@ path = "src/main.rs"
 [workspace]
 
 [dependencies]
+terminal-worker-core = { path = "../core" }
+serde_json = "1"
 uucore = "=0.12.0"
 uu_arch = "=0.12.0"
 uu_base32 = "=0.12.0"
@@ -31,7 +33,6 @@ uu_sha256sum = "=0.12.0"
 uu_sha384sum = "=0.12.0"
 uu_sha512sum = "=0.12.0"
 uu_comm = "=0.12.0"
-uu_cp = "=0.12.0"
 uu_csplit = "=0.12.0"
 uu_cut = "=0.12.0"
 uu_date = "=0.12.0"
@@ -54,7 +55,6 @@ uu_ln = "=0.12.0"
 uu_ls = "=0.12.0"
 uu_mkdir = "=0.12.0"
 uu_mktemp = "=0.12.0"
-uu_mv = "=0.12.0"
 uu_nl = "=0.12.0"
 uu_numfmt = "=0.12.0"
 uu_od = "=0.12.0"
@@ -67,7 +67,6 @@ uu_ptx = "=0.12.0"
 uu_pwd = "=0.12.0"
 uu_readlink = "=0.12.0"
 uu_realpath = "=0.12.0"
-uu_rm = "=0.12.0"
 uu_rmdir = "=0.12.0"
 uu_seq = "=0.12.0"
 uu_shred = "=0.12.0"
@@ -100,3 +99,8 @@ lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
 panic = "abort"
+
+[patch.crates-io]
+uu_ls = { path = "vendor/uu_ls" }
+uu_cat = { path = "vendor/uu_cat" }
+uu_mkdir = { path = "vendor/uu_mkdir" }

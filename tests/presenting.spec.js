@@ -23,9 +23,9 @@ function pdf() {
   return Buffer.from(text + `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
 }
 
-const busy = page => page.locator('.terminal-panel:not([hidden]) .busy');
+const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 async function run(page, text) {
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill(text); await input.press('Enter');
 }

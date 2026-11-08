@@ -86,10 +86,17 @@ test('the machine refuses route-only bookkeeping from pages and process tokens o
 });
 
 test('a forged registry header cannot reset, reap, inspect or reclaim another account', async ({ page, context }) => {
-  await page.goto('/');
-  await login(context.request);
   const seat = `registry-owner-${Date.now()}-${++sequence}`;
   const lender = `${seat}-kernel`;
+  // These registry-only processes model a live host. Claim its locks before the app
+  // boots, so ordinary abandoned-host cleanup cannot race the authorization checks.
+  await page.addInitScript(({ seat, lender }) => {
+    window.registryLocks = Promise.all([`tw-tab-${seat}`, `tw-kernel-${lender}`].map(name =>
+      new Promise(resolve => { void navigator.locks.request(name, () => { resolve(); return new Promise(() => {}); }); })));
+  }, { seat, lender });
+  await page.goto('/');
+  await page.evaluate(() => window.registryLocks);
+  await login(context.request);
   const call = async (entry, options = {}, route = true) => (await batch(page, [entry], options, route))[0];
   const exec = async seat => value(await call({ execve: { ...sleep, seat } }));
   value(await call({ proc_init: { boot: 'root-boot' } }));
@@ -246,7 +253,7 @@ for (const startsRoot of [false, true]) {
       if (startsRoot) expect((await api(context.request, 'logout')).ok()).toBe(true);
       else await login(context.request);
       expect((await syscall(context.request, 'getcreds')).uid === 0).toBe(!startsRoot);
-      await page.evaluate(() => window.securityInput.write('x'));
+      await page.evaluate(() => window.securityInput.write('x\n')); // Commit the canonical input line.
       expect((await page.evaluate(() => window.securityRun)).status).toBe(startsRoot ? 0 : 63);
       // Inspect as root: the guest page must not be able to see root's process list.
       if (startsRoot) await login(context.request);
@@ -337,5 +344,44 @@ test('a new port cannot impersonate the tab named by a visible Web Lock', async 
     await kernel(page, 'exit', { pid: parent.pid, status: 0 });
     await kernel(page, 'wait', { pid: parent.pid });
     await other.close();
+  }
+});
+
+test('exec replacement revokes its image grant while preserving ordinary descriptors', async ({ page, context }) => {
+  await page.goto('/');
+  await connect(page);
+  await login(context.request);
+  const path = `/guest/exec-lineage-${crypto.randomUUID()}.wasm`;
+  const output = path + '.txt';
+  const image = Buffer.from(binaryen.parseText('(module (memory (export "memory") 1) (func (export "_start")))').emitBinary());
+  expect((await put(context.request, '/api/file?path=' + encodeURIComponent(path), { data: image })).ok()).toBe(true);
+  await syscall(context.request, { chmod: { path, mode: 0o755 } });
+  const first = value(await kernel(page, 'exec', { ...sleep, path, argv: [path] }));
+  let stranger;
+  try {
+    const old = { pid: first.pid, proc: first.token };
+    const opened = value((await batch(page, [{ open: { path: output, flags: 0o101, mode: 0o600 } }], old))[0]);
+    const replaced = value(await kernel(page, 'reexec', { ...sleep, pid: first.pid }));
+    const current = { pid: replaced.pid, proc: replaced.token };
+    expect(replaced.token).not.toBe(first.token);
+    expect((await batch(page, ['getcreds'], old))[0].err?.errno).toBe('EPERM');
+    // The loader's descriptor is image-specific even when its owner key is also the original
+    // process lineage. A replacement must not retain this old image capability.
+    expect((await batch(page, [{ pread: { fd: first.fd, count: 4 } }], current))[0].err?.errno).toBe('EBADF');
+    stranger = value(await kernel(page, 'exec', sleep));
+    expect((await batch(page, [{ pwrite: { fd: opened.fd, index: 0, data: 'eA==' } }], { pid: stranger.pid, proc: stranger.token }))[0].err?.errno).toBe('EBADF');
+    const written = await batch(page, [
+      { pwrite: { fd: opened.fd, index: 0, data: Buffer.from('survived exec\n').toString('base64') } },
+      { close: { fd: opened.fd } },
+    ], current);
+    for (const result of written) value(result);
+    expect(await (await context.request.get('/api/file?path=' + encodeURIComponent(output))).text()).toBe('survived exec\n');
+  } finally {
+    for (const process of [first, stranger].filter(Boolean)) {
+      await kernel(page, 'exit', { pid: process.pid, status: 0 });
+      await kernel(page, 'wait', { pid: process.pid });
+    }
+    await rmrf(context.request, output);
+    await rmrf(context.request, path);
   }
 });

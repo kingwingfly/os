@@ -1,5 +1,5 @@
 //! fd: what is below its roots, a level a batch, matched as core's `find` says. Running a
-//! command on each (-x, -X) is the terminal's, on what this finds.
+//! command on each (-x, -X) is the installed executable's, on what this finds.
 use crate::files::shown_path;
 use crate::io::Io;
 use crate::sys::Sys;

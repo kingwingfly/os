@@ -929,6 +929,15 @@ pub enum Call {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seat: Option<String>,
     },
+    /// The host's projection of its local terminal descriptors. Metadata only: knowing
+    /// a PTY number grants no access to its buffers or another process's descriptors.
+    ProcTty {
+        pid: u32,
+        #[serde(rename = "proc")]
+        token: String,
+        tty: u32,
+        fds: Vec<u32>,
+    },
     /// fork(2)'s registry half: a child of `pid`, with its credentials, cgroup and descriptors
     /// copied. The client kernel clones the guest's wasm state (asyncify snapshot). The child
     /// is `child`, a pid the kernel was lent (`Pids`), when it forked at once and tells of it
@@ -1073,6 +1082,7 @@ impl Call {
             | Call::Getpid
             | Call::ProcPoll { .. }
             | Call::ProcKeep { .. }
+            | Call::ProcTty { .. }
             | Call::CgroupCreate { .. }
             | Call::CgroupRemove { .. }
             | Call::CgroupSet { .. }
@@ -1108,9 +1118,10 @@ fn modify() -> u32 {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Batch {
     pub calls: Vec<Call>,
-    /// Its umask, which what it makes takes off the mode asked for, as Linux's does.
-    #[serde(default = "umask")]
-    pub umask: u16,
+    /// The runtime's current creation mask. Omitted, use the process snapshot, or 022
+    /// for a browser session. A mask changes creation permissions, never credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub umask: Option<u16>,
     /// Whether it runs under sudo: as root, if its account may and has authenticated lately.
     #[serde(default)]
     pub sudo: bool,
@@ -1121,9 +1132,6 @@ pub struct Batch {
     pub pid: Option<u32>,
     #[serde(default, rename = "proc", skip_serializing_if = "Option::is_none")]
     pub process: Option<String>,
-}
-fn umask() -> u16 {
-    0o022
 }
 /// The most calls a batch takes.
 pub const BATCH_MAX: usize = 256;
@@ -1153,6 +1161,11 @@ pub struct Results {
     pub results: Vec<Return>,
 }
 
+/// Seconds without an authenticated host heartbeat before its processes are reaped.
+pub const PROCESS_LEASE: u64 = 30 * 60;
+/// Credential validity exceeds the host lease so a delayed revocation still expires.
+pub const PROCESS_TOKEN_TTL: u64 = 2 * PROCESS_LEASE;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1178,7 +1191,10 @@ mod tests {
                     serde_json::from_str(r#"{"calls":["getcreds",{"unlink":{"path":"/x"}}]}"#)
                 })
                 .unwrap();
-        assert_eq!(read.umask, 0o022);
+        assert_eq!(read.umask, None);
+        assert!(!text.contains("umask"));
+        let explicit: Batch = serde_json::from_str(r#"{"calls":[],"umask":0}"#).unwrap();
+        assert_eq!(explicit.umask, Some(0));
         assert_eq!(read.calls[1], Call::Unlink { path: "/x".into() });
         let failed = Return::Err(Error::new(Errno::ENOENT));
         assert_eq!(
@@ -1315,8 +1331,3 @@ mod tests {
         assert_eq!(list, Call::CgroupList { path: "/".into() });
     }
 }
-
-/// Seconds without an authenticated host heartbeat before its processes are reaped.
-pub const PROCESS_LEASE: u64 = 30 * 60;
-/// Credential validity exceeds the host lease so a delayed revocation still expires.
-pub const PROCESS_TOKEN_TTL: u64 = 2 * PROCESS_LEASE;

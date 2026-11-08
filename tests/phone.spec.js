@@ -23,7 +23,7 @@ const dock = (page, name) => page.getByRole('navigation', { name: 'Dock' }).getB
 test('a phone shows the terminal as an app that keeps its command line above the keyboard', async ({ page }) => {
   await page.goto('/');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await expect(page.locator('.busy')).toHaveText('↵');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   // The wallpaper gives way, and the terminal fills the desktop alone; the account stays on
   // one line.
   await expect(page.locator('.intro')).toBeHidden();
@@ -35,11 +35,12 @@ test('a phone shows the terminal as an app that keeps its command line above the
   // Nothing types capitals or corrections into commands.
   await expect(input).toHaveAttribute('autocapitalize', 'off');
   await expect(input).toHaveAttribute('autocorrect', 'off');
-  // ls -l: one line an entry, which scrolls sideways rather than wraps.
+  // ls writes to the same terminal grid as other executables, within the phone viewport.
   await input.tap(); await input.fill('ls -l /'); await input.press('Enter');
-  await expect(page.locator('.listing-long .listing-entry').first()).toBeVisible();
-  const heights = await page.locator('.listing-long .listing-entry').evaluateAll(entries => entries.map(e => e.getBoundingClientRect().height));
-  expect(Math.max(...heights)).toBeLessThan(40);
+  const screen = page.locator('.terminal-screen').last();
+  await expect(screen).toContainText('drwx');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   // The keyboard takes half the screen: the header and the files make room, and the command
   // line stays in what is left (app.js keeps --app-height as the visible height).
   await page.evaluate(() => { document.documentElement.style.setProperty('--app-height', '400px'); document.documentElement.classList.add('keyboard'); });
@@ -56,7 +57,7 @@ test('a phone shows the terminal as an app that keeps its command line above the
 test('keys a phone lacks are buttons, and Upload opens the chooser at once, before any request', async ({ page }) => {
   await page.goto('/');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await expect(page.locator('.busy')).toHaveText('↵');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await input.fill('cd ' + base); await input.press('Enter');
   await expect(promptPath(page)).toHaveText(base);
   // Tab completes, ↑ recalls, ^C clears.
@@ -86,7 +87,7 @@ test('long names keep one line and scroll; titles keep the file name; the dock s
   expect((await put(context.request, '/api/file?path=' + encodeURIComponent(base + '/' + long), { headers, data: 'long\n' })).status()).toBe(201);
   await page.goto('/');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await expect(page.locator('.busy')).toHaveText('↵');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await dock(page, 'Files').tap();
   await browse(page, base);
   // One line, sliding to show the rest: a touch screen points at nothing to wait for.
@@ -128,7 +129,7 @@ test('long names keep one line and scroll; titles keep the file name; the dock s
 test('a tap on the files opens what it means, in the Files, without the terminal or its keyboard', async ({ page, context }) => {
   await mkdirp(context.request, base + '/docs');
   await page.goto('/');
-  await expect(page.locator('.busy')).toHaveText('↵');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await dock(page, 'Files').tap();
   await browse(page, base);
   await page.getByRole('textbox', { name: 'Location' }).blur();

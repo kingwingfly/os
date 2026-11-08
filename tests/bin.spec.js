@@ -23,10 +23,10 @@ const transcript = page => page.locator('.transcript');
 // Run `text`, to its end unless it asks something first (su's password).
 async function run(page, text, { wait = true } = {}) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
-  await expect(busy).toHaveText('↵');
+  const busy = page.locator('#command').locator('xpath=ancestor::form');
+  await expect(busy).toHaveAttribute('data-state', 'idle');
   await input.fill(text); await input.press('Enter');
-  if (wait) await expect(busy).toHaveText('↵', { timeout: 30_000 });
+  if (wait) await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
 }
 async function terminal(page) {
   await page.goto('/');
@@ -63,7 +63,7 @@ test('uutils runs as programs of /bin: arguments, the working directory, pipes a
   await run(page, '/usr/bin/nothing');
   await expect(transcript(page)).toContainText('/usr/bin/nothing: No such file or directory');
   // An uploaded copy of the same image runs by its path (execve of uploaded wasm, phase 2);
-  // /usr/bin/ls stays the page's own program.
+  // /usr/bin/ls is the same coreutils program in every shell.
   expect((await put(request, file(base + '/coreutils'), { headers, data: coreutilsImage })).status()).toBe(201);
   await call(request, { chmod: { path: base + '/coreutils', mode: 0o755 } }, { headers });
   await run(page, './coreutils seq 3');
@@ -78,7 +78,8 @@ test('uutils runs as programs of /bin: arguments, the working directory, pipes a
   await expect(page.locator('.transcript pre').last()).toContainText('{"err":{"detail":"a path must be absolute","errno":"EINVAL"}}');
   await expect(page.locator('.transcript pre').last()).toContainText('"mode":33188');
   await run(page, 'coreutils');
-  await expect(transcript(page)).toContainText('coreutils (uutils): arch base32');
+  await expect(transcript(page)).toContainText('coreutils (uutils 0.12.0, multi-call binary)');
+  await expect(transcript(page)).toContainText('Usage: coreutils UTILITY [ARGUMENT]...');
   // help lists them, and man says where their help is.
   await run(page, 'help');
   await expect(page.locator('.transcript pre').last()).toContainText("/usr/bin, from uutils' coreutils (processes of their own)");
@@ -111,15 +112,16 @@ test('a program of /bin writes files through the kernel, as its account', async 
   await expect(transcript(page)).toContainText("rm: cannot remove 'counted.txt': Permission denied");
 });
 
-test('/usr is the build\'s, read-only: /usr/bin holds what names run, setuid what acts as root', async ({ page, request }) => {
+test('/usr is the build\'s, read-only: /usr/bin contains executable images and their applet links', async ({ page, request }) => {
   await terminal(page);
   await run(page, 'readlink /bin');
   await expect(page.locator('.transcript pre').last()).toHaveText('usr/bin');
   await run(page, 'ls -l /usr/bin | cat');
   const listed = await page.locator('.transcript pre').last().innerText();
-  expect(listed).toMatch(/^-rwsr-xr-x +1 root root .* passwd$/m);
-  expect(listed).toMatch(/^-rwsr-xr-x +1 root root .* sudo$/m);
-  expect(listed).toMatch(/^-rwxr-xr-x +1 root root .* ls$/m);
+  expect(listed).not.toMatch(/ (passwd|sudo|open)$/m);
+  expect(listed).toMatch(/^lrwxrwxrwx +1 root root .* chmod -> utilities$/m);
+  expect(listed).toMatch(/^-rwxr-xr-x +1 root root +\d+ .* utilities$/m);
+  expect(listed).toMatch(/^lrwxrwxrwx +1 root root .* ls -> coreutils$/m);
   expect(listed).toMatch(/^lrwxrwxrwx +1 root root .* cut -> coreutils$/m);
   expect(listed).toMatch(/^-rwxr-xr-x +1 root root +\d{6,} .* coreutils$/m);
   // The shell's builtins are no files; root may change nothing of it.
@@ -127,8 +129,8 @@ test('/usr is the build\'s, read-only: /usr/bin holds what names run, setuid wha
   await expect(page.locator('.transcript pre').last()).toHaveText('0');
   await run(page, 'rm /usr/bin/cut');
   await expect(transcript(page)).toContainText("rm: cannot remove '/usr/bin/cut': Read-only file system");
-  await run(page, 'mkdir /usr/local');
-  await expect(transcript(page)).toContainText("mkdir: cannot create directory '/usr/local': Read-only file system");
+  await run(page, 'mkdir /usr/new-directory');
+  await expect(transcript(page)).toContainText(/mkdir:.*\/usr\/new-directory.*Read-only file system/);
   // Its binaries read as the build has them.
   const coreutils = await request.get(file('/usr/bin/cut'), { headers });
   expect(coreutils.status()).toBe(200);
@@ -167,20 +169,26 @@ test('/ is laid out as Arch\'s', async ({ page }) => {
   await expect(page.locator('.transcript pre').last()).toHaveText('1\n2');
 });
 
-test('Ctrl+C kills a program of /bin; head stops what it reads; output past the limit stops it', async ({ page }) => {
+test('Ctrl+C kills a pipeline; head closes its input; streaming pipes wait for EOF', async ({ page }) => {
   await terminal(page);
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
+  const busy = page.locator('#command').locator('xpath=ancestor::form');
   await input.fill('sleep 30'); await input.press('Enter');
-  await expect(busy).not.toHaveText('↵');
+  await expect(busy).not.toHaveAttribute('data-state', 'idle');
   await page.waitForTimeout(500);
   await input.press('Control+c');
-  await expect(busy).toHaveText('↵', { timeout: 5_000 });
+  await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 5_000 });
   // head takes its lines and closes the pipe: yes hears SIGPIPE, and ends.
   await run(page, 'yes | head -n 2');
   await expect(page.locator('.transcript pre').last()).toHaveText('y\ny');
   await expect(transcript(page)).not.toContainText('cut short');
-  // What reads it all is given no more than 10 MB.
-  await run(page, 'yes | wc -l');
-  await expect(transcript(page)).toContainText('yes: output larger than 10 MB was cut short');
+  // wc counts until EOF. An infinite producer stays running, with bounded pipe buffers,
+  // rather than being truncated by a browser text-filter limit.
+  await input.fill('yes | wc -l'); await input.press('Enter');
+  await expect(busy).toHaveAttribute('aria-busy', 'true');
+  await page.waitForTimeout(500);
+  await expect(busy).toHaveAttribute('aria-busy', 'true');
+  await input.press('Control+c');
+  await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 5_000 });
+  await expect(transcript(page)).not.toContainText('cut short');
 });

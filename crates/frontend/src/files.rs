@@ -4,6 +4,7 @@
 //! uploads go into, through system calls, as a file manager does, apart from any shell. Its
 //! notices and uploads' progress show in it; the terminal hears nothing of it.
 use std::cell::Cell;
+use std::collections::HashMap;
 
 use leptos::prelude::*;
 use terminal_worker_core::Entry;
@@ -43,6 +44,11 @@ pub struct Files {
     /// The number of the latest navigation: a refresh that began before one, or while one was
     /// in flight, does not undo it.
     navs: StoredValue<u64>,
+    launch: Callback<String, Result<(), String>>,
+    scroller: NodeRef<leptos::html::Div>,
+    positions: StoredValue<HashMap<String, (i32, i32)>>,
+    /// An older animation frame must not restore over a newer listing.
+    rendered: StoredValue<u64>,
 }
 
 thread_local! {
@@ -56,7 +62,11 @@ pub fn files() -> Option<Files> {
 
 impl Files {
     /// The Files app, in the directory it was in, or at `start`.
-    pub fn new(account: Account, start: String) -> Self {
+    pub fn new(
+        account: Account,
+        start: String,
+        launch: Callback<String, Result<(), String>>,
+    ) -> Self {
         let cwd = storage()
             .and_then(|s| s.get_item(SAVED).ok().flatten())
             .unwrap_or(start);
@@ -73,6 +83,10 @@ impl Files {
             account,
             asked: StoredValue::new(0),
             navs: StoredValue::new(0),
+            launch,
+            scroller: NodeRef::new(),
+            positions: StoredValue::new(HashMap::new()),
+            rendered: StoredValue::new(0),
         };
         FILES.with(|cell| cell.set(Some(files)));
         files
@@ -123,6 +137,24 @@ impl Files {
     }
     /// Show the directory `path`, listed.
     fn show(self, path: String, listed: Result<Vec<Entry>, String>) {
+        // Read the departing directory before replacing its rows. Refreshes save the current
+        // position too, so an upload or an inotify update does not jump back to an old offset.
+        if let Some(scroller) = self.scroller.get_untracked()
+            && scroller.client_height() > 0
+        {
+            self.positions.update_value(|positions| {
+                positions.insert(
+                    self.cwd.get_untracked(),
+                    (scroller.scroll_left(), scroller.scroll_top()),
+                );
+            });
+        }
+        let position = self
+            .positions
+            .with_value(|positions| positions.get(&path).copied())
+            .unwrap_or_default();
+        let rendered = self.rendered.get_value() + 1;
+        self.rendered.set_value(rendered);
         if let Some(storage) = storage() {
             let _ = storage.set_item(SAVED, &path);
         }
@@ -137,6 +169,16 @@ impl Files {
                 self.error.set(error);
             }
         }
+        // Leptos commits the new rows asynchronously. Restore only after they supply the
+        // scroll height; restoring before then clamps the saved offset to the old directory.
+        request_animation_frame(move || {
+            if self.rendered.get_value() == rendered
+                && let Some(scroller) = self.scroller.get_untracked()
+            {
+                scroller.set_scroll_left(position.0);
+                scroller.set_scroll_top(position.1);
+            }
+        });
     }
     /// The directory above its own.
     pub fn up(self) {
@@ -156,8 +198,7 @@ impl Files {
             Err(error) => self.notice.set(error),
         }
     }
-    /// What a click on `entry` does: a directory opens in it, a file in the preview; a link,
-    /// what it leads to, if anything.
+    /// Directories open here, programs run in the terminal, and documents open in Preview.
     pub fn activate(self, entry: &Entry) {
         if entry.directory {
             return self.go(entry.path.clone());
@@ -165,13 +206,19 @@ impl Files {
         // The listing says what a file is; only a link is asked what it leads to now, if to
         // anything: a dangling one says so, rather than open a preview of nothing.
         let (path, name, linked) = (entry.path.clone(), entry.name.clone(), entry.link.is_some());
+        let mut runnable = terminal_worker_core::completion::runnable(entry);
         spawn_local(async move {
             if linked {
                 match crate::stat(&path).await {
                     Err(error) => return self.notice.set(format!("{name}: {error}")),
                     Ok(stat) if stat.is_dir() => return self.go(path),
-                    Ok(_) => {}
+                    Ok(stat) => runnable |= stat.mode & 0o111 != 0,
                 }
+            }
+            if runnable {
+                self.notice
+                    .set(self.launch.run(path).err().unwrap_or_default());
+                return;
             }
             let opened =
                 JsFuture::from(crate::open_file(&path, terminal_worker_core::kind(&path))).await;
@@ -309,14 +356,14 @@ pub fn view(files: Files) -> impl IntoView {
                 }}
             </div>
         </Show>
-        <div class="files" aria-label="Current directory">
+        <div class="files" aria-label="Current directory" node_ref=files.scroller>
             <Show when=move || files.cwd.get() != "/"><button class="file" on:click=move |_| files.up()><span class="file-kind">{crate::file_icon("directory", true)}</span><span>"../"</span></button></Show>
             {move || files.entries.get().into_iter().map(|entry| {
                 let size = if entry.directory { String::new() } else { crate::upload_progress(&entry).unwrap_or_else(|| format!("{:.1} KB", entry.size as f64 / 1000.0)) };
                 let title = format!("{} {}:{}{}", entry.mode_line(), entry.owner, entry.group, entry.link.as_ref().map(|t| format!(" -> {t}")).unwrap_or_default());
                 let linked = entry.link.is_some();
                 // What the account may not open shows dimmed, and says why when clicked.
-                let denied = entry.denied;
+                let denied = entry.denied && !terminal_worker_core::completion::runnable(&entry);
                 let refusal = denied.then(|| format!("Permission denied: {} is {} {}:{}", entry.name, entry.mode_line().trim_end(), entry.owner, entry.group));
                 let title = if denied { format!("{title} · permission denied") } else { title };
                 let kind = if entry.directory { "directory".to_string() } else { entry.kind.clone() };

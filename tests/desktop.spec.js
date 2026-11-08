@@ -21,7 +21,7 @@ async function ready(page) {
   await page.goto('/');
   await page.evaluate(() => localStorage.removeItem('terminal-desktop'));
   await page.reload();
-  await expect(page.locator('.busy')).toHaveText('↵');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await expect(terminal(page)).toHaveAttribute('style', /left/);
 }
 
@@ -83,7 +83,7 @@ test('windows move, resize, snap, minimize to the dock, and keep their places', 
   await expect(files(page)).toBeVisible();
   // A reload lays them out as they were.
   await page.reload();
-  await expect(page.locator('.busy')).toHaveText('↵');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await expect(terminal(page)).toHaveAttribute('style', /left/);
   near(await box(terminal(page)), kept);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);

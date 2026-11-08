@@ -214,7 +214,7 @@ test('groupmod and groupdel take a group by its name, as on Linux, never by numb
 test('terminal account workflow uses password dialogs, su homes and a caller-authenticated sudo prompt', async ({ page }) => {
  const root = await client(); await login(root,'root',rootPassword);
  const username='ui'+Date.now().toString(36), home='/home/'+username;
- const run=async text=>{const input=page.getByRole('combobox',{name:'Terminal command'});await expect(page.locator('.busy')).toHaveText('↵');await input.fill(text);await input.press('Enter');};
+ const run=async text=>{const input=page.getByRole('combobox',{name:'Terminal command'});await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');await input.fill(text);await input.press('Enter');};
  const last=()=>page.locator('.transcript pre').last();
  await page.setExtraHTTPHeaders({'CF-Connecting-IP':'ui-acl-'+Date.now()});
  try {
@@ -228,7 +228,7 @@ test('terminal account workflow uses password dialogs, su homes and a caller-aut
   // Silent on success, as GNU's are; ls -l shows what they did.
   await run('mkdir secrets');await run('chmod 700 secrets');
   await run('ls -l');await expect(last()).toContainText('drwx------');await expect(last()).toContainText(username);
-  await run('sudo ls -l /root');await expect(page.locator('#auth-title')).toContainText('sudo');await page.getByLabel('Password',{exact:true}).fill(password);await page.locator('#auth button[type=submit]').click();await expect(page.locator('.busy')).toHaveText('↵');
+  await run('sudo ls -l /root');await expect(page.locator('#auth-title')).toContainText('sudo');await page.getByLabel('Password',{exact:true}).fill(password);await page.locator('#auth button[type=submit]').click();await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await run('whoami');await expect(last()).toHaveText(username);
   await run('cd /root');await expect(last()).toContainText('Permission denied');
   await run('sudo -k');await expect(last()).toContainText('revoked');

@@ -22,6 +22,21 @@ impl Manual for Whoami {
 #[derive(Parser, Debug)]
 #[command(name = "id")]
 pub struct Id {
+    /// print only the user ID
+    #[arg(short = 'u', long = "user", conflicts_with_all = ["group_only", "groups_only"])]
+    pub user_only: bool,
+    /// print only the primary group ID
+    #[arg(short = 'g', long = "group", conflicts_with = "groups_only")]
+    pub group_only: bool,
+    /// print all group IDs
+    #[arg(short = 'G', long = "groups")]
+    pub groups_only: bool,
+    /// print names instead of numeric IDs (with -u, -g or -G)
+    #[arg(short = 'n', long = "name")]
+    pub names: bool,
+    /// print real IDs (this runtime has one credential set)
+    #[arg(short = 'r', long = "real")]
+    pub real: bool,
     #[arg(value_name = "USER")]
     pub user: Option<String>,
 }

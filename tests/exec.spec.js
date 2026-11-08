@@ -50,13 +50,15 @@ test.beforeEach(async ({ request, page }) => {
 test.afterEach(async ({ request }) => { await rmrf(request, base); });
 
 const transcript = page => page.locator('.transcript');
+// Screen wrapping inserts visual newlines, including inside JSON string tokens.
+const processJson = async page => JSON.parse((await page.locator('.transcript pre').last().innerText()).replaceAll('\n', ''));
 // Run `text` to its end, as bin.spec's does.
 async function run(page, text, { wait = true } = {}) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
-  await expect(busy).toHaveText('↵');
+  const busy = page.locator('#command').locator('xpath=ancestor::form');
+  await expect(busy).toHaveAttribute('data-state', 'idle');
   await input.fill(text); await input.press('Enter');
-  if (wait) await expect(busy).toHaveText('↵', { timeout: 30_000 });
+  if (wait) await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
 }
 async function terminal(page) {
   await page.goto('/');
@@ -77,7 +79,7 @@ test('an uploaded wasm runs by its path, with the working directory, environment
   await expect(page.locator('.transcript pre').last()).toHaveText('root');
   // Full terminal.sys as the caller: getcreds says whom it was executed as.
   await run(page, `./coreutils syscall '["getcreds"]'`);
-  await expect(page.locator('.transcript pre').last()).toContainText('"user":"root"');
+  expect((await processJson(page)).results[0].ok.user).toBe('root');
   // Two of them in one pipeline, each a process, and an in-page head closing the pipe.
   await run(page, './coreutils seq 9 | ./coreutils tail -n 2');
   await expect(page.locator('.transcript pre').last()).toHaveText('8\n9');
@@ -94,12 +96,12 @@ test('an uploaded wasm runs by its path, with the working directory, environment
   await expect(page.locator('.transcript pre').last()).toHaveText('alive');
   // Ctrl+C kills it, as a process's.
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
+  const busy = page.locator('#command').locator('xpath=ancestor::form');
   await input.fill('./coreutils sleep 30'); await input.press('Enter');
-  await expect(busy).not.toHaveText('↵');
+  await expect(busy).not.toHaveAttribute('data-state', 'idle');
   await page.waitForTimeout(500);
   await input.press('Control+c');
-  await expect(busy).toHaveText('↵', { timeout: 5_000 });
+  await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 5_000 });
 });
 
 // How a page's processes ask the kernel, as the browser sends it: by fetch, suspended on it
@@ -123,7 +125,7 @@ for (const jspi of [true, false]) test(`a process writes a file larger than a ba
   expect((await put(request, file(`${base}/big.txt`), { headers, data: big })).status()).toBe(201);
   await terminal(page);
   test.skip(jspi && !await hasJspi(page), 'this browser has no JSPI');
-  await run(page, './coreutils cp big.txt copy.txt');
+  await run(page, './coreutils cat big.txt | ./coreutils tee copy.txt | ./coreutils wc -l');
   await expect(page.locator('.transcript')).not.toContainText('Bad file descriptor');
   expect(await (await request.get(file(`${base}/copy.txt`))).text()).toBe(big);
   // What it reads comes back as written: a range of it past the first window, and a pipeline.
@@ -175,7 +177,8 @@ test('the loader and the X rule refuse as Linux refuses, with its words', async 
   // The X rule, for root too: 0644 is EACCES, a directory EISDIR, a missing name ENOENT.
   await run(page, './plain');
   await expect(transcript(page)).toContainText('./plain: Permission denied');
-  await run(page, './sub');
+  // An argument requests execution; a directory alone now performs implicit cd.
+  await run(page, './sub argument');
   await expect(transcript(page)).toContainText('./sub: Is a directory');
   await run(page, './missing');
   await expect(transcript(page)).toContainText('./missing: No such file or directory');
@@ -195,11 +198,10 @@ test('setuid on an upload does not elevate, and a process cannot sign the browse
     await run(page, `su ${name}`);
     await run(page, `cd ${base}`);
     await run(page, `./coreutils syscall '["getcreds"]'`);
-    await expect(page.locator('.transcript pre').last()).toContainText(`"user":"${name}"`);
-    await expect(page.locator('.transcript pre').last()).not.toContainText('"user":"root"');
+    expect((await processJson(page)).results[0].ok.user).toBe(name);
     // A process cannot mutate the browser's session.
     await run(page, `./coreutils syscall '[{"logout":null}]'`);
-    await expect(page.locator('.transcript pre').last()).toContainText('"errno":"EPERM"');
+    expect((await processJson(page)).results[0].err.errno).toBe('EPERM');
     await run(page, 'whoami');
     await expect(page.locator('.transcript pre').last()).toHaveText(name);
     await run(page, 'exit');
@@ -265,12 +267,12 @@ test('sudo snapshots root for an exec of a path or a coreutils applet', async ({
     await expect(page.locator('#auth-title')).toContainText('sudo');
     await page.getByLabel('Password', { exact: true }).fill(password);
     await page.locator('#auth button[type=submit]').click();
-    const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
-    await expect(busy).toHaveText('↵', { timeout: 30_000 });
-    await expect(page.locator('.transcript pre').last()).toContainText('"user":"root"');
+    const busy = page.locator('#command').locator('xpath=ancestor::form');
+    await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
+    expect((await processJson(page)).results[0].ok.user).toBe('root');
     // A bare coreutils applet goes the same way, with sudo already active.
     await run(page, `sudo syscall '["getcreds"]'`);
-    await expect(page.locator('.transcript pre').last()).toContainText('"user":"root"');
+    expect((await processJson(page)).results[0].ok.user).toBe('root');
   } finally {
     await program(request, ['userdel', '-r', name]);
   }

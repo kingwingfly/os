@@ -996,12 +996,23 @@ impl Db {
     /// Close every descriptor the process credentials `owner` hold (creds.rs `owner`): the
     /// process ended, and its loader already has what it read.
     pub fn close_proc_fds(&mut self, owner: &str) {
+        self.close_owned_fds(owner, false);
+    }
+    /// Replacing an image revokes only its loader descriptors. The first image's owner key
+    /// also identifies its descriptor lineage, which the replacement still holds.
+    pub fn close_exec_fds(&mut self, owner: &str) {
+        self.close_owned_fds(owner, true);
+    }
+    fn close_owned_fds(&mut self, owner: &str, exec_only: bool) {
         #[derive(Deserialize)]
         struct Owned {
             sid: String,
             fd: u32,
         }
-        let owned = self.rows::<Owned>("SELECT sid, fd FROM fds WHERE proc = ?", vec![text(owner)]);
+        let owned = self.rows::<Owned>(
+            "SELECT sid, fd FROM fds WHERE proc = ? AND (? = 0 OR exec = 1)",
+            vec![text(owner), int(exec_only as u8)],
+        );
         for owned in owned {
             self.close_fd(&owned.sid, owned.fd);
         }

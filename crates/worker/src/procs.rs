@@ -30,7 +30,7 @@ pub const ROOT_CGROUPS: [&str; 4] = ["/init", "/user", "/system", "/cluster"];
 type Result<T> = std::result::Result<T, Error>;
 
 /// The registry's tables, in its namespace's own Durable Object.
-const SCHEMA: [&str; 10] = [
+const SCHEMA: [&str; 12] = [
     // The namespace, one small machine: the browser it is (its guest, or session, key), the
     // boot it is of (a reload resets stale processes), and the next pid.
     "CREATE TABLE IF NOT EXISTS namespaces(id TEXT PRIMARY KEY, guest TEXT NOT NULL, boot TEXT, next_pid INTEGER NOT NULL, created INTEGER NOT NULL, last_seen INTEGER NOT NULL)",
@@ -51,6 +51,8 @@ const SCHEMA: [&str; 10] = [
     "CREATE INDEX IF NOT EXISTS processes_token ON processes(token)",
     "CREATE TABLE IF NOT EXISTS leases(pid INTEGER PRIMARY KEY, expires INTEGER NOT NULL, renewed INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS renewals(token TEXT PRIMARY KEY)",
+    "CREATE TABLE IF NOT EXISTS terminals(pid INTEGER PRIMARY KEY, tty INTEGER NOT NULL, fds TEXT NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS terminals_remove AFTER DELETE ON processes BEGIN DELETE FROM terminals WHERE pid = old.pid; END",
     "CREATE TABLE IF NOT EXISTS observations(name TEXT PRIMARY KEY, value INTEGER NOT NULL)",
 ];
 
@@ -103,6 +105,10 @@ pub struct Row {
     pub started: u64,
     pub ended: u64,
     pub seat: Option<String>,
+    #[serde(default)]
+    pub tty: Option<u32>,
+    #[serde(default)]
+    pub tty_fds: String,
 }
 impl Row {
     pub fn proc(&self) -> Proc {
@@ -150,7 +156,7 @@ fn state_of(state: &str) -> ProcState {
     }
 }
 
-const COLUMNS: &str = "ns, pid, ppid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, started, ended, seat";
+const COLUMNS: &str = "ns, pid, ppid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, started, ended, seat, (SELECT tty FROM terminals WHERE terminals.pid = processes.pid) AS tty, COALESCE((SELECT fds FROM terminals WHERE terminals.pid = processes.pid), '[]') AS tty_fds";
 
 /// What an execve asks of the registry, once its arguments are checked: the pid it runs as,
 /// and, replacing a process, whose that was and the token it held (`Begun`); then, once the
@@ -492,6 +498,24 @@ impl Db {
             }),
         }
     }
+    pub fn terminal(
+        &mut self,
+        ns: &str,
+        pid: u32,
+        token: &str,
+        tty: u32,
+        fds: &[u32],
+    ) -> Result<()> {
+        self.process_token(token, Some(pid), ns)
+            .ok_or(Errno::ESRCH)?;
+        if fds.len() > 256 || fds.iter().any(|fd| *fd > 65535) || tty < 2 {
+            return Err(Errno::EINVAL.into());
+        }
+        self.run("INSERT INTO terminals(pid, tty, fds) VALUES(?, ?, ?) ON CONFLICT(pid) DO UPDATE SET tty=excluded.tty, fds=excluded.fds",
+            vec![int(pid), int(tty), text(&serde_json::to_string(fds).unwrap_or_default())]);
+        Ok(())
+    }
+
     /// execve(2)'s second half: the process, with the credentials the authority snapshotted
     /// and its new token's hash, runs the image. A process replacing its image does so only if
     /// it still holds the token it proved itself with, alive: one that ended, or that another
@@ -782,6 +806,10 @@ impl Db {
         self.run(
             "INSERT INTO processes(ns, pid, ppid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, token, started, ended, seat) SELECT ns, ?, pid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, 'running', 0, NULL, token, ?, 0, seat FROM processes WHERE ns = ? AND pid = ?",
             vec![int(pid), int(now), text(&parent.ns), int(parent.pid)],
+        );
+        self.run(
+            "INSERT INTO terminals(pid, tty, fds) SELECT ?, tty, fds FROM terminals WHERE pid = ?",
+            vec![int(pid), int(parent.pid)],
         );
         self.lease(pid, now);
         Ok(Forked {

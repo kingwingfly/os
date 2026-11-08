@@ -4,6 +4,8 @@ import { api, call, mkdirp, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
+// External utilities inherit the browser timezone; timestamp fixtures below use UTC.
+test.use({ timezoneId: 'UTC' });
 let base, headers;
 
 // The programs of user space, with the times the kernel keeps: touch sets them, stat and ls -l
@@ -23,10 +25,10 @@ test.afterEach(async ({ request }) => { await rmrf(request, base); });
 const last = page => page.locator('.transcript pre').last();
 async function run(page, text, { wait = true } = {}) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
-  await expect(busy).toHaveText('↵');
+  const busy = page.locator('#command').locator('xpath=ancestor::form');
+  await expect(busy).toHaveAttribute('data-state', 'idle');
   await input.fill(text); await input.press('Enter');
-  if (wait) await expect(busy).toHaveText('↵', { timeout: 30_000 });
+  if (wait) await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
 }
 async function terminal(page) {
   await page.goto('/');
@@ -34,6 +36,7 @@ async function terminal(page) {
   await page.getByLabel('Password', { exact: true }).fill(password); await page.locator('#auth button[type=submit]').click();
   await expect(page.locator('#auth')).not.toBeVisible();
   await run(page, 'cd ' + base);
+  await run(page, 'export TZ=UTC');
 }
 
 test('touch sets times as told, stat shows them to the nanosecond, ls sorts and shows them', async ({ page, request }) => {
@@ -53,7 +56,7 @@ test('touch sets times as told, stat shows them to the nanosecond, ls sorts and 
   await run(page, 'touch -r old.txt made.txt');
   expect((await call(request, { stat: { path: base + '/made.txt' } }, { headers })).mtime).toBe(old.mtime);
   await run(page, 'touch -d "not a date" old.txt');
-  await expect(last(page)).toContainText("touch: invalid date format 'not a date'");
+  await expect(last(page)).toContainText('touch: Unable to parse date: not a date');
   await run(page, "stat -c '%n %s %a %U %Y' old.txt big.txt");
   await expect(last(page)).toHaveText(`old.txt 4 644 root ${old.mtime}\nbig.txt 19 644 root ${(await call(request, { stat: { path: base + '/big.txt' } }, { headers })).mtime}`);
   // ls -l shows when content changed; -t sorts by it, -S by size, -r the other way.

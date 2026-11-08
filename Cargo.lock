@@ -3856,6 +3856,7 @@ dependencies = [
  "clap",
  "regex",
  "serde",
+ "unicode-width",
 ]
 
 [[package]]
@@ -3880,6 +3881,14 @@ dependencies = [
  "serde_json",
  "terminal-worker-abi",
  "terminal-worker-core",
+]
+
+[[package]]
+name = "terminal-worker-posix"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "terminal-worker-abi",
 ]
 
 [[package]]
@@ -3976,6 +3985,18 @@ dependencies = [
  "terminal-worker-abi",
  "terminal-worker-core",
  "terminal-worker-kernel",
+]
+
+[[package]]
+name = "terminal-worker-utilities"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde_json",
+ "terminal-worker-abi",
+ "terminal-worker-core",
+ "terminal-worker-posix",
+ "terminal-worker-userland",
 ]
 
 [[package]]

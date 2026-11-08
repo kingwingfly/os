@@ -6,17 +6,17 @@ const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWOR
 let sequence = 0;
 const address = name => `accounts-${name}-${Date.now()}-${++sequence}`;
 
-const busy = page => page.locator('.terminal-panel:not([hidden]) .busy');
+const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
 async function run(page, text) {
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   await page.locator('#command').fill(text); await page.locator('#command').press('Enter');
 }
-async function output(page, text) { await run(page, text); await expect(busy(page)).toHaveText('↵'); return (await last(page).textContent()).trim(); }
+async function output(page, text) { await run(page, text); await expect(busy(page)).toHaveAttribute('data-state', 'idle'); return (await last(page).textContent()).trim(); }
 async function visitor(browser) {
   const context = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': address('visitor') } });
   const page = await context.newPage(); await page.goto(origin + '/');
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   return { context, page };
 }
 // Fill and send the account dialog: a new password twice, or the account's own once.

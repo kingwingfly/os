@@ -212,7 +212,7 @@ fn lookup(db: &Db, sid: Option<&str>, procs: &[Row], who: &Identity, path: &str)
         // works (the archive it reads, the file it writes).
         [pid, "fd"] => match job(pid)? {
             process @ Proc::Job(_) => Entry::Dir(process.owner()),
-            Proc::Process(_) => return Err(Errno::ENOENT.into()),
+            Proc::Process(row) => Entry::Dir(row.uid),
         },
         [pid, "fd", number] => match job(pid)? {
             process @ Proc::Job(_) => {
@@ -222,7 +222,12 @@ fn lookup(db: &Db, sid: Option<&str>, procs: &[Row], who: &Identity, path: &str)
                     .ok_or(Errno::ENOENT)?;
                 Entry::Link(opened(db, &found), process.owner())
             }
-            Proc::Process(_) => return Err(Errno::ENOENT.into()),
+            Proc::Process(row) => {
+                let fd: u32 = number.parse().map_err(|_| Errno::ENOENT)?;
+                let fds: Vec<u32> = serde_json::from_str(&row.tty_fds).unwrap_or_default();
+                let tty = row.tty.filter(|_| fds.contains(&fd)).ok_or(Errno::ENOENT)?;
+                Entry::Link(format!("/dev/pts/{tty}"), row.uid)
+            }
         },
         _ => return Err(Errno::ENOENT.into()),
     })
@@ -289,6 +294,17 @@ fn entries(
             .strip_prefix("/proc/")
             .and_then(|rest| rest.strip_suffix("/fd"))
         {
+            Some(pid) if pid.parse::<u32>().is_ok() => {
+                let row = procs
+                    .iter()
+                    .find(|row| row.pid.to_string() == pid)
+                    .ok_or(Errno::ENOENT)?;
+                serde_json::from_str::<Vec<u32>>(&row.tty_fds)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|fd| fd.to_string())
+                    .collect()
+            }
             Some(pid) => db
                 .fds_of(&crate::creds::job_owner(pid))
                 .into_iter()

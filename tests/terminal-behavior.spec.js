@@ -8,7 +8,7 @@ const headers = { Origin: origin };
 const url = (path, recursive = false) => '/api/file?path=' + encodeURIComponent(path) + '&recursive=' + recursive;
 async function command(page, text) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await expect(page.locator('.busy')).toHaveText('↵');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await input.fill(text); await input.press('Enter');
 }
 
@@ -26,7 +26,7 @@ test('stdout and errors scroll after DOM updates; completion uses a separate pag
     await expect(log.locator('pre').last()).not.toContainText('visitor:');
     await expect.poll(() => log.evaluate(e => e.scrollHeight - e.clientHeight - e.scrollTop)).toBeLessThanOrEqual(2);
     await command(page, 'unknown-command');
-    await expect(log.locator('pre').last()).toContainText('Unknown command');
+    await expect(log.locator('pre').last()).toContainText('unknown-command: No such file or directory');
     await expect.poll(() => log.evaluate(e => e.scrollHeight - e.clientHeight - e.scrollTop)).toBeLessThanOrEqual(2);
     const input = page.getByRole('combobox', { name: 'Terminal command' });
     const transcript = await log.innerText();
@@ -72,7 +72,7 @@ test('rm requires explicit login, handles quoted paths, refreshes lists and refu
   await expect(page.locator('#auth')).toBeVisible();
   await page.getByLabel('Password', { exact: true }).fill(password);
   await page.locator('#auth button[type=submit]').click();
-  await expect(page.locator('.busy')).toHaveText('↵');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await command(page, 'mkdir ' + base);
   await expect.poll(async () => (await entry(request, base))?.directory).toBe(true);
   try {
@@ -83,12 +83,12 @@ test('rm requires explicit login, handles quoted paths, refreshes lists and refu
     await command(page, 'rm "Delete this directory"');
     await expect(page.locator('.transcript pre').last()).toContainText("rm: cannot remove 'Delete this directory': Is a directory");
     const input = page.getByRole('combobox', { name: 'Terminal command' });
-    await expect(page.locator('.busy')).toHaveText('↵');
+    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
     await input.fill('rm -r Dele'); await input.press('Tab');
-    await expect(input).toHaveValue('rm -r "Delete this directory/"'); await input.press('Enter');
+    await expect(input).toHaveValue(String.raw`rm -r Delete\ this\ directory/`); await input.press('Enter');
     await expect(page.locator('.filename').filter({ hasText: 'Delete this directory' })).toHaveCount(0);
     await command(page, 'rm -r .'); await expect(page.locator('.transcript pre').last()).toContainText("rm: refusing to remove '.' or '..' directory");
-    await expect(page.locator('.busy')).toHaveText('↵');
+    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
     const chooser = page.waitForEvent('filechooser'); await page.getByRole('button', { name: '↑ Upload files' }).click();
     await (await chooser).setFiles({ name: 'Delete me.txt', mimeType: 'text/plain', buffer: Buffer.from('temporary') });
     await expect(page.locator('.filename').filter({ hasText: 'Delete me.txt' })).toBeVisible();
@@ -99,7 +99,7 @@ test('rm requires explicit login, handles quoted paths, refreshes lists and refu
     await expect(page.locator('.lock')).toContainText('guest');
     await command(page, 'su root'); await expect(page.locator('#auth')).toBeVisible();
     await page.getByLabel('Password', { exact: true }).fill(password); await page.locator('#auth button[type=submit]').click();
-    await expect(page.locator('.busy')).toHaveText('↵');
+    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
     await command(page, 'rm "' + base + '/Delete me.txt"');
     await expect(page.locator('.filename').filter({ hasText: 'Delete me.txt' })).toHaveCount(0);
   } finally {

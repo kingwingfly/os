@@ -33,7 +33,7 @@ async function login(page) {
   await input.fill('su root'); await input.press('Enter');
   await expect(page.locator('#auth')).toBeVisible();
   await page.getByLabel('Password', { exact: true }).fill(rootPassword); await page.locator('#auth button[type=submit]').click();
-  await expect(page.locator('.busy')).toHaveText('↵');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   return input;
 }
 
@@ -121,7 +121,7 @@ test('the browser resumes an interrupted upload from the chunks already sent, an
   const folder = '/browser-uploads-' + Date.now().toString(36);
   const input = await login(page);
   for (const command of ['mkdir ' + folder, 'cd ' + folder]) {
-    await input.fill(command); await input.press('Enter'); await expect(page.locator('.busy')).toHaveText('↵');
+    await input.fill(command); await input.press('Enter'); await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   }
   await browse(page, folder);
   const bytes = content();
@@ -134,7 +134,7 @@ test('the browser resumes an interrupted upload from the chunks already sent, an
     sent.push(index); return route.continue();
   });
   // The Files' button uploads into their directory, once the upload before has ended.
-  const prompt = () => expect(page.locator('.busy')).toHaveText('↵');
+  const prompt = () => expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   const button = page.getByRole('button', { name: '↑ Upload files' });
   const choose = async () => { await expect(button).toBeEnabled(); const chooser = page.waitForEvent('filechooser'); await button.click(); await (await chooser).setFiles({ name: 'data.log', mimeType: 'application/octet-stream', buffer: bytes }); };
   await choose();
@@ -173,8 +173,8 @@ test('the browser resumes an interrupted upload from the chunks already sent, an
   await page.evaluate(() => { HTMLInputElement.prototype.click = function () {}; });
   await prompt();
   await input.fill('upload'); await input.press('Enter');
-  await expect(page.locator('.busy')).toHaveText('Working...');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'running');
   await page.locator('#command').press('Control+c');
-  await expect(page.locator('.busy')).toHaveText('↵');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await rmrf(page.request, folder);
 });

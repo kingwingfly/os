@@ -120,7 +120,8 @@ pub static DEFINITIONS: &[&dyn Definition] = &[
     &Def::<terminal::Help>::NEW,
     &Def::<terminal::Man>::NEW,
     &Def::<terminal::Clear>::NEW,
-    &Def::<files::Ls>::NEW,
+    &Def::<terminal::Export>::NEW,
+    &Def::<terminal::Stty>::NEW,
     &Def::<files::Cd>::NEW,
     &Def::<files::Pwd>::NEW,
     &Def::<files::Open>::NEW,
@@ -698,7 +699,7 @@ mod tests {
     #[test]
     fn options_given_again_are_taken_as_getopt_takes_them() {
         let line = |text: &str| text.split(' ').map(String::from).collect::<Vec<_>>();
-        for text in ["rm -rf -f x", "ls -l -l", "cp -f -f -- a b", "echo -nn hi"] {
+        for text in ["rm -rf -f x", "cp -f -f -- a b", "echo -nn hi"] {
             assert_eq!(check(&line(text)), Ok(()), "{text}");
         }
         let tar = parse::<archives::Tar>(&line("-cf a.tar -f b.tar x")).unwrap();

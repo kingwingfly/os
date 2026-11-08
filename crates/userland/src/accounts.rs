@@ -110,6 +110,10 @@ pub async fn whoami(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
 
 pub async fn id(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
     let id = parsed!(io, args::Id);
+    if (id.names || id.real) && !(id.user_only || id.group_only || id.groups_only) {
+        io.fail("id: cannot print only names or real IDs in default format");
+        return 1;
+    }
     let Some((uid, name, gid, ids)) = who(sys, io, "id", &id.user).await else {
         return 1;
     };
@@ -120,6 +124,33 @@ pub async fn id(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
             .find(|(_, id, _)| *id == gid)
             .map_or_else(|| gid.to_string(), |(name, _, _)| name.clone())
     };
+    if id.user_only {
+        io.say(if id.names { name } else { uid.to_string() });
+        return 0;
+    }
+    if id.group_only {
+        io.say(if id.names {
+            named(gid)
+        } else {
+            gid.to_string()
+        });
+        return 0;
+    }
+    if id.groups_only {
+        io.say(
+            ids.iter()
+                .map(|gid| {
+                    if id.names {
+                        named(*gid)
+                    } else {
+                        gid.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        return 0;
+    }
     let list: Vec<String> = ids.iter().map(|g| format!("{g}({})", named(*g))).collect();
     io.say(format!(
         "uid={uid}({name}) gid={gid}({}) groups={}",

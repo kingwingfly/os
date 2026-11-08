@@ -55,9 +55,9 @@ function tarOf(members) {
 
 const form = page => page.locator('#command').locator('xpath=ancestor::form');
 async function run(page, text, { wait = true } = {}) {
-  await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 180_000 });
+  await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 180_000 });
   await page.locator('#command').fill(text); await page.locator('#command').press('Enter');
-  if (wait) await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 180_000 });
+  if (wait) await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 180_000 });
 }
 const transcript = page => page.locator('.terminal-panel:not([hidden]) .transcript');
 async function terminal(page) {
@@ -142,8 +142,8 @@ test('a job keeps the credentials it was spawned with, and its own descriptors',
   try {
     expect((await api(user, 'login', { data: { username: name, password: secret } })).ok()).toBe(true);
     const { uid, home } = await call(user, 'getcreds');
-    expect((await put(user, file(`${home}/greeting.zip`), { headers: { Origin: origin }, data: zipOf([['hello.txt', 'hello\n']]) })).status()).toBe(201);
-    const { pid } = await call(user, { spawn: { argv: ['unzip', 'greeting.zip'], cwd: home } });
+    expect((await put(user, file(`${home}/greeting.zip`), { headers: { Origin: origin }, data: zipOf([['private/hello.txt', 'hello\n']]) })).status()).toBe(201);
+    const { pid } = await call(user, { spawn: { argv: ['unzip', 'greeting.zip'], cwd: home } }, { umask: 0o077 });
     // The archive it reads is a descriptor of its own.
     const fds = await call(user, { getdents: { path: `/proc/${pid}/fd` } });
     expect(fds).toHaveLength(1);
@@ -153,9 +153,11 @@ test('a job keeps the credentials it was spawned with, and its own descriptors',
     let state;
     await expect.poll(async () => (state = await call(request, { wait: { pid } })).state, { timeout: 120_000 }).toMatch(/^(done|failed|cancelled)$/);
     expect(state.state, JSON.stringify(state.lines)).toBe('done');
-    const made = await call(request, { stat: { path: `${home}/hello.txt` } });
+    const made = await call(request, { stat: { path: `${home}/private/hello.txt` } });
     expect(made.uid).toBe(uid);
-    expect(await (await request.get(file(`${home}/hello.txt`))).text()).toBe('hello\n');
+    expect(await (await request.get(file(`${home}/private/hello.txt`))).text()).toBe('hello\n');
+    // The runner omits umask from its requests: implicit parents retain the spawn mask.
+    expect((await call(request, { stat: { path: `${home}/private` } })).mode & 0o777).toBe(0o700);
     // Ended, its credentials are revoked, and what it had open is closed.
     await call(request, { usermod: { name, unlock: true } }, { sudo: true });
     expect((await api(user, 'login', { data: { username: name, password: secret } })).ok()).toBe(true);
@@ -173,12 +175,12 @@ test('unzip asks before replacing, -o and -n decide, tar -k keeps, and hostile m
   for (const name of ['a.md', 'run.sh']) await put(request, file(`${base}/copy/docs/${name}`) + '&overwrite=true', { headers, data: 'changed\n' });
   // Asked: no for the first, then None for the rest.
   await run(page, 'unzip notes.zip -d copy', { wait: false });
-  await expect(form(page).locator('.busy')).toHaveText('Answer ↵', { timeout: 120_000 });
+  await expect(form(page)).toHaveAttribute('data-state', 'answer', { timeout: 120_000 });
   await expect(transcript(page)).toContainText('replace ' + base + '/copy/docs/a.md? [y]es, [n]o, [A]ll, [N]one');
   await page.locator('#command').fill('y'); await page.locator('#command').press('Enter');
-  await expect(form(page).locator('.busy')).toHaveText('Answer ↵');
+  await expect(form(page)).toHaveAttribute('data-state', 'answer');
   await page.locator('#command').fill('N'); await page.locator('#command').press('Enter');
-  await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 120_000 });
+  await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 120_000 });
   expect(await (await request.get(file(base + '/copy/docs/a.md'))).text()).toBe('alpha\n'.repeat(2000));
   expect(await (await request.get(file(base + '/copy/docs/run.sh'))).text()).toBe('changed\n');
   await run(page, 'unzip -qn notes.zip -d copy');
@@ -216,7 +218,7 @@ test('Ctrl+C stops an extraction between files, and a closed tab leaves its job 
   await run(page, 'unzip many.zip -d stopped', { wait: false });
   await expect(transcript(page)).toContainText('inflating:', { timeout: 120_000 });
   await page.locator('#command').press('Control+c');
-  await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 120_000 });
+  await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 120_000 });
   const stopped = await ls(request, base + '/stopped/docs/many');
   expect(stopped.length).toBeGreaterThan(0); expect(stopped.length).toBeLessThan(40);
   // What was extracted is whole; nothing is left half-written.
@@ -224,7 +226,7 @@ test('Ctrl+C stops an extraction between files, and a closed tab leaves its job 
   // A job started in a tab that closes runs to its end.
   await page.keyboard.press('Alt+t'); await expect(page.getByRole('tab')).toHaveCount(2);
   await run(page, 'unzip -q many.zip -d detached', { wait: false });
-  await expect(form(page).locator('.busy')).toHaveText('Working...');
+  await expect(form(page)).toHaveAttribute('data-state', 'running');
   await page.getByRole('button', { name: 'Close tab 2' }).click();
   await expect(page.getByRole('tab')).toHaveCount(1);
   await expect.poll(async () => (await ls(request, base + '/detached/docs/many')).length, { timeout: 180_000 }).toBe(40);
@@ -239,7 +241,7 @@ test('extracting nothing ends at once and says why; modes are those archived, 00
   await make('many.zip', zipOf(Array.from({ length: 700 }, (_, i) => [String(i).padStart(4, '0') + '.txt', 'x'])));
   await terminal(page);
   // Each ends once, rather than plan again and again.
-  const ends = async text => { await run(page, text, { wait: false }); await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 120_000 }); };
+  const ends = async text => { await run(page, text, { wait: false }); await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 120_000 }); };
   await ends('unzip -d out empty.zip');
   await expect(transcript(page)).toContainText('warning [' + base + '/empty.zip]:  zipfile is empty');
   await run(page, 'mkdir none'); await ends('tar -xf empty.tar -C none');
@@ -275,7 +277,7 @@ test('extraction tells a guest nothing of what lies where it may not look', asyn
   await page.goto('/');
   // Not asked whether to replace the file that is there: both fail alike.
   await run(page, `unzip ${base}/probe.zip -d ${base}/shared`, { wait: false });
-  await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 120_000 });
+  await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 120_000 });
   await expect(transcript(page)).not.toContainText('replace ');
   for (const name of ['exists.txt', 'missing.txt']) await expect(transcript(page)).toContainText(`${base}/shared/private/${name}: Permission denied`);
   expect(await (await request.get(file(base + '/shared/private/exists.txt'), { headers })).text()).toBe('kept');

@@ -1,19 +1,10 @@
 //! What a program is given, and what it gives back: its arguments, its working directory, its
-//! standard input, what it writes, its errors, and, for ls, a listing the terminal shows as a
-//! view of its own.
+//! standard input, what it writes, and its errors.
 use std::future::Future;
 use std::pin::Pin;
-use terminal_worker_core::Entry;
 
 /// A question a program asks on the terminal (mv -i): the line answered, or none if cancelled.
 pub type Ask<'a> = &'a dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>>>>;
-
-/// What the terminal shows of a program's output, rather than its text.
-#[derive(Clone, Debug)]
-pub enum View {
-    /// A listing: the entries, long (-l) or not.
-    Listing { entries: Vec<Entry>, long: bool },
-}
 
 pub struct Io<'a> {
     /// The program's name and its arguments.
@@ -22,14 +13,13 @@ pub struct Io<'a> {
     pub cwd: String,
     /// The account's home, which `~` names.
     pub home: String,
-    /// The time it started, in seconds since 1970, which touch -d now and ls -l reckon from.
+    /// The time it started, in seconds since 1970, which touch -d now reckons from.
     pub now: u64,
     pub stdin: Option<String>,
     /// What it writes, ...
     pub out: String,
     /// ... and its error lines.
     pub err: Vec<String>,
-    pub view: Option<View>,
     /// What fd found, by path, for -x and -X to run on.
     pub found: Vec<String>,
     /// Whether Ctrl+C asked it to stop: it does, between steps.

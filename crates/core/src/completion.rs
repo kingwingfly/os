@@ -9,6 +9,8 @@ pub struct Candidate {
     pub value: String,
     pub kind: String,
     pub descend: bool,
+    /// Caret position in UTF-8 bytes, before a directory's closing quote when quoted.
+    pub cursor: usize,
 }
 #[derive(Clone, Debug)]
 pub struct PathQuery {
@@ -16,7 +18,81 @@ pub struct PathQuery {
     pub prefix: String,
     pub needle: String,
     pub directories_only: bool,
-    pub auto_open: bool,
+    pub command_position: bool,
+    pub commands: Vec<Candidate>,
+    pub before: String,
+    pub quote: Option<char>,
+}
+
+/// Shell-safe spelling without adding quotes around ordinary paths.
+pub fn escape_path(path: &str) -> String {
+    // Backslash-newline is a line continuation, so a literal newline needs quotes.
+    if path.contains('\n') {
+        return quote(path);
+    }
+    path.chars()
+        .flat_map(|c| {
+            if c.is_alphanumeric() || "._/:-,+@%~".contains(c) {
+                vec![c]
+            } else {
+                vec!['\\', c]
+            }
+        })
+        .collect()
+}
+
+pub fn runnable(entry: &Entry) -> bool {
+    !entry.directory
+        && ((entry.link.is_none() && entry.mode & 0o111 != 0)
+            || entry.name.to_ascii_lowercase().ends_with(".wasm"))
+}
+
+/// The token containing the caret, respecting quoted spaces and escaped separators.
+pub fn token_span(input: &str, cursor: usize) -> (usize, usize) {
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    for (i, c) in input.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' && crate::escapes(quote, input[i + 1..].chars().next()) {
+            escaped = true;
+        } else if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
+        } else if c.is_whitespace() || c == '|' {
+            if i >= cursor {
+                return (start, i);
+            }
+            start = i + c.len_utf8();
+        }
+    }
+    (start, input.len())
+}
+
+/// Extend only a shared prefix; never shorten the typed token for unrelated fuzzy matches.
+pub fn common_prefix(input: &str, candidates: &[Candidate]) -> String {
+    let Some(first) = candidates.first() else {
+        return input.into();
+    };
+    let mut end = first.cursor;
+    for candidate in &candidates[1..] {
+        end = first.value[..end]
+            .chars()
+            .zip(candidate.value[..candidate.cursor].chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(c, _)| c.len_utf8())
+            .sum();
+    }
+    let prefix = &first.value[..end];
+    if prefix.starts_with(input) && prefix.len() > input.len() {
+        prefix.into()
+    } else {
+        input.into()
+    }
 }
 
 /// Exact, prefix, substring, then ordered subsequence. Case-insensitive Unicode;
@@ -139,14 +215,19 @@ pub enum Query {
 /// says of the operand or option value it is: `Some(true)` a directory, `Some(false)` any path,
 /// `None` not a path (an option, a mode, a user, a pattern...).
 fn path_operand(words: &[String]) -> Option<bool> {
-    let mut command = crate::cli::definition(&words[0])?.command();
+    let (last, before) = words[1..].split_last()?;
+    // External executables need no browser CLI definition. Like a shell without a custom
+    // completion script, offer paths for their operands, including an empty one after a space.
+    let Some(definition) = crate::cli::definition(&words[0]) else {
+        return (!last.starts_with('-') || before.iter().any(|word| word == "--")).then_some(false);
+    };
+    let mut command = definition.command();
     command.build();
     let hint = |arg: &Arg| match arg.get_value_hint() {
         ValueHint::DirPath => Some(true),
         ValueHint::AnyPath | ValueHint::FilePath => Some(false),
         _ => None,
     };
-    let (last, before) = words[1..].split_last()?;
     let mut operands = 0;
     let mut ended = false;
     let mut value_of = None;
@@ -263,12 +344,34 @@ fn nested(words: &[String]) -> Option<usize> {
 pub fn query(input: &str) -> Query {
     let (before, stage) = last_stage(input);
     let (words, typed) = partial_words(stage);
-    query_words(before.trim_end(), &words, &typed, before.is_empty())
+    let mut result = query_words(before.trim_end(), &words, &typed, before.is_empty());
+    let (start, _) = token_span(input, input.len());
+    let before = &input[..start];
+    match &mut result {
+        Query::Paths(q) => {
+            q.before = before.into();
+            q.quote = input[start..]
+                .chars()
+                .next()
+                .filter(|c| matches!(c, '\'' | '"'));
+            for c in &mut q.commands {
+                c.value = format!("{before}{} ", c.label);
+                c.cursor = c.value.len();
+            }
+        }
+        Query::Commands(candidates) => {
+            for c in candidates {
+                c.value = format!("{before}{} ", c.label);
+                c.cursor = c.value.len();
+            }
+        }
+        Query::None => {}
+    }
+    result
 }
 
 /// Complete `words`, a command and its arguments, typed after `context` on the line, each of
-/// them typed again as `typed` says. Only the line's first command, alone, may also complete as
-/// a path to open or enter.
+/// them typed again as `typed` says. The first command also offers directories and programs.
 fn query_words(context: &str, words: &[String], typed: &[String], first: bool) -> Query {
     let after = |head: &str| match (context.is_empty(), head.is_empty()) {
         (true, _) => head.to_string(),
@@ -276,8 +379,9 @@ fn query_words(context: &str, words: &[String], typed: &[String], first: bool) -
         (false, false) => format!("{context} {head}"),
     };
     let command = words[0].as_str();
-    let auto_open = words.len() == 1 && first;
-    if words.len() == 1 && (!command.is_empty() || !first) {
+    let command_position = words.len() == 1 && first;
+    let mut command_candidates = Vec::new();
+    if words.len() == 1 {
         // Every command defined, as help lists them, and /bin's programs the shell has none
         // of its own for.
         let names = crate::cli::names();
@@ -299,24 +403,27 @@ fn query_words(context: &str, words: &[String], typed: &[String], first: bool) -
                             value: format!("{} ", after(name)),
                             kind: "command".into(),
                             descend: true,
+                            cursor: 0,
                         },
                     )
                 })
             })
             .collect();
         commands.sort_by_key(|(score, _)| *score);
-        if !commands.is_empty() {
-            return Query::Commands(commands.into_iter().map(|(_, c)| c).collect());
-        }
+        command_candidates = commands.into_iter().map(|(_, c)| c).collect();
         if !first {
-            return Query::None;
+            return if command_candidates.is_empty() {
+                Query::None
+            } else {
+                Query::Commands(command_candidates)
+            };
         }
     }
     if let Some(at) = nested(words) {
         let head = typed[..at].join(" ");
         return query_words(&after(&head), &words[at..], &typed[at..], false);
     }
-    let (head, raw, directories_only) = if auto_open {
+    let (head, raw, directories_only) = if command_position {
         (String::new(), command, false)
     } else if let Some(directories) = path_operand(words) {
         let last = words.last().map_or("", String::as_str);
@@ -328,11 +435,14 @@ fn query_words(context: &str, words: &[String], typed: &[String], first: bool) -
         .rfind('/')
         .map_or(("", raw), |i| (&raw[..=i], &raw[i + 1..]));
     Query::Paths(PathQuery {
-        head: if auto_open { head } else { after(&head) },
+        head: if command_position { head } else { after(&head) },
         prefix: prefix.into(),
         needle: needle.into(),
         directories_only,
-        auto_open,
+        command_position,
+        commands: command_candidates,
+        before: String::new(),
+        quote: None,
     })
 }
 /// A word as typed again: options and plain words as they are, anything else quoted.
@@ -350,10 +460,15 @@ fn quote_word(word: &str) -> String {
 }
 
 pub fn path_candidates(query: &PathQuery, entries: &[Entry]) -> Vec<Candidate> {
-    let mut hits: Vec<_> = entries
+    let mut hits: Vec<_> = query
+        .commands
         .iter()
-        .filter_map(|entry| {
-            if query.directories_only && !entry.directory {
+        .filter_map(|c| Some((fuzzy_score(&query.needle, &c.label)?, true, c.clone())))
+        .chain(entries.iter().filter_map(|entry| {
+            if (query.directories_only && !entry.directory)
+                || (query.command_position && !entry.directory && !runnable(entry))
+                || (entry.name.starts_with('.') && !query.needle.starts_with('.'))
+            {
                 return None;
             }
             let score = fuzzy_score(&query.needle, &entry.name)?;
@@ -363,27 +478,41 @@ pub fn path_candidates(query: &PathQuery, entries: &[Entry]) -> Vec<Candidate> {
                 entry.name,
                 if entry.directory { "/" } else { "" }
             );
-            // Quoting alone doesn't stop a command from reading a leading '-' as an option.
-            if path.starts_with('-') {
+            // A local executable must be invoked by path, and leading '-' must not become an option.
+            if path.starts_with('-')
+                || (query.command_position && !entry.directory && !path.contains('/'))
+            {
                 path.insert_str(0, "./");
             }
-            let head = if query.auto_open {
-                if entry.directory { "cd" } else { "open" }
-            } else {
-                &query.head
+            let quoted = match query.quote {
+                Some('"') => quote(&path),
+                Some('\'') => format!("'{}'", path.replace('\'', "'\\''")),
+                _ => escape_path(&path),
             };
+            let value = format!(
+                "{}{}{}",
+                query.before,
+                quoted,
+                if entry.directory { "" } else { " " }
+            );
+            let cursor = value.len() - usize::from(entry.directory && query.quote.is_some());
             Some((
                 score,
                 !entry.directory,
                 Candidate {
                     label: format!("{}{}", entry.name, if entry.directory { "/" } else { "" }),
-                    value: format!("{head} {}", quote(&path)),
+                    value,
+                    cursor,
                     kind: entry.kind.clone(),
                     descend: entry.directory,
                 },
             ))
-        })
+        }))
         .collect();
+    // Prefix matches win; substring and subsequence matching are fallbacks, as in fish.
+    if let Some(best) = hits.iter().map(|h| h.0.0.saturating_sub(1)).min() {
+        hits.retain(|h| h.0.0.saturating_sub(1) == best);
+    }
     hits.sort_by(|a, b| {
         a.0.cmp(&b.0)
             .then(a.1.cmp(&b.1))
@@ -405,6 +534,19 @@ mod tests {
             kind: if directory { "directory" } else { "text" }.into(),
             ..Default::default()
         }
+    }
+    #[test]
+    fn external_programs_without_browser_definitions_complete_paths() {
+        for input in ["ls ", "ls -l ", "/usr/bin/ls ", "sudo ls ", "my-program "] {
+            let Query::Paths(query) = query(input) else {
+                panic!("{input}");
+            };
+            let hits = path_candidates(&query, &[entry("docs", true), entry("note.txt", false)]);
+            assert_eq!(hits.len(), 2, "{input}");
+            assert!(hits.iter().any(|hit| hit.value == format!("{input}docs/")));
+        }
+        assert!(matches!(query("ls --color"), Query::None));
+        assert!(matches!(query("ls -- -"), Query::Paths(_)));
     }
     #[test]
     fn touch_completion_preserves_prior_paths_and_flags() {
@@ -435,7 +577,7 @@ mod tests {
             panic!()
         };
         assert_eq!(q.head, "fd -e md | xargs wc -l");
-        assert!(!q.auto_open);
+        assert!(!q.command_position);
         let Query::Paths(q) = query("fd -e txt -x mv {} 'old notes/") else {
             panic!()
         };
@@ -468,11 +610,11 @@ mod tests {
         assert!(fuzzy_score("xyz", "hekou.md").is_none());
     }
     #[test]
-    fn empty_input_browses_files_and_commands_keep_their_context() {
+    fn command_position_completes_directories_and_commands_without_launchers() {
         let Query::Paths(q) = query("") else { panic!() };
         let hits = path_candidates(&q, &[entry("b.txt", false), entry("media", true)]);
-        assert_eq!(hits[0].value, "cd \"media/\"");
-        assert_eq!(hits[1].value, "open \"b.txt\"");
+        assert_eq!(hits[0].value, "media/");
+        assert!(!hits.iter().any(|hit| hit.label == "b.txt"));
         let Query::Paths(q) = query("cd ") else {
             panic!()
         };
@@ -480,10 +622,10 @@ mod tests {
             path_candidates(&q, &[entry("b.txt", false), entry("media", true)]).len(),
             1
         );
-        let Query::Commands(c) = query("op") else {
+        let Query::Paths(q) = query("op") else {
             panic!()
         };
-        assert_eq!(c[0].value, "open ");
+        assert_eq!(path_candidates(&q, &[])[0].value, "open ");
     }
     #[test]
     fn operands_are_paths_where_the_definitions_say() {
@@ -558,7 +700,71 @@ mod tests {
         };
         assert_eq!(
             path_candidates(&q, &[entry("-notes.txt", false)])[0].value,
-            "rm \"./-notes.txt\""
+            "rm ./-notes.txt "
         );
+    }
+    #[test]
+    fn fish_paths_complete_tokens_and_prefer_prefixes() {
+        let Query::Paths(q) = query("gues") else {
+            panic!()
+        };
+        let hits = path_candidates(&q, &[entry("guest", true), entry("great-user-space", true)]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].value, "guest/");
+        let Query::Paths(q) = query("demo") else {
+            panic!()
+        };
+        let hits = path_candidates(&q, &[entry("demo.wasm", false), entry("demo.txt", false)]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].value, "./demo.wasm ");
+        let Query::Paths(q) = query("open   alp") else {
+            panic!()
+        };
+        let hits = path_candidates(
+            &q,
+            &[
+                entry("alpha.txt", false),
+                entry("alphabet.txt", false),
+                entry("z-alpha.txt", false),
+            ],
+        );
+        assert_eq!(hits.len(), 2);
+        assert_eq!(common_prefix("open   alp", &hits), "open   alpha");
+    }
+
+    #[test]
+    fn completion_escapes_paths_and_keeps_directory_carets_inside_quotes() {
+        assert_eq!(
+            split_command(&escape_path("line\nbreak")).unwrap(),
+            ["line\nbreak"]
+        );
+        for input in ["open spa", "open 'spa", "open \"spa"] {
+            let Query::Paths(q) = query(input) else {
+                panic!()
+            };
+            let hits = path_candidates(&q, &[entry("space 'quote' \"double\"", true)]);
+            assert_eq!(
+                split_command(&hits[0].value).unwrap(),
+                ["open", "space 'quote' \"double\"/"]
+            );
+            assert!(hits[0].value[..hits[0].cursor].ends_with('/'));
+        }
+        let Query::Paths(q) = query("cp 'keep this'   spa") else {
+            panic!()
+        };
+        assert_eq!(
+            path_candidates(&q, &[entry("space file", false)])[0].value,
+            "cp 'keep this'   space\\ file "
+        );
+    }
+
+    #[test]
+    fn token_spans_preserve_quoted_pipes_and_following_arguments() {
+        let line = "cat x | open \"γάμμα | name\" tail";
+        let cursor = line.find("μμα").unwrap();
+        let (start, end) = token_span(line, cursor);
+        assert_eq!(&line[start..end], "\"γάμμα | name\"");
+        assert_eq!(&line[end..], " tail");
+        assert_eq!(token_span("open ", 5), (5, 5));
     }
 }

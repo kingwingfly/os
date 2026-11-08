@@ -23,7 +23,7 @@ test.afterEach(async ({ request }) => { await rmrf(request, base); });
 
 async function open(page, name) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await expect(page.locator('#command').locator('xpath=ancestor::form').locator('.busy')).toHaveText('↵');
+  await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle');
   await input.fill(`open ${base}/${name}`); await input.press('Enter');
   await expect(page.locator('#viewer')).toBeVisible();
 }

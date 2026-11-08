@@ -293,7 +293,7 @@ impl HttpSys {
         let count = calls.len();
         let batch = Batch {
             calls,
-            umask: self.umask,
+            umask: Some(self.umask),
             sudo: self.sudo,
             pid: None,
             process: None,

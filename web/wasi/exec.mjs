@@ -7,18 +7,19 @@
 // a line at a time. Pipes are memory the page and its processes share, which a page may have
 // only when isolated from other sites (web/_headers); where it is not, they run one after
 // another, each given what the one before wrote, and nothing reads the terminal.
-import { PAGE, Pipe, pipeBuffer } from './pipe.js';
+import { Pipe, pipeBuffer } from './pipe.js';
+import { Pty, TtyState, IOCTL, LF, IF } from '../kernel/pty.js';
 import { Bytes, Shares } from './shared.js';
 const kernelCall = (type, args) => globalThis.kernelRequest(type, args);
 import { load } from '../kernel/loader.js';
 import { STRERROR } from '../http.mjs';
+import { resolveExecs } from './resolve.mjs';
 
 // Executables are the build's own /usr/bin images by default; a stage may name its own path
 // (an uploaded wasm the shell resolved against the working directory). Each process is a
 // registry process: the client kernel asks for the pipeline's stages at once (execve, one
 // request), and each one's token goes with every batch the process makes. The loader compiles
 // once per immutable content.
-const COREUTILS = '/usr/bin/coreutils';
 // Why execve or the loader said no, as the shell says it: the name as typed, then glibc's words.
 const refused = (name, error) => {
   const why = error.errno && error.message === error.errno ? (STRERROR[error.errno] ?? error.errno) : error.message;
@@ -139,31 +140,6 @@ export function reconcile() {
   }).catch(() => {}).finally(() => { reconciling = null; });
 }
 
-// The terminal's input, which the page writes typed lines to: what does not fit yet waits, and
-// Ctrl+D ends a read after what was typed before it, and before what is typed after it.
-function terminalInput() {
-  const pipe = new Pipe(pipeBuffer()), queue = [];
-  // The page writes it, as long as the pipeline may read it.
-  pipe.hold(PAGE, 'w');
-  let timer = 0;
-  const pump = () => {
-    timer = 0;
-    // Nothing reads it any more: what was typed goes nowhere.
-    if (pipe.readerGone) { queue.length = 0; return; }
-    while (queue.length) {
-      if (queue[0] === null) { pipe.endOfFile(); queue.shift(); continue; }
-      // What follows Ctrl+D waits until a read has ended with it.
-      if (pipe.ending) break;
-      const put = pipe.put(queue[0]);
-      if (put < queue[0].length) { queue[0] = queue[0].subarray(put); break; }
-      queue.shift();
-    }
-    if (queue.length) timer = setTimeout(pump, 20);
-  };
-  const send = item => { queue.push(item); if (!timer) pump(); };
-  return { pipe, write: text => send(encoder.encode(text)), eof: () => send(null), close: () => { clearTimeout(timer); pipe.closeWriter(); } };
-}
-
 // Run the pipeline `stages`, each an argv, as `options` say: {cwd, home, user, sudo, umask;
 // stdin, a string, or none for the terminal; tty, whether the last writes to the terminal;
 // enough, how many lines of its output its reader takes, before it closes the pipe; cancelled,
@@ -180,16 +156,19 @@ export async function exec(stages, options = {}) {
   // The shell's callbacks last as long as the run: a process that outlives it (a child left in
   // the background) is heard no more.
   let finished = false;
-  const onOutput = (fd, text) => { if (!finished) options.onOutput?.(fd, text); };
+  const onOutput = (fd, text) => finished ? undefined : options.onOutput?.(fd, text);
   const onReading = () => { if (!finished) options.onReading?.(); };
   const onState = state => { if (!finished) options.onState?.(state); };
   const env = piped => ({
-    PWD: cwd, HOME: home, USER: user, LOGNAME: user, PATH: '/usr/bin', SHELL: '/usr/bin/sh', LANG: 'C.UTF-8',
-    TERM: piped ? 'dumb' : 'xterm-256color', COLUMNS: String(options.columns ?? 80),
+    HOME: home, USER: user, LOGNAME: user, PATH: '/usr/bin', SHELL: '/usr/bin/sh', LANG: 'C.UTF-8',
+    TERM: piped ? 'dumb' : 'xterm-256color', COLUMNS: String(options.columns ?? 80), LINES: String(options.rows ?? 24),
     TZ: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    ...options.environment,
+    PWD: cwd,
   });
   const last = stages.length - 1, isolated = globalThis.crossOriginIsolated;
   let stdout = '', truncated = false, lines = 0, full = false, stopped = false;
+  const truncatedBy = new Set();
   // Whether the last's reader, which takes only so much, has closed its end: the last hears
   // SIGPIPE at its next write and ends as a process does, closing what it has open (memory it
   // shares, where the page may share it; else the page ends it).
@@ -197,17 +176,22 @@ export async function exec(stages, options = {}) {
   // The stages' processes, and those they forked: the job's process group.
   const processes = [], forks = [];
   const group = () => [...processes, ...forks];
+  let input = null, terminal = null, pgid = 0, foreground = true;
   let stopSignal = SIG.INT;
   // End every process still running, by `signal`.
   const stop = signal => { stopped = true; stopSignal = signal; for (const process of group()) process.kill(signal); };
   // The pipeline as a process group: a signal to it is to each of its processes; one that ends
   // a process ends the pipeline. Stopping needs memory shared with the processes.
   const job = {
+    foreground: active => { foreground = active; if (terminal && pgid) { if (active) terminal.state.pgrp = pgid; else if (terminal.state.pgrp === pgid) terminal.state.pgrp = 0; } },
     get pids() { return group().filter(process => !process.ended).map(process => process.pid); },
     stoppable: !!isolated,
     signal: signal => {
       if (ENDING.has(signal)) return stop(signal);
-      for (const process of group()) process.signal(signal);
+      for (const process of group()) {
+        process.signal(signal);
+        if ([SIG.STOP, SIG.TSTP, SIG.CONT].includes(signal)) void kernelCall('kill', { pid: process.pid, from: process.pid, signal }).catch(() => {});
+      }
     },
   };
   // Stopped once every process still running is; running as one goes on.
@@ -219,6 +203,13 @@ export async function exec(stages, options = {}) {
     onJob(job);
   };
   onJob(job);
+  if (isolated && (tty || stdin == null)) {
+    terminal = new Pty({ state: options.terminalState ?? TtyState.create(options),
+      echo: text => onOutput(0, text), signal: number => job.signal(number),
+      mode: value => options.onMode?.(value) });
+    if (options.columns && options.rows) terminal.state.resize(options);
+    known(terminal.pipe.buffer);
+  }
   // What a process writes when not to the terminal: the next one's, or the last's reader's,
   // which may want only so much.
   const collect = (text, isLast) => {
@@ -240,15 +231,16 @@ export async function exec(stages, options = {}) {
   // credentials, in one request; each process's token goes with each batch the host makes for
   // it. A stage may name its own image (an uploaded wasm); the loader compiles it once per
   // content.
-  const asked = kernelCall('execs', {
-    stages: stages.map((stage, index) => ({
-      path: stage.path ?? COREUTILS,
+  const asked = resolveExecs(
+    stages.map((stage, index) => ({
+      path: stage.path ?? (stage.argv ?? stage)[0],
       argv: stage.argv ?? stage,
       env: Object.entries(environments[index]).map(([name, value]) => `${name}=${value}`),
       cwd,
     })),
-    sudo,
-  });
+    stages => kernelCall('execs', { stages, sudo }),
+    abandon,
+  );
   const images = stages.map((stage, index) => asked.then(results => {
     const result = results[index];
     if (result?.ok) return result.ok;
@@ -265,6 +257,18 @@ export async function exec(stages, options = {}) {
   const host = ({ pid, token, ppid, module, memory, startSection = false, argv, write, forked, start, transfer = [], files = null }) => {
     const worker = new Worker('/wasi-process.js');
     const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
+    // Each writer has two small compositor credits. A killed worker cannot leak credits
+    // needed by another writer, and fork children get their own bounded output channel.
+    const outputCredit = isolated ? new Int32Array(new SharedArrayBuffer(4)) : null;
+    if (outputCredit) Atomics.store(outputCredit, 0, 2);
+    const releaseOutput = () => { if (outputCredit) { Atomics.add(outputCredit, 0, 1); Atomics.notify(outputCredit, 0); } };
+    const displaying = new Set();
+    const publish = (fd, text, tty = false) => {
+      const done = Promise.resolve().then(() => (tty ? onOutput : write)(fd, text));
+      displaying.add(done);
+      void done.then(() => displaying.delete(done), () => displaying.delete(done));
+      return done;
+    };
     let settle, status = null, killing = null;
     const exited = new Promise(resolve => { settle = resolve; });
     // The word it is signalled by (stopped, continued, ended: process.js); the memory its
@@ -286,10 +290,10 @@ export async function exec(stages, options = {}) {
       changed();
       // What it held of pipes goes as it goes, its locks too.
       release(pid);
-      for (const fd of [1, 2]) write(fd, decoders[fd].decode());
+      for (const fd of [1, 2]) { const text = decoders[fd].decode(); if (text) void publish(fd, text); }
       const closing = outright ? closeHeld(files, pid, process.token, { umask, sudo }) : Promise.resolve();
       void closing.then(() => reap(pid, { status: code, signal }, forked));
-      void closing.then(() => settle(code));
+      void Promise.allSettled([closing, ...displaying]).then(() => settle(code));
     };
     // A signal that ends it: heeded at its next call, as it exits; outright if it cannot.
     const kill = signal => {
@@ -308,6 +312,8 @@ export async function exec(stages, options = {}) {
         // kill(2) from a process is the process's, by its own credentials.
         else if (type === 'kill') reply = (await kernelCall('kill', { pid: args.pid, signal: args.signal, from: pid })) ?? {};
         else if (type === 'exec') reply = await replace(args);
+        else if (type === 'spawn') reply = await spawn(args);
+        else if (type === 'tty') reply = ttyRequest(args);
         else reply = { errno: 'ENOSYS' };
       } catch (error) {
         reply = { errno: error.errno ?? 'EIO' };
@@ -332,6 +338,60 @@ export async function exec(stages, options = {}) {
       worker.postMessage({ image: { module: loaded.module, memory: loaded.memory, startSection: loaded.startSection, token: image.token, argv: args, env } });
       return {};
     };
+    const checkInheritance = state => {
+      const full = description => ['tty', 'pipe-in', 'pipe-out'].includes(description.kind)
+        ? !known(description.buffer).holdable(0)
+        : description.share != null && !files?.shares.holdable(description.share);
+      if (state.descriptions.some(full)) throw Object.assign(new Error('no holder free'), { errno: 'EAGAIN' });
+    };
+    const holdInheritance = (state, child) => {
+      for (const description of state.descriptions) {
+        if (description.kind === 'pipe-in' || description.kind === 'tty') known(description.buffer).hold(child, 'r', description.refs);
+        else if (description.kind === 'pipe-out') known(description.buffer).hold(child, 'w', description.refs);
+        else if (description.share != null) files?.shares.add(description.share, child, description.refs);
+      }
+    };
+    // posix_spawn: the same authorized fork/exec lifecycle, without copying guest memory.
+    // The host derives credentials from this parent; the request cannot supply a token.
+    const spawn = async state => {
+      let child, held = false;
+      const alive = () => {
+        if (process.ended || killing != null || stopped) throw { errno: 'EINTR' };
+      };
+      try {
+        alive();
+        checkInheritance(state);
+        child = await kernelCall('fork', { pid });
+        alive();
+        const [result] = await resolveExecs([{ path: state.argv[0], argv: state.argv, env: state.env, cwd: state.cwd }],
+          stages => Promise.all(stages.map(async stage => {
+            alive();
+            try { return { ok: await kernelCall('reexec', { pid: child.pid, ...stage }) }; }
+            catch (err) { return { err }; }
+          })));
+        if (result.err) throw result.err;
+        child.token = result.ok.token;
+        alive();
+        const loaded = await load(result.ok).catch(error => { throw { errno: 'ENOEXEC', detail: error.message }; });
+        alive();
+        holdInheritance(state, child.pid);
+        held = true;
+        const made = host({ pid: child.pid, token: child.token, ppid: pid, ...loaded, argv: state.argv,
+          write, forked: true, start: { inherit: state }, files });
+        forks.push(made);
+        if (control && Atomics.load(control, 0) === 1) made.signal(SIG.STOP);
+        changed();
+        return { pid: child.pid };
+      } catch (error) {
+        if (child) {
+          release(child.pid);
+          if (held) await closeHeld(files, child.pid, child.token, { umask: state.umask, sudo });
+          await reap(child.pid, { status: 126 }, true);
+          await kernelCall('waitchild', { ppid: pid, pid: child.pid }).catch(() => {});
+        }
+        throw error;
+      }
+    };
     // fork(2): a child with a pid the client kernel gives, its parent's snapshot, and its pipes'
     // ends held for it before it starts.
     const fork = async state => {
@@ -339,30 +399,27 @@ export async function exec(stages, options = {}) {
       try {
         // Each pipe and open file it shares must have a place for another holder (as many as a
         // namespace has processes): EAGAIN otherwise, as fork(2) says, before a pid is taken.
-        const full = description => description.kind === 'pipe-in' || description.kind === 'pipe-out'
-          ? !known(description.buffer).holdable(0)
-          : description.share != null && !files?.shares.holdable(description.share);
-        if (state.descriptions.some(full)) throw Object.assign(new Error('no holder free'), { errno: 'EAGAIN' });
+        checkInheritance(state);
         child = await kernelCall('fork', { pid });
       } catch (error) {
         worker.postMessage({ forked: { errno: error.errno ?? 'EIO' } });
         return;
       }
-      for (const description of state.descriptions) {
-        if (description.kind === 'pipe-in') known(description.buffer).hold(child.pid, 'r', description.refs);
-        else if (description.kind === 'pipe-out') known(description.buffer).hold(child.pid, 'w', description.refs);
-        else if (description.share != null) files?.shares.add(description.share, child.pid, description.refs);
-      }
+      holdInheritance(state, child.pid);
       const made = host({ pid: child.pid, token: child.token, ppid: pid, ...process.image, argv: state.argv, write, forked: true, start: { fork: state }, transfer: [state.snapshot.memory], files });
       forks.push(made);
       changed();
       worker.postMessage({ forked: { pid: child.pid } });
     };
     worker.onmessage = ({ data }) => {
-      if (data.out) write(data.fd, decoders[data.fd].decode(data.out, { stream: true }));
+      if (data.out) {
+        const shown = publish(data.fd, decoders[data.fd].decode(data.out, { stream: true }), data.tty);
+        if (data.credit) void shown.then(releaseOutput, releaseOutput);
+      }
+      else if (data.ttyFds) void kernelCall('tty_fds', { pid, tty: terminal?.number, fds: data.ttyFds }).catch(() => {});
       else if (data.reading) onReading();
       else if (data.stopped || data.continued) { process.stopped = !!data.stopped; changed(); }
-      else if (data.truncated) truncated = true;
+      else if (data.truncated) { truncated = true; truncatedBy.add(argv[0]); }
       else if (data.described) files?.descriptions.set(data.described.slot, data.described);
       else if (data.closed) { if (files?.descriptions.get(data.closed.slot)?.gen === data.closed.gen) files.descriptions.delete(data.closed.slot); }
       else if (data.host) void answer(data.host);
@@ -370,7 +427,7 @@ export async function exec(stages, options = {}) {
       else if ('exit' in data) end({ code: data.exit, signal: data.signal ?? undefined });
     };
     worker.onerror = event => { onOutput(2, `${argv[0]}: ${event.message}\n`); end({ code: 126 }, true); };
-    worker.postMessage({ ...start, module, memory, startSection, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: true }, control: control?.buffer, channel, shares: files?.shares.buffer }, transfer);
+    worker.postMessage({ ...start, module, memory, startSection, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: !!terminal }, pty: terminal?.transferable, control: control?.buffer, outputCredit: outputCredit?.buffer, channel, shares: files?.shares.buffer }, transfer);
     // A signal, as its default action has it: ended, stopped at its next system call, or
     // continued.
     const signal = number => {
@@ -385,6 +442,30 @@ export async function exec(stages, options = {}) {
     hosted.set(pid, process);
     return process;
   };
+  const ttyRequest = ({ request, arg }) => {
+    if (!terminal) throw { errno: 'ENOTTY' };
+    const state = terminal.state;
+    switch (request) {
+      case IOCTL.TCGETS: return state.termios;
+      case IOCTL.TCSETS: case IOCTL.TCSETSW: case IOCTL.TCSETSF:
+        terminal.configure(arg, request === IOCTL.TCSETSF); return {};
+      case IOCTL.TIOCGWINSZ: return state.size;
+      case IOCTL.TIOCSWINSZ: state.resize(arg); options.onSize?.(state.size); return {};
+      case IOCTL.TIOCGPGRP: return { pgrp: state.pgrp };
+      case IOCTL.TIOCSPGRP:
+        if (arg !== pgid) throw { errno: 'EPERM' };
+        job.foreground(true); return {};
+      case IOCTL.TIOCGPTN: return { name: terminal.name };
+      case 'wasix': {
+        const modes = state.termios;
+        modes.lflag = arg.echo ? modes.lflag | LF.ECHO : modes.lflag & ~LF.ECHO;
+        modes.lflag = arg.canonical ? modes.lflag | LF.ICANON : modes.lflag & ~LF.ICANON;
+        modes.iflag = arg.lineFeeds ? modes.iflag | IF.IGNCR : modes.iflag & ~IF.IGNCR;
+        terminal.configure(modes); return {};
+      }
+      default: throw { errno: 'ENOTTY' };
+    }
+  };
   const start = async (index, io) => {
     const stage = stages[index], argv = stage.argv ?? stage;
     const environment = environments[index];
@@ -395,7 +476,7 @@ export async function exec(stages, options = {}) {
       if (stopped) return await canceled(image);
       const { module, memory, startSection } = await load(image).catch(error => { throw refused(argv[0], error); });
       if (stopped) return await canceled(image);
-      const write = (fd, text) => { if (!text) return; if (fd === 1 && !io.stdout.tty) collect(text, index === last); else onOutput(fd, text); };
+      const write = (fd, text) => { if (!text) return; if (fd === 1 && !io.stdout.tty) collect(text, index === last); else return onOutput(fd, text); };
       // Its pipes' ends are its own from the start: held for it before it runs.
       io.stdin.reader?.hold(image.pid, 'r');
       io.stdout.writer?.hold(image.pid, 'w');
@@ -419,12 +500,26 @@ export async function exec(stages, options = {}) {
   };
   const watch = setInterval(() => { if (cancelled()) stop(SIG.INT); }, 100);
   const statuses = [];
-  let input = null;
   try {
     if (isolated) {
+      // Resolve the leader before starting stages concurrently: every stage must inherit
+      // the same slave number even if a later image loads first.
+      if (terminal) {
+        const leader = await images[0];
+        terminal.state.number ??= leader.pid; terminal.number = terminal.state.number;
+        terminal.name = `/dev/pts/${terminal.number}`; pgid = leader.pid;
+        if (foreground) terminal.state.pgrp = pgid;
+      }
       // At once, through pipes; the first reads the terminal unless given its input.
-      input = stdin == null ? terminalInput() : null;
-      if (input) onTty(input);
+      input = stdin == null ? terminal : null;
+      // A program with redirected stdin can still read its controlling terminal by
+      // opening /dev/tty. Keep the master attached independently of fd 0's source.
+      if (terminal) {
+        terminal.resize = size => { terminal.state.resize(size); options.onSize?.(terminal.state.size); };
+        onTty(terminal);
+        options.onMode?.({ raw: !terminal.state.canonical, echo: terminal.state.echo });
+        options.onSize?.(terminal.state.size);
+      }
       const links = stages.slice(1).map(() => pipeBuffer());
       const starting = [];
       for (let index = 0; index <= last; index++) {
@@ -468,8 +563,13 @@ export async function exec(stages, options = {}) {
     for (const process of processes) process.kill(SIG.INT);
     images.forEach((image, index) => { if (!taken.has(index)) image.then(abandon, () => {}); });
     clearInterval(watch);
-    if (input) { input.close(); onTty(null); }
+    job.foreground(false);
+    terminal?.close();
+    // A rejected image may never have acquired a reader, so no process release would
+    // otherwise remove this master buffer from the host's bookkeeping.
+    if (terminal && !terminal.pipe.held('r')) pipes.delete(terminal.pipe.buffer);
+    if (terminal) onTty(null);
     finished = true;
   }
-  return { status: statuses[last] ?? 128 + SIG.INT, stdout, truncated };
+  return { status: statuses[last] ?? 128 + SIG.INT, stdout, truncated, truncatedBy: [...truncatedBy] };
 }

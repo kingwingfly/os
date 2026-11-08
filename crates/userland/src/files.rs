@@ -1,7 +1,6 @@
-//! Programs on names: ls, stat, mkdir, rmdir, rm, mv, ln, readlink, realpath and touch, as
-//! GNU's are.
-use crate::io::{Io, View, basename, joined, quote};
-use crate::sys::{Sys, call, calls, done, getdents, lstat, stat};
+//! Metadata tools and the remaining rm/mv adapters; Files has its own structured listing.
+use crate::io::{Io, basename, joined, quote};
+use crate::sys::{Sys, calls, done, getdents, lstat, stat};
 use crate::{time, walk};
 use abi::{Call, Errno, Error, MAXSYMLINKS, R_OK, Stat, X_OK};
 use serde_json::Value;
@@ -80,8 +79,8 @@ fn refused<T>(answer: &Result<T, Error>) -> bool {
         .is_err_and(|error| matches!(error.errno, Errno::EACCES | Errno::EPERM))
 }
 
-/// The entries of the directory `dir` (absolute), at `shown` as the terminal shows it, as ls
-/// and the file panel show them: directories first, then by name; each as what it opens as,
+/// The entries of the directory `dir` (absolute), at `shown` as the terminal shows it, as the
+/// file panel shows them: directories first, then by name; each as what it opens as,
 /// and whether the account may open it (list a directory, read a file), which one batch asks.
 pub async fn entries(sys: &impl Sys, dir: &str, shown: &str) -> Result<Vec<Entry>, Error> {
     let dirents = getdents(sys, dir).await?;
@@ -125,88 +124,6 @@ pub async fn entries(sys: &impl Sys, dir: &str, shown: &str) -> Result<Vec<Entry
             .then_with(|| a.name.cmp(&b.name))
     });
     Ok(entries)
-}
-
-pub async fn ls(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
-    let ls = parsed!(io, args::Ls);
-    let typed = ls.path.clone().unwrap_or_else(|| ".".into());
-    let path = io.path(&typed);
-    // A link to a directory lists the directory, but with -l or -d, itself, as GNU ls shows a
-    // link named on the command line; a trailing / follows it.
-    let follow = !(ls.long || ls.directory) || typed.ends_with('/');
-    let found = if follow {
-        stat(sys, &path).await
-    } else {
-        lstat(sys, &path).await
-    };
-    let node = match found {
-        Ok(node) => node,
-        Err(error) => {
-            io.fail(format!("ls: cannot access {}: {error}", quote(&typed)));
-            return 2;
-        }
-    };
-    if node.is_dir() && !ls.directory {
-        return match entries(sys, &path, &shown_path(&path)).await {
-            Ok(mut list) => {
-                if !ls.all {
-                    list.retain(|entry| !entry.name.starts_with('.'));
-                }
-                // -t and -S sort by time or size alone, as GNU's ls does, names breaking ties.
-                if ls.time {
-                    list.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.name.cmp(&b.name)));
-                } else if ls.size {
-                    list.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
-                }
-                if ls.reverse {
-                    list.reverse();
-                }
-                io.view = Some(View::Listing {
-                    entries: list,
-                    long: ls.long,
-                });
-                0
-            }
-            Err(error) => {
-                io.fail(format!(
-                    "ls: cannot open directory {}: {error}",
-                    quote(&typed)
-                ));
-                2
-            }
-        };
-    }
-    let opened = if node.is_link() {
-        stat(sys, &path).await.ok()
-    } else {
-        None
-    };
-    let mode = if opened.as_ref().unwrap_or(&node).is_dir() {
-        R_OK | X_OK
-    } else {
-        R_OK
-    };
-    let denied = refused(
-        &done(
-            sys,
-            Call::Access {
-                path: path.clone(),
-                mode,
-            },
-        )
-        .await,
-    );
-    io.view = Some(View::Listing {
-        entries: vec![entry(
-            &typed,
-            shown_path(&path),
-            Some(&node),
-            opened.as_ref(),
-            denied,
-        )],
-        long: ls.long,
-    });
-    0
 }
 
 pub async fn stat_program(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
@@ -371,100 +288,6 @@ async fn stat_of(sys: &impl Sys, path: &str, follow: bool) -> Result<Stat, Error
     }
 }
 
-pub async fn mkdir(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
-    let mkdir = parsed!(io, args::Mkdir);
-    let mut status = 0;
-    for typed in &mkdir.dirs {
-        let path = io.path(typed);
-        let made = if mkdir.parents {
-            parents(sys, &path).await
-        } else {
-            done(
-                sys,
-                Call::Mkdir {
-                    path: path.clone(),
-                    mode: 0o777,
-                },
-            )
-            .await
-        };
-        if let Err(error) = made {
-            io.fail(format!(
-                "mkdir: cannot create directory {}: {error}",
-                quote(typed)
-            ));
-            status = 1;
-        }
-    }
-    status
-}
-
-/// mkdir -p: `path` and each directory above it that is not there, in one batch. One that is
-/// there is fine if it is a directory.
-async fn parents(sys: &impl Sys, path: &str) -> Result<(), Error> {
-    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-    let prefixes: Vec<String> = (1..=parts.len())
-        .map(|n| format!("/{}", parts[..n].join("/")))
-        .collect();
-    let made = calls::<Value>(
-        sys,
-        prefixes
-            .iter()
-            .map(|path| Call::Mkdir {
-                path: path.clone(),
-                mode: 0o777,
-            })
-            .collect(),
-    )
-    .await;
-    for (prefix, result) in prefixes.iter().zip(made) {
-        match result {
-            Ok(_) => {}
-            Err(error) if error.errno == Errno::EEXIST => {
-                if !stat(sys, prefix).await.is_ok_and(|node| node.is_dir()) {
-                    return Err(Errno::ENOTDIR.into());
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-pub async fn rmdir(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
-    let rmdir = parsed!(io, args::Rmdir);
-    let mut status = 0;
-    for typed in &rmdir.dirs {
-        // -p: then each directory above it, as written, while one goes.
-        let mut names = vec![typed.trim_end_matches('/').to_string()];
-        if rmdir.parents {
-            let mut above = names[0].clone();
-            while let Some((dir, _)) = above.rsplit_once('/') {
-                if dir.is_empty() {
-                    break;
-                }
-                names.push(dir.to_string());
-                above = dir.to_string();
-            }
-        }
-        for name in names {
-            if let Err(error) = done(
-                sys,
-                Call::Rmdir {
-                    path: io.path(&name),
-                },
-            )
-            .await
-            {
-                io.fail(format!("rmdir: failed to remove {}: {error}", quote(&name)));
-                status = 1;
-                break;
-            }
-        }
-    }
-    status
-}
-
 pub async fn rm(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
     let rm = parsed!(io, args::Rm);
     let mut status = 0;
@@ -502,6 +325,9 @@ pub async fn rm(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
             }
         };
         if !node.is_dir() {
+            if rm.interactive && !yes(io, remove_question(typed, &node)).await {
+                continue;
+            }
             if let Err(error) = done(sys, Call::Unlink { path }).await {
                 io.fail(format!("rm: cannot remove {}: {error}", quote(typed)));
                 status = 1;
@@ -516,11 +342,80 @@ pub async fn rm(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
             status = 1;
             continue;
         }
-        if !remove_tree(sys, io, typed, &path).await {
+        let removed = if rm.interactive {
+            remove_interactive_tree(sys, io, typed, &path).await
+        } else {
+            remove_tree(sys, io, typed, &path).await
+        };
+        if !removed {
             status = 1;
         }
     }
     status
+}
+
+fn remove_question(typed: &str, node: &Stat) -> String {
+    let kind = match node.mode & 0o170000 {
+        0o120000 => "symbolic link",
+        0o020000 => "character special file",
+        0o100000 if node.size == 0 => "regular empty file",
+        0o100000 => "regular file",
+        _ => "file",
+    };
+    format!("rm: remove {kind} {}? ", quote(typed))
+}
+
+/// Interactive removal asks before descent and before each mutation. A declined file is
+/// retained; an attempted removal of its now-nonempty parent reports the kernel's error.
+async fn remove_interactive_tree(sys: &impl Sys, io: &mut Io<'_>, typed: &str, path: &str) -> bool {
+    if (io.cancelled)() {
+        return false;
+    }
+    let entries = match crate::sys::getdents(sys, path).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            io.fail(format!("rm: cannot remove {}: {error}", quote(typed)));
+            return false;
+        }
+    };
+    if !entries.is_empty()
+        && !yes(io, format!("rm: descend into directory {}? ", quote(typed))).await
+    {
+        return true;
+    }
+    let mut success = true;
+    for entry in entries {
+        if (io.cancelled)() {
+            return false;
+        }
+        let child = joined(path, &entry.name);
+        let named = joined(typed, &entry.name);
+        match lstat(sys, &child).await {
+            Ok(node) if node.is_dir() => {
+                success &= Box::pin(remove_interactive_tree(sys, io, &named, &child)).await;
+            }
+            Ok(node) => {
+                if yes(io, remove_question(&named, &node)).await
+                    && let Err(error) = done(sys, Call::Unlink { path: child }).await
+                {
+                    io.fail(format!("rm: cannot remove {}: {error}", quote(&named)));
+                    success = false;
+                }
+            }
+            Err(error) => {
+                io.fail(format!("rm: cannot remove {}: {error}", quote(&named)));
+                success = false;
+            }
+        }
+    }
+    if !(io.cancelled)()
+        && yes(io, format!("rm: remove directory {}? ", quote(typed))).await
+        && let Err(error) = done(sys, Call::Rmdir { path: path.into() }).await
+    {
+        io.fail(format!("rm: cannot remove {}: {error}", quote(typed)));
+        success = false;
+    }
+    success
 }
 
 /// rm -r of the directory `path`, `typed` as written: what is in it, files first, then its
@@ -707,129 +602,6 @@ pub async fn mv(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
     status
 }
 
-pub async fn ln(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
-    let ln = parsed!(io, args::Ln);
-    let (targets, dest) = match ln.operands.as_slice() {
-        // ln TARGET: a link of the same name in the working directory.
-        [target] => (std::slice::from_ref(target), None),
-        [targets @ .., dest] => (targets, Some(dest.clone())),
-        [] => {
-            io.fail("ln: missing file operand");
-            return 1;
-        }
-    };
-    // Into DEST if it is, or leads to, a directory, unless -n or -T name the link itself.
-    let into = match &dest {
-        None => Some((io.cwd.clone(), ".".to_string())),
-        Some(dest) => {
-            let path = io.path(dest);
-            let dir = !ln.no_dereference && stat(sys, &path).await.is_ok_and(|n| n.is_dir());
-            dir.then(|| (path, dest.clone()))
-        }
-    };
-    if into.is_none() && targets.len() > 1 {
-        io.fail(format!(
-            "ln: target {} is not a directory",
-            quote(dest.as_deref().unwrap_or_default())
-        ));
-        return 1;
-    }
-    let mut status = 0;
-    for target in targets {
-        // A directory has one name, as Linux keeps it.
-        if !ln.symbolic {
-            let source = io.path(target);
-            let found = if ln.logical {
-                stat(sys, &source).await
-            } else {
-                lstat(sys, &source).await
-            };
-            if found.is_ok_and(|node| node.is_dir()) {
-                io.fail(format!("ln: {target}: hard link not allowed for directory"));
-                status = 1;
-                continue;
-            }
-        }
-        let (link, shown_link) = match (&into, &dest) {
-            (Some((dir, typed)), _) => {
-                let name = basename(target);
-                let shown = if dest.is_none() {
-                    name.to_string()
-                } else {
-                    joined(typed, name)
-                };
-                (joined(dir, name), shown)
-            }
-            (None, Some(dest)) => (io.path(dest), dest.clone()),
-            (None, None) => unreachable!(),
-        };
-        let make = |at: &str| {
-            if ln.symbolic {
-                // The target is kept as written, read from where the link is.
-                Call::Symlink {
-                    target: target.clone(),
-                    path: at.to_string(),
-                }
-            } else {
-                Call::Link {
-                    from: io.path(target),
-                    to: at.to_string(),
-                    follow: ln.logical,
-                }
-            }
-        };
-        // -f: made under another name, then put in place of what is there, so that one that
-        // cannot be made leaves it.
-        let made = if ln.force && lstat(sys, &link).await.is_ok() {
-            let (dir, name) = link.rsplit_once('/').unwrap_or(("", &link));
-            let temporary = format!("{dir}/.{name}.ln~");
-            match done(sys, make(&temporary)).await {
-                Ok(()) => {
-                    let replaced = done(
-                        sys,
-                        Call::Rename {
-                            from: temporary.clone(),
-                            to: link.clone(),
-                            noreplace: false,
-                        },
-                    )
-                    .await;
-                    if replaced.is_err() {
-                        let _ = done(sys, Call::Unlink { path: temporary }).await;
-                    }
-                    replaced
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            done(sys, make(&link)).await
-        };
-        match made {
-            Ok(()) if ln.verbose && ln.symbolic => {
-                io.say(format!("{} -> {}", quote(&shown_link), quote(target)))
-            }
-            Ok(()) if ln.verbose => io.say(format!("{} => {}", quote(&shown_link), quote(target))),
-            Ok(()) => {}
-            Err(error) => {
-                io.fail(if ln.symbolic {
-                    format!(
-                        "ln: failed to create symbolic link {}: {error}",
-                        quote(&shown_link)
-                    )
-                } else {
-                    format!(
-                        "ln: failed to create hard link {} => {}: {error}",
-                        quote(&shown_link),
-                        quote(target)
-                    )
-                });
-                status = 1;
-            }
-        }
-    }
-    status
-}
-
 /// How much of a path must exist, for readlink -f, -e and -m, and realpath.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Existing {
@@ -837,8 +609,6 @@ pub(crate) enum Existing {
     Above,
     /// All (-e).
     All,
-    /// None (-m).
-    None,
 }
 
 /// `path` (absolute) with every link followed, `.` and `..` gone, as canonicalize_file_name
@@ -898,143 +668,6 @@ pub(crate) async fn canonical(
         }
     }
     Ok(format!("/{}", at.join("/")))
-}
-
-/// readlink, and realpath (`real`), which is readlink -f that says why it fails.
-pub async fn readlink(sys: &impl Sys, io: &mut Io<'_>, real: bool) -> i32 {
-    let (files, existing, no_newline) = if real {
-        let realpath = parsed!(io, args::Realpath);
-        let existing = if realpath.existing {
-            Some(Existing::All)
-        } else if realpath.missing {
-            Some(Existing::None)
-        } else {
-            Some(Existing::Above)
-        };
-        (realpath.files, existing, false)
-    } else {
-        let readlink = parsed!(io, args::Readlink);
-        let existing = if readlink.existing {
-            Some(Existing::All)
-        } else if readlink.missing {
-            Some(Existing::None)
-        } else if readlink.canonicalize {
-            Some(Existing::Above)
-        } else {
-            None
-        };
-        (readlink.files, existing, readlink.no_newline)
-    };
-    let mut status = 0;
-    let mut lines = Vec::new();
-    for typed in &files {
-        let path = io.path(typed);
-        let result = match existing {
-            Some(existing) => canonical(sys, &path, existing).await,
-            None => call::<String>(sys, Call::Readlink { path }).await,
-        };
-        match result {
-            Ok(line) => lines.push(line),
-            Err(error) => {
-                // readlink fails without a word, as GNU's does without -v; realpath says why.
-                if real {
-                    io.fail(format!("realpath: {typed}: {error}"));
-                }
-                status = 1;
-            }
-        }
-    }
-    io.out = lines.join("\n");
-    if !(no_newline && files.len() == 1) && !io.out.is_empty() {
-        io.out.push('\n');
-    }
-    status
-}
-
-pub async fn touch(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
-    let touch = parsed!(io, args::Touch);
-    // The times to set: now, or what -d, -t or -r say; -a or -m alone sets that one only.
-    let given = if let Some(date) = &touch.date {
-        time::parse_date(date, io.now).map(|t| Some((t, t)))
-    } else if let Some(stamp) = &touch.stamp {
-        time::parse_stamp(stamp, io.now).map(|t| Some((t, t)))
-    } else if let Some(reference) = &touch.reference {
-        match stat(sys, &io.path(reference)).await {
-            Ok(found) => Ok(Some((
-                (found.atime, found.atime_nsec),
-                (found.mtime, found.mtime_nsec),
-            ))),
-            Err(error) => Err(format!(
-                "failed to get attributes of {}: {error}",
-                quote(reference)
-            )),
-        }
-    } else {
-        Ok(None)
-    };
-    let given = match given {
-        Ok(given) => given,
-        Err(why) => {
-            io.fail(format!("touch: {why}"));
-            return 1;
-        }
-    };
-    let at = |time: (u64, u32)| abi::Time::At {
-        sec: time.0,
-        nsec: time.1,
-    };
-    let (mut atime, mut mtime) =
-        given.map_or((abi::Time::Now, abi::Time::Now), |(a, m)| (at(a), at(m)));
-    if touch.access && !touch.modification {
-        mtime = abi::Time::Omit;
-    }
-    if touch.modification && !touch.access {
-        atime = abi::Time::Omit;
-    }
-    let times = |path: &String| Call::Utimens {
-        path: path.clone(),
-        atime,
-        mtime,
-        nofollow: touch.no_dereference,
-    };
-    let paths: Vec<String> = touch.files.iter().map(|typed| io.path(typed)).collect();
-    let touched = calls::<Value>(sys, paths.iter().map(times).collect()).await;
-    let mut status = 0;
-    let mut making = Vec::new();
-    for ((typed, path), result) in touch.files.iter().zip(&paths).zip(touched) {
-        match result {
-            Ok(_) => {}
-            // What is not there is made, unless -c or -h says not to.
-            Err(error)
-                if error.errno == Errno::ENOENT && (touch.no_create || touch.no_dereference) => {}
-            Err(error) if error.errno == Errno::ENOENT => making.push((typed, path)),
-            Err(error) => {
-                io.fail(format!("touch: cannot touch {}: {error}", quote(typed)));
-                status = 1;
-            }
-        }
-    }
-    // Made empty, and then given the times asked for, if they are not now.
-    let mut made_calls = Vec::new();
-    for (_, path) in &making {
-        made_calls.push(Call::Mknod {
-            path: (*path).clone(),
-            mode: 0o666,
-            rdev: None,
-        });
-        if given.is_some() {
-            made_calls.push(times(path));
-        }
-    }
-    let made = calls::<Value>(sys, made_calls).await;
-    let step = if given.is_some() { 2 } else { 1 };
-    for (index, (typed, _)) in making.iter().enumerate() {
-        if let Some(Err(error)) = made.get(index * step) {
-            io.fail(format!("touch: cannot touch {}: {error}", quote(typed)));
-            status = 1;
-        }
-    }
-    status
 }
 
 /// df: the file systems FILEs are on (the store, /, by default; /proc, procfs), their sizes in
