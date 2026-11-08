@@ -7,8 +7,8 @@
 // in a new instance, rewound from the same buffer, in a Worker of its own: the parent's call
 // returns the child's pid, the child's 0.
 //
-// The buffer is memory of the image's own, grown for it once (a few pages past what its
-// allocator had), so no layout of the image's has to be guessed. Mechanism only: who may fork,
+// The transform puts scratch in a separate memory, preserving the guest's declared limits
+// and allocator layout. Mechanism only: who may fork,
 // and the child's pid, are the client kernel's.
 
 // asyncify's states, as asyncify_get_state answers.
@@ -45,11 +45,13 @@ export class Engine {
     const global = this.exports.__stack_pointer ?? this.exports.__tw_stack_pointer;
     if (global instanceof WebAssembly.Global) global.value = value;
   }
-  words() { return new Int32Array(this.memory().buffer); }
-  // The buffer, grown once: its two words at `at`, the stack after them.
+  stackMemory() { return this.exports.__tw_asyncify_memory ?? this.memory(); }
+  words() { return new Int32Array(this.stackMemory().buffer); }
+  // The separate scratch buffer: its two words at `at`, the stack after them.
   buffer() {
     if (!this.region) {
-      const memory = this.memory(), at = memory.grow(BUFFER_PAGES) * PAGE;
+      if (!this.exports.__tw_asyncify_memory) throw new Error('image has no runtime scratch memory');
+      const at = 0;
       this.region = { at, end: at + BUFFER_PAGES * PAGE, top: this.top };
     }
     return this.region;
@@ -75,7 +77,7 @@ export class Engine {
   // The unwound stack, as bytes: what a setjmp keeps.
   saved() {
     const { at } = this.region, words = this.words();
-    return new Uint8Array(this.memory().buffer).slice(at + 8, words[at >> 2]);
+    return new Uint8Array(this.stackMemory().buffer).slice(at + 8, words[at >> 2]);
   }
   // Rewind to the call that unwound (or, with `stack`, to the one a saved stack was unwound
   // from), which answers `answer`: run `_start` next.
@@ -83,7 +85,7 @@ export class Engine {
     const { at, end } = this.buffer();
     const words = this.words();
     if (stack) {
-      new Uint8Array(this.memory().buffer).set(stack, at + 8);
+      new Uint8Array(this.stackMemory().buffer).set(stack, at + 8);
       words[at >> 2] = at + 8 + stack.length;
     }
     words[(at >> 2) + 1] = end;
@@ -115,7 +117,13 @@ export class Engine {
       } catch { /* immutable: the module's own */ }
     }
     const buffer = this.memory().buffer;
-    return { memory: new Uint8Array(buffer).slice().buffer, globals, tables: this.tables(), region: this.region };
+    const memories = {}, seen = new Set([this.memory()]);
+    for (const [name, value] of Object.entries(this.exports)) {
+      if (!(value instanceof WebAssembly.Memory) || seen.has(value)) continue;
+      seen.add(value);
+      memories[name] = new Uint8Array(value.buffer).slice();
+    }
+    return { memory: new Uint8Array(buffer).slice().buffer, memories, globals, tables: this.tables(), region: this.region };
   }
   // Each table's entries, as numbers of `__tw_functions`: -1 for none, -2 for what is not one
   // of the image's functions (kept as the child has it).
@@ -142,6 +150,12 @@ export class Engine {
     const pages = snapshot.memory.byteLength / PAGE - target.buffer.byteLength / PAGE;
     if (pages > 0) target.grow(pages);
     new Uint8Array(target.buffer).set(new Uint8Array(snapshot.memory));
+    for (const [name, bytes] of Object.entries(snapshot.memories ?? {})) {
+      const memory = instance.exports[name];
+      const pages = (bytes.length - memory.buffer.byteLength) / PAGE;
+      if (pages > 0) memory.grow(pages);
+      new Uint8Array(memory.buffer).set(bytes);
+    }
     for (const [name, value] of Object.entries(snapshot.globals)) {
       const global = instance.exports[name];
       if (!(global instanceof WebAssembly.Global)) continue;

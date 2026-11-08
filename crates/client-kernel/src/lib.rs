@@ -455,15 +455,41 @@ impl Kernel {
         Ok(value.to_string())
     }
 
-    /// getpid: what the process `pid`, hosted here, is.
+    /// Recover the state of processes owned by this host, including earlier login sessions.
+    pub async fn sync(&self, host: &str) -> Result<String, JsValue> {
+        let processes = self
+            .state
+            .borrow()
+            .processes
+            .iter()
+            .filter(|(_, local)| local.host == host && local.ended.is_none())
+            .map(|(&pid, local)| abi::ProcessProof {
+                pid,
+                token: local.token.clone(),
+            })
+            .collect();
+        let rows = self.one(Call::ProcKeep { processes }, false).await?;
+        Ok(rows.to_string())
+    }
+
+    /// The parent of a process, locally when hosted here, otherwise from the account-visible registry.
     pub async fn getpid(&self, pid: u32) -> Result<String, JsValue> {
-        let state = self.state.borrow();
-        let local = state
+        if let Some(ppid) = self
+            .state
+            .borrow()
             .processes
             .get(&pid)
             .filter(|local| local.ended.is_none())
-            .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?;
-        Ok(json!({ "pid": pid, "ppid": local.ppid }).to_string())
+            .map(|local| local.ppid)
+        {
+            return Ok(json!({ "pid": pid, "ppid": ppid }).to_string());
+        }
+        let rows = self.one(Call::ProcPoll { pids: vec![pid] }, false).await?;
+        let row = rows
+            .as_array()
+            .and_then(|rows| rows.first())
+            .ok_or_else(|| fail(Error::from(Errno::ESRCH)))?;
+        Ok(json!({ "pid": pid, "ppid": row["ppid"] }).to_string())
     }
 
     /// The tabs whose processes still run, and the kernels holding pids they were lent, by the

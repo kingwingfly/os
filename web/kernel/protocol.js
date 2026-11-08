@@ -1,10 +1,10 @@
 // The page's side of the client kernel's protocol: one envelope, versioned, with an id for each
 // request and one reply. Requests never carry functions; events (process state, a boot, a
-// mount) are pushed as they happen. The SharedWorker (client.js) speaks this too; its classic
+// mount) are pushed as they happen. The dedicated Worker (client.js) speaks this too; its classic
 // script cannot import this module, so the version here is the one to change with it.
 export const VERSION = 1;
 
-let shared;
+let connection;
 
 // This tab, as the kernel knows it (a process's seat): it holds the Web Lock `tw-tab-<tab>` for
 // as long as it lives, taken before it asks anything, which the kernel waits on to reap what
@@ -16,20 +16,18 @@ const holding = globalThis.navigator?.locks
   })
   : Promise.resolve();
 
-// The page's port to the client kernel: the browser's SharedWorker, one for every tab, or, where
-// a browser has none (Chrome for Android before 148), a dedicated Worker of this tab alone.
+// The page's port to its dedicated client-kernel Worker.
 export function kernelPort() {
-  if (shared) return shared;
-  const sharing = typeof SharedWorker === 'function';
-  const worker = sharing ? new SharedWorker('/client-kernel.js') : new Worker('/client-kernel.js');
-  const port = sharing ? worker.port : worker;
+  if (connection) return connection;
+  const worker = new Worker('/client-kernel.js');
+  const port = worker;
   const pending = new Map();
   const listeners = new Map();
   let next = 0;
   // A kernel whose script failed to load or run answers nothing: what waits fails (EIO) rather
   // than hang the command that asked, and the next call starts the worker again.
   worker.onerror = event => {
-    if (shared?.port === port) shared = undefined;
+    if (connection?.port === port) connection = undefined;
     const error = Object.assign(new Error(event?.message || 'the client kernel failed'), { errno: 'EIO' });
     for (const waiting of pending.values()) waiting.reject(error);
     pending.clear();
@@ -49,7 +47,6 @@ export function kernelPort() {
       for (const listener of listeners.get('*') ?? []) listener(data);
     }
   };
-  if (sharing) port.start();
   // Each request says which tab asks, once the tab holds its lock.
   const request = (type, args = {}) => holding.then(() => new Promise((resolve, reject) => {
     const id = ++next;
@@ -61,8 +58,8 @@ export function kernelPort() {
     listeners.get(event).add(listener);
     return () => listeners.get(event).delete(listener);
   };
-  shared = { request, on, port };
-  return shared;
+  connection = { request, on, port };
+  return connection;
 }
 
 // One call, its value: an error the kernel refused with is thrown with its errno. What some

@@ -123,6 +123,28 @@ impl Db {
     /// The guest of `key`, made if this browser has not been here: its uuid from the key, and
     /// the first free uid of the anonymous range (EMFILE if there is none, as a full table is).
     pub fn ensure_guest(&mut self, key: &str, now: u64) -> Option<Guest> {
+        let last = self
+            .meta("guest_prune_at")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        if now >= last + SEEN_EVERY {
+            if self.meta("next_guest_uid").is_none() {
+                #[derive(Deserialize)]
+                struct Highest {
+                    uid: Option<u32>,
+                }
+                let highest = self
+                    .rows::<Highest>("SELECT MAX(uid) AS uid FROM guests", vec![])
+                    .into_iter()
+                    .next()
+                    .and_then(|row| row.uid)
+                    .unwrap_or(UID_MIN - 1);
+                self.set_meta("next_guest_uid", &(highest + 1).to_string());
+            }
+            // Never recycle an identity still attached to files, open credentials or jobs.
+            self.run("DELETE FROM guests WHERE last_seen < ? AND NOT EXISTS (SELECT 1 FROM inodes WHERE owner = guests.uid) AND NOT EXISTS (SELECT 1 FROM credentials WHERE uid = guests.uid AND expires > ?) AND NOT EXISTS (SELECT 1 FROM jobs WHERE owner = guests.uid OR actor = guests.uid)", vec![int(now.saturating_sub(30 * 24 * 3600)), int(now)]);
+            self.set_meta("guest_prune_at", &now.to_string());
+        }
         if let Some(guest) = self.guest(key) {
             // When it was last seen is kept to the hour: not a write on every request.
             if guest.last_seen + SEEN_EVERY > now {
@@ -160,26 +182,29 @@ impl Db {
             last_seen: now,
         })
     }
-    fn next_guest_uid(&self) -> Option<u32> {
+    fn next_guest_uid(&mut self) -> Option<u32> {
         #[derive(Deserialize)]
         struct Next {
             uid: Option<u32>,
         }
-        // The one after the highest given; past the range's end, the first gap.
         let highest = self
             .rows::<Next>("SELECT MAX(uid) AS uid FROM guests", vec![])
             .into_iter()
             .next()
-            .and_then(|row| row.uid);
-        match highest {
-            None => Some(UID_MIN),
-            Some(uid) if uid < UID_MAX => Some(uid.max(UID_MIN - 1) + 1),
-            Some(_) => {
-                let taken: Vec<Next> = self.rows("SELECT uid FROM guests ORDER BY uid", vec![]);
-                let used: BTreeSet<u32> = taken.into_iter().filter_map(|row| row.uid).collect();
-                (UID_MIN..=UID_MAX).find(|uid| !used.contains(uid))
-            }
+            .and_then(|row| row.uid)
+            .unwrap_or(UID_MIN - 1);
+        // A pruned uid may still appear in somebody else's named ACL. Never give it to a
+        // different browser; the high-water mark survives pruning, including an empty table.
+        let next = self
+            .meta("next_guest_uid")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(UID_MIN)
+            .max(highest + 1);
+        if next > UID_MAX {
+            return None;
         }
+        self.set_meta("next_guest_uid", &(next + 1).to_string());
+        Some(next)
     }
     /// The identity of the guest `key`, made if new.
     pub fn guest_identity(&mut self, key: &str, now: u64) -> Identity {

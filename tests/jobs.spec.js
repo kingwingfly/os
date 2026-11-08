@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './test.js';
 
 // Job control (crates/frontend/src/shell/jobs.rs, web/wasi/exec.mjs): a pipeline of /usr/bin run
 // with & is a job; Ctrl+Z stops the one in the foreground, a job from then on; fg, bg and
@@ -82,4 +82,27 @@ test('a signal from another tab reaches the process where it runs: stopped, then
     await run(two, `kill ${pid}`);
     await expect(last(one)).toHaveText('[1]+  Terminated              coreutils sleep 60');
   } finally { await context.close(); }
+});
+
+test('registry polling recovers a kill missed during an events outage', async ({ page }) => {
+  await page.addInitScript(() => {
+    const Native = WebSocket;
+    window.eventsSockets = [];
+    window.WebSocket = class extends Native {
+      constructor(...args) { super(...args); window.eventsSockets.push(this); }
+    };
+  });
+  await ready(page);
+  await run(page, 'coreutils sleep 60 &');
+  await expect(last(page)).toHaveText(/^\[1\] \d+$/);
+  const pid = Number((await last(page).innerText()).split(' ')[1]);
+  await page.evaluate(() => { for (const socket of window.eventsSockets) socket.close(); });
+  const result = await page.evaluate(async pid => (await (await fetch('/api/sys', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ calls: [{ kill: { pid: String(pid), signal: 15 } }] }),
+  })).json()).results[0], pid);
+  expect(result).toHaveProperty('ok');
+  await expect(last(page)).toHaveText('[1]+  Terminated              coreutils sleep 60', { timeout: 15_000 });
+  await run(page, 'jobs');
+  await expect(last(page)).toHaveText('No jobs or unfinished uploads');
 });

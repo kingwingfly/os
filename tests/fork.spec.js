@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+import { withoutJspi } from './transport.js';
+import { test, expect } from './test.js';
 
 // Phase 3 and the owner's change request 1 (2026-11-02): each browser's processes are its own
 // machine's, a Durable Object apart from the filesystem's one authority (crates/worker/src/
@@ -7,13 +8,10 @@ import { test, expect } from '@playwright/test';
 // client kernel (crates/client-kernel) and are told to the machine in batches. An orphan is
 // init's; a zombie orphan, init reaps.
 
-// A port to the browser's client kernel, kept on the page: its SharedWorker, or, where the page
-// has none, a dedicated Worker of its own.
+// A port to this tab's dedicated client kernel.
 async function connect(page) {
   await page.evaluate(() => {
-    const shared = typeof SharedWorker === 'function';
-    const worker = shared ? new SharedWorker('/client-kernel.js') : new Worker('/client-kernel.js');
-    const port = shared ? worker.port : worker;
+    const port = new Worker('/client-kernel.js');
     const pending = new Map();
     let next = 0;
     port.onmessage = ({ data }) => {
@@ -22,7 +20,6 @@ async function connect(page) {
         pending.delete(data.id);
       }
     };
-    if (shared) port.start();
     window.__kernel = (type, args = {}) => new Promise(resolve => {
       const id = ++next;
       pending.set(id, resolve);
@@ -183,11 +180,11 @@ const assemble = wat => Buffer.from(binaryen.parseText(wat).emitBinary());
 
 // A module of WASIX's: its imports, a memory of its own, a shadow stack, and `say`, which
 // writes `len` bytes at `ptr` to standard output.
-const wasix = (imports, body, data = '') => assemble(`(module
+const wasix = (imports, body, data = '', memory = '2') => assemble(`(module
   (import "wasix_32v1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
   (import "wasix_32v1" "proc_exit" (func $exit (param i32)))
   ${imports}
-  (memory (export "memory") 2)
+  (memory (export "memory") ${memory})
   (global $sp (mut i32) (i32.const 65536))
   (export "__stack_pointer" (global $sp))
   ${data}
@@ -341,19 +338,46 @@ const last = page => page.locator('.transcript pre').last();
 function processCalls(page) {
   const kinds = new Set();
   page.context().on('request', request => {
-    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/sys' && (request.postData() ?? '').includes('"proc":')) kinds.add(request.resourceType());
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/sys' && !request.headers()['x-registry'] && JSON.parse(request.postData() || '{}').proc) kinds.add(request.resourceType());
   });
   return kinds;
 }
-// A browser without JSPI, as a process's Worker sees it.
-const withoutJspi = page => page.route('**/wasi-process.js', async route => {
-  const response = await route.fetch();
-  await route.fulfill({ response, body: 'delete WebAssembly.Suspending; delete WebAssembly.promising;\n' + await response.text() });
-});
 const hasJspi = page => page.evaluate(() => typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function');
 
 test.describe('fork in the terminal', () => {
   test.afterEach(async ({ request }) => { if (base) await rmrf(request, base); });
+
+  for (const exhausted of [false, true]) test(`fork preserves ${exhausted ? 'exhausted' : 'fixed'} memory limits and runs initialization once`, async ({ page, request }) => {
+    const fixture = wasix(`${FORK} ${JOIN}`, `
+      ${exhausted ? '(drop (memory.grow (i32.const 1)))' : ''}
+      (if (call $fork (i32.const 1) (i32.const 2060)) (then (call $say (i32.const 1040) (i32.const 6))))
+      (if (i32.load (i32.const 2060)) (then ${WAIT_CHILD}))
+      (if (i32.eq (memory.grow (i32.const 1)) (i32.const -1)) (then (call $say (i32.const 1056) (i32.const 6))))`,
+      '(data (i32.const 1024) "init\\n") (data (i32.const 1040) "error\\n") (data (i32.const 1056) "limit\\n") (func $init (call $say (i32.const 1024) (i32.const 5))) (start $init)', exhausted ? '1 2' : '1 1');
+    await uploads(request, { fixed: fixture });
+    await page.goto('/');
+    await command(page, `${base}/fixed`);
+    const output = await page.locator('.transcript pre').allInnerTexts();
+    const text = output.join('\n');
+    expect(text.match(/^init$/gm)).toHaveLength(1);
+    expect(text.match(/^limit$/gm)).toHaveLength(2);
+    expect(text).not.toContain('error');
+  });
+
+  test('a fork inside the initializer resumes initialization before entering main', async ({ page, request }) => {
+    const fixture = wasix(`${FORK} ${JOIN}`, `
+      (if (i32.eqz (i32.load (i32.const 2060)))
+        (then (call $say (i32.const 1040) (i32.const 6)) (call $exit (i32.const 7))))
+      ${WAIT_CHILD}
+      (call $say (i32.const 1056) (i32.const 7))`,
+      `(data (i32.const 1024) "init\\n") (data (i32.const 1040) "child\\n") (data (i32.const 1056) "parent\\n")
+       (func $init (call $say (i32.const 1024) (i32.const 5))
+         (drop (call $fork (i32.const 1) (i32.const 2060)))) (start $init)`, '1 1');
+    await uploads(request, { initializing: fixture });
+    await page.goto('/');
+    await command(page, `${base}/initializing`);
+    await expect(last(page)).toHaveText('init\nchild\nparent');
+  });
 
   // Each way a process makes its calls (request 4): suspended on fetch (JSPI), where the browser
   // has it, and by synchronous XHR, where it does not.

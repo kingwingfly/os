@@ -136,7 +136,7 @@ impl Db {
     /// `hash`: they are the job's for its life, whatever becomes of the account.
     pub fn job_credential(&mut self, id: &str, hash: &str, cred: &Identity, umask: u16, now: u64) {
         self.run(
-            "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner) VALUES(?, ?, 0, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner, expires) VALUES(?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 text(hash),
                 text(JOBS),
@@ -146,11 +146,30 @@ impl Db {
                 int(umask & 0o777),
                 int(now),
                 text(&job_owner(id)),
+                int(now + 7 * 24 * 3600),
+            ],
+        );
+        self.set_expiry("credential", hash, now + 7 * 24 * 3600);
+        let placement = crate::placement::container(cred.id, id);
+        self.run(
+            "UPDATE credentials SET placement = ? WHERE token = ?",
+            vec![
+                text(&serde_json::to_string(&placement).unwrap_or_default()),
+                text(hash),
             ],
         );
     }
     /// The job `id` ended: its credentials are revoked, and what it had open closes.
     pub fn revoke_job(&mut self, id: &str) {
+        for row in self.rows::<Credential>(
+            &format!(
+                "SELECT {} FROM credentials WHERE ns = ? AND owner = ?",
+                columns()
+            ),
+            vec![text(JOBS), text(&job_owner(id))],
+        ) {
+            self.clear_expiry("credential", &row.token);
+        }
         self.run(
             "DELETE FROM credentials WHERE ns = ? AND owner = ?",
             vec![text(JOBS), text(&job_owner(id))],
@@ -186,17 +205,31 @@ impl Db {
     fn credential_of(&self, hash: &str, ns: &str) -> Option<Credential> {
         self.rows::<Credential>(
             &format!(
-                "SELECT {} FROM credentials WHERE token = ? AND ns = ?",
+                "SELECT {} FROM credentials WHERE token = ? AND ns = ? AND expires > ?",
                 columns()
             ),
-            vec![text(hash), text(ns)],
+            vec![text(hash), text(ns), int(auth::now())],
         )
         .into_iter()
         .next()
     }
+    pub fn expire_credential(&mut self, hash: &str, now: u64) {
+        let expired = self.rows::<Credential>(
+            &format!(
+                "SELECT {} FROM credentials WHERE token = ? AND expires <= ?",
+                columns()
+            ),
+            vec![text(hash), int(now)],
+        );
+        for row in expired {
+            self.revoke(&row.ns, hash);
+        }
+        self.clear_expiry("credential", hash);
+    }
     /// Revoke the credentials whose token's hash is `hash`: its image's descriptor closes, and
     /// what its processes opened, once no image of theirs holds the credentials still.
     pub fn revoke(&mut self, ns: &str, hash: &str) {
+        self.clear_expiry("credential", hash);
         let found = self.rows::<Credential>(
             &format!(
                 "DELETE FROM credentials WHERE token = ? AND ns = ? RETURNING {}",
@@ -230,6 +263,10 @@ struct Asked {
     token: String,
     path: String,
     cwd: String,
+    #[serde(default)]
+    seat: Option<String>,
+    #[serde(default)]
+    cgroup: Option<String>,
     /// The account of the process it replaces, if any: only that account, or root, may.
     #[serde(default)]
     replacing: Option<u32>,
@@ -348,11 +385,24 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
             struct Asked {
                 ns: String,
                 tokens: Vec<String>,
+                #[serde(default)]
+                renew: Vec<String>,
             }
             let Ok(asked) = req.json::<Asked>().await else {
                 return Ok(Some(Reply::error("Invalid revocation", 400)));
             };
             transact(state, move |db| {
+                for hash in &asked.renew {
+                    // Expiry and revocation are final: a late heartbeat cannot revive a token.
+                    if db.credential_of(hash, &asked.ns).is_some() {
+                        let deadline = auth::now() + abi::PROCESS_TOKEN_TTL;
+                        db.run(
+                            "UPDATE credentials SET expires = ? WHERE ns = ? AND token = ?",
+                            vec![int(deadline), text(&asked.ns), text(hash)],
+                        );
+                        db.set_expiry("credential", hash, deadline);
+                    }
+                }
                 for hash in &asked.tokens {
                     db.revoke(&asked.ns, hash);
                 }
@@ -443,7 +493,7 @@ fn exec(
     // The image's descriptor is kept in its process's line's session, as what it opens is.
     let sid = session_of(ns, &lineage);
     db.run(
-        "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner, expires) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         vec![
             text(&asked.token),
             text(ns),
@@ -454,6 +504,21 @@ fn exec(
             int(umask),
             int(now),
             text(&lineage),
+            int(now + abi::PROCESS_TOKEN_TTL),
+        ],
+    );
+    db.set_expiry("credential", &asked.token, now + abi::PROCESS_TOKEN_TTL);
+    let placement = crate::placement::browser(
+        ns,
+        cred.id,
+        asked.seat.as_deref(),
+        asked.cgroup.as_deref().unwrap_or("/user"),
+    );
+    db.run(
+        "UPDATE credentials SET placement = ? WHERE token = ?",
+        vec![
+            text(&serde_json::to_string(&placement).unwrap_or_default()),
+            text(&asked.token),
         ],
     );
     // The image the process ran before is replaced: its token and its image's descriptor die

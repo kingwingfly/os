@@ -71,3 +71,19 @@ image = "./containers/jobs/Dockerfile"
 image_build_context = "."
 instance_type = "basic"
 max_instances = 4
+
+# Binaryen parses and transforms immutable executable content in a separate container.
+[[durable_objects.bindings]]
+name = "COMPILER"
+class_name = "ModuleCompiler"
+
+[[migrations]]
+tag = "v4-module-compiler"
+new_sqlite_classes = ["ModuleCompiler"]
+
+[[containers]]
+class_name = "ModuleCompiler"
+image = "./containers/compiler/Dockerfile"
+image_build_context = "."
+instance_type = "basic"
+max_instances = 4

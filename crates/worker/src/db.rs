@@ -32,10 +32,11 @@ extern "C" {
 const ROLLBACK: &str = "rollback";
 
 /// The version of the tables below, which local state made by an older one does not have.
-pub const SCHEMA_VERSION: &str = "6";
+pub const SCHEMA_VERSION: &str = "7";
 
-const SCHEMA: [&str; 33] = [
+const SCHEMA: [&str; 34] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS observations(name TEXT PRIMARY KEY, value INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
     "CREATE TABLE IF NOT EXISTS sessions(key TEXT PRIMARY KEY, uid INTEGER NOT NULL, expires INTEGER NOT NULL, sudo_until INTEGER NOT NULL)",
@@ -99,7 +100,7 @@ const SCHEMA: [&str; 33] = [
     // its browser's namespace, the process that executed, as whom it acts, and the key its
     // process's descriptors are owned by (that of the image it replaced, which it keeps). The
     // process table is each browser's own Durable Object's (machine.rs).
-    "CREATE TABLE IF NOT EXISTS credentials(token TEXT PRIMARY KEY, ns TEXT NOT NULL, pid INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, groups TEXT NOT NULL, umask INTEGER NOT NULL, started INTEGER NOT NULL, owner TEXT)",
+    "CREATE TABLE IF NOT EXISTS credentials(token TEXT PRIMARY KEY, ns TEXT NOT NULL, pid INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, groups TEXT NOT NULL, umask INTEGER NOT NULL, started INTEGER NOT NULL, owner TEXT, expires INTEGER NOT NULL DEFAULT 0, placement TEXT NOT NULL DEFAULT '{}')",
     "CREATE INDEX IF NOT EXISTS credentials_ns ON credentials(ns, pid)",
 ];
 
@@ -239,6 +240,24 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     }
     if sql.exec("SELECT device FROM fds LIMIT 0", None).is_err() {
         sql.exec("ALTER TABLE fds ADD COLUMN device TEXT", None)?;
+    }
+    if sql
+        .exec("SELECT expires FROM credentials LIMIT 0", None)
+        .is_err()
+    {
+        sql.exec(
+            "ALTER TABLE credentials ADD COLUMN expires INTEGER NOT NULL DEFAULT 0",
+            None,
+        )?;
+    }
+    if sql
+        .exec("SELECT placement FROM credentials LIMIT 0", None)
+        .is_err()
+    {
+        sql.exec(
+            "ALTER TABLE credentials ADD COLUMN placement TEXT NOT NULL DEFAULT '{}'",
+            None,
+        )?;
     }
     // Descriptors made before read tokens have none.
     if sql.exec("SELECT token FROM fds LIMIT 0", None).is_err() {
@@ -595,6 +614,21 @@ impl Db {
         }
     }
 
+    /// Counter hook shared by the authority and each Machine; never records paths or tokens.
+    pub fn observe(&mut self, name: &str, count: u64) {
+        self.run("INSERT INTO observations(name, value) VALUES(?, ?) ON CONFLICT(name) DO UPDATE SET value = value + excluded.value", vec![text(name), int(count)]);
+    }
+    pub fn observations(&self) -> std::collections::BTreeMap<String, u64> {
+        #[derive(Deserialize)]
+        struct Counter {
+            name: String,
+            value: u64,
+        }
+        self.rows::<Counter>("SELECT name, value FROM observations", vec![])
+            .into_iter()
+            .map(|row| (row.name, row.value))
+            .collect()
+    }
     pub fn meta(&self, key: &str) -> Option<String> {
         self.rows::<Value>("SELECT v FROM meta WHERE k = ?", vec![text(key)])
             .pop()
@@ -1071,6 +1105,7 @@ impl Db {
     /// under its prefix, also those written but never committed.
     pub fn drop_file(&mut self, file: &str) {
         self.discard(&format!("chunks/{file}/"));
+        self.discard(&crate::compiler::prefix(file));
         self.run("DELETE FROM chunks WHERE file = ?", vec![text(file)]);
         self.run("DELETE FROM files WHERE id = ?", vec![text(file)]);
         self.run("DELETE FROM fds WHERE file = ?", vec![text(file)]);

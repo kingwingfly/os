@@ -37,6 +37,7 @@ async function process(module, out, snapshot) {
   } };
   self.instance = await WebAssembly.instantiate(module, imports);
   self.engine = snapshot ? Engine.child(self.instance, memory, snapshot) : new Engine(self.instance, memory);
+  if (!snapshot) self.instance.exports.__tw_initialize?.();
   return self;
 }
 // Run it until it exits or forks: its exit status, or what it asked.
@@ -81,6 +82,24 @@ const TABLE = `(module
     (drop (call $fork (i32.const 0) (i32.const 16)))
     (call $exit (call_indirect $calls (type $answer) (i32.const 0)))))`;
 
+test('pre-instrumented fixed-memory modules also use separate scratch', async () => {
+  const wat = readFileSync(new URL('./fixtures/wasix-fork.wat', import.meta.url), 'utf8').replace('(memory (export "memory") 2)', '(memory (export "memory") 2 2)');
+  const original = binaryen.parseText(wat);
+  binaryen.setPassArgument('asyncify-imports', 'wasix_32v1.proc_fork');
+  original.runPasses(['asyncify']); binaryen.clearPassArguments();
+  let bytes;
+  try { bytes = asyncify(binaryen, original.emitBinary(), ['wasix_32v1.proc_fork'], false); }
+  finally { original.dispose(); }
+  const module = await WebAssembly.compile(bytes);
+  const out = [];
+  const parent = await process(module, out);
+  assert.deepEqual(run(parent), { kind: 'fork' });
+  const child = await process(module, out, parent.engine.snapshot());
+  child.engine.rewind({ pid: 0 }); assert.deepEqual(run(child), { exit: 0 });
+  parent.engine.rewind({ pid: 2 }); assert.deepEqual(run(parent), { exit: 0 });
+  assert.deepEqual(out, ['child\n', 'parent\n']);
+});
+
 test('a fork\'s child holds what its parent\'s tables held, as the image changed them', async () => {
   const bytes = asyncify(binaryen, binaryen.parseText(TABLE).emitBinary(), ['wasix_32v1.proc_fork']);
   const module = await WebAssembly.compile(bytes);
@@ -95,6 +114,50 @@ test('a fork\'s child holds what its parent\'s tables held, as the image changed
   assert.deepEqual(run(child), { exit: 2 });
   parent.engine.rewind({ pid: 2 });
   assert.deepEqual(run(parent), { exit: 2 });
+});
+
+test('fork preserves fixed and exhausted memory limits, including repeated forks', async () => {
+  for (const grow of [false, true]) {
+    const wat = `(module
+      (import "wasix_32v1" "proc_fork" (func $fork (param i32 i32) (result i32)))
+      (memory (export "memory") 1 ${grow ? 2 : 1})
+      (func (export "_start")
+        ${grow ? '(drop (memory.grow (i32.const 1)))' : ''}
+        (drop (call $fork (i32.const 1) (i32.const 16)))
+        (drop (call $fork (i32.const 1) (i32.const 16)))))`;
+    const module = await WebAssembly.compile(asyncify(binaryen, binaryen.parseText(wat).emitBinary(), ['wasix_32v1.proc_fork']));
+    const parent = await process(module, []);
+    assert.deepEqual(run(parent), { kind: 'fork' });
+    const length = parent.instance.exports.memory.buffer.byteLength;
+    const child = await process(module, [], parent.engine.snapshot());
+    child.engine.rewind({ pid: 0 });
+    assert.deepEqual(run(child), { kind: 'fork' });
+    assert.equal(child.instance.exports.memory.buffer.byteLength, length);
+    assert.throws(() => child.instance.exports.memory.grow(1), RangeError);
+    child.engine.rewind({ pid: 3 });
+    assert.deepEqual(run(child), { exit: 0 });
+  }
+});
+
+test('fork resumes the snapshot without repeating the start section', async () => {
+  const wat = `(module
+    (import "wasix_32v1" "proc_fork" (func $fork (param i32 i32) (result i32)))
+    (import "wasix_32v1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+    (memory (export "memory") 1 1)
+    (data (i32.const 64) "init")
+    (func $initialize
+      (i32.store (i32.const 0) (i32.const 64))
+      (i32.store (i32.const 4) (i32.const 4))
+      (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 24))))
+    (start $initialize)
+    (func (export "_start") (drop (call $fork (i32.const 1) (i32.const 16)))))`;
+  const module = await WebAssembly.compile(asyncify(binaryen, binaryen.parseText(wat).emitBinary(), ['wasix_32v1.proc_fork']));
+  const out = [], parent = await process(module, out);
+  assert.deepEqual(run(parent), { kind: 'fork' });
+  const child = await process(module, out, parent.engine.snapshot());
+  child.engine.rewind({ pid: 0 });
+  assert.deepEqual(run(child), { exit: 0 });
+  assert.deepEqual(out, ['init']);
 });
 
 test('a line\'s open files are counted by holder: a killed process\'s go, and the last is told', async () => {

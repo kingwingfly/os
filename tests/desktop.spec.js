@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './test.js';
 
 // The desktop (crates/frontend/src/desktop.rs): windows a pointer moves, resizes and snaps, that
 // minimize to the dock and come back, laid out again as they were after a reload; the preview a

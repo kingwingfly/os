@@ -57,7 +57,7 @@ pub fn permit(caller: Caller, call: &Call) -> Result<Acting, Error> {
                 "a process replaces itself through its kernel, which holds its token",
             )),
         },
-        Call::Fork { .. } | Call::Exit { .. } => match caller {
+        Call::Fork { .. } | Call::Exit { .. } | Call::ProcKeep { .. } => match caller {
             Registry | Process => Ok(Acting::Itself),
             Page => Err(Error::because(
                 Errno::EPERM,

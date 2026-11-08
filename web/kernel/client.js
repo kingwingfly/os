@@ -1,8 +1,7 @@
 // The client kernel: a classic worker, so it can importScripts the no-modules wasm-bindgen
 // build, with the Rust kernel (crates/client-kernel) holding the processes its tabs host and
-// their tokens. It runs as the browser's SharedWorker, one for every tab, or, where a browser
-// has none (Chrome for Android before 148), as a dedicated Worker of one tab, which speaks
-// through itself as its port. Its requests go to the browser's machine (a Durable Object of
+// their tokens. Each tab owns a dedicated Worker, which owns its process Workers and pipes.
+// The page communicates through messages. Its requests go to the browser's machine (a Durable Object of
 // its own, by a batch marked X-Registry). The machine verifies account identity with the
 // authority for tokenless batches; process-token calls use their stored snapshot.
 // Forks, exits and waits happen in the Rust kernel and are told to the machine in batches:
@@ -24,10 +23,8 @@ importScripts('/client_kernel.js');
 
 const VERSION = 1;
 const ports = new Set();
-const sharing = typeof SharedWorkerGlobalScope === 'function' && self instanceof SharedWorkerGlobalScope;
 const locks = self.navigator?.locks;
 // The tabs waited on, by seat.
-const watched = new Set();
 let kernel;
 let starting;
 // This kernel's id, and the lock it holds of it while it runs.
@@ -76,9 +73,8 @@ self.kernelSys = async body => {
 
 function boot() {
   starting ??= wasm_bindgen('/client_kernel_bg.wasm').then(async () => {
-    // A boot id reaps what the current account's last boot left; only the browser's one shared kernel,
-    // and only where tabs cannot say they are gone, may do so.
-    const id = sharing && !locks ? self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}` : '';
+    // A dedicated kernel never resets the namespace on boot; locks and leases reclaim it.
+    const id = '';
     kernel = new wasm_bindgen.Kernel(id, locks ? kernelId : '');
     const value = JSON.parse(await kernel.init());
     broadcast({ v: VERSION, type: 'event', event: 'started', value });
@@ -115,17 +111,6 @@ async function reapGone(seat) {
     if (lender !== kernelId && !held.has(kernelLock(lender))) await kernel.reclaim(lender);
   }
 }
-// Wait for the tab `seat` to go, and reap what it left: its lock is granted here once the tab
-// lets it go, closed, crashed or reloaded.
-function watch(seat) {
-  if (!locks || !seat || watched.has(seat)) return;
-  watched.add(seat);
-  void locks.request(tabLock(seat), async () => {
-    watched.delete(seat);
-    await boot();
-    await serially(() => reapGone(seat));
-  }).catch(() => watched.delete(seat));
-}
 // execve of a pipeline's stages, in one request, as the tab `seat` asks it: each stage's
 // process, or its error. Where the namespace has no room (EAGAIN), what gone tabs left is
 // reaped, and it is asked once more.
@@ -155,7 +140,11 @@ function failure(error) {
   if (typeof error === 'string') {
     try { return JSON.parse(error); } catch { /* not our envelope */ }
   }
-  if (error && typeof error === 'object' && error.errno) return error;
+  // Structured cloning an Error keeps its message, but drops errno and detail. The
+  // protocol carries a plain record so loader failures survive the worker boundary.
+  if (error && typeof error === 'object' && error.errno) {
+    return { errno: error.errno, detail: error.detail ?? error.message ?? error.errno };
+  }
   return { errno: 'EIO', detail: String(error?.message ?? error) };
 }
 
@@ -177,6 +166,7 @@ async function dispatch(message, host, tab) {
     // kill(2): as the page's account, or `from` a process this port runs, as that process.
     case 'kill': return JSON.parse(await kernel.kill(args.pid, args.signal ?? undefined, args.from ?? undefined, host));
     case 'poll': return JSON.parse(await kernel.poll(JSON.stringify(args.pids ?? [])));
+    case 'sync': return JSON.parse(await kernel.sync(host));
     case 'getpid': return JSON.parse(await kernel.getpid(args.pid));
     case 'cgroup_create': return JSON.parse(await kernel.cgroup_create(args.path));
     case 'cgroup_set': return JSON.parse(await kernel.cgroup_set(args.path, args.key, args.value));
@@ -205,12 +195,23 @@ async function handle(port, message) {
     port.postMessage({ v: VERSION, id: message.id, err: { errno: 'EPERM', detail: 'a port speaks for the tab it first said it was' } });
     return;
   }
-  // The browser's kernel outlives its tabs, and reaps what each leaves; a tab's own kernel goes
-  // with its tab.
-  if (sharing) watch(host.tab);
+  // This kernel goes with its tab; other kernels and the Machine lease reclaim what it leaves.
   try {
     await boot();
-    const value = await serially(() => dispatch(message, host.id, host.tab));
+    let value;
+    if (message.type === 'run' || message.type.startsWith('run_') || ['deliver_signal', 'reconcile'].includes(message.type)) {
+      self.kernelRequest = async (type, args) => {
+        const answer = await serially(() => dispatch({ type, args }, host.id, host.tab)).catch(error => {
+          const refused = failure(error);
+          throw Object.assign(new Error(refused.detail ?? refused.errno), refused);
+        });
+        if (type === 'wait' || type === 'waitchild') await heard();
+        void report();
+        return answer;
+      };
+      const executor = await import('/executor-host.js');
+      value = await executor.request(message.type, message.args ?? {}, value => port.postMessage({ v: VERSION, type: 'event', event: 'run', value }));
+    } else value = await serially(() => dispatch(message, host.id, host.tab));
     // A wait answers once the machine heard of it, so that /proc agrees.
     if (message.type === 'wait' || message.type === 'waitchild') await heard();
     port.postMessage({ v: VERSION, id: message.id, ok: value });
@@ -220,14 +221,6 @@ async function handle(port, message) {
   void report();
 }
 
-self.onconnect = event => {
-  for (const port of event.ports) {
-    ports.add(port);
-    port.onmessage = ({ data }) => handle(port, data);
-    port.start();
-    // A tab that joins a kernel already booted hears what it is.
-    if (kernel) port.postMessage({ v: VERSION, type: 'event', event: 'started', value: null });
-  }
-};
-// A dedicated Worker: one tab's kernel, whose port is itself.
-if (!sharing) self.onmessage = ({ data }) => handle(self, data);
+// Exactly one host owns this worker. SharedWorker is not part of process execution.
+self.onmessage = ({ data }) => handle(self, data);
+setInterval(() => { if (kernel) void serially(() => reapGone()).catch(() => {}); }, 10000);

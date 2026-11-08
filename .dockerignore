@@ -1,5 +1,6 @@
-# The job container's image builds from the repository root; it needs only the Rust workspace.
+# Both containers build from the repository root; only the compiler needs these JS sources.
 .git
+.worktrees
 .wrangler
 .dev.vars
 .local-password
@@ -8,6 +9,10 @@ dist
 target
 test-results
 crates/worker/build
-web
+web/*
+!web/kernel
+web/kernel/*
+!web/kernel/asyncify.js
+!web/kernel/image.js
 seed
 tests

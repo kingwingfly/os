@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './test.js';
 async function open(page, path) {
   await page.goto('/');
   const input = page.getByRole('combobox', { name: 'Terminal command' });

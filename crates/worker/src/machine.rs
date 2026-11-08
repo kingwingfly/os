@@ -65,6 +65,10 @@ impl DurableObject for Machine {
             procs::create(&self.state.storage().sql())?;
             self.ready.set(true);
         }
+        transact(&self.state, |db| {
+            db.expire_processes(auth::now());
+            ((), true)
+        })?;
         let path = req.path();
         let reply = match (req.method(), path.as_str()) {
             // A directly routed batch. Any page can set the header; account/token checks
@@ -145,6 +149,10 @@ impl DurableObject for Machine {
             procs::create(&self.state.storage().sql())?;
             self.ready.set(true);
         }
+        transact(&self.state, |db| {
+            db.expire_processes(auth::now());
+            ((), true)
+        })?;
         self.settle().await;
         Response::ok("")
     }
@@ -197,6 +205,11 @@ impl Machine {
                 format!("A batch takes at most {BATCH_MAX} calls"),
             ))]);
         }
+        let count = calls.len() as u64;
+        transact(&self.state, move |db| {
+            db.observe("syscalls", count);
+            ((), true)
+        })?;
         let mut results = Vec::with_capacity(calls.len());
         let mut calls = calls.into_iter().peekable();
         while let Some(call) = calls.next() {
@@ -343,7 +356,17 @@ impl Machine {
             .zip(&begun)
             .zip(&tokens)
             .filter_map(|((call, begun), token)| {
-                let (Call::Execve { path, cwd, .. }, Ok(begun)) = (call, begun) else {
+                let (
+                    Call::Execve {
+                        path,
+                        cwd,
+                        seat,
+                        cgroup,
+                        ..
+                    },
+                    Ok(begun),
+                ) = (call, begun)
+                else {
                     return None;
                 };
                 Some(json!({
@@ -351,6 +374,8 @@ impl Machine {
                     "token": auth::token_hash(token),
                     "path": path,
                     "cwd": cwd,
+                    "seat": seat.as_ref().or(begun.seat.as_ref()),
+                    "cgroup": begun.cgroup.as_ref().or(cgroup.as_ref()),
                     "replacing": begun.replacing,
                     "old": begun.old,
                     "current": begun.current,
@@ -435,9 +460,12 @@ impl Machine {
                 .clone()
                 .or(cgroup)
                 .unwrap_or_else(|| "/user".into());
+            let seat = seat.or_else(|| begun.seat.clone());
             let path = image["path"].as_str().unwrap_or_default().to_string();
             let (ns, hash) = (caller.ns.clone(), auth::token_hash(&token));
             let row = (begun.clone(), path.clone(), cgroup.clone());
+            let placement =
+                crate::placement::browser(&caller.ns, snapshot.uid, seat.as_deref(), &cgroup);
             let started = transact(&self.state, move |db| {
                 let (begun, path, cgroup) = row;
                 let started = db.exec_end(
@@ -453,13 +481,13 @@ impl Machine {
                     seat.as_deref(),
                     now,
                 );
+                if started.is_ok() {
+                    db.observe("execs", 1);
+                }
                 (started, true)
             })?;
-            if !started {
-                results.push(Return::Err(Error::because(
-                    Errno::ESRCH,
-                    "the process ended, or replaced its image, as it executed",
-                )));
+            if let Err(error) = started {
+                results.push(Return::Err(error));
                 continue;
             }
             results.push(Return::Ok(json!(Exec {
@@ -472,6 +500,7 @@ impl Machine {
                 token_read: image["token_read"].as_str().map(str::to_string),
                 version: image["version"].as_str().map(str::to_string),
                 cgroup,
+                placement,
             })));
         }
         Ok(results)
@@ -527,24 +556,25 @@ impl Machine {
 
     /// Revoke at the authority the tokens no process holds any more.
     async fn flush(&self) -> Result<()> {
-        let (ns, tokens) = transact(&self.state, |db| {
-            ((db.namespace_id(), db.revoking()), false)
+        let (ns, tokens, renew) = transact(&self.state, |db| {
+            ((db.namespace_id(), db.revoking(), db.renewing()), false)
         })?;
         let Some(ns) = ns else { return Ok(()) };
-        if tokens.is_empty() {
+        if tokens.is_empty() && renew.is_empty() {
             return Ok(());
         }
         if self
             .authority(
                 "/internal/revoke",
                 None,
-                &json!({ "ns": ns, "tokens": tokens }),
+                &json!({ "ns": ns, "tokens": tokens, "renew": renew }),
             )
             .await?
             .is_ok()
         {
             transact(&self.state, move |db| {
                 db.revoked(&tokens);
+                db.renewed(&renew);
                 ((), true)
             })?;
         }
@@ -553,10 +583,24 @@ impl Machine {
 
     /// Wake to revoke what waits, if anything does and no alarm is set.
     async fn schedule(&self) -> Result<()> {
-        let waiting = transact(&self.state, |db| (!db.revoking().is_empty(), false))?;
-        let storage = self.state.storage();
-        if waiting && storage.get_alarm().await?.is_none() {
-            storage.set_alarm(REVOKE_AFTER).await?;
+        let deadline = transact(&self.state, |db| {
+            let retry = (!db.revoking().is_empty() || !db.renewing().is_empty())
+                .then_some(auth::now() + REVOKE_AFTER as u64 / 1000);
+            let next = [retry, db.lease_deadline()].into_iter().flatten().min();
+            (next, false)
+        })?;
+        if let Some(deadline) = deadline {
+            let storage = self.state.storage();
+            let when = deadline as f64 * 1000.0;
+            if storage
+                .get_alarm()
+                .await?
+                .is_none_or(|alarm| alarm as f64 > when)
+            {
+                storage
+                    .set_alarm(((deadline.saturating_sub(auth::now()) * 1000) as i64).max(1))
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -689,7 +733,8 @@ fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Err
                     "fork is called by its parent",
                 ));
             }
-            let forked = db.fork(&row, child, now)?;
+            let forked = db.fork(&row, child, asked.reserved, now)?;
+            db.observe("forks", 1);
             Ok(json!(Forked {
                 pid: forked.pid,
                 // The child carries its parent's token, as it keeps its credentials.
@@ -747,6 +792,12 @@ fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Err
                 ));
             }
             Ok(json!(db.poll(ns, &pids, &account()?)))
+        }
+        Call::ProcKeep { processes } => {
+            if processes.len() > abi::PROC_POLL_MAX {
+                return Err(Errno::E2BIG.into());
+            }
+            Ok(json!(db.keep_processes(ns, &processes, now)))
         }
         Call::Kill {
             pid: target,

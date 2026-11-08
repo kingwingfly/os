@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
 import { fakeKernel } from './sys.js';

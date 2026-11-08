@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
 import { api, call as syscall, put, rmrf } from './sys.js';
@@ -21,9 +21,7 @@ async function connect(page, { tab, hold = false } = {}) {
     if (hold) await new Promise(resolve => {
       void navigator.locks.request(`tw-tab-${tab}`, () => { resolve(); return new Promise(() => {}); });
     });
-    const shared = typeof SharedWorker === 'function';
-    const worker = shared ? new SharedWorker('/client-kernel.js') : new Worker('/client-kernel.js');
-    const port = shared ? worker.port : worker;
+    const port = new Worker('/client-kernel.js');
     const pending = new Map();
     let next = 0;
     port.onmessage = ({ data }) => {
@@ -265,11 +263,10 @@ for (const startsRoot of [false, true]) {
   });
 }
 
-for (const dedicated of [false, true]) {
-  test(`another tab cannot fork, replace, exit, wait for children or signal as a hosted process (${dedicated ? 'dedicated' : 'shared'} kernel)`, async ({ page, context }) => {
-    if (dedicated) await context.addInitScript(() => { delete globalThis.SharedWorker; });
+for (const removed of [false, true]) {
+  test(`another tab cannot fork, replace, exit, wait for children or signal as a hosted process (SharedWorker ${removed ? 'removed' : 'unchanged'})`, async ({ page, context }) => {
+    if (removed) await context.addInitScript(() => { delete globalThis.SharedWorker; });
     await page.goto('/');
-    if (!dedicated) expect(await page.evaluate(() => typeof SharedWorker)).toBe('function');
     await connect(page);
     await login(context.request);
     const parent = value(await kernel(page, 'exec', sleep));

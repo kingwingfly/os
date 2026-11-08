@@ -222,6 +222,32 @@ pub enum ProcState {
     Zombie,
 }
 
+/// Execution location; labels never grant access to an executor or cluster.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Placement {
+    pub cluster: String,
+    pub executor: String,
+    pub cgroup: String,
+}
+
+/// Versioned capability discovery. Disabled features have no execution path yet.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Features {
+    pub wasix: bool,
+    pub cgroups: bool,
+    pub cluster: bool,
+    pub completion_queue: bool,
+}
+
+/// Reserved completion representation for future asynchronous batches/shared rings.
+/// The current API continues returning ordered Results; this is not a new syscall.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Completion {
+    pub request: u64,
+    pub index: u32,
+    pub result: Return,
+}
+
 /// What start_execve tells the loader: the process it made or replaced, the token that process
 /// makes its calls with, how to read its image, and where it runs.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -242,12 +268,23 @@ pub struct Exec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     pub cgroup: String,
+    #[serde(default)]
+    pub placement: Placement,
 }
 
 /// What fork(2)'s registry half gives: the child, and the token its calls carry.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Forked {
     pub pid: u32,
+    pub token: String,
+}
+
+/// Proof that a host still holds a process. It authorizes that process's lease and status
+/// only, independently of the browser account currently signed in.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProcessProof {
+    pub pid: u32,
+    #[serde(rename = "proc")]
     pub token: String,
 }
 
@@ -272,6 +309,8 @@ pub struct Proc {
     /// The tab that runs it, if a client kernel said (`Execve`'s `seat`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat: Option<String>,
+    #[serde(default)]
+    pub placement: Placement,
 }
 
 /// A process's wait status, as waitpid(2) encodes it: exit code in the high byte, or the signal
@@ -944,6 +983,10 @@ pub enum Call {
         #[serde(default)]
         pids: Vec<u32>,
     },
+    /// Renew hosted processes and recover their current state after a missed event.
+    ProcKeep {
+        processes: Vec<ProcessProof>,
+    },
     /// A cgroup of the namespace's hierarchy, as cgroup v2 makes one.
     CgroupCreate {
         path: String,
@@ -1029,6 +1072,7 @@ impl Call {
             | Call::Gone { .. }
             | Call::Getpid
             | Call::ProcPoll { .. }
+            | Call::ProcKeep { .. }
             | Call::CgroupCreate { .. }
             | Call::CgroupRemove { .. }
             | Call::CgroupSet { .. }
@@ -1271,3 +1315,8 @@ mod tests {
         assert_eq!(list, Call::CgroupList { path: "/".into() });
     }
 }
+
+/// Seconds without an authenticated host heartbeat before its processes are reaped.
+pub const PROCESS_LEASE: u64 = 30 * 60;
+/// Credential validity exceeds the host lease so a delayed revocation still expires.
+pub const PROCESS_TOKEN_TTL: u64 = 2 * PROCESS_LEASE;

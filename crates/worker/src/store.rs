@@ -125,6 +125,7 @@ impl DurableObject for TerminalAuthority {
                     // So does a device: a presentation unturned for long, a sound unkept; its
                     // followers hear so.
                     ("device", _, _) => dev::hangup(db, &id, true),
+                    ("credential", _, _) => db.expire_credential(&id, now),
                     _ => db.clear_expiry(&kind, &id),
                 }
             }

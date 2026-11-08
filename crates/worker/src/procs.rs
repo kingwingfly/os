@@ -30,7 +30,7 @@ pub const ROOT_CGROUPS: [&str; 4] = ["/init", "/user", "/system", "/cluster"];
 type Result<T> = std::result::Result<T, Error>;
 
 /// The registry's tables, in its namespace's own Durable Object.
-const SCHEMA: [&str; 7] = [
+const SCHEMA: [&str; 10] = [
     // The namespace, one small machine: the browser it is (its guest, or session, key), the
     // boot it is of (a reload resets stale processes), and the next pid.
     "CREATE TABLE IF NOT EXISTS namespaces(id TEXT PRIMARY KEY, guest TEXT NOT NULL, boot TEXT, next_pid INTEGER NOT NULL, created INTEGER NOT NULL, last_seen INTEGER NOT NULL)",
@@ -49,6 +49,9 @@ const SCHEMA: [&str; 7] = [
     // Tokens no process holds any more, which the authority is still to revoke.
     "CREATE TABLE IF NOT EXISTS revoked(token TEXT PRIMARY KEY)",
     "CREATE INDEX IF NOT EXISTS processes_token ON processes(token)",
+    "CREATE TABLE IF NOT EXISTS leases(pid INTEGER PRIMARY KEY, expires INTEGER NOT NULL, renewed INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS renewals(token TEXT PRIMARY KEY)",
+    "CREATE TABLE IF NOT EXISTS observations(name TEXT PRIMARY KEY, value INTEGER NOT NULL)",
 ];
 
 /// Create the registry's tables, if they are not there yet.
@@ -56,6 +59,7 @@ pub fn create(sql: &SqlStorage) -> worker::Result<()> {
     for statement in SCHEMA {
         sql.exec(statement, None)?;
     }
+    sql.exec(&format!("INSERT OR IGNORE INTO leases(pid, expires, renewed) SELECT pid, started + {}, started FROM processes WHERE pid != 1", abi::PROCESS_LEASE), None)?;
     // Pids lent before a kernel said who it was are no kernel's, and cgroups made before they
     // had an owner are root's.
     if sql.exec("SELECT kernel FROM spare LIMIT 0", None).is_err() {
@@ -116,6 +120,12 @@ impl Row {
             started: self.started,
             ended: self.ended,
             seat: self.seat.clone(),
+            placement: crate::placement::browser(
+                &self.ns,
+                self.uid,
+                self.seat.as_deref(),
+                &self.cgroup,
+            ),
         }
     }
     pub fn identity(&self) -> Identity {
@@ -158,6 +168,8 @@ pub struct Begun {
     pub current: Option<String>,
     /// The cgroup the replaced process is in, which it stays in.
     pub cgroup: Option<String>,
+    /// The executor seat retained when execve does not supply a new one.
+    pub seat: Option<String>,
 }
 
 /// The credentials an execve snapshotted (the authority's answer).
@@ -170,6 +182,111 @@ pub struct Snapshot {
 }
 
 impl Db {
+    fn lease(&mut self, pid: u32, now: u64) {
+        self.run(
+            "INSERT OR REPLACE INTO leases(pid, expires, renewed) VALUES(?, ?, ?)",
+            vec![int(pid), int(now + abi::PROCESS_LEASE), int(now)],
+        );
+    }
+    /// A host that disappears cannot leave executable credentials or process rows forever.
+    /// Web Locks clean up promptly; this deadline also works when every browser tab is gone.
+    pub fn expire_processes(&mut self, now: u64) {
+        let rows = self.rows::<Row>(&format!("SELECT {COLUMNS} FROM processes WHERE pid != 1 AND pid IN (SELECT pid FROM leases WHERE expires <= ?)"), vec![int(now)]);
+        for row in rows {
+            if row.zombie() && row.ppid != INIT {
+                // A live parent's lease preserves the status until wait, even for a child
+                // that exited hours ago. Once the parent disappears it is reaped as usual.
+                #[derive(Deserialize)]
+                struct Deadline {
+                    expires: u64,
+                }
+                if let Some(deadline) = self
+                    .rows::<Deadline>(
+                        "SELECT expires FROM leases WHERE pid = ? AND expires > ?",
+                        vec![int(row.ppid), int(now)],
+                    )
+                    .first()
+                {
+                    self.run(
+                        "UPDATE leases SET expires = ? WHERE pid = ?",
+                        vec![int(deadline.expires), int(row.pid)],
+                    );
+                    continue;
+                }
+            }
+            self.observe("processes_expired", 1);
+            if !row.zombie() {
+                let _ = self.exit(&row, 128 + i32::from(SIGKILL), Some(SIGKILL), now);
+            }
+            self.remove(&row);
+        }
+    }
+    pub fn lease_deadline(&self) -> Option<u64> {
+        #[derive(Deserialize)]
+        struct Deadline {
+            expires: Option<u64>,
+        }
+        self.rows::<Deadline>("SELECT MIN(expires) AS expires FROM leases", vec![])
+            .into_iter()
+            .next()
+            .and_then(|row| row.expires)
+    }
+    pub fn renewing(&self) -> Vec<String> {
+        #[derive(Deserialize)]
+        struct Token {
+            token: String,
+        }
+        self.rows::<Token>("SELECT token FROM renewals", vec![])
+            .into_iter()
+            .map(|row| row.token)
+            .collect()
+    }
+    pub fn renewed(&mut self, tokens: &[String]) {
+        for token in tokens {
+            self.run("DELETE FROM renewals WHERE token = ?", vec![text(token)]);
+        }
+    }
+    /// A host may inspect even a zombie by its token, without gaining access to another
+    /// account's processes after a session change. Missing or invalid proofs reveal no row.
+    pub fn keep_processes(
+        &mut self,
+        ns: &str,
+        proofs: &[abi::ProcessProof],
+        now: u64,
+    ) -> Vec<Proc> {
+        proofs
+            .iter()
+            .filter_map(|proof| {
+                if self.token_of(ns, proof.pid).as_deref()
+                    != Some(crate::auth::token_hash(&proof.token).as_str())
+                {
+                    return None;
+                }
+                let row = self.process(ns, proof.pid)?;
+                if !row.zombie() {
+                    let hash = crate::auth::token_hash(&proof.token);
+                    if self.any(
+                        "SELECT pid FROM leases WHERE pid = ? AND renewed <= ?",
+                        vec![int(proof.pid), int(now.saturating_sub(600))],
+                    ) {
+                        self.run(
+                            "INSERT OR IGNORE INTO renewals(token) VALUES(?)",
+                            vec![text(&hash)],
+                        );
+                        self.run(
+                            "UPDATE leases SET renewed = ? WHERE pid = ?",
+                            vec![int(now), int(proof.pid)],
+                        );
+                    }
+                    self.run(
+                        "UPDATE leases SET expires = ? WHERE pid = ?",
+                        vec![int(now + abi::PROCESS_LEASE), int(proof.pid)],
+                    );
+                }
+                Some(row.proc())
+            })
+            .collect()
+    }
     /// The process `pid` of namespace `ns`.
     pub fn process(&self, ns: &str, pid: u32) -> Option<Row> {
         self.rows::<Row>(
@@ -237,6 +354,9 @@ impl Db {
             "namespace": ns,
             "pid": INIT,
             "boot": self.account_boot(ns, cred.id),
+            "features": abi::Features { wasix: true, cgroups: true, cluster: false, completion_queue: false },
+            "lease_seconds": abi::PROCESS_LEASE,
+            "counters": self.observations(),
             "pids": self.poll(ns, &[], cred).iter().map(|row| row.pid).collect::<Vec<_>>(),
         })
     }
@@ -359,6 +479,7 @@ impl Db {
                     old: (!shared).then(|| token.clone()),
                     current: Some(token),
                     cgroup: Some(existing.cgroup),
+                    seat: existing.seat,
                 })
             }
             None => Ok(Begun {
@@ -367,13 +488,14 @@ impl Db {
                 old: None,
                 current: None,
                 cgroup: None,
+                seat: None,
             }),
         }
     }
     /// execve(2)'s second half: the process, with the credentials the authority snapshotted
     /// and its new token's hash, runs the image. A process replacing its image does so only if
     /// it still holds the token it proved itself with, alive: one that ended, or that another
-    /// execve replaced first, meanwhile, does not, and the new token is revoked (false). The
+    /// execve replaced first, meanwhile, does not, and the new token is revoked on error. The
     /// token it held goes once no process holds it, as a fork may still.
     #[allow(clippy::too_many_arguments)]
     pub fn exec_end(
@@ -389,7 +511,31 @@ impl Db {
         cgroup: &str,
         seat: Option<&str>,
         now: u64,
-    ) -> bool {
+    ) -> Result<()> {
+        // The authority has now verified the executable and the caller's snapshot. Check
+        // placement with that identity, including changes made while exec awaited it.
+        if begun.replacing.is_none() {
+            let allowed = self
+                .cgroup(ns, cgroup)
+                .ok_or(Errno::ENOENT)
+                .and_then(|group| {
+                    let identity = terminal_worker_core::permissions::Identity {
+                        id: cred.uid,
+                        group: cred.gid,
+                        groups: cred.groups.clone(),
+                    };
+                    registry::may_attach(&identity, cred.uid, cgroup, group.owner)
+                        .then_some(())
+                        .ok_or(Errno::EACCES)
+                });
+            if let Err(error) = allowed {
+                self.run(
+                    "INSERT OR IGNORE INTO revoked(token) VALUES(?)",
+                    vec![text(token_hash)],
+                );
+                return Err(error.into());
+            }
+        }
         let groups = serde_json::to_string(&cred.groups).unwrap_or_default();
         let argv = serde_json::to_string(argv).unwrap_or_default();
         let env = serde_json::to_string(env).unwrap_or_default();
@@ -421,14 +567,18 @@ impl Db {
                     "INSERT OR IGNORE INTO revoked(token) VALUES(?)",
                     vec![text(token_hash)],
                 );
-                return false;
+                return Err(Error::because(
+                    Errno::ESRCH,
+                    "the process ended, or replaced its image, as it executed",
+                ));
             }
             // The image it ran before died with the exec at the authority (`Begun::old`), or,
             // shared then, dies once no fork of it holds it.
             if begun.old.is_none() {
                 self.revoke_unheld(ns, &current);
             }
-            true
+            self.lease(begun.pid, now);
+            Ok(())
         } else {
             self.run(
                 "INSERT INTO processes(ns, pid, ppid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, token, started, ended, seat) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 0, NULL, ?, ?, 0, ?)",
@@ -450,7 +600,8 @@ impl Db {
                     seat,
                 ],
             );
-            true
+            self.lease(begun.pid, now);
+            Ok(())
         }
     }
     /// Whether any process still holds the token `hash` (a fork shares its parent's).
@@ -605,7 +756,13 @@ impl Db {
     /// fork(2)'s registry half: a child of `parent`, with its credentials, cgroup, image,
     /// environment and token copied (a child acts as its parent was executed, and shares its
     /// descriptors). Its pid is `child`, one lent to the kernel that forked, or a new one.
-    pub fn fork(&mut self, parent: &Row, child: Option<u32>, now: u64) -> Result<Forked> {
+    pub fn fork(
+        &mut self,
+        parent: &Row,
+        child: Option<u32>,
+        reserved: usize,
+        now: u64,
+    ) -> Result<Forked> {
         let pid = match child {
             Some(child) => {
                 if !self.any(
@@ -620,12 +777,13 @@ impl Db {
                 self.run("DELETE FROM spare WHERE pid = ?", vec![int(child)]);
                 child
             }
-            None => self.new_pid(&parent.ns, 0)?,
+            None => self.new_pid(&parent.ns, reserved)?,
         };
         self.run(
             "INSERT INTO processes(ns, pid, ppid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, token, started, ended, seat) SELECT ns, ?, pid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, 'running', 0, NULL, token, ?, 0, seat FROM processes WHERE ns = ? AND pid = ?",
             vec![int(pid), int(now), text(&parent.ns), int(parent.pid)],
         );
+        self.lease(pid, now);
         Ok(Forked {
             pid,
             // The child's calls carry its parent's token, with its own pid.
@@ -701,6 +859,7 @@ impl Db {
             "DELETE FROM processes WHERE ns = ? AND pid = ?",
             vec![text(&row.ns), int(row.pid)],
         );
+        self.run("DELETE FROM leases WHERE pid = ?", vec![int(row.pid)]);
         self.revoke_unheld(&row.ns, &token);
     }
     /// waitpid(2): the zombie `pid`, now reaped, or EAGAIN while it runs, or ECHILD when it is
