@@ -11,6 +11,8 @@ use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
+pub mod accelerator;
+
 /// Why a call failed, as Linux's errno says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[allow(clippy::upper_case_acronyms)]
@@ -444,6 +446,8 @@ pub const O_APPEND: u32 = 0o2000;
 /// A directory, to read with getdents or name others from (`/proc/self/fd/N/NAME`, as openat
 /// would): fails with ENOTDIR on anything else.
 pub const O_DIRECTORY: u32 = 0o200000;
+/// A metadata/path handle. This runtime currently supports directory O_PATH handles.
+pub const O_PATH: u32 = 0o10000000;
 /// ioctl(2)'s FICLONE, as Linux numbers it: the file the descriptor writes takes the content of
 /// the one `arg` reads, shared, nothing copied (what `cp` does).
 pub const FICLONE: u32 = 0x4004_9409;
@@ -886,15 +890,6 @@ pub enum Call {
     InotifyRmWatch {
         wd: u32,
     },
-    /// A process of the session's account (zip, unzip, tar, faststart), run as the caller
-    /// (root under sudo), from `cwd`: its pid, and a descriptor of this session that writes its
-    /// standard input (`stdin`), as a pipe would: unzip's answers to its question, `{"decisions":
-    /// {PATH: true|false}}`, go through pwrite. Its work is done apart (a container), reading
-    /// and writing as it.
-    Spawn {
-        argv: Vec<String>,
-        cwd: String,
-    },
     /// Begin a browser's process namespace, as init does. A new `boot` reaps only the calling
     /// account's old processes and lends. The browser's guest cookie names the namespace;
     /// a caller-supplied boot id grants no authority over another account.
@@ -928,6 +923,15 @@ pub enum Call {
         /// lives: a process whose seat's lock is free was left by a tab that is gone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seat: Option<String>,
+    },
+    /// The host's projection of its local terminal descriptors. Metadata only: knowing
+    /// a PTY number grants no access to its buffers or another process's descriptors.
+    ProcTty {
+        pid: u32,
+        #[serde(rename = "proc")]
+        token: String,
+        tty: u32,
+        fds: Vec<u32>,
     },
     /// fork(2)'s registry half: a child of `pid`, with its credentials, cgroup and descriptors
     /// copied. The client kernel clones the guest's wasm state (asyncify snapshot). The child
@@ -1023,13 +1027,9 @@ pub enum Call {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signal: Option<u8>,
     },
-    /// What the process `pid` is now, and what it wrote after line `since`, as waitid(2) with
-    /// WNOHANG and a read of its output: its state (`running`, `question`, `done`, `failed`,
-    /// `cancelled`), progress, question and new lines.
+    /// waitpid(2): process lifecycle and exit status only. Device output uses completions.
     Wait {
         pid: String,
-        #[serde(default)]
-        since: u64,
         /// A host may reap the zombie it ran by its token, even after the browser signs out.
         /// This grants no live-process or filesystem authority to a zombie's token.
         #[serde(default, rename = "proc", skip_serializing_if = "Option::is_none")]
@@ -1073,6 +1073,7 @@ impl Call {
             | Call::Getpid
             | Call::ProcPoll { .. }
             | Call::ProcKeep { .. }
+            | Call::ProcTty { .. }
             | Call::CgroupCreate { .. }
             | Call::CgroupRemove { .. }
             | Call::CgroupSet { .. }
@@ -1108,9 +1109,10 @@ fn modify() -> u32 {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Batch {
     pub calls: Vec<Call>,
-    /// Its umask, which what it makes takes off the mode asked for, as Linux's does.
-    #[serde(default = "umask")]
-    pub umask: u16,
+    /// The runtime's current creation mask. Omitted, use the process snapshot, or 022
+    /// for a browser session. A mask changes creation permissions, never credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub umask: Option<u16>,
     /// Whether it runs under sudo: as root, if its account may and has authenticated lately.
     #[serde(default)]
     pub sudo: bool,
@@ -1121,9 +1123,6 @@ pub struct Batch {
     pub pid: Option<u32>,
     #[serde(default, rename = "proc", skip_serializing_if = "Option::is_none")]
     pub process: Option<String>,
-}
-fn umask() -> u16 {
-    0o022
 }
 /// The most calls a batch takes.
 pub const BATCH_MAX: usize = 256;
@@ -1153,6 +1152,11 @@ pub struct Results {
     pub results: Vec<Return>,
 }
 
+/// Seconds without an authenticated host heartbeat before its processes are reaped.
+pub const PROCESS_LEASE: u64 = 30 * 60;
+/// Credential validity exceeds the host lease so a delayed revocation still expires.
+pub const PROCESS_TOKEN_TTL: u64 = 2 * PROCESS_LEASE;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1178,7 +1182,10 @@ mod tests {
                     serde_json::from_str(r#"{"calls":["getcreds",{"unlink":{"path":"/x"}}]}"#)
                 })
                 .unwrap();
-        assert_eq!(read.umask, 0o022);
+        assert_eq!(read.umask, None);
+        assert!(!text.contains("umask"));
+        let explicit: Batch = serde_json::from_str(r#"{"calls":[],"umask":0}"#).unwrap();
+        assert_eq!(explicit.umask, Some(0));
         assert_eq!(read.calls[1], Call::Unlink { path: "/x".into() });
         let failed = Return::Err(Error::new(Errno::ENOENT));
         assert_eq!(
@@ -1315,8 +1322,3 @@ mod tests {
         assert_eq!(list, Call::CgroupList { path: "/".into() });
     }
 }
-
-/// Seconds without an authenticated host heartbeat before its processes are reaped.
-pub const PROCESS_LEASE: u64 = 30 * 60;
-/// Credential validity exceeds the host lease so a delayed revocation still expires.
-pub const PROCESS_TOKEN_TTL: u64 = 2 * PROCESS_LEASE;

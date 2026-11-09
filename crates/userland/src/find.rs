@@ -1,5 +1,5 @@
 //! fd: what is below its roots, a level a batch, matched as core's `find` says. Running a
-//! command on each (-x, -X) is the terminal's, on what this finds.
+//! command on each (-x, -X) is the installed executable's, on what this finds.
 use crate::files::shown_path;
 use crate::io::Io;
 use crate::sys::Sys;
@@ -9,7 +9,7 @@ use crate::walk;
 const FD_MAX: usize = 50_000;
 
 pub async fn fd(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
-    let find = match terminal_worker_core::find::parse(io.rest()) {
+    let find = match os_core::find::parse(io.rest()) {
         Ok(find) => find,
         Err(error) => {
             io.fail(error);

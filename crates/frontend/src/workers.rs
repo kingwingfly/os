@@ -1,4 +1,4 @@
-//! The previews' web workers, of [`terminal_worker_preview`], each started when a preview first
+//! The previews' web workers, of [`os_preview`], each started when a preview first
 //! needs it: PDF pages, archive listings, Mermaid diagrams, and code, highlighted by four
 //! workers, a group of languages each. A call waits for its worker to be ready, however long it takes to load; one
 //! that then takes more than [`TIMEOUT`], as a file might make it, stops the worker, failing what
@@ -11,7 +11,7 @@ use std::{
 };
 
 use js_sys::{Array, Float64Array, Function, Promise, Uint8Array, Uint8ClampedArray};
-use terminal_worker_preview::{READY, Worker, language::Language};
+use os_preview::{READY, Worker, language::Language};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{Event, ImageData, MessageEvent};

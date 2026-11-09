@@ -7,8 +7,8 @@ use super::{Request, SOUND_IDLE, realtime, version};
 use crate::auth;
 use crate::db::{Db, Device};
 use abi::{Errno, Error};
+use os_core::permissions::Store;
 use serde_json::{Value, json};
-use terminal_worker_core::permissions::Store;
 
 type Result<T> = std::result::Result<T, Error>;
 

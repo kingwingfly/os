@@ -15,34 +15,36 @@ test('every command has side-effect-free help, including privileged and interact
   await initialized;
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   const requests = [];
-  // Whatever changes something: a request other than a read, and system calls other than those
-  // that only look (a listing the panel makes again is no side effect).
+  // External help has a normal exec/exit lifecycle. It may read files and descriptors, but
+  // must not mutate filesystem contents, permissions, or identity.
   // Directory watches and the kernel's periodic seat listing change nothing either.
-  const looking = new Set(['getcreds', 'stat', 'lstat', 'getdents', 'access', 'readlink', 'getxattr', 'listxattr', 'inotify_add_watch', 'inotify_rm_watch', 'seats']);
+  const looking = new Set(['getcreds', 'stat', 'lstat', 'getdents', 'access', 'readlink', 'getxattr', 'listxattr', 'inotify_add_watch', 'inotify_rm_watch', 'seats', 'execve', 'exit', 'wait', 'proc_init', 'proc_poll', 'proc_keep', 'proc_tty', 'pids', 'pread', 'close']);
   const changes = request => {
     if (request.method() === 'GET' || request.method() === 'HEAD') return false;
     if (!request.url().endsWith('/api/sys')) return true;
-    return JSON.parse(request.postData() || '{}').calls?.some(call => !looking.has(typeof call === 'string' ? call : Object.keys(call)[0])) ?? true;
+    return JSON.parse(request.postData() || '{}').calls?.some(call => {
+      if (typeof call === 'object' && call.open) return !!(call.open.flags & (3 | 0o100 | 0o1000 | 0o2000));
+      return !looking.has(typeof call === 'string' ? call : Object.keys(call)[0]);
+    }) ?? true;
   };
   page.on('request', request => { if (changes(request)) requests.push(request.url()); });
   for (const command of commands) {
-    await expect(page.locator('.busy')).toHaveText('↵');
+    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
     // df -h is df's own (human sizes), as in GNU's df: its help is --help.
-    await input.fill(command + (command === 'df' ? ' --help' : ' -h')); await input.press('Enter');
+    await input.fill(command + ' --help'); await input.press('Enter');
     await expect(page.locator('.transcript pre').last()).toContainText('Usage: ');
-    await expect(page.locator('.transcript pre').last()).toContainText('man ' + command);
     await expect(page.locator('#auth')).not.toBeVisible();
     await expect(page.locator('#viewer')).not.toBeVisible();
   }
   for (const command of ['sudo chmod -h', 'rm --help']) {
-    await expect(page.locator('.busy')).toHaveText('↵');
+    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
     await input.fill(command); await input.press('Enter');
     await expect(page.locator('.transcript pre').last()).toContainText('Usage: ');
   }
   expect(requests).toEqual([]);
   await expect(page.locator('.lock')).toContainText('guest');
   // Explicit -- keeps -h a path instead of interpreting it as help.
-  await expect(page.locator('.busy')).toHaveText('↵');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await input.fill('rm -- -h'); await input.press('Enter');
   await expect(page.locator('.transcript pre').last()).toContainText("rm: cannot remove '-h': No such file or directory");
   await expect(page.locator('#auth')).not.toBeVisible();
@@ -52,7 +54,7 @@ test('help lists every command by section, and -h is an option where Linux makes
   await page.goto('/');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   const last = page.locator('.transcript pre').last();
-  const run = async text => { await expect(page.locator('.busy')).toHaveText('↵'); await input.fill(text); await input.press('Enter'); await expect(page.locator('.busy')).toHaveText('↵'); };
+  const run = async text => { await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle'); await input.fill(text); await input.press('Enter'); await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle'); };
   await run('help');
   for (const section of ['Files', 'Text', 'Archives', 'Permissions', 'Accounts', 'Terminal']) await expect(last).toContainText(section);
   for (const command of commands) await expect(last).toContainText(new RegExp(`^  ${command} +\\S`, 'm'));

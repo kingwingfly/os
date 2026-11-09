@@ -1,0 +1,18 @@
+[package]
+name = "os-utilities"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "utilities"
+path = "src/main.rs"
+
+[dependencies]
+abi = { package = "os-abi", path = "../abi" }
+os-posix = { path = "../posix" }
+os-core = { path = "../core" }
+os-userland = { path = "../userland" }
+serde_json.workspace = true
+serde.workspace = true
+futures = { version = "0.3", features = ["executor"] }

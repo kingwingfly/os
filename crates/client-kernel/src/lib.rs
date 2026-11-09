@@ -222,7 +222,7 @@ impl Kernel {
                     count: LEND,
                     kernel,
                 }],
-                umask: 0o022,
+                umask: None,
                 sudo: false,
                 pid: Some(pid),
                 process: Some(token.clone()),
@@ -327,7 +327,6 @@ impl Kernel {
                 let local = state.processes.remove(&pid).unwrap();
                 state.report(Call::Wait {
                     pid: pid.to_string(),
-                    since: 0,
                     token: Some(local.token),
                 });
                 let wait = match signal {
@@ -341,7 +340,6 @@ impl Kernel {
                     .one(
                         Call::Wait {
                             pid: pid.to_string(),
-                            since: 0,
                             token: None,
                         },
                         false,
@@ -391,7 +389,6 @@ impl Kernel {
         let local = state.processes.remove(&child).unwrap();
         state.report(Call::Wait {
             pid: child.to_string(),
-            since: 0,
             token: Some(local.token),
         });
         let wait = match signal {
@@ -427,7 +424,7 @@ impl Kernel {
         self.flush().await?;
         let batch = Batch {
             calls: vec![call],
-            umask: 0o022,
+            umask: None,
             sudo: false,
             pid: Some(from),
             process: Some(token),
@@ -453,6 +450,22 @@ impl Kernel {
         }
         let value = self.one(Call::ProcPoll { pids }, false).await?;
         Ok(value.to_string())
+    }
+
+    /// Project descriptors of a process hosted by this port, with its process proof.
+    pub fn terminal(&self, pid: u32, tty: u32, fds: &str, host: &str) -> Result<(), JsValue> {
+        let token = self.token(pid, host)?;
+        let fds: Vec<u32> = parse(fds, "terminal descriptors")?;
+        if fds.len() > 256 {
+            return Err(fail(Errno::E2BIG.into()));
+        }
+        self.state.borrow_mut().report(Call::ProcTty {
+            pid,
+            token,
+            tty,
+            fds,
+        });
+        Ok(())
     }
 
     /// Recover the state of processes owned by this host, including earlier login sessions.
@@ -682,7 +695,7 @@ impl Kernel {
         batch.extend(calls);
         let batch = Batch {
             calls: batch,
-            umask: 0o022,
+            umask: None,
             sudo,
             pid: None,
             process: None,

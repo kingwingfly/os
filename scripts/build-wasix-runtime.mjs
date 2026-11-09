@@ -14,7 +14,7 @@ const target = JSON.parse(
 ).target_directory;
 execFileSync(
   'cargo',
-  ['build', '-p', 'terminal-worker-wasix-runtime', '--target', 'wasm32-unknown-unknown', '--release'],
+  ['build', '-p', 'os-wasix-runtime', '--target', 'wasm32-unknown-unknown', '--release'],
   { cwd: root, stdio: 'inherit' },
 );
 execFileSync(
@@ -23,7 +23,7 @@ execFileSync(
     '--target', 'web',
     '--out-dir', out,
     '--out-name', 'wasix_runtime',
-    join(target, 'wasm32-unknown-unknown/release/terminal_worker_wasix_runtime.wasm'),
+    join(target, 'wasm32-unknown-unknown/release/os_wasix_runtime.wasm'),
   ],
   { cwd: root, stdio: 'inherit' },
 );

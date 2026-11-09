@@ -1,14 +1,14 @@
 [package]
-name = "terminal-worker-userland"
+name = "os-userland"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-abi = { package = "terminal-worker-abi", path = "../abi" }
-terminal-worker-core = { path = "../core" }
+abi = { package = "os-abi", path = "../abi" }
+os-core = { path = "../core" }
 regex = { version = "1.13", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
 
 [dev-dependencies]
-kernel = { package = "terminal-worker-kernel", path = "../kernel" }
+kernel = { package = "os-kernel", path = "../kernel" }

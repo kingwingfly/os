@@ -6,10 +6,15 @@ import * as dev from './dev.mjs';
 import { exec } from './kernel/page.js';
 import { kernelCall } from './kernel/protocol.js';
 import { answered as resultOf, call, sys } from './http.mjs';
+import { migratePreferences } from './compat.mjs';
+
+for (const name of ['localStorage', 'sessionStorage']) {
+  try { migratePreferences(window[name]); } catch { /* storage can be disabled or full */ }
+}
 
 let configuration;
-export const ready = fetch('/terminal-config.json').then(async response => {
-  if (!response.ok) throw new Error('Cannot read terminal configuration');
+export const ready = fetch('/os-config.json').then(async response => {
+  if (!response.ok) throw new Error('Cannot read OS configuration');
   configuration = await response.json();
   document.title = configuration.branding.name + configuration.branding.subtitle;
   document.querySelector('meta[name="description"]').content = configuration.branding.description;
@@ -17,12 +22,12 @@ export const ready = fetch('/terminal-config.json').then(async response => {
 
 const $ = id => document.getElementById(id);
 const fileUrl = path => '/api/file?path=' + encodeURIComponent(path);
-// Previews render in Rust (crates/frontend/src/viewer.rs), through window.terminalPreview.
+// Previews render in Rust (crates/frontend/src/viewer.rs), through window.osPreview.
 let directory = '/', opener, viewerVersion = 0, releasePreview;
 // Lists and the account may have changed: the tabs ask again. With a reason, the account changed
 // from elsewhere, which the tabs say: 'ended', this session ended; 'window', another window
 // of this browser signed in or out.
-const changed = (reason = null) => window.dispatchEvent(new CustomEvent('terminal:changed', { detail: reason }));
+const changed = (reason = null) => window.dispatchEvent(new CustomEvent('os:changed', { detail: reason }));
 async function api(url, options) {
   const response = await fetch(url, options);
   if (!response.ok) { let error; try { error = (await response.json()).error; } catch {} const failure = new Error(error || `Request failed (${response.status})`); failure.status = response.status; throw failure; }
@@ -128,7 +133,7 @@ function listen() {
     if (message.present) { presented(message.present); return; }
     // A signal to a process of this browser's namespace: the tab that hosts it acts on it
     // (web/wasi/exec.mjs).
-    if (message.signal) { window.dispatchEvent(new CustomEvent('terminal:signal', { detail: message.signal })); return; }
+    if (message.signal) { window.dispatchEvent(new CustomEvent('os:signal', { detail: message.signal })); return; }
     // A live sound, or a listener's voice, started in a presentation this page follows or
     // presents; listeners asking to speak, and the answers to this page's ask.
     if (message.sound) { soundStarted(message.sound); return; }
@@ -151,27 +156,27 @@ function listen() {
       if (hearing?.device === name) stopHearing();
       if (voices.has(name)) stopVoice(name);
       if (message.device.ended) deviceEnded(name, version);
-      window.dispatchEvent(new CustomEvent('terminal:device', { detail: message.device }));
+      window.dispatchEvent(new CustomEvent('os:device', { detail: message.device }));
       return;
     }
     if (!Array.isArray(message.inotify)) return;
-    window.dispatchEvent(new CustomEvent('terminal:inotify', { detail: message.inotify }));
+    window.dispatchEvent(new CustomEvent('os:inotify', { detail: message.inotify }));
     clearTimeout(pendingTimer);
-    pendingTimer = setTimeout(() => window.dispatchEvent(new CustomEvent('terminal-remote')), 250);
+    pendingTimer = setTimeout(() => window.dispatchEvent(new CustomEvent('os-remote')), 250);
   };
   socket.onclose = () => { clearInterval(ping); if (events === socket) setTimeout(listen, Math.min(30000, 1000 * 2 ** eventsRetry++)); };
 }
-// The line opens once the browser has its session, signed out too (its terminal_guest cookie,
+// The line opens once the browser has its session, signed out too (its os_guest cookie,
 // which the first request is given): a driver's news to it is for that session.
 sys(['getcreds']).catch(() => {}).finally(listen);
 // Slides and PDFs presented follow each other (owner's request, 2026-10-28): the place a page
 // presents (viewer.rs calls present) shows in this browser's other windows showing that file,
 // and in the account's pages signed in elsewhere, which the authority tells (store.rs relay).
-const presenting = 'BroadcastChannel' in window ? new BroadcastChannel('terminal-present') : null;
+const presenting = 'BroadcastChannel' in window ? new BroadcastChannel('os-present') : null;
 // The last place this page heard of or showed, by path, which a deck shown later starts at
 // (viewer.rs follow_presenting): one may come while its file is still being read.
 const heard = new Map();
-const presented = detail => { heard.set(detail.path, detail.at); window.dispatchEvent(new CustomEvent('terminal:present', { detail })); };
+const presented = detail => { heard.set(detail.path, detail.at); window.dispatchEvent(new CustomEvent('os:present', { detail })); };
 if (presenting) presenting.onmessage = event => presented(event.data);
 function present(path, column, row) {
   const place = { path, at: [column, row] };
@@ -225,7 +230,7 @@ function unfollow() {
 // Follow the device `name` again, as it shows something else now: the presentation followed, the
 // sound heard, or both; if that may no longer be, the page says so.
 function followAgain(name, presentation, sound) {
-  const again = error => window.dispatchEvent(new CustomEvent('terminal:device', { detail: { name, error: error.message } }));
+  const again = error => window.dispatchEvent(new CustomEvent('os:device', { detail: { name, error: error.message } }));
   if (presentation && following?.device === name) attend(name).catch(again);
   if (sound && hearing?.device === name) hear(name).catch(again);
 }
@@ -244,7 +249,7 @@ export function started() {
 }
 // Windows of this browser share its session cookie: each tells the others when it changes it,
 // so that none goes on showing one account while its requests are another's.
-const windows = 'BroadcastChannel' in window ? new BroadcastChannel('terminal-session') : null;
+const windows = 'BroadcastChannel' in window ? new BroadcastChannel('os-session') : null;
 if (windows) windows.onmessage = () => void identityChanged('window');
 async function identityChanged(reason = null) {
   if (!reason) changingSession = 0;
@@ -284,13 +289,13 @@ async function accountCommand(args, cwd) {
   // manual's pages; this shows them.
   if (args[0] === 'man') {
     if (args.length > 2) throw new Error('Usage: man [COMMAND]');
-    const text = args[1] ? window.terminalManual.page(args[1]) : window.terminalManual.index();
-    if ((text === undefined || text === null) && window.terminalManual.bin(args[1])) throw new Error(`${args[1]} is /bin's (uutils): ${args[1]} --help says how to use it`);
+    const text = args[1] ? window.osManual.page(args[1]) : window.osManual.index();
+    if ((text === undefined || text === null) && window.osManual.bin(args[1])) throw new Error(`${args[1]} is /bin's (uutils): ${args[1]} --help says how to use it`);
     if (text === undefined || text === null) throw new Error(`No manual entry for ${args[1]}. Enter man for the index.`);
     const version = await cleanupViewer(); if (version !== viewerVersion) return {};
     trail.length = 0; showTrail();
-    viewerTitle(args[1] ? 'man · ' + args[1] : 'Terminal Worker · Manual'); $('download').hidden = true;
-    const article = document.createElement('article'); article.className = 'markdown manual'; article.innerHTML = window.terminalPreview.markdown(text, '/'); $('viewer-content').replaceChildren(article);
+    viewerTitle(args[1] ? 'man · ' + args[1] : 'OS · Manual'); $('download').hidden = true;
+    const article = document.createElement('article'); article.className = 'markdown manual'; article.innerHTML = window.osPreview.markdown(text, '/'); $('viewer-content').replaceChildren(article);
     if (!$('viewer').open) { opener = document.activeElement; showWindow($('viewer')); placePlayer(); }
     return {};
   }
@@ -393,7 +398,7 @@ async function uploadFiles(files, path, progress) {
   const results = [];
   try {
     if (!await unlock(path)) return [];
-    const rust = window.terminalUploads;
+    const rust = window.osUploads;
     for (const file of files) {
       if (controller.signal.aborted) { results.push(`✕ ${file.name}: Upload cancelled`); continue; }
       try {
@@ -565,7 +570,7 @@ $('listening-stop').onclick = () => { declined = following?.device ?? null; for 
 // The bar of the deck or PDF the viewer shows (viewer.rs LiveControls; owner's request,
 // 2026-10-28): what this account presents of it, the sound this page sends, the listeners asking
 // to speak in its presentations and speaking; and, following another's presentation, this
-// page's ask to speak. It hears of each change (terminal:bar).
+// page's ask to speak. It hears of each change (os:bar).
 const bar = { path: null, user: null, presented: [], asks: [], voices: [], sound: null, asking: null, note: '' };
 // The asks this page allowed, whose voices it hears.
 const allowed = new Set();
@@ -575,7 +580,7 @@ function barChanged() {
   const detail = { path: bar.path, user: bar.user, presented, note: bar.note, asking: bar.asking && { state: bar.asking.state, error: bar.asking.error ?? null },
     asks: bar.asks.filter(ask => presented.includes(ask.presentation)), voices: bar.voices.filter(voice => presented.includes(voice.presentation)),
     sound: sound && { device: sound.device, recording: sound.recording, since: sound.since, progress: sound.progress } };
-  window.dispatchEvent(new CustomEvent('terminal:bar', { detail }));
+  window.dispatchEvent(new CustomEvent('os:bar', { detail }));
 }
 // Say `note` in the bar a while: what failed, or what was saved.
 function barNote(note) { bar.note = note; barChanged(); clearTimeout(noteTimer); noteTimer = setTimeout(() => { bar.note = ''; barChanged(); }, 8000); }
@@ -737,12 +742,12 @@ window.addEventListener('dragover', e => { if (e.dataTransfer?.types.includes('F
 window.addEventListener('dragleave', () => { if (--depth <= 0) { depth = 0; $('dropzone').hidden = true; } });
 // Dropped files go to the active tab, which uploads them as its upload command would.
 // Dropped on the Files, files go into its directory; anywhere else, the terminal's.
-window.addEventListener('drop', e => { e.preventDefault(); depth = 0; $('dropzone').hidden = true; if (e.dataTransfer?.files.length) window.dispatchEvent(new CustomEvent(e.target?.closest?.('#window-files') ? 'files-dropped' : 'terminal-files', { detail: [...e.dataTransfer.files] })); });
+window.addEventListener('drop', e => { e.preventDefault(); depth = 0; $('dropzone').hidden = true; if (e.dataTransfer?.files.length) window.dispatchEvent(new CustomEvent(e.target?.closest?.('#window-files') ? 'files-dropped' : 'os-files', { detail: [...e.dataTransfer.files] })); });
 
 // Where each file's preview was left, by path, kept in this browser for the last 200 files, so
 // that opening one again continues there: the page code records how far it was scrolled and
 // played; slides and PDFs record their slide, page and zoom (viewer.rs).
-const PLACES = 'terminal-places';
+const PLACES = 'os-places';
 function places() { try { return JSON.parse(localStorage.getItem(PLACES) || '[]'); } catch { return []; } }
 function place(path) { return places().find(([p]) => p === path)?.[1] ?? null; }
 function setPlace(path, value) {
@@ -896,7 +901,7 @@ async function open(path, kind, followed = false, attending = false) {
     if (kind === 'slides') dialog.classList.add('slides-view');
     // The preview mounts only while the viewer still shows this file.
     content.dataset.version = String(version);
-    const release = await window.terminalPreview.show(content, path, kind, String(version));
+    const release = await window.osPreview.show(content, path, kind, String(version));
     if (version === viewerVersion) releasePreview = release; else return release();
     // Back where it was left.
     const saved = place(path);
@@ -913,10 +918,26 @@ const observedTranscripts = new WeakSet();
 function observeTranscript() {
   for (const log of document.querySelectorAll('.transcript')) {
     let frame;
-    const scroll = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; }); };
+    const scroll = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const form = log.querySelector('.command-line');
+        const cursor = log.querySelector('.terminal-screen[data-live="true"] .terminal-cursor');
+        if (form && cursor && log.closest('[data-pty="true"]')) {
+          const at = cursor.getBoundingClientRect(), bounds = log.getBoundingClientRect();
+          for (const [name, value] of [['left', at.left - bounds.left + log.scrollLeft], ['top', at.top - bounds.top + log.scrollTop]]) {
+            const position = `${value}px`;
+            if (form.style[name] !== position) form.style[name] = position;
+          }
+        } else if (form && (form.style.left || form.style.top)) {
+          form.style.removeProperty('left'); form.style.removeProperty('top');
+        }
+        log.scrollTop = log.scrollHeight;
+      });
+    };
     if (!observedTranscripts.has(log)) {
       observedTranscripts.add(log);
-      new MutationObserver(scroll).observe(log, { childList: true, subtree: true, characterData: true });
+      new MutationObserver(scroll).observe(log, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["style", "data-live", "data-alternate"] });
       new ResizeObserver(scroll).observe(log);
     }
     scroll();
@@ -939,16 +960,20 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.terminal = { config: () => configuration.branding, exec, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionFocus: (value, insideQuote) => {
+window.os = { config: () => configuration.branding, exec, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionCursor: () => $('command')?.selectionStart ?? 0, completionFocus: (value, cursor) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]:modal')) return;
     // Text selected since (the line chosen whole, to type over) is the typist's: the caret stays.
     if (document.activeElement === input && input.selectionStart !== input.selectionEnd) return;
     input.focus({ preventScroll: true });
-    const end = value.length - (insideQuote && value.endsWith('"') ? 1 : 0);
-    input.setSelectionRange(end, end);
+    input.setSelectionRange(cursor, cursor);
     document.querySelector('.completion-options [aria-selected="true"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  });
+}, focusLaunchedProgram: () => {
+  // Explicitly launching from Files transfers typing focus, including while the PTY starts.
+  requestAnimationFrame(() => {
+    if (!document.querySelector('dialog[open]:modal') && !otherWindow()) $('command')?.focus({ preventScroll: true });
   });
 }, setDirectory: path => { directory = path; }, focusInput: () => {
   observeTranscript();
@@ -985,7 +1010,7 @@ function restoreTerminalFocus() {
     const input = $('command');
     // Not while a password is asked, nor from another window that has the keyboard (the Files,
     // the preview, the editor), nor while a command runs.
-    if (document.querySelector('dialog[open]:modal') || otherWindow() || document.activeElement?.closest?.('dialog[open], .window:not(#window-terminal)') || !['↵', 'Answer ↵', 'Input ↵'].includes(input?.closest('form')?.querySelector('.busy')?.textContent)) return;
+    if (document.querySelector('dialog[open]:modal') || otherWindow() || document.activeElement?.closest?.('dialog[open], .window:not(#window-terminal)') || (!input?.closest('[data-pty="true"]') && !['idle', 'answer', 'input'].includes(input?.closest('form')?.dataset.state))) return;
     // After closing a modal Chromium can report this input as active while its
     // native text-editing focus still belongs to the closed dialog. Reacquire it.
     if (resetTerminalFocus && document.activeElement === input) input.blur();
@@ -1009,7 +1034,7 @@ document.addEventListener('keydown', event => {
   if (up) { if (!up.contains(document.activeElement)) up.focus({ preventScroll: true }); return; }
   if (!(target instanceof Element) || (target.closest('input,textarea,select,[contenteditable="true"]') && target.getClientRects().length) || window.getSelection()?.toString()) return;
   if (target.closest('button,a') && ['Enter', ' ', 'Tab'].includes(event.key)) return;
-  const input = $('command'); if (!input || !['↵', 'Answer ↵', 'Input ↵'].includes(input.closest('form')?.querySelector('.busy')?.textContent)) return;
+  const input = $('command'); if (!input || (!input.closest('[data-pty="true"]') && !['idle', 'answer', 'input'].includes(input.closest('form')?.dataset.state))) return;
   if (event.key.length === 1) {
     event.preventDefault(); input.focus({ preventScroll: true });
     input.setRangeText(event.key, input.selectionStart ?? input.value.length, input.selectionEnd ?? input.value.length, 'end');

@@ -1,27 +1,25 @@
 use crate::db::{self, transact};
-use crate::{api, auth, dev, jobs};
+use crate::{api, auth, dev};
+use os_core::devices::PRESENT;
+use os_core::permissions::{EXEC, GUEST, GUEST_HOME, Node, READ, Store, User, is_guest_id};
 use std::cell::Cell;
 use std::collections::BTreeSet;
-use terminal_worker_core::devices::PRESENT;
-use terminal_worker_core::permissions::{
-    EXEC, GUEST, GUEST_HOME, Node, READ, Store, User, is_guest_id,
-};
 use worker::*;
 
 /// The R2 object that marks the bucket as managed by an authority, so that a lost authority is
 /// noticed instead of silently starting over with an empty filesystem.
-const MARKER: &str = "system/terminal-authority-v2";
+const MARKER: &str = "system/os-authority-v2";
 
 /// The one authority over accounts, sessions and the filesystem tree. Every decision is a
 /// synchronous SQLite transaction, so requests never wait on each other's network I/O; file
 /// bytes go to and from R2 in the Worker, never through here.
 #[durable_object]
-pub struct TerminalAuthority {
+pub struct OsAuthority {
     state: State,
     env: Env,
     ready: Cell<bool>,
 }
-impl DurableObject for TerminalAuthority {
+impl DurableObject for OsAuthority {
     fn new(state: State, env: Env) -> Self {
         Self {
             state,
@@ -99,8 +97,9 @@ impl DurableObject for TerminalAuthority {
                             "Cancelled after waiting a week"
                         };
                         db.add_lines(&id, &[(true, why.into())]);
-                        jobs::finish(db, &id, "cancelled");
+                        crate::executor::finish(db, &id, "cancelled");
                     }
+                    ("device_task", _, _) => db.expire_device_task(&id),
                     // A session not heard from for long watches nothing any more, and once it
                     // keeps no descriptor, its numbers start again.
                     ("watches", _, _) => {
@@ -169,7 +168,7 @@ impl DurableObject for TerminalAuthority {
         Response::ok("")
     }
 }
-impl TerminalAuthority {
+impl OsAuthority {
     /// A page that listens for changes: a WebSocket, which keeps the session that opened it, so
     /// that it hears only of directories its account may list. Hibernation keeps idle ones free.
     fn listen(&self, req: &Request) -> Result<Response> {
@@ -279,7 +278,7 @@ impl TerminalAuthority {
                         .collect();
                     let presentations: Vec<db::Device> = follows
                         .iter()
-                        .filter(|name| terminal_worker_core::parent(name) == PRESENT)
+                        .filter(|name| os_core::parent(name) == PRESENT)
                         .filter_map(|name| db.device(name))
                         .collect();
                     let heard = sounds
@@ -430,11 +429,7 @@ impl TerminalAuthority {
                 let Some(key) = line.session else {
                     return;
                 };
-                if terminal_worker_core::resolve("/", &place.path)
-                    .ok()
-                    .as_ref()
-                    != Some(&place.path)
-                {
+                if os_core::resolve("/", &place.path).ok().as_ref() != Some(&place.path) {
                     return;
                 }
                 let sockets = self.state.get_websockets();
@@ -603,7 +598,11 @@ impl TerminalAuthority {
                 .and_then(|asset| sizes[asset].as_u64())
                 .unwrap_or(0)
         };
-        crate::usr::mount(size(crate::usr::COREUTILS), size(crate::usr::TERMINAL));
+        crate::usr::mount(
+            size(crate::usr::COREUTILS),
+            size(crate::usr::OS),
+            size(crate::usr::UTILITIES),
+        );
         self.ready.set(true);
         Ok(())
     }
@@ -623,7 +622,9 @@ impl TerminalAuthority {
     /// Create root, the system groups and the top directories, the first time only.
     async fn initialize(&self) -> Result<()> {
         let bucket = self.env.bucket("FILES")?;
-        if bucket.head(MARKER).await?.is_some() {
+        if bucket.head(MARKER).await?.is_some()
+            || bucket.head("system/terminal-authority-v2").await?.is_some()
+        {
             return Err(Error::RustError("Permission catalog is missing for an initialized bucket; restore Durable Object storage instead of starting over".into()));
         }
         let password = self.env.secret("ADMIN_PASSWORD")?.to_string();

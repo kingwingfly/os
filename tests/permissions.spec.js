@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { api, call, entry, errno, mkdirp, program, put, rmrf, sys } from './sys.js';
 import { promptPath } from './ui.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const password = 'testing-long-passphrase-8274';
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -73,10 +73,10 @@ test('sudo verifies the caller, stays per-command, revokes membership immediatel
   expect((await command(alice,['users'],{sudo:true})).status()).toBe(403);
   expect((await api(alice, 'sudo',{data:{password:'incorrect-password'}})).status()).toBe(401);
   await ok(await api(alice, 'sudo',{data:{password}}));
-  const originalCookie=(await alice.storageState()).cookies.find(c=>c.name==='terminal_session').value;
+  const originalCookie=(await alice.storageState()).cookies.find(c=>c.name==='os_session').value;
   await ok(await command(alice,['users'],{sudo:true}));
   expect((await (await api(alice, 'session')).json()).username).toBe(a);
-  expect((await alice.storageState()).cookies.find(c=>c.name==='terminal_session').value).toBe(originalCookie);
+  expect((await alice.storageState()).cookies.find(c=>c.name==='os_session').value).toBe(originalCookie);
   expect(await errno(alice, { getdents: { path: '/root' } })).toBe('EACCES');
   await ok(await api(alice, 'sudo',{data:{revoke:true}}));
   expect((await command(alice,['users'],{sudo:true})).status()).toBe(403);
@@ -99,9 +99,9 @@ test('sudo verifies the caller, stays per-command, revokes membership immediatel
   expect((await alice.get(file(next+'/kept.txt'))).status()).toBe(401);
   expect((await api(guest, 'login',{data:{username:a,password}})).status()).toBe(401);
   await login(alice,a,password+'new');
-  const oldCookie=(await alice.storageState()).cookies.find(c=>c.name==='terminal_session').value;
+  const oldCookie=(await alice.storageState()).cookies.find(c=>c.name==='os_session').value;
   await ok(await api(alice, 'logout'));
-  expect((await guest.get(file(next+'/kept.txt'),{headers:{Cookie:'terminal_session='+oldCookie}})).status()).toBe(401);
+  expect((await guest.get(file(next+'/kept.txt'),{headers:{Cookie:'os_session='+oldCookie}})).status()).toBe(401);
   // Failed account creation is atomic, including automatic private-group allocation.
   expect((await command(root,['useradd','-m','-d',next,b+'bad'])).status()).toBe(400);
   await ok(await command(root,['groupadd',b+'bad']));await ok(await command(root,['groupdel',b+'bad']));
@@ -214,7 +214,7 @@ test('groupmod and groupdel take a group by its name, as on Linux, never by numb
 test('terminal account workflow uses password dialogs, su homes and a caller-authenticated sudo prompt', async ({ page }) => {
  const root = await client(); await login(root,'root',rootPassword);
  const username='ui'+Date.now().toString(36), home='/home/'+username;
- const run=async text=>{const input=page.getByRole('combobox',{name:'Terminal command'});await expect(page.locator('.busy')).toHaveText('↵');await input.fill(text);await input.press('Enter');};
+ const run=async text=>{const input=page.getByRole('combobox',{name:'Terminal command'});await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');await input.fill(text);await input.press('Enter');};
  const last=()=>page.locator('.transcript pre').last();
  await page.setExtraHTTPHeaders({'CF-Connecting-IP':'ui-acl-'+Date.now()});
  try {
@@ -228,7 +228,7 @@ test('terminal account workflow uses password dialogs, su homes and a caller-aut
   // Silent on success, as GNU's are; ls -l shows what they did.
   await run('mkdir secrets');await run('chmod 700 secrets');
   await run('ls -l');await expect(last()).toContainText('drwx------');await expect(last()).toContainText(username);
-  await run('sudo ls -l /root');await expect(page.locator('#auth-title')).toContainText('sudo');await page.getByLabel('Password',{exact:true}).fill(password);await page.locator('#auth button[type=submit]').click();await expect(page.locator('.busy')).toHaveText('↵');
+  await run('sudo ls -l /root');await expect(page.locator('#auth-title')).toContainText('sudo');await page.getByLabel('Password',{exact:true}).fill(password);await page.locator('#auth button[type=submit]').click();await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await run('whoami');await expect(last()).toHaveText(username);
   await run('cd /root');await expect(last()).toContainText('Permission denied');
   await run('sudo -k');await expect(last()).toContainText('revoked');
@@ -258,11 +258,11 @@ test('sudo account switching checks live membership, replaces sessions and clear
   expect((await api(alice, 'login',{data:{username:b,sudo:true}})).status()).toBeGreaterThanOrEqual(400);
   expect((await (await api(alice, 'session')).json()).username).toBe(a);
   await ok(await command(root,['usermod','-U',b]));
-  const cookie=(await alice.storageState()).cookies.find(c=>c.name==='terminal_session').value;
+  const cookie=(await alice.storageState()).cookies.find(c=>c.name==='os_session').value;
   await ok(await api(alice, 'login',{data:{username:b,sudo:true}}));
   const current=await (await api(alice, 'session')).json();
   expect(current.username).toBe(b);expect(current.sudo_active).toBe(false);
-  expect((await (await api(guest, 'session',{headers:{Cookie:'terminal_session='+cookie}})).json()).username).toMatch(/^guest-[0-9a-f]{16}$/);
+  expect((await (await api(guest, 'session',{headers:{Cookie:'os_session='+cookie}})).json()).username).toMatch(/^guest-[0-9a-f]{16}$/);
   expect((await api(alice, 'login',{data:{username:'root',sudo:true}})).status()).toBe(403);
   await login(alice,a);await ok(await api(alice, 'sudo',{data:{password}}));
   await ok(await command(root,['usermod','-G',f.team,a]));

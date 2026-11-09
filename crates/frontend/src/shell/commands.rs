@@ -1,15 +1,11 @@
-//! The commands a tab runs, each a [`TerminalCommand`] registered by name in [`COMMANDS`]: those
-//! the page does itself (cd, open, upload, the text filters, xargs, fd -x...), and those it
-//! decides how to hand on (ls and mkdir with options, cp and mv -i, sudo). Every other command
-//! [`terminal_worker_core::cli`] defines goes to the server through web/app.js's
-//! accountCommand, which shows the dialogs some need. Their arguments, and their help, are their
-//! definitions there.
+//! Shell builtins and browser UI actions.
+//! External programs own their parsing, output and help. Account dialogs and sudo obtain
+//! authorization before handing installed utilities to the ordinary execution path.
 
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use leptos::prelude::*;
-use terminal_worker_core::cli::{self, files, terminal, text as filters};
-use terminal_worker_core::text;
+use os_core::cli::{self, files, terminal};
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 
@@ -18,7 +14,7 @@ use crate::{choose_files, enterable, open_file, record_sound, set_directory, sta
 
 /// A command the tab runs.
 pub trait TerminalCommand: Sync {
-    /// Its name, as [`terminal_worker_core::cli`] defines it.
+    /// Its name, as [`os_core::cli`] defines it.
     fn name(&self) -> &'static str;
     /// Run `args`, its whole line, in `shell`, with what the stage before wrote, if any; `piped`
     /// if what it writes goes on to another stage.
@@ -33,16 +29,6 @@ pub trait TerminalCommand: Sync {
 
 /// Every command the tab runs itself, or hands on as it decides.
 pub static COMMANDS: &[&dyn TerminalCommand] = &[
-    &Echo,
-    &Filter("cat"),
-    &Filter("head"),
-    &Filter("tail"),
-    &Filter("grep"),
-    &Filter("wc"),
-    &Filter("sort"),
-    &Filter("uniq"),
-    &Xargs,
-    &Fd,
     &Jobs,
     &Fg,
     &Bg,
@@ -55,6 +41,7 @@ pub static COMMANDS: &[&dyn TerminalCommand] = &[
     &Stream,
     &Upload,
     &Help,
+    &Export,
 ];
 
 /// The command named `name`, if the tab runs it.
@@ -65,97 +52,6 @@ pub fn find(name: &str) -> Option<&'static dyn TerminalCommand> {
 /// `args` without the command's name.
 fn rest(args: &[String]) -> &[String] {
     args.get(1..).unwrap_or_default()
-}
-
-struct Echo;
-impl TerminalCommand for Echo {
-    fn name(&self) -> &'static str {
-        "echo"
-    }
-    fn run(
-        &self,
-        _: Shell,
-        args: Vec<String>,
-        _: Option<String>,
-        _: bool,
-    ) -> LocalBoxFuture<'static, Result<Output, String>> {
-        async move {
-            let typed = rest(&args);
-            let echo = cli::parse::<filters::Echo>(typed)?;
-            // echo has no --: one before its words is a word, as GNU echo writes it.
-            let start = typed.len() - echo.words.len();
-            let start = if start > 0 && typed[start - 1] == "--" {
-                start - 1
-            } else {
-                start
-            };
-            Ok(Output::text(format!(
-                "{}{}",
-                typed[start..].join(" "),
-                if echo.no_newline { "" } else { "\n" }
-            )))
-        }
-        .boxed_local()
-    }
-}
-
-/// A text filter: cat, head, tail, grep, wc, sort or uniq.
-struct Filter(&'static str);
-impl TerminalCommand for Filter {
-    fn name(&self) -> &'static str {
-        self.0
-    }
-    fn run(
-        &self,
-        shell: Shell,
-        args: Vec<String>,
-        stdin: Option<String>,
-        _: bool,
-    ) -> LocalBoxFuture<'static, Result<Output, String>> {
-        debug_assert!(text::FILTERS.contains(&self.0));
-        async move { shell.filter(&args, stdin).await }.boxed_local()
-    }
-}
-
-struct Xargs;
-impl TerminalCommand for Xargs {
-    fn name(&self) -> &'static str {
-        "xargs"
-    }
-    fn run(
-        &self,
-        shell: Shell,
-        args: Vec<String>,
-        stdin: Option<String>,
-        _: bool,
-    ) -> LocalBoxFuture<'static, Result<Output, String>> {
-        async move { shell.xargs(&args, stdin).await }.boxed_local()
-    }
-}
-
-/// fd: with -x or -X, the server searches and the tab runs the command; otherwise the server.
-struct Fd;
-impl TerminalCommand for Fd {
-    fn name(&self) -> &'static str {
-        "fd"
-    }
-    fn run(
-        &self,
-        shell: Shell,
-        args: Vec<String>,
-        _: Option<String>,
-        piped: bool,
-    ) -> LocalBoxFuture<'static, Result<Output, String>> {
-        async move {
-            let find = terminal_worker_core::find::parse(rest(&args))?;
-            if find.exec.is_some() {
-                shell.fd_exec(&args).await
-            } else {
-                shell.program(args, None, piped, false).await
-            }
-        }
-        .boxed_local()
-    }
 }
 
 struct Jobs;
@@ -235,14 +131,17 @@ impl TerminalCommand for Asking {
         piped: bool,
     ) -> LocalBoxFuture<'static, Result<Output, String>> {
         async move {
-            let program = args.get(1).filter(|_| args[0] == "sudo");
-            if program.is_some_and(|name| userland::PROGRAMS.contains(&name.as_str())) {
-                return shell.sudo_program(args[1..].to_vec(), stdin, piped).await;
-            }
+            let program = args
+                .get(1)
+                .filter(|name| args[0] == "sudo" && !name.starts_with('-'));
             // A coreutils applet or a path with a slash, as root: the same exec stage the
             // non-sudo shell would resolve, with sudo snapshotted by execve.
             if program.is_some()
-                && let Some(stage) = super::process(&shell, &args[1..])
+                && let Some(stage) = super::process(&shell, &args[1..]).or_else(|| {
+                    program
+                        .filter(|name| os_core::bin::UTILITIES.contains(&name.as_str()))
+                        .map(|name| (Some(name.clone()), args[1..].to_vec()))
+                })
             {
                 if !shell.authenticated().await? {
                     return Err("sudo canceled".into());
@@ -347,7 +246,7 @@ impl TerminalCommand for Open {
             if node.is_dir() {
                 return Err("This is a directory; use cd".into());
             }
-            JsFuture::from(open_file(&path, terminal_worker_core::kind(&path)))
+            JsFuture::from(open_file(&path, os_core::kind(&path)))
                 .await
                 .map_err(js_message)?;
             Ok(Output::default())
@@ -390,7 +289,7 @@ impl TerminalCommand for Present {
             let device = started["device"].as_str().unwrap_or_default().to_string();
             // Shown presented, a PDF a page at a time and Markdown as slides, from where the
             // account showed it last.
-            let kind = terminal_worker_core::kind(&path);
+            let kind = os_core::kind(&path);
             let place = &started["place"];
             let kept = match (kind, place.is_array()) {
                 ("pdf", true) => serde_json::json!({ "present": true, "page": place[0] }),
@@ -529,19 +428,75 @@ impl TerminalCommand for Help {
     }
     fn run(
         &self,
-        _: Shell,
+        shell: Shell,
         args: Vec<String>,
         _: Option<String>,
-        _: bool,
+        piped: bool,
     ) -> LocalBoxFuture<'static, Result<Output, String>> {
         async move {
             let help = cli::parse::<terminal::Help>(rest(&args))?;
+            if let Some(name) = &help.command
+                && super::process(&shell, std::slice::from_ref(name)).is_some()
+            {
+                return shell
+                    .invoke(vec![name.clone(), "--help".into()], None, piped)
+                    .await;
+            }
             let text = match &help.command {
                 Some(name) => cli::help(name)
                     .ok_or_else(|| format!("Unknown command: {name}. Enter help for commands."))?,
                 None => cli::commands(),
             };
             Ok(Output::text(text + "\n"))
+        }
+        .boxed_local()
+    }
+}
+
+/// Export belongs to this shell's environment; it never edits another process's credentials.
+struct Export;
+impl TerminalCommand for Export {
+    fn name(&self) -> &'static str {
+        "export"
+    }
+    fn run(
+        &self,
+        shell: Shell,
+        args: Vec<String>,
+        _: Option<String>,
+        _: bool,
+    ) -> LocalBoxFuture<'static, Result<Output, String>> {
+        async move {
+            let parsed = cli::parse::<terminal::Export>(rest(&args))?;
+            if parsed.assignments.is_empty() {
+                return Ok(Output::text(
+                    shell
+                        .environment
+                        .get_value()
+                        .iter()
+                        .map(|(key, value)| {
+                            format!("{key}={}\n", os_core::completion::escape_path(value))
+                        })
+                        .collect::<String>(),
+                ));
+            }
+            let mut updates = Vec::new();
+            for assignment in parsed.assignments {
+                let (name, value) = assignment
+                    .split_once('=')
+                    .ok_or_else(|| "export: expected NAME=VALUE".to_string())?;
+                if name.is_empty()
+                    || name.bytes().enumerate().any(|(i, c)| {
+                        !(c == b'_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+                    })
+                    || value.contains('\0')
+                {
+                    return Err(format!("export: invalid assignment: {assignment}"));
+                }
+                updates.push((name.to_string(), value.to_string()));
+            }
+            shell.environment.update_value(|env| env.extend(updates));
+            Ok(Output::default())
         }
         .boxed_local()
     }

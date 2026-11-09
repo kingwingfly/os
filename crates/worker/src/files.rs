@@ -1,13 +1,13 @@
 //! File bytes, which go between the client and R2 in the Worker, outside the authority: it only
 //! says whether a request may read or write them, and records what was written.
 use crate::streams::{concatenate, fixed_length, object_range};
+use os_core::byte_range;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
-use terminal_worker_core::byte_range;
 use wasm_bindgen::prelude::*;
 use worker::wasm_bindgen_futures::future_to_promise;
 use worker::*;

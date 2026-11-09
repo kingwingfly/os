@@ -1,11 +1,11 @@
 //! The filesystem's metadata as tables in the Durable Object's SQLite, and the transactions that
 //! change them. File bytes are not here: chunks of files are R2 objects, which these tables name.
+use os_core::permissions::{GUEST, Id, Identity, Node, Session, Store, User};
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use terminal_worker_core::permissions::{GUEST, Id, Identity, Node, Session, Store, User};
 use wasm_bindgen::prelude::*;
 use worker::{Error, Result, SqlStorage, SqlStorageValue, State};
 
@@ -34,7 +34,9 @@ const ROLLBACK: &str = "rollback";
 /// The version of the tables below, which local state made by an older one does not have.
 pub const SCHEMA_VERSION: &str = "7";
 
-const SCHEMA: [&str; 34] = [
+const SCHEMA: [&str; 36] = [
+    "CREATE TABLE IF NOT EXISTS execution_owners(lineage TEXT PRIMARY KEY, uid INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS device_tasks(id TEXT PRIMARY KEY, lineage TEXT NOT NULL, request TEXT NOT NULL, device TEXT NOT NULL, digest TEXT NOT NULL, sid TEXT NOT NULL, fd INTEGER NOT NULL, owner INTEGER NOT NULL, detached INTEGER NOT NULL DEFAULT 0, grants TEXT NOT NULL, UNIQUE(lineage, request))",
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS observations(name TEXT PRIMARY KEY, value INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
@@ -573,7 +575,7 @@ fn changes(path: &str) {
         CHANGING.with(|changing| {
             changing
                 .borrow_mut()
-                .insert(terminal_worker_core::parent(path).to_string())
+                .insert(os_core::parent(path).to_string())
         });
     }
 }
@@ -581,7 +583,7 @@ fn parent_of(path: &str) -> &str {
     if path == "/" {
         ""
     } else {
-        terminal_worker_core::parent(path)
+        os_core::parent(path)
     }
 }
 
@@ -996,12 +998,23 @@ impl Db {
     /// Close every descriptor the process credentials `owner` hold (creds.rs `owner`): the
     /// process ended, and its loader already has what it read.
     pub fn close_proc_fds(&mut self, owner: &str) {
+        self.close_owned_fds(owner, false);
+    }
+    /// Replacing an image revokes only its loader descriptors. The first image's owner key
+    /// also identifies its descriptor lineage, which the replacement still holds.
+    pub fn close_exec_fds(&mut self, owner: &str) {
+        self.close_owned_fds(owner, true);
+    }
+    fn close_owned_fds(&mut self, owner: &str, exec_only: bool) {
         #[derive(Deserialize)]
         struct Owned {
             sid: String,
             fd: u32,
         }
-        let owned = self.rows::<Owned>("SELECT sid, fd FROM fds WHERE proc = ?", vec![text(owner)]);
+        let owned = self.rows::<Owned>(
+            "SELECT sid, fd FROM fds WHERE proc = ? AND (? = 0 OR exec = 1)",
+            vec![text(owner), int(exec_only as u8)],
+        );
         for owned in owned {
             self.close_fd(&owned.sid, owned.fd);
         }
@@ -1221,6 +1234,29 @@ impl Db {
                 vec![text(id), int(seq), int(*err as u8), text(line)],
             );
         }
+    }
+    pub fn output_fits(&self, id: &str, lines: &[(bool, String)]) -> bool {
+        #[derive(Deserialize)]
+        struct Size {
+            bytes: usize,
+        }
+        let bytes = self.rows::<Size>("SELECT COALESCE(SUM(LENGTH(CAST(text AS BLOB))),0) AS bytes FROM job_lines WHERE job = ?", vec![text(id)])
+            .pop().map_or(0, |s| s.bytes);
+        lines
+            .iter()
+            .all(|(_, line)| line.len() <= abi::accelerator::MAX_REQUEST_BYTES / 8)
+            && bytes.saturating_add(lines.iter().map(|(_, line)| line.len()).sum())
+                <= abi::accelerator::MAX_OUTPUT_BYTES
+    }
+    pub fn expire_device_task(&mut self, id: &str) {
+        crate::executor::finish(self, id, "cancelled");
+        self.run("DELETE FROM job_lines WHERE job = ?", vec![text(id)]);
+        self.run("DELETE FROM jobs WHERE id = ?", vec![text(id)]);
+        // Retain a small retry tombstone: expiry never permits an old write to run again.
+        self.run(
+            "UPDATE device_tasks SET grants = '[]', detached = 1 WHERE id = ?",
+            vec![text(id)],
+        );
     }
     /// A job's lines after `since`, as (seq, err, text).
     pub fn lines(&self, id: &str, since: u64, limit: u32) -> Vec<(u64, bool, String)> {
@@ -1586,7 +1622,7 @@ impl Db {
         let (now, nanos) = crate::auth::clock();
         self.run(
             "UPDATE inodes SET mtime = ?1, mtime_ns = ?2, ctime = ?1, ctime_ns = ?2 WHERE id = (SELECT ino FROM nodes WHERE path = ?3)",
-            vec![int(now), int(nanos), text(terminal_worker_core::parent(path))],
+            vec![int(now), int(nanos), text(os_core::parent(path))],
         );
     }
 }
@@ -1847,14 +1883,14 @@ impl Store for Db {
             .map(UserRow::pair)
             .or_else(|| {
                 // Only a uid of the guests' range is a guest's: no query for the rest.
-                terminal_worker_core::permissions::is_guest_id(id)
+                os_core::permissions::is_guest_id(id)
                     .then(|| self.guest_by_uid(id))
                     .flatten()
                     .map(|guest| (guest.name(), guest.user()))
             })
     }
     fn username(&self, id: u32) -> String {
-        if terminal_worker_core::permissions::is_guest_id(id)
+        if os_core::permissions::is_guest_id(id)
             && let Some(guest) = self.guest_by_uid(id)
         {
             return guest.name();
@@ -1982,5 +2018,80 @@ impl Store for Db {
             .unwrap_or(1000);
         self.set_meta(key, &(next + 1).to_string());
         next
+    }
+}
+
+/// Control ownership is separate from the immutable execution credential snapshot.
+#[derive(Clone, Debug, Deserialize)]
+pub struct DeviceTask {
+    pub id: String,
+    pub lineage: String,
+    pub request: String,
+    pub device: String,
+    pub digest: String,
+    pub sid: String,
+    pub fd: u32,
+    pub owner: u32,
+    pub detached: u8,
+    pub grants: String,
+}
+impl Db {
+    pub fn set_controller(&mut self, lineage: &str, uid: u32) {
+        self.run(
+            "INSERT OR IGNORE INTO execution_owners(lineage,uid) VALUES(?,?)",
+            vec![text(lineage), int(uid)],
+        );
+    }
+    pub fn controller(&self, lineage: &str) -> Option<u32> {
+        #[derive(Deserialize)]
+        struct Owner {
+            uid: u32,
+        }
+        self.rows::<Owner>(
+            "SELECT uid FROM execution_owners WHERE lineage = ?",
+            vec![text(lineage)],
+        )
+        .pop()
+        .map(|row| row.uid)
+    }
+    pub fn forget_controller(&mut self, lineage: &str) {
+        self.run(
+            "DELETE FROM execution_owners WHERE lineage = ?",
+            vec![text(lineage)],
+        );
+    }
+    pub fn device_task(&self, id: &str) -> Option<DeviceTask> {
+        self.rows("SELECT * FROM device_tasks WHERE id = ?", vec![text(id)])
+            .pop()
+    }
+    pub fn device_retry(&self, lineage: &str, request: &str) -> Option<DeviceTask> {
+        self.rows(
+            "SELECT * FROM device_tasks WHERE lineage = ? AND request = ?",
+            vec![text(lineage), text(request)],
+        )
+        .pop()
+    }
+    pub fn bind_device_task(&mut self, task: &DeviceTask) {
+        self.run("INSERT INTO device_tasks(id,lineage,request,device,digest,sid,fd,owner,detached,grants) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            vec![text(&task.id),text(&task.lineage),text(&task.request),text(&task.device),text(&task.digest),text(&task.sid),int(task.fd),int(task.owner),int(task.detached),text(&task.grants)]);
+    }
+    pub fn attach_device_task(&mut self, id: &str, sid: &str, fd: u32, detached: bool) {
+        self.run(
+            "UPDATE device_tasks SET sid = ?, fd = ?, detached = ? WHERE id = ?",
+            vec![text(sid), int(fd), int(detached as u8), text(id)],
+        );
+    }
+    pub fn tasks_on(&self, sid: &str, fd: u32) -> Vec<DeviceTask> {
+        self.rows(
+            "SELECT * FROM device_tasks WHERE sid = ? AND fd = ? AND detached = 0",
+            vec![text(sid), int(fd)],
+        )
+    }
+    pub fn active_tasks(&self, owner: u32) -> usize {
+        #[derive(Deserialize)]
+        struct Count {
+            n: usize,
+        }
+        self.rows::<Count>("SELECT COUNT(*) AS n FROM device_tasks JOIN jobs USING(id) WHERE device_tasks.owner = ? AND jobs.state NOT IN ('done','failed','cancelled')", vec![int(owner)]).pop().map_or(0, |n| n.n)
     }
 }

@@ -1,4 +1,5 @@
-//! Text: echo, the filters cat, head, tail, grep, wc, sort and uniq, and xargs.
+//! Text command metadata for completion and manuals. External programs parse their own argv.
+//! Grep and xargs share these definitions with their installed implementation.
 
 use clap::{Parser, ValueHint};
 
@@ -30,8 +31,7 @@ impl Manual for Echo {
 
 /// write files one after another
 ///
-/// Writes each FILE, or standard input; - stands for standard input. Files are read as UTF-8
-/// text, up to 10 MB each; links are followed.
+/// Writes each FILE, or standard input; - stands for standard input. Links are followed.
 #[derive(Parser, Debug)]
 #[command(name = "cat")]
 pub struct Cat {
@@ -66,7 +66,7 @@ pub struct Head {
 }
 impl Manual for Head {
     fn check(args: &[String]) -> Result<(), String> {
-        crate::text::parse("head", args).map(drop)
+        super::parse::<Self>(&line_arguments(args)).map(drop)
     }
     const SECTION: Section = Section::Text;
     const EXAMPLES: &'static [(&'static str, &'static str)] = &[
@@ -96,7 +96,7 @@ pub struct Tail {
 }
 impl Manual for Tail {
     fn check(args: &[String]) -> Result<(), String> {
-        crate::text::parse("tail", args).map(drop)
+        super::parse::<Self>(&line_arguments(args)).map(drop)
     }
     const SECTION: Section = Section::Text;
     const EXAMPLES: &'static [(&'static str, &'static str)] = &[
@@ -236,8 +236,8 @@ impl Manual for Uniq {
 /// Runs COMMAND (echo) with the items read from standard input added as arguments. Items are
 /// separated by blanks and newlines, with quotes and backslashes as in GNU xargs.
 ///
-/// Each run is a program of its own; a failed run does not stop the next. Ctrl+C stops between
-/// runs.
+/// Each run is a child process with inherited output and permissions. Its standard input is
+/// empty unless -o opens the terminal. Ctrl+C signals the entire foreground job.
 #[derive(Parser, Debug)]
 #[command(name = "xargs")]
 pub struct Xargs {
@@ -264,6 +264,9 @@ pub struct Xargs {
     /// print each command first
     #[arg(short = 't', long = "verbose")]
     pub verbose: bool,
+    /// read child input from the terminal
+    #[arg(short = 'o', long = "open-tty")]
+    pub open_tty: bool,
     #[arg(value_name = "COMMAND", trailing_var_arg = true)]
     pub command: Vec<String>,
 }
@@ -283,4 +286,30 @@ fn positive(value: &str) -> Result<u64, String> {
         Ok(0) | Err(_) => Err("a count of 1 or more is expected".into()),
         Ok(count) => Ok(count),
     }
+}
+
+// Completion/manual validation accepts the historical -N shorthand. Execution is always
+// parsed by coreutils, including options beyond this metadata's completion vocabulary.
+fn line_arguments(args: &[String]) -> Vec<String> {
+    let mut spelled = Vec::new();
+    let mut ended = false;
+    for (index, arg) in args.iter().enumerate() {
+        match arg.strip_prefix('-') {
+            Some(digits)
+                if !ended
+                    && !digits.is_empty()
+                    && digits.bytes().all(|byte| byte.is_ascii_digit())
+                    && args
+                        .get(index.wrapping_sub(1))
+                        .is_none_or(|previous| previous != "-n" && previous != "--lines") =>
+            {
+                spelled.extend(["-n".to_string(), digits.to_string()]);
+            }
+            _ => {
+                ended |= arg == "--";
+                spelled.push(arg.clone());
+            }
+        }
+    }
+    spelled
 }

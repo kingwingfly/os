@@ -1,7 +1,7 @@
 import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, mkdirp, put, rmrf } from './sys.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 let base, headers;
@@ -23,7 +23,7 @@ test.afterEach(async ({ request }) => { await rmrf(request, base); });
 
 async function open(page, name) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await expect(page.locator('#command').locator('xpath=ancestor::form').locator('.busy')).toHaveText('↵');
+  await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle');
   await input.fill(`open ${base}/${name}`); await input.press('Enter');
   await expect(page.locator('#viewer')).toBeVisible();
 }

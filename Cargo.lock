@@ -2527,6 +2527,207 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c04f5d74368e4d0dfe06c45c8627c81bd7c317d52762d118fb9b3076f6420fd"
 
 [[package]]
+name = "os"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "hmac",
+ "js-sys",
+ "os-abi",
+ "os-core",
+ "os-kernel",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "wasm-bindgen",
+ "worker",
+]
+
+[[package]]
+name = "os-abi"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "os-client-kernel"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "os-abi",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
+name = "os-core"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "os-abi",
+ "regex",
+ "serde",
+ "unicode-width",
+]
+
+[[package]]
+name = "os-jobs"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "os-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tiny_http",
+ "zip",
+]
+
+[[package]]
+name = "os-kernel"
+version = "0.1.0"
+dependencies = [
+ "os-abi",
+ "os-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "os-posix"
+version = "0.1.0"
+dependencies = [
+ "os-abi",
+ "serde_json",
+]
+
+[[package]]
+name = "os-preview"
+version = "0.1.0"
+dependencies = [
+ "arborium",
+ "arborium-bash",
+ "arborium-c",
+ "arborium-c-sharp",
+ "arborium-cpp",
+ "arborium-css",
+ "arborium-dart",
+ "arborium-diff",
+ "arborium-dockerfile",
+ "arborium-elixir",
+ "arborium-go",
+ "arborium-haskell",
+ "arborium-html",
+ "arborium-ini",
+ "arborium-java",
+ "arborium-javascript",
+ "arborium-jsdoc",
+ "arborium-json",
+ "arborium-julia",
+ "arborium-kotlin",
+ "arborium-lua",
+ "arborium-make",
+ "arborium-markdown",
+ "arborium-nix",
+ "arborium-ocaml",
+ "arborium-php",
+ "arborium-proto",
+ "arborium-python",
+ "arborium-ruby",
+ "arborium-rust",
+ "arborium-scala",
+ "arborium-scss",
+ "arborium-sql",
+ "arborium-swift",
+ "arborium-toml",
+ "arborium-tsx",
+ "arborium-typescript",
+ "arborium-vue",
+ "arborium-xml",
+ "arborium-yaml",
+ "arborium-zig",
+ "console_error_panic_hook",
+ "flate2",
+ "hayro",
+ "js-sys",
+ "merman",
+ "serde_json",
+ "tar",
+ "wasm-bindgen",
+ "web-sys",
+ "zip",
+]
+
+[[package]]
+name = "os-ui"
+version = "0.1.0"
+dependencies = [
+ "ammonia",
+ "console_error_panic_hook",
+ "csv",
+ "futures",
+ "gloo-net",
+ "js-sys",
+ "leptos",
+ "os-abi",
+ "os-core",
+ "os-preview",
+ "os-userland",
+ "pulldown-cmark",
+ "pulldown-latex",
+ "regex",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "sha2 0.10.9",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "os-userland"
+version = "0.1.0"
+dependencies = [
+ "os-abi",
+ "os-core",
+ "os-kernel",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "os-utilities"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "os-abi",
+ "os-core",
+ "os-posix",
+ "os-userland",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "os-wasix-runtime"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "owned_ttf_parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3808,184 +4009,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5fed54709c5b3a53d09bb1c113ea4f5ceafd1e772ddcb0030a82e1d56c087b08"
 dependencies = [
  "new_debug_unreachable",
-]
-
-[[package]]
-name = "terminal-worker"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "hmac",
- "js-sys",
- "regex",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "terminal-worker-abi",
- "terminal-worker-core",
- "terminal-worker-kernel",
- "wasm-bindgen",
- "worker",
-]
-
-[[package]]
-name = "terminal-worker-abi"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "terminal-worker-client-kernel"
-version = "0.1.0"
-dependencies = [
- "js-sys",
- "serde",
- "serde_json",
- "terminal-worker-abi",
- "wasm-bindgen",
- "wasm-bindgen-futures",
-]
-
-[[package]]
-name = "terminal-worker-core"
-version = "0.1.0"
-dependencies = [
- "clap",
- "regex",
- "serde",
-]
-
-[[package]]
-name = "terminal-worker-jobs"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "terminal-worker-core",
- "tiny_http",
- "zip",
-]
-
-[[package]]
-name = "terminal-worker-kernel"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "terminal-worker-abi",
- "terminal-worker-core",
-]
-
-[[package]]
-name = "terminal-worker-preview"
-version = "0.1.0"
-dependencies = [
- "arborium",
- "arborium-bash",
- "arborium-c",
- "arborium-c-sharp",
- "arborium-cpp",
- "arborium-css",
- "arborium-dart",
- "arborium-diff",
- "arborium-dockerfile",
- "arborium-elixir",
- "arborium-go",
- "arborium-haskell",
- "arborium-html",
- "arborium-ini",
- "arborium-java",
- "arborium-javascript",
- "arborium-jsdoc",
- "arborium-json",
- "arborium-julia",
- "arborium-kotlin",
- "arborium-lua",
- "arborium-make",
- "arborium-markdown",
- "arborium-nix",
- "arborium-ocaml",
- "arborium-php",
- "arborium-proto",
- "arborium-python",
- "arborium-ruby",
- "arborium-rust",
- "arborium-scala",
- "arborium-scss",
- "arborium-sql",
- "arborium-swift",
- "arborium-toml",
- "arborium-tsx",
- "arborium-typescript",
- "arborium-vue",
- "arborium-xml",
- "arborium-yaml",
- "arborium-zig",
- "console_error_panic_hook",
- "flate2",
- "hayro",
- "js-sys",
- "merman",
- "serde_json",
- "tar",
- "wasm-bindgen",
- "web-sys",
- "zip",
-]
-
-[[package]]
-name = "terminal-worker-ui"
-version = "0.1.0"
-dependencies = [
- "ammonia",
- "console_error_panic_hook",
- "csv",
- "futures",
- "gloo-net",
- "js-sys",
- "leptos",
- "pulldown-cmark",
- "pulldown-latex",
- "regex",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "sha2 0.10.9",
- "terminal-worker-abi",
- "terminal-worker-core",
- "terminal-worker-preview",
- "terminal-worker-userland",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "terminal-worker-userland"
-version = "0.1.0"
-dependencies = [
- "regex",
- "serde",
- "serde_json",
- "terminal-worker-abi",
- "terminal-worker-core",
- "terminal-worker-kernel",
-]
-
-[[package]]
-name = "terminal-worker-wasix-runtime"
-version = "0.1.0"
-dependencies = [
- "js-sys",
- "serde",
- "serde_json",
- "wasm-bindgen",
 ]
 
 [[package]]

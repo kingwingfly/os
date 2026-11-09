@@ -4,7 +4,7 @@
 //! rules that can be tested without it. Every registry call is in `permit`'s table: a call
 //! added to the ABI without a rule is refused.
 use abi::{Call, Errno, Error};
-use terminal_worker_core::permissions::Identity;
+use os_core::permissions::Identity;
 
 /// Who a registry call comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,7 +16,7 @@ pub enum Caller {
     /// the page's account.
     Page,
     /// A process: any batch carrying a process's token, whatever route it took. Uploaded wasm
-    /// reaches the registry this way (terminal.sys), so it is given nothing of the kernel's.
+    /// reaches the registry this way (os.sys), so it is given nothing of the kernel's.
     Process,
 }
 
@@ -57,13 +57,15 @@ pub fn permit(caller: Caller, call: &Call) -> Result<Acting, Error> {
                 "a process replaces itself through its kernel, which holds its token",
             )),
         },
-        Call::Fork { .. } | Call::Exit { .. } | Call::ProcKeep { .. } => match caller {
-            Registry | Process => Ok(Acting::Itself),
-            Page => Err(Error::because(
-                Errno::EPERM,
-                "the client kernel tells of forks, exits and waits",
-            )),
-        },
+        Call::Fork { .. } | Call::Exit { .. } | Call::ProcKeep { .. } | Call::ProcTty { .. } => {
+            match caller {
+                Registry | Process => Ok(Acting::Itself),
+                Page => Err(Error::because(
+                    Errno::EPERM,
+                    "the client kernel tells of forks, exits and waits",
+                )),
+            }
+        }
         Call::Wait { token, .. } => match caller {
             Registry if token.is_none() => Ok(Acting::Account),
             Registry | Process => Ok(Acting::Itself),
@@ -159,7 +161,7 @@ mod tests {
             },
         ] {
             assert_eq!(permit(Caller::Registry, &call), Ok(Acting::Account));
-            // Neither a page nor a process (uploaded wasm, through terminal.sys) may begin a
+            // Neither a page nor a process (uploaded wasm, through os.sys) may begin a
             // namespace, drain its pids, or end another tab's processes.
             for caller in [Caller::Page, Caller::Process] {
                 assert_eq!(permit(caller, &call).unwrap_err().errno, Errno::EPERM);
@@ -198,7 +200,6 @@ mod tests {
         };
         let wait = Call::Wait {
             pid: "3".into(),
-            since: 0,
             token: None,
         };
         assert_eq!(permit(Caller::Registry, &exit), Ok(Acting::Itself));
@@ -208,7 +209,6 @@ mod tests {
                 Caller::Registry,
                 &Call::Wait {
                     pid: "3".into(),
-                    since: 0,
                     token: Some("host-token".into())
                 }
             ),

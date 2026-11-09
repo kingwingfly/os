@@ -15,7 +15,7 @@ const target = JSON.parse(
 ).target_directory;
 execFileSync(
   'cargo',
-  ['build', '-p', 'terminal-worker-client-kernel', '--target', 'wasm32-unknown-unknown', '--release'],
+  ['build', '-p', 'os-client-kernel', '--target', 'wasm32-unknown-unknown', '--release'],
   { cwd: root, stdio: 'inherit' },
 );
 execFileSync(
@@ -25,7 +25,7 @@ execFileSync(
     '--no-typescript',
     '--out-dir', out,
     '--out-name', 'client_kernel',
-    join(target, 'wasm32-unknown-unknown/release/terminal_worker_client_kernel.wasm'),
+    join(target, 'wasm32-unknown-unknown/release/os_client_kernel.wasm'),
   ],
   { cwd: root, stdio: 'inherit' },
 );

@@ -1,14 +1,14 @@
 //! The programs, run over the kernel in memory: what they print and how they fail.
-use crate::{Io, Sys, View, run};
+use crate::{Io, Sys, run};
 use abi::{Call, Closed, Errno, Error, FICLONE, O_ACCMODE, Opened};
 use kernel::{Fs, Opening, Process, call};
+use os_core::permissions::*;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::{Pin, pin};
 use std::task::{Context, Poll, Waker};
-use terminal_worker_core::permissions::*;
 
 /// A process over the kernel in memory, as an account, with descriptors as the host keeps
 /// them: here, of whole files, whose content is an id that copies share.
@@ -186,12 +186,11 @@ impl Mem {
     }
 }
 
-/// What running `line` in `cwd` gave: its status, its output, its errors, and its view.
+/// What running `line` in `cwd` gave: its status, its output, and its errors.
 struct Ran {
     status: i32,
     out: String,
     err: Vec<String>,
-    view: Option<View>,
 }
 fn sh(mem: &Mem, cwd: &str, line: &str) -> Ran {
     sh_answering(mem, cwd, line, "n")
@@ -209,7 +208,6 @@ fn sh_answering(mem: &Mem, cwd: &str, line: &str, answer: &'static str) -> Ran {
         stdin: None,
         out: String::new(),
         err: Vec::new(),
-        view: None,
         found: Vec::new(),
         cancelled: &cancelled,
         ask: &ask,
@@ -219,61 +217,50 @@ fn sh_answering(mem: &Mem, cwd: &str, line: &str, answer: &'static str) -> Ran {
         status,
         out: io.out,
         err: io.err,
-        view: io.view,
     }
 }
-fn names(ran: &Ran) -> Vec<String> {
-    match &ran.view {
-        Some(View::Listing { entries, .. }) => entries.iter().map(|e| e.name.clone()).collect(),
-        None => Vec::new(),
+fn names(mem: &Mem, path: &str) -> Vec<String> {
+    block_on(crate::entries(mem, path, path))
+        .expect("directory entries")
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect()
+}
+
+// Fixture creation uses kernel primitives. Migrated mkdir/touch/link CLI behavior is
+// exercised through the actual WASI executables in browser integration tests.
+fn make_dirs(mem: &Mem, paths: &[&str]) {
+    for path in paths {
+        block_on(crate::sys::done(
+            mem,
+            Call::Mkdir {
+                path: (*path).into(),
+                mode: 0o777,
+            },
+        ))
+        .unwrap();
+    }
+}
+fn make_files(mem: &Mem, paths: &[&str]) {
+    for path in paths {
+        block_on(crate::sys::done(
+            mem,
+            Call::Mknod {
+                path: (*path).into(),
+                mode: 0o666,
+                rdev: None,
+            },
+        ))
+        .unwrap();
     }
 }
 
 #[test]
-fn programs_work_through_system_calls_as_gnus_do() {
+fn files_listing_is_independent_of_external_utilities() {
     let mem = mem();
-    assert_eq!(sh(&mem, "/", "mkdir -p /w/a/b").status, 0);
-    assert_eq!(sh(&mem, "/w", "touch a/one .hidden two").status, 0);
-    // ls: directories first, hidden ones with -a only.
-    assert_eq!(names(&sh(&mem, "/w", "ls")), ["a", "two"]);
-    assert_eq!(names(&sh(&mem, "/w", "ls -a")), ["a", ".hidden", "two"]);
-    let missing = sh(&mem, "/w", "ls nothing");
-    assert_eq!(
-        (missing.status, missing.err.clone()),
-        (
-            2,
-            vec!["ls: cannot access 'nothing': No such file or directory".to_string()]
-        )
-    );
-    // mkdir without -p, of what is there.
-    assert_eq!(
-        sh(&mem, "/w", "mkdir a").err,
-        ["mkdir: cannot create directory 'a': File exists"]
-    );
-    assert_eq!(
-        sh(&mem, "/w", "mkdir -p two/x").err,
-        ["mkdir: cannot create directory 'two/x': Not a directory"]
-    );
-    // mv, ln, readlink, realpath.
-    assert_eq!(
-        sh(&mem, "/w", "mv -v two a").out,
-        "renamed 'two' -> 'a/two'\n"
-    );
-    assert_eq!(sh(&mem, "/w", "ln -s a/two link").status, 0);
-    assert_eq!(sh(&mem, "/w", "readlink link").out, "a/two\n");
-    assert_eq!(sh(&mem, "/w", "readlink -f link").out, "/w/a/two\n");
-    assert_eq!(sh(&mem, "/w", "realpath a/b/../two").out, "/w/a/two\n");
-    assert_eq!(
-        sh(&mem, "/w", "realpath -e nope").err,
-        ["realpath: nope: No such file or directory"]
-    );
-    assert_eq!(
-        sh(&mem, "/w", "ln -s a/one link").err,
-        ["ln: failed to create symbolic link 'link': File exists"]
-    );
-    assert_eq!(sh(&mem, "/w", "ln -sf a/one link").status, 0);
-    assert_eq!(sh(&mem, "/w", "readlink link").out, "a/one\n");
-    // rm: a directory needs -r; . and .. never go.
+    make_dirs(&mem, &["/w", "/w/a", "/w/a/b"]);
+    make_files(&mem, &["/w/a/one", "/w/.hidden", "/w/two"]);
+    assert_eq!(names(&mem, "/w"), ["a", ".hidden", "two"]);
     assert_eq!(
         sh(&mem, "/w", "rm a").err,
         ["rm: cannot remove 'a': Is a directory"]
@@ -283,16 +270,15 @@ fn programs_work_through_system_calls_as_gnus_do() {
         ["rm: refusing to remove '.' or '..' directory: skipping '.'"]
     );
     assert_eq!(sh(&mem, "/w", "rm -f nothing").status, 0);
-    assert_eq!(sh(&mem, "/w", "rm -r a link .hidden").status, 0);
-    assert!(names(&sh(&mem, "/w", "ls -a")).is_empty());
-    assert_eq!(sh(&mem, "/w", "rmdir /w").status, 0);
+    assert_eq!(sh(&mem, "/w", "rm -r a .hidden two").status, 0);
+    assert!(names(&mem, "/w").is_empty());
 }
 
 #[test]
 fn rm_r_removes_what_it_may_and_says_what_it_may_not() {
     let mem = mem();
-    sh(&mem, "/", "mkdir -p /t/keep/inner /t/go");
-    sh(&mem, "/", "touch /t/keep/inner/f /t/go/f /t/top");
+    make_dirs(&mem, &["/t", "/t/keep", "/t/keep/inner", "/t/go"]);
+    make_files(&mem, &["/t/keep/inner/f", "/t/go/f", "/t/top"]);
     sh(&mem, "/", "chmod 777 /t /t/go");
     sh(&mem, "/", "chmod 555 /t/keep/inner");
     sh(&mem, "/", "chown -R ann /t");
@@ -306,20 +292,20 @@ fn rm_r_removes_what_it_may_and_says_what_it_may_not() {
     );
     // What could go went, as on Linux; what holds what could not, stayed.
     mem.as_user(0);
-    assert_eq!(names(&sh(&mem, "/", "ls /t")), ["keep"]);
+    assert_eq!(names(&mem, "/t"), ["keep"]);
 }
 
 #[test]
 fn mv_n_and_i_leave_what_is_there_unless_answered_yes() {
     let mem = mem();
-    sh(&mem, "/", "mkdir /m");
-    sh(&mem, "/m", "touch a b c");
+    make_dirs(&mem, &["/m"]);
+    make_files(&mem, &["/m/a", "/m/b", "/m/c"]);
     assert_eq!(sh(&mem, "/m", "mv -n a b").status, 0);
-    assert_eq!(names(&sh(&mem, "/m", "ls")), ["a", "b", "c"]);
+    assert_eq!(names(&mem, "/m"), ["a", "b", "c"]);
     assert_eq!(sh_answering(&mem, "/m", "mv -i a b", "n").status, 0);
-    assert_eq!(names(&sh(&mem, "/m", "ls")), ["a", "b", "c"]);
+    assert_eq!(names(&mem, "/m"), ["a", "b", "c"]);
     assert_eq!(sh_answering(&mem, "/m", "mv -i a b", "y").status, 0);
-    assert_eq!(names(&sh(&mem, "/m", "ls")), ["b", "c"]);
+    assert_eq!(names(&mem, "/m"), ["b", "c"]);
     assert_eq!(
         sh(&mem, "/m", "mv b c d").err,
         ["mv: target 'd' is not a directory"]
@@ -329,7 +315,7 @@ fn mv_n_and_i_leave_what_is_there_unless_answered_yes() {
         ["mv: cannot stat 'nothing': No such file or directory"]
     );
     // The working directory, and what holds it, stay where they are.
-    sh(&mem, "/", "mkdir -p /m/in/deep");
+    make_dirs(&mem, &["/m/in", "/m/in/deep"]);
     assert_eq!(
         sh(&mem, "/m/in/deep", "mv /m/in /m/out").err,
         ["mv: cannot move '/m/in': it holds the working directory; cd elsewhere first"]
@@ -341,17 +327,11 @@ fn mv_n_and_i_leave_what_is_there_unless_answered_yes() {
 #[test]
 fn modes_owners_and_acls_change_as_their_programs_say() {
     let mem = mem();
-    sh(&mem, "/", "mkdir -p /p/d");
-    sh(&mem, "/p", "touch d/f g");
+    make_dirs(&mem, &["/p", "/p/d"]);
+    make_files(&mem, &["/p/d/f", "/p/g"]);
     assert_eq!(sh(&mem, "/p", "chmod -R go-rwx d").status, 0);
-    let long = sh(&mem, "/p", "ls -l d");
-    match long.view {
-        Some(View::Listing {
-            entries,
-            long: true,
-        }) => assert_eq!(entries[0].mode, 0o600),
-        _ => panic!("a long listing"),
-    }
+    let entries = block_on(crate::entries(&mem, "/p/d", "/p/d")).unwrap();
+    assert_eq!(entries[0].mode, 0o600);
     assert_eq!(
         sh(&mem, "/p", "chmod u+q g").err,
         ["chmod: invalid mode: 'u+q'"]
@@ -395,8 +375,11 @@ fn modes_owners_and_acls_change_as_their_programs_say() {
 #[test]
 fn fd_finds_below_its_roots_and_stat_says_what_a_file_is() {
     let mem = mem();
-    sh(&mem, "/", "mkdir -p /f/x/y /f/.hid");
-    sh(&mem, "/f", "touch x/a.md x/y/b.md x/c.txt .hid/d.md");
+    make_dirs(&mem, &["/f", "/f/x", "/f/x/y", "/f/.hid"]);
+    make_files(
+        &mem,
+        &["/f/x/a.md", "/f/x/y/b.md", "/f/x/c.txt", "/f/.hid/d.md"],
+    );
     let found = sh(&mem, "/f", "fd -e md");
     assert_eq!(found.out, "x/a.md\nx/y/b.md\n");
     assert_eq!(found.status, 0);
@@ -421,8 +404,8 @@ fn content(mem: &Mem, path: &str) -> Option<String> {
 #[test]
 fn cp_shares_content_copies_trees_and_says_what_it_will_not() {
     let mem = mem();
-    sh(&mem, "/", "mkdir -p /w/src/deep");
-    sh(&mem, "/w", "touch src/a src/deep/b");
+    make_dirs(&mem, &["/w", "/w/src", "/w/src/deep"]);
+    make_files(&mem, &["/w/src/a", "/w/src/deep/b"]);
     {
         let mut fs = mem.fs.borrow_mut();
         let node = fs.node("/w/src/a").unwrap();
@@ -459,34 +442,77 @@ fn cp_shares_content_copies_trees_and_says_what_it_will_not() {
         ["cp: 'src/a' and 'src/a' are the same file"]
     );
     // -i asks of the name as given; no leaves what is there.
-    sh(&mem, "/w", "touch other");
+    make_files(&mem, &["/w/other"]);
     assert_eq!(sh(&mem, "/w", "cp -i src/a other").status, 0);
     assert_ne!(content(&mem, "/w/other").as_deref(), Some("alpha"));
     // Links are copied as links with -r, and followed when named without it.
-    sh(&mem, "/w", "ln -s a src/l");
+    block_on(crate::sys::done(
+        &mem,
+        Call::Symlink {
+            target: "a".into(),
+            path: "/w/src/l".into(),
+        },
+    ))
+    .unwrap();
     sh(&mem, "/w", "cp -r src again");
-    assert_eq!(sh(&mem, "/w", "readlink again/l").out, "a\n");
+    assert_eq!(
+        block_on(crate::sys::call::<String>(
+            &mem,
+            Call::Readlink {
+                path: "/w/again/l".into()
+            }
+        ))
+        .unwrap(),
+        "a"
+    );
     sh(&mem, "/w", "cp src/l followed");
     assert_eq!(content(&mem, "/w/followed").as_deref(), Some("alpha"));
     // -a keeps a file's names one file, and a link's target as written; -L follows links.
-    sh(&mem, "/w", "ln src/a src/deep/a-too");
+    block_on(crate::sys::done(
+        &mem,
+        Call::Link {
+            from: "/w/src/a".into(),
+            to: "/w/src/deep/a-too".into(),
+            follow: false,
+        },
+    ))
+    .unwrap();
     assert_eq!(sh(&mem, "/w", "cp -a src kept").err, Vec::<String>::new());
     let ino = |path: &str| mem.fs.borrow().node(path).unwrap().ino;
     assert_eq!(ino("/w/kept/a"), ino("/w/kept/deep/a-too"));
     assert_ne!(ino("/w/kept/a"), ino("/w/src/a"));
     assert_eq!(
-        sh(&mem, "/w", "readlink kept/l").out,
-        "a
-"
+        block_on(crate::sys::call::<String>(
+            &mem,
+            Call::Readlink {
+                path: "/w/kept/l".into()
+            }
+        ))
+        .unwrap(),
+        "a"
     );
     sh(&mem, "/w", "cp -rL src deref");
     assert_eq!(content(&mem, "/w/deref/l").as_deref(), Some("alpha"));
     // A file is written through a link to one, not through one leading nowhere.
-    sh(&mem, "/w", "touch target");
-    sh(&mem, "/w", "ln -s target via");
+    make_files(&mem, &["/w/target"]);
+    block_on(crate::sys::done(
+        &mem,
+        Call::Symlink {
+            target: "target".into(),
+            path: "/w/via".into(),
+        },
+    ))
+    .unwrap();
     sh(&mem, "/w", "cp src/a via");
     assert_eq!(content(&mem, "/w/target").as_deref(), Some("alpha"));
-    sh(&mem, "/w", "ln -s nowhere dangling");
+    block_on(crate::sys::done(
+        &mem,
+        Call::Symlink {
+            target: "nowhere".into(),
+            path: "/w/dangling".into(),
+        },
+    ))
+    .unwrap();
     assert_eq!(
         sh(&mem, "/w", "cp src/a dangling").err,
         ["cp: not writing through dangling symlink 'dangling'"]
@@ -508,7 +534,7 @@ fn cp_shares_content_copies_trees_and_says_what_it_will_not() {
     sh(&mem, "/w", "cp -p src/deep/b bobs");
     assert_eq!(mem.fs.borrow().node("/w/bobs").unwrap().owner, 1001);
     mem.as_user(1000);
-    sh(&mem, "/w", "touch /w/locked");
+    make_files(&mem, &["/w/locked"]);
     sh(&mem, "/w", "chmod 444 /w/locked");
     assert_eq!(
         sh(&mem, "/w", "cp src/deep/b locked").err,

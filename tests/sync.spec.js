@@ -2,7 +2,7 @@ import { test, expect, request as playwrightRequest } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, mkdirp, program, put, rmrf } from './sys.js';
 import { browse, promptPath } from './ui.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 let sequence = 0;
@@ -21,7 +21,7 @@ test('a page shows what other devices change as it happens, and hears nothing of
     expect((await api(context.request, 'login', { headers: { Origin: origin }, data: { password } })).ok()).toBe(true);
     await page.goto('/');
     const input = page.getByRole('combobox', { name: 'Terminal command' });
-    await expect(page.locator('.busy')).toHaveText('↵');
+    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
     await browse(page, base);
     // Without anything done here, the Files follow the other device.
     const names = page.locator('.files .filename');
@@ -67,7 +67,7 @@ test('removing a file another device is uploading stops that upload, as rm does 
     expect((await api(context.request, 'login', { headers: { Origin: origin }, data: { password } })).ok()).toBe(true);
     await page.goto('/');
     const input = page.getByRole('combobox', { name: 'Terminal command' });
-    await expect(page.locator('.busy')).toHaveText('↵');
+    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
     await input.fill('cd ' + base); await input.press('Enter');
     await expect(promptPath(page)).toHaveText(base);
     await browse(page, base);

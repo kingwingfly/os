@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, entry, errno, mkdirp, program, put, rmrf } from './sys.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 let base, headers, sequence = 0;
@@ -16,17 +16,17 @@ test.beforeEach(async ({ request, page }) => {
 });
 test.afterEach(async ({ request }) => { await rmrf(request, base); });
 
-const busy = page => page.locator('.terminal-panel:not([hidden]) .busy');
+const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
 async function run(page, text) {
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   await page.locator('#command').fill(text); await page.locator('#command').press('Enter');
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
 }
 async function output(page, text) { await run(page, text); return (await last(page).textContent()).trim(); }
 async function terminal(page) {
   await page.goto('/');
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   await page.locator('#command').fill('su root'); await page.locator('#command').press('Enter');
   await page.getByLabel('Password', { exact: true }).fill(password); await page.locator('#auth button[type=submit]').click();
   await expect(page.locator('#auth')).not.toBeVisible();
@@ -65,11 +65,13 @@ test('ln makes symbolic and hard links that behave as on Linux', async ({ page, 
   // ls -ld shows the link itself; a trailing slash follows it.
   expect(await output(page, 'ls -ld d')).toContain('d -> docs');
   expect(await output(page, 'ls d/')).toBe('b.md');
-  for (const [line, message] of [['ln docs hard', 'hard link not allowed for directory'], ['ln -s a-too.md docs/b.md', 'File exists'], ['ln -s loop loop', '']]) {
+  // Diagnostics belong to the installed uutils/WASI program.
+  for (const [line, message] of [['ln docs hard', 'hard link not allowed for directory'], ['ln -s a-too.md docs/b.md', 'Already exists'], ['ln -s loop loop', '']]) {
     await run(page, line);
     if (message) await expect(last(page)).toContainText(message);
   }
-  await run(page, 'cat loop'); await expect(last(page)).toContainText('Too many levels of symbolic links');
+  // The WASI platform adapter recognizes ELOOP and uses cat's normal diagnostic.
+  await run(page, 'cat loop'); await expect(last(page)).toHaveText('cat: loop: Too many levels of symbolic links');
   // ln -sf repoints a link; fd -t l finds links.
   await run(page, 'ln -sfn a-too.md d'); expect(await output(page, 'readlink d')).toBe('a-too.md');
   expect(await output(page, 'fd -t l | sort')).toBe('d\nloop');
@@ -94,13 +96,14 @@ test('ln makes symbolic and hard links that behave as on Linux', async ({ page, 
   await run(page, 'mkdir withlink'); await run(page, 'ln -s ../up.bin withlink/l');
   await run(page, 'cp -rL withlink taken'); await expect(last(page)).toContainText('still uploading');
   expect(await entry(request, base + '/taken')).toBe(null);
-  await run(page, 'ln up.bin up-too.bin'); await expect(last(page)).toContainText('still uploading');
+  await run(page, 'ln up.bin up-too.bin'); await expect(last(page)).toContainText('Resource busy');
+  expect(await entry(request, base + '/up-too.bin')).toBe(null);
 });
 
 test('a visitor makes an account in /guest, which is sticky, and shares files with ACLs', async ({ page, request }) => {
   const ada = 'ada' + Date.now().toString(36), bob = 'bob' + Date.now().toString(36), pass = 'guest-password-' + Date.now();
   await page.goto('/');
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   // Signed out, one is guest-<uuid>, a real account in group guest.
   const id = await output(page, 'id');
   expect(id).toMatch(/^uid=\d+\(guest-[0-9a-f]{16}\) gid=65534\(guest\) groups=65534\(guest\)$/);
@@ -112,7 +115,7 @@ test('a visitor makes an account in /guest, which is sticky, and shares files wi
   await page.getByLabel('New password', { exact: true }).fill(pass); await page.getByLabel('Confirm new password').fill(pass);
   await page.locator('#auth button[type=submit]').click();
   await expect(page.locator('#auth')).not.toBeVisible();
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   await expect(last(page)).toContainText(`Created user ${ada} and signed in; home /guest/${ada}`);
   expect(await output(page, 'pwd')).toBe('/guest/' + ada);
   expect(await output(page, 'groups')).toBe(`${ada} guest`);
@@ -133,7 +136,9 @@ test('a visitor makes an account in /guest, which is sticky, and shares files wi
     expect((await other.get(file(`/guest/${ada}/note.txt`))).status()).toBe(200);
     expect(await output(page, 'ls -l note.txt')).toMatch(/^-rw-rw-r--\+ /);
     await run(page, 'chmod g-w note.txt');
-    expect(await output(page, 'getfacl note.txt')).toBe(`# file: guest/${ada}/note.txt\n# owner: ${ada}\n# group: ${ada}\nuser::rw-\nuser:${bob}:rw-\t#effective:r--\ngroup::r--\nmask::r--\nother::r--`);
+    // Capture bytes before terminal tab expansion; the ACL and effective mask stay exact.
+    await run(page, 'getfacl note.txt | tee acl.txt');
+    expect((await (await page.request.get(file(`/guest/${ada}/acl.txt`))).text()).trim()).toBe(`# file: guest/${ada}/note.txt\n# owner: ${ada}\n# group: ${ada}\nuser::rw-\nuser:${bob}:rw-\t#effective:r--\ngroup::r--\nmask::r--\nother::r--`);
     expect((await put(other, file(`/guest/${ada}/note.txt`) + '&overwrite=true', { data: 'x' })).status()).toBe(403);
     // A default ACL is what new files get.
     await run(page, `setfacl -d -m u:${bob}:rw .`); await run(page, 'touch later.txt');

@@ -119,13 +119,20 @@ export class Pipe {
 
   // Read at most `count` bytes, waiting for some: none at the end, or where Ctrl+D ended a read.
   // `meanwhile`, if given, is called now and then as it waits (a stop to heed).
-  read(count, meanwhile) {
+  read(count, meanwhile, line = false) {
     for (;;) {
       const seen = Atomics.load(this.state, CHANGES), queued = this.queued;
       if (queued > 0 && this.lock(READING)) {
         try {
           const now = this.queued;
-          if (now > 0) return this.take(Math.min(count, now));
+          if (now > 0) {
+            let length = Math.min(count, now);
+            if (line) {
+              const start = Atomics.load(this.state, READ) >>> 0;
+              for (let i = 0; i < length; i++) if (this.data[(start + i) % this.data.length] === 10) { length = i + 1; break; }
+            }
+            return this.take(length);
+          }
         } finally { this.unlock(READING); }
         continue;
       }
@@ -189,6 +196,14 @@ export class Pipe {
 
   // Ctrl+D: the read waiting, or the next, ends with nothing.
   endOfFile() { Atomics.add(this.state, EOF, 1); this.changed(); }
+  discard() {
+    // The kernel flushes input while a reader may hold the read lock. Retry at the caller
+    // rather than moving the cursor under a concurrent read.
+    if (!this.lock(READING)) return false;
+    try { Atomics.store(this.state, READ, Atomics.load(this.state, WRITE)); Atomics.store(this.state, EOF, 0); }
+    finally { this.unlock(READING); }
+    return true;
+  }
   // An end gone at once, whoever holds it: one its process never started to hold.
   closeWriter() { Atomics.store(this.state, WRITER_GONE, 1); this.changed(); }
   closeReader() { Atomics.store(this.state, READER_GONE, 1); this.changed(); }

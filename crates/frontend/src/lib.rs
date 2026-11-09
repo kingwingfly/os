@@ -5,6 +5,7 @@ mod preview;
 mod search;
 mod shell;
 mod sys;
+mod terminal;
 mod uploads;
 mod viewer;
 mod workers;
@@ -12,63 +13,64 @@ mod workers;
 use std::cell::RefCell;
 
 use leptos::prelude::*;
+use os_core::Entry;
 use shell::{Account, LogLine, Shell};
-use terminal_worker_core::Entry;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 #[wasm_bindgen]
 extern "C" {
-    #[wasm_bindgen(js_namespace = terminal)]
+    #[wasm_bindgen(js_namespace = os)]
     fn config() -> JsValue;
-    #[wasm_bindgen(js_namespace = terminal, js_name = open)]
+    #[wasm_bindgen(js_namespace = os, js_name = open)]
     pub(crate) fn open_file(path: &str, kind: &str) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = accountCommand)]
+    #[wasm_bindgen(js_namespace = os, js_name = accountCommand)]
     fn account_command(args: JsValue, cwd: &str) -> js_sys::Promise;
     /// sudo's authentication: whether the account may act as root now, its password asked for
     /// if it has not lately.
-    #[wasm_bindgen(js_namespace = terminal)]
+    #[wasm_bindgen(js_namespace = os)]
     fn sudo() -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = chooseFiles)]
+    #[wasm_bindgen(js_namespace = os, js_name = chooseFiles)]
     fn choose_files() -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = uploadFiles)]
+    #[wasm_bindgen(js_namespace = os, js_name = uploadFiles)]
     fn upload_files(files: &JsValue, path: &str, progress: &js_sys::Function) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = cancelUploads)]
+    #[wasm_bindgen(js_namespace = os, js_name = cancelUploads)]
     fn cancel_uploads() -> bool;
     /// Whether an upload goes on in this page, the terminal's or the Files': one at a time.
-    #[wasm_bindgen(js_namespace = terminal)]
+    #[wasm_bindgen(js_namespace = os)]
     fn uploading() -> bool;
-    #[wasm_bindgen(js_namespace = terminal, js_name = recordSound)]
+    #[wasm_bindgen(js_namespace = os, js_name = recordSound)]
     fn record_sound(
         path: Option<String>,
         name: Option<String>,
         acl: Option<String>,
         progress: &js_sys::Function,
     ) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = stopRecording)]
+    #[wasm_bindgen(js_namespace = os, js_name = stopRecording)]
     fn stop_recording() -> bool;
     /// present: /dev/present/NAME made of system calls (web/dev.mjs).
-    #[wasm_bindgen(js_namespace = terminal, js_name = presentFile)]
+    #[wasm_bindgen(js_namespace = os, js_name = presentFile)]
     fn present_file(path: &str, name: Option<String>) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = stopPresenting)]
+    #[wasm_bindgen(js_namespace = os, js_name = stopPresenting)]
     fn stop_presenting(name: &str) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal, js_name = cancelChoosing)]
+    #[wasm_bindgen(js_namespace = os, js_name = cancelChoosing)]
     fn cancel_choosing() -> bool;
-    #[wasm_bindgen(js_namespace = terminal, js_name = setDirectory)]
+    #[wasm_bindgen(js_namespace = os, js_name = setDirectory)]
     fn set_directory(path: &str);
-    #[wasm_bindgen(js_namespace = terminal, js_name = focusInput)]
+    #[wasm_bindgen(js_namespace = os, js_name = focusInput)]
     fn focus_input();
-    #[wasm_bindgen(js_namespace = terminal, js_name = completionFocus)]
-    fn completion_focus(value: &str, inside_quote: bool);
+    #[wasm_bindgen(js_namespace = os, js_name = focusLaunchedProgram)]
+    fn focus_launched_program();
+    #[wasm_bindgen(js_namespace = os, js_name = completionFocus)]
+    fn completion_focus(value: &str, cursor: u32);
+    #[wasm_bindgen(js_namespace = os, js_name = completionCursor)]
+    fn completion_cursor() -> u32;
     /// exec(2) of programs of /usr/bin, a pipeline of processes (web/wasi/exec.mjs), each
     /// stage an argv: the last's exit status, and what it wrote if not to the terminal.
-    #[wasm_bindgen(js_namespace = terminal)]
+    #[wasm_bindgen(js_namespace = os)]
     fn exec(stages: &JsValue, options: &JsValue) -> js_sys::Promise;
 }
 
-fn endpoint(api: &str, path: &str) -> String {
-    format!("/api/{api}?path={}", js_sys::encode_uri_component(path))
-}
 /// What stat(2) says of `path`, a link at its end followed.
 async fn stat(path: &str) -> Result<abi::Stat, abi::Error> {
     userland::sys::stat(&sys::HttpSys::default(), path).await
@@ -89,7 +91,7 @@ thread_local! {
     static CHANGED: std::cell::RefCell<std::collections::BTreeSet<String>> = Default::default();
 }
 
-/// The entries of the directory `path`, as ls lists them: through system calls, as user space.
+/// Structured directory entries for Files and completion, read through system calls.
 async fn listing(path: &str) -> Result<Vec<Entry>, String> {
     userland::entries(&sys::HttpSys::default(), path, path)
         .await
@@ -138,16 +140,12 @@ fn upload_progress(entry: &Entry) -> Option<String> {
         (uploaded * 100).checked_div(entry.size).unwrap_or(100)
     ))
 }
-/// When an entry's content changed, as ls -l shows it, as of now.
-pub(crate) fn listed(mtime: u64) -> String {
-    userland::time::listed(mtime, (js_sys::Date::now() / 1000.0) as u64)
-}
 /// What programs write for a terminal: colours, styles and links show as they mean them.
 fn styled(text: String) -> AnyView {
-    if !terminal_worker_core::ansi::escaped(&text) {
+    if !os_core::ansi::escaped(&text) {
         return text.into_any();
     }
-    terminal_worker_core::ansi::parse(&text)
+    os_core::ansi::parse(&text)
         .into_iter()
         .map(|run| {
             let style = run.style.css();
@@ -162,6 +160,7 @@ fn styled(text: String) -> AnyView {
 
 fn render_line(line: LogLine) -> AnyView {
     match line {
+        LogLine::Screen(screen, live) => terminal::view(screen, live).into_any(),
         LogLine::Text(text) => view! { <pre class="output-line">{styled(text)}</pre> }.into_any(),
         // A program's output as it writes it, its last line ended or not.
         LogLine::Live(text) => view! { <pre class="output-line">{move || text.with(|text| styled(text.trim_end_matches('\n').to_string()))}</pre> }.into_any(),
@@ -169,18 +168,7 @@ fn render_line(line: LogLine) -> AnyView {
             let symbol = if user == "root" { " # " } else { " $ " };
             view! { <pre class="command-echo"><span class="prompt-user">{user}</span><span class="prompt-separator">":"</span><span class="prompt-path">{cwd}</span><span class="prompt-symbol">{symbol}</span><span class="prompt-command">{command}</span></pre> }.into_any()
         }
-        LogLine::Listing { entries, long } => {
-            view! { <pre class=if long { "listing-output listing-long" } else { "listing-output" }>
-                {entries.into_iter().map(|entry| {
-                    let class = if entry.link.is_some() { "listing-entry entry-link" } else if entry.directory { "listing-entry entry-directory" } else if entry.mode & 0o111 != 0 { "listing-entry entry-executable" } else { "listing-entry entry-file" };
-                    let class = if entry.denied { format!("{class} entry-denied") } else { class.to_string() };
-                    let meta = if long { format!("{} {:>2} {}:{} {:>6} {} ", entry.mode_line(), entry.links, entry.owner, entry.group, entry.size, listed(entry.mtime)) } else { String::new() };
-                    let uploading = upload_progress(&entry).map(|p| format!(" {p}"));
-                    let suffix = entry.suffix();
-                    view! { <span class=class>{file_icon(&entry.kind, entry.directory)}<span class="ls-meta">{meta}</span><span class="ls-name">{entry.name}{suffix}</span><span class="ls-uploading">{uploading}</span></span> }
-                }).collect_view()}
-            </pre> }.into_any()
-        }
+
     }
 }
 
@@ -191,7 +179,7 @@ thread_local! {
     static TABS: RefCell<Option<Tabs>> = const { RefCell::new(None) };
 }
 /// Where the tabs are kept for this browser tab, across reloads.
-const SAVED: &str = "terminal-tabs";
+const SAVED: &str = "os-tabs";
 pub(crate) fn session_storage() -> Option<web_sys::Storage> {
     // Storage can be missing or refused, as in private windows; tabs then are not kept.
     web_sys::window()?.session_storage().ok().flatten()
@@ -252,38 +240,25 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
         }
     });
     view! {
-        <section class="terminal-panel" aria-label="Terminal" hidden=move || !current()>
+        <section class="terminal-panel" data-terminal=id data-pty=move || shell.terminal_active.get().to_string() aria-label="Terminal" hidden=move || !current()>
         // A tap on the transcript, as on a phone, goes to the command line, unless it selects text.
         <div class="transcript" role="log" aria-live="polite" on:click=move |_| {
             let selecting = web_sys::window().and_then(|w| w.get_selection().ok().flatten()).is_some_and(|s| !s.is_collapsed());
             if !selecting { focus_input(); }
-        }>{move || shell.lines.get().into_iter().map(render_line).collect_view()}</div>
-        <Show when=move || shell.completion.get().is_some() || !shell.completion_status.get().is_empty()>
-            <div class="completion-pager">
-                <p class="completion-hint" role="status">{move || shell.completion.get().map(|s| match s.selected {
-                    Some(index) => format!("{} / {} · Tab next · Shift+Tab previous · → accept · Esc cancel", index + 1, s.candidates.len()),
-                    None => format!("{} matches · type to narrow · Tab pick · Esc close", s.candidates.len()),
-                }).unwrap_or_else(|| shell.completion_status.get())}</p>
-                <div id=move || current().then_some("completions") class="completion-options" role="listbox" aria-label="Completions">
-                    {move || shell.completion.get().map(|s| s.candidates.into_iter().enumerate().map(|(index, candidate)| {
-                        view! { <button type="button" role="option" tabindex="-1" id=format!("completion-{id}-{index}") aria-selected=move || shell.completion.with(|s| s.as_ref().is_some_and(|s| s.selected == Some(index))).to_string()
-                            on:mousedown=move |e| e.prevent_default()
-                            on:click=move |_| { shell.select_completion(index); shell.accept_completion(); }>
-                            <span>{candidate.label}</span><small>{candidate.kind}</small>
-                        </button> }
-                    }).collect_view())}
-                </div>
-            </div>
-        </Show>
-        <form class="command-line" on:submit=move |event| { event.prevent_default(); shell.enter(shell.input.get_untracked()); }>
-            <label for=move || current().then_some("command")><span class="prompt-user">{move || shell.account.username.get()}</span><span class="prompt-separator">":"</span><span class="prompt-path">{move || shell.cwd.get()}</span><span class="prompt-symbol">{move || if shell.asking.get() { " ?" } else if shell.account.username.get() == "root" { " #" } else { " $" }}</span></label>
-            <input id=move || current().then_some("command") class="command-input" aria-label="Terminal command" autocomplete="off" spellcheck="false" autocapitalize="off" enterkeyhint="go" prop:value=move || shell.input.get()
+        }>{move || shell.lines.get().into_iter().map(render_line).collect_view()}
+        <form class="command-line" aria-busy=move || shell.busy.get().to_string() data-state=move || if shell.reading.get() { "input" } else if shell.busy.get() { "running" } else { "idle" } on:submit=move |event| { event.prevent_default(); shell.enter(shell.input.get_untracked()); }>
+            <label hidden=move || shell.busy.get() for=move || current().then_some("command")><span class="prompt-user">{move || shell.account.username.get()}</span><span class="prompt-separator">":"</span><span class="prompt-path">{move || shell.cwd.get()}</span><span class="prompt-symbol">{move || if shell.account.username.get() == "root" { " #" } else { " $" }}</span></label>
+            <input id=move || current().then_some("command") class="command-input" type=move || if shell.tty_echo.get() { "text" } else { "password" } aria-label="Terminal command" autocomplete="off" spellcheck="false" autocapitalize="off" enterkeyhint="go" prop:value=move || shell.input.get()
                 role="combobox" aria-autocomplete="list" aria-controls=move || current().then_some("completions")
                 aria-expanded=move || shell.completion.get().is_some().to_string()
                 aria-activedescendant=move || shell.completion.get().and_then(|s| s.selected).map(|index| format!("completion-{id}-{index}"))
-                on:input=move |e| { shell.reset_completion(); shell.input.set(event_target_value(&e)); }
+                on:input=move |e| { if !e.dyn_ref::<web_sys::InputEvent>().is_some_and(|e| e.is_composing()) { shell.typed(event_target_value(&e)); } }
+                on:paste=move |e: web_sys::ClipboardEvent| {
+                    if let Some(data) = e.clipboard_data().and_then(|data| data.get_data("text/plain").ok()) && shell.paste(data) { e.prevent_default(); }
+                }
                 on:keydown=move |e| {
                     if e.is_composing() { return; }
+                    if shell.terminal_key(&e) { e.prevent_default(); return; }
                     if e.ctrl_key() && !e.alt_key() && !e.meta_key() && !e.shift_key() && e.key().eq_ignore_ascii_case("c") {
                         e.prevent_default();
                         shell.interrupt();
@@ -309,16 +284,34 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
                     }
                 }
                 node_ref=command_input/>
-            <span class="busy">{move || if shell.asking.get() { "Answer ↵" } else if shell.reading.get() { "Input ↵" } else if shell.busy.get() { "Working..." } else { "↵" }}</span>
         </form>
+        </div>
+        <Show when=move || shell.completion.get().is_some() || !shell.completion_status.get().is_empty()>
+            <div class="completion-pager">
+                <p class="completion-hint" role="status">{move || shell.completion.get().map(|s| match s.selected {
+                    Some(index) => format!("{} / {} · Tab next · Shift+Tab previous · → accept · Esc cancel", index + 1, s.candidates.len()),
+                    None => format!("{} matches · type to narrow · Tab pick · Esc close", s.candidates.len()),
+                }).unwrap_or_else(|| shell.completion_status.get())}</p>
+                <div id=move || current().then_some("completions") class="completion-options" role="listbox" aria-label="Completions">
+                    {move || shell.completion.get().map(|s| s.candidates.into_iter().enumerate().map(|(index, candidate)| {
+                        view! { <button type="button" role="option" tabindex="-1" id=format!("completion-{id}-{index}") aria-selected=move || shell.completion.with(|s| s.as_ref().is_some_and(|s| s.selected == Some(index))).to_string()
+                            on:mousedown=move |e| e.prevent_default()
+                            on:click=move |_| { shell.select_completion(index); shell.accept_completion(); }>
+                            <span>{candidate.label}</span><small>{candidate.kind}</small>
+                        </button> }
+                    }).collect_view())}
+                </div>
+            </div>
+        </Show>
+
         // The keys a phone's keyboard lacks. Pressing one keeps the focus, and the keyboard, where
         // they are.
         <div class="touch-keys" aria-label="Terminal keys" on:pointerdown=move |e| e.prevent_default()>
-            <button type="button" aria-label="Tab: complete" on:click=move |_| { focus_input(); shell.complete(false); }>"Tab"</button>
-            <button type="button" aria-label="Previous command" on:click=move |_| { focus_input(); if shell.completion.get_untracked().is_some() { shell.complete(true) } else { shell.recall(true) } }>"↑"</button>
-            <button type="button" aria-label="Next command" on:click=move |_| { focus_input(); if shell.completion.get_untracked().is_some() { shell.complete(false) } else { shell.recall(false) } }>"↓"</button>
+            <button type="button" aria-label="Tab: complete" on:click=move |_| { focus_input(); if !shell.send_terminal("\t") { shell.complete(false); } }>"Tab"</button>
+            <button type="button" aria-label="Previous command" on:click=move |_| { focus_input(); if !shell.send_terminal("\x1b[A") { if shell.completion.get_untracked().is_some() { shell.complete(true) } else { shell.recall(true) } } }>"↑"</button>
+            <button type="button" aria-label="Next command" on:click=move |_| { focus_input(); if !shell.send_terminal("\x1b[B") { if shell.completion.get_untracked().is_some() { shell.complete(false) } else { shell.recall(false) } } }>"↓"</button>
             <button type="button" aria-label="Ctrl+D: end of input" on:click=move |_| { focus_input(); shell.end_of_input(); }>"^D"</button>
-            <button type="button" aria-label="Ctrl+C: stop" class="touch-stop" on:click=move |_| { focus_input(); shell.interrupt(); }>"^C"</button>
+            <button type="button" aria-label="Ctrl+C: stop" class="touch-stop" on:click=move |_| { focus_input(); if !shell.send_terminal("\x03") { shell.interrupt(); } }>"^C"</button>
         </div>
         </section>
     }
@@ -327,11 +320,8 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
 #[component]
 fn App() -> impl IntoView {
     let branding: serde_json::Value =
-        serde_wasm_bindgen::from_value(config()).expect("terminal branding");
-    let title = branding["name"]
-        .as_str()
-        .unwrap_or("R2 TERMINAL")
-        .to_owned();
+        serde_wasm_bindgen::from_value(config()).expect("OS branding");
+    let title = branding["name"].as_str().unwrap_or("OS").to_owned();
     let subtitle = branding["subtitle"].as_str().unwrap_or("").to_owned();
     let heading = branding["heading"].as_str().unwrap_or("").to_owned();
     let description = branding["description"].as_str().unwrap_or("").to_owned();
@@ -360,9 +350,6 @@ fn App() -> impl IntoView {
         .collect();
     first[0].log("Connected as guest. Access follows account and rwx permissions.\nEnter help or open a file.");
     let active = RwSignal::new(first[saved_active].id);
-    // The Files app keeps a directory of its own, from where the terminal starts.
-    let files = files::Files::new(account, first[saved_active].cwd.get_untracked());
-    files.refresh();
     let tabs = RwSignal::new(first);
     TABS.with(|t| *t.borrow_mut() = Some((tabs, active)));
     let current = Signal::derive(move || {
@@ -373,6 +360,29 @@ fn App() -> impl IntoView {
                 .unwrap_or(t[0])
         })
     });
+    // A program clicked in Files uses an idle terminal, or a new tab when one is occupied.
+    let files = files::Files::new(
+        account,
+        current.get_untracked().cwd.get_untracked(),
+        Callback::new(move |path: String| {
+            let mut shell = current.get_untracked();
+            if shell.busy.get_untracked() || !shell.input.get_untracked().is_empty() {
+                if tabs.with_untracked(Vec::len) >= 9 {
+                    return Err(
+                        "Close an unused terminal tab before launching another program".into(),
+                    );
+                }
+                shell = make(shell.cwd.get_untracked(), Vec::new());
+                tabs.update(|tabs| tabs.push(shell));
+                active.set(shell.id);
+            }
+            desktop.show("terminal");
+            shell.run(os_core::completion::escape_path(&path));
+            focus_launched_program();
+            Ok(())
+        }),
+    );
+    files.refresh();
     let switch = move |id: u64| {
         active.set(id);
         let shell = current.get_untracked();
@@ -458,7 +468,7 @@ fn App() -> impl IntoView {
     );
     let window = web_sys::window().unwrap();
     window
-        .add_event_listener_with_callback("terminal:changed", listener.as_ref().unchecked_ref())
+        .add_event_listener_with_callback("os:changed", listener.as_ref().unchecked_ref())
         .unwrap();
     listener.forget();
     // What the kernel told of the directories this page watches: their answers go at once,
@@ -470,7 +480,7 @@ fn App() -> impl IntoView {
         CHANGED.with(|changed| changed.borrow_mut().extend(dirs));
     });
     window
-        .add_event_listener_with_callback("terminal:inotify", told.as_ref().unchecked_ref())
+        .add_event_listener_with_callback("os:inotify", told.as_ref().unchecked_ref())
         .unwrap();
     told.forget();
     let remote = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_: web_sys::CustomEvent| {
@@ -480,7 +490,7 @@ fn App() -> impl IntoView {
         }
     });
     window
-        .add_event_listener_with_callback("terminal-remote", remote.as_ref().unchecked_ref())
+        .add_event_listener_with_callback("os-remote", remote.as_ref().unchecked_ref())
         .unwrap();
     remote.forget();
     // Files dropped on the page upload in the active tab; dropped on the Files, into its
@@ -490,7 +500,7 @@ fn App() -> impl IntoView {
             current.get_untracked().upload_dropped(e.detail());
         });
     window
-        .add_event_listener_with_callback("terminal-files", dropped.as_ref().unchecked_ref())
+        .add_event_listener_with_callback("os-files", dropped.as_ref().unchecked_ref())
         .unwrap();
     dropped.forget();
     let dropped_on_files =
@@ -594,7 +604,7 @@ fn App() -> impl IntoView {
                                 view! {
                                     <span class="tab" role="tab" aria-selected=move || (active.get() == id).to_string()>
                                         <button type="button" class="tab-select" title=move || format!("Alt+{} · {}", index + 1, shell.cwd.get()) on:click=move |_| switch(id)>
-                                            {move || format!("{} {}{}", index + 1, shell.cwd.get().rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("/"), if shell.busy.get() { " ●" } else { "" })}
+                                            {move || format!("{} {}", index + 1, shell.cwd.get().rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("/"))}
                                         </button>
                                         <Show when=move || { tabs.with(|t| t.len() > 1) }>
                                             <button type="button" class="tab-close" aria-label=format!("Close tab {}", index + 1) on:click=move |_| close_tab(id)>"×"</button>

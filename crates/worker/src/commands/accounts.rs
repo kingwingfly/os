@@ -5,10 +5,10 @@
 //! terminal's dialog asks for.
 
 use crate::db::Db;
-use terminal_worker_core::cli::accounts as args;
-use terminal_worker_core::parent;
-use terminal_worker_core::permissions::Id as Next;
-use terminal_worker_core::permissions::*;
+use os_core::cli::accounts as args;
+use os_core::parent;
+use os_core::permissions::Id as Next;
+use os_core::permissions::*;
 
 use super::{absolute_home, group, groups, named_group, protect_home};
 

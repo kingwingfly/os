@@ -1,7 +1,7 @@
 // The loader (owner's design, issue #20 phase 2): what an exec's image becomes. A module is
 // compiled once per immutable content (the exec's `version`, the file's content id; an asset's
 // path for /usr), concurrent compiles sharing one promise, and validated: only the imports the
-// engine provides (WASI preview 1, terminal.sys, WASIX), a `_start`, and a memory. Anything
+// engine provides (WASI preview 1, os.sys, WASIX), a `_start`, and a memory. Anything
 // else cannot execute, as Linux's loader says (ENOEXEC); what the kernel checked (the X rule)
 // is not asked again: its exec token is the leave to read the image.
 //
@@ -15,9 +15,9 @@
 // How many modules stay compiled at once; the oldest goes past that (LRU).
 const CACHE_MAX = 8;
 // The import namespaces a process may ask for (web/wasi/process.js, the WASIX runtime): WASI
-// preview 1 and the kernel's own terminal.sys; WASIX's (what a process here has no words for,
+// preview 1 and the kernel's own os.sys; WASIX's (what a process here has no words for,
 // threads and sockets, answers ENOSYS). env's memory, which WASIX modules import.
-const NAMESPACES = new Set(['wasi_snapshot_preview1', 'terminal', 'wasix_32v1']);
+const NAMESPACES = new Set(['wasi_snapshot_preview1', 'os', 'terminal', 'wasix_32v1']);
 const MEMORY = { module: 'env', name: 'memory' };
 // The imports that unwind the stack, which asyncify is for.
 const UNWINDS = new Set(['proc_fork', 'stack_checkpoint', 'stack_restore']);
@@ -117,7 +117,7 @@ const fail = why => {
   throw formatError(new Error(why));
 };
 
-// The imports a process may ask for, as their kinds too: WASI, terminal.sys and WASIX are
+// The imports a process may ask for, as their kinds too: WASI, os.sys and WASIX are
 // functions; the only memory is WASIX's env.memory. Returns whether the image imports one.
 function validateImports(imports) {
   let memory = false;

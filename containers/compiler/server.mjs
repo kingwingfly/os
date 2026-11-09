@@ -10,7 +10,7 @@ if (!isMainThread) {
     const original = await WebAssembly.compile(workerData);
     const imports = WebAssembly.Module.imports(original);
     for (const entry of imports) {
-      if (entry.kind === 'function' && ['wasi_snapshot_preview1', 'terminal', 'wasix_32v1'].includes(entry.module)) continue;
+      if (entry.kind === 'function' && ['wasi_snapshot_preview1', 'os', 'terminal', 'wasix_32v1'].includes(entry.module)) continue;
       if (entry.kind === 'memory' && entry.module === 'env' && entry.name === 'memory') continue;
       throw new Error(`unsupported import ${entry.module}.${entry.name}`);
     }

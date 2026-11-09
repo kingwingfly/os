@@ -9,9 +9,9 @@ use crate::creds::Credential;
 use crate::db::{Db, transact};
 use abi::{BATCH_MAX, Batch, Call, Creds, Data, Errno, Error, FdRef, INLINE_MAX, Results, Return};
 use kernel::Process;
+use os_core::permissions::*;
 use serde_json::json;
 use std::rc::Rc;
-use terminal_worker_core::permissions::*;
 use worker::*;
 
 pub async fn handle(
@@ -48,7 +48,7 @@ pub async fn handle(
         key: key.clone(),
         guest: guest.clone(),
         sudo: batch.sudo,
-        umask: batch.umask & 0o777,
+        umask: batch.umask.map(|mask| mask & 0o777),
         pid: batch.pid,
         token: batch.process.clone(),
     });
@@ -76,6 +76,24 @@ pub async fn handle(
     while let Some(mut call) = calls.next() {
         // The process registry's calls are the browser's machine's (machine.rs): those in a row
         // go there at once, with the caller found here.
+        if call.is_registry() && session.token.is_some() {
+            let checking = session.clone();
+            let remote = transact(state, move |db| {
+                (
+                    checking
+                        .of(db)
+                        .ok()
+                        .and_then(|a| a.credential)
+                        .and_then(|c| c.job())
+                        .is_some(),
+                    false,
+                )
+            })?;
+            if remote {
+                results.push(Return::Err(Errno::EPERM.into()));
+                continue;
+            }
+        }
         if call.is_registry() {
             let mut registry = vec![call];
             while calls.peek().is_some_and(Call::is_registry) {
@@ -131,13 +149,12 @@ pub async fn handle(
             continue;
         }
         let logout = matches!(call, Call::Logout);
-        // A job spawned or signalled: its runner wakes. A numeric pid is a registry process's,
+        // A remote task signalled: its runner wakes. A numeric pid is a registry process's,
         // which has no runner.
         let wakes = match &call {
             Call::Kill { pid, .. } if matches!(abi::Target::of(pid), abi::Target::Job(_)) => {
                 Some(pid.clone())
             }
-            Call::Spawn { .. } => Some(String::new()),
             _ => None,
         };
         // A listing or file of /proc tells of the browser's processes, as its machine has them.
@@ -167,26 +184,25 @@ pub async fn handle(
             cookie = Some(auth::cookie(https, "", 0));
         }
         let mut result = result;
-        if let (Some(pid), Return::Ok(value)) = (wakes, &mut result) {
-            let pid = value["pid"].as_str().map(str::to_string).unwrap_or(pid);
-            // A job spawned: its token is its runner's alone, not the page's. A runner that did
-            // not hear of it never will, as nobody else has the token: the job fails now,
-            // rather than wait a week to be cancelled.
-            let token = value
+        // A driver's private executor envelope never crosses the public syscall boundary.
+        if let Return::Ok(value) = &mut result
+            && let Some(launch) = value
                 .as_object_mut()
-                .and_then(|value| value.remove("token"));
-            let spawned = token.is_some();
-            if !crate::api::kick(env, &json!({ "job": pid, "token": token })).await && spawned {
-                let pid = pid.clone();
+                .and_then(|value| value.remove("_launch"))
+        {
+            let spawned = launch["token"].as_str().is_some();
+            if !crate::api::kick(env, &launch).await && spawned {
+                let id = launch["job"].as_str().unwrap_or_default().to_string();
                 transact(state, move |db| {
-                    db.add_lines(
-                        &pid,
-                        &[(true, "The job's runner could not be started".into())],
-                    );
-                    crate::jobs::finish(db, &pid, "failed");
+                    db.add_lines(&id, &[(true, "The executor could not be started".into())]);
+                    crate::executor::finish(db, &id, "failed");
                     ((), true)
                 })?;
             }
+        }
+        if let (Some(pid), Return::Ok(value)) = (wakes, &mut result) {
+            let pid = value["pid"].as_str().map(str::to_string).unwrap_or(pid);
+            crate::api::kick(env, &json!({ "job": pid })).await;
         }
         results.push(result);
     }
@@ -255,7 +271,7 @@ pub struct Session {
     pub key: Option<String>,
     pub guest: Option<String>,
     pub sudo: bool,
-    pub umask: u16,
+    pub umask: Option<u16>,
     pub pid: Option<u32>,
     pub token: Option<String>,
 }
@@ -292,7 +308,10 @@ impl Session {
                 (
                     Process {
                         cred: credential.identity(),
-                        umask: credential.umask,
+                        // The runtime owns its mutable creation mask. Identity still comes
+                        // only from the authenticated credential snapshot. Omitted masks
+                        // retain that snapshot (including archive runner requests).
+                        umask: self.umask.unwrap_or(credential.umask),
                     },
                     Some(credential),
                 )
@@ -303,7 +322,7 @@ impl Session {
                     self.key.as_deref(),
                     self.guest.as_deref(),
                     self.sudo,
-                    self.umask,
+                    self.umask.unwrap_or(0o022),
                 )?,
                 None,
             ),
@@ -394,6 +413,9 @@ async fn bytes(
                 let (asking, path, listed) = (session.clone(), path.clone(), procs.clone());
                 let read = transact(state, move |db| {
                     let read = asking.of(db).and_then(|acting| {
+                        if acting.credential.as_ref().and_then(|c| c.job()).is_some() {
+                            return Err(Errno::EPERM.into());
+                        }
                         crate::fds::pread(
                             db,
                             acting.sid.as_deref(),
@@ -452,57 +474,24 @@ async fn bytes(
                 return Err(too_many());
             }
             let fd = fd.number();
-            // What the descriptor writes to: a process's standard input, which what it is
-            // written goes to, and wakes; or a file, a chunk of which goes to R2.
-            enum Target {
-                Stdin(String, serde_json::Value),
-                Chunk(String, String),
-            }
             let asking = session.clone();
-            let bytes = data.0.clone();
-            let target = transact(state, move |db| {
+            let (object, mime) = transact(state, move |db| {
                 let target = asking.of(db).and_then(|acting| {
-                    let (process, proc) = (&acting.process, acting.owner());
-                    let sid = acting.sid.clone().ok_or(Errno::EBADF)?;
-                    let stdin = db
-                        .fd(&sid, fd)
-                        .and_then(|found| crate::jobs::stdin_pid(&found.path).map(str::to_string));
-                    match stdin {
-                        Some(pid) => {
-                            // The job's owner as Spawn made it: a guest's own uid, not 65534.
-                            let owner = owner(
-                                db,
-                                asking.key.as_deref(),
-                                asking.guest.as_deref(),
-                                proc.is_some(),
-                                process,
-                            );
-                            crate::jobs::answer(db, owner, process, &pid, &bytes)
-                                .map(|value| Target::Stdin(pid, value))
-                        }
-                        None => crate::fds::pwrite(
-                            db,
-                            &sid,
-                            &process.cred,
-                            fd,
-                            index,
-                            length,
-                            proc.as_deref(),
-                        )
-                        .map(|(object, mime)| Target::Chunk(object, mime)),
-                    }
+                    let sid = acting.sid.as_deref().ok_or(Errno::EBADF)?;
+                    crate::fds::pwrite(
+                        db,
+                        sid,
+                        &acting.process.cred,
+                        fd,
+                        index,
+                        length,
+                        acting.owner().as_deref(),
+                    )
                 });
                 let commit = target.is_ok();
                 (target, commit)
             })
             .map_err(io)??;
-            let (object, mime) = match target {
-                Target::Stdin(pid, value) => {
-                    crate::api::kick(env, &json!({ "job": pid })).await;
-                    return Ok(value);
-                }
-                Target::Chunk(object, mime) => (object, mime),
-            };
             env.bucket("FILES")
                 .map_err(io)?
                 .put(&object, data.0)
@@ -688,6 +677,9 @@ fn run(
 ) -> std::result::Result<serde_json::Value, Error> {
     let (key, guest) = (session.key.as_deref(), session.guest.as_deref());
     let (process, sid, caller) = (&acting.process, acting.sid.as_deref(), &acting.credential);
+    if let Some(credential) = caller {
+        crate::executor::authorize(db, credential, &call)?;
+    }
     // A process acts as itself: it cannot sign the browser in or out, or mint sudo.
     if caller.is_some() && matches!(call, Call::Logout) {
         return Err(Error::because(
@@ -774,15 +766,11 @@ fn run(
         | Call::Groupmod { .. }
         | Call::Groupdel { .. }) => account(db, &process.cred, call),
         Call::Getcreds => Ok(json!(creds(db, key, &process.cred))),
-        call @ (Call::Spawn { .. } | Call::Kill { .. } | Call::Wait { .. }) => {
+        call @ (Call::Kill { .. } | Call::Wait { .. }) => {
             // A job is its account's, not root's under sudo: the tab follows it, answers it and
             // cancels it without sudo, and `~` is the account's home.
             let owner = owner(db, key, guest, caller.is_some(), process);
-            let home = db
-                .user_by_id(owner)
-                .map(|(_, user)| user.home)
-                .unwrap_or_else(|| "/".into());
-            crate::jobs::call(db, owner, &home, sid, process, call)
+            crate::executor::call(db, owner, process, call)
         }
         call @ (Call::Open { .. }
         | Call::Close { .. }
@@ -835,8 +823,7 @@ fn paths(call: &mut Call) -> Vec<(&mut String, bool)> {
         | Call::Statfs { path }
         | Call::Pread {
             path: Some(path), ..
-        }
-        | Call::Spawn { cwd: path, .. } => vec![(path, true)],
+        } => vec![(path, true)],
         Call::Lstat { path }
         | Call::Readlink { path }
         | Call::Mkdir { path, .. }
@@ -1180,7 +1167,7 @@ fn account(
     call: Call,
 ) -> std::result::Result<serde_json::Value, Error> {
     use crate::commands::accounts;
-    use terminal_worker_core::cli::accounts as args;
+    use os_core::cli::accounts as args;
     let done = match call {
         Call::Useradd {
             name,

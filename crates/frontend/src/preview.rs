@@ -9,9 +9,9 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 
 use ammonia::{UrlRelative, UrlRelativeEvaluate};
+use os_preview::language::{self, Language};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use pulldown_latex::{RenderConfig, Storage, config::DisplayMode};
-use terminal_worker_preview::language::{self, Language};
 
 /// The most bytes of text shown, ...
 pub const TEXT_MAX: usize = 2_000_000;
@@ -42,7 +42,7 @@ pub enum Kind {
         source: String,
     },
     /// Text, highlighted as the language of this name in
-    /// [`LANGUAGES`](terminal_worker_preview::language::LANGUAGES), if any, unless too long.
+    /// [`LANGUAGES`](os_preview::language::LANGUAGES), if any, unless too long.
     Code {
         text: String,
         language: Option<&'static str>,
@@ -304,7 +304,7 @@ impl<'a> UrlRelativeEvaluate<'a> for Within {
             return None;
         }
         let relative = percent_decode(url.split(['?', '#']).next()?)?;
-        let file = terminal_worker_core::resolve(&self.0, &relative).ok()?;
+        let file = os_core::resolve(&self.0, &relative).ok()?;
         Some(file_url(&file).into())
     }
 }
@@ -809,7 +809,7 @@ mod test {
             let extensions = language.extensions.iter().map(|e| format!("/a.{e}"));
             let files = language.files.iter().filter(|f| !f.starts_with('.'));
             for path in extensions.chain(files.map(|f| format!("/{f}"))) {
-                assert_ne!(terminal_worker_core::kind(&path), "unknown", "{path}");
+                assert_ne!(os_core::kind(&path), "unknown", "{path}");
             }
         }
     }

@@ -1,7 +1,7 @@
 use super::*;
 use abi::{ACL_ACCESS, ACL_DEFAULT, O_DIRECTORY, O_TRUNC, O_WRONLY, XATTR_CREATE};
+use os_core::acl::Entries;
 use std::collections::BTreeSet;
-use terminal_worker_core::acl::Entries;
 
 fn user(id: u32, groups: &[u32]) -> Identity {
     Identity {
@@ -225,6 +225,21 @@ fn open_follows_a_link_to_what_it_names_and_checks_as_linux_does() {
         Ok(Opening::Existing { .. })
     ));
     assert_eq!(errno(open(&fs, &ann, "/d", O_WRONLY, 0)), Errno::EISDIR);
+    // O_PATH anchors a later operation without granting directory reads. An execute-only
+    // parent remains traversable; every later operation still performs its own checks.
+    dir(&mut fs, "/search", 0, 0o111);
+    assert_eq!(
+        errno(open(&fs, &ann, "/search", O_RDONLY, 0)),
+        Errno::EACCES
+    );
+    assert!(matches!(
+        open(&fs, &ann, "/search", abi::O_PATH | O_DIRECTORY, 0),
+        Ok(Opening::Existing { .. })
+    ));
+    assert_eq!(
+        errno(open(&fs, &ann, "/d/r", abi::O_PATH | O_DIRECTORY, 0)),
+        Errno::ENOTDIR
+    );
     assert_eq!(
         errno(open(&fs, &ann, "/d/missing", O_DIRECTORY, 0)),
         Errno::ENOENT

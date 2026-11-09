@@ -15,11 +15,11 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use os_core::archive::Format;
+use os_jobs::faststart::{Outcome, faststart};
+use os_jobs::{Input, VERSION, build, chunk_hashes, list};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use terminal_worker_core::archive::Format;
-use terminal_worker_jobs::faststart::{Outcome, faststart};
-use terminal_worker_jobs::{Input, VERSION, build, chunk_hashes, list};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 type Reply = Response<Box<dyn Read + Send>>;

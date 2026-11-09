@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, call, descriptors, entry, errno, mkdirp, names, program, put, rmrf, sys } from './sys.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const vars = await readFile('.dev.vars', 'utf8');
 const rootPassword = vars.match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -12,12 +12,12 @@ test.use({ launchOptions: { env: browserEnv, args: ['--ozone-platform=headless',
 let sequence = 0;
 const address = name => `live-${name}-${Date.now()}-${++sequence}`;
 
-const busy = page => page.locator('.terminal-panel:not([hidden]) .busy');
+const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const transcript = page => page.locator('.terminal-panel:not([hidden]) .transcript');
 const shown = page => page.locator('.slides-current .slide:visible');
 const player = page => page.getByRole('region', { name: 'Live sound' });
 async function run(page, text) {
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill(text); await input.press('Enter');
 }
@@ -81,7 +81,9 @@ test('Present in the bar makes /dev/present/NAME; rm of it stops it, as its acco
     expect(await listed('/dev/present')).toContain(stem);
     // Another account, here everyone signed out, may not remove it.
     await run(guest.page, `rm /dev/present/${stem}`);
-    await expect(transcript(guest.page)).toContainText('Permission denied: it is another account\'s');
+    // PTY wrapping may split a word; the program's diagnostic must still be intact.
+    await expect.poll(async () => (await transcript(guest.page).innerText()).replace(/\s+/g, ''))
+      .toContain("Permissiondenied:itisanotheraccount's");
     expect(await errno(guest.context.request, { unlink: { path: `/dev/present/${stem}` } })).toBe('EACCES');
     await run(guest.page, `open /dev/present/${stem}`);
     await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
@@ -118,10 +120,12 @@ test('a presentation is a character device: ls -l and cat tell of it; chmod deci
     await expect(shown(laptop.page).locator('h1')).toHaveText('One');
     await laptop.page.getByRole('button', { name: 'Close preview' }).click();
     // Its presenter's, made as a file is, with the file's mode.
+    // These outputs are single logical lines; remove physical terminal-grid wraps.
+    const unwrapped = async () => (await transcript(guest.page).locator('pre').last().innerText()).replace(/\n/g, '');
     await run(guest.page, `ls -l ${device_}`);
-    await expect(transcript(guest.page)).toContainText(new RegExp(`crw-r--r-- +1 ${name}:${name} +0 [A-Z][a-z]{2} [ \\d]\\d [ \\d:]{5} ${device_}`));
+    await expect.poll(unwrapped).toMatch(new RegExp(`crw-r--r-- +1 ${name} +${name} +0 [A-Z][a-z]{2} [ \\d]\\d [ \\d:]{5} ${device_}`));
     await run(guest.page, `cat ${device_}`);
-    await expect(transcript(guest.page)).toContainText(`"path":"${path}"`);
+    await expect.poll(unwrapped).toContain(`"path":"${path}"`);
     // Its mode says who follows it: chmod 600, and guests may not.
     await run(laptop.page, `chmod 600 ${device_}`);
     await expect.poll(async () => ((await sys(guest.context.request, [{ stat: { path: device_ } }]))[0].ok?.mode ?? 0) & 0o777).toBe(0o600);

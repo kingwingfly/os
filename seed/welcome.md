@@ -1,4 +1,4 @@
-# R2 Terminal / File terminal
+# OS
 
 Access follows account, group, and rwx permissions. Anonymous visitors use guest.
 

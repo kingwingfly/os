@@ -1,18 +1,15 @@
-//! Jobs, as the authority sees them: zip, unzip, tar and faststart start one, whose work a
-//! JobRunner Durable Object does with a container (runner.rs). A job is a process (Phase 4,
-//! issue #20): `Spawn` snapshots who started it (root under sudo) into credentials of its own
-//! (creds.rs `JOBS`), whose token only its runner holds, and the runner makes the job's file
-//! calls through the system calls with it, checked as any process's are. What becomes of the
-//! account afterwards (locked, deleted) does not change a job that runs, as on Linux.
+//! Archive/media resource preparation for the typed accelerator drivers. Inputs are pinned
+//! at submission and writes retain per-member filesystem authorization. CLI parsing lives
+//! in executable user space; generic credentials, lifetime and revocation live in executor.rs.
 use std::collections::{BTreeMap, BTreeSet};
 
+use os_core::archive::{self, ENTRIES_MAX, Job as Command};
+use os_core::permissions::*;
+use os_core::{MAX_FILE, kind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use terminal_worker_core::archive::{self, ENTRIES_MAX, Job as Command};
-use terminal_worker_core::permissions::*;
-use terminal_worker_core::{MAX_FILE, kind};
 
-use crate::commands::{self, command_path};
+use crate::commands;
 use crate::db::{Db, Job};
 
 /// An archive a job reads.
@@ -97,44 +94,23 @@ fn source(db: &Db, who: &Identity, cmd: &str, path: &str) -> Result<Source, Stri
 fn inputs(
     db: &Db,
     who: &Identity,
-    command: &commands::Command,
     cmd: &str,
     paths: &[String],
     recursive: bool,
     links: bool,
     output: &str,
-    directory: Option<&str>,
+    stored: &[String],
 ) -> Result<(Vec<Input>, Vec<String>), String> {
-    let within;
-    let command = match directory {
-        Some(typed) => {
-            let dir = command_path(db, who, command, typed).map_err(|e| format!("{cmd}: {e}"))?;
-            let node = db
-                .access(who, &dir, EXEC)
-                .map_err(|e| format!("{cmd}: {typed}: {e}"))?;
-            if !node.directory {
-                return Err(format!("{cmd}: {typed}: Cannot open: Not a directory"));
-            }
-            within = commands::Command {
-                args: Vec::new(),
-                cwd: dir,
-                sudo: command.sudo,
-                home: command.home.clone(),
-            };
-            &within
-        }
-        None => command,
-    };
     let mut members = Vec::new();
     let mut warnings = Vec::new();
     let mut names = BTreeSet::new();
     // The first member each inode was stored as, for its other names.
     let mut first: BTreeMap<u64, String> = BTreeMap::new();
-    for typed in paths {
+    for (index, typed) in paths.iter().enumerate() {
         let found = if links {
-            commands::entry_path(db, who, command, typed)
+            db.physical(who, typed, false)
         } else {
-            command_path(db, who, command, typed)
+            db.physical(who, typed, true)
         };
         let (path, node) = match found.and_then(|p| db.access(who, &p, 0).map(|n| (p, n))) {
             Ok(found) => found,
@@ -144,7 +120,9 @@ fn inputs(
             }
         };
         // Stored as typed, or, for an absolute or home path, without its leading slash.
-        let base = if typed.starts_with('/') || typed.starts_with('~') {
+        let base = if let Some(name) = stored.get(index) {
+            archive::stored_name(name)
+        } else if typed.starts_with('/') || typed.starts_with('~') {
             archive::stored_name(&path)
         } else {
             archive::stored_name(typed)
@@ -301,16 +279,11 @@ pub fn start(
     db: &mut Db,
     who: &Identity,
     owner: u32,
-    command: &commands::Command,
+    cmd: &str,
+    parsed: Command,
+    stored: &[String],
 ) -> Result<Value, String> {
-    let (cmd, args) = command.args.split_first().ok_or("Missing command")?;
-    let parsed = match cmd.as_str() {
-        "zip" => archive::zip_args(args)?,
-        "unzip" => archive::unzip_args(args)?,
-        "faststart" => archive::faststart_args(args)?,
-        _ => archive::tar_args(args)?,
-    };
-    let path = |db: &Db, value: &str| command_path(db, who, command, value);
+    let path = |db: &Db, value: &str| db.physical(who, value, true);
     let now = crate::auth::now();
     let mut spec = Spec {
         command: parsed.clone(),
@@ -329,7 +302,6 @@ pub fn start(
             archive: name,
             paths,
             recursive,
-            directory,
             links,
             ..
         } => {
@@ -356,17 +328,8 @@ pub fn start(
                     .writable_parent(who, &output)
                     .map_err(|e| format!("{cmd}: {e}"))?,
             }
-            let (members, notes) = inputs(
-                db,
-                who,
-                command,
-                cmd,
-                paths,
-                *recursive,
-                *links,
-                &output,
-                directory.as_deref(),
-            )?;
+            let (members, notes) =
+                inputs(db, who, cmd, paths, *recursive, *links, &output, stored)?;
             spec.inputs = members;
             spec.output = Some(output);
             warnings = notes;
@@ -435,6 +398,11 @@ pub fn start(
         }
     }
     let spec_value = serde_json::to_value(&spec).map_err(|e| e.to_string())?;
+    if warnings.iter().map(String::len).sum::<usize>() > abi::accelerator::MAX_OUTPUT_BYTES
+        || spec_value.to_string().len() > abi::accelerator::MAX_OUTPUT_BYTES
+    {
+        return Err("Accelerator snapshot exceeds its bounded resource budget".into());
+    }
     let id = db.create_job(owner, who.id, cmd, &spec_value, now);
     if let Some(source) = &spec.source {
         db.pin(&id, &source.file);
@@ -453,171 +421,29 @@ pub fn start(
     Ok(json!({"job": id, "kind": cmd, "source": spec.source}))
 }
 
-/// The most lines one view of a job carries.
-const LINES_MAX: u32 = 500;
 /// How long a job may wait to run, or be done, before it is cancelled ...
 pub const WAITING: u64 = 7 * 24 * 60 * 60;
 /// ... and for an answer to its question: then nobody is there to give one, as a process whose
 /// terminal closed is hung up.
 pub const UNANSWERED: u64 = 60 * 60;
 
-/// What a job's owner sees of it: its state, progress, question and new lines, a page of them,
-/// and whether more follow, which a job that has ended may still have.
-pub fn view(db: &Db, job: &Job, since: u64) -> Value {
-    let mut lines = db.lines(&job.id, since, LINES_MAX + 1);
-    let more = lines.len() > LINES_MAX as usize;
-    lines.truncate(LINES_MAX as usize);
-    let lines: Vec<Value> = lines
-        .into_iter()
-        .map(|(seq, err, text)| json!([seq, err, text]))
-        .collect();
-    json!({
-        "id": job.id, "kind": job.kind, "state": job.state, "created": job.created,
-        "progress": serde_json::from_str::<Value>(&job.progress).unwrap_or_default(),
-        "question": job.question.as_deref().and_then(|q| serde_json::from_str::<Value>(q).ok()),
-        "lines": lines, "more": more,
-    })
-}
-
-/// End a job: let go of the files it read, revoke its credentials, which closes what it had
-/// open, and keep what it says.
-pub fn finish(db: &mut Db, job: &str, state: &str) {
-    db.set_job(job, crate::db::JobColumn::State, Some(state));
-    db.set_job(job, crate::db::JobColumn::Question, None);
-    db.unpin(job);
-    db.revoke_job(job);
-    db.clear_expiry("job", job);
-}
-
-/// The process calls (owner's design, 2026-10-29): a job is a process of the account signed in
-/// (`owner`), run as `process` (root under sudo).
-pub fn call(
-    db: &mut Db,
-    owner: u32,
-    home: &str,
-    sid: Option<&str>,
-    process: &kernel::Process,
-    call: abi::Call,
-) -> std::result::Result<Value, abi::Error> {
-    use crate::db::JobColumn;
-    use abi::{Call, Errno, Error};
-    let refused = |why: String| {
-        let errno = if commands::is_permission_error(&why) {
-            Errno::EACCES
-        } else {
-            Errno::EINVAL
-        };
-        Error::because(errno, why)
-    };
-    // Its owner's, or root's, to see and signal.
-    let theirs = |db: &Db, pid: &str| -> std::result::Result<Job, Error> {
-        let job = db.job(pid).ok_or(Errno::ESRCH)?;
-        if job.owner != owner && process.cred.id != 0 {
-            return Err(Errno::EPERM.into());
-        }
-        Ok(job)
-    };
-    match call {
-        Call::Spawn { argv, cwd } => {
-            if !matches!(
-                argv.first().map(String::as_str),
-                Some("zip" | "unzip" | "tar" | "faststart")
-            ) {
-                return Err(Errno::ENOENT.into());
-            }
-            let command = commands::Command {
-                args: argv,
-                cwd,
-                sudo: process.cred.id == 0,
-                home: Some(home.to_string()),
-            };
-            let started = start(db, &process.cred, owner, &command).map_err(refused)?;
-            let pid = started["job"].as_str().unwrap_or_default().to_string();
-            // Its standard input, a descriptor of the session that writes it, as a pipe.
-            let sid = sid.ok_or(Errno::EBADF)?;
-            let now = crate::auth::now();
-            let stdin = db.add_fd(sid, None, &stdin_of(&pid), abi::O_WRONLY, false, now);
-            // Its credentials, as the caller's now (root under sudo), for its life; the token is
-            // its runner's alone (sys.rs hands it over and takes it out of the reply).
-            let token = crate::auth::random_token();
-            db.job_credential(
-                &pid,
-                &crate::auth::token_hash(&token),
-                &process.cred,
-                process.umask,
-                now,
-            );
-            // The archive it reads is open as its own, as a process holds what it reads: it
-            // shows in /proc/PID/fd, and closes as the job ends.
-            if let Ok(source) = serde_json::from_value::<Source>(started["source"].clone()) {
-                let session = crate::creds::job_owner(&pid);
-                let fd = db.add_fd(
-                    &session,
-                    Some(&source.file),
-                    &source.path,
-                    abi::O_RDONLY,
-                    false,
-                    now,
-                );
-                db.set_fd_proc(&session, fd, &session);
-            }
-            Ok(json!({ "pid": pid, "kind": started["kind"], "stdin": stdin, "token": token }))
-        }
-        Call::Kill { pid, .. } => {
-            let job = theirs(db, &pid)?;
-            if !job.finished() {
-                db.set_job(&pid, JobColumn::State, Some("cancelling"));
-            }
-            Ok(json!({ "pid": pid, "state": db.job(&pid).map(|job| job.state) }))
-        }
-        Call::Wait { pid, since, .. } => {
-            let job = theirs(db, &pid)?;
-            Ok(view(db, &job, since))
-        }
-        _ => Err(Errno::ENOSYS.into()),
-    }
-}
-
-/// Where a process's standard input is, as its descriptor names it.
-pub fn stdin_of(pid: &str) -> String {
-    format!("/proc/{pid}/fd/0")
-}
-
-/// The process whose standard input `path` is, if it is one's.
-pub fn stdin_pid(path: &str) -> Option<&str> {
-    path.strip_prefix("/proc/")?.strip_suffix("/fd/0")
-}
-
-/// Write `data` to the standard input of the process `pid`, the account `owner`'s (or anyone's
-/// as root): unzip's answers to its question, `{"decisions": {PATH: true|false}}`.
+/// An explicit driver decision for the current conflict list.
 pub fn answer(
     db: &mut Db,
-    owner: u32,
-    process: &kernel::Process,
     pid: &str,
-    data: &[u8],
+    decisions: BTreeMap<String, bool>,
 ) -> std::result::Result<Value, abi::Error> {
     use crate::db::JobColumn;
     use abi::{Errno, Error};
     let job = db.job(pid).ok_or(Errno::EPIPE)?;
-    if job.owner != owner && process.cred.id != 0 {
-        return Err(Errno::EPERM.into());
-    }
     if job.state != "question" {
         return Err(Error::because(
             Errno::EAGAIN,
             "the process is not waiting for an answer",
         ));
     }
-    let data: Value = serde_json::from_slice(data).unwrap_or_default();
     let mut spec = Spec::of(&job).map_err(|why| Error::because(Errno::EIO, why))?;
-    spec.decisions = serde_json::from_value(data["decisions"].clone()).ok();
-    if spec.decisions.is_none() {
-        return Err(Error::because(
-            Errno::EINVAL,
-            "answer with {\"decisions\": {PATH: true|false}}",
-        ));
-    }
+    spec.decisions = Some(decisions);
     db.set_job(pid, JobColumn::Spec, Some(&json!(spec).to_string()));
     db.set_job(pid, JobColumn::Question, None);
     db.set_job(pid, JobColumn::State, Some("queued"));

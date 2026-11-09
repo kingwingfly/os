@@ -21,7 +21,7 @@ test('editor close restores actual typing after Escape, close button and discard
   });
   await page.goto('/');
   const input = page.locator('#command');
-  const run = async command => { await expect(page.locator('.busy')).toHaveText('↵');await input.fill(command);await input.press('Enter'); };
+  const run = async command => { await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');await input.fill(command);await input.press('Enter'); };
   for (const close of ['escape', 'button', 'discard']) {
     await run('vim /focus.txt');
     const editor = page.getByRole('textbox',{name:'File contents'});

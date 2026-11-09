@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, call, entry, errno, names, program, put, rmrf, sys } from './sys.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const vars = await readFile('.dev.vars', 'utf8');
 const rootPassword = vars.match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 // Whether the site has a Realtime app: its keys are named in .dev.vars (their values are not
@@ -15,10 +15,10 @@ test.use({ launchOptions: { env: browserEnv, args: ['--ozone-platform=headless',
 let sequence = 0;
 const address = name => `sound-${name}-${Date.now()}-${++sequence}`;
 
-const busy = page => page.locator('.terminal-panel:not([hidden]) .busy');
+const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const transcript = page => page.locator('.terminal-panel:not([hidden]) .transcript');
 async function run(page, text) {
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill(text); await input.press('Enter');
 }
@@ -106,7 +106,7 @@ test('a recording whose microphone stops on its own is saved, with what it heard
     await expect(transcript(page)).toContainText(new RegExp(`✓ ${recording} · \\d\\d:\\d\\d · [\\d.]+ KB.* · the microphone stopped`), { timeout: 30_000 });
     const whole = await entry(root, recording);
     expect(whole.recording).toBeFalsy(); expect(whole.size).toBeGreaterThan(0);
-    await expect(busy(page)).toHaveText('↵');
+    await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   } finally {
     await rmrf(root, recording);
     await speaker.context.close();

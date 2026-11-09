@@ -4,7 +4,7 @@ import { api } from './sys.js';
 
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const executable = { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '60'], env: [], cwd: '/' };
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 async function batch(request, calls, options = {}) {
   calls = calls.map(call => call.kill ? { kill: { ...call.kill, pid: String(call.kill.pid) } } : call.wait ? { wait: { ...call.wait, pid: String(call.wait.pid) } } : call);
   const response = await request.post('/api/sys', { headers: { 'X-Registry': '1', Origin: origin }, data: { calls, ...options } });
@@ -12,6 +12,23 @@ async function batch(request, calls, options = {}) {
   return (await response.json()).results;
 }
 const one = async (request, call, options) => (await batch(request, [call], options))[0];
+
+test('terminal descriptor reports need the live process proof and cannot cross namespaces', async ({ browser }) => {
+  const owner = await browser.newContext(), other = await browser.newContext();
+  try {
+    await owner.request.get('/'); await other.request.get('/');
+    const { ok: process } = await one(owner.request, { execve: executable });
+    const report = { pid: process.pid, proc: process.token, tty: process.pid, fds: [0, 1, 2] };
+    expect(await one(owner.request, { proc_tty: { ...report, proc: 'wrong' } })).toHaveProperty('err.errno', 'ESRCH');
+    expect(await one(other.request, { proc_tty: report })).toHaveProperty('err.errno', 'ESRCH');
+    expect(await one(owner.request, { proc_tty: report })).toHaveProperty('ok');
+    const response = await owner.request.post('/api/sys', { headers: { Origin: origin }, data: { calls: [{ readlink: { path: `/proc/${process.pid}/fd/0` } }] } });
+    expect((await response.json()).results[0].ok).toBe(`/dev/pts/${process.pid}`);
+    await one(owner.request, { kill: { pid: process.pid, signal: 9 } });
+    expect(await one(owner.request, { proc_tty: report })).toHaveProperty('err.errno', 'ESRCH');
+    await one(owner.request, { wait: { pid: process.pid } });
+  } finally { await owner.close(); await other.close(); }
+});
 
 test('exec checks cgroup ownership against its verified credentials', async ({ context }) => {
   const request = context.request;

@@ -14,16 +14,16 @@
 //!
 //! Who may make which call, and as whom it acts, is `kernel::registry`'s table: the
 //! registry route and the page both act as the authenticated account; the routing header
-//! grants no privilege. A process acts by its token and snapshot (including terminal.sys).
+//! grants no privilege. A process acts by its token and snapshot (including os.sys).
 use crate::db::{Db, transact};
 use crate::procs::{Begun, Snapshot};
 use crate::{auth, procs};
 use abi::{BATCH_MAX, Batch, Call, Errno, Error, Exec, Forked, Return};
 use kernel::registry::{self, Acting};
+use os_core::permissions::Identity;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
-use terminal_worker_core::permissions::Identity;
 use worker::*;
 
 /// How long a revocation that failed waits to be tried again, in milliseconds.
@@ -98,7 +98,7 @@ impl DurableObject for Machine {
                     ns,
                     cookie: req.headers().get("Cookie")?,
                     sudo: batch.sudo,
-                    umask: batch.umask & 0o777,
+                    umask: batch.umask.unwrap_or(0o022) & 0o777,
                     pid: batch.pid,
                     token: batch.process.clone(),
                     identity: RefCell::new(None),
@@ -634,7 +634,7 @@ pub async fn forward(
         "ns": ns,
         "cookie": cookie,
         "sudo": session.sudo,
-        "umask": session.umask,
+        "umask": session.umask.unwrap_or(0o022),
         "pid": session.pid,
         "proc": session.token,
         "identity": identity,
@@ -792,6 +792,15 @@ fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Err
                 ));
             }
             Ok(json!(db.poll(ns, &pids, &account()?)))
+        }
+        Call::ProcTty {
+            pid,
+            token,
+            tty,
+            fds,
+        } => {
+            db.terminal(ns, pid, &token, tty, &fds)?;
+            Ok(Value::Null)
         }
         Call::ProcKeep { processes } => {
             if processes.len() > abi::PROC_POLL_MAX {

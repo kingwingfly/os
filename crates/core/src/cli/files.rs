@@ -1,53 +1,8 @@
-//! Files: ls, cd, pwd, open, vim, mkdir, touch, rm, mv, cp, ln, readlink, fd and upload.
+//! Files: cd, pwd, open, vim, mkdir, touch, rm, mv, cp, ln, readlink, fd and upload.
 
 use clap::{Parser, ValueHint};
 
 use super::{Manual, Section};
-
-/// list a directory, or show one file
-///
-/// Lists what the directory PATH, or the working directory, holds: directories in green with a
-/// slash, executables in amber, links in cyan with where they point. Directories come first,
-/// then by name; -t sorts by when content changed, newest first, -S by size, largest first, and
-/// -r the other way.
-///
-/// A file is shown by itself. A link to a directory lists that directory, but with -l or -d the
-/// link itself is shown; a trailing slash (ls -l link/) follows it. Times are UTC: the month,
-/// day and time for what changed within half a year, the year for older.
-#[derive(Parser, Debug)]
-#[command(name = "ls")]
-pub struct Ls {
-    /// long format: type and mode (+ marks an ACL), names (links), owner, group, size, time
-    #[arg(short = 'l')]
-    pub long: bool,
-    /// by when content changed, newest first
-    #[arg(short = 't', overrides_with = "size")]
-    pub time: bool,
-    /// by size, largest first
-    #[arg(short = 'S', overrides_with = "time")]
-    pub size: bool,
-    /// in the other order
-    #[arg(short = 'r', long = "reverse")]
-    pub reverse: bool,
-    /// show a directory itself, not what it holds
-    #[arg(short = 'd', long = "directory")]
-    pub directory: bool,
-    /// accepted for habit: names starting with a dot are always listed
-    #[arg(short = 'a', long = "all")]
-    pub all: bool,
-    #[arg(value_hint = ValueHint::DirPath, value_name = "PATH")]
-    pub path: Option<String>,
-}
-impl Manual for Ls {
-    const SECTION: Section = Section::Files;
-    const NEEDS: &'static str = "r and x on the directory listed, x on every directory above it.";
-    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
-        ("ls -l docs", "long listing of docs"),
-        ("ls -ld ~", "your home itself"),
-        ("ls -l link", "the link, and where it points"),
-    ];
-    const SEE: &'static [&'static str] = &["cd", "fd", "getfacl"];
-}
 
 /// change the working directory
 ///
@@ -319,8 +274,11 @@ pub struct Rm {
     #[arg(short = 'r', visible_short_alias = 'R', long = "recursive")]
     pub recursive: bool,
     /// say nothing of paths that do not exist
-    #[arg(short = 'f', long = "force")]
+    #[arg(short = 'f', long = "force", overrides_with = "interactive")]
     pub force: bool,
+    /// ask before each removal
+    #[arg(short = 'i', long = "interactive", overrides_with = "force")]
+    pub interactive: bool,
     #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "PATH")]
     pub paths: Vec<String>,
 }

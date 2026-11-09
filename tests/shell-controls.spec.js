@@ -2,7 +2,7 @@ import { test, expect, request } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, entry, program, put } from './sys.js';
 import { browse } from './ui.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const password = 'shell-testing-password-621';
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -21,13 +21,13 @@ async function fixture() {
   for(const client of [root,user,guest])await client.dispose();
  }};
 }
-const run=async(page,text)=>{await expect(page.locator('.busy')).toHaveText('↵');await page.locator('#command').fill(text);await page.locator('#command').press('Enter');};
+const run=async(page,text)=>{await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');await page.locator('#command').fill(text);await page.locator('#command').press('Enter');};
 
 test('su restores typing focus; Ctrl+C clears drafts, completion and history; forced password dialog accepts short passwords',async({page})=>{
  const f=await fixture();try {
   await page.setExtraHTTPHeaders({'CF-Connecting-IP':'shell-ui-'+Date.now()});await page.goto('/');
   await run(page,'su - '+f.name);await page.locator('#password').fill(password);await page.locator('#password').press('Enter');
-  await expect(page.locator('.lock')).toContainText(f.name);await expect(page.locator('.busy')).toHaveText('↵');await expect(page.locator('#command')).toBeFocused();
+  await expect(page.locator('.lock')).toContainText(f.name);await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');await expect(page.locator('#command')).toBeFocused();
   await page.keyboard.type('pwd');await page.keyboard.press('Enter');await expect(page.locator('.transcript pre').last()).toHaveText(f.home);
   await page.keyboard.type('mkdir discard-me');await page.keyboard.press('Control+c');await expect(page.locator('#command')).toHaveValue('');
   await page.keyboard.press('ArrowUp');await expect(page.locator('#command')).toHaveValue('pwd');
@@ -37,12 +37,12 @@ test('su restores typing focus; Ctrl+C clears drafts, completion and history; fo
   expect(await entry(page.request, f.home+'/discard-me')).toBe(null);
   await run(page,'passwd --force');await expect(page.locator('#auth-description')).toContainText('--force');
   await page.locator('#current-password').fill(password);await page.locator('#password').fill('1234');await page.locator('#confirm-password').fill('1234');await page.locator('#auth button[type=submit]').click();
-  await expect(page.locator('#auth')).not.toBeVisible();await expect(page.locator('.busy')).toHaveText('↵');await expect(page.locator('#command')).toBeFocused();
+  await expect(page.locator('#auth')).not.toBeVisible();await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');await expect(page.locator('#command')).toBeFocused();
   await page.keyboard.type('whoami');await page.keyboard.press('Enter');await expect(page.locator('.transcript pre').last()).toHaveText(f.name);
   await run(page,'exit');await expect(page.locator('.lock')).toContainText('guest');await run(page,'su '+f.name);
   await page.locator('#password').fill('1234');await page.locator('#password').press('Enter');await expect(page.locator('.lock')).toContainText(f.name);
-  await expect(page.locator('.busy')).toHaveText('↵');await expect(page.locator('#command')).toBeFocused();
-  await run(page,'su root');await page.locator('#cancel-auth').click();await expect(page.locator('.busy')).toHaveText('↵');await expect(page.locator('#command')).toBeFocused();
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');await expect(page.locator('#command')).toBeFocused();
+  await run(page,'su root');await page.locator('#cancel-auth').click();await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');await expect(page.locator('#command')).toBeFocused();
  }finally{await f.cleanup();}
 });
 
@@ -53,9 +53,9 @@ test('force skips only the minimum password length, preserving identity checks a
   expect((await api(f.user, 'passwd',{data:{username:'root',password:'1',force:true}})).status()).toBe(403);
   expect((await api(f.user, 'passwd',{data:{password:'1',current_password:'wrong',force:true}})).status()).toBe(401);
   for(const value of ['', 'x'.repeat(513)])expect((await api(f.user, 'passwd',{data:{password:value,current_password:password,force:true}})).status()).toBe(400);
-  const cookie=(await f.user.storageState()).cookies.find(c=>c.name==='terminal_session').value;
+  const cookie=(await f.user.storageState()).cookies.find(c=>c.name==='os_session').value;
   await ok(await api(f.user, 'passwd',{data:{password:'1',current_password:password,force:true}}));
-  expect((await(await api(f.guest, 'session',{headers:{Cookie:'terminal_session='+cookie}})).json()).username).toMatch(/^guest-[0-9a-f]{16}$/);
+  expect((await(await api(f.guest, 'session',{headers:{Cookie:'os_session='+cookie}})).json()).username).toMatch(/^guest-[0-9a-f]{16}$/);
   await ok(await api(f.guest, 'login',{data:{username:f.name,password:'1'}}));
   expect((await(await api(f.user, 'session')).json()).username).toBe(f.name);
  }finally{await f.cleanup();}
@@ -107,8 +107,10 @@ test('touch integrates with completion, help, preview and editing extensionless 
   // Exactly the file made: a string would match the seeded /readme.txt too, case aside.
   await expect(page.locator('.filename').filter({hasText:/^README$/})).toBeVisible();
   await run(page,'vim README');await expect(page.locator('.cm-content')).toBeVisible();await page.locator('.cm-content').fill('hello terminal');await page.keyboard.press('Control+s');await expect(page.locator('#editor-status')).toHaveText('Saved');await page.keyboard.press('Escape');
-  await run(page,'touch README');await expect(page.locator('.busy')).toHaveText('↵');
+  await run(page,'touch README');await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await run(page,'open README');await expect(page.locator('.text-preview')).toHaveText('hello terminal');await page.getByRole('button',{name:'Close preview'}).click();
-  await run(page,'touch -h');await expect(page.locator('.transcript pre').last()).toContainText('Usage: touch [OPTIONS] FILE...');
+  await run(page,'touch -h');await expect(page.locator('.transcript pre').last()).toContainText('missing file operand');
+  await run(page,'touch --help');await expect(page.locator('.transcript pre').last()).toContainText('Usage: touch');
+  await expect(page.locator('.transcript pre').last()).toContainText('--no-dereference');
  }finally{await f.cleanup();}
 });

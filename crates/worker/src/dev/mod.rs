@@ -11,6 +11,7 @@
 //! sessions. As Linux passes an open file to another process, a presenter lets a guest speak
 //! by passing a descriptor that writes the presentation to the guest's session (present.rs);
 //! an account, by an ACL entry.
+pub mod accelerator;
 pub mod present;
 pub mod realtime;
 pub mod snd;
@@ -19,10 +20,10 @@ use crate::auth;
 use crate::db::{Db, Device, Told};
 use abi::{Errno, Error, Opened};
 use kernel::Process;
+use os_core::devices::device_path;
+pub use os_core::devices::{PRESENT, SOUND};
+use os_core::{parent, permissions::*};
 use serde_json::{Value, json};
-use terminal_worker_core::devices::device_path;
-pub use terminal_worker_core::devices::{PRESENT, SOUND};
-use terminal_worker_core::{parent, permissions::*};
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -49,6 +50,26 @@ pub fn ensure(db: &mut Db) {
     for directory in ["/dev", PRESENT, SOUND] {
         if db.node(directory).is_none() {
             db.set_node(directory, &Node::directory(0, 0, 0o755));
+        }
+    }
+    for (path, driver) in [
+        (abi::accelerator::ARCHIVE, "archive"),
+        (abi::accelerator::MEDIA, "media"),
+    ] {
+        if db.node(path).is_none() {
+            let mut node = Node::file(0, 0, 0o666, String::new(), 0);
+            node.file = None;
+            node.rdev = Some(driver.into());
+            db.set_node(path, &node);
+            db.set_device(
+                &Device {
+                    name: path.into(),
+                    owner: 0,
+                    path: String::new(),
+                    media: None,
+                },
+                auth::now(),
+            );
         }
     }
 }
@@ -156,6 +177,9 @@ pub fn open(db: &mut Db, sid: &str, path: &str, flags: u32) -> Result<Opened> {
 /// sound it sends, or the voice it speaks with.
 pub fn closed(db: &mut Db, sid: &str, fd: u32, device: &str) {
     match db.node(device).and_then(|node| node.rdev) {
+        Some(rdev) if matches!(rdev.as_str(), "archive" | "media") => {
+            accelerator::closed(db, sid, fd)
+        }
         Some(rdev) if rdev == "snd" => snd::closed(db, sid, fd, device),
         Some(_) => present::closed(db, sid, fd, device),
         None => {}
@@ -272,6 +296,7 @@ pub fn read(db: &Db, who: &Identity, sid: Option<&str>, path: &str) -> Option<Va
     let device = db.device(path)?;
     let node = db.node(path)?;
     Some(match node.rdev.as_deref()? {
+        "archive" | "media" => json!({"version": abi::accelerator::VERSION, "device": path}),
         "snd" => snd::read(db, &device),
         _ => present::read(db, who, sid, &device, &node),
     })
@@ -345,6 +370,7 @@ pub fn ioctl(
     arg: Value,
 ) -> Result<Value> {
     match request.node.rdev.as_deref() {
+        Some("archive" | "media") => accelerator::ioctl(db, process, request, op, arg),
         Some("present") => present::ioctl(db, process, request, op, arg),
         _ => Err(not_for(op)),
     }

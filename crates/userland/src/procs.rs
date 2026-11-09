@@ -5,8 +5,8 @@ use crate::files::parsed;
 use crate::io::Io;
 use crate::sys::{Sys, call, calls, getdents};
 use abi::{Call, Data, Errno, Error};
+use os_core::cli::{archives as args, parse};
 use serde_json::Value;
-use terminal_worker_core::cli::{archives as args, parse};
 
 /// A process, as /proc/PID says: its PID, its state and progress, and its command line.
 #[derive(Clone, Debug, Default, PartialEq)]

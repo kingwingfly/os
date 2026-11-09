@@ -11,28 +11,7 @@ pub const ENTRIES_MAX: usize = 10_000;
 /// ... and the most bytes they may expand to, together.
 pub const EXPANDED_MAX: u64 = 1_000_000_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Format {
-    Zip,
-    Tar,
-    /// A tar archive in gzip.
-    Tgz,
-}
-
-/// What extraction does with a file that exists already.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Existing {
-    /// Ask, as unzip does without -o or -n.
-    Ask,
-    /// Replace it, as tar does, and unzip -o.
-    Replace,
-    /// Keep it silently, as unzip -n and tar --skip-old-files do.
-    Skip,
-    /// Keep it, reporting each one as an error, as tar -k does.
-    Keep,
-}
+pub use abi::accelerator::{Existing, Format};
 
 /// One zip, unzip, tar or faststart command.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

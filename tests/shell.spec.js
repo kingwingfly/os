@@ -2,7 +2,7 @@ import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, entry, listing, mkdirp, program, put, rmrf, sys } from './sys.js';
 import { promptPath } from './ui.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 // Each test signs in as its own client, so that it does not use up others' login rate limit.
 let headers;
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
@@ -32,17 +32,17 @@ async function terminal(page) {
 }
 async function run(page, text) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
-  await expect(busy).toHaveText('↵');
+  const busy = page.locator('#command').locator('xpath=ancestor::form');
+  await expect(busy).toHaveAttribute('data-state', 'idle');
   await input.fill(text); await input.press('Enter');
 }
 // Run `text` to its end, for what is read of it next.
 async function done(page, text) {
   await run(page, text);
-  await expect(page.locator('#command').locator('xpath=ancestor::form').locator('.busy')).toHaveText('↵');
+  await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle');
 }
 const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
-async function output(page, text) { await run(page, text); await expect(page.locator('#command').locator('xpath=ancestor::form').locator('.busy')).toHaveText('↵'); return (await last(page).textContent()).trim(); }
+async function output(page, text) { await run(page, text); await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle'); return (await last(page).textContent()).trim(); }
 
 test('pipes join filters, fd finds what may be listed, and xargs and fd -x run commands on it', async ({ page, request }) => {
   await terminal(page);
@@ -57,7 +57,9 @@ test('pipes join filters, fd finds what may be listed, and xargs and fd -x run c
   // Names with spaces and Unicode survive NUL separation.
   expect(await output(page, 'fd -0 -e md | xargs -0 wc -l')).toContain('1 docs/deep/spéctrum notes.md');
   expect(await output(page, 'fd -e md . docs -x echo {/.}')).toMatch(/^(b\nspéctrum notes|spéctrum notes\nb)$/);
-  expect(await output(page, 'cat x.md missing.md | wc -l')).toBe('0');
+  await done(page, 'cat x.md missing.md | wc -l | tee count.txt');
+  expect((await (await request.get(file(base + '/count.txt'))).text()).trim()).toBe('0');
+  await run(page, 'rm count.txt');
   await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText('cat: missing.md');
   await run(page, 'ls || pwd'); await expect(last(page)).toContainText('not supported');
   // Options as getopt reads them: given again, attached, or long; echo has no --.
@@ -98,7 +100,7 @@ test('wildcards expand to sorted paths as bash expands them, and rm -rf * emptie
   // Completing a later path keeps an earlier wildcard unquoted, so that it still expands.
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill('rm *.tmp do'); await input.press('Tab');
-  await expect(input).toHaveValue('rm *.tmp "docs/"');
+  await expect(input).toHaveValue('rm *.tmp docs/');
   await input.press('Escape');
   await run(page, 'rm *.tmp');
   await expect.poll(() => names('')).toEqual(['.hidden', 'a.md', 'docs']);
@@ -106,7 +108,7 @@ test('wildcards expand to sorted paths as bash expands them, and rm -rf * emptie
   await run(page, 'cd docs'); await run(page, 'rm -rf *');
   await expect.poll(() => names('/docs')).toEqual([]);
   await run(page, 'rm -rf *');
-  await expect(page.locator('#command').locator('xpath=ancestor::form').locator('.busy')).toHaveText('↵');
+  await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle');
   await expect(last(page)).toHaveClass(/command-echo/);
   await run(page, 'cd ..'); await run(page, 'rm -r *');
   await expect.poll(() => names('')).toEqual(['.hidden']);
@@ -153,18 +155,18 @@ test('mv and cp follow Linux defaults, ask with -i, share content, and refuse wh
   expect(await (await request.get(file(base + '/copy/b.md'))).text()).toBe('one\ntwo\nthree\n');
   await run(page, 'mv -i docs/a.md copy/b.md');
   await expect(last(page)).toContainText("mv: overwrite 'copy/b.md'?");
-  await expect(page.locator('.terminal-panel:not([hidden]) .busy')).toHaveText('Answer ↵');
+  await expect(page.locator('.terminal-panel:not([hidden]) .command-line')).toHaveAttribute('data-state', 'input');
   await page.locator('#command').fill('n'); await page.locator('#command').press('Enter');
-  await expect(page.locator('.terminal-panel:not([hidden]) .busy')).toHaveText('↵');
+  await expect(page.locator('.terminal-panel:not([hidden]) .command-line')).toHaveAttribute('data-state', 'idle');
   expect((await request.head(file(base + '/docs/a.md'))).status()).toBe(200);
-  await run(page, 'mv -iv docs/a.md copy/b.md'); await expect(page.locator('.terminal-panel:not([hidden]) .busy')).toHaveText('Answer ↵');
+  await run(page, 'mv -iv docs/a.md copy/b.md'); await expect(page.locator('.terminal-panel:not([hidden]) .command-line')).toHaveAttribute('data-state', 'input');
   await page.locator('#command').fill('y'); await page.locator('#command').press('Enter');
   await expect(last(page)).toContainText("renamed 'docs/a.md' -> 'copy/b.md'");
   expect(await (await request.get(file(base + '/copy/b.md'))).text()).toBe('alpha\nbeta\n');
   // Long options, and one given again, are kept for the replacement.
-  await run(page, 'cp -f --interactive docs/b.md copy/b.md'); await expect(page.locator('.terminal-panel:not([hidden]) .busy')).toHaveText('Answer ↵');
+  await run(page, 'cp -f --interactive docs/b.md copy/b.md'); await expect(page.locator('.terminal-panel:not([hidden]) .command-line')).toHaveAttribute('data-state', 'input');
   await page.locator('#command').fill('y'); await page.locator('#command').press('Enter');
-  await expect(page.locator('.terminal-panel:not([hidden]) .busy')).toHaveText('↵');
+  await expect(page.locator('.terminal-panel:not([hidden]) .command-line')).toHaveAttribute('data-state', 'idle');
   expect(await (await request.get(file(base + '/copy/b.md'))).text()).toBe('one\ntwo\nthree\n');
   for (const [line, message] of [['mv docs docs/inner', 'subdirectory of itself'], ['cp docs docs-flat', '-r not specified'], ['mv . elsewhere', 'Device or resource busy'], ['cp -r copy copy/again', 'into itself'], ['mv /root elsewhere', '/root holds the home of root']]) {
     await run(page, line); await expect(last(page)).toContainText(message);
@@ -193,7 +195,7 @@ test('tabs run at once with their own directory and history, and Ctrl+C stops a 
   await expect(promptPath(page)).toHaveText(base + '/docs');
   // Tab 2 runs a long xargs; tab 1 works meanwhile.
   await run(page, 'fd -e dat | xargs -t -n 1 cat');
-  await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText('+ cat');
+  await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText('cat n');
   await page.keyboard.press('Alt+1');
   await expect(promptPath(page)).toHaveText(base);
   expect(await output(page, 'pwd')).toBe(base);
@@ -201,8 +203,8 @@ test('tabs run at once with their own directory and history, and Ctrl+C stops a 
   await page.keyboard.press('Alt+2');
   await page.locator('#command').press('Control+c');
   await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText('^C');
-  await expect(page.locator('.terminal-panel:not([hidden]) .busy')).toHaveText('↵');
-  const ran = await page.locator('.terminal-panel:not([hidden]) .transcript pre', { hasText: '+ cat' }).count();
+  await expect(page.locator('.terminal-panel:not([hidden]) .command-line')).toHaveAttribute('data-state', 'idle');
+  const ran = ((await page.locator('.terminal-panel:not([hidden]) .transcript').innerText()).match(/cat n\d+\.dat/g) || []).length;
   expect(ran).toBeGreaterThan(0); expect(ran).toBeLessThan(60);
   await page.locator('#command').press('ArrowUp'); await expect(page.locator('#command')).toHaveValue('fd -e dat | xargs -t -n 1 cat');
   // Tabs survive a reload; closing one keeps the other.
@@ -215,39 +217,39 @@ test('tabs run at once with their own directory and history, and Ctrl+C stops a 
 
 test('cp and mv -i ask as well under sudo, xargs and fd -x, about each file they would replace', async ({ page, request }) => {
   await terminal(page);
-  const busy = page.locator('.terminal-panel:not([hidden]) .busy');
+  const busy = page.locator('.terminal-panel:not([hidden]) .command-line');
   const transcript = page.locator('.terminal-panel:not([hidden]) .transcript');
-  const answer = async text => { await expect(busy).toHaveText('Answer ↵'); await page.locator('#command').fill(text); await page.locator('#command').press('Enter'); };
+  const answer = async text => { await expect(busy).toHaveAttribute('data-state', 'input'); await page.locator('#command').fill(text); await page.locator('#command').press('Enter'); };
   const read = async path => (await request.get(file(base + '/' + path), { headers })).text();
   // cp and mv ask, as GNU's do, of the name given.
   const asked = path => `overwrite '${path}'?`;
   // xargs and fd -x run each cp -i on its own, which asks: no keeps the file, yes replaces it.
-  await run(page, 'echo a.md | xargs -I {} cp -i {} docs/b.md');
+  await run(page, 'echo a.md | xargs -o -I {} cp -i {} docs/b.md');
   await expect(transcript).toContainText('cp: ' + asked('docs/b.md'));
-  await answer('n'); await expect(busy).toHaveText('↵');
+  await answer('n'); await expect(busy).toHaveAttribute('data-state', 'idle');
   expect(await read('docs/b.md')).toBe('one\ntwo\nthree\n');
   await run(page, 'fd -F c.txt docs -x cp -i {} docs/b.md');
-  await answer('y'); await expect(busy).toHaveText('↵');
+  await answer('y'); await expect(busy).toHaveAttribute('data-state', 'idle');
   expect(await read('docs/b.md')).toBe('TODO later\ndone\nTODO now\n');
   // sudo asks too, and replaces as root.
   await run(page, 'sudo mv -iv a.md docs/b.md');
   await expect(transcript).toContainText("mv: overwrite 'docs/b.md'?");
-  await answer('y'); await expect(busy).toHaveText('↵');
+  await answer('y'); await expect(busy).toHaveAttribute('data-state', 'idle');
   await expect(last(page)).toContainText("renamed 'a.md' -> 'docs/b.md'");
   expect(await read('docs/b.md')).toBe('alpha\nbeta\n');
   // cp -ri asks about each file below that exists, and copies the others.
-  await run(page, 'cp -r docs copy'); await expect(busy).toHaveText('↵');
+  await run(page, 'cp -r docs copy'); await expect(busy).toHaveAttribute('data-state', 'idle');
   expect((await put(request, file(base + '/docs/deep/spéctrum notes.md') + '&overwrite=true', { headers, data: 'δ\n' })).ok()).toBe(true);
   expect((await put(request, file(base + '/docs/deep/new.md'), { headers, data: 'new\n' })).status()).toBe(201);
   await run(page, 'cp -ri docs/deep copy');
   await expect(transcript).toContainText('cp: ' + asked('copy/deep/spéctrum notes.md'));
-  await answer('y'); await expect(busy).toHaveText('↵');
+  await answer('y'); await expect(busy).toHaveAttribute('data-state', 'idle');
   expect(await read('copy/deep/spéctrum notes.md')).toBe('δ\n');
   expect(await read('copy/deep/new.md')).toBe('new\n');
   // Ctrl+C at the question replaces nothing.
   await run(page, 'mv -i docs/c.txt docs/b.md');
-  await expect(busy).toHaveText('Answer ↵');
-  await page.locator('#command').press('Control+c'); await expect(busy).toHaveText('↵');
+  await expect(busy).toHaveAttribute('data-state', 'input');
+  await page.locator('#command').press('Control+c'); await expect(busy).toHaveAttribute('data-state', 'idle');
   expect(await read('docs/b.md')).toBe('alpha\nbeta\n');
   expect((await request.head(file(base + '/docs/c.txt'), { headers })).status()).toBe(200);
 });

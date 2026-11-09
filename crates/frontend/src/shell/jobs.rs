@@ -33,6 +33,7 @@ pub(super) struct Job {
     pub input: Rc<RefCell<Option<JsValue>>>,
     /// Whether it is the tab's foreground run: Ctrl+C ends it, and it has the terminal's input.
     pub foreground: Rc<Cell<bool>>,
+    pub live: RwSignal<bool>,
     pub state: State,
     /// Whether its first process was waiting on the terminal as it stopped, as it still is.
     pub reading: bool,
@@ -52,6 +53,7 @@ pub(super) struct Run {
     pub group: Rc<RefCell<JsValue>>,
     pub input: Rc<RefCell<Option<JsValue>>>,
     pub foreground: Rc<Cell<bool>>,
+    pub live: RwSignal<bool>,
     /// Its job's number, once it is one.
     pub number: Rc<Cell<Option<u32>>>,
 }
@@ -61,6 +63,7 @@ impl Run {
             group: Rc::new(RefCell::new(JsValue::UNDEFINED)),
             input: Rc::new(RefCell::new(None)),
             foreground: Rc::new(Cell::new(true)),
+            live: RwSignal::new(true),
             number: Rc::new(Cell::new(None)),
         }
     }
@@ -185,6 +188,7 @@ impl Shell {
                 group: run.group.borrow().clone(),
                 input: run.input.clone(),
                 foreground: run.foreground.clone(),
+                live: run.live,
                 state,
                 reading,
                 waiting: Vec::new(),
@@ -284,7 +288,7 @@ impl Shell {
     pub(super) async fn fg(self, spec: Option<&str>) -> Result<Output, String> {
         let number = self.job(spec, "fg")?;
         let (done, ended) = oneshot::channel();
-        let Some((group, input, foreground, state, command, reading)) = self
+        let Some((group, input, foreground, state, command, reading, live)) = self
             .jobs
             .try_update_value(|jobs| {
                 let job = jobs.iter_mut().find(|job| job.number == number)?;
@@ -298,6 +302,7 @@ impl Shell {
                     state,
                     job.command.clone(),
                     job.reading,
+                    job.live,
                 ))
             })
             .flatten()
@@ -306,7 +311,9 @@ impl Shell {
         };
         self.log(command.clone());
         foreground.set(true);
-        self.terminal.set_value(input.borrow().clone());
+        call(&group, "foreground", &JsValue::TRUE);
+        live.set(true);
+        self.attach_terminal(input.borrow().clone());
         self.reading.set(reading);
         let (stopping, stopped) = oneshot::channel();
         self.foreground.set_value(Some(Foreground {
@@ -319,7 +326,7 @@ impl Shell {
         let outcome = select(ended, stopped).await;
         let was_reading = self.reading.get_untracked();
         self.foreground.set_value(None);
-        self.terminal.set_value(None);
+        self.attach_terminal(None);
         self.reading.set(false);
         match outcome {
             Either::Left((status, _)) => Ok(Output {
@@ -329,6 +336,8 @@ impl Shell {
             // Stopped again: a job in the background, stopped, as it was.
             Either::Right(_) => {
                 foreground.set(false);
+                call(&group, "foreground", &JsValue::FALSE);
+                live.set(false);
                 let reading = was_reading;
                 self.jobs.update_value(|jobs| {
                     if let Some(job) = jobs.iter_mut().find(|job| job.number == number) {

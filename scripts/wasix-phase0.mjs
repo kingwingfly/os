@@ -2,7 +2,7 @@
 // Usage: WASIX_DASH=/path/to/dash node scripts/wasix-phase0.mjs [argv...]
 // The fixture is not committed; the test skips when WASIX_DASH is absent.
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,13 +18,16 @@ const argv = process.argv.slice(2);
 if (!argv.length) argv.push(...(watPath ? ['wasix-fork'] : ['dash', '-c', 'echo one; (echo two); echo three']));
 
 const target = JSON.parse(execFileSync('cargo', ['metadata', '--format-version', '1', '--no-deps'], { cwd: root, encoding: 'utf8' })).target_directory;
-execFileSync('cargo', ['build', '-p', 'terminal-worker-wasix-runtime', '--target', 'wasm32-unknown-unknown', '--release'], { cwd: root, stdio: 'pipe' });
-const bindings = join(target, 'wasix-node');
+execFileSync('cargo', ['build', '-p', 'os-wasix-runtime', '--target', 'wasm32-unknown-unknown', '--release'], { cwd: root, stdio: 'pipe' });
+// Node's test runner can launch the dash and WAT probes concurrently. Each needs its
+// own bindings: wasm-bindgen rewrites the wasm while the other probe may be loading it.
+const bindings = mkdtempSync(join(target, 'wasix-node-'));
+process.on('exit', () => rmSync(bindings, { recursive: true, force: true }));
 execFileSync('wasm-bindgen', [
   '--target', 'nodejs',
   '--out-dir', bindings,
   '--out-name', 'wasix_runtime',
-  join(target, 'wasm32-unknown-unknown/release/terminal_worker_wasix_runtime.wasm'),
+  join(target, 'wasm32-unknown-unknown/release/os_wasix_runtime.wasm'),
 ], { cwd: root, stdio: 'pipe' });
 
 const require = createRequire(import.meta.url);

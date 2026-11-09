@@ -82,7 +82,7 @@ fn cacheable(call: &Call) -> Option<(String, String, String)> {
         Call::Stat { path }
         | Call::Lstat { path }
         | Call::Readlink { path }
-        | Call::Access { path, .. } => (path, terminal_worker_core::parent(path).to_string()),
+        | Call::Access { path, .. } => (path, os_core::parent(path).to_string()),
         _ => return None,
     };
     let plain = path.starts_with('/')
@@ -293,7 +293,7 @@ impl HttpSys {
         let count = calls.len();
         let batch = Batch {
             calls,
-            umask: self.umask,
+            umask: Some(self.umask),
             sudo: self.sudo,
             pid: None,
             process: None,

@@ -21,7 +21,7 @@ const percent = (done, total) => total ? Math.floor(done * 100 / total) + '%' : 
 
 // The SHA-256 of `file`, and of each of its chunks.
 async function hash(file, size, progress, signal) {
-  const rust = window.terminalUploads, whole = rust.hasher(), parts = [];
+  const rust = window.osUploads, whole = rust.hasher(), parts = [];
   const count = Math.ceil(file.size / size);
   for (let index = 0; index < count; index++) {
     if (signal.aborted) throw new Cancelled();
@@ -73,7 +73,7 @@ function refused(error) {
 
 /** Upload `file` to `destination`, reporting progress, until done or `signal` cancels it. */
 export async function uploadFile(file, destination, { progress = () => {}, signal = new AbortController().signal } = {}) {
-  const size = window.terminalUploads.chunkSize;
+  const size = window.osUploads.chunkSize;
   const count = Math.ceil(file.size / size);
   const { sha256, parts } = await hash(file, size, progress, signal);
   if (signal.aborted) throw new Cancelled();

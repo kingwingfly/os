@@ -13,10 +13,10 @@ use crate::api::Reply;
 use crate::auth;
 use crate::db::{Db, int, text, transact};
 use abi::{EXEC_MAX, Errno, Error, Return};
+use os_core::permissions::Identity;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use terminal_worker_core::permissions::Identity;
 use worker::*;
 
 /// An exec's credentials, as its process (and what it forked) acts.
@@ -185,6 +185,7 @@ impl Db {
             crate::fds::release(self, &session, fd.fd);
         }
         self.forget_fd_numbers(&session);
+        self.forget_controller(lineage);
     }
     /// Keep the descriptors of every process line of the namespace `ns` (its pages were heard
     /// from, which host its processes).
@@ -238,7 +239,7 @@ impl Db {
             vec![text(hash), text(ns)],
         );
         for credential in found {
-            self.close_proc_fds(&credential.image());
+            self.close_exec_fds(&credential.image());
             let held = !self
                 .rows::<Credential>(
                     &format!(
@@ -490,6 +491,11 @@ fn exec(
     let lineage = current
         .as_ref()
         .map_or_else(|| owner(ns, asked.pid, &asked.token), Credential::owner);
+    let controller = match &current {
+        Some(c) => db.controller(&c.owner()).unwrap_or(c.uid),
+        None => auth::identity_of(db, key, guest).id,
+    };
+    db.set_controller(&lineage, controller);
     // The image's descriptor is kept in its process's line's session, as what it opens is.
     let sid = session_of(ns, &lineage);
     db.run(

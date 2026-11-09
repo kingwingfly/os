@@ -166,6 +166,7 @@ async function dispatch(message, host, tab) {
     // kill(2): as the page's account, or `from` a process this port runs, as that process.
     case 'kill': return JSON.parse(await kernel.kill(args.pid, args.signal ?? undefined, args.from ?? undefined, host));
     case 'poll': return JSON.parse(await kernel.poll(JSON.stringify(args.pids ?? [])));
+    case 'tty_fds': return kernel.terminal(args.pid, args.tty, JSON.stringify(args.fds), host);
     case 'sync': return JSON.parse(await kernel.sync(host));
     case 'getpid': return JSON.parse(await kernel.getpid(args.pid));
     case 'cgroup_create': return JSON.parse(await kernel.cgroup_create(args.path));

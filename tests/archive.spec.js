@@ -1,8 +1,9 @@
 import { test, expect, request as playwrightRequest } from './test.js';
+import { device, directory, ACCEL } from './accelerator.js';
 import { readFile } from 'node:fs/promises';
-import { crc32 } from 'node:zlib';
+import { zipOf, tarOf } from './archive-fixtures.js';
 import { api, call, errno, listing, mkdirp, processes, program, put, rmrf } from './sys.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 const ls = (request, path) => listing(request, path).catch(() => []);
@@ -28,36 +29,11 @@ test.afterEach(async ({ request }) => {
 
 // A ZIP of stored files, as a system without Unix modes makes one, and a tar of
 // [name, text, mode, directory], as their formats lay them out.
-function zipOf(files) {
-  const parts = [], central = []; let offset = 0;
-  for (const [name, text] of files) {
-    const data = Buffer.from(text), path = Buffer.from(name), crc = crc32(data);
-    const local = Buffer.alloc(30); local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt32LE(crc, 14); local.writeUInt32LE(data.length, 18); local.writeUInt32LE(data.length, 22); local.writeUInt16LE(path.length, 26);
-    const entry = Buffer.alloc(46); entry.writeUInt32LE(0x02014b50, 0); entry.writeUInt16LE(20, 4); entry.writeUInt16LE(20, 6); entry.writeUInt32LE(crc, 16); entry.writeUInt32LE(data.length, 20); entry.writeUInt32LE(data.length, 24); entry.writeUInt16LE(path.length, 28); entry.writeUInt32LE(offset, 42);
-    parts.push(local, path, data); central.push(entry, path); offset += 30 + path.length + data.length;
-  }
-  const directory = Buffer.concat(central), end = Buffer.alloc(22);
-  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(files.length, 8); end.writeUInt16LE(files.length, 10); end.writeUInt32LE(directory.length, 12); end.writeUInt32LE(offset, 16);
-  return Buffer.concat([...parts, directory, end]);
-}
-function tarOf(members) {
-  const blocks = [];
-  for (const [name, text, mode, directory] of members) {
-    const data = Buffer.from(text), header = Buffer.alloc(512);
-    header.write(name, 0); header.write(mode.toString(8).padStart(7, '0') + '\0', 100); header.write('0000000\0', 108); header.write('0000000\0', 116);
-    header.write(data.length.toString(8).padStart(11, '0') + '\0', 124); header.write('00000000000\0', 136); header.write('        ', 148);
-    header.write(directory ? '5' : '0', 156); header.write('ustar\0', 257); header.write('00', 263);
-    let sum = 0; for (const byte of header) sum += byte; header.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
-    blocks.push(header, data, Buffer.alloc((512 - data.length % 512) % 512));
-  }
-  return Buffer.concat([...blocks, Buffer.alloc(1024)]);
-}
-
 const form = page => page.locator('#command').locator('xpath=ancestor::form');
 async function run(page, text, { wait = true } = {}) {
-  await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 180_000 });
+  await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 180_000 });
   await page.locator('#command').fill(text); await page.locator('#command').press('Enter');
-  if (wait) await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 180_000 });
+  if (wait) await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 180_000 });
 }
 const transcript = page => page.locator('.terminal-panel:not([hidden]) .transcript');
 async function terminal(page) {
@@ -92,38 +68,43 @@ test('zip, unzip and tar round-trip files, names and modes through the container
   await run(page, 'tar -cf notes.tgz docs/a.md'); await run(page, 'tar -tf notes.tgz');
   await expect(transcript(page).locator('pre').last()).toHaveText('docs/a.md');
   await run(page, 'jobs'); await expect(transcript(page).locator('pre').last()).toContainText('done');
+  // Immutable /usr directories have synthetic inode handles; their bytes still stream
+  // through the registered asset gateway rather than an R2 object invented by the client.
+  await run(page, 'tar -cf system.tar -C /usr/bin utilities');
+  await run(page, 'mkdir system-copy');
+  await run(page, 'tar -xf system.tar -C system-copy');
+  const [installed, archived] = await Promise.all([
+    request.get(file('/usr/bin/utilities')), request.get(file(base + '/system-copy/utilities')),
+  ]);
+  expect(await archived.body()).toEqual(await installed.body());
 });
 
-test('a job is a process: spawned, waited for, listed by ps, asked on its stdin, and signalled by kill', async ({ page, request }) => {
-  const O = { cwd: base };
-  // spawn runs it apart, as the caller; wait reads what it wrote, and how it ended.
-  const { pid } = await call(request, { spawn: { argv: ['zip', '-r', 'docs.zip', 'docs'], ...O } });
-  const finished = async () => {
-    let state;
-    await expect.poll(async () => (state = await call(request, { wait: { pid } })).state, { timeout: 120_000 }).toMatch(/^(done|failed|cancelled)$/);
-    return state;
-  };
-  expect((await finished()).state).toBe('done');
+test('typed devices separate completion events from executor lifecycle and enforce control ownership', async ({ page, request }) => {
+  const resource = await directory(request, base), driver = await device(request);
+  const create = await driver.submit({ operation: 'create', format: 'zip', output: resource('docs.zip'),
+    inputs: [{ source: resource('docs'), name: 'docs' }], recursive: true, links: false, verbose: true });
+  const pid = create.id;
+  await expect.poll(async () => (await create.poll()).state, { timeout: 120_000 }).toBe('done');
   expect((await ls(request, base)).map(entry => entry.name)).toContain('docs.zip');
   expect((await processes(request)).map(process => process.pid)).toContain(pid);
-  // A question goes to its stdin: unzip asks before replacing what is there.
-  const { pid: asking, stdin } = await call(request, { spawn: { argv: ['unzip', 'docs.zip'], ...O } });
-  await expect.poll(async () => (await call(request, { wait: { pid: asking } })).state, { timeout: 120_000 }).toBe('question');
-  const { question } = await call(request, { wait: { pid: asking } });
-  const decisions = Object.fromEntries(question.replace.map(path => [path, false]));
-  // Its standard input is a descriptor of the session, written as a pipe is.
-  expect(await call(request, { readlink: { path: `/proc/self/fd/${stdin}` } })).toBe(`/proc/${asking}/fd/0`);
-  const answer = Buffer.from(JSON.stringify({ decisions })).toString('base64');
-  expect((await call(request, { pwrite: { fd: stdin, index: 0, data: answer } })).state).toBe('queued');
-  expect((await call(request, { close: { fd: stdin } })).path).toBe(`/proc/${asking}/fd/0`);
-  await expect.poll(async () => (await call(request, { wait: { pid: asking } })).state, { timeout: 120_000 }).toBe('done');
-  // Only programs are spawned; signals go to what is there, and its owner's (or root's).
-  expect(await errno(request, { spawn: { argv: ['sh', '-c', 'true'], ...O } })).toBe('ENOENT');
+  const waited = await call(request, { wait: { pid } });
+  expect(waited).toEqual({ pid, state: 'zombie', status: 0 });
+  const asking = await driver.submit({ operation: 'extract', format: 'zip', source: resource('docs.zip'),
+    destination: resource('.'), existing: 'ask', members: [], verbose: true });
+  await expect.poll(async () => (await asking.poll()).state, { timeout: 120_000 }).toBe('question');
+  const question = (await asking.poll()).events.find(event => event.event === 'conflict');
+  const decisions = Object.fromEntries(question.paths.map(path => [path, false]));
+  await asking.answer(question.sequence, decisions);
+  await expect.poll(async () => (await asking.poll()).state, { timeout: 120_000 }).toBe('done');
+  expect(await errno(request, { ioctl: { fd: driver.fd, request: ACCEL.submit,
+    arg: { version: 2, request: 'unsupported', operation: { operation: 'list', format: 'zip', source: resource('docs.zip'), verbose: false } } } })).toBe('EOPNOTSUPP');
   expect(await errno(request, { kill: { pid: 'f'.repeat(32) } })).toBe('ESRCH');
   const stranger = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'archive-stranger-' + base } });
-  try { expect(await errno(stranger, { kill: { pid } })).toBe('EPERM'); }
-  finally { await stranger.dispose(); }
-  // ps and kill, in the terminal, as procps' are.
+  try {
+    expect(await errno(stranger, { kill: { pid } })).toBe('EPERM');
+    const other = await device(stranger);
+    expect(await errno(stranger, { ioctl: { fd: other.fd, request: ACCEL.attach, arg: { version: 1, id: pid } } })).toBe('EPERM');
+  } finally { await stranger.dispose(); }
   await terminal(page);
   await run(page, 'ps');
   await expect(transcript(page).locator('pre').last()).toContainText(`${pid.slice(0, 8)}  done        zip`);
@@ -142,20 +123,27 @@ test('a job keeps the credentials it was spawned with, and its own descriptors',
   try {
     expect((await api(user, 'login', { data: { username: name, password: secret } })).ok()).toBe(true);
     const { uid, home } = await call(user, 'getcreds');
-    expect((await put(user, file(`${home}/greeting.zip`), { headers: { Origin: origin }, data: zipOf([['hello.txt', 'hello\n']]) })).status()).toBe(201);
-    const { pid } = await call(user, { spawn: { argv: ['unzip', 'greeting.zip'], cwd: home } });
+    expect((await put(user, file(`${home}/greeting.zip`), { headers: { Origin: origin }, data: zipOf([['private/hello.txt', 'hello\n']]) })).status()).toBe(201);
+    const resource = await directory(user, home), driver = await device(user, '/dev/archive', { umask: 0o077 });
+    const task = await driver.submit({ operation: 'extract', format: 'zip', source: resource('greeting.zip'),
+      destination: resource('.'), existing: 'ask', members: [], verbose: true });
+    const pid = task.id;
+    await task.detach();
     // The archive it reads is a descriptor of its own.
     const fds = await call(user, { getdents: { path: `/proc/${pid}/fd` } });
     expect(fds).toHaveLength(1);
     expect(await call(user, { readlink: { path: `/proc/${pid}/fd/${fds[0].name}` } })).toBe(`${home}/greeting.zip`);
     // Locked while its container starts: the job goes on as it was spawned.
     await call(request, { usermod: { name, lock: true } }, { sudo: true });
+    const observer = await (await device(request)).attach(pid);
     let state;
-    await expect.poll(async () => (state = await call(request, { wait: { pid } })).state, { timeout: 120_000 }).toMatch(/^(done|failed|cancelled)$/);
+    await expect.poll(async () => (state = await observer.poll()).state, { timeout: 120_000 }).toMatch(/^(done|failed|cancelled)$/);
     expect(state.state, JSON.stringify(state.lines)).toBe('done');
-    const made = await call(request, { stat: { path: `${home}/hello.txt` } });
+    const made = await call(request, { stat: { path: `${home}/private/hello.txt` } });
     expect(made.uid).toBe(uid);
-    expect(await (await request.get(file(`${home}/hello.txt`))).text()).toBe('hello\n');
+    expect(await (await request.get(file(`${home}/private/hello.txt`))).text()).toBe('hello\n');
+    // The runner omits umask from its requests: implicit parents retain the spawn mask.
+    expect((await call(request, { stat: { path: `${home}/private` } })).mode & 0o777).toBe(0o700);
     // Ended, its credentials are revoked, and what it had open is closed.
     await call(request, { usermod: { name, unlock: true } }, { sudo: true });
     expect((await api(user, 'login', { data: { username: name, password: secret } })).ok()).toBe(true);
@@ -173,12 +161,12 @@ test('unzip asks before replacing, -o and -n decide, tar -k keeps, and hostile m
   for (const name of ['a.md', 'run.sh']) await put(request, file(`${base}/copy/docs/${name}`) + '&overwrite=true', { headers, data: 'changed\n' });
   // Asked: no for the first, then None for the rest.
   await run(page, 'unzip notes.zip -d copy', { wait: false });
-  await expect(form(page).locator('.busy')).toHaveText('Answer ↵', { timeout: 120_000 });
+  await expect(form(page)).toHaveAttribute('data-state', 'input', { timeout: 120_000 });
   await expect(transcript(page)).toContainText('replace ' + base + '/copy/docs/a.md? [y]es, [n]o, [A]ll, [N]one');
   await page.locator('#command').fill('y'); await page.locator('#command').press('Enter');
-  await expect(form(page).locator('.busy')).toHaveText('Answer ↵');
+  await expect(form(page)).toHaveAttribute('data-state', 'input');
   await page.locator('#command').fill('N'); await page.locator('#command').press('Enter');
-  await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 120_000 });
+  await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 120_000 });
   expect(await (await request.get(file(base + '/copy/docs/a.md'))).text()).toBe('alpha\n'.repeat(2000));
   expect(await (await request.get(file(base + '/copy/docs/run.sh'))).text()).toBe('changed\n');
   await run(page, 'unzip -qn notes.zip -d copy');
@@ -208,7 +196,7 @@ test('unzip asks before replacing, -o and -n decide, tar -k keeps, and hostile m
   await expect(transcript(page).locator('pre').last()).toContainText('Permission denied');
 });
 
-test('Ctrl+C stops an extraction between files, and a closed tab leaves its job running', async ({ page, request }) => {
+test('Ctrl+C cancels owned work; explicit detach survives closing its control handle', async ({ page, request }) => {
   await mkdirp(request, base + '/docs/many');
   for (let i = 0; i < 40; i++) expect((await put(request, file(`${base}/docs/many/f${String(i).padStart(2, '0')}.txt`), { headers, data: 'x'.repeat(1000 + i) })).status()).toBe(201);
   await terminal(page);
@@ -216,17 +204,18 @@ test('Ctrl+C stops an extraction between files, and a closed tab leaves its job 
   await run(page, 'unzip many.zip -d stopped', { wait: false });
   await expect(transcript(page)).toContainText('inflating:', { timeout: 120_000 });
   await page.locator('#command').press('Control+c');
-  await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 120_000 });
+  await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 120_000 });
   const stopped = await ls(request, base + '/stopped/docs/many');
   expect(stopped.length).toBeGreaterThan(0); expect(stopped.length).toBeLessThan(40);
   // What was extracted is whole; nothing is left half-written.
   expect(stopped.every(e => e.uploaded === undefined)).toBe(true);
   // A job started in a tab that closes runs to its end.
-  await page.keyboard.press('Alt+t'); await expect(page.getByRole('tab')).toHaveCount(2);
-  await run(page, 'unzip -q many.zip -d detached', { wait: false });
-  await expect(form(page).locator('.busy')).toHaveText('Working...');
-  await page.getByRole('button', { name: 'Close tab 2' }).click();
-  await expect(page.getByRole('tab')).toHaveCount(1);
+  await mkdirp(request, base + '/detached');
+  const resource = await directory(request, base), driver = await device(request);
+  const detached = await driver.submit({ operation: 'extract', format: 'zip', source: resource('many.zip'),
+    destination: resource('detached'), existing: 'replace', members: [], verbose: false });
+  await detached.detach();
+  await detached.close();
   await expect.poll(async () => (await ls(request, base + '/detached/docs/many')).length, { timeout: 180_000 }).toBe(40);
   await run(page, 'jobs');
   await expect(transcript(page).locator('pre').last()).toContainText('cancelled');
@@ -239,7 +228,7 @@ test('extracting nothing ends at once and says why; modes are those archived, 00
   await make('many.zip', zipOf(Array.from({ length: 700 }, (_, i) => [String(i).padStart(4, '0') + '.txt', 'x'])));
   await terminal(page);
   // Each ends once, rather than plan again and again.
-  const ends = async text => { await run(page, text, { wait: false }); await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 120_000 }); };
+  const ends = async text => { await run(page, text, { wait: false }); await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 120_000 }); };
   await ends('unzip -d out empty.zip');
   await expect(transcript(page)).toContainText('warning [' + base + '/empty.zip]:  zipfile is empty');
   await run(page, 'mkdir none'); await ends('tar -xf empty.tar -C none');
@@ -275,7 +264,7 @@ test('extraction tells a guest nothing of what lies where it may not look', asyn
   await page.goto('/');
   // Not asked whether to replace the file that is there: both fail alike.
   await run(page, `unzip ${base}/probe.zip -d ${base}/shared`, { wait: false });
-  await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 120_000 });
+  await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 120_000 });
   await expect(transcript(page)).not.toContainText('replace ');
   for (const name of ['exists.txt', 'missing.txt']) await expect(transcript(page)).toContainText(`${base}/shared/private/${name}: Permission denied`);
   expect(await (await request.get(file(base + '/shared/private/exists.txt'), { headers })).text()).toBe('kept');
@@ -326,4 +315,24 @@ test('faststart moves a video\'s index before its media, in place, once', async 
   // Once is enough; what is not a video is refused.
   await run(page, 'faststart clip.mp4'); await expect(transcript(page)).toContainText('is already faststart; left as it was');
   await run(page, 'faststart docs/a.md'); await expect(transcript(page)).toContainText('not a readable MP4 or QuickTime file');
+});
+
+test('dash executes archive clients and a killed child releases its device while its parent stays alive', async ({ page, request }) => {
+  test.skip(!process.env.WASIX_DASH, 'set WASIX_DASH to the approved WASIX dash');
+  await put(request, file(base + '/dash.wasm'), { headers, data: await readFile(process.env.WASIX_DASH) });
+  await program(request, ['chmod', '755', base + '/dash.wasm']);
+  const before = new Set((await processes(request)).map(p => p.pid));
+  await terminal(page);
+  await run(page, `./dash.wasm -c 'cd ${base}; zip -rq shell.zip docs; tar -cf shell.tar docs; tar -tf shell.tar | wc -l; unzip shell.zip; /usr/bin/printf "parent-alive\\n"; /usr/bin/sleep 20'`, { wait: false });
+  await expect(transcript(page).locator('pre').last()).toContainText('replace ', { timeout: 120_000 });
+  const child = (await processes(page.request)).find(p => /^\d+$/.test(p.pid) && p.cmdline[0]?.endsWith('unzip'));
+  expect(child).toBeDefined();
+  await call(page.request, { kill: { pid: child.pid, signal: 9 } });
+  await expect(transcript(page).locator('pre').last()).toContainText(/(^|\n)parent-alive(\n|$)/, { timeout: 120_000 });
+  await expect(form(page)).not.toHaveAttribute('data-state', 'idle');
+  await expect.poll(async () => (await processes(request)).find(p => !before.has(p.pid) && p.name === 'unzip')?.state,
+    { timeout: 10_000 }).toBe('cancelled');
+  await page.locator('#command').press('Control+c');
+  await expect(form(page)).toHaveAttribute('data-state', 'idle');
+  expect((await ls(request, base)).map(e => e.name)).toEqual(expect.arrayContaining(['shell.zip', 'shell.tar']));
 });

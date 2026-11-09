@@ -7,11 +7,11 @@ use crate::names::Names;
 use crate::sys::{Sys, calls, lstat, stat};
 use crate::walk;
 use abi::{ACL_ACCESS, ACL_DEFAULT, Call, Errno, Error, Stat};
+use os_core::acl::{self, Entries, Spec};
+use os_core::cli::{parse, permissions as args};
+use os_core::permissions::change_mode;
+use os_core::xattr;
 use serde_json::Value;
-use terminal_worker_core::acl::{self, Entries, Spec};
-use terminal_worker_core::cli::{parse, permissions as args};
-use terminal_worker_core::permissions::change_mode;
-use terminal_worker_core::xattr;
 
 /// What a program acts on: a name as it shows it, its absolute path, and its stat.
 struct Target {

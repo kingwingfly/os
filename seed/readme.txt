@@ -1,4 +1,4 @@
-R2 TERMINAL
+OS
 
 Commands operate on an R2 virtual filesystem, never a host shell.
 

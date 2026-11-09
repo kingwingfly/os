@@ -18,9 +18,9 @@ use crate::auth;
 use crate::db::{Db, File, fd_key};
 use abi::{Call, Closed, Errno, Error, FICLONE, O_ACCMODE, O_APPEND, O_RDONLY, O_TRUNC, Opened};
 use kernel::{Fs, Opening, Process};
+use os_core::permissions::{Identity, Node, Store, WRITE};
+use os_core::{CHUNK_SIZE, MAX_FILE, mime};
 use serde_json::{Value, json};
-use terminal_worker_core::permissions::{Identity, Node, Store, WRITE};
-use terminal_worker_core::{CHUNK_SIZE, MAX_FILE, mime};
 
 /// How long a writer's file stays its own after it last kept its descriptor: every few seconds
 /// while its page is there (web/upload.mjs).
@@ -67,6 +67,9 @@ pub fn call(
         Call::Fchmod { fd, mode } => {
             let found = db.fd(sid, fd.number()).ok_or(Errno::EBADF)?;
             owned(&found, caller)?;
+            if found.flags & abi::O_PATH != 0 {
+                return Err(Errno::EBADF.into());
+            }
             // The image is read-only, as its names are (sys.rs).
             if crate::usr::is(&found.path) {
                 return Err(Errno::EROFS.into());
@@ -81,6 +84,12 @@ pub fn call(
         }
         Call::Ioctl { fd, request, arg } => {
             yours(db, sid, fd.number(), caller)?;
+            if db
+                .fd(sid, fd.number())
+                .is_some_and(|f| f.flags & abi::O_PATH != 0)
+            {
+                return Err(Errno::EBADF.into());
+            }
             let device = crate::dev::request(db, sid, fd.number())?;
             ioctl(db, sid, process, caller, fd.number(), device, request, arg)
         }
@@ -675,7 +684,7 @@ pub fn pread(
             let sid = sid.ok_or(Errno::EBADF)?;
             let found = db.fd(sid, fd).ok_or(Errno::EBADF)?;
             owned(&found, caller)?;
-            if found.flags & O_ACCMODE == abi::O_WRONLY {
+            if found.flags & O_ACCMODE == abi::O_WRONLY || found.flags & abi::O_PATH != 0 {
                 return Err(Errno::EBADF.into());
             }
             if found.device.is_some() {
@@ -801,15 +810,15 @@ pub fn by_token(
                 .filter(|credential| credential.owner() == *owner || credential.image() == *owner)
                 .ok_or(Errno::EBADF)?;
             let mask = if found.exec {
-                terminal_worker_core::permissions::EXEC
+                os_core::permissions::EXEC
             } else {
-                terminal_worker_core::permissions::READ
+                os_core::permissions::READ
             };
             (row.identity(), mask)
         }
         // A page's descriptor is its pages' alone, as `owned` has it: not a process's.
         None if caller.is_some() => return Err(Errno::EBADF.into()),
-        None => (acting(&found, who), terminal_worker_core::permissions::READ),
+        None => (acting(&found, who), os_core::permissions::READ),
     };
     let file = found
         .file
@@ -819,7 +828,7 @@ pub fn by_token(
         .ok_or(Errno::EBADF)?;
     let permitted = {
         let paths = db.showing(&file.id);
-        if mask == terminal_worker_core::permissions::EXEC {
+        if mask == os_core::permissions::EXEC {
             // The kernel's X rule, not Identity::allows: root too needs an x bit, so a chmod
             // from 0755 to 0644 revokes the image for root as it does for anyone else.
             paths.iter().any(|path| {

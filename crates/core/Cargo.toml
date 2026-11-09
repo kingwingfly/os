@@ -1,10 +1,12 @@
 [package]
-name = "terminal-worker-core"
+name = "os-core"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+abi = { package = "os-abi", path = "../abi" }
 serde.workspace = true
+unicode-width = "0.2"
 # grep and fd patterns; Unicode-aware case folding, since paths are often not ASCII.
 regex = { version = "1.13", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
 # Every command's arguments, parsed as their GNU namesakes' are, and their -h and man pages, made

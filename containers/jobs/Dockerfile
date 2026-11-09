@@ -5,8 +5,8 @@ FROM docker.io/library/rust:1-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p terminal-worker-jobs \
-    && cp target/release/terminal-worker-jobs /jobs
+RUN cargo build --release --locked -p os-jobs \
+    && cp target/release/os-jobs /jobs
 
 FROM scratch
 COPY --from=build /jobs /jobs

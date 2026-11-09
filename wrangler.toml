@@ -1,7 +1,7 @@
-name = "terminal-worker"
-main = "crates/worker/build/index.js"
+name = "os"
+main = "crates/worker/entry.js"
 compatibility_date = "2026-10-24"
-# Served at terminal-worker.<subdomain>.workers.dev. No preview URLs: a preview would share the
+# Served at os.<subdomain>.workers.dev. No preview URLs: a preview would share the
 # live R2 bucket and Durable Objects, so it would be no sandbox.
 workers_dev = true
 preview_urls = false
@@ -18,7 +18,7 @@ run_worker_first = ["/api/*"]
 
 [[r2_buckets]]
 binding = "FILES"
-bucket_name = "terminal-worker-files"
+bucket_name = "os-files"
 
 [[unsafe.bindings]]
 name = "LOGIN_LIMIT"
@@ -40,11 +40,11 @@ port = 8787
 
 [[durable_objects.bindings]]
 name = "AUTHORITY"
-class_name = "TerminalAuthority"
+class_name = "OsAuthority"
 
 [[migrations]]
 tag = "v1-users-permissions"
-new_sqlite_classes = ["TerminalAuthority"]
+new_sqlite_classes = ["OsAuthority"]
 
 # Each browser's machine (machine.rs): its process namespace, one Durable Object per browser,
 # by its name, so that processes do not wait on the filesystem's one authority.

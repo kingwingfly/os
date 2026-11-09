@@ -13,7 +13,7 @@ const has = command => spawnSync('sh', ['-c', `command -v ${command}`], { stdio:
 const env = { ...process.env };
 let service, proxy;
 if (!env.WRANGLER_DOCKER_HOST && !env.DOCKER_HOST && !has('docker') && has('podman')) {
-  const socket = join(tmpdir(), `terminal-worker-podman-${process.getuid()}.sock`);
+  const socket = join(tmpdir(), `os-podman-${process.getuid()}.sock`);
   // Another session's service may answer there already; a socket left from an ended one does not.
   const answers = () => spawnSync('podman', ['--url', 'unix://' + socket, 'version'], { stdio: 'ignore' }).status === 0;
   if (!existsSync(socket) || !answers()) {
@@ -24,7 +24,7 @@ if (!env.WRANGLER_DOCKER_HOST && !env.DOCKER_HOST && !has('docker') && has('podm
     for (let i = 0; i < 100 && !existsSync(socket); i++) await new Promise(resolve => setTimeout(resolve, 100));
   }
   env.WRANGLER_DOCKER_BIN = join(dirname(fileURLToPath(import.meta.url)), 'podman-docker.sh');
-  const proxied = join(tmpdir(), `terminal-worker-podman-${process.getuid()}-${process.pid}.sock`);
+  const proxied = join(tmpdir(), `os-podman-${process.getuid()}-${process.pid}.sock`);
   proxy = podmanProxy(proxied, socket);
   env.WRANGLER_DOCKER_HOST = 'unix://' + proxied;
   // Podman resolves only qualified image names: name the registry of wrangler's egress sidecar.

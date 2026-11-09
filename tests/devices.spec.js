@@ -2,7 +2,7 @@ import { test, expect, request as playwrightRequest } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, mkdirp, program, put, rmrf } from './sys.js';
 import { browse } from './ui.js';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 const CHUNK = 8 * 1024 * 1024;
@@ -17,10 +17,10 @@ async function device(browser, username = 'root', password = rootPassword) {
   await expect(page.locator('.lock')).toContainText(username);
   return { context, page };
 }
-const busy = page => page.locator('.terminal-panel:not([hidden]) .busy');
+const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const transcript = page => page.locator('.terminal-panel:not([hidden]) .transcript');
 async function run(page, text) {
-  await expect(busy(page)).toHaveText('↵');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill(text); await input.press('Enter');
 }
@@ -110,8 +110,10 @@ test('the file panel dims what the account may not open, and says why when click
     const entry = name => page.locator('.files .file').filter({ hasText: name });
     await expect(entry('locked/')).toHaveClass(/denied/); await expect(entry('secret.txt')).toHaveClass(/denied/);
     await expect(entry('open/')).not.toHaveClass(/denied/); await expect(entry('notes.txt')).not.toHaveClass(/denied/);
-    // ls in the terminal dims them too.
-    await run(page, 'ls'); await expect(transcript(page).locator('.entry-denied')).toHaveCount(2);
+    // The executable reports the real modes; Files owns its permission hints and icons.
+    await run(page, 'ls -l');
+    await expect(transcript(page).locator('pre').last()).toContainText('drwx------');
+    await expect(transcript(page).locator('pre').last()).toContainText('-rw-------');
     // A click on one says why, in the panel.
     // aria-disabled, which Playwright will not click; people may, and are told why.
     await entry('secret.txt').click({ force: true });
