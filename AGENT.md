@@ -2,6 +2,12 @@
 
 This file is deliberately named `AGENT.md` as requested by the owner. Read it with `README.md` before changing the project.
 
+## Publication and deployment — 2026-11-09
+
+- The owner reports completing a fresh production deployment as `os` and the old-deployment cleanup after explicitly choosing to discard the old deployment's data. This supersedes earlier notes saying nothing was deployed. Production resources were not independently inspected here; that one-time reset choice is not permission to discard future production data.
+- The owner now requests a PR for the completed work and asks whether #40 can end. Publish `feat/phase-5-pty` against the default branch `dev`, with `Closes #40`; leave #20 open for Phase 6. O1–O5 are complete, and the remaining shell/devices/init/sessions/cgroup work is tracked separately in #20. This request does not ask for another deployment.
+- The functional commits are `2575f61`, `7ad5abf` and `abb081a`. Validation below records the runs completed on 2026-11-08; their volatile `/tmp` logs are no longer present. Older local-server/PID/state notes are historical and must be checked before reuse. The publication update changes documentation only.
+
 ## Rename to OS — 2026-11-08 (completed locally)
 
 - The owner explicitly chose `os` everywhere, display name **OS**, and renamed GitHub to `kingwingfly/os`. Verified the new repository; origin now uses `git@github.com:kingwingfly/os.git`. The physical checkout remains `/run/media/louis/Work/rust/terminal_worker` because active workspace/worktree paths refer to it; `.worktrees/codex` remains untouched. Older artifacts/logs can retain their original names.
@@ -102,7 +108,7 @@ The O1 notes below record the preceding slice; the O2 notes above supersede thei
 - OS is a browser operating system with WASI/WASIX processes, a filesystem, accounts, a terminal and desktop applications. Commands execute in the OS runtime; they never execute a host shell.
 - Keep project-owned interface text, errors, manuals, comments, tests, sample content, and documentation in English. Preserve Unicode path support; non-ASCII test cases are intentional.
 - Keep Wrangler configuration in TOML. Worker/crate name is `os`, core crate `os-core`, UI crate `os-ui`, bucket `os-files`.
-- The owner currently wants local `wrangler dev`, not a cloud deployment. Do not request Cloudflare credentials or deploy without a new instruction.
+- The owner manages the production deployment. Use local `wrangler dev` for ordinary development; do not deploy or change production resources without a new instruction.
 - Inspect Git status before editing. Do not assume changes belong exclusively to you or auto-commit without a request.
 
 ## Build and run
@@ -122,7 +128,7 @@ See README for prerequisites and commands. The known toolchain uses `worker-buil
 - `.dev.vars`, `.local-password`, and `.wrangler` are private local state, not source. Never print or commit secrets.
 - ADMIN_PASSWORD initializes root once. The everyday root password has already been changed and may differ from `.dev.vars` or `.local-password`. Do not reset it for testing.
 - SESSION_SECRET is a password pepper; changing it breaks existing password verification. Restore it with the database.
-- Nothing is deployed (2026-10-25). The owner said local state is disposable: `.wrangler` may be deleted during tests, and storage changes need no migration from earlier formats. Still prefer an isolated `--persist-to` directory for test instances, and never print or commit secrets.
+- Production exists (owner report, 2026-11-09). Use an isolated `--persist-to` directory for tests, preserve everyday local state, and never print or commit secrets. The current database schema is 7; older schemas are refused, not migrated. Resource-name compatibility does not provide a schema upgrade.
 - R2 bytes without the Durable Object's tables are not a complete filesystem backup. Do not bypass the initialization marker to repair a missing authority.
 - Localization changes the application and bundled examples; existing user-uploaded R2 paths/content remain user data.
 
