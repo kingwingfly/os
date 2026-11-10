@@ -8,6 +8,50 @@ pub mod process;
 
 pub use abi::Stat;
 
+/// Discover filesystem preopens even when exec inherited ordinary fds before them.
+/// Preview 1 libc normally stops at the first non-preopen; the OS host reserves
+/// preopens below 1024 and keeps inherited descriptor numbers intact.
+pub fn init_preopens() -> io::Result<()> {
+    #[cfg(target_os = "wasi")]
+    {
+        #[repr(C)]
+        struct Prestat {
+            tag: u8,
+            padding: [u8; 3],
+            length: u32,
+        }
+        #[link(wasm_import_module = "wasi_snapshot_preview1")]
+        unsafe extern "C" {
+            fn fd_prestat_get(fd: u32, record: *mut Prestat) -> u32;
+            fn fd_prestat_dir_name(fd: u32, name: *mut u8, length: usize) -> u32;
+        }
+        unsafe extern "C" {
+            fn __wasilibc_register_preopened_fd(fd: i32, name: *const u8) -> i32;
+        }
+        for fd in 3..1024 {
+            let mut pre = Prestat {
+                tag: 0,
+                padding: [0; 3],
+                length: 0,
+            };
+            // SAFETY: record has the preview-1 layout and is writable for this call.
+            if unsafe { fd_prestat_get(fd, &mut pre) } != 0 || pre.tag != 0 || pre.length > 4096 {
+                continue;
+            }
+            let mut name = vec![0; pre.length as usize + 1];
+            // SAFETY: the host writes at most the requested length, leaving a NUL terminator.
+            if unsafe { fd_prestat_dir_name(fd, name.as_mut_ptr(), pre.length as usize) } != 0 {
+                continue;
+            }
+            // SAFETY: libc copies this NUL-terminated name into its own preopen table.
+            if unsafe { __wasilibc_register_preopened_fd(fd as i32, name.as_ptr()) } != 0 {
+                return Err(io::Error::other("cannot register filesystem preopen"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read the full metadata of a path, following its last symlink only when requested.
 pub fn stat(path: &Path, follow: bool) -> io::Result<Stat> {
     let path = absolute(path)?;

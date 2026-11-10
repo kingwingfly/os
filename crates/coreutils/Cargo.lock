@@ -1566,6 +1566,7 @@ name = "os-coreutils"
 version = "0.1.0"
 dependencies = [
  "os-core",
+ "os-posix",
  "serde_json",
  "uu_arch",
  "uu_b2sum",

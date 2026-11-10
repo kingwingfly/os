@@ -1,3 +1,4 @@
+import { CONTROL_WORDS, bit, valid, ignoredByDefault, stoppedByDefault } from './signals.mjs';
 // exec(2), as the page does it: programs of /usr/bin, built for wasm32-wasip1, each run as a
 // process of its own (web/wasi/process.js, a Worker), with their arguments, environment, standard
 // input and the terminal. The binary is compiled once, and each process instantiates it anew.
@@ -36,6 +37,7 @@ const reap = async (pid, { status, signal }, forked = false) => {
   if (!forked || parent === 1) {
     try { await kernelCall('wait', { pid }); } catch { /* reaped already, or still running */ }
   }
+  hosted.get(parent)?.signal(17);
   // A wait that waits on it hears it ended.
   exits++;
   for (const wake of [...exited]) wake();
@@ -123,20 +125,33 @@ const KILLED = 0x100, GRACE = 1000;
 // The processes this tab hosts, by pid: a signal to one, from any tab or device, is told on the
 // page's events line (app.js `os:signal`), and the tab that hosts it acts on it.
 const hosted = new Map();
-export const deliverSignal = ({ pid, signal }) => hosted.get(pid)?.signal(signal);
+export const deliverSignal = async ({ pid }) => {
+  if (!hosted.has(pid)) return;
+  await reconciling;
+  await reconcile();
+};
 
 let reconciling;
 export function reconcile() {
   if (!hosted.size) return Promise.resolve();
-  return reconciling ??= kernelCall('sync').then(rows => {
+  if (reconciling) return reconciling;
+  const checking = new Map(hosted);
+  return reconciling = kernelCall('sync', { acknowledged: Object.fromEntries([...checking].map(([pid, process]) => [pid, [...process.received.values()]])) }).then(rows => {
+    let acknowledge = false;
     const found = new Map(rows.map(row => [row.pid, row]));
-    for (const [pid, process] of hosted) {
+    for (const [pid, process] of checking) {
+      if (hosted.get(pid) !== process) continue;
       const row = found.get(pid);
       if (!row) process.signal(SIG.KILL);
-      else if (row.state === 'zombie') process.signal(row.signal ?? SIG.TERM);
-      else if (row.state === 'stopped') process.signal(SIG.STOP);
-      else if (process.stopped) process.signal(SIG.CONT);
+      else if (row.state === 'zombie') process.kill(row.signal ?? SIG.KILL);
+      // STOP/CONT come from the ordered, acknowledged queue too. Reapplying a
+      // stale state snapshot here can stop a process again after `fg` resumes it.
+      for (const event of row?.pending_signals ?? []) {
+        if ((process.received.get(event.signal) ?? 0) < event.sequence) { process.signal(event.signal); process.received.set(event.signal, event.sequence); }
+        acknowledge = true;
+      }
     }
+    if (acknowledge) setTimeout(() => { void reconcile(); }, 0);
   }).catch(() => {}).finally(() => { reconciling = null; });
 }
 
@@ -187,10 +202,14 @@ export async function exec(stages, options = {}) {
     get pids() { return group().filter(process => !process.ended).map(process => process.pid); },
     stoppable: !!isolated,
     signal: signal => {
-      if (ENDING.has(signal)) return stop(signal);
       for (const process of group()) {
+        if ([SIG.STOP, SIG.CONT].includes(signal)) {
+          void kernelCall('kill', { pid: process.pid, from: process.pid, signal })
+            .then(() => deliverSignal({ pid: process.pid })).catch(() => {});
+          continue;
+        }
         process.signal(signal);
-        if ([SIG.STOP, SIG.TSTP, SIG.CONT].includes(signal)) void kernelCall('kill', { pid: process.pid, from: process.pid, signal }).catch(() => {});
+        if (signal === SIG.KILL) void kernelCall('kill', { pid: process.pid, from: process.pid, signal }).catch(() => {});
       }
     },
   };
@@ -269,13 +288,13 @@ export async function exec(stages, options = {}) {
       void done.then(() => displaying.delete(done), () => displaying.delete(done));
       return done;
     };
-    let settle, status = null, killing = null;
+    let settle, status = null, killing = null, stopVersion = 0;
     const exited = new Promise(resolve => { settle = resolve; });
     // The word it is signalled by (stopped, continued, ended: process.js); the memory its
     // waiting calls are answered in.
-    const control = isolated ? new Int32Array(new SharedArrayBuffer(4)) : null;
+    const control = isolated ? new Int32Array(new SharedArrayBuffer(CONTROL_WORDS * 4)) : null;
     const channel = isolated ? new SharedArrayBuffer(8 + CHANNEL) : null;
-    const process = { pid, token, files, stopped: false, ended: false, forked, exited, image: { module, memory, startSection } };
+    const process = { received: new Map(), pid, token, files, stopped: false, ended: false, forked, exited, image: { module, memory, startSection } };
     // An external kill can revoke this image before the host hears its signal. The
     // descriptor table belongs to its whole fork lineage: a surviving holder may close
     // its last references. If none survives, authority revocation closes the lineage.
@@ -317,7 +336,13 @@ export async function exec(stages, options = {}) {
         else if (type === 'cleanup') reply = { token: cleanupToken() };
         else if (type === 'getpid') reply = await kernelCall('getpid', { pid: args.pid });
         // kill(2) from a process is the process's, by its own credentials.
-        else if (type === 'kill') reply = (await kernelCall('kill', { pid: args.pid, signal: args.signal, from: pid })) ?? {};
+        else if (type === 'kill') {
+          reply = (await kernelCall('kill', { pid: args.pid, signal: args.signal, from: pid })) ?? {};
+          // A self-signal must be pending before kill returns. An older sync
+          // may predate this request, so finish it before fetching delivery.
+          await reconciling;
+          await reconcile();
+        }
         else if (type === 'exec') reply = await replace(args);
         else if (type === 'spawn') reply = await spawn(args);
         else if (type === 'tty') reply = ttyRequest(args);
@@ -427,7 +452,18 @@ export async function exec(stages, options = {}) {
       }
       else if (data.ttyFds) void kernelCall('tty_fds', { pid, tty: terminal?.number, fds: data.ttyFds }).catch(() => {});
       else if (data.reading) onReading();
-      else if (data.stopped || data.continued) { process.stopped = !!data.stopped; changed(); }
+      else if (data.stopped || data.continued) {
+        const version = ++stopVersion;
+        // Only a caught/default job-control decision needs reporting. A STOP
+        // delivered by the registry is already recorded; echoing it can race CONT.
+        const recorded = data.stopped && data.cause !== SIG.STOP
+          ? kernelCall('kill', { pid, from: pid, signal: SIG.STOP }).then(() => deliverSignal({ pid }))
+          : Promise.resolve();
+        void recorded.catch(() => {}).then(() => {
+          if (version !== stopVersion || process.ended) return;
+          process.stopped = !!data.stopped; changed();
+        });
+      }
       else if (data.truncated) { truncated = true; truncatedBy.add(argv[0]); }
       else if (data.described) files?.descriptions.set(data.described.slot, data.described);
       else if (data.closed) { if (files?.descriptions.get(data.closed.slot)?.gen === data.closed.gen) files.descriptions.delete(data.closed.slot); }
@@ -437,15 +473,27 @@ export async function exec(stages, options = {}) {
     };
     worker.onerror = event => { onOutput(2, `${argv[0]}: ${event.message}\n`); end({ code: 126 }, true); };
     worker.postMessage({ ...start, module, memory, startSection, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: !!terminal }, pty: terminal?.transferable, control: control?.buffer, outputCredit: outputCredit?.buffer, channel, shares: files?.shares.buffer }, transfer);
-    // A signal, as its default action has it: ended, stopped at its next system call, or
-    // continued.
+    // Catchable signals remain pending until a safe point. Only SIGKILL is
+    // irrevocable. A handler or blocked disposition prevents the fallback kill.
     const signal = number => {
-      if (ENDING.has(number)) return kill(number);
-      if (!control) return;
-      // Stopped: one asleep on its word wakes to stop; continued, one stopped goes on. One
-      // being ended stays so.
-      if (number === SIG.STOP || number === SIG.TSTP) { Atomics.compareExchange(control, 0, 0, 1); Atomics.notify(control, 0); }
-      else if (number === SIG.CONT) { Atomics.compareExchange(control, 0, 1, 0); Atomics.notify(control, 0); }
+      if (!valid(number) || status != null) return;
+      if (number === SIG.KILL) return kill(number);
+      if (!control) return kill(number);
+      const flag = bit(number);
+      if (number === SIG.CONT) {
+        Atomics.compareExchange(control, 0, 1, 0);
+        Atomics.and(control, 1, ~(bit(19) | bit(20) | bit(21) | bit(22)));
+      }
+      if (stoppedByDefault.has(number)) Atomics.and(control, 1, ~bit(18));
+      if (number === SIG.STOP) Atomics.compareExchange(control, 0, 0, 1);
+      else if (!(Atomics.load(control, 3) & flag)) Atomics.or(control, 1, flag);
+      Atomics.notify(control, 0);
+      if (!ignoredByDefault.has(number) && number !== SIG.CONT && !stoppedByDefault.has(number)) {
+        setTimeout(() => {
+          if (status == null && Atomics.load(control, 0) === 0 && Atomics.load(control, 1) & flag &&
+              !((Atomics.load(control, 2) | Atomics.load(control, 3) | Atomics.load(control, 4)) & flag)) kill(number);
+        }, GRACE);
+      }
     };
     Object.assign(process, { kill, signal });
     hosted.set(pid, process);

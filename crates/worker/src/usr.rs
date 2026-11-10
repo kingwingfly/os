@@ -18,21 +18,25 @@ pub const COREUTILS: &str = "usr:coreutils";
 pub const OS: &str = "usr:os";
 /// Additional WASI user-space programs.
 pub const UTILITIES: &str = "usr:utilities";
+/// Pinned source-built WASIX shell.
+pub const DASH: &str = "usr:dash";
 pub fn asset(content: &str) -> Option<&'static str> {
     match content {
         COREUTILS => Some("/usr/bin/coreutils.wasm"),
         UTILITIES => Some("/usr/bin/utilities.wasm"),
+        DASH => Some("/usr/bin/dash.wasm"),
         OS | "usr:terminal" => Some("/pkg/frontend_bg.wasm"),
         _ => None,
     }
 }
 /// How many bytes the binary `content` is.
 pub fn size(content: &str) -> u64 {
-    let (coreutils, frontend, utilities) = SIZES.with(Cell::get);
+    let (coreutils, frontend, utilities, dash) = SIZES.with(Cell::get);
     match content {
         COREUTILS => coreutils,
         OS | "usr:terminal" => frontend,
         UTILITIES => utilities,
+        DASH => dash,
         _ => 0,
     }
 }
@@ -51,7 +55,7 @@ struct Program {
 
 thread_local! {
     /// The binaries' sizes, and when this instance mounted /usr, as its times.
-    static SIZES: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
+    static SIZES: Cell<(u64, u64, u64, u64)> = const { Cell::new((0, 0, 0, 0)) };
     static MOUNTED: Cell<(u64, u32)> = const { Cell::new((0, 0)) };
     static PROGRAMS: RefCell<Vec<Program>> = const { RefCell::new(Vec::new()) };
 }
@@ -62,6 +66,16 @@ fn with_programs<R>(f: impl FnOnce(&[Program]) -> R) -> R {
         let mut programs = programs.borrow_mut();
         if programs.is_empty() {
             let mut all = vec![
+                Program {
+                    name: "dash".into(),
+                    content: Some(DASH),
+                    target: "",
+                },
+                Program {
+                    name: "sh".into(),
+                    content: None,
+                    target: "dash",
+                },
                 Program {
                     name: "coreutils".into(),
                     content: Some(COREUTILS),
@@ -92,8 +106,8 @@ fn with_programs<R>(f: impl FnOnce(&[Program]) -> R) -> R {
 
 /// Mount the build's images. Legacy frontend content IDs remain readable for existing clones,
 /// but no /usr/bin name advertises the frontend as an executable.
-pub fn mount(coreutils: u64, frontend: u64, utilities: u64) {
-    SIZES.with(|cell| cell.set((coreutils, frontend, utilities)));
+pub fn mount(coreutils: u64, frontend: u64, utilities: u64, dash: u64) {
+    SIZES.with(|cell| cell.set((coreutils, frontend, utilities, dash)));
     MOUNTED.with(|cell| cell.set(crate::auth::clock()));
 }
 
@@ -214,9 +228,9 @@ pub fn times(ino: u64) -> Option<kernel::Times> {
 
 /// What statfs tells of the image: its blocks, all used.
 pub fn statfs() -> abi::StatFs {
-    let (coreutils, frontend, utilities) = SIZES.with(Cell::get);
+    let (coreutils, frontend, utilities, dash) = SIZES.with(Cell::get);
     let _ = frontend;
-    let blocks = coreutils.div_ceil(4096) + utilities.div_ceil(4096);
+    let blocks = coreutils.div_ceil(4096) + utilities.div_ceil(4096) + dash.div_ceil(4096);
     abi::StatFs {
         bsize: 4096,
         blocks,

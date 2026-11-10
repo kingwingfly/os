@@ -87,6 +87,10 @@ pub const UTILITIES: &[&str] = &[
 ];
 
 fn main() {
+    if let Err(error) = os_posix::init_preopens() {
+        eprintln!("coreutils: {error}");
+        std::process::exit(1);
+    }
     if let Some(pwd) = std::env::var_os("PWD") {
         let _ = std::env::set_current_dir(pwd);
     }

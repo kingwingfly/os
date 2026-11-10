@@ -11,6 +11,6 @@ export default defineConfig({
       launchOptions: { env: browserEnv, args: ['--ozone-platform=headless', '--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'] } } },
     // The process engine in a second browser: its calls by JSPI and by synchronous XHR, fork,
     // exec, pipes and process authorization.
-    { name: 'firefox', testMatch: ['rename.spec.js', 'archive.spec.js', 'accelerator.spec.js', 'files.spec.js', 'exec.spec.js', 'fork.spec.js', 'process-security.spec.js', 'pty.spec.js', 'completion.spec.js', 'file-launch.spec.js', 'executable-resolution.spec.js', 'shell.spec.js'], use: { browserName: 'firefox', launchOptions: { env: browserEnv } } },
+    { name: 'firefox', testMatch: ['identity-signals.spec.js', 'system-shell.spec.js', 'null.spec.js', 'rename.spec.js', 'archive.spec.js', 'accelerator.spec.js', 'files.spec.js', 'exec.spec.js', 'fork.spec.js', 'process-security.spec.js', 'pty.spec.js', 'completion.spec.js', 'file-launch.spec.js', 'executable-resolution.spec.js', 'shell.spec.js'], use: { browserName: 'firefox', launchOptions: { env: browserEnv } } },
   ],
 });

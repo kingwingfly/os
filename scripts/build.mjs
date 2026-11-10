@@ -77,10 +77,11 @@ await mkdir(join(out, 'usr/bin'), { recursive: true });
 await copy(join(target, 'coreutils/wasm32-wasip1/release/coreutils.wasm'), join(out, 'usr/bin/coreutils.wasm'));
 run('cargo', ['build', '--release', '--target', 'wasm32-wasip1', '-p', 'os-utilities']);
 await copy(join(target, 'wasm32-wasip1/release/utilities.wasm'), join(out, 'usr/bin/utilities.wasm'));
+run(process.execPath, ['scripts/build-shell.mjs', '--out-dir', out]);
 // What the kernel's /usr says of its binaries (crates/worker/src/usr.rs), which it cannot ask the
 // assets: their sizes.
 const sizes = {};
-for (const asset of ['/usr/bin/coreutils.wasm', '/usr/bin/utilities.wasm', '/pkg/frontend_bg.wasm']) sizes[asset] = (await stat(join(out, asset))).size;
+for (const asset of ['/usr/bin/coreutils.wasm', '/usr/bin/utilities.wasm', '/usr/bin/dash.wasm', '/pkg/frontend_bg.wasm']) sizes[asset] = (await stat(join(out, asset))).size;
 await writeFile(join(out, 'usr/manifest.json'), JSON.stringify(sizes));
 for (const name of ['index.html', 'style.css', '_headers']) await copy('web/' + name, join(out, name));
 if (assets) await copyTree(assets, join(out, 'content'));

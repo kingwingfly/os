@@ -475,7 +475,7 @@ async fn bytes(
             }
             let fd = fd.number();
             let asking = session.clone();
-            let (object, mime) = transact(state, move |db| {
+            let target = transact(state, move |db| {
                 let target = asking.of(db).and_then(|acting| {
                     let sid = acting.sid.as_deref().ok_or(Errno::EBADF)?;
                     crate::fds::pwrite(
@@ -492,6 +492,9 @@ async fn bytes(
                 (target, commit)
             })
             .map_err(io)??;
+            let Some((object, mime)) = target else {
+                return Ok(json!({ "written": length }));
+            };
             env.bucket("FILES")
                 .map_err(io)?
                 .put(&object, data.0)

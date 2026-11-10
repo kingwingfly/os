@@ -469,7 +469,10 @@ impl Kernel {
     }
 
     /// Recover the state of processes owned by this host, including earlier login sessions.
-    pub async fn sync(&self, host: &str) -> Result<String, JsValue> {
+    pub async fn sync(&self, host: &str, acknowledgements: &str) -> Result<String, JsValue> {
+        let acknowledgements: std::collections::BTreeMap<u32, Vec<u64>> =
+            serde_json::from_str(acknowledgements)
+                .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let processes = self
             .state
             .borrow()
@@ -477,6 +480,7 @@ impl Kernel {
             .iter()
             .filter(|(_, local)| local.host == host && local.ended.is_none())
             .map(|(&pid, local)| abi::ProcessProof {
+                signals: acknowledgements.get(&pid).cloned().unwrap_or_default(),
                 pid,
                 token: local.token.clone(),
             })
