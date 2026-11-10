@@ -7,13 +7,11 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use abi::{Call, SIGCONT, SIGTSTP};
+use abi::{SIGCONT, SIGTSTP};
 use futures::channel::oneshot;
 use futures::future::{Either, select};
 use leptos::prelude::*;
-use serde_json::Value;
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::spawn_local;
 
 use super::{Output, Shell, call};
 
@@ -89,21 +87,10 @@ fn stoppable(group: &JsValue) -> bool {
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
 }
-/// Send `signal` to the group `group`: here, at once, and to the kernel's record of each of its
-/// processes, which `ps` shows and which tells the tab hosting them (this one) on its line.
+/// Signal the hosted group once. Its executor records stops, resumes and exits;
+/// a second page-side kill would redeliver a caught signal through the registry.
 pub(super) fn signal(group: &JsValue, number: u8) {
     call(group, "signal", &JsValue::from(number));
-    let pids = pids(group);
-    spawn_local(async move {
-        let sys = crate::sys::HttpSys::default();
-        for pid in pids {
-            let sent = Call::Kill {
-                pid: pid.to_string(),
-                signal: Some(number),
-            };
-            let _ = userland::sys::call::<Value>(&sys, sent).await;
-        }
-    });
 }
 
 /// How a job ended, as bash says it: Done, Exit N, or the signal that ended it.

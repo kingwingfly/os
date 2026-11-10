@@ -180,22 +180,43 @@ pub const SIGCONT: u8 = 18;
 pub const SIGSTOP: u8 = 19;
 pub const SIGTSTP: u8 = 20;
 /// The signals by name, in number order, as `kill -l` lists them.
-pub const SIGNALS: [(u8, &str); 10] = [
-    (SIGHUP, "HUP"),
-    (SIGINT, "INT"),
-    (SIGQUIT, "QUIT"),
-    (SIGKILL, "KILL"),
-    (SIGPIPE, "PIPE"),
-    (SIGTERM, "TERM"),
-    (SIGCHLD, "CHLD"),
-    (SIGCONT, "CONT"),
-    (SIGSTOP, "STOP"),
-    (SIGTSTP, "TSTP"),
+pub const SIGNALS: [(u8, &str); 31] = [
+    (1, "HUP"),
+    (2, "INT"),
+    (3, "QUIT"),
+    (4, "ILL"),
+    (5, "TRAP"),
+    (6, "ABRT"),
+    (7, "BUS"),
+    (8, "FPE"),
+    (9, "KILL"),
+    (10, "USR1"),
+    (11, "SEGV"),
+    (12, "USR2"),
+    (13, "PIPE"),
+    (14, "ALRM"),
+    (15, "TERM"),
+    (16, "STKFLT"),
+    (17, "CHLD"),
+    (18, "CONT"),
+    (19, "STOP"),
+    (20, "TSTP"),
+    (21, "TTIN"),
+    (22, "TTOU"),
+    (23, "URG"),
+    (24, "XCPU"),
+    (25, "XFSZ"),
+    (26, "VTALRM"),
+    (27, "PROF"),
+    (28, "WINCH"),
+    (29, "IO"),
+    (30, "PWR"),
+    (31, "SYS"),
 ];
 /// The signal `name` names: by its name, with or without SIG, in any case, or its number.
 pub fn signal_named(name: &str) -> Option<u8> {
     if let Ok(number) = name.parse::<u8>() {
-        return SIGNALS.iter().find(|(n, _)| *n == number).map(|(n, _)| *n);
+        return (number <= 31).then_some(number);
     }
     let upper = name.to_ascii_uppercase();
     let bare = upper.strip_prefix("SIG").unwrap_or(&upper);
@@ -285,14 +306,25 @@ pub struct Forked {
 /// only, independently of the browser account currently signed in.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProcessProof {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<u64>,
     pub pid: u32,
     #[serde(rename = "proc")]
     pub token: String,
 }
 
+/// A coalesced standard signal awaiting acknowledgement by its process host.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingSignal {
+    pub sequence: u64,
+    pub signal: u8,
+}
+
 /// A process, as /proc and wait tell of it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Proc {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_signals: Vec<PendingSignal>,
     pub pid: u32,
     pub ppid: u32,
     pub state: ProcState,
@@ -480,6 +512,9 @@ pub const SND_ANSWER: u32 = 0x5103;
 pub struct Opened {
     pub fd: u32,
     pub size: u64,
+    /// A kernel-authorized device driver. Runtimes may implement stateless device I/O locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub chunk_size: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1261,6 +1296,9 @@ mod tests {
         assert_eq!(signal_named("SIGTSTP"), Some(SIGTSTP));
         assert_eq!(signal_named("kill"), Some(SIGKILL));
         assert_eq!(signal_named("15"), Some(SIGTERM));
+        assert_eq!(signal_named("0"), Some(0));
+        assert_eq!(signal_named("USR1"), Some(10));
+        assert_eq!(signal_named("32"), None);
         assert_eq!(signal_named("BOGUS"), None);
         assert_eq!(signal_name(SIGCONT), Some("CONT"));
         let batch: Batch =

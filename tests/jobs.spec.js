@@ -1,4 +1,5 @@
 import { test, expect } from './test.js';
+import { call as syscall } from './sys.js';
 
 // Job control (crates/frontend/src/shell/jobs.rs, web/wasi/exec.mjs): a pipeline of /usr/bin run
 // with & is a job; Ctrl+Z stops the one in the foreground, a job from then on; fg, bg and
@@ -81,8 +82,14 @@ test('a signal from another tab reaches the process where it runs: stopped, then
     await run(two, `kill -STOP ${pid}`);
     await expect(last(one)).toHaveText('[1]+  Stopped                 coreutils sleep 60');
     await run(two, 'kill -l');
-    await expect(last(two)).toHaveText('HUP INT QUIT KILL PIPE TERM CHLD CONT STOP TSTP');
+    // The terminal may wrap inside a signal name. Compare the ordered catalog without visual whitespace.
+    await expect.poll(async () => (await last(two).textContent()).replace(/\s/g, '')).toBe(
+      'HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM STKFLT CHLD CONT STOP TSTP TTIN TTOU URG XCPU XFSZ VTALRM PROF WINCH IO PWR SYS'.replace(/\s/g, ''));
     await run(two, `kill ${pid}`);
+    // Catchable signals stay pending while stopped, even past the host's fallback deadline.
+    await one.waitForTimeout(1500);
+    expect((await syscall(one.request, { proc_poll: { pids: [Number(pid)] } }))[0].state).toBe('stopped');
+    await run(two, `kill -CONT ${pid}`);
     await expect(last(one)).toHaveText('[1]+  Terminated              coreutils sleep 60');
   } finally { await context.close(); }
 });

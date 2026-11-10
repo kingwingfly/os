@@ -216,6 +216,19 @@ fn open_follows_a_link_to_what_it_names_and_checks_as_linux_does() {
         errno(open(&fs, &ann, "/d/r", O_WRONLY | O_TRUNC, 0)),
         Errno::EACCES
     );
+    // A read/write descriptor needs both permissions, including for character devices.
+    file(&mut fs, "/d/write-only", 1000, 0o200);
+    assert!(open(&fs, &ann, "/d/write-only", O_WRONLY, 0).is_ok());
+    assert_eq!(
+        errno(open(&fs, &ann, "/d/write-only", abi::O_RDWR, 0)),
+        Errno::EACCES
+    );
+    assert_eq!(
+        errno(open(&fs, &ann, "/d/r", abi::O_RDWR, 0)),
+        Errno::EACCES
+    );
+    file(&mut fs, "/d/read-write", 1000, 0o600);
+    assert!(open(&fs, &ann, "/d/read-write", abi::O_RDWR, 0).is_ok());
     let excl = O_WRONLY | O_CREAT | O_EXCL;
     assert_eq!(errno(open(&fs, &ann, "/d/r", excl, 0o666)), Errno::EEXIST);
     // A directory opens to read, as Linux's does, and only to read; O_DIRECTORY opens nothing

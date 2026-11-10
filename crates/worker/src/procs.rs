@@ -11,8 +11,8 @@
 //! is revoked there in a batch (`revoked`, flushed with the next execve or by the alarm).
 use crate::db::{Db, int, text};
 use abi::{
-    ARG_MAX, ENV_MAX, Errno, Error, Forked, PIDS_MAX, PROC_MAX, Proc, ProcState, SIGCONT, SIGHUP,
-    SIGINT, SIGKILL, SIGPIPE, SIGQUIT, SIGSTOP, SIGTERM, SIGTSTP,
+    ARG_MAX, ENV_MAX, Errno, Error, Forked, PIDS_MAX, PROC_MAX, Proc, ProcState, SIGCONT, SIGKILL,
+    SIGSTOP,
 };
 use kernel::registry;
 use os_core::permissions::Identity;
@@ -30,7 +30,8 @@ pub const ROOT_CGROUPS: [&str; 4] = ["/init", "/user", "/system", "/cluster"];
 type Result<T> = std::result::Result<T, Error>;
 
 /// The registry's tables, in its namespace's own Durable Object.
-const SCHEMA: [&str; 12] = [
+const SCHEMA: [&str; 14] = [
+    "CREATE TABLE IF NOT EXISTS pending_signals(sequence INTEGER PRIMARY KEY AUTOINCREMENT, pid INTEGER NOT NULL, signal INTEGER NOT NULL, UNIQUE(pid, signal))",
     // The namespace, one small machine: the browser it is (its guest, or session, key), the
     // boot it is of (a reload resets stale processes), and the next pid.
     "CREATE TABLE IF NOT EXISTS namespaces(id TEXT PRIMARY KEY, guest TEXT NOT NULL, boot TEXT, next_pid INTEGER NOT NULL, created INTEGER NOT NULL, last_seen INTEGER NOT NULL)",
@@ -53,6 +54,7 @@ const SCHEMA: [&str; 12] = [
     "CREATE TABLE IF NOT EXISTS renewals(token TEXT PRIMARY KEY)",
     "CREATE TABLE IF NOT EXISTS terminals(pid INTEGER PRIMARY KEY, tty INTEGER NOT NULL, fds TEXT NOT NULL)",
     "CREATE TRIGGER IF NOT EXISTS terminals_remove AFTER DELETE ON processes BEGIN DELETE FROM terminals WHERE pid = old.pid; END",
+    "CREATE TRIGGER IF NOT EXISTS signals_remove AFTER DELETE ON processes BEGIN DELETE FROM pending_signals WHERE pid = old.pid; END",
     "CREATE TABLE IF NOT EXISTS observations(name TEXT PRIMARY KEY, value INTEGER NOT NULL)",
 ];
 
@@ -113,6 +115,7 @@ pub struct Row {
 impl Row {
     pub fn proc(&self) -> Proc {
         Proc {
+            pending_signals: Vec::new(),
             pid: self.pid,
             ppid: self.ppid,
             state: state_of(&self.state),
@@ -289,7 +292,18 @@ impl Db {
                         vec![int(now + abi::PROCESS_LEASE), int(proof.pid)],
                     );
                 }
-                Some(row.proc())
+                for sequence in proof.signals.iter().take(31) {
+                    self.run(
+                        "DELETE FROM pending_signals WHERE pid = ? AND sequence = ?",
+                        vec![int(proof.pid), int(*sequence)],
+                    );
+                }
+                let mut value = row.proc();
+                value.pending_signals = self.rows::<abi::PendingSignal>(
+                    "SELECT sequence, signal FROM pending_signals WHERE pid = ? ORDER BY sequence",
+                    vec![int(proof.pid)],
+                );
+                Some(value)
             })
             .collect()
     }
@@ -834,6 +848,10 @@ impl Db {
     /// The process `row` ends with the wait status `wait`: a zombie, its children init's, and
     /// its token revoked unless a fork of it still runs.
     fn end(&mut self, row: &Row, wait: i32, signal: Option<u8>, now: u64) {
+        self.run(
+            "DELETE FROM pending_signals WHERE pid = ?",
+            vec![int(row.pid)],
+        );
         let token = self.token_of(&row.ns, row.pid).unwrap_or_default();
         self.run(
             "UPDATE processes SET state = 'zombie', status = ?, signal = ?, ended = ? WHERE ns = ? AND pid = ?",
@@ -928,9 +946,9 @@ impl Db {
         }
         self.wait(ns, None, pid)
     }
-    /// kill(2) in the namespace, by each signal's default action (a process here installs no
-    /// handlers): SIGHUP, SIGINT, SIGQUIT, SIGKILL, SIGPIPE and SIGTERM end the process;
-    /// SIGSTOP and SIGTSTP stop it; SIGCONT resumes it. A signal from another account needs root.
+    /// Authorize and queue catchable signals for the process host. Only SIGKILL
+    /// ends credentials immediately; STOP/CONT also update the registry state.
+    /// A signal from another account needs root.
     pub fn kill(
         &mut self,
         ns: &str,
@@ -946,16 +964,36 @@ impl Db {
         if row.zombie() {
             return Err(Errno::ESRCH.into());
         }
-        // Init ignores the signals it installed no handler for, SIGKILL too, as Linux's does.
-        if pid == INIT {
+        if signal > 31 {
+            return Err(Errno::EINVAL.into());
+        }
+        // Init ignores signals without handlers, including SIGKILL.
+        if pid == INIT || signal == 0 {
             return Ok(());
         }
+        if signal == SIGCONT {
+            self.run(
+                "DELETE FROM pending_signals WHERE pid = ? AND signal IN (19, 20, 21, 22)",
+                vec![int(pid)],
+            );
+        } else if matches!(signal, 19..=22) {
+            self.run(
+                "DELETE FROM pending_signals WHERE pid = ? AND signal = 18",
+                vec![int(pid)],
+            );
+        }
+        if signal != SIGKILL {
+            self.run(
+                "INSERT OR IGNORE INTO pending_signals(pid, signal) VALUES(?, ?)",
+                vec![int(pid), int(signal)],
+            );
+        }
         match signal {
-            SIGHUP | SIGINT | SIGQUIT | SIGKILL | SIGPIPE | SIGTERM => {
+            SIGKILL => {
                 self.end(&row, abi::signal_status(signal), Some(signal), now);
                 Ok(())
             }
-            SIGSTOP | SIGTSTP => {
+            SIGSTOP => {
                 self.run(
                     "UPDATE processes SET state = 'stopped' WHERE ns = ? AND pid = ?",
                     vec![text(ns), int(pid)],

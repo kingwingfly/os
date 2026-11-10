@@ -602,6 +602,7 @@ impl OsAuthority {
             size(crate::usr::COREUTILS),
             size(crate::usr::OS),
             size(crate::usr::UTILITIES),
+            size(crate::usr::DASH),
         );
         self.ready.set(true);
         Ok(())

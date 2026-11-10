@@ -217,16 +217,34 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
     }
     // A binary of /usr is the build's: the assets serve it, ranges and all.
     if let Some(asset) = grant["asset"].as_str() {
+        if !compile.is_empty() && req.method() != Method::Get {
+            return error_response("Not a complete executable image", 400);
+        }
         let headers = Headers::new();
-        for name in ["Range", "If-None-Match", "If-Range"] {
-            if let Some(value) = req.headers().get(name)? {
-                headers.set(name, &value)?;
+        if compile.is_empty() {
+            for name in ["Range", "If-None-Match", "If-Range"] {
+                if let Some(value) = req.headers().get(name)? {
+                    headers.set(name, &value)?;
+                }
             }
         }
         let mut init = RequestInit::new();
         init.with_method(req.method()).with_headers(headers);
         let request = Request::new_with_init(&format!("https://assets{asset}"), &init)?;
-        return env.assets("ASSETS")?.fetch_request(request).await;
+        let mut response = env.assets("ASSETS")?.fetch_request(request).await?;
+        if compile.is_empty() || response.status_code() != 200 {
+            return Ok(response);
+        }
+        // Asset paths/content IDs survive deployments. Hash the authoritative bytes,
+        // not `usr:dash`, so an upgrade cannot reuse a previous image's transform.
+        // The asset binding has a 25 MiB per-file limit; these are our installed images.
+        use sha2::{Digest, Sha256};
+        let bytes = response.cloned()?.bytes().await?;
+        if !(8..=abi::EXEC_MAX as usize).contains(&bytes.len()) {
+            return error_response("Not a complete executable image", 400);
+        }
+        let content = format!("asset:{:x}", Sha256::digest(&bytes));
+        return crate::compiler::image(env, &content, response).await;
     }
     let grant: Grant = serde_json::from_value(grant)?;
     if !compile.is_empty() {
@@ -468,6 +486,16 @@ pub async fn pwrite(req: Request, env: &Env) -> Result<Response> {
         return Ok(grant);
     }
     let grant: Value = grant.json().await?;
+    if grant["discard"].as_bool() == Some(true) {
+        let body = req.inner().body();
+        if crate::streams::discard_stream(body.map_or(JsValue::NULL, Into::into), length as f64)
+            .await
+            .is_err()
+        {
+            return error_response("The write body did not arrive whole", 400);
+        }
+        return Response::from_json(&json!({"written": length}));
+    }
     let key = grant["key"].as_str().unwrap_or_default();
     let content_type = grant["mime"].as_str().unwrap_or_default();
     if let Err(error) = store(env, &req, key, length, content_type, digest).await {

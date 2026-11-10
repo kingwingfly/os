@@ -53,6 +53,7 @@ pub fn ensure(db: &mut Db) {
         }
     }
     for (path, driver) in [
+        ("/dev/null", "null"),
         (abi::accelerator::ARCHIVE, "archive"),
         (abi::accelerator::MEDIA, "media"),
     ] {
@@ -169,6 +170,7 @@ pub fn open(db: &mut Db, sid: &str, path: &str, flags: u32) -> Result<Opened> {
     let fd = db.add_device_fd(sid, path, flags, now);
     Ok(Opened {
         fd,
+        device: db.node(path).and_then(|node| node.rdev),
         ..Opened::default()
     })
 }
@@ -181,7 +183,8 @@ pub fn closed(db: &mut Db, sid: &str, fd: u32, device: &str) {
             accelerator::closed(db, sid, fd)
         }
         Some(rdev) if rdev == "snd" => snd::closed(db, sid, fd, device),
-        Some(_) => present::closed(db, sid, fd, device),
+        Some(rdev) if rdev == "present" => present::closed(db, sid, fd, device),
+        Some(_) => {}
         None => {}
     }
 }
@@ -300,6 +303,11 @@ pub fn read(db: &Db, who: &Identity, sid: Option<&str>, path: &str) -> Option<Va
         "snd" => snd::read(db, &device),
         _ => present::read(db, who, sid, &device, &node),
     })
+}
+
+/// Stateless byte devices bypass the JSON state used by interactive media devices.
+pub fn bytes(db: &Db, path: &str) -> Option<Vec<u8>> {
+    (db.device(path).is_some() && db.node(path)?.rdev.as_deref() == Some("null")).then(Vec::new)
 }
 
 /// The name a session goes by to a presenter: its account's, `guest` for one signed out.

@@ -156,17 +156,19 @@ export class Pipe {
 
   // ---- Writing ----
 
-  // Write all of `bytes`, waiting for room: false if every reader is gone. A write of at most
+  // Write bytes, waiting for room. Report partial progress and whether every reader is gone.
+  // Returning false from `meanwhile(written)` interrupts the write without losing progress.
+  // A write of at most
   // ATOMIC bytes goes at once, not mixed with another writer's, as POSIX has it; a longer one
   // goes as room comes. `meanwhile`, if given, is called as it waits (a signal to heed).
   write(bytes, meanwhile) {
     let done = 0;
     while (done < bytes.length) {
       const seen = Atomics.load(this.state, CHANGES);
-      if (this.readerGone) return false;
+      if (this.readerGone) return { written: done, broken: true };
       const want = bytes.length <= ATOMIC ? bytes.length : 1;
       if (this.room < want || !this.lock(WRITING)) {
-        if (Atomics.wait(this.state, CHANGES, seen, 200) === 'timed-out') meanwhile?.();
+        if (Atomics.wait(this.state, CHANGES, seen, 200) === 'timed-out' && meanwhile?.(done) === false) return { written: done, broken: false };
         continue;
       }
       try {
@@ -174,7 +176,7 @@ export class Pipe {
         if (room >= want) done += this.copy(bytes.subarray(done, done + room));
       } finally { this.unlock(WRITING); }
     }
-    return true;
+    return { written: done, broken: false };
   }
   // Write what fits of `bytes`, waiting for nothing: how much (none while another writes).
   put(bytes) {

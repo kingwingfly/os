@@ -36,6 +36,10 @@ impl Sys for Os {
 }
 
 fn main() {
+    if let Err(error) = os_posix::init_preopens() {
+        eprintln!("utilities: {error}");
+        std::process::exit(1);
+    }
     if let Some(pwd) = std::env::var_os("PWD") {
         let _ = std::env::set_current_dir(pwd);
     }

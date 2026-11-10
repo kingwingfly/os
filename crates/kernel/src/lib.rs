@@ -375,7 +375,14 @@ pub fn open(fs: &impl Fs, process: &Process, path: &str, flags: u32, mode: u16) 
         Some(node) if node.directory && write => Err(Errno::EISDIR.into()),
         None if flags & O_DIRECTORY != 0 => Err(Errno::ENOENT.into()),
         Some(node) => {
-            require(cred, &node, if write { WRITE } else { READ })?;
+            let access = if flags & O_ACCMODE == abi::O_RDWR {
+                READ | WRITE
+            } else if write {
+                WRITE
+            } else {
+                READ
+            };
+            require(cred, &node, access)?;
             Ok(Opening::Existing {
                 path: name.path,
                 node,

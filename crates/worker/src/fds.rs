@@ -398,6 +398,7 @@ fn resume(db: &mut Db, sid: &str, path: &str, flags: u32, file: &File, now: u64)
         created,
         resumed: true,
         token: None,
+        device: None,
     })
 }
 
@@ -688,6 +689,9 @@ pub fn pread(
                 return Err(Errno::EBADF.into());
             }
             if found.device.is_some() {
+                if let Some(bytes) = crate::dev::bytes(db, &found.path) {
+                    return Ok(made(bytes, offset, count));
+                }
                 return state(crate::dev::read(db, &process.cred, Some(sid), &found.path));
             }
             if let Some(text) = crate::sys::generated(db, &found.path) {
@@ -716,6 +720,9 @@ pub fn pread(
                 return Ok(made(text.into_bytes(), offset, count));
             }
             if node.is_device() {
+                if let Some(bytes) = crate::dev::bytes(db, &path) {
+                    return Ok(made(bytes, offset, count));
+                }
                 return state(crate::dev::read(db, &process.cred, sid, &path));
             }
             node.file.ok_or(Errno::EISDIR)?
@@ -862,6 +869,7 @@ fn most(file: &File) -> u64 {
 /// What pwrite(2) of chunk `index`, `length` bytes, through the descriptor `fd` of `sid`, is
 /// written to: the R2 object for it, and the file's type. A file written whole takes each
 /// chunk at its index, of its length; a recording, its next, whole or, last, short.
+/// None means an authorized /dev/null write: discard bytes without allocating an R2 object.
 pub fn pwrite(
     db: &mut Db,
     sid: &str,
@@ -870,11 +878,20 @@ pub fn pwrite(
     index: u64,
     length: u64,
     caller: Option<&str>,
-) -> Result<(String, String)> {
-    let (found, file) = descriptor(db, sid, fd, caller)?;
-    if !found.writes() {
+) -> Result<Option<(String, String)>> {
+    let found = db.fd(sid, fd).ok_or(Errno::EBADF)?;
+    owned(&found, caller)?;
+    if !found.writes() || found.flags & abi::O_PATH != 0 {
         return Err(Errno::EBADF.into());
     }
+    if found.device.is_some() && crate::dev::bytes(db, &found.path).is_some() {
+        db.lease_fd(sid, fd, auth::now());
+        return Ok(None);
+    }
+    let file = found
+        .file
+        .clone()
+        .ok_or_else(|| Error::because(Errno::EBADF, ELSEWHERE))?;
     let who = &acting(&found, who);
     let file = unfinished(db, &file)?;
     if file.sequential() {
@@ -906,7 +923,7 @@ pub fn pwrite(
     }
     let (path, _) = writable(db, who, &file)?;
     db.lease_fd(sid, fd, auth::now());
-    Ok((chunk_key(&file.id, index), mime(&path).to_string()))
+    Ok(Some((chunk_key(&file.id, index), mime(&path).to_string())))
 }
 
 /// Record chunk `index`, written to the R2 object `key`, as part of the file `fd` writes. A

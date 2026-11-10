@@ -43,6 +43,53 @@ function value(reply) {
   expect(reply.err, JSON.stringify(reply.err)).toBeUndefined();
   return reply.ok;
 }
+
+test('signal queues survive missed events and only a valid process proof acknowledges them', async ({ page, context }) => {
+  await page.goto('/');
+  await connect(page);
+  await login(context.request);
+  const process = value(await kernel(page, 'exec', sleep));
+  const poll = async () => value(await kernel(page, 'sync')).find(row => row.pid === process.pid);
+  const kill = signal => syscall(context.request, { kill: { pid: String(process.pid), signal } });
+  try {
+    await kill(0);
+    expect((await poll()).pending_signals ?? []).toEqual([]);
+    const [invalidSignal] = await batch(page, [{ kill: { pid: String(process.pid), signal: 32 } }]);
+    expect(invalidSignal.err.errno).toBe('EINVAL');
+    await kill(10); await kill(10); await kill(15);
+    const queued = await poll();
+    expect(queued.state).toBe('running');
+    expect(queued.pending_signals.map(event => event.signal)).toEqual([10, 15]);
+    expect((await poll()).pending_signals).toEqual(queued.pending_signals);
+    const sequences = queued.pending_signals.map(event => event.sequence);
+    const invalid = value((await batch(page, [{ proc_keep: { processes: [{ pid: process.pid, proc: 'invalid', signals: sequences }] } }], {}, true))[0]);
+    expect(invalid).toEqual([]);
+    expect((await poll()).pending_signals).toEqual(queued.pending_signals);
+    expect(value(await kernel(page, 'sync', { acknowledged: { [process.pid]: sequences } })).find(row => row.pid === process.pid).pending_signals ?? []).toEqual([]);
+    // A new delivery of the same signal cannot be cleared by an older acknowledgement.
+    await kill(10);
+    const fresh = value(await kernel(page, 'sync', { acknowledged: { [process.pid]: sequences } })).find(row => row.pid === process.pid);
+    expect(fresh.pending_signals[0].sequence).toBeGreaterThan(Math.max(...sequences));
+    await kill(19); await kill(18);
+    const resumed = await poll();
+    expect(resumed.state).toBe('running');
+    expect(resumed.pending_signals.map(event => event.signal)).toEqual([10, 18]);
+    expect((await api(context.request, 'logout')).ok()).toBe(true);
+    const [denied] = await batch(page, [{ kill: { pid: String(process.pid), signal: 12 } }]);
+    expect(denied.err.errno).toBe('EPERM');
+    // A process's stored credentials and signal proof survive a browser logout.
+    expect((await poll()).pending_signals).toEqual(resumed.pending_signals);
+    await login(context.request);
+    await kill(9);
+    expect((await poll()).state).toBe('zombie');
+    const [revoked] = await batch(page, ['getcreds'], { pid: process.pid, proc: process.token });
+    expect(revoked.err.errno).toBe('EPERM');
+  } finally {
+    await login(context.request);
+    await kernel(page, 'exit', { pid: process.pid, status: 0 });
+    await kernel(page, 'wait', { pid: process.pid });
+  }
+});
 async function batch(page, calls, options = {}, registry = false) {
   return page.evaluate(async ({ calls, options, registry }) => {
     const response = await fetch('/api/sys', {
@@ -361,6 +408,7 @@ test('exec replacement revokes its image grant while preserving ordinary descrip
   try {
     const old = { pid: first.pid, proc: first.token };
     const opened = value((await batch(page, [{ open: { path: output, flags: 0o101, mode: 0o600 } }], old))[0]);
+    const sink = value((await batch(page, [{ open: { path: '/dev/null', flags: 2 } }], old))[0]);
     const replaced = value(await kernel(page, 'reexec', { ...sleep, pid: first.pid }));
     const current = { pid: replaced.pid, proc: replaced.token };
     expect(replaced.token).not.toBe(first.token);
@@ -370,6 +418,13 @@ test('exec replacement revokes its image grant while preserving ordinary descrip
     expect((await batch(page, [{ pread: { fd: first.fd, count: 4 } }], current))[0].err?.errno).toBe('EBADF');
     stranger = value(await kernel(page, 'exec', sleep));
     expect((await batch(page, [{ pwrite: { fd: opened.fd, index: 0, data: 'eA==' } }], { pid: stranger.pid, proc: stranger.token }))[0].err?.errno).toBe('EBADF');
+    // Stateless device I/O still belongs to its process lineage, including after exec.
+    const nullWrite = { pwrite: { fd: sink.fd, index: 0, data: 'eA==' } };
+    expect((await batch(page, [nullWrite]))[0].err?.errno).toBe('EBADF');
+    expect((await batch(page, [nullWrite], { pid: stranger.pid, proc: stranger.token }))[0].err?.errno).toBe('EBADF');
+    expect(value((await batch(page, [nullWrite], current))[0])).toEqual({ written: 1 });
+    expect(value((await batch(page, [{ pread: { fd: sink.fd, count: 1 } }], current))[0])).toEqual({ data: '', size: 0 });
+    value((await batch(page, [{ close: { fd: sink.fd } }], current))[0]);
     const written = await batch(page, [
       { pwrite: { fd: opened.fd, index: 0, data: Buffer.from('survived exec\n').toString('base64') } },
       { close: { fd: opened.fd } },

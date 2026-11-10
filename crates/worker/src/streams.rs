@@ -8,6 +8,31 @@ use worker::wasm_bindgen_futures::future_to_promise;
 use worker::*;
 
 #[wasm_bindgen(inline_js = "
+export async function discardStream(body, length) {
+  if (!body) { if (length) throw new Error('missing body'); return; }
+  const reader = body.getReader();
+  let received = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > length) throw new Error('body exceeds declared length');
+    }
+    if (received !== length) throw new Error('truncated body');
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally { reader.releaseLock(); }
+}
+")]
+extern "C" {
+    /// Consume an authorized null-device write with bounded memory, without R2 storage.
+    #[wasm_bindgen(catch, js_name = discardStream)]
+    pub async fn discard_stream(body: JsValue, length: f64) -> std::result::Result<(), JsValue>;
+}
+
+#[wasm_bindgen(inline_js = "
 export function concatenate(next) {
   const { readable, writable } = new TransformStream();
   (async () => {

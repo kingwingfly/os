@@ -225,6 +225,9 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     return Reply::ok(json!({ "generated": text }));
                 }
                 if node.is_device() {
+                    if crate::dev::bytes(db, &real).is_some() {
+                        return Reply::ok(json!({ "generated": "" }));
+                    }
                     return match crate::dev::read(db, &who, sid.as_deref(), &real) {
                         Some(state) => Reply::ok(json!({ "device": state })),
                         None => Reply::error("No such device or address", 404),
@@ -321,7 +324,8 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     .unwrap_or_default();
                 let caller = row.map(|row| row.owner());
                 match crate::fds::pwrite(db, &sid, &who, fd, index, length, caller.as_deref()) {
-                    Ok((key, mime)) => Reply::ok(json!({"key": key, "mime": mime})),
+                    Ok(Some((key, mime))) => Reply::ok(json!({"key": key, "mime": mime})),
+                    Ok(None) => Reply::ok(json!({"discard": true})),
                     Err(error) => errno_reply(&error).keep(),
                 }
             })
