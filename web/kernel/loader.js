@@ -32,7 +32,7 @@ globalThis.loaderStats = stats;
 // The module the exec result `image` loads, compiling it once per content: an asset path for
 // /usr, or an uploaded file read by its exec token with the process's token.
 export function load(image) {
-  const key = image.version ?? image.asset;
+  const key = `${image.pid === 1 ? 'init' : 'resources-v1'}:${image.version ?? image.asset}`;
   const known = compiled.get(key);
   if (known) {
     // A cache hit is the newest: an image just run is not the one evicted next.
@@ -54,7 +54,7 @@ export function load(image) {
 // The image's bytes, as its exec allows them to be read.
 const read = image => image.asset
   ? fetch(image.asset)
-  : fetch(`/api/file?token=${encodeURIComponent(image.token_read)}`, { headers: { 'X-Process-Token': image.token } });
+  : fetch(`/api/file?token=${encodeURIComponent(image.token_read)}`, { headers: { 'X-Process-Token': image.token, 'X-Process-Pid': String(image.pid) } });
 
 async function compile(image) {
   let module;
@@ -91,18 +91,26 @@ async function compile(image) {
   }
   validateExports(module, memoryImport);
   const unwinding = imports.filter(entry => entry.module === 'wasix_32v1' && UNWINDS.has(entry.name)).map(entry => `${entry.module}.${entry.name}`);
-  if (unwinding.length) module = await forkable(image);
+  let memoryBytes;
+  if (image.pid !== 1 || unwinding.length) {
+    const transformed = await forkable(image, image.pid === 1 ? FORKABLE : 'resources-v1');
+    module = transformed.module;
+    if (image.pid !== 1) memoryBytes = transformed.memoryBytes;
+  }
   stats.compiled++;
-  return { module, memory: memoryImport ? memory : undefined, startSection: unwinding.length ? false : start };
+  return { module, memory: memoryImport ? memory : undefined, memoryBytes, startSection: image.pid !== 1 || unwinding.length ? false : start };
 }
 
 // The server caches the transform by immutable content. Authorization is checked on every
 // request before a cached output is returned; no Binaryen bundle reaches the browser.
-async function forkable(image) {
+async function forkable(image, profile) {
   const query = image.asset ? `path=${encodeURIComponent(image.path)}` : `token=${encodeURIComponent(image.token_read)}`;
-  const response = await fetch(`/api/file?${query}&compile=${FORKABLE}`, { headers: { 'X-Process-Token': image.token } });
+  const response = await fetch(`/api/file?${query}&compile=${profile}`, { headers: { 'X-Process-Token': image.token, 'X-Process-Pid': String(image.pid) } });
   if (!response.ok) throw await refusal(response);
-  return WebAssembly.compileStreaming(response).catch(error => { throw formatError(error); });
+  const prefix = response.clone();
+  const module = await WebAssembly.compileStreaming(response).catch(error => { throw formatError(error); });
+  const { memories } = await heading(prefix);
+  return { module, memoryBytes: memories.reduce((n, m) => n + m.initial * 65536, 0) };
 }
 
 // What may not run, said as the kernel would: ENOEXEC, with what was wrong. The caller names
@@ -135,6 +143,7 @@ function validateImports(imports) {
 
 function validateExports(module, memoryImport) {
   const exports = WebAssembly.Module.exports(module);
+  if (exports.some(entry => entry.name.startsWith('__tw_'))) fail('reserved runtime export');
   if (!exports.some(entry => entry.name === '_start' && entry.kind === 'function')) fail('no _start');
   if (!memoryImport && !exports.some(entry => entry.name === 'memory' && entry.kind === 'memory')) {
     fail('no memory');
@@ -164,6 +173,7 @@ async function heading(prefix) {
   const { pull, close } = sourceOf(prefix);
   const cursor = new Cursor(pull);
   let memory, start = false;
+  const memories = [];
   try {
     const magic = await cursor.bytes(4);
     if (magic[0] !== 0x00 || magic[1] !== 0x61 || magic[2] !== 0x73 || magic[3] !== 0x6d) {
@@ -179,13 +189,18 @@ async function heading(prefix) {
         id = await cursor.u8();
       } catch {
         // The sections ended.
-        return { memory, start };
+        return { memory, start, memories };
       }
       // Sections ascend (custom ones, 0, anywhere): past the start section (8), the elements,
       // data count, code and data follow, and nothing this asks of.
-      if (id > 8) return { memory, start };
+      if (id > 8) return { memory, start, memories };
       const size = await cursor.u32();
       if (id === 8) start = true;
+      if (id === 5) {
+        const count = await cursor.u32();
+        for (let i = 0; i < count; i++) memories.push(await limits(cursor));
+        continue;
+      }
       if (id !== 2) {
         await cursor.skip(size);
         continue;
@@ -202,6 +217,7 @@ async function heading(prefix) {
           await limits(cursor);
         } else if (kind === 2) {
           const type = await limits(cursor);
+          memories.push(type);
           if (module === MEMORY.module && name === MEMORY.name) memory = type;
         } else if (kind === 3) {
           await cursor.u8();

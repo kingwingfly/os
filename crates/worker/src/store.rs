@@ -100,6 +100,13 @@ impl DurableObject for OsAuthority {
                         crate::executor::finish(db, &id, "cancelled");
                     }
                     ("device_task", _, _) => db.expire_device_task(&id),
+                    ("provider_deadline", _, Some(job)) if !job.finished() => {
+                        db.add_lines(
+                            &id,
+                            &[(true, "Cancelled: provider runtime deadline reached".into())],
+                        );
+                        crate::executor::finish(db, &id, "cancelled");
+                    }
                     // A session not heard from for long watches nothing any more, and once it
                     // keeps no descriptor, its numbers start again.
                     ("watches", _, _) => {
@@ -581,6 +588,7 @@ impl OsAuthority {
         if self.ready.get() {
             return Ok(());
         }
+        crate::system::configure(&self.env)?;
         db::create(&self.state.storage().sql())?;
         if transact(&self.state, |db| (db.is_empty(), false))? {
             self.initialize().await?;
@@ -603,6 +611,8 @@ impl OsAuthority {
             size(crate::usr::OS),
             size(crate::usr::UTILITIES),
             size(crate::usr::DASH),
+            size(crate::usr::SUPERVISE),
+            size(crate::usr::INIT),
         );
         self.ready.set(true);
         Ok(())

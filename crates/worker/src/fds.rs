@@ -71,7 +71,9 @@ pub fn call(
                 return Err(Errno::EBADF.into());
             }
             // The image is read-only, as its names are (sys.rs).
-            if crate::usr::is(&found.path) {
+            if found.ino.is_some_and(crate::system::immutable_inode)
+                || crate::system::owns(db, &found.path)
+            {
                 return Err(Errno::EROFS.into());
             }
             // The inode it opened, by whichever name it has now (another inode sharing its
@@ -503,10 +505,10 @@ fn closing(db: &mut Db, who: &Identity, found: &crate::db::Fd) -> Result<Closed>
         .clone()
         .ok_or_else(|| Error::because(Errno::EBADF, ELSEWHERE))?;
     // A binary of /usr, or a copy sharing it: the build's, complete.
-    if crate::usr::asset(&file).is_some() {
+    if crate::system::asset(&file).is_some() {
         return Ok(Closed {
             path: found.path.clone(),
-            size: crate::usr::size(&file),
+            size: crate::system::size(&file),
             version: file,
             created: found.created,
         });
@@ -612,8 +614,8 @@ fn clone(
     }
     let who = &acting(&writer, who);
     // A binary of /usr is the build's content, shared as any is.
-    let (content, size) = match crate::usr::asset(&content) {
-        Some(_) => (content.clone(), crate::usr::size(&content)),
+    let (content, size) = match crate::system::asset(&content) {
+        Some(_) => (content.clone(), crate::system::size(&content)),
         None => {
             let content = db.file(&content).ok_or(Errno::EBADF)?;
             if !content.complete() {
@@ -666,7 +668,7 @@ pub enum Read {
 /// (`caller`) answers its process alone.
 #[allow(clippy::too_many_arguments)]
 pub fn pread(
-    db: &Db,
+    db: &mut Db,
     sid: Option<&str>,
     procs: Option<&[crate::procs::Row]>,
     process: &Process,
@@ -685,12 +687,13 @@ pub fn pread(
             let sid = sid.ok_or(Errno::EBADF)?;
             let found = db.fd(sid, fd).ok_or(Errno::EBADF)?;
             owned(&found, caller)?;
+            crate::system::select(db, found.generation.as_deref())?;
             if found.flags & O_ACCMODE == abi::O_WRONLY || found.flags & abi::O_PATH != 0 {
                 return Err(Errno::EBADF.into());
             }
             if found.device.is_some() {
-                if let Some(bytes) = crate::dev::bytes(db, &found.path) {
-                    return Ok(made(bytes, offset, count));
+                if let Some(device) = crate::dev::bytes(db, &found.path) {
+                    return Ok(Read::Bytes(device.read(count)?, 0));
                 }
                 return state(crate::dev::read(db, &process.cred, Some(sid), &found.path));
             }
@@ -720,8 +723,8 @@ pub fn pread(
                 return Ok(made(text.into_bytes(), offset, count));
             }
             if node.is_device() {
-                if let Some(bytes) = crate::dev::bytes(db, &path) {
-                    return Ok(made(bytes, offset, count));
+                if let Some(device) = crate::dev::bytes(db, &path) {
+                    return Ok(Read::Bytes(device.read(count)?, 0));
                 }
                 return state(crate::dev::read(db, &process.cred, sid, &path));
             }
@@ -734,8 +737,8 @@ pub fn pread(
             ));
         }
     };
-    if let Some(asset) = crate::usr::asset(&content) {
-        let size = crate::usr::size(&content);
+    if let Some(asset) = crate::system::asset(&content) {
+        let size = crate::system::size(&content);
         let length = size.saturating_sub(offset).min(count);
         return Ok(Read::Asset(asset.to_string(), offset, length, size));
     }
@@ -869,7 +872,7 @@ fn most(file: &File) -> u64 {
 /// What pwrite(2) of chunk `index`, `length` bytes, through the descriptor `fd` of `sid`, is
 /// written to: the R2 object for it, and the file's type. A file written whole takes each
 /// chunk at its index, of its length; a recording, its next, whole or, last, short.
-/// None means an authorized /dev/null write: discard bytes without allocating an R2 object.
+/// None means an authorized byte-device write: discard bytes without allocating an R2 object.
 pub fn pwrite(
     db: &mut Db,
     sid: &str,
@@ -884,7 +887,10 @@ pub fn pwrite(
     if !found.writes() || found.flags & abi::O_PATH != 0 {
         return Err(Errno::EBADF.into());
     }
-    if found.device.is_some() && crate::dev::bytes(db, &found.path).is_some() {
+    if found.device.is_some()
+        && let Some(device) = crate::dev::bytes(db, &found.path)
+    {
+        device.write()?;
         db.lease_fd(sid, fd, auth::now());
         return Ok(None);
     }

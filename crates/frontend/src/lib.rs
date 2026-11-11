@@ -1,5 +1,7 @@
+mod console;
 mod desktop;
 mod files;
+mod greeter;
 mod manual;
 mod preview;
 mod search;
@@ -36,6 +38,8 @@ extern "C" {
     fn upload_files(files: &JsValue, path: &str, progress: &js_sys::Function) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = cancelUploads)]
     fn cancel_uploads() -> bool;
+    #[wasm_bindgen(js_namespace = os, js_name = closeConsole)]
+    fn close_console(id: &str);
     /// Whether an upload goes on in this page, the terminal's or the Files': one at a time.
     #[wasm_bindgen(js_namespace = os)]
     fn uploading() -> bool;
@@ -241,6 +245,11 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
     });
     view! {
         <section class="terminal-panel" data-terminal=id data-pty=move || shell.terminal_active.get().to_string() aria-label="Terminal" hidden=move || !current()>
+        <div class="console-actions" hidden>
+            <button type="button" data-console-open>"Open in new window"</button>
+            <span class="console-status" role="status"></span>
+            <button type="button" data-console-stop hidden>"Stop sharing"</button>
+        </div>
         // A tap on the transcript, as on a phone, goes to the command line, unless it selects text.
         <div class="transcript" role="log" aria-live="polite" on:click=move |_| {
             let selecting = web_sys::window().and_then(|w| w.get_selection().ok().flatten()).is_some_and(|s| !s.is_collapsed());
@@ -408,7 +417,7 @@ fn App() -> impl IntoView {
         }
         let index = tabs.with_untracked(|t| t.iter().position(|s| s.id == id));
         let Some(index) = index else { return };
-        // A closed tab stops what it runs in the page, at its next step; jobs go on.
+        // Closing a pane hangs up its console and cancels attached browser work.
         tabs.with_untracked(|t| t[index].detach());
         tabs.update(|t| {
             t.remove(index);
@@ -579,6 +588,8 @@ fn App() -> impl IntoView {
     view! {
         <main class="desktop">
             <header class="topbar"><div class="wordmark"><span class="signal"></span>{title}<span class="subtitle">{subtitle}</span></div>
+                <a class="session-link" href="/login.html" target="_blank" rel="noopener">"Start session"</a>
+                <button type="button" data-applications aria-haspopup="dialog" aria-controls="applications">"App windows"</button>
                 <button class="lock" on:click=move |_| current.get_untracked().run(if account.writable.get_untracked() { "logout".into() } else { "login".into() })>
                     // Kept to one line: a long name shortens, the action stays.
                     <span class="lock-name">{move || if account.writable.get() { format!("● {}", account.username.get()) } else { "○ guest".into() }}</span>
@@ -645,6 +656,35 @@ fn App() -> impl IntoView {
 #[wasm_bindgen(start)]
 pub fn start() {
     console_error_panic_hook::set_once();
+    let root = web_sys::window()
+        .unwrap()
+        .document()
+        .unwrap()
+        .get_element_by_id("app")
+        .unwrap();
+    if root.has_attribute("data-greeter") {
+        root.set_text_content(None);
+        leptos::mount::mount_to(root.unchecked_into(), greeter::Greeter).forget();
+        return;
+    }
+    if root.has_attribute("data-shell-session") {
+        root.set_text_content(None);
+        leptos::mount::mount_to(
+            root.unchecked_into(),
+            || view! { <console::ConsoleWindow local=true/> },
+        )
+        .forget();
+        return;
+    }
+    if root.has_attribute("data-attached-console") {
+        root.set_text_content(None);
+        leptos::mount::mount_to(
+            root.unchecked_into(),
+            || view! { <console::ConsoleWindow/> },
+        )
+        .forget();
+        return;
+    }
     viewer::register();
     uploads::register();
     manual::register();

@@ -25,6 +25,7 @@ async fn authority_as(
     env: &Env,
     cookie: Option<&str>,
     proc: Option<&str>,
+    release: Option<&str>,
     method: Method,
     path_and_query: &str,
     body: Option<Value>,
@@ -35,6 +36,9 @@ async fn authority_as(
     }
     if let Some(proc) = proc {
         headers.set("X-Process-Token", proc)?;
+    }
+    if let Some(release) = release {
+        headers.set("X-OS-Release", release)?;
     }
     let mut init = RequestInit::new();
     init.with_method(method);
@@ -64,6 +68,7 @@ async fn authority(
         env,
         cookie.as_deref(),
         proc.as_deref(),
+        req.headers().get("X-OS-Release")?.as_deref(),
         method,
         path_and_query,
         body,
@@ -175,13 +180,65 @@ async fn by_token(
     Ok(Ok(grant))
 }
 
+/// HTTP needs a finite response for an inexhaustible device. POSIX programs use
+/// descriptors; byte API clients request an explicit bounded range, authorized above.
+fn byte_device(req: &Request, name: &str) -> Result<Response> {
+    use crate::dev::bytes::ByteDevice;
+    let Some(device) = ByteDevice::named(name) else {
+        return error_response("Unknown byte device", 404);
+    };
+    let headers = Headers::new();
+    headers.set("Content-Type", "application/octet-stream")?;
+    headers.set("Cache-Control", "no-store")?;
+    headers.set("Accept-Ranges", "bytes")?;
+    if device == ByteDevice::Null {
+        return Ok(Response::empty()?.with_headers(headers));
+    }
+    let range = req.headers().get("Range")?;
+    if range.is_none() && req.method() == Method::Head {
+        return Ok(Response::empty()?.with_headers(headers));
+    }
+    let Some(range) = range else {
+        return error_response(
+            "This device has no EOF; request an explicit byte range",
+            400,
+        );
+    };
+    let bounded = || {
+        let (start, end) = range.strip_prefix("bytes=")?.split_once('-')?;
+        if !start.bytes().chain(end.bytes()).all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let (start, end) = (start.parse::<u64>().ok()?, end.parse::<u64>().ok()?);
+        let count = end.checked_sub(start)?.checked_add(1)?;
+        (count <= abi::INLINE_MAX).then_some((start, end, count))
+    };
+    let Some((start, end, count)) = bounded() else {
+        return error_response("Device ranges need both bounds and at most 256 KiB", 416);
+    };
+    headers.set("Content-Range", &format!("bytes {start}-{end}/*"))?;
+    headers.set("Content-Length", &count.to_string())?;
+    let response = if req.method() == Method::Head {
+        Response::empty()?
+    } else {
+        match device.read(count) {
+            Ok(bytes) => Response::from_bytes(bytes)?,
+            Err(_) => return error_response("Device read failed", 500),
+        }
+    };
+    Ok(response.with_status(206).with_headers(headers))
+}
+
 /// GET or HEAD a file, by its path or by a read descriptor's token: authorization precedes
 /// every HEAD, Range and conditional response, including 304; by a token, the kernel's word is
 /// taken for `TOKEN_FRESH` seconds. A file still uploading is read as it arrives: the response
 /// waits for each chunk not uploaded yet.
 pub async fn read(req: Request, env: &Env) -> Result<Response> {
     let compile = param(&req, "compile")?;
-    if !compile.is_empty() && compile != crate::compiler::VERSION {
+    if !compile.is_empty()
+        && compile != crate::compiler::VERSION
+        && compile != crate::compiler::RESOURCES
+    {
         return error_response("Unknown compiler version", 400);
     }
     let token = param(&req, "token")?;
@@ -205,6 +262,12 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
             Err(refused) => return Ok(refused),
         }
     };
+    if let Some(device) = grant["byte_device"].as_str() {
+        if !compile.is_empty() {
+            return error_response("Not a complete executable image", 400);
+        }
+        return byte_device(&req, device);
+    }
     // A file the kernel writes as it is read (/etc/passwd): all of it, as it is now.
     if let Some(text) = grant["generated"].as_str() {
         let headers = Headers::new();
@@ -231,8 +294,25 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
         let mut init = RequestInit::new();
         init.with_method(req.method()).with_headers(headers);
         let request = Request::new_with_init(&format!("https://assets{asset}"), &init)?;
-        let mut response = env.assets("ASSETS")?.fetch_request(request).await?;
+        let mut response = if asset.starts_with("/boot/blobs/") {
+            crate::system::checked_asset(request, env).await?
+        } else {
+            env.assets("ASSETS")?.fetch_request(request).await?
+        };
         if compile.is_empty() || response.status_code() != 200 {
+            if compile.is_empty()
+                && req.method() != Method::Head
+                && matches!(response.status_code(), 200 | 206)
+            {
+                let length = response
+                    .headers()
+                    .get("Content-Length")?
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or_else(|| grant["size"].as_u64().unwrap_or(0));
+                if let Err(e) = crate::resources::request_io(env, &req, false, length).await {
+                    return crate::resources::refused(e);
+                }
+            }
             return Ok(response);
         }
         // Asset paths/content IDs survive deployments. Hash the authoritative bytes,
@@ -244,7 +324,7 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
             return error_response("Not a complete executable image", 400);
         }
         let content = format!("asset:{:x}", Sha256::digest(&bytes));
-        return crate::compiler::image(env, &content, response).await;
+        return crate::compiler::image(env, &content, response, &compile).await;
     }
     let grant: Grant = serde_json::from_value(grant)?;
     if !compile.is_empty() {
@@ -266,7 +346,7 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
             0,
             grant.size.saturating_sub(1),
         )))?;
-        return crate::compiler::image(env, &grant.file, bytes).await;
+        return crate::compiler::image(env, &grant.file, bytes, &compile).await;
     }
     let headers = Headers::new();
     headers.set("Content-Type", &grant.mime)?;
@@ -312,6 +392,9 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
         chunks: grant.chunks.iter().cloned().collect(),
         file: grant.file.clone(),
     };
+    if let Err(e) = crate::resources::request_io(env, &req, false, length).await {
+        return crate::resources::refused(e);
+    }
     let body = reader.stream(grant.chunk_size, start, end);
     Ok(Response::from_body(ResponseBody::Stream(body))?
         .with_status(status)
@@ -401,6 +484,7 @@ impl Reader {
             &self.env,
             self.cookie.as_deref(),
             self.proc.as_deref(),
+            None,
             Method::Get,
             &format!("/internal/read?{}", self.query),
             None,
@@ -498,6 +582,9 @@ pub async fn pwrite(req: Request, env: &Env) -> Result<Response> {
     }
     let key = grant["key"].as_str().unwrap_or_default();
     let content_type = grant["mime"].as_str().unwrap_or_default();
+    if let Err(e) = crate::resources::request_io(env, &req, true, length).await {
+        return crate::resources::refused(e);
+    }
     if let Err(error) = store(env, &req, key, length, content_type, digest).await {
         console_error!("pwrite failed: {}", error);
         return Ok(Response::from_json(&json!({

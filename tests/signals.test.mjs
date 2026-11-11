@@ -43,6 +43,21 @@ test('ignoring a pending signal discards it without discarding other pending sig
   assert.equal(signals.action(0, 2, 0, 0), -28);
 });
 
+test('sigpending reports only blocked signals without consuming queued delivery', () => {
+  const signals = fresh();
+  signals.mask = bit(10);
+  signals.queue(10); signals.queue(17);
+  // SIGCHLD can arrive as wait returns. It must not appear as a blocked signal.
+  assert.equal(signals.pending, bit(10));
+  signals.mask = bit(17);
+  assert.equal(signals.pending, bit(17));
+  signals.mask = 0;
+  assert.equal(signals.pending, 0);
+  assert.equal(signals.take().n, 10);
+  assert.equal(signals.take().n, 17);
+  assert.equal(signals.take(), null);
+});
+
 test('an interrupted pipe write reports bytes already transferred without duplicating them', () => {
   const pipe = new Pipe(pipeBuffer(64));
   const data = Uint8Array.from({ length: 8192 }, (_, index) => index % 251);

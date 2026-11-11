@@ -11,6 +11,34 @@ use serde_json::Value;
 pub trait Sys {
     async fn batch(&self, calls: Vec<Call>) -> Vec<Result<Value, Error>>;
     async fn read(&self, path: &str) -> Result<Vec<u8>, Error>;
+    /// Replace an existing file's bytes. Byte-I/O adapters can handle transfers larger
+    /// than the inline syscall limit without changing the programs using this trait.
+    async fn write(&self, path: &str, bytes: &[u8]) -> Result<(), Error> {
+        if bytes.len() as u64 > abi::INLINE_MAX {
+            return Err(Errno::EFBIG.into());
+        }
+        let fd = abi::FdRef::Ref { call: 0 };
+        let mut writing = vec![Call::Open {
+            path: path.into(),
+            flags: abi::O_WRONLY | abi::O_TRUNC,
+            mode: 0,
+            size: None,
+            sha256: None,
+            version: None,
+        }];
+        if !bytes.is_empty() {
+            writing.push(Call::Pwrite {
+                fd,
+                index: 0,
+                data: bytes.to_vec().into(),
+            });
+        }
+        writing.push(Call::Close { fd });
+        for result in self.batch(writing).await {
+            result?;
+        }
+        Ok(())
+    }
 }
 
 /// Make `calls`, as many batches as they take: each one's value, as `T`, or its error.

@@ -25,6 +25,7 @@ export class Signals {
   }
   get mask() { return Atomics.load(this.words, 2); }
   set mask(value) { Atomics.store(this.words, 2, value & 0x7fffffff & ~unmaskable); }
+  get pending() { return Atomics.load(this.words, 1) & this.mask; }
   action(n, kind, mask, flags) {
     if (!valid(n) || kind < -1 || kind > 2) return -28;
     if (kind === -1) return this.actions[n].kind;

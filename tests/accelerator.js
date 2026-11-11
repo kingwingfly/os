@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { call } from './sys.js';
 export const ACCEL = { info: 0x54570100, submit: 0x54570101, poll: 0x54570102,
-  answer: 0x54570103, cancel: 0x54570104, detach: 0x54570105, attach: 0x54570106 };
+  answer: 0x54570103, cancel: 0x54570104, detach: 0x54570105, attach: 0x54570106, policy: 0x54570107, configure: 0x54570108 };
 export async function device(request, path = '/dev/archive', options = {}) {
   const { fd } = await call(request, { open: { path, flags: 2 } }, options);
   const ioctl = (op, arg) => call(request, { ioctl: { fd, request: ACCEL[op], arg } }, options);

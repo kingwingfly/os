@@ -22,26 +22,34 @@ int getgroups(int count, gid_t *groups) {
     return result;
 }
 
-/* The pinned libc treats a nonblocking join with no exited child as ECHILD.
- * POSIX requires zero, leaving the caller's status untouched. */
+/* The host implements signed wait selectors and POSIX job-state notifications. */
+HOST("waitpid2") extern int host_waitpid(int, int *, unsigned);
 pid_t waitpid(pid_t pid, int *status, int options) {
-    if (pid == 0 || pid < -1 || (options & ~(WNOHANG | WUNTRACED))) { errno = ENOSYS; return -1; }
-    __wasi_option_pid_t child = { .tag = pid == -1 ? __WASI_OPTION_NONE : __WASI_OPTION_SOME };
-    child.u.some = pid;
-    __wasi_join_status_t result;
-    __wasi_join_flags_t flags = options & WNOHANG ? __WASI_JOIN_FLAGS_NON_BLOCKING : 0;
-    if (options & WUNTRACED) flags |= __WASI_JOIN_FLAGS_WAKE_STOPPED;
-    int error = __wasi_proc_join(&child, flags, &result);
-    if (error) { errno = error; return -1; }
-    if (result.tag == __WASI_JOIN_STATUS_TYPE_NOTHING) return 0;
-    if (child.tag != __WASI_OPTION_SOME) { errno = ECHILD; return -1; }
-    if (status) {
-        if (result.tag == __WASI_JOIN_STATUS_TYPE_EXIT_NORMAL) *status = W_EXITCODE(result.u.exit_normal, 0);
-        else if (result.tag == __WASI_JOIN_STATUS_TYPE_EXIT_SIGNAL) *status = W_EXITCODE(result.u.exit_signal.exit_code, result.u.exit_signal.signal);
-        else if (result.tag == __WASI_JOIN_STATUS_TYPE_STOPPED) *status = W_STOPCODE(result.u.stopped);
-        else { errno = EIO; return -1; }
-    }
-    return child.u.some;
+    int result = host_waitpid(pid, status, options);
+    if (result < 0) { errno = -result; return -1; }
+    return result;
+}
+HOST("getpgid") extern int host_getpgid(int);
+HOST("getsid") extern int host_getsid(int);
+HOST("setpgid") extern int host_setpgid(int, int);
+HOST("setsid") extern int host_setsid(void);
+HOST("tcgetpgrp") extern int host_tcgetpgrp(int);
+HOST("tcsetpgrp") extern int host_tcsetpgrp(int, int);
+static int posix_result(int result) {
+    if (result < 0) { errno = -result; return -1; }
+    return result;
+}
+pid_t getpgid(pid_t pid) { return posix_result(host_getpgid(pid)); }
+pid_t getpgrp(void) { return getpgid(0); }
+pid_t getsid(pid_t pid) { return posix_result(host_getsid(pid)); }
+int setpgid(pid_t pid, pid_t pgid) { return posix_result(host_setpgid(pid, pgid)); }
+int setpgrp(void) { return setpgid(0, 0); }
+pid_t setsid(void) { return posix_result(host_setsid()); }
+pid_t tcgetpgrp(int fd) { return posix_result(host_tcgetpgrp(fd)); }
+int tcsetpgrp(int fd, pid_t pgid) { return posix_result(host_tcsetpgrp(fd, pgid)); }
+int killpg(pid_t pgid, int sig) {
+    if (pgid < 0) { errno = EINVAL; return -1; }
+    return kill(-pgid, sig);
 }
 /* libc's wait4 applies syscall errno translation to waitpid's already
  * translated result, turning EINTR into EPERM. Preserve the original errno. */

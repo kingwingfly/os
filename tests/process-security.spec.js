@@ -141,7 +141,9 @@ test('a forged registry header cannot reset, reap, inspect or reclaim another ac
     window.registryLocks = Promise.all([`tw-tab-${seat}`, `tw-kernel-${lender}`].map(name =>
       new Promise(resolve => { void navigator.locks.request(name, () => { resolve(); return new Promise(() => {}); }); })));
   }, { seat, lender });
-  await page.goto('/');
+  // This fixture explicitly owns its registry rows; do not boot the desktop's
+  // asynchronous PID 1 reaper, which can collect its top-level zombie.
+  await page.goto('/login.html');
   await page.evaluate(() => window.registryLocks);
   await login(context.request);
   const call = async (entry, options = {}, route = true) => (await batch(page, [entry], options, route))[0];
@@ -334,6 +336,8 @@ for (const removed of [false, true]) {
       await connect(other);
       const attempts = [
         ['fork', { pid: parent.pid }],
+        ['process_call', { pid: parent.pid, call: 'setsid' }],
+        ['session', { pids: [parent.pid] }],
         ['reexec', { ...sleep, pid: parent.pid }],
         ['exit', { pid: parent.pid, status: 99 }],
         ['waitchild', { ppid: parent.pid, pid: child.pid }],

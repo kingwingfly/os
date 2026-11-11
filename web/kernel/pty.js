@@ -3,13 +3,14 @@
 import { PAGE, Pipe, pipeBuffer } from '../wasi/pipe.js';
 
 export const IOCTL = { TCGETS: 0x5401, TCSETS: 0x5402, TCSETSW: 0x5403, TCSETSF: 0x5404,
+  TIOCSCTTY: 0x540e, TIOCNOTTY: 0x5422, TIOCGSID: 0x5429,
   TIOCGPGRP: 0x540f, TIOCSPGRP: 0x5410, TIOCGWINSZ: 0x5413, TIOCSWINSZ: 0x5414,
-  TIOCGPTN: 0x80045430 };
+  TIOCGPTN: 0x80045430, TIOCSPTLCK: 0x40045431, TIOCGPTLCK: 0x80045439 };
 export const IF = { IGNCR: 128, ICRNL: 256, INLCR: 64 };
 export const OF = { OPOST: 1, ONLCR: 4 };
-export const LF = { ISIG: 1, ICANON: 2, ECHO: 8, ECHOE: 16, ECHOK: 32, ECHONL: 64, NOFLSH: 128, ECHOCTL: 512 };
+export const LF = { ISIG: 1, ICANON: 2, ECHO: 8, ECHOE: 16, ECHOK: 32, ECHONL: 64, NOFLSH: 128, TOSTOP: 256, ECHOCTL: 512 };
 export const CC = { VINTR: 0, VQUIT: 1, VERASE: 2, VKILL: 3, VEOF: 4, VTIME: 5, VMIN: 6, VSUSP: 10 };
-const IFLAG = 0, OFLAG = 1, LFLAG = 2, COLS = 3, ROWS = 4, WIDTH = 5, HEIGHT = 6, PGRP = 7, CONTROL = 8;
+const IFLAG = 0, OFLAG = 1, LFLAG = 2, COLS = 3, ROWS = 4, WIDTH = 5, HEIGHT = 6, CONTROL = 8;
 const encoder = new TextEncoder();
 const error = errno => Object.assign(new Error(errno), { errno });
 
@@ -27,8 +28,6 @@ export class TtyState {
   set(index, value) { Atomics.store(this.words, index, value); }
   get canonical() { return !!(this.get(LFLAG) & LF.ICANON); }
   get echo() { return !!(this.get(LFLAG) & LF.ECHO); }
-  get pgrp() { return this.get(PGRP); }
-  set pgrp(value) { this.set(PGRP, value); }
   cc(index) { return this.get(CONTROL + index); }
   matches(index, byte) { return this.cc(index) !== 0 && this.cc(index) === byte; }
   get size() { return { columns: this.get(COLS), rows: this.get(ROWS), width: this.get(WIDTH), height: this.get(HEIGHT) }; }
@@ -67,13 +66,31 @@ export class TtyState {
   }
 }
 
+// Ownership belongs to one PTY, independently of the terminal tab's saved modes.
+// Only the client kernel changes it; process Workers read it at job-control checks.
+export class TtyControl {
+  constructor(buffer = new SharedArrayBuffer(12)) { this.buffer = buffer; this.words = new Int32Array(buffer); }
+  get pgrp() { return Atomics.load(this.words, 0); }
+  set pgrp(value) { Atomics.store(this.words, 0, value); }
+  get session() { return Atomics.load(this.words, 1); }
+  set session(value) { Atomics.store(this.words, 1, value); }
+  get hungup() { return !!Atomics.load(this.words, 2); }
+  set hungup(value) { Atomics.store(this.words, 2, value ? 1 : 0); }
+}
+
 export class Pty {
   constructor({ state = TtyState.create(), echo = () => {}, signal = () => {}, mode = () => {} } = {}) {
     this.state = state; this.echo = echo; this.signal = signal; this.mode = mode;
+    this.control = new TtyControl();
     this.pipe = new Pipe(pipeBuffer()); this.pipe.hold(PAGE, 'w');
+    // The master owns the input buffer even between slave readers. A pipeline's
+    // first stage may exit before a later stage opens its controlling terminal.
+    this.pipe.hold(PAGE, 'r');
     this.line = []; this.queue = []; this.queued = 0; this.timer = null; this.closed = false;
   }
-  get transferable() { return { state: this.state.buffer, input: this.pipe.buffer, number: this.number }; }
+  get session() { return this.control.session; }
+  set session(value) { this.control.session = value; }
+  get transferable() { return { state: this.state.buffer, control: this.control.buffer, input: this.pipe.buffer, number: this.number }; }
   pump() {
     this.timer = null;
     if (this.closed || this.pipe.readerGone) { this.queue = []; this.queued = 0; return; }
@@ -103,8 +120,10 @@ export class Pty {
     if (this.state.echo && this.state.get(LFLAG) & LF.ECHOE) this.echo('\b \b'.repeat(removed[0] < 32 ? 2 : 1));
   }
   write(text) {
+    return this.writeBytes(encoder.encode(text));
+  }
+  writeBytes(data) {
     if (this.closed) return;
-    const data = encoder.encode(text);
     if (this.queued + data.length > 1024 * 1024) throw error('EAGAIN');
     for (let byte of data) {
       const local = this.state.get(LFLAG), input = this.state.get(IFLAG);
@@ -139,5 +158,5 @@ export class Pty {
     else if (!this.state.canonical) this.flushLine();
     this.mode({ raw: !this.state.canonical, echo: this.state.echo });
   }
-  close() { this.closed = true; clearTimeout(this.timer); this.queue = []; this.line = []; this.pipe.closeWriter(); }
+  close() { this.closed = true; this.control.hungup = true; clearTimeout(this.timer); this.queue = []; this.line = []; this.pipe.release(PAGE); }
 }

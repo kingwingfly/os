@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 pub mod accelerator;
+pub mod system;
 
 /// Why a call failed, as Linux's errno says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -276,6 +277,11 @@ pub struct Completion {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Exec {
     pub pid: u32,
+    /// Public execution-generation expectations, never account or process credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_scope: Option<String>,
     /// The process's token, which it sends as the batch's `proc`, with its `pid`.
     pub token: String,
     /// The image, as a descriptor of the process's own for a file, or an asset path for /usr.
@@ -327,6 +333,10 @@ pub struct Proc {
     pub pending_signals: Vec<PendingSignal>,
     pub pid: u32,
     pub ppid: u32,
+    #[serde(default)]
+    pub pgid: u32,
+    #[serde(default)]
+    pub sid: u32,
     pub state: ProcState,
     /// The wait status waitpid(2) gives: exit code << 8, or the signal that ended it.
     pub status: i32,
@@ -549,6 +559,13 @@ pub struct Closed {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub created: bool,
 }
+/// Optional process-owned cgroup lifetime; ordinary cgroups remain persistent.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CgroupLifetime {
+    Process,
+}
+
 /// Bytes, as a call takes or gives them: base64 in JSON, a third more than they are, where a
 /// list of numbers would be four times.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -644,6 +661,142 @@ impl FdRef {
             Self::Ref { .. } => u32::MAX,
         }
     }
+}
+
+/// A host proves its membership independently of its publicly visible name.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoginHost {
+    pub session: String,
+    pub host: String,
+    pub proof: String,
+}
+
+/// A private startup attempt, scoped to one login and configuration revision.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginLaunch {
+    pub revision: String,
+    pub proof: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LoginAction {
+    Inspect,
+    /// Persistent account preference for this Machine's console-sharing hosts.
+    SeatPolicy {
+        session: String,
+        expected: u64,
+        sharing: SharingMode,
+    },
+    /// End this exact authenticated login scope, independently of coordinator ownership.
+    End {
+        session: String,
+    },
+    /// Explicitly start a fresh scope after the preceding shutdown has completed.
+    Restart {
+        session: String,
+    },
+    Join {
+        host: String,
+        proof: String,
+    },
+    Keep {
+        member: LoginHost,
+    },
+    Claim {
+        member: LoginHost,
+        generation: u64,
+    },
+    Renew {
+        member: LoginHost,
+        generation: u64,
+    },
+    Leave {
+        member: LoginHost,
+    },
+    /// Select an automatic startup file for this account on this Machine; None disables it.
+    Configure {
+        member: LoginHost,
+        generation: u64,
+        file: Option<String>,
+    },
+    Begin {
+        member: LoginHost,
+        generation: u64,
+        launch: LoginLaunch,
+    },
+    /// A narrow completion capability, also usable after the browser changes login.
+    Finish {
+        session: String,
+        launch: LoginLaunch,
+        status: i32,
+        error: Option<String>,
+    },
+    /// Associate a proven process with this login's single managed-process slot.
+    Attach {
+        member: LoginHost,
+        generation: u64,
+        process: ProcessProof,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch: Option<LoginLaunch>,
+    },
+    /// Control only the explicitly associated process, with a fresh coordinator fence.
+    Signal {
+        member: LoginHost,
+        generation: u64,
+        pid: u32,
+        signal: u8,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SharingMode {
+    None,
+    View,
+    #[default]
+    Control,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeatPolicy {
+    pub revision: u64,
+    pub sharing: SharingMode,
+}
+
+/// The init host's capability is scoped to one Machine boot and owner generation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitOwner {
+    pub boot: String,
+    pub host: String,
+    pub proof: String,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InitAction {
+    Inspect,
+    /// Root may restart this exact Machine boot; an init lease grants no such authority.
+    Reboot {
+        boot: String,
+    },
+    Claim {
+        owner: InitOwner,
+    },
+    Renew {
+        owner: InitOwner,
+    },
+    Release {
+        owner: InitOwner,
+    },
+    /// Start the restricted PID 1 reaper; this is never an account credential.
+    Start {
+        owner: InitOwner,
+        token: String,
+    },
 }
 
 /// A system call. Paths are absolute, as user space makes them from its working directory;
@@ -958,6 +1111,9 @@ pub enum Call {
         /// lives: a process whose seat's lock is free was left by a tab that is gone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seat: Option<String>,
+        /// Execution-host resource contract. This is capability negotiation, not trust.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<String>,
     },
     /// The host's projection of its local terminal descriptors. Metadata only: knowing
     /// a PTY number grants no access to its buffers or another process's descriptors.
@@ -974,6 +1130,9 @@ pub enum Call {
     /// after; with none, the registry gives one.
     Fork {
         pid: u32,
+        /// posix_spawn creates a pending child without cloning the parent's VM.
+        #[serde(default)]
+        empty_memory: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         child: Option<u32>,
         /// The parent's token, when its kernel tells of the fork in a batch of others' calls.
@@ -1005,6 +1164,15 @@ pub enum Call {
     /// What the client kernel checks is still there: the tabs (seats) whose processes still
     /// run, and the kernels holding lent pids (`{seats, kernels}`), for the account or all for root.
     Seats,
+    /// Machine-wide init host ownership. This grants no process or account privilege.
+    MachineInit {
+        action: InitAction,
+    },
+    /// Login-session coordination, separate from POSIX sessions and process credentials.
+    /// The authority selects the login from cookies; public host/session IDs grant nothing.
+    LoginSession {
+        action: LoginAction,
+    },
     /// The tab `seat`, or the kernel `kernel`, is gone (its Web Lock is free): what the tab ran
     /// ended with it, as by SIGKILL, and init reaps it; the pids the kernel was lent go back.
     /// Every affected row must belong to the caller's account, or the caller must be root.
@@ -1016,6 +1184,39 @@ pub enum Call {
     },
     /// getpid(2), of the calling process.
     Getpid,
+    /// POSIX process groups and sessions, always as an authenticated process.
+    Getpgid {
+        pid: i32,
+    },
+    Getsid {
+        pid: i32,
+    },
+    Setpgid {
+        pid: i32,
+        pgid: i32,
+    },
+    Setsid,
+    /// Host bootstrap of a fresh pipeline's session. Each init child proves ownership;
+    /// this does not change credentials or grant access to terminal buffers.
+    ProcSession {
+        processes: Vec<ProcessProof>,
+    },
+    /// Linux prctl subset: PR_SET_CHILD_SUBREAPER (36), PR_GET_CHILD_SUBREAPER (37).
+    Prctl {
+        option: u32,
+        #[serde(default)]
+        value: u32,
+    },
+    /// Report that the calling process actually stopped at a signal safe point.
+    ProcStopped {
+        signal: u8,
+    },
+    /// waitpid selectors (positive child, zero own group, -1 any, below -1 group).
+    /// Options use Linux WNOHANG=1, WUNTRACED=2 and WCONTINUED=8.
+    Waitpid {
+        pid: i32,
+        options: u32,
+    },
     /// What those processes are now, as waitid(2) with WNOHANG tells it, for the caller's
     /// namespace and account.
     ProcPoll {
@@ -1031,6 +1232,9 @@ pub enum Call {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         controllers: Option<String>,
+        /// Bind this subtree to the calling process; its death kills remaining members.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lifetime: Option<CgroupLifetime>,
     },
     CgroupRemove {
         path: String,
@@ -1050,6 +1254,11 @@ pub enum Call {
     /// What a cgroup's control files say, and its processes.
     CgroupStat {
         path: String,
+    },
+    /// Runtime-only linear-memory reservation, before allocation. Ordinary guest
+    /// syscall imports cannot issue it; the owning execution host carries its proof.
+    Resource {
+        memory: u64,
     },
     /// The cgroups below `path`, or the root's, as getdents lists a directory.
     CgroupList {
@@ -1084,10 +1293,20 @@ pub enum Call {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target<'a> {
     Pid(u32),
+    Group(u32),
+    All,
     Job(&'a str),
 }
 impl<'a> Target<'a> {
     pub fn of(pid: &'a str) -> Self {
+        if pid == "-1" {
+            return Target::All;
+        }
+        if let Ok(value) = pid.parse::<i32>()
+            && value < -1
+        {
+            return Target::Group(value.unsigned_abs());
+        }
         pid.parse().map_or(Target::Job(pid), Target::Pid)
     }
 }
@@ -1104,8 +1323,18 @@ impl Call {
             | Call::Exit { .. }
             | Call::Pids { .. }
             | Call::Seats
+            | Call::MachineInit { .. }
+            | Call::LoginSession { .. }
             | Call::Gone { .. }
             | Call::Getpid
+            | Call::Getpgid { .. }
+            | Call::Getsid { .. }
+            | Call::Setpgid { .. }
+            | Call::Setsid
+            | Call::ProcSession { .. }
+            | Call::ProcStopped { .. }
+            | Call::Prctl { .. }
+            | Call::Waitpid { .. }
             | Call::ProcPoll { .. }
             | Call::ProcKeep { .. }
             | Call::ProcTty { .. }
@@ -1114,9 +1343,10 @@ impl Call {
             | Call::CgroupSet { .. }
             | Call::CgroupAttach { .. }
             | Call::CgroupStat { .. }
+            | Call::Resource { .. }
             | Call::CgroupList { .. } => true,
             Call::Kill { pid, .. } | Call::Wait { pid, .. } => {
-                matches!(Target::of(pid), Target::Pid(_))
+                !matches!(Target::of(pid), Target::Job(_))
             }
             _ => false,
         }
@@ -1283,6 +1513,7 @@ mod tests {
         assert_eq!(
             call,
             Call::Execve {
+                runtime: None,
                 pid: None,
                 token: None,
                 path: "/usr/bin/coreutils".into(),
@@ -1329,6 +1560,7 @@ mod tests {
         assert_eq!(
             old,
             Call::Fork {
+                empty_memory: false,
                 pid: 4,
                 child: None,
                 token: None,

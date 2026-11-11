@@ -13,7 +13,7 @@
 // image is written out (binaryen's compact imports would).
 import { prepareImage } from './image.js';
 
-const FEATURES = ['MultiMemory', 'Atomics', 'MutableGlobals', 'NontrappingFPToInt', 'SIMD128', 'BulkMemory', 'BulkMemoryOpt', 'SignExt',
+export const FEATURES = ['MultiMemory', 'Atomics', 'MutableGlobals', 'NontrappingFPToInt', 'SIMD128', 'BulkMemory', 'BulkMemoryOpt', 'SignExt',
   'ReferenceTypes', 'Multivalue', 'ExtendedConst', 'TailCall', 'ExceptionHandling', 'CallIndirectOverlong'];
 export const FUNCTIONS = '__tw_functions';
 

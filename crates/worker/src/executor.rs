@@ -38,6 +38,12 @@ pub fn authorize(db: &Db, credential: &crate::creds::Credential, call: &Call) ->
     let Some(id) = credential.job() else {
         return Ok(());
     };
+    if db
+        .provider_deadline(&id)
+        .is_some_and(|at| at <= crate::auth::now())
+    {
+        return Err(Errno::ETIMEDOUT.into());
+    }
     let task = db.device_task(&id).ok_or(Errno::EPERM)?;
     let grants: Vec<WriteGrant> = serde_json::from_str(&task.grants).map_err(|_| Errno::EIO)?;
     let check = |path: &str, follow: bool| -> Result<(), Error> {
@@ -116,6 +122,7 @@ pub fn finish(db: &mut Db, job: &str, state: &str) {
     db.unpin(job);
     db.revoke_job(job);
     db.clear_expiry("job", job);
+    db.clear_expiry("provider_deadline", job);
 }
 
 /// The process calls (owner's design, 2026-10-29): a job is a process of the account signed in

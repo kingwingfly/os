@@ -38,7 +38,7 @@ pub fn opened(db: &Db, found: &Fd) -> String {
 
 /// `path` with a magic link /proc/self/fd/N in it followed: the last part only if `follow`, as
 /// lstat and readlink look at the link itself.
-pub fn follow(db: &Db, sid: Option<&str>, path: &str, follow: bool) -> Result<String> {
+pub fn follow(db: &mut Db, sid: Option<&str>, path: &str, follow: bool) -> Result<String> {
     let Some(rest) = path.strip_prefix("/proc/self/fd/") else {
         return Ok(path.to_string());
     };
@@ -50,6 +50,7 @@ pub fn follow(db: &Db, sid: Option<&str>, path: &str, follow: bool) -> Result<St
     }
     let fd: u32 = number.parse().map_err(|_| Errno::ENOENT)?;
     let found = sid.and_then(|sid| db.fd(sid, fd)).ok_or(Errno::ENOENT)?;
+    crate::system::select(db, found.generation.as_deref())?;
     let target = opened(db, &found);
     Ok(match after {
         Some(after) if !after.is_empty() => format!("{}/{after}", target.trim_end_matches('/')),
@@ -123,9 +124,11 @@ fn status(db: &Db, process: &Proc) -> String {
                 _ => "R (running)",
             };
             format!(
-                "Name:\t{name}\nState:\t{state}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nCgroup:\t{}\n",
+                "Name:\t{name}\nState:\t{state}\nPid:\t{}\nPPid:\t{}\nPGid:\t{}\nSid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nCgroup:\t{}\n",
                 row.pid,
                 row.ppid,
+                row.pgid,
+                row.sid,
                 row.uid,
                 row.uid,
                 row.uid,

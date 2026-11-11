@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+mod cgroup_lifetime;
 mod commands;
 mod compiler;
 mod creds;
@@ -9,15 +10,22 @@ mod executor;
 mod fds;
 mod files;
 mod guests;
+mod init;
 mod jobs;
+mod lifecycle;
+mod login;
 mod machine;
 mod placement;
 mod procfs;
 mod procs;
+mod provider_policy;
+mod resources;
 mod runner;
+mod seat_policy;
 mod store;
 mod streams;
 mod sys;
+mod system;
 mod usr;
 pub use compiler::ModuleCompiler;
 use files::error_response;
@@ -30,7 +38,7 @@ use worker::*;
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.url()?.path().to_string();
     if !path.starts_with("/api/") {
-        return env.assets("ASSETS")?.fetch_request(req).await;
+        return system::route(req, &env).await;
     }
     // The page's line for changes: a WebSocket, which carries the session cookie, so only this
     // site may open one; its reply goes back as the authority made it.
@@ -97,6 +105,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             error_response("Service temporarily unavailable; please try again", 500)?
         }
     };
+    if path == "/api/sys" {
+        response = system::finish_preparation(&env, response).await?;
+    }
     let headers = Headers::new();
     for (name, value) in response.headers().entries() {
         headers.append(&name, &value)?;

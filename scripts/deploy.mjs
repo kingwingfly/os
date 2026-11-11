@@ -20,7 +20,7 @@ function run(command, args, env = process.env) {
   if (status !== 0) process.exit(status ?? (signal ? 1 : 0));
 }
 
-run(process.execPath, [join(scripts, 'build.mjs')]);
+run('cargo', ['xtask', 'build']);
 const env = { ...process.env };
 if (!env.WRANGLER_DOCKER_BIN && !has('docker') && has('podman')) {
   env.WRANGLER_DOCKER_BIN = join(scripts, 'podman-docker.sh');

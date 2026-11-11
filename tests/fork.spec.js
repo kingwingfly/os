@@ -71,7 +71,8 @@ test('fork is the kernel\'s: its child is told after; an orphan is init\'s, and 
     expect(zombie.state).toBe('zombie');
     value(await call(page, 'exit', { pid: parent.pid, status: 0 }));
     expect(value(await call(page, 'wait', { pid: parent.pid })).status).toBe(0);
-    expect(value(await call(page, 'poll', { pids: [parent.pid, child.pid] }))).toEqual([]);
+    // Executable PID 1 waits asynchronously, after the parent exit transaction.
+    await expect.poll(async () => value(await call(page, 'poll', { pids: [parent.pid, child.pid] })), { timeout: 15_000 }).toEqual([]);
     // What init has, it waits for.
     value(await call(page, 'exit', { pid: grandchild.pid, status: 0, signal: 15 }));
     expect(value(await call(page, 'wait', { pid: grandchild.pid })).status).toBe(15);
@@ -267,11 +268,14 @@ const JUMP = wasix(`(import "wasix_32v1" "stack_checkpoint" (func $setjmp (param
 '(data (i32.const 1024) "set\\n") (data (i32.const 1040) "jumped\\n")');
 
 // The child executes `coreutils sleep N`; the parent waits for it (FORK_SLEEP), or ends at once
-// (FORK_ORPHAN), leaving it to init.
+// (FORK_ORPHAN), leaving it to init. The orphan explicitly ignores terminal
+// hangup before fork, so that disposition survives exec when its session ends.
 const sleeper = (seconds, wait) => {
   const args = `coreutils\\nsleep\\n${seconds}`;
   return wasix(`${FORK} ${JOIN}
-  (import "wasix_32v1" "proc_exec" (func $exec (param i32 i32 i32 i32)))`, `
+  (import "wasix_32v1" "proc_exec" (func $exec (param i32 i32 i32 i32)))
+  ${wait ? '' : '(import "os" "sigaction" (func $action (param i32 i32 i32 i32) (result i32)))'}`, `
+    ${wait ? '' : '(drop (call $action (i32.const 1) (i32.const 1) (i32.const 0) (i32.const 0)))'}
     (drop (call $fork (i32.const 1) (i32.const 2060)))
     (if (i32.eqz (i32.load (i32.const 2060)))
       (then (call $exec (i32.const 1024) (i32.const 18) (i32.const 1104) (i32.const ${16 + String(seconds).length}))))
@@ -333,12 +337,14 @@ async function uploads(request, files) {
   }
 }
 const last = page => page.locator('.transcript pre').last();
-// How a page's processes ask the kernel, as the browser sends it: by fetch, suspended on it
-// (JSPI), or by synchronous XHR.
+// Guest calls use fetch suspended by JSPI, or synchronous XHR. Private runtime
+// memory reservations also use XHR before instantiation, outside a JSPI frame.
 function processCalls(page) {
   const kinds = new Set();
   page.context().on('request', request => {
-    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/sys' && !request.headers()['x-registry'] && JSON.parse(request.postData() || '{}').proc) kinds.add(request.resourceType());
+    if (request.method() !== 'POST' || new URL(request.url()).pathname !== '/api/sys' || request.headers()['x-registry']) return;
+    const body = JSON.parse(request.postData() || '{}');
+    if (body.proc && body.calls?.some(call => !call.resource)) kinds.add(request.resourceType());
   });
   return kinds;
 }
@@ -454,7 +460,8 @@ test.describe('fork in the terminal', () => {
     await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle');
     // Canonical input echo and the parent's reply share the terminal screen.
     await expect(page.locator('.transcript pre').last()).toHaveText('typed\ntyped');
-    // The parent ends first: its child is init's, runs on, and is reaped as it ends.
+    // The parent ends first: its child ignores SIGHUP, becomes init's, runs on,
+    // and is reaped as it ends.
     await command(page, './fork-orphan');
     const orphan = () => call(page, 'poll', { pids: [] }).then(reply => value(reply).find(process => process.argv.join(' ') === 'coreutils sleep 3'));
     await expect.poll(async () => (await orphan())?.ppid).toBe(1);

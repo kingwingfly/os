@@ -109,6 +109,8 @@ const WRITING: &[&str] = &[
     "unzip",
     "tar",
     "faststart",
+    "imagectl",
+    "providerctl",
 ];
 
 /// The utility of coreutils named `name`.
@@ -154,11 +156,17 @@ pub const UTILITIES: &[&str] = &[
     "unzip",
     "tar",
     "faststart",
+    "imagectl",
+    "providerctl",
 ];
 
 /// The installed multicall image that owns a program; UI actions have no executable image.
 pub fn image(name: &str) -> Option<&'static str> {
-    if name == "coreutils" || PROGRAMS.contains(&name) {
+    if name == "init" {
+        Some("init")
+    } else if name == "supervise" {
+        Some("supervise")
+    } else if name == "coreutils" || PROGRAMS.contains(&name) {
         Some("coreutils")
     } else if name == "utilities" || UTILITIES.contains(&name) {
         Some("utilities")

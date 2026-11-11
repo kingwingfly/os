@@ -4,6 +4,7 @@
 use std::io;
 use std::path::Path;
 
+pub mod pipe;
 pub mod process;
 
 pub use abi::Stat;

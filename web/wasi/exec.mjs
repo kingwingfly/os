@@ -1,4 +1,5 @@
-import { CONTROL_WORDS, bit, valid, ignoredByDefault, stoppedByDefault } from './signals.mjs';
+import { asset } from '../release.js';
+import { Signals, CONTROL_WORDS, bit, valid, ignoredByDefault, stoppedByDefault } from './signals.mjs';
 // exec(2), as the page does it: programs of /usr/bin, built for wasm32-wasip1, each run as a
 // process of its own (web/wasi/process.js, a Worker), with their arguments, environment, standard
 // input and the terminal. The binary is compiled once, and each process instantiates it anew.
@@ -10,6 +11,7 @@ import { CONTROL_WORDS, bit, valid, ignoredByDefault, stoppedByDefault } from '.
 // another, each given what the one before wrote, and nothing reads the terminal.
 import { Pipe, pipeBuffer } from './pipe.js';
 import { Pty, TtyState, IOCTL, LF, IF } from '../kernel/pty.js';
+import { PtyDevices } from '../kernel/ptmx.js';
 import { Bytes, Shares } from './shared.js';
 const kernelCall = (type, args) => globalThis.kernelRequest(type, args);
 import { load } from '../kernel/loader.js';
@@ -37,23 +39,31 @@ const reap = async (pid, { status, signal }, forked = false) => {
   if (!forked || parent === 1) {
     try { await kernelCall('wait', { pid }); } catch { /* reaped already, or still running */ }
   }
-  hosted.get(parent)?.signal(17);
+  await reconcile();
   // A wait that waits on it hears it ended.
-  exits++;
-  for (const wake of [...exited]) wake();
-  exited.clear();
+  wakeChildren();
 };
 // How many processes hosted here ended, and the waits that wait for the next: a wait4 that
 // found its children running waits for one to end, and misses none that ended meanwhile.
 let exits = 0;
 const exited = new Set();
+function wakeChildren() { exits++; for (const wake of [...exited]) wake(); exited.clear(); }
 // wait4(2) of the process `ppid` for its child `pid`, or any: its status once it ends, or,
 // with `nohang`, none if none ended yet.
-async function join(ppid, pid, nohang) {
+async function join(ppid, pid, nohang, options = 0) {
   for (;;) {
     const seen = exits;
     try {
-      return await kernelCall('waitchild', { ppid, pid: pid ?? undefined });
+      const result = await kernelCall('process_call', { pid: ppid, call: { waitpid: { pid: pid ?? -1, options: options | (nohang ? 1 : 0) } } });
+      if ('code' in result) {
+        // SIGKILL ends the registry entry before a busy Worker releases its file
+        // references. Complete that cleanup before its parent observes the exit
+        // and closes what may now be the last shared writer.
+        const child = hosted.get(result.pid);
+        child?.kill(result.signal ?? SIG.KILL);
+        await (child?.exited ?? completing.get(result.pid));
+      }
+      return result;
     } catch (error) {
       if (error.errno !== 'EAGAIN') return { errno: error.errno ?? 'EIO' };
       if (nohang) return { nothing: true };
@@ -84,7 +94,7 @@ async function closeHeld(of, pid, token, as) {
     return known.description;
   }).filter(Boolean);
   if (!last.length) return;
-  const closer = new Worker('/wasi-process.js');
+  const closer = new Worker(asset('/wasi-process.js'));
   await new Promise(resolve => {
     closer.onmessage = ({ data }) => { if ('exit' in data) resolve(); };
     closer.onerror = () => resolve();
@@ -125,8 +135,39 @@ const KILLED = 0x100, GRACE = 1000;
 // The processes this tab hosts, by pid: a signal to one, from any tab or device, is told on the
 // page's events line (app.js `os:signal`), and the tab that hosts it acts on it.
 const hosted = new Map();
+// The host owns one devpts namespace, including processes from independent runs.
+// Keep loading stages visible to ownership changes before they have a Worker.
+const pendingMemberships = new Map();
+const terminalMembers = () => [...pendingMemberships.values(), ...hosted.values()];
+function clearTerminal(sid, number) {
+  for (const member of terminalMembers()) if (member.sid === sid && member.ctty === number) member.ctty = 0;
+}
+async function hangupTerminal(tty, resume, fallback = 0) {
+  const sid = tty.session, pgrp = tty.control.pgrp || fallback;
+  const recipients = terminalMembers().filter(p => !p.ended && p.sid === sid && p.pgid === pgrp);
+  clearTerminal(sid, tty.number);
+  tty.session = 0; tty.control.pgrp = 0;
+  // Device-generated delivery uses each recipient's own proof, including when
+  // the master holder and the slave's session belong to different accounts.
+  for (const signal of resume ? [SIG.HUP, SIG.CONT] : [SIG.HUP]) {
+    await Promise.allSettled(recipients.map(p => kernelCall('kill', { pid: p.pid, from: p.pid, signal })));
+  }
+  await reconciling; await reconcile();
+}
+function signalTerminal(tty, number) {
+  for (const member of terminalMembers()) if (member.sid === tty.session && member.pgid === tty.control.pgrp) {
+    if (member.signal) member.signal(number);
+    else void kernelCall('kill', { pid: member.pid, from: member.pid, signal: number }).catch(() => {});
+  }
+}
+const devices = new PtyDevices({
+  signal: signalTerminal,
+  hangup: tty => hangupTerminal(tty, true),
+});
+// Retain an exiting host's completion while its shared descriptors are closing.
+const completing = new Map();
 export const deliverSignal = async ({ pid }) => {
-  if (!hosted.has(pid)) return;
+  if (pid && !hosted.has(pid)) return;
   await reconciling;
   await reconcile();
 };
@@ -136,6 +177,7 @@ export function reconcile() {
   if (!hosted.size) return Promise.resolve();
   if (reconciling) return reconciling;
   const checking = new Map(hosted);
+  const versions = new Map([...checking].map(([pid, process]) => [pid, process.membershipVersion]));
   return reconciling = kernelCall('sync', { acknowledged: Object.fromEntries([...checking].map(([pid, process]) => [pid, [...process.received.values()]])) }).then(rows => {
     let acknowledge = false;
     const found = new Map(rows.map(row => [row.pid, row]));
@@ -144,6 +186,7 @@ export function reconcile() {
       const row = found.get(pid);
       if (!row) process.signal(SIG.KILL);
       else if (row.state === 'zombie') process.kill(row.signal ?? SIG.KILL);
+      else if (process.membershipVersion === versions.get(pid)) process.membership(row);
       // STOP/CONT come from the ordered, acknowledged queue too. Reapplying a
       // stale state snapshot here can stop a process again after `fg` resumes it.
       for (const event of row?.pending_signals ?? []) {
@@ -188,22 +231,45 @@ export async function exec(stages, options = {}) {
   // SIGPIPE at its next write and ends as a process does, closing what it has open (memory it
   // shares, where the page may share it; else the page ends it).
   const closed = isolated && enough != null && !tty ? new Int32Array(new SharedArrayBuffer(4)) : null;
-  // The stages' processes, and those they forked: the job's process group.
+  // The browser job owns its pipeline and descendants; a shell can split them
+  // into several POSIX process groups within its session.
   const processes = [], forks = [];
   const group = () => [...processes, ...forks];
-  let input = null, terminal = null, pgid = 0, foreground = true;
+  let input = null, terminal = null, pgid = 0, foreground = true, savedForeground = 0;
+  let consoleClosed = false;
+  const memberships = new Map();
+  const queuedJobSignals = new Set();
   let stopSignal = SIG.INT;
   // End every process still running, by `signal`.
   const stop = signal => { stopped = true; stopSignal = signal; for (const process of group()) process.kill(signal); };
-  // The pipeline as a process group: a signal to it is to each of its processes; one that ends
-  // a process ends the pipeline. Stopping needs memory shared with the processes.
+  // Browser job controls apply to its whole process tree. PTY input signals below
+  // instead address the foreground POSIX group. Stopping requires shared memory.
   const job = {
-    foreground: active => { foreground = active; if (terminal && pgid) { if (active) terminal.state.pgrp = pgid; else if (terminal.state.pgrp === pgid) terminal.state.pgrp = 0; } },
+    foreground: active => { foreground = active; if (terminal && pgid && terminal.session) { if (active) terminal.control.pgrp = savedForeground || pgid; else if (group().some(p => p.pgid === terminal.control.pgrp)) { savedForeground = terminal.control.pgrp; terminal.control.pgrp = 0; } } },
+    hangup: async () => {
+      if (consoleClosed) return;
+      consoleClosed = true;
+      // Deliver hangup before waking a blocking read with EOF: otherwise a
+      // process can exit successfully before its default SIGHUP is observed.
+      if (terminal) { try { await releaseTerminal(true); } finally { terminal.close(); } }
+      else await hangupWithoutTerminal();
+    },
     get pids() { return group().filter(process => !process.ended).map(process => process.pid); },
     stoppable: !!isolated,
     signal: signal => {
-      for (const process of group()) {
-        if ([SIG.STOP, SIG.CONT].includes(signal)) {
+      if (!valid(signal)) return;
+      // SIGKILL also ends admitted stages whose image is still loading. Their
+      // revoked-token response must settle as cancellation, not an image error.
+      if (signal === SIG.KILL) stop(signal);
+      if (!memberships.size) {
+        if (signal === SIG.CONT) for (const stopped of [19, 20, 21, 22]) queuedJobSignals.delete(stopped);
+        else if (stoppedByDefault.has(signal)) queuedJobSignals.delete(SIG.CONT);
+        queuedJobSignals.add(signal); return;
+      }
+      const members = new Map([...memberships.values(), ...group()].map(p => [p.pid, p]));
+      for (const process of members.values()) {
+        if (process.ended) continue;
+        if (!process.signal || [SIG.STOP, SIG.CONT].includes(signal)) {
           void kernelCall('kill', { pid: process.pid, from: process.pid, signal })
             .then(() => deliverSignal({ pid: process.pid })).catch(() => {});
           continue;
@@ -224,7 +290,7 @@ export async function exec(stages, options = {}) {
   onJob(job);
   if (isolated && (tty || stdin == null)) {
     terminal = new Pty({ state: options.terminalState ?? TtyState.create(options),
-      echo: text => onOutput(0, text), signal: number => job.signal(number),
+      echo: text => onOutput(0, text), signal: number => signalTerminal(terminal, number),
       mode: value => options.onMode?.(value) });
     if (options.columns && options.rows) terminal.state.resize(options);
     known(terminal.pipe.buffer);
@@ -243,17 +309,21 @@ export async function exec(stages, options = {}) {
   // A process made for a stage whose pipeline ends before the stage starts runs no image: it
   // exits as a hostless process would, and is reaped, so that no process is left in the
   // registry. The stage's place in the pipeline takes the status that ended it.
-  const abandon = image => reap(image.pid, { status: 126 });
+  const abandon = image => { pendingMemberships.delete(image.pid); return reap(image.pid,
+    stopped ? { status: 128 + stopSignal, signal: stopSignal } : { status: 126 }); };
   // Each stage's environment: a terminal's for the last one when it writes to the terminal.
   const environments = stages.map((_, index) => env(!(index === last && tty)));
   // execve of every stage at once: the worker kernel checks each image and snapshots the
   // credentials, in one request; each process's token goes with each batch the host makes for
   // it. A stage may name its own image (an uploaded wasm); the loader compiles it once per
   // content.
-  const asked = resolveExecs(
+  // The internal boot callback supplies an already authorized reserved process.
+  // Page execution options do not expose this callback or its private proof.
+  const asked = options.prepare ? options.prepare() : resolveExecs(
     stages.map((stage, index) => ({
       path: stage.path ?? (stage.argv ?? stage)[0],
       argv: stage.argv ?? stage,
+      cgroup: stage.cgroup,
       env: Object.entries(environments[index]).map(([name, value]) => `${name}=${value}`),
       cwd,
     })),
@@ -273,8 +343,8 @@ export async function exec(stages, options = {}) {
   // A process this job hosts, in a Worker of its own: a stage's, or one a process of it forked
   // (`forked`, its start the parent's snapshot). `write` is where its output goes, as its
   // stage's does.
-  const host = ({ pid, token, ppid, module, memory, startSection = false, argv, write, forked, start, transfer = [], files = null }) => {
-    const worker = new Worker('/wasi-process.js');
+  const host = ({ pid, token, ppid, module, memory, memoryBytes, startSection = false, argv, write, forked, start, transfer = [], files = null, membership }) => {
+    const worker = new Worker(asset('/wasi-process.js'));
     const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
     // Each writer has two small compositor credits. A killed worker cannot leak credits
     // needed by another writer, and fork children get their own bounded output channel.
@@ -293,8 +363,26 @@ export async function exec(stages, options = {}) {
     // The word it is signalled by (stopped, continued, ended: process.js); the memory its
     // waiting calls are answered in.
     const control = isolated ? new Int32Array(new SharedArrayBuffer(CONTROL_WORDS * 4)) : null;
+    if (control) {
+      // Delivery may precede Worker startup. Honor inherited ignore/mask state
+      // immediately, including exec's reset of caught dispositions.
+      const dispositions = new Signals(control, (start.fork ?? start.inherit)?.signals);
+      if (start.inherit) dispositions.exec();
+    }
     const channel = isolated ? new SharedArrayBuffer(8 + CHANNEL) : null;
-    const process = { received: new Map(), pid, token, files, stopped: false, ended: false, forked, exited, image: { module, memory, startSection } };
+    const ids = new Int32Array(isolated ? new SharedArrayBuffer(12) : new ArrayBuffer(12));
+    const process = { uid: (membership ?? memberships.get(pid)).uid, received: new Map(), pid, ppid, token, files, stopped: false, ended: false, forked, exited, membershipVersion: 0,
+      get pgid() { return Atomics.load(ids, 0); }, get sid() { return Atomics.load(ids, 1); },
+      get ctty() { return Atomics.load(ids, 2); }, set ctty(value) { Atomics.store(ids, 2, value); },
+      membership(row) {
+        this.membershipVersion++;
+        if (row.pid === pid && row.ppid != null) this.ppid = row.ppid;
+        if (this.sid !== row.sid) this.ctty = 0;
+        Atomics.store(ids, 0, row.pgid); Atomics.store(ids, 1, row.sid);
+      },
+      image: { module, memory, memoryBytes, startSection } };
+    process.membership(membership ?? memberships.get(pid));
+    process.ctty = (membership ?? memberships.get(pid)).ctty ?? 0;
     // An external kill can revoke this image before the host hears its signal. The
     // descriptor table belongs to its whole fork lineage: a surviving holder may close
     // its last references. If none survives, authority revocation closes the lineage.
@@ -309,15 +397,27 @@ export async function exec(stages, options = {}) {
       status = code;
       clearTimeout(killing);
       process.ended = true;
+      completing.set(pid, exited);
       hosted.delete(pid);
+      // The host bootstrap owns a whole pipeline. One stage exiting must not
+      // hang up siblings that are still draining its output. A standalone shell
+      // ending (or the last pipeline stage ending) releases that session's PTY.
+      const ownsTerminal = terminal && process.ctty === terminal.number && process.pid === terminal.session;
+      const hangup = terminal && ((ownsTerminal && !processes.includes(process)) ||
+        (processes.includes(process) && processes.length === stages.length && processes.every(stage => stage.ended))) ? releaseTerminal(false) : Promise.resolve();
       worker.terminate();
       changed();
       // What it held of pipes goes as it goes, its locks too.
       release(pid);
       for (const fd of [1, 2]) { const text = decoders[fd].decode(); if (text) void publish(fd, text); }
-      const closing = outright ? closeHeld(files, pid, cleanupToken(), { umask, sudo }) : Promise.resolve();
+      const owned = [...devices.pairs.values()].filter(pair => pair.terminal.session === pid);
+      // Last-master close needs the owning session/foreground group to send
+      // HUP+CONT, including when a stuck Worker could not close its own fds.
+      const deviceCleanup = devices.release(pid).then(() => Promise.all(owned
+        .filter(pair => pair.terminal.session === pid).map(pair => releaseTerminal(false, pair.terminal))));
+      const closing = Promise.all([hangup, deviceCleanup, outright ? closeHeld(files, pid, cleanupToken(), { umask, sudo }) : Promise.resolve()]);
       void closing.then(() => reap(pid, { status: code, signal }, forked));
-      void Promise.allSettled([closing, ...displaying]).then(() => settle(code));
+      void Promise.allSettled([closing, ...displaying]).then(() => { completing.delete(pid); settle(code); });
     };
     // A signal that ends it: heeded at its next call, as it exits; outright if it cannot.
     const kill = signal => {
@@ -332,8 +432,15 @@ export async function exec(stages, options = {}) {
     const answer = async ({ type, args }) => {
       let reply;
       try {
-        if (type === 'join') reply = await join(pid, args.pid, args.nohang);
+        if (type === 'join') reply = await join(pid, args.pid, args.nohang, args.options);
+        else if (type === 'process_call') {
+          reply = args.waitpid
+            ? await join(pid, args.waitpid.pid, !!(args.waitpid.options & 1), args.waitpid.options)
+            : await kernelCall('process_call', { pid, call: args });
+          if (reply?.pgid != null) hosted.get(reply.pid)?.membership(reply);
+        }
         else if (type === 'cleanup') reply = { token: cleanupToken() };
+        else if (type === 'reconcile') { await reconciling; await reconcile(); reply = {}; }
         else if (type === 'getpid') reply = await kernelCall('getpid', { pid: args.pid });
         // kill(2) from a process is the process's, by its own credentials.
         else if (type === 'kill') {
@@ -345,12 +452,14 @@ export async function exec(stages, options = {}) {
         }
         else if (type === 'exec') reply = await replace(args);
         else if (type === 'spawn') reply = await spawn(args);
-        else if (type === 'tty') reply = ttyRequest(args);
+        else if (type === 'tty') reply = await ttyRequest(process, args);
+        else if (type === 'pty') reply = await ptyRequest(process, args);
         else reply = { errno: 'ENOSYS' };
       } catch (error) {
         reply = { errno: error.errno ?? 'EIO' };
       }
-      if (reply) respond(channel, reply);
+      // Zero and null are valid syscall results, not missing replies.
+      respond(channel, reply ?? null);
     };
     // execve(2) of the process itself: the image the kernel allows, loaded, replaces its own. A
     // format the loader refuses once the kernel replaced the image ends the process, as an
@@ -369,7 +478,7 @@ export async function exec(stages, options = {}) {
         return {};
       }
       process.image = loaded;
-      worker.postMessage({ image: { module: loaded.module, memory: loaded.memory, startSection: loaded.startSection, token: image.token, argv: args, env } });
+      worker.postMessage({ image: { module: loaded.module, memory: loaded.memory, memoryBytes: loaded.memoryBytes, startSection: loaded.startSection, token: image.token, argv: args, env } });
       return {};
     };
     const checkInheritance = state => {
@@ -380,7 +489,8 @@ export async function exec(stages, options = {}) {
     };
     const holdInheritance = (state, child) => {
       for (const description of state.descriptions) {
-        if (description.kind === 'pipe-in' || description.kind === 'tty') known(description.buffer).hold(child, 'r', description.refs);
+        if (description.kind === 'pty') devices.hold(pid, child, description.handle, description.refs);
+        else if (description.kind === 'pipe-in' || description.kind === 'tty') known(description.buffer).hold(child, 'r', description.refs);
         else if (description.kind === 'pipe-out') known(description.buffer).hold(child, 'w', description.refs);
         else if (description.share != null) files?.shares.add(description.share, child, description.refs);
       }
@@ -388,15 +498,24 @@ export async function exec(stages, options = {}) {
     // posix_spawn: the same authorized fork/exec lifecycle, without copying guest memory.
     // The host derives credentials from this parent; the request cannot supply a token.
     const spawn = async state => {
-      let child, held = false;
+      let child, membership, held = false;
       const alive = () => {
         if (process.ended || killing != null || stopped) throw { errno: 'EINTR' };
       };
       try {
         alive();
         checkInheritance(state);
-        child = await kernelCall('fork', { pid });
+        child = await kernelCall('fork', { pid, emptyMemory: true });
         alive();
+        if (state.cgroup != null) {
+          await kernelCall('process_call', { pid, call: { cgroup_attach: { pid: child.pid, path: state.cgroup } } });
+          alive();
+        }
+        if (state.pgroup != null) {
+          membership = await kernelCall('process_call', { pid, call: { setpgid: { pid: child.pid, pgid: state.pgroup } } });
+          membership.ctty = process.ctty;
+          alive();
+        }
         const [result] = await resolveExecs([{ path: state.argv[0], argv: state.argv, env: state.env, cwd: state.cwd }],
           stages => Promise.all(stages.map(async stage => {
             alive();
@@ -411,7 +530,7 @@ export async function exec(stages, options = {}) {
         holdInheritance(state, child.pid);
         held = true;
         const made = host({ pid: child.pid, token: child.token, ppid: pid, ...loaded, argv: state.argv,
-          write, forked: true, start: { inherit: state }, files });
+          write, forked: true, start: { inherit: state }, files, membership: membership ?? process });
         forks.push(made);
         if (control && Atomics.load(control, 0) === 1) made.signal(SIG.STOP);
         changed();
@@ -419,6 +538,7 @@ export async function exec(stages, options = {}) {
       } catch (error) {
         if (child) {
           release(child.pid);
+          await devices.release(child.pid);
           if (held) await closeHeld(files, child.pid, child.token, { umask: state.umask, sudo });
           await reap(child.pid, { status: 126 }, true);
           await kernelCall('waitchild', { ppid: pid, pid: child.pid }).catch(() => {});
@@ -429,21 +549,32 @@ export async function exec(stages, options = {}) {
     // fork(2): a child with a pid the client kernel gives, its parent's snapshot, and its pipes'
     // ends held for it before it starts.
     const fork = async state => {
-      let child;
+      let child, held = false;
       try {
         // Each pipe and open file it shares must have a place for another holder (as many as a
         // namespace has processes): EAGAIN otherwise, as fork(2) says, before a pid is taken.
         checkInheritance(state);
         child = await kernelCall('fork', { pid });
+        // The parent can end while registry admission is in flight. Do not let
+        // its late child execute or retain a charged slot without a host.
+        if (process.ended || killing != null) throw { errno: 'EINTR' };
+        checkInheritance(state);
+        holdInheritance(state, child.pid);
+        held = true;
+        const made = host({ pid: child.pid, token: child.token, ppid: pid, ...process.image, argv: state.argv, write, forked: true, start: { fork: state }, transfer: [state.snapshot.memory], files, membership: process });
+        forks.push(made);
+        changed();
+        worker.postMessage({ forked: { pid: child.pid } });
       } catch (error) {
+        if (child) {
+          release(child.pid);
+          await devices.release(child.pid);
+          if (held) await closeHeld(files, child.pid, child.token, { umask: state.umask, sudo });
+          await reap(child.pid, { status: 126 }, true);
+          await kernelCall('waitchild', { ppid: pid, pid: child.pid }).catch(() => {});
+        }
         worker.postMessage({ forked: { errno: error.errno ?? 'EIO' } });
-        return;
       }
-      holdInheritance(state, child.pid);
-      const made = host({ pid: child.pid, token: child.token, ppid: pid, ...process.image, argv: state.argv, write, forked: true, start: { fork: state }, transfer: [state.snapshot.memory], files });
-      forks.push(made);
-      changed();
-      worker.postMessage({ forked: { pid: child.pid } });
     };
     worker.onmessage = ({ data }) => {
       if (data.out) {
@@ -457,11 +588,12 @@ export async function exec(stages, options = {}) {
         // Only a caught/default job-control decision needs reporting. A STOP
         // delivered by the registry is already recorded; echoing it can race CONT.
         const recorded = data.stopped && data.cause !== SIG.STOP
-          ? kernelCall('kill', { pid, from: pid, signal: SIG.STOP }).then(() => deliverSignal({ pid }))
+          ? kernelCall('process_call', { pid, call: { proc_stopped: { signal: data.cause ?? SIG.STOP } } }).then(() => reconcile())
           : Promise.resolve();
         void recorded.catch(() => {}).then(() => {
           if (version !== stopVersion || process.ended) return;
           process.stopped = !!data.stopped; changed();
+          wakeChildren();
         });
       }
       else if (data.truncated) { truncated = true; truncatedBy.add(argv[0]); }
@@ -472,7 +604,6 @@ export async function exec(stages, options = {}) {
       else if ('exit' in data) end({ code: data.exit, signal: data.signal ?? undefined });
     };
     worker.onerror = event => { onOutput(2, `${argv[0]}: ${event.message}\n`); end({ code: 126 }, true); };
-    worker.postMessage({ ...start, module, memory, startSection, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: !!terminal }, pty: terminal?.transferable, control: control?.buffer, outputCredit: outputCredit?.buffer, channel, shares: files?.shares.buffer }, transfer);
     // Catchable signals remain pending until a safe point. Only SIGKILL is
     // irrevocable. A handler or blocked disposition prevents the fallback kill.
     const signal = number => {
@@ -497,28 +628,147 @@ export async function exec(stages, options = {}) {
     };
     Object.assign(process, { kill, signal });
     hosted.set(pid, process);
+    pendingMemberships.delete(pid);
+    // Signals can arrive while an image is loading, before it has a Worker.
+    // Recover that delivery before entering user code, including for fork children.
+    void (async () => {
+      await reconciling; await reconcile();
+      if (!process.ended) worker.postMessage({ ...start, module, memory, memoryBytes, startSection, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: !!terminal }, pty: terminal?.transferable, control: control?.buffer, outputCredit: outputCredit?.buffer, channel, membership: ids.buffer, shares: files?.shares.buffer }, transfer);
+    })().catch(() => end({ code: 126 }, true));
     return process;
   };
-  const ttyRequest = ({ request, arg }) => {
-    if (!terminal) throw { errno: 'ENOTTY' };
-    const state = terminal.state;
+  const releaseTerminal = (resume, tty = terminal) => {
+    const fallback = tty === terminal ? savedForeground : 0;
+    if (tty === terminal) savedForeground = 0;
+    return hangupTerminal(tty, resume, fallback);
+  };
+  const hangupWithoutTerminal = async () => {
+    const members = new Map([...memberships.values(), ...group()].map(p => [p.pid, p]));
+    for (const signal of [SIG.HUP, SIG.CONT]) await Promise.allSettled([...members.values()]
+      .filter(p => !p.ended).map(p => kernelCall('kill', { pid: p.pid, from: p.pid, signal })));
+    await reconciling; await reconcile();
+  };
+  const ptyRequest = async (process, args) => {
+    const { op, handle } = args;
+    const stat = (number = 0, uid = 0, mode = 0o020600) => ({ ino: number, uid, gid: 0, user: uid ? String(uid) : 'root', group: 'root', mode, nlink: 1, size: 0, mtime: 0, ctime: 0 });
+    if (op === 'list') {
+      const entries = [...devices.pairs.values()].filter(pair => !pair.masterClosed)
+        .map(pair => ({ name: String(pair.number), stat: stat(pair.number, pair.uid) }));
+      if (terminal && !terminal.closed) entries.unshift({ name: String(terminal.number), stat: stat(terminal.number, process.uid, 0o020620) });
+      return { entries };
+    }
+    if (op === 'stat' || op === 'access') {
+      let result;
+      if (args.path === '/dev/pts') result = stat(0, 0, 0o040755);
+      else {
+        const target = devices.path(args.path, process.ctty);
+        if (!target) throw { errno: args.path === '/dev/tty' ? 'ENXIO' : 'ENOENT' };
+        result = stat(target.pair?.number, target.pair?.uid, target.master ? 0o020666 : 0o020600);
+      }
+      if (op === 'access') {
+        if (!Number.isInteger(args.mode) || args.mode < 0 || args.mode > 7) throw { errno: 'EINVAL' };
+        const allowed = process.uid === result.uid ? result.mode >> 6 & 7 : result.mode & 7;
+        if (process.uid === 0 ? args.mode & 1 && !(result.mode & 0o111) : (allowed & args.mode) !== args.mode) throw { errno: 'EACCES' };
+        return {};
+      }
+      return result;
+    }
+    if (op === 'open') {
+      const opened = devices.open(process, args.path, args);
+      const { pair, master } = devices.get(process.pid, opened.handle);
+      if (!master && !args.noctty && !process.ctty && !pair.terminal.session && process.pid === process.sid && (opened.readable || process.uid === 0))
+        await ttyRequest(process, { handle: opened.handle, request: IOCTL.TIOCSCTTY });
+      return opened;
+    }
+    const description = devices.get(process.pid, handle);
+    if (op === 'hold') { devices.hold(process.pid, process.pid, handle); return {}; }
+    if (op === 'close') { await devices.close(process.pid, handle); return {}; }
+    if (op === 'flags') {
+      if (args.nonblock != null) description.nonblock = !!args.nonblock;
+      return { nonblock: description.nonblock };
+    }
+    if (op === 'read') {
+      const result = devices.read(process.pid, handle, args.count);
+      return result instanceof Uint8Array ? { data: Array.from(result) } : result;
+    }
+    if (op === 'write') return devices.write(process.pid, handle, Uint8Array.from(args.data));
+    if (op === 'poll') return devices.poll(process.pid, handle, args.writing);
+    throw { errno: 'EINVAL' };
+  };
+  const ttyRequest = async (process, { request, arg, readable = true, handle }) => {
+    const description = handle != null ? devices.get(process.pid, handle) : null;
+    const tty = description?.pair.terminal ?? terminal;
+    if (!tty) throw { errno: 'ENOTTY' };
+    if (tty.closed && (request === 'open' || request === IOCTL.TIOCSCTTY)) throw { errno: 'EIO' };
+    if (description) {
+      readable = description.readable;
+      if ([IOCTL.TIOCGPTN, IOCTL.TIOCSPTLCK, IOCTL.TIOCGPTLCK].includes(request)) return devices.ioctl(process.pid, handle, request, arg);
+      if (description.master && [IOCTL.TIOCSCTTY, IOCTL.TIOCNOTTY].includes(request)) throw { errno: 'ENOTTY' };
+      if (description.pair.masterClosed && request === IOCTL.TIOCSCTTY) throw { errno: 'EIO' };
+    }
+    const state = tty.state, control = tty.control;
+    const controlling = () => process.ctty === tty.number && process.sid === tty.session;
     switch (request) {
+      case 'open':
+        if (!process.ctty && !tty.session && process.pid === process.sid && (readable || process.uid === 0)) {
+          tty.session = process.sid; control.pgrp = process.pgid; process.ctty = tty.number;
+          if (tty === terminal) savedForeground = process.pgid;
+        }
+        return {};
+      case 'access': {
+        if (description?.master || !controlling() || process.pgid === control.pgrp) return {};
+        const number = typeof arg === 'object' ? arg.signal : arg;
+        if (arg?.suppressed) { if (number === 21) throw { errno: 'EIO' }; return {}; }
+        const members = terminalMembers().filter(p => !p.ended && p.pgid === process.pgid && p.sid === process.sid);
+        const orphaned = !members.some(p => { const parent = hosted.get(p.ppid); return parent && parent.sid === p.sid && parent.pgid !== p.pgid; });
+        if (orphaned) return { errno: 'EIO' };
+        await kernelCall('kill', { pid: -process.pgid, from: process.pid, signal: number });
+        await reconciling; await reconcile();
+        return { signalled: true };
+      }
+      case IOCTL.TIOCGSID:
+        if (!controlling()) throw { errno: 'ENOTTY' };
+        return { sid: tty.session };
+      case IOCTL.TIOCNOTTY:
+        if (!controlling()) throw { errno: 'ENOTTY' };
+        if (process.pid === process.sid) await releaseTerminal(true, tty);
+        else process.ctty = 0;
+        return {};
+      case IOCTL.TIOCSCTTY: {
+        if (arg != null && !Number.isInteger(arg)) throw { errno: 'EINVAL' };
+        // The proof-checked bootstrap supplies uid; fork and exec preserve it.
+        // A page login or a program's environment cannot change this snapshot.
+        const privileged = process.uid === 0;
+        if (process.ended) throw { errno: 'ESRCH' };
+        if (process.pid === process.sid && tty.session === process.sid) return {};
+        if (process.pid !== process.sid || process.ctty) throw { errno: 'EPERM' };
+        if (tty.session && !(privileged && arg === 1) || !readable && !privileged) throw { errno: 'EPERM' };
+        clearTerminal(tty.session, tty.number);
+        tty.session = process.sid;
+        control.pgrp = process.pgid; if (tty === terminal) savedForeground = process.pgid;
+        process.ctty = tty.number;
+        return {};
+      }
       case IOCTL.TCGETS: return state.termios;
       case IOCTL.TCSETS: case IOCTL.TCSETSW: case IOCTL.TCSETSF:
-        terminal.configure(arg, request === IOCTL.TCSETSF); return {};
+        tty.configure(arg, request === IOCTL.TCSETSF); return {};
       case IOCTL.TIOCGWINSZ: return state.size;
-      case IOCTL.TIOCSWINSZ: state.resize(arg); options.onSize?.(state.size); return {};
-      case IOCTL.TIOCGPGRP: return { pgrp: state.pgrp };
+      case IOCTL.TIOCSWINSZ: state.resize(arg); if (tty === terminal) options.onSize?.(state.size); return {};
+      case IOCTL.TIOCGPGRP:
+        if (!description?.master && !controlling()) throw { errno: 'ENOTTY' };
+        return { pgrp: control.pgrp };
       case IOCTL.TIOCSPGRP:
-        if (arg !== pgid) throw { errno: 'EPERM' };
-        job.foreground(true); return {};
-      case IOCTL.TIOCGPTN: return { name: terminal.name };
+        if (!controlling()) throw { errno: 'ENOTTY' };
+        if (!Number.isInteger(arg) || arg <= 0) throw { errno: 'EINVAL' };
+        if (!terminalMembers().some(p => !p.ended && p.pgid === arg && p.sid === process.sid)) throw { errno: 'EPERM' };
+        control.pgrp = arg; if (tty === terminal) savedForeground = arg; return {};
+      case IOCTL.TIOCGPTN: return { name: tty.name };
       case 'wasix': {
         const modes = state.termios;
         modes.lflag = arg.echo ? modes.lflag | LF.ECHO : modes.lflag & ~LF.ECHO;
         modes.lflag = arg.canonical ? modes.lflag | LF.ICANON : modes.lflag & ~LF.ICANON;
         modes.iflag = arg.lineFeeds ? modes.iflag | IF.IGNCR : modes.iflag & ~IF.IGNCR;
-        terminal.configure(modes); return {};
+        tty.configure(modes); return {};
       }
       default: throw { errno: 'ENOTTY' };
     }
@@ -531,13 +781,21 @@ export async function exec(stages, options = {}) {
     try {
       image = await images[index];
       if (stopped) return await canceled(image);
-      const { module, memory, startSection } = await load(image).catch(error => { throw refused(argv[0], error); });
+      const { module, memory, memoryBytes, startSection } = await load(image).catch(error => { throw refused(argv[0], error); });
       if (stopped) return await canceled(image);
-      const write = (fd, text) => { if (!text) return; if (fd === 1 && !io.stdout.tty) collect(text, index === last); else return onOutput(fd, text); };
+      // Hosts may require a fresh authorization after slow loading, before any guest code.
+      if (options.beforeStart) await options.beforeStart(image.pid, image);
+      if (stopped) return await canceled(image);
+      const write = (fd, text) => {
+        if (!text) return;
+        // Background hosts can stream final stdout without allocating a PTY or collecting it.
+        if (fd === 1 && !io.stdout.tty && !(index === last && options.streamOutput)) collect(text, index === last);
+        else return onOutput(fd, text);
+      };
       // Its pipes' ends are its own from the start: held for it before it runs.
       io.stdin.reader?.hold(image.pid, 'r');
       io.stdout.writer?.hold(image.pid, 'w');
-      const process = host({ pid: image.pid, token: image.token, ppid: 1, module, memory, startSection, argv, write, forked: false,
+      const process = host({ pid: image.pid, token: image.token, ppid: image.ppid ?? 1, module, memory, memoryBytes, startSection, argv, write, forked: false,
         start: { env: environment, cwd, stdin: io.stdin.message, stdout: io.stdout.message }, files: isolated ? line() : null });
       processes.push(process);
       changed();
@@ -547,6 +805,7 @@ export async function exec(stages, options = {}) {
       // started, and none may wait for the next boot to be reaped. The ends of its pipes it
       // was to hold are gone.
       io.stdin.reader?.closeReader(); io.stdout.writer?.closeWriter();
+      if (image && stopped) return canceled(image);
       if (image) await abandon(image);
       throw error;
     }
@@ -558,22 +817,37 @@ export async function exec(stages, options = {}) {
   const watch = setInterval(() => { if (cancelled()) stop(SIG.INT); }, 100);
   const statuses = [];
   try {
+    const ready = await Promise.all(images);
+    const session = options.prepare ? ready.map(image => image.membership)
+      : await kernelCall('session', { pids: ready.map(image => image.pid) });
+    for (const row of session) { memberships.set(row.pid, row); pendingMemberships.set(row.pid, row); }
+    pgid = session[0].pgid; savedForeground = pgid;
+    if (terminal) terminal.session = session[0].sid;
     if (isolated) {
       // Resolve the leader before starting stages concurrently: every stage must inherit
       // the same slave number even if a later image loads first.
       if (terminal) {
-        const leader = await images[0];
+        const leader = ready[0];
         terminal.state.number ??= leader.pid; terminal.number = terminal.state.number;
+        for (const member of memberships.values()) member.ctty = terminal.number;
         terminal.name = `/dev/pts/${terminal.number}`; pgid = leader.pid;
-        if (foreground) terminal.state.pgrp = pgid;
+        if (foreground) terminal.control.pgrp = pgid;
       }
+      // A pane can close while authentication or image loading is pending. Queue
+      // hangup before fresh code starts, without reviving the closed master.
+      if (consoleClosed) {
+        if (terminal) { terminal.close(); await releaseTerminal(true); }
+        else await hangupWithoutTerminal();
+      }
+      for (const signal of queuedJobSignals) job.signal(signal);
+      queuedJobSignals.clear();
       // At once, through pipes; the first reads the terminal unless given its input.
       input = stdin == null ? terminal : null;
       // A program with redirected stdin can still read its controlling terminal by
       // opening /dev/tty. Keep the master attached independently of fd 0's source.
       if (terminal) {
         terminal.resize = size => { terminal.state.resize(size); options.onSize?.(terminal.state.size); };
-        onTty(terminal);
+        onTty(consoleClosed ? null : terminal);
         options.onMode?.({ raw: !terminal.state.canonical, echo: terminal.state.echo });
         options.onSize?.(terminal.state.size);
       }
@@ -602,6 +876,9 @@ export async function exec(stages, options = {}) {
       const exited = await Promise.all(started.map(process => process.exited));
       started.forEach((_, index) => { statuses[index] = exited[index]; });
     } else {
+      if (consoleClosed) await hangupWithoutTerminal();
+      for (const signal of queuedJobSignals) job.signal(signal);
+      queuedJobSignals.clear();
       // One after another, each given what the one before wrote.
       let given = stdin ?? '';
       for (let index = 0; index <= last && !stopped; index++) {

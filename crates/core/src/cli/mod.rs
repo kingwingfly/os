@@ -9,6 +9,7 @@ pub mod accounts;
 pub mod archives;
 pub mod files;
 pub mod permissions;
+pub mod system;
 pub mod terminal;
 pub mod text;
 
@@ -118,6 +119,9 @@ fn configured(command: Command) -> Command {
 /// completion prefers among equal matches (he is help before head).
 pub static DEFINITIONS: &[&dyn Definition] = &[
     &Def::<terminal::Help>::NEW,
+    &Def::<terminal::Supervise>::NEW,
+    &Def::<system::ImageCtl>::NEW,
+    &Def::<system::ProviderCtl>::NEW,
     &Def::<terminal::Man>::NEW,
     &Def::<terminal::Clear>::NEW,
     &Def::<terminal::Export>::NEW,

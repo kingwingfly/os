@@ -1,0 +1,20 @@
+[package]
+name = "os-services"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "supervise"
+path = "src/main.rs"
+
+[[bin]]
+name = "init"
+path = "src/init.rs"
+
+[dependencies]
+abi = { package = "os-abi", path = "../abi" }
+os-core = { path = "../core" }
+os-posix = { path = "../posix" }
+serde.workspace = true
+serde_json.workspace = true
