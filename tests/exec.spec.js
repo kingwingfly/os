@@ -104,12 +104,14 @@ test('an uploaded wasm runs by its path, with the working directory, environment
   await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 5_000 });
 });
 
-// How a page's processes ask the kernel, as the browser sends it: by fetch, suspended on it
-// (JSPI), or by synchronous XHR.
+// Guest calls use fetch suspended by JSPI, or synchronous XHR. Private runtime
+// memory reservations also use XHR before instantiation, outside a JSPI frame.
 function processCalls(page) {
   const kinds = new Set();
   page.context().on('request', request => {
-    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/sys' && !request.headers()['x-registry'] && JSON.parse(request.postData() || '{}').proc) kinds.add(request.resourceType());
+    if (request.method() !== 'POST' || new URL(request.url()).pathname !== '/api/sys' || request.headers()['x-registry']) return;
+    const body = JSON.parse(request.postData() || '{}');
+    if (body.proc && body.calls?.some(call => !call.resource)) kinds.add(request.resourceType());
   });
   return kinds;
 }
@@ -136,10 +138,9 @@ for (const jspi of [true, false]) test(`a process writes a file larger than a ba
   expect([...calls]).toEqual([jspi ? 'fetch' : 'xhr']);
 });
 
-test('an image with a start function runs it as it is instantiated, by synchronous requests', async ({ page, request }) => {
-  // A start section runs inside WebAssembly.instantiate, outside JSPI's promising frame, where
-  // no call may suspend: such an image makes its calls by synchronous XHR, JSPI or not. Its
-  // start function writes through the memory it imports, as WASIX's do.
+test('an image initializer runs once before main after resource instrumentation', async ({ page, request }) => {
+  // The resource transform moves the initializer into the prepared entry point,
+  // where JSPI can suspend it. Its imported memory and before-main order remain.
   const started = assemble(`(module
     (import "env" "memory" (memory 1 2))
     (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
@@ -159,7 +160,7 @@ test('an image with a start function runs it as it is instantiated, by synchrono
   await terminal(page);
   await run(page, './started');
   await expect(page.locator('.transcript pre').last()).toHaveText('started\nran');
-  expect([...calls]).toEqual(['xhr']);
+  expect([...calls]).toEqual([await hasJspi(page) ? 'fetch' : 'xhr']);
 });
 
 test('the loader and the X rule refuse as Linux refuses, with its words', async ({ page }) => {

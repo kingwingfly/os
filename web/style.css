@@ -170,7 +170,7 @@ dialog.window{inset:auto}dialog.window:not([open]){display:none}
 /* Cursor-addressed applications use a fixed cell grid, rendered as ordinary DOM text. */
 .transcript .terminal-screen{white-space:pre;overflow-wrap:normal;min-width:max-content}
 .transcript:has(.terminal-screen[data-alternate="true"]){overflow:hidden}
-.transcript:has(.terminal-screen[data-alternate="true"])> :not(.terminal-screen[data-alternate="true"]):not(.command-line){display:none}
+.transcript:has(.terminal-screen[data-alternate="true"])> :not(.terminal-screen[data-alternate="true"]):not(.command-line):not(.console-surface){display:none}
 .transcript .terminal-screen[data-alternate="true"]{margin:0;flex:1}
 
 /* The prompt follows output; PTY input is captured at the program's own cursor. */
@@ -189,3 +189,32 @@ dialog.window{inset:auto}dialog.window:not([open]){display:none}
 .terminal-panel[data-pty="true"] .command-line label{display:none}
 .terminal-panel[data-pty="true"] .command-input{opacity:0;width:1ch;min-width:1ch;caret-color:transparent}
 @media(max-width:650px){.transcript{padding-bottom:14px}}
+
+/* Explicit console attachments keep ownership visible outside the transcript. */
+.console-actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:5px 12px;border-bottom:1px solid var(--line);font-size:13px;flex-shrink:0}
+.console-actions button{font-size:13px;padding:3px 8px}.console-status{color:var(--muted);flex:1}
+#console-share{max-width:540px;width:calc(100vw - 32px);padding:24px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:8px}
+#console-share h2{font-size:21px;margin:0 0 12px}#console-share p{font-size:15px;color:var(--muted)}#console-share label{display:block;margin:12px 0;font-size:16px}#console-share-error{color:var(--ansi-1)!important}
+.console-window{height:var(--session-height,100dvh);display:flex;flex-direction:column;overflow:hidden;padding:12px 16px}
+.console-window header{padding-bottom:8px;font-size:16px}.console-window header button{padding:4px 10px;font-size:14px}
+.console-window .console-connection{font-size:14px;margin:8px 0 0;color:var(--green)}.console-window .console-note{font-size:12px;margin:2px 0 8px;color:var(--muted)}
+.console-window>.terminal-panel{flex:1;min-height:0}.console-window .transcript{flex:1;max-height:none;min-height:0;padding:0;overflow:auto}
+.console-surface{position:relative;min-height:100%}.console-window .terminal-screen{margin:0}.console-window .command-line{position:absolute!important}
+@media(max-width:650px){.console-window{padding:8px}.console-window header{font-size:14px}.console-window .console-surface{font-size:16px}}
+
+/* Session entry points share the existing DOM desktop and PTY renderer. */
+.session-link{font-size:14px;margin-left:auto;margin-right:12px;white-space:nowrap}
+#applications{width:min(540px,calc(100vw - 32px));max-height:85dvh;overflow:auto;padding:24px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:8px}
+#applications h2{margin-top:0}#applications p{font-size:15px;color:var(--muted)}#application-list{list-style:none;padding:0}#application-list li{padding:12px 0;border-bottom:1px solid var(--line)}.application-state{margin-left:12px;text-transform:capitalize}#application-error{color:var(--ansi-1)!important}
+@media(max-width:650px){.topbar{flex-wrap:wrap}.topbar .wordmark{flex:1}.session-link{margin:0}.topbar [data-applications]{font-size:13px;padding:5px 8px}}
+#app[data-greeter],#app[data-shell-session]{position:fixed;inset:var(--session-top,0px) 0 auto}
+.greeter{height:var(--session-height,100dvh);display:flex;overflow:auto;padding:24px}
+.greeter-card{margin:auto;flex-shrink:0;width:min(100%,420px);border:1px solid var(--line);border-radius:12px;padding:28px;background:var(--panel)}
+.greeter h1{font-size:28px;margin:0 0 8px}.greeter h2{font-size:18px;margin:24px 0 12px}
+.greeter p{font-size:14px;color:var(--muted)}.greeter fieldset{display:flex;gap:24px;margin:20px 0;padding:12px;border:1px solid var(--line)}
+.greeter fieldset label{display:flex;align-items:center;gap:8px}.greeter fieldset input{width:auto}
+.greeter form{display:flex;flex-direction:column;gap:8px}.greeter input{font:inherit;font-size:16px;padding:9px;max-width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:5px}.greeter input:focus-visible{outline:1px solid var(--green);outline-offset:2px}
+.greeter button{padding:9px 12px;margin:6px 0}.greeter-card>button{display:block;width:100%}
+.greeter .greeter-error{color:var(--ansi-1);white-space:pre-wrap}.greeter-error:empty{display:none}
+.console-window header{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.console-window header strong{margin-right:auto}
+.console-window header a{font-size:14px}.console-window .console-connection:empty{display:none}

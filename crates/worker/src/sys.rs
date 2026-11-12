@@ -51,6 +51,7 @@ pub async fn handle(
         umask: batch.umask.map(|mask| mask & 0o777),
         pid: batch.pid,
         token: batch.process.clone(),
+        release: req.headers().get("X-OS-Release")?,
     });
     // The session was heard from: its descriptors are kept (a process's, its line's), and a
     // page's keeps those of the processes its tabs run, whatever account they run as.
@@ -130,6 +131,20 @@ pub async fn handle(
                 cookie = Some(made.clone());
             }
             results.push(returned(reply));
+            continue;
+        }
+        if let Call::Ioctl { fd, request, arg } = &call
+            && *request == crate::system::CONTROL
+            && arg["op"] == "stage"
+        {
+            results.push(
+                match crate::system::stage(env, state, session.clone(), fd.number(), arg.clone())
+                    .await
+                {
+                    Ok(value) => Return::Ok(value),
+                    Err(error) => Return::Err(error),
+                },
+            );
             continue;
         }
         // A driver's request that asks Realtime waits for the network outside a transaction.
@@ -274,6 +289,7 @@ pub struct Session {
     pub umask: Option<u16>,
     pub pid: Option<u32>,
     pub token: Option<String>,
+    pub release: Option<String>,
 }
 
 /// As whom a call acts, once a transaction found it: its process (credentials and umask), the
@@ -299,7 +315,7 @@ impl Session {
     /// process's snapshot, never as the page signed in later; a page's batch as the session's
     /// account (root under sudo, if it may). A token that names no process is EPERM, never
     /// taken for the page's.
-    fn of(&self, db: &mut Db) -> std::result::Result<Acting, Error> {
+    pub(crate) fn of(&self, db: &mut Db) -> std::result::Result<Acting, Error> {
         let (process, credential) = match self.token.as_deref() {
             Some(token) => {
                 let credential = db
@@ -327,6 +343,11 @@ impl Session {
                 None,
             ),
         };
+        let release = credential
+            .as_ref()
+            .map(|c| c.generation.as_deref())
+            .unwrap_or(self.release.as_deref());
+        crate::system::select(db, release)?;
         let sid = crate::creds::sid_of(
             db,
             self.key.as_deref(),
@@ -357,12 +378,20 @@ async fn asset_range(env: &Env, asset: &str, offset: u64, length: u64) -> Sys<Ve
     let mut init = RequestInit::new();
     init.with_method(Method::Get).with_headers(headers);
     let request = Request::new_with_init(&format!("https://assets{asset}"), &init).map_err(io)?;
-    let mut response = env
-        .assets("ASSETS")
-        .map_err(io)?
-        .fetch_request(request)
-        .await
-        .map_err(io)?;
+    let mut response = if asset.starts_with("/boot/blobs/") {
+        crate::system::checked_asset(request, env)
+            .await
+            .map_err(io)?
+    } else {
+        env.assets("ASSETS")
+            .map_err(io)?
+            .fetch_request(request)
+            .await
+            .map_err(io)?
+    };
+    if !matches!(response.status_code(), 200 | 206) {
+        return Err(Errno::EIO.into());
+    }
     let body = response.bytes().await.map_err(io)?;
     if response.status_code() == 206 {
         return Ok(body);
@@ -443,6 +472,14 @@ async fn bytes(
             let (data, size) = match read {
                 crate::fds::Read::Bytes(data, size) => (data, size),
                 crate::fds::Read::Chunks(parts, size) => {
+                    crate::resources::session_io(
+                        env,
+                        state,
+                        session.clone(),
+                        false,
+                        parts.iter().map(|(_, _, length)| *length).sum(),
+                    )
+                    .await?;
                     let bucket = env.bucket("FILES").map_err(io)?;
                     let mut data = Vec::new();
                     for (key, offset, length) in parts {
@@ -459,6 +496,8 @@ async fn bytes(
                     (data, size)
                 }
                 crate::fds::Read::Asset(asset, offset, length, size) => {
+                    crate::resources::session_io(env, state, session.clone(), false, length)
+                        .await?;
                     (asset_range(env, &asset, offset, length).await?, size)
                 }
                 crate::fds::Read::Processes => return Err(Errno::EIO.into()),
@@ -495,6 +534,7 @@ async fn bytes(
             let Some((object, mime)) = target else {
                 return Ok(json!({ "written": length }));
             };
+            crate::resources::session_io(env, state, session.clone(), true, length).await?;
             env.bucket("FILES")
                 .map_err(io)?
                 .put(&object, data.0)
@@ -693,9 +733,18 @@ fn run(
     // /proc/self/fd/N names what the descriptor has open; /proc is procfs's.
     let mut call = call;
     let mut proc = false;
+    let writing_image = changes(&call);
+    let original_view = db.image.clone();
     for (path, follow) in paths(&mut call) {
+        db.image = original_view.clone();
         *path = crate::procfs::follow(db, sid, path, follow)?;
         proc |= crate::procfs::is(path);
+        if writing_image
+            && let Ok(name) = kernel::namei(db, &process.cred, path, follow)
+            && crate::system::owns(db, &name.path)
+        {
+            return Err(Errno::EROFS.into());
+        }
     }
     if proc {
         let opening = matches!(call, Call::Open { .. });
@@ -708,21 +757,11 @@ fn run(
         }
         return Ok(value);
     }
-    // The image (/usr, /bin) is read-only: what would change it fails, as on a read-only mount.
-    if changes(&call) {
-        for (path, follow) in paths(&mut call) {
-            if let Ok(name) = kernel::namei(db, &process.cred, path, follow)
-                && crate::usr::is(&name.path)
-            {
-                return Err(Errno::EROFS.into());
-            }
-        }
-    }
     match call {
         Call::Statfs { path } => {
             kernel::stat(db, &process.cred, &path, true)?;
             let real = kernel::namei(db, &process.cred, &path, true)?.path;
-            if crate::usr::is(&real) {
+            if crate::system::owns(db, &real) {
                 return Ok(json!(crate::usr::statfs()));
             }
             Ok(json!(statfs(db)))

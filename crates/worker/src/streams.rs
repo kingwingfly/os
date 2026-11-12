@@ -27,7 +27,7 @@ export async function discardStream(body, length) {
 }
 ")]
 extern "C" {
-    /// Consume an authorized null-device write with bounded memory, without R2 storage.
+    /// Consume an authorized byte-device write with bounded memory, without R2 storage.
     #[wasm_bindgen(catch, js_name = discardStream)]
     pub async fn discard_stream(body: JsValue, length: f64) -> std::result::Result<(), JsValue>;
 }

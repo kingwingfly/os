@@ -16,7 +16,7 @@
 // The buffer a pipe holds, as Linux's: 64 KiB; and the most a write writes at once (POSIX's
 // PIPE_BUF, Linux's 4 KiB).
 export const PIPE_BUF = 65536;
-const ATOMIC = 4096;
+export const PIPE_ATOMIC = 4096;
 // Its state, as 32-bit words before the bytes: where reading and writing are (counts that wrap),
 // whether each end is gone, ends of file pending (Ctrl+D), a count of changes to wait on, the
 // writers' and the readers' locks (the pid holding each), then each holder's pid and how many
@@ -119,7 +119,7 @@ export class Pipe {
 
   // Read at most `count` bytes, waiting for some: none at the end, or where Ctrl+D ended a read.
   // `meanwhile`, if given, is called now and then as it waits (a stop to heed).
-  read(count, meanwhile, line = false) {
+  read(count, meanwhile, line = false, nonblock = false) {
     for (;;) {
       const seen = Atomics.load(this.state, CHANGES), queued = this.queued;
       if (queued > 0 && this.lock(READING)) {
@@ -138,6 +138,7 @@ export class Pipe {
       }
       if (queued === 0 && this.ending) { Atomics.sub(this.state, EOF, 1); return new Uint8Array(0); }
       if (queued === 0 && this.writerGone) return new Uint8Array(0);
+      if (nonblock) return null;
       if (Atomics.wait(this.state, CHANGES, seen, meanwhile ? 200 : Infinity) === 'timed-out') meanwhile?.();
     }
   }
@@ -156,17 +157,30 @@ export class Pipe {
 
   // ---- Writing ----
 
+  // One nonblocking attempt. PIPE_BUF-sized writes remain atomic even with other
+  // writers; a larger write may report partial progress without ever waiting.
+  tryWrite(bytes) {
+    if (!bytes.length) return { written: 0, broken: false };
+    if (this.readerGone) return { written: 0, broken: true };
+    if (!this.lock(WRITING)) return { written: 0, broken: false };
+    try {
+      if (this.readerGone) return { written: 0, broken: true };
+      const want = bytes.length <= PIPE_ATOMIC ? bytes.length : 1;
+      return { written: this.room >= want ? this.copy(bytes.subarray(0, this.room)) : 0, broken: false };
+    } finally { this.unlock(WRITING); }
+  }
+
   // Write bytes, waiting for room. Report partial progress and whether every reader is gone.
   // Returning false from `meanwhile(written)` interrupts the write without losing progress.
   // A write of at most
-  // ATOMIC bytes goes at once, not mixed with another writer's, as POSIX has it; a longer one
+  // PIPE_ATOMIC bytes goes at once, not mixed with another writer's, as POSIX has it; a longer one
   // goes as room comes. `meanwhile`, if given, is called as it waits (a signal to heed).
   write(bytes, meanwhile) {
     let done = 0;
     while (done < bytes.length) {
       const seen = Atomics.load(this.state, CHANGES);
       if (this.readerGone) return { written: done, broken: true };
-      const want = bytes.length <= ATOMIC ? bytes.length : 1;
+      const want = bytes.length <= PIPE_ATOMIC ? bytes.length : 1;
       if (this.room < want || !this.lock(WRITING)) {
         if (Atomics.wait(this.state, CHANGES, seen, 200) === 'timed-out' && meanwhile?.(done) === false) return { written: done, broken: false };
         continue;

@@ -24,7 +24,15 @@ async function guest(browser) {
   return { context, page, creds: result.ok };
 }
 
-const read = result => Buffer.from(result.ok.data, 'base64').toString();
+async function passwd(page) {
+  // A preserved installation can have more than one read's worth of accounts.
+  const parts = []; let offset = 0;
+  for (;;) {
+    const [part] = await sys(page, [{ pread: { path: '/etc/passwd', offset, count: 65536 } }]);
+    const bytes = Buffer.from(part.ok.data, 'base64'); parts.push(bytes); offset += bytes.length;
+    if (bytes.length < 65536) return Buffer.concat(parts).toString();
+  }
+}
 
 test('a signed-out browser is guest-<uuid>:guest, with no home of its own', async ({ browser }) => {
   const one = await guest(browser);
@@ -40,8 +48,7 @@ test('a signed-out browser is guest-<uuid>:guest, with no home of its own', asyn
   const [listed] = await sys(one.page, [{ getdents: { path: '/guest' } }]);
   expect(listed.ok.map(entry => entry.name)).not.toContain(creds.user.slice(6));
   // /etc/passwd names it, and its home is the shared /guest.
-  const [passwd] = await sys(one.page, [{ pread: { path: '/etc/passwd', count: 65536 } }]);
-  expect(read(passwd)).toContain(`${creds.user}:x:${creds.uid}:65534::/guest:/bin/sh`);
+  expect(await passwd(one.page)).toContain(`${creds.user}:x:${creds.uid}:65534::/guest:/bin/sh`);
   // whoami says the same.
   await one.page.getByRole('combobox', { name: 'Terminal command' }).fill('whoami');
   await one.page.getByRole('combobox', { name: 'Terminal command' }).press('Enter');
@@ -86,8 +93,7 @@ test('signed out, useradd still makes a real account with its home, as before', 
   const [home] = await sys(one.page, [{ stat: { path: `/guest/${name}` } }]);
   expect(home.ok).toMatchObject({ user: name, mode: 0o40700 });
   // It is a real account, not a guest: /etc/passwd has it. Root removes it, home and all.
-  const [passwd] = await sys(one.page, [{ pread: { path: '/etc/passwd', count: 65536 } }]);
-  expect(read(passwd)).toContain(`${name}:x:`);
+  expect(await passwd(one.page)).toContain(`${name}:x:`);
   // An account in group guest deletes itself with its password, home and all.
   const [deleted] = await sys(one.page, [{ userdel: { name, remove: true, password } }]);
   expect(deleted.ok).toBeTruthy();

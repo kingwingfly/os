@@ -7,8 +7,8 @@ use crate::io::{Io, basename, joined, quote};
 use crate::sys::{Sys, calls, lstat, stat};
 use crate::walk;
 use abi::{
-    ACL_ACCESS, ACL_DEFAULT, Call, Errno, Error, FICLONE, FdRef, INLINE_MAX, O_CREAT, O_EXCL,
-    O_RDONLY, O_TRUNC, O_WRONLY, Opened, Stat,
+    ACL_ACCESS, ACL_DEFAULT, Call, Errno, Error, FICLONE, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC,
+    O_WRONLY, Opened, Stat,
 };
 use os_core::cli::{files as args, parse};
 use serde_json::Value;
@@ -398,34 +398,11 @@ impl Copier {
         steps
     }
 
-    /// Copy `item` by reading it whole and writing it to its copy, made empty already: for what
-    /// has no content to share, which is small (the kernel's making).
+    /// Copy generated data without reflink content into the destination, made empty already.
+    /// The byte-I/O adapter handles writes beyond the inline syscall budget.
     async fn write_read(&self, sys: &impl Sys, item: &Item) -> Result<(), Error> {
         let bytes = sys.read(&item.from).await?;
-        if bytes.len() as u64 > INLINE_MAX {
-            return Err(Errno::EFBIG.into());
-        }
-        let first = FdRef::Ref { call: 0 };
-        let mut writing = vec![Call::Open {
-            path: item.to.clone(),
-            flags: O_WRONLY | O_TRUNC,
-            mode: 0,
-            size: None,
-            sha256: None,
-            version: None,
-        }];
-        if !bytes.is_empty() {
-            writing.push(Call::Pwrite {
-                fd: first,
-                index: 0,
-                data: bytes.into(),
-            });
-        }
-        writing.push(Call::Close { fd: first });
-        for result in calls::<Value>(sys, writing).await {
-            result?;
-        }
-        Ok(())
+        sys.write(&item.to, &bytes).await
     }
 
     fn cannot_create(&mut self, io: &mut Io<'_>, item: &Item, error: &Error) {

@@ -1,3 +1,4 @@
+import { releaseId } from '../release.js';
 // A process (owner's design, 2026-10-29: the page is user space, the API its system calls): a
 // program built for wasm32-wasip1, or for WASIX, run in a Worker of its own. Its WASI calls are
 // made here over the kernel's (POST /api/sys, GET /api/file, PUT /api/pwrite), and block, as a
@@ -38,10 +39,11 @@
 // (web/wasi/shared.js), and pipes count their holders (web/wasi/pipe.js).
 import { Signals, bit, valid, ignoredByDefault, stoppedByDefault, SA_RESTART, SA_NODEFER, SA_RESETHAND } from './signals.mjs';
 import { execCandidates } from './resolve.mjs';
-import { Pipe, pipeBuffer } from './pipe.js';
+import { Pipe, pipeBuffer, PIPE_ATOMIC } from './pipe.js';
 import { Engine } from './fork.js';
 import { Bytes, Shares } from './shared.js';
-import { TtyState, IOCTL, CC } from '../kernel/pty.js';
+import { TtyState, TtyControl, IOCTL, CC, LF } from '../kernel/pty.js';
+import { isByteDevice, readDevice } from './devices.mjs';
 
 // WASI's errno numbers, by Linux's names, as the kernel answers.
 const ERRNO = {
@@ -55,14 +57,14 @@ const { EBADF, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, ENOTDIR, ESPIPE, EFBIG } = E
 // What an execve that fails says, as a shell says it.
 const STRERROR = { 2: 'Permission denied', 44: 'No such file or directory', 45: 'Exec format error', 54: 'Not a directory', 31: 'Is a directory' };
 // The kinds of descriptor standard input and output are: bytes given, the page's, a pipe's end.
-const STDIO = new Set(['in', 'out', 'pipe-in', 'pipe-out', 'tty']);
+const STDIO = new Set(['in', 'out', 'pipe-in', 'pipe-out', 'tty', 'pty']);
 // What a file is, as WASI numbers it.
 const CHARACTER_DEVICE = 2, DIRECTORY = 3, REGULAR_FILE = 4, SYMBOLIC_LINK = 7, UNKNOWN = 0;
 // open(2)'s flags, as the kernel takes them (Linux's).
 const O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2, O_CREAT = 0o100, O_EXCL = 0o200, O_TRUNC = 0o1000;
 const W_OK = 2;
 // path_open's: oflags, fdflags, lookupflags, and the rights a descriptor has.
-const OFLAG_CREAT = 1, OFLAG_DIRECTORY = 2, OFLAG_EXCL = 4, OFLAG_TRUNC = 8, FDFLAG_APPEND = 1, FOLLOW = 1;
+const OFLAG_CREAT = 1, OFLAG_DIRECTORY = 2, OFLAG_EXCL = 4, OFLAG_TRUNC = 8, FDFLAG_APPEND = 1, FDFLAG_NONBLOCK = 4, FOLLOW = 1;
 const RIGHT_READ = 1n << 1n, RIGHT_SEEK = 1n << 2n, RIGHT_TELL = 1n << 5n, RIGHT_WRITE = 1n << 6n;
 const ALL_RIGHTS = (1n << 30n) - 1n;
 // The most a call carries in a batch (abi::INLINE_MAX), what a read fetches at a time, and the
@@ -107,6 +109,7 @@ function sendSync({ method, url, body, headers, binary }) {
   const xhr = new XMLHttpRequest();
   xhr.open(method, url, false);
   if (binary) xhr.responseType = 'arraybuffer';
+  xhr.setRequestHeader('X-OS-Release', releaseId);
   for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
   try { xhr.send(body ?? null); } catch { throw new Errno(EIO); }
   return { status: xhr.status, text: binary ? '' : xhr.responseText, bytes: binary ? new Uint8Array(xhr.response) : null };
@@ -169,6 +172,7 @@ function* call(one) {
 }
 const ok = result => { if ('err' in result) throw new Errno(errnoOf(result.err)); return result.ok; };
 function* stat(path, follow = true) {
+  if (allocatedPath(path) || path === '/dev/pts') return hostErrno(host('pty', { op: 'stat', path }));
   if (isTerminal(path)) return { ino: process.pty.number, mode: 0o020620, nlink: 1, size: 0 };
   const key = (follow ? 's:' : 'l:') + path;
   if (cache.has(key)) return cache.get(key);
@@ -183,9 +187,10 @@ function* range(path, start, end, token) {
   const url = token ? '/api/file?token=' + encodeURIComponent(token) : '/api/file?path=' + encodeURIComponent(path);
   const headers = { Range: `bytes=${start}-${end - 1}` };
   if (process.proc) headers['X-Process-Token'] = process.proc;
+  if (process.pid) headers['X-Process-Pid'] = String(process.pid);
   const answer = yield* request('GET', url, null, headers, true);
   if (answer.status === 416) return new Uint8Array(0);
-  if (answer.status !== 200 && answer.status !== 206) throw new Errno(answer.status === 404 ? ENOENT : answer.status === 403 ? ERRNO.EACCES : EIO);
+  if (answer.status !== 200 && answer.status !== 206) throw new Errno(answer.status === 429 ? ERRNO.EAGAIN : answer.status === 404 ? ENOENT : answer.status === 403 ? ERRNO.EACCES : EIO);
   return answer.bytes;
 }
 // The whole of a file, for one written here anew.
@@ -207,23 +212,49 @@ const clean = path => path.length > 1 ? path.replace(/\/+$/, '').replace(/\/\/+/
 const fds = new Map();
 // The descriptors an execve closes (FD_CLOEXEC).
 const cloexec = new Set();
-let shares = null, ttyState = null;
+let shares = null, ttyState = null, ttyControl = null, membership = null;
 let lastTtyFds = '';
 function reportTty() {
   if (!process.pty) return;
-  const numbers = [...fds].filter(([, description]) => description.tty).map(([fd]) => fd);
+  const numbers = [...fds].filter(([, description]) => description.kind === 'tty').map(([fd]) => fd);
   const value = JSON.stringify(numbers);
   if (value !== lastTtyFds) { lastTtyFds = value; postMessage({ ttyFds: numbers }); }
 }
-const isTerminal = path => !!process.pty && (path === '/dev/tty' || path === `/dev/pts/${process.pty.number}`);
-const terminalFd = fd => ({ kind: 'tty', tty: true, fd, pipe: new Pipe(process.pty.input, process.pid) });
+const controllingTerminal = () => !!process.pty && Atomics.load(membership, 2) === process.pty.number;
+const isTerminal = path => {
+  if (path === '/dev/tty' && !Atomics.load(membership, 2)) throw new Errno(ERRNO.ENXIO);
+  const matches = !!process.pty && (path === '/dev/tty' || path === `/dev/pts/${process.pty.number}`);
+  if (matches && ttyControl?.hungup) throw new Errno(path === '/dev/tty' ? ERRNO.ENXIO : ENOENT);
+  return matches;
+};
+const allocatedNumber = path => path === '/dev/tty' ? Atomics.load(membership, 2) : Number(path.slice('/dev/pts/'.length));
+const allocatedPath = path => path === '/dev/ptmx' || path === '/dev/tty' && Atomics.load(membership, 2) >= 0x40000000 || /^\/dev\/pts\/[1-9][0-9]*$/.test(path) && allocatedNumber(path) >= 0x40000000;
+const localDescriptor = path => {
+  const match = new RegExp(`^/proc/(?:self|${process.pid})/fd/([0-9]+)$`).exec(path);
+  return match && fds.get(Number(match[1]));
+};
+const localLink = path => {
+  const found = localDescriptor(path);
+  return found?.kind === 'pty' ? (found.master ? '/dev/ptmx' : `/dev/pts/${found.number}`) : null;
+};
+const ptyCall = (found, op, args = {}) => hostErrno(host('pty', { handle: found.handle, op, ...args }));
+const ttyCall = (found, request, arg) => {
+  if (!found.tty || found.kind !== 'pty' && !ttyState) throw new Errno(ERRNO.ENOTTY);
+  return hostErrno(host('tty', { handle: found.handle, request, arg, readable: found.readable !== false }));
+};
+const terminalFd = (fd, readable = true, writable = true) => ({ kind: 'tty', tty: true, fd, readable, writable, pipe: new Pipe(process.pty.input, process.pid) });
 function descriptor(fd) { const found = fd >= 0 ? fds.get(fd) : null; if (!found) throw new Errno(EBADF); return found; }
 // The lowest descriptor free from `min` on, as open(2) and dup(2) take.
 function lowest(min = 0) { if (min < 0) throw new Errno(EBADF); let fd = min; while (fds.has(fd)) fd++; return fd; }
+// Non-isolated hosts still run sequential programs; only fork needs shared flags.
+const descriptorFlags = () => typeof SharedArrayBuffer === 'function' ? new SharedArrayBuffer(4) : new ArrayBuffer(4);
 // `fd` is `found`, one more descriptor of it; a pipe's end is held once more, a shared open
 // file counted once more (unless what started this process counted it already: its host, for
 // the pipes it gave, or its parent, for what it forked with).
 function install(fd, found, counted = false) {
+  // An open description's flags survive dup/fork/exec and are shared with its holders.
+  if (STDIO.has(found.kind) && found.kind !== 'pty') found.flags ??= descriptorFlags();
+  if (!counted && found.kind === 'pty') ptyCall(found, 'hold');
   found.refs = (found.refs ?? 0) + 1;
   fds.set(fd, found);
   reportTty();
@@ -233,6 +264,8 @@ function install(fd, found, counted = false) {
   else if (found.share != null) shares.add(found.share, process.pid, 1);
   else if (shares && found.kind === 'file') share(found);
 }
+const nonblocking = found => found.kind === 'pty' ? ptyCall(found, 'flags').nonblock
+  : !!(found.flags && Atomics.load(new Int32Array(found.flags), 0) & FDFLAG_NONBLOCK);
 // A file of the kernel's, just opened, in its line's table: its host is told of it.
 function share(found) {
   const slot = shares.claim(process.pid, found.refs, found.pos ?? 0);
@@ -254,6 +287,7 @@ function* uninstall(fd) {
   reportTty();
   cloexec.delete(fd);
   found.refs--;
+  if (found.kind === 'pty') return ptyCall(found, 'close');
   if (found.kind === 'pipe-in' || found.kind === 'tty') return found.pipe.drop(process.pid, 'r');
   if (found.kind === 'pipe-out') return found.pipe.drop(process.pid, 'w');
   if (found.share != null) {
@@ -275,7 +309,7 @@ function* exclusive(found, work) {
   return result;
 }
 function filetype(found) {
-  if (found.device === 'null') return CHARACTER_DEVICE;
+  if (isByteDevice(found.device)) return CHARACTER_DEVICE;
   if (STDIO.has(found.kind)) return found.tty ? CHARACTER_DEVICE : UNKNOWN;
   if (found.kind === 'dir') return DIRECTORY;
   return REGULAR_FILE;
@@ -302,6 +336,7 @@ function writeFilestat(ptr, found) {
 }
 // What a descriptor's file is now, as fstat says.
 function* fstat(found) {
+  if (found.kind === 'pty') return { ino: found.number, filetype: CHARACTER_DEVICE, mode: 0o020600 };
   if (STDIO.has(found.kind)) return { filetype: filetype(found), mode: found.tty ? 0o020620 : 0o010600 };
   if (found.kind === 'dir') return yield* stat(found.path);
   if (found.writer || found.rewrite) {
@@ -329,17 +364,17 @@ function* openRead(path) {
 }
 // Open it for writing in order: a growing file, truncated or new. What is not sent yet is held
 // in memory a fork shares (shared.js): at most two chunks and an inline write.
-function* openWriter(path, flags, read) {
-  const opened = yield* call({ open: { path, flags: flags | (read ? O_RDWR : O_WRONLY) } });
+function* openWriter(path, flags, read, mode = 0o666) {
+  const opened = yield* call({ open: { path, flags: flags | (read ? O_RDWR : O_WRONLY), mode } });
   forget();
-  if (opened.device === 'null') return { kind: 'file', path, kfd: opened.fd, device: 'null', writable: true, read, pos: 0, size: 0 };
+  if (isByteDevice(opened.device)) return { kind: 'file', path, kfd: opened.fd, device: opened.device, writable: true, read, pos: 0, size: 0 };
   const chunk = opened.chunk_size || (8 << 20);
   return { kind: 'file', path, kfd: opened.fd, writer: true, read, chunk, bytes: Bytes.create(chunk * 2 + INLINE), pos: 0 };
 }
 // Open an existing file to change in place, or append to: its content, written back whole when
 // it closes, if it changed.
 function* openRewrite(path, found, append, read) {
-  if (found.rdev === 'null') return yield* openWriter(path, 0, read);
+  if (isByteDevice(found.rdev)) return yield* openWriter(path, 0, read);
   const [allowed] = yield* batch([{ access: { path, mode: W_OK } }]);
   ok(allowed);
   const data = yield* whole(path, found.size);
@@ -353,11 +388,17 @@ function* openRewrite(path, found, append, read) {
 // VMIN/VTIME govern raw reads; canonical reads never consume a second line. Waiting
 // checks the process signal word, so a blocked read remains stoppable and cancellable.
 function readTerminal(pipe, count) {
-  if (ttyState.canonical) return pipe.read(count, () => pause(true), true);
+  if (ttyControl.hungup) return new Uint8Array(0);
+  if (count) ttyAccess(21);
+  if (ttyState.canonical) {
+    const data = pipe.read(count, () => pause(true), true);
+    return ttyControl.hungup ? new Uint8Array(0) : data;
+  }
   const minimum = Math.min(count, ttyState.cc(CC.VMIN)), timeout = ttyState.cc(CC.VTIME) * 100;
   const parts = []; let length = 0, until = minimum === 0 && timeout ? performance.now() + timeout : Infinity;
   for (;;) {
     pause();
+    if (ttyControl.hungup) return new Uint8Array(0);
     if (pipe.queued || pipe.ending || pipe.writerGone) {
       const part = pipe.read(count - length, () => pause(true)); parts.push(part); length += part.length;
       if (!part.length || length >= minimum || length >= count) break;
@@ -372,7 +413,50 @@ function readTerminal(pipe, count) {
   return out;
 }
 
+function readPty(found, count) {
+  if (!count) return new Uint8Array(0);
+  if (!found.master) ttyAccess(21, found);
+  const modes = found.master ? null : ttyCall(found, IOCTL.TCGETS);
+  const canonical = !modes || !!(modes.lflag & LF.ICANON);
+  const minimum = canonical ? 1 : Math.min(count, modes.cc[CC.VMIN]);
+  const timeout = canonical ? 0 : modes.cc[CC.VTIME] * 100;
+  let until = minimum === 0 && timeout ? performance.now() + timeout : Infinity, total = 0;
+  const chunks = [];
+  for (;;) {
+    let result;
+    try { pause(true); result = ptyCall(found, 'read', { count: Math.min(4096, count - total) }); }
+    catch (error) { if (total && error instanceof Errno && error.errno === ERRNO.EINTR) break; throw error; }
+    if (result.data) {
+      const chunk = Uint8Array.from(result.data); chunks.push(chunk); total += chunk.length;
+      if (!chunk.length || canonical || total >= minimum || total >= count) break;
+      if (timeout) until = performance.now() + timeout;
+    } else if (result.nonblock) { if (!total) throw new Errno(ERRNO.EAGAIN); break; }
+    if ((!minimum && !timeout) || performance.now() >= until) break;
+    try { sleepUntil(Math.min(until, performance.now() + 10)); }
+    catch (error) { if (total && error instanceof Errno && error.errno === ERRNO.EINTR) break; throw error; }
+  }
+  const out = new Uint8Array(total); let at = 0;
+  for (const chunk of chunks) { out.set(chunk, at); at += chunk.length; }
+  return out;
+}
+function writePty(found, data) {
+  if (!found.master && data.length && ttyCall(found, IOCTL.TCGETS).lflag & LF.TOSTOP) ttyAccess(22, found);
+  let total = 0;
+  while (total < data.length) {
+    try {
+      pause(true);
+      const result = ptyCall(found, 'write', { data: Array.from(data.subarray(total, total + 4096)) });
+      if (result.wait) {
+        if (result.nonblock) { if (!total) throw new Errno(ERRNO.EAGAIN); break; }
+        sleepUntil(performance.now() + 10);
+      } else total += result.count;
+    } catch (error) { if (total && error instanceof Errno && [ERRNO.EINTR, ERRNO.EIO].includes(error.errno)) break; throw error; }
+  }
+  return total;
+}
 function* readFrom(found, at, count) {
+  if (found.tty && found.readable === false) throw new Errno(EBADF);
+  if (found.kind === 'pty') return readPty(found, count);
   if (found.kind === 'dir') throw new Errno(EISDIR);
   if (found.kind === 'in') {
     const out = found.data.subarray(found.pos, found.pos + count);
@@ -381,15 +465,21 @@ function* readFrom(found, at, count) {
   }
   if (found.kind === 'pipe-in' || found.kind === 'tty') {
     if (count === 0) return new Uint8Array(0);
+    const nonblock = nonblocking(found);
+    if (nonblock && found.tty) ttyAccess(21);
     // A read that waits shows what was written first; on the terminal, the page hears it asks.
-    if (found.pipe.empty) { flush(); if (found.tty) postMessage({ reading: true }); }
-    const read = found.tty && ttyState ? readTerminal(found.pipe, count) : found.pipe.read(count, () => pause(true));
+    if (found.pipe.empty) { flush(nonblock); if (found.tty) postMessage({ reading: true }); }
+    const read = nonblock ? found.pipe.read(count, undefined, !!(found.tty && ttyState?.canonical), true)
+      : found.tty && ttyState ? readTerminal(found.pipe, count) : found.pipe.read(count, () => pause(true));
+    if (read === null) throw new Errno(ERRNO.EAGAIN);
     pause();
     return read;
   }
   if (found.kind === 'out' || found.kind === 'pipe-out') throw new Errno(EBADF);
   if (!found.read) throw new Errno(EBADF);
-  if (found.device === 'null') return new Uint8Array(0);
+  if (isByteDevice(found.device)) {
+    try { return readDevice(found.device, count); } catch { throw new Errno(EIO); }
+  }
   if (found.rewrite) return found.bytes.bytes(at, Math.min(found.bytes.length, at + count)).slice();
   if (found.writer) {
     const { from, length } = found.bytes;
@@ -413,19 +503,34 @@ function* readFrom(found, at, count) {
 }
 
 function* writeTo(found, at, data) {
-  if (found.device === 'null') {
+  if (found.tty && found.writable === false) throw new Errno(EBADF);
+  if (found.kind === 'pty') return writePty(found, data);
+  if (found.kind === 'tty' && ttyControl.hungup) throw new Errno(EIO);
+  if (isByteDevice(found.device)) {
     if (!found.writable) throw new Errno(EBADF);
+    if (found.device === 'full') throw new Errno(ERRNO.ENOSPC);
     return data.length;
   }
   // A pipe whose reader is gone, or the page's whose reader has closed its end (head, with its
   // lines): SIGPIPE, whose default is to end the process, quietly.
-  if (found.kind === 'tty') { output(found.fd ?? 1, ttyState.output(data), true); return data.length; }
+  if (data.length && found.tty && ttyState && (ttyState.get(2) & LF.TOSTOP)) ttyAccess(22);
+  if (found.kind === 'tty') {
+    if (nonblocking(found)) return outputNonblocking(found.fd ?? 1, data, ttyState);
+    output(found.fd ?? 1, ttyState.output(data), true); return data.length;
+  }
   if (found.kind === 'out') {
     if (found.closed && Atomics.load(found.closed, 0)) brokenPipe();
+    if (nonblocking(found)) return outputNonblocking(found.fd, data, found.tty ? ttyState : null, !!found.tty);
     output(found.fd, found.tty && ttyState ? ttyState.output(data) : data);
     return data.length;
   }
   if (found.kind === 'pipe-out') {
+    if (nonblocking(found)) {
+      const { written, broken } = found.pipe.tryWrite(data);
+      if (broken) return brokenPipe(written);
+      if (!written && data.length) throw new Errno(ERRNO.EAGAIN);
+      return written;
+    }
     // A write that waits for room shows what was written first.
     if (found.pipe.room < data.length) flush();
     const { written, broken } = found.pipe.write(data, done => {
@@ -483,6 +588,7 @@ function* flushChunk(found) {
   const index = bytes.from / found.chunk;
   const headers = { 'Content-Type': 'application/octet-stream' };
   if (process.proc) headers['X-Process-Token'] = process.proc;
+  if (process.pid) headers['X-Process-Pid'] = String(process.pid);
   const answer = yield* request('PUT', `/api/pwrite?fd=${found.kfd}&index=${index}`, chunk, headers);
   if (answer.status >= 300) throw new Errno(errnoOf(safeJson(answer.text)));
   bytes.view.copyWithin(0, count, bytes.length);
@@ -546,16 +652,27 @@ function output(fd, data, tty = false) {
     if (pendingBytes >= OUTPUT_CHUNK || performance.now() - lastFlush > 100) flush();
   }
 }
-function flush() {
+function flush(nonblock = false) {
   lastFlush = performance.now();
-  if (!pending.length) return;
+  if (!pending.length) return true;
+  // Each frame needs one credit. Flags may have changed after buffered writes;
+  // defer those frames without turning a nonblocking write into a hidden wait.
+  if (nonblock && outputCredit) {
+    let frames = 1;
+    for (let i = 1; i < pending.length; i++) if (pending[i][0] !== pending[i - 1][0] || pending[i][2] !== pending[i - 1][2]) frames++;
+    for (;;) {
+      const available = Atomics.load(outputCredit, 0);
+      if (available < frames) return false;
+      if (Atomics.compareExchange(outputCredit, 0, available, available - frames) === available) break;
+    }
+  }
   // Detach first: checking a signal while waiting for credit can itself call flush().
   const sending = pending;
   pending = []; pendingBytes = 0;
   let fd = sending[0][0], tty = sending[0][2], parts = [];
   const send = () => {
     if (!parts.length) return;
-    if (outputCredit) {
+    if (outputCredit && !nonblock) {
       for (;;) {
         pause();
         const available = Atomics.load(outputCredit, 0);
@@ -573,6 +690,27 @@ function flush() {
     parts.push(data);
   }
   send();
+  return true;
+}
+
+function outputNonblocking(fd, data, state, tty = true) {
+  if (!data.length) return 0;
+  if (!flush(true)) throw new Errno(ERRNO.EAGAIN);
+  if (outputCredit) {
+    for (;;) {
+      const credit = Atomics.load(outputCredit, 0);
+      if (credit <= 0) throw new Errno(ERRNO.EAGAIN);
+      if (Atomics.compareExchange(outputCredit, 0, credit, credit - 1) === credit) break;
+    }
+  }
+  const count = Math.min(data.length, state ? OUTPUT_CHUNK / 2 : OUTPUT_CHUNK);
+  const out = state ? state.output(data.slice(0, count)) : data.slice(0, count);
+  if (!tty || !outputCredit) {
+    written += out.length;
+    if (written > process.limit) { postMessage({ truncated: true }); throw killedBy(SIGPIPE); }
+  }
+  postMessage({ fd, out, tty, credit: !!outputCredit }, [out.buffer]);
+  return count;
 }
 
 // ---- WASI preview 1 ----
@@ -634,6 +772,55 @@ function pathAt(fd, ptr, len) {
 }
 let environ = [];
 
+function* openPath(path, dirflags, oflags, base, fdflags, noctty = false, mode = 0o666) {
+    const write = (base & RIGHT_WRITE) !== 0n, read = (base & RIGHT_READ) !== 0n || !write;
+    const append = (fdflags & FDFLAG_APPEND) !== 0;
+    const original = localDescriptor(path);
+    // Reopening a pipe or terminal creates a new open description. Unlike dup,
+    // its status flags are independent of the shell's inherited descriptors.
+    if (original?.kind === 'pty' && !original.master) path = localLink(path);
+    let found;
+    if (original && ['out', 'pipe-in', 'pipe-out', 'tty'].includes(original.kind)) {
+      if (oflags & OFLAG_DIRECTORY) throw new Errno(ENOTDIR);
+      if (oflags & OFLAG_CREAT && oflags & OFLAG_EXCL) throw new Errno(ERRNO.EEXIST);
+      if (fdflags & ~FDFLAG_NONBLOCK) throw new Errno(ERRNO.EOPNOTSUPP);
+      const readable = original.kind === 'pipe-in' || original.kind === 'tty' && original.readable !== false;
+      const writable = ['out', 'pipe-out'].includes(original.kind) || original.kind === 'tty' && original.writable !== false;
+      if (read && !readable || write && !writable) throw new Errno(ERRNO.EACCES);
+      found = { ...original, refs: 0, flags: descriptorFlags(), readable: read, writable: write };
+    } else if (path === '/dev/pts') {
+      if (write) throw new Errno(EISDIR);
+      found = { kind: 'dir', path };
+    } else if (allocatedPath(path)) {
+      if (oflags & OFLAG_DIRECTORY) throw new Errno(ENOTDIR);
+      if (oflags & OFLAG_CREAT && oflags & OFLAG_EXCL) throw new Errno(ERRNO.EEXIST);
+      found = { kind: 'pty', tty: true, ...hostErrno(host('pty', { op: 'open', path, readable: read, writable: write, nonblock: !!(fdflags & FDFLAG_NONBLOCK), noctty })) };
+    } else if (isTerminal(path)) {
+      if (oflags & OFLAG_DIRECTORY) throw new Errno(ENOTDIR);
+      found = terminalFd(1, read, write);
+      if (!noctty && path !== '/dev/tty') ttyCall(found, 'open');
+    } else if (oflags & OFLAG_DIRECTORY) {
+      if (kindOf((yield* stat(path, (dirflags & FOLLOW) !== 0)).mode) !== DIRECTORY) throw new Errno(ENOTDIR);
+      found = { kind: 'dir', path };
+    } else if (!write) {
+      found = yield* openRead(path);
+    } else if (oflags & (OFLAG_TRUNC | OFLAG_EXCL)) {
+      found = yield* openWriter(path, (oflags & OFLAG_CREAT ? O_CREAT : 0) | (oflags & OFLAG_EXCL ? O_EXCL : 0) | (oflags & OFLAG_TRUNC ? O_TRUNC : 0), read, mode);
+    } else {
+      // Written without truncating: a new file is written in order; one there is changed here.
+      let there;
+      try { there = yield* stat(path); } catch (err) { if (!(err instanceof Errno) || err.errno !== ENOENT || !(oflags & OFLAG_CREAT)) throw err; }
+      if (!there) found = yield* openWriter(path, O_CREAT, read, mode);
+      else if (kindOf(there.mode) === DIRECTORY) throw new Errno(EISDIR);
+      else found = yield* openRewrite(path, there, append, read);
+    }
+    found.append ||= append && found.kind === 'file';
+    const number = lowest();
+    install(number, found, found.kind === 'pty');
+    if (found.flags) Atomics.store(new Int32Array(found.flags), 0, fdflags & FDFLAG_NONBLOCK);
+    return number;
+}
+
 const wasi = {
   args_get: (argv, buf) => strings(process.argv, argv, buf),
   args_sizes_get: (count, size) => sizes(process.argv, count, size),
@@ -653,13 +840,24 @@ const wasi = {
   fd_fdstat_get: (fd, ptr) => attempt(function* () {
     const found = descriptor(fd), v = view();
     v.setUint8(ptr, filetype(found));
-    v.setUint16(ptr + 2, found.append ? FDFLAG_APPEND : 0, true);
+    v.setUint16(ptr + 2, (found.append ? FDFLAG_APPEND : 0) | (nonblocking(found) ? FDFLAG_NONBLOCK : 0), true);
     // A terminal cannot seek, which is how libc's isatty tells it.
-    const rights = found.tty ? ALL_RIGHTS & ~(RIGHT_SEEK | RIGHT_TELL) : ALL_RIGHTS;
+    let rights = found.tty ? ALL_RIGHTS & ~(RIGHT_SEEK | RIGHT_TELL) : ALL_RIGHTS;
+    if (found.tty && found.readable === false) rights &= ~RIGHT_READ;
+    if (found.tty && found.writable === false) rights &= ~RIGHT_WRITE;
     v.setBigUint64(ptr + 8, rights, true);
     v.setBigUint64(ptr + 16, ALL_RIGHTS, true);
   }),
-  fd_fdstat_set_flags: () => 0,
+  fd_fdstat_set_flags: (fd, flags) => attempt(function* () {
+    const found = descriptor(fd);
+    if (found.kind === 'pty') {
+      if (flags & ~FDFLAG_NONBLOCK) throw new Errno(ERRNO.EOPNOTSUPP);
+      ptyCall(found, 'flags', { nonblock: !!(flags & FDFLAG_NONBLOCK) });
+    } else if (found.flags) {
+      if (flags & ~FDFLAG_NONBLOCK) throw new Errno(ERRNO.EOPNOTSUPP);
+      Atomics.store(new Int32Array(found.flags), 0, flags);
+    }
+  }),
   fd_fdstat_set_rights: () => 0,
   fd_filestat_get: (fd, ptr) => attempt(function* () { return writeFilestat(ptr, (yield* fstat(descriptor(fd)))); }),
   fd_filestat_set_size: (fd, len) => attempt(function* () {
@@ -710,10 +908,11 @@ const wasi = {
         const at = found.pos ?? 0;
         const data = yield* readFrom(found, at, len);
         bytes().set(data, ptr); total += data.length;
-        if (!STDIO.has(found.kind)) found.pos = at + data.length;
+        if (!STDIO.has(found.kind)) found.pos = isByteDevice(found.device) ? 0 : at + data.length;
         if (data.length < len) break;
         // A pipe gives what it has: once some is read, the read waits for no more.
         if (['pipe-in', 'tty'].includes(found.kind) && total > 0 && found.pipe.queued === 0) break;
+        if (found.kind === 'pty' && total > 0 && !ptyCall(found, 'poll', { writing: false }).nbytes) break;
       }
     });
     view().setUint32(nread, total, true);
@@ -722,7 +921,7 @@ const wasi = {
     const found = descriptor(fd);
     if (found.kind !== 'dir') throw new Errno(ENOTDIR);
     if (!found.entries) {
-      const listed = yield* call({ getdents: { path: found.path } });
+      const listed = found.path === '/dev/pts' ? hostErrno(host('pty', { op: 'list' })).entries : yield* call({ getdents: { path: found.path } });
       for (const entry of listed) {
         if (!entry.stat) continue;
         const path = clean(join(found.path, entry.name));
@@ -762,7 +961,7 @@ const wasi = {
     const found = descriptor(fd);
     if (found.kind !== 'file') throw new Errno(ESPIPE);
     yield* exclusive(found, function* () {
-      if (found.device === 'null') {
+      if (isByteDevice(found.device)) {
         found.pos = 0;
         view().setBigUint64(ptr, 0n, true);
         return;
@@ -783,7 +982,23 @@ const wasi = {
     const found = descriptor(fd);
     let total = 0;
     try { yield* exclusive(found, function* () {
-      for (const [ptr, len] of iovecs(iovs, count)) {
+      const vectors = iovecs(iovs, count);
+      // PIPE_BUF atomicity applies to the complete writev, not each vector.
+      // Combine only small nonblocking pipe writes; larger writes may be partial.
+      if (found.kind === 'pipe-out' && vectors.length > 1 && nonblocking(found)) {
+        const length = vectors.reduce((sum, [, len]) => sum + len, 0);
+        if (length <= PIPE_ATOMIC) {
+          const data = new Uint8Array(length), memory = bytes();
+          let at = 0;
+          for (const [ptr, len] of vectors) {
+            if (ptr + len > memory.length) throw new Errno(ERRNO.EFAULT);
+            data.set(memory.subarray(ptr, ptr + len), at); at += len;
+          }
+          total = yield* writeTo(found, 0, data);
+          return;
+        }
+      }
+      for (const [ptr, len] of vectors) {
         const data = bytes().slice(ptr, ptr + len);
         if (found.kind !== 'file') {
           const written = yield* writeTo(found, 0, data);
@@ -793,12 +1008,12 @@ const wasi = {
         }
         const at = found.append ? size(found) : found.pos;
         total += yield* writeTo(found, at, data);
-        found.pos = found.device === 'null' ? 0 : at + len;
+        found.pos = isByteDevice(found.device) ? 0 : at + len;
       }
     }); } catch (error) {
       // writev may have finished earlier vectors before a signal interrupts a
       // later one. Report those bytes so libc does not resend them.
-      if (!total || !(error instanceof Errno) || ![ERRNO.EINTR, ERRNO.EPIPE].includes(error.errno)) throw error;
+      if (!total || !(error instanceof Errno) || ![ERRNO.EINTR, ERRNO.EPIPE, ERRNO.EAGAIN].includes(error.errno)) throw error;
     }
     view().setUint32(nwritten, total, true);
   }),
@@ -807,35 +1022,11 @@ const wasi = {
   path_filestat_set_times: (fd, flags, ptr, len, atim, mtim, fst) => attempt(function* () { return yield* times(pathAt(fd, ptr, len), atim, mtim, fst, (flags & FOLLOW) !== 0); }),
   path_link: (fd, flags, ptr, len, fd2, ptr2, len2) => attempt(function* () { yield* call({ link: { from: pathAt(fd, ptr, len), to: pathAt(fd2, ptr2, len2), follow: (flags & FOLLOW) !== 0 } }); forget(); }),
   path_open: (fd, dirflags, ptr, len, oflags, base, inheriting, fdflags, out) => attempt(function* () {
-    const path = pathAt(fd, ptr, len);
-    const write = (base & RIGHT_WRITE) !== 0n, read = (base & RIGHT_READ) !== 0n || !write;
-    const append = (fdflags & FDFLAG_APPEND) !== 0;
-    let found;
-    if (isTerminal(path)) {
-      if (oflags & OFLAG_DIRECTORY) throw new Errno(ENOTDIR);
-      found = terminalFd(1);
-    } else if (oflags & OFLAG_DIRECTORY) {
-      if (kindOf((yield* stat(path, (dirflags & FOLLOW) !== 0)).mode) !== DIRECTORY) throw new Errno(ENOTDIR);
-      found = { kind: 'dir', path };
-    } else if (!write) {
-      found = yield* openRead(path);
-    } else if (oflags & (OFLAG_TRUNC | OFLAG_EXCL)) {
-      found = yield* openWriter(path, (oflags & OFLAG_CREAT ? O_CREAT : 0) | (oflags & OFLAG_EXCL ? O_EXCL : 0) | (oflags & OFLAG_TRUNC ? O_TRUNC : 0), read);
-    } else {
-      // Written without truncating: a new file is written in order; one there is changed here.
-      let there;
-      try { there = yield* stat(path); } catch (err) { if (!(err instanceof Errno) || err.errno !== ENOENT || !(oflags & OFLAG_CREAT)) throw err; }
-      if (!there) found = yield* openWriter(path, O_CREAT, read);
-      else if (kindOf(there.mode) === DIRECTORY) throw new Errno(EISDIR);
-      else found = yield* openRewrite(path, there, append, read);
-    }
-    found.append ||= append && found.kind === 'file';
-    const number = lowest();
-    install(number, found);
-    view().setUint32(out, number, true);
+    view().setUint32(out, yield* openPath(pathAt(fd, ptr, len), dirflags, oflags, base, fdflags), true);
   }),
   path_readlink: (fd, ptr, len, buf, bufLen, used) => attempt(function* () {
-    const target = encoder.encode((yield* call({ readlink: { path: pathAt(fd, ptr, len) } })));
+    const path = pathAt(fd, ptr, len);
+    const target = encoder.encode(localLink(path) ?? (yield* call({ readlink: { path } })));
     const part = target.subarray(0, bufLen);
     bytes().set(part, buf);
     view().setUint32(used, part.length, true);
@@ -864,6 +1055,14 @@ const wasi = {
         if (sub.type === 0) { if (performance.now() < sub.until) continue; }
         else if (sub.type !== 1 && sub.type !== 2) error = EINVAL;
         else if (!found) error = EBADF;
+        else if (found.kind === 'tty' && ttyControl.hungup) hangup = true;
+        else if (found.kind === 'pty') {
+          try {
+            const result = ptyCall(found, 'poll', { writing: sub.type === 2 });
+            if (!result.ready) continue;
+            nbytes = result.nbytes; hangup = result.hangup;
+          } catch (err) { error = err instanceof Errno ? err.errno : EIO; }
+        }
         else if (sub.type === 1 && ['pipe-in', 'tty'].includes(found.kind)) {
           if (found.pipe.empty) continue;
           nbytes = found.pipe.queued; hangup = found.pipe.writerGone;
@@ -882,7 +1081,13 @@ const wasi = {
     }
   }),
   proc_exit: code => { throw new Exit(code); },
-  proc_raise: signal => { const error = signals.queue(signal); dispatchSignals(); pause(); return error; },
+  proc_raise: signal => attempt(function* () {
+    // SIGSTOP is already recorded when delivered by the registry. Local raises
+    // must take that route too, so a parent's WUNTRACED wait observes the stop.
+    if (signal === 19) hostErrno(host('kill', { pid: process.pid, signal }));
+    else { const error = signals.queue(signal); if (error) throw new Errno(error); }
+    dispatchSignals(); pause();
+  }),
   // Into memory of its own first: shared memory (WASIX's) is not the crypto's to fill.
   random_get: (ptr, len) => { for (let at = 0; at < len; at += 65536) bytes().set(crypto.getRandomValues(new Uint8Array(Math.min(65536, len - at))), ptr + at); return 0; },
   sched_yield: () => 0,
@@ -980,9 +1185,9 @@ function host(type, args) {
 }
 const hostErrno = reply => { if (reply?.errno) throw new Errno(ERRNO[reply.errno] ?? EIO); return reply; };
 // Lines of a string WASIX passes a list as (arguments, environment).
-function waitChild(pid, nohang) {
+function waitChild(pid, nohang, options = 0) {
   for (;;) {
-    const child = hostErrno(host('join', { pid, nohang: true }));
+    const child = hostErrno(host('join', { pid, nohang: true, options }));
     if (!child.nothing || nohang) return child;
     dispatchSignals(true);
     sleepUntil(performance.now() + 50);
@@ -1058,14 +1263,25 @@ const wasixCalls = {
   // WASIX 32v1's 24-byte tty record (api_wasix.h). The three descriptor flags
   // describe this process, including redirections; modes belong to its controlling PTY.
   tty_get: ptr => {
+    const found = fds.get(0);
+    if (found?.kind === 'pty') {
+      try {
+        const state = TtyState.create(ttyCall(found, IOCTL.TIOCGWINSZ));
+        state.configure(ttyCall(found, IOCTL.TCGETS));
+        state.wasix(view(), ptr, [0, 1, 2].map(fd => !!fds.get(fd)?.tty));
+        return 0;
+      } catch (err) { return err instanceof Errno ? err.errno : EIO; }
+    }
     if (!ttyState) return ERRNO.ENOTTY;
     ttyState.wasix(view(), ptr, [0, 1, 2].map(fd => !!fds.get(fd)?.tty));
     return 0;
   },
   tty_set: ptr => attempt(function* () {
-    if (!ttyState) throw new Errno(ERRNO.ENOTTY);
+    if (fds.get(0)?.kind !== 'pty' && !ttyState) throw new Errno(ERRNO.ENOTTY);
+    const found = fds.get(0)?.kind === 'pty' ? descriptor(0) : terminalFd(0);
     const v = view();
-    hostErrno(host('tty', { request: 'wasix', arg: { echo: !!v.getUint8(ptr + 19), canonical: !!v.getUint8(ptr + 20), lineFeeds: !!v.getUint8(ptr + 21) } }));
+    ttyAccess(22, found);
+    ttyCall(found, 'wasix', { echo: !!v.getUint8(ptr + 19), canonical: !!v.getUint8(ptr + 20), lineFeeds: !!v.getUint8(ptr + 21) });
   }),
   // WASIX's renumber is dup2(2): `from` stays open.
   fd_renumber: (from, to) => attempt(function* () {
@@ -1145,12 +1361,13 @@ const wasixCalls = {
   proc_join: (pidPtr, flags, statusPtr) => attempt(function* () {
     const v = view(), tag = v.getUint8(pidPtr);
     if (tag > 1) throw new Errno(EINVAL);
-    const reply = waitChild(tag === 1 ? v.getUint32(pidPtr + 4, true) : null, (flags & 1) !== 0);
+    const reply = waitChild(tag === 1 ? v.getInt32(pidPtr + 4, true) : -1, (flags & 1) !== 0, flags & 2);
     for (let at = 0; at < 6; at++) v.setUint8(statusPtr + at, 0);
     if (reply.nothing) { v.setUint8(pidPtr, 0); v.setUint32(pidPtr + 4, 0, true); return; }
     v.setUint8(pidPtr, 1);
     v.setUint32(pidPtr + 4, reply.pid, true);
-    if (reply.signal != null) { v.setUint8(statusPtr, 2); v.setUint8(statusPtr + 4, reply.signal); }
+    if (reply.stopped) { v.setUint8(statusPtr, 3); v.setUint8(statusPtr + 4, reply.status >> 8); }
+    else if (reply.signal != null) { v.setUint8(statusPtr, 2); v.setUint8(statusPtr + 4, reply.signal); }
     else { v.setUint8(statusPtr, 1); v.setUint16(statusPtr + 2, reply.code & 0xffff, true); }
   }),
   // The callback is paired with the platform's sigaction/mask imports.
@@ -1193,34 +1410,43 @@ const wasix = new Proxy(wasixCalls, {
 // What a child gets of this process's open files: each description, shared through the line's
 // table (`shares`), and which descriptors are which. Its host counts the child's references to
 // each (and holds its pipes' ends) once it has the child's pid, before the child starts.
-function forkState({ exec = false, stdin = 'inherit' } = {}) {
+function forkState({ exec = false, stdin = 'inherit', tty = null, dup2 = [] } = {}) {
   if (!shares) throw new Errno(ENOSYS);
   const ids = new Map(), descriptions = [], table = [];
-  for (const [fd, found] of fds) {
-    if (exec && cloexec.has(fd) || fd === 0 && stdin !== 'inherit') continue;
+  // Apply dup2 against a child-only table before CLOEXEC filtering. Parent fds never
+  // change, and each source must be an actual descriptor held by this process.
+  const inherited = new Map(fds), closes = new Set(cloexec);
+  const inputAction = dup2.some(([, to]) => to === 0);
+  for (const [from, to] of dup2) {
+    if (!inherited.has(from)) throw new Errno(EBADF);
+    inherited.set(to, inherited.get(from)); closes.delete(to);
+  }
+  for (const [fd, found] of inherited) {
+    if (exec && closes.has(fd) || fd === 0 && stdin !== 'inherit' && !inputAction) continue;
     if (!ids.has(found)) {
       ids.set(found, descriptions.length);
       descriptions.push({ ...describe(found), refs: 0 });
     }
     descriptions[ids.get(found)].refs++;
-    table.push([fd, ids.get(found), cloexec.has(fd)]);
+    table.push([fd, ids.get(found), closes.has(fd)]);
   }
-  if (stdin !== 'inherit') {
-    if (stdin === 'tty' && !ttyState) throw new Errno(ERRNO.ENOTTY);
+  if (stdin !== 'inherit' && !inputAction) {
+    if (stdin === 'tty' && !tty && !controllingTerminal()) throw new Errno(ERRNO.ENXIO);
     table.push([0, descriptions.length, false]);
-    descriptions.push(stdin === 'tty' ? { ...describe(terminalFd(1)), refs: 1 }
+    descriptions.push(stdin === 'tty' ? { ...describe(tty ?? terminalFd(1)), refs: 1 }
       : { kind: 'in', tty: false, data: new Uint8Array(0), refs: 1 });
   }
   return { signals: signals.snapshot(), fds: table, descriptions };
 }
 function describe(found) {
   switch (found.kind) {
+    case 'pty': return { kind: 'pty', tty: true, handle: found.handle, master: found.master, number: found.number, readable: found.readable, writable: found.writable, refs: found.refs };
     case 'in':
       if (shares && found.share == null) share(found);
       if (shares && found.share == null) throw new Errno(ERRNO.EMFILE);
-      return { kind: 'in', tty: found.tty, data: found.share == null ? found.data.slice(found.pos) : found.data, share: found.share, refs: found.refs };
-    case 'out': return { kind: 'out', fd: found.fd, tty: found.tty, closed: found.closed?.buffer ?? null };
-    case 'tty': case 'pipe-in': case 'pipe-out': return { fd: found.fd, kind: found.kind, tty: !!found.tty, buffer: found.pipe.buffer, refs: found.refs };
+      return { kind: 'in', tty: found.tty, flags: found.flags, data: found.share == null ? found.data.slice(found.pos) : found.data, share: found.share, refs: found.refs };
+    case 'out': return { kind: 'out', fd: found.fd, tty: found.tty, flags: found.flags, closed: found.closed?.buffer ?? null };
+    case 'tty': case 'pipe-in': case 'pipe-out': return { fd: found.fd, kind: found.kind, tty: !!found.tty, flags: found.flags, readable: found.readable, writable: found.writable, buffer: found.pipe.buffer, refs: found.refs };
     case 'dir': return { kind: 'dir', path: found.path, preopen: !!found.preopen };
     default: {
       if (found.share == null) share(found);
@@ -1234,13 +1460,14 @@ function describe(found) {
 function adopt(state) {
   const made = state.descriptions.map(description => {
     switch (description.kind) {
+      case 'pty': { const { refs, ...found } = description; return found; }
       case 'in': {
-        const found = { kind: 'in', tty: description.tty, data: description.data, pos: 0 };
+        const found = { kind: 'in', tty: description.tty, flags: description.flags, data: description.data, pos: 0 };
         if (description.share != null) shares.attach(found, description.share);
         return found;
       }
-      case 'out': return { kind: 'out', fd: description.fd, tty: description.tty, closed: description.closed ? new Int32Array(description.closed) : null };
-      case 'tty': case 'pipe-in': case 'pipe-out': return { fd: description.fd, kind: description.kind, tty: description.tty, pipe: new Pipe(description.buffer, process.pid) };
+      case 'out': return { kind: 'out', fd: description.fd, tty: description.tty, flags: description.flags, closed: description.closed ? new Int32Array(description.closed) : null };
+      case 'tty': case 'pipe-in': case 'pipe-out': return { fd: description.fd, kind: description.kind, tty: description.tty, flags: description.flags, readable: description.readable, writable: description.writable, pipe: new Pipe(description.buffer, process.pid) };
       case 'dir': return { kind: 'dir', path: description.path, preopen: !!description.preopen };
       default: {
         const found = adopted(description);
@@ -1291,7 +1518,48 @@ function next(key) {
 // Instantiate `module`: a memory of the type it imports (`type`), or its own; a fork's child's,
 // as large as its parent's (`snapshot`), which it becomes.
 let initializing = false;
-async function instantiate(module, type, snapshot, startSection = false) {
+let linearBytes = 0, growReserved = 0;
+function checkTermination() {
+  const word = control ? Atomics.load(control, 0) : 0;
+  if (word & KILLED) throw killedBy(word & 0xff);
+}
+function reserveMemory(bytes) {
+  // A fork inherits handlers that cannot run until its instance is restored.
+  // Unconditional termination is safe to honor even before that restoration.
+  checkTermination();
+  try {
+    const answer = sendSync({ method: 'POST', url: '/api/sys',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pid: process.pid, proc: process.proc, calls: [{ resource: { memory: bytes } }] }) });
+    if (answer.status !== 200) throw new Errno(EIO);
+    ok(JSON.parse(answer.text).results[0]); linearBytes = bytes;
+  } catch (error) {
+    // SIGKILL revokes the credential before its event reaches this host. Resolve
+    // that event before treating a denied reservation as an executable failure.
+    if (error.errno === ERRNO.EPERM && channel) host('reconcile', {});
+    checkTermination();
+    throw error;
+  }
+  checkTermination();
+}
+const resourceImports = {
+  memory_grow_pre: (_, delta) => {
+    growReserved = 0;
+    const bytes = (delta >>> 0) * 65536;
+    if (!bytes) return delta;
+    try { reserveMemory(linearBytes + bytes); growReserved = bytes; return delta; }
+    catch (error) { if (error.errno === ERRNO.EAGAIN || error.errno === EINVAL) return -1; throw error; }
+  },
+  memory_grow_post: (_, result) => {
+    if (result === -1 && growReserved) reserveMemory(linearBytes - growReserved);
+    growReserved = 0; return result;
+  },
+};
+async function instantiate(module, type, snapshot, startSection = false, memoryBytes) {
+  if (memoryBytes !== undefined) {
+    const cloned = snapshot ? snapshot.memory.byteLength + Object.values(snapshot.memories ?? {}).reduce((n, bytes) => n + bytes.byteLength, 0) : 0;
+    reserveMemory(Math.max(memoryBytes, cloned));
+  }
   // Exec preserves user fds. Recreate a closed/replaced root preopen at a free
   // number; libc must discover preopens without assuming fd 3 is available.
   // A fork keeps its copied libc table and must retain the same descriptor numbers.
@@ -1321,6 +1589,7 @@ async function instantiate(module, type, snapshot, startSection = false) {
   const imports = suspending
     ? { wasi_snapshot_preview1: suspendable(preview1), os: suspendable(osApi), terminal: suspendable(osApi), wasix_32v1: suspendable(wasix), env }
     : { wasi_snapshot_preview1: preview1, os: osApi, terminal: osApi, wasix_32v1: wasix, env };
+  imports.os_runtime = resourceImports;
   // An imported memory is this process's before the instance is: a start function, which runs
   // as it is instantiated, may already write through it (a memory of the module's own is not
   // there to reach until the instance is).
@@ -1343,7 +1612,7 @@ const NEVER_SUSPENDS = new Set([
   'proc_id', 'proc_parent', 'proc_signal', 'proc_join', 'proc_fork', 'stack_checkpoint', 'stack_restore',
   'callback_signal', 'thread_id', 'thread_signal', 'thread_exit', 'futex_wait', 'futex_wake',
   'proc_exit2', 'proc_signals_get', 'proc_signals_sizes_get', 'fd_fdflags_get', 'fd_fdflags_set',
-  'sigpoll', 'getuid', 'getgid', 'getgroups', 'sigaction', 'sigmask', 'sigpending', 'sigsuspend',
+  'sigpoll', 'getuid', 'getgid', 'getgroups', 'getpgid', 'getsid', 'setpgid', 'setsid', 'tcgetpgrp', 'tcsetpgrp', 'waitpid2', 'sigaction', 'sigmask', 'sigpending', 'sigsuspend',
   'futex_wake_all', 'reply', 'umask', 'tty_get', 'tty_set', 'posix_spawn', 'waitpid',
 ]);
 // The imports a module asks for of `namespace`: those that may ask the kernel, able to suspend
@@ -1410,7 +1679,7 @@ async function replace() {
     throw new Exit(126);
   }
   signals.exec();
-  await instantiate(image.module, image.memory, undefined, image.startSection);
+  await instantiate(image.module, image.memory, undefined, image.startSection, image.memoryBytes);
 }
 
 
@@ -1474,8 +1743,13 @@ function trackRaw(calls, results, reserved = null) {
   }
   return results;
 }
+const localMetadata = call => ['stat', 'lstat', 'access'].some(op => call[op] && (allocatedPath(call[op].path) || call[op].path === '/dev/pts')) || call.getdents?.path === '/dev/pts';
+// Known tty requests use runtime fds. Other ioctls keep a tracked raw file's
+// namespace even when its server number matches a local PTY descriptor.
+const processCalls = call => call === 'setsid' || !!(call.getpgid || call.getsid || call.setpgid || call.waitpid || call.proc_stopped || call.prctl);
 function* osBatch(calls) {
-  const split = calls.some(call => call.open || ttyRequests.has(call.ioctl?.request)
+  if (calls.some(call => call && typeof call === "object" && "resource" in call)) return calls.map(() => ({ err: { errno: "EPERM" } }));
+  const split = calls.some(call => localMetadata(call) || call.readlink && localLink(call.readlink.path) || processCalls(call) || call.open || ttyRequests.has(call.ioctl?.request) || call.ioctl && fds.get(call.ioctl.fd)?.kind === 'pty' && !fds.has(rawNumber(call.ioctl.fd))
     || Number.isInteger(call.close?.fd) && fds.has(rawNumber(call.close.fd)));
   if (!split) return trackRaw(calls, yield* batch(calls));
   const results = [];
@@ -1494,15 +1768,35 @@ function* osBatch(calls) {
       args[key] = fd;
     }
     if (args?.invalidReference) { results.push({ err: args.invalidReference }); continue; }
-    if (call.close && fds.has(rawNumber(call.close.fd))) {
+    if (localMetadata(call)) {
+      const op = Object.keys(call)[0], args = call[op];
+      if (op === 'getdents') {
+        const { cookie = 0, count } = args;
+        if (!Number.isSafeInteger(cookie) || cookie < 0 || count != null && (!Number.isSafeInteger(count) || count < 0)) {
+          results.push({ err: { errno: 'EINVAL' } }); continue;
+        }
+        const reply = host('pty', { op: 'list' });
+        results.push(reply.errno ? { err: { errno: reply.errno } } : { ok: reply.entries.slice(cookie, count == null ? undefined : cookie + count) });
+      } else {
+        const reply = host('pty', { op: op === 'access' ? 'access' : 'stat', path: args.path, mode: args.mode });
+        results.push(reply.errno ? { err: { errno: reply.errno } } : { ok: op === 'access' ? null : reply });
+      }
+    } else if (call.readlink && localLink(call.readlink.path)) {
+      results.push({ ok: localLink(call.readlink.path) });
+    } else if (processCalls(call)) {
+      const result = host('process_call', call);
+      results.push(result?.errno ? { err: { errno: result.errno } } : { ok: result });
+    } else if (call.close && fds.has(rawNumber(call.close.fd))) {
       const remaining = forgetRaw(call.close.fd);
       results.push(remaining ? { ok: null } : (yield* batch([call]))[0]);
-    } else if (ttyRequests.has(call.ioctl?.request)) {
+    } else if (ttyRequests.has(call.ioctl?.request) || call.ioctl && fds.get(call.ioctl.fd)?.kind === 'pty' && !fds.has(rawNumber(call.ioctl.fd))) {
       try {
         const { fd, request, arg } = call.ioctl;
-        if (!descriptor(fd).tty || !ttyState) throw new Errno(ERRNO.ENOTTY);
+        const found = descriptor(fd);
+        if (!found.tty || found.kind !== 'pty' && !ttyState) throw new Errno(ERRNO.ENOTTY);
+        if ([IOCTL.TIOCSPGRP, IOCTL.TCSETS, IOCTL.TCSETSW, IOCTL.TCSETSF].includes(request)) ttyAccess(22, found);
         flush();
-        results.push({ ok: hostErrno(host('tty', { request, arg })) });
+        results.push({ ok: ttyCall(found, request, arg) });
       } catch (err) {
         const errno = err instanceof Errno ? Object.keys(ERRNO).find(key => ERRNO[key] === err.errno) ?? 'EIO' : 'EIO';
         results.push({ err: { errno } });
@@ -1520,7 +1814,64 @@ function* osBatch(calls) {
 // os.sys: a batch of the kernel's calls (abi::Batch's `calls`, as JSON), sent as it is.
 // `sys` sends it and gives the reply's length; `reply` copies the reply where the program says.
 let reply = new Uint8Array(0);
+function processCall(call) { return hostErrno(host('process_call', call)); }
+function posixCall(call) {
+  pause();
+  try { return call(); } catch (err) { if (!(err instanceof Errno)) throw err; return -err.errno; }
+}
+function ttyAccess(signal, found = null) {
+  if (found?.kind === 'pty') {
+    for (;;) {
+      const suppressed = signals.actions[signal].kind === 1 || signals.mask & (1 << (signal - 1));
+      const result = ttyCall(found, 'access', { signal, suppressed });
+      if (!result.signalled) return;
+      if (dispatchSignals(true)) throw new Errno(ERRNO.EINTR);
+      pause(true);
+    }
+  }
+  if (!ttyState) return;
+  while (controllingTerminal() && Atomics.load(membership, 0) !== ttyControl.pgrp) {
+    const suppressed = signals.actions[signal].kind === 1 || signals.mask & (1 << (signal - 1));
+    if (suppressed) { if (signal === 21) throw new Errno(EIO); return; }
+    hostErrno(host('tty', { request: 'access', arg: signal }));
+    if (dispatchSignals(true)) throw new Errno(ERRNO.EINTR);
+    pause(true);
+  }
+}
 const osApi = {
+  // POSIX flag adapter over the same descriptor/open driver as WASI. Linux flag
+  // values include O_NOCTTY, which preview 1 cannot express.
+  open: (ptr, len, flags, mode) => drive((function* () {
+    try {
+      pause();
+      if (flags & ~(3 | 0o100 | 0o200 | 0o400 | 0o1000 | 0o2000 | 0o4000 | 0o200000 | 0o400000 | 0o2000000) || (flags & 3) === 3) throw new Errno(EINVAL);
+      const path = clean(join(process.cwd, string(ptr, len)));
+      if (flags & 0o400000 && kindOf((yield* stat(path, false)).mode) === SYMBOLIC_LINK) throw new Errno(ERRNO.ELOOP);
+      const oflags = (flags & O_CREAT ? OFLAG_CREAT : 0) | (flags & O_EXCL ? OFLAG_EXCL : 0) | (flags & O_TRUNC ? OFLAG_TRUNC : 0) | (flags & 0o200000 ? OFLAG_DIRECTORY : 0);
+      const rights = (flags & 3) === O_RDONLY ? RIGHT_READ : (flags & 3) === O_WRONLY ? RIGHT_WRITE : RIGHT_READ | RIGHT_WRITE;
+      const fdflags = (flags & 0o2000 ? FDFLAG_APPEND : 0) | (flags & 0o4000 ? FDFLAG_NONBLOCK : 0);
+      const fd = yield* openPath(path, FOLLOW, oflags, rights, fdflags, !!(flags & 0o400), mode);
+      if (flags & 0o2000000) cloexec.add(fd);
+      return fd;
+    } catch (err) { if (err instanceof Errno) return -err.errno; throw err; }
+  })()),
+  getpgid: pid => posixCall(() => processCall({ getpgid: { pid } }).pgid),
+  getsid: pid => posixCall(() => processCall({ getsid: { pid } }).sid),
+  setpgid: (pid, pgid) => posixCall(() => { processCall({ setpgid: { pid, pgid } }); return 0; }),
+  setsid: () => posixCall(() => processCall('setsid').sid),
+  tcgetpgrp: fd => posixCall(() => {
+    return ttyCall(descriptor(fd), IOCTL.TIOCGPGRP).pgrp;
+  }),
+  tcsetpgrp: (fd, pgid) => posixCall(() => {
+    const found = descriptor(fd); ttyAccess(22, found); ttyCall(found, IOCTL.TIOCSPGRP, pgid); return 0;
+  }),
+  waitpid2: (pid, ptr, options) => posixCall(() => {
+    if (options & ~11) throw new Errno(EINVAL);
+    const child = waitChild(pid, !!(options & 1), options);
+    if (child.nothing) return 0;
+    if (ptr) view().setInt32(ptr, child.status, true);
+    return child.pid;
+  }),
   getuid: () => identity.uid,
   getgid: () => identity.gid,
   getgroups: (count, ptr) => {
@@ -1537,7 +1888,7 @@ const osApi = {
     return previous;
   },
   sigpoll: () => { dispatchSignals(); },
-  sigpending: () => Atomics.load(signals.words, 1),
+  sigpending: () => signals.pending,
   sigsuspend: mask => {
     const previous = signals.mask;
     signals.mask = mask;
@@ -1554,19 +1905,27 @@ const osApi = {
   },
   posix_spawn: (ptr, len, result) => {
     pause();
+    let tty;
     try {
       if (len > 1 << 20) throw new Errno(ERRNO.E2BIG);
       const request = JSON.parse(string(ptr, len));
       const vector = value => Array.isArray(value) && value.every(item => typeof item === 'string' && !item.includes('\0'));
       if (!vector(request.argv) || !request.argv[0] || !vector(request.env) || typeof request.cwd !== 'string'
         || request.cwd.includes('\0') || !['inherit', 'null', 'tty'].includes(request.stdin)) throw new Errno(EINVAL);
+      if (request.pgroup != null && (!Number.isInteger(request.pgroup) || request.pgroup < 0 || request.pgroup > 0x7fffffff)) throw new Errno(EINVAL);
+      if (request.cgroup != null && (typeof request.cgroup !== 'string' || !request.cgroup.startsWith('/') || request.cgroup.length > 4096 || request.cgroup.includes('\0'))) throw new Errno(EINVAL);
+      const dup2 = request.dup2 ?? [];
+      if (!Array.isArray(dup2) || dup2.length > 64 || !dup2.every(pair => Array.isArray(pair) && pair.length === 2 && pair.every(fd => Number.isInteger(fd) && fd >= 0 && fd <= 65535))) throw new Errno(EINVAL);
       const size = values => values.reduce((sum, value) => sum + encoder.encode(value).length + 1, 0);
       if (size(request.argv) > 128 * 1024 || size(request.env) > 128 * 1024) throw new Errno(ERRNO.E2BIG);
-      const state = { ...forkState({ exec: true, stdin: request.stdin }), ...request, shares: shares.buffer, umask: process.umask };
+      if (request.stdin === 'tty' && Atomics.load(membership, 2) >= 0x40000000)
+        tty = { kind: 'pty', tty: true, ...hostErrno(host('pty', { op: 'open', path: '/dev/tty', readable: true, writable: false, noctty: true })) };
+      const state = { argv: request.argv, env: request.env, cwd: request.cwd, pgroup: request.pgroup, cgroup: request.cgroup, ...forkState({ exec: true, stdin: request.stdin, tty, dup2 }), shares: shares.buffer, umask: process.umask };
       const child = hostErrno(host('spawn', state));
       view().setUint32(result, child.pid, true);
       return 0;
     } catch (err) { if (err instanceof Exit) throw err; return err instanceof Errno ? err.errno : EINVAL; }
+    finally { if (tty) { try { ptyCall(tty, 'close'); } catch { /* host cleanup handles a concurrent exit */ } } }
   },
   waitpid: (pid, result) => {
     pause();
@@ -1603,6 +1962,8 @@ onmessage = ({ data }) => {
 async function start(data) {
   process = { ...data, limit: data.limit ?? 10 << 20, ppid: data.ppid ?? 1 };
   ttyState = data.pty ? new TtyState(data.pty.state) : null;
+  ttyControl = data.pty ? new TtyControl(data.pty.control) : null;
+  membership = data.membership ? new Int32Array(data.membership) : new Int32Array([1, 1, 0]);
   outputCredit = data.outputCredit ? new Int32Array(data.outputCredit) : null;
   control = data.control ? new Int32Array(data.control) : null;
   channel = data.channel ? { state: new Int32Array(data.channel, 0, 2), data: new Uint8Array(data.channel, 8) } : null;
@@ -1629,7 +1990,10 @@ async function start(data) {
       install(2, stderr.tty && ttyState ? terminalFd(2) : { kind: 'out', fd: 2, tty: !!stderr.tty }, !(stderr.tty && ttyState));
       install(3, { kind: 'dir', path: '/', preopen: true });
     }
-    await instantiate(data.module, data.memory, parent?.snapshot, data.startSection);
+    // Fresh/exec images have no inherited caught handlers to instantiate first.
+    // Deliver pending stop/termination before their start section can do I/O.
+    if (!data.fork) pause();
+    await instantiate(data.module, data.memory, parent?.snapshot, data.startSection, data.memoryBytes);
     // The child returns from fork with 0.
     if (data.fork) engine.rewind({ pid: 0 });
     code = await run();

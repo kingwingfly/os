@@ -217,6 +217,7 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     for statement in SCHEMA {
         sql.exec(statement, None)?;
     }
+    crate::provider_policy::create(sql)?;
     // Inodes made before they had times get them, as of 1970.
     if sql.exec("SELECT mtime FROM inodes LIMIT 0", None).is_err() {
         for column in ["mtime", "ctime"] {
@@ -294,6 +295,7 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
             None,
         )?;
     }
+    crate::system::schema(sql)?;
     // Tables made just now are this version's, said at once: initialization may fail (a
     // missing ADMIN_PASSWORD), and the next start must not take them for an older version's.
     if !tables.iter().any(|t| t.name == "users") {
@@ -326,7 +328,10 @@ pub fn transact<T: 'static>(
         REMOVING.take();
         STARTING.take();
         TELLING.take();
-        let mut db = Db { sql: sql.clone() };
+        let mut db = Db {
+            sql: sql.clone(),
+            image: None,
+        };
         let (value, commit) = work(&mut db);
         *slot.borrow_mut() = Some(value);
         let changing = CHANGING.take();
@@ -525,6 +530,7 @@ pub struct Fd {
     /// keeps its inode.
     #[serde(default)]
     pub ino: Option<u64>,
+    pub generation: Option<String>,
 }
 impl Fd {
     pub fn writes(&self) -> bool {
@@ -591,6 +597,7 @@ fn parent_of(path: &str) -> &str {
 /// fails the transaction.
 pub struct Db {
     sql: SqlStorage,
+    pub(crate) image: Option<Rc<crate::system::Mounted>>,
 }
 impl Db {
     pub(crate) fn rows<T: DeserializeOwned>(
@@ -630,6 +637,19 @@ impl Db {
             .into_iter()
             .map(|row| (row.name, row.value))
             .collect()
+    }
+    pub(crate) fn persisted_node(&self, path: &str) -> Option<Node> {
+        self.rows::<NodeRow>(&format!("{NODE} WHERE n.path = ?"), vec![text(path)])
+            .pop()
+            .map(|r| r.pair().1)
+    }
+    pub(crate) fn persisted_descendant(&self, path: &str) -> bool {
+        !self
+            .rows::<Key>(
+                "SELECT path AS key FROM nodes WHERE path >= ? AND path < ? LIMIT 1",
+                vec![text(&format!("{path}/")), text(&format!("{path}0"))],
+            )
+            .is_empty()
     }
     pub fn meta(&self, key: &str) -> Option<String> {
         self.rows::<Value>("SELECT v FROM meta WHERE k = ?", vec![text(key)])
@@ -718,7 +738,7 @@ impl Db {
     /// The descriptor `fd` of the session `sid`.
     pub fn fd(&self, sid: &str, fd: u32) -> Option<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred, ino FROM fds WHERE sid = ? AND fd = ?",
+            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred, ino, generation FROM fds WHERE sid = ? AND fd = ?",
             vec![text(sid), int(fd)],
         )
         .pop()
@@ -726,14 +746,14 @@ impl Db {
     /// The descriptors of the session `sid`.
     pub fn fds_of(&self, sid: &str) -> Vec<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred, ino FROM fds WHERE sid = ? ORDER BY fd",
+            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred, ino, generation FROM fds WHERE sid = ? ORDER BY fd",
             vec![text(sid)],
         )
     }
     /// The descriptor writing `file`, if one is.
     pub fn writer(&self, file: &str) -> Option<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred, ino FROM fds WHERE file = ? AND flags & 3 != 0",
+            "SELECT fd, file, device, path, flags, created, leased, root, proc, exec, cred, ino, generation FROM fds WHERE file = ? AND flags & 3 != 0",
             vec![text(file)],
         )
         .pop()
@@ -846,7 +866,7 @@ impl Db {
         let fd = self.next_fd(sid);
         let ino = self.node(path).map(|node| node.ino).filter(|ino| *ino != 0);
         self.run(
-            "INSERT INTO fds(sid, fd, file, path, flags, created, leased, ino) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO fds(sid, fd, file, path, flags, created, leased, ino, generation) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 text(sid),
                 int(fd),
@@ -856,6 +876,7 @@ impl Db {
                 int(created as u8),
                 int(now),
                 ino.map_or(SqlStorageValue::Null, int),
+                self.image.as_ref().map(|v| v.id.as_str()).into(),
             ],
         );
         self.set_expiry("fd", &fd_key(sid, fd), now + crate::fds::IDLE);
@@ -1634,6 +1655,9 @@ impl kernel::Fs for Db {
         crate::auth::clock()
     }
     fn times(&self, ino: u64) -> kernel::Times {
+        if crate::system::immutable_inode(ino) {
+            return kernel::Times::default();
+        }
         if let Some(times) = crate::usr::times(ino) {
             return times;
         }
@@ -1694,8 +1718,16 @@ impl kernel::Fs for Db {
 
 impl Store for Db {
     fn node(&self, path: &str) -> Option<Node> {
-        // /usr and /bin are the image's (usr.rs), over any of the store's.
-        if crate::usr::is(path) {
+        if let Some(image) = &self.image {
+            if let Some(node) = image.node(path) {
+                return Some(node);
+            }
+            if image.owns(path) {
+                return None;
+            }
+        }
+        // Legacy sessions retain their original fixed projection.
+        if self.image.is_none() && crate::usr::is(path) {
             return crate::usr::node(path);
         }
         self.rows::<NodeRow>(&format!("{NODE} WHERE n.path = ?"), vec![text(path)])
@@ -1703,8 +1735,13 @@ impl Store for Db {
             .map(|r| r.pair().1)
     }
     fn children(&self, path: &str) -> Vec<(String, Node)> {
-        let image = crate::usr::children(path);
-        if path != "/"
+        let image = self
+            .image
+            .as_ref()
+            .map(|image| image.children(path))
+            .or_else(|| crate::usr::children(path));
+        if !matches!(path, "/" | "/etc" | "/opt")
+            && crate::system::owns(self, path)
             && let Some(image) = image
         {
             return image;
@@ -1716,7 +1753,10 @@ impl Store for Db {
             )
             .into_iter()
             .map(NodeRow::pair)
-            .filter(|(child, _)| !crate::usr::is(child))
+            .filter(|(child, _)| {
+                !crate::system::owns(self, child)
+                    && !self.image.as_ref().is_some_and(|v| v.node(child).is_some())
+            })
             .collect();
         if let Some(image) = image {
             children.extend(image);

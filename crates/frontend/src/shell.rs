@@ -1444,6 +1444,7 @@ impl Shell {
     /// running.
     pub fn detach(self) {
         self.detached.set(true);
+        crate::close_console(&self.id.to_string());
         self.cancelled.set(true);
         if self.choosing.get_untracked() {
             cancel_choosing();

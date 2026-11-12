@@ -5,6 +5,7 @@ use std::time::Duration;
 use worker::*;
 
 pub const VERSION: &str = "fork-v4";
+pub const RESOURCES: &str = "resources-v1";
 const CACHE_LIFETIME: i64 = 7 * 24 * 60 * 60 * 1000;
 
 pub fn prefix(content: &str) -> String {
@@ -101,7 +102,14 @@ impl ModuleCompiler {
         init.with_method(Method::Post)
             .with_body(Some(stream.into()));
         let compiled = fetcher
-            .fetch_request(Request::new_with_init("http://compiler/compile", &init)?)
+            .fetch_request(Request::new_with_init(
+                if key.ends_with(RESOURCES) {
+                    "http://compiler/compile?profile=resources-v1"
+                } else {
+                    "http://compiler/compile"
+                },
+                &init,
+            )?)
             .await?;
         if compiled.status_code() != 200 {
             return Ok(compiled);
@@ -143,8 +151,8 @@ impl ModuleCompiler {
     }
 }
 
-pub async fn image(env: &Env, content: &str, body: Response) -> Result<Response> {
-    let key = format!("{}{VERSION}", prefix(content));
+pub async fn image(env: &Env, content: &str, body: Response, profile: &str) -> Result<Response> {
+    let key = format!("{}{profile}", prefix(content));
     let ResponseBody::Stream(stream) = body.body() else {
         return Response::error("Missing image", 400);
     };

@@ -3,8 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node scripts/build.mjs",
-    "build:web": "node scripts/build.mjs --web-only",
+    "build": "cargo xtask build",
+    "build:web": "cargo xtask build --web-only",
     "dev": "node scripts/dev.mjs --ip 127.0.0.1 --port 8787",
     "deploy": "node scripts/deploy.mjs",
     "setup": "node scripts/setup.mjs",

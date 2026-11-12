@@ -31,6 +31,7 @@ pub struct Credential {
     pub gid: u32,
     pub groups: String,
     pub umask: u16,
+    pub generation: Option<String>,
     /// The key its process's descriptors are owned by: its own exec's (`owner`), or, for an
     /// image a process replaced its own with, the one that process had, as execve keeps a
     /// process's open files.
@@ -43,7 +44,7 @@ pub struct Credential {
 const OWNER: &str = "COALESCE(owner, ns || ' ' || pid || ' ' || substr(token, 1, 16))";
 /// The columns a `Credential` is read from.
 fn columns() -> String {
-    format!("token, ns, pid, uid, gid, groups, umask, {OWNER} AS owner")
+    format!("token, ns, pid, uid, gid, groups, umask, generation, {OWNER} AS owner")
 }
 impl Credential {
     pub fn identity(&self) -> Identity {
@@ -135,6 +136,9 @@ impl Db {
     /// The credentials of the job `id`, as `cred` spawned it with `umask`, by its token's hash
     /// `hash`: they are the job's for its life, whatever becomes of the account.
     pub fn job_credential(&mut self, id: &str, hash: &str, cred: &Identity, umask: u16, now: u64) {
+        // Enforce the same absolute deadline on byte streams and syscall batches,
+        // even if the durable cleanup alarm is delivered late.
+        let expires = self.provider_deadline(id).unwrap_or(now + 7 * 24 * 3600);
         self.run(
             "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner, expires) VALUES(?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
             vec![
@@ -146,10 +150,17 @@ impl Db {
                 int(umask & 0o777),
                 int(now),
                 text(&job_owner(id)),
-                int(now + 7 * 24 * 3600),
+                int(expires),
             ],
         );
-        self.set_expiry("credential", hash, now + 7 * 24 * 3600);
+        self.run(
+            "UPDATE credentials SET generation = ? WHERE token = ?",
+            vec![
+                self.image.as_ref().map(|v| v.id.as_str()).into(),
+                text(hash),
+            ],
+        );
+        self.set_expiry("credential", hash, expires);
         let placement = crate::placement::container(cred.id, id);
         self.run(
             "UPDATE credentials SET placement = ? WHERE token = ?",
@@ -268,6 +279,8 @@ struct Asked {
     seat: Option<String>,
     #[serde(default)]
     cgroup: Option<String>,
+    #[serde(default)]
+    generation: Option<String>,
     /// The account of the process it replaces, if any: only that account, or root, may.
     #[serde(default)]
     replacing: Option<u32>,
@@ -299,6 +312,7 @@ fn umask() -> u16 {
 /// What an execve gives: the credentials snapshotted, and how the loader reads the image.
 #[derive(Serialize)]
 struct Image {
+    login: Option<crate::login::Context>,
     uid: u32,
     gid: u32,
     groups: BTreeSet<u32>,
@@ -381,6 +395,14 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
                 (reply, true)
             })?
         }
+        "/internal/login" => transact(state, move |db| {
+            let context = login_context(db, key.as_deref(), guest.as_deref());
+            let reply = match context {
+                Some(context) => Reply::ok(json!(context)),
+                None => crate::api::errno_reply(&Errno::EACCES.into()),
+            };
+            (reply, true)
+        })?,
         "/internal/revoke" => {
             #[derive(Deserialize)]
             struct Asked {
@@ -463,6 +485,12 @@ fn exec(
     {
         return Err(Errno::EPERM.into());
     }
+    let generation = current
+        .as_ref()
+        .map(|c| c.generation.clone())
+        .unwrap_or(asked.generation)
+        .filter(|g| g != "legacy");
+    crate::system::select(db, generation.as_deref())?;
     let cwd = asked.cwd;
     let path = if asked.path.starts_with('/') {
         asked.path
@@ -481,8 +509,8 @@ fn exec(
     // The image: a binary of /usr, or any file whose content is one (a FICLONE copy or a hard
     // link of /usr/bin/coreutils), is the build's asset; anything else is uploaded, and the
     // loader reads it by a token of the process's own descriptor, revalidated with the X rule.
-    let asset = crate::usr::asset(&executable.content);
-    if crate::usr::is(&executable.path) && asset.is_none() {
+    let asset = crate::system::asset(&executable.content);
+    if crate::system::owns(db, &executable.path) && asset.is_none() {
         return Err(Error::because(
             Errno::ENOEXEC,
             format!("{} is not an executable image", executable.path),
@@ -512,6 +540,10 @@ fn exec(
             text(&lineage),
             int(now + abi::PROCESS_TOKEN_TTL),
         ],
+    );
+    db.run(
+        "UPDATE credentials SET generation = ? WHERE token = ?",
+        vec![generation.as_deref().into(), text(&asked.token)],
     );
     db.set_expiry("credential", &asked.token, now + abi::PROCESS_TOKEN_TTL);
     let placement = crate::placement::browser(
@@ -548,18 +580,44 @@ fn exec(
             (Some(fd), Some(read), executable.node.size)
         }
         // A binary of /usr is as large as the build's (`usr::size` takes its content id).
-        Some(_) => (None, None, crate::usr::size(&executable.content)),
+        Some(_) => (None, None, crate::system::size(&executable.content)),
     };
     Ok(json!(Image {
+        login: if current.is_none() {
+            login_context(db, key, guest)
+        } else {
+            None
+        },
         uid: cred.id,
         gid: cred.group,
         groups: cred.groups.clone(),
         umask,
         fd,
-        asset: asset.map(str::to_string),
+        asset,
         path: executable.path.clone(),
         size,
         token_read,
         version: executable.content.clone(),
     }))
+}
+
+// Authenticated login provenance is internal registry metadata, never supplied by a page.
+fn login_context(
+    db: &mut Db,
+    key: Option<&str>,
+    guest: Option<&str>,
+) -> Option<crate::login::Context> {
+    use os_core::permissions::Store;
+    let uid = auth::identity_of(db, key, guest).id;
+    auth::sid(db, key, guest).map(|binding| {
+        let expires = key
+            .and_then(|key| db.session(key))
+            .filter(|session| session.user == uid && session.expires > auth::now())
+            .map_or(auth::now() + 24 * 60 * 60, |session| session.expires);
+        crate::login::Context {
+            binding,
+            uid,
+            expires,
+        }
+    })
 }

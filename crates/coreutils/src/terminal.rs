@@ -83,6 +83,7 @@ pub fn stty(args: impl Iterator<Item = OsString>) -> i32 {
                 ("lflag", 8, "echo"),
                 ("lflag", 2, "icanon"),
                 ("lflag", 1, "isig"),
+                ("lflag", 256, "tostop"),
                 ("oflag", 1, "opost"),
                 ("oflag", 4, "onlcr"),
             ]
@@ -153,6 +154,7 @@ pub fn stty(args: impl Iterator<Item = OsString>) -> i32 {
                         "echo" => ("lflag", 8),
                         "icanon" => ("lflag", 2),
                         "isig" => ("lflag", 1),
+                        "tostop" => ("lflag", 256),
                         "opost" => ("oflag", 1),
                         "onlcr" => ("oflag", 4),
                         _ => return Err(format!("invalid argument '{mode}'")),

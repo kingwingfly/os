@@ -4,10 +4,9 @@
 //! kernel's, and the process record is the browser's machine's (a Durable Object of its own,
 //! reached by a batch marked `X-Registry`).
 //!
-//! Only execve asks the worker kernel anything, and a pipeline's stages ask at once. A fork, an
-//! exit and a wait happen here, as they happen in a Linux kernel: a fork takes a pid the
-//! machine lent ahead of time, and each is told to the machine after, in a batch with the
-//! others (`flush`), or with the next request that goes there anyway. A wait answers here; its
+//! Exec and fork await registry admission before guest execution. Fork may use a pid lent
+//! ahead of time, but that number grants no cgroup capacity. Exit and wait reports are batched
+//! with the next request (`flush`). A wait answers here; its
 //! host replies once the machine heard (`queued`, `reported`), so that /proc no longer names
 //! what was reaped.
 //!
@@ -169,6 +168,40 @@ impl Kernel {
         Ok(Value::Array(results).to_string())
     }
 
+    /// Bind a hosted process to a proven login coordinator before guest code starts.
+    /// The process token stays inside this kernel and its authenticated registry request.
+    pub async fn login_attach(
+        &self,
+        pid: u32,
+        member: &str,
+        generation: u64,
+        launch: Option<String>,
+        host: &str,
+    ) -> Result<String, JsValue> {
+        let token = self.token(pid, host)?;
+        let value = self
+            .one(
+                Call::LoginSession {
+                    action: abi::LoginAction::Attach {
+                        member: parse(member, "login member")?,
+                        generation,
+                        launch: launch
+                            .as_deref()
+                            .map(|value| parse(value, "login launch"))
+                            .transpose()?,
+                        process: abi::ProcessProof {
+                            pid,
+                            token,
+                            signals: Vec::new(),
+                        },
+                    },
+                },
+                false,
+            )
+            .await?;
+        to_json(&value)
+    }
+
     /// execve of the process `pid` itself, as its own image calls it: the image at `path`
     /// replaces its own, with its pid, its credentials and its open descriptors; the process
     /// carries a new token from now on (its forks keep the old one). `argv` and `env` are JSON
@@ -186,6 +219,7 @@ impl Kernel {
     ) -> Result<String, JsValue> {
         let token = self.token(pid, host)?;
         let call = Call::Execve {
+            runtime: Some("resources-v1".into()),
             pid: Some(pid),
             token: Some(token),
             path: path.into(),
@@ -204,9 +238,8 @@ impl Kernel {
         to_json(&exec)
     }
 
-    /// fork: a child of `pid`, at once, with a pid lent ahead (one request when none is left);
-    /// the machine hears of it after. The page clones the wasm state.
-    pub async fn fork(&self, pid: u32, host: &str) -> Result<String, JsValue> {
+    /// Fork admits the child in the registry before the host clones/runs its wasm state.
+    pub async fn fork(&self, pid: u32, host: &str, empty_memory: bool) -> Result<String, JsValue> {
         let token = self.token(pid, host)?;
         if self
             .state
@@ -242,13 +275,44 @@ impl Kernel {
                 .or_default()
                 .extend(lent);
         }
-        let mut state = self.state.borrow_mut();
         // A fork taken while the lending was asked may have left none.
-        let child = state
+        let child = self
+            .state
+            .borrow_mut()
             .spare
             .get_mut(&token)
             .and_then(Vec::pop)
             .ok_or_else(|| fail(Errno::EAGAIN.into()))?;
+        let answer = self
+            .send(
+                vec![Call::Fork {
+                    empty_memory,
+                    pid,
+                    child: Some(child),
+                    token: Some(token.clone()),
+                }],
+                false,
+            )
+            .await
+            .map_err(fail)?;
+        match answer.into_iter().next() {
+            Some(Return::Ok(_)) => {}
+            Some(Return::Err(error)) => {
+                // A definite rejection never consumed this lend. Reuse it when
+                // capacity becomes available instead of exhausting the pool.
+                if error.errno == Errno::EAGAIN {
+                    self.state
+                        .borrow_mut()
+                        .spare
+                        .entry(token)
+                        .or_default()
+                        .push(child);
+                }
+                return Err(fail(error));
+            }
+            None => return Err(fail(Errno::EIO.into())),
+        }
+        let mut state = self.state.borrow_mut();
         state.processes.insert(
             child,
             Local {
@@ -258,11 +322,6 @@ impl Kernel {
                 ended: None,
             },
         );
-        state.report(Call::Fork {
-            pid,
-            child: Some(child),
-            token: Some(token.clone()),
-        });
         to_json(&json!({ "pid": child, "token": token }))
     }
 
@@ -290,7 +349,7 @@ impl Kernel {
         let orphans: Vec<u32> = state
             .processes
             .iter()
-            .filter(|(_, child)| child.ppid == pid)
+            .filter(|(_, child)| pid != INIT && child.ppid == pid)
             .map(|(child, _)| *child)
             .collect();
         for orphan in orphans {
@@ -407,7 +466,7 @@ impl Kernel {
     /// kernel's: the signal may be to a child it has not heard of yet.
     pub async fn kill(
         &self,
-        pid: u32,
+        pid: i32,
         signal: Option<u8>,
         from: Option<u32>,
         host: &str,
@@ -439,6 +498,67 @@ impl Kernel {
         }
     }
 
+    /// Invoke a lifecycle operation with this host's authenticated process identity.
+    pub async fn process_call(&self, pid: u32, call: &str, host: &str) -> Result<String, JsValue> {
+        let token = self.token(pid, host)?;
+        let call: Call = parse(call, "process call")?;
+        if !matches!(
+            call,
+            Call::Getpgid { .. }
+                | Call::Getsid { .. }
+                | Call::Setpgid { .. }
+                | Call::Setsid
+                | Call::Getpid
+                | Call::Waitpid { .. }
+                | Call::ProcStopped { .. }
+                | Call::Prctl { .. }
+                | Call::CgroupAttach { .. }
+        ) {
+            return Err(fail(Errno::EPERM.into()));
+        }
+        let waiting = matches!(call, Call::Waitpid { .. });
+        self.flush().await?;
+        let value = sys(Batch {
+            calls: vec![call],
+            pid: Some(pid),
+            process: Some(token),
+            ..Batch::default()
+        })
+        .await
+        .map_err(fail)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| fail(Errno::EIO.into()))?
+        .into_result()
+        .map_err(fail)?;
+        if waiting
+            && value.get("code").is_some()
+            && let Some(child) = value["pid"].as_u64()
+        {
+            self.state.borrow_mut().processes.remove(&(child as u32));
+        }
+        Ok(value.to_string())
+    }
+
+    /// Bootstrap only processes owned by this port, before their Workers start.
+    pub async fn session(&self, pids: &str, host: &str) -> Result<String, JsValue> {
+        let pids: Vec<u32> = parse(pids, "session processes")?;
+        let processes = pids
+            .into_iter()
+            .map(|pid| {
+                Ok(abi::ProcessProof {
+                    pid,
+                    token: self.token(pid, host)?,
+                    signals: Vec::new(),
+                })
+            })
+            .collect::<Result<Vec<_>, JsValue>>()?;
+        Ok(self
+            .one(Call::ProcSession { processes }, false)
+            .await?
+            .to_string())
+    }
+
     /// What those processes (JSON array of pids; none for all) are now.
     pub async fn poll(&self, pids: &str) -> Result<String, JsValue> {
         let pids: Vec<u32> = parse(pids, "pids")?;
@@ -468,6 +588,33 @@ impl Kernel {
         Ok(())
     }
 
+    /// Install a restricted boot proof only after the Machine accepts its owner fence.
+    pub async fn boot_init(&self, owner: &str, token: &str, host: &str) -> Result<String, JsValue> {
+        let owner: abi::InitOwner = parse(owner, "init owner")?;
+        self.one(
+            Call::MachineInit {
+                action: abi::InitAction::Start {
+                    owner,
+                    token: token.into(),
+                },
+            },
+            false,
+        )
+        .await?;
+        self.state.borrow_mut().processes.insert(
+            INIT,
+            Local {
+                ppid: 0,
+                token: token.into(),
+                host: host.into(),
+                ended: None,
+            },
+        );
+        Ok(json!({ "pid": INIT, "ppid": 0, "token": token, "asset": "/usr/bin/init.wasm",
+            "membership": { "pid": INIT, "ppid": 0, "pgid": INIT, "sid": INIT, "uid": 0, "ctty": 0 }
+        }).to_string())
+    }
+
     /// Recover the state of processes owned by this host, including earlier login sessions.
     pub async fn sync(&self, host: &str, acknowledgements: &str) -> Result<String, JsValue> {
         let acknowledgements: std::collections::BTreeMap<u32, Vec<u64>> =
@@ -489,24 +636,24 @@ impl Kernel {
         Ok(rows.to_string())
     }
 
-    /// The parent of a process, locally when hosted here, otherwise from the account-visible registry.
+    /// Authoritative parent identity, including adoption by a living subreaper.
     pub async fn getpid(&self, pid: u32) -> Result<String, JsValue> {
-        if let Some(ppid) = self
+        let local = self
             .state
             .borrow()
             .processes
             .get(&pid)
             .filter(|local| local.ended.is_none())
-            .map(|local| local.ppid)
-        {
-            return Ok(json!({ "pid": pid, "ppid": ppid }).to_string());
+            .map(|local| (local.token.clone(), local.host.clone()));
+        if let Some((_, host)) = local {
+            return self.process_call(pid, "\"getpid\"", &host).await;
         }
         let rows = self.one(Call::ProcPoll { pids: vec![pid] }, false).await?;
         let row = rows
             .as_array()
             .and_then(|rows| rows.first())
             .ok_or_else(|| fail(Error::from(Errno::ESRCH)))?;
-        Ok(json!({ "pid": pid, "ppid": row["ppid"] }).to_string())
+        Ok(json!({"pid":pid,"ppid":row["ppid"]}).to_string())
     }
 
     /// The tabs whose processes still run, and the kernels holding pids they were lent, by the
@@ -571,6 +718,7 @@ impl Kernel {
             Call::CgroupCreate {
                 path: path.into(),
                 controllers: None,
+                lifetime: None,
             },
             false,
         )
@@ -645,6 +793,7 @@ impl Kernel {
             .map(|stage| {
                 let cgroup = stage["cgroup"].as_str().unwrap_or_default();
                 Ok(Call::Execve {
+                    runtime: Some("resources-v1".into()),
                     pid: None,
                     token: None,
                     path: stage["path"].as_str().unwrap_or_default().into(),

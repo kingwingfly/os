@@ -176,11 +176,19 @@ pub fn ioctl(
     if !request.writes() {
         return Err(Errno::EBADF.into());
     }
+    let owner = db
+        .fd(&request.sid, request.fd)
+        .and_then(|fd| fd.proc.as_deref().and_then(|line| db.controller(line)))
+        .or_else(|| db.session(&request.sid).map(|s| s.user))
+        .unwrap_or(process.cred.id);
     match op {
+        protocol::POLICY => Ok(json!(db.provider_policy(owner)?)),
+        protocol::CONFIGURE => Ok(json!(db.configure_provider(owner, decode(arg)?)?)),
         protocol::INFO => Ok(json!({"version": protocol::VERSION,
             "device": request.device.name, "max_active": protocol::MAX_ACTIVE,
             "max_events": protocol::MAX_EVENTS, "max_request_bytes": protocol::MAX_REQUEST_BYTES,
-            "max_output_bytes": protocol::MAX_OUTPUT_BYTES})),
+            "max_output_bytes": protocol::MAX_OUTPUT_BYTES,
+            "lifetimes":["descriptor","detached"],"policy":db.provider_policy(owner)?})),
         protocol::SUBMIT => {
             let submit: protocol::Submit = decode(arg)?;
             submit.validate()?;
@@ -204,7 +212,11 @@ pub fn ioctl(
                     json!({"version": protocol::VERSION, "id": previous.id, "request": previous.request}),
                 );
             }
-            if db.active_tasks(controller) >= protocol::MAX_ACTIVE {
+            let policy = db.provider_policy(controller)?;
+            if !policy.enabled {
+                return Err(Errno::EACCES.into());
+            }
+            if db.active_tasks(controller) >= policy.max_active as usize {
                 return Err(Errno::EAGAIN.into());
             }
             let (label, operation, names) = operation(db, &request, submit.operation)?;
@@ -223,6 +235,7 @@ pub fn ioctl(
             let id = started["job"].as_str().ok_or(Errno::EIO)?.to_string();
             let token = crate::auth::random_token();
             let now = crate::auth::now();
+            db.set_expiry("provider_deadline", &id, now + policy.max_seconds);
             db.job_credential(
                 &id,
                 &crate::auth::token_hash(&token),
@@ -416,6 +429,9 @@ pub fn ioctl(
                 }
                 Ok(json!({"id": task.id, "_launch": {"job": task.id}}))
             } else {
+                if op == protocol::DETACH && !db.provider_policy(task.owner)?.detached {
+                    return Err(Errno::EACCES.into());
+                }
                 db.attach_device_task(&task.id, &request.sid, request.fd, op == protocol::DETACH);
                 Ok(json!({"id": task.id}))
             }

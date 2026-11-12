@@ -112,14 +112,14 @@ test('cgroups are created, written, attached, listed and removed, as cgroup v2 h
   value(await call(page, 'cgroup_create', { path: '/user/job' }));
   value(await call(page, 'cgroup_set', { path: '/user/job', key: 'memory.max', value: '16777216' }));
   value(await call(page, 'cgroup_set', { path: '/user/job', key: 'pids.max', value: '4' }));
-  value(await call(page, 'cgroup_set', { path: '/user/job', key: 'cgroup.freeze', value: '1' }));
+  expect((await call(page, 'cgroup_set', { path: '/user/job', key: 'cgroup.freeze', value: '1' })).err.errno).toBe('EOPNOTSUPP');
   value(await call(page, 'cgroup_attach', { pid: process.pid, path: '/user/job' }));
   const stat = value(await call(page, 'cgroup_stat', { path: '/user/job' }));
   expect(stat).toMatchObject({
     path: '/user/job',
     'memory.max': '16777216',
     'pids.max': 4,
-    'cgroup.freeze': '1',
+    'cgroup.freeze': '0',
     'cgroup.procs': [process.pid],
   });
   expect(value(await call(page, 'cgroup_list', { path: '/user' }))).toContain('/user/job');

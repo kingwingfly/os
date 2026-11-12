@@ -79,7 +79,16 @@ fn running(kind: Worker) -> Result<Rc<Running>, String> {
     if let Some(running) = RUNNING.with(|running| running.borrow().get(&kind).cloned()) {
         return Ok(running);
     }
-    let worker = web_sys::Worker::new(kind.script()).map_err(js_error)?;
+    let path = web_sys::window()
+        .and_then(|w| w.location().pathname().ok())
+        .unwrap_or_default();
+    let prefix = path
+        .strip_prefix("/boot/releases/")
+        .and_then(|s| s.split_once("/assets/"))
+        .filter(|(id, _)| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|(id, _)| format!("/boot/releases/{id}/assets"))
+        .unwrap_or_default();
+    let worker = web_sys::Worker::new(&format!("{prefix}{}", kind.script())).map_err(js_error)?;
     let calls = Rc::new(Calls::default());
     let (_, ready) = calls.add();
     let on_message = {

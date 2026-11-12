@@ -1,3 +1,4 @@
+import { asset } from '../release.js';
 // The page's side of the client kernel's protocol: one envelope, versioned, with an id for each
 // request and one reply. Requests never carry functions; events (process state, a boot, a
 // mount) are pushed as they happen. The dedicated Worker (client.js) speaks this too; its classic
@@ -19,7 +20,7 @@ const holding = globalThis.navigator?.locks
 // The page's port to its dedicated client-kernel Worker.
 export function kernelPort() {
   if (connection) return connection;
-  const worker = new Worker('/client-kernel.js');
+  const worker = new Worker(asset('/client-kernel.js'));
   const port = worker;
   const pending = new Map();
   const listeners = new Map();
@@ -48,10 +49,11 @@ export function kernelPort() {
     }
   };
   // Each request says which tab asks, once the tab holds its lock.
-  const request = (type, args = {}) => holding.then(() => new Promise((resolve, reject) => {
+  const request = (type, args = {}, transfer = []) => holding.then(() => new Promise((resolve, reject) => {
     const id = ++next;
     pending.set(id, { resolve, reject });
-    port.postMessage({ v: VERSION, id, type, args, tab });
+    try { port.postMessage({ v: VERSION, id, type, args, tab }, transfer); }
+    catch (error) { pending.delete(id); reject(error); }
   }));
   const on = (event, listener) => {
     if (!listeners.has(event)) listeners.set(event, new Set());
@@ -71,6 +73,6 @@ export function kernelPort() {
 // - `poll {pids}`: abi::Proc records, as /proc has them.
 // - `kill {pid, signal, from?}`: null; `from` names a process this tab runs, which signals as
 //   itself (its own credentials), not as the page's account.
-export async function kernelCall(type, args) {
-  return kernelPort().request(type, args);
+export async function kernelCall(type, args, transfer) {
+  return kernelPort().request(type, args, transfer);
 }

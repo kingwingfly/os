@@ -10,6 +10,8 @@ pub const ANSWER: u32 = 0x5457_0103;
 pub const CANCEL: u32 = 0x5457_0104;
 pub const DETACH: u32 = 0x5457_0105;
 pub const ATTACH: u32 = 0x5457_0106;
+pub const POLICY: u32 = 0x5457_0107;
+pub const CONFIGURE: u32 = 0x5457_0108;
 pub const MAX_ACTIVE: usize = 16;
 pub const MAX_EVENTS: usize = 128;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -17,6 +19,43 @@ pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 pub const ARCHIVE: &str = "/dev/archive";
 pub const MEDIA: &str = "/dev/media";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderPolicy {
+    pub version: u32,
+    pub revision: u64,
+    pub enabled: bool,
+    pub detached: bool,
+    pub max_active: u32,
+    pub max_seconds: u64,
+}
+impl Default for ProviderPolicy {
+    fn default() -> Self {
+        Self {
+            version: VERSION,
+            revision: 0,
+            enabled: true,
+            detached: true,
+            max_active: MAX_ACTIVE as u32,
+            max_seconds: 604800,
+        }
+    }
+}
+impl ProviderPolicy {
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        if self.version != VERSION {
+            return Err(crate::Errno::EOPNOTSUPP.into());
+        }
+        if self.revision >= (1 << 53) - 1
+            || self.max_active > MAX_ACTIVE as u32
+            || !(1..=604800).contains(&self.max_seconds)
+        {
+            return Err(crate::Errno::EINVAL.into());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

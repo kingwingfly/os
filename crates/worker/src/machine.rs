@@ -67,10 +67,26 @@ impl DurableObject for Machine {
         }
         transact(&self.state, |db| {
             db.expire_processes(auth::now());
+            db.expire_logins(auth::now());
+            db.expire_init(auth::now());
             ((), true)
         })?;
         let path = req.path();
         let reply = match (req.method(), path.as_str()) {
+            (Method::Post, "/internal/io") => {
+                let ask: crate::resources::IoRequest = req.json().await?;
+                let result = transact(&self.state, move |db| {
+                    let result = db
+                        .resource_io(&ask, js_sys::Date::now() as u64)
+                        .map(|delay| json!({"delay_ms":delay}));
+                    let commit = result.is_ok();
+                    (result, commit)
+                })?;
+                return Response::from_json(&match result {
+                    Ok(v) => Return::Ok(v),
+                    Err(e) => Return::Err(e),
+                });
+            }
             // A directly routed batch. Any page can set the header; account/token checks
             // below are the authority for every operation.
             (Method::Post, "/api/sys") => {
@@ -97,6 +113,7 @@ impl DurableObject for Machine {
                     },
                     ns,
                     cookie: req.headers().get("Cookie")?,
+                    release: req.headers().get("X-OS-Release")?,
                     sudo: batch.sudo,
                     umask: batch.umask.unwrap_or(0o022) & 0o777,
                     pid: batch.pid,
@@ -118,6 +135,7 @@ impl DurableObject for Machine {
                     },
                     ns: forwarded.ns,
                     cookie: forwarded.cookie,
+                    release: forwarded.release,
                     sudo: forwarded.sudo,
                     umask: forwarded.umask & 0o777,
                     pid: forwarded.pid,
@@ -151,6 +169,8 @@ impl DurableObject for Machine {
         }
         transact(&self.state, |db| {
             db.expire_processes(auth::now());
+            db.expire_logins(auth::now());
+            db.expire_init(auth::now());
             ((), true)
         })?;
         self.settle().await;
@@ -164,6 +184,8 @@ pub struct Forwarded {
     pub ns: String,
     #[serde(default)]
     pub cookie: Option<String>,
+    #[serde(default)]
+    pub release: Option<String>,
     #[serde(default)]
     pub sudo: bool,
     #[serde(default = "umask")]
@@ -188,6 +210,7 @@ struct Caller {
     class: registry::Caller,
     ns: String,
     cookie: Option<String>,
+    release: Option<String>,
     sudo: bool,
     umask: u16,
     pid: Option<u32>,
@@ -256,6 +279,70 @@ impl Machine {
             Ok(acting) => acting,
             Err(error) => return Ok(Err(error)),
         };
+        if let Call::MachineInit { action } = call {
+            if caller.sudo {
+                return Ok(Err(Errno::EPERM.into()));
+            }
+            // Validate the current browser context, but never give the host its account's
+            // credentials. Ownership spans login changes inside this same Machine.
+            match self
+                .authority("/internal/login", caller.cookie.as_deref(), &json!({}))
+                .await?
+            {
+                Ok(value) => {
+                    if matches!(action, abi::InitAction::Reboot { .. })
+                        && value["uid"].as_u64() != Some(0)
+                    {
+                        return Ok(Err(Errno::EPERM.into()));
+                    }
+                }
+                Err(error) => return Ok(Err(error)),
+            }
+            let ns = caller.ns.clone();
+            return transact(&self.state, move |db| {
+                let result = db.machine_init(&ns, action, auth::now());
+                let commit = result.is_ok();
+                (result, commit)
+            });
+        }
+        if let Call::LoginSession { action } = call {
+            if caller.sudo {
+                return Ok(Err(Errno::EPERM.into()));
+            }
+            let context = if matches!(
+                action,
+                abi::LoginAction::Leave { .. } | abi::LoginAction::Finish { .. }
+            ) {
+                None
+            } else {
+                match self
+                    .authority("/internal/login", caller.cookie.as_deref(), &json!({}))
+                    .await?
+                {
+                    Ok(value) => match serde_json::from_value::<crate::login::Context>(value) {
+                        Ok(context) => Some(context),
+                        Err(_) => return Ok(Err(Errno::EIO.into())),
+                    },
+                    Err(error) => return Ok(Err(error)),
+                }
+            };
+            let ns = caller.ns.clone();
+            let wake = if let abi::LoginAction::Signal { pid, signal, .. } = &action {
+                Some((*pid, *signal))
+            } else {
+                None
+            };
+            let result = transact(&self.state, move |db| {
+                let result = db.login_session(&ns, context.as_ref(), action, auth::now());
+                let commit = result.is_ok();
+                (result, commit)
+            })?;
+            if let (Ok(_), Some((pid, signal))) = (&result, wake) {
+                let told = json!({ "ns": caller.ns, "value": { "signal": { "pid": pid, "signal": signal } } });
+                let _ = self.authority("/internal/tell", None, &told).await;
+            }
+            return Ok(result);
+        }
         // What acts as an account acts as the page's, unless a process's token says whose.
         let identity = match acting {
             Acting::Account if caller.token.is_none() => match self.identity(caller).await? {
@@ -281,8 +368,14 @@ impl Machine {
         })?;
         // A signal is told to the tab that runs the process, on its browser's events line.
         if let (Ok(_), Call::Kill { pid, signal }) = (&result, told)
-            && let abi::Target::Pid(pid) = abi::Target::of(&pid)
+            && signal != Some(0)
         {
+            // A group signal is only a wakeup hint. Hosts fetch authorized pending
+            // deliveries; the event never supplies membership or credentials.
+            let pid = match abi::Target::of(&pid) {
+                abi::Target::Pid(pid) => pid,
+                _ => 0,
+            };
             let told = json!({ "ns": caller.ns, "value": { "signal": {
                 "pid": pid,
                 "signal": signal.unwrap_or(abi::SIGTERM),
@@ -302,6 +395,30 @@ impl Machine {
         {
             return Ok(calls.iter().map(|_| Return::Err(error.clone())).collect());
         }
+        let context = if calls
+            .iter()
+            .any(|call| matches!(call, Call::Execve { pid: None, .. }))
+        {
+            match self
+                .authority("/internal/login", caller.cookie.as_deref(), &json!({}))
+                .await?
+            {
+                Ok(value) => match serde_json::from_value::<crate::login::Context>(value) {
+                    Ok(context) => Some(context),
+                    Err(_) => {
+                        return Ok(calls
+                            .iter()
+                            .map(|_| Return::Err(Errno::EIO.into()))
+                            .collect());
+                    }
+                },
+                Err(error) => {
+                    return Ok(calls.iter().map(|_| Return::Err(error.clone())).collect());
+                }
+            }
+        } else {
+            None
+        };
         let now = auth::now();
         let ns = caller.ns.clone();
         let asked: Vec<Call> = calls.clone();
@@ -321,7 +438,19 @@ impl Machine {
                         cgroup,
                         ..
                     } => {
-                        let begun = db.exec_begin(
+                        let scope = if pid.is_none() {
+                            match context
+                                .as_ref()
+                                .ok_or(Error::from(Errno::EACCES))
+                                .and_then(|context| db.admit_login(&ns, context, now))
+                            {
+                                Ok(scope) => Some(scope),
+                                Err(error) => return Err(error),
+                            }
+                        } else {
+                            None
+                        };
+                        let mut begun = db.exec_begin(
                             &ns,
                             *pid,
                             token.as_deref(),
@@ -331,6 +460,11 @@ impl Machine {
                             reserved + new,
                             now,
                         );
+                        if let Ok(begun) = &mut begun
+                            && begun.replacing.is_none()
+                        {
+                            begun.scope = scope;
+                        }
                         if matches!(&begun, Ok(begun) if begun.replacing.is_none()) {
                             new += 1;
                         }
@@ -379,6 +513,7 @@ impl Machine {
                     "replacing": begun.replacing,
                     "old": begun.old,
                     "current": begun.current,
+                    "generation": caller.release,
                 }))
             })
             .collect();
@@ -442,6 +577,7 @@ impl Machine {
                 cwd,
                 cgroup,
                 seat,
+                runtime,
                 ..
             } = call
             else {
@@ -464,8 +600,8 @@ impl Machine {
             let path = image["path"].as_str().unwrap_or_default().to_string();
             let (ns, hash) = (caller.ns.clone(), auth::token_hash(&token));
             let row = (begun.clone(), path.clone(), cgroup.clone());
-            let placement =
-                crate::placement::browser(&caller.ns, snapshot.uid, seat.as_deref(), &cgroup);
+            let uid = snapshot.uid;
+            let placement_seat = seat.clone();
             let started = transact(&self.state, move |db| {
                 let (begun, path, cgroup) = row;
                 let started = db.exec_end(
@@ -479,6 +615,7 @@ impl Machine {
                     &cwd,
                     &cgroup,
                     seat.as_deref(),
+                    runtime.as_deref(),
                     now,
                 );
                 if started.is_ok() {
@@ -486,12 +623,19 @@ impl Machine {
                 }
                 (started, true)
             })?;
-            if let Err(error) = started {
-                results.push(Return::Err(error));
-                continue;
-            }
+            let cgroup = match started {
+                Ok(cgroup) => cgroup,
+                Err(error) => {
+                    results.push(Return::Err(error));
+                    continue;
+                }
+            };
+            let placement =
+                crate::placement::browser(&caller.ns, uid, placement_seat.as_deref(), &cgroup);
             results.push(Return::Ok(json!(Exec {
                 pid: begun.pid,
+                boot: Some(begun.boot),
+                login_scope: begun.scope,
                 token,
                 fd: image["fd"].as_u64().map(|fd| fd as u32),
                 asset: image["asset"].as_str().map(str::to_string),
@@ -586,7 +730,15 @@ impl Machine {
         let deadline = transact(&self.state, |db| {
             let retry = (!db.revoking().is_empty() || !db.renewing().is_empty())
                 .then_some(auth::now() + REVOKE_AFTER as u64 / 1000);
-            let next = [retry, db.lease_deadline()].into_iter().flatten().min();
+            let next = [
+                retry,
+                db.lease_deadline(),
+                db.login_deadline(),
+                db.init_deadline(),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             (next, false)
         })?;
         if let Some(deadline) = deadline {
@@ -633,6 +785,7 @@ pub async fn forward(
     let body = json!({
         "ns": ns,
         "cookie": cookie,
+        "release": session.release,
         "sudo": session.sudo,
         "umask": session.umask.unwrap_or(0o022),
         "pid": session.pid,
@@ -693,6 +846,9 @@ fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Err
         ),
         None => None,
     };
+    if caller.as_ref().is_some_and(|row| row.pid == procs::INIT) {
+        registry::permit_reaper(&call)?;
+    }
     let now = auth::now();
     let process = || {
         caller
@@ -708,9 +864,11 @@ fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Err
             .ok_or(Error::from(Errno::EPERM))
     };
     match call {
+        Call::Resource { memory } => db.resource_memory(process()?, memory).map(|_| json!(null)),
         Call::ProcInit { boot } => Ok(db.proc_init(ns, &account()?, boot.as_deref(), now)),
         Call::Fork {
             pid,
+            empty_memory,
             child,
             token: named,
         } => {
@@ -733,7 +891,7 @@ fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Err
                     "fork is called by its parent",
                 ));
             }
-            let forked = db.fork(&row, child, asked.reserved, now)?;
+            let forked = db.fork(&row, child, asked.reserved, now, empty_memory)?;
             db.observe("forks", 1);
             Ok(json!(Forked {
                 pid: forked.pid,
@@ -784,6 +942,19 @@ fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Err
             let row = process()?;
             Ok(json!({ "pid": row.pid, "ppid": row.ppid }))
         }
+        Call::Getpgid { pid } | Call::Getsid { pid } => {
+            let row = db.group_target(process()?, pid)?;
+            Ok(json!({ "pid": row.pid, "ppid": row.ppid, "pgid": row.pgid, "sid": row.sid }))
+        }
+        Call::Setpgid { pid, pgid } => Ok(json!(db.setpgid(process()?, pid, pgid)?)),
+        Call::Setsid => Ok(json!(db.setsid(process()?)?)),
+        Call::ProcSession { processes } => Ok(json!(db.start_session(ns, &processes)?)),
+        Call::ProcStopped { signal } => {
+            db.stopped(process()?, signal)?;
+            Ok(Value::Null)
+        }
+        Call::Prctl { option, value } => db.prctl(process()?, option, value),
+        Call::Waitpid { pid, options } => db.waitpid(process()?, pid, options),
         Call::ProcPoll { pids } => {
             if pids.len() > abi::PROC_POLL_MAX {
                 return Err(Error::because(
@@ -812,10 +983,14 @@ fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Err
             pid: target,
             signal,
         } => {
-            let abi::Target::Pid(target) = abi::Target::of(&target) else {
-                return Err(Errno::ESRCH.into());
-            };
-            db.kill(ns, &account()?, target, signal.unwrap_or(abi::SIGTERM), now)?;
+            db.kill_targets(
+                ns,
+                &account()?,
+                caller.as_ref(),
+                abi::Target::of(&target),
+                signal.unwrap_or(abi::SIGTERM),
+                now,
+            )?;
             Ok(Value::Null)
         }
         Call::Wait {
@@ -830,14 +1005,24 @@ fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Err
             }?;
             Ok(json!(waited))
         }
-        Call::CgroupCreate { path, controllers } => db
-            .cgroup_create(ns, &account()?, &path, controllers.as_deref())
+        Call::CgroupCreate {
+            path,
+            controllers,
+            lifetime,
+        } => db
+            .cgroup_create(
+                ns,
+                &account()?,
+                &path,
+                controllers.as_deref(),
+                lifetime.map(|_| process()).transpose()?,
+            )
             .map(|()| Value::Null),
         Call::CgroupRemove { path } => db
             .cgroup_remove(ns, &account()?, &path)
             .map(|()| Value::Null),
         Call::CgroupSet { path, key, value } => db
-            .cgroup_set(ns, &account()?, &path, &key, &value)
+            .cgroup_set(ns, &account()?, &path, &key, &value, now)
             .map(|()| Value::Null),
         Call::CgroupAttach { pid, path } => db
             .cgroup_attach(ns, &account()?, pid, &path)

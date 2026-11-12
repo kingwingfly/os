@@ -88,18 +88,22 @@ pub fn errno_reply(error: &abi::Error) -> Reply {
 /// token that does not resolve (or is another browser's process's) is refused, never treated
 /// as no header: a process request must act as its snapshot, not as the page signed in later.
 fn process_caller(
-    db: &Db,
+    db: &mut Db,
     token: Option<&str>,
     key: Option<&str>,
     guest: Option<&str>,
+    release: Option<&str>,
 ) -> std::result::Result<Option<crate::creds::Credential>, abi::Error> {
     let Some(token) = token else {
+        crate::system::select(db, release)?;
         return Ok(None);
     };
     let ns = Db::namespace(key, guest);
-    db.credential(token, &ns)
-        .map(Some)
-        .ok_or_else(|| abi::Error::because(abi::Errno::EPERM, "not this browser's process"))
+    let credential = db
+        .credential(token, &ns)
+        .ok_or_else(|| abi::Error::because(abi::Errno::EPERM, "not this browser's process"))?;
+    crate::system::select(db, credential.generation.as_deref())?;
+    Ok(Some(credential))
 }
 pub fn denied(message: &str, who: &Identity) -> Reply {
     let status = if commands::is_permission_error(message) {
@@ -150,6 +154,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
     let endpoint = url.path().to_string();
     let method = req.method();
     let key = auth::token_key(req);
+    let release = req.headers().get("X-OS-Release")?;
     let raw_path = url
         .query_pairs()
         .find(|(k, _)| k == "path")
@@ -166,12 +171,16 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             .unwrap_or_default()
     };
     match (method.clone(), endpoint.as_str()) {
+        (_, "/internal/boot" | "/internal/system-prepared") => {
+            crate::system::internal(req, state).await
+        }
         // System calls (sys.rs): what user space, the page, asks of the kernel.
         (Method::Post, "/api/sys") => crate::sys::handle(req, env, state, key).await,
         // What each browser's machine asks of the authority (creds.rs): never a browser's.
         (
             Method::Post,
-            "/internal/exec" | "/internal/identity" | "/internal/revoke" | "/internal/tell",
+            "/internal/exec" | "/internal/identity" | "/internal/login" | "/internal/revoke"
+            | "/internal/tell",
         ) => Ok(crate::creds::internal(req, state, &endpoint)
             .await?
             .unwrap_or_else(|| Reply::error("Not found", 404))),
@@ -193,6 +202,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     proc_token.as_deref(),
                     key.as_deref(),
                     guest.as_deref(),
+                    release.as_deref(),
                 ) {
                     Ok(row) => row,
                     Err(error) => return errno_reply(&error).keep(),
@@ -225,8 +235,8 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     return Reply::ok(json!({ "generated": text }));
                 }
                 if node.is_device() {
-                    if crate::dev::bytes(db, &real).is_some() {
-                        return Reply::ok(json!({ "generated": "" }));
+                    if let Some(device) = crate::dev::bytes(db, &real) {
+                        return Reply::ok(json!({ "byte_device": device.name() }));
                     }
                     return match crate::dev::read(db, &who, sid.as_deref(), &real) {
                         Some(state) => Reply::ok(json!({ "device": state })),
@@ -237,7 +247,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     return Reply::error("This is a directory", 400);
                 };
                 // /usr's binaries are the build's, in the Worker's assets.
-                if let Some(asset) = crate::usr::asset(&id) {
+                if let Some(asset) = crate::system::asset(&id) {
                     return Reply::ok(json!({ "asset": asset, "size": node.size }));
                 }
                 let Some(file) = db.file(&id) else {
@@ -266,6 +276,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     proc_token.as_deref(),
                     key.as_deref(),
                     guest.as_deref(),
+                    release.as_deref(),
                 ) {
                     Ok(row) => row,
                     Err(error) => return errno_reply(&error).keep(),
@@ -312,6 +323,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     proc_token.as_deref(),
                     key.as_deref(),
                     guest.as_deref(),
+                    release.as_deref(),
                 ) {
                     Ok(row) => row,
                     Err(error) => return errno_reply(&error).keep(),
@@ -350,6 +362,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     proc_token.as_deref(),
                     key.as_deref(),
                     guest.as_deref(),
+                    release.as_deref(),
                 ) {
                     Ok(row) => row,
                     Err(error) => return errno_reply(&error).keep(),
@@ -487,8 +500,8 @@ fn job_reply(
                 return Reply::error("The job does not read that file", 403);
             }
             // A binary of /usr (or a copy sharing it) is the build's: the Worker's asset.
-            if let Some(asset) = crate::usr::asset(file) {
-                return Reply::ok(json!({"asset": asset, "size": crate::usr::size(file)}));
+            if let Some(asset) = crate::system::asset(file) {
+                return Reply::ok(json!({"asset": asset, "size": crate::system::size(file)}));
             }
             let Some(f) = db.file(file) else {
                 return Reply::error("File content does not exist", 404);

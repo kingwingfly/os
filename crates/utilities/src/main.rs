@@ -4,6 +4,8 @@ use os_core::{bin, cli, text};
 use os_userland::{Io, Sys};
 use std::io::{self, BufRead, Write};
 mod accelerator;
+mod imagectl;
+mod providerctl;
 mod xargs;
 
 struct Os;
@@ -30,6 +32,46 @@ impl Sys for Os {
                     _ => abi::Errno::EIO,
                 },
                 error.to_string(),
+            )
+        })
+    }
+    async fn write(&self, path: &str, bytes: &[u8]) -> Result<(), abi::Error> {
+        // Descriptor writes use the runtime's chunked byte transport, independent of
+        // the inline syscall limit. Explicit close observes the final commit error.
+        let write = || -> io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path)?;
+            let result = file.write_all(bytes);
+            #[cfg(target_os = "wasi")]
+            {
+                use std::os::wasi::io::IntoRawFd;
+                #[link(wasm_import_module = "wasi_snapshot_preview1")]
+                unsafe extern "C" {
+                    fn fd_close(fd: u32) -> u32;
+                }
+                // SAFETY: ownership transfers from File to this one close operation.
+                let errno = unsafe { fd_close(file.into_raw_fd() as u32) };
+                result?;
+                if errno != 0 {
+                    return Err(io::Error::from_raw_os_error(errno as i32));
+                }
+                Ok(())
+            }
+            #[cfg(not(target_os = "wasi"))]
+            {
+                result
+            }
+        };
+        write().map_err(|e| {
+            abi::Error::because(
+                match e.kind() {
+                    io::ErrorKind::PermissionDenied => abi::Errno::EACCES,
+                    io::ErrorKind::NotFound => abi::Errno::ENOENT,
+                    _ => abi::Errno::EIO,
+                },
+                e.to_string(),
             )
         })
     }
@@ -83,6 +125,20 @@ fn main() {
             1
         });
         std::process::exit(status);
+    }
+    if args[0] == "imagectl" {
+        if let Err(error) = imagectl::run(&args[1..]) {
+            eprintln!("imagectl: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args[0] == "providerctl" {
+        if let Err(error) = providerctl::run(&args[1..]) {
+            eprintln!("providerctl: {error}");
+            std::process::exit(1);
+        }
+        return;
     }
     if args[0] == "grep" {
         let status = match grep(&args[1..]) {

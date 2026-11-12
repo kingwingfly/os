@@ -1,19 +1,22 @@
+import { verifyRelease } from './release.js';
 import { inspectFaststart } from './faststart.mjs';
 import { uploadFile, Cancelled } from './upload.mjs';
 import { record, clock } from './record.mjs';
 import { speak, listen as hearLive } from './sound.mjs';
 import * as dev from './dev.mjs';
-import { exec } from './kernel/page.js';
+import { exec, closeConsole, grantConsole, revokeConsole, attachConsole, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive } from './kernel/page.js';
 import { kernelCall } from './kernel/protocol.js';
 import { answered as resultOf, call, sys } from './http.mjs';
 import { migratePreferences } from './compat.mjs';
+import { installConsoleSharing } from './console-sharing.js';
+import { installApplications } from './application-windows.js';
 
 for (const name of ['localStorage', 'sessionStorage']) {
   try { migratePreferences(window[name]); } catch { /* storage can be disabled or full */ }
 }
 
 let configuration;
-export const ready = fetch('/os-config.json').then(async response => {
+export const ready = verifyRelease().then(() => fetch('/os-config.json')).then(async response => {
   if (!response.ok) throw new Error('Cannot read OS configuration');
   configuration = await response.json();
   document.title = configuration.branding.name + configuration.branding.subtitle;
@@ -237,9 +240,14 @@ function followAgain(name, presentation, sound) {
 // A speaker view, which a deck's S opened (viewer.rs): it shows the deck its address names once
 // the terminal runs.
 export function started() {
+  installConsoleSharing();
+  const applications = installApplications();
+  Object.assign(window.os, { applications: applications.list, launchApplication: applications.launch, stopApplication: applications.stop });
   // The client kernel: the browser's SharedWorker, or, where a browser has none, this tab's own
   // dedicated Worker (web/kernel/protocol.js).
-  void kernelCall('init').catch(() => {});
+  void loginSession().catch(() => {});
+  void machineInit().catch(() => {});
+  void seatStatus().catch(() => {});
   const files = $('window-files');
   if (files) new ResizeObserver(measureNames).observe(files);
   const deck = new URLSearchParams(location.search).get('speaker');
@@ -252,6 +260,7 @@ export function started() {
 const windows = 'BroadcastChannel' in window ? new BroadcastChannel('os-session') : null;
 if (windows) windows.onmessage = () => void identityChanged('window');
 async function identityChanged(reason = null) {
+  window.dispatchEvent(new Event('os:login-changed'));
   if (!reason) changingSession = 0;
   // A new account hears of what it may list: the line opens again with its session.
   listen();
@@ -960,7 +969,7 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.os = { config: () => configuration.branding, exec, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionCursor: () => $('command')?.selectionStart ?? 0, completionFocus: (value, cursor) => {
+window.os = { loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, config: () => configuration.branding, exec, closeConsole, grantConsole, revokeConsole, attachConsole, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionCursor: () => $('command')?.selectionStart ?? 0, completionFocus: (value, cursor) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]:modal')) return;
@@ -1010,7 +1019,7 @@ function restoreTerminalFocus() {
     const input = $('command');
     // Not while a password is asked, nor from another window that has the keyboard (the Files,
     // the preview, the editor), nor while a command runs.
-    if (document.querySelector('dialog[open]:modal') || otherWindow() || document.activeElement?.closest?.('dialog[open], .window:not(#window-terminal)') || (!input?.closest('[data-pty="true"]') && !['idle', 'answer', 'input'].includes(input?.closest('form')?.dataset.state))) return;
+    if (input?.disabled || document.querySelector('dialog[open]:modal') || otherWindow() || document.activeElement?.closest?.('dialog[open], .window:not(#window-terminal)') || (!input?.closest('[data-pty="true"]') && !['idle', 'answer', 'input'].includes(input?.closest('form')?.dataset.state))) return;
     // After closing a modal Chromium can report this input as active while its
     // native text-editing focus still belongs to the closed dialog. Reacquire it.
     if (resetTerminalFocus && document.activeElement === input) input.blur();
@@ -1018,7 +1027,7 @@ function restoreTerminalFocus() {
     input?.focus({ preventScroll: true });
   });
 }
-for (const id of ['auth', 'editor']) {
+for (const id of ['auth', 'editor', 'console-share', 'applications']) {
   $(id).addEventListener('close', () => { resetTerminalFocus = true; restoreTerminalFocus(); });
 }
 
@@ -1034,7 +1043,7 @@ document.addEventListener('keydown', event => {
   if (up) { if (!up.contains(document.activeElement)) up.focus({ preventScroll: true }); return; }
   if (!(target instanceof Element) || (target.closest('input,textarea,select,[contenteditable="true"]') && target.getClientRects().length) || window.getSelection()?.toString()) return;
   if (target.closest('button,a') && ['Enter', ' ', 'Tab'].includes(event.key)) return;
-  const input = $('command'); if (!input || (!input.closest('[data-pty="true"]') && !['idle', 'answer', 'input'].includes(input.closest('form')?.dataset.state))) return;
+  const input = $('command'); if (!input || input.disabled || (!input.closest('[data-pty="true"]') && !['idle', 'answer', 'input'].includes(input.closest('form')?.dataset.state))) return;
   if (event.key.length === 1) {
     event.preventDefault(); input.focus({ preventScroll: true });
     input.setRangeText(event.key, input.selectionStart ?? input.value.length, input.selectionEnd ?? input.value.length, 'end');

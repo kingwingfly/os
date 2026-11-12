@@ -14,7 +14,8 @@ watch_dir = ["crates/worker/src", "crates/core/src"]
 [assets]
 directory = "./dist"
 binding = "ASSETS"
-run_worker_first = ["/api/*"]
+run_worker_first = ["/api/*", "/boot/*", "/", "/index.html", "/login", "/login.html", "/shell", "/shell.html", "/console", "/console.html"]
+html_handling = "none"
 
 [[r2_buckets]]
 binding = "FILES"

@@ -12,6 +12,7 @@
 //! by passing a descriptor that writes the presentation to the guest's session (present.rs);
 //! an account, by an ACL entry.
 pub mod accelerator;
+pub mod bytes;
 pub mod present;
 pub mod realtime;
 pub mod snd;
@@ -53,12 +54,23 @@ pub fn ensure(db: &mut Db) {
         }
     }
     for (path, driver) in [
+        (crate::system::DEVICE, "system"),
         ("/dev/null", "null"),
+        ("/dev/zero", "zero"),
+        ("/dev/full", "full"),
+        ("/dev/random", "random"),
+        ("/dev/urandom", "urandom"),
         (abi::accelerator::ARCHIVE, "archive"),
         (abi::accelerator::MEDIA, "media"),
     ] {
         if db.node(path).is_none() {
-            let mut node = Node::file(0, 0, 0o666, String::new(), 0);
+            let mut node = Node::file(
+                0,
+                0,
+                if driver == "system" { 0o644 } else { 0o666 },
+                String::new(),
+                0,
+            );
             node.file = None;
             node.rdev = Some(driver.into());
             db.set_node(path, &node);
@@ -306,8 +318,9 @@ pub fn read(db: &Db, who: &Identity, sid: Option<&str>, path: &str) -> Option<Va
 }
 
 /// Stateless byte devices bypass the JSON state used by interactive media devices.
-pub fn bytes(db: &Db, path: &str) -> Option<Vec<u8>> {
-    (db.device(path).is_some() && db.node(path)?.rdev.as_deref() == Some("null")).then(Vec::new)
+pub fn bytes(db: &Db, path: &str) -> Option<bytes::ByteDevice> {
+    db.device(path)?;
+    bytes::ByteDevice::named(db.node(path)?.rdev.as_deref()?)
 }
 
 /// The name a session goes by to a presenter: its account's, `guest` for one signed out.
@@ -379,6 +392,7 @@ pub fn ioctl(
 ) -> Result<Value> {
     match request.node.rdev.as_deref() {
         Some("archive" | "media") => accelerator::ioctl(db, process, request, op, arg),
+        Some("system") => crate::system::control(db, process, request, op, arg),
         Some("present") => present::ioctl(db, process, request, op, arg),
         _ => Err(not_for(op)),
     }
