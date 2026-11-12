@@ -12,8 +12,10 @@ export function entryPath(path) { return path.replace(/^\/boot\/releases\/[a-f0-
 // Selecting an active release in a redirect would mix generations during recovery.
 export function entry(path) {
   const pinned = asset(path);
-  return !prefix && new URLSearchParams(globalThis.location?.search).get('recovery') === '1'
-    ? pinned + '?recovery=1' : pinned;
+  if (prefix || new URLSearchParams(globalThis.location?.search).get('recovery') !== '1') return pinned;
+  const target = new URL(pinned, location.href);
+  target.searchParams.set('recovery', '1');
+  return target.pathname + target.search + target.hash;
 }
 
 // Includes wasm-bindgen's HTTP calls and all browser applications. Dedicated Workers

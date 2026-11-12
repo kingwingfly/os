@@ -154,7 +154,10 @@ test('explicit end-session stops real workloads across tabs while ordinary sign-
   await run(page, 'older', 'echo OLD-READY; sleep 120');
   await expect.poll(() => page.evaluate(() => window.older.output)).toContain('OLD-READY');
   await api(page.request, 'logout');
-  await expect.poll(async () => (await state(page)).session?.uid, { timeout: 15000 }).not.toBe(0);
+  await expect.poll(async () => {
+    const status = await state(page);
+    return status.connected && status.coordinator && status.session?.uid !== 0;
+  }, { timeout: 15000 }).toBe(true);
   const second = await context.newPage(); await ready(second);
   for (const [host, key] of [[page, 'first'], [second, 'second']]) {
     await run(host, key, "trap 'echo CLEAN; exit 0' HUP TERM; echo READY; while :; do sleep 1; done");
@@ -165,6 +168,10 @@ test('explicit end-session stops real workloads across tabs while ordinary sign-
   await expect.poll(() => page.evaluate(() => window.first.output), { timeout: 15000 }).toContain('CLEAN');
   await expect.poll(() => second.evaluate(() => window.second.output), { timeout: 15000 }).toContain('CLEAN');
   await expect.poll(async () => (await login(page.request)).shutdown.complete).toBe(true);
+  await expect.poll(async () => {
+    const status = await state(page);
+    return { connected: status.connected, shutdown: status.session?.shutdown?.complete, coordinator: status.coordinator };
+  }, { timeout: 15000 }).toEqual({ connected: true, shutdown: true, coordinator: false });
   expect(await page.evaluate(() => window.older.result)).toBeUndefined();
   await second.evaluate(expected => window.os.restartLoginSession(expected), current);
   await run(second, 'replacement', 'echo NEW-SCOPE');

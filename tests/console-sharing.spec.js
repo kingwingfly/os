@@ -68,20 +68,25 @@ test('an attached interactive shell uses the existing ANSI renderer, resize and 
   await expect(other.locator('.terminal-screen[data-alternate="true"]')).toBeVisible();
   await other.keyboard.type("printf '\\033[?1049l'"); await other.keyboard.press('Enter');
   await expect(other.locator('.terminal-screen')).toHaveAttribute('data-alternate', 'false');
-  await other.keyboard.type('stty size'); await other.keyboard.press('Enter');
-  await expect(other.locator('.terminal-screen')).toContainText(/\n\d+ \d+\n/);
-  const before = (await other.locator('.terminal-screen').textContent()).match(/\n(\d+ \d+)\n/)[1];
+  let sample = 0;
+  const size = async () => {
+    const marker = `SIZE_${++sample}`;
+    await other.keyboard.type(`stty size; printf '${marker}\\n'`); await other.keyboard.press('Enter');
+    const completed = new RegExp(`\\n(\\d+ \\d+)\\n${marker}\\n\\$\\s*$`);
+    await expect(other.locator('.terminal-screen')).toContainText(completed);
+    return (await other.locator('.terminal-screen').textContent()).match(completed)[1];
+  };
+  const before = await size();
   await other.setViewportSize({ width: 700, height: 480 });
   // ResizeObserver and the remote driver update asynchronously. Ask for a fresh
-  // observation on each attempt instead of polling one earlier stty result.
-  await expect.poll(async () => {
-    await other.keyboard.type('stty size'); await other.keyboard.press('Enter');
-    return [...(await other.locator('.terminal-screen').textContent()).matchAll(/\n(\d+ \d+)\n/g)].at(-1)?.[1] ?? before;
-  }).not.toBe(before);
+  // observation on each attempt, waiting for its result and prompt before sending
+  // another command. Polling stale output must not queue additional shell input.
+  await expect.poll(size).not.toBe(before);
   await other.keyboard.type('sleep 60'); await other.keyboard.press('Enter');
   await expect.poll(async () => (await call(page.request, { proc_poll: { pids: [] } })).some(row => row.argv[0] === 'sleep')).toBe(true);
   await other.keyboard.press('Control+c');
-  await expect(other.locator('.terminal-screen')).toHaveText(/\$\s*$/);
+  await expect.poll(async () => (await call(page.request, { proc_poll: { pids: [] } })).some(row => row.argv[0] === 'sleep')).toBe(false);
+  await expect(other.locator('.terminal-screen')).toContainText(/\^C\n\$\s*$/);
   await other.keyboard.type('echo after-interrupt'); await other.keyboard.press('Enter');
   await expect(other.locator('.terminal-screen')).toContainText(/\nafter-interrupt/);
   await other.keyboard.type('exit'); await other.keyboard.press('Enter');

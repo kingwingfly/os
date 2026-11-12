@@ -51,6 +51,20 @@ test('Applications opens a ready shell with real processes and preserves output 
   await child.screenshot({ path: '/home/ai/os-gui-supervision-validation/managed-shell.png' });
 });
 
+test('recovery Applications keeps managed shells on fallback assets and retains lifecycle control', async ({ page }) => {
+  await page.goto('/?recovery=1'); await page.waitForFunction(() => !!window.os?.applications);
+  const child = await open(page, false);
+  await expect.poll(() => {
+    const url = new URL(child.url());
+    return { fallback: /^\/shell(?:\.html)?$/.test(url.pathname), managed: url.searchParams.get('managed'), recovery: url.searchParams.get('recovery') };
+  }).toEqual({ fallback: true, managed: '1', recovery: '1' });
+  await expect.poll(async () => (await records(page))[0]?.state, { timeout: 45000 }).toBe('ready');
+  await command(child, 'echo RECOVERY-SHELL', /\nRECOVERY-SHELL\n/);
+  await page.locator('[data-application]').getByRole('button', { name: 'Stop', exact: true }).click();
+  await closed(child);
+  expect((await records(page))[0].state).toBe('stopped');
+});
+
 test('Stop waits for shell cleanup and does not end an independent desktop command', async ({ page }) => {
   await page.evaluate(() => { window.independent = window.os.exec([['/usr/bin/sleep', '30']], { onJob: group => { window.independentGroup = group; } }); });
   const child = await open(page);

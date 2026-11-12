@@ -49,6 +49,31 @@ test('an unavailable authority removes coordinator status and a stale lease rejo
   } finally { await c.stop(); }
 });
 
+test('a coordinator observes shutdown from another host and follows an explicit restart', async () => {
+  let phase = 'running'; const calls = [];
+  const c = create({ call: async action => {
+    calls.push(action.op);
+    if (action.op === 'leave') return null;
+    if (phase !== 'running' && action.op === 'renew') throw { errno: 'EBUSY' };
+    if (phase === 'restarted' && action.member?.session === 'session') throw { errno: 'ESTALE' };
+    if (phase === 'running') return view();
+    if (phase === 'restarted') return view('replacement', 'other', 1);
+    return { ...view('session', null), shutdown: { complete: phase === 'ended' } };
+  } });
+  try {
+    await c.tick(); assert.equal(c.current().coordinator, true);
+    phase = 'stopping'; await c.tick();
+    assert.equal(c.current().connected, true);
+    assert.equal(c.current().coordinator, false);
+    assert.equal(c.current().session.shutdown.complete, false);
+    assert.throws(() => c.capture({ session: 'session', generation: 1 }), e => e.errno === 'EACCES');
+    phase = 'ended'; await c.tick(); assert.equal(c.current().session.shutdown.complete, true);
+    assert.equal(calls.includes('claim'), false);
+    phase = 'restarted'; await c.tick(); assert.equal(c.current().session.id, 'replacement');
+    assert.equal(c.current().connected, true); assert.equal(c.current().coordinator, false);
+  } finally { await c.stop(); }
+});
+
 test('losing a concurrent claim observes the winner without retrying a stale generation', async () => {
   const calls = [];
   const c = create({ call: async action => {

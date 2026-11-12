@@ -860,12 +860,15 @@ pub async fn checked_asset(req: Request, env: &Env) -> worker::Result<Response> 
     // Revalidate revocation on each request; retain immutable bytes without promising a
     // year of cached execution after an operator revokes a publisher.
     headers.set("Cache-Control", "no-cache")?;
-    headers.set("ETag", &format!("\"{expected}\""))?;
+    let etag = format!("\"{expected}\"");
+    headers.set("ETag", &etag)?;
     headers.set("Accept-Ranges", "bytes")?;
-    if req.headers().get("If-None-Match")?.as_deref() == Some(&format!("\"{expected}\"")) {
+    if req.headers().get("If-None-Match")?.as_deref() == Some(&etag) {
         return Ok(Response::empty()?.with_status(304).with_headers(headers));
     }
     let range = req.headers().get("Range")?;
+    let if_range = req.headers().get("If-Range")?;
+    let range = range.filter(|_| if_range.as_ref().is_none_or(|value| value == &etag));
     let (start, end, status) = if let Some(range) = range {
         match os_core::byte_range(&range, bytes.len() as u64) {
             Some((a, b)) => {

@@ -28,6 +28,22 @@ const read = async (request, path, id, options = {}) => {
   return Buffer.from(result.data, 'base64').toString();
 };
 
+test('signed asset range requests require a matching strong If-Range validator', async ({ request }) => {
+  const path = `/boot/releases/${ids.b}/assets/index.html`;
+  const original = await request.get(path);
+  expect(original.status()).toBe(200);
+  const bytes = await original.body(), etag = original.headers().etag;
+  for (const url of [path, `/boot/blobs/${etag.slice(1, -1)}`]) {
+    const matching = await request.get(url, { headers: { Range: 'bytes=0-6', 'If-Range': etag } });
+    expect(matching.status()).toBe(206); expect(await matching.body()).toEqual(bytes.subarray(0, 7));
+    for (const validator of ['"stale"', 'W/' + etag]) {
+      const stale = await request.get(url, { headers: { Range: 'bytes=0-6', 'If-Range': validator } });
+      expect(stale.status()).toBe(200); expect(await stale.body()).toEqual(bytes);
+      expect(stale.headers()['content-range']).toBeUndefined();
+    }
+  }
+});
+
 test('signed boot filenames preserve Unicode and URL delimiters through staging and byte responses', async ({ request }) => {
   test.setTimeout(180_000);
   await login(request); const fd = await open(request);

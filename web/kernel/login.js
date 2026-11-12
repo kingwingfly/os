@@ -94,7 +94,9 @@ export class LoginCoordinator {
     } catch (error) {
       if (epoch !== this.epoch || this.stopped) return this.current();
       this.connected = false; this.notify();
-      if (member && ['ESTALE', 'EACCES'].includes(error.errno)) {
+      // Ending a login revokes coordination before it expires membership. Renew
+      // then returns EBUSY; rejoin as an observer so remote shutdown is visible.
+      if (member && ['ESTALE', 'EACCES', 'EBUSY'].includes(error.errno)) {
         this.retire(); await this.cleanup();
         if (recover) return this.step(false);
       }

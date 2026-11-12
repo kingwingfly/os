@@ -60,6 +60,8 @@ test('recovery navigation keeps child entry points on the same fallback generati
     const f=await import(`../web/release.js?test=${sequence++}`);
     assert.equal(f.entry('/console.html'),'/console.html?recovery=1');
     assert.equal(f.entry('/shell.html'),'/shell.html?recovery=1');
+    assert.equal(f.entry('/shell.html?managed=1#status'),'/shell.html?managed=1&recovery=1#status');
+    assert.equal(f.entry('/shell.html?managed=1&recovery=0'),'/shell.html?managed=1&recovery=1');
     assert.equal(f.asset('/client-kernel.js'),'/client-kernel.js');
   }finally{globalThis.location=saved.location;globalThis.__osReleaseFetch=saved.flag;}
 });
