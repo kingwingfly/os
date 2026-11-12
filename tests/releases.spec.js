@@ -28,6 +28,28 @@ const read = async (request, path, id, options = {}) => {
   return Buffer.from(result.data, 'base64').toString();
 };
 
+test('signed boot filenames preserve Unicode and URL delimiters through staging and byte responses', async ({ request }) => {
+  test.setTimeout(180_000);
+  await login(request); const fd = await open(request);
+  try {
+    expect((await ioctl(request, fd, { op: 'stage', id: ids.encoded })).state).toBe('verified');
+    const prefix = `/boot/releases/${ids.encoded}/assets/`;
+    for (const name of fixtures.encodedPaths) {
+      const path = prefix + encodeURIComponent(name);
+      const response = await request.get(path);
+      expect(response.status(), name).toBe(200);
+      expect(await response.text()).toBe('encoded asset contents\n');
+      const range = await request.get(path, { headers: { Range: 'bytes=0-6' } });
+      expect(range.status(), name).toBe(206); expect(await range.text()).toBe('encoded');
+      expect((await request.get(path, { headers: { 'If-None-Match': response.headers().etag } })).status()).toBe(304);
+      expect((await request.head(path)).status()).toBe(200);
+    }
+    for (const path of ['literal%2Fname.txt', 'bad%00name.txt', 'bad%FFname.txt', '%2Fplain.txt']) {
+      expect((await request.get(prefix + path)).status(), path).toBe(409);
+    }
+  } finally { await ok(request, { close: { fd } }); }
+});
+
 test('only authenticated root can stage; signatures, bytes and schema fail closed', async ({ request }) => {
   await call(request, 'getcreds');
   expect((await answer(request, { open: { path: '/dev/system', flags: 2 } })).err?.errno).toBe('EACCES');

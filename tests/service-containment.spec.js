@@ -112,10 +112,10 @@ async function start(page,units,{journal=false,shell=false,check=false}={}) {
   const path=base+'/units.json';
   expect((await put(page.request,'/api/file?path='+path+'&overwrite=true',{data:JSON.stringify({version:1,units})})).ok()).toBe(true);
   await page.evaluate(({path,journal,shell,check})=>{
-    const run=window.contained={output:''};
+    const run=window.contained={output:'',lengths:[0,0,0]};
     const argv=['supervise',...(journal?['--journal',journal]:[]),...(check?['--check']:[]),path];
     const command=shell?{path:'/usr/bin/sh',argv:['sh','-c','supervise "$1" & wait','sh',path]}:{path:'/usr/bin/supervise',argv};
-    run.done=window.os.exec([command],{tty:true,stdin:'',onOutput:(_fd,s)=>{run.output=(run.output+s).slice(-262144);},onJob:j=>{run.job=j;}}).then(r=>{run.result=r;},e=>{run.error=String(e);});
+    run.done=window.os.exec([command],{tty:true,stdin:'',onOutput:(fd,s)=>{run.output=(run.output+s).slice(-262144);run.lengths[fd]+=s.length;},onJob:j=>{run.job=j;}}).then(r=>{run.result=r;},e=>{run.error=String(e);});
   },{path,journal:journal?base+'/journal':null,shell,check});
 }
 const output=page=>page.evaluate(()=>window.contained.output.replace(/\r\n/g,'\n'));
@@ -193,10 +193,11 @@ test('journals preserve distinct stdout stderr and lifecycle records with exact 
   await setup(page);
   try {
     await start(page,[unit('alpha',['sh','-c',"printf '\\360\\237\\246\\200\\000\\377'; printf error >&2"]),unit('beta',['printf','BETA'])],{journal:true});
-    await done(page);
+    const terminal = await done(page);
+    expect(terminal).toContain('BETA'); expect(terminal).toContain('error');
     for(const [i,name] of ['alpha','beta'].entries()) {
       const r=await page.request.get('/api/file?path='+base+`/journal/${i}-${name}.jsonl`);expect(r.ok()).toBe(true);
-      const records=(await r.text()).trim().split('\n').map(JSON.parse);expect(records[0]).toMatchObject({format:'os.service-journal',unit:name,dropped:0});
+      const records=(await r.text()).trim().split('\n').map(JSON.parse);expect(records[0]).toMatchObject({format:'os.service-journal',unit:name,dropped:0,forwarding_dropped_bytes:[0,0]});
       const bytes=stream=>Buffer.concat(records.filter(r=>r.stream===stream).map(r=>Buffer.from(r.data,'base64')));
       expect(bytes('stdout')).toEqual(name==='alpha'?Buffer.from([240,159,166,128,0,255]):Buffer.from('BETA'));
       expect(bytes('stderr').toString()).toBe(name==='alpha'?'error':'');
@@ -215,8 +216,144 @@ test('noisy journals rotate complete records and retain the final output within 
     const r=await page.request.get('/api/file?path='+base+'/journal/0-noisy.jsonl');const bytes=await r.body();expect(bytes.length).toBeLessThanOrEqual(65536);
     const records=bytes.toString().trim().split('\n').map(JSON.parse);expect(records[0].dropped).toBeGreaterThan(0);
     for(const stream of ['stdout','stderr']) expect(Buffer.concat(records.filter(r=>r.stream===stream).map(r=>Buffer.from(r.data,'base64'))).toString()).toContain('FINAL_'+stream.toUpperCase());
+    // This ASCII/NUL burst may outrun live forwarding. Every missing byte must
+    // be counted, including pending output discarded at supervisor exit.
+    expect(await page.evaluate(()=>window.contained.lengths[1]) + records[0].forwarding_dropped_bytes[0]).toBe(300012);
     expect(records.slice(1).every((r,i,a)=>i===0||r.sequence===a[i-1].sequence+1)).toBe(true);
   }finally{await cleanup(page);}
+});
+
+for (const reader of ['blocked', 'closed']) for (const blocked of ['stdout', 'stderr']) test(`a ${reader} ${blocked} reader cannot delay readiness or shutdown escalation`, async ({ page }) => {
+  test.setTimeout(90000);
+  await setup(page);
+  try {
+    const path = base + '/units.json', journal = base + '/journal';
+    const units = [
+      unit('noisy', ['sh', '-c', `trap '' TERM; yes${blocked === 'stderr' ? ' >&2' : ''}`], { stop_timeout_ms: 100 }),
+      unit('silent', ['sh', '-c', "trap '' TERM; while :; do sleep 1; done"], { readiness: 'notify', startup_timeout_ms: 3000, stop_timeout_ms: 100 }),
+    ];
+    expect((await put(page.request, '/api/file?path=' + path, { data: JSON.stringify({ version: 1, units }) })).ok()).toBe(true);
+    await page.evaluate(({ path, journal, blocked, reader }) => {
+      const run = window.contained = { output: '' };
+      run.done = window.os.exec([{ path: '/usr/bin/sh', argv: ['sh', '-c', `(supervise --journal "$1" "$2"${blocked === 'stderr' ? ' 2>&1' : ''}; printf '%s' "$?" > "$3") | ${reader === 'closed' ? 'head -c 1' : 'sleep 60'}`, 'sh', journal, path, path + '.status'] }], {
+        tty: true, stdin: '', onOutput: (_, s) => { run.output = (run.output + s).slice(-262144); }, onJob: j => { run.job = j; },
+      }).then(r => { run.result = r; }, e => { run.error = String(e); });
+    }, { path, journal, blocked, reader });
+    const records = async name => {
+      const response = await page.request.get('/api/file?path=' + encodeURIComponent(journal + '/' + name));
+      return response.ok() ? (await response.text()).trim().split('\n').map(JSON.parse) : [];
+    };
+    const events = async name => (await records(name)).map(r => r.text ?? '').join('\n');
+    await expect.poll(() => events('1-silent.jsonl'), { timeout: 30000 }).toContain('startup deadline exceeded');
+    await expect.poll(() => events('1-silent.jsonl'), { timeout: 15000 }).toContain('signal 9');
+    const groups = (await result(page.request, { cgroup_list: { path: '/user' } })).filter(p => p.startsWith('/user/supervise-'));
+    expect(groups.length).toBeGreaterThan(0);
+    const pid = groups[0].split('/supervise-')[1].split('-')[0];
+    await result(page.request, { kill: { pid, signal: 15 } });
+    // Draining the remaining noisy pipe can rotate lifecycle records out of its
+    // bounded journal. Observe the supervisor's exit and containment directly.
+    await expect.poll(async () => {
+      const response = await page.request.get('/api/file?path=' + encodeURIComponent(path + '.status'));
+      return response.ok() ? response.text() : '';
+    }, { timeout: 15000 }).toBe('143');
+    await expect.poll(async () => (await result(page.request, { cgroup_list: { path: '/user' } })).filter(p => p.startsWith('/user/supervise-')), { timeout: 15000 }).toEqual([]);
+    expect((await records('0-noisy.jsonl'))[0].forwarding_dropped_bytes[blocked === 'stdout' ? 0 : 1]).toBeGreaterThan(0);
+  } finally { await cleanup(page); }
+});
+
+test('supervision never changes the parent shell output flags, including after SIGKILL', async ({ page }) => {
+  await setup(page);
+  const module = binaryen.parseText(`(module
+    (import "wasi_snapshot_preview1" "fd_fdstat_get" (func $stat (param i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+    (memory (export "memory") 1)
+    (func (export "_start")
+      (if (call $stat (i32.const 1) (i32.const 0)) (then unreachable))
+      (if (i32.and (i32.load16_u (i32.const 2)) (i32.const 4)) (then (call $exit (i32.const 1))))
+      (if (call $stat (i32.const 2) (i32.const 0)) (then unreachable))
+      (if (i32.and (i32.load16_u (i32.const 2)) (i32.const 4)) (then (call $exit (i32.const 2))))))`);
+  try {
+    const checker = base + '/flags', path = base + '/units.json', journal = base + '/journal';
+    expect((await put(page.request, '/api/file?path=' + checker, { data: Buffer.from(module.emitBinary()) })).ok()).toBe(true);
+    await call(page.request, { chmod: { path: checker, mode: 0o755 } });
+    expect((await put(page.request, '/api/file?path=' + path, { data: JSON.stringify({ version: 1, units: [unit('idle', ['sleep', '60'])] }) })).ok()).toBe(true);
+    await page.evaluate(({ checker, path, journal }) => {
+      const run = window.contained = { output: '' };
+      run.done = window.os.exec([{ path: '/usr/bin/sh', argv: ['sh', '-c', 'supervise --journal "$1" "$2" & pid=$!; while [ ! -f "$1/0-idle.jsonl" ]; do sleep 0.1; done; "$3"; before=$?; kill -KILL "$pid"; wait "$pid"; "$3"; after=$?; test "$before" -eq 0 && test "$after" -eq 0', 'sh', journal, path, checker] }], {
+        tty: true, stdin: '', onOutput: (_, s) => { run.output += s; }, onJob: j => { run.job = j; },
+      }).then(r => { run.result = r; }, e => { run.error = String(e); });
+    }, { checker, path, journal });
+    await done(page);
+  } finally { module.dispose(); await cleanup(page); }
+});
+
+test('pipe flags share across dup and fork, reopen independently, and support nonblocking writes', async ({ page }) => {
+  await setup(page);
+  const module = binaryen.parseText(`(module
+    (import "wasix_32v1" "fd_pipe" (func $pipe (param i32 i32) (result i32)))
+    (import "wasix_32v1" "fd_dup2" (func $dup (param i32 i32) (result i32)))
+    (import "wasix_32v1" "proc_fork" (func $fork (param i32 i32) (result i32)))
+    (import "os" "waitpid2" (func $wait (param i32 i32 i32) (result i32)))
+    (import "os" "open" (func $open (param i32 i32 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_fdstat_set_flags" (func $flags (param i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_fdstat_get" (func $stat (param i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_read" (func $read (param i32 i32 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+    (memory (export "memory") 2)
+    (data (i32.const 200) "/proc/self/fd/50")
+    (func $ok (param $e i32) (if (local.get $e) (then unreachable)))
+    (func $equal (param $a i32) (param $b i32) (if (i32.ne (local.get $a) (local.get $b)) (then unreachable)))
+    (func (export "_start")
+      (call $ok (call $pipe (i32.const 32) (i32.const 36)))
+      (call $ok (call $flags (i32.load (i32.const 32)) (i32.const 4)))
+      (call $ok (call $flags (i32.load (i32.const 36)) (i32.const 4)))
+      (i32.store (i32.const 0) (i32.const 1024)) (i32.store (i32.const 4) (i32.const 65536))
+      (call $equal (call $read (i32.load (i32.const 32)) (i32.const 0) (i32.const 1) (i32.const 8)) (i32.const 6))
+      (call $ok (call $write (i32.load (i32.const 36)) (i32.const 0) (i32.const 1) (i32.const 8)))
+      (call $equal (i32.load (i32.const 8)) (i32.const 65536))
+      (i32.store (i32.const 4) (i32.const 4096))
+      (call $equal (call $write (i32.load (i32.const 36)) (i32.const 0) (i32.const 1) (i32.const 8)) (i32.const 6))
+      (i32.store (i32.const 4) (i32.const 2048))
+      (call $ok (call $read (i32.load (i32.const 32)) (i32.const 0) (i32.const 1) (i32.const 8)))
+      (i32.store (i32.const 4) (i32.const 4096))
+      (call $equal (call $write (i32.load (i32.const 36)) (i32.const 0) (i32.const 1) (i32.const 8)) (i32.const 6))
+      (i32.store (i32.const 16) (i32.const 1024)) (i32.store (i32.const 20) (i32.const 1024))
+      (i32.store (i32.const 24) (i32.const 1024)) (i32.store (i32.const 28) (i32.const 2048))
+      (call $equal (call $write (i32.load (i32.const 36)) (i32.const 16) (i32.const 2) (i32.const 8)) (i32.const 6))
+      (i32.store (i32.const 4) (i32.const 8192))
+      (call $ok (call $write (i32.load (i32.const 36)) (i32.const 0) (i32.const 1) (i32.const 8)))
+      (call $equal (i32.load (i32.const 8)) (i32.const 2048))
+      (i32.store (i32.const 4) (i32.const 4096))
+      (call $ok (call $read (i32.load (i32.const 32)) (i32.const 0) (i32.const 1) (i32.const 8)))
+      (i32.store (i32.const 16) (i32.const 1024)) (i32.store (i32.const 20) (i32.const 4096))
+      (i32.store (i32.const 24) (i32.const 1024)) (i32.store (i32.const 28) (i32.const 4096))
+      (call $ok (call $write (i32.load (i32.const 36)) (i32.const 16) (i32.const 2) (i32.const 8)))
+      (call $equal (i32.load (i32.const 8)) (i32.const 4096))
+      (call $ok (call $dup (i32.load (i32.const 36)) (i32.const 50)))
+      (call $ok (call $stat (i32.const 50) (i32.const 64)))
+      (call $equal (i32.load16_u (i32.const 66)) (i32.const 4))
+      (call $ok (call $fork (i32.const 1) (i32.const 40)))
+      (if (i32.eqz (i32.load (i32.const 40))) (then
+        (call $ok (call $flags (i32.const 50) (i32.const 0))) (call $exit (i32.const 0))))
+      (call $equal (call $wait (i32.load (i32.const 40)) (i32.const 44) (i32.const 0)) (i32.load (i32.const 40)))
+      (call $equal (i32.load (i32.const 44)) (i32.const 0))
+      (call $ok (call $stat (i32.load (i32.const 36)) (i32.const 64)))
+      (call $equal (i32.load16_u (i32.const 66)) (i32.const 0))
+      (i32.store (i32.const 44) (call $open (i32.const 200) (i32.const 16) (i32.const 2049) (i32.const 0)))
+      (if (i32.lt_s (i32.load (i32.const 44)) (i32.const 0)) (then unreachable))
+      (call $ok (call $stat (i32.load (i32.const 44)) (i32.const 64)))
+      (call $equal (i32.load16_u (i32.const 66)) (i32.const 4))
+      (call $ok (call $stat (i32.const 50) (i32.const 64)))
+      (call $equal (i32.load16_u (i32.const 66)) (i32.const 0))
+      (call $equal (call $write (i32.load (i32.const 44)) (i32.const 0) (i32.const 1) (i32.const 8)) (i32.const 6))))`);
+  try {
+    const path = base + '/nonblocking.wasm';
+    expect((await put(page.request, '/api/file?path=' + path, { data: module.emitBinary() })).ok()).toBe(true);
+    await call(page.request, { chmod: { path, mode: 0o755 } });
+    const result = await page.evaluate(path => window.os.exec([{ path, argv: [path] }], { stdin: '' }), path);
+    expect(result.status, JSON.stringify(result)).toBe(0);
+  } finally { module.dispose(); await cleanup(page); }
 });
 
 test('an existing journal directory is rejected before a service starts',async({page})=>{

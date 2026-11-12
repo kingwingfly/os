@@ -309,6 +309,40 @@ async fn metadata(env: &Env, path: &str) -> Result<String> {
     }
     String::from_utf8(bytes).map_err(invalid)
 }
+// Manifests contain filesystem names, not URL syntax. Encode each component once,
+// including literal percent signs, fragments and query delimiters.
+fn asset_url(path: &str) -> String {
+    format!(
+        "https://assets{}",
+        path.split('/')
+            .map(|part| {
+                js_sys::encode_uri_component(part)
+                    .as_string()
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    )
+}
+
+fn asset_path(encoded: &str) -> Result<String> {
+    let mut parts = Vec::new();
+    for part in encoded.split('/') {
+        let decoded = js_sys::decode_uri_component(part)
+            .map_err(|_| invalid("invalid asset path encoding"))?
+            .as_string()
+            .ok_or_else(|| invalid("invalid asset path"))?;
+        if decoded.contains('/') || decoded.contains('\\') {
+            return Err(invalid("encoded asset path separator"));
+        }
+        parts.push(decoded);
+    }
+    let path = parts.join("/");
+    if !os_image::valid_path(&path) {
+        return Err(invalid("invalid asset path"));
+    }
+    Ok(path)
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Content {
@@ -612,10 +646,7 @@ async fn check_content(env: &Env, plan: &Value) -> worker::Result<()> {
     for entry in entries {
         let mut response = env
             .assets("ASSETS")?
-            .fetch_request(Request::new(
-                &format!("https://assets{}", entry.path),
-                Method::Get,
-            )?)
+            .fetch_request(Request::new(&asset_url(&entry.path), Method::Get)?)
             .await?;
         if response.status_code() != 200 {
             return Err(worker::Error::RustError(
@@ -757,6 +788,7 @@ pub async fn checked_asset(req: Request, env: &Env) -> worker::Result<Response> 
             .ok_or_else(|| worker::Error::RustError("invalid boot asset path".into()))?;
         os_image::unhex::<32>(id).map_err(|e| worker::Error::RustError(e.to_string()))?;
         let checked = async {
+            let file = asset_path(file)?;
             let release = metadata(env, &format!("/boot/releases/{id}/manifest.json")).await?;
             let signature = metadata(env, &format!("/boot/releases/{id}/signature.json")).await?;
             if os_image::digest(release.as_bytes()) != id {

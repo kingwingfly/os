@@ -1,4 +1,5 @@
 //! The executable supervisor is ordinary user space, with the caller's process snapshot.
+mod forward;
 mod journal;
 mod notify;
 
@@ -44,6 +45,11 @@ fn signals() -> io::Result<()> {
         // SAFETY: the host copies this valid callback name; dispositions use scalar values.
         unsafe {
             callback_signal(name.as_ptr(), name.len());
+            // A closed log consumer is not a request to kill the supervised units.
+            let result = sigaction(13, 1, 0, 0); // SIGPIPE, SIG_IGN
+            if result < 0 {
+                return Err(io::Error::from_raw_os_error(-result));
+            }
             for signal in [1, 2, 15, 17] {
                 // Let the short WASI sleep finish after setting STOP. Preview-1 libc
                 // cannot provide nanosleep's remaining-time result on interruption.
@@ -156,16 +162,11 @@ fn check_readiness(
         Ok(false) => return,
         Ok(true) => {
             if supervisor.ready(i, running.child.id(), now) {
-                eprintln!("supervise: {}: Ready", supervisor.manifest.units[i].name);
                 journal.event(i, running.attempt, now, "Ready");
             }
         }
         Err(error) if error.kind() == io::ErrorKind::Interrupted => return,
         Err(error) => {
-            eprintln!(
-                "supervise: {}: readiness failed: {error}",
-                supervisor.manifest.units[i].name
-            );
             journal.event(
                 i,
                 running.attempt,
@@ -248,10 +249,6 @@ fn run() -> Result<i32, String> {
                             .code()
                             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
                     );
-                    eprintln!(
-                        "supervise: {}: {message}",
-                        supervisor.manifest.units[i].name
-                    );
                     journals.event(i, running.attempt, now(), &message);
                     running.success = Some(status.success());
                 }
@@ -292,9 +289,11 @@ fn run() -> Result<i32, String> {
                         match Notification::open() {
                             Ok(notification) => Some(notification),
                             Err(error) => {
-                                eprintln!(
-                                    "supervise: {}: readiness pipe failed: {error}",
-                                    unit.name
+                                journals.event(
+                                    i,
+                                    supervisor.services[i].restarts + 1,
+                                    now(),
+                                    &format!("readiness pipe failed: {error}"),
                                 );
                                 supervisor.exited(i, false, now());
                                 continue;
@@ -390,7 +389,6 @@ fn run() -> Result<i32, String> {
                     }
                     match result {
                         Ok(child) => {
-                            eprintln!("supervise: {}: started pid {}", unit.name, child.id());
                             journals.event(
                                 i,
                                 attempt,
@@ -411,7 +409,6 @@ fn run() -> Result<i32, String> {
                             );
                         }
                         Err(error) => {
-                            eprintln!("supervise: {}: start failed: {error}", unit.name);
                             journals.event(i, attempt, now(), &format!("start failed: {error}"));
                             remove_group(&group).map_err(|e| e.to_string())?;
                             supervisor.exited(i, false, now());
@@ -425,16 +422,8 @@ fn run() -> Result<i32, String> {
                         now(),
                         "startup deadline exceeded",
                     );
-                    eprintln!(
-                        "supervise: {}: startup deadline exceeded",
-                        supervisor.manifest.units[i].name
-                    );
                 }
                 Action::Signal { index, pid, signal } => {
-                    eprintln!(
-                        "supervise: {}: signal {signal}",
-                        supervisor.manifest.units[index].name
-                    );
                     let _ = pid;
                     if let Some(running) = children.0.get(&index) {
                         journals.event(index, running.attempt, now(), &format!("signal {signal}"));
@@ -450,10 +439,6 @@ fn run() -> Result<i32, String> {
                     supervisor.services[i].restarts + 1,
                     now(),
                     &format!("{:?}", supervisor.services[i].state),
-                );
-                eprintln!(
-                    "supervise: {}: {:?}",
-                    supervisor.manifest.units[i].name, supervisor.services[i].state
                 );
             }
         }
@@ -473,7 +458,17 @@ fn run() -> Result<i32, String> {
 }
 fn main() {
     let code = run().unwrap_or_else(|e| {
-        eprintln!("supervise: {}", e.strip_prefix("supervise: ").unwrap_or(&e));
+        if let Ok(mut output) = forward::Forward::new() {
+            output.push(
+                2,
+                format!(
+                    "supervise: {}\n",
+                    e.strip_prefix("supervise: ").unwrap_or(&e)
+                )
+                .as_bytes(),
+            );
+            output.pump(true);
+        }
         1
     });
     std::process::exit(code);

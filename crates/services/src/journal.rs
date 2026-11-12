@@ -1,4 +1,5 @@
 //! Bounded per-unit journals over ordinary pipes and files. No logging syscall or service.
+use crate::forward::Forward;
 use os_posix::pipe::{close_on_exec, pipe, readable};
 use serde_json::json;
 #[cfg(not(target_os = "wasi"))]
@@ -40,10 +41,15 @@ impl Ring {
         self.records.push_back(record);
         self.dirty = true;
     }
-    fn write(&self, out: &mut impl Write, name: &str) -> io::Result<()> {
+    fn write(
+        &self,
+        out: &mut impl Write,
+        name: &str,
+        forwarding_dropped: [u64; 2],
+    ) -> io::Result<()> {
         serde_json::to_writer(
             &mut *out,
-            &json!({"format":"os.service-journal", "version":1, "unit":name, "dropped":self.dropped}),
+            &json!({"format":"os.service-journal", "version":1, "unit":name, "dropped":self.dropped, "forwarding_dropped_bytes":forwarding_dropped}),
         )?;
         out.write_all(b"\n")?;
         for record in &self.records {
@@ -57,6 +63,7 @@ pub struct Journals {
     names: Vec<String>,
     directory: Option<PathBuf>,
     flushed: u64,
+    forward: Forward,
 }
 impl Journals {
     pub fn open(names: Vec<String>, directory: Option<&str>) -> io::Result<Self> {
@@ -69,17 +76,25 @@ impl Journals {
             names,
             directory,
             flushed: 0,
+            forward: Forward::new()?,
         })
     }
     pub fn event(&mut self, index: usize, attempt: u32, now: u64, text: &str) {
+        self.forward.push(
+            2,
+            format!("supervise: {}: {text}\n", self.names[index]).as_bytes(),
+        );
         self.rings[index]
             .push(json!({"elapsed_ms":now,"attempt":attempt,"stream":"event","text":text}));
     }
     fn output(&mut self, index: usize, attempt: u32, now: u64, fd: u32, bytes: &[u8]) {
+        self.forward.pump(false);
+        self.forward.push(fd, bytes);
         // Exact bytes survive split UTF-8, NULs and arbitrary binary output.
         self.rings[index].push(json!({"elapsed_ms":now,"attempt":attempt,"stream":if fd == 1 {"stdout"} else {"stderr"},"data":abi::Bytes(bytes.to_vec())}));
     }
     pub fn flush(&mut self, now: u64, force: bool) -> io::Result<()> {
+        self.forward.pump(force);
         if !force && now.saturating_sub(self.flushed) < 1000 {
             return Ok(());
         }
@@ -98,7 +113,7 @@ impl Journals {
             // A fresh private directory prevents accidentally replacing old journals.
             // Closing commits the bounded snapshot before rename publishes it.
             let mut bytes = Vec::with_capacity(65536);
-            ring.write(&mut bytes, &self.names[i])?;
+            ring.write(&mut bytes, &self.names[i], self.forward.dropped())?;
             if bytes.len() > 65536 {
                 return Err(io::Error::other("journal exceeds its bound"));
             }
@@ -180,11 +195,6 @@ impl Output {
                     break;
                 }
                 journal.output(index, attempt, now, n as u32 + 1, &bytes[..count]);
-                if n == 0 {
-                    io::stdout().write_all(&bytes[..count])?;
-                } else {
-                    io::stderr().write_all(&bytes[..count])?;
-                }
             }
         }
         Ok(())
@@ -203,7 +213,7 @@ mod tests {
             ring.push(json!({"text":"x".repeat(4096),"attempt":i}));
         }
         let mut bytes = Vec::new();
-        ring.write(&mut bytes, "bounded").unwrap();
+        ring.write(&mut bytes, "bounded", [0, 0]).unwrap();
         assert!(bytes.len() <= 65536);
         assert!(ring.dropped > 0);
         let lines: Vec<serde_json::Value> = String::from_utf8(bytes)

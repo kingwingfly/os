@@ -16,6 +16,32 @@ async function action(request, kind, value, errno, options = {}) {
 const login = (request, value = { op: 'inspect' }, errno, options) => action(request, 'login_session', value, errno, options);
 const init = (request, value = { op: 'inspect' }, errno, options) => action(request, 'machine_init', value, errno, options);
 const launch = request => call(request, { execve: { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [] } });
+
+test('restarted login IDs accept completion and departure without reviving the old scope', async ({ request }) => {
+  await call(request, 'getcreds');
+  const host = { host: randomUUID(), proof: randomBytes(32).toString('hex') };
+  let current = await login(request, { op: 'join', ...host });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const old = current.id;
+    await login(request, { op: 'end', session: old });
+    current = await login(request, { op: 'restart', session: old });
+    expect(current.id).not.toBe(old);
+    await login(request, { op: 'join', ...host });
+    const member = { ...host, session: current.id };
+    current = await login(request, { op: 'claim', member, generation: current.generation });
+    current = await login(request, { op: 'configure', member, generation: current.generation, file: '/guest/restart-units.json' });
+    const launch = { revision: current.startup.revision, proof: randomBytes(32).toString('hex') };
+    await login(request, { op: 'begin', member, generation: current.generation, launch });
+    await login(request, { op: 'finish', session: old, launch, status: 126, error: 'image unavailable' }, 'ESTALE');
+    await login(request, { op: 'finish', session: current.id, launch, status: 126, error: 'image unavailable' });
+    expect((await login(request)).startup).toMatchObject({ state: 'finished', status: 126 });
+    await login(request, { op: 'configure', member, generation: current.generation, file: null });
+    await login(request, { op: 'leave', member });
+    expect((await login(request)).hosts).toEqual([]);
+    await login(request, { op: 'leave', member: { ...member, session: old } }, 'ESTALE');
+  }
+  await login(request, { op: 'end', session: current.id });
+});
 async function finish(request, p) {
   await sys(request, [{ exit: { ...proof(p), status: 0 } }, { wait: { pid: String(p.pid), proc: p.token } }], {}, registry);
 }

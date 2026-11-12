@@ -71,7 +71,27 @@ await cp(join(bundle,`releases/${ids.b}/assets`),join(bundle,`releases/${ids.int
 // refresh their detached proofs via stage before the old publisher is revoked.
 await writeFile(join(bundle,'release.json'),await readFile(join(bundle,`releases/${ids.b}/manifest.json`)));
 run(['sign','--bundle',bundle,'--key-file',rotatedKey]);
+
+// Synthetic signed boot paths exercise URL encoding independently of build provenance.
+const encodedRelease = JSON.parse(await readFile(join(bundle, `releases/${ids.b}/manifest.json`), 'utf8'));
+const encodedBoot = JSON.parse(await readFile(join(bundle, `images/${encodedRelease.boot}.json`), 'utf8'));
+const encodedPaths = ['plain.txt', 'with space.txt', '文件.txt', 'hash#name.txt', 'query?name.txt', 'literal%2Fname.txt'];
+const encodedContent = Buffer.from('encoded asset contents\n');
+await writeFile(join(bundle, 'blobs', sha(encodedContent)), encodedContent);
+for (const name of encodedPaths) encodedBoot.entries.push({ path: '/' + name, uid: 0, gid: 0, mode: 0o644, node: { type: 'file', sha256: sha(encodedContent), size: encodedContent.length } });
+encodedBoot.entries.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+const encodedBootBytes = Buffer.from(JSON.stringify(encodedBoot)); encodedRelease.boot = sha(encodedBootBytes); encodedRelease.name = 'encoded paths';
+const encodedReleaseBytes = Buffer.from(JSON.stringify(encodedRelease)); ids.encoded = sha(encodedReleaseBytes);
+const encodedKey = createPrivateKey({ key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), Buffer.alloc(32, 73)]), format: 'der', type: 'pkcs8' });
+const encodedKeyId = sha(createPublicKey(encodedKey).export({ format: 'der', type: 'spki' }).subarray(-32));
+const signed = (domain, bytes) => JSON.stringify({ format: 'os.signature', version: 1, key: encodedKeyId, signature: sign(null, Buffer.concat([Buffer.from(domain + '\0'), bytes]), encodedKey).toString('hex') });
+await writeFile(join(bundle, `images/${encodedRelease.boot}.json`), encodedBootBytes);
+await writeFile(join(bundle, `images/${encodedRelease.boot}.sig`), signed('os.image.v1', encodedBootBytes));
+await cp(join(bundle, `releases/${ids.b}/assets`), join(bundle, `releases/${ids.encoded}/assets`), { recursive: true });
+for (const name of encodedPaths) await writeFile(join(bundle, `releases/${ids.encoded}/assets/${name}`), encodedContent);
+await writeFile(join(bundle, `releases/${ids.encoded}/manifest.json`), encodedReleaseBytes);
+await writeFile(join(bundle, `releases/${ids.encoded}/signature.json`), signed('os.release.v1', encodedReleaseBytes));
 await cp(bundle, join(assets, 'boot'), { recursive: true });
 const file = join(root, 'fixtures.json');
-await writeFile(file, JSON.stringify({ ids, trust, oldKey:sha(publicKey) }));
+await writeFile(file, JSON.stringify({ ids, trust, encodedPaths, oldKey:sha(publicKey) }));
 console.log(file);

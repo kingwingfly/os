@@ -208,7 +208,7 @@ impl Db {
         }
     }
     fn save_login(&mut self, ns: &str, binding: &str, session: &Session) {
-        self.run("INSERT INTO login_sessions(binding, ns, id, deadline, state) VALUES(?, ?, ?, ?, ?) ON CONFLICT(binding) DO UPDATE SET deadline = excluded.deadline, state = excluded.state",
+        self.run("INSERT INTO login_sessions(binding, ns, id, deadline, state) VALUES(?, ?, ?, ?, ?) ON CONFLICT(binding) DO UPDATE SET id = excluded.id, deadline = excluded.deadline, state = excluded.state",
             vec![text(binding), text(ns), text(&session.id), int(session.deadline()), text(&serde_json::to_string(session).unwrap())]);
     }
     pub fn expire_logins(&mut self, now: u64) {
