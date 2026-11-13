@@ -8,8 +8,14 @@ const env={...process.env};
 let podman;
 if(needsPodman(env)) {
   const socket=join(tmpdir(),`os-podman-${process.getuid()}.sock`);
-  podman=await startPodman(env,{socket,proxySocket:join(tmpdir(),`os-podman-${process.getuid()}-${process.pid}.sock`),reuse:true});
-  console.log(`Containers run with Podman, through ${socket}`);
+  try {
+    podman=await startPodman(env,{socket,proxySocket:join(tmpdir(),`os-podman-${process.getuid()}-${process.pid}.sock`),reuse:true});
+    console.log(`Containers run with Podman, through ${socket}`);
+  } catch(error) {
+    // Preserve ordinary dev startup when the optional container service fails.
+    // Isolated conformance calls startPodman directly and requires it to succeed.
+    console.warn(`Podman unavailable; starting Wrangler without container bootstrap: ${error.message}`);
+  }
 }
 const wrangler=spawn('npx',['wrangler','dev',...process.argv.slice(2)],{stdio:'inherit',env});
 const stop=signal=>{wrangler.kill(signal);void podman?.close();};

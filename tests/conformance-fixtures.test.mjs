@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { readFile, mkdtemp, writeFile, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { conformanceConfig, replaceExactly, putFile, reattachAfter, mountOutcome, checkAbsentMountCalls, startHeld, heldState, heldRows } from '../scripts/conformance/fixtures.mjs';
+import { conformanceConfig, replaceExactly, compilerConfig, helperConnection, recordReattach, putFile, mountOutcome, checkAbsentMountCalls, startHeld, heldState, heldRows } from '../scripts/conformance/fixtures.mjs';
 import { podmanEnvironment } from '../scripts/podman.mjs';
 import { saveRun } from '../scripts/conformance/results.mjs';
 import { run, revision } from '../scripts/conformance/common.mjs';
@@ -39,9 +39,9 @@ test('fixture writes use provider chunk sizes and integer indices beyond 64 KiB'
 test('EBUSY is recorded and keeps the original attachment; successful detach reattaches once',async()=>{
   let attaches=0;
   const busy={errno:'EBUSY'};
-  await reattachAfter(busy,()=>attaches++);assert.equal(attaches,0);assert.equal(busy.errno,'EBUSY');
+  await recordReattach([],busy,()=>{attaches++;return {ok:null};},'unmount-open');assert.equal(attaches,0);assert.equal(busy.errno,'EBUSY');
   const detached={ok:null};
-  await reattachAfter(detached,()=>attaches++);assert.equal(attaches,1);
+  await recordReattach([],detached,()=>{attaches++;return {ok:null};},'unmount-open');assert.equal(attaches,1);
 });
 
 test('shared Podman bootstrap respects configured egress images',()=>{
@@ -69,16 +69,22 @@ test('provenance records HEAD and dirtiness without any remote-tracking referenc
     const env={...process.env,GIT_CONFIG_GLOBAL:join(dir,'hostile-config'),GIT_CONFIG_NOSYSTEM:'1'};
     run('git',['init','--template=','--quiet',dir],{env});
     await writeFile(join(dir,'.git/hostile-config'),await readFile(join(dir,'hostile-config')));await rm(join(dir,'hostile-config'));env.GIT_CONFIG_GLOBAL=join(dir,'.git/hostile-config');await writeFile(join(dir,'source'),'one');
-    run('git',['add','source'],{cwd:dir});
+    const out=join(dir,'docs/compat');await mkdir(out,{recursive:true});await writeFile(join(out,'latency.json'),'initial');
+    run('git',['add','source','docs/compat/latency.json'],{cwd:dir});
     run('git',['-c','core.hooksPath=/dev/null','-c','commit.gpgSign=false','-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--no-gpg-sign','--no-verify','--quiet','-m','fixture'],{cwd:dir,env});
     assert.deepEqual(revision(dir),{head:run('git',['rev-parse','HEAD'],{cwd:dir}).trim(),dirty:false});
-    await writeFile(join(dir,'source'),'two');assert.equal(revision(dir).dirty,true);
+    await writeFile(join(out,'latency.json'),'generated');
+    assert.equal(revision(dir).dirty,true);assert.equal(revision(dir,out).dirty,false);
+    const other=join(dir,'out [literal]');await mkdir(other);await writeFile(join(other,'baseline.json'),'generated');
+    await writeFile(join(out,'latency.json'),'initial');assert.equal(revision(dir,other).dirty,false);
+    assert.equal(revision(dir,dir).dirty,true); // --out=. must not hide the source tree.
+    await writeFile(join(dir,'source'),'two');assert.equal(revision(dir,other).dirty,true);
   } finally {await rm(dir,{recursive:true,force:true});}
 });
 
 test('essential baseline is saved before auxiliary evidence even when an auxiliary save fails',async()=>{
-  const writes=[],baseline={schema:1,linux:[],os:{}};
-  await assert.rejects(saveRun('/unused',baseline,'os',{observations:{cloud:[]},latencies:{}},{revision:{head:'fixture',dirty:false}},async(_out,name)=>{writes.push(name);if(name==='evidence.json')throw new Error('disk failure');}),/disk failure/);
+  const writes=[],baseline={schema:2,linux:[],os:{},process:{linux:[],os:[]}};
+  await assert.rejects(saveRun('/unused',baseline,'os',{observations:{cloud:[]},process:[],latencies:{}},{revision:{head:'fixture',dirty:false}},async(_out,name)=>{writes.push(name);if(name==='evidence.json')throw new Error('disk failure');}),/disk failure/);
   assert.deepEqual(writes,['baseline.json','latency.json','evidence.json']);
   assert.deepEqual(baseline.os,{cloud:[]});
 });
@@ -142,4 +148,29 @@ test('held barrier and genuine timeout are distinguished, and timeout requests c
     assert.equal(heldRows(heldState(),'unmount-open',{skipped:'timeout'})[0].errno,'ETIMEDOUT');
     finish({status:130});await window.conformanceHeld.promise;
   } finally {globalThis.window=previous;}
+});
+
+test('compiler rewrite uses the same literal escaping as initial configuration',async()=>{
+  const root='/tmp/quoted"back\\slash-$&';
+  const config=conformanceConfig(await readFile('wrangler.toml','utf8'),root);
+  const rewritten=compilerConfig(config,root,'/tmp/Compiler.Dockerfile');
+  assert(rewritten.includes('image = "/tmp/Compiler.Dockerfile"'));
+});
+
+test('failed re-attach is saved and stops the next dependent probe immediately',async()=>{
+  const rows=[],persisted=[];let next=false;
+  await assert.rejects(async()=>{
+    await recordReattach(rows,{ok:null},async()=>({errno:'EBUSY'}),'unmount-open',rows=>persisted.push(structuredClone(rows)));
+    next=true;
+  },/unmount-open re-attach failed: EBUSY/);
+  assert(!next);assert.equal(persisted[0][0].errno,'EBUSY');assert.equal(rows[0].step,'attach');
+});
+
+test('malformed terminal output retains valid rows, status and contextual diagnostics',()=>{
+  const valid={case:'unmount-open',step:'read',call:'read(fd)',errno:'EBADF'},diagnostics=[];
+  const rows=heldRows({output:JSON.stringify(valid)+'\nwarning: /variable/path\n{"partial":',stderr:'panic details',status:101},'unmount-open',{case:'unmount-open',step:'detach',call:'detach',ok:null},diagnostics);
+  assert.deepEqual(rows[0],valid);assert(rows.find(r=>r.step==='output').skipped);
+  assert.equal(rows.find(r=>r.step==='completion').ok.status,101);
+  assert.deepEqual(diagnostics.map(d=>[d.case,d.stream]),[['unmount-open',2],['unmount-open',1],['unmount-open',1]]);
+  assert(!JSON.stringify(rows).includes('/variable/path'));assert(diagnostics[1].text.includes('/variable/path'));
 });

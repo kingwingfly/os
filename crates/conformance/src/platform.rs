@@ -113,7 +113,7 @@ pub fn identity_relation(a: Identity, b: Identity) -> Value {
     fn equal(a: Option<u64>, b: Option<u64>, field: &str) -> Value {
         match (a, b) {
             (Some(a), Some(b)) => json!(a == b),
-            _ => json!({"unavailable":format!("{field} not exposed by both observations")}),
+            _ => json!({"unavailable":true,"field":field}),
         }
     }
     json!({"same_dev":equal(a.dev,b.dev,"st_dev"),"same_ino":equal(a.ino,b.ino,"st_ino")})
@@ -442,6 +442,10 @@ pub fn mount(source: &Path, target: &Path, tmpfs: bool) -> Result<()> {
 #[cfg(target_os = "linux")]
 pub fn unmount(path: &Path) -> Result<()> {
     rc(unsafe { libc::umount(c(path).as_ptr()) })
+}
+#[cfg(target_os = "linux")]
+pub fn detach(path: &Path) -> Result<()> {
+    rc(unsafe { libc::umount2(c(path).as_ptr(), libc::MNT_DETACH) })
 }
 #[cfg(target_os = "linux")]
 pub fn chroot(path: &Path) -> Result<()> {

@@ -24,11 +24,13 @@ if(values.check||values.report) {
   }
 } else {
   if(!['linux','os'].includes(values.target))throw new Error('usage: cargo xtask conformance --target linux|os [--out DIR] | --check | --report');
-  let baseline={schema:1,linux:[],os:{}};
+  const empty=()=>({schema:2,linux:[],os:{},process:{linux:[],os:[]}});
+  let baseline=empty();
   try{baseline=JSON.parse(await readFile(join(out,'baseline.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
-  const provenance={revision:revision(),platform:run('uname',['-srmo']).trim(),rust:run('rustc',['--version']).trim(),node:process.version};
+  if(baseline.schema!==2) {console.log('Baseline schema changed; rerun both targets.');baseline=empty();}
+  const provenance={revision:revision('.',out),platform:run('uname',['-srmo']).trim(),rust:run('rustc',['--version']).trim(),node:process.version};
   const result=await (await import('./'+values.target+'.mjs'))[values.target]();
   await saveRun(out,baseline,values.target,result,provenance);
-  if(baseline.linux.length&&Object.keys(baseline.os).length)await report(out);
+  if(baseline.linux.length&&Object.keys(baseline.os).length&&baseline.process.linux.length&&baseline.process.os.length)await report(out);
   console.log('Saved '+values.target+' observations in '+out);
 }

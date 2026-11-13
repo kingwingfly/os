@@ -1,10 +1,11 @@
+import { ShutdownScope } from '../scripts/process.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cases, filesystems, operations, ok, cleanup, revision } from '../scripts/conformance/common.mjs';
+import { cases, filesystems, operations, observationCases, ok } from '../scripts/conformance/common.mjs';
 import { differences, check, parseExpected, matrix, checkLatency } from '../scripts/conformance/report.mjs';
 const fixture=()=>{
   const rows=cases.map(name=>ok(name,'call',name,null));
-  return {schema:1,linux:structuredClone(rows),os:Object.fromEntries(filesystems.map(fs=>[fs,structuredClone(rows)]))};
+  return {schema:2,linux:structuredClone(rows),os:Object.fromEntries(filesystems.map(fs=>[fs,structuredClone(rows)])),process:{linux:observationCases.map(name=>ok(name,'call',name,null)),os:observationCases.map(name=>ok(name,'call',name,null))}};
 };
 test('conformance rejects unlisted, stale, and changed differences',()=>{
   const baseline=fixture();baseline.os.cloud[0].ok='different';
@@ -56,23 +57,23 @@ test('policy rejects array-valued scalar fields and accepts new issue IDs only t
 });
 
 test('process facts are explicitly observational, detect changes, and can be reclassified when a Linux counterpart exists',()=>{
-  const b=fixture(),i=cases.indexOf('startup');
-  b.linux[i]={case:'startup',step:'unavailable',call:'startup',skipped:'environment evidence only'};
+  const b=fixture(),i=observationCases.indexOf('startup');
+  b.process.linux[i]={case:'startup',step:'unavailable',call:'startup',skipped:'environment evidence only'};
   const rows=differences(b), entries=rows.filter(r=>!r.same).map(r=>({kind:'observation',id:r.id,signature:r.signature}));
-  assert(rows.filter(r=>r.kind==='observation').length===5);
+  assert(rows.filter(r=>r.kind==='observation').length===1);
   assert.doesNotThrow(()=>check(rows,entries));
   assert.match(matrix(rows,[]),/observation:/);
-  b.os.cloud[i].ok='changed service ownership';
+  b.process.os[i].ok='changed service ownership';
   assert.throws(()=>check(differences(b),entries),/changed observation/);
   assert.throws(()=>check(differences(fixture()),entries),/stale difference/);
 });
 
 test('cleanup failures do not prevent subsequent cleanup or restoring the process umask',async()=>{
   const seen=[],mask=process.umask();
-  const errors=await cleanup([
-    ['podman ps',()=>{throw new Error('engine unavailable');}],
-    ['service',()=>seen.push('stopped')],['log',()=>seen.push('closed')],['umask',()=>process.umask(mask)],
-  ]);
+  const scope=new ShutdownScope();
+  scope.add('umask',()=>process.umask(mask));scope.add('log',()=>seen.push('closed'));scope.add('service',()=>seen.push('stopped'));
+  scope.add('podman ps',()=>{throw new Error('engine unavailable');});
+  const errors=await scope.close();
   assert.deepEqual(seen,['stopped','closed']);assert.equal(process.umask(),mask);
   assert.equal(errors[0].error.message,'engine unavailable');
 });
@@ -80,12 +81,28 @@ test('cleanup failures do not prevent subsequent cleanup or restoring the proces
 test('retained-fd device limits do not prevent convergence on observable fields',()=>{
   const baseline=fixture(),i=cases.indexOf('open-rename');
   baseline.linux[i]=ok('open-rename','identity','fstat(fd)',{same_dev:true,same_ino:true});
-  baseline.os.cloud[i]=ok('open-rename','identity','fstat(fd)',{same_dev:{unavailable:'st_dev not exposed by both observations'},same_ino:true});
+  baseline.os.cloud[i]=ok('open-rename','identity','fstat(fd)',{same_dev:{unavailable:true,field:'st_dev'},same_ino:true});
   const row=()=>differences(baseline).find(r=>r.id==='cloud/open-rename');
   assert(row().same);assert(row().limited);assert.equal(row().linux[0].ok.same_dev,true);
   assert.throws(()=>check([row()],[{id:row().id,signature:row().signature}]),/stale difference/);
   const signature=row().signature;
   baseline.os.cloud[i].ok.same_ino=false;assert(!row().same);
-  baseline.os.cloud[i].ok.same_ino={unavailable:'st_ino not exposed by both observations'};assert(!row().same);
+  baseline.os.cloud[i].ok.same_ino={unavailable:true,field:'st_ino'};assert(!row().same);
   baseline.os.cloud[i].ok={same_dev:false,same_ino:true};assert(!row().same);assert(!row().limited);assert.notEqual(row().signature,signature);
+});
+
+test('identity availability applies to arbitrary steps and cases, while unknown inode never passes',()=>{
+  const baseline=fixture(),i=cases.indexOf('alias');
+  baseline.linux[i]=ok('alias','new-fd-step','fstat(new descriptor)',{same_dev:true,same_ino:true});
+  baseline.os.cloud[i]=ok('alias','new-fd-step','fstat(new descriptor)',{same_dev:{unavailable:true,field:'st_dev'},same_ino:true});
+  const row=()=>differences(baseline).find(r=>r.id==='cloud/alias');
+  assert(row().same);assert(row().limited);
+  baseline.linux[i].ok.same_ino=baseline.os.cloud[i].ok.same_ino={unavailable:true,field:'st_ino'};
+  assert(!row().same);
+});
+
+test('process facts have one independent coverage set, not five copied profiles',()=>{
+  const b=fixture();assert.equal(differences(b).filter(r=>r.filesystem==='process').length,3);
+  b.os.cloud.push(b.process.os[0]);assert.throws(()=>differences(b),/invalid observation/);
+  b.os.cloud.pop();b.process.os.pop();assert.throws(()=>differences(b),/missing case/);
 });

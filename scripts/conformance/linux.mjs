@@ -4,9 +4,11 @@ import { join } from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { run, targetDir, jsonLines, skip, operations, probeOperations } from './common.mjs';
-export async function linux({namespaceProbe=spawnSync}={}) {
+export function buildProbe() {
   run('cargo',['build','--locked','-p','os-conformance','--release'],{stdio:'inherit'});
-  const binary=join(targetDir(),'release/os-conformance');
+  return join(targetDir(),'release/os-conformance');
+}
+export async function linux({namespaceProbe=spawnSync,binary=buildProbe(),measureLatency=true}={}) {
   const dir=await realpath(await mkdtemp(join(tmpdir(),'os-conformance-linux-')));
   try {
     await chmod(dir,0o755);
@@ -33,9 +35,11 @@ export async function linux({namespaceProbe=spawnSync}={}) {
       cmdline:await observe(async()=>(await readFile('/proc/1/cmdline','utf8')).split('\0')[0].split('/').at(-1)),
       executable:await observe(()=>readlink('/proc/1/exe')),
     };
-    observations.push(skip('startup','host PID 1 details are environmental evidence in linux-evidence.json, not a portable OS comparison'));
-    observations.push(skip('gui-processes','headless Linux reference has no Files/Editor/Preview/Mounts desktop applications'));
-    observations.push(skip('tab-pids','Linux reference has no browser OS tabs; process visibility is namespace-scoped'));
+    const processRows=[];
+    processRows.push(skip('startup','host PID 1 details are environmental evidence in linux-evidence.json, not a portable OS comparison'));
+    processRows.push(skip('gui-processes','headless Linux reference has no Files/Editor/Preview/Mounts desktop applications'));
+    processRows.push(skip('tab-pids','Linux reference has no browser OS tabs; process visibility is namespace-scoped'));
+    if(!measureLatency)return {observations,process:processRows,evidence};
     const timingRoot=join(dir,'timing');await mkdir(timingRoot);
     const args=['latency',timingRoot,timingRoot,timingRoot,String(process.getuid()),String(process.getgid())];
     run(binary,[...args,'prepare']);const latency=[];
@@ -60,7 +64,7 @@ export async function linux({namespaceProbe=spawnSync}={}) {
       }
       latency.push({operation,samples});
     }
-    return {observations,latency,evidence};
+    return {observations,process:processRows,latency,evidence};
   } finally {await rm(dir,{recursive:true,force:true});}
 }
 

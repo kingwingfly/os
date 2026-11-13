@@ -441,7 +441,7 @@ impl Probe {
             );
         }
     }
-    fn hold(&self, cwd: bool) {
+    fn hold(&self, cwd: bool) -> bool {
         let case = if cwd { "unmount-cwd" } else { "unmount-open" };
         let path = self.root.join(case);
         unit(case, "create", "write(file)", write(&path, b"hello"));
@@ -452,7 +452,7 @@ impl Probe {
                 Ok(f) => Some(f),
                 Err(e) => {
                     emit(case, "open", "open(O_RDWR)", Err(e));
-                    return;
+                    return false;
                 }
             }
         };
@@ -461,7 +461,7 @@ impl Probe {
             let failed = result.is_err();
             unit(case, "chdir", "chdir(mount)", result);
             if failed {
-                return;
+                return false;
             }
         }
         #[cfg(target_os = "wasi")]
@@ -473,21 +473,29 @@ impl Probe {
             std::io::stdin().read_line(&mut line).unwrap();
         }
         #[cfg(target_os = "linux")]
-        unit(
-            case,
-            "unmount",
-            "umount(mount)",
-            platform::unmount(&self.root),
-        );
+        let detached = {
+            unit(
+                case,
+                "unmount",
+                "umount(mount)",
+                platform::unmount(&self.root),
+            );
+            let result = platform::detach(&self.root);
+            let detached = result.is_ok();
+            unit(case, "detach", "umount2(mount, MNT_DETACH)", result);
+            detached
+        };
+        #[cfg(target_os = "wasi")]
+        let detached = false; // The runner records the actual attachment outcome.
         if let Some(f) = file.as_mut() {
-            emit(case, "read", "pread(fd) after umount", read(f));
-            emit(case, "fstat", "fstat(fd) after umount", platform::fdstat(f));
+            emit(case, "read", "pread(fd) after detach", read(f));
+            emit(case, "fstat", "fstat(fd) after detach", platform::fdstat(f));
         }
         if cwd {
             emit(
                 case,
                 "getcwd",
-                "getcwd() after umount",
+                "getcwd() after detach",
                 platform::cwd().map(|s| json!(s.replace(self.root.to_str().unwrap(), "$ROOT"))),
             );
             unit(
@@ -497,6 +505,7 @@ impl Probe {
                 platform::cd(self.root.parent().unwrap()),
             );
         }
+        detached
     }
     fn directory_facts(&self, case: &str, step: &str, dir: &Path) {
         emit(
@@ -639,8 +648,12 @@ fn main() {
         }
         "remount-prepare" => p.remount(true),
         "remount-observe" => p.remount(false),
-        "hold-open" => p.hold(false),
-        "hold-cwd" => p.hold(true),
+        "hold-open" => {
+            p.hold(false);
+        }
+        "hold-cwd" => {
+            p.hold(true);
+        }
         "latency" => unit("latency", &args[7], &args[7], p.latency(&args[7])),
         "namespace" => {
             #[cfg(target_os = "linux")]
@@ -688,8 +701,14 @@ fn main() {
                     platform::mount(&p.root.join("tree"), &q.root, false),
                 );
                 q.remount(false);
-                q.hold(false);
-                q.hold(true);
+                for cwd in [false, true] {
+                    if q.hold(cwd) {
+                        let case = if cwd { "unmount-cwd" } else { "unmount-open" };
+                        let result = platform::mount(&p.root.join("tree"), &q.root, false);
+                        unit(case, "attach", "mount(source, mount)", result.clone());
+                        result.expect("held-case re-attach failed");
+                    }
+                }
                 unit(
                     "mount-api",
                     "mount",
