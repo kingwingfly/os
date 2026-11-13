@@ -44,6 +44,6 @@ export async function containerLease(env,socket) {
       const containers=JSON.parse(await request('GET','/containers/json?all=true&filters='+filters));
       if(!Array.isArray(containers))throw new Error('container cleanup GET: expected an array');
       for(const {Id} of containers)await request('DELETE','/containers/'+encodeURIComponent(Id)+'?force=true');
-    } finally {proxy.closeAllConnections();await new Promise((resolve,reject)=>proxy.close(error=>error?reject(error):resolve()));}
+    } finally {proxy.destroyAllSockets();await new Promise((resolve,reject)=>proxy.close(error=>error?reject(error):resolve()));}
   }};
 }

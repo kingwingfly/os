@@ -9,7 +9,7 @@ import { ShutdownScope } from '../process.mjs';
 import { containerLease } from './containers.mjs';
 import { imageStore } from './storage.mjs';
 import { performance } from 'node:perf_hooks';
-import { run, targetDir, jsonLines, skip, ok, ports, start, stop, sourceEvidence, filesystems, operations, probeOperations } from './common.mjs';
+import { run, targetDir, jsonLines, requireProbeSuccess, ok, ports, start, stop, sourceEvidence, filesystems, operations, probeOperations } from './common.mjs';
 
 async function batch(page,calls,options={}) {
   return page.evaluate(async ({calls,options})=>{
@@ -74,7 +74,7 @@ async function held(page,mode,root,alias,cross,creds,diagnostics) {
 
 async function timing(page,root,alias,cross,creds) {
   const rows=[];
-  await probe(page,'latency',root,alias,cross,creds,['prepare']);
+  requireProbeSuccess(await probe(page,'latency',root,alias,cross,creds,['prepare']),'OS latency prepare failed');
   // Cold = first invocation of this operation in this fresh filesystem/profile;
   // warm = immediate repeat. This does not claim to drop host/provider caches.
   for (const operation of operations) {
@@ -128,7 +128,7 @@ export async function os() {
       const storage=join(state,'storage.conf');
       await writeFile(storage,`[storage]\ndriver = "overlay"\ngraphroot = ${JSON.stringify(join(cache,'storage'))}\nrunroot = ${JSON.stringify(join(cache,'run'))}\n`);
       serverEnv.CONTAINERS_STORAGE_CONF=storage;
-      podman=await scope.acquire('Podman service',signal=>startPodman(serverEnv,{signal,socket:join(state,'podman.sock'),proxySocket:join(state,'docker.sock'),stdio:['ignore',log.fd,log.fd],detached:true}),service=>service.close());
+      podman=await scope.acquire('Podman service',signal=>startPodman(serverEnv,{signal,socket:join(state,'podman.sock'),proxySocket:join(state,'docker.sock'),stdio:['ignore',log.fd,log.fd],detached:true,strictEgress:true}),service=>service.close());
     }
     if(process.env.OS_CONFORMANCE_COMPILER_IMAGE) {
       const image=compilerImage(process.env.OS_CONFORMANCE_COMPILER_IMAGE);
@@ -150,7 +150,7 @@ export async function os() {
     while (true) {
       scope.check();
       if(server.spawnError)throw server.spawnError;
-      if (server.exitCode!==null) throw new Error('isolated server exited; inspect '+join(state,'server.log'));
+      if (server.exitCode!==null||server.signalCode!==null) throw new Error('isolated server exited; inspect '+join(state,'server.log'));
       try {const response=await fetch(url,{signal:AbortSignal.timeout(2000)});if(response.ok)break;} catch {}
       if(Date.now()>until)throw new Error('isolated server startup timeout; inspect '+join(state,'server.log'));
       await new Promise(r=>setTimeout(r,300));

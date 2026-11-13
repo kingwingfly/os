@@ -66,7 +66,7 @@ export function podmanProxy(listen, upstream, {label,stripMemorySwappiness=true}
   // Include upgraded attach streams in explicit shutdown as well as HTTP sockets.
   const sockets=new Set();
   server.on('connection',socket=>{sockets.add(socket);socket.once('close',()=>sockets.delete(socket));});
-  server.closeAllConnections=()=>{for(const socket of sockets)socket.destroy();};
+  server.destroyAllSockets=()=>{for(const socket of sockets)socket.destroy();};
   server.listen(listen);
   const cleanup=()=>rmSync(listen,{force:true});
   process.once('exit',cleanup);

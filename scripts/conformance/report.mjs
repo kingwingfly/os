@@ -2,7 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { cases, filesystems, operations, observationCases, serialize } from './common.mjs';
+import { cases, filesystems, operations, observationCases, serialize, generatedFiles } from './common.mjs';
 const followups=JSON.parse(readFileSync(new URL('../../docs/compat/follow-up-issues.json',import.meta.url),'utf8')).issues;
 const hash=value=>createHash('sha256').update(serialize(value)).digest('hex');
 function group(rows,required=cases) {
@@ -101,16 +101,16 @@ export function checkLatency(record,native=false) {
   }
 }
 export async function report(out,checking=false) {
-  const baseline=JSON.parse(await readFile(join(out,'baseline.json'),'utf8'));
+  const baseline=JSON.parse(await readFile(join(out,generatedFiles.baseline),'utf8'));
   const rows=differences(baseline);
   let expected=[];
   try{expected=parseExpected(await readFile(join(out,'expected-differences.toml'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
   const rendered=matrix(rows,expected);
   if(checking) {
     check(rows,expected);
-    checkLatency(JSON.parse(await readFile(join(out,'latency.json'),'utf8')));
-    checkLatency(JSON.parse(await readFile(join(out,'linux-latency.json'),'utf8')),true);
-    if(await readFile(join(out,'matrix.md'),'utf8')!==rendered)throw new Error('matrix.md is stale');
+    checkLatency(JSON.parse(await readFile(join(out,generatedFiles.latency),'utf8')));
+    checkLatency(JSON.parse(await readFile(join(out,generatedFiles.linuxLatency),'utf8')),true);
+    if(await readFile(join(out,generatedFiles.matrix),'utf8')!==rendered)throw new Error('matrix.md is stale');
     console.log(`Checked ${rows.length} rows: ${rows.filter(r=>r.same).length} same, ${rows.filter(r=>!r.same&&r.kind==='difference').length} differences/skips, ${rows.filter(r=>r.kind==='observation').length} observational records.`);
-  }else await writeFile(join(out,'matrix.md'),rendered);
+  }else await writeFile(join(out,generatedFiles.matrix),rendered);
 }

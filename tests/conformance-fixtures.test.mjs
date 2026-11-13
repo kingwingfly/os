@@ -1,14 +1,33 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, mkdtemp, writeFile, mkdir, rm, chmod, symlink, stat } from 'node:fs/promises';
+import { readFile, mkdtemp, writeFile, mkdir, rm, chmod, symlink, stat, readdir } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { conformanceConfig, replaceExactly, compilerConfig, compilerImage, isSleep, sameSleep, withCleanup, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from '../scripts/conformance/fixtures.mjs';
 import { podmanEnvironment } from '../scripts/podman.mjs';
 import { saveRun } from '../scripts/conformance/results.mjs';
-import { run, revision, ports } from '../scripts/conformance/common.mjs';
+import { run, revision, ports, generatedFiles, requireProbeSuccess } from '../scripts/conformance/common.mjs';
 import { imageStore } from '../scripts/conformance/storage.mjs';
+import { report } from '../scripts/conformance/report.mjs';
+
+test('latency preparation preserves its phase and original errno',()=>{
+  for(const phase of ['native latency prepare failed','OS latency prepare failed']) {
+    for(const errno of ['ENOSPC','EACCES'])assert.throws(()=>requireProbeSuccess([{case:'latency',step:'prepare',errno}],phase),error=>error.message.includes(phase)&&error.message.includes(errno));
+    const prepared=[{case:'latency',step:'prepare',ok:null}];assert.equal(requireProbeSuccess(prepared,phase),prepared);
+  }
+});
+
+test('artifact writers and provenance use the same complete filename registry',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-artifacts-'));
+  const baseline=JSON.parse(await readFile('docs/compat/baseline.json','utf8'));
+  try {
+    await saveRun(dir,baseline,'linux',{observations:baseline.linux,process:baseline.process.linux,latency:[]},{});
+    await saveRun(dir,baseline,'os',{observations:baseline.os,process:baseline.process.os,latencies:{}},{});
+    await report(dir);
+    assert.deepEqual((await readdir(dir)).sort(),Object.values(generatedFiles).sort());
+  } finally {await rm(dir,{recursive:true,force:true});}
+});
 
 test('compiler image rejects command flags before invoking the engine',()=>{
   for(const value of ['--privileged','-x','','image;command','image with spaces'])assert.throws(()=>compilerImage(value),/invalid compiler image/);
@@ -35,6 +54,7 @@ test('readiness diagnostics survive a simultaneous cleanup failure',async()=>{
 test('image store rejects shared permissions and symlinks before loading images',async()=>{
   const dir=await mkdtemp(join(tmpdir(),'conformance-store-'));
   try {
+    await assert.rejects(imageStore(''),/OS_CONFORMANCE_PODMAN_DIR must not be empty/);
     const path=join(dir,'images');assert.equal(await imageStore(path),path);
     assert.equal((await stat(path)).mode&0o777,0o700);
     assert.equal(await imageStore(path),path);
@@ -91,9 +111,9 @@ test('EBUSY is recorded and keeps the original attachment; successful detach rea
 
 test('shared Podman bootstrap respects configured egress images',()=>{
   const custom={MINIFLARE_CONTAINER_EGRESS_IMAGE:'registry.example/custom:tag'};
-  podmanEnvironment(custom,'/tmp/proxy.sock','DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "cloudflare/sidecar:tag"');
+  podmanEnvironment(custom,'/tmp/proxy.sock',{readMiniflare:()=> 'DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "cloudflare/sidecar:tag"'});
   assert.equal(custom.MINIFLARE_CONTAINER_EGRESS_IMAGE,'registry.example/custom:tag');
-  const defaults={};podmanEnvironment(defaults,'/tmp/proxy.sock','DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "cloudflare/sidecar:tag"');
+  const defaults={};podmanEnvironment(defaults,'/tmp/proxy.sock',{readMiniflare:()=> 'DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "cloudflare/sidecar:tag"'});
   assert.equal(defaults.MINIFLARE_CONTAINER_EGRESS_IMAGE,'docker.io/cloudflare/sidecar:tag');
 });
 

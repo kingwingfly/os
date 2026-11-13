@@ -1,11 +1,33 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import { once } from 'node:events';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { containerLease, engineTarget } from '../scripts/conformance/containers.mjs';
+import { podmanProxy } from '../scripts/podman-proxy.mjs';
+
+test('proxy explicitly destroys upgraded sockets without replacing Node closeAllConnections',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-upgrade-')),upstream=http.createServer(),sockets=[];let proxy,client;
+  upstream.on('upgrade',(_req,socket)=>{sockets.push(socket);socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\n');});
+  try {
+    upstream.listen(join(dir,'upstream.sock'));await once(upstream,'listening');
+    proxy=podmanProxy(join(dir,'proxy.sock'),join(dir,'upstream.sock'));await once(proxy,'listening');
+    assert(!Object.hasOwn(proxy,'closeAllConnections'));assert.equal(proxy.closeAllConnections,http.Server.prototype.closeAllConnections);
+    client=net.connect(join(dir,'proxy.sock'));await once(client,'connect');
+    client.write('GET /attach HTTP/1.1\r\nHost: fixture\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\n');
+    assert.match(String((await once(client,'data'))[0]),/101 Switching Protocols/);
+    const closed=once(client,'close');proxy.destroyAllSockets();await closed;
+  } finally {
+    client?.destroy();proxy?.destroyAllSockets();
+    if(proxy?.listening)await new Promise(resolve=>proxy.close(resolve));
+    for(const socket of sockets)socket.destroy();
+    if(upstream.listening)await new Promise(resolve=>upstream.close(resolve));
+    await rm(dir,{recursive:true,force:true});
+  }
+});
 const request=(socket,method,path,body)=>new Promise((resolve,reject)=>{
   const req=http.request({socketPath:socket,method,path,headers:{'Content-Type':'application/json'}},res=>{
     const chunks=[];res.on('data',c=>chunks.push(c));res.on('end',()=>resolve(JSON.parse(Buffer.concat(chunks)||'null')));res.on('error',reject);

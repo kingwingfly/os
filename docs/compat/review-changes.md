@@ -1,30 +1,32 @@
-# PR #66 review measurement changes
+# PR #66 review changes
 
-Compared with reviewed commit `c71443c`. **No result rows changed: 0 of 120 filesystem rows and 0 of three process observations. The entire raw `baseline.json` is byte-identical to that commit.** Outcomes, normalized signatures and classifications are unchanged: **15 same, 105 differences/skips and three process observations**. The regenerated matrix and existing difference registry are unchanged. No OS runtime semantics or architecture decisions were changed.
+This report covers the review of `dcc9daa`: **10 of 12 comments are fixed; two are added to [#67](https://github.com/kingwingfly/os/issues/67)**, the follow-up linked to #46.
 
-| Changed result rows | Count |
-| --- | --- |
-| Filesystem rows | 0 of 120 |
-| Process observations | 0 of 3 |
+## Development bootstrap and cleanup
 
-Full recordings were required this round because the Linux remount guard and the OS tab-process identity check change measurement logic. The Linux probe now records and stops on failed detach before attempting another bind mount; failed re-attachment also stops before dependent observations. Fault injection covers remount detach, remount attach and held attach, preserving error rows and panic diagnostics. Successful remount observations are unchanged. Tab visibility now compares PID, executable path and argv together, with one shared sleep predicate and process-list helper; the measured visibility result remains unchanged.
+The dev-owned Podman service starts in its own process group. SIGINT/SIGTERM delivered to the dev foreground group therefore leave the engine available while Wrangler drains. Tests send signals both to the dev PID and to the entire group; a delayed Wrangler fixture still completes an HTTP cleanup request through Podman before the service stops.
 
-## Cleanup and small review fixes
+Dev installs its signal handlers before bootstrap. Interrupting a pending startup aborts and cleans the acquired service; failure to spawn npx also closes it. Regression tests verify service death and removal of its private socket directory for both interrupts and the spawn-error path.
 
-Process cleanup checks the owned process group's existence independently of its leader. A reaped leader does not cancel escalation or finish cleanup while descendants remain; the first ESRCH ends signalling for that group. Regressions cover a resistant TCP listener whose leader exits both before and during cleanup and require group disappearance and a closed port. Development forwards SIGINT/SIGTERM to Wrangler and closes Podman only after Wrangler exits. Both signal tests delay Wrangler cleanup, make an engine request through the still-live proxy, then assert Podman shuts down last.
+Missing Miniflare source or egress-image declarations now skip only the optional override for dev. The service, Docker shim and proxy remain usable. Discovery happens before service creation, and conformance opts into strict discovery. Tests cover both a missing source file and a source without the declaration: strict mode fails before spawning anything, while optional mode successfully serves an engine request without the override.
 
-Service readiness diagnostics are preserved together with a subsequent cleanup error. Missing Miniflare image declarations produce a real lookup failure before environment mutation, while explicit image configuration bypasses discovery. Provenance exclusions are root-anchored even for subdirectory queries. Compiler-image references cannot begin with options. The isolated server bootstrap uses the runner's `process.execPath`. Redundant held-probe cancellation assignment is removed without claiming to resolve the broader deadline/lifetime finding below.
+Bootstrap awaits the proxy's listening event, so bind errors reject and clean up instead of escaping as uncaught exceptions. A bind-failure regression verifies the service stops and the environment remains unchanged.
 
-Linux and all five OS cold/warm latency records and provenance were regenerated. Both committed evidence files identify clean source `23cc5f89f38ab74426c4f3fafa296bccc25e9452` with `dirty:false`. Timings are noisy evidence, not claimed runtime speedups. The full recordings rebuilt web assets, the WASI probe, release helper and Worker and verified the existing compiler image against the checkout.
+## Other small corrections
+
+- Signalled server death ends the OS startup poll immediately.
+- Both latency runners validate prepare results and preserve the setup phase and errno instead of failing at the next operation.
+- An explicitly empty Podman cache path is rejected before resolving or creating directories.
+- Artifact writers, readers/checks and provenance exclusions share one generated filename registry; a regression verifies the complete emitted file set.
+- The proxy's explicit `destroyAllSockets` operation closes upgraded streams without overriding Node's ordinary `closeAllConnections` method; an actual upgraded-socket test covers it.
+- The unused single-port helper and OS skip import are removed.
+
+## Measurement status
+
+No new Linux or OS measurements were recorded this round. Successful probe sequences, observation fields, artifact filenames and timed operations are unchanged; the corrections concern bootstrap, failure handling and bookkeeping. The six generated files and the difference registry are unchanged from `dcc9daa`. The existing 123-row record still passes `--check --recorded`: 15 same, 105 differences/skips and three process observations.
+
+The last full recordings and independent byte-for-byte reproduction remain those documented by `dcc9daa`. Both evidence files still identify measured source `23cc5f89f38ab74426c4f3fafa296bccc25e9452` with `dirty:false`; they have not been relabeled as measurements of this revision. No new result changes or timing comparisons are claimed.
 
 ## Deferred items
 
-Ten of the fifteen comments on `c71443c` are fixed. The other five are all tracked in [#67](https://github.com/kingwingfly/os/issues/67), linked to #46, with original review links, reasons and acceptance tests:
-
-- Docker/podman-docker endpoint discovery across CLI versions.
-- Held-probe phase deadlines and awaiting cancelled-process termination.
-- Transient Podman runroot lifecycle with persistent image-store compatibility.
-- Development shared-service publication/reuse policy and concurrent ownership.
-- Using the real ABI package/workspace manifest in the mutation gate.
-
-The current full measurements do not claim coverage of those deferred failure/portability scenarios. Commands and prerequisites are in [README](README.md); the PR records this revision's exact checks, results and exclusions.
+The two new deferrals in #67 concern preserving process-group ownership after the leader/group exits, and bounded escalation with survivor reporting/retryable cleanup errors. The five earlier CLI, held-probe, runroot, shared-service and ABI-manifest items remain there. This round does not claim those seven findings fixed. The PR records the exact checks run, their results and what was not run.

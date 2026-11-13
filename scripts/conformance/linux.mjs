@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
-import { run, targetDir, jsonLines, skip, operations, probeOperations, save } from './common.mjs';
+import { run, targetDir, jsonLines, requireProbeSuccess, skip, operations, probeOperations, save } from './common.mjs';
 export function buildProbe() {
   run('cargo',['build','--locked','-p','os-conformance','--release'],{stdio:'inherit'});
   return join(targetDir(),'release/os-conformance');
@@ -49,7 +49,7 @@ export async function linux({namespaceProbe=spawnSync,binary=buildProbe(),measur
     if(!measureLatency){success=true;return {observations,process:processRows,evidence};}
     const timingRoot=join(dir,'timing');await mkdir(timingRoot);
     const args=['latency',timingRoot,timingRoot,timingRoot,String(process.getuid()),String(process.getgid())];
-    run(binary,[...args,'prepare']);const latency=[];
+    requireProbeSuccess(jsonLines(run(binary,[...args,'prepare'])),'native latency prepare failed');const latency=[];
     for (const operation of operations) {
       const samples=[];
       for (const temperature of ['cold','warm']) {

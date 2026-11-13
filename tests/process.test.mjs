@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import http from 'node:http';
 import { mkdtemp, writeFile, readFile, rm, symlink, stat, open } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { start, stop } from '../scripts/process.mjs';
 import { startPodman, socketLive, podmanEnvironment } from '../scripts/podman.mjs';
@@ -158,7 +159,7 @@ for(const early of [false,true])test('stop waits for a resistant group member af
   } finally {try {process.kill(-child.pid,'SIGKILL');}catch(error){if(error.code!=='ESRCH')throw error;}await stop(child,{timeout:80});}
 });
 
-for(const event of ['SIGINT','SIGTERM'])test('dev keeps Podman available until Wrangler finishes '+event,async()=>{
+for(const delivery of ['pid','foreground group'])for(const event of ['SIGINT','SIGTERM'])test('dev keeps Podman available until Wrangler finishes '+event+' to '+delivery,async()=>{
   const dir=await mkdtemp(join(tmpdir(),'conformance-dev-drain-')),events=join(dir,'events');let child;
   const env={...process.env,PATH:dir,TMPDIR:dir,CONFORMANCE_EVENTS:events};
   delete env.DOCKER_HOST;delete env.WRANGLER_DOCKER_HOST;
@@ -168,9 +169,12 @@ for(const event of ['SIGINT','SIGTERM'])test('dev keeps Podman available until W
     await writeFile(join(dir,'podman'),'#!'+process.execPath+'\n'+record+`
       const s=require('node:http').createServer((_req,res)=>{record('podman-request');res.end('alive');});
       s.listen(process.argv.at(-1).slice(7));
+      process.on('SIGINT',()=>{record('podman-received-foreground-signal');process.exit(2);});
       process.on('SIGTERM',()=>{record('podman-stopped');s.close(()=>process.exit(0));});`,{mode:0o755});
     await writeFile(join(dir,'npx'),'#!'+process.execPath+'\n'+record+`
+      let draining=false;
       process.on(${JSON.stringify(event)},async()=>{
+        if(draining)return;draining=true;
         record('wrangler-draining');await new Promise(r=>setTimeout(r,150));
         require('node:http').get({socketPath:process.env.WRANGLER_DOCKER_HOST.slice(7),path:'/cleanup'},res=>{
           res.resume();res.on('end',()=>{record('wrangler-finished');process.exit(0);});
@@ -179,7 +183,8 @@ for(const event of ['SIGINT','SIGTERM'])test('dev keeps Podman available until W
     child=start(process.execPath,['scripts/dev.mjs'],{env,detached:true,stdio:['ignore','pipe','pipe']});
     const exited=once(child,'exit');let errors='';child.stderr.on('data',c=>{errors+=c;});
     await new Promise((resolve,reject)=>{let text='';child.stdout.on('data',c=>{text+=c;if(text.includes('WRANGLER_READY'))resolve();});child.once('exit',()=>reject(new Error('dev fixture exited before ready: '+errors)));});
-    child.kill(event);assert.equal((await exited)[0],0,errors);
+    if(delivery==='pid')child.kill(event);else process.kill(-child.pid,event);
+    assert.equal((await exited)[0],0,errors);
     assert.deepEqual((await readFile(events,'utf8')).trim().split('\n'),['wrangler-draining','podman-request','wrangler-finished','podman-stopped']);
   } finally {await stop(child,{timeout:100});await rm(dir,{recursive:true,force:true});}
 });
@@ -199,14 +204,79 @@ test('stale shared socket gets a private service without unlinking the shared na
   } finally {await service?.close();await stop(child);await rm(dir,{recursive:true,force:true});}
 });
 
-test('Podman configuration leaves the environment untouched on lookup failure',()=>{
+test('strict Podman configuration leaves the environment untouched on lookup failure',()=>{
   const env={ORIGINAL:'retained'};
-  assert.throws(()=>podmanEnvironment(env,'/tmp/proxy','export const unrelated = "fixture";'),/Miniflare egress image not found/);
+  assert.throws(()=>podmanEnvironment(env,'/tmp/proxy',{strictEgress:true,readMiniflare:()=> 'export const unrelated = "fixture";'}),/Miniflare egress image not found/);
   assert.deepEqual(env,{ORIGINAL:'retained'});
   const explicit={MINIFLARE_CONTAINER_EGRESS_IMAGE:'registry.example/egress:tag'};
-  podmanEnvironment(explicit,'/tmp/proxy','no default declaration');
+  podmanEnvironment(explicit,'/tmp/proxy',{readMiniflare:()=>{throw new Error('explicit image must bypass lookup');}});
   assert.equal(explicit.MINIFLARE_CONTAINER_EGRESS_IMAGE,'registry.example/egress:tag');
   assert.equal(explicit.WRANGLER_DOCKER_HOST,'unix:///tmp/proxy');
+});
+
+for(const missing of ['declaration','file'])test('missing egress '+missing+' keeps optional Podman usable and fails strict bootstrap before spawn',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-egress-')),marker=join(dir,'started'),source=join(dir,'miniflare.js');let service;
+  const env={PATH:dir,CONFORMANCE_MARKER:marker};
+  const options={socket:join(dir,'engine.sock'),proxySocket:join(dir,'proxy.sock'),detached:true,readMiniflare:()=>readFileSync(source,'utf8')};
+  try {
+    if(missing==='declaration')await writeFile(source,'export const unrelated = "fixture";');
+    await writeFile(join(dir,'podman'),'#!'+process.execPath+'\n'+`
+      require('node:fs').writeFileSync(process.env.CONFORMANCE_MARKER,String(process.pid));
+      require('node:http').createServer((_req,res)=>res.end('engine alive')).listen(process.argv.at(-1).slice(7));`,{mode:0o755});
+    await assert.rejects(startPodman(env,{...options,strictEgress:true}),missing==='file'?{code:'ENOENT'}:/Miniflare egress image not found/);
+    await assert.rejects(readFile(marker),{code:'ENOENT'});assert.deepEqual(env,{PATH:dir,CONFORMANCE_MARKER:marker});
+    service=await startPodman(env,options);
+    assert.equal(env.WRANGLER_DOCKER_HOST,'unix://'+options.proxySocket);
+    assert(!Object.hasOwn(env,'MINIFLARE_CONTAINER_EGRESS_IMAGE'));
+    const body=await new Promise((resolve,reject)=>http.get({socketPath:options.proxySocket,path:'/_ping'},res=>{let body='';res.on('data',c=>{body+=c;});res.on('end',()=>resolve(body));}).on('error',reject));
+    assert.equal(body,'engine alive');
+    const pid=Number(await readFile(marker,'utf8'));await service.close();service=null;assert(!exists(pid));
+  } finally {await service?.close();await rm(dir,{recursive:true,force:true});}
+});
+
+test('proxy bind failure rejects bootstrap and stops the service without mutating the environment',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-proxy-failure-')),marker=join(dir,'pid');
+  const env={PATH:dir,CONFORMANCE_MARKER:marker,MINIFLARE_CONTAINER_EGRESS_IMAGE:'fixture/egress:tag'};
+  try {
+    await writeFile(join(dir,'podman'),'#!'+process.execPath+'\n'+`
+      require('node:fs').writeFileSync(process.env.CONFORMANCE_MARKER,String(process.pid));
+      require('node:net').createServer().listen(process.argv.at(-1).slice(7));`,{mode:0o755});
+    await assert.rejects(startPodman(env,{socket:join(dir,'engine.sock'),proxySocket:join(dir,'absent/proxy.sock'),detached:true}),{code:'EACCES'});
+    assert(!Object.hasOwn(env,'WRANGLER_DOCKER_HOST'));assert(!exists(Number(await readFile(marker,'utf8'))));
+  } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+for(const scenario of ['SIGINT','SIGTERM','spawn failure'])test('dev cleans its detached service on bootstrap '+scenario,async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-dev-early-')),info=join(dir,'service.json');let child,service;
+  const env={...process.env,PATH:dir,TMPDIR:dir,CONFORMANCE_INFO:info};
+  delete env.DOCKER_HOST;delete env.WRANGLER_DOCKER_HOST;
+  try {
+    await symlink('/bin/sh',join(dir,'sh'));
+    await writeFile(join(dir,'podman'),'#!'+process.execPath+'\n'+`
+      const socket=process.argv.at(-1).slice(7);
+      require('node:fs').writeFileSync(process.env.CONFORMANCE_INFO+'.tmp',JSON.stringify({pid:process.pid,socket}));
+      require('node:fs').renameSync(process.env.CONFORMANCE_INFO+'.tmp',process.env.CONFORMANCE_INFO);
+      ${scenario==='spawn failure'?"require('node:net').createServer().listen(socket);":"setInterval(()=>{},1000);"}`,{mode:0o755});
+    // No npx in PATH: the spawn-failure branch must clean up from its error event.
+    child=start(process.execPath,['scripts/dev.mjs'],{env,detached:true,stdio:['ignore','pipe','pipe']});
+    const exited=once(child,'exit');let errors='';child.stderr.on('data',c=>{errors+=c;});
+    const deadline=Date.now()+5000;
+    while(!service) {
+      try {service=JSON.parse(await readFile(info,'utf8'));}catch(error) {
+        if(error.code!=='ENOENT'||Date.now()>deadline)throw error;
+        await new Promise(resolve=>setTimeout(resolve,20));
+      }
+    }
+    if(scenario!=='spawn failure')process.kill(-child.pid,scenario);
+    assert.equal((await exited)[0],scenario==='SIGINT'?130:scenario==='SIGTERM'?143:1,errors);
+    assert(!exists(service.pid),'detached Podman survived dev exit');
+    await assert.rejects(stat(dirname(service.socket)),{code:'ENOENT'});
+    if(scenario==='spawn failure')assert.match(errors,/Wrangler failed to start/);
+    else assert(!errors.includes('starting Wrangler without container bootstrap'));
+  } finally {
+    if(service&&exists(service.pid))process.kill(-service.pid,'SIGKILL');
+    await stop(child,{timeout:100});await rm(dir,{recursive:true,force:true});
+  }
 });
 
 test('helper startup stderr survives its failed connection announcement in the runner log',async()=>{

@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 // The persistent image cache is executable input. Never accept a pre-created
 // foreign/shared directory (or a symlink), including explicit cache overrides.
 export async function imageStore(path=join(homedir(),'.os-conformance-images')) {
+  if(path==='')throw new Error('OS_CONFORMANCE_PODMAN_DIR must not be empty');
   const cache=resolve(path);
   await mkdir(cache,{recursive:true,mode:0o700});
   const info=await lstat(cache);

@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
+import { once } from 'node:events';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { podmanProxy } from './podman-proxy.mjs';
@@ -11,13 +12,14 @@ import { start, stop } from './process.mjs';
 const scripts=dirname(fileURLToPath(import.meta.url));
 export const has=command=>spawnSync('sh',['-c',`command -v ${command}`],{stdio:'ignore'}).status===0;
 export const needsPodman=env=>!env.WRANGLER_DOCKER_HOST&&!env.DOCKER_HOST&&!has('docker')&&has('podman');
-export function podmanEnvironment(env,proxySocket,miniflare) {
+export function podmanEnvironment(env,proxySocket,{strictEgress=false,readMiniflare=()=>readFileSync(join(scripts,'../node_modules/miniflare/dist/src/index.js'),'utf8')}={}) {
   let egress=env.MINIFLARE_CONTAINER_EGRESS_IMAGE;
   if(!env.MINIFLARE_CONTAINER_EGRESS_IMAGE) {
-    const source=miniflare??readFileSync(join(scripts,'../node_modules/miniflare/dist/src/index.js'),'utf8');
-    const image=source.match(/DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "([^"]+)"/)?.[1];
-    if(!image)throw new Error('Miniflare egress image not found; set MINIFLARE_CONTAINER_EGRESS_IMAGE explicitly');
-    egress=image.split('/')[0].includes('.')?image:'docker.io/'+image;
+    try {
+      const image=readMiniflare().match(/DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "([^"]+)"/)?.[1];
+      if(!image)throw new Error('Miniflare egress image not found; set MINIFLARE_CONTAINER_EGRESS_IMAGE explicitly');
+      egress=image.split('/')[0].includes('.')?image:'docker.io/'+image;
+    } catch(error) {if(strictEgress)throw error;}
   }
   env.WRANGLER_DOCKER_BIN=join(scripts,'podman-docker.sh');
   env.WRANGLER_DOCKER_HOST='unix://'+proxySocket;
@@ -34,13 +36,19 @@ export function socketLive(path,timeout=2000) {
     socket.setTimeout(timeout,()=>finish(new Error('Podman socket connect timed out; shared socket preserved')));
   });
 }
-export async function startPodman(env,{socket,proxySocket,reuse=false,stdio='ignore',detached=false,signal,startupTimeout=10000,allowLate=false}) {
+export async function startPodman(env,{socket,proxySocket,reuse=false,stdio='ignore',detached=false,signal,startupTimeout=10000,allowLate=false,strictEgress=false,readMiniflare}) {
+  // Resolve optional/strict discovery before starting resources. Publish the
+  // engine overrides only once the proxy has actually bound its socket.
+  const configured={...env};
+  podmanEnvironment(configured,proxySocket,{strictEgress,readMiniflare});
   let service,proxy,closing,privateDir;
   const close=()=>closing??=(async()=>{
     try {proxy?.close();} finally {try {await stop(service);}finally {if(privateDir)await rm(privateDir,{recursive:true,force:true});}}
   })();
   try {
+    signal?.throwIfAborted();
     const borrowed=reuse&&existsSync(socket)&&await socketLive(socket);
+    signal?.throwIfAborted();
     if(!borrowed) {
       if(!reuse&&existsSync(socket))throw new Error('isolated Podman socket already exists');
       if(reuse) {
@@ -50,6 +58,7 @@ export async function startPodman(env,{socket,proxySocket,reuse=false,stdio='ign
         socket=join(privateDir,'service.sock');
       }
       const cgroups=env.DBUS_SESSION_BUS_ADDRESS?[]:['--cgroup-manager=cgroupfs'];
+      signal?.throwIfAborted();
       service=start('podman',[...cgroups,'system','service','--time=0','unix://'+socket],{stdio,env,detached});
       const deadline=Date.now()+startupTimeout;
       while(!existsSync(socket)) {
@@ -62,7 +71,9 @@ export async function startPodman(env,{socket,proxySocket,reuse=false,stdio='ign
       signal?.throwIfAborted();
     }
     proxy=podmanProxy(proxySocket,socket);
-    podmanEnvironment(env,proxySocket);
+    await once(proxy,'listening');
+    signal?.throwIfAborted();
+    for(const key of ['WRANGLER_DOCKER_BIN','WRANGLER_DOCKER_HOST','MINIFLARE_CONTAINER_EGRESS_IMAGE'])if(configured[key]!==undefined)env[key]=configured[key];
     return {close,socket};
   } catch(error) {
     try {await close();} catch(cleanupError) {console.error('Podman startup cleanup failed:',cleanupError.message);}

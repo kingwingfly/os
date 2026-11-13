@@ -5,6 +5,7 @@ import { join, resolve, relative, isAbsolute } from 'node:path';
 import { existsSync, realpathSync } from 'node:fs';
 import { start as spawnOwned } from '../process.mjs';
 export { stop } from '../process.mjs';
+export const generatedFiles = Object.freeze({baseline:'baseline.json',linuxLatency:'linux-latency.json',linuxEvidence:'linux-evidence.json',latency:'latency.json',evidence:'evidence.json',matrix:'matrix.md'});
 export const filesystems = ['cloud', 'browser-storage', 'directory-handle', 'local-helper', 'relay'];
 export const operations = ['stat-eight-deep','read-1mib','write-1mib','ls-usr-bin','shell-first-prompt'];
 export const probeOperations = {'stat-eight-deep':'stat','read-1mib':'read','write-1mib':'write'};
@@ -13,6 +14,10 @@ export const cases = ['alias','remount','open-rename','open-unlink','unmount-ope
 export const run = (cmd,args,options={}) => execFileSync(cmd,args,{encoding:'utf8',maxBuffer:32<<20,...options});
 export const targetDir = () => JSON.parse(run('cargo',['metadata','--no-deps','--format-version=1'])).target_directory;
 export const jsonLines = s => s.trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
+export function requireProbeSuccess(rows,phase) {
+  if(rows.some(row=>row.errno||row.skipped))throw new Error(phase+': '+JSON.stringify(rows));
+  return rows;
+}
 export const skip = (name,reason) => ({case:name,step:'unavailable',call:name,skipped:reason});
 export const ok = (name,step,call,value) => ({case:name,step,call,ok:value});
 export function canonical(value) {
@@ -32,7 +37,6 @@ export async function ports(count) {
     return listeners.map(s=>s.address().port);
   } finally {await Promise.all(listeners.map(s=>new Promise(resolve=>s.close(resolve))));}
 }
-export async function port() {return (await ports(1))[0];}
 export function start(cmd,args,options={}) {return spawnOwned(cmd,args,{detached:true,...options});}
 export async function sourceEvidence(path,fragments) {
   const text=await readFile(path,'utf8');
@@ -45,7 +49,7 @@ export function revision(cwd='.',out=null) {
     const output=resolve(out),path=relative(root,existsSync(output)?realpathSync(output):output);
     // Never exclude the whole source tree when --out is the repository root.
     if(path!=='..'&&!path.startsWith('../')&&!isAbsolute(path)) {
-      for(const file of ['baseline.json','latency.json','linux-latency.json','evidence.json','linux-evidence.json','matrix.md'])exclusions.push(':(top,exclude,literal)'+join(path,file));
+      for(const file of Object.values(generatedFiles))exclusions.push(':(top,exclude,literal)'+join(path,file));
     }
   }
   return {
