@@ -1,31 +1,57 @@
 # PR #66 review measurement changes
 
-Compared with commit `2455e96`, the commit reviewed in this round. No runtime semantics were changed. **15 rows changed normalized traces and two additional rows changed comparison results only.** The matrix contains 135 rows: **16 matching filesystem traces, 104 differences/skips, and 15 process observations**.
+Compared with reviewed commit `e433073`. No OS runtime semantics were changed. **23 filesystem rows changed normalized evidence**, and the same three process measurements moved from five duplicated profile copies into one independent section. The new matrix has **120 filesystem rows (17 matching traces and 103 differences/skips), plus three process observations**.
 
-The new results remove five unsupported matches (four single-account creation rows and cloud two-accounts). Two retained-file rows now match on observable fields; their raw unavailable device identity remains visible. These are measurement corrections, not runtime improvements or regressions.
+Linux now records both refused busy unmount and successful `umount2(MNT_DETACH)`. Its retained fd survives actual detach; cwd lookup returns ENOENT. OS records its existing detach separately from the unavailable busy-unmount API, then records re-attachment. Missing identity values now use structured markers; the comparison applies to every identity step. `cloud/hard-link` consequently matches on observable inode/call fields while device identity remains explicitly incomparable. This is a measurement correction, not a runtime improvement.
 
-| Row | Changed evidence | Result before → after |
+| Row | Changed steps | Result before → after |
 | --- | --- | --- |
-| cloud/open-rename | Comparison only: exclude unobservable fd st_dev; retain raw evidence and compare inode/calls/errors. | difference/skip → same |
-| cloud/creation | Stat directory mode/group; explicitly skip inheritance when creator group equals directory group. | same → difference/skip |
-| cloud/two-accounts | Measure directory mode/group, supplementary groups and inheritance; native A now uses a distinct directory group; OS A inheritance is unavailable. | same → difference/skip |
-| cloud/startup | Replace source-text flags with live init/login lease ownership and a real managed supervisor. | observation → observation |
-| browser-storage/creation | Stat directory mode/group; explicitly skip inheritance when creator group equals directory group. | same → difference/skip |
-| browser-storage/two-accounts | Measure directory mode/group, supplementary groups and inheritance; native A now uses a distinct directory group; OS A inheritance is unavailable. | difference/skip → difference/skip |
-| browser-storage/startup | Replace source-text flags with live init/login lease ownership and a real managed supervisor. | observation → observation |
-| directory-handle/creation | Stat directory mode/group; explicitly skip inheritance when creator group equals directory group. | same → difference/skip |
-| directory-handle/two-accounts | Measure directory mode/group, supplementary groups and inheritance; native A now uses a distinct directory group; OS A inheritance is unavailable. | difference/skip → difference/skip |
-| directory-handle/startup | Replace source-text flags with live init/login lease ownership and a real managed supervisor. | observation → observation |
-| local-helper/open-rename | Comparison only: exclude unobservable fd st_dev; retain raw evidence and compare inode/calls/errors. | difference/skip → same |
-| local-helper/creation | Stat directory mode/group; explicitly skip inheritance when creator group equals directory group. | same → difference/skip |
-| local-helper/two-accounts | Measure directory mode/group, supplementary groups and inheritance; native A now uses a distinct directory group; OS A inheritance is unavailable. | difference/skip → difference/skip |
-| local-helper/startup | Replace source-text flags with live init/login lease ownership and a real managed supervisor. | observation → observation |
-| relay/creation | Stat directory mode/group; explicitly skip inheritance when creator group equals directory group. | difference/skip → difference/skip |
-| relay/two-accounts | Measure directory mode/group, supplementary groups and inheritance; native A now uses a distinct directory group; OS A inheritance is unavailable. | difference/skip → difference/skip |
-| relay/startup | Replace source-text flags with live init/login lease ownership and a real managed supervisor. | observation → observation |
+| cloud/open-rename | OS: identity | same → same |
+| cloud/open-unlink | OS: identity | difference/skip → difference/skip |
+| cloud/unmount-open | Linux: attach, detach, fstat, read | difference/skip → difference/skip |
+| cloud/unmount-cwd | Linux: attach, detach, getcwd | difference/skip → difference/skip |
+| cloud/hard-link | OS: identity | difference/skip → same |
+| browser-storage/alias | OS: identity | difference/skip → difference/skip |
+| browser-storage/open-rename | OS: identity | difference/skip → difference/skip |
+| browser-storage/open-unlink | OS: identity | difference/skip → difference/skip |
+| browser-storage/unmount-open | Linux: attach, detach, fstat, read; OS: attach, detach, fstat, read, unmount | difference/skip → difference/skip |
+| browser-storage/unmount-cwd | Linux: attach, detach, getcwd; OS: attach, detach, getcwd, unmount | difference/skip → difference/skip |
+| directory-handle/alias | OS: identity | difference/skip → difference/skip |
+| directory-handle/open-rename | OS: identity | difference/skip → difference/skip |
+| directory-handle/open-unlink | OS: identity | difference/skip → difference/skip |
+| directory-handle/unmount-open | Linux: attach, detach, fstat, read; OS: attach, detach, fstat, read, unmount | difference/skip → difference/skip |
+| directory-handle/unmount-cwd | Linux: attach, detach, getcwd; OS: attach, detach, getcwd, unmount | difference/skip → difference/skip |
+| local-helper/alias | OS: identity | difference/skip → difference/skip |
+| local-helper/open-rename | OS: identity | same → same |
+| local-helper/open-unlink | OS: identity | difference/skip → difference/skip |
+| local-helper/unmount-open | Linux: attach, detach, fstat, read; OS: attach, detach, fstat, read, unmount | difference/skip → difference/skip |
+| local-helper/unmount-cwd | Linux: attach, detach, getcwd; OS: attach, detach, getcwd, unmount | difference/skip → difference/skip |
+| relay/alias | OS: identity | difference/skip → difference/skip |
+| relay/unmount-open | Linux: attach, detach, fstat, read; OS: attach, detach, fstat, read, unmount | difference/skip → difference/skip |
+| relay/unmount-cwd | Linux: attach, detach, getcwd; OS: attach, detach, getcwd, unmount | difference/skip → difference/skip |
 
-All other normalized row results are unchanged. Held-unmount rows are stored with append order instead of positional insertion; comparison has always sorted steps, so that storage-order cleanup is not a result change. All retained-fd rows now label the device comparison limit in the table, including rows that still differ on inode or I/O behavior.
+## Process rows consolidated without changing their results
 
-Linux partial mappings, denied supplementary-group clearing, the no-namespace fallback and symlinked TMPDIR are covered by the explicit native regression gate. They do not change this host’s fully mapped reference profile.
+Each old row below maps to the single new process row; all three normalized Linux/OS traces and signatures are unchanged. The 12 redundant copies are removed.
 
-The recorded target runs name source commit `e9b6529`; the dirty flag is true because generated docs/compat artifacts were being replaced. Harness/runtime sources were committed before those runs. Timings are separate and are not used for equality.
+| Previous row | New row | Result |
+| --- | --- | --- |
+| cloud/startup | process/startup | unchanged observation |
+| browser-storage/startup | process/startup | unchanged observation |
+| directory-handle/startup | process/startup | unchanged observation |
+| local-helper/startup | process/startup | unchanged observation |
+| relay/startup | process/startup | unchanged observation |
+| cloud/gui-processes | process/gui-processes | unchanged observation |
+| browser-storage/gui-processes | process/gui-processes | unchanged observation |
+| directory-handle/gui-processes | process/gui-processes | unchanged observation |
+| local-helper/gui-processes | process/gui-processes | unchanged observation |
+| relay/gui-processes | process/gui-processes | unchanged observation |
+| cloud/tab-pids | process/tab-pids | unchanged observation |
+| browser-storage/tab-pids | process/tab-pids | unchanged observation |
+| directory-handle/tab-pids | process/tab-pids | unchanged observation |
+| local-helper/tab-pids | process/tab-pids | unchanged observation |
+| relay/tab-pids | process/tab-pids | unchanged observation |
+
+The browser-storage `cross-rename` and `absolute-symlink` fixtures now cross into actual cloud storage, with source-only markers proving the trees are distinct. Their normalized outcomes remain EXDEV and ENOENT respectively. Other profiles also verify distinct crossing contents. The CDP drop no longer reaches the application upload handler. These isolation corrections do not otherwise change recorded results.
+
+Both target runs measured source commit `015dbbf` with `dirty:false`. The dirty flag excludes the resolved output directory, including generated timings, while retaining source modifications. The helper is now built in release mode; all cold/warm timings were recollected and remain outside comparison signatures.

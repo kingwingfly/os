@@ -1,5 +1,5 @@
 # Reviewed L0a measurements; no architecture or permanent provider limits selected.
-# [[observation]] records lack a comparable Linux fixture and detect changes, not convergence.
+# Process observations are stored once under process/*, independently of filesystems.
 # Allowed owners are data in follow-up-issues.json.
 
 [[difference]]
@@ -18,19 +18,19 @@ signature = "7c8f354d3d77917e2bfb1a2e0d83b56a2b4fc1f4eef36e0c3a32720fb11246f5"
 id = "cloud/open-unlink"
 issues = ["#48"]
 reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "207bbc93587875200314a99797fd3ae2c518a062e92f8ae0cbacfea1e153d814"
+signature = "7640832d79a779bd6ae2dd9bb15c1cfd2b32af6535bd567016f319b4ed08f39d"
 
 [[difference]]
 id = "cloud/unmount-open"
 issues = ["#51"]
 reason = "The current API cannot detach the cloud root; the busy-unmount case is explicitly unavailable."
-signature = "bf9657dcc1f8dd88820662d10f41284077d733427a68d37537231b8afd6af654"
+signature = "b324915528cf5536275e149decb7404a05d1eae1aae347f010a3d6634717d56f"
 
 [[difference]]
 id = "cloud/unmount-cwd"
 issues = ["#51"]
 reason = "The current API cannot detach the cloud root; the cwd busy-unmount case is explicitly unavailable."
-signature = "23dccba79d9f0c9a19e1358ba147539a2b251c1cd0d0d01c84c2723976d79dbe"
+signature = "9fb930729fb777a9256bd963985127aff9aa3f5f8a0f9f7883ffd8acbd50724f"
 
 [[difference]]
 id = "cloud/flush"
@@ -75,12 +75,6 @@ reason = "getcwd returns the removed pathname instead of ENOENT."
 signature = "80d6718291660e01a8fb4975cdb4f82d7394258015b3cfffab2a125dba33e638"
 
 [[difference]]
-id = "cloud/hard-link"
-issues = ["#48"]
-reason = "Link creation and inode equality succeed, but ABI Stat does not expose device identity. The old Preview 1 dev=1 equality was fabricated by the adapter."
-signature = "f04b63369cf3493d91357d2d330226ad1907360144683134edb34d197b03597c"
-
-[[difference]]
 id = "cloud/creation"
 issues = ["#49"]
 reason = "Setgid inheritance is explicitly incomparable: creator and directory primary groups coincide. Directory mode/group are measured; metadata follow-up validation must exercise distinct groups."
@@ -110,29 +104,11 @@ issues = ["#51","#58"]
 reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
 signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 
-[[observation]]
-id = "cloud/startup"
-issues = ["#56","#57"]
-reason = "Live init/login leases name the current execution host; a real managed /usr/bin/supervise process runs on the login owner with PID 1 as parent. Native startup details remain environmental evidence."
-signature = "c5bc335c7b9fe7b4fba8fa71f62c09c5510af7c0008e7ecf1a5ca7c3685838ea"
-
-[[observation]]
-id = "cloud/gui-processes"
-issues = ["#63","#64"]
-reason = "Actual Files/Mounts/Editor/Preview windows open without corresponding process images in the registry. The headless Linux host has no matching applications, so this row is incomparable."
-signature = "f8af0844eb74ae2fd78c97a2bfbdbed59ab0e64d413eb240e7e5b4fd36e0e4bf"
-
-[[observation]]
-id = "cloud/tab-pids"
-issues = ["#54"]
-reason = "A second tab with the same login sees the first tab live sleep PID. The headless Linux host has no browser OS tabs, so this row is incomparable."
-signature = "4098b79c8fe64247aa2dbc68a6d3ea6aa586d709602f1e35c2663e2ba736d4a6"
-
 [[difference]]
 id = "browser-storage/alias"
 issues = ["#48","#49"]
 reason = "Attachments report different inode identities; chmod and ACL changes are private to the first attachment. Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "fb8ce8c27425cf7522ae1898a472b0b2e168c310b4c95a4b120d70e571b8d2c4"
+signature = "beac5c32fc8724cac82c3b2b686513fb4e0fe51a4b1b357c2c378247473c90b2"
 
 [[difference]]
 id = "browser-storage/remount"
@@ -144,25 +120,25 @@ signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
 id = "browser-storage/open-rename"
 issues = ["#48"]
 reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write). Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "6e53b6b66f9c61892e4c1b54f9b46f57c652cff47585368d3fd76fdf146057d6"
+signature = "df27aa419c9a633039c061701a2bf48e874b830c020aa865795b94883169b1fe"
 
 [[difference]]
 id = "browser-storage/open-unlink"
 issues = ["#48"]
 reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "fb80fd8d3bd08975bbd3fe7ba5738e502130257f47b042fe224886899bc66fd2"
+signature = "5d63de0996e14c19ca7cae74d6d1f3dd682e7f7aac279a88663975cf1391924b"
 
 [[difference]]
 id = "browser-storage/unmount-open"
 issues = ["#51"]
-reason = "Unmount succeeds with a live open descriptor, then read/fstat return EBADF; Linux returns EBUSY and retains access."
-signature = "df3e73da16455b9463563f5c2d9a667483e9066692eff4733a4bc5f750a867ac"
+reason = "Linux ordinary umount returns EBUSY, then MNT_DETACH succeeds and the retained descriptor still reads hello/fstats size 5. OS unmountLocal detaches and invalidates the descriptor (EBADF); its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "5b8d1e41fa03e82fdfb208e17e5f37f421eaf780c5d354166d2fa81c953ac12b"
 
 [[difference]]
 id = "browser-storage/unmount-cwd"
 issues = ["#51"]
-reason = "Unmount succeeds with a process cwd inside the attachment; Linux returns EBUSY."
-signature = "4d7c1a84dc0caa9935597d89f66f3756127358b645af7936d85f269c35a3ccc9"
+reason = "Linux ordinary umount returns EBUSY; after successful MNT_DETACH, getcwd returns ENOENT. OS unmountLocal detaches but getcwd retains the old path string; its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "cbd90180570a9ba62759c60c3ac3b440c7e6bc3df689797618cc4fc9af312543"
 
 [[difference]]
 id = "browser-storage/flush"
@@ -260,29 +236,11 @@ issues = ["#51","#58"]
 reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
 signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 
-[[observation]]
-id = "browser-storage/startup"
-issues = ["#56","#57"]
-reason = "Live init/login leases name the current execution host; a real managed /usr/bin/supervise process runs on the login owner with PID 1 as parent. Native startup details remain environmental evidence."
-signature = "c5bc335c7b9fe7b4fba8fa71f62c09c5510af7c0008e7ecf1a5ca7c3685838ea"
-
-[[observation]]
-id = "browser-storage/gui-processes"
-issues = ["#63","#64"]
-reason = "Actual Files/Mounts/Editor/Preview windows open without corresponding process images in the registry. The headless Linux host has no matching applications, so this row is incomparable."
-signature = "f8af0844eb74ae2fd78c97a2bfbdbed59ab0e64d413eb240e7e5b4fd36e0e4bf"
-
-[[observation]]
-id = "browser-storage/tab-pids"
-issues = ["#54"]
-reason = "A second tab with the same login sees the first tab live sleep PID. The headless Linux host has no browser OS tabs, so this row is incomparable."
-signature = "4098b79c8fe64247aa2dbc68a6d3ea6aa586d709602f1e35c2663e2ba736d4a6"
-
 [[difference]]
 id = "directory-handle/alias"
 issues = ["#48","#49"]
 reason = "Attachments report different inode identities; chmod and ACL changes are private to the first attachment. Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "fb8ce8c27425cf7522ae1898a472b0b2e168c310b4c95a4b120d70e571b8d2c4"
+signature = "beac5c32fc8724cac82c3b2b686513fb4e0fe51a4b1b357c2c378247473c90b2"
 
 [[difference]]
 id = "directory-handle/remount"
@@ -294,25 +252,25 @@ signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
 id = "directory-handle/open-rename"
 issues = ["#48"]
 reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write). Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "6e53b6b66f9c61892e4c1b54f9b46f57c652cff47585368d3fd76fdf146057d6"
+signature = "df27aa419c9a633039c061701a2bf48e874b830c020aa865795b94883169b1fe"
 
 [[difference]]
 id = "directory-handle/open-unlink"
 issues = ["#48"]
 reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "fb80fd8d3bd08975bbd3fe7ba5738e502130257f47b042fe224886899bc66fd2"
+signature = "5d63de0996e14c19ca7cae74d6d1f3dd682e7f7aac279a88663975cf1391924b"
 
 [[difference]]
 id = "directory-handle/unmount-open"
 issues = ["#51"]
-reason = "Unmount succeeds with a live open descriptor, then read/fstat return EBADF; Linux returns EBUSY and retains access."
-signature = "df3e73da16455b9463563f5c2d9a667483e9066692eff4733a4bc5f750a867ac"
+reason = "Linux ordinary umount returns EBUSY, then MNT_DETACH succeeds and the retained descriptor still reads hello/fstats size 5. OS unmountLocal detaches and invalidates the descriptor (EBADF); its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "5b8d1e41fa03e82fdfb208e17e5f37f421eaf780c5d354166d2fa81c953ac12b"
 
 [[difference]]
 id = "directory-handle/unmount-cwd"
 issues = ["#51"]
-reason = "Unmount succeeds with a process cwd inside the attachment; Linux returns EBUSY."
-signature = "4d7c1a84dc0caa9935597d89f66f3756127358b645af7936d85f269c35a3ccc9"
+reason = "Linux ordinary umount returns EBUSY; after successful MNT_DETACH, getcwd returns ENOENT. OS unmountLocal detaches but getcwd retains the old path string; its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "cbd90180570a9ba62759c60c3ac3b440c7e6bc3df689797618cc4fc9af312543"
 
 [[difference]]
 id = "directory-handle/flush"
@@ -410,29 +368,11 @@ issues = ["#51","#58"]
 reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
 signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 
-[[observation]]
-id = "directory-handle/startup"
-issues = ["#56","#57"]
-reason = "Live init/login leases name the current execution host; a real managed /usr/bin/supervise process runs on the login owner with PID 1 as parent. Native startup details remain environmental evidence."
-signature = "c5bc335c7b9fe7b4fba8fa71f62c09c5510af7c0008e7ecf1a5ca7c3685838ea"
-
-[[observation]]
-id = "directory-handle/gui-processes"
-issues = ["#63","#64"]
-reason = "Actual Files/Mounts/Editor/Preview windows open without corresponding process images in the registry. The headless Linux host has no matching applications, so this row is incomparable."
-signature = "f8af0844eb74ae2fd78c97a2bfbdbed59ab0e64d413eb240e7e5b4fd36e0e4bf"
-
-[[observation]]
-id = "directory-handle/tab-pids"
-issues = ["#54"]
-reason = "A second tab with the same login sees the first tab live sleep PID. The headless Linux host has no browser OS tabs, so this row is incomparable."
-signature = "4098b79c8fe64247aa2dbc68a6d3ea6aa586d709602f1e35c2663e2ba736d4a6"
-
 [[difference]]
 id = "local-helper/alias"
 issues = ["#48","#49"]
 reason = "Attachments report different inode identities; chmod and ACL changes are private to the first attachment. Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "fb8ce8c27425cf7522ae1898a472b0b2e168c310b4c95a4b120d70e571b8d2c4"
+signature = "beac5c32fc8724cac82c3b2b686513fb4e0fe51a4b1b357c2c378247473c90b2"
 
 [[difference]]
 id = "local-helper/remount"
@@ -444,19 +384,19 @@ signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
 id = "local-helper/open-unlink"
 issues = ["#48"]
 reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "207bbc93587875200314a99797fd3ae2c518a062e92f8ae0cbacfea1e153d814"
+signature = "7640832d79a779bd6ae2dd9bb15c1cfd2b32af6535bd567016f319b4ed08f39d"
 
 [[difference]]
 id = "local-helper/unmount-open"
 issues = ["#51"]
-reason = "Unmount succeeds with a live open descriptor, then read/fstat return EBADF; Linux returns EBUSY and retains access."
-signature = "df3e73da16455b9463563f5c2d9a667483e9066692eff4733a4bc5f750a867ac"
+reason = "Linux ordinary umount returns EBUSY, then MNT_DETACH succeeds and the retained descriptor still reads hello/fstats size 5. OS unmountLocal detaches and invalidates the descriptor (EBADF); its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "5b8d1e41fa03e82fdfb208e17e5f37f421eaf780c5d354166d2fa81c953ac12b"
 
 [[difference]]
 id = "local-helper/unmount-cwd"
 issues = ["#51"]
-reason = "Unmount succeeds with a process cwd inside the attachment; Linux returns EBUSY."
-signature = "4d7c1a84dc0caa9935597d89f66f3756127358b645af7936d85f269c35a3ccc9"
+reason = "Linux ordinary umount returns EBUSY; after successful MNT_DETACH, getcwd returns ENOENT. OS unmountLocal detaches but getcwd retains the old path string; its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "cbd90180570a9ba62759c60c3ac3b440c7e6bc3df689797618cc4fc9af312543"
 
 [[difference]]
 id = "local-helper/flush"
@@ -548,29 +488,11 @@ issues = ["#51","#58"]
 reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
 signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 
-[[observation]]
-id = "local-helper/startup"
-issues = ["#56","#57"]
-reason = "Live init/login leases name the current execution host; a real managed /usr/bin/supervise process runs on the login owner with PID 1 as parent. Native startup details remain environmental evidence."
-signature = "c5bc335c7b9fe7b4fba8fa71f62c09c5510af7c0008e7ecf1a5ca7c3685838ea"
-
-[[observation]]
-id = "local-helper/gui-processes"
-issues = ["#63","#64"]
-reason = "Actual Files/Mounts/Editor/Preview windows open without corresponding process images in the registry. The headless Linux host has no matching applications, so this row is incomparable."
-signature = "f8af0844eb74ae2fd78c97a2bfbdbed59ab0e64d413eb240e7e5b4fd36e0e4bf"
-
-[[observation]]
-id = "local-helper/tab-pids"
-issues = ["#54"]
-reason = "A second tab with the same login sees the first tab live sleep PID. The headless Linux host has no browser OS tabs, so this row is incomparable."
-signature = "4098b79c8fe64247aa2dbc68a6d3ea6aa586d709602f1e35c2663e2ba736d4a6"
-
 [[difference]]
 id = "relay/alias"
 issues = ["#48","#49","#59"]
 reason = "Attachments report different inode identities. chmod and setfacl through the receiver return EPERM; the other attachment keeps private mode 0600 and no ACL. Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "25335efb55fb0bf5bf7f7c7c928df3ce1ef1cf32ae4e4e1c73037f56200d285a"
+signature = "9010a7e78ea62d7c5fc66d947d57466abe5efb1efb57efe3bfc2de45b92e481e"
 
 [[difference]]
 id = "relay/remount"
@@ -593,14 +515,14 @@ signature = "bf0285b4ac61ea7052aa97b08f1db03c22ece34df9456427050fec84a6de86d7"
 [[difference]]
 id = "relay/unmount-open"
 issues = ["#51"]
-reason = "Unmount succeeds with a live open descriptor, then read/fstat return EBADF; Linux returns EBUSY and retains access."
-signature = "df3e73da16455b9463563f5c2d9a667483e9066692eff4733a4bc5f750a867ac"
+reason = "Linux ordinary umount returns EBUSY, then MNT_DETACH succeeds and the retained descriptor still reads hello/fstats size 5. OS unmountLocal detaches and invalidates the descriptor (EBADF); its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "5b8d1e41fa03e82fdfb208e17e5f37f421eaf780c5d354166d2fa81c953ac12b"
 
 [[difference]]
 id = "relay/unmount-cwd"
 issues = ["#51"]
-reason = "Unmount succeeds with a process cwd inside the attachment; Linux returns EBUSY."
-signature = "4d7c1a84dc0caa9935597d89f66f3756127358b645af7936d85f269c35a3ccc9"
+reason = "Linux ordinary umount returns EBUSY; after successful MNT_DETACH, getcwd returns ENOENT. OS unmountLocal detaches but getcwd retains the old path string; its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "cbd90180570a9ba62759c60c3ac3b440c7e6bc3df689797618cc4fc9af312543"
 
 [[difference]]
 id = "relay/flush"
@@ -699,19 +621,19 @@ reason = "umount is absent from abi::Call; separate live-process tests measure t
 signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 
 [[observation]]
-id = "relay/startup"
+id = "process/startup"
 issues = ["#56","#57"]
 reason = "Live init/login leases name the current execution host; a real managed /usr/bin/supervise process runs on the login owner with PID 1 as parent. Native startup details remain environmental evidence."
 signature = "c5bc335c7b9fe7b4fba8fa71f62c09c5510af7c0008e7ecf1a5ca7c3685838ea"
 
 [[observation]]
-id = "relay/gui-processes"
+id = "process/gui-processes"
 issues = ["#63","#64"]
 reason = "Actual Files/Mounts/Editor/Preview windows open without corresponding process images in the registry. The headless Linux host has no matching applications, so this row is incomparable."
 signature = "f8af0844eb74ae2fd78c97a2bfbdbed59ab0e64d413eb240e7e5b4fd36e0e4bf"
 
 [[observation]]
-id = "relay/tab-pids"
+id = "process/tab-pids"
 issues = ["#54"]
 reason = "A second tab with the same login sees the first tab live sleep PID. The headless Linux host has no browser OS tabs, so this row is incomparable."
 signature = "4098b79c8fe64247aa2dbc68a6d3ea6aa586d709602f1e35c2663e2ba736d4a6"

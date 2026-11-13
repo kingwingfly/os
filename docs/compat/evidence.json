@@ -13,11 +13,12 @@
       "web/kernel/transform.js": "080d9bc6bd46c77b9e9fa966ecdde06bd90df1f98186ae906294db2eed72a7b8"
     }
   },
+  "diagnostics": [],
   "node": "v26.13.0",
   "platform": "Linux 7.2.14-arch1-1 x86_64 GNU/Linux",
   "revision": {
-    "dirty": true,
-    "head": "e9b6529278c72e32e0215dd2caad00c1fd90918c"
+    "dirty": false,
+    "head": "015dbbf51a36e79189844d6b61e883d79b986e2b"
   },
   "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "source": [

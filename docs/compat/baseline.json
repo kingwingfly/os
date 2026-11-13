@@ -576,19 +576,31 @@
       "step": "unmount"
     },
     {
-      "call": "pread(fd) after umount",
+      "call": "umount2(mount, MNT_DETACH)",
+      "case": "unmount-open",
+      "ok": null,
+      "step": "detach"
+    },
+    {
+      "call": "pread(fd) after detach",
       "case": "unmount-open",
       "ok": "hello",
       "step": "read"
     },
     {
-      "call": "fstat(fd) after umount",
+      "call": "fstat(fd) after detach",
       "case": "unmount-open",
       "ok": {
         "nlink": 1,
         "size": 5
       },
       "step": "fstat"
+    },
+    {
+      "call": "mount(source, mount)",
+      "case": "unmount-open",
+      "ok": null,
+      "step": "attach"
     },
     {
       "call": "write(file)",
@@ -609,9 +621,15 @@
       "step": "unmount"
     },
     {
-      "call": "getcwd() after umount",
+      "call": "umount2(mount, MNT_DETACH)",
       "case": "unmount-cwd",
-      "ok": "$ROOT",
+      "ok": null,
+      "step": "detach"
+    },
+    {
+      "call": "getcwd() after detach",
+      "case": "unmount-cwd",
+      "errno": "ENOENT",
       "step": "getcwd"
     },
     {
@@ -619,6 +637,12 @@
       "case": "unmount-cwd",
       "ok": null,
       "step": "restore"
+    },
+    {
+      "call": "mount(source, mount)",
+      "case": "unmount-cwd",
+      "ok": null,
+      "step": "attach"
     },
     {
       "call": "mount(source, mount)",
@@ -759,24 +783,6 @@
         "group_is_parent": true
       },
       "step": "b-inheritance"
-    },
-    {
-      "call": "startup",
-      "case": "startup",
-      "skipped": "host PID 1 details are environmental evidence in linux-evidence.json, not a portable OS comparison",
-      "step": "unavailable"
-    },
-    {
-      "call": "gui-processes",
-      "case": "gui-processes",
-      "skipped": "headless Linux reference has no Files/Editor/Preview/Mounts desktop applications",
-      "step": "unavailable"
-    },
-    {
-      "call": "tab-pids",
-      "case": "tab-pids",
-      "skipped": "Linux reference has no browser OS tabs; process visibility is namespace-scoped",
-      "step": "unavailable"
     }
   ],
   "os": {
@@ -792,7 +798,8 @@
         "case": "alias",
         "ok": {
           "same_dev": {
-            "unavailable": "st_dev not exposed by both observations"
+            "field": "st_dev",
+            "unavailable": true
           },
           "same_ino": false
         },
@@ -874,7 +881,8 @@
         "case": "open-rename",
         "ok": {
           "same_dev": {
-            "unavailable": "st_dev not exposed by both observations"
+            "field": "st_dev",
+            "unavailable": true
           },
           "same_ino": true
         },
@@ -930,7 +938,8 @@
         "case": "open-unlink",
         "ok": {
           "same_dev": {
-            "unavailable": "st_dev not exposed by both observations"
+            "field": "st_dev",
+            "unavailable": true
           },
           "same_ino": true
         },
@@ -1327,27 +1336,45 @@
         "step": "acl"
       },
       {
+        "call": "umount(mount)",
+        "case": "unmount-open",
+        "skipped": "no separate busy-unmount API; unmountLocal detach is measured below",
+        "step": "unmount"
+      },
+      {
         "call": "write(file)",
         "case": "unmount-open",
         "ok": null,
         "step": "create"
       },
       {
-        "call": "pread(fd) after umount",
+        "call": "pread(fd) after detach",
         "case": "unmount-open",
         "errno": "EBADF",
         "step": "read"
       },
       {
-        "call": "fstat(fd) after umount",
+        "call": "fstat(fd) after detach",
         "case": "unmount-open",
         "errno": "EBADF",
         "step": "fstat"
       },
       {
-        "call": "umount(mount)",
+        "call": "unmountLocal(mount)",
         "case": "unmount-open",
         "ok": null,
+        "step": "detach"
+      },
+      {
+        "call": "mount(source, mount)",
+        "case": "unmount-open",
+        "ok": null,
+        "step": "attach"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-cwd",
+        "skipped": "no separate busy-unmount API; unmountLocal detach is measured below",
         "step": "unmount"
       },
       {
@@ -1363,7 +1390,7 @@
         "step": "chdir"
       },
       {
-        "call": "getcwd() after umount",
+        "call": "getcwd() after detach",
         "case": "unmount-cwd",
         "ok": "$ROOT",
         "step": "getcwd"
@@ -1375,10 +1402,16 @@
         "step": "restore"
       },
       {
-        "call": "umount(mount)",
+        "call": "unmountLocal(mount)",
         "case": "unmount-cwd",
         "ok": null,
-        "step": "unmount"
+        "step": "detach"
+      },
+      {
+        "call": "mount(source, mount)",
+        "case": "unmount-cwd",
+        "ok": null,
+        "step": "attach"
       },
       {
         "call": "mount-api",
@@ -1516,79 +1549,6 @@
           "group_is_parent": true
         },
         "step": "b-inheritance"
-      },
-      {
-        "call": "read /proc/1/cmdline",
-        "case": "startup",
-        "ok": {
-          "comm": "init"
-        },
-        "step": "pid1"
-      },
-      {
-        "call": "inspect live init lease, login lease and managed supervisor",
-        "case": "startup",
-        "ok": {
-          "init_owner_is_current_host": true,
-          "login_owner_is_current_host": true,
-          "reaper": "running",
-          "role": "init-reaper",
-          "service_host_is_login_owner": true,
-          "supervisor_parent_is_pid1": true,
-          "supervisor_path": "/usr/bin/supervise"
-        },
-        "step": "ownership"
-      },
-      {
-        "call": "open Files/Mounts/Editor/Preview; inspect ps",
-        "case": "gui-processes",
-        "ok": {
-          "editor_opened": true,
-          "files_visible": true,
-          "images_with_editor": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "images_with_files": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "images_with_mounts": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "images_with_preview": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "mounts_opened": true,
-          "preview_opened": true
-        },
-        "step": "ps"
-      },
-      {
-        "call": "start sleep in tab A; ps in tab B",
-        "case": "tab-pids",
-        "ok": {
-          "other_tab_pid_visible": true
-        },
-        "step": "visibility"
       }
     ],
     "cloud": [
@@ -1636,7 +1596,8 @@
         "case": "open-rename",
         "ok": {
           "same_dev": {
-            "unavailable": "st_dev not exposed by both observations"
+            "field": "st_dev",
+            "unavailable": true
           },
           "same_ino": true
         },
@@ -1692,7 +1653,8 @@
         "case": "open-unlink",
         "ok": {
           "same_dev": {
-            "unavailable": "st_dev not exposed by both observations"
+            "field": "st_dev",
+            "unavailable": true
           },
           "same_ino": true
         },
@@ -1819,7 +1781,8 @@
         "case": "hard-link",
         "ok": {
           "same_dev": {
-            "unavailable": "st_dev not exposed by both observations"
+            "field": "st_dev",
+            "unavailable": true
           },
           "same_ino": true
         },
@@ -2203,79 +2166,6 @@
           "group_is_parent": true
         },
         "step": "b-inheritance"
-      },
-      {
-        "call": "read /proc/1/cmdline",
-        "case": "startup",
-        "ok": {
-          "comm": "init"
-        },
-        "step": "pid1"
-      },
-      {
-        "call": "inspect live init lease, login lease and managed supervisor",
-        "case": "startup",
-        "ok": {
-          "init_owner_is_current_host": true,
-          "login_owner_is_current_host": true,
-          "reaper": "running",
-          "role": "init-reaper",
-          "service_host_is_login_owner": true,
-          "supervisor_parent_is_pid1": true,
-          "supervisor_path": "/usr/bin/supervise"
-        },
-        "step": "ownership"
-      },
-      {
-        "call": "open Files/Mounts/Editor/Preview; inspect ps",
-        "case": "gui-processes",
-        "ok": {
-          "editor_opened": true,
-          "files_visible": true,
-          "images_with_editor": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "images_with_files": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "images_with_mounts": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "images_with_preview": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "mounts_opened": true,
-          "preview_opened": true
-        },
-        "step": "ps"
-      },
-      {
-        "call": "start sleep in tab A; ps in tab B",
-        "case": "tab-pids",
-        "ok": {
-          "other_tab_pid_visible": true
-        },
-        "step": "visibility"
       }
     ],
     "directory-handle": [
@@ -2290,7 +2180,8 @@
         "case": "alias",
         "ok": {
           "same_dev": {
-            "unavailable": "st_dev not exposed by both observations"
+            "field": "st_dev",
+            "unavailable": true
           },
           "same_ino": false
         },
@@ -2372,7 +2263,8 @@
         "case": "open-rename",
         "ok": {
           "same_dev": {
-            "unavailable": "st_dev not exposed by both observations"
+            "field": "st_dev",
+            "unavailable": true
           },
           "same_ino": true
         },
@@ -2428,7 +2320,8 @@
         "case": "open-unlink",
         "ok": {
           "same_dev": {
-            "unavailable": "st_dev not exposed by both observations"
+            "field": "st_dev",
+            "unavailable": true
           },
           "same_ino": true
         },
@@ -2825,27 +2718,45 @@
         "step": "acl"
       },
       {
+        "call": "umount(mount)",
+        "case": "unmount-open",
+        "skipped": "no separate busy-unmount API; unmountLocal detach is measured below",
+        "step": "unmount"
+      },
+      {
         "call": "write(file)",
         "case": "unmount-open",
         "ok": null,
         "step": "create"
       },
       {
-        "call": "pread(fd) after umount",
+        "call": "pread(fd) after detach",
         "case": "unmount-open",
         "errno": "EBADF",
         "step": "read"
       },
       {
-        "call": "fstat(fd) after umount",
+        "call": "fstat(fd) after detach",
         "case": "unmount-open",
         "errno": "EBADF",
         "step": "fstat"
       },
       {
-        "call": "umount(mount)",
+        "call": "unmountLocal(mount)",
         "case": "unmount-open",
         "ok": null,
+        "step": "detach"
+      },
+      {
+        "call": "mount(source, mount)",
+        "case": "unmount-open",
+        "ok": null,
+        "step": "attach"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-cwd",
+        "skipped": "no separate busy-unmount API; unmountLocal detach is measured below",
         "step": "unmount"
       },
       {
@@ -2861,7 +2772,7 @@
         "step": "chdir"
       },
       {
-        "call": "getcwd() after umount",
+        "call": "getcwd() after detach",
         "case": "unmount-cwd",
         "ok": "$ROOT",
         "step": "getcwd"
@@ -2873,10 +2784,16 @@
         "step": "restore"
       },
       {
-        "call": "umount(mount)",
+        "call": "unmountLocal(mount)",
         "case": "unmount-cwd",
         "ok": null,
-        "step": "unmount"
+        "step": "detach"
+      },
+      {
+        "call": "mount(source, mount)",
+        "case": "unmount-cwd",
+        "ok": null,
+        "step": "attach"
       },
       {
         "call": "mount-api",
@@ -3014,79 +2931,6 @@
           "group_is_parent": true
         },
         "step": "b-inheritance"
-      },
-      {
-        "call": "read /proc/1/cmdline",
-        "case": "startup",
-        "ok": {
-          "comm": "init"
-        },
-        "step": "pid1"
-      },
-      {
-        "call": "inspect live init lease, login lease and managed supervisor",
-        "case": "startup",
-        "ok": {
-          "init_owner_is_current_host": true,
-          "login_owner_is_current_host": true,
-          "reaper": "running",
-          "role": "init-reaper",
-          "service_host_is_login_owner": true,
-          "supervisor_parent_is_pid1": true,
-          "supervisor_path": "/usr/bin/supervise"
-        },
-        "step": "ownership"
-      },
-      {
-        "call": "open Files/Mounts/Editor/Preview; inspect ps",
-        "case": "gui-processes",
-        "ok": {
-          "editor_opened": true,
-          "files_visible": true,
-          "images_with_editor": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "images_with_files": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "images_with_mounts": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "images_with_preview": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "mounts_opened": true,
-          "preview_opened": true
-        },
-        "step": "ps"
-      },
-      {
-        "call": "start sleep in tab A; ps in tab B",
-        "case": "tab-pids",
-        "ok": {
-          "other_tab_pid_visible": true
-        },
-        "step": "visibility"
       }
     ],
     "local-helper": [
@@ -3101,7 +2945,8 @@
         "case": "alias",
         "ok": {
           "same_dev": {
-            "unavailable": "st_dev not exposed by both observations"
+            "field": "st_dev",
+            "unavailable": true
           },
           "same_ino": false
         },
@@ -3183,7 +3028,8 @@
         "case": "open-rename",
         "ok": {
           "same_dev": {
-            "unavailable": "st_dev not exposed by both observations"
+            "field": "st_dev",
+            "unavailable": true
           },
           "same_ino": true
         },
@@ -3239,7 +3085,8 @@
         "case": "open-unlink",
         "ok": {
           "same_dev": {
-            "unavailable": "st_dev not exposed by both observations"
+            "field": "st_dev",
+            "unavailable": true
           },
           "same_ino": true
         },
@@ -3636,27 +3483,45 @@
         "step": "acl"
       },
       {
+        "call": "umount(mount)",
+        "case": "unmount-open",
+        "skipped": "no separate busy-unmount API; unmountLocal detach is measured below",
+        "step": "unmount"
+      },
+      {
         "call": "write(file)",
         "case": "unmount-open",
         "ok": null,
         "step": "create"
       },
       {
-        "call": "pread(fd) after umount",
+        "call": "pread(fd) after detach",
         "case": "unmount-open",
         "errno": "EBADF",
         "step": "read"
       },
       {
-        "call": "fstat(fd) after umount",
+        "call": "fstat(fd) after detach",
         "case": "unmount-open",
         "errno": "EBADF",
         "step": "fstat"
       },
       {
-        "call": "umount(mount)",
+        "call": "unmountLocal(mount)",
         "case": "unmount-open",
         "ok": null,
+        "step": "detach"
+      },
+      {
+        "call": "mount(source, mount)",
+        "case": "unmount-open",
+        "ok": null,
+        "step": "attach"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-cwd",
+        "skipped": "no separate busy-unmount API; unmountLocal detach is measured below",
         "step": "unmount"
       },
       {
@@ -3672,7 +3537,7 @@
         "step": "chdir"
       },
       {
-        "call": "getcwd() after umount",
+        "call": "getcwd() after detach",
         "case": "unmount-cwd",
         "ok": "$ROOT",
         "step": "getcwd"
@@ -3684,10 +3549,16 @@
         "step": "restore"
       },
       {
-        "call": "umount(mount)",
+        "call": "unmountLocal(mount)",
         "case": "unmount-cwd",
         "ok": null,
-        "step": "unmount"
+        "step": "detach"
+      },
+      {
+        "call": "mount(source, mount)",
+        "case": "unmount-cwd",
+        "ok": null,
+        "step": "attach"
       },
       {
         "call": "mount-api",
@@ -3825,79 +3696,6 @@
           "group_is_parent": true
         },
         "step": "b-inheritance"
-      },
-      {
-        "call": "read /proc/1/cmdline",
-        "case": "startup",
-        "ok": {
-          "comm": "init"
-        },
-        "step": "pid1"
-      },
-      {
-        "call": "inspect live init lease, login lease and managed supervisor",
-        "case": "startup",
-        "ok": {
-          "init_owner_is_current_host": true,
-          "login_owner_is_current_host": true,
-          "reaper": "running",
-          "role": "init-reaper",
-          "service_host_is_login_owner": true,
-          "supervisor_parent_is_pid1": true,
-          "supervisor_path": "/usr/bin/supervise"
-        },
-        "step": "ownership"
-      },
-      {
-        "call": "open Files/Mounts/Editor/Preview; inspect ps",
-        "case": "gui-processes",
-        "ok": {
-          "editor_opened": true,
-          "files_visible": true,
-          "images_with_editor": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "images_with_files": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "images_with_mounts": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "images_with_preview": [
-            {
-              "argv": [
-                "init"
-              ],
-              "path": "/usr/bin/init"
-            }
-          ],
-          "mounts_opened": true,
-          "preview_opened": true
-        },
-        "step": "ps"
-      },
-      {
-        "call": "start sleep in tab A; ps in tab B",
-        "case": "tab-pids",
-        "ok": {
-          "other_tab_pid_visible": true
-        },
-        "step": "visibility"
       }
     ],
     "relay": [
@@ -3912,7 +3710,8 @@
         "case": "alias",
         "ok": {
           "same_dev": {
-            "unavailable": "st_dev not exposed by both observations"
+            "field": "st_dev",
+            "unavailable": true
           },
           "same_ino": false
         },
@@ -4422,27 +4221,45 @@
         "step": "acl"
       },
       {
+        "call": "umount(mount)",
+        "case": "unmount-open",
+        "skipped": "no separate busy-unmount API; unmountLocal detach is measured below",
+        "step": "unmount"
+      },
+      {
         "call": "write(file)",
         "case": "unmount-open",
         "ok": null,
         "step": "create"
       },
       {
-        "call": "pread(fd) after umount",
+        "call": "pread(fd) after detach",
         "case": "unmount-open",
         "errno": "EBADF",
         "step": "read"
       },
       {
-        "call": "fstat(fd) after umount",
+        "call": "fstat(fd) after detach",
         "case": "unmount-open",
         "errno": "EBADF",
         "step": "fstat"
       },
       {
-        "call": "umount(mount)",
+        "call": "unmountLocal(mount)",
         "case": "unmount-open",
         "ok": null,
+        "step": "detach"
+      },
+      {
+        "call": "mount(source, mount)",
+        "case": "unmount-open",
+        "ok": null,
+        "step": "attach"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-cwd",
+        "skipped": "no separate busy-unmount API; unmountLocal detach is measured below",
         "step": "unmount"
       },
       {
@@ -4458,7 +4275,7 @@
         "step": "chdir"
       },
       {
-        "call": "getcwd() after umount",
+        "call": "getcwd() after detach",
         "case": "unmount-cwd",
         "ok": "$ROOT",
         "step": "getcwd"
@@ -4470,10 +4287,16 @@
         "step": "restore"
       },
       {
-        "call": "umount(mount)",
+        "call": "unmountLocal(mount)",
         "case": "unmount-cwd",
         "ok": null,
-        "step": "unmount"
+        "step": "detach"
+      },
+      {
+        "call": "mount(source, mount)",
+        "case": "unmount-cwd",
+        "ok": null,
+        "step": "attach"
       },
       {
         "call": "mount-api",
@@ -4611,7 +4434,31 @@
           "group_is_parent": true
         },
         "step": "b-inheritance"
+      }
+    ]
+  },
+  "process": {
+    "linux": [
+      {
+        "call": "startup",
+        "case": "startup",
+        "skipped": "host PID 1 details are environmental evidence in linux-evidence.json, not a portable OS comparison",
+        "step": "unavailable"
       },
+      {
+        "call": "gui-processes",
+        "case": "gui-processes",
+        "skipped": "headless Linux reference has no Files/Editor/Preview/Mounts desktop applications",
+        "step": "unavailable"
+      },
+      {
+        "call": "tab-pids",
+        "case": "tab-pids",
+        "skipped": "Linux reference has no browser OS tabs; process visibility is namespace-scoped",
+        "step": "unavailable"
+      }
+    ],
+    "os": [
       {
         "call": "read /proc/1/cmdline",
         "case": "startup",
@@ -4687,5 +4534,5 @@
       }
     ]
   },
-  "schema": 1
+  "schema": 2
 }
