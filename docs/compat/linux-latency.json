@@ -1,0 +1,72 @@
+{
+  "method": "First invocation and immediate repeat in a temporary host filesystem; no page-cache eviction. Command wall time; shell ends at first prompt.",
+  "operations": [
+    {
+      "operation": "stat-eight-deep",
+      "samples": [
+        {
+          "milliseconds": 0.774,
+          "temperature": "cold"
+        },
+        {
+          "milliseconds": 0.76,
+          "temperature": "warm"
+        }
+      ]
+    },
+    {
+      "operation": "read-1mib",
+      "samples": [
+        {
+          "milliseconds": 1.212,
+          "temperature": "cold"
+        },
+        {
+          "milliseconds": 1.133,
+          "temperature": "warm"
+        }
+      ]
+    },
+    {
+      "operation": "write-1mib",
+      "samples": [
+        {
+          "milliseconds": 1.369,
+          "temperature": "cold"
+        },
+        {
+          "milliseconds": 1.377,
+          "temperature": "warm"
+        }
+      ]
+    },
+    {
+      "operation": "ls-usr-bin",
+      "samples": [
+        {
+          "milliseconds": 15.231,
+          "temperature": "cold"
+        },
+        {
+          "milliseconds": 14.478,
+          "temperature": "warm"
+        }
+      ]
+    },
+    {
+      "operation": "shell-first-prompt",
+      "samples": [
+        {
+          "milliseconds": 5.504,
+          "temperature": "cold"
+        },
+        {
+          "milliseconds": 2.131,
+          "temperature": "warm"
+        }
+      ]
+    }
+  ],
+  "schema": 1,
+  "unit": "milliseconds"
+}

@@ -2676,6 +2676,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "os-conformance"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "os-abi",
+ "os-posix",
+ "serde_json",
+]
+
+[[package]]
 name = "os-core"
 version = "0.1.0"
 dependencies = [

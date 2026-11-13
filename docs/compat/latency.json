@@ -1,0 +1,342 @@
+{
+  "filesystems": {
+    "browser-storage": [
+      {
+        "operation": "stat-eight-deep",
+        "samples": [
+          {
+            "milliseconds": 116.389,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 95.316,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "read-1mib",
+        "samples": [
+          {
+            "milliseconds": 250.344,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 254.619,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "write-1mib",
+        "samples": [
+          {
+            "milliseconds": 246.201,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 271.623,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "ls-usr-bin",
+        "samples": [
+          {
+            "milliseconds": 3545.712,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 2819.836,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "shell-first-prompt",
+        "samples": [
+          {
+            "milliseconds": 180.415,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 161.33,
+            "temperature": "warm"
+          }
+        ]
+      }
+    ],
+    "cloud": [
+      {
+        "operation": "stat-eight-deep",
+        "samples": [
+          {
+            "milliseconds": 118.885,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 123.686,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "read-1mib",
+        "samples": [
+          {
+            "milliseconds": 190.901,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 187.251,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "write-1mib",
+        "samples": [
+          {
+            "milliseconds": 170.064,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 169.643,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "ls-usr-bin",
+        "samples": [
+          {
+            "milliseconds": 8764.929,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 2885.946,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "shell-first-prompt",
+        "samples": [
+          {
+            "milliseconds": 4859.72,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 135.91,
+            "temperature": "warm"
+          }
+        ]
+      }
+    ],
+    "directory-handle": [
+      {
+        "operation": "stat-eight-deep",
+        "samples": [
+          {
+            "milliseconds": 101.599,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 93.52,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "read-1mib",
+        "samples": [
+          {
+            "milliseconds": 250.304,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 246.734,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "write-1mib",
+        "samples": [
+          {
+            "milliseconds": 2354.74,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 2016.749,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "ls-usr-bin",
+        "samples": [
+          {
+            "milliseconds": 3621.795,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 2777.811,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "shell-first-prompt",
+        "samples": [
+          {
+            "milliseconds": 212.925,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 154.375,
+            "temperature": "warm"
+          }
+        ]
+      }
+    ],
+    "local-helper": [
+      {
+        "operation": "stat-eight-deep",
+        "samples": [
+          {
+            "milliseconds": 88.142,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 109.229,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "read-1mib",
+        "samples": [
+          {
+            "milliseconds": 424.321,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 457.204,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "write-1mib",
+        "samples": [
+          {
+            "milliseconds": 325.38,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 315.134,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "ls-usr-bin",
+        "samples": [
+          {
+            "milliseconds": 3861.154,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 2847.897,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "shell-first-prompt",
+        "samples": [
+          {
+            "milliseconds": 207.875,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 163.775,
+            "temperature": "warm"
+          }
+        ]
+      }
+    ],
+    "relay": [
+      {
+        "operation": "stat-eight-deep",
+        "samples": [
+          {
+            "milliseconds": 119.487,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 106.834,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "read-1mib",
+        "samples": [
+          {
+            "milliseconds": 1090.992,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 1016.405,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "write-1mib",
+        "samples": [
+          {
+            "milliseconds": 898.468,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 918.478,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "ls-usr-bin",
+        "samples": [
+          {
+            "milliseconds": 4069.343,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 2921.996,
+            "temperature": "warm"
+          }
+        ]
+      },
+      {
+        "operation": "shell-first-prompt",
+        "samples": [
+          {
+            "milliseconds": 199.985,
+            "temperature": "cold"
+          },
+          {
+            "milliseconds": 164.53,
+            "temperature": "warm"
+          }
+        ]
+      }
+    ]
+  },
+  "method": "First operation in a fresh filesystem/profile and immediate repeat; browser wall time including process launch and return. No OS/provider cache eviction.",
+  "schema": 1,
+  "unit": "milliseconds"
+}

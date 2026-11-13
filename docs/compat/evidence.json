@@ -1,0 +1,36 @@
+{
+  "browser": "156.0.8078.4",
+  "compiler": {
+    "image": "localhost/os-conformance-compiler:baseline",
+    "verified_sha256": {
+      "containers/compiler/server.mjs": "febc0a1b4e88e4f952042bf9c5389b29d12b5f2aa085da7299060751d88330b1",
+      "node_modules/binaryen/index.js": "5f0579abe5dddb48daa46a63933974eea085e0e1752b238d227315cf39d5fb06",
+      "node_modules/binaryen/package.json": "3c101537ea4dc095e5c2d23e540e91c04cfe0b877e8af5e854a8a1369c4ddf81",
+      "package-lock.json": "2a25ce9721243b7d159fe5f4118e739bf01f60045013cad6384086aff091fb04",
+      "web/kernel/asyncify.js": "e26e9c00362620ac4b791536130aa40783dde086532e4451c51b72eda3953c2d",
+      "web/kernel/image.js": "b3f9dc3fe42be9d02cf0a1b13bc9adee78765bf5b9335e6eb14764c3db638e1c",
+      "web/kernel/memory.js": "d28cc4f2a436bcac5ef0925b00c0d749609c6b1752c8a63d86bf501f5cbb124c",
+      "web/kernel/transform.js": "080d9bc6bd46c77b9e9fa966ecdde06bd90df1f98186ae906294db2eed72a7b8"
+    }
+  },
+  "node": "v26.13.0",
+  "platform": "Linux 7.2.14-arch1-1 x86_64 GNU/Linux",
+  "runtime_base": "f2ed2191e8885bd29ff932852bea85a18a68e569",
+  "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "source": [
+    {
+      "fragments": [
+        "fd_datasync: () => 0",
+        "fd_sync: () => 0"
+      ],
+      "path": "web/wasi/process.js"
+    },
+    {
+      "fragments": [
+        "exec([['supervise', run.file]]",
+        "exec([['init']]"
+      ],
+      "path": "web/kernel/client.js"
+    }
+  ]
+}

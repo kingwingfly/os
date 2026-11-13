@@ -1,0 +1,13 @@
+[package]
+name = "os-conformance"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+libc = "0.2"
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+abi = { package = "os-abi", path = "../abi" }
+os-posix = { path = "../posix" }
