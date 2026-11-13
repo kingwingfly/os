@@ -69,6 +69,12 @@
       "step": "open"
     },
     {
+      "call": "fstat(fd) identity before change",
+      "case": "open-rename",
+      "ok": null,
+      "step": "identity-before"
+    },
+    {
       "call": "rename(file, moved)",
       "case": "open-rename",
       "ok": null,
@@ -94,6 +100,12 @@
         "size": 5
       },
       "step": "fstat"
+    },
+    {
+      "call": "fstat(fd) identity after change",
+      "case": "open-rename",
+      "ok": null,
+      "step": "identity-after"
     },
     {
       "call": "fstat(fd) identity before/after",
@@ -123,6 +135,12 @@
       "step": "open"
     },
     {
+      "call": "fstat(fd) identity before change",
+      "case": "open-unlink",
+      "ok": null,
+      "step": "identity-before"
+    },
+    {
       "call": "unlink(file)",
       "case": "open-unlink",
       "ok": null,
@@ -148,6 +166,12 @@
         "size": 5
       },
       "step": "fstat"
+    },
+    {
+      "call": "fstat(fd) identity after change",
+      "case": "open-unlink",
+      "ok": null,
+      "step": "identity-after"
     },
     {
       "call": "fstat(fd) identity before/after",
@@ -850,6 +874,12 @@
         "step": "open"
       },
       {
+        "call": "fstat(fd) identity before change",
+        "case": "open-rename",
+        "ok": null,
+        "step": "identity-before"
+      },
+      {
         "call": "rename(file, moved)",
         "case": "open-rename",
         "ok": null,
@@ -875,6 +905,12 @@
           "size": 5
         },
         "step": "fstat"
+      },
+      {
+        "call": "fstat(fd) identity after change",
+        "case": "open-rename",
+        "ok": null,
+        "step": "identity-after"
       },
       {
         "call": "fstat(fd) identity before/after",
@@ -907,6 +943,12 @@
         "step": "open"
       },
       {
+        "call": "fstat(fd) identity before change",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "identity-before"
+      },
+      {
         "call": "unlink(file)",
         "case": "open-unlink",
         "ok": null,
@@ -932,6 +974,12 @@
           "size": 5
         },
         "step": "fstat"
+      },
+      {
+        "call": "fstat(fd) identity after change",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "identity-after"
       },
       {
         "call": "fstat(fd) identity before/after",
@@ -1568,6 +1616,12 @@
         "step": "open"
       },
       {
+        "call": "fstat(fd) identity before change",
+        "case": "open-rename",
+        "ok": null,
+        "step": "identity-before"
+      },
+      {
         "call": "rename(file, moved)",
         "case": "open-rename",
         "ok": null,
@@ -1593,6 +1647,12 @@
           "size": 5
         },
         "step": "fstat"
+      },
+      {
+        "call": "fstat(fd) identity after change",
+        "case": "open-rename",
+        "ok": null,
+        "step": "identity-after"
       },
       {
         "call": "fstat(fd) identity before/after",
@@ -1625,6 +1685,12 @@
         "step": "open"
       },
       {
+        "call": "fstat(fd) identity before change",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "identity-before"
+      },
+      {
         "call": "unlink(file)",
         "case": "open-unlink",
         "ok": null,
@@ -1650,6 +1716,12 @@
           "size": 5
         },
         "step": "fstat"
+      },
+      {
+        "call": "fstat(fd) identity after change",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "identity-after"
       },
       {
         "call": "fstat(fd) identity before/after",
@@ -2238,6 +2310,12 @@
         "step": "open"
       },
       {
+        "call": "fstat(fd) identity before change",
+        "case": "open-rename",
+        "ok": null,
+        "step": "identity-before"
+      },
+      {
         "call": "rename(file, moved)",
         "case": "open-rename",
         "ok": null,
@@ -2263,6 +2341,12 @@
           "size": 5
         },
         "step": "fstat"
+      },
+      {
+        "call": "fstat(fd) identity after change",
+        "case": "open-rename",
+        "ok": null,
+        "step": "identity-after"
       },
       {
         "call": "fstat(fd) identity before/after",
@@ -2295,6 +2379,12 @@
         "step": "open"
       },
       {
+        "call": "fstat(fd) identity before change",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "identity-before"
+      },
+      {
         "call": "unlink(file)",
         "case": "open-unlink",
         "ok": null,
@@ -2320,6 +2410,12 @@
           "size": 5
         },
         "step": "fstat"
+      },
+      {
+        "call": "fstat(fd) identity after change",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "identity-after"
       },
       {
         "call": "fstat(fd) identity before/after",
@@ -3006,6 +3102,12 @@
         "step": "open"
       },
       {
+        "call": "fstat(fd) identity before change",
+        "case": "open-rename",
+        "ok": null,
+        "step": "identity-before"
+      },
+      {
         "call": "rename(file, moved)",
         "case": "open-rename",
         "ok": null,
@@ -3031,6 +3133,12 @@
           "size": 5
         },
         "step": "fstat"
+      },
+      {
+        "call": "fstat(fd) identity after change",
+        "case": "open-rename",
+        "ok": null,
+        "step": "identity-after"
       },
       {
         "call": "fstat(fd) identity before/after",
@@ -3063,6 +3171,12 @@
         "step": "open"
       },
       {
+        "call": "fstat(fd) identity before change",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "identity-before"
+      },
+      {
         "call": "unlink(file)",
         "case": "open-unlink",
         "ok": null,
@@ -3088,6 +3202,12 @@
           "size": 5
         },
         "step": "fstat"
+      },
+      {
+        "call": "fstat(fd) identity after change",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "identity-after"
       },
       {
         "call": "fstat(fd) identity before/after",
@@ -3774,6 +3894,12 @@
         "step": "open"
       },
       {
+        "call": "fstat(fd) identity before change",
+        "case": "open-rename",
+        "ok": null,
+        "step": "identity-before"
+      },
+      {
         "call": "rename(file, moved)",
         "case": "open-rename",
         "ok": null,
@@ -3798,9 +3924,15 @@
         "step": "fstat"
       },
       {
-        "call": "fstat(fd) identity before/after",
+        "call": "fstat(fd) identity after change",
         "case": "open-rename",
         "errno": "ENOENT",
+        "step": "identity-after"
+      },
+      {
+        "call": "fstat(fd) identity before/after",
+        "case": "open-rename",
+        "skipped": "identity comparison requires successful before and after fstat; see phase results",
         "step": "identity"
       },
       {
@@ -3820,6 +3952,12 @@
         "case": "open-unlink",
         "ok": null,
         "step": "open"
+      },
+      {
+        "call": "fstat(fd) identity before change",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "identity-before"
       },
       {
         "call": "unlink(file)",
@@ -3846,9 +3984,15 @@
         "step": "fstat"
       },
       {
-        "call": "fstat(fd) identity before/after",
+        "call": "fstat(fd) identity after change",
         "case": "open-unlink",
         "errno": "ENOENT",
+        "step": "identity-after"
+      },
+      {
+        "call": "fstat(fd) identity before/after",
+        "case": "open-unlink",
+        "skipped": "identity comparison requires successful before and after fstat; see phase results",
         "step": "identity"
       },
       {
@@ -4500,7 +4644,6 @@
         "call": "open Files/Mounts/Editor/Preview; inspect ps",
         "case": "gui-processes",
         "ok": {
-          "editor_opened": true,
           "files_visible": true,
           "images_with_editor": [
             {
@@ -4533,9 +4676,7 @@
               ],
               "path": "/usr/bin/init"
             }
-          ],
-          "mounts_opened": true,
-          "preview_opened": true
+          ]
         },
         "step": "ps"
       },

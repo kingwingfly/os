@@ -6,11 +6,11 @@
       "operation": "stat-eight-deep",
       "samples": [
         {
-          "milliseconds": 0.707,
+          "milliseconds": 0.762,
           "temperature": "cold"
         },
         {
-          "milliseconds": 0.741,
+          "milliseconds": 0.688,
           "temperature": "warm"
         }
       ]
@@ -19,11 +19,11 @@
       "operation": "read-1mib",
       "samples": [
         {
-          "milliseconds": 1.267,
+          "milliseconds": 1.117,
           "temperature": "cold"
         },
         {
-          "milliseconds": 1.254,
+          "milliseconds": 1.2,
           "temperature": "warm"
         }
       ]
@@ -32,11 +32,11 @@
       "operation": "write-1mib",
       "samples": [
         {
-          "milliseconds": 1.358,
+          "milliseconds": 1.308,
           "temperature": "cold"
         },
         {
-          "milliseconds": 1.259,
+          "milliseconds": 1.354,
           "temperature": "warm"
         }
       ]
@@ -45,11 +45,11 @@
       "operation": "ls-usr-bin",
       "samples": [
         {
-          "milliseconds": 14.088,
+          "milliseconds": 13.434,
           "temperature": "cold"
         },
         {
-          "milliseconds": 13.802,
+          "milliseconds": 13.473,
           "temperature": "warm"
         }
       ]
@@ -58,11 +58,11 @@
       "operation": "shell-first-prompt",
       "samples": [
         {
-          "milliseconds": 3.048,
+          "milliseconds": 3.425,
           "temperature": "cold"
         },
         {
-          "milliseconds": 1.481,
+          "milliseconds": 1.619,
           "temperature": "warm"
         }
       ]
