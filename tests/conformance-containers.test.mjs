@@ -7,14 +7,14 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { containerLease, engineTarget } from '../scripts/conformance/containers.mjs';
-import { podmanProxy } from '../scripts/podman-proxy.mjs';
+import { engineProxy, serverName } from '../scripts/conformance/engine-proxy.mjs';
 
 test('proxy explicitly destroys upgraded sockets without replacing Node closeAllConnections',async()=>{
   const dir=await mkdtemp(join(tmpdir(),'conformance-upgrade-')),upstream=http.createServer(),sockets=[];let proxy,client;
   upstream.on('upgrade',(_req,socket)=>{sockets.push(socket);socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\n');});
   try {
     upstream.listen(join(dir,'upstream.sock'));await once(upstream,'listening');
-    proxy=podmanProxy(join(dir,'proxy.sock'),join(dir,'upstream.sock'));await once(proxy,'listening');
+    proxy=engineProxy(join(dir,'proxy.sock'),{socketPath:join(dir,'upstream.sock')});await once(proxy,'listening');
     assert(!Object.hasOwn(proxy,'closeAllConnections'));assert.equal(proxy.closeAllConnections,http.Server.prototype.closeAllConnections);
     client=net.connect(join(dir,'proxy.sock'));await once(client,'connect');
     client.write('GET /attach HTTP/1.1\r\nHost: fixture\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\n');
@@ -33,19 +33,25 @@ const request=(socket,method,path,body)=>new Promise((resolve,reject)=>{
     const chunks=[];res.on('data',c=>chunks.push(c));res.on('end',()=>resolve(JSON.parse(Buffer.concat(chunks)||'null')));res.on('error',reject);
   });req.on('error',reject);req.end(body?JSON.stringify(body):undefined);
 });
-for(const scenario of ['missing list','invalid list','already deleted'])test('container cleanup reports '+scenario,async()=>{
-  const dir=await mkdtemp(join(tmpdir(),'conformance-engine-error-')),socket=join(dir,'engine.sock');let lease;
+// 'already deleted': DELETE answers 404 and the next listing is empty. 'removal in progress':
+// workerd's AutoRemove containers answer 409 and disappear shortly after. 'never removed':
+// the container stays listed, so cleanup fails at its deadline instead of reporting success.
+for(const scenario of ['missing list','invalid list','already deleted','removal in progress','never removed'])test('container cleanup reports '+scenario,async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-engine-error-')),socket=join(dir,'engine.sock');let lease,listings=0,deletes=0;
   const server=http.createServer((req,res)=>{
     res.setHeader('Content-Type','application/json');
-    if(req.method==='DELETE'||scenario==='missing list') {res.statusCode=404;res.end('{"message":"missing endpoint"}');}
-    else res.end(JSON.stringify(scenario==='invalid list'?{message:'unexpected shape'}:[{Id:'removed'}]));
+    if(scenario==='missing list') {res.statusCode=404;res.end('{"message":"missing endpoint"}');return;}
+    if(req.method==='DELETE') {deletes++;res.statusCode=scenario==='already deleted'?404:409;res.end('{"message":"removal already in progress"}');return;}
+    listings++;
+    const remaining=scenario==='never removed'||scenario==='removal in progress'&&listings<3||scenario==='already deleted'&&listings<2;
+    res.end(JSON.stringify(scenario==='invalid list'?{message:'unexpected shape'}:remaining?[{Id:'owned'}]:[]));
   });
   try {
     server.listen(socket);await once(server,'listening');
-    lease=await containerLease({DOCKER_HOST:'unix://'+socket},join(dir,'proxy.sock'));
+    lease=await containerLease({DOCKER_HOST:'unix://'+socket},join(dir,'proxy.sock'),{removalTimeout:1000});
     const closing=lease.close();lease=null;
-    if(scenario==='already deleted')await closing;
-    else await assert.rejects(closing,scenario==='missing list'?/cleanup GET: 404.*missing endpoint/:/cleanup GET: expected an array/);
+    if(scenario==='already deleted'||scenario==='removal in progress') {await closing;assert(deletes>=1);}
+    else await assert.rejects(closing,scenario==='missing list'?/cleanup GET: 404.*missing endpoint/:scenario==='invalid list'?/cleanup GET: expected an array/:/still present after 1000 ms: owned/);
   } finally {await lease?.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await rm(dir,{recursive:true,force:true});}
 });
 for(const selection of ['docker context','DOCKER_HOST','WRANGLER_DOCKER_HOST'])test('container ownership and cleanup through '+selection,async()=>{
@@ -100,4 +106,26 @@ test('Docker TLS defaults to 2376 while plaintext and explicit ports are preserv
     assert.equal(engineTarget({DOCKER_HOST:'tcp://example.test:80'}).port,80);
     assert.equal(engineTarget({DOCKER_HOST:'tcp://example.test:1234',DOCKER_TLS_VERIFY:'1',DOCKER_CERT_PATH:dir}).port,1234);
   } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+test('IPv6 engine addresses lose their URL brackets; TLS names the engine host, never the client Host header',()=>{
+  assert.deepEqual(engineTarget({DOCKER_HOST:'tcp://[::1]:2375'}),{hostname:'::1',port:2375,protocol:'http:'});
+  assert.equal(serverName('docker.example'),'docker.example');
+  assert.equal(serverName('::1'),'');assert.equal(serverName('192.0.2.1'),'');
+});
+
+test('an IPv6 TCP engine is reachable through the proxy',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-ipv6-'));let proxy;
+  const engine=http.createServer((_req,res)=>res.end('engine'));
+  try {
+    try {engine.listen(0,'::1');await once(engine,'listening');}
+    catch(error) {if(['EADDRNOTAVAIL','EAFNOSUPPORT'].includes(error.code))return;throw error;}
+    proxy=engineProxy(join(dir,'proxy.sock'),engineTarget({DOCKER_HOST:`tcp://[::1]:${engine.address().port}`}));await once(proxy,'listening');
+    const body=await new Promise((resolve,reject)=>http.get({socketPath:join(dir,'proxy.sock'),path:'/_ping'},res=>{let text='';res.on('data',c=>{text+=c;});res.on('end',()=>resolve(text));}).on('error',reject));
+    assert.equal(body,'engine');
+  } finally {
+    proxy?.destroyAllSockets();if(proxy?.listening)await new Promise(resolve=>proxy.close(resolve));
+    if(engine.listening)await new Promise(resolve=>engine.close(resolve));
+    await rm(dir,{recursive:true,force:true});
+  }
 });

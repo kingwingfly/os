@@ -1,4 +1,4 @@
-import { ShutdownScope } from '../scripts/process.mjs';
+import { ShutdownScope } from '../scripts/conformance/process.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { cases, filesystems, operations, observationCases, ok } from '../scripts/conformance/common.mjs';

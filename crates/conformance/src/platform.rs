@@ -338,6 +338,38 @@ pub fn setacl(path: &Path, default: bool) -> Result<()> {
         .map(|_| ())
     }
 }
+/// Decodes a Linux `system.posix_acl_access` value: a little-endian version 2 header, then
+/// 8-byte entries (tag, permissions, id). A malformed value is that step's error, never a panic.
+#[cfg(any(target_os = "linux", test))]
+fn decode_acl(bytes: &[u8]) -> Result<Value> {
+    const VERSION: u32 = 2;
+    let Some((header, entries)) = bytes.split_first_chunk::<4>() else {
+        return Err("malformed ACL xattr".into());
+    };
+    if u32::from_le_bytes(*header) != VERSION {
+        return Err("unknown ACL xattr version".into());
+    }
+    let (entries, rest) = entries.as_chunks::<8>();
+    if !rest.is_empty() {
+        return Err("malformed ACL xattr".into());
+    }
+    let mut out = json!({"user":0,"group":0,"other":0,"mask":null,"users":{},"groups":{}});
+    for entry in entries {
+        let tag = u16::from_le_bytes([entry[0], entry[1]]);
+        let perm = u16::from_le_bytes([entry[2], entry[3]]);
+        let id = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+        match tag {
+            1 => out["user"] = json!(perm),
+            4 => out["group"] = json!(perm),
+            32 => out["other"] = json!(perm),
+            16 => out["mask"] = json!(perm),
+            2 => out["users"][id.to_string()] = json!(perm),
+            8 => out["groups"][id.to_string()] = json!(perm),
+            _ => return Err("unknown ACL tag".into()),
+        }
+    }
+    Ok(out)
+}
 pub fn acl(path: &Path) -> Result<Value> {
     #[cfg(target_os = "linux")]
     {
@@ -358,22 +390,7 @@ pub fn acl(path: &Path) -> Result<Value> {
                 Err(error(io::Error::last_os_error()))
             };
         }
-        let mut out = json!({"user":0,"group":0,"other":0,"mask":null,"users":{},"groups":{}});
-        for entry in bytes[4..n as usize].as_chunks::<8>().0 {
-            let tag = u16::from_le_bytes(entry[..2].try_into().unwrap());
-            let perm = u16::from_le_bytes(entry[2..4].try_into().unwrap());
-            let id = u32::from_le_bytes(entry[4..].try_into().unwrap());
-            match tag {
-                1 => out["user"] = json!(perm),
-                4 => out["group"] = json!(perm),
-                32 => out["other"] = json!(perm),
-                16 => out["mask"] = json!(perm),
-                2 => out["users"][id.to_string()] = json!(perm),
-                8 => out["groups"][id.to_string()] = json!(perm),
-                _ => return Err("unknown ACL tag".into()),
-            }
-        }
-        Ok(out)
+        decode_acl(&bytes[..n as usize])
     }
     #[cfg(target_os = "wasi")]
     {
@@ -496,6 +513,33 @@ pub fn invalid_sync(data: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn malformed_acl_values_are_errors() {
+        for bytes in [&[][..], &[2, 0, 0], &[2, 0, 0, 0, 1, 0, 7]] {
+            assert_eq!(decode_acl(bytes), Err("malformed ACL xattr".into()));
+        }
+        assert_eq!(
+            decode_acl(&[1, 0, 0, 0]),
+            Err("unknown ACL xattr version".into())
+        );
+        let entry = |tag: u16, perm: u16, id: u32| {
+            [tag.to_le_bytes(), perm.to_le_bytes()]
+                .concat()
+                .into_iter()
+                .chain(id.to_le_bytes())
+        };
+        let value: Vec<u8> = 2u32
+            .to_le_bytes()
+            .into_iter()
+            .chain(entry(1, 7, u32::MAX))
+            .chain(entry(8, 4, 65534))
+            .chain(entry(32, 0, u32::MAX))
+            .collect();
+        assert_eq!(
+            decode_acl(&value),
+            Ok(json!({"user":7,"group":0,"other":0,"mask":null,"users":{},"groups":{"65534":4}}))
+        );
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn acl_id_must_be_mapped() {

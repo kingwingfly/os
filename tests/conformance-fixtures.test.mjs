@@ -5,7 +5,6 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { conformanceConfig, replaceExactly, compilerConfig, compilerImage, isSleep, sameSleep, withCleanup, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from '../scripts/conformance/fixtures.mjs';
-import { podmanEnvironment } from '../scripts/podman.mjs';
 import { saveRun } from '../scripts/conformance/results.mjs';
 import { run, revision, ports, generatedFiles, requireProbeSuccess } from '../scripts/conformance/common.mjs';
 import { imageStore } from '../scripts/conformance/storage.mjs';
@@ -107,14 +106,6 @@ test('EBUSY is recorded and keeps the original attachment; successful detach rea
   await recordReattach([],busy,()=>{attaches++;return {ok:null};},'unmount-open');assert.equal(attaches,0);assert.equal(busy.errno,'EBUSY');
   const detached={ok:null};
   await recordReattach([],detached,()=>{attaches++;return {ok:null};},'unmount-open');assert.equal(attaches,1);
-});
-
-test('shared Podman bootstrap respects configured egress images',()=>{
-  const custom={MINIFLARE_CONTAINER_EGRESS_IMAGE:'registry.example/custom:tag'};
-  podmanEnvironment(custom,'/tmp/proxy.sock',{readMiniflare:()=> 'DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "cloudflare/sidecar:tag"'});
-  assert.equal(custom.MINIFLARE_CONTAINER_EGRESS_IMAGE,'registry.example/custom:tag');
-  const defaults={};podmanEnvironment(defaults,'/tmp/proxy.sock',{readMiniflare:()=> 'DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "cloudflare/sidecar:tag"'});
-  assert.equal(defaults.MINIFLARE_CONTAINER_EGRESS_IMAGE,'docker.io/cloudflare/sidecar:tag');
 });
 
 test('browser detach errors retain errno across a serialization boundary',async()=>{

@@ -3,8 +3,8 @@ import { createServer } from 'node:net';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve, relative, isAbsolute } from 'node:path';
 import { existsSync, realpathSync } from 'node:fs';
-import { start as spawnOwned } from '../process.mjs';
-export { stop } from '../process.mjs';
+import { start as spawnOwned } from './process.mjs';
+export { stop } from './process.mjs';
 export const generatedFiles = Object.freeze({baseline:'baseline.json',linuxLatency:'linux-latency.json',linuxEvidence:'linux-evidence.json',latency:'latency.json',evidence:'evidence.json',matrix:'matrix.md'});
 export const filesystems = ['cloud', 'browser-storage', 'directory-handle', 'local-helper', 'relay'];
 export const operations = ['stat-eight-deep','read-1mib','write-1mib','ls-usr-bin','shell-first-prompt'];
@@ -18,6 +18,11 @@ export function requireProbeSuccess(rows,phase) {
   if(rows.some(row=>row.errno||row.skipped))throw new Error(phase+': '+JSON.stringify(rows));
   return rows;
 }
+// An observation row names a known case, a step and a call, and has exactly one outcome.
+// The report and the held-probe decoder both apply this rule.
+export const outcomes = row => ['ok','errno','skipped'].filter(k=>Object.hasOwn(row,k)).length;
+export const rowShape = (row,allowed) => !!row&&typeof row==='object'&&allowed.includes(row.case)&&typeof row.step==='string'&&typeof row.call==='string';
+export const validRow = (row,allowed) => rowShape(row,allowed)&&outcomes(row)===1;
 export const skip = (name,reason) => ({case:name,step:'unavailable',call:name,skipped:reason});
 export const ok = (name,step,call,value) => ({case:name,step,call,ok:value});
 export function canonical(value) {

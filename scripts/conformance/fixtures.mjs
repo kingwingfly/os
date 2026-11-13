@@ -1,6 +1,7 @@
 import { createInterface } from 'node:readline';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { validRow } from './common.mjs';
 
 export function compilerImage(image) {
   if(!/^[a-zA-Z0-9][a-zA-Z0-9_./:@-]*$/.test(image))throw new Error('invalid compiler image reference');
@@ -141,7 +142,7 @@ export function heldRows(state,caseName,detach,diagnostics=[]) {
     try {
       const row=JSON.parse(line);
       if(typeof row?.barrier==='string')continue;
-      if(row?.case!==caseName||typeof row.step!=='string'||typeof row.call!=='string'||['ok','errno','skipped'].filter(key=>Object.hasOwn(row,key)).length!==1)throw new Error('invalid probe row');
+      if(!validRow(row,[caseName]))throw new Error('invalid probe row');
       rows.push(row);
     } catch {
       invalid=true;diagnostics.push({case:caseName,stream:1,text:line});

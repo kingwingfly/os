@@ -3,9 +3,9 @@ import { mkdtemp, mkdir, readFile, writeFile, rm, open } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
-import { needsPodman, startPodman } from '../podman.mjs';
+import { needsPodman, startPodman } from './podman.mjs';
 import { conformanceConfig, compilerConfig, compilerImage, isSleep, sameSleep, withCleanup, mountHandle, browserOptions, directoryProfile, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from './fixtures.mjs';
-import { ShutdownScope } from '../process.mjs';
+import { ShutdownScope } from './process.mjs';
 import { containerLease } from './containers.mjs';
 import { imageStore } from './storage.mjs';
 import { performance } from 'node:perf_hooks';
@@ -128,7 +128,7 @@ export async function os() {
       const storage=join(state,'storage.conf');
       await writeFile(storage,`[storage]\ndriver = "overlay"\ngraphroot = ${JSON.stringify(join(cache,'storage'))}\nrunroot = ${JSON.stringify(join(cache,'run'))}\n`);
       serverEnv.CONTAINERS_STORAGE_CONF=storage;
-      podman=await scope.acquire('Podman service',signal=>startPodman(serverEnv,{signal,socket:join(state,'podman.sock'),proxySocket:join(state,'docker.sock'),stdio:['ignore',log.fd,log.fd],detached:true,strictEgress:true}),service=>service.close());
+      podman=await scope.acquire('Podman service',signal=>startPodman(serverEnv,{signal,socket:join(state,'podman.sock'),stdio:['ignore',log.fd,log.fd]}),service=>service.close());
     }
     if(process.env.OS_CONFORMANCE_COMPILER_IMAGE) {
       const image=compilerImage(process.env.OS_CONFORMANCE_COMPILER_IMAGE);
@@ -143,7 +143,8 @@ export async function os() {
       await writeFile(join(state,'wrangler.toml'),config);
       console.log('Verified prebuilt compiler source and Binaryen bytes: '+image);
     }
-    await scope.acquire('containers',()=>containerLease(serverEnv,join(state,'owned-containers.sock')),lease=>lease.close());
+    // One proxy: it labels this run's containers and, on Podman, drops the swappiness crun refuses.
+    await scope.acquire('containers',()=>containerLease(serverEnv,join(state,'owned-containers.sock'),{stripMemorySwappiness:!!podman}),lease=>lease.close());
     server=scope.own('server',()=>start(process.execPath,['scripts/dev.mjs','--config',join(state,'wrangler.toml'),'--local','--ip','127.0.0.1','--port',String(number),'--inspector-port',String(inspectorPort),'--persist-to',join(state,'persist')],{stdio:['ignore',log.fd,log.fd],env:serverEnv}),stop);
     console.log(`Isolated OS at ${url}; temporary state ${state}`);
     const until=Date.now()+900000;
@@ -151,7 +152,12 @@ export async function os() {
       scope.check();
       if(server.spawnError)throw server.spawnError;
       if (server.exitCode!==null||server.signalCode!==null) throw new Error('isolated server exited; inspect '+join(state,'server.log'));
-      try {const response=await fetch(url,{signal:AbortSignal.timeout(2000)});if(response.ok)break;} catch {}
+      try {
+        const response=await fetch(url,{signal:AbortSignal.timeout(2000)});
+        // Release the connection now; an unread body would hold its socket until garbage collection.
+        await response.body?.cancel();
+        if(response.ok)break;
+      } catch {}
       if(Date.now()>until)throw new Error('isolated server startup timeout; inspect '+join(state,'server.log'));
       await new Promise(r=>setTimeout(r,300));
     }

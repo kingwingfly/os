@@ -1,4 +1,4 @@
-// Process ownership shared by dev bootstrap and disposable integration runners.
+// Process ownership for the conformance runners: owned process groups and one cleanup scope.
 import { spawn } from 'node:child_process';
 const stopping=new WeakMap();
 export function start(cmd,args,options={}) {
@@ -72,7 +72,12 @@ export class ShutdownScope {
     })();
   }
   async terminate(error,code,signal=false) {
-    if(this.fatal) {if(signal)process.exit(code);return;}
+    if(this.fatal) {
+      if(signal)process.exit(code);
+      // Cleanup is already running. Report a later failure instead of discarding it.
+      console.error('During cleanup: '+(error instanceof Error?error.stack:String(error)));
+      return;
+    }
     this.fatal=true;
     console.error(error instanceof Error?error.stack:String(error));
     await this.close();process.exit(code);

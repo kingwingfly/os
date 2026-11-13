@@ -59,6 +59,8 @@ export async function linux({namespaceProbe=spawnSync,binary=buildProbe(),measur
             const shell=spawn('/bin/sh',['-i'],{env:{...process.env,ENV:undefined,PS1:'CONFORMANCE_PROMPT> '},cwd:timingRoot});
             let output='',done=false;
             const timeout=setTimeout(()=>{shell.kill();reject(new Error('native shell prompt timeout'));},10000);
+            // A spawn failure must reach the catch below, which saves the partial results.
+            shell.once('error',error=>{clearTimeout(timeout);reject(Object.assign(new Error('native shell spawn failed: '+error.message),{spawnError:error.message}));});
             shell.stderr.on('data',data=>{output+=data;if(!done&&output.includes('CONFORMANCE_PROMPT>')){done=true;elapsed=performance.now()-started;shell.stdin.end('exit\n');}});
             shell.once('exit',code=>{clearTimeout(timeout);if(!done||code!==0)reject(new Error('native shell prompt failed'));else resolve(elapsed);});
           });

@@ -2,15 +2,15 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { cases, filesystems, operations, observationCases, serialize, generatedFiles } from './common.mjs';
+import { cases, filesystems, operations, observationCases, serialize, generatedFiles, rowShape, outcomes } from './common.mjs';
 const followups=JSON.parse(readFileSync(new URL('../../docs/compat/follow-up-issues.json',import.meta.url),'utf8')).issues;
 const hash=value=>createHash('sha256').update(serialize(value)).digest('hex');
 function group(rows,required=cases) {
   if(!Array.isArray(rows))throw new Error('missing observations');
   const result=new Map();const keys=new Set();
   for(const row of rows) {
-    if(!required.includes(row.case)||typeof row.step!=='string'||typeof row.call!=='string')throw new Error('invalid observation '+JSON.stringify(row));
-    if(['ok','errno','skipped'].filter(k=>Object.hasOwn(row,k)).length!==1)throw new Error('observation must contain exactly one outcome');
+    if(!rowShape(row,required))throw new Error('invalid observation '+JSON.stringify(row));
+    if(outcomes(row)!==1)throw new Error('observation must contain exactly one outcome');
     const key=row.case+'/'+row.step;if(keys.has(key))throw new Error('duplicate observation '+key);keys.add(key);
     if(!result.has(row.case))result.set(row.case,[]);result.get(row.case).push(row);
   }
