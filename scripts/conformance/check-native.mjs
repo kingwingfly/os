@@ -1,6 +1,6 @@
 // Explicit integration gate: excluded from routine npm test.
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, symlink, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -37,6 +37,32 @@ try {
   const denied=join(dir,'denied');await mkdir(denied);
   const rows=jsonLines(run('unshare',['-Urm','setpriv','--bounding-set=-setgid',binary,'two-linux',denied,denied,denied,'0','0']));
   assert.equal(rows.length,1);assert.match(rows[0].skipped,/supplementary groups/);
+  const short=join(dir,'short-map');await mkdir(short);
+  const shortRows=jsonLines(run('unshare',['-Urm','--map-auto','unshare','-Urm','--map-users=0:0:10000','--map-groups=0:0:10000',binary,'two-linux',short,short,short,'0','0']));
+  assert.equal(shortRows.length,1);assert.match(shortRows[0].skipped,/65534.*not mapped/);
+  // Inject a real bind-mount failure after the held-open case has emitted rows.
+  const wrapper=join(dir,'fail-attach.mjs');
+  await writeFile(wrapper,'#!'+process.execPath+'\n'+
+    `import {spawnSync} from 'node:child_process';const r=spawnSync('strace',['-qq','-e','trace=mount','-e','inject=mount:error=EBUSY:when=5',${JSON.stringify(binary)},...process.argv.slice(2)],{stdio:'inherit'});process.exit(r.status??1);\n`,{mode:0o755});
+  let failed;
+  try {await linux({binary:wrapper,measureLatency:false});assert.fail('injected mount failure was not reached');}
+  catch(error){failed=error;assert(error.stateDir);}
+  try {
+    const kept=JSON.parse(await readFile(join(failed.stateDir,'observations.json'),'utf8'));
+    assert(kept.some(r=>r.case==='alias'&&r.step==='create'));
+    assert.equal(kept.find(r=>r.case==='unmount-open'&&r.step==='attach').errno,'EBUSY');
+    assert(!kept.some(r=>r.case==='unmount-cwd'));
+    const diagnostic=JSON.parse(await readFile(join(failed.stateDir,'failure.json'),'utf8'));
+    assert.equal(diagnostic.status,101);assert.match(diagnostic.stderr,/held-case re-attach failed/);
+  } finally {await rm(failed.stateDir,{recursive:true,force:true});}
+  const timing=join(dir,'latency');await mkdir(timing);
+  const timingArgs=['latency',timing,timing,timing,'0','0'];
+  run(binary,[...timingArgs,'prepare']);
+  const trace=join(dir,'stat.trace');
+  run('strace',['-qq','-o',trace,'-e','trace=%file',binary,...timingArgs,'stat']);
+  const calls=(await readFile(trace,'utf8')).split('\n');
+  assert.equal(calls.filter(line=>line.includes(JSON.stringify(join(timing,'1/2/3/4/5/6/7/file')))).length,1);
+  assert.equal(calls.filter(line=>line.includes(JSON.stringify(join(timing,'1/2/3/4/5/6/7')))).length,0);
   const full=await linux({binary,measureLatency:false});
   for(const name of ['unmount-open','unmount-cwd']) {
     const rows=full.observations.filter(r=>r.case===name);
@@ -47,7 +73,7 @@ try {
   assert.equal(full.observations.find(r=>r.case==='unmount-open'&&r.step==='read').ok,'hello');
   assert.equal(full.observations.find(r=>r.case==='unmount-cwd'&&r.step==='getcwd').errno,'ENOENT');
   assert(!Object.hasOwn(full,'latency'));
-  console.log('Native integration: actual MNT_DETACH with retained fd/cwd, fallback repetition, symlinked TMPDIR, partial mappings, denied setgroups and CLI usage passed.');
+  console.log('Native integration: actual MNT_DETACH with retained fd/cwd, fallback repetition, symlinked TMPDIR, partial/10000-ID mappings, denied setgroups, retained panic output, single-stat timing and CLI usage passed.');
 } finally {
   if(previousTmp===undefined)delete process.env.TMPDIR;else process.env.TMPDIR=previousTmp;
   await rm(dir,{recursive:true,force:true});

@@ -28,10 +28,7 @@ fn unit(case: &str, step: &str, call: &str, result: Result<()>) {
     emit(case, step, call, result.map(|_| json!(null)));
 }
 fn skipped(case: &str, reason: &str) {
-    println!(
-        "{}",
-        json!({"case":case,"step":"unavailable","call":case,"skipped":reason})
-    );
+    skip_step(case, "unavailable", case, reason);
 }
 fn skip_step(case: &str, step: &str, call: &str, reason: &str) {
     println!(
@@ -148,6 +145,12 @@ impl Probe {
                     let before = platform::fdidentity(&f);
                     unit(
                         case,
+                        "identity-before",
+                        "fstat(fd) identity before change",
+                        before.clone().map(|_| ()),
+                    );
+                    unit(
+                        case,
                         "change",
                         if unlink {
                             "unlink(file)"
@@ -168,13 +171,27 @@ impl Probe {
                         io(f.seek(SeekFrom::Start(0))).and_then(|_| io(f.write_all(b"HELLO"))),
                     );
                     emit(case, "fstat", "fstat(fd)", platform::fdstat(&f));
-                    emit(
+                    let after = platform::fdidentity(&f);
+                    unit(
                         case,
-                        "identity",
-                        "fstat(fd) identity before/after",
-                        platform::fdidentity(&f)
-                            .and_then(|id| before.map(|old| platform::identity_relation(old, id))),
+                        "identity-after",
+                        "fstat(fd) identity after change",
+                        after.clone().map(|_| ()),
                     );
+                    match (before, after) {
+                        (Ok(before), Ok(after)) => emit(
+                            case,
+                            "identity",
+                            "fstat(fd) identity before/after",
+                            Ok(platform::identity_relation(before, after)),
+                        ),
+                        _ => skip_step(
+                            case,
+                            "identity",
+                            "fstat(fd) identity before/after",
+                            "identity comparison requires successful before and after fstat; see phase results",
+                        ),
+                    }
                     emit(case, "reread", "pread(fd, 0)", read(&mut f));
                 }
             }
@@ -600,7 +617,7 @@ impl Probe {
                 write(&self.root.join("mib"), &vec![b'x'; 1 << 20])
             }
             "stat" => {
-                self.stat(&self.root.join("1/2/3/4/5/6/7/file"))?;
+                platform::stat(&self.root.join("1/2/3/4/5/6/7/file"))?;
                 Ok(())
             }
             "read" => {
@@ -776,6 +793,13 @@ pub fn run() {
                     return;
                 }
                 assert_eq!(unsafe { libc::getgroups(0, std::ptr::null_mut()) }, 0);
+                if !platform::named_acl_available() {
+                    skipped(
+                        "two-accounts",
+                        "named ACL group 65534 is not mapped in this user namespace",
+                    );
+                    return;
+                }
                 // Match the OS fixture: one explicit neutral supplementary group.
                 assert_eq!(unsafe { libc::setgroups(1, [3].as_ptr()) }, 0);
                 platform::mount(Path::new("tmpfs"), &p.root, true).unwrap();

@@ -75,21 +75,6 @@ export async function mountOutcome({operation,path,filesystem,name,connection,ad
   }
 }
 
-// Fail closed on source-layout drift: this guard understands only the current
-// top-level Call/Target layout, never an arbitrary slice produced by indexOf(-1).
-export function checkAbsentMountCalls(abi) {
-  const headers=[...abi.matchAll(/^pub enum Call \{$/gm)];
-  const ends=[...abi.matchAll(/^pub enum Target<'a> \{$/gm)];
-  if(headers.length!==1||ends.length!==1||ends[0].index<=headers[0].index)throw new Error('cannot locate ABI Call boundaries');
-  const section=abi.slice(headers[0].index,ends[0].index);
-  const closes=[...section.matchAll(/^\}$/gm)];
-  if(closes.length!==1||/^pub (?:enum|struct|fn|type) /m.test(section.slice(headers[0][0].length)))throw new Error('unexpected ABI Call boundaries');
-  const body=section.slice(headers[0][0].length,closes[0].index);
-  // Every variant currently starts at four spaces. Reject unrecognized layout.
-  const variants=[...body.matchAll(/^    ([A-Z][A-Za-z0-9_]*)\b/gm)].map(m=>m[1]);
-  if(!variants.length||body.split('\n').some(line=>/^\s*(Chroot|Mount|Umount|Unmount)\b/.test(line)))throw new Error('Mount/chroot ABI changed: replace the unavailable probes with executable calls');
-}
-
 export function startHeld({tool,args,timeout=60000}) {
   const state=window.conformanceHeld={output:'',stderr:'',input:null,barrier:false,done:false,cancelled:false};
   state.timer=setTimeout(()=>{state.timedOut=true;state.cancelled=true;},timeout);

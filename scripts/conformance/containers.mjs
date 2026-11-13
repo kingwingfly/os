@@ -16,7 +16,9 @@ export function engineTarget(env) {
   if(endpoint.startsWith('unix://'))return {socketPath:endpoint.slice(7)};
   const url=new URL(endpoint.replace(/^tcp:/,'http:'));
   if(!['http:','https:'].includes(url.protocol))throw new Error('unsupported container engine endpoint: '+url.protocol);
-  const target={hostname:url.hostname,port:Number(url.port||2375),protocol:url.protocol};
+  // URL normalizes explicit HTTP(S) ports 80/443 away; retain those too.
+  const explicitPort=new URL(endpoint.replace(/^[a-z]+:/i,'tcp:')).port;
+  const target={hostname:url.hostname,port:Number(explicitPort||(env.DOCKER_TLS_VERIFY||url.protocol==='https:'?2376:2375)),protocol:url.protocol};
   if(env.DOCKER_TLS_VERIFY||url.protocol==='https:') {
     target.protocol='https:';
     const dir=env.DOCKER_CERT_PATH;if(!dir)throw new Error('TLS container endpoint requires DOCKER_CERT_PATH');

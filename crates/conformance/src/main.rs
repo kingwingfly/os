@@ -1,4 +1,6 @@
 //! Linux/WASI measurement probe; other workspace hosts keep an explicit stub.
+#[cfg(any(target_os = "wasi", test))]
+mod abi_audit;
 #[cfg(any(target_os = "linux", target_os = "wasi"))]
 mod platform;
 #[cfg(any(target_os = "linux", target_os = "wasi"))]

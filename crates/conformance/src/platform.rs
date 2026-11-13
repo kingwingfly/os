@@ -246,7 +246,10 @@ pub fn noreplace(from: &Path, to: &Path) -> Result<()> {
 pub fn named_acl_available() -> bool {
     #[cfg(target_os = "linux")]
     {
-        fs::read_to_string("/proc/self/gid_map").is_ok_and(|map| id_mapped(&map, 65534))
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            fs::read_to_string("/proc/self/gid_map").is_ok_and(|map| id_mapped(&map, 65534))
+        })
     }
     #[cfg(target_os = "wasi")]
     {

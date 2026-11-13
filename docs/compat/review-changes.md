@@ -1,22 +1,29 @@
 # PR #66 review measurement changes
 
-Compared with reviewed commit `4c6640e`. No OS runtime semantics were changed. **Eight filesystem rows changed**: five have corrected two-account fixture evidence and three have a corrected identity classification. The matrix contains **120 filesystem rows (15 same and 105 differences/skips), plus three unchanged process observations**.
+Compared with reviewed commit `21e8bcc`. No OS runtime semantics were changed. **Eleven compatibility rows changed their evidence, with no classification changes**: ten rename/unlink rows and one GUI observation. The matrix still contains **120 filesystem rows (15 same and 105 differences/skips), plus three process observations**.
 
-Both Linux and OS creators now have exactly one configured neutral supplementary group, also the setgid directory's group, distinct from both primary groups. Native setup clears inherited groups before installing that group; OS setup replaces account memberships before login and changes the directory group through ordinary owner permissions. Both creators can demonstrate inheritance. Cloud now matches Linux and its old registry entry is removed. The four private/export profiles still show B's EACCES, publisher ownership and zero-byte file; those runtime differences remain assigned to #49/#59.
+Descriptor identity is recorded in separate `identity-before` and `identity-after` rows. On Linux and the cloud/browser-storage/directory-handle/local-helper profiles, both calls succeed; existing device/inode availability and identity relations are unchanged. On relay, the before call succeeds and the after call returns ENOENT for both rename and unlink. The relation is now explicitly skipped instead of attributing that errno to an ambiguous combined step. Those differences retain their existing follow-up issues.
 
-Device and inode together identify an object. Missing device evidence no longer permits equality based on a coincident inode alone. Three previously matching rows become incomparable and are assigned to #48; their raw syscall traces did not change. This is a measurement correction, not a runtime regression or an architecture decision.
+The GUI observation removes the hard-coded `mounts_opened`, `editor_opened` and `preview_opened` fields. The runner still asserts that each application opens before recording its actual process images; all measured process images and Files visibility are unchanged.
 
 | Row | Changed steps | Result before → after |
 | --- | --- | --- |
-| cloud/open-rename | Comparison only; raw evidence unchanged | same → difference/incomparable |
-| cloud/hard-link | Comparison only; raw evidence unchanged | same → difference/incomparable |
-| cloud/two-accounts | linux: a-groups, b-groups; os: a-directory, a-inheritance, a-stat | difference/incomparable → same |
-| browser-storage/two-accounts | linux: a-groups, b-groups; os: a-directory, a-inheritance, a-stat | difference/incomparable → difference/incomparable |
-| directory-handle/two-accounts | linux: a-groups, b-groups; os: a-directory, a-inheritance, a-stat | difference/incomparable → difference/incomparable |
-| local-helper/open-rename | Comparison only; raw evidence unchanged | same → difference/incomparable |
-| local-helper/two-accounts | linux: a-groups, b-groups; os: a-directory, a-inheritance, a-stat | difference/incomparable → difference/incomparable |
-| relay/two-accounts | linux: a-groups, b-groups; os: a-directory, a-inheritance, a-stat | difference/incomparable → difference/incomparable |
+| cloud/open-rename | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
+| cloud/open-unlink | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
+| browser-storage/open-rename | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
+| browser-storage/open-unlink | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
+| directory-handle/open-rename | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
+| directory-handle/open-unlink | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
+| local-helper/open-rename | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
+| local-helper/open-unlink | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
+| relay/open-rename | linux: identity-after, identity-before; os: identity, identity-after, identity-before | difference/incomparable → difference/incomparable |
+| relay/open-unlink | linux: identity-after, identity-before; os: identity, identity-after, identity-before | difference/incomparable → difference/incomparable |
+| process/gui-processes | os: ps | observation → observation |
 
-For all five two-account rows, Linux `a-groups`/`b-groups` now report the explicitly installed neutral supplementary membership. OS `a-directory` and `a-stat` show a group distinct from A's primary group; `a-inheritance` is measured successfully instead of skipped. B already had a distinct primary group; its creation evidence is unchanged. The fixture checks the exact supplementary membership before recording results.
+Every other normalized row is unchanged. No registry entry was added or removed; only the eleven reviewed signatures and the relay phase explanations changed.
 
-Every other normalized row and all three process observations are unchanged. Signature ordering now uses fixed code-unit order; it did not alter the signatures of this baseline's other rows. Timing and host/provenance evidence are regenerated separately from deterministic observations. Validation commands and platform limits are documented in [README](README.md); the PR records the checks actually completed.
+## Latency and auxiliary evidence
+
+The `stat-eight-deep` operation now performs one target stat, without the unrelated parent stat formerly used by ownership comparison. All five OS profiles and Linux have regenerated cold/warm samples. Linux `ls-usr-bin` now uses the timing tree as cwd, matching the documented OS scenario. These are measurement-method corrections, not runtime speedups; compare subsequent runs against the corrected samples. Other timing values are regenerated noisy evidence.
+
+Compiler provenance now includes `package.json`. The prior cached image actually contained an older package manifest; it was rebuilt from the unchanged canonical Dockerfile before the OS runs. Every copied compiler source, both package manifests and locked Binaryen bytes are verified against the checkout. Linux panic output and OS signal/helper diagnostics are retained outside successful deterministic baselines. Validation commands and limits are in [README](README.md); the PR records the checks completed for this revision.

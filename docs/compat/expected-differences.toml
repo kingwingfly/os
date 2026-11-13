@@ -18,13 +18,13 @@ signature = "7c8f354d3d77917e2bfb1a2e0d83b56a2b4fc1f4eef36e0c3a32720fb11246f5"
 id = "cloud/open-rename"
 issues = ["#48"]
 reason = "Retained descriptor operations and inode equality match, but WASI fstat exposes a fabricated device number. Device identity is unavailable, so full identity remains incomparable until the runtime exposes it."
-signature = "e938ace9663df873da817d1be825993b838d364f4e75e0640cd8b8c4da69d94f"
+signature = "b2c288488d6f5500e3cd766afa6007cdf2d4c1b7a63a8876de37aa6a9f675cfe"
 
 [[difference]]
 id = "cloud/open-unlink"
 issues = ["#48"]
 reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "7640832d79a779bd6ae2dd9bb15c1cfd2b32af6535bd567016f319b4ed08f39d"
+signature = "ea61d2102aa13211c7e88048e01ab691907953a005eb63395791e7870bf4925a"
 
 [[difference]]
 id = "cloud/unmount-open"
@@ -126,13 +126,13 @@ signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
 id = "browser-storage/open-rename"
 issues = ["#48"]
 reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write). Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "df27aa419c9a633039c061701a2bf48e874b830c020aa865795b94883169b1fe"
+signature = "a4e5dd5763765933a95004bd32901def4b31d08d668c4f8a85d3c0c59985bfcd"
 
 [[difference]]
 id = "browser-storage/open-unlink"
 issues = ["#48"]
 reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "5d63de0996e14c19ca7cae74d6d1f3dd682e7f7aac279a88663975cf1391924b"
+signature = "f390f785aff026e7910cc6de8ab24bffc240ac792b3ee6e3426adb491c5a3c12"
 
 [[difference]]
 id = "browser-storage/unmount-open"
@@ -258,13 +258,13 @@ signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
 id = "directory-handle/open-rename"
 issues = ["#48"]
 reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write). Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "df27aa419c9a633039c061701a2bf48e874b830c020aa865795b94883169b1fe"
+signature = "a4e5dd5763765933a95004bd32901def4b31d08d668c4f8a85d3c0c59985bfcd"
 
 [[difference]]
 id = "directory-handle/open-unlink"
 issues = ["#48"]
 reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "5d63de0996e14c19ca7cae74d6d1f3dd682e7f7aac279a88663975cf1391924b"
+signature = "f390f785aff026e7910cc6de8ab24bffc240ac792b3ee6e3426adb491c5a3c12"
 
 [[difference]]
 id = "directory-handle/unmount-open"
@@ -390,13 +390,13 @@ signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
 id = "local-helper/open-rename"
 issues = ["#48"]
 reason = "Retained descriptor operations and inode equality match, but WASI fstat exposes a fabricated device number. Device identity is unavailable, so full identity remains incomparable until the runtime exposes it."
-signature = "e938ace9663df873da817d1be825993b838d364f4e75e0640cd8b8c4da69d94f"
+signature = "b2c288488d6f5500e3cd766afa6007cdf2d4c1b7a63a8876de37aa6a9f675cfe"
 
 [[difference]]
 id = "local-helper/open-unlink"
 issues = ["#48"]
 reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
-signature = "7640832d79a779bd6ae2dd9bb15c1cfd2b32af6535bd567016f319b4ed08f39d"
+signature = "ea61d2102aa13211c7e88048e01ab691907953a005eb63395791e7870bf4925a"
 
 [[difference]]
 id = "local-helper/unmount-open"
@@ -515,14 +515,14 @@ signature = "2b966c0a2a9785be76791425900b02720d3c2d53e7efed01a4d817ee4d38d22d"
 [[difference]]
 id = "relay/open-rename"
 issues = ["#48"]
-reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write)."
-signature = "8703d0f54c05697172c12281854ed746c22fca8b397c44012af7130181cb10a3"
+reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write). Separate identity calls now show success before the operation and ENOENT after it; the identity relation is explicitly skipped because the after result is unavailable."
+signature = "c7d6224f42fd6105f2334aa2e56b1d0ab6cd382ec145b11fa9498f7f99bf3648"
 
 [[difference]]
 id = "relay/open-unlink"
 issues = ["#48"]
-reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat."
-signature = "bf0285b4ac61ea7052aa97b08f1db03c22ece34df9456427050fec84a6de86d7"
+reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Separate identity calls now show success before the operation and ENOENT after it; the identity relation is explicitly skipped because the after result is unavailable."
+signature = "21877fe6a3b9bbf9bca478405276026935b0f9e1b7de3752a4674598f4ded179"
 
 [[difference]]
 id = "relay/unmount-open"
@@ -642,7 +642,7 @@ signature = "c5bc335c7b9fe7b4fba8fa71f62c09c5510af7c0008e7ecf1a5ca7c3685838ea"
 id = "process/gui-processes"
 issues = ["#63","#64"]
 reason = "Actual Files/Mounts/Editor/Preview windows open without corresponding process images in the registry. The headless Linux host has no matching applications, so this row is incomparable."
-signature = "f8af0844eb74ae2fd78c97a2bfbdbed59ab0e64d413eb240e7e5b4fd36e0e4bf"
+signature = "fd4b1b6db203c78a76e5c68fc8d67c0fbf4b98ad741c16f1529280ccae822ba1"
 
 [[observation]]
 id = "process/tab-pids"

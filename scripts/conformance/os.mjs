@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { needsPodman, startPodman } from '../podman.mjs';
-import { conformanceConfig, compilerConfig, captureDirectoryDrop, helperConnection, recordReattach, putFile, mountOutcome, checkAbsentMountCalls, startHeld, heldState, heldRows } from './fixtures.mjs';
+import { conformanceConfig, compilerConfig, captureDirectoryDrop, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from './fixtures.mjs';
 import { ShutdownScope } from '../process.mjs';
 import { containerLease } from './containers.mjs';
 import { performance } from 'node:perf_hooks';
@@ -111,8 +111,6 @@ async function timing(page,root,alias,cross,creds) {
   return rows;
 }
 export async function os() {
-  const abi=await readFile('crates/abi/src/lib.rs','utf8');
-  checkAbsentMountCalls(abi);
   run('cargo',['xtask','build','--web-only'],{stdio:'inherit'});
   run('cargo',['build','--locked','-p','os-conformance','--target','wasm32-wasip1','--release'],{stdio:'inherit'});
   run('cargo',['build','--locked','-p','os-local-helper','--release'],{stdio:'inherit'});
@@ -122,7 +120,10 @@ export async function os() {
   const scope=new ShutdownScope();
   const previousMask=process.umask(0o022);
   scope.add('umask',()=>process.umask(previousMask));
-  let server,browser,persistent,helper,log,podman,compilerEvidence,failure,success=false;
+  let server,browser,persistent,helper,log,podman,compilerEvidence,failure,success=false,reported=false;
+  const retained=()=>{if(!reported){reported=true;console.error('Run retained disposable state and logs at '+state);}};
+  // This must run inside close(), before signal/error termination can exit.
+  scope.add('retained state notice',()=>{if(!success||scope.fatal)retained();});
   try {
     const number=await port(),url=`http://127.0.0.1:${number}`;
     const root=resolve('.');
@@ -143,7 +144,7 @@ export async function os() {
     if(process.env.OS_CONFORMANCE_COMPILER_IMAGE) {
       const image=process.env.OS_CONFORMANCE_COMPILER_IMAGE;
       if(!/^[a-zA-Z0-9_./:@-]+$/.test(image))throw new Error('invalid compiler image reference');
-      const inputs=['package-lock.json','containers/compiler/server.mjs','web/kernel/transform.js','web/kernel/asyncify.js','web/kernel/memory.js','web/kernel/image.js','node_modules/binaryen/index.js','node_modules/binaryen/package.json'];
+      const inputs=['package.json','package-lock.json','containers/compiler/server.mjs','web/kernel/transform.js','web/kernel/asyncify.js','web/kernel/memory.js','web/kernel/image.js','node_modules/binaryen/index.js','node_modules/binaryen/package.json'];
       const expected=Object.fromEntries(await Promise.all(inputs.map(async path=>[path,createHash('sha256').update(await readFile(path)).digest('hex')])));
       const script=`import {readFileSync} from 'node:fs';import {createHash} from 'node:crypto';console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(inputs)}.map(path=>[path,createHash('sha256').update(readFileSync('/app/'+path)).digest('hex')]))));`;
       const actual=JSON.parse(run(podman?'podman':'docker',['run','--rm','--network','none',image,'node','--input-type=module','-e',script],{env:serverEnv}));
@@ -189,6 +190,7 @@ export async function os() {
     const observations={},latencies={},diagnostics=[];
     for (const filesystem of filesystems) {
       console.log('Measuring '+filesystem);
+      const persist=rows=>writeFile(join(state,filesystem+'-observations.json'),JSON.stringify(rows,null,2));
       const a=await account(browser,url,'conformance-a',password,bytes,filesystem==='directory-handle'?persistent:null), b=await account(browser,url,'conformance-b',password,bytes);
       const {page,context,creds}=a;
       const neutral=creds.groups.filter(g=>g!==creds.gid);
@@ -205,7 +207,7 @@ export async function os() {
       let alias=filesystem==='cloud'?creds.home+'/alias':'/mnt/local/alias';
       if (filesystem==='directory-handle') await mountHandle(page,context,source);
       if (filesystem==='local-helper') {
-        helper=scope.own('helper',()=>start(join(target,'release/os-local-helper'),['--root',source,'--origin',url,'--write','--execute'],{stdio:['ignore','pipe','pipe']}),stop);
+        helper=scope.own('helper',()=>start(join(target,'release/os-local-helper'),['--root',source,'--origin',url,'--write','--execute'],{stdio:['ignore','pipe',log.fd]}),stop);
         connection=await helperConnection(helper);
       }
       if (filesystem==='relay') {
@@ -240,12 +242,12 @@ export async function os() {
         rows.push(...await probe(page,'remount-prepare',primary,alias,cross,creds));
         const detached={case:'remount',step:'detach',call:'umount(mount)',...await page.evaluate(mountOutcome,{operation:'detach',path:primary})};
         rows.push(detached);
-        await recordReattach(rows,detached,()=>attach('primary'),'remount',rows=>writeFile(join(state,filesystem+'-observations.json'),JSON.stringify(rows,null,2)));
+        await recordReattach(rows,detached,()=>attach('primary'),'remount',persist);
         rows.push(...await probe(page,'remount-observe',primary,alias,cross,creds));
         for(const mode of ['hold-open','hold-cwd']) {
           const heldResult=await held(page,mode,primary,alias,cross,creds,diagnostics);
           rows.push(...heldResult.rows);
-          await recordReattach(rows,heldResult.detach,()=>attach('primary'),mode==='hold-open'?'unmount-open':'unmount-cwd',rows=>writeFile(join(state,filesystem+'-observations.json'),JSON.stringify(rows,null,2)));
+          await recordReattach(rows,heldResult.detach,()=>attach('primary'),mode==='hold-open'?'unmount-open':'unmount-cwd',persist);
         }
       }
       rows.push(...await probe(page,'unsupported',primary,alias,cross,creds));
@@ -270,7 +272,7 @@ export async function os() {
         bpath='/mnt/shared/two-creators';
       }
       rows.push(...await probe(b.page,'creator',bpath,bpath,bpath,b.creds,['b']));
-      await writeFile(join(state,filesystem+'-observations.json'),JSON.stringify(rows,null,2));
+      await persist(rows);
       latencies[filesystem]=await timing(page,primary,alias,cross,creds);
       if(filesystem==='relay') {
         const transport=await page.evaluate(()=>window.os.mountTransports());
@@ -287,7 +289,7 @@ export async function os() {
   } finally {
     const errors=await scope.close();
     if(success&&!scope.fatal&&!errors.length)await rm(state,{recursive:true,force:true});
-    else console.error('Run retained disposable state and logs at '+state);
+    else retained();
     if(errors.length&&!failure)throw new AggregateError(errors.map(e=>e.error),'conformance cleanup failed');
   }
 }
@@ -346,7 +348,7 @@ async function processFacts(admin,url) {
   await page.keyboard.press('Escape');
   await page.evaluate(()=>window.os.open('/root/conformance-note.txt'));
   await expect(page.locator('#viewer')).toBeVisible();const preview=images(await ps());
-  rows.push(ok('gui-processes','ps','open Files/Mounts/Editor/Preview; inspect ps',{files_visible:await page.locator('#window-files').isVisible(),mounts_opened:true,editor_opened:true,preview_opened:true,
+  rows.push(ok('gui-processes','ps','open Files/Mounts/Editor/Preview; inspect ps',{files_visible:await page.locator('#window-files').isVisible(),
     images_with_files:before,images_with_mounts:mounts,images_with_editor:editor,images_with_preview:preview}));
   const tab=await context.newPage();await ready(tab,url);
   await page.evaluate(()=>{window.conformanceSleep=window.os.exec([{path:'/usr/bin/sleep',argv:['sleep','60']}],{cwd:'/',stdin:''});});

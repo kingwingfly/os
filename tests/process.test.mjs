@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdtemp, writeFile, readFile, rm, symlink } from 'node:fs/promises';
+import http from 'node:http';
+import { mkdtemp, writeFile, readFile, rm, symlink, stat, open } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { start, stop } from '../scripts/process.mjs';
@@ -26,17 +27,19 @@ for(const event of ['SIGINT','SIGTERM','uncaughtException','unhandledRejection']
   const script=`import {ShutdownScope,start,stop} from ${JSON.stringify(moduleURL)};
     import net from 'node:net';
     const scope=new ShutdownScope();
+    scope.add('retained state notice',()=>console.error('Retained fixture state: /tmp/conformance-notice'));
     const child=scope.own('detached child',()=>start(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'}),stop);
     const server=await scope.acquire('listener',()=>new Promise(resolve=>{const s=net.createServer();s.listen(0,'127.0.0.1',()=>resolve(s));}),s=>new Promise(resolve=>s.close(resolve)));
     console.log(JSON.stringify({pid:child.pid,port:server.address().port}));
     if(${JSON.stringify(event)}==='uncaughtException')setTimeout(()=>{throw new Error('fixture callback failure');},50);
     if(${JSON.stringify(event)}==='unhandledRejection')setTimeout(()=>{void Promise.reject(new Error('fixture rejection'));},50);`;
   const child=start(process.execPath,['--input-type=module','-e',script],{detached:true,stdio:['ignore','pipe','pipe']});
-  let owned;const exited=once(child,'exit');
+  let owned,errorText='';child.stderr.on('data',chunk=>{errorText+=chunk;});const exited=once(child,'exit');
   try {
     owned=JSON.parse(await firstLine(child));
     if(event.startsWith('SIG'))child.kill(event);
     const [code]=await exited;assert.equal(code,event==='SIGINT'?130:event==='SIGTERM'?143:1);
+    assert.match(errorText,/Retained fixture state: \/tmp\/conformance-notice/);
     assert(!exists(owned.pid),'owned child survived cleanup');
     await assert.rejects(fetch('http://127.0.0.1:'+owned.port));
   } finally {
@@ -107,4 +110,31 @@ test('optional dev bootstrap retains a late Podman service and wires the proxy',
     const until=Date.now()+5000;
     while(true){try {await readFile(env.CONFORMANCE_SOCKET);break;}catch(error){if(error.code!=='ENOENT'||Date.now()>until)throw error;await new Promise(r=>setTimeout(r,20));}}
   } finally {await service?.close();await rm(dir,{recursive:true,force:true});}
+});
+
+
+test('reuse never probes, unlinks or owns another session’s existing Podman socket',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-borrow-')),socket=join(dir,'shared.sock'),marker=join(dir,'invoked');
+  const server=http.createServer((_req,res)=>res.end('shared owner'));let borrowed;
+  const get=()=>new Promise((resolve,reject)=>{http.get({socketPath:socket,path:'/_ping'},res=>{let value='';res.on('data',c=>{value+=c;});res.on('end',()=>resolve(value));}).on('error',reject);});
+  try {
+    // The old version probe times out here and then deletes the live socket.
+    await writeFile(join(dir,'podman'),'#!/bin/sh\nprintf invoked > "$CONFORMANCE_MARKER"\nexec /bin/sleep 30\n',{mode:0o755});
+    server.listen(socket);await once(server,'listening');const inode=(await stat(socket)).ino;
+    borrowed=await startPodman({...process.env,PATH:dir,CONFORMANCE_MARKER:marker},{socket,proxySocket:join(dir,'borrow.sock'),reuse:true,detached:true,startupTimeout:30});
+    assert.equal((await stat(socket)).ino,inode);assert.equal(await get(),'shared owner');
+    await assert.rejects(readFile(marker),{code:'ENOENT'});
+    await borrowed.close();borrowed=null;
+    assert.equal((await stat(socket)).ino,inode);assert.equal(await get(),'shared owner');
+  } finally {await borrowed?.close();await new Promise(resolve=>server.close(resolve));await rm(dir,{recursive:true,force:true});}
+});
+
+test('helper startup stderr survives its failed connection announcement in the runner log',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-helper-log-')),path=join(dir,'server.log');
+  const log=await open(path,'w');let child;
+  try {
+    child=start(process.execPath,['-e',"console.error('openat2 fixture failure');process.exit(1)"],{stdio:['ignore','pipe',log.fd]});
+    await assert.rejects(helperConnection(child),/helper exited/);
+    assert.match(await readFile(path,'utf8'),/openat2 fixture failure/);
+  } finally {await stop(child);await log.close();await rm(dir,{recursive:true,force:true});}
 });

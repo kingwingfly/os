@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, mkdtemp, writeFile, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { conformanceConfig, replaceExactly, compilerConfig, helperConnection, recordReattach, putFile, mountOutcome, checkAbsentMountCalls, startHeld, heldState, heldRows } from '../scripts/conformance/fixtures.mjs';
+import { conformanceConfig, replaceExactly, compilerConfig, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from '../scripts/conformance/fixtures.mjs';
 import { podmanEnvironment } from '../scripts/podman.mjs';
 import { saveRun } from '../scripts/conformance/results.mjs';
 import { run, revision } from '../scripts/conformance/common.mjs';
@@ -111,12 +111,6 @@ test('replacement paths preserve dollar replacement tokens for regex and string 
   const config=conformanceConfig(await readFile('wrangler.toml','utf8'),root);
   assert(config.includes('directory = '+JSON.stringify(root+'/dist')));
   assert(config.includes('main = '+JSON.stringify(root+'/crates/worker/entry.js')));
-});
-
-test('ABI guard fails closed on missing, renamed, reordered or interposed enum headers',async()=>{
-  const source=await readFile('crates/abi/src/lib.rs','utf8');
-  assert.doesNotThrow(()=>checkAbsentMountCalls(source));
-  for(const bad of [source.replace('pub enum Call {','pub enum Requests {'),source.replace("pub enum Target<'a> {",'pub enum Destination {'),"pub enum Target<'a> {\n}\n"+source,"pub enum Target<'a> {\n}\n"+source.replace("pub enum Target<'a> {",'pub enum Moved {'),source.replace('pub enum Call {','pub enum Call {\n    Mount { path: String },'),source.replace("pub enum Target<'a> {","pub enum Extra { A }\npub enum Target<'a> {")])assert.throws(()=>checkAbsentMountCalls(bad));
 });
 
 test('attach and detach errors normalize in the browser before serialization',async()=>{

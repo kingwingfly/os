@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { containerLease } from '../scripts/conformance/containers.mjs';
+import { containerLease, engineTarget } from '../scripts/conformance/containers.mjs';
 const request=(socket,method,path,body)=>new Promise((resolve,reject)=>{
   const req=http.request({socketPath:socket,method,path,headers:{'Content-Type':'application/json'}},res=>{
     const chunks=[];res.on('data',c=>chunks.push(c));res.on('end',()=>resolve(JSON.parse(Buffer.concat(chunks)||'null')));res.on('error',reject);
@@ -49,4 +49,18 @@ for(const selection of ['docker context','DOCKER_HOST','WRANGLER_DOCKER_HOST'])t
     await lease.close();lease=null;
     assert.deepEqual(removed,['owned']);assert.deepEqual([...containers.keys()],['existing','concurrent']);
   } finally {await lease?.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await rm(dir,{recursive:true,force:true});}
+});
+
+
+test('Docker TLS defaults to 2376 while plaintext and explicit ports are preserved',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-tls-options-'));
+  try {
+    for(const file of ['ca.pem','cert.pem','key.pem'])await writeFile(join(dir,file),'fixture');
+    assert.equal(engineTarget({DOCKER_HOST:'tcp://example.test',DOCKER_TLS_VERIFY:'1',DOCKER_CERT_PATH:dir}).port,2376);
+    assert.equal(engineTarget({DOCKER_HOST:'https://example.test',DOCKER_CERT_PATH:dir}).port,2376);
+    assert.equal(engineTarget({DOCKER_HOST:'tcp://example.test'}).port,2375);
+    assert.equal(engineTarget({DOCKER_HOST:'https://example.test:443',DOCKER_CERT_PATH:dir}).port,443);
+    assert.equal(engineTarget({DOCKER_HOST:'tcp://example.test:80'}).port,80);
+    assert.equal(engineTarget({DOCKER_HOST:'tcp://example.test:1234',DOCKER_TLS_VERIFY:'1',DOCKER_CERT_PATH:dir}).port,1234);
+  } finally {await rm(dir,{recursive:true,force:true});}
 });

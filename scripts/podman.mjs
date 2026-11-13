@@ -1,6 +1,6 @@
 // Shared Docker-compatible Podman bootstrap for development and isolated tests.
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { podmanProxy } from './podman-proxy.mjs';
@@ -23,10 +23,10 @@ export async function startPodman(env,{socket,proxySocket,reuse=false,stdio='ign
     try {proxy?.close();} finally {await stop(service);}
   })();
   try {
-    const answers=()=>spawnSync('podman',['--url','unix://'+socket,'version'],{env,stdio:'ignore',timeout:2000}).status===0;
-    if(!reuse||!existsSync(socket)||!answers()) {
+    // An existing shared socket belongs to its original session. A slow or
+    // failed health check cannot transfer ownership or authorize unlinking it.
+    if(!reuse||!existsSync(socket)) {
       if(!reuse&&existsSync(socket))throw new Error('isolated Podman socket already exists');
-      if(reuse)rmSync(socket,{force:true});
       const cgroups=env.DBUS_SESSION_BUS_ADDRESS?[]:['--cgroup-manager=cgroupfs'];
       service=start('podman',[...cgroups,'system','service','--time=0','unix://'+socket],{stdio,env,detached});
       const deadline=Date.now()+startupTimeout;
