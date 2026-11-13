@@ -30,3 +30,9 @@ export async function attempt(caseName,step,call,operation) {
 export async function reattachAfter(detach,attach) {
   if(Object.hasOwn(detach,'ok'))return attach();
 }
+// This function executes in the browser. Serialize the errno there: Playwright
+// does not retain custom properties on exceptions crossing its boundary.
+export async function unmountOutcome(path) {
+  try {await window.os.unmountLocal(path);return {ok:null};}
+  catch(error) {return {errno:error.errno||error.code||error.message};}
+}

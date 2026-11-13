@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { needsPodman, startPodman } from '../podman.mjs';
-import { conformanceConfig, replaceExactly, putFile, attempt, reattachAfter } from './fixtures.mjs';
+import { conformanceConfig, replaceExactly, putFile, attempt, reattachAfter, unmountOutcome } from './fixtures.mjs';
 import { createInterface } from 'node:readline';
 import { performance } from 'node:perf_hooks';
 import { run, targetDir, jsonLines, skip, ok, port, start, stop, sourceEvidence, filesystems, operations, probeOperations, cleanup } from './common.mjs';
@@ -230,7 +230,7 @@ export async function os() {
       if(filesystem==='cloud') for(const name of ['remount','unmount-open','unmount-cwd'])rows.push(skip(name,'not implemented: cloud root cannot be detached through the current mount API'));
       else {
         rows.push(...await probe(page,'remount-prepare',primary,alias,cross,creds));
-        const detached=await attempt('remount','detach','umount(mount)',()=>page.evaluate(path=>window.os.unmountLocal(path),primary));
+        const detached={case:'remount',step:'detach',call:'umount(mount)',...await page.evaluate(unmountOutcome,primary)};
         rows.push(detached);
         await reattachAfter(detached,async()=>rows.push(await attempt('remount','attach','mount(source, mount)',()=>attach('primary'))));
         rows.push(...await probe(page,'remount-observe',primary,alias,cross,creds));

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { conformanceConfig, putFile, attempt, reattachAfter } from '../scripts/conformance/fixtures.mjs';
+import { conformanceConfig, putFile, attempt, reattachAfter, unmountOutcome } from '../scripts/conformance/fixtures.mjs';
 import { podmanEnvironment } from '../scripts/podman.mjs';
 import { saveRun } from '../scripts/conformance/results.mjs';
 import { run, revision } from '../scripts/conformance/common.mjs';
@@ -50,6 +50,16 @@ test('shared Podman bootstrap respects configured egress images',()=>{
   assert.equal(custom.MINIFLARE_CONTAINER_EGRESS_IMAGE,'registry.example/custom:tag');
   const defaults={};podmanEnvironment(defaults,'/tmp/proxy.sock','DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "cloudflare/sidecar:tag"');
   assert.equal(defaults.MINIFLARE_CONTAINER_EGRESS_IMAGE,'docker.io/cloudflare/sidecar:tag');
+});
+
+test('browser detach errors retain errno across a serialization boundary',async()=>{
+  const original=globalThis.window;
+  globalThis.window={os:{unmountLocal:()=>{throw {errno:'EBUSY',message:'busy mount'};}}};
+  try {
+    // Only plain returned data crosses the browser boundary; throwing would
+    // lose errno and surface as a generic Playwright Error instead.
+    assert.deepEqual(JSON.parse(JSON.stringify(await unmountOutcome('/mount'))),{errno:'EBUSY'});
+  } finally {if(original===undefined)delete globalThis.window;else globalThis.window=original;}
 });
 
 test('provenance records HEAD and dirtiness without any remote-tracking reference',async()=>{
