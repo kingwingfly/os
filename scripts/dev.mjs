@@ -18,7 +18,9 @@ if(needsPodman(env)) {
   }
 }
 const wrangler=spawn('npx',['wrangler','dev',...process.argv.slice(2)],{stdio:'inherit',env});
-const stop=signal=>{wrangler.kill(signal);void podman?.close();};
+// Wrangler still needs its engine connection while draining/removing containers.
+// The exit handler owns Podman cleanup after Wrangler has finished.
+const stop=signal=>{wrangler.kill(signal);};
 process.on('SIGINT',()=>stop('SIGINT'));
 process.on('SIGTERM',()=>stop('SIGTERM'));
 wrangler.on('exit',async code=>{try {await podman?.close();} finally {process.exit(code??0);}});

@@ -4,11 +4,33 @@ import { readFile, mkdtemp, writeFile, mkdir, rm, chmod, symlink, stat } from 'n
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { conformanceConfig, replaceExactly, compilerConfig, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from '../scripts/conformance/fixtures.mjs';
+import { conformanceConfig, replaceExactly, compilerConfig, compilerImage, isSleep, sameSleep, withCleanup, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from '../scripts/conformance/fixtures.mjs';
 import { podmanEnvironment } from '../scripts/podman.mjs';
 import { saveRun } from '../scripts/conformance/results.mjs';
 import { run, revision, ports } from '../scripts/conformance/common.mjs';
 import { imageStore } from '../scripts/conformance/storage.mjs';
+
+test('compiler image rejects command flags before invoking the engine',()=>{
+  for(const value of ['--privileged','-x','','image;command','image with spaces'])assert.throws(()=>compilerImage(value),/invalid compiler image/);
+  for(const value of ['localhost/compiler:baseline','registry.example:5000/compiler@sha256:abcdef'])assert.equal(compilerImage(value),value);
+});
+
+test('tab visibility requires matching executable and argv as well as PID',()=>{
+  const fixture={pid:42,path:'/usr/bin/sleep',argv:['sleep','60']};
+  assert(isSleep(fixture));assert(sameSleep({...fixture},fixture));
+  for(const other of [{...fixture,pid:43},{...fixture,path:'/usr/bin/sh',argv:['sh']},{...fixture,argv:['sleep','1']}])assert(!sameSleep(other,fixture));
+});
+
+test('readiness diagnostics survive a simultaneous cleanup failure',async()=>{
+  const primary=new Error('startup service readiness: {"output":"partial","done":false}'),cleanup=new Error('cleanup timed out');
+  await assert.rejects(withCleanup(async()=>{throw primary;},async()=>{throw cleanup;}),error=>{
+    assert(error instanceof AggregateError);assert.deepEqual(error.errors,[primary,cleanup]);assert.equal(error.cause,primary);
+    assert.match(error.message,/startup service readiness:.*partial/);assert.match(error.message,/cleanup timed out/);return true;
+  });
+  await assert.rejects(withCleanup(async()=>{},async()=>{throw cleanup;}),error=>error===cleanup);
+  await assert.rejects(withCleanup(async()=>{throw primary;},async()=>{}),error=>error===primary);
+  assert.equal(await withCleanup(async()=>42,async()=>{}),42);
+});
 
 test('image store rejects shared permissions and symlinks before loading images',async()=>{
   const dir=await mkdtemp(join(tmpdir(),'conformance-store-'));
@@ -98,6 +120,10 @@ test('provenance records HEAD and dirtiness without any remote-tracking referenc
     assert.deepEqual(revision(dir),{head:run('git',['rev-parse','HEAD'],{cwd:dir}).trim(),dirty:false});
     await writeFile(join(out,'latency.json'),'generated');
     assert.equal(revision(dir).dirty,true);assert.equal(revision(dir,out).dirty,false);
+    const subdir=join(dir,'nested/runner');await mkdir(subdir,{recursive:true});
+    // This is an isolated Git fixture, not the repository's unrelated worktrees.
+    await mkdir(join(dir,'.worktrees'));await writeFile(join(dir,'.worktrees/unrelated'),'fixture');
+    assert.deepEqual(revision(subdir,out),revision(dir,out));
     const other=join(dir,'out [literal]');await mkdir(other);await writeFile(join(other,'baseline.json'),'generated');
     await writeFile(join(out,'latency.json'),'initial');assert.equal(revision(dir,other).dirty,false);
     assert.equal(revision(dir,dir).dirty,true); // --out=. must not hide the source tree.
@@ -111,6 +137,7 @@ test('provenance records HEAD and dirtiness without any remote-tracking referenc
     run('git',['-c','core.hooksPath=/dev/null','-c','commit.gpgSign=false','-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--no-gpg-sign','--no-verify','--quiet','-m','input'],{cwd:dir,env});
     assert.equal(revision(dir,out).dirty,false);
     await writeFile(join(out,'README.md'),'edited input');assert.equal(revision(dir,out).dirty,true);
+    assert.equal(revision(subdir,out).dirty,true);
     await writeFile(join(dir,'source'),'two');assert.equal(revision(dir,other).dirty,true);
   } finally {await rm(dir,{recursive:true,force:true});}
 });

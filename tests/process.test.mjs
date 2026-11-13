@@ -129,12 +129,59 @@ test('reuse connects without waiting for an API response and never unlinks or ow
   } finally {await borrowed?.close();await new Promise(resolve=>server.close(resolve));await rm(dir,{recursive:true,force:true});}
 });
 
-test('stop never signals a reaped process group',async()=>{
+test('stop does not send termination signals to an absent process group',async()=>{
   const child=start(process.execPath,['-e',''],{detached:true,stdio:'ignore'});
   await once(child,'exit');
   const original=process.kill;const signals=[];
-  try {process.kill=(...args)=>{signals.push(args);};await stop(child);assert.deepEqual(signals,[]);}
+  try {process.kill=(...args)=>{signals.push(args);return original(...args);};await stop(child);assert.deepEqual(signals,[[-child.pid,0]]);}
   finally {process.kill=original;}
+});
+
+for(const early of [false,true])test('stop waits for a resistant group member after leader exit '+(early?'before stop':'during stop'),async()=>{
+  const worker=`process.on('SIGTERM',()=>{});const s=require('node:net').createServer();s.listen(0,'127.0.0.1',()=>console.log(JSON.stringify({pid:process.pid,port:s.address().port})));`;
+  const script=`const {spawn}=require('node:child_process');
+    process.on('SIGTERM',()=>process.exit(0));
+    const child=spawn(process.execPath,['-e',${JSON.stringify(worker)}],{stdio:['ignore','pipe','inherit']});
+    child.stdout.once('data',text=>{process.stdout.write(text,()=>{if(${early})process.exit(0);});});`;
+  const child=start(process.execPath,['-e',script],{detached:true,stdio:['ignore','pipe','pipe']});
+  const exited=once(child,'exit');
+  try {
+    const member=JSON.parse(await firstLine(child));
+    if(early)await exited;
+    assert(exists(member.pid));assert.doesNotThrow(()=>process.kill(-child.pid,0));
+    await stop(child,{timeout:80});
+    assert.throws(()=>process.kill(-child.pid,0),{code:'ESRCH'});
+    assert(!exists(member.pid),'group member survived cleanup');
+    const socket=(await import('node:net')).connect(member.port,'127.0.0.1');
+    await assert.rejects(once(socket,'connect'),{code:'ECONNREFUSED'});socket.destroy();
+    await stop(child,{timeout:80});
+  } finally {try {process.kill(-child.pid,'SIGKILL');}catch(error){if(error.code!=='ESRCH')throw error;}await stop(child,{timeout:80});}
+});
+
+for(const event of ['SIGINT','SIGTERM'])test('dev keeps Podman available until Wrangler finishes '+event,async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-dev-drain-')),events=join(dir,'events');let child;
+  const env={...process.env,PATH:dir,TMPDIR:dir,CONFORMANCE_EVENTS:events};
+  delete env.DOCKER_HOST;delete env.WRANGLER_DOCKER_HOST;
+  try {
+    await symlink('/bin/sh',join(dir,'sh'));
+    const record=`const record=s=>require('node:fs').appendFileSync(process.env.CONFORMANCE_EVENTS,s+'\\n');`;
+    await writeFile(join(dir,'podman'),'#!'+process.execPath+'\n'+record+`
+      const s=require('node:http').createServer((_req,res)=>{record('podman-request');res.end('alive');});
+      s.listen(process.argv.at(-1).slice(7));
+      process.on('SIGTERM',()=>{record('podman-stopped');s.close(()=>process.exit(0));});`,{mode:0o755});
+    await writeFile(join(dir,'npx'),'#!'+process.execPath+'\n'+record+`
+      process.on(${JSON.stringify(event)},async()=>{
+        record('wrangler-draining');await new Promise(r=>setTimeout(r,150));
+        require('node:http').get({socketPath:process.env.WRANGLER_DOCKER_HOST.slice(7),path:'/cleanup'},res=>{
+          res.resume();res.on('end',()=>{record('wrangler-finished');process.exit(0);});
+        }).on('error',error=>{console.error(error);process.exit(1);});
+      });console.log('WRANGLER_READY');setInterval(()=>{},1000);`,{mode:0o755});
+    child=start(process.execPath,['scripts/dev.mjs'],{env,detached:true,stdio:['ignore','pipe','pipe']});
+    const exited=once(child,'exit');let errors='';child.stderr.on('data',c=>{errors+=c;});
+    await new Promise((resolve,reject)=>{let text='';child.stdout.on('data',c=>{text+=c;if(text.includes('WRANGLER_READY'))resolve();});child.once('exit',()=>reject(new Error('dev fixture exited before ready: '+errors)));});
+    child.kill(event);assert.equal((await exited)[0],0,errors);
+    assert.deepEqual((await readFile(events,'utf8')).trim().split('\n'),['wrangler-draining','podman-request','wrangler-finished','podman-stopped']);
+  } finally {await stop(child,{timeout:100});await rm(dir,{recursive:true,force:true});}
 });
 
 test('stale shared socket gets a private service without unlinking the shared name',async()=>{
@@ -154,8 +201,12 @@ test('stale shared socket gets a private service without unlinking the shared na
 
 test('Podman configuration leaves the environment untouched on lookup failure',()=>{
   const env={ORIGINAL:'retained'};
-  assert.throws(()=>podmanEnvironment(env,'/tmp/proxy',{}),/match/);
+  assert.throws(()=>podmanEnvironment(env,'/tmp/proxy','export const unrelated = "fixture";'),/Miniflare egress image not found/);
   assert.deepEqual(env,{ORIGINAL:'retained'});
+  const explicit={MINIFLARE_CONTAINER_EGRESS_IMAGE:'registry.example/egress:tag'};
+  podmanEnvironment(explicit,'/tmp/proxy','no default declaration');
+  assert.equal(explicit.MINIFLARE_CONTAINER_EGRESS_IMAGE,'registry.example/egress:tag');
+  assert.equal(explicit.WRANGLER_DOCKER_HOST,'unix:///tmp/proxy');
 });
 
 test('helper startup stderr survives its failed connection announcement in the runner log',async()=>{

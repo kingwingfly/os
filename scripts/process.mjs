@@ -13,16 +13,26 @@ export function stop(child,{timeout=5000}={}) {
   if(!child?.pid)return Promise.resolve();
   if(stopping.has(child))return stopping.get(child);
   const done=(async()=>{
-    const kill=signal=>{
-      // Once reaped, the PID (and hence process-group ID) can be reused.
-      if(child.exitCode!==null||child.signalCode!==null)return;
-      try {if(child.processGroup)process.kill(-child.pid,signal);else child.kill(signal);}
-      catch(error) {if(error.code!=='ESRCH')throw error;}
+    let gone=false;
+    const leaderExited=()=>child.exitCode!==null||child.signalCode!==null;
+    const exited=leaderExited()?Promise.resolve():new Promise(resolve=>child.once('exit',resolve));
+    const signalGroup=signal=>{
+      if(gone)return false;
+      try {process.kill(-child.pid,signal);return true;}
+      catch(error) {if(error.code!=='ESRCH')throw error;gone=true;return false;}
     };
-    if(child.exitCode!==null||child.signalCode!==null)return;
-    const exited=new Promise(resolve=>child.once('exit',resolve));
-    kill('SIGTERM');const timer=setTimeout(()=>kill('SIGKILL'),timeout);
-    try {await exited;} finally {clearTimeout(timer);}
+    const alive=()=>child.processGroup?signalGroup(0):!leaderExited();
+    const kill=signal=>child.processGroup?signalGroup(signal):!leaderExited()&&child.kill(signal);
+    // A PGID remains allocated while any member exists, including descendants
+    // of a reaped leader. Stop polling/signalling permanently at the first ESRCH.
+    if(alive()) {
+      kill('SIGTERM');const deadline=Date.now()+timeout;
+      while(alive()) {
+        if(Date.now()>=deadline)kill('SIGKILL');
+        await new Promise(resolve=>setTimeout(resolve,20));
+      }
+    }
+    await exited;
   })();
   stopping.set(child,done);return done;
 }

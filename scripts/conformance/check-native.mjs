@@ -40,21 +40,28 @@ try {
   const short=join(dir,'short-map');await mkdir(short);
   const shortRows=jsonLines(run('unshare',['-Urm','--map-auto','unshare','-Urm','--map-users=0:0:10000','--map-groups=0:0:10000',binary,'two-linux',short,short,short,'0','0']));
   assert.equal(shortRows.length,1);assert.match(shortRows[0].skipped,/65534.*not mapped/);
-  // Inject a real bind-mount failure after the held-open case has emitted rows.
-  const wrapper=join(dir,'fail-attach.mjs');
-  await writeFile(wrapper,'#!'+process.execPath+'\n'+
-    `import {spawnSync} from 'node:child_process';const r=spawnSync('strace',['-qq','-e','trace=mount','-e','inject=mount:error=EBUSY:when=5',${JSON.stringify(binary)},...process.argv.slice(2)],{stdio:'inherit'});process.exit(r.status??1);\n`,{mode:0o755});
-  let failed;
-  try {await linux({binary:wrapper,measureLatency:false});}catch(error){failed=error;}
-  assert(failed?.stateDir,'injected mount failure was not reached');
-  try {
-    const kept=JSON.parse(await readFile(join(failed.stateDir,'observations.json'),'utf8'));
-    assert(kept.some(r=>r.case==='alias'&&r.step==='create'));
-    assert.equal(kept.find(r=>r.case==='unmount-open'&&r.step==='attach').errno,'EBUSY');
-    assert(!kept.some(r=>r.case==='unmount-cwd'));
-    const diagnostic=JSON.parse(await readFile(join(failed.stateDir,'failure.json'),'utf8'));
-    assert.equal(diagnostic.status,101);assert.match(diagnostic.stderr,/held-case re-attach failed/);
-  } finally {await rm(failed.stateDir,{recursive:true,force:true});}
+  // Failed detach must not stack another bind; failed attach must not proceed.
+  for(const failure of [
+    {syscall:'umount2',when:1,case:'remount',step:'detach',message:/remount detach failed/,next:'unmount-open'},
+    {syscall:'mount',when:4,case:'remount',step:'attach',message:/remount re-attach failed/,next:'unmount-open'},
+    {syscall:'mount',when:5,case:'unmount-open',step:'attach',message:/held-case re-attach failed/,next:'unmount-cwd'},
+  ]) {
+    const wrapper=join(dir,'fail-attach.mjs');
+    await writeFile(wrapper,'#!'+process.execPath+'\n'+
+      `import {spawnSync} from 'node:child_process';const r=spawnSync('strace',['-qq','-e','trace=${failure.syscall}','-e','inject=${failure.syscall}:error=EBUSY:when=${failure.when}',${JSON.stringify(binary)},...process.argv.slice(2)],{stdio:'inherit'});process.exit(r.status??1);\n`,{mode:0o755});
+    let failed;
+    try {await linux({binary:wrapper,measureLatency:false});}catch(error){failed=error;}
+    assert(failed?.stateDir,'injected mount failure was not reached');
+    try {
+      const kept=JSON.parse(await readFile(join(failed.stateDir,'observations.json'),'utf8'));
+      assert(kept.some(r=>r.case==='alias'&&r.step==='create'));
+      assert.equal(kept.find(r=>r.case===failure.case&&r.step===failure.step).errno,'EBUSY');
+      if(failure.step==='detach')assert(!kept.some(r=>r.case==='remount'&&r.step==='attach'));
+      assert(!kept.some(r=>r.case===failure.next));
+      const diagnostic=JSON.parse(await readFile(join(failed.stateDir,'failure.json'),'utf8'));
+      assert.equal(diagnostic.status,101);assert.match(diagnostic.stderr,failure.message);
+    } finally {await rm(failed.stateDir,{recursive:true,force:true});}
+  }
   const timing=join(dir,'latency');await mkdir(timing);
   const timingArgs=['latency',timing,timing,timing,'0','0'];
   run(binary,[...timingArgs,'prepare']);
@@ -89,7 +96,7 @@ try {
   }
   await assert.rejects(readFile(join(cloud,'alias-file')),{code:'ENOENT'});
 
-  console.log('Native integration: actual MNT_DETACH with retained fd/cwd, fallback repetition, symlinked TMPDIR, partial/10000-ID mappings, denied setgroups, retained panic output, single-stat timing, private TMPDIR creator parity, probe-owned cloud skips and CLI usage passed.');
+  console.log('Native integration: actual MNT_DETACH with retained fd/cwd, fallback repetition, symlinked TMPDIR, partial/10000-ID mappings, denied setgroups, retained detach/attach panic output, single-stat timing, private TMPDIR creator parity, probe-owned cloud skips and CLI usage passed.');
 } finally {
   if(previousTmp===undefined)delete process.env.TMPDIR;else process.env.TMPDIR=previousTmp;
   await rm(dir,{recursive:true,force:true});

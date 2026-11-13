@@ -762,18 +762,17 @@ pub fn run() {
                 );
                 platform::cd(&p.root).unwrap();
                 q.remount(true);
-                unit(
-                    "remount",
-                    "detach",
-                    "umount(mount)",
-                    platform::unmount(&q.root),
-                );
+                let detached = platform::unmount(&q.root);
+                unit("remount", "detach", "umount(mount)", detached.clone());
+                detached.expect("remount detach failed; refusing to stack a bind mount");
+                let attached = platform::mount(&p.root.join("tree"), &q.root, false);
                 unit(
                     "remount",
                     "attach",
                     "mount(source, mount)",
-                    platform::mount(&p.root.join("tree"), &q.root, false),
+                    attached.clone(),
                 );
+                attached.expect("remount re-attach failed");
                 q.remount(false);
                 for cwd in [false, true] {
                     if q.hold(cwd) {

@@ -16,7 +16,8 @@ export function podmanEnvironment(env,proxySocket,miniflare) {
   if(!env.MINIFLARE_CONTAINER_EGRESS_IMAGE) {
     const source=miniflare??readFileSync(join(scripts,'../node_modules/miniflare/dist/src/index.js'),'utf8');
     const image=source.match(/DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "([^"]+)"/)?.[1];
-    if(image)egress=image.split('/')[0].includes('.')?image:'docker.io/'+image;
+    if(!image)throw new Error('Miniflare egress image not found; set MINIFLARE_CONTAINER_EGRESS_IMAGE explicitly');
+    egress=image.split('/')[0].includes('.')?image:'docker.io/'+image;
   }
   env.WRANGLER_DOCKER_BIN=join(scripts,'podman-docker.sh');
   env.WRANGLER_DOCKER_HOST='unix://'+proxySocket;

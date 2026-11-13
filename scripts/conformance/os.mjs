@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { needsPodman, startPodman } from '../podman.mjs';
-import { conformanceConfig, compilerConfig, mountHandle, browserOptions, directoryProfile, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from './fixtures.mjs';
+import { conformanceConfig, compilerConfig, compilerImage, isSleep, sameSleep, withCleanup, mountHandle, browserOptions, directoryProfile, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from './fixtures.mjs';
 import { ShutdownScope } from '../process.mjs';
 import { containerLease } from './containers.mjs';
 import { imageStore } from './storage.mjs';
@@ -69,7 +69,6 @@ async function held(page,mode,root,alias,cross,creds,diagnostics) {
     await page.waitForFunction(()=>window.conformanceHeld.done||window.conformanceHeld.timedOut,null,{timeout:65000});
   }
   const final=await page.evaluate(heldState);
-  if(final.timedOut)await page.evaluate(()=>{window.conformanceHeld.cancelled=true;});
   return {rows:[{case:caseName,step:'unmount',call:'umount(mount)',skipped:'no separate busy-unmount API; unmountLocal detach is measured below'},...heldRows(final,caseName,detach,diagnostics)],detach};
 }
 
@@ -132,8 +131,7 @@ export async function os() {
       podman=await scope.acquire('Podman service',signal=>startPodman(serverEnv,{signal,socket:join(state,'podman.sock'),proxySocket:join(state,'docker.sock'),stdio:['ignore',log.fd,log.fd],detached:true}),service=>service.close());
     }
     if(process.env.OS_CONFORMANCE_COMPILER_IMAGE) {
-      const image=process.env.OS_CONFORMANCE_COMPILER_IMAGE;
-      if(!/^[a-zA-Z0-9_./:@-]+$/.test(image))throw new Error('invalid compiler image reference');
+      const image=compilerImage(process.env.OS_CONFORMANCE_COMPILER_IMAGE);
       const inputs=['package.json','package-lock.json','containers/compiler/server.mjs','web/kernel/transform.js','web/kernel/asyncify.js','web/kernel/memory.js','web/kernel/image.js','node_modules/binaryen/index.js','node_modules/binaryen/package.json'];
       const expected=Object.fromEntries(await Promise.all(inputs.map(async path=>[path,createHash('sha256').update(await readFile(path)).digest('hex')])));
       const script=`import {readFileSync} from 'node:fs';import {createHash} from 'node:crypto';console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(inputs)}.map(path=>[path,createHash('sha256').update(readFileSync('/app/'+path)).digest('hex')]))));`;
@@ -146,7 +144,7 @@ export async function os() {
       console.log('Verified prebuilt compiler source and Binaryen bytes: '+image);
     }
     await scope.acquire('containers',()=>containerLease(serverEnv,join(state,'owned-containers.sock')),lease=>lease.close());
-    server=scope.own('server',()=>start('node' ,['scripts/dev.mjs','--config',join(state,'wrangler.toml'),'--local','--ip','127.0.0.1','--port',String(number),'--inspector-port',String(inspectorPort),'--persist-to',join(state,'persist')],{stdio:['ignore',log.fd,log.fd],env:serverEnv}),stop);
+    server=scope.own('server',()=>start(process.execPath,['scripts/dev.mjs','--config',join(state,'wrangler.toml'),'--local','--ip','127.0.0.1','--port',String(number),'--inspector-port',String(inspectorPort),'--persist-to',join(state,'persist')],{stdio:['ignore',log.fd,log.fd],env:serverEnv}),stop);
     console.log(`Isolated OS at ${url}; temporary state ${state}`);
     const until=Date.now()+900000;
     while (true) {
@@ -276,7 +274,7 @@ export async function os() {
 
 async function processFacts(admin,url) {
   const {page,context}=admin;
-  const ps=async()=>(await checked(page,[{proc_poll:{pids:[]}}]))[0];
+  const ps=async(target=page)=>(await checked(target,[{proc_poll:{pids:[]}}]))[0];
   await expect.poll(async()=>(await page.evaluate(()=>window.os.machineInit()))?.reaper?.state,{timeout:30000}).toBe('running');
   const init=await page.evaluate(()=>window.os.machineInit());
   const [inspected]=await checked(page,[{machine_init:{action:{op:'inspect'}}}]);
@@ -289,7 +287,7 @@ async function processFacts(admin,url) {
     s.promise=window.os.startLoginServices(file,{tty:true,onOutput:(_fd,text)=>{s.output+=text;}})
       .then(result=>{s.status=result.status;},error=>{s.error=error.errno||'UNCLASSIFIED_ERROR';}).finally(()=>{s.done=true;});
   },units);
-  try {
+  await withCleanup(async()=>{
     try {
       await page.waitForFunction(()=>window.conformanceService.output.includes('CONFORMANCE_SERVICE_READY')||window.conformanceService.done,null,{timeout:60000});
     } catch(error) {
@@ -308,10 +306,10 @@ async function processFacts(admin,url) {
       service_host_is_login_owner:login.session.managed.host===login.session.owner,
       supervisor_path:supervisor?.path??null,supervisor_parent_is_pid1:supervisor?.ppid===1,
     }));
-  } finally {
+  },async()=>{
     await page.evaluate(async()=>{const session=(await window.os.loginSession()).session;if(session?.managed)await window.os.signalLoginServices(session);});
     await page.waitForFunction(()=>window.conformanceService.done,null,{timeout:40000});
-  }
+  });
   await expect.poll(async()=>(await ps()).some(p=>p.argv?.some(a=>a.includes('conformance-services')||a.includes('CONFORMANCE_SERVICE_READY'))||p.argv?.[0]==='sleep'),{timeout:30000}).toBe(false);
   const images=rows=>[...new Set(rows.map(p=>JSON.stringify({path:p.path,argv:p.argv})))].sort().map(s=>JSON.parse(s));
   // Wait for the fixture's completed cat to be reaped before taking the idle
@@ -332,10 +330,10 @@ async function processFacts(admin,url) {
     images_with_files:before,images_with_mounts:mounts,images_with_editor:editor,images_with_preview:preview}));
   const tab=await context.newPage();await ready(tab,url);
   await page.evaluate(()=>{window.conformanceSleep=window.os.exec([{path:'/usr/bin/sleep',argv:['sleep','60']}],{cwd:'/',stdin:''});});
-  await expect.poll(async()=>{const [rows]=await checked(page,[{proc_poll:{pids:[]}}]);return rows.some(p=>p.name==='sleep'||p.comm==='sleep'||p.argv?.includes('sleep'));},{timeout:30000}).toBe(true);
-  const [one]=await checked(page,[{proc_poll:{pids:[]}}]),[two]=await checked(tab,[{proc_poll:{pids:[]}}]);
-  const sleep=one.find(p=>p.name==='sleep'||p.comm==='sleep'||p.argv?.includes('sleep'));
-  rows.push(ok('tab-pids','visibility','start sleep in tab A; ps in tab B',{other_tab_pid_visible:two.some(p=>p.pid===sleep.pid)}));
+  await expect.poll(async()=>(await ps()).some(isSleep),{timeout:30000}).toBe(true);
+  const one=await ps(),two=await ps(tab);
+  const sleep=one.find(isSleep);
+  rows.push(ok('tab-pids','visibility','start sleep in tab A; ps in tab B',{other_tab_pid_visible:two.some(p=>sameSleep(p,sleep))}));
   await checked(page,[{kill:{pid:String(sleep.pid),signal:15}}]);await tab.close();
   return rows;
 }

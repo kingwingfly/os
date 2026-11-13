@@ -2,6 +2,23 @@ import { createInterface } from 'node:readline';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
+export function compilerImage(image) {
+  if(!/^[a-zA-Z0-9][a-zA-Z0-9_./:@-]*$/.test(image))throw new Error('invalid compiler image reference');
+  return image;
+}
+export const isSleep=p=>p.name==='sleep'||p.comm==='sleep'||p.argv?.includes('sleep');
+export const sameSleep=(candidate,fixture)=>candidate.pid===fixture.pid&&isSleep(candidate)&&candidate.path===fixture.path&&JSON.stringify(candidate.argv)===JSON.stringify(fixture.argv);
+export async function withCleanup(action,cleanup) {
+  let primary;
+  try {return await action();}catch(error){primary=error;throw error;}
+  finally {
+    try {await cleanup();}catch(error) {
+      if(!primary)throw error;
+      throw new AggregateError([primary,error],`${primary.message}; cleanup failed: ${error.message}`,{cause:primary});
+    }
+  }
+}
+
 export function browserOptions() {
   const env={...process.env};delete env.DISPLAY;
   return {channel:'chromium',headless:true,env,handleSIGINT:false,handleSIGTERM:false,

@@ -39,13 +39,13 @@ export async function sourceEvidence(path,fragments) {
   return {path,fragments:fragments.map(fragment=>({text:fragment,found:text.includes(fragment)}))};
 }
 export function revision(cwd='.',out=null) {
-  const exclusions=[':!.worktrees'];
+  const exclusions=[':(top,exclude,literal).worktrees'];
   if(out) {
     const root=run('git',['rev-parse','--show-toplevel'],{cwd}).trim();
     const output=resolve(out),path=relative(root,existsSync(output)?realpathSync(output):output);
     // Never exclude the whole source tree when --out is the repository root.
     if(path!=='..'&&!path.startsWith('../')&&!isAbsolute(path)) {
-      for(const file of ['baseline.json','latency.json','linux-latency.json','evidence.json','linux-evidence.json','matrix.md'])exclusions.push(':(exclude,literal)'+join(path,file));
+      for(const file of ['baseline.json','latency.json','linux-latency.json','evidence.json','linux-evidence.json','matrix.md'])exclusions.push(':(top,exclude,literal)'+join(path,file));
     }
   }
   return {
