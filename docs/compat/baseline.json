@@ -1604,6 +1604,12 @@
     ],
     "cloud": [
       {
+        "call": "alias",
+        "case": "alias",
+        "skipped": "not implemented: cloud tree has no second attachment API",
+        "step": "unavailable"
+      },
+      {
         "call": "write(file, 'hello')",
         "case": "open-rename",
         "ok": null,
@@ -1888,6 +1894,12 @@
         "step": "rename"
       },
       {
+        "call": "mount-parent",
+        "case": "mount-parent",
+        "skipped": "account home is a subdirectory; no cloud mount-root attachment API",
+        "step": "unavailable"
+      },
+      {
         "call": "mkdir(a)",
         "case": "link-dotdot",
         "ok": null,
@@ -2064,30 +2076,6 @@
         "step": "inheritance"
       },
       {
-        "call": "alias",
-        "case": "alias",
-        "skipped": "not implemented: cloud tree has no second attachment API",
-        "step": "unavailable"
-      },
-      {
-        "call": "mount-parent",
-        "case": "mount-parent",
-        "skipped": "account home is a subdirectory; no cloud mount-root attachment API",
-        "step": "unavailable"
-      },
-      {
-        "call": "symlink(provider/target, cloud/link)",
-        "case": "cloud-to-provider",
-        "ok": null,
-        "step": "link"
-      },
-      {
-        "call": "read(cloud/link)",
-        "case": "cloud-to-provider",
-        "errno": "ENOENT",
-        "step": "read"
-      },
-      {
         "call": "remount",
         "case": "remount",
         "skipped": "not implemented: cloud root cannot be detached through the current mount API",
@@ -2104,6 +2092,18 @@
         "case": "unmount-cwd",
         "skipped": "not implemented: cloud root cannot be detached through the current mount API",
         "step": "unavailable"
+      },
+      {
+        "call": "symlink(provider/target, cloud/link)",
+        "case": "cloud-to-provider",
+        "ok": null,
+        "step": "link"
+      },
+      {
+        "call": "read(cloud/link)",
+        "case": "cloud-to-provider",
+        "errno": "ENOENT",
+        "step": "read"
       },
       {
         "call": "mount-api",

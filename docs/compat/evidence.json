@@ -19,7 +19,7 @@
   "platform": "Linux 7.2.14-arch1-1 x86_64 GNU/Linux",
   "revision": {
     "dirty": false,
-    "head": "ec66b45b4d443420d0f9e6d164d1082d550d5095"
+    "head": "9516c1e592756d68fcc9895c3a50f4eb8f036d84"
   },
   "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "source": [
