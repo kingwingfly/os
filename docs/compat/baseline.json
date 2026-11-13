@@ -99,7 +99,8 @@
       "call": "fstat(fd) identity before/after",
       "case": "open-rename",
       "ok": {
-        "same_identity": true
+        "same_dev": true,
+        "same_ino": true
       },
       "step": "identity"
     },
@@ -152,7 +153,8 @@
       "call": "fstat(fd) identity before/after",
       "case": "open-unlink",
       "ok": {
-        "same_identity": true
+        "same_dev": true,
+        "same_ino": true
       },
       "step": "identity"
     },
@@ -692,22 +694,10 @@
       "step": "b-acl"
     },
     {
-      "call": "read /proc/1/cmdline",
+      "call": "startup",
       "case": "startup",
-      "ok": {
-        "comm": "systemd"
-      },
-      "step": "pid1"
-    },
-    {
-      "call": "inspect /proc/1 and native boot/service launcher",
-      "case": "startup",
-      "ok": {
-        "evidence": "/proc/1/cmdline; /proc/1/exe",
-        "executable": "permission denied",
-        "owner": "host PID 1"
-      },
-      "step": "ownership"
+      "skipped": "host PID 1 details are environmental evidence in linux-evidence.json, not a portable OS comparison",
+      "step": "unavailable"
     },
     {
       "call": "gui-processes",
@@ -734,7 +724,9 @@
         "call": "stat(primary); stat(alias)",
         "case": "alias",
         "ok": {
-          "same_dev": true,
+          "same_dev": {
+            "unavailable": "st_dev not exposed by both observations"
+          },
           "same_ino": false
         },
         "step": "identity"
@@ -814,7 +806,10 @@
         "call": "fstat(fd) identity before/after",
         "case": "open-rename",
         "ok": {
-          "same_identity": true
+          "same_dev": {
+            "unavailable": "st_dev not exposed by both observations"
+          },
+          "same_ino": true
         },
         "step": "identity"
       },
@@ -867,7 +862,10 @@
         "call": "fstat(fd) identity before/after",
         "case": "open-unlink",
         "ok": {
-          "same_identity": true
+          "same_dev": {
+            "unavailable": "st_dev not exposed by both observations"
+          },
+          "same_ino": true
         },
         "step": "identity"
       },
@@ -1403,7 +1401,11 @@
           "evidence": "web/kernel/client.js: boot() creates InitReaper and LoginStartup; window.os.machineInit().reaper.state",
           "owner": "browser host/session",
           "reaper": "running",
-          "role": "init-reaper"
+          "role": "init-reaper",
+          "source_launches": {
+            "init": true,
+            "services": true
+          }
         },
         "step": "ownership"
       },
@@ -1503,7 +1505,10 @@
         "call": "fstat(fd) identity before/after",
         "case": "open-rename",
         "ok": {
-          "same_identity": true
+          "same_dev": {
+            "unavailable": "st_dev not exposed by both observations"
+          },
+          "same_ino": true
         },
         "step": "identity"
       },
@@ -1556,7 +1561,10 @@
         "call": "fstat(fd) identity before/after",
         "case": "open-unlink",
         "ok": {
-          "same_identity": true
+          "same_dev": {
+            "unavailable": "st_dev not exposed by both observations"
+          },
+          "same_ino": true
         },
         "step": "identity"
       },
@@ -1680,7 +1688,9 @@
         "call": "stat(source); stat(destination)",
         "case": "hard-link",
         "ok": {
-          "same_dev": true,
+          "same_dev": {
+            "unavailable": "st_dev not exposed by both observations"
+          },
           "same_ino": true
         },
         "step": "identity"
@@ -2015,7 +2025,11 @@
           "evidence": "web/kernel/client.js: boot() creates InitReaper and LoginStartup; window.os.machineInit().reaper.state",
           "owner": "browser host/session",
           "reaper": "running",
-          "role": "init-reaper"
+          "role": "init-reaper",
+          "source_launches": {
+            "init": true,
+            "services": true
+          }
         },
         "step": "ownership"
       },
@@ -2082,7 +2096,9 @@
         "call": "stat(primary); stat(alias)",
         "case": "alias",
         "ok": {
-          "same_dev": true,
+          "same_dev": {
+            "unavailable": "st_dev not exposed by both observations"
+          },
           "same_ino": false
         },
         "step": "identity"
@@ -2162,7 +2178,10 @@
         "call": "fstat(fd) identity before/after",
         "case": "open-rename",
         "ok": {
-          "same_identity": true
+          "same_dev": {
+            "unavailable": "st_dev not exposed by both observations"
+          },
+          "same_ino": true
         },
         "step": "identity"
       },
@@ -2215,7 +2234,10 @@
         "call": "fstat(fd) identity before/after",
         "case": "open-unlink",
         "ok": {
-          "same_identity": true
+          "same_dev": {
+            "unavailable": "st_dev not exposed by both observations"
+          },
+          "same_ino": true
         },
         "step": "identity"
       },
@@ -2751,7 +2773,11 @@
           "evidence": "web/kernel/client.js: boot() creates InitReaper and LoginStartup; window.os.machineInit().reaper.state",
           "owner": "browser host/session",
           "reaper": "running",
-          "role": "init-reaper"
+          "role": "init-reaper",
+          "source_launches": {
+            "init": true,
+            "services": true
+          }
         },
         "step": "ownership"
       },
@@ -2818,7 +2844,9 @@
         "call": "stat(primary); stat(alias)",
         "case": "alias",
         "ok": {
-          "same_dev": true,
+          "same_dev": {
+            "unavailable": "st_dev not exposed by both observations"
+          },
           "same_ino": false
         },
         "step": "identity"
@@ -2898,7 +2926,10 @@
         "call": "fstat(fd) identity before/after",
         "case": "open-rename",
         "ok": {
-          "same_identity": true
+          "same_dev": {
+            "unavailable": "st_dev not exposed by both observations"
+          },
+          "same_ino": true
         },
         "step": "identity"
       },
@@ -2951,7 +2982,10 @@
         "call": "fstat(fd) identity before/after",
         "case": "open-unlink",
         "ok": {
-          "same_identity": true
+          "same_dev": {
+            "unavailable": "st_dev not exposed by both observations"
+          },
+          "same_ino": true
         },
         "step": "identity"
       },
@@ -3487,7 +3521,11 @@
           "evidence": "web/kernel/client.js: boot() creates InitReaper and LoginStartup; window.os.machineInit().reaper.state",
           "owner": "browser host/session",
           "reaper": "running",
-          "role": "init-reaper"
+          "role": "init-reaper",
+          "source_launches": {
+            "init": true,
+            "services": true
+          }
         },
         "step": "ownership"
       },
@@ -3554,7 +3592,9 @@
         "call": "stat(primary); stat(alias)",
         "case": "alias",
         "ok": {
-          "same_dev": true,
+          "same_dev": {
+            "unavailable": "st_dev not exposed by both observations"
+          },
           "same_ino": false
         },
         "step": "identity"
@@ -4204,7 +4244,11 @@
           "evidence": "web/kernel/client.js: boot() creates InitReaper and LoginStartup; window.os.machineInit().reaper.state",
           "owner": "browser host/session",
           "reaper": "running",
-          "role": "init-reaper"
+          "role": "init-reaper",
+          "source_launches": {
+            "init": true,
+            "services": true
+          }
         },
         "step": "ownership"
       },

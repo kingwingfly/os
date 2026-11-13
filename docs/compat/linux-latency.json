@@ -1,15 +1,16 @@
 {
-  "method": "First invocation and immediate repeat in a temporary host filesystem; no page-cache eviction. Command wall time; shell ends at first prompt.",
+  "build_profile": "release",
+  "method": "First invocation and immediate repeat; no page-cache eviction. Release probe, command wall time; shell ends at first prompt.",
   "operations": [
     {
       "operation": "stat-eight-deep",
       "samples": [
         {
-          "milliseconds": 0.774,
+          "milliseconds": 0.752,
           "temperature": "cold"
         },
         {
-          "milliseconds": 0.76,
+          "milliseconds": 0.756,
           "temperature": "warm"
         }
       ]
@@ -18,11 +19,11 @@
       "operation": "read-1mib",
       "samples": [
         {
-          "milliseconds": 1.212,
+          "milliseconds": 1.125,
           "temperature": "cold"
         },
         {
-          "milliseconds": 1.133,
+          "milliseconds": 1.093,
           "temperature": "warm"
         }
       ]
@@ -31,11 +32,11 @@
       "operation": "write-1mib",
       "samples": [
         {
-          "milliseconds": 1.369,
+          "milliseconds": 1.261,
           "temperature": "cold"
         },
         {
-          "milliseconds": 1.377,
+          "milliseconds": 1.266,
           "temperature": "warm"
         }
       ]
@@ -44,11 +45,11 @@
       "operation": "ls-usr-bin",
       "samples": [
         {
-          "milliseconds": 15.231,
+          "milliseconds": 14.112,
           "temperature": "cold"
         },
         {
-          "milliseconds": 14.478,
+          "milliseconds": 13.828,
           "temperature": "warm"
         }
       ]
@@ -57,11 +58,11 @@
       "operation": "shell-first-prompt",
       "samples": [
         {
-          "milliseconds": 5.504,
+          "milliseconds": 3.134,
           "temperature": "cold"
         },
         {
-          "milliseconds": 2.131,
+          "milliseconds": 1.424,
           "temperature": "warm"
         }
       ]

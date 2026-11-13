@@ -4,6 +4,8 @@ This directory records measurements for [#46](https://github.com/kingwingfly/os/
 
 The matrix contains 27 cases across five OS profiles. Filesystem rows compare normalized Linux and OS traces. Startup, GUI process visibility and browser-tab visibility are explicitly observational where this headless native fixture has no portable counterpart; their changes are checked, but they are not claimed to be compatibility differences that can automatically go stale. Every reviewed row names its follow-up issue; no permanent provider limitation is selected.
 
+The reviewed baseline has **19 matching filesystem traces, 101 filesystem differences/skips, and 15 process observations**. [Review changes](review-changes.md) lists every row changed from the original PR baseline.
+
 ## Reproduce
 
 From a fresh checkout on x86_64 Linux, install the repository's Rust targets and build tools as described in the main README, plus `unshare`, a Docker-compatible container engine, and Chromium's Playwright dependencies. Subordinate UID/GID mappings and `newuidmap`/`newgidmap` allow the Linux two-account case. The mount namespace uses `unshare -Urm`; `--map-auto` adds the mapped fixture IDs used by ACLs and the two creators.

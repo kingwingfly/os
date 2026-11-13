@@ -15,20 +15,35 @@
   },
   "node": "v26.13.0",
   "platform": "Linux 7.2.14-arch1-1 x86_64 GNU/Linux",
-  "runtime_base": "f2ed2191e8885bd29ff932852bea85a18a68e569",
+  "revision": {
+    "dirty": true,
+    "head": "66ae74b07db4176eb402c4b039b2049b87f56ebd"
+  },
   "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "source": [
     {
       "fragments": [
-        "fd_datasync: () => 0",
-        "fd_sync: () => 0"
+        {
+          "found": true,
+          "text": "fd_datasync: () => 0"
+        },
+        {
+          "found": true,
+          "text": "fd_sync: () => 0"
+        }
       ],
       "path": "web/wasi/process.js"
     },
     {
       "fragments": [
-        "exec([['supervise', run.file]]",
-        "exec([['init']]"
+        {
+          "found": true,
+          "text": "exec([['supervise', run.file]]"
+        },
+        {
+          "found": true,
+          "text": "exec([['init']]"
+        }
       ],
       "path": "web/kernel/client.js"
     }

@@ -1,6 +1,6 @@
-# L0a reviewed measurements, not architecture decisions.
-# Signatures include both normalized traces; fixes must remove stale entries.
-# Provider capability decisions remain in #47; no permanent limit is chosen here.
+# Reviewed L0a measurements; no architecture or permanent provider limits selected.
+# [[observation]] records lack a comparable Linux fixture and detect changes, not convergence.
+# Allowed owners are data in follow-up-issues.json.
 
 [[difference]]
 id = "cloud/alias"
@@ -15,10 +15,16 @@ reason = "The current API cannot detach/re-attach the cloud root; explicitly una
 signature = "7c8f354d3d77917e2bfb1a2e0d83b56a2b4fc1f4eef36e0c3a32720fb11246f5"
 
 [[difference]]
+id = "cloud/open-rename"
+issues = ["#48"]
+reason = "Retained reads/writes and inode equality succeed, but the OS does not expose descriptor device identity. The old Preview 1 dev=1 equality was fabricated by the adapter."
+signature = "9d623f9a53ef1c9e04e8881fdc9eee5bbac168178df90270a36e3d4ccbb23db2"
+
+[[difference]]
 id = "cloud/open-unlink"
 issues = ["#48"]
-reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat."
-signature = "ddf8da1f5b0af8a56dd8e91e3438073df463a2e44402a3e99798686b456fa4f3"
+reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "207bbc93587875200314a99797fd3ae2c518a062e92f8ae0cbacfea1e153d814"
 
 [[difference]]
 id = "cloud/unmount-open"
@@ -75,6 +81,12 @@ reason = "getcwd returns the removed pathname instead of ENOENT."
 signature = "80d6718291660e01a8fb4975cdb4f82d7394258015b3cfffab2a125dba33e638"
 
 [[difference]]
+id = "cloud/hard-link"
+issues = ["#48"]
+reason = "Link creation and inode equality succeed, but ABI Stat does not expose device identity. The old Preview 1 dev=1 equality was fabricated by the adapter."
+signature = "f04b63369cf3493d91357d2d330226ad1907360144683134edb34d197b03597c"
+
+[[difference]]
 id = "cloud/chroot-api"
 issues = ["#53"]
 reason = "chroot is absent from abi::Call; Linux executes the syscall in its disposable namespace."
@@ -92,19 +104,19 @@ issues = ["#51","#58"]
 reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
 signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 
-[[difference]]
+[[observation]]
 id = "cloud/startup"
 issues = ["#56","#57"]
 reason = "OS PID 1 is the running init reaper; client boot constructs InitReaper/LoginStartup and launches init/supervise. The native host PID 1 and launcher are recorded separately."
-signature = "e2fcfcfc63144dcbb6fb5342aa13575792458bf46e6c9cafb757dacdf42733ed"
+signature = "446a2e3434fe80dd12e8f93bdb2ffe83781d509dc9ee907c5064c8dbc20694c2"
 
-[[difference]]
+[[observation]]
 id = "cloud/gui-processes"
 issues = ["#63","#64"]
 reason = "Actual Files/Mounts/Editor/Preview windows open without corresponding process images in the registry. The headless Linux host has no matching applications, so this row is incomparable."
 signature = "f8af0844eb74ae2fd78c97a2bfbdbed59ab0e64d413eb240e7e5b4fd36e0e4bf"
 
-[[difference]]
+[[observation]]
 id = "cloud/tab-pids"
 issues = ["#54"]
 reason = "A second tab with the same login sees the first tab live sleep PID. The headless Linux host has no browser OS tabs, so this row is incomparable."
@@ -113,8 +125,8 @@ signature = "4098b79c8fe64247aa2dbc68a6d3ea6aa586d709602f1e35c2663e2ba736d4a6"
 [[difference]]
 id = "browser-storage/alias"
 issues = ["#48","#49"]
-reason = "Attachments report different inode identities; chmod and ACL changes are private to the first attachment."
-signature = "96909906df056f2db8cf6ddf8b118b7ff8303861b083eff7ee99e2259a4b2c6b"
+reason = "Attachments report different inode identities; chmod and ACL changes are private to the first attachment. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "fb8ce8c27425cf7522ae1898a472b0b2e168c310b4c95a4b120d70e571b8d2c4"
 
 [[difference]]
 id = "browser-storage/remount"
@@ -125,14 +137,14 @@ signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
 [[difference]]
 id = "browser-storage/open-rename"
 issues = ["#48"]
-reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write)."
-signature = "24badf16acaa805f0cad4d9ce06a85a78f6fa3da3ce130e3e42a7436f099326d"
+reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write). Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "6e53b6b66f9c61892e4c1b54f9b46f57c652cff47585368d3fd76fdf146057d6"
 
 [[difference]]
 id = "browser-storage/open-unlink"
 issues = ["#48"]
-reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat."
-signature = "c7116c07e4e26e50ff48852fb4f376bcb5036ead2983627281579e254919c404"
+reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "fb80fd8d3bd08975bbd3fe7ba5738e502130257f47b042fe224886899bc66fd2"
 
 [[difference]]
 id = "browser-storage/unmount-open"
@@ -236,19 +248,19 @@ issues = ["#51","#58"]
 reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
 signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 
-[[difference]]
+[[observation]]
 id = "browser-storage/startup"
 issues = ["#56","#57"]
 reason = "OS PID 1 is the running init reaper; client boot constructs InitReaper/LoginStartup and launches init/supervise. The native host PID 1 and launcher are recorded separately."
-signature = "e2fcfcfc63144dcbb6fb5342aa13575792458bf46e6c9cafb757dacdf42733ed"
+signature = "446a2e3434fe80dd12e8f93bdb2ffe83781d509dc9ee907c5064c8dbc20694c2"
 
-[[difference]]
+[[observation]]
 id = "browser-storage/gui-processes"
 issues = ["#63","#64"]
 reason = "Actual Files/Mounts/Editor/Preview windows open without corresponding process images in the registry. The headless Linux host has no matching applications, so this row is incomparable."
 signature = "f8af0844eb74ae2fd78c97a2bfbdbed59ab0e64d413eb240e7e5b4fd36e0e4bf"
 
-[[difference]]
+[[observation]]
 id = "browser-storage/tab-pids"
 issues = ["#54"]
 reason = "A second tab with the same login sees the first tab live sleep PID. The headless Linux host has no browser OS tabs, so this row is incomparable."
@@ -257,8 +269,8 @@ signature = "4098b79c8fe64247aa2dbc68a6d3ea6aa586d709602f1e35c2663e2ba736d4a6"
 [[difference]]
 id = "directory-handle/alias"
 issues = ["#48","#49"]
-reason = "Attachments report different inode identities; chmod and ACL changes are private to the first attachment."
-signature = "96909906df056f2db8cf6ddf8b118b7ff8303861b083eff7ee99e2259a4b2c6b"
+reason = "Attachments report different inode identities; chmod and ACL changes are private to the first attachment. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "fb8ce8c27425cf7522ae1898a472b0b2e168c310b4c95a4b120d70e571b8d2c4"
 
 [[difference]]
 id = "directory-handle/remount"
@@ -269,14 +281,14 @@ signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
 [[difference]]
 id = "directory-handle/open-rename"
 issues = ["#48"]
-reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write)."
-signature = "24badf16acaa805f0cad4d9ce06a85a78f6fa3da3ce130e3e42a7436f099326d"
+reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write). Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "6e53b6b66f9c61892e4c1b54f9b46f57c652cff47585368d3fd76fdf146057d6"
 
 [[difference]]
 id = "directory-handle/open-unlink"
 issues = ["#48"]
-reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat."
-signature = "c7116c07e4e26e50ff48852fb4f376bcb5036ead2983627281579e254919c404"
+reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "fb80fd8d3bd08975bbd3fe7ba5738e502130257f47b042fe224886899bc66fd2"
 
 [[difference]]
 id = "directory-handle/unmount-open"
@@ -380,19 +392,19 @@ issues = ["#51","#58"]
 reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
 signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 
-[[difference]]
+[[observation]]
 id = "directory-handle/startup"
 issues = ["#56","#57"]
 reason = "OS PID 1 is the running init reaper; client boot constructs InitReaper/LoginStartup and launches init/supervise. The native host PID 1 and launcher are recorded separately."
-signature = "e2fcfcfc63144dcbb6fb5342aa13575792458bf46e6c9cafb757dacdf42733ed"
+signature = "446a2e3434fe80dd12e8f93bdb2ffe83781d509dc9ee907c5064c8dbc20694c2"
 
-[[difference]]
+[[observation]]
 id = "directory-handle/gui-processes"
 issues = ["#63","#64"]
 reason = "Actual Files/Mounts/Editor/Preview windows open without corresponding process images in the registry. The headless Linux host has no matching applications, so this row is incomparable."
 signature = "f8af0844eb74ae2fd78c97a2bfbdbed59ab0e64d413eb240e7e5b4fd36e0e4bf"
 
-[[difference]]
+[[observation]]
 id = "directory-handle/tab-pids"
 issues = ["#54"]
 reason = "A second tab with the same login sees the first tab live sleep PID. The headless Linux host has no browser OS tabs, so this row is incomparable."
@@ -401,8 +413,8 @@ signature = "4098b79c8fe64247aa2dbc68a6d3ea6aa586d709602f1e35c2663e2ba736d4a6"
 [[difference]]
 id = "local-helper/alias"
 issues = ["#48","#49"]
-reason = "Attachments report different inode identities; chmod and ACL changes are private to the first attachment."
-signature = "96909906df056f2db8cf6ddf8b118b7ff8303861b083eff7ee99e2259a4b2c6b"
+reason = "Attachments report different inode identities; chmod and ACL changes are private to the first attachment. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "fb8ce8c27425cf7522ae1898a472b0b2e168c310b4c95a4b120d70e571b8d2c4"
 
 [[difference]]
 id = "local-helper/remount"
@@ -411,10 +423,16 @@ reason = "After detach/attach, mode returns to 0600 and the access ACL disappear
 signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
 
 [[difference]]
+id = "local-helper/open-rename"
+issues = ["#48"]
+reason = "Retained reads/writes and inode equality succeed, but the OS does not expose descriptor device identity. The old Preview 1 dev=1 equality was fabricated by the adapter."
+signature = "9d623f9a53ef1c9e04e8881fdc9eee5bbac168178df90270a36e3d4ccbb23db2"
+
+[[difference]]
 id = "local-helper/open-unlink"
 issues = ["#48"]
-reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat."
-signature = "ddf8da1f5b0af8a56dd8e91e3438073df463a2e44402a3e99798686b456fa4f3"
+reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "207bbc93587875200314a99797fd3ae2c518a062e92f8ae0cbacfea1e153d814"
 
 [[difference]]
 id = "local-helper/unmount-open"
@@ -512,19 +530,19 @@ issues = ["#51","#58"]
 reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
 signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 
-[[difference]]
+[[observation]]
 id = "local-helper/startup"
 issues = ["#56","#57"]
 reason = "OS PID 1 is the running init reaper; client boot constructs InitReaper/LoginStartup and launches init/supervise. The native host PID 1 and launcher are recorded separately."
-signature = "e2fcfcfc63144dcbb6fb5342aa13575792458bf46e6c9cafb757dacdf42733ed"
+signature = "446a2e3434fe80dd12e8f93bdb2ffe83781d509dc9ee907c5064c8dbc20694c2"
 
-[[difference]]
+[[observation]]
 id = "local-helper/gui-processes"
 issues = ["#63","#64"]
 reason = "Actual Files/Mounts/Editor/Preview windows open without corresponding process images in the registry. The headless Linux host has no matching applications, so this row is incomparable."
 signature = "f8af0844eb74ae2fd78c97a2bfbdbed59ab0e64d413eb240e7e5b4fd36e0e4bf"
 
-[[difference]]
+[[observation]]
 id = "local-helper/tab-pids"
 issues = ["#54"]
 reason = "A second tab with the same login sees the first tab live sleep PID. The headless Linux host has no browser OS tabs, so this row is incomparable."
@@ -533,8 +551,8 @@ signature = "4098b79c8fe64247aa2dbc68a6d3ea6aa586d709602f1e35c2663e2ba736d4a6"
 [[difference]]
 id = "relay/alias"
 issues = ["#48","#49","#59"]
-reason = "Attachments report different inode identities. chmod and setfacl through the receiver return EPERM; the other attachment keeps private mode 0600 and no ACL."
-signature = "6c5ec141035ff3561052d0f1dceec60323148dbe8db947e6f00fcd252209e34e"
+reason = "Attachments report different inode identities. chmod and setfacl through the receiver return EPERM; the other attachment keeps private mode 0600 and no ACL. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "25335efb55fb0bf5bf7f7c7c928df3ce1ef1cf32ae4e4e1c73037f56200d285a"
 
 [[difference]]
 id = "relay/remount"
@@ -546,13 +564,13 @@ signature = "2b966c0a2a9785be76791425900b02720d3c2d53e7efed01a4d817ee4d38d22d"
 id = "relay/open-rename"
 issues = ["#48"]
 reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write)."
-signature = "5304f593a4378bb22e5e40a0bee8d6a1a33abff1a66984491addd410a472ded0"
+signature = "8703d0f54c05697172c12281854ed746c22fca8b397c44012af7130181cb10a3"
 
 [[difference]]
 id = "relay/open-unlink"
 issues = ["#48"]
 reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat."
-signature = "2aaa135a77b42b738b700474f7db41241f9006ba7a35d0c92f4c1126547bb90e"
+signature = "bf0285b4ac61ea7052aa97b08f1db03c22ece34df9456427050fec84a6de86d7"
 
 [[difference]]
 id = "relay/unmount-open"
@@ -662,19 +680,19 @@ issues = ["#51","#58"]
 reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
 signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 
-[[difference]]
+[[observation]]
 id = "relay/startup"
 issues = ["#56","#57"]
 reason = "OS PID 1 is the running init reaper; client boot constructs InitReaper/LoginStartup and launches init/supervise. The native host PID 1 and launcher are recorded separately."
-signature = "e2fcfcfc63144dcbb6fb5342aa13575792458bf46e6c9cafb757dacdf42733ed"
+signature = "446a2e3434fe80dd12e8f93bdb2ffe83781d509dc9ee907c5064c8dbc20694c2"
 
-[[difference]]
+[[observation]]
 id = "relay/gui-processes"
 issues = ["#63","#64"]
 reason = "Actual Files/Mounts/Editor/Preview windows open without corresponding process images in the registry. The headless Linux host has no matching applications, so this row is incomparable."
 signature = "f8af0844eb74ae2fd78c97a2bfbdbed59ab0e64d413eb240e7e5b4fd36e0e4bf"
 
-[[difference]]
+[[observation]]
 id = "relay/tab-pids"
 issues = ["#54"]
 reason = "A second tab with the same login sees the first tab live sleep PID. The headless Linux host has no browser OS tabs, so this row is incomparable."
