@@ -89,7 +89,7 @@ test('rm requires explicit login, handles quoted paths, refreshes lists and refu
     await expect(page.locator('.filename').filter({ hasText: 'Delete this directory' })).toHaveCount(0);
     await command(page, 'rm -r .'); await expect(page.locator('.transcript pre').last()).toContainText("rm: refusing to remove '.' or '..' directory");
     await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-    const chooser = page.waitForEvent('filechooser'); await page.getByRole('button', { name: '↑ Upload files' }).click();
+    const chooser = page.waitForEvent('filechooser'); await page.getByRole('button', { name: 'Upload' }).click();
     await (await chooser).setFiles({ name: 'Delete me.txt', mimeType: 'text/plain', buffer: Buffer.from('temporary') });
     await expect(page.locator('.filename').filter({ hasText: 'Delete me.txt' })).toBeVisible();
     await command(page, 'logout'); await expect(page.locator('.lock')).toContainText('guest');

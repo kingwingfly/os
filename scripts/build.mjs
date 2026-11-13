@@ -65,11 +65,14 @@ await build({ absWorkingDir: root, entryPoints: { bridge: 'web/app.js' },
 // uutils' coreutils, built for wasm32-wasip1 (rustup target add wasm32-wasip1).
 await build({ absWorkingDir: root, entryPoints: { 'wasi-process': 'web/wasi/process.js' }, bundle: true, format: 'iife', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'executor-host': 'web/kernel/executor.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
+// Local-only images must never use the container compiler. Binaryen is embedded in this
+// separate Worker and loaded only for a local launch, not by the page or cloud loader.
+await build({ absWorkingDir: root, entryPoints: { 'local-compiler': 'web/kernel/local-compiler.js' }, external: ['node:*'], bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'console-window': 'web/console-window.js' }, external: ['./pkg/*'], bundle: true, format: 'esm', outdir: out, minify: true });
 for (const name of ['greeter', 'shell-session']) await build({ absWorkingDir: root, entryPoints: { [name]: 'web/' + name + '.js' }, external: ['./pkg/*'], bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'login-session': 'web/kernel/login.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'init-owner': 'web/kernel/init.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
-// Compiler code belongs to the server container. Remove stale browser artifacts after upgrades.
+// Remove obsolete pre-overhaul compiler artifacts; local-compiler.js is the scoped replacement.
 for (const name of ['wasi-asyncify.js', 'binaryen.js']) await rm(join(out, name), { force: true });
 // The client kernel (crates/client-kernel), a classic dedicated Worker: no-modules wasm-bindgen,
 // imported by web/kernel/client.js, with the page's protocol module bundled into the bridge.

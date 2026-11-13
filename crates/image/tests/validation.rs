@@ -73,6 +73,33 @@ fn signed(bytes: &[u8], domain: &str, key: &SigningKey) -> Vec<u8> {
 }
 
 #[test]
+fn private_composition_preserves_validation_without_a_system_base() {
+    let extension = image(
+        Kind::Sysext,
+        vec![dir("/"), dir("/opt"), file("/opt/probe")],
+    );
+    let config = image(
+        Kind::Confext,
+        vec![dir("/"), dir("/etc"), file("/etc/probe")],
+    );
+    let view = Composition::private(&[extension.clone(), config]).unwrap();
+    assert!(view.entries.contains_key("/opt/probe"));
+    assert!(view.entries.contains_key("/etc/probe"));
+    assert!(Composition::private(&[]).is_err());
+    assert!(Composition::private(&[base()]).is_err());
+    assert!(Composition::private(&[extension.clone(), extension.clone()]).is_err());
+    let mut privileged = extension.clone();
+    privileged.entries.last_mut().unwrap().mode = 0o4755;
+    assert!(Composition::private(&[privileged]).is_err());
+    let escaping = image(
+        Kind::Sysext,
+        vec![dir("/"), dir("/opt"), link("/opt/link", "../../outside")],
+    );
+    assert!(Composition::private(&[escaping]).is_err());
+    assert!(Composition::private(&vec![extension; 17]).is_err());
+}
+
+#[test]
 fn duplicate_keys_are_rejected_at_all_depths_before_typed_parsing() {
     for bytes in [
         br#"{"a":1,"a":2}"#.as_slice(),

@@ -75,7 +75,7 @@ test('keys a phone lacks are buttons, and Upload opens the chooser at once, befo
   // Phones open a chooser only while the tap is fresh: a slow server must not delay it.
   await page.route('**/api/sys', async route => { await new Promise(r => setTimeout(r, 3000)); await route.continue(); });
   const chooser = page.waitForEvent('filechooser', { timeout: 1000 });
-  await page.getByRole('button', { name: '↑ Upload files' }).tap();
+  await page.getByRole('button', { name: 'Upload' }).tap();
   await (await chooser).setFiles({ name: 'photo.png', mimeType: 'image/png', buffer: await readFile('tests/fixtures/pixel.png') });
   await page.unroute('**/api/sys');
   // What it says, it says in the Files.

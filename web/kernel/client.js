@@ -195,7 +195,7 @@ async function reapGone(seat) {
 // reaped, and it is asked once more.
 async function execs(args, seat, host) {
   const stages = (args.stages ?? []).map(stage => ({
-    path: stage.path, argv: stage.argv ?? [], env: stage.env ?? [], cwd: stage.cwd ?? '/', cgroup: stage.cgroup ?? '',
+    path: stage.path, local: stage.local, argv: stage.argv ?? [], env: stage.env ?? [], cwd: stage.cwd ?? '/', cgroup: stage.cgroup ?? '',
   }));
   const call = async () => JSON.parse(await kernel.execs(JSON.stringify(stages), !!args.sudo, seat ?? '', host));
   const results = await call();
@@ -233,6 +233,13 @@ async function dispatch(message, host, tab) {
     case 'init': return boot();
     case 'version': return kernel.version();
     case 'namespace': return kernel.namespace();
+    case 'private_extension': return JSON.parse(wasm_bindgen.private_extension(JSON.stringify(args.manifests)));
+    case 'workspace_credentials': {
+      const response = await fetch('/api/sys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ calls: ['getcreds'] }) });
+      if (!response.ok) throw { errno: 'EACCES' };
+      return (await response.json()).results?.[0]?.ok;
+    }
+    case 'vfs_policy': return JSON.parse(wasm_bindgen.vfs_policy(JSON.stringify(args.input)));
     case 'machine_init_status': return { ...machineInit.current(), reaper: machineInit.reaper.current() };
     case 'machine_init_resume': return machineInit.resume();
     case 'machine_init_leave': await machineInit.stop(); return null;
@@ -244,6 +251,7 @@ async function dispatch(message, host, tab) {
     case 'login_lifecycle': {
       if (!['end', 'restart', 'inspect'].includes(args.op)) throw { errno: 'EINVAL' };
       const value = await login.call({ op: args.op, ...(args.op === 'inspect' ? {} : { session: args.session }) });
+      if (args.op !== 'inspect') (await import(asset('/executor-host.js'))).endWorkspace(args.session);
       if (args.op !== 'inspect') await login.reset();
       return value;
     }
@@ -268,7 +276,7 @@ async function dispatch(message, host, tab) {
     case 'exec': return exec(args, tab, host);
     case 'execs': return execs(args, tab, host);
     // A process's own execve: its image replaced, its pid, credentials and descriptors kept.
-    case 'reexec': return JSON.parse(await kernel.reexec(args.pid, args.path, JSON.stringify(args.argv ?? []), JSON.stringify(args.env ?? []), args.cwd ?? '/', tab ?? '', host));
+    case 'reexec': return JSON.parse(await kernel.reexec(args.pid, JSON.stringify(args.local ?? null), args.path, JSON.stringify(args.argv ?? []), JSON.stringify(args.env ?? []), args.cwd ?? '/', tab ?? '', host));
     case 'fork': return JSON.parse(await kernel.fork(args.pid, host, args.emptyMemory === true));
     case 'session': return JSON.parse(await kernel.session(JSON.stringify(args.pids), host));
     case 'boot_init': return JSON.parse(await kernel.boot_init(JSON.stringify(args.owner), args.token, host));
@@ -321,9 +329,16 @@ async function handle(port, message) {
       void report();
       return answer;
     };
-    await boot();
+    try { await boot(); } catch (error) {
+      // An optional root-listing overlay must not prevent ordinary filesystem
+      // access before this execution host boots. No call has been dispatched.
+      if (message.type === 'mount_overlay') {
+        port.postMessage({ v: VERSION, id: message.id, ok: null }); return;
+      }
+      throw error;
+    }
     let value;
-    if (message.type === 'run' || message.type.startsWith('run_') || message.type.startsWith('console_') || message.type.startsWith('attachment_') || message.type.startsWith('seat_') || ['deliver_signal', 'reconcile'].includes(message.type)) {
+    if (message.type === 'run' || message.type.startsWith('mount_') || message.type.startsWith('run_') || message.type.startsWith('console_') || message.type.startsWith('attachment_') || message.type.startsWith('seat_') || ['deliver_signal', 'reconcile'].includes(message.type)) {
       const executor = await import(asset('/executor-host.js'));
       if (message.type === 'console_grant') await login.tick();
       executor.setSharingPolicy(() => login.current());

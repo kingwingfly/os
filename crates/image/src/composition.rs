@@ -6,6 +6,37 @@ pub struct Composition {
     pub entries: BTreeMap<String, Entry>,
 }
 impl Composition {
+    /// An unsigned development view has the same validation and collision rules as
+    /// system composition, but no system base and no publisher/activation authority.
+    pub fn private(extensions: &[Image]) -> Result<Self> {
+        require(
+            !extensions.is_empty() && extensions.len() <= 16,
+            "select 1 to 16 private extensions",
+        )?;
+        require(
+            extensions
+                .iter()
+                .all(|image| matches!(image.kind, Kind::Sysext | Kind::Confext)),
+            "private activation requires sysext or confext images",
+        )?;
+        let mut base = extensions[0].clone();
+        base.kind = Kind::Base;
+        base.entries = vec![
+            extensions
+                .iter()
+                .flat_map(|image| &image.entries)
+                .find(|entry| entry.path == "/")
+                .cloned()
+                .unwrap_or(Entry {
+                    path: "/".into(),
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o755,
+                    node: Node::Directory,
+                }),
+        ];
+        Self::new(&base, extensions)
+    }
     pub fn new(base: &Image, extensions: &[Image]) -> Result<Self> {
         require(base.kind == Kind::Base, "composition needs a base image")?;
         let mut entries: BTreeMap<String, Entry> = BTreeMap::new();

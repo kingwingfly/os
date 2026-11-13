@@ -47,7 +47,7 @@ test.beforeAll(async () => {
   server = http.createServer((req, res) => {
     const pathname = new URL(req.url, 'http://worker').pathname;
     res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-    res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
     res.setHeader('Cache-Control', 'no-store');
     if (pathname === '/') {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');

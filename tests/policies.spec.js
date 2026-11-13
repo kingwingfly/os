@@ -45,7 +45,8 @@ test('sharing preference UI revokes live control and remains saved after reload'
   await dialog.getByLabel('Use keyboard in new window').check();
   const [peer]=await Promise.all([page.waitForEvent('popup'),dialog.getByRole('button',{name:'Open window',exact:true}).click()]);
   await expect(peer.locator('.console-connection')).toHaveText('Keyboard connected');
-  await open.click();await dialog.getByLabel('Sharing allowed for this account').selectOption('none');
+  await open.click();await dialog.getByRole('combobox',{name:'Sharing allowed for this account',exact:true}).click();
+  await page.getByRole('option',{name:'Disabled',exact:true}).click();
   await dialog.getByRole('button',{name:'Save preference'}).click();
   await expect(dialog.locator('[role=alert]')).toHaveText('Preference saved.');
   await expect(peer.locator('.console-connection')).not.toHaveText('Keyboard connected');

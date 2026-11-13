@@ -264,13 +264,34 @@ pub fn markdown(source: &str, path: &str) -> String {
         .rsplit_once('/')
         .map_or("/", |(directory, _)| directory);
     let directory = if directory.is_empty() { "/" } else { directory };
-    let clean = ammonia::Builder::default()
+    let mut clean = ammonia::Builder::default()
         .add_tag_attributes("code", &["data-lang"])
         .url_schemes(HashSet::from(["http", "https", "mailto"]))
         .url_relative(UrlRelative::Custom(Box::new(Within(directory.to_string()))))
         .link_rel(Some("noopener noreferrer"))
         .clean(&html)
         .to_string();
+    // These exact URLs were produced by Within/file_url after sanitization.
+    // Keep private images inert until the viewer reads them through its VFS;
+    // a DOM src would bypass the page's filesystem transport and reach cloud.
+    for prefix in [
+        "%2Fmnt%2Flocal%2F",
+        "%2Fmnt%2Fshared%2F",
+        "%2Fopt%2Fprivate%2F",
+    ] {
+        clean = clean.replace(
+            &format!("src=\"/api/file?path={prefix}"),
+            &format!("data-local-src=\"/api/file?path={prefix}"),
+        );
+    }
+    // require-corp preserves process isolation in Safari too. Remote images use
+    // anonymous CORS instead of sending cross-site cookies or weakening isolation.
+    for prefix in ["https://", "http://", "//"] {
+        clean = clean.replace(
+            &format!("src=\"{prefix}"),
+            &format!("crossorigin=\"anonymous\" referrerpolicy=\"no-referrer\" src=\"{prefix}"),
+        );
+    }
     let mut parts = clean.split(MATH_MARK);
     let mut html = parts.next().unwrap_or_default().to_string();
     while let Some(index) = parts.next() {
@@ -826,6 +847,32 @@ mod test {
             Some("/home/ana/Ünïcode notes (1).md")
         );
         assert_eq!(file_path("https://example.com/"), None);
+    }
+
+    #[test]
+    fn private_markdown_images_never_start_a_cloud_request() {
+        for root in ["/mnt/local/dev", "/mnt/shared/dev", "/opt/private/dev"] {
+            let html = markdown(
+                "![local](pixel.png)\n\n[notes](other.md)",
+                &format!("{root}/notes.md"),
+            );
+            assert!(html.contains("<img data-local-src=\"/api/file?path="));
+            assert!(!html.contains("<img src="));
+            assert!(html.contains("href=\"/api/file?path="));
+        }
+        assert!(markdown("![cloud](pixel.png)", "/home/notes.md").contains("<img src="));
+    }
+
+    #[test]
+    fn remote_markdown_images_use_anonymous_cors_without_referrers() {
+        for source in [
+            "![external](https://example.com/pixel.png)",
+            r#"<img alt="external" src="https://example.com/pixel.png">"#,
+        ] {
+            let html = markdown(source, "/home/notes.md");
+            assert!(html.contains(r#"crossorigin="anonymous""#));
+            assert!(html.contains(r#"referrerpolicy="no-referrer""#));
+        }
     }
 
     #[test]

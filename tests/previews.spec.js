@@ -127,8 +127,8 @@ test('a link opens another file with a way back; slides, PDFs and text open wher
   const status=page.locator('.slides-bar [role=status]'),theme=page.getByRole('combobox',{name:'Slide theme'});
   await run(page,'open '+base+'/deck.slides.md');await expect(page.locator('.slides-current .slide:visible')).toContainText('One');
   // Slides look like a presentation, light by default, in a theme chosen for every deck.
-  await expect(page.locator('.slides')).toHaveAttribute('data-theme','light');await expect(theme).toHaveValue('light');
-  await theme.selectOption('sepia');await expect(page.locator('.slides')).toHaveAttribute('data-theme','sepia');
+  await expect(page.locator('.slides')).toHaveAttribute('data-theme','light');await expect(theme).toContainText('Light');
+  await theme.click();await page.getByRole('option',{name:'Sepia',exact:true}).click();await expect(page.locator('.slides')).toHaveAttribute('data-theme','sepia');
   // A link opens its file in the viewer, and Back returns, to the slide it was on.
   await expect(page.locator('#viewer-back')).toBeHidden();
   await page.locator('.slides a',{hasText:'notes'}).click();
@@ -138,7 +138,7 @@ test('a link opens another file with a way back; slides, PDFs and text open wher
   // Opened again, the deck continues at its slide, in its theme.
   await page.keyboard.press('ArrowRight');await page.keyboard.press('ArrowRight');await expect(status).toHaveText('3 / 3');
   await close(page);
-  await run(page,'open '+base+'/deck.slides.md');await expect(status).toHaveText('3 / 3');await expect(theme).toHaveValue('sepia');
+  await run(page,'open '+base+'/deck.slides.md');await expect(status).toHaveText('3 / 3');await expect(theme).toContainText('Sepia');
   await close(page);
   // Text opens scrolled where it was left.
   await run(page,'open '+base+'/long.txt');await expect(page.locator('.text-preview')).toBeVisible();

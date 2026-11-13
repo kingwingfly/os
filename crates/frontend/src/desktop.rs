@@ -20,11 +20,12 @@ use std::collections::BTreeMap;
 use wasm_bindgen::{JsCast, closure::Closure};
 
 /// The desktop's apps: their id, title, and the element that is their window.
-pub const APPS: [(&str, &str, &str); 4] = [
+pub const APPS: [(&str, &str, &str); 5] = [
     ("files", "Files", "window-files"),
     ("terminal", "Terminal", "window-terminal"),
     ("viewer", "Preview", "viewer"),
     ("editor", "Editor", "editor"),
+    ("mounts", "Mounts", "window-mounts"),
 ];
 /// The desktop is a phone's up to this width, as the CSS's: one window at a time.
 const COMPACT: f64 = 650.0;
@@ -394,6 +395,12 @@ fn default_frame(id: &str, area: Area) -> Frame {
             area.h - 2.0 * GAP,
         ),
         "viewer" => (area.w * 0.08, area.h * 0.04, area.w * 0.84, area.h * 0.92),
+        "mounts" => (
+            area.w * 0.12,
+            area.h * 0.06,
+            (area.w * 0.76).min(960.0),
+            area.h * 0.86,
+        ),
         _ => (area.w * 0.14, area.h * 0.05, area.w * 0.72, area.h * 0.9),
     };
     Frame {

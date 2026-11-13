@@ -135,16 +135,19 @@ async fn show(
     version: String,
 ) -> Result<JsValue, String> {
     let url = file_url(&path);
+    let local = ["/mnt/local/", "/mnt/shared/", "/opt/private/"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix));
     // A player asks for many ranges: it plays from a read descriptor's token, which the Worker
     // serves without asking the kernel each time; closing the preview closes it.
-    let held = if matches!(listed.as_str(), "video" | "audio") {
+    let held = if !local && matches!(listed.as_str(), "video" | "audio") {
         playing(&path).await
     } else {
         None
     };
     let size = if held.is_some() { 0 } else { head(&url).await? };
     let preview = match listed.as_str() {
-        "image" | "video" | "audio" => Preview::Media(
+        "image" | "video" | "audio" if !local => Preview::Media(
             listed,
             held.as_ref().map_or(url, |(_, token)| {
                 format!("/api/file?token={}", js_sys::encode_uri_component(token))
@@ -156,6 +159,7 @@ async fn show(
                 .any(|extension| path.to_lowercase().ends_with(extension));
             let limit = match listed.as_str() {
                 "pdf" => PDF_MAX,
+                "image" | "video" | "audio" if local => ARCHIVE_MAX,
                 _ if archive => ARCHIVE_MAX,
                 _ => TEXT_MAX,
             };
@@ -414,6 +418,38 @@ fn select(element: &Element, selector: &str) -> Vec<Element> {
 /// `pre > code[data-lang]`, and draw its Mermaid ones, as images. Blocks that fail stay as they
 /// are, saying why in `data-error`.
 fn enhance(element: &Element) {
+    for image in select(element, "img[data-local-src]") {
+        let owner = Owner::current();
+        spawn_local(async move {
+            let result = async {
+                let url = image
+                    .get_attribute("data-local-src")
+                    .ok_or("missing image path")?;
+                let path = file_path(&url).ok_or("invalid image path")?;
+                if head(&url).await? > ARCHIVE_MAX {
+                    return Err("local image exceeds preview limit".to_string());
+                }
+                let data = get(&url).await?;
+                if data.len() > ARCHIVE_MAX {
+                    return Err("local image exceeds preview limit".to_string());
+                }
+                let mime = preview::image_mime(&path, &data).ok_or("unsupported local image")?;
+                if !image.is_connected() {
+                    return Ok(());
+                }
+                let src = owner
+                    .as_ref()
+                    .and_then(|owner| owner.with(|| image_url(&data, mime)))
+                    .ok_or("image preview was closed")?;
+                image.set_attribute("src", &src).map_err(js_error)?;
+                Ok::<_, String>(())
+            }
+            .await;
+            if let Err(error) = result {
+                let _ = image.set_attribute("data-error", &error);
+            }
+        });
+    }
     for link in select(element, "a[href^='http']") {
         let _ = link.set_attribute("target", "_blank");
     }

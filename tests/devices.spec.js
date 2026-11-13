@@ -28,7 +28,7 @@ async function run(page, text) {
 const progress = page => page.getByRole('status', { name: 'Upload progress' });
 async function upload(page, name, buffer) {
   const chooser = page.waitForEvent('filechooser');
-  await page.getByRole('button', { name: '↑ Upload files' }).click();
+  await page.getByRole('button', { name: 'Upload' }).click();
   await (await chooser).setFiles({ name, mimeType: 'application/octet-stream', buffer });
 }
 

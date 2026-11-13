@@ -9,18 +9,21 @@ import { ConsoleGrants, ConsolePeer, consoleInput } from './attachment.js';
 import { stats } from './loader.js';
 import { validateExpectedSession, checkExpectedSession } from './launch-context.js';
 import { sharingAllowed } from './sharing-policy.js';
+import { currentWorkspace, mountRequest, endWorkspace } from './workspaces.js';
+export { endWorkspace };
 
 const runs = new Map();
 const consoles = new Consoles();
 const seat = new SeatDevices();
 let sharingStatus = () => null;
 const grants = new ConsoleGrants({ allowed: access => sharingAllowed(sharingStatus(), access) }), peers = new Map();
-export function setSharingPolicy(source) { sharingStatus = source; grants.sweep(); }
+export function setSharingPolicy(source) { sharingStatus = source; grants.sweep(); if (source()?.session?.shutdown) endWorkspace(source().session.id); }
 setInterval(() => {
-  void reconcile(); grants.sweep(); for (const peer of peers.values()) peer.sweep();
+  void reconcile(); setSharingPolicy(sharingStatus); for (const peer of peers.values()) peer.sweep();
 }, 5000);
 
 export async function request(type, args, send, seatChanged = () => {}) {
+  if (type.startsWith('mount_')) return mountRequest(type, args);
   const reportSeat = () => seatChanged(seat.current());
   if (type === 'seat_status') return seat.current();
   if (type === 'seat_set_active') {
@@ -137,6 +140,7 @@ export async function request(type, args, send, seatChanged = () => {}) {
   runs.set(args.run, run); run.seatChanged(); reportSeat();
   try {
     return await exec(args.stages, { ...args.options, terminalState,
+      workspace: managed ? null : await currentWorkspace(),
       beforeStart: async (pid, image) => {
         if (expectedSession) checkExpectedSession(expectedSession, image);
         if (managed) await globalThis.kernelRequest('login_service_attach', { pid, expected: managed });

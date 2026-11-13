@@ -30,7 +30,7 @@ test('Files reuses watched metadata until something in its directory changes', a
     await run('cd ' + base);
     await browse(page, base);
     const names = page.locator('.files .filename');
-    const upload = page.getByRole('button', { name: '↑ Upload files' });
+    const upload = page.getByRole('button', { name: 'Upload' });
     await expect(names).toHaveText(['one.txt']);
     await expect(upload).toBeEnabled();
     // Files uses its page metadata cache. External ls has its own process credentials and

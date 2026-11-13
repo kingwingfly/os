@@ -436,8 +436,13 @@ impl Machine {
                         argv,
                         env,
                         cgroup,
+                        local,
+                        runtime,
                         ..
                     } => {
+                        if local.is_some() && runtime.as_deref() != Some("resources-v1") {
+                            return Err(Errno::EINVAL.into());
+                        }
                         let scope = if pid.is_none() {
                             match context
                                 .as_ref()
@@ -493,6 +498,7 @@ impl Machine {
                 let (
                     Call::Execve {
                         path,
+                        local,
                         cwd,
                         seat,
                         cgroup,
@@ -507,6 +513,7 @@ impl Machine {
                     "pid": begun.pid,
                     "token": auth::token_hash(token),
                     "path": path,
+                    "local": local,
                     "cwd": cwd,
                     "seat": seat.as_ref().or(begun.seat.as_ref()),
                     "cgroup": begun.cgroup.as_ref().or(cgroup.as_ref()),
@@ -637,6 +644,7 @@ impl Machine {
                 boot: Some(begun.boot),
                 login_scope: begun.scope,
                 token,
+                local: serde_json::from_value(image["local"].clone()).unwrap_or(None),
                 fd: image["fd"].as_u64().map(|fd| fd as u32),
                 asset: image["asset"].as_str().map(str::to_string),
                 path: Some(path),

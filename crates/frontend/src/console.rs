@@ -143,7 +143,7 @@ pub fn ConsoleWindow(#[prop(default = false)] local: bool) -> impl IntoView {
                 <Show when=move || local>
                     <a href="/" target="_blank" rel="noopener">"Desktop"</a>
                     <a href="/login.html?target=shell" target="_blank" rel="noopener">"Sign in"</a>
-                    <button type="button" on:click=move |_| restart() hidden=move || !restartable.get() disabled=move || live.get()>"Start shell"</button>
+                    <button type="button" on:click=move |_| restart() hidden=move || !restartable.get() || live.get()>"Start shell"</button>
                     <button type="button" on:click=move |_| send("resume", "") hidden=move || !stopped.get()>"Resume"</button>
                 </Show>
                 <button type="button" on:click=move |_| detach() disabled=move || !live.get()>{if local { "End shell" } else { "Disconnect" }}</button>

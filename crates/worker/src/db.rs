@@ -263,6 +263,15 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
         )?;
     }
     // Descriptors made before read tokens have none.
+    if sql
+        .exec("SELECT cloud_access FROM credentials LIMIT 0", None)
+        .is_err()
+    {
+        sql.exec(
+            "ALTER TABLE credentials ADD COLUMN cloud_access INTEGER NOT NULL DEFAULT 1",
+            None,
+        )?;
+    }
     if sql.exec("SELECT token FROM fds LIMIT 0", None).is_err() {
         sql.exec("ALTER TABLE fds ADD COLUMN token TEXT", None)?;
         sql.exec("CREATE INDEX IF NOT EXISTS fds_token ON fds(token)", None)?;

@@ -71,7 +71,7 @@ export async function edit(path,{api,fileUrl,unlock,changed}) {
    let opened;
    try{opened=await call('open',state.existing?{path,flags:O_WRONLY|O_TRUNC,size:bytes.length,version:state.etag}:{path,flags:O_WRONLY|O_CREAT|O_EXCL,mode:0o666,size:bytes.length});}
    catch(error){throw new Error({ESTALE:'File changed in another session; reopen it or download your draft to avoid overwriting changes',EEXIST:'File was created by another session; reopen it',ENOENT:'File was deleted or moved; save it as a new file'}[error.errno]||error.message);}
-   try{if(bytes.length)await pwrite(opened.fd,0,bytes);}
+   try{const chunk=opened.chunk_size||8*1024*1024;for(let offset=0;offset<bytes.length;offset+=chunk)await pwrite(opened.fd,offset/chunk,bytes.subarray(offset,offset+chunk));}
    catch(error){await sys([{close:{fd:opened.fd}}]);if(opened.created)await sys([{unlink:{path}}]);throw error;}
    const result=await call('close',{fd:opened.fd});state.etag=result.version;state.existing=true;
    // Edits may continue while the save request is in flight.

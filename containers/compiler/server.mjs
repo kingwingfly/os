@@ -1,30 +1,13 @@
 // Compilation only: uploaded modules are parsed and transformed, never instantiated.
 import http from 'node:http';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+import { IMAGE_MAX as LIMIT, transformImage } from '../../web/kernel/transform.js';
 
-const LIMIT = 128 * 1024 * 1024;
 if (!isMainThread) {
   try {
     const binaryen = (await import('binaryen')).default;
-    const { asyncify } = await import('../../web/kernel/asyncify.js');
     const { bytes: input, profile } = workerData;
-    const original = await WebAssembly.compile(input);
-    const imports = WebAssembly.Module.imports(original);
-    for (const entry of imports) {
-      if (entry.kind === 'function' && ['wasi_snapshot_preview1', 'os', 'terminal', 'wasix_32v1'].includes(entry.module)) continue;
-      if (entry.kind === 'memory' && entry.module === 'env' && entry.name === 'memory') continue;
-      throw new Error(`unsupported import ${entry.module}.${entry.name}`);
-    }
-    const unwinds = imports.filter(entry => entry.module === 'wasix_32v1' && ['proc_fork', 'stack_checkpoint', 'stack_restore'].includes(entry.name)).map(entry => `${entry.module}.${entry.name}`);
-    const built = WebAssembly.Module.exports(original).some(entry => entry.name === 'asyncify_start_unwind');
-    let bytes;
-    if (profile === 'resources-v1') {
-      const { instrumentMemory } = await import('../../web/kernel/memory.js');
-      bytes = instrumentMemory(binaryen, input, !unwinds.length);
-      if (unwinds.length) bytes = asyncify(binaryen, bytes, unwinds, !built);
-    } else bytes = asyncify(binaryen, input, unwinds, !built);
-    if (bytes.byteLength > LIMIT) throw new Error('transformed image exceeds 128 MiB');
-    await WebAssembly.compile(bytes);
+    const bytes = await transformImage(binaryen, input, profile);
     parentPort.postMessage({ bytes }, [bytes.buffer]);
   } catch (error) { parentPort.postMessage({ error: String(error?.message ?? error) }); }
 } else {

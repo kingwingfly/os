@@ -69,7 +69,7 @@ test('terminal, password modal, upload, sanitized Markdown, slides and media', a
   await complete(input, 'cd ' + folder.slice(0, -1), 'cd ' + folder + '/'); await input.press('Enter'); await expect(promptPath(page)).toHaveText('/' + folder);
   // The Files upload into their own directory.
   await browse(page, '/' + folder);
-  const chooserPromise = page.waitForEvent('filechooser'); await page.getByRole('button', { name: '↑ Upload files' }).click();
+  const chooserPromise = page.waitForEvent('filechooser'); await page.getByRole('button', { name: 'Upload' }).click();
   await (await chooserPromise).setFiles({ name: 'Safe preview.md', mimeType: 'text/markdown', buffer: Buffer.from('# Rendered safely\n\n<img src="missing" onerror="window.xss=true">\n<script>window.xss=true</script>\n[bad](javascript:alert(1))') });
   await expect(page.locator('.filename').filter({ hasText: 'Safe preview.md' })).toBeVisible();
   await run(page, 'open "Safe preview.md"'); await expect(page.locator('.markdown h1')).toHaveText('Rendered safely');
