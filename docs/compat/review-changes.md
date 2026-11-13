@@ -1,22 +1,30 @@
 # PR #66 review measurement changes
 
-Compared with reviewed commit `7ddf26a`. **No normalized compatibility or process row changed its result, signature or classification.** The matrix still contains **120 filesystem rows (15 same and 105 differences/skips), plus three process observations**. No difference-registry entries or signatures were added, removed or changed. No OS runtime semantics or architecture decisions were changed.
+Compared with reviewed commit `c71443c`. **No result rows changed: 0 of 120 filesystem rows and 0 of three process observations. The entire raw `baseline.json` is byte-identical to that commit.** Outcomes, normalized signatures and classifications are unchanged: **15 same, 105 differences/skips and three process observations**. The regenerated matrix and existing difference registry are unchanged. No OS runtime semantics or architecture decisions were changed.
 
 | Changed result rows | Count |
 | --- | --- |
 | Filesystem rows | 0 of 120 |
 | Process observations | 0 of 3 |
 
-The raw cloud trace now emits the alias, mount-parent, remount and held-unmount skips from the Rust `basic-cloud` mode, at the probe's capability boundaries. Previously the runner executed and discarded alias/mount-parent observations, then appended replacement skips. The unsupported operations are no longer attempted, and the skip rows occur earlier in the raw JSON array. Every row retains the same outcome and normalized comparison signature. Native and all four other filesystem raw traces are unchanged.
+Full recordings were required this round because the Linux remount guard and the OS tab-process identity check change measurement logic. The Linux probe now records and stops on failed detach before attempting another bind mount; failed re-attachment also stops before dependent observations. Fault injection covers remount detach, remount attach and held attach, preserving error rows and panic diagnostics. Successful remount observations are unchanged. Tab visibility now compares PID, executable path and argv together, with one shared sleep predicate and process-list helper; the measured visibility result remains unchanged.
 
-The native two-account fixture now enters its mounted tree before dropping privileges and uses relative paths. Private TMPDIR ancestors no longer cause unrelated EACCES results. The regression gate requires successful create/stat/setgid inheritance for both creators under a private ancestor and identical observations under an ordinary temporary directory. The previously committed full reference used a searchable path, so its two-account outcomes do not change.
+## Cleanup and small review fixes
 
-## Runner corrections and evidence
+Process cleanup checks the owned process group's existence independently of its leader. A reaped leader does not cancel escalation or finish cleanup while descendants remain; the first ESRCH ends signalling for that group. Regressions cover a resistant TCP listener whose leader exits both before and during cleanup and require group disappearance and a closed port. Development forwards SIGINT/SIGTERM to Wrangler and closes Podman only after Wrangler exits. Both signal tests delay Wrangler cleanup, make an engine request through the still-live proxy, then assert Podman shuts down last.
 
-Playwright SIGINT/SIGTERM handling is disabled in the shared launch options so the runner's cleanup scope can finish. Real SIGINT and SIGTERM tests during OS measurement verified exit 130/143, the retained-state notice, closed server ports, stopped owned processes/Podman sockets and removed labeled containers. Reaped child PIDs are never used for later process-group signals.
+Service readiness diagnostics are preserved together with a subsequent cleanup error. Missing Miniflare image declarations produce a real lookup failure before environment mutation, while explicit image configuration bypasses discovery. Provenance exclusions are root-anchored even for subdirectory queries. Compiler-image references cannot begin with options. The isolated server bootstrap uses the runner's `process.execPath`. Redundant held-probe cancellation assignment is removed without claiming to resolve the broader deadline/lifetime finding below.
 
-Development uses a connect-only liveness check before borrowing a shared Podman socket. A stale socket gets a replacement on a private session path; the shared name is never unlinked. Potentially failing image discovery precedes environment mutation. The image cache defaults to a per-user directory and requires current-UID ownership, mode 0700 and a real directory rather than a symlink before images are loaded. The documented dedicated validation cache meets these checks. Container-list errors preserve their status/body, non-array responses are rejected, and only DELETE tolerates 404.
+Linux and all five OS cold/warm latency records and provenance were regenerated. Both committed evidence files identify clean source `23cc5f89f38ab74426c4f3fafa296bccc25e9452` with `dirty:false`. Timings are noisy evidence, not claimed runtime speedups. The full recordings rebuilt web assets, the WASI probe, release helper and Worker and verified the existing compiler image against the checkout.
 
-The browser gate and runner now share the exact CDP selection, permission request, profile setup and DISPLAY-free launch path. The account fixture checks distinct primary gids and overlaps independent creator account boots. Server/inspector ports are reserved together. Deployment reuses the command-availability helper, and xtask help lists the recorded and report modes.
+## Deferred items
 
-All Linux and OS cold/warm latency samples and provenance are regenerated separately from deterministic comparison outcomes. These noisy timings are not claimed as runtime speedups. The full recordings rebuild web assets, the WASI probe, release helper and Worker, and verify the real cached compiler image against the checkout. Commands, prerequisites and measurement limits are in [README](README.md); the PR records every check completed and the checks not run for this revision.
+Ten of the fifteen comments on `c71443c` are fixed. The other five are all tracked in [#67](https://github.com/kingwingfly/os/issues/67), linked to #46, with original review links, reasons and acceptance tests:
+
+- Docker/podman-docker endpoint discovery across CLI versions.
+- Held-probe phase deadlines and awaiting cancelled-process termination.
+- Transient Podman runroot lifecycle with persistent image-store compatibility.
+- Development shared-service publication/reuse policy and concurrent ownership.
+- Using the real ABI package/workspace manifest in the mutation gate.
+
+The current full measurements do not claim coverage of those deferred failure/portability scenarios. Commands and prerequisites are in [README](README.md); the PR records this revision's exact checks, results and exclusions.
