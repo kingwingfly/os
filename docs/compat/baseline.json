@@ -675,7 +675,7 @@
       "call": "inspect supplementary groups excluding primary",
       "case": "two-accounts",
       "ok": {
-        "empty": true
+        "empty": false
       },
       "step": "a-groups"
     },
@@ -736,7 +736,7 @@
       "call": "inspect supplementary groups excluding primary",
       "case": "two-accounts",
       "ok": {
-        "empty": true
+        "empty": false
       },
       "step": "b-groups"
     },
@@ -1435,7 +1435,7 @@
         "call": "stat(shared directory)",
         "case": "two-accounts",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "mode": "2777"
         },
         "step": "a-directory"
@@ -1458,7 +1458,7 @@
         "call": "stat(created)",
         "case": "two-accounts",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "group_is_parent": true,
           "mode": "0640",
           "nlink": 1,
@@ -1486,7 +1486,10 @@
       {
         "call": "compare creator, directory and file groups",
         "case": "two-accounts",
-        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
         "step": "a-inheritance"
       },
       {
@@ -2052,7 +2055,7 @@
         "call": "stat(shared directory)",
         "case": "two-accounts",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "mode": "2777"
         },
         "step": "a-directory"
@@ -2075,7 +2078,7 @@
         "call": "stat(created)",
         "case": "two-accounts",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "group_is_parent": true,
           "mode": "0640",
           "nlink": 1,
@@ -2103,7 +2106,10 @@
       {
         "call": "compare creator, directory and file groups",
         "case": "two-accounts",
-        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
         "step": "a-inheritance"
       },
       {
@@ -2817,7 +2823,7 @@
         "call": "stat(shared directory)",
         "case": "two-accounts",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "mode": "2777"
         },
         "step": "a-directory"
@@ -2840,7 +2846,7 @@
         "call": "stat(created)",
         "case": "two-accounts",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "group_is_parent": true,
           "mode": "0640",
           "nlink": 1,
@@ -2868,7 +2874,10 @@
       {
         "call": "compare creator, directory and file groups",
         "case": "two-accounts",
-        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
         "step": "a-inheritance"
       },
       {
@@ -3582,7 +3591,7 @@
         "call": "stat(shared directory)",
         "case": "two-accounts",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "mode": "2777"
         },
         "step": "a-directory"
@@ -3605,7 +3614,7 @@
         "call": "stat(created)",
         "case": "two-accounts",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "group_is_parent": true,
           "mode": "0640",
           "nlink": 1,
@@ -3633,7 +3642,10 @@
       {
         "call": "compare creator, directory and file groups",
         "case": "two-accounts",
-        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
         "step": "a-inheritance"
       },
       {
@@ -4320,7 +4332,7 @@
         "call": "stat(shared directory)",
         "case": "two-accounts",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "mode": "2777"
         },
         "step": "a-directory"
@@ -4343,7 +4355,7 @@
         "call": "stat(created)",
         "case": "two-accounts",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "group_is_parent": true,
           "mode": "0640",
           "nlink": 1,
@@ -4371,7 +4383,10 @@
       {
         "call": "compare creator, directory and file groups",
         "case": "two-accounts",
-        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
         "step": "a-inheritance"
       },
       {
