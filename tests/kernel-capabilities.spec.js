@@ -16,7 +16,7 @@ test.beforeAll(async () => {
   server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://probe');
     res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-    res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
     res.setHeader('Cache-Control', 'no-store');
     if (url.pathname === '/probe.js') {
       res.setHeader('Content-Type', 'text/javascript');

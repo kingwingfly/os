@@ -135,7 +135,7 @@ test('the browser resumes an interrupted upload from the chunks already sent, an
   });
   // The Files' button uploads into their directory, once the upload before has ended.
   const prompt = () => expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-  const button = page.getByRole('button', { name: '↑ Upload files' });
+  const button = page.getByRole('button', { name: 'Upload' });
   const choose = async () => { await expect(button).toBeEnabled(); const chooser = page.waitForEvent('filechooser'); await button.click(); await (await chooser).setFiles({ name: 'data.log', mimeType: 'application/octet-stream', buffer: bytes }); };
   await choose();
   // Progress and results show in the Files, not over the page, nor in the terminal.

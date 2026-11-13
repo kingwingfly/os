@@ -452,7 +452,7 @@ The revision-checked policy is shared across this account's container devices an
 
 ### Phase 6.0 contract baseline
 
-This is the agreed design baseline. The implemented Phase 6 profile is described above: signed boot/base/sysext/confext generations, the browser service unit subset, resource accounting and existing container-provider policy. Private local activation, native agents and the general task scheduler remain Phase 8/9 work. The broader contract below does not imply that every host adapter or requested credential/grant type is implemented.
+This is the agreed design baseline. The implemented Phase 6 profile is described above: signed boot/base/sysext/confext generations, the browser service unit subset, resource accounting and existing container-provider policy. Phase 8 adds private activation and filesystem adapters; native execution agents and the general task scheduler remain Phase 9 work. The broader contract below does not imply that every host adapter or requested credential/grant type is implemented.
 
 **Artifacts and release identity.** An image manifest contains `format = os.image`, `version = 1`, `kind` (boot, base, sysext, confext or workload), a human-readable name/version, required ABI/features, compatibility levels, and a sorted file-entry list. A file entry binds its absolute virtual path, type, uid/gid, mode, supported ACL/xattr metadata, and either content SHA-256 plus byte length or a symlink target. Paths must be normalized, unique and free of NUL, empty interior components, `.` and `..`; preserve Unicode names. Reject duplicate JSON keys, unknown required features, unsupported versions and unsupported metadata rather than dropping them. Initial limits are 4 MiB per manifest and 16,384 entries, with bounded strings and checked integer sizes. Image paths are validated again through physical name resolution at activation; lexical validation alone is insufficient.
 
@@ -527,7 +527,7 @@ uutils' run as processes of their own in the page's WASI engine (`web/wasi/`). T
 
 `os.posix_spawn` and `os.waitpid`, exposed by `crates/posix::process`, provide generic child creation/wait for WASI preview 1 programs. They reuse authorized fork/exec and child reaping, inherit cwd/environment/umask/credentials and descriptors, close close-on-exec descriptors, and keep children in the job's signal group. No command name is interpreted by this adapter, and no ABI `Call` variant was added. `fd -x` executes sequentially with inherited stdin; `-X` passes all results once. `xargs` reads a bounded stream and starts batches before EOF, supplies empty child stdin by default, and uses `-o` for terminal input. It preserves failure classes (123 ordinary child failure, 124 exit 255, 125 signal, 126 execution denial, 127 missing program). Child creation requires shared memory; without cross-origin isolation it fails with ENOSYS instead of switching to a browser command path.
 
-A pipeline's processes run at once, each one's output the next one's input through a pipe: 64 KiB of memory the page and its processes share (`web/wasi/pipe.js`), where a reader waits while it is empty and a writer while it is full. A write to a pipe whose reader has gone ends its process, as SIGPIPE does (status 141), so `yes | head -n 3` ends at once: the coreutils `head` process closes its input once it has its lines. What the last writes, standard error and terminal input echo share the program's screen as they arrive. The first reads the terminal unless given its input; typing appears at its cursor and stays out of shell history. In canonical mode, Ctrl+D ends a read (after what is typed, if anything is), and Ctrl+C sends SIGINT to the foreground pipeline. Sharing memory needs a page isolated from other sites (`web/_headers`: `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: credentialless`, which lets other sites' images load without cookies); where a browser does not isolate it (Safari has no `credentialless`), the processes run one after another, each given what the one before wrote, and nothing reads the terminal. A pipeline joining the terminal's own programs passes text between stages as before. Remaining browser programs run in the page itself; Files and upload progress retain their structured views. External commands, including ls, write terminal text.
+A pipeline's processes run at once, each one's output the next one's input through a pipe: 64 KiB of memory the page and its processes share (`web/wasi/pipe.js`), where a reader waits while it is empty and a writer while it is full. A write to a pipe whose reader has gone ends its process, as SIGPIPE does (status 141), so `yes | head -n 3` ends at once: the coreutils `head` process closes its input once it has its lines. What the last writes, standard error and terminal input echo share the program's screen as they arrive. The first reads the terminal unless given its input; typing appears at its cursor and stays out of shell history. In canonical mode, Ctrl+D ends a read (after what is typed, if anything is), and Ctrl+C sends SIGINT to the foreground pipeline. Sharing memory requires an isolated page (`web/_headers`: `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`). Signed entry redirects carry the same policy. This supports Safari's isolation model as well as Chromium and Firefox; the former `credentialless` policy left Safari without shared memory. Missing isolation or shared-memory support now refuses process execution before admission instead of silently running a sequential, noninteractive fallback. External embedded images must permit anonymous CORS (or appropriate CORP); Markdown images request anonymous CORS without a referrer, and remote images without permission cannot load. A pipeline joining the terminal's own programs passes text between stages as before. Remaining browser programs run in the page itself; Files and upload progress retain their structured views. External commands, including ls, write terminal text.
 
 **Job control.** The pipeline's processes are a process group, and the terminal keeps jobs as a shell does.
 - **Background:** a line ending in `&` runs as a job in the background and says `[N] PID`. What it writes still shows, its end says how it ended (`Done`, `Exit N`, `Terminated`…), and it reads nothing of the terminal. Only programs of `/usr/bin`, or uploaded ones, run so.
@@ -687,7 +687,7 @@ The automatic host sends TERM then CONT to its supervisor when it confirms a dif
 
 Profiles are bounded to 32 per Machine namespace. Startup receipts are retained until their login record expires, rather than evicted as idle, preserving the admission decision within the existing 32-record login limit. An ended run may initially lack an exit status if its host disappeared; a surviving host retries its completion report. Browser execution still depends on its original host. This provides automatic login service admission and confirmed-login shutdown; the later entry-point and lifecycle controls below add explicit scope termination and Machine restart. Cross-host service recovery and durable server execution remain separate work. That startup slice added no syscall; the Machine adds a profile table and optional startup state to existing login records.
 
-**Greeter, desktop and installed-shell entry points.** Browser sessions now have explicit entry points. The default desktop remains available without a mandatory sign-in screen. Its **Start session** link opens the greeter in a new window, preserving the current window's commands.
+**Greeter, desktop and installed-shell entry points.** Browser sessions have explicit entry points. Opening the default desktop starts its session without a mandatory sign-in screen. The account button handles sign-in; `/login.html` is the separate greeter entry point.
 
 | Entry point | Application | Execution |
 | --- | --- | --- |
@@ -701,17 +701,14 @@ The standalone shell runs with ordinary authenticated process credentials, start
 
 **End shell** requests HUP+CONT once and waits for a ready shell to finish cleanup before closing the console. A five-second deadline forces cancellation, closes the PTY and sends KILL to an unresponsive hosted process. Natural exit disables input and displays the exit status. **Start shell** explicitly starts again using the current account, a cleared screen and fresh PTY modes; failed startup never loops automatically. The old console is released after completion, so no-echo/raw settings cannot leak into a replacement. Loading candidates are cancelled when their image load settles. Sign-in/Desktop links open separate windows, and ordinary cookie changes leave a running shell's credential snapshot intact. Page departure ends its shell; neither this page nor its services survive the original browser host.
 
-These are browser-hosted user-space application entry points, with Rust/WASM UI and small JavaScript adapters for browser APIs. The greeter and desktop do not receive invented process IDs or root authority and are not WASI units managed by `supervise`. The shell is a real registered process with a POSIX session and PTY. The existing `/console.html` attachment endpoint remains capability-only and does not launch a shell. The managed shell-window adapter is described below; Phase 7 still defines the portable GUI protocol and broader application adapters. Automatic account units run under the preceding per-login admission rules and are not repeated just because another desktop/shell window opens.
+These are browser-hosted user-space application entry points, with Rust/WASM UI and small JavaScript adapters for browser APIs. The greeter and desktop do not receive invented process IDs or root authority and are not WASI units managed by `supervise`. The shell is a real registered process with a POSIX session and PTY. The existing `/console.html` attachment endpoint remains capability-only and does not launch a shell. The desktop owns its application windows; Phase 7 still defines the portable GUI protocol and broader application adapters. Automatic account units run under the preceding per-login admission rules and are not repeated just because another desktop/shell window opens.
 
-**Managed application windows.** The desktop's **App windows** button opens a host application manager. **Open shell** creates a managed shell window; its row reports Starting, Ready, Stopping, Stopped, Exited or Failed and offers Show window and Stop. This first fixed catalog entry uses the existing Rust/WASM console and ordinary `/usr/bin/sh -i`. Browser application records have their own identifiers, not invented process IDs. The shell and its descendants retain real registered process identities. The existing dock's Applications menu still selects embedded desktop components.
-
-A launch opens its window directly from the user's action, waits up to ten seconds for the host's initial login/boot status within a 30-second overall startup deadline, and transfers a private MessagePort only to that exact window/document nonce. The URL's `managed=1` flag supplies no authority and cannot start a shell on its own. Ready means the console is mounted and the installed shell has actually requested input; a loading image keeps input disabled. Unknown catalog entries, blocked pop-ups, stale documents and startup failure are visible failures. No automatic pop-ups or crash-restart loops occur. Open another window explicitly to retry. Natural shell exit preserves its read-only output window and has no in-place Start shell action; an explicit stop closes it after cleanup.
-
-Stop and the managed window's End shell action send HUP+CONT once and wait for shell cleanup before closing the PTY. A five-second deadline closes the PTY and sends KILL if cleanup stalls. Host cancellation no longer injects SIGINT during a ready shell's cleanup handler. The manager bounds window shutdown to eight seconds. Parent and child exchange private heartbeats every five seconds; a missing peer for 75 seconds ends the managed application when its event loop next runs. Desktop departure, confirmed login replacement, explicit login shutdown and Machine restart also stop managed applications. A child navigating elsewhere releases its old record without the manager closing the new document. Network-disconnected login/init status alone does not authorize stopping an existing record. Browser suspension and synchronous work can delay these cooperative checks; there is no native/durable lifetime, cross-host migration, cgroup containment or hard browser preemption guarantee. Ordinary standalone shell windows and independently launched commands preserve their existing credential and lifetime rules.
-
-The host captures the public login/boot expectation for each attempt. Authenticated Exec replies now include optional `login_scope` and `boot` metadata, and the generic browser exec option `expectedSession: {session, boot}` checks the actual process snapshot after image loading and before guest execution. Missing or mismatched metadata fails closed, so a delayed application cannot execute in a replacement login or boot. These public values restrict admission and confer no authority; credentials and process proofs retain their existing boundaries. No syscall, endpoint or schema change was added. GUI policy remains in ordinary host-side user space; the executable `supervise` still manages WASI units.
-
-`window.os.applications()` exposes bounded local summaries `{id, target, state, reason}`. `launchApplication('shell')` requires a browser action permitting a new window; `stopApplication(id)` affects only that desktop's own record. At most eight active windows and sixteen recent records are retained. There is no cross-tab discovery, persistent journal, arbitrary URL/file launch or declarative GUI unit configuration yet. Additional adapters and a portable surface/input protocol remain Phase 7 work. Resource enforcement and persistent sharing/provider preferences are described below.
+**One desktop window manager.** Applications in the dock opens Terminal, Files, Mounts
+and the manual in the current desktop. There is no second popup-window supervisor or
+extra Start session step after entering the desktop. The standalone `/shell.html` entry
+still starts one interactive shell automatically. Its prompt expands the current `USER`
+and `PWD` before each input; Start shell appears only after the shell exits. Old
+`?managed=1` popup links refuse execution and link to the desktop.
 
 **Explicit session shutdown and Machine restart.** Ordinary `logout` still changes the browser account without rewriting or killing independent process snapshots. For explicit lifecycle control, the greeter's **Session controls** offers **End session** and, for root, **Restart Machine**. End session stops the selected login's workloads across this Machine's tabs, while leaving other logins' independent commands alone. It does not sign out the account cookie. After shutdown completes, choosing Desktop or Shell explicitly creates a fresh login scope. Refreshing an execution host alone cannot revive an ended scope.
 
@@ -732,7 +729,7 @@ Each new top-level process gets a durable login scope from authenticated authori
 
 Shutdown asks top-level workloads to stop (HUP for terminal processes, TERM otherwise), followed by CONT. This lets an ordinary supervisor retain its own child shutdown ordering. A durable 35-second deadline sends KILL to every remaining scoped process, including escaped or orphaned descendants, through the normal process and credential-revocation machinery. The Machine alarm enforces the deadline if the initiating browser closes. The filesystem authority's existing revocation retries still apply during transport failure. Old unscoped processes from before this additive upgrade cannot be safely assigned to an inferred login; Machine restart includes them, while login shutdown covers recorded scopes.
 
-Machine restart first refuses new top-level execution and drains every ordinary process in its namespace. Completion replaces the boot ID and invalidates old init/reaper proofs, removes old process/login records and PID reservations, and permits fresh init and account units. PIDs keep increasing so stale handles cannot alias replacement processes. Files, account cookies, account service profiles and ordinary persistent cgroup configuration are preserved; process-owned cgroups retire with their owners. Existing unmanaged browser windows remain open and their kernels reconcile the replacement boot; a standalone shell page requires explicit Start shell after its old process exits. Managed application windows close through their adapter lifecycle. This restarts the browser Machine's execution generation, not Cloudflare infrastructure or unrelated container jobs. No live execution migrates to another host. Hierarchical PID/memory/I/O enforcement and bounded local journals are implemented. Additional GUI adapters, centralized journals and CPU scheduling remain separate work.
+Machine restart first refuses new top-level execution and drains every ordinary process in its namespace. Completion replaces the boot ID and invalidates old init/reaper proofs, removes old process/login records and PID reservations, and permits fresh init and account units. PIDs keep increasing so stale handles cannot alias replacement processes. Files, account cookies, account service profiles and ordinary persistent cgroup configuration are preserved; process-owned cgroups retire with their owners. Existing unmanaged browser windows remain open and their kernels reconcile the replacement boot; a standalone shell page requires explicit Start shell after its old process exits. Desktop processes retain their normal host lifecycle; there is no separate browser-popup application manager. This restarts the browser Machine's execution generation, not Cloudflare infrastructure or unrelated container jobs. No live execution migrates to another host. Hierarchical PID/memory/I/O enforcement and bounded local journals are implemented. Additional GUI adapters, centralized journals and CPU scheduling remain separate work.
 
 **Browser console seat activation.** Each dedicated execution host now owns one local seat for its console and received-console input devices, with at most 128 live device records. The owning kernel port authorizes local control; remote control still requires the existing transferred MessagePort grant. Public seat/device IDs and init/login election metadata grant no device authority. This seat slice added no syscall, endpoint or account privilege; the later containment slice adds `prctl`.
 
@@ -821,9 +818,210 @@ runs with the credentials snapshotted at exec; its `/api/sys` batches carry `pid
 the body, its byte requests `X-Process-Token`, and it cannot sign the browser in or out. `.wasm`
 files serve as `application/wasm`, and so does an exec image whatever its name.
 
+**Private workspaces (Phase 8).** Files → Mounts opens the desktop mount manager with two
+sources: **Host folder** and **Browser storage**. Host folder prefers the browser's directory
+picker and retains its handle. If the API is absent or unsupported, the same source offers
+the optional `os-local-helper` helper connection. Browser storage mounts the site's existing
+origin-private filesystem (`os-workspace`) directly. Neither workflow imports or mirrors
+the directory; reads and writes reach its source on demand. Names live under
+`/mnt/local/NAME` in one execution host/login workspace. Other hosts and accounts have no
+ambient access. Execution, writes and cloud file/service delegation are separate choices.
+Privileged init and managed services do not inherit private views; shared `/usr` and PATH
+are unchanged. Ordinary cookie logout preserves existing process snapshots; explicit login
+shutdown and unmount invalidate the workspace or grant.
+
+The Mounts app uses normal desktop move, resize, minimize and close controls. Its
+**Mounted** pane lists filesystems and opens their details/actions; **Add mount** separates
+host folders from browser storage; **Connect** mounts someone else's export;
+**Publish** manages your exports and their addresses. Publishing and mounting have separate
+forms and tabs. Closing the app does not unmount files.
+Mount source access uses `rwx` ceilings; OS metadata starts owner-only. Ordinary `chmod`,
+`getfacl` and `setfacl` manage owner/group/other and named account ACLs through the same Rust
+VFS permission code as the system tree. These are OS metadata, not host `chmod` operations.
+Metadata belongs to this mounted workspace and resets to private defaults on remount;
+source files remain in place. Cloud delegation remains a separate explicit capability.
+Browser storage unavailable in private sessions reports alternatives instead of a low-level
+storage error. Files keeps Refresh, Upload and Mounts in a compact icon group with tooltips,
+leaving room for its editable path. Refresh (or F5 while Files has focus) bypasses cached
+metadata and reloads the current directory without losing its scroll position. This also
+works for sources without change notifications. The terminal input follows the last row
+of a wrapped prompt.
+
+**Storage source, filesystem and mount are distinct.** Browser storage is an existing
+directory filesystem, not an emulated blank disk. Every Browser storage mount in the same
+browser profile and site opens the same `os-workspace` directory. Different mount names
+are aliases for the same bytes; unmounting one does not delete files or unmount the others.
+Unmounting all aliases and mounting again retains the files. It does not allocate another
+volume, format anything, or guarantee persistence after browser storage eviction/clearing.
+The browser profile controls the source; signing into another OS account does not create
+another physical browser filesystem. Current OS permission metadata is still per mount,
+so aliases do not yet share durable inode/ACL metadata as Linux bind mounts do.
+
+Host folders (browser API or helper) and `osfs:` exports likewise provide existing
+directory trees. They mount directly into the VFS and do not need fictional `/dev` block
+nodes or `mkfs`. The next storage-model step is stable filesystem identities, shared and
+durable permission metadata, and separate records for sources, filesystems, mounts and
+exports. Explicit mount and publication consent remains required.
+
+A future virtual-disk provider would be a different source: an OPFS-backed image with
+bounded capacity, block reads/writes/flush, a device identity, and a filesystem driver.
+Only that provider could support genuine filesystem formatting. Formatting must target
+an explicitly selected unmounted volume and require destructive-action confirmation;
+mounting an existing filesystem must never format it. Raw images cannot be independently
+mounted writable by several kernels without a single filesystem owner or a suitable
+shared filesystem protocol. This is design scope, not implemented block-device support.
+
+With direct browser support, select **Host folder**, choose `u` access and press **Choose
+folder…**. The picker asks for read or read/write access accordingly. Cancellation or
+permission denial never switches to a helper. The selection is bound to the login that
+opened the picker; changing accounts invalidates a pending selection. Browser permissions
+are rechecked during access, and unmount revokes the OS grant. Remount after reloading the
+tab; mounting does not persist a host handle or create a backup.
+
+Safari and Firefox currently lack the directory-picker API used for direct host mounts.
+For the simplest setup, open OS in **Chrome or Edge on macOS, Windows or Linux**. The
+Mounts app identifies this browser limitation before offering the helper alternative;
+browser storage remains a separate capability. See the
+[directory picker compatibility data](https://developer.mozilla.org/en-US/docs/Web/API/Window/showDirectoryPicker#browser_compatibility).
+
+Desktop dropdowns use the same styled, keyboard-accessible menu in Mounts, sharing
+dialogs and slide themes. Arrow keys navigate, Enter selects, Escape cancels and typing
+finds an option. Terminal completion suggestions sit immediately below the active
+command line inside its scrolling transcript, including after resizing the window.
+
+To stay in a browser without direct access, run **`os-local-helper`** on your own Linux
+machine (Linux 5.6+ with `openat2`):
+
+```sh
+cargo run --release -p os-local-helper -- \
+  --root /absolute/path/to/project \
+  --origin https://your-os.example \
+  --write --execute
+```
+
+Use the printed URL and token in **Mounts → Add mount → Host folder**.
+For local development, use the exact `http://127.0.0.1:8787` origin instead. The helper binds
+only to loopback, accepts one configured browser origin plus private proofs, and serves
+filesystem operations; it does not execute workloads. Omit `--write` or `--execute` to
+withhold those capabilities. The browser may require permission to access loopback.
+Tokens are private; the adapter ends when its process stops, and idle mount leases expire
+after 60 seconds without the host heartbeat. No deployment or cloud upload is involved.
+
+The Linux adapter uses `openat2` with `BENEATH`, `NO_MAGICLINKS` and `NO_SYMLINKS`, keeps real
+open descriptors across file replacement, supports atomic exclusive creation and append,
+and commits writes before acknowledging them. Symlink traversal, native ELF/PE/Mach-O
+execution, devices, ownership changes and unsupported filesystem operations fail explicitly.
+The current helper is Linux-only. macOS/Windows users can use a browser with the directory
+picker, or browser storage; Safari/Firefox host mounts on those platforms require a future
+native helper backend. There is no separate HTTP-directory source: HTTP is this helper's
+transport.
+A browser `FileSystemHandle` is a path locator, not an inode capability, and native symlink
+behavior is not portable. Browser mounts follow the browser's permission and filesystem
+semantics; they do not claim the Linux helper's `openat2` guarantees. Handles are checked
+against the selected root after access. See the
+[File System Standard](https://fs.spec.whatwg.org/) and the open
+[symlink semantics specification issue](https://github.com/WICG/file-system-access/issues/113).
+Browser-backed descriptors retain File views; external replacement can produce
+`ESTALE`/`EIO`; opening a path again reads its current contents. Browser providers cannot
+promise POSIX unlink/rename/inode semantics or atomic
+exclusive creation. These limits do not silently become cloud operations. Files previews, embedded Markdown
+images, downloads and editor saves use the same private VFS; downloads retain an open
+descriptor across chunks and release it on completion or cancellation.
+
+**Helper design.** The browser VFS converts a virtual descriptor into bounded filesystem
+requests over authenticated loopback HTTP. The helper owns the real host descriptors;
+the browser receives opaque, mount-scoped IDs, never raw host FD numbers. Reads transfer
+only requested ranges; writes commit to the original file. The configured root and
+read/write/execute capabilities bound every request, with exact-origin checks, a random
+bootstrap token, per-mount proofs, heartbeat leases and explicit close/unmount. No cloud
+proxy or native code execution is involved. A future macOS/Windows port should keep this
+wire protocol and implement platform-specific containment, handle lifetime and mutation
+semantics, with conformance tests before claiming equivalent guarantees.
+
+Cloud and remote storage are design-only for now. Future providers should enter through
+the same VFS contract and advertise capabilities such as range reads, atomic rename and
+exclusive creation; unsupported operations must fail explicitly. OpenDAL is a candidate
+for object/remote storage adapters, not a replacement for the helper's native descriptor
+backend or a raw block-device driver. No remote storage connector is implemented here.
+
+Supported WASM/WASI/WASIX programs run through the ordinary runtime and VFS: streams,
+pipes, fork/exec, file descriptors and explicit errors. Bytes are pinned at each launch;
+a later rebuild affects the next launch. A disposable on-device Binaryen Worker shares the
+cloud compiler's fork/memory instrumentation, with a 60-second transform deadline and
+128 MiB source/package limit. Its compiler asset is downloaded once as needed; local code
+never falls back to a cloud compiler. Cache hits still recheck the private grant. The
+server admits a process from digest/size metadata, applies resource policy, and attenuates
+cloud credentials across fork/exec. A hash is neither file access nor operator trust.
+Without explicit delegation, cloud filesystem/device calls are denied by the server.
+
+**Private extensions.** Build the same manifest-and-blob package used for system extensions:
+
+```sh
+cargo xtask image --root ./extension-tree --kind sysext \
+  --name dev-tools --revision local --out ./dev-tools-package
+```
+
+Place files under `extension-tree/usr/...` (or use `confext` with `etc/...`). Mount the
+package directory, select its row in **Mounts → Mounted**, set the extension name and choose **Activate package**. The verified,
+read-only snapshot appears under `/opt/private/NAME`; for example run
+`/opt/private/NAME/usr/bin/probe`. The shared Rust image/composition validator checks ABI,
+paths, collisions, symlinks, set-ID bits and content digests. No operator signature is
+needed and package uid/gid metadata cannot change process credentials. Source edits require
+reactivation; deactivation uses Unmount. Multiple packages can be composed through
+`window.os.activatePrivate({name, sources: [...], cloud: false})`. No code synchronizes to
+another device unless the owner explicitly shares/transfers it.
+
+**Shared mounts.** Publishing defines a filesystem service; mounting is a separate receiver
+action. There is no device enrollment, recipient grant or incoming-share inbox. Every OS
+account, including each distinct guest ID, can publish and mount. For example:
+
+1. A mounts a host folder or browser storage at `/mnt/local/project`.
+2. B runs `id -u` to obtain its OS UID. A runs
+   `setfacl -R -m u:B_UID:rx /mnt/local/project` to allow B to traverse/read existing files.
+   `setfacl -m d:u:B_UID:rx /mnt/local/project` sets the rule for newly created entries.
+   A can instead use group/other mode bits or ACLs. Directory traversal and file access
+   are both checked; access to the root alone does not open every child file.
+3. A opens **Mounts → Publish**, chooses the filesystem and optional
+   subdirectory, and publishes it for 5/15/60 minutes. A gives B the `osfs:…` address.
+4. B enters that address under **Mounts → Connect**, chooses a mount name and
+   requested write/execute access, then presses **Mount**. It appears at `/mnt/shared/NAME`.
+   Publishing alone creates no mount or permission on B's client.
+
+An optional export password authenticates its holder with the publisher's filesystem access
+**only inside that export**. It does not transfer an OS login, process credentials or access
+to another path/export. Source read-only/no-execute limits still apply, and the receiver
+must explicitly opt into write and executable transfer. Passwords are not addresses or URL
+parameters; the relay stores a salted PBKDF2 verifier and bounds password attempts.
+Without a password, normal OS identity and ACLs determine access. The publisher controls
+permission changes; files created through a share use its ownership and directory default
+ACL, so set a default ACL when peers need continuing access to new files.
+
+The relay verifies the current account from its session cookie, including supplementary
+groups, and passes that identity to the owner's filesystem server. Claimed client identity
+headers and process-token requests cannot authorize a connection. The owner applies the
+shared Rust VFS checks on each request, including retained descriptors and executable
+images. ACL changes affect existing mounts. Publishing does not copy the directory or
+make a durable replica. The owner must stay online; stop publishing, unmount, lease expiry
+and owner disconnect end access. Reload requires mounting and publishing again. Legacy
+enrollment/grant endpoints fail closed.
+
+An account Durable Object stores export metadata; a per-export `MountRelay` authenticates
+and isolates up to 16 independent client connections. Each has bounded frames, outstanding
+requests, handles and executable snapshots. Direct WebRTC is attempted where supported;
+only direct ICE candidates are used, with no implicit third-party STUN/TURN. Other networks
+use the relay. The control connection remains required after P2P negotiation for revocation.
+Exported symlink traversal is rejected; host-helper opens also enforce `openat2` boundaries.
+Sharing through the helper requires its current inode-identity response; older helpers must
+be updated before publication, so replacing a path cannot retain access to the old inode.
+Writes acknowledge owner-side commit; a lost acknowledgment reports an uncertain outcome
+and never retries an append silently. Shared mounts grant no cloud access by default.
+ACL refusal reports permission denied, including when the owner rejects before the receiver
+opens its transport. A read or initial mount failure does not warn about possible writes;
+only a file-changing request whose acknowledgment was lost reports an uncertain result.
+
 Phase 0 measured the limits: SharedWorkers are not cross-origin isolated in Chromium or
-Firefox, so they cannot use `SharedArrayBuffer`; File System Access and WebGPU are
-Chromium-only. The Rust WASIX runtime runs and forks a prebuilt `dash` in Node and in a
+Firefox, so they cannot use `SharedArrayBuffer`; the host-directory-picker and WebGPU
+probes passed only in Chromium at that gate. The Rust WASIX runtime runs and forks a prebuilt `dash` in Node and in a
 cross-origin-isolated module Worker; asyncify-at-load transforms an uninstrumented WAT module
 with binaryen in both. Details are in `AGENT.md` and issue #20.
 
@@ -854,7 +1052,25 @@ the implemented cgroup controls and executable init are described above.
 
 ## Roadmap
 
-The agreed roadmap is tracked in [issue #20](https://github.com/kingwingfly/os/issues/20). Phases 0–5 and the O1–O5 overhaul in [#40](https://github.com/kingwingfly/os/issues/40) are delivered; [PR #41](https://github.com/kingwingfly/os/pull/41) merged as `439d7a9`, and [PR #42](https://github.com/kingwingfly/os/pull/42) merged the first Phase 6 foundation as `7a74ba6`. **Phase 6.0–6.3 are implemented and validated** on `feat/phase-6-sessions`: init/services/sessions, resource and lifetime policies, and signed immutable boot/base/extension generations. Merge and production deployment remain separate steps. The next delivery is **8.1: local mounts and execution without upload**. Unchecked milestones describe planned capabilities.
+The agreed roadmap is tracked in [issue #20](https://github.com/kingwingfly/os/issues/20). Phases 0–5 and the O1–O5 overhaul in [#40](https://github.com/kingwingfly/os/issues/40) are delivered; [PR #41](https://github.com/kingwingfly/os/pull/41) merged as `439d7a9`, and [PR #42](https://github.com/kingwingfly/os/pull/42) merged the first Phase 6 foundation as `7a74ba6`. **Phase 6.0–6.3 are complete**, merged by [PR #43](https://github.com/kingwingfly/os/pull/43) as `de44b51`: init/services/sessions, resource and lifetime policies, and signed immutable boot/base/extension generations. **Phase 8.1–8.3 are implemented** on `feat/phase-8-local-mounts`: local execution/VFS, private extensions, and authorized shared mounts passed their bounded acceptance gates. The next workstream is **Linux semantics L0–L6 in [#44](https://github.com/kingwingfly/os/issues/44)**, before Phase 9 distributed compute. Production deployment remains separate. Existing completion records do not claim a unified Linux mount model or independent GUI application processes; unchecked milestones have not passed their full acceptance gates.
+
+### Linux filesystem, init and desktop semantics — agreed 2026-11-13
+
+[#44](https://github.com/kingwingfly/os/issues/44) records the detailed implementation plan and acceptance gates. Today the server bootstraps root/image/special trees while a client workspace attaches private providers. PID 1 is an executable orphan reaper; host/session orchestration still owns other startup policy. Built-in GUI windows share the browser frontend and DOM renderer. These are the concrete boundaries this workstream will replace incrementally.
+
+| Stage | Change | Acceptance gate |
+| --- | --- | --- |
+| L0 | Specify supported Linux filesystem/process semantics, provider limits, mount/boot contracts and GUI roles; add a Linux reference harness. | A reproducible compatibility matrix identifies current differences and required errno/behavior. |
+| L1 | Stable filesystem/inode identity, persistent shared ownership/modes/ACLs/xattrs, correct creator/umask and open-description behavior, real sync/datasync. | Aliases/remounts preserve identity and metadata; rename/unlink retain open files; durability and failure tests pass without claiming unavailable provider guarantees. |
+| L2 | One mount model for root, images, special and provider trees; process namespaces/root/cwd, inheritance, bind mounts, mount options and mount inspection. | CLI and Files see the same authorized namespace; normal busy unmount, lazy detach and revocation have distinct tested behavior. |
+| L3 | Verified minimal bootstrap followed by userspace init/service ordering, mount units, login/seat startup, recovery and reverse-order shutdown. | Headless boot, dependency failure, logout, host loss and restart are deterministic; compatible updates preserve identities and writable data. |
+| L4 | Ordinary mount tools and Mounts use the same service; distinguish source/device, filesystem, attachment and export. | GUI/CLI operations agree; sharing uses account ACL rules or an optional scoped password and explicit receiver mounting, with clear errors and reconnect consent. |
+| L5 | Permission-checked GUI IPC and per-process surfaces; userspace compositor, authorized desktop-shell roles and browser/native presentation adapters. | Independent apps cannot steal surfaces/input; resize, crash, device loss, IME and accessibility behavior are verified. |
+| L6 | Port Files, Terminal, Mounts, Editor and Preview into ordinary OS processes using reusable controllers and services. | Normal process supervision manages each app; browser/native behavioral scenarios pass and obsolete page-only control paths are removed. |
+
+All stages are planned, not implemented by the Phase 8 publication. Deliver them in separate dependent PRs and preserve existing data and signed release recovery. The kernel/boot adapter must establish a minimal root before init can execute; userspace then assembles the intended namespace through the same mount interfaces used later. The desktop shell has explicit special roles, while ordinary GUI apps own independent processes and surfaces. Browser pickers, clipboard and display/input remain host adapters, not authorization in DOM handlers.
+
+Host directories, browser storage and remote exports remain filesystem trees with no implicit copy or reformat. Virtual block devices and `mkfs`, cloud/OpenDAL storage adapters and broader compute retain separate later gates; their eventual implementations must reuse these contracts. Provider limitations must return explicit errors rather than false POSIX success. Phase 7's GUI work is delivered through L5–L6; completed Phase 6/8 milestones retain their original bounded scope.
 
 ### Agreed architecture — 2026-11-09
 
@@ -873,20 +1089,22 @@ The browser is the default UI and an optional interactive execution host. Add an
 
 Production data must survive upgrades. Separate deployment operators, future tenant administrators and ordinary users. Server authorization remains effective against modified clients; a client-reported digest is not attestation. Browser verification does not establish a hardware secure-boot chain. Credentials stay with the authorized service; configuration images contain references rather than exposed cloud secrets.
 
-Preserve the existing phase numbers as workstreams. Delivery priority is **6.0–6.3 → 8.1–8.3 → 9.1 → 9.2**, then broader GPU/storage sharing. Phase 7 GUI work may proceed after the Phase 6 foundation; it is not a prerequisite for local mounts or CPU/cloud tasks. Phase 10 documentation and validation continue throughout. Each milestone ships separately with its acceptance gate.
+Preserve the existing phase numbers as workstreams. After the delivered Phase 6 and implemented Phase 8 foundation, delivery priority is **L0–L4 filesystem/init convergence → L5–L6 (Phase 7 GUI) → 9.1 → 9.2**, then broader GPU/storage sharing. This 2026-11-13 ordering supersedes the earlier compute-first priority. Phase 10 documentation and validation continue throughout. Each milestone ships separately with its acceptance gate.
 
 ### Phase 6 — Boot, services and immutable composition
 
-- [x] **6.0: Specify the contracts before implementation.** The [Phase 6.0 contract baseline](#phase-60-contract-baseline) defines image/release identity, compatibility, composition, trust, activation authority, the service subset and host/task boundaries. Native adapters, private local execution and general scheduling retain their Phase 8/9 gates.
-- [x] **6.1: Deliver shell, devices, init and sessions.** Delivered locally: installed dash and byte devices; authenticated identity/signals, sessions/groups and job control; controlling terminals and host-wide allocated PTYs; managed consoles and authorized attachments; durable login/init ownership and seats; executable PID 1 and account service supervision; greeter/desktop/shell entry points and managed shell windows; login shutdown and root Machine restart; private readiness pipes, startup deadlines, bounded retries/journals, descendant containment and subreaping. Hierarchical PID, accounted WASM linear-memory and admitted filesystem I/O limits are enforced, including fork/exec/migration cleanup. Persistent account/Machine sharing preferences and account container-provider admission/detach/deadline policy separate browser lifetime from durable work. Units run under caller credentials with explicit descriptors and capability-checked limits. CPU quotas/weight changes, freezing, realtime/thread/alternate-stack signals and instruction-level handler preemption remain unsupported; broader GUI and credential-delegation adapters retain their later gates. **Gate passed:** fresh boot through logout/restart, service startup/failure/retry/cleanup, multi-tab ownership, PTY/signals, denial and resource exhaustion, policy persistence and detached provider survival.
+- [x] **6.0: Specify the contracts before implementation.** The [Phase 6.0 contract baseline](#phase-60-contract-baseline) defines image/release identity, compatibility, composition, trust, activation authority, the service subset and host/task boundaries. Private execution and filesystem adapters are delivered through Phase 8; native execution and general scheduling retain their Phase 9 gates.
+- [x] **6.1: Deliver shell, devices, init and sessions.** Delivered locally: installed dash and byte devices; authenticated identity/signals, sessions/groups and job control; controlling terminals and host-wide allocated PTYs; managed consoles and authorized attachments; durable login/init ownership and seats; executable PID 1 and account service supervision; greeter/desktop/shell entry points and desktop application windows; login shutdown and root Machine restart; private readiness pipes, startup deadlines, bounded retries/journals, descendant containment and subreaping. Hierarchical PID, accounted WASM linear-memory and admitted filesystem I/O limits are enforced, including fork/exec/migration cleanup. Persistent account/Machine sharing preferences and account container-provider admission/detach/deadline policy separate browser lifetime from durable work. Units run under caller credentials with explicit descriptors and capability-checked limits. CPU quotas/weight changes, freezing, realtime/thread/alternate-stack signals and instruction-level handler preemption remain unsupported; broader GUI and credential-delegation adapters retain their later gates. **Gate passed:** fresh boot through logout/restart, service startup/failure/retry/cleanup, multi-tab ownership, PTY/signals, denial and resource exhaustion, policy persistence and detached provider survival.
 - [x] **6.2: Build and activate immutable releases.** Rust `xtask build/image/boot/verify/sign` records build inputs/outputs and assembles hashed, explicitly signed boot/base artifacts. Early `/boot/entries` and pinned release views support verified bootstrap, protocol/schema negotiation, init and authenticated recovery. Root-only `/dev/system` operations stage and fully check content, select the default with revision checks, refresh signatures and roll back to an approved compatible generation. Credentials, descriptors and client assets pin complete generations; retained old/new clients coexist. Wrangler deploys prepared artifacts; Cargo features are build choices. **Gate passed:** identical final-build assembly produces identical release IDs; generated output parity, tamper/trust/compatibility rejection, interrupted staging, key rotation/revocation/recovery, three server restarts and copied pre-image schema-7 state activation/rollback preserve identities, files and preferences. Assembly determinism is not universal compiler reproducibility. There is no global live-client swap or database downgrade; retained metadata is bounded to 32 generations and asset retention is operator-managed.
-- [x] **6.3: Add system/configuration extension generations.** A general read-only VFS image layer composes base, sysext and complete confext trees. Root authorization governs shared activation. Conflicting files/types, inconsistent shared-directory metadata, escaping/dangling symlinks, incompatible images and protected identity replacements fail. Identity projections and mutable state stay outside images. Services inherit their selected executable/configuration generation; switching the default requires a new host and explicit scope restart to replace existing services. **Gate passed:** composition and unauthorized-activation denial, read-only descriptor/path behavior, immutable configuration visibility across concurrent old/new hosts, and data-preserving rollback. Private local extensions remain Phase 8.2.
+- [x] **6.3: Add system/configuration extension generations.** A general read-only VFS image layer composes base, sysext and complete confext trees. Root authorization governs shared activation. Conflicting files/types, inconsistent shared-directory metadata, escaping/dangling symlinks, incompatible images and protected identity replacements fail. Identity projections and mutable state stay outside images. Services inherit their selected executable/configuration generation; switching the default requires a new host and explicit scope restart to replace existing services. **Gate passed:** composition and unauthorized-activation denial, read-only descriptor/path behavior, immutable configuration visibility across concurrent old/new hosts, and data-preserving rollback. Private local extensions use the separate Phase 8.2 workspace; they never activate a system generation.
 
 ### Phase 8 — Local execution, private extensions and mounts
 
-- [ ] **8.1: Mount a local directory and execute without upload.** Add scoped local mount providers and loader support for local file handles. Use a browser permission picker where supported; offer selected-file/browser-local-storage fallback without claiming equivalent live mounts. Run supported WASM/WASI/WASIX images directly, with stdin/stdout, fork/exec and normal filesystem semantics where supported. Pin executable bytes at launch; a later rebuild affects the next launch. Transform locally or accept a pretransformed artifact when needed: the current cloud compiler cannot serve strict local-only execution. **Gate:** local edit/build/run works, executable bytes never reach cloud/peer/compiler endpoints, cloud resource access remains credential-checked, and umount/revocation/offline/path-escape cases fail safely. Unsupported native formats or host filesystem semantics fail explicitly.
-- [ ] **8.2: Activate a private extension locally.** Reuse the image manifest and VFS composition layer in a per-user/session workspace, without altering the shared installation or other users' PATH. Validate local packages without requiring an operator signature or granting operator trust. Keep development views separate from privileged services. A single executable needs no package. **Gate:** one user tests a local package with no code upload, another user cannot see or execute it through that private namespace, and local-package metadata cannot elevate credentials. Synchronizing it to another device is an explicit transfer policy, not implied by private activation.
-- [ ] **8.3: Share mounts with authorized devices.** Add owner-approved export/attach, scoped handles, leases, revocation, backpressure and defined owner-offline behavior; transport through an authorized relay and then P2P where supported. Keep bulk bytes out of the central authority. **Gate:** an enrolled device can use a granted directory; foreign devices, escaped paths and stale grants cannot; disconnects do not silently lose writes. A live mount is not a durable replica.
+Milestones 8.1–8.3 are implemented and validated. Host folders prefer browser directory handles and fall back to `os-local-helper` when direct access is unavailable; the helper currently supports Linux only. Browser storage is a separate direct mount. Snapshot import is no longer a Mounts workflow. Native CPU execution and durable storage replication remain Phase 9 work; remote/cloud storage adapters are design-only.
+
+- [x] **8.1: Mount a local directory and execute without upload.** Add scoped local mount providers and loader support for local file handles. Use a browser permission picker where supported and the authenticated loopback helper otherwise; mount browser storage independently. Mount sources in place without directory imports, and state each provider's filesystem semantics explicitly. Run supported WASM/WASI/WASIX images directly, with stdin/stdout, fork/exec and normal filesystem semantics where supported. Pin executable bytes at launch; a later rebuild affects the next launch. Transform locally or accept a pretransformed artifact when needed: the current cloud compiler cannot serve strict local-only execution. **Gate passed:** local edit/build/run works, executable bytes never reach cloud/peer/compiler endpoints, cloud resource access remains credential-checked, and umount/revocation/offline/path-escape cases fail safely. Unsupported native formats or host filesystem semantics fail explicitly.
+- [x] **8.2: Activate a private extension locally.** Reuse the image manifest and VFS composition layer in a per-user/session workspace, without altering the shared installation or other users' PATH. Validate local packages without requiring an operator signature or granting operator trust. Keep development views separate from privileged services. A single executable needs no package. **Gate passed:** one user tests a local package with no code upload, another user cannot see or execute it through that private namespace, and local-package metadata cannot elevate credentials. Synchronizing it to another device is an explicit transfer policy, not implied by private activation.
+- [x] **8.3: Publish filesystems under OS account rules.** Explicit owner publication and receiver mounting; existing VFS modes/ACLs, scoped optional passwords, multiple independent clients, retained-handle checks, leases, revocation and relay/P2P transport. No device enrollment or recipient grants. Keep bulk bytes out of the central authority. **Gate passed:** distinct OS accounts and guests mount only after an explicit request; named-user/default ACLs and scoped passwords control access; revoked ACLs, escaped paths and expired exports fail on existing connections; disconnects do not silently retry writes. A live mount is not a durable replica.
 
 ### Phase 9 — Shared compute and provider-independent workloads
 
@@ -898,6 +1116,7 @@ Preserve the existing phase numbers as workstreams. Delivery priority is **6.0�
 ### Phase 7 — Display/input and GUI applications
 
 - [ ] Provide permission-checked display/input devices, per-process surfaces, focus/resize and desktop windows, initially with an egui/wgpu demonstration. Track and pin the supported WASI graphics proposal interfaces rather than promising finalized standards. Exercise browser capability differences and software rendering; keep ordinary web content in sandboxed frames. GUI, inference and general GPU compute have distinct contracts. **Gate:** two applications cannot steal each other's input/surfaces; resize, device loss and unsupported-browser behavior are tested.
+- [ ] Migrate the built-in GUI apps into ordinary OS processes using OS's own GUI and desktop once that interface is available, including when OS runs in a browser. Preserve app behavior through reusable services/controllers, then replace views and host integration. Files uses `os-userland` over `Sys` for filesystem behavior; its Refresh button and F5 invoke the same Rust controller action. Mounts uses the mount-management and sharing services; no renderer should authorize filesystem access. Keep path resolution, ACLs, listings, sorting, mount/export lifetime and error semantics outside DOM rendering. Browser pickers, clipboard, message ports, focus and storage handles belong behind host adapters. Leptos signals and current DOM controllers are still browser-specific: extract portable state/actions incrementally rather than claiming those views already run natively. **Gate:** browser and native views pass the same behavioral scenarios, including refresh/scroll, account changes, denied access, explicit mounting, cancellation and revocation; native apps use normal process credentials and scoped VFS/device access, with no privileged page-only bypass.
 
 ### Phase 10 — Documentation, verification and remaining runtime work
 
@@ -950,9 +1169,105 @@ The R2 initialization marker (`system/os-authority-v2`) makes a missing authorit
 
 This architecture targets personal or small-team use: one authority orders all decisions, which are short.
 
-This is an independent workspace. Worker name: `os`; bucket: `os-files`; bindings: `FILES`, `ASSETS`, `AUTHORITY`, `MACHINE`, `JOBS`, and `COMPILER`. Content projects can reuse the build output with their own assets, configuration, data, and credentials. Copy the Durable Object declarations and migrations from `wrangler.toml`: `OsAuthority` (`v1-users-permissions`), `JobRunner` (`v2-job-runner`), `Machine` (`v3-machine`), and `ModuleCompiler` (`v4-module-compiler`), including both container images. Never connect an empty unrelated authority to an initialized bucket.
+This is an independent workspace. Worker name: `os`; bucket: `os-files`; bindings: `FILES`, `ASSETS`, `AUTHORITY`, `MACHINE`, `JOBS`, `COMPILER`, and `MOUNTS`. Content projects can reuse the build output with their own assets, configuration, data, and credentials. Copy the Durable Object declarations and migrations from `wrangler.toml`: `OsAuthority` (`v1-users-permissions`), `JobRunner` (`v2-job-runner`), `Machine` (`v3-machine`), `ModuleCompiler` (`v4-module-compiler`), and `MountRelay` (`v5-private-mount-relay`), including both container images. Keep migrations in their existing chronological order; v5 adds a separate object and does not replace previous bindings or data. Never connect an empty unrelated authority to an initialized bucket.
 
 ## Validation
+
+The mount-sharing and compact-layout revision on 2026-11-13 has **118 distinct browser
+cases with passing latest results** across Chromium, Firefox and Linux WebKit. The broad
+run passed 111 cases, failed two native previews and skipped four Chromium-only picker
+cases; the corrected provider passed all 48 affected cases. The final Mounts UI run passed
+32 cases with the same four expected skips, and four signed-demo helper checks passed,
+including refusal of an older helper without inode identity. This is a broad run plus
+focused reruns, not one clean full-suite run. Checks cover separate guest accounts,
+explicit receiver consent, ordinary ACL tools, retained-descriptor/P2P revocation,
+password bounds, multiple clients, expiry, executable rights, helper subtree isolation,
+local execution, private extensions and narrow Files/prompt layouts.
+
+The Node suite passes 130 tests with one optional skip; all 67 selected Rust tests pass
+(kernel, helper and UI). The Rust VFS bridge is also exercised by 15 focused Node tests,
+including provider timestamps and executable revocation. Browser cases also check local
+descriptors retained after unlink and replacement.
+Web/Worker builds, Clippy, formatting, syntax and bundle/provenance parity pass. The signed
+local demo retains its data and signing key; WebKit smoke checks cover isolation,
+supervisor/SIGINT, local execution and A→B→A activation. These checks do not substitute for
+real macOS Safari or native OS picker interaction.
+
+The desktop/Mounts redesign on 2026-11-12 passes **54/54 focused browser cases** across
+Chromium, Firefox and WebKit. These cover the dock menu, standalone shell prompt,
+fork/service/SIGINT behavior, missing-isolation refusal, mount panes and permissions,
+OPFS editing/execution, private packages and shared-mount revocation. WebKit OPFS
+checks use disposable persistent profiles; private contexts report unavailable storage.
+The Linux WebKit runner needs its shared-memory engine flag and is not a substitute
+for testing Safari on macOS. Browser-storage handles are acquired inside the kernel
+worker because transferring those handles from the page crashed the tested WebKit build.
+
+The affected existing regression run passed 68/70 cases; the two shell restart failures
+exposed a missing workspace join after an account change. After fixing that path, the
+63-case session/runtime/local-execution rerun passed 62 cases and exposed an unmount
+test racing the pending operation. Waiting for the UI acknowledgement then passed
+**9/9 repeats** across all three browsers. There are **124 distinct selected browser
+cases with passing latest results** across these runs, not one full-suite run.
+
+All **125 Node tests**, including the optional legacy WASIX fixture, and **15 frontend
+Rust tests** pass.
+Frontend Clippy, formatting and JavaScript syntax checks pass. Web/Worker release
+builds and source/output parity pass: 14 JS bundles/chunks, six executable sizes and
+103 captured output hashes. The refreshed signed local demo also passes WebKit service
+output/SIGINT, OPFS execution and shell-driven A → B → A activation/rollback with a
+preserved mutable file. Evidence: `/home/ai/os-desktop-safari-validation/` and
+`/tmp/os-phase6-8-demo/webkit-smoke.json`.
+
+The Phase 8 completion gate passes **72/72 browser cases** (36 each in Chromium and
+Firefox), with no skips. It covers real local execution/admission, OPFS and Linux adapter
+I/O, local WASIX fork/exec, no-upload launches, cloud credential attenuation, private
+composition, explicit backend admission acknowledgment and account/host isolation, relay/P2P sharing, executable grants, enrollment
+recovery, revocation, lease expiry on both transports and lost write acknowledgments.
+HTTPS Worker-to-loopback access uses a disposable TLS fixture; Files checks cover private
+Markdown images and editor saves larger than one transport chunk.
+
+All **280 distinct selected existing browser/API cases have passing latest results**.
+The first run completed Chromium with 138/142 passing, then stopped at the Firefox
+boundary (one interrupted case, 137 not run) to rebuild the fixes. The final remaining
+and affected run passed **215/215**; 65 unchanged initial passes complete the coverage.
+Together with the new Phase 8 gate, this is **352 distinct passing cases**, using a broad
+run plus affected/remaining checks, not one clean full-suite run. Regressions fixed during
+the audit include root listings before kernel/login startup, forwarding ordinary process
+credentials to the server, shutdown cleanup after private-mount revocation, and streamed
+file replacement. An intermittent application Stop failure passed six focused repeats
+and both final application suites.
+
+All **178 selected Rust tests and 136 Node tests** pass, along with native/wasm Clippy,
+formatting, JavaScript syntax and whitespace checks. Web/Worker release builds pass;
+12 JavaScript bundles/chunks, six executable manifest sizes, installed binaries and all
+97 recorded output hashes match. Tests used fixed assets, isolated authority/storage,
+dedicated execution hosts and the actual configured compiler container, with no compiler
+transport override. The owned test server is stopped; everyday and production state were
+not changed. Work is local and uncommitted.
+
+Native adapter tests exercise kernel-enforced symlink/parent containment, real descriptor
+identity, atomic exclusive creation, lease expiry and rights attenuation. Browser storage
+and file snapshots are tested as their own capabilities, without claiming host-directory
+or full POSIX equivalence. A streamed download regression reproduced mixed file versions
+before the descriptor-retention fix. Compiler tests exercise both transform profiles in
+an actual isolated container, plus reserved-hook rejection, resource instrumentation,
+local cache revocation, compiler startup/failure/retry and offline behavior. All test
+state and container fixtures are isolated from everyday and production state. Evidence:
+`/home/ai/os-phase8-local-validation/`. Earlier Phase 6 validation below is historical.
+
+To run the Phase 8 browser checks against a disposable development instance, first build
+web/Worker assets and `cargo build --locked -p os-local-helper`, then run:
+
+```sh
+OS_TEST_URL=http://127.0.0.1:8787 OS_NO_SHARED_WORKER=1 npx playwright test \
+  tests/local-mounts.spec.js tests/local-execution.spec.js tests/local-admission.spec.js \
+  tests/native-mounts.spec.js tests/native-https.spec.js \
+  tests/private-extensions.spec.js tests/shared-mounts.spec.js
+```
+
+Native filesystem cases require Linux with `openat2`; the HTTPS fixture uses `openssl`.
+`OS_LOCAL_HELPER_BINARY` can select an already built adapter. Sharing tests use the configured
+development administrator account and remove their own device registrations.
 
 The Phase 6.1–6.3 completion on 2026-11-11 has **714 distinct selected browser/API/container cases with passing latest results** across Chromium and Firefox. The initial broad run completed 301 Chromium cases (288 passed, 13 failed), then stopped at the Firefox boundary to fix the failures. The second run passed 324 of 326 completed cases and found two PTY failures; it stopped at a file boundary for the correction and rebuild (one interrupted case and 186 not run). The final remaining/affected run passed **299/299** in 31.7 minutes. The latest results combine 182 unchanged initial passes, 233 second-run passes and 299 final passes. This is broad-run plus affected-suite validation, not a single clean full-suite run. The focused runtime checks passed in both browsers, including four final PTY regressions on the rebuilt image. The deterministic killed-memory-reservation regression failed against the earlier build and passes after the fix. The console master now retains input between pipeline readers; that deterministic Node regression also failed before the fix, and a delayed-consumer browser test covers the same lifetime. Blocked-only `sigpending` has a dedicated Node regression. Tests used fixed served assets, dedicated client kernels, actual configured compiler/archive containers, isolated persistent state and the legacy WASIX dash fixture, with no compiler transport override or fixture skips.
 
@@ -976,9 +1291,9 @@ Coverage includes nearest-subreaper adoption, fork/exec flag semantics, process-
 
 All **68 selected Rust tests** and **43 focused Node tests** pass. Native, Worker/UI/client-kernel wasm and WASI-service/POSIX Clippy, formatting, JavaScript syntax, whitespace and added-English-text checks pass. Full web/Worker release builds pass; ten JS bundles/chunks, seven generated bindings, static assets, six executable manifest sizes and installed init/supervisor/utility bytes match source/build. Tests used preserved isolated state, dedicated kernels and real compiler containers without a transport override; served assets stayed fixed throughout each browser run. Evidence: `/home/ai/os-service-containment-validation/` (`gate.log`, `spawn.log`, development logs, result directories, Rust/Node/build/Clippy/parity logs). The isolated server was stopped and ports 8794/9234 verified absent. Changes remain local and uncommitted. Phase 6.1 stays open for resource enforcement and persistent shared-seat/provider policy; broader GUI adapters and the portable GUI protocol remain Phase 7 work.
 
-The managed GUI application slice on 2026-11-11 has **180 distinct selected Chromium/Firefox browser/API cases with passing latest results**, including all **28 new application-window cases**. The broad gate passed **177/178 in 13.8 minutes** (`applications`, `session-targets`, `services`, `login-services`, `lifecycle`, `lifecycle-scope`, `process-security`). The sole failure was a registry-only security fixture racing the desktop's asynchronous PID 1 reaper; it now uses the non-executing greeter origin while retaining every authorization assertion. After the final navigation safeguard and native-input focus checks, **52/52 affected application/security cases passed in 4.3m**. This is a broad gate plus affected-suite rerun, not one clean full-suite run.
+Historical validation of the managed GUI application slice (removed in the 2026-11-12 desktop simplification) on 2026-11-11 has **180 distinct selected Chromium/Firefox browser/API cases with passing latest results**, including all **28 new application-window cases**. The broad gate passed **177/178 in 13.8 minutes** (`applications`, `session-targets`, `services`, `login-services`, `lifecycle`, `lifecycle-scope`, `process-security`). The sole failure was a registry-only security fixture racing the desktop's asynchronous PID 1 reaper; it now uses the non-executing greeter origin while retaining every authorization assertion. After the final navigation safeguard and native-input focus checks, **52/52 affected application/security cases passed in 4.3m**. This is a broad gate plus affected-suite rerun, not one clean full-suite run.
 
-Coverage includes real shell PIDs and readiness, image-load failure/cancellation/deadlines, shell cleanup handlers, independent process survival, natural-exit output retention, blocked pop-ups, managed-URL and forged-message rejection, stale/foreign login and boot expectations before guest execution, navigation/desktop closure, account changes, scoped shutdown/reboot, narrow screens and native terminal typing after Close/Escape. Early development runs exposed an ambiguous Applications button label, the dedicated kernel's initial disconnected status, and Stop injecting SIGINT during a HUP cleanup handler. The button is now App windows, context capture waits for connected status, and ready shells receive HUP+CONT once with a five-second forced-stop fallback. A delayed navigation-cleanup fence prevents closing a replacement document.
+Coverage includes real shell PIDs and readiness, image-load failure/cancellation/deadlines, shell cleanup handlers, independent process survival, natural-exit output retention, blocked pop-ups, managed-URL and forged-message rejection, stale/foreign login and boot expectations before guest execution, navigation/desktop closure, account changes, scoped shutdown/reboot, narrow screens and native terminal typing after Close/Escape. Early development runs exposed an ambiguous Applications button label, the dedicated kernel's initial disconnected status, and Stop injecting SIGINT during a HUP cleanup handler. At that stage the button was App windows, context capture waited for connected status, and ready shells receive HUP+CONT once with a five-second forced-stop fallback. A delayed navigation-cleanup fence prevents closing a replacement document.
 
 All **64 selected Rust tests** and **43 focused Node tests** pass. Native and Worker/UI/client-kernel wasm Clippy, formatting, JavaScript syntax, whitespace and added-English-text checks pass. Full web/Worker release builds pass; ten JS bundles/chunks, seven generated binding files, static assets, six executable manifest sizes and installed init/supervisor/utility bytes match source/build. Tests use preserved isolated state, dedicated kernels and real compiler containers without a transport override; served assets remained fixed within each browser run. Evidence: `/home/ai/os-gui-supervision-validation/` (`gate.log`, `final.log`, result directories, `node-final.log`, `rust.log`, build/Clippy/parity logs and screenshots). The isolated test server was stopped and ports 8794/9234 verified absent. Work remains local and uncommitted. Phase 6.1 stays open for per-unit containment/journals, resource enforcement and persistent shared-seat/provider policy; additional GUI adapters and the portable GUI protocol remain Phase 7 work.
 

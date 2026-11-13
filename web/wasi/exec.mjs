@@ -17,6 +17,8 @@ const kernelCall = (type, args) => globalThis.kernelRequest(type, args);
 import { load } from '../kernel/loader.js';
 import { STRERROR } from '../http.mjs';
 import { resolveExecs } from './resolve.mjs';
+import { LOCAL_FD, localPath } from '../kernel/workspace.js';
+import { requireExecutionSupport } from '../kernel/capabilities.js';
 
 // Executables are the build's own /usr/bin images by default; a stage may name its own path
 // (an uploaded wasm the shell resolved against the working directory). Each process is a
@@ -82,7 +84,7 @@ const line = () => ({ shares: new Shares(), descriptions: new Map() });
 // Close what the process `pid` (its token `token`, its umask and sudo `as`) held last of its
 // line's open files, as its exit would have: in a Worker of its own, as the process, before its
 // parent hears it ended. The locks it held go first.
-async function closeHeld(of, pid, token, as) {
+async function closeHeld(of, pid, token, as, workspace, scope) {
   if (!of) return;
   for (const { description } of of.descriptions.values()) {
     if (description.bytes) new Bytes(description.bytes).release(pid);
@@ -92,7 +94,10 @@ async function closeHeld(of, pid, token, as) {
     if (known?.gen !== gen) return null;
     of.descriptions.delete(slot);
     return known.description;
-  }).filter(Boolean);
+  }).filter(Boolean).filter(description => {
+    if (description.kfd >= LOCAL_FD) { if (workspace?.fds.get(description.kfd)?.scope === scope) void workspace.closeFd(description.kfd, scope).catch(() => {}); return false; }
+    return true;
+  });
   if (!last.length) return;
   const closer = new Worker(asset('/wasi-process.js'));
   await new Promise(resolve => {
@@ -113,7 +118,7 @@ function release(pid) {
   }
 }
 // What a process's waiting call is answered with, in the memory it waits on: a JSON reply.
-const CHANNEL = 64 * 1024;
+const CHANNEL = 1024 * 1024;
 function respond(channel, reply) {
   const data = new TextEncoder().encode(JSON.stringify(reply ?? {}));
   const state = new Int32Array(channel, 0, 2);
@@ -209,6 +214,29 @@ export function reconcile() {
 // every process of it is, 'running' as one goes on}. The last's exit status, and what it wrote
 // if not to the terminal.
 export async function exec(stages, options = {}) {
+  requireExecutionSupport();
+  const workspace = options.workspace;
+  const prepareLocal = async stage => {
+    const path = stage.path.startsWith('/') ? stage.path : (stage.cwd ?? '/').replace(/\/$/, '') + '/' + stage.path;
+    if (!workspace || !localPath(path)) return null;
+    const local = await workspace?.image(stage.path, stage.cwd ?? '/');
+    if (local && !globalThis.crossOriginIsolated) throw Object.assign(new Error('local execution requires cross-origin isolation'), { errno: 'ENOTSUP' });
+    if (local) await local.load();
+    return local;
+  };
+  const loadImage = image => {
+    if (!image.localImage) return load(image);
+    const expected = image.localImage.local, admitted = image.local;
+    // An older authority can ignore new request fields. Never run private code
+    // with credentials that did not explicitly acknowledge this admission and
+    // its cloud attenuation, even if a cloud executable exists at the same path.
+    if (!admitted || admitted.digest !== expected.digest || admitted.size !== expected.size
+      || typeof admitted.cloud !== 'boolean' || admitted.cloud && !expected.cloud
+      || image.size !== expected.size || image.asset != null || image.fd != null || image.token_read != null) {
+      return Promise.reject(Object.assign(new Error('authority did not confirm the requested local execution grant'), { errno: 'EACCES' }));
+    }
+    return image.localImage.load();
+  };
   const { cwd = '/', home = '/', user = 'guest', stdin = null, sudo = false, umask = 0o022, tty = false, enough = null,
     cancelled = () => false, onTty = () => {}, onJob = () => {} } = options;
   // The shell's callbacks last as long as the run: a process that outlives it (a child left in
@@ -219,6 +247,7 @@ export async function exec(stages, options = {}) {
   const onState = state => { if (!finished) options.onState?.(state); };
   const env = piped => ({
     HOME: home, USER: user, LOGNAME: user, PATH: '/usr/bin', SHELL: '/usr/bin/sh', LANG: 'C.UTF-8',
+    PS1: '${USER}@os:${PWD}' + (user === 'root' ? ' # ' : ' $ '), PS2: '> ',
     TERM: piped ? 'dumb' : 'xterm-256color', COLUMNS: String(options.columns ?? 80), LINES: String(options.rows ?? 24),
     TZ: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
     ...options.environment,
@@ -327,7 +356,22 @@ export async function exec(stages, options = {}) {
       env: Object.entries(environments[index]).map(([name, value]) => `${name}=${value}`),
       cwd,
     })),
-    stages => kernelCall('execs', { stages, sudo }),
+    async stages => {
+      const prepared = [], replies = new Array(stages.length);
+      for (let index = 0; index < stages.length; index++) {
+        try {
+          const localImage = await prepareLocal(stages[index]);
+          prepared.push({ index, localImage, stage: { ...stages[index], local: localImage?.local, path: localImage?.path ?? stages[index].path } });
+        } catch (err) { replies[index] = { err }; }
+      }
+      const registered = prepared.length ? await kernelCall('execs', { stages: prepared.map(p => p.stage), sudo }) : [];
+      for (let i = 0; i < prepared.length; i++) {
+        const { index, localImage } = prepared[i], result = registered[i];
+        if (result?.ok) result.ok.localImage = localImage;
+        replies[index] = result;
+      }
+      return replies;
+    },
     abandon,
   );
   const images = stages.map((stage, index) => asked.then(results => {
@@ -343,7 +387,8 @@ export async function exec(stages, options = {}) {
   // A process this job hosts, in a Worker of its own: a stage's, or one a process of it forked
   // (`forked`, its start the parent's snapshot). `write` is where its output goes, as its
   // stage's does.
-  const host = ({ pid, token, ppid, module, memory, memoryBytes, startSection = false, argv, write, forked, start, transfer = [], files = null, membership }) => {
+  const host = ({ pid, token, ppid, module, memory, memoryBytes, startSection = false, argv, write, forked, start, transfer = [], files = null, membership, fsScope = workspace?.scope() }) => {
+    if (fsScope) fsScope.holders = (fsScope.holders ?? 0) + 1;
     const worker = new Worker(asset('/wasi-process.js'));
     const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
     // Each writer has two small compositor credits. A killed worker cannot leak credits
@@ -415,7 +460,8 @@ export async function exec(stages, options = {}) {
       // HUP+CONT, including when a stuck Worker could not close its own fds.
       const deviceCleanup = devices.release(pid).then(() => Promise.all(owned
         .filter(pair => pair.terminal.session === pid).map(pair => releaseTerminal(false, pair.terminal))));
-      const closing = Promise.all([hangup, deviceCleanup, outright ? closeHeld(files, pid, cleanupToken(), { umask, sudo }) : Promise.resolve()]);
+      const closing = Promise.all([hangup, deviceCleanup, outright ? closeHeld(files, pid, cleanupToken(), { umask, sudo }, workspace, fsScope) : Promise.resolve()]);
+      void closing.finally(() => { if (fsScope && --fsScope.holders === 0) workspace.closeScope(fsScope); });
       void closing.then(() => reap(pid, { status: code, signal }, forked));
       void Promise.allSettled([closing, ...displaying]).then(() => { completing.delete(pid); settle(code); });
     };
@@ -432,7 +478,18 @@ export async function exec(stages, options = {}) {
     const answer = async ({ type, args }) => {
       let reply;
       try {
-        if (type === 'join') reply = await join(pid, args.pid, args.nohang, args.options);
+        if (['filesystem', 'local_read', 'local_write'].includes(type) && (!workspace || process.ended)) throw { errno: 'ENODEV' };
+        if (type === 'filesystem') {
+          if (!workspace || process.ended) throw { errno: 'ENODEV' };
+          reply = await workspace.calls(args.calls, fsScope, async calls => {
+            const response = await fetch('/api/sys', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ calls, pid, proc: process.token, umask: args.umask }) });
+            if (!response.ok) throw { errno: 'EIO' }; return (await response.json()).results;
+          }, { allowClosedCloud: true });
+        }
+        else if (type === 'local_read') reply = await workspace.read(args.fd, args.offset, args.count, fsScope);
+        else if (type === 'local_write') reply = await workspace.write(args.fd, Uint8Array.from(atob(args.data), c => c.charCodeAt(0)), args.offset, fsScope, args.append);
+        else if (type === 'join') reply = await join(pid, args.pid, args.nohang, args.options);
         else if (type === 'process_call') {
           reply = args.waitpid
             ? await join(pid, args.waitpid.pid, !!(args.waitpid.options & 1), args.waitpid.options)
@@ -465,11 +522,14 @@ export async function exec(stages, options = {}) {
     // format the loader refuses once the kernel replaced the image ends the process, as an
     // execve past its point of no return does.
     const replace = async ({ path, argv: args, env, cwd }) => {
-      const image = await kernelCall('reexec', { pid, path, argv: args, env, cwd });
+      const localImage = await prepareLocal({ path, cwd });
+      if (process.ended) throw { errno: 'ESRCH' };
+      const image = await kernelCall('reexec', { pid, path: localImage?.path ?? path, local: localImage?.local, argv: args, env, cwd });
+      image.localImage = localImage;
       process.token = image.token;
       let loaded;
       try {
-        loaded = await load(image);
+        loaded = await loadImage(image);
       } catch (error) {
         // The replacement already owns the credential. Its Worker still owns stdio and
         // must emit the loader diagnostic through fd 2 before closing/reaping normally.
@@ -519,18 +579,22 @@ export async function exec(stages, options = {}) {
         const [result] = await resolveExecs([{ path: state.argv[0], argv: state.argv, env: state.env, cwd: state.cwd }],
           stages => Promise.all(stages.map(async stage => {
             alive();
-            try { return { ok: await kernelCall('reexec', { pid: child.pid, ...stage }) }; }
+            try {
+              const localImage = await prepareLocal(stage); alive();
+              const image = await kernelCall('reexec', { pid: child.pid, ...stage, path: localImage?.path ?? stage.path, local: localImage?.local });
+              image.localImage = localImage; return { ok: image };
+            }
             catch (err) { return { err }; }
           })));
         if (result.err) throw result.err;
         child.token = result.ok.token;
         alive();
-        const loaded = await load(result.ok).catch(error => { throw { errno: 'ENOEXEC', detail: error.message }; });
+        const loaded = await loadImage(result.ok).catch(error => { throw { errno: 'ENOEXEC', detail: error.message }; });
         alive();
         holdInheritance(state, child.pid);
         held = true;
         const made = host({ pid: child.pid, token: child.token, ppid: pid, ...loaded, argv: state.argv,
-          write, forked: true, start: { inherit: state }, files, membership: membership ?? process });
+          write, forked: true, start: { inherit: state }, files, fsScope, membership: membership ?? process });
         forks.push(made);
         if (control && Atomics.load(control, 0) === 1) made.signal(SIG.STOP);
         changed();
@@ -539,7 +603,7 @@ export async function exec(stages, options = {}) {
         if (child) {
           release(child.pid);
           await devices.release(child.pid);
-          if (held) await closeHeld(files, child.pid, child.token, { umask: state.umask, sudo });
+          if (held) await closeHeld(files, child.pid, child.token, { umask: state.umask, sudo }, workspace, fsScope);
           await reap(child.pid, { status: 126 }, true);
           await kernelCall('waitchild', { ppid: pid, pid: child.pid }).catch(() => {});
         }
@@ -561,7 +625,7 @@ export async function exec(stages, options = {}) {
         checkInheritance(state);
         holdInheritance(state, child.pid);
         held = true;
-        const made = host({ pid: child.pid, token: child.token, ppid: pid, ...process.image, argv: state.argv, write, forked: true, start: { fork: state }, transfer: [state.snapshot.memory], files, membership: process });
+        const made = host({ pid: child.pid, token: child.token, ppid: pid, ...process.image, argv: state.argv, write, forked: true, start: { fork: state }, transfer: [state.snapshot.memory], files, fsScope, membership: process });
         forks.push(made);
         changed();
         worker.postMessage({ forked: { pid: child.pid } });
@@ -569,7 +633,7 @@ export async function exec(stages, options = {}) {
         if (child) {
           release(child.pid);
           await devices.release(child.pid);
-          if (held) await closeHeld(files, child.pid, child.token, { umask: state.umask, sudo });
+          if (held) await closeHeld(files, child.pid, child.token, { umask: state.umask, sudo }, workspace, fsScope);
           await reap(child.pid, { status: 126 }, true);
           await kernelCall('waitchild', { ppid: pid, pid: child.pid }).catch(() => {});
         }
@@ -633,7 +697,7 @@ export async function exec(stages, options = {}) {
     // Recover that delivery before entering user code, including for fork children.
     void (async () => {
       await reconciling; await reconcile();
-      if (!process.ended) worker.postMessage({ ...start, module, memory, memoryBytes, startSection, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: !!terminal }, pty: terminal?.transferable, control: control?.buffer, outputCredit: outputCredit?.buffer, channel, membership: ids.buffer, shares: files?.shares.buffer }, transfer);
+      if (!process.ended) worker.postMessage({ ...start, localFs: !!workspace && isolated, module, memory, memoryBytes, startSection, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: !!terminal }, pty: terminal?.transferable, control: control?.buffer, outputCredit: outputCredit?.buffer, channel, membership: ids.buffer, shares: files?.shares.buffer }, transfer);
     })().catch(() => end({ code: 126 }, true));
     return process;
   };
@@ -780,8 +844,9 @@ export async function exec(stages, options = {}) {
     taken.add(index);
     try {
       image = await images[index];
+      if (workspace && image.login_scope !== workspace.identity.id) throw { errno: 'EACCES', message: 'login changed during local workspace launch' };
       if (stopped) return await canceled(image);
-      const { module, memory, memoryBytes, startSection } = await load(image).catch(error => { throw refused(argv[0], error); });
+      const { module, memory, memoryBytes, startSection } = await loadImage(image).catch(error => { throw refused(argv[0], error); });
       if (stopped) return await canceled(image);
       // Hosts may require a fresh authorization after slow loading, before any guest code.
       if (options.beforeStart) await options.beforeStart(image.pid, image);

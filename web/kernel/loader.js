@@ -9,8 +9,11 @@
 // memory (WASIX's do, as env.memory), the memory's declared limits and shared flag, so every
 // process creates one of exactly that type. A module of its own exports `memory`.
 //
-// Images importing fork/setjmp/longjmp request a content-cached transform from the server.
-// Binaryen stays in the compiler container. The host only compiles the resulting wasm.
+// Cloud images use the container compiler. Private local pins use a separate, on-device
+// compiler Worker and never fall back to any server route.
+import { localImage } from './local-mounts.js';
+import { LOCAL_FORMAT } from './transform.js';
+import { transformLocal } from './local-transform.js';
 
 // How many modules stay compiled at once; the oldest goes past that (LRU).
 const CACHE_MAX = 8;
@@ -25,6 +28,7 @@ const UNWINDS = new Set(['proc_fork', 'stack_checkpoint', 'stack_restore']);
 const FORKABLE = 'fork-v4';
 
 const compiled = new Map();
+const localCompiled = new Map();
 // For the tests: how many modules were really compiled (a cache hit compiles none).
 export const stats = { compiled: 0 };
 globalThis.loaderStats = stats;
@@ -49,6 +53,46 @@ export function load(image) {
   compiled.set(key, promise);
   while (compiled.size > CACHE_MAX) compiled.delete(compiled.keys().next().value);
   return promise;
+}
+
+// This prepares an image, not a process or an execution credential. The execution host
+// must still admit it with explicit resource grants before instantiation. Neither local
+// digests nor filenames can be passed to the server as image-based authority.
+export async function loadLocal(pin) {
+  const { bytes, check } = await localImage(pin);
+  const key = `${LOCAL_FORMAT}:${pin.digest}`;
+  let promise = localCompiled.get(key);
+  if (promise) localCompiled.delete(key);
+  else {
+    promise = compileLocal(bytes);
+    promise.catch(() => { if (localCompiled.get(key) === promise) localCompiled.delete(key); });
+  }
+  localCompiled.set(key, promise);
+  while (localCompiled.size > CACHE_MAX) localCompiled.delete(localCompiled.keys().next().value);
+  const result = await promise;
+  // Cached code is not a capability. In particular, detach/revocation during a transform
+  // must not let a launch continue just because another mount has the same digest.
+  await check();
+  return result;
+}
+
+async function compileLocal(bytes) {
+  try {
+    const original = await WebAssembly.compile(bytes);
+    const imported = validateImports(WebAssembly.Module.imports(original));
+    validateExports(original, imported);
+    const { memory } = await heading(bytes);
+    if (imported && !memory) fail('no env.memory type');
+    const transformed = await transformLocal(bytes);
+    const module = await WebAssembly.compile(transformed);
+    const { memories } = await heading(transformed);
+    stats.compiled++;
+    return Object.freeze({ module, memory: imported ? Object.freeze(memory) : undefined,
+      memoryBytes: memories.reduce((sum, value) => sum + value.initial * 65536, 0), startSection: false });
+  } catch (error) {
+    if (error?.errno) throw error;
+    throw formatError(error);
+  }
 }
 
 // The image's bytes, as its exec allows them to be read.

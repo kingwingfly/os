@@ -32,6 +32,7 @@ pub struct Credential {
     pub groups: String,
     pub umask: u16,
     pub generation: Option<String>,
+    pub cloud_access: u8,
     /// The key its process's descriptors are owned by: its own exec's (`owner`), or, for an
     /// image a process replaced its own with, the one that process had, as execve keeps a
     /// process's open files.
@@ -44,9 +45,19 @@ pub struct Credential {
 const OWNER: &str = "COALESCE(owner, ns || ' ' || pid || ' ' || substr(token, 1, 16))";
 /// The columns a `Credential` is read from.
 fn columns() -> String {
-    format!("token, ns, pid, uid, gid, groups, umask, generation, {OWNER} AS owner")
+    format!("token, ns, pid, uid, gid, groups, umask, generation, cloud_access, {OWNER} AS owner")
 }
 impl Credential {
+    pub fn cloud(&self) -> std::result::Result<(), abi::Error> {
+        if self.cloud_access == 0 {
+            Err(abi::Error::because(
+                Errno::EACCES,
+                "cloud filesystem access was not delegated to this process",
+            ))
+        } else {
+            Ok(())
+        }
+    }
     pub fn identity(&self) -> Identity {
         Identity {
             id: self.uid,
@@ -270,6 +281,8 @@ impl Db {
 /// One execve the registry asks the authority about.
 #[derive(Deserialize)]
 struct Asked {
+    #[serde(default)]
+    local: Option<abi::LocalExecutable>,
     pid: u32,
     /// The hash of the token its process will carry.
     token: String,
@@ -312,6 +325,8 @@ fn umask() -> u16 {
 /// What an execve gives: the credentials snapshotted, and how the loader reads the image.
 #[derive(Serialize)]
 struct Image {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local: Option<abi::LocalExecutable>,
     login: Option<crate::login::Context>,
     uid: u32,
     gid: u32,
@@ -499,21 +514,44 @@ fn exec(
     } else {
         format!("{}/{}", cwd.trim_end_matches('/'), asked.path)
     };
-    let executable = kernel::executable(&*db, &cred, &path)?;
-    if executable.node.size > EXEC_MAX {
+    let mut local = asked.local;
+    if let Some(image) = &mut local {
+        if !image.valid() || !path.starts_with('/') || path.len() > 4096 || path.contains('\0') {
+            return Err(Errno::EINVAL.into());
+        }
+        if sudo && current.is_none() {
+            return Err(Errno::EPERM.into());
+        }
+        // Exec may attenuate an existing delegation, never enlarge it.
+        image.cloud &= current.as_ref().is_none_or(|c| c.cloud_access != 0);
+    } else if let Some(current) = &current {
+        current.cloud()?;
+    }
+    let executable = if local.is_some() {
+        None
+    } else {
+        Some(kernel::executable(&*db, &cred, &path)?)
+    };
+    if executable.as_ref().is_some_and(|e| e.node.size > EXEC_MAX) {
         return Err(Error::because(
             Errno::E2BIG,
-            format!("{} is larger than an executable may be", executable.path),
+            format!("{path} is larger than an executable may be"),
         ));
     }
     // The image: a binary of /usr, or any file whose content is one (a FICLONE copy or a hard
     // link of /usr/bin/coreutils), is the build's asset; anything else is uploaded, and the
     // loader reads it by a token of the process's own descriptor, revalidated with the X rule.
-    let asset = crate::system::asset(&executable.content);
-    if crate::system::owns(db, &executable.path) && asset.is_none() {
+    let asset = executable
+        .as_ref()
+        .and_then(|e| crate::system::asset(&e.content));
+    if executable
+        .as_ref()
+        .is_some_and(|e| crate::system::owns(db, &e.path))
+        && asset.is_none()
+    {
         return Err(Error::because(
             Errno::ENOEXEC,
-            format!("{} is not an executable image", executable.path),
+            format!("{path} is not an executable image"),
         ));
     }
     let lineage = current
@@ -542,8 +580,12 @@ fn exec(
         ],
     );
     db.run(
-        "UPDATE credentials SET generation = ? WHERE token = ?",
-        vec![generation.as_deref().into(), text(&asked.token)],
+        "UPDATE credentials SET generation = ?, cloud_access = ? WHERE token = ?",
+        vec![
+            generation.as_deref().into(),
+            int(u8::from(local.as_ref().is_none_or(|l| l.cloud))),
+            text(&asked.token),
+        ],
     );
     db.set_expiry("credential", &asked.token, now + abi::PROCESS_TOKEN_TTL);
     let placement = crate::placement::browser(
@@ -566,8 +608,8 @@ fn exec(
     }
     // The new image's own descriptor is its exec's alone.
     let owner = owner(ns, asked.pid, &asked.token);
-    let (fd, token_read, size) = match asset {
-        None => {
+    let (fd, token_read, size, version, path) = match executable {
+        Some(executable) if asset.is_none() => {
             let read = auth::random_token();
             let fd = db.add_exec_fd(
                 &sid,
@@ -577,12 +619,35 @@ fn exec(
                 &auth::token_hash(&read),
                 now,
             );
-            (Some(fd), Some(read), executable.node.size)
+            (
+                Some(fd),
+                Some(read),
+                executable.node.size,
+                executable.content,
+                executable.path,
+            )
         }
         // A binary of /usr is as large as the build's (`usr::size` takes its content id).
-        Some(_) => (None, None, crate::system::size(&executable.content)),
+        Some(executable) => (
+            None,
+            None,
+            crate::system::size(&executable.content),
+            executable.content,
+            executable.path,
+        ),
+        None => {
+            let image = local.as_ref().ok_or(Errno::EINVAL)?;
+            (
+                None,
+                None,
+                image.size,
+                format!("local:{}", image.digest),
+                path,
+            )
+        }
     };
     Ok(json!(Image {
+        local,
         login: if current.is_none() {
             login_context(db, key, guest)
         } else {
@@ -594,10 +659,10 @@ fn exec(
         umask,
         fd,
         asset,
-        path: executable.path.clone(),
+        path,
         size,
         token_read,
-        version: executable.content.clone(),
+        version,
     }))
 }
 

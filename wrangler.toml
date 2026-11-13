@@ -6,6 +6,11 @@ compatibility_date = "2026-10-24"
 workers_dev = true
 preview_urls = false
 
+[[durable_objects.bindings]]
+name = "MOUNTS"
+class_name = "MountRelay"
+
+
 [build]
 command = "worker-build --release"
 cwd = "crates/worker"
@@ -88,3 +93,7 @@ image = "./containers/compiler/Dockerfile"
 image_build_context = "."
 instance_type = "basic"
 max_instances = 4
+
+[[migrations]]
+tag = "v5-private-mount-relay"
+new_sqlite_classes = ["MountRelay"]

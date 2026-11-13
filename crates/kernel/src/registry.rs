@@ -266,6 +266,7 @@ mod tests {
             Errno::EPERM
         );
         let execve = Call::Execve {
+            local: None,
             runtime: None,
             pid: None,
             token: None,

@@ -1,6 +1,7 @@
 // The page is a terminal/compositor for its dedicated kernel. Only messages cross this
 // boundary; the kernel Worker owns process Workers, pipe buffers and the process table.
 import { kernelCall, kernelPort } from './protocol.js';
+import { requireExecutionSupport } from './capabilities.js';
 
 globalThis.loaderStats = { compiled: 0 };
 globalThis.addEventListener('os:signal', ({ detail }) => { void kernelCall('deliver_signal', detail).catch(() => {}); });
@@ -101,7 +102,6 @@ export async function configureLoginServices(file, expected) {
 export function signalLoginServices(expected, signal = 15) {
   return kernelCall('login_service_signal', { expected: { session: expected?.id, generation: expected?.generation }, pid: expected?.managed?.pid, signal });
 }
-let fallbackNotified = false;
 const localRuns = new Map(), foregroundRuns = new Map();
 export function consoleStatus(terminalId) {
   const record = localRuns.get(foregroundRuns.get(String(terminalId)));
@@ -200,10 +200,7 @@ export async function exec(stages, options = {}) {
   // A pane may close while the shell is still resolving its command. Do not
   // create a new run after cancellation already reached that launch.
   if (options.cancelled?.()) return { status: 130, stdout: '', truncated: false, truncatedBy: [] };
-  if (!globalThis.crossOriginIsolated && !fallbackNotified) {
-    fallbackNotified = true;
-    options.onOutput?.(2, 'Interactive terminal input is unavailable in this browser; commands run sequentially.\n');
-  }
+  requireExecutionSupport();
   const run = crypto.randomUUID();
   const terminalId = String(options.terminalId ?? run);
   const record = { run, ready: false, sharing: { count: 0, control: false } };

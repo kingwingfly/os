@@ -34,7 +34,7 @@ test('greeter offers fixed session choices and guest desktop without booting an 
   await page.screenshot({ path: '/home/ai/os-session-targets-validation/greeter.png' });
   await page.getByRole('button', { name: 'Continue as guest', exact: true }).click();
   await expect(page).toHaveURL(/\/(?:index\.html)?$/); await expect(page.locator('#command')).toBeVisible();
-  await expect(page.getByRole('link', { name: 'Start session', exact: true })).toHaveAttribute('target', '_blank');
+  await expect(page.getByRole('link', { name: 'Start session', exact: true })).toHaveCount(0);
 });
 
 test('sign-in selects a real root shell with its account home and no credentials in the URL', async ({ page }) => {
@@ -195,7 +195,7 @@ test('missing browser isolation offers a desktop fallback without starting a ker
     await route.fulfill({ response, headers });
   });
   await page.goto('/shell'); expect(await page.evaluate(() => crossOriginIsolated)).toBe(false);
-  await expect(page.locator('#app')).toContainText('Interactive shells require');
+  await expect(page.locator('#app')).toContainText('Command execution needs an isolated browser page');
   await expect(page.getByRole('link', { name: 'Open the desktop' })).toHaveAttribute('href', '/');
   expect(execution).toEqual([]); await expect(input(page)).toHaveCount(0);
 });

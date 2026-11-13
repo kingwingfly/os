@@ -14,14 +14,26 @@ test('server compiler transforms fixed-memory modules without running their init
       (func $init unreachable) (start $init)
       (func (export "_start") (drop (call $fork (i32.const 1) (i32.const 0)))))`);
     let bytes; try { bytes = module.emitBinary(); } finally { module.dispose(); }
-    const response = await fetch(`http://127.0.0.1:${port}/compile`, { method: 'POST', body: bytes });
-    assert.equal(response.status, 200, await response.clone().text().then(text => text.slice(0, 200)));
-    const compiled = await WebAssembly.compile(await response.arrayBuffer());
-    const instance = await WebAssembly.instantiate(compiled, { wasix_32v1: { proc_fork: () => 0 } });
-    assert.equal(instance.exports.memory.buffer.byteLength, 65536);
-    assert.throws(() => instance.exports.memory.grow(1), RangeError);
-    assert.ok(instance.exports.__tw_asyncify_memory instanceof WebAssembly.Memory);
-    assert.throws(() => instance.exports.__tw_initialize(), WebAssembly.RuntimeError);
+    for (const path of ['/compile', '/compile?profile=resources-v1']) {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, { method: 'POST', body: bytes });
+      assert.equal(response.status, 200, await response.clone().text().then(text => text.slice(0, 200)));
+      const compiled = await WebAssembly.compile(await response.arrayBuffer());
+      const instance = await WebAssembly.instantiate(compiled, { wasix_32v1: { proc_fork: () => 0 } });
+      assert.equal(instance.exports.memory.buffer.byteLength, 65536);
+      assert.throws(() => instance.exports.memory.grow(1), RangeError);
+      assert.ok(instance.exports.__tw_asyncify_memory instanceof WebAssembly.Memory);
+      assert.throws(() => instance.exports.__tw_initialize(), WebAssembly.RuntimeError);
+      for (const wat of [
+        '(module (import "os_runtime" "memory_grow_pre" (func $f)) (memory (export "memory") 1) (func (export "_start") (call $f)))',
+        '(module (memory (export "memory") 1) (func (export "_start")) (func (export "__tw_initialize")))',
+      ]) {
+        const forged = binaryen.parseText(wat);
+        try {
+          const denied = await fetch(`http://127.0.0.1:${port}${path}`, { method: 'POST', body: forged.emitBinary() });
+          assert.equal(denied.status, 422); assert.equal((await denied.json()).errno, 'ENOEXEC');
+        } finally { forged.dispose(); }
+      }
+    }
     const invalid = await fetch(`http://127.0.0.1:${port}/compile`, { method: 'POST', body: 'not wasm' });
     assert.equal(invalid.status, 422);
     assert.equal((await invalid.json()).errno, 'ENOEXEC');

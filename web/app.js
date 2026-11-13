@@ -1,4 +1,5 @@
 import { verifyRelease } from './release.js';
+import { installSelectMenus } from './select-menu.js';
 import { inspectFaststart } from './faststart.mjs';
 import { uploadFile, Cancelled } from './upload.mjs';
 import { record, clock } from './record.mjs';
@@ -9,7 +10,12 @@ import { kernelCall } from './kernel/protocol.js';
 import { answered as resultOf, call, sys } from './http.mjs';
 import { migratePreferences } from './compat.mjs';
 import { installConsoleSharing } from './console-sharing.js';
-import { installApplications } from './application-windows.js';
+import { executionSupport } from './kernel/capabilities.js';
+import { installLocalFiles, localMounts } from './local-files.js';
+import { shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog } from './mount-sharing-ui.js';
+import { localPath } from './kernel/workspace.js';
+
+installLocalFiles();
 
 for (const name of ['localStorage', 'sessionStorage']) {
   try { migratePreferences(window[name]); } catch { /* storage can be disabled or full */ }
@@ -240,9 +246,14 @@ function followAgain(name, presentation, sound) {
 // A speaker view, which a deck's S opened (viewer.rs): it shows the deck its address names once
 // the terminal runs.
 export function started() {
+  installSelectMenus();
   installConsoleSharing();
-  const applications = installApplications();
-  Object.assign(window.os, { applications: applications.list, launchApplication: applications.launch, stopApplication: applications.stop });
+  const support = executionSupport();
+  if (!support.supported) {
+    const notice = document.createElement('aside'); notice.className = 'execution-notice';
+    notice.setAttribute('role', 'status'); notice.textContent = support.reason;
+    document.querySelector('.topbar')?.after(notice);
+  }
   // The client kernel: the browser's SharedWorker, or, where a browser has none, this tab's own
   // dedicated Worker (web/kernel/protocol.js).
   void loginSession().catch(() => {});
@@ -882,6 +893,16 @@ document.addEventListener('fullscreenchange', () => {
   else { clearTimeout(chromeTimer); $('viewer-surface').classList.remove('chrome'); }
 });
 window.addEventListener('message', event => { if (event.origin === location.origin && event.source === $('viewer-content').querySelector('iframe')?.contentWindow && event.data === 'close-game') closeViewer(); });
+$('download').addEventListener('click', async event => {
+  if (!localPath(shown?.path)) return;
+  event.preventDefault(); const path = shown.path;
+  try {
+    const response = await api(fileUrl(path));
+    if (Number(response.headers.get('Content-Length')) > 128 * 1024 * 1024) throw new Error('Local browser downloads are limited to 128 MiB; copy larger files on their owner device.');
+    const url = URL.createObjectURL(await response.blob()), link = document.createElement('a');
+    link.href = url; link.download = path.split('/').pop(); link.click(); setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (error) { $('viewer-content').textContent = error.message; }
+});
 async function open(path, kind, followed = false, attending = false) {
   if (/^\/dev\/present\/[^/]+$/.test(path)) return attend(path);
   if (/^\/dev\/snd\/[^/]+$/.test(path)) return hear(path);
@@ -931,6 +952,19 @@ function observeTranscript() {
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
         const form = log.querySelector('.command-line');
+        const input = form?.querySelector('.command-input'), label = form?.querySelector('label');
+        if (input && !log.closest('[data-pty="true"]')) {
+          const bounds = form.getBoundingClientRect();
+          let available = bounds.width;
+          if (label && !label.hidden) {
+            const range = document.createRange(); range.selectNodeContents(label.querySelector('.prompt-symbol') ?? label);
+            const last = [...range.getClientRects()].at(-1);
+            if (last) available = bounds.right - last.right;
+          }
+          const gap = parseFloat(getComputedStyle(input).marginLeft) || 0;
+          const width = `${Math.max(1, Math.floor((available >= 2 * gap + 1 ? available : bounds.width) - gap - 1))}px`;
+          if (input.style.width !== width) input.style.width = width;
+        }
         const cursor = log.querySelector('.terminal-screen[data-live="true"] .terminal-cursor');
         if (form && cursor && log.closest('[data-pty="true"]')) {
           const at = cursor.getBoundingClientRect(), bounds = log.getBoundingClientRect();
@@ -941,12 +975,18 @@ function observeTranscript() {
         } else if (form && (form.style.left || form.style.top)) {
           form.style.removeProperty('left'); form.style.removeProperty('top');
         }
+        const pager = log.querySelector('.completion-pager');
+        if (pager && form) {
+          // Keep both the focused line and its suggestions in the same viewport.
+          const height = `${Math.max(48, Math.min(260, log.clientHeight - form.offsetHeight - 36))}px`;
+          if (pager.style.maxHeight !== height) pager.style.maxHeight = height;
+        }
         log.scrollTop = log.scrollHeight;
       });
     };
     if (!observedTranscripts.has(log)) {
       observedTranscripts.add(log);
-      new MutationObserver(scroll).observe(log, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["style", "data-live", "data-alternate"] });
+      new MutationObserver(scroll).observe(log, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["style", "data-live", "data-alternate", "hidden", "data-state"] });
       new ResizeObserver(scroll).observe(log);
     }
     scroll();
@@ -969,10 +1009,10 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.os = { loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, config: () => configuration.branding, exec, closeConsole, grantConsole, revokeConsole, attachConsole, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionCursor: () => $('command')?.selectionStart ?? 0, completionFocus: (value, cursor) => {
+window.os = { shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal: args => kernelCall('mount_attach', args), localMountList: () => kernelCall('mount_list'), unmountLocal: path => kernelCall('mount_detach', { path }), activatePrivate: args => kernelCall('mount_activate', args), localMounts, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, config: () => configuration.branding, exec, closeConsole, grantConsole, revokeConsole, attachConsole, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionCursor: () => $('command')?.selectionStart ?? 0, completionFocus: (value, cursor) => {
   requestAnimationFrame(() => {
     const input = $('command');
-    if (input?.value !== value || document.querySelector('dialog[open]:modal')) return;
+    if (input?.value !== value || document.querySelector('dialog[open]:modal') || otherWindow()) return;
     // Text selected since (the line chosen whole, to type over) is the typist's: the caret stays.
     if (document.activeElement === input && input.selectionStart !== input.selectionEnd) return;
     input.focus({ preventScroll: true });
@@ -1027,7 +1067,7 @@ function restoreTerminalFocus() {
     input?.focus({ preventScroll: true });
   });
 }
-for (const id of ['auth', 'editor', 'console-share', 'applications']) {
+for (const id of ['auth', 'editor', 'console-share']) {
   $(id).addEventListener('close', () => { resetTerminalFocus = true; restoreTerminalFocus(); });
 }
 

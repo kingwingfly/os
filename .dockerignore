@@ -15,5 +15,6 @@ web/kernel/*
 !web/kernel/asyncify.js
 !web/kernel/image.js
 !web/kernel/memory.js
+!web/kernel/transform.js
 seed
 tests

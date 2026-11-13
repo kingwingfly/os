@@ -746,7 +746,7 @@ pub async fn route(req: Request, env: &Env) -> worker::Result<Response> {
                 .set("Cross-Origin-Opener-Policy", "same-origin")?;
             response
                 .headers_mut()
-                .set("Cross-Origin-Embedder-Policy", "credentialless")?;
+                .set("Cross-Origin-Embedder-Policy", "require-corp")?;
             return Ok(response);
         }
     }

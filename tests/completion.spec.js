@@ -37,6 +37,27 @@ test('expands the common prefix, cycles the pager, and restores the original tok
   expect(await page.locator('.transcript').innerText()).toBe(transcript);
 });
 
+test('suggestions sit directly below the active command and stay there after scrolling and resizing', async ({ page }) => {
+  const input = page.getByRole('combobox', { name: 'Terminal command' });
+  const check = async () => {
+    const geometry = await page.locator('.terminal-panel:not([hidden])').evaluate(panel => {
+      const log = panel.querySelector('.transcript'), form = panel.querySelector('.command-line'), pager = panel.querySelector('.completion-pager');
+      const l = log.getBoundingClientRect(), f = form.getBoundingClientRect(), p = pager.getBoundingClientRect();
+      return { inline: pager.parentElement === log && form.nextElementSibling === pager, gap: p.top - f.bottom, visible: f.top >= l.top - 1 && p.bottom <= l.bottom + 1 };
+    });
+    expect(geometry.inline).toBe(true); expect(geometry.gap).toBeGreaterThanOrEqual(0); expect(geometry.gap).toBeLessThanOrEqual(8); expect(geometry.visible).toBe(true);
+  };
+  await input.fill('open alp'); await input.press('Tab'); await expect(page.getByRole('option')).toHaveCount(2); await check();
+  await input.press('Escape');
+  await input.fill('/usr/bin/seq 1 60'); await input.press('Enter');
+  await expect(input.locator('xpath=..')).toHaveAttribute('data-state', 'idle', { timeout: 60000 });
+  await input.fill('open alp'); await input.press('Tab'); await expect(page.getByRole('option')).toHaveCount(2);
+  await expect.poll(async () => page.locator('.transcript').evaluate(log => log.scrollTop > 0)).toBe(true); await check();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(async () => input.evaluate(e => { const r = e.getBoundingClientRect(), parent = e.closest('.transcript').getBoundingClientRect(); return r.top >= parent.top - 1; })).toBe(true);
+  await check();
+});
+
 test('completes directories without inserting cd and enters them directly', async ({ page }) => {
   const input = page.getByRole('combobox', { name: 'Terminal command' }), options = page.getByRole('option');
   await input.fill(''); await input.press('Tab');
@@ -101,6 +122,25 @@ test('queues fast Tab presses and discards late listings after editing or moving
   await input.press('End'); await input.press('Tab'); await expect(page.locator('.completion-hint')).toHaveText('No matches');
 });
 
+test('a delayed completion cannot steal focus from another desktop app', async ({ page }) => {
+  const input = page.getByRole('combobox', { name: 'Terminal command' });
+  let release, pending = false;
+  const gate = new Promise(resolve => { release = resolve; });
+  await page.route('**/api/sys', async route => {
+    if (route.request().postData()?.includes('getdents')) { pending = true; await gate; }
+    await route.continue();
+  });
+  try {
+    await input.fill('open a-dir/in'); await input.press('Tab'); await expect.poll(() => pending).toBe(true);
+    await page.evaluate(() => window.os.localMounts());
+    const app = page.locator('#window-mounts'); await app.getByRole('tab', { name: 'Add mount', exact: true }).click();
+    await app.locator('[data-add-form] [name=name]').focus(); release();
+    await expect(input).toHaveValue('open a-dir/inside.txt ');
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    await expect(app).toHaveClass(/window-focused/); await expect(app.locator('[data-add-form] [name=name]')).toBeFocused();
+  } finally { release(); await page.unrouteAll({ behavior: 'wait' }); }
+});
+
 test('ls and explicit external programs complete files without a browser command definition', async ({ page }) => {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   for (const command of ['ls', '/usr/bin/ls', 'sudo ls']) {
@@ -109,5 +149,19 @@ test('ls and explicit external programs complete files without a browser command
     await input.press('Escape');
     await input.fill(command + ' a-d'); await input.press('Tab');
     await expect(input).toHaveValue(command + ' a-dir/');
+  }
+});
+
+test('a wrapped guest prompt keeps the input beside its final symbol in narrow windows', async ({ page }) => {
+  await page.goto('/');
+  const input = page.getByRole('combobox', { name: 'Terminal command' }); await expect(input).toBeVisible();
+  for (const width of [320, 270, 410]) {
+    await page.locator('#window-terminal').evaluate((window, width) => { window.style.minWidth = '0'; window.style.width = width + 'px'; }, width);
+    await expect.poll(() => input.evaluate(input => {
+      const label = input.closest('form').querySelector('.prompt-symbol'), range = document.createRange(); range.selectNodeContents(label);
+      const end = [...range.getClientRects()].at(-1), caret = input.getBoundingClientRect(), form = input.closest('form').getBoundingClientRect();
+      return { sameRow: Math.abs(caret.bottom - end.bottom) < 15, adjacent: caret.left >= end.right && caret.left - end.right < 20, contained: caret.right <= form.right + 1 };
+    })).toEqual({ sameRow: true, adjacent: true, contained: true });
+    await input.fill('ls'); await expect(input).toHaveValue('ls'); await input.fill('');
   }
 });

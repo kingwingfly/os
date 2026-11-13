@@ -114,3 +114,27 @@ test('returning to a directory restores its scroll position and refreshes keep i
   await go(page, base + '/docs'); await expect.poll(position).toBe(0);
   await go(page, base); await expect.poll(position).toBe(parentPosition);
 });
+
+test('Refresh and F5 bypass cached listings without navigation or losing scroll', async ({ page }) => {
+  // Simulate a disconnected watcher: explicit refresh must still fetch fresh data.
+  await page.addInitScript(() => window.addEventListener('os:inotify', event => event.stopImmediatePropagation()));
+  await sys(page.request, Array.from({ length: 60 }, (_, index) => ({ mkdir: { path: base + '/folder-' + String(index).padStart(3, '0'), mode: 0o755 } })));
+  await page.goto('/'); await go(page, base);
+  const scroller = page.locator('.files');
+  await expect(names(page)).toHaveCount(62);
+  await scroller.evaluate(element => { element.scrollTop = 800; });
+  const scroll = await scroller.evaluate(element => element.scrollTop);
+  await page.evaluate(() => { window.refreshTestPage = true; });
+  await mkdirp(page.request, base + '/zz-button');
+  await expect(names(page).filter({ hasText: 'zz-button/' })).toHaveCount(0);
+  await page.locator('#window-files').getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(names(page).filter({ hasText: 'zz-button/' })).toHaveCount(1);
+  await expect(location(page)).toHaveValue(base);
+  await expect.poll(() => scroller.evaluate(element => element.scrollTop)).toBe(scroll);
+  await mkdirp(page.request, base + '/zz-keyboard');
+  await location(page).press('F5');
+  await expect(names(page).filter({ hasText: 'zz-keyboard/' })).toHaveCount(1);
+  expect(await page.evaluate(() => window.refreshTestPage)).toBe(true);
+  await expect(location(page)).toHaveValue(base);
+  await expect.poll(() => scroller.evaluate(element => element.scrollTop)).toBe(scroll);
+});

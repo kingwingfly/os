@@ -284,6 +284,9 @@ pub struct Exec {
     pub login_scope: Option<String>,
     /// The process's token, which it sends as the batch's `proc`, with its `pid`.
     pub token: String,
+    /// Local image metadata is not an image capability or a publisher signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<LocalExecutable>,
     /// The image, as a descriptor of the process's own for a file, or an asset path for /usr.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fd: Option<u32>,
@@ -299,6 +302,29 @@ pub struct Exec {
     pub cgroup: String,
     #[serde(default)]
     pub placement: Placement,
+}
+
+/// A host snapshots and validates local code. The authority admits only the process;
+/// neither these metadata nor its path grant filesystem or image-based privilege.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalExecutable {
+    pub digest: String,
+    pub size: u64,
+    #[serde(default)]
+    pub cloud: bool,
+}
+
+impl LocalExecutable {
+    pub fn valid(&self) -> bool {
+        self.size >= 8
+            && self.size <= EXEC_MAX
+            && self.digest.len() == 64
+            && self
+                .digest
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    }
 }
 
 /// What fork(2)'s registry half gives: the child, and the token its calls carry.
@@ -1093,6 +1119,8 @@ pub enum Call {
     /// credentials and its open descriptors, as Linux's execve does.
     Execve {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        local: Option<LocalExecutable>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pid: Option<u32>,
         /// The token of the process `pid`, which only that process holds: the proof that it
         /// replaces itself.
@@ -1513,6 +1541,7 @@ mod tests {
         assert_eq!(
             call,
             Call::Execve {
+                local: None,
                 runtime: None,
                 pid: None,
                 token: None,

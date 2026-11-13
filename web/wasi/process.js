@@ -1,4 +1,5 @@
 import { releaseId } from '../release.js';
+import { localPath, localFdPath, LOCAL_FD } from '../kernel/workspace.js';
 // A process (owner's design, 2026-10-29: the page is user space, the API its system calls): a
 // program built for wasm32-wasip1, or for WASIX, run in a Worker of its own. Its WASI calls are
 // made here over the kernel's (POST /api/sys, GET /api/file, PUT /api/pwrite), and block, as a
@@ -61,7 +62,7 @@ const STDIO = new Set(['in', 'out', 'pipe-in', 'pipe-out', 'tty', 'pty']);
 // What a file is, as WASI numbers it.
 const CHARACTER_DEVICE = 2, DIRECTORY = 3, REGULAR_FILE = 4, SYMBOLIC_LINK = 7, UNKNOWN = 0;
 // open(2)'s flags, as the kernel takes them (Linux's).
-const O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2, O_CREAT = 0o100, O_EXCL = 0o200, O_TRUNC = 0o1000;
+const O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2, O_CREAT = 0o100, O_EXCL = 0o200, O_TRUNC = 0o1000, O_APPEND = 0o2000;
 const W_OK = 2;
 // path_open's: oflags, fdflags, lookupflags, and the rights a descriptor has.
 const OFLAG_CREAT = 1, OFLAG_DIRECTORY = 2, OFLAG_EXCL = 4, OFLAG_TRUNC = 8, FDFLAG_APPEND = 1, FDFLAG_NONBLOCK = 4, FOLLOW = 1;
@@ -157,6 +158,11 @@ function drive(work) {
 function* batch(calls) {
   const sent = [...calls, ...closing.map(fd => ({ close: { fd } }))];
   closing = [];
+  if (process.localFs && sent.some(call => {
+    if (!call || typeof call !== 'object') return false;
+    const arg = Object.values(call)[0];
+    return arg && (arg.fd >= LOCAL_FD || [arg.path, arg.from, arg.to].some(path => localPath(path) || localFdPath(path) || ['/', '/mnt', '/opt'].includes(path)));
+  })) return hostErrno(host('filesystem', { calls: sent, umask: process.umask })).slice(0, calls.length);
   const body = { calls: sent, umask: process.umask, sudo: process.sudo };
   if (process.pid) body.pid = process.pid;
   if (process.proc) body.proc = process.proc;
@@ -175,7 +181,7 @@ function* stat(path, follow = true) {
   if (allocatedPath(path) || path === '/dev/pts') return hostErrno(host('pty', { op: 'stat', path }));
   if (isTerminal(path)) return { ino: process.pty.number, mode: 0o020620, nlink: 1, size: 0 };
   const key = (follow ? 's:' : 'l:') + path;
-  if (cache.has(key)) return cache.get(key);
+  if (!localPath(path) && cache.has(key)) return cache.get(key);
   const found = yield* call(follow ? { stat: { path } } : { lstat: { path } });
   cache.set(key, found);
   return found;
@@ -336,6 +342,7 @@ function writeFilestat(ptr, found) {
 }
 // What a descriptor's file is now, as fstat says.
 function* fstat(found) {
+  if (found.local) return yield* call({ fstat: { fd: found.kfd } });
   if (found.kind === 'pty') return { ino: found.number, filetype: CHARACTER_DEVICE, mode: 0o020600 };
   if (STDIO.has(found.kind)) return { filetype: filetype(found), mode: found.tty ? 0o020620 : 0o010600 };
   if (found.kind === 'dir') return yield* stat(found.path);
@@ -455,6 +462,11 @@ function writePty(found, data) {
   return total;
 }
 function* readFrom(found, at, count) {
+  if (found.local) {
+    if (!found.read) throw new Errno(EBADF);
+    const result = hostErrno(host('local_read', { fd: found.kfd, offset: at, count: Math.min(INLINE, count) }));
+    found.size = result.size; return unbase64(result.data);
+  }
   if (found.tty && found.readable === false) throw new Errno(EBADF);
   if (found.kind === 'pty') return readPty(found, count);
   if (found.kind === 'dir') throw new Errno(EISDIR);
@@ -503,6 +515,16 @@ function* readFrom(found, at, count) {
 }
 
 function* writeTo(found, at, data) {
+  if (found.local) {
+    if (!found.writable) throw new Errno(EBADF);
+    let written = 0;
+    while (written < data.length) {
+      const chunk = data.subarray(written, written + INLINE);
+      const result = hostErrno(host('local_write', { fd: found.kfd, offset: at + written, append: !!found.append, data: base64(chunk) }));
+      written += result.written; found.size = result.size;
+    }
+    return written;
+  }
   if (found.tty && found.writable === false) throw new Errno(EBADF);
   if (found.kind === 'pty') return writePty(found, data);
   if (found.kind === 'tty' && ttyControl.hungup) throw new Errno(EIO);
@@ -799,6 +821,20 @@ function* openPath(path, dirflags, oflags, base, fdflags, noctty = false, mode =
       if (oflags & OFLAG_DIRECTORY) throw new Errno(ENOTDIR);
       found = terminalFd(1, read, write);
       if (!noctty && path !== '/dev/tty') ttyCall(found, 'open');
+    } else if (process.localFs && localPath(path)) {
+      if (oflags & OFLAG_DIRECTORY) {
+        if (kindOf((yield* stat(path)).mode) !== DIRECTORY) throw new Errno(ENOTDIR);
+        found = { kind: 'dir', path };
+      } else {
+        try {
+          const opened = yield* call({ open: { path, flags: (write ? read ? O_RDWR : O_WRONLY : O_RDONLY) |
+            (oflags & OFLAG_CREAT ? O_CREAT : 0) | (oflags & OFLAG_TRUNC ? O_TRUNC : 0) | (oflags & OFLAG_EXCL ? O_EXCL : 0) | (append ? O_APPEND : 0) } });
+          found = { kind: 'file', local: true, path, kfd: opened.fd, token: opened.token, read, writable: write, pos: 0, size: opened.size, stat: opened.stat };
+        } catch (error) {
+          if (!(error instanceof Errno) || error.errno !== EISDIR || write) throw error;
+          found = { kind: 'dir', path };
+        }
+      }
     } else if (oflags & OFLAG_DIRECTORY) {
       if (kindOf((yield* stat(path, (dirflags & FOLLOW) !== 0)).mode) !== DIRECTORY) throw new Errno(ENOTDIR);
       found = { kind: 'dir', path };
@@ -862,6 +898,9 @@ const wasi = {
   fd_filestat_get: (fd, ptr) => attempt(function* () { return writeFilestat(ptr, (yield* fstat(descriptor(fd)))); }),
   fd_filestat_set_size: (fd, len) => attempt(function* () {
     const found = descriptor(fd), length = Number(len);
+    if (found.local) {
+      yield* call({ ftruncate: { fd: found.kfd, size: length } }); found.size = length; return;
+    }
     if (!found.rewrite && !found.writer) throw new Errno(EINVAL);
     const bytes = found.bytes;
     if (found.writer) {
@@ -920,6 +959,7 @@ const wasi = {
   fd_readdir: (fd, buf, len, cookie, used) => attempt(function* () {
     const found = descriptor(fd);
     if (found.kind !== 'dir') throw new Errno(ENOTDIR);
+    if (process.localFs && localPath(found.path)) { yield* stat(found.path); found.entries = null; }
     if (!found.entries) {
       const listed = found.path === '/dev/pts' ? hostErrno(host('pty', { op: 'list' })).entries : yield* call({ getdents: { path: found.path } });
       for (const entry of listed) {
@@ -966,7 +1006,7 @@ const wasi = {
         view().setBigUint64(ptr, 0n, true);
         return;
       }
-      const base = whence === 0 ? 0 : whence === 1 ? found.pos : size(found);
+      const base = whence === 0 ? 0 : whence === 1 ? found.pos : found.local ? (yield* fstat(found)).size : size(found);
       const pos = base + Number(offset);
       if (pos < 0) throw new Errno(EINVAL);
       found.pos = pos;
@@ -1008,7 +1048,7 @@ const wasi = {
         }
         const at = found.append ? size(found) : found.pos;
         total += yield* writeTo(found, at, data);
-        found.pos = isByteDevice(found.device) ? 0 : at + len;
+        found.pos = isByteDevice(found.device) ? 0 : found.local && found.append ? found.size : at + len;
       }
     }); } catch (error) {
       // writev may have finished earlier vectors before a signal interrupts a
@@ -1451,8 +1491,8 @@ function describe(found) {
     default: {
       if (found.share == null) share(found);
       if (found.share == null) throw new Errno(ERRNO.EMFILE);
-      const { kind, path, kfd, token, device, writable, read, size: length, stat: stated, writer, rewrite, append, chunk, share: slot, refs } = found;
-      return { kind, path, kfd, token, device, writable, read, size: length, stat: stated, writer, rewrite, append, chunk, share: slot, refs, bytes: found.bytes?.transferable };
+      const { kind, local, path, kfd, token, device, writable, read, size: length, stat: stated, writer, rewrite, append, chunk, share: slot, refs } = found;
+      return { kind, local, path, kfd, token, device, writable, read, size: length, stat: stated, writer, rewrite, append, chunk, share: slot, refs, bytes: found.bytes?.transferable };
     }
   }
 }

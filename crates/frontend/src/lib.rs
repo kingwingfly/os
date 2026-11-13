@@ -34,6 +34,8 @@ extern "C" {
     fn sudo() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = chooseFiles)]
     fn choose_files() -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = os, js_name = localMounts)]
+    fn local_mounts() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = uploadFiles)]
     fn upload_files(files: &JsValue, path: &str, progress: &js_sys::Function) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = cancelUploads)]
@@ -294,7 +296,6 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
                 }
                 node_ref=command_input/>
         </form>
-        </div>
         <Show when=move || shell.completion.get().is_some() || !shell.completion_status.get().is_empty()>
             <div class="completion-pager">
                 <p class="completion-hint" role="status">{move || shell.completion.get().map(|s| match s.selected {
@@ -312,6 +313,7 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
                 </div>
             </div>
         </Show>
+        </div>
 
         // The keys a phone's keyboard lacks. Pressing one keeps the focus, and the keyboard, where
         // they are.
@@ -523,10 +525,18 @@ fn App() -> impl IntoView {
         )
         .unwrap();
     dropped_on_files.forget();
-    // Alt+T opens a tab, Alt+W closes it, Alt+1…9 switch; browsers keep Ctrl+T and Ctrl+W.
+    // F5 refreshes the focused Files app. Alt+T opens a tab, Alt+W closes it,
+    // Alt+1…9 switch; browsers keep Ctrl+T and Ctrl+W.
     let keys =
         Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
-            if !e.alt_key() || e.ctrl_key() || e.meta_key() || e.is_composing() {
+            let refresh_files =
+                e.key() == "F5" && !e.alt_key() && desktop.focused.get_untracked() == Some("files");
+            if (!refresh_files && !e.alt_key())
+                || e.default_prevented()
+                || e.ctrl_key()
+                || e.meta_key()
+                || e.is_composing()
+            {
                 return;
             }
             // A modal dialog (a password asked) has the keyboard; windows do not.
@@ -534,6 +544,11 @@ fn App() -> impl IntoView {
                 .and_then(|w| w.document())
                 .and_then(|d| d.query_selector("dialog[open]:modal").ok().flatten());
             if dialog.is_some() {
+                return;
+            }
+            if refresh_files {
+                e.prevent_default();
+                files.reload();
                 return;
             }
             match e.code().as_str() {
@@ -583,13 +598,31 @@ fn App() -> impl IntoView {
     };
     let launch = move |id: &'static str| {
         launcher.set(false);
-        desktop.show(id);
+        if id == "mounts" {
+            let _ = local_mounts();
+        } else {
+            desktop.show(id);
+        }
     };
+    let show_mounts = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| desktop.show("mounts"));
+    window
+        .add_event_listener_with_callback("os-open-mounts", show_mounts.as_ref().unchecked_ref())
+        .unwrap();
+    show_mounts.forget();
+    let browse =
+        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |event: web_sys::CustomEvent| {
+            if let Some(path) = event.detail().as_string() {
+                files.go(path);
+                desktop.show("files");
+            }
+        });
+    window
+        .add_event_listener_with_callback("os-open-directory", browse.as_ref().unchecked_ref())
+        .unwrap();
+    browse.forget();
     view! {
         <main class="desktop">
             <header class="topbar"><div class="wordmark"><span class="signal"></span>{title}<span class="subtitle">{subtitle}</span></div>
-                <a class="session-link" href="/login.html" target="_blank" rel="noopener">"Start session"</a>
-                <button type="button" data-applications aria-haspopup="dialog" aria-controls="applications">"App windows"</button>
                 <button class="lock" on:click=move |_| current.get_untracked().run(if account.writable.get_untracked() { "logout".into() } else { "login".into() })>
                     // Kept to one line: a long name shortens, the action stays.
                     <span class="lock-name">{move || if account.writable.get() { format!("● {}", account.username.get()) } else { "○ guest".into() }}</span>
@@ -632,23 +665,41 @@ fn App() -> impl IntoView {
                 </div>
                 {desktop::handles()}
             </section>
+            <section class="window" id="window-mounts" data-window="mounts" aria-label="Mounts window" tabindex="-1">
+                <div class="window-bar" data-window-bar><span class="window-title"><span class="window-glyph" aria-hidden="true">"▱"</span>"Mounts"</span>{desktop::controls("mounts", "Mounts")}</div>
+                <div id="mount-manager"></div>
+                {desktop::handles()}
+            </section>
             </div>
             <nav class="dock" aria-label="Dock">
+              <div class="dock-launcher-group"
+                on:keydown=move |event: web_sys::KeyboardEvent| {
+                    if event.key() == "Escape" { launcher.set(false); }
+                }
+                on:focusout=move |event: web_sys::FocusEvent| {
+                    let inside = event.current_target().and_then(|node| node.dyn_into::<web_sys::Node>().ok())
+                        .zip(event.related_target().and_then(|node| node.dyn_into::<web_sys::Node>().ok()))
+                        .is_some_and(|(group, target)| group.contains(Some(&target)));
+                    if !inside { launcher.set(false); }
+                }>
                 <button type="button" class="dock-item dock-launcher" aria-label="Applications" title="Applications" aria-expanded=move || launcher.get().to_string() on:click=move |_| launcher.update(|open| *open = !*open)>
                     <span class="dock-icon" aria-hidden="true">"⋮⋮"</span>
                 </button>
-                {dock_item("terminal", "Terminal", ">_")}
-                {dock_item("files", "Files", "▤")}
-                <Show when=move || desktop.windows.with(|w| w.iter().any(|w| w.id == "viewer" && w.open))>{dock_item("viewer", "Preview", "◫")}</Show>
-                <Show when=move || desktop.windows.with(|w| w.iter().any(|w| w.id == "editor" && w.open))>{dock_item("editor", "Editor", "✎")}</Show>
                 <Show when=move || launcher.get()>
                     <div class="launcher" role="menu" aria-label="Applications">
                         <button type="button" role="menuitem" on:click=move |_| launch("terminal")><span aria-hidden="true">">_"</span>"Terminal"</button>
                         <button type="button" role="menuitem" on:click=move |_| launch("files")><span aria-hidden="true">"▤"</span>"Files"</button>
+                        <button type="button" role="menuitem" on:click=move |_| launch("mounts")><span aria-hidden="true">"▱"</span>"Mounts"</button>
                         <button type="button" role="menuitem" on:click=move |_| { launcher.set(false); current.get_untracked().run("man".into()); }><span aria-hidden="true">"?"</span>"Manual"</button>
                         <button type="button" role="menuitem" on:click=move |_| { launcher.set(false); desktop.show("files"); files.choose(); }><span aria-hidden="true">"↑"</span>"Upload files"</button>
                     </div>
                 </Show>
+              </div>
+                {dock_item("terminal", "Terminal", ">_")}
+                {dock_item("files", "Files", "▤")}
+                <Show when=move || desktop.windows.with(|w| w.iter().any(|w| w.id == "mounts" && w.open))>{dock_item("mounts", "Mounts", "▱")}</Show>
+                <Show when=move || desktop.windows.with(|w| w.iter().any(|w| w.id == "viewer" && w.open))>{dock_item("viewer", "Preview", "◫")}</Show>
+                <Show when=move || desktop.windows.with(|w| w.iter().any(|w| w.id == "editor" && w.open))>{dock_item("editor", "Editor", "✎")}</Show>
             </nav>
         </main>
     }

@@ -40,6 +40,32 @@ async fn kernel_sys(body: &str) -> Result<JsValue, JsValue> {
 
 /// The kernel's own protocol version, which the page checks at start.
 pub const VERSION: &str = "1";
+
+#[wasm_bindgen]
+pub fn vfs_policy(input: &str) -> String {
+    kernel::mount_policy::json_request(input)
+}
+
+/// Local validation only. This does not verify an operator signature, activate a
+/// system generation, or confer credentials described by package metadata.
+#[wasm_bindgen]
+pub fn private_extension(manifests: &str) -> Result<String, JsValue> {
+    let validate = || -> image::Result<String> {
+        let texts: Vec<String> = image::parse(manifests.as_bytes())?;
+        let images: Vec<_> = texts
+            .iter()
+            .map(|text| image::Image::parse(text.as_bytes()))
+            .collect::<image::Result<_>>()?;
+        let composition = image::Composition::private(&images)?;
+        let aliases = composition
+            .entries
+            .keys()
+            .map(|path| Ok((path.clone(), composition.resolve(path)?)))
+            .collect::<image::Result<std::collections::BTreeMap<_, _>>>()?;
+        Ok(json!({"entries": composition.entries, "resolved": aliases}).to_string())
+    };
+    validate().map_err(|error| JsValue::from_str(&error.to_string()))
+}
 /// How many pids the kernel asks to be lent at a time, for its forks.
 const LEND: u32 = 8;
 /// Linux's init.
@@ -210,6 +236,7 @@ impl Kernel {
     pub async fn reexec(
         &self,
         pid: u32,
+        local: &str,
         path: &str,
         argv: &str,
         env: &str,
@@ -219,6 +246,7 @@ impl Kernel {
     ) -> Result<String, JsValue> {
         let token = self.token(pid, host)?;
         let call = Call::Execve {
+            local: parse(local, "local executable")?,
             runtime: Some("resources-v1".into()),
             pid: Some(pid),
             token: Some(token),
@@ -793,6 +821,7 @@ impl Kernel {
             .map(|stage| {
                 let cgroup = stage["cgroup"].as_str().unwrap_or_default();
                 Ok(Call::Execve {
+                    local: from_value(stage["local"].clone(), "local executable")?,
                     runtime: Some("resources-v1".into()),
                     pid: None,
                     token: None,

@@ -61,6 +61,19 @@ pub fn files() -> Option<Files> {
 }
 
 impl Files {
+    fn local_mounts(self) {
+        let chosen = crate::local_mounts();
+        spawn_local(async move {
+            match JsFuture::from(chosen).await {
+                Ok(path) => {
+                    if let Some(path) = path.as_string() {
+                        self.go(path);
+                    }
+                }
+                Err(error) => self.notice.set(js_message(error)),
+            }
+        });
+    }
     /// The Files app, in the directory it was in, or at `start`.
     pub fn new(
         account: Account,
@@ -134,6 +147,17 @@ impl Files {
             }
             self.show(path, listed);
         });
+    }
+    /// Explicit user refresh bypasses cached directory metadata without navigating.
+    /// Both the view button and its keyboard shortcut use this controller action.
+    pub fn reload(self) {
+        if self.navigating.get_untracked() {
+            return;
+        }
+        super::sys::forget(false);
+        self.typed.set(None);
+        self.notice.set(String::new());
+        self.refresh();
     }
     /// Show the directory `path`, listed.
     fn show(self, path: String, listed: Result<Vec<Entry>, String>) {
@@ -342,7 +366,9 @@ pub fn view(files: Files) -> impl IntoView {
                     }
                 }
                 on:blur=move |_| files.typed.set(None)/>
-            <button on:click=move |_| files.choose() disabled=move || files.uploading.get() || files.navigating.get()>"↑ Upload files"</button>
+            <div class="directory-actions" role="group" aria-label="Filesystem actions"><button type="button" class="files-refresh" title="Refresh (F5)" aria-label="Refresh" aria-keyshortcuts="F5" on:click=move |_| files.reload() disabled=move || files.navigating.get()><span aria-hidden="true">"↻"</span></button>
+            <button class="files-upload" title="Upload" aria-label="Upload" on:click=move |_| files.choose() disabled=move || files.uploading.get() || files.navigating.get()><span aria-hidden="true">"↑"</span></button>
+            <button type="button" class="files-mounts" aria-label="Mounts" title="Mount and manage filesystems" on:click=move |_| files.local_mounts()><span aria-hidden="true">"▱"</span></button></div>
         </div>
         <p class="file-notice" role="status">{move || files.notice.get()}</p>
         <Show when=move || !files.progress.get().is_empty()>

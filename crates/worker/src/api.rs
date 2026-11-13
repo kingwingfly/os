@@ -103,6 +103,7 @@ fn process_caller(
         .credential(token, &ns)
         .ok_or_else(|| abi::Error::because(abi::Errno::EPERM, "not this browser's process"))?;
     crate::system::select(db, credential.generation.as_deref())?;
+    credential.cloud()?;
     Ok(Some(credential))
 }
 pub fn denied(message: &str, who: &Identity) -> Reply {

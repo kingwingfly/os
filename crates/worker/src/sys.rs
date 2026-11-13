@@ -104,6 +104,23 @@ pub async fn handle(
             results.extend(crate::machine::forward(env, state, &session, cookie, registry).await?);
             continue;
         }
+        // Local process credentials carry an explicit cloud delegation. Keep this gate
+        // before byte transfers and asynchronous device routes as well as ordinary calls.
+        if session.token.is_some() && !matches!(call, Call::Getcreds | Call::Close { .. }) {
+            let checking = session.clone();
+            let allowed = transact(state, move |db| {
+                (
+                    checking.of(db).and_then(|acting| {
+                        acting.credential.as_ref().map_or(Ok(()), Credential::cloud)
+                    }),
+                    false,
+                )
+            })?;
+            if let Err(error) = allowed {
+                results.push(Return::Err(error));
+                continue;
+            }
+        }
         if let Err(error) = resolve(&mut call, &results) {
             results.push(Return::Err(error));
             continue;

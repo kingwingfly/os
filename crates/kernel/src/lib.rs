@@ -8,6 +8,7 @@
 pub mod init;
 pub mod lifecycle;
 pub mod login;
+pub mod mount_policy;
 mod namei;
 pub mod registry;
 pub mod resource;
