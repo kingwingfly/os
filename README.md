@@ -1029,7 +1029,7 @@ only a file-changing request whose acknowledgment was lost reports an uncertain 
 
 ## Roadmap
 
-[#20](https://github.com/kingwingfly/os/issues/20) tracks delivery. Phases 0–6 and #40 delivered the existing runtime foundation. Phase 8 is implemented in open [PR #45](https://github.com/kingwingfly/os/pull/45); it does not complete the architecture refactor.
+[#20](https://github.com/kingwingfly/os/issues/20) tracks delivery. Phases 0–6 and #40 delivered the existing runtime foundation. Phase 8 is implemented in [PR #45](https://github.com/kingwingfly/os/pull/45); it does not complete the architecture refactor.
 
 **[#44](https://github.com/kingwingfly/os/issues/44) is the blocking refactor before the remaining feature phases.** Deliver L0 → L1 → L2 → L3 → L4 → L5 → L6 in dependent PRs. Phase 7's compositor/application work belongs to L5–L6. Start Phase 9 only after all #44 acceptance gates pass. Documentation, verification and fixes needed for those gates continue throughout the refactor.
 

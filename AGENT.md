@@ -7,7 +7,7 @@ This file is deliberately named `AGENT.md`. Read it with [README.md](README.md) 
 - [#44](https://github.com/kingwingfly/os/issues/44) is the required architecture refactor before remaining feature phases. Deliver L0 → L1 → L2 → L3 → L4 → L5 → L6 in dependent PRs; Phase 7 GUI work is included in L5–L6. Phase 9 starts only after every #44 gate passes. Documentation, verification and necessary fixes continue throughout.
 - Start with L0's supported-behavior matrix, versioned local/remote contracts, migration plan and runnable Linux reference harness. L1 then implements stable filesystem/inode identity and durable metadata. None of these milestones is implemented by the documentation update.
 - [#20](https://github.com/kingwingfly/os/issues/20) is the delivery roadmap. [PR #45](https://github.com/kingwingfly/os/pull/45), `feat/phase-8-local-mounts` → `dev`, publishes implemented Phase 8 local execution/mounts/private extensions/account-based exports and UI fixes. It does not close #20 or #44.
-- The documentation request authorizes synchronization of these docs and open issue/PR descriptions. It does not authorize merging, production deployment or claiming the runtime refactor complete. Preserve unrelated `.worktrees/` and the existing local demo/data.
+- Keep merge and production deployment separate; merging the Phase 8 baseline does not complete #44. Follow the owner's current instructions for publication and deployment. Preserve unrelated `.worktrees/` and the existing local demo/data.
 
 ## Architecture contract
 
