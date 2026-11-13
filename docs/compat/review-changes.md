@@ -1,45 +1,31 @@
 # PR #66 review measurement changes
 
-Compared with the original PR baseline at `46afafe`. No runtime behavior was fixed. 20 rows changed their normalized trace, and 10 additional rows changed classification only. The revised matrix has 135 rows: 19 matching filesystem traces, 101 filesystem differences/skips, and 15 process observations.
+Compared with commit `2455e96`, the commit reviewed in this round. No runtime semantics were changed. **15 rows changed normalized traces and two additional rows changed comparison results only.** The matrix contains 135 rows: **16 matching filesystem traces, 104 differences/skips, and 15 process observations**.
 
-Path identities now use ABI Stat; absent device/inode fields are unavailable. Retained-fd identity uses separate device/inode observations and rejects Preview 1's constant device value and zero-inode fallback. Native startup details moved to environmental evidence; OS startup records source-launch flags rather than silently assuming them. Filesystem improvements are not implied by these measurement corrections.
+The new results remove five unsupported matches (four single-account creation rows and cloud two-accounts). Two retained-file rows now match on observable fields; their raw unavailable device identity remains visible. These are measurement corrections, not runtime improvements or regressions.
 
-| Row | Changed steps | Classification |
+| Row | Changed evidence | Result before → after |
 | --- | --- | --- |
-| cloud/open-rename | Linux: identity; OS: identity | same → difference/skip |
-| cloud/open-unlink | Linux: identity; OS: identity | difference/skip → difference/skip |
-| cloud/hard-link | OS: identity | same → difference/skip |
-| cloud/startup | Linux: ownership, pid1, unavailable; OS: ownership | difference/skip → observational |
-| browser-storage/alias | OS: identity | difference/skip → difference/skip |
-| browser-storage/open-rename | Linux: identity; OS: identity | difference/skip → difference/skip |
-| browser-storage/open-unlink | Linux: identity; OS: identity | difference/skip → difference/skip |
-| browser-storage/startup | Linux: ownership, pid1, unavailable; OS: ownership | difference/skip → observational |
-| directory-handle/alias | OS: identity | difference/skip → difference/skip |
-| directory-handle/open-rename | Linux: identity; OS: identity | difference/skip → difference/skip |
-| directory-handle/open-unlink | Linux: identity; OS: identity | difference/skip → difference/skip |
-| directory-handle/startup | Linux: ownership, pid1, unavailable; OS: ownership | difference/skip → observational |
-| local-helper/alias | OS: identity | difference/skip → difference/skip |
-| local-helper/open-rename | Linux: identity; OS: identity | same → difference/skip |
-| local-helper/open-unlink | Linux: identity; OS: identity | difference/skip → difference/skip |
-| local-helper/startup | Linux: ownership, pid1, unavailable; OS: ownership | difference/skip → observational |
-| relay/alias | OS: identity | difference/skip → difference/skip |
-| relay/open-rename | Linux: identity | difference/skip → difference/skip |
-| relay/open-unlink | Linux: identity | difference/skip → difference/skip |
-| relay/startup | Linux: ownership, pid1, unavailable; OS: ownership | difference/skip → observational |
+| cloud/open-rename | Comparison only: exclude unobservable fd st_dev; retain raw evidence and compare inode/calls/errors. | difference/skip → same |
+| cloud/creation | Stat directory mode/group; explicitly skip inheritance when creator group equals directory group. | same → difference/skip |
+| cloud/two-accounts | Measure directory mode/group, supplementary groups and inheritance; native A now uses a distinct directory group; OS A inheritance is unavailable. | same → difference/skip |
+| cloud/startup | Replace source-text flags with live init/login lease ownership and a real managed supervisor. | observation → observation |
+| browser-storage/creation | Stat directory mode/group; explicitly skip inheritance when creator group equals directory group. | same → difference/skip |
+| browser-storage/two-accounts | Measure directory mode/group, supplementary groups and inheritance; native A now uses a distinct directory group; OS A inheritance is unavailable. | difference/skip → difference/skip |
+| browser-storage/startup | Replace source-text flags with live init/login lease ownership and a real managed supervisor. | observation → observation |
+| directory-handle/creation | Stat directory mode/group; explicitly skip inheritance when creator group equals directory group. | same → difference/skip |
+| directory-handle/two-accounts | Measure directory mode/group, supplementary groups and inheritance; native A now uses a distinct directory group; OS A inheritance is unavailable. | difference/skip → difference/skip |
+| directory-handle/startup | Replace source-text flags with live init/login lease ownership and a real managed supervisor. | observation → observation |
+| local-helper/open-rename | Comparison only: exclude unobservable fd st_dev; retain raw evidence and compare inode/calls/errors. | difference/skip → same |
+| local-helper/creation | Stat directory mode/group; explicitly skip inheritance when creator group equals directory group. | same → difference/skip |
+| local-helper/two-accounts | Measure directory mode/group, supplementary groups and inheritance; native A now uses a distinct directory group; OS A inheritance is unavailable. | difference/skip → difference/skip |
+| local-helper/startup | Replace source-text flags with live init/login lease ownership and a real managed supervisor. | observation → observation |
+| relay/creation | Stat directory mode/group; explicitly skip inheritance when creator group equals directory group. | difference/skip → difference/skip |
+| relay/two-accounts | Measure directory mode/group, supplementary groups and inheritance; native A now uses a distinct directory group; OS A inheritance is unavailable. | difference/skip → difference/skip |
+| relay/startup | Replace source-text flags with live init/login lease ownership and a real managed supervisor. | observation → observation |
 
-These rows have unchanged observations but no comparable native GUI/browser fixture, so they are tracked as observations rather than permanent Linux differences:
+All other normalized row results are unchanged. Held-unmount rows are stored with append order instead of positional insertion; comparison has always sorted steps, so that storage-order cleanup is not a result change. All retained-fd rows now label the device comparison limit in the table, including rows that still differ on inode or I/O behavior.
 
-| Row | Changed steps | Classification |
-| --- | --- | --- |
-| cloud/gui-processes | Trace unchanged; classification corrected | difference/skip → observational |
-| cloud/tab-pids | Trace unchanged; classification corrected | difference/skip → observational |
-| browser-storage/gui-processes | Trace unchanged; classification corrected | difference/skip → observational |
-| browser-storage/tab-pids | Trace unchanged; classification corrected | difference/skip → observational |
-| directory-handle/gui-processes | Trace unchanged; classification corrected | difference/skip → observational |
-| directory-handle/tab-pids | Trace unchanged; classification corrected | difference/skip → observational |
-| local-helper/gui-processes | Trace unchanged; classification corrected | difference/skip → observational |
-| local-helper/tab-pids | Trace unchanged; classification corrected | difference/skip → observational |
-| relay/gui-processes | Trace unchanged; classification corrected | difference/skip → observational |
-| relay/tab-pids | Trace unchanged; classification corrected | difference/skip → observational |
+Linux partial mappings, denied supplementary-group clearing, the no-namespace fallback and symlinked TMPDIR are covered by the explicit native regression gate. They do not change this host’s fully mapped reference profile.
 
-All Linux cold/warm timings were regenerated with a release probe instead of debug; all OS timings were rerun. `linux-evidence.json` now holds host startup facts/errors. Both evidence files record the measured checkout HEAD and dirty flag, and the OS runner rebuilds web assets before measuring.
+The recorded target runs name source commit `e9b6529`; the dirty flag is true because generated docs/compat artifacts were being replaced. Harness/runtime sources were committed before those runs. Timings are separate and are not used for equality.

@@ -6,8 +6,8 @@
   "node": "v26.13.0",
   "platform": "Linux 7.2.14-arch1-1 x86_64 GNU/Linux",
   "revision": {
-    "dirty": false,
-    "head": "a8a817a63d0603f4a207175622e2322bd313f7db"
+    "dirty": true,
+    "head": "e9b6529278c72e32e0215dd2caad00c1fd90918c"
   },
   "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "startup": {

@@ -437,6 +437,15 @@
       "step": "setgid"
     },
     {
+      "call": "stat(shared directory)",
+      "case": "creation",
+      "ok": {
+        "group_is_caller": true,
+        "mode": "2770"
+      },
+      "step": "directory"
+    },
+    {
       "call": "setfacl(default, shared)",
       "case": "creation",
       "ok": null,
@@ -476,6 +485,12 @@
         "users": {}
       },
       "step": "acl"
+    },
+    {
+      "call": "compare creator, directory and file groups",
+      "case": "creation",
+      "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+      "step": "inheritance"
     },
     {
       "call": "symlink(provider/target, cloud/link)",
@@ -624,6 +639,23 @@
       "step": "chroot"
     },
     {
+      "call": "stat(shared directory)",
+      "case": "two-accounts",
+      "ok": {
+        "group_is_caller": false,
+        "mode": "2777"
+      },
+      "step": "a-directory"
+    },
+    {
+      "call": "inspect supplementary groups excluding primary",
+      "case": "two-accounts",
+      "ok": {
+        "empty": true
+      },
+      "step": "a-groups"
+    },
+    {
       "call": "umask(027); create(shared/file, 0666)",
       "case": "two-accounts",
       "ok": null,
@@ -633,7 +665,7 @@
       "call": "stat(created)",
       "case": "two-accounts",
       "ok": {
-        "group_is_caller": true,
+        "group_is_caller": false,
         "group_is_parent": true,
         "mode": "0640",
         "nlink": 1,
@@ -657,6 +689,32 @@
         "users": {}
       },
       "step": "a-acl"
+    },
+    {
+      "call": "compare creator, directory and file groups",
+      "case": "two-accounts",
+      "ok": {
+        "group_is_caller": false,
+        "group_is_parent": true
+      },
+      "step": "a-inheritance"
+    },
+    {
+      "call": "stat(shared directory)",
+      "case": "two-accounts",
+      "ok": {
+        "group_is_caller": false,
+        "mode": "2777"
+      },
+      "step": "b-directory"
+    },
+    {
+      "call": "inspect supplementary groups excluding primary",
+      "case": "two-accounts",
+      "ok": {
+        "empty": true
+      },
+      "step": "b-groups"
     },
     {
       "call": "umask(027); create(shared/file, 0666)",
@@ -692,6 +750,15 @@
         "users": {}
       },
       "step": "b-acl"
+    },
+    {
+      "call": "compare creator, directory and file groups",
+      "case": "two-accounts",
+      "ok": {
+        "group_is_caller": false,
+        "group_is_parent": true
+      },
+      "step": "b-inheritance"
     },
     {
       "call": "startup",
@@ -1142,6 +1209,15 @@
         "step": "setgid"
       },
       {
+        "call": "stat(shared directory)",
+        "case": "creation",
+        "ok": {
+          "group_is_caller": true,
+          "mode": "2770"
+        },
+        "step": "directory"
+      },
+      {
         "call": "setfacl(default, shared)",
         "case": "creation",
         "ok": null,
@@ -1181,6 +1257,12 @@
           "users": {}
         },
         "step": "acl"
+      },
+      {
+        "call": "compare creator, directory and file groups",
+        "case": "creation",
+        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "step": "inheritance"
       },
       {
         "call": "symlink(provider/target, cloud/link)",
@@ -1251,12 +1333,6 @@
         "step": "create"
       },
       {
-        "call": "umount(mount)",
-        "case": "unmount-open",
-        "ok": null,
-        "step": "unmount"
-      },
-      {
         "call": "pread(fd) after umount",
         "case": "unmount-open",
         "errno": "EBADF",
@@ -1267,6 +1343,12 @@
         "case": "unmount-open",
         "errno": "EBADF",
         "step": "fstat"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-open",
+        "ok": null,
+        "step": "unmount"
       },
       {
         "call": "write(file)",
@@ -1281,12 +1363,6 @@
         "step": "chdir"
       },
       {
-        "call": "umount(mount)",
-        "case": "unmount-cwd",
-        "ok": null,
-        "step": "unmount"
-      },
-      {
         "call": "getcwd() after umount",
         "case": "unmount-cwd",
         "ok": "$ROOT",
@@ -1297,6 +1373,12 @@
         "case": "unmount-cwd",
         "ok": null,
         "step": "restore"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-cwd",
+        "ok": null,
+        "step": "unmount"
       },
       {
         "call": "mount-api",
@@ -1315,6 +1397,23 @@
         "case": "chroot-api",
         "skipped": "not implemented: absent from abi::Call",
         "step": "unavailable"
+      },
+      {
+        "call": "stat(shared directory)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": true,
+          "mode": "2777"
+        },
+        "step": "a-directory"
+      },
+      {
+        "call": "inspect supplementary groups excluding primary",
+        "case": "two-accounts",
+        "ok": {
+          "empty": false
+        },
+        "step": "a-groups"
       },
       {
         "call": "umask(027); create(shared/file, 0666)",
@@ -1352,6 +1451,29 @@
         "step": "a-acl"
       },
       {
+        "call": "compare creator, directory and file groups",
+        "case": "two-accounts",
+        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "step": "a-inheritance"
+      },
+      {
+        "call": "stat(shared directory)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "mode": "2777"
+        },
+        "step": "b-directory"
+      },
+      {
+        "call": "inspect supplementary groups excluding primary",
+        "case": "two-accounts",
+        "ok": {
+          "empty": false
+        },
+        "step": "b-groups"
+      },
+      {
         "call": "umask(027); create(shared/file, 0666)",
         "case": "two-accounts",
         "errno": "EACCES",
@@ -1387,6 +1509,15 @@
         "step": "b-acl"
       },
       {
+        "call": "compare creator, directory and file groups",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
+        "step": "b-inheritance"
+      },
+      {
         "call": "read /proc/1/cmdline",
         "case": "startup",
         "ok": {
@@ -1395,17 +1526,16 @@
         "step": "pid1"
       },
       {
-        "call": "inspect PID 1 and service launch owner",
+        "call": "inspect live init lease, login lease and managed supervisor",
         "case": "startup",
         "ok": {
-          "evidence": "web/kernel/client.js: boot() creates InitReaper and LoginStartup; window.os.machineInit().reaper.state",
-          "owner": "browser host/session",
+          "init_owner_is_current_host": true,
+          "login_owner_is_current_host": true,
           "reaper": "running",
           "role": "init-reaper",
-          "source_launches": {
-            "init": true,
-            "services": true
-          }
+          "service_host_is_login_owner": true,
+          "supervisor_parent_is_pid1": true,
+          "supervisor_path": "/usr/bin/supervise"
         },
         "step": "ownership"
       },
@@ -1840,6 +1970,15 @@
         "step": "setgid"
       },
       {
+        "call": "stat(shared directory)",
+        "case": "creation",
+        "ok": {
+          "group_is_caller": true,
+          "mode": "2770"
+        },
+        "step": "directory"
+      },
+      {
         "call": "setfacl(default, shared)",
         "case": "creation",
         "ok": null,
@@ -1879,6 +2018,12 @@
           "users": {}
         },
         "step": "acl"
+      },
+      {
+        "call": "compare creator, directory and file groups",
+        "case": "creation",
+        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "step": "inheritance"
       },
       {
         "call": "alias",
@@ -1941,6 +2086,23 @@
         "step": "unavailable"
       },
       {
+        "call": "stat(shared directory)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": true,
+          "mode": "2777"
+        },
+        "step": "a-directory"
+      },
+      {
+        "call": "inspect supplementary groups excluding primary",
+        "case": "two-accounts",
+        "ok": {
+          "empty": false
+        },
+        "step": "a-groups"
+      },
+      {
         "call": "umask(027); create(shared/file, 0666)",
         "case": "two-accounts",
         "ok": null,
@@ -1974,6 +2136,29 @@
           "users": {}
         },
         "step": "a-acl"
+      },
+      {
+        "call": "compare creator, directory and file groups",
+        "case": "two-accounts",
+        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "step": "a-inheritance"
+      },
+      {
+        "call": "stat(shared directory)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "mode": "2777"
+        },
+        "step": "b-directory"
+      },
+      {
+        "call": "inspect supplementary groups excluding primary",
+        "case": "two-accounts",
+        "ok": {
+          "empty": false
+        },
+        "step": "b-groups"
       },
       {
         "call": "umask(027); create(shared/file, 0666)",
@@ -2011,6 +2196,15 @@
         "step": "b-acl"
       },
       {
+        "call": "compare creator, directory and file groups",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
+        "step": "b-inheritance"
+      },
+      {
         "call": "read /proc/1/cmdline",
         "case": "startup",
         "ok": {
@@ -2019,17 +2213,16 @@
         "step": "pid1"
       },
       {
-        "call": "inspect PID 1 and service launch owner",
+        "call": "inspect live init lease, login lease and managed supervisor",
         "case": "startup",
         "ok": {
-          "evidence": "web/kernel/client.js: boot() creates InitReaper and LoginStartup; window.os.machineInit().reaper.state",
-          "owner": "browser host/session",
+          "init_owner_is_current_host": true,
+          "login_owner_is_current_host": true,
           "reaper": "running",
           "role": "init-reaper",
-          "source_launches": {
-            "init": true,
-            "services": true
-          }
+          "service_host_is_login_owner": true,
+          "supervisor_parent_is_pid1": true,
+          "supervisor_path": "/usr/bin/supervise"
         },
         "step": "ownership"
       },
@@ -2514,6 +2707,15 @@
         "step": "setgid"
       },
       {
+        "call": "stat(shared directory)",
+        "case": "creation",
+        "ok": {
+          "group_is_caller": true,
+          "mode": "2770"
+        },
+        "step": "directory"
+      },
+      {
         "call": "setfacl(default, shared)",
         "case": "creation",
         "ok": null,
@@ -2553,6 +2755,12 @@
           "users": {}
         },
         "step": "acl"
+      },
+      {
+        "call": "compare creator, directory and file groups",
+        "case": "creation",
+        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "step": "inheritance"
       },
       {
         "call": "symlink(provider/target, cloud/link)",
@@ -2623,12 +2831,6 @@
         "step": "create"
       },
       {
-        "call": "umount(mount)",
-        "case": "unmount-open",
-        "ok": null,
-        "step": "unmount"
-      },
-      {
         "call": "pread(fd) after umount",
         "case": "unmount-open",
         "errno": "EBADF",
@@ -2639,6 +2841,12 @@
         "case": "unmount-open",
         "errno": "EBADF",
         "step": "fstat"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-open",
+        "ok": null,
+        "step": "unmount"
       },
       {
         "call": "write(file)",
@@ -2653,12 +2861,6 @@
         "step": "chdir"
       },
       {
-        "call": "umount(mount)",
-        "case": "unmount-cwd",
-        "ok": null,
-        "step": "unmount"
-      },
-      {
         "call": "getcwd() after umount",
         "case": "unmount-cwd",
         "ok": "$ROOT",
@@ -2669,6 +2871,12 @@
         "case": "unmount-cwd",
         "ok": null,
         "step": "restore"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-cwd",
+        "ok": null,
+        "step": "unmount"
       },
       {
         "call": "mount-api",
@@ -2687,6 +2895,23 @@
         "case": "chroot-api",
         "skipped": "not implemented: absent from abi::Call",
         "step": "unavailable"
+      },
+      {
+        "call": "stat(shared directory)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": true,
+          "mode": "2777"
+        },
+        "step": "a-directory"
+      },
+      {
+        "call": "inspect supplementary groups excluding primary",
+        "case": "two-accounts",
+        "ok": {
+          "empty": false
+        },
+        "step": "a-groups"
       },
       {
         "call": "umask(027); create(shared/file, 0666)",
@@ -2724,6 +2949,29 @@
         "step": "a-acl"
       },
       {
+        "call": "compare creator, directory and file groups",
+        "case": "two-accounts",
+        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "step": "a-inheritance"
+      },
+      {
+        "call": "stat(shared directory)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "mode": "2777"
+        },
+        "step": "b-directory"
+      },
+      {
+        "call": "inspect supplementary groups excluding primary",
+        "case": "two-accounts",
+        "ok": {
+          "empty": false
+        },
+        "step": "b-groups"
+      },
+      {
         "call": "umask(027); create(shared/file, 0666)",
         "case": "two-accounts",
         "errno": "EACCES",
@@ -2759,6 +3007,15 @@
         "step": "b-acl"
       },
       {
+        "call": "compare creator, directory and file groups",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
+        "step": "b-inheritance"
+      },
+      {
         "call": "read /proc/1/cmdline",
         "case": "startup",
         "ok": {
@@ -2767,17 +3024,16 @@
         "step": "pid1"
       },
       {
-        "call": "inspect PID 1 and service launch owner",
+        "call": "inspect live init lease, login lease and managed supervisor",
         "case": "startup",
         "ok": {
-          "evidence": "web/kernel/client.js: boot() creates InitReaper and LoginStartup; window.os.machineInit().reaper.state",
-          "owner": "browser host/session",
+          "init_owner_is_current_host": true,
+          "login_owner_is_current_host": true,
           "reaper": "running",
           "role": "init-reaper",
-          "source_launches": {
-            "init": true,
-            "services": true
-          }
+          "service_host_is_login_owner": true,
+          "supervisor_parent_is_pid1": true,
+          "supervisor_path": "/usr/bin/supervise"
         },
         "step": "ownership"
       },
@@ -3262,6 +3518,15 @@
         "step": "setgid"
       },
       {
+        "call": "stat(shared directory)",
+        "case": "creation",
+        "ok": {
+          "group_is_caller": true,
+          "mode": "2770"
+        },
+        "step": "directory"
+      },
+      {
         "call": "setfacl(default, shared)",
         "case": "creation",
         "ok": null,
@@ -3301,6 +3566,12 @@
           "users": {}
         },
         "step": "acl"
+      },
+      {
+        "call": "compare creator, directory and file groups",
+        "case": "creation",
+        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "step": "inheritance"
       },
       {
         "call": "symlink(provider/target, cloud/link)",
@@ -3371,12 +3642,6 @@
         "step": "create"
       },
       {
-        "call": "umount(mount)",
-        "case": "unmount-open",
-        "ok": null,
-        "step": "unmount"
-      },
-      {
         "call": "pread(fd) after umount",
         "case": "unmount-open",
         "errno": "EBADF",
@@ -3387,6 +3652,12 @@
         "case": "unmount-open",
         "errno": "EBADF",
         "step": "fstat"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-open",
+        "ok": null,
+        "step": "unmount"
       },
       {
         "call": "write(file)",
@@ -3401,12 +3672,6 @@
         "step": "chdir"
       },
       {
-        "call": "umount(mount)",
-        "case": "unmount-cwd",
-        "ok": null,
-        "step": "unmount"
-      },
-      {
         "call": "getcwd() after umount",
         "case": "unmount-cwd",
         "ok": "$ROOT",
@@ -3417,6 +3682,12 @@
         "case": "unmount-cwd",
         "ok": null,
         "step": "restore"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-cwd",
+        "ok": null,
+        "step": "unmount"
       },
       {
         "call": "mount-api",
@@ -3435,6 +3706,23 @@
         "case": "chroot-api",
         "skipped": "not implemented: absent from abi::Call",
         "step": "unavailable"
+      },
+      {
+        "call": "stat(shared directory)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": true,
+          "mode": "2777"
+        },
+        "step": "a-directory"
+      },
+      {
+        "call": "inspect supplementary groups excluding primary",
+        "case": "two-accounts",
+        "ok": {
+          "empty": false
+        },
+        "step": "a-groups"
       },
       {
         "call": "umask(027); create(shared/file, 0666)",
@@ -3472,6 +3760,29 @@
         "step": "a-acl"
       },
       {
+        "call": "compare creator, directory and file groups",
+        "case": "two-accounts",
+        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "step": "a-inheritance"
+      },
+      {
+        "call": "stat(shared directory)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "mode": "2777"
+        },
+        "step": "b-directory"
+      },
+      {
+        "call": "inspect supplementary groups excluding primary",
+        "case": "two-accounts",
+        "ok": {
+          "empty": false
+        },
+        "step": "b-groups"
+      },
+      {
         "call": "umask(027); create(shared/file, 0666)",
         "case": "two-accounts",
         "errno": "EACCES",
@@ -3507,6 +3818,15 @@
         "step": "b-acl"
       },
       {
+        "call": "compare creator, directory and file groups",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
+        "step": "b-inheritance"
+      },
+      {
         "call": "read /proc/1/cmdline",
         "case": "startup",
         "ok": {
@@ -3515,17 +3835,16 @@
         "step": "pid1"
       },
       {
-        "call": "inspect PID 1 and service launch owner",
+        "call": "inspect live init lease, login lease and managed supervisor",
         "case": "startup",
         "ok": {
-          "evidence": "web/kernel/client.js: boot() creates InitReaper and LoginStartup; window.os.machineInit().reaper.state",
-          "owner": "browser host/session",
+          "init_owner_is_current_host": true,
+          "login_owner_is_current_host": true,
           "reaper": "running",
           "role": "init-reaper",
-          "source_launches": {
-            "init": true,
-            "services": true
-          }
+          "service_host_is_login_owner": true,
+          "supervisor_parent_is_pid1": true,
+          "supervisor_path": "/usr/bin/supervise"
         },
         "step": "ownership"
       },
@@ -3994,6 +4313,15 @@
         "step": "setgid"
       },
       {
+        "call": "stat(shared directory)",
+        "case": "creation",
+        "ok": {
+          "group_is_caller": true,
+          "mode": "0700"
+        },
+        "step": "directory"
+      },
+      {
         "call": "setfacl(default, shared)",
         "case": "creation",
         "errno": "EPERM",
@@ -4024,6 +4352,12 @@
         "case": "creation",
         "ok": null,
         "step": "acl"
+      },
+      {
+        "call": "compare creator, directory and file groups",
+        "case": "creation",
+        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "step": "inheritance"
       },
       {
         "call": "symlink(provider/target, cloud/link)",
@@ -4094,12 +4428,6 @@
         "step": "create"
       },
       {
-        "call": "umount(mount)",
-        "case": "unmount-open",
-        "ok": null,
-        "step": "unmount"
-      },
-      {
         "call": "pread(fd) after umount",
         "case": "unmount-open",
         "errno": "EBADF",
@@ -4110,6 +4438,12 @@
         "case": "unmount-open",
         "errno": "EBADF",
         "step": "fstat"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-open",
+        "ok": null,
+        "step": "unmount"
       },
       {
         "call": "write(file)",
@@ -4124,12 +4458,6 @@
         "step": "chdir"
       },
       {
-        "call": "umount(mount)",
-        "case": "unmount-cwd",
-        "ok": null,
-        "step": "unmount"
-      },
-      {
         "call": "getcwd() after umount",
         "case": "unmount-cwd",
         "ok": "$ROOT",
@@ -4140,6 +4468,12 @@
         "case": "unmount-cwd",
         "ok": null,
         "step": "restore"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-cwd",
+        "ok": null,
+        "step": "unmount"
       },
       {
         "call": "mount-api",
@@ -4158,6 +4492,23 @@
         "case": "chroot-api",
         "skipped": "not implemented: absent from abi::Call",
         "step": "unavailable"
+      },
+      {
+        "call": "stat(shared directory)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": true,
+          "mode": "2777"
+        },
+        "step": "a-directory"
+      },
+      {
+        "call": "inspect supplementary groups excluding primary",
+        "case": "two-accounts",
+        "ok": {
+          "empty": false
+        },
+        "step": "a-groups"
       },
       {
         "call": "umask(027); create(shared/file, 0666)",
@@ -4195,6 +4546,29 @@
         "step": "a-acl"
       },
       {
+        "call": "compare creator, directory and file groups",
+        "case": "two-accounts",
+        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "step": "a-inheritance"
+      },
+      {
+        "call": "stat(shared directory)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "mode": "2777"
+        },
+        "step": "b-directory"
+      },
+      {
+        "call": "inspect supplementary groups excluding primary",
+        "case": "two-accounts",
+        "ok": {
+          "empty": false
+        },
+        "step": "b-groups"
+      },
+      {
         "call": "umask(027); create(shared/file, 0666)",
         "case": "two-accounts",
         "errno": "EACCES",
@@ -4230,6 +4604,15 @@
         "step": "b-acl"
       },
       {
+        "call": "compare creator, directory and file groups",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
+        "step": "b-inheritance"
+      },
+      {
         "call": "read /proc/1/cmdline",
         "case": "startup",
         "ok": {
@@ -4238,17 +4621,16 @@
         "step": "pid1"
       },
       {
-        "call": "inspect PID 1 and service launch owner",
+        "call": "inspect live init lease, login lease and managed supervisor",
         "case": "startup",
         "ok": {
-          "evidence": "web/kernel/client.js: boot() creates InitReaper and LoginStartup; window.os.machineInit().reaper.state",
-          "owner": "browser host/session",
+          "init_owner_is_current_host": true,
+          "login_owner_is_current_host": true,
           "reaper": "running",
           "role": "init-reaper",
-          "source_launches": {
-            "init": true,
-            "services": true
-          }
+          "service_host_is_login_owner": true,
+          "supervisor_parent_is_pid1": true,
+          "supervisor_path": "/usr/bin/supervise"
         },
         "step": "ownership"
       },

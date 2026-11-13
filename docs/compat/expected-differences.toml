@@ -15,12 +15,6 @@ reason = "The current API cannot detach/re-attach the cloud root; explicitly una
 signature = "7c8f354d3d77917e2bfb1a2e0d83b56a2b4fc1f4eef36e0c3a32720fb11246f5"
 
 [[difference]]
-id = "cloud/open-rename"
-issues = ["#48"]
-reason = "Retained reads/writes and inode equality succeed, but the OS does not expose descriptor device identity. The old Preview 1 dev=1 equality was fabricated by the adapter."
-signature = "9d623f9a53ef1c9e04e8881fdc9eee5bbac168178df90270a36e3d4ccbb23db2"
-
-[[difference]]
 id = "cloud/open-unlink"
 issues = ["#48"]
 reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
@@ -87,6 +81,18 @@ reason = "Link creation and inode equality succeed, but ABI Stat does not expose
 signature = "f04b63369cf3493d91357d2d330226ad1907360144683134edb34d197b03597c"
 
 [[difference]]
+id = "cloud/creation"
+issues = ["#49"]
+reason = "Setgid inheritance is explicitly incomparable: creator and directory primary groups coincide. Directory mode/group are measured; metadata follow-up validation must exercise distinct groups."
+signature = "a23f92d93f340f73b7da61189ff4c2e11fd7895160b5391a1e6ef2a94b41e6b2"
+
+[[difference]]
+id = "cloud/two-accounts"
+issues = ["#49"]
+reason = "Account B inherits the directory group. Linux creators now have empty supplementary groups and primary groups distinct from directory group 3; OS accounts report supplementary membership, and creator A inheritance is explicitly unavailable because its primary group equals the directory group."
+signature = "6a86e6a4ff4f1c560d56d47c55b496215cb535e22e722ae78f518da6a1102b2b"
+
+[[difference]]
 id = "cloud/chroot-api"
 issues = ["#53"]
 reason = "chroot is absent from abi::Call; Linux executes the syscall in its disposable namespace."
@@ -107,8 +113,8 @@ signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 [[observation]]
 id = "cloud/startup"
 issues = ["#56","#57"]
-reason = "OS PID 1 is the running init reaper; client boot constructs InitReaper/LoginStartup and launches init/supervise. The native host PID 1 and launcher are recorded separately."
-signature = "446a2e3434fe80dd12e8f93bdb2ffe83781d509dc9ee907c5064c8dbc20694c2"
+reason = "Live init/login leases name the current execution host; a real managed /usr/bin/supervise process runs on the login owner with PID 1 as parent. Native startup details remain environmental evidence."
+signature = "c5bc335c7b9fe7b4fba8fa71f62c09c5510af7c0008e7ecf1a5ca7c3685838ea"
 
 [[observation]]
 id = "cloud/gui-processes"
@@ -225,10 +231,16 @@ reason = "symlink creation returns EOPNOTSUPP; reading the absent link returns E
 signature = "cb9a4fe6a37f2c3db0e81136f0a698834ee78b24ac384538426ff510a98166c3"
 
 [[difference]]
+id = "browser-storage/creation"
+issues = ["#49"]
+reason = "Setgid inheritance is explicitly incomparable: creator and directory primary groups coincide. Directory mode/group are measured; metadata follow-up validation must exercise distinct groups."
+signature = "a23f92d93f340f73b7da61189ff4c2e11fd7895160b5391a1e6ef2a94b41e6b2"
+
+[[difference]]
 id = "browser-storage/two-accounts"
 issues = ["#49","#59"]
-reason = "Account B creates through the authenticated export: writing returns EACCES and leaves a zero-byte file owned by the publisher/parent, not B; inherited group, mode and ACL are recorded."
-signature = "ca1087111907336b767c65f4c941c7413b8bb373bda20a0d400c5d7c750bf626"
+reason = "Account B creates through the authenticated export: writing returns EACCES and leaves a zero-byte file owned by the publisher/parent, not B; inherited group, mode and ACL are recorded. Linux creators now have empty supplementary groups and primary groups distinct from directory group 3; OS accounts report supplementary membership, and creator A inheritance is explicitly unavailable because its primary group equals the directory group."
+signature = "e7aeb10ec55a6374c5132584b7792599598ec4c52bed0478166fe390b80a05b0"
 
 [[difference]]
 id = "browser-storage/chroot-api"
@@ -251,8 +263,8 @@ signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 [[observation]]
 id = "browser-storage/startup"
 issues = ["#56","#57"]
-reason = "OS PID 1 is the running init reaper; client boot constructs InitReaper/LoginStartup and launches init/supervise. The native host PID 1 and launcher are recorded separately."
-signature = "446a2e3434fe80dd12e8f93bdb2ffe83781d509dc9ee907c5064c8dbc20694c2"
+reason = "Live init/login leases name the current execution host; a real managed /usr/bin/supervise process runs on the login owner with PID 1 as parent. Native startup details remain environmental evidence."
+signature = "c5bc335c7b9fe7b4fba8fa71f62c09c5510af7c0008e7ecf1a5ca7c3685838ea"
 
 [[observation]]
 id = "browser-storage/gui-processes"
@@ -369,10 +381,16 @@ reason = "symlink creation returns EOPNOTSUPP; reading the absent link returns E
 signature = "cb9a4fe6a37f2c3db0e81136f0a698834ee78b24ac384538426ff510a98166c3"
 
 [[difference]]
+id = "directory-handle/creation"
+issues = ["#49"]
+reason = "Setgid inheritance is explicitly incomparable: creator and directory primary groups coincide. Directory mode/group are measured; metadata follow-up validation must exercise distinct groups."
+signature = "a23f92d93f340f73b7da61189ff4c2e11fd7895160b5391a1e6ef2a94b41e6b2"
+
+[[difference]]
 id = "directory-handle/two-accounts"
 issues = ["#49","#59"]
-reason = "Account B creates through the authenticated export: writing returns EACCES and leaves a zero-byte file owned by the publisher/parent, not B; inherited group, mode and ACL are recorded."
-signature = "ca1087111907336b767c65f4c941c7413b8bb373bda20a0d400c5d7c750bf626"
+reason = "Account B creates through the authenticated export: writing returns EACCES and leaves a zero-byte file owned by the publisher/parent, not B; inherited group, mode and ACL are recorded. Linux creators now have empty supplementary groups and primary groups distinct from directory group 3; OS accounts report supplementary membership, and creator A inheritance is explicitly unavailable because its primary group equals the directory group."
+signature = "e7aeb10ec55a6374c5132584b7792599598ec4c52bed0478166fe390b80a05b0"
 
 [[difference]]
 id = "directory-handle/chroot-api"
@@ -395,8 +413,8 @@ signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 [[observation]]
 id = "directory-handle/startup"
 issues = ["#56","#57"]
-reason = "OS PID 1 is the running init reaper; client boot constructs InitReaper/LoginStartup and launches init/supervise. The native host PID 1 and launcher are recorded separately."
-signature = "446a2e3434fe80dd12e8f93bdb2ffe83781d509dc9ee907c5064c8dbc20694c2"
+reason = "Live init/login leases name the current execution host; a real managed /usr/bin/supervise process runs on the login owner with PID 1 as parent. Native startup details remain environmental evidence."
+signature = "c5bc335c7b9fe7b4fba8fa71f62c09c5510af7c0008e7ecf1a5ca7c3685838ea"
 
 [[observation]]
 id = "directory-handle/gui-processes"
@@ -421,12 +439,6 @@ id = "local-helper/remount"
 issues = ["#49"]
 reason = "After detach/attach, mode returns to 0600 and the access ACL disappears."
 signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
-
-[[difference]]
-id = "local-helper/open-rename"
-issues = ["#48"]
-reason = "Retained reads/writes and inode equality succeed, but the OS does not expose descriptor device identity. The old Preview 1 dev=1 equality was fabricated by the adapter."
-signature = "9d623f9a53ef1c9e04e8881fdc9eee5bbac168178df90270a36e3d4ccbb23db2"
 
 [[difference]]
 id = "local-helper/open-unlink"
@@ -507,10 +519,16 @@ reason = "symlink creation returns EOPNOTSUPP; reading the absent link returns E
 signature = "cb9a4fe6a37f2c3db0e81136f0a698834ee78b24ac384538426ff510a98166c3"
 
 [[difference]]
+id = "local-helper/creation"
+issues = ["#49"]
+reason = "Setgid inheritance is explicitly incomparable: creator and directory primary groups coincide. Directory mode/group are measured; metadata follow-up validation must exercise distinct groups."
+signature = "a23f92d93f340f73b7da61189ff4c2e11fd7895160b5391a1e6ef2a94b41e6b2"
+
+[[difference]]
 id = "local-helper/two-accounts"
 issues = ["#49","#59"]
-reason = "Account B creates through the authenticated export: writing returns EACCES and leaves a zero-byte file owned by the publisher/parent, not B; inherited group, mode and ACL are recorded."
-signature = "ca1087111907336b767c65f4c941c7413b8bb373bda20a0d400c5d7c750bf626"
+reason = "Account B creates through the authenticated export: writing returns EACCES and leaves a zero-byte file owned by the publisher/parent, not B; inherited group, mode and ACL are recorded. Linux creators now have empty supplementary groups and primary groups distinct from directory group 3; OS accounts report supplementary membership, and creator A inheritance is explicitly unavailable because its primary group equals the directory group."
+signature = "e7aeb10ec55a6374c5132584b7792599598ec4c52bed0478166fe390b80a05b0"
 
 [[difference]]
 id = "local-helper/chroot-api"
@@ -533,8 +551,8 @@ signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 [[observation]]
 id = "local-helper/startup"
 issues = ["#56","#57"]
-reason = "OS PID 1 is the running init reaper; client boot constructs InitReaper/LoginStartup and launches init/supervise. The native host PID 1 and launcher are recorded separately."
-signature = "446a2e3434fe80dd12e8f93bdb2ffe83781d509dc9ee907c5064c8dbc20694c2"
+reason = "Live init/login leases name the current execution host; a real managed /usr/bin/supervise process runs on the login owner with PID 1 as parent. Native startup details remain environmental evidence."
+signature = "c5bc335c7b9fe7b4fba8fa71f62c09c5510af7c0008e7ecf1a5ca7c3685838ea"
 
 [[observation]]
 id = "local-helper/gui-processes"
@@ -653,14 +671,14 @@ signature = "cb9a4fe6a37f2c3db0e81136f0a698834ee78b24ac384538426ff510a98166c3"
 [[difference]]
 id = "relay/creation"
 issues = ["#49","#59"]
-reason = "Relay metadata administration returns EPERM for setgid/default ACL; the created file has mode 0600 without the inherited access ACL."
-signature = "d55c32d6389ab34ecdd3df3950db79000f1e4aa858b10fff48eda20d87130104"
+reason = "Relay setgid/default ACL administration returns EPERM; directory mode remains 0700 and the created file has mode 0600 without an inherited access ACL. Setgid inheritance is explicitly incomparable: creator and directory primary groups coincide. Directory mode/group are measured; metadata follow-up validation must exercise distinct groups."
+signature = "36f0b903cfc7b2971c9ec901442117fa39906da5190ce28a2098c0c9a14336a9"
 
 [[difference]]
 id = "relay/two-accounts"
 issues = ["#49","#59"]
-reason = "Account B creates through the authenticated export: writing returns EACCES and leaves a zero-byte file owned by the publisher/parent, not B; inherited group, mode and ACL are recorded."
-signature = "ca1087111907336b767c65f4c941c7413b8bb373bda20a0d400c5d7c750bf626"
+reason = "Account B creates through the authenticated export: writing returns EACCES and leaves a zero-byte file owned by the publisher/parent, not B; inherited group, mode and ACL are recorded. Linux creators now have empty supplementary groups and primary groups distinct from directory group 3; OS accounts report supplementary membership, and creator A inheritance is explicitly unavailable because its primary group equals the directory group."
+signature = "e7aeb10ec55a6374c5132584b7792599598ec4c52bed0478166fe390b80a05b0"
 
 [[difference]]
 id = "relay/chroot-api"
@@ -683,8 +701,8 @@ signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
 [[observation]]
 id = "relay/startup"
 issues = ["#56","#57"]
-reason = "OS PID 1 is the running init reaper; client boot constructs InitReaper/LoginStartup and launches init/supervise. The native host PID 1 and launcher are recorded separately."
-signature = "446a2e3434fe80dd12e8f93bdb2ffe83781d509dc9ee907c5064c8dbc20694c2"
+reason = "Live init/login leases name the current execution host; a real managed /usr/bin/supervise process runs on the login owner with PID 1 as parent. Native startup details remain environmental evidence."
+signature = "c5bc335c7b9fe7b4fba8fa71f62c09c5510af7c0008e7ecf1a5ca7c3685838ea"
 
 [[observation]]
 id = "relay/gui-processes"

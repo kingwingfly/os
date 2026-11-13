@@ -4,7 +4,7 @@ This directory records measurements for [#46](https://github.com/kingwingfly/os/
 
 The matrix contains 27 cases across five OS profiles. Filesystem rows compare normalized Linux and OS traces. Startup, GUI process visibility and browser-tab visibility are explicitly observational where this headless native fixture has no portable counterpart; their changes are checked, but they are not claimed to be compatibility differences that can automatically go stale. Every reviewed row names its follow-up issue; no permanent provider limitation is selected.
 
-The reviewed baseline has **19 matching filesystem traces, 101 filesystem differences/skips, and 15 process observations**. [Review changes](review-changes.md) lists every row changed from the original PR baseline.
+The reviewed baseline has **16 matching filesystem traces, 104 filesystem differences/skips, and 15 process observations**. [Review changes](review-changes.md) lists every row changed from reviewed commit `2455e96`.
 
 ## Reproduce
 
