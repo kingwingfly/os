@@ -3,11 +3,11 @@ import { mkdtemp, mkdir, readFile, writeFile, rm, open } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { podmanProxy } from '../podman-proxy.mjs';
+import { needsPodman, startPodman } from '../podman.mjs';
+import { conformanceConfig, replaceExactly, putFile, attempt, reattachAfter } from './fixtures.mjs';
 import { createInterface } from 'node:readline';
 import { performance } from 'node:perf_hooks';
-import { run, targetDir, jsonLines, skip, ok, port, start, stop, sourceEvidence } from './common.mjs';
+import { run, targetDir, jsonLines, skip, ok, port, start, stop, sourceEvidence, filesystems, operations, probeOperations, cleanup } from './common.mjs';
 
 async function batch(page,calls,options={}) {
   return page.evaluate(async ({calls,options})=>{
@@ -22,9 +22,7 @@ async function checked(page,calls,options={}) {
   return rows.map(row=>row.ok);
 }
 async function put(page,path,bytes) {
-  const [opened]=await checked(page,[{open:{path,flags:0o1101,mode:0o666}}]);
-  for (let offset=0;offset<bytes.length;offset+=65536) await checked(page,[{pwrite:{fd:opened.fd,index:offset/(opened.chunk_size||65536),data:bytes.subarray(offset,offset+65536).toString('base64')}}]);
-  await checked(page,[{close:{fd:opened.fd}}]);
+  return putFile(calls=>checked(page,calls),path,bytes);
 }
 async function exec(page,path,args=[],cwd='/') {
   return page.evaluate(async ({path,args,cwd})=>{
@@ -85,14 +83,14 @@ async function held(page,mode,root,alias,cross,creds) {
     window.conformanceInput.write('continue\n');return row;
   },{root,mode});
   const output=await page.evaluate(async ()=>{const result=await window.conformanceHeld;if(result.status!==0)throw new Error('held process failed');return window.conformanceOutput;});
-  const rows=jsonLines(output.replaceAll('\r','')).filter(r=>!r.barrier);rows.splice(mode==='hold-open'?1:2,0,row);return rows;
+  const rows=jsonLines(output.replaceAll('\r','')).filter(r=>!r.barrier);rows.splice(mode==='hold-open'?1:2,0,row);return {rows,detach:row};
 }
 async function timing(page,root,alias,cross,creds) {
   const rows=[];
   await probe(page,'latency',root,alias,cross,creds,['prepare']);
   // Cold = first invocation of this operation in this fresh filesystem/profile;
   // warm = immediate repeat. This does not claim to drop host/provider caches.
-  for (const operation of ['stat-eight-deep','read-1mib','write-1mib','ls-usr-bin','shell-first-prompt']) {
+  for (const operation of operations) {
     const samples=[];
     for (const temperature of ['cold','warm']) {
       const started=performance.now();let result;
@@ -105,7 +103,7 @@ async function timing(page,root,alias,cross,creds) {
           if(result.status!==0||!sent)throw new Error('interactive shell prompt missing');return elapsed;
         },root);
       } else {
-        const op={'stat-eight-deep':'stat','read-1mib':'read','write-1mib':'write'}[operation];
+        const op=probeOperations[operation];
         result=await probe(page,'latency',root,alias,cross,creds,[op]);
         if(result.some(row=>row.errno))throw new Error('latency I/O failed '+JSON.stringify(result));
       }
@@ -119,46 +117,32 @@ export async function os() {
   const abi=await readFile('crates/abi/src/lib.rs','utf8');
   const calls=abi.slice(abi.indexOf('pub enum Call {'),abi.indexOf('pub enum Target'));
   if(/^    (Chroot|Mount|Umount|Unmount)\b/m.test(calls))throw new Error('Mount/chroot ABI changed: replace the unavailable probes with executable calls');
+  run('cargo',['xtask','build','--web-only'],{stdio:'inherit'});
   run('cargo',['build','--locked','-p','os-conformance','--target','wasm32-wasip1','--release'],{stdio:'inherit'});
   run('cargo',['build','--locked','-p','os-local-helper'],{stdio:'inherit'});
   run('worker-build',['--release'],{cwd:'crates/worker',stdio:'inherit'});
   const target=targetDir(), bytes=await readFile(join(target,'wasm32-wasip1/release/os-conformance.wasm'));
   const state=await mkdtemp(join(tmpdir(),'os-conformance-os-'));
   const previousMask=process.umask(0o022);
-  let server,browser,persistent,helper,log,podman,proxy,podmanEnv,initialContainers,compilerEvidence,success=false;
+  let server,browser,persistent,helper,log,podman,podmanEnv,initialContainers,compilerEvidence,failure,success=false;
   try {
     const number=await port(),url=`http://127.0.0.1:${number}`;
     process.env.OS_TEST_URL=url;
     const root=resolve('.');
-    let config=await readFile('wrangler.toml','utf8');
-    config=config.replace('main = "crates/worker/entry.js"',`main = ${JSON.stringify(join(root,'crates/worker/entry.js'))}`)
-      .replace(/\[build\][\s\S]*?(?=\n\[)/,'')
-      .replace(/\[\[containers\]\]\nclass_name = "JobRunner"[\s\S]*?(?=\n\[)/,'')
-      .replace('directory = "./dist"',`directory = ${JSON.stringify(join(root,'dist'))}`)
-      .replaceAll('image_build_context = "."',`image_build_context = ${JSON.stringify(root)}`)
-      .replaceAll('image = "./containers/',`image = "${root}/containers/`);
+    let config=conformanceConfig(await readFile('wrangler.toml','utf8'),root);
     await writeFile(join(state,'wrangler.toml'),config);
     const password=randomBytes(20).toString('hex');
     await writeFile(join(state,'.dev.vars'),`ADMIN_PASSWORD=${password}\nSESSION_SECRET=${randomBytes(32).toString('hex')}\n`,{mode:0o600});
     log=await open(join(state,'server.log'),'w');
     const serverEnv={...process.env};
-    if (!serverEnv.DOCKER_HOST && !serverEnv.WRANGLER_DOCKER_HOST && run('sh',['-c','command -v docker || command -v podman']).trim().endsWith('podman')) {
+    if (needsPodman(serverEnv)) {
       const cache=resolve(process.env.OS_CONFORMANCE_PODMAN_DIR||join(tmpdir(),'os-conformance-images-'+process.getuid()));
       await mkdir(cache,{recursive:true});
       const storage=join(state,'storage.conf');
       await writeFile(storage,`[storage]\ndriver = "overlay"\ngraphroot = ${JSON.stringify(join(cache,'storage'))}\nrunroot = ${JSON.stringify(join(cache,'run'))}\n`);
       serverEnv.CONTAINERS_STORAGE_CONF=storage;podmanEnv=serverEnv;
       initialContainers=new Set(run('podman',['--cgroup-manager=cgroupfs','ps','-aq'],{env:serverEnv}).trim().split('\n').filter(Boolean));
-      const socket=join(state,'podman.sock');
-      podman=start('podman',['--cgroup-manager=cgroupfs','system','service','--time=0','unix://'+socket],{stdio:['ignore',log.fd,log.fd],env:serverEnv});
-      for(let i=0;i<100&&!existsSync(socket);i++)await new Promise(r=>setTimeout(r,100));
-      if(!existsSync(socket))throw new Error('isolated Podman service did not start');
-      const proxied=join(state,'docker.sock');proxy=podmanProxy(proxied,socket);
-      serverEnv.WRANGLER_DOCKER_BIN=join(root,'scripts/podman-docker.sh');
-      serverEnv.WRANGLER_DOCKER_HOST='unix://'+proxied;
-      const miniflare=await readFile('node_modules/miniflare/dist/src/index.js','utf8');
-      const image=miniflare.match(/DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "([^"]+)"/)?.[1];
-      if(image)serverEnv.MINIFLARE_CONTAINER_EGRESS_IMAGE=image.split('/')[0].includes('.')?image:'docker.io/'+image;
+      podman=await startPodman(serverEnv,{socket:join(state,'podman.sock'),proxySocket:join(state,'docker.sock'),stdio:['ignore',log.fd,log.fd],detached:true});
     }
     if(process.env.OS_CONFORMANCE_COMPILER_IMAGE) {
       const image=process.env.OS_CONFORMANCE_COMPILER_IMAGE;
@@ -170,7 +154,7 @@ export async function os() {
       if(JSON.stringify(actual)!==JSON.stringify(expected))throw new Error('prebuilt compiler image differs from checkout/locked Binaryen');
       compilerEvidence={image,verified_sha256:actual};
       const dockerfile=join(state,'Compiler.Dockerfile');await writeFile(dockerfile,`FROM ${image}\n`);
-      config=config.replace(`image = "${root}/containers/compiler/Dockerfile"`,`image = ${JSON.stringify(dockerfile)}`);
+      config=replaceExactly(config,`image = "${root}/containers/compiler/Dockerfile"`,`image = ${JSON.stringify(dockerfile)}`,'prebuilt compiler Dockerfile');
       await writeFile(join(state,'wrangler.toml'),config);
       console.log('Verified prebuilt compiler source and Binaryen bytes: '+image);
     }
@@ -199,7 +183,7 @@ export async function os() {
       await registration.close();if(result.err)throw new Error('registration failed: '+result.err.errno);
     }
     const observations={},latencies={};
-    for (const filesystem of ['cloud','browser-storage','directory-handle','local-helper','relay']) {
+    for (const filesystem of filesystems) {
       console.log('Measuring '+filesystem);
       const a=await account(browser,url,'conformance-a',password,bytes,filesystem==='directory-handle'?persistent:null), b=await account(browser,url,'conformance-b',password,bytes);
       const {page,context,creds}=a;
@@ -246,11 +230,15 @@ export async function os() {
       if(filesystem==='cloud') for(const name of ['remount','unmount-open','unmount-cwd'])rows.push(skip(name,'not implemented: cloud root cannot be detached through the current mount API'));
       else {
         rows.push(...await probe(page,'remount-prepare',primary,alias,cross,creds));
-        await page.evaluate(path=>window.os.unmountLocal(path),primary);rows.push(ok('remount','detach','umount(mount)',null));
-        await attach('primary');rows.push(ok('remount','attach','mount(source, mount)',null));
+        const detached=await attempt('remount','detach','umount(mount)',()=>page.evaluate(path=>window.os.unmountLocal(path),primary));
+        rows.push(detached);
+        await reattachAfter(detached,async()=>rows.push(await attempt('remount','attach','mount(source, mount)',()=>attach('primary'))));
         rows.push(...await probe(page,'remount-observe',primary,alias,cross,creds));
-        rows.push(...await held(page,'hold-open',primary,alias,cross,creds));await attach('primary');
-        rows.push(...await held(page,'hold-cwd',primary,alias,cross,creds));await attach('primary');
+        for(const mode of ['hold-open','hold-cwd']) {
+          const heldResult=await held(page,mode,primary,alias,cross,creds);
+          rows.push(...heldResult.rows);
+          await reattachAfter(heldResult.detach,()=>attach('primary'));
+        }
       }
       rows.push(...await probe(page,'unsupported',primary,alias,cross,creds));
       // Two authenticated accounts create in one setgid/default-ACL directory.
@@ -287,23 +275,32 @@ export async function os() {
     for(const rows of Object.values(observations))rows.push(...processRows);
     const evidence=[await sourceEvidence('web/wasi/process.js',['fd_datasync: () => 0','fd_sync: () => 0']),await sourceEvidence('web/kernel/client.js',["exec([['supervise', run.file]]","exec([['init']]"])];
     success=true;return {observations,latencies,evidence,compiler:compilerEvidence??{dockerfile:'containers/compiler/Dockerfile'},browser:browser.version()};
+  } catch(error) {
+    failure=error;throw error;
   } finally {
-    await browser?.close();await stop(helper);await stop(server);proxy?.close();
-    if(podmanEnv) {
-      const created=run('podman',['--cgroup-manager=cgroupfs','ps','-aq'],{env:podmanEnv}).trim().split('\n').filter(id=>id&&!initialContainers.has(id));
-      if(created.length)run('podman',['--cgroup-manager=cgroupfs','rm','-f',...created],{env:podmanEnv,stdio:'ignore'});
-    }
-    await stop(podman);await log?.close();process.umask(previousMask);
-    if(success)await rm(state,{recursive:true,force:true});
-    else console.error('Failed run retained disposable state and logs at '+state);
+    const errors=await cleanup([
+      ['browser',()=>browser?.close()],['helper',()=>stop(helper)],['server',()=>stop(server)],
+      ['containers',()=>{
+        if(!podmanEnv||!initialContainers)return;
+        const created=run('podman',['--cgroup-manager=cgroupfs','ps','-aq'],{env:podmanEnv}).trim().split('\n').filter(id=>id&&!initialContainers.has(id));
+        if(created.length)run('podman',['--cgroup-manager=cgroupfs','rm','-f',...created],{env:podmanEnv,stdio:'ignore'});
+      }],
+      ['Podman service',()=>podman?.close()],['log',()=>log?.close()],['umask',()=>process.umask(previousMask)],
+    ]);
+    for(const {name,error} of errors)console.error(`Cleanup ${name}: ${error.message}`);
+    if(success&&!errors.length)await rm(state,{recursive:true,force:true});
+    else console.error('Run retained disposable state and logs at '+state);
+    if(errors.length&&!failure)throw new AggregateError(errors.map(e=>e.error),'conformance cleanup failed');
   }
 }
+
 async function processFacts(admin,url) {
   const {page,context}=admin;
-  await expect.poll(async()=>page.evaluate(()=>window.os.machineInit().then(s=>s.reaper?.state)),{timeout:60000}).toBe('running');
-  const init=await page.evaluate(()=>window.os.machineInit());
+  const init=await page.evaluate(()=>window.os.machineInit?.()??null);
+  const client=await readFile('web/kernel/client.js','utf8');
+  const launches={init:client.includes("exec([['init']]"),services:client.includes("exec([['supervise', run.file]]")};
   const initComm=await exec(page,'/usr/bin/cat',['/proc/1/cmdline']);
-  const rows=[ok('startup','pid1','read /proc/1/cmdline',{comm:initComm.split('\0')[0].split('/').at(-1)}),ok('startup','ownership','inspect PID 1 and service launch owner',{role:'init-reaper',owner:'browser host/session',evidence:'web/kernel/client.js: boot() creates InitReaper and LoginStartup; window.os.machineInit().reaper.state',reaper:init.reaper.state})];
+  const rows=[ok('startup','pid1','read /proc/1/cmdline',{comm:initComm.split('\0')[0].split('/').at(-1)}),ok('startup','ownership','inspect PID 1 and service launch owner',{role:client.includes('new InitReaper(')?'init-reaper':'unclassified',owner:launches.init&&launches.services?'browser host/session':'unclassified',source_launches:launches,evidence:'web/kernel/client.js: boot() creates InitReaper and LoginStartup; window.os.machineInit().reaper.state',reaper:init?.reaper?.state??null})];
   const ps=async()=>(await checked(page,[{proc_poll:{pids:[]}}]))[0];
   const images=rows=>[...new Set(rows.map(p=>JSON.stringify({path:p.path,argv:p.argv})))].sort().map(s=>JSON.parse(s));
   // Wait for the fixture's completed cat to be reaped before taking the idle
@@ -324,7 +321,7 @@ async function processFacts(admin,url) {
     images_with_files:before,images_with_mounts:mounts,images_with_editor:editor,images_with_preview:preview}));
   const tab=await context.newPage();await ready(tab,url);
   await page.evaluate(()=>{window.conformanceSleep=window.os.exec([{path:'/usr/bin/sleep',argv:['sleep','60']}],{cwd:'/',stdin:''});});
-  await expect.poll(async()=>{const [rows]=await checked(tab,[{proc_poll:{pids:[]}}]);return rows.some(p=>p.name==='sleep'||p.comm==='sleep'||p.argv?.includes('sleep'));},{timeout:30000}).toBe(true);
+  await expect.poll(async()=>{const [rows]=await checked(page,[{proc_poll:{pids:[]}}]);return rows.some(p=>p.name==='sleep'||p.comm==='sleep'||p.argv?.includes('sleep'));},{timeout:30000}).toBe(true);
   const [one]=await checked(page,[{proc_poll:{pids:[]}}]),[two]=await checked(tab,[{proc_poll:{pids:[]}}]);
   const sleep=one.find(p=>p.name==='sleep'||p.comm==='sleep'||p.argv?.includes('sleep'));
   rows.push(ok('tab-pids','visibility','start sleep in tab A; ps in tab B',{other_tab_pid_visible:two.some(p=>p.pid===sleep.pid)}));

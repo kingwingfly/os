@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cases, filesystems, ok } from '../scripts/conformance/common.mjs';
+import { cases, filesystems, operations, ok, cleanup, revision } from '../scripts/conformance/common.mjs';
 import { differences, check, parseExpected, matrix, checkLatency } from '../scripts/conformance/report.mjs';
 const fixture=()=>{
   const rows=cases.map(name=>ok(name,'call',name,null));
@@ -34,10 +34,45 @@ test('difference policy requires an owning issue or explicit permanent limit',()
 });
 
 test('latency coverage requires both successful finite samples for every operation and filesystem',()=>{
-  const operations=['stat-eight-deep','read-1mib','write-1mib','ls-usr-bin','shell-first-prompt'].map(operation=>({operation,samples:[{temperature:'cold',milliseconds:1},{temperature:'warm',milliseconds:0.5}]}));
-  const record={schema:1,unit:'milliseconds',filesystems:Object.fromEntries(filesystems.map(fs=>[fs,structuredClone(operations)]))};
+  const samples=operations.map(operation=>({operation,samples:[{temperature:'cold',milliseconds:1},{temperature:'warm',milliseconds:0.5}]}));
+  const record={schema:1,unit:'milliseconds',filesystems:Object.fromEntries(filesystems.map(fs=>[fs,structuredClone(samples)]))};
   assert.doesNotThrow(()=>checkLatency(record));
   delete record.filesystems.cloud;assert.throws(()=>checkLatency(record),/missing latency/);
-  const native={schema:1,unit:'milliseconds',operations};native.operations[0].samples[1].milliseconds=null;
+  const native={schema:1,unit:'milliseconds',operations:samples};native.operations[0].samples[1].milliseconds=null;
   assert.throws(()=>checkLatency(native,true),/invalid cold\/warm/);
+});
+
+
+test('policy rejects array-valued scalar fields and accepts new issue IDs only through data',()=>{
+  const valid='[[difference]]\nid = "cloud/alias"\nissue = "#48"\nreason = "pending"\nsignature = "abc"\n';
+  for(const key of ['id','issue','reason','signature']) {
+    const bad=valid.replace(new RegExp(key+' = ("[^"\\n]*")'),key+' = [$1]');
+    assert.throws(()=>parseExpected(bad));
+  }
+  assert.throws(()=>parseExpected(valid.replace('issue = "#48"','permanent = []')));
+  assert.throws(()=>parseExpected(valid.replace('issue = "#48"','issues = [["#48"]]')));
+  assert.throws(()=>parseExpected(valid.replace('#48','#67')));
+  assert.equal(parseExpected(valid.replace('#48','#67'),['#67'])[0].issue,'#67');
+});
+
+test('process facts are explicitly observational, detect changes, and can be reclassified when a Linux counterpart exists',()=>{
+  const b=fixture(),i=cases.indexOf('startup');
+  b.linux[i]={case:'startup',step:'unavailable',call:'startup',skipped:'environment evidence only'};
+  const rows=differences(b), entries=rows.filter(r=>!r.same).map(r=>({kind:'observation',id:r.id,signature:r.signature}));
+  assert(rows.filter(r=>r.kind==='observation').length===5);
+  assert.doesNotThrow(()=>check(rows,entries));
+  assert.match(matrix(rows,[]),/observation:/);
+  b.os.cloud[i].ok='changed service ownership';
+  assert.throws(()=>check(differences(b),entries),/changed observation/);
+  assert.throws(()=>check(differences(fixture()),entries),/stale difference/);
+});
+
+test('cleanup failures do not prevent subsequent cleanup or restoring the process umask',async()=>{
+  const seen=[],mask=process.umask();
+  const errors=await cleanup([
+    ['podman ps',()=>{throw new Error('engine unavailable');}],
+    ['service',()=>seen.push('stopped')],['log',()=>seen.push('closed')],['umask',()=>process.umask(mask)],
+  ]);
+  assert.deepEqual(seen,['stopped','closed']);assert.equal(process.umask(),mask);
+  assert.equal(errors[0].error.message,'engine unavailable');
 });

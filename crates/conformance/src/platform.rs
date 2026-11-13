@@ -15,9 +15,12 @@ pub fn error(e: io::Error) -> String {
     for (code, name) in [
         (libc::EPERM, "EPERM"),
         (libc::ENOENT, "ENOENT"),
+        (libc::ESRCH, "ESRCH"),
         (libc::EIO, "EIO"),
+        (libc::ENXIO, "ENXIO"),
+        (libc::E2BIG, "E2BIG"),
         (libc::EBADF, "EBADF"),
-        (libc::ESTALE, "ESTALE"),
+        (libc::EAGAIN, "EAGAIN"),
         (libc::EACCES, "EACCES"),
         (libc::EBUSY, "EBUSY"),
         (libc::EEXIST, "EEXIST"),
@@ -26,23 +29,40 @@ pub fn error(e: io::Error) -> String {
         (libc::ENOTDIR, "ENOTDIR"),
         (libc::EISDIR, "EISDIR"),
         (libc::EINVAL, "EINVAL"),
+        (libc::EMFILE, "EMFILE"),
+        (libc::ENOTTY, "ENOTTY"),
+        (libc::ETXTBSY, "ETXTBSY"),
+        (libc::EFBIG, "EFBIG"),
+        (libc::ENOSPC, "ENOSPC"),
+        (libc::EROFS, "EROFS"),
+        (libc::EMLINK, "EMLINK"),
+        (libc::EPIPE, "EPIPE"),
+        (libc::ERANGE, "ERANGE"),
+        (libc::ENAMETOOLONG, "ENAMETOOLONG"),
         (libc::ENOSYS, "ENOSYS"),
         (libc::ENOTEMPTY, "ENOTEMPTY"),
         (libc::ELOOP, "ELOOP"),
-        (libc::EROFS, "EROFS"),
+        #[cfg(target_os = "linux")]
+        (libc::ENODATA, "ENODATA"),
         (libc::EOPNOTSUPP, "EOPNOTSUPP"),
+        (libc::ESTALE, "ESTALE"),
+        (libc::ETIMEDOUT, "ETIMEDOUT"),
+        (libc::ECANCELED, "ECANCELED"),
+        (libc::ENOEXEC, "ENOEXEC"),
+        (libc::ECHILD, "ECHILD"),
     ] {
         if n == Some(code) {
             return name.into();
         }
     }
-    // Keep unmapped codes visible; never collapse unknown errors into success.
-    format!(
-        "{:?}:{}",
-        e.kind(),
-        n.map_or("no-errno".into(), |n| n.to_string())
-    )
+    // Preview 1 has no ENODATA number: this runtime aliases it to ENOENT.
+    // ABI errors preserve ENODATA by name; never invent a distinction in raw 44.
+    match n {
+        Some(n) => format!("UNMAPPED_ERRNO:{}:{n}", std::env::consts::OS),
+        None => "NO_OS_ERRNO".into(),
+    }
 }
+
 pub fn io<T>(r: io::Result<T>) -> Result<T> {
     r.map_err(error)
 }
@@ -77,13 +97,63 @@ fn rawstat(path: Option<&Path>, file: Option<&File>) -> Result<libc::stat> {
     rc(result)?;
     Ok(unsafe { value.assume_init() })
 }
-pub fn identity(path: &Path) -> Result<(u64, u64)> {
-    let s = rawstat(Some(path), None)?;
-    Ok((s.st_dev as u64, s.st_ino as u64))
+#[derive(Clone, Copy)]
+pub struct Identity {
+    dev: Option<u64>,
+    ino: Option<u64>,
 }
-pub fn fdidentity(file: &File) -> Result<(u64, u64)> {
+#[cfg(any(target_os = "wasi", test))]
+fn identity_from_json(value: &Value) -> Identity {
+    Identity {
+        dev: value["dev"].as_u64(),
+        ino: value["ino"].as_u64().filter(|n| *n != 0),
+    }
+}
+pub fn identity_relation(a: Identity, b: Identity) -> Value {
+    fn equal(a: Option<u64>, b: Option<u64>, field: &str) -> Value {
+        match (a, b) {
+            (Some(a), Some(b)) => json!(a == b),
+            _ => json!({"unavailable":format!("{field} not exposed by both observations")}),
+        }
+    }
+    json!({"same_dev":equal(a.dev,b.dev,"st_dev"),"same_ino":equal(a.ino,b.ino,"st_ino")})
+}
+pub fn identity(path: &Path) -> Result<Identity> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = rawstat(Some(path), None)?;
+        Ok(Identity {
+            dev: Some(s.st_dev),
+            ino: Some(s.st_ino),
+        })
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        let value = call(abi::Call::Stat {
+            path: path.to_string_lossy().into_owned(),
+        })?;
+        Ok(identity_from_json(&value))
+    }
+}
+pub fn fdidentity(file: &File) -> Result<Identity> {
     let s = rawstat(None, Some(file))?;
-    Ok((s.st_dev as u64, s.st_ino as u64))
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Identity {
+            dev: Some(s.st_dev),
+            ino: Some(s.st_ino),
+        })
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        // There is no abi::Call::Fstat and ABI descriptor numbers are distinct
+        // from libc fds. Preview 1 exposes the inode, but writeFilestat invents
+        // dev=1 and substitutes ino=0 when absent. Neither is identity evidence.
+        Ok(Identity {
+            dev: None,
+            ino: (s.st_ino != 0).then_some(s.st_ino),
+        })
+    }
 }
 pub fn fdstat(f: &File) -> Result<Value> {
     let s = rawstat(None, Some(f))?;
@@ -368,5 +438,40 @@ pub fn invalid_sync(data: bool) -> Result<()> {
         } else {
             Err(error(io::Error::from_raw_os_error(n as i32)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn absent_identity_never_compares_equal() {
+        let missing = identity_from_json(&json!({"ino":0}));
+        let known = identity_from_json(&json!({"dev":2,"ino":3}));
+        assert!(identity_relation(missing, missing)["same_ino"].is_object());
+        assert!(identity_relation(missing, known)["same_dev"].is_object());
+        assert_eq!(
+            identity_relation(known, known),
+            json!({"same_dev":true,"same_ino":true})
+        );
+        assert_eq!(
+            identity_relation(known, identity_from_json(&json!({"dev":4,"ino":5}))),
+            json!({"same_dev":false,"same_ino":false})
+        );
+    }
+    #[test]
+    fn errors_use_stable_names() {
+        for (code, name) in [
+            (libc::ENOSPC, "ENOSPC"),
+            (libc::ENAMETOOLONG, "ENAMETOOLONG"),
+            (libc::EMLINK, "EMLINK"),
+            (libc::ERANGE, "ERANGE"),
+            (libc::ETXTBSY, "ETXTBSY"),
+            (libc::EAGAIN, "EAGAIN"),
+            (libc::ENODATA, "ENODATA"),
+        ] {
+            assert_eq!(error(io::Error::from_raw_os_error(code)), name);
+        }
+        assert_eq!(error(io::Error::other("details")), "NO_OS_ERRNO");
     }
 }

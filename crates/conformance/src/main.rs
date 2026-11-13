@@ -67,7 +67,7 @@ impl Probe {
     fn same(&self, a: &Path, b: &Path) -> Result<Value> {
         let a = platform::identity(a)?;
         let b = platform::identity(b)?;
-        Ok(json!({"same_dev":a.0==b.0,"same_ino":a.1==b.1}))
+        Ok(platform::identity_relation(a, b))
     }
     fn basic(&self) {
         let p = |s: &str| self.root.join(s);
@@ -119,7 +119,7 @@ impl Probe {
                 Err(e) => emit(case, "open", "open(O_RDWR)", Err(e)),
                 Ok(mut f) => {
                     emit(case, "open", "open(O_RDWR)", Ok(json!(null)));
-                    let before = platform::fdidentity(&f).ok();
+                    let before = platform::fdidentity(&f);
                     unit(
                         case,
                         "change",
@@ -147,7 +147,7 @@ impl Probe {
                         "identity",
                         "fstat(fd) identity before/after",
                         platform::fdidentity(&f)
-                            .map(|id| json!({"same_identity":Some(id)==before})),
+                            .and_then(|id| before.map(|old| platform::identity_relation(old, id))),
                     );
                     emit(case, "reread", "pread(fd, 0)", read(&mut f));
                 }
