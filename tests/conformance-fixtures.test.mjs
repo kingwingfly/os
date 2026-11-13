@@ -100,7 +100,7 @@ test('replacement paths preserve dollar replacement tokens for regex and string 
 test('ABI guard fails closed on missing, renamed, reordered or interposed enum headers',async()=>{
   const source=await readFile('crates/abi/src/lib.rs','utf8');
   assert.doesNotThrow(()=>checkAbsentMountCalls(source));
-  for(const bad of [source.replace('pub enum Call {','pub enum Requests {'),source.replace("pub enum Target<'a> {",'pub enum Destination {'),"pub enum Target<'a> {\n}\n"+source,source.replace('pub enum Call {','pub enum Call {\n    Mount { path: String },'),source.replace("pub enum Target<'a> {","pub enum Extra { A }\npub enum Target<'a> {")])assert.throws(()=>checkAbsentMountCalls(bad));
+  for(const bad of [source.replace('pub enum Call {','pub enum Requests {'),source.replace("pub enum Target<'a> {",'pub enum Destination {'),"pub enum Target<'a> {\n}\n"+source,"pub enum Target<'a> {\n}\n"+source.replace("pub enum Target<'a> {",'pub enum Moved {'),source.replace('pub enum Call {','pub enum Call {\n    Mount { path: String },'),source.replace("pub enum Target<'a> {","pub enum Extra { A }\npub enum Target<'a> {")])assert.throws(()=>checkAbsentMountCalls(bad));
 });
 
 test('attach and detach errors normalize in the browser before serialization',async()=>{

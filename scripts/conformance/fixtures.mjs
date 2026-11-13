@@ -1,5 +1,3 @@
-import { ok } from './common.mjs';
-
 export function replaceExactly(text,pattern,replacement,label,count=1) {
   const regex=typeof pattern==='string'?null:new RegExp(pattern.source,pattern.flags.includes('g')?pattern.flags:pattern.flags+'g');
   const matches=regex?[...text.matchAll(regex)].length:text.split(pattern).length-1;

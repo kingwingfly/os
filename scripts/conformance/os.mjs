@@ -299,11 +299,16 @@ async function processFacts(admin,url) {
   await put(page,units,Buffer.from(JSON.stringify({version:1,units:[{name:'measured',argv:['sh','-c','echo CONFORMANCE_SERVICE_READY; sleep 60']}]})));
   await page.evaluate(file=>{
     const s=window.conformanceService={output:'',done:false};
-    s.promise=window.os.startLoginServices(file,{onOutput:(_fd,text)=>{s.output+=text;}})
+    s.promise=window.os.startLoginServices(file,{tty:true,onOutput:(_fd,text)=>{s.output+=text;}})
       .then(result=>{s.status=result.status;},error=>{s.error=error.errno||'UNCLASSIFIED_ERROR';}).finally(()=>{s.done=true;});
   },units);
   try {
-    await page.waitForFunction(()=>window.conformanceService.output.includes('CONFORMANCE_SERVICE_READY')||window.conformanceService.done,null,{timeout:60000});
+    try {
+      await page.waitForFunction(()=>window.conformanceService.output.includes('CONFORMANCE_SERVICE_READY')||window.conformanceService.done,null,{timeout:60000});
+    } catch(error) {
+      const state=await page.evaluate(()=>({output:window.conformanceService.output,done:window.conformanceService.done,status:window.conformanceService.status,error:window.conformanceService.error}));
+      throw new Error('startup service readiness: '+JSON.stringify(state),{cause:error});
+    }
     const service=await page.evaluate(()=>({done:window.conformanceService.done,error:window.conformanceService.error}));
     if(service.done)throw new Error('service fixture exited before inspection: '+JSON.stringify(service));
     await expect.poll(async()=>(await page.evaluate(()=>window.os.loginSession())).session?.managed?.pid,{timeout:30000}).toBeGreaterThan(1);
