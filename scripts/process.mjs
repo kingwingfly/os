@@ -38,8 +38,8 @@ export class ShutdownScope {
   constructor() {
     this.actions=[];this.closing=false;this.controller=new AbortController();
     this.handlers=new Map([
-      ['SIGINT',()=>this.terminate(new Error('interrupted by SIGINT'),130)],
-      ['SIGTERM',()=>this.terminate(new Error('interrupted by SIGTERM'),143)],
+      ['SIGINT',()=>this.terminate(new Error('interrupted by SIGINT'),130,true)],
+      ['SIGTERM',()=>this.terminate(new Error('interrupted by SIGTERM'),143,true)],
       ['uncaughtException',error=>this.terminate(error,1)],
       ['unhandledRejection',error=>this.terminate(error,1)],
     ]);
@@ -66,8 +66,9 @@ export class ShutdownScope {
       return errors;
     })();
   }
-  async terminate(error,code) {
-    if(this.fatal)return;this.fatal=true;
+  async terminate(error,code,signal=false) {
+    if(this.fatal) {if(signal)process.exit(code);return;}
+    this.fatal=true;
     console.error(error instanceof Error?error.stack:String(error));
     await this.close();process.exit(code);
   }

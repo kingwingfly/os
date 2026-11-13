@@ -78,25 +78,25 @@ test('cleanup failures do not prevent subsequent cleanup or restoring the proces
   assert.equal(errors[0].error.message,'engine unavailable');
 });
 
-test('retained-fd device limits do not prevent convergence on observable fields',()=>{
+test('identity requires both device and inode evidence, including retained descriptors',()=>{
   const baseline=fixture(),i=cases.indexOf('open-rename');
   baseline.linux[i]=ok('open-rename','identity','fstat(fd)',{same_dev:true,same_ino:true});
   baseline.os.cloud[i]=ok('open-rename','identity','fstat(fd)',{same_dev:{unavailable:true,field:'st_dev'},same_ino:true});
   const row=()=>differences(baseline).find(r=>r.id==='cloud/open-rename');
-  assert(row().same);assert(row().limited);assert.equal(row().linux[0].ok.same_dev,true);
-  assert.throws(()=>check([row()],[{id:row().id,signature:row().signature}]),/stale difference/);
+  assert(!row().same);assert(row().limited);assert.equal(row().linux[0].ok.same_dev,true);
+  assert.doesNotThrow(()=>check([row()],[{id:row().id,signature:row().signature}]));
   const signature=row().signature;
   baseline.os.cloud[i].ok.same_ino=false;assert(!row().same);
   baseline.os.cloud[i].ok.same_ino={unavailable:true,field:'st_ino'};assert(!row().same);
   baseline.os.cloud[i].ok={same_dev:false,same_ino:true};assert(!row().same);assert(!row().limited);assert.notEqual(row().signature,signature);
 });
 
-test('identity availability applies to arbitrary steps and cases, while unknown inode never passes',()=>{
+test('colliding inode numbers never pass cross-mount identity when device is missing',()=>{
   const baseline=fixture(),i=cases.indexOf('alias');
   baseline.linux[i]=ok('alias','new-fd-step','fstat(new descriptor)',{same_dev:true,same_ino:true});
   baseline.os.cloud[i]=ok('alias','new-fd-step','fstat(new descriptor)',{same_dev:{unavailable:true,field:'st_dev'},same_ino:true});
   const row=()=>differences(baseline).find(r=>r.id==='cloud/alias');
-  assert(row().same);assert(row().limited);
+  assert(!row().same);assert(row().limited);
   baseline.linux[i].ok.same_ino=baseline.os.cloud[i].ok.same_ino={unavailable:true,field:'st_ino'};
   assert(!row().same);
 });
@@ -105,4 +105,13 @@ test('process facts have one independent coverage set, not five copied profiles'
   const b=fixture();assert.equal(differences(b).filter(r=>r.filesystem==='process').length,3);
   b.os.cloud.push(b.process.os[0]);assert.throws(()=>differences(b),/invalid observation/);
   b.os.cloud.pop();b.process.os.pop();assert.throws(()=>differences(b),/missing case/);
+});
+
+test('step signatures use fixed code-unit ordering, independent of ICU',()=>{
+  const baseline=fixture();
+  const rows=['a_z','a-z','a.z','aZ'].map(step=>ok('alias',step,step,null));
+  baseline.linux=[...baseline.linux.filter(r=>r.case!=='alias'),...rows];
+  baseline.os.cloud=[...baseline.os.cloud.filter(r=>r.case!=='alias'),...rows.toReversed()];
+  const row=differences(baseline).find(r=>r.id==='cloud/alias');
+  assert.deepEqual(row.linux.map(r=>r.step),['a-z','a.z','aZ','a_z']);assert(row.same);
 });

@@ -9,7 +9,7 @@ let podman;
 if(needsPodman(env)) {
   const socket=join(tmpdir(),`os-podman-${process.getuid()}.sock`);
   try {
-    podman=await startPodman(env,{socket,proxySocket:join(tmpdir(),`os-podman-${process.getuid()}-${process.pid}.sock`),reuse:true});
+    podman=await startPodman(env,{socket,proxySocket:join(tmpdir(),`os-podman-${process.getuid()}-${process.pid}.sock`),reuse:true,allowLate:true});
     console.log(`Containers run with Podman, through ${socket}`);
   } catch(error) {
     // Preserve ordinary dev startup when the optional container service fails.

@@ -1,57 +1,22 @@
 # PR #66 review measurement changes
 
-Compared with reviewed commit `e433073`. No OS runtime semantics were changed. **23 filesystem rows changed normalized evidence**, and the same three process measurements moved from five duplicated profile copies into one independent section. The new matrix has **120 filesystem rows (17 matching traces and 103 differences/skips), plus three process observations**.
+Compared with reviewed commit `4c6640e`. No OS runtime semantics were changed. **Eight filesystem rows changed**: five have corrected two-account fixture evidence and three have a corrected identity classification. The matrix contains **120 filesystem rows (15 same and 105 differences/skips), plus three unchanged process observations**.
 
-Linux now records both refused busy unmount and successful `umount2(MNT_DETACH)`. Its retained fd survives actual detach; cwd lookup returns ENOENT. OS records its existing detach separately from the unavailable busy-unmount API, then records re-attachment. Missing identity values now use structured markers; the comparison applies to every identity step. `cloud/hard-link` consequently matches on observable inode/call fields while device identity remains explicitly incomparable. This is a measurement correction, not a runtime improvement.
+Both Linux and OS creators now have exactly one configured neutral supplementary group, also the setgid directory's group, distinct from both primary groups. Native setup clears inherited groups before installing that group; OS setup replaces account memberships before login and changes the directory group through ordinary owner permissions. Both creators can demonstrate inheritance. Cloud now matches Linux and its old registry entry is removed. The four private/export profiles still show B's EACCES, publisher ownership and zero-byte file; those runtime differences remain assigned to #49/#59.
+
+Device and inode together identify an object. Missing device evidence no longer permits equality based on a coincident inode alone. Three previously matching rows become incomparable and are assigned to #48; their raw syscall traces did not change. This is a measurement correction, not a runtime regression or an architecture decision.
 
 | Row | Changed steps | Result before → after |
 | --- | --- | --- |
-| cloud/open-rename | OS: identity | same → same |
-| cloud/open-unlink | OS: identity | difference/skip → difference/skip |
-| cloud/unmount-open | Linux: attach, detach, fstat, read | difference/skip → difference/skip |
-| cloud/unmount-cwd | Linux: attach, detach, getcwd | difference/skip → difference/skip |
-| cloud/hard-link | OS: identity | difference/skip → same |
-| browser-storage/alias | OS: identity | difference/skip → difference/skip |
-| browser-storage/open-rename | OS: identity | difference/skip → difference/skip |
-| browser-storage/open-unlink | OS: identity | difference/skip → difference/skip |
-| browser-storage/unmount-open | Linux: attach, detach, fstat, read; OS: attach, detach, fstat, read, unmount | difference/skip → difference/skip |
-| browser-storage/unmount-cwd | Linux: attach, detach, getcwd; OS: attach, detach, getcwd, unmount | difference/skip → difference/skip |
-| directory-handle/alias | OS: identity | difference/skip → difference/skip |
-| directory-handle/open-rename | OS: identity | difference/skip → difference/skip |
-| directory-handle/open-unlink | OS: identity | difference/skip → difference/skip |
-| directory-handle/unmount-open | Linux: attach, detach, fstat, read; OS: attach, detach, fstat, read, unmount | difference/skip → difference/skip |
-| directory-handle/unmount-cwd | Linux: attach, detach, getcwd; OS: attach, detach, getcwd, unmount | difference/skip → difference/skip |
-| local-helper/alias | OS: identity | difference/skip → difference/skip |
-| local-helper/open-rename | OS: identity | same → same |
-| local-helper/open-unlink | OS: identity | difference/skip → difference/skip |
-| local-helper/unmount-open | Linux: attach, detach, fstat, read; OS: attach, detach, fstat, read, unmount | difference/skip → difference/skip |
-| local-helper/unmount-cwd | Linux: attach, detach, getcwd; OS: attach, detach, getcwd, unmount | difference/skip → difference/skip |
-| relay/alias | OS: identity | difference/skip → difference/skip |
-| relay/unmount-open | Linux: attach, detach, fstat, read; OS: attach, detach, fstat, read, unmount | difference/skip → difference/skip |
-| relay/unmount-cwd | Linux: attach, detach, getcwd; OS: attach, detach, getcwd, unmount | difference/skip → difference/skip |
+| cloud/open-rename | Comparison only; raw evidence unchanged | same → difference/incomparable |
+| cloud/hard-link | Comparison only; raw evidence unchanged | same → difference/incomparable |
+| cloud/two-accounts | linux: a-groups, b-groups; os: a-directory, a-inheritance, a-stat | difference/incomparable → same |
+| browser-storage/two-accounts | linux: a-groups, b-groups; os: a-directory, a-inheritance, a-stat | difference/incomparable → difference/incomparable |
+| directory-handle/two-accounts | linux: a-groups, b-groups; os: a-directory, a-inheritance, a-stat | difference/incomparable → difference/incomparable |
+| local-helper/open-rename | Comparison only; raw evidence unchanged | same → difference/incomparable |
+| local-helper/two-accounts | linux: a-groups, b-groups; os: a-directory, a-inheritance, a-stat | difference/incomparable → difference/incomparable |
+| relay/two-accounts | linux: a-groups, b-groups; os: a-directory, a-inheritance, a-stat | difference/incomparable → difference/incomparable |
 
-## Process rows consolidated without changing their results
+For all five two-account rows, Linux `a-groups`/`b-groups` now report the explicitly installed neutral supplementary membership. OS `a-directory` and `a-stat` show a group distinct from A's primary group; `a-inheritance` is measured successfully instead of skipped. B already had a distinct primary group; its creation evidence is unchanged. The fixture checks the exact supplementary membership before recording results.
 
-Each old row below maps to the single new process row; all three normalized Linux/OS traces and signatures are unchanged. The 12 redundant copies are removed.
-
-| Previous row | New row | Result |
-| --- | --- | --- |
-| cloud/startup | process/startup | unchanged observation |
-| browser-storage/startup | process/startup | unchanged observation |
-| directory-handle/startup | process/startup | unchanged observation |
-| local-helper/startup | process/startup | unchanged observation |
-| relay/startup | process/startup | unchanged observation |
-| cloud/gui-processes | process/gui-processes | unchanged observation |
-| browser-storage/gui-processes | process/gui-processes | unchanged observation |
-| directory-handle/gui-processes | process/gui-processes | unchanged observation |
-| local-helper/gui-processes | process/gui-processes | unchanged observation |
-| relay/gui-processes | process/gui-processes | unchanged observation |
-| cloud/tab-pids | process/tab-pids | unchanged observation |
-| browser-storage/tab-pids | process/tab-pids | unchanged observation |
-| directory-handle/tab-pids | process/tab-pids | unchanged observation |
-| local-helper/tab-pids | process/tab-pids | unchanged observation |
-| relay/tab-pids | process/tab-pids | unchanged observation |
-
-The browser-storage `cross-rename` and `absolute-symlink` fixtures now cross into actual cloud storage, with source-only markers proving the trees are distinct. Their normalized outcomes remain EXDEV and ENOENT respectively. Other profiles also verify distinct crossing contents. The CDP drop no longer reaches the application upload handler. These isolation corrections do not otherwise change recorded results.
-
-Both target runs measured source commit `015dbbf` with `dirty:false`. The dirty flag excludes the resolved output directory, including generated timings, while retaining source modifications. The helper is now built in release mode; all cold/warm timings were recollected and remain outside comparison signatures.
+Every other normalized row and all three process observations are unchanged. Signature ordering now uses fixed code-unit order; it did not alter the signatures of this baseline's other rows. Timing and host/provenance evidence are regenerated separately from deterministic observations. Validation commands and platform limits are documented in [README](README.md); the PR records the checks actually completed.

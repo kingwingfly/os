@@ -6,6 +6,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { needsPodman, startPodman } from '../podman.mjs';
 import { conformanceConfig, compilerConfig, captureDirectoryDrop, helperConnection, recordReattach, putFile, mountOutcome, checkAbsentMountCalls, startHeld, heldState, heldRows } from './fixtures.mjs';
 import { ShutdownScope } from '../process.mjs';
+import { containerLease } from './containers.mjs';
 import { performance } from 'node:perf_hooks';
 import { run, targetDir, jsonLines, skip, ok, port, start, stop, sourceEvidence, filesystems, operations, probeOperations } from './common.mjs';
 
@@ -121,7 +122,7 @@ export async function os() {
   const scope=new ShutdownScope();
   const previousMask=process.umask(0o022);
   scope.add('umask',()=>process.umask(previousMask));
-  let server,browser,persistent,helper,log,podman,podmanEnv,initialContainers,compilerEvidence,failure,success=false;
+  let server,browser,persistent,helper,log,podman,compilerEvidence,failure,success=false;
   try {
     const number=await port(),url=`http://127.0.0.1:${number}`;
     const root=resolve('.');
@@ -136,15 +137,9 @@ export async function os() {
       await mkdir(cache,{recursive:true});
       const storage=join(state,'storage.conf');
       await writeFile(storage,`[storage]\ndriver = "overlay"\ngraphroot = ${JSON.stringify(join(cache,'storage'))}\nrunroot = ${JSON.stringify(join(cache,'run'))}\n`);
-      serverEnv.CONTAINERS_STORAGE_CONF=storage;podmanEnv=serverEnv;
-      initialContainers=new Set(run('podman',['--cgroup-manager=cgroupfs','ps','-aq'],{env:serverEnv}).trim().split('\n').filter(Boolean));
+      serverEnv.CONTAINERS_STORAGE_CONF=storage;
       podman=await scope.acquire('Podman service',signal=>startPodman(serverEnv,{signal,socket:join(state,'podman.sock'),proxySocket:join(state,'docker.sock'),stdio:['ignore',log.fd,log.fd],detached:true}),service=>service.close());
     }
-    scope.add('containers',()=>{
-      if(!podmanEnv||!initialContainers)return;
-      const created=run('podman',['--cgroup-manager=cgroupfs','ps','-aq'],{env:podmanEnv,timeout:10000}).trim().split('\n').filter(id=>id&&!initialContainers.has(id));
-      if(created.length)run('podman',['--cgroup-manager=cgroupfs','rm','-f',...created],{env:podmanEnv,stdio:'ignore',timeout:30000});
-    });
     if(process.env.OS_CONFORMANCE_COMPILER_IMAGE) {
       const image=process.env.OS_CONFORMANCE_COMPILER_IMAGE;
       if(!/^[a-zA-Z0-9_./:@-]+$/.test(image))throw new Error('invalid compiler image reference');
@@ -159,6 +154,7 @@ export async function os() {
       await writeFile(join(state,'wrangler.toml'),config);
       console.log('Verified prebuilt compiler source and Binaryen bytes: '+image);
     }
+    await scope.acquire('containers',()=>containerLease(serverEnv,join(state,'owned-containers.sock')),lease=>lease.close());
     const inspectorPort=await port();
     server=scope.own('server',()=>start('node' ,['scripts/dev.mjs','--config',join(state,'wrangler.toml'),'--local','--ip','127.0.0.1','--port',String(number),'--inspector-port',String(inspectorPort),'--persist-to',join(state,'persist')],{stdio:['ignore',log.fd,log.fd],env:serverEnv}),stop);
     console.log(`Isolated OS at ${url}; temporary state ${state}`);
@@ -186,11 +182,17 @@ export async function os() {
       const [result]=(await response.json()).results;
       await registration.close();if(result.err)throw new Error('registration failed: '+result.err.errno);
     }
+    // Give both creators exactly one common supplementary group. It differs
+    // from their primary groups and permits the owner to chgrp private trees.
+    await checked(admin.page,[{groupadd:{name:'conformance-shared'}}]);
+    for(const name of ['conformance-a','conformance-b'])await checked(admin.page,[{usermod:{name,groups:'conformance-shared'}}]);
     const observations={},latencies={},diagnostics=[];
     for (const filesystem of filesystems) {
       console.log('Measuring '+filesystem);
       const a=await account(browser,url,'conformance-a',password,bytes,filesystem==='directory-handle'?persistent:null), b=await account(browser,url,'conformance-b',password,bytes);
       const {page,context,creds}=a;
+      const neutral=creds.groups.filter(g=>g!==creds.gid);
+      if(neutral.length!==1||neutral[0]===b.creds.gid||JSON.stringify(b.creds.groups.filter(g=>g!==b.creds.gid))!==JSON.stringify(neutral))throw new Error('two-account fixture requires distinct primary groups and one neutral supplementary group');
       const source=join(state,filesystem);await mkdir(source);
       let connection,owner,grant;
       const cross=filesystem==='browser-storage'?creds.home+'/cross-browser-storage':'/mnt/local/cross';
@@ -252,7 +254,7 @@ export async function os() {
       // Export metadata is administered at its source; relay chmod is itself
       // measured above and is not a fixture-setup API.
       const setupPage=owner?.page||page, setupRoot=owner?'/mnt/local/source':primary;
-      await checked(setupPage,[{chmod:{path:setupRoot,mode:0o777}},{mkdir:{path:setupRoot+'/two',mode:0o777}},{chmod:{path:setupRoot+'/two',mode:0o2777}}]);
+      await checked(setupPage,[{chmod:{path:setupRoot,mode:0o777}},{mkdir:{path:setupRoot+'/two',mode:0o777}},{chown:{path:setupRoot+'/two',gid:neutral[0]}},{chmod:{path:setupRoot+'/two',mode:0o2777}}]);
       const acl=Buffer.from(JSON.stringify({user:7,group:5,other:0,mask:5,users:{},groups:{65534:4}})).toString('base64');
       await checked(setupPage,[{setxattr:{path:setupRoot+'/two',name:'system.posix_acl_default',value:acl}}]);
       rows.push(...await probe(page,'creator',shared,alias,cross,creds,['a']));

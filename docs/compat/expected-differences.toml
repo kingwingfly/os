@@ -15,6 +15,12 @@ reason = "The current API cannot detach/re-attach the cloud root; explicitly una
 signature = "7c8f354d3d77917e2bfb1a2e0d83b56a2b4fc1f4eef36e0c3a32720fb11246f5"
 
 [[difference]]
+id = "cloud/open-rename"
+issues = ["#48"]
+reason = "Retained descriptor operations and inode equality match, but WASI fstat exposes a fabricated device number. Device identity is unavailable, so full identity remains incomparable until the runtime exposes it."
+signature = "e938ace9663df873da817d1be825993b838d364f4e75e0640cd8b8c4da69d94f"
+
+[[difference]]
 id = "cloud/open-unlink"
 issues = ["#48"]
 reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
@@ -75,16 +81,16 @@ reason = "getcwd returns the removed pathname instead of ENOENT."
 signature = "80d6718291660e01a8fb4975cdb4f82d7394258015b3cfffab2a125dba33e638"
 
 [[difference]]
+id = "cloud/hard-link"
+issues = ["#48"]
+reason = "Cloud link calls and inode equality match, but ABI Stat has no st_dev. Full device/inode identity remains incomparable; inode equality alone cannot prove object identity."
+signature = "28519222474cc924c42a507a7db9150f474dfaa15bdbcb2ab657ea70d1ff6376"
+
+[[difference]]
 id = "cloud/creation"
 issues = ["#49"]
 reason = "Setgid inheritance is explicitly incomparable: creator and directory primary groups coincide. Directory mode/group are measured; metadata follow-up validation must exercise distinct groups."
 signature = "a23f92d93f340f73b7da61189ff4c2e11fd7895160b5391a1e6ef2a94b41e6b2"
-
-[[difference]]
-id = "cloud/two-accounts"
-issues = ["#49"]
-reason = "Account B inherits the directory group. Linux creators now have empty supplementary groups and primary groups distinct from directory group 3; OS accounts report supplementary membership, and creator A inheritance is explicitly unavailable because its primary group equals the directory group."
-signature = "6a86e6a4ff4f1c560d56d47c55b496215cb535e22e722ae78f518da6a1102b2b"
 
 [[difference]]
 id = "cloud/chroot-api"
@@ -215,8 +221,8 @@ signature = "a23f92d93f340f73b7da61189ff4c2e11fd7895160b5391a1e6ef2a94b41e6b2"
 [[difference]]
 id = "browser-storage/two-accounts"
 issues = ["#49","#59"]
-reason = "Account B creates through the authenticated export: writing returns EACCES and leaves a zero-byte file owned by the publisher/parent, not B; inherited group, mode and ACL are recorded. Linux creators now have empty supplementary groups and primary groups distinct from directory group 3; OS accounts report supplementary membership, and creator A inheritance is explicitly unavailable because its primary group equals the directory group."
-signature = "e7aeb10ec55a6374c5132584b7792599598ec4c52bed0478166fe390b80a05b0"
+reason = "Both creators have one neutral supplementary group, matching the directory group and distinct from their primary groups. Both targets record inherited group/mode/ACL. Through the authenticated export, B still receives EACCES and leaves a zero-byte file owned by the publisher/parent instead of B; no fixture mismatch remains."
+signature = "843bff54f19ea09c07a0930f76eb316de3bf54097fce4483ecf4952e9acb2495"
 
 [[difference]]
 id = "browser-storage/chroot-api"
@@ -347,8 +353,8 @@ signature = "a23f92d93f340f73b7da61189ff4c2e11fd7895160b5391a1e6ef2a94b41e6b2"
 [[difference]]
 id = "directory-handle/two-accounts"
 issues = ["#49","#59"]
-reason = "Account B creates through the authenticated export: writing returns EACCES and leaves a zero-byte file owned by the publisher/parent, not B; inherited group, mode and ACL are recorded. Linux creators now have empty supplementary groups and primary groups distinct from directory group 3; OS accounts report supplementary membership, and creator A inheritance is explicitly unavailable because its primary group equals the directory group."
-signature = "e7aeb10ec55a6374c5132584b7792599598ec4c52bed0478166fe390b80a05b0"
+reason = "Both creators have one neutral supplementary group, matching the directory group and distinct from their primary groups. Both targets record inherited group/mode/ACL. Through the authenticated export, B still receives EACCES and leaves a zero-byte file owned by the publisher/parent instead of B; no fixture mismatch remains."
+signature = "843bff54f19ea09c07a0930f76eb316de3bf54097fce4483ecf4952e9acb2495"
 
 [[difference]]
 id = "directory-handle/chroot-api"
@@ -379,6 +385,12 @@ id = "local-helper/remount"
 issues = ["#49"]
 reason = "After detach/attach, mode returns to 0600 and the access ACL disappears."
 signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
+
+[[difference]]
+id = "local-helper/open-rename"
+issues = ["#48"]
+reason = "Retained descriptor operations and inode equality match, but WASI fstat exposes a fabricated device number. Device identity is unavailable, so full identity remains incomparable until the runtime exposes it."
+signature = "e938ace9663df873da817d1be825993b838d364f4e75e0640cd8b8c4da69d94f"
 
 [[difference]]
 id = "local-helper/open-unlink"
@@ -467,8 +479,8 @@ signature = "a23f92d93f340f73b7da61189ff4c2e11fd7895160b5391a1e6ef2a94b41e6b2"
 [[difference]]
 id = "local-helper/two-accounts"
 issues = ["#49","#59"]
-reason = "Account B creates through the authenticated export: writing returns EACCES and leaves a zero-byte file owned by the publisher/parent, not B; inherited group, mode and ACL are recorded. Linux creators now have empty supplementary groups and primary groups distinct from directory group 3; OS accounts report supplementary membership, and creator A inheritance is explicitly unavailable because its primary group equals the directory group."
-signature = "e7aeb10ec55a6374c5132584b7792599598ec4c52bed0478166fe390b80a05b0"
+reason = "Both creators have one neutral supplementary group, matching the directory group and distinct from their primary groups. Both targets record inherited group/mode/ACL. Through the authenticated export, B still receives EACCES and leaves a zero-byte file owned by the publisher/parent instead of B; no fixture mismatch remains."
+signature = "843bff54f19ea09c07a0930f76eb316de3bf54097fce4483ecf4952e9acb2495"
 
 [[difference]]
 id = "local-helper/chroot-api"
@@ -599,8 +611,8 @@ signature = "36f0b903cfc7b2971c9ec901442117fa39906da5190ce28a2098c0c9a14336a9"
 [[difference]]
 id = "relay/two-accounts"
 issues = ["#49","#59"]
-reason = "Account B creates through the authenticated export: writing returns EACCES and leaves a zero-byte file owned by the publisher/parent, not B; inherited group, mode and ACL are recorded. Linux creators now have empty supplementary groups and primary groups distinct from directory group 3; OS accounts report supplementary membership, and creator A inheritance is explicitly unavailable because its primary group equals the directory group."
-signature = "e7aeb10ec55a6374c5132584b7792599598ec4c52bed0478166fe390b80a05b0"
+reason = "Both creators have one neutral supplementary group, matching the directory group and distinct from their primary groups. Both targets record inherited group/mode/ACL. Through the authenticated export, B still receives EACCES and leaves a zero-byte file owned by the publisher/parent instead of B; no fixture mismatch remains."
+signature = "843bff54f19ea09c07a0930f76eb316de3bf54097fce4483ecf4952e9acb2495"
 
 [[difference]]
 id = "relay/chroot-api"

@@ -17,7 +17,7 @@ export function podmanEnvironment(env,proxySocket,miniflare) {
     if(image)env.MINIFLARE_CONTAINER_EGRESS_IMAGE=image.split('/')[0].includes('.')?image:'docker.io/'+image;
   }
 }
-export async function startPodman(env,{socket,proxySocket,reuse=false,stdio='ignore',detached=false,signal,startupTimeout=10000}) {
+export async function startPodman(env,{socket,proxySocket,reuse=false,stdio='ignore',detached=false,signal,startupTimeout=10000,allowLate=false}) {
   let service,proxy,closing;
   const close=()=>closing??=(async()=>{
     try {proxy?.close();} finally {await stop(service);}
@@ -34,7 +34,7 @@ export async function startPodman(env,{socket,proxySocket,reuse=false,stdio='ign
         signal?.throwIfAborted();
         if(service.spawnError)throw service.spawnError;
         if(service.exitCode!==null||service.signalCode!==null)throw new Error('Podman service exited before opening its socket');
-        if(Date.now()>=deadline)throw new Error('Podman service did not start');
+        if(Date.now()>=deadline) {if(allowLate)break;throw new Error('Podman service did not start');}
         await new Promise(resolve=>setTimeout(resolve,50));
       }
       signal?.throwIfAborted();

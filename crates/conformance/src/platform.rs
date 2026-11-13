@@ -21,6 +21,11 @@ pub fn error(e: io::Error) -> String {
         (libc::E2BIG, "E2BIG"),
         (libc::EBADF, "EBADF"),
         (libc::EAGAIN, "EAGAIN"),
+        (libc::EINTR, "EINTR"),
+        (libc::ENOMEM, "ENOMEM"),
+        (libc::EFAULT, "EFAULT"),
+        (libc::EDQUOT, "EDQUOT"),
+        (libc::ENOTCONN, "ENOTCONN"),
         (libc::EACCES, "EACCES"),
         (libc::EBUSY, "EBUSY"),
         (libc::EEXIST, "EEXIST"),
@@ -519,6 +524,12 @@ mod tests {
             (libc::ERANGE, "ERANGE"),
             (libc::ETXTBSY, "ETXTBSY"),
             (libc::EAGAIN, "EAGAIN"),
+            (libc::EINTR, "EINTR"),
+            (libc::ENOMEM, "ENOMEM"),
+            (libc::EFAULT, "EFAULT"),
+            (libc::EDQUOT, "EDQUOT"),
+            (libc::ENOTCONN, "ENOTCONN"),
+            #[cfg(target_os = "linux")]
             (libc::ENODATA, "ENODATA"),
         ] {
             assert_eq!(error(io::Error::from_raw_os_error(code)), name);

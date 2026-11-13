@@ -78,6 +78,16 @@ test('provenance records HEAD and dirtiness without any remote-tracking referenc
     const other=join(dir,'out [literal]');await mkdir(other);await writeFile(join(other,'baseline.json'),'generated');
     await writeFile(join(out,'latency.json'),'initial');assert.equal(revision(dir,other).dirty,false);
     assert.equal(revision(dir,dir).dirty,true); // --out=. must not hide the source tree.
+    for(const file of ['expected-differences.toml','follow-up-issues.json','README.md','extra-source.mjs']) {
+      await writeFile(join(other,file),'manual input');assert.equal(revision(dir,other).dirty,true,file);
+      await rm(join(other,file));
+    }
+    await rm(other,{recursive:true});assert.equal(revision(dir,out).dirty,false);
+    await writeFile(join(out,'README.md'),'input');
+    run('git',['add','docs/compat/README.md'],{cwd:dir});
+    run('git',['-c','core.hooksPath=/dev/null','-c','commit.gpgSign=false','-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--no-gpg-sign','--no-verify','--quiet','-m','input'],{cwd:dir,env});
+    assert.equal(revision(dir,out).dirty,false);
+    await writeFile(join(out,'README.md'),'edited input');assert.equal(revision(dir,out).dirty,true);
     await writeFile(join(dir,'source'),'two');assert.equal(revision(dir,other).dirty,true);
   } finally {await rm(dir,{recursive:true,force:true});}
 });

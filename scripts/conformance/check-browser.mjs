@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { captureDirectoryDrop } from './fixtures.mjs';
 import { ShutdownScope } from '../process.mjs';
 const scope=new ShutdownScope();
+let failure;
 try {
   const dir=await mkdtemp(join(tmpdir(),'conformance-drop-'));scope.add('fixture',()=>rm(dir,{recursive:true,force:true}));
   await writeFile(join(dir,'source.txt'),'unchanged');
@@ -27,4 +28,4 @@ try {
   assert.deepEqual(result,{kind:'directory',uploads:0,bubbled:0});
   assert.equal(await readFile(join(dir,'source.txt'),'utf8'),'unchanged');
   console.log('Chromium CDP drop acquired a real directory handle without triggering upload or bubbling handlers.');
-} finally {const errors=await scope.close();if(errors.length)throw new AggregateError(errors.map(e=>e.error),'browser gate cleanup');}
+} catch(error) {failure=error;throw error;} finally {const errors=await scope.close();if(errors.length&&!failure)throw new AggregateError(errors.map(e=>e.error),'browser gate cleanup');}

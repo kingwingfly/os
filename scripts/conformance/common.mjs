@@ -34,10 +34,12 @@ export function revision(cwd='.',out=null) {
     const root=run('git',['rev-parse','--show-toplevel'],{cwd}).trim();
     const output=resolve(out),path=relative(root,existsSync(output)?realpathSync(output):output);
     // Never exclude the whole source tree when --out is the repository root.
-    if(path&&path!=='..'&&!path.startsWith('../')&&!isAbsolute(path))exclusions.push(':(exclude,literal)'+path);
+    if(path!=='..'&&!path.startsWith('../')&&!isAbsolute(path)) {
+      for(const file of ['baseline.json','latency.json','linux-latency.json','evidence.json','linux-evidence.json','matrix.md'])exclusions.push(':(exclude,literal)'+join(path,file));
+    }
   }
   return {
     head:run('git',['rev-parse','HEAD'],{cwd}).trim(),
-    dirty:!!run('git',['status','--porcelain','--untracked-files=normal','--',':/',...exclusions],{cwd}).trim(),
+    dirty:!!run('git',['status','--porcelain','--untracked-files=all','--',':/',...exclusions],{cwd}).trim(),
   };
 }

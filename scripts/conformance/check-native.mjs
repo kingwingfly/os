@@ -18,6 +18,10 @@ try {
   process.env.TMPDIR=linked;
   const second=await linux({binary,measureLatency:false,namespaceProbe:()=>({status:1,stderr:'different diagnostic'})});
   assert.deepEqual(first.observations,second.observations);
+  for(const name of ['alias','remount','unmount-open','unmount-cwd','cross-rename','absolute-symlink','mount-parent','mount-api','umount-api','chroot-api','cloud-to-provider']) {
+    const rows=first.observations.filter(r=>r.case===name);
+    assert.equal(rows.length,1);assert(rows[0].skipped,name);
+  }
   assert(!JSON.stringify(second.observations).includes(dir));
   for(const mode of ['creator','latency']) {
     const result=spawnSync(binary,[mode,dir,dir,dir,'1','1'],{encoding:'utf8'});

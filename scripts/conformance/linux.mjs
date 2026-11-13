@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, readFile, writeFile, chmod, readlink, realpath } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, readFile, chmod, readlink, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
@@ -21,11 +21,7 @@ export async function linux({namespaceProbe=spawnSync,binary=buildProbe(),measur
       observations.push(...jsonLines(run('unshare',['-Urm',...(mapped.status===0?['--map-auto']:[]),binary,'namespace',dir,dir,dir,'0','0'])));
     } else {
       const tree=join(dir,'tree');await mkdir(tree);
-      // Keep even the discarded cross-mount probe well formed. The fallback
-      // cannot measure mount crossings and must never turn ENOENT into a pass.
-      await writeFile(join(tree,'target'),'target');
-      const rows=jsonLines(run(binary,['basic',tree,tree,tree,String(process.getuid()),String(process.getgid())]));
-      observations.push(...withoutMountNamespace(rows));
+      observations.push(...jsonLines(run(binary,['no-mounts',tree,tree,tree,String(process.getuid()),String(process.getgid())])));
     }
     const two=join(dir,'two');await mkdir(two);
     if (mapped.status===0) observations.push(...jsonLines(run('unshare',['-Urm','--map-auto',binary,'two-linux',two,two,two,'0','0'])));
@@ -49,7 +45,7 @@ export async function linux({namespaceProbe=spawnSync,binary=buildProbe(),measur
         const started=performance.now();let elapsed;
         if(operation==='shell-first-prompt') {
           elapsed=await new Promise((resolve,reject)=>{
-            const shell=spawn('/bin/sh',['-i'],{env:{...process.env,PS1:'CONFORMANCE_PROMPT> '},cwd:timingRoot});
+            const shell=spawn('/bin/sh',['-i'],{env:{...process.env,ENV:undefined,PS1:'CONFORMANCE_PROMPT> '},cwd:timingRoot});
             let output='',done=false;
             const timeout=setTimeout(()=>{shell.kill();reject(new Error('native shell prompt timeout'));},10000);
             shell.stderr.on('data',data=>{output+=data;if(!done&&output.includes('CONFORMANCE_PROMPT>')){done=true;elapsed=performance.now()-started;shell.stdin.end('exit\n');}});
@@ -66,10 +62,4 @@ export async function linux({namespaceProbe=spawnSync,binary=buildProbe(),measur
     }
     return {observations,process:processRows,latency,evidence};
   } finally {await rm(dir,{recursive:true,force:true});}
-}
-
-// Pure assembly keeps routine tests independent of Cargo, namespaces and timings.
-export function withoutMountNamespace(rows) {
-  const unavailable=['alias','remount','unmount-open','unmount-cwd','cross-rename','absolute-symlink','mount-parent','mount-api','umount-api','chroot-api','cloud-to-provider'];
-  return [...unavailable.map(name=>skip(name,'rootless mount namespace unavailable; see linux-evidence.json')),...rows.filter(row=>!unavailable.includes(row.case))];
 }
