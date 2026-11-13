@@ -1,4 +1,30 @@
 import { createInterface } from 'node:readline';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
+export function browserOptions() {
+  const env={...process.env};delete env.DISPLAY;
+  return {channel:'chromium',headless:true,env,handleSIGINT:false,handleSIGTERM:false,
+    viewport:{width:1440,height:1000},args:['--ozone-platform=headless','--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader']};
+}
+export async function directoryProfile(profile) {
+  // Full Chromium's permission context can grant the selected real directory;
+  // an incognito context or headless-shell's delegate denies write requests.
+  await mkdir(join(profile,'Default'),{recursive:true});
+  await writeFile(join(profile,'Default/Preferences'),JSON.stringify({profile:{default_content_setting_values:{file_system_read_guard:1,file_system_write_guard:1}}}));
+  return profile;
+}
+export async function mountHandle(page,context,dir) {
+  await page.evaluate(captureDirectoryDrop);
+  const cdp=await context.newCDPSession(page);
+  try {
+    for(const type of ['dragEnter','dragOver','drop'])await cdp.send('Input.dispatchDragEvent',{type,x:500,y:300,data:{items:[],files:[dir],dragOperationsMask:1}});
+  } finally {await cdp.detach();}
+  await page.evaluate(async()=>{window.conformanceHandle=await window.conformanceHandle;});
+  await page.mouse.click(500,300);
+  const permission=await page.evaluate(()=>window.conformanceHandle.requestPermission({mode:'readwrite'}));
+  if(permission!=='granted')throw new Error('host directory write grant unavailable: '+permission);
+}
 
 export function replaceExactly(text,pattern,replacement,label,count=1) {
   const regex=typeof pattern==='string'?null:new RegExp(pattern.source,pattern.flags.includes('g')?pattern.flags:pattern.flags+'g');

@@ -1,12 +1,35 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, mkdtemp, writeFile, mkdir, rm } from 'node:fs/promises';
+import { readFile, mkdtemp, writeFile, mkdir, rm, chmod, symlink, stat } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { conformanceConfig, replaceExactly, compilerConfig, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from '../scripts/conformance/fixtures.mjs';
 import { podmanEnvironment } from '../scripts/podman.mjs';
 import { saveRun } from '../scripts/conformance/results.mjs';
-import { run, revision } from '../scripts/conformance/common.mjs';
+import { run, revision, ports } from '../scripts/conformance/common.mjs';
+import { imageStore } from '../scripts/conformance/storage.mjs';
+
+test('image store rejects shared permissions and symlinks before loading images',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-store-'));
+  try {
+    const path=join(dir,'images');assert.equal(await imageStore(path),path);
+    assert.equal((await stat(path)).mode&0o777,0o700);
+    assert.equal(await imageStore(path),path);
+    await chmod(path,0o755);await assert.rejects(imageStore(path),/owned directory with mode 0700/);
+    await chmod(path,0o700);await symlink(path,join(dir,'link'));
+    await assert.rejects(imageStore(join(dir,'link')),/owned directory with mode 0700/);
+  } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+test('server and inspector ports are reserved together and then released',async()=>{
+  const selected=await ports(8);assert.equal(new Set(selected).size,8);
+  for(const port of selected) {
+    const s=createServer();
+    try {await new Promise((resolve,reject)=>s.once('error',reject).listen(port,'127.0.0.1',resolve));}
+    finally {await new Promise(resolve=>s.close(resolve));}
+  }
+});
 
 test('temporary configuration uses absolute paths, removes build/archive sections and rejects drift',async()=>{
   const source=await readFile('wrangler.toml','utf8');

@@ -22,7 +22,17 @@ export function canonical(value) {
 }
 export const serialize = value => JSON.stringify(canonical(value),null,2)+'\n';
 export async function save(out,name,value) {await mkdir(out,{recursive:true});await writeFile(join(out,name),serialize(value));}
-export async function port() {const s=createServer();await new Promise((resolve,reject)=>s.once('error',reject).listen(0,'127.0.0.1',resolve));const port=s.address().port;await new Promise(resolve=>s.close(resolve));return port;}
+export async function ports(count) {
+  const listeners=[];
+  try {
+    for(let i=0;i<count;i++) {
+      const s=createServer();listeners.push(s);
+      await new Promise((resolve,reject)=>s.once('error',reject).listen(0,'127.0.0.1',resolve));
+    }
+    return listeners.map(s=>s.address().port);
+  } finally {await Promise.all(listeners.map(s=>new Promise(resolve=>s.close(resolve))));}
+}
+export async function port() {return (await ports(1))[0];}
 export function start(cmd,args,options={}) {return spawnOwned(cmd,args,{detached:true,...options});}
 export async function sourceEvidence(path,fragments) {
   const text=await readFile(path,'utf8');

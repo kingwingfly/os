@@ -11,6 +11,21 @@ const request=(socket,method,path,body)=>new Promise((resolve,reject)=>{
     const chunks=[];res.on('data',c=>chunks.push(c));res.on('end',()=>resolve(JSON.parse(Buffer.concat(chunks)||'null')));res.on('error',reject);
   });req.on('error',reject);req.end(body?JSON.stringify(body):undefined);
 });
+for(const scenario of ['missing list','invalid list','already deleted'])test('container cleanup reports '+scenario,async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-engine-error-')),socket=join(dir,'engine.sock');let lease;
+  const server=http.createServer((req,res)=>{
+    res.setHeader('Content-Type','application/json');
+    if(req.method==='DELETE'||scenario==='missing list') {res.statusCode=404;res.end('{"message":"missing endpoint"}');}
+    else res.end(JSON.stringify(scenario==='invalid list'?{message:'unexpected shape'}:[{Id:'removed'}]));
+  });
+  try {
+    server.listen(socket);await once(server,'listening');
+    lease=await containerLease({DOCKER_HOST:'unix://'+socket},join(dir,'proxy.sock'));
+    const closing=lease.close();lease=null;
+    if(scenario==='already deleted')await closing;
+    else await assert.rejects(closing,scenario==='missing list'?/cleanup GET: 404.*missing endpoint/:/cleanup GET: expected an array/);
+  } finally {await lease?.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await rm(dir,{recursive:true,force:true});}
+});
 for(const selection of ['docker context','DOCKER_HOST','WRANGLER_DOCKER_HOST'])test('container ownership and cleanup through '+selection,async()=>{
   const dir=await mkdtemp(join(tmpdir(),'conformance-engine-')),socket=join(dir,'engine.sock');
   const containers=new Map([['existing',{Id:'existing',Labels:{}}]]),removed=[];let lease,created;

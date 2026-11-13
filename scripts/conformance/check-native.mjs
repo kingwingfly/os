@@ -45,8 +45,8 @@ try {
   await writeFile(wrapper,'#!'+process.execPath+'\n'+
     `import {spawnSync} from 'node:child_process';const r=spawnSync('strace',['-qq','-e','trace=mount','-e','inject=mount:error=EBUSY:when=5',${JSON.stringify(binary)},...process.argv.slice(2)],{stdio:'inherit'});process.exit(r.status??1);\n`,{mode:0o755});
   let failed;
-  try {await linux({binary:wrapper,measureLatency:false});assert.fail('injected mount failure was not reached');}
-  catch(error){failed=error;assert(error.stateDir);}
+  try {await linux({binary:wrapper,measureLatency:false});}catch(error){failed=error;}
+  assert(failed?.stateDir,'injected mount failure was not reached');
   try {
     const kept=JSON.parse(await readFile(join(failed.stateDir,'observations.json'),'utf8'));
     assert(kept.some(r=>r.case==='alias'&&r.step==='create'));
@@ -73,7 +73,23 @@ try {
   assert.equal(full.observations.find(r=>r.case==='unmount-open'&&r.step==='read').ok,'hello');
   assert.equal(full.observations.find(r=>r.case==='unmount-cwd'&&r.step==='getcwd').errno,'ENOENT');
   assert(!Object.hasOwn(full,'latency'));
-  console.log('Native integration: actual MNT_DETACH with retained fd/cwd, fallback repetition, symlinked TMPDIR, partial/10000-ID mappings, denied setgroups, retained panic output, single-stat timing and CLI usage passed.');
+  const creators=full.observations.filter(r=>r.case==='two-accounts');
+  for(const name of ['a','b']) {
+    assert.equal(creators.find(r=>r.step===name+'-create').ok,null);
+    assert.equal(creators.find(r=>r.step===name+'-stat').ok.owner_is_caller,true);
+    assert.deepEqual(creators.find(r=>r.step===name+'-inheritance').ok,{group_is_parent:true,group_is_caller:false});
+  }
+  if(previousTmp===undefined)delete process.env.TMPDIR;else process.env.TMPDIR=previousTmp;
+  const ordinary=await linux({binary,measureLatency:false});
+  assert.deepEqual(ordinary.observations,full.observations,'private TMPDIR ancestors changed measured semantics');
+  const cloud=join(dir,'cloud'),cross=join(dir,'cross');await mkdir(cloud);await mkdir(cross);
+  const cloudRows=jsonLines(run(binary,['basic-cloud',cloud,cloud,cross,String(process.getuid()),String(process.getgid())]));
+  for(const name of ['alias','mount-parent','remount','unmount-open','unmount-cwd']) {
+    const rows=cloudRows.filter(r=>r.case===name);assert.equal(rows.length,1);assert(rows[0].skipped,name);
+  }
+  await assert.rejects(readFile(join(cloud,'alias-file')),{code:'ENOENT'});
+
+  console.log('Native integration: actual MNT_DETACH with retained fd/cwd, fallback repetition, symlinked TMPDIR, partial/10000-ID mappings, denied setgroups, retained panic output, single-stat timing, private TMPDIR creator parity, probe-owned cloud skips and CLI usage passed.');
 } finally {
   if(previousTmp===undefined)delete process.env.TMPDIR;else process.env.TMPDIR=previousTmp;
   await rm(dir,{recursive:true,force:true});

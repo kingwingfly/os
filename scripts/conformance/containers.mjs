@@ -34,7 +34,7 @@ export async function containerLease(env,socket) {
   const request=(method,path)=>new Promise((resolve,reject)=>{
     const req=http.request({socketPath:socket,method,path},res=>{
       const chunks=[];res.on('data',c=>chunks.push(c));res.on('error',reject);
-      res.on('end',()=>{const body=Buffer.concat(chunks).toString();if(res.statusCode>=400&&res.statusCode!==404)reject(new Error(`container cleanup ${method}: ${res.statusCode} ${body}`));else resolve(body);});
+      res.on('end',()=>{const body=Buffer.concat(chunks).toString();if(res.statusCode>=400&&!(method==='DELETE'&&res.statusCode===404))reject(new Error(`container cleanup ${method}: ${res.statusCode} ${body}`));else resolve(body);});
     });
     req.setTimeout(30000,()=>req.destroy(new Error('container cleanup timeout')));req.on('error',reject);req.end();
   });
@@ -42,6 +42,7 @@ export async function containerLease(env,socket) {
     try {
       const filters=encodeURIComponent(JSON.stringify({label:Object.entries(label).map(([k,v])=>k+'='+v)}));
       const containers=JSON.parse(await request('GET','/containers/json?all=true&filters='+filters));
+      if(!Array.isArray(containers))throw new Error('container cleanup GET: expected an array');
       for(const {Id} of containers)await request('DELETE','/containers/'+encodeURIComponent(Id)+'?force=true');
     } finally {proxy.closeAllConnections();await new Promise((resolve,reject)=>proxy.close(error=>error?reject(error):resolve()));}
   }};

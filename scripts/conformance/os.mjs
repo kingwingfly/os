@@ -4,11 +4,12 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { needsPodman, startPodman } from '../podman.mjs';
-import { conformanceConfig, compilerConfig, captureDirectoryDrop, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from './fixtures.mjs';
+import { conformanceConfig, compilerConfig, mountHandle, browserOptions, directoryProfile, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from './fixtures.mjs';
 import { ShutdownScope } from '../process.mjs';
 import { containerLease } from './containers.mjs';
+import { imageStore } from './storage.mjs';
 import { performance } from 'node:perf_hooks';
-import { run, targetDir, jsonLines, skip, ok, port, start, stop, sourceEvidence, filesystems, operations, probeOperations } from './common.mjs';
+import { run, targetDir, jsonLines, skip, ok, ports, start, stop, sourceEvidence, filesystems, operations, probeOperations } from './common.mjs';
 
 async function batch(page,calls,options={}) {
   return page.evaluate(async ({calls,options})=>{
@@ -53,16 +54,6 @@ async function account(browser,url,name,password,bytes,existingContext=null) {
   const page=await context.newPage();await ready(page,url);await uploadTool(page,bytes);
   const [creds]=await checked(page,['getcreds']);
   return {context,page,creds};
-}
-async function mountHandle(page,context,dir) {
-  await page.evaluate(captureDirectoryDrop);
-  const cdp=await context.newCDPSession(page);
-  for (const type of ['dragEnter','dragOver','drop']) await cdp.send('Input.dispatchDragEvent',{type,x:500,y:300,data:{items:[],files:[dir],dragOperationsMask:1}});
-  await cdp.detach();
-  await page.evaluate(async ()=>{window.conformanceHandle=await window.conformanceHandle;});
-  await page.mouse.click(500,300);
-  const permission=await page.evaluate(()=>window.conformanceHandle.requestPermission({mode:'readwrite'}));
-  if(permission!=='granted')throw new Error('host directory write grant unavailable: '+permission);
 }
 async function held(page,mode,root,alias,cross,creds,diagnostics) {
   const args=[mode,root,alias,cross,String(creds.uid),String(creds.gid)];
@@ -125,7 +116,7 @@ export async function os() {
   // This must run inside close(), before signal/error termination can exit.
   scope.add('retained state notice',()=>{if(!success||scope.fatal)retained();});
   try {
-    const number=await port(),url=`http://127.0.0.1:${number}`;
+    const [number,inspectorPort]=await ports(2),url=`http://127.0.0.1:${number}`;
     const root=resolve('.');
     let config=conformanceConfig(await readFile('wrangler.toml','utf8'),root);
     await writeFile(join(state,'wrangler.toml'),config);
@@ -134,8 +125,7 @@ export async function os() {
     log=await scope.acquire('log',()=>open(join(state,'server.log'),'w'),file=>file.close());
     const serverEnv={...process.env};
     if (needsPodman(serverEnv)) {
-      const cache=resolve(process.env.OS_CONFORMANCE_PODMAN_DIR||join(tmpdir(),'os-conformance-images-'+process.getuid()));
-      await mkdir(cache,{recursive:true});
+      const cache=await imageStore(process.env.OS_CONFORMANCE_PODMAN_DIR);
       const storage=join(state,'storage.conf');
       await writeFile(storage,`[storage]\ndriver = "overlay"\ngraphroot = ${JSON.stringify(join(cache,'storage'))}\nrunroot = ${JSON.stringify(join(cache,'run'))}\n`);
       serverEnv.CONTAINERS_STORAGE_CONF=storage;
@@ -156,7 +146,6 @@ export async function os() {
       console.log('Verified prebuilt compiler source and Binaryen bytes: '+image);
     }
     await scope.acquire('containers',()=>containerLease(serverEnv,join(state,'owned-containers.sock')),lease=>lease.close());
-    const inspectorPort=await port();
     server=scope.own('server',()=>start('node' ,['scripts/dev.mjs','--config',join(state,'wrangler.toml'),'--local','--ip','127.0.0.1','--port',String(number),'--inspector-port',String(inspectorPort),'--persist-to',join(state,'persist')],{stdio:['ignore',log.fd,log.fd],env:serverEnv}),stop);
     console.log(`Isolated OS at ${url}; temporary state ${state}`);
     const until=Date.now()+900000;
@@ -168,13 +157,8 @@ export async function os() {
       if(Date.now()>until)throw new Error('isolated server startup timeout; inspect '+join(state,'server.log'));
       await new Promise(r=>setTimeout(r,300));
     }
-    const env={...process.env};delete env.DISPLAY;
-    const profile=join(state,'profile');await mkdir(join(profile,'Default'),{recursive:true});
-    // Chrome's ordinary permission context (not headless-shell's denial-only
-    // delegate) gives the explicitly selected fixture a write grant. No mocked
-    // handle or provider method is substituted. Incognito profiles remain separate.
-    await writeFile(join(profile,'Default/Preferences'),JSON.stringify({profile:{default_content_setting_values:{file_system_read_guard:1,file_system_write_guard:1}}}));
-    persistent=await scope.acquire('browser',()=>chromium.launchPersistentContext(profile,{channel:'chromium',headless:true,env,viewport:{width:1440,height:1000},args:['--ozone-platform=headless','--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader']}),context=>context.browser()?.close());
+    const profile=await directoryProfile(join(state,'profile'));
+    persistent=await scope.acquire('browser',()=>chromium.launchPersistentContext(profile,browserOptions()),context=>context.close());
     browser=persistent.browser();
     const admin=await account(browser,url,'root',password,bytes);
     for (const name of ['conformance-a','conformance-b']) {
@@ -191,10 +175,10 @@ export async function os() {
     for (const filesystem of filesystems) {
       console.log('Measuring '+filesystem);
       const persist=rows=>writeFile(join(state,filesystem+'-observations.json'),JSON.stringify(rows,null,2));
-      const a=await account(browser,url,'conformance-a',password,bytes,filesystem==='directory-handle'?persistent:null), b=await account(browser,url,'conformance-b',password,bytes);
+      const [a,b]=await Promise.all([account(browser,url,'conformance-a',password,bytes,filesystem==='directory-handle'?persistent:null),account(browser,url,'conformance-b',password,bytes)]);
       const {page,context,creds}=a;
       const neutral=creds.groups.filter(g=>g!==creds.gid);
-      if(neutral.length!==1||neutral[0]===b.creds.gid||JSON.stringify(b.creds.groups.filter(g=>g!==b.creds.gid))!==JSON.stringify(neutral))throw new Error('two-account fixture requires distinct primary groups and one neutral supplementary group');
+      if(creds.gid===b.creds.gid||neutral.length!==1||neutral[0]===b.creds.gid||JSON.stringify(b.creds.groups.filter(g=>g!==b.creds.gid))!==JSON.stringify(neutral))throw new Error('two-account fixture requires distinct primary groups and one neutral supplementary group');
       const source=join(state,filesystem);await mkdir(source);
       let connection,owner,grant;
       const cross=filesystem==='browser-storage'?creds.home+'/cross-browser-storage':'/mnt/local/cross';
@@ -228,17 +212,13 @@ export async function os() {
         const [result]=await batch(page,[{stat:{path}}]);
         if(result.err?.errno!=='ENOENT')throw new Error('crossing fixture aliases the primary tree: '+path);
       }
-      let rows=await probe(page,'basic',primary,alias,cross,creds);
+      const rows=await probe(page,filesystem==='cloud'?'basic-cloud':'basic',primary,alias,cross,creds);
       await writeFile(join(state,filesystem+'-basic.json'),JSON.stringify(rows,null,2));
-      if(filesystem==='cloud')rows=rows.filter(r=>!['alias','mount-parent'].includes(r.case)).concat(
-        skip('alias','not implemented: cloud tree has no second attachment API'),
-        skip('mount-parent','account home is a subdirectory; no cloud mount-root attachment API'));
 
       await checked(page,[{mkdir:{path:creds.home+'/links-'+filesystem,mode:0o700}}]);
       await put(page,primary+'/target',Buffer.from('target'));
       rows.push(...await probe(page,'cloud-link',creds.home+'/links-'+filesystem,alias,filesystem==='cloud'?cross:primary,creds));
-      if(filesystem==='cloud') for(const name of ['remount','unmount-open','unmount-cwd'])rows.push(skip(name,'not implemented: cloud root cannot be detached through the current mount API'));
-      else {
+      if(filesystem!=='cloud') {
         rows.push(...await probe(page,'remount-prepare',primary,alias,cross,creds));
         const detached={case:'remount',step:'detach',call:'umount(mount)',...await page.evaluate(mountOutcome,{operation:'detach',path:primary})};
         rows.push(detached);

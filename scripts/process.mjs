@@ -14,20 +14,15 @@ export function stop(child,{timeout=5000}={}) {
   if(stopping.has(child))return stopping.get(child);
   const done=(async()=>{
     const kill=signal=>{
+      // Once reaped, the PID (and hence process-group ID) can be reused.
+      if(child.exitCode!==null||child.signalCode!==null)return;
       try {if(child.processGroup)process.kill(-child.pid,signal);else child.kill(signal);}
       catch(error) {if(error.code!=='ESRCH')throw error;}
     };
-    if(child.exitCode!==null||child.signalCode!==null) {
-      if(child.processGroup)kill('SIGKILL');
-      return;
-    }
+    if(child.exitCode!==null||child.signalCode!==null)return;
     const exited=new Promise(resolve=>child.once('exit',resolve));
     kill('SIGTERM');const timer=setTimeout(()=>kill('SIGKILL'),timeout);
-    try {await exited;} finally {
-      clearTimeout(timer);
-      // A detached leader can exit before its descendants. Reap its entire group.
-      if(child.processGroup)kill('SIGKILL');
-    }
+    try {await exited;} finally {clearTimeout(timer);}
   })();
   stopping.set(child,done);return done;
 }

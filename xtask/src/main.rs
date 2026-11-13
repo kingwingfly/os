@@ -10,7 +10,7 @@ use std::{
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-const HELP: &str = "cargo xtask conformance --target linux|os [--out DIR] | --check [--out DIR]\n\
+const HELP: &str = "cargo xtask conformance --target linux|os [--out DIR] | --check [--recorded] [--out DIR] | --report [--out DIR]\n\
 cargo xtask build [build.mjs options]\n\
 cargo xtask image --root TREE --kind base|sysext|confext|workload --out PACKAGE [--name NAME] [--revision REV]\n\
 cargo xtask boot --assets DIST --out BUNDLE [--name NAME] [--sysext PACKAGE] [--confext PACKAGE]\n\

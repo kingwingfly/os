@@ -6,7 +6,7 @@ import { mkdtemp, writeFile, readFile, rm, symlink, stat, open } from 'node:fs/p
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { start, stop } from '../scripts/process.mjs';
-import { startPodman } from '../scripts/podman.mjs';
+import { startPodman, socketLive, podmanEnvironment } from '../scripts/podman.mjs';
 import { helperConnection } from '../scripts/conformance/fixtures.mjs';
 const moduleURL=new URL('../scripts/process.mjs',import.meta.url).href;
 const exists=pid=>{try {process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}};
@@ -113,7 +113,7 @@ test('optional dev bootstrap retains a late Podman service and wires the proxy',
 });
 
 
-test('reuse never probes, unlinks or owns another session’s existing Podman socket',async()=>{
+test('reuse connects without waiting for an API response and never unlinks or owns a live shared socket',async()=>{
   const dir=await mkdtemp(join(tmpdir(),'conformance-borrow-')),socket=join(dir,'shared.sock'),marker=join(dir,'invoked');
   const server=http.createServer((_req,res)=>res.end('shared owner'));let borrowed;
   const get=()=>new Promise((resolve,reject)=>{http.get({socketPath:socket,path:'/_ping'},res=>{let value='';res.on('data',c=>{value+=c;});res.on('end',()=>resolve(value));}).on('error',reject);});
@@ -127,6 +127,35 @@ test('reuse never probes, unlinks or owns another session’s existing Podman so
     await borrowed.close();borrowed=null;
     assert.equal((await stat(socket)).ino,inode);assert.equal(await get(),'shared owner');
   } finally {await borrowed?.close();await new Promise(resolve=>server.close(resolve));await rm(dir,{recursive:true,force:true});}
+});
+
+test('stop never signals a reaped process group',async()=>{
+  const child=start(process.execPath,['-e',''],{detached:true,stdio:'ignore'});
+  await once(child,'exit');
+  const original=process.kill;const signals=[];
+  try {process.kill=(...args)=>{signals.push(args);};await stop(child);assert.deepEqual(signals,[]);}
+  finally {process.kill=original;}
+});
+
+test('stale shared socket gets a private service without unlinking the shared name',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-stale-')),socket=join(dir,'shared.sock');let service;
+  const child=start(process.execPath,['-e',`require('node:net').createServer().listen(${JSON.stringify(socket)},()=>console.log('ready'))`],{stdio:['ignore','pipe','pipe']});
+  try {
+    await firstLine(child);const exited=once(child,'exit');child.kill('SIGKILL');await exited;
+    assert.equal(await socketLive(socket),false);const inode=(await stat(socket)).ino;
+    await writeFile(join(dir,'podman'),'#!'+process.execPath+'\n'+`require('node:net').createServer().listen(process.argv.at(-1).slice(7));\n`,{mode:0o755});
+    service=await startPodman({...process.env,PATH:dir},{socket,proxySocket:join(dir,'proxy.sock'),reuse:true,detached:true});
+    assert.notEqual(service.socket,socket);assert.equal(await socketLive(service.socket),true);
+    assert.equal((await stat(socket)).ino,inode);
+    const owned=service.socket;await service.close();service=null;
+    await assert.rejects(stat(owned),{code:'ENOENT'});assert.equal((await stat(socket)).ino,inode);
+  } finally {await service?.close();await stop(child);await rm(dir,{recursive:true,force:true});}
+});
+
+test('Podman configuration leaves the environment untouched on lookup failure',()=>{
+  const env={ORIGINAL:'retained'};
+  assert.throws(()=>podmanEnvironment(env,'/tmp/proxy',{}),/match/);
+  assert.deepEqual(env,{ORIGINAL:'retained'});
 });
 
 test('helper startup stderr survives its failed connection announcement in the runner log',async()=>{

@@ -1,29 +1,22 @@
 # PR #66 review measurement changes
 
-Compared with reviewed commit `21e8bcc`. No OS runtime semantics were changed. **Eleven compatibility rows changed their evidence, with no classification changes**: ten rename/unlink rows and one GUI observation. The matrix still contains **120 filesystem rows (15 same and 105 differences/skips), plus three process observations**.
+Compared with reviewed commit `7ddf26a`. **No normalized compatibility or process row changed its result, signature or classification.** The matrix still contains **120 filesystem rows (15 same and 105 differences/skips), plus three process observations**. No difference-registry entries or signatures were added, removed or changed. No OS runtime semantics or architecture decisions were changed.
 
-Descriptor identity is recorded in separate `identity-before` and `identity-after` rows. On Linux and the cloud/browser-storage/directory-handle/local-helper profiles, both calls succeed; existing device/inode availability and identity relations are unchanged. On relay, the before call succeeds and the after call returns ENOENT for both rename and unlink. The relation is now explicitly skipped instead of attributing that errno to an ambiguous combined step. Those differences retain their existing follow-up issues.
+| Changed result rows | Count |
+| --- | --- |
+| Filesystem rows | 0 of 120 |
+| Process observations | 0 of 3 |
 
-The GUI observation removes the hard-coded `mounts_opened`, `editor_opened` and `preview_opened` fields. The runner still asserts that each application opens before recording its actual process images; all measured process images and Files visibility are unchanged.
+The raw cloud trace now emits the alias, mount-parent, remount and held-unmount skips from the Rust `basic-cloud` mode, at the probe's capability boundaries. Previously the runner executed and discarded alias/mount-parent observations, then appended replacement skips. The unsupported operations are no longer attempted, and the skip rows occur earlier in the raw JSON array. Every row retains the same outcome and normalized comparison signature. Native and all four other filesystem raw traces are unchanged.
 
-| Row | Changed steps | Result before → after |
-| --- | --- | --- |
-| cloud/open-rename | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
-| cloud/open-unlink | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
-| browser-storage/open-rename | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
-| browser-storage/open-unlink | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
-| directory-handle/open-rename | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
-| directory-handle/open-unlink | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
-| local-helper/open-rename | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
-| local-helper/open-unlink | linux: identity-after, identity-before; os: identity-after, identity-before | difference/incomparable → difference/incomparable |
-| relay/open-rename | linux: identity-after, identity-before; os: identity, identity-after, identity-before | difference/incomparable → difference/incomparable |
-| relay/open-unlink | linux: identity-after, identity-before; os: identity, identity-after, identity-before | difference/incomparable → difference/incomparable |
-| process/gui-processes | os: ps | observation → observation |
+The native two-account fixture now enters its mounted tree before dropping privileges and uses relative paths. Private TMPDIR ancestors no longer cause unrelated EACCES results. The regression gate requires successful create/stat/setgid inheritance for both creators under a private ancestor and identical observations under an ordinary temporary directory. The previously committed full reference used a searchable path, so its two-account outcomes do not change.
 
-Every other normalized row is unchanged. No registry entry was added or removed; only the eleven reviewed signatures and the relay phase explanations changed.
+## Runner corrections and evidence
 
-## Latency and auxiliary evidence
+Playwright SIGINT/SIGTERM handling is disabled in the shared launch options so the runner's cleanup scope can finish. Real SIGINT and SIGTERM tests during OS measurement verified exit 130/143, the retained-state notice, closed server ports, stopped owned processes/Podman sockets and removed labeled containers. Reaped child PIDs are never used for later process-group signals.
 
-The `stat-eight-deep` operation now performs one target stat, without the unrelated parent stat formerly used by ownership comparison. All five OS profiles and Linux have regenerated cold/warm samples. Linux `ls-usr-bin` now uses the timing tree as cwd, matching the documented OS scenario. These are measurement-method corrections, not runtime speedups; compare subsequent runs against the corrected samples. Other timing values are regenerated noisy evidence.
+Development uses a connect-only liveness check before borrowing a shared Podman socket. A stale socket gets a replacement on a private session path; the shared name is never unlinked. Potentially failing image discovery precedes environment mutation. The image cache defaults to a per-user directory and requires current-UID ownership, mode 0700 and a real directory rather than a symlink before images are loaded. The documented dedicated validation cache meets these checks. Container-list errors preserve their status/body, non-array responses are rejected, and only DELETE tolerates 404.
 
-Compiler provenance now includes `package.json`. The prior cached image actually contained an older package manifest; it was rebuilt from the unchanged canonical Dockerfile before the OS runs. Every copied compiler source, both package manifests and locked Binaryen bytes are verified against the checkout. Linux panic output and OS signal/helper diagnostics are retained outside successful deterministic baselines. Validation commands and limits are in [README](README.md); the PR records the checks completed for this revision.
+The browser gate and runner now share the exact CDP selection, permission request, profile setup and DISPLAY-free launch path. The account fixture checks distinct primary gids and overlaps independent creator account boots. Server/inspector ports are reserved together. Deployment reuses the command-availability helper, and xtask help lists the recorded and report modes.
+
+All Linux and OS cold/warm latency samples and provenance are regenerated separately from deterministic comparison outcomes. These noisy timings are not claimed as runtime speedups. The full recordings rebuild web assets, the WASI probe, release helper and Worker, and verify the real cached compiler image against the checkout. Commands, prerequisites and measurement limits are in [README](README.md); the PR records every check completed and the checks not run for this revision.

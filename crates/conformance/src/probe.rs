@@ -96,9 +96,16 @@ impl Probe {
             }
         }
     }
-    fn basic(&self, mounts: bool) {
+    fn basic(&self, mounts: bool, cloud: bool) {
         let p = |s: &str| self.root.join(s);
         self.with_mounts(mounts, &["alias"], || {
+            if cloud {
+                skipped(
+                    "alias",
+                    "not implemented: cloud tree has no second attachment API",
+                );
+                return;
+            }
             unit(
                 "alias",
                 "create",
@@ -315,7 +322,7 @@ impl Probe {
             "read(link)",
             io(fs::read_to_string(p("relative-link"))).map(|s| json!(s)),
         );
-        self.with_mounts(mounts, &["cross-rename", "mount-parent"], || {
+        self.with_mounts(mounts, &["cross-rename"], || {
             unit(
                 "cross-rename",
                 "create",
@@ -328,6 +335,15 @@ impl Probe {
                 "rename(source, other-mount/destination)",
                 io(fs::rename(p("cross"), self.cross.join("cross-destination"))),
             );
+        });
+        self.with_mounts(mounts, &["mount-parent"], || {
+            if cloud {
+                skipped(
+                    "mount-parent",
+                    "account home is a subdirectory; no cloud mount-root attachment API",
+                );
+                return;
+            }
             emit(
                 "mount-parent",
                 "stat",
@@ -641,8 +657,9 @@ fn valid_args(args: &[String]) -> bool {
         "latency" => {
             args.len() == 8 && matches!(args[7].as_str(), "prepare" | "stat" | "read" | "write")
         }
-        "basic" | "no-mounts" | "cloud-link" | "remount-prepare" | "remount-observe"
-        | "hold-open" | "hold-cwd" | "namespace" | "two-linux" | "unsupported" => args.len() == 7,
+        "basic" | "basic-cloud" | "no-mounts" | "cloud-link" | "remount-prepare"
+        | "remount-observe" | "hold-open" | "hold-cwd" | "namespace" | "two-linux"
+        | "unsupported" => args.len() == 7,
         _ => false,
     }
 }
@@ -663,9 +680,18 @@ pub fn run() {
     };
     platform::umask(0o022);
     match args[1].as_str() {
-        "basic" => p.basic(true),
+        "basic" => p.basic(true, false),
+        "basic-cloud" => {
+            p.basic(true, true);
+            for case in ["remount", "unmount-open", "unmount-cwd"] {
+                skipped(
+                    case,
+                    "not implemented: cloud root cannot be detached through the current mount API",
+                );
+            }
+        }
         "no-mounts" => {
-            p.basic(false);
+            p.basic(false, false);
             p.with_mounts(
                 false,
                 &[
@@ -720,7 +746,7 @@ pub fn run() {
                 platform::mount(&p.root.join("tree"), &q.alias, false).unwrap();
                 platform::mount(Path::new("tmpfs"), &q.cross, true).unwrap();
                 write(&q.cross.join("target"), b"target").unwrap();
-                q.basic(true);
+                q.basic(true, false);
                 write(&q.root.join("target"), b"target").unwrap();
                 unit(
                     "cloud-to-provider",
@@ -804,7 +830,10 @@ pub fn run() {
                 assert_eq!(unsafe { libc::setgroups(1, [3].as_ptr()) }, 0);
                 platform::mount(Path::new("tmpfs"), &p.root, true).unwrap();
                 platform::chmod(&p.root, 0o777).unwrap();
-                let path = p.root.join("shared");
+                // Enter while privileged. Dropped children must not traverse
+                // unrelated private ancestors of the caller's TMPDIR.
+                std::env::set_current_dir(&p.root).unwrap();
+                let path = PathBuf::from("shared");
                 fs::create_dir(&path).unwrap();
                 let c = CString::new(path.to_str().unwrap()).unwrap();
                 assert_eq!(unsafe { libc::chown(c.as_ptr(), 1, 3) }, 0);
