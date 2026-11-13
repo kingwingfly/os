@@ -33,6 +33,24 @@ fn skipped(case: &str, reason: &str) {
         json!({"case":case,"step":"unavailable","call":case,"skipped":reason})
     );
 }
+fn skip_step(case: &str, step: &str, call: &str, reason: &str) {
+    println!(
+        "{}",
+        json!({"case":case,"step":step,"call":call,"skipped":reason})
+    );
+}
+fn acl_step(case: &str, step: &str, call: &str, operation: impl FnOnce() -> Result<Value>) {
+    if platform::named_acl_available() {
+        emit(case, step, call, operation());
+    } else {
+        skip_step(
+            case,
+            step,
+            call,
+            "named ACL group 65534 is not mapped in this user namespace",
+        );
+    }
+}
 fn write(path: &Path, text: &[u8]) -> Result<()> {
     io(fs::write(path, text))
 }
@@ -95,18 +113,12 @@ impl Probe {
             "stat(alias)",
             self.stat(&self.alias.join("alias-file")),
         );
-        unit(
-            "alias",
-            "setfacl",
-            "setfacl(primary, named group)",
-            platform::setacl(&p("alias-file"), false),
-        );
-        emit(
-            "alias",
-            "acl",
-            "getfacl(alias)",
-            platform::acl(&self.alias.join("alias-file")),
-        );
+        acl_step("alias", "setfacl", "setfacl(primary, named group)", || {
+            platform::setacl(&p("alias-file"), false).map(|_| json!(null))
+        });
+        acl_step("alias", "acl", "getfacl(alias)", || {
+            platform::acl(&self.alias.join("alias-file"))
+        });
         for (case, unlink) in [("open-rename", false), ("open-unlink", true)] {
             let path = p(case);
             unit(
@@ -376,30 +388,31 @@ impl Probe {
             "chmod(shared, 02770)",
             platform::chmod(&p("creation"), 0o2770),
         );
-        unit(
+        self.directory_facts("creation", "directory", &p("creation"));
+        acl_step(
             "creation",
             "default-acl",
             "setfacl(default, shared)",
-            platform::setacl(&p("creation"), true),
+            || platform::setacl(&p("creation"), true).map(|_| json!(null)),
         );
         platform::umask(0o027);
-        unit(
+        acl_step(
             "creation",
             "create",
             "umask(027); open(O_CREAT, 0666)",
-            write(&p("creation/file"), b"hello"),
+            || write(&p("creation/file"), b"hello").map(|_| json!(null)),
         );
-        emit(
+        acl_step("creation", "stat", "stat(created)", || {
+            self.stat(&p("creation/file"))
+        });
+        acl_step("creation", "acl", "getfacl(created)", || {
+            platform::acl(&p("creation/file"))
+        });
+        self.inheritance(
             "creation",
-            "stat",
-            "stat(created)",
-            self.stat(&p("creation/file")),
-        );
-        emit(
-            "creation",
-            "acl",
-            "getfacl(created)",
-            platform::acl(&p("creation/file")),
+            "inheritance",
+            &p("creation"),
+            &p("creation/file"),
         );
         platform::umask(0o022);
     }
@@ -413,24 +426,18 @@ impl Probe {
                 "chmod(file, 0640)",
                 platform::chmod(&path, 0o640),
             );
-            unit(
-                "remount",
-                "setfacl",
-                "setfacl(file, named group)",
-                platform::setacl(&path, false),
-            );
+            acl_step("remount", "setfacl", "setfacl(file, named group)", || {
+                platform::setacl(&path, false).map(|_| json!(null))
+            });
         } else {
-            emit(
-                "remount",
-                "stat",
-                "stat(file) after detach/attach",
-                self.stat(&path),
-            );
-            emit(
+            acl_step("remount", "stat", "stat(file) after detach/attach", || {
+                self.stat(&path)
+            });
+            acl_step(
                 "remount",
                 "acl",
                 "getfacl(file) after detach/attach",
-                platform::acl(&path),
+                || platform::acl(&path),
             );
         }
     }
@@ -450,7 +457,12 @@ impl Probe {
             }
         };
         if cwd {
-            unit(case, "chdir", "chdir(mount)", platform::cd(&self.root));
+            let result = platform::cd(&self.root);
+            let failed = result.is_err();
+            unit(case, "chdir", "chdir(mount)", result);
+            if failed {
+                return;
+            }
         }
         #[cfg(target_os = "wasi")]
         {
@@ -486,7 +498,48 @@ impl Probe {
             );
         }
     }
+    fn directory_facts(&self, case: &str, step: &str, dir: &Path) {
+        emit(
+            case,
+            step,
+            "stat(shared directory)",
+            platform::stat(dir)
+                .map(|v| json!({"mode":v["mode"], "group_is_caller":v["gid"] == self.gid})),
+        );
+    }
+    fn inheritance(&self, case: &str, step: &str, dir: &Path, file: &Path) {
+        match platform::stat(dir) {
+            Ok(v) if v["gid"] == self.gid => skip_step(
+                case,
+                step,
+                "compare creator, directory and file groups",
+                "creator primary group equals directory group; setgid inheritance is not distinguishable",
+            ),
+            Ok(_) => acl_step(
+                case,
+                step,
+                "compare creator, directory and file groups",
+                || {
+                    self.stat(file).map(|v| json!({"group_is_parent":v["group_is_parent"], "group_is_caller":v["group_is_caller"]}))
+                },
+            ),
+            Err(e) => emit(
+                case,
+                step,
+                "compare creator, directory and file groups",
+                Err(e),
+            ),
+        }
+    }
     fn creator(&self, name: &str) {
+        self.directory_facts("two-accounts", &format!("{name}-directory"), &self.root);
+        emit(
+            "two-accounts",
+            &format!("{name}-groups"),
+            "inspect supplementary groups excluding primary",
+            platform::supplementary_groups_empty(self.gid).map(|empty| json!({"empty":empty})),
+        );
+
         platform::umask(0o027);
         let file = self.root.join(name);
         unit(
@@ -506,6 +559,12 @@ impl Probe {
             &format!("{name}-acl"),
             "getfacl(created)",
             platform::acl(&file),
+        );
+        self.inheritance(
+            "two-accounts",
+            &format!("{name}-inheritance"),
+            &self.root,
+            &file,
         );
     }
     fn latency(&self, op: &str) -> Result<()> {
@@ -532,11 +591,25 @@ impl Probe {
         }
     }
 }
+fn valid_args(args: &[String]) -> bool {
+    if args.len() < 7 || args[5].parse::<u32>().is_err() || args[6].parse::<u32>().is_err() {
+        return false;
+    }
+    match args[1].as_str() {
+        "creator" => args.len() == 8 && matches!(args[7].as_str(), "a" | "b"),
+        "latency" => {
+            args.len() == 8 && matches!(args[7].as_str(), "prepare" | "stat" | "read" | "write")
+        }
+        "basic" | "cloud-link" | "remount-prepare" | "remount-observe" | "hold-open"
+        | "hold-cwd" | "namespace" | "two-linux" | "unsupported" => args.len() == 7,
+        _ => false,
+    }
+}
 fn main() {
     #[cfg(target_os = "wasi")]
     os_posix::init_preopens().unwrap();
     let args: Vec<_> = std::env::args().collect();
-    if args.len() < 7 {
+    if !valid_args(&args) {
         eprintln!("os-conformance MODE ROOT ALIAS CROSS UID GID [OP]");
         std::process::exit(2);
     }
@@ -645,12 +718,20 @@ fn main() {
             #[cfg(target_os = "linux")]
             {
                 use std::ffi::CString;
+                if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+                    skipped(
+                        "two-accounts",
+                        "cannot clear inherited supplementary groups in this user namespace",
+                    );
+                    return;
+                }
+                assert_eq!(unsafe { libc::getgroups(0, std::ptr::null_mut()) }, 0);
                 platform::mount(Path::new("tmpfs"), &p.root, true).unwrap();
                 platform::chmod(&p.root, 0o777).unwrap();
                 let path = p.root.join("shared");
                 fs::create_dir(&path).unwrap();
                 let c = CString::new(path.to_str().unwrap()).unwrap();
-                assert_eq!(unsafe { libc::chown(c.as_ptr(), 1, 1) }, 0);
+                assert_eq!(unsafe { libc::chown(c.as_ptr(), 1, 3) }, 0);
                 platform::chmod(&path, 0o2777).unwrap();
                 platform::setacl(&path, true).unwrap();
                 for (uid, name) in [(1, "a"), (2, "b")] {
@@ -659,6 +740,9 @@ fn main() {
                     if child == 0 {
                         assert_eq!(unsafe { libc::setgid(uid) }, 0);
                         assert_eq!(unsafe { libc::setuid(uid) }, 0);
+                        assert_eq!(unsafe { libc::getgroups(0, std::ptr::null_mut()) }, 0);
+                        assert_eq!(unsafe { libc::getuid() }, uid);
+                        assert_eq!(unsafe { libc::getgid() }, uid);
                         let q = Probe {
                             root: path.clone(),
                             alias: path.clone(),
@@ -685,5 +769,39 @@ fn main() {
             eprintln!("unknown mode");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn mode_specific_usage() {
+        for mode in ["creator", "latency", "unknown"] {
+            assert!(!valid_args(
+                &format!("probe {mode} / / / 1 1")
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        for args in [
+            "probe latency / / / 1 1 read",
+            "probe creator / / / 1 2 a",
+            "probe basic / / / 1 1",
+        ] {
+            assert!(valid_args(
+                &args
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        assert!(!valid_args(
+            &"probe basic / / / invalid 1"
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        ));
     }
 }

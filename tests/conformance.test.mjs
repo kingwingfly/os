@@ -76,3 +76,16 @@ test('cleanup failures do not prevent subsequent cleanup or restoring the proces
   assert.deepEqual(seen,['stopped','closed']);assert.equal(process.umask(),mask);
   assert.equal(errors[0].error.message,'engine unavailable');
 });
+
+test('retained-fd device limits do not prevent convergence on observable fields',()=>{
+  const baseline=fixture(),i=cases.indexOf('open-rename');
+  baseline.linux[i]=ok('open-rename','identity','fstat(fd)',{same_dev:true,same_ino:true});
+  baseline.os.cloud[i]=ok('open-rename','identity','fstat(fd)',{same_dev:{unavailable:'st_dev not exposed by both observations'},same_ino:true});
+  const row=()=>differences(baseline).find(r=>r.id==='cloud/open-rename');
+  assert(row().same);assert(row().limited);assert.equal(row().linux[0].ok.same_dev,true);
+  assert.throws(()=>check([row()],[{id:row().id,signature:row().signature}]),/stale difference/);
+  const signature=row().signature;
+  baseline.os.cloud[i].ok.same_ino=false;assert(!row().same);
+  baseline.os.cloud[i].ok.same_ino={unavailable:'st_ino not exposed by both observations'};assert(!row().same);
+  baseline.os.cloud[i].ok={same_dev:false,same_ino:true};assert(!row().same);assert(!row().limited);assert.notEqual(row().signature,signature);
+});

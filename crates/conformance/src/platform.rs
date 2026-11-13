@@ -236,6 +236,46 @@ pub fn noreplace(from: &Path, to: &Path) -> Result<()> {
         .map(|_| ())
     }
 }
+// Named ACL IDs must be mapped in this process's user namespace. A mount
+// namespace alone does not make subordinate group IDs usable by setxattr.
+pub fn named_acl_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/proc/self/gid_map").is_ok_and(|map| id_mapped(&map, 65534))
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        true
+    }
+}
+#[cfg(target_os = "linux")]
+fn id_mapped(map: &str, id: u64) -> bool {
+    map.lines().any(|line| {
+        let fields: Vec<u64> = line
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        fields.len() == 3 && id >= fields[0] && id - fields[0] < fields[2]
+    })
+}
+pub fn supplementary_groups_empty(gid: u64) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        rc(count)?;
+        let mut groups = vec![0; count as usize];
+        rc(unsafe { libc::getgroups(count, groups.as_mut_ptr()) })?;
+        Ok(groups.iter().all(|g| u64::from(*g) == gid))
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        let creds = call(abi::Call::Getcreds)?;
+        let groups = creds["groups"]
+            .as_array()
+            .ok_or("missing credential groups")?;
+        Ok(groups.iter().all(|g| g.as_u64() == Some(gid)))
+    }
+}
 pub fn setacl(path: &Path, default: bool) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -444,6 +484,13 @@ pub fn invalid_sync(data: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn acl_id_must_be_mapped() {
+        assert!(!id_mapped("0 1000 1\n", 65534));
+        assert!(id_mapped("0 1000 1\n1 100000 65536\n", 65534));
+        assert!(!id_mapped("0 100000 65534\n", 65534));
+    }
     #[test]
     fn absent_identity_never_compares_equal() {
         let missing = identity_from_json(&json!({"ino":0}));

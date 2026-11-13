@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { needsPodman, startPodman } from '../podman.mjs';
-import { conformanceConfig, replaceExactly, putFile, attempt, reattachAfter, unmountOutcome } from './fixtures.mjs';
+import { conformanceConfig, replaceExactly, putFile, reattachAfter, mountOutcome, checkAbsentMountCalls, startHeld, heldState, heldRows } from './fixtures.mjs';
 import { createInterface } from 'node:readline';
 import { performance } from 'node:perf_hooks';
 import { run, targetDir, jsonLines, skip, ok, port, start, stop, sourceEvidence, filesystems, operations, probeOperations, cleanup } from './common.mjs';
@@ -68,23 +68,22 @@ async function mountHandle(page,context,dir) {
 }
 async function held(page,mode,root,alias,cross,creds) {
   const args=[mode,root,alias,cross,String(creds.uid),String(creds.gid)];
-  await page.evaluate(({tool,args,root})=>{
-    window.conformanceBarrier=null;window.conformanceOutput='';window.conformanceInput=null;
-    const started=Date.now();window.conformanceHeld=window.os.exec([{path:tool,argv:[tool,...args]}],{
-      cwd:'/',stdin:null,tty:true,cancelled:()=>Date.now()-started>120000,
-      onTty:input=>{window.conformanceInput=input;},
-      onOutput:(fd,text)=>{if(fd===1){window.conformanceOutput+=text; if(window.conformanceOutput.includes('barrier')) window.conformanceBarrier=true;}},
-    });
-  },{tool,args,root});
-  await page.waitForFunction(()=>window.conformanceBarrier && window.conformanceInput,{},{timeout:60000});
-  const row=await page.evaluate(async ({root,mode})=>{
-    let row={case:mode==='hold-open'?'unmount-open':'unmount-cwd',step:'unmount',call:'umount(mount)'};
-    try {await window.os.unmountLocal(root);row.ok=null;} catch(e) {row.errno=e.errno||e.message;}
-    window.conformanceInput.write('continue\n');return row;
-  },{root,mode});
-  const output=await page.evaluate(async ()=>{const result=await window.conformanceHeld;if(result.status!==0)throw new Error('held process failed');return window.conformanceOutput;});
-  const rows=jsonLines(output.replaceAll('\r','')).filter(r=>!r.barrier);rows.splice(mode==='hold-open'?1:2,0,row);return {rows,detach:row};
+  const caseName=mode==='hold-open'?'unmount-open':'unmount-cwd';
+  await page.evaluate(startHeld,{tool,args});
+  await page.waitForFunction(()=>{const s=window.conformanceHeld;return s.done||s.timedOut||(s.barrier&&s.input);},null,{timeout:65000});
+  const state=await page.evaluate(heldState);
+  let detach={case:caseName,step:'unmount',call:'umount(mount)'};
+  if(state.done||state.timedOut)detach.skipped=state.timedOut?'probe did not reach barrier before deadline':'probe completed before barrier; see preceding results';
+  else {
+    detach={...detach,...await page.evaluate(mountOutcome,{operation:'detach',path:root})};
+    await page.evaluate(()=>window.conformanceHeld.input.write('continue\n'));
+    await page.waitForFunction(()=>window.conformanceHeld.done||window.conformanceHeld.timedOut,null,{timeout:65000});
+  }
+  const final=await page.evaluate(heldState);
+  if(final.timedOut)await page.evaluate(()=>{window.conformanceHeld.cancelled=true;});
+  return {rows:heldRows(final,caseName,detach),detach};
 }
+
 async function timing(page,root,alias,cross,creds) {
   const rows=[];
   await probe(page,'latency',root,alias,cross,creds,['prepare']);
@@ -115,8 +114,7 @@ async function timing(page,root,alias,cross,creds) {
 }
 export async function os() {
   const abi=await readFile('crates/abi/src/lib.rs','utf8');
-  const calls=abi.slice(abi.indexOf('pub enum Call {'),abi.indexOf('pub enum Target'));
-  if(/^    (Chroot|Mount|Umount|Unmount)\b/m.test(calls))throw new Error('Mount/chroot ABI changed: replace the unavailable probes with executable calls');
+  checkAbsentMountCalls(abi);
   run('cargo',['xtask','build','--web-only'],{stdio:'inherit'});
   run('cargo',['build','--locked','-p','os-conformance','--target','wasm32-wasip1','--release'],{stdio:'inherit'});
   run('cargo',['build','--locked','-p','os-local-helper'],{stdio:'inherit'});
@@ -127,7 +125,6 @@ export async function os() {
   let server,browser,persistent,helper,log,podman,podmanEnv,initialContainers,compilerEvidence,failure,success=false;
   try {
     const number=await port(),url=`http://127.0.0.1:${number}`;
-    process.env.OS_TEST_URL=url;
     const root=resolve('.');
     let config=conformanceConfig(await readFile('wrangler.toml','utf8'),root);
     await writeFile(join(state,'wrangler.toml'),config);
@@ -211,13 +208,9 @@ export async function os() {
         grant=await owner.page.evaluate(()=>window.os.shareMount({path:'/mnt/local/source',name:'conformance',seconds:3600},{p2p:false}));
         primary='/mnt/shared/primary';alias='/mnt/shared/alias';
       }
-      const attach=async name=>{
-        if(filesystem==='cloud')return;
-        if(filesystem==='relay')return page.evaluate(({grant,name})=>window.os.attachShared({address:grant.address,name,writable:true,cloud:true},{p2p:false}),{grant,name});
-        return page.evaluate(async ({filesystem,name,connection})=>window.os.mountLocal({name,writable:true,cloud:true,
-          ...(filesystem==='browser-storage'?{storage:true}:filesystem==='directory-handle'?{handle:window.conformanceHandle}:connection)}),{filesystem,name,connection});
-      };
-      if(filesystem==='cloud')await checked(page,[{mkdir:{path:primary,mode:0o700}}]);else {await attach('primary');await attach('alias');}
+      const attach=name=>page.evaluate(mountOutcome,{operation:'attach',filesystem,name,connection,address:grant?.address});
+      const requireAttach=async name=>{const result=await attach(name);if(result.errno)throw new Error('fixture attach: '+result.errno);};
+      if(filesystem==='cloud')await checked(page,[{mkdir:{path:primary,mode:0o700}}]);else {await requireAttach('primary');await requireAttach('alias');}
       let rows=await probe(page,'basic',primary,alias,cross,creds);
       await writeFile(join(state,filesystem+'-basic.json'),JSON.stringify(rows,null,2));
       if(filesystem==='cloud')rows=rows.filter(r=>!['alias','mount-parent'].includes(r.case)).concat(
@@ -230,9 +223,9 @@ export async function os() {
       if(filesystem==='cloud') for(const name of ['remount','unmount-open','unmount-cwd'])rows.push(skip(name,'not implemented: cloud root cannot be detached through the current mount API'));
       else {
         rows.push(...await probe(page,'remount-prepare',primary,alias,cross,creds));
-        const detached={case:'remount',step:'detach',call:'umount(mount)',...await page.evaluate(unmountOutcome,primary)};
+        const detached={case:'remount',step:'detach',call:'umount(mount)',...await page.evaluate(mountOutcome,{operation:'detach',path:primary})};
         rows.push(detached);
-        await reattachAfter(detached,async()=>rows.push(await attempt('remount','attach','mount(source, mount)',()=>attach('primary'))));
+        await reattachAfter(detached,async()=>rows.push({case:'remount',step:'attach',call:'mount(source, mount)',...await attach('primary')}));
         rows.push(...await probe(page,'remount-observe',primary,alias,cross,creds));
         for(const mode of ['hold-open','hold-cwd']) {
           const heldResult=await held(page,mode,primary,alias,cross,creds);
@@ -271,7 +264,7 @@ export async function os() {
       observations[filesystem]=rows;
       if(a.context===persistent)await a.page.close();else await a.context.close();await b.context.close();await owner?.context.close();await stop(helper);helper=null;
     }
-    const processRows=await processFacts(admin,url,bytes);
+    const processRows=await processFacts(admin,url);
     for(const rows of Object.values(observations))rows.push(...processRows);
     const evidence=[await sourceEvidence('web/wasi/process.js',['fd_datasync: () => 0','fd_sync: () => 0']),await sourceEvidence('web/kernel/client.js',["exec([['supervise', run.file]]","exec([['init']]"])];
     success=true;return {observations,latencies,evidence,compiler:compilerEvidence??{dockerfile:'containers/compiler/Dockerfile'},browser:browser.version()};
@@ -296,12 +289,38 @@ export async function os() {
 
 async function processFacts(admin,url) {
   const {page,context}=admin;
-  const init=await page.evaluate(()=>window.os.machineInit?.()??null);
-  const client=await readFile('web/kernel/client.js','utf8');
-  const launches={init:client.includes("exec([['init']]"),services:client.includes("exec([['supervise', run.file]]")};
-  const initComm=await exec(page,'/usr/bin/cat',['/proc/1/cmdline']);
-  const rows=[ok('startup','pid1','read /proc/1/cmdline',{comm:initComm.split('\0')[0].split('/').at(-1)}),ok('startup','ownership','inspect PID 1 and service launch owner',{role:client.includes('new InitReaper(')?'init-reaper':'unclassified',owner:launches.init&&launches.services?'browser host/session':'unclassified',source_launches:launches,evidence:'web/kernel/client.js: boot() creates InitReaper and LoginStartup; window.os.machineInit().reaper.state',reaper:init?.reaper?.state??null})];
   const ps=async()=>(await checked(page,[{proc_poll:{pids:[]}}]))[0];
+  await expect.poll(async()=>(await page.evaluate(()=>window.os.machineInit()))?.reaper?.state,{timeout:30000}).toBe('running');
+  const init=await page.evaluate(()=>window.os.machineInit());
+  const [inspected]=await checked(page,[{machine_init:{action:{op:'inspect'}}}]);
+  const initComm=await exec(page,'/usr/bin/cat',['/proc/1/cmdline']);
+  const rows=[ok('startup','pid1','read /proc/1/cmdline',{comm:initComm.split('\0')[0].split('/').at(-1)})];
+  const units='/root/conformance-services.json';
+  await put(page,units,Buffer.from(JSON.stringify({version:1,units:[{name:'measured',argv:['sh','-c','echo CONFORMANCE_SERVICE_READY; sleep 60']}]})));
+  await page.evaluate(file=>{
+    const s=window.conformanceService={output:'',done:false};
+    s.promise=window.os.startLoginServices(file,{onOutput:(_fd,text)=>{s.output+=text;}})
+      .then(result=>{s.status=result.status;},error=>{s.error=error.errno||'UNCLASSIFIED_ERROR';}).finally(()=>{s.done=true;});
+  },units);
+  try {
+    await page.waitForFunction(()=>window.conformanceService.output.includes('CONFORMANCE_SERVICE_READY')||window.conformanceService.done,null,{timeout:60000});
+    const service=await page.evaluate(()=>({done:window.conformanceService.done,error:window.conformanceService.error}));
+    if(service.done)throw new Error('service fixture exited before inspection: '+JSON.stringify(service));
+    await expect.poll(async()=>(await page.evaluate(()=>window.os.loginSession())).session?.managed?.pid,{timeout:30000}).toBeGreaterThan(1);
+    const login=await page.evaluate(()=>window.os.loginSession()), processes=await ps();
+    const supervisor=processes.find(p=>p.pid===login.session.managed.pid);
+    rows.push(ok('startup','ownership','inspect live init lease, login lease and managed supervisor',{
+      role:inspected.execution?.role??null,reaper:init.reaper?.state??null,
+      init_owner_is_current_host:!!inspected.owner&&inspected.owner===init.host,
+      login_owner_is_current_host:!!login.session?.owner&&login.session.owner===login.host,
+      service_host_is_login_owner:login.session.managed.host===login.session.owner,
+      supervisor_path:supervisor?.path??null,supervisor_parent_is_pid1:supervisor?.ppid===1,
+    }));
+  } finally {
+    await page.evaluate(async()=>{const session=(await window.os.loginSession()).session;if(session?.managed)await window.os.signalLoginServices(session);});
+    await page.waitForFunction(()=>window.conformanceService.done,null,{timeout:40000});
+  }
+  await expect.poll(async()=>(await ps()).some(p=>p.argv?.some(a=>a.includes('conformance-services')||a.includes('CONFORMANCE_SERVICE_READY'))||p.argv?.[0]==='sleep'),{timeout:30000}).toBe(false);
   const images=rows=>[...new Set(rows.map(p=>JSON.stringify({path:p.path,argv:p.argv})))].sort().map(s=>JSON.parse(s));
   // Wait for the fixture's completed cat to be reaped before taking the idle
   // Files snapshot; otherwise scheduler timing would leak into the baseline.
