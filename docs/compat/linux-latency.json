@@ -1,0 +1,73 @@
+{
+  "build_profile": "release",
+  "method": "First invocation and immediate repeat; no page-cache eviction. Release probe, command wall time; shell ends at first prompt.",
+  "operations": [
+    {
+      "operation": "stat-eight-deep",
+      "samples": [
+        {
+          "milliseconds": 0.736,
+          "temperature": "cold"
+        },
+        {
+          "milliseconds": 0.687,
+          "temperature": "warm"
+        }
+      ]
+    },
+    {
+      "operation": "read-1mib",
+      "samples": [
+        {
+          "milliseconds": 1.089,
+          "temperature": "cold"
+        },
+        {
+          "milliseconds": 1.051,
+          "temperature": "warm"
+        }
+      ]
+    },
+    {
+      "operation": "write-1mib",
+      "samples": [
+        {
+          "milliseconds": 1.295,
+          "temperature": "cold"
+        },
+        {
+          "milliseconds": 1.306,
+          "temperature": "warm"
+        }
+      ]
+    },
+    {
+      "operation": "ls-usr-bin",
+      "samples": [
+        {
+          "milliseconds": 14.235,
+          "temperature": "cold"
+        },
+        {
+          "milliseconds": 13.34,
+          "temperature": "warm"
+        }
+      ]
+    },
+    {
+      "operation": "shell-first-prompt",
+      "samples": [
+        {
+          "milliseconds": 2.993,
+          "temperature": "cold"
+        },
+        {
+          "milliseconds": 1.424,
+          "temperature": "warm"
+        }
+      ]
+    }
+  ],
+  "schema": 1,
+  "unit": "milliseconds"
+}

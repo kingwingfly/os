@@ -1,4 +1,5 @@
 mod build;
+mod conformance;
 mod package;
 use ed25519_dalek::{Signer, SigningKey};
 use os_image::{Detached, Image, Kind, Release, Trust, digest, hex, signing_message, unhex};
@@ -9,7 +10,8 @@ use std::{
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-const HELP: &str = "cargo xtask build [build.mjs options]\n\
+const HELP: &str = "cargo xtask conformance --target linux|os [--out DIR] | --check [--recorded] [--out DIR] | --report [--out DIR]\n\
+cargo xtask build [build.mjs options]\n\
 cargo xtask image --root TREE --kind base|sysext|confext|workload --out PACKAGE [--name NAME] [--revision REV]\n\
 cargo xtask boot --assets DIST --out BUNDLE [--name NAME] [--sysext PACKAGE] [--confext PACKAGE]\n\
 cargo xtask verify --bundle BUNDLE --trust PUBLIC_TRUST_JSON\n\
@@ -33,6 +35,9 @@ fn run() -> Result<()> {
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         println!("{HELP}");
         return Ok(());
+    }
+    if command == "conformance" {
+        return conformance::run(args.collect());
     }
     if command == "build" {
         return build::run(args.collect());

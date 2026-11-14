@@ -1,0 +1,214 @@
+import { createInterface } from 'node:readline';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { validRow } from './common.mjs';
+
+export function compilerImage(image) {
+  if(!/^[a-zA-Z0-9][a-zA-Z0-9_./:@-]*$/.test(image))throw new Error('invalid compiler image reference');
+  return image;
+}
+export const isSleep=p=>p.name==='sleep'||p.comm==='sleep'||p.argv?.includes('sleep');
+export const sameSleep=(candidate,fixture)=>candidate.pid===fixture.pid&&isSleep(candidate)&&candidate.path===fixture.path&&JSON.stringify(candidate.argv)===JSON.stringify(fixture.argv);
+export async function withCleanup(action,cleanup) {
+  let primary;
+  try {return await action();}catch(error){primary=error;throw error;}
+  finally {
+    try {await cleanup();}catch(error) {
+      if(!primary)throw error;
+      throw new AggregateError([primary,error],`${primary.message}; cleanup failed: ${error.message}`,{cause:primary});
+    }
+  }
+}
+
+export function browserOptions() {
+  const env={...process.env};delete env.DISPLAY;
+  return {channel:'chromium',headless:true,env,handleSIGINT:false,handleSIGTERM:false,
+    viewport:{width:1440,height:1000},args:['--ozone-platform=headless','--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader']};
+}
+export async function directoryProfile(profile) {
+  // Full Chromium's permission context can grant the selected real directory;
+  // an incognito context or headless-shell's delegate denies write requests.
+  await mkdir(join(profile,'Default'),{recursive:true});
+  await writeFile(join(profile,'Default/Preferences'),JSON.stringify({profile:{default_content_setting_values:{file_system_read_guard:1,file_system_write_guard:1}}}));
+  return profile;
+}
+export async function mountHandle(page,context,dir) {
+  await page.evaluate(captureDirectoryDrop);
+  const cdp=await context.newCDPSession(page);
+  try {
+    for(const type of ['dragEnter','dragOver','drop'])await cdp.send('Input.dispatchDragEvent',{type,x:500,y:300,data:{items:[],files:[dir],dragOperationsMask:1}});
+  } finally {await cdp.detach();}
+  await page.evaluate(async()=>{window.conformanceHandle=await window.conformanceHandle;});
+  await page.mouse.click(500,300);
+  const permission=await page.evaluate(()=>window.conformanceHandle.requestPermission({mode:'readwrite'}));
+  if(permission!=='granted')throw new Error('host directory write grant unavailable: '+permission);
+}
+
+export function replaceExactly(text,pattern,replacement,label,count=1) {
+  const regex=typeof pattern==='string'?null:new RegExp(pattern.source,pattern.flags.includes('g')?pattern.flags:pattern.flags+'g');
+  const matches=regex?[...text.matchAll(regex)].length:text.split(pattern).length-1;
+  if(matches!==count)throw new Error(`conformance config: ${label}: expected ${count} matches, found ${matches}`);
+  return regex?text.replace(regex,()=>replacement):text.replaceAll(pattern,()=>replacement);
+}
+export function conformanceConfig(source,root) {
+  let text=replaceExactly(source,/^main = "(?:\.\/)?crates\/worker\/entry\.js"$/m,`main = ${JSON.stringify(root+'/crates/worker/entry.js')}`,'Worker entry');
+  text=replaceExactly(text,/^\[build\][\s\S]*?(?=\n\[|(?![\s\S]))/m,'','build section');
+  text=replaceExactly(text,/^\[\[containers\]\]\nclass_name = "JobRunner"[\s\S]*?(?=\n\[|(?![\s\S]))/m,'','unused JobRunner container');
+  text=replaceExactly(text,'directory = "./dist"',`directory = ${JSON.stringify(root+'/dist')}`,'assets directory');
+  text=replaceExactly(text,'image_build_context = "."',`image_build_context = ${JSON.stringify(root)}`,'compiler build context');
+  return replaceExactly(text,'image = "./containers/compiler/Dockerfile"',`image = ${JSON.stringify(root+'/containers/compiler/Dockerfile')}`,'compiler Dockerfile');
+}
+export function compilerConfig(source,root,dockerfile) {
+  return replaceExactly(source,`image = ${JSON.stringify(root+'/containers/compiler/Dockerfile')}`,`image = ${JSON.stringify(dockerfile)}`,'prebuilt compiler Dockerfile');
+}
+// A capture listener must run before the application's bubbling upload handler.
+export function captureDirectoryDrop() {
+  const over=event=>{event.preventDefault();event.stopImmediatePropagation();};
+  addEventListener('dragover',over,{capture:true});
+  addEventListener('drop',event=>{
+    event.preventDefault();event.stopImmediatePropagation();
+    removeEventListener('dragover',over,{capture:true});
+    window.conformanceHandle=event.dataTransfer.items[0].getAsFileSystemHandle();
+  },{capture:true,once:true});
+}
+export function helperConnection(child,timeout=10000) {
+  return new Promise((resolve,reject)=>{
+    if(child.spawnError)return reject(child.spawnError);
+    const lines=createInterface({input:child.stdout});
+    const finish=(error,value)=>{
+      clearTimeout(timer);lines.close();child.off('error',failed);child.off('exit',exited);
+      if(error)reject(error);else resolve(value);
+    };
+    const failed=error=>finish(error),exited=()=>finish(new Error('helper exited before announcing its connection'));
+    const timer=setTimeout(()=>finish(new Error('helper startup timeout')),timeout);
+    child.once('error',failed);child.once('exit',exited);
+    lines.once('line',line=>{try {finish(null,JSON.parse(line));}catch(error){finish(new Error('invalid helper connection JSON',{cause:error}));}});
+  });
+}
+// Re-attach is fixture recovery. Preserve its result before failing immediately;
+// no subsequent probe may run against a mount that failed to come back.
+export async function recordReattach(rows,detach,attach,caseName,persist=async()=>{}) {
+  if(!Object.hasOwn(detach,'ok'))return;
+  const result=await attach();
+  const row={case:caseName,step:'attach',call:'mount(source, mount)',...result};
+  rows.push(row);await persist(rows);
+  if(!Object.hasOwn(result,'ok'))throw new Error(`${caseName} re-attach failed: ${result.errno??'invalid outcome'}`);
+}
+export async function putFile(call,path,bytes) {
+  const [opened]=await call([{open:{path,flags:0o1101,mode:0o666}}]);
+  const chunk=opened.chunk_size??65536;
+  if(!Number.isSafeInteger(chunk)||chunk<=0)throw new Error('invalid provider chunk_size');
+  for(let offset=0,index=0;offset<bytes.length;offset+=chunk,index++) {
+    await call([{pwrite:{fd:opened.fd,index,data:bytes.subarray(offset,offset+chunk).toString('base64')}}]);
+  }
+  await call([{close:{fd:opened.fd}}]);
+}
+// These callbacks execute in the browser: only returned data crosses Playwright.
+// Keep all mount-operation error handling here, including held-process detach.
+export async function mountOutcome({operation,path,filesystem,name,connection,address}) {
+  try {
+    if(operation==='detach')await window.os.unmountLocal(path);
+    else if(operation!=='attach')throw new Error('invalid mount operation');
+    else if(filesystem==='relay')await window.os.attachShared({address,name,writable:true,cloud:true},{p2p:false});
+    else await window.os.mountLocal({name,writable:true,cloud:true,
+      ...(filesystem==='browser-storage'?{storage:true}:filesystem==='directory-handle'?{handle:window.conformanceHandle}:connection)});
+    return {ok:null};
+  } catch(error) {
+    const name=error.errno||error.code||error.message;
+    return {errno:typeof name==='string'&&/^E[A-Z0-9_]+$/.test(name)?name:'UNCLASSIFIED_ERROR'};
+  }
+}
+
+// A held probe has three phases, each with its own deadline: reaching its barrier, the runner's
+// detach of the mount, and finishing after the runner resumes it. A probe cancelled in any phase
+// must have exited before anything touches the mount again. startHeld, resumeHeld, cancelHeld,
+// heldDetach and heldState run in the browser and must stay self-contained.
+export function startHeld({tool,args,timeout=60000}) {
+  const state=window.conformanceHeld={output:'',stderr:'',input:null,barrier:false,done:false,cancelled:false,timedOut:null};
+  state.timer=setTimeout(()=>{if(!state.done){state.timedOut='barrier';state.cancelled=true;}},timeout);
+  // The barrier deadline ends once the probe waits at its barrier with a terminal to resume it.
+  const ready=()=>{if(state.barrier&&state.input&&!state.timedOut)clearTimeout(state.timer);};
+  state.promise=Promise.resolve().then(()=>window.os.exec([{path:tool,argv:[tool,...args]}],{
+    cwd:'/',stdin:null,tty:true,cancelled:()=>state.cancelled,
+    onTty:input=>{state.input=input;ready();},
+    onOutput:(fd,text)=>{if(fd===2)state.stderr+=text;if(fd===1){state.output+=text;state.barrier=state.output.split('\n').some(line=>{try{return typeof JSON.parse(line).barrier==='string';}catch{return false;}});ready();}},
+  })).then(result=>{state.status=result.status;},error=>{
+    const name=error.errno||error.code||error.message;
+    state.error=typeof name==='string'&&/^E[A-Z0-9_]+$/.test(name)?name:'UNCLASSIFIED_ERROR';
+  }).finally(()=>{state.done=true;clearTimeout(state.timer);});
+}
+export function resumeHeld({timeout=60000}) {
+  const state=window.conformanceHeld;
+  state.timer=setTimeout(()=>{if(!state.done){state.timedOut='completion';state.cancelled=true;}},timeout);
+  state.input.write('continue\n');
+}
+export function cancelHeld({phase}) {
+  const state=window.conformanceHeld;
+  if(!state.done) {state.timedOut??=phase;state.cancelled=true;}
+}
+export async function heldDetach({path,timeout=60000}) {
+  const detach=(async()=>{
+    try {await window.os.unmountLocal(path);return {ok:null};}
+    catch(error) {
+      const name=error.errno||error.code||error.message;
+      return {errno:typeof name==='string'&&/^E[A-Z0-9_]+$/.test(name)?name:'UNCLASSIFIED_ERROR'};
+    }
+  })();
+  let timer;
+  const late=new Promise(resolve=>{timer=setTimeout(()=>resolve({errno:'ETIMEDOUT'}),timeout);});
+  try {return await Promise.race([detach,late]);} finally {clearTimeout(timer);}
+}
+export function heldState() {
+  const s=window.conformanceHeld;
+  return {output:s.output,stderr:s.stderr,ready:s.barrier&&!!s.input,done:s.done,status:s.status,error:s.error,timedOut:s.timedOut||null};
+}
+export function heldRows(state,caseName,detach,diagnostics=[]) {
+  const rows=[];let invalid=false;
+  if(state.stderr)diagnostics.push({case:caseName,stream:2,text:state.stderr});
+  for(const line of state.output.replaceAll('\r','').split('\n').filter(line=>line.trim())) {
+    try {
+      const row=JSON.parse(line);
+      if(typeof row?.barrier==='string')continue;
+      if(!validRow(row,[caseName]))throw new Error('invalid probe row');
+      rows.push(row);
+    } catch {
+      invalid=true;diagnostics.push({case:caseName,stream:1,text:line});
+    }
+  }
+  if(invalid)rows.push({case:caseName,step:'output',call:'decode probe JSON lines',skipped:'non-JSON or malformed probe output; see evidence.json diagnostics'});
+  if(state.error)rows.push({case:caseName,step:'launch',call:'exec(probe)',errno:state.error});
+  else if(state.timedOut==='barrier')rows.push({case:caseName,step:'barrier',call:'wait for probe barrier',errno:'ETIMEDOUT'});
+  else if(state.timedOut==='detach')rows.push({case:caseName,step:'completion',call:'wait(probe)',skipped:'probe cancelled because the detach did not finish'});
+  else if(state.timedOut)rows.push({case:caseName,step:'completion',call:'wait(probe)',errno:'ETIMEDOUT'});
+  else if(state.status!==0)rows.push({case:caseName,step:'completion',call:'wait(probe)',ok:{status:state.status}});
+  if(!state.done)rows.push({case:caseName,step:'exit',call:'wait for cancelled probe',errno:'ETIMEDOUT'});
+  rows.push(detach);return rows;
+}
+// Run one held case through its phases. `failure` is set when the runner must stop before
+// re-attaching: the detach did not finish, or a cancelled probe did not exit. The rows are
+// returned either way, so the caller can save them first.
+export async function heldProbe(page,{tool,args,caseName,path,diagnostics=[],barrierTimeout=60000,detachTimeout=60000,completionTimeout=60000,exitTimeout=30000}) {
+  const reached=async(predicate,timeout)=>{
+    try {await page.waitForFunction(predicate,null,{timeout});return true;}
+    catch(error) {if(error.name==='TimeoutError')return false;throw error;}
+  };
+  await page.evaluate(startHeld,{tool,args,timeout:barrierTimeout});
+  // The browser-side deadline decides the barrier phase; this wait only has to outlast it.
+  await reached(()=>{const s=window.conformanceHeld;return s.done||s.timedOut||(s.barrier&&s.input);},barrierTimeout+exitTimeout);
+  const state=await page.evaluate(heldState);
+  let detach={case:caseName,step:'detach',call:'unmountLocal(mount)'},failure=null,resumed=false;
+  if(!state.ready||state.done||state.timedOut) {
+    detach.skipped=state.timedOut||!state.done?'probe did not reach barrier before deadline':'probe completed before barrier; see preceding results';
+    await page.evaluate(cancelHeld,{phase:'barrier'});
+  } else {
+    detach={...detach,...await page.evaluate(heldDetach,{path,timeout:detachTimeout})};
+    if(detach.errno==='ETIMEDOUT') {
+      await page.evaluate(cancelHeld,{phase:'detach'});
+      failure=new Error(`${caseName}: detach did not finish within ${detachTimeout} ms; the mount state is unknown`);
+    } else {await page.evaluate(resumeHeld,{timeout:completionTimeout});resumed=true;}
+  }
+  const exited=await reached(()=>window.conformanceHeld.done,(resumed?completionTimeout:0)+exitTimeout);
+  if(!exited)failure??=new Error(`${caseName}: cancelled probe did not exit within ${exitTimeout} ms`);
+  const final=await page.evaluate(heldState);
+  return {rows:[{case:caseName,step:'unmount',call:'umount(mount)',skipped:'no separate busy-unmount API; unmountLocal detach is measured below'},...heldRows(final,caseName,detach,diagnostics)],detach,failure};
+}

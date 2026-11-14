@@ -1,0 +1,651 @@
+# Reviewed L0a measurements; no architecture or permanent provider limits selected.
+# Process observations are stored once under process/*, independently of filesystems.
+# Allowed owners are data in follow-up-issues.json.
+
+[[difference]]
+id = "cloud/alias"
+issues = ["#51"]
+reason = "No API attaches the cloud tree a second time; explicitly unavailable."
+signature = "c2938767e08b71c1f4aa968223f6bbfa7448ba7f84f935a4a2178543ebcdb3a2"
+
+[[difference]]
+id = "cloud/remount"
+issues = ["#51"]
+reason = "The current API cannot detach/re-attach the cloud root; explicitly unavailable."
+signature = "7c8f354d3d77917e2bfb1a2e0d83b56a2b4fc1f4eef36e0c3a32720fb11246f5"
+
+[[difference]]
+id = "cloud/open-rename"
+issues = ["#48"]
+reason = "Retained descriptor operations and inode equality match, but WASI fstat exposes a fabricated device number. Device identity is unavailable, so full identity remains incomparable until the runtime exposes it."
+signature = "b2c288488d6f5500e3cd766afa6007cdf2d4c1b7a63a8876de37aa6a9f675cfe"
+
+[[difference]]
+id = "cloud/open-unlink"
+issues = ["#48"]
+reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "ea61d2102aa13211c7e88048e01ab691907953a005eb63395791e7870bf4925a"
+
+[[difference]]
+id = "cloud/unmount-open"
+issues = ["#51"]
+reason = "The current API cannot detach the cloud root; the busy-unmount case is explicitly unavailable."
+signature = "b324915528cf5536275e149decb7404a05d1eae1aae347f010a3d6634717d56f"
+
+[[difference]]
+id = "cloud/unmount-cwd"
+issues = ["#51"]
+reason = "The current API cannot detach the cloud root; the cwd busy-unmount case is explicitly unavailable."
+signature = "9fb930729fb777a9256bd963985127aff9aa3f5f8a0f9f7883ffd8acbd50724f"
+
+[[difference]]
+id = "cloud/flush"
+issues = ["#50"]
+reason = "fsync/fdatasync return success even for fd -1, where Linux returns EBADF; inspected WASI handlers return zero without calling a provider. Successful valid-fd calls do not establish durability."
+signature = "51cd96d8f41db057278307da2d995be0c551c36171493c78ebc5f3d450d215b3"
+
+[[difference]]
+id = "cloud/mount-parent"
+issues = ["#51"]
+reason = "The account home is a subdirectory, not an attachable cloud mount root; explicitly unavailable."
+signature = "57545eebbda4e8e5fbcda4f34e99846d4a90e0dba9f412e74891d5c0f778ab5b"
+
+[[difference]]
+id = "cloud/link-dotdot"
+issues = ["#51"]
+reason = "The symlink is created and chdir succeeds, but getcwd reflects lexical link/.. resolution rather than a."
+signature = "598ae7d4ad7689118bd61890d61600311e013fbae35de392808e941d267b8cb6"
+
+[[difference]]
+id = "cloud/cloud-to-provider"
+issues = ["#51"]
+reason = "The cloud symlink is created, but reading its target across the provider boundary returns ENOENT."
+signature = "d009f76c10d1a2325b1ca31002530192281b0acfb60187e46be0d69f5d199c86"
+
+[[difference]]
+id = "cloud/absolute-symlink"
+issues = ["#51"]
+reason = "The absolute symlink is created in the cloud tree, but reading its provider target returns ENOENT."
+signature = "45389291d9337986409df5300dac4ec155cec4ca5f6c30d02b628bb0f31195ac"
+
+[[difference]]
+id = "cloud/cwd-rename"
+issues = ["#51"]
+reason = "Directory rename succeeds but getcwd retains the old pathname."
+signature = "548a345074b163dddbf19361abe4d1f814056dc957e63ff3a1ae03c2a692e404"
+
+[[difference]]
+id = "cloud/cwd-remove"
+issues = ["#51"]
+reason = "getcwd returns the removed pathname instead of ENOENT."
+signature = "80d6718291660e01a8fb4975cdb4f82d7394258015b3cfffab2a125dba33e638"
+
+[[difference]]
+id = "cloud/hard-link"
+issues = ["#48"]
+reason = "Cloud link calls and inode equality match, but ABI Stat has no st_dev. Full device/inode identity remains incomparable; inode equality alone cannot prove object identity."
+signature = "28519222474cc924c42a507a7db9150f474dfaa15bdbcb2ab657ea70d1ff6376"
+
+[[difference]]
+id = "cloud/creation"
+issues = ["#49"]
+reason = "Setgid inheritance is explicitly incomparable: creator and directory primary groups coincide. Directory mode/group are measured; metadata follow-up validation must exercise distinct groups."
+signature = "a23f92d93f340f73b7da61189ff4c2e11fd7895160b5391a1e6ef2a94b41e6b2"
+
+[[difference]]
+id = "cloud/chroot-api"
+issues = ["#53"]
+reason = "chroot is absent from abi::Call; Linux executes the syscall in its disposable namespace."
+signature = "e96482cf3c2c9863e4bfb938c22d66b3966c3ef897515fc768aacf2d3fbd9663"
+
+[[difference]]
+id = "cloud/mount-api"
+issues = ["#51","#58"]
+reason = "mount is absent from abi::Call; the JavaScript attachment API is not a mount syscall."
+signature = "cd9917595721d6e1670ddeec0c052d67bde9c8917b0f15c3f20e2d97ccfff601"
+
+[[difference]]
+id = "cloud/umount-api"
+issues = ["#51","#58"]
+reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
+signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
+
+[[difference]]
+id = "browser-storage/alias"
+issues = ["#48","#49"]
+reason = "Attachments report different inode identities; chmod and ACL changes are private to the first attachment. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "beac5c32fc8724cac82c3b2b686513fb4e0fe51a4b1b357c2c378247473c90b2"
+
+[[difference]]
+id = "browser-storage/remount"
+issues = ["#49"]
+reason = "After detach/attach, mode returns to 0600 and the access ACL disappears."
+signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
+
+[[difference]]
+id = "browser-storage/open-rename"
+issues = ["#48"]
+reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write). Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "a4e5dd5763765933a95004bd32901def4b31d08d668c4f8a85d3c0c59985bfcd"
+
+[[difference]]
+id = "browser-storage/open-unlink"
+issues = ["#48"]
+reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "f390f785aff026e7910cc6de8ab24bffc240ac792b3ee6e3426adb491c5a3c12"
+
+[[difference]]
+id = "browser-storage/unmount-open"
+issues = ["#51"]
+reason = "Linux ordinary umount returns EBUSY, then MNT_DETACH succeeds and the retained descriptor still reads hello/fstats size 5. OS unmountLocal detaches and invalidates the descriptor (EBADF); its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "5b8d1e41fa03e82fdfb208e17e5f37f421eaf780c5d354166d2fa81c953ac12b"
+
+[[difference]]
+id = "browser-storage/unmount-cwd"
+issues = ["#51"]
+reason = "Linux ordinary umount returns EBUSY; after successful MNT_DETACH, getcwd returns ENOENT. OS unmountLocal detaches but getcwd retains the old path string; its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "cbd90180570a9ba62759c60c3ac3b440c7e6bc3df689797618cc4fc9af312543"
+
+[[difference]]
+id = "browser-storage/flush"
+issues = ["#50"]
+reason = "fsync/fdatasync return success even for fd -1, where Linux returns EBADF; inspected WASI handlers return zero without calling a provider. Successful valid-fd calls do not establish durability."
+signature = "51cd96d8f41db057278307da2d995be0c551c36171493c78ebc5f3d450d215b3"
+
+[[difference]]
+id = "browser-storage/mount-parent"
+issues = ["#51"]
+reason = "stat(mount/..) returns EACCES instead of the parent directory identity."
+signature = "c0671a8a900f3ae0c845cb60a647f30e8cf1988895b808b5372ec013c8d0448c"
+
+[[difference]]
+id = "browser-storage/link-dotdot"
+issues = ["#48","#51"]
+reason = "chdir(link/..) uses lexical parent behavior and getcwd does not identify a; provider symlink creation also returns EOPNOTSUPP."
+signature = "0a57ef8b32c90f6722061c8dc7775c3f4e4bf5cd2d4740d2901a521c6d004ac1"
+
+[[difference]]
+id = "browser-storage/cloud-to-provider"
+issues = ["#51"]
+reason = "The cloud symlink is created, but reading its target across the provider boundary returns ENOENT."
+signature = "d009f76c10d1a2325b1ca31002530192281b0acfb60187e46be0d69f5d199c86"
+
+[[difference]]
+id = "browser-storage/absolute-symlink"
+issues = ["#48","#51"]
+reason = "Provider symlink creation returns EOPNOTSUPP and reading the absent link returns ENOENT."
+signature = "b3d74f340cac6be7b443862e58d7d235d835c48a9076e449de18c7354133ea3e"
+
+[[difference]]
+id = "browser-storage/cwd-rename"
+issues = ["#48","#51"]
+reason = "getcwd retains the old pathname after rename; browser handles and relay additionally reject directory rename with EOPNOTSUPP."
+signature = "8806edc33110ae5a18d32d92ee5f319efc8831507b702a0c27fc8d79427423a3"
+
+[[difference]]
+id = "browser-storage/cwd-remove"
+issues = ["#51"]
+reason = "getcwd returns the removed pathname instead of ENOENT."
+signature = "80d6718291660e01a8fb4975cdb4f82d7394258015b3cfffab2a125dba33e638"
+
+[[difference]]
+id = "browser-storage/exclusive"
+issues = ["#50"]
+reason = "Opening an existing file with O_CREAT|O_EXCL returns EOPNOTSUPP instead of EEXIST."
+signature = "5889c9f04c71b58e7cf69b54e2f8bc4dd5864f6bcf5592e5eb150b3a3f54f901"
+
+[[difference]]
+id = "browser-storage/noreplace"
+issues = ["#50"]
+reason = "RENAME_NOREPLACE returns EOPNOTSUPP instead of EEXIST for an existing destination."
+signature = "c85048115032e13e5dc297599ce83984b0745da5efd1dc64529d01dbd6ad97e3"
+
+[[difference]]
+id = "browser-storage/hard-link"
+issues = ["#48","#49"]
+reason = "link returns EOPNOTSUPP; there is no alias identity, and the original retains one link and private mode 0600."
+signature = "5294599376182d353038534cb60674a9dfaf40383ac867bf1d8897b8b11a5374"
+
+[[difference]]
+id = "browser-storage/symlink"
+issues = ["#48"]
+reason = "symlink creation returns EOPNOTSUPP; reading the absent link returns ENOENT."
+signature = "cb9a4fe6a37f2c3db0e81136f0a698834ee78b24ac384538426ff510a98166c3"
+
+[[difference]]
+id = "browser-storage/creation"
+issues = ["#49"]
+reason = "Setgid inheritance is explicitly incomparable: creator and directory primary groups coincide. Directory mode/group are measured; metadata follow-up validation must exercise distinct groups."
+signature = "a23f92d93f340f73b7da61189ff4c2e11fd7895160b5391a1e6ef2a94b41e6b2"
+
+[[difference]]
+id = "browser-storage/two-accounts"
+issues = ["#49","#59"]
+reason = "Both creators have one neutral supplementary group, matching the directory group and distinct from their primary groups. Both targets record inherited group/mode/ACL. Through the authenticated export, B still receives EACCES and leaves a zero-byte file owned by the publisher/parent instead of B; no fixture mismatch remains."
+signature = "843bff54f19ea09c07a0930f76eb316de3bf54097fce4483ecf4952e9acb2495"
+
+[[difference]]
+id = "browser-storage/chroot-api"
+issues = ["#53"]
+reason = "chroot is absent from abi::Call; Linux executes the syscall in its disposable namespace."
+signature = "e96482cf3c2c9863e4bfb938c22d66b3966c3ef897515fc768aacf2d3fbd9663"
+
+[[difference]]
+id = "browser-storage/mount-api"
+issues = ["#51","#58"]
+reason = "mount is absent from abi::Call; the JavaScript attachment API is not a mount syscall."
+signature = "cd9917595721d6e1670ddeec0c052d67bde9c8917b0f15c3f20e2d97ccfff601"
+
+[[difference]]
+id = "browser-storage/umount-api"
+issues = ["#51","#58"]
+reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
+signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
+
+[[difference]]
+id = "directory-handle/alias"
+issues = ["#48","#49"]
+reason = "Attachments report different inode identities; chmod and ACL changes are private to the first attachment. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "beac5c32fc8724cac82c3b2b686513fb4e0fe51a4b1b357c2c378247473c90b2"
+
+[[difference]]
+id = "directory-handle/remount"
+issues = ["#49"]
+reason = "After detach/attach, mode returns to 0600 and the access ACL disappears."
+signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
+
+[[difference]]
+id = "directory-handle/open-rename"
+issues = ["#48"]
+reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write). Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "a4e5dd5763765933a95004bd32901def4b31d08d668c4f8a85d3c0c59985bfcd"
+
+[[difference]]
+id = "directory-handle/open-unlink"
+issues = ["#48"]
+reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "f390f785aff026e7910cc6de8ab24bffc240ac792b3ee6e3426adb491c5a3c12"
+
+[[difference]]
+id = "directory-handle/unmount-open"
+issues = ["#51"]
+reason = "Linux ordinary umount returns EBUSY, then MNT_DETACH succeeds and the retained descriptor still reads hello/fstats size 5. OS unmountLocal detaches and invalidates the descriptor (EBADF); its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "5b8d1e41fa03e82fdfb208e17e5f37f421eaf780c5d354166d2fa81c953ac12b"
+
+[[difference]]
+id = "directory-handle/unmount-cwd"
+issues = ["#51"]
+reason = "Linux ordinary umount returns EBUSY; after successful MNT_DETACH, getcwd returns ENOENT. OS unmountLocal detaches but getcwd retains the old path string; its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "cbd90180570a9ba62759c60c3ac3b440c7e6bc3df689797618cc4fc9af312543"
+
+[[difference]]
+id = "directory-handle/flush"
+issues = ["#50"]
+reason = "fsync/fdatasync return success even for fd -1, where Linux returns EBADF; inspected WASI handlers return zero without calling a provider. Successful valid-fd calls do not establish durability."
+signature = "51cd96d8f41db057278307da2d995be0c551c36171493c78ebc5f3d450d215b3"
+
+[[difference]]
+id = "directory-handle/mount-parent"
+issues = ["#51"]
+reason = "stat(mount/..) returns EACCES instead of the parent directory identity."
+signature = "c0671a8a900f3ae0c845cb60a647f30e8cf1988895b808b5372ec013c8d0448c"
+
+[[difference]]
+id = "directory-handle/link-dotdot"
+issues = ["#48","#51"]
+reason = "chdir(link/..) uses lexical parent behavior and getcwd does not identify a; provider symlink creation also returns EOPNOTSUPP."
+signature = "0a57ef8b32c90f6722061c8dc7775c3f4e4bf5cd2d4740d2901a521c6d004ac1"
+
+[[difference]]
+id = "directory-handle/cloud-to-provider"
+issues = ["#51"]
+reason = "The cloud symlink is created, but reading its target across the provider boundary returns ENOENT."
+signature = "d009f76c10d1a2325b1ca31002530192281b0acfb60187e46be0d69f5d199c86"
+
+[[difference]]
+id = "directory-handle/absolute-symlink"
+issues = ["#48","#51"]
+reason = "Provider symlink creation returns EOPNOTSUPP and reading the absent link returns ENOENT."
+signature = "b3d74f340cac6be7b443862e58d7d235d835c48a9076e449de18c7354133ea3e"
+
+[[difference]]
+id = "directory-handle/cwd-rename"
+issues = ["#48","#51"]
+reason = "getcwd retains the old pathname after rename; browser handles and relay additionally reject directory rename with EOPNOTSUPP."
+signature = "8806edc33110ae5a18d32d92ee5f319efc8831507b702a0c27fc8d79427423a3"
+
+[[difference]]
+id = "directory-handle/cwd-remove"
+issues = ["#51"]
+reason = "getcwd returns the removed pathname instead of ENOENT."
+signature = "80d6718291660e01a8fb4975cdb4f82d7394258015b3cfffab2a125dba33e638"
+
+[[difference]]
+id = "directory-handle/exclusive"
+issues = ["#50"]
+reason = "Opening an existing file with O_CREAT|O_EXCL returns EOPNOTSUPP instead of EEXIST."
+signature = "5889c9f04c71b58e7cf69b54e2f8bc4dd5864f6bcf5592e5eb150b3a3f54f901"
+
+[[difference]]
+id = "directory-handle/noreplace"
+issues = ["#50"]
+reason = "RENAME_NOREPLACE returns EOPNOTSUPP instead of EEXIST for an existing destination."
+signature = "c85048115032e13e5dc297599ce83984b0745da5efd1dc64529d01dbd6ad97e3"
+
+[[difference]]
+id = "directory-handle/hard-link"
+issues = ["#48","#49"]
+reason = "link returns EOPNOTSUPP; there is no alias identity, and the original retains one link and private mode 0600."
+signature = "5294599376182d353038534cb60674a9dfaf40383ac867bf1d8897b8b11a5374"
+
+[[difference]]
+id = "directory-handle/symlink"
+issues = ["#48"]
+reason = "symlink creation returns EOPNOTSUPP; reading the absent link returns ENOENT."
+signature = "cb9a4fe6a37f2c3db0e81136f0a698834ee78b24ac384538426ff510a98166c3"
+
+[[difference]]
+id = "directory-handle/creation"
+issues = ["#49"]
+reason = "Setgid inheritance is explicitly incomparable: creator and directory primary groups coincide. Directory mode/group are measured; metadata follow-up validation must exercise distinct groups."
+signature = "a23f92d93f340f73b7da61189ff4c2e11fd7895160b5391a1e6ef2a94b41e6b2"
+
+[[difference]]
+id = "directory-handle/two-accounts"
+issues = ["#49","#59"]
+reason = "Both creators have one neutral supplementary group, matching the directory group and distinct from their primary groups. Both targets record inherited group/mode/ACL. Through the authenticated export, B still receives EACCES and leaves a zero-byte file owned by the publisher/parent instead of B; no fixture mismatch remains."
+signature = "843bff54f19ea09c07a0930f76eb316de3bf54097fce4483ecf4952e9acb2495"
+
+[[difference]]
+id = "directory-handle/chroot-api"
+issues = ["#53"]
+reason = "chroot is absent from abi::Call; Linux executes the syscall in its disposable namespace."
+signature = "e96482cf3c2c9863e4bfb938c22d66b3966c3ef897515fc768aacf2d3fbd9663"
+
+[[difference]]
+id = "directory-handle/mount-api"
+issues = ["#51","#58"]
+reason = "mount is absent from abi::Call; the JavaScript attachment API is not a mount syscall."
+signature = "cd9917595721d6e1670ddeec0c052d67bde9c8917b0f15c3f20e2d97ccfff601"
+
+[[difference]]
+id = "directory-handle/umount-api"
+issues = ["#51","#58"]
+reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
+signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
+
+[[difference]]
+id = "local-helper/alias"
+issues = ["#48","#49"]
+reason = "Attachments report different inode identities; chmod and ACL changes are private to the first attachment. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "beac5c32fc8724cac82c3b2b686513fb4e0fe51a4b1b357c2c378247473c90b2"
+
+[[difference]]
+id = "local-helper/remount"
+issues = ["#49"]
+reason = "After detach/attach, mode returns to 0600 and the access ACL disappears."
+signature = "324d16ce10a69efe4620a6baff0367794fa2b793621b078a3da7f28d035e0ccd"
+
+[[difference]]
+id = "local-helper/open-rename"
+issues = ["#48"]
+reason = "Retained descriptor operations and inode equality match, but WASI fstat exposes a fabricated device number. Device identity is unavailable, so full identity remains incomparable until the runtime exposes it."
+signature = "b2c288488d6f5500e3cd766afa6007cdf2d4c1b7a63a8876de37aa6a9f675cfe"
+
+[[difference]]
+id = "local-helper/open-unlink"
+issues = ["#48"]
+reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "ea61d2102aa13211c7e88048e01ab691907953a005eb63395791e7870bf4925a"
+
+[[difference]]
+id = "local-helper/unmount-open"
+issues = ["#51"]
+reason = "Linux ordinary umount returns EBUSY, then MNT_DETACH succeeds and the retained descriptor still reads hello/fstats size 5. OS unmountLocal detaches and invalidates the descriptor (EBADF); its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "5b8d1e41fa03e82fdfb208e17e5f37f421eaf780c5d354166d2fa81c953ac12b"
+
+[[difference]]
+id = "local-helper/unmount-cwd"
+issues = ["#51"]
+reason = "Linux ordinary umount returns EBUSY; after successful MNT_DETACH, getcwd returns ENOENT. OS unmountLocal detaches but getcwd retains the old path string; its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "cbd90180570a9ba62759c60c3ac3b440c7e6bc3df689797618cc4fc9af312543"
+
+[[difference]]
+id = "local-helper/flush"
+issues = ["#50"]
+reason = "fsync/fdatasync return success even for fd -1, where Linux returns EBADF; inspected WASI handlers return zero without calling a provider. Successful valid-fd calls do not establish durability."
+signature = "51cd96d8f41db057278307da2d995be0c551c36171493c78ebc5f3d450d215b3"
+
+[[difference]]
+id = "local-helper/mount-parent"
+issues = ["#51"]
+reason = "stat(mount/..) returns EACCES instead of the parent directory identity."
+signature = "c0671a8a900f3ae0c845cb60a647f30e8cf1988895b808b5372ec013c8d0448c"
+
+[[difference]]
+id = "local-helper/link-dotdot"
+issues = ["#48","#51"]
+reason = "chdir(link/..) uses lexical parent behavior and getcwd does not identify a; provider symlink creation also returns EOPNOTSUPP."
+signature = "0a57ef8b32c90f6722061c8dc7775c3f4e4bf5cd2d4740d2901a521c6d004ac1"
+
+[[difference]]
+id = "local-helper/cloud-to-provider"
+issues = ["#51"]
+reason = "The cloud symlink is created, but reading its target across the provider boundary returns ENOENT."
+signature = "d009f76c10d1a2325b1ca31002530192281b0acfb60187e46be0d69f5d199c86"
+
+[[difference]]
+id = "local-helper/absolute-symlink"
+issues = ["#48","#51"]
+reason = "Provider symlink creation returns EOPNOTSUPP and reading the absent link returns ENOENT."
+signature = "b3d74f340cac6be7b443862e58d7d235d835c48a9076e449de18c7354133ea3e"
+
+[[difference]]
+id = "local-helper/cwd-rename"
+issues = ["#51"]
+reason = "Directory rename succeeds but getcwd retains the old pathname."
+signature = "548a345074b163dddbf19361abe4d1f814056dc957e63ff3a1ae03c2a692e404"
+
+[[difference]]
+id = "local-helper/cwd-remove"
+issues = ["#51"]
+reason = "getcwd returns the removed pathname instead of ENOENT."
+signature = "80d6718291660e01a8fb4975cdb4f82d7394258015b3cfffab2a125dba33e638"
+
+[[difference]]
+id = "local-helper/noreplace"
+issues = ["#50"]
+reason = "RENAME_NOREPLACE returns EOPNOTSUPP instead of EEXIST for an existing destination."
+signature = "c85048115032e13e5dc297599ce83984b0745da5efd1dc64529d01dbd6ad97e3"
+
+[[difference]]
+id = "local-helper/hard-link"
+issues = ["#48","#49"]
+reason = "link returns EOPNOTSUPP; there is no alias identity, and the original retains one link and private mode 0600."
+signature = "5294599376182d353038534cb60674a9dfaf40383ac867bf1d8897b8b11a5374"
+
+[[difference]]
+id = "local-helper/symlink"
+issues = ["#48"]
+reason = "symlink creation returns EOPNOTSUPP; reading the absent link returns ENOENT."
+signature = "cb9a4fe6a37f2c3db0e81136f0a698834ee78b24ac384538426ff510a98166c3"
+
+[[difference]]
+id = "local-helper/creation"
+issues = ["#49"]
+reason = "Setgid inheritance is explicitly incomparable: creator and directory primary groups coincide. Directory mode/group are measured; metadata follow-up validation must exercise distinct groups."
+signature = "a23f92d93f340f73b7da61189ff4c2e11fd7895160b5391a1e6ef2a94b41e6b2"
+
+[[difference]]
+id = "local-helper/two-accounts"
+issues = ["#49","#59"]
+reason = "Both creators have one neutral supplementary group, matching the directory group and distinct from their primary groups. Both targets record inherited group/mode/ACL. Through the authenticated export, B still receives EACCES and leaves a zero-byte file owned by the publisher/parent instead of B; no fixture mismatch remains."
+signature = "843bff54f19ea09c07a0930f76eb316de3bf54097fce4483ecf4952e9acb2495"
+
+[[difference]]
+id = "local-helper/chroot-api"
+issues = ["#53"]
+reason = "chroot is absent from abi::Call; Linux executes the syscall in its disposable namespace."
+signature = "e96482cf3c2c9863e4bfb938c22d66b3966c3ef897515fc768aacf2d3fbd9663"
+
+[[difference]]
+id = "local-helper/mount-api"
+issues = ["#51","#58"]
+reason = "mount is absent from abi::Call; the JavaScript attachment API is not a mount syscall."
+signature = "cd9917595721d6e1670ddeec0c052d67bde9c8917b0f15c3f20e2d97ccfff601"
+
+[[difference]]
+id = "local-helper/umount-api"
+issues = ["#51","#58"]
+reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
+signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
+
+[[difference]]
+id = "relay/alias"
+issues = ["#48","#49","#59"]
+reason = "Attachments report different inode identities. chmod and setfacl through the receiver return EPERM; the other attachment keeps private mode 0600 and no ACL. Device identity is unavailable in the OS metadata, rather than equal by assumption."
+signature = "9010a7e78ea62d7c5fc66d947d57466abe5efb1efb57efe3bfc2de45b92e481e"
+
+[[difference]]
+id = "relay/remount"
+issues = ["#49","#59"]
+reason = "Receiver chmod/setfacl return EPERM before detach; after attach the file still has mode 0600/no ACL. This does not establish persistence of changes denied by the export."
+signature = "2b966c0a2a9785be76791425900b02720d3c2d53e7efed01a4d817ee4d38d22d"
+
+[[difference]]
+id = "relay/open-rename"
+issues = ["#48"]
+reason = "The retained descriptor loses pathname-based access after rename (ENOENT reads and ESTALE writes on browser handles; ENOENT also on relay fstat/write). Separate identity calls now show success before the operation and ENOENT after it; the identity relation is explicitly skipped because the after result is unavailable."
+signature = "c7d6224f42fd6105f2334aa2e56b1d0ab6cd382ec145b11fa9498f7f99bf3648"
+
+[[difference]]
+id = "relay/open-unlink"
+issues = ["#48"]
+reason = "Unlinked cloud/helper descriptors still report nlink 1; browser handles lose reads/writes while fstat retains nlink 1; relay also loses fstat. Separate identity calls now show success before the operation and ENOENT after it; the identity relation is explicitly skipped because the after result is unavailable."
+signature = "21877fe6a3b9bbf9bca478405276026935b0f9e1b7de3752a4674598f4ded179"
+
+[[difference]]
+id = "relay/unmount-open"
+issues = ["#51"]
+reason = "Linux ordinary umount returns EBUSY, then MNT_DETACH succeeds and the retained descriptor still reads hello/fstats size 5. OS unmountLocal detaches and invalidates the descriptor (EBADF); its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "5b8d1e41fa03e82fdfb208e17e5f37f421eaf780c5d354166d2fa81c953ac12b"
+
+[[difference]]
+id = "relay/unmount-cwd"
+issues = ["#51"]
+reason = "Linux ordinary umount returns EBUSY; after successful MNT_DETACH, getcwd returns ENOENT. OS unmountLocal detaches but getcwd retains the old path string; its separate busy-unmount API is unavailable. Re-attachment succeeds."
+signature = "cbd90180570a9ba62759c60c3ac3b440c7e6bc3df689797618cc4fc9af312543"
+
+[[difference]]
+id = "relay/flush"
+issues = ["#50"]
+reason = "fsync/fdatasync return success even for fd -1, where Linux returns EBADF; inspected WASI handlers return zero without calling a provider. Successful valid-fd calls do not establish durability."
+signature = "51cd96d8f41db057278307da2d995be0c551c36171493c78ebc5f3d450d215b3"
+
+[[difference]]
+id = "relay/mount-parent"
+issues = ["#51"]
+reason = "stat(mount/..) returns EACCES instead of the parent directory identity."
+signature = "c0671a8a900f3ae0c845cb60a647f30e8cf1988895b808b5372ec013c8d0448c"
+
+[[difference]]
+id = "relay/link-dotdot"
+issues = ["#48","#51"]
+reason = "chdir(link/..) uses lexical parent behavior and getcwd does not identify a; provider symlink creation also returns EOPNOTSUPP."
+signature = "0a57ef8b32c90f6722061c8dc7775c3f4e4bf5cd2d4740d2901a521c6d004ac1"
+
+[[difference]]
+id = "relay/cloud-to-provider"
+issues = ["#51"]
+reason = "The cloud symlink is created, but reading its target across the provider boundary returns ENOENT."
+signature = "d009f76c10d1a2325b1ca31002530192281b0acfb60187e46be0d69f5d199c86"
+
+[[difference]]
+id = "relay/absolute-symlink"
+issues = ["#48","#51"]
+reason = "Provider symlink creation returns EOPNOTSUPP and reading the absent link returns ENOENT."
+signature = "b3d74f340cac6be7b443862e58d7d235d835c48a9076e449de18c7354133ea3e"
+
+[[difference]]
+id = "relay/cwd-rename"
+issues = ["#48","#51"]
+reason = "getcwd retains the old pathname after rename; browser handles and relay additionally reject directory rename with EOPNOTSUPP."
+signature = "8806edc33110ae5a18d32d92ee5f319efc8831507b702a0c27fc8d79427423a3"
+
+[[difference]]
+id = "relay/cwd-remove"
+issues = ["#51"]
+reason = "getcwd returns the removed pathname instead of ENOENT."
+signature = "80d6718291660e01a8fb4975cdb4f82d7394258015b3cfffab2a125dba33e638"
+
+[[difference]]
+id = "relay/exclusive"
+issues = ["#50"]
+reason = "Opening an existing file with O_CREAT|O_EXCL returns EOPNOTSUPP instead of EEXIST."
+signature = "5889c9f04c71b58e7cf69b54e2f8bc4dd5864f6bcf5592e5eb150b3a3f54f901"
+
+[[difference]]
+id = "relay/noreplace"
+issues = ["#50"]
+reason = "RENAME_NOREPLACE returns EOPNOTSUPP instead of EEXIST for an existing destination."
+signature = "c85048115032e13e5dc297599ce83984b0745da5efd1dc64529d01dbd6ad97e3"
+
+[[difference]]
+id = "relay/hard-link"
+issues = ["#48","#49"]
+reason = "link returns EOPNOTSUPP; there is no alias identity, and the original retains one link and private mode 0600."
+signature = "5294599376182d353038534cb60674a9dfaf40383ac867bf1d8897b8b11a5374"
+
+[[difference]]
+id = "relay/symlink"
+issues = ["#48"]
+reason = "symlink creation returns EOPNOTSUPP; reading the absent link returns ENOENT."
+signature = "cb9a4fe6a37f2c3db0e81136f0a698834ee78b24ac384538426ff510a98166c3"
+
+[[difference]]
+id = "relay/creation"
+issues = ["#49","#59"]
+reason = "Relay setgid/default ACL administration returns EPERM; directory mode remains 0700 and the created file has mode 0600 without an inherited access ACL. Setgid inheritance is explicitly incomparable: creator and directory primary groups coincide. Directory mode/group are measured; metadata follow-up validation must exercise distinct groups."
+signature = "36f0b903cfc7b2971c9ec901442117fa39906da5190ce28a2098c0c9a14336a9"
+
+[[difference]]
+id = "relay/two-accounts"
+issues = ["#49","#59"]
+reason = "Both creators have one neutral supplementary group, matching the directory group and distinct from their primary groups. Both targets record inherited group/mode/ACL. Through the authenticated export, B still receives EACCES and leaves a zero-byte file owned by the publisher/parent instead of B; no fixture mismatch remains."
+signature = "843bff54f19ea09c07a0930f76eb316de3bf54097fce4483ecf4952e9acb2495"
+
+[[difference]]
+id = "relay/chroot-api"
+issues = ["#53"]
+reason = "chroot is absent from abi::Call; Linux executes the syscall in its disposable namespace."
+signature = "e96482cf3c2c9863e4bfb938c22d66b3966c3ef897515fc768aacf2d3fbd9663"
+
+[[difference]]
+id = "relay/mount-api"
+issues = ["#51","#58"]
+reason = "mount is absent from abi::Call; the JavaScript attachment API is not a mount syscall."
+signature = "cd9917595721d6e1670ddeec0c052d67bde9c8917b0f15c3f20e2d97ccfff601"
+
+[[difference]]
+id = "relay/umount-api"
+issues = ["#51","#58"]
+reason = "umount is absent from abi::Call; separate live-process tests measure the JavaScript detach API."
+signature = "23a53c48f8036615023948b89e48521d8aff56a9397ac0df89baf56b66a42031"
+
+[[observation]]
+id = "process/startup"
+issues = ["#56","#57"]
+reason = "Live init/login leases name the current execution host; a real managed /usr/bin/supervise process runs on the login owner with PID 1 as parent. Native startup details remain environmental evidence."
+signature = "c5bc335c7b9fe7b4fba8fa71f62c09c5510af7c0008e7ecf1a5ca7c3685838ea"
+
+[[observation]]
+id = "process/gui-processes"
+issues = ["#63","#64"]
+reason = "Actual Files/Mounts/Editor/Preview windows open without corresponding process images in the registry. The headless Linux host has no matching applications, so this row is incomparable."
+signature = "fd4b1b6db203c78a76e5c68fc8d67c0fbf4b98ad741c16f1529280ccae822ba1"
+
+[[observation]]
+id = "process/tab-pids"
+issues = ["#54"]
+reason = "A second tab with the same login sees the first tab live sleep PID. The headless Linux host has no browser OS tabs, so this row is incomparable."
+signature = "4098b79c8fe64247aa2dbc68a6d3ea6aa586d709602f1e35c2663e2ba736d4a6"
