@@ -2,22 +2,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { start, stop } from '../scripts/process.mjs';
-import { startPodman, egressImage, configureWrangler } from '../scripts/podman.mjs';
-const exists=pid=>{try {process.kill(pid,0);return true;}catch(error) {if(error.code==='ESRCH')return false;throw error;}};
-const waitFor=async(condition,timeout=5000)=>{const until=Date.now()+timeout;while(!await condition()) {if(Date.now()>until)throw new Error('condition not reached');await new Promise(r=>setTimeout(r,20));}};
+import { start, stop, startTime } from '../scripts/process.mjs';
+import { startPodman, egressImage, configureWrangler, sessionDirectory } from '../scripts/podman.mjs';
+import { exists, waitFor, fakePodman, eventLines, podmanPid } from './helpers.mjs';
 const podmanModule=new URL('../scripts/podman.mjs',import.meta.url).href;
-// Records its PID, then listens where `system service` is told to (or exits, or never listens).
-const fakePodman=(dir,mode='listen')=>writeFile(join(dir,'podman'),'#!'+process.execPath+'\n'+`
-  require('node:fs').writeFileSync(process.env.CONFORMANCE_MARKER,String(process.pid));
-  ${mode==='listen'?"require('node:net').createServer().listen(process.argv.at(-1).slice(7));":mode==='exit'?'process.exit(1);':''}
-  setInterval(()=>{},1000);`,{mode:0o755});
 const miniflare=()=>'DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "cloudflare/sidecar:tag"';
-const fixture=async name=>{const dir=await mkdtemp(join(tmpdir(),name));return {dir,marker:join(dir,'pid'),env:{PATH:dir,CONFORMANCE_MARKER:join(dir,'pid')}};};
-const servicePid=async marker=>{let pid;await waitFor(async()=>{pid=Number(await readFile(marker,'utf8').catch(()=>''));return pid>0;});return pid;};
+// The fake podman comes first on PATH; the system part provides `sleep` for the lifeline.
+async function fixture(mode) {
+  const dir=await mkdtemp(join(tmpdir(),'podman-test-')),events=join(dir,'events');
+  if(mode)await fakePodman(dir,mode);
+  return {dir,events,env:{PATH:dir+':/usr/bin:/bin',FAKE_EVENTS:events},done:()=>rm(dir,{recursive:true,force:true})};
+}
+const pgrp=async pid=>Number((await readFile(`/proc/${pid}/stat`,'utf8')).split(') ')[1].split(' ')[2]);
 
 test('egress image: an explicit setting wins; Miniflare names it otherwise; strict decides what a missing one means',()=>{
   assert.equal(egressImage({MINIFLARE_CONTAINER_EGRESS_IMAGE:'registry.example/custom:tag'},{readMiniflare:()=>{throw new Error('lookup must be skipped');}}),'registry.example/custom:tag');
@@ -38,52 +37,72 @@ test('Wrangler is pointed at the socket, with the shim and the egress image',()=
 });
 
 test('the service runs in its own process group, leaves the environment alone, and close stops it',async()=>{
-  const {dir,marker,env}=await fixture('podman-start-');let service;
+  const f=await fixture('listen');let service;
   try {
-    await fakePodman(dir);
-    service=await startPodman(env,{socket:join(dir,'engine.sock')});
-    assert.equal(service.socket,join(dir,'engine.sock'));assert.deepEqual(Object.keys(env),['PATH','CONFORMANCE_MARKER']);
-    const pid=await servicePid(marker);
+    service=await startPodman(f.env,{socket:join(f.dir,'engine.sock')});
+    assert.equal(service.socket,join(f.dir,'engine.sock'));assert.equal(service.late,false);assert.equal(await service.ready,true);
+    assert.deepEqual(Object.keys(f.env),['PATH','FAKE_EVENTS']);
+    const pid=await podmanPid(f.events);
     // Not in this process's group: a terminal signal to the owner's group never reaches it.
-    assert.notEqual(Number((await readFile(`/proc/${pid}/stat`,'utf8')).split(') ')[1].split(' ')[2]),Number((await readFile('/proc/self/stat','utf8')).split(') ')[1].split(' ')[2]));
+    assert.notEqual(await pgrp(pid),await pgrp(process.pid));
     await service.close();service=null;
     assert(!exists(pid),'Podman service survived close');
-  } finally {await service?.close();await rm(dir,{recursive:true,force:true});}
+    assert((await eventLines(f.events)).includes('podman-stopped'));
+  } finally {await service?.close();await f.done();}
 });
 
 test('an existing socket is refused; a service that exits or never listens fails, and is stopped',async()=>{
-  const {dir,marker,env}=await fixture('podman-strict-');
+  const f=await fixture();
   try {
-    await writeFile(join(dir,'taken.sock'),'');
-    await assert.rejects(startPodman(env,{socket:join(dir,'taken.sock')}),/already exists/);
-    await fakePodman(dir,'exit');
-    await assert.rejects(startPodman(env,{socket:join(dir,'exits.sock')}),/exited before opening its socket/);
-    await fakePodman(dir,'silent');
-    await assert.rejects(startPodman(env,{socket:join(dir,'silent.sock'),startupTimeout:300}),/did not start/);
-    assert(!exists(await servicePid(marker)),'timed-out Podman service survived');
-  } finally {await rm(dir,{recursive:true,force:true});}
+    await writeFile(join(f.dir,'taken.sock'),'');
+    await assert.rejects(startPodman(f.env,{socket:join(f.dir,'taken.sock')}),/already exists/);
+    await fakePodman(f.dir,'exit');
+    await assert.rejects(startPodman(f.env,{socket:join(f.dir,'exits.sock')}),/exited before opening its socket/);
+    await rm(f.events,{force:true});await fakePodman(f.dir,'silent');
+    await assert.rejects(startPodman(f.env,{socket:join(f.dir,'silent.sock'),startupTimeout:300}),/did not start/);
+    assert(!exists(await podmanPid(f.events)),'timed-out Podman service survived');
+  } finally {await f.done();}
 });
 
-test('allowLate keeps a service still opening its socket at the deadline',async()=>{
-  const {dir,marker,env}=await fixture('podman-late-');let service;
+for(const [mode,expected] of [['late',true],['late-exit',false]])test(`allowLate: a service past its deadline reports ${expected?'when it listens':'that it exited'}`,async()=>{
+  const f=await fixture(mode);let service;
   try {
-    await fakePodman(dir,'silent');
-    service=await startPodman(env,{socket:join(dir,'late.sock'),startupTimeout:100,allowLate:true});
-    const pid=await servicePid(marker);assert(exists(pid));
-    await service.close();service=null;assert(!exists(pid));
-  } finally {await service?.close();await rm(dir,{recursive:true,force:true});}
+    service=await startPodman(f.env,{socket:join(f.dir,'late.sock'),startupTimeout:50,allowLate:true});
+    assert.equal(service.late,true);
+    assert.equal(await service.ready,expected);
+    await service.close();service=null;
+  } finally {await service?.close();await f.done();}
 });
 
-test('the service stops when its owner is killed outright',async()=>{
-  const {dir,marker,env}=await fixture('podman-owner-');let owner;
+for(const mode of ['listen','stubborn'])test(`the service stops when its owner is killed outright${mode==='stubborn'?', with SIGKILL if it ignores SIGTERM':''}`,async()=>{
+  const f=await fixture(mode);let owner;
   try {
-    await fakePodman(dir);
     const script=`import {startPodman} from ${JSON.stringify(podmanModule)};
-      await startPodman(process.env,{socket:${JSON.stringify(join(dir,'owned.sock'))}});console.log('ready');setInterval(()=>{},1000);`;
-    owner=start(process.execPath,['--input-type=module','-e',script],{env:{...process.env,...env,PATH:dir+':'+process.env.PATH},stdio:['ignore','pipe','inherit']});
+      await startPodman(process.env,{socket:${JSON.stringify(join(f.dir,'owned.sock'))}});console.log('ready');setInterval(()=>{},1000);`;
+    owner=start(process.execPath,['--input-type=module','-e',script],{env:{...process.env,...f.env},stdio:['ignore','pipe','inherit']});
     await once(owner.stdout,'data');
-    const pid=await servicePid(marker);assert(exists(pid));
+    const pid=await podmanPid(f.events);assert(exists(pid));
     owner.kill('SIGKILL');
-    await waitFor(()=>!exists(pid));
-  } finally {await stop(owner);await rm(dir,{recursive:true,force:true});}
+    await waitFor(()=>!exists(pid),mode==='stubborn'?9000:4000);
+    assert((await eventLines(f.events)).includes('podman-got-SIGTERM'));
+  } finally {await stop(owner);await f.done();}
+});
+
+test('session directories record their owner; those of dead owners are swept',async()=>{
+  const base=await mkdtemp(join(tmpdir(),'podman-sessions-'));
+  try {
+    const dead=start(process.execPath,['-e','setTimeout(()=>{},100)'],{stdio:'ignore'});
+    await waitFor(()=>startTime(dead.pid));const deadStart=startTime(dead.pid);await once(dead,'exit');
+    const make=async(name,owner)=>{await mkdir(join(base,name),{mode:0o700});if(owner)await writeFile(join(base,name,'owner.json'),JSON.stringify(owner));};
+    await make('os-podman-Dead01',{pid:dead.pid,start:deadStart});
+    await make('os-podman-Live01',{pid:process.pid,start:startTime(process.pid)});
+    await make('os-podman-NoOwnr',null);
+    await writeFile(join(base,`os-podman-${process.getuid()}.sock`),'');
+    const dir=sessionDirectory(base);
+    const owner=JSON.parse(await readFile(join(dir,'owner.json'),'utf8'));
+    assert.deepEqual(owner,{pid:process.pid,start:startTime(process.pid)});
+    const names=(await readdir(base)).sort();
+    assert(!names.includes('os-podman-Dead01'));
+    for(const kept of ['os-podman-Live01','os-podman-NoOwnr',`os-podman-${process.getuid()}.sock`])assert(names.includes(kept),kept);
+  } finally {await rm(base,{recursive:true,force:true});}
 });

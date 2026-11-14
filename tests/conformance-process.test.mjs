@@ -2,19 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once, EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
-import { mkdtemp, writeFile, readFile, rm, open } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, open } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { start, stop, ShutdownScope } from '../scripts/process.mjs';
 import { helperConnection } from '../scripts/conformance/fixtures.mjs';
 import { recoverInterrupted, startTime, RunRecord, runPrefix } from '../scripts/conformance/recovery.mjs';
-import { mkdir } from 'node:fs/promises';
+import { exists, waitFor, firstLine } from './helpers.mjs';
 const moduleURL=new URL('../scripts/process.mjs',import.meta.url).href;
-const exists=pid=>{try {process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}};
-const firstLine=child=>new Promise((resolve,reject)=>{
-  let text='';child.stdout.on('data',chunk=>{text+=chunk;if(text.includes('\n'))resolve(text.split('\n')[0]);});
-  child.once('error',reject);child.once('exit',()=>reject(new Error('fixture exited before ready')));
-});
 
 test('shared stop handles failed spawn and escalates a resistant owned process',async()=>{
   const missing=start('/does-not-exist-conformance',[],{detached:true,stdio:'pipe'});
@@ -82,7 +77,6 @@ test('a second signal interrupts a hung cleanup',async()=>{
 
 // Records every signal stop() sends, without changing what is sent.
 const recording=()=>{const signals=[];return {signals,kill:(...args)=>{signals.push(args);return process.kill(...args);}};};
-const waitFor=async(condition,timeout=5000)=>{const until=Date.now()+timeout;while(!condition()){if(Date.now()>until)throw new Error('condition not reached');await new Promise(r=>setTimeout(r,20));}};
 
 test('a group already empty when its leader exits is never signalled',async()=>{
   const child=start(process.execPath,['-e',''],{detached:true,stdio:'ignore'});
@@ -162,6 +156,32 @@ for(const early of [false,true])test('stop waits for a resistant group member af
     await assert.rejects(once(socket,'connect'),{code:'ECONNREFUSED'});socket.destroy();
     await stop(child,{timeout:80});
   } finally {try {process.kill(-child.pid,'SIGKILL');}catch(error){if(error.code!=='ESRCH')throw error;}await stop(child,{timeout:80});}
+});
+
+// Under npm run, one Ctrl-C reaches a script twice: from the terminal and relayed by npm.
+test('an identical signal within the window is the same request; a later one exits at once',async()=>{
+  const script=`import {ShutdownScope} from ${JSON.stringify(moduleURL)};
+    const scope=new ShutdownScope();scope.add('hung',()=>{console.log('cleaning');return new Promise(()=>{});});console.log('ready');setInterval(()=>{},1000);`;
+  const child=start(process.execPath,['--input-type=module','-e',script],{detached:true,stdio:['ignore','pipe','pipe']});
+  const exited=once(child,'exit');
+  try {
+    await firstLine(child);const cleaning=firstLine(child);
+    child.kill('SIGTERM');child.kill('SIGTERM');await cleaning;
+    await new Promise(resolve=>setTimeout(resolve,200));
+    assert.equal(child.exitCode,null,'the relayed copy was taken as a second signal');
+    await new Promise(resolve=>setTimeout(resolve,400));
+    child.kill('SIGTERM');assert.equal((await exited)[0],143);
+  } finally {await stop(child,{timeout:30});}
+});
+
+test('a closed terminal (SIGHUP) runs the same cleanup and exits 129',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-hup-')),marker=join(dir,'closed');
+  const script=`import {ShutdownScope} from ${JSON.stringify(moduleURL)};import {writeFileSync} from 'node:fs';
+    const scope=new ShutdownScope();scope.add('resource',()=>writeFileSync(${JSON.stringify(marker)},String(scope.signal)));console.log('ready');setInterval(()=>{},1000);`;
+  const child=start(process.execPath,['--input-type=module','-e',script],{detached:true,stdio:['ignore','pipe','pipe']});
+  const exited=once(child,'exit');
+  try {await firstLine(child);child.kill('SIGHUP');assert.equal((await exited)[0],129);assert.equal(await readFile(marker,'utf8'),'SIGHUP');}
+  finally {await stop(child,{timeout:30});await rm(dir,{recursive:true,force:true});}
 });
 
 test('a failure during cleanup is reported, not discarded',async()=>{

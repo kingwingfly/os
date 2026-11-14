@@ -3,53 +3,67 @@
 // Podman API service for the session (scripts/podman.mjs) and points wrangler at it, through a
 // proxy that fixes up what Podman would refuse (scripts/engine-proxy.mjs).
 //
-// Shutdown order: Ctrl-C, SIGTERM or a closed terminal reach dev and Wrangler, never Podman, which
-// stays available while Wrangler removes its containers and is stopped after Wrangler exits.
-// A second signal exits at once. If dev itself is killed, Podman stops with it.
+// Wrangler is started from its own entry point, not through npx, so the signals sent and the
+// exit seen are Wrangler's. Shutdown uses the shared cleanup scope (scripts/process.mjs): the
+// first SIGINT, SIGTERM or SIGHUP (a closed terminal) is passed on to Wrangler, which removes
+// its containers while Podman, out of reach of terminal signals, keeps serving; Podman stops
+// after Wrangler exits. The copy of the same signal that npm relays is not a second signal; a
+// later one exits at once, and Podman then stops with its lifeline.
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { readFileSync, rmSync } from 'node:fs';
 import { once } from 'node:events';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { needsPodman, egressImage, startPodman, configureWrangler } from './podman.mjs';
+import { dirname, join, resolve } from 'node:path';
+import { needsPodman, egressImage, startPodman, configureWrangler, sessionDirectory } from './podman.mjs';
 import { engineProxy } from './engine-proxy.mjs';
+import { ShutdownScope, signalCodes } from './process.mjs';
 
 const env={...process.env};
-const codes={SIGINT:130,SIGTERM:143,SIGHUP:129};
-let podman,proxy,dir,wrangler,interrupted,finishing;
 // After a terminal closes, writing to it fails; that must not cut the shutdown short.
 for(const stream of [process.stdout,process.stderr])stream.on('error',()=>{});
-// The private socket directory goes even when a second signal exits at once.
-process.on('exit',()=>{if(dir)rmSync(dir,{recursive:true,force:true});});
-const bootstrap=new AbortController();
-async function release() {
-  proxy?.destroyAllSockets();proxy?.close();
-  await podman?.close();
+const scope=new ShutdownScope();
+
+function wranglerEntry() {
+  const manifest=createRequire(import.meta.url).resolve('wrangler/package.json');
+  const {bin}=JSON.parse(readFileSync(manifest,'utf8'));
+  return resolve(dirname(manifest),typeof bin==='string'?bin:bin.wrangler);
 }
-const finish=code=>finishing??=release().catch(error=>console.error('Podman cleanup failed: '+error.message)).finally(()=>process.exit(code));
-for(const signal of Object.keys(codes))process.on(signal,()=>{
-  if(interrupted)process.exit(codes[signal]);
-  interrupted=signal;
-  if(wrangler)wrangler.kill(signal);
-  else bootstrap.abort(new Error('interrupted by '+signal));
-});
+async function exit(code) {await scope.close();process.exit(code);}
 
 if(needsPodman(env)) {
+  let dir,podman,proxy;
   try {
-    dir=mkdtempSync(join(tmpdir(),'os-podman-'));
+    dir=sessionDirectory();
+    // Removed even when a second signal exits at once.
+    process.on('exit',()=>rmSync(dir,{recursive:true,force:true}));
     const egress=egressImage(env);
-    podman=await startPodman(env,{socket:join(dir,'podman.sock'),allowLate:true,signal:bootstrap.signal});
+    podman=await startPodman(env,{socket:join(dir,'podman.sock'),allowLate:true,signal:scope.controller.signal});
     proxy=engineProxy(join(dir,'docker.sock'),{socketPath:podman.socket},{stripMemorySwappiness:true});
     await once(proxy,'listening');
     configureWrangler(env,{host:join(dir,'docker.sock'),egress});
-    console.log(`Containers run with Podman, through ${podman.socket}`);
+    // Disposed in reverse order, after Wrangler: the proxy, then Podman.
+    scope.add('Podman',()=>podman.close());
+    scope.add('engine proxy',()=>{proxy.destroyAllSockets();return new Promise(resolve=>proxy.close(()=>resolve()));});
+    if(podman.late) {
+      console.log(`Podman is still starting; containers will be available once it listens at ${podman.socket}`);
+      podman.ready.then(ok=>ok?console.log('Podman is now listening.'):console.warn('Podman exited before opening its socket; containers are unavailable in this session.'));
+    } else console.log(`Containers run with Podman, through ${podman.socket}`);
   } catch(error) {
-    await release().catch(()=>{});podman=proxy=null;
-    if(interrupted)await finish(codes[interrupted]);
+    if(scope.closing)await new Promise(()=>{}); // a signal arrived: the scope is exiting
+    proxy?.destroyAllSockets();proxy?.close();
+    await podman?.close().catch(()=>{});
     console.warn(`Podman unavailable; starting Wrangler without container bootstrap: ${error.message}`);
   }
 }
-if(interrupted)await finish(codes[interrupted]);
-wrangler=spawn('npx',['wrangler','dev',...process.argv.slice(2)],{stdio:'inherit',env});
-wrangler.on('error',error=>{console.error('Wrangler failed to start: '+error.message);void finish(1);});
-wrangler.on('exit',(code,signal)=>{void finish(code??codes[signal]??1);});
+
+let entry;
+try {entry=wranglerEntry();}
+catch(error) {console.error('Wrangler failed to start: '+error.message);await exit(1);}
+const wrangler=scope.own('Wrangler',()=>spawn(process.execPath,[entry,'dev',...process.argv.slice(2)],{stdio:'inherit',env}),async child=>{
+  if(child.exitCode!==null||child.signalCode!==null||child.spawnError)return;
+  const exited=once(child,'exit');
+  child.kill(scope.signal??'SIGTERM');
+  await exited;
+});
+wrangler.on('error',error=>{wrangler.spawnError=error;console.error('Wrangler failed to start: '+error.message);if(!scope.closing)void exit(1);});
+wrangler.on('exit',(code,signal)=>{if(!scope.closing)void exit(code??signalCodes[signal]??1);});
