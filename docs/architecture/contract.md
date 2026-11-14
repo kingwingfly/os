@@ -58,7 +58,7 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 **Today.**
 - **Server-side Rust:** path lookup and permission rules are Rust (`crates/kernel`, `crates/core`), executed by the server.
 - **Client-side JavaScript:** the client's mount routing, descriptors and metadata overlay (`web/kernel/workspace.js`, `mount-policy.js`, `local-mounts.js`).
-- **Client kernel crate:** `crates/client-kernel` holds processes and tokens only.
+- **Client kernel crate:** `crates/client-kernel` holds processes and tokens. It also exports the Rust permission policy that `PermissionMount` calls for every decision (`vfs_policy`, over `kernel::mount_policy`) and private-extension validation (`private_extension`).
 
 **Decision.**
 - **Portable Rust crates.** Kernel semantics live in Rust crates with no DOM, `web-sys` or `wasm-bindgen` types, so a native host and a headless test host can run them. That covers VFS objects, the mount table, path walk, process filesystem context, procfs, local sockets and the process table.
@@ -83,18 +83,26 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 - **Name operations:**
   - `lookup(dir, name)`;
   - `walk(dir, names)`: resolves several components within this one filesystem in one round trip. Each name is a single component and never `.` or `..` (`EINVAL` otherwise). It stops at the first symlink, missing name or non-directory, and returns how far it got. The client never passes a name beyond its own next mount point: it splits a path at its mount points and resolves `..`, symlinks and mount crossings itself, against its mount table and process root, so `..` can never escape a `chroot` through the server;
-  - `create`, `mkdir`, `mknod`, `symlink`, `readlink`, `link(handle, dir, name)`, `unlink(dir, name)`, `rmdir(dir, name)`, `rename(dir, name, dir, name, flags)`.
+  - `parent(dir)`: the directory's parent and its name there, within this filesystem (at the filesystem's root it says so). The client resolves `..` with it inside a filesystem, and with its own mount table at mount roots and process roots. `getcwd` is built from it, so a cwd renamed by another instance still resolves `..` and reports its current path;
+  - `create(dir, name, mode, flags, access)`: creates and opens in one call, returning the new handle and an open reference with the requested access, whatever the new file's mode, as Linux gives the creator. With `O_EXCL` it fails with `EEXIST` if the name exists, so no other instance can slip in between;
+  - `mkdir`, `mknod`, `symlink`, `readlink`, `link(handle, dir, name)`, `unlink(dir, name)`, `rmdir(dir, name)`, `rename(dir, name, dir, name, flags)`.
 - **Attributes:** `getattr`, `setattr` (mode, owner, times, size), `readdir`, `getxattr`/`setxattr`/`listxattr`/`removexattr`, `statfs`.
 - **Open files:**
   - `open(handle, access)` returns an **open reference**. The server records it, as the `fds` table does today.
   - `access` is read, write, read-write, append, or **exec**. Exec is checked against execute permission, not read, and its bytes serve only the loader, so execute-only images keep running (`crates/kernel/src/lib.rs`, the X rule).
-  - `read(open, offset, length)`, `write(open, offset, data)`, `fsync(open, datasync)` and `release(open)` act on it.
+  - `read(open, offset, length)`, `write(open, offset, data)`, `truncate(open, size)`, `fsync(open, datasync)` and `release(open)` act on it.
+  - `lock(open, kind, range, wait)`, `unlock(open, range)` and `getlk(open, range)` take advisory locks. The cloud authority keeps them per inode, owned by open references and released with them, so every instance sees them (§3).
+  - An open reference records the credential that opened it, as Linux records an open file's credential. It works only while that credential is valid: revoking the credential ends its open references, and later operations on them fail with `EACCES`.
+  - **Execute-only is local policy.** Exec access sends the bytes to the client's loader, so a client that may execute a file can read it. The server still refuses exec access without execute permission, but it promises no confidentiality of executable bytes.
 - **When permission is checked, as on Linux:**
   - `lookup` and `walk` check search permission on each directory they pass.
   - `open` checks the requested access once.
-  - `read` and `write` through an open reference check only the access granted at open. A file created read-only can still be written through the descriptor that created it, as `tar` relies on.
+  - `read`, `write` and `truncate` through an open reference check only the access granted at open (and that its credential is still valid). A file created read-only can still be written and truncated through the descriptor that created it, as `tar` relies on.
   - Every other operation (`setattr`, `link`, `unlink`, xattrs) checks the presenting credential when it is made.
-- **Content lifetime.** An unlinked file's content lives until its last open reference is released. Open references belong to their instance's connection. When the connection ends, or its lease expires because the host vanished, the server releases them, so content is neither leaked nor collected under a reader. AGENT.md's garbage-collection rule ("respect open references") applies to these references.
+- **Content lifetime.** An unlinked file's content lives until its last open reference is released. Open references belong to the instance's **session** with the service: a lease renewed while the instance is connected, and a resume secret the service issues at connect.
+  - A reconnect within the lease (proposed: two minutes) that presents the secret keeps every open reference and lock, so a network drop or a deployment loses nothing.
+  - When the lease expires because the host vanished, the service releases them, so content is neither leaked nor collected under a reader.
+  - AGENT.md's garbage-collection rule ("respect open references") applies to these references.
 - **Path calls go away.** Version 1 path calls are removed once nothing in the repository uses them. No compatibility window is kept (§2.12).
 - **Server storage.** Looking a child up by (directory inode, name) uses the existing `nodes_ino` index; the table may be re-keyed if useful, without migration.
 
@@ -111,10 +119,11 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 
 **Decision.**
 - **Local policy, local enforcement.** Local policy protects one user's processes and local resources from another user's, inside one instance. Its enforcer is the client kernel, which the user's browser runs, so it is not a security boundary against that user. It is documented as such.
-- **Remote services check everything themselves.** Each remote service checks its own resources against a credential it issued. Nothing local is taken on trust: a modified kernel gains no remote right.
+- **Remote services check everything themselves.** Each remote service checks its own resources against a credential it issued. Nothing local is taken on trust: a modified kernel gains no remote right beyond what its credentials allow. It does receive the bytes of what it may execute (§2.3).
 - **No request needed** for `fork`, `exit`, `wait`, `kill` within the instance, signals, pipes, process groups, sessions, local sockets, local mounts of local filesystems, and tmpfs.
 - **A request to the service is needed for:**
   - an identity change: `login`, `su`, `sudo`, `passwd`, `newgrp`, and exec of a setuid image if that is ever allowed to elevate (it is not today, and this contract keeps that);
+  - dropping privileges: root's `setuid`, `setgid` or `setgroups` to a lower identity asks the service for that identity's credential (root may act as any account, as `su` does). The process's remote credential is replaced, never kept, so a daemon that drops privileges has only the lower identity's remote rights;
   - the first use of a remote resource in a credential's lifetime (a filesystem connection, a device, a task);
   - every remote operation thereafter, each authorized as in §2.3.
 - **Fork and exec.** A forked child keeps its parent's credential with no request. A plain exec keeps the credential and its remote rights.
@@ -136,17 +145,19 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 | Cloud tree (`OsAuthority`) | the authority's filesystem id | its inode ids, with a generation added | the authority's tables, as today |
 | Browser storage (`os-workspace` in OPFS) | a UUID minted once per profile | ids minted by the metadata store | a metadata store beside the tree, in the profile's IndexedDB |
 | Host folder (browser directory handle) | a UUID minted at first attach, kept with the handle in IndexedDB and matched with `isSameEntry` | ids minted by the metadata store, keyed by path plus a fingerprint (size and modification time at the OS's last write) | the profile's IndexedDB, keyed by the UUID |
-| Host folder (Linux helper) | a UUID the helper mints for its root folder and keeps in its own state | `st_ino` plus the inode's birth time (`statx` `stx_btime`) or generation (`FS_IOC_GETVERSION`); not `st_dev`, which changes across reboots and re-plugging | the helper's own state directory, keyed by the folder UUID and inode identity |
+| Host folder (Linux helper) | a UUID the helper mints for its root folder and keeps in its own state | (device, `st_ino`, birth time `stx_btime` or generation `FS_IOC_GETVERSION`). The device is the helper's stable name for each filesystem under the folder: the folder-relative path of that filesystem's topmost directory, which the helper records. It distinguishes mounts, btrfs subvolumes and snapshots under the folder, and survives `st_dev` renumbering after a reboot or re-plug. | the helper's own state directory, keyed by the folder UUID and inode identity |
 | Shared mount (export) | the publisher's | the publisher's | the publisher's, passed through |
 
 **Shared by every tab of a profile.** OPFS and IndexedDB belong to the browser profile, and every tab of it is a separate instance (§2.1). So for browser storage and directory-handle folders, the metadata store, open references and whole-file locks are profile-wide:
 - **Metadata** is written in IndexedDB transactions.
-- **Open references** are registered under Web Locks, which every same-origin tab shares. Unlink-at-last-close counts every tab's opens, and a tab's references go when it closes.
+- **Open references** are registered under Web Locks, which every same-origin tab shares. Unlink-at-last-close counts every tab's opens, and a tab's references go when it closes. A tab that crashes releases its Web Locks too, so each tab sweeps, as it starts, unlinked entries whose references are no longer held.
 - **Minting** a folder's UUID happens under a Web Lock, so two tabs attaching one folder agree on one identity.
 
 **Never wider than the host.**
 - **Bounded by the host grant.** Metadata never grants more than the host grant: the browser permission, or the helper's `--write`/`--execute` ceiling.
-- **Changes outside the OS reset metadata.** A file whose identity no longer matches its metadata loses it and gets the folder's private defaults (owner the attaching account, no ACL): a helper inode reused after a deletion, or a directory-handle file renamed, replaced or changed outside the OS. It never inherits a previous file's grants.
+- **Changes outside the OS reset metadata.** A file whose identity no longer matches its metadata loses it and gets the folder's private defaults (owner the attaching account, no ACL): a helper inode reused after a deletion, or a directory-handle file renamed, replaced or changed outside the OS.
+  - On the helper this is exact, so a file never inherits a previous file's grants.
+  - On a directory-handle folder it is a declared limit. The API exposes nothing stronger than path, size and modification time, so a file replaced outside the OS with the same size and modification time (`cp -p`, `rsync -a`) keeps the previous file's metadata. The folder's owner made both files; no other account can cause it.
 - **No sidecar files.** Nothing is written into the user's folder.
 - **Profile-local.** A directory-handle folder's identity and metadata are stable only within one browser profile.
 
@@ -159,14 +170,14 @@ Every later gate is read against the table in [§3](#3-filesystem-capability-pro
 ### 2.7 Mounts and namespaces (Proposed)
 
 - **Private propagation only.** `MS_SHARED`, `MS_SLAVE` and `MS_UNBINDABLE` are rejected with `EINVAL`. A new namespace copies the mounts of the one it comes from.
-- **Supported:** bind mounts (with `MS_REC`), `MS_RDONLY`, `MS_NOEXEC`, `MS_NOSUID`, `MS_NODEV`, the atime flags, `MS_REMOUNT` of those flags, `MS_MOVE` (for the root switch), unmount and lazy detach. `MS_SILENT` and the `MS_MGC_VAL` magic are accepted and ignored, as Linux does.
-- **Filesystem types** include `image`, for read-only system and extension images. That keeps private extensions (Phase 8.2, mounted at `/opt/private/NAME` today) as ordinary mounts.
+- **Supported:** bind mounts (with `MS_REC`), `MS_RDONLY`, `MS_NOEXEC`, `MS_NOSUID`, `MS_NODEV`, `MS_SYNCHRONOUS`, `MS_DIRSYNC`, `MS_NOSYMFOLLOW`, the atime flags, `MS_REMOUNT` of those flags, `MS_MOVE` (for the root switch), unmount, lazy detach and root's forced unmount. `MS_SILENT`, `MS_POSIXACL`, `MS_I_VERSION` and the `MS_MGC_VAL` magic are accepted and ignored, as Linux does.
+- **Filesystem types** include `image`, for read-only system and extension images. That keeps private extensions (Phase 8.2, mounted at `/opt/private/NAME` today) as ordinary mounts. Early init builds `/dev` from `devtmpfs` and `devpts`. There is no `sysfs` (`ENODEV`).
 - **Who may mount.**
   - Instance root may mount anything.
   - An ordinary user may mount a filesystem it has a grant for (host folder, browser storage, an export it was admitted to, its private extension image) on a directory it owns.
-  - The mount service creates the user's mount-point directories under `/mnt/local` and `/opt/private`, owned by that user, in the instance's tmpfs. So the Mounts app's `/mnt/local/NAME` and `/opt/private/NAME` keep working.
+  - The mount service creates the user's mount-point directories under `/mnt/local`, `/mnt/shared` and `/opt/private`, owned by that user, in the instance's tmpfs. So the Mounts app's `/mnt/local/NAME`, `/mnt/shared/NAME` and `/opt/private/NAME` keep working.
   - `nosuid` and `nodev` are forced on user mounts, and an ordinary user's remount cannot clear them (`EPERM`).
-  - A user mount is usable only by its user and instance root, as FUSE does without `allow_other`. Sharing with other users goes through exports (#59).
+  - A user mount is usable only by its user, not even by instance root, as FUSE does without `allow_other`. That keeps root's services and tools out of user-controlled trees with hostile symlinks or stalled providers. Sharing with other users goes through exports (#59).
   - Bind mounts, remounts of mounts you did not make, and `MS_MOVE` need instance root.
 - **Errors** for busy unmount, lazy detach, export revocation and provider loss are in [§4](#4-mounts-and-namespaces).
 
@@ -214,10 +225,11 @@ The protocol contains no DOM types. `/dev/display` and `/dev/input` expose them 
 **Decision.**
 - **Named boundaries with versions.** Each boundary in [§6](#6-versioned-boundaries) has a version.
 - **Negotiation at connect.** Each side states the versions it speaks, and the highest common one is used. With none in common, the connection is refused with `EPROTONOSUPPORT`.
-- **Recovering in a page:**
-  - A page at the default release reloads once to fetch matching code, and records the attempt so a second mismatch does not reload again.
-  - A page at a pinned release URL never reloads by itself, because a reload stays pinned (README "Immutable releases and extensions"). It shows which boundary and version the pinned release lacks and offers the default release.
-- **One version per side.** Because nothing older is kept (§2.12), each side speaks exactly one version during #44; the negotiation exists to detect a stale page or host after a deployment, not to serve old clients.
+- **Recovering in a page.** A page never reloads by itself, since a reload ends the instance and its processes.
+  - It reports the mismatch, keeps local processes running, and fails only the calls that cross the mismatched boundary.
+  - It offers a reload at the default release, or, at a pinned release URL (where a reload stays pinned, README "Immutable releases and extensions"), the switch to the default release.
+  - Nothing is recorded between page loads, so each deployment's mismatch is reported afresh.
+- **One version per side.** Because nothing older is kept (§2.12), each side speaks one version during #44. The exception is the step that replaces a protocol: version 1 and version 2 file calls coexist between #48 and #51. The negotiation exists to detect a stale page or host after a deployment, not to serve old clients.
 
 `contract.rs` defines the boundaries, their versions and the negotiation rule.
 
@@ -237,7 +249,8 @@ The protocol contains no DOM types. `/dev/display` and `/dev/input` expose them 
 - **Durable Object migration entries stay valid.** Cloudflare requires wrangler's `[[migrations]]` entries for Durable Object class changes, in deployment and in local development. Changes add entries as Cloudflare requires; the redeploy may start a fresh history.
 - **Browser-side state survives the redeploy**, so it is versioned too.
   - Every store the client writes carries a format version: OPFS and IndexedDB metadata stores, the directory-handle registry, saved preferences.
-  - A store in another format is reset, never read: its metadata goes back to private defaults. File contents (in `os-workspace` and in users' folders) are never deleted by a reset.
+  - Formats only move forward. Code meeting an older store resets it once, never reading it: its metadata goes back to private defaults. Code meeting a newer store (an older pinned release in another tab) leaves it alone and reports the filesystem unavailable (`EPROTONOSUPPORT`), so tabs on different releases never reset each other's metadata.
+  - File contents (in `os-workspace` and in users' folders) are never deleted by a reset.
   - Cookies from before the redeploy fail authentication, and the user signs in again.
 - **Removed as soon as replaced:** an old path goes when its replacement works in the repository. Its authorization rules and denial tests carry over.
 - **Per-mount permissions are not carried over.** A filesystem's first attachment after L1 starts private to the attaching account and never widens access.
@@ -267,7 +280,7 @@ Target profiles (Proposed).
 | Capability | Cloud tree | Browser storage (OPFS) | Host folder (directory handle) | Host folder (helper) | Shared mount (export) |
 | --- | --- | --- | --- | --- | --- |
 | Filesystem identity | global | profile-local | profile-local | host-local (folder UUID) | the publisher's |
-| Open file survives unlink | yes | emulated: name removed, content deleted when the last tab releases it | stale: `ESTALE` | yes (the helper holds the host descriptor) | the publisher's |
+| Open file survives unlink | yes | emulated: name removed, content deleted when the last tab releases it (or when a later tab finds its holder gone) | stale: `ESTALE` | yes (the helper holds the host descriptor) | the publisher's |
 | Open file survives rename | yes | yes | yes when renamed through the OS; stale (`ESTALE`) after an outside rename | yes | the publisher's |
 | Hard links | yes | emulated in the metadata store | refused: `EPERM` | yes | the publisher's |
 | Symbolic links | yes | emulated in the metadata store | refused: `EPERM` | yes, confined beneath the folder | the publisher's |
@@ -275,12 +288,11 @@ Target profiles (Proposed).
 | Atomic rename | yes | emulated (profile lock) | no: declared non-atomic | yes (`renameat2`) | the publisher's |
 | `RENAME_NOREPLACE` | yes | emulated (profile lock) | emulated: checked under the profile lock | yes (`renameat2`) | the publisher's |
 | Durability point (`fsync` returns after) | the authority's transaction and chunk commit | closing the writable stream, or the sync handle's `flush()` | closing the writable stream | the helper's `fsync(2)` | the publisher's acknowledgement |
-| Whole-file locks (`flock`) | within the instance | across the profile's tabs (Web Locks) | across the profile's tabs (Web Locks) | within the instance | within the instance |
+| Locks (`flock`, `fcntl` byte ranges) | kept by the authority, seen by every instance | across the profile's tabs: Web Locks, with byte ranges in the metadata store | across the profile's tabs, as browser storage | the host's own locks, held by the helper, seen by every host program | the publisher's |
 
 Baseline rows: `open-rename`, `open-unlink`, `hard-link`, `symlink` → #48; `exclusive`, `noreplace`, `flush` → #50.
 
-- **Byte-range locks** (`fcntl`) are within the instance on every driver.
-- **Unsupported locks.** A lock request a driver cannot honour fails with `ENOLCK` (added to `abi::Errno` by #50).
+- **No lock is faked.** A lock is granted only where every client of that filesystem can see it. A driver that cannot reach its lock keeper fails the request with `ENOLCK` (added to `abi::Errno` by #50), never with success.
 - **Provider loss** (the folder's permission withdrawn, the helper gone, the publisher offline) fails operations with `ENOTCONN` (added by #51), as on Linux when a FUSE daemon dies.
 
 ## 4. Mounts and namespaces
@@ -291,12 +303,13 @@ Proposed results, following Linux where it has an answer:
 | --- | --- |
 | `umount` of a mount with open files, a cwd, a process root or child mounts in it | `EBUSY` |
 | `umount2(MNT_DETACH)` (lazy detach) | Succeeds at once. The mount leaves the namespace; open files, cwds and process roots in it keep working until released; then the filesystem is released. |
-| `umount2(MNT_FORCE)` or `MNT_EXPIRE` | `EINVAL` (not supported) |
+| `umount2(MNT_FORCE)` | Instance root: the provider's outstanding requests fail with `EIO`, then the unmount proceeds as without it (`EBUSY` if still busy). Anyone else: `EPERM`. |
+| `umount2(MNT_EXPIRE)` | `EINVAL` (not supported) |
 | The publisher revokes an export, or the receiver's access is withdrawn | The mount stays attached. Every operation through it, including on open descriptors, fails with `EACCES`, until it is unmounted. |
 | Provider loss | The mount stays attached. Operations fail with `ENOTCONN`. A write whose acknowledgement was lost fails with `EIO` and is reported as an uncertain write. |
 | `MS_SHARED`, `MS_SLAVE`, `MS_UNBINDABLE` | `EINVAL` |
 | `MS_PRIVATE` | Accepted; already the case |
-| Another user enters a user mount | `EACCES` (only its user and instance root may use it, §2.7) |
+| Another user, or instance root, enters a user mount | `EACCES` (only its user may use it, §2.7) |
 | An ordinary user's remount without `nosuid` or `nodev` | `EPERM` |
 
 ## 5. New calls: flags and errors
@@ -307,8 +320,8 @@ These are the calls #51–#56 add. Errors follow Linux; where this OS differs or
 
 | Item | Value |
 | --- | --- |
-| Flags | `MS_RDONLY`, `MS_NOSUID`, `MS_NODEV`, `MS_NOEXEC`, `MS_NOATIME`, `MS_NODIRATIME`, `MS_RELATIME`, `MS_STRICTATIME`, `MS_LAZYTIME`, `MS_REMOUNT`, `MS_BIND`, `MS_REC`, `MS_MOVE`, `MS_PRIVATE`. `MS_SILENT` and the `MS_MGC_VAL` magic (`0xC0ED` in the top 16 bits) are accepted and ignored. Any other flag → `EINVAL`. |
-| Filesystem types | `cloud`, `opfs`, `hostfs`, `helperfs`, `sharefs`, `image`, `tmpfs`, `proc`; unknown → `ENODEV` |
+| Flags | `MS_RDONLY`, `MS_NOSUID`, `MS_NODEV`, `MS_NOEXEC`, `MS_SYNCHRONOUS`, `MS_DIRSYNC`, `MS_NOSYMFOLLOW`, `MS_NOATIME`, `MS_NODIRATIME`, `MS_RELATIME`, `MS_STRICTATIME`, `MS_LAZYTIME`, `MS_REMOUNT`, `MS_BIND`, `MS_REC`, `MS_MOVE`, `MS_PRIVATE`. `MS_SILENT`, `MS_POSIXACL`, `MS_I_VERSION` and the `MS_MGC_VAL` magic (`0xC0ED` in the top 16 bits) are accepted and ignored. Any other flag → `EINVAL`. |
+| Filesystem types | `cloud`, `opfs`, `hostfs`, `helperfs`, `sharefs`, `image`, `tmpfs`, `proc`, `devtmpfs`, `devpts`; unknown (including `sysfs`) → `ENODEV` |
 | `EPERM` | the caller may not mount here (§2.7), or an ordinary user's remount would clear `nosuid`/`nodev` |
 | `EACCES` | a path component cannot be searched, or the provider refused the grant |
 | `ENOENT`, `ENOTDIR`, `ELOOP`, `ENAMETOOLONG` | path errors, as for any lookup |
@@ -320,10 +333,10 @@ These are the calls #51–#56 add. Errors follow Linux; where this OS differs or
 
 | Item | Value |
 | --- | --- |
-| Flags | `MNT_DETACH`, `UMOUNT_NOFOLLOW`; `MNT_FORCE` and `MNT_EXPIRE` → `EINVAL` |
+| Flags | `MNT_DETACH`, `UMOUNT_NOFOLLOW`, `MNT_FORCE` (instance root, §4); `MNT_EXPIRE` → `EINVAL` |
 | `EBUSY` | in use, without `MNT_DETACH` |
 | `EINVAL` | not a mount point, or an unsupported flag |
-| `EPERM` | the caller did not make this mount and is not instance root |
+| `EPERM` | the caller did not make this mount and is not instance root, or `MNT_FORCE` without instance root |
 | `ENOENT`, `ENOTDIR`, `ELOOP`, `ENAMETOOLONG` | path errors |
 
 ### `chroot(path)`
@@ -358,18 +371,19 @@ These are the calls #51–#56 add. Errors follow Linux; where this OS differs or
 
 | Item | Value |
 | --- | --- |
-| Namespaces | `CLONE_NEWNS` only; any other flag → `EINVAL` |
-| `EPERM` | the caller is not instance root (there are no user namespaces) |
-| `setns` | the descriptor is a `/proc/<pid>/ns/mnt` of the same instance; any other → `EINVAL`; another user's process → `EPERM` |
+| `unshare` flags | `CLONE_NEWNS`, `CLONE_FS`, `CLONE_FILES`, or `0` (no change), as Linux; any other flag → `EINVAL` |
+| `EPERM` | `CLONE_NEWNS` or `setns` without instance root (there are no user namespaces); `CLONE_FS` and `CLONE_FILES` need no privilege |
+| `setns` | the descriptor is a `/proc/<pid>/ns/mnt` of the same instance; any other → `EINVAL` |
 
 ### Root switch (`switch_root`)
 
 The root switch is not a separate call, and needs no special permission rule: it is a sequence of the calls above, which require instance root. The main init's early stage (#56) runs it as PID 1, following Linux's `switch_root`:
 
-1. Move `/proc`, `/dev` and `/run` onto the new root: `mount("/proc", "/sysroot/proc", MS_MOVE)` and the same for the others.
-2. `chdir("/sysroot")`, `mount(".", "/", MS_MOVE)`, `chroot(".")`.
-3. Release the initial filesystem's contents.
-4. `execve` the main init, keeping PID 1.
+1. Open the initial root as a descriptor, so it can still be reached after the switch.
+2. Move `/proc`, `/dev` and `/run` onto the new root: `mount("/proc", "/sysroot/proc", MS_MOVE)` and the same for the others.
+3. `chdir("/sysroot")`, `mount(".", "/", MS_MOVE)`, `chroot(".")`.
+4. Delete the initial filesystem's contents through the descriptor from step 1, without crossing into other mounts, then close it.
+5. `execve` the main init, keeping PID 1.
 
 Errors are those of the calls: `EPERM` without instance root, `EINVAL` when the new root is not a mount point, `EBUSY` when a mount cannot move now.
 

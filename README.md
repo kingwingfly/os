@@ -1124,7 +1124,7 @@ Every decision is one synchronous SQLite transaction (`transactionSync`, bound b
 
 Nodes refer to files by id, and copies share files. A file nobody refers to any more goes to a garbage table in the same transaction, and an alarm deletes its R2 objects, in batches; the same alarm expires idle uploads. Home moves, `mv`, and `cp` change metadata only. Write through the application API; direct bucket writes add nothing to the tables. Keep the bucket private.
 
-The R2 initialization marker (`system/os-authority-v2`) makes a missing authority fail closed instead of starting over with an empty filesystem. Back up R2, the Durable Object's storage, and credentials together; for local development, the whole `.wrangler/state` directory and `.dev.vars`. Changing the pepper breaks existing password verification. Schema upgrades are not automatic: this build accepts schema 7 and refuses older database layouts. Preserve deployed data when planning future upgrades.
+The R2 initialization marker (`system/os-authority-v2`) makes a missing authority fail closed instead of starting over with an empty filesystem. Back up R2, the Durable Object's storage, and credentials together; for local development, the whole `.wrangler/state` directory and `.dev.vars`. Changing the pepper breaks existing password verification. Schema upgrades are not automatic: this build accepts schema 7 and refuses older database layouts. Deployed data is not preserved across the #44 redeploy; after it, plan upgrades to preserve deployed data.
 
 The current deployment serializes shared filesystem/account metadata through one authority. Scaling this service requires explicit partitioning and consistency design; it does not change instance-local kernel ownership.
 

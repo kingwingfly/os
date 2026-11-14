@@ -9,7 +9,7 @@
     "deploy": "node scripts/deploy.mjs",
     "setup": "node scripts/setup.mjs",
     "seed": "node scripts/seed.mjs",
-    "test": "node --test tests/*.test.mjs && cargo test -p os-abi -p os-kernel -p os-userland -p os-core -p os-conformance -p xtask",
+    "test": "node --test tests/*.test.mjs && cargo test -p os-abi -p os-kernel -p os-userland -p os-core -p os-conformance -p os-client-kernel -p xtask",
     "test:e2e": "playwright test"
   },
   "dependencies": {

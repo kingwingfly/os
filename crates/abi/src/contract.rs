@@ -126,14 +126,19 @@ pub enum Durability {
     PublisherAck,
 }
 
-/// How far a whole-file lock (`flock`) reaches (contract §3). Byte-range locks are always
-/// within the instance.
+/// Who keeps a filesystem's locks (`flock` and `fcntl` byte ranges), so every client of it sees
+/// them (contract §3). A driver that cannot reach its keeper fails with ENOLCK; none fakes a lock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LockScope {
-    Instance,
-    /// Every tab of the browser profile, through Web Locks.
+    /// The filesystem service (the cloud authority), for every instance.
+    Service,
+    /// Every tab of the browser profile, through Web Locks and the metadata store.
     Profile,
+    /// The host's own locks, held by the helper, seen by every host program.
+    Host,
+    /// The publisher of a shared mount.
+    Publisher,
 }
 
 /// What one filesystem driver provides; every gate is read against it (contract §3).
@@ -151,7 +156,7 @@ pub struct FsCapabilities {
     /// RENAME_NOREPLACE.
     pub rename_noreplace: Support,
     pub durability: Durability,
-    pub whole_file_locks: LockScope,
+    pub locks: LockScope,
 }
 
 /// Identities an instance carries (contract §1). None of them is a credential: a remote
@@ -172,7 +177,13 @@ pub mod mount_flags {
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
+    /// Every write waits for the driver's durability point.
+    pub const MS_SYNCHRONOUS: u64 = 16;
     pub const MS_REMOUNT: u64 = 32;
+    /// Directory changes wait for the driver's durability point.
+    pub const MS_DIRSYNC: u64 = 128;
+    /// Path walks through this mount refuse symlinks.
+    pub const MS_NOSYMFOLLOW: u64 = 256;
     pub const MS_NOATIME: u64 = 1024;
     pub const MS_NODIRATIME: u64 = 2048;
     pub const MS_BIND: u64 = 4096;
@@ -180,8 +191,12 @@ pub mod mount_flags {
     pub const MS_REC: u64 = 16384;
     /// Accepted and ignored, as Linux does.
     pub const MS_SILENT: u64 = 32768;
+    /// Accepted and ignored: ACLs are always enabled.
+    pub const MS_POSIXACL: u64 = 1 << 16;
     pub const MS_PRIVATE: u64 = 1 << 18;
     pub const MS_RELATIME: u64 = 1 << 21;
+    /// Accepted and ignored.
+    pub const MS_I_VERSION: u64 = 1 << 23;
     pub const MS_STRICTATIME: u64 = 1 << 24;
     pub const MS_LAZYTIME: u64 = 1 << 25;
     /// Rejected with EINVAL: propagation is private only.
@@ -196,7 +211,10 @@ pub mod mount_flags {
         | MS_NOSUID
         | MS_NODEV
         | MS_NOEXEC
+        | MS_SYNCHRONOUS
         | MS_REMOUNT
+        | MS_DIRSYNC
+        | MS_NOSYMFOLLOW
         | MS_NOATIME
         | MS_NODIRATIME
         | MS_BIND
@@ -207,14 +225,17 @@ pub mod mount_flags {
         | MS_STRICTATIME
         | MS_LAZYTIME;
 
-    /// The flags a mount(2) call means: the magic number and MS_SILENT dropped, anything the
-    /// contract does not support refused with EINVAL.
+    /// Flags Linux accepts that change nothing here.
+    pub const IGNORED: u64 = MS_SILENT | MS_POSIXACL | MS_I_VERSION;
+
+    /// The flags a mount(2) call means: the magic number and the ignored flags dropped, anything
+    /// the contract does not support refused with EINVAL.
     pub fn accepted(flags: u64) -> Result<u64, Errno> {
         let flags = if flags & MS_MGC_MSK == MS_MGC_VAL {
             flags & !MS_MGC_MSK
         } else {
             flags
-        } & !MS_SILENT;
+        } & !IGNORED;
         if flags & !SUPPORTED == 0 {
             Ok(flags)
         } else {
@@ -225,17 +246,24 @@ pub mod mount_flags {
 
 /// umount2(2) flags, with Linux's values (contract §5).
 pub mod umount_flags {
-    /// Rejected with EINVAL.
+    /// Instance root only (EPERM otherwise): fails the provider's outstanding requests with EIO,
+    /// then unmounts as without it.
     pub const MNT_FORCE: u32 = 1;
     pub const MNT_DETACH: u32 = 2;
     /// Rejected with EINVAL.
     pub const MNT_EXPIRE: u32 = 4;
     pub const UMOUNT_NOFOLLOW: u32 = 8;
-    pub const SUPPORTED: u32 = MNT_DETACH | UMOUNT_NOFOLLOW;
+    pub const SUPPORTED: u32 = MNT_FORCE | MNT_DETACH | UMOUNT_NOFOLLOW;
 }
 
-/// The only namespace unshare(2) and setns(2) accept, with Linux's value (contract §5).
-pub const CLONE_NEWNS: u32 = 0x0002_0000;
+/// unshare(2) and setns(2) flags, with Linux's values (contract §5). CLONE_NEWNS is the only
+/// namespace; CLONE_FS and CLONE_FILES unshare process-local state.
+pub mod unshare_flags {
+    pub const CLONE_FS: u32 = 0x0200;
+    pub const CLONE_FILES: u32 = 0x0400;
+    pub const CLONE_NEWNS: u32 = 0x0002_0000;
+    pub const SUPPORTED: u32 = CLONE_FS | CLONE_FILES | CLONE_NEWNS;
+}
 
 #[cfg(test)]
 mod tests {
@@ -278,6 +306,12 @@ mod tests {
         use mount_flags::*;
         // busybox `mount -o bind` adds MS_SILENT; old callers add the magic number.
         assert_eq!(accepted(MS_BIND | MS_SILENT), Ok(MS_BIND));
+        // `mount -o remount,sync`, `-o nosymfollow`, and flags Linux ignores.
+        assert_eq!(
+            accepted(MS_REMOUNT | MS_SYNCHRONOUS | MS_POSIXACL | MS_I_VERSION),
+            Ok(MS_REMOUNT | MS_SYNCHRONOUS)
+        );
+        assert_eq!(accepted(MS_NOSYMFOLLOW), Ok(MS_NOSYMFOLLOW));
         assert_eq!(
             accepted(MS_MGC_VAL | MS_RDONLY | MS_NOATIME),
             Ok(MS_RDONLY | MS_NOATIME)
@@ -286,6 +320,7 @@ mod tests {
             assert_eq!(accepted(MS_REC | propagation), Err(Errno::EINVAL));
         }
         assert_eq!(accepted(MS_PRIVATE | MS_REC), Ok(MS_PRIVATE | MS_REC));
-        assert_eq!(umount_flags::SUPPORTED & umount_flags::MNT_FORCE, 0);
+        assert_eq!(umount_flags::SUPPORTED & umount_flags::MNT_EXPIRE, 0);
+        assert_ne!(umount_flags::SUPPORTED & umount_flags::MNT_FORCE, 0);
     }
 }

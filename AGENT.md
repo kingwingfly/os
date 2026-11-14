@@ -64,7 +64,7 @@ These are current behaviors. A #44 change to them needs a deliberate decision an
 
 - Repository: `/run/media/louis/Work/rust/terminal_worker`, an independent Rust/npm workspace. The presentation repository `/run/media/louis/Work/lab_meeting/2026-10-28` owns its slides/story/game; do not edit it for OS maintenance.
 - Inspect Git status before edits; preserve unrelated user changes. Keep project-owned interface text, errors, manuals, comments, tests and samples in English. Preserve Unicode paths and non-ASCII regression fixtures.
-- Keep Wrangler configuration in TOML. Worker/crate name is `os`, bucket `os-files`, packages `os-*`. Existing compatibility identifiers are deliberate; do not rename storage or protocol identities casually.
+- Keep Wrangler configuration in TOML. Worker/crate name is `os`, bucket `os-files`, packages `os-*`. Existing compatibility identifiers are deliberate. During #44 they may change without migration, but change them deliberately, never casually.
 - The owner manages production. Local development is authorized; deployment/resource changes require an instruction. Commands typed inside OS execute through its runtime, never the host shell.
 - Build/run: `npm ci`, `npm run setup`, `npm run build:web`, `npm run dev`. Known tools: `worker-build 0.8.5`, `wasm-bindgen-cli 0.2.129`; verify Cargo.lock compatibility before changing versions. `cargo xtask build` is the build entry point.
 - Default dev port is 127.0.0.1:8787. Inspect listeners before starting/stopping processes. Avoid concurrent builds into shared Worker output. Discover Cargo's target directory through metadata. Edit source and rebuild generated frontend/manual assets when serving changes; `dist` and `crates/worker/build` are generated.
