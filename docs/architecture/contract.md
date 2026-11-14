@@ -2,10 +2,7 @@
 
 This is the decision record for the [#44](https://github.com/kingwingfly/os/issues/44) refactor, written in L0b ([#47](https://github.com/kingwingfly/os/issues/47)). It settles what the later steps (#48–#65) build. It changes no behaviour; the only code it adds is unused version and capability types in `crates/abi/src/contract.rs`.
 
-**Status.** Each decision is marked:
-
-- **Decided**: the owner has stated it.
-- **Proposed**: a default from reviewing the code, awaiting the owner's approval in this document's pull request. Once the pull request merges, every decision here is authoritative, and the later sub-issues are edited to agree.
+**Status: authoritative.** The owner approved every decision when this document merged ([PR #69](https://github.com/kingwingfly/os/pull/69), 2026-11-14). Decision 2.12 was stated by the owner directly. Where a sub-issue (#48–#65) differs from this document, this document wins.
 
 "Today" statements describe `dev` at `48d9c15` and cite the code. Measured differences from Linux come from the L0a baseline ([`docs/compat/matrix.md`](../compat/matrix.md)).
 
@@ -37,7 +34,7 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 
 ## 2. Decisions
 
-### 2.1 What an instance is (Proposed)
+### 2.1 What an instance is (Decided)
 
 **Today.**
 - **One process space per browser login.** All tabs of one browser login share one PID space: the `Machine` Durable Object chosen by the session or guest key (`crates/worker/src/lib.rs`, `/api/sys` with `X-Registry` → `db::Db::namespace`). Its process table is in `crates/worker/src/procs.rs`.
@@ -53,7 +50,7 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 
 **Implemented by** #54 (process table and `/proc` in the instance), #56 (boot, PID 1), #57 (sessions).
 
-### 2.2 Where kernel code lives (Proposed)
+### 2.2 Where kernel code lives (Decided)
 
 **Today.**
 - **Server-side Rust:** path lookup and permission rules are Rust (`crates/kernel`, `crates/core`), executed by the server.
@@ -67,7 +64,7 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 
 **Implemented by** #48 (VFS crate and drivers), #51 (mount table and walk), #54 (process table), #55 (sockets).
 
-### 2.3 The remote filesystem protocol (Proposed)
+### 2.3 The remote filesystem protocol (Decided)
 
 **Today.**
 - **Paths, resolved by the server.** Every file call in `abi::Call` takes an absolute path string, and the server resolves it: `crates/kernel/src/namei.rs` over the path-keyed `Store` (`crates/core/src/permissions.rs`, `trait Store`), on the table `nodes(path PRIMARY KEY, parent, ino)` (`crates/worker/src/db.rs`).
@@ -100,7 +97,7 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
   - `read`, `write` and `truncate` through an open reference check only the access granted at open (and that its credential is still valid). A file created read-only can still be written and truncated through the descriptor that created it, as `tar` relies on.
   - Every other operation (`setattr`, `link`, `unlink`, xattrs) checks the presenting credential when it is made.
 - **Content lifetime.** An unlinked file's content lives until its last open reference is released. Open references belong to the instance's **session** with the service: a lease renewed while the instance is connected, and a resume secret the service issues at connect.
-  - A reconnect within the lease (proposed: two minutes) that presents the secret keeps every open reference and lock, so a network drop or a deployment loses nothing.
+  - A reconnect within the lease (two minutes, unless #48 measures a reason to change it) that presents the secret keeps every open reference and lock, so a network drop or a deployment loses nothing.
   - When the lease expires because the host vanished, the service releases them, so content is neither leaked nor collected under a reader.
   - AGENT.md's garbage-collection rule ("respect open references") applies to these references.
 - **Path calls go away.** Version 1 path calls are removed once nothing in the repository uses them. No compatibility window is kept (§2.12).
@@ -108,7 +105,7 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 
 **Implemented by** #48 (calls and the cloud driver), #50 (`fsync`), #51 (client-side walk; path calls removed).
 
-### 2.4 Who is trusted for what (Proposed)
+### 2.4 Who is trusted for what (Decided)
 
 **Today.** README says "User space is never trusted" (README "Current executable and API inventory"), and every check is in the server; that was written when the kernel was the server.
 - **Exec.** The authority checks the image (execute, not read), snapshots the caller's credential, and records it under the hash of the process's token (`crates/worker/src/creds.rs`).
@@ -138,7 +135,7 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 
 **Implemented by** #54 (local process authority and remote admission), #57 (login and sessions), #59 (exports).
 
-### 2.5 Filesystem identity and metadata, per driver (Proposed)
+### 2.5 Filesystem identity and metadata, per driver (Decided)
 
 | Driver | Filesystem identity | Inode identity | Where OS metadata lives |
 | --- | --- | --- | --- |
@@ -163,11 +160,11 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 
 **Implemented by** #48 (identity), #49 (metadata stores).
 
-### 2.6 Filesystem capability profiles (Proposed)
+### 2.6 Filesystem capability profiles (Decided)
 
 Every later gate is read against the table in [§3](#3-filesystem-capability-profiles). A capability a driver lacks either refuses the operation with the errno the table names, or lets it succeed and fails later access with the named errno, as the table says. It never fakes success.
 
-### 2.7 Mounts and namespaces (Proposed)
+### 2.7 Mounts and namespaces (Decided)
 
 - **Private propagation only.** `MS_SHARED`, `MS_SLAVE` and `MS_UNBINDABLE` are rejected with `EINVAL`. A new namespace copies the mounts of the one it comes from.
 - **Supported:** bind mounts (with `MS_REC`), `MS_RDONLY`, `MS_NOEXEC`, `MS_NOSUID`, `MS_NODEV`, `MS_SYNCHRONOUS`, `MS_DIRSYNC`, `MS_NOSYMFOLLOW`, the atime flags, `MS_REMOUNT` of those flags, `MS_MOVE` (for the root switch), unmount, lazy detach and root's forced unmount. `MS_SILENT`, `MS_POSIXACL`, `MS_I_VERSION` and the `MS_MGC_VAL` magic are accepted and ignored, as Linux does.
@@ -183,7 +180,7 @@ Every later gate is read against the table in [§3](#3-filesystem-capability-pro
 
 **Implemented by** #51 (mount table and calls), #52 (namespaces and authorization), #58 (tools and the Mounts app).
 
-### 2.8 Local IPC (Proposed)
+### 2.8 Local IPC (Decided)
 
 **Today.** The only IPC is the pipe. A service's readiness is a line on an inherited pipe (`crates/services/src/notify.rs`), and nothing lets one process serve another.
 
@@ -196,7 +193,7 @@ Every later gate is read against the table in [§3](#3-filesystem-capability-pro
 
 **Implemented by** #55.
 
-### 2.9 GUI surfaces (Proposed)
+### 2.9 GUI surfaces (Decided)
 
 **Today.**
 - **A DOM desktop.** The desktop is a compositor in the page that places DOM windows (`crates/frontend/src/desktop.rs`).
@@ -211,7 +208,7 @@ The protocol contains no DOM types. `/dev/display` and `/dev/input` expose them 
 
 **Implemented by** #60, #61.
 
-### 2.10 Versioning (Proposed)
+### 2.10 Versioning (Decided)
 
 **Today.**
 - **Capabilities without versions.** `abi::Features` (`crates/abi/src/lib.rs`) discovers capabilities, but most protocols carry no version.
@@ -233,7 +230,7 @@ The protocol contains no DOM types. `/dev/display` and `/dev/input` expose them 
 
 `contract.rs` defines the boundaries, their versions and the negotiation rule.
 
-### 2.11 "Native" in the L5 and L6 gates (Proposed)
+### 2.11 "Native" in the L5 and L6 gates (Decided)
 
 #44 requires browser and native presentation to pass the same scenarios. But the native agent is a Phase 9.1 deliverable, and Phase 9 waits for #44.
 
@@ -246,6 +243,8 @@ The protocol contains no DOM types. `/dev/display` and `/dev/input` expose them 
 **None.** When #44 is done, the owner removes the deployment and all its data and redeploys.
 
 - **Server state may change without migration:** the state schema, the authority's tables, Durable Object classes, storage layout and protocols. Each incompatible change bumps the schema version, so stale state is refused, never misread.
+- **No SQL migrations.** A schema change edits the `CREATE TABLE` statements directly. Guarded `ALTER`s and backfills are not written, and existing ones may be removed when their code is touched. Local test state is recreated, not upgraded.
+- **No previous versions or legacy configuration.** Nothing needs to read data, cookies, protocols or programs from before the refactor. `wrangler.legacy.toml`, the old Durable Object export and R2 marker, legacy cookie and preference names, and the old `terminal` WASM import namespace may be removed.
 - **Durable Object migration entries stay valid.** Cloudflare requires wrangler's `[[migrations]]` entries for Durable Object class changes, in deployment and in local development. Changes add entries as Cloudflare requires; the redeploy may start a fresh history.
 - **Browser-side state survives the redeploy**, so it is versioned too.
   - Every store the client writes carries a format version: OPFS and IndexedDB metadata stores, the directory-handle registry, saved preferences.
@@ -256,7 +255,7 @@ The protocol contains no DOM types. `/dev/display` and `/dev/input` expose them 
 - **Per-mount permissions are not carried over.** A filesystem's first attachment after L1 starts private to the attaching account and never widens access.
 - **Still required:** the new system's own release generations, upgrades and rollback (L3).
 
-### 2.13 Dispatch (Proposed)
+### 2.13 Dispatch (Decided)
 
 The contract records only the boundary between task state and delivery:
 - **Task state stays with the task service:** admission, durable state, leases, cancellation and results.
@@ -264,15 +263,15 @@ The contract records only the boundary between task state and delivery:
 
 The full Queues contract stays in README "Cloudflare Queues and background dispatch" and is implemented in Phase 9.2-Q.
 
-### 2.14 When Phase 9 may start (Proposed)
+### 2.14 When Phase 9 may start (Decided)
 
 #44 says after L6. Phase 9 (shared compute) needs identity, namespaces, init and the task contract, but not the GUI work.
 
-**Proposed:** Phase 9 may start after #59 (L4b). The owner may keep #44's rule.
+**Decided:** Phase 9 may start after #59 (L4b). #44 itself closes only after all L0–L6 gates.
 
 ## 3. Filesystem capability profiles
 
-Target profiles (Proposed).
+Target profiles.
 - **"Emulated"** means the OS provides the behaviour in its own metadata, coordinated across the tabs of the browser profile (§2.5). A change made outside the OS can still show the difference.
 - **"Refused"** means the operation fails with the errno shown.
 - **"Stale"** means the operation succeeds, but later access through a file already open fails with the errno shown.
@@ -297,7 +296,7 @@ Baseline rows: `open-rename`, `open-unlink`, `hard-link`, `symlink` → #48; `ex
 
 ## 4. Mounts and namespaces
 
-Proposed results, following Linux where it has an answer:
+Results, following Linux where it has an answer:
 
 | Situation | Result |
 | --- | --- |
@@ -400,7 +399,7 @@ Errors are those of the calls: `EPERM` without instance root, `EINVAL` when the 
 | Release | images and release manifests | 1 | `os_image::PROTOCOL = 1` |
 | GUI | clients, the compositor, `/dev/display`, `/dev/input` | 1 (reserved, #60) | none |
 
-**Negotiation (Proposed).**
+**Negotiation.**
 - **Hello.** The first message on each connection is a hello naming the boundary and the versions offered.
 - **Choice.** The receiver picks the highest version both offer.
 - **Refusal.** With none in common, it refuses with `EPROTONOSUPPORT`; a page recovers as §2.10 says.
