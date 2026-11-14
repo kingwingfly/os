@@ -16,10 +16,14 @@ pub enum Boundary {
     HostAdapter,
     /// Filesystem clients and filesystem services.
     RemoteFilesystem,
+    /// The helper driver and `os-local-helper`.
+    LocalHelper,
     /// Instances and the identity service: login, credentials, revocation.
     Identity,
     /// Typed devices and remote tasks.
     DeviceTask,
+    /// Images and release manifests.
+    Release,
     /// GUI clients, the compositor, `/dev/display` and `/dev/input`.
     Gui,
 }
@@ -31,8 +35,10 @@ impl Boundary {
             Boundary::Syscall => SYSCALL_VERSION,
             Boundary::HostAdapter => HOST_ADAPTER_VERSION,
             Boundary::RemoteFilesystem => REMOTE_FILESYSTEM_VERSION,
+            Boundary::LocalHelper => LOCAL_HELPER_VERSION,
             Boundary::Identity => IDENTITY_VERSION,
             Boundary::DeviceTask => DEVICE_TASK_VERSION,
+            Boundary::Release => RELEASE_VERSION,
             Boundary::Gui => GUI_VERSION,
         }
     }
@@ -42,8 +48,14 @@ pub const SYSCALL_VERSION: u32 = 1;
 pub const HOST_ADAPTER_VERSION: u32 = 1;
 /// Handle-addressed calls (contract §2.3). The path-addressed calls in use today are version 1.
 pub const REMOTE_FILESYSTEM_VERSION: u32 = 2;
+/// The helper's `protocol` field, which web/kernel/native-mount.js checks today.
+pub const LOCAL_HELPER_VERSION: u32 = 1;
 pub const IDENTITY_VERSION: u32 = 1;
-pub const DEVICE_TASK_VERSION: u32 = crate::accelerator::VERSION;
+/// The device/task boundary as a whole. Each device's own formats, such as the accelerator
+/// ioctl (`accelerator::VERSION`), are versioned separately within it.
+pub const DEVICE_TASK_VERSION: u32 = 1;
+/// The same number as `os_image::PROTOCOL` (crates/image), which this crate does not depend on.
+pub const RELEASE_VERSION: u32 = 1;
 /// Reserved for #60.
 pub const GUI_VERSION: u32 = 1;
 
@@ -55,7 +67,7 @@ pub struct Hello {
 }
 
 /// The version two sides use: the highest both offer for the same boundary. `None` means the
-/// connection is refused with EPROTONOSUPPORT and a browser page reloads (contract §2.10).
+/// connection is refused with EPROTONOSUPPORT; a page recovers as contract §2.10 says.
 pub fn negotiate(ours: &Hello, theirs: &Hello) -> Option<u32> {
     if ours.boundary != theirs.boundary {
         return None;
@@ -73,7 +85,7 @@ pub fn negotiate(ours: &Hello, theirs: &Hello) -> Option<u32> {
 pub enum IdentityScope {
     /// The same everywhere the filesystem is reached.
     Global,
-    /// Stable only on one host, as `st_dev`.
+    /// Stable on one host: the helper's folder UUID.
     HostLocal,
     /// Stable only within one browser profile.
     ProfileLocal,
@@ -86,11 +98,16 @@ pub enum IdentityScope {
 #[serde(rename_all = "kebab-case")]
 pub enum Support {
     Yes,
-    /// Provided by the OS's own metadata within one instance; another instance, or a change
-    /// made outside the OS, can see the difference.
+    /// Provided by the OS's own metadata, coordinated across the browser profile's tabs; a
+    /// change made outside the OS can still show the difference.
     Emulated,
-    /// Not provided: the call fails with this errno.
-    No(Errno),
+    /// Not provided: the operation fails with this errno.
+    Refused(Errno),
+    /// The operation succeeds, but later access through a file already open fails with this
+    /// errno.
+    Stale(Errno),
+    /// Not provided, and declared so: the operation runs without the guarantee.
+    Declared,
     /// Whatever the publisher of a shared mount provides.
     Publisher,
 }
@@ -109,6 +126,16 @@ pub enum Durability {
     PublisherAck,
 }
 
+/// How far a whole-file lock (`flock`) reaches (contract §3). Byte-range locks are always
+/// within the instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LockScope {
+    Instance,
+    /// Every tab of the browser profile, through Web Locks.
+    Profile,
+}
+
 /// What one filesystem driver provides; every gate is read against it (contract §3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsCapabilities {
@@ -119,11 +146,12 @@ pub struct FsCapabilities {
     pub symlinks: Support,
     /// Atomic O_EXCL creation.
     pub exclusive_create: Support,
-    /// Atomic rename, and RENAME_NOREPLACE.
+    /// Rename that replaces its target atomically.
     pub atomic_rename: Support,
+    /// RENAME_NOREPLACE.
+    pub rename_noreplace: Support,
     pub durability: Durability,
-    /// Locks are visible within one instance only, for every driver.
-    pub instance_local_locks: bool,
+    pub whole_file_locks: LockScope,
 }
 
 /// Identities an instance carries (contract §1). None of them is a credential: a remote
@@ -136,31 +164,63 @@ pub struct InstanceIdentity {
     pub host: String,
 }
 
-/// mount(2) flags the contract supports, with Linux's values (contract §5).
+/// mount(2) flags, with Linux's values (contract §5).
 pub mod mount_flags {
+    use crate::Errno;
+
     pub const MS_RDONLY: u64 = 1;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
     pub const MS_REMOUNT: u64 = 32;
+    pub const MS_NOATIME: u64 = 1024;
+    pub const MS_NODIRATIME: u64 = 2048;
     pub const MS_BIND: u64 = 4096;
     pub const MS_MOVE: u64 = 8192;
     pub const MS_REC: u64 = 16384;
+    /// Accepted and ignored, as Linux does.
+    pub const MS_SILENT: u64 = 32768;
     pub const MS_PRIVATE: u64 = 1 << 18;
+    pub const MS_RELATIME: u64 = 1 << 21;
+    pub const MS_STRICTATIME: u64 = 1 << 24;
+    pub const MS_LAZYTIME: u64 = 1 << 25;
     /// Rejected with EINVAL: propagation is private only.
     pub const MS_UNBINDABLE: u64 = 1 << 17;
     pub const MS_SLAVE: u64 = 1 << 19;
     pub const MS_SHARED: u64 = 1 << 20;
-    /// Every flag the contract accepts.
+    /// The old magic number callers may put in the top 16 bits; Linux discards it.
+    pub const MS_MGC_VAL: u64 = 0xC0ED_0000;
+    pub const MS_MGC_MSK: u64 = 0xFFFF_0000;
+    /// Every flag the contract gives meaning to.
     pub const SUPPORTED: u64 = MS_RDONLY
         | MS_NOSUID
         | MS_NODEV
         | MS_NOEXEC
         | MS_REMOUNT
+        | MS_NOATIME
+        | MS_NODIRATIME
         | MS_BIND
         | MS_MOVE
         | MS_REC
-        | MS_PRIVATE;
+        | MS_PRIVATE
+        | MS_RELATIME
+        | MS_STRICTATIME
+        | MS_LAZYTIME;
+
+    /// The flags a mount(2) call means: the magic number and MS_SILENT dropped, anything the
+    /// contract does not support refused with EINVAL.
+    pub fn accepted(flags: u64) -> Result<u64, Errno> {
+        let flags = if flags & MS_MGC_MSK == MS_MGC_VAL {
+            flags & !MS_MGC_MSK
+        } else {
+            flags
+        } & !MS_SILENT;
+        if flags & !SUPPORTED == 0 {
+            Ok(flags)
+        } else {
+            Err(Errno::EINVAL)
+        }
+    }
 }
 
 /// umount2(2) flags, with Linux's values (contract §5).
@@ -200,18 +260,32 @@ mod tests {
     }
 
     #[test]
-    fn boundaries_and_flags_keep_their_contract_values() {
+    fn boundaries_keep_their_contract_values() {
         assert_eq!(Boundary::RemoteFilesystem.version(), 2);
-        assert_eq!(Boundary::DeviceTask.version(), crate::accelerator::VERSION);
+        assert_eq!(Boundary::DeviceTask.version(), 1);
         assert_eq!(
             serde_json::to_string(&Boundary::HostAdapter).unwrap(),
             "\"host-adapter\""
         );
-        assert_eq!(mount_flags::SUPPORTED & mount_flags::MS_SHARED, 0);
-        assert_eq!(umount_flags::SUPPORTED & umount_flags::MNT_FORCE, 0);
         assert_eq!(
-            serde_json::to_string(&Support::No(Errno::EPERM)).unwrap(),
-            "{\"no\":\"EPERM\"}"
+            serde_json::to_string(&Support::Stale(Errno::ESTALE)).unwrap(),
+            "{\"stale\":\"ESTALE\"}"
         );
+    }
+
+    #[test]
+    fn mount_flags_follow_linux() {
+        use mount_flags::*;
+        // busybox `mount -o bind` adds MS_SILENT; old callers add the magic number.
+        assert_eq!(accepted(MS_BIND | MS_SILENT), Ok(MS_BIND));
+        assert_eq!(
+            accepted(MS_MGC_VAL | MS_RDONLY | MS_NOATIME),
+            Ok(MS_RDONLY | MS_NOATIME)
+        );
+        for propagation in [MS_SHARED, MS_SLAVE, MS_UNBINDABLE] {
+            assert_eq!(accepted(MS_REC | propagation), Err(Errno::EINVAL));
+        }
+        assert_eq!(accepted(MS_PRIVATE | MS_REC), Ok(MS_PRIVATE | MS_REC));
+        assert_eq!(umount_flags::SUPPORTED & umount_flags::MNT_FORCE, 0);
     }
 }
