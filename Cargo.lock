@@ -2870,6 +2870,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "os-vfs"
+version = "0.1.0"
+dependencies = [
+ "os-abi",
+ "os-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "os-wasix-runtime"
 version = "0.1.0"
 dependencies = [

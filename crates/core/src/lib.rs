@@ -7,6 +7,7 @@ pub mod completion;
 pub mod devices;
 pub mod find;
 pub mod glob;
+pub mod inode;
 pub mod permissions;
 pub mod shell;
 pub mod text;

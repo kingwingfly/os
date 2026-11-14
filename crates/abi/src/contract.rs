@@ -85,6 +85,8 @@ pub fn negotiate(ours: &Hello, theirs: &Hello) -> Option<u32> {
 pub enum IdentityScope {
     /// The same everywhere the filesystem is reached.
     Global,
+    /// Exists only within one instance, as tmpfs and procfs.
+    Instance,
     /// Stable on one host: the helper's folder UUID.
     HostLocal,
     /// Stable only within one browser profile.
@@ -124,6 +126,9 @@ pub enum Durability {
     HostFsync,
     /// The publisher's acknowledgement.
     PublisherAck,
+    /// None: the content is in the instance's memory and goes with it (tmpfs), so fsync has
+    /// nothing to wait for.
+    Volatile,
 }
 
 /// Who keeps a filesystem's locks (`flock` and `fcntl` byte ranges), so every client of it sees
@@ -133,6 +138,9 @@ pub enum Durability {
 pub enum LockScope {
     /// The filesystem service (the cloud authority), for every instance.
     Service,
+    /// A filesystem that exists only within one instance (tmpfs), so its locks are seen by all
+    /// of its clients.
+    Instance,
     /// Every tab of the browser profile, through Web Locks and the metadata store.
     Profile,
     /// The host's own locks, held by the helper, seen by every host program.
