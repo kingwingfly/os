@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 pub mod accelerator;
+pub mod contract;
 pub mod system;
 
 /// Why a call failed, as Linux's errno says.

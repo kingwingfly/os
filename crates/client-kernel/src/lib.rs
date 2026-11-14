@@ -971,3 +971,17 @@ fn fail(error: Error) -> JsValue {
         .to_string(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    /// The contract's version constants (crates/abi/src/contract.rs) name these protocols; they
+    /// must not drift apart.
+    #[test]
+    fn versions_match_the_contract() {
+        assert_eq!(
+            super::VERSION,
+            abi::contract::HOST_ADAPTER_VERSION.to_string()
+        );
+        assert_eq!(image::PROTOCOL, abi::contract::RELEASE_VERSION);
+    }
+}
