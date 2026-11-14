@@ -6,7 +6,7 @@ import { mkdtemp, mkdir, writeFile, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mountHandle, browserOptions, directoryProfile } from './fixtures.mjs';
-import { ShutdownScope } from './process.mjs';
+import { ShutdownScope } from '../process.mjs';
 const scope=new ShutdownScope();
 let failure;
 try {

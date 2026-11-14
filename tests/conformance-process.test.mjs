@@ -5,12 +5,11 @@ import { existsSync } from 'node:fs';
 import { mkdtemp, writeFile, readFile, rm, open } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { start, stop, ShutdownScope } from '../scripts/conformance/process.mjs';
-import { startPodman, egressImage } from '../scripts/conformance/podman.mjs';
+import { start, stop, ShutdownScope } from '../scripts/process.mjs';
 import { helperConnection } from '../scripts/conformance/fixtures.mjs';
 import { recoverInterrupted, startTime, RunRecord, runPrefix } from '../scripts/conformance/recovery.mjs';
 import { mkdir } from 'node:fs/promises';
-const moduleURL=new URL('../scripts/conformance/process.mjs',import.meta.url).href;
+const moduleURL=new URL('../scripts/process.mjs',import.meta.url).href;
 const exists=pid=>{try {process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}};
 const firstLine=child=>new Promise((resolve,reject)=>{
   let text='';child.stdout.on('data',chunk=>{text+=chunk;if(text.includes('\n'))resolve(text.split('\n')[0]);});
@@ -174,60 +173,6 @@ test('a failure during cleanup is reported, not discarded',async()=>{
   let errors='';child.stderr.on('data',chunk=>{errors+=chunk;});const exited=once(child,'exit');
   try {await firstLine(child);child.kill('SIGTERM');assert.equal((await exited)[0],143);assert.match(errors,/During cleanup: Error: late fixture failure/);}
   finally {await stop(child,{timeout:30});}
-});
-
-// A fake `podman` on PATH records its PID and listens where `system service` is told to.
-const fakePodman=(dir,listen=true)=>writeFile(join(dir,'podman'),'#!'+process.execPath+'\n'+`
-  require('node:fs').writeFileSync(process.env.CONFORMANCE_MARKER,String(process.pid));
-  ${listen?"require('node:net').createServer().listen(process.argv.at(-1).slice(7));":''}
-  setInterval(()=>{},1000);`,{mode:0o755});
-const miniflare=()=>'DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "cloudflare/sidecar:tag"';
-
-test('egress image: an explicit setting wins; otherwise Miniflare names it, qualified for Podman',()=>{
-  assert.equal(egressImage({MINIFLARE_CONTAINER_EGRESS_IMAGE:'registry.example/custom:tag'},()=>{throw new Error('lookup must be skipped');}),'registry.example/custom:tag');
-  assert.equal(egressImage({},miniflare),'docker.io/cloudflare/sidecar:tag');
-  assert.equal(egressImage({},()=>'DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE = "registry.example/sidecar:tag"'),'registry.example/sidecar:tag');
-});
-
-for(const missing of ['declaration','file'])test('missing egress '+missing+' fails before the service starts and leaves the environment alone',async()=>{
-  const dir=await mkdtemp(join(tmpdir(),'conformance-egress-')),marker=join(dir,'pid');
-  const env={PATH:dir,CONFORMANCE_MARKER:marker};
-  try {
-    await fakePodman(dir);
-    const readMiniflare=missing==='file'?()=>{throw Object.assign(new Error('absent'),{code:'ENOENT'});}:()=>'export const unrelated = "fixture";';
-    await assert.rejects(startPodman(env,{socket:join(dir,'engine.sock'),readMiniflare}),missing==='file'?{code:'ENOENT'}:/Miniflare egress image not found/);
-    await assert.rejects(readFile(marker),{code:'ENOENT'});
-    assert.deepEqual(env,{PATH:dir,CONFORMANCE_MARKER:marker});
-  } finally {await rm(dir,{recursive:true,force:true});}
-});
-
-test('the service publishes engine settings once its socket exists, and close stops it',async()=>{
-  const dir=await mkdtemp(join(tmpdir(),'conformance-podman-')),marker=join(dir,'pid'),socket=join(dir,'engine.sock');let service;
-  const env={PATH:dir,CONFORMANCE_MARKER:marker};
-  try {
-    await fakePodman(dir);
-    service=await startPodman(env,{socket,readMiniflare:miniflare});
-    assert.equal(env.WRANGLER_DOCKER_HOST,'unix://'+socket);
-    assert.match(env.WRANGLER_DOCKER_BIN,/scripts\/podman-docker\.sh$/);
-    assert.equal(env.MINIFLARE_CONTAINER_EGRESS_IMAGE,'docker.io/cloudflare/sidecar:tag');
-    const pid=Number(await readFile(marker,'utf8'));
-    await service.close();service=null;
-    assert(!exists(pid),'Podman service survived close');
-  } finally {await service?.close();await rm(dir,{recursive:true,force:true});}
-});
-
-test('an existing socket is refused, and a service that never listens is stopped at the deadline',async()=>{
-  const dir=await mkdtemp(join(tmpdir(),'conformance-podman-strict-')),marker=join(dir,'pid');
-  const env={PATH:dir,CONFORMANCE_MARKER:marker};
-  try {
-    await writeFile(join(dir,'taken.sock'),'');
-    await assert.rejects(startPodman(env,{socket:join(dir,'taken.sock'),readMiniflare:miniflare}),/already exists/);
-    await fakePodman(dir,false);
-    await assert.rejects(startPodman(env,{socket:join(dir,'engine.sock'),readMiniflare:miniflare,startupTimeout:300}),/did not start/);
-    const pid=Number(await readFile(marker,'utf8'));
-    assert(!exists(pid),'timed-out Podman service survived');
-    assert(!Object.hasOwn(env,'WRANGLER_DOCKER_HOST'));
-  } finally {await rm(dir,{recursive:true,force:true});}
 });
 
 test('helper startup stderr survives its failed connection announcement in the runner log',async()=>{

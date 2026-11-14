@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { engineProxy } from './engine-proxy.mjs';
+import { engineProxy } from '../engine-proxy.mjs';
 import { run } from './common.mjs';
 const hint='set DOCKER_HOST to the engine API socket, for example unix:///run/user/$UID/podman/podman.sock';
 // The current endpoint in `context ls --format json` output. Docker 23 and later print one
