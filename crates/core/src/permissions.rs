@@ -235,7 +235,7 @@ pub enum Id {
 /// `requested`, as open(2) and mkdir(2) make one: owned by `who`, in the directory's group if
 /// it is setgid, else in `who`'s; with the requested bits less `umask`, or, if the directory has
 /// a default ACL, that ACL bounded by the requested bits. A directory inherits the default ACL,
-/// and the setgid bit.
+/// and the setgid bit, and keeps the sticky bit requested, as mkdir(2) does.
 pub fn created(who: &Identity, parent: &Node, requested: u16, directory: bool, umask: u16) -> Node {
     let group = if parent.mode & SETGID != 0 {
         parent.group
@@ -244,6 +244,7 @@ pub fn created(who: &Identity, parent: &Node, requested: u16, directory: bool, u
     };
     let mut node = Node::directory(who.id, group, 0);
     node.directory = directory;
+    let sticky = requested & STICKY;
     let requested = requested & 0o777;
     match &parent.default_acl {
         Some(default) => {
@@ -255,7 +256,7 @@ pub fn created(who: &Identity, parent: &Node, requested: u16, directory: bool, u
     }
     if directory {
         node.default_acl = parent.default_acl.clone();
-        node.mode |= parent.mode & SETGID;
+        node.mode |= (parent.mode & SETGID) | sticky;
     }
     node
 }

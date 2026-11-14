@@ -1,9 +1,16 @@
 //! Open file descriptions and one process's descriptor table, whatever the driver behind them
 //! (#48 scope 3). An [`OpenFile`] is Linux's `struct file`: its offset and status flags are
 //! shared by every descriptor that refers to it, in this process (`dup`) and in its children
-//! (`fork`). The driver's open reference is released when the last descriptor closes.
+//! (`fork`).
+//!
+//! References to a description are counted explicitly, as Linux counts `f_count`, never by
+//! `Rc` clones: each descriptor holds one, so does each holder that took one with
+//! [`OpenFile::hold`] (a descriptor in transit, the loader), and so does each call in progress
+//! through it, so a close while a read waits on a remote driver leaves the read to finish. The
+//! driver's open reference is released when the last reference goes; calls through a
+//! description after that fail with `EBADF`.
 
-use crate::{Attr, Cred, Filesystem, Handle, OpenRef, Result};
+use crate::{Attr, BoxFuture, Cred, Filesystem, Handle, OpenRef, Result, WriteAt, Written};
 use abi::Errno;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -16,14 +23,17 @@ pub struct OpenFile {
     pub fs: Rc<dyn Filesystem>,
     pub open: OpenRef,
     pub handle: Handle,
-    /// The opener's credential, as Linux keeps `f_cred`: fstat and the offset of `O_APPEND`
-    /// writes use it.
+    /// The opener's credential, as Linux keeps `f_cred`: fstat uses it.
     pub cred: Cred,
     offset: Cell<u64>,
     append: Cell<bool>,
+    /// Descriptors, holders and calls in progress referring to it; 0 once released.
+    refs: Cell<usize>,
 }
 
 impl OpenFile {
+    /// A description with one reference, the caller's: [`DescriptorTable::insert`] takes it
+    /// over, or [`OpenFile::put`] gives it up.
     pub fn new(
         fs: Rc<dyn Filesystem>,
         open: OpenRef,
@@ -38,6 +48,7 @@ impl OpenFile {
             cred,
             offset: Cell::new(0),
             append: Cell::new(flags & abi::O_APPEND != 0),
+            refs: Cell::new(1),
         })
     }
     pub fn offset(&self) -> u64 {
@@ -50,7 +61,49 @@ impl OpenFile {
     pub fn set_append(&self, append: bool) {
         self.append.set(append);
     }
+    /// Whether the driver's open reference has been released.
+    pub fn released(&self) -> bool {
+        self.refs.get() == 0
+    }
+    /// Take another reference, as Linux's `get_file`: `EBADF` once released. Give it up with
+    /// [`OpenFile::put`].
+    pub fn hold(&self) -> Result<()> {
+        match self.refs.get() {
+            0 => Err(Errno::EBADF),
+            refs => {
+                self.refs.set(refs + 1);
+                Ok(())
+            }
+        }
+    }
+    /// Give up a reference, as Linux's `fput`: the last releases the driver's open reference,
+    /// and says how that went.
+    pub async fn put(&self) -> Result<()> {
+        match self.refs.get() {
+            0 => Err(Errno::EBADF),
+            1 => {
+                self.refs.set(0);
+                self.fs.release(&self.open).await
+            }
+            refs => {
+                self.refs.set(refs - 1);
+                Ok(())
+            }
+        }
+    }
+    /// Make a driver call holding a reference, so that a close meanwhile leaves the release
+    /// to the call's end. The release's result is not the call's, as Linux's last `fput`
+    /// after a read reports nothing.
+    async fn during<'s, T>(&'s self, call: impl FnOnce(&'s Self) -> BoxFuture<'s, T>) -> Result<T> {
+        self.hold()?;
+        let result = call(self).await;
+        let _ = self.put().await;
+        result
+    }
     pub async fn stat(&self) -> Result<Attr> {
+        if self.released() {
+            return Err(Errno::EBADF);
+        }
         self.fs.getattr(&self.cred, &self.handle).await
     }
     /// lseek(2): `whence` 0 (SEEK_SET), 1 (SEEK_CUR) or 2 (SEEK_END).
@@ -74,37 +127,52 @@ impl OpenFile {
             return Err(Errno::EBADF);
         }
         let at = self.offset.get();
-        let data = self.fs.read(&self.open, at, len).await?;
+        let data = self
+            .during(|file| file.fs.read(&file.open, at, len))
+            .await?;
         self.offset.set(at + data.len() as u64);
         Ok(data)
     }
-    /// write(2): at the shared offset, or at the end with O_APPEND; the offset moves past it.
+    /// write(2): at the shared offset, or, with O_APPEND, at the end as the driver finds it
+    /// when the write lands (atomically: concurrent appends never overwrite each other). The
+    /// offset moves past what was written.
     pub async fn write(&self, data: &[u8]) -> Result<usize> {
         if !self.open.access.writes() {
             return Err(Errno::EBADF);
         }
         let at = if self.append.get() {
-            self.stat().await?.size
+            WriteAt::End
         } else {
-            self.offset.get()
+            WriteAt::Offset(self.offset.get())
         };
-        let written = self.fs.write(&self.open, at, data).await?;
-        self.offset.set(at + written as u64);
-        Ok(written)
+        let written = self.write_at(at, data).await?;
+        self.offset.set(written.offset + written.len as u64);
+        Ok(written.len)
     }
     /// pread(2): the offset does not move.
     pub async fn pread(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         if !self.open.access.reads() {
             return Err(Errno::EBADF);
         }
-        self.fs.read(&self.open, offset, len).await
+        self.during(|file| file.fs.read(&file.open, offset, len))
+            .await
     }
-    /// pwrite(2): the offset does not move.
+    /// pwrite(2): the offset does not move. With O_APPEND the data goes at the end whatever
+    /// `offset` says, as on Linux (pwrite(2), BUGS).
     pub async fn pwrite(&self, offset: u64, data: &[u8]) -> Result<usize> {
         if !self.open.access.writes() {
             return Err(Errno::EBADF);
         }
-        self.fs.write(&self.open, offset, data).await
+        let at = if self.append.get() {
+            WriteAt::End
+        } else {
+            WriteAt::Offset(offset)
+        };
+        Ok(self.write_at(at, data).await?.len)
+    }
+    async fn write_at(&self, at: WriteAt, data: &[u8]) -> Result<Written> {
+        self.during(|file| file.fs.write(&file.open, at, data))
+            .await
     }
 }
 
@@ -114,11 +182,24 @@ struct Slot {
     cloexec: bool,
 }
 
-/// One process's descriptors. Cloning it is `fork`: the child's descriptors refer to the same
-/// descriptions.
-#[derive(Clone, Default)]
+/// One process's descriptors. Each holds a reference to its description. Cloning the table is
+/// `fork`: the child's descriptors refer to the same descriptions, each with its own
+/// reference. A process empties its table with [`DescriptorTable::close_all`] when it exits.
+#[derive(Default)]
 pub struct DescriptorTable {
     slots: Vec<Option<Slot>>,
+}
+
+impl Clone for DescriptorTable {
+    fn clone(&self) -> Self {
+        for slot in self.slots.iter().flatten() {
+            // A description in a table is never released: its descriptor holds it.
+            slot.file.refs.set(slot.file.refs.get() + 1);
+        }
+        Self {
+            slots: self.slots.clone(),
+        }
+    }
 }
 
 impl DescriptorTable {
@@ -136,12 +217,26 @@ impl DescriptorTable {
         }
         self.slots[fd].replace(slot).map(|old| old.file)
     }
-    /// A new descriptor for `file`: the lowest free number.
+    fn take(&mut self, fd: u32) -> Result<Rc<OpenFile>> {
+        self.slots
+            .get_mut(fd as usize)
+            .and_then(Option::take)
+            .map(|slot| slot.file)
+            .ok_or(Errno::EBADF)
+    }
+    /// A new descriptor for `file`, the lowest free number: it takes over the caller's
+    /// reference (as from [`OpenFile::new`]), which stays the caller's if this fails
+    /// (`EMFILE`, or `EBADF` for a released description).
     pub fn insert(&mut self, file: Rc<OpenFile>, cloexec: bool) -> Result<u32> {
+        if file.released() {
+            return Err(Errno::EBADF);
+        }
         let fd = self.lowest_free(0)?;
         self.place(fd, Slot { file, cloexec });
         Ok(fd as u32)
     }
+    /// The description `fd` refers to. Calls through it hold their own reference while they
+    /// run; anything kept longer takes one with [`OpenFile::hold`].
     pub fn get(&self, fd: u32) -> Result<Rc<OpenFile>> {
         self.slots
             .get(fd as usize)
@@ -172,34 +267,32 @@ impl DescriptorTable {
             return Err(Errno::EINVAL);
         }
         let new = self.lowest_free(min as usize)?;
+        file.hold()?;
         self.place(new, Slot { file, cloexec });
         Ok(new as u32)
     }
-    /// dup2(2): `new` refers to `old`'s description. What `new` referred to before is returned,
-    /// to be released with [`release_if_last`].
-    pub fn dup2(&mut self, old: u32, new: u32) -> Result<Option<Rc<OpenFile>>> {
+    /// dup2(2): `new` refers to `old`'s description. What `new` referred to before is closed,
+    /// its errors unreported, as Linux's dup2 does.
+    pub async fn dup2(&mut self, old: u32, new: u32) -> Result<u32> {
         let file = self.get(old)?;
         if new as usize >= FD_MAX {
             return Err(Errno::EBADF);
         }
         if old == new {
-            return Ok(None);
+            return Ok(new);
         }
-        Ok(self.place(
+        file.hold()?;
+        let replaced = self.place(
             new as usize,
             Slot {
                 file,
                 cloexec: false,
             },
-        ))
-    }
-    /// Remove a descriptor; release its description with [`release_if_last`].
-    pub fn remove(&mut self, fd: u32) -> Result<Rc<OpenFile>> {
-        self.slots
-            .get_mut(fd as usize)
-            .and_then(Option::take)
-            .map(|slot| slot.file)
-            .ok_or(Errno::EBADF)
+        );
+        if let Some(replaced) = replaced {
+            let _ = replaced.put().await;
+        }
+        Ok(new)
     }
     /// The descriptors open, in order.
     pub fn fds(&self) -> impl Iterator<Item = u32> + '_ {
@@ -209,26 +302,29 @@ impl DescriptorTable {
             .filter(|(_, slot)| slot.is_some())
             .map(|(fd, _)| fd as u32)
     }
-    /// execve(2): close-on-exec descriptors go. Release what is returned.
-    pub fn exec(&mut self) -> Vec<Rc<OpenFile>> {
-        self.slots
-            .iter_mut()
-            .filter(|slot| slot.as_ref().is_some_and(|slot| slot.cloexec))
-            .filter_map(|slot| slot.take().map(|slot| slot.file))
-            .collect()
-    }
-    /// close(2).
+    /// close(2): the last reference to its description releases the driver's open reference,
+    /// and its error, if any, is close's.
     pub async fn close(&mut self, fd: u32) -> Result<()> {
-        let file = self.remove(fd)?;
-        release_if_last(file).await
+        self.take(fd)?.put().await
     }
-}
-
-/// Release the driver's open reference if `file` was the last reference to its description.
-pub async fn release_if_last(file: Rc<OpenFile>) -> Result<()> {
-    if Rc::strong_count(&file) == 1 {
-        file.fs.release(&file.open).await
-    } else {
-        Ok(())
+    /// execve(2): the close-on-exec descriptors are closed, their errors unreported.
+    pub async fn exec(&mut self) {
+        let doomed: Vec<u32> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.as_ref().is_some_and(|slot| slot.cloexec))
+            .map(|(fd, _)| fd as u32)
+            .collect();
+        for fd in doomed {
+            let _ = self.close(fd).await;
+        }
+    }
+    /// exit(2): every descriptor is closed, their errors unreported.
+    pub async fn close_all(&mut self) {
+        let open: Vec<u32> = self.fds().collect();
+        for fd in open {
+            let _ = self.close(fd).await;
+        }
     }
 }

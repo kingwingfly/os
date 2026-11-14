@@ -86,8 +86,9 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 - **Attributes:** `getattr`, `setattr` (mode, owner, times, size), `readdir`, `getxattr`/`setxattr`/`listxattr`/`removexattr`, `statfs`.
 - **Open files:**
   - `open(handle, access)` returns an **open reference**. The server records it, as the `fds` table does today.
-  - `access` is read, write, read-write, append, or **exec**. Exec is checked against execute permission, not read, and its bytes serve only the loader, so execute-only images keep running (`crates/kernel/src/lib.rs`, the X rule).
+  - `access` is read, write, read-write, or **exec**. Exec is checked against execute permission, not read, and its bytes serve only the loader, so execute-only images keep running (`crates/kernel/src/lib.rs`, the X rule).
   - `read(open, offset, length)`, `write(open, offset, data)`, `truncate(open, size)`, `fsync(open, datasync)` and `release(open)` act on it.
+  - **Append is a write position, not an access.** A write names an offset or the end of the file. The driver places a write at the end atomically, at the end as it is when the write lands, and returns where it went, so appends from several processes or instances never overwrite each other. `O_APPEND` set or cleared with `fcntl(F_SETFL)` applies from the next write.
   - `lock(open, kind, range, wait)`, `unlock(open, range)` and `getlk(open, range)` take advisory locks. The cloud authority keeps them per inode, owned by open references and released with them, so every instance sees them (§3).
   - An open reference records the credential that opened it, as Linux records an open file's credential. It works only while that credential is valid: revoking the credential ends its open references, and later operations on them fail with `EACCES`.
   - **Execute-only is local policy.** Exec access sends the bytes to the client's loader, so a client that may execute a file can read it. The server still refuses exec access without execute permission, but it promises no confidentiality of executable bytes.

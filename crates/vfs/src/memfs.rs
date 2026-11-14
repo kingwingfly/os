@@ -1,26 +1,37 @@
 //! An in-memory filesystem with Linux semantics: the reference the other drivers are tested
-//! against (contract §3, every capability "yes"), and the instance's tmpfs (#51). Permissions
-//! are `os_core::permissions`' (owner/group/other, ACLs, sticky directories, protected hard
-//! links, setgid inheritance, umask and default ACLs), so they match the server's.
+//! against (contract §3, every capability "yes"), and the instance's tmpfs (#51). Who may do
+//! what is `os_core`'s, which the server's kernel applies too, so their answers agree:
+//! `permissions` (owner/group/other, ACLs, sticky directories, setgid inheritance, umask and
+//! default ACLs), `inode` (chmod, chown, utimensat, protected hard links) and `xattr`.
 //!
 //! Inode numbers are never used again, so a handle's generation only has to say which filesystem
 //! instance issued it. A file's content lives until its last name and its last open reference
-//! are gone.
+//! are gone. Files are sparse, as on tmpfs: content is kept in pages, holes read as zeros, and
+//! only the pages written count against the filesystem's capacity (`ENOSPC` past it).
 
 use crate::{
-    Access, Attr, BoxFuture, Conflict, Cred, DirEntry, Entry, FileKind, Filesystem, FsId, Handle,
-    LockKind, LockRange, NodeId, OpenRef, RENAME_NOREPLACE, Result, SetAttr, StatFs, Stop, Walked,
-    profiles, valid_component,
+    Access, Attr, BoxFuture, Conflict, Cred, DirEntry, Entry, FILE_MAX, FileKind, Filesystem, FsId,
+    Handle, LockKind, LockRange, NodeId, OpenRef, RENAME_NOREPLACE, Result, SetAttr, StatFs, Stop,
+    Walked, WriteAt, Written, check_component, profiles,
 };
 use abi::Errno;
 use abi::contract::FsCapabilities;
+use os_core::acl::Entries;
+use os_core::inode;
 use os_core::permissions::{EXEC, Node, READ, SETGID, SETUID, STICKY, WRITE, created};
+use os_core::xattr::{self, Space};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 const ROOT: u64 = 1;
-/// Extended attribute values, as the server allows (4 KiB per value).
-const XATTR_MAX: usize = 4096;
+/// The unit content is kept and counted in.
+const PAGE: usize = 4096;
+const PAGE_BYTES: u64 = PAGE as u64;
+/// The most one read or write moves, as Linux's `MAX_RW_COUNT`: a longer one is short.
+const RW_MAX: usize = 0x7fff_f000;
+/// The content a filesystem holds unless [`MemFs::with_capacity`] says otherwise, as tmpfs's
+/// `size=`: 256 MiB.
+pub const DEFAULT_CAPACITY: u64 = 256 << 20;
 
 /// Seconds and nanoseconds since 1970. The kernel passes the host's clock; tests count.
 pub type Clock = Box<dyn Fn() -> (u64, u32)>;
@@ -28,7 +39,10 @@ pub type Clock = Box<dyn Fn() -> (u64, u32)>;
 struct Inode {
     meta: Node,
     nlink: u32,
-    data: Vec<u8>,
+    /// A regular file's size, and the pages of its content written, by index: the rest reads as
+    /// zeros, and every byte past the size is zero.
+    size: u64,
+    pages: BTreeMap<u64, Box<[u8; PAGE]>>,
     entries: BTreeMap<String, u64>,
     /// A directory's parent (the root's is itself).
     parent: u64,
@@ -39,6 +53,21 @@ struct Inode {
     opens: u32,
 }
 impl Inode {
+    fn new(meta: Node, nlink: u32, parent: u64, now: (u64, u32)) -> Self {
+        Self {
+            meta,
+            nlink,
+            size: 0,
+            pages: BTreeMap::new(),
+            entries: BTreeMap::new(),
+            parent,
+            xattrs: BTreeMap::new(),
+            atime: now,
+            mtime: now,
+            ctime: now,
+            opens: 0,
+        }
+    }
     fn kind(&self) -> FileKind {
         if self.meta.directory {
             FileKind::Directory
@@ -50,6 +79,77 @@ impl Inode {
             FileKind::File
         }
     }
+    /// Up to `len` bytes from `offset`, holes as zeros.
+    fn read(&self, offset: u64, len: usize) -> Vec<u8> {
+        if offset >= self.size {
+            return Vec::new();
+        }
+        let len = usize::try_from(self.size - offset).map_or(len, |left| left.min(len));
+        let mut out = vec![0; len];
+        let mut done = 0;
+        while done < len {
+            let at = offset + done as u64;
+            let within = (at % PAGE_BYTES) as usize;
+            let n = (PAGE - within).min(len - done);
+            if let Some(page) = self.pages.get(&(at / PAGE_BYTES)) {
+                out[done..done + n].copy_from_slice(&page[within..within + n]);
+            }
+            done += n;
+        }
+        out
+    }
+    /// How many pages writing `len` bytes at `offset` would add.
+    fn missing(&self, offset: u64, len: usize) -> u64 {
+        if len == 0 {
+            return 0;
+        }
+        let first = offset / PAGE_BYTES;
+        let last = (offset + len as u64 - 1) / PAGE_BYTES;
+        (first..=last)
+            .filter(|index| !self.pages.contains_key(index))
+            .count() as u64
+    }
+    fn write(&mut self, offset: u64, data: &[u8]) {
+        let mut done = 0;
+        while done < data.len() {
+            let at = offset + done as u64;
+            let within = (at % PAGE_BYTES) as usize;
+            let n = (PAGE - within).min(data.len() - done);
+            let page = self
+                .pages
+                .entry(at / PAGE_BYTES)
+                .or_insert_with(|| Box::new([0; PAGE]));
+            page[within..within + n].copy_from_slice(&data[done..done + n]);
+            done += n;
+        }
+        self.size = self.size.max(offset + data.len() as u64);
+    }
+    /// Make the file `size` bytes long, and say how many pages that freed. Growing allocates
+    /// nothing: the new bytes are a hole.
+    fn resize(&mut self, size: u64) -> u64 {
+        let mut freed = 0;
+        if size < self.size {
+            freed = self.pages.split_off(&size.div_ceil(PAGE_BYTES)).len() as u64;
+            let within = (size % PAGE_BYTES) as usize;
+            if within != 0
+                && let Some(page) = self.pages.get_mut(&(size / PAGE_BYTES))
+            {
+                page[within..].fill(0);
+            }
+        }
+        self.size = size;
+        freed
+    }
+    /// A write or truncate by anyone but root clears setuid, and setgid if the group may
+    /// execute, as Linux's file_remove_privs.
+    fn written_by(&mut self, uid: u32) {
+        if uid != 0 {
+            self.meta.mode &= !SETUID;
+            if self.meta.mode & 0o010 != 0 {
+                self.meta.mode &= !SETGID;
+            }
+        }
+    }
 }
 
 struct OpenRecord {
@@ -58,10 +158,36 @@ struct OpenRecord {
     uid: u32,
 }
 
+#[derive(Clone, Copy)]
 struct Lock {
     owner: u64,
     kind: LockKind,
     range: LockRange,
+}
+
+/// Take `range` out of `owner`'s locks, keeping what lies outside it, as fcntl(2) splits a
+/// lock that a new lock or an unlock covers part of.
+fn carve(locks: &mut Vec<Lock>, owner: u64, range: LockRange) {
+    let mut kept = Vec::with_capacity(locks.len() + 1);
+    for lock in locks.drain(..) {
+        if lock.owner != owner || !lock.range.overlaps(range) {
+            kept.push(lock);
+            continue;
+        }
+        if lock.range.start < range.start {
+            kept.push(Lock {
+                range: LockRange::between(lock.range.start, range.start),
+                ..lock
+            });
+        }
+        if range.end() < lock.range.end() {
+            kept.push(Lock {
+                range: LockRange::between(range.end(), lock.range.end()),
+                ..lock
+            });
+        }
+    }
+    *locks = kept;
 }
 
 struct State {
@@ -70,45 +196,45 @@ struct State {
     next_open: u64,
     opens: HashMap<u64, OpenRecord>,
     locks: HashMap<u64, Vec<Lock>>,
+    /// Pages of content held, against the capacity.
+    pages: u64,
 }
 
 pub struct MemFs {
     id: FsId,
     generation: u64,
     clock: Clock,
+    /// The most pages of content it holds.
+    capacity: u64,
     state: RefCell<State>,
 }
 
 impl MemFs {
-    /// A filesystem whose root directory is owned by `owner`:`group` with `perm`.
+    /// A filesystem whose root directory is owned by `owner`:`group` with `perm`, holding up to
+    /// [`DEFAULT_CAPACITY`] of content.
     pub fn new(id: FsId, generation: u64, owner: u32, group: u32, perm: u16, clock: Clock) -> Self {
         let now = clock();
         let mut root = Node::directory(owner, group, perm);
         root.ino = ROOT;
-        let inode = Inode {
-            meta: root,
-            nlink: 2,
-            data: Vec::new(),
-            entries: BTreeMap::new(),
-            parent: ROOT,
-            xattrs: BTreeMap::new(),
-            atime: now,
-            mtime: now,
-            ctime: now,
-            opens: 0,
-        };
         Self {
             id,
             generation,
             clock,
+            capacity: DEFAULT_CAPACITY.div_ceil(PAGE_BYTES),
             state: RefCell::new(State {
-                inodes: HashMap::from([(ROOT, inode)]),
+                inodes: HashMap::from([(ROOT, Inode::new(root, 2, ROOT, now))]),
                 next_ino: ROOT + 1,
                 next_open: 1,
                 opens: HashMap::new(),
                 locks: HashMap::new(),
+                pages: 0,
             }),
         }
+    }
+    /// The same, holding up to `bytes` of content, in whole pages.
+    pub fn with_capacity(mut self, bytes: u64) -> Self {
+        self.capacity = bytes.div_ceil(PAGE_BYTES);
+        self
     }
     /// The number of objects it holds, for tests: content released with its last name and open.
     pub fn inode_count(&self) -> usize {
@@ -146,8 +272,8 @@ impl MemFs {
             gid: inode.meta.group,
             size: match inode.kind() {
                 FileKind::Symlink => inode.meta.link.as_ref().map_or(0, |l| l.len() as u64),
-                FileKind::Directory => 4096,
-                _ => inode.data.len() as u64,
+                FileKind::Directory => PAGE_BYTES,
+                _ => inode.size,
             },
             mtime: inode.mtime,
             ctime: inode.ctime,
@@ -163,7 +289,7 @@ impl MemFs {
         }
     }
     fn may(cred: &Cred, inode: &Inode, bits: u16) -> bool {
-        cred.identity.allows(&inode.meta, bits)
+        inode::permission(&cred.identity, &inode.meta, bits)
     }
     /// A directory `cred` may search: ENOTDIR, EACCES otherwise.
     fn searchable(state: &State, cred: &Cred, ino: u64) -> Result<()> {
@@ -176,9 +302,18 @@ impl MemFs {
         }
         Ok(())
     }
+    /// A directory still named: one removed, though open, takes no new names (ENOENT), as
+    /// Linux's IS_DEADDIR.
+    fn alive(state: &State, ino: u64) -> Result<()> {
+        if state.inodes[&ino].nlink == 0 {
+            return Err(Errno::ENOENT);
+        }
+        Ok(())
+    }
     /// A directory `cred` may add names to or remove names from.
     fn writable_dir(state: &State, cred: &Cred, ino: u64) -> Result<()> {
         Self::searchable(state, cred, ino)?;
+        Self::alive(state, ino)?;
         if !Self::may(cred, &state.inodes[&ino], WRITE) {
             return Err(Errno::EACCES);
         }
@@ -192,13 +327,6 @@ impl MemFs {
             || cred.identity.id == dir.meta.owner
             || cred.identity.id == victim.meta.owner
     }
-    fn name(name: &str) -> Result<()> {
-        if valid_component(name) {
-            Ok(())
-        } else {
-            Err(Errno::EINVAL)
-        }
-    }
     fn touch(&self, inode: &mut Inode, content: bool) {
         let now = (self.clock)();
         if content {
@@ -206,28 +334,15 @@ impl MemFs {
         }
         inode.ctime = now;
     }
-    fn add(&self, state: &mut State, dir: u64, name: &str, meta: Node, data: Vec<u8>) -> u64 {
+    fn add(&self, state: &mut State, dir: u64, name: &str, meta: Node) -> u64 {
         let ino = state.next_ino;
         state.next_ino += 1;
-        let now = (self.clock)();
         let directory = meta.directory;
         let mut meta = meta;
         meta.ino = ino;
-        state.inodes.insert(
-            ino,
-            Inode {
-                meta,
-                nlink: if directory { 2 } else { 1 },
-                data,
-                entries: BTreeMap::new(),
-                parent: dir,
-                xattrs: BTreeMap::new(),
-                atime: now,
-                mtime: now,
-                ctime: now,
-                opens: 0,
-            },
-        );
+        let nlink = if directory { 2 } else { 1 };
+        let inode = Inode::new(meta, nlink, dir, (self.clock)());
+        state.inodes.insert(ino, inode);
         let parent = state.inodes.get_mut(&dir).expect("parent directory");
         parent.entries.insert(name.to_string(), ino);
         if directory {
@@ -236,14 +351,16 @@ impl MemFs {
         self.touch(parent, true);
         ino
     }
-    /// Free an object with no name and no open reference left.
+    /// Free an object with no name and no open reference left, and its content.
     fn reclaim(state: &mut State, ino: u64) {
         if state
             .inodes
             .get(&ino)
             .is_some_and(|i| i.nlink == 0 && i.opens == 0)
         {
-            state.inodes.remove(&ino);
+            if let Some(inode) = state.inodes.remove(&ino) {
+                state.pages -= inode.pages.len() as u64;
+            }
             state.locks.remove(&ino);
         }
     }
@@ -257,15 +374,17 @@ impl MemFs {
         }
         Self::reclaim(state, ino);
     }
+    /// Whether `ancestor` is `ino` or above it. Only live directories are asked about, whose
+    /// parents are live too; a missing one ends the walk all the same.
     fn is_ancestor(state: &State, ancestor: u64, mut ino: u64) -> bool {
         loop {
             if ino == ancestor {
                 return true;
             }
-            if ino == ROOT {
-                return false;
+            match state.inodes.get(&ino) {
+                Some(inode) if ino != ROOT => ino = inode.parent,
+                _ => return false,
             }
-            ino = state.inodes[&ino].parent;
         }
     }
     fn open_record<'s>(&self, state: &'s State, open: &OpenRef) -> Result<&'s OpenRecord> {
@@ -296,7 +415,8 @@ impl MemFs {
             access,
         }
     }
-    /// Check `access` on an existing object, as open(2) does.
+    /// Check `access` on an existing object, as open(2) does. Only regular files run, and
+    /// root needs an execute bit to run one, as `inode::permission` has it.
     fn openable(cred: &Cred, inode: &Inode, access: Access) -> Result<()> {
         match inode.kind() {
             FileKind::Directory if access != Access::Read => {
@@ -307,13 +427,7 @@ impl MemFs {
                 });
             }
             FileKind::Symlink => return Err(Errno::ELOOP),
-            // Even root needs one execute bit, and only regular files run.
-            FileKind::File | FileKind::Device
-                if access == Access::Exec
-                    && (inode.kind() != FileKind::File || inode.meta.mode & 0o111 == 0) =>
-            {
-                return Err(Errno::EACCES);
-            }
+            FileKind::Device if access == Access::Exec => return Err(Errno::EACCES),
             _ => {}
         }
         if !Self::may(cred, inode, access.bits()) {
@@ -321,11 +435,21 @@ impl MemFs {
         }
         Ok(())
     }
+    /// Resize a file's content, freeing the pages past its new end.
+    fn resize(&self, state: &mut State, ino: u64, size: u64, uid: u32) {
+        let now = (self.clock)();
+        let inode = state.inodes.get_mut(&ino).expect("checked inode");
+        let freed = inode.resize(size);
+        inode.written_by(uid);
+        inode.mtime = now;
+        inode.ctime = now;
+        state.pages -= freed;
+    }
 
     fn do_lookup(&self, cred: &Cred, dir: &Handle, name: &str) -> Result<Entry> {
         let state = self.state.borrow();
         let dir = self.check(&state, dir)?;
-        Self::name(name)?;
+        check_component(name)?;
         Self::searchable(&state, cred, dir)?;
         let ino = *state.inodes[&dir].entries.get(name).ok_or(Errno::ENOENT)?;
         Ok(self.entry(&state, ino))
@@ -335,7 +459,7 @@ impl MemFs {
         let mut current = self.check(&state, dir)?;
         let mut entries = Vec::new();
         for (index, name) in names.iter().enumerate() {
-            Self::name(name)?;
+            check_component(name)?;
             if index > 0 {
                 match state.inodes[&current].kind() {
                     FileKind::Symlink => {
@@ -379,13 +503,20 @@ impl MemFs {
         if dir == ROOT {
             return Ok(None);
         }
+        // A removed directory has no parent left to name, as getcwd(2) says: ENOENT.
+        Self::alive(&state, dir)?;
         let parent = state.inodes[&dir].parent;
-        let name = state.inodes[&parent]
-            .entries
-            .iter()
-            .find(|(_, ino)| **ino == dir)
-            .map(|(name, _)| name.clone())
-            .ok_or(Errno::ESTALE)?;
+        let name = state
+            .inodes
+            .get(&parent)
+            .and_then(|parent| {
+                parent
+                    .entries
+                    .iter()
+                    .find(|(_, ino)| **ino == dir)
+                    .map(|(name, _)| name.clone())
+            })
+            .ok_or(Errno::ENOENT)?;
         Ok(Some((self.entry(&state, parent), name)))
     }
     fn do_setattr(&self, cred: &Cred, handle: &Handle, set: &SetAttr) -> Result<Attr> {
@@ -393,61 +524,41 @@ impl MemFs {
         let ino = self.check(&state, handle)?;
         let who = &cred.identity;
         let inode = &state.inodes[&ino];
-        let owner = who.id == 0 || who.id == inode.meta.owner;
-        if (set.perm.is_some() || set.atime.is_some() || set.mtime.is_some()) && !owner {
-            return Err(Errno::EPERM);
+        if *set == SetAttr::default() {
+            return Ok(Self::attr(inode));
         }
-        if set
-            .uid
-            .is_some_and(|uid| uid != inode.meta.owner && who.id != 0)
-        {
-            return Err(Errno::EPERM);
+        // Every change is checked before any is made.
+        let mut meta = inode.meta.clone();
+        if let Some(perm) = set.perm {
+            inode::chmod(who, &mut meta, perm)?;
         }
-        if set.gid.is_some_and(|gid| {
-            gid != inode.meta.group && who.id != 0 && !(owner && who.groups.contains(&gid))
-        }) {
-            return Err(Errno::EPERM);
+        if set.uid.is_some() || set.gid.is_some() {
+            inode::chown(who, &mut meta, set.uid, set.gid)?;
         }
-        if set.size.is_some() {
-            if inode.meta.directory {
-                return Err(Errno::EISDIR);
+        inode::may_set_times(who, &inode.meta, set.atime, set.mtime)?;
+        if let Some(size) = set.size {
+            match inode.kind() {
+                FileKind::Directory => return Err(Errno::EISDIR),
+                FileKind::File => {}
+                _ => return Err(Errno::EINVAL),
             }
             if !Self::may(cred, inode, WRITE) {
                 return Err(Errno::EACCES);
             }
+            if size > FILE_MAX {
+                return Err(Errno::EFBIG);
+            }
         }
         let now = (self.clock)();
-        let inode = state.inodes.get_mut(&ino).expect("checked inode");
-        if let Some(perm) = set.perm {
-            let mut perm = perm & 0o7777;
-            // Without root, setgid needs the file's group to be one of the caller's.
-            if who.id != 0 && !inode.meta.directory && !who.groups.contains(&inode.meta.group) {
-                perm &= !SETGID;
-            }
-            inode.meta.mode = perm;
-        }
-        let changing_owner = set.uid.is_some_and(|u| u != inode.meta.owner)
-            || set.gid.is_some_and(|g| g != inode.meta.group);
-        if let Some(uid) = set.uid {
-            inode.meta.owner = uid;
-        }
-        if let Some(gid) = set.gid {
-            inode.meta.group = gid;
-        }
-        if changing_owner && inode.kind() == FileKind::File {
-            inode.meta.mode &= !SETUID;
-            if inode.meta.mode & 0o010 != 0 {
-                inode.meta.mode &= !SETGID;
-            }
-        }
+        state.inodes.get_mut(&ino).expect("checked inode").meta = meta;
         if let Some(size) = set.size {
-            inode.data.resize(size as usize, 0);
-            inode.mtime = now;
+            self.resize(&mut state, ino, size, who.id);
         }
-        if let Some(atime) = set.atime {
+        let inode = state.inodes.get_mut(&ino).expect("checked inode");
+        if let Some(atime) = inode::time(set.atime, now) {
             inode.atime = atime;
         }
-        if let Some(mtime) = set.mtime {
+        if let Some(mtime) = inode::time(set.mtime, now) {
             inode.mtime = mtime;
         }
         inode.ctime = now;
@@ -486,13 +597,13 @@ impl MemFs {
     ) -> Result<Entry> {
         let mut state = self.state.borrow_mut();
         let dir = self.check(&state, dir)?;
-        Self::name(name)?;
+        check_component(name)?;
         Self::writable_dir(&state, cred, dir)?;
         if state.inodes[&dir].entries.contains_key(name) {
             return Err(Errno::EEXIST);
         }
         let meta = meta(&state.inodes[&dir].meta);
-        let ino = self.add(&mut state, dir, name, meta, Vec::new());
+        let ino = self.add(&mut state, dir, name, meta);
         Ok(self.entry(&state, ino))
     }
     fn do_create(
@@ -509,16 +620,21 @@ impl MemFs {
         }
         let mut state = self.state.borrow_mut();
         let dir_ino = self.check(&state, dir)?;
-        Self::name(name)?;
+        check_component(name)?;
         Self::searchable(&state, cred, dir_ino)?;
         if let Some(ino) = state.inodes[&dir_ino].entries.get(name).copied() {
             if exclusive {
                 return Err(Errno::EEXIST);
             }
+            // open(O_CREAT) never opens a directory, whatever the access.
+            if state.inodes[&ino].meta.directory {
+                return Err(Errno::EISDIR);
+            }
             Self::openable(cred, &state.inodes[&ino], access)?;
             let open = self.new_open(&mut state, cred, ino, access);
             return Ok((self.entry(&state, ino), open));
         }
+        Self::alive(&state, dir_ino)?;
         if !Self::may(cred, &state.inodes[&dir_ino], WRITE) {
             return Err(Errno::EACCES);
         }
@@ -529,7 +645,7 @@ impl MemFs {
             false,
             cred.umask,
         );
-        let ino = self.add(&mut state, dir_ino, name, meta, Vec::new());
+        let ino = self.add(&mut state, dir_ino, name, meta);
         // The creator gets the access it asked for, whatever the new file's mode, as on Linux.
         let open = self.new_open(&mut state, cred, ino, access);
         Ok((self.entry(&state, ino), open))
@@ -538,21 +654,15 @@ impl MemFs {
         let mut state = self.state.borrow_mut();
         let target = self.check(&state, target)?;
         let dir = self.check(&state, dir)?;
-        Self::name(name)?;
-        let inode = &state.inodes[&target];
-        if inode.meta.directory {
-            return Err(Errno::EPERM);
-        }
-        // protected_hardlinks: without root, own the file or be able to read and write it.
-        if cred.identity.id != 0
-            && cred.identity.id != inode.meta.owner
-            && !Self::may(cred, inode, READ | WRITE)
-        {
-            return Err(Errno::EPERM);
-        }
+        check_component(name)?;
+        inode::may_link(&cred.identity, &state.inodes[&target].meta)?;
         Self::writable_dir(&state, cred, dir)?;
         if state.inodes[&dir].entries.contains_key(name) {
             return Err(Errno::EEXIST);
+        }
+        // An unlinked file, though still open, takes no name again.
+        if state.inodes[&target].nlink == 0 {
+            return Err(Errno::ENOENT);
         }
         let parent = state.inodes.get_mut(&dir).expect("checked directory");
         parent.entries.insert(name.to_string(), target);
@@ -565,7 +675,7 @@ impl MemFs {
     fn do_remove(&self, cred: &Cred, dir: &Handle, name: &str, directory: bool) -> Result<()> {
         let mut state = self.state.borrow_mut();
         let dir = self.check(&state, dir)?;
-        Self::name(name)?;
+        check_component(name)?;
         Self::writable_dir(&state, cred, dir)?;
         let victim = *state.inodes[&dir].entries.get(name).ok_or(Errno::ENOENT)?;
         let inode = &state.inodes[&victim];
@@ -606,8 +716,8 @@ impl MemFs {
         let mut state = self.state.borrow_mut();
         let from_dir = self.check(&state, from_dir)?;
         let to_dir = self.check(&state, to_dir)?;
-        Self::name(from)?;
-        Self::name(to)?;
+        check_component(from)?;
+        check_component(to)?;
         Self::writable_dir(&state, cred, from_dir)?;
         Self::writable_dir(&state, cred, to_dir)?;
         let source = *state.inodes[&from_dir]
@@ -675,22 +785,59 @@ impl MemFs {
         self.touch(inode, false);
         Ok(())
     }
-    /// The permission an extended attribute's namespace needs: `user.*` read or write,
-    /// `trusted.*` root; others are not supported.
-    fn xattr_allowed(cred: &Cred, inode: &Inode, name: &str, write: bool) -> Result<()> {
-        if name.starts_with("trusted.") {
-            return if cred.identity.id == 0 {
-                Ok(())
-            } else {
-                Err(Errno::EPERM)
-            };
+    fn do_getxattr(&self, cred: &Cred, handle: &Handle, name: &str) -> Result<Vec<u8>> {
+        let space = xattr::space(name)?;
+        let state = self.state.borrow();
+        let inode = &state.inodes[&self.check(&state, handle)?];
+        xattr::readable(&cred.identity, &inode.meta, space)?;
+        match space {
+            Space::Access | Space::Default => {
+                let entries = xattr::acl(&inode.meta, space)?;
+                Ok(serde_json::to_vec(&entries).unwrap_or_default())
+            }
+            Space::User | Space::Trusted => inode.xattrs.get(name).cloned().ok_or(Errno::ENODATA),
         }
-        if !name.starts_with("user.") || name.len() == 5 {
-            return Err(Errno::EOPNOTSUPP);
+    }
+    fn do_setxattr(
+        &self,
+        cred: &Cred,
+        handle: &Handle,
+        name: &str,
+        value: &[u8],
+        flags: u8,
+    ) -> Result<()> {
+        let space = xattr::space(name)?;
+        let mut state = self.state.borrow_mut();
+        let ino = self.check(&state, handle)?;
+        let inode = state.inodes.get_mut(&ino).expect("checked inode");
+        xattr::settable(&cred.identity, &inode.meta, space)?;
+        match space {
+            Space::Access | Space::Default => {
+                xattr::check_flags(flags, xattr::has_acl(&inode.meta, space))?;
+                let entries: Entries = serde_json::from_slice(value).map_err(|_| Errno::EINVAL)?;
+                xattr::set_acl(&mut inode.meta, space, entries)?;
+            }
+            Space::User | Space::Trusted => {
+                xattr::check_flags(flags, inode.xattrs.contains_key(name))?;
+                xattr::store(&mut inode.xattrs, name, value)?;
+            }
         }
-        if !Self::may(cred, inode, if write { WRITE } else { READ }) {
-            return Err(Errno::EACCES);
+        self.touch(inode, false);
+        Ok(())
+    }
+    fn do_removexattr(&self, cred: &Cred, handle: &Handle, name: &str) -> Result<()> {
+        let space = xattr::space(name)?;
+        let mut state = self.state.borrow_mut();
+        let ino = self.check(&state, handle)?;
+        let inode = state.inodes.get_mut(&ino).expect("checked inode");
+        xattr::settable(&cred.identity, &inode.meta, space)?;
+        match space {
+            Space::Access | Space::Default => xattr::remove_acl(&mut inode.meta, space)?,
+            Space::User | Space::Trusted => {
+                inode.xattrs.remove(name).ok_or(Errno::ENODATA)?;
+            }
         }
+        self.touch(inode, false);
         Ok(())
     }
     fn do_open(
@@ -707,11 +854,9 @@ impl MemFs {
             if !access.writes() {
                 return Err(Errno::EINVAL);
             }
-            let now = (self.clock)();
-            let inode = state.inodes.get_mut(&ino).expect("checked");
-            inode.data.clear();
-            inode.mtime = now;
-            inode.ctime = now;
+            if state.inodes[&ino].kind() == FileKind::File {
+                self.resize(&mut state, ino, 0, cred.identity.id);
+            }
         }
         Ok(self.new_open(&mut state, cred, ino, access))
     }
@@ -725,35 +870,46 @@ impl MemFs {
         if inode.meta.directory {
             return Err(Errno::EISDIR);
         }
-        let start = (offset as usize).min(inode.data.len());
-        let end = start.saturating_add(len).min(inode.data.len());
-        Ok(inode.data[start..end].to_vec())
+        Ok(inode.read(offset, len.min(RW_MAX)))
     }
-    fn do_write(&self, open: &OpenRef, offset: u64, data: &[u8]) -> Result<usize> {
+    fn do_write(&self, open: &OpenRef, at: WriteAt, data: &[u8]) -> Result<Written> {
         let mut state = self.state.borrow_mut();
         let record = self.open_record(&state, open)?;
         if !record.access.writes() {
             return Err(Errno::EBADF);
         }
         let (ino, uid) = (record.ino, record.uid);
+        let inode = &state.inodes[&ino];
+        // The end is read here, with the write, so appends never overwrite each other.
+        let offset = match at {
+            WriteAt::Offset(offset) => offset,
+            WriteAt::End => inode.size,
+        };
+        // Nothing to write changes nothing: not the size, the times nor the mode.
+        if data.is_empty() {
+            return Ok(Written { offset, len: 0 });
+        }
+        // As Linux: nothing goes at or past the largest offset (EFBIG); before it, what fits.
+        if offset >= FILE_MAX {
+            return Err(Errno::EFBIG);
+        }
+        let fits = usize::try_from(FILE_MAX - offset).unwrap_or(usize::MAX);
+        let data = &data[..data.len().min(fits).min(RW_MAX)];
+        let needed = inode.missing(offset, data.len());
+        if state.pages + needed > self.capacity {
+            return Err(Errno::ENOSPC);
+        }
+        state.pages += needed;
         let now = (self.clock)();
         let inode = state.inodes.get_mut(&ino).expect("open inode");
-        let start = offset as usize;
-        let end = start.checked_add(data.len()).ok_or(Errno::EFBIG)?;
-        if inode.data.len() < end {
-            inode.data.resize(end, 0);
-        }
-        inode.data[start..end].copy_from_slice(data);
+        inode.write(offset, data);
+        inode.written_by(uid);
         inode.mtime = now;
         inode.ctime = now;
-        // A write by anyone but root clears setuid, and setgid if the group may execute.
-        if uid != 0 {
-            inode.meta.mode &= !SETUID;
-            if inode.meta.mode & 0o010 != 0 {
-                inode.meta.mode &= !SETGID;
-            }
-        }
-        Ok(data.len())
+        Ok(Written {
+            offset,
+            len: data.len(),
+        })
     }
     fn do_truncate(&self, open: &OpenRef, size: u64) -> Result<()> {
         let mut state = self.state.borrow_mut();
@@ -761,12 +917,11 @@ impl MemFs {
         if !record.access.writes() {
             return Err(Errno::EINVAL);
         }
-        let ino = record.ino;
-        let now = (self.clock)();
-        let inode = state.inodes.get_mut(&ino).expect("open inode");
-        inode.data.resize(size as usize, 0);
-        inode.mtime = now;
-        inode.ctime = now;
+        if size > FILE_MAX {
+            return Err(Errno::EFBIG);
+        }
+        let (ino, uid) = (record.ino, record.uid);
+        self.resize(&mut state, ino, size, uid);
         Ok(())
     }
     fn conflict(
@@ -794,11 +949,24 @@ impl MemFs {
             return Err(Errno::EAGAIN);
         }
         let locks = state.locks.entry(ino).or_default();
-        locks.retain(|lock| lock.owner != open.id || !lock.range.overlaps(range));
+        // The new lock replaces this owner's within its range, whatever their kind; what lies
+        // outside stays, and locks of the same kind it meets join it, as Linux merges them.
+        carve(locks, open.id, range);
+        let mut merged = range;
+        locks.retain(|lock| {
+            let joins = lock.owner == open.id && lock.kind == kind && lock.range.touches(merged);
+            if joins {
+                merged = LockRange::between(
+                    merged.start.min(lock.range.start),
+                    merged.end().max(lock.range.end()),
+                );
+            }
+            !joins
+        });
         locks.push(Lock {
             owner: open.id,
             kind,
-            range,
+            range: merged,
         });
         Ok(())
     }
@@ -806,7 +974,7 @@ impl MemFs {
         let mut state = self.state.borrow_mut();
         let ino = self.open_record(&state, open)?.ino;
         if let Some(locks) = state.locks.get_mut(&ino) {
-            locks.retain(|lock| lock.owner != open.id || !lock.range.overlaps(range));
+            carve(locks, open.id, range);
         }
         Ok(())
     }
@@ -910,6 +1078,7 @@ impl Filesystem for MemFs {
         name: &'a str,
         perm: u16,
     ) -> BoxFuture<'a, Entry> {
+        // `created` keeps the sticky bit asked for, as mkdir(2) does.
         ready!(self.make(cred, dir, name, |parent| created(
             &cred.identity,
             parent,
@@ -989,12 +1158,7 @@ impl Filesystem for MemFs {
         handle: &'a Handle,
         name: &'a str,
     ) -> BoxFuture<'a, Vec<u8>> {
-        let state = self.state.borrow();
-        ready!(self.check(&state, handle).and_then(|ino| {
-            let inode = &state.inodes[&ino];
-            Self::xattr_allowed(cred, inode, name, false)?;
-            inode.xattrs.get(name).cloned().ok_or(Errno::ENODATA)
-        }))
+        ready!(self.do_getxattr(cred, handle, name))
     }
     fn setxattr<'a>(
         &'a self,
@@ -1002,28 +1166,15 @@ impl Filesystem for MemFs {
         handle: &'a Handle,
         name: &'a str,
         value: &'a [u8],
+        flags: u8,
     ) -> BoxFuture<'a, ()> {
-        let mut state = self.state.borrow_mut();
-        ready!(self.check(&state, handle).and_then(|ino| {
-            Self::xattr_allowed(cred, &state.inodes[&ino], name, true)?;
-            if value.len() > XATTR_MAX {
-                return Err(Errno::ERANGE);
-            }
-            let inode = state.inodes.get_mut(&ino).expect("checked");
-            inode.xattrs.insert(name.to_string(), value.to_vec());
-            self.touch(inode, false);
-            Ok(())
-        }))
+        ready!(self.do_setxattr(cred, handle, name, value, flags))
     }
     fn listxattr<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, Vec<String>> {
         let state = self.state.borrow();
         ready!(self.check(&state, handle).map(|ino| {
-            state.inodes[&ino]
-                .xattrs
-                .keys()
-                .filter(|name| name.starts_with("user.") || cred.identity.id == 0)
-                .cloned()
-                .collect()
+            let inode = &state.inodes[&ino];
+            xattr::listed(&cred.identity, &inode.meta, inode.xattrs.keys())
         }))
     }
     fn removexattr<'a>(
@@ -1032,25 +1183,17 @@ impl Filesystem for MemFs {
         handle: &'a Handle,
         name: &'a str,
     ) -> BoxFuture<'a, ()> {
-        let mut state = self.state.borrow_mut();
-        ready!(self.check(&state, handle).and_then(|ino| {
-            Self::xattr_allowed(cred, &state.inodes[&ino], name, true)?;
-            let inode = state.inodes.get_mut(&ino).expect("checked");
-            inode.xattrs.remove(name).ok_or(Errno::ENODATA)?;
-            self.touch(inode, false);
-            Ok(())
-        }))
+        ready!(self.do_removexattr(cred, handle, name))
     }
     fn statfs<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, StatFs> {
         let state = self.state.borrow();
-        let used: usize = state.inodes.values().map(|inode| inode.data.len()).sum();
         ready!(Ok(StatFs {
-            block_size: 4096,
-            blocks: (used as u64).div_ceil(4096),
-            blocks_free: 0,
+            block_size: PAGE_BYTES,
+            blocks: self.capacity,
+            blocks_free: self.capacity.saturating_sub(state.pages),
             files: state.inodes.len() as u64,
             files_free: u64::MAX - state.next_ino,
-            name_max: 255,
+            name_max: abi::NAME_MAX as u64,
         }))
     }
     fn open<'a>(
@@ -1065,14 +1208,19 @@ impl Filesystem for MemFs {
     fn read<'a>(&'a self, open: &'a OpenRef, offset: u64, len: usize) -> BoxFuture<'a, Vec<u8>> {
         ready!(self.do_read(open, offset, len))
     }
-    fn write<'a>(&'a self, open: &'a OpenRef, offset: u64, data: &'a [u8]) -> BoxFuture<'a, usize> {
-        ready!(self.do_write(open, offset, data))
+    fn write<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        at: WriteAt,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, Written> {
+        ready!(self.do_write(open, at, data))
     }
     fn truncate<'a>(&'a self, open: &'a OpenRef, size: u64) -> BoxFuture<'a, ()> {
         ready!(self.do_truncate(open, size))
     }
     fn fsync<'a>(&'a self, open: &'a OpenRef, _datasync: bool) -> BoxFuture<'a, ()> {
-        // Memory is this filesystem's durability point: there is nothing further to wait for.
+        // Nothing here is durable (`Durability::Volatile`): there is nothing to wait for.
         let state = self.state.borrow();
         ready!(self.open_record(&state, open).map(|_| ()))
     }

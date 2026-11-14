@@ -75,7 +75,8 @@ pub const EXPORT: FsCapabilities = FsCapabilities {
     locks: LockScope::Publisher,
 };
 
-/// An instance's in-memory filesystem ([`crate::memfs`]): full semantics, gone with the instance.
+/// An instance's in-memory filesystem ([`crate::memfs`]): full semantics, and nothing durable,
+/// since it goes with the instance.
 pub const MEMORY: FsCapabilities = FsCapabilities {
     identity: IdentityScope::Instance,
     open_survives_unlink: Support::Yes,
@@ -85,6 +86,6 @@ pub const MEMORY: FsCapabilities = FsCapabilities {
     exclusive_create: Support::Yes,
     atomic_rename: Support::Yes,
     rename_noreplace: Support::Yes,
-    durability: Durability::ServiceCommit,
+    durability: Durability::Volatile,
     locks: LockScope::Instance,
 };

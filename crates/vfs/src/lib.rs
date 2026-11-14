@@ -23,6 +23,7 @@ pub mod profiles;
 pub use descriptors::{DescriptorTable, OpenFile};
 
 use abi::Errno;
+pub use abi::Time;
 use abi::contract::FsCapabilities;
 pub use os_core::permissions::Identity;
 use serde::{Deserialize, Serialize};
@@ -212,16 +213,51 @@ pub struct OpenRef {
     pub access: Access,
 }
 
-/// Attribute changes, as chmod, chown, utimensat and truncate make them; `None` leaves one alone.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Attribute changes, as chmod, chown, utimensat and truncate make them; `None` and
+/// [`Time::Omit`] leave one alone. A driver checks them all before it changes any, as
+/// `os_core::inode` decides: times set to [`Time::Now`] need only write permission, a time
+/// given needs the owner or root.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SetAttr {
     pub perm: Option<u16>,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub size: Option<u64>,
-    pub atime: Option<(u64, u32)>,
-    pub mtime: Option<(u64, u32)>,
+    pub atime: Time,
+    pub mtime: Time,
 }
+impl Default for SetAttr {
+    fn default() -> Self {
+        Self {
+            perm: None,
+            uid: None,
+            gid: None,
+            size: None,
+            atime: Time::Omit,
+            mtime: Time::Omit,
+        }
+    }
+}
+
+/// Where a write goes (contract §2.3): at an offset, or at the end of the file as it is when
+/// the write lands, which the driver decides atomically (`O_APPEND`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WriteAt {
+    Offset(u64),
+    End,
+}
+
+/// What a write did: the offset its data went to, and how many bytes went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Written {
+    pub offset: u64,
+    pub len: usize,
+}
+
+/// The largest file size and offset, as Linux's `MAX_LFS_FILESIZE` (`off_t` is 64 bits on
+/// every target): a write or truncate past it fails with `EFBIG`.
+pub const FILE_MAX: u64 = i64::MAX as u64;
 
 /// rename(2)'s flags: RENAME_NOREPLACE is the one the contract requires.
 pub const RENAME_NOREPLACE: u32 = 1;
@@ -241,7 +277,15 @@ pub struct LockRange {
 }
 impl LockRange {
     pub const WHOLE: LockRange = LockRange { start: 0, len: 0 };
-    fn end(self) -> u64 {
+    /// The range from `start` up to `end`, not included; `u64::MAX` is the end of the file.
+    pub fn between(start: u64, end: u64) -> Self {
+        Self {
+            start,
+            len: if end == u64::MAX { 0 } else { end - start },
+        }
+    }
+    /// Where it ends, not included: `u64::MAX` for one to the end of the file.
+    pub fn end(self) -> u64 {
         if self.len == 0 {
             u64::MAX
         } else {
@@ -250,6 +294,10 @@ impl LockRange {
     }
     pub fn overlaps(self, other: LockRange) -> bool {
         self.start < other.end() && other.start < self.end()
+    }
+    /// Whether the two overlap or meet, so that one lock may take both.
+    pub fn touches(self, other: LockRange) -> bool {
+        self.start <= other.end() && other.start <= self.end()
     }
 }
 /// A lock that conflicts with one asked for, as F_GETLK reports it.
@@ -273,8 +321,10 @@ pub struct StatFs {
 
 /// A filesystem driver: the version 2 calls of the contract §2.3. Every call names the
 /// credential acting; names are single components, never `.`, `..` or containing `/`
-/// (`EINVAL`). A handle whose object is gone, or whose generation changed, fails with
-/// `ESTALE`; a handle the driver did not issue fails with `EACCES`.
+/// (`EINVAL`), and at most `NAME_MAX` bytes (`ENAMETOOLONG`), as [`check_component`] has it.
+/// A handle whose object is gone, or whose generation changed, fails with `ESTALE`; a handle
+/// the driver did not issue fails with `EACCES`. A directory that has been removed, though
+/// still open, takes no new names (`ENOENT`).
 pub trait Filesystem {
     fn id(&self) -> &FsId;
     /// What the driver provides (contract §3); every gate is read against it.
@@ -369,12 +419,14 @@ pub trait Filesystem {
         handle: &'a Handle,
         name: &'a str,
     ) -> BoxFuture<'a, Vec<u8>>;
+    /// Set an attribute; `flags` are setxattr(2)'s `XATTR_CREATE` and `XATTR_REPLACE`.
     fn setxattr<'a>(
         &'a self,
         cred: &'a Cred,
         handle: &'a Handle,
         name: &'a str,
         value: &'a [u8],
+        flags: u8,
     ) -> BoxFuture<'a, ()>;
     fn listxattr<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, Vec<String>>;
     fn removexattr<'a>(
@@ -395,7 +447,14 @@ pub trait Filesystem {
         truncate: bool,
     ) -> BoxFuture<'a, OpenRef>;
     fn read<'a>(&'a self, open: &'a OpenRef, offset: u64, len: usize) -> BoxFuture<'a, Vec<u8>>;
-    fn write<'a>(&'a self, open: &'a OpenRef, offset: u64, data: &'a [u8]) -> BoxFuture<'a, usize>;
+    /// Write `data` at `at`, and say where it went and how much went. Nothing at all changes
+    /// for empty `data`.
+    fn write<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        at: WriteAt,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, Written>;
     fn truncate<'a>(&'a self, open: &'a OpenRef, size: u64) -> BoxFuture<'a, ()>;
     /// Return after the driver's durability point (contract §3).
     fn fsync<'a>(&'a self, open: &'a OpenRef, datasync: bool) -> BoxFuture<'a, ()>;
@@ -416,13 +475,22 @@ pub trait Filesystem {
     fn release<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()>;
 }
 
-/// Whether `name` may be one component of a path: not empty, `.` or `..`, and without `/` or NUL.
+/// Whether `name` may be one component of a path: `ENAMETOOLONG` past `NAME_MAX` bytes, as
+/// Linux says before anything else, and `EINVAL` for an empty name, `.`, `..`, or one with `/`
+/// or NUL.
+pub fn check_component(name: &str) -> Result<()> {
+    if name.len() > abi::NAME_MAX {
+        return Err(Errno::ENAMETOOLONG);
+    }
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+/// Whether `name` may be one component of a path ([`check_component`]).
 pub fn valid_component(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains(['/', '\0'])
-        && name.len() <= 255
+    check_component(name).is_ok()
 }
 
 /// Run a future that never waits, as every [`memfs`] call is: for tests and synchronous callers.

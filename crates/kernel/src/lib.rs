@@ -18,8 +18,8 @@ mod xattr;
 use abi::{
     Call, Dirent, Errno, Error, O_ACCMODE, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, Stat, Time,
 };
-use os_core::parent;
 use os_core::permissions::*;
+use os_core::{inode, parent};
 use serde_json::{Value, json};
 
 pub use namei::namei;
@@ -204,15 +204,7 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
     }
 }
 
-/// Whether `cred` may `mask` (READ, WRITE, EXEC) the node, as Linux's generic_permission
-/// decides: its mode and ACL say (`Identity::allows`); root may anything, but execute only
-/// what someone may.
-pub fn permission(cred: &Identity, node: &Node, mask: u16) -> bool {
-    if cred.id == 0 {
-        return mask & EXEC == 0 || node.directory || node.mode & 0o111 != 0;
-    }
-    cred.allows(node, mask)
-}
+pub use os_core::inode::permission;
 fn require(cred: &Identity, node: &Node, mask: u16) -> Result<()> {
     if permission(cred, node, mask) {
         Ok(())
@@ -450,9 +442,7 @@ pub fn executable(fs: &impl Fs, cred: &Identity, path: &str) -> Result<Executabl
 
 pub fn mkdir(fs: &mut impl Fs, process: &Process, path: &str, mode: u16) -> Result<()> {
     let (real, dir) = creating(fs, &process.cred, path)?;
-    let mut node = created(&process.cred, &dir, mode, true, process.umask);
-    // mkdir(2) keeps the sticky bit asked for.
-    node.mode |= mode & !process.umask & 0o1000;
+    let node = created(&process.cred, &dir, mode, true, process.umask);
     fs.set_node(&real, &node);
     Ok(())
 }
@@ -625,15 +615,7 @@ pub fn link(fs: &mut impl Fs, cred: &Identity, from: &str, to: &str, follow: boo
         ));
     }
     let (real, _) = creating(fs, cred, to)?;
-    if cred.id != 0 && cred.id != node.owner {
-        let safe = node.is_file()
-            && node.mode & SETUID == 0
-            && !(node.mode & SETGID != 0 && node.mode & 0o010 != 0)
-            && permission(cred, &node, READ | WRITE);
-        if !safe {
-            return Err(Errno::EPERM.into());
-        }
-    }
+    inode::may_link(cred, &node)?;
     fs.set_node(&real, &node);
     Ok(())
 }
@@ -659,8 +641,7 @@ pub fn symlink(fs: &mut impl Fs, cred: &Identity, target: &str, path: &str) -> R
     Ok(())
 }
 
-/// chmod(2): its owner's or root's. Without root, setgid needs the node's group to be one of
-/// the caller's: it is cleared otherwise, without an error, as Linux does.
+/// chmod(2): its owner's or root's, as [`inode::chmod`] has it.
 pub fn chmod(fs: &mut impl Fs, cred: &Identity, path: &str, mode: u16) -> Result<()> {
     let (real, node) = existing(fs, cred, path, true)?;
     change_mode(fs, cred, &real, node, mode)
@@ -680,20 +661,12 @@ fn change_mode(
     mut node: Node,
     mode: u16,
 ) -> Result<()> {
-    if cred.id != 0 && cred.id != node.owner {
-        return Err(Errno::EPERM.into());
-    }
-    node.mode = mode & 0o7777;
-    if cred.id != 0 && !cred.groups.contains(&node.group) {
-        node.mode &= !SETGID;
-    }
+    inode::chmod(cred, &mut node, mode)?;
     fs.set_node(real, &node);
     Ok(())
 }
 
-/// chown(2), lchown(2) without `follow`: root's; an owner may change the group to one of its
-/// own. Changing who owns a regular file clears its setuid bit, and its setgid bit if its
-/// group may execute it.
+/// chown(2), lchown(2) without `follow`, as [`inode::chown`] has it.
 pub fn chown(
     fs: &mut impl Fs,
     cred: &Identity,
@@ -703,31 +676,12 @@ pub fn chown(
     follow: bool,
 ) -> Result<()> {
     let (real, mut node) = existing(fs, cred, path, follow)?;
-    if cred.id != 0
-        && (cred.id != node.owner
-            || uid.is_some_and(|id| id != node.owner)
-            || gid.is_some_and(|g| !cred.groups.contains(&g)))
-    {
-        return Err(Errno::EPERM.into());
-    }
-    if let Some(id) = uid {
-        node.owner = id;
-    }
-    if let Some(id) = gid {
-        node.group = id;
-    }
-    if node.is_file() && (uid.is_some() || gid.is_some()) {
-        node.mode &= !SETUID;
-        if node.mode & 0o010 != 0 {
-            node.mode &= !SETGID;
-        }
-    }
+    inode::chown(cred, &mut node, uid, gid)?;
     fs.set_node(&real, &node);
     Ok(())
 }
 
-/// utimensat(2): times set to now need the owner, root, or whoever may write it; a time given,
-/// the owner or root, as Linux's setattr asks.
+/// utimensat(2), as [`inode::may_set_times`] allows.
 pub fn utimens(
     fs: &mut impl Fs,
     cred: &Identity,
@@ -740,21 +694,9 @@ pub fn utimens(
     if atime == Time::Omit && mtime == Time::Omit {
         return Ok(());
     }
-    let owner = cred.id == 0 || cred.id == node.owner;
-    let given = |time| matches!(time, Time::At { .. });
-    if (given(atime) || given(mtime)) && !owner {
-        return Err(Errno::EPERM.into());
-    }
-    if !owner && !permission(cred, &node, WRITE) {
-        return Err(Errno::EACCES.into());
-    }
+    inode::may_set_times(cred, &node, atime, mtime)?;
     let now = fs.now();
-    let at = |time| match time {
-        Time::Now => Some(now),
-        Time::Omit => None,
-        Time::At { sec, nsec } => Some((sec, nsec.min(999_999_999))),
-    };
-    fs.set_times(node.ino, at(atime), at(mtime));
+    fs.set_times(node.ino, inode::time(atime, now), inode::time(mtime, now));
     Ok(())
 }
 

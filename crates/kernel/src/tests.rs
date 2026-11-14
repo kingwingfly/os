@@ -395,8 +395,16 @@ fn modes_and_owners_change_as_their_owner_or_root_may() {
         errno(chown(&mut fs, &ann, "/w/f", Some(1001), None, true)),
         Errno::EPERM
     );
+    // The owner may name the group the file has, or one of its own; no other, as Linux's
+    // chgrp_ok has it.
     assert_eq!(
-        errno(chown(&mut fs, &ann, "/w/f", None, Some(60), true)),
+        errno(chown(&mut fs, &ann, "/w/f", None, Some(70), true)),
+        Errno::EPERM
+    );
+    chown(&mut fs, &ann, "/w/f", None, Some(60), true).unwrap();
+    // Not even the owner it already has may someone else name.
+    assert_eq!(
+        errno(chown(&mut fs, &bob, "/w/f", Some(1000), None, true)),
         Errno::EPERM
     );
     chown(&mut fs, &ann, "/w/f", None, Some(50), true).unwrap();

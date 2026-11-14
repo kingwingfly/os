@@ -126,6 +126,9 @@ pub enum Durability {
     HostFsync,
     /// The publisher's acknowledgement.
     PublisherAck,
+    /// None: the content is in the instance's memory and goes with it (tmpfs), so fsync has
+    /// nothing to wait for.
+    Volatile,
 }
 
 /// Who keeps a filesystem's locks (`flock` and `fcntl` byte ranges), so every client of it sees

@@ -2876,6 +2876,7 @@ dependencies = [
  "os-abi",
  "os-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

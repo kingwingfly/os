@@ -8,3 +8,4 @@ publish = false
 abi = { package = "os-abi", path = "../abi" }
 os-core = { path = "../core" }
 serde.workspace = true
+serde_json.workspace = true
