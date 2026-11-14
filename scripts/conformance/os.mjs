@@ -4,10 +4,11 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { needsPodman, startPodman } from './podman.mjs';
-import { conformanceConfig, compilerConfig, compilerImage, isSleep, sameSleep, withCleanup, mountHandle, browserOptions, directoryProfile, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from './fixtures.mjs';
+import { conformanceConfig, compilerConfig, compilerImage, isSleep, sameSleep, withCleanup, mountHandle, browserOptions, directoryProfile, helperConnection, recordReattach, putFile, mountOutcome, heldProbe } from './fixtures.mjs';
 import { ShutdownScope } from './process.mjs';
 import { containerLease } from './containers.mjs';
 import { imageStore } from './storage.mjs';
+import { RunRecord, recoverInterrupted, runPrefix } from './recovery.mjs';
 import { performance } from 'node:perf_hooks';
 import { run, targetDir, jsonLines, requireProbeSuccess, ok, ports, start, stop, sourceEvidence, filesystems, operations, probeOperations } from './common.mjs';
 
@@ -55,22 +56,6 @@ async function account(browser,url,name,password,bytes,existingContext=null) {
   const [creds]=await checked(page,['getcreds']);
   return {context,page,creds};
 }
-async function held(page,mode,root,alias,cross,creds,diagnostics) {
-  const args=[mode,root,alias,cross,String(creds.uid),String(creds.gid)];
-  const caseName=mode==='hold-open'?'unmount-open':'unmount-cwd';
-  await page.evaluate(startHeld,{tool,args});
-  await page.waitForFunction(()=>{const s=window.conformanceHeld;return s.done||s.timedOut||(s.barrier&&s.input);},null,{timeout:65000});
-  const state=await page.evaluate(heldState);
-  let detach={case:caseName,step:'detach',call:'unmountLocal(mount)'};
-  if(state.done||state.timedOut)detach.skipped=state.timedOut?'probe did not reach barrier before deadline':'probe completed before barrier; see preceding results';
-  else {
-    detach={...detach,...await page.evaluate(mountOutcome,{operation:'detach',path:root})};
-    await page.evaluate(()=>window.conformanceHeld.input.write('continue\n'));
-    await page.waitForFunction(()=>window.conformanceHeld.done||window.conformanceHeld.timedOut,null,{timeout:65000});
-  }
-  const final=await page.evaluate(heldState);
-  return {rows:[{case:caseName,step:'unmount',call:'umount(mount)',skipped:'no separate busy-unmount API; unmountLocal detach is measured below'},...heldRows(final,caseName,detach,diagnostics)],detach};
-}
 
 async function timing(page,root,alias,cross,creds) {
   const rows=[];
@@ -106,14 +91,24 @@ export async function os() {
   run('cargo',['build','--locked','-p','os-local-helper','--release'],{stdio:'inherit'});
   run('worker-build',['--release'],{cwd:'crates/worker',stdio:'inherit'});
   const target=targetDir(), bytes=await readFile(join(target,'wasm32-wasip1/release/os-conformance.wasm'));
-  const state=await mkdtemp(join(tmpdir(),'os-conformance-os-'));
+  // A runner killed outright leaves its processes and containers behind; stop those first.
+  for(const run of await recoverInterrupted()) {
+    const parts=[`stopped ${run.stopped.join(', ')||'nothing'}`];
+    if(run.survived.length)parts.push('still running after SIGKILL: '+run.survived.join(', '));
+    if(run.unverified.length)parts.push('leader gone, members left running: '+run.unverified.join(', '));
+    if(run.processes.stopped||run.processes.remaining)parts.push(`other processes of the run stopped: ${run.processes.stopped}, still running: ${run.processes.remaining}`);
+    if(run.containers)parts.push('containers: '+JSON.stringify(run.containers));
+    console.error(`Recovered interrupted run ${run.state}: ${parts.join('; ')}`);
+  }
+  const state=await mkdtemp(join(tmpdir(),runPrefix));
+  const record=new RunRecord(state);await record.save();
   const scope=new ShutdownScope();
   const previousMask=process.umask(0o022);
-  scope.add('umask',()=>process.umask(previousMask));
+  scope.add('umask',()=>process.umask(previousMask),{always:true});
   let server,browser,persistent,helper,log,podman,compilerEvidence,failure,success=false,reported=false;
   const retained=()=>{if(!reported){reported=true;console.error('Run retained disposable state and logs at '+state);}};
   // This must run inside close(), before signal/error termination can exit.
-  scope.add('retained state notice',()=>{if(!success||scope.fatal)retained();});
+  scope.add('retained state notice',()=>{if(!success||scope.fatal)retained();},{always:true});
   try {
     const [number,inspectorPort]=await ports(2),url=`http://127.0.0.1:${number}`;
     const root=resolve('.');
@@ -126,9 +121,12 @@ export async function os() {
     if (needsPodman(serverEnv)) {
       const cache=await imageStore(process.env.OS_CONFORMANCE_PODMAN_DIR);
       const storage=join(state,'storage.conf');
-      await writeFile(storage,`[storage]\ndriver = "overlay"\ngraphroot = ${JSON.stringify(join(cache,'storage'))}\nrunroot = ${JSON.stringify(join(cache,'run'))}\n`);
+      // Only images persist in the cache. Container metadata, Podman's database and mount state
+      // are transient and private to this run, in its own state directory.
+      await writeFile(storage,`[storage]\ndriver = "overlay"\ngraphroot = ${JSON.stringify(join(cache,'storage'))}\nrunroot = ${JSON.stringify(join(state,'podman-run'))}\ntransient_store = true\n`);
       serverEnv.CONTAINERS_STORAGE_CONF=storage;
       podman=await scope.acquire('Podman service',signal=>startPodman(serverEnv,{signal,socket:join(state,'podman.sock'),stdio:['ignore',log.fd,log.fd]}),service=>service.close());
+      await record.addGroup('Podman service',podman.pid);
     }
     if(process.env.OS_CONFORMANCE_COMPILER_IMAGE) {
       const image=compilerImage(process.env.OS_CONFORMANCE_COMPILER_IMAGE);
@@ -144,8 +142,10 @@ export async function os() {
       console.log('Verified prebuilt compiler source and Binaryen bytes: '+image);
     }
     // One proxy: it labels this run's containers and, on Podman, drops the swappiness crun refuses.
-    await scope.acquire('containers',()=>containerLease(serverEnv,join(state,'owned-containers.sock'),{stripMemorySwappiness:!!podman}),lease=>lease.close());
+    const lease=await scope.acquire('containers',()=>containerLease(serverEnv,join(state,'owned-containers.sock'),{stripMemorySwappiness:!!podman}),lease=>lease.close());
+    await record.setContainers({engine:podman?'podman':'docker',label:lease.label});
     server=scope.own('server',()=>start(process.execPath,['scripts/dev.mjs','--config',join(state,'wrangler.toml'),'--local','--ip','127.0.0.1','--port',String(number),'--inspector-port',String(inspectorPort),'--persist-to',join(state,'persist')],{stdio:['ignore',log.fd,log.fd],env:serverEnv}),stop);
+    await record.addGroup('server',server.pid);
     console.log(`Isolated OS at ${url}; temporary state ${state}`);
     const until=Date.now()+900000;
     while (true) {
@@ -196,6 +196,7 @@ export async function os() {
       if (filesystem==='directory-handle') await mountHandle(page,context,source);
       if (filesystem==='local-helper') {
         helper=scope.own('helper',()=>start(join(target,'release/os-local-helper'),['--root',source,'--origin',url,'--write','--execute'],{stdio:['ignore','pipe',log.fd]}),stop);
+        await record.addGroup('helper',helper.pid);
         connection=await helperConnection(helper);
       }
       if (filesystem==='relay') {
@@ -229,9 +230,12 @@ export async function os() {
         await recordReattach(rows,detached,()=>attach('primary'),'remount',persist);
         rows.push(...await probe(page,'remount-observe',primary,alias,cross,creds));
         for(const mode of ['hold-open','hold-cwd']) {
-          const heldResult=await held(page,mode,primary,alias,cross,creds,diagnostics);
+          const caseName=mode==='hold-open'?'unmount-open':'unmount-cwd';
+          const heldResult=await heldProbe(page,{tool,args:[mode,primary,alias,cross,String(creds.uid),String(creds.gid)],caseName,path:primary,diagnostics});
           rows.push(...heldResult.rows);
-          await recordReattach(rows,heldResult.detach,()=>attach('primary'),mode==='hold-open'?'unmount-open':'unmount-cwd',persist);
+          // Never re-attach while the mount state is unknown or a cancelled probe still runs.
+          if(heldResult.failure) {await persist(rows);throw heldResult.failure;}
+          await recordReattach(rows,heldResult.detach,()=>attach('primary'),caseName,persist);
         }
       }
       rows.push(...await probe(page,'unsupported',primary,alias,cross,creds));

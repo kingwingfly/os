@@ -119,21 +119,48 @@ export async function mountOutcome({operation,path,filesystem,name,connection,ad
   }
 }
 
+// A held probe has three phases, each with its own deadline: reaching its barrier, the runner's
+// detach of the mount, and finishing after the runner resumes it. A probe cancelled in any phase
+// must have exited before anything touches the mount again. startHeld, resumeHeld, cancelHeld,
+// heldDetach and heldState run in the browser and must stay self-contained.
 export function startHeld({tool,args,timeout=60000}) {
-  const state=window.conformanceHeld={output:'',stderr:'',input:null,barrier:false,done:false,cancelled:false};
-  state.timer=setTimeout(()=>{state.timedOut=true;state.cancelled=true;},timeout);
+  const state=window.conformanceHeld={output:'',stderr:'',input:null,barrier:false,done:false,cancelled:false,timedOut:null};
+  state.timer=setTimeout(()=>{if(!state.done){state.timedOut='barrier';state.cancelled=true;}},timeout);
+  // The barrier deadline ends once the probe waits at its barrier with a terminal to resume it.
+  const ready=()=>{if(state.barrier&&state.input&&!state.timedOut)clearTimeout(state.timer);};
   state.promise=Promise.resolve().then(()=>window.os.exec([{path:tool,argv:[tool,...args]}],{
     cwd:'/',stdin:null,tty:true,cancelled:()=>state.cancelled,
-    onTty:input=>{state.input=input;},
-    onOutput:(fd,text)=>{if(fd===2)state.stderr+=text;if(fd===1){state.output+=text;state.barrier=state.output.split('\n').some(line=>{try{return typeof JSON.parse(line).barrier==='string';}catch{return false;}});}},
+    onTty:input=>{state.input=input;ready();},
+    onOutput:(fd,text)=>{if(fd===2)state.stderr+=text;if(fd===1){state.output+=text;state.barrier=state.output.split('\n').some(line=>{try{return typeof JSON.parse(line).barrier==='string';}catch{return false;}});ready();}},
   })).then(result=>{state.status=result.status;},error=>{
     const name=error.errno||error.code||error.message;
     state.error=typeof name==='string'&&/^E[A-Z0-9_]+$/.test(name)?name:'UNCLASSIFIED_ERROR';
   }).finally(()=>{state.done=true;clearTimeout(state.timer);});
 }
+export function resumeHeld({timeout=60000}) {
+  const state=window.conformanceHeld;
+  state.timer=setTimeout(()=>{if(!state.done){state.timedOut='completion';state.cancelled=true;}},timeout);
+  state.input.write('continue\n');
+}
+export function cancelHeld({phase}) {
+  const state=window.conformanceHeld;
+  if(!state.done) {state.timedOut??=phase;state.cancelled=true;}
+}
+export async function heldDetach({path,timeout=60000}) {
+  const detach=(async()=>{
+    try {await window.os.unmountLocal(path);return {ok:null};}
+    catch(error) {
+      const name=error.errno||error.code||error.message;
+      return {errno:typeof name==='string'&&/^E[A-Z0-9_]+$/.test(name)?name:'UNCLASSIFIED_ERROR'};
+    }
+  })();
+  let timer;
+  const late=new Promise(resolve=>{timer=setTimeout(()=>resolve({errno:'ETIMEDOUT'}),timeout);});
+  try {return await Promise.race([detach,late]);} finally {clearTimeout(timer);}
+}
 export function heldState() {
   const s=window.conformanceHeld;
-  return {output:s.output,stderr:s.stderr,ready:s.barrier&&!!s.input,done:s.done,status:s.status,error:s.error,timedOut:!!s.timedOut};
+  return {output:s.output,stderr:s.stderr,ready:s.barrier&&!!s.input,done:s.done,status:s.status,error:s.error,timedOut:s.timedOut||null};
 }
 export function heldRows(state,caseName,detach,diagnostics=[]) {
   const rows=[];let invalid=false;
@@ -150,7 +177,38 @@ export function heldRows(state,caseName,detach,diagnostics=[]) {
   }
   if(invalid)rows.push({case:caseName,step:'output',call:'decode probe JSON lines',skipped:'non-JSON or malformed probe output; see evidence.json diagnostics'});
   if(state.error)rows.push({case:caseName,step:'launch',call:'exec(probe)',errno:state.error});
+  else if(state.timedOut==='barrier')rows.push({case:caseName,step:'barrier',call:'wait for probe barrier',errno:'ETIMEDOUT'});
+  else if(state.timedOut==='detach')rows.push({case:caseName,step:'completion',call:'wait(probe)',skipped:'probe cancelled because the detach did not finish'});
   else if(state.timedOut)rows.push({case:caseName,step:'completion',call:'wait(probe)',errno:'ETIMEDOUT'});
   else if(state.status!==0)rows.push({case:caseName,step:'completion',call:'wait(probe)',ok:{status:state.status}});
+  if(!state.done)rows.push({case:caseName,step:'exit',call:'wait for cancelled probe',errno:'ETIMEDOUT'});
   rows.push(detach);return rows;
+}
+// Run one held case through its phases. `failure` is set when the runner must stop before
+// re-attaching: the detach did not finish, or a cancelled probe did not exit. The rows are
+// returned either way, so the caller can save them first.
+export async function heldProbe(page,{tool,args,caseName,path,diagnostics=[],barrierTimeout=60000,detachTimeout=60000,completionTimeout=60000,exitTimeout=30000}) {
+  const reached=async(predicate,timeout)=>{
+    try {await page.waitForFunction(predicate,null,{timeout});return true;}
+    catch(error) {if(error.name==='TimeoutError')return false;throw error;}
+  };
+  await page.evaluate(startHeld,{tool,args,timeout:barrierTimeout});
+  // The browser-side deadline decides the barrier phase; this wait only has to outlast it.
+  await reached(()=>{const s=window.conformanceHeld;return s.done||s.timedOut||(s.barrier&&s.input);},barrierTimeout+exitTimeout);
+  const state=await page.evaluate(heldState);
+  let detach={case:caseName,step:'detach',call:'unmountLocal(mount)'},failure=null,resumed=false;
+  if(!state.ready||state.done||state.timedOut) {
+    detach.skipped=state.timedOut||!state.done?'probe did not reach barrier before deadline':'probe completed before barrier; see preceding results';
+    await page.evaluate(cancelHeld,{phase:'barrier'});
+  } else {
+    detach={...detach,...await page.evaluate(heldDetach,{path,timeout:detachTimeout})};
+    if(detach.errno==='ETIMEDOUT') {
+      await page.evaluate(cancelHeld,{phase:'detach'});
+      failure=new Error(`${caseName}: detach did not finish within ${detachTimeout} ms; the mount state is unknown`);
+    } else {await page.evaluate(resumeHeld,{timeout:completionTimeout});resumed=true;}
+  }
+  const exited=await reached(()=>window.conformanceHeld.done,(resumed?completionTimeout:0)+exitTimeout);
+  if(!exited)failure??=new Error(`${caseName}: cancelled probe did not exit within ${exitTimeout} ms`);
+  const final=await page.evaluate(heldState);
+  return {rows:[{case:caseName,step:'unmount',call:'umount(mount)',skipped:'no separate busy-unmount API; unmountLocal detach is measured below'},...heldRows(final,caseName,detach,diagnostics)],detach,failure};
 }

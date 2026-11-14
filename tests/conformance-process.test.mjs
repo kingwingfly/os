@@ -1,12 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
+import { once, EventEmitter } from 'node:events';
+import { existsSync } from 'node:fs';
 import { mkdtemp, writeFile, readFile, rm, open } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { start, stop } from '../scripts/conformance/process.mjs';
+import { start, stop, ShutdownScope } from '../scripts/conformance/process.mjs';
 import { startPodman, egressImage } from '../scripts/conformance/podman.mjs';
 import { helperConnection } from '../scripts/conformance/fixtures.mjs';
+import { recoverInterrupted, startTime, RunRecord, runPrefix } from '../scripts/conformance/recovery.mjs';
+import { mkdir } from 'node:fs/promises';
 const moduleURL=new URL('../scripts/conformance/process.mjs',import.meta.url).href;
 const exists=pid=>{try {process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}};
 const firstLine=child=>new Promise((resolve,reject)=>{
@@ -78,12 +81,67 @@ test('a second signal interrupts a hung cleanup',async()=>{
   } finally {await stop(child,{timeout:30});}
 });
 
-test('stop does not send termination signals to an absent process group',async()=>{
+// Records every signal stop() sends, without changing what is sent.
+const recording=()=>{const signals=[];return {signals,kill:(...args)=>{signals.push(args);return process.kill(...args);}};};
+const waitFor=async(condition,timeout=5000)=>{const until=Date.now()+timeout;while(!condition()){if(Date.now()>until)throw new Error('condition not reached');await new Promise(r=>setTimeout(r,20));}};
+
+test('a group already empty when its leader exits is never signalled',async()=>{
   const child=start(process.execPath,['-e',''],{detached:true,stdio:'ignore'});
   await once(child,'exit');
-  const original=process.kill;const signals=[];
-  try {process.kill=(...args)=>{signals.push(args);return original(...args);};await stop(child);assert.deepEqual(signals,[[-child.pid,0]]);}
-  finally {process.kill=original;}
+  assert.equal(child.groupGone,true);
+  const {signals,kill}=recording();await stop(child,{kill});assert.deepEqual(signals,[]);
+});
+
+test('a group whose last member exits after the leader is never signalled again',async()=>{
+  // The leader exits at once; its member lives 300 ms, then the group is empty.
+  const script=`require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>{},300)'],{stdio:'ignore'}).unref();`;
+  const child=start(process.execPath,['-e',script],{detached:true,stdio:'ignore'});
+  await once(child,'exit');
+  assert.notEqual(child.groupGone,true,'member should still be running');
+  await waitFor(()=>child.groupGone===true);
+  const {signals,kill}=recording();await stop(child,{kill});assert.deepEqual(signals,[]);
+});
+
+test('a reused group number is never signalled',async()=>{
+  // An unrelated live group stands in for one that has taken over our reaped leader's number.
+  const unrelated=start(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});
+  try {
+    await waitFor(()=>existsSync('/proc/'+unrelated.pid));
+    const ours=Object.assign(new EventEmitter(),{pid:unrelated.pid,processGroup:true,exitCode:0,signalCode:null});
+    const {signals,kill}=recording();await stop(ours,{kill});
+    assert.deepEqual(signals,[]);assert(exists(unrelated.pid),'unrelated group was signalled');
+  } finally {await stop(unrelated,{timeout:30});}
+});
+
+test('escalation is bounded: survivors are reported and dependents retained',async()=>{
+  // A group that never disappears, as with a member in uninterruptible I/O.
+  const stuck=Object.assign(new EventEmitter(),{pid:process.pid,processGroup:true,exitCode:null,signalCode:null});
+  const signals=[];const kill=(...args)=>{signals.push(args[1]);};
+  const error=await stop(stuck,{timeout:20,killTimeout:60,kill}).then(()=>null,error=>error);
+  assert.match(error?.message??'',/process group \d+ still running 60 ms after SIGKILL/);
+  assert.equal(error.retainDependents,true);assert(Array.isArray(error.survivors));
+  assert.equal(signals[1],'SIGTERM');assert(signals.includes('SIGKILL'));
+});
+
+test('a failed stop is retried by the next call, as after a transient EPERM',async()=>{
+  const gone=start(process.execPath,['-e',''],{stdio:'ignore'});await once(gone,'exit');
+  const target=Object.assign(new EventEmitter(),{pid:gone.pid,processGroup:true,exitCode:null,signalCode:null});
+  await assert.rejects(stop(target,{kill:()=>{throw Object.assign(new Error('not permitted'),{code:'EPERM'});}}),{code:'EPERM'});
+  target.exitCode=0;
+  const calls=[];await stop(target,{kill:(...args)=>{calls.push(args);throw Object.assign(new Error('absent'),{code:'ESRCH'});}});
+  assert.equal(calls.length,1);assert.equal(target.groupGone,true);
+});
+
+test('a scope keeps what a process that could not be stopped may still use',async()=>{
+  const scope=new ShutdownScope();const disposed=[];
+  scope.add('image store',()=>{disposed.push('image store');});
+  scope.add('notice',()=>{disposed.push('notice');},{always:true});
+  scope.add('engine',()=>{disposed.push('engine');});
+  scope.add('server',()=>{throw Object.assign(new Error('still running'),{retainDependents:true});});
+  scope.add('browser',()=>{disposed.push('browser');});
+  const errors=await scope.close();
+  assert.deepEqual(disposed,['browser','notice']);
+  assert.deepEqual(errors.map(e=>[e.name,e.error.message]),[['server','still running'],['engine','retained because server is still running'],['image store','retained because server is still running']]);
 });
 
 for(const early of [false,true])test('stop waits for a resistant group member after leader exit '+(early?'before stop':'during stop'),async()=>{
@@ -180,4 +238,47 @@ test('helper startup stderr survives its failed connection announcement in the r
     await assert.rejects(helperConnection(child),/helper exited/);
     assert.match(await readFile(path,'utf8'),/openat2 fixture failure/);
   } finally {await stop(child);await log.close();await rm(dir,{recursive:true,force:true});}
+});
+
+test('recovery stops only the proven groups of runs whose runner has died, once',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-recovery-')),fake=join(dir,'bin');const owned=[];
+  const longLived=()=>{const child=start(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});owned.push(child);return child;};
+  try {
+    // The interrupted run: its runner has exited.
+    const runner=start(process.execPath,['-e','setTimeout(()=>{},100)'],{stdio:'ignore'});
+    await waitFor(()=>startTime(runner.pid));const runnerStart=startTime(runner.pid);await once(runner,'exit');
+    const server=longLived(),impostor=longLived();
+    // A group whose leader has exited while a member still runs.
+    const leader=start(process.execPath,['-e',`require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}).unref();setTimeout(()=>{},100)`],{detached:true,stdio:'ignore'});
+    owned.push(leader);await waitFor(()=>startTime(leader.pid));const leaderStart=startTime(leader.pid);await once(leader,'exit');
+    await waitFor(()=>startTime(server.pid)&&startTime(impostor.pid));
+    const dead=join(dir,runPrefix+'dead');await mkdir(dead);
+    await writeFile(join(dead,'storage.conf'),'[storage]\n');
+    // A process of the run that is in no recorded group, as the browser is: its command line names the state directory.
+    const browser=start(process.execPath,['-e','setInterval(()=>{},1000)','--',join(dead,'profile')],{detached:true,stdio:'ignore'});owned.push(browser);
+    await waitFor(()=>startTime(browser.pid));
+    await writeFile(join(dead,'run.json'),JSON.stringify({runner:{pid:runner.pid,start:runnerStart},containers:{engine:'podman',label:'os.conformance.run=x'},groups:[
+      {name:'server',pid:server.pid,start:startTime(server.pid)},
+      {name:'impostor',pid:impostor.pid,start:'1'},
+      {name:'helper',pid:leader.pid,start:leaderStart},
+    ]}));
+    // A live run (this process) is never touched.
+    const live=join(dir,runPrefix+'live');await mkdir(live);
+    const record=new RunRecord(live);await record.addGroup('server',impostor.pid);
+    // A fake podman lists the containers it removed, and the storage configuration it used.
+    await mkdir(fake);
+    await writeFile(join(fake,'podman'),'#!'+process.execPath+'\nconsole.log("c1\\nc2");require("node:fs").writeFileSync(process.env.CONTAINERS_STORAGE_CONF+".used",process.argv.slice(2).join(" "));\n',{mode:0o755});
+    const recovered=await recoverInterrupted({dir,env:{PATH:fake},timeout:500});
+    assert.equal(recovered.length,1);const [run]=recovered;
+    assert.equal(run.state,dead);assert.deepEqual(run.stopped,['server']);assert.deepEqual(run.survived,[]);
+    assert.deepEqual(run.unverified.sort(),['helper','impostor']);assert.deepEqual(run.containers,{removed:2});
+    assert.deepEqual(run.processes,{stopped:1,remaining:0});await waitFor(()=>!exists(browser.pid));
+    assert.match(await readFile(join(dead,'storage.conf.used'),'utf8'),/rm --all --force --time 0/);
+    await waitFor(()=>!exists(server.pid));
+    assert(exists(impostor.pid),'a group not proved to be the run\'s own was signalled');
+    assert.deepEqual(await recoverInterrupted({dir,env:{PATH:fake},timeout:500}),[]);
+  } finally {
+    for(const child of owned)try {process.kill(-child.pid,'SIGKILL');}catch {}
+    await rm(dir,{recursive:true,force:true});
+  }
 });

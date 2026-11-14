@@ -41,5 +41,5 @@ export async function startPodman(env,{socket,stdio='ignore',signal,startupTimeo
     throw error;
   }
   Object.assign(env,{WRANGLER_DOCKER_BIN:join(scripts,'podman-docker.sh'),WRANGLER_DOCKER_HOST:'unix://'+socket,MINIFLARE_CONTAINER_EGRESS_IMAGE:egress});
-  return {close,socket};
+  return {close,socket,pid:service.pid};
 }

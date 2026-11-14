@@ -4,10 +4,11 @@ import { readFile, mkdtemp, writeFile, mkdir, rm, chmod, symlink, stat, readdir 
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { conformanceConfig, replaceExactly, compilerConfig, compilerImage, isSleep, sameSleep, withCleanup, helperConnection, recordReattach, putFile, mountOutcome, startHeld, heldState, heldRows } from '../scripts/conformance/fixtures.mjs';
+import { conformanceConfig, replaceExactly, compilerConfig, compilerImage, isSleep, sameSleep, withCleanup, helperConnection, recordReattach, putFile, mountOutcome, startHeld, resumeHeld, heldState, heldRows, heldProbe } from '../scripts/conformance/fixtures.mjs';
 import { saveRun } from '../scripts/conformance/results.mjs';
 import { run, revision, ports, generatedFiles, requireProbeSuccess } from '../scripts/conformance/common.mjs';
 import { imageStore } from '../scripts/conformance/storage.mjs';
+import { relocateManifest, workspaceManifest } from '../scripts/conformance/manifest.mjs';
 import { report } from '../scripts/conformance/report.mjs';
 
 test('latency preparation preserves its phase and original errno',()=>{
@@ -201,17 +202,91 @@ test('held probes preserve early EACCES and launch rejection without waiting for
   } finally {globalThis.window=previous;}
 });
 
-test('held barrier and genuine timeout are distinguished, and timeout requests cancellation',async()=>{
+test('the barrier deadline ends at the barrier; resuming starts the completion deadline',async()=>{
   const previous=globalThis.window;
   try {
-    let finish,options;
+    let finish,options;const written=[];
     globalThis.window={os:{exec:(_p,o)=>{options=o;return new Promise(resolve=>{finish=resolve;});}}};
     startHeld({tool:'/probe',args:[],timeout:20});await Promise.resolve();
-    options.onTty({write:()=>{}});options.onOutput(1,'{"barrier":"unmount-open"}\n');assert(heldState().ready);
-    // The finite deadline applies even to a stuck process after a barrier.
-    await new Promise(resolve=>setTimeout(resolve,30));assert(heldState().timedOut);assert(options.cancelled());
-    assert.equal(heldRows(heldState(),'unmount-open',{skipped:'timeout'})[0].errno,'ETIMEDOUT');
+    options.onTty({write:text=>written.push(text)});options.onOutput(1,'{"barrier":"unmount-open"}\n');assert(heldState().ready);
+    // Waiting at the barrier (while the runner detaches) is not the probe's timeout.
+    await new Promise(resolve=>setTimeout(resolve,40));assert.equal(heldState().timedOut,null);assert(!options.cancelled());
+    resumeHeld({timeout:20});assert.deepEqual(written,['continue\n']);
+    await new Promise(resolve=>setTimeout(resolve,40));assert.equal(heldState().timedOut,'completion');assert(options.cancelled());
     finish({status:130});await window.conformanceHeld.promise;
+    assert.equal(heldRows(heldState(),'unmount-open',{skipped:'timeout'}).find(r=>r.step==='completion').errno,'ETIMEDOUT');
+  } finally {globalThis.window=previous;}
+});
+
+// A page whose evaluate runs the browser functions here, against a fake window.os.
+const fakePage={
+  evaluate:async(fn,arg)=>fn(arg),
+  waitForFunction:async(fn,_arg,{timeout})=>{
+    const until=Date.now()+timeout;
+    while(!fn()) {if(Date.now()>until)throw Object.assign(new Error(`Timeout ${timeout}ms exceeded.`),{name:'TimeoutError'});await new Promise(r=>setTimeout(r,5));}
+    return true;
+  },
+};
+// A fake held probe. barrier: print the barrier; resume: finish after `continue`; obeyCancel: exit when cancelled.
+function fakeOs({barrier=true,resume=true,obeyCancel=true,detach=async()=>{}}) {
+  return {unmountLocal:detach,exec:(_p,o)=>new Promise(resolve=>{
+    let input='';
+    o.onTty({write:text=>{input+=text;if(resume&&input.includes('continue')) {o.onOutput(1,JSON.stringify({case:'unmount-open',step:'read',call:'pread(fd) after detach',ok:'hello'})+'\n');resolve({status:0});}}});
+    if(barrier)o.onOutput(1,'{"barrier":"unmount-open"}\n');
+    const poll=setInterval(()=>{if(obeyCancel&&o.cancelled()){clearInterval(poll);resolve({status:130});}},5);
+    poll.unref?.();
+  })};
+}
+const heldCase=extra=>heldProbe(fakePage,{tool:'/probe',args:[],caseName:'unmount-open',path:'/mnt/local/primary',barrierTimeout:50,detachTimeout:50,completionTimeout:50,exitTimeout:100,...extra});
+const step=(rows,name)=>rows.find(r=>r.step===name);
+
+test('held probe: an ordinary run detaches, resumes and needs no failure',async()=>{
+  const previous=globalThis.window;
+  try {
+    globalThis.window={os:fakeOs({})};
+    const {rows,detach,failure}=await heldCase();
+    assert.equal(failure,null);assert.deepEqual(detach.ok,null);
+    assert.equal(step(rows,'read').ok,'hello');assert.equal(step(rows,'completion'),undefined);assert.equal(step(rows,'exit'),undefined);
+  } finally {globalThis.window=previous;}
+});
+
+test('held probe: a missing barrier is a barrier timeout; the cancelled probe exits; no detach',async()=>{
+  const previous=globalThis.window;
+  try {
+    let detached=false;globalThis.window={os:fakeOs({barrier:false,detach:async()=>{detached=true;}})};
+    const {rows,detach,failure}=await heldCase();
+    assert.equal(failure,null);assert(!detached);assert.match(detach.skipped,/did not reach barrier/);
+    assert.equal(step(rows,'barrier').errno,'ETIMEDOUT');assert.equal(step(rows,'exit'),undefined);
+  } finally {globalThis.window=previous;}
+});
+
+test('held probe: a detach that does not finish cancels the probe and stops the fixture',async()=>{
+  const previous=globalThis.window;
+  try {
+    globalThis.window={os:fakeOs({detach:()=>new Promise(()=>{})})};
+    const {rows,detach,failure}=await heldCase();
+    assert.equal(detach.errno,'ETIMEDOUT');assert.match(failure?.message??'',/detach did not finish within 50 ms; the mount state is unknown/);
+    assert.match(step(rows,'completion').skipped,/detach did not finish/);assert.equal(step(rows,'exit'),undefined);
+  } finally {globalThis.window=previous;}
+});
+
+test('held probe: a stalled continuation times out in its own phase; the probe still exits before re-attach',async()=>{
+  const previous=globalThis.window;
+  try {
+    globalThis.window={os:fakeOs({resume:false})};
+    const {rows,detach,failure}=await heldCase();
+    assert.deepEqual(detach.ok,null);assert.equal(failure,null);
+    assert.equal(step(rows,'completion').errno,'ETIMEDOUT');assert.equal(step(rows,'exit'),undefined);
+  } finally {globalThis.window=previous;}
+});
+
+test('held probe: a cancelled probe that never exits is recorded and stops the fixture',async()=>{
+  const previous=globalThis.window;
+  try {
+    globalThis.window={os:fakeOs({resume:false,obeyCancel:false})};
+    const {rows,failure}=await heldCase();
+    assert.match(failure?.message??'',/cancelled probe did not exit within 100 ms/);
+    assert.equal(step(rows,'completion').errno,'ETIMEDOUT');assert.equal(step(rows,'exit').errno,'ETIMEDOUT');
   } finally {globalThis.window=previous;}
 });
 
@@ -238,4 +313,26 @@ test('malformed terminal output retains valid rows, status and contextual diagno
   assert.equal(rows.find(r=>r.step==='completion').ok.status,101);
   assert.deepEqual(diagnostics.map(d=>[d.case,d.stream]),[['unmount-open',2],['unmount-open',1],['unmount-open',1]]);
   assert(!JSON.stringify(rows).includes('/variable/path'));assert(diagnostics[1].text.includes('/variable/path'));
+});
+
+test('copied manifests keep local dependencies but not their own file paths',()=>{
+  const manifest=['[package]','name = "os-abi"','build = "build.rs"','','[lib]','path = "src/lib.rs"','',
+    '[dependencies]','local = { path = "../local", version = "0.1" }','remote = "1"','',
+    "[target.'cfg(unix)'.dependencies]",'unixy = { path = "../unixy" }','',
+    '[dependencies.dotted]','path = "../dotted"','','[dev-dependencies]','absolute = { path = "/opt/absolute" }','',
+    '[patch.crates-io]','patched = { path = "vendor/patched" }'].join('\n');
+  const out=relocateManifest(manifest,'/repo/crates/abi').split('\n');
+  assert(out.includes('path = "src/lib.rs"'));assert(out.includes('build = "build.rs"'));
+  assert(out.includes('local = { path = "/repo/crates/local", version = "0.1" }'));
+  assert(out.includes('unixy = { path = "/repo/crates/unixy" }'));assert(out.includes('path = "/repo/crates/dotted"'));
+  assert(out.includes('absolute = { path = "/opt/absolute" }'));assert(out.includes('patched = { path = "/repo/crates/abi/vendor/patched" }'));
+});
+
+test('the gate workspace is the repository workspace with only its members changed',()=>{
+  const root=['[workspace]','members = [','  "crates/abi",','  "xtask",',']','resolver = "2"','','[workspace.dependencies]','serde = { version = "1" }','tool = { path = "crates/tool" }','','[profile.release]','opt-level = "s"'].join('\n');
+  const out=workspaceManifest(root,'/repo',['abi','audit']);
+  assert.match(out,/^members = \["abi","audit"\]$/m);assert(!out.includes('xtask'));
+  assert(out.includes('tool = { path = "/repo/crates/tool" }'));assert(out.includes('opt-level = "s"'));assert(out.includes('serde = { version = "1" }'));
+  assert.throws(()=>workspaceManifest('[workspace]\nresolver = "2"','/repo',['abi']),/no members list/);
+  assert.throws(()=>workspaceManifest(root+'\ndefault-members = ["xtask"]','/repo',['abi']),/default-members/);
 });

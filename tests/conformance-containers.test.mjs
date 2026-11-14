@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { containerLease, engineTarget } from '../scripts/conformance/containers.mjs';
+import { containerLease, engineTarget, contextEndpoint } from '../scripts/conformance/containers.mjs';
 import { engineProxy, serverName } from '../scripts/conformance/engine-proxy.mjs';
 
 test('proxy explicitly destroys upgraded sockets without replacing Node closeAllConnections',async()=>{
@@ -128,4 +128,56 @@ test('an IPv6 TCP engine is reachable through the proxy',async()=>{
     if(engine.listening)await new Promise(resolve=>engine.close(resolve));
     await rm(dir,{recursive:true,force:true});
   }
+});
+
+// A fake engine command line: `context ls` and `context inspect` print fixed output, or fail.
+async function fakeCli(dir,{ls,inspect},name='docker') {
+  const cli=join(dir,name);
+  await writeFile(cli,'#!'+process.execPath+`
+const [,,command,sub]=process.argv,out=${JSON.stringify({ls,inspect})}[sub==='ls'?'ls':'inspect'];
+if(command!=='context'||out===null){console.error('docker: unknown command');process.exit(1);}
+process.stdout.write(out);
+`,{mode:0o755});
+  return cli;
+}
+// Real shapes: Docker 23+ prints one object per line; Podman 6.1 (and podman-docker) prints an
+// array with Name/URI/Default/ReadWrite; Docker before 23 prints the template text "json".
+const contextCases={
+  'Docker 23+ one object per line':{ls:JSON.stringify({Current:false,DockerEndpoint:'unix:///other.sock',Name:'default'})+'\n'+JSON.stringify({Current:true,DockerEndpoint:'unix://SOCKET',Name:'work'})+'\n',inspect:null},
+  'podman-docker array':{ls:JSON.stringify([{Name:'remote',URI:'ssh://core@host/run/podman.sock',Default:false,ReadWrite:true},{Name:'local',URI:'unix://SOCKET',Default:true,ReadWrite:true}],null,4),inspect:null},
+  'Docker before 23':{ls:'json\njson\n',inspect:JSON.stringify([{Name:'default',Endpoints:{docker:{Host:'unix://SOCKET',SkipTLSVerify:false}}}])},
+};
+for(const [name,outputs] of Object.entries(contextCases))test('engine discovery: '+name,async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-context-')),socket=join(dir,'engine.sock');
+  try {
+    await writeFile(socket,'');
+    const fill=text=>text&&text.replaceAll('SOCKET',socket);
+    const cli=await fakeCli(dir,{ls:fill(outputs.ls),inspect:fill(outputs.inspect)});
+    assert.deepEqual(engineTarget({WRANGLER_DOCKER_BIN:cli}),{socketPath:socket});
+    // An explicit endpoint always wins over discovery.
+    assert.deepEqual(engineTarget({WRANGLER_DOCKER_BIN:cli,DOCKER_HOST:'tcp://127.0.0.1:2375'}),{hostname:'127.0.0.1',port:2375,protocol:'http:'});
+  } finally {await rm(dir,{recursive:true,force:true});}
+});
+test('engine discovery: no current context uses the default socket, and a missing socket is explained',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-context-')),socket=join(dir,'default.sock');
+  try {
+    const cli=await fakeCli(dir,{ls:'[]\n',inspect:'[]\n'});
+    assert.throws(()=>engineTarget({WRANGLER_DOCKER_BIN:cli},{defaultSocket:socket}),/does not exist; start the engine or set DOCKER_HOST/);
+    await writeFile(socket,'');
+    assert.deepEqual(engineTarget({WRANGLER_DOCKER_BIN:cli},{defaultSocket:socket}),{socketPath:socket});
+  } finally {await rm(dir,{recursive:true,force:true});}
+});
+test('engine discovery: a command line without contexts, and remote endpoints, fail with guidance',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'conformance-context-'));
+  try {
+    const old=await fakeCli(dir,{ls:null,inspect:null},'old-docker');
+    assert.throws(()=>engineTarget({WRANGLER_DOCKER_BIN:old}),/cannot determine the container engine endpoint .*set DOCKER_HOST/);
+    const ssh=await fakeCli(dir,{ls:JSON.stringify([{Name:'remote',URI:'ssh://core@host/run/podman.sock',Default:true}]),inspect:null},'ssh-docker');
+    assert.throws(()=>engineTarget({WRANGLER_DOCKER_BIN:ssh}),/unsupported container engine endpoint ssh:\/\/core@host.*set DOCKER_HOST/);
+  } finally {await rm(dir,{recursive:true,force:true});}
+});
+test('context listings parse by shape, not by guessing',()=>{
+  assert.equal(contextEndpoint(''),null);assert.equal(contextEndpoint('[]'),null);
+  assert.equal(contextEndpoint('json\njson'),undefined);assert.equal(contextEndpoint('{"Current":true}'),undefined);
+  assert.equal(contextEndpoint('[{"Name":"a","URI":"unix:///a.sock","Default":false}]'),null);
 });
