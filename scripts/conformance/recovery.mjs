@@ -10,13 +10,10 @@ import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { startTime } from '../process.mjs';
 export const runPrefix='os-conformance-os-';
 
-// A process's start time since boot, from /proc; with the PID it identifies one process.
-export function startTime(pid) {
-  try {const stat=readFileSync(`/proc/${pid}/stat`,'utf8');return stat.slice(stat.lastIndexOf(')')+2).split(' ')[19];}
-  catch {return null;}
-}
+export { startTime };
 const sameProcess=entry=>!!entry?.pid&&!!entry.start&&startTime(entry.pid)===entry.start;
 
 export class RunRecord {

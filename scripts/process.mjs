@@ -1,10 +1,15 @@
-// Process ownership for the conformance runners: owned process groups and one cleanup scope.
-// The runners are Linux-only; process facts come from /proc.
+// Process ownership for `npm run dev` and the conformance runners: owned process groups and one
+// cleanup scope. Both are Linux-only here; process facts come from /proc.
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 const stopping=new WeakMap();
 const groupPoll=250;
 
+// A process's start time since boot; with the PID it identifies one process.
+export function startTime(pid) {
+  try {const stat=readFileSync(`/proc/${pid}/stat`,'utf8');return stat.slice(stat.lastIndexOf(')')+2).split(' ')[19];}
+  catch {return null;}
+}
 // Whether any process (or thread) currently has this ID.
 const idInUse=id=>existsSync('/proc/'+id);
 // Live members of process group `pgid`, for diagnostics.
@@ -93,12 +98,25 @@ export function stop(child,{timeout=5000,killTimeout=5000,kill=process.kill}={})
 // When a disposal fails with `retainDependents` (an owned process that could not be
 // stopped), everything acquired before it is kept, since that process may still use it;
 // only actions registered with {always:true}, such as notices, still run.
+//
+// A signal starts cleanup and a second signal exits at once. One request can arrive twice:
+// under `npm run`, a terminal Ctrl-C (or a SIGTERM to the whole process group) reaches this
+// process directly and again through npm, which relays SIGINT and SIGTERM to its child. An
+// identical signal within `duplicateWindow` ms of the one that started cleanup is that copy.
+// `signal` names the signal that started cleanup, so disposals can pass it on.
+export const signalCodes={SIGINT:130,SIGTERM:143,SIGHUP:129};
 export class ShutdownScope {
-  constructor() {
-    this.actions=[];this.closing=false;this.controller=new AbortController();
+  constructor({duplicateWindow=500}={}) {
+    this.actions=[];this.closing=false;this.controller=new AbortController();this.signal=null;
+    let last=null;
+    const onSignal=signal=>()=>{
+      const now=Date.now();
+      if(last&&last.signal===signal&&now-last.at<duplicateWindow)return;
+      last={signal,at:now};this.signal??=signal;
+      this.terminate(new Error('interrupted by '+signal),signalCodes[signal],true);
+    };
     this.handlers=new Map([
-      ['SIGINT',()=>this.terminate(new Error('interrupted by SIGINT'),130,true)],
-      ['SIGTERM',()=>this.terminate(new Error('interrupted by SIGTERM'),143,true)],
+      ...Object.keys(signalCodes).map(signal=>[signal,onSignal(signal)]),
       ['uncaughtException',error=>this.terminate(error,1)],
       ['unhandledRejection',error=>this.terminate(error,1)],
     ]);
@@ -140,7 +158,7 @@ export class ShutdownScope {
       return;
     }
     this.fatal=true;
-    console.error(error instanceof Error?error.stack:String(error));
+    console.error(signal?error.message:error instanceof Error?error.stack:String(error));
     await this.close();process.exit(code);
   }
 }

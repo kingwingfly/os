@@ -10,9 +10,9 @@
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { has } from './podman.mjs';
 
 const scripts = dirname(fileURLToPath(import.meta.url));
-const has = command => spawnSync('sh', ['-c', `command -v ${command}`], { stdio: 'ignore' }).status === 0;
 // Run `command`, stopping here, with its status, if it fails.
 function run(command, args, env = process.env) {
   const { status, signal, error } = spawnSync(command, args, { stdio: 'inherit', env });

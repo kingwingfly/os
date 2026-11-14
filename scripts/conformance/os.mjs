@@ -3,9 +3,9 @@ import { mkdtemp, mkdir, readFile, writeFile, rm, open } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
-import { needsPodman, startPodman } from './podman.mjs';
+import { needsPodman, egressImage, startPodman, configureWrangler } from '../podman.mjs';
 import { conformanceConfig, compilerConfig, compilerImage, isSleep, sameSleep, withCleanup, mountHandle, browserOptions, directoryProfile, helperConnection, recordReattach, putFile, mountOutcome, heldProbe } from './fixtures.mjs';
-import { ShutdownScope } from './process.mjs';
+import { ShutdownScope } from '../process.mjs';
 import { containerLease } from './containers.mjs';
 import { imageStore } from './storage.mjs';
 import { RunRecord, recoverInterrupted, runPrefix } from './recovery.mjs';
@@ -125,8 +125,11 @@ export async function os() {
       // are transient and private to this run, in its own state directory.
       await writeFile(storage,`[storage]\ndriver = "overlay"\ngraphroot = ${JSON.stringify(join(cache,'storage'))}\nrunroot = ${JSON.stringify(join(state,'podman-run'))}\ntransient_store = true\n`);
       serverEnv.CONTAINERS_STORAGE_CONF=storage;
-      podman=await scope.acquire('Podman service',signal=>startPodman(serverEnv,{signal,socket:join(state,'podman.sock'),stdio:['ignore',log.fd,log.fd]}),service=>service.close());
+      // Resolve the egress image before starting anything; the run fails if it cannot.
+      const egress=egressImage(serverEnv,{strict:true});
+      podman=await scope.acquire('Podman service',signal=>startPodman(serverEnv,{signal,socket:join(state,'podman.sock'),output:log.fd}),service=>service.close());
       await record.addGroup('Podman service',podman.pid);
+      configureWrangler(serverEnv,{host:podman.socket,egress});
     }
     if(process.env.OS_CONFORMANCE_COMPILER_IMAGE) {
       const image=compilerImage(process.env.OS_CONFORMANCE_COMPILER_IMAGE);

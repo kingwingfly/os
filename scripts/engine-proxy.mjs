@@ -1,8 +1,9 @@
-// The run's Docker API socket, in front of the engine Wrangler uses: Docker, or the run's own
-// Podman service. It labels every container it creates with the run's identity, so cleanup can
-// remove exactly those. For Podman it also drops the memory swappiness workerd asks for, which
-// crun refuses on cgroup v2 (scripts/podman-proxy.mjs does the same for `npm run dev`; sharing
-// the two is a follow-up in #67).
+// A Docker API socket in front of the engine Wrangler uses, for `npm run dev` and the conformance
+// harness. For Podman it drops the memory swappiness workerd asks for in every container it
+// creates: Docker ignores that on cgroup v2, but crun refuses it ("cannot set memory swappiness
+// with cgroupv2") wherever it applies cgroups, as in a systemd user session, so no container
+// would start. The harness also labels every container it creates with the run's identity, so
+// cleanup can remove exactly those.
 import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';

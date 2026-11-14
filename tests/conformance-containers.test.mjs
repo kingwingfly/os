@@ -7,7 +7,7 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { containerLease, engineTarget, contextEndpoint } from '../scripts/conformance/containers.mjs';
-import { engineProxy, serverName } from '../scripts/conformance/engine-proxy.mjs';
+import { engineProxy, serverName } from '../scripts/engine-proxy.mjs';
 
 test('proxy explicitly destroys upgraded sockets without replacing Node closeAllConnections',async()=>{
   const dir=await mkdtemp(join(tmpdir(),'conformance-upgrade-')),upstream=http.createServer(),sockets=[];let proxy,client;
