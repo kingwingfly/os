@@ -17,6 +17,10 @@ struct Host {
     next: Rc<Cell<u64>>,
     actor: Rc<RefCell<(String, Option<u32>)>>,
     data: Rc<RefCell<Vec<DataRequest>>>,
+    requests: Rc<RefCell<Vec<wire::Request>>>,
+    failure: Rc<Cell<Option<Errno>>>,
+    denied: Rc<RefCell<Vec<String>>>,
+    granted: Rc<Cell<bool>>,
 }
 fn root() -> Handle {
     Handle {
@@ -46,6 +50,7 @@ impl Transport for Host {
     fn request(&self, request: wire::Request) -> BoxFuture<'_, Value> {
         Box::pin(async move {
             self.calls.borrow_mut().push(request.call.clone());
+            self.requests.borrow_mut().push(request.clone());
             std::future::poll_fn(|_| {
                 if self.pending.get() {
                     std::task::Poll::Pending
@@ -54,6 +59,12 @@ impl Transport for Host {
                 }
             })
             .await;
+            if let Some(error) = self.failure.get() {
+                return Err(error);
+            }
+            if self.denied.borrow().contains(&request.credential) {
+                return Err(Errno::EACCES);
+            }
             Ok(match request.call {
                 Call::Connect => json!(wire::Connected {
                     version: 2,
@@ -66,7 +77,7 @@ impl Transport for Host {
                     lease_seconds: 120
                 }),
                 Call::Open { .. } => json!(open()),
-                Call::Lock { .. } => json!(false),
+                Call::Lock { .. } => json!(self.granted.get()),
                 _ => Value::Null,
             })
         })
@@ -177,6 +188,191 @@ fn data_calls_snapshot_the_current_process_before_waiting_for_cleanup() {
         ("another process", Some(43))
     );
     assert_eq!(sent[0].open, sent[1].open);
+}
+#[test]
+fn open_control_calls_authenticate_the_actor_separately_from_the_opener() {
+    let host = Host::default();
+    let fs = now_or_never(CloudFs::connect(host.clone(), "opener".into()))
+        .unwrap()
+        .unwrap();
+    let mut cred = Cred::root();
+    cred.token = Some("opener".into());
+    let opened = ready(fs.open(&cred, &root(), OpenOptions::new().read(true).write(true))).unwrap();
+    *host.denied.borrow_mut() = vec!["revoked".into(), "cloud denied".into()];
+    host.granted.set(true);
+    for token in ["revoked", "cloud denied", "allowed"] {
+        *host.actor.borrow_mut() = (token.into(), Some(42));
+        let expected = if token == "allowed" {
+            Ok(())
+        } else {
+            Err(Errno::EACCES)
+        };
+        assert_eq!(ready(fs.set_len(&opened, 0)), expected);
+        assert_eq!(ready(fs.sync_all(&opened)), expected);
+        assert_eq!(ready(fs.sync_data(&opened)), expected);
+        assert_eq!(
+            ready(fs.try_lock(
+                &opened,
+                LockFamily::Posix,
+                LockKind::Exclusive,
+                LockRange::WHOLE
+            )),
+            expected
+        );
+        assert_eq!(
+            ready(fs.lock(
+                &opened,
+                LockFamily::Posix,
+                LockKind::Exclusive,
+                LockRange::WHOLE
+            )),
+            expected
+        );
+        assert_eq!(
+            ready(fs.unlock(&opened, LockFamily::Posix, LockRange::WHOLE)),
+            expected
+        );
+        assert_eq!(
+            ready(fs.test_lock(&opened, LockKind::Exclusive, LockRange::WHOLE)),
+            expected.map(|()| None)
+        );
+    }
+    // Cleanup remains possible after a calling task is gone; it cannot acquire a new grant.
+    assert!(
+        host.requests
+            .borrow()
+            .iter()
+            .filter(|r| matches!(r.call, Call::CancelLock { .. }))
+            .all(|r| r.credential == "opener")
+    );
+    let requests = host.requests.borrow();
+    let acknowledged = requests
+        .iter()
+        .find(|r| matches!(r.call, Call::AckLock { .. }))
+        .unwrap();
+    assert_eq!(acknowledged.credential, "allowed");
+}
+#[test]
+fn open_control_calls_snapshot_the_actor_before_draining_older_cleanup() {
+    use std::task::{Context, Poll, Waker};
+    for locking in [false, true] {
+        let host = Host::default();
+        let fs = now_or_never(CloudFs::connect(host.clone(), "opener".into()))
+            .unwrap()
+            .unwrap();
+        let mut cred = Cred::root();
+        cred.token = Some("opener".into());
+        let options = *OpenOptions::new().read(true).write(true);
+        let opened = ready(fs.open(&cred, &root(), &options)).unwrap();
+        host.pending.set(true);
+        assert!(now_or_never(fs.open(&cred, &root(), &options)).is_none());
+        *host.actor.borrow_mut() = ("caller".into(), Some(42));
+        let mut operation = if locking {
+            fs.lock(
+                &opened,
+                LockFamily::Posix,
+                LockKind::Exclusive,
+                LockRange::WHOLE,
+            )
+        } else {
+            fs.set_len(&opened, 0)
+        };
+        assert!(matches!(
+            operation
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        *host.actor.borrow_mut() = ("different task".into(), Some(43));
+        host.pending.set(false);
+        host.granted.set(true);
+        assert_eq!(ready(operation), Ok(()));
+        for request in host.requests.borrow().iter().filter(|r| {
+            matches!(
+                r.call,
+                Call::SetLen { .. } | Call::Lock { .. } | Call::AckLock { .. }
+            )
+        }) {
+            assert_eq!(request.credential, "caller");
+        }
+    }
+}
+#[test]
+fn failed_older_cleanup_cannot_lose_a_close_or_release_queue_entry() {
+    for explicit_close in [false, true] {
+        let host = Host::default();
+        let fs = Rc::new(
+            now_or_never(CloudFs::connect(host.clone(), "opener".into()))
+                .unwrap()
+                .unwrap(),
+        );
+        let mut cred = Cred::root();
+        cred.token = Some("opener".into());
+        let options = *OpenOptions::new().read(true).write(true);
+        let opened = ready(fs.open(&cred, &root(), &options)).unwrap();
+        let queue = ReleaseQueue::new();
+        let file = FileRef::new(
+            fs.clone(),
+            opened.clone(),
+            Handle {
+                node: opened.node,
+                ..root()
+            },
+            cred.clone(),
+            &options,
+            &queue,
+        );
+        host.pending.set(true);
+        assert!(now_or_never(fs.open(&cred, &root(), &options)).is_none());
+        host.pending.set(false);
+        host.failure.set(Some(Errno::EIO));
+        if explicit_close {
+            assert_eq!(now_or_never(file.close()), Some(Err(Errno::EIO)));
+        } else {
+            drop(file);
+            assert_eq!(now_or_never(queue.flush()), Some(Err(Errno::EIO)));
+        }
+        assert!(queue.is_empty());
+        assert_eq!(fs.pending_cancellations(), 2);
+        host.failure.set(None);
+        assert_eq!(now_or_never(fs.drain()), Some(Ok(())));
+        assert_eq!(fs.pending_cancellations(), 0);
+        assert_eq!(
+            host.calls
+                .borrow()
+                .iter()
+                .filter(|c| matches!(c, Call::Release { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(ready(fs.sync_all(&opened)), Err(Errno::EBADF));
+    }
+}
+#[test]
+fn cancelling_a_release_while_draining_older_cleanup_keeps_both_obligations() {
+    let host = Host::default();
+    let fs = now_or_never(CloudFs::connect(host.clone(), "opener".into()))
+        .unwrap()
+        .unwrap();
+    let mut cred = Cred::root();
+    cred.token = Some("opener".into());
+    let options = *OpenOptions::new().read(true).write(true);
+    let opened = ready(fs.open(&cred, &root(), &options)).unwrap();
+    host.pending.set(true);
+    assert!(now_or_never(fs.open(&cred, &root(), &options)).is_none());
+    assert!(now_or_never(fs.release(&opened)).is_none());
+    assert_eq!(fs.pending_cancellations(), 2);
+    host.pending.set(false);
+    assert_eq!(now_or_never(fs.drain()), Some(Ok(())));
+    assert_eq!(fs.pending_cancellations(), 0);
+    assert_eq!(
+        host.calls
+            .borrow()
+            .iter()
+            .filter(|c| matches!(c, Call::Release { .. }))
+            .count(),
+        1
+    );
 }
 fn held(owner: u64, start: u64, end: Option<u64>) -> Held {
     Held {

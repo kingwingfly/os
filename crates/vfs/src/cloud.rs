@@ -110,7 +110,7 @@ impl<T: Transport> CloudFs<T> {
             .await?;
         serde_json::from_value(value).map_err(|_| Errno::EIO)
     }
-    fn token(&self, open: &OpenRef) -> Result<String> {
+    fn opener(&self, open: &OpenRef) -> Result<String> {
         if open.fs != self.connected.root.fs {
             return Err(Errno::EACCES);
         }
@@ -122,12 +122,13 @@ impl<T: Transport> CloudFs<T> {
         Ok(token.clone())
     }
     async fn opened<R: DeserializeOwned>(&self, open: &OpenRef, call: Call) -> Result<R> {
+        self.opener(open)?;
+        let (token, _) = self.transport.caller()?;
         self.drain().await?;
-        let token = self.token(open)?;
         serde_json::from_value(self.send(&token, call).await?).map_err(|_| Errno::EIO)
     }
     fn data(&self, open: &OpenRef, operation: DataOperation) -> Result<DataRequest> {
-        self.token(open)?;
+        self.opener(open)?;
         let (credential, pid) = self.transport.caller()?;
         Ok(DataRequest {
             version: wire::VERSION,
@@ -617,13 +618,15 @@ impl<T: Transport> Filesystem for CloudFs<T> {
         range: LockRange,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            let opener = self.opener(open)?;
+            let (token, _) = self.transport.caller()?;
             self.drain().await?;
-            let token = self.token(open)?;
             let ticket = self.transport.ticket();
             let mut guard = Cancel {
                 fs: self,
                 pending: Some(Pending {
-                    credential: token.clone(),
+                    // Cleanup belongs to the retained grant even if the actor goes away.
+                    credential: opener,
                     call: Call::CancelLock {
                         open: open.clone(),
                         ticket: ticket.clone(),
@@ -699,8 +702,7 @@ impl<T: Transport> Filesystem for CloudFs<T> {
     }
     fn release<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            self.drain().await?;
-            let token = self.token(open)?;
+            let token = self.opener(open)?;
             let mut guard = Cancel {
                 fs: self,
                 pending: Some(Pending {
@@ -708,6 +710,8 @@ impl<T: Transport> Filesystem for CloudFs<T> {
                     call: Call::Release { open: open.clone() },
                 }),
             };
+            // Retain this release before older cleanup can fail or be cancelled.
+            self.drain().await?;
             self.send(&token, Call::Release { open: open.clone() })
                 .await?;
             self.opens.borrow_mut().remove(&open.id);

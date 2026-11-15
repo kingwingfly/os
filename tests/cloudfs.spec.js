@@ -27,7 +27,7 @@ async function connection(request,{token,pid}) {
   return c;
 }
 async function setup(request) {
-  await call(request,'getcreds');expect((await api(request,'login',{data:{username:'root',password}})).ok()).toBe(true);
+  await call(request,'getcreds');expect((await api(request,'login',{headers:{'CF-Connecting-IP':'cloudfs-'+randomUUID()},data:{username:'root',password}})).ok()).toBe(true);
   const p=await admit(request);const c=await connection(request,p);
   const dir=await c.call('mkdir',{dir:c.root,name:'vfs-'+randomUUID(),mode:0o777});return {c,dir:dir.handle,p};
 }
@@ -104,6 +104,38 @@ test('revoking an opener releases its inode and locks even when another credenti
   await rpc(request,observer.token,c.session,{sync:{open,data_only:false}},'EACCES');
   await rpc(request,observer.token,c.session,{metadata:{handle:entry.handle}},'ESTALE');
   await rpc(request,observer.token,c.session,'disconnect');
+});
+test('open control calls reject revoked and cloud-denied callers while the opener remains valid',async({request})=>{
+  const {c,dir}=await setup(request);const [entry,open]=await c.create(dir,'caller');await c.write(open,'keep data');
+  const peer=await c.open(entry.handle);const range={start:0,end:null};const lock={open,family:'posix',kind:'exclusive',range};
+  await c.call('try_lock',lock);
+  const revoked=await admit(request);await call(request,{kill:{pid:String(revoked.pid),signal:9}});
+  const denied=await call(request,{execve:{path:'/mnt/local/cloudfs/probe',argv:['probe'],cwd:'/',runtime:'resources-v1',local:{digest:'a'.repeat(64),size:8,cloud:false}}});
+  const actor=await admit(request);
+  try {
+    for(const caller of [revoked,denied]) {
+      for(const operation of [
+        {set_len:{open,size:0}},
+        {sync:{open,data_only:false}},
+        {sync:{open,data_only:true}},
+        {try_lock:lock},
+        {lock:{...lock,ticket:randomUUID()}},
+        {unlock:{open,family:'posix',range}},
+        {test_lock:{open,kind:'exclusive',range}},
+      ])await rpc(request,caller.token,c.session,operation,'EACCES');
+    }
+    expect((await c.read(open)).toString()).toBe('keep data');
+    expect((await c.call('test_lock',{open:peer,kind:'exclusive',range})).owner).toBe(open.id);
+    await rpc(request,actor.token,c.session,{set_len:{open,size:4}});expect((await c.read(open)).toString()).toBe('keep');
+    await rpc(request,actor.token,c.session,{unlock:{open,family:'posix',range}});
+    expect(await c.call('test_lock',{open:peer,kind:'exclusive',range})).toBeNull();
+    const ticket=randomUUID();expect(await rpc(request,actor.token,c.session,{lock:{...lock,ticket}})).toBe(true);
+    await rpc(request,actor.token,c.session,{ack_lock:{open,ticket}});
+    expect((await c.call('test_lock',{open:peer,kind:'exclusive',range})).owner).toBe(open.id);
+  } finally {
+    await c.call('disconnect');
+    for(const process of [denied,actor])await sys(request,[{exit:{pid:process.pid,proc:process.token,status:0}},{wait:{pid:String(process.pid),proc:process.token}}],{}, {'X-Registry':'1'});
+  }
 });
 test('lease expiry releases references while an independently renewed session remains usable',async({request})=>{
   test.setTimeout(180000);
