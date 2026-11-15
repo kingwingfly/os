@@ -238,8 +238,20 @@ pub fn writer(db: &Db, device: &str) -> Option<(String, u32)> {
 /// What unlinking the device at `path` does: as its account or root, it hangs it up; another
 /// may not (EACCES, or EPERM for an account signed in). None for no device.
 pub fn unlink(db: &mut Db, who: &Identity, path: &str) -> Option<Result<()>> {
-    driver(parent(path))?;
     let device = db.device(path)?;
+    if driver(parent(path)).is_none() {
+        if who.id != 0
+            && !db
+                .node(parent(path))
+                .is_some_and(|dir| kernel::permission(who, &dir, WRITE | EXEC))
+        {
+            return Some(Err(Errno::EACCES.into()));
+        }
+        return Some(Err(Error::because(
+            Errno::EPERM,
+            "a device stays where its driver made it",
+        )));
+    }
     if device.owner != who.id && who.id != 0 {
         return Some(Err(Error::because(
             if is_guest_id(who.id) {

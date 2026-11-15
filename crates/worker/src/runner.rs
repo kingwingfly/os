@@ -620,7 +620,7 @@ impl JobRunner {
             };
             let mut init = RequestInit::new();
             init.with_method(Method::Put);
-            init.with_body(Some(streams::fixed_length(stream, size as f64).into()));
+            init.with_body(Some(streams::fixed_length(stream, size).into()));
             let answer = fetcher
                 .fetch(format!("http://jobs{url}"), Some(init))
                 .await?;
@@ -688,7 +688,7 @@ impl JobRunner {
         let ResponseBody::Stream(stream) = response.body() else {
             return Err(Error::RustError("the job container sent no content".into()));
         };
-        let data = Data::ReadableStream(streams::fixed_length(stream, length as f64));
+        let data = Data::ReadableStream(streams::fixed_length(stream, length));
         let bucket = self.env.bucket("FILES")?;
         let mut put = bucket.put(key, data);
         if let Some(bytes) = sha256.and_then(decode_hex) {

@@ -24,16 +24,19 @@ pub struct Displaced {
     pub ticket: String,
     pub lock: Held,
 }
-/// How many cancelled tickets an inode remembers; the oldest are forgotten first.
-pub const CANCELLED_MAX: usize = 1024;
+/// How many acknowledged tickets an owner keeps rollback history for before committing the
+/// oldest; sequential driver calls drain deferred cancellations before acquiring again.
+pub const ACKNOWLEDGED_MAX: usize = 1024;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Locks {
     #[serde(default)]
-    pub cancelled: Vec<(u64, String)>,
+    pub cancelled: BTreeSet<(u64, String)>,
     pub held: Vec<Held>,
     pub waits: Vec<Wait>,
     #[serde(default)]
     pub displaced: Vec<Displaced>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acknowledged: Vec<(u64, String)>,
 }
 /// What `piece` keeps of an owner and family's locks once `range` is taken out of them.
 fn cut(piece: &Held, owner: u64, family: LockFamily, range: LockRange) -> Vec<LockRange> {
@@ -98,7 +101,7 @@ impl Locks {
             || self
                 .waits
                 .iter()
-                .take_while(|w| Some(w.ticket.as_str()) != ticket)
+                .take_while(|w| ticket.is_none_or(|t| w.lock.owner != lock.owner || w.ticket != t))
                 .any(|w| !w.granted && self.queue_blocks(&w.lock, lock))
     }
     fn queue_blocks(&self, earlier: &Held, lock: &Held) -> bool {
@@ -111,7 +114,7 @@ impl Locks {
                 .iter()
                 .any(|held| held.owner == lock.owner && held.conflicts(earlier))
     }
-    pub fn carve(&mut self, owner: u64, family: LockFamily, range: LockRange) {
+    fn cut_held(&mut self, owner: u64, family: LockFamily, range: LockRange) {
         self.held = std::mem::take(&mut self.held)
             .into_iter()
             .flat_map(|l| {
@@ -120,8 +123,11 @@ impl Locks {
                     .map(move |range| Held { range, ..l.clone() })
             })
             .collect();
-        // Whatever replaces these bytes now also replaces what a late cancellation of an
-        // earlier request would have restored there.
+    }
+    pub fn carve(&mut self, owner: u64, family: LockFamily, range: LockRange) {
+        self.cut_held(owner, family, range);
+        // Non-cancellable replacements (try_lock, unlock, flock conversion) permanently
+        // supersede whatever an earlier ticketed request would have restored on these bytes.
         self.displaced = std::mem::take(&mut self.displaced)
             .into_iter()
             .flat_map(|d| {
@@ -136,27 +142,9 @@ impl Locks {
                     })
             })
             .collect();
+        self.prune_acknowledged(owner);
     }
-    fn grant(&mut self, mut lock: Held) {
-        let replaced: Vec<Held> = match lock.ticket {
-            Some(_) => self
-                .held
-                .iter()
-                .filter(|l| l.owner == lock.owner && l.family == lock.family)
-                .filter_map(|l| {
-                    intersection(l.range, lock.range).map(|range| Held { range, ..l.clone() })
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-        self.carve(lock.owner, lock.family, lock.range);
-        if let Some(ticket) = &lock.ticket {
-            self.displaced
-                .extend(replaced.into_iter().map(|lock| Displaced {
-                    ticket: ticket.clone(),
-                    lock,
-                }));
-        }
+    fn insert_held(&mut self, mut lock: Held) {
         // Merge only pieces with the same cancellation ownership. A late cancellation
         // must remove that request's surviving pieces without unlocking its neighbors.
         loop {
@@ -178,6 +166,27 @@ impl Locks {
         }
         self.held.push(lock);
     }
+    fn grant(&mut self, lock: Held) {
+        if let Some(ticket) = &lock.ticket {
+            let replaced: Vec<Held> = self
+                .held
+                .iter()
+                .filter(|l| l.owner == lock.owner && l.family == lock.family)
+                .filter_map(|l| {
+                    intersection(l.range, lock.range).map(|range| Held { range, ..l.clone() })
+                })
+                .collect();
+            self.cut_held(lock.owner, lock.family, lock.range);
+            self.displaced
+                .extend(replaced.into_iter().map(|lock| Displaced {
+                    ticket: ticket.clone(),
+                    lock,
+                }));
+        } else {
+            self.carve(lock.owner, lock.family, lock.range);
+        }
+        self.insert_held(lock);
+    }
     pub fn wake(&mut self) {
         for index in 0..self.waits.len() {
             let w = self.waits[index].clone();
@@ -189,19 +198,18 @@ impl Locks {
     }
     pub fn acquire(&mut self, mut lock: Held, ticket: Option<&str>, all: &[Locks]) -> Result<bool> {
         if let Some(ticket) = ticket {
-            if self
-                .cancelled
-                .iter()
-                .any(|(owner, t)| *owner == lock.owner && t == ticket)
-            {
-                return Err(Errno::ECANCELED);
-            }
             if ticket.is_empty() || ticket.len() > 128 {
                 return Err(Errno::EINVAL);
             }
-            if let Some(w) = self.waits.iter().find(|w| w.ticket == ticket) {
-                if w.lock.owner != lock.owner
-                    || w.lock.family != lock.family
+            if self.cancelled.contains(&(lock.owner, ticket.into())) {
+                return Err(Errno::ECANCELED);
+            }
+            if let Some(w) = self
+                .waits
+                .iter()
+                .find(|w| w.lock.owner == lock.owner && w.ticket == ticket)
+            {
+                if w.lock.family != lock.family
                     || w.lock.kind != lock.kind
                     || w.lock.range != lock.range
                 {
@@ -287,46 +295,156 @@ impl Locks {
         }
         Ok(!blocked)
     }
+    fn commit_ticket(&mut self, owner: u64, ticket: &str) {
+        self.displaced
+            .retain(|d| d.lock.owner != owner || d.ticket != ticket);
+        for d in &mut self.displaced {
+            if d.lock.owner == owner && d.lock.ticket.as_deref() == Some(ticket) {
+                d.lock.ticket = None;
+            }
+        }
+        let (committed, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|l| l.owner == owner && l.ticket.as_deref() == Some(ticket));
+        self.held = keep;
+        for mut lock in committed {
+            lock.ticket = None;
+            self.insert_held(lock);
+        }
+    }
+    fn is_tracked(&self, owner: u64, ticket: &str) -> bool {
+        self.held
+            .iter()
+            .any(|l| l.owner == owner && l.ticket.as_deref() == Some(ticket))
+            || self.displaced.iter().any(|d| {
+                d.lock.owner == owner
+                    && (d.ticket == ticket || d.lock.ticket.as_deref() == Some(ticket))
+            })
+    }
+    fn prune_acknowledged(&mut self, owner: u64) {
+        let stale: BTreeSet<String> = self
+            .acknowledged
+            .iter()
+            .filter(|(o, t)| *o == owner && !self.is_tracked(owner, t))
+            .map(|(_, t)| t.clone())
+            .collect();
+        if !stale.is_empty() {
+            self.acknowledged
+                .retain(|(o, t)| *o != owner || !stale.contains(t));
+        }
+    }
     pub fn acknowledge(&mut self, owner: u64, ticket: &str) {
         self.waits
             .retain(|w| w.lock.owner != owner || w.ticket != ticket || !w.granted);
+        if self.is_tracked(owner, ticket)
+            && !self
+                .acknowledged
+                .iter()
+                .any(|(o, t)| *o == owner && t == ticket)
+        {
+            self.acknowledged.push((owner, ticket.into()));
+            while self
+                .acknowledged
+                .iter()
+                .filter(|(o, _)| *o == owner)
+                .count()
+                > ACKNOWLEDGED_MAX
+            {
+                let pos = self
+                    .acknowledged
+                    .iter()
+                    .position(|(o, _)| *o == owner)
+                    .expect("counted above");
+                let (_, oldest) = self.acknowledged.remove(pos);
+                self.commit_ticket(owner, &oldest);
+            }
+        }
     }
     pub fn cancel(&mut self, owner: u64, ticket: &str) {
-        if !self
-            .cancelled
-            .iter()
-            .any(|(o, t)| *o == owner && t == ticket)
-        {
-            if self.cancelled.len() >= CANCELLED_MAX {
-                self.cancelled.remove(0);
-            }
-            self.cancelled.push((owner, ticket.into()));
+        if ticket.is_empty() || ticket.len() > 128 {
+            return;
         }
+        self.cancelled.insert((owner, ticket.into()));
+        self.acknowledged
+            .retain(|(o, t)| *o != owner || t != ticket);
         self.waits
             .retain(|w| w.lock.owner != owner || w.ticket != ticket);
-        let granted = self
-            .held
-            .iter()
-            .find(|l| l.owner == owner && l.ticket.as_deref() == Some(ticket))
-            .cloned();
-        self.held
-            .retain(|l| l.owner != owner || l.ticket.as_deref() != Some(ticket));
-        // Undo what the cancelled grant replaced of the owner's own locks, where nothing has
-        // replaced it since (`carve` trims these records). Another owner may meanwhile hold a
-        // lock the granted kind allowed (after a downgrade): keep the granted kind there.
-        let (restore, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.displaced)
+        let (active, keep_held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
             .into_iter()
-            .partition(|d| d.lock.owner == owner && d.ticket == ticket);
-        self.displaced = keep;
-        for Displaced { lock, .. } in restore {
-            if !self.held.iter().any(|l| l.conflicts(&lock)) {
-                self.held.push(lock);
-            } else if let Some(granted) = &granted {
-                self.held.push(Held {
-                    range: lock.range,
-                    ticket: None,
-                    ..granted.clone()
-                });
+            .partition(|l| l.owner == owner && l.ticket.as_deref() == Some(ticket));
+        self.held = keep_held;
+        let (own_displaced, other_displaced): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.displaced)
+                .into_iter()
+                .partition(|d| d.lock.owner == owner && d.ticket == ticket);
+        // If a later ticketed lock overlapped this one and is cancelled after it, splice this
+        // cancelled grant out of that later ticket's displaced chain so it restores what was
+        // held before this grant (or nothing), never this cancelled grant itself.
+        self.displaced = other_displaced
+            .into_iter()
+            .flat_map(|d| {
+                if d.lock.owner == owner && d.lock.ticket.as_deref() == Some(ticket) {
+                    own_displaced
+                        .iter()
+                        .filter(|p| p.lock.family == d.lock.family)
+                        .filter_map(|p| {
+                            intersection(p.lock.range, d.lock.range).map(|range| Displaced {
+                                ticket: d.ticket.clone(),
+                                lock: Held {
+                                    range,
+                                    ..p.lock.clone()
+                                },
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![d]
+                }
+            })
+            .collect();
+        // Undo what the cancelled grant replaced on the bytes it still owned, splitting at
+        // any subrange where another owner has since taken a lock the downgrade allowed.
+        for granted in active {
+            for prior in own_displaced
+                .iter()
+                .filter(|p| p.lock.family == granted.family)
+            {
+                let Some(overlap) = intersection(prior.lock.range, granted.range) else {
+                    continue;
+                };
+                let candidate = Held {
+                    range: overlap,
+                    ..prior.lock.clone()
+                };
+                let mut uncontested = vec![overlap];
+                for other in &self.held {
+                    if other.conflicts(&candidate) {
+                        uncontested = uncontested
+                            .into_iter()
+                            .flat_map(|seg| seg.minus(other.range).into_iter().flatten())
+                            .collect();
+                    }
+                }
+                let mut contested = vec![overlap];
+                for seg in &uncontested {
+                    contested = contested
+                        .into_iter()
+                        .flat_map(|c| c.minus(*seg).into_iter().flatten())
+                        .collect();
+                }
+                for range in uncontested {
+                    self.insert_held(Held {
+                        range,
+                        ..prior.lock.clone()
+                    });
+                }
+                for range in contested {
+                    self.insert_held(Held {
+                        range,
+                        ticket: prior.lock.ticket.clone(),
+                        ..granted.clone()
+                    });
+                }
             }
         }
         self.wake();
@@ -334,6 +452,7 @@ impl Locks {
     pub fn release(&mut self, owner: u64) {
         self.displaced.retain(|d| d.lock.owner != owner);
         self.cancelled.retain(|(o, _)| *o != owner);
+        self.acknowledged.retain(|(o, _)| *o != owner);
         self.waits.retain(|w| w.lock.owner != owner);
         self.held.retain(|l| l.owner != owner);
         self.wake();

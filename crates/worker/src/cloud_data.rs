@@ -12,7 +12,6 @@ use abi::{
     fs::*,
     remote_fs::{self as wire, DataOperation, DataRequest},
 };
-use kernel::Fs;
 use os_core::{inode, permissions::Node};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -81,15 +80,16 @@ impl Db {
             })
             .collect())
     }
-    fn replace_content(
+    fn replace_content_at(
         &mut self,
         node: &mut Node,
         size: u64,
         extents: Vec<Extent>,
         cred: &Credential,
+        now: (u64, u32),
     ) -> FsResult<()> {
         let file = auth::random_token();
-        self.run("INSERT INTO files(id,size,chunk_size,state,uploader,target,touched) VALUES(?,?,0,'complete',?,'',?)",vec![text(&file),int(size),int(cred.uid),int(auth::now())]);
+        self.run("INSERT INTO files(id,size,chunk_size,state,uploader,target,touched) VALUES(?,?,0,'complete',?,'',?)",vec![text(&file),int(size),int(cred.uid),int(now.0)]);
         for e in extents {
             if e.length > 0 {
                 self.run("INSERT INTO vfs_extents(file,start,length,key,offset,source) VALUES(?,?,?,?,?,?)",vec![text(&file),int(e.start),int(e.length),text(&e.key),int(e.offset),e.source.as_deref().into()]);
@@ -98,8 +98,8 @@ impl Db {
         node.file = Some(file);
         node.size = size;
         inode::remove_privs(&cred.identity(), node);
-        self.update_inode(node);
-        self.set_times(node.ino, None, Some(auth::clock()));
+        self.update_inode_at(node, now);
+        self.set_times_at(node.ino, None, Some(now), now);
         Ok(())
     }
     pub(crate) fn cloud_truncate(
@@ -108,14 +108,23 @@ impl Db {
         size: u64,
         cred: &Credential,
     ) -> FsResult<()> {
-        if size > FILE_MAX {
-            return Err(Errno::EFBIG);
-        }
+        self.cloud_truncate_at(node, size, cred, auth::clock())
+    }
+    pub(crate) fn cloud_truncate_at(
+        &mut self,
+        node: &mut Node,
+        size: u64,
+        cred: &Credential,
+        now: (u64, u32),
+    ) -> FsResult<()> {
         if node.directory {
             return Err(Errno::EISDIR);
         }
         if !node.is_file() {
             return Err(Errno::EINVAL);
+        }
+        if size > FILE_MAX {
+            return Err(Errno::EFBIG);
         }
         let extents = self
             .content(node)?
@@ -126,7 +135,7 @@ impl Db {
                 e
             })
             .collect();
-        self.replace_content(node, size, extents, cred)
+        self.replace_content_at(node, size, extents, cred, now)
     }
     pub(crate) fn drop_extents(&mut self, file: &str) {
         let extents = self.extents(file);
@@ -150,8 +159,15 @@ impl Db {
         }
     }
     pub(crate) fn expire_cloud_upload(&mut self, id: &str) {
-        self.run("DELETE FROM vfs_uploads WHERE id = ?", vec![text(id)]);
-        self.discard(&format!("vfs/{id}"));
+        let deleted = !self
+            .rows::<Value>(
+                "DELETE FROM vfs_uploads WHERE id = ? RETURNING id",
+                vec![text(id)],
+            )
+            .is_empty();
+        if deleted {
+            self.discard(&format!("vfs/{id}"));
+        }
         self.clear_expiry("vfs_upload", id);
     }
     pub(crate) fn end_cloud_read(&mut self, id: &str) {
@@ -197,6 +213,25 @@ fn prepare(db: &mut Db, request: &DataRequest) -> FsResult<Value> {
             if length > wire::DATA_MAX {
                 return Err(Errno::E2BIG);
             }
+            if let Some(generated) = db
+                .names(node.ino)
+                .iter()
+                .find_map(|path| crate::sys::generated(db, path))
+            {
+                let bytes = generated.into_bytes();
+                let start = bytes
+                    .len()
+                    .min(usize::try_from(offset).unwrap_or(usize::MAX));
+                let end = bytes
+                    .len()
+                    .min(usize::try_from(offset.saturating_add(length)).unwrap_or(usize::MAX));
+                let slice = &bytes[start..end];
+                db.cloud_accessed(node.ino);
+                return Ok(json!({
+                    "generated": slice,
+                    "io": c.io(&request.credential, request.pid, false, slice.len() as u64)?,
+                }));
+            }
             let length = length.min(node.size.saturating_sub(offset));
             let extents = db.content(&node)?;
             let id = auth::random_token();
@@ -207,15 +242,14 @@ fn prepare(db: &mut Db, request: &DataRequest) -> FsResult<Value> {
                 );
                 db.set_expiry("vfs_read", &id, auth::now() + wire::LEASE_SECONDS);
             }
-            if length > 0 {
-                db.cloud_accessed(node.ino);
-            }
+            db.cloud_accessed(node.ino);
             Ok(
                 json!({"id":id,"offset":offset,"length":length,"extents":extents,"io":c.io(&request.credential,request.pid,false,length)?}),
             )
         }
         DataOperation::Write { at, length } => {
             regular(&node, &request.open, true)?;
+            cloudfs::unchanged_names(db, node.ino)?;
             if length > wire::DATA_MAX {
                 return Err(Errno::E2BIG);
             }
@@ -224,7 +258,13 @@ fn prepare(db: &mut Db, request: &DataRequest) -> FsResult<Value> {
                 WriteAt::End => node.size,
             };
             // Writing nothing changes nothing, at any offset, as MemFs and Linux have it.
-            if length > 0 && (offset > FILE_MAX || length > FILE_MAX - offset) {
+            if length == 0 {
+                return Ok(json!({
+                    "written": Written { offset, len: 0 },
+                    "io": c.io(&request.credential, request.pid, true, 0)?,
+                }));
+            }
+            if offset >= FILE_MAX {
                 return Err(Errno::EFBIG);
             }
             let id = auth::random_token();
@@ -244,6 +284,7 @@ fn commit(db: &mut Db, request: &DataRequest, id: &str) -> FsResult<Value> {
     let c = cloudfs::caller(db, &request.session, &request.credential)?;
     let mut node = c.opened(db, &request.open)?;
     regular(&node, &request.open, true)?;
+    cloudfs::unchanged_names(db, node.ino)?;
     let upload = db
         .rows::<Upload>("SELECT * FROM vfs_uploads WHERE id = ?", vec![text(id)])
         .pop()
@@ -266,50 +307,54 @@ fn commit(db: &mut Db, request: &DataRequest, id: &str) -> FsResult<Value> {
         WriteAt::Offset(offset) => offset,
         WriteAt::End => node.size,
     };
-    if length > 0 && (offset > FILE_MAX || length > FILE_MAX - offset) {
+    if length == 0 {
+        db.run("DELETE FROM vfs_uploads WHERE id = ?", vec![text(id)]);
+        db.clear_expiry("vfs_upload", id);
+        return Ok(json!(Written { offset, len: 0 }));
+    }
+    if offset >= FILE_MAX {
         return Err(Errno::EFBIG);
     }
-    if length > 0 {
-        let end = offset + length;
-        let mut extents = Vec::new();
-        for e in db.content(&node)? {
-            let ee = e.start + e.length;
-            if ee <= offset || e.start >= end {
-                extents.push(e);
-                continue;
-            }
-            if e.start < offset {
-                extents.push(Extent {
-                    length: offset - e.start,
-                    ..e.clone()
-                });
-            }
-            if ee > end {
-                extents.push(Extent {
-                    start: end,
-                    length: ee - end,
-                    offset: e.offset + end - e.start,
-                    ..e
-                });
-            }
+    // A write starting before FILE_MAX and extending past it commits only the prefix up to
+    // FILE_MAX, including when concurrent appends advance EOF between prepare and commit.
+    let written = length.min(FILE_MAX - offset);
+    let end = offset + written;
+    let mut extents = Vec::new();
+    for e in db.content(&node)? {
+        let ee = e.start + e.length;
+        if ee <= offset || e.start >= end {
+            extents.push(e);
+            continue;
         }
-        extents.push(Extent {
-            start: offset,
-            length,
-            key: format!("vfs/{id}"),
-            offset: 0,
-            source: None,
-        });
-        let size = node.size.max(end);
-        db.replace_content(&mut node, size, extents, c.actor())?;
-    } else {
-        db.discard(&format!("vfs/{id}"));
+        if e.start < offset {
+            extents.push(Extent {
+                length: offset - e.start,
+                ..e.clone()
+            });
+        }
+        if ee > end {
+            extents.push(Extent {
+                start: end,
+                length: ee - end,
+                offset: e.offset + end - e.start,
+                ..e
+            });
+        }
     }
+    extents.push(Extent {
+        start: offset,
+        length: written,
+        key: format!("vfs/{id}"),
+        offset: 0,
+        source: None,
+    });
+    let size = node.size.max(end);
+    db.replace_content_at(&mut node, size, extents, c.actor(), auth::clock())?;
     db.run("DELETE FROM vfs_uploads WHERE id = ?", vec![text(id)]);
     db.clear_expiry("vfs_upload", id);
     Ok(json!(Written {
         offset,
-        len: length as usize
+        len: written as usize
     }))
 }
 
@@ -393,16 +438,22 @@ pub async fn gateway(req: Request, env: &Env) -> Result<Response> {
     if let Some(value) = grant.get("io").filter(|v| !v.is_null()) {
         let io: crate::resources::IoRequest = serde_json::from_value(value.clone())?;
         if let Err(error) = crate::resources::checked_io(env, io).await {
-            let cleanup = match request.operation {
-                DataOperation::Read { .. } => "/internal/fs/read-done",
-                DataOperation::Write { .. } => "/internal/fs/abandon",
-            };
-            let _ = ask(env, cleanup, &request, Some(id)).await;
+            if !id.is_empty() {
+                let cleanup = match request.operation {
+                    DataOperation::Read { .. } => "/internal/fs/read-done",
+                    DataOperation::Write { .. } => "/internal/fs/abandon",
+                };
+                let _ = ask(env, cleanup, &request, Some(id)).await;
+            }
             return crate::resources::refused(error);
         }
     }
     match request.operation {
         DataOperation::Read { .. } => {
+            if let Some(generated) = grant.get("generated") {
+                let bytes: Vec<u8> = serde_json::from_value(generated.clone())?;
+                return Response::from_bytes(bytes);
+            }
             let extents: Vec<Extent> = serde_json::from_value(grant["extents"].clone())?;
             let length = grant["length"].as_u64().unwrap_or(0);
             let offset = grant["offset"].as_u64().unwrap_or(0);
@@ -427,24 +478,27 @@ pub async fn gateway(req: Request, env: &Env) -> Result<Response> {
             )))
         }
         DataOperation::Write { length, .. } => {
-            let result = if length == 0 {
-                crate::streams::discard_stream(
+            if length == 0 {
+                if crate::streams::discard_stream(
                     req.inner().body().map_or(JsValue::NULL, Into::into),
                     0.0,
                 )
                 .await
-                .map_err(worker::Error::from)
-            } else {
-                crate::files::store(
-                    env,
-                    &req,
-                    &format!("vfs/{id}"),
-                    length,
-                    "application/octet-stream",
-                    None,
-                )
-                .await
-            };
+                .is_err()
+                {
+                    return api::errno_reply(&Errno::EIO.into()).response();
+                }
+                return Response::from_json(&grant["written"]);
+            }
+            let result = crate::files::store(
+                env,
+                &req,
+                &format!("vfs/{id}"),
+                length,
+                "application/octet-stream",
+                None,
+            )
+            .await;
             if result.is_err() {
                 let _ = ask(env, "/internal/fs/abandon", &request, Some(id)).await;
                 return api::errno_reply(&Errno::EIO.into()).response();
@@ -462,11 +516,11 @@ use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 use wasm_bindgen::prelude::*;
 use worker::wasm_bindgen_futures::future_to_promise;
 #[wasm_bindgen(
-    inline_js = "export function zeroBytes(length) { return new ReadableStream({pull(c) { const n = Math.min(length, 65536); if (!n) {c.close();return;} c.enqueue(new Uint8Array(n));length -= n; }}); }"
+    inline_js = "export function zeroBytes(length) { return new ReadableStream({pull(c) { const n = length > 65536n ? 65536 : Number(length); if (!n) {c.close();return;} c.enqueue(new Uint8Array(n));length -= BigInt(n); }}); }"
 )]
 extern "C" {
     #[wasm_bindgen(js_name=zeroBytes)]
-    fn zeros(length: f64) -> web_sys::ReadableStream;
+    fn zeros(length: u64) -> web_sys::ReadableStream;
 }
 /// Clip extents to a read, including holes (no object key). Both inline and streamed readers
 /// use the same ranges, including offsets into objects shared by multiple manifests.
@@ -517,7 +571,7 @@ pub fn extent_stream(
         future_to_promise(async move {
             match part {
                 None => Ok(JsValue::NULL),
-                Some((None, _, length)) => Ok(zeros(length as f64).into()),
+                Some((None, _, length)) => Ok(zeros(length).into()),
                 Some((Some(key), offset, length)) => {
                     if let Some(asset) = crate::system::asset(&key) {
                         return crate::streams::asset_range(&env, &asset, offset, length)
@@ -533,7 +587,7 @@ pub fn extent_stream(
     });
     Ok(crate::streams::fixed_length(
         &crate::streams::concatenate(&next.into_js_value().into()),
-        length as f64,
+        length,
     ))
 }
 

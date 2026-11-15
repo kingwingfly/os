@@ -753,9 +753,12 @@ test('default ACL inheritance takes precedence over the current umask without ch
     await c.call('disconnect');
   }
 });
-test('system-image and procfs names are read-only even for root, as on the path API',async({request})=>{
+test('system-image, procfs and generated account projections are read-only while large-offset and empty writes follow Linux',async({request})=>{
   const {c,dir}=await setup(request);
+  const exact=(open,rawOp,bytes)=>request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Filesystem':`{"version":2,"credential":${JSON.stringify(c.token)},"pid":${c.pid},"session":${JSON.stringify(c.session)},"open":${JSON.stringify(open)},"operation":${rawOp}}`},data:bytes??Buffer.alloc(0)});
   try {
+    const rootChildren=await c.call('read_dir',{dir:c.root});
+    expect((await c.call('metadata',{handle:c.root})).nlink).toBe(2+rootChildren.filter(e=>e.file_type==='dir').length);
     for(const name of ['usr','sys'])await c.call('mkdir',{dir:c.root,name,mode:0o755},'EROFS');
     await c.call('create',{ticket:randomUUID(),dir:c.root,name:'usr',mode:0o644,options:options('read-write',{create:true})},'EROFS');
     await c.call('symlink',{dir:c.root,name:'sys',target:'/tmp'},'EROFS');
@@ -764,13 +767,206 @@ test('system-image and procfs names are read-only even for root, as on the path 
     await c.call('setattr',{handle:proc.handle,attr:attrs({mode:0o777})},'EROFS');
     await c.call('setxattr',{handle:proc.handle,name:'user.shadow',value:[1],flags:''},'EROFS');
     await c.call('rmdir',{dir:c.root,name:'proc'},'EROFS');
+    const etc=(await c.call('lookup',{dir:c.root,name:'etc'})).handle;
+    for(const [name,needle] of [['passwd','root:x:0:0:'],['group','root:x:0:']]) {
+      const entry=await c.call('lookup',{dir:etc,name});const ro=await c.open(entry.handle,'read');
+      const full=await c.read(ro,0,65536);
+      expect(entry.metadata.size).toBe(full.length);expect(full.toString()).toContain(needle);
+      expect(await c.read(ro,2,5)).toEqual(full.subarray(2,7));
+      await c.call('release',{open:ro});
+      await c.call('open',{ticket:randomUUID(),handle:entry.handle,options:options('write')},'EROFS');
+      await c.call('create',{ticket:randomUUID(),dir:etc,name,mode:0o644,options:options('read-write',{create:true})},'EROFS');
+      await c.call('setattr',{handle:entry.handle,attr:attrs({mode:0o600})},'EROFS');
+      await c.call('link',{target:entry.handle,dir,name:'alias-'+name},'EROFS');
+      await c.call('unlink',{dir:etc,name},'EROFS');
+      await c.call('rename',{from_dir:etc,from:name,to_dir:dir,to:'moved-'+name,flags:''},'EROFS');
+    }
     const [file,open]=await c.create(dir,'file');
     await c.call('rename',{from_dir:dir,from:'file',to_dir:c.root,to:'usr',flags:''},'EROFS');
     await c.call('rename',{from_dir:dir,from:'file',to_dir:proc.handle,to:'file',flags:''},'EROFS');
     // ftruncate of an O_PATH reference is EBADF; writing nothing is no error at any offset.
     const path=await c.open(file.handle,'path');await c.call('set_len',{open:path,size:0},'EBADF');
-    expect(await c.data(open,{write:{at:{offset:2**63},length:0}})).toMatchObject({len:0});
-    await c.data(open,{write:{at:{offset:2**63},length:1}},Buffer.from('x'),'EFBIG');
+    for(const rawOffset of ['9223372036854775807','9223372036854775808']) {
+      const res=await exact(open,`{"write":{"at":{"offset":${rawOffset}},"length":0}}`);
+      expect(res.ok(),await res.text()).toBe(true);expect(await res.json()).toMatchObject({len:0});
+    }
+    // Straddling i64::MAX (9223372036854775807) commits a short write; starting at or past it returns EFBIG.
+    const shortOff=await exact(open,'{"write":{"at":{"offset":9223372036854775805},"length":5}}',Buffer.from('hello'));
+    expect(shortOff.ok(),shortOff.ok()?'':await shortOff.text()).toBe(true);expect(await shortOff.text()).toBe('{"len":2,"offset":9223372036854775805}');
+    const tail=await exact(open,'{"read":{"offset":9223372036854775805,"length":2}}');
+    expect((await tail.body()).toString()).toBe('he');
+    const atMax=await exact(open,'{"write":{"at":{"offset":9223372036854775807},"length":1}}',Buffer.from('x'));
+    expect((await atMax.json()).errno).toBe('EFBIG');
+    const appendAtMax=await exact(open,'{"write":{"at":"end","length":1}}',Buffer.from('x'));
+    expect((await appendAtMax.json()).errno).toBe('EFBIG');
+    const shrink=await request.post(origin+'/api/fs',{headers:{Origin:origin,'Content-Type':'application/json'},data:'{"version":2,"credential":'+JSON.stringify(c.token)+',"session":'+JSON.stringify(c.session)+',"call":{"set_len":{"open":'+JSON.stringify(open)+',"size":9223372036854775805}}}'});
+    expect(shrink.ok(),shrink.ok()?'':await shrink.text()).toBe(true);
+    const shortEnd=await exact(open,'{"write":{"at":"end","length":5}}',Buffer.from('world'));
+    expect(shortEnd.ok(),shortEnd.ok()?'':await shortEnd.text()).toBe(true);expect(await shortEnd.text()).toBe('{"len":2,"offset":9223372036854775805}');
+    await c.call('unlink',{dir,name:'file'});await c.call('release',{open:path});await c.call('release',{open});
+  } finally {
+    await c.call('disconnect');
+  }
+});
+test('fixed kernel devices and device directories refuse unlink, rmdir and rename',async({request})=>{
+  const {c,dir}=await setup(request);const dev=(await c.call('lookup',{dir:c.root,name:'dev'})).handle;
+  try {
+    for(const fixed of ['null','zero','system']) {
+      expect((await sys(request,[{unlink:{path:'/dev/'+fixed}}]))[0].err.errno).toBe('EPERM');
+      await c.call('unlink',{dir:dev,name:fixed},'EPERM');
+      expect((await c.call('lookup',{dir:dev,name:fixed})).metadata.file_type).toBe('char-device');
+    }
+    await c.call('rename',{from_dir:c.root,from:'dev',to_dir:dir,to:'moved-dev',flags:''},'EPERM');
+    await c.call('rename',{from_dir:dev,from:'present',to_dir:dir,to:'moved-present',flags:''},'EPERM');
+    await c.call('rmdir',{dir:c.root,name:'dev'},'EBUSY');
+    const present=(await c.call('lookup',{dir:dev,name:'present'})).handle;
+    if((await c.call('read_dir',{dir:present})).length===0)await c.call('rmdir',{dir:dev,name:'present'},'EBUSY');
+    await api(request,'logout');const guest=await admit(request);
+    const guestConn=await connection(request,guest);
+    const guestDev=(await guestConn.call('lookup',{dir:guestConn.root,name:'dev'})).handle;
+    await guestConn.call('unlink',{dir:guestDev,name:'null'},'EACCES');
+    expect((await sys(request,[{unlink:{path:'/dev/null'}}]))[0].err.errno).toBe('EACCES');
+    await guestConn.call('disconnect');
+  } finally {
+    await c.call('disconnect');
+  }
+});
+test('chained lock cancellations, >1024 cancellation receipts, and partial downgrade rollbacks hold across SQLite',async({request})=>{
+  const {c,dir}=await setup(request);const [entry,a]=await c.create(dir,'locks-reg');
+  const b=await c.open(entry.handle);const d=await c.open(entry.handle);
+  const span=(start,end)=>({start,end});
+  const lock=(open,start,end,kind='exclusive')=>({open,family:'posix',kind,range:span(start,end)});
+  try {
+    // 1. Out-of-order cancellation of overlapping ticketed grants must not resurrect the earlier grant.
+    const tA=randomUUID(),tB=randomUUID();
+    expect(await c.call('lock',{...lock(a,0,80),ticket:tA})).toBe(true);
+    expect(await c.call('lock',{...lock(a,20,100),ticket:tB})).toBe(true);
+    await c.call('cancel_lock',{open:a,ticket:tA});
+    await c.call('cancel_lock',{open:a,ticket:tB});
+    await c.call('try_lock',lock(b,0,100));
+    await c.call('unlock',{open:b,family:'posix',range:span(0,100)});
+
+    // 2. Cancelling a downgrade splits at conflicting subranges and restores exclusive elsewhere.
+    await c.call('try_lock',lock(a,0,100,'exclusive'));
+    const down=randomUUID();
+    expect(await c.call('lock',{...lock(a,0,100,'shared'),ticket:down})).toBe(true);
+    await c.call('try_lock',lock(b,0,10,'shared'));
+    await c.call('cancel_lock',{open:a,ticket:down});
+    await c.call('try_lock',lock(d,0,10,'shared'));
+    await c.call('try_lock',lock(d,10,100,'shared'),'EAGAIN');
+    await c.call('unlock',{open:d,family:'posix',range:span(0,10)});
+    await c.call('unlock',{open:b,family:'posix',range:span(0,10)});
+    await c.call('unlock',{open:a,family:'posix',range:span(0,100)});
+
+    // 3. >1,024 subsequent cancellations must not evict an unretired cancellation receipt.
+    const early=randomUUID();
+    await c.call('cancel_lock',{open:a,ticket:early});
+    for(let batch=0;batch<22;batch++) {
+      await Promise.all(Array.from({length:50},(_,i)=>c.call('cancel_lock',{open:i%2?a:b,ticket:`noise-${batch}-${i}-${randomUUID()}`})));
+    }
+    await c.call('lock',{...lock(a,0,10),ticket:early},'ECANCELED');
+  } finally {
+    await c.call('unlink',{dir,name:'locks-reg'});
+    for(const open of [a,b,d])await c.call('release',{open});
+    await c.call('disconnect');
+  }
+});
+test('walk final symlinks, ticket/cancel_open authorization, read-only subtree renames, owner-scoped lock tickets, zero/EOF relatime, and POSIX error order',async({request})=>{
+  const {c,dir}=await setup(request);
+  try {
+    // 1. Walk returns stop: null when the final component is a symlink, and Symlink(index) only when intermediate.
+    const sub=await c.call('mkdir',{dir,name:'sub',mode:0o755});
+    const sym=await c.call('symlink',{dir,name:'sym',target:'sub'});
+    await c.call('symlink',{dir:sub.handle,name:'leaf-sym',target:'target'});
+    const walkFinal=await c.call('walk',{dir,names:['sym']});
+    expect(walkFinal.stop).toBeNull();
+    expect(walkFinal.entries).toHaveLength(1);
+    expect(walkFinal.entries[0].metadata.file_type).toBe('symlink');
+    const walkNestedFinal=await c.call('walk',{dir,names:['sub','leaf-sym']});
+    expect(walkNestedFinal.stop).toBeNull();
+    expect(walkNestedFinal.entries).toHaveLength(2);
+    expect(walkNestedFinal.entries[1].metadata.file_type).toBe('symlink');
+    const walkMid=await c.call('walk',{dir,names:['sym','leaf-sym']});
+    expect(walkMid.stop).toEqual({Symlink:0});
+    expect(walkMid.entries).toHaveLength(1);
+
+    // 2. Renaming an ancestor of read-only projections (/etc) returns EROFS even for root.
+    await c.call('rename',{from_dir:c.root,from:'etc',to_dir:dir,to:'moved-etc',flags:''},'EROFS');
+
+    // 3. Same lock wait ticket across two opens on the same inode stays independent per owner.
+    const [fileEntry,o1]=await c.create(dir,'file',0o644);
+    const o2=await c.open(fileEntry.handle);
+    const o3=await c.open(fileEntry.handle);
+    const span=(start,end)=>({start,end});
+    await c.call('try_lock',{open:o3,family:'posix',kind:'shared',range:span(0,50)});
+    const sharedTicket=randomUUID();
+    expect(await c.call('lock',{ticket:sharedTicket,open:o1,family:'posix',kind:'exclusive',range:span(0,100)})).toBe(false);
+    expect(await c.call('lock',{ticket:sharedTicket,open:o2,family:'posix',kind:'shared',range:span(50,100)})).toBe(false);
+    await c.call('unlock',{open:o3,family:'posix',range:span(0,50)});
+    expect(await c.call('lock',{ticket:sharedTicket,open:o2,family:'posix',kind:'shared',range:span(50,100)})).toBe(false);
+    expect(await c.call('lock',{ticket:sharedTicket,open:o1,family:'posix',kind:'exclusive',range:span(0,100)})).toBe(true);
+    await c.call('ack_lock',{open:o1,ticket:sharedTicket});
+    await c.call('unlock',{open:o1,family:'posix',range:span(0,100)});
+    expect(await c.call('lock',{ticket:sharedTicket,open:o2,family:'posix',kind:'shared',range:span(50,100)})).toBe(true);
+    await c.call('ack_lock',{open:o2,ticket:sharedTicket});
+    await c.call('unlock',{open:o2,family:'posix',range:span(50,100)});
+
+    // 4. Zero-byte reads and reads at/past EOF update atime under relatime.
+    await c.write(o1,'hello');
+    await c.call('setattr',{handle:fileEntry.handle,attr:attrs({atime:{sec:1,nsec:0}})});
+    expect((await c.call('metadata',{handle:fileEntry.handle})).atime.sec).toBe(1);
+    expect((await c.read(o1,0,0)).length).toBe(0);
+    expect((await c.call('metadata',{handle:fileEntry.handle})).atime.sec).toBeGreaterThan(1);
+    await c.call('setattr',{handle:fileEntry.handle,attr:attrs({atime:{sec:1,nsec:0}})});
+    expect((await c.call('metadata',{handle:fileEntry.handle})).atime.sec).toBe(1);
+    expect((await c.read(o1,100,16)).length).toBe(0);
+    expect((await c.call('metadata',{handle:fileEntry.handle})).atime.sec).toBeGreaterThan(1);
+
+    // 5. POSIX / MemFs check ordering and atomic mtime == ctime on truncate.
+    await c.call('open',{ticket:randomUUID(),handle:sym.handle,options:options('write')},'ELOOP');
+    const etc=(await c.call('lookup',{dir:c.root,name:'etc'})).handle;
+    await c.call('open',{ticket:randomUUID(),handle:etc,options:options('read',{truncate:true})},'EISDIR');
+    const [,passwdRo]=await c.call('create',{ticket:randomUUID(),dir:etc,name:'passwd',mode:0o644,options:options('read',{create:true})});
+    expect((await c.read(passwdRo,0,128)).toString()).toContain('root:x:0:0:');
+    await c.call('release',{open:passwdRo});
+    await c.call('link',{target:sub.handle,dir,name:'file'},'EEXIST');
+    await c.call('setattr',{handle:fileEntry.handle,attr:attrs({size:2})});
+    const truncMeta=await c.call('metadata',{handle:fileEntry.handle});
+    expect(truncMeta.mtime).toEqual(truncMeta.ctime);
+
+    // Prepare a read-only directory fixture before switching to an unprivileged credential in the same namespace.
+    const roDir=await c.call('mkdir',{dir,name:'ro-dir',mode:0o755});
+    const [aEntry,aOpen]=await c.create(roDir.handle,'a',0o644);
+    await c.call('release',{open:aOpen});
+    await c.call('link',{target:aEntry.handle,dir:roDir.handle,name:'a-link'});
+    const [,bOpen]=await c.create(roDir.handle,'b',0o644);
+    await c.call('release',{open:bOpen});
+    const cycleDir=await c.call('mkdir',{dir:roDir.handle,name:'cycle',mode:0o555});
+    await c.call('setattr',{handle:roDir.handle,attr:attrs({mode:0o555})});
+
+    // 6. Ticket replay validates call shape (EINVAL) and caller grant (EACCES), and CancelOpen rejects ungranted callers.
+    const tOpen=randomUUID();
+    const askOpen={ticket:tOpen,handle:fileEntry.handle,options:options('read-write')};
+    const retained=await c.call('open',askOpen);
+    expect(await c.call('open',askOpen)).toEqual(retained);
+    await c.call('open',{...askOpen,options:options('read')},'EINVAL');
+    await c.call('create',{ticket:tOpen,dir,name:'other',mode:0o644,options:options('read-write',{create:true})},'EINVAL');
+
+    await api(request,'logout');
+    const guest=await admit(request);
+    await rpc(request,guest.token,c.session,{open:askOpen},'EACCES');
+    await rpc(request,guest.token,c.session,{cancel_open:{ticket:tOpen}},'EACCES');
+    expect((await c.read(retained)).toString()).toBe('he');
+
+    // Unprivileged error ordering on directories and non-writable parents matches MemFs/Linux.
+    await rpc(request,guest.token,c.session,{setattr:{handle:sub.handle,attr:attrs({size:0})}},'EISDIR');
+    await rpc(request,guest.token,c.session,{rename:{from_dir:roDir.handle,from:'a',to_dir:roDir.handle,to:'b',flags:'NOREPLACE'}},'EEXIST');
+    expect(await rpc(request,guest.token,c.session,{rename:{from_dir:roDir.handle,from:'a',to_dir:roDir.handle,to:'a-link',flags:''}})).toBeNull();
+    await rpc(request,guest.token,c.session,{rename:{from_dir:roDir.handle,from:'cycle',to_dir:cycleDir.handle,to:'sub',flags:''}},'EINVAL');
+
+    await c.call('cancel_open',{ticket:tOpen});
+    await c.call('open',askOpen,'ECANCELED');
+    for(const o of [o1,o2,o3])await c.call('release',{open:o});
   } finally {
     await c.call('disconnect');
   }

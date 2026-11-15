@@ -823,19 +823,135 @@ fn cancelling_a_granted_downgrade_keeps_compatible_locks_others_took_since() {
     assert!(locks.conflict(&shared(3, 0, Some(100))).is_none());
     assert_eq!(locks.held.iter().filter(|l| l.owner == 1).count(), 1);
     assert_eq!(locks.held.iter().filter(|l| l.owner == 2).count(), 1);
+
+    // Partial contenders split restoration at conflicting boundaries so uncontended regions
+    // regain exclusive protection.
+    let mut partial = Locks::default();
+    partial.acquire(held(1, 0, Some(100)), None, &[]).unwrap();
+    assert_eq!(
+        partial.acquire(shared(1, 0, Some(100)), Some("downgrade"), &[]),
+        Ok(true)
+    );
+    partial.acquire(shared(2, 0, Some(10)), None, &[]).unwrap();
+    partial.acquire(shared(2, 40, Some(50)), None, &[]).unwrap();
+    partial.cancel(1, "downgrade");
+    assert_eq!(partial.acquire(shared(3, 0, Some(10)), None, &[]), Ok(true));
+    assert_eq!(
+        partial.acquire(shared(3, 40, Some(50)), None, &[]),
+        Ok(true)
+    );
+    assert_eq!(
+        partial.acquire(shared(3, 10, Some(40)), None, &[]),
+        Err(Errno::EAGAIN)
+    );
+    assert_eq!(
+        partial.acquire(shared(3, 50, Some(100)), None, &[]),
+        Err(Errno::EAGAIN)
+    );
+    assert_eq!(
+        partial.acquire(held(3, 0, Some(10)), None, &[]),
+        Err(Errno::EAGAIN)
+    );
 }
 #[test]
-fn cancellation_tombstones_stay_bounded() {
-    let mut locks = Locks::default();
-    for n in 0..10_000 {
-        locks.cancel(1, &n.to_string());
+fn cancelling_chained_ticketed_replacements_converges_in_any_order() {
+    for first_a in [true, false] {
+        // Overlapping ticketed grants over unlocked bytes: cancelling both must leave nothing.
+        let mut locks = Locks::default();
+        assert_eq!(
+            locks.acquire(held(1, 0, Some(80)), Some("a"), &[]),
+            Ok(true)
+        );
+        assert_eq!(
+            locks.acquire(held(1, 20, Some(100)), Some("b"), &[]),
+            Ok(true)
+        );
+        if first_a {
+            locks.cancel(1, "a");
+            locks.cancel(1, "b");
+        } else {
+            locks.cancel(1, "b");
+            locks.cancel(1, "a");
+        }
+        assert!(locks.held.is_empty() && locks.displaced.is_empty());
+        assert_eq!(locks.acquire(held(2, 0, Some(100)), None, &[]), Ok(true));
+
+        // Chained upgrade then downgrade over a non-ticketed shared lock, with a partial
+        // contender arriving during the downgrade: cancelling both restores the original
+        // shared lock across the whole range without holes or resurrected exclusive bytes.
+        let mut locks = Locks::default();
+        locks.acquire(shared(1, 0, Some(100)), None, &[]).unwrap();
+        assert_eq!(
+            locks.acquire(held(1, 10, Some(90)), Some("a"), &[]),
+            Ok(true)
+        );
+        assert_eq!(
+            locks.acquire(shared(1, 0, Some(100)), Some("b"), &[]),
+            Ok(true)
+        );
+        locks.acquire(shared(2, 10, Some(30)), None, &[]).unwrap();
+        if first_a {
+            locks.cancel(1, "a");
+            locks.cancel(1, "b");
+        } else {
+            locks.cancel(1, "b");
+            locks.cancel(1, "a");
+        }
+        assert!(locks.displaced.is_empty());
+        assert!(locks.conflict(&shared(3, 0, Some(100))).is_none());
+        let conflict = locks.conflict(&held(2, 0, Some(100))).unwrap();
+        assert_eq!(
+            (conflict.owner, conflict.kind, conflict.range),
+            (1, LockKind::Shared, LockRange::new(0, Some(100)).unwrap())
+        );
+        locks.release(2);
+        let conflict = locks.conflict(&held(3, 0, Some(100))).unwrap();
+        assert_eq!(
+            (conflict.owner, conflict.kind, conflict.range),
+            (1, LockKind::Shared, LockRange::new(0, Some(100)).unwrap())
+        );
     }
-    assert!(locks.cancelled.len() <= os_vfs::locks::CANCELLED_MAX);
-    // The most recent cancellations are still refused.
+}
+#[test]
+fn cancellation_records_persist_until_release_while_acknowledged_history_stays_bounded() {
+    let mut locks = Locks::default();
+    locks.cancel(1, "");
+    locks.cancel(1, &"x".repeat(129));
+    assert!(locks.cancelled.is_empty());
+
+    locks.cancel(1, "early");
+    for n in 0..5_000 {
+        locks.cancel(2, &format!("other-{n}"));
+        locks.cancel(1, &format!("own-{n}"));
+    }
     assert_eq!(
-        locks.acquire(held(1, 0, None), Some("9999"), &[]),
+        locks.acquire(held(1, 0, None), Some("early"), &[]),
         Err(Errno::ECANCELED)
     );
+    assert_eq!(
+        locks.acquire(held(1, 0, None), Some("own-4999"), &[]),
+        Err(Errno::ECANCELED)
+    );
+    locks.release(2);
+    assert_eq!(
+        locks.acquire(held(1, 0, None), Some("early"), &[]),
+        Err(Errno::ECANCELED)
+    );
+    locks.release(1);
+    assert!(locks.cancelled.is_empty());
+
+    for n in 0..2_500 {
+        let ticket = format!("ack-{n}");
+        assert_eq!(
+            locks.acquire(held(1, 0, Some(100)), Some(&ticket), &[]),
+            Ok(true)
+        );
+        locks.acknowledge(1, &ticket);
+    }
+    assert!(locks.displaced.len() <= os_vfs::locks::ACKNOWLEDGED_MAX);
+    assert!(locks.acknowledged.len() <= os_vfs::locks::ACKNOWLEDGED_MAX);
+    locks.release(1);
+    assert!(locks.held.is_empty() && locks.displaced.is_empty() && locks.acknowledged.is_empty());
 }
 #[test]
 fn opens_the_authority_refused_queue_no_cancellation_but_uncertain_ones_do() {
@@ -924,4 +1040,248 @@ fn session_calls_clean_up_with_their_own_credential_when_opener_and_actor_are_re
             .iter()
             .any(|r| { matches!(r.call, Call::CancelOpen { .. }) && r.credential == "host" })
     );
+}
+#[test]
+fn concurrent_drains_serialize_and_preserve_fifo_cancellation_order() {
+    use std::task::{Context, Poll, Waker};
+    let host = Host::default();
+    let fs = now_or_never(CloudFs::connect(host.clone(), "opener".into()))
+        .unwrap()
+        .unwrap();
+    let mut cred = Cred::root();
+    cred.token = Some("opener".into());
+    let options = *OpenOptions::new().read(true);
+
+    let root_handle = root();
+    host.pending.set(true);
+    {
+        let mut open_1 = fs.open(&cred, &root_handle, &options);
+        let mut open_2 = fs.open(&cred, &root_handle, &options);
+        assert!(matches!(
+            open_1
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            open_2
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        drop(open_1);
+        drop(open_2);
+    }
+    assert_eq!(fs.pending_cancellations(), 2);
+
+    // Start draining on task A while transport is still pending: ticket "1" is in flight,
+    // and must remain visible and block concurrent callers from overtaking cleanup.
+    let mut drain_a = Box::pin(fs.drain());
+    assert!(matches!(
+        drain_a
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Pending
+    ));
+    assert_eq!(fs.pending_cancellations(), 2);
+
+    let calls_while_in_flight = host.calls.borrow().len();
+    let mut concurrent_meta = fs.metadata(&cred, &root_handle);
+    assert!(matches!(
+        concurrent_meta
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Pending
+    ));
+    // Task B must wait on the drain lock rather than sending Metadata or duplicate CancelOpen.
+    assert_eq!(host.calls.borrow().len(), calls_while_in_flight);
+
+    host.pending.set(false);
+    assert_eq!(
+        drain_a
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Ok(()))
+    );
+    assert_eq!(fs.pending_cancellations(), 0);
+    assert_eq!(
+        concurrent_meta
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .map(|r| r.map(|m| m.size)),
+        Poll::Ready(Ok(20))
+    );
+
+    let tail: Vec<_> = host.calls.borrow()[calls_while_in_flight - 1..].to_vec();
+    assert!(matches!(
+        tail.as_slice(),
+        [
+            Call::CancelOpen { ticket: t1 },
+            Call::CancelOpen { ticket: t2 },
+            Call::Metadata { .. },
+        ] if t1 == "1" && t2 == "2"
+    ));
+}
+#[test]
+fn cancelled_file_close_and_release_queue_flush_release_once_and_fence_open() {
+    for drain_between in [false, true] {
+        let host = Host::default();
+        let fs = Rc::new(
+            now_or_never(CloudFs::connect(host.clone(), "opener".into()))
+                .unwrap()
+                .unwrap(),
+        );
+        let mut cred = Cred::root();
+        cred.token = Some("opener".into());
+        *host.actor.borrow_mut() = ("opener".into(), Some(10));
+        let options = *OpenOptions::new().read(true).write(true);
+        let opened = ready(fs.open(&cred, &root(), &options)).unwrap();
+        let queue = ReleaseQueue::new();
+        let file = FileRef::new(
+            fs.clone(),
+            opened.clone(),
+            Handle {
+                node: opened.node,
+                ..root()
+            },
+            cred.clone(),
+            &options,
+            &queue,
+        );
+
+        // Cancel FileRef::close while Call::Release is in flight: FileRef queued fallback release
+        // on ReleaseQueue, and OpenRef must already be fenced against further use.
+        host.pending.set(true);
+        assert!(now_or_never(file.close()).is_none());
+        assert_eq!(fs.pending_cancellations(), 1);
+        assert_eq!(ready(fs.sync_all(&opened)), Err(Errno::EBADF));
+        assert_eq!(ready(fs.read_at(&opened, &mut [0], 0)), Err(Errno::EBADF));
+
+        // Cancelling ReleaseQueue::flush itself while still blocked must preserve cleanup.
+        assert!(now_or_never(queue.flush()).is_none());
+        assert_eq!(fs.pending_cancellations(), 1);
+
+        host.pending.set(false);
+        if drain_between {
+            // Even if another call drains the pending Release before ReleaseQueue::flush runs,
+            // flush must observe that its cancelled release already completed cleanly.
+            assert_eq!(ready(fs.metadata(&cred, &root())).unwrap().size, 20);
+            assert_eq!(fs.pending_cancellations(), 0);
+        }
+        let releases_before_flush = host
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| matches!(c, Call::Release { .. }))
+            .count();
+        assert_eq!(now_or_never(queue.flush()), Some(Ok(())));
+        assert_eq!(fs.pending_cancellations(), 0);
+        let total_releases = host
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| matches!(c, Call::Release { .. }))
+            .count();
+        // Two attempts were aborted while pending, and exactly one Release completed; when
+        // an intervening call already drained that Release, flush sends zero extra Releases.
+        assert_eq!(
+            total_releases,
+            if drain_between {
+                releases_before_flush
+            } else {
+                releases_before_flush + 1
+            }
+        );
+        assert_eq!(total_releases, 3);
+        assert_eq!(ready(fs.release(&opened)), Err(Errno::EBADF));
+    }
+}
+#[test]
+fn deterministic_authority_refusals_do_not_queue_spurious_cancellations() {
+    let host = Host::default();
+    let fs = now_or_never(CloudFs::connect(host.clone(), "opener".into()))
+        .unwrap()
+        .unwrap();
+    let mut cred = Cred::root();
+    cred.token = Some("opener".into());
+    *host.actor.borrow_mut() = ("opener".into(), Some(1));
+    let options = *OpenOptions::new().read(true).write(true).create(true);
+    let opened = ready(fs.open(&cred, &root(), &options)).unwrap();
+
+    for errno in [
+        Errno::ESTALE,
+        Errno::EBUSY,
+        Errno::ETXTBSY,
+        Errno::EFBIG,
+        Errno::E2BIG,
+        Errno::ENXIO,
+        Errno::ENODEV,
+        Errno::EMFILE,
+        Errno::EMLINK,
+        Errno::ENOTEMPTY,
+        Errno::EXDEV,
+        Errno::EOPNOTSUPP,
+        Errno::EPROTONOSUPPORT,
+    ] {
+        host.failure.set(Some(errno));
+        assert_eq!(ready(fs.open(&cred, &root(), &options)), Err(errno));
+        assert!(matches!(
+            ready(fs.create(&cred, &root(), "f", 0o644, &options)),
+            Err(e) if e == errno
+        ));
+        assert_eq!(
+            ready(fs.lock(
+                &opened,
+                LockFamily::Posix,
+                LockKind::Exclusive,
+                LockRange::WHOLE
+            )),
+            Err(errno)
+        );
+        assert_eq!(
+            fs.pending_cancellations(),
+            0,
+            "unexpected cleanup for {errno:?}"
+        );
+    }
+}
+#[test]
+fn lock_wait_tickets_are_scoped_per_open_owner() {
+    let mut locks = Locks::default();
+    assert_eq!(locks.acquire(shared(3, 0, Some(50)), None, &[]), Ok(true));
+    assert_eq!(
+        locks.acquire(held(1, 0, Some(100)), Some("t1"), &[]),
+        Ok(false)
+    );
+    // Owner 2 choosing the same ticket "t1" must still queue behind owner 1's exclusive waiter
+    // on [0, 100), rather than mistaking owner 1's wait entry for its own queue position.
+    assert_eq!(
+        locks.acquire(shared(2, 50, Some(100)), Some("t1"), &[]),
+        Ok(false)
+    );
+    assert_eq!(locks.waits.len(), 2);
+
+    // Releasing owner 3 grants owner 1's exclusive lock; polling owner 2 with "t1" must stay
+    // blocked rather than matching owner 1's granted wait record.
+    locks.release(3);
+    assert_eq!(
+        locks.acquire(shared(2, 50, Some(100)), Some("t1"), &[]),
+        Ok(false)
+    );
+    assert_eq!(
+        locks.acquire(held(1, 0, Some(100)), Some("t1"), &[]),
+        Ok(true)
+    );
+    locks.acknowledge(1, "t1");
+    assert_eq!(locks.waits.len(), 1);
+
+    locks.release(1);
+    assert_eq!(
+        locks.acquire(shared(2, 50, Some(100)), Some("t1"), &[]),
+        Ok(true)
+    );
+    locks.acknowledge(2, "t1");
+    assert!(locks.waits.is_empty());
+    assert_eq!(locks.held.len(), 1);
+    assert_eq!(locks.held[0].owner, 2);
 }

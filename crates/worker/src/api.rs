@@ -609,6 +609,7 @@ pub fn cancel(db: &mut Db, file: &File) {
         for path in db.showing(&file.id) {
             db.delete_node(&path);
         }
+        db.detach_abandoned_upload(&file.id);
     }
     // Deleting the last node showing it may have freed it already.
     if db.file(&file.id).is_some() {

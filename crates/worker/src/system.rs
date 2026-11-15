@@ -240,6 +240,17 @@ pub fn owns(db: &Db, path: &str) -> bool {
         .as_ref()
         .map_or_else(|| crate::usr::is(path), |v| v.owns(path))
 }
+pub fn owns_descendant(db: &Db, path: &str) -> bool {
+    let prefix = format!("{}/", path.trim_end_matches('/'));
+    db.image.as_ref().map_or_else(
+        || "/usr".starts_with(&prefix),
+        |v| {
+            "/usr".starts_with(&prefix)
+                || "/sys".starts_with(&prefix)
+                || v.entries.keys().any(|p| p.starts_with(&prefix))
+        },
+    )
+}
 pub fn asset(content: &str) -> Option<String> {
     if let Some((hash, _)) = content
         .strip_prefix("image:")

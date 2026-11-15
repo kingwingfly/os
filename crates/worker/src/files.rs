@@ -454,7 +454,7 @@ impl Reader {
             })
         });
         let stream = concatenate(&next.into_js_value().into());
-        fixed_length(&stream, (end - start + 1) as f64)
+        fixed_length(&stream, end - start + 1)
     }
     /// The R2 key of chunk `index`, waiting for it while the file uploads.
     async fn key(&mut self, index: u64) -> std::result::Result<String, JsValue> {
@@ -528,10 +528,7 @@ pub(crate) async fn store(
         .ok_or_else(|| Error::RustError("Upload has no body".into()))?;
     let bucket = env.bucket("FILES")?;
     let mut put = bucket
-        .put(
-            key,
-            Data::ReadableStream(fixed_length(&body, length as f64)),
-        )
+        .put(key, Data::ReadableStream(fixed_length(&body, length)))
         .http_metadata(HttpMetadata {
             content_type: Some(content_type.into()),
             ..Default::default()

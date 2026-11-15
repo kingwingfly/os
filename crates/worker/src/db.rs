@@ -594,8 +594,10 @@ impl Db {
     }
     /// Change an inode without adding a name (including an unlinked open inode).
     pub(crate) fn update_inode(&mut self, node: &Node) {
+        self.update_inode_at(node, crate::auth::clock());
+    }
+    pub(crate) fn update_inode_at(&mut self, node: &Node, (sec, ns): (u64, u32)) {
         let before = self.inode(node.ino).and_then(|n| n.file);
-        let (sec, ns) = crate::auth::clock();
         self.run("UPDATE inodes SET owner = ?, grp = ?, mode = ?, file = ?, size = ?, acl = ?, default_acl = ?, ctime = ?, ctime_ns = ? WHERE id = ?",
             vec![int(node.owner), int(node.group), int(node.mode), node.file.as_deref().into(), int(node.size), node.acl.as_ref().map(|v| serde_json::json!(v).to_string()).into(), node.default_acl.as_ref().map(|v| serde_json::json!(v).to_string()).into(), int(sec), int(ns), int(node.ino)]);
         for name in self.names(node.ino) {
@@ -604,6 +606,36 @@ impl Db {
         if before != node.file {
             self.release(before);
         }
+    }
+    pub(crate) fn set_times_at(
+        &mut self,
+        ino: u64,
+        atime: Option<(u64, u32)>,
+        mtime: Option<(u64, u32)>,
+        (now, nanos): (u64, u32),
+    ) {
+        let given = |time: Option<(u64, u32)>| match time {
+            Some((sec, nsec)) => [int(sec), int(nsec)],
+            None => [SqlStorageValue::Null, SqlStorageValue::Null],
+        };
+        let mut values = given(atime).to_vec();
+        values.extend(given(mtime));
+        values.extend([int(now), int(nanos), int(ino)]);
+        self.run(
+            "UPDATE inodes SET atime = COALESCE(?1, atime), atime_ns = COALESCE(?2, atime_ns), mtime = COALESCE(?3, mtime), mtime_ns = COALESCE(?4, mtime_ns), ctime = ?5, ctime_ns = ?6 WHERE id = ?7",
+            values,
+        );
+        for name in self.names(ino) {
+            changes(&name);
+        }
+    }
+    /// Clear `file` from any unlinked inode still pinned by CloudFS when an incomplete upload is cancelled.
+    pub(crate) fn detach_abandoned_upload(&mut self, file: &str) {
+        let (sec, ns) = crate::auth::clock();
+        self.run(
+            "UPDATE inodes SET file = NULL, size = 0, mtime = ?, mtime_ns = ?, ctime = ?, ctime_ns = ? WHERE file = ?",
+            vec![int(sec), int(ns), int(sec), int(ns), text(file)],
+        );
     }
     /// Move directory entries without rewriting descendant inode metadata. The transaction
     /// has already checked the replacement and cycles; no intermediate path is observable.
@@ -634,6 +666,18 @@ impl Db {
                 vec![text(&format!("{path}/")), text(&format!("{path}0"))],
             )
             .is_empty()
+    }
+    pub(crate) fn persisted_subdirs(&self, path: &str) -> u32 {
+        #[derive(Deserialize)]
+        struct Count {
+            n: u32,
+        }
+        self.rows::<Count>(
+            "SELECT COUNT(*) AS n FROM nodes n JOIN inodes i ON i.id = n.ino WHERE n.parent = ? AND i.directory = 1",
+            vec![text(path)],
+        )
+        .pop()
+        .map_or(0, |c| c.n)
     }
     pub fn meta(&self, key: &str) -> Option<String> {
         self.rows::<Value>("SELECT v FROM meta WHERE k = ?", vec![text(key)])
@@ -1673,21 +1717,7 @@ impl kernel::Fs for Db {
         })
     }
     fn set_times(&mut self, ino: u64, atime: Option<(u64, u32)>, mtime: Option<(u64, u32)>) {
-        let (now, nanos) = crate::auth::clock();
-        let given = |time: Option<(u64, u32)>| match time {
-            Some((sec, nsec)) => [int(sec), int(nsec)],
-            None => [SqlStorageValue::Null, SqlStorageValue::Null],
-        };
-        let mut values = given(atime).to_vec();
-        values.extend(given(mtime));
-        values.extend([int(now), int(nanos), int(ino)]);
-        self.run(
-            "UPDATE inodes SET atime = COALESCE(?1, atime), atime_ns = COALESCE(?2, atime_ns), mtime = COALESCE(?3, mtime), mtime_ns = COALESCE(?4, mtime_ns), ctime = ?5, ctime_ns = ?6 WHERE id = ?7",
-            values,
-        );
-        for name in self.names(ino) {
-            changes(&name);
-        }
+        self.set_times_at(ino, atime, mtime, crate::auth::clock());
     }
     fn empty(&mut self, owner: u32, path: &str) -> String {
         let file = self.create_file(0, 1, None, owner, path, None, crate::auth::now());

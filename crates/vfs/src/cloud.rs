@@ -6,8 +6,10 @@ use abi::remote_fs::{self as wire, Call, DataOperation, DataRequest};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::{
-    cell::RefCell,
-    collections::{HashMap, VecDeque},
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, HashMap, VecDeque},
+    future::poll_fn,
+    task::{Poll, Waker},
 };
 
 pub trait Transport {
@@ -26,15 +28,66 @@ pub trait Transport {
     /// Unique across reconnects/reconstruction (for example a host-generated UUID).
     fn ticket(&self) -> String;
 }
+#[derive(Clone)]
 struct Pending {
     credential: String,
     call: Call,
 }
+struct OpenEntry {
+    record: OpenRef,
+    credential: String,
+    closing: bool,
+    cancelled_release: bool,
+    drained: bool,
+}
+#[derive(Default)]
+struct DrainLock {
+    held: Cell<bool>,
+    next_waiter: Cell<u64>,
+    waiters: RefCell<BTreeMap<u64, Waker>>,
+}
+struct DrainGuard<'a>(&'a DrainLock);
+struct DrainWait<'a> {
+    lock: &'a DrainLock,
+    id: u64,
+}
+impl Drop for DrainWait<'_> {
+    fn drop(&mut self) {
+        self.lock.waiters.borrow_mut().remove(&self.id);
+    }
+}
+impl DrainLock {
+    async fn lock(&self) -> DrainGuard<'_> {
+        let id = self.next_waiter.get();
+        self.next_waiter.set(id + 1);
+        let _wait = DrainWait { lock: self, id };
+        poll_fn(|context| {
+            if self.held.replace(true) {
+                self.waiters
+                    .borrow_mut()
+                    .insert(id, context.waker().clone());
+                Poll::Pending
+            } else {
+                Poll::Ready(DrainGuard(self))
+            }
+        })
+        .await
+    }
+}
+impl Drop for DrainGuard<'_> {
+    fn drop(&mut self) {
+        self.0.held.set(false);
+        for waker in self.0.waiters.take().into_values() {
+            waker.wake();
+        }
+    }
+}
 pub struct CloudFs<T> {
     transport: T,
     connected: wire::Connected,
-    opens: RefCell<HashMap<u64, (OpenRef, String)>>,
+    opens: RefCell<HashMap<u64, OpenEntry>>,
     pending: RefCell<VecDeque<Pending>>,
+    draining: DrainLock,
 }
 impl<T: Transport> CloudFs<T> {
     pub async fn connect(transport: T, credential: String) -> Result<Self> {
@@ -55,6 +108,7 @@ impl<T: Transport> CloudFs<T> {
             connected,
             opens: RefCell::new(HashMap::new()),
             pending: RefCell::new(VecDeque::new()),
+            draining: DrainLock::default(),
         })
     }
     /// The resume secret is private transport state, never a pathname/uid/PID credential.
@@ -78,26 +132,34 @@ impl<T: Transport> CloudFs<T> {
     /// that neither its opener nor the acting task may do any more, as when a host renews
     /// the session from a timer with no task to act for.
     async fn drain_as(&self, fallback: Option<&str>) -> Result<()> {
-        loop {
-            let pending = self.pending.borrow_mut().pop_front();
-            let Some(pending) = pending else {
-                return Ok(());
-            };
-            let mut guard = Cancel {
-                fs: self,
-                pending: Some(pending),
-            };
-            let p = guard.pending.as_ref().expect("pending cancellation");
-            match self.cleanup(p, fallback).await {
+        let _guard = self.draining.lock().await;
+        while let Some(pending) = { self.pending.borrow().front().cloned() } {
+            match self.cleanup(&pending, fallback).await {
                 Ok(_) | Err(Errno::ENOTCONN | Errno::EBADF) => {
-                    if let Call::Release { open } = &p.call {
-                        self.opens.borrow_mut().remove(&open.id);
+                    if let Call::Release { open } = &pending.call {
+                        let mut opens = self.opens.borrow_mut();
+                        if opens.get(&open.id).is_some_and(|e| e.cancelled_release) {
+                            if let Some(entry) = opens.get_mut(&open.id) {
+                                entry.drained = true;
+                            }
+                            if opens.values().filter(|e| e.drained).count() > 1024
+                                && let Some(evict) = opens
+                                    .iter()
+                                    .find(|(k, e)| e.drained && **k != open.id)
+                                    .map(|(k, _)| *k)
+                            {
+                                opens.remove(&evict);
+                            }
+                        } else {
+                            opens.remove(&open.id);
+                        }
                     }
-                    guard.pending = None;
+                    self.pending.borrow_mut().pop_front();
                 }
                 Err(e) => return Err(e),
             }
         }
+        Ok(())
     }
     async fn cleanup(&self, pending: &Pending, fallback: Option<&str>) -> Result<Value> {
         // The opener may have execed since this work was queued. Snapshot a replacement
@@ -139,11 +201,26 @@ impl<T: Transport> CloudFs<T> {
             return Err(Errno::EACCES);
         }
         let opens = self.opens.borrow();
-        let (record, token) = opens.get(&open.id).ok_or(Errno::EBADF)?;
-        if record != open {
+        let entry = opens.get(&open.id).ok_or(Errno::EBADF)?;
+        if entry.record != *open {
             return Err(Errno::EACCES);
         }
-        Ok(token.clone())
+        if entry.closing {
+            return Err(Errno::EBADF);
+        }
+        Ok(entry.credential.clone())
+    }
+    fn remember_open(&self, open: OpenRef, credential: String) {
+        self.opens.borrow_mut().insert(
+            open.id,
+            OpenEntry {
+                record: open,
+                credential,
+                closing: false,
+                cancelled_release: false,
+                drained: false,
+            },
+        );
     }
     async fn opened<R: DeserializeOwned>(&self, open: &OpenRef, call: Call) -> Result<R> {
         self.opener(open)?;
@@ -171,7 +248,25 @@ struct Cancel<'a, T: Transport> {
 impl<T: Transport> Drop for Cancel<'_, T> {
     fn drop(&mut self) {
         if let Some(pending) = self.pending.take() {
-            self.fs.pending.borrow_mut().push_front(pending);
+            self.fs.pending.borrow_mut().push_back(pending);
+        }
+    }
+}
+struct ReleaseGuard<'a, T: Transport> {
+    fs: &'a CloudFs<T>,
+    id: u64,
+    enqueue: Option<Pending>,
+    completed: bool,
+}
+impl<T: Transport> Drop for ReleaseGuard<'_, T> {
+    fn drop(&mut self) {
+        if !self.completed
+            && let Some(entry) = self.fs.opens.borrow_mut().get_mut(&self.id)
+        {
+            entry.cancelled_release = true;
+        }
+        if let Some(pending) = self.enqueue.take() {
+            self.fs.pending.borrow_mut().push_back(pending);
         }
     }
 }
@@ -185,12 +280,25 @@ fn rejected(errno: Errno) -> bool {
             | Errno::EEXIST
             | Errno::EISDIR
             | Errno::ENOTDIR
+            | Errno::ENOTEMPTY
             | Errno::EACCES
             | Errno::EPERM
             | Errno::EROFS
+            | Errno::EXDEV
+            | Errno::EBUSY
+            | Errno::ETXTBSY
+            | Errno::ESTALE
             | Errno::EINVAL
+            | Errno::EFBIG
+            | Errno::E2BIG
+            | Errno::ENXIO
+            | Errno::ENODEV
+            | Errno::EMFILE
+            | Errno::EMLINK
             | Errno::ENAMETOOLONG
             | Errno::ELOOP
+            | Errno::EOPNOTSUPP
+            | Errno::EPROTONOSUPPORT
             | Errno::EBADF
             | Errno::EDEADLK
             | Errno::ENOSPC
@@ -527,9 +635,7 @@ impl<T: Transport> Filesystem for CloudFs<T> {
                 guard.pending = None;
             }
             let open: OpenRef = serde_json::from_value(reply?).map_err(|_| Errno::EIO)?;
-            self.opens
-                .borrow_mut()
-                .insert(open.id, (open.clone(), token));
+            self.remember_open(open.clone(), token);
             guard.pending = None;
             Ok(open)
         })
@@ -574,9 +680,7 @@ impl<T: Transport> Filesystem for CloudFs<T> {
             }
             let (entry, open): (Entry, OpenRef) =
                 serde_json::from_value(reply?).map_err(|_| Errno::EIO)?;
-            self.opens
-                .borrow_mut()
-                .insert(open.id, (open.clone(), token));
+            self.remember_open(open.clone(), token);
             guard.pending = None;
             Ok((entry, open))
         })
@@ -775,21 +879,93 @@ impl<T: Transport> Filesystem for CloudFs<T> {
     }
     fn release<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let token = self.opener(open)?;
-            let mut guard = Cancel {
-                fs: self,
-                pending: Some(Pending {
-                    credential: token.clone(),
-                    call: Call::Release { open: open.clone() },
-                }),
+            if open.fs != self.connected.root.fs {
+                return Err(Errno::EACCES);
+            }
+            enum ReleaseAction {
+                First(String),
+                WaitDrained,
+                AlreadyDrained(bool),
+            }
+            let action = {
+                let mut opens = self.opens.borrow_mut();
+                let entry = opens.get_mut(&open.id).ok_or(Errno::EBADF)?;
+                if entry.record != *open {
+                    return Err(Errno::EACCES);
+                }
+                if entry.drained {
+                    let was_cancelled = entry.cancelled_release;
+                    opens.remove(&open.id);
+                    ReleaseAction::AlreadyDrained(was_cancelled)
+                } else {
+                    let action = if entry.closing {
+                        ReleaseAction::WaitDrained
+                    } else {
+                        entry.closing = true;
+                        ReleaseAction::First(entry.credential.clone())
+                    };
+                    entry.cancelled_release = false;
+                    action
+                }
             };
-            // Retain this release before older cleanup can fail or be cancelled.
-            self.drain().await?;
-            self.cleanup(guard.pending.as_ref().expect("pending release"), None)
-                .await?;
-            self.opens.borrow_mut().remove(&open.id);
-            guard.pending = None;
-            Ok(())
+            match action {
+                ReleaseAction::AlreadyDrained(was_cancelled) => {
+                    if was_cancelled {
+                        self.drain().await
+                    } else {
+                        Err(Errno::EBADF)
+                    }
+                }
+                ReleaseAction::First(token) => {
+                    let mut guard = ReleaseGuard {
+                        fs: self,
+                        id: open.id,
+                        enqueue: Some(Pending {
+                            credential: token,
+                            call: Call::Release { open: open.clone() },
+                        }),
+                        completed: false,
+                    };
+                    // Retain this release before older cleanup can fail or be cancelled.
+                    let drained = self.drain().await;
+                    if let Err(e) = drained {
+                        guard.completed = true;
+                        return Err(e);
+                    }
+                    let sent = {
+                        let _lock = self.draining.lock().await;
+                        self.cleanup(guard.enqueue.as_ref().expect("pending release"), None)
+                            .await
+                    };
+                    guard.completed = true;
+                    match sent {
+                        Ok(_) => {
+                            self.opens.borrow_mut().remove(&open.id);
+                            guard.enqueue = None;
+                            Ok(())
+                        }
+                        Err(e @ (Errno::ENOTCONN | Errno::EBADF)) => {
+                            self.opens.borrow_mut().remove(&open.id);
+                            guard.enqueue = None;
+                            Err(e)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                ReleaseAction::WaitDrained => {
+                    let mut guard = ReleaseGuard {
+                        fs: self,
+                        id: open.id,
+                        enqueue: None,
+                        completed: false,
+                    };
+                    let drained = self.drain().await;
+                    guard.completed = true;
+                    drained?;
+                    self.opens.borrow_mut().remove(&open.id);
+                    Ok(())
+                }
+            }
         })
     }
 }

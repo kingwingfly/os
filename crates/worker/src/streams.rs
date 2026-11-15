@@ -59,6 +59,31 @@ extern "C" {
 // function the module imports from it directly, which esbuild warns of as a duplicate key.
 #[wasm_bindgen(inline_js = "
 export function fixedLength(body, length) {
+  if (length >= 9007199254740992n) {
+    const reader = body.getReader();
+    let remaining = length;
+    return new ReadableStream({
+      async pull(c) {
+        try {
+          const { value, done } = await reader.read();
+          if (done) {
+            if (remaining) throw new Error('stream ended before expected length');
+            c.close();
+            return;
+          }
+          const n = BigInt(value.byteLength);
+          if (n > remaining) throw new Error('stream exceeded expected length');
+          remaining -= n;
+          c.enqueue(value);
+          if (!remaining) { await reader.cancel().catch(() => {}); c.close(); }
+        } catch (e) {
+          await reader.cancel(e).catch(() => {});
+          c.error(e);
+        }
+      },
+      cancel(why) { return reader.cancel(why); },
+    });
+  }
   const { readable, writable } = new FixedLengthStream(length);
   body.pipeTo(writable).catch(() => {});
   return readable;
@@ -67,7 +92,7 @@ export function fixedLength(body, length) {
 extern "C" {
     /// `body`, which must be exactly `length` bytes, as a stream R2 accepts.
     #[wasm_bindgen(js_name = fixedLength)]
-    pub fn fixed_length(body: &web_sys::ReadableStream, length: f64) -> web_sys::ReadableStream;
+    pub fn fixed_length(body: &web_sys::ReadableStream, length: u64) -> web_sys::ReadableStream;
 }
 
 /// `length` bytes of the R2 object `key`, from `offset`.
@@ -99,10 +124,12 @@ export function assetWindow(body, skip, length) {
         while (length) {
           const {value, done} = await reader.read();
           if (done) throw new Error('truncated asset');
-          const start = Math.min(skip, value.byteLength); skip -= start;
-          const n = Math.min(length, value.byteLength - start);
+          const len = BigInt(value.byteLength);
+          const start = skip > len ? value.byteLength : Number(skip); skip -= BigInt(start);
+          const rem = value.byteLength - start;
+          const n = length > BigInt(rem) ? rem : Number(length);
           if (!n) continue;
-          c.enqueue(value.subarray(start, start + n)); length -= n;
+          c.enqueue(value.subarray(start, start + n)); length -= BigInt(n);
           if (length) return;
         }
         await reader.cancel(); c.close();
@@ -116,8 +143,8 @@ extern "C" {
     #[wasm_bindgen(js_name = assetWindow)]
     fn asset_window(
         body: &web_sys::ReadableStream,
-        skip: f64,
-        length: f64,
+        skip: u64,
+        length: u64,
     ) -> web_sys::ReadableStream;
 }
 
@@ -149,7 +176,7 @@ pub async fn asset_range(
         let body = response
             .body()
             .ok_or_else(|| Error::RustError("Missing asset body".into()))?;
-        Ok(asset_window(&body, skip as f64, length as f64))
+        Ok(asset_window(&body, skip, length))
     };
     fetch
         .await
@@ -173,5 +200,5 @@ pub fn objects(bucket: Bucket, parts: Vec<(String, u64)>) -> web_sys::ReadableSt
         })
     });
     let stream = concatenate(&next.into_js_value().into());
-    fixed_length(&stream, total as f64)
+    fixed_length(&stream, total)
 }
