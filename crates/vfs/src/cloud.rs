@@ -12,7 +12,7 @@ use std::{
 
 pub trait Transport {
     /// Snapshot the current call's credential and PID before any await. This is kernel
-    /// task context, never the opener or connection's cached identity. Only jobs omit PID.
+    /// task context, never the opener or connection's cached identity. Data calls need PID.
     fn caller(&self) -> Result<(String, Option<u32>)>;
     /// POST /api/fs; deserialize a successful JSON body and translate an error's errno.
     /// Never retry a mutating request automatically except an open with its same ticket.
@@ -82,8 +82,8 @@ impl<T: Transport> CloudFs<T> {
                 pending: Some(pending),
             };
             let p = guard.pending.as_ref().expect("pending cancellation");
-            match self.send(&p.credential, p.call.clone()).await {
-                Ok(_) | Err(Errno::EACCES | Errno::ENOTCONN | Errno::EBADF) => {
+            match self.cleanup(p).await {
+                Ok(_) | Err(Errno::ENOTCONN | Errno::EBADF) => {
                     if let Call::Release { open } = &p.call {
                         self.opens.borrow_mut().remove(&open.id);
                     }
@@ -91,6 +91,21 @@ impl<T: Transport> CloudFs<T> {
                 }
                 Err(e) => return Err(e),
             }
+        }
+    }
+    async fn cleanup(&self, pending: &Pending) -> Result<Value> {
+        // The opener may have execed since this work was queued. Snapshot a replacement
+        // before awaiting, but keep the opener usable when no acting task remains.
+        let actor = self.transport.caller().ok().map(|(token, _)| token);
+        match self.send(&pending.credential, pending.call.clone()).await {
+            Err(Errno::EACCES) if actor.as_ref().is_some_and(|t| t != &pending.credential) => {
+                self.send(
+                    actor.as_deref().expect("acting credential"),
+                    pending.call.clone(),
+                )
+                .await
+            }
+            result => result,
         }
     }
     async fn send(&self, credential: &str, call: Call) -> Result<Value> {
@@ -716,7 +731,7 @@ impl<T: Transport> Filesystem for CloudFs<T> {
             };
             // Retain this release before older cleanup can fail or be cancelled.
             self.drain().await?;
-            self.send(&token, Call::Release { open: open.clone() })
+            self.cleanup(guard.pending.as_ref().expect("pending release"))
                 .await?;
             self.opens.borrow_mut().remove(&open.id);
             guard.pending = None;

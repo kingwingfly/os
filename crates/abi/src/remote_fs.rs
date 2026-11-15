@@ -187,7 +187,7 @@ pub struct DataRequest {
     pub version: u32,
     pub credential: String,
     /// The current caller, validated against this credential's issuer namespace. A fork
-    /// shares a credential, not a PID or I/O budget. Only job credentials may omit it.
+    /// shares a credential, not a PID or I/O budget. Missing PIDs are rejected.
     pub pid: Option<u32>,
     pub session: Session,
     pub open: OpenRef,

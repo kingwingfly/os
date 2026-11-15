@@ -605,6 +605,9 @@ fn exec(
     );
     // The image the process ran before is replaced: its token and its image's descriptor die
     // with the exec, not only when the process ends; what it opened stays open for the new one.
+    if let Some(current) = &current {
+        db.inherit_cloud_opens(ns, &current.token, &asked.token);
+    }
     if let Some(old) = &asked.old {
         db.revoke(ns, old);
     }

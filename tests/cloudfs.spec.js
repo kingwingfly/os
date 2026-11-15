@@ -16,7 +16,7 @@ async function connection(request,{token,pid}) {
   const c={...await rpc(request,token,null,'connect'),request,token,pid,umask:0o022};
   c.call=(op,args,errno)=>{
     if(['create','mkdir','mknod'].includes(op))args={umask:c.umask,...args};
-    return rpc(request,token,c.session,args===undefined?op:{[op]:args},errno);
+    return rpc(request,c.token,c.session,args===undefined?op:{[op]:args},errno);
   };
   c.data=async(open,operation,bytes,errno)=>{
     const response=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Filesystem':JSON.stringify({version:2,credential:c.token,pid:c.pid,session:c.session,open,operation})},data:bytes??Buffer.alloc(0)});
@@ -104,6 +104,59 @@ test('revoking an opener releases its inode and locks even when another credenti
   const {c,dir,p}=await setup(request);const observer=await admit(request);
   const [entry,open]=await c.create(dir,'file');await c.write(open,'kept');await c.call('unlink',{dir,name:'file'});
   await call(request,{kill:{pid:String(p.pid),signal:9}});
+  await rpc(request,observer.token,c.session,{sync:{open,data_only:false}},'EACCES');
+  await rpc(request,observer.token,c.session,{metadata:{handle:entry.handle}},'ESTALE');
+  await rpc(request,observer.token,c.session,'disconnect');
+});
+const replace=async(request,p,local)=>call(request,{execve:{pid:p.pid,proc:p.token,path:local?'/mnt/local/probe':'/usr/bin/coreutils',argv:['coreutils','sleep','300'],env:[],cwd:'/',...(local?{runtime:'resources-v1',local}:{} )}});
+test('exec retains unlinked cloud opens and locks across repeated token rotation',async({request})=>{
+  const {c,dir}=await setup(request);const observer=await admit(request);
+  const [entry,open]=await c.create(dir,'exec');await c.write(open,'kept');
+  const peer=await rpc(request,observer.token,c.session,{open:{ticket:randomUUID(),handle:entry.handle,options:options()}});
+  const range={start:0,end:null};await c.call('try_lock',{open,family:'flock',kind:'exclusive',range});
+  await c.call('unlink',{dir,name:'exec'});
+  for(let i=0;i<2;i++){
+    const old=c.token;const next=await replace(request,c);expect(next.pid).toBe(c.pid);c.token=next.token;
+    await rpc(request,old,c.session,{sync:{open,data_only:false}},'EACCES');
+    await c.call('renew');await c.call('sync',{open,data_only:false});
+    expect((await c.read(open)).toString()).toBe('kept'+'!'.repeat(i));await c.write(open,'!');
+    await rpc(request,observer.token,c.session,{try_lock:{open:peer,family:'flock',kind:'exclusive',range}},'EAGAIN');
+  }
+  await call(request,{kill:{pid:String(c.pid),signal:9}});
+  await rpc(request,observer.token,c.session,{sync:{open,data_only:false}},'EACCES');
+  await rpc(request,observer.token,c.session,{try_lock:{open:peer,family:'flock',kind:'exclusive',range}});
+  await rpc(request,observer.token,c.session,{cancel_lock:{open,ticket:randomUUID()}});
+  await rpc(request,observer.token,c.session,{release:{open}});
+  await rpc(request,observer.token,c.session,{release:{open:peer}});
+  await rpc(request,observer.token,c.session,{metadata:{handle:entry.handle}},'ESTALE');
+  await rpc(request,observer.token,c.session,'disconnect');
+});
+test('fork and exec retain inherited opens until the last credential is revoked',async({request})=>{
+  for(const endParentFirst of [true,false]){
+    const {c,dir,p}=await setup(request);const observer=await admit(request);
+    const [entry,open]=await c.create(dir,'fork-exec');await c.write(open,'shared');await c.call('unlink',{dir,name:'fork-exec'});
+    const fork={...await call(request,{fork:{pid:p.pid}},{pid:p.pid,proc:p.token}),token:p.token};
+    const child=await replace(request,fork);
+    const [late,later]=await c.create(dir,'after-fork-exec');await c.call('unlink',{dir,name:'after-fork-exec'});
+    const first=endParentFirst?p:child,last=endParentFirst?child:p;
+    await call(request,{kill:{pid:String(first.pid),signal:9}});
+    c.token=last.token;c.pid=last.pid;
+    await c.call('sync',{open,data_only:false});expect((await c.read(open)).toString()).toBe('shared');await c.write(open,'!');
+    if(endParentFirst){
+      // A successor inherits only the descriptions open at its exec, never later opens.
+      await c.call('sync',{open:later,data_only:false},'EACCES');await c.call('metadata',{handle:late.handle},'ESTALE');
+    }
+    await call(request,{kill:{pid:String(last.pid),signal:9}});
+    await rpc(request,observer.token,c.session,{sync:{open,data_only:false}},'EACCES');
+    await rpc(request,observer.token,c.session,{metadata:{handle:entry.handle}},'ESTALE');
+    await rpc(request,observer.token,c.session,'disconnect');
+  }
+});
+test('exec cannot retain cloud grants when the replacement drops cloud access',async({request})=>{
+  const {c,dir}=await setup(request);const observer=await admit(request);
+  const [entry,open]=await c.create(dir,'attenuated');await c.write(open,'private');await c.call('unlink',{dir,name:'attenuated'});
+  const denied=await replace(request,c,{digest:'a'.repeat(64),size:8,cloud:false});
+  await rpc(request,denied.token,c.session,{sync:{open,data_only:false}},'EACCES');
   await rpc(request,observer.token,c.session,{sync:{open,data_only:false}},'EACCES');
   await rpc(request,observer.token,c.session,{metadata:{handle:entry.handle}},'ESTALE');
   await rpc(request,observer.token,c.session,'disconnect');
@@ -519,6 +572,7 @@ for(const operation of ['write','truncate'])test(`${operation} privilege bits fo
   const guestOpen=await rpc(request,guest.token,c.session,{open:{ticket:randomUUID(),handle:entry.handle,options:options()}});
   try {
     for(const open of [rootOpen,guestOpen])for(const actor of [guest,p])for(const mode of [0o6755,0o6744]) {
+      c.token=p.token;c.pid=p.pid;
       await c.call('set_len',{open:rootOpen,size:4});await c.call('setattr',{handle:entry.handle,attr:attrs({mode})});
       c.token=actor.token;c.pid=actor.pid;
       if(operation==='write') {

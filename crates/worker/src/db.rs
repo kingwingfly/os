@@ -32,7 +32,7 @@ extern "C" {
 const ROLLBACK: &str = "rollback";
 
 /// The version of the tables below, which local state made by an older one does not have.
-pub const SCHEMA_VERSION: &str = "8";
+pub const SCHEMA_VERSION: &str = "9";
 
 const SCHEMA: [&str; 36] = [
     "CREATE TABLE IF NOT EXISTS execution_owners(lineage TEXT PRIMARY KEY, uid INTEGER NOT NULL)",

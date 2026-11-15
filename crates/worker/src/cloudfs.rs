@@ -28,10 +28,11 @@ type Result<T> = std::result::Result<T, Errno>;
 pub fn schema(sql: &SqlStorage) -> worker::Result<()> {
     for statement in [
         "CREATE TABLE IF NOT EXISTS vfs_sessions(id TEXT PRIMARY KEY, secret TEXT NOT NULL, ns TEXT NOT NULL, expires INTEGER NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS vfs_opens(id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL, ino INTEGER NOT NULL, credential TEXT NOT NULL, access TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS vfs_opens(id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL, ino INTEGER NOT NULL, access TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)",
         "CREATE INDEX IF NOT EXISTS vfs_opens_inode ON vfs_opens(ino, revoked)",
         "CREATE INDEX IF NOT EXISTS vfs_opens_session ON vfs_opens(session)",
-        "CREATE INDEX IF NOT EXISTS vfs_opens_credential ON vfs_opens(credential)",
+        "CREATE TABLE IF NOT EXISTS vfs_open_grants(open INTEGER NOT NULL, credential TEXT NOT NULL, PRIMARY KEY(open, credential))",
+        "CREATE INDEX IF NOT EXISTS vfs_open_grants_credential ON vfs_open_grants(credential)",
         "CREATE TABLE IF NOT EXISTS vfs_calls(session TEXT NOT NULL, ticket TEXT NOT NULL, result TEXT, open INTEGER, cancelled INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(session,ticket))",
         "CREATE TABLE IF NOT EXISTS vfs_locks(ino INTEGER PRIMARY KEY, state TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS vfs_extents(file TEXT NOT NULL, start INTEGER NOT NULL, length INTEGER NOT NULL, key TEXT NOT NULL, offset INTEGER NOT NULL, source TEXT, PRIMARY KEY(file, start))",
@@ -57,7 +58,6 @@ struct OpenRow {
     id: u64,
     session: String,
     ino: u64,
-    credential: String,
     access: String,
     revoked: u8,
 }
@@ -136,6 +136,15 @@ fn identity(db: &mut Db) -> (FsId, String) {
     };
     (FsId(get("vfs_id")), get("vfs_handle_key"))
 }
+fn authorize(credential: &Credential) -> Result<()> {
+    credential.cloud().map_err(|_| Errno::EACCES)?;
+    // Jobs have recorded path grants enforced by executor::authorize. Until the handle
+    // protocol can enforce those same restrictions, they must use the scoped job API.
+    if credential.job().is_some() {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
+}
 pub(super) fn caller(db: &mut Db, session: &wire::Session, token: &str) -> Result<Caller> {
     let row = db
         .rows::<SessionRow>(
@@ -151,7 +160,7 @@ pub(super) fn caller(db: &mut Db, session: &wire::Session, token: &str) -> Resul
         return Err(Errno::ENOTCONN);
     }
     let credential = db.credential(token, &row.ns).ok_or(Errno::EACCES)?;
-    credential.cloud().map_err(|_| Errno::EACCES)?;
+    authorize(&credential)?;
     let (fs, key) = identity(db);
     Ok(Caller {
         session: row,
@@ -171,17 +180,14 @@ impl Caller {
         pid: Option<u32>,
         write: bool,
         bytes: u64,
-    ) -> Result<Option<crate::resources::IoRequest>> {
-        if self.credential.job().is_some() {
-            return Ok(None);
-        }
-        Ok(Some(crate::resources::IoRequest {
+    ) -> Result<crate::resources::IoRequest> {
+        Ok(crate::resources::IoRequest {
             ns: self.credential.ns.clone(),
             token: token.into(),
             pid: Some(pid.ok_or(Errno::EINVAL)?),
             write,
             bytes,
-        }))
+        })
     }
     fn proof(&self, node: NodeId) -> Hmac<Sha256> {
         let mut mac = Hmac::<Sha256>::new_from_slice(self.key.as_bytes())
@@ -256,7 +262,22 @@ impl Caller {
         struct Id {
             id: u64,
         }
-        let id = db.rows::<Id>("INSERT INTO vfs_opens(session, ino, credential, access) VALUES(?, ?, ?, ?) RETURNING id", vec![text(&self.session.id), int(node.ino), text(&self.credential.token), text(&serde_json::to_string(&access).map_err(|_| Errno::EIO)?)]).pop().ok_or(Errno::EIO)?.id;
+        let id = db
+            .rows::<Id>(
+                "INSERT INTO vfs_opens(session, ino, access) VALUES(?, ?, ?) RETURNING id",
+                vec![
+                    text(&self.session.id),
+                    int(node.ino),
+                    text(&serde_json::to_string(&access).map_err(|_| Errno::EIO)?),
+                ],
+            )
+            .pop()
+            .ok_or(Errno::EIO)?
+            .id;
+        db.run(
+            "INSERT INTO vfs_open_grants(open, credential) VALUES(?, ?)",
+            vec![int(id), text(&self.credential.token)],
+        );
         Ok(OpenRef {
             fs: self.fs.clone(),
             id,
@@ -267,7 +288,7 @@ impl Caller {
             access,
         })
     }
-    pub(super) fn opened(&self, db: &Db, open: &OpenRef) -> Result<Node> {
+    fn open_row(&self, db: &Db, open: &OpenRef) -> Result<OpenRow> {
         let row = db
             .rows::<OpenRow>("SELECT * FROM vfs_opens WHERE id = ?", vec![int(open.id)])
             .pop()
@@ -275,17 +296,17 @@ impl Caller {
         if row.session != self.session.id || open.fs != self.fs {
             return Err(Errno::EACCES);
         }
-        if row.revoked != 0 {
-            return Err(Errno::EACCES);
-        }
-        let opener = db
-            .credential_of(&row.credential, &self.session.ns)
-            .ok_or(Errno::EACCES)?;
-        opener.cloud().map_err(|_| Errno::EACCES)?;
         if row.ino != open.node.ino
             || open.node.generation != 1
             || row.access != serde_json::to_string(&open.access).map_err(|_| Errno::EIO)?
         {
+            return Err(Errno::EACCES);
+        }
+        Ok(row)
+    }
+    pub(super) fn opened(&self, db: &Db, open: &OpenRef) -> Result<Node> {
+        let row = self.open_row(db, open)?;
+        if row.revoked != 0 || !db.cloud_granted(open.id, &self.session.ns) {
             return Err(Errno::EACCES);
         }
         db.inode(row.ino).ok_or(Errno::ESTALE)
@@ -371,7 +392,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         let credential = db
             .credential(&request.credential, ns)
             .ok_or(Errno::EACCES)?;
-        credential.cloud().map_err(|_| Errno::EACCES)?;
+        authorize(&credential)?;
         let session = wire::Session {
             id: auth::random_token(),
             secret: auth::random_token(),
@@ -805,7 +826,8 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             Value::Null
         }
         Release { open } => {
-            c.opened(db, open)?;
+            // Cleanup can retire a revoked tombstone; it never renews the open's grant.
+            c.open_row(db, open)?;
             db.release_cloud_open(open.id, false);
             Value::Null
         }
@@ -915,6 +937,20 @@ fn rename(
 }
 
 impl Db {
+    fn cloud_granted(&self, open: u64, ns: &str) -> bool {
+        !self.rows::<Value>(
+            "SELECT 1 FROM vfs_open_grants g JOIN credentials c ON c.token = g.credential WHERE g.open = ? AND c.ns = ? AND c.expires > ? AND c.cloud_access != 0 LIMIT 1",
+            vec![int(open), text(ns), int(auth::now())],
+        ).is_empty()
+    }
+    /// Exec inherits existing grants without transferring them away from a fork still
+    /// holding the old token. A revoked/expired token cannot acquire a successor grant.
+    pub(crate) fn inherit_cloud_opens(&mut self, ns: &str, old: &str, new: &str) {
+        self.run(
+            "INSERT OR IGNORE INTO vfs_open_grants(open, credential) SELECT g.open, successor.token FROM vfs_open_grants g JOIN vfs_opens o ON o.id = g.open JOIN credentials prior ON prior.token = g.credential JOIN credentials successor ON successor.token = ? WHERE g.credential = ? AND o.revoked = 0 AND prior.ns = ? AND successor.ns = prior.ns AND successor.owner = prior.owner AND prior.expires > ? AND successor.expires > ? AND prior.cloud_access != 0 AND successor.cloud_access != 0",
+            vec![text(new), text(old), text(ns), int(auth::now()), int(auth::now())],
+        );
+    }
     pub(crate) fn cloud_pinned(&self, ino: u64) -> bool {
         !self
             .rows::<Value>(
@@ -939,6 +975,10 @@ impl Db {
     pub(crate) fn release_cloud_open(&mut self, id: u64, revoked: bool) {
         let rows = self.rows::<OpenRow>("SELECT * FROM vfs_opens WHERE id = ?", vec![int(id)]);
         for row in rows {
+            self.run(
+                "DELETE FROM vfs_open_grants WHERE open = ?",
+                vec![int(row.id)],
+            );
             if revoked {
                 self.run(
                     "UPDATE vfs_opens SET revoked = 1 WHERE id = ?",
@@ -953,11 +993,23 @@ impl Db {
     }
     pub(crate) fn revoke_cloud_opens(&mut self, hash: &str) {
         let rows = self.rows::<OpenRow>(
-            "SELECT * FROM vfs_opens WHERE credential = ? AND revoked = 0",
+            "SELECT o.* FROM vfs_opens o JOIN vfs_open_grants g ON g.open = o.id WHERE g.credential = ? AND o.revoked = 0",
+            vec![text(hash)],
+        );
+        self.run(
+            "DELETE FROM vfs_open_grants WHERE credential = ?",
             vec![text(hash)],
         );
         for row in rows {
-            self.release_cloud_open(row.id, true);
+            let ns = self
+                .rows::<SessionRow>(
+                    "SELECT * FROM vfs_sessions WHERE id = ?",
+                    vec![text(&row.session)],
+                )
+                .pop();
+            if ns.is_none_or(|s| !self.cloud_granted(row.id, &s.ns)) {
+                self.release_cloud_open(row.id, true);
+            }
         }
     }
     pub(crate) fn end_cloud_session(&mut self, id: &str) {
@@ -987,7 +1039,8 @@ impl Db {
         for row in rows {
             self.end_cloud_session(&row.id);
         }
-        let rows=self.rows::<OpenRow>("SELECT o.* FROM vfs_opens o LEFT JOIN credentials c ON c.token = o.credential WHERE o.revoked = 0 AND (c.token IS NULL OR c.expires <= ? OR c.cloud_access = 0)",vec![int(auth::now())]);
+        self.run("DELETE FROM vfs_open_grants WHERE credential NOT IN (SELECT token FROM credentials WHERE expires > ? AND cloud_access != 0)", vec![int(auth::now())]);
+        let rows = self.rows::<OpenRow>("SELECT o.* FROM vfs_opens o WHERE o.revoked = 0 AND NOT EXISTS (SELECT 1 FROM vfs_open_grants g WHERE g.open = o.id)", vec![]);
         for row in rows {
             self.release_cloud_open(row.id, true);
         }
@@ -1022,6 +1075,9 @@ fn locks(db: &mut Db, c: &Caller, call: &Call) -> Result<Value> {
         }
         _ => return Err(Errno::EINVAL),
     };
+    if matches!(call, CancelLock { .. }) && c.open_row(db, open)?.revoked != 0 {
+        return Ok(Value::Null);
+    }
     let node = c.opened(db, open)?;
     advisory::validate(open.access, family, kind, range)?;
     let mut state = db.cloud_locks(node.ino);

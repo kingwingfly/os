@@ -271,13 +271,13 @@ fn release_compatibility_rejects_rollback_into_incompatible_state() {
         sysext: vec![],
         confext: vec![],
         protocol: Range { min: 1, max: 1 },
-        schema: Range { min: 8, max: 8 },
+        schema: Range { min: 9, max: 9 },
         provenance: BTreeMap::new(),
     };
     assert!(r.validate().is_ok());
     r.schema.max = 6;
     assert!(r.validate().is_err());
-    r.schema.max = 8;
+    r.schema.max = 9;
     r.protocol.min = 2;
     assert!(r.validate().is_err());
     r.protocol.min = 1;

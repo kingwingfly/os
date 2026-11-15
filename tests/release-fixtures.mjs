@@ -61,7 +61,7 @@ await writeFile(join(bundle, `releases/${ids.incompatible}/manifest.json`), byte
 await writeFile(join(bundle, `releases/${ids.incompatible}/signature.json`), JSON.stringify(signature));
 
 // A complete candidate for an interrupted preparation. No selected release changes here.
-release.schema={min:8,max:8};release.name='interrupted';
+release.schema={min:9,max:9};release.name='interrupted';
 const interrupted=Buffer.from(JSON.stringify(release));ids.interrupted=sha(interrupted);
 await mkdir(join(bundle,`releases/${ids.interrupted}`),{recursive:true});
 await writeFile(join(bundle,`releases/${ids.interrupted}/manifest.json`),interrupted);

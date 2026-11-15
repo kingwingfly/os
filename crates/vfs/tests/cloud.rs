@@ -384,6 +384,46 @@ fn failed_older_cleanup_cannot_lose_a_close_or_release_queue_entry() {
     }
 }
 #[test]
+fn exec_rotation_retries_deferred_cleanup_without_losing_unauthorized_work() {
+    let host = Host::default();
+    let fs = now_or_never(CloudFs::connect(host.clone(), "opener".into()))
+        .unwrap()
+        .unwrap();
+    let mut cred = Cred::root();
+    cred.token = Some("opener".into());
+    let options = *OpenOptions::new().read(true).write(true);
+    let opened = ready(fs.open(&cred, &root(), &options)).unwrap();
+    host.pending.set(true);
+    assert!(now_or_never(fs.open(&cred, &root(), &options)).is_none());
+    host.pending.set(false);
+    host.denied
+        .borrow_mut()
+        .extend(["opener".into(), "revoked actor".into()]);
+    *host.actor.borrow_mut() = ("revoked actor".into(), Some(42));
+    assert_eq!(ready(fs.release(&opened)), Err(Errno::EACCES));
+    assert_eq!(fs.pending_cancellations(), 2);
+    *host.actor.borrow_mut() = ("replacement".into(), Some(42));
+    assert_eq!(now_or_never(fs.drain()), Some(Ok(())));
+    assert_eq!(fs.pending_cancellations(), 0);
+    for cleanup in ["cancel_open", "release"] {
+        assert!(host.requests.borrow().iter().any(|r| {
+            r.credential == "replacement"
+                && serde_json::to_value(&r.call)
+                    .unwrap()
+                    .get(cleanup)
+                    .is_some()
+        }));
+    }
+    assert_eq!(ready(fs.sync_all(&opened)), Err(Errno::EBADF));
+    // A direct close also retries when exec retired its original opening credential.
+    cred.token = Some("replacement".into());
+    let opened = ready(fs.open(&cred, &root(), &options)).unwrap();
+    host.denied.borrow_mut().push("replacement".into());
+    *host.actor.borrow_mut() = ("next exec".into(), Some(42));
+    assert_eq!(ready(fs.release(&opened)), Ok(()));
+    assert_eq!(fs.pending_cancellations(), 0);
+}
+#[test]
 fn cancelling_a_release_while_draining_older_cleanup_keeps_both_obligations() {
     let host = Host::default();
     let fs = now_or_never(CloudFs::connect(host.clone(), "opener".into()))
