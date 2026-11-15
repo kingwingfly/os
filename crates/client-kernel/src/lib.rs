@@ -15,6 +15,11 @@
 //! its host's (the tab, or port, that executed it): only that host forks it, replaces its image,
 //! ends it, waits for its children, or signals as it. A signal a process sends is the machine's
 //! to allow as that process, by its token; one the page sends, as the page's account.
+mod cloudfs;
+mod helper;
+mod hostfs;
+mod mounts;
+
 use abi::{Batch, Call, Errno, Error, Exec, PROC_POLL_MAX, Return, SIGTERM};
 use serde_json::{Value, json};
 use std::cell::RefCell;

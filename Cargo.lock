@@ -2674,6 +2674,7 @@ dependencies = [
  "os-abi",
  "os-image",
  "os-kernel",
+ "os-vfs",
  "serde",
  "serde_json",
  "wasm-bindgen",

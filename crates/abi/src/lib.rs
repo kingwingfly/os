@@ -14,6 +14,7 @@ use std::fmt;
 pub mod accelerator;
 pub mod contract;
 pub mod fs;
+pub mod local_helper;
 pub mod remote_fs;
 pub mod system;
 

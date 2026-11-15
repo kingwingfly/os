@@ -23,11 +23,16 @@
 //!   against, and the instance's tmpfs.
 
 pub mod cloud;
+pub mod cloud_http;
+pub mod descriptions;
 pub mod fdtable;
 pub mod file;
+pub mod helperfs;
+pub mod hostfs;
 pub mod locks;
 pub mod memfs;
 pub mod profiles;
+pub mod stat;
 
 pub use fdtable::{FD_MAX, Fd, FdTable};
 pub use file::{File, FileRef, ReleaseQueue};
