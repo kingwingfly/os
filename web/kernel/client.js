@@ -83,6 +83,7 @@ self.cloudFsTicket = () => self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.
 
 function boot() {
   starting ??= wasm_bindgen(asset('/client_kernel_bg.wasm')).then(async () => {
+    self.wasm_bindgen = wasm_bindgen;
     // A dedicated kernel never resets the namespace on boot; locks and leases reclaim it.
     const id = '';
     kernel = new wasm_bindgen.Kernel(id, locks ? kernelId : '');
