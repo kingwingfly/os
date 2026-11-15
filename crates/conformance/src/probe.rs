@@ -433,6 +433,14 @@ impl Probe {
             "mkdir(shared)",
             io(fs::create_dir(p("creation"))),
         );
+        if let Some(group) = platform::neutral_group(self.gid) {
+            unit(
+                "creation",
+                "chgrp",
+                "chgrp(shared, neutral)",
+                platform::chgrp(&p("creation"), group),
+            );
+        }
         unit(
             "creation",
             "setgid",

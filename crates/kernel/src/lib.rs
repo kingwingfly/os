@@ -27,6 +27,8 @@ pub use namei::namei;
 /// What a store keeps beyond names and inodes: the time, an inode's times, empty content for a
 /// new file, and what has arrived of content still being written.
 pub trait Fs: Store {
+    /// `st_dev`: the filesystem's identity, as `abi::fs::FsId::dev` derives it.
+    fn dev(&self) -> u64;
     /// Seconds since 1970, and nanoseconds past them.
     fn now(&self) -> (u64, u32);
     /// The inode `ino`'s times.
@@ -49,6 +51,9 @@ pub trait Fs: Store {
 /// The store in memory, for tests and tools: no clock, no times, every file whole but those
 /// marked `incomplete`, of which nothing has arrived.
 impl Fs for MemStore {
+    fn dev(&self) -> u64 {
+        abi::fs::FsId("memory".into()).dev()
+    }
     fn now(&self) -> (u64, u32) {
         (0, 0)
     }
@@ -234,6 +239,7 @@ pub fn stat_of(fs: &impl Fs, node: &Node) -> Stat {
                 recording,
             });
     Stat {
+        dev: fs.dev(),
         ino: node.ino,
         mode: kind | u32::from(node.mode & 0o7777),
         nlink: node.links,

@@ -1,7 +1,7 @@
 //! Versions and capability descriptions from the architecture contract
 //! (docs/architecture/contract.md), defined in L0b (#47) for the steps that follow. Nothing uses
-//! them yet; each later step adopts what it needs. Errno names that `Errno` lacks today
-//! (ENOTCONN, ENOLCK, EDQUOT, EPROTONOSUPPORT) are added by the step that first returns them.
+//! them yet; each later step adopts what it needs. `Errno` carries the names the
+//! contract adds (ENOTCONN, ENOLCK, EDQUOT, EPROTONOSUPPORT).
 
 use crate::Errno;
 use serde::{Deserialize, Serialize};

@@ -26,6 +26,7 @@ pub fn error(e: io::Error) -> String {
         (libc::EFAULT, "EFAULT"),
         (libc::EDQUOT, "EDQUOT"),
         (libc::ENOTCONN, "ENOTCONN"),
+        (libc::ENOLCK, "ENOLCK"),
         (libc::EACCES, "EACCES"),
         (libc::EBUSY, "EBUSY"),
         (libc::EEXIST, "EEXIST"),
@@ -113,7 +114,7 @@ pub struct Identity {
 #[cfg(any(target_os = "wasi", test))]
 fn identity_from_json(value: &Value) -> Identity {
     Identity {
-        dev: value["dev"].as_u64(),
+        dev: value["dev"].as_u64().filter(|n| *n != 0),
         ino: value["ino"].as_u64().filter(|n| *n != 0),
     }
 }
@@ -154,11 +155,10 @@ pub fn fdidentity(file: &File) -> Result<Identity> {
     }
     #[cfg(target_os = "wasi")]
     {
-        // There is no abi::Call::Fstat and ABI descriptor numbers are distinct
-        // from libc fds. Preview 1 exposes the inode, but writeFilestat invents
-        // dev=1 and substitutes ino=0 when absent. Neither is identity evidence.
+        // Preview 1 filestat carries the filesystem's st_dev and the inode; the
+        // runtime reports 0 for either when it has no identity to give.
         Ok(Identity {
-            dev: None,
+            dev: (s.st_dev != 0).then_some(s.st_dev),
             ino: (s.st_ino != 0).then_some(s.st_ino),
         })
     }
@@ -197,6 +197,48 @@ pub fn chmod(path: &Path, mode: u32) -> Result<()> {
             mode: mode as u16,
         })
         .map(|_| ())
+    }
+}
+pub fn chgrp(path: &Path, gid: u64) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let gid = libc::gid_t::try_from(gid).map_err(|_| "EINVAL".to_string())?;
+        rc(unsafe { libc::chown(c(path).as_ptr(), !0 as libc::uid_t, gid) })
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        let gid = u32::try_from(gid).map_err(|_| "EINVAL".to_string())?;
+        call(abi::Call::Chown {
+            path: path.to_string_lossy().into_owned(),
+            uid: None,
+            gid: Some(gid),
+            nofollow: false,
+        })
+        .map(|_| ())
+    }
+}
+pub fn neutral_group(gid: u64) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if count > 0 {
+            let mut groups = vec![0; count as usize];
+            if unsafe { libc::getgroups(count, groups.as_mut_ptr()) } >= 0
+                && let Some(other) = groups.into_iter().map(u64::from).find(|&g| g != gid)
+            {
+                return Some(other);
+            }
+        }
+        (unsafe { libc::geteuid() } == 0 && named_acl_available() && gid != 65534).then_some(65534)
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        let creds = call(abi::Call::Getcreds).ok()?;
+        creds["groups"]
+            .as_array()?
+            .iter()
+            .filter_map(|g| g.as_u64())
+            .find(|&g| g != gid)
     }
 }
 pub fn umask(mode: u32) {

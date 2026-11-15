@@ -74,6 +74,13 @@ self.kernelSys = async (body, signal) => {
   return JSON.stringify({ status: response.status, text: await response.text() });
 };
 
+self.cloudFsPost = async (path, headers, body) => {
+  const response = await fetch(path, { method: 'POST', headers, body });
+  return { status: response.status, body: new Uint8Array(await response.arrayBuffer()) };
+};
+self.cloudFsSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+self.cloudFsTicket = () => self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
 function boot() {
   starting ??= wasm_bindgen(asset('/client_kernel_bg.wasm')).then(async () => {
     // A dedicated kernel never resets the namespace on boot; locks and leases reclaim it.
@@ -239,7 +246,6 @@ async function dispatch(message, host, tab) {
       if (!response.ok) throw { errno: 'EACCES' };
       return (await response.json()).results?.[0]?.ok;
     }
-    case 'vfs_policy': return JSON.parse(wasm_bindgen.vfs_policy(JSON.stringify(args.input)));
     case 'machine_init_status': return { ...machineInit.current(), reaper: machineInit.reaper.current() };
     case 'machine_init_resume': return machineInit.resume();
     case 'machine_init_leave': await machineInit.stop(); return null;
@@ -297,6 +303,22 @@ async function dispatch(message, host, tab) {
     case 'cgroup_remove': return JSON.parse(await kernel.cgroup_remove(args.path));
     case 'cgroup_stat': return JSON.parse(await kernel.cgroup_stat(args.path));
     case 'cgroup_list': return JSON.parse(await kernel.cgroup_list(args.path ?? '/'));
+    case 'cloud_open': return JSON.parse(await kernel.cloud_open(args.pid, host, args.path, args.flags, args.mode ?? 0, args.umask ?? 0o022));
+    case 'cloud_read': return await kernel.cloud_read(args.pid, host, args.id, args.count, args.offset != null ? BigInt(args.offset) : undefined);
+    case 'cloud_write': return await kernel.cloud_write(args.pid, host, args.id, args.data, args.offset != null ? BigInt(args.offset) : undefined);
+    case 'cloud_seek': return (await kernel.cloud_seek(args.pid, host, args.id, BigInt(args.offset), args.whence)).toString();
+    case 'cloud_fstat': return JSON.parse(await kernel.cloud_fstat(args.pid, host, args.id));
+    case 'cloud_truncate': await kernel.cloud_truncate(args.pid, host, args.id, BigInt(args.size)); return null;
+    case 'cloud_sync': await kernel.cloud_sync(args.pid, host, args.id, !!args.data_only); return null;
+    case 'cloud_set_append': kernel.cloud_set_append(args.pid, host, args.id, !!args.append); return null;
+    case 'cloud_append': return kernel.cloud_append(args.pid, host, args.id);
+    case 'cloud_inherit': kernel.cloud_inherit(args.pid, args.child, JSON.stringify(args.ids ?? []), host); return null;
+    case 'cloud_close': await kernel.cloud_close(args.pid, host, args.id); return null;
+    case 'cloud_lock': await kernel.cloud_lock(args.pid, host, args.id, args.family, args.kind, BigInt(args.start), args.end != null ? BigInt(args.end) : undefined, !!args.wait); return null;
+    case 'cloud_cancel': kernel.cloud_cancel(args.pid, host, args.id); return null;
+    case 'cloud_unlock': await kernel.cloud_unlock(args.pid, host, args.id, args.family, BigInt(args.start), args.end != null ? BigInt(args.end) : undefined); return null;
+    case 'cloud_test_lock': return JSON.parse(await kernel.cloud_test_lock(args.pid, host, args.id, args.kind, BigInt(args.start), args.end != null ? BigInt(args.end) : undefined));
+    case 'cloud_renew': await kernel.cloud_renew(); return null;
     default: throw { errno: 'ENOSYS', detail: `no client-kernel call ${type}` };
   }
 }
@@ -321,7 +343,8 @@ async function handle(port, message) {
   // This kernel goes with its tab; other kernels and the Machine lease reclaim what it leaves.
   try {
     self.kernelRequest = async (type, args) => {
-      const answer = await serially(() => dispatch({ type, args }, host.id, host.tab)).catch(error => {
+      const run = () => dispatch({ type, args }, host.id, host.tab);
+      const answer = await (type.startsWith('cloud_') ? run() : serially(run)).catch(error => {
         const refused = failure(error);
         throw Object.assign(new Error(refused.detail ?? refused.errno), refused);
       });
@@ -343,7 +366,7 @@ async function handle(port, message) {
       if (message.type === 'console_grant') await login.tick();
       executor.setSharingPolicy(() => login.current());
       value = await executor.request(message.type, message.args ?? {}, value => port.postMessage({ v: VERSION, type: 'event', event: message.type.startsWith('attachment_') ? 'attachment' : 'run', value }), value => broadcast({ v: VERSION, type: 'event', event: 'seat', value }));
-    } else if ((message.type.startsWith('login_') && message.type !== 'login_service_attach' || message.type.startsWith('machine_init_'))) value = await dispatch(message, host.id, host.tab);
+    } else if (message.type.startsWith('cloud_') || (message.type.startsWith('login_') && message.type !== 'login_service_attach' || message.type.startsWith('machine_init_'))) value = await dispatch(message, host.id, host.tab);
     else value = await serially(() => dispatch(message, host.id, host.tab));
     // A wait answers once the machine heard of it, so that /proc agrees.
     if (message.type === 'wait' || message.type === 'waitchild') await heard();
@@ -358,3 +381,4 @@ async function handle(port, message) {
 self.onmessage = ({ data }) => handle(self, data);
 setInterval(() => { if (kernel) void serially(() => reapGone()).catch(() => {}); }, 10000);
 setInterval(() => { if (login) void login.tick(); if (machineInit) void machineInit.tick(); }, 5000);
+setInterval(() => { if (kernel) void kernel.cloud_renew().catch(() => {}); }, 30000);

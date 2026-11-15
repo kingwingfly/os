@@ -5,19 +5,24 @@ use serde::{Deserialize, Serialize};
 use std::ops::{Range, RangeFrom};
 type Result<T> = std::result::Result<T, Errno>;
 
+/// The largest integer a JavaScript number holds exactly (`Number.MAX_SAFE_INTEGER`): device and
+/// inode numbers stay within it, as they cross JSON into JavaScript.
+pub const JS_SAFE: u64 = (1 << 53) - 1;
+
 /// A filesystem's identity (contract §2.5): the authority's id, a UUID, a helper folder's id.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FsId(pub String);
 impl FsId {
-    /// `st_dev`: a stable number for this filesystem, the same wherever it is mounted (FNV-1a of
-    /// its id, never 0).
+    /// `st_dev`: a stable number for this filesystem, the same wherever it is mounted: FNV-1a
+    /// of its id, kept to 53 bits so JavaScript numbers carry it exactly, and never 0 (which
+    /// means no identity).
     pub fn dev(&self) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in self.0.bytes() {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        hash.max(1)
+        (hash & JS_SAFE).max(1)
     }
 }
 

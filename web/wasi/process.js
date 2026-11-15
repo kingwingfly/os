@@ -42,7 +42,7 @@ import { Signals, bit, valid, ignoredByDefault, stoppedByDefault, SA_RESTART, SA
 import { execCandidates } from './resolve.mjs';
 import { Pipe, pipeBuffer, PIPE_ATOMIC } from './pipe.js';
 import { Engine } from './fork.js';
-import { Bytes, Shares } from './shared.js';
+import { Shares } from './shared.js';
 import { TtyState, TtyControl, IOCTL, CC, LF } from '../kernel/pty.js';
 import { isByteDevice, readDevice } from './devices.mjs';
 
@@ -52,7 +52,7 @@ const ERRNO = {
   EINVAL: 28, EIO: 29, EISDIR: 31, ELOOP: 32, EMFILE: 33, EMLINK: 34, ENAMETOOLONG: 37, ENODEV: 43, ENOENT: 44,
   ENOEXEC: 45, ENOMEM: 48, ENOSPC: 51, ENOSYS: 52, ENOTCONN: 53, ENOTDIR: 54, ENOTEMPTY: 55, ENOTSUP: 58, EOPNOTSUPP: 58,
   ENOTTY: 59, ENXIO: 60, EPERM: 63, EPIPE: 64, EPROTONOSUPPORT: 66, ERANGE: 68, EROFS: 69, ESPIPE: 70, ESRCH: 71, ESTALE: 72,
-  ETIMEDOUT: 73, ETXTBSY: 74, EXDEV: 75, ENODATA: 44,
+  ETIMEDOUT: 73, ETXTBSY: 74, EXDEV: 75, ENODATA: 44, EDQUOT: 19, ENOLCK: 46,
 };
 const { EBADF, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, ENOTDIR, ESPIPE, EFBIG } = ERRNO;
 // What an execve that fails says, as a shell says it.
@@ -62,15 +62,15 @@ const STDIO = new Set(['in', 'out', 'pipe-in', 'pipe-out', 'tty', 'pty']);
 // What a file is, as WASI numbers it.
 const CHARACTER_DEVICE = 2, DIRECTORY = 3, REGULAR_FILE = 4, SYMBOLIC_LINK = 7, UNKNOWN = 0;
 // open(2)'s flags, as the kernel takes them (Linux's).
-const O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2, O_CREAT = 0o100, O_EXCL = 0o200, O_TRUNC = 0o1000, O_APPEND = 0o2000;
+const O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2, O_CREAT = 0o100, O_EXCL = 0o200, O_TRUNC = 0o1000, O_APPEND = 0o2000, O_DIRECTORY = 0o200000, O_NOFOLLOW = 0o400000;
 const W_OK = 2;
 // path_open's: oflags, fdflags, lookupflags, and the rights a descriptor has.
 const OFLAG_CREAT = 1, OFLAG_DIRECTORY = 2, OFLAG_EXCL = 4, OFLAG_TRUNC = 8, FDFLAG_APPEND = 1, FDFLAG_NONBLOCK = 4, FOLLOW = 1;
 const RIGHT_READ = 1n << 1n, RIGHT_SEEK = 1n << 2n, RIGHT_TELL = 1n << 5n, RIGHT_WRITE = 1n << 6n;
 const ALL_RIGHTS = (1n << 30n) - 1n;
-// The most a call carries in a batch (abi::INLINE_MAX), what a read fetches at a time, and the
-// most of an existing file rewritten here (a write to one not truncated, an append).
-const INLINE = 256 * 1024, WINDOW = 4 << 20, REWRITE_MAX = 64 << 20;
+// The most a call carries in a batch (abi::INLINE_MAX), what a fallback read fetches at a time,
+// and one chunk of a cloud file read or written over the host channel.
+const INLINE = 256 * 1024, WINDOW = 4 << 20, CLOUD_CHUNK = 512 * 1024;
 
 // The end of the process: its exit status, and the signal that ended it, if one did.
 class Exit { constructor(code, signal) { this.code = code; this.signal = signal; } }
@@ -199,19 +199,13 @@ function* range(path, start, end, token) {
   if (answer.status !== 200 && answer.status !== 206) throw new Errno(answer.status === 429 ? ERRNO.EAGAIN : answer.status === 404 ? ENOENT : answer.status === 403 ? ERRNO.EACCES : EIO);
   return answer.bytes;
 }
-// The whole of a file, for one written here anew.
-function* whole(path, size) {
-  if (size > REWRITE_MAX) throw new Errno(EFBIG);
-  if (size <= INLINE) return unbase64((yield* call({ pread: { path, count: INLINE } })).data);
-  return yield* range(path, 0, size);
-}
 const join = (dir, path) => path.startsWith('/') ? path : (dir === '/' ? '' : dir) + '/' + (path === '.' ? '' : path).replace(/^\.\//, '');
 const clean = path => path.length > 1 ? path.replace(/\/+$/, '').replace(/\/\/+/g, '/') || '/' : path;
 
 // ---- Descriptors ----
 
-// What each descriptor is: the terminal or a pipe (in, out), a directory, or a file read through
-// a kernel descriptor (kfd), one written (in order, in chunks), or one rewritten here whole.
+// What each descriptor is: the terminal or a pipe (in, out), a directory, a cloud file
+// (backed by client-kernel open descriptions), a local kernel descriptor, or a fallback reader/device.
 // Several descriptors may be one open file (dup, fork): `refs` counts this process's; its line's
 // table (`shares`, where memory may be shared) counts every process's, by pid, and holds its
 // offset, so that its host can close what a process it killed held last.
@@ -298,8 +292,11 @@ function* uninstall(fd) {
   if (found.kind === 'pipe-out') return found.pipe.drop(process.pid, 'w');
   if (found.share != null) {
     const gen = shares.gen(found.share);
-    if (shares.drop(found.share, process.pid) > 0) return;
-    postMessage({ closed: { slot: found.share, gen } });
+    const left = shares.drop(found.share, process.pid);
+    if (left <= 0) postMessage({ closed: { slot: found.share, gen } });
+    // Local shared files close once nobody in the line holds them; cloud descriptions track
+    // holders per pid in client-kernel, so each process drops its own description on last ref.
+    if (found.cloud == null ? left > 0 : found.refs > 0) return;
   } else if (found.refs > 0) return;
   yield* closeFd(found);
 }
@@ -331,7 +328,9 @@ function kindOf(mode) {
 const nanos = (seconds, nsec = 0) => BigInt(seconds ?? 0) * 1000000000n + BigInt(nsec ?? 0);
 function writeFilestat(ptr, found) {
   const v = view();
-  v.setBigUint64(ptr, 1n, true);
+  // st_dev is the filesystem's identity (abi::Stat::dev); 0 where none is known, never a
+  // made-up number that would make different filesystems look alike.
+  v.setBigUint64(ptr, BigInt(found.dev ?? 0), true);
   v.setBigUint64(ptr + 8, BigInt(found.ino ?? 0), true);
   v.setUint8(ptr + 16, found.filetype ?? kindOf(found.mode));
   v.setBigUint64(ptr + 24, BigInt(found.nlink ?? 1), true);
@@ -340,22 +339,89 @@ function writeFilestat(ptr, found) {
   v.setBigUint64(ptr + 48, nanos(found.mtime, found.mtime_nsec), true);
   v.setBigUint64(ptr + 56, nanos(found.ctime, found.ctime_nsec), true);
 }
+const cloudCall = (op, args = {}) => hostErrno(host('cloud', { op, ...args }));
+function cloudRead(found, offset, count) {
+  if (!found.read) throw new Errno(EBADF);
+  if (count === 0) return new Uint8Array(0);
+  const out = new Uint8Array(count);
+  let got = 0;
+  while (got < count) {
+    const want = Math.min(CLOUD_CHUNK, count - got);
+    let reply;
+    try {
+      reply = cloudCall('read', {
+        id: found.cloud,
+        count: want,
+        ...(offset != null ? { offset: (BigInt(offset) + BigInt(got)).toString() } : {}),
+      });
+    } catch (error) {
+      if (got > 0 && error instanceof Errno) break;
+      throw error;
+    }
+    const chunk = unbase64(reply.data);
+    out.set(chunk, got);
+    got += chunk.length;
+    if (chunk.length < want) break;
+  }
+  return out.subarray(0, got);
+}
+function cloudWrite(found, offset, data) {
+  if (!found.writable) throw new Errno(EBADF);
+  if (!data.length) return 0;
+  let sent = 0;
+  while (sent < data.length) {
+    const chunk = data.subarray(sent, sent + CLOUD_CHUNK);
+    let reply;
+    try {
+      reply = cloudCall('write', {
+        id: found.cloud,
+        data: base64(chunk),
+        ...(offset != null ? { offset: (BigInt(offset) + BigInt(sent)).toString() } : {}),
+      });
+    } catch (error) {
+      if (sent > 0 && error instanceof Errno) { forget(); return sent; }
+      throw error;
+    }
+    if (!reply.written) break;
+    sent += reply.written;
+    if (reply.written < chunk.length) break;
+  }
+  forget();
+  return sent;
+}
+function openCloud(path, dirflags, oflags, read, write, append, mode) {
+  const flags = (write ? read ? O_RDWR : O_WRONLY : O_RDONLY)
+    | (oflags & OFLAG_CREAT ? O_CREAT : 0)
+    | (oflags & OFLAG_TRUNC ? O_TRUNC : 0)
+    | (oflags & OFLAG_EXCL ? O_EXCL : 0)
+    | (append ? O_APPEND : 0)
+    | (oflags & OFLAG_DIRECTORY ? O_DIRECTORY : 0)
+    | (dirflags & FOLLOW ? 0 : O_NOFOLLOW);
+  const result = cloudCall('open', { path, flags, mode, umask: process.umask });
+  forget();
+  if (result.fallback) return null;
+  return { kind: 'file', cloud: result.id, path, read, writable: write, append, stat: result.stat };
+}
+function* syncFd(fd, data_only) {
+  const found = descriptor(fd);
+  if (found.cloud != null) { cloudCall('sync', { id: found.cloud, data_only }); return; }
+  if (found.local) { yield* call({ fsync: { fd: found.kfd, data_only } }); return; }
+  if (found.kind === 'dir') { yield* stat(found.path); return; }
+  throw new Errno(EINVAL);
+}
+
 // What a descriptor's file is now, as fstat says.
 function* fstat(found) {
+  if (found.cloud != null) return cloudCall('fstat', { id: found.cloud });
   if (found.local) return yield* call({ fstat: { fd: found.kfd } });
   if (found.kind === 'pty') return { ino: found.number, filetype: CHARACTER_DEVICE, mode: 0o020600 };
   if (STDIO.has(found.kind)) return { filetype: filetype(found), mode: found.tty ? 0o020620 : 0o010600 };
   if (found.kind === 'dir') return yield* stat(found.path);
-  if (found.writer || found.rewrite) {
-    const now = Math.floor(Date.now() / 1000);
-    return { ...(found.stat ?? {}), filetype: REGULAR_FILE, size: size(found), mtime: now, ctime: now };
-  }
   return found.stat ?? (yield* stat(found.path));
 }
-const size = found => found.rewrite ? found.bytes.length : found.writer ? found.bytes.from + found.bytes.length : found.size;
+const size = found => found.size;
 
-// Open the file at `path` for reading: the descriptor, its first bytes and its stat, in one
-// request.
+// Open the file at `path` for reading: fallback for /proc, devices, and hosts without a channel.
 function* openRead(path) {
   const [opened, read, stated] = yield* batch([{ open: { path, flags: O_RDONLY } }, { pread: { fd: { ref: 0 }, count: INLINE } }, { stat: { path } }]);
   if (opened.err?.errno === 'EISDIR') return { kind: 'dir', path };
@@ -369,27 +435,13 @@ function* openRead(path) {
   const first = read.ok;
   return { kind: 'file', path, kfd: fd, token, device, read: true, pos: 0, size: first.size, window: { start: 0, data: unbase64(first.data) }, stat: stated.ok };
 }
-// Open it for writing in order: a growing file, truncated or new. What is not sent yet is held
-// in memory a fork shares (shared.js): at most two chunks and an inline write.
+// Open a byte device for writing (fallback when outside cloud/local filesystems).
 function* openWriter(path, flags, read, mode = 0o666) {
   const opened = yield* call({ open: { path, flags: flags | (read ? O_RDWR : O_WRONLY), mode } });
   forget();
   if (isByteDevice(opened.device)) return { kind: 'file', path, kfd: opened.fd, device: opened.device, writable: true, read, pos: 0, size: 0 };
-  const chunk = opened.chunk_size || (8 << 20);
-  return { kind: 'file', path, kfd: opened.fd, writer: true, read, chunk, bytes: Bytes.create(chunk * 2 + INLINE), pos: 0 };
-}
-// Open an existing file to change in place, or append to: its content, written back whole when
-// it closes, if it changed.
-function* openRewrite(path, found, append, read) {
-  if (isByteDevice(found.rdev)) return yield* openWriter(path, 0, read);
-  const [allowed] = yield* batch([{ access: { path, mode: W_OK } }]);
-  ok(allowed);
-  const data = yield* whole(path, found.size);
-  const bytes = Bytes.create(REWRITE_MAX, Math.max(data.length, 64 * 1024));
-  bytes.ensure(data.length);
-  bytes.view.set(data);
-  bytes.length = data.length;
-  return { kind: 'file', path, rewrite: true, read, bytes, pos: append ? data.length : 0, append, stat: found };
+  closing.push(opened.fd);
+  throw new Errno(ERRNO.ENOSYS);
 }
 
 // VMIN/VTIME govern raw reads; canonical reads never consume a second line. Waiting
@@ -492,12 +544,6 @@ function* readFrom(found, at, count) {
   if (isByteDevice(found.device)) {
     try { return readDevice(found.device, count); } catch { throw new Errno(EIO); }
   }
-  if (found.rewrite) return found.bytes.bytes(at, Math.min(found.bytes.length, at + count)).slice();
-  if (found.writer) {
-    const { from, length } = found.bytes;
-    if (at < from) throw new Errno(ESPIPE);
-    return found.bytes.bytes(at - from, Math.min(length, at - from + count)).slice();
-  }
   const window = found.window;
   if (at < window.start || at >= window.start + window.data.length) {
     if (at >= found.size) return new Uint8Array(0);
@@ -564,37 +610,7 @@ function* writeTo(found, at, data) {
     });
     return broken ? brokenPipe(written) : written;
   }
-  if (found.kind === 'pipe-in') throw new Errno(EBADF);
-  if (found.kind !== 'file' || (!found.writer && !found.rewrite)) throw new Errno(EBADF);
-  const bytes = found.bytes;
-  bytes.lock(process.pid, pause);
-  try {
-    if (found.rewrite) {
-      if (found.append) at = bytes.length;
-      const end = at + data.length;
-      if (end > REWRITE_MAX || !bytes.ensure(end)) throw new Errno(EFBIG);
-      // A hole is zeros, whatever a truncation left.
-      if (at > bytes.length) bytes.view.fill(0, bytes.length, at);
-      bytes.view.set(data, at);
-      bytes.length = Math.max(bytes.length, end);
-      bytes.dirty = true;
-      return data.length;
-    }
-    // Written in order: whole chunks go before more is held, and at most a chunk at a time is
-    // added, so that what is held stays within two chunks.
-    for (let done = 0; done < data.length;) {
-      while (bytes.length > found.chunk) (yield* flushChunk(found));
-      const offset = at + done - bytes.from;
-      if (offset < 0) throw new Errno(ESPIPE);
-      const piece = data.subarray(done, done + found.chunk);
-      if (!bytes.ensure(offset + piece.length)) throw new Errno(EFBIG);
-      if (offset > bytes.length) bytes.view.fill(0, bytes.length, offset);
-      bytes.view.set(piece, offset);
-      bytes.length = Math.max(bytes.length, offset + piece.length);
-      done += piece.length;
-    }
-    return data.length;
-  } finally { bytes.unlock(); }
+  throw new Errno(EBADF);
 }
 function brokenPipe(written = 0) {
   signals.queue(SIGPIPE);
@@ -602,54 +618,13 @@ function brokenPipe(written = 0) {
   if (written) return written;
   throw new Errno(ERRNO.EPIPE);
 }
-// Send the next chunk, whole, or the last, short (its bytes' lock held).
-function* flushChunk(found) {
-  const bytes = found.bytes;
-  const count = Math.min(found.chunk, bytes.length);
-  const chunk = bytes.bytes(0, count).slice();
-  const index = bytes.from / found.chunk;
-  const headers = { 'Content-Type': 'application/octet-stream' };
-  if (process.proc) headers['X-Process-Token'] = process.proc;
-  if (process.pid) headers['X-Process-Pid'] = String(process.pid);
-  const answer = yield* request('PUT', `/api/pwrite?fd=${found.kfd}&index=${index}`, chunk, headers);
-  if (answer.status >= 300) throw new Errno(errnoOf(safeJson(answer.text)));
-  bytes.view.copyWithin(0, count, bytes.length);
-  bytes.length -= count;
-  bytes.from += count;
-}
 const safeJson = text => { try { return JSON.parse(text); } catch { return {}; } };
 
-// Close an open file, its last descriptor gone: what it wrote goes, with the close, in one
-// request where it can.
+// Close an open file, its last descriptor gone.
 function* closeFd(found) {
-  if (found.kind === 'file' && found.writer) {
-    const bytes = found.bytes;
-    bytes.lock(process.pid);
-    try {
-      while (bytes.length > found.chunk) (yield* flushChunk(found));
-      const calls = [];
-      if (bytes.length > INLINE) (yield* flushChunk(found));
-      if (bytes.length > 0) calls.push({ pwrite: { fd: found.kfd, index: bytes.from / found.chunk, data: base64(bytes.bytes(0, bytes.length)) } });
-      calls.push({ close: { fd: found.kfd } });
-      const results = yield* batch(calls);
-      forget();
-      for (const result of results) ok(result);
-    } finally { bytes.unlock(); }
-  } else if (found.kind === 'file' && found.rewrite && found.bytes.dirty) {
+  if (found.cloud != null) {
+    cloudCall('close', { id: found.cloud });
     forget();
-    const data = found.bytes.bytes(0, found.bytes.length).slice();
-    if (data.length <= INLINE) {
-      const results = yield* batch([
-        { open: { path: found.path, flags: O_WRONLY | O_TRUNC } },
-        ...(data.length ? [{ pwrite: { fd: { ref: 0 }, index: 0, data: base64(data) } }] : []),
-        { close: { fd: { ref: 0 } } },
-      ]);
-      for (const result of results) ok(result);
-    } else {
-      const writer = yield* openWriter(found.path, O_TRUNC, false);
-      yield* writeTo(writer, 0, data);
-      yield* closeFd(writer);
-    }
   } else if (found.kind === 'file' && found.kfd !== undefined) {
     closing.push(found.kfd);
   }
@@ -822,33 +797,39 @@ function* openPath(path, dirflags, oflags, base, fdflags, noctty = false, mode =
       found = terminalFd(1, read, write);
       if (!noctty && path !== '/dev/tty') ttyCall(found, 'open');
     } else if (process.localFs && localPath(path)) {
+      if (!(dirflags & FOLLOW) && !(oflags & OFLAG_CREAT && oflags & OFLAG_EXCL)) {
+        try { if (kindOf((yield* stat(path, false)).mode) === SYMBOLIC_LINK) throw new Errno(ERRNO.ELOOP); }
+        catch (err) { if (!(err instanceof Errno) || err.errno !== ENOENT || !(oflags & OFLAG_CREAT) || (oflags & OFLAG_DIRECTORY)) throw err; }
+      }
       if (oflags & OFLAG_DIRECTORY) {
-        if (kindOf((yield* stat(path)).mode) !== DIRECTORY) throw new Errno(ENOTDIR);
+        if (kindOf((yield* stat(path, (dirflags & FOLLOW) !== 0)).mode) !== DIRECTORY) throw new Errno(ENOTDIR);
         found = { kind: 'dir', path };
       } else {
         try {
           const opened = yield* call({ open: { path, flags: (write ? read ? O_RDWR : O_WRONLY : O_RDONLY) |
-            (oflags & OFLAG_CREAT ? O_CREAT : 0) | (oflags & OFLAG_TRUNC ? O_TRUNC : 0) | (oflags & OFLAG_EXCL ? O_EXCL : 0) | (append ? O_APPEND : 0) } });
+            (oflags & OFLAG_CREAT ? O_CREAT : 0) | (oflags & OFLAG_TRUNC ? O_TRUNC : 0) | (oflags & OFLAG_EXCL ? O_EXCL : 0) | (append ? O_APPEND : 0), mode } });
           found = { kind: 'file', local: true, path, kfd: opened.fd, token: opened.token, read, writable: write, pos: 0, size: opened.size, stat: opened.stat };
         } catch (error) {
           if (!(error instanceof Errno) || error.errno !== EISDIR || write) throw error;
           found = { kind: 'dir', path };
         }
       }
-    } else if (oflags & OFLAG_DIRECTORY) {
-      if (kindOf((yield* stat(path, (dirflags & FOLLOW) !== 0)).mode) !== DIRECTORY) throw new Errno(ENOTDIR);
-      found = { kind: 'dir', path };
-    } else if (!write) {
-      found = yield* openRead(path);
-    } else if (oflags & (OFLAG_TRUNC | OFLAG_EXCL)) {
-      found = yield* openWriter(path, (oflags & OFLAG_CREAT ? O_CREAT : 0) | (oflags & OFLAG_EXCL ? O_EXCL : 0) | (oflags & OFLAG_TRUNC ? O_TRUNC : 0), read, mode);
     } else {
-      // Written without truncating: a new file is written in order; one there is changed here.
-      let there;
-      try { there = yield* stat(path); } catch (err) { if (!(err instanceof Errno) || err.errno !== ENOENT || !(oflags & OFLAG_CREAT)) throw err; }
-      if (!there) found = yield* openWriter(path, O_CREAT, read, mode);
-      else if (kindOf(there.mode) === DIRECTORY) throw new Errno(EISDIR);
-      else found = yield* openRewrite(path, there, append, read);
+      found = channel ? openCloud(path, dirflags, oflags, read, write, append, mode) : null;
+      if (!found) {
+        if (!(dirflags & FOLLOW) && !(oflags & OFLAG_CREAT && oflags & OFLAG_EXCL)) {
+          try { if (kindOf((yield* stat(path, false)).mode) === SYMBOLIC_LINK) throw new Errno(ERRNO.ELOOP); }
+          catch (err) { if (!(err instanceof Errno) || err.errno !== ENOENT || !(oflags & OFLAG_CREAT) || (oflags & OFLAG_DIRECTORY)) throw err; }
+        }
+        if (oflags & OFLAG_DIRECTORY) {
+          if (kindOf((yield* stat(path, (dirflags & FOLLOW) !== 0)).mode) !== DIRECTORY) throw new Errno(ENOTDIR);
+          found = { kind: 'dir', path };
+        } else if (!write) {
+          found = yield* openRead(path);
+        } else {
+          found = yield* openWriter(path, (oflags & OFLAG_CREAT ? O_CREAT : 0) | (oflags & OFLAG_EXCL ? O_EXCL : 0) | (oflags & OFLAG_TRUNC ? O_TRUNC : 0), read, mode);
+        }
+      }
     }
     found.append ||= append && found.kind === 'file';
     const number = lowest();
@@ -870,13 +851,14 @@ const wasi = {
   },
   fd_advise: () => 0,
   fd_allocate: () => 0,
-  fd_datasync: () => 0,
-  fd_sync: () => 0,
+  fd_datasync: fd => attempt(() => syncFd(fd, true)),
+  fd_sync: fd => attempt(() => syncFd(fd, false)),
   fd_close: fd => attempt(function* () { descriptor(fd); return yield* uninstall(fd); }),
   fd_fdstat_get: (fd, ptr) => attempt(function* () {
     const found = descriptor(fd), v = view();
+    const appending = found.cloud != null ? cloudCall('append', { id: found.cloud }).append : found.append;
     v.setUint8(ptr, filetype(found));
-    v.setUint16(ptr + 2, (found.append ? FDFLAG_APPEND : 0) | (nonblocking(found) ? FDFLAG_NONBLOCK : 0), true);
+    v.setUint16(ptr + 2, (appending ? FDFLAG_APPEND : 0) | (nonblocking(found) ? FDFLAG_NONBLOCK : 0), true);
     // A terminal cannot seek, which is how libc's isatty tells it.
     let rights = found.tty ? ALL_RIGHTS & ~(RIGHT_SEEK | RIGHT_TELL) : ALL_RIGHTS;
     if (found.tty && found.readable === false) rights &= ~RIGHT_READ;
@@ -886,6 +868,12 @@ const wasi = {
   }),
   fd_fdstat_set_flags: (fd, flags) => attempt(function* () {
     const found = descriptor(fd);
+    if (found.cloud != null) {
+      if (flags & ~(FDFLAG_APPEND | FDFLAG_NONBLOCK)) throw new Errno(ERRNO.EOPNOTSUPP);
+      cloudCall('set_append', { id: found.cloud, append: !!(flags & FDFLAG_APPEND) });
+      found.append = !!(flags & FDFLAG_APPEND);
+      return;
+    }
     if (found.kind === 'pty') {
       if (flags & ~FDFLAG_NONBLOCK) throw new Errno(ERRNO.EOPNOTSUPP);
       ptyCall(found, 'flags', { nonblock: !!(flags & FDFLAG_NONBLOCK) });
@@ -897,28 +885,37 @@ const wasi = {
   fd_fdstat_set_rights: () => 0,
   fd_filestat_get: (fd, ptr) => attempt(function* () { return writeFilestat(ptr, (yield* fstat(descriptor(fd)))); }),
   fd_filestat_set_size: (fd, len) => attempt(function* () {
-    const found = descriptor(fd), length = Number(len);
+    const found = descriptor(fd);
+    if (found.cloud != null) {
+      if (len < 0n) throw new Errno(EINVAL);
+      cloudCall('truncate', { id: found.cloud, size: len.toString() });
+      forget();
+      return;
+    }
     if (found.local) {
+      const length = Number(len);
       yield* call({ ftruncate: { fd: found.kfd, size: length } }); found.size = length; return;
     }
-    if (!found.rewrite && !found.writer) throw new Errno(EINVAL);
-    const bytes = found.bytes;
-    if (found.writer) {
-      if (length < bytes.from) throw new Errno(EINVAL);
-      if (length > size(found)) yield* writeTo(found, size(found), new Uint8Array(length - size(found)));
-    }
-    bytes.lock(process.pid, pause);
-    try {
-      const keep = length - (found.writer ? bytes.from : 0);
-      if (!bytes.ensure(keep)) throw new Errno(EFBIG);
-      if (keep > bytes.length) bytes.view.fill(0, bytes.length, keep);
-      bytes.length = keep;
-      if (found.rewrite) bytes.dirty = true;
-    } finally { bytes.unlock(); }
+    throw new Errno(EINVAL);
   }),
   fd_filestat_set_times: (fd, atim, mtim, flags) => attempt(function* () { yield* times(descriptor(fd).path, atim, mtim, flags); }),
   fd_pread: (fd, iovs, count, offset, nread) => attempt(function* () {
     const found = descriptor(fd);
+    if (found.cloud != null) {
+      if (offset < 0n) throw new Errno(EINVAL);
+      let at = offset, total = 0;
+      try {
+        for (const [ptr, len] of iovecs(iovs, count)) {
+          const data = cloudRead(found, at, len);
+          bytes().set(data, ptr); total += data.length; at += BigInt(data.length);
+          if (data.length < len) break;
+        }
+      } catch (error) {
+        if (!total || !(error instanceof Errno)) throw error;
+      }
+      view().setUint32(nread, total, true);
+      return;
+    }
     let at = Number(offset), total = 0;
     for (const [ptr, len] of iovecs(iovs, count)) {
       const data = yield* readFrom(found, at, len);
@@ -935,6 +932,21 @@ const wasi = {
   fd_prestat_dir_name: (fd, ptr, len) => { if (!preopen(fd)) return EBADF; bytes().set(encoder.encode('/').subarray(0, len), ptr); return 0; },
   fd_pwrite: (fd, iovs, count, offset, nwritten) => attempt(function* () {
     const found = descriptor(fd);
+    if (found.cloud != null) {
+      if (offset < 0n) throw new Errno(EINVAL);
+      let at = offset, total = 0;
+      try {
+        for (const [ptr, len] of iovecs(iovs, count)) {
+          const wrote = cloudWrite(found, at, bytes().slice(ptr, ptr + len));
+          total += wrote; at += BigInt(wrote);
+          if (wrote < len) break;
+        }
+      } catch (error) {
+        if (!total || !(error instanceof Errno)) throw error;
+      }
+      view().setUint32(nwritten, total, true);
+      return;
+    }
     let at = Number(offset), total = 0;
     for (const [ptr, len] of iovecs(iovs, count)) { total += yield* writeTo(found, at, bytes().slice(ptr, ptr + len)); at += len; }
     view().setUint32(nwritten, total, true);
@@ -942,8 +954,14 @@ const wasi = {
   fd_read: (fd, iovs, count, nread) => attempt(function* () {
     const found = descriptor(fd);
     let total = 0;
-    yield* exclusive(found, function* () {
+    try { yield* exclusive(found, function* () {
       for (const [ptr, len] of iovecs(iovs, count)) {
+        if (found.cloud != null) {
+          const data = cloudRead(found, null, len);
+          bytes().set(data, ptr); total += data.length;
+          if (data.length < len) break;
+          continue;
+        }
         const at = found.pos ?? 0;
         const data = yield* readFrom(found, at, len);
         bytes().set(data, ptr); total += data.length;
@@ -953,7 +971,9 @@ const wasi = {
         if (['pipe-in', 'tty'].includes(found.kind) && total > 0 && found.pipe.queued === 0) break;
         if (found.kind === 'pty' && total > 0 && !ptyCall(found, 'poll', { writing: false }).nbytes) break;
       }
-    });
+    }); } catch (error) {
+      if (found.cloud == null || !total || !(error instanceof Errno)) throw error;
+    }
     view().setUint32(nread, total, true);
   }),
   fd_readdir: (fd, buf, len, cookie, used) => attempt(function* () {
@@ -1001,11 +1021,17 @@ const wasi = {
     const found = descriptor(fd);
     if (found.kind !== 'file') throw new Errno(ESPIPE);
     yield* exclusive(found, function* () {
+      if (found.cloud != null) {
+        const result = cloudCall('seek', { id: found.cloud, offset: offset.toString(), whence });
+        view().setBigUint64(ptr, BigInt(result.pos), true);
+        return;
+      }
       if (isByteDevice(found.device)) {
         found.pos = 0;
         view().setBigUint64(ptr, 0n, true);
         return;
       }
+      if (whence < 0 || whence > 2) throw new Errno(EINVAL);
       const base = whence === 0 ? 0 : whence === 1 ? found.pos : found.local ? (yield* fstat(found)).size : size(found);
       const pos = base + Number(offset);
       if (pos < 0) throw new Errno(EINVAL);
@@ -1016,13 +1042,21 @@ const wasi = {
   fd_tell: (fd, ptr) => attempt(function* () {
     const found = descriptor(fd);
     if (found.kind !== 'file') throw new Errno(ESPIPE);
-    yield* exclusive(found, function* () { view().setBigUint64(ptr, BigInt(found.pos), true); });
+    yield* exclusive(found, function* () {
+      if (found.cloud != null) {
+        const result = cloudCall('seek', { id: found.cloud, offset: '0', whence: 1 });
+        view().setBigUint64(ptr, BigInt(result.pos), true);
+        return;
+      }
+      view().setBigUint64(ptr, BigInt(found.pos), true);
+    });
   }),
   fd_write: (fd, iovs, count, nwritten) => attempt(function* () {
     const found = descriptor(fd);
     let total = 0;
     try { yield* exclusive(found, function* () {
       const vectors = iovecs(iovs, count);
+      if (found.cloud != null && !found.writable && !vectors.length) throw new Errno(EBADF);
       // PIPE_BUF atomicity applies to the complete writev, not each vector.
       // Combine only small nonblocking pipe writes; larger writes may be partial.
       if (found.kind === 'pipe-out' && vectors.length > 1 && nonblocking(found)) {
@@ -1040,6 +1074,12 @@ const wasi = {
       }
       for (const [ptr, len] of vectors) {
         const data = bytes().slice(ptr, ptr + len);
+        if (found.cloud != null) {
+          const wrote = cloudWrite(found, null, data);
+          total += wrote;
+          if (wrote < len) break;
+          continue;
+        }
         if (found.kind !== 'file') {
           const written = yield* writeTo(found, 0, data);
           total += written;
@@ -1051,9 +1091,9 @@ const wasi = {
         found.pos = isByteDevice(found.device) ? 0 : found.local && found.append ? found.size : at + len;
       }
     }); } catch (error) {
-      // writev may have finished earlier vectors before a signal interrupts a
-      // later one. Report those bytes so libc does not resend them.
-      if (!total || !(error instanceof Errno) || ![ERRNO.EINTR, ERRNO.EPIPE, ERRNO.EAGAIN].includes(error.errno)) throw error;
+      // writev may have finished earlier vectors before a signal interrupts or an error stops
+      // a later one. Report those bytes so libc does not resend them.
+      if (!total || !(error instanceof Errno) || (found.cloud == null && ![ERRNO.EINTR, ERRNO.EPIPE, ERRNO.EAGAIN].includes(error.errno))) throw error;
     }
     view().setUint32(nwritten, total, true);
   }),
@@ -1265,6 +1305,7 @@ function* diagnostic(text) {
   try {
     const found = descriptor(2), data = encoder.encode(text);
     yield* exclusive(found, function* () {
+      if (found.cloud != null) { cloudWrite(found, null, data); return; }
       const at = found.kind === 'file' ? (found.append ? size(found) : found.pos) : 0;
       const count = yield* writeTo(found, at, data);
       if (found.kind === 'file') found.pos = at + count;
@@ -1489,10 +1530,16 @@ function describe(found) {
     case 'tty': case 'pipe-in': case 'pipe-out': return { fd: found.fd, kind: found.kind, tty: !!found.tty, flags: found.flags, readable: found.readable, writable: found.writable, buffer: found.pipe.buffer, refs: found.refs };
     case 'dir': return { kind: 'dir', path: found.path, preopen: !!found.preopen };
     default: {
+      if (found.cloud != null) {
+        if (found.share == null) share(found);
+        if (found.share == null) throw new Errno(ERRNO.EMFILE);
+        const { kind, cloud, path, device, writable, read, append, stat: stated, share: slot, refs } = found;
+        return { kind, cloud, path, device, writable, read, append, stat: stated, share: slot, refs };
+      }
       if (found.share == null) share(found);
       if (found.share == null) throw new Errno(ERRNO.EMFILE);
-      const { kind, local, path, kfd, token, device, writable, read, size: length, stat: stated, writer, rewrite, append, chunk, share: slot, refs } = found;
-      return { kind, local, path, kfd, token, device, writable, read, size: length, stat: stated, writer, rewrite, append, chunk, share: slot, refs, bytes: found.bytes?.transferable };
+      const { kind, local, path, kfd, token, device, writable, read, size: length, stat: stated, append, share: slot, refs } = found;
+      return { kind, local, path, kfd, token, device, writable, read, size: length, stat: stated, append, share: slot, refs };
     }
   }
 }
@@ -1511,7 +1558,7 @@ function adopt(state) {
       case 'dir': return { kind: 'dir', path: description.path, preopen: !!description.preopen };
       default: {
         const found = adopted(description);
-        if (shares) shares.attach(found, description.share);
+        if (shares && description.share != null) shares.attach(found, description.share);
         return found;
       }
     }
@@ -1523,10 +1570,8 @@ function adopt(state) {
 }
 // A file of the kernel's another process described (`describe`): one to read or write here.
 function adopted(description) {
-  const { bytes, share, refs, ...rest } = description;
-  const found = { ...rest, window: { start: 0, data: new Uint8Array(0) } };
-  if (bytes) found.bytes = new Bytes(bytes);
-  return found;
+  const { share, refs, ...rest } = description;
+  return { ...rest, window: { start: 0, data: new Uint8Array(0) } };
 }
 // fork(2), the image unwound: the host makes the child (a pid, a Worker) of this snapshot.
 async function fork() {
@@ -1646,8 +1691,8 @@ async function instantiate(module, type, snapshot, startSection = false, memoryB
 // are not wrapped to suspend, as they never do.
 const NEVER_SUSPENDS = new Set([
   'args_get', 'args_sizes_get', 'environ_get', 'environ_sizes_get', 'clock_res_get', 'clock_time_get',
-  'fd_advise', 'fd_allocate', 'fd_datasync', 'fd_sync', 'fd_fdstat_get', 'fd_fdstat_set_flags',
-  'fd_fdstat_set_rights', 'fd_prestat_get', 'fd_prestat_dir_name', 'fd_seek', 'fd_tell', 'fd_dup',
+  'fd_advise', 'fd_allocate', 'fd_fdstat_get', 'fd_fdstat_set_flags',
+  'fd_fdstat_set_rights', 'fd_prestat_get', 'fd_prestat_dir_name', 'fd_tell', 'fd_dup',
   'fd_dup2', 'fd_pipe', 'poll_oneoff', 'proc_exit', 'proc_raise', 'random_get', 'sched_yield', 'getcwd',
   'proc_id', 'proc_parent', 'proc_signal', 'proc_join', 'proc_fork', 'stack_checkpoint', 'stack_restore',
   'callback_signal', 'thread_id', 'thread_signal', 'thread_exit', 'futex_wait', 'futex_wake',
@@ -1768,7 +1813,7 @@ function trackRaw(calls, results, reserved = null) {
     const one = calls[i], result = results[i];
     if (one.open && Number.isInteger(result?.ok?.fd)) {
       const fd = result.ok.fd;
-      const found = { kind: 'file', kfd: fd, path: one.open.path, pos: 0, read: false, writer: false };
+      const found = { kind: 'file', kfd: fd, path: one.open.path, pos: 0, read: false };
       if (reserved != null) shares.attach(found, reserved);
       install(rawNumber(fd), found, reserved != null);
       if (reserved != null) postMessage({ described: { slot: reserved, gen: shares.gen(reserved), description: describe(found) } });
@@ -1884,13 +1929,12 @@ const osApi = {
   open: (ptr, len, flags, mode) => drive((function* () {
     try {
       pause();
-      if (flags & ~(3 | 0o100 | 0o200 | 0o400 | 0o1000 | 0o2000 | 0o4000 | 0o200000 | 0o400000 | 0o2000000) || (flags & 3) === 3) throw new Errno(EINVAL);
+      if (flags & ~(3 | 0o100 | 0o200 | 0o400 | 0o1000 | 0o2000 | 0o4000 | O_DIRECTORY | O_NOFOLLOW | 0o2000000) || (flags & 3) === 3) throw new Errno(EINVAL);
       const path = clean(join(process.cwd, string(ptr, len)));
-      if (flags & 0o400000 && kindOf((yield* stat(path, false)).mode) === SYMBOLIC_LINK) throw new Errno(ERRNO.ELOOP);
-      const oflags = (flags & O_CREAT ? OFLAG_CREAT : 0) | (flags & O_EXCL ? OFLAG_EXCL : 0) | (flags & O_TRUNC ? OFLAG_TRUNC : 0) | (flags & 0o200000 ? OFLAG_DIRECTORY : 0);
+      const oflags = (flags & O_CREAT ? OFLAG_CREAT : 0) | (flags & O_EXCL ? OFLAG_EXCL : 0) | (flags & O_TRUNC ? OFLAG_TRUNC : 0) | (flags & O_DIRECTORY ? OFLAG_DIRECTORY : 0);
       const rights = (flags & 3) === O_RDONLY ? RIGHT_READ : (flags & 3) === O_WRONLY ? RIGHT_WRITE : RIGHT_READ | RIGHT_WRITE;
-      const fdflags = (flags & 0o2000 ? FDFLAG_APPEND : 0) | (flags & 0o4000 ? FDFLAG_NONBLOCK : 0);
-      const fd = yield* openPath(path, FOLLOW, oflags, rights, fdflags, !!(flags & 0o400), mode);
+      const fdflags = (flags & O_APPEND ? FDFLAG_APPEND : 0) | (flags & 0o4000 ? FDFLAG_NONBLOCK : 0);
+      const fd = yield* openPath(path, flags & O_NOFOLLOW ? 0 : FOLLOW, oflags, rights, fdflags, !!(flags & 0o400), mode);
       if (flags & 0o2000000) cloexec.add(fd);
       return fd;
     } catch (err) { if (err instanceof Errno) return -err.errno; throw err; }
