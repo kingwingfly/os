@@ -12,6 +12,8 @@ A handle's HMAC covers filesystem, session and inode identity. It grants no perm
 
 Open descriptions record their service session, inode, access and opening credential. Each request authenticates a presenting credential; open operations also verify that the opening credential remains valid. Chmod does not remove an existing grant. Revocation ends its references and locks and leaves an `EACCES` tombstone until session cleanup. Path-only opens retain removed directories without granting byte access.
 
+Creation accepts read, write or read/write access; exec and path access return `EINVAL` before changing names or opening existing files. Creating or renaming into an absent account home requires its owner or root, even in a writable parent. Moving a directory between parents also requires write permission on that directory. Unlinking an interactive device uses its driver's ownership checks and teardown, releasing attached descriptors, voices and pending requests and notifying followers. Direct device renames and replacements by rename are refused with `EPERM`.
+
 ## Lifetime and cancellation
 
 The lease is 120 seconds. Hosts call `renew` at least every minute, including while operations are pending. Renewing with the existing secret resumes all opens and locks; no in-memory authority state is needed. Explicit disconnect or expiry releases references, locks and active read manifests. Credential revocation is independent of browser logout.

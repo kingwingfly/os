@@ -331,6 +331,13 @@ fn file_type(node: &Node) -> FileType {
         FileType::File
     }
 }
+fn check_home(db: &Db, uid: u32, path: &str) -> Result<()> {
+    // An absent home belongs to its account (or root), even in a writable parent.
+    if uid != 0 && db.home_of(path).is_some_and(|owner| owner != uid) {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
+}
 fn make(
     db: &mut Db,
     c: &Caller,
@@ -345,6 +352,7 @@ fn make(
         return Err(Errno::EEXIST);
     }
     inode::may_create(&c.credential.identity(), &parent, false)?;
+    check_home(db, c.credential.uid, &path)?;
     db.set_node(&path, &node(&parent));
     db.persisted_node(&path).ok_or(Errno::EIO)
 }
@@ -537,7 +545,9 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             options,
             ..
         } => {
-            options.access()?;
+            if matches!(options.access()?, Access::Exec | Access::Path) {
+                return Err(Errno::EINVAL);
+            }
             let node = match c.child(db, dir, name) {
                 Ok((node, _)) => {
                     if options.is_create_new() {
@@ -606,6 +616,13 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         }
         Unlink { dir, name } | Rmdir { dir, name } => {
             let (node, path) = c.child(db, dir, name)?;
+            // Device drivers own removal permissions and teardown, including their open
+            // descriptors, voices, pending requests and disappearance notifications.
+            if matches!(&request.call, Unlink { .. })
+                && let Some(done) = db.unlink_device(&who, &path)
+            {
+                return done.map(|()| Value::Null).map_err(|error| error.errno);
+            }
             let (parent, _) = c.dir(db, dir, 0)?;
             inode::may_delete(&who, &parent, &node)?;
             let directory = matches!(&request.call, Rmdir { .. });
@@ -809,6 +826,9 @@ fn rename(
     }
     check_component(to)?;
     let (source, old) = c.child(db, from_dir, from)?;
+    if source.is_device() {
+        return Err(Errno::EPERM);
+    }
     let (parent, _) = c.dir(db, from_dir, 0)?;
     let (dest_parent, dest) = c.dir(db, to_dir, EXEC)?;
     let new = join(&dest, to);
@@ -822,6 +842,10 @@ fn rename(
         if target.ino == source.ino {
             return Ok(());
         }
+        // A driver knows its device by name; rename cannot replace it without teardown.
+        if target.is_device() {
+            return Err(Errno::EPERM);
+        }
         inode::may_delete(&who, &dest_parent, &target)?;
         if source.directory != target.directory {
             return Err(if source.directory {
@@ -833,9 +857,14 @@ fn rename(
         if target.directory && db.persisted_descendant(&new) {
             return Err(Errno::ENOTEMPTY);
         }
+    } else {
+        check_home(db, c.credential.uid, &new)?;
     }
     if source.directory && (dest == old || dest.starts_with(&format!("{old}/"))) {
         return Err(Errno::EINVAL);
+    }
+    if source.directory && parent.ino != dest_parent.ino {
+        inode::require(&who, &source, WRITE)?;
     }
     if let Some(target) = db.persisted_node(&new) {
         db.set_times(target.ino, None, None);
