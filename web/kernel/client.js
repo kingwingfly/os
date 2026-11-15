@@ -76,6 +76,7 @@ self.kernelSys = async (body, signal) => {
 
 function boot() {
   starting ??= wasm_bindgen(asset('/client_kernel_bg.wasm')).then(async () => {
+    self.wasm_bindgen = wasm_bindgen;
     // A dedicated kernel never resets the namespace on boot; locks and leases reclaim it.
     const id = '';
     kernel = new wasm_bindgen.Kernel(id, locks ? kernelId : '');
@@ -239,7 +240,6 @@ async function dispatch(message, host, tab) {
       if (!response.ok) throw { errno: 'EACCES' };
       return (await response.json()).results?.[0]?.ok;
     }
-    case 'vfs_policy': return JSON.parse(wasm_bindgen.vfs_policy(JSON.stringify(args.input)));
     case 'machine_init_status': return { ...machineInit.current(), reaper: machineInit.reaper.current() };
     case 'machine_init_resume': return machineInit.resume();
     case 'machine_init_leave': await machineInit.stop(); return null;

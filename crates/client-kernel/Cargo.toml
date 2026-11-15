@@ -9,7 +9,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 abi = { package = "os-abi", path = "../abi" }
 image = { package = "os-image", path = "../image" }
-kernel = { package = "os-kernel", path = "../kernel" }
 vfs = { package = "os-vfs", path = "../vfs" }
 serde.workspace = true
 serde_json.workspace = true

@@ -46,11 +46,6 @@ async fn kernel_sys(body: &str) -> Result<JsValue, JsValue> {
 /// The kernel's own protocol version, which the page checks at start.
 pub const VERSION: &str = "1";
 
-#[wasm_bindgen]
-pub fn vfs_policy(input: &str) -> String {
-    kernel::mount_policy::json_request(input)
-}
-
 /// Local validation only. This does not verify an operator signature, activate a
 /// system generation, or confer credentials described by package metadata.
 #[wasm_bindgen]

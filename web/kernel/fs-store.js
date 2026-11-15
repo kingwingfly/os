@@ -73,23 +73,31 @@ function reqPromise(req) {
   });
 }
 
+const TX_DONE = Symbol('os.txDone');
+
 function txDone(tx) {
-  return new Promise((resolve, reject) => {
+  return tx[TX_DONE];
+}
+
+function openTransaction(db, stores, mode, strict = false) {
+  let tx;
+  if (strict && mode === 'readwrite') {
+    try {
+      tx = db.transaction(stores, mode, { durability: 'strict' });
+    } catch {
+      tx = db.transaction(stores, mode);
+    }
+  } else {
+    tx = db.transaction(stores, mode);
+  }
+  const done = new Promise((resolve, reject) => {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(refusal(tx.error));
     tx.onabort = () => reject(refusal(tx.error ?? new Error('IndexedDB transaction aborted')));
   });
-}
-
-function openTransaction(db, stores, mode, strict = false) {
-  if (strict && mode === 'readwrite') {
-    try {
-      return db.transaction(stores, mode, { durability: 'strict' });
-    } catch {
-      return db.transaction(stores, mode);
-    }
-  }
-  return db.transaction(stores, mode);
+  done.catch(() => {});
+  tx[TX_DONE] = done;
+  return tx;
 }
 
 function openMetaDb(idb, dbName) {
@@ -160,12 +168,14 @@ async function resolveDirectoryUuid(handle, { idb, locks }) {
     const db = await openHandleRegistryDb(idb);
     try {
       const rtx = openTransaction(db, ['meta', 'handles'], 'readonly');
-      const storedVersion = await reqPromise(rtx.objectStore('meta').get('version'));
+      const [storedVersion, existing] = await Promise.all([
+        reqPromise(rtx.objectStore('meta').get('version')),
+        reqPromise(rtx.objectStore('handles').getAll()),
+        txDone(rtx),
+      ]);
       if (storedVersion !== undefined && storedVersion !== null && storedVersion > STORE_FORMAT_VERSION) {
         throw error('EPROTONOSUPPORT', 'directory handle registry belongs to a newer OS release');
       }
-      const existing = await reqPromise(rtx.objectStore('handles').getAll());
-      await txDone(rtx);
 
       for (const row of existing ?? []) {
         if (!row?.handle || typeof row.uuid !== 'string') continue;
@@ -186,8 +196,10 @@ async function resolveDirectoryUuid(handle, { idb, locks }) {
       try {
         const wtx = openTransaction(db, ['meta', 'handles'], 'readwrite', true);
         wtx.objectStore('meta').put(STORE_FORMAT_VERSION, 'version');
-        wtx.objectStore('handles').put({ uuid, handle });
-        await txDone(wtx);
+        await Promise.all([
+          reqPromise(wtx.objectStore('handles').put({ uuid, handle })),
+          txDone(wtx),
+        ]);
       } catch (err) {
         // Plain JS mock handles in unit tests have method functions and cannot be structured-cloned;
         // retain them in the in-process handle table without failing mount admission.
@@ -227,6 +239,7 @@ function buildStore({
   const channel = typeof globalThis.BroadcastChannel === 'function'
     ? new globalThis.BroadcastChannel(LOCK_CHANNEL_NAME)
     : null;
+  channel?.unref?.();
 
   function ensureOpen() {
     if (closed) throw error('ENODEV', 'local mount is detached');
