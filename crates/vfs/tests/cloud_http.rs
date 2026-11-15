@@ -7,9 +7,11 @@ use os_vfs::{Access, BoxFuture, FsId, NodeId, OpenRef, Result, WriteAt, now_or_n
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
+type RecordedPost = (String, Vec<(&'static str, String)>, Vec<u8>);
+
 #[derive(Default)]
 struct Fake {
-    sent: RefCell<Vec<(String, Vec<(&'static str, String)>, Vec<u8>)>>,
+    sent: RefCell<Vec<RecordedPost>>,
     replies: RefCell<VecDeque<Result<Reply>>>,
 }
 impl Host for Fake {

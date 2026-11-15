@@ -373,38 +373,40 @@ impl Kernel {
         signal: Option<u8>,
         host: &str,
     ) -> Result<String, JsValue> {
-        let mut state = self.state.borrow_mut();
-        let local = state
-            .processes
-            .get_mut(&pid)
-            .filter(|local| local.host == host)
-            .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?;
-        if local.ended.is_some() {
-            return Err(fail(Errno::ESRCH.into()));
-        }
-        local.ended = Some((status, signal));
-        let (token, ppid) = (local.token.clone(), local.ppid);
-        let orphans: Vec<u32> = state
-            .processes
-            .iter()
-            .filter(|(_, child)| pid != INIT && child.ppid == pid)
-            .map(|(child, _)| *child)
-            .collect();
-        for orphan in orphans {
-            if state.processes[&orphan].ended.is_some() {
-                state.processes.remove(&orphan);
-            } else if let Some(child) = state.processes.get_mut(&orphan) {
-                child.ppid = INIT;
+        let (token, ppid) = {
+            let mut state = self.state.borrow_mut();
+            let local = state
+                .processes
+                .get_mut(&pid)
+                .filter(|local| local.host == host)
+                .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?;
+            if local.ended.is_some() {
+                return Err(fail(Errno::ESRCH.into()));
             }
-        }
-        state.report(Call::Exit {
-            status,
-            signal,
-            pid: Some(pid),
-            token: Some(token.clone()),
-        });
-        state.retain_spare();
-        drop(state);
+            local.ended = Some((status, signal));
+            let (token, ppid) = (local.token.clone(), local.ppid);
+            let orphans: Vec<u32> = state
+                .processes
+                .iter()
+                .filter(|(_, child)| pid != INIT && child.ppid == pid)
+                .map(|(child, _)| *child)
+                .collect();
+            for orphan in orphans {
+                if state.processes[&orphan].ended.is_some() {
+                    state.processes.remove(&orphan);
+                } else if let Some(child) = state.processes.get_mut(&orphan) {
+                    child.ppid = INIT;
+                }
+            }
+            state.report(Call::Exit {
+                status,
+                signal,
+                pid: Some(pid),
+                token: Some(token.clone()),
+            });
+            state.retain_spare();
+            (token, ppid)
+        };
         // What it held of cloud files it lets go, as its descriptors close at exit.
         self.cloud_exited(pid, Some(token)).await;
         Ok(json!({ "ppid": ppid }).to_string())
