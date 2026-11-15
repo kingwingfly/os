@@ -3,7 +3,7 @@
 // fingerprints, store format versions, and advisory lock state; this module strictly performs
 // primitive browser host I/O, durable IndexedDB record transactions, and Web Locks coordination.
 
-export const STORE_FORMAT_VERSION = 1;
+export const STORE_FORMAT_VERSION = 2;
 const HANDLE_REGISTRY_DB = 'os-fs-handles';
 const LOCK_CHANNEL_NAME = 'os-fs-locks';
 const WASM_MAGIC = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
@@ -43,6 +43,32 @@ const localLockListeners = new Set();
 // Fallback handle -> uuid map for non-cloneable mock directory handles in unit tests.
 const nonCloneableHandles = new WeakMap();
 const nonCloneableRegistry = [];
+// Fallback Map<storeKey, Map<string, FileSystemHandle>> for non-cloneable mock entry handles.
+const nonCloneableEntryHandles = new Map();
+
+function fileMtimeParts(file) {
+  const raw = typeof file?.lastModified === 'number' ? file.lastModified : 0;
+  if (!Number.isFinite(raw) || raw <= 0) return { wholeMs: 0, subNs: 0 };
+  const wholeMs = Math.trunc(raw);
+  const subNs = Math.min(999_999, Math.round((raw - wholeMs) * 1_000_000));
+  return { wholeMs, subNs };
+}
+
+function fingerprintMatches(file, expectedFp) {
+  if (!expectedFp) return true;
+  if (file.size !== expectedFp.size) return false;
+  const { wholeMs, subNs } = fileMtimeParts(file);
+  return wholeMs === expectedFp.mtimeWholeMs && subNs === expectedFp.mtimeSubNs;
+}
+
+async function sameEntry(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (typeof a.isSameEntry === 'function') {
+    return Boolean(await a.isSameEntry(b).catch(() => false));
+  }
+  return false;
+}
 
 function getIdb(override) {
   const idb = override ?? globalThis.indexedDB;
@@ -227,14 +253,60 @@ function buildStore({
   execute,
   writable,
   db,
+  dbName,
   fixedUuid,
   locksOption,
 }) {
   let closed = false;
   let onRevoke = null;
   let currentUuid = fixedUuid ?? null;
+  const storeKey = dbName ?? db?.name ?? fixedUuid ?? 'default';
   const fileQueues = new Map();
   const dirtyFiles = new Set();
+
+  function fallbackEntryMap(create = false) {
+    let map = nonCloneableEntryHandles.get(storeKey);
+    if (!map && create) {
+      map = new Map();
+      nonCloneableEntryHandles.set(storeKey, map);
+    }
+    return map;
+  }
+
+  async function saveEntryHandle(ino, handle) {
+    const keyStr = String(ino);
+    const idbKey = `entryHandle:${keyStr}`;
+    try {
+      const tx = openTransaction(db, ['meta'], 'readwrite', false);
+      tx.objectStore('meta').put(handle, idbKey);
+      await txDone(tx);
+      fallbackEntryMap(false)?.delete(keyStr);
+    } catch (err) {
+      if (err?.name === 'DataCloneError' || /clone/i.test(err?.message ?? '')) {
+        fallbackEntryMap(true).set(keyStr, handle);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  async function loadEntryHandle(ino) {
+    const keyStr = String(ino);
+    const mem = fallbackEntryMap(false)?.get(keyStr);
+    if (mem) return mem;
+    const tx = openTransaction(db, ['meta'], 'readonly');
+    const raw = await reqPromise(tx.objectStore('meta').get(`entryHandle:${keyStr}`));
+    await txDone(tx);
+    return raw ?? null;
+  }
+
+  async function deleteEntryHandle(ino) {
+    const keyStr = String(ino);
+    fallbackEntryMap(false)?.delete(keyStr);
+    const tx = openTransaction(db, ['meta'], 'readwrite', false);
+    tx.objectStore('meta').delete(`entryHandle:${keyStr}`);
+    await txDone(tx);
+  }
 
   const channel = typeof globalThis.BroadcastChannel === 'function'
     ? new globalThis.BroadcastChannel(LOCK_CHANNEL_NAME)
@@ -364,6 +436,53 @@ function buildStore({
         throw error('ESTALE', 'backing file was replaced by a directory');
       }
       throw reason;
+    }
+  }
+
+  async function resolveEntryHandle(path, isDir) {
+    const segs = splitPath(path);
+    if (!segs.length) return rootHandle;
+    if (isDir) {
+      return resolveDirHandle(segs, false);
+    }
+    return resolveBackingFile('path', path);
+  }
+
+  async function openValidatedBacking(kind, target, expectedFp, expectedIno) {
+    const fh = await resolveBackingFile(kind, target);
+    if (kind === 'path' && !originPrivate) {
+      if (expectedIno !== undefined && expectedIno !== null) {
+        const saved = await loadEntryHandle(expectedIno);
+        if (!saved || !(await sameEntry(saved, fh))) {
+          throw error('ESTALE', 'backing file identity changed outside the OS');
+        }
+      }
+      const file = await fh.getFile();
+      if (expectedFp && !fingerprintMatches(file, expectedFp)) {
+        throw error('ESTALE', 'backing file changed outside the OS');
+      }
+      return { fh, file };
+    }
+    return { fh, file: null };
+  }
+
+  async function assertBackingUnchanged(target, fh, expectedFp, expectedIno) {
+    const currentFh = await resolveBackingFile('path', target);
+    if (!(await sameEntry(fh, currentFh))) {
+      throw error('ESTALE', 'backing file was replaced during OS I/O');
+    }
+    await verifyConfined(fh);
+    if (expectedIno !== undefined && expectedIno !== null) {
+      const saved = await loadEntryHandle(expectedIno);
+      if (!saved || !(await sameEntry(saved, currentFh))) {
+        throw error('ESTALE', 'backing file identity changed during OS I/O');
+      }
+    }
+    if (expectedFp) {
+      const currentFile = await currentFh.getFile();
+      if (!fingerprintMatches(currentFile, expectedFp)) {
+        throw error('ESTALE', 'backing file modified externally during OS I/O');
+      }
     }
   }
 
@@ -548,36 +667,53 @@ function buildStore({
       });
     },
 
-    readFile(kind, target, offset, len) {
+    readFile(kind, target, offset, len, expectedFp = null, expectedIno = null) {
       return runHost(async () => {
         const key = `${kind}:${target}`;
         return serializeFile(key, async () => {
-          const fh = await resolveBackingFile(kind, target);
-          const file = await fh.getFile();
+          const { fh, file: validatedFile } = await openValidatedBacking(
+            kind,
+            target,
+            expectedFp,
+            expectedIno,
+          );
+          const file = validatedFile ?? await fh.getFile();
           if (offset >= file.size || len <= 0) return new Uint8Array(0);
           const end = Math.min(file.size, offset + len);
           const buf = await file.slice(offset, end).arrayBuffer();
+          if (kind === 'path' && !originPrivate) {
+            await assertBackingUnchanged(target, fh, expectedFp, expectedIno);
+          }
           return new Uint8Array(buf);
         });
       });
     },
 
-    writeFile(kind, target, offset, data, append) {
+    writeFile(kind, target, offset, data, append, expectedFp = null, expectedIno = null) {
       return runHost(async () => {
         const key = `${kind}:${target}`;
         return serializeFile(key, async () => {
-          const fh = await resolveBackingFile(kind, target);
+          const { fh, file: validatedFile } = await openValidatedBacking(
+            kind,
+            target,
+            expectedFp,
+            expectedIno,
+          );
           if (typeof fh.createWritable !== 'function') {
             throw error('EOPNOTSUPP', 'this browser cannot write local files');
           }
-          const before = await fh.getFile();
+          const before = validatedFile ?? await fh.getFile();
           const pos = append ? before.size : offset;
           const stream = await fh.createWritable({ keepExistingData: true });
           try {
             if (data.byteLength > 0) {
               await stream.write({ type: 'write', position: pos, data });
             }
-            if (kind === 'path') await verifyConfined(fh);
+            if (kind === 'path' && !originPrivate) {
+              await assertBackingUnchanged(target, fh, expectedFp, expectedIno);
+            } else if (kind === 'path') {
+              await verifyConfined(fh);
+            }
             await stream.close();
           } catch (err) {
             await stream.abort().catch(() => {});
@@ -595,18 +731,27 @@ function buildStore({
       });
     },
 
-    setFileLen(kind, target, size) {
+    setFileLen(kind, target, size, expectedFp = null, expectedIno = null) {
       return runHost(async () => {
         const key = `${kind}:${target}`;
         return serializeFile(key, async () => {
-          const fh = await resolveBackingFile(kind, target);
+          const { fh } = await openValidatedBacking(
+            kind,
+            target,
+            expectedFp,
+            expectedIno,
+          );
           if (typeof fh.createWritable !== 'function') {
             throw error('EOPNOTSUPP', 'this browser cannot truncate local files');
           }
           const stream = await fh.createWritable({ keepExistingData: true });
           try {
             await stream.truncate(size);
-            if (kind === 'path') await verifyConfined(fh);
+            if (kind === 'path' && !originPrivate) {
+              await assertBackingUnchanged(target, fh, expectedFp, expectedIno);
+            } else if (kind === 'path') {
+              await verifyConfined(fh);
+            }
             await stream.close();
           } catch (err) {
             await stream.abort().catch(() => {});
@@ -622,11 +767,16 @@ function buildStore({
       });
     },
 
-    flushFile(kind, target, _dataOnly) {
+    flushFile(kind, target, _dataOnly, expectedFp = null, expectedIno = null) {
       return runHost(async () => {
         const key = `${kind}:${target}`;
         return serializeFile(key, async () => {
-          const fh = await resolveBackingFile(kind, target);
+          const { fh } = await openValidatedBacking(
+            kind,
+            target,
+            expectedFp,
+            expectedIno,
+          );
           if (typeof fh.flush === 'function') {
             await fh.flush();
           } else if (originPrivate && typeof fh.createSyncAccessHandle === 'function') {
@@ -644,6 +794,39 @@ function buildStore({
             mtimeMs: typeof after.lastModified === 'number' ? after.lastModified : 0,
           };
         });
+      });
+    },
+
+    retainEntryHandle(ino, path, isDir) {
+      return runHost(async () => {
+        if (originPrivate) return;
+        const entry = await resolveEntryHandle(path, isDir);
+        await saveEntryHandle(ino, entry);
+      });
+    },
+
+    verifyEntryHandle(ino, path, isDir) {
+      return runHost(async () => {
+        if (originPrivate) return true;
+        const saved = await loadEntryHandle(ino);
+        if (!saved) return false;
+        let current;
+        try {
+          current = await resolveEntryHandle(path, isDir);
+        } catch (err) {
+          if (err?.errno === 'ENOENT' || err?.errno === 'ESTALE' || err?.errno === 'ENOTDIR') {
+            return false;
+          }
+          throw err;
+        }
+        return sameEntry(saved, current);
+      });
+    },
+
+    forgetEntryHandle(ino) {
+      return runHost(async () => {
+        if (originPrivate) return;
+        await deleteEntryHandle(ino);
       });
     },
 
@@ -839,6 +1022,7 @@ function buildStore({
         const parsed = JSON.parse(headerJson);
         if (typeof parsed?.uuid === 'string' && parsed.uuid) currentUuid = parsed.uuid;
       } catch {}
+      fallbackEntryMap(false)?.clear();
       const tx = openTransaction(db, ['meta', 'inodes', 'locks'], 'readwrite', true);
       const meta = tx.objectStore('meta');
       const inodes = tx.objectStore('inodes');
@@ -1090,7 +1274,8 @@ export async function createOpfsStore(handle, { execute = false, writable = true
 
   const idb = getIdb(idbOpt);
   getWebLocks(locksOpt, 'os-fs-mint');
-  const db = await openMetaDb(idb, `os-fs-opfs:${storeKey}`);
+  const dbName = `os-fs-opfs:${storeKey}`;
+  const db = await openMetaDb(idb, dbName);
   return buildStore({
     rootHandle,
     opfsRoot,
@@ -1098,6 +1283,7 @@ export async function createOpfsStore(handle, { execute = false, writable = true
     execute,
     writable,
     db,
+    dbName,
     fixedUuid: null,
     locksOption: locksOpt,
   });
@@ -1130,7 +1316,8 @@ export async function createDirectoryStore(handle, { execute = false, writable =
   const idb = getIdb(idbOpt);
   const locks = getWebLocks(locksOpt, 'os-fs-mint');
   const uuid = await resolveDirectoryUuid(handle, { idb, locks });
-  const db = await openMetaDb(idb, `os-fs-dir:${uuid}`);
+  const dbName = `os-fs-dir:${uuid}`;
+  const db = await openMetaDb(idb, dbName);
 
   return buildStore({
     rootHandle: handle,
@@ -1139,6 +1326,7 @@ export async function createDirectoryStore(handle, { execute = false, writable =
     execute,
     writable,
     db,
+    dbName,
     fixedUuid: uuid,
     locksOption: locksOpt,
   });

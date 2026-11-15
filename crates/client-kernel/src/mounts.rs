@@ -14,7 +14,10 @@ use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
-use vfs::{Access, Cred, Entry, Filesystem, Handle, Identity, Metadata, OpenRef, SetAttr, WriteAt};
+use vfs::{
+    Access, Cred, Entry, Filesystem, FsId, Handle, Identity, Metadata, NodeId, OpenRef, SetAttr,
+    WriteAt,
+};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -219,13 +222,52 @@ fn expand_symlink(
 type OpenTable = RefCell<HashMap<u64, RetainedOpen>>;
 type OpenMap = Rc<OpenTable>;
 
+thread_local! {
+    static INODE_POLICY_REV: RefCell<HashMap<(FsId, NodeId), u64>> = RefCell::new(HashMap::new());
+    static FS_POLICY_REV: RefCell<HashMap<FsId, u64>> = RefCell::new(HashMap::new());
+}
+
+fn current_inode_policy_rev(fs: &FsId, node: NodeId) -> u64 {
+    INODE_POLICY_REV.with(|m| m.borrow().get(&(fs.clone(), node)).copied().unwrap_or(0))
+}
+
+fn current_fs_policy_rev(fs: &FsId) -> u64 {
+    FS_POLICY_REV.with(|m| m.borrow().get(fs).copied().unwrap_or(0))
+}
+
+fn bump_fs_policy_rev(fs: &FsId) {
+    FS_POLICY_REV.with(|m| {
+        let mut map = m.borrow_mut();
+        let entry = map.entry(fs.clone()).or_insert(0);
+        *entry = entry.wrapping_add(1);
+    });
+}
+
+fn bump_inode_policy_rev(fs: &FsId, node: NodeId) {
+    INODE_POLICY_REV.with(|m| {
+        let mut map = m.borrow_mut();
+        let entry = map.entry((fs.clone(), node)).or_insert(0);
+        *entry = entry.wrapping_add(1);
+    });
+    bump_fs_policy_rev(fs);
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CreatedPolicy {
+    rev: u64,
+    uid: u32,
+    gid: u32,
+    mode: u16,
+    acl: bool,
+    acl_bytes: Option<Vec<u8>>,
+}
+
 struct SharedMountState {
     fs: Rc<dyn Filesystem>,
     grant: Grant,
     grant_js: JsValue,
     active: Cell<bool>,
     snapshot_data_ro: bool,
-    policy_revision: Cell<u64>,
     known_paths: RefCell<HashMap<vfs::NodeId, Vec<String>>>,
     unmount_fn: RefCell<Option<Box<dyn FnOnce()>>>,
     views: RefCell<Vec<Weak<OpenTable>>>,
@@ -274,7 +316,7 @@ struct RetainedOpen {
     path: String,
     append: bool,
     held: bool,
-    created_at_rev: Option<u64>,
+    created_policy: Option<CreatedPolicy>,
 }
 
 struct OpenLookup {
@@ -284,7 +326,7 @@ struct OpenLookup {
     path: String,
     append: bool,
     held: bool,
-    created_at_rev: Option<u64>,
+    created_policy: Option<CreatedPolicy>,
 }
 
 /// Wasm-exported local mount provider wrapping an `Rc<dyn vfs::Filesystem>`.
@@ -346,7 +388,6 @@ impl LocalMount {
             grant_js,
             active: Cell::new(true),
             snapshot_data_ro,
-            policy_revision: Cell::new(0),
             known_paths: RefCell::new(HashMap::new()),
             unmount_fn: RefCell::new(on_unmount),
             views: RefCell::new(Vec::new()),
@@ -419,7 +460,7 @@ impl LocalMount {
         path: String,
         append: bool,
         held: bool,
-        created_at_rev: Option<u64>,
+        created_policy: Option<CreatedPolicy>,
     ) -> JsValue {
         let id = self.next_local_open.get();
         self.next_local_open.set(id + 1);
@@ -446,7 +487,7 @@ impl LocalMount {
                 path,
                 append,
                 held,
-                created_at_rev,
+                created_policy,
             },
         );
         token
@@ -470,7 +511,7 @@ impl LocalMount {
             path: entry.path.clone(),
             append: entry.append,
             held: entry.held,
-            created_at_rev: entry.created_at_rev,
+            created_policy: entry.created_policy.clone(),
         })
     }
 
@@ -524,6 +565,13 @@ impl LocalMount {
                     return Err(Errno::ELOOP);
                 }
                 if next.metadata.file_type == FileType::Symlink && (!is_last || follow_last) {
+                    if !vfs::descriptions::may_follow_link(
+                        step_cred,
+                        &current.metadata,
+                        &next.metadata,
+                    ) {
+                        return Err(Errno::EACCES);
+                    }
                     depth += 1;
                     if depth > SYMLINK_MAX {
                         return Err(Errno::ELOOP);
@@ -755,13 +803,36 @@ impl LocalMount {
             return Ok(());
         }
         self.verify_boundary_search(cred).await?;
-        let creator_keeps_access = open.created_at_rev == Some(self.state.policy_revision.get())
-            && match required_access {
+        let meta = self.state.fs.open_metadata(&open.open_ref).await?;
+        let creator_keeps_access = if let Some(ref created) = open.created_policy {
+            let access_ok = match required_access {
                 Access::Read => open.open_ref.access.reads(),
                 Access::Write => open.open_ref.access.writes(),
                 Access::ReadWrite => open.open_ref.access.reads() && open.open_ref.access.writes(),
                 Access::Exec | Access::Path => false,
             };
+            let same_rev =
+                current_inode_policy_rev(self.state.fs.id(), open.handle.node) == created.rev;
+            let same_meta = meta.uid == created.uid
+                && meta.gid == created.gid
+                && meta.mode == created.mode
+                && meta.acl == created.acl;
+            let same_acl = if !created.acl {
+                true
+            } else if !meta.acl {
+                false
+            } else {
+                self.state
+                    .fs
+                    .getxattr(&self.owner_cred(), &open.handle, "system.posix_acl_access")
+                    .await
+                    .ok()
+                    == created.acl_bytes
+            };
+            access_ok && same_rev && same_meta && same_acl
+        } else {
+            false
+        };
         if required_access != Access::Path && !creator_keeps_access {
             let mut opts = OpenOptions::new();
             match required_access {
@@ -782,7 +853,6 @@ impl LocalMount {
             let probe = self.state.fs.open(cred, &open.handle, &opts).await?;
             let _ = self.state.fs.release(&probe).await;
         }
-        let meta = self.state.fs.open_metadata(&open.open_ref).await?;
         if meta.nlink > 0 {
             let mut candidates: Vec<String> = self
                 .state
@@ -860,6 +930,13 @@ impl LocalMount {
                     if existing.metadata.file_type == FileType::Symlink {
                         if nofollow {
                             return Err(Errno::ELOOP);
+                        }
+                        if !vfs::descriptions::may_follow_link(
+                            cred,
+                            &parent_entry.metadata,
+                            &existing.metadata,
+                        ) {
+                            return Err(Errno::EACCES);
                         }
                         depth += 1;
                         if depth > SYMLINK_MAX {
@@ -1166,9 +1243,7 @@ impl LocalMount {
                 )
                 .await
                 .map_err(map_vfs_err)?;
-                self.state
-                    .policy_revision
-                    .set(self.state.policy_revision.get().wrapping_add(1));
+                bump_inode_policy_rev(fs.id(), entry.handle.node);
                 Ok(JsValue::NULL)
             }
             "chown" => {
@@ -1191,9 +1266,7 @@ impl LocalMount {
                 )
                 .await
                 .map_err(map_vfs_err)?;
-                self.state
-                    .policy_revision
-                    .set(self.state.policy_revision.get().wrapping_add(1));
+                bump_inode_policy_rev(fs.id(), entry.handle.node);
                 Ok(JsValue::NULL)
             }
             "utimens" => {
@@ -1249,9 +1322,7 @@ impl LocalMount {
                 fs.setxattr(&cred, &entry.handle, attr_name, &value.0, xflags)
                     .await
                     .map_err(map_vfs_err)?;
-                self.state
-                    .policy_revision
-                    .set(self.state.policy_revision.get().wrapping_add(1));
+                bump_inode_policy_rev(fs.id(), entry.handle.node);
                 Ok(JsValue::NULL)
             }
             "listxattr" => {
@@ -1269,9 +1340,7 @@ impl LocalMount {
                 fs.removexattr(&cred, &entry.handle, attr_name)
                     .await
                     .map_err(map_vfs_err)?;
-                self.state
-                    .policy_revision
-                    .set(self.state.policy_revision.get().wrapping_add(1));
+                bump_inode_policy_rev(fs.id(), entry.handle.node);
                 Ok(JsValue::NULL)
             }
             "statfs" => {
@@ -1338,24 +1407,40 @@ impl LocalMount {
                 .open_or_create_target(&cred, path, nofollow, req_mode, &options)
                 .await
                 .map_err(map_vfs_err)?;
+            let created_policy = if created {
+                let acl_bytes = if entry.metadata.acl {
+                    self.state
+                        .fs
+                        .getxattr(&self.owner_cred(), &entry.handle, "system.posix_acl_access")
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
+                Some(CreatedPolicy {
+                    rev: current_inode_policy_rev(self.state.fs.id(), entry.handle.node),
+                    uid: entry.metadata.uid,
+                    gid: entry.metadata.gid,
+                    mode: entry.metadata.mode,
+                    acl: entry.metadata.acl,
+                    acl_bytes,
+                })
+            } else {
+                None
+            };
             return Ok(self.mint_js_handle(
                 open_ref,
                 entry.handle,
                 resolved_parts.join("/"),
                 options.is_append(),
                 false,
-                created.then(|| self.state.policy_revision.get()),
+                created_policy,
             ));
         }
 
         let (parts, trailing_dir) = clean_rel_path(path).map_err(map_vfs_err)?;
         let (entry, resolved) = self
-            .resolve_parts(
-                &cred,
-                parts,
-                !nofollow && access != Access::Path,
-                trailing_dir,
-            )
+            .resolve_parts(&cred, parts, !nofollow, trailing_dir)
             .await
             .map_err(map_vfs_err)?;
         if access != Access::Path && nofollow && entry.metadata.file_type == FileType::Symlink {
@@ -1867,9 +1952,7 @@ impl LocalMount {
                 .await
                 .map_err(map_vfs_err)?;
         }
-        self.state
-            .policy_revision
-            .set(self.state.policy_revision.get().wrapping_add(1));
+        bump_fs_policy_rev(self.state.fs.id());
         Ok(JsValue::NULL)
     }
 
@@ -1934,9 +2017,7 @@ impl LocalMount {
                 }
             }
         }
-        self.state
-            .policy_revision
-            .set(self.state.policy_revision.get().wrapping_add(1));
+        bump_fs_policy_rev(self.state.fs.id());
         Ok(JsValue::NULL)
     }
 
@@ -2206,7 +2287,7 @@ impl LocalMount {
         let _ = self.state.fs.release(&exec_open).await;
         read_res.map_err(map_vfs_err)?;
 
-        let pinned_revision = self.state.policy_revision.get();
+        let pinned_revision = current_fs_policy_rev(self.state.fs.id());
         let pinned_node = entry.handle.node;
         let state = Rc::clone(&self.state);
         let identity = self.identity.clone();
@@ -2221,7 +2302,7 @@ impl LocalMount {
                 if !state.active.get() {
                     return Err(map_vfs_err(Errno::ENODEV));
                 }
-                if state.policy_revision.get() != pinned_revision {
+                if current_fs_policy_rev(state.fs.id()) != pinned_revision {
                     return Err(map_vfs_err(Errno::ESTALE));
                 }
                 let view = LocalMount {

@@ -3121,3 +3121,160 @@ fn snapshot_subvol_and_fsuuid_distinguish_replaced_subfilesystems() {
     assert_ne!(mino1, mino2);
     assert_eq!(store.get(mino2).unwrap().node.mode, 0o600);
 }
+
+#[test]
+fn cross_parent_directory_rename_requires_source_write_permission() {
+    let tmp = TempDir::new("dir-rename-write");
+    let root = tmp.path().join("root");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&root).unwrap();
+
+    let mut engine = open_engine(&root, &state, true, false);
+    let root_user = cred(0, 0, vec![0], 0o022);
+    let nonroot = cred(1000, 1000, vec![1000], 0o022);
+    let att_user = attach(&mut engine, "c-user", &nonroot, true, false);
+    let att_root = attach(&mut engine, "c-root", &root_user, true, false);
+
+    let src_dir: Entry = call(
+        &mut engine,
+        &att_user.session,
+        &nonroot,
+        Call::Mkdir {
+            dir: att_user.root.clone(),
+            name: "src".into(),
+            mode: 0o755,
+        },
+    )
+    .unwrap();
+    let dst_dir: Entry = call(
+        &mut engine,
+        &att_user.session,
+        &nonroot,
+        Call::Mkdir {
+            dir: att_user.root.clone(),
+            name: "dst".into(),
+            mode: 0o755,
+        },
+    )
+    .unwrap();
+    let locked_dir: Entry = call(
+        &mut engine,
+        &att_user.session,
+        &nonroot,
+        Call::Mkdir {
+            dir: src_dir.handle.clone(),
+            name: "box".into(),
+            mode: 0o555,
+        },
+    )
+    .unwrap();
+    let _ = locked_dir;
+
+    // Cross-parent rename by non-root of a 0o555 directory fails with EACCES.
+    assert_eq!(
+        call_unit(
+            &mut engine,
+            &att_user.session,
+            &nonroot,
+            Call::Rename {
+                from_dir: src_dir.handle.clone(),
+                from: "box".into(),
+                to_dir: dst_dir.handle.clone(),
+                to: "box".into(),
+                flags: RenameFlags::empty(),
+            },
+        ),
+        Err(Errno::EACCES)
+    );
+
+    // Same-parent rename does not modify `..` and succeeds.
+    call_unit(
+        &mut engine,
+        &att_user.session,
+        &nonroot,
+        Call::Rename {
+            from_dir: src_dir.handle.clone(),
+            from: "box".into(),
+            to_dir: src_dir.handle.clone(),
+            to: "box-same".into(),
+            flags: RenameFlags::empty(),
+        },
+    )
+    .unwrap();
+
+    // Root bypasses source directory WRITE check cleanly across parents.
+    let src_root: Entry = call(
+        &mut engine,
+        &att_root.session,
+        &root_user,
+        Call::Lookup {
+            dir: att_root.root.clone(),
+            name: "src".into(),
+        },
+    )
+    .unwrap();
+    let dst_root: Entry = call(
+        &mut engine,
+        &att_root.session,
+        &root_user,
+        Call::Lookup {
+            dir: att_root.root.clone(),
+            name: "dst".into(),
+        },
+    )
+    .unwrap();
+    call_unit(
+        &mut engine,
+        &att_root.session,
+        &root_user,
+        Call::Rename {
+            from_dir: src_root.handle,
+            from: "box-same".into(),
+            to_dir: dst_root.handle,
+            to: "box-moved".into(),
+            flags: RenameFlags::empty(),
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn discovered_wasm_binary_gets_owner_exec_while_text_gets_rw_only() {
+    let tmp = TempDir::new("wasm-exec-discover");
+    let root = tmp.path().join("root");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("prog.wasm"),
+        [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x42],
+    )
+    .unwrap();
+    fs::write(root.join("notes.txt"), b"plain text file").unwrap();
+
+    let mut engine = open_engine(&root, &state, true, true);
+    let user = cred(1000, 1000, vec![1000], 0o022);
+    let att = attach(&mut engine, "c-wasm", &user, true, true);
+
+    let prog: Entry = call(
+        &mut engine,
+        &att.session,
+        &user,
+        Call::Lookup {
+            dir: att.root.clone(),
+            name: "prog.wasm".into(),
+        },
+    )
+    .unwrap();
+    let notes: Entry = call(
+        &mut engine,
+        &att.session,
+        &user,
+        Call::Lookup {
+            dir: att.root,
+            name: "notes.txt".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(prog.metadata.mode, 0o700);
+    assert_eq!(notes.metadata.mode, 0o600);
+}

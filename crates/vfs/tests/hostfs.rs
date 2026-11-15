@@ -1218,3 +1218,189 @@ fn multiple_blocked_waiters_do_not_churn_lock_notifications() {
     drop(wait3);
     let _ = tab3;
 }
+
+#[test]
+fn directory_io_rejects_external_replacement_between_validate_and_io() {
+    let owner = user(10, 10, &[10], 0o022);
+    let sim = SimProfile::new();
+
+    block_on(async {
+        let fs = sim
+            .mount_directory(1, grant(&owner, false, false), 1)
+            .await
+            .unwrap();
+        let (secret, rd) = fs
+            .create(
+                &owner,
+                &fs.root(),
+                "secret.txt",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        fs.write_at(&rd, b"original-data", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        let _ = secret;
+
+        // Simulate external host replacement occurring after `validate_inode_by_id` and right
+        // before `HostTree::read_file`: must return `ESTALE`, never leak replacement bytes, and
+        // mark the old inode stale.
+        sim.schedule_external_replace("secret.txt", b"REPLACED_SECRET_BYTES");
+        let mut buf = [0u8; 32];
+        assert_eq!(fs.read_at(&rd, &mut buf, 0).await, Err(Errno::ESTALE));
+        assert_eq!(fs.read_at(&rd, &mut buf, 0).await, Err(Errno::ESTALE));
+        fs.release(&rd).await.unwrap();
+
+        // Now verify `write_at` and `set_len` refuse to overwrite a replacement host file too.
+        let (_, wr) = fs
+            .create(
+                &owner,
+                &fs.root(),
+                "target.txt",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        fs.write_at(&wr, b"old-body", WriteAt::Offset(0))
+            .await
+            .unwrap();
+
+        sim.schedule_external_replace("target.txt", b"REPLACED_KEEP_INTACT");
+        assert_eq!(
+            fs.write_at(&wr, b"STALE_CLOBBER", WriteAt::Offset(0)).await,
+            Err(Errno::ESTALE)
+        );
+        assert_eq!(
+            sim.external_read("target.txt").as_deref(),
+            Some(b"REPLACED_KEEP_INTACT".as_slice())
+        );
+        fs.release(&wr).await.unwrap();
+
+        let (trunc_entry, tr) = fs
+            .create(
+                &owner,
+                &fs.root(),
+                "trunc.txt",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        let _ = trunc_entry;
+        fs.write_at(&tr, b"keep-trunc-orig", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        sim.schedule_external_replace("trunc.txt", b"REPLACED_BEFORE_TRUNC");
+        assert_eq!(fs.set_len(&tr, 0).await, Err(Errno::ESTALE));
+        assert_eq!(
+            sim.external_read("trunc.txt").as_deref(),
+            Some(b"REPLACED_BEFORE_TRUNC".as_slice())
+        );
+        fs.release(&tr).await.unwrap();
+    });
+}
+
+#[test]
+fn directory_external_replacement_invalidates_handle_and_resets_descendants_across_remount() {
+    let owner = user(10, 10, &[10], 0o022);
+    let sim = SimProfile::new();
+
+    let (shared_entry, sub_entry, child_entry, shared2_ino) = block_on(async {
+        let fs = sim
+            .mount_directory(1, grant(&owner, false, false), 1)
+            .await
+            .unwrap();
+        let shared = fs.mkdir(&owner, &fs.root(), "shared", 0o755).await.unwrap();
+        fs.setxattr(
+            &owner,
+            &shared.handle,
+            "user.dir",
+            b"secret-dir-tag",
+            XattrFlags::empty(),
+        )
+        .await
+        .unwrap();
+        let sub = fs
+            .mkdir(&owner, &shared.handle, "sub", 0o755)
+            .await
+            .unwrap();
+        let (child, child_open) = fs
+            .create(
+                &owner,
+                &sub.handle,
+                "child.txt",
+                0o644,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        fs.write_at(&child_open, b"hello", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        fs.release(&child_open).await.unwrap();
+
+        let shared2 = fs
+            .mkdir(&owner, &fs.root(), "shared2", 0o755)
+            .await
+            .unwrap();
+        fs.setxattr(
+            &owner,
+            &shared2.handle,
+            "user.dir2",
+            b"secret-dir2-tag",
+            XattrFlags::empty(),
+        )
+        .await
+        .unwrap();
+        (shared, sub, child, shared2.handle.node.ino)
+    });
+
+    // Replace both directories externally on the host OS.
+    sim.external_remove("shared/sub/child.txt");
+    sim.external_remove("shared/sub");
+    sim.external_remove("shared");
+    sim.external_mkdir("shared");
+    sim.external_mkdir("shared/sub");
+    sim.external_write("shared/sub/child.txt", b"replacement-child");
+
+    sim.external_remove("shared2");
+    sim.external_mkdir("shared2");
+
+    block_on(async {
+        // Tab 1 observes ESTALE on the replaced directory and cached descendants.
+        let tab1 = sim
+            .mount_directory(1, grant(&owner, false, false), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            tab1.metadata(&owner, &shared_entry.handle).await,
+            Err(Errno::ESTALE)
+        );
+        assert_eq!(
+            tab1.metadata(&owner, &sub_entry.handle).await,
+            Err(Errno::ESTALE)
+        );
+        assert_eq!(
+            tab1.metadata(&owner, &child_entry.handle).await,
+            Err(Errno::ESTALE)
+        );
+
+        // Fresh remount resets replaced `shared2` cleanly even without checking it before unmount.
+        let tab2 = sim
+            .mount_directory(2, grant(&owner, false, false), 3)
+            .await
+            .unwrap();
+        let fresh_shared2 = tab2.lookup(&owner, &tab2.root(), "shared2").await.unwrap();
+        assert_ne!(fresh_shared2.handle.node.ino, shared2_ino);
+        assert_eq!(fresh_shared2.metadata.mode, 0o700);
+        assert!(!fresh_shared2.metadata.acl);
+        assert_eq!(
+            tab2.getxattr(&owner, &fresh_shared2.handle, "user.dir2")
+                .await,
+            Err(Errno::ENODATA)
+        );
+    });
+}

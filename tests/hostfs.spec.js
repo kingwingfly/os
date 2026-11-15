@@ -661,7 +661,7 @@ test('Store format versioning (§2.12): older format resets metadata once preser
     const root = await navigator.storage.getDirectory();
     const handle = await root.getDirectoryHandle('os-workspace', { create: true });
 
-    // 1. Write user file & custom metadata under current format version (1)
+    // 1. Write user file & custom metadata under current format version (2)
     const ws1 = new Workspace({ id: 'v1', uid: 1000, gid: 1000, groups: [1000] });
     ws1.scope = ws1.scope();
     globalThis.ws = ws1;
@@ -708,7 +708,7 @@ test('Store format versioning (§2.12): older format resets metadata once preser
     modeAfterUpgrade: 0o600,
     xattrAfterUpgrade: 'ENODATA',
     bytesAfterUpgrade: 'precious user bytes',
-    upgradedVersion: 1,
+    upgradedVersion: 2,
     futureMountErr: 'EPROTONOSUPPORT',
     untouchedFutureVersion: 99,
   });

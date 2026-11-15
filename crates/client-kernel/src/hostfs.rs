@@ -122,6 +122,15 @@ impl JsFingerprintWire {
     }
 }
 
+#[derive(Serialize)]
+struct JsExpectedFingerprintWire {
+    size: u64,
+    #[serde(rename = "mtimeWholeMs")]
+    mtime_whole_ms: u64,
+    #[serde(rename = "mtimeSubNs")]
+    mtime_sub_ns: u32,
+}
+
 #[derive(Deserialize)]
 struct JsWrittenWire {
     offset: u64,
@@ -195,6 +204,24 @@ fn js_to_json_vfs(val: &JsValue) -> vfs::Result<Value> {
 fn json_to_js_vfs(val: &Value) -> vfs::Result<JsValue> {
     let text = serde_json::to_string(val).map_err(|_| Errno::EIO)?;
     js_sys::JSON::parse(&text).map_err(|_| Errno::EIO)
+}
+
+fn expected_fp_to_js(expected_fp: Option<Fingerprint>) -> vfs::Result<JsValue> {
+    match expected_fp {
+        None => Ok(JsValue::NULL),
+        Some(fp) => json_to_js_vfs(
+            &serde_json::to_value(JsExpectedFingerprintWire {
+                size: fp.size,
+                mtime_whole_ms: fp.mtime_ns / 1_000_000,
+                mtime_sub_ns: (fp.mtime_ns % 1_000_000) as u32,
+            })
+            .map_err(|_| Errno::EIO)?,
+        ),
+    }
+}
+
+fn expected_ino_to_js(expected_ino: Option<u64>) -> JsValue {
+    expected_ino.map_or(JsValue::NULL, |ino| JsValue::from_str(&ino.to_string()))
 }
 
 struct JsStore {
@@ -324,6 +351,8 @@ impl HostTree for JsHostTree {
         backing: &'a Backing,
         offset: u64,
         len: usize,
+        expected_fp: Option<Fingerprint>,
+        expected_ino: Option<u64>,
     ) -> BoxFuture<'a, Vec<u8>> {
         Box::pin(async move {
             let (kind, target) = backing_args(backing)?;
@@ -336,6 +365,8 @@ impl HostTree for JsHostTree {
                         JsValue::from_str(&target),
                         JsValue::from_f64(offset as f64),
                         JsValue::from_f64(len as f64),
+                        expected_fp_to_js(expected_fp)?,
+                        expected_ino_to_js(expected_ino),
                     ],
                 )
                 .await?;
@@ -352,6 +383,8 @@ impl HostTree for JsHostTree {
         offset: u64,
         data: &'a [u8],
         append: bool,
+        expected_fp: Option<Fingerprint>,
+        expected_ino: Option<u64>,
     ) -> BoxFuture<'a, (Written, Fingerprint)> {
         Box::pin(async move {
             let (kind, target) = backing_args(backing)?;
@@ -366,6 +399,8 @@ impl HostTree for JsHostTree {
                         JsValue::from_f64(offset as f64),
                         bytes.into(),
                         JsValue::from_bool(append),
+                        expected_fp_to_js(expected_fp)?,
+                        expected_ino_to_js(expected_ino),
                     ],
                 )
                 .await?;
@@ -381,7 +416,13 @@ impl HostTree for JsHostTree {
         })
     }
 
-    fn set_file_len<'a>(&'a self, backing: &'a Backing, size: u64) -> BoxFuture<'a, Fingerprint> {
+    fn set_file_len<'a>(
+        &'a self,
+        backing: &'a Backing,
+        size: u64,
+        expected_fp: Option<Fingerprint>,
+        expected_ino: Option<u64>,
+    ) -> BoxFuture<'a, Fingerprint> {
         Box::pin(async move {
             let (kind, target) = backing_args(backing)?;
             let val = self
@@ -392,6 +433,8 @@ impl HostTree for JsHostTree {
                         JsValue::from_str(kind),
                         JsValue::from_str(&target),
                         JsValue::from_f64(size as f64),
+                        expected_fp_to_js(expected_fp)?,
+                        expected_ino_to_js(expected_ino),
                     ],
                 )
                 .await?;
@@ -405,6 +448,8 @@ impl HostTree for JsHostTree {
         &'a self,
         backing: &'a Backing,
         data_only: bool,
+        expected_fp: Option<Fingerprint>,
+        expected_ino: Option<u64>,
     ) -> BoxFuture<'a, Fingerprint> {
         Box::pin(async move {
             let (kind, target) = backing_args(backing)?;
@@ -416,12 +461,64 @@ impl HostTree for JsHostTree {
                         JsValue::from_str(kind),
                         JsValue::from_str(&target),
                         JsValue::from_bool(data_only),
+                        expected_fp_to_js(expected_fp)?,
+                        expected_ino_to_js(expected_ino),
                     ],
                 )
                 .await?;
             let wire: JsFingerprintWire =
                 serde_json::from_value(js_to_json_vfs(&val)?).map_err(|_| Errno::EIO)?;
             Ok(wire.into_fingerprint())
+        })
+    }
+
+    fn retain_host_entry<'a>(&'a self, ino: u64, path: &'a str, is_dir: bool) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let ino_str = ino.to_string();
+            self.0
+                .call_async(
+                    "retainEntryHandle",
+                    &[
+                        JsValue::from_str(&ino_str),
+                        JsValue::from_str(path),
+                        JsValue::from_bool(is_dir),
+                    ],
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn verify_host_entry<'a>(
+        &'a self,
+        ino: u64,
+        path: &'a str,
+        is_dir: bool,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let ino_str = ino.to_string();
+            let val = self
+                .0
+                .call_async(
+                    "verifyEntryHandle",
+                    &[
+                        JsValue::from_str(&ino_str),
+                        JsValue::from_str(path),
+                        JsValue::from_bool(is_dir),
+                    ],
+                )
+                .await?;
+            Ok(val.as_bool().unwrap_or(false))
+        })
+    }
+
+    fn forget_host_entry<'a>(&'a self, ino: u64) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let ino_str = ino.to_string();
+            self.0
+                .call_async("forgetEntryHandle", &[JsValue::from_str(&ino_str)])
+                .await?;
+            Ok(())
         })
     }
 

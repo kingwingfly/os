@@ -453,12 +453,31 @@ impl StateStore {
 
     /// Look up an existing host inode or mint a private-default record when newly discovered or
     /// replaced outside OS. Returns `(minted_ino, dirty)`.
+    pub fn has_host_key(&self, key: &HostInodeKey) -> bool {
+        self.by_host.contains_key(key)
+    }
+
     pub fn discover_or_reset<F>(
         &mut self,
         relpath: &str,
         key: HostInodeKey,
         default_uid: u32,
         default_gid: u32,
+        is_open: &F,
+    ) -> Result<(u64, bool), Errno>
+    where
+        F: Fn(u64) -> bool,
+    {
+        self.discover_or_reset_with_mode(relpath, key, default_uid, default_gid, 0o600, is_open)
+    }
+
+    pub fn discover_or_reset_with_mode<F>(
+        &mut self,
+        relpath: &str,
+        key: HostInodeKey,
+        default_uid: u32,
+        default_gid: u32,
+        default_file_mode: u16,
         is_open: &F,
     ) -> Result<(u64, bool), Errno>
     where
@@ -496,7 +515,13 @@ impl StateStore {
         let minted_ino = self.mint_ino()?;
         let mut node = match key.kind {
             HostKind::Dir => Node::directory(default_uid, default_gid, 0o700),
-            HostKind::File => Node::file(default_uid, default_gid, 0o600, String::new(), 0),
+            HostKind::File => Node::file(
+                default_uid,
+                default_gid,
+                default_file_mode,
+                String::new(),
+                0,
+            ),
             HostKind::Symlink => Node::symlink(default_uid, default_gid, ""),
             HostKind::Other => Node::device(default_uid, default_gid, 0o600, ""),
         };

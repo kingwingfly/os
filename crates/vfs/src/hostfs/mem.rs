@@ -21,6 +21,7 @@ const WASM_MAGIC: [u8; 8] = [0x00, b'a', b's', b'm', 0x01, 0x00, 0x00, 0x00];
 struct SimFile {
     bytes: Vec<u8>,
     mtime_ns: u64,
+    entry_id: u64,
 }
 
 impl SimFile {
@@ -44,11 +45,20 @@ impl SimFile {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SimDir {
+    mtime_ns: u64,
+    entry_id: u64,
+}
+
 struct TreeInner {
-    dirs: BTreeMap<String, u64>,
+    dirs: BTreeMap<String, SimDir>,
     files: BTreeMap<String, SimFile>,
     orphans: BTreeMap<u64, SimFile>,
+    retained_entries: BTreeMap<u64, u64>,
     next_tick_ns: u64,
+    next_entry_id: u64,
+    pending_external_replace: Option<(String, Vec<u8>)>,
     copy_dir_move: bool,
     quota_exceeded: bool,
     flush_error: bool,
@@ -62,6 +72,46 @@ impl TreeInner {
         let ts = self.next_tick_ns;
         self.next_tick_ns += 1_000_000;
         ts
+    }
+
+    fn mint_entry_id(&mut self) -> u64 {
+        let id = self.next_entry_id;
+        self.next_entry_id += 1;
+        id
+    }
+
+    fn apply_pending_replace(&mut self) {
+        if let Some((path, bytes)) = self.pending_external_replace.take() {
+            let mtime_ns = self.tick();
+            let entry_id = self.mint_entry_id();
+            self.files.insert(
+                path,
+                SimFile {
+                    bytes,
+                    mtime_ns,
+                    entry_id,
+                },
+            );
+        }
+    }
+
+    fn check_file_io(
+        file: &SimFile,
+        expected_fp: Option<Fingerprint>,
+        expected_ino: Option<u64>,
+        retained: &BTreeMap<u64, u64>,
+    ) -> Result<()> {
+        if let Some(fp) = expected_fp
+            && file.fingerprint() != fp
+        {
+            return Err(Errno::ESTALE);
+        }
+        if let Some(ino) = expected_ino
+            && retained.get(&ino) != Some(&file.entry_id)
+        {
+            return Err(Errno::ESTALE);
+        }
+        Ok(())
     }
 
     fn check_perm(&self) -> Result<()> {
@@ -93,14 +143,17 @@ impl TreeInner {
         Ok(())
     }
 
-    fn dir_entry(mtime_ns: u64) -> HostEntry {
-        let sec = mtime_ns / 1_000_000_000;
-        let nsec = (mtime_ns % 1_000_000_000) as u32;
+    fn dir_entry(dir: SimDir) -> HostEntry {
+        let sec = dir.mtime_ns / 1_000_000_000;
+        let nsec = (dir.mtime_ns % 1_000_000_000) as u32;
         HostEntry {
             file_type: FileType::Dir,
             size: 0,
             mtime: Timespec { sec, nsec },
-            fingerprint: Fingerprint { size: 0, mtime_ns },
+            fingerprint: Fingerprint {
+                size: 0,
+                mtime_ns: dir.mtime_ns,
+            },
             executable: false,
         }
     }
@@ -171,13 +224,22 @@ impl Default for SimProfile {
 impl SimProfile {
     pub fn new() -> Self {
         let mut dirs = BTreeMap::new();
-        dirs.insert(String::new(), 1_700_000_000_000_000_000);
+        dirs.insert(
+            String::new(),
+            SimDir {
+                mtime_ns: 1_700_000_000_000_000_000,
+                entry_id: 1,
+            },
+        );
         Self {
             tree: Rc::new(RefCell::new(TreeInner {
                 dirs,
                 files: BTreeMap::new(),
                 orphans: BTreeMap::new(),
+                retained_entries: BTreeMap::new(),
                 next_tick_ns: 1_700_000_000_001_000_000,
+                next_entry_id: 2,
+                pending_external_replace: None,
                 copy_dir_move: false,
                 quota_exceeded: false,
                 flush_error: false,
@@ -282,11 +344,13 @@ impl SimProfile {
     pub fn external_write(&self, path: &str, bytes: &[u8]) {
         let mut t = self.tree.borrow_mut();
         let mtime_ns = t.tick();
+        let entry_id = t.mint_entry_id();
         t.files.insert(
             path.to_string(),
             SimFile {
                 bytes: bytes.to_vec(),
                 mtime_ns,
+                entry_id,
             },
         );
     }
@@ -294,7 +358,9 @@ impl SimProfile {
     pub fn external_mkdir(&self, path: &str) {
         let mut t = self.tree.borrow_mut();
         let mtime_ns = t.tick();
-        t.dirs.insert(path.to_string(), mtime_ns);
+        let entry_id = t.mint_entry_id();
+        t.dirs
+            .insert(path.to_string(), SimDir { mtime_ns, entry_id });
     }
 
     pub fn external_remove(&self, path: &str) {
@@ -309,9 +375,14 @@ impl SimProfile {
         if let Some(mut f) = t.files.remove(from) {
             f.mtime_ns = mtime_ns;
             t.files.insert(to.to_string(), f);
-        } else if t.dirs.remove(from).is_some() {
-            t.dirs.insert(to.to_string(), mtime_ns);
+        } else if let Some(mut d) = t.dirs.remove(from) {
+            d.mtime_ns = mtime_ns;
+            t.dirs.insert(to.to_string(), d);
         }
+    }
+
+    pub fn schedule_external_replace(&self, path: &str, bytes: &[u8]) {
+        self.tree.borrow_mut().pending_external_replace = Some((path.to_string(), bytes.to_vec()));
     }
 
     pub fn external_read(&self, path: &str) -> Option<Vec<u8>> {
@@ -397,8 +468,8 @@ impl HostTree for SimTree {
             let mut t = self.0.borrow_mut();
             t.tree_ops += 1;
             t.check_perm()?;
-            if let Some(&mtime_ns) = t.dirs.get(path) {
-                return Ok(Some(TreeInner::dir_entry(mtime_ns)));
+            if let Some(&dir) = t.dirs.get(path) {
+                return Ok(Some(TreeInner::dir_entry(dir)));
             }
             if let Some(file) = t.files.get(path) {
                 return Ok(Some(file.host_entry()));
@@ -421,7 +492,7 @@ impl HostTree for SimTree {
                 format!("{path}/")
             };
             let mut entries = Vec::new();
-            for (dpath, &mtime_ns) in &t.dirs {
+            for (dpath, &dir) in &t.dirs {
                 if dpath.is_empty() {
                     continue;
                 }
@@ -429,7 +500,7 @@ impl HostTree for SimTree {
                     && !rest.is_empty()
                     && !rest.contains('/')
                 {
-                    entries.push((rest.to_string(), TreeInner::dir_entry(mtime_ns)));
+                    entries.push((rest.to_string(), TreeInner::dir_entry(dir)));
                 }
             }
             for (fpath, file) in &t.files {
@@ -464,15 +535,22 @@ impl HostTree for SimTree {
                 return Err(Errno::EEXIST);
             }
             let mtime_ns = t.tick();
-            let entry = t.files.entry(path.to_string()).or_insert_with(|| SimFile {
+            if let Some(entry) = t.files.get_mut(path) {
+                if truncate {
+                    entry.bytes.clear();
+                    entry.mtime_ns = mtime_ns;
+                }
+                return Ok(entry.host_entry());
+            }
+            let entry_id = t.mint_entry_id();
+            let entry = SimFile {
                 bytes: Vec::new(),
                 mtime_ns,
-            });
-            if truncate {
-                entry.bytes.clear();
-                entry.mtime_ns = mtime_ns;
-            }
-            Ok(entry.host_entry())
+                entry_id,
+            };
+            let host = entry.host_entry();
+            t.files.insert(path.to_string(), entry);
+            Ok(host)
         })
     }
 
@@ -487,8 +565,10 @@ impl HostTree for SimTree {
                 return Err(Errno::EEXIST);
             }
             let mtime_ns = t.tick();
-            t.dirs.insert(path.to_string(), mtime_ns);
-            Ok(TreeInner::dir_entry(mtime_ns))
+            let entry_id = t.mint_entry_id();
+            let dir = SimDir { mtime_ns, entry_id };
+            t.dirs.insert(path.to_string(), dir);
+            Ok(TreeInner::dir_entry(dir))
         })
     }
 
@@ -497,16 +577,22 @@ impl HostTree for SimTree {
         backing: &'a Backing,
         offset: u64,
         len: usize,
+        expected_fp: Option<Fingerprint>,
+        expected_ino: Option<u64>,
     ) -> BoxFuture<'a, Vec<u8>> {
         Box::pin(async move {
             let mut t = self.0.borrow_mut();
             t.tree_ops += 1;
             t.check_perm()?;
+            t.apply_pending_replace();
             let file = match backing {
                 Backing::Path(p) => t.files.get(p).ok_or(Errno::ESTALE)?,
                 Backing::Orphan(ino) => t.orphans.get(ino).ok_or(Errno::ESTALE)?,
                 Backing::MetaOnly => return Err(Errno::EINVAL),
             };
+            if matches!(backing, Backing::Path(_)) {
+                TreeInner::check_file_io(file, expected_fp, expected_ino, &t.retained_entries)?;
+            }
             let start = usize::try_from(offset).unwrap_or(usize::MAX);
             if start >= file.bytes.len() || len == 0 {
                 return Ok(Vec::new());
@@ -522,12 +608,24 @@ impl HostTree for SimTree {
         offset: u64,
         data: &'a [u8],
         append: bool,
+        expected_fp: Option<Fingerprint>,
+        expected_ino: Option<u64>,
     ) -> BoxFuture<'a, (Written, Fingerprint)> {
         Box::pin(async move {
             let mut t = self.0.borrow_mut();
             t.tree_ops += 1;
             t.check_perm()?;
             t.check_quota()?;
+            t.apply_pending_replace();
+            let check_path = matches!(backing, Backing::Path(_));
+            if check_path {
+                let retained = t.retained_entries.clone();
+                let file = match backing {
+                    Backing::Path(p) => t.files.get(p).ok_or(Errno::ESTALE)?,
+                    _ => unreachable!(),
+                };
+                TreeInner::check_file_io(file, expected_fp, expected_ino, &retained)?;
+            }
             let mtime_ns = t.tick();
             let file = match backing {
                 Backing::Path(p) => t.files.get_mut(p).ok_or(Errno::ESTALE)?,
@@ -556,12 +654,27 @@ impl HostTree for SimTree {
         })
     }
 
-    fn set_file_len<'a>(&'a self, backing: &'a Backing, size: u64) -> BoxFuture<'a, Fingerprint> {
+    fn set_file_len<'a>(
+        &'a self,
+        backing: &'a Backing,
+        size: u64,
+        expected_fp: Option<Fingerprint>,
+        expected_ino: Option<u64>,
+    ) -> BoxFuture<'a, Fingerprint> {
         Box::pin(async move {
             let mut t = self.0.borrow_mut();
             t.tree_ops += 1;
             t.check_perm()?;
             t.check_quota()?;
+            t.apply_pending_replace();
+            if matches!(backing, Backing::Path(_)) {
+                let retained = t.retained_entries.clone();
+                let file = match backing {
+                    Backing::Path(p) => t.files.get(p).ok_or(Errno::ESTALE)?,
+                    _ => unreachable!(),
+                };
+                TreeInner::check_file_io(file, expected_fp, expected_ino, &retained)?;
+            }
             let mtime_ns = t.tick();
             let new_len = usize::try_from(size).map_err(|_| Errno::EFBIG)?;
             let file = match backing {
@@ -579,21 +692,68 @@ impl HostTree for SimTree {
         &'a self,
         backing: &'a Backing,
         _data_only: bool,
+        expected_fp: Option<Fingerprint>,
+        expected_ino: Option<u64>,
     ) -> BoxFuture<'a, Fingerprint> {
         Box::pin(async move {
             let mut t = self.0.borrow_mut();
             t.tree_ops += 1;
             t.check_perm()?;
+            t.apply_pending_replace();
             if t.flush_error {
                 return Err(Errno::EIO);
             }
-            let fp = match backing {
-                Backing::Path(p) => t.files.get(p).ok_or(Errno::ESTALE)?.fingerprint(),
-                Backing::Orphan(ino) => t.orphans.get(ino).ok_or(Errno::ESTALE)?.fingerprint(),
+            let file = match backing {
+                Backing::Path(p) => t.files.get(p).ok_or(Errno::ESTALE)?,
+                Backing::Orphan(ino) => t.orphans.get(ino).ok_or(Errno::ESTALE)?,
                 Backing::MetaOnly => return Err(Errno::EINVAL),
             };
+            if matches!(backing, Backing::Path(_)) {
+                TreeInner::check_file_io(file, expected_fp, expected_ino, &t.retained_entries)?;
+            }
+            let fp = file.fingerprint();
             t.file_flushes += 1;
             Ok(fp)
+        })
+    }
+
+    fn retain_host_entry<'a>(&'a self, ino: u64, path: &'a str, is_dir: bool) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let mut t = self.0.borrow_mut();
+            t.check_perm()?;
+            let entry_id = if is_dir {
+                t.dirs.get(path).map(|d| d.entry_id)
+            } else {
+                t.files.get(path).map(|f| f.entry_id)
+            }
+            .ok_or(Errno::ESTALE)?;
+            t.retained_entries.insert(ino, entry_id);
+            Ok(())
+        })
+    }
+
+    fn verify_host_entry<'a>(
+        &'a self,
+        ino: u64,
+        path: &'a str,
+        is_dir: bool,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let t = self.0.borrow();
+            t.check_perm()?;
+            let current_id = if is_dir {
+                t.dirs.get(path).map(|d| d.entry_id)
+            } else {
+                t.files.get(path).map(|f| f.entry_id)
+            };
+            Ok(current_id.is_some() && t.retained_entries.get(&ino) == current_id.as_ref())
+        })
+    }
+
+    fn forget_host_entry<'a>(&'a self, ino: u64) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.0.borrow_mut().retained_entries.remove(&ino);
+            Ok(())
         })
     }
 
@@ -642,23 +802,34 @@ impl HostTree for SimTree {
                 let mut f = t.files.remove(from).ok_or(Errno::ENOENT)?;
                 if t.copy_dir_move {
                     f.mtime_ns = t.tick();
+                    f.entry_id = t.mint_entry_id();
                 }
                 let fp = f.fingerprint();
                 t.files.insert(to.to_string(), f);
                 return Ok(vec![(to.to_string(), fp)]);
             }
-            let dir_mtime = t.dirs.remove(from).ok_or(Errno::ENOENT)?;
-            t.dirs.insert(to.to_string(), dir_mtime);
+            let mut dir = t.dirs.remove(from).ok_or(Errno::ENOENT)?;
+            if t.copy_dir_move {
+                dir.mtime_ns = t.tick();
+                dir.entry_id = t.mint_entry_id();
+            }
+            let mut moved_fps = vec![(to.to_string(), TreeInner::dir_entry(dir).fingerprint)];
+            t.dirs.insert(to.to_string(), dir);
             let prefix = format!("{from}/");
-            let subdirs: Vec<(String, u64)> = t
+            let subdirs: Vec<(String, SimDir)> = t
                 .dirs
                 .iter()
                 .filter(|(k, _)| k.starts_with(&prefix))
                 .map(|(k, &v)| (k.clone(), v))
                 .collect();
-            for (old_k, v) in subdirs {
+            for (old_k, mut v) in subdirs {
                 t.dirs.remove(&old_k);
+                if t.copy_dir_move {
+                    v.mtime_ns = t.tick();
+                    v.entry_id = t.mint_entry_id();
+                }
                 let new_k = format!("{to}/{}", &old_k[prefix.len()..]);
+                moved_fps.push((new_k.clone(), TreeInner::dir_entry(v).fingerprint));
                 t.dirs.insert(new_k, v);
             }
             let subfiles: Vec<String> = t
@@ -668,11 +839,11 @@ impl HostTree for SimTree {
                 .cloned()
                 .collect();
             let copy_mode = t.copy_dir_move;
-            let mut moved_fps = Vec::new();
             for old_k in subfiles {
                 if let Some(mut f) = t.files.remove(&old_k) {
                     if copy_mode {
                         f.mtime_ns = t.tick();
+                        f.entry_id = t.mint_entry_id();
                     }
                     let new_k = format!("{to}/{}", &old_k[prefix.len()..]);
                     let fp = f.fingerprint();

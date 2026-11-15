@@ -96,7 +96,7 @@ async fn ensure_metadata<'a>(
     Ok(frame.metadata.as_ref().expect("populated metadata"))
 }
 
-fn may_follow_link(cred: &Cred, dir: &Metadata, link: &Metadata) -> bool {
+pub fn may_follow_link(cred: &Cred, dir: &Metadata, link: &Metadata) -> bool {
     let dir_node = Node::directory(dir.uid, dir.gid, dir.mode);
     let link_node = Node::symlink(link.uid, link.gid, "");
     allowed_link(&cred.identity, &dir_node, &link_node)

@@ -212,8 +212,17 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                 match self.tree.stat_path(path).await? {
                     Some(host)
                         if host.file_type == inode.file_type()
-                            && (host.file_type == FileType::Dir
-                                || inode.fingerprint == Some(host.fingerprint)) => {}
+                            && inode.fingerprint == Some(host.fingerprint) =>
+                    {
+                        if !self
+                            .tree
+                            .verify_host_entry(inode.ino, path, host.file_type == FileType::Dir)
+                            .await?
+                        {
+                            self.mark_stale(&inode).await?;
+                            return Err(Errno::ESTALE);
+                        }
+                    }
                     _ => {
                         self.mark_stale(&inode).await?;
                         return Err(Errno::ESTALE);
@@ -226,38 +235,132 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         Ok(inode)
     }
 
+    fn dir_expectation(&self, inode: &InodeRecord) -> (Option<Fingerprint>, Option<u64>) {
+        if self.kind == HostKind::Directory {
+            (inode.fingerprint, Some(inode.ino))
+        } else {
+            (None, None)
+        }
+    }
+
+    async fn fail_if_stale<R>(&self, inode: &InodeRecord, result: Result<R>) -> Result<R> {
+        match result {
+            Err(Errno::ESTALE) if self.kind == HostKind::Directory => {
+                self.mark_stale(inode).await?;
+                Err(Errno::ESTALE)
+            }
+            other => other,
+        }
+    }
+
+    async fn collect_stale_descendants(
+        &self,
+        root_stale: &InodeRecord,
+        modified: &mut BTreeMap<u64, InodeRecord>,
+        forgotten: &mut Vec<u64>,
+    ) -> Result<()> {
+        if !root_stale.meta.directory {
+            return Ok(());
+        }
+        let prefix = match &root_stale.backing {
+            Backing::Path(p) if !p.is_empty() => Some(format!("{p}/")),
+            _ => None,
+        };
+        let all = self.meta.list_all_inodes().await?;
+        let by_ino: BTreeMap<u64, InodeRecord> =
+            all.into_iter().map(|rec| (rec.ino, rec)).collect();
+        let mut queue = vec![root_stale.ino];
+        while let Some(dir_ino) = queue.pop() {
+            let child_inos: Vec<u64> = by_ino
+                .get(&dir_ino)
+                .map(|rec| rec.entries.values().copied().collect())
+                .unwrap_or_default();
+            for child_ino in child_inos {
+                if modified.contains_key(&child_ino) {
+                    continue;
+                }
+                if let Some(mut child) = by_ino.get(&child_ino).cloned() {
+                    if child.meta.directory {
+                        child.stale = true;
+                        child.nlink = 0;
+                        queue.push(child.ino);
+                        forgotten.push(child.ino);
+                        modified.insert(child.ino, child);
+                    } else {
+                        child
+                            .parents
+                            .retain(|(p, _)| *p != dir_ino && !modified.contains_key(p));
+                        if child.parents.is_empty() {
+                            child.stale = true;
+                            child.nlink = 0;
+                            forgotten.push(child.ino);
+                        }
+                        modified.insert(child.ino, child);
+                    }
+                }
+            }
+        }
+        if let Some(prefix) = prefix {
+            for rec in by_ino.into_values() {
+                if modified.contains_key(&rec.ino) {
+                    continue;
+                }
+                if let Backing::Path(ref bp) = rec.backing
+                    && bp.starts_with(&prefix)
+                {
+                    let mut child = rec;
+                    child.stale = true;
+                    child.nlink = 0;
+                    forgotten.push(child.ino);
+                    modified.insert(child.ino, child);
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn mark_stale(&self, inode: &InodeRecord) -> Result<()> {
         let mut stale_rec = inode.clone();
         stale_rec.stale = true;
         stale_rec.nlink = 0;
-        let mut put_inodes = vec![stale_rec];
-        if inode.meta.directory && inode.ino != ROOT_INO && inode.parent != 0 {
-            if let Some(mut p) = self.meta.get_inode(inode.parent).await?
-                && p.entries.get(&inode.name) == Some(&inode.ino)
+        let mut modified = BTreeMap::from([(stale_rec.ino, stale_rec.clone())]);
+        let mut forgotten = vec![stale_rec.ino];
+        self.collect_stale_descendants(&stale_rec, &mut modified, &mut forgotten)
+            .await?;
+
+        if stale_rec.meta.directory && stale_rec.ino != ROOT_INO && stale_rec.parent != 0 {
+            if let Some(mut p) = self.meta.get_inode(stale_rec.parent).await?
+                && p.entries.get(&stale_rec.name) == Some(&stale_rec.ino)
             {
-                p.entries.remove(&inode.name);
+                p.entries.remove(&stale_rec.name);
                 p.nlink = p.nlink.saturating_sub(1);
-                put_inodes.push(p);
+                modified.insert(p.ino, p);
             }
         } else {
-            for (p_ino, p_name) in &inode.parents {
+            for (p_ino, p_name) in &stale_rec.parents {
                 if let Some(mut p) = self.meta.get_inode(*p_ino).await?
-                    && p.entries.get(p_name) == Some(&inode.ino)
+                    && p.entries.get(p_name) == Some(&stale_rec.ino)
                 {
                     p.entries.remove(p_name);
-                    put_inodes.push(p);
+                    modified.insert(p.ino, p);
                 }
             }
         }
         self.meta
             .commit(
                 MetaBatch {
-                    put_inodes,
+                    put_inodes: modified.into_values().collect(),
                     ..MetaBatch::default()
                 },
                 false,
             )
-            .await
+            .await?;
+        if self.kind == HostKind::Directory {
+            for ino in forgotten {
+                self.tree.forget_host_entry(ino).await?;
+            }
+        }
+        Ok(())
     }
 
     fn default_inode_from_host(
@@ -301,7 +404,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             mtime: ts,
             ctime: ts,
             backing: Backing::Path(path),
-            fingerprint: (!is_dir).then_some(host.fingerprint),
+            fingerprint: Some(host.fingerprint),
             stale: false,
         }
     }
@@ -388,25 +491,32 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                 let Some(host) = host_opt else {
                     if let Some(old_ino) = recorded_ino {
                         dir.entries.remove(name);
-                        let mut put_inodes = vec![dir.clone()];
+                        let mut modified = BTreeMap::new();
+                        let mut forgotten = Vec::new();
                         if let Some(mut old) = self.meta.get_inode(old_ino).await? {
                             if old.meta.directory {
                                 dir.nlink = dir.nlink.saturating_sub(1);
-                                put_inodes[0] = dir.clone();
                             }
                             old.stale = true;
                             old.nlink = 0;
-                            put_inodes.push(old);
+                            forgotten.push(old.ino);
+                            self.collect_stale_descendants(&old, &mut modified, &mut forgotten)
+                                .await?;
+                            modified.insert(old.ino, old);
                         }
+                        modified.insert(dir.ino, dir.clone());
                         self.meta
                             .commit(
                                 MetaBatch {
-                                    put_inodes,
+                                    put_inodes: modified.into_values().collect(),
                                     ..MetaBatch::default()
                                 },
                                 false,
                             )
                             .await?;
+                        for stale_ino in forgotten {
+                            self.tree.forget_host_entry(stale_ino).await?;
+                        }
                     }
                     return Ok(None);
                 };
@@ -415,14 +525,17 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                     && let Some(child) = self.meta.get_inode(ino).await?
                     && !child.stale
                     && child.file_type() == host.file_type
-                    && (host.file_type == FileType::Dir
-                        || child.fingerprint == Some(host.fingerprint))
+                    && child.fingerprint == Some(host.fingerprint)
+                    && self
+                        .tree
+                        .verify_host_entry(ino, &child_path, host.file_type == FileType::Dir)
+                        .await?
                 {
                     return Ok(Some(child));
                 }
 
-                // Either unrecorded or modified/replaced outside the OS: mark any old inode stale
-                // and mint a new inode with private defaults.
+                // Either unrecorded or modified/replaced outside the OS: mark any old inode (and
+                // any cached descendants) stale and mint a new inode with private defaults.
                 let mut header = self.load_header().await?;
                 let new_ino = Self::alloc_ino(&mut header)?;
                 let new_child = Self::default_inode_from_host(
@@ -430,10 +543,11 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                     new_ino,
                     dir.ino,
                     name,
-                    child_path,
+                    child_path.clone(),
                     &host,
                 );
-                let mut put_inodes = Vec::new();
+                let mut modified = BTreeMap::new();
+                let mut forgotten = Vec::new();
                 if let Some(old_ino) = recorded_ino
                     && let Some(mut old) = self.meta.get_inode(old_ino).await?
                 {
@@ -442,24 +556,33 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                     }
                     old.stale = true;
                     old.nlink = 0;
-                    put_inodes.push(old);
+                    forgotten.push(old.ino);
+                    self.collect_stale_descendants(&old, &mut modified, &mut forgotten)
+                        .await?;
+                    modified.insert(old.ino, old);
                 }
                 dir.entries.insert(name.to_string(), new_ino);
                 if new_child.meta.directory {
                     dir.nlink += 1;
                 }
-                put_inodes.push(dir.clone());
-                put_inodes.push(new_child.clone());
+                modified.insert(dir.ino, dir.clone());
+                modified.insert(new_child.ino, new_child.clone());
+                self.tree
+                    .retain_host_entry(new_ino, &child_path, new_child.meta.directory)
+                    .await?;
                 self.meta
                     .commit(
                         MetaBatch {
                             header: Some(header),
-                            put_inodes,
+                            put_inodes: modified.into_values().collect(),
                             ..MetaBatch::default()
                         },
                         false,
                     )
                     .await?;
+                for stale_ino in forgotten {
+                    self.tree.forget_host_entry(stale_ino).await?;
+                }
                 Ok(Some(new_child))
             }
         }
@@ -718,9 +841,17 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             }
         }
         let now = (self.clock)();
+        let (expected_fp, expected_ino) = self.dir_expectation(&inode);
         inode.meta = meta;
         if let Some(size) = attr.size {
-            let fp = self.tree.set_file_len(&inode.backing, size).await?;
+            let fp = self
+                .fail_if_stale(
+                    &inode,
+                    self.tree
+                        .set_file_len(&inode.backing, size, expected_fp, expected_ino)
+                        .await,
+                )
+                .await?;
             inode.size = size;
             inode.meta.size = size;
             if self.kind == HostKind::Directory {
@@ -850,7 +981,15 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             let mut header = self.load_header().await?;
             let mut put_inodes = Vec::new();
             if options.is_truncate() && existing.file_type() == FileType::File {
-                let fp = self.tree.set_file_len(&existing.backing, 0).await?;
+                let (expected_fp, expected_ino) = self.dir_expectation(&existing);
+                let fp = self
+                    .fail_if_stale(
+                        &existing,
+                        self.tree
+                            .set_file_len(&existing.backing, 0, expected_fp, expected_ino)
+                            .await,
+                    )
+                    .await?;
                 existing.size = 0;
                 existing.meta.size = 0;
                 if self.kind == HostKind::Directory {
@@ -904,7 +1043,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             atime: now,
             mtime: now,
             ctime: now,
-            backing: Backing::Path(child_path),
+            backing: Backing::Path(child_path.clone()),
             fingerprint: Some(host.fingerprint),
             stale: false,
         };
@@ -913,6 +1052,9 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
 
         let open = self.register_open(&mut header, cred, ino, access).await?;
         let entry = self.make_entry(&child);
+        if self.kind == HostKind::Directory {
+            self.tree.retain_host_entry(ino, &child_path, false).await?;
+        }
         self.meta
             .commit(
                 MetaBatch {
@@ -947,7 +1089,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             return Err(Errno::ENOENT);
         };
         let child_path = join_rel(&dir_path, name);
-        self.tree.create_dir(&child_path).await?;
+        let host = self.tree.create_dir(&child_path).await?;
 
         let mut header = self.load_header().await?;
         let ino = Self::alloc_ino(&mut header)?;
@@ -967,14 +1109,17 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             atime: now,
             mtime: now,
             ctime: now,
-            backing: Backing::Path(child_path),
-            fingerprint: None,
+            backing: Backing::Path(child_path.clone()),
+            fingerprint: Some(host.fingerprint),
             stale: false,
         };
         dir_rec.entries.insert(name.to_string(), ino);
         dir_rec.nlink += 1;
         Self::touch(&mut dir_rec, now, true);
         let entry = self.make_entry(&child);
+        if self.kind == HostKind::Directory {
+            self.tree.retain_host_entry(ino, &child_path, true).await?;
+        }
         self.meta
             .commit(
                 MetaBatch {
@@ -1172,6 +1317,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             victim.nlink = 0;
             if self.kind == HostKind::Directory {
                 victim.stale = true;
+                self.tree.forget_host_entry(victim.ino).await?;
                 return Ok(false);
             }
             victim.backing = Backing::MetaOnly;
@@ -1184,6 +1330,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             self.tree.remove_file(unlinked_path).await?;
             victim.stale = true;
             victim.nlink = 0;
+            self.tree.forget_host_entry(victim.ino).await?;
             return Ok(false);
         }
 
@@ -1426,6 +1573,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         let source_has_path =
             moving_dir || matches!(&source.backing, Backing::Path(bp) if bp == &from_path);
         let mut undo_target = None;
+        let mut forgotten_targets = Vec::new();
 
         // If `move_entry` will overwrite `to_path` directly, only stage away a hard-linked or open
         // OPFS target so a failed `move_entry` (e.g., `EDQUOT`) never loses the destination.
@@ -1482,6 +1630,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                     target.nlink = 0;
                     if self.kind == HostKind::Directory {
                         target.stale = true;
+                        forgotten_targets.push(target.ino);
                         modified.insert(target.ino, target);
                     } else {
                         target.backing = Backing::MetaOnly;
@@ -1532,12 +1681,19 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             Vec::new()
         };
 
+        let mut moved_retains: Vec<(u64, String, bool)> = Vec::new();
         if moving_dir {
             source.parent = to_parent.ino;
             source.name = to.to_string();
             source.backing = Backing::Path(to_path.clone());
             let fp_map: std::collections::HashMap<String, Fingerprint> =
                 moved_fps.into_iter().collect();
+            if self.kind == HostKind::Directory {
+                if let Some(fp) = fp_map.get(&to_path) {
+                    source.fingerprint = Some(*fp);
+                }
+                moved_retains.push((source.ino, to_path.clone(), true));
+            }
             let prefix = format!("{from_path}/");
             for mut rec in self.meta.list_all_inodes().await? {
                 if rec.ino == source.ino || modified.contains_key(&rec.ino) {
@@ -1547,10 +1703,11 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                     && bp.starts_with(&prefix)
                 {
                     let new_bp = format!("{to_path}/{}", &bp[prefix.len()..]);
-                    if self.kind == HostKind::Directory
-                        && let Some(fp) = fp_map.get(&new_bp)
-                    {
-                        rec.fingerprint = Some(*fp);
+                    if self.kind == HostKind::Directory {
+                        if let Some(fp) = fp_map.get(&new_bp) {
+                            rec.fingerprint = Some(*fp);
+                        }
+                        moved_retains.push((rec.ino, new_bp.clone(), rec.meta.directory));
                     }
                     rec.backing = Backing::Path(new_bp);
                     modified.insert(rec.ino, rec);
@@ -1559,10 +1716,11 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         } else {
             source.parents.remove(&(from_parent.ino, from.to_string()));
             source.parents.insert((to_parent.ino, to.to_string()));
-            if self.kind == HostKind::Directory
-                && let Some((_, fp)) = moved_fps.iter().find(|(p, _)| p == &to_path)
-            {
-                source.fingerprint = Some(*fp);
+            if self.kind == HostKind::Directory && source_has_path {
+                if let Some((_, fp)) = moved_fps.iter().find(|(p, _)| p == &to_path) {
+                    source.fingerprint = Some(*fp);
+                }
+                moved_retains.push((source.ino, to_path.clone(), false));
             }
         }
         Self::touch(&mut source, now, false);
@@ -1578,7 +1736,16 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                 },
                 false,
             )
-            .await
+            .await?;
+        if self.kind == HostKind::Directory {
+            for ino in forgotten_targets {
+                self.tree.forget_host_entry(ino).await?;
+            }
+            for (ino, path, is_dir) in moved_retains {
+                self.tree.retain_host_entry(ino, &path, is_dir).await?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn do_getxattr(
@@ -1708,7 +1875,15 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         let mut header = self.load_header().await?;
         let mut put_inodes = Vec::new();
         if access != Access::Path && options.is_truncate() && inode.file_type() == FileType::File {
-            let fp = self.tree.set_file_len(&inode.backing, 0).await?;
+            let (expected_fp, expected_ino) = self.dir_expectation(&inode);
+            let fp = self
+                .fail_if_stale(
+                    &inode,
+                    self.tree
+                        .set_file_len(&inode.backing, 0, expected_fp, expected_ino)
+                        .await,
+                )
+                .await?;
             inode.size = 0;
             inode.meta.size = 0;
             if self.kind == HostKind::Directory {
@@ -1765,7 +1940,14 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         } else {
             let want =
                 usize::try_from(inode.size - offset).map_or(max_len, |left| left.min(max_len));
-            self.tree.read_file(&inode.backing, offset, want).await?
+            let (expected_fp, expected_ino) = self.dir_expectation(&inode);
+            self.fail_if_stale(
+                &inode,
+                self.tree
+                    .read_file(&inode.backing, offset, want, expected_fp, expected_ino)
+                    .await,
+            )
+            .await?
         };
         let n = data.len().min(max_len);
         buf[..n].copy_from_slice(&data[..n]);
@@ -1812,9 +1994,21 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         }
         let room = usize::try_from(FILE_MAX - offset).unwrap_or(usize::MAX);
         let len = buf.len().min(room).min(RW_MAX);
+        let (expected_fp, expected_ino) = self.dir_expectation(&inode);
         let (written, fp) = self
-            .tree
-            .write_file(&inode.backing, offset, &buf[..len], append)
+            .fail_if_stale(
+                &inode,
+                self.tree
+                    .write_file(
+                        &inode.backing,
+                        offset,
+                        &buf[..len],
+                        append,
+                        expected_fp,
+                        expected_ino,
+                    )
+                    .await,
+            )
             .await?;
         let new_end = written.offset.saturating_add(written.len as u64);
         inode.size = inode.size.max(new_end).max(fp.size);
@@ -1851,7 +2045,15 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             return Err(Errno::EFBIG);
         }
         self.require_writable_grant()?;
-        let fp = self.tree.set_file_len(&inode.backing, size).await?;
+        let (expected_fp, expected_ino) = self.dir_expectation(&inode);
+        let fp = self
+            .fail_if_stale(
+                &inode,
+                self.tree
+                    .set_file_len(&inode.backing, size, expected_fp, expected_ino)
+                    .await,
+            )
+            .await?;
         inode.size = size;
         inode.meta.size = size;
         if self.kind == HostKind::Directory {
@@ -1880,7 +2082,15 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         let mut inode = self.validate_inode_by_id(ino).await?;
         match inode.file_type() {
             FileType::File => {
-                let fp = self.tree.flush_file(&inode.backing, data_only).await?;
+                let (expected_fp, expected_ino) = self.dir_expectation(&inode);
+                let fp = self
+                    .fail_if_stale(
+                        &inode,
+                        self.tree
+                            .flush_file(&inode.backing, data_only, expected_fp, expected_ino)
+                            .await,
+                    )
+                    .await?;
                 if self.kind == HostKind::Directory && inode.fingerprint != Some(fp) {
                     inode.fingerprint = Some(fp);
                     self.meta

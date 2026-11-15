@@ -843,10 +843,10 @@ host folders from browser storage; **Connect** mounts someone else's export;
 **Publish** manages your exports and their addresses. Publishing and mounting have separate
 forms and tabs. Closing the app does not unmount files.
 Mount source access uses `rwx` ceilings; OS metadata starts owner-only. Ordinary `chmod`,
-`getfacl` and `setfacl` manage owner/group/other and named account ACLs through the same Rust
-VFS permission code as the system tree. These are OS metadata, not host `chmod` operations.
-Metadata belongs to this mounted workspace and resets to private defaults on remount;
-source files remain in place. Cloud delegation remains a separate explicit capability.
+`getfacl` and `setfacl` manage owner/group/other and named account ACLs through Rust
+`os-vfs` (`LocalMount` over `HostFs` and `HelperFs`, replacing the removed JS
+`PermissionMount`). These are OS metadata, not host `chmod` operations; source files
+remain in place, and cloud delegation remains a separate explicit capability.
 Browser storage unavailable in private sessions reports alternatives instead of a low-level
 storage error. Files keeps Refresh, Upload and Mounts in a compact icon group with tooltips,
 leaving room for its editable path. Refresh (or F5 while Files has focus) bypasses cached
@@ -861,14 +861,16 @@ are aliases for the same bytes; unmounting one does not delete files or unmount 
 Unmounting all aliases and mounting again retains the files. It does not allocate another
 volume, format anything, or guarantee persistence after browser storage eviction/clearing.
 The browser profile controls the source; signing into another OS account does not create
-another physical browser filesystem. Current OS permission metadata is still per mount,
-so aliases do not yet share durable inode/ACL metadata as Linux bind mounts do.
+another physical browser filesystem. Browser storage (`HostFs::opfs`) shares a durable
+filesystem identity and IndexedDB metadata store (`STORE_FORMAT_VERSION = 2`) across
+aliases, so remounts and bind-like aliases share inode, mode, ACL, xattr, open-unlink, and
+Web Locks advisory lock state.
 
-Host folders (browser API or helper) and `osfs:` exports likewise provide existing
-directory trees. They mount directly into the VFS and do not need fictional `/dev` block
-nodes or `mkfs`. The next storage-model step is stable filesystem identities, shared and
-durable permission metadata, and separate records for sources, filesystems, mounts and
-exports. Explicit mount and publication consent remains required.
+Host folders (browser `HostFs::directory` or `os-local-helper` `HelperFs`) and `osfs:`
+exports likewise provide existing directory trees without sidecar files inside the host
+folder (`os-local-helper` keeps private metadata in app state under `STATE_FORMAT_VERSION = 2`).
+They mount directly into the VFS and do not need fictional `/dev` block nodes or `mkfs`.
+Explicit mount and publication consent remains required.
 
 A future virtual-disk provider would be a different source: an OPFS-backed image with
 bounded capacity, block reads/writes/flush, a device identity, and a filesystem driver.
@@ -928,10 +930,13 @@ semantics; they do not claim the Linux helper's `openat2` guarantees. Handles ar
 against the selected root after access. See the
 [File System Standard](https://fs.spec.whatwg.org/) and the open
 [symlink semantics specification issue](https://github.com/WICG/file-system-access/issues/113).
-Browser-backed descriptors retain File views; external replacement can produce
-`ESTALE`/`EIO`; opening a path again reads its current contents. Browser providers cannot
-promise POSIX unlink/rename/inode semantics or atomic
-exclusive creation. These limits do not silently become cloud operations. Files previews, embedded Markdown
+Browser-backed descriptors retain File views; external replacement on host folders invalidates
+stale cached metadata with `ESTALE`/`EIO` (never writing sidecars to the host folder);
+opening a path again reads its current contents. `os_vfs::hostfs::HostFs` (`STORE_FORMAT_VERSION = 2`)
+coordinates `O_EXCL` atomic creation, `RENAME_NOREPLACE`, and cross-tab advisory locking via
+Web Locks (`os-fs-*`) plus `fsync`/`fdatasync` flushes; host-folder symlinks remain
+`EOPNOTSUPP`, and native POSIX unlink-while-open on external host directories requires
+`os-local-helper` (`HelperFs`). These limits do not silently become cloud operations. Files previews, embedded Markdown
 images, downloads and editor saves use the same private VFS; downloads retain an open
 descriptor across chunks and release it on completion or cancellation.
 
@@ -1047,7 +1052,7 @@ The [client OS and remote services architecture](#client-os-and-remote-services)
 | L5 | Permission-checked GUI IPC and per-process surfaces; userspace compositor, authorized desktop-shell roles and browser/native presentation adapters. | Independent apps cannot steal surfaces/input; resize, crash, device loss, IME and accessibility behavior are verified. |
 | L6 | Port Files, Terminal, Mounts, Editor and Preview into ordinary OS processes using reusable controllers and services. | Normal process supervision manages each app; browser/native behavioral scenarios pass and obsolete page-only control paths are removed. |
 
-L0 is split into [#46](https://github.com/kingwingfly/os/issues/46), the [measurement harness and baseline](docs/compat/README.md), and [#47](https://github.com/kingwingfly/os/issues/47), the [architecture contract](docs/architecture/contract.md) (merged), with its decisions, versioned boundaries and replacement plan. The harness records current behavior without fixing it. **L1** then implements stable filesystem/inode identity and persistent metadata. No L0–L6 milestone is complete yet. Closing #44 requires all seven gates, including actual `chroot`, boot/root handoff and ordinary-process GUI applications; documentation alone does not close it.
+L0 is split into [#46](https://github.com/kingwingfly/os/issues/46), the [measurement harness and baseline](docs/compat/README.md), and [#47](https://github.com/kingwingfly/os/issues/47), the [architecture contract](docs/architecture/contract.md) (merged), with its decisions, versioned boundaries and replacement plan. Wave 1 **L1** ([#48](https://github.com/kingwingfly/os/issues/48), [#49](https://github.com/kingwingfly/os/issues/49), [#50](https://github.com/kingwingfly/os/issues/50)) implements `os-vfs` handle drivers (`CloudFs`, `HostFs`, `HelperFs`), durable identity/metadata/locking/durability, and `LocalMount` integration. Milestones L2–L6 remain open; closing #44 requires all seven gates, including actual `chroot`, boot/root handoff and ordinary-process GUI applications; documentation alone does not close it.
 
 Preserve account authorization, signed release recovery and no-copy host mounts. Existing deployed data and older protocol versions are not migrated: after #44 the deployment and its data are removed and the system is redeployed. Provider limitations must return explicit unsupported errors. Host directories, browser storage and remote exports are filesystem trees; virtual block devices and `mkfs` need a separate later implementation. L0 defines the portable dispatch/outbox boundary; Cloudflare Queues integration remains Phase 9.2-Q after #44. Additional cloud/OpenDAL providers, general compute and native execution backends retain their later gates.
 
@@ -1057,7 +1062,7 @@ Preserve account authorization, signed release recovery and no-copy host mounts.
 | --- | --- | --- |
 | Phase 6: runtime and services | Installed shell, PTYs, process groups/signals, restricted PID 1, service supervision/readiness/journals, resource limits and session lifecycle. | L0–L3 moves local ownership and startup policy into the instance kernel and userspace init. |
 | Phase 6: immutable composition | `xtask` build/image/boot/sign/verify, signed base/sysext/confext generations, scoped activation and data-preserving rollback. | The initial filesystem and early-init/root-switch sequence remain L3 work. |
-| Phase 8.1: local mounts/execution | No-copy browser host folders, Linux helper fallback and browser storage; supported local WASM execution and compilation without upload. | L1–L2 unifies stable metadata, durability and mount semantics. |
+| Phase 8.1: local mounts/execution | No-copy browser host folders, Linux helper (`openat2`), OPFS storage, and Wave 1 L1 (`HostFs`/`HelperFs`/`LocalMount`) persistent identity, metadata, Web Locks, and `fsync`; supported local WASM execution without upload. | L2 unifies the common per-process mount namespace. |
 | Phase 8.2: private extensions | Private image validation and executable views without changing shared installation trust or another user's PATH. | Use the common process mount model in L2. |
 | Phase 8.3: sharing | Account/ACL or scoped-password exports, explicit receiver mounting, relay/P2P, leases and revocation. | L4 supplies the userspace export-service lifecycle and shared CLI/GUI mount interface. |
 
@@ -1132,7 +1137,7 @@ This is an independent workspace. Worker name: `os`; bucket: `os-files`; binding
 
 ## Validation
 
-The portable VFS (`crates/vfs`, L1a parts 1–2 of #48) includes handle operations, open options, counted descriptions, a descriptor table, reference tmpfs and the cloud driver. The Worker now serves [the v2 cloud protocol](docs/architecture/cloudfs.md), with current-caller checks for bytes and open-reference controls, verified calling PIDs for I/O accounting, retained open objects, descriptor metadata and `SEEK_END` authenticated as the current caller, persistent lock queues and two-minute resumable sessions. Compatible POSIX ranges coalesce, and conflict reports span adjacent grants without losing cancellation ownership. Ordinary exec preserves open grants and locks across token rotation, including forked holders; explicit revocation ends the final grant. Deferred cleanup retries with the current credential after exec and survives transport failures. Job credentials use their scoped path API and are rejected by v2. File bytes stream through Worker/R2; SQLite commits immutable extent manifests, including atomic append and sparse truncation. Old path clients read the same content. Browser syscall integration, host HTTP transport, other adapters and the full L1 conformance/latency gates remain pending.
+Wave 1 L1 ([#48](https://github.com/kingwingfly/os/issues/48), [#49](https://github.com/kingwingfly/os/issues/49), [#50](https://github.com/kingwingfly/os/issues/50)) completes the portable VFS (`crates/vfs`) handle operations, open options, counted descriptions, descriptor table, `MemFs`, [cloud driver](docs/architecture/cloudfs.md), [browser `HostFs` driver](docs/architecture/hostfs.md) (`STORE_FORMAT_VERSION = 2`), and Linux `HelperFs` client over `os-local-helper` (`STATE_FORMAT_VERSION = 2`). The Worker serves `/api/fs` v2 and `/api/fs/data` (`SCHEMA_VERSION = "9"`) with current-caller checks, verified calling PIDs, retained open objects, `SEEK_END` authenticated as the current caller, persistent coalesced POSIX lock queues, two-minute resumable sessions (`cloud_renew`), exec/fork grant inheritance and revocation, durable deferred cleanup, and immutable R2 byte extents. In `crates/client-kernel`, `cloudfs.rs` routes regular cloud files through `CloudFs` while path calls remain for directories, devices, `/proc`, and local mounts until [#51](https://github.com/kingwingfly/os/issues/51), and `mounts.rs` (`LocalMount`) replaces the removed JS `PermissionMount` across OPFS, directory handles, snapshots, and `os-local-helper`, wired to real `fd_sync`/`fd_datasync` in `web/wasi/process.js`.
 
 Run `cargo test --locked -p os-vfs -p os-core -p os-kernel` for portable semantics and cancellation checks. Against a disposable schema-9 Worker, `OS_PASSWORD=... OS_TEST_URL=http://127.0.0.1:8791 npx playwright test tests/cloudfs.spec.js --project=chromium` checks the actual authority/R2 adapter, including home reservation and move rules, privilege bits under different callers, device creation/teardown and alias denial, current umask/default ACL inheritance, creation and truncation rules, exec/fork grant retention and revocation, and the full two-minute lease expiry. After building the Worker, `node --test tests/cloudfs-authority.mjs` runs a disposable authority-binding regression that rejects job credentials at v2 connect, control and data boundaries while checking the existing job path grants. These API tests do not start browser processes or complete the browser/conformance milestone gates.
 

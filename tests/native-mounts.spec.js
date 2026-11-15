@@ -31,7 +31,7 @@ test('host build/edit/run uses the native directory without sending executable b
   await writeFile(root + '/new-program', two); await rename(root + '/new-program', root + '/program');
   expect(await run(page, './program')).toMatchObject({ status: 0, stdout: 'SECOND' }); expect(sent).toEqual([]);
   helper.kill('SIGTERM'); await new Promise(resolve => helper.once('exit', resolve));
-  await expect(run(page, './program')).rejects.toThrow(/offline|disconnected|ENODEV/);
+  await expect(run(page, './program')).rejects.toThrow(/offline|disconnected|ENODEV|ENOTCONN/);
 });
 
 test('native descriptors retain inodes across rebuilds and symlink paths cannot escape', async ({ page }) => {
@@ -111,11 +111,31 @@ test('a shared helper subtree denies symlinks and a held file moved outside the 
 });
 
 test('an older helper cannot publish without the inode identity needed for revocation', async ({ page, context }) => {
+  let realFs = null;
   await context.route(connection.url, async route => {
-    const response = await route.fetch(), value = await response.json();
-    if (value.ok && typeof value.ok === 'object') delete value.ok.identity;
+    const post = route.request().postDataJSON();
+    let postData;
+    if (realFs && post && typeof post === 'object') {
+      const rewrite = obj => {
+        if (!obj || typeof obj !== 'object') return;
+        if (obj.fs === '' && 'node' in obj && 'proof' in obj) obj.fs = realFs;
+        for (const v of Object.values(obj)) rewrite(v);
+      };
+      rewrite(post);
+      postData = JSON.stringify(post);
+    }
+    const response = await route.fetch({ postData }), value = await response.json();
+    if (value && typeof value === 'object' && typeof value.fs === 'string' && value.root && typeof value.root === 'object') {
+      realFs = value.fs;
+      value.fs = '';
+      value.root.fs = '';
+    }
     await route.fulfill({ response, json: value });
   });
-  await expect(page.evaluate(() => window.os.shareMount({ path: '/mnt/local/native', name: 'old-helper', password: '', seconds: 300 }))).rejects.toThrow(/Update os-local-helper/);
+  await page.evaluate(
+    connection => window.os.mountLocal({ name: 'legacy', url: connection.url, token: connection.token, cloud: false }),
+    connection,
+  );
+  await expect(page.evaluate(() => window.os.shareMount({ path: '/mnt/local/legacy', name: 'old-helper', password: '', seconds: 300 }))).rejects.toThrow(/Update os-local-helper/);
   expect((await page.evaluate(() => window.os.sharedMounts())).exports).toEqual([]);
 });

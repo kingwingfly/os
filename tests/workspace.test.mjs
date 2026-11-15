@@ -1496,3 +1496,189 @@ test('RemoteMount enforces O_CREAT target auth, final symlinks, RO O_CREAT|O_EXC
     }
   }
 });
+
+test('LocalMount enforces O_PATH symlink following, sticky protected symlinks, cross-alias creator revocation, and fs-store I/O/directory identity', async () => {
+  installBrowserEnv();
+  const O_PATH = 0o10000000;
+  const O_DIRECTORY = 0o200000;
+  const O_NOFOLLOW = 0o400000;
+
+  const ownerA = new Workspace({ id: 'owner-a', uid: 50, gid: 50, groups: [50] });
+  const ownerB = new Workspace({ id: 'owner-b', uid: 50, gid: 50, groups: [50] });
+  const thirdParty = new Workspace({ id: 'third', uid: 52, gid: 52, groups: [52] });
+  const peer = new Workspace({ id: 'peer-c', uid: 51, gid: 51, groups: [51] });
+
+  await ownerA.mount({ name: 'opfs', storage: true, writable: true, execute: false, cloud: false });
+  await ownerB.mount({ name: 'opfs', storage: true, writable: true, execute: false, cloud: false });
+
+  await ownerA.calls([
+    { chmod: { path: '/mnt/local/opfs', mode: 0o755 } },
+    { mkdir: { path: '/mnt/local/opfs/sub', mode: 0o777 } },
+    { chmod: { path: '/mnt/local/opfs/sub', mode: 0o777 } },
+    { mkdir: { path: '/mnt/local/opfs/sub/targetdir', mode: 0o755 } },
+    { open: { path: '/mnt/local/opfs/sub/targetfile.txt', flags: 0o302, mode: 0o644 } },
+    { pwrite: { fd: { ref: 3 }, index: 0, data: btoa('target-ok') } },
+    { close: { fd: { ref: 3 } } },
+    { chmod: { path: '/mnt/local/opfs/sub/targetfile.txt', mode: 0o644 } },
+    { symlink: { target: 'targetfile.txt', path: '/mnt/local/opfs/sub/symfile' } },
+    { symlink: { target: 'targetdir', path: '/mnt/local/opfs/sub/symdir' } },
+    { mkdir: { path: '/mnt/local/opfs/sub/sticky', mode: 0o1777 } },
+    { chmod: { path: '/mnt/local/opfs/sub/sticky', mode: 0o1777 } },
+  ], ownerA.page, cloud);
+
+  // `O_PATH` follows final symlinks unless `O_NOFOLLOW` is set.
+  const opathRes = await ownerA.calls([
+    { open: { path: '/mnt/local/opfs/sub/symfile', flags: O_PATH } },
+    { fstat: { fd: { ref: 0 } } },
+    { close: { fd: { ref: 0 } } },
+    { open: { path: '/mnt/local/opfs/sub/symdir', flags: O_PATH | O_DIRECTORY } },
+    { fstat: { fd: { ref: 3 } } },
+    { close: { fd: { ref: 3 } } },
+    { open: { path: '/mnt/local/opfs/sub/symdir', flags: O_PATH | O_DIRECTORY | O_NOFOLLOW } },
+    { open: { path: '/mnt/local/opfs/sub/symfile', flags: O_PATH | O_NOFOLLOW } },
+    { fstat: { fd: { ref: 7 } } },
+    { close: { fd: { ref: 7 } } },
+  ], ownerA.page, cloud);
+  assert.equal(opathRes[1].ok.mode & 0o170000, 0o100000);
+  assert.equal(opathRes[4].ok.mode & 0o170000, 0o040000);
+  assert.equal(opathRes[6].err.errno, 'ENOTDIR');
+  assert.equal(opathRes[8].ok.mode & 0o170000, 0o120000);
+
+  // Sticky world-writable protected symlink: thirdParty (uid 52) creates foreign-sym inside
+  // ownerA-owned sticky dir (uid 50, mode 01777) -> target owned by uid 50.
+  await thirdParty.mount({ name: 'opfs', storage: true, writable: true, execute: false, cloud: false });
+  const [symCreate] = await thirdParty.calls([
+    { symlink: { target: '../targetfile.txt', path: '/mnt/local/opfs/sub/sticky/foreign-sym' } },
+  ], thirdParty.page, cloud);
+  assert.equal(symCreate.ok, null);
+  const mA = ownerA.mounts.get('/mnt/local/opfs');
+  const exportView = mA.provider.forIdentity({ id: 51, group: 51, groups: [51] }, 'sub');
+
+  await assert.rejects(
+    exportView.open(mA.grant, 'sub/sticky/foreign-sym', 0),
+    { errno: 'EACCES' },
+  );
+  await assert.rejects(
+    exportView.open(mA.grant, 'sub/sticky/foreign-sym', 0o102, 0o600),
+    { errno: 'EACCES' },
+  );
+  // Non-creator (including sticky dir owner uid 50 and third user uid 51) cannot follow foreign symlink;
+  // owner of the symlink (uid 52) and links owned by dir.owner (uid 50) ARE allowed.
+  const [ownerFollow] = await ownerA.calls([
+    { open: { path: '/mnt/local/opfs/sub/sticky/foreign-sym', flags: 0 } },
+  ], ownerA.page, cloud);
+  assert.equal(ownerFollow.err.errno, 'EACCES');
+  const [thirdFollow] = await thirdParty.calls([
+    { open: { path: '/mnt/local/opfs/sub/sticky/foreign-sym', flags: 0 } },
+    { close: { fd: { ref: 0 } } },
+  ], thirdParty.page, cloud);
+  assert.ok('ok' in thirdFollow, JSON.stringify(thirdFollow));
+  const [ownerSym] = await ownerA.calls([
+    { symlink: { target: '../targetfile.txt', path: '/mnt/local/opfs/sub/sticky/owner-sym' } },
+  ], ownerA.page, cloud);
+  assert.equal(ownerSym.ok, null);
+  const ownerSymFd = await exportView.open(mA.grant, 'sub/sticky/owner-sym', 0);
+  await exportView.release(mA.grant, ownerSymFd);
+
+  // Cross-alias creator-grant revocation: creator opens writable via ownerA's attachment, then
+  // ownerB (distinct LocalMount instance on same FsId) runs chmod(0) -> existing fd sees EACCES!
+  const creatorFd = await exportView.open(mA.grant, 'sub/creator-revoke.txt', 0o302, 0o600);
+  await exportView.write(mA.grant, creatorFd, new TextEncoder().encode('ok'), {});
+  const [chmodB] = await ownerB.calls([
+    { chmod: { path: '/mnt/local/opfs/sub/creator-revoke.txt', mode: 0o000 } },
+  ], ownerB.page, cloud);
+  assert.equal(chmodB.ok, null);
+  await assert.rejects(
+    exportView.write(mA.grant, creatorFd, new TextEncoder().encode('revoked'), {}),
+    { errno: 'EACCES' },
+  );
+  await exportView.release(mA.grant, creatorFd);
+
+  // Direct `fs-store.js` binding tests: mid-I/O host swap & replaced directory `isSameEntry`.
+  const hostTree = createFakeFsTree('race-dir', { originPrivate: false });
+  hostTree.hostWrite('race.txt', 'INITIAL');
+  const dirWs = new Workspace({ id: 'dir-race', uid: 20, gid: 20, groups: [20] });
+  await dirWs.mount({ name: 'race', handle: hostTree.handle(), writable: true, execute: false, cloud: false });
+
+  const [openRace] = await dirWs.calls([
+    { open: { path: '/mnt/local/race/race.txt', flags: 2 } },
+    { mkdir: { path: '/mnt/local/race/sub', mode: 0o755 } },
+    { chmod: { path: '/mnt/local/race/sub', mode: 0o755 } },
+    { setxattr: { path: '/mnt/local/race/sub', name: 'user.tag', value: btoa('keep-no') } },
+  ], dirWs.page, cloud);
+  const raceFd = openRace.ok.fd;
+
+  // Intercept `getFileHandle('race.txt')` via a custom handle wrapper that swaps hostTree on close-time!
+  let raceSwapped = false;
+  const swapTree = createFakeFsTree('swap-wrap', { originPrivate: false });
+  swapTree.hostWrite('race.txt', 'ORIG_DATA', 1700000001000);
+  const rawSwapHandle = swapTree.handle();
+  const baseGetFileHandle = rawSwapHandle.getFileHandle.bind(rawSwapHandle);
+  let armSwapBeforeClose = false;
+  rawSwapHandle.getFileHandle = async (childName, opts) => {
+    const fh = await baseGetFileHandle(childName, opts);
+    if (childName !== 'race.txt' || !fh.createWritable) return fh;
+    const origCreateWritable = fh.createWritable.bind(fh);
+    return {
+      ...fh,
+      async isSameEntry(other) {
+        return fh.isSameEntry(other);
+      },
+      async createWritable(wOpts) {
+        const w = await origCreateWritable(wOpts);
+        if (armSwapBeforeClose) {
+          armSwapBeforeClose = false;
+          // Host externally replaces `race.txt` while writable swap stream is open!
+          swapTree.hostWrite('race.txt', 'EXTERNAL_REPLACEMENT_INTACT', 1700000009000);
+          raceSwapped = true;
+        }
+        return w;
+      },
+    };
+  };
+  const swapWs = new Workspace({ id: 'swap-ws', uid: 20, gid: 20, groups: [20] });
+  await swapWs.mount({ name: 'swap', handle: rawSwapHandle, writable: true, execute: false, cloud: false });
+  const [swapOpen] = await swapWs.calls([
+    { open: { path: '/mnt/local/swap/race.txt', flags: 2 } },
+  ], swapWs.page, cloud);
+  armSwapBeforeClose = true;
+  const [swapWrite] = await swapWs.calls([
+    { pwrite: { fd: swapOpen.ok.fd, index: 0, data: btoa('STALE_OVERWRITE') } },
+  ], swapWs.page, cloud);
+  assert.equal(raceSwapped, true);
+  assert.equal(swapWrite.err.errno, 'ESTALE');
+  const afterSwapBytes = new TextDecoder().decode(swapTree.rootNode.children.get('race.txt').bytes);
+  assert.equal(afterSwapBytes, 'EXTERNAL_REPLACEMENT_INTACT');
+  await swapWs.calls([{ close: { fd: swapOpen.ok.fd } }], swapWs.page, cloud);
+  swapWs.close();
+
+  // Directory external replacement (`isSameEntry === false`) invalidates old directory & resets defaults!
+  const beforeSubStat = await dirWs.stat('/mnt/local/race/sub');
+  const [subDirOpen] = await dirWs.calls([
+    { open: { path: '/mnt/local/race/sub', flags: O_DIRECTORY } },
+  ], dirWs.page, cloud);
+  hostTree.rootNode.children.set('sub', {
+    kind: 'directory',
+    name: 'sub',
+    children: new Map(),
+  });
+  const [staleDirMeta, freshDirStat, freshTag] = await dirWs.calls([
+    { fstat: { fd: subDirOpen.ok.fd } },
+    { stat: { path: '/mnt/local/race/sub' } },
+    { getxattr: { path: '/mnt/local/race/sub', name: 'user.tag' } },
+  ], dirWs.page, cloud);
+  assert.equal(staleDirMeta.err.errno, 'ESTALE');
+  assert.notEqual(freshDirStat.ok.ino, beforeSubStat.ino);
+  assert.equal(freshDirStat.ok.mode & 0o7777, 0o700);
+  assert.equal(freshTag.err.errno, 'ENODATA');
+
+  await dirWs.calls([
+    { close: { fd: raceFd } },
+    { close: { fd: subDirOpen.ok.fd } },
+  ], dirWs.page, cloud);
+  dirWs.close();
+  ownerA.close();
+  ownerB.close();
+  thirdParty.close();
+  peer.close();
+});

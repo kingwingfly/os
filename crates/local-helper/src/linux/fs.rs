@@ -876,6 +876,27 @@ impl HelperEngine {
         Ok((rel, fd, stx, key))
     }
 
+    fn is_wasm_binary(&self, rel: &str) -> bool {
+        const WASM_MAGIC: [u8; 8] = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let Ok(rfd) = sys::open_beneath(
+            self.root_fd.as_fd(),
+            rel,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0,
+        ) else {
+            return false;
+        };
+        let Ok(stx) = sys::statx_fd(rfd.as_fd()) else {
+            return false;
+        };
+        if stx.kind != HostKind::File {
+            return false;
+        }
+        let mut file = std::fs::File::from(rfd);
+        let mut magic = [0u8; 8];
+        std::io::Read::read_exact(&mut file, &mut magic).is_ok() && magic == WASM_MAGIC
+    }
+
     fn discover_child(
         &mut self,
         parent: &ResolvedHandle,
@@ -883,12 +904,24 @@ impl HelperEngine {
         owner: (u32, u32),
     ) -> Result<(u64, String, OwnedFd, HostStat, HostInodeKey, bool), Errno> {
         let (rel, fd, stx, key) = self.inspect_child(parent, name)?;
+        let default_file_mode = if stx.kind == HostKind::File
+            && stx.size >= 8
+            && !self.store.has_host_key(&key)
+            && self.is_wasm_binary(&rel)
+        {
+            0o700
+        } else {
+            0o600
+        };
         let open_inos = self.open_ino_set();
-        let (ino, dirty) =
-            self.store
-                .discover_or_reset(&rel, key.clone(), owner.0, owner.1, &|id| {
-                    open_inos.contains(&id)
-                })?;
+        let (ino, dirty) = self.store.discover_or_reset_with_mode(
+            &rel,
+            key.clone(),
+            owner.0,
+            owner.1,
+            default_file_mode,
+            &|id| open_inos.contains(&id),
+        )?;
         Ok((ino, rel, fd, stx, key, dirty))
     }
 
@@ -1688,6 +1721,9 @@ impl HelperEngine {
             }
         } else if from_res.ino != to_res.ino {
             inode::may_create(identity, &to_node, to_res.unlinked)?;
+        }
+        if moving_dir && from_res.ino != to_res.ino {
+            inode::require(identity, &src_node, WRITE)?;
         }
 
         let (live_from_rel, fresh_from_fd) = self.reopen_confined_dir(&from_res)?;

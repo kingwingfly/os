@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 /// Explicit durable metadata store format version (contract §2.12).
 /// Older versions reset metadata once (never deleting user files); newer versions fail with
 /// `Errno::EPROTONOSUPPORT` without modifying the store.
-pub const STORE_FORMAT_VERSION: u32 = 1;
+pub const STORE_FORMAT_VERSION: u32 = 2;
 
 /// Fixed root directory inode number.
 pub const ROOT_INO: u64 = 1;
@@ -166,6 +166,8 @@ pub trait HostTree {
         backing: &'a Backing,
         offset: u64,
         len: usize,
+        expected_fp: Option<Fingerprint>,
+        expected_ino: Option<u64>,
     ) -> BoxFuture<'a, Vec<u8>>;
     fn write_file<'a>(
         &'a self,
@@ -173,13 +175,35 @@ pub trait HostTree {
         offset: u64,
         data: &'a [u8],
         append: bool,
+        expected_fp: Option<Fingerprint>,
+        expected_ino: Option<u64>,
     ) -> BoxFuture<'a, (Written, Fingerprint)>;
-    fn set_file_len<'a>(&'a self, backing: &'a Backing, size: u64) -> BoxFuture<'a, Fingerprint>;
+    fn set_file_len<'a>(
+        &'a self,
+        backing: &'a Backing,
+        size: u64,
+        expected_fp: Option<Fingerprint>,
+        expected_ino: Option<u64>,
+    ) -> BoxFuture<'a, Fingerprint>;
     fn flush_file<'a>(
         &'a self,
         backing: &'a Backing,
         data_only: bool,
+        expected_fp: Option<Fingerprint>,
+        expected_ino: Option<u64>,
     ) -> BoxFuture<'a, Fingerprint>;
+    /// Retain the validated host directory/file entry handle for `ino` so subsequent lookups can
+    /// verify object identity (`isSameEntry`) rather than accepting a path-matched replacement.
+    fn retain_host_entry<'a>(&'a self, ino: u64, path: &'a str, is_dir: bool) -> BoxFuture<'a, ()>;
+    /// Verify that the live host entry at `path` still matches the retained handle for `ino`.
+    fn verify_host_entry<'a>(
+        &'a self,
+        ino: u64,
+        path: &'a str,
+        is_dir: bool,
+    ) -> BoxFuture<'a, bool>;
+    /// Drop any retained host handle associated with a stale or removed inode.
+    fn forget_host_entry<'a>(&'a self, ino: u64) -> BoxFuture<'a, ()>;
     fn remove_file<'a>(&'a self, path: &'a str) -> BoxFuture<'a, ()>;
     fn remove_dir<'a>(&'a self, path: &'a str) -> BoxFuture<'a, ()>;
     /// Move a file or directory from `from` to `to`, returning any updated `(rel_path, fingerprint)`
