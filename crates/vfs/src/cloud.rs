@@ -259,6 +259,7 @@ impl<T: Transport> Filesystem for CloudFs<T> {
                     dir: dir.clone(),
                     name: name.into(),
                     mode,
+                    umask: cred.umask,
                 },
             )
             .await
@@ -279,6 +280,7 @@ impl<T: Transport> Filesystem for CloudFs<T> {
                     dir: dir.clone(),
                     name: name.into(),
                     mode,
+                    umask: cred.umask,
                     rdev: rdev.into(),
                 },
             )
@@ -489,6 +491,7 @@ impl<T: Transport> Filesystem for CloudFs<T> {
         Box::pin(async move {
             let ticket = self.transport.ticket();
             let token = cred.token.clone().ok_or(Errno::EACCES)?;
+            let umask = cred.umask;
             self.drain().await?;
             let mut guard = Cancel {
                 fs: self,
@@ -507,6 +510,7 @@ impl<T: Transport> Filesystem for CloudFs<T> {
                         dir: dir.clone(),
                         name: name.into(),
                         mode,
+                        umask,
                         options: *options,
                     },
                 )

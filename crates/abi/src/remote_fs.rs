@@ -64,17 +64,21 @@ pub enum Call {
         dir: Handle,
         name: String,
         mode: u16,
+        /// The current process mask; keep separate from mode for default ACL inheritance.
+        umask: u16,
         options: OpenOptions,
     },
     Mkdir {
         dir: Handle,
         name: String,
         mode: u16,
+        umask: u16,
     },
     Mknod {
         dir: Handle,
         name: String,
         mode: u16,
+        umask: u16,
         rdev: String,
     },
     Symlink {

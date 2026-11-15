@@ -13,8 +13,11 @@ async function rpc(request,credential,session,call,errno,version=2) {
   expect(response.ok(),JSON.stringify(body)).toBe(true);return body;
 }
 async function connection(request,{token,pid}) {
-  const c={...await rpc(request,token,null,'connect'),request,token,pid};
-  c.call=(op,args,errno)=>rpc(request,token,c.session,args===undefined?op:{[op]:args},errno);
+  const c={...await rpc(request,token,null,'connect'),request,token,pid,umask:0o022};
+  c.call=(op,args,errno)=>{
+    if(['create','mkdir','mknod'].includes(op))args={umask:c.umask,...args};
+    return rpc(request,token,c.session,args===undefined?op:{[op]:args},errno);
+  };
   c.data=async(open,operation,bytes,errno)=>{
     const response=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Filesystem':JSON.stringify({version:2,credential:c.token,pid:c.pid,session:c.session,open,operation})},data:bytes??Buffer.alloc(0)});
     if(errno){expect((await response.json()).errno).toBe(errno);return;}
@@ -373,8 +376,8 @@ test('reserved home destinations allow only the account owner or root',async({re
     const source='source-'+randomUUID();const [file,open]=await attacker.create(guest,source);
     expect((await sys(stranger,[{mkdir:{path:identity.home,mode:0o700}}]))[0].err.errno).toBe('EACCES');
     for(const operation of [
-      {mkdir:{dir:guest,name,mode:0o700}},
-      {create:{ticket:randomUUID(),dir:guest,name,mode:0o600,options:options('read-write',{create_new:true})}},
+      {mkdir:{dir:guest,name,mode:0o700,umask:0o022}},
+      {create:{ticket:randomUUID(),dir:guest,name,mode:0o600,umask:0o022,options:options('read-write',{create_new:true})}},
       {symlink:{dir:guest,name,target:source}},
       {link:{target:file.handle,dir:guest,name}},
       {rename:{from_dir:guest,from:source,to_dir:guest,to:name,flags:''}},
@@ -557,7 +560,7 @@ test('driver-backed device creation initializes usable state and rejects unsuppo
       await c.call('lookup',{dir,name:'unsupported'},'ENOENT');
     }
     await api(request,'logout');const guest=await admit(request);
-    await rpc(request,guest.token,c.session,{mknod:{dir,name:'guest-device',mode:0o600,rdev:'present'}},'EPERM');
+    await rpc(request,guest.token,c.session,{mknod:{dir,name:'guest-device',mode:0o600,umask:0o022,rdev:'present'}},'EPERM');
     await c.call('lookup',{dir,name:'guest-device'},'ENOENT');
   } finally {
     // Also repairs the inode-only result when running this probe against the old code.
@@ -587,5 +590,78 @@ test('device hardlinks are denied for both root and the device owner without cre
   } finally {
     if(user)await user.call('disconnect');for(const path of paths)await sys(request,[{unlink:{path}}]);
     await account.dispose();await sys(request,[{userdel:{name,remove:true}}]);await c.call('disconnect');await rmrf(request,base);
+  }
+});
+test('truncate on creation preserves privilege bits while reopening an existing file strips them',async({request})=>{
+  await call(request,'getcreds');const c=await connection(request,await admit(request));
+  const guest=(await c.call('lookup',{dir:c.root,name:'guest'})).handle;const name='create-truncate-'+randomUUID();
+  const dir=(await c.call('mkdir',{dir:guest,name,mode:0o700})).handle;
+  try {
+    for(const mode of [0o4755,0o6755]) {
+      const args={dir,name:'mode-'+mode,mode,options:options('read-write',{create:true,truncate:true})};
+      const [entry,open]=await c.call('create',{ticket:randomUUID(),...args});
+      expect(entry.metadata.mode).toBe(mode);
+      expect(await c.call('metadata',{handle:entry.handle})).toEqual(entry.metadata);
+      expect((await c.read(open)).length).toBe(0);
+      await c.write(open,'existing data');await c.call('setattr',{handle:entry.handle,attr:attrs({mode})});
+      const [reopened,next]=await c.call('create',{ticket:randomUUID(),...args});
+      expect(reopened.handle.node).toEqual(entry.handle.node);
+      expect(reopened.metadata).toMatchObject({mode:0o755,size:0});
+      expect(await c.call('metadata',{handle:entry.handle})).toEqual(reopened.metadata);
+      expect((await c.read(open)).length).toBe(0);await c.call('release',{open:next});
+    }
+  } finally {
+    await c.call('disconnect');await rmrf(request,'/guest/'+name);
+  }
+});
+test('creation uses the current per-call umask and requires it even when it is zero',async({request})=>{
+  const {c,dir}=await setup(request);const devices=(await c.call('walk',{dir:c.root,names:['dev','present']})).entries.at(-1).handle;
+  let privateFile,publicFile;
+  try {
+    for(const mask of [0o022,0o077,0o002,0]) {
+      c.umask=mask;
+      const [file]=await c.create(dir,'file-'+mask,0o666);
+      const directory=await c.call('mkdir',{dir,name:'dir-'+mask,mode:0o777});
+      const name='mask-'+randomUUID();const device=await c.call('mknod',{dir:devices,name,mode:0o666,rdev:'present'});
+      expect(file.metadata.mode).toBe(0o666&~mask);expect(directory.metadata.mode).toBe(0o777&~mask);expect(device.metadata.mode).toBe(0o666&~mask);
+      expect((await c.call('metadata',{handle:file.handle})).mode).toBe(file.metadata.mode);
+      await c.call('unlink',{dir:devices,name});
+      if(mask===0o077)privateFile=file.handle;if(mask===0)publicFile=file.handle;
+    }
+    for(const [operation,args] of [
+      ['create',{dir,name:'omitted',ticket:randomUUID(),mode:0o666,options:options('read-write',{create_new:true})}],
+      ['mkdir',{dir,name:'omitted',mode:0o777}],
+      ['mknod',{dir:devices,name:'omitted-'+randomUUID(),mode:0o666,rdev:'present'}],
+    ]) {
+      await rpc(request,c.token,c.session,{[operation]:args},'EINVAL');
+      await c.call('lookup',{dir:args.dir,name:args.name},'ENOENT');
+    }
+    await api(request,'logout');const guest=await admit(request);
+    await rpc(request,guest.token,c.session,{open:{ticket:randomUUID(),handle:privateFile,options:options('read')}},'EACCES');
+    const opened=await rpc(request,guest.token,c.session,{open:{ticket:randomUUID(),handle:publicFile,options:options('read')}});
+    await c.call('release',{open:opened});
+  } finally {
+    await c.call('disconnect');
+  }
+});
+test('default ACL inheritance takes precedence over the current umask without changing existing files',async({request})=>{
+  const {c,dir}=await setup(request);const acl={user:7,group:5,other:0,mask:5,users:{1001:7},groups:{}};
+  const decode=value=>JSON.parse(Buffer.from(value).toString());
+  try {
+    await c.call('setattr',{handle:dir,attr:attrs({mode:0o2777,gid:1234})});
+    await c.call('setxattr',{handle:dir,name:'system.posix_acl_default',value:[...Buffer.from(JSON.stringify(acl))],flags:'CREATE'});
+    c.umask=0o077;
+    const [file,open]=await c.create(dir,'file',0o666);const child=await c.call('mkdir',{dir,name:'child',mode:0o777});
+    expect(file.metadata).toMatchObject({mode:0o640,gid:1234,acl:true});expect(child.metadata).toMatchObject({mode:0o2750,gid:1234,acl:true});
+    expect(decode(await c.call('getxattr',{handle:file.handle,name:'system.posix_acl_access'}))).toMatchObject({mask:4,users:{1001:7}});
+    expect(decode(await c.call('getxattr',{handle:child.handle,name:'system.posix_acl_default'}))).toEqual(acl);
+    c.umask=0o777;
+    const [nested]=await c.create(child.handle,'nested',0o666);expect(nested.metadata).toMatchObject({mode:0o640,gid:1234,acl:true});
+    await c.write(open,'kept');const before=await c.call('metadata',{handle:file.handle});
+    const [existing]=await c.call('create',{ticket:randomUUID(),dir,name:'file',mode:0o600,options:options('read-write',{create:true})});
+    expect(existing.metadata).toEqual(before);
+    expect((await c.call('symlink',{dir,name:'link',target:'file'})).metadata.mode).toBe(0o777);
+  } finally {
+    await c.call('disconnect');
   }
 });

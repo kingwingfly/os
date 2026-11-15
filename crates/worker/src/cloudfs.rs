@@ -243,15 +243,11 @@ impl Caller {
         if !created {
             inode::may_open(&self.credential.identity(), &node, access.mask())?;
         }
-        if access != Access::Path && options.is_truncate() {
+        if !created && access != Access::Path && options.is_truncate() {
             if node.directory {
                 return Err(Errno::EISDIR);
             }
-            inode::require(
-                &self.credential.identity(),
-                &node,
-                if created { 0 } else { WRITE },
-            )?;
+            inode::require(&self.credential.identity(), &node, WRITE)?;
             if node.is_file() {
                 db.cloud_truncate(&mut node, 0, &self.credential)?;
             }
@@ -550,6 +546,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             dir,
             name,
             mode,
+            umask,
             options,
             ..
         } => {
@@ -573,7 +570,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
                     );
                 }
                 Err(Errno::ENOENT) => make(db, &c, dir, name, |p| {
-                    permissions::created(&who, p, *mode, false, c.credential.umask)
+                    permissions::created(&who, p, *mode, false, *umask)
                 })?,
                 Err(e) => return Err(e),
             };
@@ -583,9 +580,14 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             let open = c.open(db, node.clone(), options, true)?;
             json!((c.entry(db, &node), open))
         }
-        Mkdir { dir, name, mode } => {
+        Mkdir {
+            dir,
+            name,
+            mode,
+            umask,
+        } => {
             let node = make(db, &c, dir, name, |p| {
-                permissions::created(&who, p, *mode, true, c.credential.umask)
+                permissions::created(&who, p, *mode, true, *umask)
             })?;
             json!(c.entry(db, &node))
         }
@@ -593,6 +595,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             dir,
             name,
             mode,
+            umask,
             rdev,
         } => {
             if who.id != 0 {
@@ -611,7 +614,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
                 db,
                 &kernel::Process {
                     cred: who.clone(),
-                    umask: c.credential.umask,
+                    umask: *umask,
                 },
                 &path,
                 *mode,

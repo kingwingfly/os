@@ -110,6 +110,41 @@ fn ready<T>(future: BoxFuture<'_, T>) -> Result<T> {
     now_or_never(future).expect("ready")
 }
 #[test]
+fn creation_sends_the_current_umask_separately_from_the_requested_mode() {
+    let host = Host::default();
+    let fs = now_or_never(CloudFs::connect(host.clone(), "credential".into()))
+        .unwrap()
+        .unwrap();
+    let mut cred = Cred::root();
+    cred.token = Some("credential".into());
+    let options = *OpenOptions::new().read(true).write(true).create(true);
+    for mask in [0o077, 0o002, 0] {
+        cred.umask = mask;
+        host.pending.set(true);
+        assert!(now_or_never(fs.mkdir(&cred, &root(), "dir", 0o777)).is_none());
+        assert!(now_or_never(fs.mknod(&cred, &root(), "device", 0o666, "present")).is_none());
+        assert!(now_or_never(fs.create(&cred, &root(), "file", 0o666, &options)).is_none());
+        {
+            let calls = host.calls.borrow();
+            for call in &calls[calls.len() - 3..] {
+                let value = serde_json::to_value(call).unwrap();
+                let (kind, args) = value.as_object().unwrap().iter().next().unwrap();
+                assert_eq!(args["umask"], json!(mask));
+                // Applying umask on the client would prevent default ACL inheritance.
+                assert_eq!(
+                    args["mode"],
+                    json!(if kind == "mkdir" { 0o777 } else { 0o666 })
+                );
+                let mut omitted = value.clone();
+                omitted[kind].as_object_mut().unwrap().remove("umask");
+                assert!(serde_json::from_value::<Call>(omitted).is_err());
+            }
+        }
+        host.pending.set(false);
+        assert_eq!(now_or_never(fs.drain()), Some(Ok(())));
+    }
+}
+#[test]
 fn abandoned_and_cancelled_remote_opens_keep_cleanup_until_delivered() {
     let host = Host::default();
     let fs = now_or_never(CloudFs::connect(host.clone(), "credential".into()))
