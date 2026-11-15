@@ -750,3 +750,178 @@ fn dropping_a_pending_remote_lock_queues_cancellation() {
     assert_eq!(now_or_never(fs.drain()), Some(Ok(())));
     assert!(matches!(host.calls.borrow().last(),Some(Call::CancelLock{ticket,..}) if ticket=="2"));
 }
+fn shared(owner: u64, start: u64, end: Option<u64>) -> Held {
+    Held {
+        kind: LockKind::Shared,
+        ..held(owner, start, end)
+    }
+}
+#[test]
+fn cancelling_a_granted_conversion_restores_the_locks_it_replaced() {
+    // An upgrade granted while its client waited (or before AckLock answered) and then
+    // cancelled must leave the owner's earlier lock, not a hole in it.
+    let mut locks = Locks::default();
+    locks.acquire(shared(1, 0, Some(100)), None, &[]).unwrap();
+    locks.acquire(shared(2, 0, Some(100)), None, &[]).unwrap();
+    assert_eq!(
+        locks.acquire(held(1, 20, Some(40)), Some("upgrade"), &[]),
+        Ok(false)
+    );
+    locks.release(2);
+    let mut restored: Locks = serde_json::from_value(json!(locks)).unwrap();
+    restored.cancel(1, "upgrade");
+    let conflict = restored.conflict(&held(3, 0, Some(100))).unwrap();
+    assert_eq!(
+        (conflict.owner, conflict.kind, conflict.range),
+        (1, LockKind::Shared, LockRange::new(0, Some(100)).unwrap())
+    );
+    assert!(restored.conflict(&shared(3, 20, Some(40))).is_none());
+    assert!(restored.displaced.is_empty());
+
+    // The same holds for reapplying a flock with a blocking request.
+    let mut flock = held(1, 0, None);
+    flock.family = LockFamily::Flock;
+    let mut locks = Locks::default();
+    locks.acquire(flock.clone(), None, &[]).unwrap();
+    assert_eq!(locks.acquire(flock.clone(), Some("again"), &[]), Ok(true));
+    locks.cancel(1, "again");
+    let other = Held { owner: 2, ..flock };
+    assert_eq!(locks.acquire(other, None, &[]), Err(Errno::EAGAIN));
+}
+#[test]
+fn cancelling_a_granted_conversion_never_resurrects_what_was_since_unlocked() {
+    let mut locks = Locks::default();
+    locks.acquire(shared(1, 0, Some(100)), None, &[]).unwrap();
+    assert_eq!(
+        locks.acquire(held(1, 20, Some(40)), Some("upgrade"), &[]),
+        Ok(true)
+    );
+    locks.acknowledge(1, "upgrade");
+    // A later unlock of part of the range replaces the upgrade's effect there.
+    locks.carve(1, LockFamily::Posix, LockRange::new(30, Some(100)).unwrap());
+    locks.cancel(1, "upgrade");
+    assert!(locks.conflict(&held(3, 30, None)).is_none());
+    let conflict = locks.conflict(&held(3, 0, Some(30))).unwrap();
+    assert_eq!(
+        (conflict.kind, conflict.range),
+        (LockKind::Shared, LockRange::new(0, Some(30)).unwrap())
+    );
+    locks.release(1);
+    assert!(locks.held.is_empty() && locks.displaced.is_empty());
+}
+#[test]
+fn cancelling_a_granted_downgrade_keeps_compatible_locks_others_took_since() {
+    let mut locks = Locks::default();
+    locks.acquire(held(1, 0, Some(100)), None, &[]).unwrap();
+    assert_eq!(
+        locks.acquire(shared(1, 0, Some(100)), Some("downgrade"), &[]),
+        Ok(true)
+    );
+    locks.acquire(shared(2, 0, Some(100)), None, &[]).unwrap();
+    locks.cancel(1, "downgrade");
+    // Restoring the exclusive lock would conflict with owner 2: owner 1 keeps its shared one.
+    assert!(locks.conflict(&shared(3, 0, Some(100))).is_none());
+    assert_eq!(locks.held.iter().filter(|l| l.owner == 1).count(), 1);
+    assert_eq!(locks.held.iter().filter(|l| l.owner == 2).count(), 1);
+}
+#[test]
+fn cancellation_tombstones_stay_bounded() {
+    let mut locks = Locks::default();
+    for n in 0..10_000 {
+        locks.cancel(1, &n.to_string());
+    }
+    assert!(locks.cancelled.len() <= os_vfs::locks::CANCELLED_MAX);
+    // The most recent cancellations are still refused.
+    assert_eq!(
+        locks.acquire(held(1, 0, None), Some("9999"), &[]),
+        Err(Errno::ECANCELED)
+    );
+}
+#[test]
+fn opens_the_authority_refused_queue_no_cancellation_but_uncertain_ones_do() {
+    let host = Host::default();
+    let fs = now_or_never(CloudFs::connect(host.clone(), "opener".into()))
+        .unwrap()
+        .unwrap();
+    let mut cred = Cred::root();
+    cred.token = Some("opener".into());
+    let options = *OpenOptions::new().read(true).write(true).create(true);
+    host.failure.set(Some(Errno::ENOENT));
+    assert_eq!(ready(fs.open(&cred, &root(), &options)), Err(Errno::ENOENT));
+    host.failure.set(Some(Errno::EEXIST));
+    assert!(matches!(
+        ready(fs.create(&cred, &root(), "file", 0o644, &options)),
+        Err(Errno::EEXIST)
+    ));
+    assert_eq!(fs.pending_cancellations(), 0);
+    // A lost reply may follow an open the authority made: it is still cancelled.
+    host.failure.set(Some(Errno::EIO));
+    assert_eq!(ready(fs.open(&cred, &root(), &options)), Err(Errno::EIO));
+    assert_eq!(fs.pending_cancellations(), 1);
+    host.failure.set(None);
+    let opened = ready(fs.open(&cred, &root(), &options)).unwrap();
+    assert_eq!(fs.pending_cancellations(), 0);
+    host.failure.set(Some(Errno::EDEADLK));
+    assert_eq!(
+        ready(fs.lock(
+            &opened,
+            LockFamily::Posix,
+            LockKind::Exclusive,
+            LockRange::WHOLE
+        )),
+        Err(Errno::EDEADLK)
+    );
+    assert_eq!(fs.pending_cancellations(), 0);
+}
+#[test]
+fn writes_straddling_the_largest_offset_are_short() {
+    let host = Host::default();
+    let fs = now_or_never(CloudFs::connect(host.clone(), "opener".into()))
+        .unwrap()
+        .unwrap();
+    let mut cred = Cred::root();
+    cred.token = Some("opener".into());
+    let opened = ready(fs.open(&cred, &root(), OpenOptions::new().read(true).write(true))).unwrap();
+    let written = ready(fs.write_at(&opened, b"hello", WriteAt::Offset(FILE_MAX - 3))).unwrap();
+    assert_eq!(written.len, 3);
+    ready(fs.write_at(&opened, b"hello", WriteAt::Offset(FILE_MAX))).unwrap();
+    ready(fs.write_at(&opened, b"hello", WriteAt::End)).unwrap();
+    let lengths: Vec<_> = host
+        .data
+        .borrow()
+        .iter()
+        .map(|r| match r.operation {
+            wire::DataOperation::Write { length, .. } => length,
+            _ => unreachable!(),
+        })
+        .collect();
+    // At the largest offset the full request goes, for the authority's EFBIG.
+    assert_eq!(lengths, [3, 5, 5]);
+}
+#[test]
+fn session_calls_clean_up_with_their_own_credential_when_opener_and_actor_are_revoked() {
+    let host = Host::default();
+    let fs = now_or_never(CloudFs::connect(host.clone(), "opener".into()))
+        .unwrap()
+        .unwrap();
+    let mut cred = Cred::root();
+    cred.token = Some("opener".into());
+    let options = *OpenOptions::new().read(true).write(true);
+    host.pending.set(true);
+    assert!(now_or_never(fs.open(&cred, &root(), &options)).is_none());
+    host.pending.set(false);
+    assert_eq!(fs.pending_cancellations(), 1);
+    host.denied
+        .borrow_mut()
+        .extend(["opener".into(), "stale actor".into()]);
+    *host.actor.borrow_mut() = ("stale actor".into(), None);
+    cred.token = Some("host".into());
+    assert_eq!(now_or_never(fs.disconnect(&cred)), Some(Ok(())));
+    assert_eq!(fs.pending_cancellations(), 0);
+    assert!(
+        host.requests
+            .borrow()
+            .iter()
+            .any(|r| { matches!(r.call, Call::CancelOpen { .. }) && r.credential == "host" })
+    );
+}

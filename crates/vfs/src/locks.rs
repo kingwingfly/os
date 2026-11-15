@@ -17,12 +17,42 @@ pub struct Wait {
     pub ticket: String,
     pub granted: bool,
 }
+/// A piece of its owner's own lock that a ticketed grant replaced (an upgrade, downgrade or
+/// reapplication). A late cancellation of that ticket puts it back instead of unlocking it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Displaced {
+    pub ticket: String,
+    pub lock: Held,
+}
+/// How many cancelled tickets an inode remembers; the oldest are forgotten first.
+pub const CANCELLED_MAX: usize = 1024;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Locks {
     #[serde(default)]
     pub cancelled: Vec<(u64, String)>,
     pub held: Vec<Held>,
     pub waits: Vec<Wait>,
+    #[serde(default)]
+    pub displaced: Vec<Displaced>,
+}
+/// What `piece` keeps of an owner and family's locks once `range` is taken out of them.
+fn cut(piece: &Held, owner: u64, family: LockFamily, range: LockRange) -> Vec<LockRange> {
+    if piece.owner == owner && piece.family == family {
+        piece.range.minus(range).into_iter().flatten().collect()
+    } else {
+        vec![piece.range]
+    }
+}
+/// The bytes both ranges cover, if any.
+fn intersection(a: LockRange, b: LockRange) -> Option<LockRange> {
+    if !a.overlaps(b) {
+        return None;
+    }
+    let end = match (a.end(), b.end()) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, None) | (None, x) => x,
+    };
+    LockRange::new(a.start().max(b.start()), end)
 }
 impl Held {
     fn same_lock(&self, other: &Self) -> bool {
@@ -85,21 +115,48 @@ impl Locks {
         self.held = std::mem::take(&mut self.held)
             .into_iter()
             .flat_map(|l| {
-                if l.owner == owner && l.family == family {
-                    l.range
-                        .minus(range)
-                        .into_iter()
-                        .flatten()
-                        .map(|range| Held { range, ..l.clone() })
-                        .collect()
-                } else {
-                    vec![l]
-                }
+                cut(&l, owner, family, range)
+                    .into_iter()
+                    .map(move |range| Held { range, ..l.clone() })
+            })
+            .collect();
+        // Whatever replaces these bytes now also replaces what a late cancellation of an
+        // earlier request would have restored there.
+        self.displaced = std::mem::take(&mut self.displaced)
+            .into_iter()
+            .flat_map(|d| {
+                cut(&d.lock, owner, family, range)
+                    .into_iter()
+                    .map(move |range| Displaced {
+                        ticket: d.ticket.clone(),
+                        lock: Held {
+                            range,
+                            ..d.lock.clone()
+                        },
+                    })
             })
             .collect();
     }
     fn grant(&mut self, mut lock: Held) {
+        let replaced: Vec<Held> = match lock.ticket {
+            Some(_) => self
+                .held
+                .iter()
+                .filter(|l| l.owner == lock.owner && l.family == lock.family)
+                .filter_map(|l| {
+                    intersection(l.range, lock.range).map(|range| Held { range, ..l.clone() })
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         self.carve(lock.owner, lock.family, lock.range);
+        if let Some(ticket) = &lock.ticket {
+            self.displaced
+                .extend(replaced.into_iter().map(|lock| Displaced {
+                    ticket: ticket.clone(),
+                    lock,
+                }));
+        }
         // Merge only pieces with the same cancellation ownership. A late cancellation
         // must remove that request's surviving pieces without unlocking its neighbors.
         loop {
@@ -240,15 +297,42 @@ impl Locks {
             .iter()
             .any(|(o, t)| *o == owner && t == ticket)
         {
+            if self.cancelled.len() >= CANCELLED_MAX {
+                self.cancelled.remove(0);
+            }
             self.cancelled.push((owner, ticket.into()));
         }
         self.waits
             .retain(|w| w.lock.owner != owner || w.ticket != ticket);
+        let granted = self
+            .held
+            .iter()
+            .find(|l| l.owner == owner && l.ticket.as_deref() == Some(ticket))
+            .cloned();
         self.held
             .retain(|l| l.owner != owner || l.ticket.as_deref() != Some(ticket));
+        // Undo what the cancelled grant replaced of the owner's own locks, where nothing has
+        // replaced it since (`carve` trims these records). Another owner may meanwhile hold a
+        // lock the granted kind allowed (after a downgrade): keep the granted kind there.
+        let (restore, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.displaced)
+            .into_iter()
+            .partition(|d| d.lock.owner == owner && d.ticket == ticket);
+        self.displaced = keep;
+        for Displaced { lock, .. } in restore {
+            if !self.held.iter().any(|l| l.conflicts(&lock)) {
+                self.held.push(lock);
+            } else if let Some(granted) = &granted {
+                self.held.push(Held {
+                    range: lock.range,
+                    ticket: None,
+                    ..granted.clone()
+                });
+            }
+        }
         self.wake();
     }
     pub fn release(&mut self, owner: u64) {
+        self.displaced.retain(|d| d.lock.owner != owner);
         self.cancelled.retain(|(o, _)| *o != owner);
         self.waits.retain(|w| w.lock.owner != owner);
         self.held.retain(|l| l.owner != owner);

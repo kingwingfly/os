@@ -72,6 +72,12 @@ impl<T: Transport> CloudFs<T> {
         self.pending.borrow().len()
     }
     pub async fn drain(&self) -> Result<()> {
+        self.drain_as(None).await
+    }
+    /// Drain, also trying `fallback` (the credential the current call presents) for cleanup
+    /// that neither its opener nor the acting task may do any more, as when a host renews
+    /// the session from a timer with no task to act for.
+    async fn drain_as(&self, fallback: Option<&str>) -> Result<()> {
         loop {
             let pending = self.pending.borrow_mut().pop_front();
             let Some(pending) = pending else {
@@ -82,7 +88,7 @@ impl<T: Transport> CloudFs<T> {
                 pending: Some(pending),
             };
             let p = guard.pending.as_ref().expect("pending cancellation");
-            match self.cleanup(p).await {
+            match self.cleanup(p, fallback).await {
                 Ok(_) | Err(Errno::ENOTCONN | Errno::EBADF) => {
                     if let Call::Release { open } = &p.call {
                         self.opens.borrow_mut().remove(&open.id);
@@ -93,20 +99,23 @@ impl<T: Transport> CloudFs<T> {
             }
         }
     }
-    async fn cleanup(&self, pending: &Pending) -> Result<Value> {
+    async fn cleanup(&self, pending: &Pending, fallback: Option<&str>) -> Result<Value> {
         // The opener may have execed since this work was queued. Snapshot a replacement
         // before awaiting, but keep the opener usable when no acting task remains.
         let actor = self.transport.caller().ok().map(|(token, _)| token);
-        match self.send(&pending.credential, pending.call.clone()).await {
-            Err(Errno::EACCES) if actor.as_ref().is_some_and(|t| t != &pending.credential) => {
-                self.send(
-                    actor.as_deref().expect("acting credential"),
-                    pending.call.clone(),
-                )
-                .await
+        let mut tried = vec![pending.credential.as_str()];
+        let mut result = self.send(&pending.credential, pending.call.clone()).await;
+        for credential in [actor.as_deref(), fallback].into_iter().flatten() {
+            if !matches!(result, Err(Errno::EACCES)) {
+                break;
             }
-            result => result,
+            if tried.contains(&credential) {
+                continue;
+            }
+            tried.push(credential);
+            result = self.send(credential, pending.call.clone()).await;
         }
+        result
     }
     async fn send(&self, credential: &str, call: Call) -> Result<Value> {
         self.transport
@@ -119,7 +128,7 @@ impl<T: Transport> CloudFs<T> {
             .await
     }
     async fn call<R: DeserializeOwned>(&self, cred: &Cred, call: Call) -> Result<R> {
-        self.drain().await?;
+        self.drain_as(cred.token.as_deref()).await?;
         let value = self
             .send(cred.token.as_deref().ok_or(Errno::EACCES)?, call)
             .await?;
@@ -165,6 +174,28 @@ impl<T: Transport> Drop for Cancel<'_, T> {
             self.fs.pending.borrow_mut().push_front(pending);
         }
     }
+}
+/// Answers only the authority gives, after rolling back the request's transaction: it
+/// recorded nothing (no open, no wait), so there is nothing to cancel. Transport failures
+/// (EIO, ENOTCONN, timeouts) stay uncertain and keep their cancellation.
+fn rejected(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::ENOENT
+            | Errno::EEXIST
+            | Errno::EISDIR
+            | Errno::ENOTDIR
+            | Errno::EACCES
+            | Errno::EPERM
+            | Errno::EROFS
+            | Errno::EINVAL
+            | Errno::ENAMETOOLONG
+            | Errno::ELOOP
+            | Errno::EBADF
+            | Errno::EDEADLK
+            | Errno::ENOSPC
+            | Errno::ECANCELED
+    )
 }
 
 impl<T: Transport> Filesystem for CloudFs<T> {
@@ -472,7 +503,7 @@ impl<T: Transport> Filesystem for CloudFs<T> {
             let ticket = self.transport.ticket();
             let token = cred.token.clone().ok_or(Errno::EACCES)?;
             // Drain before arming this guard: its cancellation must never precede its request.
-            self.drain().await?;
+            self.drain_as(Some(&token)).await?;
             let mut guard = Cancel {
                 fs: self,
                 pending: Some(Pending {
@@ -482,8 +513,8 @@ impl<T: Transport> Filesystem for CloudFs<T> {
                     },
                 }),
             };
-            let open: OpenRef = serde_json::from_value(
-                self.send(
+            let reply = self
+                .send(
                     &token,
                     Call::Open {
                         ticket,
@@ -491,9 +522,11 @@ impl<T: Transport> Filesystem for CloudFs<T> {
                         options: *options,
                     },
                 )
-                .await?,
-            )
-            .map_err(|_| Errno::EIO)?;
+                .await;
+            if matches!(reply, Err(e) if rejected(e)) {
+                guard.pending = None;
+            }
+            let open: OpenRef = serde_json::from_value(reply?).map_err(|_| Errno::EIO)?;
             self.opens
                 .borrow_mut()
                 .insert(open.id, (open.clone(), token));
@@ -513,7 +546,7 @@ impl<T: Transport> Filesystem for CloudFs<T> {
             let ticket = self.transport.ticket();
             let token = cred.token.clone().ok_or(Errno::EACCES)?;
             let umask = cred.umask;
-            self.drain().await?;
+            self.drain_as(Some(&token)).await?;
             let mut guard = Cancel {
                 fs: self,
                 pending: Some(Pending {
@@ -523,8 +556,8 @@ impl<T: Transport> Filesystem for CloudFs<T> {
                     },
                 }),
             };
-            let (entry, open): (Entry, OpenRef) = serde_json::from_value(
-                self.send(
+            let reply = self
+                .send(
                     &token,
                     Call::Create {
                         ticket,
@@ -535,9 +568,12 @@ impl<T: Transport> Filesystem for CloudFs<T> {
                         options: *options,
                     },
                 )
-                .await?,
-            )
-            .map_err(|_| Errno::EIO)?;
+                .await;
+            if matches!(reply, Err(e) if rejected(e)) {
+                guard.pending = None;
+            }
+            let (entry, open): (Entry, OpenRef) =
+                serde_json::from_value(reply?).map_err(|_| Errno::EIO)?;
             self.opens
                 .borrow_mut()
                 .insert(open.id, (open.clone(), token));
@@ -573,7 +609,13 @@ impl<T: Transport> Filesystem for CloudFs<T> {
         at: WriteAt,
     ) -> BoxFuture<'a, Written> {
         Box::pin(async move {
-            let length = (buf.len() as u64).min(wire::DATA_MAX);
+            // As Linux: before the largest offset, what fits is a short write; at or past it,
+            // nothing (EFBIG, which the authority answers for a non-empty write).
+            let room = match at {
+                WriteAt::Offset(offset) if offset < FILE_MAX => FILE_MAX - offset,
+                _ => u64::MAX,
+            };
+            let length = (buf.len() as u64).min(wire::DATA_MAX).min(room);
             let request = self.data(open, DataOperation::Write { at, length })?;
             self.drain().await?;
             self.transport.write(request, &buf[..length as usize]).await
@@ -658,9 +700,10 @@ impl<T: Transport> Filesystem for CloudFs<T> {
                     },
                 }),
             };
+            let mut first = true;
             loop {
-                let granted: bool = serde_json::from_value(
-                    self.send(
+                let reply = self
+                    .send(
                         &token,
                         Call::Lock {
                             open: open.clone(),
@@ -670,9 +713,14 @@ impl<T: Transport> Filesystem for CloudFs<T> {
                             ticket: ticket.clone(),
                         },
                     )
-                    .await?,
-                )
-                .map_err(|_| Errno::EIO)?;
+                    .await;
+                // Only the first request can be refused before it queued anything; a later
+                // poll's refusal leaves the wait the first one queued, to be cancelled.
+                if first && matches!(reply, Err(e) if rejected(e)) {
+                    guard.pending = None;
+                }
+                first = false;
+                let granted: bool = serde_json::from_value(reply?).map_err(|_| Errno::EIO)?;
                 if granted {
                     self.send(
                         &token,
@@ -737,7 +785,7 @@ impl<T: Transport> Filesystem for CloudFs<T> {
             };
             // Retain this release before older cleanup can fail or be cancelled.
             self.drain().await?;
-            self.cleanup(guard.pending.as_ref().expect("pending release"))
+            self.cleanup(guard.pending.as_ref().expect("pending release"), None)
                 .await?;
             self.opens.borrow_mut().remove(&open.id);
             guard.pending = None;

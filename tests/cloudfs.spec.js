@@ -753,3 +753,25 @@ test('default ACL inheritance takes precedence over the current umask without ch
     await c.call('disconnect');
   }
 });
+test('system-image and procfs names are read-only even for root, as on the path API',async({request})=>{
+  const {c,dir}=await setup(request);
+  try {
+    for(const name of ['usr','sys'])await c.call('mkdir',{dir:c.root,name,mode:0o755},'EROFS');
+    await c.call('create',{ticket:randomUUID(),dir:c.root,name:'usr',mode:0o644,options:options('read-write',{create:true})},'EROFS');
+    await c.call('symlink',{dir:c.root,name:'sys',target:'/tmp'},'EROFS');
+    const proc=await c.call('lookup',{dir:c.root,name:'proc'});
+    await c.call('mkdir',{dir:proc.handle,name:'shadow',mode:0o755},'EROFS');
+    await c.call('setattr',{handle:proc.handle,attr:attrs({mode:0o777})},'EROFS');
+    await c.call('setxattr',{handle:proc.handle,name:'user.shadow',value:[1],flags:''},'EROFS');
+    await c.call('rmdir',{dir:c.root,name:'proc'},'EROFS');
+    const [file,open]=await c.create(dir,'file');
+    await c.call('rename',{from_dir:dir,from:'file',to_dir:c.root,to:'usr',flags:''},'EROFS');
+    await c.call('rename',{from_dir:dir,from:'file',to_dir:proc.handle,to:'file',flags:''},'EROFS');
+    // ftruncate of an O_PATH reference is EBADF; writing nothing is no error at any offset.
+    const path=await c.open(file.handle,'path');await c.call('set_len',{open:path,size:0},'EBADF');
+    expect(await c.data(open,{write:{at:{offset:2**63},length:0}})).toMatchObject({len:0});
+    await c.data(open,{write:{at:{offset:2**63},length:1}},Buffer.from('x'),'EFBIG');
+  } finally {
+    await c.call('disconnect');
+  }
+});

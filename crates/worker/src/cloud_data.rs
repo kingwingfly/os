@@ -176,8 +176,9 @@ fn regular(node: &Node, open: &OpenRef, write: bool) -> FsResult<()> {
     if node.directory {
         return Err(Errno::EISDIR);
     }
+    // A device's I/O is its driver's, as MemFs refuses it.
     if !node.is_file() {
-        return Err(Errno::ENODEV);
+        return Err(Errno::ENXIO);
     }
     Ok(())
 }
@@ -222,7 +223,8 @@ fn prepare(db: &mut Db, request: &DataRequest) -> FsResult<Value> {
                 WriteAt::Offset(offset) => offset,
                 WriteAt::End => node.size,
             };
-            if offset > FILE_MAX || length > FILE_MAX - offset {
+            // Writing nothing changes nothing, at any offset, as MemFs and Linux have it.
+            if length > 0 && (offset > FILE_MAX || length > FILE_MAX - offset) {
                 return Err(Errno::EFBIG);
             }
             let id = auth::random_token();
@@ -264,7 +266,7 @@ fn commit(db: &mut Db, request: &DataRequest, id: &str) -> FsResult<Value> {
         WriteAt::Offset(offset) => offset,
         WriteAt::End => node.size,
     };
-    if offset > FILE_MAX || length > FILE_MAX - offset {
+    if length > 0 && (offset > FILE_MAX || length > FILE_MAX - offset) {
         return Err(Errno::EFBIG);
     }
     if length > 0 {

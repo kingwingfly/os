@@ -161,6 +161,9 @@ pub(super) fn caller(db: &mut Db, session: &wire::Session, token: &str) -> Resul
     }
     let credential = db.credential(token, &row.ns).ok_or(Errno::EACCES)?;
     authorize(&credential)?;
+    // The caller's system generation decides which paths its image owns (read-only), as it
+    // does on the path API.
+    crate::system::select(db, credential.generation.as_deref()).map_err(|e| e.errno)?;
     let (fs, key) = identity(db);
     Ok(Caller {
         session: row,
@@ -222,8 +225,9 @@ impl Caller {
         if !node.directory {
             return Err(Errno::ENOTDIR);
         }
-        let path = db.names(node.ino).pop().ok_or(Errno::ENOENT)?;
+        // Permission before removal, as MemFs and Linux order them (EACCES, then ENOENT).
         inode::require(&self.credential.identity(), &node, mask)?;
+        let path = db.names(node.ino).pop().ok_or(Errno::ENOENT)?;
         Ok((node, path))
     }
     fn child(&self, db: &Db, dir: &Handle, name: &str) -> Result<(Node, String)> {
@@ -246,6 +250,11 @@ impl Caller {
         created: bool,
     ) -> Result<OpenRef> {
         let access = options.access()?;
+        let writing = access.writes() || (access != Access::Path && options.is_truncate());
+        // A directory's write or truncation fails on its own (EISDIR) below.
+        if !created && writing && !node.directory {
+            unchanged_names(db, node.ino)?;
+        }
         if !created {
             inode::may_open(&self.credential.identity(), &node, access.mask())?;
         }
@@ -315,6 +324,24 @@ impl Caller {
 fn join(dir: &str, name: &str) -> String {
     format!("{}/{name}", dir.trim_end_matches('/'))
 }
+/// Paths the path API refuses to change (`EROFS`): the caller's system image's, and /proc's,
+/// which procfs makes. Their persisted placeholders are not what callers see there, and
+/// names made under an image path would block later activations (`system::validate_mount`).
+fn read_only(db: &Db, path: &str) -> bool {
+    crate::system::owns(db, path) || crate::procfs::is(path)
+}
+/// `EROFS` if any name of `ino` is read-only.
+fn unchanged_names(db: &Db, ino: u64) -> Result<()> {
+    if db.names(ino).iter().any(|path| read_only(db, path)) {
+        return Err(Errno::EROFS);
+    }
+    Ok(())
+}
+/// The longest request ticket; a longer or empty one never named a request.
+const TICKET_MAX: usize = 128;
+fn ticket_valid(ticket: &str) -> bool {
+    !ticket.is_empty() && ticket.len() <= TICKET_MAX
+}
 fn metadata(db: &Db, node: &Node) -> Metadata {
     let times = db.times(node.ino);
     let nlink = if node.directory && node.links != 0 {
@@ -363,6 +390,9 @@ fn new_name(db: &Db, c: &Caller, dir: &Handle, name: &str) -> Result<(Node, Stri
     check_component(name)?;
     let (parent, path) = c.dir(db, dir, EXEC)?;
     let path = join(&path, name);
+    if read_only(db, &path) {
+        return Err(Errno::EROFS);
+    }
     if db.persisted_node(&path).is_some() {
         return Err(Errno::EEXIST);
     }
@@ -430,7 +460,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         _ => None,
     };
     if let Some(ticket) = ticket {
-        if ticket.is_empty() || ticket.len() > 128 {
+        if !ticket_valid(ticket) {
             return Err(Errno::EINVAL);
         }
         #[derive(Deserialize)]
@@ -666,6 +696,9 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         }
         Unlink { dir, name } | Rmdir { dir, name } => {
             let (node, path) = c.child(db, dir, name)?;
+            if read_only(db, &path) {
+                return Err(Errno::EROFS);
+            }
             // Device drivers own removal permissions and teardown, including their open
             // descriptors, voices, pending requests and disappearance notifications.
             if matches!(&request.call, Unlink { .. })
@@ -705,6 +738,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             if *attr == SetAttr::default() {
                 return Ok(json!(metadata(db, &original)));
             }
+            unchanged_names(db, original.ino)?;
             let mut node = original.clone();
             if let Some(mode) = attr.mode {
                 inode::chmod(&who, &mut node, mode)?;
@@ -747,6 +781,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             flags,
         } => {
             let mut node = c.node(db, handle)?;
+            unchanged_names(db, node.ino)?;
             let space = xattr::space(name)?;
             xattr::settable(&who, &node, space)?;
             if matches!(space, xattr::Space::Access | xattr::Space::Default) {
@@ -765,6 +800,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         }
         Removexattr { handle, name } => {
             let mut node = c.node(db, handle)?;
+            unchanged_names(db, node.ino)?;
             let space = xattr::space(name)?;
             xattr::settable(&who, &node, space)?;
             if matches!(space, xattr::Space::Access | xattr::Space::Default) {
@@ -794,6 +830,10 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             json!(c.open(db, node, options, false)?)
         }
         CancelOpen { ticket } => {
+            // No create/open accepted such a ticket: there is nothing to cancel or record.
+            if !ticket_valid(ticket) {
+                return Ok(Value::Null);
+            }
             #[derive(Deserialize)]
             struct Id {
                 open: Option<u64>,
@@ -813,6 +853,9 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         }
         SetLen { open, size } => {
             let mut node = c.opened(db, open)?;
+            if open.access == Access::Path {
+                return Err(Errno::EBADF);
+            }
             if !open.access.writes() {
                 return Err(Errno::EINVAL);
             }
@@ -883,6 +926,9 @@ fn rename(
     let (parent, _) = c.dir(db, from_dir, 0)?;
     let (dest_parent, dest) = c.dir(db, to_dir, EXEC)?;
     let new = join(&dest, to);
+    if read_only(db, &old) || read_only(db, &new) {
+        return Err(Errno::EROFS);
+    }
     let who = c.credential.identity();
     inode::may_delete(&who, &parent, &source)?;
     inode::may_create(&who, &dest_parent, false)?;
@@ -1076,6 +1122,12 @@ fn locks(db: &mut Db, c: &Caller, call: &Call) -> Result<Value> {
         }
         _ => return Err(Errno::EINVAL),
     };
+    // A ticket no lock request could carry named nothing to cancel.
+    if let CancelLock { ticket, .. } = call
+        && !ticket_valid(ticket)
+    {
+        return Ok(Value::Null);
+    }
     if matches!(call, CancelLock { .. }) && c.open_row(db, open)?.revoked != 0 {
         return Ok(Value::Null);
     }
@@ -1089,11 +1141,21 @@ fn locks(db: &mut Db, c: &Caller, call: &Call) -> Result<Value> {
             } else {
                 None
             };
-            let all = db
-                .rows::<LockRow>("SELECT state FROM vfs_locks", vec![])
+            // Only a new blocking POSIX request can queue and so close a wait cycle; polling
+            // an existing wait, try-locks and flock never look at other inodes. This inode's
+            // own table is `state`, not its stored copy.
+            let polling = ticket.is_some_and(|t| state.waits.iter().any(|w| w.ticket == t));
+            let all = if ticket.is_some() && family == LockFamily::Posix && !polling {
+                db.rows::<LockRow>(
+                    "SELECT state FROM vfs_locks WHERE ino != ?",
+                    vec![int(node.ino)],
+                )
                 .into_iter()
                 .map(|r| serde_json::from_str(&r.state).map_err(|_| Errno::EIO))
-                .collect::<Result<Vec<Locks>>>()?;
+                .collect::<Result<Vec<Locks>>>()?
+            } else {
+                Vec::new()
+            };
             let acquired = state.acquire(
                 Held {
                     owner: open.id,
@@ -1150,7 +1212,11 @@ impl Db {
             .unwrap_or_default()
     }
     fn save_cloud_locks(&mut self, ino: u64, state: &Locks) {
-        if state.held.is_empty() && state.waits.is_empty() && state.cancelled.is_empty() {
+        if state.held.is_empty()
+            && state.waits.is_empty()
+            && state.cancelled.is_empty()
+            && state.displaced.is_empty()
+        {
             self.run("DELETE FROM vfs_locks WHERE ino = ?", vec![int(ino)]);
         } else {
             self.run("INSERT INTO vfs_locks(ino,state) VALUES(?,?) ON CONFLICT(ino) DO UPDATE SET state=excluded.state",vec![int(ino),text(&json!(state).to_string())]);
