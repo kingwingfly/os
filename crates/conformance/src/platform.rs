@@ -114,7 +114,7 @@ pub struct Identity {
 #[cfg(any(target_os = "wasi", test))]
 fn identity_from_json(value: &Value) -> Identity {
     Identity {
-        dev: value["dev"].as_u64(),
+        dev: value["dev"].as_u64().filter(|n| *n != 0),
         ino: value["ino"].as_u64().filter(|n| *n != 0),
     }
 }
@@ -155,11 +155,10 @@ pub fn fdidentity(file: &File) -> Result<Identity> {
     }
     #[cfg(target_os = "wasi")]
     {
-        // There is no abi::Call::Fstat and ABI descriptor numbers are distinct
-        // from libc fds. Preview 1 exposes the inode, but writeFilestat invents
-        // dev=1 and substitutes ino=0 when absent. Neither is identity evidence.
+        // Preview 1 filestat carries the filesystem's st_dev and the inode; the
+        // runtime reports 0 for either when it has no identity to give.
         Ok(Identity {
-            dev: None,
+            dev: (s.st_dev != 0).then_some(s.st_dev),
             ino: (s.st_ino != 0).then_some(s.st_ino),
         })
     }

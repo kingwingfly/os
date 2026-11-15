@@ -251,6 +251,8 @@ fn stat_of(db: &Db, path: &str, entry: &Entry) -> Stat {
     let group = db.user_by_id(owner).map_or(0, |(_, user)| user.group);
     let now = crate::auth::now();
     Stat {
+        // procfs is a filesystem of its own, as on Linux: never the cloud tree's device.
+        dev: abi::fs::FsId("proc".into()).dev(),
         ino,
         mode,
         nlink: 1,

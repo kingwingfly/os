@@ -331,7 +331,9 @@ function kindOf(mode) {
 const nanos = (seconds, nsec = 0) => BigInt(seconds ?? 0) * 1000000000n + BigInt(nsec ?? 0);
 function writeFilestat(ptr, found) {
   const v = view();
-  v.setBigUint64(ptr, 1n, true);
+  // st_dev is the filesystem's identity (abi::Stat::dev); 0 where none is known, never a
+  // made-up number that would make different filesystems look alike.
+  v.setBigUint64(ptr, BigInt(found.dev ?? 0), true);
   v.setBigUint64(ptr + 8, BigInt(found.ino ?? 0), true);
   v.setUint8(ptr + 16, found.filetype ?? kindOf(found.mode));
   v.setBigUint64(ptr + 24, BigInt(found.nlink ?? 1), true);

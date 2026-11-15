@@ -414,6 +414,10 @@ pub fn signaled(status: i32) -> Option<u8> {
 /// What stat(2) tells of a node.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Stat {
+    /// `st_dev`: the filesystem's identity (contract §2.5), the same wherever it is mounted
+    /// (`abi::fs::FsId::dev`); 0 where the filesystem has none to give.
+    #[serde(default)]
+    pub dev: u64,
     pub ino: u64,
     /// Its type (`S_IF*`) and its special and permission bits.
     pub mode: u32,
