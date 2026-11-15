@@ -231,21 +231,28 @@ pub async fn io(
     write: bool,
     bytes: u64,
 ) -> Result<()> {
-    use worker::*;
     let Some(token) = token else {
         return Ok(());
     };
     if bytes == 0 {
         return Ok(());
     }
+    checked_io(
+        env,
+        IoRequest {
+            ns,
+            token,
+            pid,
+            write,
+            bytes,
+        },
+    )
+    .await
+}
+/// Validate the actual process even for empty reads/writes, then reserve its I/O budget.
+pub async fn checked_io(env: &worker::Env, request: IoRequest) -> Result<()> {
+    use worker::*;
     let map = |e: worker::Error| abi::Error::because(Errno::EIO, e.to_string());
-    let request = IoRequest {
-        ns,
-        token,
-        pid,
-        write,
-        bytes,
-    };
     let mut init = RequestInit::new();
     init.with_method(Method::Post).with_body(Some(
         serde_json::to_string(&request)

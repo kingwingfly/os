@@ -12,11 +12,11 @@ async function rpc(request,credential,session,call,errno,version=2) {
   if(errno){expect(body.errno,JSON.stringify(body)).toBe(errno);return body;}
   expect(response.ok(),JSON.stringify(body)).toBe(true);return body;
 }
-async function connection(request,token) {
-  const c={...await rpc(request,token,null,'connect'),request,token};
+async function connection(request,{token,pid}) {
+  const c={...await rpc(request,token,null,'connect'),request,token,pid};
   c.call=(op,args,errno)=>rpc(request,token,c.session,args===undefined?op:{[op]:args},errno);
   c.data=async(open,operation,bytes,errno)=>{
-    const response=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Filesystem':JSON.stringify({version:2,credential:token,session:c.session,open,operation})},data:bytes??Buffer.alloc(0)});
+    const response=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Filesystem':JSON.stringify({version:2,credential:c.token,pid:c.pid,session:c.session,open,operation})},data:bytes??Buffer.alloc(0)});
     if(errno){expect((await response.json()).errno).toBe(errno);return;}
     expect(response.ok(),response.ok()?'':await response.text()).toBe(true);return 'read' in operation?response.body():response.json();
   };
@@ -28,11 +28,11 @@ async function connection(request,token) {
 }
 async function setup(request) {
   await call(request,'getcreds');expect((await api(request,'login',{data:{username:'root',password}})).ok()).toBe(true);
-  const p=await admit(request);const c=await connection(request,p.token);
+  const p=await admit(request);const c=await connection(request,p);
   const dir=await c.call('mkdir',{dir:c.root,name:'vfs-'+randomUUID(),mode:0o777});return {c,dir:dir.handle,p};
 }
 test('v2 checks credentials, version, instance ownership, proofs and component syntax',async({request})=>{
-  const {c,dir}=await setup(request);const other=await connection(request,c.token);
+  const {c,dir}=await setup(request);const other=await connection(request,c);
   await c.call('metadata',{handle:other.root},'EACCES');await other.call('metadata',{handle:dir},'EACCES');
   const forged=structuredClone(dir);forged.node.ino++;await c.call('metadata',{handle:forged},'EACCES');
   await rpc(request,'forged',c.session,{metadata:{handle:dir}},'EACCES');await rpc(request,c.token,{...c.session,secret:'forged'},{metadata:{handle:dir}},'EACCES');
@@ -107,7 +107,7 @@ test('revoking an opener releases its inode and locks even when another credenti
 });
 test('lease expiry releases references while an independently renewed session remains usable',async({request})=>{
   test.setTimeout(180000);
-  const {c,dir,p}=await setup(request);const other=await connection(request,c.token);
+  const {c,dir,p}=await setup(request);const other=await connection(request,c);
   const [entry,open]=await c.create(dir,'expire');await c.write(open,'lease');
   const dirName=(await c.call('parent',{dir}))[1];const otherDir=(await other.call('lookup',{dir:other.root,name:dirName})).handle;
   const observed=(await other.call('lookup',{dir:otherDir,name:'expire'})).handle;await c.call('unlink',{dir,name:'expire'});
@@ -116,7 +116,7 @@ test('lease expiry releases references while an independently renewed session re
 });
 test('signed 64-bit offsets retain precision across SQLite and the Worker gateway',async({request})=>{
   const {c,dir}=await setup(request);const [entry,open]=await c.create(dir,'large');
-  const data={version:2,credential:c.token,session:c.session,open,operation:{write:{at:{offset:'LARGE_OFFSET'},length:1}}};
+  const data={version:2,credential:c.token,pid:c.pid,session:c.session,open,operation:{write:{at:{offset:'LARGE_OFFSET'},length:1}}};
   const response=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Filesystem':JSON.stringify(data).replace('"LARGE_OFFSET"','9223372036854775806')},data:Buffer.from('x')});
   expect(response.ok(),response.ok()?'':await response.text()).toBe(true);
   expect(await response.text()).toContain('9223372036854775806');
@@ -143,7 +143,7 @@ test('moving a directory preserves descendant inode metadata and revocation deni
 });
 test('separate service instances share inode locks but cannot exchange handle proofs',async({request})=>{
   const {c,dir}=await setup(request);const [entry,open]=await c.create(dir,'shared');await c.write(open,'shared');
-  const other=await connection(request,c.token);expect(other.root.fs).toBe(c.root.fs);
+  const other=await connection(request,c);expect(other.root.fs).toBe(c.root.fs);
   const name=(await c.call('parent',{dir}))[1];const od=(await other.call('lookup',{dir:other.root,name})).handle;
   const theirs=(await other.call('lookup',{dir:od,name:'shared'})).handle;expect(theirs.node).toEqual(entry.handle.node);expect(theirs.proof).not.toBe(entry.handle.proof);
   const peer=await other.open(theirs);const range={start:0,end:null};
@@ -159,7 +159,7 @@ test('account lock revokes open grants and unlocking never revives them',async({
   try{
     expect((await api(request,'passwd',{data:{username:name,password}})).ok()).toBe(true);
     await call(account,'getcreds');expect((await api(account,'login',{data:{username:name,password}})).ok()).toBe(true);
-    const actor=await admit(account);const c=await connection(account,actor.token);const creds=await call(account,'getcreds');
+    const actor=await admit(account);const c=await connection(account,actor);const creds=await call(account,'getcreds');
     const walked=await c.call('walk',{dir:c.root,names:creds.home.split('/').filter(Boolean)});const home=walked.entries.at(-1).handle;
     const [entry,open]=await c.create(home,'retained');await c.write(open,'private');await c.call('unlink',{dir:home,name:'retained'});
     await call(request,{usermod:{name,lock:true}});await c.data(open,{read:{offset:0,length:7}},undefined,'EACCES');
@@ -241,4 +241,90 @@ test('empty setattr preserves metadata for both owners and non-owners',async({re
   expect(await c.call('metadata',{handle:entry.handle})).toEqual(before);
   await c.call('unlink',{dir,name:'no-op'});await c.call('release',{open});
   await c.call('setattr',{handle:entry.handle,attr:attrs()},'ESTALE');await c.call('disconnect');
+});
+test('forked callers use their own I/O limits and survive the credential issuer process',async({request})=>{
+  const {c,dir,p}=await setup(request);const group='/user/cloudfs-fork-'+randomUUID();
+  const child={...await call(request,{fork:{pid:p.pid}},{pid:p.pid,proc:p.token}),token:p.token};
+  const end=process=>sys(request,[{exit:{pid:process.pid,proc:process.token,status:0}},{wait:{pid:String(process.pid),proc:process.token}}],{}, {'X-Registry':'1'});
+  await call(request,{cgroup_create:{path:group}});await call(request,{cgroup_attach:{pid:child.pid,path:group}});
+  try{
+    const [,open]=await c.create(dir,'fork');await c.write(open,'parent');
+    await call(request,{cgroup_set:{path:group,key:'io.max',value:'rbps=0 wbps=0'}});
+    c.pid=child.pid;
+    await c.data(open,{write:{at:'end',length:1}},Buffer.from('!'),'EAGAIN');
+    await c.data(open,{read:{offset:0,length:6}},undefined,'EAGAIN');
+    const usage=(await call(request,{cgroup_stat:{path:group}}))['io.stat'];
+    expect([usage.read_bytes,usage.write_bytes]).toEqual([0,0]);
+    await end(p);await call(request,{cgroup_set:{path:group,key:'io.max',value:'max'}});
+    expect((await c.read(open)).toString()).toBe('parent');await c.write(open,' child');
+    expect((await c.read(open)).toString()).toBe('parent child');
+    const unrelated=await admit(request);
+    for(const pid of [p.pid,unrelated.pid,0]){
+      c.pid=pid;await c.data(open,{read:{offset:0,length:1}},undefined,'EPERM');
+      await c.data(open,{write:{at:'end',length:0}},undefined,'EPERM');
+    }
+    c.pid=null;await c.data(open,{read:{offset:0,length:1}},undefined,'EINVAL');
+    c.pid=child.pid;await c.call('unlink',{dir,name:'fork'});await c.call('release',{open});await end(unrelated);
+  }finally{await c.call('disconnect');await end(child);await end(p);await call(request,{cgroup_remove:{path:group}});}
+});
+test('ordinary image-backed clones support v2 reads, edits and sparse truncation across readers',async({request})=>{
+  const {c,dir}=await setup(request);const name=(await c.call('parent',{dir}))[1];const base='/'+name;
+  const source='/usr/bin/coreutils';
+  const original=await call(request,{pread:{path:source,offset:0,count:64}});
+  const head=Buffer.from(original.data,'base64');expect(head).toHaveLength(64);
+  const clone=async name=>{
+    const from=await call(request,{open:{path:source,flags:0}});
+    const to=await call(request,{open:{path:base+'/'+name,flags:0o301,mode:0o600}});
+    try{await call(request,{ioctl:{fd:to.fd,request:0x40049409,arg:from.fd}});}
+    finally{await call(request,{close:{fd:to.fd}});await call(request,{close:{fd:from.fd}});}
+    const entry=await c.call('lookup',{dir,name});return {entry,open:await c.open(entry.handle)};
+  };
+  const {entry,open}=await clone('edited');
+  expect(await c.read(open,3,17)).toEqual(head.subarray(3,20));
+  await c.write(open,'edit',{offset:4});const edited=Buffer.from(head);edited.write('edit',4);
+  expect(await c.read(open,0,64)).toEqual(edited);
+  const inline=await call(request,{pread:{path:base+'/edited',offset:0,count:64}});
+  expect(Buffer.from(inline.data,'base64')).toEqual(edited);
+  const file=await request.get(origin+'/api/file?path='+encodeURIComponent(base+'/edited'),{headers:{Range:'bytes=0-63'}});
+  expect(file.status()).toBe(206);expect(await file.body()).toEqual(edited);
+  await c.call('set_len',{open,size:12});await c.call('set_len',{open,size:24});await c.write(open,'after',{offset:16});
+  const sparse=Buffer.alloc(24);edited.copy(sparse,0,0,12);sparse.write('after',16);
+  expect(await c.read(open)).toEqual(sparse);
+  const zero=await clone('zero');await c.call('set_len',{open:zero.open,size:0});await c.call('set_len',{open:zero.open,size:8});
+  expect(await c.read(zero.open)).toEqual(Buffer.alloc(8));
+  await c.call('unlink',{dir,name:'edited'});await c.call('unlink',{dir,name:'zero'});await c.call('release',{open});await c.call('release',{open:zero.open});
+  await c.call('metadata',{handle:entry.handle},'ESTALE');
+  const unchanged=await call(request,{pread:{path:source,offset:0,count:64}});
+  expect(Buffer.from(unchanged.data,'base64')).toEqual(head);await c.call('disconnect');
+});
+test('compound setattr checks the original owner permissions before applying any change',async({request})=>{
+  const {c:admin,dir:shared}=await setup(request);await admin.call('setattr',{handle:shared,attr:attrs({mode:0o777})});
+  const name=(await admin.call('parent',{dir:shared}))[1];await api(request,'logout');
+  const guest=await admit(request);const c=await connection(request,guest);const dir=(await c.call('lookup',{dir:c.root,name})).handle;
+  const [entry,open]=await c.create(dir,'compound',0o600);await c.write(open,'original');
+  const changed=await c.call('setattr',{handle:entry.handle,attr:attrs({mode:0o400,size:0,mtime:'now'})});
+  expect([changed.mode,changed.size]).toEqual([0o400,0]);
+  await c.call('setattr',{handle:entry.handle,attr:attrs({mode:0o600,size:3})},'EACCES');
+  expect(await c.call('metadata',{handle:entry.handle})).toEqual(changed);
+  await c.call('setattr',{handle:entry.handle,attr:attrs({mode:0o600})});await c.write(open,'updated');
+  const truncated=await c.call('setattr',{handle:entry.handle,attr:attrs({mode:0o400,size:2})});
+  expect([truncated.mode,truncated.size]).toEqual([0o400,2]);expect((await c.read(open)).toString()).toBe('up');
+  await c.call('unlink',{dir,name:'compound'});await c.call('disconnect');await admin.call('disconnect');
+});
+test('directory enumeration returns only immediate persisted children of a nested tree',async({request})=>{
+  const {c,dir}=await setup(request);const name=(await c.call('parent',{dir}))[1];const base='/'+name;
+  const nested=await c.call('mkdir',{dir,name:'nested',mode:0o700});const [entry,open]=await c.create(dir,'file');
+  const link=await c.call('symlink',{dir,name:'link',target:'nested'});
+  for(let d=0;d<10;d++){
+    await call(request,{mkdir:{path:base+'/nested/d'+d,mode:0o700}});
+    const results=await sys(request,Array.from({length:40},(_,i)=>({symlink:{target:'missing',path:base+'/nested/d'+d+'/child'+i}})));
+    expect(results.every(r=>'ok' in r)).toBe(true);
+  }
+  const entries=await c.call('read_dir',{dir});
+  expect(entries.map(e=>[e.name,e.node.ino,e.file_type])).toEqual([
+    ['file',entry.handle.node.ino,'file'],['link',link.handle.node.ino,'symlink'],['nested',nested.handle.node.ino,'dir']
+  ]);
+  expect((await c.call('read_dir',{dir:nested.handle})).map(e=>e.name)).toEqual(Array.from({length:10},(_,i)=>'d'+i));
+  expect((await c.call('read_dir',{dir:c.root})).some(e=>e.name===name&&e.node.ino===dir.node.ino)).toBe(true);
+  await c.call('release',{open});await c.call('disconnect');
 });

@@ -53,6 +53,15 @@ impl Db {
         let Some(id) = node.file.as_deref() else {
             return Ok(Vec::new());
         };
+        if crate::system::asset(id).is_some() {
+            return Ok(vec![Extent {
+                start: 0,
+                length: node.size,
+                key: id.into(),
+                offset: 0,
+                source: Some(id.into()),
+            }]);
+        }
         let file = self.file(id).ok_or(Errno::EIO)?;
         if !file.complete() {
             return Err(Errno::EBUSY);
@@ -201,7 +210,7 @@ fn prepare(db: &mut Db, request: &DataRequest) -> FsResult<Value> {
                 db.cloud_accessed(node.ino);
             }
             Ok(
-                json!({"id":id,"offset":offset,"length":length,"extents":extents,"io":c.io(&request.credential,false,length)}),
+                json!({"id":id,"offset":offset,"length":length,"extents":extents,"io":c.io(&request.credential,request.pid,false,length)?}),
             )
         }
         DataOperation::Write { at, length } => {
@@ -221,7 +230,7 @@ fn prepare(db: &mut Db, request: &DataRequest) -> FsResult<Value> {
             db.run("INSERT INTO vfs_uploads(id,session,open,credential,operation,expires) VALUES(?,?,?,?,?,?)",vec![text(&id),text(&request.session.id),int(request.open.id),text(&auth::token_hash(&request.credential)),text(&json!(request.operation).to_string()),int(expires)]);
             db.set_expiry("vfs_upload", &id, expires);
             Ok(
-                json!({"id":id,"key":format!("vfs/{id}"),"io":c.io(&request.credential,true,length)}),
+                json!({"id":id,"key":format!("vfs/{id}"),"io":c.io(&request.credential,request.pid,true,length)?}),
             )
         }
     }
@@ -381,9 +390,7 @@ pub async fn gateway(req: Request, env: &Env) -> Result<Response> {
     let id = grant["id"].as_str().unwrap_or_default();
     if let Some(value) = grant.get("io").filter(|v| !v.is_null()) {
         let io: crate::resources::IoRequest = serde_json::from_value(value.clone())?;
-        if let Err(error) =
-            crate::resources::io(env, io.ns, Some(io.token), io.pid, io.write, io.bytes).await
-        {
+        if let Err(error) = crate::resources::checked_io(env, io).await {
             let cleanup = match request.operation {
                 DataOperation::Read { .. } => "/internal/fs/read-done",
                 DataOperation::Write { .. } => "/internal/fs/abandon",
@@ -397,7 +404,7 @@ pub async fn gateway(req: Request, env: &Env) -> Result<Response> {
             let extents: Vec<Extent> = serde_json::from_value(grant["extents"].clone())?;
             let length = grant["length"].as_u64().unwrap_or(0);
             let offset = grant["offset"].as_u64().unwrap_or(0);
-            let body = extent_stream(env.bucket("FILES")?, extents, offset, length);
+            let body = extent_stream(env, extents, offset, length)?;
             // A read pins the immutable manifest for its bounded lease. The stream owns no
             // authority transaction; alarm cleanup also covers cancelled responses.
             let env = env.clone();
@@ -491,23 +498,30 @@ pub(crate) fn extent_parts(
 }
 /// Extents clipped to the requested range, with bounded-memory zero streams for holes.
 pub fn extent_stream(
-    bucket: Bucket,
+    env: &Env,
     extents: Vec<Extent>,
     offset: u64,
     length: u64,
-) -> web_sys::ReadableStream {
+) -> Result<web_sys::ReadableStream> {
     let parts = Rc::new(RefCell::new(VecDeque::from(extent_parts(
         extents, offset, length,
     ))));
-    let bucket = Rc::new(bucket);
+    let bucket = Rc::new(env.bucket("FILES")?);
+    let env = env.clone();
     let next = Closure::<dyn FnMut() -> js_sys::Promise>::new(move || {
         let part = parts.borrow_mut().pop_front();
         let bucket = bucket.clone();
+        let env = env.clone();
         future_to_promise(async move {
             match part {
                 None => Ok(JsValue::NULL),
                 Some((None, _, length)) => Ok(zeros(length as f64).into()),
                 Some((Some(key), offset, length)) => {
+                    if let Some(asset) = crate::system::asset(&key) {
+                        return crate::streams::asset_range(&env, &asset, offset, length)
+                            .await
+                            .map(Into::into);
+                    }
                     crate::streams::object_range(&bucket, &key, offset, length)
                         .await
                         .map(Into::into)
@@ -515,10 +529,10 @@ pub fn extent_stream(
             }
         })
     });
-    crate::streams::fixed_length(
+    Ok(crate::streams::fixed_length(
         &crate::streams::concatenate(&next.into_js_value().into()),
         length as f64,
-    )
+    ))
 }
 
 #[wasm_bindgen(

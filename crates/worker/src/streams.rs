@@ -90,6 +90,72 @@ pub async fn object_range(
     }
 }
 
+#[wasm_bindgen(inline_js = "
+export function assetWindow(body, skip, length) {
+  const reader = body.getReader();
+  return new ReadableStream({
+    async pull(c) {
+      try {
+        while (length) {
+          const {value, done} = await reader.read();
+          if (done) throw new Error('truncated asset');
+          const start = Math.min(skip, value.byteLength); skip -= start;
+          const n = Math.min(length, value.byteLength - start);
+          if (!n) continue;
+          c.enqueue(value.subarray(start, start + n)); length -= n;
+          if (length) return;
+        }
+        await reader.cancel(); c.close();
+      } catch (e) { await reader.cancel(e).catch(()=>{}); c.error(e); }
+    },
+    cancel(why) { return reader.cancel(why); }
+  });
+}
+")]
+extern "C" {
+    #[wasm_bindgen(js_name = assetWindow)]
+    fn asset_window(
+        body: &web_sys::ReadableStream,
+        skip: f64,
+        length: f64,
+    ) -> web_sys::ReadableStream;
+}
+
+/// Stream a range of an immutable image/build asset, retaining its integrity checks.
+/// A binding may ignore Range and return 200; discard that prefix without buffering it.
+pub async fn asset_range(
+    env: &Env,
+    asset: &str,
+    offset: u64,
+    length: u64,
+) -> std::result::Result<web_sys::ReadableStream, JsValue> {
+    let fetch = async {
+        let headers = Headers::new();
+        headers.set("Range", &format!("bytes={offset}-{}", offset + length - 1))?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Get).with_headers(headers);
+        let request = Request::new_with_init(&format!("https://assets{asset}"), &init)?;
+        let response = if asset.starts_with("/boot/blobs/") {
+            crate::system::checked_asset(request, env).await?
+        } else {
+            env.assets("ASSETS")?.fetch_request(request).await?
+        };
+        let skip = match response.status_code() {
+            200 => offset,
+            206 => 0,
+            _ => return Err(Error::RustError("File content is unavailable".into())),
+        };
+        let response: web_sys::Response = response.into();
+        let body = response
+            .body()
+            .ok_or_else(|| Error::RustError("Missing asset body".into()))?;
+        Ok(asset_window(&body, skip as f64, length as f64))
+    };
+    fetch
+        .await
+        .map_err(|e: Error| JsValue::from_str(&e.to_string()))
+}
+
 /// The R2 objects `parts`, each (key, length), one after another, as one stream of their
 /// total length.
 pub fn objects(bucket: Bucket, parts: Vec<(String, u64)>) -> web_sys::ReadableStream {

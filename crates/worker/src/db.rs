@@ -1144,6 +1144,10 @@ impl Db {
     }
     pub(crate) fn release(&mut self, file: Option<String>) {
         let Some(file) = file else { return };
+        // Immutable build/image assets belong to the release, never to ordinary-file GC.
+        if crate::system::asset(&file).is_some() {
+            return;
+        }
         // A job still reading it keeps it too, and so does a descriptor.
         let referenced = !self
             .rows::<Key>(

@@ -344,7 +344,7 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
             file: grant.file.clone(),
         };
         let bytes = Response::from_body(ResponseBody::Stream(if grant.chunk_size == 0 {
-            crate::cloud_data::extent_stream(env.bucket("FILES")?, grant.extents, 0, grant.size)
+            crate::cloud_data::extent_stream(env, grant.extents, 0, grant.size)?
         } else {
             reader.stream(grant.chunk_size, 0, grant.size.saturating_sub(1))
         }))?;
@@ -398,7 +398,7 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
         return crate::resources::refused(e);
     }
     let body = if grant.chunk_size == 0 {
-        crate::cloud_data::extent_stream(env.bucket("FILES")?, grant.extents, start, length)
+        crate::cloud_data::extent_stream(env, grant.extents, start, length)?
     } else {
         reader.stream(grant.chunk_size, start, end)
     };

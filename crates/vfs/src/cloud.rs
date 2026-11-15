@@ -11,6 +11,9 @@ use std::{
 };
 
 pub trait Transport {
+    /// Snapshot the current call's credential and PID before any await. This is kernel
+    /// task context, never the opener or connection's cached identity. Only jobs omit PID.
+    fn caller(&self) -> Result<(String, Option<u32>)>;
     /// POST /api/fs; deserialize a successful JSON body and translate an error's errno.
     /// Never retry a mutating request automatically except an open with its same ticket.
     fn request(&self, request: wire::Request) -> BoxFuture<'_, Value>;
@@ -124,9 +127,12 @@ impl<T: Transport> CloudFs<T> {
         serde_json::from_value(self.send(&token, call).await?).map_err(|_| Errno::EIO)
     }
     fn data(&self, open: &OpenRef, operation: DataOperation) -> Result<DataRequest> {
+        self.token(open)?;
+        let (credential, pid) = self.transport.caller()?;
         Ok(DataRequest {
             version: wire::VERSION,
-            credential: self.token(open)?,
+            credential,
+            pid,
             session: self.connected.session.clone(),
             open: open.clone(),
             operation,
@@ -523,12 +529,10 @@ impl<T: Transport> Filesystem for CloudFs<T> {
             if offset > FILE_MAX || buf.len() as u64 > FILE_MAX - offset {
                 return Err(Errno::EINVAL);
             }
-            self.drain().await?;
             let length = (buf.len() as u64).min(wire::DATA_MAX);
-            let bytes = self
-                .transport
-                .read(self.data(open, DataOperation::Read { offset, length })?)
-                .await?;
+            let request = self.data(open, DataOperation::Read { offset, length })?;
+            self.drain().await?;
+            let bytes = self.transport.read(request).await?;
             if bytes.len() > length as usize {
                 return Err(Errno::EIO);
             }
@@ -543,14 +547,10 @@ impl<T: Transport> Filesystem for CloudFs<T> {
         at: WriteAt,
     ) -> BoxFuture<'a, Written> {
         Box::pin(async move {
-            self.drain().await?;
             let length = (buf.len() as u64).min(wire::DATA_MAX);
-            self.transport
-                .write(
-                    self.data(open, DataOperation::Write { at, length })?,
-                    &buf[..length as usize],
-                )
-                .await
+            let request = self.data(open, DataOperation::Write { at, length })?;
+            self.drain().await?;
+            self.transport.write(request, &buf[..length as usize]).await
         })
     }
     fn set_len<'a>(&'a self, open: &'a OpenRef, size: u64) -> BoxFuture<'a, ()> {

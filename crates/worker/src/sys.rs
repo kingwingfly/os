@@ -504,6 +504,10 @@ async fn bytes(
                             data.resize(data.len() + length as usize, 0);
                             continue;
                         };
+                        if let Some(asset) = crate::system::asset(&key) {
+                            data.extend(asset_range(env, &asset, offset, length).await?);
+                            continue;
+                        }
                         let object = bucket
                             .get(&key)
                             .range(Range::OffsetWithLength { offset, length })

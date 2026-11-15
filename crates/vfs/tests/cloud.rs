@@ -15,6 +15,8 @@ struct Host {
     pending: Rc<Cell<bool>>,
     calls: Rc<RefCell<Vec<Call>>>,
     next: Rc<Cell<u64>>,
+    actor: Rc<RefCell<(String, Option<u32>)>>,
+    data: Rc<RefCell<Vec<DataRequest>>>,
 }
 fn root() -> Handle {
     Handle {
@@ -38,12 +40,20 @@ fn open() -> OpenRef {
     }
 }
 impl Transport for Host {
+    fn caller(&self) -> Result<(String, Option<u32>)> {
+        Ok(self.actor.borrow().clone())
+    }
     fn request(&self, request: wire::Request) -> BoxFuture<'_, Value> {
         Box::pin(async move {
             self.calls.borrow_mut().push(request.call.clone());
-            if self.pending.get() {
-                return std::future::pending().await;
-            }
+            std::future::poll_fn(|_| {
+                if self.pending.get() {
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(())
+                }
+            })
+            .await;
             Ok(match request.call {
                 Call::Connect => json!(wire::Connected {
                     version: 2,
@@ -61,11 +71,15 @@ impl Transport for Host {
             })
         })
     }
-    fn read(&self, _: DataRequest) -> BoxFuture<'_, Vec<u8>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-    fn write<'a>(&'a self, _: DataRequest, bytes: &'a [u8]) -> BoxFuture<'a, Written> {
+    fn read(&self, request: DataRequest) -> BoxFuture<'_, Vec<u8>> {
         Box::pin(async move {
+            self.data.borrow_mut().push(request);
+            Ok(Vec::new())
+        })
+    }
+    fn write<'a>(&'a self, request: DataRequest, bytes: &'a [u8]) -> BoxFuture<'a, Written> {
+        Box::pin(async move {
+            self.data.borrow_mut().push(request);
             Ok(Written {
                 offset: 0,
                 len: bytes.len(),
@@ -129,6 +143,40 @@ fn cancelled_release_is_retried_and_invalid_read_offsets_never_cross_transport()
     host.pending.set(false);
     assert_eq!(now_or_never(fs.drain()), Some(Ok(())));
     assert_eq!(ready(fs.sync_all(&opened)), Err(Errno::EBADF));
+}
+#[test]
+fn data_calls_snapshot_the_current_process_before_waiting_for_cleanup() {
+    use std::task::{Context, Poll, Waker};
+    let host = Host::default();
+    let fs = now_or_never(CloudFs::connect(host.clone(), "opener".into()))
+        .unwrap()
+        .unwrap();
+    let mut cred = Cred::root();
+    cred.token = Some("opener".into());
+    let options = *OpenOptions::new().read(true).write(true);
+    let opened = ready(fs.open(&cred, &root(), &options)).unwrap();
+    host.pending.set(true);
+    assert!(now_or_never(fs.open(&cred, &root(), &options)).is_none());
+    *host.actor.borrow_mut() = ("child".into(), Some(42));
+    let mut write = fs.write_at(&opened, b"data", WriteAt::End);
+    assert!(matches!(
+        write.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Pending
+    ));
+    *host.actor.borrow_mut() = ("another process".into(), Some(43));
+    host.pending.set(false);
+    assert_eq!(ready(write).unwrap().len, 4);
+    assert_eq!(ready(fs.read_at(&opened, &mut [0], 0)), Ok(0));
+    let sent = host.data.borrow();
+    assert_eq!(
+        (sent[0].credential.as_str(), sent[0].pid),
+        ("child", Some(42))
+    );
+    assert_eq!(
+        (sent[1].credential.as_str(), sent[1].pid),
+        ("another process", Some(43))
+    );
+    assert_eq!(sent[0].open, sent[1].open);
 }
 fn held(owner: u64, start: u64, end: Option<u64>) -> Held {
     Held {

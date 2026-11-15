@@ -164,19 +164,20 @@ impl Caller {
     pub(super) fn io(
         &self,
         token: &str,
+        pid: Option<u32>,
         write: bool,
         bytes: u64,
-    ) -> Option<crate::resources::IoRequest> {
-        self.credential
-            .job()
-            .is_none()
-            .then(|| crate::resources::IoRequest {
-                ns: self.credential.ns.clone(),
-                token: token.into(),
-                pid: Some(self.credential.pid),
-                write,
-                bytes,
-            })
+    ) -> Result<Option<crate::resources::IoRequest>> {
+        if self.credential.job().is_some() {
+            return Ok(None);
+        }
+        Ok(Some(crate::resources::IoRequest {
+            ns: self.credential.ns.clone(),
+            token: token.into(),
+            pid: Some(pid.ok_or(Errno::EINVAL)?),
+            write,
+            bytes,
+        }))
     }
     fn proof(&self, node: NodeId) -> Hmac<Sha256> {
         let mut mac = Hmac::<Sha256>::new_from_slice(self.key.as_bytes())
@@ -295,15 +296,6 @@ fn join(dir: &str, name: &str) -> String {
 }
 fn metadata(db: &Db, node: &Node) -> Metadata {
     let times = db.times(node.ino);
-    let file_type = if node.directory {
-        FileType::Dir
-    } else if node.is_link() {
-        FileType::Symlink
-    } else if node.rdev.is_some() {
-        FileType::CharDevice
-    } else {
-        FileType::File
-    };
     let nlink = if node.directory && node.links != 0 {
         2 + db.names(node.ino).first().map_or(0, |path| {
             db.children(path)
@@ -315,7 +307,7 @@ fn metadata(db: &Db, node: &Node) -> Metadata {
         node.links
     };
     Metadata {
-        file_type,
+        file_type: file_type(node),
         mode: node.mode,
         nlink,
         uid: node.owner,
@@ -326,6 +318,17 @@ fn metadata(db: &Db, node: &Node) -> Metadata {
         ctime: times.ctime.into(),
         rdev: node.rdev.clone(),
         acl: node.acl.is_some(),
+    }
+}
+fn file_type(node: &Node) -> FileType {
+    if node.directory {
+        FileType::Dir
+    } else if node.is_link() {
+        FileType::Symlink
+    } else if node.rdev.is_some() {
+        FileType::CharDevice
+    } else {
+        FileType::File
     }
 }
 fn make(
@@ -495,17 +498,27 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         Metadata { handle } => json!(metadata(db, &c.node(db, handle)?)),
         ReadDir { dir } => {
             let (_, path) = c.dir(db, dir, READ)?;
+            #[derive(Deserialize)]
+            struct Child {
+                path: String,
+                ino: u64,
+                file_type: FileType,
+            }
+            // Only names, identities and types are needed: avoid loading descendants or
+            // computing their metadata/link counts inside this synchronous transaction.
             let entries: Vec<_> = db
-                .subtree(&path)
+                .rows::<Child>(
+                    "SELECT n.path,i.id AS ino,CASE WHEN i.directory = 1 THEN 'dir' WHEN i.link IS NOT NULL THEN 'symlink' WHEN i.rdev IS NOT NULL THEN 'char-device' ELSE 'file' END AS file_type FROM nodes n JOIN inodes i ON i.id = n.ino WHERE n.parent = ? AND n.path != ? ORDER BY n.path",
+                    vec![text(&path), text(&path)],
+                )
                 .into_iter()
-                .filter(|(p, _)| os_core::parent(p) == path && p != &path)
-                .map(|(p, n)| DirEntry {
-                    name: p.rsplit('/').next().unwrap_or("").into(),
+                .map(|child| DirEntry {
+                    name: child.path.rsplit('/').next().unwrap_or("").into(),
                     node: NodeId {
-                        ino: n.ino,
+                        ino: child.ino,
                         generation: 1,
                     },
-                    file_type: metadata(db, &n).file_type,
+                    file_type: child.file_type,
                 })
                 .collect();
             db.cloud_accessed(dir.node.ino);
@@ -621,17 +634,18 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             Value::Null
         }
         Setattr { handle, attr } => {
-            let mut node = c.node(db, handle)?;
+            let original = c.node(db, handle)?;
             if *attr == SetAttr::default() {
-                return Ok(json!(metadata(db, &node)));
+                return Ok(json!(metadata(db, &original)));
             }
+            let mut node = original.clone();
             if let Some(mode) = attr.mode {
                 inode::chmod(&who, &mut node, mode)?;
             }
             inode::chown(&who, &mut node, attr.uid, attr.gid)?;
-            inode::may_set_times(&who, &node, attr.atime, attr.mtime)?;
+            inode::may_set_times(&who, &original, attr.atime, attr.mtime)?;
             if let Some(size) = attr.size {
-                inode::require(&who, &node, WRITE)?;
+                inode::require(&who, &original, WRITE)?;
                 db.cloud_truncate(&mut node, size, &c.credential)?;
             }
             db.update_inode(&node);
