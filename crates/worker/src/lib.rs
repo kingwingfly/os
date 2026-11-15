@@ -1,6 +1,8 @@
 mod api;
 mod auth;
 mod cgroup_lifetime;
+mod cloud_data;
+mod cloudfs;
 mod commands;
 mod compiler;
 mod creds;
@@ -73,6 +75,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // File bytes stream here, outside the authority, which only decides and records.
         match (req.method(), path.as_str()) {
             (Method::Get | Method::Head, "/api/file") => files::read(req, &env).await,
+            (Method::Post, "/api/fs/data") => cloud_data::gateway(req, &env).await,
             (Method::Put, "/api/pwrite") => files::pwrite(req, &env).await,
             // The client kernel's batches of process calls go to its browser's own machine
             // (machine.rs), not the filesystem's one authority. The header is routing only:

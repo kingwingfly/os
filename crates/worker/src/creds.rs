@@ -44,7 +44,7 @@ pub struct Credential {
 /// them by its own key (`owner`).
 const OWNER: &str = "COALESCE(owner, ns || ' ' || pid || ' ' || substr(token, 1, 16))";
 /// The columns a `Credential` is read from.
-fn columns() -> String {
+pub(crate) fn columns() -> String {
     format!("token, ns, pid, uid, gid, groups, umask, generation, cloud_access, {OWNER} AS owner")
 }
 impl Credential {
@@ -190,6 +190,7 @@ impl Db {
             ),
             vec![text(JOBS), text(&job_owner(id))],
         ) {
+            self.revoke_cloud_opens(&row.token);
             self.clear_expiry("credential", &row.token);
         }
         self.run(
@@ -225,7 +226,7 @@ impl Db {
         }
     }
     /// The credentials whose token's hash is `hash`, in `ns`.
-    fn credential_of(&self, hash: &str, ns: &str) -> Option<Credential> {
+    pub(crate) fn credential_of(&self, hash: &str, ns: &str) -> Option<Credential> {
         self.rows::<Credential>(
             &format!(
                 "SELECT {} FROM credentials WHERE token = ? AND ns = ? AND expires > ?",
@@ -252,7 +253,6 @@ impl Db {
     /// Revoke the credentials whose token's hash is `hash`: its image's descriptor closes, and
     /// what its processes opened, once no image of theirs holds the credentials still.
     pub fn revoke(&mut self, ns: &str, hash: &str) {
-        self.clear_expiry("credential", hash);
         let found = self.rows::<Credential>(
             &format!(
                 "DELETE FROM credentials WHERE token = ? AND ns = ? RETURNING {}",
@@ -261,6 +261,8 @@ impl Db {
             vec![text(hash), text(ns)],
         );
         for credential in found {
+            self.revoke_cloud_opens(hash);
+            self.clear_expiry("credential", hash);
             self.close_exec_fds(&credential.image());
             let held = !self
                 .rows::<Credential>(
@@ -603,6 +605,9 @@ fn exec(
     );
     // The image the process ran before is replaced: its token and its image's descriptor die
     // with the exec, not only when the process ends; what it opened stays open for the new one.
+    if let Some(current) = &current {
+        db.inherit_cloud_opens(ns, &current.token, &asked.token);
+    }
     if let Some(old) = &asked.old {
         db.revoke(ns, old);
     }

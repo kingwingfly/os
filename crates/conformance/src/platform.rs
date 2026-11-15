@@ -56,6 +56,8 @@ pub fn error(e: io::Error) -> String {
         (libc::ENOEXEC, "ENOEXEC"),
         (libc::ECHILD, "ECHILD"),
         (libc::EDEADLK, "EDEADLK"),
+        (libc::EPROTONOSUPPORT, "EPROTONOSUPPORT"),
+        (libc::ENOTCONN, "ENOTCONN"),
     ] {
         if n == Some(code) {
             return name.into();

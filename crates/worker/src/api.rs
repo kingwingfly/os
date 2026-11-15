@@ -151,6 +151,16 @@ macro_rules! real {
 }
 
 pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply> {
+    if matches!(
+        req.path().as_str(),
+        "/api/fs"
+            | "/internal/fs/data"
+            | "/internal/fs/commit"
+            | "/internal/fs/read-done"
+            | "/internal/fs/abandon"
+    ) {
+        return crate::cloudfs::handle(req, state).await;
+    }
     let url = req.url()?;
     let endpoint = url.path().to_string();
     let method = req.method();
@@ -262,7 +272,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 Reply::ok(json!({
                     "file": id, "size": file.size, "chunk_size": file.chunk_size,
                     "state": file.state, "etag": file.etag(), "mime": mime(&real), "chunks": chunks,
-                    "readable": db.readable(&file),
+                    "readable": db.readable(&file), "extents": db.extents(&id),
                 }))
             })
         }
@@ -303,7 +313,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                         Reply::ok(json!({
                             "file": file.id, "size": file.size, "chunk_size": file.chunk_size,
                             "state": file.state, "etag": file.etag(), "mime": content_type, "chunks": chunks,
-                            "readable": file.size, "exec": exec,
+                            "readable": file.size, "exec": exec, "extents": db.extents(&file.id),
                         }))
                     }
                     Err(error) => errno_reply(&error).keep(),
@@ -512,7 +522,9 @@ fn job_reply(
                 .into_iter()
                 .map(|c| json!([c.idx, c.key]))
                 .collect();
-            Reply::ok(json!({"size": f.size, "chunk_size": f.chunk_size, "chunks": chunks}))
+            Reply::ok(
+                json!({"size": f.size, "chunk_size": f.chunk_size, "chunks": chunks, "extents": db.extents(file)}),
+            )
         }
         _ => Reply::error("Unknown endpoint or unsupported request method", 404),
     }
@@ -597,6 +609,7 @@ pub fn cancel(db: &mut Db, file: &File) {
         for path in db.showing(&file.id) {
             db.delete_node(&path);
         }
+        db.detach_abandoned_upload(&file.id);
     }
     // Deleting the last node showing it may have freed it already.
     if db.file(&file.id).is_some() {

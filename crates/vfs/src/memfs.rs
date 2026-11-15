@@ -1241,6 +1241,13 @@ impl Filesystem for MemFs {
                 .map(|ino| Self::metadata_of(&state.inodes[&ino]))
         })
     }
+    fn open_metadata<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, Metadata> {
+        ready!({
+            let state = self.state.borrow();
+            self.open_record(&state, open)
+                .map(|record| Self::metadata_of(&state.inodes[&record.ino]))
+        })
+    }
     fn setattr<'a>(
         &'a self,
         cred: &'a Cred,

@@ -7,10 +7,10 @@ let sequence = 0;
 async function fixture(change = () => {}) {
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const raw = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32), key = hash(raw);
-  const bytes = Buffer.from(JSON.stringify({ format:'os.release',version:1,protocol:{min:1,max:1},schema:{min:7,max:7} }));
+  const bytes = Buffer.from(JSON.stringify({ format:'os.release',version:1,protocol:{min:1,max:1},schema:{min:9,max:9} }));
   const id = hash(bytes), prefix = `/boot/releases/${id}/assets`;
   const signature = { format:'os.signature',version:1,key,signature:sign(null,Buffer.concat([Buffer.from('os.release.v1\0'),bytes]),privateKey).toString('hex') };
-  const entries = { format:'os.boot',version:1,protocol:1,schema:7,default:id,trust:{keys:{[key]:raw.toString('hex')},revoked:[]} };
+  const entries = { format:'os.boot',version:1,protocol:1,schema:9,default:id,trust:{keys:{[key]:raw.toString('hex')},revoked:[]} };
   const state = { entries, signature, bytes, id, key }; change(state);
   const saved = { location:globalThis.location, fetch:globalThis.fetch, flag:globalThis.__osReleaseFetch };
   const requests = [];

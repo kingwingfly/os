@@ -36,25 +36,7 @@ pub fn configure(env: &Env) -> worker::Result<()> {
     Ok(())
 }
 pub fn schema(sql: &worker::SqlStorage) -> worker::Result<()> {
-    sql.exec("CREATE TABLE IF NOT EXISTS system_releases(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, package TEXT NOT NULL, state TEXT NOT NULL, ticket TEXT, expires INTEGER NOT NULL, approved INTEGER NOT NULL DEFAULT 0)", None)?;
-    if sql
-        .exec("SELECT pending FROM system_releases LIMIT 0", None)
-        .is_err()
-    {
-        sql.exec("ALTER TABLE system_releases ADD COLUMN pending TEXT", None)?;
-    }
-    if sql
-        .exec("SELECT generation FROM credentials LIMIT 0", None)
-        .is_err()
-    {
-        sql.exec("ALTER TABLE credentials ADD COLUMN generation TEXT", None)?;
-    }
-    if sql
-        .exec("SELECT generation FROM fds LIMIT 0", None)
-        .is_err()
-    {
-        sql.exec("ALTER TABLE fds ADD COLUMN generation TEXT", None)?;
-    }
+    sql.exec("CREATE TABLE IF NOT EXISTS system_releases(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, package TEXT NOT NULL, state TEXT NOT NULL, ticket TEXT, expires INTEGER NOT NULL, approved INTEGER NOT NULL DEFAULT 0, pending TEXT)", None)?;
     Ok(())
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -257,6 +239,17 @@ pub fn owns(db: &Db, path: &str) -> bool {
     db.image
         .as_ref()
         .map_or_else(|| crate::usr::is(path), |v| v.owns(path))
+}
+pub fn owns_descendant(db: &Db, path: &str) -> bool {
+    let prefix = format!("{}/", path.trim_end_matches('/'));
+    db.image.as_ref().map_or_else(
+        || "/usr".starts_with(&prefix),
+        |v| {
+            "/usr".starts_with(&prefix)
+                || "/sys".starts_with(&prefix)
+                || v.entries.keys().any(|p| p.starts_with(&prefix))
+        },
+    )
 }
 pub fn asset(content: &str) -> Option<String> {
     if let Some((hash, _)) = content

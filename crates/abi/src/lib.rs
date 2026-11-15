@@ -13,6 +13,8 @@ use std::fmt;
 
 pub mod accelerator;
 pub mod contract;
+pub mod fs;
+pub mod remote_fs;
 pub mod system;
 
 /// Why a call failed, as Linux's errno says.
@@ -56,6 +58,8 @@ pub enum Errno {
     ENOEXEC,
     ECHILD,
     EDEADLK,
+    EPROTONOSUPPORT,
+    ENOTCONN,
 }
 impl Errno {
     /// What glibc's strerror says of it.
@@ -98,6 +102,8 @@ impl Errno {
             ECANCELED => "Operation canceled",
             ENOEXEC => "Exec format error",
             ECHILD => "No child processes",
+            EPROTONOSUPPORT => "Protocol not supported",
+            ENOTCONN => "Transport endpoint is not connected",
             EDEADLK => "Resource deadlock avoided",
         }
     }

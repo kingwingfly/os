@@ -127,7 +127,7 @@ impl ModuleCompiler {
         };
         // R2 requires a stream with a known length. Keep bytes in native streams, as the
         // archive runner does, and reject a truncated or oversized compiler response.
-        let output = Data::ReadableStream(crate::streams::fixed_length(stream, length as f64));
+        let output = Data::ReadableStream(crate::streams::fixed_length(stream, length));
         self.env.bucket("FILES")?.put(key, output).execute().await?;
         container.destroy(None).await?;
         self.state.storage().put("cached", key).await?;

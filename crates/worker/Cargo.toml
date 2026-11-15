@@ -23,3 +23,5 @@ sha2 = "0.10"
 base64 = "0.22"
 wasm-bindgen.workspace = true
 js-sys.workspace = true
+
+os-vfs = { path = "../vfs" }

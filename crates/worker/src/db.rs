@@ -32,7 +32,7 @@ extern "C" {
 const ROLLBACK: &str = "rollback";
 
 /// The version of the tables below, which local state made by an older one does not have.
-pub const SCHEMA_VERSION: &str = "7";
+pub const SCHEMA_VERSION: &str = "9";
 
 const SCHEMA: [&str; 36] = [
     "CREATE TABLE IF NOT EXISTS execution_owners(lineage TEXT PRIMARY KEY, uid INTEGER NOT NULL)",
@@ -49,9 +49,9 @@ const SCHEMA: [&str; 36] = [
     "CREATE INDEX IF NOT EXISTS nodes_ino ON nodes(ino)",
     // An inode: a directory, a file showing content, or a symbolic link to `link`; its ACLs as
     // JSON (crate::acl); when its content (a directory's entries) last changed, when it did at
-    // all, and when it was last read as far as anything says (reading does not: noatime), each
-    // in seconds and the nanoseconds past them.
-    "CREATE TABLE IF NOT EXISTS inodes(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, grp INTEGER NOT NULL, mode INTEGER NOT NULL, directory INTEGER NOT NULL, file TEXT, size INTEGER NOT NULL, link TEXT, acl TEXT, default_acl TEXT, mtime INTEGER NOT NULL DEFAULT 0, ctime INTEGER NOT NULL DEFAULT 0, rdev TEXT, mtime_ns INTEGER NOT NULL DEFAULT 0, ctime_ns INTEGER NOT NULL DEFAULT 0, atime INTEGER NOT NULL DEFAULT 0, atime_ns INTEGER NOT NULL DEFAULT 0)",
+    // all, and its access time (relatime for v2 reads; unchanged by path reads), each in seconds
+    // and the nanoseconds past them.
+    "CREATE TABLE IF NOT EXISTS inodes(id INTEGER PRIMARY KEY AUTOINCREMENT, owner INTEGER NOT NULL, grp INTEGER NOT NULL, mode INTEGER NOT NULL, directory INTEGER NOT NULL, file TEXT, size INTEGER NOT NULL, link TEXT, acl TEXT, default_acl TEXT, mtime INTEGER NOT NULL DEFAULT 0, ctime INTEGER NOT NULL DEFAULT 0, rdev TEXT, mtime_ns INTEGER NOT NULL DEFAULT 0, ctime_ns INTEGER NOT NULL DEFAULT 0, atime INTEGER NOT NULL DEFAULT 0, atime_ns INTEGER NOT NULL DEFAULT 0)",
     "CREATE INDEX IF NOT EXISTS inodes_file ON inodes(file)",
     // Extended attributes, their values in hexadecimal.
     "CREATE TABLE IF NOT EXISTS xattrs(ino INTEGER NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(ino, name))",
@@ -62,7 +62,7 @@ const SCHEMA: [&str; 36] = [
     // File descriptors (fds.rs): a session's (each browser is one), by number; the content it
     // reads or writes (none once another writer took it over), where, its open(2) flags,
     // whether it made the file, and when it was last kept (its lease).
-    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, token TEXT, root INTEGER NOT NULL DEFAULT 0, proc TEXT, exec INTEGER NOT NULL DEFAULT 0, cred TEXT, ino INTEGER, PRIMARY KEY(sid, fd))",
+    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, token TEXT, root INTEGER NOT NULL DEFAULT 0, proc TEXT, exec INTEGER NOT NULL DEFAULT 0, cred TEXT, ino INTEGER, generation TEXT, PRIMARY KEY(sid, fd))",
     // The next descriptor number of each session: numbers are not given again, as a session's
     // pages share its descriptors, and one may go on using a number another closed.
     "CREATE TABLE IF NOT EXISTS fd_numbers(sid TEXT PRIMARY KEY, next INTEGER NOT NULL)",
@@ -102,7 +102,7 @@ const SCHEMA: [&str; 36] = [
     // its browser's namespace, the process that executed, as whom it acts, and the key its
     // process's descriptors are owned by (that of the image it replaced, which it keeps). The
     // process table is each browser's own Durable Object's (machine.rs).
-    "CREATE TABLE IF NOT EXISTS credentials(token TEXT PRIMARY KEY, ns TEXT NOT NULL, pid INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, groups TEXT NOT NULL, umask INTEGER NOT NULL, started INTEGER NOT NULL, owner TEXT, expires INTEGER NOT NULL DEFAULT 0, placement TEXT NOT NULL DEFAULT '{}')",
+    "CREATE TABLE IF NOT EXISTS credentials(token TEXT PRIMARY KEY, ns TEXT NOT NULL, pid INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, groups TEXT NOT NULL, umask INTEGER NOT NULL, started INTEGER NOT NULL, owner TEXT, expires INTEGER NOT NULL DEFAULT 0, placement TEXT NOT NULL DEFAULT '{}', generation TEXT, cloud_access INTEGER NOT NULL DEFAULT 1)",
     "CREATE INDEX IF NOT EXISTS credentials_ns ON credentials(ns, pid)",
 ];
 
@@ -218,92 +218,7 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
         sql.exec(statement, None)?;
     }
     crate::provider_policy::create(sql)?;
-    // Inodes made before they had times get them, as of 1970.
-    if sql.exec("SELECT mtime FROM inodes LIMIT 0", None).is_err() {
-        for column in ["mtime", "ctime"] {
-            sql.exec(
-                &format!("ALTER TABLE inodes ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
-                None,
-            )?;
-        }
-    }
-    // Inodes made before times had nanoseconds and an access time get them, as of 1970.
-    if sql.exec("SELECT atime FROM inodes LIMIT 0", None).is_err() {
-        for column in ["mtime_ns", "ctime_ns", "atime", "atime_ns"] {
-            sql.exec(
-                &format!("ALTER TABLE inodes ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
-                None,
-            )?;
-        }
-    }
-    // Inodes made before devices were nodes of their own have no driver, and descriptors
-    // made before then open no device.
-    if sql.exec("SELECT rdev FROM inodes LIMIT 0", None).is_err() {
-        sql.exec("ALTER TABLE inodes ADD COLUMN rdev TEXT", None)?;
-    }
-    if sql.exec("SELECT device FROM fds LIMIT 0", None).is_err() {
-        sql.exec("ALTER TABLE fds ADD COLUMN device TEXT", None)?;
-    }
-    if sql
-        .exec("SELECT expires FROM credentials LIMIT 0", None)
-        .is_err()
-    {
-        sql.exec(
-            "ALTER TABLE credentials ADD COLUMN expires INTEGER NOT NULL DEFAULT 0",
-            None,
-        )?;
-    }
-    if sql
-        .exec("SELECT placement FROM credentials LIMIT 0", None)
-        .is_err()
-    {
-        sql.exec(
-            "ALTER TABLE credentials ADD COLUMN placement TEXT NOT NULL DEFAULT '{}'",
-            None,
-        )?;
-    }
-    // Descriptors made before read tokens have none.
-    if sql
-        .exec("SELECT cloud_access FROM credentials LIMIT 0", None)
-        .is_err()
-    {
-        sql.exec(
-            "ALTER TABLE credentials ADD COLUMN cloud_access INTEGER NOT NULL DEFAULT 1",
-            None,
-        )?;
-    }
-    if sql.exec("SELECT token FROM fds LIMIT 0", None).is_err() {
-        sql.exec("ALTER TABLE fds ADD COLUMN token TEXT", None)?;
-        sql.exec("CREATE INDEX IF NOT EXISTS fds_token ON fds(token)", None)?;
-    }
-    // The process tables moved to each browser's machine: what a local state kept of them was
-    // the processes of boots that are gone.
-    for table in ["processes", "namespaces", "cgroups"] {
-        sql.exec(&format!("DROP TABLE IF EXISTS {table}"), None)?;
-    }
-    // Descriptors made before they kept their opener's credentials act as `root` says.
-    if sql.exec("SELECT cred FROM fds LIMIT 0", None).is_err() {
-        sql.exec("ALTER TABLE fds ADD COLUMN cred TEXT", None)?;
-    }
-    // Descriptors made before they named the inode they opened name none: fchmod of one is
-    // EBADF.
-    if sql.exec("SELECT ino FROM fds LIMIT 0", None).is_err() {
-        sql.exec("ALTER TABLE fds ADD COLUMN ino INTEGER", None)?;
-    }
-    // Credentials made before they named their descriptors' owner own them by their own key.
-    if sql
-        .exec("SELECT owner FROM credentials LIMIT 0", None)
-        .is_err()
-    {
-        sql.exec("ALTER TABLE credentials ADD COLUMN owner TEXT", None)?;
-    }
-    // Descriptors made before they said as whom they were opened were not opened as root.
-    if sql.exec("SELECT root FROM fds LIMIT 0", None).is_err() {
-        sql.exec(
-            "ALTER TABLE fds ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
-            None,
-        )?;
-    }
+    crate::cloudfs::schema(sql)?;
     crate::system::schema(sql)?;
     // Tables made just now are this version's, said at once: initialization may fail (a
     // missing ADMIN_PASSWORD), and the next start must not take them for an older version's.
@@ -381,6 +296,7 @@ struct NodeRow {
     mode: u16,
     directory: u8,
     file: Option<String>,
+    #[serde(deserialize_with = "exact_u64")]
     size: u64,
     link: Option<String>,
     rdev: Option<String>,
@@ -464,6 +380,7 @@ struct Ino {
 #[derive(Clone, Debug, Deserialize)]
 pub struct File {
     pub id: String,
+    #[serde(deserialize_with = "exact_u64")]
     pub size: u64,
     pub chunk_size: u64,
     pub state: String,
@@ -494,7 +411,7 @@ impl File {
     }
     /// How many chunks the whole file has.
     pub fn chunk_count(&self) -> u64 {
-        self.size.div_ceil(self.chunk_size)
+        self.size.div_ceil(self.chunk_size.max(1))
     }
     /// The size of chunk `index`: the chunk size, except for the last chunk.
     pub fn chunk_len(&self, index: u64) -> u64 {
@@ -578,8 +495,29 @@ pub struct Chunk {
     pub key: String,
 }
 
+pub(crate) fn exact_u64<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<u64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Number {
+        Text(String),
+        Integer(u64),
+    }
+    match Number::deserialize(d)? {
+        Number::Text(v) => v.parse().map_err(serde::de::Error::custom),
+        Number::Integer(v) => Ok(v),
+    }
+}
 pub(crate) fn int(value: impl TryInto<i64>) -> SqlStorageValue {
-    SqlStorageValue::Integer(value.try_into().unwrap_or(i64::MAX))
+    let value = value.try_into().unwrap_or(i64::MAX);
+    // worker-rs transports Integer through a JS Number. SQLite INTEGER affinity parses a
+    // decimal string exactly, retaining signed 64-bit offsets beyond Number.MAX_SAFE_INTEGER.
+    if !(-(1i64 << 53) + 1..=(1i64 << 53) - 1).contains(&value) {
+        text(&value.to_string())
+    } else {
+        SqlStorageValue::Integer(value)
+    }
 }
 pub(crate) fn text(value: &str) -> SqlStorageValue {
     value.into()
@@ -647,6 +585,75 @@ impl Db {
             .map(|row| (row.name, row.value))
             .collect()
     }
+    /// Read an inode even after its last name was removed. Numbers are never recycled.
+    pub(crate) fn inode(&self, ino: u64) -> Option<Node> {
+        self.rows::<NodeRow>(
+            "SELECT '' AS path, i.id AS ino, i.owner, i.grp, i.mode, i.directory, i.file, CAST(i.size AS TEXT) AS size, i.link, i.rdev, i.acl, i.default_acl, (SELECT COUNT(*) FROM nodes WHERE ino = i.id) AS links FROM inodes i WHERE i.id = ?",
+            vec![int(ino)],
+        ).pop().map(|r| r.pair().1)
+    }
+    /// Change an inode without adding a name (including an unlinked open inode).
+    pub(crate) fn update_inode(&mut self, node: &Node) {
+        self.update_inode_at(node, crate::auth::clock());
+    }
+    pub(crate) fn update_inode_at(&mut self, node: &Node, (sec, ns): (u64, u32)) {
+        let before = self.inode(node.ino).and_then(|n| n.file);
+        self.run("UPDATE inodes SET owner = ?, grp = ?, mode = ?, file = ?, size = ?, acl = ?, default_acl = ?, ctime = ?, ctime_ns = ? WHERE id = ?",
+            vec![int(node.owner), int(node.group), int(node.mode), node.file.as_deref().into(), int(node.size), node.acl.as_ref().map(|v| serde_json::json!(v).to_string()).into(), node.default_acl.as_ref().map(|v| serde_json::json!(v).to_string()).into(), int(sec), int(ns), int(node.ino)]);
+        for name in self.names(node.ino) {
+            changes(&name);
+        }
+        if before != node.file {
+            self.release(before);
+        }
+    }
+    pub(crate) fn set_times_at(
+        &mut self,
+        ino: u64,
+        atime: Option<(u64, u32)>,
+        mtime: Option<(u64, u32)>,
+        (now, nanos): (u64, u32),
+    ) {
+        let given = |time: Option<(u64, u32)>| match time {
+            Some((sec, nsec)) => [int(sec), int(nsec)],
+            None => [SqlStorageValue::Null, SqlStorageValue::Null],
+        };
+        let mut values = given(atime).to_vec();
+        values.extend(given(mtime));
+        values.extend([int(now), int(nanos), int(ino)]);
+        self.run(
+            "UPDATE inodes SET atime = COALESCE(?1, atime), atime_ns = COALESCE(?2, atime_ns), mtime = COALESCE(?3, mtime), mtime_ns = COALESCE(?4, mtime_ns), ctime = ?5, ctime_ns = ?6 WHERE id = ?7",
+            values,
+        );
+        for name in self.names(ino) {
+            changes(&name);
+        }
+    }
+    /// Clear `file` from any unlinked inode still pinned by CloudFS when an incomplete upload is cancelled.
+    pub(crate) fn detach_abandoned_upload(&mut self, file: &str) {
+        let (sec, ns) = crate::auth::clock();
+        self.run(
+            "UPDATE inodes SET file = NULL, size = 0, mtime = ?, mtime_ns = ?, ctime = ?, ctime_ns = ? WHERE file = ?",
+            vec![int(sec), int(ns), int(sec), int(ns), text(file)],
+        );
+    }
+    /// Move directory entries without rewriting descendant inode metadata. The transaction
+    /// has already checked the replacement and cycles; no intermediate path is observable.
+    pub(crate) fn move_names(&mut self, from: &str, to: &str) {
+        let tree = self.subtree(from);
+        self.delete_node(to);
+        for (path, _) in tree {
+            let next = format!("{to}{}", &path[from.len()..]);
+            self.run(
+                "UPDATE nodes SET path = ?, parent = ? WHERE path = ?",
+                vec![text(&next), text(parent_of(&next)), text(&path)],
+            );
+            changes(&path);
+            changes(&next);
+        }
+        self.entries_changed(from);
+        self.entries_changed(to);
+    }
     pub(crate) fn persisted_node(&self, path: &str) -> Option<Node> {
         self.rows::<NodeRow>(&format!("{NODE} WHERE n.path = ?"), vec![text(path)])
             .pop()
@@ -659,6 +666,18 @@ impl Db {
                 vec![text(&format!("{path}/")), text(&format!("{path}0"))],
             )
             .is_empty()
+    }
+    pub(crate) fn persisted_subdirs(&self, path: &str) -> u32 {
+        #[derive(Deserialize)]
+        struct Count {
+            n: u32,
+        }
+        self.rows::<Count>(
+            "SELECT COUNT(*) AS n FROM nodes n JOIN inodes i ON i.id = n.ino WHERE n.parent = ? AND i.directory = 1",
+            vec![text(path)],
+        )
+        .pop()
+        .map_or(0, |c| c.n)
     }
     pub fn meta(&self, key: &str) -> Option<String> {
         self.rows::<Value>("SELECT v FROM meta WHERE k = ?", vec![text(key)])
@@ -740,7 +759,9 @@ impl Db {
         }
         let count = |query: &str| self.rows::<Count>(query, vec![]).pop().map_or(0, |c| c.n);
         (
-            count("SELECT COALESCE(SUM(size), 0) AS n FROM files WHERE state = 'complete'"),
+            count(
+                "SELECT COALESCE(SUM(CASE WHEN chunk_size = 0 THEN (SELECT COALESCE(SUM(length),0) FROM vfs_extents WHERE file = files.id) ELSE size END), 0) AS n FROM files WHERE state = 'complete'",
+            ),
             count("SELECT COUNT(*) AS n FROM inodes"),
         )
     }
@@ -1073,7 +1094,7 @@ impl Db {
     }
     pub fn file(&self, id: &str) -> Option<File> {
         self.rows(
-            "SELECT id, size, chunk_size, state, sha256, uploader, target, base FROM files WHERE id = ?",
+            "SELECT id, CAST(size AS TEXT) AS size, chunk_size, state, sha256, uploader, target, base FROM files WHERE id = ?",
             vec![text(id)],
         )
         .pop()
@@ -1147,6 +1168,7 @@ impl Db {
     /// Delete `file` and send its chunks to the garbage, whatever refers to it: every object
     /// under its prefix, also those written but never committed.
     pub fn drop_file(&mut self, file: &str) {
+        self.drop_extents(file);
         self.discard(&format!("chunks/{file}/"));
         self.discard(&crate::compiler::prefix(file));
         self.run("DELETE FROM chunks WHERE file = ?", vec![text(file)]);
@@ -1164,12 +1186,16 @@ impl Db {
         );
         ALARM.set(true);
     }
-    fn release(&mut self, file: Option<String>) {
+    pub(crate) fn release(&mut self, file: Option<String>) {
         let Some(file) = file else { return };
+        // Immutable build/image assets belong to the release, never to ordinary-file GC.
+        if crate::system::asset(&file).is_some() {
+            return;
+        }
         // A job still reading it keeps it too, and so does a descriptor.
         let referenced = !self
             .rows::<Key>(
-                "SELECT CAST(id AS TEXT) AS key FROM inodes WHERE file = ?1 UNION ALL SELECT job AS key FROM job_files WHERE file = ?1 UNION ALL SELECT sid AS key FROM fds WHERE file = ?1 LIMIT 1",
+                "SELECT CAST(id AS TEXT) AS key FROM inodes WHERE file = ?1 UNION ALL SELECT job AS key FROM job_files WHERE file = ?1 UNION ALL SELECT sid AS key FROM fds WHERE file = ?1 UNION ALL SELECT file AS key FROM vfs_extents WHERE source = ?1 UNION ALL SELECT id AS key FROM vfs_reads WHERE file = ?1 LIMIT 1",
                 vec![text(&file)],
             )
             .is_empty();
@@ -1178,7 +1204,7 @@ impl Db {
         }
     }
     /// The names of the inode `ino`.
-    fn names(&self, ino: u64) -> Vec<String> {
+    pub(crate) fn names(&self, ino: u64) -> Vec<String> {
         self.rows::<Key>(
             "SELECT path AS key FROM nodes WHERE ino = ?",
             vec![int(ino)],
@@ -1188,8 +1214,8 @@ impl Db {
         .collect()
     }
     /// Let the inode `ino` go, and what it shows, if nothing names it.
-    fn forget(&mut self, ino: u64) {
-        if !self.names(ino).is_empty() {
+    pub(crate) fn forget(&mut self, ino: u64) {
+        if !self.names(ino).is_empty() || self.cloud_pinned(ino) {
             return;
         }
         #[derive(Deserialize)]
@@ -1610,7 +1636,7 @@ impl Db {
 
 /// Names and their inodes, with how many names each has: a directory, 2 and one for each
 /// directory in it.
-const NODE: &str = "SELECT n.path, i.id AS ino, i.owner, i.grp, i.mode, i.directory, i.file, i.size, i.link, i.rdev, i.acl, i.default_acl, CASE WHEN i.directory = 1 THEN 2 + (SELECT COUNT(*) FROM nodes c JOIN inodes ci ON ci.id = c.ino WHERE c.parent = n.path AND ci.directory = 1) ELSE (SELECT COUNT(*) FROM nodes m WHERE m.ino = i.id) END AS links FROM nodes n JOIN inodes i ON i.id = n.ino";
+const NODE: &str = "SELECT n.path, i.id AS ino, i.owner, i.grp, i.mode, i.directory, i.file, CAST(i.size AS TEXT) AS size, i.link, i.rdev, i.acl, i.default_acl, CASE WHEN i.directory = 1 THEN 2 + (SELECT COUNT(*) FROM nodes c JOIN inodes ci ON ci.id = c.ino WHERE c.parent = n.path AND ci.directory = 1) ELSE (SELECT COUNT(*) FROM nodes m WHERE m.ino = i.id) END AS links FROM nodes n JOIN inodes i ON i.id = n.ino";
 const JOB: &str =
     "SELECT id, owner, actor, kind, spec, state, progress, question, created FROM jobs";
 
@@ -1691,21 +1717,7 @@ impl kernel::Fs for Db {
         })
     }
     fn set_times(&mut self, ino: u64, atime: Option<(u64, u32)>, mtime: Option<(u64, u32)>) {
-        let (now, nanos) = crate::auth::clock();
-        let given = |time: Option<(u64, u32)>| match time {
-            Some((sec, nsec)) => [int(sec), int(nsec)],
-            None => [SqlStorageValue::Null, SqlStorageValue::Null],
-        };
-        let mut values = given(atime).to_vec();
-        values.extend(given(mtime));
-        values.extend([int(now), int(nanos), int(ino)]);
-        self.run(
-            "UPDATE inodes SET atime = COALESCE(?1, atime), atime_ns = COALESCE(?2, atime_ns), mtime = COALESCE(?3, mtime), mtime_ns = COALESCE(?4, mtime_ns), ctime = ?5, ctime_ns = ?6 WHERE id = ?7",
-            values,
-        );
-        for name in self.names(ino) {
-            changes(&name);
-        }
+        self.set_times_at(ino, atime, mtime, crate::auth::clock());
     }
     fn empty(&mut self, owner: u32, path: &str) -> String {
         let file = self.create_file(0, 1, None, owner, path, None, crate::auth::now());
@@ -2047,6 +2059,16 @@ impl Store for Db {
         self.end_sessions("key = ?", vec![text(key)]);
     }
     fn delete_sessions(&mut self, user: u32) {
+        let credentials = self.rows::<crate::creds::Credential>(
+            &format!(
+                "SELECT {} FROM credentials WHERE uid = ?",
+                crate::creds::columns()
+            ),
+            vec![int(user)],
+        );
+        for cred in credentials {
+            self.revoke(&cred.ns, &cred.token);
+        }
         self.end_sessions("uid = ?", vec![int(user)]);
     }
     fn delete_expired_sessions(&mut self, now: u64) {

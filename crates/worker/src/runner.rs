@@ -620,7 +620,7 @@ impl JobRunner {
             };
             let mut init = RequestInit::new();
             init.with_method(Method::Put);
-            init.with_body(Some(streams::fixed_length(stream, size as f64).into()));
+            init.with_body(Some(streams::fixed_length(stream, size).into()));
             let answer = fetcher
                 .fetch(format!("http://jobs{url}"), Some(init))
                 .await?;
@@ -646,7 +646,17 @@ impl JobRunner {
         init.with_body(Some(if size == 0 {
             JsValue::from_str("")
         } else {
-            streams::objects(self.env.bucket("FILES")?, parts).into()
+            if grant["chunk_size"].as_u64() == Some(0) {
+                crate::cloud_data::extent_stream(
+                    &self.env,
+                    serde_json::from_value(grant["extents"].clone())?,
+                    0,
+                    size,
+                )?
+                .into()
+            } else {
+                streams::objects(self.env.bucket("FILES")?, parts).into()
+            }
         }));
         let response = fetcher
             .fetch(format!("http://jobs{url}"), Some(init))
@@ -678,7 +688,7 @@ impl JobRunner {
         let ResponseBody::Stream(stream) = response.body() else {
             return Err(Error::RustError("the job container sent no content".into()));
         };
-        let data = Data::ReadableStream(streams::fixed_length(stream, length as f64));
+        let data = Data::ReadableStream(streams::fixed_length(stream, length));
         let bucket = self.env.bucket("FILES")?;
         let mut put = bucket.put(key, data);
         if let Some(bytes) = sha256.and_then(decode_hex) {

@@ -59,6 +59,31 @@ extern "C" {
 // function the module imports from it directly, which esbuild warns of as a duplicate key.
 #[wasm_bindgen(inline_js = "
 export function fixedLength(body, length) {
+  if (length >= 9007199254740992n) {
+    const reader = body.getReader();
+    let remaining = length;
+    return new ReadableStream({
+      async pull(c) {
+        try {
+          const { value, done } = await reader.read();
+          if (done) {
+            if (remaining) throw new Error('stream ended before expected length');
+            c.close();
+            return;
+          }
+          const n = BigInt(value.byteLength);
+          if (n > remaining) throw new Error('stream exceeded expected length');
+          remaining -= n;
+          c.enqueue(value);
+          if (!remaining) { await reader.cancel().catch(() => {}); c.close(); }
+        } catch (e) {
+          await reader.cancel(e).catch(() => {});
+          c.error(e);
+        }
+      },
+      cancel(why) { return reader.cancel(why); },
+    });
+  }
   const { readable, writable } = new FixedLengthStream(length);
   body.pipeTo(writable).catch(() => {});
   return readable;
@@ -67,7 +92,7 @@ export function fixedLength(body, length) {
 extern "C" {
     /// `body`, which must be exactly `length` bytes, as a stream R2 accepts.
     #[wasm_bindgen(js_name = fixedLength)]
-    pub fn fixed_length(body: &web_sys::ReadableStream, length: f64) -> web_sys::ReadableStream;
+    pub fn fixed_length(body: &web_sys::ReadableStream, length: u64) -> web_sys::ReadableStream;
 }
 
 /// `length` bytes of the R2 object `key`, from `offset`.
@@ -90,6 +115,74 @@ pub async fn object_range(
     }
 }
 
+#[wasm_bindgen(inline_js = "
+export function assetWindow(body, skip, length) {
+  const reader = body.getReader();
+  return new ReadableStream({
+    async pull(c) {
+      try {
+        while (length) {
+          const {value, done} = await reader.read();
+          if (done) throw new Error('truncated asset');
+          const len = BigInt(value.byteLength);
+          const start = skip > len ? value.byteLength : Number(skip); skip -= BigInt(start);
+          const rem = value.byteLength - start;
+          const n = length > BigInt(rem) ? rem : Number(length);
+          if (!n) continue;
+          c.enqueue(value.subarray(start, start + n)); length -= BigInt(n);
+          if (length) return;
+        }
+        await reader.cancel(); c.close();
+      } catch (e) { await reader.cancel(e).catch(()=>{}); c.error(e); }
+    },
+    cancel(why) { return reader.cancel(why); }
+  });
+}
+")]
+extern "C" {
+    #[wasm_bindgen(js_name = assetWindow)]
+    fn asset_window(
+        body: &web_sys::ReadableStream,
+        skip: u64,
+        length: u64,
+    ) -> web_sys::ReadableStream;
+}
+
+/// Stream a range of an immutable image/build asset, retaining its integrity checks.
+/// A binding may ignore Range and return 200; discard that prefix without buffering it.
+pub async fn asset_range(
+    env: &Env,
+    asset: &str,
+    offset: u64,
+    length: u64,
+) -> std::result::Result<web_sys::ReadableStream, JsValue> {
+    let fetch = async {
+        let headers = Headers::new();
+        headers.set("Range", &format!("bytes={offset}-{}", offset + length - 1))?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Get).with_headers(headers);
+        let request = Request::new_with_init(&format!("https://assets{asset}"), &init)?;
+        let response = if asset.starts_with("/boot/blobs/") {
+            crate::system::checked_asset(request, env).await?
+        } else {
+            env.assets("ASSETS")?.fetch_request(request).await?
+        };
+        let skip = match response.status_code() {
+            200 => offset,
+            206 => 0,
+            _ => return Err(Error::RustError("File content is unavailable".into())),
+        };
+        let response: web_sys::Response = response.into();
+        let body = response
+            .body()
+            .ok_or_else(|| Error::RustError("Missing asset body".into()))?;
+        Ok(asset_window(&body, skip, length))
+    };
+    fetch
+        .await
+        .map_err(|e: Error| JsValue::from_str(&e.to_string()))
+}
+
 /// The R2 objects `parts`, each (key, length), one after another, as one stream of their
 /// total length.
 pub fn objects(bucket: Bucket, parts: Vec<(String, u64)>) -> web_sys::ReadableStream {
@@ -107,5 +200,5 @@ pub fn objects(bucket: Bucket, parts: Vec<(String, u64)>) -> web_sys::ReadableSt
         })
     });
     let stream = concatenate(&next.into_js_value().into());
-    fixed_length(&stream, total as f64)
+    fixed_length(&stream, total)
 }

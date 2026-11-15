@@ -65,6 +65,7 @@ impl Filesystem for DelayedFs {
         fn walk(cred: &'a Cred, dir: &'a Handle, names: &'a [String]) -> Walked;
         fn parent(cred: &'a Cred, dir: &'a Handle) -> Option<(Entry, String)>;
         fn metadata(cred: &'a Cred, handle: &'a Handle) -> Metadata;
+        fn open_metadata(open: &'a OpenRef) -> Metadata;
         fn setattr(cred: &'a Cred, handle: &'a Handle, attr: &'a SetAttr) -> Metadata;
         fn read_dir(cred: &'a Cred, dir: &'a Handle) -> Vec<DirEntry>;
         fn read_link(cred: &'a Cred, link: &'a Handle) -> String;

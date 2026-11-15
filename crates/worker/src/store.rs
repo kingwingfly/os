@@ -131,6 +131,9 @@ impl DurableObject for OsAuthority {
                     // So does a device: a presentation unturned for long, a sound unkept; its
                     // followers hear so.
                     ("device", _, _) => dev::hangup(db, &id, true),
+                    ("vfs_session", _, _) => db.end_cloud_session(&id),
+                    ("vfs_upload", _, _) => db.expire_cloud_upload(&id),
+                    ("vfs_read", _, _) => db.end_cloud_read(&id),
                     ("credential", _, _) => db.expire_credential(&id, now),
                     _ => db.clear_expiry(&kind, &id),
                 }

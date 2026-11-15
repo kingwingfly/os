@@ -500,6 +500,14 @@ async fn bytes(
                     let bucket = env.bucket("FILES").map_err(io)?;
                     let mut data = Vec::new();
                     for (key, offset, length) in parts {
+                        let Some(key) = key else {
+                            data.resize(data.len() + length as usize, 0);
+                            continue;
+                        };
+                        if let Some(asset) = crate::system::asset(&key) {
+                            data.extend(asset_range(env, &asset, offset, length).await?);
+                            continue;
+                        }
                         let object = bucket
                             .get(&key)
                             .range(Range::OffsetWithLength { offset, length })

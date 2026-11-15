@@ -459,8 +459,8 @@ fn discard(db: &mut Db, sid: &str, who: &Identity, fd: u32, caller: Option<&str>
 fn close(db: &mut Db, sid: &str, who: &Identity, fd: u32, caller: Option<&str>) -> Result<Closed> {
     let found = db.fd(sid, fd).ok_or(Errno::EBADF)?;
     owned(&found, caller)?;
-    release(db, sid, fd);
     if found.file.is_none() {
+        release(db, sid, fd);
         return match found.device {
             Some(device) => Ok(Closed {
                 path: device,
@@ -477,7 +477,10 @@ fn close(db: &mut Db, sid: &str, who: &Identity, fd: u32, caller: Option<&str>) 
             None => Err(Error::because(Errno::EBADF, ELSEWHERE)),
         };
     }
+    // Resolve the close result while the descriptor still pins its immutable content.
+    // Releasing an unlinked file's last descriptor may collect that content immediately.
     let closed = closing(db, &acting(&found, who), &found);
+    release(db, sid, fd);
     // A new file removed while it was written goes with its last descriptor, as an unlinked
     // file does on Linux.
     if let Some(file) = found.file.as_deref().and_then(|id| db.file(id))
@@ -652,11 +655,11 @@ fn clone(
 }
 
 /// What pread(2) reads: bytes the kernel has (a file it writes as it is read, a device's state),
-/// or those of R2 objects, each (key, offset, length); and the file's size, what may be read of
-/// it now.
+/// or those of R2 objects, each (key, offset, length), with no key for sparse holes; and the
+/// file's size, what may be read of it now.
 pub enum Read {
     Bytes(Vec<u8>, u64),
-    Chunks(Vec<(String, u64, u64)>, u64),
+    Chunks(Vec<(Option<String>, u64, u64)>, u64),
     /// Of a binary of /usr: the Worker's asset, from an offset, so many bytes; and its size.
     Asset(String, u64, u64, u64),
     /// A file of /proc that tells of processes: read it again with the machine's list.
@@ -745,6 +748,16 @@ pub fn pread(
     let file = db.file(&content).ok_or(Errno::EBADF)?;
     let size = db.readable(&file);
     let end = size.min(offset.saturating_add(count));
+    if file.chunk_size == 0 {
+        return Ok(Read::Chunks(
+            crate::cloud_data::extent_parts(
+                db.extents(&file.id),
+                offset,
+                end.saturating_sub(offset),
+            ),
+            size,
+        ));
+    }
     let mut parts = Vec::new();
     if offset < end {
         let keys: std::collections::HashMap<u64, String> = db
@@ -757,7 +770,7 @@ pub fn pread(
             let from = offset.max(start) - start;
             let to = end.min(start + file.chunk_size) - start;
             let key = keys.get(&index).ok_or(Errno::EIO)?;
-            parts.push((key.clone(), from, to - from));
+            parts.push((Some(key.clone()), from, to - from));
         }
     }
     Ok(Read::Chunks(parts, size))
