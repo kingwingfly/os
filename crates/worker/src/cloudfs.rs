@@ -161,6 +161,10 @@ pub(super) fn caller(db: &mut Db, session: &wire::Session, token: &str) -> Resul
     })
 }
 impl Caller {
+    /// The presenting credential decides metadata effects of an authorized operation.
+    pub(super) fn actor(&self) -> &Credential {
+        &self.credential
+    }
     pub(super) fn io(
         &self,
         token: &str,
@@ -267,7 +271,7 @@ impl Caller {
             access,
         })
     }
-    pub(super) fn opened(&self, db: &Db, open: &OpenRef) -> Result<(Node, Credential)> {
+    pub(super) fn opened(&self, db: &Db, open: &OpenRef) -> Result<Node> {
         let row = db
             .rows::<OpenRow>("SELECT * FROM vfs_opens WHERE id = ?", vec![int(open.id)])
             .pop()
@@ -278,17 +282,17 @@ impl Caller {
         if row.revoked != 0 {
             return Err(Errno::EACCES);
         }
-        let credential = db
+        let opener = db
             .credential_of(&row.credential, &self.session.ns)
             .ok_or(Errno::EACCES)?;
-        credential.cloud().map_err(|_| Errno::EACCES)?;
+        opener.cloud().map_err(|_| Errno::EACCES)?;
         if row.ino != open.node.ino
             || open.node.generation != 1
             || row.access != serde_json::to_string(&open.access).map_err(|_| Errno::EIO)?
         {
             return Err(Errno::EACCES);
         }
-        Ok((db.inode(row.ino).ok_or(Errno::ESTALE)?, credential))
+        db.inode(row.ino).ok_or(Errno::ESTALE)
     }
 }
 fn join(dir: &str, name: &str) -> String {
@@ -338,13 +342,7 @@ fn check_home(db: &Db, uid: u32, path: &str) -> Result<()> {
     }
     Ok(())
 }
-fn make(
-    db: &mut Db,
-    c: &Caller,
-    dir: &Handle,
-    name: &str,
-    node: impl FnOnce(&Node) -> Node,
-) -> Result<Node> {
+fn new_name(db: &Db, c: &Caller, dir: &Handle, name: &str) -> Result<(Node, String)> {
     check_component(name)?;
     let (parent, path) = c.dir(db, dir, EXEC)?;
     let path = join(&path, name);
@@ -353,6 +351,16 @@ fn make(
     }
     inode::may_create(&c.credential.identity(), &parent, false)?;
     check_home(db, c.credential.uid, &path)?;
+    Ok((parent, path))
+}
+fn make(
+    db: &mut Db,
+    c: &Caller,
+    dir: &Handle,
+    name: &str,
+    node: impl FnOnce(&Node) -> Node,
+) -> Result<Node> {
+    let (parent, path) = new_name(db, c, dir, name)?;
     db.set_node(&path, &node(&parent));
     db.persisted_node(&path).ok_or(Errno::EIO)
 }
@@ -593,11 +601,24 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             if rdev.is_empty() || rdev.len() > 255 {
                 return Err(Errno::EINVAL);
             }
-            let node = make(db, &c, dir, name, |p| {
-                let mut n = permissions::created(&who, p, *mode, false, c.credential.umask);
-                n.rdev = Some(rdev.clone());
-                n
-            })?;
+            if !matches!(rdev.as_str(), "present" | "snd") {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            let (_, path) = new_name(db, &c, dir, name)?;
+            // The driver creates its inode, live state and expiry together. Unlike the
+            // path driver's replace operation, VFS mknod requires an unused name.
+            crate::dev::mknod(
+                db,
+                &kernel::Process {
+                    cred: who.clone(),
+                    umask: c.credential.umask,
+                },
+                &path,
+                *mode,
+                rdev,
+            )
+            .map_err(|error| error.errno)?;
+            let node = db.persisted_node(&path).ok_or(Errno::EIO)?;
             json!(c.entry(db, &node))
         }
         Symlink { dir, name, target } => {
@@ -607,6 +628,10 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         }
         Link { target, dir, name } => {
             let node = c.node(db, target)?;
+            // These drivers identify devices by pathname and cannot serve an alias.
+            if node.is_device() {
+                return Err(Errno::EPERM);
+            }
             inode::may_link(&who, &node)?;
             if node.links == 0 {
                 return Err(Errno::ENOENT);
@@ -762,11 +787,11 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             Value::Null
         }
         SetLen { open, size } => {
-            let (mut node, cred) = c.opened(db, open)?;
+            let mut node = c.opened(db, open)?;
             if !open.access.writes() {
                 return Err(Errno::EINVAL);
             }
-            db.cloud_truncate(&mut node, *size, &cred)?;
+            db.cloud_truncate(&mut node, *size, c.actor())?;
             Value::Null
         }
         Sync { open, .. } => {
@@ -865,6 +890,18 @@ fn rename(
     }
     if source.directory && parent.ino != dest_parent.ino {
         inode::require(&who, &source, WRITE)?;
+    }
+    // Only usermod moves a registered home and updates the account's path. Match a whole
+    // path component, including homes not created yet.
+    if source.directory
+        && !db
+            .rows::<Value>(
+                "SELECT 1 FROM users WHERE home = ? OR instr(home, ?) = 1 LIMIT 1",
+                vec![text(&old), text(&format!("{old}/"))],
+            )
+            .is_empty()
+    {
+        return Err(Errno::EBUSY);
     }
     if let Some(target) = db.persisted_node(&new) {
         db.set_times(target.ino, None, None);
@@ -982,7 +1019,7 @@ fn locks(db: &mut Db, c: &Caller, call: &Call) -> Result<Value> {
         }
         _ => return Err(Errno::EINVAL),
     };
-    let (node, _) = c.opened(db, open)?;
+    let node = c.opened(db, open)?;
     advisory::validate(open.access, family, kind, range)?;
     let mut state = db.cloud_locks(node.ino);
     let out = match call {

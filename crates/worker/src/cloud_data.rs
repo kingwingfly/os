@@ -186,7 +186,7 @@ fn prepare(db: &mut Db, request: &DataRequest) -> FsResult<Value> {
         return Err(Errno::EPROTONOSUPPORT);
     }
     let c = cloudfs::caller(db, &request.session, &request.credential)?;
-    let (node, _) = c.opened(db, &request.open)?;
+    let node = c.opened(db, &request.open)?;
     match request.operation {
         DataOperation::Read { offset, length } => {
             regular(&node, &request.open, false)?;
@@ -240,7 +240,7 @@ fn commit(db: &mut Db, request: &DataRequest, id: &str) -> FsResult<Value> {
         return Err(Errno::EPROTONOSUPPORT);
     }
     let c = cloudfs::caller(db, &request.session, &request.credential)?;
-    let (mut node, cred) = c.opened(db, &request.open)?;
+    let mut node = c.opened(db, &request.open)?;
     regular(&node, &request.open, true)?;
     let upload = db
         .rows::<Upload>("SELECT * FROM vfs_uploads WHERE id = ?", vec![text(id)])
@@ -299,7 +299,7 @@ fn commit(db: &mut Db, request: &DataRequest, id: &str) -> FsResult<Value> {
             source: None,
         });
         let size = node.size.max(end);
-        db.replace_content(&mut node, size, extents, &cred)?;
+        db.replace_content(&mut node, size, extents, c.actor())?;
     } else {
         db.discard(&format!("vfs/{id}"));
     }

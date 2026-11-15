@@ -57,7 +57,7 @@ The [README architecture](README.md#client-os-and-remote-services) and #44 defin
 
 These are current behaviors. A #44 change to them needs a deliberate decision and denial tests rather than an accidental UI/API change; no migration of existing accounts or sessions is needed.
 
-- Individual signed-out identities are `guest-<id>` in group guest, uid 1,000,000–1,999,999. Use `is_guest_id`; reserved uid/gid 65534 is the fallback/group. Shared `/guest` is sticky; `useradd -m` creates a private home.
+- Individual signed-out identities are `guest-<id>` in group guest, uid 1,000,000–1,999,999. Use `is_guest_id`; reserved uid/gid 65534 is the fallback/group. Shared `/guest` is sticky; `useradd -m` creates a private home. Both namespace protocols reject renaming registered homes or their containing directories; use `usermod -d HOME -m NAME` to move an existing home with its account record.
 - Guest cannot sudo; ordinary sudo callers need wheel membership, rechecked for explicit requests. `sudo COMMAND` elevates that command only; the credential cache lasts five minutes. `su` uses the target password except for authorized root switching. Current `sudo -u USER` switches the browser account without accepting a trailing command.
 - Logout/exit revokes the browser session and returns to guest without a nested account stack. Existing process snapshots remain separate; explicit login shutdown is a different lifecycle operation. Locking/account changes revoke old sessions; unlocking never revives them.
 - `passwd --force` skips the minimum length only; the password must remain nonempty and within 512 bytes. Permission failures never implicitly sign in as root.

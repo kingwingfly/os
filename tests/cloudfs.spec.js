@@ -479,3 +479,113 @@ test('exec and path creation are rejected without adding names or changing exist
     await c.call('disconnect');
   }
 });
+test('registered homes and their containing directories require usermod to move',async({request})=>{
+  const {c,dir}=await setup(request);const baseName=(await c.call('parent',{dir}))[1];const base='/'+baseName;
+  const name='home-'+randomUUID().slice(0,12);const pending=name+'-pending';const path=base+'/homes/account';
+  const accountHome=async user=>Buffer.from((await call(request,{pread:{path:'/etc/passwd',offset:0,count:262144}})).data,'base64').toString().split('\n').find(line=>line.startsWith(user+':')).split(':')[5];
+  try {
+    await call(request,{useradd:{name,home:path,create_home:true}});
+    const homes=(await c.call('lookup',{dir,name:'homes'})).handle;const home=(await c.call('lookup',{dir:homes,name:'account'})).handle;
+    await c.call('mkdir',{dir,name:'reserved',mode:0o755});
+    await call(request,{useradd:{name:pending,home:base+'/reserved/unmade'}});
+    const [,open]=await c.create(home,'kept');await c.write(open,'home data');
+    const before=await c.call('metadata',{handle:home});
+    expect((await sys(request,[{rename:{from:path,to:base+'/homes/moved'}}]))[0].err.errno).toBe('EBUSY');
+    for(const flags of ['','NOREPLACE'])for(const [parent,from] of [[homes,'account'],[dir,'homes'],[dir,'reserved'],[c.root,baseName]]) {
+      await c.call('rename',{from_dir:parent,from,to_dir:parent,to:from+'-moved',flags},'EBUSY');
+      await c.call('lookup',{dir:parent,name:from+'-moved'},'ENOENT');
+    }
+    expect(await accountHome(name)).toBe(path);expect(await accountHome(pending)).toBe(base+'/reserved/unmade');
+    expect(await c.call('metadata',{handle:home})).toEqual(before);
+    await c.call('rename',{from_dir:homes,from:'account',to_dir:homes,to:'account',flags:''});
+    await c.call('mkdir',{dir,name:'home',mode:0o755});
+    await c.call('rename',{from_dir:dir,from:'home',to_dir:dir,to:'home-moved',flags:''});
+    await call(request,{usermod:{name,home:base+'/relocated',move_home:true}});
+    expect(await accountHome(name)).toBe(base+'/relocated');
+    expect((await c.call('lookup',{dir,name:'relocated'})).handle.node).toEqual(home.node);
+    expect((await c.read(open)).toString()).toBe('home data');
+    await c.call('rename',{from_dir:dir,from:'relocated',to_dir:dir,to:'again',flags:''},'EBUSY');
+  } finally {
+    await c.call('disconnect');await sys(request,[{userdel:{name,remove:true}},{userdel:{name:pending,remove:true}},{groupdel:{name}},{groupdel:{name:pending}}]);await rmrf(request,base);
+  }
+});
+for(const operation of ['write','truncate'])test(`${operation} privilege bits follow the actor independently of the opener`,async({request})=>{
+  const {c,dir,p}=await setup(request);const [entry,rootOpen]=await c.create(dir,'privileged',0o666);
+  await c.call('setattr',{handle:entry.handle,attr:attrs({mode:0o666})});
+  await api(request,'logout');const guest=await admit(request);
+  const guestOpen=await rpc(request,guest.token,c.session,{open:{ticket:randomUUID(),handle:entry.handle,options:options()}});
+  try {
+    for(const open of [rootOpen,guestOpen])for(const actor of [guest,p])for(const mode of [0o6755,0o6744]) {
+      await c.call('set_len',{open:rootOpen,size:4});await c.call('setattr',{handle:entry.handle,attr:attrs({mode})});
+      c.token=actor.token;c.pid=actor.pid;
+      if(operation==='write') {
+        await c.write(open,'',{offset:0});expect((await c.call('metadata',{handle:entry.handle})).mode).toBe(mode);
+        await c.write(open,'x',{offset:0});
+      } else {
+        await rpc(request,actor.token,c.session,{set_len:{open,size:2}});
+      }
+      const expected=actor===p?mode:mode===0o6755?0o755:0o2744;
+      expect((await c.call('metadata',{handle:entry.handle})).mode).toBe(expected);
+    }
+    await call(request,{kill:{pid:String(guest.pid),signal:9}});
+    c.token=p.token;c.pid=p.pid;
+    if(operation==='write')await c.data(guestOpen,{write:{at:'end',length:1}},Buffer.from('x'),'EACCES');
+    else await c.call('set_len',{open:guestOpen,size:0},'EACCES');
+  } finally {
+    await c.call('disconnect');
+  }
+});
+test('driver-backed device creation initializes usable state and rejects unsupported drivers',async({request})=>{
+  const {c,dir}=await setup(request);const name='created-'+randomUUID().slice(0,12);const paths=[];
+  try {
+    for(const driver of ['present','snd']) {
+      const parent=(await c.call('walk',{dir:c.root,names:['dev',driver]})).entries.at(-1).handle;
+      const path='/dev/'+driver+'/'+name;paths.push(path);
+      const entry=await c.call('mknod',{dir:parent,name,mode:0o666,rdev:driver});
+      expect(entry.metadata).toMatchObject({file_type:'char-device',rdev:driver,mode:0o644,uid:0,nlink:1});
+      const opened=await call(request,{open:{path,flags:2}});expect(opened.device).toBe(driver);
+      await c.call('mknod',{dir:parent,name,mode:0o600,rdev:driver},'EEXIST');
+      expect((await c.call('lookup',{dir:parent,name})).handle.node).toEqual(entry.handle.node);
+      const state=JSON.parse(Buffer.from((await call(request,{pread:{fd:opened.fd,offset:0,count:4096}})).data,'base64').toString());
+      expect(state).toMatchObject({device:path,owner:'root'});
+      if(driver==='present')expect(state.asks).toEqual([]);else expect(state.live).toBe(false);
+      await c.call('unlink',{dir:parent,name});
+      expect((await sys(request,[{ioctl:{fd:opened.fd,request:0x5002,arg:{}}}]))[0].err.errno).toBe('EBADF');
+    }
+    for(const [rdev,errno] of [['unknown-driver','EOPNOTSUPP'],['present','EPERM'],['snd','EPERM'],['','EINVAL']]) {
+      await c.call('mknod',{dir,name:'unsupported',mode:0o600,rdev},errno);
+      await c.call('lookup',{dir,name:'unsupported'},'ENOENT');
+    }
+    await api(request,'logout');const guest=await admit(request);
+    await rpc(request,guest.token,c.session,{mknod:{dir,name:'guest-device',mode:0o600,rdev:'present'}},'EPERM');
+    await c.call('lookup',{dir,name:'guest-device'},'ENOENT');
+  } finally {
+    // Also repairs the inode-only result when running this probe against the old code.
+    for(const path of paths)await sys(request,[{unlink:{path}}]);
+    await c.call('disconnect');
+  }
+});
+test('device hardlinks are denied for both root and the device owner without creating aliases',async({request})=>{
+  const {c,dir}=await setup(request);const base='/'+(await c.call('parent',{dir}))[1];const name='linkdev-'+randomUUID().slice(0,12);
+  const account=await contexts.newContext({extraHTTPHeaders:{'CF-Connecting-IP':'cloudfs-'+randomUUID()}});let user;const paths=[];
+  try {
+    await call(account,'getcreds');expect((await api(account,'register',{data:{username:name,password,create_home:true}})).ok()).toBe(true);
+    user=await connection(account,await admit(account));const identity=await call(account,'getcreds');
+    const home=(await user.call('walk',{dir:user.root,names:identity.home.split('/').filter(Boolean)})).entries.at(-1).handle;
+    for(const driver of ['present','snd']) {
+      const path='/dev/'+driver+'/'+name;paths.push(path);await call(account,{mknod:{path,mode:0o644,rdev:driver}});
+      expect((await sys(request,[{link:{from:path,to:base+'/legacy-'+driver,follow:false}}]))[0].err.errno).toBe('EPERM');
+      for(const [client,dest] of [[c,dir],[user,home]]) {
+        const parent=(await client.call('walk',{dir:client.root,names:['dev',driver]})).entries.at(-1).handle;
+        const device=await client.call('lookup',{dir:parent,name});
+        await client.call('link',{target:device.handle,dir:dest,name:'alias-'+driver},'EPERM');
+        await client.call('lookup',{dir:dest,name:'alias-'+driver},'ENOENT');
+        expect((await client.call('metadata',{handle:device.handle})).nlink).toBe(1);
+      }
+      await call(account,{unlink:{path}});
+    }
+  } finally {
+    if(user)await user.call('disconnect');for(const path of paths)await sys(request,[{unlink:{path}}]);
+    await account.dispose();await sys(request,[{userdel:{name,remove:true}}]);await c.call('disconnect');await rmrf(request,base);
+  }
+});
