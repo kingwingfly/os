@@ -49,7 +49,17 @@ impl Locks {
                 .waits
                 .iter()
                 .take_while(|w| Some(w.ticket.as_str()) != ticket)
-                .any(|w| !w.granted && w.lock.conflicts(lock))
+                .any(|w| !w.granted && self.queue_blocks(&w.lock, lock))
+    }
+    fn queue_blocks(&self, earlier: &Held, lock: &Held) -> bool {
+        // A waiter that needs this owner's existing locks must not prevent that owner from
+        // updating them. Otherwise a reapply/downgrade creates a false wait cycle. Actual
+        // held conflicts still block, and new contenders keep their queue order.
+        earlier.conflicts(lock)
+            && !self
+                .held
+                .iter()
+                .any(|held| held.owner == lock.owner && held.conflicts(earlier))
     }
     pub fn carve(&mut self, owner: u64, family: LockFamily, range: LockRange) {
         self.held = std::mem::take(&mut self.held)
@@ -106,8 +116,13 @@ impl Locks {
             lock.ticket = Some(ticket.into());
         }
         // flock conversion releases the old lock before waiting, as Linux documents.
-        if lock.family == LockFamily::Flock {
+        if lock.family == LockFamily::Flock
+            && self.held.iter().any(|held| {
+                held.owner == lock.owner && held.family == lock.family && held.kind != lock.kind
+            })
+        {
             self.carve(lock.owner, lock.family, LockRange::WHOLE);
+            self.wake();
         }
         let blocked = self.blocked(&lock, None);
         if blocked && ticket.is_none() {
@@ -123,7 +138,7 @@ impl Locks {
             reachable.extend(
                 self.waits
                     .iter()
-                    .filter(|w| !w.granted && w.lock.conflicts(&lock))
+                    .filter(|w| !w.granted && self.queue_blocks(&w.lock, &lock))
                     .map(|w| w.lock.owner),
             );
             loop {
@@ -149,7 +164,7 @@ impl Locks {
                             reachable.extend(
                                 table.waits[..i]
                                     .iter()
-                                    .filter(|p| !p.granted && p.lock.conflicts(&w.lock))
+                                    .filter(|p| !p.granted && table.queue_blocks(&p.lock, &w.lock))
                                     .map(|p| p.lock.owner),
                             );
                         }

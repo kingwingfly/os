@@ -622,6 +622,9 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         }
         Setattr { handle, attr } => {
             let mut node = c.node(db, handle)?;
+            if *attr == SetAttr::default() {
+                return Ok(json!(metadata(db, &node)));
+            }
             if let Some(mode) = attr.mode {
                 inode::chmod(&who, &mut node, mode)?;
             }

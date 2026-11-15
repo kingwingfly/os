@@ -168,3 +168,77 @@ test('account lock revokes open grants and unlocking never revives them',async({
     await rpc(account,guest.token,c.session,'disconnect');
   }finally{await account.dispose();await call(request,{userdel:{name,remove:true}});await admin.call('disconnect');}
 });
+test('inline pread reads extents, object offsets and sparse holes through paths and retained descriptors',async({request})=>{
+  const {c,dir}=await setup(request);const [entry,open]=await c.create(dir,'inline');
+  const name=(await c.call('parent',{dir}))[1];const path='/'+name+'/inline';
+  const pread=async(target,offset,count)=>{
+    const result=await call(request,{pread:{...target,offset,count}});
+    return {bytes:Buffer.from(result.data,'base64'),size:result.size};
+  };
+  await c.write(open,'hello');expect(await pread({path},0,20)).toEqual({bytes:Buffer.from('hello'),size:5});
+  await c.call('set_len',{open,size:12});await c.write(open,'XYZ',{offset:8});await c.write(open,'AB',{offset:1});
+  await c.call('set_len',{open,size:10});await c.call('set_len',{open,size:14});
+  const bytes=Buffer.from([104,65,66,108,111,0,0,0,88,89,0,0,0,0]);
+  expect(await pread({path},0,30)).toEqual({bytes,size:bytes.length});
+  for(const offset of [1,3,5,7,9,10,13,14,99]){
+    expect(await pread({path},offset,5)).toEqual({bytes:bytes.subarray(offset,offset+5),size:bytes.length});
+  }
+  expect(await pread({path},3,0)).toEqual({bytes:Buffer.alloc(0),size:14});
+  const {fd}=await call(request,{open:{path,flags:0,mode:0}});
+  try{
+    await c.call('rename',{from_dir:dir,from:'inline',to_dir:dir,to:'moved',flags:''});
+    await c.call('unlink',{dir,name:'moved'});await c.call('release',{open});
+    expect(await pread({fd},0,30)).toEqual({bytes,size:bytes.length});
+  }finally{await call(request,{close:{fd}});}
+  const [,hole]=await c.create(dir,'hole');await c.call('set_len',{open:hole,size:7});
+  expect(await pread({path:'/'+name+'/hole'},0,10)).toEqual({bytes:Buffer.alloc(7),size:7});
+  await c.call('unlink',{dir,name:'hole'});await c.call('release',{open:hole});await c.call('disconnect');
+});
+test('I/O-denied reads release their prepared manifests before session renewal',async({request})=>{
+  const {c,dir,p}=await setup(request);const group='/user/cloudfs-'+randomUUID();
+  await call(request,{cgroup_create:{path:group}});await call(request,{cgroup_attach:{pid:p.pid,path:group}});
+  const baseline=(await c.call('statfs')).blocks;const [entry,open]=await c.create(dir,'denied');
+  try{
+    await c.write(open,Buffer.alloc(4096,42));expect((await c.call('statfs')).blocks).toBe(baseline+1);
+    await call(request,{cgroup_set:{path:group,key:'io.max',value:'rbps=0'}});
+    for(let i=0;i<3;i++)await c.data(open,{read:{offset:0,length:4096}},undefined,'EAGAIN');
+    await c.call('unlink',{dir,name:'denied'});await c.call('release',{open});
+    await c.call('metadata',{handle:entry.handle},'ESTALE');
+    expect((await c.call('statfs')).blocks).toBe(baseline);
+    await c.call('renew');expect((await c.call('statfs')).blocks).toBe(baseline);
+  }finally{
+    await c.call('disconnect');await call(request,{cgroup_attach:{pid:p.pid,path:'/user'}});
+    await call(request,{cgroup_remove:{path:group}});
+  }
+});
+test('flock conversion wakes queued owners and POSIX updates preserve ownership and queue order',async({request})=>{
+  const {c,dir}=await setup(request);const [entry,a]=await c.create(dir,'locks');const b=await c.open(entry.handle);const d=await c.open(entry.handle);
+  const range={start:0,end:null};const lock=(open,family,kind='exclusive')=>({open,family,kind,range});
+  await c.call('try_lock',lock(a,'flock'));const flockTicket=randomUUID();
+  expect(await c.call('lock',{...lock(b,'flock'),ticket:flockTicket})).toBe(false);
+  await c.call('try_lock',lock(a,'flock'));await c.call('try_lock',lock(a,'flock','shared'),'EAGAIN');
+  expect(await c.call('lock',{...lock(b,'flock'),ticket:flockTicket})).toBe(true);
+  await c.call('ack_lock',{open:b,ticket:flockTicket});await c.call('try_lock',lock(d,'flock'),'EAGAIN');
+  await c.call('try_lock',lock(a,'posix'));const writer=randomUUID(),reader=randomUUID(),downgrade=randomUUID();
+  expect(await c.call('lock',{...lock(b,'posix'),ticket:writer})).toBe(false);
+  await c.call('try_lock',lock(a,'posix'));
+  expect(await c.call('lock',{...lock(a,'posix','shared'),ticket:downgrade})).toBe(true);
+  await c.call('ack_lock',{open:a,ticket:downgrade});
+  expect(await c.call('lock',{...lock(d,'posix','shared'),ticket:reader})).toBe(false);
+  await c.call('unlock',{open:a,family:'posix',range});
+  expect(await c.call('lock',{...lock(b,'posix'),ticket:writer})).toBe(true);
+  expect(await c.call('lock',{...lock(d,'posix','shared'),ticket:reader})).toBe(false);
+  await c.call('release',{open:b});expect(await c.call('lock',{...lock(d,'posix','shared'),ticket:reader})).toBe(true);
+  await c.call('disconnect');
+});
+test('empty setattr preserves metadata for both owners and non-owners',async({request})=>{
+  const {c,dir}=await setup(request);const [entry,open]=await c.create(dir,'no-op');await c.write(open,'unchanged');
+  const before=await c.call('metadata',{handle:entry.handle});
+  expect(await c.call('setattr',{handle:entry.handle,attr:attrs()})).toEqual(before);
+  await api(request,'logout');const guest=await admit(request);
+  expect(await rpc(request,guest.token,c.session,{setattr:{handle:entry.handle,attr:attrs()}})).toEqual(before);
+  await rpc(request,guest.token,c.session,{setattr:{handle:entry.handle,attr:attrs({mode:0o777})}},'EPERM');
+  expect(await c.call('metadata',{handle:entry.handle})).toEqual(before);
+  await c.call('unlink',{dir,name:'no-op'});await c.call('release',{open});
+  await c.call('setattr',{handle:entry.handle,attr:attrs()},'ESTALE');await c.call('disconnect');
+});

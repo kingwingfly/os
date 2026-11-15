@@ -189,6 +189,66 @@ fn durable_posix_deadlock_detection_crosses_inodes_and_unlock_splits_ranges() {
     assert!(b.conflict(&held(3, 0, Some(1))).is_some());
 }
 #[test]
+fn flock_conversion_wakes_waiters_even_when_the_conversion_would_block() {
+    let mut locks = Locks::default();
+    let mut a = held(1, 0, None);
+    a.family = LockFamily::Flock;
+    let b = Held {
+        owner: 2,
+        ..a.clone()
+    };
+    assert_eq!(locks.acquire(a.clone(), None, &[]), Ok(true));
+    assert_eq!(locks.acquire(b.clone(), Some("wait"), &[]), Ok(false));
+    // Reapplying the same flock keeps ownership; converting it releases ownership first.
+    assert_eq!(locks.acquire(a.clone(), None, &[]), Ok(true));
+    a.kind = LockKind::Shared;
+    assert_eq!(locks.acquire(a, None, &[]), Err(Errno::EAGAIN));
+    let mut restored: Locks = serde_json::from_value(json!(locks)).unwrap();
+    assert_eq!(restored.acquire(b, Some("wait"), &[]), Ok(true));
+    assert_eq!(restored.held.len(), 1);
+    assert_eq!(restored.held[0].owner, 2);
+}
+#[test]
+fn posix_owner_can_reapply_and_downgrade_without_bypassing_held_conflicts() {
+    let mut locks = Locks::default();
+    let mut a = held(1, 0, None);
+    let b = held(2, 0, None);
+    let c = Held {
+        kind: LockKind::Shared,
+        ..held(3, 0, None)
+    };
+    assert_eq!(locks.acquire(a.clone(), None, &[]), Ok(true));
+    assert_eq!(locks.acquire(b.clone(), Some("writer"), &[]), Ok(false));
+    assert_eq!(locks.acquire(a.clone(), None, &[]), Ok(true));
+    a.kind = LockKind::Shared;
+    assert_eq!(locks.acquire(a.clone(), Some("downgrade"), &[]), Ok(true));
+    // New readers stay behind the writer, even though the held lock is now shared.
+    assert_eq!(locks.acquire(c.clone(), Some("reader"), &[]), Ok(false));
+    assert_eq!(locks.acquire(b.clone(), Some("writer"), &[]), Ok(false));
+    locks.release(1);
+    assert_eq!(locks.acquire(b, Some("writer"), &[]), Ok(true));
+    assert_eq!(locks.acquire(c.clone(), Some("reader"), &[]), Ok(false));
+    locks.release(2);
+    assert_eq!(locks.acquire(c, Some("reader"), &[]), Ok(true));
+    assert_eq!(locks.acquire(a.clone(), None, &[]), Ok(true));
+    a.kind = LockKind::Exclusive;
+    assert_eq!(locks.acquire(a, None, &[]), Err(Errno::EAGAIN));
+}
+#[test]
+fn posix_downgrade_wakes_shared_waiters() {
+    let mut locks = Locks::default();
+    let mut a = held(1, 0, None);
+    let b = Held {
+        kind: LockKind::Shared,
+        ..held(2, 0, None)
+    };
+    assert_eq!(locks.acquire(a.clone(), None, &[]), Ok(true));
+    assert_eq!(locks.acquire(b.clone(), Some("reader"), &[]), Ok(false));
+    a.kind = LockKind::Shared;
+    assert_eq!(locks.acquire(a, None, &[]), Ok(true));
+    assert_eq!(locks.acquire(b, Some("reader"), &[]), Ok(true));
+}
+#[test]
 fn acknowledged_locks_do_not_accumulate_wait_records() {
     let mut state = Locks::default();
     for n in 0..5000 {

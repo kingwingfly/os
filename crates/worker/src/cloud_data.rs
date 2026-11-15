@@ -384,6 +384,11 @@ pub async fn gateway(req: Request, env: &Env) -> Result<Response> {
         if let Err(error) =
             crate::resources::io(env, io.ns, Some(io.token), io.pid, io.write, io.bytes).await
         {
+            let cleanup = match request.operation {
+                DataOperation::Read { .. } => "/internal/fs/read-done",
+                DataOperation::Write { .. } => "/internal/fs/abandon",
+            };
+            let _ = ask(env, cleanup, &request, Some(id)).await;
             return crate::resources::refused(error);
         }
     }
@@ -454,16 +459,16 @@ extern "C" {
     #[wasm_bindgen(js_name=zeroBytes)]
     fn zeros(length: f64) -> web_sys::ReadableStream;
 }
-/// Extents clipped to the requested range, with bounded-memory zero streams for holes.
-pub fn extent_stream(
-    bucket: Bucket,
+/// Clip extents to a read, including holes (no object key). Both inline and streamed readers
+/// use the same ranges, including offsets into objects shared by multiple manifests.
+pub(crate) fn extent_parts(
     extents: Vec<Extent>,
     offset: u64,
     length: u64,
-) -> web_sys::ReadableStream {
+) -> Vec<(Option<String>, u64, u64)> {
     let end = offset + length;
     let mut at = offset;
-    let mut parts = VecDeque::new();
+    let mut parts = Vec::new();
     for e in extents {
         if e.start >= end {
             break;
@@ -474,15 +479,26 @@ pub fn extent_stream(
             continue;
         }
         if from > at {
-            parts.push_back((None, 0, from - at));
+            parts.push((None, 0, from - at));
         }
-        parts.push_back((Some(e.key), e.offset + from - e.start, to - from));
+        parts.push((Some(e.key), e.offset + from - e.start, to - from));
         at = to;
     }
     if at < end {
-        parts.push_back((None, 0, end - at));
+        parts.push((None, 0, end - at));
     }
-    let parts = Rc::new(RefCell::new(parts));
+    parts
+}
+/// Extents clipped to the requested range, with bounded-memory zero streams for holes.
+pub fn extent_stream(
+    bucket: Bucket,
+    extents: Vec<Extent>,
+    offset: u64,
+    length: u64,
+) -> web_sys::ReadableStream {
+    let parts = Rc::new(RefCell::new(VecDeque::from(extent_parts(
+        extents, offset, length,
+    ))));
     let bucket = Rc::new(bucket);
     let next = Closure::<dyn FnMut() -> js_sys::Promise>::new(move || {
         let part = parts.borrow_mut().pop_front();
