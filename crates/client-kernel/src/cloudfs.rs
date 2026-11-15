@@ -705,14 +705,15 @@ impl Kernel {
                 previous.cancel();
             }
             let result = cancel.run(file.lock(family, kind, range)).await;
-            let mut waits = cloud.waits.borrow_mut();
-            if waits
-                .get(&key)
-                .is_some_and(|current| Rc::ptr_eq(current, &cancel))
             {
-                waits.remove(&key);
+                let mut waits = cloud.waits.borrow_mut();
+                if waits
+                    .get(&key)
+                    .is_some_and(|current| Rc::ptr_eq(current, &cancel))
+                {
+                    waits.remove(&key);
+                }
             }
-            drop(waits);
             if result.is_err() {
                 // A wait given up owes its cancellation now, not at the next call.
                 let _ = cloud.fs.drain().await;
