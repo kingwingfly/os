@@ -960,3 +960,261 @@ fn multi_tab_flock_and_fcntl_byte_ranges_deadlock_cancel_crash_and_enolck() {
         );
     });
 }
+
+#[test]
+fn failed_replacement_rename_preserves_destination_and_unlinked_orphan() {
+    let owner = user(1, 1, &[1], 0o022);
+
+    // 1. OPFS: ordinary replacement rename failure (`EDQUOT`) keeps destination content intact, and
+    // an open unlinked target is rolled back out of orphans when `move_entry` fails.
+    block_on(async {
+        let sim = SimProfile::new();
+        let fs = sim
+            .mount_opfs(1, grant(&owner, false, true), 1)
+            .await
+            .unwrap();
+        let (src, o_src) = fs
+            .create(
+                &owner,
+                &fs.root(),
+                "src",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        let (dst, o_dst) = fs
+            .create(
+                &owner,
+                &fs.root(),
+                "dst",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        fs.write_at(&o_src, b"NEW", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        fs.write_at(&o_dst, b"OLD", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        fs.release(&o_src).await.unwrap();
+        let _ = src;
+
+        // With `dst` still open, trigger `EDQUOT` inside `move_entry`: target must be restored!
+        sim.set_quota_exceeded(true);
+        let err = fs
+            .rename(
+                &owner,
+                &fs.root(),
+                "src",
+                &fs.root(),
+                "dst",
+                RenameFlags::empty(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, Errno::EDQUOT);
+        sim.set_quota_exceeded(false);
+
+        assert!(sim.orphan_ids().is_empty());
+        assert_eq!(sim.external_read("src").as_deref(), Some(b"NEW".as_slice()));
+        assert_eq!(sim.external_read("dst").as_deref(), Some(b"OLD".as_slice()));
+
+        // Open descriptor on `dst` still resolves cleanly after rollback, and fresh lookup works.
+        let mut buf = [0u8; 8];
+        let n = fs.read_at(&o_dst, &mut buf, 0).await.unwrap();
+        assert_eq!(&buf[..n], b"OLD");
+        let dst_now = fs.lookup(&owner, &fs.root(), "dst").await.unwrap();
+        assert_eq!(dst_now.handle.node.ino, dst.handle.node.ino);
+        fs.release(&o_dst).await.unwrap();
+
+        // Also test closed destination on `EDQUOT`.
+        sim.set_quota_exceeded(true);
+        assert_eq!(
+            fs.rename(
+                &owner,
+                &fs.root(),
+                "src",
+                &fs.root(),
+                "dst",
+                RenameFlags::empty()
+            )
+            .await
+            .unwrap_err(),
+            Errno::EDQUOT
+        );
+        sim.set_quota_exceeded(false);
+        assert_eq!(sim.external_read("dst").as_deref(), Some(b"OLD".as_slice()));
+    });
+
+    // 2. Host Directory: failed replacement rename preserves destination in both tree and metadata.
+    block_on(async {
+        let sim = SimProfile::new();
+        sim.external_write("src", b"SRC");
+        sim.external_write("dst", b"KEEP");
+        let fs = sim
+            .mount_directory(1, grant(&owner, false, false), 1)
+            .await
+            .unwrap();
+        sim.set_quota_exceeded(true);
+        assert_eq!(
+            fs.rename(
+                &owner,
+                &fs.root(),
+                "src",
+                &fs.root(),
+                "dst",
+                RenameFlags::empty()
+            )
+            .await
+            .unwrap_err(),
+            Errno::EDQUOT
+        );
+        sim.set_quota_exceeded(false);
+        let dst_e = fs.lookup(&owner, &fs.root(), "dst").await.unwrap();
+        let ro = fs
+            .open(&owner, &dst_e.handle, OpenOptions::new().read(true))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 8];
+        let n = fs.read_at(&ro, &mut buf, 0).await.unwrap();
+        assert_eq!(&buf[..n], b"KEEP");
+        fs.release(&ro).await.unwrap();
+    });
+}
+
+#[test]
+fn read_only_directory_attachment_does_not_strip_persistent_owner_write_bit() {
+    let owner = user(10, 10, &[10], 0o022);
+    let sim = SimProfile::new();
+    sim.external_write("notes.txt", b"hello");
+
+    block_on(async {
+        let ro_fs = sim
+            .mount_directory(1, grant(&owner, true, false), 1)
+            .await
+            .unwrap();
+        let ro_entry = ro_fs
+            .lookup(&owner, &ro_fs.root(), "notes.txt")
+            .await
+            .unwrap();
+        assert_eq!(ro_entry.metadata.mode, 0o600);
+        assert_eq!(
+            ro_fs
+                .open(&owner, &ro_entry.handle, OpenOptions::new().write(true))
+                .await,
+            Err(Errno::EROFS)
+        );
+        drop(ro_fs);
+
+        let rw_fs = sim
+            .mount_directory(2, grant(&owner, false, false), 2)
+            .await
+            .unwrap();
+        let rw_entry = rw_fs
+            .lookup(&owner, &rw_fs.root(), "notes.txt")
+            .await
+            .unwrap();
+        assert_eq!(rw_entry.metadata.mode, 0o600);
+        let w = rw_fs
+            .open(&owner, &rw_entry.handle, OpenOptions::new().write(true))
+            .await
+            .unwrap();
+        rw_fs
+            .write_at(&w, b"world", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        rw_fs.release(&w).await.unwrap();
+    });
+}
+
+#[test]
+fn multiple_blocked_waiters_do_not_churn_lock_notifications() {
+    let owner = user(1, 1, &[1], 0o022);
+    let sim = SimProfile::new();
+
+    let (tab1, tab2, tab3, o1, o2, o3) = block_on(async {
+        let tab1 = sim
+            .mount_opfs(1, grant(&owner, false, true), 1)
+            .await
+            .unwrap();
+        let tab2 = sim
+            .mount_opfs(2, grant(&owner, false, true), 2)
+            .await
+            .unwrap();
+        let tab3 = sim
+            .mount_opfs(3, grant(&owner, false, true), 3)
+            .await
+            .unwrap();
+        let (f, o1) = tab1
+            .create(
+                &owner,
+                &tab1.root(),
+                "lock",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        let _ = f;
+        let f2 = tab2.lookup(&owner, &tab2.root(), "lock").await.unwrap();
+        let f3 = tab3.lookup(&owner, &tab3.root(), "lock").await.unwrap();
+        let o2 = tab2
+            .open(
+                &owner,
+                &f2.handle,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        let o3 = tab3
+            .open(
+                &owner,
+                &f3.handle,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        (tab1, tab2, tab3, o1, o2, o3)
+    });
+
+    block_on(tab1.try_lock(
+        &o1,
+        LockFamily::Flock,
+        LockKind::Exclusive,
+        LockRange::WHOLE,
+    ))
+    .unwrap();
+
+    let mut wait2 = Box::pin(tab2.lock(
+        &o2,
+        LockFamily::Flock,
+        LockKind::Exclusive,
+        LockRange::WHOLE,
+    ));
+    let mut wait3 = Box::pin(tab3.lock(
+        &o3,
+        LockFamily::Flock,
+        LockKind::Exclusive,
+        LockRange::WHOLE,
+    ));
+    assert!(poll_once(&mut wait2).is_pending());
+    assert!(poll_once(&mut wait3).is_pending());
+
+    let epoch_after_join = sim.lock_notifications();
+    // Re-polling while lock stays held must NOT emit broadcast churn!
+    assert!(poll_once(&mut wait2).is_pending());
+    assert!(poll_once(&mut wait3).is_pending());
+    assert_eq!(sim.lock_notifications(), epoch_after_join);
+
+    block_on(tab1.unlock(&o1, LockFamily::Flock, LockRange::WHOLE)).unwrap();
+    assert!(sim.lock_notifications() > epoch_after_join);
+    assert_eq!(poll_once(&mut wait2), Poll::Ready(Ok(())));
+    drop(wait2);
+    block_on(tab2.unlock(&o2, LockFamily::Flock, LockRange::WHOLE)).unwrap();
+    assert_eq!(poll_once(&mut wait3), Poll::Ready(Ok(())));
+    drop(wait3);
+    let _ = tab3;
+}

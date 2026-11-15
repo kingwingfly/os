@@ -192,6 +192,8 @@ pub trait HostTree {
     ) -> BoxFuture<'a, Vec<(String, Fingerprint)>>;
     /// Move `os-workspace/<path>` to `/os-orphans/<uuid>/<ino>` when unlinking an open OPFS file.
     fn move_to_orphan<'a>(&'a self, path: &'a str, ino: u64) -> BoxFuture<'a, ()>;
+    /// Restore `/os-orphans/<uuid>/<ino>` back to `os-workspace/<to>` if a staged replacement fails.
+    fn restore_orphan<'a>(&'a self, ino: u64, to: &'a str) -> BoxFuture<'a, ()>;
     /// Remove `/os-orphans/<uuid>/<ino>` after the last open reference closes or during crash sweep.
     fn remove_orphan(&self, ino: u64) -> BoxFuture<'_, ()>;
     /// List `<ino>` entries present under `/os-orphans/<uuid>/`.

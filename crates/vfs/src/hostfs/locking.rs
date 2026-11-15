@@ -209,7 +209,10 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             let blocking_locks = {
                 let _guard = self.lock_mutex().await?;
                 let (mut tables, mut dirty) = self.load_and_prune_tables().await?;
+                let pruned = !dirty.is_empty();
                 let mut target = tables.remove(&ino).unwrap_or_default();
+                let before_table = serde_json::to_vec(&target).ok();
+                let before_held = serde_json::to_vec(&target.held).ok();
                 let others: Vec<Locks> = tables.values().cloned().collect();
                 let res = target.acquire(
                     Held {
@@ -249,14 +252,24 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                                 ));
                             }
                         }
-                        dirty.insert(ino);
+                        let table_changed =
+                            before_table.as_ref() != serde_json::to_vec(&target).ok().as_ref();
+                        let held_changed =
+                            before_held.as_ref() != serde_json::to_vec(&target.held).ok().as_ref();
+                        if table_changed {
+                            dirty.insert(ino);
+                        }
                         tables.insert(ino, target);
                         self.flush_dirty_tables(&tables, dirty).await?;
-                        self.locks.notify_locks();
+                        if pruned || held_changed {
+                            self.locks.notify_locks();
+                        }
                         blockers.into_iter().collect::<Vec<_>>()
                     }
                     Err(err) => {
-                        dirty.insert(ino);
+                        if before_table.as_ref() != serde_json::to_vec(&target).ok().as_ref() {
+                            dirty.insert(ino);
+                        }
                         tables.insert(ino, target);
                         self.flush_dirty_tables(&tables, dirty).await?;
                         cancel_guard.armed = false;

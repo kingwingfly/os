@@ -299,8 +299,9 @@ export class Workspace {
   async open(path, flags, scope, mode = 0o666, umask = 0o077) {
     const found = this.resolve(path);
     if (!found) { await this.stat(path); throw bad('EISDIR'); }
-    if (!Number.isSafeInteger(flags) || flags < 0 || (flags & 3) === 3) throw bad('EINVAL');
-    const write = (flags & 3) !== 0;
+    const pathOnly = !!(flags & 0o10000000);
+    if (!Number.isSafeInteger(flags) || flags < 0 || (!pathOnly && (flags & 3) === 3)) throw bad('EINVAL');
+    const write = !pathOnly && (flags & 3) !== 0;
     if (write && found.mount.grant.readOnly) throw bad('EROFS');
 
     if (found.mount.provider.open) {
@@ -310,12 +311,12 @@ export class Workspace {
         const stat = this.metadata(found.path, await found.mount.provider.stat(found.mount.grant, handle), found.mount);
         // WASI `process.js` opens directories without `O_DIRECTORY` and catches `EISDIR` to create
         // its `{ kind: 'dir', path }` descriptor entry for `fd_readdir` and `openat`.
-        if ((stat.mode & 0o170000) === 0o040000 && !(flags & 0o200000)) {
+        if (!pathOnly && (stat.mode & 0o170000) === 0o040000 && !(flags & 0o200000)) {
           await found.mount.provider.release(found.mount.grant, handle).catch(() => {});
           throw bad('EISDIR');
         }
         const fd = nextFd++, token = 'local:' + crypto.randomUUID();
-        this.fds.set(fd, { ...found, handle, scope, read: (flags & 3) !== 1, write, append: !!(flags & 0o2000), token });
+        this.fds.set(fd, { ...found, handle, scope, read: !pathOnly && (flags & 3) !== 1, write, append: !pathOnly && !!(flags & 0o2000), pathOnly, token });
         return { fd, token, size: stat.size, stat, chunk_size: INLINE, local: true };
       } catch (error) {
         if (error?.errno !== 'EISDIR') await found.mount.provider.release(found.mount.grant, handle).catch(() => {});
@@ -355,6 +356,7 @@ export class Workspace {
 
   async fsync(fd, dataOnly, scope) {
     const file = this.descriptor(fd, scope);
+    if (file.pathOnly) throw bad('EBADF');
     if (!file.mount.provider.fsync) throw bad('EINVAL');
     return file.mount.provider.fsync(file.mount.grant, file.handle, !!dataOnly);
   }
@@ -573,6 +575,9 @@ export class Workspace {
             const a = this.resolve(arg.from), b = this.resolve(arg.to);
             if (!a || !b || a.mount !== b.mount) throw bad('EXDEV');
             if (a.mount.grant.readOnly) throw bad('EROFS');
+            if (arg.noreplace && a.mount.provider instanceof NativeMount) {
+              throw bad('EOPNOTSUPP', 'atomic no-replace rename is unavailable on this filesystem');
+            }
             value = await a.mount.provider.rename(a.mount.grant, a.relative, b.relative, !!arg.noreplace);
             break;
           }
@@ -602,6 +607,7 @@ export class Workspace {
           case 'removexattr':
           case 'fchmod': {
             const file = name === 'fchmod' ? this.descriptor(arg.fd, scope) : this.resolve(target);
+            if (name === 'fchmod' && file.pathOnly) throw bad('EBADF');
             if (!file?.mount.provider.policy) throw bad('EOPNOTSUPP');
             value = await file.mount.provider.policy(
               file.mount.grant,

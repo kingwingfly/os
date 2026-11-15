@@ -1,7 +1,10 @@
 import { localImage, pinImage } from './local-mounts.js';
+import { NativeMount } from './native-mount.js';
 const bad = (errno, message = errno) => Object.assign(new Error(message), { errno });
 const CHUNK = 24 * 1024, MAX = 128 * 1024 * 1024;
 const mutations = new Set(['write', 'ftruncate', 'mkdir', 'remove', 'rename', 'link', 'symlink']);
+const isMutation = (op, args) => mutations.has(op)
+  || (op === 'open' && Number.isSafeInteger(args?.flags) && !(args.flags & 0o10000000) && (args.flags & 0o1100) !== 0);
 const disconnected = errno => bad(errno, errno === 'EACCES'
   ? 'Permission denied. Your OS account cannot access this directory. Ask the owner to check its permissions or ACL, or enter the export password if one is set.'
   : errno === 'ESTALE' ? 'This share has expired or was stopped. Ask the owner for a new address.'
@@ -50,7 +53,7 @@ class Connection {
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.close('ETIMEDOUT'), 15000);
-      this.pending.set(id, { resolve, reject, timer, mutation: mutations.has(op) });
+      this.pending.set(id, { resolve, reject, timer, mutation: isMutation(op, args) });
       try { this.send({ type: 'request', id, op, args }); } catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
     });
   }
@@ -117,6 +120,15 @@ export async function exportMount(workspace, args) {
 }
 function serve(workspace, found, provider, source, grant, connection) {
   const pins = new Map(), handles = new Map(), seen = new Set(); let busy = 0, highest = 0;
+  const retainHandle = handle => {
+    if (!connection.active) {
+      void provider.release?.(source, handle)?.catch(() => {});
+      throw bad('ENODEV');
+    }
+    const id = crypto.randomUUID();
+    handles.set(id, handle);
+    return id;
+  };
   connection.onclose = () => { pins.clear(); for (const handle of handles.values()) void provider.release?.(source, handle)?.catch(() => {}); handles.clear(); };
   connection.serve = async message => {
     try {
@@ -132,24 +144,33 @@ function serve(workspace, found, provider, source, grant, connection) {
           case 'open': {
             if (handles.size >= 128) throw bad('EMFILE');
             const flags = Number.isSafeInteger(args.flags) ? args.flags : 0;
-            if (((flags & 3) !== 0 || (flags & 0o100) !== 0 || (flags & 0o1000) !== 0) && !grant.write) {
-              if (!((flags & 3) === 0 && (flags & 0o300) === 0o300)) throw bad('EROFS');
+            let openFlags = flags;
+            if (!grant.write && !(flags & 0o10000000)) {
+              if ((flags & 3) !== 0 || (flags & 0o1000) !== 0) throw bad('EROFS');
+              if (flags & 0o100) {
+                try {
+                  await provider.stat(source, path, { follow: !(flags & 0o400000) && !(flags & 0o200) });
+                } catch (err) {
+                  if (err?.errno === 'ENOENT') throw bad('EROFS');
+                  throw err;
+                }
+                if (flags & 0o200) throw bad('EEXIST');
+                openFlags &= ~(0o100 | 0o200);
+              }
             }
             if (!provider.open) {
-              if (flags & 0o200) throw bad('EOPNOTSUPP');
-              const st = await provider.stat(source, path, { follow: !(flags & 0o400000) });
-              if ((flags & 0o400000) && st.kind === 'symlink') throw bad('ELOOP');
-              if (st.kind === 'directory') throw bad((flags & 0o200000) ? 'EOPNOTSUPP' : 'EISDIR');
-              if (flags & 0o200000) throw bad('ENOTDIR');
-              const held = await provider.hold(source, path, found.relative), id = crypto.randomUUID();
-              handles.set(id, held); value = id; break;
+              if (openFlags & 0o200) throw bad('EOPNOTSUPP');
+              const st = await provider.stat(source, path, { follow: !(openFlags & 0o400000) });
+              if ((openFlags & 0o400000) && st.kind === 'symlink') throw bad('ELOOP');
+              if (st.kind === 'directory') throw bad((openFlags & 0o200000) ? 'EOPNOTSUPP' : 'EISDIR');
+              if (openFlags & 0o200000) throw bad('ENOTDIR');
+              value = retainHandle(await provider.hold(source, path, found.relative)); break;
             }
-            const held = await provider.open(source, path, flags, args.mode ?? 0o666, args.umask ?? 0o077);
-            const id = crypto.randomUUID(); handles.set(id, held); value = id; break;
+            value = retainHandle(await provider.open(source, path, openFlags, args.mode ?? 0o666, args.umask ?? 0o077)); break;
           }
           case 'hold': {
             if (handles.size >= 128) throw bad('EMFILE');
-            const held = await provider.hold(source, path, found.relative), id = crypto.randomUUID(); handles.set(id, held); value = id; break;
+            value = retainHandle(await provider.hold(source, path, found.relative)); break;
           }
           case 'release': { if (!handles.has(args.handle)) throw bad('EBADF'); await provider.release(source, path); handles.delete(args.handle); value = null; break; }
           case 'policy':
@@ -184,6 +205,7 @@ function serve(workspace, found, provider, source, grant, connection) {
             value = await provider.remove(source, path, !!args.directory); break;
           case 'rename':
             if (!grant.write) throw bad('EROFS');
+            if (args.noreplace && provider instanceof NativeMount) throw bad('EOPNOTSUPP', 'atomic no-replace rename is unavailable on this filesystem');
             value = await provider.rename(source, path, [found.relative, safePath(args.to)].filter(Boolean).join('/'), !!args.noreplace); break;
           case 'link':
             if (!grant.write) throw bad('EROFS');
@@ -202,7 +224,9 @@ function serve(workspace, found, provider, source, grant, connection) {
           }
           case 'pin': {
             if (!grant.execute || pins.size >= 2) throw bad('EACCES');
-            const pin = await provider.pin(source, path), id = crypto.randomUUID(); pins.set(id, await localImage(pin));
+            const pin = await provider.pin(source, path), image = await localImage(pin), id = crypto.randomUUID();
+            if (!connection.active) throw bad('ENODEV');
+            pins.set(id, image);
             value = { id, size: pin.size, digest: pin.digest }; break;
           }
           case 'image': {
@@ -242,7 +266,7 @@ class RemoteMount {
     return this.connection.request(op, args);
   }
   async open(grant, path, flags = 0, mode = 0o666, umask = 0o077) {
-    if (((flags & 3) !== 0 || (flags & 0o1000) !== 0) && grant.readOnly) throw bad('EROFS');
+    if (!(flags & 0o10000000) && ((flags & 3) !== 0 || (flags & 0o1000) !== 0) && grant.readOnly) throw bad('EROFS');
     const id = await this.request(grant, 'open', { path, flags, mode, umask });
     const handle = Object.freeze({}); this.#handles.set(handle, id); return handle;
   }

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use vfs::{Access, Cred, Entry, Filesystem, Handle, Identity, Metadata, OpenRef, SetAttr, WriteAt};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -188,6 +188,37 @@ fn clean_rel_path(path: &str) -> std::result::Result<(Vec<String>, bool), Errno>
     Ok((out, trailing_dir))
 }
 
+fn expand_symlink(
+    prefix: &[String],
+    boundary_len: usize,
+    link_target: &str,
+) -> std::result::Result<Vec<String>, Errno> {
+    if link_target.starts_with('/') {
+        return Err(Errno::ENOENT);
+    }
+    let mut resolved = prefix.to_vec();
+    for seg in link_target.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            if resolved.len() <= boundary_len {
+                return Err(Errno::ELOOP);
+            }
+            resolved.pop();
+        } else {
+            if seg.len() > abi::NAME_MAX {
+                return Err(Errno::ENAMETOOLONG);
+            }
+            resolved.push(seg.to_string());
+        }
+    }
+    Ok(resolved)
+}
+
+type OpenTable = RefCell<HashMap<u64, RetainedOpen>>;
+type OpenMap = Rc<OpenTable>;
+
 struct SharedMountState {
     fs: Rc<dyn Filesystem>,
     grant: Grant,
@@ -197,6 +228,43 @@ struct SharedMountState {
     policy_revision: Cell<u64>,
     known_paths: RefCell<HashMap<vfs::NodeId, Vec<String>>>,
     unmount_fn: RefCell<Option<Box<dyn FnOnce()>>>,
+    views: RefCell<Vec<Weak<OpenTable>>>,
+}
+
+impl SharedMountState {
+    fn register_view(&self, opens: &OpenMap) {
+        let mut views = self.views.borrow_mut();
+        views.retain(|w| w.strong_count() > 0);
+        views.push(Rc::downgrade(opens));
+    }
+
+    fn shutdown(&self) {
+        self.active.set(false);
+        let mut drained = Vec::new();
+        for weak in self.views.borrow().iter() {
+            if let Some(map) = weak.upgrade() {
+                drained.extend(map.borrow_mut().drain().map(|(_, v)| v));
+            }
+        }
+        self.views.borrow_mut().clear();
+        let unmount_cb = self.unmount_fn.borrow_mut().take();
+        if drained.is_empty() {
+            if let Some(cb) = unmount_cb {
+                cb();
+            }
+            return;
+        }
+        let fs = Rc::clone(&self.fs);
+        wasm_bindgen_futures::spawn_local(async move {
+            for item in drained {
+                let _ = fs.release(&item.open_ref).await;
+            }
+            drop(fs);
+            if let Some(cb) = unmount_cb {
+                cb();
+            }
+        });
+    }
 }
 
 struct RetainedOpen {
@@ -205,6 +273,18 @@ struct RetainedOpen {
     handle: Handle,
     path: String,
     append: bool,
+    held: bool,
+    created_at_rev: Option<u64>,
+}
+
+struct OpenLookup {
+    id: u64,
+    open_ref: OpenRef,
+    handle: Handle,
+    path: String,
+    append: bool,
+    held: bool,
+    created_at_rev: Option<u64>,
 }
 
 /// Wasm-exported local mount provider wrapping an `Rc<dyn vfs::Filesystem>`.
@@ -215,7 +295,7 @@ pub struct LocalMount {
     boundary: Vec<String>,
     remote: bool,
     next_local_open: Cell<u64>,
-    opens: RefCell<HashMap<u64, RetainedOpen>>,
+    opens: OpenMap,
 }
 
 /// Construct a [`LocalMount`] over any [`Filesystem`] implementation (used by `hostfs` and `helper`).
@@ -228,7 +308,7 @@ pub fn from_fs(fs: Rc<dyn Filesystem>, grant: Grant) -> LocalMount {
 pub fn from_fs_with_unmount(
     fs: Rc<dyn Filesystem>,
     grant: Grant,
-    on_unmount: Box<dyn FnOnce()>,
+    on_unmount: impl FnOnce() + 'static,
 ) -> LocalMount {
     LocalMount::from_fs_with_unmount(fs, grant, on_unmount)
 }
@@ -242,9 +322,9 @@ impl LocalMount {
     pub fn from_fs_with_unmount(
         fs: Rc<dyn Filesystem>,
         grant: Grant,
-        on_unmount: Box<dyn FnOnce()>,
+        on_unmount: impl FnOnce() + 'static,
     ) -> Self {
-        Self::new_internal(fs, grant, false, Some(on_unmount))
+        Self::new_internal(fs, grant, false, Some(Box::new(on_unmount)))
     }
 
     pub(crate) fn from_snapshot(fs: Rc<dyn Filesystem>, grant: Grant) -> Self {
@@ -259,33 +339,32 @@ impl LocalMount {
     ) -> Self {
         let identity = grant.owner.clone();
         let grant_js = build_grant_js(&grant);
+        let opens = Rc::new(RefCell::new(HashMap::new()));
+        let state = Rc::new(SharedMountState {
+            fs,
+            grant,
+            grant_js,
+            active: Cell::new(true),
+            snapshot_data_ro,
+            policy_revision: Cell::new(0),
+            known_paths: RefCell::new(HashMap::new()),
+            unmount_fn: RefCell::new(on_unmount),
+            views: RefCell::new(Vec::new()),
+        });
+        state.register_view(&opens);
         Self {
-            state: Rc::new(SharedMountState {
-                fs,
-                grant,
-                grant_js,
-                active: Cell::new(true),
-                snapshot_data_ro,
-                policy_revision: Cell::new(0),
-                known_paths: RefCell::new(HashMap::new()),
-                unmount_fn: RefCell::new(on_unmount),
-            }),
+            state,
             identity,
             boundary: Vec::new(),
             remote: false,
             next_local_open: Cell::new(1),
-            opens: RefCell::new(HashMap::new()),
+            opens,
         }
     }
 
     pub(crate) fn detach_callback(&self) -> Rc<dyn Fn()> {
         let state = Rc::clone(&self.state);
-        Rc::new(move || {
-            state.active.set(false);
-            if let Some(cb) = state.unmount_fn.borrow_mut().take() {
-                cb();
-            }
-        })
+        Rc::new(move || state.shutdown())
     }
 
     fn check_grant(&self, grant: &JsValue) -> std::result::Result<(), Errno> {
@@ -339,6 +418,8 @@ impl LocalMount {
         handle: Handle,
         path: String,
         append: bool,
+        held: bool,
+        created_at_rev: Option<u64>,
     ) -> JsValue {
         let id = self.next_local_open.get();
         self.next_local_open.set(id + 1);
@@ -364,15 +445,14 @@ impl LocalMount {
                 handle,
                 path,
                 append,
+                held,
+                created_at_rev,
             },
         );
         token
     }
 
-    fn lookup_open(
-        &self,
-        val: &JsValue,
-    ) -> std::result::Result<(u64, OpenRef, Handle, String, bool), Errno> {
+    fn lookup_open(&self, val: &JsValue) -> std::result::Result<OpenLookup, Errno> {
         let id = js_sys::Reflect::get(val, &JsValue::from_str("__localHandle"))
             .ok()
             .and_then(|v| v.as_f64())
@@ -383,13 +463,15 @@ impl LocalMount {
         if !js_sys::Object::is(&entry.token, val) {
             return Err(Errno::EBADF);
         }
-        Ok((
+        Ok(OpenLookup {
             id,
-            entry.open_ref.clone(),
-            entry.handle.clone(),
-            entry.path.clone(),
-            entry.append,
-        ))
+            open_ref: entry.open_ref.clone(),
+            handle: entry.handle.clone(),
+            path: entry.path.clone(),
+            append: entry.append,
+            held: entry.held,
+            created_at_rev: entry.created_at_rev,
+        })
     }
 
     async fn resolve_parts(
@@ -447,26 +529,8 @@ impl LocalMount {
                         return Err(Errno::ELOOP);
                     }
                     let link_target = fs.read_link(step_cred, &next.handle).await?;
-                    if link_target.starts_with('/') {
-                        return Err(Errno::ENOENT);
-                    }
-                    let mut resolved: Vec<String> = parts[..i].to_vec();
-                    for seg in link_target.split('/') {
-                        if seg.is_empty() || seg == "." {
-                            continue;
-                        }
-                        if seg == ".." {
-                            if resolved.len() <= self.boundary.len() {
-                                return Err(Errno::ELOOP);
-                            }
-                            resolved.pop();
-                        } else {
-                            if seg.len() > abi::NAME_MAX {
-                                return Err(Errno::ENAMETOOLONG);
-                            }
-                            resolved.push(seg.to_string());
-                        }
-                    }
+                    let mut resolved =
+                        expand_symlink(&parts[..i], self.boundary.len(), &link_target)?;
                     resolved.extend_from_slice(&parts[i + 1..]);
                     parts = resolved;
                     continue 'restart;
@@ -684,35 +748,51 @@ impl LocalMount {
     async fn verify_remote_open_live(
         &self,
         cred: &Cred,
-        open_ref: &OpenRef,
-        handle: &Handle,
-        open_path: &str,
-        want_write: bool,
+        open: &OpenLookup,
+        required_access: Access,
     ) -> std::result::Result<(), Errno> {
         if !self.remote {
             return Ok(());
         }
         self.verify_boundary_search(cred).await?;
-        let meta = self.state.fs.open_metadata(open_ref).await?;
-        if meta.nlink > 0 {
+        let creator_keeps_access = open.created_at_rev == Some(self.state.policy_revision.get())
+            && match required_access {
+                Access::Read => open.open_ref.access.reads(),
+                Access::Write => open.open_ref.access.writes(),
+                Access::ReadWrite => open.open_ref.access.reads() && open.open_ref.access.writes(),
+                Access::Exec | Access::Path => false,
+            };
+        if required_access != Access::Path && !creator_keeps_access {
             let mut opts = OpenOptions::new();
-            if want_write {
-                opts.write(true);
-            } else {
-                opts.read(true);
+            match required_access {
+                Access::Read => {
+                    opts.read(true);
+                }
+                Access::Write => {
+                    opts.write(true);
+                }
+                Access::ReadWrite => {
+                    opts.read(true).write(true);
+                }
+                Access::Exec => {
+                    opts.exec(true);
+                }
+                Access::Path => {}
             }
-            let probe = self.state.fs.open(cred, handle, &opts).await?;
+            let probe = self.state.fs.open(cred, &open.handle, &opts).await?;
             let _ = self.state.fs.release(&probe).await;
-
+        }
+        let meta = self.state.fs.open_metadata(&open.open_ref).await?;
+        if meta.nlink > 0 {
             let mut candidates: Vec<String> = self
                 .state
                 .known_paths
                 .borrow()
-                .get(&handle.node)
+                .get(&open.handle.node)
                 .cloned()
                 .unwrap_or_default();
-            if !open_path.is_empty() && !candidates.iter().any(|p| p == open_path) {
-                candidates.push(open_path.to_string());
+            if !open.path.is_empty() && !candidates.iter().any(|p| p == &open.path) {
+                candidates.push(open.path.clone());
             }
             let mut reachable = false;
             for cand in candidates {
@@ -723,7 +803,7 @@ impl LocalMount {
                     continue;
                 }
                 if let Ok((live, _)) = self.resolve_parts(cred, parts, false, false).await
-                    && live.handle.node == handle.node
+                    && live.handle.node == open.handle.node
                 {
                     reachable = true;
                     break;
@@ -734,6 +814,130 @@ impl LocalMount {
             }
         }
         Ok(())
+    }
+
+    async fn open_or_create_target(
+        &self,
+        cred: &Cred,
+        path: &str,
+        nofollow: bool,
+        mode: u16,
+        options: &OpenOptions,
+    ) -> std::result::Result<(Entry, OpenRef, Vec<String>, bool), Errno> {
+        let (initial_parts, trailing_dir) = clean_rel_path(path)?;
+        if trailing_dir {
+            return Err(Errno::EISDIR);
+        }
+        let mut parts = initial_parts;
+        let mut depth = 0usize;
+        let ro_grant = self.state.grant.read_only || self.state.snapshot_data_ro;
+
+        loop {
+            self.check_within_boundary(&parts)?;
+            if parts.is_empty() || parts == self.boundary {
+                return Err(Errno::EISDIR);
+            }
+            let name = parts.last().cloned().ok_or(Errno::EISDIR)?;
+            let parent_parts = parts[..parts.len() - 1].to_vec();
+            let (parent_entry, mut resolved_parts) =
+                self.resolve_parts(cred, parent_parts, true, true).await?;
+            if parent_entry.metadata.file_type != FileType::Dir {
+                return Err(Errno::ENOTDIR);
+            }
+            resolved_parts.push(name.clone());
+            self.check_within_boundary(&resolved_parts)?;
+
+            match self
+                .state
+                .fs
+                .lookup(cred, &parent_entry.handle, &name)
+                .await
+            {
+                Ok(existing) => {
+                    if options.is_create_new() {
+                        return Err(Errno::EEXIST);
+                    }
+                    if existing.metadata.file_type == FileType::Symlink {
+                        if nofollow {
+                            return Err(Errno::ELOOP);
+                        }
+                        depth += 1;
+                        if depth > SYMLINK_MAX {
+                            return Err(Errno::ELOOP);
+                        }
+                        let link_target = self.state.fs.read_link(cred, &existing.handle).await?;
+                        parts = expand_symlink(
+                            &resolved_parts[..resolved_parts.len() - 1],
+                            self.boundary.len(),
+                            &link_target,
+                        )?;
+                        continue;
+                    }
+                    if existing.metadata.file_type == FileType::Dir {
+                        return Err(Errno::EISDIR);
+                    }
+                    // Existing targets always authorize against the caller's own credentials.
+                    let mut open_opts = *options;
+                    open_opts.create(false).create_new(false);
+                    if ro_grant {
+                        let mut ro_opts = OpenOptions::new();
+                        ro_opts.read(true);
+                        open_opts = ro_opts;
+                    }
+                    let open_ref = self
+                        .state
+                        .fs
+                        .open(cred, &existing.handle, &open_opts)
+                        .await?;
+                    return Ok((existing, open_ref, resolved_parts, false));
+                }
+                Err(Errno::ENOENT) => {
+                    if ro_grant {
+                        return Err(Errno::EROFS);
+                    }
+                    // On shared exports (`self.remote`), until #59 adds multi-owner export policy,
+                    // newly created nodes remain owned by the publishing account after verifying
+                    // `self.identity` may create in `parent_entry`.
+                    let create_cred = if self.remote {
+                        self.check_access_entry(cred, &parent_entry, 3).await?;
+                        Cred {
+                            identity: self.state.grant.owner.clone(),
+                            umask: cred.umask,
+                            token: None,
+                        }
+                    } else {
+                        cred.clone()
+                    };
+                    let mut create_opts = *options;
+                    create_opts.create(true).create_new(true);
+                    match self
+                        .state
+                        .fs
+                        .create(
+                            &create_cred,
+                            &parent_entry.handle,
+                            &name,
+                            mode,
+                            &create_opts,
+                        )
+                        .await
+                    {
+                        Ok((created_entry, open_ref)) => {
+                            return Ok((created_entry, open_ref, resolved_parts, true));
+                        }
+                        Err(Errno::EEXIST) if !options.is_create_new() => {
+                            depth += 1;
+                            if depth > SYMLINK_MAX {
+                                return Err(Errno::EEXIST);
+                            }
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     async fn format_stat_js(
@@ -806,13 +1010,15 @@ impl LocalMount {
     pub fn for_identity(&self, identity: JsValue, boundary: &str) -> Result<LocalMount, JsValue> {
         let parsed = parse_identity(&identity)?;
         let (boundary_parts, _) = clean_rel_path(boundary).map_err(map_vfs_err)?;
+        let opens = Rc::new(RefCell::new(HashMap::new()));
+        self.state.register_view(&opens);
         Ok(Self {
             state: Rc::clone(&self.state),
             identity: parsed,
             boundary: boundary_parts,
             remote: true,
             next_local_open: Cell::new(1),
-            opens: RefCell::new(HashMap::new()),
+            opens,
         })
     }
 
@@ -828,18 +1034,18 @@ impl LocalMount {
         let cred = self.cred(None);
 
         if target.is_object() {
-            let (_, open_ref, handle, path, _) = self.lookup_open(&target).map_err(map_vfs_err)?;
-            self.verify_remote_open_live(&cred, &open_ref, &handle, &path, false)
+            let open = self.lookup_open(&target).map_err(map_vfs_err)?;
+            self.verify_remote_open_live(&cred, &open, open.open_ref.access)
                 .await
                 .map_err(map_vfs_err)?;
             let meta = self
                 .state
                 .fs
-                .open_metadata(&open_ref)
+                .open_metadata(&open.open_ref)
                 .await
                 .map_err(map_vfs_err)?;
-            let name = path.rsplit('/').next().unwrap_or("");
-            return self.format_stat_js(&cred, &handle, &meta, name).await;
+            let name = open.path.rsplit('/').next().unwrap_or("");
+            return self.format_stat_js(&cred, &open.handle, &meta, name).await;
         }
 
         let path = target.as_string().unwrap_or_default();
@@ -892,15 +1098,24 @@ impl LocalMount {
         }
 
         let entry = if target.is_object() {
-            let (_, open_ref, handle, _, _) = self.lookup_open(&target).map_err(map_vfs_err)?;
+            let open = self.lookup_open(&target).map_err(map_vfs_err)?;
+            if open.open_ref.access == Access::Path
+                && !open.held
+                && !matches!(name, "stat" | "lstat" | "statfs")
+            {
+                return Err(map_vfs_err(Errno::EBADF));
+            }
+            self.verify_remote_open_live(&cred, &open, open.open_ref.access)
+                .await
+                .map_err(map_vfs_err)?;
             let meta = self
                 .state
                 .fs
-                .open_metadata(&open_ref)
+                .open_metadata(&open.open_ref)
                 .await
                 .map_err(map_vfs_err)?;
             Entry {
-                handle,
+                handle: open.handle,
                 metadata: meta,
             }
         } else {
@@ -1118,100 +1333,32 @@ impl LocalMount {
             if want_dir {
                 return Err(map_vfs_err(Errno::EINVAL));
             }
-            let (parent_entry, name, resolved_parts) = self
-                .resolve_parent(&cred, path)
-                .await
-                .map_err(map_vfs_err)?;
-            // If file exists and is a symlink when O_NOFOLLOW is set (without O_EXCL): ELOOP;
-            // with O_EXCL: create_new returns EEXIST.
-            if nofollow
-                && !options.is_create_new()
-                && let Ok(existing) = self
-                    .state
-                    .fs
-                    .lookup(&cred, &parent_entry.handle, &name)
-                    .await
-                && existing.metadata.file_type == FileType::Symlink
-            {
-                return Err(map_vfs_err(Errno::ELOOP));
-            }
-            // If not read-only grant, run atomic `fs.create`; if read-only grant, `O_CREAT` without
-            // `O_EXCL` on an existing readable file opens it read-only, else `EROFS`.
-            if self.state.grant.read_only || self.state.snapshot_data_ro {
-                match self
-                    .state
-                    .fs
-                    .lookup(&cred, &parent_entry.handle, &name)
-                    .await
-                {
-                    Ok(_) if options.is_create_new() => return Err(map_vfs_err(Errno::EEXIST)),
-                    Ok(_) => {
-                        let (parts, trailing_dir) = clean_rel_path(path).map_err(map_vfs_err)?;
-                        let (resolved_entry, resolved) = self
-                            .resolve_parts(&cred, parts, !nofollow, trailing_dir)
-                            .await
-                            .map_err(map_vfs_err)?;
-                        let mut ro_opts = OpenOptions::new();
-                        ro_opts.read(true);
-                        let open_ref = self
-                            .state
-                            .fs
-                            .open(&cred, &resolved_entry.handle, &ro_opts)
-                            .await
-                            .map_err(map_vfs_err)?;
-                        return Ok(self.mint_js_handle(
-                            open_ref,
-                            resolved_entry.handle,
-                            resolved.join("/"),
-                            false,
-                        ));
-                    }
-                    Err(Errno::ENOENT) => return Err(map_vfs_err(Errno::EROFS)),
-                    Err(err) => return Err(map_vfs_err(err)),
-                }
-            }
-            // On shared exports (`self.remote`), until #59 adds multi-owner export policy,
-            // created nodes remain owned by the publishing account (`self.state.grant.owner`)
-            // after verifying `self.identity` may create in `parent_entry`.
-            let create_cred = if self.remote {
-                self.check_access_entry(&cred, &parent_entry, 3)
-                    .await
-                    .map_err(map_vfs_err)?;
-                Cred {
-                    identity: self.state.grant.owner.clone(),
-                    umask: cred.umask,
-                    token: None,
-                }
-            } else {
-                cred.clone()
-            };
             let req_mode = mode.unwrap_or(0o666);
-            let (created_entry, open_ref) = self
-                .state
-                .fs
-                .create(
-                    &create_cred,
-                    &parent_entry.handle,
-                    &name,
-                    req_mode,
-                    &options,
-                )
+            let (entry, open_ref, resolved_parts, created) = self
+                .open_or_create_target(&cred, path, nofollow, req_mode, &options)
                 .await
                 .map_err(map_vfs_err)?;
             return Ok(self.mint_js_handle(
                 open_ref,
-                created_entry.handle,
+                entry.handle,
                 resolved_parts.join("/"),
                 options.is_append(),
+                false,
+                created.then(|| self.state.policy_revision.get()),
             ));
         }
 
         let (parts, trailing_dir) = clean_rel_path(path).map_err(map_vfs_err)?;
         let (entry, resolved) = self
-            .resolve_parts(&cred, parts, !nofollow, trailing_dir)
+            .resolve_parts(
+                &cred,
+                parts,
+                !nofollow && access != Access::Path,
+                trailing_dir,
+            )
             .await
             .map_err(map_vfs_err)?;
-        if nofollow && entry.metadata.file_type == FileType::Symlink {
+        if access != Access::Path && nofollow && entry.metadata.file_type == FileType::Symlink {
             return Err(map_vfs_err(Errno::ELOOP));
         }
         if want_dir && entry.metadata.file_type != FileType::Dir {
@@ -1228,6 +1375,8 @@ impl LocalMount {
             entry.handle,
             resolved.join("/"),
             options.is_append(),
+            false,
+            None,
         ))
     }
 
@@ -1262,22 +1411,27 @@ impl LocalMount {
             .open(&cred, &entry.handle, OpenOptions::new().path(true))
             .await
             .map_err(map_vfs_err)?;
-        Ok(self.mint_js_handle(open_ref, entry.handle, resolved.join("/"), false))
+        Ok(self.mint_js_handle(
+            open_ref,
+            entry.handle,
+            resolved.join("/"),
+            false,
+            true,
+            None,
+        ))
     }
 
     pub async fn release(&self, grant: JsValue, handle: JsValue) -> Result<JsValue, JsValue> {
         if !js_sys::Object::is(&grant, &self.state.grant_js) {
             return Err(map_vfs_err(Errno::EACCES));
         }
-        let (id, open_ref, _, _, _) = self.lookup_open(&handle).map_err(map_vfs_err)?;
-        self.opens.borrow_mut().remove(&id);
-        if self.state.active.get() {
-            self.state
-                .fs
-                .release(&open_ref)
-                .await
-                .map_err(map_vfs_err)?;
-        }
+        let open = self.lookup_open(&handle).map_err(map_vfs_err)?;
+        self.opens.borrow_mut().remove(&open.id);
+        self.state
+            .fs
+            .release(&open.open_ref)
+            .await
+            .map_err(map_vfs_err)?;
         Ok(JsValue::NULL)
     }
 
@@ -1297,17 +1451,20 @@ impl LocalMount {
         let cred = self.cred(None);
 
         if target.is_object() {
-            let (_, open_ref, handle, path, _) = self.lookup_open(&target).map_err(map_vfs_err)?;
-            self.verify_remote_open_live(&cred, &open_ref, &handle, &path, false)
+            let open = self.lookup_open(&target).map_err(map_vfs_err)?;
+            if !open.held && !open.open_ref.access.reads() {
+                return Err(map_vfs_err(Errno::EBADF));
+            }
+            self.verify_remote_open_live(&cred, &open, Access::Read)
                 .await
                 .map_err(map_vfs_err)?;
-            if open_ref.access == Access::Path {
+            if open.open_ref.access == Access::Path {
                 // `hold()` creates a path reference for `PermissionMount`-compatible callers;
                 // verify live read access and read via a transient read OpenRef.
                 let r_open = self
                     .state
                     .fs
-                    .open(&cred, &handle, OpenOptions::new().read(true))
+                    .open(&cred, &open.handle, OpenOptions::new().read(true))
                     .await
                     .map_err(map_vfs_err)?;
                 let mut buf = vec![0u8; len];
@@ -1320,7 +1477,7 @@ impl LocalMount {
             let n = self
                 .state
                 .fs
-                .read_at(&open_ref, &mut buf, off)
+                .read_at(&open.open_ref, &mut buf, off)
                 .await
                 .map_err(map_vfs_err)?;
             return Ok(js_sys::Uint8Array::from(&buf[..n]));
@@ -1370,17 +1527,19 @@ impl LocalMount {
         let cred = self.cred(umask);
 
         if target.is_object() {
-            let (_, open_ref, handle, path, default_append) =
-                self.lookup_open(&target).map_err(map_vfs_err)?;
-            self.verify_remote_open_live(&cred, &open_ref, &handle, &path, true)
+            let open = self.lookup_open(&target).map_err(map_vfs_err)?;
+            if !open.held && !open.open_ref.access.writes() {
+                return Err(map_vfs_err(Errno::EBADF));
+            }
+            self.verify_remote_open_live(&cred, &open, Access::Write)
                 .await
                 .map_err(map_vfs_err)?;
-            let append = append_opt.unwrap_or(default_append);
-            if open_ref.access == Access::Path {
+            let append = append_opt.unwrap_or(open.append);
+            if open.open_ref.access == Access::Path {
                 let w_open = self
                     .state
                     .fs
-                    .open(&cred, &handle, OpenOptions::new().write(true))
+                    .open(&cred, &open.handle, OpenOptions::new().write(true))
                     .await
                     .map_err(map_vfs_err)?;
                 let res = async {
@@ -1419,7 +1578,7 @@ impl LocalMount {
             if let Some(sz) = truncate {
                 self.state
                     .fs
-                    .set_len(&open_ref, sz)
+                    .set_len(&open.open_ref, sz)
                     .await
                     .map_err(map_vfs_err)?;
             }
@@ -1427,7 +1586,7 @@ impl LocalMount {
                 self.state
                     .fs
                     .write_at(
-                        &open_ref,
+                        &open.open_ref,
                         bytes,
                         if append {
                             WriteAt::End
@@ -1443,7 +1602,7 @@ impl LocalMount {
             let meta = self
                 .state
                 .fs
-                .open_metadata(&open_ref)
+                .open_metadata(&open.open_ref)
                 .await
                 .map_err(map_vfs_err)?;
             return json_to_js(&json!({
@@ -1458,32 +1617,10 @@ impl LocalMount {
             .ok_or_else(|| map_vfs_err(Errno::EINVAL))?;
         let append = append_opt.unwrap_or(false);
         let w_open = if create {
-            let (parent_entry, name, _) = self
-                .resolve_parent(&cred, &path)
-                .await
-                .map_err(map_vfs_err)?;
-            let create_cred = if self.remote {
-                self.check_access_entry(&cred, &parent_entry, 3)
-                    .await
-                    .map_err(map_vfs_err)?;
-                Cred {
-                    identity: self.state.grant.owner.clone(),
-                    umask: cred.umask,
-                    token: None,
-                }
-            } else {
-                cred.clone()
-            };
-            let (_, o) = self
-                .state
-                .fs
-                .create(
-                    &create_cred,
-                    &parent_entry.handle,
-                    &name,
-                    0o666,
-                    OpenOptions::new().write(true).create(true),
-                )
+            let mut create_opts = OpenOptions::new();
+            create_opts.write(true).create(true);
+            let (_, o, _, _) = self
+                .open_or_create_target(&cred, &path, false, 0o666, &create_opts)
                 .await
                 .map_err(map_vfs_err)?;
             o
@@ -1545,13 +1682,16 @@ impl LocalMount {
             return Err(map_vfs_err(Errno::EINVAL));
         }
         let cred = self.cred(None);
-        let (_, open_ref, h, path, _) = self.lookup_open(&handle).map_err(map_vfs_err)?;
-        self.verify_remote_open_live(&cred, &open_ref, &h, &path, true)
+        let open = self.lookup_open(&handle).map_err(map_vfs_err)?;
+        if open.open_ref.access == Access::Path {
+            return Err(map_vfs_err(Errno::EBADF));
+        }
+        self.verify_remote_open_live(&cred, &open, Access::Write)
             .await
             .map_err(map_vfs_err)?;
         self.state
             .fs
-            .set_len(&open_ref, size as u64)
+            .set_len(&open.open_ref, size as u64)
             .await
             .map_err(map_vfs_err)?;
         Ok(JsValue::NULL)
@@ -1564,17 +1704,20 @@ impl LocalMount {
         data_only: bool,
     ) -> Result<JsValue, JsValue> {
         self.check_grant(&grant).map_err(map_vfs_err)?;
-        let (_, open_ref, _, _, _) = self.lookup_open(&handle).map_err(map_vfs_err)?;
+        let open = self.lookup_open(&handle).map_err(map_vfs_err)?;
+        if open.open_ref.access == Access::Path {
+            return Err(map_vfs_err(Errno::EBADF));
+        }
         if data_only {
             self.state
                 .fs
-                .sync_data(&open_ref)
+                .sync_data(&open.open_ref)
                 .await
                 .map_err(map_vfs_err)?;
         } else {
             self.state
                 .fs
-                .sync_all(&open_ref)
+                .sync_all(&open.open_ref)
                 .await
                 .map_err(map_vfs_err)?;
         }
@@ -1598,11 +1741,14 @@ impl LocalMount {
         let cred = self.cred(None);
 
         let dir_handle = if target.is_object() {
-            let (_, open_ref, handle, path, _) = self.lookup_open(&target).map_err(map_vfs_err)?;
-            self.verify_remote_open_live(&cred, &open_ref, &handle, &path, false)
+            let open = self.lookup_open(&target).map_err(map_vfs_err)?;
+            if open.open_ref.access == Access::Path && !open.held {
+                return Err(map_vfs_err(Errno::EBADF));
+            }
+            self.verify_remote_open_live(&cred, &open, Access::Read)
                 .await
                 .map_err(map_vfs_err)?;
-            handle
+            open.handle
         } else {
             let path = target.as_string().unwrap_or_default();
             let (parts, _) = clean_rel_path(&path).map_err(map_vfs_err)?;
@@ -1891,13 +2037,16 @@ impl LocalMount {
         end: Option<f64>,
     ) -> Result<JsValue, JsValue> {
         self.check_grant(&grant).map_err(map_vfs_err)?;
-        let (_, open_ref, _, _, _) = self.lookup_open(&handle).map_err(map_vfs_err)?;
+        let open = self.lookup_open(&handle).map_err(map_vfs_err)?;
+        if open.open_ref.access == Access::Path {
+            return Err(map_vfs_err(Errno::EBADF));
+        }
         let fam = parse_family(family)?;
         let lk = parse_kind(kind)?;
         let range = parse_range(start, end)?;
         self.state
             .fs
-            .try_lock(&open_ref, fam, lk, range)
+            .try_lock(&open.open_ref, fam, lk, range)
             .await
             .map_err(map_vfs_err)?;
         Ok(JsValue::NULL)
@@ -1913,13 +2062,16 @@ impl LocalMount {
         end: Option<f64>,
     ) -> Result<JsValue, JsValue> {
         self.check_grant(&grant).map_err(map_vfs_err)?;
-        let (_, open_ref, _, _, _) = self.lookup_open(&handle).map_err(map_vfs_err)?;
+        let open = self.lookup_open(&handle).map_err(map_vfs_err)?;
+        if open.open_ref.access == Access::Path {
+            return Err(map_vfs_err(Errno::EBADF));
+        }
         let fam = parse_family(family)?;
         let lk = parse_kind(kind)?;
         let range = parse_range(start, end)?;
         self.state
             .fs
-            .lock(&open_ref, fam, lk, range)
+            .lock(&open.open_ref, fam, lk, range)
             .await
             .map_err(map_vfs_err)?;
         Ok(JsValue::NULL)
@@ -1934,12 +2086,15 @@ impl LocalMount {
         end: Option<f64>,
     ) -> Result<JsValue, JsValue> {
         self.check_grant(&grant).map_err(map_vfs_err)?;
-        let (_, open_ref, _, _, _) = self.lookup_open(&handle).map_err(map_vfs_err)?;
+        let open = self.lookup_open(&handle).map_err(map_vfs_err)?;
+        if open.open_ref.access == Access::Path {
+            return Err(map_vfs_err(Errno::EBADF));
+        }
         let fam = parse_family(family)?;
         let range = parse_range(start, end)?;
         self.state
             .fs
-            .unlock(&open_ref, fam, range)
+            .unlock(&open.open_ref, fam, range)
             .await
             .map_err(map_vfs_err)?;
         Ok(JsValue::NULL)
@@ -1955,13 +2110,16 @@ impl LocalMount {
         end: Option<f64>,
     ) -> Result<JsValue, JsValue> {
         self.check_grant(&grant).map_err(map_vfs_err)?;
-        let (_, open_ref, _, _, _) = self.lookup_open(&handle).map_err(map_vfs_err)?;
+        let open = self.lookup_open(&handle).map_err(map_vfs_err)?;
+        if open.open_ref.access == Access::Path {
+            return Err(map_vfs_err(Errno::EBADF));
+        }
         let lk = parse_kind(kind)?;
         let range = parse_range(start, end)?;
         let conflict = self
             .state
             .fs
-            .test_lock(&open_ref, lk, range)
+            .test_lock(&open.open_ref, lk, range)
             .await
             .map_err(map_vfs_err)?;
         json_to_js(&serde_json::to_value(conflict).unwrap_or(Value::Null))
@@ -1974,22 +2132,25 @@ impl LocalMount {
         }
         let cred = self.cred(None);
         let (entry, resolved_path) = if target.is_object() {
-            let (_, open_ref, handle, path, _) = self.lookup_open(&target).map_err(map_vfs_err)?;
-            self.verify_remote_open_live(&cred, &open_ref, &handle, &path, false)
+            let open = self.lookup_open(&target).map_err(map_vfs_err)?;
+            if open.open_ref.access == Access::Path && !open.held {
+                return Err(map_vfs_err(Errno::EBADF));
+            }
+            self.verify_remote_open_live(&cred, &open, Access::Exec)
                 .await
                 .map_err(map_vfs_err)?;
             let meta = self
                 .state
                 .fs
-                .open_metadata(&open_ref)
+                .open_metadata(&open.open_ref)
                 .await
                 .map_err(map_vfs_err)?;
             (
                 Entry {
-                    handle,
+                    handle: open.handle,
                     metadata: meta,
                 },
-                path,
+                open.path,
             )
         } else {
             let path = target
@@ -2069,7 +2230,7 @@ impl LocalMount {
                     boundary,
                     remote: false,
                     next_local_open: Cell::new(1),
-                    opens: RefCell::new(HashMap::new()),
+                    opens: Rc::new(RefCell::new(HashMap::new())),
                 };
                 let check_cred = view.cred(None);
                 let (parts, _) = clean_rel_path(&path).map_err(|_| map_vfs_err(Errno::ESTALE))?;
@@ -2125,18 +2286,8 @@ impl LocalMount {
         if !js_sys::Object::is(&grant, &self.state.grant_js) {
             return Err(map_vfs_err(Errno::EACCES));
         }
-        if !self.state.active.replace(false) {
-            return Ok(());
-        }
-        let drained: Vec<RetainedOpen> = self.opens.borrow_mut().drain().map(|(_, v)| v).collect();
-        let fs = Rc::clone(&self.state.fs);
-        wasm_bindgen_futures::spawn_local(async move {
-            for item in drained {
-                let _ = fs.release(&item.open_ref).await;
-            }
-        });
-        if let Some(cb) = self.state.unmount_fn.borrow_mut().take() {
-            cb();
+        if self.state.active.get() {
+            self.state.shutdown();
         }
         Ok(())
     }

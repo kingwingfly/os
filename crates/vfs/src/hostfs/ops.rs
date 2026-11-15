@@ -1,6 +1,6 @@
 use super::{
-    Backing, Fingerprint, HostEntry, HostFs, HostGrant, HostKind, HostTree, InodeRecord, LockGuard,
-    MetaBatch, MetaStore, OpenEntry, ProfileLocks, ROOT_INO, STORE_FORMAT_VERSION, StoreHeader,
+    Backing, Fingerprint, HostEntry, HostFs, HostKind, HostTree, InodeRecord, LockGuard, MetaBatch,
+    MetaStore, OpenEntry, ProfileLocks, ROOT_INO, STORE_FORMAT_VERSION, StoreHeader,
 };
 use crate::{
     Access, Cred, DirEntry, Entry, FILE_MAX, FileType, Handle, LockKind, Metadata, NodeId,
@@ -261,7 +261,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
     }
 
     fn default_inode_from_host(
-        grant: &HostGrant,
+        owner: &Identity,
         ino: u64,
         parent: u64,
         name: &str,
@@ -270,22 +270,12 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
     ) -> InodeRecord {
         let is_dir = host.file_type == FileType::Dir;
         let mut meta = if is_dir {
-            Node::directory(grant.owner.id, grant.owner.group, 0o700)
+            Node::directory(owner.id, owner.group, 0o700)
         } else {
-            let mode = 0o400
-                | if grant.read_only { 0 } else { 0o200 }
-                | if grant.execute && host.executable {
-                    0o100
-                } else {
-                    0
-                };
-            Node::file(
-                grant.owner.id,
-                grant.owner.group,
-                mode,
-                String::new(),
-                host.size,
-            )
+            // Initialize durable permissions from host metadata independently of mount-level
+            // read-only / no-exec ceilings so browsing read-only does not strip owner write/exec bits.
+            let mode = 0o600 | if host.executable { 0o100 } else { 0 };
+            Node::file(owner.id, owner.group, mode, String::new(), host.size)
         };
         meta.ino = ino;
         let ts = (host.mtime.sec, host.mtime.nsec);
@@ -370,7 +360,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                 let mut header = self.load_header().await?;
                 let ino = Self::alloc_ino(&mut header)?;
                 let child = Self::default_inode_from_host(
-                    &self.grant,
+                    &self.grant.owner,
                     ino,
                     dir.ino,
                     name,
@@ -436,7 +426,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                 let mut header = self.load_header().await?;
                 let new_ino = Self::alloc_ino(&mut header)?;
                 let new_child = Self::default_inode_from_host(
-                    &self.grant,
+                    &self.grant.owner,
                     new_ino,
                     dir.ino,
                     name,
@@ -1428,33 +1418,118 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             modified.insert(to_parent.ino, to_parent.clone());
         }
 
-        // First clean up / evacuate overwritten target if present.
+        enum UndoTargetMove {
+            ToPath { from: String, to: String },
+            ToOrphan { ino: u64, to: String },
+        }
+
+        let source_has_path =
+            moving_dir || matches!(&source.backing, Backing::Path(bp) if bp == &from_path);
+        let mut undo_target = None;
+
+        // If `move_entry` will overwrite `to_path` directly, only stage away a hard-linked or open
+        // OPFS target so a failed `move_entry` (e.g., `EDQUOT`) never loses the destination.
         if let Some(mut target) = existing {
             target.parents.remove(&(to_parent.ino, to.to_string()));
             target.ctime = now;
-            let delete_target = self
-                .evacuate_or_remove_unlinked_link(&mut target, &to_path, &mut modified)
-                .await?;
-            if delete_target {
-                delete_inodes.push(target.ino);
-                delete_locks.push(target.ino);
+            if source_has_path {
+                if !target.meta.directory && self.kind == HostKind::Opfs {
+                    target.nlink = target.nlink.saturating_sub(1);
+                    if let Backing::Path(bp) = target.backing.clone()
+                        && bp == to_path
+                    {
+                        if target.nlink > 0 {
+                            let (other_dir_ino, other_name) =
+                                target.parents.iter().next().cloned().ok_or(Errno::EIO)?;
+                            let other_dir = if let Some(d) = modified.get(&other_dir_ino) {
+                                d.clone()
+                            } else {
+                                self.meta
+                                    .get_inode(other_dir_ino)
+                                    .await?
+                                    .ok_or(Errno::EIO)?
+                            };
+                            let Backing::Path(other_dir_path) = other_dir.backing else {
+                                return Err(Errno::EIO);
+                            };
+                            let other_path = join_rel(&other_dir_path, &other_name);
+                            self.tree.move_entry(&bp, &other_path, false).await?;
+                            target.backing = Backing::Path(other_path.clone());
+                            undo_target = Some(UndoTargetMove::ToPath {
+                                from: other_path,
+                                to: to_path.clone(),
+                            });
+                            modified.insert(target.ino, target);
+                        } else if self.has_external_opens(target.ino).await? {
+                            self.tree.move_to_orphan(&bp, target.ino).await?;
+                            target.backing = Backing::Orphan(target.ino);
+                            undo_target = Some(UndoTargetMove::ToOrphan {
+                                ino: target.ino,
+                                to: to_path.clone(),
+                            });
+                            modified.insert(target.ino, target);
+                        } else {
+                            delete_inodes.push(target.ino);
+                            delete_locks.push(target.ino);
+                        }
+                    } else if target.nlink == 0 && !self.has_external_opens(target.ino).await? {
+                        delete_inodes.push(target.ino);
+                        delete_locks.push(target.ino);
+                    } else {
+                        modified.insert(target.ino, target);
+                    }
+                } else {
+                    target.nlink = 0;
+                    if self.kind == HostKind::Directory {
+                        target.stale = true;
+                        modified.insert(target.ino, target);
+                    } else {
+                        target.backing = Backing::MetaOnly;
+                        if self.has_external_opens(target.ino).await? {
+                            modified.insert(target.ino, target);
+                        } else {
+                            delete_inodes.push(target.ino);
+                            delete_locks.push(target.ino);
+                        }
+                    }
+                }
             } else {
-                modified.insert(target.ino, target);
+                let delete_target = self
+                    .evacuate_or_remove_unlinked_link(&mut target, &to_path, &mut modified)
+                    .await?;
+                if delete_target {
+                    delete_inodes.push(target.ino);
+                    delete_locks.push(target.ino);
+                } else {
+                    modified.insert(target.ino, target);
+                }
             }
         }
 
         // Now move source on host if its backing lives at `from_path`.
-        let moved_fps: Vec<(String, Fingerprint)> = if moving_dir {
-            self.tree.move_entry(&from_path, &to_path, true).await?
-        } else {
-            match &source.backing {
-                Backing::Path(bp) if bp == &from_path => {
-                    let fps = self.tree.move_entry(&from_path, &to_path, false).await?;
-                    source.backing = Backing::Path(to_path.clone());
+        let moved_fps: Vec<(String, Fingerprint)> = if source_has_path {
+            match self.tree.move_entry(&from_path, &to_path, moving_dir).await {
+                Ok(fps) => {
+                    if !moving_dir {
+                        source.backing = Backing::Path(to_path.clone());
+                    }
                     fps
                 }
-                _ => Vec::new(),
+                Err(err) => {
+                    match undo_target {
+                        Some(UndoTargetMove::ToPath { from, to }) => {
+                            let _ = self.tree.move_entry(&from, &to, false).await;
+                        }
+                        Some(UndoTargetMove::ToOrphan { ino, to }) => {
+                            let _ = self.tree.restore_orphan(ino, &to).await;
+                        }
+                        None => {}
+                    }
+                    return Err(err);
+                }
             }
+        } else {
+            Vec::new()
         };
 
         if moving_dir {

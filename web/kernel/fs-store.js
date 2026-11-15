@@ -704,19 +704,33 @@ function buildStore({
           }
         }
 
-        // Remove destination first if replacing an existing file or empty directory.
-        await dstParent.removeEntry(dstName, { recursive: false }).catch(err => {
-          if (err?.name !== 'NotFoundError') throw err;
-        });
+        // Remove destination only when falling back to directory copy; files overwrite atomically
+        // via `createWritable` only when `stream.close()` succeeds.
+        let removedDestDir = false;
+        if (isDir) {
+          try {
+            await dstParent.removeEntry(dstName, { recursive: false });
+            removedDestDir = true;
+          } catch (err) {
+            if (err?.name !== 'NotFoundError') throw err;
+          }
+        }
 
         const updates = [];
-        if (isDir) {
-          await copyDirectoryRecursive(entry, dstParent, dstName, to, updates);
-          await srcParent.removeEntry(srcName, { recursive: true });
-        } else {
-          const fp = await copyFileHandle(entry, dstParent, dstName);
-          updates.push([to, fp]);
-          await srcParent.removeEntry(srcName, { recursive: false });
+        try {
+          if (isDir) {
+            await copyDirectoryRecursive(entry, dstParent, dstName, to, updates);
+            await srcParent.removeEntry(srcName, { recursive: true });
+          } else {
+            const fp = await copyFileHandle(entry, dstParent, dstName);
+            updates.push([to, fp]);
+            await srcParent.removeEntry(srcName, { recursive: false });
+          }
+        } catch (err) {
+          if (removedDestDir) {
+            await dstParent.getDirectoryHandle(dstName, { create: true }).catch(() => {});
+          }
+          throw err;
         }
         return updates;
       });
@@ -740,6 +754,26 @@ function buildStore({
         }
         await copyFileHandle(fh, orphanDir, inoStr);
         await srcParent.removeEntry(srcName, { recursive: false });
+      });
+    },
+
+    restoreOrphan(inoStr, path) {
+      return runHost(async () => {
+        const orphanDir = await orphanDirHandle(false);
+        const fh = await orphanDir.getFileHandle(inoStr);
+        const { parent: dstParent, name: dstName } = await resolveParent(path);
+        if (typeof fh.move === 'function') {
+          try {
+            await fh.move(dstParent, dstName);
+            return;
+          } catch (moveErr) {
+            if (!['NotSupportedError', 'InvalidModificationError', 'TypeError'].includes(moveErr?.name)) {
+              throw moveErr;
+            }
+          }
+        }
+        await copyFileHandle(fh, dstParent, dstName);
+        await orphanDir.removeEntry(inoStr, { recursive: false });
       });
     },
 

@@ -127,6 +127,7 @@ struct LockBusInner {
     held: BTreeMap<String, Vec<HeldWebLock>>,
     waiters: Vec<Waker>,
     change_epoch: u64,
+    notify_epoch: u64,
     next_holder_id: u64,
     next_ticket_id: u64,
 }
@@ -197,6 +198,7 @@ impl SimProfile {
                 held: BTreeMap::new(),
                 waiters: Vec::new(),
                 change_epoch: 0,
+                notify_epoch: 0,
                 next_holder_id: 1,
                 next_ticket_id: 1,
             })),
@@ -343,6 +345,10 @@ impl SimProfile {
 
     pub fn set_flush_error(&self, err: bool) {
         self.tree.borrow_mut().flush_error = err;
+    }
+
+    pub fn lock_notifications(&self) -> u64 {
+        self.bus.borrow().notify_epoch
     }
 
     pub fn set_permission_revoked(&self, revoked: bool) {
@@ -689,6 +695,18 @@ impl HostTree for SimTree {
         })
     }
 
+    fn restore_orphan<'a>(&'a self, ino: u64, to: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let mut t = self.0.borrow_mut();
+            t.tree_ops += 1;
+            t.check_perm()?;
+            t.require_parent_dir(to)?;
+            let f = t.orphans.remove(&ino).ok_or(Errno::ENOENT)?;
+            t.files.insert(to.to_string(), f);
+            Ok(())
+        })
+    }
+
     fn remove_orphan(&self, ino: u64) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             let mut t = self.0.borrow_mut();
@@ -929,20 +947,22 @@ impl ProfileLocks for SimLocks {
     }
 
     fn notify_locks(&self) {
-        self.bus.borrow_mut().wake_all();
+        let mut bus = self.bus.borrow_mut();
+        bus.notify_epoch = bus.notify_epoch.wrapping_add(1);
+        bus.wake_all();
     }
 
     fn wait_for_change<'a>(&'a self, blocking_locks: &'a [String]) -> BoxFuture<'a, ()> {
         let blockers: Vec<String> = blocking_locks.to_vec();
         Box::pin(async move {
-            let start_epoch = self.bus.borrow().change_epoch;
+            let start_epoch = self.bus.borrow().notify_epoch;
             let _ = self.fifo.borrow();
             poll_fn(|cx| {
                 if *self.unavailable.borrow() {
                     return Poll::Ready(Err(Errno::ENOLCK));
                 }
                 let mut bus = self.bus.borrow_mut();
-                if bus.change_epoch != start_epoch
+                if bus.notify_epoch != start_epoch
                     || blockers
                         .iter()
                         .any(|b| !bus.held.get(b).is_some_and(|v| !v.is_empty()))

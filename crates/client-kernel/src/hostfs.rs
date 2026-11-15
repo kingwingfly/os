@@ -483,6 +483,19 @@ impl HostTree for JsHostTree {
         })
     }
 
+    fn restore_orphan<'a>(&'a self, ino: u64, to: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let ino_str = ino.to_string();
+            self.0
+                .call_async(
+                    "restoreOrphan",
+                    &[JsValue::from_str(&ino_str), JsValue::from_str(to)],
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
     fn remove_orphan(&self, ino: u64) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             let ino_str = ino.to_string();
@@ -873,8 +886,7 @@ pub async fn mount_opfs(store: JsValue, grant_json: &str) -> Result<LocalMount, 
         }
     };
     let close_store = Rc::clone(&js_store);
-    let mount =
-        mounts::from_fs_with_unmount(Rc::new(fs), grant, Box::new(move || close_store.close()));
+    let mount = mounts::from_fs_with_unmount(Rc::new(fs), grant, move || close_store.close());
     js_store.set_on_revoke(mount.detach_callback());
     Ok(mount)
 }
@@ -901,8 +913,7 @@ pub async fn mount_directory(store: JsValue, grant_json: &str) -> Result<LocalMo
         }
     };
     let close_store = Rc::clone(&js_store);
-    let mount =
-        mounts::from_fs_with_unmount(Rc::new(fs), grant, Box::new(move || close_store.close()));
+    let mount = mounts::from_fs_with_unmount(Rc::new(fs), grant, move || close_store.close());
     js_store.set_on_revoke(mount.detach_callback());
     Ok(mount)
 }

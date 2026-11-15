@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { Workspace, localPath, localFdPath, LOCAL_FD } from '../web/kernel/workspace.js';
 import { currentWorkspace, mountRequest, endWorkspace } from '../web/kernel/workspaces.js';
 import { localImage } from '../web/kernel/local-mounts.js';
+import { NativeMount } from '../web/kernel/native-mount.js';
 import { exportMount, attachMount } from '../web/kernel/mount-sharing.js';
 
 // --- Compile & load real `os-client-kernel` Wasm module for Node.js ---
@@ -1129,6 +1130,11 @@ test('RemoteMount and exportMount support O_EXCL, RENAME_NOREPLACE, links, fsync
           if (pair.ownerPort === ch.port2) pair.targetPort?.postMessage({ type: 'message', message: data.message });
           else if (pair.targetPort === ch.port2) pair.ownerPort?.postMessage({ type: 'message', message: data.message });
         }
+      } else if (data.type === 'close') {
+        for (const pair of grants.values()) {
+          if (pair.ownerPort === ch.port2) pair.targetPort?.postMessage({ type: 'closed', errno: 'ENODEV' });
+          else if (pair.targetPort === ch.port2) pair.ownerPort?.postMessage({ type: 'closed', errno: 'ENODEV' });
+        }
       } else if (data.type === 'reject') {
         for (const [k, pair] of grants.entries()) {
           if (k.endsWith(':' + data.session)) pair.targetPort?.postMessage({ type: 'closed', errno: data.errno });
@@ -1212,6 +1218,274 @@ test('RemoteMount and exportMount support O_EXCL, RENAME_NOREPLACE, links, fsync
     assert.equal(remoteOps[12].ok.nlink, 0);
     assert.equal(atob(remoteOps[13].ok.data), 'remote-hello');
     assert.equal(remoteOps[14].err.errno, 'ELOOP');
+  } finally {
+    globalThis.fetch = prevFetch;
+    peer.close();
+    owner.close();
+    for (const ch of channels) {
+      try { ch.port1.close(); } catch {}
+      try { ch.port2.close(); } catch {}
+    }
+  }
+});
+
+test('O_PATH rejects I/O and fchmod with EBADF while allowing fstat and symlink targets, and NativeMount rejects noreplace rename', async () => {
+  installBrowserEnv();
+  const ws = new Workspace({ id: 'opath-ws', uid: 77, gid: 77, groups: [77] });
+  await ws.mount({ name: 'opfs', storage: true, writable: true, execute: false, cloud: false });
+
+  await ws.calls([
+    { open: { path: '/mnt/local/opfs/file.txt', flags: 0o302, mode: 0o600 } },
+    { pwrite: { fd: { ref: 0 }, index: 0, data: btoa('hello') } },
+    { close: { fd: { ref: 0 } } },
+    { mkdir: { path: '/mnt/local/opfs/dir', mode: 0o700 } },
+    { symlink: { target: 'file.txt', path: '/mnt/local/opfs/sym' } },
+  ], ws.page, cloud);
+
+  const O_PATH = 0o10000000;
+  const O_NOFOLLOW = 0o400000;
+  const f = await ws.calls([
+    { open: { path: '/mnt/local/opfs/file.txt', flags: O_PATH } },
+    { fstat: { fd: { ref: 0 } } },
+    { pread: { fd: { ref: 0 }, count: 8 } },
+    { pwrite: { fd: { ref: 0 }, index: 0, data: btoa('x') } },
+    { ftruncate: { fd: { ref: 0 }, size: 0 } },
+    { fsync: { fd: { ref: 0 }, data_only: false } },
+    { fchmod: { fd: { ref: 0 }, mode: 0o644 } },
+    { close: { fd: { ref: 0 } } },
+    { open: { path: '/mnt/local/opfs/dir', flags: O_PATH } },
+    { fstat: { fd: { ref: 8 } } },
+    { fchmod: { fd: { ref: 8 }, mode: 0o755 } },
+    { close: { fd: { ref: 8 } } },
+    { open: { path: '/mnt/local/opfs/sym', flags: O_PATH | O_NOFOLLOW } },
+    { fstat: { fd: { ref: 12 } } },
+    { close: { fd: { ref: 12 } } },
+  ], ws.page, cloud);
+
+  assert.equal(f[1].ok.size, 5);
+  assert.equal(f[2].err.errno, 'EBADF');
+  assert.equal(f[3].err.errno, 'EBADF');
+  assert.equal(f[4].err.errno, 'EBADF');
+  assert.equal(f[5].err.errno, 'EBADF');
+  assert.equal(f[6].err.errno, 'EBADF');
+  assert.equal(f[9].ok.mode & 0o170000, 0o040000);
+  assert.equal(f[10].err.errno, 'EBADF');
+  assert.equal(f[13].ok.mode & 0o170000, 0o120000);
+
+  // Also test direct LocalMount facade handles for O_PATH (`!held`).
+  const m = ws.mounts.get('/mnt/local/opfs');
+  const mh = await m.provider.open(m.grant, 'file.txt', O_PATH);
+  const dh = await m.provider.open(m.grant, 'dir', O_PATH);
+  assert.equal((await m.provider.stat(m.grant, mh)).size, 5);
+  for (const op of [
+    () => m.provider.read(m.grant, mh, 0, 4),
+    () => m.provider.write(m.grant, mh, new Uint8Array([1]), {}),
+    () => m.provider.ftruncate(m.grant, mh, 0),
+    () => m.provider.fsync(m.grant, mh, false),
+    () => m.provider.policy(m.grant, mh, 'chmod', { mode: 0o644 }),
+    () => m.provider.tryLock(m.grant, mh, 'flock', 'shared', 0),
+    () => m.provider.list(m.grant, dh, {}),
+  ]) {
+    await assert.rejects(op, { errno: 'EBADF' });
+  }
+  await m.provider.release(m.grant, mh);
+  await m.provider.release(m.grant, dh);
+
+  // NativeMount standalone must fail `rename(..., { noreplace: true })` with `EOPNOTSUPP`.
+  const native = new NativeMount('http://127.0.0.1:1/');
+  native.grant = Object.freeze({ kind: 'native-directory', name: 'nat', readOnly: false, execute: false });
+  native.rename = () => assert.fail('NativeMount.rename must not run when noreplace is set');
+  ws.mounts.set('/mnt/local/nat', {
+    path: '/mnt/local/nat',
+    name: 'nat',
+    grant: native.grant,
+    provider: native,
+    cloud: false,
+    active: true,
+  });
+  const [natRes] = await ws.calls([{ rename: { from: '/mnt/local/nat/a', to: '/mnt/local/nat/b', noreplace: true } }], ws.page, cloud);
+  assert.equal(natRes.err.errno, 'EOPNOTSUPP');
+
+  ws.close();
+});
+
+test('RemoteMount enforces O_CREAT target auth, final symlinks, RO O_CREAT|O_EXCL, O_WRONLY fstat, unlinked fchmod revocation, mutating open disconnects, and unmount open drain', async () => {
+  installBrowserEnv();
+  const owner = new Workspace({ id: 'owner-sec', uid: 50, gid: 50, groups: [50] });
+  const peer = new Workspace({ id: 'peer-sec', uid: 51, gid: 51, groups: [51] });
+  await owner.mount({ name: 'opfs', storage: true, writable: true, execute: true, cloud: false });
+
+  await owner.calls([
+    { mkdir: { path: '/mnt/local/opfs/sub', mode: 0o700 } },
+    { setxattr: { path: '/mnt/local/opfs/sub', ...aclAttr(acl({ 51: 7 }, 7)) } },
+    { open: { path: '/mnt/local/opfs/sub/pub.txt', flags: 0o302, mode: 0o600 } },
+    { pwrite: { fd: { ref: 2 }, index: 0, data: btoa('PUB') } },
+    { close: { fd: { ref: 2 } } },
+    { symlink: { target: 'pub.txt', path: '/mnt/local/opfs/sub/pubsym' } },
+    { open: { path: '/mnt/local/opfs/sub/writable.txt', flags: 0o302, mode: 0o666 } },
+    { chmod: { path: '/mnt/local/opfs/sub/writable.txt', mode: 0o666 } },
+    { pwrite: { fd: { ref: 6 }, index: 0, data: btoa('OLD') } },
+    { close: { fd: { ref: 6 } } },
+    { symlink: { target: 'writable.txt', path: '/mnt/local/opfs/sub/wsym' } },
+    { symlink: { target: 'dangling-target.txt', path: '/mnt/local/opfs/sub/dsym' } },
+    { open: { path: '/mnt/local/opfs/sub/writeonly.txt', flags: 0o302, mode: 0o222 } },
+    { chmod: { path: '/mnt/local/opfs/sub/writeonly.txt', mode: 0o222 } },
+    { close: { fd: { ref: 12 } } },
+    { open: { path: '/mnt/local/opfs/sub/ephem.txt', flags: 0o302, mode: 0o644 } },
+    { chmod: { path: '/mnt/local/opfs/sub/ephem.txt', mode: 0o644 } },
+    { pwrite: { fd: { ref: 15 }, index: 0, data: btoa('SECRET') } },
+    { close: { fd: { ref: 15 } } },
+  ], owner.page, cloud);
+
+  const prevFetch = globalThis.fetch;
+  const listeners = new Map();
+  const grants = new Map();
+  const channels = [];
+  function makeRelayBridge(isOwner) {
+    const ch = new MessageChannel();
+    channels.push(ch);
+    ch.port2.onmessage = ({ data }) => {
+      if (data.type === 'listen') {
+        const id = data.url.split('/listen/')[1].split('?')[0];
+        listeners.set(id, ch.port2);
+        queueMicrotask(() => ch.port2.postMessage({ type: 'ready' }));
+      } else if (data.type === 'connect') {
+        const parts = data.url.split('/channel/')[1].split('?')[0].split('/');
+        const pair = grants.get(parts[0] + ':' + parts[1]);
+        pair[isOwner ? 'ownerPort' : 'targetPort'] = ch.port2;
+        if (pair.ownerPort && pair.targetPort) {
+          queueMicrotask(() => {
+            pair.ownerPort.postMessage({ type: 'ready' });
+            pair.targetPort.postMessage({ type: 'ready' });
+          });
+        }
+      } else if (data.type === 'send') {
+        for (const pair of grants.values()) {
+          if (pair.ownerPort === ch.port2) pair.targetPort?.postMessage({ type: 'message', message: data.message });
+          else if (pair.targetPort === ch.port2) pair.ownerPort?.postMessage({ type: 'message', message: data.message });
+        }
+      } else if (data.type === 'close') {
+        for (const pair of grants.values()) {
+          if (pair.ownerPort === ch.port2) pair.targetPort?.postMessage({ type: 'closed', errno: 'ENODEV' });
+          else if (pair.targetPort === ch.port2) pair.ownerPort?.postMessage({ type: 'closed', errno: 'ENODEV' });
+        }
+      }
+    };
+    ch.port2.start();
+    return ch.port1;
+  }
+
+  let currentFetchUid = 50;
+  try {
+    globalThis.fetch = async (url, init) => {
+      const body = init?.body ? JSON.parse(init.body) : {};
+      if (url === '/api/mounts/publish') {
+        const id = crypto.randomUUID();
+        grants.set(id, { write: body.write, execute: body.execute, expires: Date.now() + 60_000 });
+        return new Response(JSON.stringify({ id, uid: currentFetchUid, ticket: 't', expires: Date.now() + 60_000, name: body.name, write: body.write, execute: body.execute }), { status: 200 });
+      }
+      if (url.startsWith('/api/mounts/connect/')) {
+        const id = url.split('/connect/')[1];
+        const g = grants.get(id);
+        const session = crypto.randomUUID();
+        grants.set(id + ':' + session, { ownerPort: null, targetPort: null });
+        const ownerPort = makeRelayBridge(true);
+        listeners.get(id).postMessage({
+          type: 'client',
+          session,
+          ticket: 't',
+          port: ownerPort,
+          password: false,
+          identity: { id: 51, group: 51, groups: [51] },
+          write: g.write && body.write,
+          execute: g.execute && body.execute,
+        }, [ownerPort]);
+        return new Response(JSON.stringify({ id, session, uid: currentFetchUid, ticket: 't', expires: g.expires, name: 'shared', write: g.write && body.write, execute: g.execute && body.execute }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ exports: [] }), { status: 200 });
+    };
+
+    currentFetchUid = 50;
+    const pub = await exportMount(owner, { path: '/mnt/local/opfs/sub', name: 'sub', seconds: 60, port: makeRelayBridge(true) });
+    currentFetchUid = 51;
+    const remoteRw = await attachMount(peer, { address: pub.address, writable: true, execute: false, port: makeRelayBridge(false) });
+    const remoteRo = await attachMount(peer, { address: pub.address, writable: false, execute: false, port: makeRelayBridge(false) });
+    peer.mounts.set('/mnt/shared/rw', { path: '/mnt/shared/rw', name: 'rw', grant: remoteRw.grant, provider: remoteRw, cloud: false, active: true });
+    peer.mounts.set('/mnt/shared/ro', { path: '/mnt/shared/ro', name: 'ro', grant: remoteRo.grant, provider: remoteRo, cloud: false, active: true });
+
+    // 1. Existing 0600 publisher file cannot be opened/truncated by receiver via O_CREAT or write(create:true),
+    // while non-exclusive O_CREAT follows final symlinks (both existing target and dangling symlink).
+    const peerRes = await peer.calls([
+      { open: { path: '/mnt/shared/rw/pub.txt', flags: 0o1102, mode: 0o600 } }, // EACCES!
+      { open: { path: '/mnt/shared/rw/pubsym', flags: 0o1102, mode: 0o600 } }, // EACCES!
+      { open: { path: '/mnt/shared/rw/wsym', flags: 0o1102, mode: 0o600 } },
+      { pwrite: { fd: { ref: 2 }, index: 0, data: btoa('W1') } },
+      { close: { fd: { ref: 2 } } },
+      { open: { path: '/mnt/shared/rw/dsym', flags: 0o102, mode: 0o600 } },
+      { pwrite: { fd: { ref: 5 }, index: 0, data: btoa('DAN') } },
+      { close: { fd: { ref: 5 } } },
+      { open: { path: '/mnt/shared/rw/writeonly.txt', flags: 1 } }, // O_WRONLY on 0222!
+      { fstat: { fd: { ref: 8 } } },
+      { pwrite: { fd: { ref: 8 }, index: 0, data: btoa('WO') } },
+      { close: { fd: { ref: 8 } } },
+      { open: { path: '/mnt/shared/ro/absent.txt', flags: 0o300, mode: 0o600 } }, // O_RDONLY|O_CREAT|O_EXCL -> EROFS!
+      { open: { path: '/mnt/shared/ro/pub.txt', flags: 0o300, mode: 0o600 } }, // existing -> EEXIST!
+    ], peer.page, cloud);
+
+    assert.equal(peerRes[0].err.errno, 'EACCES');
+    assert.equal(peerRes[1].err.errno, 'EACCES');
+    assert.equal(peerRes[3].ok.written, 2);
+    assert.equal(peerRes[6].ok.written, 3);
+    assert.equal(peerRes[9].ok.mode & 0o777, 0o222, JSON.stringify(peerRes));
+    assert.equal(peerRes[10].ok.written, 2);
+    assert.equal(peerRes[12].err.errno, 'EROFS');
+    assert.equal(peerRes[13].err.errno, 'EEXIST');
+    await assert.rejects(
+      remoteRw.write(remoteRw.grant, 'pub.txt', new TextEncoder().encode('HACK'), { create: true }),
+      { errno: 'EACCES' },
+    );
+    await assert.rejects(owner.stat('/mnt/local/opfs/sub/absent.txt'), { errno: 'ENOENT' });
+    const [pubAfter] = await owner.calls([{ pread: { path: '/mnt/local/opfs/sub/pub.txt', count: 16 } }], owner.page, cloud);
+    assert.equal(atob(pubAfter.ok.data), 'PUB');
+    const [danglingAfter] = await owner.calls([{ pread: { path: '/mnt/local/opfs/sub/dangling-target.txt', count: 16 } }], owner.page, cloud);
+    assert.equal(atob(danglingAfter.ok.data), 'DAN');
+
+    // 2. Unlinked OPFS file retains permission rechecks: fchmod(0) revokes an already-open peer fd!
+    const [ownerEphem] = await owner.calls([{ open: { path: '/mnt/local/opfs/sub/ephem.txt', flags: 2 } }], owner.page, cloud);
+    const openedPeerEphem = await peer.calls([{ open: { path: '/mnt/shared/rw/ephem.txt', flags: 0 } }], peer.page, cloud);
+    const pFd = openedPeerEphem[0].ok.fd;
+    await owner.calls([{ unlink: { path: '/mnt/local/opfs/sub/ephem.txt' } }], owner.page, cloud);
+    const [readUnlinked] = await peer.calls([{ pread: { fd: pFd, count: 16 } }], peer.page, cloud);
+    assert.equal(atob(readUnlinked.ok.data), 'SECRET');
+    await owner.calls([
+      { fchmod: { fd: ownerEphem.ok.fd, mode: 0o000 } },
+      { close: { fd: ownerEphem.ok.fd } },
+    ], owner.page, cloud);
+    const [readAfterRevoke] = await peer.calls([{ pread: { fd: pFd, count: 16 } }], peer.page, cloud);
+    assert.equal(readAfterRevoke.err.errno, 'EACCES');
+    await peer.calls([{ close: { fd: pFd } }], peer.page, cloud);
+
+    // 3. Disconnect during mutating `open` reports the uncertain-write warning, while read-only `open` does not.
+    const dropRo = remoteRo.open(remoteRo.grant, 'pub.txt', 0);
+    remoteRo.connection.close('ENODEV');
+    await assert.rejects(dropRo, err => !/already have been saved/i.test(err.message));
+
+    const dropMut = remoteRw.open(remoteRw.grant, 'lost-create.txt', 0o102);
+    remoteRw.connection.close('ENODEV');
+    await assert.rejects(dropMut, /already have been saved/i);
+
+    // 4. `unmount()` on the owner mount drains remote `forIdentity` open refs and frees `os-fs-open` locks!
+    const remoteRw2 = await attachMount(peer, { address: pub.address, writable: true, execute: false, port: makeRelayBridge(false) });
+    peer.mounts.set('/mnt/shared/rw2', { path: '/mnt/shared/rw2', name: 'rw2', grant: remoteRw2.grant, provider: remoteRw2, cloud: false, active: true });
+    await peer.calls([{ open: { path: '/mnt/shared/rw2/orphan-drain.txt', flags: 0o302, mode: 0o600 } }], peer.page, cloud);
+    await owner.calls([{ unlink: { path: '/mnt/local/opfs/sub/orphan-drain.txt' } }], owner.page, cloud);
+    const locksBeforeUnmount = (await navigator.locks.query()).held.filter(l => l.name.startsWith('os-fs-open:'));
+    assert.equal(locksBeforeUnmount.length, 1);
+
+    owner.unmount('/mnt/local/opfs');
+    await new Promise(r => setTimeout(r, 30));
+    const locksAfterUnmount = (await navigator.locks.query()).held.filter(l => l.name.startsWith('os-fs-open:'));
+    assert.equal(locksAfterUnmount.length, 0);
   } finally {
     globalThis.fetch = prevFetch;
     peer.close();
