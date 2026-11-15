@@ -60,6 +60,8 @@ pub enum Errno {
     EDEADLK,
     EPROTONOSUPPORT,
     ENOTCONN,
+    ENOLCK,
+    EDQUOT,
 }
 impl Errno {
     /// What glibc's strerror says of it.
@@ -105,6 +107,8 @@ impl Errno {
             EPROTONOSUPPORT => "Protocol not supported",
             ENOTCONN => "Transport endpoint is not connected",
             EDEADLK => "Resource deadlock avoided",
+            ENOLCK => "No locks available",
+            EDQUOT => "Disk quota exceeded",
         }
     }
 }

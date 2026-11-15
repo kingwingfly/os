@@ -26,6 +26,7 @@ pub fn error(e: io::Error) -> String {
         (libc::EFAULT, "EFAULT"),
         (libc::EDQUOT, "EDQUOT"),
         (libc::ENOTCONN, "ENOTCONN"),
+        (libc::ENOLCK, "ENOLCK"),
         (libc::EACCES, "EACCES"),
         (libc::EBUSY, "EBUSY"),
         (libc::EEXIST, "EEXIST"),
