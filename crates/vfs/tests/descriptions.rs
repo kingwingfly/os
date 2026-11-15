@@ -67,7 +67,13 @@ fn paths_resolve_within_the_driver_with_dotdot_and_symlinks_followed_here() {
         .unwrap()
         .unwrap();
     let ino = opened.entry.handle.node.ino;
-    for path in ["/a/b/f", "/a/up/f", "/a/abs/f", "/a/./b//f", "/../a/b/c/../../b/f"] {
+    for path in [
+        "/a/b/f",
+        "/a/up/f",
+        "/a/abs/f",
+        "/a/./b//f",
+        "/../a/b/c/../../b/f",
+    ] {
         match run(table.resolve(&cred, path, true, &everywhere)).unwrap() {
             Some(Resolved::Found { entry, name, .. }) => {
                 assert_eq!((entry.handle.node.ino, name.as_str()), (ino, "f"), "{path}");
@@ -208,10 +214,7 @@ fn descriptions_are_shared_by_forks_and_released_by_the_last_holder() {
     run(table.exit(11));
     assert!(table.is_empty());
     // The last holder's exit released the open reference, and the unlinked inode went.
-    assert_eq!(
-        run(fs.metadata(&cred, &handle)).unwrap_err(),
-        Errno::ESTALE
-    );
+    assert_eq!(run(fs.metadata(&cred, &handle)).unwrap_err(), Errno::ESTALE);
 }
 
 #[test]
@@ -237,6 +240,107 @@ fn seek_end_and_append_use_the_driver_size() {
         .unwrap();
     assert_eq!(run(again.file.metadata()).unwrap().size, 0);
     drop((file, again));
+    run(table.exit(1));
+    assert!(table.is_empty());
+}
+
+#[test]
+fn open_with_enforces_nofollow_and_directory_flags() {
+    let (fs, table) = table();
+    let cred = Cred::root();
+    mkdir(&fs, "/d");
+    run(table.open(1, &cred, "/d/target", &create(), 0o644, &everywhere))
+        .unwrap()
+        .unwrap();
+    symlink(&fs, "/d", "link_file", "target");
+    symlink(&fs, "/d", "link_dir", ".");
+
+    // O_NOFOLLOW rejects symlinks with ELOOP, even if O_DIRECTORY is also set.
+    for dir in [false, true] {
+        assert_eq!(
+            run(table.open_with(1, &cred, "/d/link_file", &read(), 0, true, dir, &everywhere))
+                .err()
+                .unwrap(),
+            Errno::ELOOP
+        );
+        assert_eq!(
+            run(table.open_with(1, &cred, "/d/link_dir", &read(), 0, true, dir, &everywhere))
+                .err()
+                .unwrap(),
+            Errno::ELOOP
+        );
+    }
+
+    // O_CREAT | O_EXCL returns EEXIST on a symlink even when O_NOFOLLOW is passed.
+    let excl = *OpenOptions::new().write(true).create_new(true);
+    assert_eq!(
+        run(table.open_with(
+            1,
+            &cred,
+            "/d/link_file",
+            &excl,
+            0o644,
+            true,
+            false,
+            &everywhere
+        ))
+        .err()
+        .unwrap(),
+        Errno::EEXIST
+    );
+
+    // O_PATH with O_NOFOLLOW still resolves the symlink entry (fallback None since non-regular).
+    let path_only = *OpenOptions::new().path(true);
+    assert!(
+        run(table.open_with(
+            1,
+            &cred,
+            "/d/link_file",
+            &path_only,
+            0,
+            true,
+            false,
+            &everywhere
+        ))
+        .unwrap()
+        .is_none()
+    );
+
+    // O_DIRECTORY rejects non-directories with ENOTDIR, falls back to None on directories,
+    // and returns ENOENT / EINVAL on missing targets.
+    assert_eq!(
+        run(table.open_with(1, &cred, "/d/target", &read(), 0, false, true, &everywhere))
+            .err()
+            .unwrap(),
+        Errno::ENOTDIR
+    );
+    assert!(
+        run(table.open_with(1, &cred, "/d", &read(), 0, false, true, &everywhere))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        run(table.open_with(1, &cred, "/d/absent", &read(), 0, false, true, &everywhere))
+            .err()
+            .unwrap(),
+        Errno::ENOENT
+    );
+    assert_eq!(
+        run(table.open_with(
+            1,
+            &cred,
+            "/d/absent",
+            &create(),
+            0o644,
+            false,
+            true,
+            &everywhere
+        ))
+        .err()
+        .unwrap(),
+        Errno::EINVAL
+    );
+
     run(table.exit(1));
     assert!(table.is_empty());
 }

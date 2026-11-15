@@ -63,6 +63,7 @@ pub enum Errno {
     ENOTCONN,
     ENOLCK,
     EDQUOT,
+    EINTR,
 }
 impl Errno {
     /// What glibc's strerror says of it.
@@ -110,6 +111,7 @@ impl Errno {
             EDEADLK => "Resource deadlock avoided",
             ENOLCK => "No locks available",
             EDQUOT => "Disk quota exceeded",
+            EINTR => "Interrupted system call",
         }
     }
 }
@@ -532,6 +534,8 @@ pub const O_APPEND: u32 = 0o2000;
 /// A directory, to read with getdents or name others from (`/proc/self/fd/N/NAME`, as openat
 /// would): fails with ENOTDIR on anything else.
 pub const O_DIRECTORY: u32 = 0o200000;
+/// Do not follow a trailing symbolic link (ELOOP).
+pub const O_NOFOLLOW: u32 = 0o400000;
 /// A metadata/path handle. This runtime currently supports directory O_PATH handles.
 pub const O_PATH: u32 = 0o10000000;
 /// ioctl(2)'s FICLONE, as Linux numbers it: the file the descriptor writes takes the content of

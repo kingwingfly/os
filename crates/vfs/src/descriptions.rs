@@ -221,15 +221,40 @@ impl Descriptions {
         mode: u16,
         inside: &dyn Fn(&str) -> bool,
     ) -> Result<Option<Opened>> {
-        options.access()?;
-        let resolved = self
-            .resolve(cred, path, !options.is_create_new(), inside)
-            .await?;
+        self.open_with(pid, cred, path, options, mode, false, false, inside)
+            .await
+    }
+
+    /// Like [`Descriptions::open`], additionally enforcing `O_NOFOLLOW` and `O_DIRECTORY`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_with(
+        &self,
+        pid: u32,
+        cred: &Cred,
+        path: &str,
+        options: &OpenOptions,
+        mode: u16,
+        nofollow: bool,
+        directory: bool,
+        inside: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<Opened>> {
+        let is_path = options.access()? == abi::fs::Access::Path;
+        let follow = !options.is_create_new() && !nofollow;
+        let resolved = self.resolve(cred, path, follow, inside).await?;
         let (handle, open, entry) = match resolved {
             None | Some(Resolved::Directory(_)) => return Ok(None),
             Some(Resolved::Found { entry, .. }) => {
                 if options.is_create_new() {
                     return Err(Errno::EEXIST);
+                }
+                if nofollow && !is_path && entry.metadata.is_symlink() {
+                    return Err(Errno::ELOOP);
+                }
+                if entry.metadata.is_dir() {
+                    return Ok(None);
+                }
+                if directory {
+                    return Err(Errno::ENOTDIR);
                 }
                 if !entry.metadata.is_file() {
                     return Ok(None);
@@ -238,6 +263,13 @@ impl Descriptions {
                 (entry.handle.clone(), open, entry)
             }
             Some(Resolved::Missing { parent, name }) => {
+                if directory {
+                    return Err(if options.is_create() {
+                        Errno::EINVAL
+                    } else {
+                        Errno::ENOENT
+                    });
+                }
                 if !options.is_create() {
                     return Err(Errno::ENOENT);
                 }
@@ -282,10 +314,11 @@ impl Descriptions {
     /// Nothing changes unless the parent holds every one.
     pub fn inherit(&self, pid: u32, child: u32, ids: &[Id]) -> Result<()> {
         let mut files = self.files.borrow_mut();
-        if ids
-            .iter()
-            .any(|id| files.get(id).is_none_or(|held| !held.holders.contains_key(&pid)))
-        {
+        if ids.iter().any(|id| {
+            files
+                .get(id)
+                .is_none_or(|held| !held.holders.contains_key(&pid))
+        }) {
             return Err(Errno::EBADF);
         }
         for id in ids {

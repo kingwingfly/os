@@ -2673,7 +2673,6 @@ dependencies = [
  "js-sys",
  "os-abi",
  "os-image",
- "os-kernel",
  "os-vfs",
  "serde",
  "serde_json",

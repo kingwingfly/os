@@ -199,6 +199,48 @@ pub fn chmod(path: &Path, mode: u32) -> Result<()> {
         .map(|_| ())
     }
 }
+pub fn chgrp(path: &Path, gid: u64) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let gid = libc::gid_t::try_from(gid).map_err(|_| "EINVAL".to_string())?;
+        rc(unsafe { libc::chown(c(path).as_ptr(), !0 as libc::uid_t, gid) })
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        let gid = u32::try_from(gid).map_err(|_| "EINVAL".to_string())?;
+        call(abi::Call::Chown {
+            path: path.to_string_lossy().into_owned(),
+            uid: None,
+            gid: Some(gid),
+            nofollow: false,
+        })
+        .map(|_| ())
+    }
+}
+pub fn neutral_group(gid: u64) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if count > 0 {
+            let mut groups = vec![0; count as usize];
+            if unsafe { libc::getgroups(count, groups.as_mut_ptr()) } >= 0
+                && let Some(other) = groups.into_iter().map(u64::from).find(|&g| g != gid)
+            {
+                return Some(other);
+            }
+        }
+        (unsafe { libc::geteuid() } == 0 && named_acl_available() && gid != 65534).then_some(65534)
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        let creds = call(abi::Call::Getcreds).ok()?;
+        creds["groups"]
+            .as_array()?
+            .iter()
+            .filter_map(|g| g.as_u64())
+            .find(|&g| g != gid)
+    }
+}
 pub fn umask(mode: u32) {
     #[cfg(target_os = "linux")]
     unsafe {

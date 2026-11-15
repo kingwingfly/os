@@ -158,7 +158,10 @@ fn data_calls_carry_the_header_and_raw_bytes_and_lost_writes_are_not_replayed() 
     assert_eq!(sent[1].0, "/api/fs/data");
     assert_eq!(sent[1].1[0].0, DATA_HEADER);
     let header: serde_json::Value = serde_json::from_str(&sent[1].1[0].1).unwrap();
-    assert_eq!((header["pid"].as_u64(), header["open"]["id"].as_u64()), (Some(7), Some(3)));
+    assert_eq!(
+        (header["pid"].as_u64(), header["open"]["id"].as_u64()),
+        (Some(7), Some(3))
+    );
     assert_eq!(sent[1].2, b"xy");
     assert!(sent[0].2.is_empty());
 }

@@ -22,8 +22,9 @@ mod mounts;
 
 use abi::{Batch, Call, Errno, Error, Exec, PROC_POLL_MAX, Return, SIGTERM};
 use serde_json::{Value, json};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -45,11 +46,6 @@ async fn kernel_sys(body: &str) -> Result<JsValue, JsValue> {
 
 /// The kernel's own protocol version, which the page checks at start.
 pub const VERSION: &str = "1";
-
-#[wasm_bindgen]
-pub fn vfs_policy(input: &str) -> String {
-    kernel::mount_policy::json_request(input)
-}
 
 /// Local validation only. This does not verify an operator signature, activate a
 /// system generation, or confer credentials described by package metadata.
@@ -108,7 +104,11 @@ struct State {
 
 #[wasm_bindgen]
 pub struct Kernel {
-    state: RefCell<State>,
+    state: Rc<RefCell<State>>,
+    /// The process a cloud call acts for now (cloudfs.rs), read before the driver awaits.
+    current: Rc<Cell<cloudfs::Actor>>,
+    /// The instance's cloud filesystem session and descriptions (cloudfs.rs).
+    cloud: cloudfs::Connector,
 }
 
 #[wasm_bindgen]
@@ -120,7 +120,9 @@ impl Kernel {
     #[wasm_bindgen(constructor)]
     pub fn new(boot: &str, id: &str) -> Kernel {
         Kernel {
-            state: RefCell::new(State {
+            current: Rc::default(),
+            cloud: cloudfs::Connector::default(),
+            state: Rc::new(RefCell::new(State {
                 namespace: String::new(),
                 boot: boot.to_string(),
                 id: id.to_string(),
@@ -129,7 +131,7 @@ impl Kernel {
                 reports: Vec::new(),
                 queued: 0,
                 reported: 0,
-            }),
+            })),
         }
     }
 
@@ -399,6 +401,9 @@ impl Kernel {
             token: Some(token),
         });
         state.retain_spare();
+        drop(state);
+        // What it held of cloud files it lets go, as its descriptors close at exit.
+        self.cloud_exited(pid).await;
         Ok(json!({ "ppid": ppid }).to_string())
     }
 
@@ -713,9 +718,9 @@ impl Kernel {
         let value = self.one(call, false).await?;
         // What it ran that this kernel kept goes too.
         let reaped: Vec<u32> = serde_json::from_value(value.clone()).unwrap_or_default();
-        let mut state = self.state.borrow_mut();
         for pid in reaped {
-            state.processes.remove(&pid);
+            self.state.borrow_mut().processes.remove(&pid);
+            self.cloud_exited(pid).await;
         }
         Ok(value.to_string())
     }
