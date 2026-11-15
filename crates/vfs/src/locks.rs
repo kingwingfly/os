@@ -25,6 +25,9 @@ pub struct Locks {
     pub waits: Vec<Wait>,
 }
 impl Held {
+    fn same_lock(&self, other: &Self) -> bool {
+        self.owner == other.owner && self.family == other.family && self.kind == other.kind
+    }
     pub fn conflicts(&self, other: &Self) -> bool {
         self.owner != other.owner
             && self.family == other.family
@@ -34,17 +37,34 @@ impl Held {
 }
 impl Locks {
     pub fn conflict(&self, lock: &Held) -> Option<Conflict> {
-        self.held
+        let first = self.held.iter().find(|l| l.conflicts(lock))?;
+        // Cancellation tickets can partition one logical POSIX lock. F_GETLK reports the
+        // entire contiguous range, regardless of which request contributed each piece.
+        let mut ranges: Vec<_> = self
+            .held
             .iter()
-            .find(|l| l.conflicts(lock))
-            .map(|l| Conflict {
-                owner: l.owner,
-                kind: l.kind,
-                range: l.range,
-            })
+            .filter(|l| l.same_lock(first))
+            .map(|l| l.range)
+            .collect();
+        ranges.sort_unstable_by_key(|r| r.start());
+        let mut range = ranges[0];
+        for next in ranges.into_iter().skip(1) {
+            if range.touches(next) {
+                range = range.union(next);
+            } else if range.overlaps(first.range) {
+                break;
+            } else {
+                range = next;
+            }
+        }
+        Some(Conflict {
+            owner: first.owner,
+            kind: first.kind,
+            range,
+        })
     }
     fn blocked(&self, lock: &Held, ticket: Option<&str>) -> bool {
-        self.conflict(lock).is_some()
+        self.held.iter().any(|held| held.conflicts(lock))
             || self
                 .waits
                 .iter()
@@ -78,8 +98,27 @@ impl Locks {
             })
             .collect();
     }
-    fn grant(&mut self, lock: Held) {
+    fn grant(&mut self, mut lock: Held) {
         self.carve(lock.owner, lock.family, lock.range);
+        // Merge only pieces with the same cancellation ownership. A late cancellation
+        // must remove that request's surviving pieces without unlocking its neighbors.
+        loop {
+            let before = self.held.len();
+            self.held.retain(|held| {
+                if held.same_lock(&lock)
+                    && held.ticket == lock.ticket
+                    && held.range.touches(lock.range)
+                {
+                    lock.range = lock.range.union(held.range);
+                    false
+                } else {
+                    true
+                }
+            });
+            if before == self.held.len() {
+                break;
+            }
+        }
         self.held.push(lock);
     }
     pub fn wake(&mut self) {

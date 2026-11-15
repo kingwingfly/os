@@ -129,7 +129,7 @@ pub struct File {
     fs: Rc<dyn Filesystem>,
     open: OpenRef,
     handle: Handle,
-    /// The opener's credential, as Linux keeps `f_cred`: fstat uses it.
+    /// The opener's credential, as Linux keeps `f_cred`; never current-call authentication.
     cred: Cred,
     pos: Cell<u64>,
     pos_lock: PosLock,
@@ -258,7 +258,7 @@ impl FileRef {
     /// stat through the description (fstat).
     pub async fn metadata(&self) -> Result<Metadata> {
         let _call = self.clone();
-        self.fs.metadata(&self.cred, &self.handle).await
+        self.fs.open_metadata(&self.open).await
     }
     /// lseek(2), as `Seek::seek`: EINVAL for a position before 0.
     pub async fn seek(&self, from: SeekFrom) -> Result<u64> {
@@ -270,10 +270,7 @@ impl FileRef {
         let (base, offset) = match from {
             SeekFrom::Start(at) => (at, 0),
             SeekFrom::Current(offset) => (self.pos.get(), offset),
-            SeekFrom::End(offset) => (
-                self.fs.metadata(&self.cred, &self.handle).await?.size,
-                offset,
-            ),
+            SeekFrom::End(offset) => (self.fs.open_metadata(&self.open).await?.size, offset),
         };
         let at = base.checked_add_signed(offset).ok_or(Errno::EINVAL)?;
         if at > crate::FILE_MAX {

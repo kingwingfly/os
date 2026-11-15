@@ -49,6 +49,9 @@ pub enum Call {
     Metadata {
         handle: Handle,
     },
+    OpenMetadata {
+        open: OpenRef,
+    },
     Setattr {
         handle: Handle,
         attr: SetAttr,

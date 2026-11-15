@@ -529,6 +529,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             }
         }
         Metadata { handle } => json!(metadata(db, &c.node(db, handle)?)),
+        OpenMetadata { open } => json!(metadata(db, &c.opened(db, open)?)),
         ReadDir { dir } => {
             let (_, path) = c.dir(db, dir, READ)?;
             #[derive(Deserialize)]

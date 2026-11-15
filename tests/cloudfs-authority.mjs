@@ -77,7 +77,7 @@ test('authority binding rejects job credentials for v2 control and data while pa
   assert.ok('ok' in (await pathCall({ unlink: { path: '/job-scope/output' } })).results[0]);
   assert.equal((await rpc(null, 'connect')).errno, 'EACCES');
   for (const call of [
-    'renew', { metadata: { handle: entry.handle } }, { unlink: { dir: dir.handle, name: 'unrelated' } },
+    'renew', { metadata: { handle: entry.handle } }, { open_metadata: { open } }, { unlink: { dir: dir.handle, name: 'unrelated' } },
     { open: { ticket: randomUUID(), handle: entry.handle, options } },
     { set_len: { open, size: 0 } }, { sync: { open, data_only: false } },
     { try_lock: { open, family: 'flock', kind: 'exclusive', range: { start: 0, end: null } } },

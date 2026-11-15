@@ -229,6 +229,12 @@ impl<T: Transport> Filesystem for CloudFs<T> {
             .await
         })
     }
+    fn open_metadata<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, Metadata> {
+        Box::pin(async move {
+            self.opened(open, Call::OpenMetadata { open: open.clone() })
+                .await
+        })
+    }
     fn setattr<'a>(
         &'a self,
         cred: &'a Cred,

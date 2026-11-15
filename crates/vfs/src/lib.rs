@@ -198,6 +198,9 @@ pub trait Filesystem {
         handle: &'a Handle,
         options: &'a OpenOptions,
     ) -> BoxFuture<'a, OpenRef>;
+    /// fstat: metadata of a retained open, including path-only references. Remote drivers
+    /// authenticate the current caller and validate the retained grant, not a cached token.
+    fn open_metadata<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, Metadata>;
     /// pread: read into `buf` from `offset`, and say how much was read (0 at the end).
     /// Offsets above [`FILE_MAX`] and ranges that overflow it are invalid (EINVAL), even at
     /// EOF. An empty buffer still requires a valid offset.

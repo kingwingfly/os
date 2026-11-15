@@ -60,6 +60,7 @@ test('open access, rename/unlink, O_PATH, sparse bytes and old readers share one
   await c.call('release',{open});await c.call('release',{open:ro});await c.call('metadata',{handle:entry.handle},'ESTALE');
   const sub=await c.call('mkdir',{dir,name:'cwd',mode:0});const path=await c.open(sub.handle,'path');await c.call('rmdir',{dir,name:'cwd'});
   expect((await c.call('metadata',{handle:sub.handle})).nlink).toBe(0);await c.call('parent',{dir:sub.handle},'ENOENT');await c.call('read_dir',{dir:sub.handle},'ENOENT');
+  expect(await c.call('open_metadata',{open:path})).toMatchObject({file_type:'dir',nlink:0});
   await c.data(path,{read:{offset:0,length:1}},undefined,'EBADF');await c.call('release',{open:path});await c.call('disconnect');
 });
 test('atomic append, lock families, durable waits, cancellation and resume',async({request})=>{
@@ -118,12 +119,15 @@ test('exec retains unlinked cloud opens and locks across repeated token rotation
   for(let i=0;i<2;i++){
     const old=c.token;const next=await replace(request,c);expect(next.pid).toBe(c.pid);c.token=next.token;
     await rpc(request,old,c.session,{sync:{open,data_only:false}},'EACCES');
+    await rpc(request,old,c.session,{open_metadata:{open}},'EACCES');
     await c.call('renew');await c.call('sync',{open,data_only:false});
+    expect(await c.call('open_metadata',{open})).toMatchObject({nlink:0,size:4+i});
     expect((await c.read(open)).toString()).toBe('kept'+'!'.repeat(i));await c.write(open,'!');
     await rpc(request,observer.token,c.session,{try_lock:{open:peer,family:'flock',kind:'exclusive',range}},'EAGAIN');
   }
   await call(request,{kill:{pid:String(c.pid),signal:9}});
   await rpc(request,observer.token,c.session,{sync:{open,data_only:false}},'EACCES');
+  await rpc(request,observer.token,c.session,{open_metadata:{open}},'EACCES');
   await rpc(request,observer.token,c.session,{try_lock:{open:peer,family:'flock',kind:'exclusive',range}});
   await rpc(request,observer.token,c.session,{cancel_lock:{open,ticket:randomUUID()}});
   await rpc(request,observer.token,c.session,{release:{open}});
@@ -171,6 +175,7 @@ test('open control calls reject revoked and cloud-denied callers while the opene
   try {
     for(const caller of [revoked,denied]) {
       for(const operation of [
+        {open_metadata:{open}},
         {set_len:{open,size:0}},
         {sync:{open,data_only:false}},
         {sync:{open,data_only:true}},
@@ -317,6 +322,35 @@ test('flock conversion wakes queued owners and POSIX updates preserve ownership 
   expect(await c.call('lock',{...lock(b,'posix'),ticket:writer})).toBe(true);
   expect(await c.call('lock',{...lock(d,'posix','shared'),ticket:reader})).toBe(false);
   await c.call('release',{open:b});expect(await c.call('lock',{...lock(d,'posix','shared'),ticket:reader})).toBe(true);
+  await c.call('disconnect');
+});
+test('POSIX ranges coalesce across grants without losing cancellation ownership',async({request})=>{
+  const {c,dir}=await setup(request);const [entry,a]=await c.create(dir,'ranges');const b=await c.open(entry.handle);const peer=await c.open(entry.handle);
+  const span=(start,end)=>({start,end});
+  const lock=(open,start,end,kind='exclusive')=>({open,family:'posix',kind,range:span(start,end)});
+  const conflict=(start,end)=>c.call('test_lock',{open:peer,kind:'exclusive',range:span(start,end)});
+  for(const start of [20,0,10])await c.call('try_lock',lock(a,start,start+10));
+  expect((await conflict(1,2)).range).toEqual(span(0,30));
+  await c.call('unlock',{open:a,family:'posix',range:span(10,20)});
+  await c.call('try_lock',lock(a,0,5,'shared'));
+  await c.call('try_lock',lock(a,10,20));
+  expect((await conflict(10,11)).range).toEqual(span(5,30));
+  await c.call('try_lock',lock(a,30,null));expect((await conflict(25,26)).range).toEqual(span(5,null));
+  await c.call('unlock',{open:a,family:'posix',range:span(0,null)});
+  await c.call('try_lock',lock(a,0,10));
+  const right=randomUUID(),middle=randomUUID();
+  expect(await c.call('lock',{...lock(a,20,30),ticket:right})).toBe(true);await c.call('ack_lock',{open:a,ticket:right});
+  await c.call('try_lock',lock(b,10,20));
+  expect(await c.call('lock',{...lock(a,10,20),ticket:middle})).toBe(false);
+  await c.call('release',{open:b});
+  expect(await c.call('lock',{...lock(a,10,20),ticket:middle})).toBe(true);await c.call('ack_lock',{open:a,ticket:middle});
+  expect((await conflict(25,26)).range).toEqual(span(0,30));
+  await c.call('try_lock',lock(a,15,25));
+  await c.call('cancel_lock',{open:a,ticket:middle});
+  expect(await conflict(10,15)).toBeNull();expect((await conflict(15,16)).range).toEqual(span(15,30));
+  await c.call('cancel_lock',{open:a,ticket:right});
+  expect(await conflict(25,30)).toBeNull();expect((await conflict(15,16)).range).toEqual(span(15,25));
+  expect((await conflict(1,2)).range).toEqual(span(0,10));
   await c.call('disconnect');
 });
 test('empty setattr preserves metadata for both owners and non-owners',async({request})=>{

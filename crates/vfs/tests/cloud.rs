@@ -77,6 +77,11 @@ impl Transport for Host {
                     lease_seconds: 120
                 }),
                 Call::Open { .. } => json!(open()),
+                Call::Metadata { .. } | Call::OpenMetadata { .. } => json!({
+                    "file_type":"file", "mode":384, "nlink":0, "uid":0, "gid":0,
+                    "size":20, "atime":{"sec":0,"nsec":0}, "mtime":{"sec":0,"nsec":0},
+                    "ctime":{"sec":0,"nsec":0}, "rdev":null, "acl":false
+                }),
                 Call::Lock { .. } => json!(self.granted.get()),
                 _ => Value::Null,
             })
@@ -165,6 +170,72 @@ fn abandoned_and_cancelled_remote_opens_keep_cleanup_until_delivered() {
     assert_eq!(now_or_never(fs.drain()), Some(Ok(())));
     assert_eq!(fs.pending_cancellations(), 0);
     assert!(matches!(host.calls.borrow().last(),Some(Call::CancelOpen{ticket}) if ticket=="1"));
+}
+#[test]
+fn descriptor_metadata_and_seek_end_use_the_current_caller_after_exec() {
+    use std::task::{Context, Poll, Waker};
+    let host = Host::default();
+    let fs = Rc::new(
+        now_or_never(CloudFs::connect(host.clone(), "opener".into()))
+            .unwrap()
+            .unwrap(),
+    );
+    let mut cred = Cred::root();
+    cred.token = Some("opener".into());
+    let options = *OpenOptions::new().read(true).write(true);
+    let opened = ready(fs.open(&cred, &root(), &options)).unwrap();
+    let queue = ReleaseQueue::new();
+    let file = FileRef::new(
+        fs.clone(),
+        opened.clone(),
+        Handle {
+            node: opened.node,
+            ..root()
+        },
+        cred.clone(),
+        &options,
+        &queue,
+    );
+    host.denied
+        .borrow_mut()
+        .extend(["opener".into(), "revoked".into(), "cloud denied".into()]);
+    *host.actor.borrow_mut() = ("replacement".into(), Some(42));
+    assert_eq!(now_or_never(file.metadata()).unwrap().unwrap().size, 20);
+    assert_eq!(now_or_never(file.seek(SeekFrom::End(-2))), Some(Ok(18)));
+    // Ordinary handle calls still authenticate their explicit credential.
+    assert_eq!(ready(fs.metadata(&cred, file.handle())), Err(Errno::EACCES));
+    for token in ["revoked", "cloud denied"] {
+        *host.actor.borrow_mut() = (token.into(), Some(42));
+        assert_eq!(now_or_never(file.metadata()), Some(Err(Errno::EACCES)));
+        assert_eq!(
+            now_or_never(file.seek(SeekFrom::End(0))),
+            Some(Err(Errno::EACCES))
+        );
+        assert_eq!(file.position(), 18);
+    }
+    // The driver keeps the actor it sampled before deferred cleanup or transport waits.
+    for seek in [false, true] {
+        *host.actor.borrow_mut() = ("replacement".into(), Some(42));
+        cred.token = Some("replacement".into());
+        host.pending.set(true);
+        assert!(now_or_never(fs.open(&cred, &root(), &options)).is_none());
+        let mut operation: BoxFuture<'_, u64> = if seek {
+            Box::pin(file.seek(SeekFrom::End(0)))
+        } else {
+            Box::pin(async { file.metadata().await.map(|m| m.size) })
+        };
+        assert!(matches!(
+            operation
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        *host.actor.borrow_mut() = ("revoked".into(), Some(43));
+        host.pending.set(false);
+        assert_eq!(ready(operation), Ok(20));
+    }
+    *host.actor.borrow_mut() = ("replacement".into(), Some(42));
+    assert_eq!(now_or_never(file.close()), Some(Ok(())));
 }
 #[test]
 fn cancelled_release_is_retried_and_invalid_read_offsets_never_cross_transport() {
@@ -487,6 +558,82 @@ fn serialized_waits_wake_and_cancel_without_crossing_lock_families() {
     flock.family = LockFamily::Flock;
     restored.acquire(flock, None, &[]).unwrap();
     assert_eq!(restored.acquire(held(5, 0, None), None, &[]), Ok(true));
+}
+#[test]
+fn posix_adjacent_ranges_merge_and_split_without_changing_kind_or_owner() {
+    let mut locks = Locks::default();
+    for n in (0..100).rev() {
+        assert_eq!(
+            locks.acquire(held(1, n * 10, Some((n + 1) * 10)), None, &[]),
+            Ok(true)
+        );
+        assert_eq!(locks.held.len(), 1);
+    }
+    assert_eq!(
+        locks.conflict(&held(2, 20, Some(21))).unwrap().range,
+        LockRange::new(0, Some(1000)).unwrap()
+    );
+    locks.carve(1, LockFamily::Posix, LockRange::new(50, Some(60)).unwrap());
+    let shared = Held {
+        kind: LockKind::Shared,
+        ..held(1, 0, Some(10))
+    };
+    locks.acquire(shared, None, &[]).unwrap();
+    locks.acquire(held(1, 50, Some(60)), None, &[]).unwrap();
+    assert_eq!(
+        locks.conflict(&held(2, 20, Some(21))).unwrap().range,
+        LockRange::new(10, Some(1000)).unwrap()
+    );
+    locks.acquire(held(1, 1000, None), None, &[]).unwrap();
+    assert_eq!(
+        locks.conflict(&held(2, 999, None)).unwrap().range,
+        LockRange::from(10..)
+    );
+    locks.carve(1, LockFamily::Posix, LockRange::new(20, Some(30)).unwrap());
+    assert!(locks.conflict(&held(2, 20, Some(30))).is_none());
+    assert_eq!(
+        locks.conflict(&held(2, 30, Some(31))).unwrap().range,
+        LockRange::from(30..)
+    );
+}
+#[test]
+fn merged_lock_reports_preserve_each_tickets_surviving_ranges_after_serialization() {
+    let mut locks = Locks::default();
+    locks.acquire(held(1, 0, Some(10)), None, &[]).unwrap();
+    locks
+        .acquire(held(1, 20, Some(30)), Some("right"), &[])
+        .unwrap();
+    locks.acknowledge(1, "right");
+    locks.acquire(held(2, 10, Some(20)), None, &[]).unwrap();
+    assert_eq!(
+        locks.acquire(held(1, 10, Some(20)), Some("middle"), &[]),
+        Ok(false)
+    );
+    locks.release(2);
+    assert_eq!(
+        locks.conflict(&held(3, 25, Some(26))).unwrap().range,
+        LockRange::new(0, Some(30)).unwrap()
+    );
+    locks.acknowledge(1, "middle");
+    // A later request replaces only part of the cancelled request's contribution.
+    locks.acquire(held(1, 15, Some(25)), None, &[]).unwrap();
+    let mut restored: Locks = serde_json::from_value(json!(locks)).unwrap();
+    restored.cancel(1, "middle");
+    assert!(restored.conflict(&held(3, 10, Some(15))).is_none());
+    assert_eq!(
+        restored.conflict(&held(3, 15, Some(16))).unwrap().range,
+        LockRange::new(15, Some(30)).unwrap()
+    );
+    restored.cancel(1, "right");
+    assert!(restored.conflict(&held(3, 25, Some(30))).is_none());
+    assert_eq!(
+        restored.conflict(&held(3, 15, Some(16))).unwrap().range,
+        LockRange::new(15, Some(25)).unwrap()
+    );
+    assert_eq!(
+        restored.conflict(&held(3, 5, Some(6))).unwrap().range,
+        LockRange::new(0, Some(10)).unwrap()
+    );
 }
 #[test]
 fn durable_posix_deadlock_detection_crosses_inodes_and_unlock_splits_ranges() {
