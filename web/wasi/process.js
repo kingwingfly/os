@@ -262,7 +262,7 @@ function install(fd, found, counted = false) {
   if (found.kind === 'pipe-in' || found.kind === 'tty') found.pipe.hold(process.pid, 'r');
   else if (found.kind === 'pipe-out') found.pipe.hold(process.pid, 'w');
   else if (found.share != null) shares.add(found.share, process.pid, 1);
-  else if (shares && found.kind === 'file' && found.cloud == null) share(found);
+  else if (shares && found.kind === 'file') share(found);
 }
 const nonblocking = found => found.kind === 'pty' ? ptyCall(found, 'flags').nonblock
   : !!(found.flags && Atomics.load(new Int32Array(found.flags), 0) & FDFLAG_NONBLOCK);
@@ -292,8 +292,11 @@ function* uninstall(fd) {
   if (found.kind === 'pipe-out') return found.pipe.drop(process.pid, 'w');
   if (found.share != null) {
     const gen = shares.gen(found.share);
-    if (shares.drop(found.share, process.pid) > 0) return;
-    postMessage({ closed: { slot: found.share, gen } });
+    const left = shares.drop(found.share, process.pid);
+    if (left <= 0) postMessage({ closed: { slot: found.share, gen } });
+    // Local shared files close once nobody in the line holds them; cloud descriptions track
+    // holders per pid in client-kernel, so each process drops its own description on last ref.
+    if (found.cloud == null ? left > 0 : found.refs > 0) return;
   } else if (found.refs > 0) return;
   yield* closeFd(found);
 }
@@ -344,15 +347,21 @@ function cloudRead(found, offset, count) {
   let got = 0;
   while (got < count) {
     const want = Math.min(CLOUD_CHUNK, count - got);
-    const reply = cloudCall('read', {
-      id: found.cloud,
-      count: want,
-      ...(offset != null ? { offset: (BigInt(offset) + BigInt(got)).toString() } : {}),
-    });
+    let reply;
+    try {
+      reply = cloudCall('read', {
+        id: found.cloud,
+        count: want,
+        ...(offset != null ? { offset: (BigInt(offset) + BigInt(got)).toString() } : {}),
+      });
+    } catch (error) {
+      if (got > 0 && error instanceof Errno) break;
+      throw error;
+    }
     const chunk = unbase64(reply.data);
     out.set(chunk, got);
     got += chunk.length;
-    if (chunk.length === 0) break;
+    if (chunk.length < want) break;
   }
   return out.subarray(0, got);
 }
@@ -362,13 +371,20 @@ function cloudWrite(found, offset, data) {
   let sent = 0;
   while (sent < data.length) {
     const chunk = data.subarray(sent, sent + CLOUD_CHUNK);
-    const reply = cloudCall('write', {
-      id: found.cloud,
-      data: base64(chunk),
-      ...(offset != null ? { offset: (BigInt(offset) + BigInt(sent)).toString() } : {}),
-    });
+    let reply;
+    try {
+      reply = cloudCall('write', {
+        id: found.cloud,
+        data: base64(chunk),
+        ...(offset != null ? { offset: (BigInt(offset) + BigInt(sent)).toString() } : {}),
+      });
+    } catch (error) {
+      if (sent > 0 && error instanceof Errno) { forget(); return sent; }
+      throw error;
+    }
     if (!reply.written) break;
     sent += reply.written;
+    if (reply.written < chunk.length) break;
   }
   forget();
   return sent;
@@ -888,10 +904,14 @@ const wasi = {
     if (found.cloud != null) {
       if (offset < 0n) throw new Errno(EINVAL);
       let at = offset, total = 0;
-      for (const [ptr, len] of iovecs(iovs, count)) {
-        const data = cloudRead(found, at, len);
-        bytes().set(data, ptr); total += data.length; at += BigInt(data.length);
-        if (data.length < len) break;
+      try {
+        for (const [ptr, len] of iovecs(iovs, count)) {
+          const data = cloudRead(found, at, len);
+          bytes().set(data, ptr); total += data.length; at += BigInt(data.length);
+          if (data.length < len) break;
+        }
+      } catch (error) {
+        if (!total || !(error instanceof Errno)) throw error;
       }
       view().setUint32(nread, total, true);
       return;
@@ -915,9 +935,14 @@ const wasi = {
     if (found.cloud != null) {
       if (offset < 0n) throw new Errno(EINVAL);
       let at = offset, total = 0;
-      for (const [ptr, len] of iovecs(iovs, count)) {
-        const wrote = cloudWrite(found, at, bytes().slice(ptr, ptr + len));
-        total += wrote; at += BigInt(wrote);
+      try {
+        for (const [ptr, len] of iovecs(iovs, count)) {
+          const wrote = cloudWrite(found, at, bytes().slice(ptr, ptr + len));
+          total += wrote; at += BigInt(wrote);
+          if (wrote < len) break;
+        }
+      } catch (error) {
+        if (!total || !(error instanceof Errno)) throw error;
       }
       view().setUint32(nwritten, total, true);
       return;
@@ -929,7 +954,7 @@ const wasi = {
   fd_read: (fd, iovs, count, nread) => attempt(function* () {
     const found = descriptor(fd);
     let total = 0;
-    yield* exclusive(found, function* () {
+    try { yield* exclusive(found, function* () {
       for (const [ptr, len] of iovecs(iovs, count)) {
         if (found.cloud != null) {
           const data = cloudRead(found, null, len);
@@ -946,7 +971,9 @@ const wasi = {
         if (['pipe-in', 'tty'].includes(found.kind) && total > 0 && found.pipe.queued === 0) break;
         if (found.kind === 'pty' && total > 0 && !ptyCall(found, 'poll', { writing: false }).nbytes) break;
       }
-    });
+    }); } catch (error) {
+      if (found.cloud == null || !total || !(error instanceof Errno)) throw error;
+    }
     view().setUint32(nread, total, true);
   }),
   fd_readdir: (fd, buf, len, cookie, used) => attempt(function* () {
@@ -1048,7 +1075,9 @@ const wasi = {
       for (const [ptr, len] of vectors) {
         const data = bytes().slice(ptr, ptr + len);
         if (found.cloud != null) {
-          total += cloudWrite(found, null, data);
+          const wrote = cloudWrite(found, null, data);
+          total += wrote;
+          if (wrote < len) break;
           continue;
         }
         if (found.kind !== 'file') {
@@ -1062,9 +1091,9 @@ const wasi = {
         found.pos = isByteDevice(found.device) ? 0 : found.local && found.append ? found.size : at + len;
       }
     }); } catch (error) {
-      // writev may have finished earlier vectors before a signal interrupts a
-      // later one. Report those bytes so libc does not resend them.
-      if (!total || !(error instanceof Errno) || ![ERRNO.EINTR, ERRNO.EPIPE, ERRNO.EAGAIN].includes(error.errno)) throw error;
+      // writev may have finished earlier vectors before a signal interrupts or an error stops
+      // a later one. Report those bytes so libc does not resend them.
+      if (!total || !(error instanceof Errno) || (found.cloud == null && ![ERRNO.EINTR, ERRNO.EPIPE, ERRNO.EAGAIN].includes(error.errno))) throw error;
     }
     view().setUint32(nwritten, total, true);
   }),
@@ -1502,8 +1531,10 @@ function describe(found) {
     case 'dir': return { kind: 'dir', path: found.path, preopen: !!found.preopen };
     default: {
       if (found.cloud != null) {
-        const { kind, cloud, path, device, writable, read, append, stat: stated, refs } = found;
-        return { kind, cloud, path, device, writable, read, append, stat: stated, refs };
+        if (found.share == null) share(found);
+        if (found.share == null) throw new Errno(ERRNO.EMFILE);
+        const { kind, cloud, path, device, writable, read, append, stat: stated, share: slot, refs } = found;
+        return { kind, cloud, path, device, writable, read, append, stat: stated, share: slot, refs };
       }
       if (found.share == null) share(found);
       if (found.share == null) throw new Errno(ERRNO.EMFILE);

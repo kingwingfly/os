@@ -344,3 +344,157 @@ fn open_with_enforces_nofollow_and_directory_flags() {
     run(table.exit(1));
     assert!(table.is_empty());
 }
+
+#[test]
+fn dot_and_dotdot_require_search_permission() {
+    let (fs, table) = table();
+    let root = Cred::root();
+    let user = Cred::new(os_vfs::Identity {
+        id: 1000,
+        group: 1000,
+        groups: std::collections::BTreeSet::from([1000]),
+    });
+
+    let (_, ok_open) = run(fs.create(&root, &fs.root(), "ok", 0o644, &create())).unwrap();
+    run(fs.release(&ok_open)).unwrap();
+    let blocked = run(fs.mkdir(&root, &fs.root(), "blocked", 0o644))
+        .unwrap()
+        .handle;
+    let (_, inner_open) = run(fs.create(&root, &blocked, "inner", 0o644, &create())).unwrap();
+    run(fs.release(&inner_open)).unwrap();
+
+    for path in ["/blocked/../ok", "/blocked/./inner"] {
+        let err = match run(table.open(1, &user, path, &read(), 0, &everywhere)) {
+            Ok(_) => panic!("expected EACCES for {path}"),
+            Err(err) => err,
+        };
+        assert_eq!(err, Errno::EACCES, "path {path}");
+    }
+    for path in ["/blocked/..", "/blocked/."] {
+        let err = match run(table.resolve(&user, path, true, &everywhere)) {
+            Ok(_) => panic!("expected EACCES resolving {path}"),
+            Err(err) => err,
+        };
+        assert_eq!(err, Errno::EACCES, "resolve {path}");
+    }
+
+    assert!(
+        run(table.open(2, &root, "/blocked/../ok", &read(), 0, &everywhere))
+            .unwrap()
+            .is_some(),
+        "root should traverse /blocked/../ok"
+    );
+    assert!(
+        run(table.open(2, &root, "/blocked/./inner", &read(), 0, &everywhere))
+            .unwrap()
+            .is_some(),
+        "root should traverse /blocked/./inner"
+    );
+    for path in ["/blocked/..", "/blocked/."] {
+        assert!(
+            matches!(
+                run(table.resolve(&root, path, true, &everywhere)).unwrap(),
+                Some(Resolved::Directory(_))
+            ),
+            "root should resolve directory {path}"
+        );
+    }
+
+    run(table.exit(1));
+    run(table.exit(2));
+    assert!(table.is_empty());
+}
+
+#[test]
+fn sticky_directory_protected_symlinks_check_acting_credential() {
+    let (fs, table) = table();
+    let root = Cred::root();
+    let alice = Cred::new(os_vfs::Identity {
+        id: 1001,
+        group: 1001,
+        groups: std::collections::BTreeSet::from([1001]),
+    });
+    let bob = Cred::new(os_vfs::Identity {
+        id: 1002,
+        group: 1002,
+        groups: std::collections::BTreeSet::from([1002]),
+    });
+    let charlie = Cred::new(os_vfs::Identity {
+        id: 1003,
+        group: 1003,
+        groups: std::collections::BTreeSet::from([1003]),
+    });
+
+    let sticky = run(fs.mkdir(&bob, &fs.root(), "sticky", 0o1777))
+        .unwrap()
+        .handle;
+    run(fs.setattr(
+        &bob,
+        &sticky,
+        &os_vfs::SetAttr {
+            mode: Some(0o1777),
+            ..os_vfs::SetAttr::default()
+        },
+    ))
+    .unwrap();
+    let (_, target_open) = run(fs.create(&alice, &sticky, "target", 0o644, &create())).unwrap();
+    run(fs.release(&target_open)).unwrap();
+    run(fs.symlink(&alice, &sticky, "link", "target")).unwrap();
+    run(fs.symlink(&bob, &sticky, "owner_link", "target")).unwrap();
+
+    for (pid, who) in [(1, &charlie), (2, &bob)] {
+        let denied = match run(table.open(pid, who, "/sticky/link", &read(), 0, &everywhere)) {
+            Ok(_) => panic!("expected EACCES when pid {pid} follows alice's symlink in sticky dir"),
+            Err(err) => err,
+        };
+        assert_eq!(denied, Errno::EACCES);
+    }
+
+    assert!(
+        run(table.open(3, &alice, "/sticky/link", &read(), 0, &everywhere))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        run(table.open(4, &root, "/sticky/link", &read(), 0, &everywhere))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        run(table.open(5, &charlie, "/sticky/owner_link", &read(), 0, &everywhere))
+            .unwrap()
+            .is_some()
+    );
+
+    for pid in 1..=5 {
+        run(table.exit(pid));
+    }
+    assert!(table.is_empty());
+}
+
+#[test]
+fn monotonic_id_source_prevents_aliasing_across_tables() {
+    let (fs, _) = table();
+    let cred = Cred::root();
+    let (_, open_ref) = run(fs.create(&cred, &fs.root(), "f", 0o644, &create())).unwrap();
+    run(fs.release(&open_ref)).unwrap();
+
+    let next_id = std::rc::Rc::new(std::cell::Cell::new(1u64));
+    let first = Descriptions::with_id_source(fs.clone(), next_id.clone());
+    let f1 = run(first.open(1, &cred, "/f", &read(), 0, &everywhere))
+        .unwrap()
+        .unwrap();
+    assert_eq!(f1.id, 1);
+    drop(f1);
+
+    let reconnected = Descriptions::with_id_source(fs, next_id);
+    assert_eq!(reconnected.get(1, 1).err(), Some(Errno::EBADF));
+    let f2 = run(reconnected.open(1, &cred, "/f", &read(), 0, &everywhere))
+        .unwrap()
+        .unwrap();
+    assert_eq!(f2.id, 2);
+    drop(f2);
+
+    run(first.exit(1));
+    run(reconnected.exit(1));
+}

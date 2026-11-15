@@ -22,7 +22,7 @@ mod mounts;
 
 use abi::{Batch, Call, Errno, Error, Exec, PROC_POLL_MAX, Return, SIGTERM};
 use serde_json::{Value, json};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
@@ -95,6 +95,8 @@ struct State {
     /// Pids lent for each process lineage. Never reuse another account's reservation after
     /// login/logout; the server binds each pool to the process token that requested it.
     spare: HashMap<String, Vec<u32>>,
+    /// Cached authenticated process identities keyed by process token.
+    identities: HashMap<String, vfs::Identity>,
     /// What happened here that the machine is still to hear: forks, exits, waits, in order.
     reports: Vec<Call>,
     /// How many reports were made, and how many the machine heard, since the kernel started.
@@ -106,7 +108,7 @@ struct State {
 pub struct Kernel {
     state: Rc<RefCell<State>>,
     /// The process a cloud call acts for now (cloudfs.rs), read before the driver awaits.
-    current: Rc<Cell<cloudfs::Actor>>,
+    current: Rc<RefCell<cloudfs::Actor>>,
     /// The instance's cloud filesystem session and descriptions (cloudfs.rs).
     cloud: cloudfs::Connector,
 }
@@ -128,6 +130,7 @@ impl Kernel {
                 id: id.to_string(),
                 processes: HashMap::new(),
                 spare: HashMap::new(),
+                identities: HashMap::new(),
                 reports: Vec::new(),
                 queued: 0,
                 reported: 0,
@@ -398,12 +401,12 @@ impl Kernel {
             status,
             signal,
             pid: Some(pid),
-            token: Some(token),
+            token: Some(token.clone()),
         });
         state.retain_spare();
         drop(state);
         // What it held of cloud files it lets go, as its descriptors close at exit.
-        self.cloud_exited(pid).await;
+        self.cloud_exited(pid, Some(token)).await;
         Ok(json!({ "ppid": ppid }).to_string())
     }
 
@@ -639,7 +642,8 @@ impl Kernel {
             false,
         )
         .await?;
-        self.state.borrow_mut().processes.insert(
+        let mut state = self.state.borrow_mut();
+        state.processes.insert(
             INIT,
             Local {
                 ppid: 0,
@@ -648,6 +652,7 @@ impl Kernel {
                 ended: None,
             },
         );
+        state.identities.insert(token.into(), vfs::Identity::root());
         Ok(json!({ "pid": INIT, "ppid": 0, "token": token, "asset": "/usr/bin/init.wasm",
             "membership": { "pid": INIT, "ppid": 0, "pgid": INIT, "sid": INIT, "uid": 0, "ctty": 0 }
         }).to_string())
@@ -719,8 +724,14 @@ impl Kernel {
         // What it ran that this kernel kept goes too.
         let reaped: Vec<u32> = serde_json::from_value(value.clone()).unwrap_or_default();
         for pid in reaped {
-            self.state.borrow_mut().processes.remove(&pid);
-            self.cloud_exited(pid).await;
+            let removed = {
+                let mut state = self.state.borrow_mut();
+                let removed = state.processes.remove(&pid);
+                state.retain_spare();
+                removed
+            };
+            self.cloud_exited(pid, removed.map(|local| local.token))
+                .await;
         }
         Ok(value.to_string())
     }
@@ -912,6 +923,11 @@ impl State {
     /// The server releases unused lends when the last live holder of their token ends.
     fn retain_spare(&mut self) {
         self.spare.retain(|token, _| {
+            self.processes
+                .values()
+                .any(|local| local.ended.is_none() && &local.token == token)
+        });
+        self.identities.retain(|token, _| {
             self.processes
                 .values()
                 .any(|local| local.ended.is_none() && &local.token == token)

@@ -14,10 +14,12 @@
 //! not serve) is not resolved here at all: the caller's `inside` says which paths are the
 //! driver's, and anything else answers `None`, for the caller's other paths to serve.
 use crate::{
-    Cred, Entry, Filesystem, Handle, OpenOptions, ReleaseQueue, Result, Stop, check_component,
-    file::FileRef,
+    Cred, Entry, Filesystem, Handle, Metadata, OpenOptions, ReleaseQueue, Result, Stop,
+    check_component, file::FileRef,
 };
 use abi::Errno;
+use os_core::inode::may_follow_link as allowed_link;
+use os_core::permissions::Node;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
@@ -55,7 +57,7 @@ struct Held {
 pub struct Descriptions {
     fs: Rc<dyn Filesystem>,
     releases: ReleaseQueue,
-    next: Cell<Id>,
+    next: Rc<Cell<Id>>,
     files: RefCell<BTreeMap<Id, Held>>,
 }
 
@@ -66,12 +68,50 @@ fn names(path: &str) -> impl DoubleEndedIterator<Item = String> + '_ {
         .map(str::to_string)
 }
 
+struct Frame {
+    handle: Handle,
+    path: String,
+    metadata: Option<Metadata>,
+    searchable: bool,
+}
+
+async fn ensure_searchable(fs: &Rc<dyn Filesystem>, cred: &Cred, frame: &mut Frame) -> Result<()> {
+    if !frame.searchable {
+        // Probe with a valid component name so drivers with ACLs or server-side identity
+        // evaluate search permission (`EXEC`) on `frame.handle` using their real authority.
+        fs.walk(cred, &frame.handle, &["_".to_string()]).await?;
+        frame.searchable = true;
+    }
+    Ok(())
+}
+
+async fn ensure_metadata<'a>(
+    fs: &Rc<dyn Filesystem>,
+    cred: &Cred,
+    frame: &'a mut Frame,
+) -> Result<&'a Metadata> {
+    if frame.metadata.is_none() {
+        frame.metadata = Some(fs.metadata(cred, &frame.handle).await?);
+    }
+    Ok(frame.metadata.as_ref().expect("populated metadata"))
+}
+
+fn may_follow_link(cred: &Cred, dir: &Metadata, link: &Metadata) -> bool {
+    let dir_node = Node::directory(dir.uid, dir.gid, dir.mode);
+    let link_node = Node::symlink(link.uid, link.gid, "");
+    allowed_link(&cred.identity, &dir_node, &link_node)
+}
+
 impl Descriptions {
     pub fn new(fs: Rc<dyn Filesystem>) -> Self {
+        Self::with_id_source(fs, Rc::new(Cell::new(1)))
+    }
+    /// Construct a table sharing a monotonic ID counter so IDs never alias across reconnects.
+    pub fn with_id_source(fs: Rc<dyn Filesystem>, next: Rc<Cell<Id>>) -> Self {
         Self {
             fs,
             releases: ReleaseQueue::new(),
-            next: Cell::new(1),
+            next,
             files: RefCell::new(BTreeMap::new()),
         }
     }
@@ -103,19 +143,26 @@ impl Descriptions {
             return Err(Errno::ENAMETOOLONG);
         }
         // Each directory came through, with its path; the root's is "".
-        let mut stack: Vec<(Handle, String)> = vec![(self.fs.root(), String::new())];
+        let mut stack = vec![Frame {
+            handle: self.fs.root(),
+            path: String::new(),
+            metadata: None,
+            searchable: false,
+        }];
         let mut queue: VecDeque<String> = names(path).collect();
         // A trailing slash asks for a directory: the last name is followed, as Linux does.
         let mut directory = path.ends_with('/') && queue.back().is_some();
         let mut links = 0;
         'walk: loop {
             match queue.front().map(String::as_str) {
-                None => return Ok(Some(Resolved::Directory(stack.pop().expect("root").0))),
+                None => return Ok(Some(Resolved::Directory(stack.pop().expect("root").handle))),
                 Some(".") => {
+                    ensure_searchable(&self.fs, cred, stack.last_mut().expect("root")).await?;
                     queue.pop_front();
                     continue;
                 }
                 Some("..") => {
+                    ensure_searchable(&self.fs, cred, stack.last_mut().expect("root")).await?;
                     queue.pop_front();
                     if stack.len() > 1 {
                         stack.pop();
@@ -125,7 +172,7 @@ impl Descriptions {
                 Some(_) => {}
             }
             // The run of plain names from here, as far as the driver serves them.
-            let base = stack.last().expect("root").1.clone();
+            let base = stack.last().expect("root").path.clone();
             let mut run = Vec::new();
             let mut at = base;
             while let Some(name) = queue.front() {
@@ -143,12 +190,19 @@ impl Descriptions {
                 at = next;
                 run.push(queue.pop_front().expect("front"));
             }
-            let dir = stack.last().expect("root").0.clone();
+            let dir = stack.last().expect("root").handle.clone();
             let walked = self.fs.walk(cred, &dir, &run).await?;
+            // Stepping into `run[0]` succeeded, so `dir` passed search permission.
+            stack.last_mut().expect("root").searchable = true;
             for (index, entry) in walked.entries.into_iter().enumerate() {
                 let name = &run[index];
                 let last = index + 1 == run.len() && queue.is_empty();
                 if entry.metadata.is_symlink() && (!last || follow || directory) {
+                    let parent_meta =
+                        ensure_metadata(&self.fs, cred, stack.last_mut().expect("root")).await?;
+                    if !may_follow_link(cred, parent_meta, &entry.metadata) {
+                        return Err(Errno::EACCES);
+                    }
                     links += 1;
                     if links > abi::MAXSYMLINKS {
                         return Err(Errno::ELOOP);
@@ -175,7 +229,7 @@ impl Descriptions {
                     if directory && !entry.metadata.is_dir() {
                         return Err(Errno::ENOTDIR);
                     }
-                    let parent = stack.pop().expect("root").0;
+                    let parent = stack.pop().expect("root").handle;
                     return Ok(Some(Resolved::Found {
                         parent,
                         name: name.clone(),
@@ -185,12 +239,17 @@ impl Descriptions {
                 if !entry.metadata.is_dir() {
                     return Err(Errno::ENOTDIR);
                 }
-                let path = format!("{}/{name}", stack.last().expect("root").1);
-                stack.push((entry.handle, path));
+                let path = format!("{}/{name}", stack.last().expect("root").path);
+                stack.push(Frame {
+                    handle: entry.handle,
+                    path,
+                    metadata: Some(entry.metadata),
+                    searchable: index + 1 < run.len(),
+                });
             }
             match walked.stop {
                 Some(Stop::Missing(index)) if index + 1 == run.len() && queue.is_empty() => {
-                    let parent = stack.pop().expect("root").0;
+                    let parent = stack.pop().expect("root").handle;
                     return Ok(Some(Resolved::Missing {
                         parent,
                         name: run[index].clone(),

@@ -17,7 +17,7 @@
 //!   else, a directory, a device, `/proc`, a local mount, answers `{"fallback": true}`, and
 //!   its caller keeps using the path calls, which coexist with v2 until #51 (contract §2.10).
 use crate::{Kernel, State, fail};
-use abi::{Errno, Error};
+use abi::{Batch, Call, Creds, Errno, Error};
 use serde_json::json;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -74,31 +74,32 @@ async fn promised(value: JsValue) -> vfs::Result<JsValue> {
 }
 
 /// Which kernel process is currently driving the cloud session across a poll.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) enum Actor {
     #[default]
     None,
     Process(u32),
-    Exiting(u32),
+    Exiting(u32, Option<String>),
 }
 
 struct Acted<F> {
-    current: Rc<Cell<Actor>>,
+    current: Rc<RefCell<Actor>>,
     actor: Actor,
     future: F,
 }
 impl<F: Future> Future for Acted<F> {
     type Output = F::Output;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        struct Reset<'a>(&'a Cell<Actor>, Actor);
+        struct Reset<'a>(&'a RefCell<Actor>, Actor);
         impl Drop for Reset<'_> {
             fn drop(&mut self) {
-                self.0.set(self.1);
+                *self.0.borrow_mut() = std::mem::take(&mut self.1);
             }
         }
         // SAFETY: `current` and `actor` are not pinned; `future` remains structurally pinned.
         let this = unsafe { self.get_unchecked_mut() };
-        let _reset = Reset(&this.current, this.current.replace(this.actor));
+        let previous = std::mem::replace(&mut *this.current.borrow_mut(), this.actor.clone());
+        let _reset = Reset(&this.current, previous);
         unsafe { Pin::new_unchecked(&mut this.future) }.poll(cx)
     }
 }
@@ -107,7 +108,7 @@ impl<F: Future> Future for Acted<F> {
 /// fetch, which carries the `Origin` header), `cloudFsSleep(ms)` and `cloudFsTicket()`.
 pub(crate) struct BrowserHost {
     state: Rc<RefCell<State>>,
-    current: Rc<Cell<Actor>>,
+    current: Rc<RefCell<Actor>>,
 }
 impl Host for BrowserHost {
     fn post<'a>(
@@ -159,19 +160,22 @@ impl Host for BrowserHost {
     }
     fn caller(&self) -> vfs::Result<(String, Option<u32>)> {
         let state = self.state.borrow();
-        match self.current.get() {
+        match &*self.current.borrow() {
             Actor::None => Err(Errno::EACCES),
             Actor::Process(pid) => {
                 let local = state
                     .processes
-                    .get(&pid)
+                    .get(pid)
                     .filter(|local| local.ended.is_none())
                     .ok_or(Errno::EACCES)?;
-                Ok((local.token.clone(), Some(pid)))
+                Ok((local.token.clone(), Some(*pid)))
             }
-            Actor::Exiting(pid) => {
-                let local = state.processes.get(&pid).ok_or(Errno::EACCES)?;
-                Ok((local.token.clone(), Some(pid)))
+            Actor::Exiting(pid, token) => {
+                if let Some(token) = token {
+                    return Ok((token.clone(), Some(*pid)));
+                }
+                let local = state.processes.get(pid).ok_or(Errno::EACCES)?;
+                Ok((local.token.clone(), Some(*pid)))
             }
         }
     }
@@ -218,11 +222,22 @@ pub(crate) struct Cloud {
 }
 
 /// Connects the session once, for every caller that needs it meanwhile.
-#[derive(Default)]
 pub(crate) struct Connector {
     cloud: RefCell<Option<Rc<Cloud>>>,
     busy: Cell<bool>,
     waiters: RefCell<Vec<Waker>>,
+    /// Monotonic description IDs across reconnects so old Workers can never alias new opens.
+    next_id: Rc<Cell<Id>>,
+}
+impl Default for Connector {
+    fn default() -> Self {
+        Self {
+            cloud: RefCell::default(),
+            busy: Cell::default(),
+            waiters: RefCell::default(),
+            next_id: Rc::new(Cell::new(1)),
+        }
+    }
 }
 struct Connecting<'a>(&'a Connector);
 impl Drop for Connecting<'_> {
@@ -240,7 +255,7 @@ impl Connector {
     async fn get(
         &self,
         state: &Rc<RefCell<State>>,
-        current: &Rc<Cell<Actor>>,
+        current: &Rc<RefCell<Actor>>,
         token: &str,
     ) -> vfs::Result<Rc<Cloud>> {
         poll_fn(|context| {
@@ -263,7 +278,10 @@ impl Connector {
         };
         let fs = Rc::new(CloudFs::connect(HttpTransport(host), token.to_string()).await?);
         let cloud = Rc::new(Cloud {
-            table: Descriptions::new(fs.clone() as Rc<dyn Filesystem>),
+            table: Descriptions::with_id_source(
+                fs.clone() as Rc<dyn Filesystem>,
+                self.next_id.clone(),
+            ),
             fs,
             waits: RefCell::default(),
         });
@@ -341,8 +359,72 @@ impl Kernel {
         let file = cloud.table.get(pid, id).map_err(errno)?;
         Ok((cloud, file))
     }
+    fn is_live(&self, pid: u32) -> bool {
+        self.state
+            .borrow()
+            .processes
+            .get(&pid)
+            .is_some_and(|local| local.ended.is_none())
+    }
+    /// Fetch and cache the acting process's authenticated identity from `/api/sys` on the
+    /// authority (never `X-Registry`) so client-side traversal rules (such as protected
+    /// symlinks in sticky directories) match the service's authority.
+    async fn cloud_identity(&self, pid: u32, token: &str) -> JsResult<Identity> {
+        if let Some(identity) = self.state.borrow().identities.get(token).cloned() {
+            return Ok(identity);
+        }
+        let body = serde_json::to_vec(&Batch {
+            calls: vec![Call::Getcreds],
+            umask: None,
+            sudo: false,
+            pid: Some(pid),
+            process: Some(token.to_string()),
+        })
+        .map_err(|error| fail(Error::because(Errno::EIO, error.to_string())))?;
+        let host = BrowserHost {
+            state: self.state.clone(),
+            current: self.current.clone(),
+        };
+        let reply = host
+            .post(
+                "/api/sys",
+                vec![("Content-Type", "application/json".to_string())],
+                body,
+            )
+            .await
+            .map_err(errno)?;
+        if reply.status != 200 {
+            let detail = String::from_utf8_lossy(&reply.body).into_owned();
+            return Err(fail(Error::because(Errno::EIO, detail)));
+        }
+        let results: abi::Results = serde_json::from_slice(&reply.body)
+            .map_err(|error| fail(Error::because(Errno::EIO, error.to_string())))?;
+        let value = results
+            .results
+            .into_iter()
+            .next()
+            .ok_or_else(|| fail(Errno::EIO.into()))?
+            .into_result()
+            .map_err(fail)?;
+        let creds: Creds = crate::from_value(value, "creds")?;
+        let identity = Identity {
+            id: creds.uid,
+            group: creds.gid,
+            groups: creds.groups.into_iter().collect(),
+        };
+        let mut state = self.state.borrow_mut();
+        if state
+            .processes
+            .get(&pid)
+            .is_some_and(|local| local.ended.is_none() && local.token == token)
+        {
+            state.identities.insert(token.to_string(), identity.clone());
+            state.retain_spare();
+        }
+        Ok(identity)
+    }
     /// What `pid`'s exit lets go of: its cloud descriptions and lock waits.
-    pub(crate) async fn cloud_exited(&self, pid: u32) {
+    pub(crate) async fn cloud_exited(&self, pid: u32, token: Option<String>) {
         let Some(cloud) = self.cloud.current() else {
             return;
         };
@@ -352,7 +434,7 @@ impl Kernel {
             }
             *holder != pid
         });
-        self.acted(Actor::Exiting(pid), async {
+        self.acted(Actor::Exiting(pid, token), async {
             cloud.table.exit(pid).await;
             let _ = cloud.table.flush().await;
             let _ = cloud.fs.drain().await;
@@ -379,50 +461,76 @@ impl Kernel {
         let options = OpenOptions::from_flags(flags).map_err(errno)?;
         let nofollow = flags & abi::O_NOFOLLOW != 0;
         let directory = flags & abi::O_DIRECTORY != 0;
+        if !inside(path) {
+            return Ok(json!({ "fallback": true }).to_string());
+        }
+        let identity = self.cloud_identity(pid, &token).await?;
+        if !self.is_live(pid) {
+            return Err(errno(Errno::ESRCH));
+        }
         let cred = Cred {
-            // Remote drivers act on the token; the identity is the service's to know.
-            identity: Identity::guest(),
+            identity,
             umask,
             token: Some(token.clone()),
         };
-        self.acted(Actor::Process(pid), async move {
-            let mut cloud = self.cloud(&token).await?;
-            let opened = match cloud
-                .table
-                .open_with(
-                    pid, &cred, path, &options, mode, nofollow, directory, &inside,
-                )
-                .await
-            {
-                Err(Errno::ENOTCONN)
-                    if cloud.table.is_empty() && cloud.fs.pending_cancellations() == 0 =>
+        let mut cloud = self.acted(Actor::Process(pid), self.cloud(&token)).await?;
+        if !self.is_live(pid) {
+            self.acted(Actor::Exiting(pid, Some(token)), async {
+                let _ = cloud.table.flush().await;
+                let _ = cloud.fs.drain().await;
+            })
+            .await;
+            return Err(errno(Errno::ESRCH));
+        }
+        let open_result = self
+            .acted(Actor::Process(pid), async {
+                match cloud
+                    .table
+                    .open_with(
+                        pid, &cred, path, &options, mode, nofollow, directory, &inside,
+                    )
+                    .await
                 {
-                    self.drop_if_disconnected(&cloud, Errno::ENOTCONN);
-                    cloud = self.cloud(&token).await?;
-                    self.map_cloud(
-                        &cloud,
-                        cloud
-                            .table
-                            .open_with(
-                                pid, &cred, path, &options, mode, nofollow, directory, &inside,
-                            )
-                            .await,
-                    )?
+                    Err(Errno::ENOTCONN)
+                        if cloud.table.is_empty() && cloud.fs.pending_cancellations() == 0 =>
+                    {
+                        self.drop_if_disconnected(&cloud, Errno::ENOTCONN);
+                        cloud = self.cloud(&token).await?;
+                        self.map_cloud(
+                            &cloud,
+                            cloud
+                                .table
+                                .open_with(
+                                    pid, &cred, path, &options, mode, nofollow, directory, &inside,
+                                )
+                                .await,
+                        )
+                    }
+                    other => self.map_cloud(&cloud, other),
                 }
-                other => self.map_cloud(&cloud, other)?,
-            };
-            let Some(opened) = opened else {
-                return Ok(json!({ "fallback": true }).to_string());
-            };
-            let handle = opened.file.handle();
-            let mut metadata = opened.entry.metadata.clone();
-            if options.is_truncate() {
-                metadata.size = 0;
-            }
-            let stat = vfs::stat::stat(&handle.fs, handle.node, &metadata);
-            Ok(json!({ "id": opened.id, "stat": stat }).to_string())
-        })
-        .await
+            })
+            .await;
+        if !self.is_live(pid) {
+            self.acted(Actor::Exiting(pid, Some(token)), async {
+                if let Ok(Some(opened)) = open_result {
+                    let _ = cloud.table.close(pid, opened.id).await;
+                }
+                let _ = cloud.table.flush().await;
+                let _ = cloud.fs.drain().await;
+            })
+            .await;
+            return Err(errno(Errno::ESRCH));
+        }
+        let Some(opened) = open_result? else {
+            return Ok(json!({ "fallback": true }).to_string());
+        };
+        let handle = opened.file.handle();
+        let mut metadata = opened.entry.metadata.clone();
+        if options.is_truncate() {
+            metadata.size = 0;
+        }
+        let stat = vfs::stat::stat(&handle.fs, handle.node, &metadata);
+        Ok(json!({ "id": opened.id, "stat": stat }).to_string())
     }
 
     /// read(2) (at the shared position) or pread(2) (at `offset`): at most `count` bytes.
