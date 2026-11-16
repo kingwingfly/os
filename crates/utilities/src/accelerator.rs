@@ -53,6 +53,7 @@ impl Handles {
         Ok(protocol::PathAt {
             directory: fd,
             name: name.into(),
+            open: None,
         })
     }
 }

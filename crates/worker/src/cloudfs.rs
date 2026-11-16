@@ -970,6 +970,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             db.release_cloud_open(open.id, false);
             Value::Null
         }
+        wire::Call::Clone { .. } => return Err(Errno::ENOSYS),
         TryLock { .. }
         | Lock { .. }
         | AckLock { .. }

@@ -791,7 +791,7 @@ fn run(
             }
             Ok(json!(statfs(db)))
         }
-        Call::InotifyAddWatch { path, mask } => {
+        Call::InotifyAddWatch { path, mask, .. } => {
             let sid = sid.ok_or(Errno::EBADF)?;
             let stat = kernel::stat(db, &process.cred, &path, true)?;
             if !stat.is_dir() {
@@ -930,6 +930,7 @@ fn statfs(db: &Db) -> abi::StatFs {
         files: inodes + FREE,
         ffree: FREE,
         namelen: abi::NAME_MAX as u64,
+        ..abi::StatFs::default()
     }
 }
 

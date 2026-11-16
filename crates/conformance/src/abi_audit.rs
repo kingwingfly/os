@@ -1,6 +1,6 @@
-//! Audited Call variants contain no mount, unmount or chroot operation.
-//! An addition/rename must fail compilation until the unsupported probes are
-//! reviewed against the new ABI. This is deliberately exhaustive, without `_`.
+//! Audited Call variants for the conformance probe.
+//! An addition/rename must fail compilation until the probe is reviewed
+//! against the new ABI. This is deliberately exhaustive, without `_`.
 //! Comments, impl placement and enum ordering do not affect this type check.
 use abi::Call;
 
@@ -22,6 +22,24 @@ const _: fn(Call) = |call| match call {
     | Call::Chown { .. }
     | Call::Utimens { .. }
     | Call::Statfs { .. }
+    | Call::Fstatfs { .. }
+    | Call::Mount { .. }
+    | Call::Umount2 { .. }
+    | Call::Chdir { .. }
+    | Call::Fchdir { .. }
+    | Call::Getcwd
+    | Call::Chroot { .. }
+    | Call::Unshare { .. }
+    | Call::Setns { .. }
+    | Call::OpenAt { .. }
+    | Call::FstatAt { .. }
+    | Call::MkdirAt { .. }
+    | Call::UnlinkAt { .. }
+    | Call::RenameAt { .. }
+    | Call::LinkAt { .. }
+    | Call::SymlinkAt { .. }
+    | Call::ReadlinkAt { .. }
+    | Call::UtimensAt { .. }
     | Call::Getxattr { .. }
     | Call::Setxattr { .. }
     | Call::Listxattr { .. }

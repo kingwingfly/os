@@ -1590,6 +1590,7 @@ impl LocalMount {
                     files: sfs.files,
                     ffree: sfs.files_free,
                     namelen: sfs.name_max,
+                    ..abi::StatFs::default()
                 };
                 json_to_js(&serde_json::to_value(out).unwrap_or(Value::Null))
             }

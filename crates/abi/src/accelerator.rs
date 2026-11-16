@@ -79,8 +79,11 @@ pub enum Existing {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PathAt {
+    #[serde(default)]
     pub directory: u32,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<crate::fs::OpenRef>,
 }
 impl PathAt {
     pub fn valid(&self) -> bool {
@@ -235,6 +238,8 @@ pub struct Completion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::{Access, FsId, NodeId, OpenRef};
+
     #[test]
     fn reject_versions_ambiguous_resources_and_extra_authority() {
         let mut request = Submit {
@@ -245,18 +250,45 @@ mod tests {
                 source: PathAt {
                     directory: 3,
                     name: "input.zip".into(),
+                    open: None,
                 },
                 verbose: false,
             },
         };
         assert!(request.validate().is_ok());
+        // Omitted `open` skips serialization and deserializes cleanly as `None`.
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(!encoded.contains("\"open\""), "{encoded}");
+        assert_eq!(serde_json::from_str::<Submit>(&encoded).unwrap(), request);
+
+        // v2 `OpenRef` on `PathAt` round-trips cleanly.
+        let with_open = PathAt {
+            directory: 3,
+            name: "input.zip".into(),
+            open: Some(OpenRef {
+                fs: FsId("cloud".into()),
+                id: 77,
+                node: NodeId {
+                    ino: 12,
+                    generation: 1,
+                },
+                access: Access::Path,
+            }),
+        };
+        let encoded_open = serde_json::to_string(&with_open).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PathAt>(&encoded_open).unwrap(),
+            with_open
+        );
+
         request.version += 1;
         assert_eq!(request.validate(), Err(crate::Errno::EOPNOTSUPP));
         for name in ["", "..", "../private", "/private", "a/b", "a\0b"] {
             assert!(
                 !PathAt {
                     directory: 3,
-                    name: name.into()
+                    name: name.into(),
+                    open: None,
                 }
                 .valid()
             );
