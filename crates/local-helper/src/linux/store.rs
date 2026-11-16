@@ -6,7 +6,8 @@ use abi::fs::{FsId, Handle, JS_SAFE, NodeId};
 use os_core::permissions::Node;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -14,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 
 /// On-disk state schema version (contract §2.12). Older versions reset metadata once without
 /// touching host files; newer versions are refused with `EPROTONOSUPPORT`.
-pub const STATE_FORMAT_VERSION: u32 = 2;
+pub const STATE_FORMAT_VERSION: u32 = 3;
 pub const ROOT_INO: u64 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -66,6 +67,7 @@ struct PersistedState {
     handle_key: String,
     root_identity: Option<HostInodeKey>,
     next_ino: u64,
+    next_generation: u64,
     nodes: BTreeMap<u64, StoredNode>,
 }
 
@@ -178,6 +180,9 @@ pub struct StateStore {
     hmac_key: [u8; 32],
     state: PersistedState,
     by_host: HashMap<HostInodeKey, u64>,
+    by_hint: BTreeMap<String, BTreeSet<u64>>,
+    by_subfs: BTreeMap<String, BTreeSet<u64>>,
+    dirty: Cell<bool>,
 }
 
 fn open_dir_chain_nofollow(path: &Path) -> Result<OwnedFd, Errno> {
@@ -293,15 +298,21 @@ impl StateStore {
                         // Older state version: reset metadata once without touching host files.
                         (Self::mint_fresh_state(root_key)?, true)
                     } else {
-                        let loaded: PersistedState =
+                        let mut loaded: PersistedState =
                             serde_json::from_slice(&bytes).map_err(|_| Errno::EIO)?;
-                        if loaded.root_identity.as_ref() != Some(&root_key)
+                        if loaded.next_generation == 0
+                            || loaded.root_identity.as_ref() != Some(&root_key)
                             || decode_key_32(&loaded.handle_key).is_none()
                         {
                             // Host root directory itself changed identity; never inherit stale grants.
                             (Self::mint_fresh_state(root_key)?, true)
                         } else {
-                            (loaded, false)
+                            // Advance generation epoch once per store open and flush before
+                            // serving requests so unpersisted pre-crash discovery handles fail
+                            // ESTALE even if the same next_ino is reused after crash/restart.
+                            loaded.next_generation =
+                                loaded.next_generation.checked_add(1).ok_or(Errno::ENOSPC)?;
+                            (loaded, true)
                         }
                     }
                 }
@@ -321,8 +332,17 @@ impl StateStore {
         let hmac_key = decode_key_32(&state.handle_key).ok_or(Errno::EIO)?;
         let fs_id = FsId(format!("helperfs:{}", state.folder_uuid));
         let mut by_host = HashMap::with_capacity(state.nodes.len());
-        for (ino, record) in &state.nodes {
-            by_host.insert(record.host.clone(), *ino);
+        let mut by_hint: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+        let mut by_subfs: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+        for (&ino, record) in &state.nodes {
+            by_host.insert(record.host.clone(), ino);
+            for hint in &record.path_hints {
+                by_hint.entry(hint.clone()).or_default().insert(ino);
+            }
+            by_subfs
+                .entry(record.host.subfs_relpath.clone())
+                .or_default()
+                .insert(ino);
         }
 
         let store = Self {
@@ -335,6 +355,9 @@ impl StateStore {
             hmac_key,
             state,
             by_host,
+            by_hint,
+            by_subfs,
+            dirty: Cell::new(need_flush),
         };
         if need_flush {
             store.flush()?;
@@ -351,6 +374,7 @@ impl StateStore {
             handle_key,
             root_identity: Some(root_key),
             next_ino: ROOT_INO + 1,
+            next_generation: 1,
             nodes: BTreeMap::new(),
         })
     }
@@ -364,6 +388,13 @@ impl StateStore {
         &self.state_file
     }
 
+    pub fn flush_if_dirty(&self) -> Result<(), Errno> {
+        if self.dirty.get() {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
     pub fn ensure_root_node(
         &mut self,
         root_key: &HostInodeKey,
@@ -373,7 +404,7 @@ impl StateStore {
         if !self.state.nodes.contains_key(&ROOT_INO) {
             let record = StoredNode {
                 minted_ino: ROOT_INO,
-                generation: 1,
+                generation: self.state.next_generation,
                 host: root_key.clone(),
                 path_hints: vec![String::new()],
                 node: Node::directory(uid, gid, 0o700),
@@ -382,7 +413,10 @@ impl StateStore {
                 unlinked: false,
             };
             self.by_host.insert(root_key.clone(), ROOT_INO);
+            insert_index(&mut self.by_hint, "", ROOT_INO);
+            insert_index(&mut self.by_subfs, &root_key.subfs_relpath, ROOT_INO);
             self.state.nodes.insert(ROOT_INO, record);
+            self.dirty.set(true);
             self.flush()?;
         }
         Ok(self.sign_handle(NodeId {
@@ -493,18 +527,29 @@ impl StateStore {
         }
         if let Some(&existing_ino) = self.by_host.get(&key) {
             let mut dirty = self.detach_hint_except(relpath, Some(existing_ino), false, is_open);
-            let record = self
-                .state
-                .nodes
-                .get_mut(&existing_ino)
-                .expect("by_host index matches nodes map");
-            if record.unlinked {
-                record.unlinked = false;
-                dirty = true;
+            let added_hint = {
+                let record = self
+                    .state
+                    .nodes
+                    .get_mut(&existing_ino)
+                    .expect("by_host index matches nodes map");
+                if record.unlinked {
+                    record.unlinked = false;
+                    dirty = true;
+                }
+                if !record.path_hints.iter().any(|p| p == relpath) {
+                    record.path_hints.push(relpath.to_owned());
+                    dirty = true;
+                    true
+                } else {
+                    false
+                }
+            };
+            if added_hint {
+                insert_index(&mut self.by_hint, relpath, existing_ino);
             }
-            if !record.path_hints.iter().any(|p| p == relpath) {
-                record.path_hints.push(relpath.to_owned());
-                dirty = true;
+            if dirty {
+                self.dirty.set(true);
             }
             return Ok((existing_ino, dirty));
         }
@@ -526,9 +571,10 @@ impl StateStore {
             HostKind::Other => Node::device(default_uid, default_gid, 0o600, ""),
         };
         node.ino = minted_ino;
+        let subfs_rel = key.subfs_relpath.clone();
         let record = StoredNode {
             minted_ino,
-            generation: 1,
+            generation: self.state.next_generation,
             host: key.clone(),
             path_hints: if relpath.is_empty() {
                 vec![String::new()]
@@ -541,7 +587,10 @@ impl StateStore {
             unlinked: false,
         };
         self.by_host.insert(key, minted_ino);
+        insert_index(&mut self.by_hint, relpath, minted_ino);
+        insert_index(&mut self.by_subfs, &subfs_rel, minted_ino);
         self.state.nodes.insert(minted_ino, record);
+        self.dirty.set(true);
         Ok((minted_ino, true))
     }
 
@@ -560,19 +609,25 @@ impl StateStore {
         self.detach_hint_except(relpath, None, false, is_open);
         if let Some(stale_ino) = self.by_host.remove(&key) {
             if is_open(stale_ino) {
-                if let Some(rec) = self.state.nodes.get_mut(&stale_ino) {
+                let stale_hints = if let Some(rec) = self.state.nodes.get_mut(&stale_ino) {
                     rec.unlinked = true;
-                    rec.path_hints.clear();
+                    std::mem::take(&mut rec.path_hints)
+                } else {
+                    Vec::new()
+                };
+                for h in stale_hints {
+                    remove_index(&mut self.by_hint, &h, stale_ino);
                 }
             } else {
-                self.state.nodes.remove(&stale_ino);
+                self.remove_node(stale_ino);
             }
         }
         let minted_ino = self.mint_ino()?;
         node.ino = minted_ino;
+        let subfs_rel = key.subfs_relpath.clone();
         let record = StoredNode {
             minted_ino,
-            generation: 1,
+            generation: self.state.next_generation,
             host: key.clone(),
             path_hints: vec![relpath.to_owned()],
             node,
@@ -581,20 +636,38 @@ impl StateStore {
             unlinked: false,
         };
         self.by_host.insert(key, minted_ino);
+        insert_index(&mut self.by_hint, relpath, minted_ino);
+        insert_index(&mut self.by_subfs, &subfs_rel, minted_ino);
         self.state.nodes.insert(minted_ino, record);
-        self.flush()?;
+        self.dirty.set(true);
+        if let Err(e) = self.flush() {
+            self.remove_node(minted_ino);
+            return Err(e);
+        }
         Ok(minted_ino)
     }
 
-    pub fn add_path_hint(&mut self, ino: u64, relpath: &str) -> Result<(), Errno> {
+    pub fn add_path_hint(&mut self, ino: u64, relpath: &str) {
+        let mut added = false;
+        let mut changed = false;
         if let Some(rec) = self.state.nodes.get_mut(&ino) {
-            rec.unlinked = false;
+            if rec.unlinked {
+                rec.unlinked = false;
+                changed = true;
+            }
             if !rec.path_hints.iter().any(|p| p == relpath) {
                 rec.path_hints.push(relpath.to_owned());
+                rec.meta_ctime = Some(sys::now_timespec());
+                added = true;
+                changed = true;
             }
-            rec.meta_ctime = Some(sys::now_timespec());
         }
-        self.flush()
+        if added {
+            insert_index(&mut self.by_hint, relpath, ino);
+        }
+        if changed {
+            self.dirty.set(true);
+        }
     }
 
     pub fn remove_hint<F>(
@@ -606,16 +679,26 @@ impl StateStore {
     where
         F: Fn(u64) -> bool,
     {
-        let _ = self.detach_hint_except(relpath, None, confirmed_last_link, is_open);
+        if self.detach_hint_except(relpath, None, confirmed_last_link, is_open) {
+            self.dirty.set(true);
+        }
         self.flush()
     }
 
     pub fn mark_unlinked(&mut self, ino: u64) -> bool {
-        if let Some(rec) = self.state.nodes.get_mut(&ino)
+        let stale_hints = if let Some(rec) = self.state.nodes.get_mut(&ino)
             && !rec.unlinked
         {
             rec.unlinked = true;
-            rec.path_hints.clear();
+            Some(std::mem::take(&mut rec.path_hints))
+        } else {
+            None
+        };
+        if let Some(hints) = stale_hints {
+            for h in hints {
+                remove_index(&mut self.by_hint, &h, ino);
+            }
+            self.dirty.set(true);
             return true;
         }
         false
@@ -634,12 +717,19 @@ impl StateStore {
     /// Drop a path hint that returned `ENOENT`/`ENOTDIR` without mistaking missing hints for
     /// inode death (an undiscovered hard link or external rename may keep the inode alive).
     pub fn drop_dead_hint(&mut self, ino: u64, relpath: &str) -> bool {
-        let Some(rec) = self.state.nodes.get_mut(&ino) else {
-            return false;
+        let changed = {
+            let Some(rec) = self.state.nodes.get_mut(&ino) else {
+                return false;
+            };
+            let before = rec.path_hints.len();
+            rec.path_hints.retain(|p| p != relpath);
+            rec.path_hints.len() != before
         };
-        let before = rec.path_hints.len();
-        rec.path_hints.retain(|p| p != relpath);
-        rec.path_hints.len() != before
+        if changed {
+            remove_index(&mut self.by_hint, relpath, ino);
+            self.dirty.set(true);
+        }
+        changed
     }
 
     pub fn gc_unlinked(&mut self, ino: u64, still_open: bool) -> Result<(), Errno> {
@@ -652,9 +742,8 @@ impl StateStore {
             .get(&ino)
             .is_some_and(|rec| rec.unlinked && rec.path_hints.is_empty());
         if should_remove {
-            if let Some(removed) = self.state.nodes.remove(&ino) {
-                self.by_host.remove(&removed.host);
-            }
+            self.remove_node(ino);
+            self.dirty.set(true);
             self.flush()?;
         }
         Ok(())
@@ -680,35 +769,72 @@ impl StateStore {
 
         let from_prefix = format!("{from_rel}/");
         let to_prefix = format!("{to_rel}/");
-        let mut rekey = Vec::new();
-        for (&ino, rec) in &mut self.state.nodes {
-            for hint in &mut rec.path_hints {
-                if hint == from_rel {
-                    *hint = to_rel.to_owned();
-                } else if is_dir && hint.starts_with(&from_prefix) {
-                    *hint = format!("{to_prefix}{}", &hint[from_prefix.len()..]);
+
+        let mut hint_moves: Vec<(String, String, Vec<u64>)> = Vec::new();
+        if let Some(inos) = self.by_hint.get(from_rel) {
+            hint_moves.push((
+                from_rel.to_owned(),
+                to_rel.to_owned(),
+                inos.iter().copied().collect(),
+            ));
+        }
+        if is_dir {
+            for (hint, inos) in self.by_hint.range(from_prefix.clone()..) {
+                if !hint.starts_with(&from_prefix) {
+                    break;
                 }
-            }
-            if is_dir
-                && (rec.host.subfs_relpath == from_rel
-                    || rec.host.subfs_relpath.starts_with(&from_prefix))
-            {
-                let old_key = rec.host.clone();
-                if rec.host.subfs_relpath == from_rel {
-                    rec.host.subfs_relpath = to_rel.to_owned();
-                } else {
-                    rec.host.subfs_relpath = format!(
-                        "{to_prefix}{}",
-                        &rec.host.subfs_relpath[from_prefix.len()..]
-                    );
-                }
-                rekey.push((ino, old_key, rec.host.clone()));
+                let new_hint = format!("{to_prefix}{}", &hint[from_prefix.len()..]);
+                hint_moves.push((hint.clone(), new_hint, inos.iter().copied().collect()));
             }
         }
-        for (ino, old_key, new_key) in rekey {
-            self.by_host.remove(&old_key);
-            self.by_host.insert(new_key, ino);
+        for (old_hint, new_hint, inos) in hint_moves {
+            self.by_hint.remove(&old_hint);
+            for ino in inos {
+                if let Some(rec) = self.state.nodes.get_mut(&ino) {
+                    for h in &mut rec.path_hints {
+                        if *h == old_hint {
+                            *h = new_hint.clone();
+                        }
+                    }
+                    insert_index(&mut self.by_hint, &new_hint, ino);
+                }
+            }
         }
+
+        if is_dir {
+            let mut subfs_moves: Vec<(String, String, Vec<u64>)> = Vec::new();
+            if let Some(inos) = self.by_subfs.get(from_rel) {
+                subfs_moves.push((
+                    from_rel.to_owned(),
+                    to_rel.to_owned(),
+                    inos.iter().copied().collect(),
+                ));
+            }
+            for (subfs, inos) in self.by_subfs.range(from_prefix.clone()..) {
+                if !subfs.starts_with(&from_prefix) {
+                    break;
+                }
+                let new_subfs = format!("{to_prefix}{}", &subfs[from_prefix.len()..]);
+                subfs_moves.push((subfs.clone(), new_subfs, inos.iter().copied().collect()));
+            }
+            for (old_subfs, new_subfs, inos) in subfs_moves {
+                self.by_subfs.remove(&old_subfs);
+                for ino in inos {
+                    if let Some(rec) = self.state.nodes.get_mut(&ino)
+                        && rec.host.subfs_relpath == old_subfs
+                    {
+                        let old_key = rec.host.clone();
+                        rec.host.subfs_relpath = new_subfs.clone();
+                        let new_key = rec.host.clone();
+                        self.by_host.remove(&old_key);
+                        self.by_host.insert(new_key, ino);
+                        insert_index(&mut self.by_subfs, &new_subfs, ino);
+                    }
+                }
+            }
+        }
+
+        self.dirty.set(true);
         self.flush()
     }
 
@@ -725,31 +851,52 @@ impl StateStore {
         if relpath.is_empty() {
             return false;
         }
+        let Some(candidates) = self
+            .by_hint
+            .get(relpath)
+            .map(|set| set.iter().copied().collect::<Vec<_>>())
+        else {
+            return false;
+        };
         let mut to_prune = Vec::new();
         let mut changed = false;
-        for (&ino, rec) in &mut self.state.nodes {
+        for ino in candidates {
             if Some(ino) == keep_ino {
                 continue;
             }
-            let prev = rec.path_hints.len();
-            rec.path_hints.retain(|p| p != relpath);
-            if rec.path_hints.len() != prev {
-                changed = true;
-                if rec.path_hints.is_empty() && confirmed_last_link {
-                    if is_open(ino) {
-                        rec.unlinked = true;
-                    } else {
-                        to_prune.push(ino);
+            remove_index(&mut self.by_hint, relpath, ino);
+            if let Some(rec) = self.state.nodes.get_mut(&ino) {
+                let prev = rec.path_hints.len();
+                rec.path_hints.retain(|p| p != relpath);
+                if rec.path_hints.len() != prev {
+                    changed = true;
+                    if rec.path_hints.is_empty() && confirmed_last_link {
+                        if is_open(ino) {
+                            rec.unlinked = true;
+                        } else {
+                            to_prune.push(ino);
+                        }
                     }
                 }
             }
         }
         for ino in to_prune {
-            if let Some(removed) = self.state.nodes.remove(&ino) {
-                self.by_host.remove(&removed.host);
-            }
+            self.remove_node(ino);
+        }
+        if changed {
+            self.dirty.set(true);
         }
         changed
+    }
+
+    fn remove_node(&mut self, ino: u64) {
+        if let Some(removed) = self.state.nodes.remove(&ino) {
+            self.by_host.remove(&removed.host);
+            remove_index(&mut self.by_subfs, &removed.host.subfs_relpath, ino);
+            for h in removed.path_hints {
+                remove_index(&mut self.by_hint, &h, ino);
+            }
+        }
     }
 
     pub fn flush(&self) -> Result<(), Errno> {
@@ -759,20 +906,45 @@ impl StateStore {
             self.state_name,
             sys::hex_encode(&sys::random_bytes::<8>()?)
         );
-        {
-            let tmp_fd = sys::openat_nofollow(
-                self.folders_fd.as_fd(),
-                &tmp_name,
-                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY,
-                0o600,
-            )?;
+        let tmp_fd = sys::openat_nofollow(
+            self.folders_fd.as_fd(),
+            &tmp_name,
+            libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY,
+            0o600,
+        )?;
+        let write_rename = (|| {
             let mut file = File::from(tmp_fd);
             file.write_all(&payload).map_err(|e| sys::io_to_errno(&e))?;
             file.sync_all().map_err(|e| sys::io_to_errno(&e))?;
+            sys::renameat_same_dir(self.folders_fd.as_fd(), &tmp_name, &self.state_name)?;
+            Ok(())
+        })();
+        if let Err(e) = write_rename {
+            let _ = sys::unlinkat_fd(self.folders_fd.as_fd(), &tmp_name, false);
+            return Err(e);
         }
-        sys::renameat_same_dir(self.folders_fd.as_fd(), &tmp_name, &self.state_name)?;
         sys::sync_fd(self.folders_fd.as_fd(), false)?;
+        self.dirty.set(false);
         Ok(())
+    }
+}
+
+impl Drop for StateStore {
+    fn drop(&mut self) {
+        let _ = self.flush_if_dirty();
+    }
+}
+
+fn insert_index(index: &mut BTreeMap<String, BTreeSet<u64>>, key: &str, ino: u64) {
+    index.entry(key.to_owned()).or_default().insert(ino);
+}
+
+fn remove_index(index: &mut BTreeMap<String, BTreeSet<u64>>, key: &str, ino: u64) {
+    if let Some(set) = index.get_mut(key) {
+        set.remove(&ino);
+        if set.is_empty() {
+            index.remove(key);
+        }
     }
 }
 

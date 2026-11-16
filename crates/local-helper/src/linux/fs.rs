@@ -22,7 +22,7 @@ use os_core::xattr::{self, Space};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 const OPEN_TICKET_CAP: usize = 4096;
@@ -43,6 +43,7 @@ struct OpenHandle {
     access: Access,
     kind: HostKind,
     fd: OwnedFd,
+    ticket: Option<String>,
 }
 
 struct Session {
@@ -51,7 +52,7 @@ struct Session {
     grant: abi::local_helper::HelperGrant,
     opens: HashMap<u64, OpenHandle>,
     open_tickets: HashMap<String, OpenTicketState>,
-    open_ticket_order: VecDeque<String>,
+    cancelled_ticket_order: VecDeque<String>,
 }
 
 struct ResolvedHandle {
@@ -63,8 +64,81 @@ struct ResolvedHandle {
     key: HostInodeKey,
 }
 
+#[derive(Clone, Copy)]
+struct EntryIdentity {
+    ino: u64,
+    btime: Option<(i64, u32)>,
+    kind: HostKind,
+}
+
+struct CreatedHostGuard<'a> {
+    dir_fd: BorrowedFd<'a>,
+    name: &'a str,
+    is_dir: bool,
+    expected: Option<EntryIdentity>,
+    armed: bool,
+}
+
+impl<'a> CreatedHostGuard<'a> {
+    fn arm(dir_fd: BorrowedFd<'a>, name: &'a str, is_dir: bool) -> Self {
+        let expected = probe_entry_identity(dir_fd, name);
+        Self {
+            dir_fd,
+            name,
+            is_dir,
+            expected,
+            armed: true,
+        }
+    }
+
+    fn refresh_from_fd(&mut self, fd: BorrowedFd<'_>) {
+        if let Ok(stx) = sys::statx_fd(fd) {
+            self.expected = Some(EntryIdentity {
+                ino: stx.ino,
+                btime: stx.btime,
+                kind: stx.kind,
+            });
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CreatedHostGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(exp) = self.expected {
+            let Ok(probe) =
+                sys::open_beneath(self.dir_fd, self.name, libc::O_PATH | libc::O_NOFOLLOW, 0)
+            else {
+                return;
+            };
+            let Ok(stx) = sys::statx_fd(probe.as_fd()) else {
+                return;
+            };
+            if stx.ino != exp.ino || stx.btime != exp.btime || stx.kind != exp.kind {
+                return;
+            }
+        }
+        let _ = sys::unlinkat_fd(self.dir_fd, self.name, self.is_dir);
+    }
+}
+
+fn probe_entry_identity(dir_fd: BorrowedFd<'_>, name: &str) -> Option<EntryIdentity> {
+    let probe = sys::open_beneath(dir_fd, name, libc::O_PATH | libc::O_NOFOLLOW, 0).ok()?;
+    let stx = sys::statx_fd(probe.as_fd()).ok()?;
+    Some(EntryIdentity {
+        ino: stx.ino,
+        btime: stx.btime,
+        kind: stx.kind,
+    })
+}
+
 pub struct HelperEngine {
-    canonical_root: PathBuf,
     root_fd: OwnedFd,
     store: StateStore,
     locks: LockManager,
@@ -82,7 +156,7 @@ impl HelperEngine {
         write: bool,
         execute: bool,
     ) -> Result<Self, Errno> {
-        sys::verify_fd_inside_root(canonical_root, root_fd.as_fd())?;
+        sys::verify_fd_inside_root(root_fd.as_fd(), root_fd.as_fd())?;
         let root_stx = sys::statx_fd(root_fd.as_fd())?;
         if root_stx.kind != HostKind::Dir {
             return Err(Errno::ENOTDIR);
@@ -90,7 +164,6 @@ impl HelperEngine {
         let root_key = HostInodeKey::from_root(root_fd.as_fd(), &root_stx)?;
         let store = StateStore::open(canonical_root, state_dir, root_key)?;
         Ok(Self {
-            canonical_root: canonical_root.to_path_buf(),
             root_fd,
             store,
             locks: LockManager::new(),
@@ -99,6 +172,10 @@ impl HelperEngine {
             next_open_id: 1,
             ceiling: abi::local_helper::HelperGrant { write, execute },
         })
+    }
+
+    pub fn flush_if_dirty(&self) {
+        let _ = self.store.flush_if_dirty();
     }
 
     pub fn fs_id(&self) -> &FsId {
@@ -156,6 +233,7 @@ impl HelperEngine {
                     return Err(Errno::EPROTONOSUPPORT);
                 }
                 self.close_session(&session)?;
+                self.store.flush_if_dirty()?;
                 Ok(json!({}))
             }
             Request::Call {
@@ -228,7 +306,7 @@ impl HelperEngine {
         if client_id.is_empty() || client_id.len() > 128 {
             return Err(Errno::EINVAL);
         }
-        sys::verify_fd_inside_root(&self.canonical_root, self.root_fd.as_fd())?;
+        sys::verify_fd_inside_root(self.root_fd.as_fd(), self.root_fd.as_fd())?;
         let root_stx = sys::statx_fd(self.root_fd.as_fd())?;
         let root_key = HostInodeKey::from_root(self.root_fd.as_fd(), &root_stx)?;
         let root_handle = self
@@ -248,7 +326,7 @@ impl HelperEngine {
                 grant,
                 opens: HashMap::new(),
                 open_tickets: HashMap::new(),
-                open_ticket_order: VecDeque::new(),
+                cancelled_ticket_order: VecDeque::new(),
             },
         );
         let reply = AttachReply {
@@ -586,14 +664,10 @@ impl HelperEngine {
             });
         }
 
-        let mut hints_dirty = false;
         for hint in hints {
             match self.walk_relpath(&hint) {
                 Ok((fd, stx, live_key)) if live_key == host_key => {
                     self.store.promote_hint(ino, &hint);
-                    if hints_dirty {
-                        let _ = self.store.flush();
-                    }
                     let unlinked = stx.nlink == 0;
                     return Ok(ResolvedHandle {
                         ino,
@@ -605,20 +679,12 @@ impl HelperEngine {
                     });
                 }
                 Ok(_) | Err(Errno::ENOENT | Errno::ENOTDIR) => {
-                    if self.store.drop_dead_hint(ino, &hint) {
-                        hints_dirty = true;
-                    }
+                    self.store.drop_dead_hint(ino, &hint);
                 }
                 Err(e) => {
-                    if hints_dirty {
-                        let _ = self.store.flush();
-                    }
                     return Err(e);
                 }
             }
-        }
-        if hints_dirty {
-            let _ = self.store.flush();
         }
         if let Some((dup_fd, is_opath)) = self.clone_open_fd(ino)? {
             let stx = sys::statx_fd(dup_fd.as_fd())?;
@@ -637,11 +703,10 @@ impl HelperEngine {
                 if stx.kind == HostKind::Dir {
                     if stx.nlink == 0 {
                         let _ = self.store.mark_unlinked(ino);
-                        let _ = self.store.flush();
                         return Err(Errno::ENOENT);
                     }
                     let live_rel =
-                        sys::fd_relpath_inside_root(&self.canonical_root, dup_fd.as_fd())?;
+                        sys::fd_relpath_inside_root(self.root_fd.as_fd(), dup_fd.as_fd())?;
                     if live_rel.is_empty() {
                         return Err(Errno::ESTALE);
                     }
@@ -649,7 +714,7 @@ impl HelperEngine {
                     if walked_key != host_key || walked_stx.kind != HostKind::Dir {
                         return Err(Errno::ESTALE);
                     }
-                    self.store.add_path_hint(ino, &live_rel)?;
+                    self.store.add_path_hint(ino, &live_rel);
                     return Ok(ResolvedHandle {
                         ino,
                         relpath: live_rel,
@@ -660,9 +725,7 @@ impl HelperEngine {
                     });
                 }
                 if stx.nlink == 0 {
-                    if self.store.mark_unlinked(ino) {
-                        let _ = self.store.flush();
-                    }
+                    let _ = self.store.mark_unlinked(ino);
                     return Ok(ResolvedHandle {
                         ino,
                         relpath: String::new(),
@@ -672,13 +735,13 @@ impl HelperEngine {
                         key: host_key,
                     });
                 }
-                match sys::fd_relpath_inside_root(&self.canonical_root, dup_fd.as_fd()) {
+                match sys::fd_relpath_inside_root(self.root_fd.as_fd(), dup_fd.as_fd()) {
                     Ok(live_rel) if !live_rel.is_empty() => {
                         if let Ok((walked_fd, walked_stx, walked_key)) =
                             self.walk_relpath(&live_rel)
                             && walked_key == host_key
                         {
-                            self.store.add_path_hint(ino, &live_rel)?;
+                            self.store.add_path_hint(ino, &live_rel);
                             return Ok(ResolvedHandle {
                                 ino,
                                 relpath: live_rel,
@@ -754,8 +817,8 @@ impl HelperEngine {
         if dir_res.unlinked || dir_res.stat.nlink == 0 {
             return Err(Errno::ENOENT);
         }
-        sys::verify_fd_inside_root(&self.canonical_root, self.root_fd.as_fd())?;
-        sys::verify_fd_inside_root(&self.canonical_root, dir_res.fd.as_fd())
+        sys::verify_fd_inside_root(self.root_fd.as_fd(), self.root_fd.as_fd())?;
+        sys::verify_fd_inside_root(self.root_fd.as_fd(), dir_res.fd.as_fd())
     }
 
     /// Re-resolve and open a fresh, root-anchored directory descriptor immediately prior to a
@@ -765,7 +828,7 @@ impl HelperEngine {
         let live_rel = if dir_res.ino == ROOT_INO {
             String::new()
         } else {
-            sys::fd_relpath_inside_root(&self.canonical_root, dir_res.fd.as_fd())?
+            sys::fd_relpath_inside_root(self.root_fd.as_fd(), dir_res.fd.as_fd())?
         };
         if dir_res.ino != ROOT_INO && live_rel.is_empty() {
             return Err(Errno::ESTALE);
@@ -785,7 +848,7 @@ impl HelperEngine {
     }
 
     fn walk_relpath(&self, rel: &str) -> Result<(OwnedFd, HostStat, HostInodeKey), Errno> {
-        sys::verify_fd_inside_root(&self.canonical_root, self.root_fd.as_fd())?;
+        sys::verify_fd_inside_root(self.root_fd.as_fd(), self.root_fd.as_fd())?;
         let root_stx = sys::statx_fd(self.root_fd.as_fd())?;
         let mut cur_fd = sys::open_beneath(self.root_fd.as_fd(), ".", libc::O_PATH, 0)?;
         if rel.is_empty() {
@@ -822,7 +885,7 @@ impl HelperEngine {
             cur_stx = next_stx;
         }
         if cur_stx.kind == HostKind::Dir {
-            sys::verify_fd_inside_root(&self.canonical_root, cur_fd.as_fd())?;
+            sys::verify_fd_inside_root(self.root_fd.as_fd(), cur_fd.as_fd())?;
         }
         let host_gen = sys::capture_gen_from_fd(cur_fd.as_fd(), &cur_stx)?;
         let key = HostInodeKey {
@@ -851,7 +914,7 @@ impl HelperEngine {
         )?;
         let stx = sys::statx_fd(fd.as_fd())?;
         if stx.kind == HostKind::Dir {
-            sys::verify_fd_inside_root(&self.canonical_root, fd.as_fd())?;
+            sys::verify_fd_inside_root(self.root_fd.as_fd(), fd.as_fd())?;
         }
         let parent_stx = sys::statx_fd(parent.fd.as_fd())?;
         let (subfs_relpath, subfs_fsuuid) = if sys::boundary_crossed(&parent_stx, &stx) {
@@ -948,10 +1011,7 @@ impl HelperEngine {
         let dir_node = &self.store.get(dir_res.ino).ok_or(Errno::ESTALE)?.node;
         require_live_dir(&dir_res, dir_node)?;
         inode::require(identity, dir_node, EXEC)?;
-        let (ino, _rel, _fd, stx, _key, dirty) = self.discover_child(&dir_res, name, owner)?;
-        if dirty {
-            self.store.flush()?;
-        }
+        let (ino, _rel, _fd, stx, _key, _dirty) = self.discover_child(&dir_res, name, owner)?;
         Ok(self.entry_for(ino, &stx))
     }
 
@@ -967,15 +1027,11 @@ impl HelperEngine {
         }
         let mut cur = self.resolve_handle(dir)?;
         let mut entries = Vec::with_capacity(names.len());
-        let mut dirty = false;
 
         for (index, name) in names.iter().enumerate() {
             if index > 0 {
                 let stop = match cur.stat.kind {
                     HostKind::Dir if cur.unlinked || cur.stat.nlink == 0 => {
-                        if dirty {
-                            self.store.flush()?;
-                        }
                         return Ok(Walked {
                             entries,
                             stop: Some(Stop::Missing(index)),
@@ -986,9 +1042,6 @@ impl HelperEngine {
                     _ => Some(Stop::NotDirectory(index - 1)),
                 };
                 if stop.is_some() {
-                    if dirty {
-                        self.store.flush()?;
-                    }
                     return Ok(Walked { entries, stop });
                 }
             } else {
@@ -1000,8 +1053,7 @@ impl HelperEngine {
                 inode::require(identity, cur_node, EXEC)?;
             }
             match self.discover_child(&cur, name, owner) {
-                Ok((ino, rel, fd, stx, key, d)) => {
-                    dirty |= d;
+                Ok((ino, rel, fd, stx, key, _d)) => {
                     entries.push(self.entry_for(ino, &stx));
                     cur = ResolvedHandle {
                         ino,
@@ -1013,9 +1065,6 @@ impl HelperEngine {
                     };
                 }
                 Err(Errno::ENOENT) => {
-                    if dirty {
-                        self.store.flush()?;
-                    }
                     return Ok(Walked {
                         entries,
                         stop: Some(Stop::Missing(index)),
@@ -1023,9 +1072,6 @@ impl HelperEngine {
                 }
                 Err(e) => return Err(e),
             }
-        }
-        if dirty {
-            self.store.flush()?;
         }
         Ok(Walked {
             entries,
@@ -1050,14 +1096,11 @@ impl HelperEngine {
         };
         let (parent_fd, parent_stx, parent_key) = self.walk_relpath(parent_rel)?;
         let open_inos = self.open_ino_set();
-        let (parent_ino, dirty) =
+        let (parent_ino, _dirty) =
             self.store
                 .discover_or_reset(parent_rel, parent_key, owner.0, owner.1, &|id| {
                     open_inos.contains(&id)
                 })?;
-        if dirty {
-            self.store.flush()?;
-        }
         let _ = parent_fd;
         Ok(Some((self.entry_for(parent_ino, &parent_stx), my_name)))
     }
@@ -1103,6 +1146,9 @@ impl HelperEngine {
             attr.mtime,
         )?;
         if let Some(size) = attr.size {
+            if meta.rdev.is_some() {
+                return Err(Errno::EINVAL);
+            }
             match res.stat.kind {
                 HostKind::Dir => return Err(Errno::EISDIR),
                 HostKind::File => {}
@@ -1120,7 +1166,7 @@ impl HelperEngine {
 
         if let Some(size) = attr.size {
             let wfd = if !res.relpath.is_empty() {
-                sys::verify_fd_inside_root(&self.canonical_root, self.root_fd.as_fd())?;
+                sys::verify_fd_inside_root(self.root_fd.as_fd(), self.root_fd.as_fd())?;
                 sys::open_beneath(
                     self.root_fd.as_fd(),
                     &res.relpath,
@@ -1149,7 +1195,37 @@ impl HelperEngine {
         }
 
         if attr.atime != abi::Time::Omit || attr.mtime != abi::Time::Omit {
-            sys::utimensat_exact_fd(res.fd.as_fd(), attr.atime, attr.mtime)?;
+            if res.stat.kind == HostKind::Symlink {
+                let rel = if !res.relpath.is_empty() {
+                    res.relpath.clone()
+                } else {
+                    sys::fd_relpath_inside_root(self.root_fd.as_fd(), res.fd.as_fd())?
+                };
+                if rel.is_empty() {
+                    return Err(Errno::ESTALE);
+                }
+                let (parent_fd, name) = self.open_parent_of(&rel)?;
+                let child = sys::open_beneath(
+                    parent_fd.as_fd(),
+                    &name,
+                    libc::O_PATH | libc::O_NOFOLLOW,
+                    0,
+                )?;
+                let cstx = sys::statx_fd(child.as_fd())?;
+                let cgen = sys::capture_gen_from_fd(child.as_fd(), &cstx)?;
+                if cstx.kind != HostKind::Symlink
+                    || cstx.ino != res.stat.ino
+                    || cstx.dev != res.stat.dev
+                    || cstx.mnt_id != res.stat.mnt_id
+                    || cstx.subvol != res.stat.subvol
+                    || cgen != res.key.host_gen
+                {
+                    return Err(Errno::ESTALE);
+                }
+                sys::utimensat_nofollow_at(parent_fd.as_fd(), &name, attr.atime, attr.mtime)?;
+            } else {
+                sys::utimensat_exact_fd(res.fd.as_fd(), attr.atime, attr.mtime)?;
+            }
         }
 
         let new_stx = sys::statx_fd(res.fd.as_fd())?;
@@ -1177,10 +1253,8 @@ impl HelperEngine {
         inode::require(identity, dir_node, READ)?;
         let names = sys::readdir_fd(dir_res.fd.as_fd())?;
         let mut out = Vec::with_capacity(names.len());
-        let mut dirty = false;
         for name in names {
-            let (ino, _rel, _fd, stx, _key, d) = self.discover_child(&dir_res, &name, owner)?;
-            dirty |= d;
+            let (ino, _rel, _fd, stx, _key, _d) = self.discover_child(&dir_res, &name, owner)?;
             let rec = self.store.get(ino).ok_or(Errno::ESTALE)?;
             out.push(DirEntry {
                 name,
@@ -1190,9 +1264,6 @@ impl HelperEngine {
                 },
                 file_type: file_type_of(rec, &stx),
             });
-        }
-        if dirty {
-            self.store.flush()?;
         }
         Ok(out)
     }
@@ -1264,11 +1335,8 @@ impl HelperEngine {
                     _existing_fd,
                     existing_stx,
                     existing_key,
-                    dirty,
+                    _dirty,
                 )) => {
-                    if dirty {
-                        self.store.flush()?;
-                    }
                     if options.is_create_new() {
                         return Err(Errno::EEXIST);
                     }
@@ -1320,6 +1388,7 @@ impl HelperEngine {
                         access,
                         HostKind::File,
                         fd,
+                        Some(ticket.to_owned()),
                     )?;
                     self.record_open_ticket(
                         session_id,
@@ -1342,13 +1411,15 @@ impl HelperEngine {
                 | libc::O_EXCL
                 | libc::O_NOFOLLOW
                 | libc::O_NONBLOCK;
-            let (live_dir_rel, _fresh_dir_fd) = self.reopen_confined_dir(&dir_res)?;
+            let (live_dir_rel, fresh_dir_fd) = self.reopen_confined_dir(&dir_res)?;
             let rel = join_rel(&live_dir_rel, name);
             let fd = match sys::open_beneath(self.root_fd.as_fd(), &rel, host_flags, 0o600) {
                 Ok(fd) => fd,
                 Err(Errno::EEXIST) if !options.is_create_new() && attempt < 7 => continue,
                 Err(e) => return Err(e),
             };
+            let mut guard = CreatedHostGuard::arm(fresh_dir_fd.as_fd(), name, false);
+            guard.refresh_from_fd(fd.as_fd());
             sys::clear_nonblock(fd.as_fd())?;
             let stx = sys::statx_fd(fd.as_fd())?;
             let (subfs_relpath, subfs_fsuuid) = if sys::boundary_crossed(&dir_res.stat, &stx) {
@@ -1370,8 +1441,15 @@ impl HelperEngine {
                 .store
                 .insert_created(&rel, key.clone(), node, &|id| open_inos.contains(&id))?;
             let entry = self.entry_for(ino, &stx);
-            let open =
-                self.register_open(session_id, entry.handle.node, key, access, stx.kind, fd)?;
+            let open = self.register_open(
+                session_id,
+                entry.handle.node,
+                key,
+                access,
+                stx.kind,
+                fd,
+                Some(ticket.to_owned()),
+            )?;
             self.record_open_ticket(
                 session_id,
                 ticket,
@@ -1380,6 +1458,7 @@ impl HelperEngine {
                     open: open.clone(),
                 },
             );
+            guard.disarm();
             return Ok((entry, open));
         }
 
@@ -1393,19 +1472,15 @@ impl HelperEngine {
         is_dir: bool,
         node: Node,
     ) -> Result<Entry, Errno> {
-        let post_dir_rel = match sys::fd_relpath_inside_root(&self.canonical_root, fresh_dir_fd) {
-            Ok(rel) => rel,
-            Err(e) => {
-                let _ = sys::unlinkat_fd(fresh_dir_fd, name, is_dir);
-                return Err(e);
-            }
-        };
+        let mut guard = CreatedHostGuard::arm(fresh_dir_fd, name, is_dir);
+        let post_dir_rel = sys::fd_relpath_inside_root(self.root_fd.as_fd(), fresh_dir_fd)?;
         let rel = join_rel(&post_dir_rel, name);
         let (_fd, stx, key) = self.walk_relpath(&rel)?;
         let open_inos = self.open_ino_set();
         let ino = self
             .store
             .insert_created(&rel, key, node, &|id| open_inos.contains(&id))?;
+        guard.disarm();
         Ok(self.entry_for(ino, &stx))
     }
 
@@ -1430,13 +1505,13 @@ impl HelperEngine {
             .node
             .clone();
         require_live_dir(&dir_res, &dir_node)?;
-        inode::may_create(identity, &dir_node, dir_res.unlinked)?;
-        let node = created(identity, &dir_node, mode, true, cred.umask);
-        let (live_rel, fresh_dir_fd) = self.reopen_confined_dir(&dir_res)?;
-        let rel = join_rel(&live_rel, name);
-        if entry_exists(self.root_fd.as_fd(), &rel)? {
+        inode::require(identity, &dir_node, EXEC)?;
+        let (_live_rel, fresh_dir_fd) = self.reopen_confined_dir(&dir_res)?;
+        if entry_exists(fresh_dir_fd.as_fd(), name)? {
             return Err(Errno::EEXIST);
         }
+        inode::may_create(identity, &dir_node, dir_res.unlinked)?;
+        let node = created(identity, &dir_node, mode, true, cred.umask);
         sys::mkdirat_fd(fresh_dir_fd.as_fd(), name, 0o700)?;
         self.finish_created_child(fresh_dir_fd.as_fd(), name, true, node)
     }
@@ -1467,22 +1542,22 @@ impl HelperEngine {
             .node
             .clone();
         require_live_dir(&dir_res, &dir_node)?;
+        inode::require(identity, &dir_node, EXEC)?;
+        let (_live_rel, fresh_dir_fd) = self.reopen_confined_dir(&dir_res)?;
+        if entry_exists(fresh_dir_fd.as_fd(), name)? {
+            return Err(Errno::EEXIST);
+        }
         inode::may_create(identity, &dir_node, dir_res.unlinked)?;
         let mut node = created(identity, &dir_node, mode, false, cred.umask);
         node.rdev = (!rdev.is_empty()).then(|| rdev.to_owned());
-        let (live_rel, fresh_dir_fd) = self.reopen_confined_dir(&dir_res)?;
-        let rel = join_rel(&live_rel, name);
-        if entry_exists(self.root_fd.as_fd(), &rel)? {
-            return Err(Errno::EEXIST);
-        }
         if rdev == "fifo" {
             sys::mkfifoat_fd(fresh_dir_fd.as_fd(), name, 0o600)?;
         } else {
             // Host unprivileged helpers cannot mknod device nodes; back with a 0-byte regular
             // host inode while preserving OS device metadata.
             let fd = sys::open_beneath(
-                self.root_fd.as_fd(),
-                &rel,
+                fresh_dir_fd.as_fd(),
+                name,
                 libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_NOFOLLOW,
                 0o600,
             )?;
@@ -1512,13 +1587,13 @@ impl HelperEngine {
             .node
             .clone();
         require_live_dir(&dir_res, &dir_node)?;
-        inode::may_create(identity, &dir_node, dir_res.unlinked)?;
-        let node = inode::new_symlink(identity, &dir_node, target);
-        let (live_rel, fresh_dir_fd) = self.reopen_confined_dir(&dir_res)?;
-        let rel = join_rel(&live_rel, name);
-        if entry_exists(self.root_fd.as_fd(), &rel)? {
+        inode::require(identity, &dir_node, EXEC)?;
+        let (_live_rel, fresh_dir_fd) = self.reopen_confined_dir(&dir_res)?;
+        if entry_exists(fresh_dir_fd.as_fd(), name)? {
             return Err(Errno::EEXIST);
         }
+        inode::may_create(identity, &dir_node, dir_res.unlinked)?;
+        let node = inode::new_symlink(identity, &dir_node, target);
         sys::symlinkat_fd(target, fresh_dir_fd.as_fd(), name)?;
         self.finish_created_child(fresh_dir_fd.as_fd(), name, false, node)
     }
@@ -1550,6 +1625,11 @@ impl HelperEngine {
             .ok_or(Errno::ESTALE)?
             .node
             .clone();
+        inode::require(identity, &dir_node, EXEC)?;
+        let (_live_dir_rel, fresh_dir_fd) = self.reopen_confined_dir(&dir_res)?;
+        if entry_exists(fresh_dir_fd.as_fd(), name)? {
+            return Err(Errno::EEXIST);
+        }
         inode::may_link(identity, &target_node)?;
         inode::may_create(identity, &dir_node, dir_res.unlinked)?;
 
@@ -1560,33 +1640,23 @@ impl HelperEngine {
             return Err(Errno::ENOENT);
         }
         let live_target_rel =
-            sys::fd_relpath_inside_root(&self.canonical_root, target_res.fd.as_fd())?;
+            sys::fd_relpath_inside_root(self.root_fd.as_fd(), target_res.fd.as_fd())?;
         if live_target_rel.is_empty() {
             return Err(Errno::ENOENT);
         }
         let (old_parent_fd, old_name) = self.open_parent_of(&live_target_rel)?;
-        sys::verify_fd_inside_root(&self.canonical_root, old_parent_fd.as_fd())?;
-        let (live_dir_rel, fresh_dir_fd) = self.reopen_confined_dir(&dir_res)?;
-        let rel = join_rel(&live_dir_rel, name);
-        if entry_exists(self.root_fd.as_fd(), &rel)? {
-            return Err(Errno::EEXIST);
-        }
+        sys::verify_fd_inside_root(self.root_fd.as_fd(), old_parent_fd.as_fd())?;
         sys::linkat_fd(old_parent_fd.as_fd(), &old_name, fresh_dir_fd.as_fd(), name)?;
-        let post_dir_rel =
-            match sys::fd_relpath_inside_root(&self.canonical_root, fresh_dir_fd.as_fd()) {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = sys::unlinkat_fd(fresh_dir_fd.as_fd(), name, false);
-                    return Err(e);
-                }
-            };
+        let mut guard = CreatedHostGuard::arm(fresh_dir_fd.as_fd(), name, false);
+        let post_dir_rel = sys::fd_relpath_inside_root(self.root_fd.as_fd(), fresh_dir_fd.as_fd())?;
         let new_rel = join_rel(&post_dir_rel, name);
         let (_fd, new_stx, new_key) = self.walk_relpath(&new_rel)?;
         if new_key != target_res.key {
-            let _ = sys::unlinkat_fd(fresh_dir_fd.as_fd(), name, false);
             return Err(Errno::ESTALE);
         }
-        self.store.add_path_hint(target_res.ino, &new_rel)?;
+        self.store.add_path_hint(target_res.ino, &new_rel);
+        self.store.flush()?;
+        guard.disarm();
         Ok(self.entry_for(target_res.ino, &new_stx))
     }
 
@@ -1613,11 +1683,9 @@ impl HelperEngine {
             .clone();
         require_live_dir(&dir_res, &dir_node)?;
         self.verify_dir_confined(&dir_res)?;
-        let (victim_ino, _victim_rel, victim_fd, victim_stx, _vkey, dirty) =
+        inode::require(identity, &dir_node, EXEC)?;
+        let (victim_ino, _victim_rel, victim_fd, victim_stx, _vkey, _dirty) =
             self.discover_child(&dir_res, name, owner)?;
-        if dirty {
-            self.store.flush()?;
-        }
         let victim_node = &self.store.get(victim_ino).ok_or(Errno::ESTALE)?.node;
         inode::may_delete(identity, &dir_node, victim_node)?;
         match (directory, victim_stx.kind == HostKind::Dir) {
@@ -1677,23 +1745,30 @@ impl HelperEngine {
         require_live_dir(&to_res, &to_node)?;
         self.verify_dir_confined(&from_res)?;
         self.verify_dir_confined(&to_res)?;
-        let (src_ino, src_rel, _sfd, src_stx, _skey, mut dirty) =
+        inode::require(identity, &from_node, EXEC)?;
+        inode::require(identity, &to_node, EXEC)?;
+        let (src_ino, src_rel, _sfd, src_stx, _skey, _dirty) =
             self.discover_child(&from_res, from, owner)?;
+        let src_node = self.store.get(src_ino).ok_or(Errno::ESTALE)?.node.clone();
         let existing = match self.discover_child(&to_res, to, owner) {
-            Ok((ino, _rel, fd, stx, _key, d)) => {
-                dirty |= d;
-                Some((ino, stx, fd))
-            }
+            Ok((ino, _rel, fd, stx, _key, _d)) => Some((ino, stx, fd)),
             Err(Errno::ENOENT) => None,
             Err(e) => return Err(e),
         };
-        if dirty {
-            self.store.flush()?;
-        }
 
         let noreplace = flags.contains(RenameFlags::NOREPLACE);
         if existing.is_some() && noreplace {
             return Err(Errno::EEXIST);
+        }
+        inode::may_delete(identity, &from_node, &src_node)?;
+        if let Some((target_ino, _, _)) = existing {
+            let target_node = self
+                .store
+                .get(target_ino)
+                .ok_or(Errno::ESTALE)?
+                .node
+                .clone();
+            inode::may_delete(identity, &to_node, &target_node)?;
         }
         if existing.as_ref().is_some_and(|(ino, _, _)| *ino == src_ino) {
             return Ok(());
@@ -1704,16 +1779,7 @@ impl HelperEngine {
         {
             return Err(Errno::EINVAL);
         }
-        let src_node = self.store.get(src_ino).ok_or(Errno::ESTALE)?.node.clone();
-        inode::may_delete(identity, &from_node, &src_node)?;
-        if let Some((target_ino, ref target_stx, _)) = existing {
-            let target_node = self
-                .store
-                .get(target_ino)
-                .ok_or(Errno::ESTALE)?
-                .node
-                .clone();
-            inode::may_delete(identity, &to_node, &target_node)?;
+        if let Some((_, ref target_stx, _)) = existing {
             match (moving_dir, target_stx.kind == HostKind::Dir) {
                 (true, false) => return Err(Errno::ENOTDIR),
                 (false, true) => return Err(Errno::EISDIR),
@@ -1860,9 +1926,6 @@ impl HelperEngine {
             return Err(Errno::EINVAL);
         }
         let access = options.access()?;
-        if !grant.write && (access.writes() || options.is_truncate() || options.is_create()) {
-            return Err(Errno::EROFS);
-        }
         if let Some(prev) = self
             .sessions
             .get(session_id)
@@ -1880,19 +1943,24 @@ impl HelperEngine {
         let res = self.resolve_handle(handle)?;
         let node = self.store.get(res.ino).ok_or(Errno::ESTALE)?.node.clone();
 
-        if access == Access::Exec && res.stat.kind != HostKind::Dir && !grant.execute {
-            return Err(Errno::EACCES);
-        }
-
         if access != Access::Path {
             if res.stat.kind == HostKind::Symlink {
                 return Err(Errno::ELOOP);
+            }
+            if res.stat.kind == HostKind::Dir && (access.writes() || options.is_truncate()) {
+                return Err(Errno::EISDIR);
             }
             if res.stat.kind != HostKind::Dir && res.stat.kind != HostKind::File {
                 return Err(Errno::ENXIO);
             }
             if node.rdev.is_some() {
                 return Err(Errno::ENXIO);
+            }
+            if !grant.write && (access.writes() || options.is_truncate() || options.is_create()) {
+                return Err(Errno::EROFS);
+            }
+            if access == Access::Exec && res.stat.kind != HostKind::Dir && !grant.execute {
+                return Err(Errno::EACCES);
             }
             let mut mask = access.mask();
             if options.is_truncate() {
@@ -1904,9 +1972,6 @@ impl HelperEngine {
         let fd = if access == Access::Path {
             res.fd
         } else if res.stat.kind == HostKind::Dir {
-            if access.writes() || options.is_truncate() {
-                return Err(Errno::EISDIR);
-            }
             sys::upgrade_dir_fd(res.fd.as_fd())?
         } else {
             let fd = if !res.relpath.is_empty() {
@@ -1969,6 +2034,7 @@ impl HelperEngine {
             access,
             res.stat.kind,
             fd,
+            Some(ticket.to_owned()),
         )?;
         self.record_open_ticket(
             session_id,
@@ -1986,7 +2052,7 @@ impl HelperEngine {
         expected: &HostStat,
         expected_key: &HostInodeKey,
     ) -> Result<OwnedFd, Errno> {
-        sys::verify_fd_inside_root(&self.canonical_root, self.root_fd.as_fd())?;
+        sys::verify_fd_inside_root(self.root_fd.as_fd(), self.root_fd.as_fd())?;
         let flags = open_access_flags(access)? | libc::O_NOFOLLOW | libc::O_NONBLOCK;
         let fd = match sys::open_beneath(self.root_fd.as_fd(), rel, flags, 0) {
             Ok(fd) => fd,
@@ -2058,16 +2124,7 @@ impl HelperEngine {
         let Some(session) = self.sessions.get_mut(session_id) else {
             return;
         };
-        if !session.open_tickets.contains_key(ticket) {
-            session.open_ticket_order.push_back(ticket.to_owned());
-        }
         session.open_tickets.insert(ticket.to_owned(), state);
-        while session.open_ticket_order.len() > OPEN_TICKET_CAP {
-            let Some(oldest) = session.open_ticket_order.pop_front() else {
-                break;
-            };
-            session.open_tickets.remove(&oldest);
-        }
     }
 
     fn do_cancel_open(&mut self, session_id: &str, ticket: &str) -> Result<(), Errno> {
@@ -2082,10 +2139,15 @@ impl HelperEngine {
                 let prev = session
                     .open_tickets
                     .insert(ticket.to_owned(), OpenTicketState::Cancelled);
-                if prev.is_none() {
-                    session.open_ticket_order.push_back(ticket.to_owned());
-                    while session.open_ticket_order.len() > OPEN_TICKET_CAP {
-                        if let Some(oldest) = session.open_ticket_order.pop_front() {
+                if !matches!(prev, Some(OpenTicketState::Cancelled)) {
+                    session.cancelled_ticket_order.push_back(ticket.to_owned());
+                    while session.cancelled_ticket_order.len() > OPEN_TICKET_CAP {
+                        if let Some(oldest) = session.cancelled_ticket_order.pop_front()
+                            && matches!(
+                                session.open_tickets.get(&oldest),
+                                Some(OpenTicketState::Cancelled)
+                            )
+                        {
                             session.open_tickets.remove(&oldest);
                         }
                     }
@@ -2103,6 +2165,7 @@ impl HelperEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_open(
         &mut self,
         session_id: &str,
@@ -2111,6 +2174,7 @@ impl HelperEngine {
         access: Access,
         kind: HostKind,
         fd: OwnedFd,
+        ticket: Option<String>,
     ) -> Result<OpenRef, Errno> {
         let id = self.next_open_id;
         self.next_open_id += 1;
@@ -2128,6 +2192,7 @@ impl HelperEngine {
                 access,
                 kind,
                 fd,
+                ticket,
             },
         );
         Ok(OpenRef {
@@ -2277,6 +2342,17 @@ impl HelperEngine {
         if handle.node_id != open.node {
             session.opens.insert(open.id, handle);
             return Err(Errno::EBADF);
+        }
+        if let Some(ticket) = &handle.ticket
+            && matches!(
+                session.open_tickets.get(ticket),
+                Some(
+                    OpenTicketState::Created { open: o, .. }
+                        | OpenTicketState::Opened { open: o }
+                ) if o.id == open.id
+            )
+        {
+            session.open_tickets.remove(ticket);
         }
         let ino = handle.node_id.ino;
         self.locks.release_open(handle.id);

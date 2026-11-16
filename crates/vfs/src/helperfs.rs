@@ -20,8 +20,26 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
 use std::task::{Poll, Waker};
+
+/// Typed outcome failure from a [`HelperTransport`] request, separating unacknowledged transport
+/// uncertainty and HTTP `503` worker-pool overload from confirmed `HelperEngine` `Errno` refusals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelperError {
+    /// Transport drop, timeout (`ENOTCONN`/`ETIMEDOUT`), or corrupted HTTP `200` body (`EIO`);
+    /// request execution is uncertain so in-flight open/lock tickets must still be cancelled.
+    Transport(Errno),
+    /// Helper HTTP worker pool was saturated (`503`); request never reached the engine.
+    Overload,
+    /// Confirmed protocol/engine refusal returned in an HTTP response (including genuine Linux
+    /// `EBUSY` on an active submount, `EAGAIN` on `TryLock`, or `ENODEV` on a dead session).
+    Engine(Errno),
+}
+
+pub type HelperFuture<'a, T> =
+    Pin<Box<dyn Future<Output = std::result::Result<T, HelperError>> + 'a>>;
 
 /// Reply returned by a [`HelperHttpHost`] POST request.
 #[derive(Clone, Debug)]
@@ -42,7 +60,7 @@ pub trait HelperHttpHost {
 
 /// Portable transport connecting [`HelperFs`] to an `os-local-helper` service.
 pub trait HelperTransport {
-    fn request(&self, request: Request) -> BoxFuture<'_, Value>;
+    fn request(&self, request: Request) -> HelperFuture<'_, Value>;
     fn pause(&self) -> BoxFuture<'_, ()>;
     fn ticket(&self) -> String;
 }
@@ -56,42 +74,46 @@ impl<H> HttpHelperTransport<H> {
     }
 }
 
-fn parse_http_refusal(reply: &HttpReply) -> Errno {
-    if reply.status == 503 {
-        if let Ok(body) = serde_json::from_slice::<Value>(&reply.body)
-            && let Ok(errno) = serde_json::from_value::<Errno>(body["errno"].clone())
-            && matches!(errno, Errno::ENODEV | Errno::EBUSY)
-        {
-            return errno;
-        }
-        return Errno::EBUSY;
-    }
-    serde_json::from_slice::<Value>(&reply.body)
+fn parse_http_refusal(reply: &HttpReply) -> HelperError {
+    let parsed_errno = serde_json::from_slice::<Value>(&reply.body)
         .ok()
-        .and_then(|body| serde_json::from_value(body["errno"].clone()).ok())
-        .unwrap_or(match reply.status {
-            401 | 403 => Errno::EACCES,
-            408 => Errno::ETIMEDOUT,
-            413 => Errno::E2BIG,
-            _ => Errno::EIO,
-        })
+        .and_then(|body| serde_json::from_value::<Errno>(body["errno"].clone()).ok());
+    if reply.status == 503 {
+        return match parsed_errno {
+            Some(Errno::ENODEV) => HelperError::Engine(Errno::ENODEV),
+            _ => HelperError::Overload,
+        };
+    }
+    if reply.status == 408 {
+        let errno = match parsed_errno {
+            Some(e @ (Errno::ETIMEDOUT | Errno::ENOTCONN)) => e,
+            _ => Errno::ETIMEDOUT,
+        };
+        return HelperError::Transport(errno);
+    }
+    let errno = parsed_errno.unwrap_or(match reply.status {
+        401 | 403 => Errno::EACCES,
+        413 => Errno::E2BIG,
+        _ => Errno::EIO,
+    });
+    HelperError::Engine(errno)
 }
 
 impl<H: HelperHttpHost> HelperTransport for HttpHelperTransport<H> {
-    fn request(&self, request: Request) -> BoxFuture<'_, Value> {
+    fn request(&self, request: Request) -> HelperFuture<'_, Value> {
         Box::pin(async move {
-            let body = serde_json::to_vec(&request).map_err(|_| Errno::EIO)?;
+            let body = serde_json::to_vec(&request).map_err(|_| HelperError::Engine(Errno::EIO))?;
             if body.len() > CONTROL_MAX {
-                return Err(Errno::E2BIG);
+                return Err(HelperError::Engine(Errno::E2BIG));
             }
             let reply = self.0.post(body).await.map_err(|e| match e {
-                Errno::ETIMEDOUT => Errno::ETIMEDOUT,
-                _ => Errno::ENOTCONN,
+                Errno::ETIMEDOUT => HelperError::Transport(Errno::ETIMEDOUT),
+                _ => HelperError::Transport(Errno::ENOTCONN),
             })?;
             if reply.status != 200 {
                 return Err(parse_http_refusal(&reply));
             }
-            serde_json::from_slice(&reply.body).map_err(|_| Errno::EIO)
+            serde_json::from_slice(&reply.body).map_err(|_| HelperError::Transport(Errno::EIO))
         })
     }
 
@@ -217,54 +239,49 @@ fn to_wire_cred(cred: &Cred) -> WireCred {
     }
 }
 
-fn map_nonlock_err(errno: Errno) -> Errno {
-    match errno {
-        Errno::ENOTCONN | Errno::ETIMEDOUT | Errno::ENOLCK | Errno::EAGAIN | Errno::EBUSY => {
-            Errno::ENOTCONN
-        }
-        other => other,
+fn map_nonlock_err(err: HelperError) -> Errno {
+    match err {
+        HelperError::Transport(Errno::EIO) => Errno::EIO,
+        HelperError::Transport(_) | HelperError::Overload => Errno::ENOTCONN,
+        HelperError::Engine(errno) => errno,
     }
 }
 
-fn map_uncertain_mutation_err(errno: Errno) -> Errno {
-    match errno {
-        Errno::ENOTCONN | Errno::ETIMEDOUT => Errno::EIO,
-        Errno::ENOLCK | Errno::EAGAIN | Errno::EBUSY => Errno::ENOTCONN,
-        other => other,
+fn map_uncertain_mutation_err(err: HelperError) -> Errno {
+    match err {
+        HelperError::Transport(_) => Errno::EIO,
+        HelperError::Overload => Errno::ENOTCONN,
+        HelperError::Engine(errno) => errno,
     }
 }
 
-fn map_lock_err(errno: Errno) -> Errno {
-    match errno {
-        Errno::ENODEV | Errno::ENOTCONN | Errno::ETIMEDOUT | Errno::EAGAIN | Errno::EBUSY => {
+fn map_lock_err(err: HelperError) -> Errno {
+    match err {
+        HelperError::Transport(_) | HelperError::Overload | HelperError::Engine(Errno::ENODEV) => {
             Errno::ENOLCK
         }
-        other => other,
+        HelperError::Engine(errno) => errno,
     }
 }
 
-fn map_try_lock_err(errno: Errno) -> Errno {
-    match errno {
-        Errno::ENODEV | Errno::ENOTCONN | Errno::ETIMEDOUT | Errno::EBUSY => Errno::ENOLCK,
-        other => other,
-    }
+fn uncertain_err(err: HelperError) -> bool {
+    matches!(err, HelperError::Transport(_))
 }
 
-fn uncertain_err(errno: Errno) -> bool {
-    matches!(errno, Errno::ENOTCONN | Errno::ETIMEDOUT | Errno::EIO)
-}
-
-fn rejected_lock_before_queue(errno: Errno) -> bool {
+fn rejected_lock_before_queue(err: HelperError) -> bool {
     matches!(
-        errno,
-        Errno::EACCES
-            | Errno::EBADF
-            | Errno::EINVAL
-            | Errno::EDEADLK
-            | Errno::EPROTONOSUPPORT
-            | Errno::ENOSPC
-            | Errno::ECANCELED
-            | Errno::ENODEV
+        err,
+        HelperError::Overload
+            | HelperError::Engine(
+                Errno::EACCES
+                    | Errno::EBADF
+                    | Errno::EINVAL
+                    | Errno::EDEADLK
+                    | Errno::EPROTONOSUPPORT
+                    | Errno::ENOSPC
+                    | Errno::ECANCELED
+                    | Errno::ENODEV
+            )
     )
 }
 
@@ -347,7 +364,8 @@ impl<T: HelperTransport> HelperFs<T> {
                 version: VERSION,
                 session: self.attach.session.clone(),
             })
-            .await?;
+            .await
+            .map_err(map_nonlock_err)?;
         let reply: RenewReply = serde_json::from_value(raw).map_err(|_| Errno::EIO)?;
         let _ = self.drain().await;
         Ok(reply)
@@ -368,7 +386,7 @@ impl<T: HelperTransport> HelperFs<T> {
 
     /// Flush deferred `CancelLock`, `CancelOpen`, and `Release` requests from previously dropped
     /// or transiently failed futures.
-    pub async fn drain(&self) -> Result<()> {
+    pub async fn drain_raw(&self) -> std::result::Result<(), HelperError> {
         let _guard = self.draining.lock().await;
         while let Some(item) = { self.pending.borrow().front().cloned() } {
             let reply = self.send_raw(&item.cred, item.call.clone()).await;
@@ -382,13 +400,16 @@ impl<T: HelperTransport> HelperFs<T> {
                     }
                 }
                 // Confirmed closed (`EBADF`) or session already gone (`ENODEV`) means server state
-                // is already clean; do not treat transport loss (`ENOTCONN`/`ETIMEDOUT`) as clean.
-                (Call::Release { open }, Err(Errno::EBADF | Errno::ENODEV)) => {
+                // is already clean; do not treat transport loss (`Transport`/`Overload`) as clean.
+                (
+                    Call::Release { open },
+                    Err(HelperError::Engine(Errno::EBADF | Errno::ENODEV)),
+                ) => {
                     if let Some(entry) = self.opens.borrow_mut().get_mut(&open.id) {
                         entry.drained = true;
                     }
                 }
-                (_, Err(Errno::ENODEV)) => {
+                (_, Err(HelperError::Engine(Errno::ENODEV))) => {
                     while let Some(rest) = self.pending.borrow_mut().pop_front() {
                         if let Call::Release { open } = rest.call
                             && let Some(entry) = self.opens.borrow_mut().get_mut(&open.id)
@@ -396,27 +417,23 @@ impl<T: HelperTransport> HelperFs<T> {
                             entry.drained = true;
                         }
                     }
-                    return Err(Errno::ENODEV);
+                    return Err(HelperError::Engine(Errno::ENODEV));
                 }
                 (
                     _,
-                    Err(
+                    Err(HelperError::Engine(
                         Errno::EBADF
                         | Errno::EINVAL
                         | Errno::EACCES
                         | Errno::EPROTONOSUPPORT
                         | Errno::E2BIG,
-                    ),
+                    )),
                 ) => {
                     if let Call::Release { open } = &item.call
                         && let Some(entry) = self.opens.borrow_mut().get_mut(&open.id)
                     {
                         entry.drained = true;
                     }
-                }
-                (Call::CancelLock { .. }, Err(_)) => {
-                    self.pending.borrow_mut().push_front(item);
-                    return Err(Errno::ENOLCK);
                 }
                 (_, Err(e)) => {
                     self.pending.borrow_mut().push_front(item);
@@ -427,7 +444,15 @@ impl<T: HelperTransport> HelperFs<T> {
         Ok(())
     }
 
-    async fn send_raw(&self, cred: &WireCred, call: Call) -> Result<Value> {
+    pub async fn drain(&self) -> Result<()> {
+        self.drain_raw().await.map_err(map_nonlock_err)
+    }
+
+    async fn send_raw(
+        &self,
+        cred: &WireCred,
+        call: Call,
+    ) -> std::result::Result<Value, HelperError> {
         self.transport
             .request(Request::Call {
                 version: VERSION,
@@ -439,14 +464,14 @@ impl<T: HelperTransport> HelperFs<T> {
     }
 
     async fn call<R: DeserializeOwned>(&self, cred: &Cred, call: Call) -> Result<R> {
-        self.drain().await.map_err(map_nonlock_err)?;
+        self.drain_raw().await.map_err(map_nonlock_err)?;
         let wire = to_wire_cred(cred);
         let value = self.send_raw(&wire, call).await.map_err(map_nonlock_err)?;
         serde_json::from_value(value).map_err(|_| Errno::EIO)
     }
 
     async fn call_mutation<R: DeserializeOwned>(&self, cred: &Cred, call: Call) -> Result<R> {
-        self.drain().await.map_err(map_nonlock_err)?;
+        self.drain_raw().await.map_err(map_nonlock_err)?;
         let wire = to_wire_cred(cred);
         let value = self
             .send_raw(&wire, call)
@@ -485,14 +510,14 @@ impl<T: HelperTransport> HelperFs<T> {
 
     async fn opened<R: DeserializeOwned>(&self, open: &OpenRef, call: Call) -> Result<R> {
         let cred = self.open_cred(open)?;
-        self.drain().await.map_err(map_nonlock_err)?;
+        self.drain_raw().await.map_err(map_nonlock_err)?;
         let value = self.send_raw(&cred, call).await.map_err(map_nonlock_err)?;
         serde_json::from_value(value).map_err(|_| Errno::EIO)
     }
 
     async fn opened_mutation<R: DeserializeOwned>(&self, open: &OpenRef, call: Call) -> Result<R> {
         let cred = self.open_cred(open)?;
-        self.drain().await.map_err(map_nonlock_err)?;
+        self.drain_raw().await.map_err(map_nonlock_err)?;
         let value = self
             .send_raw(&cred, call)
             .await
@@ -500,15 +525,10 @@ impl<T: HelperTransport> HelperFs<T> {
         serde_json::from_value(value).map_err(|_| Errno::EIO)
     }
 
-    async fn opened_lock<R: DeserializeOwned>(
-        &self,
-        open: &OpenRef,
-        call: Call,
-        map_call_err: fn(Errno) -> Errno,
-    ) -> Result<R> {
+    async fn opened_lock<R: DeserializeOwned>(&self, open: &OpenRef, call: Call) -> Result<R> {
         let cred = self.open_cred(open)?;
-        self.drain().await.map_err(map_lock_err)?;
-        let value = self.send_raw(&cred, call).await.map_err(map_call_err)?;
+        self.drain_raw().await.map_err(map_lock_err)?;
+        let value = self.send_raw(&cred, call).await.map_err(map_lock_err)?;
         serde_json::from_value(value).map_err(|_| Errno::EIO)
     }
 
@@ -644,7 +664,7 @@ impl<T: HelperTransport> Filesystem for HelperFs<T> {
         Box::pin(async move {
             self.check_handle_fs(dir)?;
             check_component(name)?;
-            self.drain().await.map_err(map_nonlock_err)?;
+            self.drain_raw().await.map_err(map_nonlock_err)?;
             let wire = to_wire_cred(cred);
             let ticket = self.transport.ticket();
             let mut guard = CancelGuard {
@@ -933,7 +953,7 @@ impl<T: HelperTransport> Filesystem for HelperFs<T> {
     ) -> BoxFuture<'a, OpenRef> {
         Box::pin(async move {
             self.check_handle_fs(handle)?;
-            self.drain().await.map_err(map_nonlock_err)?;
+            self.drain_raw().await.map_err(map_nonlock_err)?;
             let wire = to_wire_cred(cred);
             let ticket = self.transport.ticket();
             let mut guard = CancelGuard {
@@ -1087,7 +1107,7 @@ impl<T: HelperTransport> Filesystem for HelperFs<T> {
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let cred = self.open_cred(open)?;
-            self.drain().await.map_err(map_lock_err)?;
+            self.drain_raw().await.map_err(map_lock_err)?;
             let ticket = self.transport.ticket();
             let mut guard = CancelGuard {
                 fs: self,
@@ -1127,7 +1147,7 @@ impl<T: HelperTransport> Filesystem for HelperFs<T> {
                     guard.pending = None;
                     return Ok(());
                 }
-                self.transport.pause().await.map_err(map_lock_err)?;
+                self.transport.pause().await.map_err(|_| Errno::ENOLCK)?;
             }
         })
     }
@@ -1149,7 +1169,6 @@ impl<T: HelperTransport> Filesystem for HelperFs<T> {
                         kind,
                         range,
                     },
-                    map_try_lock_err,
                 )
                 .await?;
             Ok(())
@@ -1171,7 +1190,6 @@ impl<T: HelperTransport> Filesystem for HelperFs<T> {
                         family,
                         range,
                     },
-                    map_lock_err,
                 )
                 .await?;
             Ok(())
@@ -1192,7 +1210,6 @@ impl<T: HelperTransport> Filesystem for HelperFs<T> {
                     kind,
                     range,
                 },
-                map_lock_err,
             )
             .await
         })
@@ -1232,7 +1249,7 @@ impl<T: HelperTransport> Filesystem for HelperFs<T> {
             match action {
                 ReleaseAction::AlreadyDrained(was_cancelled) => {
                     if was_cancelled {
-                        self.drain().await.map_err(map_nonlock_err)
+                        self.drain_raw().await.map_err(map_nonlock_err)
                     } else {
                         Err(Errno::EBADF)
                     }
@@ -1247,7 +1264,7 @@ impl<T: HelperTransport> Filesystem for HelperFs<T> {
                         }),
                         completed: false,
                     };
-                    self.drain().await.map_err(map_nonlock_err)?;
+                    self.drain_raw().await.map_err(map_nonlock_err)?;
                     let sent = {
                         let _lock = self.draining.lock().await;
                         self.send_raw(&cred, Call::Release { open: open.clone() })
@@ -1260,7 +1277,7 @@ impl<T: HelperTransport> Filesystem for HelperFs<T> {
                             guard.completed = true;
                             Ok(())
                         }
-                        Err(e @ (Errno::ENODEV | Errno::EBADF)) => {
+                        Err(HelperError::Engine(e @ (Errno::ENODEV | Errno::EBADF))) => {
                             self.opens.borrow_mut().remove(&open.id);
                             guard.enqueue = None;
                             guard.completed = true;
@@ -1276,14 +1293,14 @@ impl<T: HelperTransport> Filesystem for HelperFs<T> {
                         enqueue: None,
                         completed: false,
                     };
-                    let drained = self.drain().await;
+                    let drained = self.drain_raw().await;
                     match drained {
                         Ok(()) => {
                             guard.completed = true;
                             self.opens.borrow_mut().remove(&open.id);
                             Ok(())
                         }
-                        Err(e @ (Errno::ENODEV | Errno::EBADF)) => {
+                        Err(HelperError::Engine(e @ (Errno::ENODEV | Errno::EBADF))) => {
                             guard.completed = true;
                             self.opens.borrow_mut().remove(&open.id);
                             Err(e)

@@ -10,7 +10,10 @@ use abi::local_helper::{
 };
 use os_vfs::{
     BoxFuture, Cred, Filesystem, Identity,
-    helperfs::{HelperFs, HelperHttpHost, HelperTransport, HttpHelperTransport, HttpReply},
+    helperfs::{
+        HelperError, HelperFs, HelperFuture, HelperHttpHost, HelperTransport, HttpHelperTransport,
+        HttpReply,
+    },
     now_or_never, profiles,
 };
 use serde_json::{Value, json};
@@ -64,8 +67,8 @@ fn fake_open(ino: u64, id: u64) -> OpenRef {
 #[derive(Clone, Default)]
 struct MockTransport {
     requests: Rc<RefCell<Vec<Request>>>,
-    replies: Rc<RefCell<VecDeque<Result<Value, Errno>>>>,
-    disconnected: Rc<Cell<Option<Errno>>>,
+    replies: Rc<RefCell<VecDeque<std::result::Result<Value, HelperError>>>>,
+    disconnected: Rc<Cell<Option<HelperError>>>,
     next_ticket: Rc<Cell<u64>>,
     paused: Rc<Cell<u64>>,
 }
@@ -78,7 +81,17 @@ impl MockTransport {
     }
 
     fn push_err(&self, e: Errno) {
-        self.replies.borrow_mut().push_back(Err(e));
+        let he = match e {
+            Errno::ENOTCONN | Errno::ETIMEDOUT => HelperError::Transport(e),
+            other => HelperError::Engine(other),
+        };
+        self.replies.borrow_mut().push_back(Err(he));
+    }
+
+    fn push_overload(&self) {
+        self.replies
+            .borrow_mut()
+            .push_back(Err(HelperError::Overload));
     }
 
     fn push_connect(&self, grant: HelperGrant) {
@@ -102,7 +115,7 @@ impl MockTransport {
 }
 
 impl HelperTransport for MockTransport {
-    fn request(&self, request: Request) -> BoxFuture<'_, Value> {
+    fn request(&self, request: Request) -> HelperFuture<'_, Value> {
         Box::pin(async move {
             self.requests.borrow_mut().push(request);
             if let Some(err) = self.disconnected.get() {
@@ -406,7 +419,7 @@ fn lock_drop_cancels_deferred_ticket_and_unreachable_maps_to_enolck() {
     assert_eq!(t.requests.borrow().len(), reqs_before + 1);
 
     // Confirmed TryLock contention returns EAGAIN (never masked as ENOLCK!), while 503 overload
-    // (EBUSY) and unreachable helper calls still map to ENOLCK!
+    // and unreachable helper calls still map to ENOLCK!
     for family in [LockFamily::Flock, LockFamily::Posix] {
         t.push_err(Errno::EAGAIN);
         assert_eq!(
@@ -415,7 +428,7 @@ fn lock_drop_cancels_deferred_ticket_and_unreachable_maps_to_enolck() {
                 .unwrap_err(),
             Errno::EAGAIN
         );
-        t.push_err(Errno::EBUSY);
+        t.push_overload();
         assert_eq!(
             now_or_never(fs.try_lock(&open, family, LockKind::Exclusive, LockRange::WHOLE))
                 .unwrap()
@@ -424,8 +437,40 @@ fn lock_drop_cancels_deferred_ticket_and_unreachable_maps_to_enolck() {
         );
     }
 
+    // Genuine HelperEngine Errno::EBUSY (e.g. rmdir/rename on an active submount) and EAGAIN MUST
+    // preserve their exact errnos rather than being rewritten to ENOTCONN.
+    t.push_err(Errno::EBUSY);
+    assert_eq!(
+        now_or_never(fs.rmdir(&cred(), &fs.root(), "submount"))
+            .unwrap()
+            .unwrap_err(),
+        Errno::EBUSY
+    );
+    t.push_err(Errno::EBUSY);
+    assert_eq!(
+        now_or_never(fs.rename(
+            &cred(),
+            &fs.root(),
+            "submount",
+            &fs.root(),
+            "moved",
+            os_vfs::RenameFlags::empty(),
+        ))
+        .unwrap()
+        .unwrap_err(),
+        Errno::EBUSY
+    );
+    // By contrast, HTTP 503 worker-pool overload guarantees the engine never executed the call -> ENOTCONN.
+    t.push_overload();
+    assert_eq!(
+        now_or_never(fs.rmdir(&cred(), &fs.root(), "submount"))
+            .unwrap()
+            .unwrap_err(),
+        Errno::ENOTCONN
+    );
+
     // Unreachable helper during lock operations -> ENOLCK; non-lock -> ENODEV!
-    t.disconnected.set(Some(Errno::ENODEV));
+    t.disconnected.set(Some(HelperError::Engine(Errno::ENODEV)));
     assert_eq!(
         now_or_never(fs.try_lock(
             &open,
@@ -508,13 +553,13 @@ fn http_helper_transport_parses_refusals_and_enforces_control_max() {
     }))
     .unwrap()
     .unwrap_err();
-    assert_eq!(err, Errno::EPROTONOSUPPORT);
+    assert_eq!(err, HelperError::Engine(Errno::EPROTONOSUPPORT));
 
-    // Network loss preserves ENOTCONN/ETIMEDOUT uncertainty so HelperFs distinguishes transport
-    // uncertainty from confirmed server disconnects (ENODEV). HTTP 503 overload maps to EBUSY.
+    // HTTP 400 EBUSY (genuine kernel/engine refusal) MUST stay HelperError::Engine(EBUSY),
+    // distinct from HTTP 503 overload (HelperError::Overload) and transport failures.
     *host.host().reply.borrow_mut() = Ok(HttpReply {
-        status: 503,
-        body: br#"{"errno":"EAGAIN","error":"helper busy"}"#.to_vec(),
+        status: 400,
+        body: br#"{"errno":"EBUSY","error":"Device or resource busy"}"#.to_vec(),
     });
     assert_eq!(
         now_or_never(host.request(Request::Renew {
@@ -523,7 +568,23 @@ fn http_helper_transport_parses_refusals_and_enforces_control_max() {
         }))
         .unwrap()
         .unwrap_err(),
-        Errno::EBUSY
+        HelperError::Engine(Errno::EBUSY)
+    );
+
+    // Network loss preserves ENOTCONN/ETIMEDOUT uncertainty so HelperFs distinguishes transport
+    // uncertainty from confirmed server disconnects (ENODEV). HTTP 503 overload maps to Overload.
+    *host.host().reply.borrow_mut() = Ok(HttpReply {
+        status: 503,
+        body: br#"{"errno":"EBUSY","error":"helper busy"}"#.to_vec(),
+    });
+    assert_eq!(
+        now_or_never(host.request(Request::Renew {
+            version: 1,
+            session: "s".into(),
+        }))
+        .unwrap()
+        .unwrap_err(),
+        HelperError::Overload
     );
 
     *host.host().reply.borrow_mut() = Err(Errno::ENOTCONN);
@@ -533,7 +594,7 @@ fn http_helper_transport_parses_refusals_and_enforces_control_max() {
     }))
     .unwrap()
     .unwrap_err();
-    assert_eq!(err2, Errno::ENOTCONN);
+    assert_eq!(err2, HelperError::Transport(Errno::ENOTCONN));
 
     *host.host().reply.borrow_mut() = Err(Errno::ETIMEDOUT);
     let err_timeout = now_or_never(host.request(Request::Renew {
@@ -542,7 +603,23 @@ fn http_helper_transport_parses_refusals_and_enforces_control_max() {
     }))
     .unwrap()
     .unwrap_err();
-    assert_eq!(err_timeout, Errno::ETIMEDOUT);
+    assert_eq!(err_timeout, HelperError::Transport(Errno::ETIMEDOUT));
+
+    // Malformed HTTP 200 JSON body must remain an uncertain Transport(EIO) so open/create/lock
+    // keep CancelOpen/CancelLock queued instead of leaking server handles.
+    *host.host().reply.borrow_mut() = Ok(HttpReply {
+        status: 200,
+        body: b"{not-valid-json".to_vec(),
+    });
+    assert_eq!(
+        now_or_never(host.request(Request::Renew {
+            version: 1,
+            session: "s".into(),
+        }))
+        .unwrap()
+        .unwrap_err(),
+        HelperError::Transport(Errno::EIO)
+    );
 
     // Oversized body fails locally with E2BIG before posting.
     let huge = "x".repeat(CONTROL_MAX + 1);
@@ -552,7 +629,7 @@ fn http_helper_transport_parses_refusals_and_enforces_control_max() {
     }))
     .unwrap()
     .unwrap_err();
-    assert_eq!(err3, Errno::E2BIG);
+    assert_eq!(err3, HelperError::Engine(Errno::E2BIG));
 
     assert_eq!(serde_json::to_string(&Call::Statfs).unwrap(), r#""statfs""#);
     assert_eq!(
@@ -660,7 +737,7 @@ fn uncertain_open_mutations_return_eio_and_abandoned_open_create_queues_cancel_o
     .unwrap();
 
     for transient in [Errno::ENOTCONN, Errno::ETIMEDOUT] {
-        t.disconnected.set(Some(transient));
+        t.disconnected.set(Some(HelperError::Transport(transient)));
         assert_eq!(
             now_or_never(fs.write_at(&open, b"abc", os_vfs::WriteAt::Offset(0)))
                 .unwrap()
@@ -760,14 +837,15 @@ fn enotconn_and_eagain_keep_pending_cleanup_queued_and_renew_drains_cleanup() {
     assert_eq!(fs.pending_cancellations(), 1);
 
     // Release while disconnected hits ENOTCONN when trying to drain CancelLock -> keeps BOTH queued!
-    t.disconnected.set(Some(Errno::ENOTCONN));
+    t.disconnected
+        .set(Some(HelperError::Transport(Errno::ENOTCONN)));
     assert_eq!(
         now_or_never(fs.release(&open)).unwrap(),
         Err(Errno::ENOTCONN)
     );
     assert_eq!(fs.pending_cancellations(), 2);
-    // Overload (503 / EAGAIN) while retrying WaitDrained MUST also preserve BOTH pending cleanups!
-    t.disconnected.set(Some(Errno::EAGAIN));
+    // Overload (503) while retrying WaitDrained MUST also preserve BOTH pending cleanups!
+    t.disconnected.set(Some(HelperError::Overload));
     assert_eq!(
         now_or_never(fs.release(&open)).unwrap(),
         Err(Errno::ENOTCONN)
@@ -801,4 +879,93 @@ fn enotconn_and_eagain_keep_pending_cleanup_queued_and_renew_drains_cleanup() {
             ..
         }
     ));
+}
+
+#[test]
+fn malformed_http_200_open_keeps_cancel_open_queued() {
+    struct QueueHttpHost {
+        replies: RefCell<VecDeque<Result<HttpReply, Errno>>>,
+        requests: RefCell<Vec<Request>>,
+        next_ticket: Cell<u64>,
+    }
+    impl HelperHttpHost for QueueHttpHost {
+        fn post<'a>(&'a self, body: Vec<u8>) -> BoxFuture<'a, HttpReply> {
+            let req: Request = serde_json::from_slice(&body).unwrap();
+            self.requests.borrow_mut().push(req);
+            let next = self.replies.borrow_mut().pop_front().unwrap();
+            Box::pin(async move { next })
+        }
+        fn sleep(&self, _millis: u32) -> BoxFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn ticket(&self) -> String {
+            let n = self.next_ticket.get() + 1;
+            self.next_ticket.set(n);
+            format!("http-t-{n}")
+        }
+    }
+
+    let ok_json = |v: Value| {
+        Ok(HttpReply {
+            status: 200,
+            body: serde_json::to_vec(&v).unwrap(),
+        })
+    };
+    let grant = HelperGrant {
+        write: true,
+        execute: true,
+    };
+    let root = fake_root();
+    let expected_meta = fake_entry(1).metadata;
+    let host = HttpHelperTransport(QueueHttpHost {
+        replies: RefCell::new(VecDeque::from([
+            ok_json(
+                serde_json::to_value(HelloReply {
+                    boundary: Boundary::LocalHelper,
+                    version: VERSION,
+                    write: grant.write,
+                    execute: grant.execute,
+                    handshake: "hs".into(),
+                })
+                .unwrap(),
+            ),
+            ok_json(
+                serde_json::to_value(AttachReply {
+                    version: VERSION,
+                    fs: root.fs.clone(),
+                    session: "sess-http".into(),
+                    capabilities: profiles::HELPER,
+                    root: root.clone(),
+                    grant,
+                    lease_seconds: 60,
+                })
+                .unwrap(),
+            ),
+            // Corrupted HTTP 200 body on Call::Open: server may have created the OpenRef.
+            Ok(HttpReply {
+                status: 200,
+                body: b"{\"truncated\"".to_vec(),
+            }),
+            // Next call drains CancelOpen first, then serves Metadata.
+            ok_json(json!({})),
+            ok_json(serde_json::to_value(&expected_meta).unwrap()),
+        ])),
+        requests: RefCell::new(Vec::new()),
+        next_ticket: Cell::new(0),
+    });
+    let fs = now_or_never(HelperFs::connect(host, "http-client", &cred(), grant))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        now_or_never(fs.open(&cred(), &root, OpenOptions::new().read(true)))
+            .unwrap()
+            .unwrap_err(),
+        Errno::EIO
+    );
+    assert_eq!(fs.pending_cancellations(), 1);
+
+    let meta = now_or_never(fs.metadata(&cred(), &root)).unwrap().unwrap();
+    assert_eq!(meta.mode, expected_meta.mode);
+    assert_eq!(fs.pending_cancellations(), 0);
 }
