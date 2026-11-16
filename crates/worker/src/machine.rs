@@ -101,12 +101,36 @@ impl DurableObject for Machine {
                 let Ok(batch) = req.json::<Batch>().await else {
                     return Response::error("Invalid system call batch", 400);
                 };
+                let header_token = req
+                    .headers()
+                    .get("X-Process-Token")?
+                    .filter(|t| !t.is_empty());
+                let batch_token = batch.process.clone().filter(|t| !t.is_empty());
+                if let (Some(a), Some(b)) = (&header_token, &batch_token)
+                    && a != b
+                {
+                    let reply =
+                        vec![
+                            Return::Err(Error::because(Errno::EPERM, "not this process's token"));
+                            batch.calls.len()
+                        ];
+                    return Response::from_json(&json!(abi::Results { results: reply }));
+                }
+                let token = batch_token.or(header_token);
+                let no_usr_fallback = req
+                    .headers()
+                    .get("X-OS-No-Usr-Fallback")?
+                    .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                let chroot = req
+                    .headers()
+                    .get("X-OS-Chroot")?
+                    .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
                 let ns = Db::namespace(
                     auth::token_key(&req).as_deref(),
                     auth::guest_key(&req).as_deref(),
                 );
                 let caller = Caller {
-                    class: if batch.process.is_some() {
+                    class: if token.is_some() {
                         registry::Caller::Process
                     } else {
                         registry::Caller::Registry
@@ -117,7 +141,9 @@ impl DurableObject for Machine {
                     sudo: batch.sudo,
                     umask: batch.umask.unwrap_or(0o022) & 0o777,
                     pid: batch.pid,
-                    token: batch.process.clone(),
+                    token,
+                    no_usr_fallback,
+                    chroot,
                     identity: RefCell::new(None),
                 };
                 self.batch(&caller, batch.calls).await?
@@ -140,6 +166,8 @@ impl DurableObject for Machine {
                     umask: forwarded.umask & 0o777,
                     pid: forwarded.pid,
                     token: forwarded.token,
+                    no_usr_fallback: forwarded.no_usr_fallback,
+                    chroot: forwarded.chroot,
                     identity: RefCell::new(forwarded.identity.map(Ok)),
                 };
                 self.batch(&caller, forwarded.calls).await?
@@ -194,6 +222,10 @@ pub struct Forwarded {
     pub pid: Option<u32>,
     #[serde(default, rename = "proc")]
     pub token: Option<String>,
+    #[serde(default)]
+    pub no_usr_fallback: bool,
+    #[serde(default)]
+    pub chroot: bool,
     /// The page's caller, as the authority found it (root under sudo, if it may).
     #[serde(default)]
     pub identity: Option<Identity>,
@@ -215,6 +247,8 @@ struct Caller {
     umask: u16,
     pid: Option<u32>,
     token: Option<String>,
+    no_usr_fallback: bool,
+    chroot: bool,
     identity: RefCell<Option<std::result::Result<Identity, Error>>>,
 }
 
@@ -440,7 +474,16 @@ impl Machine {
                         runtime,
                         ..
                     } => {
-                        if local.is_some() && runtime.as_deref() != Some("resources-v1") {
+                        if local.is_some()
+                            && !matches!(
+                                runtime.as_deref(),
+                                Some(
+                                    "resources-v1"
+                                        | "resources-v1:chroot"
+                                        | "resources-v1:no-usr-fallback"
+                                )
+                            )
+                        {
                             return Err(Errno::EINVAL.into());
                         }
                         let scope = if pid.is_none() {
@@ -502,6 +545,7 @@ impl Machine {
                         cwd,
                         seat,
                         cgroup,
+                        runtime,
                         ..
                     },
                     Ok(begun),
@@ -509,6 +553,12 @@ impl Machine {
                 else {
                     return None;
                 };
+                let rt_chroot =
+                    matches!(runtime.as_deref(), Some("chroot" | "resources-v1:chroot"));
+                let rt_no_usr = matches!(
+                    runtime.as_deref(),
+                    Some("no-usr-fallback" | "resources-v1:no-usr-fallback")
+                );
                 Some(json!({
                     "pid": begun.pid,
                     "token": auth::token_hash(token),
@@ -521,6 +571,8 @@ impl Machine {
                     "old": begun.old,
                     "current": begun.current,
                     "generation": caller.release,
+                    "no_usr_fallback": caller.no_usr_fallback || rt_no_usr || rt_chroot,
+                    "chroot": caller.chroot || rt_chroot,
                 }))
             })
             .collect();
@@ -535,6 +587,8 @@ impl Machine {
                     "ns": caller.ns,
                     "sudo": caller.sudo,
                     "umask": caller.umask,
+                    "no_usr_fallback": caller.no_usr_fallback,
+                    "chroot": caller.chroot,
                     "execs": execs,
                     "revoke": revoke,
                 }),
@@ -609,6 +663,13 @@ impl Machine {
             let row = (begun.clone(), path.clone(), cgroup.clone());
             let uid = snapshot.uid;
             let placement_seat = seat.clone();
+            let normalized_runtime = match runtime.as_deref() {
+                Some("resources-v1:chroot" | "resources-v1:no-usr-fallback") => {
+                    Some("resources-v1".to_string())
+                }
+                Some("chroot" | "no-usr-fallback") => None,
+                other => other.map(str::to_string),
+            };
             let started = transact(&self.state, move |db| {
                 let (begun, path, cgroup) = row;
                 let started = db.exec_end(
@@ -622,7 +683,7 @@ impl Machine {
                     &cwd,
                     &cgroup,
                     seat.as_deref(),
-                    runtime.as_deref(),
+                    normalized_runtime.as_deref(),
                     now,
                 );
                 if started.is_ok() {
@@ -798,6 +859,8 @@ pub async fn forward(
         "umask": session.umask.unwrap_or(0o022),
         "pid": session.pid,
         "proc": session.token,
+        "no_usr_fallback": session.no_usr_fallback,
+        "chroot": session.chroot,
         "identity": identity,
         "calls": calls,
     });

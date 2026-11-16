@@ -41,6 +41,20 @@ pub fn call(
     caller: Option<&str>,
     call: Call,
 ) -> Result<Value> {
+    call_in_namespace(db, sid, "", process, caller, None, call)
+}
+
+/// The descriptor calls of the session `sid`, as `process`, carrying the caller's namespace and
+/// credential so typed device ioctls can validate v2 `OpenRef` directory capabilities.
+pub fn call_in_namespace(
+    db: &mut Db,
+    sid: Option<&str>,
+    ns: &str,
+    process: &Process,
+    caller: Option<&str>,
+    credential: Option<&crate::creds::Credential>,
+    call: Call,
+) -> Result<Value> {
     let sid = sid.ok_or_else(|| Error::because(Errno::EBADF, "no session to keep descriptors"))?;
     match call {
         Call::Open {
@@ -92,8 +106,22 @@ pub fn call(
             {
                 return Err(Errno::EBADF.into());
             }
-            let device = crate::dev::request(db, sid, fd.number())?;
-            ioctl(db, sid, process, caller, fd.number(), device, request, arg)
+            let mut device = crate::dev::request(db, sid, fd.number())?;
+            if let Some(dev) = &mut device {
+                dev.ns = ns.to_string();
+                dev.credential = credential.cloned();
+            }
+            ioctl(
+                db,
+                sid,
+                process,
+                caller,
+                credential,
+                fd.number(),
+                device,
+                request,
+                arg,
+            )
         }
         _ => Err(Errno::ENOSYS.into()),
     }
@@ -106,6 +134,7 @@ fn ioctl(
     sid: &str,
     process: &Process,
     caller: Option<&str>,
+    credential: Option<&crate::creds::Credential>,
     fd: u32,
     device: Option<crate::dev::Request>,
     request: u32,
@@ -113,15 +142,20 @@ fn ioctl(
 ) -> Result<Value> {
     match device {
         Some(device) => crate::dev::ioctl(db, process, device, request, arg),
-        None if request == FICLONE => clone(
-            db,
-            sid,
-            &process.cred,
-            fd,
-            arg.as_u64().unwrap_or(u64::MAX),
-            caller,
-        )
-        .map(|()| Value::Null),
+        None if request == FICLONE => {
+            if credential.is_some_and(|c| c.job().is_none()) {
+                return Err(Errno::EPERM.into());
+            }
+            clone(
+                db,
+                sid,
+                &process.cred,
+                fd,
+                arg.as_u64().unwrap_or(u64::MAX),
+                caller,
+            )
+            .map(|()| Value::Null)
+        }
         None => Err(Errno::ENOTTY.into()),
     }
 }

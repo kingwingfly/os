@@ -146,6 +146,9 @@ pub(super) fn reply(result: Result<Value>) -> Reply {
         Err(errno) => api::errno_reply(&errno.into()),
     }
 }
+fn stored_identity(db: &Db) -> Option<(FsId, String)> {
+    Some((FsId(db.meta(FS_ID_KEY)?), db.meta("vfs_handle_key")?))
+}
 fn identity(db: &mut Db) -> (FsId, String) {
     let mut get = |name: &str| {
         db.meta(name).unwrap_or_else(|| {
@@ -155,6 +158,112 @@ fn identity(db: &mut Db) -> (FsId, String) {
         })
     };
     (FsId(get(FS_ID_KEY)), get("vfs_handle_key"))
+}
+fn proof_mac(key: &str, fs: &FsId, session_id: &str, node: NodeId) -> Hmac<Sha256> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts every key size");
+    mac.update(&serde_json::to_vec(&(fs, session_id, node)).expect("serializable handle"));
+    mac
+}
+pub(crate) fn opened_in_namespace(
+    db: &Db,
+    ns: &str,
+    credential: Option<&Credential>,
+    open: &OpenRef,
+) -> Result<Node> {
+    if let Some(cred) = credential {
+        authorize(cred)?;
+        if cred.ns != ns {
+            return Err(Errno::EACCES);
+        }
+    }
+    let open_row = db
+        .rows::<OpenRow>("SELECT * FROM vfs_opens WHERE id = ?", vec![int(open.id)])
+        .pop()
+        .ok_or(Errno::EBADF)?;
+    let session = db
+        .rows::<SessionRow>(
+            "SELECT id, secret, ns, expires FROM vfs_sessions WHERE id = ?",
+            vec![text(&open_row.session)],
+        )
+        .pop()
+        .ok_or(Errno::ENOTCONN)?;
+    if session.expires <= auth::now() {
+        return Err(Errno::ENOTCONN);
+    }
+    if session.ns != ns {
+        return Err(Errno::EACCES);
+    }
+    let (fs, key) = stored_identity(db).ok_or(Errno::EACCES)?;
+    if let Some(cred) = credential {
+        let caller = Caller {
+            session,
+            credential: cred.clone(),
+            fs,
+            key,
+        };
+        return caller.opened(db, open);
+    }
+    if open.fs != fs
+        || open_row.ino != open.node.ino
+        || open.node.generation != 1
+        || open_row.access != serde_json::to_string(&open.access).map_err(|_| Errno::EIO)?
+        || open_row.revoked != 0
+        || !db.cloud_granted(open.id, &session.ns)
+    {
+        return Err(Errno::EACCES);
+    }
+    db.inode(open_row.ino).ok_or(Errno::ESTALE)
+}
+pub(crate) fn verify_handle(
+    db: &Db,
+    ns: &str,
+    credential: Option<&Credential>,
+    handle: &Handle,
+) -> Result<Node> {
+    if let Some(cred) = credential {
+        authorize(cred)?;
+        if cred.ns != ns {
+            return Err(Errno::EACCES);
+        }
+    }
+    let (fs, key) = stored_identity(db).ok_or(Errno::EACCES)?;
+    let tag = URL_SAFE_NO_PAD
+        .decode(&handle.proof)
+        .map_err(|_| Errno::EACCES)?;
+    if handle.fs != fs {
+        return Err(Errno::EACCES);
+    }
+    let sessions = db.rows::<SessionRow>(
+        "SELECT id, secret, ns, expires FROM vfs_sessions WHERE ns = ?",
+        vec![text(ns)],
+    );
+    let now = auth::now();
+    let mut matched_expired = false;
+    let mut matched_active = false;
+    for s in sessions {
+        if proof_mac(&key, &fs, &s.id, handle.node)
+            .verify_slice(&tag)
+            .is_ok()
+        {
+            if s.expires > now {
+                matched_active = true;
+                break;
+            }
+            matched_expired = true;
+        }
+    }
+    if !matched_active {
+        return Err(if matched_expired {
+            Errno::ENOTCONN
+        } else {
+            Errno::EACCES
+        });
+    }
+    if handle.node.generation != 1 {
+        return Err(Errno::ESTALE);
+    }
+    db.inode(handle.node.ino).ok_or(Errno::ESTALE)
 }
 fn authorize(credential: &Credential) -> Result<()> {
     credential.cloud().map_err(|_| Errno::EACCES)?;
@@ -213,12 +322,7 @@ impl Caller {
         })
     }
     fn proof(&self, node: NodeId) -> Hmac<Sha256> {
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.key.as_bytes())
-            .expect("HMAC accepts every key size");
-        mac.update(
-            &serde_json::to_vec(&(&self.fs, &self.session.id, node)).expect("serializable handle"),
-        );
-        mac
+        proof_mac(&self.key, &self.fs, &self.session.id, node)
     }
     fn handle(&self, ino: u64) -> Handle {
         let node = NodeId { ino, generation: 1 };
@@ -349,15 +453,30 @@ fn join(dir: &str, name: &str) -> String {
 /// later activations (`system::validate_mount`).
 fn read_only(db: &Db, path: &str) -> bool {
     crate::system::owns(db, path)
+        || os_image::below(path, "/usr")
+        || os_image::below(path, "/sys")
         || crate::procfs::is(path)
-        || matches!(path, "/etc/passwd" | "/etc/group")
+        || matches!(
+            path,
+            "/bin" | "/sbin" | "/lib" | "/lib64" | "/etc/passwd" | "/etc/group"
+        )
 }
 fn read_only_descendant(db: &Db, path: &str) -> bool {
     let prefix = format!("{}/", path.trim_end_matches('/'));
     crate::system::owns_descendant(db, path)
-        || ["/etc/passwd", "/etc/group", "/proc"]
-            .iter()
-            .any(|ro| ro.starts_with(&prefix))
+        || [
+            "/usr",
+            "/sys",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/proc",
+            "/etc/passwd",
+            "/etc/group",
+        ]
+        .iter()
+        .any(|ro| ro.starts_with(&prefix))
 }
 /// `EROFS` if any name of `ino` is read-only.
 pub(super) fn unchanged_names(db: &Db, ino: u64) -> Result<()> {
@@ -656,7 +775,11 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
                 return Err(Errno::EINVAL);
             }
             let node = match c.child(db, dir, name) {
-                Ok((node, _)) => {
+                Ok((node, path)) => {
+                    if (options.access()?.writes() || options.is_truncate()) && read_only(db, &path)
+                    {
+                        return Err(Errno::EROFS);
+                    }
                     if options.is_create_new() {
                         return Err(Errno::EEXIST);
                     }
@@ -701,16 +824,27 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             umask,
             rdev,
         } => {
-            if who.id != 0 {
-                return Err(Errno::EPERM);
-            }
             if rdev.is_empty() || rdev.len() > 255 {
                 return Err(Errno::EINVAL);
             }
             if !matches!(rdev.as_str(), "present" | "snd") {
                 return Err(Errno::EOPNOTSUPP);
             }
-            let (_, path) = new_name(db, &c, dir, name)?;
+            check_component(name)?;
+            let (_, dir_path) = c.dir(db, dir, EXEC)?;
+            let path = join(&dir_path, name);
+            if read_only(db, &path) {
+                return Err(Errno::EROFS);
+            }
+            if crate::dev::driver(&dir_path) != Some(rdev.as_str()) {
+                return Err(Errno::EPERM);
+            }
+            if permissions::is_guest_id(who.id) {
+                return Err(Errno::EPERM);
+            }
+            if db.persisted_node(&path).is_some() {
+                return Err(Errno::EEXIST);
+            }
             // The driver creates its inode, live state and expiry together. Unlike the
             // path driver's replace operation, VFS mknod requires an unused name.
             crate::dev::mknod(
@@ -787,7 +921,12 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             if node.is_device() {
                 return Err(Errno::EPERM);
             }
-            if directory && matches!(path.as_str(), "/dev" | "/dev/present" | "/dev/snd") {
+            if directory
+                && matches!(
+                    path.as_str(),
+                    "/dev" | "/dev/pts" | "/dev/present" | "/dev/snd"
+                )
+            {
                 return Err(Errno::EBUSY);
             }
             if directory && db.persisted_descendant(&path) {
@@ -902,13 +1041,16 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             Value::Null
         }
         Statfs => {
+            const FREE: u64 = (1 << 50) / 4096;
             let (bytes, files) = db.usage();
+            let used = bytes.div_ceil(4096);
             json!(StatFs {
                 block_size: 4096,
-                blocks: bytes.div_ceil(4096),
-                files,
+                blocks: used + FREE,
+                blocks_free: FREE,
+                files: files + FREE,
+                files_free: FREE,
                 name_max: abi::NAME_MAX as u64,
-                ..StatFs::default()
             })
         }
         Open {
@@ -970,7 +1112,36 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             db.release_cloud_open(open.id, false);
             Value::Null
         }
-        wire::Call::Clone { .. } => return Err(Errno::ENOSYS),
+        wire::Call::Clone { source, target } => {
+            let src_node = c.opened(db, source)?;
+            let mut dst_node = c.opened(db, target)?;
+            if !matches!(source.access, Access::Read | Access::ReadWrite) || !target.access.writes()
+            {
+                return Err(Errno::EBADF);
+            }
+            if src_node.directory || dst_node.directory {
+                return Err(Errno::EISDIR);
+            }
+            if !src_node.is_file() || !dst_node.is_file() || src_node.ino == dst_node.ino {
+                return Err(Errno::EINVAL);
+            }
+            if db
+                .names(src_node.ino)
+                .iter()
+                .any(|path| crate::sys::generated(db, path).is_some())
+            {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            unchanged_names(db, dst_node.ino)?;
+            if src_node.file.as_deref().is_some_and(|id| db.uploading(id))
+                || dst_node.file.as_deref().is_some_and(|id| db.uploading(id))
+            {
+                return Err(Errno::EBUSY);
+            }
+            db.cloud_clone(&src_node, &mut dst_node, c.actor())?;
+            db.cloud_accessed(src_node.ino);
+            Value::Null
+        }
         TryLock { .. }
         | Lock { .. }
         | AckLock { .. }
@@ -1079,13 +1250,15 @@ fn rename(
         return Err(Errno::ENOTEMPTY);
     }
     if source.directory
-        && (matches!(old.as_str(), "/dev" | "/dev/present" | "/dev/snd")
-            || !db
-                .rows::<Value>(
-                    "SELECT 1 FROM nodes n JOIN inodes i ON i.id = n.ino WHERE (n.path = ? OR instr(n.path, ?) = 1) AND i.rdev IS NOT NULL LIMIT 1",
-                    vec![text(&old), text(&format!("{old}/"))],
-                )
-                .is_empty())
+        && (matches!(
+            old.as_str(),
+            "/dev" | "/dev/pts" | "/dev/present" | "/dev/snd"
+        ) || !db
+            .rows::<Value>(
+                "SELECT 1 FROM nodes n JOIN inodes i ON i.id = n.ino WHERE (n.path = ? OR instr(n.path, ?) = 1) AND i.rdev IS NOT NULL LIMIT 1",
+                vec![text(&old), text(&format!("{old}/"))],
+            )
+            .is_empty())
     {
         return Err(Errno::EPERM);
     }

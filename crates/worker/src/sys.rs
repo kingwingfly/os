@@ -43,6 +43,30 @@ pub async fn handle(
         ));
     }
     let guest = auth::guest_key(req);
+    let header_token = req
+        .headers()
+        .get("X-Process-Token")?
+        .filter(|t| !t.is_empty());
+    let batch_token = batch.process.clone().filter(|t| !t.is_empty());
+    if let (Some(a), Some(b)) = (&header_token, &batch_token)
+        && a != b
+    {
+        return Ok(Reply::ok(json!(Results {
+            results: vec![
+                Return::Err(Error::because(Errno::EPERM, "not this process's token"));
+                batch.calls.len()
+            ],
+        })));
+    }
+    let token = batch_token.or(header_token);
+    let no_usr_fallback = req
+        .headers()
+        .get("X-OS-No-Usr-Fallback")?
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let chroot = req
+        .headers()
+        .get("X-OS-Chroot")?
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     // As whom each call is made: the page's session, or the process the batch names.
     let session = Rc::new(Session {
         key: key.clone(),
@@ -50,8 +74,10 @@ pub async fn handle(
         sudo: batch.sudo,
         umask: batch.umask.map(|mask| mask & 0o777),
         pid: batch.pid,
-        token: batch.process.clone(),
+        token,
         release: req.headers().get("X-OS-Release")?,
+        no_usr_fallback,
+        chroot,
     });
     // The session was heard from: its descriptors are kept (a process's, its line's), and a
     // page's keeps those of the processes its tabs run, whatever account they run as.
@@ -307,6 +333,8 @@ pub struct Session {
     pub pid: Option<u32>,
     pub token: Option<String>,
     pub release: Option<String>,
+    pub no_usr_fallback: bool,
+    pub chroot: bool,
 }
 
 /// As whom a call acts, once a transaction found it: its process (credentials and umask), the
@@ -456,11 +484,20 @@ async fn bytes(
             // A file of /proc that tells of processes is read again with its machine's list.
             let mut procs: Option<Rc<Vec<crate::procs::Row>>> = None;
             let read = loop {
-                let (asking, path, listed) = (session.clone(), path.clone(), procs.clone());
+                let (asking, path_arg, listed) = (session.clone(), path.clone(), procs.clone());
                 let read = transact(state, move |db| {
                     let read = asking.of(db).and_then(|acting| {
                         if acting.credential.as_ref().and_then(|c| c.job()).is_some() {
                             return Err(Errno::EPERM.into());
+                        }
+                        if let Some(credential) = &acting.credential {
+                            let probe = Call::Pread {
+                                fd,
+                                path: path_arg.clone(),
+                                offset,
+                                count,
+                            };
+                            authorize_process_v1(db, acting.sid.as_deref(), credential, &probe)?;
                         }
                         crate::fds::pread(
                             db,
@@ -468,7 +505,7 @@ async fn bytes(
                             listed.as_deref().map(Vec::as_slice),
                             &acting.process,
                             fd.map(FdRef::number),
-                            path.as_deref(),
+                            path_arg.as_deref(),
                             offset,
                             count,
                             acting.owner().as_deref(),
@@ -537,10 +574,19 @@ async fn bytes(
             if length > INLINE_MAX {
                 return Err(too_many());
             }
+            let fd_ref = fd;
             let fd = fd.number();
             let asking = session.clone();
             let target = transact(state, move |db| {
                 let target = asking.of(db).and_then(|acting| {
+                    if let Some(credential) = &acting.credential {
+                        let probe = Call::Pwrite {
+                            fd: fd_ref,
+                            index,
+                            data: Vec::new().into(),
+                        };
+                        authorize_process_v1(db, acting.sid.as_deref(), credential, &probe)?;
+                    }
                     let sid = acting.sid.as_deref().ok_or(Errno::EBADF)?;
                     crate::fds::pwrite(
                         db,
@@ -733,6 +779,111 @@ fn owner(
     }
 }
 
+fn canonical_subpath(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || (path.starts_with(&format!("{prefix}/"))
+            && !path.contains('\0')
+            && !path[prefix.len() + 1..]
+                .split('/')
+                .any(|seg| seg.is_empty() || seg == "." || seg == ".."))
+}
+
+fn allowed_proc_path(path: &str) -> bool {
+    canonical_subpath(path, "/proc")
+        && path != "/proc/self/fd"
+        && !path.starts_with("/proc/self/fd/")
+        && path != "/proc/self/fdinfo"
+        && !path.starts_with("/proc/self/fdinfo/")
+}
+
+fn allowed_dev_open(db: &Db, path: &str, flags: u32) -> bool {
+    flags & abi::O_CREAT == 0
+        && canonical_subpath(path, "/dev")
+        && path != "/dev"
+        && matches!(os_core::parent(path), "/dev" | "/dev/present" | "/dev/snd")
+        && db.persisted_node(path).is_none_or(|n| n.is_device())
+}
+
+/// Ordinary OS process tokens (`credential.job().is_none()`) resolve all filesystem paths via
+/// the client kernel's VFS and `/api/fs` v2 handles; direct v1 `/api/sys` filesystem path calls
+/// are refused at the server boundary so a chrooted or namespaced process cannot escape.
+fn authorize_process_v1(
+    db: &Db,
+    sid: Option<&str>,
+    credential: &Credential,
+    call: &Call,
+) -> std::result::Result<(), Error> {
+    if credential.job().is_some() {
+        return Ok(());
+    }
+    match call {
+        call if call.is_registry() => Ok(()),
+        Call::Getcreds
+        | Call::Useradd { .. }
+        | Call::Usermod { .. }
+        | Call::Userdel { .. }
+        | Call::Groupadd { .. }
+        | Call::Groupmod { .. }
+        | Call::Groupdel { .. }
+        | Call::Kill { .. }
+        | Call::Wait { .. } => Ok(()),
+        Call::InotifyAddWatch {
+            handle: Some(_), ..
+        }
+        | Call::InotifyRmWatch { .. } => Ok(()),
+        Call::Close { .. } | Call::Ioctl { .. } => Ok(()),
+        Call::Open { path, flags, .. } if allowed_dev_open(db, path, *flags) => Ok(()),
+        Call::Open { path, flags, .. }
+            if allowed_proc_path(path)
+                && flags & abi::O_ACCMODE == abi::O_RDONLY
+                && flags & (abi::O_CREAT | abi::O_TRUNC) == 0 =>
+        {
+            Ok(())
+        }
+        Call::Mknod {
+            path,
+            rdev: Some(_),
+            ..
+        } if canonical_subpath(path, "/dev")
+            && matches!(os_core::parent(path), "/dev/present" | "/dev/snd") =>
+        {
+            Ok(())
+        }
+        Call::Stat { path }
+        | Call::Lstat { path }
+        | Call::Getdents { path, .. }
+        | Call::Access { path, .. }
+        | Call::Readlink { path }
+            if allowed_proc_path(path) =>
+        {
+            Ok(())
+        }
+        Call::Pread {
+            fd: None,
+            path: Some(path),
+            ..
+        } if allowed_proc_path(path) => Ok(()),
+        Call::Pread {
+            fd: Some(fd),
+            path: None,
+            ..
+        } if sid
+            .and_then(|s| db.fd(s, fd.number()))
+            .is_none_or(|f| f.device.is_some() || allowed_proc_path(&f.path)) =>
+        {
+            Ok(())
+        }
+        Call::Pwrite { fd, .. }
+            if sid
+                .and_then(|s| db.fd(s, fd.number()))
+                .is_none_or(|f| f.device.is_some()) =>
+        {
+            Ok(())
+        }
+        _ => Err(Errno::EPERM.into()),
+    }
+}
+
 /// The call `call`, as `acting` found it: a process's own snapshot, or the session's account
 /// (signed in or not, under sudo if it asked). `procs` are the browser's processes, as its
 /// machine listed them, for a call on /proc.
@@ -747,6 +898,7 @@ fn run(
     let (process, sid, caller) = (&acting.process, acting.sid.as_deref(), &acting.credential);
     if let Some(credential) = caller {
         crate::executor::authorize(db, credential, &call)?;
+        authorize_process_v1(db, sid, credential, &call)?;
     }
     // A process acts as itself: it cannot sign the browser in or out, or mint sudo.
     if caller.is_some() && matches!(call, Call::Logout) {
@@ -791,8 +943,28 @@ fn run(
             }
             Ok(json!(statfs(db)))
         }
-        Call::InotifyAddWatch { path, mask, .. } => {
+        Call::InotifyAddWatch { path, mask, handle } => {
             let sid = sid.ok_or(Errno::EBADF)?;
+            if let Some(handle) = handle {
+                let node = crate::cloudfs::verify_handle(
+                    db,
+                    &session.namespace(),
+                    caller.as_ref(),
+                    &handle,
+                )?;
+                if !node.directory {
+                    return Err(Error::because(
+                        Errno::ENOTDIR,
+                        "only a directory's changes are told",
+                    ));
+                }
+                os_core::inode::require(&process.cred, &node, READ | EXEC)?;
+                let real = db.name_of(node.ino).ok_or(Errno::ESTALE)?;
+                return db
+                    .add_watch(sid, &real, mask)
+                    .map(|wd| json!(wd))
+                    .ok_or_else(|| Errno::ENOSPC.into());
+            }
             let stat = kernel::stat(db, &process.cred, &path, true)?;
             if !stat.is_dir() {
                 return Err(Error::because(
@@ -843,9 +1015,15 @@ fn run(
         | Call::Close { .. }
         | Call::Discard { .. }
         | Call::Fchmod { .. }
-        | Call::Ioctl { .. }) => {
-            crate::fds::call(db, sid, process, acting.owner().as_deref(), call)
-        }
+        | Call::Ioctl { .. }) => crate::fds::call_in_namespace(
+            db,
+            sid,
+            &session.namespace(),
+            process,
+            acting.owner().as_deref(),
+            caller.as_ref(),
+            call,
+        ),
         call => kernel::call(db, process, call),
     }
 }
@@ -987,30 +1165,45 @@ pub fn generated(db: &Db, path: &str) -> Option<String> {
 }
 
 /// Make /etc and the files the kernel writes in it, root's, where they are not; /proc, where
-/// procfs answers; and the rest of Arch's / that is the store's.
+/// procfs answers; and all root mountpoints and merged-/usr symlinks so CloudFs v2 sees them.
 pub fn ensure(db: &mut Db) {
-    if db.node("/etc").is_none() {
-        db.set_node("/etc", &Node::directory(0, 0, 0o755));
-    }
-    if db.node("/proc").is_none() {
-        db.set_node("/proc", &Node::directory(0, 0, 0o555));
-    }
-    // The rest of Arch's /, the store's: /tmp shared and sticky, as /guest is.
     for (path, mode) in [
+        ("/", 0o755),
+        ("/usr", 0o755),
+        ("/sys", 0o555),
+        ("/proc", 0o555),
+        ("/dev", 0o755),
+        ("/dev/pts", 0o755),
+        ("/dev/present", 0o755),
+        ("/dev/snd", 0o755),
+        ("/etc", 0o755),
         ("/boot", 0o755),
         ("/mnt", 0o755),
+        ("/mnt/local", 0o755),
+        ("/mnt/shared", 0o755),
         ("/opt", 0o755),
+        ("/opt/private", 0o755),
         ("/run", 0o755),
         ("/srv", 0o755),
         ("/tmp", 0o1777),
         ("/var", 0o755),
     ] {
-        if db.node(path).is_none() {
+        if db.persisted_node(path).is_none() {
             db.set_node(path, &Node::directory(0, 0, mode));
         }
     }
+    for (path, target) in [
+        ("/bin", "usr/bin"),
+        ("/sbin", "usr/bin"),
+        ("/lib", "usr/lib"),
+        ("/lib64", "usr/lib"),
+    ] {
+        if db.persisted_node(path).is_none() {
+            db.set_node(path, &Node::symlink(0, 0, target));
+        }
+    }
     for path in ["/etc/passwd", "/etc/group"] {
-        if db.node(path).is_none() {
+        if db.persisted_node(path).is_none() {
             let file = kernel::Fs::empty(db, 0, path);
             db.set_node(path, &Node::file(0, 0, 0o644, file, 0));
         }
