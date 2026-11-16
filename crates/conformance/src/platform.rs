@@ -11,6 +11,10 @@ use std::{fs::File, io, path::Path};
 
 pub type Result<T> = std::result::Result<T, String>;
 pub fn error(e: io::Error) -> String {
+    #[cfg(target_os = "wasi")]
+    if let Some(errno) = os_posix::errno_of(&e) {
+        return format!("{errno:?}");
+    }
     let n = e.raw_os_error();
     for (code, name) in [
         (libc::EPERM, "EPERM"),
@@ -454,12 +458,6 @@ pub fn acl(path: &Path) -> Result<Value> {
         }
     }
 }
-#[cfg(target_os = "wasi")]
-#[link(wasm_import_module = "wasix_32v1")]
-unsafe extern "C" {
-    fn chdir(ptr: *const u8, len: usize) -> u32;
-    fn getcwd(ptr: *mut u8, len: *mut u32) -> u32;
-}
 pub fn cd(path: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -467,13 +465,18 @@ pub fn cd(path: &Path) -> Result<()> {
     }
     #[cfg(target_os = "wasi")]
     {
-        let s = path.to_string_lossy();
-        let n = unsafe { chdir(s.as_ptr(), s.len()) };
-        if n == 0 {
-            Ok(())
-        } else {
-            Err(error(io::Error::from_raw_os_error(n as i32)))
-        }
+        io(os_posix::chdir(path))
+    }
+}
+#[allow(dead_code)]
+pub fn fchdir(file: &File) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        rc(unsafe { libc::fchdir(file.as_raw_fd()) })
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        io(os_posix::fchdir(file.as_raw_fd() as u32))
     }
 }
 pub fn cwd() -> Result<String> {
@@ -483,43 +486,89 @@ pub fn cwd() -> Result<String> {
     }
     #[cfg(target_os = "wasi")]
     {
-        let mut bytes = vec![0u8; 4096];
-        let mut n = bytes.len() as u32;
-        let e = unsafe { getcwd(bytes.as_mut_ptr(), &mut n) };
-        if e != 0 {
-            return Err(error(io::Error::from_raw_os_error(e as i32)));
-        }
-        Ok(String::from_utf8_lossy(&bytes[..n as usize - 1]).into_owned())
+        io(os_posix::getcwd()).map(|p| p.to_string_lossy().into_owned())
     }
 }
-#[cfg(target_os = "linux")]
 pub fn mount(source: &Path, target: &Path, tmpfs: bool) -> Result<()> {
-    let kind = CString::new("tmpfs").unwrap();
-    rc(unsafe {
-        libc::mount(
-            c(source).as_ptr(),
-            c(target).as_ptr(),
-            if tmpfs {
-                kind.as_ptr()
-            } else {
-                std::ptr::null()
-            },
-            if tmpfs { 0 } else { libc::MS_BIND },
-            std::ptr::null(),
-        )
-    })
+    #[cfg(target_os = "linux")]
+    {
+        let kind = CString::new("tmpfs").unwrap();
+        rc(unsafe {
+            libc::mount(
+                c(source).as_ptr(),
+                c(target).as_ptr(),
+                if tmpfs {
+                    kind.as_ptr()
+                } else {
+                    std::ptr::null()
+                },
+                if tmpfs { 0 } else { libc::MS_BIND },
+                std::ptr::null(),
+            )
+        })
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        io(os_posix::mount(
+            Some(source),
+            target,
+            tmpfs.then_some("tmpfs"),
+            if tmpfs { 0 } else { abi::mount_flags::MS_BIND },
+            None,
+        ))
+    }
 }
-#[cfg(target_os = "linux")]
 pub fn unmount(path: &Path) -> Result<()> {
-    rc(unsafe { libc::umount(c(path).as_ptr()) })
+    #[cfg(target_os = "linux")]
+    {
+        rc(unsafe { libc::umount(c(path).as_ptr()) })
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        io(os_posix::umount(path))
+    }
 }
-#[cfg(target_os = "linux")]
 pub fn detach(path: &Path) -> Result<()> {
-    rc(unsafe { libc::umount2(c(path).as_ptr(), libc::MNT_DETACH) })
+    #[cfg(target_os = "linux")]
+    {
+        rc(unsafe { libc::umount2(c(path).as_ptr(), libc::MNT_DETACH) })
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        io(os_posix::umount2(path, abi::umount_flags::MNT_DETACH))
+    }
 }
-#[cfg(target_os = "linux")]
 pub fn chroot(path: &Path) -> Result<()> {
-    rc(unsafe { libc::chroot(c(path).as_ptr()) })
+    #[cfg(target_os = "linux")]
+    {
+        rc(unsafe { libc::chroot(c(path).as_ptr()) })
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        io(os_posix::chroot(path))
+    }
+}
+#[allow(dead_code)]
+pub fn unshare(flags: u32) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        rc(unsafe { libc::unshare(flags as i32) })
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        io(os_posix::unshare(flags))
+    }
+}
+#[allow(dead_code)]
+pub fn setns(file: &File, nstype: u32) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        rc(unsafe { libc::setns(file.as_raw_fd(), nstype as i32) })
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        io(os_posix::setns(file.as_raw_fd() as u32, nstype))
+    }
 }
 
 pub fn invalid_sync(data: bool) -> Result<()> {
