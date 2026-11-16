@@ -547,7 +547,7 @@ pub async fn mv(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
         // The working directory, and the directories holding it, stay: the terminal would be
         // left in a directory no longer there.
         let holding = format!("{}/", source.trim_end_matches('/'));
-        if io.cwd == source || io.cwd.starts_with(&holding) {
+        if !io.cwd.is_empty() && (io.cwd == source || io.cwd.starts_with(&holding)) {
             io.fail(format!(
                 "mv: cannot move {}: it holds the working directory; cd elsewhere first",
                 quote(typed)
@@ -670,24 +670,138 @@ pub(crate) async fn canonical(
     Ok(format!("/{}", at.join("/")))
 }
 
-/// df: the file systems FILEs are on (the store, /, by default; /proc, procfs), their sizes in
-/// 1K blocks, or with -h in powers of 1024.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MountEntry {
+    id: u64,
+    parent_id: u64,
+    maj_min: String,
+    root: String,
+    mount_point: String,
+    fstype: String,
+    source: String,
+}
+
+fn unescape_mountinfo_field(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && (b'0'..=b'7').contains(&bytes[i + 1])
+            && (b'0'..=b'7').contains(&bytes[i + 2])
+            && (b'0'..=b'7').contains(&bytes[i + 3])
+        {
+            let val =
+                ((bytes[i + 1] - b'0') << 6) | ((bytes[i + 2] - b'0') << 3) | (bytes[i + 3] - b'0');
+            out.push(val);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
+    let mut mounts = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some(sep) = tokens.iter().position(|tok| *tok == "-") else {
+            continue;
+        };
+        if sep < 6 || sep + 2 >= tokens.len() {
+            continue;
+        }
+        let Ok(id) = tokens[0].parse::<u64>() else {
+            continue;
+        };
+        let Ok(parent_id) = tokens[1].parse::<u64>() else {
+            continue;
+        };
+        mounts.push(MountEntry {
+            id,
+            parent_id,
+            maj_min: tokens[2].to_string(),
+            root: unescape_mountinfo_field(tokens[3]),
+            mount_point: unescape_mountinfo_field(tokens[4]),
+            fstype: unescape_mountinfo_field(tokens[sep + 1]),
+            source: unescape_mountinfo_field(tokens[sep + 2]),
+        });
+    }
+    mounts
+}
+
+/// Topmost visible mount at each mountpoint (when stacked, later/overmounted entries win).
+fn visible_mounts(entries: &[MountEntry]) -> Vec<MountEntry> {
+    let mut out: Vec<MountEntry> = Vec::new();
+    for entry in entries {
+        if let Some(existing) = out.iter_mut().find(|m| m.mount_point == entry.mount_point) {
+            *existing = entry.clone();
+        } else {
+            out.push(entry.clone());
+        }
+    }
+    out
+}
+
+fn mount_for_path<'a>(mounts: &'a [MountEntry], path: &str) -> Option<&'a MountEntry> {
+    mounts
+        .iter()
+        .filter(|m| {
+            if m.mount_point == "/" {
+                path.starts_with('/')
+            } else {
+                path == m.mount_point
+                    || path
+                        .strip_prefix(&m.mount_point)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            }
+        })
+        .max_by_key(|m| m.mount_point.len())
+}
+
+fn mount_source_label(entry: &MountEntry) -> &str {
+    if entry.source.is_empty() || entry.source == "none" {
+        &entry.fstype
+    } else {
+        &entry.source
+    }
+}
+
+fn fallback_mount_label(path: &str) -> (&'static str, &'static str) {
+    if path == "/proc" || path.starts_with("/proc/") {
+        ("proc", "/proc")
+    } else if path == "/usr" || path.starts_with("/usr/") || path.starts_with("/bin") {
+        ("usr", "/usr")
+    } else {
+        ("r2", "/")
+    }
+}
+
+fn is_pseudo_fstype(fstype: &str) -> bool {
+    matches!(
+        fstype,
+        "proc" | "devpts" | "devtmpfs" | "sysfs" | "cgroup" | "cgroup2" | "mqueue"
+    )
+}
+
+/// df: the file systems FILEs are on (discovered from `/proc/self/mountinfo` by default, or `/`
+/// when mountinfo is unavailable), their sizes in 1K blocks, or with -h in powers of 1024.
 pub async fn df(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
     let df = parsed!(io, args::Df);
-    let typed = if df.files.is_empty() {
-        vec!["/".to_string()]
-    } else {
-        df.files.clone()
-    };
-    let paths: Vec<String> = typed.iter().map(|t| io.path(t)).collect();
-    let found = calls::<abi::StatFs>(
-        sys,
-        paths
-            .iter()
-            .map(|path| Call::Statfs { path: path.clone() })
-            .collect(),
-    )
-    .await;
+    let mountinfo = sys
+        .read("/proc/self/mountinfo")
+        .await
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|text| visible_mounts(&parse_mountinfo(&text)));
+
     let size = |bytes: u64| {
         if df.human {
             human(bytes)
@@ -704,23 +818,9 @@ pub async fn df(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
         "Mounted on".to_string(),
     ]];
     let mut status = 0;
-    for ((typed, path), found) in typed.iter().zip(&paths).zip(found) {
-        let fs = match found {
-            Ok(fs) => fs,
-            Err(error) => {
-                io.fail(format!("df: {}: {error}", quote(typed)));
-                status = 1;
-                continue;
-            }
-        };
-        let (name, mounted) = if path == "/proc" || path.starts_with("/proc/") {
-            ("proc", "/proc")
-        } else if path == "/usr" || path.starts_with("/usr/") || path.starts_with("/bin") {
-            ("usr", "/usr")
-        } else {
-            ("r2", "/")
-        };
-        let used = (fs.blocks - fs.bfree) * fs.bsize;
+
+    let push_row = |rows: &mut Vec<[String; 6]>, name: &str, mounted: &str, fs: &abi::StatFs| {
+        let used = fs.blocks.saturating_sub(fs.bfree) * fs.bsize;
         let percent = if fs.blocks == 0 {
             "-".to_string()
         } else {
@@ -737,7 +837,108 @@ pub async fn df(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
             percent,
             mounted.to_string(),
         ]);
+    };
+
+    if df.files.is_empty() {
+        if let Some(mounts) = mountinfo.as_deref().filter(|m| !m.is_empty()) {
+            // Order shallowest mountpoint first before deduplicating bind mounts by `maj:min`.
+            let mut ordered: Vec<&MountEntry> = mounts.iter().collect();
+            ordered.sort_by(|a, b| {
+                a.mount_point
+                    .len()
+                    .cmp(&b.mount_point.len())
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            let mut candidates: Vec<&MountEntry> = Vec::new();
+            let mut seen_dev = std::collections::BTreeSet::new();
+            for m in ordered {
+                if is_pseudo_fstype(&m.fstype) {
+                    continue;
+                }
+                if seen_dev.insert(m.maj_min.clone()) {
+                    candidates.push(m);
+                }
+            }
+            // Restore mountinfo table order among selected mounts.
+            candidates.sort_by_key(|m| m.id);
+            let stat_calls: Vec<Call> = candidates
+                .iter()
+                .map(|m| Call::Statfs {
+                    path: m.mount_point.clone(),
+                })
+                .collect();
+            let found = calls::<abi::StatFs>(sys, stat_calls).await;
+            let mut emitted = 0usize;
+            for (m, res) in candidates.into_iter().zip(found) {
+                if let Ok(fs) = res {
+                    if fs.blocks == 0 && is_pseudo_fstype(&m.fstype) {
+                        continue;
+                    }
+                    push_row(&mut rows, mount_source_label(m), &m.mount_point, &fs);
+                    emitted += 1;
+                }
+            }
+            if emitted == 0
+                && let Some(Ok(fs)) =
+                    calls::<abi::StatFs>(sys, vec![Call::Statfs { path: "/".into() }])
+                        .await
+                        .into_iter()
+                        .next()
+            {
+                let (name, mounted) = mounts
+                    .iter()
+                    .find(|m| m.mount_point == "/")
+                    .map_or(("r2", "/"), |m| (mount_source_label(m), "/"));
+                push_row(&mut rows, name, mounted, &fs);
+            }
+        } else {
+            let found = calls::<abi::StatFs>(sys, vec![Call::Statfs { path: "/".into() }]).await;
+            if let Some(res) = found.into_iter().next() {
+                match res {
+                    Ok(fs) => push_row(&mut rows, "r2", "/", &fs),
+                    Err(error) => {
+                        io.fail(format!("df: '/': {error}"));
+                        status = 1;
+                    }
+                }
+            }
+        }
+    } else {
+        let paths: Vec<String> = df.files.iter().map(|t| io.path(t)).collect();
+        let found = calls::<abi::StatFs>(
+            sys,
+            paths
+                .iter()
+                .map(|path| Call::Statfs { path: path.clone() })
+                .collect(),
+        )
+        .await;
+        for ((typed, path), found) in df.files.iter().zip(&paths).zip(found) {
+            let fs = match found {
+                Ok(fs) => fs,
+                Err(error) => {
+                    io.fail(format!("df: {}: {error}", quote(typed)));
+                    status = 1;
+                    continue;
+                }
+            };
+            if let Some(mounts) = mountinfo.as_deref().filter(|m| !m.is_empty()) {
+                let canon = canonical(sys, path, Existing::All)
+                    .await
+                    .unwrap_or_else(|_| shown_path(path));
+                if let Some(m) = mount_for_path(mounts, &canon) {
+                    push_row(&mut rows, mount_source_label(m), &m.mount_point, &fs);
+                } else {
+                    let (name, mounted) = fallback_mount_label(&canon);
+                    push_row(&mut rows, name, mounted, &fs);
+                }
+            } else {
+                let (name, mounted) = fallback_mount_label(path);
+                push_row(&mut rows, name, mounted, &fs);
+            }
+        }
     }
+
     let widths: Vec<usize> = (0..6)
         .map(|i| rows.iter().map(|row| row[i].len()).max().unwrap_or(0))
         .collect();
@@ -775,5 +976,180 @@ fn human(bytes: u64) -> String {
         format!("{:.1}{}", (value * 10.0).ceil() / 10.0, units[unit])
     } else {
         format!("{}{}", value.ceil(), units[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    fn block_on<T>(fut: impl Future<Output = T>) -> T {
+        let mut fut = pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(val) => val,
+            Poll::Pending => panic!("unexpected pending future in mock Sys"),
+        }
+    }
+
+    struct MockDfSys {
+        mountinfo: Option<String>,
+        statfs: BTreeMap<String, abi::StatFs>,
+        symlinks: BTreeMap<String, String>,
+    }
+
+    impl Sys for MockDfSys {
+        async fn batch(&self, calls: Vec<Call>) -> Vec<Result<Value, Error>> {
+            calls
+                .into_iter()
+                .map(|call| match call {
+                    Call::Statfs { path } => self
+                        .statfs
+                        .get(&path)
+                        .and_then(|fs| serde_json::to_value(fs).ok())
+                        .ok_or_else(|| Errno::ENOENT.into()),
+                    Call::Lstat { path } => {
+                        if let Some(target) = self.symlinks.get(&path) {
+                            serde_json::to_value(Stat {
+                                mode: 0o120_777,
+                                link: Some(target.clone()),
+                                ..Stat::default()
+                            })
+                            .map_err(|_| Errno::EIO.into())
+                        } else if self.statfs.contains_key(&path)
+                            || matches!(path.as_str(), "/" | "/mnt" | "/mnt/work")
+                        {
+                            serde_json::to_value(Stat {
+                                mode: 0o040_755,
+                                ..Stat::default()
+                            })
+                            .map_err(|_| Errno::EIO.into())
+                        } else {
+                            Err(Errno::ENOENT.into())
+                        }
+                    }
+                    Call::Readlink { path } => self
+                        .symlinks
+                        .get(&path)
+                        .map(|target| Value::String(target.clone()))
+                        .ok_or_else(|| Errno::EINVAL.into()),
+                    _ => Err(Errno::ENOSYS.into()),
+                })
+                .collect()
+        }
+
+        async fn read(&self, path: &str) -> Result<Vec<u8>, Error> {
+            if path == "/proc/self/mountinfo"
+                && let Some(text) = &self.mountinfo
+            {
+                return Ok(text.as_bytes().to_vec());
+            }
+            Err(Errno::ENOENT.into())
+        }
+    }
+
+    fn run_df(sys: &MockDfSys, args: &[&str]) -> (i32, String, Vec<String>) {
+        let mut io = Io {
+            args: args.iter().map(|s| (*s).to_string()).collect(),
+            cwd: "/".to_string(),
+            home: "/root".to_string(),
+            now: 0,
+            stdin: None,
+            out: String::new(),
+            err: Vec::new(),
+            found: Vec::new(),
+            cancelled: &|| false,
+            ask: &|_| Box::pin(async { None }),
+        };
+        let code = block_on(df(sys, &mut io));
+        (code, io.out, io.err)
+    }
+
+    fn sample_statfs(blocks: u64, bfree: u64) -> abi::StatFs {
+        abi::StatFs {
+            bsize: 4096,
+            blocks,
+            bfree,
+            bavail: bfree,
+            files: 100,
+            ffree: 90,
+            namelen: 255,
+            ..abi::StatFs::default()
+        }
+    }
+
+    #[test]
+    fn df_discovers_mounts_from_mountinfo_unescapes_and_skips_pseudo_and_binds() {
+        let mountinfo = "\
+1 1 0:1 / / rw,relatime shared:1 - r2 r2 rw
+2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw
+3 1 0:3 / /mnt/my\\040disk rw shared:2 - tmpfs scratch rw
+4 1 0:3 /sub /mnt/bind rw shared:2 - tmpfs scratch rw
+5 3 0:4 / /mnt/my\\040disk ro shared:3 - overlay stacked ro
+";
+        let mut statfs = BTreeMap::new();
+        statfs.insert("/".into(), sample_statfs(1000, 800));
+        statfs.insert("/proc".into(), sample_statfs(0, 0));
+        statfs.insert("/mnt/my disk".into(), sample_statfs(500, 250));
+        statfs.insert("/mnt/bind".into(), sample_statfs(500, 250));
+
+        let sys = MockDfSys {
+            mountinfo: Some(mountinfo.into()),
+            statfs,
+            symlinks: BTreeMap::new(),
+        };
+        let (code, out, err) = run_df(&sys, &["df"]);
+        assert_eq!(code, 0, "err={err:?}");
+        assert!(out.contains("r2"), "out={out}");
+        // Overmount `stacked` at `/mnt/my disk` wins over shadowed `scratch`, while `/mnt/bind`
+        // keeps `0:3` (`scratch`) because `0:3` was shadowed at `/mnt/my disk`.
+        assert!(
+            out.contains("stacked") && out.contains("/mnt/my disk"),
+            "out={out}"
+        );
+        assert!(
+            !out.contains("/proc"),
+            "pseudo-fs /proc should be skipped: {out}"
+        );
+    }
+
+    #[test]
+    fn df_resolves_symlink_operand_to_target_mount_and_falls_back_without_mountinfo() {
+        let mountinfo = "\
+1 1 0:1 / / rw - r2 r2 rw
+2 1 0:5 / /mnt/work rw - tmpfs workfs rw
+";
+        let mut statfs = BTreeMap::new();
+        statfs.insert("/".into(), sample_statfs(1000, 900));
+        statfs.insert("/shortcut".into(), sample_statfs(200, 100));
+        statfs.insert("/mnt/work/data".into(), sample_statfs(200, 100));
+        let mut symlinks = BTreeMap::new();
+        symlinks.insert("/shortcut".into(), "/mnt/work/data".into());
+
+        let sys = MockDfSys {
+            mountinfo: Some(mountinfo.into()),
+            statfs: statfs.clone(),
+            symlinks,
+        };
+        let (code, out, _) = run_df(&sys, &["df", "/shortcut"]);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("workfs") && out.contains("/mnt/work"),
+            "out={out}"
+        );
+
+        // Fallback when `/proc/self/mountinfo` is absent (isolated mock Sys).
+        let fallback_sys = MockDfSys {
+            mountinfo: None,
+            statfs,
+            symlinks: BTreeMap::new(),
+        };
+        let (code2, out2, _) = run_df(&fallback_sys, &["df"]);
+        assert_eq!(code2, 0);
+        assert!(out2.contains("r2") && out2.contains("/"), "out2={out2}");
     }
 }
