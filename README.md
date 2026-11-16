@@ -862,13 +862,13 @@ Unmounting all aliases and mounting again retains the files. It does not allocat
 volume, format anything, or guarantee persistence after browser storage eviction/clearing.
 The browser profile controls the source; signing into another OS account does not create
 another physical browser filesystem. Browser storage (`HostFs::opfs`) shares a durable
-filesystem identity and IndexedDB metadata store (`STORE_FORMAT_VERSION = 2`) across
+filesystem identity and IndexedDB metadata store (`STORE_FORMAT_VERSION = 3`) across
 aliases, so remounts and bind-like aliases share inode, mode, ACL, xattr, open-unlink, and
 Web Locks advisory lock state.
 
 Host folders (browser `HostFs::directory` or `os-local-helper` `HelperFs`) and `osfs:`
 exports likewise provide existing directory trees without sidecar files inside the host
-folder (`os-local-helper` keeps private metadata in app state under `STATE_FORMAT_VERSION = 2`).
+folder (`os-local-helper` keeps private metadata in app state under `STATE_FORMAT_VERSION = 3`).
 They mount directly into the VFS and do not need fictional `/dev` block nodes or `mkfs`.
 Explicit mount and publication consent remains required.
 
@@ -932,7 +932,7 @@ against the selected root after access. See the
 [symlink semantics specification issue](https://github.com/WICG/file-system-access/issues/113).
 Browser-backed descriptors retain File views; external replacement on host folders invalidates
 stale cached metadata with `ESTALE`/`EIO` (never writing sidecars to the host folder);
-opening a path again reads its current contents. `os_vfs::hostfs::HostFs` (`STORE_FORMAT_VERSION = 2`)
+opening a path again reads its current contents. `os_vfs::hostfs::HostFs` (`STORE_FORMAT_VERSION = 3`)
 coordinates `O_EXCL` atomic creation, `RENAME_NOREPLACE`, and cross-tab advisory locking via
 Web Locks (`os-fs-*`) plus `fsync`/`fdatasync` flushes; host-folder symlinks remain
 `EOPNOTSUPP`, and native POSIX unlink-while-open on external host directories requires
@@ -1137,7 +1137,7 @@ This is an independent workspace. Worker name: `os`; bucket: `os-files`; binding
 
 ## Validation
 
-Wave 1 L1 ([#48](https://github.com/kingwingfly/os/issues/48), [#49](https://github.com/kingwingfly/os/issues/49), [#50](https://github.com/kingwingfly/os/issues/50)) completes the portable VFS (`crates/vfs`) handle operations, open options, counted descriptions, descriptor table, `MemFs`, [cloud driver](docs/architecture/cloudfs.md), [browser `HostFs` driver](docs/architecture/hostfs.md) (`STORE_FORMAT_VERSION = 2`), and Linux `HelperFs` client over `os-local-helper` (`STATE_FORMAT_VERSION = 2`). The Worker serves `/api/fs` v2 and `/api/fs/data` (`SCHEMA_VERSION = "9"`) with current-caller checks, verified calling PIDs, retained open objects, `SEEK_END` authenticated as the current caller, persistent coalesced POSIX lock queues, two-minute resumable sessions (`cloud_renew`), exec/fork grant inheritance and revocation, durable deferred cleanup, and immutable R2 byte extents. In `crates/client-kernel`, `cloudfs.rs` routes regular cloud files through `CloudFs` while path calls remain for directories, devices, `/proc`, and local mounts until [#51](https://github.com/kingwingfly/os/issues/51), and `mounts.rs` (`LocalMount`) replaces the removed JS `PermissionMount` across OPFS, directory handles, snapshots, and `os-local-helper`, wired to real `fd_sync`/`fd_datasync` in `web/wasi/process.js`.
+Wave 1 L1 ([#48](https://github.com/kingwingfly/os/issues/48), [#49](https://github.com/kingwingfly/os/issues/49), [#50](https://github.com/kingwingfly/os/issues/50)) completes the portable VFS (`crates/vfs`) handle operations, open options, counted descriptions, descriptor table, `MemFs`, [cloud driver](docs/architecture/cloudfs.md), [browser `HostFs` driver](docs/architecture/hostfs.md) (`STORE_FORMAT_VERSION = 3`), and Linux `HelperFs` client over `os-local-helper` (`STATE_FORMAT_VERSION = 3`). The Worker serves `/api/fs` v2 and `/api/fs/data` (`SCHEMA_VERSION = "9"`) with current-caller checks, verified calling PIDs, retained open objects, `SEEK_END` authenticated as the current caller, persistent coalesced POSIX lock queues, two-minute resumable sessions (`cloud_renew`), exec/fork grant inheritance and revocation, durable deferred cleanup, and immutable R2 byte extents. In `crates/client-kernel`, `cloudfs.rs` routes regular cloud files through `CloudFs` while path calls remain for directories, devices, `/proc`, and local mounts until [#51](https://github.com/kingwingfly/os/issues/51), and `mounts.rs` (`LocalMount`) replaces the removed JS `PermissionMount` across OPFS, directory handles, snapshots, and `os-local-helper`, wired to real `fd_sync`/`fd_datasync` in `web/wasi/process.js`.
 
 Run `cargo test --locked -p os-vfs -p os-core -p os-kernel` for portable semantics and cancellation checks. Against a disposable schema-9 Worker, `OS_PASSWORD=... OS_TEST_URL=http://127.0.0.1:8791 npx playwright test tests/cloudfs.spec.js --project=chromium` checks the actual authority/R2 adapter, including home reservation and move rules, privilege bits under different callers, device creation/teardown and alias denial, current umask/default ACL inheritance, creation and truncation rules, exec/fork grant retention and revocation, and the full two-minute lease expiry. After building the Worker, `node --test tests/cloudfs-authority.mjs` runs a disposable authority-binding regression that rejects job credentials at v2 connect, control and data boundaries while checking the existing job path grants. These API tests do not start browser processes or complete the browser/conformance milestone gates.
 
