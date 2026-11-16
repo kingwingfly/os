@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 /// Explicit durable metadata store format version (contract §2.12).
 /// Older versions reset metadata once (never deleting user files); newer versions fail with
 /// `Errno::EPROTONOSUPPORT` without modifying the store.
-pub const STORE_FORMAT_VERSION: u32 = 2;
+pub const STORE_FORMAT_VERSION: u32 = 3;
 
 /// Fixed root directory inode number.
 pub const ROOT_INO: u64 = 1;
@@ -80,6 +80,26 @@ pub enum Backing {
     MetaOnly,
 }
 
+/// Crash-recovery journal record persisted in [`StoreHeader`] while staging an OPFS rename.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRename {
+    pub from_path: String,
+    pub to_path: String,
+    pub is_dir: bool,
+    pub source_has_path: bool,
+    pub staged_target_ino: Option<u64>,
+    pub staged_other_path: Option<String>,
+    pub removed_empty_dir: bool,
+}
+
+/// Crash-recovery journal record persisted in [`StoreHeader`] while truncating an existing file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingTruncate {
+    pub ino: u64,
+    pub backing: Backing,
+    pub target_mode: u16,
+}
+
 /// Persistent header stored in [`MetaStore`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreHeader {
@@ -87,6 +107,9 @@ pub struct StoreHeader {
     pub uuid: String,
     pub next_ino: u64,
     pub next_open_id: u64,
+    pub pending_rename: Option<PendingRename>,
+    #[serde(default)]
+    pub pending_truncate: Option<PendingTruncate>,
 }
 
 /// Persistent inode record stored in [`MetaStore`].
@@ -345,6 +368,8 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                         uuid: uuid.clone(),
                         next_ino: ROOT_INO + 1,
                         next_open_id: 1,
+                        pending_rename: None,
+                        pending_truncate: None,
                     };
                     meta.reset_to_current(header, root).await?;
                     uuid
@@ -374,6 +399,8 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                         uuid: uuid.clone(),
                         next_ino: ROOT_INO + 1,
                         next_open_id: 1,
+                        pending_rename: None,
+                        pending_truncate: None,
                     };
                     meta.reset_to_current(header, root).await?;
                     uuid

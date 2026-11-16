@@ -3,7 +3,7 @@
 // fingerprints, store format versions, and advisory lock state; this module strictly performs
 // primitive browser host I/O, durable IndexedDB record transactions, and Web Locks coordination.
 
-export const STORE_FORMAT_VERSION = 2;
+export const STORE_FORMAT_VERSION = 3;
 const HANDLE_REGISTRY_DB = 'os-fs-handles';
 const LOCK_CHANNEL_NAME = 'os-fs-locks';
 const WASM_MAGIC = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
@@ -40,11 +40,19 @@ function splitPath(path) {
 
 // Local in-process listeners so same-tab `F_SETLKW` waiters wake even without BroadcastChannel loopback.
 const localLockListeners = new Set();
-// Fallback handle -> uuid map for non-cloneable mock directory handles in unit tests.
-const nonCloneableHandles = new WeakMap();
-const nonCloneableRegistry = [];
+// Per-IndexedDB fallback handle registries for non-cloneable mock directory handles in unit tests.
+const nonCloneableRegistries = new WeakMap();
 // Fallback Map<storeKey, Map<string, FileSystemHandle>> for non-cloneable mock entry handles.
 const nonCloneableEntryHandles = new Map();
+
+function fallbackRegistryFor(idb) {
+  let state = nonCloneableRegistries.get(idb);
+  if (!state) {
+    state = { rows: [] };
+    nonCloneableRegistries.set(idb, state);
+  }
+  return state;
+}
 
 function fileMtimeParts(file) {
   const raw = typeof file?.lastModified === 'number' ? file.lastModified : 0;
@@ -179,18 +187,19 @@ async function acquireExclusiveLock(locks, name, fn) {
   return locks.request(name, { mode: 'exclusive' }, () => fn());
 }
 
-async function resolveDirectoryUuid(handle, { idb, locks }) {
-  if (nonCloneableHandles.has(handle)) {
-    return nonCloneableHandles.get(handle);
+async function handlesOverlap(a, b) {
+  if (typeof a?.resolve === 'function' && (await a.resolve(b).catch(() => null)) !== null) {
+    return true;
   }
-  return acquireExclusiveLock(locks, 'os-fs-mint', async () => {
-    for (const item of nonCloneableRegistry) {
-      const same = typeof handle.isSameEntry === 'function'
-        ? await handle.isSameEntry(item.handle).catch(() => false)
-        : handle === item.handle;
-      if (same) return item.uuid;
-    }
+  if (typeof b?.resolve === 'function' && (await b.resolve(a).catch(() => null)) !== null) {
+    return true;
+  }
+  return false;
+}
 
+async function resolveDirectoryUuid(handle, { idb, locks }) {
+  const fallback = fallbackRegistryFor(idb);
+  return acquireExclusiveLock(locks, 'os-fs-mint', async () => {
     const db = await openHandleRegistryDb(idb);
     try {
       const rtx = openTransaction(db, ['meta', 'handles'], 'readonly');
@@ -203,19 +212,30 @@ async function resolveDirectoryUuid(handle, { idb, locks }) {
         throw error('EPROTONOSUPPORT', 'directory handle registry belongs to a newer OS release');
       }
 
-      for (const row of existing ?? []) {
-        if (!row?.handle || typeof row.uuid !== 'string') continue;
-        const same = typeof handle.isSameEntry === 'function'
-          ? await handle.isSameEntry(row.handle).catch(() => false)
-          : handle === row.handle;
-        if (same) {
-          if (storedVersion !== STORE_FORMAT_VERSION) {
-            const wtx = openTransaction(db, ['meta'], 'readwrite', true);
-            wtx.objectStore('meta').put(STORE_FORMAT_VERSION, 'version');
-            await txDone(wtx);
-          }
-          return row.uuid;
+      const registered = [
+        ...fallback.rows,
+        ...(existing ?? []).filter(row => row?.handle && typeof row.uuid === 'string'),
+      ];
+      let matchedUuid = null;
+      for (const row of registered) {
+        if (await sameEntry(handle, row.handle)) {
+          matchedUuid ??= row.uuid;
+          continue;
         }
+        // Always check every other registered handle (including legacy entries) for
+        // ancestor/descendant overlap before returning an existing or newly minted UUID.
+        if (await handlesOverlap(handle, row.handle)) {
+          throw error('EACCES', 'cannot mount a directory overlapping an already registered folder');
+        }
+      }
+
+      if (matchedUuid !== null) {
+        if (storedVersion !== STORE_FORMAT_VERSION) {
+          const wtx = openTransaction(db, ['meta'], 'readwrite', true);
+          wtx.objectStore('meta').put(STORE_FORMAT_VERSION, 'version');
+          await txDone(wtx);
+        }
+        return matchedUuid;
       }
 
       const uuid = crypto.randomUUID();
@@ -228,10 +248,9 @@ async function resolveDirectoryUuid(handle, { idb, locks }) {
         ]);
       } catch (err) {
         // Plain JS mock handles in unit tests have method functions and cannot be structured-cloned;
-        // retain them in the in-process handle table without failing mount admission.
+        // retain them in the per-IDB fallback table without failing mount admission.
         if (err?.name === 'DataCloneError' || /clone/i.test(err?.message ?? '')) {
-          nonCloneableHandles.set(handle, uuid);
-          nonCloneableRegistry.push({ uuid, handle });
+          fallback.rows.push({ uuid, handle });
           const vtx = openTransaction(db, ['meta'], 'readwrite', true);
           vtx.objectStore('meta').put(STORE_FORMAT_VERSION, 'version');
           await txDone(vtx);
@@ -633,19 +652,26 @@ function buildStore({
         }
 
         const fh = await parent.getFileHandle(name, { create: true });
-        await verifyConfined(fh);
-        if (truncate) {
-          await serializeFile(`path:${path}`, async () => {
-            const stream = await fh.createWritable({ keepExistingData: false });
-            try {
-              await stream.close();
-            } catch (err) {
-              await stream.abort().catch(() => {});
-              throw err;
-            }
-          });
+        try {
+          await verifyConfined(fh);
+          if (truncate) {
+            await serializeFile(`path:${path}`, async () => {
+              const stream = await fh.createWritable({ keepExistingData: false });
+              try {
+                await stream.close();
+              } catch (err) {
+                await stream.abort().catch(() => {});
+                throw err;
+              }
+            });
+          }
+          return await hostEntryFromFileHandle(fh);
+        } catch (err) {
+          if (createNew) {
+            await parent.removeEntry(name, { recursive: false }).catch(() => {});
+          }
+          throw err;
         }
-        return hostEntryFromFileHandle(fh);
       });
     },
 
@@ -662,7 +688,12 @@ function buildStore({
         }
         if (exists) throw error('EEXIST', 'entry already exists');
         const dh = await parent.getDirectoryHandle(name, { create: true });
-        await verifyConfined(dh);
+        try {
+          await verifyConfined(dh);
+        } catch (err) {
+          await parent.removeEntry(name, { recursive: false }).catch(() => {});
+          throw err;
+        }
         return dirHostEntry();
       });
     },
@@ -910,6 +941,9 @@ function buildStore({
             await srcParent.removeEntry(srcName, { recursive: false });
           }
         } catch (err) {
+          if (isDir) {
+            await dstParent.removeEntry(dstName, { recursive: true }).catch(() => {});
+          }
           if (removedDestDir) {
             await dstParent.getDirectoryHandle(dstName, { create: true }).catch(() => {});
           }
@@ -1219,7 +1253,7 @@ function buildStore({
         }
       };
 
-      const promise = new Promise(resolve => {
+      const promise = new Promise((resolve, reject) => {
         finishFn = () => {
           if (settled) return;
           cleanup();
@@ -1233,7 +1267,12 @@ function buildStore({
         for (const lockName of blockingLocks ?? []) {
           locks
             .request(lockName, { mode: 'shared', signal: controller.signal }, () => {})
-            .then(finishFn, () => {});
+            .then(finishFn, err => {
+              if (!settled && err?.name !== 'AbortError') {
+                cleanup();
+                reject(lockRefusal(err));
+              }
+            });
         }
       });
 
@@ -1267,7 +1306,12 @@ export async function createOpfsStore(handle, { execute = false, writable = true
     }
     const rel = await opfsRoot.resolve(rootHandle);
     if (rel === null) throw error('EACCES', 'handle is outside browser storage');
-    storeKey = rel.join('/') || 'root';
+    if (rel.length === 0) throw error('EACCES', 'cannot mount browser storage root');
+    if (rel[0] === 'os-orphans') throw error('EACCES', 'cannot mount internal orphan storage');
+    if (rel.length > 1) {
+      throw error('EACCES', 'cannot mount a nested subdirectory inside browser storage');
+    }
+    storeKey = rel[0];
   } else {
     rootHandle = await opfsRoot.getDirectoryHandle('os-workspace', { create: true });
   }
@@ -1301,6 +1345,12 @@ export async function createDirectoryStore(handle, { execute = false, writable =
   }
   if (typeof handle.queryPermission !== 'function') {
     throw error('ENOTSUP', 'directory permissions cannot be checked');
+  }
+  if (globalThis.navigator?.storage?.getDirectory) {
+    const opfsRoot = await navigator.storage.getDirectory().catch(() => null);
+    if (opfsRoot && (await opfsRoot.resolve(handle).catch(() => null)) !== null) {
+      throw error('EACCES', 'browser storage handles must use browser storage mount');
+    }
   }
 
   let perm;

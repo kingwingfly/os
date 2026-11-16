@@ -1,6 +1,7 @@
 use super::{
     Backing, Fingerprint, HostEntry, HostFs, HostKind, HostTree, InodeRecord, LockGuard, MetaBatch,
-    MetaStore, OpenEntry, ProfileLocks, ROOT_INO, STORE_FORMAT_VERSION, StoreHeader,
+    MetaStore, OpenEntry, PendingRename, PendingTruncate, ProfileLocks, ROOT_INO,
+    STORE_FORMAT_VERSION, StoreHeader,
 };
 use crate::{
     Access, Cred, DirEntry, Entry, FILE_MAX, FileType, Handle, LockKind, Metadata, NodeId,
@@ -17,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const PAGE_BYTES: u64 = 4096;
 const RW_MAX: usize = 0x7fff_f000;
 const CAPACITY_BLOCKS: u64 = (256 << 20) / PAGE_BYTES;
+const TRUNCATE_ROLLBACK_MAX: u64 = 16 * 1024 * 1024;
 
 fn join_rel(dir: &str, name: &str) -> String {
     if dir.is_empty() {
@@ -74,25 +76,45 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         Ok(())
     }
 
-    pub(super) async fn ns_lock(&self, kind: LockKind) -> Result<Option<Box<dyn LockGuard>>> {
+    pub(super) fn read_ns_kind(&self) -> LockKind {
+        match self.kind {
+            HostKind::Directory => LockKind::Exclusive,
+            HostKind::Opfs => LockKind::Shared,
+        }
+    }
+
+    async fn acquire_raw_ns(&self, kind: LockKind) -> Result<Box<dyn LockGuard>> {
         let name = format!("os-fs-ns:{}", self.uuid);
-        match self.locks.acquire(&name, kind).await {
-            Ok(guard) => Ok(Some(guard)),
-            Err(Errno::ENOLCK) => Ok(None),
-            Err(err) => Err(err),
+        self.locks.acquire(&name, kind).await
+    }
+
+    pub(super) async fn ns_lock(&self, kind: LockKind) -> Result<Box<dyn LockGuard>> {
+        loop {
+            let guard = self.acquire_raw_ns(kind).await?;
+            let has_pending = self
+                .meta
+                .read_header()
+                .await?
+                .is_some_and(|h| h.pending_rename.is_some() || h.pending_truncate.is_some());
+            if !has_pending {
+                return Ok(guard);
+            }
+            // A previous tab crashed mid-rename or mid-truncate: recover under Exclusive lock
+            // before any surviving tab reads stale state or starts another mutation.
+            if kind == LockKind::Exclusive {
+                self.recover_pending().await?;
+                return Ok(guard);
+            }
+            drop(guard);
+            let ex_guard = self.acquire_raw_ns(LockKind::Exclusive).await?;
+            self.recover_pending().await?;
+            drop(ex_guard);
         }
     }
 
     async fn acquire_open_guard(&self, ino: u64, open_id: u64) -> Result<Box<dyn LockGuard>> {
-        struct NoopGuard;
-        impl LockGuard for NoopGuard {}
-
         let name = format!("os-fs-open:{}:{ino}:{open_id}", self.uuid);
-        match self.locks.acquire(&name, LockKind::Exclusive).await {
-            Ok(guard) => Ok(guard),
-            Err(Errno::ENOLCK) => Ok(Box::new(NoopGuard)),
-            Err(err) => Err(err),
-        }
+        self.locks.acquire(&name, LockKind::Exclusive).await
     }
 
     async fn has_external_opens(&self, ino: u64) -> Result<bool> {
@@ -106,40 +128,132 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             return Ok(true);
         }
         let prefix = format!("os-fs-open:{}:{ino}:", self.uuid);
-        match self.locks.held_locks().await {
-            Ok(held) => Ok(held.iter().any(|name| name.starts_with(&prefix))),
-            Err(Errno::ENOLCK) => Ok(false),
-            Err(err) => Err(err),
+        let held = self.locks.held_locks().await?;
+        Ok(held.iter().any(|name| name.starts_with(&prefix)))
+    }
+
+    async fn recover_pending(&self) -> Result<()> {
+        let mut header = self.load_header().await?;
+        if header.pending_rename.is_none() && header.pending_truncate.is_none() {
+            return Ok(());
         }
+        let mut batch = MetaBatch::default();
+
+        if let Some(pr) = header.pending_rename.take()
+            && self.kind == HostKind::Opfs
+        {
+            let orphans: std::collections::HashSet<u64> =
+                self.tree.list_orphans().await?.into_iter().collect();
+            let from_exists = self.tree.stat_path(&pr.from_path).await?.is_some();
+            let to_exists = self.tree.stat_path(&pr.to_path).await?.is_some();
+            let staged_other_exists = match pr.staged_other_path.as_ref() {
+                Some(p) => self.tree.stat_path(p).await?.is_some(),
+                None => false,
+            };
+            let staged_orphan_exists =
+                matches!(pr.staged_target_ino, Some(ino) if orphans.contains(&ino));
+
+            // Never remove `to_path` when `from_exists && to_exists`: fallback copy staging
+            // can leave an incomplete orphan while `to_path` still holds the intact destination.
+            if pr.source_has_path && !from_exists && to_exists {
+                self.tree
+                    .move_entry(&pr.to_path, &pr.from_path, pr.is_dir)
+                    .await?;
+            }
+
+            if let Some(ref other) = pr.staged_other_path
+                && staged_other_exists
+                && self.tree.stat_path(&pr.to_path).await?.is_none()
+            {
+                self.tree.move_entry(other, &pr.to_path, false).await?;
+            }
+            if let Some(target_ino) = pr.staged_target_ino
+                && staged_orphan_exists
+                && self.tree.stat_path(&pr.to_path).await?.is_none()
+            {
+                self.tree.restore_orphan(target_ino, &pr.to_path).await?;
+            }
+            if pr.removed_empty_dir && self.tree.stat_path(&pr.to_path).await?.is_none() {
+                let _ = self.tree.create_dir(&pr.to_path).await;
+            }
+        }
+
+        if let Some(pt) = header.pending_truncate.take()
+            && let Some(mut inode) = self.meta.get_inode(pt.ino).await?
+            && !inode.removed()
+        {
+            let (expected_fp, expected_ino) = self.dir_expectation(&inode);
+            match self
+                .fail_if_stale(
+                    &inode,
+                    self.tree
+                        .set_file_len(&pt.backing, 0, expected_fp, expected_ino)
+                        .await,
+                )
+                .await
+            {
+                Ok(fp) => {
+                    inode.size = 0;
+                    inode.meta.size = 0;
+                    inode.meta.mode = pt.target_mode;
+                    if self.kind == HostKind::Directory {
+                        inode.fingerprint = Some(fp);
+                    }
+                    Self::touch(&mut inode, (self.clock)(), true);
+                    batch.put_inodes.push(inode);
+                }
+                Err(Errno::ENOENT | Errno::ESTALE) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        batch.header = Some(header);
+        self.meta.commit(batch, true).await
     }
 
     pub(super) async fn sweep_orphans(&self) -> Result<()> {
         let _ns = self.ns_lock(LockKind::Exclusive).await?;
-        let held = match self.locks.held_locks().await {
-            Ok(set) => set,
-            Err(Errno::ENOLCK) => return Ok(()),
-            Err(err) => return Err(err),
-        };
+        let held = self.locks.held_locks().await?;
+
+        let inodes = self.meta.list_all_inodes().await?;
+        let by_ino: BTreeMap<u64, &InodeRecord> = inodes.iter().map(|r| (r.ino, r)).collect();
         let orphans = self.tree.list_orphans().await?;
         let mut delete_inodes = Vec::new();
         let mut delete_locks = Vec::new();
         for ino in orphans {
+            // Restore still-linked files BEFORE checking open guards so interrupted unlinks
+            // repair `live_path` even while another tab holds an open descriptor.
+            if let Some(rec) = by_ino.get(&ino)
+                && (rec.nlink > 0 || matches!(rec.backing, Backing::Path(_)))
+            {
+                if let Backing::Path(ref live_path) = rec.backing
+                    && self.tree.stat_path(live_path).await?.is_none()
+                {
+                    self.tree.restore_orphan(ino, live_path).await?;
+                }
+                continue;
+            }
             let prefix = format!("os-fs-open:{}:{ino}:", self.uuid);
-            if !held.iter().any(|name| name.starts_with(&prefix)) {
-                self.tree.remove_orphan(ino).await?;
+            if held.iter().any(|name| name.starts_with(&prefix)) {
+                continue;
+            }
+            self.tree.remove_orphan(ino).await?;
+            if by_ino.contains_key(&ino) {
                 delete_inodes.push(ino);
                 delete_locks.push(ino);
             }
         }
-        for inode in self.meta.list_all_inodes().await? {
+        for inode in &inodes {
             if inode.ino != ROOT_INO && inode.nlink == 0 {
                 let prefix = format!("os-fs-open:{}:{}:", self.uuid, inode.ino);
                 if !held.iter().any(|name| name.starts_with(&prefix)) {
-                    if let Backing::Orphan(ino) = inode.backing {
-                        let _ = self.tree.remove_orphan(ino).await;
+                    if let Backing::Orphan(orphan_ino) = inode.backing {
+                        self.tree.remove_orphan(orphan_ino).await?;
                     }
-                    delete_inodes.push(inode.ino);
-                    delete_locks.push(inode.ino);
+                    if !delete_inodes.contains(&inode.ino) {
+                        delete_inodes.push(inode.ino);
+                        delete_locks.push(inode.ino);
+                    }
                 }
             }
         }
@@ -438,6 +552,10 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                             if self.tree.stat_path(bp).await?.is_some() {
                                 return Ok(Some(child));
                             }
+                            if child.nlink > 0 && self.tree.list_orphans().await?.contains(&ino) {
+                                self.tree.restore_orphan(ino, bp).await?;
+                                return Ok(Some(child));
+                            }
                             // Backing OPFS entry disappeared externally: prune stale mapping.
                             dir.entries.remove(name);
                             if child.meta.directory {
@@ -672,15 +790,24 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         Ok(access)
     }
 
-    async fn register_open(
+    async fn prepare_open(
         &self,
         header: &mut StoreHeader,
+        ino: u64,
+    ) -> Result<(u64, Box<dyn LockGuard>)> {
+        let id = Self::alloc_open_id(header)?;
+        let guard = self.acquire_open_guard(ino, id).await?;
+        Ok((id, guard))
+    }
+
+    fn commit_open(
+        &self,
+        id: u64,
+        guard: Box<dyn LockGuard>,
         cred: &Cred,
         ino: u64,
         access: Access,
-    ) -> Result<OpenRef> {
-        let id = Self::alloc_open_id(header)?;
-        let guard = self.acquire_open_guard(ino, id).await?;
+    ) -> OpenRef {
         self.local.borrow_mut().opens.insert(
             id,
             OpenEntry {
@@ -690,7 +817,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                 _open_guard: guard,
             },
         );
-        Ok(OpenRef {
+        OpenRef {
             fs: self.id.clone(),
             id,
             node: NodeId {
@@ -698,7 +825,201 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                 generation: self.generation,
             },
             access,
-        })
+        }
+    }
+
+    async fn finish_open_existing(
+        &self,
+        cred: &Cred,
+        inode: InodeRecord,
+        options: &OpenOptions,
+        access: Access,
+    ) -> Result<(Entry, OpenRef)> {
+        let old_header = self.load_header().await?;
+        let mut header = old_header.clone();
+        let (open_id, open_guard) = self.prepare_open(&mut header, inode.ino).await?;
+        let truncate_reg =
+            access != Access::Path && options.is_truncate() && inode.file_type() == FileType::File;
+
+        if !truncate_reg {
+            if let Err(err) = self
+                .meta
+                .commit(
+                    MetaBatch {
+                        header: Some(header),
+                        ..MetaBatch::default()
+                    },
+                    false,
+                )
+                .await
+            {
+                drop(open_guard);
+                return Err(err);
+            }
+            let open = self.commit_open(open_id, open_guard, cred, inode.ino, access);
+            return Ok((self.make_entry(&inode), open));
+        }
+
+        let old_inode = inode.clone();
+        let (expected_fp, expected_ino) = self.dir_expectation(&inode);
+        let trunc_backup = if inode.size > 0 && inode.size <= TRUNCATE_ROLLBACK_MAX {
+            Some(
+                self.fail_if_stale(
+                    &inode,
+                    self.tree
+                        .read_file(
+                            &inode.backing,
+                            0,
+                            inode.size as usize,
+                            expected_fp,
+                            expected_ino,
+                        )
+                        .await,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        let mut post_trunc = inode.clone();
+        post_trunc.size = 0;
+        post_trunc.meta.size = 0;
+        inode::remove_privs(&cred.identity, &mut post_trunc.meta);
+        Self::touch(&mut post_trunc, (self.clock)(), true);
+
+        let pt = PendingTruncate {
+            ino: inode.ino,
+            backing: inode.backing.clone(),
+            target_mode: post_trunc.meta.mode,
+        };
+        header.pending_truncate = Some(pt.clone());
+
+        // Persist `pending_truncate` + `open_id` BEFORE touching host bytes (without shrinking
+        // `inode.size` prematurely): commit errors never truncate any file size, and crashes
+        // before Commit 1 reconcile host & metadata under `recover_pending`.
+        if let Err(err) = self
+            .meta
+            .commit(
+                MetaBatch {
+                    header: Some(header.clone()),
+                    ..MetaBatch::default()
+                },
+                true,
+            )
+            .await
+        {
+            drop(open_guard);
+            return Err(err);
+        }
+
+        let fp = match self
+            .fail_if_stale(
+                &old_inode,
+                self.tree
+                    .set_file_len(&inode.backing, 0, expected_fp, expected_ino)
+                    .await,
+            )
+            .await
+        {
+            Ok(fp) => fp,
+            Err(err) => {
+                let put_inodes = if err == Errno::ESTALE && self.kind == HostKind::Directory {
+                    let mut stale = old_inode;
+                    stale.stale = true;
+                    vec![stale]
+                } else {
+                    Vec::new()
+                };
+                let _ = self
+                    .meta
+                    .commit(
+                        MetaBatch {
+                            header: Some(old_header),
+                            put_inodes,
+                            ..MetaBatch::default()
+                        },
+                        true,
+                    )
+                    .await;
+                drop(open_guard);
+                return Err(err);
+            }
+        };
+
+        header.pending_truncate = None;
+        if self.kind == HostKind::Directory {
+            post_trunc.fingerprint = Some(fp);
+        }
+        if let Err(err) = self
+            .meta
+            .commit(
+                MetaBatch {
+                    header: Some(header),
+                    put_inodes: vec![post_trunc],
+                    ..MetaBatch::default()
+                },
+                true,
+            )
+            .await
+        {
+            let mut rollback_header = old_header;
+            let mut rollback_inode = old_inode;
+            let dir_fp = (self.kind == HostKind::Directory).then_some(fp);
+            let dir_ino = (self.kind == HostKind::Directory).then_some(rollback_inode.ino);
+            let put_inodes = match trunc_backup {
+                Some(ref old_bytes) => {
+                    match self
+                        .tree
+                        .write_file(
+                            &rollback_inode.backing,
+                            0,
+                            old_bytes,
+                            false,
+                            dir_fp,
+                            dir_ino,
+                        )
+                        .await
+                    {
+                        Ok((_, restored_fp)) => {
+                            if self.kind == HostKind::Directory {
+                                rollback_inode.fingerprint = Some(restored_fp);
+                            }
+                            vec![rollback_inode]
+                        }
+                        Err(_) => Vec::new(),
+                    }
+                }
+                None if rollback_inode.size == 0 => {
+                    if self.kind == HostKind::Directory {
+                        rollback_inode.fingerprint = Some(fp);
+                    }
+                    vec![rollback_inode]
+                }
+                None => {
+                    // >16 MiB file was already truncated on disk: keep `pending_truncate` armed so
+                    // the next namespace operation reconciles metadata to size 0 cleanly.
+                    rollback_header.pending_truncate = Some(pt);
+                    Vec::new()
+                }
+            };
+            let _ = self
+                .meta
+                .commit(
+                    MetaBatch {
+                        header: Some(rollback_header),
+                        put_inodes,
+                        ..MetaBatch::default()
+                    },
+                    true,
+                )
+                .await;
+            drop(open_guard);
+            return Err(err);
+        }
+
+        let open = self.commit_open(open_id, open_guard, cred, inode.ino, access);
+        Ok((self.make_entry(&inode), open))
     }
 
     pub(super) fn get_open_info(&self, open: &OpenRef) -> Result<(u64, Access, Identity)> {
@@ -773,7 +1094,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
 
     pub(super) async fn do_parent(&self, dir: &Handle) -> Result<Option<(Entry, String)>> {
         self.ensure_version().await?;
-        let _ns = self.ns_lock(LockKind::Shared).await?;
+        let _ns = self.ns_lock(self.read_ns_kind()).await?;
         let inode = self.check_live_inode(dir).await?;
         if !inode.meta.directory {
             return Err(Errno::ENOTDIR);
@@ -796,7 +1117,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
 
     pub(super) async fn do_metadata(&self, handle: &Handle) -> Result<Metadata> {
         self.ensure_version().await?;
-        let _ns = self.ns_lock(LockKind::Shared).await?;
+        let _ns = self.ns_lock(self.read_ns_kind()).await?;
         let inode = self.check_live_inode(handle).await?;
         Ok(Self::metadata_of(&inode))
     }
@@ -804,7 +1125,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
     pub(super) async fn do_open_metadata(&self, open: &OpenRef) -> Result<Metadata> {
         self.ensure_version().await?;
         let (ino, _, _) = self.get_open_info(open)?;
-        let _ns = self.ns_lock(LockKind::Shared).await?;
+        let _ns = self.ns_lock(self.read_ns_kind()).await?;
         let inode = self.validate_inode_by_id(ino).await?;
         Ok(Self::metadata_of(&inode))
     }
@@ -970,49 +1291,17 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         check_component(name)?;
         Self::require_searchable(cred, &dir_rec)?;
 
-        if let Some(mut existing) = self.resolve_child(&mut dir_rec, name).await? {
+        if let Some(existing) = self.resolve_child(&mut dir_rec, name).await? {
             if options.is_create_new() {
                 return Err(Errno::EEXIST);
             }
             if existing.meta.directory {
                 return Err(Errno::EISDIR);
             }
-            self.check_openable(cred, &existing, options)?;
-            let mut header = self.load_header().await?;
-            let mut put_inodes = Vec::new();
-            if options.is_truncate() && existing.file_type() == FileType::File {
-                let (expected_fp, expected_ino) = self.dir_expectation(&existing);
-                let fp = self
-                    .fail_if_stale(
-                        &existing,
-                        self.tree
-                            .set_file_len(&existing.backing, 0, expected_fp, expected_ino)
-                            .await,
-                    )
-                    .await?;
-                existing.size = 0;
-                existing.meta.size = 0;
-                if self.kind == HostKind::Directory {
-                    existing.fingerprint = Some(fp);
-                }
-                inode::remove_privs(&cred.identity, &mut existing.meta);
-                Self::touch(&mut existing, (self.clock)(), true);
-                put_inodes.push(existing.clone());
-            }
-            let open = self
-                .register_open(&mut header, cred, existing.ino, access)
-                .await?;
-            self.meta
-                .commit(
-                    MetaBatch {
-                        header: Some(header),
-                        put_inodes,
-                        ..MetaBatch::default()
-                    },
-                    false,
-                )
-                .await?;
-            return Ok((self.make_entry(&existing), open));
+            let access = self.check_openable(cred, &existing, options)?;
+            return self
+                .finish_open_existing(cred, existing, options, access)
+                .await;
         }
 
         self.require_writable_grant()?;
@@ -1020,11 +1309,21 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         let Backing::Path(dir_path) = dir_rec.backing.clone() else {
             return Err(Errno::ENOENT);
         };
-        let child_path = join_rel(&dir_path, name);
-        let host = self.tree.create_file(&child_path, true, true).await?;
-
         let mut header = self.load_header().await?;
         let ino = Self::alloc_ino(&mut header)?;
+        let (open_id, open_guard) = self.prepare_open(&mut header, ino).await?;
+        let child_path = join_rel(&dir_path, name);
+        let host = match self.tree.create_file(&child_path, true, true).await {
+            Ok(host) => host,
+            Err(err) => {
+                if err != Errno::EEXIST {
+                    let _ = self.tree.remove_file(&child_path).await;
+                }
+                drop(open_guard);
+                return Err(err);
+            }
+        };
+
         let mut meta = created(&cred.identity, &dir_rec.meta, mode, false, cred.umask);
         meta.ino = ino;
         let now = (self.clock)();
@@ -1050,12 +1349,16 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         dir_rec.entries.insert(name.to_string(), ino);
         Self::touch(&mut dir_rec, now, true);
 
-        let open = self.register_open(&mut header, cred, ino, access).await?;
         let entry = self.make_entry(&child);
-        if self.kind == HostKind::Directory {
-            self.tree.retain_host_entry(ino, &child_path, false).await?;
+        if self.kind == HostKind::Directory
+            && let Err(err) = self.tree.retain_host_entry(ino, &child_path, false).await
+        {
+            let _ = self.tree.remove_file(&child_path).await;
+            drop(open_guard);
+            return Err(err);
         }
-        self.meta
+        if let Err(err) = self
+            .meta
             .commit(
                 MetaBatch {
                     header: Some(header),
@@ -1064,7 +1367,16 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                 },
                 false,
             )
-            .await?;
+            .await
+        {
+            if self.kind == HostKind::Directory {
+                let _ = self.tree.forget_host_entry(ino).await;
+            }
+            let _ = self.tree.remove_file(&child_path).await;
+            drop(open_guard);
+            return Err(err);
+        }
+        let open = self.commit_open(open_id, open_guard, cred, ino, access);
         Ok((entry, open))
     }
 
@@ -1088,11 +1400,19 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         let Backing::Path(dir_path) = dir_rec.backing.clone() else {
             return Err(Errno::ENOENT);
         };
-        let child_path = join_rel(&dir_path, name);
-        let host = self.tree.create_dir(&child_path).await?;
-
         let mut header = self.load_header().await?;
         let ino = Self::alloc_ino(&mut header)?;
+        let child_path = join_rel(&dir_path, name);
+        let host = match self.tree.create_dir(&child_path).await {
+            Ok(host) => host,
+            Err(err) => {
+                if err != Errno::EEXIST {
+                    let _ = self.tree.remove_dir(&child_path).await;
+                }
+                return Err(err);
+            }
+        };
+
         let mut meta = created(&cred.identity, &dir_rec.meta, mode, true, cred.umask);
         meta.ino = ino;
         let now = (self.clock)();
@@ -1117,10 +1437,14 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         dir_rec.nlink += 1;
         Self::touch(&mut dir_rec, now, true);
         let entry = self.make_entry(&child);
-        if self.kind == HostKind::Directory {
-            self.tree.retain_host_entry(ino, &child_path, true).await?;
+        if self.kind == HostKind::Directory
+            && let Err(err) = self.tree.retain_host_entry(ino, &child_path, true).await
+        {
+            let _ = self.tree.remove_dir(&child_path).await;
+            return Err(err);
         }
-        self.meta
+        if let Err(err) = self
+            .meta
             .commit(
                 MetaBatch {
                     header: Some(header),
@@ -1129,7 +1453,14 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                 },
                 false,
             )
-            .await?;
+            .await
+        {
+            if self.kind == HostKind::Directory {
+                let _ = self.tree.forget_host_entry(ino).await;
+            }
+            let _ = self.tree.remove_dir(&child_path).await;
+            return Err(err);
+        }
         Ok(entry)
     }
 
@@ -1311,18 +1642,24 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         victim: &mut InodeRecord,
         unlinked_path: &str,
         extra_modified: &mut BTreeMap<u64, InodeRecord>,
-    ) -> Result<bool> {
+    ) -> Result<(bool, Option<UndoTargetMove>, Option<u64>)> {
         if victim.meta.directory {
             self.tree.remove_dir(unlinked_path).await?;
             victim.nlink = 0;
             if self.kind == HostKind::Directory {
                 victim.stale = true;
                 self.tree.forget_host_entry(victim.ino).await?;
-                return Ok(false);
+                return Ok((false, None, None));
             }
             victim.backing = Backing::MetaOnly;
-            let keep = self.has_external_opens(victim.ino).await?;
-            return Ok(!keep);
+            let keep = match self.has_external_opens(victim.ino).await {
+                Ok(keep) => keep,
+                Err(err) => {
+                    let _ = self.tree.create_dir(unlinked_path).await;
+                    return Err(err);
+                }
+            };
+            return Ok((!keep, None, None));
         }
 
         victim.nlink = victim.nlink.saturating_sub(1);
@@ -1331,20 +1668,28 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             victim.stale = true;
             victim.nlink = 0;
             self.tree.forget_host_entry(victim.ino).await?;
-            return Ok(false);
+            return Ok((false, None, None));
         }
 
         // OPFS regular file / symlink / device.
         match victim.backing.clone() {
-            Backing::MetaOnly | Backing::Orphan(_) => {
+            Backing::MetaOnly => {
                 if victim.nlink == 0 {
                     let keep = self.has_external_opens(victim.ino).await?;
-                    return Ok(!keep);
+                    return Ok((!keep, None, None));
                 }
-                Ok(false)
+                Ok((false, None, None))
+            }
+            Backing::Orphan(orphan_ino) => {
+                if victim.nlink == 0 {
+                    let keep = self.has_external_opens(victim.ino).await?;
+                    return Ok((!keep, None, (!keep).then_some(orphan_ino)));
+                }
+                Ok((false, None, None))
             }
             Backing::Path(bp) => {
                 if victim.nlink > 0 {
+                    let mut undo = None;
                     if bp == unlinked_path {
                         // Move backing OPFS file to another surviving link of this inode.
                         let (other_dir_ino, other_name) =
@@ -1362,16 +1707,32 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                         };
                         let other_path = join_rel(&other_dir_path, &other_name);
                         self.tree.move_entry(&bp, &other_path, false).await?;
-                        victim.backing = Backing::Path(other_path);
+                        victim.backing = Backing::Path(other_path.clone());
+                        undo = Some(UndoTargetMove::ToPath {
+                            from: other_path,
+                            to: bp,
+                        });
                     }
-                    Ok(false)
-                } else if self.has_external_opens(victim.ino).await? {
-                    self.tree.move_to_orphan(&bp, victim.ino).await?;
-                    victim.backing = Backing::Orphan(victim.ino);
-                    Ok(false)
+                    Ok((false, undo, None))
                 } else {
-                    self.tree.remove_file(&bp).await?;
-                    Ok(true)
+                    // Stage single-link regular unlink into `/os-orphans` first so commit
+                    // failures can restore `unlinked_path` cleanly instead of losing data.
+                    self.tree.move_to_orphan(&bp, victim.ino).await?;
+                    let undo = UndoTargetMove::ToOrphan {
+                        ino: victim.ino,
+                        to: bp.clone(),
+                    };
+                    match self.has_external_opens(victim.ino).await {
+                        Ok(true) => {
+                            victim.backing = Backing::Orphan(victim.ino);
+                            Ok((false, Some(undo), None))
+                        }
+                        Ok(false) => Ok((true, Some(undo), Some(victim.ino))),
+                        Err(err) => {
+                            let _ = self.tree.restore_orphan(victim.ino, &bp).await;
+                            Err(err)
+                        }
+                    }
                 }
             }
         }
@@ -1421,7 +1782,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         victim.ctime = now;
 
         let mut modified = BTreeMap::from([(dir_rec.ino, dir_rec)]);
-        let delete_victim = self
+        let (delete_victim, undo_evac, cleanup_orphan_ino) = self
             .evacuate_or_remove_unlinked_link(&mut victim, &victim_path, &mut modified)
             .await?;
 
@@ -1433,7 +1794,23 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             modified.insert(victim.ino, victim);
         }
         batch.put_inodes = modified.into_values().collect();
-        self.meta.commit(batch, false).await
+        if let Err(err) = self.meta.commit(batch, self.kind == HostKind::Opfs).await {
+            let _ = self
+                .rollback_rename_host(
+                    false,
+                    &victim_path,
+                    &victim_path,
+                    directory,
+                    undo_evac,
+                    directory && self.kind == HostKind::Opfs,
+                )
+                .await;
+            return Err(err);
+        }
+        if let Some(orphan_ino) = cleanup_orphan_ino {
+            let _ = self.tree.remove_orphan(orphan_ino).await;
+        }
+        Ok(())
     }
 
     async fn is_ancestor(&self, ancestor_ino: u64, mut ino: u64) -> Result<bool> {
@@ -1449,6 +1826,57 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                 _ => return Ok(false),
             }
         }
+    }
+}
+
+enum UndoTargetMove {
+    ToPath { from: String, to: String },
+    ToOrphan { ino: u64, to: String },
+}
+
+impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
+    async fn clear_pending_rename(&self) {
+        if let Ok(mut header) = self.load_header().await
+            && header.pending_rename.take().is_some()
+        {
+            let _ = self
+                .meta
+                .commit(
+                    MetaBatch {
+                        header: Some(header),
+                        ..MetaBatch::default()
+                    },
+                    false,
+                )
+                .await;
+        }
+    }
+
+    async fn rollback_rename_host(
+        &self,
+        move_back: bool,
+        from_path: &str,
+        to_path: &str,
+        is_dir: bool,
+        undo_target: Option<UndoTargetMove>,
+        recreate_empty_dir: bool,
+    ) -> Result<()> {
+        if move_back {
+            self.tree.move_entry(to_path, from_path, is_dir).await?;
+        }
+        match undo_target {
+            Some(UndoTargetMove::ToPath { from, to }) => {
+                self.tree.move_entry(&from, &to, false).await?;
+            }
+            Some(UndoTargetMove::ToOrphan { ino, to }) => {
+                self.tree.restore_orphan(ino, &to).await?;
+            }
+            None => {}
+        }
+        if recreate_empty_dir && self.tree.stat_path(to_path).await?.is_none() {
+            self.tree.create_dir(to_path).await?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1489,8 +1917,13 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             from_parent = to_parent.clone();
         }
 
+        self.require_writable_grant()?;
         if existing.is_some() && flags.contains(RenameFlags::NOREPLACE) {
             return Err(Errno::EEXIST);
+        }
+        inode::may_delete(who, &from_parent.meta, &source.meta)?;
+        if let Some(ref target) = existing {
+            inode::may_delete(who, &to_parent.meta, &target.meta)?;
         }
         if existing.as_ref().map(|e| e.ino) == Some(source.ino) {
             return Ok(());
@@ -1500,10 +1933,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         if moving_dir && self.is_ancestor(source.ino, to_parent.ino).await? {
             return Err(Errno::EINVAL);
         }
-        self.require_writable_grant()?;
-        inode::may_delete(who, &from_parent.meta, &source.meta)?;
         if let Some(ref target) = existing {
-            inode::may_delete(who, &to_parent.meta, &target.meta)?;
             match (moving_dir, target.meta.directory) {
                 (true, false) => return Err(Errno::ENOTDIR),
                 (false, true) => return Err(Errno::EISDIR),
@@ -1565,87 +1995,181 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             modified.insert(to_parent.ino, to_parent.clone());
         }
 
-        enum UndoTargetMove {
-            ToPath { from: String, to: String },
-            ToOrphan { ino: u64, to: String },
-        }
-
         let source_has_path =
             moving_dir || matches!(&source.backing, Backing::Path(bp) if bp == &from_path);
+        let removed_empty_dir = existing
+            .as_ref()
+            .is_some_and(|target| target.meta.directory);
+
+        // Pre-compute OPFS staging plan and persist durable `PendingRename` intent BEFORE any host
+        // move or orphan evacuation runs, so crash/reload or commit failure never loses user data.
+        let mut staged_header: Option<StoreHeader> = None;
+        let mut planned_other_path: Option<String> = None;
+        let mut planned_orphan_ino: Option<u64> = None;
+        if self.kind == HostKind::Opfs && (source_has_path || existing.is_some()) {
+            if let Some(ref target) = existing
+                && !target.meta.directory
+                && matches!(&target.backing, Backing::Path(bp) if bp == &to_path)
+            {
+                let mut remaining = target.parents.clone();
+                remaining.remove(&(to_parent.ino, to.to_string()));
+                if target.nlink > 1 {
+                    let (other_dir_ino, other_name) =
+                        remaining.iter().next().cloned().ok_or(Errno::EIO)?;
+                    let other_dir = if let Some(d) = modified.get(&other_dir_ino) {
+                        d.clone()
+                    } else {
+                        self.meta
+                            .get_inode(other_dir_ino)
+                            .await?
+                            .ok_or(Errno::EIO)?
+                    };
+                    let Backing::Path(other_dir_path) = other_dir.backing else {
+                        return Err(Errno::EIO);
+                    };
+                    planned_other_path = Some(join_rel(&other_dir_path, &other_name));
+                } else {
+                    // Stage single-link regular destinations (both open and closed) to orphan
+                    // storage before moving/replacing, so commit failures/crashes never lose bytes.
+                    planned_orphan_ino = Some(target.ino);
+                }
+            }
+            let mut header = self.load_header().await?;
+            header.pending_rename = Some(PendingRename {
+                from_path: from_path.clone(),
+                to_path: to_path.clone(),
+                is_dir: moving_dir,
+                source_has_path,
+                staged_target_ino: planned_orphan_ino,
+                staged_other_path: planned_other_path.clone(),
+                removed_empty_dir,
+            });
+            self.meta
+                .commit(
+                    MetaBatch {
+                        header: Some(header.clone()),
+                        ..MetaBatch::default()
+                    },
+                    true,
+                )
+                .await?;
+            staged_header = Some(header);
+        }
+
         let mut undo_target = None;
         let mut forgotten_targets = Vec::new();
+        let mut cleanup_orphans_after_commit = Vec::new();
 
-        // If `move_entry` will overwrite `to_path` directly, only stage away a hard-linked or open
-        // OPFS target so a failed `move_entry` (e.g., `EDQUOT`) never loses the destination.
         if let Some(mut target) = existing {
             target.parents.remove(&(to_parent.ino, to.to_string()));
             target.ctime = now;
-            if source_has_path {
-                if !target.meta.directory && self.kind == HostKind::Opfs {
-                    target.nlink = target.nlink.saturating_sub(1);
-                    if let Backing::Path(bp) = target.backing.clone()
-                        && bp == to_path
-                    {
-                        if target.nlink > 0 {
-                            let (other_dir_ino, other_name) =
-                                target.parents.iter().next().cloned().ok_or(Errno::EIO)?;
-                            let other_dir = if let Some(d) = modified.get(&other_dir_ino) {
-                                d.clone()
-                            } else {
-                                self.meta
-                                    .get_inode(other_dir_ino)
-                                    .await?
-                                    .ok_or(Errno::EIO)?
-                            };
-                            let Backing::Path(other_dir_path) = other_dir.backing else {
-                                return Err(Errno::EIO);
-                            };
-                            let other_path = join_rel(&other_dir_path, &other_name);
-                            self.tree.move_entry(&bp, &other_path, false).await?;
-                            target.backing = Backing::Path(other_path.clone());
-                            undo_target = Some(UndoTargetMove::ToPath {
-                                from: other_path,
-                                to: to_path.clone(),
-                            });
-                            modified.insert(target.ino, target);
-                        } else if self.has_external_opens(target.ino).await? {
-                            self.tree.move_to_orphan(&bp, target.ino).await?;
-                            target.backing = Backing::Orphan(target.ino);
-                            undo_target = Some(UndoTargetMove::ToOrphan {
-                                ino: target.ino,
-                                to: to_path.clone(),
-                            });
-                            modified.insert(target.ino, target);
+            if !target.meta.directory && self.kind == HostKind::Opfs {
+                target.nlink = target.nlink.saturating_sub(1);
+                if let Backing::Path(bp) = target.backing.clone()
+                    && bp == to_path
+                {
+                    if let Some(other_path) = planned_other_path {
+                        if let Err(err) = self.tree.move_entry(&bp, &other_path, false).await {
+                            self.clear_pending_rename().await;
+                            return Err(err);
+                        }
+                        target.backing = Backing::Path(other_path.clone());
+                        undo_target = Some(UndoTargetMove::ToPath {
+                            from: other_path,
+                            to: to_path.clone(),
+                        });
+                        modified.insert(target.ino, target);
+                    } else if let Some(orphan_ino) = planned_orphan_ino {
+                        if let Err(err) = self.tree.move_to_orphan(&bp, orphan_ino).await {
+                            self.clear_pending_rename().await;
+                            return Err(err);
+                        }
+                        target.backing = Backing::Orphan(orphan_ino);
+                        undo_target = Some(UndoTargetMove::ToOrphan {
+                            ino: orphan_ino,
+                            to: to_path.clone(),
+                        });
+                        if target.nlink == 0 {
+                            match self.has_external_opens(target.ino).await {
+                                Ok(true) => {
+                                    modified.insert(target.ino, target);
+                                }
+                                Ok(false) => {
+                                    delete_inodes.push(target.ino);
+                                    delete_locks.push(target.ino);
+                                    cleanup_orphans_after_commit.push(orphan_ino);
+                                }
+                                Err(err) => {
+                                    self.tree.restore_orphan(orphan_ino, &to_path).await?;
+                                    self.clear_pending_rename().await;
+                                    return Err(err);
+                                }
+                            }
                         } else {
+                            modified.insert(target.ino, target);
+                        }
+                    }
+                } else if target.nlink == 0 {
+                    match self.has_external_opens(target.ino).await {
+                        Ok(true) => {
+                            modified.insert(target.ino, target);
+                        }
+                        Ok(false) => {
+                            if let Backing::Orphan(orphan_ino) = target.backing {
+                                cleanup_orphans_after_commit.push(orphan_ino);
+                            }
                             delete_inodes.push(target.ino);
                             delete_locks.push(target.ino);
                         }
-                    } else if target.nlink == 0 && !self.has_external_opens(target.ino).await? {
-                        delete_inodes.push(target.ino);
-                        delete_locks.push(target.ino);
-                    } else {
-                        modified.insert(target.ino, target);
+                        Err(err) => {
+                            self.clear_pending_rename().await;
+                            return Err(err);
+                        }
                     }
                 } else {
-                    target.nlink = 0;
-                    if self.kind == HostKind::Directory {
-                        target.stale = true;
-                        forgotten_targets.push(target.ino);
-                        modified.insert(target.ino, target);
-                    } else {
-                        target.backing = Backing::MetaOnly;
-                        if self.has_external_opens(target.ino).await? {
+                    modified.insert(target.ino, target);
+                }
+            } else if source_has_path {
+                target.nlink = 0;
+                if self.kind == HostKind::Directory {
+                    target.stale = true;
+                    forgotten_targets.push(target.ino);
+                    modified.insert(target.ino, target);
+                } else {
+                    // Empty destination directory replaced on OPFS by `move_entry`.
+                    target.backing = Backing::MetaOnly;
+                    match self.has_external_opens(target.ino).await {
+                        Ok(true) => {
                             modified.insert(target.ino, target);
-                        } else {
+                        }
+                        Ok(false) => {
                             delete_inodes.push(target.ino);
                             delete_locks.push(target.ino);
+                        }
+                        Err(err) => {
+                            self.clear_pending_rename().await;
+                            return Err(err);
                         }
                     }
                 }
             } else {
-                let delete_target = self
+                // `Directory` or non-backing `Opfs` replace over a non-path target.
+                let (delete_target, evac_undo, evac_orphan) = match self
                     .evacuate_or_remove_unlinked_link(&mut target, &to_path, &mut modified)
-                    .await?;
+                    .await
+                {
+                    Ok(res) => res,
+                    Err(err) => {
+                        self.clear_pending_rename().await;
+                        return Err(err);
+                    }
+                };
+                if undo_target.is_none() {
+                    undo_target = evac_undo;
+                }
+                if let Some(orphan_ino) = evac_orphan {
+                    cleanup_orphans_after_commit.push(orphan_ino);
+                }
                 if delete_target {
                     delete_inodes.push(target.ino);
                     delete_locks.push(target.ino);
@@ -1665,15 +2189,16 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                     fps
                 }
                 Err(err) => {
-                    match undo_target {
-                        Some(UndoTargetMove::ToPath { from, to }) => {
-                            let _ = self.tree.move_entry(&from, &to, false).await;
-                        }
-                        Some(UndoTargetMove::ToOrphan { ino, to }) => {
-                            let _ = self.tree.restore_orphan(ino, &to).await;
-                        }
-                        None => {}
-                    }
+                    self.rollback_rename_host(
+                        false,
+                        &from_path,
+                        &to_path,
+                        moving_dir,
+                        undo_target,
+                        false,
+                    )
+                    .await?;
+                    self.clear_pending_rename().await;
                     return Err(err);
                 }
             }
@@ -1695,7 +2220,23 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                 moved_retains.push((source.ino, to_path.clone(), true));
             }
             let prefix = format!("{from_path}/");
-            for mut rec in self.meta.list_all_inodes().await? {
+            let all_inodes = match self.meta.list_all_inodes().await {
+                Ok(list) => list,
+                Err(err) => {
+                    self.rollback_rename_host(
+                        source_has_path,
+                        &from_path,
+                        &to_path,
+                        moving_dir,
+                        undo_target,
+                        source_has_path && removed_empty_dir,
+                    )
+                    .await?;
+                    self.clear_pending_rename().await;
+                    return Err(err);
+                }
+            };
+            for mut rec in all_inodes {
                 if rec.ino == source.ino || modified.contains_key(&rec.ino) {
                     continue;
                 }
@@ -1726,17 +2267,39 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         Self::touch(&mut source, now, false);
         modified.insert(source.ino, source);
 
-        self.meta
+        let strict_rename = staged_header.is_some();
+        if let Some(ref mut h) = staged_header {
+            h.pending_rename = None;
+        }
+        if let Err(err) = self
+            .meta
             .commit(
                 MetaBatch {
+                    header: staged_header,
                     put_inodes: modified.into_values().collect(),
                     delete_inodes,
                     delete_locks,
                     ..MetaBatch::default()
                 },
-                false,
+                strict_rename,
+            )
+            .await
+        {
+            self.rollback_rename_host(
+                source_has_path,
+                &from_path,
+                &to_path,
+                moving_dir,
+                undo_target,
+                source_has_path && removed_empty_dir,
             )
             .await?;
+            self.clear_pending_rename().await;
+            return Err(err);
+        }
+        for orphan_ino in cleanup_orphans_after_commit {
+            let _ = self.tree.remove_orphan(orphan_ino).await;
+        }
         if self.kind == HostKind::Directory {
             for ino in forgotten_targets {
                 self.tree.forget_host_entry(ino).await?;
@@ -1756,7 +2319,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
     ) -> Result<Vec<u8>> {
         self.ensure_version().await?;
         let space = xattr::space(name)?;
-        let _ns = self.ns_lock(LockKind::Shared).await?;
+        let _ns = self.ns_lock(self.read_ns_kind()).await?;
         let inode = self.check_live_inode(handle).await?;
         xattr::readable(&cred.identity, &inode.meta, space)?;
         match space {
@@ -1807,7 +2370,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
 
     pub(super) async fn do_listxattr(&self, cred: &Cred, handle: &Handle) -> Result<Vec<String>> {
         self.ensure_version().await?;
-        let _ns = self.ns_lock(LockKind::Shared).await?;
+        let _ns = self.ns_lock(self.read_ns_kind()).await?;
         let inode = self.check_live_inode(handle).await?;
         Ok(xattr::listed(
             &cred.identity,
@@ -1870,41 +2433,10 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
     ) -> Result<OpenRef> {
         self.ensure_version().await?;
         let _ns = self.ns_lock(LockKind::Exclusive).await?;
-        let mut inode = self.check_live_inode(handle).await?;
+        let inode = self.check_live_inode(handle).await?;
         let access = self.check_openable(cred, &inode, options)?;
-        let mut header = self.load_header().await?;
-        let mut put_inodes = Vec::new();
-        if access != Access::Path && options.is_truncate() && inode.file_type() == FileType::File {
-            let (expected_fp, expected_ino) = self.dir_expectation(&inode);
-            let fp = self
-                .fail_if_stale(
-                    &inode,
-                    self.tree
-                        .set_file_len(&inode.backing, 0, expected_fp, expected_ino)
-                        .await,
-                )
-                .await?;
-            inode.size = 0;
-            inode.meta.size = 0;
-            if self.kind == HostKind::Directory {
-                inode.fingerprint = Some(fp);
-            }
-            inode::remove_privs(&cred.identity, &mut inode.meta);
-            Self::touch(&mut inode, (self.clock)(), true);
-            put_inodes.push(inode.clone());
-        }
-        let open = self
-            .register_open(&mut header, cred, inode.ino, access)
-            .await?;
-        self.meta
-            .commit(
-                MetaBatch {
-                    header: Some(header),
-                    put_inodes,
-                    ..MetaBatch::default()
-                },
-                false,
-            )
+        let (_, open) = self
+            .finish_open_existing(cred, inode, options, access)
             .await?;
         Ok(open)
     }
@@ -1928,7 +2460,12 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         if !access.reads() {
             return Err(Errno::EBADF);
         }
-        let _ns = self.ns_lock(LockKind::Shared).await?;
+        let ns_kind = if self.kind == HostKind::Directory || !self.grant.read_only {
+            LockKind::Exclusive
+        } else {
+            LockKind::Shared
+        };
+        let _ns = self.ns_lock(ns_kind).await?;
         let mut inode = self.validate_inode_by_id(ino).await?;
         Self::require_regular_file(&inode)?;
         if offset > FILE_MAX || buf.len() as u64 > FILE_MAX - offset {
@@ -2114,9 +2651,16 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
     pub(super) async fn do_release(&self, open: &OpenRef) -> Result<()> {
         let (ino, _, _) = self.get_open_info(open)?;
         // First release any advisory locks held by this open description.
-        let _ = self.release_open_locks(ino, open.id).await;
+        let lock_res = self.release_open_locks(ino, open.id).await;
 
-        let _ns = self.ns_lock(LockKind::Exclusive).await?;
+        let _ns = match self.ns_lock(LockKind::Exclusive).await {
+            Ok(ns) => ns,
+            Err(err) => {
+                // Still retire the local descriptor & Web Lock guard even if coordinator failed.
+                self.local.borrow_mut().opens.remove(&open.id);
+                return Err(err);
+            }
+        };
         // Remove local OpenEntry (dropping its `os-fs-open:<uuid>:<ino>:<open_id>` Web Lock guard).
         self.local.borrow_mut().opens.remove(&open.id);
 
@@ -2139,6 +2683,6 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                 )
                 .await?;
         }
-        Ok(())
+        lock_res
     }
 }
