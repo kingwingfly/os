@@ -2,7 +2,7 @@ import { test, expect } from './storage-test.js';
 import http from 'node:http';
 import { execFileSync } from 'node:child_process';
 import { accessSync, constants as fsConstants, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
-import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -661,7 +661,7 @@ test('Store format versioning (§2.12): older format resets metadata once preser
     const root = await navigator.storage.getDirectory();
     const handle = await root.getDirectoryHandle('os-workspace', { create: true });
 
-    // 1. Write user file & custom metadata under current format version (2)
+    // 1. Write user file & custom metadata under current format version (3)
     const ws1 = new Workspace({ id: 'v1', uid: 1000, gid: 1000, groups: [1000] });
     ws1.scope = ws1.scope();
     globalThis.ws = ws1;
@@ -708,8 +708,274 @@ test('Store format versioning (§2.12): older format resets metadata once preser
     modeAfterUpgrade: 0o600,
     xattrAfterUpgrade: 'ENODATA',
     bytesAfterUpgrade: 'precious user bytes',
-    upgradedVersion: 2,
+    upgradedVersion: 3,
     futureMountErr: 'EPROTONOSUPPORT',
     untouchedFutureVersion: 99,
   });
+});
+
+test('OPFS and directory mounts refuse overlapping subpaths/ancestors, and cross-tab unlock wakes blocked lock waiters without closing fd', async ({ page, context }) => {
+  const hostParent = await mkdtemp(join(tmpdir(), 'os-hostfs-overlap-'));
+  await mkdir(join(hostParent, 'nested'), { recursive: true });
+  await writeFile(join(hostParent, 'nested', 'data.txt'), 'secret');
+  const hostParent2 = await mkdtemp(join(tmpdir(), 'os-hostfs-desc-'));
+  await mkdir(join(hostParent2, 'inner'), { recursive: true });
+  await writeFile(join(hostParent2, 'inner', 'secret.txt'), 'parent-owned');
+
+  const tab1 = page;
+  const tab2 = await context.newPage();
+  await setupTab(tab1);
+  await setupTab(tab2);
+
+  try {
+    // 1. OPFS rejects root, `os-orphans`, and nested `os-workspace/*` subdirs; permits `os-workspace`.
+    const opfsChecks = await tab1.evaluate(async () => {
+      const opfsRoot = await navigator.storage.getDirectory();
+      const wsDir = await opfsRoot.getDirectoryHandle('os-workspace', { create: true });
+      const nestedDir = await wsDir.getDirectoryHandle('sub', { create: true });
+      const orphanDir = await opfsRoot.getDirectoryHandle('os-orphans', { create: true });
+
+      const ws = new Workspace({ id: 'opfs-ov', uid: 1000, gid: 1000, groups: [1000] });
+      ws.scope = ws.scope();
+
+      const tryMount = async (name, handle) => ws
+        .mount({ name, handle, originPrivate: true, writable: true, execute: false, cloud: false })
+        .then(() => null, err => err.errno);
+
+      const rootErr = await tryMount('badroot', opfsRoot);
+      const orphanErr = await tryMount('badorph', orphanDir);
+      const subErr = await tryMount('badsub', nestedDir);
+      const okErr = await tryMount('work', wsDir);
+
+      // Keep a locked file ready for cross-tab unlock wakeup test below.
+      const opened = await callOne(ws, { open: { path: '/mnt/local/work/wake.txt', flags: 0o1102, mode: 0o600 } });
+      await callOne(ws, { try_lock: { fd: opened.fd, family: 'flock', kind: 'exclusive' } });
+      globalThis.wakeWs = ws;
+      globalThis.wakeFd = opened.fd;
+      return { rootErr, orphanErr, subErr, okErr };
+    });
+    expect(opfsChecks).toEqual({
+      rootErr: 'EACCES',
+      orphanErr: 'EACCES',
+      subErr: 'EACCES',
+      okErr: null,
+    });
+
+    // 2. Cross-tab `unlock` while keeping fd open immediately wakes a blocked waiter in tab 2!
+    await tab2.evaluate(async () => {
+      const root = await navigator.storage.getDirectory();
+      const wsDir = await root.getDirectoryHandle('os-workspace', { create: false });
+      const ws2 = new Workspace({ id: 'opfs-w2', uid: 1000, gid: 1000, groups: [1000] });
+      ws2.scope = ws2.scope();
+      await ws2.mount({ name: 'peer', handle: wsDir, originPrivate: true, writable: true, execute: false, cloud: false });
+      const opened = await callOne(ws2, { open: { path: '/mnt/local/peer/wake.txt', flags: 2 } });
+      globalThis.peerWs = ws2;
+      globalThis.peerFd = opened.fd;
+      globalThis.peerBlockingLock = callOne(ws2, { lock: { fd: opened.fd, family: 'flock', kind: 'exclusive' } }).then(() => 'unlocked-woke');
+    });
+
+    // Give tab 2 a tick to enqueue in IndexedDB and enter wait_for_change.
+    await tab1.waitForTimeout(150);
+
+    // Tab 1 unlocks WITHOUT closing `wakeFd`!
+    await tab1.evaluate(async () => {
+      await callOne(globalThis.wakeWs, { unlock: { fd: globalThis.wakeFd, family: 'flock' } });
+    });
+    const wokeResult = await tab2.evaluate(() => globalThis.peerBlockingLock);
+    expect(wokeResult).toBe('unlocked-woke');
+
+    await tab1.evaluate(async () => {
+      await callOne(globalThis.wakeWs, { close: { fd: globalThis.wakeFd } });
+      globalThis.wakeWs.close();
+    });
+    await tab2.evaluate(async () => {
+      await callOne(globalThis.peerWs, { unlock: { fd: globalThis.peerFd, family: 'flock' } });
+      await callOne(globalThis.peerWs, { close: { fd: globalThis.peerFd } });
+      globalThis.peerWs.close();
+    });
+
+    // 3. Directory handles reject descendant/ancestor overlaps against already-registered handles.
+    const cdp = await context.newCDPSession(tab1);
+    await tab1.evaluate(() => {
+      globalThis.droppedFolder = new Promise(resolve => {
+        window.addEventListener('drop', async e => {
+          e.preventDefault();
+          const item = e.dataTransfer?.items?.[0];
+          resolve(await item.getAsFileSystemHandle());
+        }, { once: true });
+        window.addEventListener('dragover', e => e.preventDefault());
+      });
+      FileSystemHandle.prototype.queryPermission = async () => 'granted';
+    });
+    for (const type of ['dragEnter', 'dragOver', 'drop']) {
+      await cdp.send('Input.dispatchDragEvent', {
+        type,
+        x: 200,
+        y: 200,
+        data: { items: [], files: [hostParent], dragOperationsMask: 1 },
+      });
+    }
+    const dirOverlap = await tab1.evaluate(async () => {
+      const parentHandle = await globalThis.droppedFolder;
+      const subHandle = await parentHandle.getDirectoryHandle('nested', { create: false });
+      const ws = new Workspace({ id: 'dir-ov', uid: 1000, gid: 1000, groups: [1000] });
+      ws.scope = ws.scope();
+
+      // Mount `nested` first, then ensure mounting ancestor `parentHandle` fails with EACCES while exact `subHandle` succeeds!
+      await ws.mount({ name: 'child', handle: subHandle, originPrivate: false, writable: true, execute: false, cloud: false });
+      const ancestorErr = await ws
+        .mount({ name: 'anc', handle: parentHandle, originPrivate: false, writable: true, execute: false, cloud: false })
+        .then(() => null, err => err.errno);
+      await ws.mount({ name: 'same', handle: subHandle, originPrivate: false, writable: true, execute: false, cloud: false });
+      ws.close();
+      return { ancestorErr };
+    });
+    expect(dirOverlap).toEqual({ ancestorErr: 'EACCES' });
+
+    // Reverse overlap direction: mount parent first, then verify descendant subdirectory is refused!
+    await tab1.evaluate(() => {
+      globalThis.droppedFolder2 = new Promise(resolve => {
+        window.addEventListener('drop', async e => {
+          e.preventDefault();
+          const item = e.dataTransfer?.items?.[0];
+          resolve(await item.getAsFileSystemHandle());
+        }, { once: true });
+        window.addEventListener('dragover', e => e.preventDefault());
+      });
+    });
+    for (const type of ['dragEnter', 'dragOver', 'drop']) {
+      await cdp.send('Input.dispatchDragEvent', {
+        type,
+        x: 200,
+        y: 200,
+        data: { items: [], files: [hostParent2], dragOperationsMask: 1 },
+      });
+    }
+    const descOverlap = await tab1.evaluate(async () => {
+      const parentHandle = await globalThis.droppedFolder2;
+      const subHandle = await parentHandle.getDirectoryHandle('inner', { create: false });
+      const ws = new Workspace({ id: 'dir-desc', uid: 1000, gid: 1000, groups: [1000] });
+      ws.scope = ws.scope();
+
+      await ws.mount({ name: 'rootdir', handle: parentHandle, originPrivate: false, writable: true, execute: false, cloud: false });
+      const descErr = await ws
+        .mount({ name: 'childdir', handle: subHandle, originPrivate: false, writable: true, execute: false, cloud: false })
+        .then(() => null, err => err.errno);
+      ws.close();
+      return { descErr };
+    });
+    expect(descOverlap).toEqual({ descErr: 'EACCES' });
+  } finally {
+    await tab2.close();
+    await rm(hostParent, { recursive: true, force: true });
+    await rm(hostParent2, { recursive: true, force: true });
+  }
+});
+
+test('pre-existing overlapping dir handles fail closed on remount and failed createFile cleans stray OPFS entries', async ({ page }) => {
+  await setupTab(page);
+
+  const hostParent = await mkdtemp(join(tmpdir(), 'os-hostfs-legacy-ov-'));
+  await mkdir(join(hostParent, 'nested'), { recursive: true });
+  try {
+    // 1. Codex #6: Pre-existing overlapping handles in `os-fs-handles` IDB (parent + child)
+    // must still be refused with EACCES when remounting child via exact `isSameEntry` match.
+    const cdp = await page.context().newCDPSession(page);
+    await page.evaluate(() => {
+      globalThis.droppedLegacy = new Promise(resolve => {
+        window.addEventListener('drop', async e => {
+          e.preventDefault();
+          resolve(await e.dataTransfer?.items?.[0].getAsFileSystemHandle());
+        }, { once: true });
+        window.addEventListener('dragover', e => e.preventDefault());
+      });
+      FileSystemHandle.prototype.queryPermission = async () => 'granted';
+    });
+    for (const type of ['dragEnter', 'dragOver', 'drop']) {
+      await cdp.send('Input.dispatchDragEvent', {
+        type,
+        x: 200,
+        y: 200,
+        data: { items: [], files: [hostParent], dragOperationsMask: 1 },
+      });
+    }
+
+    const legacyOverlapErr = await page.evaluate(async () => {
+      const parentHandle = await globalThis.droppedLegacy;
+      const subHandle = await parentHandle.getDirectoryHandle('nested', { create: false });
+      const ws1 = new Workspace({ id: 'ov-seed', uid: 1000, gid: 1000, groups: [1000] });
+      ws1.scope = ws1.scope();
+      await ws1.mount({ name: 'p', handle: parentHandle, originPrivate: false, writable: true, execute: false, cloud: false });
+      ws1.close();
+
+      await new Promise((resolve, reject) => {
+        const req = indexedDB.open('os-fs-handles', 1);
+        req.onsuccess = () => {
+          const db = req.result;
+          const tx = db.transaction('handles', 'readwrite');
+          tx.objectStore('handles').put({
+            uuid: '11111111-2222-4333-8444-555555555555',
+            handle: subHandle,
+            createdAt: Date.now(),
+          });
+          tx.oncomplete = () => {
+            db.close();
+            resolve();
+          };
+          tx.onerror = () => reject(tx.error);
+        };
+        req.onerror = () => reject(req.error);
+      });
+
+      const ws2 = new Workspace({ id: 'ov-remount', uid: 1000, gid: 1000, groups: [1000] });
+      ws2.scope = ws2.scope();
+      const errno = await ws2
+        .mount({ name: 'c', handle: subHandle, originPrivate: false, writable: true, execute: false, cloud: false })
+        .then(() => null, err => err.errno);
+      ws2.close();
+      return errno;
+    });
+    expect(legacyOverlapErr).toBe('EACCES');
+
+    // 2. Codex #8: `createFile(..., createNew: true)` removes stray OPFS host entry when
+    // `createWritable` / `stream.close` fails with quota error so O_EXCL retry succeeds.
+    const createCleanupResult = await page.evaluate(async () => {
+      const root = await navigator.storage.getDirectory();
+      const handle = await root.getDirectoryHandle('os-workspace', { create: true });
+      const ws = new Workspace({ id: 'opfs-c8', uid: 1000, gid: 1000, groups: [1000] });
+      ws.scope = ws.scope();
+      await ws.mount({ name: 'work', handle, originPrivate: true, writable: true, execute: true, cloud: false });
+
+      const origCreateWritable = FileSystemFileHandle.prototype.createWritable;
+      let armed = true;
+      FileSystemFileHandle.prototype.createWritable = async function (...args) {
+        if (armed && this.name === 'quota-stray.txt') {
+          armed = false;
+          throw new DOMException('Quota exceeded', 'QuotaExceededError');
+        }
+        return origCreateWritable.apply(this, args);
+      };
+      let firstErr = null;
+      try {
+        firstErr = await callErr(ws, { open: { path: '/mnt/local/work/quota-stray.txt', flags: 0o302, mode: 0o600 } });
+      } finally {
+        FileSystemFileHandle.prototype.createWritable = origCreateWritable;
+      }
+
+      const presentOnHost = await handle.getFileHandle('quota-stray.txt').then(() => true, () => false);
+      const retry = await callOne(ws, { open: { path: '/mnt/local/work/quota-stray.txt', flags: 0o302, mode: 0o600 } });
+      await callOne(ws, { pwrite: { fd: retry.fd, offset: 0, data: b64('clean-retry') } });
+      await callOne(ws, { close: { fd: retry.fd } });
+      const readBack = unb64((await callOne(ws, { pread: { path: '/mnt/local/work/quota-stray.txt', offset: 0, count: 32 } })).data);
+      ws.close();
+      return { firstErr, presentOnHost, readBack };
+    });
+    expect(createCleanupResult).toEqual({
+      firstErr: 'EDQUOT',
+      presentOnHost: false,
+      readBack: 'clean-retry',
+    });
+  } finally {
+    await rm(hostParent, { recursive: true, force: true });
+  }
 });

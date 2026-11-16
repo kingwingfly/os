@@ -3,7 +3,9 @@ use abi::{ACL_ACCESS, ACL_DEFAULT, Errno, Time};
 use os_core::acl::Entries;
 use os_core::permissions::Identity;
 use os_vfs::hostfs::mem::SimProfile;
-use os_vfs::hostfs::{HostFs, HostGrant, STORE_FORMAT_VERSION};
+use os_vfs::hostfs::{
+    Backing, HostFs, HostGrant, PendingRename, PendingTruncate, STORE_FORMAT_VERSION,
+};
 use os_vfs::stat::stat as vfs_stat;
 use os_vfs::{
     Cred, FileType, Filesystem, LockFamily, LockKind, LockRange, OpenOptions, RenameFlags, SetAttr,
@@ -1402,5 +1404,1159 @@ fn directory_external_replacement_invalidates_handle_and_resets_descendants_acro
                 .await,
             Err(Errno::ENODATA)
         );
+    });
+}
+
+#[test]
+fn commit_failure_rolls_back_open_guard_created_files_and_truncations() {
+    let owner = user(1, 1, &[1], 0o022);
+    let sim = SimProfile::new();
+
+    block_on(async {
+        let fs = sim
+            .mount_opfs(1, grant(&owner, false, true), 1)
+            .await
+            .unwrap();
+        let (f, o) = fs
+            .create(
+                &owner,
+                &fs.root(),
+                "keep.txt",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        fs.write_at(&o, b"KEEP_ME", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        fs.release(&o).await.unwrap();
+
+        // 1. Existing-file `open(O_TRUNC)` commit failure restores bytes, releases lock, and allows reopen!
+        sim.set_commit_error(Some(Errno::EDQUOT));
+        assert_eq!(
+            fs.open(
+                &owner,
+                &f.handle,
+                OpenOptions::new().read(true).write(true).truncate(true),
+            )
+            .await,
+            Err(Errno::EDQUOT)
+        );
+        sim.set_commit_error(None);
+        assert_eq!(sim.held_lock_count("os-fs-open:"), 0);
+        assert_eq!(
+            sim.external_read("keep.txt").as_deref(),
+            Some(b"KEEP_ME".as_slice())
+        );
+
+        let reopened = fs
+            .open(&owner, &f.handle, OpenOptions::new().read(true).write(true))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let n = fs.read_at(&reopened, &mut buf, 0).await.unwrap();
+        assert_eq!(&buf[..n], b"KEEP_ME");
+        fs.release(&reopened).await.unwrap();
+
+        // 2. Existing-file `create(O_TRUNC)` commit failure also restores bytes and leaks no lock!
+        sim.set_commit_error(Some(Errno::EDQUOT));
+        assert_eq!(
+            fs.create(
+                &owner,
+                &fs.root(),
+                "keep.txt",
+                0o600,
+                OpenOptions::new().read(true).write(true).truncate(true),
+            )
+            .await
+            .map(|_| ()),
+            Err(Errno::EDQUOT)
+        );
+        sim.set_commit_error(None);
+        assert_eq!(sim.held_lock_count("os-fs-open:"), 0);
+        assert_eq!(
+            sim.external_read("keep.txt").as_deref(),
+            Some(b"KEEP_ME".as_slice())
+        );
+
+        // 3. New-file `create` commit failure removes stray disk file and leaks no Web Lock!
+        sim.set_commit_error(Some(Errno::EDQUOT));
+        assert_eq!(
+            fs.create(
+                &owner,
+                &fs.root(),
+                "stray.txt",
+                0o600,
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .create_new(true),
+            )
+            .await
+            .map(|_| ()),
+            Err(Errno::EDQUOT)
+        );
+        sim.set_commit_error(None);
+        assert_eq!(sim.held_lock_count("os-fs-open:"), 0);
+        assert_eq!(sim.external_read("stray.txt"), None);
+
+        let (_, o_retry) = fs
+            .create(
+                &owner,
+                &fs.root(),
+                "stray.txt",
+                0o600,
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .create_new(true),
+            )
+            .await
+            .unwrap();
+        fs.release(&o_retry).await.unwrap();
+
+        // 4. `mkdir` commit failure removes stray directory!
+        sim.set_commit_error(Some(Errno::EDQUOT));
+        assert_eq!(
+            fs.mkdir(&owner, &fs.root(), "straydir", 0o755).await,
+            Err(Errno::EDQUOT)
+        );
+        sim.set_commit_error(None);
+        assert!(!sim.host_paths().contains(&"straydir".to_string()));
+    });
+}
+
+#[test]
+fn do_lock_arms_wakeup_before_releasing_lock_mutex_and_unblocks_without_fd_close() {
+    let owner = user(1, 1, &[1], 0o022);
+    let sim = SimProfile::new();
+
+    let (tab1, tab2, o1, o2) = block_on(async {
+        let tab1 = sim
+            .mount_opfs(1, grant(&owner, false, true), 1)
+            .await
+            .unwrap();
+        let tab2 = sim
+            .mount_opfs(2, grant(&owner, false, true), 2)
+            .await
+            .unwrap();
+        let (_, o1) = tab1
+            .create(
+                &owner,
+                &tab1.root(),
+                "wake",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        let f2 = tab2.lookup(&owner, &tab2.root(), "wake").await.unwrap();
+        let o2 = tab2
+            .open(
+                &owner,
+                &f2.handle,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        (tab1, tab2, o1, o2)
+    });
+
+    block_on(tab1.try_lock(
+        &o1,
+        LockFamily::Flock,
+        LockKind::Exclusive,
+        LockRange::WHOLE,
+    ))
+    .unwrap();
+
+    let mut wait2 = Box::pin(tab2.lock(
+        &o2,
+        LockFamily::Flock,
+        LockKind::Exclusive,
+        LockRange::WHOLE,
+    ));
+    assert!(poll_once(&mut wait2).is_pending());
+    // Waiter has armed wakeup AND released `os-fs-lock` before suspending!
+    assert_eq!(sim.held_lock_count("os-fs-lock:"), 0);
+
+    // Unlock WITHOUT closing `o1` (`o1`'s `os-fs-open` lock remains held): `wait2` must wake!
+    block_on(tab1.unlock(&o1, LockFamily::Flock, LockRange::WHOLE)).unwrap();
+    assert_eq!(poll_once(&mut wait2), Poll::Ready(Ok(())));
+    drop(wait2);
+    let _ = tab2;
+}
+
+#[test]
+fn opfs_replacement_rename_crash_and_rollback_preserve_open_destination() {
+    let owner = user(1, 1, &[1], 0o022);
+
+    // 1. Mid-rename final commit failure rolls back BOTH source move and open destination orphan!
+    {
+        let sim = SimProfile::new();
+        let (fs, dst_ino, o_dst) = block_on(async {
+            let fs = sim
+                .mount_opfs(1, grant(&owner, false, true), 1)
+                .await
+                .unwrap();
+            let (_, o_src) = fs
+                .create(
+                    &owner,
+                    &fs.root(),
+                    "src",
+                    0o600,
+                    OpenOptions::new().read(true).write(true),
+                )
+                .await
+                .unwrap();
+            let (dst, o_dst) = fs
+                .create(
+                    &owner,
+                    &fs.root(),
+                    "dst",
+                    0o600,
+                    OpenOptions::new().read(true).write(true),
+                )
+                .await
+                .unwrap();
+            fs.write_at(&o_src, b"NEW_SRC", WriteAt::Offset(0))
+                .await
+                .unwrap();
+            fs.write_at(&o_dst, b"PRECIOUS_DST", WriteAt::Offset(0))
+                .await
+                .unwrap();
+            fs.release(&o_src).await.unwrap();
+            (fs, dst.handle.node.ino, o_dst)
+        });
+
+        // Commit 0 = `pending_rename` succeeds; commit 1 = final rename batch fails `EDQUOT`!
+        sim.set_fail_commit_after(Some(1), Errno::EDQUOT);
+        assert_eq!(
+            block_on(fs.rename(
+                &owner,
+                &fs.root(),
+                "src",
+                &fs.root(),
+                "dst",
+                RenameFlags::empty(),
+            )),
+            Err(Errno::EDQUOT)
+        );
+        assert!(sim.orphan_ids().is_empty());
+        assert_eq!(
+            sim.external_read("src").as_deref(),
+            Some(b"NEW_SRC".as_slice())
+        );
+        assert_eq!(
+            sim.external_read("dst").as_deref(),
+            Some(b"PRECIOUS_DST".as_slice())
+        );
+        assert!(sim.raw_header().and_then(|h| h.pending_rename).is_none());
+        let mut buf = [0u8; 16];
+        let n = block_on(fs.read_at(&o_dst, &mut buf, 0)).unwrap();
+        assert_eq!(&buf[..n], b"PRECIOUS_DST");
+        assert_eq!(sim.raw_inode(dst_ino).unwrap().nlink, 1);
+    }
+
+    // 2. `restore_orphan` failure on rollback propagates error and keeps durable `pending_rename`
+    // so the next mount's `sweep_orphans()` repairs `dst` without deleting `/os-orphans`!
+    {
+        let sim = SimProfile::new();
+        let (fs, o_dst) = block_on(async {
+            let fs = sim
+                .mount_opfs(1, grant(&owner, false, true), 1)
+                .await
+                .unwrap();
+            let (_, o_src) = fs
+                .create(
+                    &owner,
+                    &fs.root(),
+                    "src",
+                    0o600,
+                    OpenOptions::new().read(true).write(true),
+                )
+                .await
+                .unwrap();
+            let (_, o_dst) = fs
+                .create(
+                    &owner,
+                    &fs.root(),
+                    "dst",
+                    0o600,
+                    OpenOptions::new().read(true).write(true),
+                )
+                .await
+                .unwrap();
+            fs.write_at(&o_src, b"NEW_SRC", WriteAt::Offset(0))
+                .await
+                .unwrap();
+            fs.write_at(&o_dst, b"PRECIOUS_DST", WriteAt::Offset(0))
+                .await
+                .unwrap();
+            fs.release(&o_src).await.unwrap();
+            (fs, o_dst)
+        });
+
+        sim.set_quota_exceeded(true);
+        sim.set_restore_orphan_error(Some(Errno::EIO));
+        assert_eq!(
+            block_on(fs.rename(
+                &owner,
+                &fs.root(),
+                "src",
+                &fs.root(),
+                "dst",
+                RenameFlags::empty(),
+            )),
+            Err(Errno::EIO)
+        );
+        sim.set_quota_exceeded(false);
+        sim.set_restore_orphan_error(None);
+        drop(o_dst);
+        drop(fs);
+        sim.crash_tab(1);
+
+        // Next mount sweeps and restores `dst` instead of deleting the orphan!
+        let recovered = block_on(sim.mount_opfs(2, grant(&owner, false, true), 2)).unwrap();
+        assert!(sim.orphan_ids().is_empty());
+        assert_eq!(
+            sim.external_read("dst").as_deref(),
+            Some(b"PRECIOUS_DST".as_slice())
+        );
+        assert!(sim.raw_header().and_then(|h| h.pending_rename).is_none());
+        let dst_e = block_on(recovered.lookup(&owner, &recovered.root(), "dst")).unwrap();
+        let o2 =
+            block_on(recovered.open(&owner, &dst_e.handle, OpenOptions::new().read(true))).unwrap();
+        let mut buf = [0u8; 16];
+        let n = block_on(recovered.read_at(&o2, &mut buf, 0)).unwrap();
+        assert_eq!(&buf[..n], b"PRECIOUS_DST");
+    }
+
+    // 3. Even WITHOUT `pending_rename`, an orphan file whose inode record still shows `nlink > 0`
+    // is never deleted by `sweep_orphans()`.
+    {
+        let sim = SimProfile::new();
+        let dst_ino = block_on(async {
+            let fs = sim
+                .mount_opfs(1, grant(&owner, false, true), 1)
+                .await
+                .unwrap();
+            let (dst, o_dst) = fs
+                .create(
+                    &owner,
+                    &fs.root(),
+                    "live",
+                    0o600,
+                    OpenOptions::new().read(true).write(true),
+                )
+                .await
+                .unwrap();
+            fs.write_at(&o_dst, b"KEEP_LIVE", WriteAt::Offset(0))
+                .await
+                .unwrap();
+            fs.release(&o_dst).await.unwrap();
+            dst.handle.node.ino
+        });
+        sim.put_external_orphan(dst_ino, b"STAGED_COPY");
+        let _remount = block_on(sim.mount_opfs(2, grant(&owner, false, true), 2)).unwrap();
+        assert_eq!(sim.orphan_ids(), vec![dst_ino]);
+    }
+}
+
+#[test]
+fn same_inode_rename_checks_rofs_and_may_delete_before_noop() {
+    let owner = user(1, 1, &[1], 0o022);
+    let bob = user(2, 2, &[2], 0o022);
+    let sim = SimProfile::new();
+
+    block_on(async {
+        let rw = sim
+            .mount_opfs(1, grant(&owner, false, true), 1)
+            .await
+            .unwrap();
+        let d = rw.mkdir(&owner, &rw.root(), "d", 0o755).await.unwrap();
+        let (a, o) = rw
+            .create(
+                &owner,
+                &d.handle,
+                "a",
+                0o644,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        rw.release(&o).await.unwrap();
+        rw.link(&owner, &a.handle, &d.handle, "b").await.unwrap();
+
+        // Non-owner (`bob`) lacks write on `d` (0o755) -> EACCES on same-name AND hardlink rename!
+        assert_eq!(
+            rw.rename(&bob, &d.handle, "a", &d.handle, "a", RenameFlags::empty())
+                .await,
+            Err(Errno::EACCES)
+        );
+        assert_eq!(
+            rw.rename(&bob, &d.handle, "a", &d.handle, "b", RenameFlags::empty())
+                .await,
+            Err(Errno::EACCES)
+        );
+        // Owner can no-op rename("a", "a") and gets EEXIST for RENAME_NOREPLACE on hardlink "b".
+        rw.rename(&owner, &d.handle, "a", &d.handle, "a", RenameFlags::empty())
+            .await
+            .unwrap();
+        assert_eq!(
+            rw.rename(
+                &owner,
+                &d.handle,
+                "a",
+                &d.handle,
+                "b",
+                RenameFlags::NOREPLACE
+            )
+            .await,
+            Err(Errno::EEXIST)
+        );
+
+        // Read-only grant fails closed with EROFS on same-name and hardlink rename!
+        let ro = sim
+            .mount_opfs(2, grant(&owner, true, false), 2)
+            .await
+            .unwrap();
+        let ro_d = ro.lookup(&owner, &ro.root(), "d").await.unwrap();
+        assert_eq!(
+            ro.rename(
+                &owner,
+                &ro_d.handle,
+                "a",
+                &ro_d.handle,
+                "a",
+                RenameFlags::empty(),
+            )
+            .await,
+            Err(Errno::EROFS)
+        );
+        assert_eq!(
+            ro.rename(
+                &owner,
+                &ro_d.handle,
+                "a",
+                &ro_d.handle,
+                "b",
+                RenameFlags::empty(),
+            )
+            .await,
+            Err(Errno::EROFS)
+        );
+    });
+}
+
+#[test]
+fn hostfs_fails_closed_on_enolck_and_does_not_delete_open_backing() {
+    let owner = user(1, 1, &[1], 0o022);
+    let sim = SimProfile::new();
+
+    block_on(async {
+        let locks1 = sim.locks_handle(1);
+        let locks2 = sim.locks_handle(2);
+        let tab1 = HostFs::opfs(
+            grant(&owner, false, true),
+            1,
+            sim.tree_handle(),
+            sim.meta_handle(),
+            locks1.clone(),
+            sim.clock(),
+        )
+        .await
+        .unwrap();
+        let tab2 = HostFs::opfs(
+            grant(&owner, false, true),
+            2,
+            sim.tree_handle(),
+            sim.meta_handle(),
+            locks2.clone(),
+            sim.clock(),
+        )
+        .await
+        .unwrap();
+
+        let (_, o1) = tab1
+            .create(
+                &owner,
+                &tab1.root(),
+                "protected.txt",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        tab1.write_at(&o1, b"MUST_SURVIVE", WriteAt::Offset(0))
+            .await
+            .unwrap();
+
+        // Losing Web Locks mid-session must fail namespace mutations & opens with ENOLCK,
+        // NOT bypass mutual exclusion or delete open backing data!
+        locks2.set_unavailable(true);
+        assert_eq!(
+            tab2.create(
+                &owner,
+                &tab2.root(),
+                "excl.txt",
+                0o600,
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .create_new(true),
+            )
+            .await
+            .map(|_| ()),
+            Err(Errno::ENOLCK)
+        );
+        assert_eq!(
+            tab2.unlink(&owner, &tab2.root(), "protected.txt").await,
+            Err(Errno::ENOLCK)
+        );
+        assert_eq!(
+            sim.external_read("protected.txt").as_deref(),
+            Some(b"MUST_SURVIVE".as_slice())
+        );
+
+        let mut buf = [0u8; 16];
+        let n = tab1.read_at(&o1, &mut buf, 0).await.unwrap();
+        assert_eq!(&buf[..n], b"MUST_SURVIVE");
+
+        locks1.set_unavailable(true);
+        assert_eq!(tab1.release(&o1).await, Err(Errno::ENOLCK));
+        // Even on ENOLCK release, the local open guard was still retired cleanly.
+        assert_eq!(sim.held_lock_count("os-fs-open:"), 0);
+    });
+}
+
+#[test]
+fn codex1_pending_rename_recovery_preserves_intact_destination_across_partial_or_repeated_recovery()
+{
+    let owner = user(1, 1, &[1], 0o022);
+
+    // 1. Crash after committing `pending_rename` BEFORE `move_to_orphan` / `move_entry`,
+    // or repeated recovery after `restore_orphan` already deleted the orphan:
+    // `to_path` has no backup elsewhere and must NEVER be deleted!
+    {
+        let sim = SimProfile::new();
+        let dst_ino = block_on(async {
+            let fs = sim
+                .mount_opfs(1, grant(&owner, false, true), 1)
+                .await
+                .unwrap();
+            let (_, o_src) = fs
+                .create(
+                    &owner,
+                    &fs.root(),
+                    "src",
+                    0o600,
+                    OpenOptions::new().read(true).write(true),
+                )
+                .await
+                .unwrap();
+            let (dst, o_dst) = fs
+                .create(
+                    &owner,
+                    &fs.root(),
+                    "dst",
+                    0o600,
+                    OpenOptions::new().read(true).write(true),
+                )
+                .await
+                .unwrap();
+            fs.write_at(&o_src, b"NEW_SRC", WriteAt::Offset(0))
+                .await
+                .unwrap();
+            fs.write_at(&o_dst, b"PRECIOUS_DST", WriteAt::Offset(0))
+                .await
+                .unwrap();
+            fs.release(&o_src).await.unwrap();
+            fs.release(&o_dst).await.unwrap();
+            dst.handle.node.ino
+        });
+
+        let mut header = sim.raw_header().unwrap();
+        header.pending_rename = Some(PendingRename {
+            from_path: "src".into(),
+            to_path: "dst".into(),
+            is_dir: false,
+            source_has_path: true,
+            staged_target_ino: Some(dst_ino),
+            staged_other_path: None,
+            removed_empty_dir: false,
+        });
+        sim.set_raw_header(header);
+        sim.crash_tab(1);
+
+        let tab2 = block_on(sim.mount_opfs(2, grant(&owner, false, true), 2)).unwrap();
+        assert!(sim.raw_header().and_then(|h| h.pending_rename).is_none());
+        assert_eq!(
+            sim.external_read("src").as_deref(),
+            Some(b"NEW_SRC".as_slice())
+        );
+        assert_eq!(
+            sim.external_read("dst").as_deref(),
+            Some(b"PRECIOUS_DST".as_slice())
+        );
+        let dst_e = block_on(tab2.lookup(&owner, &tab2.root(), "dst")).unwrap();
+        let o2 = block_on(tab2.open(&owner, &dst_e.handle, OpenOptions::new().read(true))).unwrap();
+        let mut buf = [0u8; 16];
+        let n = block_on(tab2.read_at(&o2, &mut buf, 0)).unwrap();
+        assert_eq!(&buf[..n], b"PRECIOUS_DST");
+        block_on(tab2.release(&o2)).unwrap();
+
+        // Also test non-backing source (`source_has_path: false`) where orphan was already restored
+        // before `pending_rename` cleared: `dst` must survive untouched.
+        let mut h2 = sim.raw_header().unwrap();
+        h2.pending_rename = Some(PendingRename {
+            from_path: "h2".into(),
+            to_path: "dst".into(),
+            is_dir: false,
+            source_has_path: false,
+            staged_target_ino: Some(dst_ino),
+            staged_other_path: None,
+            removed_empty_dir: false,
+        });
+        sim.set_raw_header(h2);
+        drop(tab2);
+        sim.crash_tab(2);
+
+        let _tab3 = block_on(sim.mount_opfs(3, grant(&owner, false, true), 3)).unwrap();
+        assert!(sim.raw_header().and_then(|h| h.pending_rename).is_none());
+        assert_eq!(
+            sim.external_read("dst").as_deref(),
+            Some(b"PRECIOUS_DST".as_slice())
+        );
+    }
+}
+
+#[test]
+fn codex2_and_3_closed_dst_and_non_backing_source_preserve_dst_on_commit_failure() {
+    let owner = user(1, 1, &[1], 0o022);
+    let sim = SimProfile::new();
+
+    block_on(async {
+        let fs = sim
+            .mount_opfs(1, grant(&owner, false, true), 1)
+            .await
+            .unwrap();
+        let (_, o_src) = fs
+            .create(
+                &owner,
+                &fs.root(),
+                "src",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        let (_, o_dst) = fs
+            .create(
+                &owner,
+                &fs.root(),
+                "dst",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        fs.write_at(&o_src, b"NEW_SRC", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        fs.write_at(&o_dst, b"PRECIOUS_DST", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        fs.release(&o_src).await.unwrap();
+        fs.release(&o_dst).await.unwrap();
+
+        // Codex #2: Closed single-link `dst` is staged in `/os-orphans` and restored on commit failure.
+        sim.set_fail_commit_after(Some(1), Errno::EDQUOT);
+        assert_eq!(
+            fs.rename(
+                &owner,
+                &fs.root(),
+                "src",
+                &fs.root(),
+                "dst",
+                RenameFlags::empty(),
+            )
+            .await,
+            Err(Errno::EDQUOT)
+        );
+        assert!(sim.orphan_ids().is_empty());
+        assert!(sim.raw_header().and_then(|h| h.pending_rename).is_none());
+        assert_eq!(
+            sim.external_read("src").as_deref(),
+            Some(b"NEW_SRC".as_slice())
+        );
+        assert_eq!(
+            sim.external_read("dst").as_deref(),
+            Some(b"PRECIOUS_DST".as_slice())
+        );
+
+        // Codex #3a: Non-backing 2nd hardlink `h2` (`!source_has_path`) replacing closed `dst`.
+        let (h1, o_h1) = fs
+            .create(
+                &owner,
+                &fs.root(),
+                "h1",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        fs.write_at(&o_h1, b"LINK_DATA", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        fs.release(&o_h1).await.unwrap();
+        fs.link(&owner, &h1.handle, &fs.root(), "h2").await.unwrap();
+
+        sim.set_fail_commit_after(Some(1), Errno::EDQUOT);
+        assert_eq!(
+            fs.rename(
+                &owner,
+                &fs.root(),
+                "h2",
+                &fs.root(),
+                "dst",
+                RenameFlags::empty(),
+            )
+            .await,
+            Err(Errno::EDQUOT)
+        );
+        assert!(sim.orphan_ids().is_empty());
+        assert!(sim.raw_header().and_then(|h| h.pending_rename).is_none());
+        assert_eq!(
+            sim.external_read("dst").as_deref(),
+            Some(b"PRECIOUS_DST".as_slice())
+        );
+        let dst_e = fs.lookup(&owner, &fs.root(), "dst").await.unwrap();
+        let o2 = fs
+            .open(&owner, &dst_e.handle, OpenOptions::new().read(true))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let n = fs.read_at(&o2, &mut buf, 0).await.unwrap();
+        assert_eq!(&buf[..n], b"PRECIOUS_DST");
+        fs.release(&o2).await.unwrap();
+        assert_eq!(
+            fs.lookup(&owner, &fs.root(), "h2")
+                .await
+                .unwrap()
+                .handle
+                .node
+                .ino,
+            h1.handle.node.ino
+        );
+
+        // Codex #3b: Non-backing symlink `sym` replacing closed `dst`.
+        fs.symlink(&owner, &fs.root(), "sym", "h1").await.unwrap();
+        sim.set_fail_commit_after(Some(1), Errno::EDQUOT);
+        assert_eq!(
+            fs.rename(
+                &owner,
+                &fs.root(),
+                "sym",
+                &fs.root(),
+                "dst",
+                RenameFlags::empty(),
+            )
+            .await,
+            Err(Errno::EDQUOT)
+        );
+        assert!(sim.orphan_ids().is_empty());
+        assert!(sim.raw_header().and_then(|h| h.pending_rename).is_none());
+        assert_eq!(
+            sim.external_read("dst").as_deref(),
+            Some(b"PRECIOUS_DST".as_slice())
+        );
+        let sym_e = fs.lookup(&owner, &fs.root(), "sym").await.unwrap();
+        assert_eq!(sym_e.metadata.file_type, FileType::Symlink);
+        assert_eq!(fs.read_link(&owner, &sym_e.handle).await.unwrap(), "h1");
+    });
+}
+
+#[test]
+fn codex4_already_mounted_surviving_tab_recovers_pending_rename_before_ops() {
+    let owner = user(1, 1, &[1], 0o022);
+    let sim = SimProfile::new();
+
+    let (tab1, tab2) = block_on(async {
+        let tab1 = sim
+            .mount_opfs(1, grant(&owner, false, true), 1)
+            .await
+            .unwrap();
+        let tab2 = sim
+            .mount_opfs(2, grant(&owner, false, true), 2)
+            .await
+            .unwrap();
+        let (_, o_src) = tab1
+            .create(
+                &owner,
+                &tab1.root(),
+                "src",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        let (_, o_dst) = tab1
+            .create(
+                &owner,
+                &tab1.root(),
+                "dst",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        tab1.write_at(&o_src, b"NEW_SRC", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        tab1.write_at(&o_dst, b"PRECIOUS_DST", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        tab1.release(&o_src).await.unwrap();
+        tab1.release(&o_dst).await.unwrap();
+        (tab1, tab2)
+    });
+
+    // Fail `tab1`'s final commit AND rollback `restore_orphan`, leaving `pending_rename` active
+    // while `dst` sits orphaned and `tab2` is already mounted.
+    sim.set_fail_commit_after(Some(1), Errno::EDQUOT);
+    sim.set_restore_orphan_error(Some(Errno::EIO));
+    assert_eq!(
+        block_on(tab1.rename(
+            &owner,
+            &tab1.root(),
+            "src",
+            &tab1.root(),
+            "dst",
+            RenameFlags::empty(),
+        )),
+        Err(Errno::EIO)
+    );
+    drop(tab1);
+    sim.crash_tab(1);
+    sim.set_restore_orphan_error(None);
+    assert!(sim.raw_header().and_then(|h| h.pending_rename).is_some());
+    assert_eq!(sim.external_read("dst"), None);
+
+    // Surviving `tab2` executes an ordinary op without remounting -> `ns_lock` recovers first!
+    block_on(async {
+        let dst_e = tab2.lookup(&owner, &tab2.root(), "dst").await.unwrap();
+        let o2 = tab2
+            .open(&owner, &dst_e.handle, OpenOptions::new().read(true))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let n = tab2.read_at(&o2, &mut buf, 0).await.unwrap();
+        assert_eq!(&buf[..n], b"PRECIOUS_DST");
+        tab2.release(&o2).await.unwrap();
+    });
+    assert!(sim.orphan_ids().is_empty());
+    assert!(sim.raw_header().and_then(|h| h.pending_rename).is_none());
+    assert_eq!(
+        sim.external_read("src").as_deref(),
+        Some(b"NEW_SRC".as_slice())
+    );
+    assert_eq!(
+        sim.external_read("dst").as_deref(),
+        Some(b"PRECIOUS_DST".as_slice())
+    );
+}
+
+#[test]
+fn codex5_large_17mib_otrunc_commit_failure_does_not_truncate_host_bytes() {
+    let owner = user(1, 1, &[1], 0o022);
+    let sim = SimProfile::new();
+    let offset_17m = 17 * 1024 * 1024u64;
+
+    block_on(async {
+        let fs = sim
+            .mount_opfs(1, grant(&owner, false, true), 1)
+            .await
+            .unwrap();
+        let (big, o) = fs
+            .create(
+                &owner,
+                &fs.root(),
+                "big.bin",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        fs.write_at(&o, b"BIG_HEADER_17M", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        fs.write_at(&o, b"BIG_TAIL", WriteAt::Offset(offset_17m))
+            .await
+            .unwrap();
+        fs.release(&o).await.unwrap();
+
+        sim.set_commit_error(Some(Errno::EDQUOT));
+        assert_eq!(
+            fs.open(
+                &owner,
+                &big.handle,
+                OpenOptions::new().read(true).write(true).truncate(true),
+            )
+            .await,
+            Err(Errno::EDQUOT)
+        );
+        assert_eq!(
+            fs.create(
+                &owner,
+                &fs.root(),
+                "big.bin",
+                0o600,
+                OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(true),
+            )
+            .await
+            .map(|_| ()),
+            Err(Errno::EDQUOT)
+        );
+        sim.set_commit_error(None);
+        assert_eq!(sim.held_lock_count("os-fs-open:"), 0);
+
+        let bytes = sim.external_read("big.bin").unwrap();
+        assert_eq!(bytes.len(), offset_17m as usize + 8);
+        assert_eq!(&bytes[..14], b"BIG_HEADER_17M");
+        assert_eq!(&bytes[offset_17m as usize..], b"BIG_TAIL");
+    });
+}
+
+#[test]
+fn codex7_directory_otrunc_second_commit_failure_restores_bytes_and_keeps_fp_live() {
+    let owner = user(1, 1, &[1], 0o022);
+    let sim = SimProfile::new();
+
+    block_on(async {
+        let fs = sim
+            .mount_directory(1, grant(&owner, false, true), 1)
+            .await
+            .unwrap();
+        let (doc, o_init) = fs
+            .create(
+                &owner,
+                &fs.root(),
+                "doc.txt",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        fs.write_at(&o_init, b"ORIGINAL_BYTES", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        fs.release(&o_init).await.unwrap();
+        fs.setxattr(
+            &owner,
+            &doc.handle,
+            "user.tag",
+            b"keep",
+            XattrFlags::empty(),
+        )
+        .await
+        .unwrap();
+
+        let o_keep = fs
+            .open(&owner, &doc.handle, OpenOptions::new().read(true))
+            .await
+            .unwrap();
+
+        // Commit 0 = pre-truncate metadata + open_id; Commit 1 = post-truncate fingerprint commit -> fail!
+        sim.set_fail_commit_after(Some(1), Errno::EDQUOT);
+        assert_eq!(
+            fs.open(
+                &owner,
+                &doc.handle,
+                OpenOptions::new().read(true).write(true).truncate(true),
+            )
+            .await,
+            Err(Errno::EDQUOT)
+        );
+
+        assert_eq!(
+            sim.external_read("doc.txt").as_deref(),
+            Some(b"ORIGINAL_BYTES".as_slice())
+        );
+        // Existing handle & xattrs must remain live (updated fingerprint recorded during rollback, NOT ESTALE).
+        let mut buf = [0u8; 32];
+        let n = fs.read_at(&o_keep, &mut buf, 0).await.unwrap();
+        assert_eq!(&buf[..n], b"ORIGINAL_BYTES");
+        assert_eq!(
+            fs.getxattr(&owner, &doc.handle, "user.tag").await.unwrap(),
+            b"keep"
+        );
+        fs.release(&o_keep).await.unwrap();
+        assert_eq!(sim.held_lock_count("os-fs-open:"), 0);
+    });
+}
+
+#[test]
+fn pending_truncate_recovery_reconciles_size_and_appends_cleanly() {
+    let owner = user(1, 1, &[1], 0o022);
+    let sim = SimProfile::new();
+
+    let ino = block_on(async {
+        let fs = sim
+            .mount_opfs(1, grant(&owner, false, true), 1)
+            .await
+            .unwrap();
+        let (f, o) = fs
+            .create(
+                &owner,
+                &fs.root(),
+                "trunc.txt",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        fs.write_at(&o, b"OLD_SECRET_BYTES", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        fs.release(&o).await.unwrap();
+        f.handle.node.ino
+    });
+
+    // Simulate crash right after Commit 0 recorded `pending_truncate` before `set_file_len(0)`:
+    let mut header = sim.raw_header().unwrap();
+    header.pending_truncate = Some(PendingTruncate {
+        ino,
+        backing: Backing::Path("trunc.txt".into()),
+        target_mode: sim.raw_inode(ino).unwrap().meta.mode,
+    });
+    sim.set_raw_header(header);
+    sim.crash_tab(1);
+
+    block_on(async {
+        let tab2 = sim
+            .mount_opfs(2, grant(&owner, false, true), 2)
+            .await
+            .unwrap();
+        // O_APPEND after crash recovery must see size 0 (NOT append past stale bytes!).
+        let f2 = tab2
+            .lookup(&owner, &tab2.root(), "trunc.txt")
+            .await
+            .unwrap();
+        assert_eq!(f2.metadata.size, 0);
+        assert_eq!(
+            sim.external_read("trunc.txt").as_deref(),
+            Some(b"".as_slice())
+        );
+        assert!(sim.raw_header().and_then(|h| h.pending_truncate).is_none());
+
+        let o_app = tab2
+            .open(
+                &owner,
+                &f2.handle,
+                OpenOptions::new().read(true).write(true).append(true),
+            )
+            .await
+            .unwrap();
+        tab2.write_at(&o_app, b"NEW", WriteAt::End).await.unwrap();
+        let mut buf = [0u8; 32];
+        let n = tab2.read_at(&o_app, &mut buf, 0).await.unwrap();
+        assert_eq!(&buf[..n], b"NEW");
+        tab2.release(&o_app).await.unwrap();
+    });
+}
+
+#[test]
+fn interrupted_opfs_open_unlink_repairs_live_backing_despite_surviving_open_fd() {
+    let owner = user(1, 1, &[1], 0o022);
+    let sim = SimProfile::new();
+
+    let (tab2, o2, live_ino) = block_on(async {
+        let tab1 = sim
+            .mount_opfs(1, grant(&owner, false, true), 1)
+            .await
+            .unwrap();
+        let tab2 = sim
+            .mount_opfs(2, grant(&owner, false, true), 2)
+            .await
+            .unwrap();
+        let (f, o1) = tab1
+            .create(
+                &owner,
+                &tab1.root(),
+                "live.txt",
+                0o600,
+                OpenOptions::new().read(true).write(true),
+            )
+            .await
+            .unwrap();
+        tab1.write_at(&o1, b"IMPORTANT_DATA", WriteAt::Offset(0))
+            .await
+            .unwrap();
+        tab1.release(&o1).await.unwrap();
+        let f2 = tab2.lookup(&owner, &tab2.root(), "live.txt").await.unwrap();
+        let o2 = tab2
+            .open(&owner, &f2.handle, OpenOptions::new().read(true))
+            .await
+            .unwrap();
+
+        // 1. Synchronous unlink commit failure rolls back the orphan back to `live.txt`.
+        sim.set_commit_error(Some(Errno::EDQUOT));
+        assert_eq!(
+            tab1.unlink(&owner, &tab1.root(), "live.txt").await,
+            Err(Errno::EDQUOT)
+        );
+        sim.set_commit_error(None);
+        assert_eq!(
+            sim.external_read("live.txt").as_deref(),
+            Some(b"IMPORTANT_DATA".as_slice())
+        );
+        assert!(sim.orphan_ids().is_empty());
+
+        (tab2, o2, f.handle.node.ino)
+    });
+
+    // 2. Crash leaving `live.txt` evacuated into `/os-orphans` while metadata still shows nlink==1
+    // AND `tab2` still holds open descriptor `o2`: both `resolve_child` AND `sweep_orphans` must
+    // restore `live.txt` (never delete the live inode or lose data)!
+    sim.external_remove("live.txt");
+    sim.put_external_orphan(live_ino, b"IMPORTANT_DATA");
+    sim.crash_tab(1);
+
+    block_on(async {
+        // `tab2.lookup` repairs via `resolve_child` instead of pruning `live.txt`:
+        let repaired = tab2.lookup(&owner, &tab2.root(), "live.txt").await.unwrap();
+        assert_eq!(repaired.handle.node.ino, live_ino);
+        assert_eq!(
+            sim.external_read("live.txt").as_deref(),
+            Some(b"IMPORTANT_DATA".as_slice())
+        );
+
+        // Now repeat crash state and verify `sweep_orphans` on Tab 3 ALSO restores despite `o2`:
+        sim.external_remove("live.txt");
+        sim.put_external_orphan(live_ino, b"IMPORTANT_DATA");
+        let tab3 = sim
+            .mount_opfs(3, grant(&owner, false, true), 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            sim.external_read("live.txt").as_deref(),
+            Some(b"IMPORTANT_DATA".as_slice())
+        );
+        assert!(sim.orphan_ids().is_empty());
+
+        let mut buf = [0u8; 32];
+        let n = tab2.read_at(&o2, &mut buf, 0).await.unwrap();
+        assert_eq!(&buf[..n], b"IMPORTANT_DATA");
+        tab2.release(&o2).await.unwrap();
+        let _ = tab3;
     });
 }

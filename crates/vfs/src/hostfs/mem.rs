@@ -63,6 +63,7 @@ struct TreeInner {
     quota_exceeded: bool,
     flush_error: bool,
     permission_revoked: bool,
+    restore_orphan_error: Option<Errno>,
     file_flushes: usize,
     tree_ops: usize,
 }
@@ -167,6 +168,9 @@ struct MetaInner {
     next_uuid: u64,
     strict_commits: usize,
     strict_syncs: usize,
+    commit_calls: usize,
+    commit_error: Option<Errno>,
+    fail_commit_on_call: Option<(usize, Errno)>,
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +248,7 @@ impl SimProfile {
                 quota_exceeded: false,
                 flush_error: false,
                 permission_revoked: false,
+                restore_orphan_error: None,
                 file_flushes: 0,
                 tree_ops: 0,
             })),
@@ -255,6 +260,9 @@ impl SimProfile {
                 next_uuid: 1,
                 strict_commits: 0,
                 strict_syncs: 0,
+                commit_calls: 0,
+                commit_error: None,
+                fail_commit_on_call: None,
             })),
             bus: Rc::new(RefCell::new(LockBusInner {
                 held: BTreeMap::new(),
@@ -426,6 +434,46 @@ impl SimProfile {
         self.tree.borrow_mut().permission_revoked = revoked;
     }
 
+    pub fn set_commit_error(&self, err: Option<Errno>) {
+        self.meta.borrow_mut().commit_error = err;
+    }
+
+    pub fn set_fail_commit_after(&self, successes: Option<usize>, err: Errno) {
+        let mut m = self.meta.borrow_mut();
+        m.fail_commit_on_call = successes.map(|s| (m.commit_calls + s + 1, err));
+    }
+
+    pub fn set_restore_orphan_error(&self, err: Option<Errno>) {
+        self.tree.borrow_mut().restore_orphan_error = err;
+    }
+
+    pub fn put_external_orphan(&self, ino: u64, bytes: &[u8]) {
+        let mut t = self.tree.borrow_mut();
+        let mtime_ns = t.tick();
+        let entry_id = t.mint_entry_id();
+        t.orphans.insert(
+            ino,
+            SimFile {
+                bytes: bytes.to_vec(),
+                mtime_ns,
+                entry_id,
+            },
+        );
+    }
+
+    pub fn held_lock_count(&self, prefix: &str) -> usize {
+        self.bus
+            .borrow()
+            .held
+            .iter()
+            .filter(|(k, v)| k.starts_with(prefix) && !v.is_empty())
+            .count()
+    }
+
+    pub fn raw_header(&self) -> Option<StoreHeader> {
+        self.meta.borrow().header.clone()
+    }
+
     pub fn flushes(&self) -> (usize, usize, usize) {
         let t = self.tree.borrow();
         let m = self.meta.borrow();
@@ -456,6 +504,10 @@ impl SimProfile {
 
     pub fn put_raw_inode(&self, rec: InodeRecord) {
         self.meta.borrow_mut().inodes.insert(rec.ino, rec);
+    }
+
+    pub fn set_raw_header(&self, header: StoreHeader) {
+        self.meta.borrow_mut().header = Some(header);
     }
 }
 
@@ -870,6 +922,9 @@ impl HostTree for SimTree {
         Box::pin(async move {
             let mut t = self.0.borrow_mut();
             t.tree_ops += 1;
+            if let Some(err) = t.restore_orphan_error {
+                return Err(err);
+            }
             t.check_perm()?;
             t.require_parent_dir(to)?;
             let f = t.orphans.remove(&ino).ok_or(Errno::ENOENT)?;
@@ -967,6 +1022,16 @@ impl MetaStore for SimMeta {
     fn commit(&self, batch: MetaBatch, strict: bool) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             let mut m = self.0.borrow_mut();
+            m.commit_calls += 1;
+            if let Some((fail_at, err)) = m.fail_commit_on_call
+                && m.commit_calls == fail_at
+            {
+                m.fail_commit_on_call = None;
+                return Err(err);
+            }
+            if let Some(err) = m.commit_error {
+                return Err(err);
+            }
             if let Some(h) = batch.header {
                 m.version = Some(h.format_version);
                 m.header = Some(h);

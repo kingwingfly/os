@@ -109,9 +109,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
     }
 
     pub(super) async fn release_open_locks(&self, ino: u64, owner: u64) -> Result<()> {
-        let Ok(_guard) = self.lock_mutex().await else {
-            return Ok(());
-        };
+        let _guard = self.lock_mutex().await?;
         let mut table = self.meta.get_locks(ino).await?;
         let had_any = table.held.iter().any(|h| h.owner == owner)
             || table.waits.iter().any(|w| w.lock.owner == owner)
@@ -144,7 +142,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         let (ino, access, _) = self.get_open_info(open)?;
         locks::validate(access, family, Some(kind), range)?;
         {
-            let _ns = self.ns_lock(LockKind::Shared).await?;
+            let _ns = self.ns_lock(self.read_ns_kind()).await?;
             self.validate_inode_by_id(ino).await?;
         }
 
@@ -182,7 +180,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         let (ino, access, _) = self.get_open_info(open)?;
         locks::validate(access, family, Some(kind), range)?;
         {
-            let _ns = self.ns_lock(LockKind::Shared).await?;
+            let _ns = self.ns_lock(self.read_ns_kind()).await?;
             self.validate_inode_by_id(ino).await?;
         }
 
@@ -202,12 +200,12 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             self.ensure_version().await?;
             let _ = self.get_open_info(open)?;
             {
-                let _ns = self.ns_lock(LockKind::Shared).await?;
+                let _ns = self.ns_lock(self.read_ns_kind()).await?;
                 self.validate_inode_by_id(ino).await?;
             }
 
-            let blocking_locks = {
-                let _guard = self.lock_mutex().await?;
+            let (guard, blocking_locks) = {
+                let guard = self.lock_mutex().await?;
                 let (mut tables, mut dirty) = self.load_and_prune_tables().await?;
                 let pruned = !dirty.is_empty();
                 let mut target = tables.remove(&ino).unwrap_or_default();
@@ -264,7 +262,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                         if pruned || held_changed {
                             self.locks.notify_locks();
                         }
-                        blockers.into_iter().collect::<Vec<_>>()
+                        (guard, blockers.into_iter().collect::<Vec<_>>())
                     }
                     Err(err) => {
                         if before_table.as_ref() != serde_json::to_vec(&target).ok().as_ref() {
@@ -278,7 +276,16 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
                 }
             };
 
-            self.locks.wait_for_change(&blocking_locks).await?;
+            // Arm the BroadcastChannel / local wakeup subscription BEFORE releasing `os-fs-lock`
+            // so a holder calling `unlock()` right after `guard` drops cannot lose the notification.
+            let mut guard_slot = Some(guard);
+            let mut wait_fut = self.locks.wait_for_change(&blocking_locks);
+            std::future::poll_fn(|cx| {
+                let poll = wait_fut.as_mut().poll(cx);
+                drop(guard_slot.take());
+                poll
+            })
+            .await?;
         }
     }
 
@@ -292,7 +299,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         let (ino, access, _) = self.get_open_info(open)?;
         locks::validate(access, family, None, range)?;
         {
-            let _ns = self.ns_lock(LockKind::Shared).await?;
+            let _ns = self.ns_lock(self.read_ns_kind()).await?;
             self.validate_inode_by_id(ino).await?;
         }
 
@@ -318,7 +325,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         let (ino, access, _) = self.get_open_info(open)?;
         locks::validate(access, LockFamily::Posix, None, range)?;
         {
-            let _ns = self.ns_lock(LockKind::Shared).await?;
+            let _ns = self.ns_lock(self.read_ns_kind()).await?;
             self.validate_inode_by_id(ino).await?;
         }
 
