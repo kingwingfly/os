@@ -36,6 +36,7 @@ extern "C" {
 
 thread_local! {
     static NEXT_GENERATION: Cell<u64> = const { Cell::new(1) };
+    static NEXT_SNAPSHOT_ID: Cell<u64> = const { Cell::new(1) };
 }
 
 fn next_generation() -> u64 {
@@ -44,6 +45,32 @@ fn next_generation() -> u64 {
         c.set(g.wrapping_add(1));
         g
     })
+}
+
+fn next_snapshot_uuid() -> String {
+    let id = NEXT_SNAPSHOT_ID.with(|c| {
+        let cur = c.get();
+        c.set(cur.wrapping_add(1));
+        cur
+    });
+    let suffix = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("crypto"))
+        .ok()
+        .and_then(|c| {
+            let f = js_sys::Reflect::get(&c, &JsValue::from_str("randomUUID"))
+                .ok()?
+                .dyn_into::<js_sys::Function>()
+                .ok()?;
+            f.call0(&c).ok()?.as_string()
+        })
+        .unwrap_or_else(|| format!("{id:012x}"));
+    format!("snapshot-{id}-{suffix}")
+}
+
+fn ensure_js_safe(value: u64) -> vfs::Result<()> {
+    if value > abi::fs::JS_SAFE {
+        return Err(Errno::EFBIG);
+    }
+    Ok(())
 }
 
 fn now_timespec() -> (u64, u32) {
@@ -355,6 +382,8 @@ impl HostTree for JsHostTree {
         expected_ino: Option<u64>,
     ) -> BoxFuture<'a, Vec<u8>> {
         Box::pin(async move {
+            ensure_js_safe(offset)?;
+            ensure_js_safe(len as u64)?;
             let (kind, target) = backing_args(backing)?;
             let val = self
                 .0
@@ -387,6 +416,8 @@ impl HostTree for JsHostTree {
         expected_ino: Option<u64>,
     ) -> BoxFuture<'a, (Written, Fingerprint)> {
         Box::pin(async move {
+            ensure_js_safe(offset)?;
+            ensure_js_safe(data.len() as u64)?;
             let (kind, target) = backing_args(backing)?;
             let bytes = js_sys::Uint8Array::from(data);
             let val = self
@@ -424,6 +455,7 @@ impl HostTree for JsHostTree {
         expected_ino: Option<u64>,
     ) -> BoxFuture<'a, Fingerprint> {
         Box::pin(async move {
+            ensure_js_safe(size)?;
             let (kind, target) = backing_args(backing)?;
             let val = self
                 .0
@@ -1033,6 +1065,45 @@ fn parse_snapshot_parts(raw: &str) -> Result<Vec<String>, JsValue> {
     Ok(names)
 }
 
+struct SnapshotMeta(vfs::hostfs::mem::SimMeta, String);
+
+impl MetaStore for SnapshotMeta {
+    fn read_version(&self) -> BoxFuture<'_, Option<u32>> {
+        self.0.read_version()
+    }
+    fn read_header(&self) -> BoxFuture<'_, Option<StoreHeader>> {
+        self.0.read_header()
+    }
+    fn reset_to_current(&self, header: StoreHeader, root: InodeRecord) -> BoxFuture<'_, ()> {
+        self.0.reset_to_current(header, root)
+    }
+    fn mint_uuid(&self) -> BoxFuture<'_, String> {
+        let uuid = self.1.clone();
+        Box::pin(async move { Ok(uuid) })
+    }
+    fn get_inode(&self, ino: u64) -> BoxFuture<'_, Option<InodeRecord>> {
+        self.0.get_inode(ino)
+    }
+    fn find_by_backing<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Option<InodeRecord>> {
+        self.0.find_by_backing(path)
+    }
+    fn list_all_inodes(&self) -> BoxFuture<'_, Vec<InodeRecord>> {
+        self.0.list_all_inodes()
+    }
+    fn get_locks(&self, ino: u64) -> BoxFuture<'_, Locks> {
+        self.0.get_locks(ino)
+    }
+    fn list_all_locks(&self) -> BoxFuture<'_, Vec<(u64, Locks)>> {
+        self.0.list_all_locks()
+    }
+    fn commit(&self, batch: MetaBatch, strict: bool) -> BoxFuture<'_, ()> {
+        self.0.commit(batch, strict)
+    }
+    fn sync_strict(&self) -> BoxFuture<'_, ()> {
+        self.0.sync_strict()
+    }
+}
+
 /// Mount an immutable selected-files snapshot (`<input type="file">`) over in-memory [`HostFs`].
 ///
 /// Copies file bytes eagerly at selection time so later host edits cannot invalidate the snapshot,
@@ -1153,11 +1224,12 @@ pub async fn mount_snapshot(files: JsValue, grant_json: &str) -> Result<LocalMou
         read_only: false,
         execute: grant.execute,
     };
+    let meta = SnapshotMeta(sim.meta_handle(), next_snapshot_uuid());
     let fs = HostFs::opfs(
         host_grant,
         next_generation(),
         sim.tree_handle(),
-        sim.meta_handle(),
+        meta,
         sim.locks_handle(1),
         js_clock(),
     )

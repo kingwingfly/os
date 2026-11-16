@@ -107,7 +107,7 @@ export async function exportMount(workspace, args) {
       await service.access(source, found.relative, 1);
       workspace.check(); if (!active) throw bad('ENODEV');
       const connection = new Connection(data.port, grant.expires); clients.set(data.session, connection);
-      serve(workspace, found, service, source, { ...grant, write: data.write, execute: data.execute }, connection);
+      serve(workspace, found, service, source, { ...grant, write: Boolean(data.write) && !source.readOnly, execute: Boolean(data.execute) && source.execute }, connection);
       await connection.connect('/api/mounts/channel/' + grant.id + '/' + data.session + '?ticket=' + data.ticket, 'owner');
     })().catch(error => { data.port?.postMessage({ type: 'close' }); data.port?.close(); if (active) port.postMessage({ type: 'reject', session: data.session, errno: error.errno ?? 'EACCES' }); });
   };
@@ -118,6 +118,67 @@ export async function exportMount(workspace, args) {
   const { ticket, ...publicGrant } = grant;
   return { ...publicGrant, address: 'osfs:' + grant.id };
 }
+const PATH_ONLY_OPS = new Set(['open', 'hold', 'list', 'mkdir', 'remove', 'rename', 'link', 'symlink', 'readlink', 'pin']);
+const VFS_SAFE_MAX = 0x1fffffffffffff;
+const VFS_U32_MAX = 0xffffffff;
+const KIND_TYPE_BITS = { file: 0o100000, directory: 0o040000, symlink: 0o120000 };
+const isSafeNonNeg = n => Number.isSafeInteger(n) && n >= 0;
+const isSafePos53 = n => Number.isSafeInteger(n) && n >= 1 && n <= VFS_SAFE_MAX;
+const isU32 = n => Number.isSafeInteger(n) && n >= 0 && n <= VFS_U32_MAX;
+const isNsec = n => Number.isSafeInteger(n) && n >= 0 && n <= 999_999_999;
+
+function sanitizeRemoteStat(value, grant) {
+  if (!value || typeof value !== 'object') throw bad('EIO', 'invalid remote metadata');
+  if (!['file', 'directory', 'symlink'].includes(value.kind)) throw bad('EIO', 'invalid remote metadata');
+  if (value.kind === 'file' && !isSafeNonNeg(value.size)) throw bad('EIO', 'invalid remote metadata');
+  if (value.link !== undefined && (typeof value.link !== 'string' || value.link.includes('\0'))) throw bad('EIO', 'invalid remote metadata');
+  if (value.vfs === null) throw bad('EIO', 'invalid remote metadata');
+  let sanitizedVfs;
+  if (value.vfs !== undefined) {
+    const raw = value.vfs;
+    if (!raw || typeof raw !== 'object') throw bad('EIO', 'invalid remote metadata');
+    if (!isSafePos53(raw.dev) || !isSafePos53(raw.ino)) throw bad('EIO', 'invalid remote metadata');
+    if (!Number.isSafeInteger(raw.mode) || raw.mode < 0 || raw.mode > 0o177777) throw bad('EIO', 'invalid remote metadata');
+    const typeBits = raw.mode & 0o170000;
+    if (typeBits !== KIND_TYPE_BITS[value.kind]) throw bad('EIO', 'invalid remote metadata');
+    if (!isU32(raw.uid) || !isU32(raw.gid) || !isU32(raw.nlink) || !isSafeNonNeg(raw.size)) throw bad('EIO', 'invalid remote metadata');
+    if (!isSafeNonNeg(raw.mtime) || !isSafeNonNeg(raw.ctime) || !isSafeNonNeg(raw.atime)) throw bad('EIO', 'invalid remote metadata');
+    for (const ns of [raw.mtime_nsec, raw.ctime_nsec, raw.atime_nsec]) {
+      if (ns !== undefined && !isNsec(ns)) throw bad('EIO', 'invalid remote metadata');
+    }
+    if (raw.link != null && (typeof raw.link !== 'string' || raw.link.includes('\0'))) throw bad('EIO', 'invalid remote metadata');
+    let mode = raw.mode;
+    if (grant.readOnly) mode &= ~0o222;
+    if (!grant.execute && value.kind === 'file') mode &= ~0o111;
+    sanitizedVfs = {
+      dev: raw.dev,
+      ino: raw.ino,
+      mode,
+      nlink: raw.nlink,
+      uid: raw.uid,
+      gid: raw.gid,
+      user: typeof raw.user === 'string' ? raw.user : '',
+      group: typeof raw.group === 'string' ? raw.group : '',
+      size: raw.size,
+      mtime: raw.mtime,
+      mtime_nsec: raw.mtime_nsec ?? 0,
+      ctime: raw.ctime,
+      ctime_nsec: raw.ctime_nsec ?? 0,
+      atime: raw.atime,
+      atime_nsec: raw.atime_nsec ?? 0,
+      ...(raw.link != null ? { link: raw.link } : {}),
+      ...(typeof raw.rdev === 'string' ? { rdev: raw.rdev } : {}),
+      ...(raw.acl !== undefined ? { acl: Boolean(raw.acl) } : {}),
+    };
+  }
+  return {
+    ...value,
+    readOnly: grant.readOnly,
+    executable: value.kind === 'directory' || (grant.execute && !!value.executable),
+    ...(sanitizedVfs ? { vfs: sanitizedVfs } : {}),
+  };
+}
+
 function serve(workspace, found, provider, source, grant, connection) {
   const pins = new Map(), handles = new Map(), seen = new Set(); let busy = 0, highest = 0;
   const retainHandle = handle => {
@@ -138,7 +199,9 @@ function serve(workspace, found, provider, source, grant, connection) {
       busy++;
       let value;
       try {
-        const args = message.args ?? {}, path = args.handle === undefined ? args.path === undefined ? null : [found.relative, safePath(args.path)].filter(Boolean).join('/') : handles.get(args.handle);
+        const args = message.args ?? {};
+        if (args.handle !== undefined && PATH_ONLY_OPS.has(message.op)) throw bad('EINVAL', 'handle is not valid for path operation');
+        const path = args.handle === undefined ? args.path === undefined ? null : [found.relative, safePath(args.path)].filter(Boolean).join('/') : handles.get(args.handle);
         if (args.handle !== undefined && !path) throw bad('EBADF');
         switch (message.op) {
           case 'open': {
@@ -279,14 +342,12 @@ class RemoteMount {
     if (mode & 1 && !grant.execute && (await this.stat(grant, path)).kind !== 'directory') throw bad('EACCES');
   }
   async stat(grant, path, { follow = true } = {}) {
-    const value = await this.request(grant, 'stat', { path, follow });
-    if (!['file', 'directory', 'symlink'].includes(value.kind) || value.kind === 'file' && (!Number.isSafeInteger(value.size) || value.size < 0)) throw bad('EIO', 'invalid remote metadata');
-    return { ...value, readOnly: grant.readOnly, executable: value.kind === 'directory' || (grant.execute && !!value.executable) };
+    return sanitizeRemoteStat(await this.request(grant, 'stat', { path, follow }), grant);
   }
   async list(grant, path, { offset = 0, limit = 256 } = {}) {
     const value = await this.request(grant, 'list', { path, offset, limit: Math.min(16, limit) });
-    if (!Array.isArray(value.entries) || value.entries.length > Math.min(16, limit) || value.entries.some(entry => typeof entry.name !== 'string' || !entry.name || entry.name.includes('/') || ['.', '..'].includes(entry.name) || !entry.stat || !['file', 'directory', 'symlink'].includes(entry.stat.kind) || entry.stat.kind === 'file' && (!Number.isSafeInteger(entry.stat.size) || entry.stat.size < 0)) || value.next !== null && (!value.entries.length || value.next !== offset + value.entries.length)) throw bad('EIO', 'invalid remote directory page');
-    for (const entry of value.entries) entry.stat = { ...entry.stat, readOnly: grant.readOnly, executable: entry.stat.kind === 'directory' || (grant.execute && !!entry.stat.executable) };
+    if (!Array.isArray(value.entries) || value.entries.length > Math.min(16, limit) || value.entries.some(entry => typeof entry.name !== 'string' || !entry.name || entry.name.includes('/') || ['.', '..'].includes(entry.name) || !entry.stat) || value.next !== null && (!value.entries.length || value.next !== offset + value.entries.length)) throw bad('EIO', 'invalid remote directory page');
+    for (const entry of value.entries) entry.stat = sanitizeRemoteStat(entry.stat, grant);
     return value;
   }
   async read(grant, path, offset, length) {

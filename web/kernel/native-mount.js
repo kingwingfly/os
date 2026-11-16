@@ -96,9 +96,14 @@ export class NativeMount {
 
   static async connect(args, owner = null) {
     const url = validateHelperConnection(args);
+    const wasm = args?.wasm ?? null;
+    // eslint-disable-next-line no-undef
+    const defaultWasm = globalThis.wasm_bindgen ?? (typeof wasm_bindgen !== 'undefined' ? wasm_bindgen : null);
     const connectHelper =
       args.connectHelper ??
-      (args.standalone === true ? null : globalThis.wasm_bindgen?.connect_helper_mount);
+      (args.standalone === true
+        ? null
+        : (wasm?.connect_helper_mount ?? defaultWasm?.connect_helper_mount));
 
     if (typeof connectHelper === 'function') {
       const transport = new NativeMount(url.href, args.token);

@@ -23,11 +23,13 @@ const encoded = bytes => {
 };
 const decoded = data => Uint8Array.from(atob(data), c => c.charCodeAt(0));
 
+const utf8Encoder = new TextEncoder();
+
 // 53-bit FNV-1a64 matching `abi::fs::FsId::dev()` (`1..=0x1fffffffffffff`).
 function fnv53(text) {
   let hash = 0xcbf29ce484222325n;
-  for (let i = 0; i < text.length; i++) {
-    hash ^= BigInt(text.charCodeAt(i) & 0xff);
+  for (const byte of utf8Encoder.encode(text)) {
+    hash ^= BigInt(byte);
     hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
   }
   return Number(hash & 0x1fffffffffffffn) || 1;
@@ -118,7 +120,7 @@ export class Workspace {
     const owner = ownerCredential(this.identity);
     let provider;
     if (args.url) {
-      provider = await NativeMount.connect({ ...args, name, owner }, owner);
+      provider = await NativeMount.connect({ ...args, name, owner, wasm: this.wasm }, owner);
     } else if (args.files) {
       const wasm = this.#wasmBindings();
       const grantJson = JSON.stringify({
@@ -245,24 +247,44 @@ export class Workspace {
   }
 
   metadata(path, metadata, mount) {
+    const rawLink = metadata.vfs?.link ?? metadata.link;
+    const link = typeof rawLink === 'string' && rawLink.startsWith('/') && mount
+      ? mount.path + rawLink
+      : rawLink;
     if (metadata.vfs) {
+      let mode = metadata.vfs.mode;
+      const isDir = metadata.kind === 'directory' || (mode & 0o170000) === 0o040000;
+      const isReg = metadata.kind === 'file' || (mode & 0o170000) === 0o100000;
+      if (mount?.grant?.readOnly) mode &= ~0o222;
+      if (mount && !mount.grant.execute && isReg && !isDir) mode &= ~0o111;
       return {
         ...metadata.vfs,
+        mode,
+        ...(link === undefined ? {} : { link }),
         size: metadata.size ?? metadata.vfs.size ?? 0,
       };
     }
     const directory = metadata.kind === 'directory';
     const executable = directory || (!!mount?.grant.execute && (metadata.executable ?? true));
     const time = Math.floor((metadata.lastModified ?? 0) / 1000);
-    const link = metadata.link?.startsWith('/') && mount ? mount.path + metadata.link : metadata.link;
-    const dev = mount ? fnv53('private:' + mount.path) : VIRTUAL_DEV;
-    const ino = fnv53((mount ? 'private:' : 'virtual:') + path);
+    let dev = mount ? fnv53('private:' + mount.path) : VIRTUAL_DEV;
+    let ino = fnv53((mount ? 'private:' : 'virtual:') + path);
+    if (typeof metadata.identity === 'string') {
+      const match = /^(.*):(\d+):(\d+)$/.exec(metadata.identity);
+      if (match && match[1]) {
+        const parsedIno = Number(match[2]);
+        if (Number.isSafeInteger(parsedIno) && parsedIno > 0) {
+          dev = fnv53(match[1]);
+          ino = parsedIno;
+        }
+      }
+    }
     return {
       dev,
       ino,
       mode: (directory ? 0o040000 : metadata.kind === 'symlink' ? 0o120000 : 0o100000)
         | 0o400
-        | (metadata.readOnly ? 0 : 0o200)
+        | ((metadata.readOnly || mount?.grant.readOnly) ? 0 : 0o200)
         | (executable ? 0o100 : 0),
       ...(link === undefined ? {} : { link }),
       nlink: 1,

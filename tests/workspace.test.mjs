@@ -1682,3 +1682,575 @@ test('LocalMount enforces O_PATH symlink following, sticky protected symlinks, c
   thirdParty.close();
   peer.close();
 });
+
+test('PR #73 P1-4 & P2-5: RemoteMount validates/clamps vfs, rejects args.handle on path ops, UTF-8 fnv53, NativeMount identity & wasm', async () => {
+  installBrowserEnv();
+  const owner = new Workspace({ id: 'p14-owner', uid: 50, gid: 50, groups: [50] });
+  const peer = new Workspace({ id: 'p14-peer', uid: 51, gid: 51, groups: [51] });
+  await owner.mount({ name: 'opfs', storage: true, writable: true, execute: true, cloud: false });
+  await owner.calls([
+    { mkdir: { path: '/mnt/local/opfs/sub', mode: 0o777 } },
+    { chmod: { path: '/mnt/local/opfs/sub', mode: 0o777 } },
+    { open: { path: '/mnt/local/opfs/sub/exec.txt', flags: 0o302, mode: 0o777 } },
+    { chmod: { path: '/mnt/local/opfs/sub/exec.txt', mode: 0o777 } },
+    { pwrite: { fd: { ref: 2 }, index: 0, data: btoa('hi') } },
+    { close: { fd: { ref: 2 } } },
+    { symlink: { target: '/secret', path: '/mnt/local/opfs/sub/abssym' } },
+  ], owner.page, cloud);
+
+  const prevFetch = globalThis.fetch;
+  const listeners = new Map();
+  const grants = new Map();
+  const channels = [];
+  let interceptStat = null;
+  let interceptList = null;
+
+  function makeBridge(isOwner) {
+    const ch = new MessageChannel();
+    channels.push(ch);
+    ch.port2.onmessage = ({ data }) => {
+      if (data.type === 'listen') {
+        listeners.set(data.url.split('/listen/')[1].split('?')[0], ch.port2);
+        queueMicrotask(() => ch.port2.postMessage({ type: 'ready' }));
+      } else if (data.type === 'connect') {
+        const [id, sess] = data.url.split('/channel/')[1].split('?')[0].split('/');
+        const pair = grants.get(id + ':' + sess);
+        pair[isOwner ? 'ownerPort' : 'targetPort'] = ch.port2;
+        if (pair.ownerPort && pair.targetPort) {
+          queueMicrotask(() => {
+            pair.ownerPort.postMessage({ type: 'ready' });
+            pair.targetPort.postMessage({ type: 'ready' });
+          });
+        }
+      } else if (data.type === 'send') {
+        let msg = data.message;
+        if (isOwner && msg?.type === 'reply' && !msg.error) {
+          if (interceptStat && msg.value && typeof msg.value === 'object' && 'kind' in msg.value && !('entries' in msg.value)) {
+            msg = { ...msg, value: interceptStat(msg.value) };
+          } else if (interceptList && msg.value && Array.isArray(msg.value.entries)) {
+            msg = { ...msg, value: interceptList(msg.value) };
+          }
+        }
+        for (const pair of grants.values()) {
+          if (pair.ownerPort === ch.port2) pair.targetPort?.postMessage({ type: 'message', message: msg });
+          else if (pair.targetPort === ch.port2) pair.ownerPort?.postMessage({ type: 'message', message: msg });
+        }
+      } else if (data.type === 'close') {
+        for (const pair of grants.values()) {
+          if (pair.ownerPort === ch.port2) pair.targetPort?.postMessage({ type: 'closed', errno: 'ENODEV' });
+          else if (pair.targetPort === ch.port2) pair.ownerPort?.postMessage({ type: 'closed', errno: 'ENODEV' });
+        }
+      }
+    };
+    ch.port2.start();
+    return ch.port1;
+  }
+
+  let fetchUid = 50;
+  try {
+    globalThis.fetch = async (url, init) => {
+      const body = init?.body ? JSON.parse(init.body) : {};
+      if (url === '/api/mounts/publish') {
+        const id = crypto.randomUUID();
+        grants.set(id, { write: body.write, execute: body.execute, expires: Date.now() + 60_000 });
+        return new Response(JSON.stringify({ id, uid: fetchUid, ticket: 't', expires: Date.now() + 60_000, name: body.name, write: body.write, execute: body.execute }), { status: 200 });
+      }
+      if (url.startsWith('/api/mounts/connect/')) {
+        const id = url.split('/connect/')[1];
+        const g = grants.get(id);
+        const session = crypto.randomUUID();
+        grants.set(id + ':' + session, { ownerPort: null, targetPort: null });
+        const ownerPort = makeBridge(true);
+        listeners.get(id).postMessage({
+          type: 'client',
+          session,
+          ticket: 't',
+          port: ownerPort,
+          password: false,
+          identity: { id: 51, group: 51, groups: [51] },
+          write: g.write && body.write,
+          execute: g.execute && body.execute,
+        }, [ownerPort]);
+        return new Response(JSON.stringify({ id, session, uid: fetchUid, ticket: 't', expires: g.expires, name: 'ro', write: g.write && body.write, execute: g.execute && body.execute }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    };
+
+    const pub = await exportMount(owner, { path: '/mnt/local/opfs/sub', name: 'ro', seconds: 60, port: makeBridge(true) });
+    fetchUid = 51;
+    const remoteRo = await attachMount(peer, { address: pub.address, writable: false, execute: false, port: makeBridge(false) });
+    peer.mounts.set('/mnt/shared/ro', { path: '/mnt/shared/ro', name: 'ro', grant: remoteRo.grant, provider: remoteRo, cloud: false, active: true });
+
+    // 1. args.handle is rejected with EINVAL on all path-only export operations.
+    for (const op of ['open', 'hold', 'list', 'mkdir', 'remove', 'rename', 'link', 'symlink', 'readlink', 'pin']) {
+      await assert.rejects(
+        remoteRo.connection.request(op, { handle: 'fake-handle', path: '' }),
+        { errno: 'EINVAL' },
+        `expected EINVAL for args.handle on ${op}`,
+      );
+    }
+
+    // 2. RemoteMount clamps vfs.mode against readOnly (~0o222) and !execute (~0o111 on regular files),
+    // and Workspace.metadata clamps + prefixes absolute vfs.link under mount.path.
+    const fileSt = await remoteRo.stat(remoteRo.grant, 'exec.txt');
+    assert.equal(fileSt.readOnly, true);
+    assert.equal(fileSt.executable, false);
+    assert.equal(fileSt.vfs.mode & 0o777, 0o444);
+
+    const peerMeta = await peer.stat('/mnt/shared/ro/exec.txt');
+    assert.equal(peerMeta.mode & 0o777, 0o444);
+
+    const symSt = await peer.stat('/mnt/shared/ro/abssym', false);
+    assert.equal(symSt.link, '/mnt/shared/ro/secret');
+
+    const listed = await remoteRo.list(remoteRo.grant, '');
+    const execEntry = listed.entries.find(e => e.name === 'exec.txt');
+    assert.equal(execEntry.stat.vfs.mode & 0o777, 0o444);
+
+    // 3. Malformed peer vfs fields are rejected with EIO on both stat and list.
+    for (const mutateVfs of [
+      vfs => ({ ...vfs, dev: 0 }),
+      vfs => ({ ...vfs, ino: 2 ** 54 }),
+      vfs => ({ ...vfs, uid: -1 }),
+      vfs => ({ ...vfs, mode: 0o040755 }), // wrong file-type bits for regular file
+      () => null,
+    ]) {
+      interceptStat = v => ({ ...v, vfs: mutateVfs(v.vfs) });
+      await assert.rejects(remoteRo.stat(remoteRo.grant, 'exec.txt'), { errno: 'EIO' });
+      interceptStat = null;
+
+      interceptList = page => ({
+        ...page,
+        entries: page.entries.map(e => e.name === 'exec.txt' ? { ...e, stat: { ...e.stat, vfs: mutateVfs(e.stat.vfs) } } : e),
+      });
+      await assert.rejects(remoteRo.list(remoteRo.grant, ''), { errno: 'EIO' });
+      interceptList = null;
+    }
+
+    // 4. P2-5: fnv53 uses UTF-8 bytes so /opt/private/pkg/I and /opt/private/pkg/汉 never collide.
+    const blobBytesI = encoder.encode('I-file');
+    const blobBytesHan = encoder.encode('han-file');
+    const shaHex = async bytes => [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(b => b.toString(16).padStart(2, '0')).join('');
+    const shaI = await shaHex(blobBytesI);
+    const shaHan = await shaHex(blobBytesHan);
+    const manifest = JSON.stringify({
+      version: 1,
+      name: 'unicode-pkg',
+      entries: [
+        { path: 'I', node: { type: 'file', sha256: shaI, size: blobBytesI.length } },
+        { path: '汉', node: { type: 'file', sha256: shaHan, size: blobBytesHan.length } },
+      ],
+    });
+    await owner.calls([
+      { mkdir: { path: '/mnt/local/opfs/ext', mode: 0o755 } },
+      { mkdir: { path: '/mnt/local/opfs/ext/blobs', mode: 0o755 } },
+      { open: { path: '/mnt/local/opfs/ext/manifest.json', flags: 0o302, mode: 0o644 } },
+      { pwrite: { fd: { ref: 2 }, index: 0, data: encodeB64Bytes(encoder.encode(manifest)) } },
+      { close: { fd: { ref: 2 } } },
+      { open: { path: '/mnt/local/opfs/ext/blobs/' + shaI, flags: 0o302, mode: 0o644 } },
+      { pwrite: { fd: { ref: 5 }, index: 0, data: encodeB64Bytes(blobBytesI) } },
+      { close: { fd: { ref: 5 } } },
+      { open: { path: '/mnt/local/opfs/ext/blobs/' + shaHan, flags: 0o302, mode: 0o644 } },
+      { pwrite: { fd: { ref: 8 }, index: 0, data: encodeB64Bytes(blobBytesHan) } },
+      { close: { fd: { ref: 8 } } },
+    ], owner.page, cloud);
+    await owner.activate(
+      { name: 'pkg', source: '/mnt/local/opfs/ext', cloud: false },
+      async () => ({
+        entries: {
+          '/': { path: '/', node: { type: 'directory' }, mode: 0o755 },
+          '/I': { path: '/I', node: { type: 'file', sha256: shaI, size: blobBytesI.length }, mode: 0o644 },
+          '/汉': { path: '/汉', node: { type: 'file', sha256: shaHan, size: blobBytesHan.length }, mode: 0o644 },
+        },
+        resolved: { '/': '/', '/I': '/I', '/汉': '/汉' },
+      }),
+    );
+    const stI = await owner.stat('/opt/private/pkg/I');
+    const stHan = await owner.stat('/opt/private/pkg/汉');
+    assert.notEqual(stI.ino, stHan.ino);
+
+    // 5. P2-5: Workspace.metadata honors `identity` (`<fs>:<ino>:<gen>`) without `vfs` & NativeMount checks `args.wasm`.
+    const nativeMountMeta = { path: '/mnt/local/native', grant: { readOnly: true, execute: false } };
+    const st1 = owner.metadata('/mnt/local/native/a', { kind: 'file', size: 3, identity: 'native-fs-1:9001:1', link: '/rel' }, nativeMountMeta);
+    const st2 = owner.metadata('/mnt/local/native/b', { kind: 'file', size: 3, identity: 'native-fs-1:9001:1' }, nativeMountMeta);
+    assert.equal(st1.dev, st2.dev);
+    assert.equal(st1.ino, 9001);
+    assert.equal(st1.link, '/mnt/local/native/rel');
+    assert.equal(st1.mode & 0o200, 0);
+
+    let calledWasmHelper = false;
+    const prevBindgen = globalThis.wasm_bindgen;
+    globalThis.wasm_bindgen = undefined;
+    try {
+      const sentinel = { grant: Object.freeze({ kind: 'native-directory', name: 'h', readOnly: false, execute: true }) };
+      const connected = await NativeMount.connect({
+        url: 'http://127.0.0.1:45555/',
+        token: 'b'.repeat(64),
+        name: 'h',
+        writable: true,
+        execute: true,
+        wasm: {
+          connect_helper_mount: async (transport, grantJson) => {
+            calledWasmHelper = true;
+            assert.ok(transport);
+            assert.equal(JSON.parse(grantJson).name, 'h');
+            return sentinel;
+          },
+        },
+      }, { id: 50, group: 50, groups: [50] });
+      assert.equal(calledWasmHelper, true);
+      assert.equal(connected, sentinel);
+    } finally {
+      globalThis.wasm_bindgen = prevBindgen;
+    }
+  } finally {
+    globalThis.fetch = prevFetch;
+    peer.close();
+    owner.close();
+    for (const ch of channels) {
+      try { ch.port1.close(); } catch {}
+      try { ch.port2.close(); } catch {}
+    }
+  }
+});
+
+function encodeB64Bytes(u8) {
+  return btoa(String.fromCharCode(...u8));
+}
+
+test('PR #73 P2-2, P2-3, P2-4, P2-6: LocalMount symlink .. walk, alias rename revalidation, distinct snapshots, O_RDONLY|O_TRUNC, EFBIG', async () => {
+  installBrowserEnv();
+
+  // P2-4: independent snapshots must get distinct st_dev.
+  const snapWs = new Workspace({ id: 'snap-distinct', uid: 20, gid: 20, groups: [20] });
+  try {
+    await snapWs.mount({ name: 's1', files: [file('same.txt', 'one')], execute: false, cloud: false });
+    await snapWs.mount({ name: 's2', files: [file('same.txt', 'one')], execute: false, cloud: false });
+    const snapStat1 = await snapWs.stat('/mnt/local/s1/same.txt');
+    const snapStat2 = await snapWs.stat('/mnt/local/s2/same.txt');
+    assert.notEqual(snapStat1.dev, snapStat2.dev);
+  } finally {
+    snapWs.close();
+  }
+
+  // P2-2, P2-3, P2-6 on multi-alias OPFS mounts:
+  const ownerA = new Workspace({ id: 'p2-ownerA', uid: 50, gid: 50, groups: [50] });
+  const ownerB = new Workspace({ id: 'p2-ownerB', uid: 50, gid: 50, groups: [50] });
+  try {
+    await ownerA.mount({ name: 'opfs', storage: true, writable: true, execute: true, cloud: false });
+    await ownerB.mount({ name: 'opfs', storage: true, writable: true, execute: true, cloud: false });
+
+    await ownerA.calls([
+      { chmod: { path: '/mnt/local/opfs', mode: 0o755 } },
+      { mkdir: { path: '/mnt/local/opfs/nest', mode: 0o755 } },
+      { chmod: { path: '/mnt/local/opfs/nest', mode: 0o755 } },
+      { mkdir: { path: '/mnt/local/opfs/nest/deep', mode: 0o755 } },
+      { chmod: { path: '/mnt/local/opfs/nest/deep', mode: 0o755 } },
+      { mkdir: { path: '/mnt/local/opfs/nest/blocked', mode: 0o700 } },
+      { chmod: { path: '/mnt/local/opfs/nest/blocked', mode: 0o700 } },
+      { open: { path: '/mnt/local/opfs/target', flags: 0o302, mode: 0o644 } },
+      { pwrite: { fd: { ref: 7 }, index: 0, data: btoa('ROOT') } },
+      { close: { fd: { ref: 7 } } },
+      { chmod: { path: '/mnt/local/opfs/target', mode: 0o644 } },
+      { open: { path: '/mnt/local/opfs/nest/target', flags: 0o302, mode: 0o644 } },
+      { pwrite: { fd: { ref: 11 }, index: 0, data: btoa('NEST') } },
+      { close: { fd: { ref: 11 } } },
+      { chmod: { path: '/mnt/local/opfs/nest/target', mode: 0o644 } },
+      { symlink: { target: 'nest/deep', path: '/mnt/local/opfs/dirlink' } },
+      { symlink: { target: 'dirlink/../target', path: '/mnt/local/opfs/indirect' } },
+      { symlink: { target: 'dirlink/../made.txt', path: '/mnt/local/opfs/dangling' } },
+      { symlink: { target: 'nest/blocked/../target', path: '/mnt/local/opfs/blocked_dot' } },
+    ], ownerA.page, cloud);
+
+    // P2-2: `indirect -> dirlink/../target` walks dirlink (`nest/deep`), then `..`, resolving `nest/target`!
+    const symlinkOps = await ownerA.calls([
+      { open: { path: '/mnt/local/opfs/indirect', flags: 2 } },
+      { pread: { fd: { ref: 0 }, count: 16 } },
+      { pwrite: { fd: { ref: 0 }, index: 0, data: btoa('UPDATED') } },
+      { close: { fd: { ref: 0 } } },
+      { open: { path: '/mnt/local/opfs/dangling', flags: 0o102, mode: 0o644 } },
+      { pwrite: { fd: { ref: 4 }, index: 0, data: btoa('MADE') } },
+      { close: { fd: { ref: 4 } } },
+      { pread: { path: '/mnt/local/opfs/nest/target', count: 16 } },
+      { pread: { path: '/mnt/local/opfs/nest/made.txt', count: 16 } },
+      { pread: { path: '/mnt/local/opfs/target', count: 16 } },
+    ], ownerA.page, cloud);
+    assert.equal(atob(symlinkOps[1].ok.data), 'NEST');
+    assert.equal(atob(symlinkOps[7].ok.data), 'UPDATED');
+    assert.equal(atob(symlinkOps[8].ok.data), 'MADE');
+    assert.equal(atob(symlinkOps[9].ok.data), 'ROOT');
+    await assert.rejects(ownerA.stat('/mnt/local/opfs/made.txt'), { errno: 'ENOENT' });
+
+    // Non-searchable blocked ancestor inside `nest/blocked/../target` fails EACCES for unprivileged identity,
+    // while direct readable `nest/target` succeeds!
+    const mA = ownerA.mounts.get('/mnt/local/opfs');
+    const mPeerView = mA.provider.forIdentity({ id: 51, group: 51, groups: [51] }, '');
+    const peerOkFd = await mPeerView.open(mA.grant, 'nest/target', 0);
+    await mPeerView.release(mA.grant, peerOkFd);
+    await assert.rejects(mPeerView.open(mA.grant, 'blocked_dot', 0), { errno: 'EACCES' });
+
+    // P2-3: cross-alias rename while an exported descriptor is open must remain live inside boundary,
+    // and become ESTALE once renamed outside boundary.
+    await ownerA.calls([
+      { mkdir: { path: '/mnt/local/opfs/sub', mode: 0o755 } },
+      { chmod: { path: '/mnt/local/opfs/sub', mode: 0o755 } },
+      { mkdir: { path: '/mnt/local/opfs/sub/subdir', mode: 0o755 } },
+      { chmod: { path: '/mnt/local/opfs/sub/subdir', mode: 0o755 } },
+      { mkdir: { path: '/mnt/local/opfs/sub/moved', mode: 0o755 } },
+      { chmod: { path: '/mnt/local/opfs/sub/moved', mode: 0o755 } },
+      { open: { path: '/mnt/local/opfs/sub/alias.txt', flags: 0o302, mode: 0o644 } },
+      { pwrite: { fd: { ref: 6 }, index: 0, data: btoa('LIVE-ALIAS') } },
+      { close: { fd: { ref: 6 } } },
+      { chmod: { path: '/mnt/local/opfs/sub/alias.txt', mode: 0o644 } },
+    ], ownerA.page, cloud);
+    const subView = mA.provider.forIdentity({ id: 51, group: 51, groups: [51] }, 'sub');
+    const openAliasFd = await subView.open(mA.grant, 'sub/alias.txt', 0);
+    const openDirFd = await subView.open(mA.grant, 'sub/subdir', 0);
+
+    // Alias ownerB moves BOTH inside `sub` without ownerA knowing:
+    await ownerB.calls([
+      { rename: { from: '/mnt/local/opfs/sub/alias.txt', to: '/mnt/local/opfs/sub/moved/alias2.txt' } },
+      { rename: { from: '/mnt/local/opfs/sub/subdir', to: '/mnt/local/opfs/sub/subdir2' } },
+    ], ownerB.page, cloud);
+    const aliasBytes = await subView.read(mA.grant, openAliasFd, 0, 32);
+    assert.equal(decoder.decode(aliasBytes), 'LIVE-ALIAS');
+    const listedRenamedDir = await subView.list(mA.grant, openDirFd, {});
+    assert.ok(Array.isArray(listedRenamedDir.entries));
+
+    // Alias ownerB moves file OUTSIDE `sub` boundary -> ESTALE!
+    await ownerB.calls([
+      { rename: { from: '/mnt/local/opfs/sub/moved/alias2.txt', to: '/mnt/local/opfs/outside.txt' } },
+    ], ownerB.page, cloud);
+    await assert.rejects(subView.read(mA.grant, openAliasFd, 0, 32), { errno: 'ESTALE' });
+    await subView.release(mA.grant, openAliasFd);
+    await subView.release(mA.grant, openDirFd);
+
+    // P2-3 + known_paths pruning on ownerA `unlink` when hardlink exists outside `sub`:
+    await ownerA.calls([
+      { open: { path: '/mnt/local/opfs/sub/linked.txt', flags: 0o302, mode: 0o644 } },
+      { pwrite: { fd: { ref: 0 }, index: 0, data: btoa('LNK') } },
+      { close: { fd: { ref: 0 } } },
+      { chmod: { path: '/mnt/local/opfs/sub/linked.txt', mode: 0o644 } },
+      { link: { from: '/mnt/local/opfs/sub/linked.txt', to: '/mnt/local/opfs/outside_keep.txt' } },
+    ], ownerA.page, cloud);
+    const openLinked = await subView.open(mA.grant, 'sub/linked.txt', 0);
+    await ownerA.calls([{ unlink: { path: '/mnt/local/opfs/sub/linked.txt' } }], ownerA.page, cloud);
+    await assert.rejects(subView.read(mA.grant, openLinked, 0, 16), { errno: 'ESTALE' });
+    await subView.release(mA.grant, openLinked);
+
+    // P2-6: O_RDONLY|O_TRUNC truncates regular file, EISDIR on directory, ENOENT on missing; RO ordering; invalid write offset & EFBIG!
+    await ownerA.calls([
+      { open: { path: '/mnt/local/opfs/truncme.txt', flags: 0o302, mode: 0o644 } },
+      { pwrite: { fd: { ref: 0 }, index: 0, data: btoa('LONGDATA') } },
+      { close: { fd: { ref: 0 } } },
+    ], ownerA.page, cloud);
+    const roTrunc = await mA.provider.open(mA.grant, 'truncme.txt', 0o1000, 0o644, 0o022); // O_RDONLY | O_TRUNC
+    assert.equal((await mA.provider.stat(mA.grant, 'truncme.txt')).size, 0);
+    await mA.provider.release(mA.grant, roTrunc);
+    await assert.rejects(mA.provider.open(mA.grant, 'missing.txt', 0o1000, 0o644, 0o022), { errno: 'ENOENT' });
+    await assert.rejects(mA.provider.open(mA.grant, 'nest', 0o1000, 0o644, 0o022), { errno: 'EISDIR' });
+
+    // RO mount: missing O_WRONLY -> ENOENT, dir O_WRONLY / O_RDONLY|O_TRUNC -> EISDIR, file O_WRONLY / O_RDONLY|O_TRUNC -> EROFS.
+    const roWs = new Workspace({ id: 'p2-ro', uid: 50, gid: 50, groups: [50] });
+    try {
+      await roWs.mount({ name: 'opfs', storage: true, writable: false, execute: true, cloud: false });
+      const mRo = roWs.mounts.get('/mnt/local/opfs');
+      await assert.rejects(mRo.provider.open(mRo.grant, 'missing.txt', 1, 0o644, 0o022), { errno: 'ENOENT' });
+      await assert.rejects(mRo.provider.open(mRo.grant, 'nest', 1, 0o644, 0o022), { errno: 'EISDIR' });
+      await assert.rejects(mRo.provider.open(mRo.grant, 'nest', 0o1000, 0o644, 0o022), { errno: 'EISDIR' });
+      await assert.rejects(mRo.provider.open(mRo.grant, 'target', 1, 0o644, 0o022), { errno: 'EROFS' });
+      await assert.rejects(mRo.provider.open(mRo.grant, 'target', 0o1000, 0o644, 0o022), { errno: 'EROFS' });
+    } finally {
+      roWs.close();
+    }
+
+    // Invalid write offset -> EINVAL; > JS_SAFE -> EFBIG in hostfs.
+    await assert.rejects(mA.provider.write(mA.grant, 'target', new Uint8Array([1]), { offset: -1 }), { errno: 'EINVAL' });
+    await assert.rejects(mA.provider.write(mA.grant, 'target', new Uint8Array([1]), { offset: 1.5 }), { errno: 'EINVAL' });
+    await assert.rejects(mA.provider.write(mA.grant, 'target', new Uint8Array([1]), { offset: 2 ** 54 }), { errno: 'EFBIG' });
+    const fTruncHandle = await mA.provider.open(mA.grant, 'target', 2, 0o644, 0o022);
+    await assert.rejects(mA.provider.ftruncate(mA.grant, fTruncHandle, 2 ** 54), { errno: 'EFBIG' });
+    await mA.provider.release(mA.grant, fTruncHandle);
+
+    // P2-6: LocalMount::pin preserves remote: self.remote for boundary revalidation.
+    const wasmMagic = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+    await ownerA.calls([
+      { open: { path: '/mnt/local/opfs/sub/bin.wasm', flags: 0o302, mode: 0o755 } },
+      { pwrite: { fd: { ref: 0 }, index: 0, data: encodeB64Bytes(wasmMagic) } },
+      { close: { fd: { ref: 0 } } },
+      { chmod: { path: '/mnt/local/opfs/sub/bin.wasm', mode: 0o755 } },
+    ], ownerA.page, cloud);
+    const pinnedRemote = await subView.pin(mA.grant, 'sub/bin.wasm');
+    assert.equal((await localImage(pinnedRemote)).bytes.length, 8);
+    await ownerA.calls([{ chmod: { path: '/mnt/local/opfs/sub/bin.wasm', mode: 0o600 } }], ownerA.page, cloud);
+    await assert.rejects(localImage(pinnedRemote), { errno: 'ESTALE' });
+  } finally {
+    ownerA.close();
+    ownerB.close();
+  }
+});
+
+test('PR #73 P1-5: WASI process.js openPath rejects O_RDONLY|O_TRUNC on directories with EISDIR and passes atomic O_NOFOLLOW to localFs', async () => {
+  const binaryen = (await import('binaryen')).default;
+  const { Worker } = await import('node:worker_threads');
+  installBrowserEnv();
+
+  const ws = new Workspace({ id: 'wasi-p15', uid: 20, gid: 20, groups: [20] });
+  await ws.mount({ name: 'proj', storage: true, writable: true, execute: false, cloud: false });
+  await ws.calls([
+    { mkdir: { path: '/mnt/local/proj/dir', mode: 0o755 } },
+    { open: { path: '/mnt/local/proj/target', flags: 0o302, mode: 0o644 } },
+    { close: { fd: { ref: 1 } } },
+    { symlink: { target: 'target', path: '/mnt/local/proj/sym' } },
+  ], ws.page, cloud);
+
+  // Worker 1 (localFs + channel): tests (1) local dir + OFLAG_TRUNC -> EISDIR(31) with atomic O_NOFOLLOW|O_TRUNC,
+  // (2) local sym + !FOLLOW -> ELOOP(32).
+  const localWat = `(module
+    (import "wasi_snapshot_preview1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+    (memory (export "memory") 1)
+    (data (i32.const 100) "mnt/local/proj/dir")
+    (data (i32.const 140) "mnt/local/proj/sym")
+    (func (export "_start")
+      (local $rc i32)
+      ;; 1. localFs dir + OFLAG_TRUNC (8), dirflags=0 (!FOLLOW), RIGHT_READ(2) -> expect 31 (EISDIR)
+      (local.set $rc (call $open (i32.const 3) (i32.const 0) (i32.const 100) (i32.const 18) (i32.const 8) (i64.const 2) (i64.const 2) (i32.const 0) (i32.const 500)))
+      (if (i32.ne (local.get $rc) (i32.const 31)) (then (call $exit (i32.add (i32.const 100) (local.get $rc)))))
+      ;; 2. localFs sym, dirflags=0 (!FOLLOW), RIGHT_READ(2) -> expect 32 (ELOOP)
+      (local.set $rc (call $open (i32.const 3) (i32.const 0) (i32.const 140) (i32.const 18) (i32.const 0) (i64.const 2) (i64.const 2) (i32.const 0) (i32.const 500)))
+      (if (i32.ne (local.get $rc) (i32.const 32)) (then (call $exit (i32.add (i32.const 200) (local.get $rc)))))
+      (call $exit (i32.const 0))))`;
+
+  // Worker 2 (no channel, openRead fallback): tests (1) dir + OFLAG_TRUNC -> EISDIR(31) + O_NOFOLLOW|O_TRUNC sent,
+  // (2) dir without OFLAG_TRUNC -> 0.
+  const fallbackWat = `(module
+    (import "wasi_snapshot_preview1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_close" (func $close (param i32) (result i32)))
+    (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+    (memory (export "memory") 1)
+    (data (i32.const 180) "cloud-dir")
+    (func (export "_start")
+      (local $rc i32)
+      ;; 1. openRead fallback dir + OFLAG_TRUNC (8), dirflags=0 (!FOLLOW), RIGHT_READ(2) -> expect 31 (EISDIR)
+      (local.set $rc (call $open (i32.const 3) (i32.const 0) (i32.const 180) (i32.const 9) (i32.const 8) (i64.const 2) (i64.const 2) (i32.const 0) (i32.const 500)))
+      (if (i32.ne (local.get $rc) (i32.const 31)) (then (call $exit (i32.add (i32.const 300) (local.get $rc)))))
+      ;; 2. openRead fallback dir without OFLAG_TRUNC, dirflags=1 (FOLLOW), RIGHT_READ(2) -> expect 0
+      (local.set $rc (call $open (i32.const 3) (i32.const 1) (i32.const 180) (i32.const 9) (i32.const 0) (i64.const 2) (i64.const 2) (i32.const 0) (i32.const 500)))
+      (if (i32.ne (local.get $rc) (i32.const 0)) (then (call $exit (i32.add (i32.const 400) (local.get $rc)))))
+      (drop (call $close (i32.load (i32.const 500))))
+      (call $exit (i32.const 0))))`;
+
+  const processUrl = new URL('../web/wasi/process.js', import.meta.url).href;
+  const workerCode = `
+    import { parentPort, workerData } from 'node:worker_threads';
+    const pending = [];
+    let handler = null;
+    Object.defineProperty(globalThis, 'onmessage', {
+      configurable: true,
+      get() { return handler; },
+      set(fn) {
+        handler = fn;
+        while (pending.length && handler) handler(pending.shift());
+      },
+    });
+    globalThis.postMessage = (msg, _transfer) => parentPort.postMessage(msg);
+    globalThis.fetch = async (url, init) => {
+      if (url === '/api/sys') {
+        const body = JSON.parse(init.body);
+        for (const c of body.calls) {
+          if (c.open) parentPort.postMessage({ observedSysOpen: c.open });
+        }
+        const results = body.calls.map(c => {
+          if (c.stat || c.lstat) return { ok: { mode: 0o040755, nlink: 2, size: 0, ino: 77 } };
+          if (c.open) return { err: { errno: 'EISDIR', detail: 'is a directory' } };
+          return { ok: null };
+        });
+        return new Response(JSON.stringify({ results }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    };
+    parentPort.on('message', data => {
+      const ev = { data };
+      if (handler) handler(ev);
+      else pending.push(ev);
+    });
+    await import(workerData.processUrl);
+  `;
+
+  async function runWasiCase(wat, { localFs, useChannel }) {
+    const modBytes = binaryen.parseText(wat).emitBinary();
+    const channelBuf = useChannel ? new SharedArrayBuffer(1 << 20) : null;
+    const opens = [];
+    const worker = new Worker(workerCode, { eval: true, workerData: { processUrl } });
+    try {
+      const module = await WebAssembly.compile(modBytes);
+      const channelState = channelBuf ? new Int32Array(channelBuf, 0, 2) : null;
+      const channelData = channelBuf ? new Uint8Array(channelBuf, 8) : null;
+      const exitResult = await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error(`worker timed out; opens=${JSON.stringify(opens)}`));
+        }, 5000);
+        const finish = fn => val => { clearTimeout(timer); fn(val); };
+        worker.on('error', finish(reject));
+        worker.on('exit', code => finish(reject)(new Error(`worker exited unexpectedly with code ${code}`)));
+        worker.on('message', async msg => {
+          if (msg?.observedSysOpen) {
+            opens.push(msg.observedSysOpen);
+            return;
+          }
+          if (msg?.host?.type === 'filesystem') {
+            for (const c of msg.host.args.calls) {
+              if (c.open) opens.push(c.open);
+            }
+            let reply;
+            try {
+              reply = await ws.calls(msg.host.args.calls, ws.page, cloud);
+            } catch (err) {
+              reply = { errno: err.errno ?? 'EIO' };
+            }
+            const bytes = encoder.encode(JSON.stringify(reply));
+            channelData.set(bytes, 0);
+            Atomics.store(channelState, 1, bytes.length);
+            Atomics.store(channelState, 0, 1);
+            Atomics.notify(channelState, 0);
+          } else if (msg?.exit !== undefined) {
+            finish(resolve)(msg);
+          }
+        });
+        worker.postMessage({
+          module,
+          argv: ['probe'],
+          env: [],
+          cwd: '/',
+          pid: 1,
+          ppid: 0,
+          umask: 0o022,
+          sudo: false,
+          localFs,
+          channel: channelBuf,
+        });
+      });
+      return { exitResult, opens };
+    } finally {
+      await worker.terminate();
+    }
+  }
+
+  try {
+    const localRes = await runWasiCase(localWat, { localFs: true, useChannel: true });
+    assert.equal(localRes.exitResult.exit, 0, `unexpected local WASI exit code ${localRes.exitResult.exit}`);
+    const dirOpen = localRes.opens.find(o => o.path === '/mnt/local/proj/dir');
+    assert.ok(dirOpen, 'expected localFs open on /mnt/local/proj/dir');
+    assert.notEqual(dirOpen.flags & 0o400000, 0, 'O_NOFOLLOW must be passed to localFs open');
+    assert.notEqual(dirOpen.flags & 0o1000, 0, 'O_TRUNC must be passed to localFs open');
+
+    const fallbackRes = await runWasiCase(fallbackWat, { localFs: false, useChannel: false });
+    assert.equal(fallbackRes.exitResult.exit, 0, `unexpected fallback WASI exit code ${fallbackRes.exitResult.exit}`);
+    const truncSysOpen = fallbackRes.opens.find(o => o.path === '/cloud-dir' && (o.flags & 0o1000));
+    assert.ok(truncSysOpen, 'expected openRead open with O_TRUNC on /cloud-dir');
+    assert.notEqual(truncSysOpen.flags & 0o400000, 0, 'O_NOFOLLOW must be passed by openRead when !FOLLOW');
+  } finally {
+    ws.close();
+  }
+});

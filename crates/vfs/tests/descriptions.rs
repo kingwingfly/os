@@ -498,3 +498,41 @@ fn monotonic_id_source_prevents_aliasing_across_tables() {
     run(first.exit(1));
     run(reconnected.exit(1));
 }
+
+#[test]
+fn directory_open_with_write_truncate_or_create_returns_eisdir() {
+    let (fs, table) = table();
+    let cred = Cred::root();
+    mkdir(&fs, "/d");
+
+    let mut trunc_ro = read();
+    trunc_ro.truncate(true);
+    let write_only = *os_vfs::OpenOptions::new().write(true);
+    let rw = create();
+    let mut create_ro = read();
+    create_ro.create(true);
+    let path_only = *os_vfs::OpenOptions::new().path(true);
+
+    for path in ["/d", "/d/", "/d/.", "/"] {
+        for opts in [&trunc_ro, &write_only, &rw, &create_ro] {
+            let err = match run(table.open(1, &cred, path, opts, 0o644, &everywhere)) {
+                Ok(_) => panic!("expected EISDIR for {path} with {opts:?}"),
+                Err(err) => err,
+            };
+            assert_eq!(err, Errno::EISDIR, "path {path}");
+        }
+        assert!(
+            run(table.open(1, &cred, path, &read(), 0, &everywhere))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            run(table.open(1, &cred, path, &path_only, 0, &everywhere))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    run(table.exit(1));
+    assert!(table.is_empty());
+}

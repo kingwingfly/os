@@ -297,11 +297,20 @@ impl Descriptions {
         directory: bool,
         inside: &dyn Fn(&str) -> bool,
     ) -> Result<Option<Opened>> {
-        let is_path = options.access()? == abi::fs::Access::Path;
+        let access = options.access()?;
+        let is_path = access == abi::fs::Access::Path;
+        let dir_disallowed =
+            !is_path && (options.is_truncate() || access.writes() || options.is_create());
         let follow = !options.is_create_new() && !nofollow;
         let resolved = self.resolve(cred, path, follow, inside).await?;
         let (handle, open, entry) = match resolved {
-            None | Some(Resolved::Directory(_)) => return Ok(None),
+            None => return Ok(None),
+            Some(Resolved::Directory(_)) => {
+                if dir_disallowed {
+                    return Err(Errno::EISDIR);
+                }
+                return Ok(None);
+            }
             Some(Resolved::Found { entry, .. }) => {
                 if options.is_create_new() {
                     return Err(Errno::EEXIST);
@@ -310,6 +319,9 @@ impl Descriptions {
                     return Err(Errno::ELOOP);
                 }
                 if entry.metadata.is_dir() {
+                    if dir_disallowed {
+                        return Err(Errno::EISDIR);
+                    }
                     return Ok(None);
                 }
                 if directory {
