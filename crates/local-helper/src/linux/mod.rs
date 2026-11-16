@@ -158,11 +158,13 @@ pub fn run() -> Result<(), String> {
                         let _ = reply.send(res);
                         if last_sweep.elapsed() >= ENGINE_SWEEP_INTERVAL {
                             engine.sweep_expired();
+                            engine.flush_if_dirty();
                             last_sweep = Instant::now();
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         engine.sweep_expired();
+                        engine.flush_if_dirty();
                         last_sweep = Instant::now();
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,

@@ -643,4 +643,46 @@ fn slow_stalled_http_client_does_not_block_other_requests() {
         start.elapsed()
     );
     drop(slow);
+    now_or_never(fs.detach()).unwrap().unwrap();
+    drop(helper);
+
+    // Opening a directory with write/truncate on --no-write helper returns EISDIR before EROFS,
+    // and detached read-only discovered host files keep their minted inode across restart.
+    let ro_helper = SpawnedHelper::spawn(&root, &state, origin, false, false);
+    let ro_fs = now_or_never(HelperFs::connect(
+        HttpHelperTransport(TcpHelperHost::new(
+            ro_helper.url.clone(),
+            origin.into(),
+            ro_helper.token.clone(),
+        )),
+        "ro-tab",
+        &owner,
+        HelperGrant {
+            write: false,
+            execute: false,
+        },
+    ))
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        now_or_never(ro_fs.open(&owner, &ro_fs.root(), OpenOptions::new().write(true)))
+            .unwrap()
+            .unwrap_err(),
+        Errno::EISDIR
+    );
+    assert_eq!(
+        now_or_never(ro_fs.open(
+            &owner,
+            &ro_fs.root(),
+            OpenOptions::new().read(true).truncate(true)
+        ))
+        .unwrap()
+        .unwrap_err(),
+        Errno::EISDIR
+    );
+    let hello_e = now_or_never(ro_fs.lookup(&owner, &ro_fs.root(), "hello.txt"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(hello_e.handle.node.ino, entry.handle.node.ino);
+    now_or_never(ro_fs.detach()).unwrap().unwrap();
 }

@@ -3278,3 +3278,1081 @@ fn discovered_wasm_binary_gets_owner_exec_while_text_gets_rw_only() {
     assert_eq!(prog.metadata.mode, 0o700);
     assert_eq!(notes.metadata.mode, 0o600);
 }
+
+#[test]
+fn rename_enforces_exec_and_may_delete_before_same_inode_short_circuit() {
+    let tmp = TempDir::new("rename-perms");
+    let root = tmp.path().join("root");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&root).unwrap();
+
+    let mut engine = open_engine(&root, &state, true, true);
+    let root_user = cred(0, 0, vec![0], 0o022);
+    let alice = cred(1000, 1000, vec![1000], 0o022);
+    let bob = cred(2000, 2000, vec![2000], 0o022);
+    let att_root = attach(&mut engine, "r", &root_user, true, true);
+    let att_alice = attach(&mut engine, "a", &alice, true, true);
+    let att_bob = attach(&mut engine, "b", &bob, true, true);
+
+    call_unit(
+        &mut engine,
+        &att_root.session,
+        &root_user,
+        Call::Setattr {
+            handle: att_root.root.clone(),
+            attr: SetAttr {
+                mode: Some(0o777),
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap();
+
+    // Non-executable dir (0600) must fail EACCES BEFORE child discovery (`ENOENT`).
+    let noexec_dir: Entry = call(
+        &mut engine,
+        &att_alice.session,
+        &alice,
+        Call::Mkdir {
+            dir: att_alice.root.clone(),
+            name: "noexec".into(),
+            mode: 0o700,
+        },
+    )
+    .unwrap();
+    let dst_ok: Entry = call(
+        &mut engine,
+        &att_alice.session,
+        &alice,
+        Call::Mkdir {
+            dir: att_alice.root.clone(),
+            name: "ok".into(),
+            mode: 0o755,
+        },
+    )
+    .unwrap();
+    call_unit(
+        &mut engine,
+        &att_alice.session,
+        &alice,
+        Call::Setattr {
+            handle: noexec_dir.handle.clone(),
+            attr: SetAttr {
+                mode: Some(0o600),
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        call_unit(
+            &mut engine,
+            &att_alice.session,
+            &alice,
+            Call::Rename {
+                from_dir: noexec_dir.handle.clone(),
+                from: "missing".into(),
+                to_dir: dst_ok.handle.clone(),
+                to: "x".into(),
+                flags: RenameFlags::empty(),
+            },
+        )
+        .unwrap_err(),
+        Errno::EACCES
+    );
+    assert_eq!(
+        call_unit(
+            &mut engine,
+            &att_alice.session,
+            &alice,
+            Call::Rename {
+                from_dir: dst_ok.handle.clone(),
+                from: "missing".into(),
+                to_dir: noexec_dir.handle.clone(),
+                to: "x".into(),
+                flags: RenameFlags::empty(),
+            },
+        )
+        .unwrap_err(),
+        Errno::EACCES
+    );
+
+    // Same-inode short-circuit in a 0555 (non-writable) dir and a sticky dir (+t) MUST check
+    // `inode::may_delete` first instead of silently returning Ok(()).
+    let ro_dir: Entry = call(
+        &mut engine,
+        &att_alice.session,
+        &alice,
+        Call::Mkdir {
+            dir: att_alice.root.clone(),
+            name: "ro".into(),
+            mode: 0o755,
+        },
+    )
+    .unwrap();
+    let (a_entry, a_open): (Entry, OpenRef) = call(
+        &mut engine,
+        &att_alice.session,
+        &alice,
+        Call::Create {
+            ticket: ticket(),
+            dir: ro_dir.handle.clone(),
+            name: "same.txt".into(),
+            mode: 0o644,
+            options: opts_create_w_excl(),
+        },
+    )
+    .unwrap();
+    call_unit(
+        &mut engine,
+        &att_alice.session,
+        &alice,
+        Call::Release { open: a_open },
+    )
+    .unwrap();
+    let _link: Entry = call(
+        &mut engine,
+        &att_alice.session,
+        &alice,
+        Call::Link {
+            target: a_entry.handle,
+            dir: ro_dir.handle.clone(),
+            name: "alias.txt".into(),
+        },
+    )
+    .unwrap();
+    call_unit(
+        &mut engine,
+        &att_alice.session,
+        &alice,
+        Call::Setattr {
+            handle: ro_dir.handle.clone(),
+            attr: SetAttr {
+                mode: Some(0o555),
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        call_unit(
+            &mut engine,
+            &att_alice.session,
+            &alice,
+            Call::Rename {
+                from_dir: ro_dir.handle.clone(),
+                from: "same.txt".into(),
+                to_dir: ro_dir.handle.clone(),
+                to: "same.txt".into(),
+                flags: RenameFlags::empty(),
+            },
+        )
+        .unwrap_err(),
+        Errno::EACCES
+    );
+    assert_eq!(
+        call_unit(
+            &mut engine,
+            &att_alice.session,
+            &alice,
+            Call::Rename {
+                from_dir: ro_dir.handle.clone(),
+                from: "same.txt".into(),
+                to_dir: ro_dir.handle.clone(),
+                to: "alias.txt".into(),
+                flags: RenameFlags::empty(),
+            },
+        )
+        .unwrap_err(),
+        Errno::EACCES
+    );
+    // RENAME_NOREPLACE still fails EEXIST even when parent directory is non-writable (0555).
+    assert_eq!(
+        call_unit(
+            &mut engine,
+            &att_alice.session,
+            &alice,
+            Call::Rename {
+                from_dir: ro_dir.handle.clone(),
+                from: "same.txt".into(),
+                to_dir: ro_dir.handle,
+                to: "alias.txt".into(),
+                flags: RenameFlags::NOREPLACE,
+            },
+        )
+        .unwrap_err(),
+        Errno::EEXIST
+    );
+
+    let sticky: Entry = call(
+        &mut engine,
+        &att_root.session,
+        &root_user,
+        Call::Mkdir {
+            dir: att_root.root.clone(),
+            name: "sticky".into(),
+            mode: 0o1777,
+        },
+    )
+    .unwrap();
+    call_unit(
+        &mut engine,
+        &att_root.session,
+        &root_user,
+        Call::Setattr {
+            handle: sticky.handle.clone(),
+            attr: SetAttr {
+                mode: Some(0o1777),
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap();
+    let (_, alice_o): (Entry, OpenRef) = call(
+        &mut engine,
+        &att_alice.session,
+        &alice,
+        Call::Create {
+            ticket: ticket(),
+            dir: sticky.handle.clone(),
+            name: "owned.txt".into(),
+            mode: 0o644,
+            options: opts_create_w_excl(),
+        },
+    )
+    .unwrap();
+    call_unit(
+        &mut engine,
+        &att_alice.session,
+        &alice,
+        Call::Release { open: alice_o },
+    )
+    .unwrap();
+    assert_eq!(
+        call_unit(
+            &mut engine,
+            &att_bob.session,
+            &bob,
+            Call::Rename {
+                from_dir: sticky.handle.clone(),
+                from: "owned.txt".into(),
+                to_dir: sticky.handle,
+                to: "owned.txt".into(),
+                flags: RenameFlags::empty(),
+            },
+        )
+        .unwrap_err(),
+        Errno::EPERM
+    );
+}
+
+#[test]
+fn create_rollback_exist_before_may_create_and_flush_tmp_cleanup() {
+    let tmp = TempDir::new("rollback-exist");
+    let root = tmp.path().join("root");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&root).unwrap();
+
+    let mut engine = open_engine(&root, &state, true, true);
+    let root_user = cred(0, 0, vec![0], 0o022);
+    let alice = cred(1000, 1000, vec![1000], 0o022);
+    let att_root = attach(&mut engine, "r", &root_user, true, true);
+    let att_alice = attach(&mut engine, "a", &alice, true, true);
+
+    call_unit(
+        &mut engine,
+        &att_root.session,
+        &root_user,
+        Call::Setattr {
+            handle: att_root.root.clone(),
+            attr: SetAttr {
+                mode: Some(0o777),
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap();
+
+    let ro_parent: Entry = call(
+        &mut engine,
+        &att_root.session,
+        &root_user,
+        Call::Mkdir {
+            dir: att_root.root.clone(),
+            name: "ro_parent".into(),
+            mode: 0o755,
+        },
+    )
+    .unwrap();
+    let (existing_file, eo): (Entry, OpenRef) = call(
+        &mut engine,
+        &att_root.session,
+        &root_user,
+        Call::Create {
+            ticket: ticket(),
+            dir: ro_parent.handle.clone(),
+            name: "exists".into(),
+            mode: 0o644,
+            options: opts_create_w_excl(),
+        },
+    )
+    .unwrap();
+    call_unit(
+        &mut engine,
+        &att_root.session,
+        &root_user,
+        Call::Release { open: eo },
+    )
+    .unwrap();
+    call_unit(
+        &mut engine,
+        &att_root.session,
+        &root_user,
+        Call::Setattr {
+            handle: ro_parent.handle.clone(),
+            attr: SetAttr {
+                mode: Some(0o555),
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap();
+
+    // Existing name in a 0555 parent must fail with EEXIST BEFORE may_create EACCES/EPERM.
+    assert_eq!(
+        call::<Entry>(
+            &mut engine,
+            &att_alice.session,
+            &alice,
+            Call::Mkdir {
+                dir: ro_parent.handle.clone(),
+                name: "exists".into(),
+                mode: 0o755,
+            },
+        )
+        .unwrap_err(),
+        Errno::EEXIST
+    );
+    assert_eq!(
+        call::<Entry>(
+            &mut engine,
+            &att_root.session,
+            &root_user,
+            Call::Mknod {
+                dir: ro_parent.handle.clone(),
+                name: "exists".into(),
+                mode: 0o644,
+                rdev: "fifo".into(),
+            },
+        )
+        .unwrap_err(),
+        Errno::EEXIST
+    );
+    assert_eq!(
+        call::<Entry>(
+            &mut engine,
+            &att_alice.session,
+            &alice,
+            Call::Symlink {
+                dir: ro_parent.handle.clone(),
+                name: "exists".into(),
+                target: "x".into(),
+            },
+        )
+        .unwrap_err(),
+        Errno::EEXIST
+    );
+    assert_eq!(
+        call::<Entry>(
+            &mut engine,
+            &att_alice.session,
+            &alice,
+            Call::Link {
+                target: existing_file.handle,
+                dir: ro_parent.handle,
+                name: "exists".into(),
+            },
+        )
+        .unwrap_err(),
+        Errno::EEXIST
+    );
+
+    // Block `flush()` rename by replacing the target state JSON file with a directory (`EISDIR`),
+    // then confirm create/mkdir/mknod/symlink all roll back host entries AND unlink `.tmp.*`!
+    let state_file = engine.state_file_path().to_path_buf();
+    let folders_dir = state_file.parent().unwrap().to_path_buf();
+    let saved_state = fs::read(&state_file).unwrap();
+    fs::remove_file(&state_file).unwrap();
+    fs::create_dir(&state_file).unwrap();
+
+    assert_eq!(
+        call::<(Entry, OpenRef)>(
+            &mut engine,
+            &att_root.session,
+            &root_user,
+            Call::Create {
+                ticket: ticket(),
+                dir: att_root.root.clone(),
+                name: "rolled-file".into(),
+                mode: 0o644,
+                options: opts_create_w_excl(),
+            },
+        )
+        .unwrap_err(),
+        Errno::EISDIR
+    );
+    assert!(!root.join("rolled-file").exists());
+
+    assert_eq!(
+        call::<Entry>(
+            &mut engine,
+            &att_root.session,
+            &root_user,
+            Call::Mkdir {
+                dir: att_root.root.clone(),
+                name: "rolled-dir".into(),
+                mode: 0o755,
+            },
+        )
+        .unwrap_err(),
+        Errno::EISDIR
+    );
+    assert!(!root.join("rolled-dir").exists());
+
+    assert_eq!(
+        call::<Entry>(
+            &mut engine,
+            &att_root.session,
+            &root_user,
+            Call::Mknod {
+                dir: att_root.root.clone(),
+                name: "rolled-fifo".into(),
+                mode: 0o644,
+                rdev: "fifo".into(),
+            },
+        )
+        .unwrap_err(),
+        Errno::EISDIR
+    );
+    assert!(!root.join("rolled-fifo").exists());
+
+    assert_eq!(
+        call::<Entry>(
+            &mut engine,
+            &att_root.session,
+            &root_user,
+            Call::Symlink {
+                dir: att_root.root.clone(),
+                name: "rolled-sym".into(),
+                target: "x".into(),
+            },
+        )
+        .unwrap_err(),
+        Errno::EISDIR
+    );
+    assert!(!root.join("rolled-sym").exists());
+
+    let leftover_tmp: Vec<_> = fs::read_dir(&folders_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+        .collect();
+    assert!(
+        leftover_tmp.is_empty(),
+        "stale .tmp files left behind: {leftover_tmp:?}"
+    );
+
+    // Unblock state file and confirm retry creates cleanly without stale EEXIST.
+    fs::remove_dir(&state_file).unwrap();
+    fs::write(&state_file, &saved_state).unwrap();
+    let (_ok_e, ok_o): (Entry, OpenRef) = call(
+        &mut engine,
+        &att_root.session,
+        &root_user,
+        Call::Create {
+            ticket: ticket(),
+            dir: att_root.root,
+            name: "rolled-file".into(),
+            mode: 0o644,
+            options: opts_create_w_excl(),
+        },
+    )
+    .unwrap();
+    call_unit(
+        &mut engine,
+        &att_root.session,
+        &root_user,
+        Call::Release { open: ok_o },
+    )
+    .unwrap();
+}
+
+#[test]
+fn read_only_discovery_defers_flush_until_detach_and_drop() {
+    let tmp = TempDir::new("deferred-flush");
+    let root = tmp.path().join("root");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(root.join("tree/sub")).unwrap();
+    fs::write(root.join("tree/sub/leaf.txt"), b"leaf").unwrap();
+
+    let alice = cred(1000, 1000, vec![1000], 0o022);
+    let bob = cred(2000, 2000, vec![2000], 0o022);
+    let leaf_ino;
+    {
+        let mut engine = open_engine(&root, &state, true, true);
+        let att_a = attach(&mut engine, "a", &alice, true, true);
+        let att_b = attach(&mut engine, "b", &bob, true, true);
+        let state_file = engine.state_file_path().to_path_buf();
+        let before_bytes = fs::read(&state_file).unwrap();
+
+        let walked: Walked = call(
+            &mut engine,
+            &att_a.session,
+            &alice,
+            Call::Walk {
+                dir: att_a.root.clone(),
+                names: vec!["tree".into(), "sub".into(), "leaf.txt".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(walked.entries.len(), 3);
+        leaf_ino = walked.entries[2].handle.node.ino;
+        let _items: Vec<DirEntry> = call(
+            &mut engine,
+            &att_a.session,
+            &alice,
+            Call::ReadDir {
+                dir: walked.entries[1].handle.clone(),
+            },
+        )
+        .unwrap();
+
+        // Read-only lookup/walk/readdir must NOT rewrite the JSON store synchronously.
+        assert_eq!(fs::read(&state_file).unwrap(), before_bytes);
+
+        // Unprivileged `unlink` failure must NOT trigger a store flush either.
+        assert_eq!(
+            call_unit(
+                &mut engine,
+                &att_b.session,
+                &bob,
+                Call::Unlink {
+                    dir: walked.entries[1].handle.clone(),
+                    name: "leaf.txt".into(),
+                },
+            )
+            .unwrap_err(),
+            Errno::EACCES
+        );
+        assert_eq!(fs::read(&state_file).unwrap(), before_bytes);
+
+        // Detach flushes dirty discovered nodes cleanly.
+        engine
+            .handle_request(Request::Detach {
+                version: VERSION,
+                session: att_a.session,
+            })
+            .unwrap();
+        assert_ne!(fs::read(&state_file).unwrap(), before_bytes);
+    }
+
+    // Reopen and verify persisted ino survived, plus verify Drop-only persistence too.
+    let new_ino;
+    {
+        let mut engine2 = open_engine(&root, &state, true, true);
+        let att2 = attach(&mut engine2, "c", &alice, true, true);
+        let tree_e: Entry = call(
+            &mut engine2,
+            &att2.session,
+            &alice,
+            Call::Lookup {
+                dir: att2.root.clone(),
+                name: "tree".into(),
+            },
+        )
+        .unwrap();
+        let sub_e: Entry = call(
+            &mut engine2,
+            &att2.session,
+            &alice,
+            Call::Lookup {
+                dir: tree_e.handle,
+                name: "sub".into(),
+            },
+        )
+        .unwrap();
+        let leaf_e: Entry = call(
+            &mut engine2,
+            &att2.session,
+            &alice,
+            Call::Lookup {
+                dir: sub_e.handle,
+                name: "leaf.txt".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(leaf_e.handle.node.ino, leaf_ino);
+
+        fs::write(root.join("on-drop.txt"), b"drop").unwrap();
+        let drop_e: Entry = call(
+            &mut engine2,
+            &att2.session,
+            &alice,
+            Call::Lookup {
+                dir: att2.root,
+                name: "on-drop.txt".into(),
+            },
+        )
+        .unwrap();
+        new_ino = drop_e.handle.node.ino;
+    }
+    let mut engine3 = open_engine(&root, &state, true, true);
+    let att3 = attach(&mut engine3, "d", &alice, true, true);
+    let drop_again: Entry = call(
+        &mut engine3,
+        &att3.session,
+        &alice,
+        Call::Lookup {
+            dir: att3.root,
+            name: "on-drop.txt".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(drop_again.handle.node.ino, new_ino);
+}
+
+#[test]
+fn live_moved_root_literal_deleted_names_symlink_utimens_device_trunc_dir_eisdir_and_ticket_release()
+ {
+    let tmp = TempDir::new("p2-10-p3s");
+    let root = tmp.path().join("root");
+    let moved_root = tmp.path().join("root-moved (deleted)");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&root).unwrap();
+
+    let mut engine = open_engine(&root, &state, true, true);
+    let root_user = cred(0, 0, vec![0], 0o022);
+    let att = attach(&mut engine, "tab-1", &root_user, true, true);
+
+    // Hold a literal `"sub (deleted)"` dir open before moving `--root` externally!
+    let del_dir: Entry = call(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Mkdir {
+            dir: att.root.clone(),
+            name: "sub (deleted)".into(),
+            mode: 0o755,
+        },
+    )
+    .unwrap();
+    let _del_dir_open: OpenRef = call(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Open {
+            ticket: ticket(),
+            handle: del_dir.handle.clone(),
+            options: opts_read(),
+        },
+    )
+    .unwrap();
+
+    // Move `--root` to a path ending in `" (deleted)"` externally!
+    fs::rename(&root, &moved_root).unwrap();
+    let (del_file, del_open): (Entry, OpenRef) = call(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Create {
+            ticket: ticket(),
+            dir: del_dir.handle.clone(),
+            name: "file (deleted)".into(),
+            mode: 0o644,
+            options: opts_create_rw_excl(),
+        },
+    )
+    .unwrap();
+    assert_eq!(del_file.metadata.nlink, 1);
+
+    // Symlink utimens updates symlink timestamps via parent+AT_SYMLINK_NOFOLLOW, never target!
+    let (target_e, target_o): (Entry, OpenRef) = call(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Create {
+            ticket: ticket(),
+            dir: att.root.clone(),
+            name: "target.txt".into(),
+            mode: 0o644,
+            options: opts_create_rw_excl(),
+        },
+    )
+    .unwrap();
+    call_unit(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Release { open: target_o },
+    )
+    .unwrap();
+    let target_before = call::<Metadata>(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Setattr {
+            handle: target_e.handle.clone(),
+            attr: SetAttr {
+                atime: abi::Time::At { sec: 500, nsec: 0 },
+                mtime: abi::Time::At { sec: 600, nsec: 0 },
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(target_before.mtime.sec, 600);
+
+    let sym_e: Entry = call(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Symlink {
+            dir: att.root.clone(),
+            name: "link".into(),
+            target: "target.txt".into(),
+        },
+    )
+    .unwrap();
+    let sym_after = call::<Metadata>(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Setattr {
+            handle: sym_e.handle,
+            attr: SetAttr {
+                atime: abi::Time::At { sec: 111, nsec: 0 },
+                mtime: abi::Time::At { sec: 222, nsec: 0 },
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(sym_after.mtime.sec, 222);
+    let target_after: Metadata = call(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Metadata {
+            handle: target_e.handle,
+        },
+    )
+    .unwrap();
+    assert_eq!(target_after.mtime.sec, 600);
+
+    // Emulated device node rejects SetAttr.size with EINVAL.
+    let dev_e: Entry = call(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Mknod {
+            dir: att.root.clone(),
+            name: "null0".into(),
+            mode: 0o666,
+            rdev: "chr:1:3".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        call::<Metadata>(
+            &mut engine,
+            &att.session,
+            &root_user,
+            Call::Setattr {
+                handle: dev_e.handle,
+                attr: SetAttr {
+                    size: Some(12),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap_err(),
+        Errno::EINVAL
+    );
+
+    // Opening a directory with write or truncate returns EISDIR before EACCES or EROFS.
+    let locked_dir: Entry = call(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Mkdir {
+            dir: att.root.clone(),
+            name: "locked-dir".into(),
+            mode: 0o000,
+        },
+    )
+    .unwrap();
+    let alice = cred(1000, 1000, vec![1000], 0o022);
+    assert_eq!(
+        call::<OpenRef>(
+            &mut engine,
+            &att.session,
+            &alice,
+            Call::Open {
+                ticket: ticket(),
+                handle: locked_dir.handle.clone(),
+                options: *OpenOptions::new().write(true),
+            },
+        )
+        .unwrap_err(),
+        Errno::EISDIR
+    );
+    assert_eq!(
+        call::<OpenRef>(
+            &mut engine,
+            &att.session,
+            &alice,
+            Call::Open {
+                ticket: ticket(),
+                handle: locked_dir.handle.clone(),
+                options: *OpenOptions::new().read(true).truncate(true),
+            },
+        )
+        .unwrap_err(),
+        Errno::EISDIR
+    );
+    let mut ro_engine = open_engine(&moved_root, &state.join("ro"), false, false);
+    let att_ro = attach(&mut ro_engine, "ro-tab", &alice, false, false);
+    assert_eq!(
+        call::<OpenRef>(
+            &mut ro_engine,
+            &att_ro.session,
+            &alice,
+            Call::Open {
+                ticket: ticket(),
+                handle: att_ro.root,
+                options: *OpenOptions::new().write(true),
+            },
+        )
+        .unwrap_err(),
+        Errno::EISDIR
+    );
+
+    // Release clears the open ticket so replaying it never returns the released dead OpenRef,
+    // and releasing many normal opens never evicts an early CancelOpen ticket.
+    let cancel_t = "early-cancel-ticket";
+    call_unit(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::CancelOpen {
+            ticket: cancel_t.into(),
+        },
+    )
+    .unwrap();
+
+    call_unit(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Release {
+            open: del_open.clone(),
+        },
+    )
+    .unwrap();
+    // Replaying `del_file` with a fresh open after release works cleanly and allocates a new id,
+    // while replaying the exact create ticket fails EEXIST instead of returning dead `del_open`.
+    let (reopened_e, reopened_o): (Entry, OpenRef) = call(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Create {
+            ticket: "reused-after-release".into(),
+            dir: del_dir.handle,
+            name: "reused.txt".into(),
+            mode: 0o644,
+            options: opts_create_rw_excl(),
+        },
+    )
+    .unwrap();
+    call_unit(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Release {
+            open: reopened_o.clone(),
+        },
+    )
+    .unwrap();
+    let replay_open: OpenRef = call(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Open {
+            ticket: "reused-after-release".into(),
+            handle: reopened_e.handle.clone(),
+            options: opts_read(),
+        },
+    )
+    .unwrap();
+    assert_ne!(replay_open.id, reopened_o.id);
+    assert_eq!(
+        call::<Metadata>(
+            &mut engine,
+            &att.session,
+            &root_user,
+            Call::OpenMetadata { open: reopened_o },
+        )
+        .unwrap_err(),
+        Errno::EBADF
+    );
+    let live_meta: Metadata = call(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::OpenMetadata {
+            open: replay_open.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(live_meta.nlink, 1);
+    call_unit(
+        &mut engine,
+        &att.session,
+        &root_user,
+        Call::Release { open: replay_open },
+    )
+    .unwrap();
+
+    // 4100 normal open/release cycles must NOT evict `early-cancel-ticket`.
+    for i in 0..4100 {
+        let o: OpenRef = call(
+            &mut engine,
+            &att.session,
+            &root_user,
+            Call::Open {
+                ticket: format!("churn-{i}"),
+                handle: del_file.handle.clone(),
+                options: opts_read(),
+            },
+        )
+        .unwrap();
+        call_unit(
+            &mut engine,
+            &att.session,
+            &root_user,
+            Call::Release { open: o },
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        call::<OpenRef>(
+            &mut engine,
+            &att.session,
+            &root_user,
+            Call::Open {
+                ticket: cancel_t.into(),
+                handle: del_file.handle,
+                options: opts_read(),
+            },
+        )
+        .unwrap_err(),
+        Errno::ECANCELED
+    );
+}
+
+#[test]
+fn crash_after_unflushed_lookup_advances_generation_to_reject_stale_handle() {
+    let tmp = TempDir::new("crash-gen-epoch");
+    let root = tmp.path().join("root");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("unflushed-a.txt"), b"alpha").unwrap();
+    fs::write(root.join("unflushed-b.txt"), b"beta").unwrap();
+
+    let owner = cred(1000, 1000, vec![1000], 0o022);
+    let mut engine = open_engine(&root, &state, true, true);
+    let state_file = engine.state_file_path().to_path_buf();
+    let att = attach(&mut engine, "c-crash", &owner, true, true);
+
+    // Persisted mutation flushes `kept.txt` (`ino = 2`, `generation = 1`) to disk.
+    let (kept_entry, kept_open): (Entry, OpenRef) = call(
+        &mut engine,
+        &att.session,
+        &owner,
+        Call::Create {
+            ticket: ticket(),
+            dir: att.root.clone(),
+            name: "kept.txt".into(),
+            mode: 0o600,
+            options: opts_create_w_excl(),
+        },
+    )
+    .unwrap();
+    call_unit(
+        &mut engine,
+        &att.session,
+        &owner,
+        Call::Release { open: kept_open },
+    )
+    .unwrap();
+    let pre_crash_state = fs::read(&state_file).unwrap();
+
+    // Read-only discovery mints `unflushed-a.txt` (`ino = 3`, `generation = 1`) in memory without
+    // rewriting the JSON store immediately.
+    let a_entry: Entry = call(
+        &mut engine,
+        &att.session,
+        &owner,
+        Call::Lookup {
+            dir: att.root.clone(),
+            name: "unflushed-a.txt".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(a_entry.handle.node.ino, kept_entry.handle.node.ino + 1);
+    assert_eq!(fs::read(&state_file).unwrap(), pre_crash_state);
+
+    // Drop to release the test-process flock, then restore the exact pre-crash JSON bytes.
+    drop(engine);
+    fs::write(&state_file, pre_crash_state).unwrap();
+
+    // Restarting advances `next_generation` and flushes before serving any lookup, so discovering
+    // `unflushed-b.txt` reuses the same `next_ino` (`3`) at a higher generation (`2`), making
+    // `a_entry.handle` fail `ESTALE` while persisted `kept_entry.handle` remains valid.
+    let mut engine2 = open_engine(&root, &state, true, true);
+    let att2 = attach(&mut engine2, "c-crash-2", &owner, true, true);
+    let b_entry: Entry = call(
+        &mut engine2,
+        &att2.session,
+        &owner,
+        Call::Lookup {
+            dir: att2.root,
+            name: "unflushed-b.txt".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(b_entry.handle.node.ino, a_entry.handle.node.ino);
+    assert!(b_entry.handle.node.generation > a_entry.handle.node.generation);
+    assert_eq!(
+        call::<Metadata>(
+            &mut engine2,
+            &att2.session,
+            &owner,
+            Call::Metadata {
+                handle: a_entry.handle,
+            },
+        )
+        .unwrap_err(),
+        Errno::ESTALE
+    );
+    let kept_meta: Metadata = call(
+        &mut engine2,
+        &att2.session,
+        &owner,
+        Call::Metadata {
+            handle: kept_entry.handle,
+        },
+    )
+    .unwrap();
+    assert_eq!(kept_meta.mode, kept_entry.metadata.mode);
+}

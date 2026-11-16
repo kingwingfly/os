@@ -488,39 +488,64 @@ pub fn proc_fd_path(fd: BorrowedFd<'_>) -> Result<PathBuf, Errno> {
     std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(|e| io_to_errno(&e))
 }
 
-/// Resolve an already-open descriptor's live path and return its canonical path relative to
-/// `canonical_root` (`""` for the root directory itself), failing if deleted or moved outside
-/// `canonical_root`.
-pub fn fd_relpath_inside_root(canonical_root: &Path, fd: BorrowedFd<'_>) -> Result<String, Errno> {
-    let link = proc_fd_path(fd)?;
-    let raw = link.as_os_str().as_encoded_bytes();
-    if raw.ends_with(b" (deleted)") {
+/// Resolve an already-open descriptor's live path relative to the live path of `root_fd` (`""` for
+/// `root_fd` itself), dynamically tracking host renames of `--root` or ancestor directories and
+/// handling literal `"* (deleted)"` names safely without relying on string suffixes.
+pub fn fd_relpath_inside_root(
+    root_fd: BorrowedFd<'_>,
+    fd: BorrowedFd<'_>,
+) -> Result<String, Errno> {
+    let stx = statx_fd(fd)?;
+    if stx.nlink == 0 {
         return Err(Errno::ENOENT);
     }
+    let root_stx = statx_fd(root_fd)?;
+    if root_stx.nlink == 0 {
+        return Err(Errno::ENOENT);
+    }
+
+    let root_link = proc_fd_path(root_fd)?;
+    let root_canon = std::fs::canonicalize(&root_link).map_err(|e| io_to_errno(&e))?;
+    let link = proc_fd_path(fd)?;
     let canon = std::fs::canonicalize(&link).map_err(|e| io_to_errno(&e))?;
-    let rel = canon
-        .strip_prefix(canonical_root)
-        .map_err(|_| Errno::EACCES)?;
-    if rel.as_os_str().is_empty() {
-        return Ok(String::new());
-    }
-    let mut parts = Vec::new();
-    for comp in rel.components() {
-        match comp {
-            std::path::Component::Normal(p) => {
-                let s = p.to_str().ok_or(Errno::EIO)?;
-                parts.push(s);
+    let rel = canon.strip_prefix(&root_canon).map_err(|_| Errno::EACCES)?;
+    let rel_str = if rel.as_os_str().is_empty() {
+        String::new()
+    } else {
+        let mut parts = Vec::new();
+        for comp in rel.components() {
+            match comp {
+                std::path::Component::Normal(p) => {
+                    let s = p.to_str().ok_or(Errno::EIO)?;
+                    parts.push(s);
+                }
+                _ => return Err(Errno::EACCES),
             }
-            _ => return Err(Errno::EACCES),
         }
+        parts.join("/")
+    };
+
+    // Guard against the rare case where an unlinked open dentry (`"... (deleted)"` with another
+    // hard link so nlink > 0) collides with a real unrelated host entry literally named `"* (deleted)"`.
+    let probe_target = if rel_str.is_empty() { "." } else { &rel_str };
+    let probe = open_beneath(root_fd, probe_target, libc::O_PATH | libc::O_NOFOLLOW, 0)
+        .map_err(|e| if e == Errno::EACCES { e } else { Errno::ENOENT })?;
+    let probe_stx = statx_fd(std::os::fd::AsFd::as_fd(&probe))?;
+    if probe_stx.ino != stx.ino
+        || probe_stx.dev != stx.dev
+        || probe_stx.mnt_id != stx.mnt_id
+        || probe_stx.subvol != stx.subvol
+        || probe_stx.kind != stx.kind
+    {
+        return Err(Errno::ENOENT);
     }
-    Ok(parts.join("/"))
+    Ok(rel_str)
 }
 
-/// Verify an already-open directory descriptor still resides inside `canonical_root` and has not
-/// been deleted or moved out of the mount tree externally.
-pub fn verify_fd_inside_root(canonical_root: &Path, fd: BorrowedFd<'_>) -> Result<(), Errno> {
-    fd_relpath_inside_root(canonical_root, fd).map(|_| ())
+/// Verify an already-open directory descriptor still resides inside `root_fd` and has not been
+/// deleted or moved out of the mount tree externally.
+pub fn verify_fd_inside_root(root_fd: BorrowedFd<'_>, fd: BorrowedFd<'_>) -> Result<(), Errno> {
+    fd_relpath_inside_root(root_fd, fd).map(|_| ())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -924,8 +949,8 @@ fn to_utim_spec(t: abi::Time) -> libc::timespec {
     }
 }
 
-/// Apply timestamps directly to an already-validated file/directory/symlink descriptor (`O_PATH`
-/// included) via `/proc/self/fd`, avoiding pathname lookup races.
+/// Apply timestamps directly to an already-validated file/directory/other descriptor (`O_PATH`
+/// included) via `/proc/self/fd`, avoiding pathname lookup races. Not used for symlinks.
 pub fn utimensat_exact_fd(
     fd: BorrowedFd<'_>,
     atime: abi::Time,
@@ -935,6 +960,26 @@ pub fn utimensat_exact_fd(
     let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
     let c_path = c_str(&path)?;
     let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    if rc == 0 { Ok(()) } else { Err(last_errno()) }
+}
+
+/// Apply timestamps to `name` inside `dir_fd` without dereferencing symlinks (`AT_SYMLINK_NOFOLLOW`).
+pub fn utimensat_nofollow_at(
+    dir_fd: BorrowedFd<'_>,
+    name: &str,
+    atime: abi::Time,
+    mtime: abi::Time,
+) -> Result<(), Errno> {
+    let times = [to_utim_spec(atime), to_utim_spec(mtime)];
+    let c_name = c_str(name)?;
+    let rc = unsafe {
+        libc::utimensat(
+            dir_fd.as_raw_fd(),
+            c_name.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
     if rc == 0 { Ok(()) } else { Err(last_errno()) }
 }
 
