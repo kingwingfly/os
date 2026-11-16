@@ -4,7 +4,10 @@ use os_core::{bin, cli, text};
 use os_userland::{Io, Sys};
 use std::io::{self, BufRead, Write};
 mod accelerator;
+mod chroot;
+mod findmnt;
 mod imagectl;
+mod mount;
 mod providerctl;
 mod xargs;
 
@@ -24,15 +27,13 @@ impl Sys for Os {
     }
     async fn read(&self, path: &str) -> Result<Vec<u8>, abi::Error> {
         std::fs::read(path).map_err(|error| {
-            abi::Error::because(
-                match error.kind() {
-                    io::ErrorKind::NotFound => abi::Errno::ENOENT,
-                    io::ErrorKind::PermissionDenied => abi::Errno::EACCES,
-                    io::ErrorKind::IsADirectory => abi::Errno::EISDIR,
-                    _ => abi::Errno::EIO,
-                },
-                error.to_string(),
-            )
+            let errno = os_posix::errno_of(&error).unwrap_or(match error.kind() {
+                io::ErrorKind::NotFound => abi::Errno::ENOENT,
+                io::ErrorKind::PermissionDenied => abi::Errno::EACCES,
+                io::ErrorKind::IsADirectory => abi::Errno::EISDIR,
+                _ => abi::Errno::EIO,
+            });
+            abi::Error::because(errno, error.to_string())
         })
     }
     async fn write(&self, path: &str, bytes: &[u8]) -> Result<(), abi::Error> {
@@ -65,14 +66,12 @@ impl Sys for Os {
             }
         };
         write().map_err(|e| {
-            abi::Error::because(
-                match e.kind() {
-                    io::ErrorKind::PermissionDenied => abi::Errno::EACCES,
-                    io::ErrorKind::NotFound => abi::Errno::ENOENT,
-                    _ => abi::Errno::EIO,
-                },
-                e.to_string(),
-            )
+            let errno = os_posix::errno_of(&e).unwrap_or(match e.kind() {
+                io::ErrorKind::PermissionDenied => abi::Errno::EACCES,
+                io::ErrorKind::NotFound => abi::Errno::ENOENT,
+                _ => abi::Errno::EIO,
+            });
+            abi::Error::because(errno, e.to_string())
         })
     }
 }
@@ -81,9 +80,6 @@ fn main() {
     if let Err(error) = os_posix::init_preopens() {
         eprintln!("utilities: {error}");
         std::process::exit(1);
-    }
-    if let Some(pwd) = std::env::var_os("PWD") {
-        let _ = std::env::set_current_dir(pwd);
     }
     let mut args: Vec<String> = std::env::args().collect();
     let name = args
@@ -108,11 +104,23 @@ fn main() {
         eprintln!("utilities: {}: no such program", args[0]);
         std::process::exit(127);
     }
+    if args[0] == "chroot" {
+        std::process::exit(chroot::run(&args[1..]));
+    }
     if cli::wants_help(&args)
         && let Some(help) = cli::help(&args[0])
     {
         println!("{help}");
         return;
+    }
+    if args[0] == "mount" {
+        std::process::exit(mount::run_mount(&args[1..]));
+    }
+    if args[0] == "umount" {
+        std::process::exit(mount::run_umount(&args[1..]));
+    }
+    if args[0] == "findmnt" {
+        std::process::exit(findmnt::run(&args[1..]));
     }
     if matches!(args[0].as_str(), "zip" | "unzip" | "tar" | "faststart") {
         let status = accelerator::run(&args[0], &args[1..]).unwrap_or_else(|error| {
@@ -181,9 +189,8 @@ fn main() {
     let mut state = Io {
         args,
         cwd: std::env::current_dir()
-            .unwrap_or_else(|_| "/".into())
-            .to_string_lossy()
-            .into_owned(),
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         home: std::env::var("HOME").unwrap_or_else(|_| "/".into()),
         now: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -41,7 +41,7 @@ impl Io<'_> {
         } else {
             operand.to_string()
         };
-        if operand.starts_with('/') {
+        if operand.starts_with('/') || self.cwd.is_empty() {
             operand
         } else if self.cwd == "/" {
             format!("/{operand}")
@@ -86,4 +86,33 @@ pub fn basename(path: &str) -> &str {
         return "/";
     }
     trimmed.rsplit('/').next().unwrap_or(trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_io(cwd: &str) -> Io<'static> {
+        Io {
+            args: Vec::new(),
+            cwd: cwd.to_string(),
+            home: "/home/user".to_string(),
+            now: 0,
+            stdin: None,
+            out: String::new(),
+            err: Vec::new(),
+            found: Vec::new(),
+            cancelled: &|| false,
+            ask: &|_| Box::pin(async { None }),
+        }
+    }
+
+    #[test]
+    fn empty_cwd_preserves_relative_operands_without_leading_slash() {
+        let io = test_io("");
+        assert_eq!(io.path("sub/file"), "sub/file");
+        assert_eq!(io.path("../sibling"), "../sibling");
+        assert_eq!(io.path("/abs/path"), "/abs/path");
+        assert_eq!(io.path("~/notes"), "/home/user/notes");
+    }
 }

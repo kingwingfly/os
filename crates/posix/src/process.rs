@@ -1,4 +1,4 @@
-//! Process creation for WASI preview 1 programs, over the runtime's generic host adapter.
+//! Process creation and image replacement for WASI/WASIX programs over the OS host adapter.
 use std::io;
 
 #[derive(Clone, Copy)]
@@ -24,13 +24,16 @@ impl ExitStatus {
     }
 }
 
-/// Spawn through PATH, inheriting credentials, umask, cwd, environment and descriptors.
+/// Spawn through PATH, inheriting credentials, umask, cwd, root, mount namespace and descriptors.
 /// The stdin action is applied only in the child. Close-on-exec descriptors are excluded.
 pub fn spawn(argv: &[String], stdin: Stdin) -> io::Result<Child> {
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     spawn_with(
         argv,
         stdin,
-        &std::env::current_dir()?.to_string_lossy(),
+        &cwd,
         &std::env::vars()
             .map(|(name, value)| format!("{name}={value}"))
             .collect::<Vec<_>>(),
@@ -97,6 +100,63 @@ pub fn spawn_configured(
             io::ErrorKind::Unsupported,
             "requires the WASI process adapter",
         ))
+    }
+}
+
+/// Replace the current process image in place, searching `PATH` when `file` contains no `'/'`.
+///
+/// Preserves PID, process group, controlling TTY, open non-`FD_CLOEXEC` descriptors, mount
+/// namespace, `FsContext.root` (`chroot`), and `FsContext.cwd`. Never returns on success;
+/// returns the failure `io::Error` if the image could not be resolved or executed.
+pub fn execvp(file: &str, argv: &[String]) -> io::Error {
+    let env: Vec<String> = std::env::vars()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    exec_impl(file, argv, &env, !file.contains('/'))
+}
+
+/// Replace the current process image in place without searching `PATH`.
+pub fn execve(file: &str, argv: &[String], env: &[String]) -> io::Error {
+    exec_impl(file, argv, env, false)
+}
+
+fn exec_impl(file: &str, argv: &[String], env: &[String], search: bool) -> io::Error {
+    if file.is_empty() {
+        return crate::os_error(abi::Error::new(abi::Errno::ENOENT));
+    }
+    if file.contains('\0')
+        || argv.is_empty()
+        || argv.iter().any(|arg| arg.contains('\0'))
+        || env.iter().any(|entry| entry.contains('\0'))
+    {
+        return crate::os_error(abi::Error::new(abi::Errno::EINVAL));
+    }
+    let request = match serde_json::to_vec(&serde_json::json!({
+        "file": file,
+        "argv": argv,
+        "env": env,
+        "search": search,
+    })) {
+        Ok(bytes) => bytes,
+        Err(err) => return err.into(),
+    };
+    #[cfg(target_arch = "wasm32")]
+    {
+        // SAFETY: `request` lives across the host call; on success the host unwinds the image.
+        let rc = unsafe { crate::wasi_libc::host::host_execve(request.as_ptr(), request.len()) };
+        if rc < 0 {
+            crate::host_errno_error(-rc)
+        } else {
+            crate::os_error(abi::Error::new(abi::Errno::ENOEXEC))
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = request;
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "requires the WASI process adapter",
+        )
     }
 }
 
