@@ -422,14 +422,23 @@ function* fstat(found) {
 const size = found => found.size;
 
 // Open the file at `path` for reading: fallback for /proc, devices, and hosts without a channel.
-function* openRead(path) {
-  const [opened, read, stated] = yield* batch([{ open: { path, flags: O_RDONLY } }, { pread: { fd: { ref: 0 }, count: INLINE } }, { stat: { path } }]);
-  if (opened.err?.errno === 'EISDIR') return { kind: 'dir', path };
+function* openRead(path, oflags = 0, dirflags = FOLLOW) {
+  const truncate = (oflags & OFLAG_TRUNC) !== 0;
+  const allowDir = !(truncate || (oflags & OFLAG_CREAT));
+  const flags = O_RDONLY | (truncate ? O_TRUNC : 0) | (dirflags & FOLLOW ? 0 : O_NOFOLLOW);
+  const [opened, read, stated] = yield* batch([{ open: { path, flags } }, { pread: { fd: { ref: 0 }, count: INLINE } }, { stat: { path } }]);
+  if (opened.err?.errno === 'EISDIR') {
+    if (!allowDir) throw new Errno(EISDIR);
+    return { kind: 'dir', path };
+  }
   const { fd, token, device } = ok(opened);
   // What cannot be read closes, as it goes: a directory, opened as open(2) opens one, is one.
   if ('err' in read) {
     closing.push(fd);
-    if (read.err.errno === 'EISDIR') return { kind: 'dir', path };
+    if (read.err.errno === 'EISDIR') {
+      if (!allowDir) throw new Errno(EISDIR);
+      return { kind: 'dir', path };
+    }
     ok(read);
   }
   const first = read.ok;
@@ -786,7 +795,7 @@ function* openPath(path, dirflags, oflags, base, fdflags, noctty = false, mode =
       if (read && !readable || write && !writable) throw new Errno(ERRNO.EACCES);
       found = { ...original, refs: 0, flags: descriptorFlags(), readable: read, writable: write };
     } else if (path === '/dev/pts') {
-      if (write) throw new Errno(EISDIR);
+      if (write || (oflags & OFLAG_TRUNC)) throw new Errno(EISDIR);
       found = { kind: 'dir', path };
     } else if (allocatedPath(path)) {
       if (oflags & OFLAG_DIRECTORY) throw new Errno(ENOTDIR);
@@ -807,10 +816,10 @@ function* openPath(path, dirflags, oflags, base, fdflags, noctty = false, mode =
       } else {
         try {
           const opened = yield* call({ open: { path, flags: (write ? read ? O_RDWR : O_WRONLY : O_RDONLY) |
-            (oflags & OFLAG_CREAT ? O_CREAT : 0) | (oflags & OFLAG_TRUNC ? O_TRUNC : 0) | (oflags & OFLAG_EXCL ? O_EXCL : 0) | (append ? O_APPEND : 0), mode } });
+            (oflags & OFLAG_CREAT ? O_CREAT : 0) | (oflags & OFLAG_TRUNC ? O_TRUNC : 0) | (oflags & OFLAG_EXCL ? O_EXCL : 0) | (append ? O_APPEND : 0) | (dirflags & FOLLOW ? 0 : O_NOFOLLOW), mode } });
           found = { kind: 'file', local: true, path, kfd: opened.fd, token: opened.token, read, writable: write, pos: 0, size: opened.size, stat: opened.stat };
         } catch (error) {
-          if (!(error instanceof Errno) || error.errno !== EISDIR || write) throw error;
+          if (!(error instanceof Errno) || error.errno !== EISDIR || write || (oflags & OFLAG_TRUNC)) throw error;
           found = { kind: 'dir', path };
         }
       }
@@ -825,7 +834,7 @@ function* openPath(path, dirflags, oflags, base, fdflags, noctty = false, mode =
           if (kindOf((yield* stat(path, (dirflags & FOLLOW) !== 0)).mode) !== DIRECTORY) throw new Errno(ENOTDIR);
           found = { kind: 'dir', path };
         } else if (!write) {
-          found = yield* openRead(path);
+          found = yield* openRead(path, oflags, dirflags);
         } else {
           found = yield* openWriter(path, (oflags & OFLAG_CREAT ? O_CREAT : 0) | (oflags & OFLAG_EXCL ? O_EXCL : 0) | (oflags & OFLAG_TRUNC ? O_TRUNC : 0), read, mode);
         }

@@ -12,7 +12,7 @@ const O_NOFOLLOW: u32 = 0o400000;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::{Rc, Weak};
 use vfs::{
     Access, Cred, Entry, Filesystem, FsId, Handle, Identity, Metadata, NodeId, OpenRef, SetAttr,
@@ -191,32 +191,78 @@ fn clean_rel_path(path: &str) -> std::result::Result<(Vec<String>, bool), Errno>
     Ok((out, trailing_dir))
 }
 
-fn expand_symlink(
-    prefix: &[String],
-    boundary_len: usize,
+fn parse_u16_field(val: &Value, key: &str) -> std::result::Result<Option<u16>, Errno> {
+    match val.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .map(Some)
+            .ok_or(Errno::EINVAL),
+    }
+}
+
+fn parse_u32_field(val: &Value, key: &str) -> std::result::Result<Option<u32>, Errno> {
+    match val.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .map(Some)
+            .ok_or(Errno::EINVAL),
+    }
+}
+
+fn parse_off_field(val: &Value, key: &str) -> std::result::Result<Option<u64>, Errno> {
+    match val.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .filter(|&n| n <= abi::fs::FILE_MAX)
+            .map(Some)
+            .ok_or(Errno::EINVAL),
+    }
+}
+
+fn push_target_segments(
+    queue: &mut VecDeque<String>,
     link_target: &str,
-) -> std::result::Result<Vec<String>, Errno> {
-    if link_target.starts_with('/') {
+) -> std::result::Result<(), Errno> {
+    if link_target.is_empty() || link_target.starts_with('/') {
         return Err(Errno::ENOENT);
     }
-    let mut resolved = prefix.to_vec();
+    let mut segments = Vec::new();
     for seg in link_target.split('/') {
-        if seg.is_empty() || seg == "." {
+        if seg.is_empty() {
             continue;
         }
-        if seg == ".." {
-            if resolved.len() <= boundary_len {
-                return Err(Errno::ELOOP);
-            }
-            resolved.pop();
-        } else {
-            if seg.len() > abi::NAME_MAX {
-                return Err(Errno::ENAMETOOLONG);
-            }
-            resolved.push(seg.to_string());
+        if seg != "." && seg != ".." && seg.len() > abi::NAME_MAX {
+            return Err(Errno::ENAMETOOLONG);
         }
+        segments.push(seg.to_string());
     }
-    Ok(resolved)
+    for seg in segments.into_iter().rev() {
+        queue.push_front(seg);
+    }
+    Ok(())
+}
+
+struct WalkFrame {
+    entry: Entry,
+    component: Option<String>,
+    searchable: bool,
+}
+
+enum WalkOutcome {
+    Found {
+        entry: Entry,
+        parts: Vec<String>,
+    },
+    MissingLast {
+        parent: Entry,
+        name: String,
+        parts: Vec<String>,
+    },
 }
 
 type OpenTable = RefCell<HashMap<u64, RetainedOpen>>;
@@ -515,6 +561,185 @@ impl LocalMount {
         })
     }
 
+    async fn walk_to_boundary(&self, cred: &Cred) -> std::result::Result<Vec<WalkFrame>, Errno> {
+        let fs = &self.state.fs;
+        let owner_cred = self.owner_cred();
+        let root_cred = if self.boundary.is_empty() {
+            cred
+        } else {
+            &owner_cred
+        };
+        let root_handle = fs.root();
+        let root_meta = fs.metadata(root_cred, &root_handle).await?;
+        let mut stack = vec![WalkFrame {
+            entry: Entry {
+                handle: root_handle,
+                metadata: root_meta,
+            },
+            component: None,
+            searchable: false,
+        }];
+        for comp in &self.boundary {
+            let parent_handle = stack.last().expect("root").entry.handle.clone();
+            let entry = fs.lookup(&owner_cred, &parent_handle, comp).await?;
+            if self.remote && entry.metadata.file_type == FileType::Symlink {
+                return Err(Errno::ELOOP);
+            }
+            if entry.metadata.file_type != FileType::Dir {
+                return Err(Errno::ENOTDIR);
+            }
+            stack.last_mut().expect("root").searchable = true;
+            stack.push(WalkFrame {
+                entry,
+                component: Some(comp.clone()),
+                searchable: false,
+            });
+        }
+        // Reset search check on the boundary directory so the acting credential is verified
+        // whenever stepping into user-supplied segments or `.` / `..`.
+        stack.last_mut().expect("boundary").searchable = false;
+        Ok(stack)
+    }
+
+    async fn ensure_searchable(
+        &self,
+        cred: &Cred,
+        frame: &mut WalkFrame,
+    ) -> std::result::Result<(), Errno> {
+        if frame.searchable {
+            return Ok(());
+        }
+        if frame.entry.metadata.file_type != FileType::Dir {
+            return Err(Errno::ENOTDIR);
+        }
+        match self.state.fs.lookup(cred, &frame.entry.handle, "_").await {
+            Ok(_) | Err(Errno::ENOENT) => {
+                frame.searchable = true;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn resolve_walk(
+        &self,
+        cred: &Cred,
+        initial_parts: Vec<String>,
+        follow_last: bool,
+        mut trailing_dir: bool,
+        allow_missing_last: bool,
+    ) -> std::result::Result<WalkOutcome, Errno> {
+        self.check_within_boundary(&initial_parts)?;
+        let fs = &self.state.fs;
+        let mut stack = self.walk_to_boundary(cred).await?;
+        let boundary_stack_len = stack.len();
+        let mut queue: VecDeque<String> = initial_parts[self.boundary.len()..]
+            .iter()
+            .cloned()
+            .collect();
+        let mut depth = 0usize;
+
+        while let Some(front) = queue.front().map(String::as_str) {
+            match front {
+                "." => {
+                    self.ensure_searchable(cred, stack.last_mut().expect("boundary"))
+                        .await?;
+                    queue.pop_front();
+                }
+                ".." => {
+                    self.ensure_searchable(cred, stack.last_mut().expect("boundary"))
+                        .await?;
+                    queue.pop_front();
+                    if stack.len() <= boundary_stack_len {
+                        return Err(Errno::ELOOP);
+                    }
+                    stack.pop();
+                }
+                _ => {
+                    let name = queue.pop_front().expect("front");
+                    if name.len() > abi::NAME_MAX {
+                        return Err(Errno::ENAMETOOLONG);
+                    }
+                    let is_last = queue.is_empty();
+                    let parent_entry = stack.last().expect("boundary").entry.clone();
+                    match fs.lookup(cred, &parent_entry.handle, &name).await {
+                        Ok(next) => {
+                            stack.last_mut().expect("boundary").searchable = true;
+                            if next.metadata.file_type == FileType::Symlink
+                                && (!is_last || follow_last || trailing_dir)
+                            {
+                                if !vfs::descriptions::may_follow_link(
+                                    cred,
+                                    &parent_entry.metadata,
+                                    &next.metadata,
+                                ) {
+                                    return Err(Errno::EACCES);
+                                }
+                                depth += 1;
+                                if depth > SYMLINK_MAX {
+                                    return Err(Errno::ELOOP);
+                                }
+                                let link_target = fs.read_link(cred, &next.handle).await?;
+                                push_target_segments(&mut queue, &link_target)?;
+                                if is_last
+                                    && (link_target.ends_with('/') || link_target.ends_with("/."))
+                                {
+                                    trailing_dir = true;
+                                }
+                                continue;
+                            }
+                            if is_last {
+                                if trailing_dir && next.metadata.file_type != FileType::Dir {
+                                    return Err(Errno::ENOTDIR);
+                                }
+                                let parts = stack
+                                    .iter()
+                                    .filter_map(|f| f.component.clone())
+                                    .chain(std::iter::once(name))
+                                    .collect();
+                                return Ok(WalkOutcome::Found { entry: next, parts });
+                            }
+                            if next.metadata.file_type != FileType::Dir {
+                                return Err(Errno::ENOTDIR);
+                            }
+                            stack.push(WalkFrame {
+                                entry: next,
+                                component: Some(name),
+                                searchable: false,
+                            });
+                        }
+                        Err(Errno::ENOENT) if allow_missing_last && is_last => {
+                            if trailing_dir {
+                                return Err(Errno::EISDIR);
+                            }
+                            let parts = stack
+                                .iter()
+                                .filter_map(|f| f.component.clone())
+                                .chain(std::iter::once(name.clone()))
+                                .collect();
+                            return Ok(WalkOutcome::MissingLast {
+                                parent: parent_entry,
+                                name,
+                                parts,
+                            });
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        }
+
+        let top = stack.last().expect("boundary");
+        if trailing_dir && top.entry.metadata.file_type != FileType::Dir {
+            return Err(Errno::ENOTDIR);
+        }
+        let parts = stack.iter().filter_map(|f| f.component.clone()).collect();
+        Ok(WalkOutcome::Found {
+            entry: top.entry.clone(),
+            parts,
+        })
+    }
+
     async fn resolve_parts(
         &self,
         cred: &Cred,
@@ -522,77 +747,12 @@ impl LocalMount {
         follow_last: bool,
         trailing_dir: bool,
     ) -> std::result::Result<(Entry, Vec<String>), Errno> {
-        self.check_within_boundary(&initial_parts)?;
-        let fs = &self.state.fs;
-        let mut parts = initial_parts;
-        let mut depth = 0usize;
-
-        'restart: loop {
-            self.check_within_boundary(&parts)?;
-            let owner_cred = self.owner_cred();
-            let root_handle = fs.root();
-            let root_meta = fs
-                .metadata(
-                    if self.boundary.is_empty() {
-                        cred
-                    } else {
-                        &owner_cred
-                    },
-                    &root_handle,
-                )
-                .await?;
-            let mut current = Entry {
-                handle: root_handle,
-                metadata: root_meta,
-            };
-
-            if parts.is_empty() {
-                return Ok((current, parts));
-            }
-
-            for i in 0..parts.len() {
-                let is_last = i + 1 == parts.len();
-                let step_cred = if i < self.boundary.len() {
-                    &owner_cred
-                } else {
-                    cred
-                };
-                let next = fs.lookup(step_cred, &current.handle, &parts[i]).await?;
-                if i < self.boundary.len()
-                    && self.remote
-                    && next.metadata.file_type == FileType::Symlink
-                {
-                    return Err(Errno::ELOOP);
-                }
-                if next.metadata.file_type == FileType::Symlink && (!is_last || follow_last) {
-                    if !vfs::descriptions::may_follow_link(
-                        step_cred,
-                        &current.metadata,
-                        &next.metadata,
-                    ) {
-                        return Err(Errno::EACCES);
-                    }
-                    depth += 1;
-                    if depth > SYMLINK_MAX {
-                        return Err(Errno::ELOOP);
-                    }
-                    let link_target = fs.read_link(step_cred, &next.handle).await?;
-                    let mut resolved =
-                        expand_symlink(&parts[..i], self.boundary.len(), &link_target)?;
-                    resolved.extend_from_slice(&parts[i + 1..]);
-                    parts = resolved;
-                    continue 'restart;
-                }
-                if !is_last && next.metadata.file_type != FileType::Dir {
-                    return Err(Errno::ENOTDIR);
-                }
-                current = next;
-            }
-
-            if trailing_dir && current.metadata.file_type != FileType::Dir {
-                return Err(Errno::ENOTDIR);
-            }
-            return Ok((current, parts));
+        match self
+            .resolve_walk(cred, initial_parts, follow_last, trailing_dir, false)
+            .await?
+        {
+            WalkOutcome::Found { entry, parts } => Ok((entry, parts)),
+            WalkOutcome::MissingLast { .. } => Err(Errno::ENOENT),
         }
     }
 
@@ -793,6 +953,120 @@ impl LocalMount {
         }
     }
 
+    fn record_known_path(&self, node: NodeId, rel: String) {
+        if rel.is_empty() {
+            return;
+        }
+        let mut kp = self.state.known_paths.borrow_mut();
+        let list = kp.entry(node).or_default();
+        if !list.contains(&rel) {
+            list.push(rel);
+        }
+    }
+
+    fn prune_known_paths(&self, rel: &str, is_dir: bool, keep_node: Option<NodeId>) {
+        if rel.is_empty() {
+            return;
+        }
+        let prefix = format!("{rel}/");
+        let mut kp = self.state.known_paths.borrow_mut();
+        kp.retain(|node, paths| {
+            if keep_node == Some(*node) {
+                return true;
+            }
+            paths.retain(|p| p != rel && (!is_dir || !p.starts_with(&prefix)));
+            !paths.is_empty()
+        });
+    }
+
+    async fn revalidate_live_path(
+        &self,
+        cred: &Cred,
+        open: &OpenLookup,
+        meta: &Metadata,
+    ) -> std::result::Result<(), Errno> {
+        let fs = &self.state.fs;
+        let owner_cred = self.owner_cred();
+        let boundary_stack = self.walk_to_boundary(cred).await?;
+        let boundary_handle = boundary_stack
+            .last()
+            .expect("boundary")
+            .entry
+            .handle
+            .clone();
+
+        if meta.file_type == FileType::Dir {
+            if open.handle.node == boundary_handle.node {
+                let rel = self.boundary.join("/");
+                self.record_known_path(open.handle.node, rel);
+                return Ok(());
+            }
+            let mut rev_names = Vec::new();
+            let mut cur = open.handle.clone();
+            let mut seen = HashSet::from([cur.node]);
+            while cur.node != boundary_handle.node {
+                let Some((parent_entry, name)) = fs.parent(&owner_cred, &cur).await? else {
+                    return Err(Errno::ESTALE);
+                };
+                rev_names.push(name);
+                if !seen.insert(parent_entry.handle.node) {
+                    return Err(Errno::ESTALE);
+                }
+                cur = parent_entry.handle;
+            }
+            rev_names.reverse();
+            let mut parts = self.boundary.clone();
+            parts.extend(rev_names);
+            let (live, _) = self
+                .resolve_parts(cred, parts.clone(), false, false)
+                .await?;
+            if live.handle.node != open.handle.node {
+                return Err(Errno::ESTALE);
+            }
+            self.record_known_path(open.handle.node, parts.join("/"));
+            return Ok(());
+        }
+
+        let mut queue = VecDeque::from([(boundary_handle.clone(), self.boundary.clone())]);
+        let mut visited = HashSet::from([boundary_handle.node]);
+        let mut saw_eacces = false;
+        while let Some((dir_handle, dir_parts)) = queue.pop_front() {
+            let Ok(entries) = fs.read_dir(&owner_cred, &dir_handle).await else {
+                continue;
+            };
+            for entry in entries {
+                let mut child_parts = dir_parts.clone();
+                child_parts.push(entry.name.clone());
+                if entry.node == open.handle.node {
+                    match self
+                        .resolve_parts(cred, child_parts.clone(), false, false)
+                        .await
+                    {
+                        Ok((live, _)) if live.handle.node == open.handle.node => {
+                            self.record_known_path(open.handle.node, child_parts.join("/"));
+                            return Ok(());
+                        }
+                        Err(Errno::EACCES) => {
+                            saw_eacces = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if entry.file_type == FileType::Dir
+                    && visited.insert(entry.node)
+                    && let Ok(sub) = fs.lookup(&owner_cred, &dir_handle, &entry.name).await
+                {
+                    queue.push_back((sub.handle, child_parts));
+                }
+            }
+        }
+        Err(if saw_eacces {
+            Errno::EACCES
+        } else {
+            Errno::ESTALE
+        })
+    }
+
     async fn verify_remote_open_live(
         &self,
         cred: &Cred,
@@ -880,7 +1154,7 @@ impl LocalMount {
                 }
             }
             if !reachable {
-                return Err(Errno::ESTALE);
+                self.revalidate_live_path(cred, open, &meta).await?;
             }
         }
         Ok(())
@@ -898,69 +1172,33 @@ impl LocalMount {
         if trailing_dir {
             return Err(Errno::EISDIR);
         }
-        let mut parts = initial_parts;
-        let mut depth = 0usize;
-        let ro_grant = self.state.grant.read_only || self.state.snapshot_data_ro;
+        let access = options.access()?;
+        let follow_last = !options.is_create_new() && !nofollow;
+        let mut retries = 0usize;
 
         loop {
-            self.check_within_boundary(&parts)?;
-            if parts.is_empty() || parts == self.boundary {
-                return Err(Errno::EISDIR);
-            }
-            let name = parts.last().cloned().ok_or(Errno::EISDIR)?;
-            let parent_parts = parts[..parts.len() - 1].to_vec();
-            let (parent_entry, mut resolved_parts) =
-                self.resolve_parts(cred, parent_parts, true, true).await?;
-            if parent_entry.metadata.file_type != FileType::Dir {
-                return Err(Errno::ENOTDIR);
-            }
-            resolved_parts.push(name.clone());
-            self.check_within_boundary(&resolved_parts)?;
-
             match self
-                .state
-                .fs
-                .lookup(cred, &parent_entry.handle, &name)
-                .await
+                .resolve_walk(cred, initial_parts.clone(), follow_last, false, true)
+                .await?
             {
-                Ok(existing) => {
+                WalkOutcome::Found {
+                    entry: existing,
+                    parts: resolved_parts,
+                } => {
                     if options.is_create_new() {
                         return Err(Errno::EEXIST);
                     }
-                    if existing.metadata.file_type == FileType::Symlink {
-                        if nofollow {
-                            return Err(Errno::ELOOP);
-                        }
-                        if !vfs::descriptions::may_follow_link(
-                            cred,
-                            &parent_entry.metadata,
-                            &existing.metadata,
-                        ) {
-                            return Err(Errno::EACCES);
-                        }
-                        depth += 1;
-                        if depth > SYMLINK_MAX {
-                            return Err(Errno::ELOOP);
-                        }
-                        let link_target = self.state.fs.read_link(cred, &existing.handle).await?;
-                        parts = expand_symlink(
-                            &resolved_parts[..resolved_parts.len() - 1],
-                            self.boundary.len(),
-                            &link_target,
-                        )?;
-                        continue;
+                    if nofollow && existing.metadata.file_type == FileType::Symlink {
+                        return Err(Errno::ELOOP);
                     }
                     if existing.metadata.file_type == FileType::Dir {
                         return Err(Errno::EISDIR);
                     }
-                    // Existing targets always authorize against the caller's own credentials.
+                    if access != Access::Path && (access.writes() || options.is_truncate()) {
+                        self.require_data_writable()?;
+                    }
                     let mut open_opts = *options;
                     open_opts.create(false).create_new(false);
-                    if ro_grant {
-                        let mut ro_opts = OpenOptions::new();
-                        ro_opts.read(true);
-                        open_opts = ro_opts;
-                    }
                     let open_ref = self
                         .state
                         .fs
@@ -968,10 +1206,12 @@ impl LocalMount {
                         .await?;
                     return Ok((existing, open_ref, resolved_parts, false));
                 }
-                Err(Errno::ENOENT) => {
-                    if ro_grant {
-                        return Err(Errno::EROFS);
-                    }
+                WalkOutcome::MissingLast {
+                    parent: parent_entry,
+                    name,
+                    parts: resolved_parts,
+                } => {
+                    self.require_data_writable()?;
                     // On shared exports (`self.remote`), until #59 adds multi-owner export policy,
                     // newly created nodes remain owned by the publishing account after verifying
                     // `self.identity` may create in `parent_entry`.
@@ -1003,8 +1243,8 @@ impl LocalMount {
                             return Ok((created_entry, open_ref, resolved_parts, true));
                         }
                         Err(Errno::EEXIST) if !options.is_create_new() => {
-                            depth += 1;
-                            if depth > SYMLINK_MAX {
+                            retries += 1;
+                            if retries > SYMLINK_MAX {
                                 return Err(Errno::EEXIST);
                             }
                             continue;
@@ -1012,7 +1252,6 @@ impl LocalMount {
                         Err(err) => return Err(err),
                     }
                 }
-                Err(err) => return Err(err),
             }
         }
     }
@@ -1222,17 +1461,18 @@ impl LocalMount {
                 json_to_js(&serde_json::to_value(st).unwrap_or(Value::Null))
             }
             "access" => {
-                let mode = arg_val.get("mode").and_then(Value::as_u64).unwrap_or(0) as u16;
+                let mode = parse_u16_field(&arg_val, "mode")
+                    .map_err(map_vfs_err)?
+                    .unwrap_or(0);
                 self.check_access_entry(&cred, &entry, mode)
                     .await
                     .map_err(map_vfs_err)?;
                 Ok(JsValue::NULL)
             }
             "chmod" => {
-                let mode = arg_val
-                    .get("mode")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| map_vfs_err(Errno::EINVAL))? as u16;
+                let mode = parse_u16_field(&arg_val, "mode")
+                    .map_err(map_vfs_err)?
+                    .ok_or_else(|| map_vfs_err(Errno::EINVAL))?;
                 fs.setattr(
                     &cred,
                     &entry.handle,
@@ -1247,14 +1487,8 @@ impl LocalMount {
                 Ok(JsValue::NULL)
             }
             "chown" => {
-                let uid = arg_val
-                    .get("uid")
-                    .and_then(|v| if v.is_null() { None } else { v.as_u64() })
-                    .map(|n| n as u32);
-                let gid = arg_val
-                    .get("gid")
-                    .and_then(|v| if v.is_null() { None } else { v.as_u64() })
-                    .map(|n| n as u32);
+                let uid = parse_u32_field(&arg_val, "uid").map_err(map_vfs_err)?;
+                let gid = parse_u32_field(&arg_val, "gid").map_err(map_vfs_err)?;
                 fs.setattr(
                     &cred,
                     &entry.handle,
@@ -1316,7 +1550,10 @@ impl LocalMount {
                 let value: abi::Bytes =
                     serde_json::from_value(arg_val.get("value").cloned().unwrap_or(Value::Null))
                         .map_err(|_| map_vfs_err(Errno::EINVAL))?;
-                let flags_bits = arg_val.get("flags").and_then(Value::as_u64).unwrap_or(0) as u8;
+                let flags_raw = parse_u16_field(&arg_val, "flags")
+                    .map_err(map_vfs_err)?
+                    .unwrap_or(0);
+                let flags_bits = u8::try_from(flags_raw).map_err(|_| map_vfs_err(Errno::EINVAL))?;
                 let xflags =
                     XattrFlags::from_bits(flags_bits).ok_or_else(|| map_vfs_err(Errno::EINVAL))?;
                 fs.setxattr(&cred, &entry.handle, attr_name, &value.0, xflags)
@@ -1387,12 +1624,6 @@ impl LocalMount {
         }
         let options = OpenOptions::from_flags(flags).map_err(map_vfs_err)?;
         let access = options.access().map_err(map_vfs_err)?;
-        if options.is_truncate() && !access.writes() && !options.is_create() {
-            return Err(map_vfs_err(Errno::EACCES));
-        }
-        if access.writes() || options.is_truncate() {
-            self.require_data_writable().map_err(map_vfs_err)?;
-        }
 
         let cred = self.cred(umask);
         let nofollow = flags & O_NOFOLLOW != 0;
@@ -1446,8 +1677,17 @@ impl LocalMount {
         if access != Access::Path && nofollow && entry.metadata.file_type == FileType::Symlink {
             return Err(map_vfs_err(Errno::ELOOP));
         }
+        if access != Access::Path
+            && (access.writes() || options.is_truncate())
+            && entry.metadata.file_type == FileType::Dir
+        {
+            return Err(map_vfs_err(Errno::EISDIR));
+        }
         if want_dir && entry.metadata.file_type != FileType::Dir {
             return Err(map_vfs_err(Errno::ENOTDIR));
+        }
+        if access != Access::Path && (access.writes() || options.is_truncate()) {
+            self.require_data_writable().map_err(map_vfs_err)?;
         }
         let open_ref = self
             .state
@@ -1602,13 +1842,13 @@ impl LocalMount {
         self.check_grant(&grant).map_err(map_vfs_err)?;
         self.require_data_writable().map_err(map_vfs_err)?;
         let opts = js_to_json(&options)?;
-        let offset = opts.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let offset = parse_off_field(&opts, "offset")
+            .map_err(map_vfs_err)?
+            .unwrap_or(0);
         let append_opt = opts.get("append").and_then(Value::as_bool);
-        let truncate = opts
-            .get("truncate")
-            .and_then(|v| if v.is_null() { None } else { v.as_u64() });
+        let truncate = parse_off_field(&opts, "truncate").map_err(map_vfs_err)?;
         let create = opts.get("create").and_then(Value::as_bool).unwrap_or(false);
-        let umask = opts.get("umask").and_then(Value::as_u64).map(|n| n as u16);
+        let umask = parse_u16_field(&opts, "umask").map_err(map_vfs_err)?;
         let cred = self.cred(umask);
 
         if target.is_object() {
@@ -1935,7 +2175,7 @@ impl LocalMount {
         self.check_grant(&grant).map_err(map_vfs_err)?;
         self.require_data_writable().map_err(map_vfs_err)?;
         let cred = self.cred(None);
-        let (parent_entry, name, _) = self
+        let (parent_entry, name, resolved_parts) = self
             .resolve_parent(&cred, path)
             .await
             .map_err(map_vfs_err)?;
@@ -1952,6 +2192,7 @@ impl LocalMount {
                 .await
                 .map_err(map_vfs_err)?;
         }
+        self.prune_known_paths(&resolved_parts.join("/"), directory, None);
         bump_fs_policy_rev(self.state.fs.id());
         Ok(JsValue::NULL)
     }
@@ -1972,13 +2213,20 @@ impl LocalMount {
             .map_err(map_vfs_err)?;
         let (to_parent, to_name, to_resolved) =
             self.resolve_parent(&cred, to).await.map_err(map_vfs_err)?;
-        let moved_node = self
+        let moved = self
             .state
             .fs
             .lookup(&cred, &from_parent.handle, &from_name)
             .await
+            .ok();
+        let moved_node = moved.as_ref().map(|e| e.handle.node);
+        let overwritten = self
+            .state
+            .fs
+            .lookup(&cred, &to_parent.handle, &to_name)
+            .await
             .ok()
-            .map(|e| e.handle.node);
+            .map(|e| (e.handle.node, e.metadata.file_type == FileType::Dir));
         let flags = if noreplace.unwrap_or(false) {
             RenameFlags::NOREPLACE
         } else {
@@ -1998,6 +2246,11 @@ impl LocalMount {
             .map_err(map_vfs_err)?;
         let old_rel = from_resolved.join("/");
         let new_rel = to_resolved.join("/");
+        if let Some((over_node, over_dir)) = overwritten
+            && Some(over_node) != moved_node
+        {
+            self.prune_known_paths(&new_rel, over_dir, moved_node);
+        }
         let prefix = format!("{old_rel}/");
         {
             let mut kp = self.state.known_paths.borrow_mut();
@@ -2009,6 +2262,8 @@ impl LocalMount {
                         *p = format!("{new_rel}/{rest}");
                     }
                 }
+                let mut dedup = HashSet::new();
+                paths.retain(|p| dedup.insert(p.clone()));
             }
             if let Some(node) = moved_node {
                 let list = kp.entry(node).or_default();
@@ -2292,6 +2547,7 @@ impl LocalMount {
         let state = Rc::clone(&self.state);
         let identity = self.identity.clone();
         let boundary = self.boundary.clone();
+        let remote = self.remote;
 
         let check_cb = Closure::<dyn Fn() -> js_sys::Promise>::new(move || {
             let state = Rc::clone(&state);
@@ -2309,7 +2565,7 @@ impl LocalMount {
                     state,
                     identity,
                     boundary,
-                    remote: false,
+                    remote,
                     next_local_open: Cell::new(1),
                     opens: Rc::new(RefCell::new(HashMap::new())),
                 };

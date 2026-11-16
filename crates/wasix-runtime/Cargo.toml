@@ -9,5 +9,4 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 wasm-bindgen.workspace = true
 js-sys.workspace = true
-serde.workspace = true
 serde_json.workspace = true
