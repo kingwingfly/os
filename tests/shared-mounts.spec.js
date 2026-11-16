@@ -3,7 +3,9 @@ import binaryen from 'binaryen';
 const batch = (page, calls) => page.evaluate(async calls => (await (await fetch('/api/sys', { method: 'POST', body: JSON.stringify({ calls }) })).json()).results, calls);
 async function client(browser) {
   const context = await browser.newContext(), page = await context.newPage();
-  await page.goto('/'); await page.waitForFunction(() => window.os?.shareMount);
+  const guestReady = page.waitForResponse(response => new URL(response.url()).pathname === '/api/sys' && response.request().method() === 'POST' && response.ok());
+  await page.goto('/');
+  await Promise.all([guestReady, page.waitForFunction(() => window.os?.shareMount)]);
   const [creds] = await batch(page, ['getcreds']);
   return { context, page, uid: creds.ok.uid };
 }

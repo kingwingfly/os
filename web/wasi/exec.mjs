@@ -95,6 +95,7 @@ async function closeHeld(of, pid, token, as, workspace, scope) {
     of.descriptions.delete(slot);
     return known.description;
   }).filter(Boolean).filter(description => {
+    if (description.cloud != null) return false;
     if (description.kfd >= LOCAL_FD) { if (workspace?.fds.get(description.kfd)?.scope === scope) void workspace.closeFd(description.kfd, scope).catch(() => {}); return false; }
     return true;
   });
@@ -128,6 +129,12 @@ function respond(channel, reply) {
   Atomics.notify(state, 0);
 }
 const encoder = new TextEncoder();
+const toBase64 = data => {
+  let text = '';
+  for (let i = 0; i < data.length; i += 0x8000) text += String.fromCharCode(...data.subarray(i, i + 0x8000));
+  return btoa(text);
+};
+const fromBase64 = text => Uint8Array.from(atob(text), c => c.charCodeAt(0));
 // Signals, by Linux's numbers: those that end a process by default, and those that stop and
 // continue one. A process ended by one exits 128 and its number.
 const SIG = { HUP: 1, INT: 2, QUIT: 3, KILL: 9, PIPE: 13, TERM: 15, CONT: 18, STOP: 19, TSTP: 20 };
@@ -474,7 +481,25 @@ export async function exec(stages, options = {}) {
       Atomics.notify(control, 0);
       killing = setTimeout(() => end(killedBy(signal), true), GRACE);
     };
-    // A call it waits on: answered in its channel.
+// A call it waits on: answered in its channel.
+    const cloudRequest = async args => {
+      switch (args.op) {
+        case 'open': return await kernelCall('cloud_open', { pid, path: args.path, flags: args.flags, mode: args.mode, umask: args.umask });
+        case 'read': {
+          const bytes = await kernelCall('cloud_read', { pid, id: args.id, count: args.count, offset: args.offset });
+          return { data: toBase64(bytes) };
+        }
+        case 'write': return { written: await kernelCall('cloud_write', { pid, id: args.id, data: fromBase64(args.data), offset: args.offset }) };
+        case 'seek': return { pos: await kernelCall('cloud_seek', { pid, id: args.id, offset: args.offset, whence: args.whence }) };
+        case 'fstat': return await kernelCall('cloud_fstat', { pid, id: args.id });
+        case 'truncate': await kernelCall('cloud_truncate', { pid, id: args.id, size: args.size }); return {};
+        case 'sync': await kernelCall('cloud_sync', { pid, id: args.id, data_only: !!args.data_only }); return {};
+        case 'set_append': await kernelCall('cloud_set_append', { pid, id: args.id, append: !!args.append }); return {};
+        case 'append': return { append: await kernelCall('cloud_append', { pid, id: args.id }) };
+        case 'close': await kernelCall('cloud_close', { pid, id: args.id }); return {};
+        default: throw { errno: 'ENOSYS' };
+      }
+    };
     const answer = async ({ type, args }) => {
       let reply;
       try {
@@ -485,10 +510,14 @@ export async function exec(stages, options = {}) {
             const response = await fetch('/api/sys', { method: 'POST', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ calls, pid, proc: process.token, umask: args.umask }) });
             if (!response.ok) throw { errno: 'EIO' }; return (await response.json()).results;
-          }, { allowClosedCloud: true });
+          }, { allowClosedCloud: true, umask: args.umask });
+        }
+        else if (type === 'cloud') {
+          if (process.ended) throw { errno: 'EBADF' };
+          reply = await cloudRequest(args);
         }
         else if (type === 'local_read') reply = await workspace.read(args.fd, args.offset, args.count, fsScope);
-        else if (type === 'local_write') reply = await workspace.write(args.fd, Uint8Array.from(atob(args.data), c => c.charCodeAt(0)), args.offset, fsScope, args.append);
+        else if (type === 'local_write') reply = await workspace.write(args.fd, fromBase64(args.data), args.offset, fsScope, args.append);
         else if (type === 'join') reply = await join(pid, args.pid, args.nohang, args.options);
         else if (type === 'process_call') {
           reply = args.waitpid
@@ -547,7 +576,12 @@ export async function exec(stages, options = {}) {
         : description.share != null && !files?.shares.holdable(description.share);
       if (state.descriptions.some(full)) throw Object.assign(new Error('no holder free'), { errno: 'EAGAIN' });
     };
-    const holdInheritance = (state, child) => {
+    const holdInheritance = async (state, child) => {
+      const cloudIds = [];
+      for (const description of state.descriptions) {
+        if (description.cloud != null && !cloudIds.includes(description.cloud)) cloudIds.push(description.cloud);
+      }
+      if (cloudIds.length) await kernelCall('cloud_inherit', { pid, child, ids: cloudIds });
       for (const description of state.descriptions) {
         if (description.kind === 'pty') devices.hold(pid, child, description.handle, description.refs);
         else if (description.kind === 'pipe-in' || description.kind === 'tty') known(description.buffer).hold(child, 'r', description.refs);
@@ -591,8 +625,9 @@ export async function exec(stages, options = {}) {
         alive();
         const loaded = await loadImage(result.ok).catch(error => { throw { errno: 'ENOEXEC', detail: error.message }; });
         alive();
-        holdInheritance(state, child.pid);
+        await holdInheritance(state, child.pid);
         held = true;
+        alive();
         const made = host({ pid: child.pid, token: child.token, ppid: pid, ...loaded, argv: state.argv,
           write, forked: true, start: { inherit: state }, files, fsScope, membership: membership ?? process });
         forks.push(made);
@@ -623,8 +658,9 @@ export async function exec(stages, options = {}) {
         // its late child execute or retain a charged slot without a host.
         if (process.ended || killing != null) throw { errno: 'EINTR' };
         checkInheritance(state);
-        holdInheritance(state, child.pid);
+        await holdInheritance(state, child.pid);
         held = true;
+        if (process.ended || killing != null) throw { errno: 'EINTR' };
         const made = host({ pid: child.pid, token: child.token, ppid: pid, ...process.image, argv: state.argv, write, forked: true, start: { fork: state }, transfer: [state.snapshot.memory], files, fsScope, membership: process });
         forks.push(made);
         changed();

@@ -273,7 +273,7 @@ export async function os() {
       if(a.context===persistent)await a.page.close();else await a.context.close();await b.context.close();await owner?.context.close();await stop(helper);helper=null;
     }
     const processRows=await processFacts(admin,url);
-    const evidence=[await sourceEvidence('web/wasi/process.js',['fd_datasync: () => 0','fd_sync: () => 0']),await sourceEvidence('web/kernel/client.js',["exec([['supervise', run.file]]","exec([['init']]"])];
+    const evidence=[await sourceEvidence('web/wasi/process.js',['fd_datasync: fd => attempt(() => syncFd(fd, true))','fd_sync: fd => attempt(() => syncFd(fd, false))']),await sourceEvidence('web/kernel/client.js',["exec([['supervise', run.file]]","exec([['init']]"])];
     success=true;return {observations,process:processRows,latencies,evidence,diagnostics,compiler:compilerEvidence??{dockerfile:'containers/compiler/Dockerfile'},browser:browser.version()};
   } catch(error) {
     failure=error;throw error;

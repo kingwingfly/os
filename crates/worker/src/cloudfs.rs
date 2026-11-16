@@ -44,8 +44,18 @@ pub fn schema(sql: &SqlStorage) -> worker::Result<()> {
     ] {
         sql.exec(statement, None)?;
     }
+    // The filesystem's identity exists before any call reports it: v1 stat's `dev` and the
+    // v2 handles' `fs` must agree from the first request.
+    sql.exec(
+        &format!(
+            "INSERT OR IGNORE INTO meta(k, v) VALUES('{FS_ID_KEY}', lower(hex(randomblob(32))))"
+        ),
+        None,
+    )?;
     Ok(())
 }
+/// The `meta` key of the cloud tree's filesystem id (contract §2.5).
+pub const FS_ID_KEY: &str = "vfs_id";
 
 #[derive(Deserialize)]
 struct SessionRow {
@@ -144,7 +154,7 @@ fn identity(db: &mut Db) -> (FsId, String) {
             value
         })
     };
-    (FsId(get("vfs_id")), get("vfs_handle_key"))
+    (FsId(get(FS_ID_KEY)), get("vfs_handle_key"))
 }
 fn authorize(credential: &Credential) -> Result<()> {
     credential.cloud().map_err(|_| Errno::EACCES)?;

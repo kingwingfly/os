@@ -15,10 +15,16 @@
 //! its host's (the tab, or port, that executed it): only that host forks it, replaces its image,
 //! ends it, waits for its children, or signals as it. A signal a process sends is the machine's
 //! to allow as that process, by its token; one the page sends, as the page's account.
+mod cloudfs;
+mod helper;
+mod hostfs;
+mod mounts;
+
 use abi::{Batch, Call, Errno, Error, Exec, PROC_POLL_MAX, Return, SIGTERM};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -40,11 +46,6 @@ async fn kernel_sys(body: &str) -> Result<JsValue, JsValue> {
 
 /// The kernel's own protocol version, which the page checks at start.
 pub const VERSION: &str = "1";
-
-#[wasm_bindgen]
-pub fn vfs_policy(input: &str) -> String {
-    kernel::mount_policy::json_request(input)
-}
 
 /// Local validation only. This does not verify an operator signature, activate a
 /// system generation, or confer credentials described by package metadata.
@@ -94,6 +95,8 @@ struct State {
     /// Pids lent for each process lineage. Never reuse another account's reservation after
     /// login/logout; the server binds each pool to the process token that requested it.
     spare: HashMap<String, Vec<u32>>,
+    /// Cached authenticated process identities keyed by process token.
+    identities: HashMap<String, vfs::Identity>,
     /// What happened here that the machine is still to hear: forks, exits, waits, in order.
     reports: Vec<Call>,
     /// How many reports were made, and how many the machine heard, since the kernel started.
@@ -103,7 +106,11 @@ struct State {
 
 #[wasm_bindgen]
 pub struct Kernel {
-    state: RefCell<State>,
+    state: Rc<RefCell<State>>,
+    /// The process a cloud call acts for now (cloudfs.rs), read before the driver awaits.
+    current: Rc<RefCell<cloudfs::Actor>>,
+    /// The instance's cloud filesystem session and descriptions (cloudfs.rs).
+    cloud: cloudfs::Connector,
 }
 
 #[wasm_bindgen]
@@ -115,16 +122,19 @@ impl Kernel {
     #[wasm_bindgen(constructor)]
     pub fn new(boot: &str, id: &str) -> Kernel {
         Kernel {
-            state: RefCell::new(State {
+            current: Rc::default(),
+            cloud: cloudfs::Connector::default(),
+            state: Rc::new(RefCell::new(State {
                 namespace: String::new(),
                 boot: boot.to_string(),
                 id: id.to_string(),
                 processes: HashMap::new(),
                 spare: HashMap::new(),
+                identities: HashMap::new(),
                 reports: Vec::new(),
                 queued: 0,
                 reported: 0,
-            }),
+            })),
         }
     }
 
@@ -363,37 +373,42 @@ impl Kernel {
         signal: Option<u8>,
         host: &str,
     ) -> Result<String, JsValue> {
-        let mut state = self.state.borrow_mut();
-        let local = state
-            .processes
-            .get_mut(&pid)
-            .filter(|local| local.host == host)
-            .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?;
-        if local.ended.is_some() {
-            return Err(fail(Errno::ESRCH.into()));
-        }
-        local.ended = Some((status, signal));
-        let (token, ppid) = (local.token.clone(), local.ppid);
-        let orphans: Vec<u32> = state
-            .processes
-            .iter()
-            .filter(|(_, child)| pid != INIT && child.ppid == pid)
-            .map(|(child, _)| *child)
-            .collect();
-        for orphan in orphans {
-            if state.processes[&orphan].ended.is_some() {
-                state.processes.remove(&orphan);
-            } else if let Some(child) = state.processes.get_mut(&orphan) {
-                child.ppid = INIT;
+        let (token, ppid) = {
+            let mut state = self.state.borrow_mut();
+            let local = state
+                .processes
+                .get_mut(&pid)
+                .filter(|local| local.host == host)
+                .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?;
+            if local.ended.is_some() {
+                return Err(fail(Errno::ESRCH.into()));
             }
-        }
-        state.report(Call::Exit {
-            status,
-            signal,
-            pid: Some(pid),
-            token: Some(token),
-        });
-        state.retain_spare();
+            local.ended = Some((status, signal));
+            let (token, ppid) = (local.token.clone(), local.ppid);
+            let orphans: Vec<u32> = state
+                .processes
+                .iter()
+                .filter(|(_, child)| pid != INIT && child.ppid == pid)
+                .map(|(child, _)| *child)
+                .collect();
+            for orphan in orphans {
+                if state.processes[&orphan].ended.is_some() {
+                    state.processes.remove(&orphan);
+                } else if let Some(child) = state.processes.get_mut(&orphan) {
+                    child.ppid = INIT;
+                }
+            }
+            state.report(Call::Exit {
+                status,
+                signal,
+                pid: Some(pid),
+                token: Some(token.clone()),
+            });
+            state.retain_spare();
+            (token, ppid)
+        };
+        // What it held of cloud files it lets go, as its descriptors close at exit.
+        self.cloud_exited(pid, Some(token)).await;
         Ok(json!({ "ppid": ppid }).to_string())
     }
 
@@ -629,7 +644,8 @@ impl Kernel {
             false,
         )
         .await?;
-        self.state.borrow_mut().processes.insert(
+        let mut state = self.state.borrow_mut();
+        state.processes.insert(
             INIT,
             Local {
                 ppid: 0,
@@ -638,6 +654,7 @@ impl Kernel {
                 ended: None,
             },
         );
+        state.identities.insert(token.into(), vfs::Identity::root());
         Ok(json!({ "pid": INIT, "ppid": 0, "token": token, "asset": "/usr/bin/init.wasm",
             "membership": { "pid": INIT, "ppid": 0, "pgid": INIT, "sid": INIT, "uid": 0, "ctty": 0 }
         }).to_string())
@@ -708,9 +725,15 @@ impl Kernel {
         let value = self.one(call, false).await?;
         // What it ran that this kernel kept goes too.
         let reaped: Vec<u32> = serde_json::from_value(value.clone()).unwrap_or_default();
-        let mut state = self.state.borrow_mut();
         for pid in reaped {
-            state.processes.remove(&pid);
+            let removed = {
+                let mut state = self.state.borrow_mut();
+                let removed = state.processes.remove(&pid);
+                state.retain_spare();
+                removed
+            };
+            self.cloud_exited(pid, removed.map(|local| local.token))
+                .await;
         }
         Ok(value.to_string())
     }
@@ -902,6 +925,11 @@ impl State {
     /// The server releases unused lends when the last live holder of their token ends.
     fn retain_spare(&mut self) {
         self.spare.retain(|token, _| {
+            self.processes
+                .values()
+                .any(|local| local.ended.is_none() && &local.token == token)
+        });
+        self.identities.retain(|token, _| {
             self.processes
                 .values()
                 .any(|local| local.ended.is_none() && &local.token == token)

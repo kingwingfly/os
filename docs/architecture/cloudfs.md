@@ -1,6 +1,6 @@
 # Cloud filesystem v2
 
-L1a part 2 of [#48](https://github.com/kingwingfly/os/issues/48) implements contract §2.3 at the authority and in the portable `os_vfs::cloud::CloudFs` driver. The browser syscall path still uses the existing path protocol. Client integration and its host HTTP transport are subsequent work; there is no compatibility window once repository callers move.
+Wave 1 L1 ([#48](https://github.com/kingwingfly/os/issues/48)) implements contract §2.3 across the authority, the portable `os_vfs::cloud::CloudFs` driver (`crates/vfs`), and client-kernel regular-file integration (`crates/client-kernel/src/cloudfs.rs`, `web/kernel/client.js`, `web/wasi/process.js`, `web/wasi/exec.mjs`). Regular files inside the cloud tree route through `CloudFs` and `/api/fs` v2 + `/api/fs/data`, while directories, devices, `/proc`, `/dev`, `/sys`, and mounted paths return `{"fallback": true}` and continue using the existing path calls until [#51](https://github.com/kingwingfly/os/issues/51).
 
 ## Calls and identity
 

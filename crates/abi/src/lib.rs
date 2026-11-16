@@ -14,6 +14,7 @@ use std::fmt;
 pub mod accelerator;
 pub mod contract;
 pub mod fs;
+pub mod local_helper;
 pub mod remote_fs;
 pub mod system;
 
@@ -60,6 +61,9 @@ pub enum Errno {
     EDEADLK,
     EPROTONOSUPPORT,
     ENOTCONN,
+    ENOLCK,
+    EDQUOT,
+    EINTR,
 }
 impl Errno {
     /// What glibc's strerror says of it.
@@ -105,6 +109,9 @@ impl Errno {
             EPROTONOSUPPORT => "Protocol not supported",
             ENOTCONN => "Transport endpoint is not connected",
             EDEADLK => "Resource deadlock avoided",
+            ENOLCK => "No locks available",
+            EDQUOT => "Disk quota exceeded",
+            EINTR => "Interrupted system call",
         }
     }
 }
@@ -410,6 +417,10 @@ pub fn signaled(status: i32) -> Option<u8> {
 /// What stat(2) tells of a node.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Stat {
+    /// `st_dev`: the filesystem's identity (contract §2.5), the same wherever it is mounted
+    /// (`abi::fs::FsId::dev`); 0 where the filesystem has none to give.
+    #[serde(default)]
+    pub dev: u64,
     pub ino: u64,
     /// Its type (`S_IF*`) and its special and permission bits.
     pub mode: u32,
@@ -523,6 +534,8 @@ pub const O_APPEND: u32 = 0o2000;
 /// A directory, to read with getdents or name others from (`/proc/self/fd/N/NAME`, as openat
 /// would): fails with ENOTDIR on anything else.
 pub const O_DIRECTORY: u32 = 0o200000;
+/// Do not follow a trailing symbolic link (ELOOP).
+pub const O_NOFOLLOW: u32 = 0o400000;
 /// A metadata/path handle. This runtime currently supports directory O_PATH handles.
 pub const O_PATH: u32 = 0o10000000;
 /// ioctl(2)'s FICLONE, as Linux numbers it: the file the descriptor writes takes the content of

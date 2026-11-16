@@ -1,7 +1,7 @@
 import { test, expect, request as contexts } from './test.js';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { api, call, put, rmrf, sys } from './sys.js';
+import { api, call, mkdirp, put, rmrf, sys } from './sys.js';
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = process.env.OS_PASSWORD || readFileSync('.local-password', 'utf8').trim();
 const options = (access='read-write', extra={}) => ({read:access==='read'||access==='read-write',write:access==='write'||access==='read-write',append:false,append_implies_write:false,truncate:false,create:false,create_new:false,exec:access==='exec',path:access==='path',...extra});
@@ -56,7 +56,7 @@ test('open access, rename/unlink, O_PATH, sparse bytes and old readers share one
   expect(await c.write(open,'Z',{offset:5})).toEqual({offset:5,len:1});
   const name=(await c.call('parent',{dir}))[1];const old=await request.get(origin+'/api/file?path='+encodeURIComponent('/'+name+'/renamed'));
   expect(old.ok(),old.ok()?'':await old.text()).toBe(true);expect(await old.body()).toEqual(await c.read(open));
-  await c.call('unlink',{dir,name:'renamed'});expect((await c.call('metadata',{handle:entry.handle})).nlink).toBe(0);expect((await c.read(open)).length).toBe(7);
+  await c.call('unlink',{dir,name:'renamed'});expect((await c.call('metadata',{handle:entry.handle})).nlink).toBe(0);expect((await c.call('open_metadata',{open})).nlink).toBe(0);expect((await c.read(open)).length).toBe(7);
   await c.call('release',{open});await c.call('release',{open:ro});await c.call('metadata',{handle:entry.handle},'ESTALE');
   const sub=await c.call('mkdir',{dir,name:'cwd',mode:0});const path=await c.open(sub.handle,'path');await c.call('rmdir',{dir,name:'cwd'});
   expect((await c.call('metadata',{handle:sub.handle})).nlink).toBe(0);await c.call('parent',{dir:sub.handle},'ENOENT');await c.call('read_dir',{dir:sub.handle},'ENOENT');
@@ -969,5 +969,447 @@ test('walk final symlinks, ticket/cancel_open authorization, read-only subtree r
     for(const o of [o1,o2,o3])await c.call('release',{open:o});
   } finally {
     await c.call('disconnect');
+  }
+});
+
+test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, lock cancel, fork inheritance and unlinked exit cleanup', async ({ context, request }) => {
+  const ip = 'cloudfs-ck-' + randomUUID();
+  const extra = { Origin: origin, 'CF-Connecting-IP': ip };
+  await context.setExtraHTTPHeaders({ 'CF-Connecting-IP': ip });
+  expect((await api(request, 'login', { headers: extra, data: { password } })).ok()).toBe(true);
+  expect((await api(context.request, 'login', { headers: extra, data: { password } })).ok()).toBe(true);
+  const base = '/cloudfs-ck-' + randomUUID();
+  await mkdirp(request, base, 0o755);
+  const page = await context.newPage();
+  try {
+    await page.goto('/');
+    await page.evaluate(() => {
+      const port = new Worker('/client-kernel.js');
+      const pending = new Map();
+      let next = 0;
+      port.onmessage = ({ data }) => {
+        if (data?.id != null && pending.has(data.id)) {
+          pending.get(data.id)(data);
+          pending.delete(data.id);
+        }
+      };
+      window.__kernel = (type, args = {}) => new Promise(resolve => {
+        const id = ++next;
+        pending.set(id, resolve);
+        port.postMessage({ v: 1, id, type, args });
+      });
+    });
+    const k = async (type, args = {}) => {
+      const reply = await page.evaluate(([t, a]) => window.__kernel(t, a), [type, args]);
+      if (reply.err) throw Object.assign(new Error(reply.err.detail ?? reply.err.errno), reply.err);
+      return reply.ok;
+    };
+    const kErr = async (type, args = {}) => {
+      const reply = await page.evaluate(([t, a]) => window.__kernel(t, a), [type, args]);
+      expect(reply.err, `expected error for ${type}`).toBeTruthy();
+      return reply.err.errno;
+    };
+    const ENV = ['PWD=/', 'PATH=/usr/bin', 'LANG=C.UTF-8'];
+    const sleepCmd = { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '60'], env: ENV, cwd: '/' };
+    await k('init');
+    const p1 = await k('exec', sleepCmd);
+    const p2 = await k('exec', sleepCmd);
+    const child = await k('fork', { pid: p1.pid });
+
+    // 1. Open creates regular files with shared CloudFs st_dev and delegates /dev/null.
+    expect(await k('cloud_open', { pid: p1.pid, path: '/dev/null', flags: 2 })).toEqual({ fallback: true });
+    const f = await k('cloud_open', { pid: p1.pid, path: `${base}/f.txt`, flags: 0o2 | 0o100 | 0o200, mode: 0o644, umask: 0o022 });
+    const g = await k('cloud_open', { pid: p1.pid, path: `${base}/g.txt`, flags: 0o2 | 0o100 | 0o200, mode: 0o644, umask: 0o022 });
+    expect(f.stat.dev).toBeGreaterThan(0);
+    expect(g.stat.dev).toBe(f.stat.dev);
+    expect(g.stat.ino).not.toBe(f.stat.ino);
+    expect(f.stat.nlink).toBe(1);
+
+    // 2. Write, SEEK_END, O_APPEND toggle (F_SETFL/F_GETFL), and fsync/fdatasync.
+    expect(await k('cloud_write', { pid: p1.pid, id: f.id, data: Array.from(Buffer.from('hello')) })).toBe(5);
+    expect(await k('cloud_seek', { pid: p1.pid, id: f.id, offset: '0', whence: 2 })).toBe('5');
+    expect(await k('cloud_append', { pid: p1.pid, id: f.id })).toBe(false);
+    await k('cloud_set_append', { pid: p1.pid, id: f.id, append: true });
+    expect(await k('cloud_append', { pid: p1.pid, id: f.id })).toBe(true);
+    expect(await k('cloud_seek', { pid: p1.pid, id: f.id, offset: '1', whence: 0 })).toBe('1');
+    expect(await k('cloud_write', { pid: p1.pid, id: f.id, data: Array.from(Buffer.from('!')) })).toBe(1);
+    expect(await k('cloud_seek', { pid: p1.pid, id: f.id, offset: '0', whence: 2 })).toBe('6');
+    await k('cloud_sync', { pid: p1.pid, id: f.id, data_only: false });
+    await k('cloud_sync', { pid: p1.pid, id: f.id, data_only: true });
+
+    // 3. Fork inheritance + parent close + unlink while child still holds the open inode.
+    await k('cloud_inherit', { pid: p1.pid, child: child.pid, ids: [f.id] });
+    await k('cloud_close', { pid: p1.pid, id: f.id });
+    expect(await kErr('cloud_fstat', { pid: p1.pid, id: f.id })).toBe('EBADF');
+    expect(await kErr('cloud_fstat', { pid: p2.pid, id: f.id })).toBe('EBADF');
+    const [unlinked] = await sys(request, [{ unlink: { path: `${base}/f.txt` } }], {}, extra);
+    expect(unlinked.ok).toBeNull();
+    const unlinkedStat = await k('cloud_fstat', { pid: child.pid, id: f.id });
+    expect(unlinkedStat.dev).toBe(f.stat.dev);
+    expect(unlinkedStat.ino).toBe(f.stat.ino);
+    expect(unlinkedStat.nlink).toBe(0);
+    expect(unlinkedStat.size).toBe(6);
+    const bytes = await k('cloud_read', { pid: child.pid, id: f.id, count: 16, offset: '0' });
+    expect(Buffer.from(bytes).toString()).toBe('hello!');
+
+    // 4. Blocking lock wait + cloud_cancel unblocks concurrently with EINTR.
+    const g2 = await k('cloud_open', { pid: p2.pid, path: `${base}/g.txt`, flags: 0o2 });
+    await k('cloud_lock', { pid: p1.pid, id: g.id, family: 'posix', kind: 'exclusive', start: '0', wait: false });
+    const conflict = await k('cloud_test_lock', { pid: p2.pid, id: g2.id, kind: 'exclusive', start: '0' });
+    expect(conflict).toBeTruthy();
+    const waitLock = kErr('cloud_lock', { pid: p2.pid, id: g2.id, family: 'posix', kind: 'exclusive', start: '0', wait: true });
+    await page.waitForTimeout(100);
+    await k('cloud_cancel', { pid: p2.pid, id: g2.id });
+    expect(await waitLock).toBe('EINTR');
+    await k('cloud_unlock', { pid: p1.pid, id: g.id, family: 'posix', start: '0' });
+    await k('cloud_lock', { pid: p2.pid, id: g2.id, family: 'posix', kind: 'exclusive', start: '0', wait: false });
+    await k('cloud_close', { pid: p1.pid, id: g.id });
+    await k('cloud_close', { pid: p2.pid, id: g2.id });
+
+    // 5. Replacement reexec retains caller access & cloud_renew succeeds; exit releases unlinked file.
+    await k('reexec', { pid: child.pid, ...sleepCmd });
+    expect(await k('cloud_write', { pid: child.pid, id: f.id, data: Array.from(Buffer.from('?')) })).toBe(1);
+    await k('cloud_renew');
+    await k('exit', { pid: child.pid, status: 0 });
+    await k('exit', { pid: p1.pid, status: 0 });
+    await k('exit', { pid: p2.pid, status: 0 });
+    await k('wait', { pid: p1.pid });
+    await k('wait', { pid: p2.pid });
+    const [afterExit] = await sys(request, [{ stat: { path: `${base}/f.txt` } }], {}, extra);
+    expect(afterExit.err?.errno).toBe('ENOENT');
+
+    // 6. Traversal permission checks (..), protected symlinks with Call::Getcreds identity, and non-aliasing reconnect IDs.
+    await mkdirp(request, `${base}/blocked`, 0o700);
+    await call(request, { chmod: { path: `${base}/blocked`, mode: 0o700 } }, { headers: extra });
+    expect((await put(request, '/api/file?path=' + encodeURIComponent(`${base}/ok`), { headers: extra, data: 'ok' })).status()).toBe(201);
+    await mkdirp(request, `${base}/sticky`, 0o777);
+    await call(request, { chmod: { path: `${base}/sticky`, mode: 0o1777 } }, { headers: extra });
+    expect((await put(request, '/api/file?path=' + encodeURIComponent(`${base}/sticky/target`), { headers: extra, data: 'secret-ok' })).status()).toBe(201);
+
+    const aliceName = 'alice' + randomUUID().replaceAll('-', '').slice(0, 8);
+    const alicePassword = 'account-' + randomUUID();
+    expect((await api(context.request, 'logout', { headers: extra })).ok()).toBe(true);
+    const pGuest = await k('exec', sleepCmd);
+
+    await call(context.request, 'getcreds');
+    expect((await api(context.request, 'register', { headers: extra, data: { username: aliceName, password: alicePassword, create_home: false } })).ok()).toBe(true);
+    const pAlice = await k('exec', sleepCmd);
+    expect(await call(context.request, { symlink: { target: 'target', path: `${base}/sticky/link` } }, { headers: extra })).toBeNull();
+
+    expect(await kErr('cloud_open', { pid: pGuest.pid, path: `${base}/blocked/../ok`, flags: 0 })).toBe('EACCES');
+    expect(await kErr('cloud_open', { pid: pGuest.pid, path: `${base}/sticky/link`, flags: 0 })).toBe('EACCES');
+
+    const aliceOpen = await k('cloud_open', { pid: pAlice.pid, path: `${base}/sticky/link`, flags: 0 });
+    expect(Buffer.from(await k('cloud_read', { pid: pAlice.pid, id: aliceOpen.id, count: 16, offset: '0' })).toString()).toBe('secret-ok');
+    await k('cloud_close', { pid: pAlice.pid, id: aliceOpen.id });
+
+    const beforeReconnect = await k('cloud_open', { pid: pAlice.pid, path: `${base}/ok`, flags: 0 });
+    let dropRenew = true;
+    const dropOnce = async route => {
+      if (dropRenew && route.request().postData()?.includes('"renew"')) {
+        dropRenew = false;
+        await route.fulfill({ status: 410, contentType: 'application/json', body: JSON.stringify({ errno: 'ENOTCONN' }) });
+        return;
+      }
+      await route.continue();
+    };
+    await context.route('**/api/fs', dropOnce);
+    expect(await kErr('cloud_renew')).toBe('ENOTCONN');
+    await context.unroute('**/api/fs', dropOnce);
+    expect(await kErr('cloud_fstat', { pid: pAlice.pid, id: beforeReconnect.id })).toBe('EBADF');
+    const afterReconnect = await k('cloud_open', { pid: pAlice.pid, path: `${base}/ok`, flags: 0 });
+    expect(afterReconnect.id).toBeGreaterThan(beforeReconnect.id);
+
+    await k('exit', { pid: pAlice.pid, status: 0 });
+    await k('exit', { pid: pGuest.pid, status: 0 });
+    await k('wait', { pid: pAlice.pid });
+    await k('wait', { pid: pGuest.pid });
+  } finally {
+    await rmrf(request, base);
+  }
+});
+
+test('WASI and WASIX processes use CloudFs for dev/ino/nlink==0, SEEK_END, O_APPEND, fsync/EBADF/EINVAL and fork/exec', async ({ context, page, request }) => {
+  const binaryen = (await import('binaryen')).default;
+  const assemble = wat => Buffer.from(binaryen.parseText(wat).emitBinary());
+  const ip = 'cloudfs-wasi-' + randomUUID();
+  const extra = { Origin: origin, 'CF-Connecting-IP': ip };
+  await context.setExtraHTTPHeaders({ 'CF-Connecting-IP': ip });
+  expect((await api(request, 'login', { headers: extra, data: { password } })).ok()).toBe(true);
+  expect((await api(context.request, 'login', { headers: extra, data: { password } })).ok()).toBe(true);
+
+  const base = '/cloudfs-wasi-' + randomUUID();
+  await mkdirp(request, base, 0o755);
+  const rel = base.slice(1);
+  const upload = async (name, data) => {
+    expect((await put(request, '/api/file?path=' + encodeURIComponent(`${base}/${name}`), { headers: extra, data })).status()).toBe(201);
+    expect(await call(request, { chmod: { path: `${base}/${name}`, mode: 0o755 } }, { headers: extra })).toBeNull();
+  };
+
+  // Probe 1: WASI preview1 CloudFs lifecycle & fsync/SEEK_END/O_APPEND/unlinked-fstat checks.
+  const WASI_PROBE = assemble(`(module
+    (import "wasi_snapshot_preview1" "args_sizes_get" (func $args_sizes (param i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "args_get" (func $args_get (param i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_pread" (func $pread (param i32 i32 i32 i64 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_seek" (func $seek (param i32 i64 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_tell" (func $tell (param i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_sync" (func $sync (param i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_datasync" (func $datasync (param i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_fdstat_get" (func $fdstat_get (param i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_fdstat_set_flags" (func $fdstat_set (param i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_filestat_get" (func $fstat (param i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "path_filestat_get" (func $pstat (param i32 i32 i32 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "path_unlink_file" (func $unlink (param i32 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_filestat_set_size" (func $trunc (param i32 i64) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_close" (func $close (param i32) (result i32)))
+    (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+    (memory (export "memory") 2)
+    (data (i32.const 1000) "hello")
+    (data (i32.const 1008) "world")
+    (func $check (param $ok i32) (param $code i32)
+      (if (i32.eqz (local.get $ok)) (then (call $exit (local.get $code)))))
+    (func $cstrlen (param $p i32) (result i32)
+      (local $n i32)
+      (block $done (loop $loop
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $p) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $loop)))
+      (local.get $n))
+    (func (export "_start")
+      (local $p i32) (local $plen i32) (local $fd i32)
+      (local $dev i64) (local $ino i64)
+      (drop (call $args_sizes (i32.const 2000) (i32.const 2004)))
+      (drop (call $args_get (i32.const 2016) (i32.const 8192)))
+      (local.set $p (i32.load (i32.const 2020)))
+      (local.set $plen (call $cstrlen (local.get $p)))
+      (call $check (i32.eqz (call $open (i32.const 3) (i32.const 1) (local.get $p) (local.get $plen) (i32.const 1) (i64.const 0x3fffffff) (i64.const 0x3fffffff) (i32.const 0) (i32.const 2200))) (i32.const 1))
+      (local.set $fd (i32.load (i32.const 2200)))
+      (i32.store (i32.const 2208) (i32.const 1000))
+      (i32.store (i32.const 2212) (i32.const 5))
+      (call $check (i32.eqz (call $write (local.get $fd) (i32.const 2208) (i32.const 1) (i32.const 2204))) (i32.const 2))
+      (call $check (i32.eq (i32.load (i32.const 2204)) (i32.const 5)) (i32.const 3))
+      (call $check (i32.eqz (call $sync (local.get $fd))) (i32.const 4))
+      (call $check (i32.eqz (call $datasync (local.get $fd))) (i32.const 5))
+      (call $check (i32.eqz (call $sync (i32.const 3))) (i32.const 6))
+      (call $check (i32.eq (call $sync (i32.const 999)) (i32.const 8)) (i32.const 7))
+      (call $check (i32.eq (call $datasync (i32.const 1)) (i32.const 28)) (i32.const 8))
+      (call $check (i32.eqz (call $seek (local.get $fd) (i64.const 0) (i32.const 2) (i32.const 2216))) (i32.const 9))
+      (call $check (i64.eq (i64.load (i32.const 2216)) (i64.const 5)) (i32.const 10))
+      (call $check (i32.eqz (call $fdstat_set (local.get $fd) (i32.const 1))) (i32.const 11))
+      (call $check (i32.eqz (call $fdstat_get (local.get $fd) (i32.const 2224))) (i32.const 12))
+      (call $check (i32.eq (i32.and (i32.load16_u (i32.const 2226)) (i32.const 1)) (i32.const 1)) (i32.const 13))
+      (call $check (i32.eqz (call $seek (local.get $fd) (i64.const 0) (i32.const 0) (i32.const 2216))) (i32.const 14))
+      (i32.store (i32.const 2208) (i32.const 1008))
+      (i32.store (i32.const 2212) (i32.const 5))
+      (call $check (i32.eqz (call $write (local.get $fd) (i32.const 2208) (i32.const 1) (i32.const 2204))) (i32.const 15))
+      (call $check (i32.eqz (call $tell (local.get $fd) (i32.const 2216))) (i32.const 16))
+      (call $check (i64.eq (i64.load (i32.const 2216)) (i64.const 10)) (i32.const 17))
+      (call $check (i32.eqz (call $fstat (local.get $fd) (i32.const 3000))) (i32.const 18))
+      (call $check (i32.eqz (call $pstat (i32.const 3) (i32.const 1) (local.get $p) (local.get $plen) (i32.const 3100))) (i32.const 19))
+      (local.set $dev (i64.load (i32.const 3000)))
+      (local.set $ino (i64.load (i32.const 3008)))
+      (call $check (i64.gt_u (local.get $dev) (i64.const 0)) (i32.const 20))
+      (call $check (i64.gt_u (local.get $ino) (i64.const 0)) (i32.const 21))
+      (call $check (i64.eq (local.get $dev) (i64.load (i32.const 3100))) (i32.const 22))
+      (call $check (i64.eq (local.get $ino) (i64.load (i32.const 3108))) (i32.const 23))
+      (call $check (i64.eq (i64.load (i32.const 3024)) (i64.const 1)) (i32.const 24))
+      (call $check (i64.eq (i64.load (i32.const 3032)) (i64.const 10)) (i32.const 25))
+      (call $check (i32.eqz (call $unlink (i32.const 3) (local.get $p) (local.get $plen))) (i32.const 26))
+      (call $check (i32.eqz (call $fstat (local.get $fd) (i32.const 3200))) (i32.const 27))
+      (call $check (i64.eq (i64.load (i32.const 3200)) (local.get $dev)) (i32.const 28))
+      (call $check (i64.eq (i64.load (i32.const 3208)) (local.get $ino)) (i32.const 29))
+      (call $check (i64.eq (i64.load (i32.const 3224)) (i64.const 0)) (i32.const 30))
+      (call $check (i32.eqz (call $trunc (local.get $fd) (i64.const 4))) (i32.const 31))
+      (call $check (i32.eqz (call $seek (local.get $fd) (i64.const 0) (i32.const 2) (i32.const 2216))) (i32.const 32))
+      (call $check (i64.eq (i64.load (i32.const 2216)) (i64.const 4)) (i32.const 33))
+      (i32.store (i32.const 2208) (i32.const 4000))
+      (i32.store (i32.const 2212) (i32.const 10))
+      (call $check (i32.eqz (call $pread (local.get $fd) (i32.const 2208) (i32.const 1) (i64.const 0) (i32.const 2204))) (i32.const 34))
+      (call $check (i32.eq (i32.load (i32.const 2204)) (i32.const 4)) (i32.const 35))
+      (i32.store (i32.const 2212) (i32.const 4))
+      (drop (call $write (i32.const 1) (i32.const 2208) (i32.const 1) (i32.const 2204)))
+      (call $check (i32.eqz (call $close (local.get $fd))) (i32.const 36))
+      (call $exit (i32.const 0))))`);
+
+  // Probe 2: WASIX fork + CLOEXEC + exec replacement retaining fd 4 + pipe fd_sync EINVAL.
+  const CHILD_EXEC = assemble(`(module
+    (import "wasix_32v1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+    (import "wasix_32v1" "fd_sync" (func $sync (param i32) (result i32)))
+    (import "wasix_32v1" "proc_exit" (func $exit (param i32)))
+    (memory (export "memory") 1)
+    (data (i32.const 1000) "exec")
+    (func (export "_start")
+      (if (call $sync (i32.const 5)) (then) (else (call $exit (i32.const 90))))
+      (i32.store (i32.const 1024) (i32.const 1000))
+      (i32.store (i32.const 1028) (i32.const 4))
+      (if (call $write (i32.const 4) (i32.const 1024) (i32.const 1) (i32.const 1032)) (then (call $exit (i32.const 91))))
+      (if (call $sync (i32.const 4)) (then (call $exit (i32.const 92))))
+      (call $exit (i32.const 0))))`);
+
+  const FORK_PROBE = assemble(`(module
+    (import "wasix_32v1" "args_sizes_get" (func $args_sizes (param i32 i32) (result i32)))
+    (import "wasix_32v1" "args_get" (func $args_get (param i32 i32) (result i32)))
+    (import "wasix_32v1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+    (import "wasix_32v1" "path_open2" (func $open2 (param i32 i32 i32 i32 i32 i64 i64 i32 i32 i32) (result i32)))
+    (import "wasix_32v1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+    (import "wasix_32v1" "fd_pread" (func $pread (param i32 i32 i32 i64 i32) (result i32)))
+    (import "wasix_32v1" "fd_seek" (func $seek (param i32 i64 i32 i32) (result i32)))
+    (import "wasix_32v1" "fd_sync" (func $sync (param i32) (result i32)))
+    (import "wasix_32v1" "fd_pipe" (func $pipe (param i32 i32) (result i32)))
+    (import "wasix_32v1" "fd_close" (func $close (param i32) (result i32)))
+    (import "wasix_32v1" "proc_fork" (func $fork (param i32 i32) (result i32)))
+    (import "wasix_32v1" "proc_join" (func $join (param i32 i32 i32) (result i32)))
+    (import "wasix_32v1" "proc_exec" (func $exec (param i32 i32 i32 i32)))
+    (import "wasix_32v1" "proc_exit" (func $exit (param i32)))
+    (memory (export "memory") 2)
+    (global $sp (mut i32) (i32.const 65536))
+    (export "__stack_pointer" (global $sp))
+    (data (i32.const 1000) "child:")
+    (func $check (param $ok i32) (param $code i32)
+      (if (i32.eqz (local.get $ok)) (then (call $exit (local.get $code)))))
+    (func $cstrlen (param $p i32) (result i32)
+      (local $n i32)
+      (block $done (loop $loop
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $p) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $loop)))
+      (local.get $n))
+    (func (export "_start")
+      (local $p1 i32) (local $l1 i32) (local $p2 i32) (local $l2 i32) (local $p3 i32) (local $l3 i32)
+      (local $sfd i32) (local $cfd i32)
+      (drop (call $args_sizes (i32.const 2000) (i32.const 2004)))
+      (drop (call $args_get (i32.const 2016) (i32.const 8192)))
+      (local.set $p1 (i32.load (i32.const 2020))) (local.set $l1 (call $cstrlen (local.get $p1)))
+      (local.set $p2 (i32.load (i32.const 2024))) (local.set $l2 (call $cstrlen (local.get $p2)))
+      (local.set $p3 (i32.load (i32.const 2028))) (local.set $l3 (call $cstrlen (local.get $p3)))
+      (call $check (i32.eqz (call $open (i32.const 3) (i32.const 1) (local.get $p1) (local.get $l1) (i32.const 1) (i64.const 0x3fffffff) (i64.const 0x3fffffff) (i32.const 0) (i32.const 2200))) (i32.const 1))
+      (local.set $sfd (i32.load (i32.const 2200)))
+      (call $check (i32.eq (local.get $sfd) (i32.const 4)) (i32.const 2))
+      (call $check (i32.eqz (call $open2 (i32.const 3) (i32.const 1) (local.get $p2) (local.get $l2) (i32.const 1) (i64.const 0x3fffffff) (i64.const 0x3fffffff) (i32.const 0) (i32.const 1) (i32.const 2200))) (i32.const 3))
+      (local.set $cfd (i32.load (i32.const 2200)))
+      (call $check (i32.eq (local.get $cfd) (i32.const 5)) (i32.const 4))
+      (call $check (i32.eqz (call $pipe (i32.const 2300) (i32.const 2304))) (i32.const 5))
+      (call $check (i32.eq (call $sync (i32.load (i32.const 2304))) (i32.const 28)) (i32.const 6))
+      (drop (call $close (i32.load (i32.const 2300))))
+      (drop (call $close (i32.load (i32.const 2304))))
+      (call $check (i32.eqz (call $fork (i32.const 1) (i32.const 2060))) (i32.const 7))
+      (if (i32.eqz (i32.load (i32.const 2060)))
+        (then
+          (i32.store (i32.const 2208) (i32.const 1000))
+          (i32.store (i32.const 2212) (i32.const 6))
+          (call $check (i32.eqz (call $write (local.get $sfd) (i32.const 2208) (i32.const 1) (i32.const 2204))) (i32.const 8))
+          (call $exec (local.get $p3) (local.get $l3) (local.get $p3) (local.get $l3))
+          (call $exit (i32.const 9))))
+      (drop (call $close (local.get $cfd)))
+      (i32.store8 (i32.const 2064) (i32.const 1))
+      (i32.store (i32.const 2068) (i32.load (i32.const 2060)))
+      (drop (call $join (i32.const 2064) (i32.const 0) (i32.const 2080)))
+      (call $check (i32.and (i32.eq (i32.load8_u (i32.const 2080)) (i32.const 1)) (i32.eqz (i32.load16_u (i32.const 2082)))) (i32.const 10))
+      (call $check (i32.eqz (call $seek (local.get $sfd) (i64.const 0) (i32.const 2) (i32.const 2216))) (i32.const 11))
+      (call $check (i64.eq (i64.load (i32.const 2216)) (i64.const 10)) (i32.const 12))
+      (i32.store (i32.const 2208) (i32.const 4000))
+      (i32.store (i32.const 2212) (i32.const 10))
+      (call $check (i32.eqz (call $pread (local.get $sfd) (i32.const 2208) (i32.const 1) (i64.const 0) (i32.const 2204))) (i32.const 13))
+      (call $check (i32.eq (i32.load (i32.const 2204)) (i32.const 10)) (i32.const 14))
+      (drop (call $write (i32.const 1) (i32.const 2208) (i32.const 1) (i32.const 2204)))
+      (drop (call $close (local.get $sfd)))
+      (call $exit (i32.const 0))))`);
+
+  const SHARED_IO_PROBE = assemble(`(module
+    (import "wasix_32v1" "args_sizes_get" (func $args_sizes (param i32 i32) (result i32)))
+    (import "wasix_32v1" "args_get" (func $args_get (param i32 i32) (result i32)))
+    (import "wasix_32v1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+    (import "wasix_32v1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+    (import "wasix_32v1" "fd_close" (func $close (param i32) (result i32)))
+    (import "wasix_32v1" "proc_fork" (func $fork (param i32 i32) (result i32)))
+    (import "wasix_32v1" "proc_join" (func $join (param i32 i32 i32) (result i32)))
+    (import "wasix_32v1" "proc_exit" (func $exit (param i32)))
+    (memory (export "memory") 16)
+    (global $sp (mut i32) (i32.const 65536))
+    (export "__stack_pointer" (global $sp))
+    (func $check (param $ok i32) (param $code i32)
+      (if (i32.eqz (local.get $ok)) (then (call $exit (local.get $code)))))
+    (func $cstrlen (param $p i32) (result i32)
+      (local $n i32)
+      (block $done (loop $loop
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $p) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $loop)))
+      (local.get $n))
+    (func $fill (param $word i32)
+      (local $i i32)
+      (loop $fill_loop
+        (i32.store (i32.add (i32.const 65536) (local.get $i)) (local.get $word))
+        (local.set $i (i32.add (local.get $i) (i32.const 4)))
+        (br_if $fill_loop (i32.lt_u (local.get $i) (i32.const 614400)))))
+    (func (export "_start")
+      (local $p i32) (local $plen i32) (local $sfd i32)
+      (drop (call $args_sizes (i32.const 2000) (i32.const 2004)))
+      (drop (call $args_get (i32.const 2016) (i32.const 8192)))
+      (local.set $p (i32.load (i32.const 2020)))
+      (local.set $plen (call $cstrlen (local.get $p)))
+      (call $check (i32.eqz (call $open (i32.const 3) (i32.const 1) (local.get $p) (local.get $plen) (i32.const 1) (i64.const 0x3fffffff) (i64.const 0x3fffffff) (i32.const 0) (i32.const 2200))) (i32.const 1))
+      (local.set $sfd (i32.load (i32.const 2200)))
+      (call $check (i32.eqz (call $fork (i32.const 1) (i32.const 2060))) (i32.const 2))
+      (if (i32.eqz (i32.load (i32.const 2060)))
+        (then
+          (call $fill (i32.const 0x43434343))
+          (i32.store (i32.const 2208) (i32.const 65536))
+          (i32.store (i32.const 2212) (i32.const 614400))
+          (call $check (i32.eqz (call $write (local.get $sfd) (i32.const 2208) (i32.const 1) (i32.const 2204))) (i32.const 3))
+          (call $check (i32.eq (i32.load (i32.const 2204)) (i32.const 614400)) (i32.const 4))
+          (drop (call $close (local.get $sfd)))
+          (call $exit (i32.const 0))))
+      (call $fill (i32.const 0x50505050))
+      (i32.store (i32.const 2208) (i32.const 65536))
+      (i32.store (i32.const 2212) (i32.const 614400))
+      (call $check (i32.eqz (call $write (local.get $sfd) (i32.const 2208) (i32.const 1) (i32.const 2204))) (i32.const 5))
+      (call $check (i32.eq (i32.load (i32.const 2204)) (i32.const 614400)) (i32.const 6))
+      (i32.store8 (i32.const 2064) (i32.const 1))
+      (i32.store (i32.const 2068) (i32.load (i32.const 2060)))
+      (drop (call $join (i32.const 2064) (i32.const 0) (i32.const 2080)))
+      (call $check (i32.and (i32.eq (i32.load8_u (i32.const 2080)) (i32.const 1)) (i32.eqz (i32.load16_u (i32.const 2082)))) (i32.const 7))
+      (drop (call $close (local.get $sfd)))
+      (call $exit (i32.const 0))))`);
+
+  try {
+    await upload('wasi-probe', WASI_PROBE);
+    await upload('child-writer', CHILD_EXEC);
+    await upload('fork-probe', FORK_PROBE);
+    await upload('shared-io-probe', SHARED_IO_PROBE);
+    await page.goto('/');
+    const input = page.getByRole('combobox', { name: 'Terminal command' });
+    const busy = page.locator('#command').locator('xpath=ancestor::form');
+    const run = async text => {
+      await expect(busy).toHaveAttribute('data-state', 'idle');
+      await input.fill(text);
+      await input.press('Enter');
+      await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
+    };
+    await expect(busy).toHaveAttribute('data-state', 'idle');
+    await run(`sh -c '${base}/wasi-probe ${rel}/probe.txt; printf probe=%d $?'`);
+    await expect(page.locator('.transcript pre').last()).toHaveText('hellprobe=0');
+    const [afterUnlink] = await sys(request, [{ stat: { path: `${base}/probe.txt` } }], {}, extra);
+    expect(afterUnlink.err?.errno).toBe('ENOENT');
+
+    await run(`sh -c '${base}/fork-probe ${rel}/shared.txt ${rel}/clo.txt ${base}/child-writer; printf fork=%d $?'`);
+    await expect(page.locator('.transcript pre').last()).toHaveText('child:execfork=0');
+
+    await run(`sh -c '${base}/shared-io-probe ${rel}/shared-big.bin; printf io=%d $?'`);
+    await expect(page.locator('.transcript pre').last()).toHaveText('io=0');
+    const bigRes = await request.get(origin + '/api/file?path=' + encodeURIComponent(`${base}/shared-big.bin`), { headers: extra });
+    expect(bigRes.ok()).toBe(true);
+    const bigBuf = await bigRes.body();
+    expect(bigBuf.length).toBe(1228800);
+    const firstByte = bigBuf[0];
+    const secondByte = bigBuf[614400];
+    expect([0x43, 0x50]).toContain(firstByte);
+    expect(secondByte).toBe(firstByte === 0x43 ? 0x50 : 0x43);
+    expect(bigBuf.subarray(0, 614400).every(b => b === firstByte)).toBe(true);
+    expect(bigBuf.subarray(614400).every(b => b === secondByte)).toBe(true);
+  } finally {
+    await rmrf(request, base);
   }
 });

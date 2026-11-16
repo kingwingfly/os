@@ -87,7 +87,7 @@ export async function mountRequest(type, args) {
     return workspace.calls(args.calls, workspace.page, async calls => {
       const response = await fetch('/api/sys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ calls, sudo: !!args.sudo, umask: args.umask }) });
       if (!response.ok) throw { errno: 'EIO' }; return (await response.json()).results;
-    });
+    }, { umask: args.umask });
   }
   throw { errno: 'ENOSYS' };
 }

@@ -118,6 +118,8 @@ fn os_error(error: abi::Error) -> io::Error {
         abi::Errno::ENOTDIR => io::ErrorKind::NotADirectory,
         abi::Errno::ENOTEMPTY => io::ErrorKind::DirectoryNotEmpty,
         abi::Errno::EINVAL => io::ErrorKind::InvalidInput,
+        abi::Errno::EINTR => io::ErrorKind::Interrupted,
+        abi::Errno::EDQUOT => io::ErrorKind::QuotaExceeded,
         _ => io::ErrorKind::Other,
     };
     io::Error::new(kind, error.to_string())
@@ -216,6 +218,22 @@ mod tests {
         assert_eq!(
             metadata(reply.as_bytes()).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn os_error_maps_eintr_and_edquot() {
+        assert_eq!(
+            os_error(abi::Error::new(abi::Errno::EINTR)).kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            os_error(abi::Error::new(abi::Errno::EDQUOT)).kind(),
+            io::ErrorKind::QuotaExceeded
+        );
+        assert_eq!(
+            os_error(abi::Error::new(abi::Errno::ENOLCK)).kind(),
+            io::ErrorKind::Other
         );
     }
 }

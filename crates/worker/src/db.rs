@@ -1686,6 +1686,12 @@ impl Db {
 /// What the kernel's file system keeps beyond names: the time, inodes' times, empty content,
 /// and what has arrived of content still being written.
 impl kernel::Fs for Db {
+    /// The cloud tree's identity: the same `FsId` the v2 protocol names (`cloudfs`), minted
+    /// with the schema.
+    fn dev(&self) -> u64 {
+        self.meta(crate::cloudfs::FS_ID_KEY)
+            .map_or(0, |id| abi::fs::FsId(id).dev())
+    }
     fn now(&self) -> (u64, u32) {
         crate::auth::clock()
     }
