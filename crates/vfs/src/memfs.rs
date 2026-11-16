@@ -1477,3 +1477,93 @@ impl Filesystem for MemFs {
         ready!(self.do_release(open))
     }
 }
+
+/// Parsed `tmpfs` mount options (`-o mode=...,uid=...,gid=...,size=...`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TmpfsOptions {
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+}
+
+impl TmpfsOptions {
+    /// Parse comma-separated `tmpfs` mount options (`mode=`, `uid=`, `gid=`, `size=`).
+    /// Defaults match Linux `tmpfs`: `mode=01777`, caller `uid`/`gid`, [`DEFAULT_CAPACITY`].
+    /// Unknown or malformed options fail with `Errno::EINVAL`.
+    pub fn parse(cred: &Cred, data: Option<&str>) -> Result<Self> {
+        let mut opts = Self {
+            mode: 0o1777,
+            uid: cred.identity.id,
+            gid: cred.identity.group,
+            size: DEFAULT_CAPACITY,
+        };
+        let Some(raw) = data else {
+            return Ok(opts);
+        };
+        for item in raw.split(',').filter(|s| !s.is_empty()) {
+            let Some((key, val)) = item.split_once('=') else {
+                return Err(Errno::EINVAL);
+            };
+            if val.is_empty() {
+                return Err(Errno::EINVAL);
+            }
+            match key {
+                "mode" => {
+                    let mode = u16::from_str_radix(val, 8).map_err(|_| Errno::EINVAL)?;
+                    if mode > 0o7777 {
+                        return Err(Errno::EINVAL);
+                    }
+                    opts.mode = mode;
+                }
+                "uid" => {
+                    opts.uid = val.parse::<u32>().map_err(|_| Errno::EINVAL)?;
+                }
+                "gid" => {
+                    opts.gid = val.parse::<u32>().map_err(|_| Errno::EINVAL)?;
+                }
+                "size" => {
+                    opts.size = parse_tmpfs_size(val)?;
+                }
+                _ => return Err(Errno::EINVAL),
+            }
+        }
+        Ok(opts)
+    }
+}
+
+fn parse_tmpfs_size(val: &str) -> Result<u64> {
+    let bytes = val.as_bytes();
+    let (digits, mult) = match bytes.last().copied() {
+        Some(b'k' | b'K') => (&val[..val.len() - 1], 1024u64),
+        Some(b'm' | b'M') => (&val[..val.len() - 1], 1024u64 * 1024),
+        Some(b'g' | b'G') => (&val[..val.len() - 1], 1024u64 * 1024 * 1024),
+        _ => (val, 1u64),
+    };
+    if digits.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    let base = digits.parse::<u64>().map_err(|_| Errno::EINVAL)?;
+    let total = base.checked_mul(mult).ok_or(Errno::EINVAL)?;
+    if total > FILE_MAX {
+        return Err(Errno::EINVAL);
+    }
+    Ok(total)
+}
+
+impl MemFs {
+    /// Instantiate a `tmpfs` [`MemFs`] from `mount(2)` `data` options.
+    pub fn from_mount_options(
+        id: FsId,
+        generation: u64,
+        cred: &Cred,
+        data: Option<&str>,
+        clock: Clock,
+    ) -> Result<Self> {
+        let opts = TmpfsOptions::parse(cred, data)?;
+        Ok(
+            Self::new(id, generation, opts.uid, opts.gid, opts.mode, clock)
+                .with_capacity(opts.size),
+        )
+    }
+}

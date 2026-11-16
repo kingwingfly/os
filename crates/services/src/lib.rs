@@ -1,5 +1,5 @@
 //! User-space service policy. Unit metadata conveys no account or resource authority.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
 #[derive(Debug, Deserialize)]
@@ -9,7 +9,7 @@ pub struct Manifest {
     pub units: Vec<Unit>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Restart {
     #[default]
@@ -17,19 +17,55 @@ pub enum Restart {
     OnFailure,
     Always,
 }
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Identity {
     #[default]
     Caller,
 }
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Readiness {
     #[default]
     Started,
     Notify,
 }
+
+/// Mount namespace policy for a supervised service unit (contract §2.7, #52).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MountNamespaceGrant {
+    /// Default: run in the supervisor's (system) mount namespace; no user mounts visible.
+    #[default]
+    System,
+    /// Clone a fresh private mount namespace from the supervisor's namespace at service start.
+    Isolated,
+    /// Attach to the owning non-root caller's session mount namespace when started as a user
+    /// session unit; rejected with `EPERM` for root/system-boot units.
+    Session,
+}
+
+/// Explicit bind-mount entry applied inside a private (`isolated` or `session`) service namespace.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BindGrant {
+    pub source: String,
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+fn clean_abs_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() <= abi::PATH_MAX
+        && !path.contains('\0')
+        && (path == "/"
+            || (!path.ends_with('/')
+                && path[1..].split('/').all(|seg| {
+                    !seg.is_empty() && seg != "." && seg != ".." && seg.len() <= abi::NAME_MAX
+                })))
+}
+
 fn root() -> String {
     "/".into()
 }
@@ -64,6 +100,10 @@ pub struct Unit {
     #[serde(default)]
     pub identity: Identity,
     #[serde(default)]
+    pub mount_namespace: MountNamespaceGrant,
+    #[serde(default)]
+    pub bind_mounts: Vec<BindGrant>,
+    #[serde(default)]
     pub limits: Option<Limits>,
     #[serde(default)]
     pub readiness: Readiness,
@@ -81,6 +121,24 @@ pub struct Unit {
     pub startup_timeout_ms: u64,
     #[serde(default = "timeout")]
     pub stop_timeout_ms: u64,
+}
+
+impl Unit {
+    /// Validate that the caller is authorized to instantiate this unit's `mount_namespace` grant.
+    /// `MountNamespaceGrant::Session` is rejected (`EPERM`) for root/system-boot units or callers
+    /// without an owning non-root login session.
+    pub fn authorize_namespace(
+        &self,
+        caller_uid: u32,
+        has_user_session: bool,
+    ) -> Result<(), abi::Errno> {
+        if self.mount_namespace == MountNamespaceGrant::Session
+            && (caller_uid == 0 || !has_user_session)
+        {
+            return Err(abi::Errno::EPERM);
+        }
+        Ok(())
+    }
 }
 
 impl Manifest {
@@ -142,9 +200,36 @@ impl Manifest {
                     unit.name
                 ));
             }
+            if unit.bind_mounts.len() > 32 {
+                return Err(format!("{}: too many bind_mounts (max 32)", unit.name));
+            }
+            if !unit.bind_mounts.is_empty() && unit.mount_namespace == MountNamespaceGrant::System {
+                return Err(format!(
+                    "{}: bind_mounts require isolated or session mount_namespace",
+                    unit.name
+                ));
+            }
+            for bind in &unit.bind_mounts {
+                if !clean_abs_path(&bind.source) || !clean_abs_path(&bind.target) {
+                    return Err(format!(
+                        "{}: bind_mounts paths must be clean absolute paths",
+                        unit.name
+                    ));
+                }
+            }
         }
         manifest.order()?;
         Ok(manifest)
+    }
+    pub fn authorize_namespace(
+        &self,
+        caller_uid: u32,
+        has_user_session: bool,
+    ) -> Result<(), abi::Errno> {
+        for unit in &self.units {
+            unit.authorize_namespace(caller_uid, has_user_session)?;
+        }
+        Ok(())
     }
     pub fn index(&self, name: &str) -> Option<usize> {
         self.units.iter().position(|u| u.name == name)
@@ -398,5 +483,154 @@ impl Supervisor {
     }
     pub fn failed(&self) -> bool {
         self.services.iter().any(|s| s.state == State::Failed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn mount_namespace_and_bind_grants_parse_and_default_to_system() {
+        let raw = serde_json::to_vec(&json!({
+            "version": 1,
+            "units": [
+                {
+                    "name": "sys-worker",
+                    "argv": ["/usr/bin/true"]
+                },
+                {
+                    "name": "iso-worker",
+                    "argv": ["/usr/bin/true"],
+                    "mount_namespace": "isolated",
+                    "bind_mounts": [
+                        { "source": "/srv/data", "target": "/var/lib/app", "read_only": true },
+                        { "source": "/tmp/work", "target": "/work" }
+                    ]
+                },
+                {
+                    "name": "session-worker",
+                    "argv": ["/usr/bin/true"],
+                    "mount_namespace": "session",
+                    "bind_mounts": [
+                        { "source": "/mnt/shared/docs", "target": "/docs", "read_only": true }
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        let manifest = Manifest::parse(&raw).unwrap();
+        assert_eq!(
+            manifest.units[0].mount_namespace,
+            MountNamespaceGrant::System
+        );
+        assert!(manifest.units[0].bind_mounts.is_empty());
+
+        assert_eq!(
+            manifest.units[1].mount_namespace,
+            MountNamespaceGrant::Isolated
+        );
+        assert_eq!(manifest.units[1].bind_mounts.len(), 2);
+        assert!(manifest.units[1].bind_mounts[0].read_only);
+        assert!(!manifest.units[1].bind_mounts[1].read_only);
+
+        assert_eq!(
+            manifest.units[2].mount_namespace,
+            MountNamespaceGrant::Session
+        );
+
+        // System/root boot cannot use `session` mount namespace; non-root user session can.
+        assert_eq!(
+            manifest.authorize_namespace(0, false),
+            Err(abi::Errno::EPERM)
+        );
+        assert_eq!(
+            manifest.authorize_namespace(0, true),
+            Err(abi::Errno::EPERM)
+        );
+        assert_eq!(
+            manifest.authorize_namespace(1000, false),
+            Err(abi::Errno::EPERM)
+        );
+        assert_eq!(manifest.authorize_namespace(1000, true), Ok(()));
+
+        // System and Isolated grants work for both root/system and user callers.
+        assert_eq!(manifest.units[0].authorize_namespace(0, false), Ok(()));
+        assert_eq!(manifest.units[1].authorize_namespace(0, false), Ok(()));
+    }
+
+    #[test]
+    fn invalid_mount_namespace_or_bind_mounts_are_rejected() {
+        let bad_cases = [
+            // Unknown mount_namespace variant
+            json!({
+                "name": "bad-ns",
+                "argv": ["/usr/bin/true"],
+                "mount_namespace": "shared"
+            }),
+            // bind_mounts on default `system` namespace
+            json!({
+                "name": "sys-bind",
+                "argv": ["/usr/bin/true"],
+                "bind_mounts": [{ "source": "/srv", "target": "/mnt" }]
+            }),
+            // Relative source path
+            json!({
+                "name": "rel-src",
+                "argv": ["/usr/bin/true"],
+                "mount_namespace": "isolated",
+                "bind_mounts": [{ "source": "srv/data", "target": "/mnt" }]
+            }),
+            // `..` segment in target
+            json!({
+                "name": "dotdot-tgt",
+                "argv": ["/usr/bin/true"],
+                "mount_namespace": "isolated",
+                "bind_mounts": [{ "source": "/srv", "target": "/mnt/../etc" }]
+            }),
+            // `.` segment
+            json!({
+                "name": "dot-src",
+                "argv": ["/usr/bin/true"],
+                "mount_namespace": "isolated",
+                "bind_mounts": [{ "source": "/srv/./a", "target": "/mnt" }]
+            }),
+            // Double slash
+            json!({
+                "name": "double-slash",
+                "argv": ["/usr/bin/true"],
+                "mount_namespace": "isolated",
+                "bind_mounts": [{ "source": "/srv//a", "target": "/mnt" }]
+            }),
+            // Trailing slash
+            json!({
+                "name": "trailing-slash",
+                "argv": ["/usr/bin/true"],
+                "mount_namespace": "isolated",
+                "bind_mounts": [{ "source": "/srv/a/", "target": "/mnt" }]
+            }),
+            // NUL byte
+            json!({
+                "name": "nul-byte",
+                "argv": ["/usr/bin/true"],
+                "mount_namespace": "isolated",
+                "bind_mounts": [{ "source": "/srv/\u{0000}a", "target": "/mnt" }]
+            }),
+            // Unknown field on BindGrant (`deny_unknown_fields`)
+            json!({
+                "name": "extra-field",
+                "argv": ["/usr/bin/true"],
+                "mount_namespace": "isolated",
+                "bind_mounts": [{ "source": "/srv", "target": "/mnt", "propagation": "shared" }]
+            }),
+        ];
+        for unit in bad_cases {
+            let raw = serde_json::to_vec(&json!({ "version": 1, "units": [unit] })).unwrap();
+            assert!(
+                Manifest::parse(&raw).is_err(),
+                "expected failure for {unit}"
+            );
+        }
     }
 }

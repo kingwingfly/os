@@ -24,19 +24,39 @@
 
 pub mod cloud;
 pub mod cloud_http;
+pub mod context;
 pub mod descriptions;
+pub mod devfs;
 pub mod fdtable;
 pub mod file;
 pub mod helperfs;
 pub mod hostfs;
+pub mod imagefs;
 pub mod locks;
 pub mod memfs;
+pub mod mount;
+pub mod namespace;
+pub mod procfs;
 pub mod profiles;
+pub mod sharefs;
 pub mod stat;
+pub mod vfs;
+pub mod walk;
 
+pub use context::{FsContext, PathAnchor, SharedFdTable, SharedFsContext};
 pub use fdtable::{FD_MAX, Fd, FdTable};
-pub use file::{File, FileRef, ReleaseQueue};
+pub use file::{File, FileRef, MountNsFile, ReleaseQueue};
+pub use mount::{
+    AtimeMode, FsType, MountAttachment, MountBacking, MountEntry, MountFlags, MountId, MountPin,
+    MountSlot, NamespaceId, ProviderHealth, ProviderState,
+};
+pub use namespace::{MountNamespace, escape_mountinfo, format_mountinfo, format_mounts};
 pub use std::io::SeekFrom;
+pub use vfs::{
+    DefaultFilesystemFactory, FilesystemFactory, MAX_SHEBANG_DEPTH, MountedFs, ProcessCtx,
+    ResolvedExec, Vfs,
+};
+pub use walk::{StartAnchor, WalkFlags, WalkResult};
 
 use abi::Errno;
 pub use abi::Time;
