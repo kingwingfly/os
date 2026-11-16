@@ -137,6 +137,47 @@ impl Db {
             .collect();
         self.replace_content_at(node, size, extents, cred, now)
     }
+    pub(crate) fn cloud_clone(
+        &mut self,
+        source: &Node,
+        target: &mut Node,
+        cred: &Credential,
+    ) -> FsResult<()> {
+        let now = auth::clock();
+        if let Some(id) = source.file.as_deref() {
+            if crate::system::asset(id).is_some() {
+                target.file = Some(id.into());
+                target.size = source.size;
+                inode::remove_privs(&cred.identity(), target);
+                self.update_inode_at(target, now);
+                self.set_times_at(target.ino, None, Some(now), now);
+                return Ok(());
+            }
+            let src_file = self.file(id).ok_or(Errno::EIO)?;
+            if !src_file.complete() {
+                return Err(Errno::EBUSY);
+            }
+            if src_file.chunk_size == 0 {
+                let file = auth::random_token();
+                self.run(
+                    "INSERT INTO files(id,size,chunk_size,state,uploader,target,touched) VALUES(?,?,0,'complete',?,'',?)",
+                    vec![text(&file), int(source.size), int(cred.uid), int(now.0)],
+                );
+                self.run(
+                    "INSERT INTO vfs_extents(file,start,length,key,offset,source) SELECT ?,start,length,key,offset,source FROM vfs_extents WHERE file = ?",
+                    vec![text(&file), text(id)],
+                );
+                target.file = Some(file);
+                target.size = source.size;
+                inode::remove_privs(&cred.identity(), target);
+                self.update_inode_at(target, now);
+                self.set_times_at(target.ino, None, Some(now), now);
+                return Ok(());
+            }
+        }
+        let extents = self.content(source)?;
+        self.replace_content_at(target, source.size, extents, cred, now)
+    }
     pub(crate) fn drop_extents(&mut self, file: &str) {
         let extents = self.extents(file);
         self.run("DELETE FROM vfs_extents WHERE file = ?", vec![text(file)]);

@@ -48,8 +48,8 @@ pub fn driver(directory: &str) -> Option<&'static str> {
 /// Make /dev and its directories, root's, where they are not: they are there from the start
 /// (store.rs), and made again if removed.
 pub fn ensure(db: &mut Db) {
-    for directory in ["/dev", PRESENT, SOUND] {
-        if db.node(directory).is_none() {
+    for directory in ["/dev", "/dev/pts", PRESENT, SOUND] {
+        if db.persisted_node(directory).is_none() {
             db.set_node(directory, &Node::directory(0, 0, 0o755));
         }
     }
@@ -63,7 +63,7 @@ pub fn ensure(db: &mut Db) {
         (abi::accelerator::ARCHIVE, "archive"),
         (abi::accelerator::MEDIA, "media"),
     ] {
-        if db.node(path).is_none() {
+        if db.persisted_node(path).is_none() {
             let mut node = Node::file(
                 0,
                 0,
@@ -365,6 +365,8 @@ pub struct Request {
     pub sid: String,
     pub fd: u32,
     pub flags: u32,
+    pub ns: String,
+    pub credential: Option<crate::creds::Credential>,
 }
 impl Request {
     pub fn writes(&self) -> bool {
@@ -391,6 +393,8 @@ pub fn request(db: &Db, sid: &str, fd: u32) -> Result<Option<Request>> {
         sid: sid.to_string(),
         fd,
         flags: found.flags,
+        ns: String::new(),
+        credential: None,
     }))
 }
 
