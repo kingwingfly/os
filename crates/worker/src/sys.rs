@@ -859,6 +859,19 @@ fn authorize_process_v1_with(
         {
             Ok(())
         }
+        Call::Open {
+            path,
+            flags,
+            size: None,
+            sha256: None,
+            version: None,
+            ..
+        } if canonical_subpath(path, "/usr")
+            && (*flags & abi::O_PATH) != 0
+            && (*flags & !(abi::O_PATH | abi::O_DIRECTORY | abi::O_NOFOLLOW)) == 0 =>
+        {
+            Ok(())
+        }
         Call::Mknod {
             path,
             rdev: Some(_),
@@ -1651,5 +1664,51 @@ mod tests {
         assert_eq!(s.fs_auth(), None);
         s.fs_secret = Some("fs-sec".into());
         assert_eq!(s.fs_auth(), Some(("fs-sid", "fs-sec")));
+
+        // `/usr` `O_PATH` opens are permitted for accelerator directory handles, while
+        // non-`O_PATH`, mutating, or non-canonical `/usr` opens are rejected with `EPERM`.
+        assert!(
+            authorize_process_v1_with(
+                &cred,
+                &Call::Open {
+                    path: "/usr/bin".to_string(),
+                    flags: abi::O_PATH | abi::O_DIRECTORY,
+                    mode: 0,
+                    size: None,
+                    sha256: None,
+                    version: None,
+                },
+                is_dev,
+                |_| None,
+            )
+            .is_ok()
+        );
+        for (bad_path, bad_flags, bad_size) in [
+            ("/usr/bin/utilities", abi::O_RDONLY, None),
+            ("/usr/bin", abi::O_PATH | abi::O_WRONLY, None),
+            ("/usr/bin", abi::O_PATH | abi::O_CREAT, None),
+            ("/usr/../etc", abi::O_PATH | abi::O_DIRECTORY, None),
+            ("/usr/bin", abi::O_PATH | abi::O_DIRECTORY, Some(4)),
+        ] {
+            assert_eq!(
+                authorize_process_v1_with(
+                    &cred,
+                    &Call::Open {
+                        path: bad_path.to_string(),
+                        flags: bad_flags,
+                        mode: 0,
+                        size: bad_size,
+                        sha256: None,
+                        version: None,
+                    },
+                    is_dev,
+                    |_| None,
+                )
+                .unwrap_err()
+                .errno,
+                Errno::EPERM,
+                "expected EPERM for {bad_path} flags={bad_flags:#o}"
+            );
+        }
     }
 }
