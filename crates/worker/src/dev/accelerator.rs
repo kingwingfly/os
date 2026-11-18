@@ -72,7 +72,7 @@ fn path(
         .and_then(|ino| {
             db.name_of(ino).or_else(|| {
                 // Immutable image directories have synthetic inodes and no mutable SQLite name.
-                (crate::usr::is(&directory.path)
+                ((crate::usr::is(&directory.path) || crate::system::owns(db, &directory.path))
                     && db
                         .node(&directory.path)
                         .is_some_and(|node| node.ino == ino && node.directory))

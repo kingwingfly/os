@@ -1618,11 +1618,11 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         let mut dir_rec = self.check_live_inode(dir).await?;
         check_component(name)?;
         Self::require_searchable(cred, &dir_rec)?;
+        self.require_writable_grant()?;
+        inode::may_link(&cred.identity, &target_rec.meta)?;
         if self.resolve_child(&mut dir_rec, name).await?.is_some() {
             return Err(Errno::EEXIST);
         }
-        self.require_writable_grant()?;
-        inode::may_link(&cred.identity, &target_rec.meta)?;
         inode::may_create(&cred.identity, &dir_rec.meta, dir_rec.removed())?;
         if target_rec.nlink == 0 {
             return Err(Errno::ENOENT);
