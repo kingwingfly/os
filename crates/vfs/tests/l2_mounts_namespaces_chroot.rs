@@ -3999,4 +3999,46 @@ fn p2_and_p3_mountinfo_rbind_rename_slashes_setns_atime_chardev_and_misc() {
         read_all(&env.vfs, 1, &format!("/proc/self/fd/{proc_mounts_fd}")).unwrap();
     assert!(!reopened_mounts.is_empty());
     run(env.vfs.close(1, proc_mounts_fd)).unwrap();
+
+    // - `linkat` POSIX error ordering (`tests/links.spec.js:90-92`):
+    //   `linkat(dir, existing_file) == Err(Errno::EPERM)` (checked BEFORE `EEXIST`, leaving
+    //   `existing_file` untouched under `ln -f`) and `linkat(file, existing_dir) == Err(Errno::EEXIST)`.
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/tmp/ln_src_dir", 0o755))
+    .unwrap();
+    write_all(&env.vfs, 1, "/tmp/ln_existing_file", 0o644, b"keep\n");
+    write_all(&env.vfs, 1, "/tmp/ln_src_file", 0o644, b"src\n");
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/tmp/ln_existing_dir", 0o755))
+    .unwrap();
+    assert_eq!(
+        run(env.vfs.linkat(
+            1,
+            StartAnchor::Root,
+            "/tmp/ln_src_dir",
+            StartAnchor::Root,
+            "/tmp/ln_existing_file",
+            false,
+        ))
+        .err(),
+        Some(Errno::EPERM)
+    );
+    assert_eq!(
+        read_all(&env.vfs, 1, "/tmp/ln_existing_file").unwrap(),
+        b"keep\n"
+    );
+    assert_eq!(
+        run(env.vfs.linkat(
+            1,
+            StartAnchor::Root,
+            "/tmp/ln_src_file",
+            StartAnchor::Root,
+            "/tmp/ln_existing_dir",
+            false,
+        ))
+        .err(),
+        Some(Errno::EEXIST)
+    );
 }

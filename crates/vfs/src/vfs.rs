@@ -3242,7 +3242,7 @@ impl Vfs {
             else {
                 return Err(Errno::ENOENT);
             };
-            if matches!(magic, Some(MagicResolved::MountNs { .. })) {
+            if matches!(magic, Some(MagicResolved::MountNs { .. })) || old_entry.metadata.is_dir() {
                 return Err(Errno::EPERM);
             }
 
