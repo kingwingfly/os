@@ -1016,7 +1016,7 @@ pub async fn mount_opfs(store: JsValue, grant_json: &str) -> Result<LocalMount, 
     };
     let close_store = Rc::clone(&js_store);
     let mount = mounts::from_fs_with_unmount(Rc::new(fs), grant, move || close_store.close());
-    js_store.set_on_revoke(mount.detach_callback());
+    js_store.set_on_revoke(mount.revoke_callback());
     Ok(mount)
 }
 
@@ -1043,7 +1043,7 @@ pub async fn mount_directory(store: JsValue, grant_json: &str) -> Result<LocalMo
     };
     let close_store = Rc::clone(&js_store);
     let mount = mounts::from_fs_with_unmount(Rc::new(fs), grant, move || close_store.close());
-    js_store.set_on_revoke(mount.detach_callback());
+    js_store.set_on_revoke(mount.revoke_callback());
     Ok(mount)
 }
 

@@ -32,8 +32,33 @@ async function hash(file, size, progress, signal) {
   return { sha256: whole.hex(), parts };
 }
 
-// pwrite(2) of chunk `index`, as an XMLHttpRequest, which stops when asked.
+const CLIENT_PAGE_FD_BASE = 0x40000000;
+
+// pwrite(2) of chunk `index`, as an XMLHttpRequest for remote authority uploads (which reports
+// progress and stops when asked) or intercepted `fetch` for client-mounted filesystems.
 function send(fd, index, blob, sha256, requests) {
+  if (fd >= CLIENT_PAGE_FD_BASE) {
+    const controller = new AbortController();
+    const handle = { abort: () => controller.abort() };
+    requests.add(handle);
+    return fetch(`/api/pwrite?fd=${fd}&index=${index}`, {
+      method: 'PUT',
+      headers: { 'X-Chunk-SHA256': sha256 },
+      body: blob,
+      signal: controller.signal,
+    }).then(async response => {
+      requests.delete(handle);
+      if (response.ok) return;
+      let reply = {}; try { reply = await response.json(); } catch {}
+      const error = new Error(reply.error || `Chunk ${index} failed (${response.status})`);
+      error.status = response.status; error.errno = reply.errno;
+      throw error;
+    }, error => {
+      requests.delete(handle);
+      if (error?.name === 'AbortError') throw new Cancelled();
+      throw error;
+    });
+  }
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest(); requests.add(xhr);
     xhr.open('PUT', `/api/pwrite?fd=${fd}&index=${index}`);
@@ -96,7 +121,7 @@ export async function uploadFile(file, destination, { progress = () => {}, signa
   writing.add(fd);
   // Still here, while it sends: the page keeps its descriptor; another page going on with the
   // file, or its removal, stops the next chunk (EBADF).
-  const lease = hold(fd);
+  const lease = fd >= CLIENT_PAGE_FD_BASE ? () => {} : hold(fd);
   try {
     await Promise.all(Array.from({ length: Math.min(PARALLEL, pending.length) }, async () => {
       while (pending.length && !halted) {

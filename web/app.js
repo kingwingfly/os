@@ -13,7 +13,6 @@ import { installConsoleSharing } from './console-sharing.js';
 import { executionSupport } from './kernel/capabilities.js';
 import { installLocalFiles, localMounts } from './local-files.js';
 import { shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog } from './mount-sharing-ui.js';
-import { localPath } from './kernel/workspace.js';
 
 installLocalFiles();
 
@@ -893,10 +892,17 @@ document.addEventListener('fullscreenchange', () => {
   else { clearTimeout(chromeTimer); $('viewer-surface').classList.remove('chrome'); }
 });
 window.addEventListener('message', event => { if (event.origin === location.origin && event.source === $('viewer-content').querySelector('iframe')?.contentWindow && event.data === 'close-game') closeViewer(); });
+const OS_CLOUD_MAGIC = 0x4f53434c;
 $('download').addEventListener('click', async event => {
-  if (!localPath(shown?.path)) return;
+  if (!shown?.path) return;
   event.preventDefault(); const path = shown.path;
   try {
+    const [sfs] = await sys([{ statfs: { path } }]).catch(() => []);
+    if (sfs?.ok?.f_type === OS_CLOUD_MAGIC) {
+      const link = document.createElement('a');
+      link.href = fileUrl(path); link.download = path.split('/').pop(); link.click();
+      return;
+    }
     const response = await api(fileUrl(path));
     if (Number(response.headers.get('Content-Length')) > 128 * 1024 * 1024) throw new Error('Local browser downloads are limited to 128 MiB; copy larger files on their owner device.');
     const url = URL.createObjectURL(await response.blob()), link = document.createElement('a');

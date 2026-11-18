@@ -308,8 +308,261 @@ struct CreatedPolicy {
     acl_bytes: Option<Vec<u8>>,
 }
 
+struct SnapshotFs(Rc<dyn Filesystem>);
+
+impl Filesystem for SnapshotFs {
+    fn id(&self) -> &FsId {
+        self.0.id()
+    }
+    fn capabilities(&self) -> abi::contract::FsCapabilities {
+        let mut caps = self.0.capabilities();
+        caps.open_survives_unlink = abi::contract::Support::Refused(Errno::EROFS);
+        caps
+    }
+    fn root(&self) -> Handle {
+        self.0.root()
+    }
+    fn lookup<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+    ) -> vfs::BoxFuture<'a, Entry> {
+        self.0.lookup(cred, dir, name)
+    }
+    fn walk<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        names: &'a [String],
+    ) -> vfs::BoxFuture<'a, vfs::Walked> {
+        self.0.walk(cred, dir, names)
+    }
+    fn parent<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+    ) -> vfs::BoxFuture<'a, Option<(Entry, String)>> {
+        self.0.parent(cred, dir)
+    }
+    fn metadata<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> vfs::BoxFuture<'a, Metadata> {
+        self.0.metadata(cred, handle)
+    }
+    fn setattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        attr: &'a SetAttr,
+    ) -> vfs::BoxFuture<'a, Metadata> {
+        if attr.size.is_some() {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.0.setattr(cred, handle, attr)
+    }
+    fn read_dir<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+    ) -> vfs::BoxFuture<'a, Vec<vfs::DirEntry>> {
+        self.0.read_dir(cred, dir)
+    }
+    fn read_link<'a>(&'a self, cred: &'a Cred, link: &'a Handle) -> vfs::BoxFuture<'a, String> {
+        self.0.read_link(cred, link)
+    }
+    fn create<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+        _mode: u16,
+        _options: &'a OpenOptions,
+    ) -> vfs::BoxFuture<'a, (Entry, OpenRef)> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn mkdir<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+        _mode: u16,
+    ) -> vfs::BoxFuture<'a, Entry> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn mknod<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+        _mode: u16,
+        _rdev: &'a str,
+    ) -> vfs::BoxFuture<'a, Entry> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn symlink<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+        _target: &'a str,
+    ) -> vfs::BoxFuture<'a, Entry> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn link<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _target: &'a Handle,
+        _dir: &'a Handle,
+        _name: &'a str,
+    ) -> vfs::BoxFuture<'a, Entry> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn unlink<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+    ) -> vfs::BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn rmdir<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+    ) -> vfs::BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn rename<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _from_dir: &'a Handle,
+        _from: &'a str,
+        _to_dir: &'a Handle,
+        _to: &'a str,
+        _flags: RenameFlags,
+    ) -> vfs::BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn getxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+    ) -> vfs::BoxFuture<'a, Vec<u8>> {
+        self.0.getxattr(cred, handle, name)
+    }
+    fn setxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+        value: &'a [u8],
+        flags: XattrFlags,
+    ) -> vfs::BoxFuture<'a, ()> {
+        self.0.setxattr(cred, handle, name, value, flags)
+    }
+    fn listxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+    ) -> vfs::BoxFuture<'a, Vec<String>> {
+        self.0.listxattr(cred, handle)
+    }
+    fn removexattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+    ) -> vfs::BoxFuture<'a, ()> {
+        self.0.removexattr(cred, handle, name)
+    }
+    fn statfs<'a>(&'a self, cred: &'a Cred) -> vfs::BoxFuture<'a, vfs::StatFs> {
+        self.0.statfs(cred)
+    }
+    fn open<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        options: &'a OpenOptions,
+    ) -> vfs::BoxFuture<'a, OpenRef> {
+        Box::pin(async move {
+            let access = options.access()?;
+            if access != Access::Path && (access.writes() || options.is_truncate()) {
+                return Err(Errno::EROFS);
+            }
+            self.0.open(cred, handle, options).await
+        })
+    }
+    fn open_metadata<'a>(&'a self, open: &'a OpenRef) -> vfs::BoxFuture<'a, Metadata> {
+        self.0.open_metadata(open)
+    }
+    fn read_at<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> vfs::BoxFuture<'a, usize> {
+        self.0.read_at(open, buf, offset)
+    }
+    fn write_at<'a>(
+        &'a self,
+        _open: &'a OpenRef,
+        _buf: &'a [u8],
+        _at: WriteAt,
+    ) -> vfs::BoxFuture<'a, vfs::Written> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn set_len<'a>(&'a self, _open: &'a OpenRef, _size: u64) -> vfs::BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn sync_all<'a>(&'a self, open: &'a OpenRef) -> vfs::BoxFuture<'a, ()> {
+        self.0.sync_all(open)
+    }
+    fn sync_data<'a>(&'a self, open: &'a OpenRef) -> vfs::BoxFuture<'a, ()> {
+        self.0.sync_data(open)
+    }
+    fn lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
+    ) -> vfs::BoxFuture<'a, ()> {
+        self.0.lock(open, family, kind, range)
+    }
+    fn try_lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
+    ) -> vfs::BoxFuture<'a, ()> {
+        self.0.try_lock(open, family, kind, range)
+    }
+    fn unlock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        range: LockRange,
+    ) -> vfs::BoxFuture<'a, ()> {
+        self.0.unlock(open, family, range)
+    }
+    fn test_lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        kind: LockKind,
+        range: LockRange,
+    ) -> vfs::BoxFuture<'a, Option<vfs::Conflict>> {
+        self.0.test_lock(open, kind, range)
+    }
+    fn release<'a>(&'a self, open: &'a OpenRef) -> vfs::BoxFuture<'a, ()> {
+        self.0.release(open)
+    }
+}
+
 struct SharedMountState {
     fs: Rc<dyn Filesystem>,
+    provider_state: Rc<vfs::ProviderState>,
     grant: Grant,
     grant_js: JsValue,
     active: Cell<bool>,
@@ -324,6 +577,16 @@ impl SharedMountState {
         let mut views = self.views.borrow_mut();
         views.retain(|w| w.strong_count() > 0);
         views.push(Rc::downgrade(opens));
+    }
+
+    fn lose_provider(&self) {
+        self.provider_state.lose();
+        self.shutdown();
+    }
+
+    fn revoke_provider(&self) {
+        self.provider_state.revoke();
+        self.shutdown();
     }
 
     fn shutdown(&self) {
@@ -430,6 +693,7 @@ impl LocalMount {
         let opens = Rc::new(RefCell::new(HashMap::new()));
         let state = Rc::new(SharedMountState {
             fs,
+            provider_state: vfs::ProviderState::new(),
             grant,
             grant_js,
             active: Cell::new(true),
@@ -449,9 +713,58 @@ impl LocalMount {
         }
     }
 
-    pub(crate) fn detach_callback(&self) -> Rc<dyn Fn()> {
+    pub(crate) fn lose_callback(&self) -> Rc<dyn Fn()> {
         let state = Rc::clone(&self.state);
-        Rc::new(move || state.shutdown())
+        Rc::new(move || state.lose_provider())
+    }
+
+    pub(crate) fn revoke_callback(&self) -> Rc<dyn Fn()> {
+        let state = Rc::clone(&self.state);
+        Rc::new(move || state.revoke_provider())
+    }
+
+    pub(crate) fn mount_backing(&self, fstype: vfs::FsType) -> Rc<vfs::MountBacking> {
+        let fs: Rc<dyn Filesystem> = if self.state.snapshot_data_ro {
+            Rc::new(SnapshotFs(Rc::clone(&self.state.fs)))
+        } else {
+            Rc::clone(&self.state.fs)
+        };
+        let rdonly_ceiling = self.state.grant.read_only && !self.state.snapshot_data_ro;
+        let noexec_ceiling = !self.state.grant.execute;
+        Rc::new(
+            vfs::MountBacking::new(fs, fstype)
+                .with_provider(Rc::clone(&self.state.provider_state))
+                .with_ceilings(rdonly_ceiling, noexec_ceiling),
+        )
+    }
+
+    pub(crate) fn provider_state(&self) -> Rc<vfs::ProviderState> {
+        Rc::clone(&self.state.provider_state)
+    }
+
+    pub(crate) fn grant_info(&self) -> &Grant {
+        &self.state.grant
+    }
+
+    pub(crate) fn grant_js(&self) -> JsValue {
+        self.state.grant_js.clone()
+    }
+
+    pub(crate) fn shutdown_provider(&self) {
+        self.state.shutdown();
+    }
+
+    pub(crate) fn clone_owner(&self) -> Self {
+        let opens = Rc::new(RefCell::new(HashMap::new()));
+        self.state.register_view(&opens);
+        Self {
+            state: Rc::clone(&self.state),
+            identity: self.state.grant.owner.clone(),
+            boundary: Vec::new(),
+            remote: false,
+            next_local_open: Cell::new(1),
+            opens,
+        }
     }
 
     fn check_grant(&self, grant: &JsValue) -> std::result::Result<(), Errno> {

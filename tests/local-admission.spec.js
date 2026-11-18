@@ -1,5 +1,8 @@
 import { test, expect } from './test.js';
 import { sys, call } from './sys.js';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
+const fsRpc = async (request, credential, session, fsCall) =>
+  (await request.post('/api/fs', { headers: { Origin: origin }, data: { version: 2, credential, session, call: fsCall } })).json();
 const image = { path: '/mnt/local/project/probe', argv: ['probe'], cwd: '/', runtime: 'resources-v1', local: { digest: 'a'.repeat(64), size: 8, cloud: false } };
 const proof = process => ({ pid: process.pid, proc: process.token });
 const result = async (request, call, options = {}) => (await sys(request, [call], options))[0];
@@ -27,9 +30,26 @@ test('local fork and replacement preserve attenuation, while an explicitly deleg
     child = { ...(await result(request, { fork: { pid: parent.pid } }, proof(parent))).ok, token: parent.token };
     expect((await result(request, { stat: { path: '/usr/bin/coreutils' } }, proof(child))).err.errno).toBe('EACCES');
     const replacement = await result(request, { execve: { ...image, ...proof(child), local: { ...image.local, cloud: true } } }); expect(replacement.err).toBeUndefined(); child = replacement.ok; expect(child.local.cloud).toBe(false);
+    expect((await fsRpc(request, parent.token, null, 'connect')).errno).toBe('EACCES');
     delegated = (await result(request, { execve: { ...image, local: { ...image.local, cloud: true } } })).ok;
-    expect((await result(request, { stat: { path: '/usr/bin/coreutils' } }, proof(delegated))).err).toBeUndefined();
-    expect(['EACCES', 'ENOENT']).toContain((await result(request, { pread: { path: '/etc/shadow', count: 64 } }, proof(delegated))).err.errno);
+    // Ordinary processes resolve files via /api/fs v2 handles; direct /api/sys path calls are refused at the server boundary.
+    expect((await result(request, { stat: { path: '/usr/bin/coreutils' } }, proof(delegated))).err.errno).toBe('EPERM');
+    const conn = await fsRpc(request, delegated.token, null, 'connect');
+    expect(conn.session).toBeTruthy();
+    try {
+      const passwdWalk = await fsRpc(request, delegated.token, conn.session, { walk: { dir: conn.root, names: ['etc', 'passwd'] } });
+      expect(passwdWalk.stop).toBeNull();
+      expect(passwdWalk.entries).toHaveLength(2);
+      const shadowWalk = await fsRpc(request, delegated.token, conn.session, { walk: { dir: conn.root, names: ['etc', 'shadow'] } });
+      if (shadowWalk.entries?.length === 2 && !shadowWalk.stop) {
+        const shadowOpen = await fsRpc(request, delegated.token, conn.session, { open: { ticket: 'shadow-acl-check', handle: shadowWalk.entries[1].handle, options: { read: true, write: false, append: false, append_implies_write: false, truncate: false, create: false, create_new: false, exec: false, path: false } } });
+        expect(['EACCES', 'ENOENT']).toContain(shadowOpen.errno);
+      } else {
+        expect(shadowWalk.stop).toBeTruthy();
+      }
+    } finally {
+      await fsRpc(request, delegated.token, conn.session, 'disconnect');
+    }
   } finally { await end(request, child); await end(request, parent); await end(request, delegated); }
 });
 

@@ -151,9 +151,9 @@ test('CLI sudo mount -t tmpfs syncs across findmnt, mount, df, Files UI, and Mou
     const mountOut = await cliOutput(page, '/usr/bin/mount');
     expect(mountOut).toContain(`on ${scratch} type tmpfs`);
 
-    // 3. df listing
+    // 3. df listing (a 99-col row wraps across terminal columns on .terminal-screen)
     const dfOut = await cliOutput(page, '/usr/bin/df');
-    expect(dfOut).toContain(scratch);
+    expect(dfOut.replace(/\n/g, '')).toContain(scratch);
 
     // 4. Files UI
     const filesWin = page.locator('#window-files');
@@ -177,7 +177,7 @@ test('CLI sudo mount -t tmpfs syncs across findmnt, mount, df, Files UI, and Mou
     const afterFindmnt = flattenFindmnt(JSON.parse(await cliOutput(page, '/usr/bin/findmnt -J')).filesystems);
     expect(afterFindmnt.some(m => m.target === scratch)).toBe(false);
     expect(await cliOutput(page, '/usr/bin/mount')).not.toContain(`on ${scratch} `);
-    expect(await cliOutput(page, '/usr/bin/df')).not.toContain(scratch);
+    expect((await cliOutput(page, '/usr/bin/df')).replace(/\n/g, '')).not.toContain(scratch);
     await expect(mountsWin.locator('[data-mounts]')).not.toContainText(scratch);
 
     await location.fill(scratch);
@@ -225,9 +225,9 @@ test('child unshare(CLONE_NEWNS) requires privilege and keeps child mounts invis
     session = await openUserSession(browser, alice, { sudo: true });
     const { page } = session;
 
-    // Unprivileged unshare(CLONE_NEWNS) must fail with EPERM (errno = 1)
+    // Unprivileged unshare(CLONE_NEWNS) must fail with WASI EPERM (63, per crates/posix/src/lib.rs)
     const denied = await execCmd(page, [helperBin], { sudo: false });
-    expect(denied.status).toBe(1);
+    expect(denied.status).toBe(63);
 
     // Privileged child unshares CLONE_NEWNS, mounts tmpfs, and holds it open while we inspect parent
     await page.evaluate(
@@ -238,6 +238,7 @@ test('child unshare(CLONE_NEWNS) requires privilege and keeps child mounts invis
             cwd: '/',
             sudo: true,
             stdin: '',
+            streamOutput: true,
             onOutput(_fd, text) {
               state.output += text;
             },
@@ -435,6 +436,7 @@ test('ordinary umount fails with EBUSY while open descriptors or cwd hold a moun
             {
               cwd: '/',
               stdin: '',
+              streamOutput: true,
               onOutput(_fd, text) {
                 holder.output += text;
               },

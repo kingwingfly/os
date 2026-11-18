@@ -2,7 +2,24 @@ import { kernelCall } from './kernel/protocol.js';
 import { shareMount, attachShared, sharedMounts, revokeMount } from './mount-sharing-ui.js';
 
 let manager;
-const kinds = { directory: 'Host folder · browser', 'native-directory': 'Host folder · helper', 'browser-storage': 'Browser storage', snapshot: 'File image', 'private-extension': 'Private extension' };
+const kinds = {
+  directory: 'Host folder · browser',
+  'native-directory': 'Host folder · helper',
+  'browser-storage': 'Browser storage',
+  snapshot: 'File image',
+  'private-extension': 'Private extension',
+  shared: 'Shared directory',
+  tmpfs: 'Memory filesystem · tmpfs',
+  image: 'Image filesystem',
+  cloud: 'Cloud filesystem',
+  proc: 'Process filesystem · proc',
+  devtmpfs: 'Device filesystem · devtmpfs',
+  devpts: 'Pseudo-terminals · devpts',
+  opfs: 'Browser storage',
+  hostfs: 'Host folder · browser',
+  helperfs: 'Host folder · helper',
+  sharefs: 'Shared directory',
+};
 const mode = mount => {
   if (!Number.isInteger(mount.mode)) return 'Unavailable';
   const bits = [...'rwxrwxrwx'].map((letter, index) => mount.mode & (1 << (8 - index)) ? letter : '-');
@@ -238,6 +255,10 @@ function createManager(root) {
     notice.textContent = 'Session changed. Refresh to view its mounts.';
   };
   addEventListener('os:login-changed', reset);
+  addEventListener('os:mounts-changed', () => {
+    if (pane === 'mounted') void action(refresh)();
+    else if (pane === 'publish') void action(refreshSharing)();
+  });
   let login;
   addEventListener('os:login-session', ({ detail }) => {
     if (!detail?.connected) return;

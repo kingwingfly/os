@@ -135,9 +135,17 @@ async fn show(
     version: String,
 ) -> Result<JsValue, String> {
     let url = file_url(&path);
-    let local = ["/mnt/local/", "/mnt/shared/", "/opt/private/"]
-        .iter()
-        .any(|prefix| path.starts_with(prefix));
+    let local = match userland::sys::call::<abi::StatFs>(
+        &crate::sys::HttpSys::default(),
+        abi::Call::Statfs { path: path.clone() },
+    )
+    .await
+    {
+        Ok(sfs) => sfs.f_type != abi::fs_magic::OS_CLOUD_MAGIC,
+        Err(_) => ["/mnt/local/", "/mnt/shared/", "/opt/private/"]
+            .iter()
+            .any(|prefix| path.starts_with(prefix)),
+    };
     // A player asks for many ranges: it plays from a read descriptor's token, which the Worker
     // serves without asking the kernel each time; closing the preview closes it.
     let held = if !local && matches!(listed.as_str(), "video" | "audio") {

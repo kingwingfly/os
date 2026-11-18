@@ -791,7 +791,7 @@ test('unshare(CLONE_NEWNS) and setns enforce privilege, reject forged/non-ns/sha
   await k.kfd_close(400, dirFd.kfd);
 
   // 3) Non-root with a real /proc/<pid>/ns/mnt fd -> EPERM
-  const nonRootNsFd = await k.proc_openat(402, OS_FD_ROOT, '/proc/401/ns/mnt', O_RDONLY, 0, false);
+  const nonRootNsFd = await k.proc_openat(402, OS_FD_ROOT, '/proc/402/ns/mnt', O_RDONLY, 0, false);
   await expectErrno(() => k.sys_setns(402, nonRootNsFd.kfd, CLONE_NEWNS), 'EPERM');
   await k.kfd_close(402, nonRootNsFd.kfd);
 

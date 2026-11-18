@@ -251,7 +251,7 @@ fn process(shell: &Shell, args: &[String]) -> Option<(Option<String>, Vec<String
     }
     // execvp searches PATH, including commands installed by the user. The engine tries each
     // candidate through ordinary exec authorization; the shell has no applet dispatch table.
-    Some((Some(name.clone()), args.to_vec()))
+    Some((None, args.to_vec()))
 }
 
 pub(crate) fn js_message(error: JsValue) -> String {
@@ -451,9 +451,8 @@ impl Shell {
         let value = self.call(args).await?;
         // Not one of web/app.js's dialogs: a program of user space.
         if value["program"] == true {
-            return self
-                .bin((Some(argv[0].clone()), argv.to_vec()), None, piped, sudo)
-                .await;
+            let path = argv[0].contains('/').then(|| argv[0].clone());
+            return self.bin((path, argv.to_vec()), None, piped, sudo).await;
         }
         let out = self.output(&value);
         self.refresh().await?;
@@ -942,7 +941,12 @@ impl Shell {
         set(&options, "onReading", reading.as_ref().clone());
         let names: Vec<String> = stages.iter().map(|(_, args)| args[0].clone()).collect();
         // An uploaded program's writes are its own: refresh after one ran, as after coreutils'.
-        let execed = stages.iter().any(|(path, _)| path.is_some());
+        let execed = stages.iter().any(|(path, args)| {
+            path.is_some()
+                || args
+                    .first()
+                    .is_some_and(|name| cli_bin::image(name).is_none())
+        });
         let argvs = js_sys::Array::new();
         for (path, args) in stages {
             let stage = js_sys::Object::new();

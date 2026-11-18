@@ -66,7 +66,7 @@ class Connection {
       waiting.reject(waiting.mutation ? bad(errno, 'Connection lost before the file change was confirmed. It may already have been saved. Check the shared folder before repeating the change.') : error);
     }
     this.pending.clear();
-    this.port.postMessage({ type: 'close' }); this.port.close(); this.onclose?.();
+    this.port.postMessage({ type: 'close' }); this.port.close(); this.onclose?.(errno);
   }
 }
 async function connect(grant, port, role) {
@@ -79,9 +79,15 @@ const safePath = path => {
   return path.split('/').filter(name => name && name !== '.').join('/');
 };
 export async function exportMount(workspace, args) {
-  const found = workspace.resolve(args.path);
-  if (!found || !found.mount.provider.forIdentity) throw bad('EACCES', 'publish a local filesystem');
-  const { provider, grant: source } = found.mount;
+  const resolved = workspace.resolveExport
+    ? await workspace.resolveExport(args.path)
+    : (() => {
+        const f = workspace.resolve?.(args.path);
+        return f ? { mountPath: f.mount.path, relative: f.relative, grant: f.mount.grant, provider: f.mount.provider, mountRef: f.mount } : null;
+      })();
+  if (!resolved || !resolved.provider?.forIdentity) throw bad('EACCES', 'publish a local filesystem');
+  const { provider, grant: source, relative, mountPath } = resolved;
+  const found = { relative, mount: resolved.mountRef ?? { path: mountPath, provider, grant: source } };
   if ((await provider.stat(source, found.relative)).kind !== 'directory') throw bad('ENOTDIR');
   if (source.kind === 'native-directory' && provider.identitySupported !== true) throw bad('EPROTONOSUPPORT', 'Update os-local-helper before sharing this folder.');
   const grant = await mountApi(workspace, 'publish', { name: args.name, write: !source.readOnly, execute: source.execute, seconds: args.seconds, password: args.password ?? '' });
@@ -114,7 +120,7 @@ export async function exportMount(workspace, args) {
   port.onmessageerror = () => controller.close(); port.start();
   port.postMessage({ type: 'listen', url: '/api/mounts/listen/' + grant.id + '?ticket=' + grant.ticket, expires: grant.expires });
   try { await ready; } catch (error) { controller.close(); await mountApi(workspace, 'revoke/' + grant.id).catch(() => {}); throw error; }
-  workspace.exports ??= new Map(); workspace.exports.set(grant.id, { connection: controller, grant, mount: found.mount, clients });
+  workspace.exports ??= new Map(); workspace.exports.set(grant.id, { connection: controller, grant, mount: found.mount, mountPath: mountPath ?? found.mount.path, clients });
   const { ticket, ...publicGrant } = grant;
   return { ...publicGrant, address: 'osfs:' + grant.id };
 }
@@ -236,9 +242,12 @@ function serve(workspace, found, provider, source, grant, connection) {
             value = retainHandle(await provider.hold(source, path, found.relative)); break;
           }
           case 'release': { if (!handles.has(args.handle)) throw bad('EBADF'); await provider.release(source, path); handles.delete(args.handle); value = null; break; }
-          case 'policy':
-            if (!['access', 'getxattr', 'listxattr', 'statfs'].includes(args.name)) throw bad('EPERM');
+          case 'policy': {
+            const readOps = ['access', 'getxattr', 'listxattr', 'statfs'];
+            const writeOps = ['chmod', 'utimens', 'setxattr', 'removexattr'];
+            if (!readOps.includes(args.name) && !(grant.write && writeOps.includes(args.name))) throw bad('EPERM');
             value = await provider.policy(source, path, args.name, args.options); break;
+          }
           case 'stat': value = await provider.stat(source, path, { follow: args.follow !== false }); break;
           case 'list': {
             value = await provider.list(source, path, { offset: args.offset, limit: Math.min(16, args.limit ?? 16) });
@@ -318,6 +327,9 @@ class RemoteMount {
   constructor(connection, grant) {
     this.connection = connection; this.remote = grant;
     this.grant = Object.freeze({ kind: 'shared', name: grant.name, readOnly: !grant.write, execute: grant.execute });
+    this.connection.onclose = errno => {
+      this.onProviderEvent?.(errno === 'EACCES' ? 'revoked' : 'lost');
+    };
   }
   check(grant) { if (grant !== this.grant) throw bad('EACCES'); this.connection.check(); }
   request(grant, op, args) {

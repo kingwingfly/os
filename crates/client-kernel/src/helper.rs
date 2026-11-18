@@ -19,7 +19,13 @@ async fn sleep_ms(millis: u32) -> Result<(), JsValue> {
         if let Ok(set_timeout) = Reflect::get(&global, &JsValue::from_str("setTimeout"))
             && let Ok(func) = set_timeout.dyn_into::<Function>()
         {
-            let _ = func.call2(&global, &resolve, &JsValue::from_f64(f64::from(millis)));
+            if let Ok(timer) = func.call2(&global, &resolve, &JsValue::from_f64(f64::from(millis)))
+                && timer.is_object()
+                && let Ok(unref) = Reflect::get(&timer, &JsValue::from_str("unref"))
+                && let Ok(unref_fn) = unref.dyn_into::<Function>()
+            {
+                let _ = unref_fn.call0(&timer);
+            }
         } else {
             let _ = resolve.call0(&JsValue::UNDEFINED);
         }
@@ -161,9 +167,27 @@ pub async fn connect_helper_mount(
     let fs = Rc::new(fs);
     let alive = Rc::new(Cell::new(true));
 
+    let fs_unmount = Rc::clone(&fs);
+    let alive_unmount = Rc::clone(&alive);
+    let transport_unmount = transport.clone();
+    let on_unmount = move || {
+        alive_unmount.set(false);
+        let fs_detach = Rc::clone(&fs_unmount);
+        let transport_close = transport_unmount.clone();
+        spawn_local(async move {
+            let _ = fs_detach.detach().await;
+            close_js_transport(&transport_close);
+        });
+    };
+
+    let dyn_fs: Rc<dyn Filesystem> = Rc::clone(&fs) as Rc<dyn Filesystem>;
+    let mount = crate::mounts::from_fs_with_unmount(dyn_fs, grant, on_unmount);
+    let on_revoke = mount.revoke_callback();
+    let on_lose = mount.lose_callback();
+
     let fs_renew = Rc::clone(&fs);
     let alive_renew = Rc::clone(&alive);
-    let transport_renew = transport.clone();
+    let transport_renew = transport;
     let lease_ms = fs_renew
         .lease_seconds()
         .saturating_mul(1000)
@@ -180,8 +204,15 @@ pub async fn connect_helper_mount(
                     failed_ms = 0;
                     next_delay = RENEW_MILLIS;
                 }
-                Err(Errno::ENODEV | Errno::EACCES | Errno::EPROTONOSUPPORT) => {
+                Err(Errno::EACCES) => {
                     alive_renew.set(false);
+                    on_revoke();
+                    close_js_transport(&transport_renew);
+                    break;
+                }
+                Err(Errno::ENODEV | Errno::EPROTONOSUPPORT) => {
+                    alive_renew.set(false);
+                    on_lose();
                     close_js_transport(&transport_renew);
                     break;
                 }
@@ -189,6 +220,7 @@ pub async fn connect_helper_mount(
                     failed_ms = failed_ms.saturating_add(u64::from(next_delay));
                     if failed_ms >= lease_ms {
                         alive_renew.set(false);
+                        on_lose();
                         close_js_transport(&transport_renew);
                         break;
                     }
@@ -198,21 +230,5 @@ pub async fn connect_helper_mount(
         }
     });
 
-    let fs_unmount = Rc::clone(&fs);
-    let alive_unmount = Rc::clone(&alive);
-    let transport_unmount = transport;
-    let on_unmount = move || {
-        alive_unmount.set(false);
-        let fs_detach = Rc::clone(&fs_unmount);
-        let transport_close = transport_unmount.clone();
-        spawn_local(async move {
-            let _ = fs_detach.detach().await;
-            close_js_transport(&transport_close);
-        });
-    };
-
-    let dyn_fs: Rc<dyn Filesystem> = fs;
-    Ok(crate::mounts::from_fs_with_unmount(
-        dyn_fs, grant, on_unmount,
-    ))
+    Ok(mount)
 }

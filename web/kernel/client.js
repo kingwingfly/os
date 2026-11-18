@@ -74,6 +74,52 @@ self.kernelSys = async (body, signal) => {
   return JSON.stringify({ status: response.status, text: await response.text() });
 };
 
+// Cookie-authenticated authority batch transport for page VFS calls (NEVER X-Registry).
+self.pageSysPost = async body => {
+  const response = await fetch('/api/sys', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+  });
+  return JSON.stringify({ status: response.status, text: await response.text() });
+};
+
+self.pageFileRead = async (path, offset, len) => {
+  const start = Number(offset);
+  const count = Number(len);
+  if (count <= 0) return new Uint8Array(0);
+  const end = start + count - 1;
+  const response = await fetch('/api/file?path=' + encodeURIComponent(path), {
+    headers: { Range: `bytes=${start}-${end}` },
+  });
+  if (response.status === 416) return new Uint8Array(0);
+  if (response.status === 404) throw { errno: 'ENOENT' };
+  if (response.status === 401 || response.status === 403) throw { errno: 'EACCES' };
+  if (!response.ok && response.status !== 206) throw { errno: 'EIO' };
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  return response.status === 200 ? bytes.subarray(start, start + count) : bytes;
+};
+
+self.imageBlobRead = async (blobId, offset, len) => {
+  const start = Number(offset);
+  const count = Number(len);
+  if (count <= 0) return new Uint8Array(0);
+  const url = blobId.startsWith('sha256:')
+    ? `/boot/blobs/${blobId.slice(7)}`
+    : asset(blobId.startsWith('/') ? blobId : `/${blobId}`);
+  const response = await fetch(url);
+  if (response.status === 404) throw { errno: 'ENOENT' };
+  if (!response.ok) throw { errno: 'EIO' };
+  const full = new Uint8Array(await response.arrayBuffer());
+  if (start === 0 && count >= full.length) return full;
+  if (start >= full.length) return new Uint8Array(0);
+  return full.subarray(start, start + count);
+};
+
+self.onKernelMountsChanged = value => {
+  broadcast({ v: VERSION, type: 'event', event: 'mounts-changed', value });
+};
+
 self.cloudFsPost = async (path, headers, body) => {
   const response = await fetch(path, { method: 'POST', headers, body });
   return { status: response.status, body: new Uint8Array(await response.arrayBuffer()) };
@@ -203,7 +249,15 @@ async function reapGone(seat) {
 // reaped, and it is asked once more.
 async function execs(args, seat, host) {
   const stages = (args.stages ?? []).map(stage => ({
-    path: stage.path, local: stage.local, argv: stage.argv ?? [], env: stage.env ?? [], cwd: stage.cwd ?? '/', cgroup: stage.cgroup ?? '',
+    path: stage.path,
+    local: stage.local,
+    runtime: stage.runtime,
+    parentPid: stage.parentPid,
+    sessionId: stage.sessionId,
+    argv: stage.argv ?? [],
+    env: stage.env ?? [],
+    cwd: stage.cwd ?? '/',
+    cgroup: stage.cgroup ?? '',
   }));
   const call = async () => JSON.parse(await kernel.execs(JSON.stringify(stages), !!args.sudo, seat ?? '', host));
   const results = await call();
@@ -304,25 +358,132 @@ async function dispatch(message, host, tab) {
     case 'cgroup_remove': return JSON.parse(await kernel.cgroup_remove(args.path));
     case 'cgroup_stat': return JSON.parse(await kernel.cgroup_stat(args.path));
     case 'cgroup_list': return JSON.parse(await kernel.cgroup_list(args.path ?? '/'));
-    case 'cloud_open': return JSON.parse(await kernel.cloud_open(args.pid, host, args.path, args.flags, args.mode ?? 0, args.umask ?? 0o022));
-    case 'cloud_read': return await kernel.cloud_read(args.pid, host, args.id, args.count, args.offset != null ? BigInt(args.offset) : undefined);
-    case 'cloud_write': return await kernel.cloud_write(args.pid, host, args.id, args.data, args.offset != null ? BigInt(args.offset) : undefined);
-    case 'cloud_seek': return (await kernel.cloud_seek(args.pid, host, args.id, BigInt(args.offset), args.whence)).toString();
-    case 'cloud_fstat': return JSON.parse(await kernel.cloud_fstat(args.pid, host, args.id));
-    case 'cloud_truncate': await kernel.cloud_truncate(args.pid, host, args.id, BigInt(args.size)); return null;
-    case 'cloud_sync': await kernel.cloud_sync(args.pid, host, args.id, !!args.data_only); return null;
-    case 'cloud_set_append': kernel.cloud_set_append(args.pid, host, args.id, !!args.append); return null;
-    case 'cloud_append': return kernel.cloud_append(args.pid, host, args.id);
-    case 'cloud_inherit': kernel.cloud_inherit(args.pid, args.child, JSON.stringify(args.ids ?? []), host); return null;
-    case 'cloud_close': await kernel.cloud_close(args.pid, host, args.id); return null;
-    case 'cloud_lock': await kernel.cloud_lock(args.pid, host, args.id, args.family, args.kind, BigInt(args.start), args.end != null ? BigInt(args.end) : undefined, !!args.wait); return null;
-    case 'cloud_cancel': kernel.cloud_cancel(args.pid, host, args.id); return null;
-    case 'cloud_unlock': await kernel.cloud_unlock(args.pid, host, args.id, args.family, BigInt(args.start), args.end != null ? BigInt(args.end) : undefined); return null;
-    case 'cloud_test_lock': return JSON.parse(await kernel.cloud_test_lock(args.pid, host, args.id, args.kind, BigInt(args.start), args.end != null ? BigInt(args.end) : undefined));
     case 'cloud_renew': await kernel.cloud_renew(); return null;
+    case 'boot_vfs': await kernel.boot_vfs(args.opts != null ? (typeof args.opts === 'string' ? args.opts : JSON.stringify(args.opts)) : undefined); return null;
+    case 'session_begin': return await kernel.session_begin(args.sessionId, args.uid, args.gid ?? args.uid, new Uint32Array(args.groups ?? []));
+    case 'set_active_session': kernel.set_active_session(args.sessionId ?? undefined); return null;
+    case 'session_end': await kernel.session_end(args.sessionId); return null;
+    case 'mount_user': return await kernel.mount_user(args.sessionId, typeof args.spec === 'string' ? args.spec : JSON.stringify(args.spec), args.hostObj);
+    case 'unmount_user': await kernel.unmount_user(args.sessionId, args.target, args.flags ?? 0); return null;
+    case 'revoke_mount_provider': kernel.revoke_mount_provider(args.sessionId, args.target); return null;
+    case 'lose_mount_provider': kernel.lose_mount_provider(args.sessionId, args.target); return null;
+    case 'export_provider': return kernel.export_provider(args.sessionId, args.path);
+    case 'list_mounts': return await kernel.list_mounts(args.sessionId ?? '');
+    case 'vfs_sys': return JSON.parse(await kernel.vfs_sys(args.sessionId ?? '', typeof args.batch === 'string' ? args.batch : JSON.stringify(args.batch)));
+    case 'vfs_read_file': {
+      const sid = args.sessionId ?? '';
+      const first = await kernel.vfs_read_file(sid, args.path, 0n, args.headOnly ? 0 : (args.rangeStart != null ? 0 : 4 * 1024 * 1024));
+      const totalSize = Number(first.stat?.size ?? 0);
+      if (args.rangeStart != null) {
+        const start = Number(args.rangeStart);
+        if (start >= totalSize && totalSize > 0) return { status: 416, totalSize };
+        if (start >= totalSize && totalSize === 0) return { status: 416, totalSize: 0 };
+        const end = Math.min(totalSize - 1, args.rangeEnd != null ? Number(args.rangeEnd) : totalSize - 1);
+        const contentRange = `bytes ${start}-${end}/${totalSize}`;
+        if (args.headOnly) return { status: 206, totalSize, contentRange, bytes: new Uint8Array(0) };
+        const want = end - start + 1;
+        const out = new Uint8Array(want);
+        let pos = 0;
+        while (pos < want) {
+          const step = Math.min(4 * 1024 * 1024, want - pos);
+          const part = await kernel.vfs_read_file(sid, args.path, BigInt(start + pos), step);
+          if (!part.bytes?.byteLength) break;
+          out.set(part.bytes, pos);
+          pos += part.bytes.byteLength;
+        }
+        return { status: 206, totalSize, contentRange, bytes: pos === want ? out : out.subarray(0, pos) };
+      }
+      if (args.headOnly) return { status: 200, totalSize, bytes: new Uint8Array(0) };
+      if (totalSize <= first.bytes.byteLength) return { status: 200, totalSize, bytes: first.bytes };
+      const out = new Uint8Array(totalSize);
+      out.set(first.bytes, 0);
+      let pos = first.bytes.byteLength;
+      while (pos < totalSize) {
+        const step = Math.min(4 * 1024 * 1024, totalSize - pos);
+        const part = await kernel.vfs_read_file(sid, args.path, BigInt(pos), step);
+        if (!part.bytes?.byteLength) break;
+        out.set(part.bytes, pos);
+        pos += part.bytes.byteLength;
+      }
+      return { status: 200, totalSize, bytes: pos === totalSize ? out : out.subarray(0, pos) };
+    }
+    case 'vfs_pwrite_chunk': {
+      const r = await kernel.vfs_pwrite_chunk(args.sessionId ?? '', args.fd, BigInt(args.offset ?? 0), args.data instanceof Uint8Array ? args.data : new Uint8Array(args.data));
+      return typeof r === 'number' ? r : (r?.written ?? 0);
+    }
+    case 'proc_spawn_init': return await kernel.proc_spawn_init(typeof args.opts === 'string' ? args.opts : JSON.stringify(args.opts));
+    case 'proc_fork': return kernel.proc_fork(args.parentPid, args.childPid, args.cloneFlags ?? 0);
+    case 'proc_exec_preserve': await kernel.proc_exec_preserve(args.pid); return null;
+    case 'proc_set_creds': kernel.proc_set_creds(args.pid, args.uid, args.gid, new Uint32Array(args.groups ?? []), args.token ?? undefined, args.cloudAccess !== false); return null;
+    case 'proc_set_umask': return kernel.proc_set_umask(args.pid, args.umask);
+    case 'proc_exit': await kernel.proc_exit(args.pid); return null;
+    case 'sys_chdir': await kernel.sys_chdir(args.pid, args.path); return null;
+    case 'sys_fchdir': await kernel.sys_fchdir(args.pid, args.kfd); return null;
+    case 'sys_chroot': await kernel.sys_chroot(args.pid, args.path); return null;
+    case 'sys_getcwd': return await kernel.sys_getcwd(args.pid);
+    case 'sys_mount': await kernel.sys_mount(args.pid, args.source ?? undefined, args.target, args.fstype ?? undefined, BigInt(args.flags ?? 0), args.data ?? undefined); return null;
+    case 'sys_umount2': await kernel.sys_umount2(args.pid, args.target, args.flags ?? 0); return null;
+    case 'sys_statfs': return await kernel.sys_statfs(args.pid, args.dirfd ?? 0x7ffffffe, args.path);
+    case 'sys_fstatfs': return await kernel.sys_fstatfs(args.pid, args.kfd);
+    case 'sys_unshare': kernel.sys_unshare(args.pid, args.flags ?? 0); return null;
+    case 'sys_setns': kernel.sys_setns(args.pid, args.kfd, args.nstype ?? 0); return null;
+    case 'proc_openat': return await kernel.proc_openat(args.pid, args.dirfd, args.path, args.oflags ?? 0, args.mode ?? 0, !!args.cloexec);
+    case 'proc_statat': return await kernel.proc_statat(args.pid, args.dirfd, args.path, args.follow !== false);
+    case 'proc_accessat': await kernel.proc_accessat(args.pid, args.dirfd, args.path, args.amode ?? 0, args.follow !== false); return null;
+    case 'proc_mkdirat': await kernel.proc_mkdirat(args.pid, args.dirfd, args.path, args.mode ?? 0o777); return null;
+    case 'proc_mknodat': await kernel.proc_mknodat(args.pid, args.dirfd, args.path, args.mode, args.rdev ?? undefined); return null;
+    case 'proc_unlinkat': await kernel.proc_unlinkat(args.pid, args.dirfd, args.path, !!args.removedir); return null;
+    case 'proc_renameat': await kernel.proc_renameat(args.pid, args.olddirfd, args.oldpath, args.newdirfd, args.newpath, args.flags ?? 0); return null;
+    case 'proc_linkat': await kernel.proc_linkat(args.pid, args.olddirfd, args.oldpath, args.newdirfd, args.newpath, !!args.follow); return null;
+    case 'proc_symlinkat': await kernel.proc_symlinkat(args.pid, args.target, args.newdirfd, args.linkpath); return null;
+    case 'proc_readlinkat': return await kernel.proc_readlinkat(args.pid, args.dirfd, args.path);
+    case 'proc_utimensat': await kernel.proc_utimensat(args.pid, args.dirfd, args.path, typeof args.atime === 'string' ? args.atime : JSON.stringify(args.atime), typeof args.mtime === 'string' ? args.mtime : JSON.stringify(args.mtime), args.follow !== false); return null;
+    case 'proc_sys': return JSON.parse(await kernel.proc_sys(args.pid, typeof args.batch === 'string' ? args.batch : JSON.stringify(args.batch)));
+    case 'kfd_read': return await kernel.kfd_read(args.pid, args.kfd, args.len);
+    case 'kfd_write': return await kernel.kfd_write(args.pid, args.kfd, args.data instanceof Uint8Array ? args.data : new Uint8Array(args.data));
+    case 'kfd_pread': return await kernel.kfd_pread(args.pid, args.kfd, args.len, BigInt(args.offset ?? 0));
+    case 'kfd_pwrite': return await kernel.kfd_pwrite(args.pid, args.kfd, args.data instanceof Uint8Array ? args.data : new Uint8Array(args.data), BigInt(args.offset ?? 0));
+    case 'kfd_seek': return (await kernel.kfd_seek(args.pid, args.kfd, BigInt(args.offset ?? 0), args.whence ?? 0)).toString();
+    case 'kfd_readdir': return await kernel.kfd_readdir(args.pid, args.kfd);
+    case 'kfd_fstat': return await kernel.kfd_fstat(args.pid, args.kfd);
+    case 'kfd_ftruncate': await kernel.kfd_ftruncate(args.pid, args.kfd, BigInt(args.size ?? 0)); return null;
+    case 'kfd_fsync': await kernel.kfd_fsync(args.pid, args.kfd, !!args.dataOnly); return null;
+    case 'kfd_set_append': kernel.kfd_set_append(args.pid, args.kfd, !!args.append); return null;
+    case 'kfd_is_append': return kernel.kfd_is_append(args.pid, args.kfd);
+    case 'kfd_lock': await kernel.kfd_lock(args.pid, args.kfd, args.family, args.kind, BigInt(args.start ?? 0), args.end != null ? BigInt(args.end) : undefined, !!args.wait); return null;
+    case 'kfd_cancel': kernel.kfd_cancel(args.pid, args.kfd); return null;
+    case 'kfd_unlock': await kernel.kfd_unlock(args.pid, args.kfd, args.family, BigInt(args.start ?? 0), args.end != null ? BigInt(args.end) : undefined); return null;
+    case 'kfd_test_lock': return await kernel.kfd_test_lock(args.pid, args.kfd, args.kind, BigInt(args.start ?? 0), args.end != null ? BigInt(args.end) : undefined);
+    case 'kfd_dup': return kernel.kfd_dup(args.pid, args.kfd);
+    case 'kfd_dup2': return await kernel.kfd_dup2(args.pid, args.oldKfd, args.newKfd);
+    case 'kfd_set_cloexec': kernel.kfd_set_cloexec(args.pid, args.kfd, !!args.cloexec); return null;
+    case 'kfd_is_cloexec': return kernel.kfd_is_cloexec(args.pid, args.kfd);
+    case 'kfd_close': await kernel.kfd_close(args.pid, args.kfd); return null;
+    case 'pty_register': kernel.pty_register(args.index, args.uid ?? 0, args.gid ?? 0, args.mode ?? 0o600); return null;
+    case 'pty_close': return kernel.pty_close(args.index);
+    case 'proc_resolve_exec': return await kernel.proc_resolve_exec(args.pid, args.file, typeof args.argv === 'string' ? args.argv : JSON.stringify(args.argv ?? []), args.pathEnv ?? undefined, !!args.searchPath);
+    case 'session_resolve_exec': return await kernel.session_resolve_exec(args.sessionId ?? '', args.file, typeof args.argv === 'string' ? args.argv : JSON.stringify(args.argv ?? []), args.cwd ?? '/', args.pathEnv ?? undefined, !!args.searchPath, !!args.sudo);
+    case 'take_local_exec_bytes': return kernel.take_local_exec_bytes(args.digest);
     default: throw { errno: 'ENOSYS', detail: `no client-kernel call ${type}` };
   }
 }
+
+const isConcurrentCall = type => (
+  type.startsWith('cloud_') ||
+  type.startsWith('kfd_') ||
+  type.startsWith('proc_') ||
+  type.startsWith('sys_') ||
+  type.startsWith('vfs_') ||
+  type.startsWith('pty_') ||
+  type.startsWith('session_') ||
+  (type.startsWith('login_') && type !== 'login_service_attach') ||
+  type.startsWith('machine_init_') ||
+  [
+    'boot_vfs', 'set_active_session', 'mount_user', 'unmount_user',
+    'revoke_mount_provider', 'lose_mount_provider', 'export_provider',
+    'list_mounts', 'take_local_exec_bytes',
+  ].includes(type)
+);
 
 async function handle(port, message) {
   if (message?.v !== VERSION) {
@@ -343,9 +504,10 @@ async function handle(port, message) {
   }
   // This kernel goes with its tab; other kernels and the Machine lease reclaim what it leaves.
   try {
+    self.kernel = kernel;
     self.kernelRequest = async (type, args) => {
       const run = () => dispatch({ type, args }, host.id, host.tab);
-      const answer = await (type.startsWith('cloud_') ? run() : serially(run)).catch(error => {
+      const answer = await (isConcurrentCall(type) ? run() : serially(run)).catch(error => {
         const refused = failure(error);
         throw Object.assign(new Error(refused.detail ?? refused.errno), refused);
       });
@@ -353,7 +515,7 @@ async function handle(port, message) {
       void report();
       return answer;
     };
-    try { await boot(); } catch (error) {
+    try { await boot(); self.kernel = kernel; } catch (error) {
       // An optional root-listing overlay must not prevent ordinary filesystem
       // access before this execution host boots. No call has been dispatched.
       if (message.type === 'mount_overlay') {
@@ -367,7 +529,7 @@ async function handle(port, message) {
       if (message.type === 'console_grant') await login.tick();
       executor.setSharingPolicy(() => login.current());
       value = await executor.request(message.type, message.args ?? {}, value => port.postMessage({ v: VERSION, type: 'event', event: message.type.startsWith('attachment_') ? 'attachment' : 'run', value }), value => broadcast({ v: VERSION, type: 'event', event: 'seat', value }));
-    } else if (message.type.startsWith('cloud_') || (message.type.startsWith('login_') && message.type !== 'login_service_attach' || message.type.startsWith('machine_init_'))) value = await dispatch(message, host.id, host.tab);
+    } else if (isConcurrentCall(message.type)) value = await dispatch(message, host.id, host.tab);
     else value = await serially(() => dispatch(message, host.id, host.tab));
     // A wait answers once the machine heard of it, so that /proc agrees.
     if (message.type === 'wait' || message.type === 'waitchild') await heard();

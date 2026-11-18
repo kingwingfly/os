@@ -14,10 +14,8 @@ import { Pty, TtyState, IOCTL, LF, IF } from '../kernel/pty.js';
 import { PtyDevices } from '../kernel/ptmx.js';
 import { Bytes, Shares } from './shared.js';
 const kernelCall = (type, args) => globalThis.kernelRequest(type, args);
-import { load } from '../kernel/loader.js';
+import { load, loadLocalBytes } from '../kernel/loader.js';
 import { STRERROR } from '../http.mjs';
-import { resolveExecs } from './resolve.mjs';
-import { LOCAL_FD, localPath } from '../kernel/workspace.js';
 import { requireExecutionSupport } from '../kernel/capabilities.js';
 
 // Executables are the build's own /usr/bin images by default; a stage may name its own path
@@ -84,7 +82,7 @@ const line = () => ({ shares: new Shares(), descriptions: new Map() });
 // Close what the process `pid` (its token `token`, its umask and sudo `as`) held last of its
 // line's open files, as its exit would have: in a Worker of its own, as the process, before its
 // parent hears it ended. The locks it held go first.
-async function closeHeld(of, pid, token, as, workspace, scope) {
+async function closeHeld(of, pid, token, as) {
   if (!of) return;
   for (const { description } of of.descriptions.values()) {
     if (description.bytes) new Bytes(description.bytes).release(pid);
@@ -95,9 +93,8 @@ async function closeHeld(of, pid, token, as, workspace, scope) {
     of.descriptions.delete(slot);
     return known.description;
   }).filter(Boolean).filter(description => {
-    if (description.cloud != null) return false;
-    if (description.kfd >= LOCAL_FD) { if (workspace?.fds.get(description.kfd)?.scope === scope) void workspace.closeFd(description.kfd, scope).catch(() => {}); return false; }
-    return true;
+    if (description.kind === 'kfd' || description.cloud != null) return false;
+    return description.kfd != null;
   });
   if (!last.length) return;
   const closer = new Worker(asset('/wasi-process.js'));
@@ -223,26 +220,32 @@ export function reconcile() {
 export async function exec(stages, options = {}) {
   requireExecutionSupport();
   const workspace = options.workspace;
-  const prepareLocal = async stage => {
-    const path = stage.path.startsWith('/') ? stage.path : (stage.cwd ?? '/').replace(/\/$/, '') + '/' + stage.path;
-    if (!workspace || !localPath(path)) return null;
-    const local = await workspace?.image(stage.path, stage.cwd ?? '/');
-    if (local && !globalThis.crossOriginIsolated) throw Object.assign(new Error('local execution requires cross-origin isolation'), { errno: 'ENOTSUP' });
-    if (local) await local.load();
-    return local;
-  };
-  const loadImage = image => {
-    if (!image.localImage) return load(image);
-    const expected = image.localImage.local, admitted = image.local;
+  const sessionId = workspace?.identity?.id ?? '';
+  const loadImage = async image => {
+    if (image.resolvedAsset) {
+      image.asset = image.resolvedAsset;
+      if (image.resolvedExecPath) image.path = image.resolvedExecPath;
+      return load(image);
+    }
+    if (!image.localExec) return load(image);
+    const expected = image.localExec, admitted = image.local;
+    if (!globalThis.crossOriginIsolated) {
+      throw Object.assign(new Error('local execution requires cross-origin isolation'), { errno: 'ENOTSUP' });
+    }
     // An older authority can ignore new request fields. Never run private code
     // with credentials that did not explicitly acknowledge this admission and
     // its cloud attenuation, even if a cloud executable exists at the same path.
     if (!admitted || admitted.digest !== expected.digest || admitted.size !== expected.size
-      || typeof admitted.cloud !== 'boolean' || admitted.cloud && !expected.cloud
+      || typeof admitted.cloud !== 'boolean' || (admitted.cloud && !expected.cloud)
       || image.size !== expected.size || image.asset != null || image.fd != null || image.token_read != null) {
-      return Promise.reject(Object.assign(new Error('authority did not confirm the requested local execution grant'), { errno: 'EACCES' }));
+      throw Object.assign(new Error('authority did not confirm the requested local execution grant'), { errno: 'EACCES' });
     }
-    return image.localImage.load();
+    const bytes = await kernelCall('take_local_exec_bytes', { digest: expected.digest });
+    if (!bytes) throw Object.assign(new Error('executable image is no longer available'), { errno: 'ESTALE' });
+    return loadLocalBytes(expected.digest, bytes, async () => {
+      const stillLive = await kernelCall('take_local_exec_bytes', { digest: expected.digest });
+      if (!stillLive) throw Object.assign(new Error('executable mount was detached'), { errno: 'ESTALE' });
+    });
   };
   const { cwd = '/', home = '/', user = 'guest', stdin = null, sudo = false, umask = 0o022, tty = false, enough = null,
     cancelled = () => false, onTty = () => {}, onJob = () => {} } = options;
@@ -355,32 +358,63 @@ export async function exec(stages, options = {}) {
   // content.
   // The internal boot callback supplies an already authorized reserved process.
   // Page execution options do not expose this callback or its private proof.
-  const asked = options.prepare ? options.prepare() : resolveExecs(
-    stages.map((stage, index) => ({
-      path: stage.path ?? (stage.argv ?? stage)[0],
-      argv: stage.argv ?? stage,
-      cgroup: stage.cgroup,
-      env: Object.entries(environments[index]).map(([name, value]) => `${name}=${value}`),
-      cwd,
-    })),
-    async stages => {
-      const prepared = [], replies = new Array(stages.length);
-      for (let index = 0; index < stages.length; index++) {
-        try {
-          const localImage = await prepareLocal(stages[index]);
-          prepared.push({ index, localImage, stage: { ...stages[index], local: localImage?.local, path: localImage?.path ?? stages[index].path } });
-        } catch (err) { replies[index] = { err }; }
+  const asked = options.prepare ? options.prepare() : (async () => {
+    const replies = new Array(stages.length);
+    const prepared = [];
+    for (let index = 0; index < stages.length; index++) {
+      const stage = stages[index];
+      const argv = stage.argv ?? stage;
+      const file = stage.path ?? argv[0] ?? '';
+      const envMap = environments[index];
+      const envList = Object.entries(envMap).map(([name, value]) => `${name}=${value}`);
+      const searchPath = stage.searchPath ?? !file.includes('/');
+      try {
+        const resolved = await kernelCall('session_resolve_exec', {
+          sessionId,
+          file,
+          argv,
+          cwd,
+          pathEnv: envMap.PATH ?? '/usr/bin',
+          searchPath,
+          sudo,
+        });
+        if (resolved.local && !resolved.asset && !globalThis.crossOriginIsolated) {
+          throw Object.assign(new Error('local execution requires cross-origin isolation'), { errno: 'ENOTSUP' });
+        }
+        prepared.push({
+          index,
+          resolved,
+          stage: {
+            path: resolved.execPath,
+            local: resolved.local ?? undefined,
+            runtime: resolved.runtime,
+            sessionId: sessionId || undefined,
+            argv: resolved.argv,
+            env: envList,
+            cwd,
+            cgroup: stage.cgroup,
+          },
+        });
+      } catch (err) {
+        replies[index] = { err };
       }
-      const registered = prepared.length ? await kernelCall('execs', { stages: prepared.map(p => p.stage), sudo }) : [];
-      for (let i = 0; i < prepared.length; i++) {
-        const { index, localImage } = prepared[i], result = registered[i];
-        if (result?.ok) result.ok.localImage = localImage;
-        replies[index] = result;
+    }
+    const registered = prepared.length
+      ? await kernelCall('execs', { stages: prepared.map(p => p.stage), sudo })
+      : [];
+    for (let i = 0; i < prepared.length; i++) {
+      const { index, resolved } = prepared[i];
+      const result = registered[i];
+      if (result?.ok) {
+        result.ok.resolvedArgv = resolved.argv;
+        result.ok.resolvedAsset = resolved.asset;
+        result.ok.resolvedExecPath = resolved.execPath;
+        result.ok.localExec = resolved.asset ? null : resolved.local;
       }
-      return replies;
-    },
-    abandon,
-  );
+      replies[index] = result;
+    }
+    return replies;
+  })();
   const images = stages.map((stage, index) => asked.then(results => {
     const result = results[index];
     if (result?.ok) return result.ok;
@@ -394,8 +428,7 @@ export async function exec(stages, options = {}) {
   // A process this job hosts, in a Worker of its own: a stage's, or one a process of it forked
   // (`forked`, its start the parent's snapshot). `write` is where its output goes, as its
   // stage's does.
-  const host = ({ pid, token, ppid, module, memory, memoryBytes, startSection = false, argv, write, forked, start, transfer = [], files = null, membership, fsScope = workspace?.scope() }) => {
-    if (fsScope) fsScope.holders = (fsScope.holders ?? 0) + 1;
+  const host = ({ pid, token, ppid, module, memory, memoryBytes, startSection = false, argv, write, forked, start, transfer = [], files = null, membership }) => {
     const worker = new Worker(asset('/wasi-process.js'));
     const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
     // Each writer has two small compositor credits. A killed worker cannot leak credits
@@ -465,10 +498,13 @@ export async function exec(stages, options = {}) {
       const owned = [...devices.pairs.values()].filter(pair => pair.terminal.session === pid);
       // Last-master close needs the owning session/foreground group to send
       // HUP+CONT, including when a stuck Worker could not close its own fds.
-      const deviceCleanup = devices.release(pid).then(() => Promise.all(owned
-        .filter(pair => pair.terminal.session === pid).map(pair => releaseTerminal(false, pair.terminal))));
-      const closing = Promise.all([hangup, deviceCleanup, outright ? closeHeld(files, pid, cleanupToken(), { umask, sudo }, workspace, fsScope) : Promise.resolve()]);
-      void closing.finally(() => { if (fsScope && --fsScope.holders === 0) workspace.closeScope(fsScope); });
+      const deviceCleanup = devices.release(pid).then(() => {
+        for (const pair of devices.pairs.values()) {
+          if (pair.masterClosed) void kernelCall('pty_close', { index: pair.number }).catch(() => {});
+        }
+        return Promise.all(owned.filter(pair => pair.terminal.session === pid).map(pair => releaseTerminal(false, pair.terminal)));
+      });
+      const closing = Promise.all([hangup, deviceCleanup, outright ? closeHeld(files, pid, cleanupToken(), { umask, sudo }) : Promise.resolve()]);
       void closing.then(() => reap(pid, { status: code, signal }, forked));
       void Promise.allSettled([closing, ...displaying]).then(() => { completing.delete(pid); settle(code); });
     };
@@ -481,43 +517,62 @@ export async function exec(stages, options = {}) {
       Atomics.notify(control, 0);
       killing = setTimeout(() => end(killedBy(signal), true), GRACE);
     };
-// A call it waits on: answered in its channel.
-    const cloudRequest = async args => {
+    // A call it waits on: answered in its channel.
+    const vfsRequest = async args => {
       switch (args.op) {
-        case 'open': return await kernelCall('cloud_open', { pid, path: args.path, flags: args.flags, mode: args.mode, umask: args.umask });
-        case 'read': {
-          const bytes = await kernelCall('cloud_read', { pid, id: args.id, count: args.count, offset: args.offset });
-          return { data: toBase64(bytes) };
-        }
-        case 'write': return { written: await kernelCall('cloud_write', { pid, id: args.id, data: fromBase64(args.data), offset: args.offset }) };
-        case 'seek': return { pos: await kernelCall('cloud_seek', { pid, id: args.id, offset: args.offset, whence: args.whence }) };
-        case 'fstat': return await kernelCall('cloud_fstat', { pid, id: args.id });
-        case 'truncate': await kernelCall('cloud_truncate', { pid, id: args.id, size: args.size }); return {};
-        case 'sync': await kernelCall('cloud_sync', { pid, id: args.id, data_only: !!args.data_only }); return {};
-        case 'set_append': await kernelCall('cloud_set_append', { pid, id: args.id, append: !!args.append }); return {};
-        case 'append': return { append: await kernelCall('cloud_append', { pid, id: args.id }) };
-        case 'close': await kernelCall('cloud_close', { pid, id: args.id }); return {};
+        case 'openat': return await kernelCall('proc_openat', { pid, dirfd: args.dirfd, path: args.path, oflags: args.oflags, mode: args.mode, cloexec: !!args.cloexec });
+        case 'statat': return await kernelCall('proc_statat', { pid, dirfd: args.dirfd, path: args.path, follow: args.follow !== false });
+        case 'accessat': await kernelCall('proc_accessat', { pid, dirfd: args.dirfd, path: args.path, amode: args.amode, follow: args.follow !== false }); return {};
+        case 'mkdirat': await kernelCall('proc_mkdirat', { pid, dirfd: args.dirfd, path: args.path, mode: args.mode }); return {};
+        case 'mknodat': await kernelCall('proc_mknodat', { pid, dirfd: args.dirfd, path: args.path, mode: args.mode, rdev: args.rdev }); return {};
+        case 'unlinkat': await kernelCall('proc_unlinkat', { pid, dirfd: args.dirfd, path: args.path, removedir: !!args.removedir }); return {};
+        case 'renameat': await kernelCall('proc_renameat', { pid, olddirfd: args.olddirfd, oldpath: args.oldpath, newdirfd: args.newdirfd, newpath: args.newpath, flags: args.flags ?? 0 }); return {};
+        case 'linkat': await kernelCall('proc_linkat', { pid, olddirfd: args.olddirfd, oldpath: args.oldpath, newdirfd: args.newdirfd, newpath: args.newpath, follow: !!args.follow }); return {};
+        case 'symlinkat': await kernelCall('proc_symlinkat', { pid, target: args.target, newdirfd: args.newdirfd, linkpath: args.linkpath }); return {};
+        case 'readlinkat': return { target: await kernelCall('proc_readlinkat', { pid, dirfd: args.dirfd, path: args.path }) };
+        case 'utimensat': await kernelCall('proc_utimensat', { pid, dirfd: args.dirfd, path: args.path, atime: args.atime, mtime: args.mtime, follow: args.follow !== false }); return {};
+        case 'sys': return await kernelCall('proc_sys', { pid, batch: args.batch });
+        case 'read': return { data: toBase64(await kernelCall('kfd_read', { pid, kfd: args.kfd, len: args.len })) };
+        case 'write': return { written: await kernelCall('kfd_write', { pid, kfd: args.kfd, data: fromBase64(args.data) }) };
+        case 'pread': return { data: toBase64(await kernelCall('kfd_pread', { pid, kfd: args.kfd, len: args.len, offset: args.offset })) };
+        case 'pwrite': return { written: await kernelCall('kfd_pwrite', { pid, kfd: args.kfd, data: fromBase64(args.data), offset: args.offset }) };
+        case 'seek': return { pos: await kernelCall('kfd_seek', { pid, kfd: args.kfd, offset: args.offset, whence: args.whence }) };
+        case 'readdir': return { entries: await kernelCall('kfd_readdir', { pid, kfd: args.kfd }) };
+        case 'fstat': return await kernelCall('kfd_fstat', { pid, kfd: args.kfd });
+        case 'ftruncate': await kernelCall('kfd_ftruncate', { pid, kfd: args.kfd, size: args.size }); return {};
+        case 'fsync': await kernelCall('kfd_fsync', { pid, kfd: args.kfd, dataOnly: !!args.dataOnly }); return {};
+        case 'set_append': await kernelCall('kfd_set_append', { pid, kfd: args.kfd, append: !!args.append }); return {};
+        case 'is_append': return { append: await kernelCall('kfd_is_append', { pid, kfd: args.kfd }) };
+        case 'lock': await kernelCall('kfd_lock', { pid, kfd: args.kfd, family: args.family, kind: args.kind, start: args.start, end: args.end, wait: !!args.wait }); return {};
+        case 'cancel': await kernelCall('kfd_cancel', { pid, kfd: args.kfd }); return {};
+        case 'unlock': await kernelCall('kfd_unlock', { pid, kfd: args.kfd, family: args.family, start: args.start, end: args.end }); return {};
+        case 'test_lock': return { conflict: await kernelCall('kfd_test_lock', { pid, kfd: args.kfd, kind: args.kind, start: args.start, end: args.end }) };
+        case 'dup': return { kfd: await kernelCall('kfd_dup', { pid, kfd: args.kfd }) };
+        case 'dup2': return { kfd: await kernelCall('kfd_dup2', { pid, oldKfd: args.oldKfd, newKfd: args.newKfd }) };
+        case 'set_cloexec': await kernelCall('kfd_set_cloexec', { pid, kfd: args.kfd, cloexec: !!args.cloexec }); return {};
+        case 'is_cloexec': return { cloexec: await kernelCall('kfd_is_cloexec', { pid, kfd: args.kfd }) };
+        case 'close': await kernelCall('kfd_close', { pid, kfd: args.kfd }); return {};
+        case 'set_umask': return { previous: await kernelCall('proc_set_umask', { pid, umask: args.umask }) };
+        case 'chdir': await kernelCall('sys_chdir', { pid, path: args.path }); return {};
+        case 'fchdir': await kernelCall('sys_fchdir', { pid, kfd: args.kfd }); return {};
+        case 'chroot': await kernelCall('sys_chroot', { pid, path: args.path }); return {};
+        case 'getcwd': return { cwd: await kernelCall('sys_getcwd', { pid }) };
+        case 'mount': await kernelCall('sys_mount', { pid, source: args.source, target: args.target, fstype: args.fstype, flags: args.flags, data: args.data }); return {};
+        case 'umount2': await kernelCall('sys_umount2', { pid, target: args.target, flags: args.flags }); return {};
+        case 'statfs': return await kernelCall('sys_statfs', { pid, dirfd: args.dirfd, path: args.path });
+        case 'fstatfs': return await kernelCall('sys_fstatfs', { pid, kfd: args.kfd });
+        case 'unshare': await kernelCall('sys_unshare', { pid, flags: args.flags }); return {};
+        case 'setns': await kernelCall('sys_setns', { pid, kfd: args.kfd, nstype: args.nstype }); return {};
         default: throw { errno: 'ENOSYS' };
       }
     };
     const answer = async ({ type, args }) => {
       let reply;
       try {
-        if (['filesystem', 'local_read', 'local_write'].includes(type) && (!workspace || process.ended)) throw { errno: 'ENODEV' };
-        if (type === 'filesystem') {
-          if (!workspace || process.ended) throw { errno: 'ENODEV' };
-          reply = await workspace.calls(args.calls, fsScope, async calls => {
-            const response = await fetch('/api/sys', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ calls, pid, proc: process.token, umask: args.umask }) });
-            if (!response.ok) throw { errno: 'EIO' }; return (await response.json()).results;
-          }, { allowClosedCloud: true, umask: args.umask });
-        }
-        else if (type === 'cloud') {
+        if (type === 'vfs') {
           if (process.ended) throw { errno: 'EBADF' };
-          reply = await cloudRequest(args);
+          reply = await vfsRequest(args);
         }
-        else if (type === 'local_read') reply = await workspace.read(args.fd, args.offset, args.count, fsScope);
-        else if (type === 'local_write') reply = await workspace.write(args.fd, fromBase64(args.data), args.offset, fsScope, args.append);
         else if (type === 'join') reply = await join(pid, args.pid, args.nohang, args.options);
         else if (type === 'process_call') {
           reply = args.waitpid
@@ -547,14 +602,45 @@ export async function exec(stages, options = {}) {
       // Zero and null are valid syscall results, not missing replies.
       respond(channel, reply ?? null);
     };
-    // execve(2) of the process itself: the image the kernel allows, loaded, replaces its own. A
-    // format the loader refuses once the kernel replaced the image ends the process, as an
-    // execve past its point of no return does.
-    const replace = async ({ path, argv: args, env, cwd }) => {
-      const localImage = await prepareLocal({ path, cwd });
+    // execve(2) of the process itself: resolves in the process's own MountNamespace + FsContext
+    // (`root` & `cwd`) BEFORE calling `reexec`. If resolution or admission fails, `replace` throws
+    // `{ errno }` so the caller receives `-errno` without unwinding its stack.
+    const replace = async ({ file, path, argv: args, env, search = false }) => {
       if (process.ended) throw { errno: 'ESRCH' };
-      const image = await kernelCall('reexec', { pid, path: localImage?.path ?? path, local: localImage?.local, argv: args, env, cwd });
-      image.localImage = localImage;
+      const targetFile = file ?? path ?? args?.[0] ?? '';
+      const pathEnv = env?.find(entry => entry.startsWith('PATH='))?.slice(5);
+      const resolved = await kernelCall('proc_resolve_exec', {
+        pid,
+        file: targetFile,
+        argv: args,
+        pathEnv,
+        searchPath: !!search,
+      });
+      if (resolved.local && !resolved.asset && !globalThis.crossOriginIsolated) {
+        throw { errno: 'ENOTSUP', detail: 'local execution requires cross-origin isolation' };
+      }
+      if (process.ended) throw { errno: 'ESRCH' };
+      let cwdNow = '/';
+      let hasCwd = false;
+      try {
+        cwdNow = await kernelCall('sys_getcwd', { pid });
+        hasCwd = true;
+      } catch { /* cwd outside chroot: leave PWD untouched */ }
+      const updatedEnv = hasCwd
+        ? [...(env ?? []).filter(entry => !entry.startsWith('PWD=')), `PWD=${cwdNow}`]
+        : [...(env ?? [])];
+      const image = await kernelCall('reexec', {
+        pid,
+        path: resolved.execPath,
+        local: resolved.local ?? null,
+        argv: resolved.argv,
+        env: updatedEnv,
+        cwd: cwdNow,
+      });
+      image.resolvedArgv = resolved.argv;
+      image.resolvedAsset = resolved.asset;
+      image.resolvedExecPath = resolved.execPath;
+      image.localExec = resolved.asset ? null : resolved.local;
       process.token = image.token;
       let loaded;
       try {
@@ -562,12 +648,12 @@ export async function exec(stages, options = {}) {
       } catch (error) {
         // The replacement already owns the credential. Its Worker still owns stdio and
         // must emit the loader diagnostic through fd 2 before closing/reaping normally.
-        worker.postMessage({ image: { error: refused(args[0] ?? path, error).message,
-          token: image.token, argv: args, env } });
+        worker.postMessage({ image: { error: refused(resolved.argv?.[0] ?? targetFile, error).message,
+          token: image.token, argv: resolved.argv, env: updatedEnv } });
         return {};
       }
       process.image = loaded;
-      worker.postMessage({ image: { module: loaded.module, memory: loaded.memory, memoryBytes: loaded.memoryBytes, startSection: loaded.startSection, token: image.token, argv: args, env } });
+      worker.postMessage({ image: { module: loaded.module, memory: loaded.memory, memoryBytes: loaded.memoryBytes, startSection: loaded.startSection, token: image.token, argv: resolved.argv, env: updatedEnv } });
       return {};
     };
     const checkInheritance = state => {
@@ -577,11 +663,6 @@ export async function exec(stages, options = {}) {
       if (state.descriptions.some(full)) throw Object.assign(new Error('no holder free'), { errno: 'EAGAIN' });
     };
     const holdInheritance = async (state, child) => {
-      const cloudIds = [];
-      for (const description of state.descriptions) {
-        if (description.cloud != null && !cloudIds.includes(description.cloud)) cloudIds.push(description.cloud);
-      }
-      if (cloudIds.length) await kernelCall('cloud_inherit', { pid, child, ids: cloudIds });
       for (const description of state.descriptions) {
         if (description.kind === 'pty') devices.hold(pid, child, description.handle, description.refs);
         else if (description.kind === 'pipe-in' || description.kind === 'tty') known(description.buffer).hold(child, 'r', description.refs);
@@ -601,6 +682,14 @@ export async function exec(stages, options = {}) {
         checkInheritance(state);
         child = await kernelCall('fork', { pid, emptyMemory: true });
         alive();
+        if (state.cwd && state.cwd !== '/') {
+          let parentCwd = null;
+          try { parentCwd = await kernelCall('sys_getcwd', { pid }); } catch {}
+          if (parentCwd !== state.cwd) {
+            await kernelCall('sys_chdir', { pid: child.pid, path: state.cwd });
+            alive();
+          }
+        }
         if (state.cgroup != null) {
           await kernelCall('process_call', { pid, call: { cgroup_attach: { pid: child.pid, path: state.cgroup } } });
           alive();
@@ -610,26 +699,43 @@ export async function exec(stages, options = {}) {
           membership.ctty = process.ctty;
           alive();
         }
-        const [result] = await resolveExecs([{ path: state.argv[0], argv: state.argv, env: state.env, cwd: state.cwd }],
-          stages => Promise.all(stages.map(async stage => {
-            alive();
-            try {
-              const localImage = await prepareLocal(stage); alive();
-              const image = await kernelCall('reexec', { pid: child.pid, ...stage, path: localImage?.path ?? stage.path, local: localImage?.local });
-              image.localImage = localImage; return { ok: image };
-            }
-            catch (err) { return { err }; }
-          })));
-        if (result.err) throw result.err;
-        child.token = result.ok.token;
+        const pathEnv = state.env?.find(entry => entry.startsWith('PATH='))?.slice(5);
+        const resolved = await kernelCall('proc_resolve_exec', {
+          pid: child.pid,
+          file: state.argv[0],
+          argv: state.argv,
+          pathEnv,
+          searchPath: !state.argv[0].includes('/'),
+        });
+        if (resolved.local && !resolved.asset && !globalThis.crossOriginIsolated) {
+          throw { errno: 'ENOTSUP', detail: 'local execution requires cross-origin isolation' };
+        }
         alive();
-        const loaded = await loadImage(result.ok).catch(error => { throw { errno: 'ENOEXEC', detail: error.message }; });
+        // Clear FD_CLOEXEC on any kfd duplicated onto a target fd by posix_spawn dup2 actions
+        for (const kfd of state.keepOpenKfds ?? []) {
+          await kernelCall('kfd_set_cloexec', { pid: child.pid, kfd, cloexec: false }).catch(() => {});
+        }
+        const image = await kernelCall('reexec', {
+          pid: child.pid,
+          path: resolved.execPath,
+          local: resolved.local ?? null,
+          argv: resolved.argv,
+          env: state.env,
+          cwd: state.cwd ?? '/',
+        });
+        image.resolvedArgv = resolved.argv;
+        image.resolvedAsset = resolved.asset;
+        image.resolvedExecPath = resolved.execPath;
+        image.localExec = resolved.asset ? null : resolved.local;
+        child.token = image.token;
+        alive();
+        const loaded = await loadImage(image).catch(error => { throw { errno: error?.errno ?? 'ENOEXEC', detail: error.message }; });
         alive();
         await holdInheritance(state, child.pid);
         held = true;
         alive();
-        const made = host({ pid: child.pid, token: child.token, ppid: pid, ...loaded, argv: state.argv,
-          write, forked: true, start: { inherit: state }, files, fsScope, membership: membership ?? process });
+        const made = host({ pid: child.pid, token: child.token, ppid: pid, ...loaded, argv: resolved.argv,
+          write, forked: true, start: { inherit: state }, files, membership: membership ?? process });
         forks.push(made);
         if (control && Atomics.load(control, 0) === 1) made.signal(SIG.STOP);
         changed();
@@ -638,7 +744,7 @@ export async function exec(stages, options = {}) {
         if (child) {
           release(child.pid);
           await devices.release(child.pid);
-          if (held) await closeHeld(files, child.pid, child.token, { umask: state.umask, sudo }, workspace, fsScope);
+          if (held) await closeHeld(files, child.pid, child.token, { umask: state.umask, sudo });
           await reap(child.pid, { status: 126 }, true);
           await kernelCall('waitchild', { ppid: pid, pid: child.pid }).catch(() => {});
         }
@@ -661,7 +767,7 @@ export async function exec(stages, options = {}) {
         await holdInheritance(state, child.pid);
         held = true;
         if (process.ended || killing != null) throw { errno: 'EINTR' };
-        const made = host({ pid: child.pid, token: child.token, ppid: pid, ...process.image, argv: state.argv, write, forked: true, start: { fork: state }, transfer: [state.snapshot.memory], files, fsScope, membership: process });
+        const made = host({ pid: child.pid, token: child.token, ppid: pid, ...process.image, argv: state.argv, write, forked: true, start: { fork: state }, transfer: [state.snapshot.memory], files, membership: process });
         forks.push(made);
         changed();
         worker.postMessage({ forked: { pid: child.pid } });
@@ -669,7 +775,7 @@ export async function exec(stages, options = {}) {
         if (child) {
           release(child.pid);
           await devices.release(child.pid);
-          if (held) await closeHeld(files, child.pid, child.token, { umask: state.umask, sudo }, workspace, fsScope);
+          if (held) await closeHeld(files, child.pid, child.token, { umask: state.umask, sudo });
           await reap(child.pid, { status: 126 }, true);
           await kernelCall('waitchild', { ppid: pid, pid: child.pid }).catch(() => {});
         }
@@ -733,7 +839,8 @@ export async function exec(stages, options = {}) {
     // Recover that delivery before entering user code, including for fork children.
     void (async () => {
       await reconciling; await reconcile();
-      if (!process.ended) worker.postMessage({ ...start, localFs: !!workspace && isolated, module, memory, memoryBytes, startSection, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: !!terminal }, pty: terminal?.transferable, control: control?.buffer, outputCredit: outputCredit?.buffer, channel, membership: ids.buffer, shares: files?.shares.buffer }, transfer);
+      await kernelCall('proc_set_umask', { pid, umask }).catch(() => {});
+      if (!process.ended) worker.postMessage({ ...start, module, memory, memoryBytes, startSection, argv, umask, sudo, pid, ppid, proc: token, stderr: { tty: !!terminal }, pty: terminal?.transferable, control: control?.buffer, outputCredit: outputCredit?.buffer, channel, membership: ids.buffer, shares: files?.shares.buffer }, transfer);
     })().catch(() => end({ code: 126 }, true));
     return process;
   };
@@ -776,13 +883,21 @@ export async function exec(stages, options = {}) {
     if (op === 'open') {
       const opened = devices.open(process, args.path, args);
       const { pair, master } = devices.get(process.pid, opened.handle);
+      if (master) {
+        await kernelCall('pty_register', { index: pair.number, uid: pair.uid, gid: 0, mode: 0o600 }).catch(() => {});
+      }
       if (!master && !args.noctty && !process.ctty && !pair.terminal.session && process.pid === process.sid && (opened.readable || process.uid === 0))
         await ttyRequest(process, { handle: opened.handle, request: IOCTL.TIOCSCTTY });
       return opened;
     }
     const description = devices.get(process.pid, handle);
     if (op === 'hold') { devices.hold(process.pid, process.pid, handle); return {}; }
-    if (op === 'close') { await devices.close(process.pid, handle); return {}; }
+    if (op === 'close') {
+      const pair = description.pair;
+      await devices.close(process.pid, handle);
+      if (pair?.masterClosed) await kernelCall('pty_close', { index: pair.number }).catch(() => {});
+      return {};
+    }
     if (op === 'flags') {
       if (args.nonblock != null) description.nonblock = !!args.nonblock;
       return { nonblock: description.nonblock };
@@ -896,7 +1011,8 @@ export async function exec(stages, options = {}) {
       // Its pipes' ends are its own from the start: held for it before it runs.
       io.stdin.reader?.hold(image.pid, 'r');
       io.stdout.writer?.hold(image.pid, 'w');
-      const process = host({ pid: image.pid, token: image.token, ppid: image.ppid ?? 1, module, memory, memoryBytes, startSection, argv, write, forked: false,
+      const effectiveArgv = image.resolvedArgv ?? argv;
+      const process = host({ pid: image.pid, token: image.token, ppid: image.ppid ?? 1, module, memory, memoryBytes, startSection, argv: effectiveArgv, write, forked: false,
         start: { env: environment, cwd, stdin: io.stdin.message, stdout: io.stdout.message }, files: isolated ? line() : null });
       processes.push(process);
       changed();
@@ -930,6 +1046,7 @@ export async function exec(stages, options = {}) {
       if (terminal) {
         const leader = ready[0];
         terminal.state.number ??= leader.pid; terminal.number = terminal.state.number;
+        await kernelCall('pty_register', { index: terminal.number, uid: session[0].uid ?? 0, gid: 0, mode: 0o620 }).catch(() => {});
         for (const member of memberships.values()) member.ctty = terminal.number;
         terminal.name = `/dev/pts/${terminal.number}`; pgid = leader.pid;
         if (foreground) terminal.control.pgrp = pgid;
@@ -1000,6 +1117,7 @@ export async function exec(stages, options = {}) {
     clearInterval(watch);
     job.foreground(false);
     terminal?.close();
+    if (terminal?.number != null) void kernelCall('pty_close', { index: terminal.number }).catch(() => {});
     // A rejected image may never have acquired a reader, so no process release would
     // otherwise remove this master buffer from the host's bookkeeping.
     if (terminal && !terminal.pipe.held('r')) pipes.delete(terminal.pipe.buffer);

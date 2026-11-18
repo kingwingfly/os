@@ -1185,6 +1185,7 @@ pub enum Call {
     /// file, must be the one it has (ESTALE otherwise), as an editor's save needs.
     Open {
         path: String,
+        #[serde(default)]
         flags: u32,
         #[serde(default = "creation_mode")]
         mode: u16,
@@ -1223,12 +1224,14 @@ pub enum Call {
         path: Option<String>,
         #[serde(default)]
         offset: u64,
+        #[serde(default)]
         count: u64,
     },
     /// pwrite(2) of chunk `index` of the file `fd` writes, with its bytes: at most
     /// `INLINE_MAX`, so a small file whole, or the short end of a large one.
     Pwrite {
         fd: FdRef,
+        #[serde(default)]
         index: u64,
         data: Bytes,
     },
