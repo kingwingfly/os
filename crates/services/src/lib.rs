@@ -45,6 +45,16 @@ pub enum MountNamespaceGrant {
     Session,
 }
 
+impl MountNamespaceGrant {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Isolated => "isolated",
+            Self::Session => "session",
+        }
+    }
+}
+
 /// Explicit bind-mount entry applied inside a private (`isolated` or `session`) service namespace.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -558,6 +568,10 @@ mod tests {
         // System and Isolated grants work for both root/system and user callers.
         assert_eq!(manifest.units[0].authorize_namespace(0, false), Ok(()));
         assert_eq!(manifest.units[1].authorize_namespace(0, false), Ok(()));
+
+        assert_eq!(MountNamespaceGrant::System.as_str(), "system");
+        assert_eq!(MountNamespaceGrant::Isolated.as_str(), "isolated");
+        assert_eq!(MountNamespaceGrant::Session.as_str(), "session");
     }
 
     #[test]

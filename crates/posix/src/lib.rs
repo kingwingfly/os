@@ -76,8 +76,8 @@ fn raw_errno_to_abi(code: i32) -> Option<abi::Errno> {
     wasi_libc::wasi_errno_to_abi(code)
 }
 
-#[cfg(all(unix, not(target_os = "wasi")))]
-fn raw_errno_to_abi(code: i32) -> Option<abi::Errno> {
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn linux_errno_to_abi(code: i32) -> Option<abi::Errno> {
     use abi::Errno::*;
     Some(match code {
         1 => EPERM,
@@ -127,7 +127,143 @@ fn raw_errno_to_abi(code: i32) -> Option<abi::Errno> {
     })
 }
 
-#[cfg(not(any(unix, target_os = "wasi")))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    test
+))]
+#[derive(Clone, Copy)]
+#[cfg_attr(test, allow(dead_code))]
+enum BsdFlavour {
+    Apple,
+    FreeBsd,
+    OpenBsd,
+    NetBsd,
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    test
+))]
+fn bsd_errno_to_abi(code: i32, flavour: BsdFlavour) -> Option<abi::Errno> {
+    use abi::Errno::*;
+    Some(match code {
+        1 => EPERM,
+        2 => ENOENT,
+        3 => ESRCH,
+        4 => EINTR,
+        5 => EIO,
+        6 => ENXIO,
+        7 => E2BIG,
+        8 => ENOEXEC,
+        9 => EBADF,
+        10 => ECHILD,
+        11 => EDEADLK,
+        13 => EACCES,
+        14 => EINVAL, // EFAULT
+        16 => EBUSY,
+        17 => EEXIST,
+        18 => EXDEV,
+        19 => ENODEV,
+        20 => ENOTDIR,
+        21 => EISDIR,
+        22 => EINVAL,
+        24 => EMFILE,
+        25 => ENOTTY,
+        26 => ETXTBSY,
+        27 => EFBIG,
+        28 => ENOSPC,
+        30 => EROFS,
+        31 => EMLINK,
+        32 => EPIPE,
+        34 => ERANGE,
+        35 => EAGAIN,
+        43 => EPROTONOSUPPORT,
+        45 => EOPNOTSUPP,
+        57 => ENOTCONN,
+        60 => ETIMEDOUT,
+        62 => ELOOP,
+        63 => ENAMETOOLONG,
+        66 => ENOTEMPTY,
+        69 => EDQUOT,
+        70 => ESTALE,
+        77 => ENOLCK,
+        78 => ENOSYS,
+        _ => match (flavour, code) {
+            (BsdFlavour::Apple, 89) => ECANCELED,
+            (BsdFlavour::Apple, 96) => ENODATA,
+            (BsdFlavour::Apple, 102) => EOPNOTSUPP,
+            (BsdFlavour::FreeBsd, 85) => ECANCELED,
+            (BsdFlavour::OpenBsd, 88) => ECANCELED,
+            (BsdFlavour::OpenBsd, 91) => EOPNOTSUPP,
+            (BsdFlavour::NetBsd, 86) => EOPNOTSUPP,
+            (BsdFlavour::NetBsd, 87) => ECANCELED,
+            (BsdFlavour::NetBsd, 89) => ENODATA,
+            _ => return None,
+        },
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn raw_errno_to_abi(code: i32) -> Option<abi::Errno> {
+    linux_errno_to_abi(code)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+))]
+fn raw_errno_to_abi(code: i32) -> Option<abi::Errno> {
+    bsd_errno_to_abi(code, BsdFlavour::Apple)
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+fn raw_errno_to_abi(code: i32) -> Option<abi::Errno> {
+    bsd_errno_to_abi(code, BsdFlavour::FreeBsd)
+}
+
+#[cfg(target_os = "openbsd")]
+fn raw_errno_to_abi(code: i32) -> Option<abi::Errno> {
+    bsd_errno_to_abi(code, BsdFlavour::OpenBsd)
+}
+
+#[cfg(target_os = "netbsd")]
+fn raw_errno_to_abi(code: i32) -> Option<abi::Errno> {
+    bsd_errno_to_abi(code, BsdFlavour::NetBsd)
+}
+
+#[cfg(not(any(
+    target_os = "wasi",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+)))]
 fn raw_errno_to_abi(_code: i32) -> Option<abi::Errno> {
     None
 }
@@ -187,6 +323,66 @@ pub fn chmod(path: &Path, mode: u32) -> io::Result<()> {
         path: raw_path(path)?,
         mode: (mode & 0o7777) as u16,
     })
+}
+
+/// fchmod(2): update permission bits on an open file descriptor.
+pub fn fchmod(fd: u32, mode: u32) -> io::Result<()> {
+    unit_call(abi::Call::Fchmod {
+        fd: fd.into(),
+        mode: (mode & 0o7777) as u16,
+    })
+}
+
+/// fchmodat(2): update permission bits on `path` relative to `dirfd` (`None` = `AT_FDCWD`).
+pub fn fchmodat(dirfd: Option<u32>, path: &Path, mode: u32) -> io::Result<()> {
+    let raw = raw_path(path)?;
+    if raw.is_empty() {
+        return Err(os_error(abi::Error::new(Errno::ENOENT)));
+    }
+    let masked = (mode & 0o7777) as u16;
+    if raw.starts_with('/') {
+        return unit_call(abi::Call::Chmod {
+            path: raw,
+            mode: masked,
+        });
+    }
+    match dirfd {
+        None => unit_call(abi::Call::Chmod {
+            path: raw,
+            mode: masked,
+        }),
+        Some(fd) if fd as i32 == abi::OS_FD_CWD => unit_call(abi::Call::Chmod {
+            path: raw,
+            mode: masked,
+        }),
+        Some(fd) if fd as i32 == abi::OS_FD_ROOT => unit_call(abi::Call::Chmod {
+            path: format!("/{raw}"),
+            mode: masked,
+        }),
+        Some(fd) => {
+            let opened = value_call(abi::Call::OpenAt {
+                dirfd: fd.into(),
+                path: raw,
+                flags: abi::O_RDONLY,
+                mode: 0,
+            })?;
+            let tmp_fd = opened["fd"]
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "open_at returned invalid fd")
+                })?;
+            let mut reply = batch(&[
+                abi::Call::Fchmod {
+                    fd: tmp_fd.into(),
+                    mode: masked,
+                },
+                abi::Call::Close { fd: tmp_fd.into() },
+            ])?;
+            reply.results.remove(0).into_result().map_err(os_error)?;
+            Ok(())
+        }
+    }
 }
 
 /// mount(2): attach, bind, move, or remount a filesystem in the caller's mount namespace.
@@ -790,12 +986,17 @@ mod tests {
             wasi_libc::split_guest_path(b""),
             Err(wasi_libc::WASI_ENOENT)
         );
+        // All-slash paths emit `(OS_FD_ROOT, "/")` while `"/."` emits `(OS_FD_ROOT, ".")`.
         assert_eq!(
             wasi_libc::split_guest_path(b"/"),
-            Ok((OS_FD_ROOT, b"/\0".as_slice(), b".".as_slice()))
+            Ok((OS_FD_ROOT, b"/\0".as_slice(), b"/".as_slice()))
         );
         assert_eq!(
             wasi_libc::split_guest_path(b"///"),
+            Ok((OS_FD_ROOT, b"/\0".as_slice(), b"/".as_slice()))
+        );
+        assert_eq!(
+            wasi_libc::split_guest_path(b"/."),
             Ok((OS_FD_ROOT, b"/\0".as_slice(), b".".as_slice()))
         );
         assert_eq!(
@@ -827,6 +1028,114 @@ mod tests {
             (wasi_libc::WASI_ERANGE, Errno::ERANGE),
         ] {
             assert_eq!(wasi_libc::wasi_errno_to_abi(wasi), Some(expected));
+            assert_eq!(wasi_libc::abi_errno_to_wasi(expected), wasi);
         }
+    }
+
+    #[test]
+    fn ctimeval_uses_64bit_suseconds_and_rejects_out_of_range_usec() {
+        assert_eq!(core::mem::size_of::<wasi_libc::CTimeval>(), 16);
+        assert_eq!(core::mem::align_of::<wasi_libc::CTimeval>(), 8);
+        assert_eq!(core::mem::offset_of!(wasi_libc::CTimeval, tv_sec), 0);
+        assert_eq!(core::mem::offset_of!(wasi_libc::CTimeval, tv_usec), 8);
+
+        let ok = wasi_libc::convert_timevals([
+            wasi_libc::CTimeval {
+                tv_sec: 1_700_000_000,
+                tv_usec: 0,
+            },
+            wasi_libc::CTimeval {
+                tv_sec: 1_700_000_001,
+                tv_usec: 999_999,
+            },
+        ])
+        .unwrap();
+        assert_eq!(ok[0].tv_sec, 1_700_000_000);
+        assert_eq!(ok[0].tv_nsec, 0);
+        assert_eq!(ok[1].tv_sec, 1_700_000_001);
+        assert_eq!(ok[1].tv_nsec, 999_999_000);
+
+        // High-32-bit overflow (`0x1_0000_0001`), negative, and `>= 1_000_000` must fail with EINVAL.
+        for bad_usec in [-1_i64, 1_000_000, 0x1_0000_0001] {
+            let err = wasi_libc::convert_timevals([
+                wasi_libc::CTimeval {
+                    tv_sec: 10,
+                    tv_usec: bad_usec,
+                },
+                wasi_libc::CTimeval {
+                    tv_sec: 10,
+                    tv_usec: 0,
+                },
+            ]);
+            assert_eq!(err, Err(wasi_libc::WASI_EINVAL), "usec={bad_usec}");
+        }
+    }
+
+    #[test]
+    fn unix_errno_mappings_distinguish_linux_and_bsd_macos_numbers() {
+        // Linux: EAGAIN = 11, EDEADLK = 35.
+        assert_eq!(linux_errno_to_abi(11), Some(Errno::EAGAIN));
+        assert_eq!(linux_errno_to_abi(35), Some(Errno::EDEADLK));
+        assert_eq!(linux_errno_to_abi(36), Some(Errno::ENAMETOOLONG));
+        assert_eq!(linux_errno_to_abi(40), Some(Errno::ELOOP));
+
+        // macOS / BSD: EDEADLK = 11, EAGAIN = 35, ELOOP = 62, ENAMETOOLONG = 63, EOPNOTSUPP = 102/45.
+        assert_eq!(
+            bsd_errno_to_abi(11, BsdFlavour::Apple),
+            Some(Errno::EDEADLK)
+        );
+        assert_eq!(bsd_errno_to_abi(35, BsdFlavour::Apple), Some(Errno::EAGAIN));
+        assert_eq!(bsd_errno_to_abi(62, BsdFlavour::Apple), Some(Errno::ELOOP));
+        assert_eq!(
+            bsd_errno_to_abi(63, BsdFlavour::Apple),
+            Some(Errno::ENAMETOOLONG)
+        );
+        assert_eq!(
+            bsd_errno_to_abi(102, BsdFlavour::Apple),
+            Some(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(
+            bsd_errno_to_abi(89, BsdFlavour::Apple),
+            Some(Errno::ECANCELED)
+        );
+        assert_eq!(
+            bsd_errno_to_abi(85, BsdFlavour::FreeBsd),
+            Some(Errno::ECANCELED)
+        );
+    }
+
+    #[test]
+    fn fchmodat_flag_validation_rejects_symlink_nofollow_and_unknown_bits() {
+        assert_eq!(wasi_libc::validate_fchmodat_flags(0), Ok(()));
+        assert_eq!(
+            wasi_libc::validate_fchmodat_flags(wasi_libc::WASI_AT_SYMLINK_NOFOLLOW),
+            Err(wasi_libc::WASI_EOPNOTSUPP)
+        );
+        assert_eq!(
+            wasi_libc::validate_fchmodat_flags(wasi_libc::LINUX_AT_SYMLINK_NOFOLLOW),
+            Err(wasi_libc::WASI_EOPNOTSUPP)
+        );
+        assert_eq!(
+            wasi_libc::validate_fchmodat_flags(0x4000),
+            Err(wasi_libc::WASI_EINVAL)
+        );
+        assert_eq!(
+            wasi_libc::resolve_fchmodat_dirfd(wasi_libc::WASI_AT_FDCWD),
+            Ok(None)
+        );
+        assert_eq!(
+            wasi_libc::resolve_fchmodat_dirfd(wasi_libc::LINUX_AT_FDCWD),
+            Ok(None)
+        );
+        assert_eq!(wasi_libc::resolve_fchmodat_dirfd(OS_FD_CWD), Ok(None));
+        assert_eq!(
+            wasi_libc::resolve_fchmodat_dirfd(OS_FD_ROOT),
+            Ok(Some(OS_FD_ROOT as u32))
+        );
+        assert_eq!(
+            wasi_libc::resolve_fchmodat_dirfd(-1),
+            Err(wasi_libc::WASI_EBADF)
+        );
+        assert_eq!(wasi_libc::resolve_fchmodat_dirfd(5), Ok(Some(5)));
     }
 }

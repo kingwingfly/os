@@ -10,6 +10,9 @@ use std::path::Path;
 
 pub(crate) trait MountBackend {
     fn read_mountinfo(&self) -> io::Result<String>;
+    fn resolve_mountpoint(&self, target: &str) -> String {
+        normalize_mountpoint_target(target)
+    }
     fn mount(
         &mut self,
         source: Option<&str>,
@@ -21,11 +24,34 @@ pub(crate) trait MountBackend {
     fn umount2(&mut self, target: &str, flags: u32) -> io::Result<()>;
 }
 
+fn normalize_mountpoint_target(target: &str) -> String {
+    let trimmed = target.trim_end_matches('/');
+    if trimmed.is_empty() && target.starts_with('/') {
+        "/".to_string()
+    } else if trimmed.is_empty() {
+        target.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 struct OsMountBackend;
 
 impl MountBackend for OsMountBackend {
     fn read_mountinfo(&self) -> io::Result<String> {
         std::fs::read_to_string("/proc/self/mountinfo")
+    }
+
+    fn resolve_mountpoint(&self, target: &str) -> String {
+        if let Ok(canon) = Path::new(target).canonicalize() {
+            return canon.to_string_lossy().into_owned();
+        }
+        if !target.starts_with('/')
+            && let Ok(cwd) = std::env::current_dir()
+        {
+            return normalize_mountpoint_target(&cwd.join(target).to_string_lossy());
+        }
+        normalize_mountpoint_target(target)
     }
 
     fn mount(
@@ -51,7 +77,14 @@ impl MountBackend for OsMountBackend {
 }
 
 pub(crate) fn parse_mount_options(options: &[String]) -> (u64, String) {
-    let mut flags: u64 = 0;
+    parse_mount_options_with_base(0, options)
+}
+
+pub(crate) fn parse_mount_options_with_base(
+    initial_flags: u64,
+    options: &[String],
+) -> (u64, String) {
+    let mut flags: u64 = initial_flags;
     let mut fs_data: Vec<String> = Vec::new();
     for group in options {
         for raw in group.split(',') {
@@ -73,17 +106,27 @@ pub(crate) fn parse_mount_options(options: &[String]) -> (u64, String) {
                 "sync" => flags |= mount_flags::MS_SYNCHRONOUS,
                 "async" => flags &= !mount_flags::MS_SYNCHRONOUS,
                 "dirsync" => flags |= mount_flags::MS_DIRSYNC,
+                "nodirsync" => flags &= !mount_flags::MS_DIRSYNC,
                 "remount" => flags |= mount_flags::MS_REMOUNT,
                 "bind" => flags |= mount_flags::MS_BIND,
                 "rbind" => flags |= mount_flags::MS_BIND | mount_flags::MS_REC,
                 "move" => flags |= mount_flags::MS_MOVE,
-                "noatime" => flags |= mount_flags::MS_NOATIME,
+                "noatime" => {
+                    flags = (flags & !(mount_flags::MS_RELATIME | mount_flags::MS_STRICTATIME))
+                        | mount_flags::MS_NOATIME;
+                }
                 "atime" => flags &= !mount_flags::MS_NOATIME,
                 "nodiratime" => flags |= mount_flags::MS_NODIRATIME,
                 "diratime" => flags &= !mount_flags::MS_NODIRATIME,
-                "relatime" => flags |= mount_flags::MS_RELATIME,
+                "relatime" => {
+                    flags = (flags & !(mount_flags::MS_NOATIME | mount_flags::MS_STRICTATIME))
+                        | mount_flags::MS_RELATIME;
+                }
                 "norelatime" => flags &= !mount_flags::MS_RELATIME,
-                "strictatime" => flags |= mount_flags::MS_STRICTATIME,
+                "strictatime" => {
+                    flags = (flags & !(mount_flags::MS_NOATIME | mount_flags::MS_RELATIME))
+                        | mount_flags::MS_STRICTATIME;
+                }
                 "nostrictatime" => flags &= !mount_flags::MS_STRICTATIME,
                 "lazytime" => flags |= mount_flags::MS_LAZYTIME,
                 "nolazytime" => flags &= !mount_flags::MS_LAZYTIME,
@@ -109,6 +152,49 @@ pub(crate) fn parse_mount_options(options: &[String]) -> (u64, String) {
         }
     }
     (flags, fs_data.join(","))
+}
+
+fn apply_cli_mount_modifiers(mut flags: u64, parsed: &Mount) -> u64 {
+    if parsed.read_only {
+        flags |= mount_flags::MS_RDONLY;
+    }
+    if parsed.read_write {
+        flags &= !mount_flags::MS_RDONLY;
+    }
+    if parsed.bind {
+        flags |= mount_flags::MS_BIND;
+    }
+    if parsed.rbind {
+        flags |= mount_flags::MS_BIND | mount_flags::MS_REC;
+    }
+    if parsed.move_mount {
+        flags |= mount_flags::MS_MOVE;
+    }
+    if parsed.make_private {
+        flags |= mount_flags::MS_PRIVATE;
+    }
+    if parsed.make_shared {
+        flags |= mount_flags::MS_SHARED;
+    }
+    if parsed.make_slave {
+        flags |= mount_flags::MS_SLAVE;
+    }
+    if parsed.make_unbindable {
+        flags |= mount_flags::MS_UNBINDABLE;
+    }
+    if parsed.make_rprivate {
+        flags |= mount_flags::MS_PRIVATE | mount_flags::MS_REC;
+    }
+    if parsed.make_rshared {
+        flags |= mount_flags::MS_SHARED | mount_flags::MS_REC;
+    }
+    if parsed.make_rslave {
+        flags |= mount_flags::MS_SLAVE | mount_flags::MS_REC;
+    }
+    if parsed.make_runbindable {
+        flags |= mount_flags::MS_UNBINDABLE | mount_flags::MS_REC;
+    }
+    flags
 }
 
 fn check_unsupported_mount_flags(args: &[String]) -> Result<(), String> {
@@ -195,46 +281,8 @@ pub(crate) fn run_mount_with(
         Err(msg) => return (String::new(), vec![msg], 2),
     };
 
-    let (mut flags, data) = parse_mount_options(&parsed.options);
-    if parsed.read_only {
-        flags |= mount_flags::MS_RDONLY;
-    }
-    if parsed.read_write {
-        flags &= !mount_flags::MS_RDONLY;
-    }
-    if parsed.bind {
-        flags |= mount_flags::MS_BIND;
-    }
-    if parsed.rbind {
-        flags |= mount_flags::MS_BIND | mount_flags::MS_REC;
-    }
-    if parsed.move_mount {
-        flags |= mount_flags::MS_MOVE;
-    }
-    if parsed.make_private {
-        flags |= mount_flags::MS_PRIVATE;
-    }
-    if parsed.make_shared {
-        flags |= mount_flags::MS_SHARED;
-    }
-    if parsed.make_slave {
-        flags |= mount_flags::MS_SLAVE;
-    }
-    if parsed.make_unbindable {
-        flags |= mount_flags::MS_UNBINDABLE;
-    }
-    if parsed.make_rprivate {
-        flags |= mount_flags::MS_PRIVATE | mount_flags::MS_REC;
-    }
-    if parsed.make_rshared {
-        flags |= mount_flags::MS_SHARED | mount_flags::MS_REC;
-    }
-    if parsed.make_rslave {
-        flags |= mount_flags::MS_SLAVE | mount_flags::MS_REC;
-    }
-    if parsed.make_runbindable {
-        flags |= mount_flags::MS_UNBINDABLE | mount_flags::MS_REC;
-    }
+    let (prelim_flags, data) = parse_mount_options(&parsed.options);
+    let mut flags = apply_cli_mount_modifiers(prelim_flags, &parsed);
 
     let propagation_mask = mount_flags::MS_PRIVATE
         | mount_flags::MS_SHARED
@@ -335,6 +383,21 @@ pub(crate) fn run_mount_with(
             }
         }
     };
+
+    if (flags & mount_flags::MS_REMOUNT) != 0
+        && let Ok(text) = backend.read_mountinfo()
+    {
+        let norm_target = backend.resolve_mountpoint(target);
+        if let Some(rec) = parse_mountinfo(&text)
+            .into_iter()
+            .rev()
+            .find(|r| r.target == norm_target)
+        {
+            let (seed_flags, _) = parse_mount_options(std::slice::from_ref(&rec.mount_opts));
+            let (recomputed, _) = parse_mount_options_with_base(seed_flags, &parsed.options);
+            flags = apply_cli_mount_modifiers(recomputed, &parsed);
+        }
+    }
 
     if let Err(err) = backend.mount(source, target, fstype, flags, data_opt) {
         return (String::new(), vec![format!("mount: {target}: {err}")], 32);
@@ -566,5 +629,61 @@ mod tests {
             assert_eq!(bad_code, 2, "flag {unsupported}");
             assert!(errs[0].contains("unsupported option"), "errs={errs:?}");
         }
+    }
+
+    #[test]
+    fn remount_seeds_current_mountinfo_vfs_flags_and_applies_explicit_overrides() {
+        let mut backend = MockMountBackend {
+            mountinfo: "\
+1 1 0:1 / / rw,relatime - cloud cloud rw
+2 1 0:2 / /mnt/local/proj rw,nosuid,nodev,relatime - hostfs proj rw,user_id=1000
+3 1 0:3 / /srv ro,nosuid,nodev,noexec,noatime,nosymfollow - tmpfs srv rw
+4 3 0:4 / /srv rw,nodev,relatime - tmpfs top rw
+"
+            .into(),
+            ..Default::default()
+        };
+
+        // User remount (`mount -o remount,ro /mnt/local/proj/`) preserves locked `nosuid,nodev`
+        // and `relatime` instead of clearing them (which would fail with EPERM).
+        let (_, errs, code) =
+            run_mount_with(&s(&["-o", "remount,ro", "/mnt/local/proj/"]), &mut backend);
+        assert_eq!(code, 0, "errs={errs:?}");
+        assert_eq!(
+            backend.mounts.pop().unwrap().flags,
+            mount_flags::MS_REMOUNT
+                | mount_flags::MS_RDONLY
+                | mount_flags::MS_NOSUID
+                | mount_flags::MS_NODEV
+                | mount_flags::MS_RELATIME
+        );
+
+        // Stacked mounts at `/srv`: picks the topmost visible mount (id 4: `rw,nodev,relatime`),
+        // preserves `nodev`, overrides `relatime` -> `strictatime`, and applies `-r`.
+        let (_, errs, code) = run_mount_with(
+            &s(&["-r", "-o", "remount,strictatime,noexec", "/srv"]),
+            &mut backend,
+        );
+        assert_eq!(code, 0, "errs={errs:?}");
+        assert_eq!(
+            backend.mounts.pop().unwrap().flags,
+            mount_flags::MS_REMOUNT
+                | mount_flags::MS_RDONLY
+                | mount_flags::MS_NODEV
+                | mount_flags::MS_NOEXEC
+                | mount_flags::MS_STRICTATIME
+        );
+
+        // Explicit clearing (`exec`, `suid`, `-w`) clears previously set flags while preserving `nodev`.
+        backend.mountinfo = "3 1 0:3 / /srv ro,nosuid,nodev,noexec,noatime - tmpfs srv rw\n".into();
+        let (_, errs, code) = run_mount_with(
+            &s(&["-w", "-o", "remount,exec,suid,relatime", "/srv"]),
+            &mut backend,
+        );
+        assert_eq!(code, 0, "errs={errs:?}");
+        assert_eq!(
+            backend.mounts.pop().unwrap().flags,
+            mount_flags::MS_REMOUNT | mount_flags::MS_NODEV | mount_flags::MS_RELATIME
+        );
     }
 }

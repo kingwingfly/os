@@ -141,8 +141,142 @@ pub(crate) fn wasi_errno_to_abi(code: i32) -> Option<abi::Errno> {
     })
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn abi_errno_to_wasi(errno: abi::Errno) -> i32 {
+    use abi::Errno::*;
+    match errno {
+        EPERM => WASI_EPERM,
+        ENOENT => WASI_ENOENT,
+        ESRCH => WASI_ESRCH,
+        EIO => WASI_EIO,
+        ENXIO => WASI_ENXIO,
+        E2BIG => WASI_E2BIG,
+        EBADF => WASI_EBADF,
+        EAGAIN => WASI_EAGAIN,
+        EACCES => WASI_EACCES,
+        EBUSY => WASI_EBUSY,
+        EEXIST => WASI_EEXIST,
+        EXDEV => WASI_EXDEV,
+        ENODEV => WASI_ENODEV,
+        ENOTDIR => WASI_ENOTDIR,
+        EISDIR => WASI_EISDIR,
+        EINVAL => WASI_EINVAL,
+        EMFILE => WASI_EMFILE,
+        ENOTTY => WASI_ENOTTY,
+        ETXTBSY => WASI_ETXTBSY,
+        EFBIG => WASI_EFBIG,
+        ENOSPC => WASI_ENOSPC,
+        EROFS => WASI_EROFS,
+        EMLINK => WASI_EMLINK,
+        EPIPE => WASI_EPIPE,
+        ERANGE => WASI_ERANGE,
+        ENAMETOOLONG => WASI_ENAMETOOLONG,
+        ENOSYS => WASI_ENOSYS,
+        ENOTEMPTY => WASI_ENOTEMPTY,
+        ELOOP => WASI_ELOOP,
+        ENODATA => 217,
+        EOPNOTSUPP => WASI_EOPNOTSUPP,
+        ESTALE => WASI_ESTALE,
+        ETIMEDOUT => WASI_ETIMEDOUT,
+        ECANCELED => WASI_ECANCELED,
+        ENOEXEC => WASI_ENOEXEC,
+        ECHILD => WASI_ECHILD,
+        EDEADLK => WASI_EDEADLK,
+        EPROTONOSUPPORT => WASI_EPROTONOSUPPORT,
+        ENOTCONN => WASI_ENOTCONN,
+        ENOLCK => WASI_ENOLCK,
+        EDQUOT => WASI_EDQUOT,
+        EINTR => WASI_EINTR,
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CTimespec {
+    pub tv_sec: i64,
+    pub tv_nsec: core::ffi::c_long,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+const _: () = {
+    assert!(core::mem::size_of::<CTimespec>() == 16);
+    assert!(core::mem::align_of::<CTimespec>() == 8);
+    assert!(core::mem::offset_of!(CTimespec, tv_sec) == 0);
+    assert!(core::mem::offset_of!(CTimespec, tv_nsec) == 8);
+};
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CTimeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+const _: () = {
+    assert!(core::mem::size_of::<CTimeval>() == 16);
+    assert!(core::mem::align_of::<CTimeval>() == 8);
+    assert!(core::mem::offset_of!(CTimeval, tv_sec) == 0);
+    assert!(core::mem::offset_of!(CTimeval, tv_usec) == 8);
+};
+
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn convert_timevals(times: [CTimeval; 2]) -> Result<[CTimespec; 2], i32> {
+    let [atime, mtime] = times;
+    if !(0..1_000_000).contains(&atime.tv_usec) || !(0..1_000_000).contains(&mtime.tv_usec) {
+        return Err(WASI_EINVAL);
+    }
+    Ok([
+        CTimespec {
+            tv_sec: atime.tv_sec,
+            tv_nsec: (atime.tv_usec * 1000) as core::ffi::c_long,
+        },
+        CTimespec {
+            tv_sec: mtime.tv_sec,
+            tv_nsec: (mtime.tv_usec * 1000) as core::ffi::c_long,
+        },
+    ])
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const WASI_AT_FDCWD: i32 = -2;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const LINUX_AT_FDCWD: i32 = -100;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const WASI_AT_SYMLINK_NOFOLLOW: i32 = 0x1;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const LINUX_AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn validate_fchmodat_flags(flags: i32) -> Result<(), i32> {
+    let known = WASI_AT_SYMLINK_NOFOLLOW | LINUX_AT_SYMLINK_NOFOLLOW;
+    if (flags & !known) != 0 {
+        return Err(WASI_EINVAL);
+    }
+    if (flags & known) != 0 {
+        return Err(WASI_EOPNOTSUPP);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn resolve_fchmodat_dirfd(fd: i32) -> Result<Option<u32>, i32> {
+    if fd == WASI_AT_FDCWD || fd == LINUX_AT_FDCWD || fd == abi::OS_FD_CWD {
+        Ok(None)
+    } else if fd == abi::OS_FD_ROOT {
+        Ok(Some(abi::OS_FD_ROOT as u32))
+    } else if fd < 0 {
+        Err(WASI_EBADF)
+    } else {
+        Ok(Some(fd as u32))
+    }
+}
+
 /// Classify a raw NUL-free guest path slice into `(anchor_fd, abs_prefix_cstr, relative_slice)`
 /// without calling `getcwd()` or lexically collapsing `.` or `..`.
+/// All-slash paths (`"/"`, `"///"`) emit `(OS_FD_ROOT, "/")` while `"/."` emits `(OS_FD_ROOT, ".")`.
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn split_guest_path(raw: &[u8]) -> Result<(i32, &'static [u8], &[u8]), i32> {
     if raw.is_empty() {
@@ -153,7 +287,7 @@ pub(crate) fn split_guest_path(raw: &[u8]) -> Result<(i32, &'static [u8], &[u8])
         while idx < raw.len() && raw[idx] == b'/' {
             idx += 1;
         }
-        let rel: &[u8] = if idx == raw.len() { b"." } else { &raw[idx..] };
+        let rel: &[u8] = if idx == raw.len() { b"/" } else { &raw[idx..] };
         Ok((abi::OS_FD_ROOT, b"/\0", rel))
     } else {
         Ok((abi::OS_FD_CWD, b".\0", raw))
@@ -228,21 +362,6 @@ mod c_abi {
     }
 
     const _: [(); 96] = [(); core::mem::size_of::<CStatVfs>()];
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct CTimespec {
-        pub tv_sec: i64,
-        pub tv_nsec: i64,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct CTimeval {
-        pub tv_sec: i64,
-        pub tv_usec: i32,
-        pub _pad: i32,
-    }
 
     unsafe extern "C" {
         fn __errno_location() -> *mut i32;
@@ -335,7 +454,7 @@ mod c_abi {
     unsafe fn direct_relpath(path: *const u8) -> Option<(i32, *const u8)> {
         if path.is_null() {
             // SAFETY: valid guest errno location.
-            unsafe { set_errno(WASI_ENOENT) };
+            unsafe { set_errno(WASI_EFAULT) };
             return None;
         }
         // SAFETY: path is non-null C string.
@@ -351,7 +470,7 @@ mod c_abi {
                 idx += 1;
             }
             let rel = if unsafe { *path.add(idx) } == 0 {
-                c".".as_ptr().cast()
+                c"/".as_ptr().cast()
             } else {
                 unsafe { path.add(idx) }
             };
@@ -389,6 +508,7 @@ mod c_abi {
     pub(crate) fn ensure_linked() {
         std::hint::black_box(chdir as *const ());
         std::hint::black_box(getcwd as *const ());
+        std::hint::black_box(chmod as *const ());
         std::hint::black_box(statvfs as *const ());
         std::hint::black_box(__wasilibc_find_relpath_alloc as *const ());
     }
@@ -412,7 +532,7 @@ mod c_abi {
     ) -> i32 {
         if abspath.is_null() {
             // SAFETY: valid guest errno location.
-            unsafe { set_errno(WASI_ENOENT) };
+            unsafe { set_errno(WASI_EFAULT) };
             return -1;
         }
         // SAFETY: abspath is a NUL-terminated C string from libc.
@@ -433,10 +553,10 @@ mod c_abi {
             unsafe { *abs_prefix = c"/".as_ptr().cast() };
         }
         if !relative_path.is_null() {
-            // SAFETY: relative_path is writable; returns static "." or interior pointer in abspath.
+            // SAFETY: relative_path is writable; returns static "/" or interior pointer in abspath.
             unsafe {
                 *relative_path = if idx == raw.len() {
-                    c".".as_ptr().cast()
+                    c"/".as_ptr().cast()
                 } else {
                     abspath.add(idx)
                 };
@@ -455,7 +575,7 @@ mod c_abi {
     ) -> i32 {
         if path.is_null() || relative_path.is_null() || relative_path_len.is_null() {
             // SAFETY: valid guest errno location.
-            unsafe { set_errno(WASI_ENOENT) };
+            unsafe { set_errno(WASI_EFAULT) };
             return -1;
         }
         // SAFETY: path is a NUL-terminated C string.
@@ -619,17 +739,14 @@ mod c_abi {
             return unsafe { __wasilibc_nocwd_utimensat(fd, rel, core::ptr::null(), 0) };
         }
         // SAFETY: non-null `timeval[2]` array.
-        let [atime, mtime] = unsafe { *times };
-        let ts = [
-            CTimespec {
-                tv_sec: atime.tv_sec,
-                tv_nsec: i64::from(atime.tv_usec) * 1000,
-            },
-            CTimespec {
-                tv_sec: mtime.tv_sec,
-                tv_nsec: i64::from(mtime.tv_usec) * 1000,
-            },
-        ];
+        let raw_times = unsafe { *times };
+        let ts = match convert_timevals(raw_times) {
+            Ok(ts) => ts,
+            Err(err) => {
+                unsafe { set_errno(err) };
+                return -1;
+            }
+        };
         unsafe { __wasilibc_nocwd_utimensat(fd, rel, ts.as_ptr(), 0) }
     }
 
@@ -699,6 +816,10 @@ mod c_abi {
 
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn symlink(target: *const u8, linkpath: *const u8) -> i32 {
+        if target.is_null() {
+            unsafe { set_errno(WASI_EFAULT) };
+            return -1;
+        }
         let Some((fd, rel)) = (unsafe { direct_relpath(linkpath) }) else {
             return -1;
         };
@@ -732,6 +853,10 @@ mod c_abi {
         newpath: *const u8,
         flags: i32,
     ) -> i32 {
+        if oldpath.is_null() {
+            unsafe { set_errno(WASI_EFAULT) };
+            return -1;
+        }
         let Some((new_fd, new_rel)) = (unsafe { direct_relpath(newpath) }) else {
             return -1;
         };
@@ -745,6 +870,10 @@ mod c_abi {
         newpath: *const u8,
         flags: i32,
     ) -> i32 {
+        if newpath.is_null() {
+            unsafe { set_errno(WASI_EFAULT) };
+            return -1;
+        }
         let Some((old_fd, old_rel)) = (unsafe { direct_relpath(oldpath) }) else {
             return -1;
         };
@@ -768,6 +897,10 @@ mod c_abi {
         oldpath: *const u8,
         newpath: *const u8,
     ) -> i32 {
+        if oldpath.is_null() {
+            unsafe { set_errno(WASI_EFAULT) };
+            return -1;
+        }
         let Some((new_fd, new_rel)) = (unsafe { direct_relpath(newpath) }) else {
             return -1;
         };
@@ -780,28 +913,90 @@ mod c_abi {
         newdirfd: i32,
         newpath: *const u8,
     ) -> i32 {
+        if newpath.is_null() {
+            unsafe { set_errno(WASI_EFAULT) };
+            return -1;
+        }
         let Some((old_fd, old_rel)) = (unsafe { direct_relpath(oldpath) }) else {
             return -1;
         };
         unsafe { __wasilibc_nocwd_renameat(old_fd, old_rel, newdirfd, newpath) }
     }
 
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn chmod(_path: *const u8, _mode: u32) -> i32 {
-        unsafe { set_errno(WASI_ENOSYS) };
-        -1
+    #[inline]
+    unsafe fn io_result_to_c(res: std::io::Result<()>) -> i32 {
+        match res {
+            Ok(()) => 0,
+            Err(err) => {
+                let code = crate::errno_of(&err).map_or(WASI_EIO, abi_errno_to_wasi);
+                // SAFETY: valid guest errno location.
+                unsafe { set_errno(code) };
+                -1
+            }
+        }
     }
 
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn fchmod(_fd: i32, _mode: u32) -> i32 {
-        unsafe { set_errno(WASI_ENOSYS) };
-        -1
+    pub unsafe extern "C" fn chmod(path: *const u8, mode: u32) -> i32 {
+        if path.is_null() {
+            // SAFETY: valid guest errno location.
+            unsafe { set_errno(WASI_EFAULT) };
+            return -1;
+        }
+        // SAFETY: path is a NUL-terminated C string.
+        let len = unsafe { c_strlen(path) };
+        if len == 0 {
+            unsafe { set_errno(WASI_ENOENT) };
+            return -1;
+        }
+        let raw = unsafe { core::slice::from_raw_parts(path, len) };
+        let Ok(text) = core::str::from_utf8(raw) else {
+            unsafe { set_errno(WASI_EINVAL) };
+            return -1;
+        };
+        unsafe { io_result_to_c(crate::chmod(std::path::Path::new(text), mode)) }
     }
 
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn fchmodat(_fd: i32, _path: *const u8, _mode: u32, _flags: i32) -> i32 {
-        unsafe { set_errno(WASI_ENOSYS) };
-        -1
+    pub unsafe extern "C" fn fchmod(fd: i32, mode: u32) -> i32 {
+        if fd < 0 {
+            // SAFETY: valid guest errno location.
+            unsafe { set_errno(WASI_EBADF) };
+            return -1;
+        }
+        unsafe { io_result_to_c(crate::fchmod(fd as u32, mode)) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn fchmodat(fd: i32, path: *const u8, mode: u32, flags: i32) -> i32 {
+        if path.is_null() {
+            // SAFETY: valid guest errno location.
+            unsafe { set_errno(WASI_EFAULT) };
+            return -1;
+        }
+        if let Err(err) = validate_fchmodat_flags(flags) {
+            unsafe { set_errno(err) };
+            return -1;
+        }
+        // SAFETY: path is a NUL-terminated C string.
+        let len = unsafe { c_strlen(path) };
+        if len == 0 {
+            unsafe { set_errno(WASI_ENOENT) };
+            return -1;
+        }
+        let raw = unsafe { core::slice::from_raw_parts(path, len) };
+        let Ok(text) = core::str::from_utf8(raw) else {
+            unsafe { set_errno(WASI_EINVAL) };
+            return -1;
+        };
+        let dirfd = match resolve_fchmodat_dirfd(fd) {
+            Ok(dirfd) => dirfd,
+            Err(err) => {
+                unsafe { set_errno(err) };
+                return -1;
+            }
+        };
+        unsafe { io_result_to_c(crate::fchmodat(dirfd, std::path::Path::new(text), mode)) }
     }
 
     #[unsafe(no_mangle)]

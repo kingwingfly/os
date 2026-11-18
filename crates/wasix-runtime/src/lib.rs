@@ -23,8 +23,10 @@ pub const OS_FD_CWD: u32 = 0x7fff_fffe;
 
 #[wasm_bindgen]
 extern "C" {
+    #[cfg_attr(test, allow(dead_code))]
     #[wasm_bindgen(js_namespace = ["globalThis", "wasixGuest"], js_name = read)]
     fn guest_read(pid: u32, ptr: u32, len: u32) -> js_sys::Uint8Array;
+    #[cfg_attr(test, allow(dead_code))]
     #[wasm_bindgen(js_namespace = ["globalThis", "wasixGuest"], js_name = write)]
     fn guest_write(pid: u32, ptr: u32, data: &[u8]);
     #[wasm_bindgen(js_namespace = ["globalThis", "wasixGuest"], js_name = output)]
@@ -37,9 +39,9 @@ extern "C" {
     fn guest_clone(parent: u32, child: u32, stack_pointer: u32) -> u32;
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum Outcome {
-    Ready(u16),
+    Ready(i32),
     Exit(i32),
     Unwind,
     Resume,
@@ -47,7 +49,17 @@ enum Outcome {
 }
 impl Outcome {
     fn ready(errno: u16) -> Self {
-        Self::Ready(errno)
+        Self::Ready(i32::from(errno))
+    }
+    fn os_value(value: i32) -> Self {
+        Self::Ready(value)
+    }
+    fn os_errno(errno: u16) -> Self {
+        if errno == SUCCESS {
+            Self::Ready(0)
+        } else {
+            Self::Ready(-i32::from(errno))
+        }
     }
     fn json(&self) -> String {
         match self {
@@ -224,10 +236,17 @@ impl Runtime {
         }
     }
 
-    /// One `wasix_32v1` / `os` import call. The JS bridge calls this from the guest's import
-    /// function and returns the resulting errno, throws on `exit`, or starts asyncify on `unwind`.
+    /// One `wasix_32v1` / `os` import call. Accepts bare `wasix_32v1` symbol names (`"getcwd"`)
+    /// or module-qualified `"<module>::<name>"` / `"<module>.<name>"` names (`"os::getcwd"`).
     pub fn syscall(&mut self, pid: u32, name: &str, args: &[u32]) -> String {
-        let outcome = self.dispatch(pid, name, args);
+        let (module, bare) = split_qualified_syscall(name);
+        let outcome = self.dispatch(pid, module, bare, args);
+        outcome.json()
+    }
+
+    /// Module-qualified import call (`module` = `"os"`, `"wasix_32v1"`, or `"wasi_snapshot_preview1"`).
+    pub fn syscall_module(&mut self, pid: u32, module: &str, name: &str, args: &[u32]) -> String {
+        let outcome = self.dispatch(pid, module, name, args);
         outcome.json()
     }
 }
@@ -350,18 +369,52 @@ impl Runtime {
         Outcome::Unwind
     }
 
-    fn dispatch(&mut self, pid: u32, name: &str, args: &[u32]) -> Outcome {
-        match name {
-            "stack_checkpoint" => return self.stack_checkpoint(pid, args),
-            "stack_restore" => return self.stack_restore(pid, args),
-            "proc_fork" => return self.proc_fork(pid, args),
-            _ => {}
+    fn dispatch(&mut self, pid: u32, module: &str, name: &str, args: &[u32]) -> Outcome {
+        if module != "os" {
+            match name {
+                "stack_checkpoint" => return self.stack_checkpoint(pid, args),
+                "stack_restore" => return self.stack_restore(pid, args),
+                "proc_fork" => return self.proc_fork(pid, args),
+                _ => {}
+            }
         }
         let files = &self.files;
         let Some(proc) = self.procs.get_mut(&pid) else {
-            return Outcome::ready(BADF);
+            return if module == "os" {
+                Outcome::os_errno(BADF)
+            } else {
+                Outcome::ready(BADF)
+            };
         };
         let arg = |i: usize| args.get(i).copied().unwrap_or(0);
+        if module == "os" {
+            return match name {
+                "getcwd" => {
+                    let (buf_ptr, cap) = (arg(0), arg(1) as usize);
+                    if buf_ptr == 0 && cap != 0 {
+                        return Outcome::os_errno(FAULT);
+                    }
+                    match proc_getcwd(proc, cap) {
+                        Ok(cwd) => {
+                            write_bytes(pid, buf_ptr, cwd.as_bytes());
+                            write_bytes(pid, buf_ptr + cwd.len() as u32, &[0]);
+                            Outcome::os_value((cwd.len() + 1) as i32)
+                        }
+                        Err(errno) => Outcome::os_errno(errno),
+                    }
+                }
+                "chdir" => {
+                    let path = read_string(pid, arg(0), arg(1));
+                    Outcome::os_errno(proc_chdir(files, proc, &path))
+                }
+                "fchdir" => Outcome::os_errno(proc_fchdir(proc, arg(0))),
+                "chroot" => {
+                    let path = read_string(pid, arg(0), arg(1));
+                    Outcome::os_errno(proc_chroot(files, proc, &path))
+                }
+                _ => Outcome::os_errno(NOSYS),
+            };
+        }
         match name {
             "args_sizes_get" => {
                 let size = strings_size(&proc.argv);
@@ -557,14 +610,28 @@ impl Runtime {
                     Err(errno) => Outcome::ready(errno),
                 }
             }
-            "getcwd" => match proc_getcwd(proc, arg(1) as usize) {
-                Ok(cwd) => {
-                    write_bytes(pid, arg(0), cwd.as_bytes());
-                    write_bytes(pid, arg(0) + cwd.len() as u32, &[0]);
+            "getcwd" => {
+                let (buf_ptr, len_ptr) = (arg(0), arg(1));
+                if len_ptr == 0 {
+                    return Outcome::ready(FAULT);
+                }
+                let cap = read_u32(pid, len_ptr) as usize;
+                let Some(cwd) = rebase_under_root(&proc.cwd, &proc.root) else {
+                    return Outcome::ready(NOENT);
+                };
+                let needed = cwd.len() + 1;
+                if cap < needed {
+                    write_u32(pid, len_ptr, needed as u32);
+                    Outcome::ready(RANGE)
+                } else if buf_ptr == 0 {
+                    Outcome::ready(FAULT)
+                } else {
+                    write_bytes(pid, buf_ptr, cwd.as_bytes());
+                    write_bytes(pid, buf_ptr + cwd.len() as u32, &[0]);
+                    write_u32(pid, len_ptr, cwd.len() as u32);
                     Outcome::ready(SUCCESS)
                 }
-                Err(errno) => Outcome::ready(errno),
-            },
+            }
             "chdir" => {
                 let path = read_string(pid, arg(0), arg(1));
                 Outcome::ready(proc_chdir(files, proc, &path))
@@ -889,12 +956,60 @@ fn write_filestat(pid: u32, out: u32, filetype: u8, size: u64) {
     write_bytes(pid, out, &stat);
 }
 
+fn split_qualified_syscall(name: &str) -> (&str, &str) {
+    if let Some((module, bare)) = name.split_once("::") {
+        return (module, bare);
+    }
+    if let Some((module, bare)) = name.split_once('.') {
+        return (module, bare);
+    }
+    ("wasix_32v1", name)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GUEST_MEM: std::cell::RefCell<BTreeMap<u32, Vec<u8>>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
 fn mem_read(pid: u32, ptr: u32, len: u32) -> Vec<u8> {
-    guest_read(pid, ptr, len).to_vec()
+    #[cfg(test)]
+    {
+        TEST_GUEST_MEM.with(|mem| {
+            let map = mem.borrow();
+            let Some(buf) = map.get(&pid) else {
+                return vec![0; len as usize];
+            };
+            let start = (ptr as usize).min(buf.len());
+            let end = (start + len as usize).min(buf.len());
+            let mut out = vec![0; len as usize];
+            out[..end - start].copy_from_slice(&buf[start..end]);
+            out
+        })
+    }
+    #[cfg(not(test))]
+    {
+        guest_read(pid, ptr, len).to_vec()
+    }
 }
 
 fn write_bytes(pid: u32, ptr: u32, data: &[u8]) {
-    guest_write(pid, ptr, data);
+    #[cfg(test)]
+    {
+        TEST_GUEST_MEM.with(|mem| {
+            let mut map = mem.borrow_mut();
+            let buf = map.entry(pid).or_insert_with(|| vec![0; 65536]);
+            let end = ptr as usize + data.len();
+            if buf.len() < end {
+                buf.resize(end, 0);
+            }
+            buf[ptr as usize..end].copy_from_slice(data);
+        });
+    }
+    #[cfg(not(test))]
+    {
+        guest_write(pid, ptr, data);
+    }
 }
 
 fn read_u32(pid: u32, ptr: u32) -> u32 {
@@ -986,5 +1101,74 @@ mod tests {
         assert_eq!(proc_fchdir(proc, 999), BADF);
         assert_eq!(proc_fchdir(proc, dir_fd), SUCCESS);
         assert_eq!(proc_getcwd(proc, 64), Ok("/jail/etc".to_string()));
+    }
+
+    #[test]
+    fn os_getcwd_returns_len_plus_one_and_negative_wasi_errno_while_wasix_uses_len_ptr() {
+        TEST_GUEST_MEM.with(|mem| mem.borrow_mut().insert(1, vec![0xaa; 4096]));
+        let mut rt = test_runtime();
+
+        // Write "jail/bin" at ptr 256 and chdir via `os::chdir`.
+        write_bytes(1, 256, b"jail/bin");
+        let chdir_reply: serde_json::Value =
+            serde_json::from_str(&rt.syscall_module(1, "os", "chdir", &[256, 8])).unwrap();
+        assert_eq!(chdir_reply["errno"], 0);
+
+        // `os::getcwd` with cap == 0 -> -EINVAL (-28).
+        let zero_cap: serde_json::Value =
+            serde_json::from_str(&rt.syscall_module(1, "os", "getcwd", &[512, 0])).unwrap();
+        assert_eq!(zero_cap["errno"], -i32::from(INVAL));
+
+        // `os::getcwd` with cap too small (4 < "/jail/bin\0".len() == 10) -> -ERANGE (-68),
+        // and guest buffer at 512 remains untouched (`0xaa`).
+        let small_cap: serde_json::Value =
+            serde_json::from_str(&rt.syscall(1, "os::getcwd", &[512, 4])).unwrap();
+        assert_eq!(small_cap["errno"], -i32::from(RANGE));
+        assert_eq!(mem_read(1, 512, 4), vec![0xaa; 4]);
+
+        // `os::getcwd` with sufficient capacity -> returns `len + 1` (10) and writes NUL-terminated path.
+        let ok_reply: serde_json::Value =
+            serde_json::from_str(&rt.syscall_module(1, "os", "getcwd", &[512, 64])).unwrap();
+        assert_eq!(ok_reply["errno"], 10);
+        assert_eq!(mem_read(1, 512, 10), b"/jail/bin\0");
+
+        // `wasix_32v1::getcwd` uses `(buf_ptr, len_ptr) -> 0 / +ERANGE (68)`.
+        write_u32(1, 1024, 4);
+        let wasix_small: serde_json::Value =
+            serde_json::from_str(&rt.syscall(1, "getcwd", &[1200, 1024])).unwrap();
+        assert_eq!(wasix_small["errno"], i32::from(RANGE));
+        assert_eq!(read_u32(1, 1024), 10);
+
+        write_u32(1, 1024, 64);
+        let wasix_ok: serde_json::Value =
+            serde_json::from_str(&rt.syscall(1, "getcwd", &[1200, 1024])).unwrap();
+        assert_eq!(wasix_ok["errno"], i32::from(SUCCESS));
+        assert_eq!(read_u32(1, 1024), 9);
+        assert_eq!(mem_read(1, 1200, 10), b"/jail/bin\0");
+
+        // `os::chroot` leaving cwd outside root -> `os::getcwd` returns -ENOENT (-44).
+        write_bytes(1, 256, b"/etc");
+        let chroot_reply: serde_json::Value =
+            serde_json::from_str(&rt.syscall_module(1, "os", "chroot", &[256, 4])).unwrap();
+        assert_eq!(chroot_reply["errno"], 0);
+        let unreachable: serde_json::Value =
+            serde_json::from_str(&rt.syscall_module(1, "os", "getcwd", &[512, 64])).unwrap();
+        assert_eq!(unreachable["errno"], -i32::from(NOENT));
+    }
+
+    #[test]
+    fn resolve_at_accepts_all_slash_root_path_inside_and_outside_chroot() {
+        let mut rt = test_runtime();
+        let files = rt.files.clone();
+        let proc = rt.procs.get_mut(&1).expect("proc 1");
+        assert_eq!(
+            resolve_at(&files, proc, OS_FD_ROOT, "/"),
+            Ok(("/".to_string(), Node::Dir))
+        );
+        assert_eq!(proc_chroot(&files, proc, "/jail"), SUCCESS);
+        assert_eq!(
+            resolve_at(&files, proc, OS_FD_ROOT, "/"),
+            Ok(("/jail".to_string(), Node::Dir))
+        );
     }
 }
