@@ -116,7 +116,7 @@ HOST("unshare") extern int host_unshare(uint32_t);
 HOST("setns") extern int host_setns(int, uint32_t);
 
 int chdir(const char *path) {
-    if (!path) { errno = EINVAL; return -1; }
+    if (!path) { errno = EFAULT; return -1; }
     return posix_result(host_chdir(path, strlen(path)));
 }
 
@@ -159,7 +159,7 @@ char *getcwd(char *buf, size_t size) {
 }
 
 int chroot(const char *path) {
-    if (!path) { errno = EINVAL; return -1; }
+    if (!path) { errno = EFAULT; return -1; }
     return posix_result(host_chroot(path, strlen(path)));
 }
 
@@ -170,21 +170,24 @@ int mount(
     unsigned long mountflags,
     const void *data
 ) {
-    if (!target) { errno = EINVAL; return -1; }
-    const char *src = source ? source : "";
-    const char *fst = filesystemtype ? filesystemtype : "";
-    const char *dat = data ? (const char *)data : "";
+    if (!target) { errno = EFAULT; return -1; }
+    const char *src = source ? source : (const char *)(uintptr_t)0;
+    size_t src_len = source ? strlen(source) : 0;
+    const char *fst = filesystemtype ? filesystemtype : (const char *)(uintptr_t)0;
+    size_t fst_len = filesystemtype ? strlen(filesystemtype) : 0;
+    const char *dat = data ? (const char *)data : (const char *)(uintptr_t)0;
+    size_t dat_len = data ? strlen((const char *)data) : 0;
     return posix_result(host_mount(
-        src, strlen(src),
+        src, src_len,
         target, strlen(target),
-        fst, strlen(fst),
+        fst, fst_len,
         (uint64_t)mountflags,
-        dat, strlen(dat)
+        dat, dat_len
     ));
 }
 
 int umount2(const char *target, int flags) {
-    if (!target) { errno = EINVAL; return -1; }
+    if (!target) { errno = EFAULT; return -1; }
     return posix_result(host_umount2(target, strlen(target), (uint32_t)flags));
 }
 
@@ -193,13 +196,13 @@ int umount(const char *target) {
 }
 
 int statfs(const char *path, struct os_raw_statfs *buf) {
-    if (!path || !buf) { errno = EINVAL; return -1; }
+    if (!path || !buf) { errno = EFAULT; return -1; }
     return posix_result(host_statfs(path, strlen(path), buf));
 }
 
 int fstatfs(int fd, struct os_raw_statfs *buf) {
     if (fd < 0) { errno = EBADF; return -1; }
-    if (!buf) { errno = EINVAL; return -1; }
+    if (!buf) { errno = EFAULT; return -1; }
     return posix_result(host_fstatfs(fd, buf));
 }
 
@@ -219,7 +222,7 @@ static void fill_statvfs(struct statvfs *dst, const struct os_raw_statfs *src) {
 }
 
 int statvfs(const char *__restrict path, struct statvfs *__restrict buf) {
-    if (!path || !buf) { errno = EINVAL; return -1; }
+    if (!path || !buf) { errno = EFAULT; return -1; }
     struct os_raw_statfs raw;
     if (posix_result(host_statfs(path, strlen(path), &raw)) < 0) return -1;
     fill_statvfs(buf, &raw);
@@ -228,7 +231,7 @@ int statvfs(const char *__restrict path, struct statvfs *__restrict buf) {
 
 int fstatvfs(int fd, struct statvfs *buf) {
     if (fd < 0) { errno = EBADF; return -1; }
-    if (!buf) { errno = EINVAL; return -1; }
+    if (!buf) { errno = EFAULT; return -1; }
     struct os_raw_statfs raw;
     if (posix_result(host_fstatfs(fd, &raw)) < 0) return -1;
     fill_statvfs(buf, &raw);
@@ -259,10 +262,11 @@ int __wasilibc_find_abspath(
     const char **__restrict__ abs_prefix,
     const char **__restrict__ relative_path
 ) {
-    if (!path || path[0] == '\0') { errno = ENOENT; return -1; }
+    if (!path) { errno = EFAULT; return -1; }
+    if (path[0] == '\0') { errno = ENOENT; return -1; }
     const char *rel = path;
     while (*rel == '/') rel++;
-    if (*rel == '\0') rel = ".";
+    if (*rel == '\0') rel = "/";
     if (abs_prefix) *abs_prefix = "";
     if (relative_path) *relative_path = rel;
     return OS_FD_ROOT;
@@ -275,7 +279,7 @@ int __wasilibc_find_relpath_alloc(
     size_t *relative_path_len,
     int can_realloc
 ) {
-    if (!path || !relative_path || !relative_path_len) { errno = EINVAL; return -1; }
+    if (!path || !relative_path || !relative_path_len) { errno = EFAULT; return -1; }
     if (path[0] == '\0') { errno = ENOENT; return -1; }
     int dirfd;
     const char *rel;
@@ -283,7 +287,7 @@ int __wasilibc_find_relpath_alloc(
         dirfd = OS_FD_ROOT;
         rel = path;
         while (*rel == '/') rel++;
-        if (*rel == '\0') rel = ".";
+        if (*rel == '\0') rel = "/";
     } else {
         dirfd = OS_FD_CWD;
         rel = path;
