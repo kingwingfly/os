@@ -169,6 +169,16 @@ export async function mountRequest(type, args = {}) {
       batch: { calls: args.calls, sudo: !!args.sudo, umask: args.umask },
     })).results;
   }
+  if (type === 'mount_vfs_open_read') {
+    const sessionId = await resolveOptionalSessionId();
+    return globalThis.kernelRequest('vfs_open_read', { ...args, sessionId });
+  }
+  if (type === 'mount_vfs_read_chunk') {
+    return globalThis.kernelRequest('vfs_read_stream_chunk', args);
+  }
+  if (type === 'mount_vfs_close_read') {
+    return globalThis.kernelRequest('vfs_close_read_stream', args);
+  }
   if (type === 'mount_vfs_read_file') {
     const sessionId = await resolveOptionalSessionId();
     return globalThis.kernelRequest('vfs_read_file', { ...args, sessionId });
@@ -334,25 +344,20 @@ export async function mountRequest(type, args = {}) {
         workspace.exports.delete(id);
       }
     }
-    const sharedConn = workspace.sharedConnections.get(target);
-    if (sharedConn) {
-      try { sharedConn.close(); } catch {}
-      workspace.sharedConnections.delete(target);
-    }
-    const cleanup = workspace.cleanups.get(target);
-    if (cleanup) {
-      workspace.cleanups.delete(target);
-      try { cleanup(); } catch {}
-    }
+    // Leave active provider transports/cleanups to Rust `MountBacking`/`JsShareTransport` Drop so
+    // `MNT_DETACH` keeps already-open file descriptors working until their last `MountPin` drops.
+    workspace.sharedConnections.delete(target);
+    workspace.cleanups.delete(target);
     return null;
   }
 
   if (type === 'mount_write') {
-    if (!(args.bytes instanceof Uint8Array) || args.bytes.length > 256 * 1024) throw bad('E2BIG');
+    if (!(args.bytes instanceof Uint8Array) || args.bytes.length > 8 * 1024 * 1024) throw bad('E2BIG');
     const written = await globalThis.kernelRequest('vfs_pwrite_chunk', {
       sessionId: workspace.id,
       fd: args.fd,
       offset: args.offset ?? 0,
+      chunkIndex: args.chunkIndex,
       data: args.bytes,
     });
     return { written };

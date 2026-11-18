@@ -814,3 +814,99 @@ test('unshare(CLONE_NEWNS) and setns enforce privilege, reject forged/non-ns/sha
   await k.kfd_close(400, rootNsFd.kfd);
   assert.equal(await h.readText(400, '/tmp/ns-only/inside.txt'), 'ns401');
 });
+
+test('Contract 4 serviceGrant (system/isolated/session), streamed vfs_open_read, chunkIndex pwrite, and execTicket liveness', async t => {
+  const h = createHarness(t);
+  const { k } = h;
+
+  await h.beginSession('sess-svc', 1000, 1000, [1000]);
+  const opfsStore = await createOpfsStore(null, { writable: true, execute: true });
+  await k.mount_user('sess-svc', JSON.stringify({
+    kind: 'opfs',
+    name: 'proj',
+    writable: true,
+    execute: true,
+    cloud: false,
+  }), opfsStore);
+
+  // Root setup in session + supervisor process running in system_namespace while retaining session attribution
+  await h.spawn({ pid: 500, ppid: 1, sessionId: 'sess-svc', uid: 1000, gid: 1000, groups: [1000] });
+  await h.writeText(500, '/mnt/local/proj/hello.txt', 'from-session');
+  const appFd = await k.proc_openat(500, OS_FD_ROOT, '/mnt/local/proj/app.wasm', O_RDWR | O_CREAT | O_TRUNC, 0o755, false);
+  await k.kfd_write(500, appFd.kfd, new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02]));
+  await k.kfd_close(500, appFd.kfd);
+
+  // One-shot execTicket + non-consuming checkOnly
+  const resolved = await k.proc_resolve_exec(500, '/mnt/local/proj/app.wasm', JSON.stringify(['app.wasm']), '/usr/bin', false);
+  assert.ok(resolved.execTicket, 'expected execTicket');
+  assert.ok(k.take_local_exec_bytes(resolved.execTicket, true), 'checkOnly must report live without consuming ticket');
+  const took = k.take_local_exec_bytes(resolved.execTicket, false);
+  assert.equal(took.length, 10);
+  assert.equal(k.take_local_exec_bytes(resolved.execTicket, false), undefined);
+  assert.ok(k.take_local_exec_bytes(resolved.execTicket, true), 'live check works post-consume until unmount');
+
+  // Root cannot obtain a "session" serviceGrant -> EPERM
+  await h.spawn({ pid: 501, ppid: 1, uid: 0, gid: 0, groups: [0] });
+  await expectErrno(
+    () => k.proc_apply_service_grant(501, 1, JSON.stringify({ mountNamespace: 'session', bindMounts: [] })),
+    'EPERM',
+  );
+
+  // Forked child inheriting an open kfd switches to "session" + read-only bindMount and retains kfd
+  const openDir = await k.proc_openat(500, OS_FD_ROOT, '/mnt/local/proj', O_RDONLY | O_DIRECTORY, 0, false);
+  h.fork(500, 502, 0);
+  await k.proc_spawn_init(JSON.stringify({
+    pid: 503,
+    ppid: 1,
+    uid: 0,
+    gid: 0,
+    groups: [0],
+  }));
+  await k.proc_mkdirat(503, OS_FD_ROOT, '/tmp/svc-ro', 0o755);
+
+  await k.proc_apply_service_grant(502, 500, JSON.stringify({
+    mountNamespace: 'session',
+    bindMounts: [{ source: '/mnt/local/proj', target: '/tmp/svc-ro', readOnly: true }],
+  }));
+  assert.equal(await h.readText(502, '/tmp/svc-ro/hello.txt'), 'from-session');
+  await expectErrno(
+    () => k.proc_openat(502, OS_FD_ROOT, '/tmp/svc-ro/hello.txt', O_WRONLY, 0, false),
+    'EROFS',
+  );
+  // Inherited kfd survived namespace switch
+  const fstatKeep = await k.kfd_fstat(502, openDir.kfd);
+  assert.equal(fstatKeep.mode & 0o170000, 0o040000);
+  await k.kfd_close(500, openDir.kfd);
+  await k.kfd_close(502, openDir.kfd);
+
+  // "system" serviceGrant hides user mounts
+  h.fork(500, 504, 0);
+  await k.proc_apply_service_grant(504, 500, JSON.stringify({ mountNamespace: 'system', bindMounts: [] }));
+  await expectErrno(() => k.proc_statat(504, OS_FD_ROOT, '/mnt/local/proj/hello.txt', true), 'ENOENT');
+
+  // Streamed vfs_open_read (> 256 KiB inline cutoff) + vfs_pwrite_chunk with chunkIndex
+  const bigSize = 300 * 1024;
+  const openBatch = JSON.parse(await k.vfs_sys('sess-svc', JSON.stringify({
+    calls: [{ open: { path: '/mnt/local/proj/big.bin', flags: O_RDWR | O_CREAT | O_TRUNC, mode: 0o644 } }],
+    sudo: false,
+    umask: 0o022,
+  })));
+  const pageFd = openBatch.results[0].ok.fd;
+  const chunk = new Uint8Array(bigSize);
+  for (let i = 0; i < bigSize; i++) chunk[i] = i & 0xff;
+  await k.vfs_pwrite_chunk('sess-svc', pageFd, 0n, chunk, 0n);
+  await k.vfs_sys('sess-svc', JSON.stringify({ calls: [{ close: { fd: pageFd } }], sudo: false, umask: 0o022 }));
+
+  const openedStream = await k.vfs_open_read('sess-svc', '/mnt/local/proj/big.bin', undefined, undefined, false, false);
+  assert.ok(openedStream.streamId > 0);
+  assert.equal(openedStream.totalSize, bigSize);
+  const parts = [];
+  for (;;) {
+    const part = await k.vfs_read_stream_chunk(openedStream.streamId, 65536);
+    if (!part.length) break;
+    parts.push(...part);
+  }
+  await k.vfs_close_read_stream(openedStream.streamId);
+  assert.equal(parts.length, bigSize);
+  assert.equal(parts[299999], 299999 & 0xff);
+});

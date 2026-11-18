@@ -75,11 +75,20 @@ self.kernelSys = async (body, signal) => {
 };
 
 // Cookie-authenticated authority batch transport for page VFS calls (NEVER X-Registry).
-self.pageSysPost = async body => {
+self.pageSysPost = async (body, extraHeaders = {}) => {
   const response = await fetch('/api/sys', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...(extraHeaders ?? {}) },
     body,
+  });
+  return JSON.stringify({ status: response.status, text: await response.text() });
+};
+
+self.pagePwrite = async (fd, index, bytes, extraHeaders = {}) => {
+  const response = await fetch(`/api/pwrite?fd=${Number(fd)}&index=${Number(index)}`, {
+    method: 'PUT',
+    headers: extraHeaders ?? {},
+    body: bytes,
   });
   return JSON.stringify({ status: response.status, text: await response.text() });
 };
@@ -87,17 +96,18 @@ self.pageSysPost = async body => {
 self.pageFileRead = async (path, offset, len) => {
   const start = Number(offset);
   const count = Number(len);
-  if (count <= 0) return new Uint8Array(0);
+  if (count <= 0) return { status: 200, body: new Uint8Array(0), etag: '' };
   const end = start + count - 1;
   const response = await fetch('/api/file?path=' + encodeURIComponent(path), {
     headers: { Range: `bytes=${start}-${end}` },
   });
-  if (response.status === 416) return new Uint8Array(0);
-  if (response.status === 404) throw { errno: 'ENOENT' };
-  if (response.status === 401 || response.status === 403) throw { errno: 'EACCES' };
-  if (!response.ok && response.status !== 206) throw { errno: 'EIO' };
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  return response.status === 200 ? bytes.subarray(start, start + count) : bytes;
+  const etag = response.headers.get('ETag') ?? '';
+  if (response.status === 416) return { status: 416, body: new Uint8Array(0), etag };
+  const raw = response.status === 200 || response.status === 206
+    ? new Uint8Array(await response.arrayBuffer())
+    : new Uint8Array(0);
+  const body = response.status === 200 ? raw.subarray(start, start + count) : raw;
+  return { status: response.status, body, etag };
 };
 
 self.imageBlobRead = async (blobId, offset, len) => {
@@ -158,8 +168,12 @@ function boot() {
         broadcast({ v: VERSION, type: 'event', event: 'login', value: { ...value, services: login.startup.current(value) } });
       },
       execute: async (run, onOutput) => {
-        const { exec } = await import(asset('/executor-host.js'));
-        return exec([['supervise', run.file]], { stdin: '', streamOutput: true,
+        const executor = await import(asset('/executor-host.js'));
+        const workspace = await executor.currentWorkspace().catch(() => null);
+        return executor.exec([['supervise', run.file]], { stdin: '', streamOutput: true,
+          sessionId: run.session,
+          serviceGrant: { mountNamespace: 'system', bindMounts: [] },
+          ...(workspace?.id === run.session ? { workspace } : {}),
           cancelled: () => run.cancelled, onOutput,
           onJob: job => { run.job = job; },
           beforeStart: async pid => {
@@ -254,6 +268,7 @@ async function execs(args, seat, host) {
     runtime: stage.runtime,
     parentPid: stage.parentPid,
     sessionId: stage.sessionId,
+    serviceGrant: stage.serviceGrant,
     argv: stage.argv ?? [],
     env: stage.env ?? [],
     cwd: stage.cwd ?? '/',
@@ -295,7 +310,6 @@ async function dispatch(message, host, tab) {
     case 'init': return boot();
     case 'version': return kernel.version();
     case 'namespace': return kernel.namespace();
-    case 'private_extension': return JSON.parse(wasm_bindgen.private_extension(JSON.stringify(args.manifests)));
     case 'workspace_credentials': {
       const response = await fetch('/api/sys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ calls: ['getcreds'] }) });
       if (!response.ok) throw { errno: 'EACCES' };
@@ -370,6 +384,16 @@ async function dispatch(message, host, tab) {
     case 'export_provider': return kernel.export_provider(args.sessionId, args.path);
     case 'list_mounts': return await kernel.list_mounts(args.sessionId ?? '');
     case 'vfs_sys': return JSON.parse(await kernel.vfs_sys(args.sessionId ?? '', typeof args.batch === 'string' ? args.batch : JSON.stringify(args.batch)));
+    case 'vfs_open_read': return await kernel.vfs_open_read(
+      args.sessionId ?? '',
+      args.path,
+      args.rangeStart != null ? BigInt(args.rangeStart) : undefined,
+      args.rangeEnd != null ? BigInt(args.rangeEnd) : undefined,
+      !!args.headOnly,
+      !!args.sudo,
+    );
+    case 'vfs_read_stream_chunk': return await kernel.vfs_read_stream_chunk(args.streamId, args.maxBytes ?? undefined);
+    case 'vfs_close_read_stream': await kernel.vfs_close_read_stream(args.streamId); return null;
     case 'vfs_read_file': {
       const sid = args.sessionId ?? '';
       const first = await kernel.vfs_read_file(sid, args.path, 0n, args.headOnly ? 0 : (args.rangeStart != null ? 0 : 4 * 1024 * 1024));
@@ -408,10 +432,17 @@ async function dispatch(message, host, tab) {
       return { status: 200, totalSize, bytes: pos === totalSize ? out : out.subarray(0, pos) };
     }
     case 'vfs_pwrite_chunk': {
-      const r = await kernel.vfs_pwrite_chunk(args.sessionId ?? '', args.fd, BigInt(args.offset ?? 0), args.data instanceof Uint8Array ? args.data : new Uint8Array(args.data));
+      const r = await kernel.vfs_pwrite_chunk(
+        args.sessionId ?? '',
+        args.fd,
+        BigInt(args.offset ?? 0),
+        args.data instanceof Uint8Array ? args.data : new Uint8Array(args.data),
+        args.chunkIndex != null ? BigInt(args.chunkIndex) : undefined,
+      );
       return typeof r === 'number' ? r : (r?.written ?? 0);
     }
     case 'proc_spawn_init': return await kernel.proc_spawn_init(typeof args.opts === 'string' ? args.opts : JSON.stringify(args.opts));
+    case 'proc_apply_service_grant': return await kernel.proc_apply_service_grant(args.pid, args.parentPid, typeof args.grant === 'string' ? args.grant : JSON.stringify(args.grant));
     case 'proc_fork': return kernel.proc_fork(args.parentPid, args.childPid, args.cloneFlags ?? 0);
     case 'proc_exec_preserve': await kernel.proc_exec_preserve(args.pid); return null;
     case 'proc_set_creds': kernel.proc_set_creds(args.pid, args.uid, args.gid, new Uint32Array(args.groups ?? []), args.token ?? undefined, args.cloudAccess !== false); return null;
@@ -463,7 +494,7 @@ async function dispatch(message, host, tab) {
     case 'pty_close': return kernel.pty_close(args.index);
     case 'proc_resolve_exec': return await kernel.proc_resolve_exec(args.pid, args.file, typeof args.argv === 'string' ? args.argv : JSON.stringify(args.argv ?? []), args.pathEnv ?? undefined, !!args.searchPath);
     case 'session_resolve_exec': return await kernel.session_resolve_exec(args.sessionId ?? '', args.file, typeof args.argv === 'string' ? args.argv : JSON.stringify(args.argv ?? []), args.cwd ?? '/', args.pathEnv ?? undefined, !!args.searchPath, !!args.sudo);
-    case 'take_local_exec_bytes': return kernel.take_local_exec_bytes(args.digest);
+    case 'take_local_exec_bytes': return kernel.take_local_exec_bytes(args.ticket ?? args.digest, args.checkOnly);
     default: throw { errno: 'ENOSYS', detail: `no client-kernel call ${type}` };
   }
 }

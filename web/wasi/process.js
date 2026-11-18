@@ -136,16 +136,69 @@ function reportTty() {
   if (value !== lastTtyFds) { lastTtyFds = value; postMessage({ ttyFds: numbers }); }
 }
 const controllingTerminal = () => !!process.pty && Atomics.load(membership, 2) === process.pty.number;
-const localDescriptor = (path, fromRoot = false) => {
-  const norm = fromRoot && !path.startsWith('/') ? '/' + path.replace(/^\.\//, '') : path;
-  const match = new RegExp(`^/(?:proc/(?:self|${process.pid})/fd|dev/fd)/([0-9]+)$`).exec(norm);
-  return match && fds.get(Number(match[1]));
-};
-const localLink = (path, fromRoot = false) => {
-  const found = localDescriptor(path, fromRoot);
-  return found?.kind === 'pty' ? (found.master ? '/dev/ptmx' : `/dev/pts/${found.number}`) : null;
-};
+function normalizeAbs(path) {
+  const parts = [];
+  for (const seg of path.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') parts.pop();
+    else parts.push(seg);
+  }
+  return '/' + parts.join('/');
+}
 const localNamespaceMount = path => /^\/?(?:\.\/)?dev\//.test(path) ? '/dev/fd' : '/proc/self';
+const procFdCandidate = path => typeof path === 'string' && /(?:^|\/)(?:proc\/(?:self|[0-9]+)\/fd|dev\/fd)\/[0-9]+$/.test(path);
+function hasProcFsMount(path) {
+  try {
+    const sfs = vfsCall('statfs', { dirfd: OS_FD_ROOT, path: localNamespaceMount(path) });
+    return sfs?.f_type === 0x9fa0;
+  } catch {
+    return false;
+  }
+}
+function resolveProcFd(anchor, rawPath) {
+  if (typeof rawPath !== 'string' || !rawPath) return null;
+  let norm = null;
+  if (rawPath.startsWith('/')) {
+    norm = normalizeAbs(rawPath);
+  } else if (anchor === OS_FD_ROOT) {
+    norm = normalizeAbs('/' + rawPath);
+  } else if (anchor === OS_FD_CWD && (/(?:^|\/)(?:proc|dev|fd)\//.test(rawPath) || /^[0-9]+$/.test(rawPath))) {
+    try {
+      norm = normalizeAbs(vfsCall('getcwd', {}).cwd + '/' + rawPath);
+    } catch {
+      return null;
+    }
+  } else if (anchor >= 0 && /^[0-9]+$/.test(rawPath)) {
+    try {
+      const dirPath = vfsCall('readlinkat', { dirfd: OS_FD_ROOT, path: `/proc/self/fd/${anchor}` }).target;
+      norm = normalizeAbs(dirPath + '/' + rawPath);
+    } catch {
+      return null;
+    }
+  }
+  if (!norm) return null;
+  const match = /^\/(?:proc\/(self|[0-9]+)\/fd|dev\/fd)\/([0-9]+)$/.exec(norm);
+  if (!match) return null;
+  if (match[1] && match[1] !== 'self' && Number(match[1]) !== process.pid) return null;
+  if (!hasProcFsMount(norm)) return null;
+  const guestFd = Number(match[2]);
+  return { guestFd, found: fds.get(guestFd) ?? null, procPath: norm };
+}
+function linkTextFor(found) {
+  if (!found) return '';
+  if (found.kind === 'pty') return found.master ? '/dev/ptmx' : `/dev/pts/${found.number}`;
+  if (found.kind === 'tty') return process.pty ? `/dev/pts/${process.pty.number}` : '/dev/tty';
+  if (found.preopen && found.kfd == null) return '/';
+  if (found.kind === 'kfd' && found.kfd != null) {
+    return vfsCall('readlinkat', { dirfd: OS_FD_ROOT, path: `/proc/self/fd/${found.kfd}` }).target;
+  }
+  if (found.serverDev) {
+    const d = found.device ?? 'null';
+    return (d.startsWith('present:') || d.startsWith('snd:')) ? `/dev/${d.replace(':', '/')}` : `/dev/${d}`;
+  }
+  if (found.tty && process.pty) return `/dev/pts/${process.pty.number}`;
+  return 'pipe:[0]';
+}
 
 const ptyCall = (found, op, args = {}) => hostErrno(host('pty', { handle: found.handle, op, ...args }));
 const ttyCall = (found, request, arg) => {
@@ -383,13 +436,14 @@ function* syncFd(fd, dataOnly) {
   throw new Errno(EINVAL);
 }
 
-function* fstat(found) {
+function statOf(found) {
   if (found.kind === 'kfd') return vfsCall('fstat', { kfd: found.kfd });
   if (found.preopen) return vfsCall('statat', { dirfd: OS_FD_ROOT, path: '/', follow: true });
   if (found.kind === 'pty') return { ino: found.number, filetype: CHARACTER_DEVICE, mode: 0o020600 };
   if (STDIO.has(found.kind)) return { filetype: filetype(found), mode: found.tty ? 0o020620 : 0o010600 };
   return found.stat ?? { filetype: REGULAR_FILE, mode: 0o100644, size: found.size ?? 0 };
 }
+function* fstat(found) { return statOf(found); }
 
 function readTerminal(pipe, count) {
   if (ttyControl.hungup) return new Uint8Array(0);
@@ -554,6 +608,10 @@ function brokenPipe(written = 0) {
 }
 
 function* closeFd(found) {
+  if (found.kind === 'file' && found.serverDev && found.kfd !== undefined) {
+    vfsCall('sys', { batch: { calls: [{ close: { fd: found.kfd } }], umask: process.umask } });
+    return;
+  }
   if (found.kind === 'file' && found.kfd !== undefined) {
     closing.push(found.kfd);
   }
@@ -687,34 +745,51 @@ function openPathAt(dirfd, rawPath, dirflags, oflags, base, fdflags, noctty = fa
   const read = !pathOnly && ((base & RIGHT_READ) !== 0n || !write);
   const append = !pathOnly && (fdflags & FDFLAG_APPEND) !== 0;
   const cloexecFlag = (extraFlags & O_CLOEXEC) !== 0;
-  const anchor = resolveAnchorForPath(dirfd, rawPath);
+  let anchor = resolveAnchorForPath(dirfd, rawPath);
 
-  // Reopening an existing stdio pipe or terminal via `/proc/self/fd/<N>` or `/dev/fd/<N>`
-  // checks first that `/proc/self` (or `/dev/fd`) is actually mounted in this root/namespace.
-  let original = anchor === OS_FD_ROOT ? localDescriptor(rawPath, true) : null;
-  if (original && ['out', 'pipe-in', 'pipe-out', 'tty', 'pty'].includes(original.kind)) {
-    vfsCall('statat', {
-      dirfd: OS_FD_ROOT,
-      path: localNamespaceMount(rawPath),
-      follow: true,
-    });
+  // Reopening a descriptor via `/proc/self/fd/<N>`, `/proc/<pid>/fd/<N>`, or `/dev/fd/<N>`
+  // verifies first that genuine `ProcFs` (`0x9fa0`) is mounted in this root/namespace.
+  const procEntry = resolveProcFd(anchor, rawPath);
+  if (procEntry) {
+    if (!procEntry.found) throw new Errno(ENOENT);
+    if (!(dirflags & FOLLOW) && !pathOnly) throw new Errno(ERRNO.ELOOP);
+    const original = procEntry.found;
     if (original.kind === 'pty') {
       if (original.master) throw new Errno(ERRNO.EACCES);
       rawPath = `/dev/pts/${original.number}`;
-      original = null;
-    } else {
+      anchor = OS_FD_ROOT;
+    } else if (['out', 'pipe-in', 'pipe-out', 'tty'].includes(original.kind)) {
       if (oflags & OFLAG_DIRECTORY) throw new Errno(ENOTDIR);
       if ((oflags & OFLAG_CREAT) && (oflags & OFLAG_EXCL)) throw new Errno(ERRNO.EEXIST);
       if (fdflags & ~FDFLAG_NONBLOCK) throw new Errno(ERRNO.EOPNOTSUPP);
       const readable = original.kind === 'pipe-in' || (original.kind === 'tty' && original.readable !== false);
       const writable = ['out', 'pipe-out'].includes(original.kind) || (original.kind === 'tty' && original.writable !== false);
       if ((read && !readable) || (write && !writable)) throw new Errno(ERRNO.EACCES);
-      const found = { ...original, refs: 0, flags: descriptorFlags(), readable: read, writable: write };
+      const found = { ...original, refs: 0, flags: descriptorFlags(), readable: read, writable: write, ...(pathOnly ? { pathOnly: true } : {}) };
       const number = lowest();
       install(number, found, false);
       if (found.flags) Atomics.store(new Int32Array(found.flags), 0, fdflags & FDFLAG_NONBLOCK);
       if (cloexecFlag) cloexec.add(number);
       return number;
+    } else if (original.kind === 'in') {
+      if (oflags & OFLAG_DIRECTORY) throw new Errno(ENOTDIR);
+      if ((oflags & OFLAG_CREAT) && (oflags & OFLAG_EXCL)) throw new Errno(ERRNO.EEXIST);
+      if (!pathOnly && write) throw new Errno(ERRNO.EACCES);
+      const found = { ...original, refs: 0, flags: descriptorFlags(), ...(pathOnly ? { pathOnly: true } : {}) };
+      const number = lowest();
+      install(number, found, false);
+      if (found.flags) Atomics.store(new Int32Array(found.flags), 0, fdflags & FDFLAG_NONBLOCK);
+      if (cloexecFlag) cloexec.add(number);
+      return number;
+    } else if (original.preopen && original.kfd == null) {
+      rawPath = '/';
+      anchor = OS_FD_ROOT;
+    } else if (original.kind === 'kfd' && original.kfd != null) {
+      rawPath = `/proc/self/fd/${original.kfd}`;
+      anchor = OS_FD_ROOT;
+    } else if (original.serverDev) {
+      rawPath = linkTextFor(original);
+      anchor = OS_FD_ROOT;
     }
   }
 
@@ -778,14 +853,8 @@ function openPathAt(dirfd, rawPath, dirflags, oflags, base, fdflags, noctty = fa
     } else {
       throw new Errno(ENOENT);
     }
-  } else if (!pathOnly && typeof dev === 'string' && (dev.startsWith('present') || dev.startsWith('snd') || ['archive', 'media', 'system'].includes(dev))) {
-    vfsCall('close', { kfd: opened.kfd });
-    const devPath = (dev.startsWith('present:') || dev.startsWith('snd:'))
-      ? `/dev/${dev.replace(':', '/')}`
-      : `/dev/${dev}`;
-    const res = vfsCall('sys', { batch: { calls: [{ open: { path: devPath, flags: linuxFlags, mode } }], umask: process.umask } }).results[0];
-    const srvOpen = ok(res);
-    found = { kind: 'file', serverDev: true, kfd: srvOpen.fd, device: dev, read, writable: write, pos: 0, size: 0, stat: opened.stat };
+  } else if (opened.serverDev) {
+    found = { kind: 'file', serverDev: true, kfd: opened.fd, device: dev, read, writable: write, pos: 0, size: 0, stat: opened.stat };
   } else {
     found = {
       kind: 'kfd',
@@ -799,6 +868,7 @@ function openPathAt(dirfd, rawPath, dirflags, oflags, base, fdflags, noctty = fa
       pathOnly,
       stat: opened.stat,
     };
+    if (fdflags & FDFLAG_NONBLOCK) found.flags = descriptorFlags();
   }
 
   const number = lowest();
@@ -851,6 +921,8 @@ const wasi = {
       if (flags & ~(FDFLAG_APPEND | FDFLAG_NONBLOCK)) throw new Errno(ERRNO.EOPNOTSUPP);
       vfsCall('set_append', { kfd: found.kfd, append: !!(flags & FDFLAG_APPEND) });
       found.append = !!(flags & FDFLAG_APPEND);
+      found.flags ??= descriptorFlags();
+      Atomics.store(new Int32Array(found.flags), 0, flags & FDFLAG_NONBLOCK);
       return;
     }
     if (found.kind === 'pty') {
@@ -1109,7 +1181,18 @@ const wasi = {
   }),
   path_filestat_get: (fd, flags, ptr, len, out) => attempt(function* () {
     const raw = string(ptr, len);
-    const st = vfsCall('statat', { dirfd: resolveAnchorForPath(fd, raw), path: raw, follow: (flags & FOLLOW) !== 0 });
+    const anchor = resolveAnchorForPath(fd, raw);
+    const procEntry = resolveProcFd(anchor, raw);
+    if (procEntry) {
+      if (!procEntry.found) throw new Errno(ENOENT);
+      if ((flags & FOLLOW) !== 0) return writeFilestat(out, statOf(procEntry.found));
+      if (procEntry.found.kind === 'kfd' && procEntry.found.kfd != null) {
+        return writeFilestat(out, vfsCall('statat', { dirfd: OS_FD_ROOT, path: `/proc/self/fd/${procEntry.found.kfd}`, follow: false }));
+      }
+      const targetStr = linkTextFor(procEntry.found);
+      return writeFilestat(out, { dev: 0, ino: procEntry.guestFd, filetype: SYMBOLIC_LINK, mode: 0o120700, nlink: 1, size: targetStr.length });
+    }
+    const st = vfsCall('statat', { dirfd: anchor, path: raw, follow: (flags & FOLLOW) !== 0 });
     return writeFilestat(out, st);
   }),
   path_filestat_set_times: (fd, flags, ptr, len, atim, mtim, fst) => attempt(function* () {
@@ -1140,11 +1223,14 @@ const wasi = {
   path_readlink: (fd, ptr, len, buf, bufLen, used) => attempt(function* () {
     const raw = string(ptr, len);
     const anchor = resolveAnchorForPath(fd, raw);
-    const ptyTarget = anchor === OS_FD_ROOT ? localLink(raw, true) : null;
-    if (ptyTarget) {
-      vfsCall('statat', { dirfd: OS_FD_ROOT, path: localNamespaceMount(raw), follow: true });
+    const procEntry = resolveProcFd(anchor, raw);
+    let targetStr;
+    if (procEntry) {
+      if (!procEntry.found) throw new Errno(ENOENT);
+      targetStr = linkTextFor(procEntry.found);
+    } else {
+      targetStr = vfsCall('readlinkat', { dirfd: anchor, path: raw }).target;
     }
-    const targetStr = ptyTarget ?? vfsCall('readlinkat', { dirfd: anchor, path: raw }).target;
     const target = encoder.encode(targetStr);
     const part = target.subarray(0, bufLen);
     bytes().set(part, buf);
@@ -1524,6 +1610,10 @@ function forkState({ exec = false, stdin = 'inherit', tty = null, dup2 = [] } = 
   const ids = new Map(), descriptions = [], table = [];
   const inherited = new Map(fds), closes = new Set(cloexec);
   const inputAction = dup2.some(([, to]) => to === 0);
+  const parentKfds = new Set();
+  for (const found of fds.values()) {
+    if (found?.kind === 'kfd' && found.kfd != null) parentKfds.add(found.kfd);
+  }
   const keepOpenKfds = new Set();
   for (const [from, to] of dup2) {
     if (!inherited.has(from)) throw new Errno(EBADF);
@@ -1548,7 +1638,8 @@ function forkState({ exec = false, stdin = 'inherit', tty = null, dup2 = [] } = 
     descriptions.push(stdin === 'tty' ? { ...describe(tty ?? terminalFd(1)), refs: 1 }
       : { kind: 'in', tty: false, data: new Uint8Array(0), refs: 1 });
   }
-  return { signals: signals.snapshot(), fds: table, descriptions, keepOpenKfds: [...keepOpenKfds] };
+  const closeKfds = exec ? [...parentKfds].filter(k => !keepOpenKfds.has(k)) : [];
+  return { signals: signals.snapshot(), fds: table, descriptions, keepOpenKfds: [...keepOpenKfds], closeKfds };
 }
 
 function describe(found) {
@@ -1562,8 +1653,8 @@ function describe(found) {
     case 'out': return { kind: 'out', fd: found.fd, tty: found.tty, flags: found.flags, closed: found.closed?.buffer ?? null };
     case 'tty': case 'pipe-in': case 'pipe-out': return { fd: found.fd, kind: found.kind, tty: !!found.tty, flags: found.flags, readable: found.readable, writable: found.writable, buffer: found.pipe.buffer, refs: found.refs };
     case 'kfd': {
-      const { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, stat, share: slot } = found;
-      return { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, stat, ...(slot != null ? { share: slot } : {}), refs: found.refs };
+      const { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, flags, stat, share: slot } = found;
+      return { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, ...(flags ? { flags } : {}), stat, ...(slot != null ? { share: slot } : {}), refs: found.refs };
     }
     default: {
       if (shares && found.share == null) share(found);
@@ -1766,8 +1857,8 @@ async function replace() {
   process.proc = image.token;
   for (const fd of [...cloexec]) {
     const found = fds.get(fd);
-    if (found?.kind === 'kfd') {
-      // `reexec` already closed `FD_CLOEXEC` kfds in `client-kernel`; drop JS table entry & share ref.
+    if (found?.kind === 'kfd' || found?.serverDev) {
+      // `reexec` already closed `FD_CLOEXEC` kfds and serverDev fds in `client-kernel`; drop JS table entry & share ref.
       fds.delete(fd);
       cloexec.delete(fd);
       found.refs--;
@@ -1810,12 +1901,12 @@ function sleepUntil(until) {
 // ---- `os.sys` Batch & `(module "os")` Syscall Imports ----
 
 const ttyRequests = new Set(Object.values(IOCTL));
-const rawNumber = fd => -fd - 1;
+const rawFds = new Map();
 
 function forgetRaw(fd) {
-  const number = rawNumber(fd), found = fds.get(number);
+  const found = rawFds.get(fd);
   if (!found) return 0;
-  fds.delete(number);
+  rawFds.delete(fd);
   if (found.share == null) return 0;
   const gen = shares.gen(found.share), left = shares.drop(found.share, process.pid);
   if (!left) postMessage({ closed: { slot: found.share, gen } });
@@ -1828,9 +1919,9 @@ function trackRaw(calls, results, reserved = null) {
     const openedReq = one?.open ?? one?.open_at;
     if (openedReq && Number.isInteger(result?.ok?.fd)) {
       const fd = result.ok.fd;
-      const found = { kind: 'file', kfd: fd, pos: 0, read: false };
+      const found = { kind: 'file', kfd: fd, pos: 0, read: false, refs: 1 };
       if (reserved != null) shares.attach(found, reserved);
-      install(rawNumber(fd), found, reserved != null);
+      rawFds.set(fd, found);
       if (reserved != null) postMessage({ described: { slot: reserved, gen: shares.gen(reserved), description: describe(found) } });
     } else if (openedReq && reserved != null) {
       shares.drop(reserved, process.pid);
@@ -1849,7 +1940,7 @@ function translateGuestFd(rawFd) {
   const u = rawFd >>> 0;
   if (u === OS_FD_ROOT || u === OS_FD_CWD) return u;
   if ((rawFd | 0) === -100) return OS_FD_CWD;
-  if (fds.has(rawNumber(rawFd))) return rawFd;
+  if (rawFds.has(rawFd)) return rawFd;
   const found = fds.get(rawFd);
   if (!found) return rawFd;
   if (found.preopen && found.kfd == null) return OS_FD_ROOT;
@@ -1905,7 +1996,7 @@ const processCalls = call =>
 function isPtyIoctl(call) {
   if (!call?.ioctl) return false;
   if (ttyRequests.has(call.ioctl.request)) return true;
-  return Number.isInteger(call.ioctl.fd) && fds.get(call.ioctl.fd)?.kind === 'pty' && !fds.has(rawNumber(call.ioctl.fd));
+  return Number.isInteger(call.ioctl.fd) && fds.get(call.ioctl.fd)?.kind === 'pty' && !rawFds.has(call.ioctl.fd);
 }
 
 function osBatch(calls) {
@@ -1914,10 +2005,12 @@ function osBatch(calls) {
   }
   const split = calls.some(c =>
     processCalls(c) ||
-    (c?.readlink && localLink(c.readlink.path)) ||
+    procFdCandidate(c?.readlink?.path) ||
+    procFdCandidate(c?.stat?.path) ||
+    procFdCandidate(c?.lstat?.path) ||
     c?.open || c?.open_at ||
     isPtyIoctl(c) ||
-    (Number.isInteger(c?.close?.fd) && fds.has(rawNumber(c.close.fd)))
+    (Number.isInteger(c?.close?.fd) && rawFds.has(c.close.fd))
   );
   if (!split) {
     const translated = calls.map(translateCallFds);
@@ -1937,44 +2030,63 @@ function osBatch(calls) {
       args[key] = fd;
     }
     if (args?.invalidReference) { results.push({ err: args.invalidReference }); continue; }
-    if (call?.readlink && localLink(call.readlink.path)) {
-      try {
-        vfsCall('statat', { dirfd: OS_FD_ROOT, path: localNamespaceMount(call.readlink.path), follow: true });
-        results.push({ ok: localLink(call.readlink.path) });
-      } catch (err) {
-        const errno = err instanceof Errno ? Object.keys(ERRNO).find(k => ERRNO[k] === err.errno) ?? 'ENOENT' : 'ENOENT';
+    const procRL = call?.readlink?.path ? resolveProcFd(OS_FD_ROOT, call.readlink.path) : null;
+    const procSt = call?.stat?.path ? resolveProcFd(OS_FD_ROOT, call.stat.path) : null;
+    const procLst = call?.lstat?.path ? resolveProcFd(OS_FD_ROOT, call.lstat.path) : null;
+    if (procRL) {
+      if (!procRL.found) { results.push({ err: { errno: 'ENOENT' } }); continue; }
+      try { results.push({ ok: linkTextFor(procRL.found) }); }
+      catch (err) {
+        const errno = err instanceof Errno ? Object.keys(ERRNO).find(k => ERRNO[k] === err.errno) ?? 'EIO' : 'EIO';
         results.push({ err: { errno } });
       }
+    } else if (procSt) {
+      if (!procSt.found) { results.push({ err: { errno: 'ENOENT' } }); continue; }
+      try { results.push({ ok: statOf(procSt.found) }); }
+      catch (err) {
+        const errno = err instanceof Errno ? Object.keys(ERRNO).find(k => ERRNO[k] === err.errno) ?? 'EIO' : 'EIO';
+        results.push({ err: { errno } });
+      }
+    } else if (procLst && procLst.found == null) {
+      results.push({ err: { errno: 'ENOENT' } });
+    } else if (procLst && procLst.found.kind !== 'kfd') {
+      const targetStr = linkTextFor(procLst.found);
+      results.push({ ok: { dev: 0, ino: procLst.guestFd, mode: 0o120700, nlink: 1, uid: identity.uid, gid: identity.gid, size: targetStr.length } });
     } else if (processCalls(call)) {
       const result = host('process_call', call);
       results.push(result?.errno ? { err: { errno: result.errno } } : { ok: result });
-    } else if (call?.close && Number.isInteger(call.close.fd) && fds.has(rawNumber(call.close.fd))) {
+    } else if (call?.close && Number.isInteger(call.close.fd) && rawFds.has(call.close.fd)) {
       const remaining = forgetRaw(call.close.fd);
       if (remaining) results.push({ ok: null });
       else results.push(...vfsCall('sys', { batch: { calls: [call], umask: process.umask } }).results);
-    } else if (isPtyIoctl(call)) {
-      try {
-        const { fd, request: reqCode, arg } = call.ioctl;
-        const found = descriptor(fd);
-        if (!found.tty || (found.kind !== 'pty' && !ttyState)) throw new Errno(ERRNO.ENOTTY);
-        if ([IOCTL.TIOCSPGRP, IOCTL.TCSETS, IOCTL.TCSETSW, IOCTL.TCSETSF].includes(reqCode)) ttyAccess(22, found);
-        flush();
-        results.push({ ok: ttyCall(found, reqCode, arg) });
-      } catch (err) {
-        const errno = err instanceof Errno ? Object.keys(ERRNO).find(key => ERRNO[key] === err.errno) ?? 'EIO' : 'EIO';
-        results.push({ err: { errno } });
-      }
     } else {
-      const isOpen = !!(call?.open || call?.open_at);
-      const reserved = isOpen && shares ? shares.claim(process.pid, 1, 0) : null;
-      if (reserved != null && reserved < 0) { results.push({ err: { errno: 'EMFILE' } }); continue; }
-      try {
-        const translated = translateCallFds(call);
-        const single = vfsCall('sys', { batch: { calls: [translated], umask: process.umask } }).results;
-        results.push(...trackRaw([call], single, reserved));
-      } catch (error) {
-        if (reserved != null) shares.drop(reserved, process.pid);
-        throw error;
+      if (procLst?.found?.kind === 'kfd' && procLst.found.kfd != null) {
+        call.lstat.path = `/proc/self/fd/${procLst.found.kfd}`;
+      }
+      if (isPtyIoctl(call)) {
+        try {
+          const { fd, request: reqCode, arg } = call.ioctl;
+          const found = descriptor(fd);
+          if (!found.tty || (found.kind !== 'pty' && !ttyState)) throw new Errno(ERRNO.ENOTTY);
+          if ([IOCTL.TIOCSPGRP, IOCTL.TCSETS, IOCTL.TCSETSW, IOCTL.TCSETSF].includes(reqCode)) ttyAccess(22, found);
+          flush();
+          results.push({ ok: ttyCall(found, reqCode, arg) });
+        } catch (err) {
+          const errno = err instanceof Errno ? Object.keys(ERRNO).find(key => ERRNO[key] === err.errno) ?? 'EIO' : 'EIO';
+          results.push({ err: { errno } });
+        }
+      } else {
+        const isOpen = !!(call?.open || call?.open_at);
+        const reserved = isOpen && shares ? shares.claim(process.pid, 1, 0) : null;
+        if (reserved != null && reserved < 0) { results.push({ err: { errno: 'EMFILE' } }); continue; }
+        try {
+          const translated = translateCallFds(call);
+          const single = vfsCall('sys', { batch: { calls: [translated], umask: process.umask } }).results;
+          results.push(...trackRaw([call], single, reserved));
+        } catch (error) {
+          if (reserved != null) shares.drop(reserved, process.pid);
+          throw error;
+        }
       }
     }
   }
@@ -2091,6 +2203,14 @@ const osApi = {
       writeRawStatFs(outPtr, { f_type: 0x00001cd1, bsize: 4096, frsize: 4096, namelen: 255, flags: 6 });
       return 0;
     }
+    if (found.kind === 'pipe-in' || found.kind === 'pipe-out') {
+      writeRawStatFs(outPtr, { f_type: 0x50495045, bsize: 4096, frsize: 4096, namelen: 255, flags: 0 });
+      return 0;
+    }
+    if (found.serverDev) {
+      writeRawStatFs(outPtr, { f_type: 0x01021994, bsize: 4096, frsize: 4096, namelen: 255, flags: 6 });
+      return 0;
+    }
     throw new Errno(ENOSYS);
   }),
   unshare: flags => posixCall(() => {
@@ -2177,12 +2297,20 @@ const osApi = {
       if (req.cgroup != null && (typeof req.cgroup !== 'string' || !req.cgroup.startsWith('/') || req.cgroup.length > 4096 || req.cgroup.includes('\0'))) throw new Errno(EINVAL);
       const dup2 = req.dup2 ?? [];
       if (!Array.isArray(dup2) || dup2.length > 64 || !dup2.every(pair => Array.isArray(pair) && pair.length === 2 && pair.every(fd => Number.isInteger(fd) && fd >= 0 && fd <= 65535))) throw new Errno(EINVAL);
+      let serviceGrant = null;
+      if (req.serviceGrant != null) {
+        const g = req.serviceGrant;
+        if (typeof g !== 'object' || Array.isArray(g) || typeof g.mountNamespace !== 'string' || g.mountNamespace.includes('\0')) throw new Errno(EINVAL);
+        const binds = g.bindMounts ?? [];
+        if (!Array.isArray(binds) || binds.length > 32 || !binds.every(b => b && typeof b === 'object' && typeof b.source === 'string' && !b.source.includes('\0') && typeof b.target === 'string' && !b.target.includes('\0') && typeof b.readOnly === 'boolean')) throw new Errno(EINVAL);
+        serviceGrant = { mountNamespace: g.mountNamespace, bindMounts: binds.map(b => ({ source: b.source, target: b.target, readOnly: b.readOnly })) };
+      }
       const totalSize = values => values.reduce((sum, value) => sum + encoder.encode(value).length + 1, 0);
       if (totalSize(req.argv) > 128 * 1024 || totalSize(req.env) > 128 * 1024) throw new Errno(ERRNO.E2BIG);
       if (req.stdin === 'tty' && Atomics.load(membership, 2) >= 0x40000000) {
         tty = { kind: 'pty', tty: true, ...hostErrno(host('pty', { op: 'open', path: '/dev/tty', readable: true, writable: false, noctty: true })) };
       }
-      const state = { argv: req.argv, env: req.env, cwd: req.cwd, pgroup: req.pgroup, cgroup: req.cgroup, ...forkState({ exec: true, stdin: req.stdin, tty, dup2 }), shares: shares.buffer, umask: process.umask };
+      const state = { argv: req.argv, env: req.env, cwd: req.cwd, pgroup: req.pgroup, cgroup: req.cgroup, serviceGrant, ...forkState({ exec: true, stdin: req.stdin, tty, dup2 }), shares: shares.buffer, umask: process.umask };
       const child = hostErrno(host('spawn', state));
       view().setUint32(result, child.pid, true);
       return 0;

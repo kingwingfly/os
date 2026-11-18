@@ -159,6 +159,7 @@ function sanitizeRemoteStat(value, grant) {
     sanitizedVfs = {
       dev: raw.dev,
       ino: raw.ino,
+      ...(isSafePos53(raw.generation) ? { generation: raw.generation } : {}),
       mode,
       nlink: raw.nlink,
       uid: raw.uid,
@@ -181,6 +182,7 @@ function sanitizeRemoteStat(value, grant) {
     ...value,
     readOnly: grant.readOnly,
     executable: value.kind === 'directory' || (grant.execute && !!value.executable),
+    ...(typeof value.fsId === 'string' && value.fsId ? { fsId: value.fsId } : {}),
     ...(sanitizedVfs ? { vfs: sanitizedVfs } : {}),
   };
 }
@@ -213,7 +215,12 @@ function serve(workspace, found, provider, source, grant, connection) {
           case 'open': {
             if (handles.size >= 128) throw bad('EMFILE');
             const flags = Number.isSafeInteger(args.flags) ? args.flags : 0;
+            const exec = Boolean(args.exec);
             let openFlags = flags;
+            if (exec) {
+              if (!grant.execute) throw bad('EACCES');
+              if ((flags & 3) !== 0 || (flags & 0o10000000) || (flags & (0o100 | 0o1000 | 0o200000))) throw bad('EINVAL');
+            }
             if (!grant.write && !(flags & 0o10000000)) {
               if ((flags & 3) !== 0 || (flags & 0o1000) !== 0) throw bad('EROFS');
               if (flags & 0o100) {
@@ -231,11 +238,12 @@ function serve(workspace, found, provider, source, grant, connection) {
               if (openFlags & 0o200) throw bad('EOPNOTSUPP');
               const st = await provider.stat(source, path, { follow: !(openFlags & 0o400000) });
               if ((openFlags & 0o400000) && st.kind === 'symlink') throw bad('ELOOP');
-              if (st.kind === 'directory') throw bad((openFlags & 0o200000) ? 'EOPNOTSUPP' : 'EISDIR');
+              if (st.kind === 'directory') throw bad(exec ? 'EACCES' : (openFlags & 0o200000) ? 'EOPNOTSUPP' : 'EISDIR');
               if (openFlags & 0o200000) throw bad('ENOTDIR');
+              if (exec && !st.executable) throw bad('EACCES');
               value = retainHandle(await provider.hold(source, path, found.relative)); break;
             }
-            value = retainHandle(await provider.open(source, path, openFlags, args.mode ?? 0o666, args.umask ?? 0o077)); break;
+            value = retainHandle(await provider.open(source, path, openFlags, args.mode ?? 0o666, args.umask ?? 0o077, exec)); break;
           }
           case 'hold': {
             if (handles.size >= 128) throw bad('EMFILE');
@@ -244,9 +252,27 @@ function serve(workspace, found, provider, source, grant, connection) {
           case 'release': { if (!handles.has(args.handle)) throw bad('EBADF'); await provider.release(source, path); handles.delete(args.handle); value = null; break; }
           case 'policy': {
             const readOps = ['access', 'getxattr', 'listxattr', 'statfs'];
-            const writeOps = ['chmod', 'utimens', 'setxattr', 'removexattr'];
+            const writeOps = ['chmod', 'chown', 'utimens', 'setxattr', 'removexattr'];
             if (!readOps.includes(args.name) && !(grant.write && writeOps.includes(args.name))) throw bad('EPERM');
+            if (!provider.policy) throw bad('EOPNOTSUPP');
             value = await provider.policy(source, path, args.name, args.options); break;
+          }
+          case 'tryLock':
+          case 'lock':
+          case 'unlock': {
+            if (args.handle === undefined) throw bad('EBADF');
+            const fn = provider[message.op];
+            if (typeof fn !== 'function') throw bad('EOPNOTSUPP');
+            value = message.op === 'unlock'
+              ? await fn.call(provider, source, path, args.family, args.start, args.end ?? null)
+              : await fn.call(provider, source, path, args.family, args.kind, args.start, args.end ?? null);
+            break;
+          }
+          case 'testLock': {
+            if (args.handle === undefined) throw bad('EBADF');
+            if (typeof provider.testLock !== 'function') throw bad('EOPNOTSUPP');
+            value = await provider.testLock(source, path, args.kind, args.start, args.end ?? null);
+            break;
           }
           case 'stat': value = await provider.stat(source, path, { follow: args.follow !== false }); break;
           case 'list': {
@@ -340,13 +366,18 @@ class RemoteMount {
     } else if (args.path !== undefined) safePath(args.path);
     return this.connection.request(op, args);
   }
-  async open(grant, path, flags = 0, mode = 0o666, umask = 0o077) {
+  async open(grant, path, flags = 0, mode = 0o666, umask = 0o077, exec = false) {
+    if (exec && !grant.execute) throw bad('EACCES');
     if (!(flags & 0o10000000) && ((flags & 3) !== 0 || (flags & 0o1000) !== 0) && grant.readOnly) throw bad('EROFS');
-    const id = await this.request(grant, 'open', { path, flags, mode, umask });
+    const id = await this.request(grant, 'open', { path, flags, mode, umask, exec: Boolean(exec) });
     const handle = Object.freeze({}); this.#handles.set(handle, id); return handle;
   }
   async hold(grant, path) { const id = await this.request(grant, 'hold', { path }); const handle = Object.freeze({}); this.#handles.set(handle, id); return handle; }
   async release(grant, path) { try { await this.request(grant, 'release', { path }); } finally { this.#handles.delete(path); } }
+  tryLock(grant, handle, family, kind, start, end = null) { return this.request(grant, 'tryLock', { path: handle, family, kind, start, end }); }
+  lock(grant, handle, family, kind, start, end = null) { return this.request(grant, 'lock', { path: handle, family, kind, start, end }); }
+  unlock(grant, handle, family, start, end = null) { return this.request(grant, 'unlock', { path: handle, family, start, end }); }
+  testLock(grant, handle, kind, start, end = null) { return this.request(grant, 'testLock', { path: handle, kind, start, end }); }
   policy(grant, path, name, options) { return this.request(grant, 'policy', { path, name, options }); }
   async access(grant, path, mode) {
     if (mode & 2 && grant.readOnly) throw bad('EROFS');

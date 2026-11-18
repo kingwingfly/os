@@ -22,7 +22,7 @@ const FS_CALL_NAMES = new Set([
 
 const ACCOUNT_MUTATION_CALLS = new Set([
   'login', 'logout', 'sudo', 'passwd', 'register', 'useradd', 'userdel', 'usermod',
-  'groupadd', 'groupdel', 'gpasswd', 'login_session', 'machine_init',
+  'groupadd', 'groupdel', 'groupmod', 'gpasswd', 'login_session', 'machine_init',
 ]);
 
 function callName(call) {
@@ -132,12 +132,13 @@ export function installLocalFiles() {
         if (request.method !== 'PUT') return json({ errno: 'EINVAL' }, 400);
         const body = new Uint8Array(await request.arrayBuffer());
         const index = Number(url.searchParams.get('index'));
-        if (!Number.isSafeInteger(index) || index < 0 || body.length > 256 * 1024) {
+        if (!Number.isSafeInteger(index) || index < 0 || body.length > 8 * 1024 * 1024) {
           return json({ errno: 'E2BIG' }, 400);
         }
         const written = await kernelCall('mount_vfs_pwrite', {
           fd: Number(url.searchParams.get('fd')),
-          offset: index * 256 * 1024,
+          offset: 0,
+          chunkIndex: index,
           data: body,
         });
         return json({ written });
@@ -156,7 +157,7 @@ export function installLocalFiles() {
         if (range.invalid) return new Response(null, { status: 416 });
         if (request.signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
-        const res = await kernelCall('mount_vfs_read_file', {
+        const res = await kernelCall('mount_vfs_open_read', {
           path,
           rangeStart: range.hasRange ? range.start : undefined,
           rangeEnd: range.hasRange ? range.end : undefined,
@@ -164,15 +165,61 @@ export function installLocalFiles() {
           sudo: false,
         });
         if (res.status === 416) return new Response(null, { status: 416 });
-        const bodyBytes = res.bytes instanceof Uint8Array ? res.bytes : new Uint8Array(res.bytes ?? []);
-        const contentLen = request.method === 'HEAD'
-          ? (range.hasRange && res.contentRange
-              ? (() => {
-                  const m = /^bytes (\d+)-(\d+)\//.exec(res.contentRange);
-                  return m ? Number(m[2]) - Number(m[1]) + 1 : res.totalSize;
-                })()
-              : res.totalSize)
-          : bodyBytes.byteLength;
+        const rangeLen = range.hasRange && res.contentRange
+          ? (() => {
+              const m = /^bytes (\d+)-(\d+)\//.exec(res.contentRange);
+              return m ? Number(m[2]) - Number(m[1]) + 1 : res.totalSize;
+            })()
+          : res.totalSize;
+        if (res.streamId != null) {
+          const headers = {
+            'Content-Type': res.contentType || 'application/octet-stream',
+            'Content-Length': String(rangeLen),
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'no-store',
+          };
+          if (res.contentRange) headers['Content-Range'] = res.contentRange;
+          let closed = false;
+          const closeStream = () => {
+            if (closed) return;
+            closed = true;
+            request.signal?.removeEventListener('abort', closeStream);
+            void kernelCall('mount_vfs_close_read', { streamId: res.streamId }).catch(() => {});
+          };
+          request.signal?.addEventListener('abort', closeStream, { once: true });
+          const stream = new ReadableStream({
+            async pull(controller) {
+              if (closed) {
+                controller.close();
+                return;
+              }
+              try {
+                const chunk = await kernelCall('mount_vfs_read_chunk', { streamId: res.streamId });
+                const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk ?? []);
+                if (!bytes.byteLength) {
+                  closeStream();
+                  controller.close();
+                  return;
+                }
+                controller.enqueue(bytes);
+              } catch (err) {
+                closeStream();
+                controller.error(err);
+              }
+            },
+            async cancel() {
+              closeStream();
+            },
+          });
+          return new Response(stream, {
+            status: res.status || (range.hasRange ? 206 : 200),
+            headers,
+          });
+        }
+        const bodyBytes = res.inlineBytes instanceof Uint8Array
+          ? res.inlineBytes
+          : new Uint8Array(res.inlineBytes ?? res.bytes ?? []);
+        const contentLen = request.method === 'HEAD' ? rangeLen : bodyBytes.byteLength;
         const headers = {
           'Content-Type': res.contentType || 'application/octet-stream',
           'Content-Length': String(contentLen),

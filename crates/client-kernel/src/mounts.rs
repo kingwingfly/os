@@ -731,10 +731,12 @@ impl LocalMount {
         };
         let rdonly_ceiling = self.state.grant.read_only && !self.state.snapshot_data_ro;
         let noexec_ceiling = !self.state.grant.execute;
+        let state_for_release = Rc::clone(&self.state);
         Rc::new(
             vfs::MountBacking::new(fs, fstype)
                 .with_provider(Rc::clone(&self.state.provider_state))
-                .with_ceilings(rdonly_ceiling, noexec_ceiling),
+                .with_ceilings(rdonly_ceiling, noexec_ceiling)
+                .with_on_release(move || state_for_release.shutdown()),
         )
     }
 
@@ -748,10 +750,6 @@ impl LocalMount {
 
     pub(crate) fn grant_js(&self) -> JsValue {
         self.state.grant_js.clone()
-    }
-
-    pub(crate) fn shutdown_provider(&self) {
-        self.state.shutdown();
     }
 
     pub(crate) fn clone_owner(&self) -> Self {
@@ -1592,6 +1590,8 @@ impl LocalMount {
             (meta.mtime.sec as f64) * 1000.0 + (meta.mtime.nsec as f64) / 1_000_000.0;
         let executable = meta.file_type == FileType::Dir
             || (self.state.grant.execute && (meta.mode & 0o111) != 0);
+        let mut st_val = serde_json::to_value(&st).unwrap_or(Value::Null);
+        st_val["generation"] = json!(handle.node.generation);
         let mut obj = json!({
             "kind": kind_str,
             "name": name,
@@ -1599,7 +1599,8 @@ impl LocalMount {
             "lastModified": last_modified_ms,
             "readOnly": self.state.grant.read_only || self.state.snapshot_data_ro,
             "executable": executable,
-            "vfs": st,
+            "fsId": fs.id().0,
+            "vfs": st_val,
         });
         if let Some(ref link) = st.link {
             obj["link"] = Value::String(link.clone());
@@ -1918,6 +1919,7 @@ impl LocalMount {
         flags: u32,
         mode: Option<u16>,
         umask: Option<u16>,
+        exec: Option<bool>,
     ) -> Result<JsValue, JsValue> {
         self.check_grant(&grant).map_err(map_vfs_err)?;
         if self.opens.borrow().len() >= 1024 {
@@ -1936,7 +1938,22 @@ impl LocalMount {
         if flags & !allowed_mask != 0 {
             return Err(map_vfs_err(Errno::EOPNOTSUPP));
         }
-        let options = OpenOptions::from_flags(flags).map_err(map_vfs_err)?;
+        let exec_open = exec.unwrap_or(false);
+        let mut options = OpenOptions::from_flags(flags).map_err(map_vfs_err)?;
+        if exec_open {
+            if flags & abi::O_PATH != 0
+                || (flags & abi::O_ACCMODE) != abi::O_RDONLY
+                || flags & O_DIRECTORY != 0
+                || options.is_create()
+                || options.is_truncate()
+            {
+                return Err(map_vfs_err(Errno::EINVAL));
+            }
+            if !self.state.grant.execute {
+                return Err(map_vfs_err(Errno::EACCES));
+            }
+            options = *OpenOptions::new().exec(true);
+        }
         let access = options.access().map_err(map_vfs_err)?;
 
         let cred = self.cred(umask);
@@ -1990,6 +2007,9 @@ impl LocalMount {
             .map_err(map_vfs_err)?;
         if access != Access::Path && nofollow && entry.metadata.file_type == FileType::Symlink {
             return Err(map_vfs_err(Errno::ELOOP));
+        }
+        if access == Access::Exec && entry.metadata.file_type == FileType::Dir {
+            return Err(map_vfs_err(Errno::EACCES));
         }
         if access != Access::Path
             && (access.writes() || options.is_truncate())

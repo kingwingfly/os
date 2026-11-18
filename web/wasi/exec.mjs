@@ -220,7 +220,7 @@ export function reconcile() {
 export async function exec(stages, options = {}) {
   requireExecutionSupport();
   const workspace = options.workspace;
-  const sessionId = workspace?.identity?.id ?? '';
+  const sessionId = options.sessionId ?? workspace?.identity?.id ?? '';
   const loadImage = async image => {
     if (image.resolvedAsset) {
       image.asset = image.resolvedAsset;
@@ -240,10 +240,11 @@ export async function exec(stages, options = {}) {
       || image.size !== expected.size || image.asset != null || image.fd != null || image.token_read != null) {
       throw Object.assign(new Error('authority did not confirm the requested local execution grant'), { errno: 'EACCES' });
     }
-    const bytes = await kernelCall('take_local_exec_bytes', { digest: expected.digest });
+    const ticketKey = image.execTicket ?? expected.digest;
+    const bytes = await kernelCall('take_local_exec_bytes', { ticket: ticketKey });
     if (!bytes) throw Object.assign(new Error('executable image is no longer available'), { errno: 'ESTALE' });
     return loadLocalBytes(expected.digest, bytes, async () => {
-      const stillLive = await kernelCall('take_local_exec_bytes', { digest: expected.digest });
+      const stillLive = await kernelCall('take_local_exec_bytes', { ticket: ticketKey, checkOnly: true });
       if (!stillLive) throw Object.assign(new Error('executable mount was detached'), { errno: 'ESTALE' });
     });
   };
@@ -389,6 +390,7 @@ export async function exec(stages, options = {}) {
             local: resolved.local ?? undefined,
             runtime: resolved.runtime,
             sessionId: sessionId || undefined,
+            ...((stage.serviceGrant ?? (index === 0 ? options.serviceGrant : null)) ? { serviceGrant: stage.serviceGrant ?? options.serviceGrant } : {}),
             argv: resolved.argv,
             env: envList,
             cwd,
@@ -410,6 +412,7 @@ export async function exec(stages, options = {}) {
         result.ok.resolvedAsset = resolved.asset;
         result.ok.resolvedExecPath = resolved.execPath;
         result.ok.localExec = resolved.asset ? null : resolved.local;
+        result.ok.execTicket = resolved.execTicket;
       }
       replies[index] = result;
     }
@@ -641,6 +644,7 @@ export async function exec(stages, options = {}) {
       image.resolvedAsset = resolved.asset;
       image.resolvedExecPath = resolved.execPath;
       image.localExec = resolved.asset ? null : resolved.local;
+      image.execTicket = resolved.execTicket;
       process.token = image.token;
       let loaded;
       try {
@@ -682,9 +686,13 @@ export async function exec(stages, options = {}) {
         checkInheritance(state);
         child = await kernelCall('fork', { pid, emptyMemory: true });
         alive();
-        if (state.cwd && state.cwd !== '/') {
+        if (state.serviceGrant != null) {
+          await kernelCall('proc_apply_service_grant', { pid: child.pid, parentPid: pid, grant: state.serviceGrant });
+          alive();
+        }
+        if (state.cwd) {
           let parentCwd = null;
-          try { parentCwd = await kernelCall('sys_getcwd', { pid }); } catch {}
+          try { parentCwd = await kernelCall('sys_getcwd', { pid: child.pid }); } catch {}
           if (parentCwd !== state.cwd) {
             await kernelCall('sys_chdir', { pid: child.pid, path: state.cwd });
             alive();
@@ -711,9 +719,13 @@ export async function exec(stages, options = {}) {
           throw { errno: 'ENOTSUP', detail: 'local execution requires cross-origin isolation' };
         }
         alive();
-        // Clear FD_CLOEXEC on any kfd duplicated onto a target fd by posix_spawn dup2 actions
+        // Clear FD_CLOEXEC on any kfd duplicated onto a target fd by posix_spawn dup2 actions,
+        // and close parent kfds overwritten by dup2/stdin redirections before reexec.
         for (const kfd of state.keepOpenKfds ?? []) {
-          await kernelCall('kfd_set_cloexec', { pid: child.pid, kfd, cloexec: false }).catch(() => {});
+          await kernelCall('kfd_set_cloexec', { pid: child.pid, kfd, cloexec: false });
+        }
+        for (const kfd of state.closeKfds ?? []) {
+          await kernelCall('kfd_close', { pid: child.pid, kfd }).catch(() => {});
         }
         const image = await kernelCall('reexec', {
           pid: child.pid,
@@ -727,6 +739,7 @@ export async function exec(stages, options = {}) {
         image.resolvedAsset = resolved.asset;
         image.resolvedExecPath = resolved.execPath;
         image.localExec = resolved.asset ? null : resolved.local;
+        image.execTicket = resolved.execTicket;
         child.token = image.token;
         alive();
         const loaded = await loadImage(image).catch(error => { throw { errno: error?.errno ?? 'ENOEXEC', detail: error.message }; });

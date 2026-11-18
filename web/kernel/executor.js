@@ -10,7 +10,7 @@ import { stats } from './loader.js';
 import { validateExpectedSession, checkExpectedSession } from './launch-context.js';
 import { sharingAllowed } from './sharing-policy.js';
 import { currentWorkspace, mountRequest, endWorkspace } from './workspaces.js';
-export { endWorkspace };
+export { endWorkspace, currentWorkspace };
 
 const runs = new Map();
 const consoles = new Consoles();

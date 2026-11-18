@@ -2788,7 +2788,10 @@ test('PR #73 P1-5: WASI process.js openPath rejects O_RDONLY|O_TRUNC on director
   }
 
   try {
-    await ws.calls([{ mkdir: { path: '/cloud-dir', mode: 0o755 } }], ws.page, cloud, { sudo: true });
+    const adminPid = ws.scope();
+    await ws.kernel.proc_spawn_init(JSON.stringify({ pid: adminPid, ppid: 1, sessionId: ws.id, uid: 0, gid: 0, groups: [0], umask: 0o022, cwd: '/' }));
+    await ws.kernel.proc_mkdirat(adminPid, OS_FD_ROOT, '/cloud-dir', 0o755);
+    await ws.kernel.proc_exit(adminPid);
     const localRes = await runWasiCase(localWat, { localFs: true, useChannel: true, kind: 'local' });
     assert.equal(localRes.exitResult.exit, 0, `unexpected local WASI exit code ${localRes.exitResult.exit}`);
     const dirOpen = localRes.opens.find(o => o.path === 'mnt/local/proj/dir' || o.path === '/mnt/local/proj/dir');
@@ -2803,5 +2806,300 @@ test('PR #73 P1-5: WASI process.js openPath rejects O_RDONLY|O_TRUNC on director
     assert.notEqual(truncSysOpen.flags & 0o400000, 0, 'O_NOFOLLOW must be passed when !FOLLOW');
   } finally {
     ws.close();
+  }
+});
+
+test('PR #74 Track C: WASI process.js kfd FDFLAG_NONBLOCK, /proc/self/fd translation & ELOOP, rawFds separation, posix_spawn serviceGrant validation', async () => {
+  const { Worker } = await import('node:worker_threads');
+  installBrowserEnv();
+
+  const uleb = n => { const o = []; do { let b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; o.push(b); } while (n); return o; };
+  const sleb = n => { const o = []; let more = true; while (more) { let b = n & 0x7f; n >>= 7; if ((n === 0 && !(b & 0x40)) || (n === -1 && (b & 0x40))) more = false; else b |= 0x80; o.push(b); } return o; };
+  const wstr = s => { const b = encoder.encode(s); return [...uleb(b.length), ...b]; };
+  const sec = (id, body) => [id, ...uleb(body.length), ...body];
+  const i32c = v => [0x41, ...sleb(v)];
+  const i64c = v => [0x42, ...sleb(v)];
+
+  const sTarget = 'mnt/local/proj/target';
+  const sSubdir = 'mnt/local/proj/subdir';
+  const sSelfFd4 = '/proc/self/fd/4';
+  const sSelfFd5 = '/proc/self/fd/5';
+  const sSelfFd99 = '/proc/self/fd/99';
+  const sSysBatch = JSON.stringify([
+    { open: { path: '/mnt/local/proj/target', flags: 0 } },
+    { close: { fd: { ref: 0 } } },
+  ]);
+  const sBadGrant = JSON.stringify({
+    argv: ['/usr/bin/true'],
+    env: [],
+    cwd: '/',
+    stdin: 'null',
+    serviceGrant: { mountNamespace: 42 },
+  });
+
+  // Type indices:
+  // 0: path_open (9 i32/i64 -> i32)
+  // 1: (i32, i32) -> i32  [fd_fdstat_set_flags, fd_fdstat_get, os.sys]
+  // 2: (i32, i32, i32, i32, i32, i32) -> i32 [path_readlink]
+  // 3: (i32, i32, i32, i32, i32) -> i32 [path_filestat_get]
+  // 4: (i32) -> i32 [fd_close]
+  // 5: (i32, i32, i32) -> i32 [os.posix_spawn]
+  // 6: (i32) -> void [proc_exit]
+  // 7: () -> void [_start]
+  const types = [8,
+    0x60, 9, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7e, 0x7e, 0x7f, 0x7f, 1, 0x7f,
+    0x60, 2, 0x7f, 0x7f, 1, 0x7f,
+    0x60, 6, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f,
+    0x60, 5, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f,
+    0x60, 1, 0x7f, 1, 0x7f,
+    0x60, 3, 0x7f, 0x7f, 0x7f, 1, 0x7f,
+    0x60, 1, 0x7f, 0,
+    0x60, 0, 0,
+  ];
+  const imports = [9,
+    ...wstr('wasi_snapshot_preview1'), ...wstr('path_open'), 0x00, 0x00,
+    ...wstr('wasi_snapshot_preview1'), ...wstr('fd_fdstat_set_flags'), 0x00, 0x01,
+    ...wstr('wasi_snapshot_preview1'), ...wstr('fd_fdstat_get'), 0x00, 0x01,
+    ...wstr('wasi_snapshot_preview1'), ...wstr('path_readlink'), 0x00, 0x02,
+    ...wstr('wasi_snapshot_preview1'), ...wstr('path_filestat_get'), 0x00, 0x03,
+    ...wstr('wasi_snapshot_preview1'), ...wstr('fd_close'), 0x00, 0x04,
+    ...wstr('os'), ...wstr('sys'), 0x00, 0x01,
+    ...wstr('os'), ...wstr('posix_spawn'), 0x00, 0x05,
+    ...wstr('wasi_snapshot_preview1'), ...wstr('proc_exit'), 0x00, 0x06,
+  ];
+  const bailIfNe = (expect, code) => [
+    0x21, 0x00, 0x20, 0x00, ...i32c(expect), 0x47,
+    0x04, 0x40, ...i32c(code), 0x20, 0x00, 0x6a, 0x10, 0x08, 0x0b,
+  ];
+  const body = [
+    1, 3, 0x7f, // local $rc (0), local $fd (1), local $dfd (2)
+    // 1. open mnt/local/proj/target -> guest fd 4 at out=500; mnt/local/proj/subdir -> guest fd 5 at out=504
+    ...i32c(3), ...i32c(1), ...i32c(100), ...i32c(sTarget.length), ...i32c(0), ...i64c(2), ...i64c(2), ...i32c(0), ...i32c(500), 0x10, 0x00,
+    ...bailIfNe(0, 100),
+    ...i32c(500), 0x28, 0x02, 0x00, 0x21, 0x01, // $fd = i32[500]
+    ...i32c(4), 0x20, 0x01, 0x47, 0x04, 0x40, ...i32c(91), 0x10, 0x08, 0x0b, // expect guest $fd == 4 (while Rust kfd == 0)
+    ...i32c(3), ...i32c(1), ...i32c(600), ...i32c(sSubdir.length), ...i32c(2), ...i64c(2), ...i64c(2), ...i32c(0), ...i32c(504), 0x10, 0x00,
+    ...bailIfNe(0, 105),
+    ...i32c(504), 0x28, 0x02, 0x00, 0x21, 0x02, // $dfd = i32[504] (guest fd 5, Rust kfd 1)
+    ...i32c(5), 0x20, 0x02, 0x47, 0x04, 0x40, ...i32c(95), 0x10, 0x08, 0x0b,
+    // 2. fd_fdstat_set_flags($fd, FDFLAG_NONBLOCK=4) & fd_fdstat_get($fd, 512)
+    0x20, 0x01, ...i32c(4), 0x10, 0x01, ...bailIfNe(0, 110),
+    0x20, 0x01, ...i32c(512), 0x10, 0x02, ...bailIfNe(0, 120),
+    ...i32c(512), 0x2f, 0x01, 0x02, ...i32c(4), 0x71, ...i32c(4), 0x47,
+    0x04, 0x40, ...i32c(92), 0x10, 0x08, 0x0b,
+    // 3. open(/proc/self/fd/4, !FOLLOW) -> ELOOP(32); open(/proc/self/fd/99, !FOLLOW) -> ENOENT(44)
+    ...i32c(3), ...i32c(0), ...i32c(140), ...i32c(sSelfFd4.length), ...i32c(0), ...i64c(2), ...i64c(2), ...i32c(0), ...i32c(540), 0x10, 0x00,
+    ...bailIfNe(32, 200),
+    ...i32c(3), ...i32c(0), ...i32c(180), ...i32c(sSelfFd99.length), ...i32c(0), ...i64c(2), ...i64c(2), ...i32c(0), ...i32c(540), 0x10, 0x00,
+    ...bailIfNe(44, 210),
+    // 4. path_readlink(3, /proc/self/fd/5, 700, 128, 560) & path_filestat_get(3, FOLLOW=1, /proc/self/fd/4, 768)
+    ...i32c(3), ...i32c(640), ...i32c(sSelfFd5.length), ...i32c(700), ...i32c(128), ...i32c(560), 0x10, 0x03,
+    ...bailIfNe(0, 220),
+    ...i32c(560), 0x28, 0x02, 0x00, ...i32c(sSubdir.length + 1), 0x47,
+    0x04, 0x40, ...i32c(93), 0x10, 0x08, 0x0b,
+    ...i32c(3), ...i32c(1), ...i32c(140), ...i32c(sSelfFd4.length), ...i32c(768), 0x10, 0x04,
+    ...bailIfNe(0, 230),
+    ...i32c(768), 0x29, 0x03, 0x20, 0x42, 0x0b, 0x52, // fstat.size == 11 ("target-data")
+    0x04, 0x40, ...i32c(94), 0x10, 0x08, 0x0b,
+    // 5. os.sys batch raw open+close (rawFds) preserves guest $fd=4
+    ...i32c(220), ...i32c(sSysBatch.length), 0x10, 0x06, 0x1a,
+    0x20, 0x01, ...i32c(512), 0x10, 0x02, ...bailIfNe(0, 240),
+    0x20, 0x01, 0x10, 0x05, ...bailIfNe(0, 250),
+    0x20, 0x02, 0x10, 0x05, ...bailIfNe(0, 255),
+    // 6. os.posix_spawn validates invalid serviceGrant -> EINVAL(28)
+    ...i32c(400), ...i32c(sBadGrant.length), ...i32c(580), 0x10, 0x07,
+    ...bailIfNe(28, 260),
+    ...i32c(0), 0x10, 0x08, 0x0b,
+  ];
+  const dSegs = [
+    [100, sTarget],
+    [140, sSelfFd4],
+    [180, sSelfFd99],
+    [220, sSysBatch],
+    [400, sBadGrant],
+    [600, sSubdir],
+    [640, sSelfFd5],
+  ];
+  const dataSec = [dSegs.length, ...dSegs.flatMap(([off, str]) => {
+    const b = encoder.encode(str);
+    return [0x00, ...i32c(off), 0x0b, ...uleb(b.length), ...b];
+  })];
+  const wasmBytes = new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    ...sec(1, types), ...sec(2, imports),
+    ...sec(3, [1, 0x07]), ...sec(5, [1, 0x00, 0x01]),
+    ...sec(7, [2, ...wstr('memory'), 0x02, 0x00, ...wstr('_start'), 0x00, 0x09]),
+    ...sec(10, [1, ...uleb(body.length), ...body]),
+    ...sec(11, dataSec),
+  ]);
+
+  const ws = new Workspace({ id: 'wasi-track-c', uid: 20, gid: 20, groups: [20] });
+  await ws.mount({ name: 'proj', storage: true, writable: true, execute: false, cloud: false });
+  await ws.calls([
+    { mkdir: { path: '/mnt/local/proj/subdir', mode: 0o755 } },
+    { open: { path: '/mnt/local/proj/target', flags: 0o1102, mode: 0o644 } },
+    { pwrite: { fd: { ref: 1 }, index: 0, data: btoa('target-data') } },
+    { close: { fd: { ref: 1 } } },
+  ], ws.page, cloud);
+
+  const processUrl = new URL('../web/wasi/process.js', import.meta.url).href;
+  const workerCode = `
+    import { parentPort, workerData } from 'node:worker_threads';
+    const pending = [];
+    let handler = null;
+    Object.defineProperty(globalThis, 'onmessage', {
+      configurable: true,
+      get() { return handler; },
+      set(fn) {
+        handler = fn;
+        while (pending.length && handler) handler(pending.shift());
+      },
+    });
+    globalThis.postMessage = msg => parentPort.postMessage(msg);
+    parentPort.on('message', data => {
+      const ev = { data };
+      if (handler) handler(ev);
+      else pending.push(ev);
+    });
+    await import(workerData.processUrl);
+  `;
+
+  const module = await WebAssembly.compile(wasmBytes);
+  const channelBuf = new SharedArrayBuffer(1 << 20);
+  const channelState = new Int32Array(channelBuf, 0, 2);
+  const channelData = new Uint8Array(channelBuf, 8);
+  const worker = new Worker(workerCode, { eval: true, workerData: { processUrl } });
+  try {
+    const exitResult = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('worker timed out')), 5000);
+      const finish = fn => val => { clearTimeout(timer); fn(val); };
+      worker.on('error', finish(reject));
+      worker.on('exit', code => finish(reject)(new Error(`worker exited unexpectedly with code ${code}`)));
+      worker.on('message', async msg => {
+        if (msg?.host?.type === 'vfs') {
+          const { op, ...vargs } = msg.host.args;
+          let reply;
+          try {
+            await ws._ready;
+            if (op === 'openat') reply = await ws.kernel.proc_openat(ws.page, vargs.dirfd, vargs.path, vargs.oflags ?? 0, vargs.mode ?? 0, !!vargs.cloexec);
+            else if (op === 'close') { await ws.kernel.kfd_close(ws.page, vargs.kfd); reply = {}; }
+            else if (op === 'fstat') reply = await ws.kernel.kfd_fstat(ws.page, vargs.kfd);
+            else if (op === 'statat') reply = await ws.kernel.proc_statat(ws.page, vargs.dirfd, vargs.path, vargs.follow !== false);
+            else if (op === 'statfs') reply = await ws.kernel.sys_statfs(ws.page, vargs.dirfd, vargs.path);
+            else if (op === 'readlinkat') reply = { target: await ws.kernel.proc_readlinkat(ws.page, vargs.dirfd, vargs.path) };
+            else if (op === 'set_append') { ws.kernel.kfd_set_append(ws.page, vargs.kfd, !!vargs.append); reply = {}; }
+            else if (op === 'is_append') reply = { append: ws.kernel.kfd_is_append(ws.page, vargs.kfd) };
+            else if (op === 'sys') reply = JSON.parse(await ws.kernel.proc_sys(ws.page, JSON.stringify(vargs.batch)));
+            else reply = {};
+          } catch (err) {
+            reply = { errno: err.errno ?? 'EIO' };
+          }
+          const bytes = encoder.encode(JSON.stringify(reply));
+          channelData.set(bytes, 0);
+          Atomics.store(channelState, 1, bytes.length);
+          Atomics.store(channelState, 0, 1);
+          Atomics.notify(channelState, 0);
+        } else if (msg?.exit !== undefined) {
+          finish(resolve)(msg);
+        }
+      });
+      worker.postMessage({
+        module,
+        argv: ['probe-track-c'],
+        env: [],
+        cwd: '/',
+        pid: ws.page,
+        ppid: 1,
+        umask: 0o022,
+        sudo: false,
+        channel: channelBuf,
+      });
+    });
+    assert.equal(exitResult.exit, 0, `unexpected exit code ${exitResult.exit}`);
+  } finally {
+    await worker.terminate();
+    ws.close();
+  }
+});
+
+test('PR #74 Track C: local-files.js routes groupmod to network, streams GET /api/file with abort close, and passes 8 MiB chunkIndex on PUT /api/pwrite', async () => {
+  const prevLocation = globalThis.location;
+  const prevFetch = globalThis.fetch;
+  const prevWorker = globalThis.Worker;
+  const networkCalls = [];
+  const kernelCalls = [];
+  let streamClosed = false;
+  let readCalls = 0;
+
+  globalThis.location = { origin: 'https://os.example', href: 'https://os.example/' };
+  globalThis.fetch = async (input, init) => {
+    const req = new Request(input, init);
+    networkCalls.push(new URL(req.url).pathname);
+    return new Response(JSON.stringify({ results: [{ ok: null }] }), { status: 200 });
+  };
+  globalThis.Worker = class MockKernelWorker {
+    postMessage(msg) {
+      queueMicrotask(() => {
+        kernelCalls.push({ type: msg.type, args: msg.args });
+        let okVal = null;
+        if (msg.type === 'mount_vfs_pwrite') okVal = msg.args.data.length;
+        else if (msg.type === 'mount_vfs_open_read') {
+          readCalls = 0;
+          okVal = { status: 200, totalSize: 600000, contentType: 'application/octet-stream', streamId: 77 };
+        } else if (msg.type === 'mount_vfs_read_chunk') {
+          readCalls++;
+          okVal = readCalls === 1 ? new Uint8Array([1, 2, 3, 4]) : new Uint8Array(0);
+        } else if (msg.type === 'mount_vfs_close_read') {
+          streamClosed = true;
+          okVal = null;
+        }
+        this.onmessage?.({ data: { v: msg.v, id: msg.id, ok: okVal } });
+      });
+    }
+  };
+
+  try {
+    const { installLocalFiles } = await import('../web/local-files.js');
+    installLocalFiles();
+
+    // 1. groupmod must hit network, NOT mount_vfs_sys
+    const gRes = await globalThis.fetch('https://os.example/api/sys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ calls: [{ groupmod: { name: 'devs' } }] }),
+    });
+    assert.equal(gRes.status, 200);
+    assert.deepEqual(networkCalls, ['/api/sys']);
+    assert.equal(kernelCalls.some(c => c.type === 'mount_vfs_sys'), false);
+
+    // 2. PUT /api/pwrite accepts >256 KiB chunks (up to 8 MiB) and passes chunkIndex
+    const big = new Uint8Array(300 * 1024);
+    const pRes = await globalThis.fetch(`https://os.example/api/pwrite?fd=${LOCAL_FD}&index=3`, {
+      method: 'PUT',
+      body: big,
+    });
+    assert.equal(pRes.status, 200);
+    assert.deepEqual(await pRes.json(), { written: 300 * 1024 });
+    const pwCall = kernelCalls.find(c => c.type === 'mount_vfs_pwrite');
+    assert.equal(pwCall.args.chunkIndex, 3);
+    assert.equal(pwCall.args.fd, LOCAL_FD);
+
+    // 3. Streamed GET /api/file reads chunks via streamId and cancelling closes stream
+    const ac = new AbortController();
+    const fRes = await globalThis.fetch('https://os.example/api/file?path=%2Fmnt%2Flocal%2Fproj%2Fbig.bin', {
+      signal: ac.signal,
+    });
+    assert.equal(fRes.status, 200);
+    const reader = fRes.body.getReader();
+    const first = await reader.read();
+    assert.deepEqual(Array.from(first.value), [1, 2, 3, 4]);
+    ac.abort();
+    await reader.cancel().catch(() => {});
+    await new Promise(r => setTimeout(r, 20));
+    assert.equal(streamClosed, true);
+  } finally {
+    globalThis.location = prevLocation;
+    globalThis.fetch = prevFetch;
+    globalThis.Worker = prevWorker;
   }
 });

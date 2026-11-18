@@ -48,27 +48,6 @@ async fn kernel_sys(body: &str) -> Result<JsValue, JsValue> {
 
 /// The kernel's own protocol version, which the page checks at start.
 pub const VERSION: &str = "1";
-
-/// Local validation only. This does not verify an operator signature, activate a
-/// system generation, or confer credentials described by package metadata.
-#[wasm_bindgen]
-pub fn private_extension(manifests: &str) -> Result<String, JsValue> {
-    let validate = || -> image::Result<String> {
-        let texts: Vec<String> = image::parse(manifests.as_bytes())?;
-        let images: Vec<_> = texts
-            .iter()
-            .map(|text| image::Image::parse(text.as_bytes()))
-            .collect::<image::Result<_>>()?;
-        let composition = image::Composition::private(&images)?;
-        let aliases = composition
-            .entries
-            .keys()
-            .map(|path| Ok((path.clone(), composition.resolve(path)?)))
-            .collect::<image::Result<std::collections::BTreeMap<_, _>>>()?;
-        Ok(json!({"entries": composition.entries, "resolved": aliases}).to_string())
-    };
-    validate().map_err(|error| JsValue::from_str(&error.to_string()))
-}
 /// How many pids the kernel asks to be lent at a time, for its forks.
 const LEND: u32 = 8;
 /// Linux's init.
@@ -275,8 +254,13 @@ impl Kernel {
         let runtime_tag = {
             let rt = self.vfs_rt.borrow();
             let chrooted = rt.vfs.process_fs_context(pid).ok().is_some_and(|ctx| {
-                let sys_root = rt.vfs.system_namespace().borrow().root_anchor();
-                !ctx.borrow().root.same_anchor(&sys_root)
+                let ns_root = rt
+                    .vfs
+                    .process_namespace(pid)
+                    .unwrap_or_else(|_| rt.vfs.system_namespace())
+                    .borrow()
+                    .root_anchor();
+                !ctx.borrow().root.same_anchor(&ns_root)
             });
             if chrooted {
                 "resources-v1:chroot"
@@ -306,16 +290,15 @@ impl Kernel {
         }
         self.state.borrow_mut().retain_spare();
         let _ = self.proc_exec_preserve(pid).await;
-        if let Ok(identity) = self.cloud_identity(pid, &exec.token).await {
-            let _ = self.proc_set_creds(
-                pid,
-                identity.id,
-                identity.group,
-                identity.groups.into_iter().collect(),
-                Some(exec.token.clone()),
-                cloud_allowed,
-            );
-        }
+        let identity = self.cloud_identity(pid, &exec.token).await?;
+        let _ = self.proc_set_creds(
+            pid,
+            identity.id,
+            identity.group,
+            identity.groups.into_iter().collect(),
+            Some(exec.token.clone()),
+            cloud_allowed,
+        );
         to_json(&exec)
     }
 
@@ -944,10 +927,13 @@ impl Kernel {
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
                 if let Some(parent_pid) = stage["parentPid"].as_u64().map(|p| p as u32) {
-                    let identity = self
-                        .cloud_identity(exec.pid, &exec.token)
-                        .await
-                        .unwrap_or_else(|_| vfs::Identity::root());
+                    let identity = match self.cloud_identity(exec.pid, &exec.token).await {
+                        Ok(id) => id,
+                        Err(err) => {
+                            self.state.borrow_mut().processes.remove(&exec.pid);
+                            return Err(err);
+                        }
+                    };
                     let _ = self.proc_fork(parent_pid, exec.pid, 0);
                     let _ = self.proc_exec_preserve(exec.pid).await;
                     let _ = self.proc_set_creds(
@@ -962,8 +948,25 @@ impl Kernel {
                         let _ = self.sys_chdir(exec.pid, cwd.to_string()).await;
                     }
                 } else {
-                    self.register_exec_in_vfs(exec.pid, INIT, &exec.token, cwd, sid, cloud_allowed)
-                        .await;
+                    let grant_json = stage
+                        .get("serviceGrant")
+                        .filter(|v| !v.is_null())
+                        .map(Value::to_string);
+                    if let Err(err) = self
+                        .register_exec_in_vfs(
+                            exec.pid,
+                            INIT,
+                            &exec.token,
+                            cwd,
+                            sid,
+                            cloud_allowed,
+                            grant_json.as_deref(),
+                        )
+                        .await
+                    {
+                        self.state.borrow_mut().processes.remove(&exec.pid);
+                        return Err(err);
+                    }
                 }
             }
         }

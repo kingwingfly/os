@@ -32,6 +32,16 @@ pub(crate) struct JsShareTransport {
     next_open: Cell<u64>,
     opens: RefCell<HashMap<u64, ShareOpen>>,
     next_synth_ino: Cell<u64>,
+    provider_cb: Option<Closure<dyn FnMut(JsValue)>>,
+}
+
+impl Drop for JsShareTransport {
+    fn drop(&mut self) {
+        if self.provider_cb.take().is_some() {
+            let _ = js_sys::Reflect::set(&self.remote, &"onProviderEvent".into(), &JsValue::NULL);
+        }
+        let _ = call_remote_sync(&self.remote, "unmount", std::slice::from_ref(&self.grant));
+    }
 }
 
 fn map_js_share_err(remote: &JsValue, err: &JsValue) -> ShareError {
@@ -148,10 +158,14 @@ fn parse_remote_stat(
             sec: vfs_obj["ctime"].as_u64().unwrap_or(0),
             nsec: vfs_obj["ctime_nsec"].as_u64().unwrap_or(0) as u32,
         };
+        let generation = vfs_obj["generation"]
+            .as_u64()
+            .filter(|&g| g > 0)
+            .unwrap_or(1);
         let rdev = vfs_obj["rdev"].as_str().map(str::to_string);
         let acl = vfs_obj["acl"].as_bool().unwrap_or(false);
         return Ok((
-            NodeId { ino, generation: 1 },
+            NodeId { ino, generation },
             Metadata {
                 file_type,
                 mode,
@@ -204,7 +218,34 @@ fn parse_remote_stat(
     ))
 }
 
+fn lock_family_str(family: LockFamily) -> &'static str {
+    match family {
+        LockFamily::Flock => "flock",
+        LockFamily::Posix => "posix",
+    }
+}
+
+fn lock_kind_str(kind: LockKind) -> &'static str {
+    match kind {
+        LockKind::Shared => "shared",
+        LockKind::Exclusive => "exclusive",
+    }
+}
+
 impl JsShareTransport {
+    fn lock_handle(&self, open: &OpenRef) -> Result<JsValue, ShareError> {
+        let opens = self.opens.borrow();
+        let rec = opens
+            .get(&open.id)
+            .ok_or(ShareError::Remote(Errno::EBADF))?;
+        if rec.access == Access::Path {
+            return Err(ShareError::Remote(Errno::EBADF));
+        }
+        rec.js_handle
+            .clone()
+            .ok_or(ShareError::Remote(Errno::EBADF))
+    }
+
     fn rel_path(&self, handle: &Handle) -> Result<String, ShareError> {
         if handle.fs != self.fs_id {
             return Err(ShareError::Remote(Errno::EACCES));
@@ -337,6 +378,22 @@ impl ShareTransport for JsShareTransport {
                 )
                 .await?;
             }
+            if attr.uid.is_some() || attr.gid.is_some() {
+                let opts =
+                    js_sys::JSON::parse(&json!({ "uid": attr.uid, "gid": attr.gid }).to_string())
+                        .map_err(|_| ShareError::Remote(Errno::EINVAL))?;
+                call_remote(
+                    &self.remote,
+                    "policy",
+                    &[
+                        self.grant.clone(),
+                        JsValue::from_str(&rel),
+                        JsValue::from_str("chown"),
+                        opts,
+                    ],
+                )
+                .await?;
+            }
             if let Some(mode) = attr.mode {
                 let opts = js_sys::JSON::parse(&json!({ "mode": mode }).to_string())
                     .map_err(|_| ShareError::Remote(Errno::EINVAL))?;
@@ -347,6 +404,23 @@ impl ShareTransport for JsShareTransport {
                         self.grant.clone(),
                         JsValue::from_str(&rel),
                         JsValue::from_str("chmod"),
+                        opts,
+                    ],
+                )
+                .await?;
+            }
+            if !matches!(attr.atime, abi::Time::Omit) || !matches!(attr.mtime, abi::Time::Omit) {
+                let opts = js_sys::JSON::parse(
+                    &json!({ "atime": attr.atime, "mtime": attr.mtime }).to_string(),
+                )
+                .map_err(|_| ShareError::Remote(Errno::EINVAL))?;
+                call_remote(
+                    &self.remote,
+                    "policy",
+                    &[
+                        self.grant.clone(),
+                        JsValue::from_str(&rel),
+                        JsValue::from_str("utimens"),
                         opts,
                     ],
                 )
@@ -665,6 +739,13 @@ impl ShareTransport for JsShareTransport {
                     *p = format!("{to_rel}/{rest}");
                 }
             }
+            for rec in self.opens.borrow_mut().values_mut() {
+                if rec.path == from_rel {
+                    rec.path = to_rel.clone();
+                } else if let Some(rest) = rec.path.strip_prefix(&prefix) {
+                    rec.path = format!("{to_rel}/{rest}");
+                }
+            }
             Ok(())
         })
     }
@@ -817,27 +898,20 @@ impl ShareTransport for JsShareTransport {
                     JsValue::NULL,
                 ],
             )
-            .await;
-            if let Ok(v) = val
-                && let Some(text) = js_sys::JSON::stringify(&v).ok().and_then(|s| s.as_string())
-                && let Ok(sfs) = serde_json::from_str::<abi::StatFs>(&text)
-            {
-                return Ok(StatFs {
-                    block_size: sfs.bsize,
-                    blocks: sfs.blocks,
-                    blocks_free: sfs.bfree,
-                    files: sfs.files,
-                    files_free: sfs.ffree,
-                    name_max: sfs.namelen,
-                });
-            }
+            .await?;
+            let text = js_sys::JSON::stringify(&val)
+                .ok()
+                .and_then(|s| s.as_string())
+                .ok_or(ShareError::Remote(Errno::EIO))?;
+            let sfs: abi::StatFs =
+                serde_json::from_str(&text).map_err(|_| ShareError::Remote(Errno::EIO))?;
             Ok(StatFs {
-                block_size: 4096,
-                blocks: 0,
-                blocks_free: 0,
-                files: 0,
-                files_free: 0,
-                name_max: abi::NAME_MAX as u64,
+                block_size: sfs.bsize,
+                blocks: sfs.blocks,
+                blocks_free: sfs.bfree,
+                files: sfs.files,
+                files_free: sfs.ffree,
+                name_max: sfs.namelen,
             })
         })
     }
@@ -851,51 +925,22 @@ impl ShareTransport for JsShareTransport {
         Box::pin(async move {
             let access = options.access().map_err(ShareError::Remote)?;
             let rel = self.rel_path(handle)?;
-            if access == Access::Path {
-                let id = self.next_open.get();
-                self.next_open.set(id + 1);
-                self.opens.borrow_mut().insert(
-                    id,
-                    ShareOpen {
-                        js_handle: None,
-                        path: rel,
-                        access,
-                    },
-                );
-                return Ok(OpenRef {
-                    fs: self.fs_id.clone(),
-                    id,
-                    node: handle.node,
-                    access,
-                });
-            }
-            let meta = self.stat_rel(&rel, false).await?.metadata;
-            if meta.is_dir() {
-                if access.writes() || options.is_truncate() {
-                    return Err(ShareError::Remote(Errno::EISDIR));
+            if access != Access::Path {
+                let meta = self.stat_rel(&rel, false).await?.metadata;
+                if meta.is_dir() {
+                    if access == Access::Exec {
+                        return Err(ShareError::Remote(Errno::EACCES));
+                    }
+                    if access.writes() || options.is_truncate() {
+                        return Err(ShareError::Remote(Errno::EISDIR));
+                    }
                 }
-                let id = self.next_open.get();
-                self.next_open.set(id + 1);
-                self.opens.borrow_mut().insert(
-                    id,
-                    ShareOpen {
-                        js_handle: None,
-                        path: rel,
-                        access,
-                    },
-                );
-                return Ok(OpenRef {
-                    fs: self.fs_id.clone(),
-                    id,
-                    node: handle.node,
-                    access,
-                });
             }
             let mut flags: u32 = match access {
                 Access::Read | Access::Exec => abi::O_RDONLY,
                 Access::Write => abi::O_WRONLY,
                 Access::ReadWrite => abi::O_RDWR,
-                Access::Path => 0o1000_0000,
+                Access::Path => abi::O_PATH,
             };
             if options.is_truncate() {
                 flags |= abi::O_TRUNC;
@@ -909,6 +954,7 @@ impl ShareTransport for JsShareTransport {
                     JsValue::from_f64(flags as f64),
                     JsValue::from_f64(f64::from(0o666u16)),
                     JsValue::from_f64(cred.umask as f64),
+                    JsValue::from_bool(access == Access::Exec),
                 ],
             )
             .await?;
@@ -1114,40 +1160,126 @@ impl ShareTransport for JsShareTransport {
 
     fn lock<'a>(
         &'a self,
-        _open: &'a OpenRef,
-        _family: LockFamily,
-        _kind: LockKind,
-        _range: LockRange,
+        open: &'a OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
     ) -> ShareFuture<'a, ()> {
-        Box::pin(async { Err(ShareError::Remote(Errno::ENOLCK)) })
+        Box::pin(async move {
+            let h = self.lock_handle(open)?;
+            let end_js = range
+                .end()
+                .map(|e| JsValue::from_f64(e as f64))
+                .unwrap_or(JsValue::NULL);
+            call_remote(
+                &self.remote,
+                "lock",
+                &[
+                    self.grant.clone(),
+                    h,
+                    JsValue::from_str(lock_family_str(family)),
+                    JsValue::from_str(lock_kind_str(kind)),
+                    JsValue::from_f64(range.start() as f64),
+                    end_js,
+                ],
+            )
+            .await
+            .map(|_| ())
+        })
     }
 
     fn try_lock<'a>(
         &'a self,
-        _open: &'a OpenRef,
-        _family: LockFamily,
-        _kind: LockKind,
-        _range: LockRange,
+        open: &'a OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
     ) -> ShareFuture<'a, ()> {
-        Box::pin(async { Err(ShareError::Remote(Errno::ENOLCK)) })
+        Box::pin(async move {
+            let h = self.lock_handle(open)?;
+            let end_js = range
+                .end()
+                .map(|e| JsValue::from_f64(e as f64))
+                .unwrap_or(JsValue::NULL);
+            call_remote(
+                &self.remote,
+                "tryLock",
+                &[
+                    self.grant.clone(),
+                    h,
+                    JsValue::from_str(lock_family_str(family)),
+                    JsValue::from_str(lock_kind_str(kind)),
+                    JsValue::from_f64(range.start() as f64),
+                    end_js,
+                ],
+            )
+            .await
+            .map(|_| ())
+        })
     }
 
     fn unlock<'a>(
         &'a self,
-        _open: &'a OpenRef,
-        _family: LockFamily,
-        _range: LockRange,
+        open: &'a OpenRef,
+        family: LockFamily,
+        range: LockRange,
     ) -> ShareFuture<'a, ()> {
-        Box::pin(async { Err(ShareError::Remote(Errno::ENOLCK)) })
+        Box::pin(async move {
+            let h = self.lock_handle(open)?;
+            let end_js = range
+                .end()
+                .map(|e| JsValue::from_f64(e as f64))
+                .unwrap_or(JsValue::NULL);
+            call_remote(
+                &self.remote,
+                "unlock",
+                &[
+                    self.grant.clone(),
+                    h,
+                    JsValue::from_str(lock_family_str(family)),
+                    JsValue::from_f64(range.start() as f64),
+                    end_js,
+                ],
+            )
+            .await
+            .map(|_| ())
+        })
     }
 
     fn test_lock<'a>(
         &'a self,
-        _open: &'a OpenRef,
-        _kind: LockKind,
-        _range: LockRange,
+        open: &'a OpenRef,
+        kind: LockKind,
+        range: LockRange,
     ) -> ShareFuture<'a, Option<Conflict>> {
-        Box::pin(async { Err(ShareError::Remote(Errno::ENOLCK)) })
+        Box::pin(async move {
+            let h = self.lock_handle(open)?;
+            let end_js = range
+                .end()
+                .map(|e| JsValue::from_f64(e as f64))
+                .unwrap_or(JsValue::NULL);
+            let val = call_remote(
+                &self.remote,
+                "testLock",
+                &[
+                    self.grant.clone(),
+                    h,
+                    JsValue::from_str(lock_kind_str(kind)),
+                    JsValue::from_f64(range.start() as f64),
+                    end_js,
+                ],
+            )
+            .await?;
+            if val.is_null() || val.is_undefined() {
+                return Ok(None);
+            }
+            let text = js_sys::JSON::stringify(&val)
+                .ok()
+                .and_then(|s| s.as_string())
+                .ok_or(ShareError::Remote(Errno::EIO))?;
+            serde_json::from_str::<Option<Conflict>>(&text)
+                .map_err(|_| ShareError::Remote(Errno::EIO))
+        })
     }
 
     fn release<'a>(&'a self, open: &'a OpenRef) -> ShareFuture<'a, ()> {
@@ -1167,17 +1299,7 @@ impl ShareTransport for JsShareTransport {
 pub(crate) async fn build_share_backing(
     remote: JsValue,
     share_id: &str,
-) -> Result<
-    (
-        Rc<MountBacking>,
-        Handle,
-        Rc<ProviderState>,
-        bool,
-        bool,
-        Box<dyn FnOnce()>,
-    ),
-    Errno,
-> {
+) -> Result<(Rc<MountBacking>, Handle, Rc<ProviderState>, bool, bool), Errno> {
     let grant =
         js_sys::Reflect::get(&remote, &JsValue::from_str("grant")).map_err(|_| Errno::EINVAL)?;
     let read_only = js_sys::Reflect::get(&grant, &JsValue::from_str("readOnly"))
@@ -1189,7 +1311,6 @@ pub(crate) async fn build_share_backing(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let fs_id = FsId(format!("share:{share_id}"));
     let synth = Cell::new(2);
     let opts = js_sys::Object::new();
     let _ = js_sys::Reflect::set(&opts, &"follow".into(), &JsValue::from_bool(true));
@@ -1204,6 +1325,14 @@ pub(crate) async fn build_share_backing(
         ShareError::Revoked => Errno::EACCES,
         ShareError::Disconnected => Errno::ENOTCONN,
     })?;
+    let pub_fs_id = js_sys::Reflect::get(&root_stat_val, &JsValue::from_str("fsId"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .filter(|s| !s.is_empty());
+    let fs_id = FsId(match pub_fs_id {
+        Some(pub_id) => format!("share:{share_id}:{pub_id}"),
+        None => format!("share:{share_id}"),
+    });
     let (root_node, _) = parse_remote_stat(&root_stat_val, &synth).map_err(|_| Errno::EIO)?;
     let mut node_paths = HashMap::new();
     node_paths.insert(root_node, String::new());
@@ -1223,13 +1352,6 @@ pub(crate) async fn build_share_backing(
         &JsValue::from_str("onProviderEvent"),
         closure.as_ref().unchecked_ref(),
     );
-    closure.forget();
-
-    let remote_unmount = remote.clone();
-    let grant_unmount = grant.clone();
-    let cleanup: Box<dyn FnOnce()> = Box::new(move || {
-        let _ = call_remote_sync(&remote_unmount, "unmount", &[grant_unmount]);
-    });
 
     let transport = JsShareTransport {
         fs_id,
@@ -1240,10 +1362,11 @@ pub(crate) async fn build_share_backing(
         next_open: Cell::new(1),
         opens: RefCell::new(HashMap::new()),
         next_synth_ino: synth,
+        provider_cb: Some(closure),
     };
     let share_fs = ShareFs::new(transport, Rc::clone(&provider), read_only, !execute);
     let (backing, root_handle) = share_fs.into_backing();
-    Ok((backing, root_handle, provider, read_only, execute, cleanup))
+    Ok((backing, root_handle, provider, read_only, execute))
 }
 
 fn call_remote_sync(remote: &JsValue, method: &str, args: &[JsValue]) -> Result<JsValue, ()> {
