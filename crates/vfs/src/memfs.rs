@@ -623,7 +623,7 @@ impl MemFs {
                 file_type: state.inodes[ino].file_type(),
             })
             .collect();
-        self.accessed(state.inodes.get_mut(&ino).expect("checked directory"));
+        self.accessed(state.inodes.get_mut(&ino).expect("checked directory"), true);
         Ok(entries)
     }
     /// Make a node named `name` in `dir`, after the checks every creation shares.
@@ -879,14 +879,21 @@ impl MemFs {
             _ => Err(Errno::ENXIO),
         }
     }
-    /// Linux's default relatime policy. Access never changes mtime or ctime, and clock
-    /// rollback must not make a recent atime appear a day old through unsigned subtraction.
-    fn accessed(&self, inode: &mut Inode) {
+    /// Access-time update respecting active mount flags (`MS_NOATIME`, `MS_NODIRATIME`,
+    /// `MS_STRICTATIME`, `MS_RDONLY`), defaulting to Linux's relatime policy when unmounted.
+    fn accessed(&self, inode: &mut Inode, is_dir: bool) {
         let now = (self.clock)();
-        if inode.atime <= inode.mtime
-            || inode.atime <= inode.ctime
-            || now.0.saturating_sub(inode.atime.0) >= 24 * 60 * 60
-        {
+        let update = match crate::mount::active_mount_flags() {
+            Some(flags) => {
+                flags.should_update_atime(is_dir, inode.atime, inode.mtime, inode.ctime, now)
+            }
+            None => {
+                inode.atime <= inode.mtime
+                    || inode.atime <= inode.ctime
+                    || now.0.saturating_sub(inode.atime.0) >= 24 * 60 * 60
+            }
+        };
+        if update {
             inode.atime = now;
         }
     }
@@ -904,7 +911,7 @@ impl MemFs {
         }
         let len = buf.len().min(RW_MAX);
         let read = inode.read(offset, &mut buf[..len]);
-        self.accessed(inode);
+        self.accessed(inode, false);
         Ok(read)
     }
     fn do_write_at(&self, open: &OpenRef, buf: &[u8], at: WriteAt) -> Result<Written> {
@@ -1265,7 +1272,7 @@ impl Filesystem for MemFs {
             let ino = self.check(&state, link)?;
             let inode = state.inodes.get_mut(&ino).expect("checked inode");
             let target = inode.meta.link.clone().ok_or(Errno::EINVAL)?;
-            self.accessed(inode);
+            self.accessed(inode, false);
             Ok(target)
         })
     }

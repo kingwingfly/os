@@ -7,11 +7,11 @@
 //! `MS_SYNCHRONOUS` durability, export revocation (`EACCES`), provider loss (`ENOTCONN` / `EIO`
 //! uncertain writes), and `MNT_FORCE` (`EIO`).
 
-use crate::mount::{MountPin, ProviderHealth};
+use crate::mount::{MountPin, ProviderHealth, ProviderState};
 use crate::namespace::MountNamespace;
 use crate::{
-    Access, Conflict, Cred, Filesystem, Handle, LockFamily, LockKind, LockRange, Metadata,
-    OpenOptions, OpenRef, Result, SeekFrom, Timespec, WriteAt,
+    Access, Conflict, Cred, FileType, Filesystem, Handle, LockFamily, LockKind, LockRange,
+    Metadata, OpenOptions, OpenRef, Result, SeekFrom, SetAttr, Timespec, WriteAt,
 };
 use abi::Errno;
 use std::cell::{Cell, RefCell};
@@ -26,7 +26,12 @@ use std::task::{Poll, Waker};
 #[derive(Clone, Default)]
 pub struct ReleaseQueue(Rc<RefCell<Vec<Release>>>);
 
-type Release = (Rc<dyn Filesystem>, OpenRef);
+type Release = (
+    Rc<dyn Filesystem>,
+    OpenRef,
+    Option<Rc<ProviderState>>,
+    Option<u32>,
+);
 
 /// A release removed from the queue but not yet answered. Cancellation puts it back.
 struct PendingRelease<'a> {
@@ -35,8 +40,8 @@ struct PendingRelease<'a> {
 }
 impl Drop for PendingRelease<'_> {
     fn drop(&mut self) {
-        if let Some((fs, open)) = self.item.take() {
-            self.queue.push(fs, open);
+        if let Some((fs, open, provider, owner_uid)) = self.item.take() {
+            self.queue.push(fs, open, provider, owner_uid);
         }
     }
 }
@@ -51,9 +56,47 @@ impl ReleaseQueue {
     pub fn is_empty(&self) -> bool {
         self.0.borrow().is_empty()
     }
-    fn push(&self, fs: Rc<dyn Filesystem>, open: OpenRef) {
-        self.0.borrow_mut().push((fs, open));
+    fn push(
+        &self,
+        fs: Rc<dyn Filesystem>,
+        open: OpenRef,
+        provider: Option<Rc<ProviderState>>,
+        owner_uid: Option<u32>,
+    ) {
+        if provider
+            .as_ref()
+            .is_some_and(|p| p.health() != ProviderHealth::Connected)
+        {
+            return;
+        }
+        self.0.borrow_mut().push((fs, open, provider, owner_uid));
     }
+
+    async fn run_one(&self, item: Release) -> Result<()> {
+        if item
+            .2
+            .as_ref()
+            .is_some_and(|p| p.health() != ProviderHealth::Connected)
+        {
+            return Ok(());
+        }
+        let mut pending = PendingRelease {
+            queue: self,
+            item: Some(item),
+        };
+        let (fs, open, provider, _) = pending.item.as_ref().expect("pending release");
+        let released = match provider {
+            Some(p) => match p.guard_future(false, fs.release(open)).await {
+                Ok(()) => Ok(()),
+                Err(_) if p.health() != ProviderHealth::Connected => Ok(()),
+                Err(e) => Err(e),
+            },
+            None => fs.release(open).await,
+        };
+        pending.item.take();
+        released
+    }
+
     /// Release every open reference queued, and say how the first that failed did. Every
     /// release is tried, whatever an earlier one says.
     pub async fn flush(&self) -> Result<()> {
@@ -63,13 +106,41 @@ impl ReleaseQueue {
             let Some(item) = next else {
                 return result;
             };
-            let mut pending = PendingRelease {
-                queue: self,
-                item: Some(item),
+            let released = self.run_one(item).await;
+            if result.is_ok() {
+                result = released;
+            }
+        }
+    }
+
+    /// Flush only queued releases that are either unmounted or belong to `providers` and pass
+    /// the user-mount `owner_uid` check for `caller_uid` (also pruning dead/disconnected items).
+    pub(crate) async fn flush_scoped(
+        &self,
+        caller_uid: u32,
+        providers: &[*const ProviderState],
+    ) -> Result<()> {
+        let mut result = Ok(());
+        loop {
+            let next = {
+                let mut vec = self.0.borrow_mut();
+                vec.retain(|(_, _, prov, _)| {
+                    prov.as_ref()
+                        .is_none_or(|p| p.health() == ProviderHealth::Connected)
+                });
+                let pos = vec.iter().rposition(|(_, _, prov, owner_uid)| match prov {
+                    None => true,
+                    Some(p) => {
+                        owner_uid.is_none_or(|u| u == caller_uid)
+                            && providers.contains(&Rc::as_ptr(p))
+                    }
+                });
+                pos.map(|idx| vec.remove(idx))
             };
-            let (fs, open) = pending.item.as_ref().expect("pending release");
-            let released = fs.release(open).await;
-            pending.item.take();
+            let Some(item) = next else {
+                return result;
+            };
+            let released = self.run_one(item).await;
             if result.is_ok() {
                 result = released;
             }
@@ -143,9 +214,12 @@ pub struct File {
     fs: Rc<dyn Filesystem>,
     open: OpenRef,
     handle: Handle,
+    file_type: Option<FileType>,
     /// The opener's credential, as Linux keeps `f_cred`; never current-call authentication.
     cred: Cred,
     mount: Option<MountPin>,
+    backing_provider: Option<Rc<ProviderState>>,
+    backing_owner_uid: Option<u32>,
     payload: FilePayload,
     writable_tracked: Cell<bool>,
     pos: Cell<u64>,
@@ -181,6 +255,18 @@ impl File {
     }
     pub fn mount_pin(&self) -> Option<&MountPin> {
         self.mount.as_ref()
+    }
+    fn effective_provider(&self) -> Option<&Rc<ProviderState>> {
+        self.mount
+            .as_ref()
+            .map(|p| p.provider())
+            .or(self.backing_provider.as_ref())
+    }
+    fn effective_owner_uid(&self) -> Option<u32> {
+        self.mount
+            .as_ref()
+            .and_then(|p| p.owner_uid())
+            .or(self.backing_owner_uid)
     }
     pub fn mount_ns(&self) -> Option<&MountNsFile> {
         match &self.payload {
@@ -258,9 +344,14 @@ impl Drop for FileRef {
         if self.counted && self.put() {
             self.file.release_writable_tracking();
             if matches!(self.file.payload, FilePayload::Driver) {
-                self.file
-                    .releases
-                    .push(self.file.fs.clone(), self.file.open.clone());
+                let provider = self.file.effective_provider().cloned();
+                let owner_uid = self.file.effective_owner_uid();
+                self.file.releases.push(
+                    self.file.fs.clone(),
+                    self.file.open.clone(),
+                    provider,
+                    owner_uid,
+                );
             }
         }
     }
@@ -283,8 +374,47 @@ impl FileRef {
                 fs,
                 open,
                 handle,
+                file_type: None,
                 cred,
                 mount: None,
+                backing_provider: None,
+                backing_owner_uid: None,
+                payload: FilePayload::Driver,
+                writable_tracked: Cell::new(false),
+                pos: Cell::new(0),
+                pos_lock: PosLock::default(),
+                append: Cell::new(options.is_append()),
+                refs: Cell::new(1),
+                releases: releases.clone(),
+            }),
+            counted: true,
+        }
+    }
+
+    /// An internal `O_PATH` anchor/mount reference that does not pin a [`MountSlot`] as busy
+    /// (`root_open`, `mountpoint_open`, `PathAnchor.open`), while still guarding `release`
+    /// through its backing [`ProviderState`] and `owner_uid`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_provider(
+        fs: Rc<dyn Filesystem>,
+        provider: Rc<ProviderState>,
+        owner_uid: Option<u32>,
+        open: OpenRef,
+        handle: Handle,
+        cred: Cred,
+        options: &OpenOptions,
+        releases: &ReleaseQueue,
+    ) -> Self {
+        Self {
+            file: Rc::new(File {
+                fs,
+                open,
+                handle,
+                file_type: None,
+                cred,
+                mount: None,
+                backing_provider: Some(provider),
+                backing_owner_uid: owner_uid,
                 payload: FilePayload::Driver,
                 writable_tracked: Cell::new(false),
                 pos: Cell::new(0),
@@ -307,8 +437,22 @@ impl FileRef {
         options: &OpenOptions,
         releases: &ReleaseQueue,
     ) -> Self {
+        Self::new_mounted_with_type(pin, open, handle, None, cred, options, releases)
+    }
+
+    /// A mount-pinned description carrying its known [`FileType`] (`CharDevice` opens/writes are
+    /// exempt from `MS_RDONLY` and writable-open remount tracking).
+    pub fn new_mounted_with_type(
+        pin: MountPin,
+        open: OpenRef,
+        handle: Handle,
+        file_type: Option<FileType>,
+        cred: Cred,
+        options: &OpenOptions,
+        releases: &ReleaseQueue,
+    ) -> Self {
         let fs = Rc::clone(pin.fs());
-        let writable = open.access.writes();
+        let writable = open.access.writes() && file_type != Some(FileType::CharDevice);
         if writable {
             pin.slot().inc_writable_opens();
         }
@@ -317,8 +461,11 @@ impl FileRef {
                 fs,
                 open,
                 handle,
+                file_type,
                 cred,
                 mount: Some(pin),
+                backing_provider: None,
+                backing_owner_uid: None,
                 payload: FilePayload::Driver,
                 writable_tracked: Cell::new(writable),
                 pos: Cell::new(0),
@@ -360,8 +507,11 @@ impl FileRef {
                 fs: proc_fs,
                 open,
                 handle,
+                file_type: Some(FileType::File),
                 cred,
                 mount: pin,
+                backing_provider: None,
+                backing_owner_uid: None,
                 payload: FilePayload::MountNs(MountNsFile { instance_id, ns }),
                 writable_tracked: Cell::new(false),
                 pos: Cell::new(0),
@@ -388,6 +538,7 @@ impl FileRef {
         releases: &ReleaseQueue,
     ) -> Self {
         metadata.size = bytes.len() as u64;
+        let file_type = metadata.file_type;
         let open = OpenRef {
             fs: fs.id().clone(),
             id: 0,
@@ -399,8 +550,11 @@ impl FileRef {
                 fs,
                 open,
                 handle,
+                file_type: Some(file_type),
                 cred,
                 mount: pin,
+                backing_provider: None,
+                backing_owner_uid: None,
                 payload: FilePayload::VirtualBytes {
                     bytes: Rc::new(bytes),
                     metadata,
@@ -414,6 +568,46 @@ impl FileRef {
             }),
             counted: true,
         }
+    }
+
+    pub(crate) fn reopen_virtual(
+        &self,
+        access: Access,
+        cred: Cred,
+        releases: &ReleaseQueue,
+    ) -> Option<Self> {
+        let FilePayload::VirtualBytes { bytes, metadata } = &self.file.payload else {
+            return None;
+        };
+        let open = OpenRef {
+            fs: self.file.fs.id().clone(),
+            id: 0,
+            node: self.file.handle.node,
+            access,
+        };
+        Some(Self {
+            file: Rc::new(File {
+                fs: Rc::clone(&self.file.fs),
+                open,
+                handle: self.file.handle.clone(),
+                file_type: Some(metadata.file_type),
+                cred,
+                mount: self.file.mount.clone(),
+                backing_provider: None,
+                backing_owner_uid: None,
+                payload: FilePayload::VirtualBytes {
+                    bytes: Rc::clone(bytes),
+                    metadata: metadata.clone(),
+                },
+                writable_tracked: Cell::new(false),
+                pos: Cell::new(0),
+                pos_lock: PosLock::default(),
+                append: Cell::new(false),
+                refs: Cell::new(1),
+                releases: releases.clone(),
+            }),
+            counted: true,
+        })
     }
 
     /// Whether two references are to the same description.
@@ -435,19 +629,23 @@ impl FileRef {
         let result = if self.file.refs.get() == 1 {
             self.file.release_writable_tracking();
             match &self.file.payload {
-                FilePayload::Driver => {
-                    let released = self.file.fs.release(&self.file.open).await;
-                    if self
-                        .file
-                        .mount
-                        .as_ref()
-                        .is_some_and(|p| p.health() != ProviderHealth::Connected)
-                    {
-                        Ok(())
-                    } else {
-                        released
+                FilePayload::Driver => match self.file.effective_provider() {
+                    Some(prov) => {
+                        if prov.health() != ProviderHealth::Connected {
+                            Ok(())
+                        } else {
+                            match prov
+                                .guard_future(false, self.file.fs.release(&self.file.open))
+                                .await
+                            {
+                                Ok(()) => Ok(()),
+                                Err(_) if prov.health() != ProviderHealth::Connected => Ok(()),
+                                Err(e) => Err(e),
+                            }
+                        }
                     }
-                }
+                    None => self.file.fs.release(&self.file.open).await,
+                },
                 FilePayload::MountNs(_) | FilePayload::VirtualBytes { .. } => Ok(()),
             }
         } else {
@@ -475,7 +673,7 @@ impl FileRef {
                     pin.guard_enter(cred)?;
                 }
                 Ok(Metadata {
-                    file_type: crate::FileType::File,
+                    file_type: FileType::File,
                     mode: 0o444,
                     nlink: 1,
                     uid: 0,
@@ -493,6 +691,59 @@ impl FileRef {
                     pin.guard_enter(cred)?;
                 }
                 Ok(metadata.clone())
+            }
+        }
+    }
+
+    /// Descriptor attribute mutation (`fchmod`, `fchown`, `futimens`), acting with `self.cred`.
+    pub async fn setattr(&self, attr: &SetAttr) -> Result<Metadata> {
+        self.setattr_as(&self.cred, attr).await
+    }
+
+    /// Descriptor attribute mutation (`fchmod`, `fchown`, `futimens`) acting with the caller's
+    /// current `cred` (contract §2.3) and enforcing mount ownership, `MS_RDONLY`, `MS_SYNCHRONOUS`,
+    /// and provider health.
+    pub async fn setattr_as(&self, cred: &Cred, attr: &SetAttr) -> Result<Metadata> {
+        if self.access() == Access::Path {
+            return Err(Errno::EBADF);
+        }
+        let Some(pin) = &self.file.mount else {
+            return Err(Errno::EPERM);
+        };
+        let _call = self.clone();
+        match &self.file.payload {
+            FilePayload::Driver => {
+                let meta = self
+                    .file
+                    .guard(
+                        cred,
+                        true,
+                        true,
+                        self.file.fs.setattr(cred, &self.file.handle, attr),
+                    )
+                    .await?;
+                if pin.effective_flags().synchronous {
+                    match self
+                        .file
+                        .guard(cred, true, false, self.file.fs.sync_all(&self.file.open))
+                        .await
+                    {
+                        Ok(()) | Err(Errno::EINVAL) => {}
+                        Err(e) => return Err(e),
+                    }
+                    pin.backing().record_sync();
+                }
+                Ok(meta)
+            }
+            FilePayload::MountNs(_) | FilePayload::VirtualBytes { .. } => {
+                pin.guard_enter(cred)?;
+                if pin.effective_rdonly() {
+                    return Err(Errno::EROFS);
+                }
+                if *attr == SetAttr::default() {
+                    return self.metadata_as(cred).await;
+                }
+                Err(Errno::EPERM)
             }
         }
     }
@@ -599,6 +850,7 @@ impl FileRef {
         if !self.access().writes() || matches!(self.payload, FilePayload::VirtualBytes { .. }) {
             return Err(Errno::EBADF);
         }
+        let is_char_dev = self.file.file_type == Some(FileType::CharDevice);
         let _call = self.clone();
         let _pos = self.pos_lock.lock().await;
         let at = if self.is_append() {
@@ -607,11 +859,17 @@ impl FileRef {
             WriteAt::Offset(self.pos.get())
         };
         let written = self
-            .guard(cred, true, true, self.fs.write_at(&self.open, buf, at))
+            .guard(
+                cred,
+                true,
+                !is_char_dev,
+                self.fs.write_at(&self.open, buf, at),
+            )
             .await?;
         if written.len > 0 {
             self.pos.set(written.offset + written.len as u64);
-            if let Some(pin) = &self.mount
+            if !is_char_dev
+                && let Some(pin) = &self.mount
                 && pin.effective_flags().synchronous
             {
                 pin.guard_op(cred, true, false, self.fs.sync_all(&self.open))
@@ -663,6 +921,7 @@ impl FileRef {
         if !self.access().writes() || matches!(self.payload, FilePayload::VirtualBytes { .. }) {
             return Err(Errno::EBADF);
         }
+        let is_char_dev = self.file.file_type == Some(FileType::CharDevice);
         let _call = self.clone();
         let at = if self.is_append() {
             WriteAt::End
@@ -670,9 +929,15 @@ impl FileRef {
             WriteAt::Offset(offset)
         };
         let written = self
-            .guard(cred, true, true, self.fs.write_at(&self.open, buf, at))
+            .guard(
+                cred,
+                true,
+                !is_char_dev,
+                self.fs.write_at(&self.open, buf, at),
+            )
             .await?;
         if written.len > 0
+            && !is_char_dev
             && let Some(pin) = &self.mount
             && pin.effective_flags().synchronous
         {
@@ -711,16 +976,16 @@ impl FileRef {
     }
 
     pub async fn sync_all_as(&self, cred: &Cred) -> Result<()> {
+        if self.access() == Access::Path {
+            return Err(Errno::EBADF);
+        }
         let _call = self.clone();
         match &self.payload {
             FilePayload::Driver => {
-                self.guard(cred, true, false, self.fs.sync_all(&self.open))
+                self.guard(cred, false, false, self.fs.sync_all(&self.open))
                     .await
             }
             FilePayload::VirtualBytes { .. } => {
-                if self.access() == Access::Path {
-                    return Err(Errno::EBADF);
-                }
                 if let Some(pin) = &self.mount {
                     pin.guard_enter(cred)?;
                 }
@@ -736,16 +1001,16 @@ impl FileRef {
     }
 
     pub async fn sync_data_as(&self, cred: &Cred) -> Result<()> {
+        if self.access() == Access::Path {
+            return Err(Errno::EBADF);
+        }
         let _call = self.clone();
         match &self.payload {
             FilePayload::Driver => {
-                self.guard(cred, true, false, self.fs.sync_data(&self.open))
+                self.guard(cred, false, false, self.fs.sync_data(&self.open))
                     .await
             }
             FilePayload::VirtualBytes { .. } => {
-                if self.access() == Access::Path {
-                    return Err(Errno::EBADF);
-                }
                 if let Some(pin) = &self.mount {
                     pin.guard_enter(cred)?;
                 }

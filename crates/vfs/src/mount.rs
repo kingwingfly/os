@@ -1,15 +1,57 @@
 //! Mount, provider lifecycle, and O(1) pin-counted mount-slot primitives
 //! (`docs/architecture/contract.md` §2.5, §2.7, §4, §5).
 
-use crate::{Cred, FileRef, Filesystem, Handle, NodeId, Result};
+use crate::{Cred, FileRef, Filesystem, FsId, Handle, NodeId, Result};
 use abi::Errno;
 use abi::contract::{fs_magic, mount_flags, statfs_flags};
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::{Future, poll_fn};
 use std::rc::Rc;
+use std::sync::{LazyLock, Mutex};
 use std::task::{Poll, Waker};
+
+thread_local! {
+    static ACTIVE_MOUNT_FLAGS: Cell<Option<MountFlags>> = const { Cell::new(None) };
+}
+
+/// Returns the effective [`MountFlags`] of the mount currently being polled inside
+/// [`MountSlot::guard_op`], or `None` for standalone unmounted driver calls.
+pub fn active_mount_flags() -> Option<MountFlags> {
+    ACTIVE_MOUNT_FLAGS.with(|c| c.get())
+}
+
+struct MountFlagsPollGuard {
+    prev: Option<MountFlags>,
+}
+
+impl MountFlagsPollGuard {
+    fn enter(flags: MountFlags) -> Self {
+        let prev = ACTIVE_MOUNT_FLAGS.with(|c| c.replace(Some(flags)));
+        Self { prev }
+    }
+}
+
+impl Drop for MountFlagsPollGuard {
+    fn drop(&mut self) {
+        ACTIVE_MOUNT_FLAGS.with(|c| c.set(self.prev));
+    }
+}
+
+/// Collision-free monotonic `0:minor` device number per distinct [`FsId`].
+pub fn minor_for_fs_id(fs_id: &FsId) -> u64 {
+    static MINORS: LazyLock<Mutex<(HashMap<String, u64>, u64)>> =
+        LazyLock::new(|| Mutex::new((HashMap::new(), 1)));
+    let mut guard = MINORS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&m) = guard.0.get(&fs_id.0) {
+        return m;
+    }
+    let m = guard.1;
+    guard.1 = guard.1.saturating_add(1);
+    guard.0.insert(fs_id.0.clone(), m);
+    m
+}
 
 /// Kernel-monotonic mount identifier across the OS instance (never recycled, starts at 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -240,6 +282,30 @@ impl MountFlags {
         }
         parts.join(",")
     }
+
+    /// Whether an access on a mounted inode should update `atime` under these mount flags.
+    pub fn should_update_atime(
+        self,
+        is_dir: bool,
+        atime: (u64, u32),
+        mtime: (u64, u32),
+        ctime: (u64, u32),
+        now: (u64, u32),
+    ) -> bool {
+        if self.rdonly || self.atime == AtimeMode::Noatime {
+            return false;
+        }
+        if is_dir && self.nodiratime {
+            return false;
+        }
+        match self.atime {
+            AtimeMode::Noatime => false,
+            AtimeMode::Strictatime => true,
+            AtimeMode::Relatime => {
+                atime <= mtime || atime <= ctime || now.0.saturating_sub(atime.0) >= 24 * 60 * 60
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,6 +425,9 @@ impl ProviderState {
 
     /// Provider lost (`ENOTCONN`, and `EIO` + uncertain write for in-flight mutations).
     pub fn lose(&self) {
+        if self.health.get() == ProviderHealth::Revoked {
+            return;
+        }
         self.health.set(ProviderHealth::Lost);
         self.last_abort.set(AbortCause::Lost);
         self.abort_epoch.set(self.abort_epoch.get().wrapping_add(1));
@@ -375,6 +444,9 @@ impl ProviderState {
 
     /// Restore `Connected` health when a provider reconnects.
     pub fn reconnect(&self) {
+        if self.health.get() == ProviderHealth::Revoked {
+            return;
+        }
         self.health.set(ProviderHealth::Connected);
     }
 
@@ -507,6 +579,163 @@ impl Drop for MountBacking {
     }
 }
 
+pub struct WriteOpGuard<'a>(&'a MountSlot);
+
+impl<'a> WriteOpGuard<'a> {
+    fn enter(slot: &'a MountSlot) -> Self {
+        slot.in_flight_writes.set(slot.in_flight_writes.get() + 1);
+        Self(slot)
+    }
+}
+
+impl Drop for WriteOpGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .in_flight_writes
+            .set(self.0.in_flight_writes.get() - 1);
+    }
+}
+
+pub(crate) struct DetachedParent {
+    pub parent_slot: Rc<MountSlot>,
+    pub mountpoint: Handle,
+    pub _mountpoint_open: FileRef,
+    pub mp_parent_node: Option<NodeId>,
+    pub mp_name: Option<String>,
+}
+
+pub(crate) struct DetachedNode {
+    pub slot: Rc<MountSlot>,
+    pub root: Handle,
+    pub _root_open: FileRef,
+    pub parent: Option<DetachedParent>,
+}
+
+/// Preserves internal parent/child mount topology for a lazily detached mount subtree as long as
+/// at least one external [`MountPin`] (`FileRef`, `cwd`, `root`) references any mount in the
+/// subtree. Clears all internal `Rc<MountSlot>` links immediately when `external_pins` reaches 0.
+pub(crate) struct DetachedGroup {
+    external_pins: Cell<usize>,
+    nodes: RefCell<BTreeMap<MountId, DetachedNode>>,
+    children: RefCell<HashMap<(MountId, NodeId), Vec<MountId>>>,
+    parents_with_children: RefCell<HashSet<MountId>>,
+    mp_names_by_parent: RefCell<HashMap<(MountId, NodeId), HashSet<String>>>,
+}
+
+impl DetachedGroup {
+    pub(crate) fn install(
+        entries: Vec<MountEntry>,
+        children_order: HashMap<(MountId, NodeId), Vec<MountId>>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        let detached_ids: HashSet<MountId> = entries.iter().map(|e| e.slot.id).collect();
+        for entry in &entries {
+            entry.slot.detached.set(true);
+        }
+
+        let mut nodes = BTreeMap::new();
+        let mut mp_names_by_parent: HashMap<(MountId, NodeId), HashSet<String>> = HashMap::new();
+
+        for entry in entries {
+            let MountEntry {
+                slot,
+                parent,
+                root,
+                root_open,
+                ..
+            } = entry;
+            let detached_parent = match parent {
+                Some(att) => {
+                    let parent_id = att.parent_pin.id();
+                    if detached_ids.contains(&parent_id) {
+                        let parent_slot = Rc::clone(att.parent_pin.slot());
+                        drop(att.parent_pin);
+                        if let (Some(dir_node), Some(name)) =
+                            (att.mp_parent_node, att.mp_name.as_ref())
+                        {
+                            mp_names_by_parent
+                                .entry((parent_id, dir_node))
+                                .or_default()
+                                .insert(name.clone());
+                        }
+                        Some(DetachedParent {
+                            parent_slot,
+                            mountpoint: att.mountpoint,
+                            _mountpoint_open: att.mountpoint_open,
+                            mp_parent_node: att.mp_parent_node,
+                            mp_name: att.mp_name,
+                        })
+                    } else {
+                        drop(att);
+                        None
+                    }
+                }
+                None => None,
+            };
+            nodes.insert(
+                slot.id,
+                DetachedNode {
+                    slot,
+                    root,
+                    _root_open: root_open,
+                    parent: detached_parent,
+                },
+            );
+        }
+
+        let external_pins: usize = nodes.values().map(|n| n.slot.active_pins()).sum();
+        if external_pins == 0 {
+            return;
+        }
+
+        let mut children: HashMap<(MountId, NodeId), Vec<MountId>> = HashMap::new();
+        let mut parents_with_children: HashSet<MountId> = HashSet::new();
+        for ((pm, pnode), stack) in children_order {
+            if detached_ids.contains(&pm) {
+                let filtered: Vec<MountId> = stack
+                    .into_iter()
+                    .filter(|cid| detached_ids.contains(cid))
+                    .collect();
+                if !filtered.is_empty() {
+                    parents_with_children.insert(pm);
+                    children.insert((pm, pnode), filtered);
+                }
+            }
+        }
+
+        let group = Rc::new(Self {
+            external_pins: Cell::new(external_pins),
+            nodes: RefCell::new(nodes),
+            children: RefCell::new(children),
+            parents_with_children: RefCell::new(parents_with_children),
+            mp_names_by_parent: RefCell::new(mp_names_by_parent),
+        });
+        for node in group.nodes.borrow().values() {
+            *node.slot.detached_group.borrow_mut() = Some(Rc::clone(&group));
+        }
+    }
+
+    fn inc_external_pins(&self) {
+        self.external_pins.set(self.external_pins.get() + 1);
+    }
+
+    fn dec_external_pins(&self) {
+        let rem = self.external_pins.get() - 1;
+        self.external_pins.set(rem);
+        if rem == 0 {
+            let nodes = std::mem::take(&mut *self.nodes.borrow_mut());
+            self.children.borrow_mut().clear();
+            self.parents_with_children.borrow_mut().clear();
+            self.mp_names_by_parent.borrow_mut().clear();
+            for node in nodes.into_values() {
+                *node.slot.detached_group.borrow_mut() = None;
+            }
+        }
+    }
+}
+
 /// Per-`MountId` state held by [`MountEntry`] and pinned by [`MountPin`].
 pub struct MountSlot {
     pub id: MountId,
@@ -520,6 +749,8 @@ pub struct MountSlot {
     pub detached: Cell<bool>,
     active_pins: Cell<usize>,
     writable_opens: Cell<usize>,
+    in_flight_writes: Cell<usize>,
+    detached_group: RefCell<Option<Rc<DetachedGroup>>>,
 }
 
 impl MountSlot {
@@ -556,11 +787,16 @@ impl MountSlot {
             detached: Cell::new(false),
             active_pins: Cell::new(0),
             writable_opens: Cell::new(0),
+            in_flight_writes: Cell::new(0),
+            detached_group: RefCell::new(None),
         })
     }
 
     pub fn pin(self: &Rc<Self>) -> MountPin {
         self.active_pins.set(self.active_pins.get() + 1);
+        if let Some(group) = self.detached_group.borrow().as_ref() {
+            group.inc_external_pins();
+        }
         MountPin(Rc::clone(self))
     }
 
@@ -613,6 +849,17 @@ impl MountSlot {
         self.writable_opens.get()
     }
 
+    pub fn in_flight_writes(&self) -> usize {
+        self.in_flight_writes.get()
+    }
+
+    pub fn begin_write(&self) -> Result<WriteOpGuard<'_>> {
+        if self.effective_rdonly() {
+            return Err(Errno::EROFS);
+        }
+        Ok(WriteOpGuard::enter(self))
+    }
+
     pub(crate) fn inc_writable_opens(&self) {
         self.writable_opens.set(self.writable_opens.get() + 1);
     }
@@ -646,10 +893,20 @@ impl MountSlot {
         F: Future<Output = Result<T>>,
     {
         self.check_owner(cred)?;
-        if check_rofs && self.effective_rdonly() {
-            return Err(Errno::EROFS);
-        }
-        self.backing.provider.guard_future(is_mutating, fut).await
+        let _write_guard = if check_rofs {
+            Some(self.begin_write()?)
+        } else {
+            None
+        };
+        let mut fut = std::pin::pin!(fut);
+        let wrapped = poll_fn(|cx| {
+            let _flags_guard = MountFlagsPollGuard::enter(self.effective_flags());
+            fut.as_mut().poll(cx)
+        });
+        self.backing
+            .provider
+            .guard_future(is_mutating, wrapped)
+            .await
     }
 }
 
@@ -660,6 +917,9 @@ pub struct MountPin(Rc<MountSlot>);
 impl Clone for MountPin {
     fn clone(&self) -> Self {
         self.0.active_pins.set(self.0.active_pins.get() + 1);
+        if let Some(group) = self.0.detached_group.borrow().as_ref() {
+            group.inc_external_pins();
+        }
         Self(Rc::clone(&self.0))
     }
 }
@@ -667,6 +927,10 @@ impl Clone for MountPin {
 impl Drop for MountPin {
     fn drop(&mut self) {
         self.0.active_pins.set(self.0.active_pins.get() - 1);
+        let group = self.0.detached_group.borrow().clone();
+        if let Some(group) = group {
+            group.dec_external_pins();
+        }
     }
 }
 
@@ -755,6 +1019,77 @@ impl MountPin {
 
     pub fn writable_opens(&self) -> usize {
         self.0.writable_opens()
+    }
+
+    pub fn in_flight_writes(&self) -> usize {
+        self.0.in_flight_writes()
+    }
+
+    pub fn begin_write(&self) -> Result<WriteOpGuard<'_>> {
+        self.0.begin_write()
+    }
+
+    pub(crate) fn detached_topmost_at(
+        &self,
+        mp_mount: MountId,
+        mp_node: NodeId,
+    ) -> Option<(MountPin, Handle)> {
+        let group = self.0.detached_group.borrow().clone()?;
+        let children = group.children.borrow();
+        let nodes = group.nodes.borrow();
+        let mut cur_mount = mp_mount;
+        let mut cur_node = mp_node;
+        let mut found: Option<&DetachedNode> = None;
+        while let Some(stack) = children.get(&(cur_mount, cur_node))
+            && let Some(&top_id) = stack.last()
+            && let Some(entry) = nodes.get(&top_id)
+        {
+            cur_mount = top_id;
+            cur_node = entry.root.node;
+            found = Some(entry);
+        }
+        let entry = found?;
+        let pin = entry.slot.pin();
+        let root = entry.root.clone();
+        drop(nodes);
+        drop(children);
+        Some((pin, root))
+    }
+
+    pub(crate) fn detached_mount_parent(
+        &self,
+        mount_id: MountId,
+    ) -> Option<(MountPin, Handle, Option<NodeId>, Option<String>)> {
+        let group = self.0.detached_group.borrow().clone()?;
+        let nodes = group.nodes.borrow();
+        let p = nodes.get(&mount_id)?.parent.as_ref()?;
+        let pin = p.parent_slot.pin();
+        let mp = p.mountpoint.clone();
+        let mp_parent = p.mp_parent_node;
+        let mp_name = p.mp_name.clone();
+        drop(nodes);
+        Some((pin, mp, mp_parent, mp_name))
+    }
+
+    pub(crate) fn detached_dir_has_mountpoint(
+        &self,
+        parent_mount: MountId,
+        parent_dir_node: NodeId,
+        name: &str,
+    ) -> bool {
+        let Some(group) = self.0.detached_group.borrow().clone() else {
+            return false;
+        };
+        let map = group.mp_names_by_parent.borrow();
+        map.get(&(parent_mount, parent_dir_node))
+            .is_some_and(|set| set.contains(name))
+    }
+
+    pub(crate) fn detached_has_children_on(&self, parent_mount: MountId) -> bool {
+        let Some(group) = self.0.detached_group.borrow().clone() else {
+            return false;
+        };
+        group.parents_with_children.borrow().contains(&parent_mount)
     }
 
     pub fn guard_enter(&self, cred: &Cred) -> Result<()> {

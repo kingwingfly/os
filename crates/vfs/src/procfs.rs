@@ -143,6 +143,12 @@ pub trait ProcBridge {
     fn current_caller(&self) -> Option<ProcCallerInfo>;
     fn local_pids(&self) -> Vec<u32>;
     fn process_info(&self, pid: u32) -> Option<ProcTargetInfo>;
+    fn namespace_by_id(
+        &self,
+        _id: crate::mount::NamespaceId,
+    ) -> Option<Rc<RefCell<MountNamespace>>> {
+        None
+    }
 }
 
 pub fn may_inspect_proc(cred: &Cred, target_uid: u32) -> Result<()> {
@@ -455,10 +461,16 @@ impl<P: ProcProvider> ProcFs<P> {
                 }
             }
             ProcNode::PidDir(pid) => {
-                let (_, _, is_local) = self.pid_owner(cred, pid).await?;
+                let (uid, _, is_local) = self.pid_owner(cred, pid).await?;
                 match name {
-                    "mountinfo" if is_local => ProcNode::PidMountinfo(pid),
-                    "mounts" if is_local => ProcNode::PidMounts(pid),
+                    "mountinfo" if is_local => {
+                        may_inspect_proc(cred, uid)?;
+                        ProcNode::PidMountinfo(pid)
+                    }
+                    "mounts" if is_local => {
+                        may_inspect_proc(cred, uid)?;
+                        ProcNode::PidMounts(pid)
+                    }
                     "ns" if is_local => ProcNode::PidNsDir(pid),
                     "root" if is_local => ProcNode::PidRoot(pid),
                     "cwd" if is_local => ProcNode::PidCwd(pid),
@@ -536,6 +548,7 @@ impl<P: ProcProvider> ProcFs<P> {
             ProcNode::PidMountinfo(pid) => {
                 let bridge = self.bridge().ok_or(Errno::ENOENT)?;
                 let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
+                may_inspect_proc(cred, info.uid)?;
                 let (reader_root, is_at_ns_root) = self.reader_root_for(&info.mnt_ns);
                 Ok(
                     format_mountinfo(cred, &info.mnt_ns, &reader_root, is_at_ns_root)
@@ -546,6 +559,7 @@ impl<P: ProcProvider> ProcFs<P> {
             ProcNode::PidMounts(pid) => {
                 let bridge = self.bridge().ok_or(Errno::ENOENT)?;
                 let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
+                may_inspect_proc(cred, info.uid)?;
                 let (reader_root, is_at_ns_root) = self.reader_root_for(&info.mnt_ns);
                 Ok(
                     format_mounts(cred, &info.mnt_ns, &reader_root, is_at_ns_root)
@@ -617,15 +631,47 @@ pub async fn format_proc_link(
     target_handle: &Handle,
     reader_root: &PathAnchor,
 ) -> String {
+    format_proc_link_with_bridge(
+        cred,
+        target_ns,
+        target_pin,
+        target_handle,
+        reader_root,
+        None,
+    )
+    .await
+}
+
+async fn format_proc_link_with_bridge(
+    cred: &Cred,
+    target_ns: &Rc<RefCell<MountNamespace>>,
+    target_pin: &MountPin,
+    target_handle: &Handle,
+    reader_root: &PathAnchor,
+    bridge: Option<&dyn ProcBridge>,
+) -> String {
     let deleted = target_pin
-        .fs()
-        .metadata(cred, target_handle)
+        .guard_op(
+            cred,
+            false,
+            false,
+            target_pin.fs().metadata(cred, target_handle),
+        )
         .await
         .is_ok_and(|m| m.nlink == 0);
     let suffix = if deleted { " (deleted)" } else { "" };
 
     let mut cur_pin = target_pin.clone();
     let mut cur_handle = target_handle.clone();
+    let mut cur_ns = if target_ns.borrow().id() == cur_pin.ns_id() {
+        Rc::clone(target_ns)
+    } else if let Some(b) = bridge
+        && let Some(found) = b.namespace_by_id(cur_pin.ns_id())
+    {
+        found
+    } else {
+        Rc::clone(target_ns)
+    };
     let mut segments: Vec<String> = Vec::new();
     let mut unreachable = false;
 
@@ -635,10 +681,22 @@ pub async fn format_proc_link(
         }
         if cur_handle.node == cur_pin.root_node() {
             if cur_pin.is_detached() {
+                if let Some((p_pin, mp_handle, _, _)) = cur_pin.detached_mount_parent(cur_pin.id())
+                {
+                    cur_pin = p_pin;
+                    cur_handle = mp_handle;
+                    continue;
+                }
                 unreachable = true;
                 break;
             }
-            let next_parent = target_ns
+            if cur_ns.borrow().id() != cur_pin.ns_id()
+                && let Some(b) = bridge
+                && let Some(found) = b.namespace_by_id(cur_pin.ns_id())
+            {
+                cur_ns = found;
+            }
+            let next_parent = cur_ns
                 .borrow()
                 .entry(cur_pin.id())
                 .and_then(|e| e.parent.as_ref())
@@ -656,7 +714,10 @@ pub async fn format_proc_link(
             }
         }
         let fs = Rc::clone(cur_pin.fs());
-        match fs.parent(cred, &cur_handle).await {
+        match cur_pin
+            .guard_op(cred, false, false, fs.parent(cred, &cur_handle))
+            .await
+        {
             Ok(Some((parent_entry, name))) => {
                 segments.push(name);
                 cur_handle = parent_entry.handle;
@@ -983,13 +1044,15 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
                     let bridge = self.bridge().ok_or(Errno::ENOENT)?;
                     let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
                     may_inspect_proc(cred, info.uid)?;
+                    info.root.pin.guard_enter(cred)?;
                     let (reader_root, _) = self.reader_root_for(&info.mnt_ns);
-                    Ok(format_proc_link(
+                    Ok(format_proc_link_with_bridge(
                         cred,
                         &info.mnt_ns,
                         &info.root.pin,
                         &info.root.handle,
                         &reader_root,
+                        Some(bridge.as_ref()),
                     )
                     .await)
                 }
@@ -997,13 +1060,15 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
                     let bridge = self.bridge().ok_or(Errno::ENOENT)?;
                     let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
                     may_inspect_proc(cred, info.uid)?;
+                    info.cwd.pin.guard_enter(cred)?;
                     let (reader_root, _) = self.reader_root_for(&info.mnt_ns);
-                    Ok(format_proc_link(
+                    Ok(format_proc_link_with_bridge(
                         cred,
                         &info.mnt_ns,
                         &info.cwd.pin,
                         &info.cwd.handle,
                         &reader_root,
+                        Some(bridge.as_ref()),
                     )
                     .await)
                 }
@@ -1021,13 +1086,15 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
                         return Ok(format!("mnt:[{ns_id}]"));
                     }
                     if let Some(pin) = file.mount_pin() {
+                        pin.guard_enter(cred)?;
                         let (reader_root, _) = self.reader_root_for(&info.mnt_ns);
-                        return Ok(format_proc_link(
+                        return Ok(format_proc_link_with_bridge(
                             cred,
                             &info.mnt_ns,
                             pin,
                             file.handle(),
                             &reader_root,
+                            Some(bridge.as_ref()),
                         )
                         .await);
                     }

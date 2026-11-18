@@ -67,6 +67,8 @@ pub async fn handle(
         .headers()
         .get("X-OS-Chroot")?
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let fs_session = req.headers().get("X-Fs-Session")?.filter(|s| !s.is_empty());
+    let fs_secret = req.headers().get("X-Fs-Secret")?.filter(|s| !s.is_empty());
     // As whom each call is made: the page's session, or the process the batch names.
     let session = Rc::new(Session {
         key: key.clone(),
@@ -78,6 +80,8 @@ pub async fn handle(
         release: req.headers().get("X-OS-Release")?,
         no_usr_fallback,
         chroot,
+        fs_session,
+        fs_secret,
     });
     // The session was heard from: its descriptors are kept (a process's, its line's), and a
     // page's keeps those of the processes its tabs run, whatever account they run as.
@@ -335,6 +339,8 @@ pub struct Session {
     pub release: Option<String>,
     pub no_usr_fallback: bool,
     pub chroot: bool,
+    pub fs_session: Option<String>,
+    pub fs_secret: Option<String>,
 }
 
 /// As whom a call acts, once a transaction found it: its process (credentials and umask), the
@@ -355,6 +361,10 @@ impl Session {
     /// The browser's process namespace.
     pub fn namespace(&self) -> String {
         Db::namespace(self.key.as_deref(), self.guest.as_deref())
+    }
+    /// Optional authenticated `/api/fs` v2 session `(id, secret)` attached via HTTP headers.
+    pub fn fs_auth(&self) -> Option<(&str, &str)> {
+        Some((self.fs_session.as_deref()?, self.fs_secret.as_deref()?))
     }
     /// As whom its calls act, as the store `db` knows it: a process token runs as the
     /// process's snapshot, never as the page signed in later; a page's batch as the session's
@@ -796,22 +806,29 @@ fn allowed_proc_path(path: &str) -> bool {
         && !path.starts_with("/proc/self/fdinfo/")
 }
 
-fn allowed_dev_open(db: &Db, path: &str, flags: u32) -> bool {
-    flags & abi::O_CREAT == 0
-        && canonical_subpath(path, "/dev")
-        && path != "/dev"
+fn allowed_dev_path_pure(path: &str, persisted_is_device: Option<bool>) -> bool {
+    canonical_subpath(path, "/dev")
+        && !matches!(path, "/dev" | "/dev/pts" | "/dev/present" | "/dev/snd")
         && matches!(os_core::parent(path), "/dev" | "/dev/present" | "/dev/snd")
-        && db.persisted_node(path).is_none_or(|n| n.is_device())
+        && persisted_is_device.unwrap_or(true)
+}
+
+fn allowed_dev_open_with(
+    path: &str,
+    flags: u32,
+    mut is_device: impl FnMut(&str) -> Option<bool>,
+) -> bool {
+    flags & abi::O_CREAT == 0 && allowed_dev_path_pure(path, is_device(path))
 }
 
 /// Ordinary OS process tokens (`credential.job().is_none()`) resolve all filesystem paths via
 /// the client kernel's VFS and `/api/fs` v2 handles; direct v1 `/api/sys` filesystem path calls
 /// are refused at the server boundary so a chrooted or namespaced process cannot escape.
-fn authorize_process_v1(
-    db: &Db,
-    sid: Option<&str>,
+fn authorize_process_v1_with(
     credential: &Credential,
     call: &Call,
+    mut is_device: impl FnMut(&str) -> Option<bool>,
+    mut fd_info: impl FnMut(u32) -> Option<(bool, String)>,
 ) -> std::result::Result<(), Error> {
     if credential.job().is_some() {
         return Ok(());
@@ -832,7 +849,9 @@ fn authorize_process_v1(
         }
         | Call::InotifyRmWatch { .. } => Ok(()),
         Call::Close { .. } | Call::Ioctl { .. } => Ok(()),
-        Call::Open { path, flags, .. } if allowed_dev_open(db, path, *flags) => Ok(()),
+        Call::Open { path, flags, .. } if allowed_dev_open_with(path, *flags, &mut is_device) => {
+            Ok(())
+        }
         Call::Open { path, flags, .. }
             if allowed_proc_path(path)
                 && flags & abi::O_ACCMODE == abi::O_RDONLY
@@ -846,6 +865,11 @@ fn authorize_process_v1(
             ..
         } if canonical_subpath(path, "/dev")
             && matches!(os_core::parent(path), "/dev/present" | "/dev/snd") =>
+        {
+            Ok(())
+        }
+        Call::Stat { path } | Call::Lstat { path }
+            if allowed_dev_path_pure(path, is_device(path)) =>
         {
             Ok(())
         }
@@ -867,21 +891,29 @@ fn authorize_process_v1(
             fd: Some(fd),
             path: None,
             ..
-        } if sid
-            .and_then(|s| db.fd(s, fd.number()))
-            .is_none_or(|f| f.device.is_some() || allowed_proc_path(&f.path)) =>
-        {
+        } if fd_info(fd.number()).is_none_or(|(is_dev, p)| is_dev || allowed_proc_path(&p)) => {
             Ok(())
         }
-        Call::Pwrite { fd, .. }
-            if sid
-                .and_then(|s| db.fd(s, fd.number()))
-                .is_none_or(|f| f.device.is_some()) =>
-        {
-            Ok(())
-        }
+        Call::Pwrite { fd, .. } if fd_info(fd.number()).is_none_or(|(is_dev, _)| is_dev) => Ok(()),
         _ => Err(Errno::EPERM.into()),
     }
+}
+
+fn authorize_process_v1(
+    db: &Db,
+    sid: Option<&str>,
+    credential: &Credential,
+    call: &Call,
+) -> std::result::Result<(), Error> {
+    authorize_process_v1_with(
+        credential,
+        call,
+        |path| db.persisted_node(path).map(|n| n.is_device()),
+        |fd_num| {
+            sid.and_then(|s| db.fd(s, fd_num))
+                .map(|f| (f.device.is_some(), f.path))
+        },
+    )
 }
 
 /// The call `call`, as `acting` found it: a process's own snapshot, or the session's account
@@ -950,6 +982,7 @@ fn run(
                     db,
                     &session.namespace(),
                     caller.as_ref(),
+                    session.fs_auth(),
                     &handle,
                 )?;
                 if !node.directory {
@@ -1022,6 +1055,7 @@ fn run(
             process,
             acting.owner().as_deref(),
             caller.as_ref(),
+            session.fs_auth(),
             call,
         ),
         call => kernel::call(db, process, call),
@@ -1506,4 +1540,116 @@ fn account(
             };
             Error::because(errno, why)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proc_credential() -> Credential {
+        serde_json::from_value(json!({
+            "token": "tok-hash",
+            "ns": "user:1001",
+            "pid": 42,
+            "uid": 1001,
+            "gid": 1001,
+            "groups": "[1001]",
+            "umask": 0o022,
+            "generation": null,
+            "cloud_access": 1,
+            "owner": "user:1001 42 tok-hash"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn authorize_process_v1_permits_dev_stat_and_lstat_while_blocking_escapes() {
+        let cred = proc_credential();
+        let is_dev = |path: &str| match path {
+            "/dev/present/deck" | "/dev/snd/mic" | "/dev/archive" | "/dev/media"
+            | "/dev/system" => Some(true),
+            "/dev/not_a_device" => Some(false),
+            _ => None,
+        };
+
+        for path in [
+            "/dev/present/deck",
+            "/dev/present/missing",
+            "/dev/snd/mic",
+            "/dev/archive",
+            "/dev/media",
+            "/dev/system",
+        ] {
+            assert!(
+                authorize_process_v1_with(
+                    &cred,
+                    &Call::Lstat {
+                        path: path.to_string(),
+                    },
+                    is_dev,
+                    |_| None,
+                )
+                .is_ok(),
+                "expected Lstat Ok for {path}"
+            );
+            assert!(
+                authorize_process_v1_with(
+                    &cred,
+                    &Call::Stat {
+                        path: path.to_string(),
+                    },
+                    is_dev,
+                    |_| None,
+                )
+                .is_ok(),
+                "expected Stat Ok for {path}"
+            );
+        }
+
+        for denied in [
+            "/dev",
+            "/dev/present",
+            "/dev/snd",
+            "/dev/pts",
+            "/dev/pts/0",
+            "/dev/../etc/passwd",
+            "/dev/present/../pts/0",
+            "/dev/not_a_device",
+            "/etc/passwd",
+            "/proc/self/fd/0",
+        ] {
+            assert_eq!(
+                authorize_process_v1_with(
+                    &cred,
+                    &Call::Lstat {
+                        path: denied.to_string(),
+                    },
+                    is_dev,
+                    |_| None,
+                )
+                .unwrap_err()
+                .errno,
+                Errno::EPERM,
+                "expected EPERM for {denied}"
+            );
+        }
+
+        // Session::fs_auth requires both non-empty X-Fs-Session and X-Fs-Secret.
+        let mut s = Session {
+            key: None,
+            guest: None,
+            sudo: false,
+            umask: None,
+            pid: Some(42),
+            token: Some("tok".into()),
+            release: None,
+            no_usr_fallback: false,
+            chroot: false,
+            fs_session: Some("fs-sid".into()),
+            fs_secret: None,
+        };
+        assert_eq!(s.fs_auth(), None);
+        s.fs_secret = Some("fs-sec".into());
+        assert_eq!(s.fs_auth(), Some(("fs-sid", "fs-sec")));
+    }
 }

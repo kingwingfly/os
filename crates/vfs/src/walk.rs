@@ -3,7 +3,7 @@
 //! `MAXSYMLINKS`, `MS_NOSYMFOLLOW`, sticky-directory `may_follow_link`, trailing-slash directory
 //! rules, user-mount `owner_uid` ceilings, and `/proc` magic links.
 
-use crate::context::{FsContext, PathAnchor};
+use crate::context::{FsContext, PathAnchor, SharedFdTable};
 use crate::descriptions::may_follow_link;
 use crate::mount::{FsType, MountPin};
 use crate::namespace::MountNamespace;
@@ -17,6 +17,30 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ops::{BitOr, BitOrAssign};
 use std::rc::Rc;
+
+/// Read-only descriptor lookup abstraction so [`walk`] and [`walk_parent`] borrow [`FdTable`] or
+/// [`SharedFdTable`] without deep-cloning descriptor tables on every syscall.
+pub trait FdLookup {
+    fn get_fd(&self, fd: Fd) -> Result<FileRef>;
+}
+
+impl FdLookup for FdTable {
+    fn get_fd(&self, fd: Fd) -> Result<FileRef> {
+        self.get(fd)
+    }
+}
+
+impl FdLookup for SharedFdTable {
+    fn get_fd(&self, fd: Fd) -> Result<FileRef> {
+        self.borrow().get(fd)
+    }
+}
+
+impl<T: FdLookup + ?Sized> FdLookup for &T {
+    fn get_fd(&self, fd: Fd) -> Result<FileRef> {
+        (**self).get_fd(fd)
+    }
+}
 
 /// Starting anchor for a path walk (`AT_FDCWD`, `OS_FD_ROOT`, `OS_FD_CWD`, or open `dirfd`).
 #[derive(Clone, Debug)]
@@ -167,7 +191,7 @@ pub async fn ensure_searchable(
 async fn resolve_initial_anchor(
     cred: &Cred,
     ctx: &FsContext,
-    fds: &FdTable,
+    fds: &impl FdLookup,
     anchor: &StartAnchor,
     force_root: bool,
 ) -> Result<(MountPin, Handle, Option<Metadata>)> {
@@ -179,7 +203,7 @@ async fn resolve_initial_anchor(
         StartAnchor::AtFdCwd => Ok((ctx.cwd.pin.clone(), ctx.cwd.handle.clone(), None)),
         StartAnchor::Anchor(a) => Ok((a.pin.clone(), a.handle.clone(), None)),
         StartAnchor::DirFd(fd) => {
-            let file = fds.get(*fd)?;
+            let file = fds.get_fd(*fd)?;
             if file.mount_ns().is_some() {
                 return Err(Errno::ENOTDIR);
             }
@@ -193,13 +217,63 @@ async fn resolve_initial_anchor(
     }
 }
 
+fn ns_for_pin(
+    default_ns: &Rc<RefCell<MountNamespace>>,
+    proc_bridge: Option<&dyn ProcBridge>,
+    pin: &MountPin,
+) -> Rc<RefCell<MountNamespace>> {
+    if default_ns.borrow().id() == pin.ns_id() {
+        return Rc::clone(default_ns);
+    }
+    if let Some(b) = proc_bridge
+        && let Some(found) = b.namespace_by_id(pin.ns_id())
+    {
+        return found;
+    }
+    Rc::clone(default_ns)
+}
+
+fn can_batch_on_pin(cur_ns: &MountNamespace, cur_pin: &MountPin) -> bool {
+    if cur_pin.fstype() == FsType::Proc {
+        return false;
+    }
+    if matches!(
+        cur_pin.fstype(),
+        FsType::HostFs | FsType::HelperFs | FsType::ShareFs
+    ) {
+        let has_children = if cur_pin.is_detached() {
+            cur_pin.detached_has_children_on(cur_pin.id())
+        } else {
+            cur_ns.has_children_on(cur_pin.id())
+        };
+        if has_children {
+            return false;
+        }
+    }
+    true
+}
+
+fn seg_may_be_mountpoint(
+    cur_ns: &MountNamespace,
+    cur_pin: &MountPin,
+    cur_dir_node: crate::NodeId,
+    name: &str,
+) -> bool {
+    if cur_pin.is_detached() {
+        cur_pin.detached_dir_has_mountpoint(cur_pin.id(), cur_dir_node, name)
+            || cur_pin.detached_has_children_on(cur_pin.id())
+    } else {
+        cur_ns.may_be_mountpoint_name(cur_pin.id(), name)
+    }
+}
+
 /// Component-wise path resolution against `(ns, ctx, fds)`.
 #[allow(clippy::too_many_arguments)]
 pub async fn walk(
     cred: &Cred,
     ns: &Rc<RefCell<MountNamespace>>,
     ctx: &FsContext,
-    fds: &FdTable,
+    fds: &impl FdLookup,
     proc_bridge: Option<&dyn ProcBridge>,
     anchor: &StartAnchor,
     path: &str,
@@ -223,11 +297,12 @@ pub async fn walk(
         queue.push_back(seg.to_string());
     }
 
-    let mut trailing_dir =
-        flags.contains(WalkFlags::MUST_BE_DIR) || (path.ends_with('/') && !queue.is_empty());
+    let must_be_dir = flags.contains(WalkFlags::MUST_BE_DIR);
+    let mut has_trailing_slash = path.ends_with('/') && !queue.is_empty();
 
     let (mut cur_pin, mut cur_handle, mut cur_meta) =
         resolve_initial_anchor(cred, ctx, fds, anchor, path.starts_with('/')).await?;
+    let mut cur_ns = ns_for_pin(ns, proc_bridge, &cur_pin);
     let mut cur_searchable = false;
     let mut last_step: Option<(MountPin, Handle, String)> = None;
     let mut symlinks_followed: usize = 0;
@@ -260,7 +335,7 @@ pub async fn walk(
                             .await?
                     }
                 };
-                if trailing_dir && !meta.is_dir() {
+                if (has_trailing_slash || must_be_dir) && !meta.is_dir() {
                     return Err(Errno::ENOTDIR);
                 }
                 return Ok(WalkResult::Found {
@@ -278,7 +353,7 @@ pub async fn walk(
                 queue.pop_front();
                 last_step = None;
                 if queue.is_empty() {
-                    trailing_dir = true;
+                    has_trailing_slash = true;
                 }
                 continue 'walk;
             }
@@ -290,7 +365,7 @@ pub async fn walk(
                 // 1. Process `chroot` boundary check FIRST (before mount-root unwind!).
                 if ctx.root.same_location(&cur_pin, cur_handle.node) {
                     if queue.is_empty() {
-                        trailing_dir = true;
+                        has_trailing_slash = true;
                     }
                     continue 'walk;
                 }
@@ -298,11 +373,29 @@ pub async fn walk(
                 // 2. Mount-root unwind loop across stacked/parent mounts.
                 let mut clamped = false;
                 while cur_handle.node == cur_pin.root_node() {
-                    if ctx.root.same_location(&cur_pin, cur_handle.node) || cur_pin.is_detached() {
+                    if ctx.root.same_location(&cur_pin, cur_handle.node) {
                         clamped = true;
                         break;
                     }
-                    let parent_step = ns
+                    if cur_pin.is_detached() {
+                        match cur_pin.detached_mount_parent(cur_pin.id()) {
+                            Some((p_pin, mp_handle, _, _)) => {
+                                cur_pin = p_pin;
+                                cur_handle = mp_handle;
+                                cur_meta = None;
+                                cur_searchable = false;
+                                continue;
+                            }
+                            None => {
+                                clamped = true;
+                                break;
+                            }
+                        }
+                    }
+                    if cur_ns.borrow().id() != cur_pin.ns_id() {
+                        cur_ns = ns_for_pin(ns, proc_bridge, &cur_pin);
+                    }
+                    let parent_step = cur_ns
                         .borrow()
                         .entry(cur_pin.id())
                         .and_then(|e| e.parent.as_ref())
@@ -338,7 +431,7 @@ pub async fn walk(
                 }
 
                 if queue.is_empty() {
-                    trailing_dir = true;
+                    has_trailing_slash = true;
                 }
                 continue 'walk;
             }
@@ -349,15 +442,17 @@ pub async fn walk(
         let first = queue.pop_front().expect("checked non-empty");
         check_component(&first)?;
         let mut run = vec![first];
-        if cur_pin.fstype() != FsType::Proc {
-            let first_is_mp = ns.borrow().may_be_mountpoint_name(cur_pin.id(), &run[0]);
-            if !first_is_mp {
+        {
+            let ns_ref = cur_ns.borrow();
+            if can_batch_on_pin(&ns_ref, &cur_pin)
+                && !seg_may_be_mountpoint(&ns_ref, &cur_pin, cur_handle.node, &run[0])
+            {
                 while let Some(next) = queue.front() {
                     if next == "." || next == ".." {
                         break;
                     }
                     check_component(next)?;
-                    if ns.borrow().may_be_mountpoint_name(cur_pin.id(), next) {
+                    if seg_may_be_mountpoint(&ns_ref, &cur_pin, cur_handle.node, next) {
                         break;
                     }
                     run.push(queue.pop_front().expect("checked front"));
@@ -381,10 +476,19 @@ pub async fn walk(
             let is_last = idx + 1 == run.len() && queue.is_empty();
 
             // A. Check stacked child mounts on `(cur_pin.id(), entry.handle.node)`.
-            let crossed = ns.borrow().top_mount_at(cur_pin.id(), entry.handle.node);
-            if let Some((top_slot, top_root)) = crossed {
+            let crossed = if cur_pin.is_detached() {
+                cur_pin.detached_topmost_at(cur_pin.id(), entry.handle.node)
+            } else {
+                if cur_ns.borrow().id() != cur_pin.ns_id() {
+                    cur_ns = ns_for_pin(ns, proc_bridge, &cur_pin);
+                }
+                cur_ns
+                    .borrow()
+                    .top_mount_at(cur_pin.id(), entry.handle.node)
+                    .map(|(slot, root)| (slot.pin(), root))
+            };
+            if let Some((top_pin, top_root)) = crossed {
                 let step_info = Some((cur_pin.clone(), cur_handle.clone(), seg_name.clone()));
-                let top_pin = top_slot.pin();
                 if is_last && flags.contains(WalkFlags::UMOUNT_FINAL) {
                     return Ok(WalkResult::Found {
                         pin: top_pin,
@@ -410,7 +514,7 @@ pub async fn walk(
                 last_step = step_info;
                 if queue.is_empty() {
                     let meta = cur_meta.expect("populated");
-                    if trailing_dir && !meta.is_dir() {
+                    if (has_trailing_slash || must_be_dir) && !meta.is_dir() {
                         return Err(Errno::ENOTDIR);
                     }
                     return Ok(WalkResult::Found {
@@ -444,7 +548,7 @@ pub async fn walk(
                     return Err(Errno::EINVAL);
                 }
                 let should_follow =
-                    !is_last || flags.contains(WalkFlags::FOLLOW_LAST) || trailing_dir;
+                    !is_last || flags.contains(WalkFlags::FOLLOW_LAST) || has_trailing_slash;
                 if should_follow {
                     if cur_pin.effective_flags().nosymfollow {
                         return Err(Errno::ELOOP);
@@ -473,6 +577,7 @@ pub async fn walk(
                                 queue.push_front(rest.clone());
                             }
                             cur_pin = target_anchor.pin;
+                            cur_ns = ns_for_pin(&info.mnt_ns, proc_bridge, &cur_pin);
                             cur_handle = target_anchor.handle;
                             cur_meta = None;
                             cur_searchable = false;
@@ -480,7 +585,7 @@ pub async fn walk(
                             continue 'walk;
                         }
                         ProcNode::PidNsMnt(pid) => {
-                            if !is_last || trailing_dir {
+                            if !is_last || has_trailing_slash || must_be_dir {
                                 return Err(Errno::ENOTDIR);
                             }
                             let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
@@ -503,7 +608,7 @@ pub async fn walk(
                                 .borrow()
                                 .get(Fd::from(fd))
                                 .map_err(|_| Errno::ENOENT)?;
-                            if !is_last || trailing_dir {
+                            if !is_last || has_trailing_slash {
                                 if file.mount_ns().is_some() {
                                     return Err(Errno::ENOTDIR);
                                 }
@@ -517,6 +622,7 @@ pub async fn walk(
                                     queue.push_front(rest.clone());
                                 }
                                 cur_pin = f_pin;
+                                cur_ns = ns_for_pin(&info.mnt_ns, proc_bridge, &cur_pin);
                                 cur_handle = file.handle().clone();
                                 cur_meta = Some(f_meta);
                                 cur_searchable = false;
@@ -524,6 +630,9 @@ pub async fn walk(
                                 continue 'walk;
                             }
                             if let Some(ns_f) = file.mount_ns() {
+                                if must_be_dir {
+                                    return Err(Errno::ENOTDIR);
+                                }
                                 return Ok(WalkResult::Found {
                                     pin: cur_pin,
                                     entry,
@@ -538,6 +647,9 @@ pub async fn walk(
                                 file.mount_pin().cloned().unwrap_or_else(|| cur_pin.clone());
                             f_pin.guard_enter(cred)?;
                             let f_meta = file.metadata_as(cred).await?;
+                            if must_be_dir && !f_meta.is_dir() {
+                                return Err(Errno::ENOTDIR);
+                            }
                             return Ok(WalkResult::Found {
                                 pin: f_pin,
                                 entry: Entry {
@@ -561,7 +673,7 @@ pub async fn walk(
                 {
                     return Err(Errno::EINVAL);
                 }
-                if !is_last || flags.contains(WalkFlags::FOLLOW_LAST) || trailing_dir {
+                if !is_last || flags.contains(WalkFlags::FOLLOW_LAST) || has_trailing_slash {
                     let parent_meta = match &cur_meta {
                         Some(m) => m.clone(),
                         None => {
@@ -624,12 +736,13 @@ pub async fn walk(
                             || target.ends_with("/.")
                             || target.ends_with("/.."))
                     {
-                        trailing_dir = true;
+                        has_trailing_slash = true;
                     }
                     // Absolute symlinks ALWAYS anchor at `ctx.root`, even when `walk` started
                     // from an outside-`chroot` `cwd` or retained `dirfd`!
                     if target.starts_with('/') {
                         cur_pin = ctx.root.pin.clone();
+                        cur_ns = ns_for_pin(ns, proc_bridge, &cur_pin);
                         cur_handle = ctx.root.handle.clone();
                         cur_meta = None;
                         cur_searchable = false;
@@ -644,7 +757,7 @@ pub async fn walk(
 
             // D. Terminal component.
             if is_last {
-                if trailing_dir && !entry.metadata.is_dir() {
+                if (has_trailing_slash || must_be_dir) && !entry.metadata.is_dir() {
                     return Err(Errno::ENOTDIR);
                 }
                 return Ok(WalkResult::Found {
@@ -694,7 +807,7 @@ pub async fn walk(
                             metadata: parent_meta,
                         },
                         name: run[miss_idx].clone(),
-                        trailing_slash: trailing_dir,
+                        trailing_slash: has_trailing_slash,
                     });
                 }
                 return Err(Errno::ENOENT);
@@ -711,7 +824,7 @@ pub async fn walk_parent(
     cred: &Cred,
     ns: &Rc<RefCell<MountNamespace>>,
     ctx: &FsContext,
-    fds: &FdTable,
+    fds: &impl FdLookup,
     proc_bridge: Option<&dyn ProcBridge>,
     anchor: &StartAnchor,
     path: &str,

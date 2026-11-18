@@ -278,6 +278,9 @@ impl<T: ShareTransport> ShareFs<T> {
                 Errno::EACCES
             }
             ShareError::Disconnected => {
+                if self.provider.health() == crate::mount::ProviderHealth::Revoked {
+                    return Errno::EACCES;
+                }
                 let in_guard = self.provider.is_in_guarded_poll();
                 self.provider.lose();
                 if is_mutating {
@@ -546,11 +549,17 @@ impl<T: ShareTransport> Filesystem for ShareFs<T> {
     }
 
     fn sync_all<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
-        Box::pin(self.call(true, false, self.transport.sync_all(open)))
+        if open.access == Access::Path {
+            return Box::pin(async { Err(Errno::EBADF) });
+        }
+        Box::pin(self.call(false, false, self.transport.sync_all(open)))
     }
 
     fn sync_data<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
-        Box::pin(self.call(true, false, self.transport.sync_data(open)))
+        if open.access == Access::Path {
+            return Box::pin(async { Err(Errno::EBADF) });
+        }
+        Box::pin(self.call(false, false, self.transport.sync_data(open)))
     }
 
     fn lock<'a>(

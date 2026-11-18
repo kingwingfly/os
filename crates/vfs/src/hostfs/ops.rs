@@ -745,10 +745,24 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
 
     fn touch_accessed(&self, inode: &mut InodeRecord) -> bool {
         let now = (self.clock)();
-        if inode.atime <= inode.mtime
-            || inode.atime <= inode.ctime
-            || now.0.saturating_sub(inode.atime.0) >= 24 * 60 * 60
-        {
+        let should_update = match crate::mount::active_mount_flags() {
+            Some(flags) => {
+                !flags.lazytime
+                    && flags.should_update_atime(
+                        inode.meta.directory,
+                        inode.atime,
+                        inode.mtime,
+                        inode.ctime,
+                        now,
+                    )
+            }
+            None => {
+                inode.atime <= inode.mtime
+                    || inode.atime <= inode.ctime
+                    || now.0.saturating_sub(inode.atime.0) >= 24 * 60 * 60
+            }
+        };
+        if should_update {
             inode.atime = now;
             true
         } else {
@@ -2644,6 +2658,37 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             }
             FileType::Dir => {}
             _ => return Err(Errno::EINVAL),
+        }
+        self.meta.sync_strict().await
+    }
+
+    pub(super) async fn do_sync_handle(&self, handle: &Handle) -> Result<()> {
+        self.ensure_version().await?;
+        let _ns = self.ns_lock(LockKind::Exclusive).await?;
+        let mut inode = self.check_live_inode(handle).await?;
+        if inode.file_type() == FileType::File {
+            let (expected_fp, expected_ino) = self.dir_expectation(&inode);
+            let fp = self
+                .fail_if_stale(
+                    &inode,
+                    self.tree
+                        .flush_file(&inode.backing, false, expected_fp, expected_ino)
+                        .await,
+                )
+                .await?;
+            if self.kind == HostKind::Directory && inode.fingerprint != Some(fp) {
+                inode.fingerprint = Some(fp);
+                self.meta
+                    .commit(
+                        MetaBatch {
+                            put_inodes: vec![inode],
+                            ..MetaBatch::default()
+                        },
+                        true,
+                    )
+                    .await?;
+                return Ok(());
+            }
         }
         self.meta.sync_strict().await
     }

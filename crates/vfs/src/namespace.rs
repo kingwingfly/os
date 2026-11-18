@@ -3,12 +3,13 @@
 
 use crate::context::PathAnchor;
 use crate::mount::{
-    FsType, MountAttachment, MountEntry, MountFlags, MountId, MountSlot, NamespaceId,
+    DetachedGroup, FsType, MountAttachment, MountEntry, MountFlags, MountId, MountSlot,
+    NamespaceId, minor_for_fs_id,
 };
-use crate::{Cred, Handle, NodeId, Result};
+use crate::{Cred, FsId, Handle, NodeId, Result};
 use abi::Errno;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 pub struct MountNamespace {
@@ -127,6 +128,13 @@ impl MountNamespace {
             .is_some_and(|stack| !stack.is_empty())
     }
 
+    /// True if `parent_mount` currently has any attached child mounts.
+    pub fn has_children_on(&self, parent_mount: MountId) -> bool {
+        self.children
+            .iter()
+            .any(|(&(pm, _), stack)| pm == parent_mount && !stack.is_empty())
+    }
+
     /// True if `(dir_node, name)` on `parent_mount` is an active mountpoint (`EBUSY` on
     /// `unlink`/`rmdir`/`rename`).
     pub fn has_mountpoint_at_name(
@@ -197,6 +205,24 @@ impl MountNamespace {
         id
     }
 
+    /// Atomically validate that `entry.parent` is still attached in this namespace (not lazily
+    /// detached across an `.await` point) before committing `entry`.
+    pub fn try_attach(
+        &mut self,
+        entry: MountEntry,
+    ) -> std::result::Result<MountId, Box<(Errno, MountEntry)>> {
+        if let Some(att) = &entry.parent {
+            let parent_id = att.parent_pin.id();
+            if att.parent_pin.is_detached()
+                || att.parent_pin.ns_id() != self.id
+                || !self.mounts.contains_key(&parent_id)
+            {
+                return Err(Box::new((Errno::ENOENT, entry)));
+            }
+        }
+        Ok(self.attach(entry))
+    }
+
     /// True if `ancestor` equals `candidate` or is a mount-tree ancestor of `candidate`.
     pub fn is_mount_ancestor(&self, ancestor: MountId, mut candidate: MountId) -> bool {
         loop {
@@ -246,6 +272,19 @@ impl MountNamespace {
         out
     }
 
+    fn snapshot_children_for_detached(
+        &self,
+        ids: &HashSet<MountId>,
+    ) -> HashMap<(MountId, NodeId), Vec<MountId>> {
+        let mut out = HashMap::new();
+        for (&(pm, pnode), stack) in &self.children {
+            if ids.contains(&pm) {
+                out.insert((pm, pnode), stack.clone());
+            }
+        }
+        out
+    }
+
     /// Ordinary `umount2(target, 0)`: fails with `EBUSY` if `mount_id` is the namespace root or
     /// has any active `MountPin` (open files, `cwd`, `root`, or child mounts).
     pub fn unmount_ordinary(&mut self, mount_id: MountId) -> Result<MountEntry> {
@@ -259,6 +298,7 @@ impl MountNamespace {
             return Err(Errno::EBUSY);
         }
         let mut entry = self.mounts.remove(&mount_id).expect("checked mount");
+        entry.slot.detached.set(true);
         if let Some(att) = entry.parent.take() {
             self.unregister_attachment_indices(mount_id, &att);
         }
@@ -267,7 +307,8 @@ impl MountNamespace {
     }
 
     /// Lazy `umount2(target, MNT_DETACH)`: detaches `mount_id` and any descendant mounts from
-    /// this namespace immediately while keeping existing `MountPin`s functional until dropped.
+    /// this namespace immediately while keeping existing `MountPin`s and internal subtree mount
+    /// crossings functional until the last external pin drops.
     pub fn detach_subtree(&mut self, mount_id: MountId) -> Result<Vec<MountEntry>> {
         if mount_id == self.root_mount {
             return Err(Errno::EBUSY);
@@ -276,32 +317,50 @@ impl MountNamespace {
             return Err(Errno::EINVAL);
         }
         let postorder = self.collect_subtree_postorder(mount_id);
+        let id_set: HashSet<MountId> = postorder.iter().copied().collect();
+        let children_order = self.snapshot_children_for_detached(&id_set);
         let mut removed = Vec::with_capacity(postorder.len());
         for id in postorder {
-            if let Some(mut entry) = self.mounts.remove(&id) {
+            if let Some(entry) = self.mounts.remove(&id) {
                 entry.slot.detached.set(true);
-                if let Some(att) = entry.parent.take() {
-                    self.unregister_attachment_indices(id, &att);
+                if let Some(att) = &entry.parent {
+                    self.unregister_attachment_indices(id, att);
                 }
                 removed.push(entry);
             }
         }
         self.bump_generation();
-        Ok(removed)
+        DetachedGroup::install(removed, children_order);
+        Ok(Vec::new())
     }
 
-    /// Re-parent `mount_id` onto `new_att` (`MS_MOVE` to a non-root target).
-    pub fn move_mount(&mut self, mount_id: MountId, new_att: MountAttachment) -> Result<()> {
+    /// Re-parent `mount_id` onto `new_att` (`MS_MOVE` to a non-root target), returning `new_att`
+    /// on failure so callers can close `mountpoint_open`.
+    pub fn try_move_mount(
+        &mut self,
+        mount_id: MountId,
+        new_att: MountAttachment,
+    ) -> std::result::Result<(), Box<(Errno, MountAttachment)>> {
         if mount_id == self.root_mount {
-            return Err(Errno::EINVAL);
+            return Err(Box::new((Errno::EINVAL, new_att)));
         }
-        if self.is_mount_ancestor(mount_id, new_att.parent_pin.id()) {
-            return Err(Errno::EINVAL);
+        if !self.mounts.contains_key(&mount_id) {
+            return Err(Box::new((Errno::ENOENT, new_att)));
+        }
+        let parent_id = new_att.parent_pin.id();
+        if new_att.parent_pin.is_detached()
+            || new_att.parent_pin.ns_id() != self.id
+            || !self.mounts.contains_key(&parent_id)
+        {
+            return Err(Box::new((Errno::ENOENT, new_att)));
+        }
+        if self.is_mount_ancestor(mount_id, parent_id) {
+            return Err(Box::new((Errno::EINVAL, new_att)));
         }
         let old_att = self
             .mounts
             .get_mut(&mount_id)
-            .ok_or(Errno::EINVAL)?
+            .expect("checked mount")
             .parent
             .take();
         if let Some(att) = old_att {
@@ -316,11 +375,20 @@ impl MountNamespace {
         Ok(())
     }
 
+    /// Re-parent `mount_id` onto `new_att` (`MS_MOVE` to a non-root target).
+    pub fn move_mount(&mut self, mount_id: MountId, new_att: MountAttachment) -> Result<()> {
+        self.try_move_mount(mount_id, new_att)
+            .map_err(|boxed| boxed.0)
+    }
+
     /// `switch_root` move (`mount(src, "/", MS_MOVE)`): promotes `mount_id` to `self.root_mount`
     /// and detaches the old root hierarchy's un-moved mounts.
     pub fn switch_root_move(&mut self, mount_id: MountId) -> Result<Vec<MountEntry>> {
-        if mount_id == self.root_mount || !self.mounts.contains_key(&mount_id) {
+        if mount_id == self.root_mount {
             return Err(Errno::EINVAL);
+        }
+        if !self.mounts.contains_key(&mount_id) {
+            return Err(Errno::ENOENT);
         }
         let old_att = self
             .mounts
@@ -335,10 +403,17 @@ impl MountNamespace {
 
         // Every mount still in `self.mounts` that does NOT descend from the new `root_mount`
         // belonged to the superseded initial root and is detached in post-order.
-        let keep: std::collections::HashSet<MountId> = self
+        let keep: HashSet<MountId> = self
             .collect_subtree_postorder(mount_id)
             .into_iter()
             .collect();
+        let doomed_ids: HashSet<MountId> = self
+            .mounts
+            .keys()
+            .copied()
+            .filter(|id| !keep.contains(id))
+            .collect();
+        let children_order = self.snapshot_children_for_detached(&doomed_ids);
         let doomed_roots: Vec<MountId> = self
             .mounts
             .iter()
@@ -354,18 +429,19 @@ impl MountNamespace {
         for root in doomed_roots {
             for id in self.collect_subtree_postorder(root) {
                 if !keep.contains(&id)
-                    && let Some(mut entry) = self.mounts.remove(&id)
+                    && let Some(entry) = self.mounts.remove(&id)
                 {
                     entry.slot.detached.set(true);
-                    if let Some(att) = entry.parent.take() {
-                        self.unregister_attachment_indices(id, &att);
+                    if let Some(att) = &entry.parent {
+                        self.unregister_attachment_indices(id, att);
                     }
                     detached.push(entry);
                 }
             }
         }
         self.bump_generation();
-        Ok(detached)
+        DetachedGroup::install(detached, children_order);
+        Ok(Vec::new())
     }
 
     /// Clone this namespace with private propagation (`CLONE_NEWNS` / login session derivation),
@@ -375,9 +451,16 @@ impl MountNamespace {
         new_ns_id: NamespaceId,
         mut mint_mount_id: impl FnMut() -> MountId,
     ) -> (Self, HashMap<MountId, Rc<MountSlot>>) {
+        let reachable: HashSet<MountId> = self
+            .collect_subtree_postorder(self.root_mount)
+            .into_iter()
+            .collect();
         let mut old_to_new: HashMap<MountId, Rc<MountSlot>> =
-            HashMap::with_capacity(self.mounts.len());
+            HashMap::with_capacity(reachable.len());
         for (&old_id, entry) in &self.mounts {
+            if !reachable.contains(&old_id) {
+                continue;
+            }
             let new_id = mint_mount_id();
             let slot = MountSlot::new(
                 new_id,
@@ -391,20 +474,32 @@ impl MountNamespace {
             old_to_new.insert(old_id, slot);
         }
 
-        let new_root = old_to_new[&self.root_mount].id;
+        let new_root = old_to_new
+            .get(&self.root_mount)
+            .map(|s| s.id)
+            .unwrap_or(self.root_mount);
         let mut new_mounts = BTreeMap::new();
         for (&old_id, entry) in &self.mounts {
-            let slot = Rc::clone(&old_to_new[&old_id]);
-            let parent = entry.parent.as_ref().map(|att| {
-                let parent_slot = &old_to_new[&att.parent_pin.id()];
-                MountAttachment {
+            let Some(slot) = old_to_new.get(&old_id).cloned() else {
+                continue;
+            };
+            let parent = if old_id == self.root_mount {
+                None
+            } else {
+                let Some(att) = entry.parent.as_ref() else {
+                    continue;
+                };
+                let Some(parent_slot) = old_to_new.get(&att.parent_pin.id()) else {
+                    continue;
+                };
+                Some(MountAttachment {
                     parent_pin: parent_slot.pin(),
                     mountpoint: att.mountpoint.clone(),
                     mountpoint_open: att.mountpoint_open.clone(),
                     mp_parent_node: att.mp_parent_node,
                     mp_name: att.mp_name.clone(),
-                }
-            });
+                })
+            };
             new_mounts.insert(
                 slot.id,
                 MountEntry {
@@ -420,14 +515,23 @@ impl MountNamespace {
 
         let mut new_children = HashMap::with_capacity(self.children.len());
         for (&(old_parent, node), stack) in &self.children {
-            let new_parent = old_to_new[&old_parent].id;
-            let mapped: Vec<MountId> = stack.iter().map(|old_c| old_to_new[old_c].id).collect();
-            new_children.insert((new_parent, node), mapped);
+            let Some(parent_slot) = old_to_new.get(&old_parent) else {
+                continue;
+            };
+            let mapped: Vec<MountId> = stack
+                .iter()
+                .filter_map(|old_c| old_to_new.get(old_c).map(|s| s.id))
+                .collect();
+            if !mapped.is_empty() {
+                new_children.insert((parent_slot.id, node), mapped);
+            }
         }
 
         let mut new_mp_names = HashMap::with_capacity(self.mp_names_by_parent.len());
         for (&old_parent, names) in &self.mp_names_by_parent {
-            new_mp_names.insert(old_to_new[&old_parent].id, names.clone());
+            if let Some(parent_slot) = old_to_new.get(&old_parent) {
+                new_mp_names.insert(parent_slot.id, names.clone());
+            }
         }
 
         let ns = Self {
@@ -439,6 +543,20 @@ impl MountNamespace {
             generation: 1,
         };
         (ns, old_to_new)
+    }
+}
+
+impl Drop for MountNamespace {
+    fn drop(&mut self) {
+        if self.mounts.is_empty() {
+            return;
+        }
+        let all_ids: HashSet<MountId> = self.mounts.keys().copied().collect();
+        let children_order = self.snapshot_children_for_detached(&all_ids);
+        let entries: Vec<MountEntry> = std::mem::take(&mut self.mounts).into_values().collect();
+        self.children.clear();
+        self.mp_names_by_parent.clear();
+        DetachedGroup::install(entries, children_order);
     }
 }
 
@@ -467,71 +585,169 @@ struct MountSnapshot {
     source: String,
     flags: MountFlags,
     fstype: FsType,
-    dev: u64,
+    fs_id: FsId,
     ceiling_rdonly: bool,
     owner_uid: Option<u32>,
+}
+
+struct NamespaceSnapshot {
+    filter_mount: MountId,
+    filter_handle: Handle,
+    ordered: Vec<MountId>,
+    snaps: HashMap<MountId, MountSnapshot>,
+}
+
+fn collect_topological_mounts(ns: &MountNamespace, mount_id: MountId, out: &mut Vec<MountId>) {
+    if !ns.mounts.contains_key(&mount_id) {
+        return;
+    }
+    out.push(mount_id);
+    let mut mp_stacks: Vec<(MountId, u64, &Vec<MountId>)> = ns
+        .children
+        .iter()
+        .filter_map(|(&(pm, pnode), stack)| {
+            if pm == mount_id
+                && let Some(&first_id) = stack.first()
+            {
+                Some((first_id, pnode.ino, stack))
+            } else {
+                None
+            }
+        })
+        .collect();
+    mp_stacks.sort_by_key(|&(first_id, ino, _)| (first_id, ino));
+    for (_, _, stack) in mp_stacks {
+        for &child_id in stack {
+            collect_topological_mounts(ns, child_id, out);
+        }
+    }
 }
 
 fn snapshot_namespace(
     ns_rc: &Rc<RefCell<MountNamespace>>,
     reader_root: &PathAnchor,
     reader_is_at_own_ns_root: bool,
-) -> Option<(MountId, NodeId, BTreeMap<MountId, MountSnapshot>)> {
+) -> Option<NamespaceSnapshot> {
     let ns = ns_rc.borrow();
-    let (filter_mount, filter_node) = if ns.contains_mount(reader_root.pin.id()) {
-        (reader_root.pin.id(), reader_root.handle.node)
+    let (filter_mount, filter_handle) = if ns.contains_mount(reader_root.pin.id()) {
+        (reader_root.pin.id(), reader_root.handle.clone())
     } else if reader_is_at_own_ns_root {
         let root = ns.root_entry();
-        (ns.root_mount, root.root.node)
+        (ns.root_mount, root.root.clone())
     } else {
         // Chrooted reader inspecting a foreign namespace whose mounts are outside its root.
         return None;
     };
-    let mut snaps = BTreeMap::new();
-    for (&id, entry) in &ns.mounts {
-        snaps.insert(
-            id,
-            MountSnapshot {
+    let mut ordered = Vec::with_capacity(ns.mounts.len());
+    collect_topological_mounts(&ns, ns.root_mount, &mut ordered);
+    let mut snaps = HashMap::with_capacity(ordered.len());
+    for &id in &ordered {
+        if let Some(entry) = ns.mounts.get(&id) {
+            snaps.insert(
                 id,
-                parent: entry
-                    .parent
-                    .as_ref()
-                    .map(|att| (att.parent_pin.id(), att.mountpoint.clone())),
-                slot: Rc::clone(&entry.slot),
-                root: entry.root.clone(),
-                root_in_fs: entry.root_in_fs.clone(),
-                source: entry.source.clone(),
-                flags: entry.slot.effective_flags(),
-                fstype: entry.slot.backing.fstype,
-                dev: entry.slot.backing.fs.id().dev(),
-                ceiling_rdonly: entry.slot.backing.ceiling_rdonly,
-                owner_uid: entry.slot.owner_uid,
-            },
-        );
+                MountSnapshot {
+                    id,
+                    parent: entry
+                        .parent
+                        .as_ref()
+                        .map(|att| (att.parent_pin.id(), att.mountpoint.clone())),
+                    slot: Rc::clone(&entry.slot),
+                    root: entry.root.clone(),
+                    root_in_fs: entry.root_in_fs.clone(),
+                    source: entry.source.clone(),
+                    flags: entry.slot.effective_flags(),
+                    fstype: entry.slot.backing.fstype,
+                    fs_id: entry.slot.backing.fs.id().clone(),
+                    ceiling_rdonly: entry.slot.backing.ceiling_rdonly,
+                    owner_uid: entry.slot.owner_uid,
+                },
+            );
+        }
     }
-    Some((filter_mount, filter_node, snaps))
+    Some(NamespaceSnapshot {
+        filter_mount,
+        filter_handle,
+        ordered,
+        snaps,
+    })
 }
 
-async fn resolve_mountpoint_path(
+fn join_root_in_fs(base: &str, rel_segments: &[String]) -> String {
+    if rel_segments.is_empty() {
+        return if base.is_empty() {
+            "/".to_string()
+        } else {
+            base.to_string()
+        };
+    }
+    let prefix = base.trim_end_matches('/');
+    format!("{prefix}/{}", rel_segments.join("/"))
+}
+
+/// Resolve `(mountpoint_path_in_chroot, effective_root_in_fs)` for `mount_id` relative to
+/// `(filter_mount, filter_handle)`.
+async fn resolve_mount_view(
     cred: &Cred,
-    snaps: &BTreeMap<MountId, MountSnapshot>,
+    snaps: &HashMap<MountId, MountSnapshot>,
     mount_id: MountId,
     filter_mount: MountId,
-    filter_node: NodeId,
-) -> Option<String> {
+    filter_handle: &Handle,
+) -> Option<(String, String)> {
     let start = snaps.get(&mount_id)?;
+    if mount_id == filter_mount {
+        if filter_handle.node == start.root.node {
+            let root_str = if start.root_in_fs.is_empty() {
+                "/".to_string()
+            } else {
+                start.root_in_fs.clone()
+            };
+            return Some(("/".to_string(), root_str));
+        }
+        // Chroot root is a subdirectory inside `filter_mount`: walk up from `filter_handle` to
+        // `start.root.node` to verify reachability and compute the effective `root` subpath.
+        let mut cur_h = filter_handle.clone();
+        let mut sub_segs = Vec::new();
+        let fs = Rc::clone(&start.slot.backing.fs);
+        loop {
+            if cur_h.node == start.root.node {
+                sub_segs.reverse();
+                return Some((
+                    "/".to_string(),
+                    join_root_in_fs(&start.root_in_fs, &sub_segs),
+                ));
+            }
+            match start
+                .slot
+                .guard_op(cred, false, false, fs.parent(cred, &cur_h))
+                .await
+            {
+                Ok(Some((parent_entry, name))) => {
+                    sub_segs.push(name);
+                    cur_h = parent_entry.handle;
+                }
+                _ => return None,
+            }
+        }
+    }
+
     let mut cur_mount = mount_id;
     let mut cur_handle = start.root.clone();
     let mut segments: Vec<String> = Vec::new();
+    let root_in_fs = if start.root_in_fs.is_empty() {
+        "/".to_string()
+    } else {
+        start.root_in_fs.clone()
+    };
 
     loop {
-        if cur_mount == filter_mount && cur_handle.node == filter_node {
-            return if segments.is_empty() {
-                Some("/".to_string())
+        if cur_mount == filter_mount && cur_handle.node == filter_handle.node {
+            let mp = if segments.is_empty() {
+                "/".to_string()
             } else {
                 segments.reverse();
-                Some(format!("/{}", segments.join("/")))
+                format!("/{}", segments.join("/"))
             };
+            return Some((mp, root_in_fs));
         }
 
         let cur_snap = snaps.get(&cur_mount)?;
@@ -543,7 +759,11 @@ async fn resolve_mountpoint_path(
         }
 
         let fs = Rc::clone(&cur_snap.slot.backing.fs);
-        match fs.parent(cred, &cur_handle).await {
+        match cur_snap
+            .slot
+            .guard_op(cred, false, false, fs.parent(cred, &cur_handle))
+            .await
+        {
             Ok(Some((parent_entry, name))) => {
                 segments.push(name);
                 cur_handle = parent_entry.handle;
@@ -560,25 +780,35 @@ pub async fn format_mountinfo(
     reader_root: &PathAnchor,
     reader_is_at_own_ns_root: bool,
 ) -> String {
-    let Some((filter_mount, filter_node, snaps)) =
-        snapshot_namespace(target_ns, reader_root, reader_is_at_own_ns_root)
-    else {
+    let Some(ns_snap) = snapshot_namespace(target_ns, reader_root, reader_is_at_own_ns_root) else {
         return String::new();
     };
     let mut out = String::new();
-    for (&id, snap) in &snaps {
-        let Some(mp_path) =
-            resolve_mountpoint_path(cred, &snaps, id, filter_mount, filter_node).await
+    for id in &ns_snap.ordered {
+        let Some(snap) = ns_snap.snaps.get(id) else {
+            continue;
+        };
+        if snap.owner_uid.is_some_and(|u| u != cred.identity.id) {
+            continue;
+        }
+        let Some((mp_path, eff_root)) = resolve_mount_view(
+            cred,
+            &ns_snap.snaps,
+            *id,
+            ns_snap.filter_mount,
+            &ns_snap.filter_handle,
+        )
+        .await
         else {
             continue;
         };
-        let parent_id = snap.parent.as_ref().map_or(snap.id.0, |(p, _)| p.0);
-        let minor = (snap.dev % 1_000_000) + 1;
-        let root_str = escape_mountinfo(if snap.root_in_fs.is_empty() {
-            "/"
+        let parent_id = if *id == ns_snap.filter_mount {
+            snap.parent.as_ref().map_or(snap.id.0, |(p, _)| p.0)
         } else {
-            &snap.root_in_fs
-        });
+            snap.parent.as_ref().map_or(snap.id.0, |(p, _)| p.0)
+        };
+        let minor = minor_for_fs_id(&snap.fs_id);
+        let root_str = escape_mountinfo(&eff_root);
         let mp_str = escape_mountinfo(&mp_path);
         let mount_opts = snap.flags.format_mount_opts();
         let fstype = snap.fstype.as_str();
@@ -610,15 +840,25 @@ pub async fn format_mounts(
     reader_root: &PathAnchor,
     reader_is_at_own_ns_root: bool,
 ) -> String {
-    let Some((filter_mount, filter_node, snaps)) =
-        snapshot_namespace(target_ns, reader_root, reader_is_at_own_ns_root)
-    else {
+    let Some(ns_snap) = snapshot_namespace(target_ns, reader_root, reader_is_at_own_ns_root) else {
         return String::new();
     };
     let mut out = String::new();
-    for (&id, snap) in &snaps {
-        let Some(mp_path) =
-            resolve_mountpoint_path(cred, &snaps, id, filter_mount, filter_node).await
+    for id in &ns_snap.ordered {
+        let Some(snap) = ns_snap.snaps.get(id) else {
+            continue;
+        };
+        if snap.owner_uid.is_some_and(|u| u != cred.identity.id) {
+            continue;
+        }
+        let Some((mp_path, _)) = resolve_mount_view(
+            cred,
+            &ns_snap.snaps,
+            *id,
+            ns_snap.filter_mount,
+            &ns_snap.filter_handle,
+        )
+        .await
         else {
             continue;
         };

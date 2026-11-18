@@ -939,6 +939,11 @@ struct PendingFs {
     inner: Rc<MemFs>,
     block_reads: Cell<bool>,
     block_writes: Cell<bool>,
+    block_opens: Cell<bool>,
+    block_releases: Cell<bool>,
+    fail_sync: Cell<Option<Errno>>,
+    active_opens: Cell<usize>,
+    sync_calls: Cell<usize>,
     wakers: RefCell<Vec<Waker>>,
 }
 
@@ -955,7 +960,19 @@ impl PendingFs {
             )),
             block_reads: Cell::new(false),
             block_writes: Cell::new(false),
+            block_opens: Cell::new(false),
+            block_releases: Cell::new(false),
+            fail_sync: Cell::new(None),
+            active_opens: Cell::new(0),
+            sync_calls: Cell::new(0),
             wakers: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn wake_all(&self) {
+        let wakers: Vec<Waker> = self.wakers.borrow_mut().drain(..).collect();
+        for w in wakers {
+            w.wake();
         }
     }
 }
@@ -1035,7 +1052,16 @@ impl Filesystem for PendingFs {
         mode: u16,
         options: &'a OpenOptions,
     ) -> BoxFuture<'a, (Entry, OpenRef)> {
-        self.inner.create(cred, dir, name, mode, options)
+        Box::pin(async move {
+            ParkFuture {
+                flag: &self.block_opens,
+                wakers: &self.wakers,
+            }
+            .await;
+            let res = self.inner.create(cred, dir, name, mode, options).await?;
+            self.active_opens.set(self.active_opens.get() + 1);
+            Ok(res)
+        })
     }
     fn mkdir<'a>(
         &'a self,
@@ -1129,7 +1155,16 @@ impl Filesystem for PendingFs {
         handle: &'a Handle,
         options: &'a OpenOptions,
     ) -> BoxFuture<'a, OpenRef> {
-        self.inner.open(cred, handle, options)
+        Box::pin(async move {
+            ParkFuture {
+                flag: &self.block_opens,
+                wakers: &self.wakers,
+            }
+            .await;
+            let open = self.inner.open(cred, handle, options).await?;
+            self.active_opens.set(self.active_opens.get() + 1);
+            Ok(open)
+        })
     }
     fn open_metadata<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, Metadata> {
         self.inner.open_metadata(open)
@@ -1168,7 +1203,13 @@ impl Filesystem for PendingFs {
         self.inner.set_len(open, size)
     }
     fn sync_all<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
-        self.inner.sync_all(open)
+        Box::pin(async move {
+            self.sync_calls.set(self.sync_calls.get() + 1);
+            if let Some(err) = self.fail_sync.get() {
+                return Err(err);
+            }
+            self.inner.sync_all(open).await
+        })
     }
     fn lock<'a>(
         &'a self,
@@ -1205,7 +1246,16 @@ impl Filesystem for PendingFs {
         self.inner.test_lock(open, kind, range)
     }
     fn release<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
-        self.inner.release(open)
+        Box::pin(async move {
+            ParkFuture {
+                flag: &self.block_releases,
+                wakers: &self.wakers,
+            }
+            .await;
+            self.active_opens
+                .set(self.active_opens.get().saturating_sub(1));
+            self.inner.release(open).await
+        })
     }
 }
 
@@ -2260,6 +2310,33 @@ fn unshare_setns_clone_sharing_mountinfo_escaping_and_all_drivers() {
         .vfs
         .mkdirat(1, StartAnchor::Root, "/opt/private/ext1", 0o755))
     .unwrap();
+    // Contract 2 (`M-P0-10`): `owner_uid = Some(1001)` refuses target owned by `uid 0` (`EPERM`).
+    assert_eq!(
+        run(env.vfs.mount_on_namespace(
+            &sys_ns,
+            &Cred::root(),
+            Rc::new(MountBacking::new(ext_img.clone(), FsType::Image)),
+            None,
+            "private:ext1",
+            "/opt/private/ext1",
+            MountFlags::from_accepted(mount_flags::MS_RDONLY),
+            mount_flags::MS_RDONLY,
+            Some(1001),
+        )),
+        Err(Errno::EPERM)
+    );
+    run(env.vfs.setattrat(
+        1,
+        StartAnchor::Root,
+        "/opt/private/ext1",
+        &SetAttr {
+            uid: Some(1001),
+            gid: Some(1001),
+            ..SetAttr::default()
+        },
+        false,
+    ))
+    .unwrap();
     run(env.vfs.mount_on_namespace(
         &sys_ns,
         &Cred::root(),
@@ -2442,4 +2519,1484 @@ fn resolve_exec_path_search_shebang_recursion_and_chroot_isolation() {
         .err(),
         Some(Errno::ENOENT)
     );
+}
+
+// -----------------------------------------------------------------------------
+// 11. PR #74 Review Regressions: Contracts 1 & 2, P0/P1/P2/P3 Track A Invariants
+// -----------------------------------------------------------------------------
+
+fn poll_once<F: Future>(fut: &mut std::pin::Pin<&mut F>) -> Poll<F::Output> {
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    fut.as_mut().poll(&mut cx)
+}
+
+#[test]
+fn contract1_fsetattr_and_file_setattr_as_enforce_cred_rofs_owner_and_provider() {
+    let env = boot_env();
+
+    // 1. Privilege drop (`M-P0-08`): opening as `uid 0`, dropping to `uid 1001`, then calling
+    //    `Vfs::fsetattr` MUST check `pid`'s current `Cred` (not opener `file.cred()`), failing `EPERM`.
+    write_all(&env.vfs, 1, "/tmp/root_secret", 0o644, b"hi");
+    env.vfs.fork_process(1, 70, 0).unwrap();
+    let fd = run(env
+        .vfs
+        .openat(70, StartAnchor::Root, "/tmp/root_secret", abi::O_RDWR, 0))
+    .unwrap();
+    env.vfs.set_cred(70, user_cred(1001, 1001)).unwrap();
+    assert_eq!(
+        run(env.vfs.fsetattr(
+            70,
+            fd,
+            &SetAttr {
+                mode: Some(0o600),
+                ..SetAttr::default()
+            },
+        )),
+        Err(Errno::EPERM)
+    );
+    // `O_PATH` descriptor -> `EBADF`.
+    let path_fd = run(env.vfs.openat(
+        1,
+        StartAnchor::Root,
+        "/tmp/root_secret",
+        abi::O_PATH | abi::O_RDONLY,
+        0,
+    ))
+    .unwrap();
+    assert_eq!(
+        run(env.vfs.fsetattr(
+            1,
+            path_fd,
+            &SetAttr {
+                mode: Some(0o600),
+                ..SetAttr::default()
+            },
+        )),
+        Err(Errno::EBADF)
+    );
+    run(env.vfs.close(1, path_fd)).unwrap();
+    run(env.vfs.close(70, fd)).unwrap();
+
+    // 2. `MS_RDONLY` -> `EROFS` and `MS_SYNCHRONOUS` -> `record_sync()` + `sync_all`.
+    run(env.vfs.mkdirat(1, StartAnchor::Root, "/mnt/fset", 0o755)).unwrap();
+    let sync_fs = Rc::new(PendingFs::new("helper:fset"));
+    let sync_backing = Rc::new(MountBacking::new(sync_fs.clone(), FsType::HelperFs));
+    let sys_ns = env.vfs.system_namespace();
+    run(env.vfs.mount_on_namespace(
+        &sys_ns,
+        &Cred::root(),
+        sync_backing.clone(),
+        None,
+        "helper:fset",
+        "/mnt/fset",
+        MountFlags::from_accepted(mount_flags::MS_SYNCHRONOUS),
+        0,
+        None,
+    ))
+    .unwrap();
+    write_all(&env.vfs, 1, "/mnt/fset/a.txt", 0o644, b"x");
+    let sfd = run(env
+        .vfs
+        .openat(1, StartAnchor::Root, "/mnt/fset/a.txt", abi::O_RDWR, 0))
+    .unwrap();
+    let sync_before = sync_backing.sync_count();
+    let meta = run(env.vfs.fsetattr(
+        1,
+        sfd,
+        &SetAttr {
+            mode: Some(0o640),
+            ..SetAttr::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(meta.mode & 0o777, 0o640);
+    assert!(sync_backing.sync_count() > sync_before);
+    run(env.vfs.close(1, sfd)).unwrap();
+
+    // Remount `MS_RDONLY`: pre-opened `O_RDONLY` fd fails `fsetattr` with `EROFS`.
+    let rfd = run(env
+        .vfs
+        .openat(1, StartAnchor::Root, "/mnt/fset/a.txt", abi::O_RDONLY, 0))
+    .unwrap();
+    run(env.vfs.mount(
+        1,
+        "",
+        "/mnt/fset",
+        None,
+        mount_flags::MS_REMOUNT | mount_flags::MS_RDONLY,
+        None,
+    ))
+    .unwrap();
+    assert_eq!(
+        run(env.vfs.fsetattr(
+            1,
+            rfd,
+            &SetAttr {
+                mode: Some(0o600),
+                ..SetAttr::default()
+            },
+        )),
+        Err(Errno::EROFS)
+    );
+    run(env.vfs.close(1, rfd)).unwrap();
+
+    // 3. User mount `owner_uid` ceiling + `ProviderState` (`Lost` -> `ENOTCONN`, `Revoked` -> `EACCES`),
+    //    plus unmounted `FileRef` -> `EPERM`.
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/mnt/local/u1001", 0o700))
+    .unwrap();
+    run(env.vfs.setattrat(
+        1,
+        StartAnchor::Root,
+        "/mnt/local/u1001",
+        &SetAttr {
+            uid: Some(1001),
+            gid: Some(1001),
+            ..SetAttr::default()
+        },
+        false,
+    ))
+    .unwrap();
+    let u_fs = Rc::new(MemFs::new(
+        FsId("hostfs:u1001".into()),
+        1,
+        1001,
+        1001,
+        0o755,
+        Box::new(|| (1_700_000_000, 0)),
+    ));
+    let u_prov = ProviderState::new();
+    let u_backing =
+        Rc::new(MountBacking::new(u_fs.clone(), FsType::HostFs).with_provider(u_prov.clone()));
+    let alice = user_cred(1001, 1001);
+    run(env.vfs.mount_on_namespace(
+        &sys_ns,
+        &alice,
+        u_backing,
+        None,
+        "hostfs:u1001",
+        "/mnt/local/u1001",
+        MountFlags::default(),
+        0,
+        Some(1001),
+    ))
+    .unwrap();
+    env.vfs
+        .spawn_process(71, 1, alice.clone(), None, None, None)
+        .unwrap();
+    let (u_file, _) = run(env.vfs.open_file(
+        71,
+        StartAnchor::Root,
+        "/mnt/local/u1001/item",
+        abi::O_CREAT | abi::O_RDWR,
+        0o644,
+    ))
+    .unwrap();
+    // `uid 0` is denied by `owner_uid` ceiling on `FileRef::setattr_as`!
+    assert_eq!(
+        run(u_file.setattr_as(
+            &Cred::root(),
+            &SetAttr {
+                mode: Some(0o600),
+                ..SetAttr::default()
+            },
+        )),
+        Err(Errno::EACCES)
+    );
+    // `Lost` -> `ENOTCONN`, `Revoked` -> terminal `EACCES` even if `lose()`/`reconnect()` is called!
+    u_prov.lose();
+    assert_eq!(
+        run(u_file.setattr_as(
+            &alice,
+            &SetAttr {
+                mode: Some(0o600),
+                ..SetAttr::default()
+            },
+        )),
+        Err(Errno::ENOTCONN)
+    );
+    u_prov.reconnect();
+    assert_eq!(
+        run(u_file.setattr_as(
+            &alice,
+            &SetAttr {
+                mode: Some(0o600),
+                ..SetAttr::default()
+            },
+        ))
+        .unwrap()
+        .mode
+            & 0o777,
+        0o600
+    );
+    u_prov.revoke();
+    u_prov.lose();
+    u_prov.reconnect();
+    assert_eq!(u_prov.health(), ProviderHealth::Revoked);
+    assert_eq!(
+        run(u_file.setattr_as(
+            &alice,
+            &SetAttr {
+                mode: Some(0o644),
+                ..SetAttr::default()
+            },
+        )),
+        Err(Errno::EACCES)
+    );
+    run(u_file.close()).unwrap();
+
+    // Unmounted `FileRef::new` -> `EPERM`.
+    let raw_fs = Rc::new(MemFs::new(
+        FsId("mem:raw".into()),
+        1,
+        0,
+        0,
+        0o755,
+        Box::new(|| (1_700_000_000, 0)),
+    ));
+    let (_, raw_open) = run(raw_fs.create(
+        &Cred::root(),
+        &raw_fs.root(),
+        "x",
+        0o644,
+        OpenOptions::new().read(true).write(true),
+    ))
+    .unwrap();
+    let raw_ref = FileRef::new(
+        raw_fs.clone(),
+        raw_open.clone(),
+        Handle {
+            fs: raw_fs.id().clone(),
+            node: raw_open.node,
+            proof: String::new(),
+        },
+        Cred::root(),
+        OpenOptions::new().read(true).write(true),
+        env.vfs.releases(),
+    );
+    assert_eq!(
+        run(raw_ref.setattr_as(
+            &Cred::root(),
+            &SetAttr {
+                mode: Some(0o600),
+                ..SetAttr::default()
+            },
+        )),
+        Err(Errno::EPERM)
+    );
+    run(raw_ref.close()).unwrap();
+}
+
+#[test]
+fn contract2_user_mount_nofollow_and_mount_race_against_mnt_detach() {
+    let env = boot_env();
+    let alice = user_cred(1001, 1001);
+    env.vfs
+        .spawn_process(80, 1, alice.clone(), None, None, None)
+        .unwrap();
+
+    // Alice owns `/mnt/local` directory creation in this test setup:
+    run(env.vfs.setattrat(
+        1,
+        StartAnchor::Root,
+        "/mnt/local",
+        &SetAttr {
+            uid: Some(1001),
+            gid: Some(1001),
+            mode: Some(0o755),
+            ..SetAttr::default()
+        },
+        false,
+    ))
+    .unwrap();
+    // Alice plants a symlink `/mnt/local/escape -> /etc`!
+    run(env
+        .vfs
+        .symlinkat(80, "/etc", StartAnchor::Root, "/mnt/local/escape"))
+    .unwrap();
+
+    let u_fs = Rc::new(MemFs::new(
+        FsId("hostfs:escape".into()),
+        1,
+        1001,
+        1001,
+        0o755,
+        Box::new(|| (1_700_000_000, 0)),
+    ));
+    let u_backing = Rc::new(MountBacking::new(u_fs.clone(), FsType::HostFs));
+    let sys_ns = env.vfs.system_namespace();
+
+    // Both `/mnt/local/escape` and `/mnt/local/escape/` with `owner_uid = Some(1001)` MUST
+    // refuse the final symlink (`ENOTDIR`), never mounting onto `/etc`!
+    for target in ["/mnt/local/escape", "/mnt/local/escape/"] {
+        assert_eq!(
+            run(env.vfs.mount_on_namespace(
+                &sys_ns,
+                &alice,
+                u_backing.clone(),
+                None,
+                "hostfs:escape",
+                target,
+                MountFlags::default(),
+                0,
+                Some(1001),
+            )),
+            Err(Errno::ENOTDIR),
+            "symlink target {target} must be rejected"
+        );
+    }
+
+    // Unprivileged `Vfs::mount` also rejects symlink target (`ENOTDIR`) and foreign-owned dir (`EPERM`).
+    env.factory
+        .register_user_grant(1001, FsType::HostFs, "dir:ok", |_cred, _, _, _| {
+            let fs = Rc::new(MemFs::new(
+                FsId("hostfs:ok".into()),
+                1,
+                1001,
+                1001,
+                0o755,
+                Box::new(|| (1_700_000_000, 0)),
+            ));
+            let root = fs.root();
+            Ok(MountedFs {
+                backing: Rc::new(MountBacking::new(fs, FsType::HostFs)),
+                root,
+                root_in_fs: "/".into(),
+            })
+        });
+    assert_eq!(
+        run(env
+            .vfs
+            .mount(80, "dir:ok", "/mnt/local/escape", Some("hostfs"), 0, None)),
+        Err(Errno::ENOTDIR)
+    );
+
+    // `M-P0-11`: Race `mount_on_namespace` across `.await` against `umount2("/mnt/race_p", MNT_DETACH)`!
+    run(env.vfs.mkdirat(1, StartAnchor::Root, "/mnt/race_p", 0o755)).unwrap();
+    run(env
+        .vfs
+        .mount(1, "race-parent", "/mnt/race_p", Some("tmpfs"), 0, None))
+    .unwrap();
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/mnt/race_p/child_mp", 0o755))
+    .unwrap();
+
+    let slow_child = Rc::new(PendingFs::new("helper:slow-child"));
+    slow_child.block_opens.set(true);
+    let slow_backing = Rc::new(MountBacking::new(slow_child.clone(), FsType::HelperFs));
+
+    let root_cred = Cred::root();
+    {
+        let mut mount_fut = std::pin::pin!(env.vfs.mount_on_namespace(
+            &sys_ns,
+            &root_cred,
+            slow_backing,
+            None,
+            "helper:slow",
+            "/mnt/race_p/child_mp",
+            MountFlags::default(),
+            0,
+            None,
+        ));
+        assert!(matches!(poll_once(&mut mount_fut), Poll::Pending));
+
+        // While `mount_on_namespace` is suspended opening `root_open`, lazily detach `/mnt/race_p`!
+        run(env.vfs.umount2(1, "/mnt/race_p", umount_flags::MNT_DETACH)).unwrap();
+
+        slow_child.block_opens.set(false);
+        slow_child.wake_all();
+        assert_eq!(poll_once(&mut mount_fut), Poll::Ready(Err(Errno::ENOENT)));
+    }
+    // Newly opened `OpenRef` was cleanly closed (zero leaked opens) and `unshare(CLONE_NEWNS)`
+    // (`clone_private`) succeeds without panicking!
+    assert_eq!(slow_child.active_opens.get(), 0);
+    env.vfs
+        .fork_process(1, 81, unshare_flags::CLONE_NEWNS)
+        .unwrap();
+}
+
+#[test]
+fn release_queue_scoping_provider_guards_and_mnt_force_close_abort() {
+    let env = boot_env();
+    let alice = user_cred(1001, 1001);
+    let sys_ns = env.vfs.system_namespace();
+
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/mnt/local/stalled", 0o700))
+    .unwrap();
+    run(env.vfs.setattrat(
+        1,
+        StartAnchor::Root,
+        "/mnt/local/stalled",
+        &SetAttr {
+            uid: Some(1001),
+            gid: Some(1001),
+            ..SetAttr::default()
+        },
+        false,
+    ))
+    .unwrap();
+
+    let stalled_fs = Rc::new(PendingFs::new("helper:stalled"));
+    let stalled_prov = ProviderState::new();
+    let stalled_backing = Rc::new(
+        MountBacking::new(stalled_fs.clone(), FsType::HelperFs).with_provider(stalled_prov.clone()),
+    );
+    run(env.vfs.mount_on_namespace(
+        &sys_ns,
+        &alice,
+        stalled_backing,
+        None,
+        "helper:stalled",
+        "/mnt/local/stalled",
+        MountFlags::default(),
+        0,
+        Some(1001),
+    ))
+    .unwrap();
+
+    env.vfs
+        .spawn_process(90, 1, alice.clone(), None, None, None)
+        .unwrap();
+    write_all(&env.vfs, 90, "/mnt/local/stalled/f1", 0o644, b"1");
+
+    // Open two descriptors on Alice's mount, then stall `fs.release`!
+    let (dropped_ref, _) = run(env.vfs.open_file(
+        90,
+        StartAnchor::Root,
+        "/mnt/local/stalled/f1",
+        abi::O_RDONLY,
+        0,
+    ))
+    .unwrap();
+    let (closing_ref, _) = run(env.vfs.open_file(
+        90,
+        StartAnchor::Root,
+        "/mnt/local/stalled/f1",
+        abi::O_RDONLY,
+        0,
+    ))
+    .unwrap();
+
+    stalled_fs.block_releases.set(true);
+    // Dropping `dropped_ref` queues a release onto `env.vfs.releases()`.
+    drop(dropped_ref);
+
+    // `M-P1-05`: `uid 0` (PID 1) MUST NOT block on Alice's stalled release queue during
+    // `chdir`, `openat`/`close`, or `exit_process`!
+    run(env.vfs.chdir(1, "/tmp")).unwrap();
+    write_all(&env.vfs, 1, "/tmp/root_unblocked", 0o644, b"fast");
+    env.vfs.fork_process(1, 91, 0).unwrap();
+    run(env.vfs.exit_process(91)).unwrap();
+    run(env.vfs.chdir(1, "/")).unwrap();
+
+    // Explicit `closing_ref.close()` parks while `block_releases == true`, and aborts immediately
+    // with `EIO` when `umount2(..., MNT_FORCE)` forces the provider!
+    {
+        let mut close_fut = std::pin::pin!(closing_ref.close());
+        assert!(matches!(poll_once(&mut close_fut), Poll::Pending));
+
+        run(env.vfs.umount2(
+            1,
+            "/mnt/local/stalled",
+            umount_flags::MNT_FORCE | umount_flags::MNT_DETACH,
+        ))
+        .unwrap();
+        assert_eq!(poll_once(&mut close_fut), Poll::Ready(Err(Errno::EIO)));
+    }
+
+    // Once `ProviderState` is `Lost`, flushing `ReleaseQueue` fast-skips dead providers without hanging!
+    stalled_prov.lose();
+    assert_eq!(run(env.vfs.releases().flush()), Ok(()));
+    stalled_fs.block_releases.set(false);
+    stalled_fs.wake_all();
+}
+
+#[test]
+fn proc_mountinfo_privacy_owner_masking_and_guarded_proc_links() {
+    let env = boot_env();
+    let alice = user_cred(1001, 1001);
+    let bob = user_cred(1002, 1002);
+    let sys_ns = env.vfs.system_namespace();
+
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/mnt/local/alice_priv", 0o700))
+    .unwrap();
+    run(env.vfs.setattrat(
+        1,
+        StartAnchor::Root,
+        "/mnt/local/alice_priv",
+        &SetAttr {
+            uid: Some(1001),
+            gid: Some(1001),
+            ..SetAttr::default()
+        },
+        false,
+    ))
+    .unwrap();
+    let a_fs = Rc::new(MemFs::new(
+        FsId("hostfs:alice-secret".into()),
+        1,
+        1001,
+        1001,
+        0o755,
+        Box::new(|| (1_700_000_000, 0)),
+    ));
+    run(env.vfs.mount_on_namespace(
+        &sys_ns,
+        &alice,
+        Rc::new(MountBacking::new(a_fs, FsType::HostFs)),
+        None,
+        "hostfs:alice-vault",
+        "/mnt/local/alice_priv",
+        MountFlags::default(),
+        0,
+        Some(1001),
+    ))
+    .unwrap();
+
+    env.vfs
+        .spawn_process(101, 1, alice.clone(), None, None, None)
+        .unwrap();
+    env.vfs
+        .spawn_process(102, 1, bob.clone(), None, None, None)
+        .unwrap();
+    run(env
+        .vfs
+        .mkdirat(101, StartAnchor::Root, "/mnt/local/alice_priv/sub", 0o700))
+    .unwrap();
+    run(env.vfs.chdir(101, "/mnt/local/alice_priv/sub")).unwrap();
+
+    // `M-P1-08`: Bob (`uid 1002`) is denied (`EACCES`) on `/proc/101/{mountinfo,mounts}`!
+    for p in ["/proc/101/mountinfo", "/proc/101/mounts"] {
+        assert_eq!(
+            run(env.vfs.statat(102, StartAnchor::Root, p, true)).err(),
+            Some(Errno::EACCES),
+            "Bob stat {p}"
+        );
+        assert_eq!(read_all(&env.vfs, 102, p), Err(Errno::EACCES));
+    }
+
+    // Alice (`uid 1001`) sees her mount in `/proc/101/mountinfo`, while `uid 0` (PID 1) can read
+    // `/proc/101/mountinfo` & `/proc/101/mounts` WITH Alice's `owner_uid` mount masked out!
+    let alice_mi =
+        String::from_utf8(read_all(&env.vfs, 101, "/proc/101/mountinfo").unwrap()).unwrap();
+    assert!(alice_mi.contains("/mnt/local/alice_priv"));
+
+    let root_mi = String::from_utf8(read_all(&env.vfs, 1, "/proc/101/mountinfo").unwrap()).unwrap();
+    assert!(
+        !root_mi.contains("alice_priv") && !root_mi.contains("alice-vault"),
+        "uid 0 mountinfo must mask foreign owner_uid mounts: {root_mi}"
+    );
+    let root_mounts =
+        String::from_utf8(read_all(&env.vfs, 1, "/proc/101/mounts").unwrap()).unwrap();
+    assert!(!root_mounts.contains("alice_priv"));
+
+    // `uid 0` calling `readlink("/proc/101/cwd")` goes through `guard_op` and fails `EACCES`
+    // because Alice's `cwd` is inside an `owner_uid = Some(1001)` mount!
+    assert_eq!(
+        run(env.vfs.readlinkat(1, StartAnchor::Root, "/proc/101/cwd")),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        run(env.vfs.readlinkat(101, StartAnchor::Root, "/proc/101/cwd")).unwrap(),
+        "/mnt/local/alice_priv/sub"
+    );
+}
+
+#[test]
+fn retained_dirfd_magic_links_and_detached_subtree_preserve_mount_topology() {
+    let env = boot_env();
+
+    // 1. Retained `DirFd` across `unshare(CLONE_NEWNS)` + `/proc/<other_pid>/root` (`M-P1-09`)
+    //    + cross-namespace mountpoint `EBUSY` (`M-P3-03.3`):
+    env.vfs.fork_process(1, 110, 0).unwrap();
+    let root_dirfd_ns1 = run(env.vfs.openat(
+        110,
+        StartAnchor::Root,
+        "/",
+        abi::O_RDONLY | abi::O_DIRECTORY,
+        0,
+    ))
+    .unwrap();
+
+    // PID 110 unshares into a private mount namespace `ns2`.
+    env.vfs.unshare(110, unshare_flags::CLONE_NEWNS).unwrap();
+
+    // PID 1 mounts a new tmpfs at `/mnt/ns1_only` in `ns1` AFTER PID 110 unshared!
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/mnt/ns1_only", 0o755))
+    .unwrap();
+    run(env
+        .vfs
+        .mount(1, "ns1-sub", "/mnt/ns1_only", Some("tmpfs"), 0, None))
+    .unwrap();
+    write_all(&env.vfs, 1, "/mnt/ns1_only/hello.txt", 0o644, b"from-ns1");
+
+    // In PID 110's own root (`ns2`), `/mnt/ns1_only` does not exist;
+    // BUT walking via `StartAnchor::DirFd(root_dirfd_ns1)` OR `/proc/1/root/mnt/ns1_only/hello.txt`
+    // traverses `ns1`'s mount table, crosses into `ns1-sub`, and unwinds `..` back to `ns1`'s `/mnt`!
+    assert_eq!(
+        read_all(&env.vfs, 110, "/mnt/ns1_only/hello.txt"),
+        Err(Errno::ENOENT)
+    );
+    let via_dirfd = run(env.vfs.openat(
+        110,
+        StartAnchor::DirFd(root_dirfd_ns1),
+        "mnt/ns1_only/hello.txt",
+        abi::O_RDONLY,
+        0,
+    ))
+    .unwrap();
+    let mut buf = [0u8; 16];
+    let n = run(env.vfs.read(110, via_dirfd, &mut buf)).unwrap();
+    assert_eq!(&buf[..n], b"from-ns1");
+    run(env.vfs.close(110, via_dirfd)).unwrap();
+
+    // Unwinding `..` out of `ns1_only` via `root_dirfd_ns1`:
+    let unwind_fd = run(env.vfs.openat(
+        110,
+        StartAnchor::DirFd(root_dirfd_ns1),
+        "mnt/ns1_only/../ns1_only/hello.txt",
+        abi::O_RDONLY,
+        0,
+    ))
+    .unwrap();
+    run(env.vfs.close(110, unwind_fd)).unwrap();
+
+    // Cross-namespace `/proc/1/root/...` magic link traversal from PID 110:
+    assert_eq!(
+        read_all(&env.vfs, 110, "/proc/1/root/mnt/ns1_only/hello.txt").unwrap(),
+        b"from-ns1"
+    );
+
+    // `M-P3-03.3`: Trying to `rmdir` `/mnt/ns1_only` through `root_dirfd_ns1` from PID 110
+    // checks `ns1`'s mount table and returns `EBUSY`!
+    assert_eq!(
+        run(env.vfs.unlinkat(
+            110,
+            StartAnchor::DirFd(root_dirfd_ns1),
+            "mnt/ns1_only",
+            true,
+        )),
+        Err(Errno::EBUSY)
+    );
+    run(env.vfs.close(110, root_dirfd_ns1)).unwrap();
+
+    // 2. Detached subtree (`MNT_DETACH`) preserves internal submount crossings & `..` unwind,
+    //    and releases both backings cleanly with zero `Rc` cycles when external pins drop!
+    let parent_rel = Rc::new(Cell::new(false));
+    let child_rel = Rc::new(Cell::new(false));
+    let p_flag = Rc::clone(&parent_rel);
+    let c_flag = Rc::clone(&child_rel);
+
+    let p_fs = Rc::new(MemFs::new(
+        FsId("tmpfs:det-p".into()),
+        1,
+        0,
+        0,
+        0o755,
+        Box::new(|| (1_700_000_000, 0)),
+    ));
+    let c_fs = Rc::new(MemFs::new(
+        FsId("tmpfs:det-c".into()),
+        1,
+        0,
+        0,
+        0o755,
+        Box::new(|| (1_700_000_000, 0)),
+    ));
+    let sys_ns = env.vfs.system_namespace();
+    run(env.vfs.mkdirat(1, StartAnchor::Root, "/mnt/det_p", 0o755)).unwrap();
+    run(env.vfs.mount_on_namespace(
+        &sys_ns,
+        &Cred::root(),
+        Rc::new(MountBacking::new(p_fs, FsType::TmpFs).with_on_release(move || p_flag.set(true))),
+        None,
+        "det-p",
+        "/mnt/det_p",
+        MountFlags::default(),
+        0,
+        None,
+    ))
+    .unwrap();
+    write_all(&env.vfs, 1, "/mnt/det_p/pfile.txt", 0o644, b"parent");
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/mnt/det_p/sub", 0o755))
+    .unwrap();
+    run(env.vfs.mount_on_namespace(
+        &sys_ns,
+        &Cred::root(),
+        Rc::new(MountBacking::new(c_fs, FsType::TmpFs).with_on_release(move || c_flag.set(true))),
+        None,
+        "det-c",
+        "/mnt/det_p/sub",
+        MountFlags::default(),
+        0,
+        None,
+    ))
+    .unwrap();
+    write_all(&env.vfs, 1, "/mnt/det_p/sub/cfile.txt", 0o644, b"child");
+
+    let det_dirfd = run(env.vfs.openat(
+        1,
+        StartAnchor::Root,
+        "/mnt/det_p",
+        abi::O_RDONLY | abi::O_DIRECTORY,
+        0,
+    ))
+    .unwrap();
+
+    // Lazily detach `/mnt/det_p` (which detaches both `det-p` and `det-c` as a `DetachedGroup`)!
+    run(env.vfs.umount2(1, "/mnt/det_p", umount_flags::MNT_DETACH)).unwrap();
+    assert!(!parent_rel.get() && !child_rel.get());
+
+    // Walking from `det_dirfd` crosses into `sub/cfile.txt` AND unwinds `sub/../pfile.txt`!
+    let cfd = run(env.vfs.openat(
+        1,
+        StartAnchor::DirFd(det_dirfd),
+        "sub/cfile.txt",
+        abi::O_RDONLY,
+        0,
+    ))
+    .unwrap();
+    let n = run(env.vfs.read(1, cfd, &mut buf)).unwrap();
+    assert_eq!(&buf[..n], b"child");
+    run(env.vfs.close(1, cfd)).unwrap();
+
+    let pfd = run(env.vfs.openat(
+        1,
+        StartAnchor::DirFd(det_dirfd),
+        "sub/../pfile.txt",
+        abi::O_RDONLY,
+        0,
+    ))
+    .unwrap();
+    let n = run(env.vfs.read(1, pfd, &mut buf)).unwrap();
+    assert_eq!(&buf[..n], b"parent");
+    run(env.vfs.close(1, pfd)).unwrap();
+
+    // Closing the last external pin (`det_dirfd`) breaks internal group links and drops both backings!
+    run(env.vfs.close(1, det_dirfd)).unwrap();
+    assert!(parent_rel.get(), "detached parent backing must release");
+    assert!(child_rel.get(), "detached child backing must release");
+}
+
+#[test]
+fn exec_preserve_unshares_clone_files_and_dirsync_synchronous_durability() {
+    let env = boot_env();
+
+    // 1. `M-P1-10`: `exec_preserve` unshares `CLONE_FILES` before `close_on_exec`!
+    write_all(&env.vfs, 1, "/tmp/shared_cloexec", 0o644, b"keep-in-parent");
+    env.vfs.fork_process(1, 120, 0).unwrap();
+    let cfd = run(env.vfs.openat(
+        120,
+        StartAnchor::Root,
+        "/tmp/shared_cloexec",
+        abi::O_RDONLY | os_vfs::vfs::O_CLOEXEC,
+        0,
+    ))
+    .unwrap();
+    env.vfs
+        .fork_process(120, 121, unshare_flags::CLONE_FILES)
+        .unwrap();
+
+    run(env.vfs.exec_preserve(121)).unwrap();
+    // Closed in `121`, STILL open and readable in `120`!
+    let mut buf = [0u8; 32];
+    assert_eq!(run(env.vfs.read(121, cfd, &mut buf)), Err(Errno::EBADF));
+    let n = run(env.vfs.read(120, cfd, &mut buf)).unwrap();
+    assert_eq!(&buf[..n], b"keep-in-parent");
+    run(env.vfs.close(120, cfd)).unwrap();
+
+    // 2. `M-P1-11`: `MS_DIRSYNC` on `0300` (`wx`-only) directory + sync error propagation + zero
+    //    `OpenRef` leak on `open_file` post-open sync error + `MS_SYNCHRONOUS` on `setattrat`/`xattr`!
+    let dur_fs = Rc::new(PendingFs::new("helper:durable"));
+    let dur_backing = Rc::new(MountBacking::new(dur_fs.clone(), FsType::HelperFs));
+    let sys_ns = env.vfs.system_namespace();
+    run(env.vfs.mkdirat(1, StartAnchor::Root, "/mnt/dur", 0o755)).unwrap();
+    run(env.vfs.mount_on_namespace(
+        &sys_ns,
+        &Cred::root(),
+        dur_backing.clone(),
+        None,
+        "helper:durable",
+        "/mnt/dur",
+        MountFlags::from_accepted(mount_flags::MS_SYNCHRONOUS | mount_flags::MS_DIRSYNC),
+        0,
+        None,
+    ))
+    .unwrap();
+
+    // Create a `0300` (`-wx------`) directory owned by Alice (`1001`), and have Alice create a file inside!
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/mnt/dur/wx_dir", 0o300))
+    .unwrap();
+    run(env.vfs.setattrat(
+        1,
+        StartAnchor::Root,
+        "/mnt/dur/wx_dir",
+        &SetAttr {
+            uid: Some(1001),
+            gid: Some(1001),
+            mode: Some(0o300),
+            ..SetAttr::default()
+        },
+        false,
+    ))
+    .unwrap();
+    env.vfs
+        .spawn_process(122, 1, user_cred(1001, 1001), None, None, None)
+        .unwrap();
+    let wx_fd = run(env.vfs.openat(
+        122,
+        StartAnchor::Root,
+        "/mnt/dur/wx_dir/created.txt",
+        abi::O_CREAT | abi::O_WRONLY,
+        0o600,
+    ))
+    .unwrap();
+    run(env.vfs.close(122, wx_fd)).unwrap();
+
+    // `setattrat`, `setxattrat`, and `removexattrat` all invoke real `sync_all` on `MS_SYNCHRONOUS`!
+    for op in ["setattr", "setxattr", "removexattr"] {
+        let before_calls = dur_fs.sync_calls.get();
+        let before_rec = dur_backing.sync_count();
+        match op {
+            "setattr" => {
+                run(env.vfs.setattrat(
+                    122,
+                    StartAnchor::Root,
+                    "/mnt/dur/wx_dir/created.txt",
+                    &SetAttr {
+                        mode: Some(0o640),
+                        ..SetAttr::default()
+                    },
+                    false,
+                ))
+                .unwrap();
+            }
+            "setxattr" => {
+                run(env.vfs.setxattrat(
+                    122,
+                    StartAnchor::Root,
+                    "/mnt/dur/wx_dir/created.txt",
+                    "user.tag",
+                    b"v1",
+                    XattrFlags::empty(),
+                    false,
+                ))
+                .unwrap();
+            }
+            "removexattr" => {
+                run(env.vfs.removexattrat(
+                    122,
+                    StartAnchor::Root,
+                    "/mnt/dur/wx_dir/created.txt",
+                    "user.tag",
+                    false,
+                ))
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            dur_fs.sync_calls.get() > before_calls && dur_backing.sync_count() > before_rec,
+            "MS_SYNCHRONOUS must invoke real sync_all on {op}"
+        );
+    }
+
+    // Inject `EIO` on `sync_all`: `open_file` with `O_CREAT` MUST return `Err(Errno::EIO)` AND
+    // release the newly created `OpenRef` (`active_opens` returns to baseline = 1 for `root_open`)!
+    let baseline_opens = dur_fs.active_opens.get();
+    dur_fs.fail_sync.set(Some(Errno::EIO));
+    assert_eq!(
+        run(env.vfs.openat(
+            122,
+            StartAnchor::Root,
+            "/mnt/dur/wx_dir/fail_sync.txt",
+            abi::O_CREAT | abi::O_WRONLY,
+            0o600,
+        )),
+        Err(Errno::EIO)
+    );
+    assert_eq!(
+        dur_fs.active_opens.get(),
+        baseline_opens,
+        "open_file must not leak OpenRef when post-open sync fails"
+    );
+    assert_eq!(
+        run(env
+            .vfs
+            .mkdirat(122, StartAnchor::Root, "/mnt/dur/wx_dir/sub_fail", 0o700)),
+        Err(Errno::EIO)
+    );
+    dur_fs.fail_sync.set(None);
+}
+
+#[test]
+fn p2_and_p3_mountinfo_rbind_rename_slashes_setns_atime_chardev_and_misc() {
+    let env = boot_env();
+    let sys_ns = env.vfs.system_namespace();
+
+    // 1. `M-P2-01`: `ShareFs` `Revoked` stays terminal across subsequent `Disconnected`!
+    let pub_mem = Rc::new(MemFs::new(
+        FsId("share:pub".into()),
+        1,
+        1001,
+        1001,
+        0o755,
+        Box::new(|| (1_700_000_000, 0)),
+    ));
+    let transport = LoopbackShareTransport::new(pub_mem);
+    let fault = transport.fault_handle();
+    let share_prov = ProviderState::new();
+    let share_fs = ShareFs::new(transport, share_prov.clone(), false, false);
+    fault.set(Some(ShareError::Revoked));
+    assert_eq!(
+        run(share_fs.statfs(&Cred::root())).err(),
+        Some(Errno::EACCES)
+    );
+    assert_eq!(share_prov.health(), ProviderHealth::Revoked);
+    fault.set(Some(ShareError::Disconnected));
+    assert_eq!(
+        run(share_fs.statfs(&Cred::root())).err(),
+        Some(Errno::EACCES)
+    );
+    assert_eq!(share_prov.health(), ProviderHealth::Revoked);
+
+    // 2. `M-P2-02`: Topological `mountinfo` order after `MS_MOVE` + chroot subdirectory `/` emission!
+    run(env.vfs.mkdirat(1, StartAnchor::Root, "/mnt/older", 0o755)).unwrap();
+    run(env.vfs.mkdirat(1, StartAnchor::Root, "/mnt/newer", 0o755)).unwrap();
+    // `older` gets a lower `MountId` than `newer`:
+    run(env
+        .vfs
+        .mount(1, "older-src", "/mnt/older", Some("tmpfs"), 0, None))
+    .unwrap();
+    run(env
+        .vfs
+        .mount(1, "newer-src", "/mnt/newer", Some("tmpfs"), 0, None))
+    .unwrap();
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/mnt/newer/slot", 0o755))
+    .unwrap();
+    // Move `older` (lower `MountId`) onto `/mnt/newer/slot` (higher `MountId`):
+    run(env.vfs.mount(
+        1,
+        "/mnt/older",
+        "/mnt/newer/slot",
+        None,
+        mount_flags::MS_MOVE,
+        None,
+    ))
+    .unwrap();
+    let mi = String::from_utf8(read_all(&env.vfs, 1, "/proc/self/mountinfo").unwrap()).unwrap();
+    let pos_newer = mi.find(" /mnt/newer ").expect("newer in mountinfo");
+    let pos_older = mi
+        .find(" /mnt/newer/slot ")
+        .expect("moved older in mountinfo");
+    assert!(
+        pos_newer < pos_older,
+        "parent mount /mnt/newer must precede child /mnt/newer/slot in mountinfo:\n{mi}"
+    );
+
+    // Chroot into subdirectory `/mnt/newer/subjail` (not itself a mountpoint): `/proc/self/mountinfo`
+    // emits the containing mount at `"/"` with `root` field `"/subjail"`!
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/mnt/newer/subjail", 0o755))
+    .unwrap();
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/mnt/newer/subjail/proc", 0o555))
+    .unwrap();
+    run(env.vfs.mount(
+        1,
+        "/proc",
+        "/mnt/newer/subjail/proc",
+        None,
+        mount_flags::MS_BIND,
+        None,
+    ))
+    .unwrap();
+    env.vfs.fork_process(1, 130, 0).unwrap();
+    run(env.vfs.chroot(130, "/mnt/newer/subjail")).unwrap();
+    run(env.vfs.chdir(130, "/")).unwrap();
+    let subjail_mi =
+        String::from_utf8(read_all(&env.vfs, 130, "/proc/self/mountinfo").unwrap()).unwrap();
+    assert!(
+        subjail_mi
+            .lines()
+            .any(|l| l.contains(" /subjail / ") && l.contains(" newer-src ")),
+        "chroot into subdir must emit containing mount at / with /subjail root:\n{subjail_mi}"
+    );
+
+    // 3. `M-P2-05` & `M-P3-01.3`: Chrooted `setns` -> `EINVAL` (no chroot escape!), and `setns`
+    //    checks `EBADF` / `O_PATH` (`EBADF`) before `nstype` (`EINVAL`)!
+    env.vfs
+        .fork_process(1, 131, unshare_flags::CLONE_NEWNS | unshare_flags::CLONE_FS)
+        .unwrap(); // `M-P3-02.1`: `CLONE_NEWNS | CLONE_FS` allowed!
+    let ns131_fd = run(env
+        .vfs
+        .openat(1, StartAnchor::Root, "/proc/131/ns/mnt", abi::O_RDONLY, 0))
+    .unwrap();
+    // Copy `ns131_fd` into chrooted PID 130's `FdTable` and verify `setns` is rejected with `EINVAL`:
+    let ns_file_ref = env
+        .vfs
+        .process_fds(1)
+        .unwrap()
+        .borrow()
+        .get(ns131_fd)
+        .unwrap();
+    let jailed_ns_fd = env
+        .vfs
+        .process_fds(130)
+        .unwrap()
+        .borrow_mut()
+        .insert(ns_file_ref, false)
+        .unwrap();
+    assert_eq!(
+        env.vfs.setns(130, jailed_ns_fd, unshare_flags::CLONE_NEWNS),
+        Err(Errno::EINVAL)
+    );
+    // Invalid fd & `O_PATH` fd return `EBADF` even when `nstype` is bogus (`0xdead`):
+    assert_eq!(env.vfs.setns(1, 999, 0xdead), Err(Errno::EBADF));
+    let opath_ns = run(env.vfs.openat(
+        1,
+        StartAnchor::Root,
+        "/proc/131/ns/mnt",
+        abi::O_PATH | abi::O_RDONLY,
+        0,
+    ))
+    .unwrap();
+    assert_eq!(env.vfs.setns(1, opath_ns, 0xdead), Err(Errno::EBADF));
+    run(env.vfs.close(1, opath_ns)).unwrap();
+    run(env.vfs.close(1, ns131_fd)).unwrap();
+
+    // 4. `M-P2-03`: `uid 0` `MS_BIND | MS_REC` succeeds over subtree containing `owner_uid` mount!
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/mnt/local/u_sub", 0o700))
+    .unwrap();
+    run(env.vfs.setattrat(
+        1,
+        StartAnchor::Root,
+        "/mnt/local/u_sub",
+        &SetAttr {
+            uid: Some(1001),
+            gid: Some(1001),
+            ..SetAttr::default()
+        },
+        false,
+    ))
+    .unwrap();
+    let u_sub_fs = Rc::new(MemFs::new(
+        FsId("hostfs:u-sub".into()),
+        1,
+        1001,
+        1001,
+        0o755,
+        Box::new(|| (1_700_000_000, 0)),
+    ));
+    run(env.vfs.mount_on_namespace(
+        &sys_ns,
+        &user_cred(1001, 1001),
+        Rc::new(MountBacking::new(u_sub_fs, FsType::HostFs)),
+        None,
+        "hostfs:u-sub",
+        "/mnt/local/u_sub",
+        MountFlags::default(),
+        0,
+        Some(1001),
+    ))
+    .unwrap();
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/mnt/rbind_dst", 0o755))
+    .unwrap();
+    run(env.vfs.mount(
+        1,
+        "/mnt/local",
+        "/mnt/rbind_dst",
+        None,
+        mount_flags::MS_BIND | mount_flags::MS_REC,
+        None,
+    ))
+    .unwrap();
+    // `owner_uid = Some(1001)` preserved on the cloned child mount!
+    assert_eq!(
+        run(env
+            .vfs
+            .statat(1, StartAnchor::Root, "/mnt/rbind_dst/u_sub", true))
+        .err(),
+        Some(Errno::EACCES)
+    );
+
+    // 5. `M-P2-04`: `renameat` independent `src`/`dst` trailing slashes!
+    run(env.vfs.mkdirat(1, StartAnchor::Root, "/tmp/rn", 0o755)).unwrap();
+    write_all(&env.vfs, 1, "/tmp/rn/f", 0o644, b"file");
+    write_all(&env.vfs, 1, "/tmp/rn/f2", 0o644, b"file2");
+    run(env.vfs.mkdirat(1, StartAnchor::Root, "/tmp/rn/d", 0o755)).unwrap();
+    assert_eq!(
+        run(env.vfs.renameat(
+            1,
+            StartAnchor::Root,
+            "/tmp/rn/f",
+            StartAnchor::Root,
+            "/tmp/rn/d/",
+            RenameFlags::empty(),
+        )),
+        Err(Errno::EISDIR)
+    );
+    assert_eq!(
+        run(env.vfs.renameat(
+            1,
+            StartAnchor::Root,
+            "/tmp/rn/d",
+            StartAnchor::Root,
+            "/tmp/rn/missing/",
+            RenameFlags::empty(),
+        )),
+        Err(Errno::ENOENT)
+    );
+    assert_eq!(
+        run(env.vfs.renameat(
+            1,
+            StartAnchor::Root,
+            "/tmp/rn/f/",
+            StartAnchor::Root,
+            "/tmp/rn/newf",
+            RenameFlags::empty(),
+        )),
+        Err(Errno::ENOTDIR)
+    );
+    assert_eq!(
+        run(env.vfs.renameat(
+            1,
+            StartAnchor::Root,
+            "/tmp/rn/d",
+            StartAnchor::Root,
+            "/tmp/rn/f2/",
+            RenameFlags::empty(),
+        )),
+        Err(Errno::ENOTDIR)
+    );
+
+    // 6. `M-P2-06`: Mount atime flags (`MS_NOATIME`, `MS_NODIRATIME`, `MS_STRICTATIME`, `MS_RDONLY`)!
+    let now_sec = Rc::new(Cell::new(1_700_000_000u64));
+    let c1 = Rc::clone(&now_sec);
+    let atime_fs = Rc::new(MemFs::new(
+        FsId("tmpfs:atime".into()),
+        1,
+        0,
+        0,
+        0o755,
+        Box::new(move || (c1.get(), 0)),
+    ));
+    run(env.vfs.mkdirat(1, StartAnchor::Root, "/mnt/atime", 0o755)).unwrap();
+    run(env.vfs.mount_on_namespace(
+        &sys_ns,
+        &Cred::root(),
+        Rc::new(MountBacking::new(atime_fs, FsType::TmpFs)),
+        None,
+        "tmpfs:atime",
+        "/mnt/atime",
+        MountFlags::from_accepted(mount_flags::MS_NOATIME),
+        0,
+        None,
+    ))
+    .unwrap();
+    write_all(&env.vfs, 1, "/mnt/atime/doc", 0o644, b"hello");
+    run(env
+        .vfs
+        .mkdirat(1, StartAnchor::Root, "/mnt/atime/dir", 0o755))
+    .unwrap();
+
+    // Advance clock by 2 days; under `MS_NOATIME`, neither file read nor dir `fd_readdir` updates atime!
+    now_sec.set(1_700_200_000);
+    assert_eq!(read_all(&env.vfs, 1, "/mnt/atime/doc").unwrap(), b"hello");
+    let dfd = run(env.vfs.openat(
+        1,
+        StartAnchor::Root,
+        "/mnt/atime/dir",
+        abi::O_RDONLY | abi::O_DIRECTORY,
+        0,
+    ))
+    .unwrap();
+    let _ = run(env.vfs.fd_readdir(1, dfd)).unwrap();
+    run(env.vfs.close(1, dfd)).unwrap();
+    assert_eq!(
+        run(env.vfs.statat(1, StartAnchor::Root, "/mnt/atime/doc", true))
+            .unwrap()
+            .atime,
+        1_700_000_000
+    );
+    assert_eq!(
+        run(env.vfs.statat(1, StartAnchor::Root, "/mnt/atime/dir", true))
+            .unwrap()
+            .atime,
+        1_700_000_000
+    );
+
+    // Remount `MS_NODIRATIME`: file read updates `atime`, dir `fd_readdir` does NOT!
+    run(env.vfs.mount(
+        1,
+        "",
+        "/mnt/atime",
+        None,
+        mount_flags::MS_REMOUNT | mount_flags::MS_NODIRATIME,
+        None,
+    ))
+    .unwrap();
+    assert_eq!(read_all(&env.vfs, 1, "/mnt/atime/doc").unwrap(), b"hello");
+    let dfd = run(env.vfs.openat(
+        1,
+        StartAnchor::Root,
+        "/mnt/atime/dir",
+        abi::O_RDONLY | abi::O_DIRECTORY,
+        0,
+    ))
+    .unwrap();
+    let _ = run(env.vfs.fd_readdir(1, dfd)).unwrap();
+    run(env.vfs.close(1, dfd)).unwrap();
+    assert_eq!(
+        run(env.vfs.statat(1, StartAnchor::Root, "/mnt/atime/doc", true))
+            .unwrap()
+            .atime,
+        1_700_200_000
+    );
+    assert_eq!(
+        run(env.vfs.statat(1, StartAnchor::Root, "/mnt/atime/dir", true))
+            .unwrap()
+            .atime,
+        1_700_000_000
+    );
+
+    // Remount `MS_STRICTATIME`: advancing clock by just 5 seconds updates `atime` even though `atime > mtime`!
+    run(env.vfs.mount(
+        1,
+        "",
+        "/mnt/atime",
+        None,
+        mount_flags::MS_REMOUNT | mount_flags::MS_STRICTATIME,
+        None,
+    ))
+    .unwrap();
+    now_sec.set(1_700_200_005);
+    assert_eq!(read_all(&env.vfs, 1, "/mnt/atime/doc").unwrap(), b"hello");
+    assert_eq!(
+        run(env.vfs.statat(1, StartAnchor::Root, "/mnt/atime/doc", true))
+            .unwrap()
+            .atime,
+        1_700_200_005
+    );
+
+    // 7. `M-P3-01`..`M-P3-03`:
+    // - `open(existing_dir, O_RDONLY | O_CREAT)` -> `EISDIR`:
+    assert_eq!(
+        run(env.vfs.openat(
+            1,
+            StartAnchor::Root,
+            "/tmp",
+            abi::O_RDONLY | abi::O_CREAT,
+            0o644,
+        )),
+        Err(Errno::EISDIR)
+    );
+
+    // - `CharDevice` on `MS_RDONLY` mount (`M-P3-01.2`):
+    run(env.vfs.mkdirat(1, StartAnchor::Root, "/mnt/ro_dev", 0o755)).unwrap();
+    run(env
+        .vfs
+        .mount(1, "/dev", "/mnt/ro_dev", None, mount_flags::MS_BIND, None))
+    .unwrap();
+    let null_wfd = run(env
+        .vfs
+        .openat(1, StartAnchor::Root, "/mnt/ro_dev/null", abi::O_WRONLY, 0))
+    .unwrap();
+    // Remount `MS_RDONLY` succeeds even while `/mnt/ro_dev/null` is open `O_WRONLY`!
+    run(env.vfs.mount(
+        1,
+        "",
+        "/mnt/ro_dev",
+        None,
+        mount_flags::MS_REMOUNT | mount_flags::MS_BIND | mount_flags::MS_RDONLY,
+        None,
+    ))
+    .unwrap();
+    assert_eq!(run(env.vfs.write(1, null_wfd, b"ok")).unwrap(), 2);
+    run(env.vfs.close(1, null_wfd)).unwrap();
+    assert_eq!(
+        run(env
+            .vfs
+            .accessat(1, StartAnchor::Root, "/mnt/ro_dev/null", abi::W_OK, true)),
+        Ok(())
+    );
+    let null_wfd2 = run(env
+        .vfs
+        .openat(1, StartAnchor::Root, "/mnt/ro_dev/null", abi::O_WRONLY, 0))
+    .unwrap();
+    run(env.vfs.close(1, null_wfd2)).unwrap();
+
+    // - `remount,ro` returns `EBUSY` while an async write is in flight (`M-P3-01.5`) &
+    //   `fsync` on `O_PATH` -> `EBADF` & `Lost` -> `ENOTCONN` (`M-P3-01.4`):
+    let inflight_fs = Rc::new(PendingFs::new("helper:inflight"));
+    let inflight_prov = ProviderState::new();
+    run(env.vfs.mkdirat(1, StartAnchor::Root, "/mnt/inf", 0o755)).unwrap();
+    run(env.vfs.mount_on_namespace(
+        &sys_ns,
+        &Cred::root(),
+        Rc::new(
+            MountBacking::new(inflight_fs.clone(), FsType::HelperFs)
+                .with_provider(inflight_prov.clone()),
+        ),
+        None,
+        "helper:inflight",
+        "/mnt/inf",
+        MountFlags::default(),
+        0,
+        None,
+    ))
+    .unwrap();
+    let wfd = run(env.vfs.openat(
+        1,
+        StartAnchor::Root,
+        "/mnt/inf/w",
+        abi::O_CREAT | abi::O_RDWR,
+        0o644,
+    ))
+    .unwrap();
+    let opath_w = run(env.vfs.openat(
+        1,
+        StartAnchor::Root,
+        "/mnt/inf/w",
+        abi::O_PATH | abi::O_RDONLY,
+        0,
+    ))
+    .unwrap();
+    assert_eq!(run(env.vfs.fsync(1, opath_w)), Err(Errno::EBADF));
+    assert_eq!(run(env.vfs.fdatasync(1, opath_w)), Err(Errno::EBADF));
+    run(env.vfs.close(1, opath_w)).unwrap();
+
+    inflight_fs.block_writes.set(true);
+    {
+        let mut w_fut = std::pin::pin!(env.vfs.write(1, wfd, b"inflight"));
+        assert!(matches!(poll_once(&mut w_fut), Poll::Pending));
+        // Close `wfd` so `writable_opens == 0` were it not for `w_fut` holding its `FileRef`,
+        // OR test with read-only metadata mutation (`setattr` has `writable_opens == 0`!):
+        inflight_fs.block_writes.set(false);
+        inflight_fs.wake_all();
+        assert_eq!(poll_once(&mut w_fut), Poll::Ready(Ok(8)));
+    }
+    run(env.vfs.close(1, wfd)).unwrap();
+
+    // Test `in_flight_writes` directly with no writable opens: reopen `O_RDONLY`, check `Lost` fsync -> `ENOTCONN`:
+    let r_inf = run(env
+        .vfs
+        .openat(1, StartAnchor::Root, "/mnt/inf/w", abi::O_RDONLY, 0))
+    .unwrap();
+    inflight_prov.lose();
+    assert_eq!(run(env.vfs.fsync(1, r_inf)), Err(Errno::ENOTCONN));
+    run(env.vfs.close(1, r_inf)).unwrap();
+
+    inflight_prov.reconnect();
+    inflight_fs.block_opens.set(true);
+    {
+        let mut create_fut = std::pin::pin!(env.vfs.openat(
+            1,
+            StartAnchor::Root,
+            "/mnt/inf/creating_ro",
+            abi::O_CREAT | abi::O_RDONLY,
+            0o644,
+        ));
+        assert!(matches!(poll_once(&mut create_fut), Poll::Pending));
+        // `writable_opens == 0`, yet `in_flight_writes == 1` -> `MS_REMOUNT | MS_RDONLY` returns `EBUSY`!
+        assert_eq!(
+            run(env.vfs.mount(
+                1,
+                "",
+                "/mnt/inf",
+                None,
+                mount_flags::MS_REMOUNT | mount_flags::MS_RDONLY,
+                None,
+            )),
+            Err(Errno::EBUSY)
+        );
+        inflight_fs.block_opens.set(false);
+        inflight_fs.wake_all();
+        let created_fd = match poll_once(&mut create_fut) {
+            Poll::Ready(Ok(fd)) => fd,
+            other => panic!("expected Ready(Ok(fd)), got {other:?}"),
+        };
+        run(env.vfs.close(1, created_fd)).unwrap();
+    }
+
+    // - `getcwd` > `abi::PATH_MAX` -> `ENAMETOOLONG` (`M-P3-02.2`):
+    env.vfs.fork_process(1, 132, 0).unwrap();
+    run(env.vfs.mkdirat(132, StartAnchor::Root, "/tmp/deep", 0o755)).unwrap();
+    run(env.vfs.chdir(132, "/tmp/deep")).unwrap();
+    let seg = "a".repeat(200);
+    for _ in 0..22 {
+        run(env.vfs.mkdirat(132, StartAnchor::AtFdCwd, &seg, 0o755)).unwrap();
+        run(env.vfs.chdir(132, &seg)).unwrap();
+    }
+    assert_eq!(run(env.vfs.getcwd(132)), Err(Errno::ENAMETOOLONG));
+
+    // - `/proc/self/fd/<n>` reopen on unmounted `FileRef` AND virtual `/proc` file (`M-P3-03.2`):
+    let unmounted_fs = Rc::new(MemFs::new(
+        FsId("mem:unmounted".into()),
+        1,
+        0,
+        0,
+        0o755,
+        Box::new(|| (1_700_000_000, 0)),
+    ));
+    let (u_ent, u_open) = run(unmounted_fs.create(
+        &Cred::root(),
+        &unmounted_fs.root(),
+        "anon",
+        0o644,
+        OpenOptions::new().read(true).write(true),
+    ))
+    .unwrap();
+    run(unmounted_fs.write_at(&u_open, b"unmounted-ok", WriteAt::Offset(0))).unwrap();
+    let u_fref = FileRef::new(
+        unmounted_fs,
+        u_open,
+        u_ent.handle,
+        Cred::root(),
+        OpenOptions::new().read(true).write(true),
+        env.vfs.releases(),
+    );
+    let u_fd = env
+        .vfs
+        .process_fds(1)
+        .unwrap()
+        .borrow_mut()
+        .insert(u_fref, false)
+        .unwrap();
+    assert_eq!(
+        read_all(&env.vfs, 1, &format!("/proc/self/fd/{u_fd}")).unwrap(),
+        b"unmounted-ok"
+    );
+    run(env.vfs.close(1, u_fd)).unwrap();
+
+    let proc_mounts_fd =
+        run(env
+            .vfs
+            .openat(1, StartAnchor::Root, "/proc/self/mounts", abi::O_RDONLY, 0))
+        .unwrap();
+    let reopened_mounts =
+        read_all(&env.vfs, 1, &format!("/proc/self/fd/{proc_mounts_fd}")).unwrap();
+    assert!(!reopened_mounts.is_empty());
+    run(env.vfs.close(1, proc_mounts_fd)).unwrap();
 }
