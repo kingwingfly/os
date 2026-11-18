@@ -908,6 +908,9 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             if read_only(db, &path) {
                 return Err(Errno::EROFS);
             }
+            if db.persisted_node(&path).is_some() {
+                return Err(Errno::EEXIST);
+            }
             // These drivers identify devices by pathname and cannot serve an alias.
             if node.is_device() {
                 return Err(Errno::EPERM);
@@ -916,9 +919,6 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             unchanged_names(db, node.ino)?;
             if node.file.as_deref().is_some_and(|id| db.uploading(id)) {
                 return Err(Errno::EBUSY);
-            }
-            if db.persisted_node(&path).is_some() {
-                return Err(Errno::EEXIST);
             }
             inode::may_create(&who, &parent, false)?;
             check_home(db, c.credential.uid, &path)?;
