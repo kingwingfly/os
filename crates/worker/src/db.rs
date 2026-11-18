@@ -2066,14 +2066,13 @@ impl Store for Db {
     }
     fn delete_sessions(&mut self, user: u32) {
         let credentials = self.rows::<crate::creds::Credential>(
-            &format!(
-                "SELECT {} FROM credentials WHERE uid = ?",
-                crate::creds::columns()
-            ),
-            vec![int(user)],
+            &delete_sessions_credentials_sql(),
+            vec![int(user), text(crate::creds::JOBS)],
         );
         for cred in credentials {
-            self.revoke(&cred.ns, &cred.token);
+            if cred.ns != crate::creds::JOBS {
+                self.revoke(&cred.ns, &cred.token);
+            }
         }
         self.end_sessions("uid = ?", vec![int(user)]);
     }
@@ -2170,5 +2169,24 @@ impl Db {
             n: usize,
         }
         self.rows::<Count>("SELECT COUNT(*) AS n FROM device_tasks JOIN jobs USING(id) WHERE device_tasks.owner = ? AND jobs.state NOT IN ('done','failed','cancelled')", vec![int(owner)]).pop().map_or(0, |n| n.n)
+    }
+}
+
+fn delete_sessions_credentials_sql() -> String {
+    format!(
+        "SELECT {} FROM credentials WHERE uid = ? AND ns != ?",
+        crate::creds::columns()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_sessions_query_excludes_job_credentials() {
+        let sql = delete_sessions_credentials_sql();
+        assert!(sql.contains("WHERE uid = ? AND ns != ?"), "sql: {sql}");
+        assert_eq!(crate::creds::JOBS, "jobs");
     }
 }
