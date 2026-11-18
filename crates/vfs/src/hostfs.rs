@@ -679,6 +679,10 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> Filesystem for HostFs<T, M, L> 
         Box::pin(self.do_sync(open, true))
     }
 
+    fn sync_handle<'a>(&'a self, _cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, ()> {
+        Box::pin(self.do_sync_handle(handle))
+    }
+
     fn lock<'a>(
         &'a self,
         open: &'a OpenRef,

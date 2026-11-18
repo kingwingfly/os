@@ -165,10 +165,83 @@ fn proof_mac(key: &str, fs: &FsId, session_id: &str, node: NodeId) -> Hmac<Sha25
     mac.update(&serde_json::to_vec(&(fs, session_id, node)).expect("serializable handle"));
     mac
 }
+fn check_fs_session_row(
+    session: Option<SessionRow>,
+    ns: &str,
+    fs_auth: Option<(&str, &str)>,
+    now: u64,
+) -> Result<SessionRow> {
+    let Some((_, fs_sec)) = fs_auth else {
+        return Err(Errno::EACCES);
+    };
+    let session = session.ok_or(Errno::ENOTCONN)?;
+    if session.ns != ns || session.secret != auth::token_hash(fs_sec) {
+        return Err(Errno::EACCES);
+    }
+    if session.expires <= now {
+        return Err(Errno::ENOTCONN);
+    }
+    Ok(session)
+}
+
+fn authenticate_fs_session(db: &Db, ns: &str, fs_auth: Option<(&str, &str)>) -> Result<SessionRow> {
+    let Some((fs_sid, _)) = fs_auth else {
+        return Err(Errno::EACCES);
+    };
+    let row = db
+        .rows::<SessionRow>(
+            "SELECT id, secret, ns, expires FROM vfs_sessions WHERE id = ?",
+            vec![text(fs_sid)],
+        )
+        .pop();
+    check_fs_session_row(row, ns, fs_auth, auth::now())
+}
+
+fn verify_handle_proof_for_session(
+    key: &str,
+    fs: &FsId,
+    session_id: &str,
+    handle: &Handle,
+) -> Result<()> {
+    let tag = URL_SAFE_NO_PAD
+        .decode(&handle.proof)
+        .map_err(|_| Errno::EACCES)?;
+    if &handle.fs != fs
+        || proof_mac(key, fs, session_id, handle.node)
+            .verify_slice(&tag)
+            .is_err()
+    {
+        return Err(Errno::EACCES);
+    }
+    if handle.node.generation != 1 {
+        return Err(Errno::ESTALE);
+    }
+    Ok(())
+}
+
+fn check_open_row_for_session(
+    fs: &FsId,
+    session_id: &str,
+    open_row: &OpenRow,
+    open: &OpenRef,
+) -> Result<()> {
+    if open_row.session != session_id
+        || &open.fs != fs
+        || open_row.ino != open.node.ino
+        || open.node.generation != 1
+        || open_row.access != serde_json::to_string(&open.access).map_err(|_| Errno::EIO)?
+        || open_row.revoked != 0
+    {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
+}
+
 pub(crate) fn opened_in_namespace(
     db: &Db,
     ns: &str,
     credential: Option<&Credential>,
+    fs_auth: Option<(&str, &str)>,
     open: &OpenRef,
 ) -> Result<Node> {
     if let Some(cred) = credential {
@@ -177,23 +250,11 @@ pub(crate) fn opened_in_namespace(
             return Err(Errno::EACCES);
         }
     }
+    let session = authenticate_fs_session(db, ns, fs_auth)?;
     let open_row = db
         .rows::<OpenRow>("SELECT * FROM vfs_opens WHERE id = ?", vec![int(open.id)])
         .pop()
         .ok_or(Errno::EBADF)?;
-    let session = db
-        .rows::<SessionRow>(
-            "SELECT id, secret, ns, expires FROM vfs_sessions WHERE id = ?",
-            vec![text(&open_row.session)],
-        )
-        .pop()
-        .ok_or(Errno::ENOTCONN)?;
-    if session.expires <= auth::now() {
-        return Err(Errno::ENOTCONN);
-    }
-    if session.ns != ns {
-        return Err(Errno::EACCES);
-    }
     let (fs, key) = stored_identity(db).ok_or(Errno::EACCES)?;
     if let Some(cred) = credential {
         let caller = Caller {
@@ -204,13 +265,8 @@ pub(crate) fn opened_in_namespace(
         };
         return caller.opened(db, open);
     }
-    if open.fs != fs
-        || open_row.ino != open.node.ino
-        || open.node.generation != 1
-        || open_row.access != serde_json::to_string(&open.access).map_err(|_| Errno::EIO)?
-        || open_row.revoked != 0
-        || !db.cloud_granted(open.id, &session.ns)
-    {
+    check_open_row_for_session(&fs, &session.id, &open_row, open)?;
+    if !db.cloud_granted(open.id, &session.ns) {
         return Err(Errno::EACCES);
     }
     db.inode(open_row.ino).ok_or(Errno::ESTALE)
@@ -219,6 +275,7 @@ pub(crate) fn verify_handle(
     db: &Db,
     ns: &str,
     credential: Option<&Credential>,
+    fs_auth: Option<(&str, &str)>,
     handle: &Handle,
 ) -> Result<Node> {
     if let Some(cred) = credential {
@@ -227,42 +284,9 @@ pub(crate) fn verify_handle(
             return Err(Errno::EACCES);
         }
     }
+    let session = authenticate_fs_session(db, ns, fs_auth)?;
     let (fs, key) = stored_identity(db).ok_or(Errno::EACCES)?;
-    let tag = URL_SAFE_NO_PAD
-        .decode(&handle.proof)
-        .map_err(|_| Errno::EACCES)?;
-    if handle.fs != fs {
-        return Err(Errno::EACCES);
-    }
-    let sessions = db.rows::<SessionRow>(
-        "SELECT id, secret, ns, expires FROM vfs_sessions WHERE ns = ?",
-        vec![text(ns)],
-    );
-    let now = auth::now();
-    let mut matched_expired = false;
-    let mut matched_active = false;
-    for s in sessions {
-        if proof_mac(&key, &fs, &s.id, handle.node)
-            .verify_slice(&tag)
-            .is_ok()
-        {
-            if s.expires > now {
-                matched_active = true;
-                break;
-            }
-            matched_expired = true;
-        }
-    }
-    if !matched_active {
-        return Err(if matched_expired {
-            Errno::ENOTCONN
-        } else {
-            Errno::EACCES
-        });
-    }
-    if handle.node.generation != 1 {
-        return Err(Errno::ESTALE);
-    }
+    verify_handle_proof_for_session(&key, &fs, &session.id, handle)?;
     db.inode(handle.node.ino).ok_or(Errno::ESTALE)
 }
 fn authorize(credential: &Credential) -> Result<()> {
@@ -1577,5 +1601,137 @@ impl Db {
         let mut state = self.cloud_locks(ino);
         state.release(owner);
         self.save_cloud_locks(ino, &mut state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_session_row(id: &str, raw_secret: &str, ns: &str, expires: u64) -> SessionRow {
+        SessionRow {
+            id: id.to_string(),
+            secret: auth::token_hash(raw_secret),
+            ns: ns.to_string(),
+            expires,
+        }
+    }
+
+    fn make_handle(key: &str, fs: &FsId, session_id: &str, ino: u64, generation: u64) -> Handle {
+        let node = NodeId { ino, generation };
+        Handle {
+            fs: fs.clone(),
+            node,
+            proof: URL_SAFE_NO_PAD
+                .encode(proof_mac(key, fs, session_id, node).finalize().into_bytes()),
+        }
+    }
+
+    #[test]
+    fn check_fs_session_row_enforces_secret_namespace_and_expiry() {
+        let now = 1_700_000_000;
+        let row = make_session_row("sess-a", "sec-a", "user:1001", now + 3600);
+
+        // Missing X-Fs-Session / X-Fs-Secret -> EACCES.
+        assert_eq!(
+            check_fs_session_row(Some(row), "user:1001", None, now).err(),
+            Some(Errno::EACCES)
+        );
+
+        // Non-existent session row -> ENOTCONN.
+        assert_eq!(
+            check_fs_session_row(None, "user:1001", Some(("sess-a", "sec-a")), now).err(),
+            Some(Errno::ENOTCONN)
+        );
+
+        // Wrong secret -> EACCES.
+        let row = make_session_row("sess-a", "sec-a", "user:1001", now + 3600);
+        assert_eq!(
+            check_fs_session_row(Some(row), "user:1001", Some(("sess-a", "wrong")), now).err(),
+            Some(Errno::EACCES)
+        );
+
+        // Cross-namespace session -> EACCES.
+        let row = make_session_row("sess-a", "sec-a", "user:1002", now + 3600);
+        assert_eq!(
+            check_fs_session_row(Some(row), "user:1001", Some(("sess-a", "sec-a")), now).err(),
+            Some(Errno::EACCES)
+        );
+
+        // Expired session (`expires <= now`) -> ENOTCONN.
+        let expired = make_session_row("sess-a", "sec-a", "user:1001", now);
+        assert_eq!(
+            check_fs_session_row(Some(expired), "user:1001", Some(("sess-a", "sec-a")), now).err(),
+            Some(Errno::ENOTCONN)
+        );
+
+        // Matching session, namespace, secret, and future expiry -> Ok.
+        let valid = make_session_row("sess-a", "sec-a", "user:1001", now + 60);
+        let checked =
+            check_fs_session_row(Some(valid), "user:1001", Some(("sess-a", "sec-a")), now).unwrap();
+        assert_eq!(checked.id, "sess-a");
+    }
+
+    #[test]
+    fn verify_handle_proof_and_open_row_reject_cross_session_capabilities() {
+        let key = "test-handle-hmac-key";
+        let fs = FsId("cloud:test".to_string());
+
+        let handle_a = make_handle(key, &fs, "sess-a", 42, 1);
+        assert_eq!(
+            verify_handle_proof_for_session(key, &fs, "sess-a", &handle_a),
+            Ok(())
+        );
+        // Handle minted for `sess-a` rejected when presented under `sess-b` in the same namespace!
+        assert_eq!(
+            verify_handle_proof_for_session(key, &fs, "sess-b", &handle_a),
+            Err(Errno::EACCES)
+        );
+        // Wrong FsId -> EACCES.
+        assert_eq!(
+            verify_handle_proof_for_session(key, &FsId("cloud:other".into()), "sess-a", &handle_a),
+            Err(Errno::EACCES)
+        );
+        // Stale generation -> ESTALE (when HMAC matches that generation).
+        let stale_handle = make_handle(key, &fs, "sess-a", 42, 2);
+        assert_eq!(
+            verify_handle_proof_for_session(key, &fs, "sess-a", &stale_handle),
+            Err(Errno::ESTALE)
+        );
+
+        // OpenRef bound to `sess-a` succeeds for `sess-a` and fails `EACCES` for `sess-b` or revoked.
+        let open = OpenRef {
+            fs: fs.clone(),
+            id: 7,
+            node: NodeId {
+                ino: 42,
+                generation: 1,
+            },
+            access: Access::Path,
+        };
+        let open_row = OpenRow {
+            id: 7,
+            session: "sess-a".to_string(),
+            ino: 42,
+            access: serde_json::to_string(&Access::Path).unwrap(),
+            revoked: 0,
+        };
+        assert_eq!(open_row.id, 7);
+        assert_eq!(
+            check_open_row_for_session(&fs, "sess-a", &open_row, &open),
+            Ok(())
+        );
+        assert_eq!(
+            check_open_row_for_session(&fs, "sess-b", &open_row, &open),
+            Err(Errno::EACCES)
+        );
+        let revoked_row = OpenRow {
+            revoked: 1,
+            ..open_row
+        };
+        assert_eq!(
+            check_open_row_for_session(&fs, "sess-a", &revoked_row, &open),
+            Err(Errno::EACCES)
+        );
     }
 }

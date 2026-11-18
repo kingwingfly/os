@@ -251,6 +251,41 @@ pub trait Filesystem {
     fn sync_data<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
         self.sync_all(open)
     }
+    /// Synchronize a file or directory addressed by `handle` (`MS_DIRSYNC` / `MS_SYNCHRONOUS` on
+    /// handle-based operations where the caller holds no [`OpenRef`]).
+    fn sync_handle<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if self.capabilities().durability == abi::contract::Durability::Volatile {
+                return Ok(());
+            }
+            let mut opts = OpenOptions::new();
+            opts.read(true);
+            let open = match self.open(cred, handle, &opts).await {
+                Ok(open) => open,
+                Err(Errno::EACCES) => {
+                    let root_cred = Cred {
+                        identity: Identity::root(),
+                        umask: cred.umask,
+                        token: cred.token.clone(),
+                    };
+                    match self.open(&root_cred, handle, &opts).await {
+                        Ok(open) => open,
+                        Err(Errno::ELOOP) => return Ok(()),
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(Errno::ELOOP) => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            let sync_res = match self.sync_all(&open).await {
+                Ok(()) | Err(Errno::EINVAL) => Ok(()),
+                Err(e) => Err(e),
+            };
+            let rel_res = self.release(&open).await;
+            sync_res?;
+            rel_res
+        })
+    }
     /// Take an advisory lock for `open`, waiting until it is granted (F_SETLKW, flock without
     /// LOCK_NB). Dropping the future gives up the wait. An fcntl wait that would deadlock fails
     /// with EDEADLK; flock does not detect deadlock, as on Linux.

@@ -367,6 +367,7 @@ pub struct Request {
     pub flags: u32,
     pub ns: String,
     pub credential: Option<crate::creds::Credential>,
+    pub fs_auth: Option<(String, String)>,
 }
 impl Request {
     pub fn writes(&self) -> bool {
@@ -395,6 +396,7 @@ pub fn request(db: &Db, sid: &str, fd: u32) -> Result<Option<Request>> {
         flags: found.flags,
         ns: String::new(),
         credential: None,
+        fs_auth: None,
     }))
 }
 

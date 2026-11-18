@@ -19,7 +19,7 @@ use crate::{
     NodeId, OpenOptions, ReleaseQueue, RenameFlags, Result, SeekFrom, SetAttr, XattrFlags,
 };
 use abi::Errno;
-use abi::contract::{Durability, mount_flags, statfs_flags, umount_flags, unshare_flags};
+use abi::contract::{mount_flags, statfs_flags, umount_flags, unshare_flags};
 use os_core::inode;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -186,6 +186,7 @@ struct VfsInner {
     releases: ReleaseQueue,
     factory: Rc<dyn FilesystemFactory>,
     system_ns: Rc<RefCell<MountNamespace>>,
+    namespaces: RefCell<HashMap<NamespaceId, Weak<RefCell<MountNamespace>>>>,
     processes: RefCell<BTreeMap<u32, ProcessCtx>>,
 }
 
@@ -200,6 +201,13 @@ impl VfsInner {
         let id = self.next_ns_id.get();
         self.next_ns_id.set(id + 1);
         NamespaceId(id)
+    }
+
+    fn register_namespace(&self, ns: &Rc<RefCell<MountNamespace>>) {
+        let id = ns.borrow().id();
+        let mut map = self.namespaces.borrow_mut();
+        map.retain(|_, w| w.strong_count() > 0);
+        map.insert(id, Rc::downgrade(ns));
     }
 }
 
@@ -239,6 +247,13 @@ impl ProcBridge for VfsInner {
             cwd: ctx.cwd.clone(),
             fds: p.fds.clone(),
         })
+    }
+
+    fn namespace_by_id(&self, id: NamespaceId) -> Option<Rc<RefCell<MountNamespace>>> {
+        if self.system_ns.borrow().id() == id {
+            return Some(Rc::clone(&self.system_ns));
+        }
+        self.namespaces.borrow().get(&id).and_then(Weak::upgrade)
     }
 }
 
@@ -283,6 +298,7 @@ struct SubmountSpec {
     rel_segments: Vec<String>,
     backing: Rc<MountBacking>,
     root: Handle,
+    root_open: FileRef,
     root_in_fs: String,
     source: String,
     flags: MountFlags,
@@ -308,8 +324,10 @@ impl Vfs {
             .fs
             .open(&root_cred, &root_handle, &path_opts)
             .await?;
-        let root_open = FileRef::new(
+        let root_open = FileRef::new_with_provider(
             Rc::clone(&root_backing.fs),
+            Rc::clone(&root_backing.provider),
+            None,
             root_open_ref,
             root_handle.clone(),
             root_cred.clone(),
@@ -354,6 +372,8 @@ impl Vfs {
                 fds: SharedFdTable::new(),
             },
         );
+        let mut namespaces = HashMap::new();
+        namespaces.insert(ns_id, Rc::downgrade(&system_ns));
 
         Ok(Self {
             inner: Rc::new(VfsInner {
@@ -364,6 +384,7 @@ impl Vfs {
                 releases,
                 factory,
                 system_ns,
+                namespaces: RefCell::new(namespaces),
                 processes: RefCell::new(processes),
             }),
         })
@@ -395,7 +416,9 @@ impl Vfs {
         let (cloned, map) = ns
             .borrow()
             .clone_private(new_ns_id, || self.inner.alloc_mount_id());
-        (Rc::new(RefCell::new(cloned)), map)
+        let rc = Rc::new(RefCell::new(cloned));
+        self.inner.register_namespace(&rc);
+        (rc, map)
     }
 
     /// Spawn/register a new top-level process in `Vfs` (defaulting to `system_ns` and its `"/"`).
@@ -413,6 +436,7 @@ impl Vfs {
             return Err(Errno::EEXIST);
         }
         let ns = mnt_ns.unwrap_or_else(|| Rc::clone(&self.inner.system_ns));
+        self.inner.register_namespace(&ns);
         let default_anchor = ns.borrow().root_anchor();
         let root_anchor = root.unwrap_or_else(|| default_anchor.clone());
         let cwd_anchor = cwd.unwrap_or(default_anchor);
@@ -434,9 +458,6 @@ impl Vfs {
     /// Fork `parent_pid` into `child_pid` honoring `CLONE_FS`, `CLONE_FILES`, and `CLONE_NEWNS`.
     pub fn fork_process(&self, parent_pid: u32, child_pid: u32, clone_flags: u32) -> Result<()> {
         let clean = unshare_flags::accepted_unshare(clone_flags)?;
-        if clean & unshare_flags::CLONE_NEWNS != 0 && clean & unshare_flags::CLONE_FS != 0 {
-            return Err(Errno::EINVAL);
-        }
         let mut procs = self.inner.processes.borrow_mut();
         if procs.contains_key(&child_pid) {
             return Err(Errno::EEXIST);
@@ -446,7 +467,10 @@ impl Vfs {
             return Err(Errno::EPERM);
         }
 
-        let share_fs = clean & unshare_flags::CLONE_FS != 0;
+        // When `CLONE_NEWNS` is set, the child gets an unshared `FsContext` so remapping its
+        // `root`/`cwd` pins onto the new `MountNamespace` never mutates the parent's anchors.
+        let share_fs =
+            (clean & unshare_flags::CLONE_FS != 0) && (clean & unshare_flags::CLONE_NEWNS == 0);
         let share_files = clean & unshare_flags::CLONE_FILES != 0;
         let cred = parent.cred.clone();
         let fs_ctx = parent.fs_ctx.fork_clone(share_fs);
@@ -479,17 +503,18 @@ impl Vfs {
         Ok(())
     }
 
-    /// `execve` preservation: unshares `CLONE_FS` if shared, keeps `mnt_ns`, `root`, `cwd`, and
-    /// `umask` intact, and closes `FD_CLOEXEC` descriptors.
+    /// `execve` preservation: unshares `CLONE_FS` and `CLONE_FILES` if shared, keeps `mnt_ns`,
+    /// `root`, `cwd`, and `umask` intact, and closes `FD_CLOEXEC` descriptors.
     pub async fn exec_preserve(&self, pid: u32) -> Result<()> {
-        let fds = {
+        let (caller_uid, fds) = {
             let mut procs = self.inner.processes.borrow_mut();
             let proc_ctx = procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
             proc_ctx.fs_ctx.unshare();
-            proc_ctx.fds.clone()
+            proc_ctx.fds.unshare();
+            (proc_ctx.cred.identity.id, proc_ctx.fds.clone())
         };
         fds.close_on_exec().await;
-        let _ = self.inner.releases.flush().await;
+        let _ = self.inner.releases.flush_scoped(caller_uid, &[]).await;
         Ok(())
     }
 
@@ -519,11 +544,22 @@ impl Vfs {
         let Some(proc_ctx) = removed else {
             return Err(Errno::ESRCH);
         };
+        let caller_uid = proc_ctx.cred.identity.id;
+        let mut providers = Vec::new();
+        {
+            let ctx = proc_ctx.fs_ctx.borrow();
+            providers.push(Rc::as_ptr(ctx.root.pin.provider()));
+            providers.push(Rc::as_ptr(ctx.cwd.pin.provider()));
+        }
         if !proc_ctx.fds.is_shared() {
             proc_ctx.fds.close_all().await;
         }
         drop(proc_ctx);
-        let _ = self.inner.releases.flush().await;
+        let _ = self
+            .inner
+            .releases
+            .flush_scoped(caller_uid, &providers)
+            .await;
         Ok(())
     }
 
@@ -576,6 +612,7 @@ impl Vfs {
         &self,
         cred: &Cred,
         backing: &Rc<MountBacking>,
+        owner_uid: Option<u32>,
         handle: &Handle,
     ) -> Result<FileRef> {
         let mut opts = OpenOptions::new();
@@ -584,8 +621,10 @@ impl Vfs {
             .provider
             .guard_future(false, backing.fs.open(cred, handle, &opts))
             .await?;
-        Ok(FileRef::new(
+        Ok(FileRef::new_with_provider(
             Rc::clone(&backing.fs),
+            Rc::clone(&backing.provider),
+            owner_uid,
             open,
             handle.clone(),
             cred.clone(),
@@ -595,8 +634,46 @@ impl Vfs {
     }
 
     async fn make_anchor(&self, cred: &Cred, pin: MountPin, handle: Handle) -> Result<PathAnchor> {
-        let open = self.open_path_ref(cred, pin.backing(), &handle).await?;
+        let open = self
+            .open_path_ref(cred, pin.backing(), pin.owner_uid(), &handle)
+            .await?;
         Ok(PathAnchor { pin, handle, open })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_fallback_last_step(
+        &self,
+        cred: &Cred,
+        ns: &Rc<RefCell<MountNamespace>>,
+        ctx: &crate::context::FsContext,
+        fds: &impl crate::walk::FdLookup,
+        anchor: &StartAnchor,
+        target_path: &str,
+        dst_pin: &MountPin,
+        dst_entry: &Entry,
+        last_step: Option<(MountPin, Handle, String)>,
+    ) -> Option<(MountPin, Handle, String)> {
+        if last_step.is_some() || dst_entry.handle.node == dst_pin.root_node() {
+            return last_step;
+        }
+        let bridge: &dyn ProcBridge = &*self.inner;
+        if let Ok(ParentResolution::Child(t)) =
+            walk_parent(cred, ns, ctx, fds, Some(bridge), anchor, target_path).await
+            && t.parent_pin.id() == dst_pin.id()
+            && let Ok(looked) = t
+                .parent_pin
+                .guard_op(
+                    cred,
+                    false,
+                    false,
+                    t.parent_pin.fs().lookup(cred, &t.parent.handle, &t.name),
+                )
+                .await
+            && looked.handle.node == dst_entry.handle.node
+        {
+            return Some((t.parent_pin, t.parent.handle, t.name));
+        }
+        None
     }
 
     async fn build_attachment(
@@ -607,7 +684,12 @@ impl Vfs {
         last_step: Option<(MountPin, Handle, String)>,
     ) -> Result<MountAttachment> {
         let mountpoint_open = self
-            .open_path_ref(cred, dst_pin.backing(), &dst_entry.handle)
+            .open_path_ref(
+                cred,
+                dst_pin.backing(),
+                dst_pin.owner_uid(),
+                &dst_entry.handle,
+            )
             .await?;
         let (mp_parent_node, mp_name) = if dst_entry.handle.node == dst_pin.root_node() {
             (None, None)
@@ -638,6 +720,30 @@ impl Vfs {
         })
     }
 
+    async fn commit_mount_entry(
+        &self,
+        ns: &Rc<RefCell<MountNamespace>>,
+        entry: MountEntry,
+    ) -> Result<MountId> {
+        let res = ns.borrow_mut().try_attach(entry);
+        match res {
+            Ok(id) => Ok(id),
+            Err(boxed) => {
+                let (
+                    err,
+                    MountEntry {
+                        parent, root_open, ..
+                    },
+                ) = *boxed;
+                if let Some(att) = parent {
+                    let _ = att.mountpoint_open.close().await;
+                }
+                let _ = root_open.close().await;
+                Err(err)
+            }
+        }
+    }
+
     /// Programmatically attach `backing` inside `ns` at `target_path` (resolved from `ns` root).
     /// Used at kernel boot (`/usr`, `/proc`, `/dev`, `/dev/pts`, `/mnt/local`, `/mnt/shared`,
     /// `/opt/private`) and by the user mount service (`owner_uid = Some(uid)`).
@@ -654,6 +760,7 @@ impl Vfs {
         locked_flags: u64,
         owner_uid: Option<u32>,
     ) -> Result<MountId> {
+        self.inner.register_namespace(ns);
         let ns_root = ns.borrow().root_anchor();
         let temp_ctx = crate::context::FsContext {
             root: ns_root.clone(),
@@ -662,6 +769,17 @@ impl Vfs {
         };
         let empty_fds = crate::FdTable::new();
         let bridge: &dyn ProcBridge = &*self.inner;
+        let (walk_target, walk_flags) = if owner_uid.is_some() {
+            let trimmed = if target_path.len() > 1 {
+                let t = target_path.trim_end_matches('/');
+                if t.is_empty() { "/" } else { t }
+            } else {
+                target_path
+            };
+            (trimmed, WalkFlags::MUST_BE_DIR)
+        } else {
+            (target_path, WalkFlags::FOLLOW_LAST)
+        };
         let resolved = walk(
             cred,
             ns,
@@ -669,8 +787,8 @@ impl Vfs {
             &empty_fds,
             Some(bridge),
             &StartAnchor::Root,
-            target_path,
-            WalkFlags::FOLLOW_LAST,
+            walk_target,
+            walk_flags,
         )
         .await?;
         let WalkResult::Found {
@@ -683,6 +801,12 @@ impl Vfs {
             return Err(Errno::ENOENT);
         };
 
+        if let Some(uid) = owner_uid
+            && (!dst_entry.metadata.is_dir() || dst_entry.metadata.uid != uid)
+        {
+            return Err(Errno::EPERM);
+        }
+
         let (root_handle, root_in_fs) =
             subroot.unwrap_or_else(|| (backing.fs.root(), "/".to_string()));
         let root_meta = backing.fs.metadata(cred, &root_handle).await?;
@@ -690,10 +814,37 @@ impl Vfs {
             return Err(Errno::ENOTDIR);
         }
 
-        let root_open = self.open_path_ref(cred, &backing, &root_handle).await?;
-        let att = self
+        let last_step = self
+            .resolve_fallback_last_step(
+                cred,
+                ns,
+                &temp_ctx,
+                &empty_fds,
+                &StartAnchor::Root,
+                walk_target,
+                &dst_pin,
+                &dst_entry,
+                last_step,
+            )
+            .await;
+
+        let root_open = match self
+            .open_path_ref(cred, &backing, owner_uid, &root_handle)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => return Err(e),
+        };
+        let att = match self
             .build_attachment(cred, dst_pin, &dst_entry, last_step)
-            .await?;
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = root_open.close().await;
+                return Err(e);
+            }
+        };
         let ns_id = ns.borrow().id();
         let mount_id = self.inner.alloc_mount_id();
         let slot = MountSlot::new(
@@ -713,7 +864,7 @@ impl Vfs {
             root_in_fs,
             source: source.to_string(),
         };
-        Ok(ns.borrow_mut().attach(entry))
+        self.commit_mount_entry(ns, entry).await
     }
 
     async fn sync_dir_if_needed(
@@ -726,22 +877,24 @@ impl Vfs {
         if !(eff.synchronous || eff.dirsync) {
             return Ok(());
         }
+        pin.guard_op(cred, true, false, pin.fs().sync_handle(cred, dir_handle))
+            .await?;
         pin.backing().record_sync();
-        if pin.fs().capabilities().durability == Durability::Volatile {
+        Ok(())
+    }
+
+    async fn sync_object_if_needed(
+        &self,
+        cred: &Cred,
+        pin: &MountPin,
+        handle: &Handle,
+    ) -> Result<()> {
+        if !pin.effective_flags().synchronous {
             return Ok(());
         }
-        let mut opts = OpenOptions::new();
-        opts.read(true);
-        if let Ok(open) = pin
-            .guard_op(cred, false, false, pin.fs().open(cred, dir_handle, &opts))
-            .await
-        {
-            let sync_res = pin
-                .guard_op(cred, true, false, pin.fs().sync_all(&open))
-                .await;
-            let _ = pin.fs().release(&open).await;
-            sync_res?;
-        }
+        pin.guard_op(cred, true, false, pin.fs().sync_handle(cred, handle))
+            .await?;
+        pin.backing().record_sync();
         Ok(())
     }
 
@@ -759,6 +912,13 @@ impl Vfs {
 
             let mut cur_pin = cwd_anchor.pin;
             let mut cur_handle = cwd_anchor.handle;
+            let mut cur_ns = if ns.borrow().id() == cur_pin.ns_id() {
+                Rc::clone(&ns)
+            } else {
+                self.inner
+                    .namespace_by_id(cur_pin.ns_id())
+                    .unwrap_or_else(|| Rc::clone(&ns))
+            };
             cur_pin.guard_enter(&cred)?;
 
             // Verify `cwd` has not been unlinked (`cwd-remove` -> ENOENT even if cwd == root).
@@ -785,7 +945,7 @@ impl Vfs {
                         format!("/{}", components.join("/"))
                     };
                     if path.len() > abi::PATH_MAX {
-                        return Err(Errno::ERANGE);
+                        return Err(Errno::ENAMETOOLONG);
                     }
                     return Ok(path);
                 }
@@ -799,15 +959,27 @@ impl Vfs {
                             format!("/{}", components.join("/"))
                         };
                         if path.len() > abi::PATH_MAX {
-                            return Err(Errno::ERANGE);
+                            return Err(Errno::ENAMETOOLONG);
                         }
                         return Ok(path);
                     }
-                    // Detached mount (`umount2(MNT_DETACH)`) -> ENOENT (`unmount-cwd`).
                     if cur_pin.is_detached() {
+                        if let Some((p_pin, mp_handle, _, _)) =
+                            cur_pin.detached_mount_parent(cur_pin.id())
+                        {
+                            cur_pin = p_pin;
+                            cur_handle = mp_handle;
+                            continue;
+                        }
+                        // Detached mount root (`umount2(MNT_DETACH)`) -> ENOENT (`unmount-cwd`).
                         return Err(Errno::ENOENT);
                     }
-                    let parent_step = ns
+                    if cur_ns.borrow().id() != cur_pin.ns_id()
+                        && let Some(found) = self.inner.namespace_by_id(cur_pin.ns_id())
+                    {
+                        cur_ns = found;
+                    }
+                    let parent_step = cur_ns
                         .borrow()
                         .entry(cur_pin.id())
                         .and_then(|e| e.parent.as_ref())
@@ -831,7 +1003,7 @@ impl Vfs {
                         format!("/{}", components.join("/"))
                     };
                     if path.len() > abi::PATH_MAX {
-                        return Err(Errno::ERANGE);
+                        return Err(Errno::ENAMETOOLONG);
                     }
                     return Ok(path);
                 }
@@ -855,13 +1027,12 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
             let resolved = walk(
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &StartAnchor::AtFdCwd,
                 path,
@@ -874,8 +1045,17 @@ impl Vfs {
             let mut searchable = false;
             ensure_searchable(&cred, &pin, &entry.handle, &mut searchable).await?;
             let new_cwd = self.make_anchor(&cred, pin, entry.handle).await?;
-            fs_ctx.borrow_mut().cwd = new_cwd;
-            let _ = self.inner.releases.flush().await;
+            let old_prov = {
+                let mut ctx = fs_ctx.borrow_mut();
+                let old = Rc::as_ptr(ctx.cwd.pin.provider());
+                ctx.cwd = new_cwd;
+                old
+            };
+            let _ = self
+                .inner
+                .releases
+                .flush_scoped(cred.identity.id, &[old_prov])
+                .await;
             Ok(())
         })
         .await
@@ -896,8 +1076,17 @@ impl Vfs {
             let mut searchable = false;
             ensure_searchable(&cred, &pin, file.handle(), &mut searchable).await?;
             let new_cwd = self.make_anchor(&cred, pin, file.handle().clone()).await?;
-            fs_ctx.borrow_mut().cwd = new_cwd;
-            let _ = self.inner.releases.flush().await;
+            let old_prov = {
+                let mut ctx = fs_ctx.borrow_mut();
+                let old = Rc::as_ptr(ctx.cwd.pin.provider());
+                ctx.cwd = new_cwd;
+                old
+            };
+            let _ = self
+                .inner
+                .releases
+                .flush_scoped(cred.identity.id, &[old_prov])
+                .await;
             Ok(())
         })
         .await
@@ -910,13 +1099,12 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
             let resolved = walk(
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &StartAnchor::AtFdCwd,
                 path,
@@ -932,8 +1120,17 @@ impl Vfs {
                 return Err(Errno::EPERM);
             }
             let new_root = self.make_anchor(&cred, pin, entry.handle).await?;
-            fs_ctx.borrow_mut().root = new_root;
-            let _ = self.inner.releases.flush().await;
+            let old_prov = {
+                let mut ctx = fs_ctx.borrow_mut();
+                let old = Rc::as_ptr(ctx.root.pin.provider());
+                ctx.root = new_root;
+                old
+            };
+            let _ = self
+                .inner
+                .releases
+                .flush_scoped(cred.identity.id, &[old_prov])
+                .await;
             Ok(())
         })
         .await
@@ -1010,6 +1207,7 @@ impl Vfs {
             mp_handle: Handle,
             slot: Rc<MountSlot>,
             root: Handle,
+            root_open: FileRef,
             root_in_fs: String,
             source: String,
         }
@@ -1029,6 +1227,7 @@ impl Vfs {
                             mp_handle: att.mountpoint.clone(),
                             slot: Rc::clone(&ce.slot),
                             root: ce.root.clone(),
+                            root_open: ce.root_open.clone(),
                             root_in_fs: ce.root_in_fs.clone(),
                             source: ce.source.clone(),
                         });
@@ -1078,6 +1277,12 @@ impl Vfs {
                         inside = true;
                     }
                 } else {
+                    if cur_slot
+                        .owner_uid
+                        .is_some_and(|owner| owner != cred.identity.id)
+                    {
+                        continue;
+                    }
                     let mut probe = child.mp_handle.clone();
                     loop {
                         if probe.node == boundary_node {
@@ -1087,7 +1292,10 @@ impl Vfs {
                         if probe.node == cur_slot.root_node {
                             break;
                         }
-                        match cur_slot.backing.fs.parent(cred, &probe).await? {
+                        match cur_slot
+                            .guard_op(cred, false, false, cur_slot.backing.fs.parent(cred, &probe))
+                            .await?
+                        {
                             Some((p_entry, name)) => {
                                 rel_tail.push(name);
                                 probe = p_entry.handle;
@@ -1099,7 +1307,7 @@ impl Vfs {
                 if !inside {
                     continue;
                 }
-                child.slot.guard_enter(cred)?;
+                child.slot.backing.provider.check_health()?;
                 rel_tail.reverse();
                 let mut full_rel = base_rel.clone();
                 full_rel.extend(rel_tail);
@@ -1107,19 +1315,26 @@ impl Vfs {
                     rel_segments: full_rel.clone(),
                     backing: Rc::clone(&child.slot.backing),
                     root: child.root.clone(),
+                    root_open: child.root_open.clone(),
                     root_in_fs: child.root_in_fs.clone(),
                     source: child.source.clone(),
                     flags: child.slot.flags(),
                     locked_flags: child.slot.locked_flags(),
                     owner_uid: child.slot.owner_uid,
                 });
-                queue.push_back(SubmountQueueItem {
-                    cur_id: child.id,
-                    cur_slot: Rc::clone(&child.slot),
-                    boundary_node: child.root.node,
-                    base_rel: full_rel,
-                    is_initial_src: false,
-                });
+                if child
+                    .slot
+                    .owner_uid
+                    .is_none_or(|owner| owner == cred.identity.id)
+                {
+                    queue.push_back(SubmountQueueItem {
+                        cur_id: child.id,
+                        cur_slot: Rc::clone(&child.slot),
+                        boundary_node: child.root.node,
+                        base_rel: full_rel,
+                        is_initial_src: false,
+                    });
+                }
             }
         }
         Ok(out)
@@ -1138,7 +1353,6 @@ impl Vfs {
             let clean_with_priv = mount_flags::accepted(flags)?;
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
 
             // Propagation-only `--make-private` (`MS_PRIVATE [| MS_REC]` with no other action):
@@ -1151,7 +1365,7 @@ impl Vfs {
                     &cred,
                     &ns,
                     &ctx_snap,
-                    &fds_snap,
+                    &fds,
                     Some(bridge),
                     &StartAnchor::AtFdCwd,
                     target,
@@ -1181,7 +1395,7 @@ impl Vfs {
                     &cred,
                     &ns,
                     &ctx_snap,
-                    &fds_snap,
+                    &fds,
                     Some(bridge),
                     &StartAnchor::AtFdCwd,
                     target,
@@ -1214,7 +1428,10 @@ impl Vfs {
                 }
 
                 let new_flags = MountFlags::from_accepted(clean);
-                if new_flags.rdonly && !pin.flags().rdonly && pin.writable_opens() > 0 {
+                if new_flags.rdonly
+                    && !pin.effective_rdonly()
+                    && (pin.writable_opens() > 0 || pin.in_flight_writes() > 0)
+                {
                     return Err(Errno::EBUSY);
                 }
                 pin.slot().set_flags(new_flags);
@@ -1234,7 +1451,7 @@ impl Vfs {
                     &cred,
                     &ns,
                     &ctx_snap,
-                    &fds_snap,
+                    &fds,
                     Some(bridge),
                     &StartAnchor::AtFdCwd,
                     source,
@@ -1255,7 +1472,7 @@ impl Vfs {
                     &cred,
                     &ns,
                     &ctx_snap,
-                    &fds_snap,
+                    &fds,
                     Some(bridge),
                     &StartAnchor::AtFdCwd,
                     target,
@@ -1285,6 +1502,20 @@ impl Vfs {
                     Vec::new()
                 };
 
+                let dst_last_step = self
+                    .resolve_fallback_last_step(
+                        &cred,
+                        &ns,
+                        &ctx_snap,
+                        &fds,
+                        &StartAnchor::AtFdCwd,
+                        target,
+                        &dst_pin,
+                        &dst_entry,
+                        dst_last_step,
+                    )
+                    .await;
+
                 let root_in_fs = self
                     .compute_root_in_fs(&cred, &ns, &src_pin, &src_entry, src_last_step)
                     .await?;
@@ -1295,11 +1526,23 @@ impl Vfs {
                     .unwrap_or_else(|| src_pin.fstype().as_str().to_string());
 
                 let root_open = self
-                    .open_path_ref(&cred, src_pin.backing(), &src_entry.handle)
+                    .open_path_ref(
+                        &cred,
+                        src_pin.backing(),
+                        src_pin.owner_uid(),
+                        &src_entry.handle,
+                    )
                     .await?;
-                let att = self
+                let att = match self
                     .build_attachment(&cred, dst_pin, &dst_entry, dst_last_step)
-                    .await?;
+                    .await
+                {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let _ = root_open.close().await;
+                        return Err(e);
+                    }
+                };
 
                 let ns_id = ns.borrow().id();
                 let bind_id = self.inner.alloc_mount_id();
@@ -1316,14 +1559,18 @@ impl Vfs {
                 let bind_anchor_handle = src_entry.handle.clone();
                 let bind_anchor_open = root_open.clone();
 
-                ns.borrow_mut().attach(MountEntry {
-                    slot: bind_slot,
-                    parent: Some(att),
-                    root: src_entry.handle.clone(),
-                    root_open,
-                    root_in_fs,
-                    source: src_source,
-                });
+                self.commit_mount_entry(
+                    &ns,
+                    MountEntry {
+                        slot: bind_slot,
+                        parent: Some(att),
+                        root: src_entry.handle.clone(),
+                        root_open,
+                        root_in_fs,
+                        source: src_source,
+                    },
+                )
+                .await?;
 
                 if !rec_submounts.is_empty() {
                     let bind_anchor = PathAnchor {
@@ -1341,7 +1588,7 @@ impl Vfs {
                             &cred,
                             &ns,
                             &ctx_snap,
-                            &fds_snap,
+                            &fds,
                             Some(bridge),
                             &StartAnchor::Anchor(bind_anchor.clone()),
                             &rel_path,
@@ -1357,11 +1604,17 @@ impl Vfs {
                         else {
                             continue;
                         };
-                        let sub_root_open =
-                            self.open_path_ref(&cred, &sub.backing, &sub.root).await?;
-                        let sub_att = self
+                        let sub_root_open = sub.root_open;
+                        let sub_att = match self
                             .build_attachment(&cred, sub_dst_pin, &sub_dst_entry, sub_last_step)
-                            .await?;
+                            .await
+                        {
+                            Ok(a) => a,
+                            Err(e) => {
+                                drop(sub_root_open);
+                                return Err(e);
+                            }
+                        };
                         let sub_id = self.inner.alloc_mount_id();
                         let sub_slot = MountSlot::new(
                             sub_id,
@@ -1372,17 +1625,26 @@ impl Vfs {
                             sub.locked_flags,
                             sub.owner_uid,
                         );
-                        ns.borrow_mut().attach(MountEntry {
-                            slot: sub_slot,
-                            parent: Some(sub_att),
-                            root: sub.root,
-                            root_open: sub_root_open,
-                            root_in_fs: sub.root_in_fs,
-                            source: sub.source,
-                        });
+                        let _ = self
+                            .commit_mount_entry(
+                                &ns,
+                                MountEntry {
+                                    slot: sub_slot,
+                                    parent: Some(sub_att),
+                                    root: sub.root,
+                                    root_open: sub_root_open,
+                                    root_in_fs: sub.root_in_fs,
+                                    source: sub.source,
+                                },
+                            )
+                            .await;
                     }
                 }
-                let _ = self.inner.releases.flush().await;
+                let _ = self
+                    .inner
+                    .releases
+                    .flush_scoped(cred.identity.id, &[])
+                    .await;
                 return Ok(());
             }
 
@@ -1395,7 +1657,7 @@ impl Vfs {
                     &cred,
                     &ns,
                     &ctx_snap,
-                    &fds_snap,
+                    &fds,
                     Some(bridge),
                     &StartAnchor::AtFdCwd,
                     source,
@@ -1424,7 +1686,7 @@ impl Vfs {
                     &cred,
                     &ns,
                     &ctx_snap,
-                    &fds_snap,
+                    &fds,
                     Some(bridge),
                     &StartAnchor::AtFdCwd,
                     target,
@@ -1454,27 +1716,61 @@ impl Vfs {
                     let detached = ns.borrow_mut().switch_root_move(src_pin.id())?;
                     drop(detached);
                 } else {
+                    let dst_last_step = self
+                        .resolve_fallback_last_step(
+                            &cred,
+                            &ns,
+                            &ctx_snap,
+                            &fds,
+                            &StartAnchor::AtFdCwd,
+                            target,
+                            &dst_pin,
+                            &dst_entry,
+                            dst_last_step,
+                        )
+                        .await;
                     let new_att = self
                         .build_attachment(&cred, dst_pin, &dst_entry, dst_last_step)
                         .await?;
-                    ns.borrow_mut().move_mount(src_pin.id(), new_att)?;
+                    let move_res = ns.borrow_mut().try_move_mount(src_pin.id(), new_att);
+                    if let Err(boxed) = move_res {
+                        let (err, failed_att) = *boxed;
+                        let _ = failed_att.mountpoint_open.close().await;
+                        return Err(err);
+                    }
                 }
-                let _ = self.inner.releases.flush().await;
+                let _ = self
+                    .inner
+                    .releases
+                    .flush_scoped(cred.identity.id, &[])
+                    .await;
                 return Ok(());
             }
 
             // 4. New filesystem mount (`fstype` required)
             let fstype_str = fstype.filter(|s| !s.is_empty()).ok_or(Errno::EINVAL)?;
             let kind = FsType::parse(fstype_str)?;
+            let is_unpriv = cred.identity.id != 0;
+            let (walk_target, dst_wflags) = if is_unpriv {
+                let trimmed = if target.len() > 1 {
+                    let t = target.trim_end_matches('/');
+                    if t.is_empty() { "/" } else { t }
+                } else {
+                    target
+                };
+                (trimmed, WalkFlags::MUST_BE_DIR)
+            } else {
+                (target, WalkFlags::FOLLOW_LAST | WalkFlags::MUST_BE_DIR)
+            };
             let dst_res = walk(
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &StartAnchor::AtFdCwd,
-                target,
-                WalkFlags::FOLLOW_LAST | WalkFlags::MUST_BE_DIR,
+                walk_target,
+                dst_wflags,
             )
             .await?;
             let WalkResult::Found {
@@ -1489,10 +1785,13 @@ impl Vfs {
 
             let mut mnt_flags = MountFlags::from_accepted(clean);
             let mut locked_flags = 0u64;
-            let owner_uid = if cred.identity.id == 0 {
+            let owner_uid = if !is_unpriv {
                 None
             } else {
-                if !kind.is_user_mountable() || dst_entry.metadata.uid != cred.identity.id {
+                if !kind.is_user_mountable()
+                    || !dst_entry.metadata.is_dir()
+                    || dst_entry.metadata.uid != cred.identity.id
+                {
                     return Err(Errno::EPERM);
                 }
                 mnt_flags.nosuid = true;
@@ -1507,14 +1806,22 @@ impl Vfs {
                 .mount_fs(&cred, kind, source, mnt_flags, data)
                 .await?;
             let root_open = self
-                .open_path_ref(&cred, &mounted.backing, &mounted.root)
+                .open_path_ref(&cred, &mounted.backing, owner_uid, &mounted.root)
                 .await?;
-            let att = self
+            let att = match self
                 .build_attachment(&cred, dst_pin, &dst_entry, dst_last_step)
-                .await?;
+                .await
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = root_open.close().await;
+                    return Err(e);
+                }
+            };
 
             let ns_id = ns.borrow().id();
             let mount_id = self.inner.alloc_mount_id();
+            let mounted_prov = Rc::as_ptr(&mounted.backing.provider);
             let slot = MountSlot::new(
                 mount_id,
                 ns_id,
@@ -1529,15 +1836,23 @@ impl Vfs {
             } else {
                 source.to_string()
             };
-            ns.borrow_mut().attach(MountEntry {
-                slot,
-                parent: Some(att),
-                root: mounted.root,
-                root_open,
-                root_in_fs: mounted.root_in_fs,
-                source: src_label,
-            });
-            let _ = self.inner.releases.flush().await;
+            self.commit_mount_entry(
+                &ns,
+                MountEntry {
+                    slot,
+                    parent: Some(att),
+                    root: mounted.root,
+                    root_open,
+                    root_in_fs: mounted.root_in_fs,
+                    source: src_label,
+                },
+            )
+            .await?;
+            let _ = self
+                .inner
+                .releases
+                .flush_scoped(cred.identity.id, &[mounted_prov])
+                .await;
             Ok(())
         })
         .await
@@ -1552,7 +1867,6 @@ impl Vfs {
             }
 
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
             let mut walk_flags = WalkFlags::UMOUNT_FINAL;
             if clean & umount_flags::UMOUNT_NOFOLLOW == 0 {
@@ -1563,7 +1877,7 @@ impl Vfs {
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &StartAnchor::AtFdCwd,
                 target,
@@ -1578,6 +1892,11 @@ impl Vfs {
             let root_node = pin.root_node();
             let owner_uid = pin.owner_uid();
             let provider = Rc::clone(pin.provider());
+            let parent_prov = ns
+                .borrow()
+                .entry(target_id)
+                .and_then(|e| e.parent.as_ref())
+                .map(|att| Rc::as_ptr(att.parent_pin.provider()));
             // Drop `pin` BEFORE busy check so `umount2`'s own lookup pin does not count as busy!
             drop(pin);
 
@@ -1595,17 +1914,53 @@ impl Vfs {
             }
 
             if clean & umount_flags::MNT_FORCE != 0 {
-                provider.force_abort();
+                let subtree_providers: Vec<_> = {
+                    let ns_ref = ns.borrow();
+                    ns_ref
+                        .collect_subtree_postorder(target_id)
+                        .into_iter()
+                        .filter_map(|id| {
+                            ns_ref
+                                .entry(id)
+                                .map(|e| Rc::clone(&e.slot.backing.provider))
+                        })
+                        .collect()
+                };
+                if subtree_providers.is_empty() {
+                    provider.force_abort();
+                } else {
+                    for p in subtree_providers {
+                        p.force_abort();
+                    }
+                }
             }
 
             if clean & umount_flags::MNT_DETACH != 0 {
                 let removed = ns.borrow_mut().detach_subtree(target_id)?;
                 drop(removed);
+                let mut flush_provs = Vec::new();
+                if let Some(pp) = parent_prov {
+                    flush_provs.push(pp);
+                }
+                let _ = self
+                    .inner
+                    .releases
+                    .flush_scoped(cred.identity.id, &flush_provs)
+                    .await;
             } else {
                 let removed = ns.borrow_mut().unmount_ordinary(target_id)?;
+                let target_prov = Rc::as_ptr(&provider);
                 drop(removed);
+                let mut flush_provs = vec![target_prov];
+                if let Some(pp) = parent_prov {
+                    flush_provs.push(pp);
+                }
+                let _ = self
+                    .inner
+                    .releases
+                    .flush_scoped(cred.identity.id, &flush_provs)
+                    .await;
             }
-            let _ = self.inner.releases.flush().await;
             Ok(())
         })
         .await
@@ -1639,7 +1994,9 @@ impl Vfs {
                 ctx.root.remap_pin(&pin_map);
                 ctx.cwd.remap_pin(&pin_map);
             }
-            proc_ctx.mnt_ns = Rc::new(RefCell::new(cloned_ns));
+            let new_ns_rc = Rc::new(RefCell::new(cloned_ns));
+            self.inner.register_namespace(&new_ns_rc);
+            proc_ctx.mnt_ns = new_ns_rc;
         }
 
         if clean & unshare_flags::CLONE_FS != 0 {
@@ -1652,11 +2009,14 @@ impl Vfs {
     }
 
     pub fn setns(&self, pid: u32, fd: Fd, nstype: u32) -> Result<()> {
-        unshare_flags::accepted_setns(nstype)?;
         let mut procs = self.inner.processes.borrow_mut();
         let proc_ctx = procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
 
         let file = proc_ctx.fds.borrow().get(fd)?;
+        if file.access() == Access::Path {
+            return Err(Errno::EBADF);
+        }
+        unshare_flags::accepted_setns(nstype)?;
         let ns_file = file.mount_ns().ok_or(Errno::EINVAL)?;
         if ns_file.instance_id != self.inner.instance_id {
             return Err(Errno::EINVAL);
@@ -1667,8 +2027,13 @@ impl Vfs {
         if proc_ctx.fs_ctx.is_shared() {
             return Err(Errno::EINVAL);
         }
+        let old_ns_root = proc_ctx.mnt_ns.borrow().root_anchor();
+        if !proc_ctx.fs_ctx.borrow().root.same_anchor(&old_ns_root) {
+            return Err(Errno::EINVAL);
+        }
 
         let target_ns = Rc::clone(&ns_file.ns);
+        self.inner.register_namespace(&target_ns);
         let root_anchor = target_ns.borrow().root_anchor();
         proc_ctx.mnt_ns = target_ns;
         {
@@ -1710,13 +2075,12 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
             let resolved = walk(
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &anchor,
                 path,
@@ -1792,7 +2156,6 @@ impl Vfs {
             let access = options.access()?;
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
 
             let nofollow = oflags & abi::O_NOFOLLOW != 0;
@@ -1804,7 +2167,10 @@ impl Vfs {
             if !nofollow && !(is_creat && is_excl) {
                 wflags |= WalkFlags::FOLLOW_LAST;
             }
-            if must_dir && !is_creat {
+            if must_dir
+                && !is_creat
+                && (wflags.contains(WalkFlags::FOLLOW_LAST) || access == Access::Path)
+            {
                 wflags |= WalkFlags::MUST_BE_DIR;
             }
             if is_creat {
@@ -1815,7 +2181,7 @@ impl Vfs {
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &anchor,
                 path,
@@ -1846,16 +2212,22 @@ impl Vfs {
                                 .create(&cred, &parent.handle, &name, mode, &options),
                         )
                         .await?;
-                    self.sync_dir_if_needed(&cred, &parent_pin, &parent.handle)
-                        .await?;
-                    let file_ref = FileRef::new_mounted(
-                        parent_pin,
+                    let file_ref = FileRef::new_mounted_with_type(
+                        parent_pin.clone(),
                         open_ref,
                         entry.handle.clone(),
-                        cred,
+                        Some(entry.metadata.file_type),
+                        cred.clone(),
                         &options,
                         &self.inner.releases,
                     );
+                    if let Err(err) = self
+                        .sync_dir_if_needed(&cred, &parent_pin, &parent.handle)
+                        .await
+                    {
+                        let _ = file_ref.close().await;
+                        return Err(err);
+                    }
                     Ok((file_ref, entry))
                 }
                 WalkResult::Found {
@@ -1864,47 +2236,100 @@ impl Vfs {
                     if is_creat && is_excl {
                         return Err(Errno::EEXIST);
                     }
-                    if let Some(MagicResolved::MountNs { instance_id, ns }) = magic {
-                        if must_dir {
-                            return Err(Errno::ENOTDIR);
-                        }
-                        if access.writes() || options.is_truncate() || access == Access::Exec {
-                            return Err(Errno::EACCES);
-                        }
-                        let ns_ino = ns.borrow().id().0;
-                        let ns_entry = Entry {
-                            handle: Handle {
-                                fs: pin.fs().id().clone(),
-                                node: NodeId {
-                                    ino: ns_ino,
-                                    generation: 1,
+                    match magic {
+                        Some(MagicResolved::MountNs { instance_id, ns }) => {
+                            if must_dir {
+                                return Err(Errno::ENOTDIR);
+                            }
+                            if access.writes() || options.is_truncate() || access == Access::Exec {
+                                return Err(Errno::EACCES);
+                            }
+                            let ns_ino = ns.borrow().id().0;
+                            let ns_entry = Entry {
+                                handle: Handle {
+                                    fs: pin.fs().id().clone(),
+                                    node: NodeId {
+                                        ino: ns_ino,
+                                        generation: 1,
+                                    },
+                                    proof: String::new(),
                                 },
-                                proof: String::new(),
-                            },
-                            metadata: Metadata {
-                                file_type: FileType::File,
-                                mode: 0o444,
-                                nlink: 1,
-                                uid: 0,
-                                gid: 0,
-                                size: 0,
-                                atime: Default::default(),
-                                mtime: Default::default(),
-                                ctime: Default::default(),
-                                rdev: None,
-                                acl: false,
-                            },
-                        };
-                        let file_ref = FileRef::new_mount_ns(
-                            Rc::clone(pin.fs()),
-                            Some(pin),
-                            instance_id,
-                            ns,
-                            access,
-                            cred,
-                            &self.inner.releases,
-                        );
-                        return Ok((file_ref, ns_entry));
+                                metadata: Metadata {
+                                    file_type: FileType::File,
+                                    mode: 0o444,
+                                    nlink: 1,
+                                    uid: 0,
+                                    gid: 0,
+                                    size: 0,
+                                    atime: Default::default(),
+                                    mtime: Default::default(),
+                                    ctime: Default::default(),
+                                    rdev: None,
+                                    acl: false,
+                                },
+                            };
+                            let file_ref = FileRef::new_mount_ns(
+                                Rc::clone(pin.fs()),
+                                Some(pin),
+                                instance_id,
+                                ns,
+                                access,
+                                cred,
+                                &self.inner.releases,
+                            );
+                            return Ok((file_ref, ns_entry));
+                        }
+                        Some(MagicResolved::OpenFile(orig))
+                            if orig.is_virtual() || orig.mount_pin().is_none() =>
+                        {
+                            if entry.metadata.is_symlink() && access != Access::Path {
+                                return Err(Errno::ELOOP);
+                            }
+                            if must_dir && !entry.metadata.is_dir() {
+                                return Err(Errno::ENOTDIR);
+                            }
+                            if entry.metadata.is_dir()
+                                && (access.writes() || options.is_truncate() || is_creat)
+                            {
+                                return Err(Errno::EISDIR);
+                            }
+                            if orig.is_virtual() {
+                                if access.writes()
+                                    || options.is_truncate()
+                                    || access == Access::Exec
+                                {
+                                    return Err(Errno::EACCES);
+                                }
+                                let reopened = orig
+                                    .reopen_virtual(access, cred, &self.inner.releases)
+                                    .ok_or(Errno::EACCES)?;
+                                return Ok((reopened, entry));
+                            }
+                            let open_ref = orig.fs().open(&cred, orig.handle(), &options).await?;
+                            let is_trunc = options.is_truncate() && entry.metadata.is_file();
+                            let refreshed_meta = if is_trunc {
+                                orig.fs()
+                                    .open_metadata(&open_ref)
+                                    .await
+                                    .unwrap_or(entry.metadata)
+                            } else {
+                                entry.metadata
+                            };
+                            let out_entry = Entry {
+                                handle: orig.handle().clone(),
+                                metadata: refreshed_meta,
+                            };
+                            let file_ref = FileRef::new(
+                                Rc::clone(orig.fs()),
+                                open_ref,
+                                orig.handle().clone(),
+                                cred,
+                                &options,
+                                &self.inner.releases,
+                            );
+                            return Ok((file_ref, out_entry));
+                        }
+                        _ => {}
                     }
 
                     if entry.metadata.is_symlink() && access != Access::Path {
@@ -1913,56 +2338,77 @@ impl Vfs {
                     if must_dir && !entry.metadata.is_dir() {
                         return Err(Errno::ENOTDIR);
                     }
-                    if entry.metadata.is_dir() && (access.writes() || options.is_truncate()) {
+                    if entry.metadata.is_dir()
+                        && (access.writes() || options.is_truncate() || is_creat)
+                    {
                         return Err(Errno::EISDIR);
                     }
+                    let is_char_dev = entry.metadata.file_type == FileType::CharDevice;
+                    let wants_write =
+                        access != Access::Path && (access.writes() || options.is_truncate());
                     if access != Access::Path {
-                        if entry.metadata.file_type == FileType::CharDevice
-                            && pin.effective_flags().nodev
-                        {
+                        if is_char_dev && pin.effective_flags().nodev {
                             return Err(Errno::EACCES);
                         }
                         if access == Access::Exec && pin.effective_noexec() {
                             return Err(Errno::EACCES);
                         }
-                        if (access.writes() || options.is_truncate()) && pin.effective_rdonly() {
+                        if wants_write && !is_char_dev && pin.effective_rdonly() {
                             return Err(Errno::EROFS);
                         }
                     }
 
                     let is_trunc = options.is_truncate() && entry.metadata.is_file();
+                    let write_guard = if wants_write && !is_char_dev {
+                        Some(pin.begin_write()?)
+                    } else {
+                        None
+                    };
                     let open_ref = pin
                         .guard_op(
                             &cred,
                             is_trunc,
-                            is_trunc,
+                            false,
                             pin.fs().open(&cred, &entry.handle, &options),
                         )
                         .await?;
+                    let file_type = entry.metadata.file_type;
+                    let file_ref = FileRef::new_mounted_with_type(
+                        pin.clone(),
+                        open_ref,
+                        entry.handle.clone(),
+                        Some(file_type),
+                        cred.clone(),
+                        &options,
+                        &self.inner.releases,
+                    );
+                    drop(write_guard);
                     if is_trunc && pin.effective_flags().synchronous {
-                        pin.guard_op(&cred, true, false, pin.fs().sync_all(&open_ref))
-                            .await?;
+                        if let Err(err) = pin
+                            .guard_op(&cred, true, false, pin.fs().sync_all(file_ref.open_ref()))
+                            .await
+                        {
+                            let _ = file_ref.close().await;
+                            return Err(err);
+                        }
                         pin.backing().record_sync();
                     }
                     let refreshed_meta = if is_trunc {
-                        pin.guard_op(&cred, false, false, pin.fs().open_metadata(&open_ref))
-                            .await
-                            .unwrap_or(entry.metadata)
+                        pin.guard_op(
+                            &cred,
+                            false,
+                            false,
+                            pin.fs().open_metadata(file_ref.open_ref()),
+                        )
+                        .await
+                        .unwrap_or(entry.metadata)
                     } else {
                         entry.metadata
                     };
                     let out_entry = Entry {
-                        handle: entry.handle.clone(),
+                        handle: entry.handle,
                         metadata: refreshed_meta,
                     };
-                    let file_ref = FileRef::new_mounted(
-                        pin,
-                        open_ref,
-                        entry.handle,
-                        cred,
-                        &options,
-                        &self.inner.releases,
-                    );
                     Ok((file_ref, out_entry))
                 }
             }
@@ -1980,10 +2426,16 @@ impl Vfs {
     ) -> Result<Fd> {
         let (file_ref, _) = self.open_file(pid, anchor, path, oflags, mode).await?;
         let cloexec = oflags & O_CLOEXEC != 0;
-        let fds = self.process_fds(pid)?;
+        let (cred, _, _, fds) = self.snapshot_proc(pid)?;
+        let prov = file_ref.mount_pin().map(|p| Rc::as_ptr(p.provider()));
         let res = fds.borrow_mut().insert(file_ref, cloexec);
         if res.is_err() {
-            let _ = self.inner.releases.flush().await;
+            let provs: Vec<_> = prov.into_iter().collect();
+            let _ = self
+                .inner
+                .releases
+                .flush_scoped(cred.identity.id, &provs)
+                .await;
         }
         res
     }
@@ -1998,7 +2450,6 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
             let flags = if follow {
                 WalkFlags::FOLLOW_LAST
@@ -2009,7 +2460,7 @@ impl Vfs {
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &anchor,
                 path,
@@ -2065,6 +2516,26 @@ impl Vfs {
         .await
     }
 
+    /// Descriptor attribute mutation (`fchmod`, `fchown`, `futimens`) acting with `pid`'s current
+    /// credentials (contract §2.3).
+    pub async fn fsetattr(&self, pid: u32, fd: Fd, attr: &SetAttr) -> Result<Metadata> {
+        self.with_caller(pid, async move {
+            let (cred, _, _, fds) = self.snapshot_proc(pid)?;
+            let file = fds.borrow().get(fd)?;
+            file.setattr_as(&cred, attr).await
+        })
+        .await
+    }
+
+    async fn release_temp_open(pin: &MountPin, open: &crate::OpenRef) {
+        if pin.health() == crate::mount::ProviderHealth::Connected {
+            let _ = pin
+                .provider()
+                .guard_future(false, pin.fs().release(open))
+                .await;
+        }
+    }
+
     pub async fn accessat(
         &self,
         pid: u32,
@@ -2079,7 +2550,6 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
             let flags = if follow {
                 WalkFlags::FOLLOW_LAST
@@ -2090,7 +2560,7 @@ impl Vfs {
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &anchor,
                 path,
@@ -2103,7 +2573,10 @@ impl Vfs {
             if mode == abi::F_OK {
                 return Ok(());
             }
-            if mode & abi::W_OK != 0 && pin.effective_rdonly() {
+            if mode & abi::W_OK != 0
+                && entry.metadata.file_type != FileType::CharDevice
+                && pin.effective_rdonly()
+            {
                 return Err(Errno::EROFS);
             }
             if mode & abi::X_OK != 0 && !entry.metadata.is_dir() && pin.effective_noexec() {
@@ -2142,7 +2615,7 @@ impl Vfs {
                             pin.fs().open(&cred, &entry.handle, &opts),
                         )
                         .await?;
-                    let _ = pin.fs().release(&open).await;
+                    Self::release_temp_open(&pin, &open).await;
                 }
                 if mode & abi::W_OK != 0 {
                     if entry.metadata.is_dir() {
@@ -2172,7 +2645,7 @@ impl Vfs {
                                 pin.fs().open(&cred, &entry.handle, &opts),
                             )
                             .await?;
-                        let _ = pin.fs().release(&open).await;
+                        Self::release_temp_open(&pin, &open).await;
                     }
                 }
                 if mode & abi::X_OK != 0 {
@@ -2190,7 +2663,7 @@ impl Vfs {
                                 pin.fs().open(&cred, &entry.handle, &opts),
                             )
                             .await?;
-                        let _ = pin.fs().release(&open).await;
+                        Self::release_temp_open(&pin, &open).await;
                     }
                 }
                 Ok(())
@@ -2206,13 +2679,12 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
             let resolved = walk(
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &anchor,
                 path,
@@ -2245,13 +2717,12 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
             let resolved = walk(
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &anchor,
                 path,
@@ -2301,19 +2772,8 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
-            match walk_parent(
-                &cred,
-                &ns,
-                &ctx_snap,
-                &fds_snap,
-                Some(bridge),
-                &anchor,
-                path,
-            )
-            .await?
-            {
+            match walk_parent(&cred, &ns, &ctx_snap, &fds, Some(bridge), &anchor, path).await? {
                 ParentResolution::Root { .. } | ParentResolution::DotOrDotDot { .. } => {
                     Err(Errno::EEXIST)
                 }
@@ -2352,19 +2812,8 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
-            match walk_parent(
-                &cred,
-                &ns,
-                &ctx_snap,
-                &fds_snap,
-                Some(bridge),
-                &anchor,
-                path,
-            )
-            .await?
-            {
+            match walk_parent(&cred, &ns, &ctx_snap, &fds, Some(bridge), &anchor, path).await? {
                 ParentResolution::Root { .. } | ParentResolution::DotOrDotDot { .. } => {
                     Err(Errno::EEXIST)
                 }
@@ -2405,19 +2854,8 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
-            match walk_parent(
-                &cred,
-                &ns,
-                &ctx_snap,
-                &fds_snap,
-                Some(bridge),
-                &anchor,
-                path,
-            )
-            .await?
-            {
+            match walk_parent(&cred, &ns, &ctx_snap, &fds, Some(bridge), &anchor, path).await? {
                 ParentResolution::Root { .. } | ParentResolution::DotOrDotDot { .. } => {
                     Err(Errno::EEXIST)
                 }
@@ -2491,6 +2929,30 @@ impl Vfs {
         Ok(node)
     }
 
+    fn is_mountpoint_in_pin_ns(
+        &self,
+        default_ns: &Rc<RefCell<MountNamespace>>,
+        pin: &MountPin,
+        dir_node: NodeId,
+        name: &str,
+        item_node: Option<NodeId>,
+    ) -> bool {
+        if pin.is_detached() {
+            return pin.detached_dir_has_mountpoint(pin.id(), dir_node, name)
+                || item_node.is_some_and(|n| pin.detached_topmost_at(pin.id(), n).is_some());
+        }
+        let target_ns = if default_ns.borrow().id() == pin.ns_id() {
+            Rc::clone(default_ns)
+        } else {
+            self.inner
+                .namespace_by_id(pin.ns_id())
+                .unwrap_or_else(|| Rc::clone(default_ns))
+        };
+        let ns_ref = target_ns.borrow();
+        ns_ref.has_mountpoint_at_name(pin.id(), dir_node, name)
+            || item_node.is_some_and(|n| ns_ref.is_mountpoint(pin.id(), n))
+    }
+
     pub async fn unlinkat(
         &self,
         pid: u32,
@@ -2501,19 +2963,8 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
-            match walk_parent(
-                &cred,
-                &ns,
-                &ctx_snap,
-                &fds_snap,
-                Some(bridge),
-                &anchor,
-                path,
-            )
-            .await?
-            {
+            match walk_parent(&cred, &ns, &ctx_snap, &fds, Some(bridge), &anchor, path).await? {
                 ParentResolution::Root { .. } => {
                     Err(if rmdir { Errno::EBUSY } else { Errno::EISDIR })
                 }
@@ -2548,14 +2999,13 @@ impl Vfs {
                             Errno::ENOTDIR
                         });
                     }
-                    let is_mp = {
-                        let ns_ref = ns.borrow();
-                        ns_ref.has_mountpoint_at_name(
-                            t.parent_pin.id(),
-                            t.parent.handle.node,
-                            &t.name,
-                        ) || ns_ref.is_mountpoint(t.parent_pin.id(), child.handle.node)
-                    };
+                    let is_mp = self.is_mountpoint_in_pin_ns(
+                        &ns,
+                        &t.parent_pin,
+                        t.parent.handle.node,
+                        &t.name,
+                        Some(child.handle.node),
+                    );
                     if is_mp {
                         let dir_node = Self::node_for_perm(&cred, &t.parent_pin, &t.parent).await?;
                         let child_node = Self::node_for_perm(&cred, &t.parent_pin, &child).await?;
@@ -2609,14 +3059,13 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
 
             let src = match walk_parent(
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &from_anchor,
                 from,
@@ -2629,16 +3078,8 @@ impl Vfs {
                 ParentResolution::Child(t) => t,
             };
 
-            let dst = match walk_parent(
-                &cred,
-                &ns,
-                &ctx_snap,
-                &fds_snap,
-                Some(bridge),
-                &to_anchor,
-                to,
-            )
-            .await?
+            let dst = match walk_parent(&cred, &ns, &ctx_snap, &fds, Some(bridge), &to_anchor, to)
+                .await?
             {
                 ParentResolution::Root { .. } | ParentResolution::DotOrDotDot { .. } => {
                     return Err(Errno::EBUSY);
@@ -2665,7 +3106,7 @@ impl Vfs {
                         .lookup(&cred, &src.parent.handle, &src.name),
                 )
                 .await?;
-            if (src.trailing_slash || dst.trailing_slash) && !src_entry.metadata.is_dir() {
+            if src.trailing_slash && !src_entry.metadata.is_dir() {
                 return Err(Errno::ENOTDIR);
             }
 
@@ -2685,22 +3126,39 @@ impl Vfs {
                 Err(Errno::ENOENT) => None,
                 Err(e) => return Err(e),
             };
+            match &dst_entry {
+                Some(d) => {
+                    if dst.trailing_slash && !d.metadata.is_dir() {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    if src_entry.metadata.is_dir() && !d.metadata.is_dir() {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    if !src_entry.metadata.is_dir() && d.metadata.is_dir() {
+                        return Err(Errno::EISDIR);
+                    }
+                }
+                None => {
+                    if dst.trailing_slash {
+                        return Err(Errno::ENOENT);
+                    }
+                }
+            }
             let dst_node = dst_entry.as_ref().map(|e| e.handle.node);
 
-            let is_mp = {
-                let ns_ref = ns.borrow();
-                ns_ref.has_mountpoint_at_name(
-                    src.parent_pin.id(),
-                    src.parent.handle.node,
-                    &src.name,
-                ) || ns_ref.is_mountpoint(src.parent_pin.id(), src_entry.handle.node)
-                    || ns_ref.has_mountpoint_at_name(
-                        dst.parent_pin.id(),
-                        dst.parent.handle.node,
-                        &dst.name,
-                    )
-                    || dst_node.is_some_and(|n| ns_ref.is_mountpoint(dst.parent_pin.id(), n))
-            };
+            let is_mp = self.is_mountpoint_in_pin_ns(
+                &ns,
+                &src.parent_pin,
+                src.parent.handle.node,
+                &src.name,
+                Some(src_entry.handle.node),
+            ) || self.is_mountpoint_in_pin_ns(
+                &ns,
+                &dst.parent_pin,
+                dst.parent.handle.node,
+                &dst.name,
+                dst_node,
+            );
             if is_mp {
                 let src_dir_node = Self::node_for_perm(&cred, &src.parent_pin, &src.parent).await?;
                 let src_item_node = Self::node_for_perm(&cred, &src.parent_pin, &src_entry).await?;
@@ -2757,7 +3215,6 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
 
             let wflags = if follow {
@@ -2769,7 +3226,7 @@ impl Vfs {
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &from_anchor,
                 from,
@@ -2789,16 +3246,8 @@ impl Vfs {
                 return Err(Errno::EPERM);
             }
 
-            let dst = match walk_parent(
-                &cred,
-                &ns,
-                &ctx_snap,
-                &fds_snap,
-                Some(bridge),
-                &to_anchor,
-                to,
-            )
-            .await?
+            let dst = match walk_parent(&cred, &ns, &ctx_snap, &fds, Some(bridge), &to_anchor, to)
+                .await?
             {
                 ParentResolution::Root { .. } | ParentResolution::DotOrDotDot { .. } => {
                     return Err(Errno::EEXIST);
@@ -2848,7 +3297,6 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
             let flags = if follow {
                 WalkFlags::FOLLOW_LAST
@@ -2859,7 +3307,7 @@ impl Vfs {
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &anchor,
                 path,
@@ -2880,9 +3328,8 @@ impl Vfs {
                     pin.fs().setattr(&cred, &entry.handle, attr),
                 )
                 .await?;
-            if pin.effective_flags().synchronous {
-                pin.backing().record_sync();
-            }
+            self.sync_object_if_needed(&cred, &pin, &entry.handle)
+                .await?;
             Ok(meta)
         })
         .await
@@ -2899,7 +3346,6 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
             let flags = if follow {
                 WalkFlags::FOLLOW_LAST
@@ -2910,7 +3356,7 @@ impl Vfs {
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &anchor,
                 path,
@@ -2945,7 +3391,6 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
             let flags = if follow {
                 WalkFlags::FOLLOW_LAST
@@ -2956,7 +3401,7 @@ impl Vfs {
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &anchor,
                 path,
@@ -2975,7 +3420,10 @@ impl Vfs {
                 true,
                 pin.fs().setxattr(&cred, &entry.handle, name, value, xflags),
             )
-            .await
+            .await?;
+            self.sync_object_if_needed(&cred, &pin, &entry.handle)
+                .await?;
+            Ok(())
         })
         .await
     }
@@ -2990,7 +3438,6 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
             let flags = if follow {
                 WalkFlags::FOLLOW_LAST
@@ -3001,7 +3448,7 @@ impl Vfs {
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &anchor,
                 path,
@@ -3033,7 +3480,6 @@ impl Vfs {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
             let bridge: &dyn ProcBridge = &*self.inner;
             let flags = if follow {
                 WalkFlags::FOLLOW_LAST
@@ -3044,7 +3490,7 @@ impl Vfs {
                 &cred,
                 &ns,
                 &ctx_snap,
-                &fds_snap,
+                &fds,
                 Some(bridge),
                 &anchor,
                 path,
@@ -3063,7 +3509,10 @@ impl Vfs {
                 true,
                 pin.fs().removexattr(&cred, &entry.handle, name),
             )
-            .await
+            .await?;
+            self.sync_object_if_needed(&cred, &pin, &entry.handle)
+                .await?;
+            Ok(())
         })
         .await
     }
@@ -3146,16 +3595,36 @@ impl Vfs {
     }
 
     pub async fn dup2(&self, pid: u32, old: Fd, new: Fd) -> Result<Fd> {
-        let fds = self.process_fds(pid)?;
+        let (cred, _, _, fds) = self.snapshot_proc(pid)?;
+        let old_prov = fds
+            .borrow()
+            .get(new)
+            .ok()
+            .and_then(|f| f.mount_pin().map(|p| Rc::as_ptr(p.provider())));
         let res = fds.dup2(old, new).await;
-        let _ = self.inner.releases.flush().await;
+        let provs: Vec<_> = old_prov.into_iter().collect();
+        let _ = self
+            .inner
+            .releases
+            .flush_scoped(cred.identity.id, &provs)
+            .await;
         res
     }
 
     pub async fn close(&self, pid: u32, fd: Fd) -> Result<()> {
-        let fds = self.process_fds(pid)?;
+        let (cred, _, _, fds) = self.snapshot_proc(pid)?;
+        let old_prov = fds
+            .borrow()
+            .get(fd)
+            .ok()
+            .and_then(|f| f.mount_pin().map(|p| Rc::as_ptr(p.provider())));
         let res = fds.close(fd).await;
-        let _ = self.inner.releases.flush().await;
+        let provs: Vec<_> = old_prov.into_iter().collect();
+        let _ = self
+            .inner
+            .releases
+            .flush_scoped(cred.identity.id, &provs)
+            .await;
         res
     }
 
@@ -3168,7 +3637,7 @@ impl Vfs {
         cred: &Cred,
         ns: &Rc<RefCell<MountNamespace>>,
         ctx: &crate::context::FsContext,
-        fds: &crate::FdTable,
+        fds: &impl crate::walk::FdLookup,
         candidate: &str,
     ) -> Result<(MountPin, Entry, FileRef)> {
         let bridge: &dyn ProcBridge = &*self.inner;
@@ -3209,10 +3678,11 @@ impl Vfs {
                 pin.fs().open(cred, &entry.handle, &exec_opts),
             )
             .await?;
-        let file_ref = FileRef::new_mounted(
+        let file_ref = FileRef::new_mounted_with_type(
             pin.clone(),
             open_ref,
             entry.handle.clone(),
+            Some(entry.metadata.file_type),
             cred.clone(),
             &exec_opts,
             &self.inner.releases,
@@ -3236,7 +3706,6 @@ impl Vfs {
             }
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
-            let fds_snap = fds.borrow().clone();
 
             let mut cur_argv = if argv.is_empty() {
                 vec![file.to_string()]
@@ -3248,7 +3717,7 @@ impl Vfs {
             let (mut matched_path, mut pin, mut entry, mut file_ref) =
                 if file.contains('/') || !search_path {
                     let (p, e, f) = self
-                        .open_exec_candidate(&cred, &ns, &ctx_snap, &fds_snap, file)
+                        .open_exec_candidate(&cred, &ns, &ctx_snap, &fds, file)
                         .await?;
                     (file.to_string(), p, e, f)
                 } else {
@@ -3264,7 +3733,7 @@ impl Vfs {
                             format!("{}/{file}", dir.trim_end_matches('/'))
                         };
                         match self
-                            .open_exec_candidate(&cred, &ns, &ctx_snap, &fds_snap, &candidate)
+                            .open_exec_candidate(&cred, &ns, &ctx_snap, &fds, &candidate)
                             .await
                         {
                             Ok((p, e, f)) => {
@@ -3325,7 +3794,7 @@ impl Vfs {
                     // `#!` interpreters are NEVER searched in `PATH`; `/...` resolves from
                     // `FsContext.root` (`chroot`), relative from `FsContext.cwd`.
                     let (next_pin, next_entry, next_file) = self
-                        .open_exec_candidate(&cred, &ns, &ctx_snap, &fds_snap, &interp)
+                        .open_exec_candidate(&cred, &ns, &ctx_snap, &fds, &interp)
                         .await?;
                     matched_path = interp;
                     pin = next_pin;

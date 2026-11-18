@@ -41,11 +41,13 @@ pub fn call(
     caller: Option<&str>,
     call: Call,
 ) -> Result<Value> {
-    call_in_namespace(db, sid, "", process, caller, None, call)
+    call_in_namespace(db, sid, "", process, caller, None, None, call)
 }
 
-/// The descriptor calls of the session `sid`, as `process`, carrying the caller's namespace and
-/// credential so typed device ioctls can validate v2 `OpenRef` directory capabilities.
+/// The descriptor calls of the session `sid`, as `process`, carrying the caller's namespace,
+/// credential, and authenticated v2 filesystem session so typed device ioctls can validate v2
+/// `OpenRef` directory capabilities strictly against the caller's instance session.
+#[allow(clippy::too_many_arguments)]
 pub fn call_in_namespace(
     db: &mut Db,
     sid: Option<&str>,
@@ -53,6 +55,7 @@ pub fn call_in_namespace(
     process: &Process,
     caller: Option<&str>,
     credential: Option<&crate::creds::Credential>,
+    fs_auth: Option<(&str, &str)>,
     call: Call,
 ) -> Result<Value> {
     let sid = sid.ok_or_else(|| Error::because(Errno::EBADF, "no session to keep descriptors"))?;
@@ -110,6 +113,7 @@ pub fn call_in_namespace(
             if let Some(dev) = &mut device {
                 dev.ns = ns.to_string();
                 dev.credential = credential.cloned();
+                dev.fs_auth = fs_auth.map(|(id, sec)| (id.to_string(), sec.to_string()));
             }
             ioctl(
                 db,

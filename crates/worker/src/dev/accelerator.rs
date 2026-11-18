@@ -33,10 +33,15 @@ fn path(
         return Err(Errno::EINVAL.into());
     }
     if let Some(open) = &resource.open {
+        let fs_auth = request
+            .fs_auth
+            .as_ref()
+            .map(|(id, sec)| (id.as_str(), sec.as_str()));
         let dir_node = crate::cloudfs::opened_in_namespace(
             db,
             &request.ns,
             request.credential.as_ref(),
+            fs_auth,
             open,
         )?;
         if !dir_node.directory {
