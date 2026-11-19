@@ -1299,7 +1299,17 @@ impl ShareTransport for JsShareTransport {
 pub(crate) async fn build_share_backing(
     remote: JsValue,
     share_id: &str,
-) -> Result<(Rc<MountBacking>, Handle, Rc<ProviderState>, bool, bool), Errno> {
+) -> Result<
+    (
+        Rc<MountBacking>,
+        Handle,
+        Rc<ProviderState>,
+        bool,
+        bool,
+        bool,
+    ),
+    Errno,
+> {
     let grant =
         js_sys::Reflect::get(&remote, &JsValue::from_str("grant")).map_err(|_| Errno::EINVAL)?;
     let read_only = js_sys::Reflect::get(&grant, &JsValue::from_str("readOnly"))
@@ -1329,6 +1339,10 @@ pub(crate) async fn build_share_backing(
         .ok()
         .and_then(|v| v.as_string())
         .filter(|s| !s.is_empty());
+    let nosymfollow = js_sys::Reflect::get(&root_stat_val, &JsValue::from_str("nosymfollow"))
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let fs_id = FsId(match pub_fs_id {
         Some(pub_id) => format!("share:{share_id}:{pub_id}"),
         None => format!("share:{share_id}"),
@@ -1366,7 +1380,14 @@ pub(crate) async fn build_share_backing(
     };
     let share_fs = ShareFs::new(transport, Rc::clone(&provider), read_only, !execute);
     let (backing, root_handle) = share_fs.into_backing();
-    Ok((backing, root_handle, provider, read_only, execute))
+    Ok((
+        backing,
+        root_handle,
+        provider,
+        read_only,
+        execute,
+        nosymfollow,
+    ))
 }
 
 fn call_remote_sync(remote: &JsValue, method: &str, args: &[JsValue]) -> Result<JsValue, ()> {

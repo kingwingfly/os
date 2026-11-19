@@ -152,7 +152,7 @@ async function resolveOptionalSessionId() {
     const ws = await currentWorkspace();
     return ws.id;
   } catch (err) {
-    if (err?.errno === 'EACCES') return '';
+    if (err?.errno === 'EACCES' || err?.errno === 'EIO') return '';
     throw err;
   }
 }

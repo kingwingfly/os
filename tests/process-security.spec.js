@@ -409,9 +409,37 @@ test('exec replacement revokes its image grant while preserving ordinary descrip
   await syscall(context.request, { chmod: { path, mode: 0o755 } });
   const first = value(await kernel(page, 'exec', { ...sleep, path, argv: [path] }));
   let stranger;
+  const fsOrigin = await page.evaluate(() => location.origin);
+  const fsRpc = async (credential, session, call) => {
+    const response = await context.request.post(fsOrigin + '/api/fs', {
+      headers: { Origin: fsOrigin },
+      data: { version: 2, credential, session, call },
+    });
+    return { ok: response.ok(), status: response.status(), body: await response.json() };
+  };
+  let fsSession;
+  let openRef;
   try {
     const old = { pid: first.pid, proc: first.token };
-    const opened = value((await batch(page, [{ open: { path: output, flags: 0o101, mode: 0o600 } }], old))[0]);
+    // Processes use /api/fs v2 handles; direct v1 /api/sys regular-file path opens are refused.
+    expect((await batch(page, [{ open: { path: output, flags: 0o101, mode: 0o600 } }], old))[0].err?.errno).toBe('EPERM');
+    const conn = await fsRpc(first.token, null, 'connect');
+    expect(conn.ok, JSON.stringify(conn.body)).toBe(true);
+    fsSession = conn.body.session;
+    const guestDir = await fsRpc(first.token, fsSession, { lookup: { dir: conn.body.root, name: 'guest' } });
+    expect(guestDir.ok, JSON.stringify(guestDir.body)).toBe(true);
+    const created = await fsRpc(first.token, fsSession, {
+      create: {
+        ticket: `exec-lineage-${crypto.randomUUID()}`,
+        dir: guestDir.body.handle,
+        name: output.split('/').pop(),
+        mode: 0o600,
+        umask: 0o022,
+        options: { read: false, write: true, append: false, append_implies_write: false, truncate: false, create: true, create_new: true, exec: false, path: false },
+      },
+    });
+    expect(created.ok, JSON.stringify(created.body)).toBe(true);
+    openRef = created.body[1];
     const sink = value((await batch(page, [{ open: { path: '/dev/null', flags: 2 } }], old))[0]);
     const replaced = value(await kernel(page, 'reexec', { ...sleep, pid: first.pid }));
     const current = { pid: replaced.pid, proc: replaced.token };
@@ -421,7 +449,26 @@ test('exec replacement revokes its image grant while preserving ordinary descrip
     // process lineage. A replacement must not retain this old image capability.
     expect((await batch(page, [{ pread: { fd: first.fd, count: 4 } }], current))[0].err?.errno).toBe('EBADF');
     stranger = value(await kernel(page, 'exec', sleep));
-    expect((await batch(page, [{ pwrite: { fd: opened.fd, index: 0, data: 'eA==' } }], { pid: stranger.pid, proc: stranger.token }))[0].err?.errno).toBe('EBADF');
+    const strangerConn = await fsRpc(stranger.token, null, 'connect');
+    expect(strangerConn.ok, JSON.stringify(strangerConn.body)).toBe(true);
+    const payload = Buffer.from('survived exec\n');
+    const strangerWrite = await context.request.post(fsOrigin + '/api/fs/data', {
+      headers: {
+        Origin: fsOrigin,
+        'X-OS-Filesystem': JSON.stringify({
+          version: 2,
+          credential: stranger.token,
+          pid: stranger.pid,
+          session: strangerConn.body.session,
+          open: openRef,
+          operation: { write: { at: { offset: 0 }, length: payload.length } },
+        }),
+      },
+      data: payload,
+    });
+    await fsRpc(stranger.token, strangerConn.body.session, 'disconnect').catch(() => {});
+    expect(strangerWrite.ok()).toBe(false);
+    expect(['EACCES', 'EPERM']).toContain((await strangerWrite.json()).errno);
     // Stateless device I/O still belongs to its process lineage, including after exec.
     const nullWrite = { pwrite: { fd: sink.fd, index: 0, data: 'eA==' } };
     expect((await batch(page, [nullWrite]))[0].err?.errno).toBe('EBADF');
@@ -429,13 +476,31 @@ test('exec replacement revokes its image grant while preserving ordinary descrip
     expect(value((await batch(page, [nullWrite], current))[0])).toEqual({ written: 1 });
     expect(value((await batch(page, [{ pread: { fd: sink.fd, count: 1 } }], current))[0])).toEqual({ data: '', size: 0 });
     value((await batch(page, [{ close: { fd: sink.fd } }], current))[0]);
-    const written = await batch(page, [
-      { pwrite: { fd: opened.fd, index: 0, data: Buffer.from('survived exec\n').toString('base64') } },
-      { close: { fd: opened.fd } },
-    ], current);
-    for (const result of written) value(result);
+    const currentWrite = await context.request.post(fsOrigin + '/api/fs/data', {
+      headers: {
+        Origin: fsOrigin,
+        'X-OS-Filesystem': JSON.stringify({
+          version: 2,
+          credential: replaced.token,
+          pid: replaced.pid,
+          session: fsSession,
+          open: openRef,
+          operation: { write: { at: { offset: 0 }, length: payload.length } },
+        }),
+      },
+      data: payload,
+    });
+    expect(currentWrite.ok(), await currentWrite.text()).toBe(true);
+    const released = await fsRpc(replaced.token, fsSession, { release: { open: openRef } });
+    expect(released.ok, JSON.stringify(released.body)).toBe(true);
+    openRef = null;
+    await fsRpc(replaced.token, fsSession, 'disconnect');
+    fsSession = null;
     expect(await (await context.request.get('/api/file?path=' + encodeURIComponent(output))).text()).toBe('survived exec\n');
   } finally {
+    if (fsSession) {
+      await fsRpc(first.token, fsSession, 'disconnect').catch(() => {});
+    }
     for (const process of [first, stranger].filter(Boolean)) {
       await kernel(page, 'exit', { pid: process.pid, status: 0 });
       await kernel(page, 'wait', { pid: process.pid });

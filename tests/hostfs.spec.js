@@ -33,7 +33,6 @@ const sourceModules = [
   'web/kernel/image.js',
   'web/kernel/loader.js',
   'web/kernel/native-mount.js',
-  'web/kernel/private-extension.js',
   'web/wasi/fork.js',
 ];
 
@@ -133,10 +132,207 @@ async function setupTab(page) {
     await wasm_bindgen('/client_kernel_bg.wasm');
     // eslint-disable-next-line no-undef
     globalThis.wasm_bindgen = wasm_bindgen;
-    const { Workspace } = await import('/web/kernel/workspace.js');
+    const { prepareUserMount, CLIENT_PAGE_FD_BASE } = await import('/web/kernel/workspace.js');
     const { exportMount, attachMount } = await import('/web/kernel/mount-sharing.js');
+    const OS_FD_ROOT = 0x7ffffffd;
+    const decodeB64Bytes = data => {
+      const bin = atob(data);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    };
+    const encodeB64Bytes = u8 => {
+      let text = '';
+      for (let i = 0; i < u8.length; i += 0x8000) {
+        text += String.fromCharCode(...u8.subarray(i, i + 0x8000));
+      }
+      return btoa(text);
+    };
+    const errPayload = err => ({
+      errno: err?.errno ?? 'EIO',
+      detail: err?.detail ?? err?.message ?? String(err ?? 'EIO'),
+    });
+
+    class TestSession {
+      constructor({ id, uid, gid = uid, groups = [gid] }) {
+        this.id = id;
+        this.identity = Object.freeze({ id, uid, gid, groups: Object.freeze([...groups]) });
+        this.kernel = new wasm_bindgen.Kernel(`inst-${crypto.randomUUID()}`, `k-${crypto.randomUUID()}`);
+        this.alive = true;
+        this.cleanups = new Map();
+        this.mounts = new Map();
+        this._nextPid = 200;
+        this.page = 200;
+        this._spawnedPids = new Set([200]);
+        this._ready = (async () => {
+          await this.kernel.session_begin(id, uid, gid, new Uint32Array(groups));
+          await this.kernel.proc_spawn_init(JSON.stringify({
+            pid: 200,
+            ppid: 1,
+            sessionId: id,
+            uid,
+            gid,
+            groups,
+            umask: 0o022,
+            cwd: '/',
+          }));
+        })();
+      }
+      check() {
+        if (!this.alive) throw Object.assign(new Error('workspace is closed'), { errno: 'ENODEV' });
+      }
+      scope() {
+        return ++this._nextPid;
+      }
+      async _ensureScope(pid = this.page) {
+        await this._ready;
+        const p = typeof pid === 'number' ? pid : this.page;
+        if (!this._spawnedPids.has(p)) {
+          this._spawnedPids.add(p);
+          await this.kernel.proc_spawn_init(JSON.stringify({
+            pid: p,
+            ppid: 1,
+            sessionId: this.id,
+            uid: this.identity.uid,
+            gid: this.identity.gid,
+            groups: [...this.identity.groups],
+            umask: 0o022,
+            cwd: '/',
+          }));
+        }
+        return p;
+      }
+      async mount(args) {
+        await this._ready;
+        this.check();
+        const prepared = await prepareUserMount(args, this.identity);
+        let summary;
+        try {
+          this.check();
+          summary = await this.kernel.mount_user(this.id, JSON.stringify(prepared.spec), prepared.hostObj);
+        } catch (err) {
+          try { prepared.cleanup?.(); } catch {}
+          throw err;
+        }
+        if (prepared.cleanup) this.cleanups.set(summary.path, prepared.cleanup);
+        const fsId = summary.fsId;
+        const rec = { ...summary, fsId, provider: { fsId }, active: true };
+        this.mounts.set(summary.path, rec);
+        return rec;
+      }
+      async unmount(path, flags = 2) {
+        await this._ready;
+        await this.kernel.unmount_user(this.id, path, flags);
+        this.mounts.delete(path);
+        const cleanup = this.cleanups.get(path);
+        if (cleanup) {
+          this.cleanups.delete(path);
+          try { cleanup(); } catch {}
+        }
+      }
+      close() {
+        if (!this.alive) return;
+        this.alive = false;
+        for (const fn of this.cleanups.values()) {
+          try { fn?.(); } catch {}
+        }
+        this.cleanups.clear();
+        this.mounts.clear();
+        void this._ready.then(async () => {
+          for (const pid of this._spawnedPids) {
+            await this.kernel.proc_exit(pid).catch(() => {});
+          }
+          await this.kernel.session_end(this.id).catch(() => {});
+        });
+      }
+      async calls(calls, scope = this.page, _cloudFn = null, opts = {}) {
+        await this._ready;
+        this.check();
+        const pid = await this._ensureScope(scope);
+        const results = [];
+        for (const c of calls) {
+          const [key, val] = Object.entries(c)[0];
+          try {
+            if (key === 'open') {
+              const prevUmask = opts.umask !== undefined ? this.kernel.proc_set_umask(pid, opts.umask) : null;
+              try {
+                const opened = await this.kernel.proc_openat(pid, OS_FD_ROOT, val.path, val.flags ?? 0, val.mode ?? 0o666, false);
+                results.push({ ok: { fd: opened.kfd, ...(opened.stat ?? {}) } });
+              } finally {
+                if (prevUmask !== null) this.kernel.proc_set_umask(pid, prevUmask);
+              }
+            } else if (key === 'close') {
+              await this.kernel.kfd_close(pid, val.fd);
+              results.push({ ok: null });
+            } else if (key === 'pread') {
+              if (typeof val.fd === 'number') {
+                const bytes = val.fd >= CLIENT_PAGE_FD_BASE
+                  ? decodeB64Bytes(JSON.parse(await this.kernel.vfs_sys(this.id, JSON.stringify({ calls: [c], sudo: !!opts.sudo, umask: opts.umask }))).results[0].ok.data)
+                  : await this.kernel.kfd_pread(pid, val.fd, val.count ?? 4096, BigInt(val.offset ?? 0));
+                results.push({ ok: { data: encodeB64Bytes(bytes) } });
+              } else {
+                const opened = await this.kernel.proc_openat(pid, OS_FD_ROOT, val.path, 0, 0, false);
+                try {
+                  const bytes = await this.kernel.kfd_pread(pid, opened.kfd, val.count ?? 4096, BigInt(val.offset ?? 0));
+                  results.push({ ok: { data: encodeB64Bytes(bytes) } });
+                } finally {
+                  await this.kernel.kfd_close(pid, opened.kfd).catch(() => {});
+                }
+              }
+            } else if (key === 'pwrite') {
+              const bytes = decodeB64Bytes(val.data);
+              const written = val.fd >= CLIENT_PAGE_FD_BASE
+                ? await this.kernel.vfs_pwrite_chunk(this.id, val.fd, BigInt(val.offset ?? 0), bytes)
+                : await this.kernel.kfd_pwrite(pid, val.fd, bytes, BigInt(val.offset ?? 0));
+              results.push({ ok: typeof written === 'number' ? { written } : written });
+            } else if (key === 'fstat') {
+              const st = val.fd >= CLIENT_PAGE_FD_BASE
+                ? await this.kernel.vfs_fstat_fd(this.id, val.fd)
+                : await this.kernel.kfd_fstat(pid, val.fd);
+              results.push({ ok: st });
+            } else if (key === 'fsync') {
+              if (val.fd >= CLIENT_PAGE_FD_BASE) {
+                await this.kernel.vfs_fsync_fd(this.id, val.fd, !!val.data_only);
+              } else {
+                await this.kernel.kfd_fsync(pid, val.fd, !!val.data_only);
+              }
+              results.push({ ok: null });
+            } else if (key === 'ftruncate') {
+              if (val.fd >= CLIENT_PAGE_FD_BASE) {
+                await this.kernel.vfs_ftruncate_fd(this.id, val.fd, BigInt(val.size ?? 0));
+              } else {
+                await this.kernel.kfd_ftruncate(pid, val.fd, BigInt(val.size ?? 0));
+              }
+              results.push({ ok: null });
+            } else if (key === 'try_lock') {
+              await this.kernel.kfd_lock(pid, val.fd, val.family, val.kind, BigInt(val.start ?? 0), val.end != null ? BigInt(val.end) : undefined, false);
+              results.push({ ok: null });
+            } else if (key === 'lock') {
+              await this.kernel.kfd_lock(pid, val.fd, val.family, val.kind, BigInt(val.start ?? 0), val.end != null ? BigInt(val.end) : undefined, true);
+              results.push({ ok: null });
+            } else if (key === 'unlock') {
+              await this.kernel.kfd_unlock(pid, val.fd, val.family, BigInt(val.start ?? 0), val.end != null ? BigInt(val.end) : undefined);
+              results.push({ ok: null });
+            } else if (key === 'test_lock') {
+              const res = await this.kernel.kfd_test_lock(pid, val.fd, val.kind, BigInt(val.start ?? 0), val.end != null ? BigInt(val.end) : undefined);
+              results.push({ ok: res });
+            } else {
+              const raw = await this.kernel.vfs_sys(
+                this.id,
+                JSON.stringify({ calls: [c], sudo: !!opts.sudo, umask: opts.umask }),
+              );
+              results.push(JSON.parse(raw).results[0]);
+            }
+          } catch (err) {
+            results.push({ err: errPayload(err) });
+          }
+        }
+        return results;
+      }
+    }
+
     Object.assign(globalThis, {
-      Workspace,
+      Workspace: TestSession,
       exportMount,
       attachMount,
       b64: text => btoa(text),
@@ -359,19 +555,9 @@ test('OPFS enforces cross-tab open-unlink (nlink == 0), sweeps crashed-tab orpha
     const dirFd = await callOne(ws1, { open: { path: '/mnt/local/work', flags: 0o200000 } });
     const dirFsync = await callErr(ws1, { fsync: { fd: dirFd.fd, data_only: false } });
     await callOne(ws1, { close: { fd: dirFd.fd } });
-    const roGrant = Object.freeze({ readOnly: true });
-    ws1.mounts.set('/opt/private/roext', {
-      path: '/opt/private/roext',
-      name: 'roext',
-      grant: roGrant,
-      provider: { grant: roGrant, async stat() { return { kind: 'file', size: 2, readOnly: true }; }, unmount() {} },
-      cloud: false,
-      active: true,
-    });
-    const extFd = await callOne(ws1, { open: { path: '/opt/private/roext/bin', flags: 0 } });
-    const nonSyncableFsync = await callErr(ws1, { fsync: { fd: extFd.fd, data_only: false } });
-    await callOne(ws1, { close: { fd: extFd.fd } });
-    ws1.unmount('/opt/private/roext');
+    const devNullFd = await callOne(ws1, { open: { path: '/dev/null', flags: 0 } });
+    const nonSyncableFsync = await callErr(ws1, { fsync: { fd: devNullFd.fd, data_only: false } });
+    await callOne(ws1, { close: { fd: devNullFd.fd } });
     return { exclDup, nlink: st2.nlink, target, symRead, noreplaceErr, viaOpenFd, badFsync, dirFsync, nonSyncableFsync };
   });
   expect(opsResult).toEqual({
@@ -499,12 +685,18 @@ test('Multi-tab flock and fcntl byte-range locks coordinate via Web Locks with F
 
   await tab2.close({ runBeforeUnload: false });
 
-  // Tab 1 now acquires flock(LOCK_EX) without error because Tab 2's open-handle Web Lock released!
-  const acquiredAfterCrash = await tab1.evaluate(async () => {
-    const err = await callErr(ws, { try_lock: { fd: fd1b, family: 'flock', kind: 'exclusive' } });
+  // Tab 1 now acquires flock(LOCK_EX) without error because Tab 2's open-handle Web Lock released
+  // (wait briefly for browser renderer teardown to release Web Locks across tabs).
+  let acquiredAfterCrash = 'EAGAIN';
+  await expect.poll(async () => {
+    acquiredAfterCrash = await tab1.evaluate(async () => {
+      return await callErr(ws, { try_lock: { fd: fd1b, family: 'flock', kind: 'exclusive' } });
+    });
+    return acquiredAfterCrash;
+  }, { timeout: 5000 }).toBeNull();
+  await tab1.evaluate(async () => {
     await callOne(ws, { close: { fd: fd1b } });
     ws.close();
-    return err;
   });
   expect(acquiredAfterCrash).toBeNull();
 });

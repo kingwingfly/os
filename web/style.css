@@ -26,7 +26,7 @@ dialog { color:var(--text); background:#101714; border:1px solid #3d5345; border
 .tab-bar{display:flex;align-items:stretch;gap:2px;padding:6px 10px 0;border-bottom:1px solid var(--line);overflow-x:auto;scrollbar-width:none;flex-shrink:0}
 .tab-bar::-webkit-scrollbar{display:none}
 .tab{display:flex;align-items:center;border:1px solid transparent;border-bottom:0;border-radius:5px 5px 0 0;color:var(--muted)}
-.tab[aria-selected="true"]{border-color:var(--line);background:#101714;color:var(--text)}
+.tab:has(> .tab-select[aria-selected="true"]){border-color:var(--line);background:#101714;color:var(--text)}
 .tab button{background:none;border:0;color:inherit;font-size:14px;padding:5px 9px;white-space:nowrap}
 .tab .tab-close{padding:5px 8px 5px 2px;opacity:.6}
 .tab .tab-close:hover{opacity:1}

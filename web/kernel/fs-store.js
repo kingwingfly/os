@@ -1292,8 +1292,8 @@ export async function createOpfsStore(handle, { execute = false, writable = true
   if (!globalThis.navigator?.storage?.getDirectory) {
     throw error('ENOTSUP', 'Browser storage is unavailable in this session. Use a regular browser window or mount a host folder.');
   }
-  const opfsRoot = await navigator.storage.getDirectory().catch(reason => {
-    throw refusal(reason);
+  const opfsRoot = await navigator.storage.getDirectory().catch(() => {
+    throw error('ENOTSUP', 'Browser storage is unavailable in this session. Use a regular browser window or mount a host folder.');
   });
   let rootHandle = handle;
   let storeKey = 'os-workspace';

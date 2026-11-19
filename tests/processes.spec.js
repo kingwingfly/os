@@ -103,7 +103,7 @@ test('head takes its lines as they come, a prompt shows as it waits, and NULs ar
   await expect(last(page)).toHaveText('ab');
 });
 
-test('a page not isolated runs a pipeline one process after another, and nothing reads the terminal', async ({ page }) => {
+test('a page not isolated shows an execution notice and refuses command execution', async ({ page }) => {
   await page.route(url => new URL(url).pathname === '/', async route => {
     const response = await route.fetch();
     const headers = { ...response.headers() };
@@ -112,18 +112,12 @@ test('a page not isolated runs a pipeline one process after another, and nothing
   });
   await ready(page);
   expect(await page.evaluate(() => crossOriginIsolated)).toBe(false);
-  await run(page, 'seq 1 3 | tr 1-3 a-c | fold -w 1');
-  await expect(last(page)).toHaveText('a\nb\nc');
-  await run(page, 'yes | head -n 2');
-  // Without shared memory this fallback buffers stages sequentially, so an infinite
-  // producer reaches its buffer limit before head can run. Report the producer accurately.
-  await expect(page.locator('.transcript pre').filter({ hasText: /^y\ny$/ })).toHaveCount(1);
-  await expect(last(page)).toContainText('yes: output larger than 10 MB was cut short');
-  await run(page, 'tr a-z A-Z');
-  await expect(last(page)).toHaveText(/tr a-z A-Z$/);
-  await run(page, 'echo item | xargs echo');
-  await expect(last(page)).toContainText('Function not implemented');
-  await run(page, 'echo still-responsive'); await expect(last(page)).toHaveText('still-responsive');
+  await expect(page.locator('.execution-notice')).toContainText('isolated browser page');
+  await run(page, 'seq 1 3 | tr 1-3 a-c');
+  await expect(last(page)).toContainText('Command execution needs an isolated browser page');
+  await expect(page.evaluate(() => window.os.exec([['/usr/bin/seq', '1', '3']]))).rejects.toThrow(/isolated browser page/);
+  await run(page, 'echo still-responsive');
+  await expect(last(page)).toContainText('Command execution needs an isolated browser page');
 });
 
 test('a process reads one file after another; cp copies what the kernel makes, reading it', async ({ page }) => {

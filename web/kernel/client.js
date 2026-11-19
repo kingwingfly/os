@@ -447,6 +447,7 @@ async function dispatch(message, host, tab) {
     case 'proc_exec_preserve': await kernel.proc_exec_preserve(args.pid); return null;
     case 'proc_set_creds': kernel.proc_set_creds(args.pid, args.uid, args.gid, new Uint32Array(args.groups ?? []), args.token ?? undefined, args.cloudAccess !== false); return null;
     case 'proc_set_umask': return kernel.proc_set_umask(args.pid, args.umask);
+    case 'proc_close_server_fds': await kernel.proc_close_server_fds(args.pid); return null;
     case 'proc_exit': await kernel.proc_exit(args.pid); return null;
     case 'sys_chdir': await kernel.sys_chdir(args.pid, args.path); return null;
     case 'sys_fchdir': await kernel.sys_fchdir(args.pid, args.kfd); return null;
@@ -468,7 +469,11 @@ async function dispatch(message, host, tab) {
     case 'proc_linkat': await kernel.proc_linkat(args.pid, args.olddirfd, args.oldpath, args.newdirfd, args.newpath, !!args.follow); return null;
     case 'proc_symlinkat': await kernel.proc_symlinkat(args.pid, args.target, args.newdirfd, args.linkpath); return null;
     case 'proc_readlinkat': return await kernel.proc_readlinkat(args.pid, args.dirfd, args.path);
-    case 'proc_utimensat': await kernel.proc_utimensat(args.pid, args.dirfd, args.path, typeof args.atime === 'string' ? args.atime : JSON.stringify(args.atime), typeof args.mtime === 'string' ? args.mtime : JSON.stringify(args.mtime), args.follow !== false); return null;
+    case 'proc_utimensat': {
+      const encodeTime = v => (typeof v === 'string' && (v.startsWith('"') || v.startsWith('{'))) ? v : JSON.stringify(v ?? 'now');
+      await kernel.proc_utimensat(args.pid, args.dirfd, args.path, encodeTime(args.atime), encodeTime(args.mtime), args.follow !== false);
+      return null;
+    }
     case 'proc_sys': return JSON.parse(await kernel.proc_sys(args.pid, typeof args.batch === 'string' ? args.batch : JSON.stringify(args.batch)));
     case 'kfd_read': return await kernel.kfd_read(args.pid, args.kfd, args.len);
     case 'kfd_write': return await kernel.kfd_write(args.pid, args.kfd, args.data instanceof Uint8Array ? args.data : new Uint8Array(args.data));
@@ -478,6 +483,11 @@ async function dispatch(message, host, tab) {
     case 'kfd_readdir': return await kernel.kfd_readdir(args.pid, args.kfd);
     case 'kfd_fstat': return await kernel.kfd_fstat(args.pid, args.kfd);
     case 'kfd_ftruncate': await kernel.kfd_ftruncate(args.pid, args.kfd, BigInt(args.size ?? 0)); return null;
+    case 'kfd_futimens': {
+      const encodeTime = v => (typeof v === 'string' && (v.startsWith('"') || v.startsWith('{'))) ? v : JSON.stringify(v ?? 'now');
+      await kernel.kfd_futimens(args.pid, args.kfd, encodeTime(args.atime), encodeTime(args.mtime));
+      return null;
+    }
     case 'kfd_fsync': await kernel.kfd_fsync(args.pid, args.kfd, !!args.dataOnly); return null;
     case 'kfd_set_append': kernel.kfd_set_append(args.pid, args.kfd, !!args.append); return null;
     case 'kfd_is_append': return kernel.kfd_is_append(args.pid, args.kfd);

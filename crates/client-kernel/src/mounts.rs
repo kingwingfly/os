@@ -979,6 +979,12 @@ impl LocalMount {
                             if next.metadata.file_type == FileType::Symlink
                                 && (!is_last || follow_last || trailing_dir)
                             {
+                                if matches!(
+                                    fs.capabilities().identity,
+                                    abi::contract::IdentityScope::HostLocal
+                                ) {
+                                    return Err(Errno::ELOOP);
+                                }
                                 if !vfs::descriptions::may_follow_link(
                                     cred,
                                     &parent_entry.metadata,
@@ -1599,6 +1605,7 @@ impl LocalMount {
             "lastModified": last_modified_ms,
             "readOnly": self.state.grant.read_only || self.state.snapshot_data_ro,
             "executable": executable,
+            "nosymfollow": matches!(fs.capabilities().identity, abi::contract::IdentityScope::HostLocal),
             "fsId": fs.id().0,
             "vfs": st_val,
         });

@@ -949,14 +949,21 @@ const wasi = {
     throw new Errno(EINVAL);
   }),
   fd_filestat_set_times: (fd, atim, mtim, flags) => attempt(function* () {
-    let anchor = sentinelAnchor(fd);
-    if (anchor == null) {
-      const found = descriptor(fd);
-      anchor = found.preopen && found.kfd == null ? OS_FD_ROOT : found.kfd;
-    }
-    if (anchor == null) throw new Errno(EINVAL);
     const time = (value, set, now) => (flags & now) ? 'now' : (flags & set) ? { sec: Number(value / 1000000000n), nsec: Number(value % 1000000000n) } : 'omit';
-    vfsCall('utimensat', { dirfd: anchor, path: '.', atime: time(atim, 1, 2), mtime: time(mtim, 4, 8), follow: false });
+    const atime = time(atim, 1, 2);
+    const mtime = time(mtim, 4, 8);
+    const sentinel = sentinelAnchor(fd);
+    if (sentinel != null) {
+      vfsCall('utimensat', { dirfd: sentinel, path: '.', atime, mtime, follow: false });
+      return;
+    }
+    const found = descriptor(fd);
+    if (found.preopen && found.kfd == null) {
+      vfsCall('utimensat', { dirfd: OS_FD_ROOT, path: '.', atime, mtime, follow: false });
+      return;
+    }
+    if (found.kind !== 'kfd' || found.kfd == null) throw new Errno(EINVAL);
+    vfsCall('futimens', { kfd: found.kfd, atime, mtime });
   }),
   fd_pread: (fd, iovs, count, offset, nread) => attempt(function* () {
     const found = descriptor(fd);

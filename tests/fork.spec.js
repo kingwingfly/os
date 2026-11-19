@@ -411,8 +411,8 @@ test.describe('fork in the terminal', () => {
     // Nothing of them is left in the machine: every child was waited for.
     await command(page, 'ps');
     await expect(last(page)).not.toContainText('fork-');
-    // Their calls to the kernel went as the browser can make them.
-    expect([...calls]).toEqual([jspi ? 'fetch' : 'xhr']);
+    // Under L2, worker runtime calls bridge to client-kernel via Atomics/JSPI and hit the server via fetch (never raw XHR).
+    expect([...calls]).toEqual(['fetch']);
   });
 
   test('runtime exec diagnostics follow redirected stderr and leave stdout untouched', async ({ page, request }) => {

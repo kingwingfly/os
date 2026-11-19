@@ -140,7 +140,7 @@ export async function request(type, args, send, seatChanged = () => {}) {
   runs.set(args.run, run); run.seatChanged(); reportSeat();
   try {
     return await exec(args.stages, { ...args.options, terminalState,
-      workspace: managed ? null : await currentWorkspace(),
+      workspace: managed ? null : await currentWorkspace().catch(err => (!expectedSession && err?.errno === 'EIO') ? null : Promise.reject(err)),
       beforeStart: async (pid, image) => {
         if (expectedSession) checkExpectedSession(expectedSession, image);
         if (managed) await globalThis.kernelRequest('login_service_attach', { pid, expected: managed });

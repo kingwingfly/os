@@ -23,6 +23,7 @@ export class ShellSession {
       if (run.stopping) { this.message = 'Shell ended'; return { status: 130 }; }
       const result = await this.execute([['/usr/bin/sh', '-i']], {
         cwd: who.home, home: who.home, user: who.user, stdin: null, tty: true, terminalId: 'session-shell',
+        environment: { PS1: '${USER}@os:${PWD}' + (who.user === 'root' ? ' # ' : ' $ '), PS2: '> ' },
         expectedSession: this.expectedSession,
         // Once dash is reading, let its HUP handler finish. Cancelling the host run
         // would inject SIGINT while that cleanup is still doing filesystem I/O.

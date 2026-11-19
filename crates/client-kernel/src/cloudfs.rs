@@ -8,7 +8,7 @@
 use crate::{Kernel, State, fail};
 use abi::contract::FsCapabilities;
 use abi::remote_fs as wire;
-use abi::{Batch, Bytes, Call, Creds, Errno, Error, FdRef, Results, Return, Stat, Time};
+use abi::{BATCH_MAX, Batch, Bytes, Call, Creds, Errno, Error, FdRef, Results, Return, Stat, Time};
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -585,6 +585,43 @@ enum OpenRecord {
     },
 }
 
+#[derive(Default)]
+struct PageReadCache {
+    uid: u32,
+    sudo: bool,
+    mut_epoch: u64,
+    entries: HashMap<String, Entry>,
+    links: HashMap<String, Option<String>>,
+    missing: HashSet<String>,
+    complete_dirs: HashMap<String, Metadata>,
+    transport_err: Option<Errno>,
+}
+
+impl PageReadCache {
+    fn new(uid: u32, sudo: bool, mut_epoch: u64) -> Self {
+        Self {
+            uid,
+            sudo,
+            mut_epoch,
+            ..Self::default()
+        }
+    }
+}
+
+pub(crate) struct PageReadScope {
+    driver: Rc<RootCloudDriver>,
+}
+
+impl Drop for PageReadScope {
+    fn drop(&mut self) {
+        let next = self.driver.page_read_depth.get().saturating_sub(1);
+        self.driver.page_read_depth.set(next);
+        if next == 0 {
+            *self.driver.page_read_cache.borrow_mut() = None;
+        }
+    }
+}
+
 /// Unified `/` cloud filesystem driver mounted at the root of `system_mnt_ns`.
 pub(crate) struct RootCloudDriver {
     fs_id: FsId,
@@ -601,10 +638,14 @@ pub(crate) struct RootCloudDriver {
     canonical_nodes: RefCell<HashMap<String, NodeId>>,
     node_paths: RefCell<HashMap<NodeId, String>>,
     path_entries: RefCell<HashMap<String, Entry>>,
+    page_mut_epoch: Cell<u64>,
+    page_read_depth: Cell<u32>,
+    page_read_cache: RefCell<Option<PageReadCache>>,
     cloud_handles: RefCell<HashMap<NodeId, Handle>>,
     next_open: Cell<u64>,
     opens: RefCell<HashMap<u64, OpenRecord>>,
     page_locks: RefCell<HashMap<u64, Rc<PageLock>>>,
+    writing_by_ino: RefCell<HashMap<u64, abi::Writing>>,
 }
 
 impl RootCloudDriver {
@@ -689,11 +730,49 @@ impl RootCloudDriver {
             canonical_nodes: RefCell::new(HashMap::new()),
             node_paths: RefCell::new(node_paths),
             path_entries: RefCell::new(HashMap::new()),
+            page_mut_epoch: Cell::new(0),
+            page_read_depth: Cell::new(0),
+            page_read_cache: RefCell::new(None),
             cloud_handles: RefCell::new(HashMap::new()),
             next_open: Cell::new(1),
             opens: RefCell::new(HashMap::new()),
             page_locks: RefCell::new(HashMap::new()),
+            writing_by_ino: RefCell::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn writing_of(&self, ino: u64) -> Option<abi::Writing> {
+        self.writing_by_ino.borrow().get(&ino).cloned()
+    }
+
+    /// Parse and clear the internal `os.writing:<received>:<0|1>` wire tag from `Metadata.rdev`
+    /// on regular files before `os_vfs` sees it (so `Vfs::node_for_perm` never treats an uploading
+    /// file as a device node), caching any active `abi::Writing` status by inode.
+    fn strip_and_record_writing(&self, ino: u64, meta: &mut Metadata) {
+        if meta.file_type == FileType::File
+            && let Some(tag) = meta.rdev.as_deref()
+            && tag.starts_with("os.writing:")
+        {
+            let parsed = tag.strip_prefix("os.writing:").and_then(|rest| {
+                let (rec_s, flag_s) = rest.split_once(':')?;
+                let received = rec_s.parse::<u64>().ok()?;
+                let recording = match flag_s {
+                    "0" => false,
+                    "1" => true,
+                    _ => return None,
+                };
+                Some(abi::Writing {
+                    received,
+                    recording,
+                })
+            });
+            meta.rdev = None;
+            if let Some(w) = parsed {
+                self.writing_by_ino.borrow_mut().insert(ino, w);
+                return;
+            }
+        }
+        self.writing_by_ino.borrow_mut().remove(&ino);
     }
 
     pub(crate) fn is_remote_mode(&self) -> bool {
@@ -710,6 +789,154 @@ impl RootCloudDriver {
             fs: self.fs_id.clone(),
             node: NodeId { ino, generation: 1 },
             proof: String::new(),
+        }
+    }
+
+    pub(crate) fn fs_id(&self) -> &FsId {
+        &self.fs_id
+    }
+
+    pub(crate) fn uncached_page_paths(
+        &self,
+        paths: &[String],
+        uid: u32,
+        sudo: bool,
+    ) -> Vec<String> {
+        let epoch = self.page_mut_epoch.get();
+        let slot = self.page_read_cache.borrow();
+        let Some(cache) = slot.as_ref() else {
+            return Vec::new();
+        };
+        if cache.uid != uid || cache.sudo != sudo || cache.mut_epoch != epoch {
+            return Vec::new();
+        }
+        paths
+            .iter()
+            .filter(|p| !cache.entries.contains_key(*p) && !cache.missing.contains(*p))
+            .cloned()
+            .collect()
+    }
+
+    fn bump_page_mutation(&self) {
+        self.page_mut_epoch
+            .set(self.page_mut_epoch.get().wrapping_add(1));
+        *self.page_read_cache.borrow_mut() = None;
+    }
+
+    pub(crate) fn begin_page_read(self: &Rc<Self>, uid: u32, sudo: bool) -> PageReadScope {
+        let prev = self.page_read_depth.get();
+        self.page_read_depth.set(prev.saturating_add(1));
+        let epoch = self.page_mut_epoch.get();
+        let mut slot = self.page_read_cache.borrow_mut();
+        if prev == 0 {
+            *slot = Some(PageReadCache::new(uid, sudo, epoch));
+        } else if slot
+            .as_ref()
+            .is_some_and(|c| c.uid != uid || c.sudo != sudo || c.mut_epoch != epoch)
+        {
+            *slot = None;
+        }
+        PageReadScope {
+            driver: Rc::clone(self),
+        }
+    }
+
+    pub(crate) fn ensure_page_read_cache(&self, uid: u32, sudo: bool) -> bool {
+        if self.page_read_depth.get() == 0 {
+            return false;
+        }
+        let epoch = self.page_mut_epoch.get();
+        let mut slot = self.page_read_cache.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(PageReadCache::new(uid, sudo, epoch));
+            return true;
+        }
+        false
+    }
+
+    pub(crate) async fn prewarm_page_paths(
+        &self,
+        paths: &[String],
+        umask: u16,
+        uid: u32,
+        sudo: bool,
+    ) {
+        if installed("pageSysPost").is_err() || paths.is_empty() {
+            return;
+        }
+        let epoch = self.page_mut_epoch.get();
+        let to_fetch: Vec<String> = {
+            let slot = self.page_read_cache.borrow();
+            let Some(cache) = slot.as_ref() else {
+                return;
+            };
+            if cache.uid != uid || cache.sudo != sudo || cache.mut_epoch != epoch {
+                return;
+            }
+            paths
+                .iter()
+                .filter(|p| !cache.entries.contains_key(*p) && !cache.missing.contains(*p))
+                .cloned()
+                .collect()
+        };
+        if to_fetch.is_empty() {
+            return;
+        }
+        let fs_session = self.connector.current_session();
+        let fs_sess_ref = fs_session.as_ref().map(|(s, k)| (s.as_str(), k.as_str()));
+        for chunk in to_fetch.chunks(BATCH_MAX) {
+            let calls = chunk
+                .iter()
+                .map(|p| Call::Lstat { path: p.clone() })
+                .collect();
+            let results = match page_sys_batch_with_session(
+                Batch {
+                    calls,
+                    umask: Some(umask),
+                    sudo,
+                    pid: None,
+                    process: None,
+                },
+                fs_sess_ref,
+            )
+            .await
+            {
+                Ok(results) => results,
+                Err(err) => {
+                    let mut slot = self.page_read_cache.borrow_mut();
+                    if let Some(cache) = slot.as_mut()
+                        && cache.uid == uid
+                        && cache.sudo == sudo
+                        && cache.mut_epoch == epoch
+                    {
+                        cache.transport_err = Some(err);
+                    }
+                    return;
+                }
+            };
+            if self.page_mut_epoch.get() != epoch {
+                return;
+            }
+            for (path, ret) in chunk.iter().zip(results) {
+                match ret {
+                    Return::Ok(val) => {
+                        if let Ok(st) = serde_json::from_value::<Stat>(val) {
+                            self.record_path_stat(path, &st);
+                        }
+                    }
+                    Return::Err(err) if err.errno == Errno::ENOENT => {
+                        let mut slot = self.page_read_cache.borrow_mut();
+                        if let Some(cache) = slot.as_mut()
+                            && cache.uid == uid
+                            && cache.sudo == sudo
+                            && cache.mut_epoch == epoch
+                        {
+                            cache.missing.insert(path.clone());
+                        }
+                    }
+                    Return::Err(_) => {}
+                }
+            }
         }
     }
 
@@ -731,18 +958,115 @@ impl RootCloudDriver {
             },
             metadata: stat_to_metadata(st),
         };
+        if let Some(writing) = &st.writing {
+            self.writing_by_ino
+                .borrow_mut()
+                .insert(node.ino, writing.clone());
+        } else {
+            self.writing_by_ino.borrow_mut().remove(&node.ino);
+        }
         self.node_paths.borrow_mut().insert(node, path.to_string());
         self.path_entries
             .borrow_mut()
             .insert(path.to_string(), entry.clone());
+        let epoch = self.page_mut_epoch.get();
+        if let Some(cache) = self.page_read_cache.borrow_mut().as_mut()
+            && cache.mut_epoch == epoch
+        {
+            cache.missing.remove(path);
+            cache.entries.insert(path.to_string(), entry.clone());
+            cache.links.insert(path.to_string(), st.link.clone());
+        }
         entry
     }
 
-    fn wrap_cloud_entry(&self, real: Entry, known_path: Option<String>) -> Entry {
+    fn cached_page_entry(&self, cred: &Cred, path: &str) -> Option<Entry> {
+        let sudo = self.page_sudo.get();
+        let epoch = self.page_mut_epoch.get();
+        let slot = self.page_read_cache.borrow();
+        let cache = slot.as_ref()?;
+        if cache.uid != cred.identity.id || cache.sudo != sudo || cache.mut_epoch != epoch {
+            return None;
+        }
+        cache.entries.get(path).cloned()
+    }
+
+    fn cached_page_entry_for_open(
+        &self,
+        node: NodeId,
+        path: &str,
+        open_sudo: bool,
+    ) -> Option<Metadata> {
+        let sudo = self.page_sudo.get() || open_sudo;
+        let epoch = self.page_mut_epoch.get();
+        let slot = self.page_read_cache.borrow();
+        let cache = slot.as_ref()?;
+        if cache.sudo != sudo || cache.mut_epoch != epoch {
+            return None;
+        }
+        let _ = node;
+        cache.entries.get(path).map(|e| e.metadata.clone())
+    }
+
+    fn cached_page_transport_err(&self, cred: &Cred) -> Option<Errno> {
+        let sudo = self.page_sudo.get();
+        let epoch = self.page_mut_epoch.get();
+        let slot = self.page_read_cache.borrow();
+        let cache = slot.as_ref()?;
+        if cache.uid != cred.identity.id || cache.sudo != sudo || cache.mut_epoch != epoch {
+            return None;
+        }
+        cache.transport_err
+    }
+
+    fn lookup_page_cache(
+        &self,
+        cred: &Cred,
+        dir_path: &str,
+        child_path: &str,
+        name: &str,
+    ) -> Option<vfs::Result<Entry>> {
+        let sudo = self.page_sudo.get();
+        let epoch = self.page_mut_epoch.get();
+        let slot = self.page_read_cache.borrow();
+        let cache = slot.as_ref()?;
+        if cache.uid != cred.identity.id || cache.sudo != sudo || cache.mut_epoch != epoch {
+            return None;
+        }
+        if let Some(err) = cache.transport_err {
+            return Some(Err(err));
+        }
+        if let Some(entry) = cache.entries.get(child_path) {
+            return Some(Ok(entry.clone()));
+        }
+        if cache.missing.contains(child_path) {
+            return Some(Err(Errno::ENOENT));
+        }
+        if let Some(dir_meta) = cache.complete_dirs.get(dir_path)
+            && (name != "_" || (!dir_meta.acl && cred_permits_exec(dir_meta, cred)))
+        {
+            return Some(Err(Errno::ENOENT));
+        }
+        None
+    }
+
+    fn cached_page_link(&self, cred: &Cred, path: &str) -> Option<String> {
+        let sudo = self.page_sudo.get();
+        let epoch = self.page_mut_epoch.get();
+        let slot = self.page_read_cache.borrow();
+        let cache = slot.as_ref()?;
+        if cache.uid != cred.identity.id || cache.sudo != sudo || cache.mut_epoch != epoch {
+            return None;
+        }
+        cache.links.get(path).and_then(|v| v.clone())
+    }
+
+    fn wrap_cloud_entry(&self, mut real: Entry, known_path: Option<String>) -> Entry {
         let canon_node = known_path
             .as_deref()
             .and_then(|p| self.canonical_nodes.borrow().get(p).copied());
         let node = canon_node.unwrap_or(real.handle.node);
+        self.strip_and_record_writing(node.ino, &mut real.metadata);
         self.cloud_handles
             .borrow_mut()
             .insert(node, real.handle.clone());
@@ -937,10 +1261,11 @@ impl RootCloudDriver {
         if names.is_empty() {
             return Ok(cloud.fs.root());
         }
-        let walked = cloud.fs.walk(cred, &cloud.fs.root(), &names).await?;
+        let mut walked = cloud.fs.walk(cred, &cloud.fs.root(), &names).await?;
         let mut cur_path = String::new();
-        for (seg, entry) in names.iter().zip(walked.entries.iter()) {
+        for (seg, entry) in names.iter().zip(walked.entries.iter_mut()) {
             cur_path = format!("{cur_path}/{seg}");
+            self.strip_and_record_writing(entry.handle.node.ino, &mut entry.metadata);
             self.cloud_handles
                 .borrow_mut()
                 .insert(entry.handle.node, entry.handle.clone());
@@ -1210,6 +1535,7 @@ impl RootCloudDriver {
     }
 
     fn invalidate_page_path(&self, path: &str, subtree: bool) {
+        self.bump_page_mutation();
         let slash_prefix = format!("{path}/");
         self.path_entries
             .borrow_mut()
@@ -1231,6 +1557,7 @@ impl RootCloudDriver {
     }
 
     fn rename_page_paths(&self, old_prefix: &str, new_prefix: &str) {
+        self.bump_page_mutation();
         let slash_prefix = format!("{old_prefix}/");
         let new_slash = format!("{new_prefix}/");
         self.path_entries.borrow_mut().retain(|k, _| {
@@ -1259,6 +1586,7 @@ impl RootCloudDriver {
         sudo: bool,
         mutation: PageMutation<'_>,
     ) -> vfs::Result<Written> {
+        self.bump_page_mutation();
         let _guard = lock_page(self.page_lock_for(expected_node.ino)).await;
         for attempt in 0..3 {
             let st_val = self
@@ -1425,6 +1753,9 @@ impl Filesystem for RootCloudDriver {
             {
                 return Ok(cached);
             }
+            if let Some(hit) = self.lookup_page_cache(cred, &dir_path, &child_path, name) {
+                return hit;
+            }
             let sudo = self.page_sudo.get();
             let val = self
                 .page_sys_one(
@@ -1576,6 +1907,17 @@ impl Filesystem for RootCloudDriver {
             let Some((parent_path, name)) = split_cloud_parent(&path) else {
                 return Ok(None);
             };
+            if self.use_seed_cache.get()
+                && let Some(cached) = self.path_entries.borrow().get(&parent_path).cloned()
+            {
+                return Ok(Some((cached, name)));
+            }
+            if let Some(cached) = self.cached_page_entry(cred, &parent_path) {
+                return Ok(Some((cached, name)));
+            }
+            if let Some(err) = self.cached_page_transport_err(cred) {
+                return Err(err);
+            }
             let sudo = self.page_sudo.get();
             let val = self
                 .page_sys_one(
@@ -1608,12 +1950,14 @@ impl Filesystem for RootCloudDriver {
             }
             if self.has_cloud_token(cred) {
                 let (actor, cloud) = self.connect_cloud(cred).await?;
-                return self
+                let mut meta = self
                     .acted(actor, async {
                         let real = self.ensure_cloud_handle(&cloud, cred, handle).await?;
                         cloud.fs.metadata(cred, &real).await
                     })
-                    .await;
+                    .await?;
+                self.strip_and_record_writing(handle.node.ino, &mut meta);
+                return Ok(meta);
             }
             if (self.use_seed_cache.get() || installed("pageSysPost").is_err())
                 && let Some(path) = self.node_paths.borrow().get(&handle.node).cloned()
@@ -1622,6 +1966,12 @@ impl Filesystem for RootCloudDriver {
                 return Ok(cached.metadata);
             }
             let path = self.path_for_handle(handle)?;
+            if let Some(cached) = self.cached_page_entry(cred, &path) {
+                return Ok(cached.metadata);
+            }
+            if let Some(err) = self.cached_page_transport_err(cred) {
+                return Err(err);
+            }
             let sudo = self.page_sudo.get();
             let val = self
                 .page_sys_one(Call::Lstat { path: path.clone() }, Some(cred.umask), sudo)
@@ -1641,17 +1991,20 @@ impl Filesystem for RootCloudDriver {
             if !self.is_remote_mode() {
                 return self.mem.setattr(cred, handle, attr).await;
             }
+            self.bump_page_mutation();
             if self.is_cloud_denied(cred) {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
                 let (actor, cloud) = self.connect_cloud(cred).await?;
-                return self
+                let mut meta = self
                     .acted(actor, async {
                         let real = self.ensure_cloud_handle(&cloud, cred, handle).await?;
                         cloud.fs.setattr(cred, &real, attr).await
                     })
-                    .await;
+                    .await?;
+                self.strip_and_record_writing(handle.node.ino, &mut meta);
+                return Ok(meta);
             }
             let path = self.path_for_handle(handle)?;
             let sudo = self.page_sudo.get();
@@ -1702,6 +2055,7 @@ impl Filesystem for RootCloudDriver {
                 )
                 .await?;
             }
+            self.path_entries.borrow_mut().remove(&path);
             self.metadata(cred, handle).await
         })
     }
@@ -1738,6 +2092,9 @@ impl Filesystem for RootCloudDriver {
             }
 
             let dir_path = self.path_for_handle(dir)?;
+            if let Some(err) = self.cached_page_transport_err(cred) {
+                return Err(err);
+            }
             let sudo = self.page_sudo.get();
             let val = self
                 .page_sys_one(
@@ -1752,6 +2109,7 @@ impl Filesystem for RootCloudDriver {
                 .await?;
             let raw_entries: Vec<abi::Dirent> =
                 serde_json::from_value(val).map_err(|_| Errno::EIO)?;
+            let mut all_have_stat = true;
             let mut out = Vec::with_capacity(raw_entries.len());
             for item in raw_entries {
                 let child_path = join_cloud_path(&dir_path, &item.name);
@@ -1762,7 +2120,18 @@ impl Filesystem for RootCloudDriver {
                         node: recorded.handle.node,
                         file_type: recorded.metadata.file_type,
                     });
+                } else {
+                    all_have_stat = false;
                 }
+            }
+            if all_have_stat
+                && let Some(dir_entry) = self.cached_page_entry(cred, &dir_path)
+                && let Some(cache) = self.page_read_cache.borrow_mut().as_mut()
+                && cache.uid == cred.identity.id
+                && cache.sudo == sudo
+                && cache.mut_epoch == self.page_mut_epoch.get()
+            {
+                cache.complete_dirs.insert(dir_path, dir_entry.metadata);
             }
             Ok(out)
         })
@@ -1790,6 +2159,12 @@ impl Filesystem for RootCloudDriver {
                     .await;
             }
             let path = self.path_for_handle(link)?;
+            if let Some(target) = self.cached_page_link(cred, &path) {
+                return Ok(target);
+            }
+            if let Some(err) = self.cached_page_transport_err(cred) {
+                return Err(err);
+            }
             let sudo = self.page_sudo.get();
             let val = self
                 .page_sys_one(Call::Readlink { path }, Some(cred.umask), sudo)
@@ -1813,6 +2188,7 @@ impl Filesystem for RootCloudDriver {
                     self.alloc_open(entry.handle.node, oref.access, OpenRecord::Mem(oref));
                 return Ok((entry, wrapped));
             }
+            self.bump_page_mutation();
             check_component(name)?;
             if self.is_cloud_denied(cred) {
                 return Err(Errno::EACCES);
@@ -1908,6 +2284,7 @@ impl Filesystem for RootCloudDriver {
             if !self.is_remote_mode() {
                 return self.mem.mkdir(cred, dir, name, mode).await;
             }
+            self.bump_page_mutation();
             check_component(name)?;
             if self.is_cloud_denied(cred) {
                 return Err(Errno::EACCES);
@@ -1963,6 +2340,7 @@ impl Filesystem for RootCloudDriver {
             if !self.is_remote_mode() {
                 return self.mem.mknod(cred, dir, name, mode, rdev).await;
             }
+            self.bump_page_mutation();
             check_component(name)?;
             if self.is_cloud_denied(cred) {
                 return Err(Errno::EACCES);
@@ -2066,6 +2444,7 @@ impl Filesystem for RootCloudDriver {
             if !self.is_remote_mode() {
                 return self.mem.symlink(cred, dir, name, target).await;
             }
+            self.bump_page_mutation();
             check_component(name)?;
             if self.is_cloud_denied(cred) {
                 return Err(Errno::EACCES);
@@ -2120,6 +2499,7 @@ impl Filesystem for RootCloudDriver {
             if !self.is_remote_mode() {
                 return self.mem.link(cred, target, dir, name).await;
             }
+            self.bump_page_mutation();
             check_component(name)?;
             if self.is_cloud_denied(cred) {
                 return Err(Errno::EACCES);
@@ -2171,6 +2551,7 @@ impl Filesystem for RootCloudDriver {
             if !self.is_remote_mode() {
                 return self.mem.unlink(cred, dir, name).await;
             }
+            self.bump_page_mutation();
             check_component(name)?;
             if self.is_cloud_denied(cred) {
                 return Err(Errno::EACCES);
@@ -2209,6 +2590,7 @@ impl Filesystem for RootCloudDriver {
             if !self.is_remote_mode() {
                 return self.mem.rmdir(cred, dir, name).await;
             }
+            self.bump_page_mutation();
             check_component(name)?;
             if self.is_cloud_denied(cred) {
                 return Err(Errno::EACCES);
@@ -2258,6 +2640,7 @@ impl Filesystem for RootCloudDriver {
                     .rename(cred, from_dir, from, to_dir, to, flags)
                     .await;
             }
+            self.bump_page_mutation();
             check_component(from)?;
             check_component(to)?;
             if self.is_cloud_denied(cred) {
@@ -2352,6 +2735,7 @@ impl Filesystem for RootCloudDriver {
             if !self.is_remote_mode() {
                 return self.mem.setxattr(cred, handle, name, value, flags).await;
             }
+            self.bump_page_mutation();
             if self.is_cloud_denied(cred) {
                 return Err(Errno::EACCES);
             }
@@ -2425,6 +2809,7 @@ impl Filesystem for RootCloudDriver {
             if !self.is_remote_mode() {
                 return self.mem.removexattr(cred, handle, name).await;
             }
+            self.bump_page_mutation();
             if self.is_cloud_denied(cred) {
                 return Err(Errno::EACCES);
             }
@@ -2578,6 +2963,8 @@ impl Filesystem for RootCloudDriver {
                 .await?;
             }
             if options.is_truncate() && meta.is_file() {
+                self.bump_page_mutation();
+                self.path_entries.borrow_mut().remove(&path);
                 let _guard = lock_page(self.page_lock_for(handle.node.ino)).await;
                 let fs_session = self.connector.current_session();
                 write_whole_cloud_page(
@@ -2637,7 +3024,9 @@ impl Filesystem for RootCloudDriver {
                 MetaDispatch::Mem(m) => self.mem.open_metadata(&m).await,
                 MetaDispatch::Remote(cloud, real) => {
                     let actor = self.active_pid.get().map_or(Actor::None, Actor::Process);
-                    self.acted(actor, cloud.fs.open_metadata(&real)).await
+                    let mut meta = self.acted(actor, cloud.fs.open_metadata(&real)).await?;
+                    self.strip_and_record_writing(open.node.ino, &mut meta);
+                    Ok(meta)
                 }
                 MetaDispatch::Page(opt_path, node, open_sudo) => {
                     let path = opt_path
@@ -2648,6 +3037,9 @@ impl Filesystem for RootCloudDriver {
                             .cached_or_mem_carrier_entry(&path)
                             .map(|e| e.metadata)
                             .ok_or(Errno::EACCES);
+                    }
+                    if let Some(cached) = self.cached_page_entry_for_open(node, &path, open_sudo) {
+                        return Ok(cached);
                     }
                     let sudo = self.page_sudo.get() || open_sudo;
                     let val = self

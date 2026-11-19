@@ -427,6 +427,26 @@ test('a session\'s numbers are given once; sudo\'s descriptors stream as root; w
   expect(await root.sys({ mkdir: { path: '/sys/x', mode: 0o755 } })).toBe('EROFS');
 });
 
+const fsOrigin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
+async function fsRpc(ctx, credential, session, call) {
+  const response = await ctx.post(fsOrigin + '/api/fs', {
+    headers: { Origin: fsOrigin },
+    data: { version: 2, credential, session, call },
+  });
+  const body = await response.json();
+  return { ok: response.ok(), status: response.status(), body };
+}
+async function fsReadData(ctx, credential, pid, session, open, offset = 0, length = 64) {
+  const response = await ctx.post(fsOrigin + '/api/fs/data', {
+    headers: {
+      Origin: fsOrigin,
+      'X-OS-Filesystem': JSON.stringify({ version: 2, credential, pid, session, open, operation: { read: { offset, length } } }),
+    },
+    data: Buffer.alloc(0),
+  });
+  return { ok: response.ok(), status: response.status(), body: response.ok() ? await response.body() : await response.json() };
+}
+
 test('execve runs /usr binaries, snapshots the caller, and refuses what Linux refuses', async () => {
   // The test's directory, when only this test is selected.
   await root.batch([{ mkdir: { path: base, mode: 0o777 } }]);
@@ -441,9 +461,30 @@ test('execve runs /usr binaries, snapshots the caller, and refuses what Linux re
   // A process token cannot sign the browser out.
   const [logout] = await root.batch([{ logout: null }], { pid: exec.pid, proc: exec.token });
   expect(logout.err.errno).toBe('EPERM');
-  // Its calls run as its snapshot: root here, and what it makes is root's.
-  const [created] = await root.batch([{ mknod: { path: base + '/from-process', mode: 0o644 } }], { pid: exec.pid, proc: exec.token });
-  expect(created.ok).toBeNull();
+  // Direct v1 /api/sys path calls with { pid, proc } are refused at the server boundary;
+  // processes mutate cloud files via /api/fs v2 handles using their snapshotted identity.
+  const [deniedV1] = await root.batch([{ mknod: { path: base + '/from-process', mode: 0o644 } }], { pid: exec.pid, proc: exec.token });
+  expect(deniedV1.err.errno).toBe('EPERM');
+  const fsConn = await fsRpc(root.context, exec.token, null, 'connect');
+  expect(fsConn.ok, JSON.stringify(fsConn.body)).toBe(true);
+  const walkBase = await fsRpc(root.context, exec.token, fsConn.body.session, {
+    walk: { dir: fsConn.body.root, names: base.split('/').filter(Boolean) },
+  });
+  expect(walkBase.ok, JSON.stringify(walkBase.body)).toBe(true);
+  const baseHandle = walkBase.body.entries[walkBase.body.entries.length - 1].handle;
+  const created = await fsRpc(root.context, exec.token, fsConn.body.session, {
+    create: {
+      ticket: 'sys-from-process-' + Date.now(),
+      dir: baseHandle,
+      name: 'from-process',
+      mode: 0o644,
+      umask: 0o022,
+      options: { read: true, write: true, append: false, append_implies_write: false, truncate: false, create: true, create_new: true, exec: false, path: false },
+    },
+  });
+  expect(created.ok, JSON.stringify(created.body)).toBe(true);
+  await fsRpc(root.context, exec.token, fsConn.body.session, { release: { open: created.body[1] } });
+  await fsRpc(root.context, exec.token, fsConn.body.session, 'disconnect');
   expect((await root.sys({ stat: { path: base + '/from-process' } })).user).toBe('root');
   // exit and wait: the status is waitpid's 5 << 8.
   expect(await root.sys({ exit: { status: 5 } }, { pid: exec.pid, proc: exec.token })).toBeNull();
@@ -593,42 +634,52 @@ test('uploaded wasm execves, its image read by the process token alone', async (
 });
 
 test('a process uses its own descriptors, and a page its own: neither reaches the other\'s', async () => {
-  // Fresh sessions deliberately allocate the same number for two different files.
   const page = await session('root', rootPassword);
-  const path = '/tmp/process-close-' + Date.now().toString(36);
   try {
     const mine = await page.sys({ open: { path: '/etc/passwd', flags: 0 } });
     const exec = await page.sys({ execve: { path: '/usr/bin/coreutils', argv: ['coreutils', 'true'], env: [], cwd: '/' } });
     const as = { pid: exec.pid, proc: exec.token };
+    // Process credentials cannot read a page /api/sys descriptor, and direct v1 path opens from a process are refused.
     expect(await page.sys({ pread: { fd: mine.fd, count: 64 } }, as)).toBe('EBADF');
-    const own = await page.sys({ open: { path: '/etc/group', flags: 0 } }, as);
-    expect(own.fd).toBe(mine.fd);
-    const link = { readlink: { path: `/proc/self/fd/${own.fd}` } };
-    expect(await page.sys(link)).toBe('/etc/passwd');
-    expect(await page.sys(link, as)).toBe('/etc/group');
-    const read = options => page.sys({ pread: { fd: own.fd, offset: 0, count: 64 } }, options);
-    expect(Buffer.from((await read(as)).data, 'base64').toString()).toMatch(/^root:x:0:/);
-    expect(Buffer.from((await read()).data, 'base64').toString()).toMatch(/^root:x:0:0:/);
+    expect(await page.sys({ open: { path: '/etc/group', flags: 0 } }, as)).toBe('EPERM');
 
-    // Ending the line releases its writer's lease, so the page can resume and close it.
-    const writing = { path, flags: 0o1 | 0o100, mode: 0o600, size: 8, sha256: createHash('sha256').update('finished').digest('hex') };
-    const writer = await page.sys({ open: writing }, as);
-    expect(await page.sys({ pwrite: { fd: writer.fd, index: 0, data: Buffer.from('finished').toString('base64') } }, as)).toBeTruthy();
-    expect((await page.sys({ stat: { path } })).writing).toBeTruthy();
-    expect(await page.sys({ open: writing })).toBe('EBUSY');
+    // Process opens /etc/group via its own /api/fs v2 session and OpenRef, isolated from the page's fd table.
+    const fsConn = await fsRpc(page.context, exec.token, null, 'connect');
+    expect(fsConn.ok, JSON.stringify(fsConn.body)).toBe(true);
+    const groupWalk = await fsRpc(page.context, exec.token, fsConn.body.session, {
+      walk: { dir: fsConn.body.root, names: ['etc', 'group'] },
+    });
+    expect(groupWalk.ok, JSON.stringify(groupWalk.body)).toBe(true);
+    const groupOpen = await fsRpc(page.context, exec.token, fsConn.body.session, {
+      open: {
+        ticket: 'sys-own-' + Date.now(),
+        handle: groupWalk.body.entries[1].handle,
+        options: { read: true, write: false, append: false, append_implies_write: false, truncate: false, create: false, create_new: false, exec: false, path: false },
+      },
+    });
+    expect(groupOpen.ok, JSON.stringify(groupOpen.body)).toBe(true);
+    const groupBytes = await fsReadData(page.context, exec.token, exec.pid, fsConn.body.session, groupOpen.body);
+    expect(groupBytes.ok).toBe(true);
+    expect(groupBytes.body.toString()).toMatch(/^root:x:0:/);
+
+    // Another credential cannot use the process's /api/fs session/OpenRef, and the page's fd still points to /etc/passwd.
+    const hijack = await fsReadData(page.context, 'forged-token', exec.pid, fsConn.body.session, groupOpen.body);
+    expect(hijack.ok).toBe(false);
+    expect(['EACCES', 'EPERM']).toContain(hijack.body.errno);
+    const link = { readlink: { path: `/proc/self/fd/${mine.fd}` } };
+    expect(await page.sys(link)).toBe('/etc/passwd');
+    expect(Buffer.from((await page.sys({ pread: { fd: mine.fd, offset: 0, count: 64 } })).data, 'base64').toString()).toMatch(/^root:x:0:0:/);
+
+    // Exiting and reaping the process revokes its /api/fs access while leaving the page's descriptor intact.
     expect(await page.sys({ exit: { status: 0 } }, as)).toBeNull();
     expect((await page.sys({ wait: { pid: String(exec.pid) } }, {}, true)).pid).toBe(exec.pid);
-    const resumed = await page.sys({ open: writing });
-    expect(resumed, JSON.stringify(resumed)).toMatchObject({ resumed: true });
-    expect(await page.sys({ close: { fd: resumed.fd } })).toMatchObject({ size: 8 });
-    expect((await page.sys({ stat: { path } })).writing).toBeUndefined();
-    expect(await (await page.context.get(`/api/file?path=${path}`)).text()).toBe('finished');
-    expect(await read(as)).toBe('EPERM');
+    const afterExit = await fsReadData(page.context, exec.token, exec.pid, fsConn.body.session, groupOpen.body);
+    expect(afterExit.ok).toBe(false);
+    expect(['EACCES', 'EPERM']).toContain(afterExit.body.errno);
     expect(await page.sys(link)).toBe('/etc/passwd');
     expect((await page.sys({ getdents: { path: '/proc/self/fd' } })).map(entry => entry.name)).toEqual([String(mine.fd)]);
     expect(await page.sys({ close: { fd: mine.fd } })).toBeTruthy();
   } finally {
-    await rmrf(page.context, path);
     await page.context.dispose();
   }
 });
@@ -641,10 +692,25 @@ test('a process keeps its descriptors and credentials when its page changes acco
     expect(await page.sys({ chmod: { path, mode: 0o600 } })).toBeNull();
     const exec = await page.sys({ execve: { path: '/usr/bin/coreutils', argv: ['coreutils', 'true'], env: [], cwd: '/' } });
     const as = { pid: exec.pid, proc: exec.token };
-    const opened = await page.sys({ open: { path, flags: 0 } }, as);
+    const fsConn = await fsRpc(page.context, exec.token, null, 'connect');
+    expect(fsConn.ok, JSON.stringify(fsConn.body)).toBe(true);
+    const walkFile = await fsRpc(page.context, exec.token, fsConn.body.session, {
+      walk: { dir: fsConn.body.root, names: path.split('/').filter(Boolean) },
+    });
+    expect(walkFile.ok, JSON.stringify(walkFile.body)).toBe(true);
+    const opened = await fsRpc(page.context, exec.token, fsConn.body.session, {
+      open: {
+        ticket: 'sys-account-' + Date.now(),
+        handle: walkFile.body.entries[walkFile.body.entries.length - 1].handle,
+        options: { read: true, write: false, append: false, append_implies_write: false, truncate: false, create: false, create_new: false, exec: false, path: false },
+      },
+    });
+    expect(opened.ok, JSON.stringify(opened.body)).toBe(true);
     const before = await page.sys('getcreds', as);
-    const read = () => page.sys({ pread: { fd: opened.fd, offset: 0, count: 64 } }, as);
-    expect(Buffer.from((await read()).data, 'base64').toString()).toBe('root-only content');
+    const read = () => fsReadData(page.context, exec.token, exec.pid, fsConn.body.session, opened.body);
+    const first = await read();
+    expect(first.ok).toBe(true);
+    expect(first.body.toString()).toBe('root-only content');
     expect((await api(page.context, 'login', { data: { username: name, password } })).ok()).toBe(true);
     expect((await page.sys('getcreds')).user).toBe(name);
     expect(await page.sys({ open: { path, flags: 0 } })).toBe('EACCES');
@@ -652,13 +718,14 @@ test('a process keeps its descriptors and credentials when its page changes acco
       uid: before.uid, user: before.user, gid: before.gid, group: before.group,
       groups: before.groups, home: before.home,
     });
-    expect(Buffer.from((await read()).data, 'base64').toString()).toBe('root-only content');
-    const streamed = await page.context.get(`/api/file?token=${opened.token}`, { headers: { 'X-Process-Token': exec.token } });
-    expect(streamed.status()).toBe(200);
-    expect(await streamed.text()).toBe('root-only content');
+    const afterLogin = await read();
+    expect(afterLogin.ok).toBe(true);
+    expect(afterLogin.body.toString()).toBe('root-only content');
     expect(await page.sys({ exit: { status: 0 } }, as)).toBeNull();
     expect((await page.sys({ wait: { pid: String(exec.pid), proc: exec.token } }, {}, true)).pid).toBe(exec.pid);
-    expect(await read()).toBe('EPERM');
+    const afterExit = await read();
+    expect(afterExit.ok).toBe(false);
+    expect(['EACCES', 'EPERM']).toContain(afterExit.body.errno);
   } finally {
     await rmrf(root.context, path);
     await page.context.dispose();

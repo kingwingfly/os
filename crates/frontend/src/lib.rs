@@ -658,8 +658,8 @@ fn App() -> impl IntoView {
                                 let (index, shell) = item;
                                 let id = shell.id;
                                 view! {
-                                    <span class="tab" role="tab" aria-selected=move || (active.get() == id).to_string()>
-                                        <button type="button" class="tab-select" title=move || format!("Alt+{} · {}", index + 1, shell.cwd.get()) on:click=move |_| switch(id)>
+                                    <span class="tab">
+                                        <button type="button" class="tab-select" role="tab" aria-selected=move || (active.get() == id).to_string() title=move || format!("Alt+{} · {}", index + 1, shell.cwd.get()) on:click=move |_| switch(id)>
                                             {move || format!("{} {}", index + 1, shell.cwd.get().rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("/"))}
                                         </button>
                                         <Show when=move || { tabs.with(|t| t.len() > 1) }>

@@ -862,7 +862,17 @@ test('Contract 4 serviceGrant (system/isolated/session), streamed vfs_open_read,
     gid: 0,
     groups: [0],
   }));
-  await k.proc_mkdirat(503, OS_FD_ROOT, '/tmp/svc-ro', 0o755);
+  // Root-owned mount target cannot be bound by non-root user unit (Contract 2 -> EPERM);
+  // user-owned target (/tmp/svc-ro created by uid 1000) succeeds while keeping inherited kfd.
+  await k.proc_mkdirat(503, OS_FD_ROOT, '/tmp/root-only-svc', 0o755);
+  await expectErrno(
+    () => k.proc_apply_service_grant(502, 500, JSON.stringify({
+      mountNamespace: 'session',
+      bindMounts: [{ source: '/mnt/local/proj', target: '/tmp/root-only-svc', readOnly: true }],
+    })),
+    'EPERM',
+  );
+  await k.proc_mkdirat(500, OS_FD_ROOT, '/tmp/svc-ro', 0o755);
 
   await k.proc_apply_service_grant(502, 500, JSON.stringify({
     mountNamespace: 'session',
@@ -909,4 +919,140 @@ test('Contract 4 serviceGrant (system/isolated/session), streamed vfs_open_read,
   await k.vfs_close_read_stream(openedStream.streamId);
   assert.equal(parts.length, bigSize);
   assert.equal(parts[299999], 299999 & 0xff);
+});
+
+test('Contract 1: eval_fchmod and kfd_futimens enforce caller Cred, O_PATH EBADF, and MS_RDONLY EROFS via fsetattr', async t => {
+  const h = createHarness(t);
+  const sid = 'sess-contract1';
+  await h.beginSession(sid, 1000, 1000, [1000]);
+
+  const opfsStore = await createOpfsStore(null, { writable: true, execute: false });
+  await h.k.mount_user(
+    sid,
+    JSON.stringify({ kind: 'opfs', name: 'u1', writable: true, execute: false, cloud: false }),
+    opfsStore,
+  );
+
+  await h.spawn({
+    pid: 5100,
+    uid: 1000,
+    gid: 1000,
+    groups: [1000],
+    sessionId: sid,
+  });
+
+  // Open a regular writable kfd and an O_PATH kfd as uid 1000.
+  const O_PATH = 0o10000000;
+  const rwOpen = await h.k.proc_openat(
+    5100,
+    OS_FD_ROOT,
+    '/mnt/local/u1/target.txt',
+    O_RDWR | O_CREAT | O_TRUNC,
+    0o644,
+    false,
+  );
+  const rwKfd = rwOpen.kfd;
+  const pathOpen = await h.k.proc_openat(
+    5100,
+    OS_FD_ROOT,
+    '/mnt/local/u1/target.txt',
+    O_PATH,
+    0,
+    false,
+  );
+  const pathKfd = pathOpen.kfd;
+
+  // Regular kfd: kfd_futimens updates mtime and Fchmod via proc_sys updates mode.
+  const omit = JSON.stringify('omit');
+  const now = JSON.stringify('now');
+  const targetTs = JSON.stringify({ sec: 1700000123, nsec: 456000000 });
+  await h.k.kfd_futimens(5100, rwKfd, omit, targetTs);
+  const fchmodRes = JSON.parse(await h.k.proc_sys(
+    5100,
+    JSON.stringify({ calls: [{ fchmod: { fd: rwKfd, mode: 0o600 } }] }),
+  ));
+  assert.equal(fchmodRes.results[0].ok, null);
+  const stAfter = await h.k.kfd_fstat(5100, rwKfd);
+  assert.equal(stAfter.mode & 0o777, 0o600);
+  assert.equal(stAfter.mtime, 1700000123);
+  assert.equal(stAfter.mtime_nsec, 456000000);
+
+  // O_PATH kfd: kfd_futimens and Fchmod both return EBADF.
+  await expectErrno(() => h.k.kfd_futimens(5100, pathKfd, omit, now), 'EBADF');
+  const pathFchmod = JSON.parse(await h.k.proc_sys(
+    5100,
+    JSON.stringify({ calls: [{ fchmod: { fd: pathKfd, mode: 0o644 } }] }),
+  ));
+  assert.equal(pathFchmod.results[0].err.errno, 'EBADF');
+
+  // Fork and escalate child credentials to uid 0 while keeping inherited rwKfd:
+  // FileRef::setattr_as must evaluate caller Cred (uid 0 != owner_uid 1000) -> EACCES.
+  h.fork(5100, 5101, 0);
+  h.k.proc_set_creds(5101, 0, 0, new Uint32Array([0]), null, false);
+  await expectErrno(() => h.k.kfd_futimens(5101, rwKfd, omit, now), 'EACCES');
+  const escalatedFchmod = JSON.parse(await h.k.proc_sys(
+    5101,
+    JSON.stringify({ calls: [{ fchmod: { fd: rwKfd, mode: 0o644 } }] }),
+  ));
+  assert.equal(escalatedFchmod.results[0].err.errno, 'EACCES');
+
+  // Remount MS_RDONLY as uid 1000 (preserving locked MS_NOSUID | MS_NODEV | MS_NOEXEC):
+  // fails with EBUSY while writable rwKfd is open, then succeeds once closed;
+  // page fd eval_fchmod and kfd_futimens return EROFS.
+  await expectErrno(
+    () => h.k.sys_mount(5100, '', '/mnt/local/u1', '', 1n | 2n | 4n | 8n | 32n, ''),
+    'EBUSY',
+  );
+  await h.k.kfd_close(5101, rwKfd);
+  await h.k.kfd_close(5100, rwKfd);
+  const roOpen = await h.k.proc_openat(
+    5100,
+    OS_FD_ROOT,
+    '/mnt/local/u1/target.txt',
+    O_RDONLY,
+    0,
+    false,
+  );
+  const roKfd = roOpen.kfd;
+  await h.k.sys_mount(5100, '', '/mnt/local/u1', '', 1n | 2n | 4n | 8n | 32n, '');
+  const pageOpen = JSON.parse(await h.k.vfs_sys(
+    sid,
+    JSON.stringify({
+      calls: [
+        {
+          open: {
+            path: '/mnt/local/u1/target.txt',
+            flags: O_RDONLY,
+            mode: 0o644,
+          },
+        },
+        {
+          open: {
+            path: '/mnt/local/u1/target.txt',
+            flags: O_PATH,
+            mode: 0o644,
+          },
+        },
+      ],
+    }),
+  ));
+  const pageReadFd = pageOpen.results[0].ok.fd;
+  const pagePathFd = pageOpen.results[1].ok.fd;
+  const pageRes = JSON.parse(await h.k.vfs_sys(
+    sid,
+    JSON.stringify({
+      calls: [
+        { fchmod: { fd: pageReadFd, mode: 0o644 } },
+        { fchmod: { fd: pagePathFd, mode: 0o644 } },
+        { close: { fd: pageReadFd } },
+        { close: { fd: pagePathFd } },
+      ],
+    }),
+  ));
+  assert.equal(pageRes.results[0].err.errno, 'EROFS');
+  assert.equal(pageRes.results[1].err.errno, 'EBADF');
+  await expectErrno(() => h.k.kfd_futimens(5100, roKfd, now, now), 'EROFS');
+
+  await h.k.kfd_close(5100, roKfd);
+  await h.k.kfd_close(5100, pathKfd);
 });

@@ -7,7 +7,8 @@
 //! `vfs_sys`, and `proc_resolve_exec`.
 
 use crate::cloudfs::{
-    RootCloudDriver, installed, page_sys_batch, page_sys_batch_with_session, promised,
+    PageReadScope, RootCloudDriver, installed, page_sys_batch, page_sys_batch_with_session,
+    promised,
 };
 use crate::mounts::{Grant, LocalMount, errno_code};
 use crate::share_bridge::build_share_backing;
@@ -488,6 +489,944 @@ impl ProcProvider for BrowserProcProvider {
     }
 }
 
+const PROC_GENERATION: u64 = 1;
+const PROC_ROOT_INO: u64 = 1;
+const PROC_REMOTE_TAG: u64 = 8;
+const PROC_REMOTE_OPEN_BIT: u64 = 1 << 63;
+
+fn proc_is_remote_ino(ino: u64) -> bool {
+    ino <= abi::fs::JS_SAFE && (ino >> 48) == PROC_REMOTE_TAG
+}
+
+fn proc_is_local_only_root_child(name: &str) -> bool {
+    name == "mounts"
+        || name == "self"
+        || name.parse::<u32>().is_ok_and(|pid| pid.to_string() == name)
+}
+
+fn proc_file_type_from_mode(mode: u32) -> FileType {
+    match mode & abi::S_IFMT {
+        abi::S_IFDIR => FileType::Dir,
+        abi::S_IFLNK => FileType::Symlink,
+        abi::S_IFCHR => FileType::CharDevice,
+        _ => FileType::File,
+    }
+}
+
+fn proc_metadata_from_stat(st: &abi::Stat) -> vfs::Metadata {
+    vfs::Metadata {
+        file_type: proc_file_type_from_mode(st.mode),
+        mode: (st.mode & 0o7777) as u16,
+        nlink: st.nlink,
+        uid: st.uid,
+        gid: st.gid,
+        size: st.size,
+        atime: Timespec {
+            sec: st.atime,
+            nsec: st.atime_nsec,
+        },
+        mtime: Timespec {
+            sec: st.mtime,
+            nsec: st.mtime_nsec,
+        },
+        ctime: Timespec {
+            sec: st.ctime,
+            nsec: st.ctime_nsec,
+        },
+        rdev: st.rdev.clone(),
+        acl: st.acl,
+    }
+}
+
+struct BrowserProcOpen {
+    ino: u64,
+    access: vfs::Access,
+    bytes: Option<Vec<u8>>,
+    metadata: vfs::Metadata,
+}
+
+struct BrowserProcState {
+    next_remote_id: u64,
+    paths: HashMap<u64, String>,
+    path_to_ino: HashMap<String, u64>,
+    parents: HashMap<u64, (u64, String)>,
+    next_open: u64,
+    opens: HashMap<u64, BrowserProcOpen>,
+}
+
+impl Default for BrowserProcState {
+    fn default() -> Self {
+        Self {
+            next_remote_id: 1,
+            paths: HashMap::new(),
+            path_to_ino: HashMap::new(),
+            parents: HashMap::new(),
+            next_open: 1,
+            opens: HashMap::new(),
+        }
+    }
+}
+
+impl BrowserProcState {
+    fn intern_remote(&mut self, parent_ino: u64, name: &str, path: &str) -> vfs::Result<u64> {
+        if let Some(&ino) = self.path_to_ino.get(path) {
+            self.parents
+                .entry(ino)
+                .or_insert_with(|| (parent_ino, name.to_string()));
+            return Ok(ino);
+        }
+        let seq = self.next_remote_id;
+        if seq > 0xffff_ffff_ffff {
+            return Err(Errno::ENOSPC);
+        }
+        self.next_remote_id += 1;
+        let ino = (PROC_REMOTE_TAG << 48) | seq;
+        self.paths.insert(ino, path.to_string());
+        self.path_to_ino.insert(path.to_string(), ino);
+        self.parents.insert(ino, (parent_ino, name.to_string()));
+        Ok(ino)
+    }
+}
+
+/// Wrapper over [`ProcFs`] delegating non-numeric `/proc/<job-id>` directory hierarchies
+/// (`/proc/<job>/{status,cmdline,fd,fd/<n>}`) to `/api/sys` while keeping local PID and namespace
+/// entries inside `os_vfs::ProcFs`.
+pub(crate) struct BrowserProcFs {
+    fs_id: FsId,
+    inner: Rc<ProcFs<BrowserProcProvider>>,
+    provider: BrowserProcProvider,
+    state: RefCell<BrowserProcState>,
+}
+
+impl BrowserProcFs {
+    fn new(
+        fs_id: FsId,
+        inner: Rc<ProcFs<BrowserProcProvider>>,
+        provider: BrowserProcProvider,
+    ) -> Self {
+        Self {
+            fs_id,
+            inner,
+            provider,
+            state: RefCell::new(BrowserProcState::default()),
+        }
+    }
+
+    fn handle(&self, ino: u64) -> Handle {
+        Handle {
+            fs: self.fs_id.clone(),
+            node: NodeId {
+                ino,
+                generation: PROC_GENERATION,
+            },
+            proof: String::new(),
+        }
+    }
+
+    fn check_remote_handle(&self, handle: &Handle) -> vfs::Result<String> {
+        if handle.fs != self.fs_id || !handle.proof.is_empty() {
+            return Err(Errno::EACCES);
+        }
+        if handle.node.generation != PROC_GENERATION {
+            return Err(Errno::ESTALE);
+        }
+        if !proc_is_remote_ino(handle.node.ino) {
+            return Err(Errno::ESTALE);
+        }
+        self.state
+            .borrow()
+            .paths
+            .get(&handle.node.ino)
+            .cloned()
+            .ok_or(Errno::ESTALE)
+    }
+
+    async fn remote_meta(&self, cred: &Cred, path: &str) -> vfs::Result<vfs::Metadata> {
+        let val = self
+            .provider
+            .proc_call(
+                cred,
+                Call::Lstat {
+                    path: path.to_string(),
+                },
+            )
+            .await?;
+        let st: abi::Stat = serde_json::from_value(val).map_err(|_| Errno::EIO)?;
+        Ok(proc_metadata_from_stat(&st))
+    }
+
+    async fn lookup_remote(
+        &self,
+        cred: &Cred,
+        parent_ino: u64,
+        parent_path: &str,
+        name: &str,
+    ) -> vfs::Result<vfs::Entry> {
+        check_component(name)?;
+        let child_path = format!("{parent_path}/{name}");
+        let metadata = self.remote_meta(cred, &child_path).await?;
+        let ino = self
+            .state
+            .borrow_mut()
+            .intern_remote(parent_ino, name, &child_path)?;
+        Ok(vfs::Entry {
+            handle: self.handle(ino),
+            metadata,
+        })
+    }
+
+    async fn walk_via_lookup(
+        &self,
+        cred: &Cred,
+        dir: &Handle,
+        names: &[String],
+    ) -> vfs::Result<vfs::Walked> {
+        for name in names {
+            check_component(name)?;
+        }
+        let cur_meta = self.metadata(cred, dir).await?;
+        if !cur_meta.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        let mut cur_handle = dir.clone();
+        let mut cur_type = FileType::Dir;
+        let mut entries = Vec::new();
+        for (idx, name) in names.iter().enumerate() {
+            if idx > 0 {
+                let stop = match cur_type {
+                    FileType::Dir => None,
+                    FileType::Symlink => Some(vfs::Stop::Symlink(idx - 1)),
+                    _ => Some(vfs::Stop::NotDirectory(idx - 1)),
+                };
+                if stop.is_some() {
+                    return Ok(vfs::Walked { entries, stop });
+                }
+            }
+            match self.lookup(cred, &cur_handle, name).await {
+                Ok(entry) => {
+                    cur_handle = entry.handle.clone();
+                    cur_type = entry.metadata.file_type;
+                    entries.push(entry);
+                }
+                Err(Errno::ENOENT) => {
+                    return Ok(vfs::Walked {
+                        entries,
+                        stop: Some(vfs::Stop::Missing(idx)),
+                    });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vfs::Walked {
+            entries,
+            stop: None,
+        })
+    }
+}
+
+impl Filesystem for BrowserProcFs {
+    fn id(&self) -> &FsId {
+        &self.fs_id
+    }
+
+    fn capabilities(&self) -> abi::contract::FsCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn root(&self) -> Handle {
+        self.inner.root()
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, vfs::Entry> {
+        Box::pin(async move {
+            if proc_is_remote_ino(dir.node.ino) {
+                let parent_path = self.check_remote_handle(dir)?;
+                if !self.remote_meta(cred, &parent_path).await?.is_dir() {
+                    return Err(Errno::ENOTDIR);
+                }
+                return self
+                    .lookup_remote(cred, dir.node.ino, &parent_path, name)
+                    .await;
+            }
+            check_component(name)?;
+            if dir.node.ino == PROC_ROOT_INO && !proc_is_local_only_root_child(name) {
+                return self.lookup_remote(cred, PROC_ROOT_INO, "/proc", name).await;
+            }
+            let entry = self.inner.lookup(cred, dir, name).await?;
+            // Promote dynamic directory entries under a remote numeric PID (`TAG_PID_DYN = 5`)
+            // so `fd/<n>` inside remote PID directories can be traversed too.
+            if entry.metadata.is_dir()
+                && ((entry.handle.node.ino >> 48) == 5 || (entry.handle.node.ino >> 48) == 1)
+                && (dir.node.ino >> 48) == 2
+                && (dir.node.ino & 0xffff) == 0
+            {
+                let pid = ((dir.node.ino >> 16) & 0xffff_ffff) as u32;
+                let path = format!("/proc/{pid}/{name}");
+                let ino = self
+                    .state
+                    .borrow_mut()
+                    .intern_remote(dir.node.ino, name, &path)?;
+                return Ok(vfs::Entry {
+                    handle: self.handle(ino),
+                    metadata: entry.metadata,
+                });
+            }
+            Ok(entry)
+        })
+    }
+
+    fn walk<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        names: &'a [String],
+    ) -> BoxFuture<'a, vfs::Walked> {
+        Box::pin(async move {
+            if proc_is_remote_ino(dir.node.ino) {
+                return self.walk_via_lookup(cred, dir, names).await;
+            }
+            if dir.node.ino == PROC_ROOT_INO
+                && names
+                    .first()
+                    .is_some_and(|n| !proc_is_local_only_root_child(n))
+            {
+                return self.walk_via_lookup(cred, dir, names).await;
+            }
+            match self.inner.walk(cred, dir, names).await {
+                Ok(mut walked) => {
+                    if dir.node.ino == PROC_ROOT_INO
+                        && let Some(first) = walked.entries.first_mut()
+                        && first.metadata.is_dir()
+                        && ((first.handle.node.ino >> 48) == 1
+                            || (first.handle.node.ino >> 48) == 5)
+                    {
+                        return self.walk_via_lookup(cred, dir, names).await;
+                    }
+                    Ok(walked)
+                }
+                Err(Errno::ENOTDIR) if names.len() > 1 => {
+                    self.walk_via_lookup(cred, dir, names).await
+                }
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    fn parent<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+    ) -> BoxFuture<'a, Option<(vfs::Entry, String)>> {
+        Box::pin(async move {
+            if !proc_is_remote_ino(dir.node.ino) {
+                return self.inner.parent(cred, dir).await;
+            }
+            let _ = self.check_remote_handle(dir)?;
+            let parent = self.state.borrow().parents.get(&dir.node.ino).cloned();
+            let Some((parent_ino, name)) = parent else {
+                return Ok(None);
+            };
+            let parent_handle = self.handle(parent_ino);
+            let metadata = self.metadata(cred, &parent_handle).await?;
+            Ok(Some((
+                vfs::Entry {
+                    handle: parent_handle,
+                    metadata,
+                },
+                name,
+            )))
+        })
+    }
+
+    fn metadata<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, vfs::Metadata> {
+        Box::pin(async move {
+            if proc_is_remote_ino(handle.node.ino) {
+                let path = self.check_remote_handle(handle)?;
+                return self.remote_meta(cred, &path).await;
+            }
+            self.inner.metadata(cred, handle).await
+        })
+    }
+
+    fn setattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        attr: &'a SetAttr,
+    ) -> BoxFuture<'a, vfs::Metadata> {
+        Box::pin(async move {
+            if proc_is_remote_ino(handle.node.ino) {
+                let path = self.check_remote_handle(handle)?;
+                let meta = self.remote_meta(cred, &path).await?;
+                if *attr == SetAttr::default() {
+                    return Ok(meta);
+                }
+                return Err(Errno::EPERM);
+            }
+            self.inner.setattr(cred, handle, attr).await
+        })
+    }
+
+    fn read_dir<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+    ) -> BoxFuture<'a, Vec<vfs::DirEntry>> {
+        Box::pin(async move {
+            if proc_is_remote_ino(dir.node.ino) {
+                let dir_path = self.check_remote_handle(dir)?;
+                if !self.remote_meta(cred, &dir_path).await?.is_dir() {
+                    return Err(Errno::ENOTDIR);
+                }
+                let val = self
+                    .provider
+                    .proc_call(
+                        cred,
+                        Call::Getdents {
+                            path: dir_path.clone(),
+                            cookie: 0,
+                            count: None,
+                        },
+                    )
+                    .await?;
+                let entries: Vec<Dirent> = serde_json::from_value(val).map_err(|_| Errno::EIO)?;
+                let mut state = self.state.borrow_mut();
+                let mut out = Vec::with_capacity(entries.len());
+                for de in entries {
+                    if de.name == "." || de.name == ".." {
+                        continue;
+                    }
+                    let child_path = format!("{dir_path}/{}", de.name);
+                    let ino = state.intern_remote(dir.node.ino, &de.name, &child_path)?;
+                    let file_type = de
+                        .stat
+                        .as_ref()
+                        .map(|s| proc_file_type_from_mode(s.mode))
+                        .unwrap_or(FileType::File);
+                    out.push(vfs::DirEntry {
+                        name: de.name,
+                        node: NodeId {
+                            ino,
+                            generation: PROC_GENERATION,
+                        },
+                        file_type,
+                    });
+                }
+                return Ok(out);
+            }
+            let mut entries = self.inner.read_dir(cred, dir).await?;
+            if dir.node.ino == PROC_ROOT_INO {
+                let mut state = self.state.borrow_mut();
+                for de in &mut entries {
+                    if !proc_is_local_only_root_child(&de.name) {
+                        let child_path = format!("/proc/{}", de.name);
+                        de.node.ino = state.intern_remote(PROC_ROOT_INO, &de.name, &child_path)?;
+                    }
+                }
+            }
+            Ok(entries)
+        })
+    }
+
+    fn read_link<'a>(&'a self, cred: &'a Cred, link: &'a Handle) -> BoxFuture<'a, String> {
+        Box::pin(async move {
+            if proc_is_remote_ino(link.node.ino) {
+                let path = self.check_remote_handle(link)?;
+                let val = self
+                    .provider
+                    .proc_call(cred, Call::Readlink { path })
+                    .await?;
+                return serde_json::from_value::<String>(val).map_err(|_| Errno::EIO);
+            }
+            self.inner.read_link(cred, link).await
+        })
+    }
+
+    fn create<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+        options: &'a vfs::OpenOptions,
+    ) -> BoxFuture<'a, (vfs::Entry, vfs::OpenRef)> {
+        Box::pin(async move {
+            if proc_is_remote_ino(dir.node.ino) || dir.node.ino == PROC_ROOT_INO {
+                check_component(name)?;
+                match self.lookup(cred, dir, name).await {
+                    Ok(entry) => {
+                        if options.is_create_new() {
+                            return Err(Errno::EEXIST);
+                        }
+                        if entry.metadata.is_dir() {
+                            return Err(Errno::EISDIR);
+                        }
+                        let open = self.open(cred, &entry.handle, options).await?;
+                        return Ok((entry, open));
+                    }
+                    Err(Errno::ENOENT) if proc_is_remote_ino(dir.node.ino) => {
+                        return Err(Errno::EACCES);
+                    }
+                    Err(e) if proc_is_remote_ino(dir.node.ino) => return Err(e),
+                    Err(_) => {}
+                }
+            }
+            self.inner.create(cred, dir, name, mode, options).await
+        })
+    }
+
+    fn mkdir<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+    ) -> BoxFuture<'a, vfs::Entry> {
+        Box::pin(async move {
+            if proc_is_remote_ino(dir.node.ino) {
+                let _ = self.check_remote_handle(dir)?;
+                check_component(name)?;
+                return Err(Errno::EPERM);
+            }
+            self.inner.mkdir(cred, dir, name, mode).await
+        })
+    }
+
+    fn mknod<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+        rdev: &'a str,
+    ) -> BoxFuture<'a, vfs::Entry> {
+        Box::pin(async move {
+            if proc_is_remote_ino(dir.node.ino) {
+                let _ = self.check_remote_handle(dir)?;
+                check_component(name)?;
+                return Err(Errno::EPERM);
+            }
+            self.inner.mknod(cred, dir, name, mode, rdev).await
+        })
+    }
+
+    fn symlink<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        target: &'a str,
+    ) -> BoxFuture<'a, vfs::Entry> {
+        Box::pin(async move {
+            if proc_is_remote_ino(dir.node.ino) {
+                let _ = self.check_remote_handle(dir)?;
+                return self
+                    .inner
+                    .symlink(cred, &self.inner.root(), name, target)
+                    .await;
+            }
+            self.inner.symlink(cred, dir, name, target).await
+        })
+    }
+
+    fn link<'a>(
+        &'a self,
+        cred: &'a Cred,
+        target: &'a Handle,
+        dir: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, vfs::Entry> {
+        Box::pin(async move {
+            if proc_is_remote_ino(target.node.ino) || proc_is_remote_ino(dir.node.ino) {
+                if proc_is_remote_ino(target.node.ino) {
+                    let _ = self.check_remote_handle(target)?;
+                }
+                if proc_is_remote_ino(dir.node.ino) {
+                    let _ = self.check_remote_handle(dir)?;
+                }
+                check_component(name)?;
+                return Err(Errno::EPERM);
+            }
+            self.inner.link(cred, target, dir, name).await
+        })
+    }
+
+    fn unlink<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if proc_is_remote_ino(dir.node.ino) {
+                let _ = self.check_remote_handle(dir)?;
+                check_component(name)?;
+                return Err(Errno::EPERM);
+            }
+            self.inner.unlink(cred, dir, name).await
+        })
+    }
+
+    fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if proc_is_remote_ino(dir.node.ino) {
+                let _ = self.check_remote_handle(dir)?;
+                check_component(name)?;
+                return Err(Errno::EPERM);
+            }
+            self.inner.rmdir(cred, dir, name).await
+        })
+    }
+
+    fn rename<'a>(
+        &'a self,
+        cred: &'a Cred,
+        from_dir: &'a Handle,
+        from: &'a str,
+        to_dir: &'a Handle,
+        to: &'a str,
+        flags: RenameFlags,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if proc_is_remote_ino(from_dir.node.ino) || proc_is_remote_ino(to_dir.node.ino) {
+                if proc_is_remote_ino(from_dir.node.ino) {
+                    let _ = self.check_remote_handle(from_dir)?;
+                }
+                if proc_is_remote_ino(to_dir.node.ino) {
+                    let _ = self.check_remote_handle(to_dir)?;
+                }
+                check_component(from)?;
+                check_component(to)?;
+                return Err(Errno::EPERM);
+            }
+            self.inner
+                .rename(cred, from_dir, from, to_dir, to, flags)
+                .await
+        })
+    }
+
+    fn getxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            if proc_is_remote_ino(handle.node.ino) {
+                let _ = self.check_remote_handle(handle)?;
+                return self.inner.getxattr(cred, &self.inner.root(), name).await;
+            }
+            self.inner.getxattr(cred, handle, name).await
+        })
+    }
+
+    fn setxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+        value: &'a [u8],
+        flags: XattrFlags,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if proc_is_remote_ino(handle.node.ino) {
+                let _ = self.check_remote_handle(handle)?;
+                return self
+                    .inner
+                    .setxattr(cred, &self.inner.root(), name, value, flags)
+                    .await;
+            }
+            self.inner.setxattr(cred, handle, name, value, flags).await
+        })
+    }
+
+    fn listxattr<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(async move {
+            if proc_is_remote_ino(handle.node.ino) {
+                let _ = self.check_remote_handle(handle)?;
+                return Ok(Vec::new());
+            }
+            self.inner.listxattr(cred, handle).await
+        })
+    }
+
+    fn removexattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if proc_is_remote_ino(handle.node.ino) {
+                let _ = self.check_remote_handle(handle)?;
+                return self.inner.removexattr(cred, &self.inner.root(), name).await;
+            }
+            self.inner.removexattr(cred, handle, name).await
+        })
+    }
+
+    fn statfs<'a>(&'a self, cred: &'a Cred) -> BoxFuture<'a, vfs::StatFs> {
+        self.inner.statfs(cred)
+    }
+
+    fn open<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        options: &'a vfs::OpenOptions,
+    ) -> BoxFuture<'a, vfs::OpenRef> {
+        Box::pin(async move {
+            if !proc_is_remote_ino(handle.node.ino) {
+                return self.inner.open(cred, handle, options).await;
+            }
+            let path = self.check_remote_handle(handle)?;
+            let access = options.access()?;
+            let mut metadata = self.remote_meta(cred, &path).await?;
+            if access != vfs::Access::Path {
+                if metadata.is_symlink() {
+                    return Err(Errno::ELOOP);
+                }
+                if metadata.is_dir() {
+                    if access.writes() || options.is_truncate() {
+                        return Err(Errno::EISDIR);
+                    }
+                } else if access.writes() || options.is_truncate() || access == vfs::Access::Exec {
+                    return Err(Errno::EACCES);
+                }
+            }
+            let bytes = if metadata.is_file() && access != vfs::Access::Path {
+                let data = self.provider.read_proc_file(cred, &path).await?;
+                metadata.size = data.len() as u64;
+                Some(data)
+            } else {
+                None
+            };
+            let mut state = self.state.borrow_mut();
+            let id = state.next_open | PROC_REMOTE_OPEN_BIT;
+            state.next_open += 1;
+            state.opens.insert(
+                id,
+                BrowserProcOpen {
+                    ino: handle.node.ino,
+                    access,
+                    bytes,
+                    metadata,
+                },
+            );
+            Ok(vfs::OpenRef {
+                fs: self.fs_id.clone(),
+                id,
+                node: handle.node,
+                access,
+            })
+        })
+    }
+
+    fn open_metadata<'a>(&'a self, open: &'a vfs::OpenRef) -> BoxFuture<'a, vfs::Metadata> {
+        Box::pin(async move {
+            if (open.id & PROC_REMOTE_OPEN_BIT) == 0 {
+                return self.inner.open_metadata(open).await;
+            }
+            let state = self.state.borrow();
+            let rec = state
+                .opens
+                .get(&open.id)
+                .filter(|r| open.fs == self.fs_id && r.ino == open.node.ino)
+                .ok_or(Errno::EBADF)?;
+            Ok(rec.metadata.clone())
+        })
+    }
+
+    fn read_at<'a>(
+        &'a self,
+        open: &'a vfs::OpenRef,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> BoxFuture<'a, usize> {
+        Box::pin(async move {
+            if (open.id & PROC_REMOTE_OPEN_BIT) == 0 {
+                return self.inner.read_at(open, buf, offset).await;
+            }
+            let state = self.state.borrow();
+            let rec = state
+                .opens
+                .get(&open.id)
+                .filter(|r| open.fs == self.fs_id && r.ino == open.node.ino)
+                .ok_or(Errno::EBADF)?;
+            if !rec.access.reads() {
+                return Err(Errno::EBADF);
+            }
+            if rec.metadata.is_dir() {
+                return Err(Errno::EISDIR);
+            }
+            let Some(bytes) = rec.bytes.as_deref() else {
+                return Err(Errno::EINVAL);
+            };
+            if offset > FILE_MAX || buf.len() as u64 > FILE_MAX - offset {
+                return Err(Errno::EINVAL);
+            }
+            if offset >= bytes.len() as u64 || buf.is_empty() {
+                return Ok(0);
+            }
+            let start = offset as usize;
+            let len = (bytes.len() - start).min(buf.len());
+            buf[..len].copy_from_slice(&bytes[start..start + len]);
+            Ok(len)
+        })
+    }
+
+    fn write_at<'a>(
+        &'a self,
+        open: &'a vfs::OpenRef,
+        buf: &'a [u8],
+        at: vfs::WriteAt,
+    ) -> BoxFuture<'a, vfs::Written> {
+        Box::pin(async move {
+            if (open.id & PROC_REMOTE_OPEN_BIT) == 0 {
+                return self.inner.write_at(open, buf, at).await;
+            }
+            let state = self.state.borrow();
+            let _ = state
+                .opens
+                .get(&open.id)
+                .filter(|r| open.fs == self.fs_id && r.ino == open.node.ino)
+                .ok_or(Errno::EBADF)?;
+            Err(Errno::EBADF)
+        })
+    }
+
+    fn set_len<'a>(&'a self, open: &'a vfs::OpenRef, size: u64) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if (open.id & PROC_REMOTE_OPEN_BIT) == 0 {
+                return self.inner.set_len(open, size).await;
+            }
+            let state = self.state.borrow();
+            let _ = state
+                .opens
+                .get(&open.id)
+                .filter(|r| open.fs == self.fs_id && r.ino == open.node.ino)
+                .ok_or(Errno::EBADF)?;
+            Err(Errno::EINVAL)
+        })
+    }
+
+    fn sync_all<'a>(&'a self, open: &'a vfs::OpenRef) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if (open.id & PROC_REMOTE_OPEN_BIT) == 0 {
+                return self.inner.sync_all(open).await;
+            }
+            let state = self.state.borrow();
+            let rec = state
+                .opens
+                .get(&open.id)
+                .filter(|r| open.fs == self.fs_id && r.ino == open.node.ino)
+                .ok_or(Errno::EBADF)?;
+            if rec.access == vfs::Access::Path {
+                return Err(Errno::EBADF);
+            }
+            Ok(())
+        })
+    }
+
+    fn lock<'a>(
+        &'a self,
+        open: &'a vfs::OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if (open.id & PROC_REMOTE_OPEN_BIT) == 0 {
+                return self.inner.lock(open, family, kind, range).await;
+            }
+            let state = self.state.borrow();
+            let rec = state
+                .opens
+                .get(&open.id)
+                .filter(|r| open.fs == self.fs_id && r.ino == open.node.ino)
+                .ok_or(Errno::EBADF)?;
+            if rec.access == vfs::Access::Path {
+                return Err(Errno::EBADF);
+            }
+            Err(Errno::ENOLCK)
+        })
+    }
+
+    fn try_lock<'a>(
+        &'a self,
+        open: &'a vfs::OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
+    ) -> BoxFuture<'a, ()> {
+        self.lock(open, family, kind, range)
+    }
+
+    fn unlock<'a>(
+        &'a self,
+        open: &'a vfs::OpenRef,
+        family: LockFamily,
+        range: LockRange,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if (open.id & PROC_REMOTE_OPEN_BIT) == 0 {
+                return self.inner.unlock(open, family, range).await;
+            }
+            let state = self.state.borrow();
+            let rec = state
+                .opens
+                .get(&open.id)
+                .filter(|r| open.fs == self.fs_id && r.ino == open.node.ino)
+                .ok_or(Errno::EBADF)?;
+            if rec.access == vfs::Access::Path {
+                return Err(Errno::EBADF);
+            }
+            Ok(())
+        })
+    }
+
+    fn test_lock<'a>(
+        &'a self,
+        open: &'a vfs::OpenRef,
+        kind: LockKind,
+        range: LockRange,
+    ) -> BoxFuture<'a, Option<vfs::Conflict>> {
+        Box::pin(async move {
+            if (open.id & PROC_REMOTE_OPEN_BIT) == 0 {
+                return self.inner.test_lock(open, kind, range).await;
+            }
+            let state = self.state.borrow();
+            let rec = state
+                .opens
+                .get(&open.id)
+                .filter(|r| open.fs == self.fs_id && r.ino == open.node.ino)
+                .ok_or(Errno::EBADF)?;
+            if rec.access == vfs::Access::Path {
+                return Err(Errno::EBADF);
+            }
+            Ok(None)
+        })
+    }
+
+    fn release<'a>(&'a self, open: &'a vfs::OpenRef) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if (open.id & PROC_REMOTE_OPEN_BIT) == 0 {
+                return self.inner.release(open).await;
+            }
+            let mut state = self.state.borrow_mut();
+            if state
+                .opens
+                .get(&open.id)
+                .is_none_or(|r| open.fs != self.fs_id || r.ino != open.node.ino)
+            {
+                return Err(Errno::EBADF);
+            }
+            state.opens.remove(&open.id);
+            Ok(())
+        })
+    }
+}
+
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BootVfsOptions {
@@ -865,7 +1804,7 @@ async fn construct_vfs(
         &root_cred,
         usr_backing,
         usr_subroot,
-        "image:/usr",
+        "usr",
         "/usr",
         MountFlags {
             rdonly: true,
@@ -877,15 +1816,21 @@ async fn construct_vfs(
     )
     .await?;
 
-    // 2. `/proc` (`ProcFs` bound to `vfs.proc_bridge()` + `BrowserProcProvider`)
+    // 2. `/proc` (`ProcFs` bound to `vfs.proc_bridge()` + `BrowserProcProvider`, wrapped in
+    // `BrowserProcFs` so non-numeric `/proc/<job-id>` directory trees traverse cleanly).
     let proc_fs = Rc::new(ProcFs::new(
         FsId("proc".to_string()),
         mounted_at,
         BrowserProcProvider,
     ));
     proc_fs.bind_bridge(vfs.proc_bridge());
+    let proc_wrapper = Rc::new(BrowserProcFs::new(
+        FsId("proc".to_string()),
+        proc_fs,
+        BrowserProcProvider,
+    ));
     let proc_backing = Rc::new(
-        MountBacking::new(proc_fs as Rc<dyn Filesystem>, vfs::FsType::Proc)
+        MountBacking::new(proc_wrapper as Rc<dyn Filesystem>, vfs::FsType::Proc)
             .with_ceilings(true, true),
     );
     vfs.mount_on_namespace(
@@ -1275,6 +2220,12 @@ impl Kernel {
     }
 
     async fn fill_stat_names(&self, vfs: &Vfs, pid: u32, st: &mut abi::Stat) {
+        let root_cloud = Rc::clone(&self.vfs_rt.borrow().root_cloud);
+        if (st.mode & abi::S_IFMT) == abi::S_IFREG && st.dev == root_cloud.fs_id().dev() {
+            st.writing = root_cloud.writing_of(st.ino);
+        } else {
+            st.writing = None;
+        }
         let missing = {
             let rt = self.vfs_rt.borrow();
             (st.user.is_empty() && !rt.uid_names.contains_key(&st.uid))
@@ -1297,6 +2248,22 @@ impl Kernel {
                 .entry(st.gid)
                 .or_insert_with(|| st.gid.to_string())
                 .clone();
+        }
+    }
+
+    async fn fill_symlink_target(
+        &self,
+        vfs: &Vfs,
+        pid: u32,
+        anchor: StartAnchor,
+        path: &str,
+        st: &mut abi::Stat,
+    ) {
+        if st.link.is_none()
+            && (st.mode & abi::S_IFMT) == abi::S_IFLNK
+            && let Ok(target) = vfs.readlinkat(pid, anchor, path).await
+        {
+            st.link = Some(target);
         }
     }
 
@@ -1340,7 +2307,34 @@ impl Kernel {
         Ok(())
     }
 
+    pub(crate) async fn close_process_server_fds(&self, pid: u32) {
+        let sfds: Vec<u32> = {
+            let mut rt = self.vfs_rt.borrow_mut();
+            let Some(meta) = rt.proc_meta.get_mut(&pid) else {
+                return;
+            };
+            let drained: Vec<u32> = meta.server_fds.drain().map(|(_, e)| e.sfd).collect();
+            drained
+                .into_iter()
+                .filter(|sfd| {
+                    !rt.proc_meta.iter().any(|(other, m)| {
+                        *other != pid && m.server_fds.values().any(|e| e.sfd == *sfd)
+                    })
+                })
+                .collect()
+        };
+        for sfd in sfds {
+            let _ = self
+                .with_proc_scope(
+                    pid,
+                    self.forward_server_call(pid, false, Call::Close { fd: FdRef::Fd(sfd) }),
+                )
+                .await;
+        }
+    }
+
     pub(crate) async fn vfs_process_exit_cleanup(&self, pid: u32, _token: Option<String>) {
+        self.close_process_server_fds(pid).await;
         let (vfs, root_cloud, waits) = {
             let mut rt = self.vfs_rt.borrow_mut();
             rt.proc_meta.remove(&pid);
@@ -1938,18 +2932,27 @@ impl Kernel {
             String,
             bool,
             bool,
+            bool,
             Rc<ProviderState>,
             Option<LocalMount>,
         );
-        let (backing, subroot, source_str, read_only, execute, provider, local_mount): PreparedMount =
-            match normalized_kind {
+        let (
+            backing,
+            subroot,
+            source_str,
+            read_only,
+            execute,
+            nosymfollow,
+            provider,
+            local_mount,
+        ): PreparedMount = match normalized_kind {
             "opfs" => {
                 let lm = crate::hostfs::mount_opfs(host_obj, &grant_json).await?;
                 let ro = lm.grant_info().read_only;
                 let ex = lm.grant_info().execute;
                 let b = lm.mount_backing(vfs::FsType::Opfs);
                 let p = lm.provider_state();
-                (b, None, format!("opfs:{clean_name}"), ro, ex, p, Some(lm))
+                (b, None, format!("opfs:{clean_name}"), ro, ex, false, p, Some(lm))
             }
             "hostfs" => {
                 let lm = crate::hostfs::mount_directory(host_obj, &grant_json).await?;
@@ -1963,6 +2966,7 @@ impl Kernel {
                     format!("hostfs:{clean_name}"),
                     ro,
                     ex,
+                    false,
                     p,
                     Some(lm),
                 )
@@ -1978,6 +2982,7 @@ impl Kernel {
                     format!("snapshot:{clean_name}"),
                     true,
                     ex,
+                    false,
                     p,
                     Some(lm),
                 )
@@ -1994,12 +2999,13 @@ impl Kernel {
                     format!("helperfs:{clean_name}"),
                     ro,
                     ex,
+                    true,
                     p,
                     Some(lm),
                 )
             }
             "sharefs" => {
-                let (b, root_h, p, ro, ex) =
+                let (b, root_h, p, ro, ex, nosymfollow) =
                     build_share_backing(host_obj, &format!("{session_id}:{tmp_seq}"))
                         .await
                         .map_err(map_errno)?;
@@ -2009,6 +3015,7 @@ impl Kernel {
                     format!("sharefs:{clean_name}"),
                     ro,
                     ex,
+                    nosymfollow,
                     p,
                     None,
                 )
@@ -2033,6 +3040,7 @@ impl Kernel {
                     format!("image:{label}"),
                     true,
                     true,
+                    false,
                     p,
                     None,
                 )
@@ -2103,6 +3111,7 @@ impl Kernel {
             nosuid: true,
             nodev: true,
             noexec: !execute,
+            nosymfollow,
             ..MountFlags::default()
         };
         let mut locked = mount_flags::MS_NOSUID | mount_flags::MS_NODEV;
@@ -2111,6 +3120,9 @@ impl Kernel {
         }
         if !execute {
             locked |= mount_flags::MS_NOEXEC;
+        }
+        if nosymfollow {
+            locked |= mount_flags::MS_NOSYMFOLLOW;
         }
 
         let fs_id = backing.fs.id().clone();
@@ -2177,6 +3189,7 @@ impl Kernel {
                     "execute": execute,
                     "cloud": spec.cloud,
                     "dev": fs_id.dev(),
+                    "fsId": fs_id.0,
                 }),
             )
         };
@@ -2775,6 +3788,8 @@ impl Kernel {
                         batch.calls,
                         effective_sudo,
                         batch.umask.is_none(),
+                        cred.identity.id,
+                        cred.umask,
                     )
                     .await;
                 let _ = vfs.exit_process(scoped_pid).await;
@@ -3632,7 +4647,12 @@ impl Kernel {
         vfs.set_umask(pid, umask).map_err(map_errno)
     }
 
+    pub async fn proc_close_server_fds(&self, pid: u32) {
+        self.close_process_server_fds(pid).await;
+    }
+
     pub async fn proc_exit(&self, pid: u32) -> Result<(), JsValue> {
+        self.close_process_server_fds(pid).await;
         let (vfs, root_cloud, waits) = {
             let mut rt = self.vfs_rt.borrow_mut();
             rt.proc_meta.remove(&pid);
@@ -3938,10 +4958,17 @@ impl Kernel {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let mut st = self
-            .with_proc_scope(
-                pid,
-                async move { vfs.statat(pid, anchor, &path, follow).await },
-            )
+            .with_proc_scope(pid, async move {
+                let mut st = vfs.statat(pid, anchor.clone(), &path, follow).await?;
+                if !follow
+                    && st.link.is_none()
+                    && (st.mode & abi::S_IFMT) == abi::S_IFLNK
+                    && let Ok(target) = vfs.readlinkat(pid, anchor, &path).await
+                {
+                    st.link = Some(target);
+                }
+                Ok(st)
+            })
             .await
             .map_err(map_errno)?;
         let vfs_for_names = self.vfs_rt.borrow().vfs.clone();
@@ -4143,7 +5170,7 @@ impl Kernel {
         let results = self
             .with_proc_scope(
                 pid,
-                self.execute_batch_on_pid(&vfs, pid, None, batch.calls, false, false),
+                self.execute_batch_on_pid(&vfs, pid, None, batch.calls, false, false, 0, 0o022),
             )
             .await;
         serde_json::to_string(&abi::Results { results })
@@ -4263,6 +5290,35 @@ impl Kernel {
         self.with_proc_scope(pid, async move { vfs.ftruncate(pid, kfd, size).await })
             .await
             .map_err(map_errno)
+    }
+
+    pub async fn kfd_futimens(
+        &self,
+        pid: u32,
+        kfd: u32,
+        atime_json: String,
+        mtime_json: String,
+    ) -> Result<(), JsValue> {
+        let atime: Time = serde_json::from_str(&atime_json)
+            .map_err(|e| vfs_js_err(Errno::EINVAL, e.to_string()))?;
+        let mtime: Time = serde_json::from_str(&mtime_json)
+            .map_err(|e| vfs_js_err(Errno::EINVAL, e.to_string()))?;
+        let vfs = self.vfs_rt.borrow().vfs.clone();
+        self.with_proc_scope(pid, async move {
+            vfs.fsetattr(
+                pid,
+                kfd,
+                &SetAttr {
+                    atime,
+                    mtime,
+                    ..SetAttr::default()
+                },
+            )
+            .await
+        })
+        .await
+        .map(|_| ())
+        .map_err(map_errno)
     }
 
     pub async fn kfd_fsync(&self, pid: u32, kfd: u32, data_only: bool) -> Result<(), JsValue> {
@@ -4414,6 +5470,16 @@ impl Kernel {
     }
 
     pub fn kfd_set_cloexec(&self, pid: u32, kfd: u32, cloexec: bool) -> Result<(), JsValue> {
+        if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&kfd) {
+            let mut rt = self.vfs_rt.borrow_mut();
+            let entry = rt
+                .proc_meta
+                .get_mut(&pid)
+                .and_then(|m| m.server_fds.get_mut(&kfd))
+                .ok_or_else(|| map_errno(Errno::EBADF))?;
+            entry.cloexec = cloexec;
+            return Ok(());
+        }
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let fds = vfs.process_fds(pid).map_err(map_errno)?;
         fds.borrow_mut()
@@ -4422,12 +5488,52 @@ impl Kernel {
     }
 
     pub fn kfd_is_cloexec(&self, pid: u32, kfd: u32) -> Result<bool, JsValue> {
+        if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&kfd) {
+            let rt = self.vfs_rt.borrow();
+            return rt
+                .proc_meta
+                .get(&pid)
+                .and_then(|m| m.server_fds.get(&kfd))
+                .map(|e| e.cloexec)
+                .ok_or_else(|| map_errno(Errno::EBADF));
+        }
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let fds = vfs.process_fds(pid).map_err(map_errno)?;
         fds.borrow().get_cloexec(kfd).map_err(map_errno)
     }
 
     pub async fn kfd_close(&self, pid: u32, kfd: u32) -> Result<(), JsValue> {
+        if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&kfd) {
+            let entry = {
+                let mut rt = self.vfs_rt.borrow_mut();
+                rt.proc_meta
+                    .get_mut(&pid)
+                    .and_then(|m| m.server_fds.remove(&kfd))
+                    .ok_or_else(|| map_errno(Errno::EBADF))?
+            };
+            let still_shared = {
+                let rt = self.vfs_rt.borrow();
+                rt.proc_meta.iter().any(|(other_pid, meta)| {
+                    *other_pid != pid && meta.server_fds.values().any(|e| e.sfd == entry.sfd)
+                })
+            };
+            if !still_shared {
+                self.with_proc_scope(
+                    pid,
+                    self.forward_server_call(
+                        pid,
+                        false,
+                        Call::Close {
+                            fd: FdRef::Fd(entry.sfd),
+                        },
+                    ),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| vfs_js_err(e.errno, e.detail.unwrap_or_default()))?;
+            }
+            return Ok(());
+        }
         let vfs = self.vfs_rt.borrow().vfs.clone();
         self.with_proc_scope(pid, async move { vfs.close(pid, kfd).await })
             .await
@@ -4919,6 +6025,9 @@ async fn apply_service_bind(
         .entry(src_pin.id())
         .map(|e| e.source.clone())
         .unwrap_or_else(|| "bind".to_string());
+    let owner_uid = src_pin
+        .owner_uid()
+        .or_else(|| (cred.identity.id != 0).then_some(cred.identity.id));
     vfs.mount_on_namespace(
         ns,
         cred,
@@ -4928,7 +6037,7 @@ async fn apply_service_bind(
         &bm.target,
         flags,
         locked,
-        src_pin.owner_uid(),
+        owner_uid,
     )
     .await
     .map(|_| ())
@@ -5052,9 +6161,256 @@ async fn resolve_default_creation_umask(
     None
 }
 
+fn is_readonly_batch_call(call: &Call) -> bool {
+    matches!(
+        call,
+        Call::Stat { .. }
+            | Call::Lstat { .. }
+            | Call::FstatAt { .. }
+            | Call::Getdents { .. }
+            | Call::Access { .. }
+            | Call::Readlink { .. }
+            | Call::ReadlinkAt { .. }
+            | Call::Statfs { .. }
+            | Call::Fstatfs { .. }
+            | Call::Getcwd
+            | Call::Getxattr { .. }
+            | Call::Listxattr { .. }
+    )
+}
+
+struct CloudMountFilter {
+    cwd: Option<String>,
+    blocked_prefixes: Vec<String>,
+    unknown_mp_names: HashSet<String>,
+}
+
+impl CloudMountFilter {
+    fn for_pid(vfs: &Vfs, root_cloud: &RootCloudDriver, pid: u32) -> Option<Self> {
+        let fs_ctx = vfs.process_fs_context(pid).ok()?;
+        let ns = vfs.process_namespace(pid).ok()?;
+        let ctx_b = fs_ctx.borrow();
+        if ctx_b.root.pin.fs().id() != root_cloud.fs_id() || ctx_b.root.handle.node.ino != 1 {
+            return None;
+        }
+        let ns_b = ns.borrow();
+        if ns_b
+            .top_mount_at(ctx_b.root.pin.id(), ctx_b.root.handle.node)
+            .is_some()
+        {
+            return None;
+        }
+        let cwd = if ctx_b.cwd.pin.fs().id() == root_cloud.fs_id() {
+            if ctx_b.cwd.handle.node.ino == 1 {
+                Some("/".to_string())
+            } else {
+                root_cloud.canonical_cloud_path(ctx_b.cwd.handle.node)
+            }
+        } else {
+            None
+        };
+        let mut blocked_prefixes: Vec<String> = vec![
+            "/usr",
+            "/proc",
+            "/dev",
+            "/run",
+            "/sys",
+            "/mnt/local",
+            "/mnt/shared",
+            "/opt/private",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut unknown_mp_names = HashSet::new();
+        for entry in ns_b.mounts().values() {
+            if entry.slot.pin().fs().id() == root_cloud.fs_id() {
+                continue;
+            }
+            let Some(att) = &entry.parent else {
+                return None;
+            };
+            if att.parent_pin.fs().id() != root_cloud.fs_id() {
+                continue;
+            }
+            if let Some(p) = root_cloud.canonical_cloud_path(att.mountpoint.node) {
+                blocked_prefixes.push(p);
+            } else if let (Some(pnode), Some(name)) = (att.mp_parent_node, &att.mp_name) {
+                if let Some(parent_path) = root_cloud.canonical_cloud_path(pnode) {
+                    let full = if parent_path == "/" {
+                        format!("/{name}")
+                    } else {
+                        format!("{}/{name}", parent_path.trim_end_matches('/'))
+                    };
+                    blocked_prefixes.push(full);
+                } else {
+                    unknown_mp_names.insert(name.clone());
+                }
+            } else if let Some(name) = &att.mp_name {
+                unknown_mp_names.insert(name.clone());
+            } else {
+                return None;
+            }
+        }
+        Some(Self {
+            cwd,
+            blocked_prefixes,
+            unknown_mp_names,
+        })
+    }
+
+    fn is_blocked_prefix(&self, path: &str) -> bool {
+        self.blocked_prefixes
+            .iter()
+            .any(|mp| path == mp || path.starts_with(&format!("{mp}/")))
+    }
+
+    fn push_cloud_prefixes(
+        &self,
+        raw: &str,
+        include_leaf_probe: bool,
+        seen: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        if raw.is_empty() || strip_proc_self_fd(raw).is_some() {
+            return;
+        }
+        let joined;
+        let source = if raw.starts_with('/') {
+            raw
+        } else if let Some(cwd) = &self.cwd {
+            joined = if cwd == "/" {
+                format!("/{raw}")
+            } else {
+                format!("{}/{raw}", cwd.trim_end_matches('/'))
+            };
+            &joined
+        } else {
+            return;
+        };
+        let mut segs = Vec::new();
+        for part in source.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    segs.pop();
+                }
+                name => segs.push(name),
+            }
+        }
+        if segs
+            .iter()
+            .any(|s| self.unknown_mp_names.contains(*s) || *s == "_")
+        {
+            return;
+        }
+        let mut add = |p: String| {
+            if seen.insert(p.clone()) {
+                out.push(p);
+            }
+        };
+        add("/".to_string());
+        add("/_".to_string());
+        let mut cur = String::new();
+        for (i, seg) in segs.iter().enumerate() {
+            cur.push('/');
+            cur.push_str(seg);
+            if self.is_blocked_prefix(&cur) {
+                return;
+            }
+            add(cur.clone());
+            let is_dir_step = i + 1 < segs.len() || include_leaf_probe;
+            if is_dir_step {
+                add(format!("{cur}/_"));
+            }
+        }
+    }
+}
+
+fn collect_cloud_read_prewarm_paths(
+    vfs: &Vfs,
+    root_cloud: &RootCloudDriver,
+    pid: u32,
+    calls: &[Call],
+) -> Vec<String> {
+    let Some(filter) = CloudMountFilter::for_pid(vfs, root_cloud, pid) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for call in calls {
+        match call {
+            Call::Stat { path } | Call::Lstat { path } | Call::Readlink { path } => {
+                filter.push_cloud_prefixes(path, false, &mut seen, &mut out);
+            }
+            Call::Getdents { path, .. } => {
+                filter.push_cloud_prefixes(path, true, &mut seen, &mut out);
+            }
+            Call::Access { path, mode } => {
+                filter.push_cloud_prefixes(path, (*mode & abi::X_OK) != 0, &mut seen, &mut out);
+            }
+            Call::Getxattr { path, .. } | Call::Listxattr { path, .. } | Call::Statfs { path } => {
+                filter.push_cloud_prefixes(path, false, &mut seen, &mut out);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn require_abs_call_path(path: &str) -> std::result::Result<(), abi::Error> {
+    if path.is_empty() {
+        return Err(Errno::ENOENT.into());
+    }
+    if path.len() > abi::PATH_MAX {
+        return Err(Errno::ENAMETOOLONG.into());
+    }
+    if !path.starts_with('/') {
+        return Err(abi::Error::because(
+            Errno::EINVAL,
+            "a path must be absolute",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_non_at_call_paths(call: &Call) -> std::result::Result<(), abi::Error> {
+    match call {
+        Call::Stat { path }
+        | Call::Lstat { path }
+        | Call::Getdents { path, .. }
+        | Call::Access { path, .. }
+        | Call::Readlink { path }
+        | Call::Mkdir { path, .. }
+        | Call::Mknod { path, .. }
+        | Call::Rmdir { path }
+        | Call::Unlink { path }
+        | Call::Symlink { path, .. }
+        | Call::Chmod { path, .. }
+        | Call::Chown { path, .. }
+        | Call::Utimens { path, .. }
+        | Call::Statfs { path }
+        | Call::Getxattr { path, .. }
+        | Call::Setxattr { path, .. }
+        | Call::Listxattr { path, .. }
+        | Call::Removexattr { path, .. }
+        | Call::Open { path, .. }
+        | Call::InotifyAddWatch { path, .. } => require_abs_call_path(path),
+        Call::Rename { from, to, .. } | Call::Link { from, to, .. } => {
+            require_abs_call_path(from)?;
+            require_abs_call_path(to)
+        }
+        Call::Pread {
+            path: Some(path), ..
+        } => require_abs_call_path(path),
+        _ => Ok(()),
+    }
+}
+
 impl Kernel {
     /// Execute a list of `abi::Call`s on `pid` (either a live process in `proc_sys` or a scoped
     /// page caller in `vfs_sys`).
+    #[allow(clippy::too_many_arguments)]
     async fn execute_batch_on_pid(
         &self,
         vfs: &Vfs,
@@ -5063,11 +6419,41 @@ impl Kernel {
         calls: Vec<Call>,
         page_sudo: bool,
         default_private_user_umask: bool,
+        page_uid: u32,
+        page_umask: u16,
     ) -> Vec<Return> {
         let mut results = Vec::with_capacity(calls.len());
         let mut fd_refs: Vec<Option<u32>> = Vec::with_capacity(calls.len());
+        let root_cloud = Rc::clone(&self.vfs_rt.borrow().root_cloud);
+        let can_page_prewarm = pid >= SCOPED_PAGE_PID_BASE
+            && root_cloud.is_remote_mode()
+            && installed("pageSysPost").is_ok();
+        let mut active_read_scope: Option<PageReadScope> = None;
 
-        for call in calls {
+        for idx in 0..calls.len() {
+            let readonly = is_readonly_batch_call(&calls[idx]);
+            if !readonly {
+                active_read_scope.take();
+            } else if can_page_prewarm
+                && (active_read_scope.is_none()
+                    || root_cloud.ensure_page_read_cache(page_uid, page_sudo))
+            {
+                let mut run_end = idx + 1;
+                while run_end < calls.len() && is_readonly_batch_call(&calls[run_end]) {
+                    run_end += 1;
+                }
+                if active_read_scope.is_none() {
+                    active_read_scope = Some(root_cloud.begin_page_read(page_uid, page_sudo));
+                }
+                let candidates =
+                    collect_cloud_read_prewarm_paths(vfs, &root_cloud, pid, &calls[idx..run_end]);
+                if !candidates.is_empty() {
+                    root_cloud
+                        .prewarm_page_paths(&candidates, page_umask, page_uid, page_sudo)
+                        .await;
+                }
+            }
+            let call = calls[idx].clone();
             let prev_umask = if default_private_user_umask {
                 match &call {
                     Call::Mkdir { path, .. } | Call::Mknod { path, .. } => {
@@ -5103,294 +6489,293 @@ impl Kernel {
             };
             let mut opened_fd: Option<u32> = None;
             let page_sid = page_session_id.filter(|s| !s.is_empty());
-            let outcome: std::result::Result<Value, abi::Error> = match call {
-                Call::Stat { path } => {
-                    if let Some(sid) = page_sid
-                        && let Some(fd_str) = strip_proc_self_fd(&path)
-                        && let Ok(fd_num) = fd_str.parse::<u32>()
-                    {
-                        self.eval_proc_self_fd_stat(vfs, pid, sid, page_sudo, fd_num, true)
-                            .await
-                    } else {
-                        match vfs.statat(pid, StartAnchor::AtFdCwd, &path, true).await {
+            let outcome: std::result::Result<Value, abi::Error> = if let Err(err) =
+                validate_non_at_call_paths(&call)
+            {
+                Err(err)
+            } else {
+                match call {
+                    Call::Stat { path } => {
+                        if let Some(sid) = page_sid
+                            && let Some(fd_str) = strip_proc_self_fd(&path)
+                            && let Ok(fd_num) = fd_str.parse::<u32>()
+                        {
+                            self.eval_proc_self_fd_stat(vfs, pid, sid, page_sudo, fd_num, true)
+                                .await
+                        } else {
+                            match vfs.statat(pid, StartAnchor::AtFdCwd, &path, true).await {
+                                Ok(mut s) => {
+                                    self.fill_stat_names(vfs, pid, &mut s).await;
+                                    Ok(json!(s))
+                                }
+                                Err(e) => Err(e.into()),
+                            }
+                        }
+                    }
+                    Call::Lstat { path } => {
+                        if let Some(sid) = page_sid
+                            && let Some(fd_str) = strip_proc_self_fd(&path)
+                            && let Ok(fd_num) = fd_str.parse::<u32>()
+                        {
+                            self.eval_proc_self_fd_stat(vfs, pid, sid, page_sudo, fd_num, false)
+                                .await
+                        } else {
+                            match vfs.statat(pid, StartAnchor::AtFdCwd, &path, false).await {
+                                Ok(mut s) => {
+                                    self.fill_stat_names(vfs, pid, &mut s).await;
+                                    self.fill_symlink_target(
+                                        vfs,
+                                        pid,
+                                        StartAnchor::AtFdCwd,
+                                        &path,
+                                        &mut s,
+                                    )
+                                    .await;
+                                    Ok(json!(s))
+                                }
+                                Err(e) => Err(e.into()),
+                            }
+                        }
+                    }
+                    Call::FstatAt {
+                        dirfd,
+                        path,
+                        nofollow,
+                    } => match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
+                        Ok(anchor) => match vfs.statat(pid, anchor.clone(), &path, !nofollow).await
+                        {
                             Ok(mut s) => {
                                 self.fill_stat_names(vfs, pid, &mut s).await;
+                                if nofollow {
+                                    self.fill_symlink_target(vfs, pid, anchor, &path, &mut s)
+                                        .await;
+                                }
                                 Ok(json!(s))
                             }
                             Err(e) => Err(e.into()),
-                        }
-                    }
-                }
-                Call::Lstat { path } => {
-                    if let Some(sid) = page_sid
-                        && let Some(fd_str) = strip_proc_self_fd(&path)
-                        && let Ok(fd_num) = fd_str.parse::<u32>()
-                    {
-                        self.eval_proc_self_fd_stat(vfs, pid, sid, page_sudo, fd_num, false)
-                            .await
-                    } else {
-                        match vfs.statat(pid, StartAnchor::AtFdCwd, &path, false).await {
-                            Ok(mut s) => {
-                                self.fill_stat_names(vfs, pid, &mut s).await;
-                                Ok(json!(s))
-                            }
-                            Err(e) => Err(e.into()),
-                        }
-                    }
-                }
-                Call::FstatAt {
-                    dirfd,
-                    path,
-                    nofollow,
-                } => match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
-                    Ok(anchor) => match vfs.statat(pid, anchor, &path, !nofollow).await {
-                        Ok(mut s) => {
-                            self.fill_stat_names(vfs, pid, &mut s).await;
-                            Ok(json!(s))
-                        }
+                        },
                         Err(e) => Err(e.into()),
                     },
-                    Err(e) => Err(e.into()),
-                },
-                Call::Getdents {
-                    path,
-                    cookie,
-                    count,
-                } => {
-                    self.eval_getdents(vfs, pid, page_sid, page_sudo, &path, cookie, count)
+                    Call::Getdents {
+                        path,
+                        cookie,
+                        count,
+                    } => {
+                        self.eval_getdents(
+                            vfs, pid, page_sid, page_sudo, page_uid, page_umask, &path, cookie,
+                            count,
+                        )
                         .await
-                }
-                Call::Access { path, mode } => vfs
-                    .accessat(pid, StartAnchor::AtFdCwd, &path, mode, true)
-                    .await
-                    .map(|()| Value::Null)
-                    .map_err(Into::into),
-                Call::Readlink { path } => {
-                    if let Some(sid) = page_sid
-                        && let Some(fd_str) = strip_proc_self_fd(&path)
-                        && let Ok(fd_num) = fd_str.parse::<u32>()
-                    {
-                        self.eval_proc_self_fd_readlink(pid, sid, page_sudo, fd_num)
-                            .await
-                    } else {
-                        vfs.readlinkat(pid, StartAnchor::AtFdCwd, &path)
-                            .await
-                            .map(|s| json!(s))
-                            .map_err(Into::into)
                     }
-                }
-                Call::ReadlinkAt { dirfd, path } => {
-                    match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
-                        Ok(anchor) => vfs
-                            .readlinkat(pid, anchor, &path)
-                            .await
-                            .map(|s| json!(s))
-                            .map_err(Into::into),
-                        Err(e) => Err(e.into()),
+                    Call::Access { path, mode } => vfs
+                        .accessat(pid, StartAnchor::AtFdCwd, &path, mode, true)
+                        .await
+                        .map(|()| Value::Null)
+                        .map_err(Into::into),
+                    Call::Readlink { path } => {
+                        if let Some(sid) = page_sid
+                            && let Some(fd_str) = strip_proc_self_fd(&path)
+                            && let Ok(fd_num) = fd_str.parse::<u32>()
+                        {
+                            self.eval_proc_self_fd_readlink(pid, sid, page_sudo, fd_num)
+                                .await
+                        } else {
+                            vfs.readlinkat(pid, StartAnchor::AtFdCwd, &path)
+                                .await
+                                .map(|s| json!(s))
+                                .map_err(Into::into)
+                        }
                     }
-                }
-                Call::Mkdir { path, mode } => vfs
-                    .mkdirat(pid, StartAnchor::AtFdCwd, &path, mode)
-                    .await
-                    .map(|_| Value::Null)
-                    .map_err(Into::into),
-                Call::MkdirAt { dirfd, path, mode } => {
-                    match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
-                        Ok(anchor) => vfs
-                            .mkdirat(pid, anchor, &path, mode)
-                            .await
-                            .map(|_| Value::Null)
-                            .map_err(Into::into),
-                        Err(e) => Err(e.into()),
+                    Call::ReadlinkAt { dirfd, path } => {
+                        match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
+                            Ok(anchor) => vfs
+                                .readlinkat(pid, anchor, &path)
+                                .await
+                                .map(|s| json!(s))
+                                .map_err(Into::into),
+                            Err(e) => Err(e.into()),
+                        }
                     }
-                }
-                Call::Mknod { path, mode, rdev } => vfs
-                    .mknodat(
-                        pid,
-                        StartAnchor::AtFdCwd,
-                        &path,
-                        mode,
-                        rdev.as_deref().unwrap_or(""),
-                    )
-                    .await
-                    .map(|_| Value::Null)
-                    .map_err(Into::into),
-                Call::Rmdir { path } => vfs
-                    .unlinkat(pid, StartAnchor::AtFdCwd, &path, true)
-                    .await
-                    .map(|()| Value::Null)
-                    .map_err(Into::into),
-                Call::Unlink { path } => vfs
-                    .unlinkat(pid, StartAnchor::AtFdCwd, &path, false)
-                    .await
-                    .map(|()| Value::Null)
-                    .map_err(Into::into),
-                Call::UnlinkAt { dirfd, path, rmdir } => {
-                    match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
-                        Ok(anchor) => vfs
-                            .unlinkat(pid, anchor, &path, rmdir)
-                            .await
-                            .map(|()| Value::Null)
-                            .map_err(Into::into),
-                        Err(e) => Err(e.into()),
+                    Call::Mkdir { path, mode } => vfs
+                        .mkdirat(pid, StartAnchor::AtFdCwd, &path, mode)
+                        .await
+                        .map(|_| Value::Null)
+                        .map_err(Into::into),
+                    Call::MkdirAt { dirfd, path, mode } => {
+                        match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
+                            Ok(anchor) => vfs
+                                .mkdirat(pid, anchor, &path, mode)
+                                .await
+                                .map(|_| Value::Null)
+                                .map_err(Into::into),
+                            Err(e) => Err(e.into()),
+                        }
                     }
-                }
-                Call::Rename {
-                    from,
-                    to,
-                    noreplace,
-                } => {
-                    let rf = if noreplace {
-                        RenameFlags::NOREPLACE
-                    } else {
-                        RenameFlags::empty()
-                    };
-                    vfs.renameat(
-                        pid,
-                        StartAnchor::AtFdCwd,
-                        &from,
-                        StartAnchor::AtFdCwd,
-                        &to,
-                        rf,
-                    )
-                    .await
-                    .map(|()| Value::Null)
-                    .map_err(Into::into)
-                }
-                Call::RenameAt {
-                    from_dirfd,
-                    from,
-                    to_dirfd,
-                    to,
-                    noreplace,
-                } => match (
-                    parse_fd_ref(from_dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)),
-                    parse_fd_ref(to_dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)),
-                ) {
-                    (Ok(fa), Ok(ta)) => {
+                    Call::Mknod { path, mode, rdev } => vfs
+                        .mknodat(
+                            pid,
+                            StartAnchor::AtFdCwd,
+                            &path,
+                            mode,
+                            rdev.as_deref().unwrap_or(""),
+                        )
+                        .await
+                        .map(|_| Value::Null)
+                        .map_err(Into::into),
+                    Call::Rmdir { path } => vfs
+                        .unlinkat(pid, StartAnchor::AtFdCwd, &path, true)
+                        .await
+                        .map(|()| Value::Null)
+                        .map_err(Into::into),
+                    Call::Unlink { path } => vfs
+                        .unlinkat(pid, StartAnchor::AtFdCwd, &path, false)
+                        .await
+                        .map(|()| Value::Null)
+                        .map_err(Into::into),
+                    Call::UnlinkAt { dirfd, path, rmdir } => {
+                        match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
+                            Ok(anchor) => vfs
+                                .unlinkat(pid, anchor, &path, rmdir)
+                                .await
+                                .map(|()| Value::Null)
+                                .map_err(Into::into),
+                            Err(e) => Err(e.into()),
+                        }
+                    }
+                    Call::Rename {
+                        from,
+                        to,
+                        noreplace,
+                    } => {
                         let rf = if noreplace {
                             RenameFlags::NOREPLACE
                         } else {
                             RenameFlags::empty()
                         };
-                        vfs.renameat(pid, fa, &from, ta, &to, rf)
-                            .await
-                            .map(|()| Value::Null)
-                            .map_err(Into::into)
+                        vfs.renameat(
+                            pid,
+                            StartAnchor::AtFdCwd,
+                            &from,
+                            StartAnchor::AtFdCwd,
+                            &to,
+                            rf,
+                        )
+                        .await
+                        .map(|()| Value::Null)
+                        .map_err(Into::into)
                     }
-                    (Err(e), _) | (_, Err(e)) => Err(e.into()),
-                },
-                Call::Link { from, to, follow } => vfs
-                    .linkat(
-                        pid,
-                        StartAnchor::AtFdCwd,
-                        &from,
-                        StartAnchor::AtFdCwd,
-                        &to,
+                    Call::RenameAt {
+                        from_dirfd,
+                        from,
+                        to_dirfd,
+                        to,
+                        noreplace,
+                    } => match (
+                        parse_fd_ref(from_dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)),
+                        parse_fd_ref(to_dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)),
+                    ) {
+                        (Ok(fa), Ok(ta)) => {
+                            let rf = if noreplace {
+                                RenameFlags::NOREPLACE
+                            } else {
+                                RenameFlags::empty()
+                            };
+                            vfs.renameat(pid, fa, &from, ta, &to, rf)
+                                .await
+                                .map(|()| Value::Null)
+                                .map_err(Into::into)
+                        }
+                        (Err(e), _) | (_, Err(e)) => Err(e.into()),
+                    },
+                    Call::Link { from, to, follow } => vfs
+                        .linkat(
+                            pid,
+                            StartAnchor::AtFdCwd,
+                            &from,
+                            StartAnchor::AtFdCwd,
+                            &to,
+                            follow,
+                        )
+                        .await
+                        .map(|_| Value::Null)
+                        .map_err(Into::into),
+                    Call::LinkAt {
+                        from_dirfd,
+                        from,
+                        to_dirfd,
+                        to,
                         follow,
-                    )
-                    .await
-                    .map(|_| Value::Null)
-                    .map_err(Into::into),
-                Call::LinkAt {
-                    from_dirfd,
-                    from,
-                    to_dirfd,
-                    to,
-                    follow,
-                } => match (
-                    parse_fd_ref(from_dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)),
-                    parse_fd_ref(to_dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)),
-                ) {
-                    (Ok(fa), Ok(ta)) => vfs
-                        .linkat(pid, fa, &from, ta, &to, follow)
+                    } => match (
+                        parse_fd_ref(from_dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)),
+                        parse_fd_ref(to_dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)),
+                    ) {
+                        (Ok(fa), Ok(ta)) => vfs
+                            .linkat(pid, fa, &from, ta, &to, follow)
+                            .await
+                            .map(|_| Value::Null)
+                            .map_err(Into::into),
+                        (Err(e), _) | (_, Err(e)) => Err(e.into()),
+                    },
+                    Call::Symlink { target, path } => vfs
+                        .symlinkat(pid, &target, StartAnchor::AtFdCwd, &path)
                         .await
                         .map(|_| Value::Null)
                         .map_err(Into::into),
-                    (Err(e), _) | (_, Err(e)) => Err(e.into()),
-                },
-                Call::Symlink { target, path } => vfs
-                    .symlinkat(pid, &target, StartAnchor::AtFdCwd, &path)
-                    .await
-                    .map(|_| Value::Null)
-                    .map_err(Into::into),
-                Call::SymlinkAt {
-                    target,
-                    dirfd,
-                    path,
-                } => match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
-                    Ok(anchor) => vfs
-                        .symlinkat(pid, &target, anchor, &path)
-                        .await
-                        .map(|_| Value::Null)
-                        .map_err(Into::into),
-                    Err(e) => Err(e.into()),
-                },
-                Call::Chmod { path, mode } => vfs
-                    .setattrat(
-                        pid,
-                        StartAnchor::AtFdCwd,
-                        &path,
-                        &SetAttr {
-                            mode: Some(mode),
-                            ..SetAttr::default()
-                        },
-                        true,
-                    )
-                    .await
-                    .map(|_| Value::Null)
-                    .map_err(Into::into),
-                Call::Chown {
-                    path,
-                    uid,
-                    gid,
-                    nofollow,
-                } => vfs
-                    .setattrat(
-                        pid,
-                        StartAnchor::AtFdCwd,
-                        &path,
-                        &SetAttr {
-                            uid,
-                            gid,
-                            ..SetAttr::default()
-                        },
-                        !nofollow,
-                    )
-                    .await
-                    .map(|_| Value::Null)
-                    .map_err(Into::into),
-                Call::Utimens {
-                    path,
-                    atime,
-                    mtime,
-                    nofollow,
-                } => vfs
-                    .setattrat(
-                        pid,
-                        StartAnchor::AtFdCwd,
-                        &path,
-                        &SetAttr {
-                            atime,
-                            mtime,
-                            ..SetAttr::default()
-                        },
-                        !nofollow,
-                    )
-                    .await
-                    .map(|_| Value::Null)
-                    .map_err(Into::into),
-                Call::UtimensAt {
-                    dirfd,
-                    path,
-                    atime,
-                    mtime,
-                    nofollow,
-                } => match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
-                    Ok(anchor) => vfs
+                    Call::SymlinkAt {
+                        target,
+                        dirfd,
+                        path,
+                    } => match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
+                        Ok(anchor) => vfs
+                            .symlinkat(pid, &target, anchor, &path)
+                            .await
+                            .map(|_| Value::Null)
+                            .map_err(Into::into),
+                        Err(e) => Err(e.into()),
+                    },
+                    Call::Chmod { path, mode } => vfs
                         .setattrat(
                             pid,
-                            anchor,
+                            StartAnchor::AtFdCwd,
+                            &path,
+                            &SetAttr {
+                                mode: Some(mode),
+                                ..SetAttr::default()
+                            },
+                            true,
+                        )
+                        .await
+                        .map(|_| Value::Null)
+                        .map_err(Into::into),
+                    Call::Chown {
+                        path,
+                        uid,
+                        gid,
+                        nofollow,
+                    } => vfs
+                        .setattrat(
+                            pid,
+                            StartAnchor::AtFdCwd,
+                            &path,
+                            &SetAttr {
+                                uid,
+                                gid,
+                                ..SetAttr::default()
+                            },
+                            !nofollow,
+                        )
+                        .await
+                        .map(|_| Value::Null)
+                        .map_err(Into::into),
+                    Call::Utimens {
+                        path,
+                        atime,
+                        mtime,
+                        nofollow,
+                    } => vfs
+                        .setattrat(
+                            pid,
+                            StartAnchor::AtFdCwd,
                             &path,
                             &SetAttr {
                                 atime,
@@ -5402,159 +6787,170 @@ impl Kernel {
                         .await
                         .map(|_| Value::Null)
                         .map_err(Into::into),
-                    Err(e) => Err(e.into()),
-                },
-                Call::Statfs { path } => vfs
-                    .statfs(pid, StartAnchor::AtFdCwd, &path)
-                    .await
-                    .map(|s| json!(safe_statfs_for_js(s)))
-                    .map_err(Into::into),
-                Call::Fstatfs { fd } => match parse_fd_ref(fd, &fd_refs) {
-                    Ok(raw_fd) => {
-                        if let Some(sid) = page_sid
-                            && raw_fd >= CLIENT_PAGE_FD_BASE
-                        {
-                            let cred_and_file = {
-                                let rt = self.vfs_rt.borrow();
-                                rt.sessions.get(sid).and_then(|s| {
-                                    s.page_fds
-                                        .get(&raw_fd)
-                                        .map(|e| (e.file.clone(), s.cred(0o022)))
-                                })
-                            };
-                            match cred_and_file {
-                                Some((file, cred)) => {
-                                    let pin = file.mount_pin();
-                                    let fstype = pin
-                                        .map(|p| p.fstype().as_str().to_string())
-                                        .unwrap_or_default();
-                                    let fsid = file.fs().id().dev();
-                                    file.fs()
-                                        .statfs(&cred)
+                    Call::UtimensAt {
+                        dirfd,
+                        path,
+                        atime,
+                        mtime,
+                        nofollow,
+                    } => match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
+                        Ok(anchor) => vfs
+                            .setattrat(
+                                pid,
+                                anchor,
+                                &path,
+                                &SetAttr {
+                                    atime,
+                                    mtime,
+                                    ..SetAttr::default()
+                                },
+                                !nofollow,
+                            )
+                            .await
+                            .map(|_| Value::Null)
+                            .map_err(Into::into),
+                        Err(e) => Err(e.into()),
+                    },
+                    Call::Statfs { path } => vfs
+                        .statfs(pid, StartAnchor::AtFdCwd, &path)
+                        .await
+                        .map(|s| json!(safe_statfs_for_js(s)))
+                        .map_err(Into::into),
+                    Call::Fstatfs { fd } => match parse_fd_ref(fd, &fd_refs) {
+                        Ok(raw_fd) => {
+                            if let Some(sid) = page_sid
+                                && raw_fd >= CLIENT_PAGE_FD_BASE
+                            {
+                                let cred_and_file = {
+                                    let rt = self.vfs_rt.borrow();
+                                    rt.sessions.get(sid).and_then(|s| {
+                                        s.page_fds
+                                            .get(&raw_fd)
+                                            .map(|e| (e.file.clone(), s.cred(0o022)))
+                                    })
+                                };
+                                match cred_and_file {
+                                    Some((file, cred)) => {
+                                        let pin = file.mount_pin();
+                                        let fstype = pin
+                                            .map(|p| p.fstype().as_str().to_string())
+                                            .unwrap_or_default();
+                                        let fsid = file.fs().id().dev();
+                                        file.fs()
+                                            .statfs(&cred)
+                                            .await
+                                            .map(|s| {
+                                                json!(safe_statfs_for_js(abi::StatFs {
+                                                    bsize: s.block_size,
+                                                    frsize: s.block_size,
+                                                    blocks: s.blocks,
+                                                    bfree: s.blocks_free,
+                                                    bavail: s.blocks_free,
+                                                    files: s.files,
+                                                    ffree: s.files_free,
+                                                    namelen: s.name_max,
+                                                    fstype,
+                                                    fsid,
+                                                    flags: 0,
+                                                    f_type: 0,
+                                                }))
+                                            })
+                                            .map_err(Into::into)
+                                    }
+                                    None => Err(Errno::EBADF.into()),
+                                }
+                            } else if page_sid.is_none()
+                                && (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd)
+                            {
+                                match self.resolve_process_server_fd(pid, raw_fd) {
+                                    Ok(sfd) => {
+                                        self.forward_server_call(
+                                            pid,
+                                            page_sudo,
+                                            Call::Fstatfs { fd: FdRef::Fd(sfd) },
+                                        )
                                         .await
-                                        .map(|s| {
-                                            json!(safe_statfs_for_js(abi::StatFs {
-                                                bsize: s.block_size,
-                                                frsize: s.block_size,
-                                                blocks: s.blocks,
-                                                bfree: s.blocks_free,
-                                                bavail: s.blocks_free,
-                                                files: s.files,
-                                                ffree: s.files_free,
-                                                namelen: s.name_max,
-                                                fstype,
-                                                fsid,
-                                                flags: 0,
-                                                f_type: 0,
-                                            }))
-                                        })
-                                        .map_err(Into::into)
+                                    }
+                                    Err(e) => Err(e),
                                 }
-                                None => Err(Errno::EBADF.into()),
-                            }
-                        } else if page_sid.is_none()
-                            && (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd)
-                        {
-                            match self.resolve_process_server_fd(pid, raw_fd) {
-                                Ok(sfd) => {
-                                    self.forward_server_call(
-                                        pid,
-                                        page_sudo,
-                                        Call::Fstatfs { fd: FdRef::Fd(sfd) },
-                                    )
+                            } else {
+                                vfs.fstatfs(pid, raw_fd)
                                     .await
-                                }
-                                Err(e) => Err(e),
+                                    .map(|s| json!(safe_statfs_for_js(s)))
+                                    .map_err(Into::into)
                             }
-                        } else {
-                            vfs.fstatfs(pid, raw_fd)
-                                .await
-                                .map(|s| json!(safe_statfs_for_js(s)))
-                                .map_err(Into::into)
                         }
-                    }
-                    Err(e) => Err(e.into()),
-                },
-                Call::Mount {
-                    source,
-                    target,
-                    fstype,
-                    flags,
-                    data,
-                } => {
-                    let ns_id = vfs.process_namespace(pid).map(|n| n.borrow().id()).ok();
-                    let res = vfs
-                        .mount(
-                            pid,
-                            &source,
-                            &target,
-                            fstype.as_deref(),
-                            flags,
-                            data.as_deref(),
-                        )
-                        .await
-                        .map(|()| Value::Null)
-                        .map_err(Into::into);
-                    if res.is_ok()
-                        && let Some(nid) = ns_id
-                    {
-                        self.notify_ns_changed(nid);
-                    }
-                    res
-                }
-                Call::Umount2 { target, flags } => {
-                    let ns = vfs.process_namespace(pid).ok();
-                    let ns_id = ns.as_ref().map(|n| n.borrow().id());
-                    let before_ids = ns.as_ref().map(Self::collect_mount_ids).unwrap_or_default();
-                    let res = vfs
-                        .umount2(pid, &target, flags)
-                        .await
-                        .map(|()| Value::Null)
-                        .map_err(Into::into);
-                    if res.is_ok() {
-                        if let Some(ref ns_rc) = ns {
-                            self.evict_detached_mount_ids(ns_rc, before_ids);
-                        }
-                        if let Some(nid) = ns_id {
+                        Err(e) => Err(e.into()),
+                    },
+                    Call::Mount {
+                        source,
+                        target,
+                        fstype,
+                        flags,
+                        data,
+                    } => {
+                        let ns_id = vfs.process_namespace(pid).map(|n| n.borrow().id()).ok();
+                        let res = vfs
+                            .mount(
+                                pid,
+                                &source,
+                                &target,
+                                fstype.as_deref(),
+                                flags,
+                                data.as_deref(),
+                            )
+                            .await
+                            .map(|()| Value::Null)
+                            .map_err(Into::into);
+                        if res.is_ok()
+                            && let Some(nid) = ns_id
+                        {
                             self.notify_ns_changed(nid);
                         }
+                        res
                     }
-                    res
-                }
-                Call::Chdir { path } => vfs
-                    .chdir(pid, &path)
-                    .await
-                    .map(|()| Value::Null)
-                    .map_err(Into::into),
-                Call::Fchdir { fd } => match parse_fd_ref(fd, &fd_refs) {
-                    Ok(kfd) => vfs
-                        .fchdir(pid, kfd)
+                    Call::Umount2 { target, flags } => {
+                        let ns = vfs.process_namespace(pid).ok();
+                        let ns_id = ns.as_ref().map(|n| n.borrow().id());
+                        let before_ids =
+                            ns.as_ref().map(Self::collect_mount_ids).unwrap_or_default();
+                        let res = vfs
+                            .umount2(pid, &target, flags)
+                            .await
+                            .map(|()| Value::Null)
+                            .map_err(Into::into);
+                        if res.is_ok() {
+                            if let Some(ref ns_rc) = ns {
+                                self.evict_detached_mount_ids(ns_rc, before_ids);
+                            }
+                            if let Some(nid) = ns_id {
+                                self.notify_ns_changed(nid);
+                            }
+                        }
+                        res
+                    }
+                    Call::Chdir { path } => vfs
+                        .chdir(pid, &path)
                         .await
                         .map(|()| Value::Null)
                         .map_err(Into::into),
-                    Err(e) => Err(e.into()),
-                },
-                Call::Getcwd => vfs.getcwd(pid).await.map(|s| json!(s)).map_err(Into::into),
-                Call::Chroot { path } => vfs
-                    .chroot(pid, &path)
-                    .await
-                    .map(|()| Value::Null)
-                    .map_err(Into::into),
-                Call::Unshare { flags } => match vfs.unshare(pid, flags) {
-                    Ok(()) => {
-                        if flags & unshare_flags::CLONE_NEWNS != 0
-                            && let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid)
-                        {
-                            meta.session_id = None;
-                        }
-                        Ok(Value::Null)
-                    }
-                    Err(e) => Err(e.into()),
-                },
-                Call::Setns { fd, nstype } => match parse_fd_ref(fd, &fd_refs) {
-                    Ok(kfd) => match vfs.setns(pid, kfd, nstype) {
+                    Call::Fchdir { fd } => match parse_fd_ref(fd, &fd_refs) {
+                        Ok(kfd) => vfs
+                            .fchdir(pid, kfd)
+                            .await
+                            .map(|()| Value::Null)
+                            .map_err(Into::into),
+                        Err(e) => Err(e.into()),
+                    },
+                    Call::Getcwd => vfs.getcwd(pid).await.map(|s| json!(s)).map_err(Into::into),
+                    Call::Chroot { path } => vfs
+                        .chroot(pid, &path)
+                        .await
+                        .map(|()| Value::Null)
+                        .map_err(Into::into),
+                    Call::Unshare { flags } => match vfs.unshare(pid, flags) {
                         Ok(()) => {
-                            if (nstype == 0 || (nstype & unshare_flags::CLONE_NEWNS) != 0)
+                            if flags & unshare_flags::CLONE_NEWNS != 0
                                 && let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid)
                             {
                                 meta.session_id = None;
@@ -5563,19 +6959,110 @@ impl Kernel {
                         }
                         Err(e) => Err(e.into()),
                     },
-                    Err(e) => Err(e.into()),
-                },
-                Call::OpenAt {
-                    dirfd,
-                    path,
-                    flags,
-                    mode,
-                } => match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
-                    Ok(anchor) => {
+                    Call::Setns { fd, nstype } => match parse_fd_ref(fd, &fd_refs) {
+                        Ok(kfd) => match vfs.setns(pid, kfd, nstype) {
+                            Ok(()) => {
+                                if (nstype == 0 || (nstype & unshare_flags::CLONE_NEWNS) != 0)
+                                    && let Some(meta) =
+                                        self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid)
+                                {
+                                    meta.session_id = None;
+                                }
+                                Ok(Value::Null)
+                            }
+                            Err(e) => Err(e.into()),
+                        },
+                        Err(e) => Err(e.into()),
+                    },
+                    Call::OpenAt {
+                        dirfd,
+                        path,
+                        flags,
+                        mode,
+                    } => match parse_fd_ref(dirfd, &fd_refs).and_then(|d| parse_anchor(d as i32)) {
+                        Ok(anchor) => {
+                            match self
+                                .eval_open_anchor_call(
+                                    vfs, pid, anchor, page_sid, page_sudo, &path, flags, mode,
+                                    None, None, None,
+                                )
+                                .await
+                            {
+                                Ok((fd, val)) => {
+                                    opened_fd = Some(fd);
+                                    Ok(val)
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e.into()),
+                    },
+                    Call::Getxattr {
+                        path,
+                        name,
+                        nofollow,
+                    } => vfs
+                        .getxattrat(pid, StartAnchor::AtFdCwd, &path, &name, !nofollow)
+                        .await
+                        .map(|b| json!(Bytes(b)))
+                        .map_err(Into::into),
+                    Call::Setxattr {
+                        path,
+                        name,
+                        value,
+                        flags,
+                        nofollow,
+                    } => match XattrFlags::from_bits(flags) {
+                        Some(xf) => vfs
+                            .setxattrat(
+                                pid,
+                                StartAnchor::AtFdCwd,
+                                &path,
+                                &name,
+                                &value.0,
+                                xf,
+                                !nofollow,
+                            )
+                            .await
+                            .map(|()| Value::Null)
+                            .map_err(Into::into),
+                        None => Err(Errno::EINVAL.into()),
+                    },
+                    Call::Listxattr { path, nofollow } => vfs
+                        .listxattrat(pid, StartAnchor::AtFdCwd, &path, !nofollow)
+                        .await
+                        .map(|names| json!(names))
+                        .map_err(Into::into),
+                    Call::Removexattr {
+                        path,
+                        name,
+                        nofollow,
+                    } => vfs
+                        .removexattrat(pid, StartAnchor::AtFdCwd, &path, &name, !nofollow)
+                        .await
+                        .map(|()| Value::Null)
+                        .map_err(Into::into),
+                    Call::Open {
+                        path,
+                        flags,
+                        mode,
+                        size,
+                        sha256,
+                        version,
+                    } => {
                         match self
                             .eval_open_anchor_call(
-                                vfs, pid, anchor, page_sid, page_sudo, &path, flags, mode, None,
-                                None, None,
+                                vfs,
+                                pid,
+                                StartAnchor::AtFdCwd,
+                                page_sid,
+                                page_sudo,
+                                &path,
+                                flags,
+                                mode,
+                                size,
+                                sha256,
+                                version,
                             )
                             .await
                         {
@@ -5586,157 +7073,80 @@ impl Kernel {
                             Err(e) => Err(e),
                         }
                     }
-                    Err(e) => Err(e.into()),
-                },
-                Call::Getxattr {
-                    path,
-                    name,
-                    nofollow,
-                } => vfs
-                    .getxattrat(pid, StartAnchor::AtFdCwd, &path, &name, !nofollow)
-                    .await
-                    .map(|b| json!(Bytes(b)))
-                    .map_err(Into::into),
-                Call::Setxattr {
-                    path,
-                    name,
-                    value,
-                    flags,
-                    nofollow,
-                } => match XattrFlags::from_bits(flags) {
-                    Some(xf) => vfs
-                        .setxattrat(
-                            pid,
-                            StartAnchor::AtFdCwd,
-                            &path,
-                            &name,
-                            &value.0,
-                            xf,
-                            !nofollow,
-                        )
-                        .await
-                        .map(|()| Value::Null)
-                        .map_err(Into::into),
-                    None => Err(Errno::EINVAL.into()),
-                },
-                Call::Listxattr { path, nofollow } => vfs
-                    .listxattrat(pid, StartAnchor::AtFdCwd, &path, !nofollow)
-                    .await
-                    .map(|names| json!(names))
-                    .map_err(Into::into),
-                Call::Removexattr {
-                    path,
-                    name,
-                    nofollow,
-                } => vfs
-                    .removexattrat(pid, StartAnchor::AtFdCwd, &path, &name, !nofollow)
-                    .await
-                    .map(|()| Value::Null)
-                    .map_err(Into::into),
-                Call::Open {
-                    path,
-                    flags,
-                    mode,
-                    size,
-                    sha256,
-                    version,
-                } => {
-                    match self
-                        .eval_open_anchor_call(
-                            vfs,
-                            pid,
-                            StartAnchor::AtFdCwd,
-                            page_sid,
-                            page_sudo,
-                            &path,
-                            flags,
-                            mode,
-                            size,
-                            sha256,
-                            version,
-                        )
-                        .await
-                    {
-                        Ok((fd, val)) => {
-                            opened_fd = Some(fd);
-                            Ok(val)
+                    Call::Close { fd } => match parse_fd_ref(fd, &fd_refs) {
+                        Ok(raw_fd) => {
+                            self.eval_close_call(vfs, pid, page_sid, page_sudo, raw_fd, false)
+                                .await
                         }
-                        Err(e) => Err(e),
-                    }
-                }
-                Call::Close { fd } => match parse_fd_ref(fd, &fd_refs) {
-                    Ok(raw_fd) => {
-                        self.eval_close_call(vfs, pid, page_sid, page_sudo, raw_fd, false)
-                            .await
-                    }
-                    Err(e) => Err(e.into()),
-                },
-                Call::Discard { fd } => match parse_fd_ref(fd, &fd_refs) {
-                    Ok(raw_fd) => {
-                        self.eval_close_call(vfs, pid, page_sid, page_sudo, raw_fd, true)
-                            .await
-                    }
-                    Err(e) => Err(e.into()),
-                },
-                Call::Fchmod { fd, mode } => match parse_fd_ref(fd, &fd_refs) {
-                    Ok(raw_fd) => {
-                        self.eval_fchmod(vfs, pid, page_sid, page_sudo, raw_fd, mode)
-                            .await
-                    }
-                    Err(e) => Err(e.into()),
-                },
-                Call::Pread {
-                    fd,
-                    path,
-                    offset,
-                    count,
-                } => {
-                    self.eval_pread(
-                        vfs, pid, page_sid, page_sudo, fd, path, offset, count, &fd_refs,
-                    )
-                    .await
-                }
-                Call::Pwrite { fd, index, data } => match parse_fd_ref(fd, &fd_refs) {
-                    Ok(raw_fd) => {
-                        self.eval_pwrite(vfs, pid, page_sid, page_sudo, raw_fd, index, data.0)
-                            .await
-                    }
-                    Err(e) => Err(e.into()),
-                },
-                Call::InotifyAddWatch { path, mask, .. } => {
-                    self.eval_inotify_add(vfs, pid, page_sudo, &path, mask)
+                        Err(e) => Err(e.into()),
+                    },
+                    Call::Discard { fd } => match parse_fd_ref(fd, &fd_refs) {
+                        Ok(raw_fd) => {
+                            self.eval_close_call(vfs, pid, page_sid, page_sudo, raw_fd, true)
+                                .await
+                        }
+                        Err(e) => Err(e.into()),
+                    },
+                    Call::Fchmod { fd, mode } => match parse_fd_ref(fd, &fd_refs) {
+                        Ok(raw_fd) => {
+                            self.eval_fchmod(vfs, pid, page_sid, page_sudo, raw_fd, mode)
+                                .await
+                        }
+                        Err(e) => Err(e.into()),
+                    },
+                    Call::Pread {
+                        fd,
+                        path,
+                        offset,
+                        count,
+                    } => {
+                        self.eval_pread(
+                            vfs, pid, page_sid, page_sudo, fd, path, offset, count, &fd_refs,
+                        )
                         .await
-                }
-                Call::InotifyRmWatch { wd } => {
-                    self.forward_server_call(pid, page_sudo, Call::InotifyRmWatch { wd })
-                        .await
-                }
-                Call::Ioctl { fd, request, arg } => match parse_fd_ref(fd, &fd_refs) {
-                    Ok(raw_fd) => {
-                        self.eval_ioctl(vfs, pid, page_sudo, raw_fd, request, arg, &fd_refs)
+                    }
+                    Call::Pwrite { fd, index, data } => match parse_fd_ref(fd, &fd_refs) {
+                        Ok(raw_fd) => {
+                            self.eval_pwrite(vfs, pid, page_sid, page_sudo, raw_fd, index, data.0)
+                                .await
+                        }
+                        Err(e) => Err(e.into()),
+                    },
+                    Call::InotifyAddWatch { path, mask, .. } => {
+                        self.eval_inotify_add(vfs, pid, page_sudo, &path, mask)
                             .await
                     }
-                    Err(e) => Err(e.into()),
-                },
-                other => {
-                    let invalidates_accounts = matches!(
-                        other,
-                        Call::Useradd { .. }
-                            | Call::Usermod { .. }
-                            | Call::Userdel { .. }
-                            | Call::Groupadd { .. }
-                            | Call::Groupmod { .. }
-                            | Call::Groupdel { .. }
-                            | Call::Login { .. }
-                            | Call::Logout
-                    );
-                    let res = self.forward_server_call(pid, page_sudo, other).await;
-                    if invalidates_accounts && res.is_ok() {
-                        let mut rt = self.vfs_rt.borrow_mut();
-                        rt.uid_names = default_uid_names();
-                        rt.gid_names = default_gid_names();
+                    Call::InotifyRmWatch { wd } => {
+                        self.forward_server_call(pid, page_sudo, Call::InotifyRmWatch { wd })
+                            .await
                     }
-                    res
+                    Call::Ioctl { fd, request, arg } => match parse_fd_ref(fd, &fd_refs) {
+                        Ok(raw_fd) => {
+                            self.eval_ioctl(vfs, pid, page_sudo, raw_fd, request, arg, &fd_refs)
+                                .await
+                        }
+                        Err(e) => Err(e.into()),
+                    },
+                    other => {
+                        let invalidates_accounts = matches!(
+                            other,
+                            Call::Useradd { .. }
+                                | Call::Usermod { .. }
+                                | Call::Userdel { .. }
+                                | Call::Groupadd { .. }
+                                | Call::Groupmod { .. }
+                                | Call::Groupdel { .. }
+                                | Call::Login { .. }
+                                | Call::Logout
+                        );
+                        let res = self.forward_server_call(pid, page_sudo, other).await;
+                        if invalidates_accounts && res.is_ok() {
+                            let mut rt = self.vfs_rt.borrow_mut();
+                            rt.uid_names = default_uid_names();
+                            rt.gid_names = default_gid_names();
+                        }
+                        res
+                    }
                 }
             };
 
@@ -5896,6 +7306,8 @@ impl Kernel {
         pid: u32,
         page_session_id: Option<&str>,
         page_sudo: bool,
+        page_uid: u32,
+        page_umask: u16,
         path: &str,
         cookie: u64,
         count: Option<u64>,
@@ -5964,6 +7376,28 @@ impl Kernel {
             return Ok(json!(&all[start..end]));
         }
 
+        let root_cloud = Rc::clone(&self.vfs_rt.borrow().root_cloud);
+        let can_page_cache = pid >= SCOPED_PAGE_PID_BASE
+            && root_cloud.is_remote_mode()
+            && installed("pageSysPost").is_ok();
+        let _getdents_scope = if can_page_cache {
+            let scope = root_cloud.begin_page_read(page_uid, page_sudo);
+            if let Some(filter) = CloudMountFilter::for_pid(vfs, &root_cloud, pid) {
+                let mut seen = HashSet::new();
+                let mut paths = Vec::new();
+                filter.push_cloud_prefixes(path, true, &mut seen, &mut paths);
+                let uncached = root_cloud.uncached_page_paths(&paths, page_uid, page_sudo);
+                if !uncached.is_empty() {
+                    root_cloud
+                        .prewarm_page_paths(&uncached, page_umask, page_uid, page_sudo)
+                        .await;
+                }
+            }
+            Some(scope)
+        } else {
+            None
+        };
+
         let dir_entries = vfs.readdir(pid, StartAnchor::AtFdCwd, path).await?;
         let total = dir_entries.len();
         let start = (cookie as usize).min(total);
@@ -5974,6 +7408,20 @@ impl Kernel {
         } else {
             path.trim_end_matches('/')
         };
+        if can_page_cache && let Some(filter) = CloudMountFilter::for_pid(vfs, &root_cloud, pid) {
+            let mut seen = HashSet::new();
+            let mut child_paths = Vec::new();
+            for de in &dir_entries[start..end] {
+                let child_path = format!("{base}/{}", de.name);
+                filter.push_cloud_prefixes(&child_path, false, &mut seen, &mut child_paths);
+            }
+            let uncached = root_cloud.uncached_page_paths(&child_paths, page_uid, page_sudo);
+            if !uncached.is_empty() {
+                root_cloud
+                    .prewarm_page_paths(&uncached, page_umask, page_uid, page_sudo)
+                    .await;
+            }
+        }
         let mut out = Vec::with_capacity(end.saturating_sub(start));
         for de in &dir_entries[start..end] {
             let child_path = format!("{base}/{}", de.name);
@@ -5983,6 +7431,10 @@ impl Kernel {
                 .ok();
             if let Some(st) = stat.as_mut() {
                 self.fill_stat_names(vfs, pid, st).await;
+                if de.name != "." && de.name != ".." {
+                    self.fill_symlink_target(vfs, pid, StartAnchor::AtFdCwd, &child_path, st)
+                        .await;
+                }
             }
             out.push(Dirent {
                 name: de.name.clone(),
@@ -6433,29 +7885,27 @@ impl Kernel {
         raw_fd: u32,
         mode: u16,
     ) -> std::result::Result<Value, abi::Error> {
+        let attr = SetAttr {
+            mode: Some(mode),
+            ..SetAttr::default()
+        };
         if let Some(sid) = page_session_id {
             if raw_fd >= CLIENT_PAGE_FD_BASE {
-                let file = {
+                let (file, cred) = {
                     let rt = self.vfs_rt.borrow();
-                    rt.sessions
-                        .get(sid)
-                        .and_then(|s| s.page_fds.get(&raw_fd))
+                    let sess = rt.sessions.get(sid).ok_or(Errno::EBADF)?;
+                    let file = sess
+                        .page_fds
+                        .get(&raw_fd)
                         .map(|e| e.file.clone())
-                        .ok_or(Errno::EBADF)?
+                        .ok_or(Errno::EBADF)?;
+                    let mut cred = sess.cred(0o022);
+                    if page_sudo {
+                        cred.identity = Identity::root();
+                    }
+                    (file, cred)
                 };
-                if file.access() == vfs::Access::Path {
-                    return Err(Errno::EBADF.into());
-                }
-                file.fs()
-                    .setattr(
-                        file.cred(),
-                        file.handle(),
-                        &SetAttr {
-                            mode: Some(mode),
-                            ..SetAttr::default()
-                        },
-                    )
-                    .await?;
+                file.setattr_as(&cred, &attr).await?;
                 return Ok(Value::Null);
             }
             return self
@@ -6482,27 +7932,8 @@ impl Kernel {
                 )
                 .await;
         }
-        let opt_file = vfs
-            .process_fds(pid)
-            .ok()
-            .and_then(|fds| fds.borrow().get(raw_fd).ok());
-        if let Some(file) = opt_file {
-            if file.access() == vfs::Access::Path {
-                return Err(Errno::EBADF.into());
-            }
-            file.fs()
-                .setattr(
-                    file.cred(),
-                    file.handle(),
-                    &SetAttr {
-                        mode: Some(mode),
-                        ..SetAttr::default()
-                    },
-                )
-                .await?;
-            return Ok(Value::Null);
-        }
-        Err(Errno::EBADF.into())
+        vfs.fsetattr(pid, raw_fd, &attr).await?;
+        Ok(Value::Null)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6529,12 +7960,15 @@ impl Kernel {
             }
             let mut buf = vec![0u8; cap];
             let res = file_ref.read_at(&mut buf, offset).await;
+            let meta = file_ref.metadata().await.ok();
             let _ = file_ref.close().await;
             let n = res?;
             buf.truncate(n);
             let mut st = vfs::stat::stat(&entry.handle.fs, entry.handle.node, &entry.metadata);
+            let size = meta.map(|m| m.size).unwrap_or(st.size);
+            st.size = size;
             self.fill_stat_names(vfs, pid, &mut st).await;
-            return Ok(json!({ "data": Bytes(buf), "stat": st }));
+            return Ok(json!({ "data": Bytes(buf), "size": size, "stat": st }));
         }
         let raw_fd = parse_fd_ref(fd.ok_or(Errno::EBADF)?, fd_refs)?;
         if let Some(sid) = page_session_id {
@@ -6549,8 +7983,9 @@ impl Kernel {
                 };
                 let mut buf = vec![0u8; cap];
                 let n = file.read_at(&mut buf, offset).await?;
+                let size = file.metadata().await.map(|m| m.size).unwrap_or(n as u64);
                 buf.truncate(n);
-                return Ok(json!({ "data": Bytes(buf) }));
+                return Ok(json!({ "data": Bytes(buf), "size": size }));
             }
             return self
                 .forward_server_call(
@@ -6581,12 +8016,16 @@ impl Kernel {
                 .await;
         }
         if let Ok(fds) = vfs.process_fds(pid)
-            && fds.borrow().get(raw_fd).is_ok()
+            && let Ok(file) = {
+                let tbl = fds.borrow();
+                tbl.get(raw_fd)
+            }
         {
             let mut buf = vec![0u8; cap];
             let n = vfs.pread(pid, raw_fd, &mut buf, offset).await?;
+            let size = file.metadata().await.map(|m| m.size).unwrap_or(n as u64);
             buf.truncate(n);
-            return Ok(json!({ "data": Bytes(buf) }));
+            return Ok(json!({ "data": Bytes(buf), "size": size }));
         }
         Err(Errno::EBADF.into())
     }
@@ -6747,103 +8186,217 @@ impl Kernel {
         }
 
         // 2. `/dev/archive` & `/dev/media` (`accelerator::SUBMIT`): translate `PathAt.directory`
-        //    client descriptors (`kfd`, `OS_FD_CWD`, `OS_FD_ROOT`) into `PathAt.open` (`OpenRef`)!
-        if request == accelerator::SUBMIT {
-            let mut submit: Submit =
-                serde_json::from_value(arg).map_err(|_| abi::Error::from(Errno::EINVAL))?;
-            match &mut submit.operation {
-                Operation::Create { output, inputs, .. } => {
-                    self.rewrite_accel_path_at(vfs, pid, output, true)?;
-                    for inp in inputs {
-                        self.rewrite_accel_path_at(vfs, pid, &mut inp.source, false)?;
-                    }
-                }
-                Operation::Extract {
-                    source,
-                    destination,
-                    ..
-                } => {
-                    self.rewrite_accel_path_at(vfs, pid, source, false)?;
-                    self.rewrite_accel_path_at(vfs, pid, destination, true)?;
-                }
-                Operation::List { source, .. } => {
-                    self.rewrite_accel_path_at(vfs, pid, source, false)?;
-                }
-                Operation::Faststart { file } => {
-                    self.rewrite_accel_path_at(vfs, pid, file, true)?;
-                }
-            }
-            arg = serde_json::to_value(submit).map_err(|_| abi::Error::from(Errno::EIO))?;
-        }
-
+        //    client descriptors (`kfd`, `OS_FD_CWD`, `OS_FD_ROOT`) into `PathAt.open` (`OpenRef`)
+        //    for `CloudFs`, or a temporary server `O_PATH | O_DIRECTORY` fd for system `/usr`
+        //    `ImageFs` directories!
         let target_fd = if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
             self.resolve_process_server_fd(pid, raw_fd)?
         } else {
             raw_fd
         };
-        self.forward_server_call(
-            pid,
-            page_sudo,
-            Call::Ioctl {
-                fd: FdRef::Fd(target_fd),
-                request,
-                arg,
-            },
-        )
-        .await
+        let mut temp_usr_fds: Vec<u32> = Vec::new();
+        let ioctl_res = async {
+            if request == accelerator::SUBMIT {
+                let mut submit: Submit =
+                    serde_json::from_value(arg).map_err(|_| abi::Error::from(Errno::EINVAL))?;
+                match &mut submit.operation {
+                    Operation::Create { output, inputs, .. } => {
+                        self.rewrite_accel_path_at(
+                            vfs,
+                            pid,
+                            page_sudo,
+                            output,
+                            true,
+                            &mut temp_usr_fds,
+                        )
+                        .await?;
+                        for inp in inputs {
+                            self.rewrite_accel_path_at(
+                                vfs,
+                                pid,
+                                page_sudo,
+                                &mut inp.source,
+                                false,
+                                &mut temp_usr_fds,
+                            )
+                            .await?;
+                        }
+                    }
+                    Operation::Extract {
+                        source,
+                        destination,
+                        ..
+                    } => {
+                        self.rewrite_accel_path_at(
+                            vfs,
+                            pid,
+                            page_sudo,
+                            source,
+                            false,
+                            &mut temp_usr_fds,
+                        )
+                        .await?;
+                        self.rewrite_accel_path_at(
+                            vfs,
+                            pid,
+                            page_sudo,
+                            destination,
+                            true,
+                            &mut temp_usr_fds,
+                        )
+                        .await?;
+                    }
+                    Operation::List { source, .. } => {
+                        self.rewrite_accel_path_at(
+                            vfs,
+                            pid,
+                            page_sudo,
+                            source,
+                            false,
+                            &mut temp_usr_fds,
+                        )
+                        .await?;
+                    }
+                    Operation::Faststart { file } => {
+                        self.rewrite_accel_path_at(
+                            vfs,
+                            pid,
+                            page_sudo,
+                            file,
+                            true,
+                            &mut temp_usr_fds,
+                        )
+                        .await?;
+                    }
+                }
+                arg = serde_json::to_value(submit).map_err(|_| abi::Error::from(Errno::EIO))?;
+            }
+
+            self.forward_server_call(
+                pid,
+                page_sudo,
+                Call::Ioctl {
+                    fd: FdRef::Fd(target_fd),
+                    request,
+                    arg,
+                },
+            )
+            .await
+        }
+        .await;
+        for sfd in temp_usr_fds {
+            let _ = self
+                .forward_server_call(pid, page_sudo, Call::Close { fd: FdRef::Fd(sfd) })
+                .await;
+        }
+        ioctl_res
     }
 
-    fn rewrite_accel_path_at(
+    async fn rewrite_accel_path_at(
         &self,
         vfs: &Vfs,
         pid: u32,
+        page_sudo: bool,
         pat: &mut PathAt,
         mutating: bool,
-    ) -> vfs::Result<()> {
+        temp_usr_fds: &mut Vec<u32>,
+    ) -> std::result::Result<(), abi::Error> {
         pat.open = None;
-        let root_cloud = Rc::clone(&self.vfs_rt.borrow().root_cloud);
+        let (root_cloud, usr_fs_id) = {
+            let rt = self.vfs_rt.borrow();
+            (Rc::clone(&rt.root_cloud), rt.usr_fs_id.clone())
+        };
         let dir_fd = pat.directory as i32;
-        if dir_fd == OS_FD_ROOT {
+        let (pin, handle, open_ref) = if dir_fd == OS_FD_ROOT {
             let fs_ctx = vfs.process_fs_context(pid)?;
             let root_anchor = fs_ctx.borrow().root.clone();
-            if root_anchor.pin.fstype() != vfs::FsType::Cloud {
-                return Err(Errno::EXDEV);
-            }
-            if mutating && root_anchor.pin.effective_rdonly() {
-                return Err(Errno::EROFS);
-            }
-            let real_open = root_cloud
-                .real_cloud_open_ref(root_anchor.open.open_ref())
-                .ok_or(Errno::EBADF)?;
-            pat.open = Some(real_open);
+            (
+                root_anchor.pin,
+                root_anchor.handle,
+                root_anchor.open.open_ref().clone(),
+            )
         } else if dir_fd == OS_FD_CWD || dir_fd == -100 {
             let fs_ctx = vfs.process_fs_context(pid)?;
             let cwd_anchor = fs_ctx.borrow().cwd.clone();
-            if cwd_anchor.pin.fstype() != vfs::FsType::Cloud {
-                return Err(Errno::EXDEV);
-            }
-            if mutating && cwd_anchor.pin.effective_rdonly() {
-                return Err(Errno::EROFS);
-            }
-            let real_open = root_cloud
-                .real_cloud_open_ref(cwd_anchor.open.open_ref())
-                .ok_or(Errno::EBADF)?;
-            pat.open = Some(real_open);
+            (
+                cwd_anchor.pin,
+                cwd_anchor.handle,
+                cwd_anchor.open.open_ref().clone(),
+            )
         } else {
             let fds = vfs.process_fds(pid)?;
             let dir_file = fds.borrow().get(pat.directory)?;
-            let pin = dir_file.mount_pin().ok_or(Errno::EXDEV)?;
-            if pin.fstype() != vfs::FsType::Cloud {
-                return Err(Errno::EXDEV);
+            let pin = dir_file.mount_pin().ok_or(Errno::EXDEV)?.clone();
+            (pin, dir_file.handle().clone(), dir_file.open_ref().clone())
+        };
+
+        if pin.fs().id() == &usr_fs_id {
+            if mutating {
+                return Err(Errno::EROFS.into());
             }
-            if mutating && pin.effective_rdonly() {
-                return Err(Errno::EROFS);
+            if root_cloud.is_pid_cloud_denied(pid) {
+                return Err(Errno::EACCES.into());
             }
-            let real_open = root_cloud
-                .real_cloud_open_ref(dir_file.open_ref())
-                .ok_or(Errno::EBADF)?;
-            pat.open = Some(real_open);
+            let fs = pin.fs();
+            let root_cred = Cred::root();
+            let meta = fs.metadata(&root_cred, &handle).await?;
+            if !meta.is_dir() {
+                return Err(Errno::ENOTDIR.into());
+            }
+            let mut parts = Vec::new();
+            let mut cur = handle;
+            let mut seen = std::collections::HashSet::from([cur.node]);
+            while let Some((parent_entry, name)) = fs.parent(&root_cred, &cur).await? {
+                parts.push(name);
+                if !seen.insert(parent_entry.handle.node) {
+                    return Err(Errno::ESTALE.into());
+                }
+                cur = parent_entry.handle;
+            }
+            parts.reverse();
+            let usr_dir_path = if parts.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", parts.join("/"))
+            };
+            if usr_dir_path != "/usr" && !usr_dir_path.starts_with("/usr/") {
+                return Err(Errno::EXDEV.into());
+            }
+            let opened = self
+                .forward_server_call(
+                    pid,
+                    page_sudo,
+                    Call::Open {
+                        path: usr_dir_path,
+                        flags: abi::O_PATH | abi::O_DIRECTORY,
+                        mode: 0,
+                        size: None,
+                        sha256: None,
+                        version: None,
+                    },
+                )
+                .await?;
+            let server_fd = opened
+                .get("fd")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| abi::Error::from(Errno::EIO))?;
+            temp_usr_fds.push(server_fd);
+            pat.open = None;
+            pat.directory = server_fd;
+            return Ok(());
         }
+
+        if pin.fstype() != vfs::FsType::Cloud {
+            return Err(Errno::EXDEV.into());
+        }
+        if mutating && pin.effective_rdonly() {
+            return Err(Errno::EROFS.into());
+        }
+        let real_open = root_cloud
+            .real_cloud_open_ref(&open_ref)
+            .ok_or(Errno::EBADF)?;
+        pat.open = Some(real_open);
         Ok(())
     }
 

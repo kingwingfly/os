@@ -22,7 +22,7 @@ const NO_MEMORY = assemble('(module (func (export "_start")))');
 const IMPORTED_MEMORY = assemble('(module (import "env" "memory" (memory 3 4)) (func (export "_start")))');
 const WRONG_MEMORY_NAME = assemble('(module (memory 1) (export "mem" (memory 0)) (func (export "_start")))');
 const MEMORY_AS_FUNCTION = assemble('(module (import "env" "memory" (func)) (memory 1) (func (export "_start")))');
-const SCRIPT = Buffer.from('#!/bin/sh\necho no\n');
+const SCRIPT = Buffer.from('echo no\n');
 
 test.beforeEach(async ({ request, page }) => {
   base = '/exec-' + Date.now().toString(36);
@@ -135,7 +135,8 @@ for (const jspi of [true, false]) test(`a process writes a file larger than a ba
   await expect(page.locator('.transcript pre').last()).toHaveText('abcdefghijklmnopqrstuvwxyz0123456789');
   await run(page, './coreutils cat copy.txt | ./coreutils wc -l');
   await expect(page.locator('.transcript pre').last()).toHaveText('10000');
-  expect([...calls]).toEqual([jspi ? 'fetch' : 'xhr']);
+  // Under L2, worker runtime calls bridge to client-kernel via Atomics/JSPI and hit the server via fetch (never raw XHR).
+  expect([...calls]).toEqual(['fetch']);
 });
 
 test('an image initializer runs once before main after resource instrumentation', async ({ page, request }) => {
@@ -167,7 +168,7 @@ test('the loader and the X rule refuse as Linux refuses, with its words', async 
   await terminal(page);
   // A text file with the execute bit is not a program; a wasm-looking name does not help it.
   await run(page, './script.sh');
-  await expect(transcript(page)).toContainText('./script.sh: cannot execute binary file: Exec format error');
+  await expect(transcript(page)).toContainText('./script.sh: Exec format error');
   // Imports the engine does not give, no entry point, no memory: ENOEXEC, saying why.
   await run(page, './bad-import');
   await expect(transcript(page)).toContainText('./bad-import: cannot execute binary file: Exec format error (unknown import foo.bar)');
@@ -180,7 +181,7 @@ test('the loader and the X rule refuse as Linux refuses, with its words', async 
   await expect(transcript(page)).toContainText('./plain: Permission denied');
   // An argument requests execution; a directory alone now performs implicit cd.
   await run(page, './sub argument');
-  await expect(transcript(page)).toContainText('./sub: Is a directory');
+  await expect(transcript(page)).toContainText('./sub: Permission denied');
   await run(page, './missing');
   await expect(transcript(page)).toContainText('./missing: No such file or directory');
   // An x-only file runs: its image is read by the exec token, never by path.

@@ -402,6 +402,20 @@ impl Kernel {
         signal: Option<u8>,
         host: &str,
     ) -> Result<String, JsValue> {
+        let can_exit = {
+            let state = self.state.borrow();
+            state
+                .processes
+                .get(&pid)
+                .filter(|local| local.host == host)
+                .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?
+                .ended
+                .is_none()
+        };
+        if !can_exit {
+            return Err(fail(Errno::ESRCH.into()));
+        }
+        self.close_process_server_fds(pid).await;
         let (token, ppid) = {
             let mut state = self.state.borrow_mut();
             let local = state

@@ -26,7 +26,10 @@ import { requireExecutionSupport } from '../kernel/capabilities.js';
 // Why execve or the loader said no, as the shell says it: the name as typed, then glibc's words.
 const refused = (name, error) => {
   const why = error.errno && error.message === error.errno ? (STRERROR[error.errno] ?? error.errno) : error.message;
-  return Object.assign(new Error(`${name}: ${why}`), { errno: error.errno });
+  const tag = (error.errno === 'ENOTCONN' || error.errno === 'ENODEV') && !/offline|disconnected|ENODEV|ENOTCONN/.test(why)
+    ? ` (${error.errno})`
+    : '';
+  return Object.assign(new Error(`${name}: ${why}${tag}`), { errno: error.errno });
 };
 // exit(2) of the process `pid`, then waitpid for it, so no zombie stays in the registry: both
 // happen in the client kernel, which tells the browser's machine in a batch. The wait goes even
@@ -158,6 +161,7 @@ async function hangupTerminal(tty, resume, fallback = 0) {
   tty.session = 0; tty.control.pgrp = 0;
   // Device-generated delivery uses each recipient's own proof, including when
   // the master holder and the slave's session belong to different accounts.
+  if (!recipients.length) return;
   for (const signal of resume ? [SIG.HUP, SIG.CONT] : [SIG.HUP]) {
     await Promise.allSettled(recipients.map(p => kernelCall('kill', { pid: p.pid, from: p.pid, signal })));
   }
@@ -258,7 +262,6 @@ export async function exec(stages, options = {}) {
   const onState = state => { if (!finished) options.onState?.(state); };
   const env = piped => ({
     HOME: home, USER: user, LOGNAME: user, PATH: '/usr/bin', SHELL: '/usr/bin/sh', LANG: 'C.UTF-8',
-    PS1: '${USER}@os:${PWD}' + (user === 'root' ? ' # ' : ' $ '), PS2: '> ',
     TERM: piped ? 'dumb' : 'xterm-256color', COLUMNS: String(options.columns ?? 80), LINES: String(options.rows ?? 24),
     TZ: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
     ...options.environment,
@@ -508,8 +511,8 @@ export async function exec(stages, options = {}) {
         return Promise.all(owned.filter(pair => pair.terminal.session === pid).map(pair => releaseTerminal(false, pair.terminal)));
       });
       const closing = Promise.all([hangup, deviceCleanup, outright ? closeHeld(files, pid, cleanupToken(), { umask, sudo }) : Promise.resolve()]);
-      void closing.then(() => reap(pid, { status: code, signal }, forked));
-      void Promise.allSettled([closing, ...displaying]).then(() => { completing.delete(pid); settle(code); });
+      const reaped = closing.then(() => reap(pid, { status: code, signal }, forked));
+      void Promise.allSettled([reaped, ...displaying]).then(() => { completing.delete(pid); settle(code); });
     };
     // A signal that ends it: heeded at its next call, as it exits; outright if it cannot.
     const kill = signal => {
@@ -543,6 +546,7 @@ export async function exec(stages, options = {}) {
         case 'readdir': return { entries: await kernelCall('kfd_readdir', { pid, kfd: args.kfd }) };
         case 'fstat': return await kernelCall('kfd_fstat', { pid, kfd: args.kfd });
         case 'ftruncate': await kernelCall('kfd_ftruncate', { pid, kfd: args.kfd, size: args.size }); return {};
+        case 'futimens': await kernelCall('kfd_futimens', { pid, kfd: args.kfd, atime: args.atime, mtime: args.mtime }); return {};
         case 'fsync': await kernelCall('kfd_fsync', { pid, kfd: args.kfd, dataOnly: !!args.dataOnly }); return {};
         case 'set_append': await kernelCall('kfd_set_append', { pid, kfd: args.kfd, append: !!args.append }); return {};
         case 'is_append': return { append: await kernelCall('kfd_is_append', { pid, kfd: args.kfd }) };
@@ -583,7 +587,10 @@ export async function exec(stages, options = {}) {
             : await kernelCall('process_call', { pid, call: args });
           if (reply?.pgid != null) hosted.get(reply.pid)?.membership(reply);
         }
-        else if (type === 'cleanup') reply = { token: cleanupToken() };
+        else if (type === 'cleanup') {
+          await kernelCall('proc_close_server_fds', { pid }).catch(() => {});
+          reply = { token: cleanupToken() };
+        }
         else if (type === 'reconcile') { await reconciling; await reconcile(); reply = {}; }
         else if (type === 'getpid') reply = await kernelCall('getpid', { pid: args.pid });
         // kill(2) from a process is the process's, by its own credentials.
@@ -863,9 +870,9 @@ export async function exec(stages, options = {}) {
     return hangupTerminal(tty, resume, fallback);
   };
   const hangupWithoutTerminal = async () => {
-    const members = new Map([...memberships.values(), ...group()].map(p => [p.pid, p]));
-    for (const signal of [SIG.HUP, SIG.CONT]) await Promise.allSettled([...members.values()]
-      .filter(p => !p.ended).map(p => kernelCall('kill', { pid: p.pid, from: p.pid, signal })));
+    const live = [...new Map([...memberships.values(), ...group()].map(p => [p.pid, p])).values()].filter(p => !p.ended);
+    if (!live.length) return;
+    for (const signal of [SIG.HUP, SIG.CONT]) await Promise.allSettled(live.map(p => kernelCall('kill', { pid: p.pid, from: p.pid, signal })));
     await reconciling; await reconcile();
   };
   const ptyRequest = async (process, args) => {

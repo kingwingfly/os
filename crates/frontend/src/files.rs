@@ -49,6 +49,8 @@ pub struct Files {
     positions: StoredValue<HashMap<String, (i32, i32)>>,
     /// An older animation frame must not restore over a newer listing.
     rendered: StoredValue<u64>,
+    refreshing: StoredValue<bool>,
+    refresh_pending: StoredValue<bool>,
 }
 
 thread_local! {
@@ -100,6 +102,8 @@ impl Files {
             scroller: NodeRef::new(),
             positions: StoredValue::new(HashMap::new()),
             rendered: StoredValue::new(0),
+            refreshing: StoredValue::new(false),
+            refresh_pending: StoredValue::new(false),
         };
         FILES.with(|cell| cell.set(Some(files)));
         files
@@ -133,19 +137,30 @@ impl Files {
     /// List its directory again, as it is now: unless a navigation began meanwhile, which the
     /// refresh would undo.
     pub fn refresh(self) {
-        let navs = self.navs.get_value();
+        if self.refreshing.get_value() {
+            self.refresh_pending.set_value(true);
+            return;
+        }
+        self.refreshing.set_value(true);
         spawn_local(async move {
-            let path = self.cwd.get_untracked();
-            let asked = self.asked.get_value() + 1;
-            self.asked.set_value(asked);
-            let listed = crate::listing(&path).await;
-            if self.asked.get_value() != asked
-                || self.navs.get_value() != navs
-                || self.cwd.get_untracked() != path
-            {
-                return;
+            loop {
+                self.refresh_pending.set_value(false);
+                let navs = self.navs.get_value();
+                let path = self.cwd.get_untracked();
+                let asked = self.asked.get_value() + 1;
+                self.asked.set_value(asked);
+                let listed = crate::listing(&path).await;
+                if self.asked.get_value() == asked
+                    && self.navs.get_value() == navs
+                    && self.cwd.get_untracked() == path
+                {
+                    self.show(path, listed);
+                }
+                if !self.refresh_pending.get_value() {
+                    break;
+                }
             }
-            self.show(path, listed);
+            self.refreshing.set_value(false);
         });
     }
     /// Explicit user refresh bypasses cached directory metadata without navigating.
