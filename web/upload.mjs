@@ -12,7 +12,9 @@ const RETRIES = 3;
 
 // The descriptors this page writes, closed as it goes, so that another may go on with them.
 const writing = new Set();
-addEventListener('pagehide', () => closeOnLeaving([...writing]));
+addEventListener('pagehide', () => {
+  for (const opened of writing) closeOnLeaving([opened.fd], opened.fd_epoch);
+});
 
 export class Cancelled extends Error { constructor() { super('Upload cancelled'); this.name = 'Cancelled'; } }
 
@@ -36,7 +38,7 @@ const CLIENT_PAGE_FD_BASE = 0x40000000;
 
 // pwrite(2) of chunk `index`, as an XMLHttpRequest for remote authority uploads (which reports
 // progress and stops when asked) or intercepted `fetch` for client-mounted filesystems.
-function send(fd, index, blob, sha256, requests) {
+function send({ fd, fd_epoch }, index, blob, sha256, requests) {
   if (fd >= CLIENT_PAGE_FD_BASE) {
     const controller = new AbortController();
     const handle = { abort: () => controller.abort() };
@@ -63,6 +65,7 @@ function send(fd, index, blob, sha256, requests) {
     const xhr = new XMLHttpRequest(); requests.add(xhr);
     xhr.open('PUT', `/api/pwrite?fd=${fd}&index=${index}`);
     xhr.setRequestHeader('X-Chunk-SHA256', sha256);
+    if (fd_epoch) xhr.setRequestHeader('X-Fd-Epoch', fd_epoch);
     const done = () => requests.delete(xhr);
     xhr.onload = () => {
       done();
@@ -77,9 +80,9 @@ function send(fd, index, blob, sha256, requests) {
 }
 // Send a chunk, again after a moment if the network or the server failed; a refusal is final.
 // `halted` says whether the upload stopped meanwhile, as another chunk failed.
-async function sendWithRetries(fd, index, blob, sha256, requests, signal, halted) {
+async function sendWithRetries(opened, index, blob, sha256, requests, signal, halted) {
   for (let attempt = 0; ; attempt++) {
-    try { return await send(fd, index, blob, sha256, requests); }
+    try { return await send(opened, index, blob, sha256, requests); }
     catch (error) {
       if (signal.aborted || error instanceof Cancelled) throw new Cancelled();
       if (attempt + 1 >= RETRIES || (error.status >= 400 && error.status < 500 && error.status !== 400)) throw error;
@@ -118,17 +121,19 @@ export async function uploadFile(file, destination, { progress = () => {}, signa
   let halted = false, failure;
   const requests = new Set(), abort = () => { halted = true; requests.forEach(xhr => xhr.abort()); };
   signal.addEventListener('abort', abort, { once: true });
-  writing.add(fd);
+  writing.add(opened);
   // Still here, while it sends: the page keeps its descriptor; another page going on with the
   // file, or its removal, stops the next chunk (EBADF).
   const lease = fd >= CLIENT_PAGE_FD_BASE ? () => {} : hold(fd);
   try {
-    await Promise.all(Array.from({ length: Math.min(PARALLEL, pending.length) }, async () => {
+    // Local page descriptors hash the stream as each write completes.
+    const parallel = fd >= CLIENT_PAGE_FD_BASE ? 1 : PARALLEL;
+    await Promise.all(Array.from({ length: Math.min(parallel, pending.length) }, async () => {
       while (pending.length && !halted) {
         if (signal.aborted) throw new Cancelled();
         const index = pending.shift();
         try {
-          await sendWithRetries(fd, index, file.slice(index * size, Math.min((index + 1) * size, file.size)), parts[index], requests, signal, () => halted);
+          await sendWithRetries(opened, index, file.slice(index * size, Math.min((index + 1) * size, file.size)), parts[index], requests, signal, () => halted);
         } catch (error) { if (!(error instanceof Cancelled)) failure ??= error; abort(); throw error; }
         committed.add(index); arrived += length(index);
         progress(percent(arrived, file.size));
@@ -143,17 +148,17 @@ export async function uploadFile(file, destination, { progress = () => {}, signa
     // writing goes with its descriptor (discard), by its content, not by a name another file may
     // have now; a file it was writing over keeps its old content.
     if (signal.aborted || (error instanceof Cancelled && !failure)) {
-      await sys([{ discard: { fd } }]).catch(() => {});
+      await sys([{ discard: { fd } }], { fdEpoch: opened.fd_epoch }).catch(() => {});
       throw new Cancelled();
     }
     // Let go, so that choosing the file again goes on with it now, here or elsewhere.
-    await sys([{ close: { fd } }]).catch(() => {});
+    await sys([{ close: { fd } }], { fdEpoch: opened.fd_epoch }).catch(() => {});
     // Nothing to go on with here: another page went on with it, someone removed it, or it
     // expired.
     const reason = failure || error;
     if (reason.errno === 'EBADF') throw new Error('stopped: ' + (/another tab or device/.test(reason.message) ? reason.message : 'the file was removed, or its upload cancelled, elsewhere'));
     throw new Error(reason.message + '; choose the same file again to resume');
-  } finally { lease(); writing.delete(fd); signal.removeEventListener('abort', abort); }
-  const done = await call('close', { fd });
+  } finally { lease(); writing.delete(opened); signal.removeEventListener('abort', abort); }
+  const done = await call('close', { fd }, { fdEpoch: opened.fd_epoch });
   return { ...done, resumed };
 }

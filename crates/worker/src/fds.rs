@@ -32,6 +32,15 @@ const ELSEWHERE: &str = "the upload goes on from another tab or device";
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// An open reply's public cookie-epoch precondition. The request still authenticates normally.
+pub(crate) fn check_epoch(sid: Option<&str>, expected: &str) -> Result<()> {
+    if sid.is_some_and(|s| os_image::digest(s.as_bytes()) == expected) {
+        Ok(())
+    } else {
+        Err(Errno::EBADF.into())
+    }
+}
+
 /// The descriptor calls of the session `sid`, as `process`. `caller` is the calling process's
 /// key ("ns pid"), or none for a page's batch: a process's own descriptor answers it alone.
 pub fn call(
@@ -93,13 +102,13 @@ pub fn call_in_namespace(
             {
                 return Err(Errno::EROFS.into());
             }
-            // The inode it opened, by whichever name it has now (another inode sharing its
-            // content, a FICLONE copy, is not it); one with no name left is gone.
-            let path = found
+            let mut node = found
                 .ino
-                .and_then(|ino| db.name_of(ino))
-                .ok_or_else(|| Error::because(Errno::EBADF, "the file it opened is gone"))?;
-            kernel::fchmod(db, &process.cred, &path, mode).map(|()| Value::Null)
+                .and_then(|ino| db.inode(ino))
+                .ok_or(Errno::EBADF)?;
+            os_core::inode::chmod(&process.cred, &mut node, mode)?;
+            db.update_inode(&node);
+            Ok(Value::Null)
         }
         Call::Ioctl { fd, request, arg } => {
             yours(db, sid, fd.number(), caller)?;
@@ -310,8 +319,15 @@ fn open(
         ));
     }
     let (path, node, base) = match opening {
+        Opening::New { .. } if version.is_some() => return Err(Errno::ESTALE.into()),
         Opening::New { path, node } => (path, node, None),
         Opening::Existing { path, node } => {
+            if version
+                .as_deref()
+                .is_some_and(|v| Some(v) != node.file.as_deref().map(crate::db::etag).as_deref())
+            {
+                return Err(Errno::ESTALE.into());
+            }
             let current = node.file.as_deref().and_then(|id| db.file(id));
             if let Some(file) = current.filter(|file| !file.complete()) {
                 // The same unfinished file, by the same account, to the same place: go on with
@@ -336,12 +352,6 @@ fn open(
             // Content is written whole: what is there is replaced, or not written.
             if append || flags & O_TRUNC == 0 {
                 return Err(Errno::EEXIST.into());
-            }
-            if version
-                .as_deref()
-                .is_some_and(|v| Some(v) != node.file.as_deref().map(crate::db::etag).as_deref())
-            {
-                return Err(Errno::ESTALE.into());
             }
             // Truncated as it opens, as O_TRUNC does on Linux: its new content shows as it is
             // written, at every name of it.
@@ -455,7 +465,14 @@ pub fn writable(db: &mut Db, who: &Identity, file: &File) -> Result<(String, Nod
     };
     // A name `who` may not reach is not told of.
     kernel::namei(db, who, &path, false)?;
-    match (&file.base, db.node(&path)) {
+    let node = db.node(&path);
+    if file
+        .target_ino
+        .is_some_and(|ino| node.as_ref().is_none_or(|n| n.ino != ino))
+    {
+        return Err(Errno::ESTALE.into());
+    }
+    match (&file.base, node) {
         (Some(base), Some(node)) if node.file.as_ref() == Some(base) => {
             if !kernel::permission(who, &node, WRITE) {
                 return Err(Errno::EACCES.into());

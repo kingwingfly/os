@@ -814,6 +814,9 @@ impl<T: HelperTransport> Filesystem for HelperFs<T> {
         })
     }
 
+    // Host processes can replace a directory entry between fstatat and unlinkat.
+    // Keep the default EOPNOTSUPP for conditional upload cleanup.
+
     fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             self.check_handle_fs(dir)?;

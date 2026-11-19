@@ -501,6 +501,13 @@ test('L2 root seeding + EROFS, v2 statfs + non-root mknod, v2 FICLONE, and X-Pro
     const createdDev = await rpcAs(aliceToken, session, {
       mknod: { dir: devDir, name: 'alice-' + driver, mode: 0o666, umask: 0o022, rdev: driver },
     });
+    for (const rdev of ['', '0']) {
+      const name = 'inferred-' + (rdev || 'empty');
+      const req = { mknod: { dir: devDir, name, mode: 0o020640, umask: 0o022, rdev } };
+      assert.equal((await rpcAs(guestToken, session, req)).errno, 'EPERM');
+      assert.equal((await rpcAs(aliceToken, session, req)).metadata.rdev, driver);
+      assert.equal(await rpcAs(aliceToken, session, { unlink: { dir: devDir, name } }), null);
+    }
     assert.equal(createdDev.metadata.file_type, 'char-device');
     assert.equal(createdDev.metadata.uid, 1000);
     assert.equal(createdDev.metadata.rdev, driver);
@@ -627,7 +634,9 @@ test('L2 root seeding + EROFS, v2 statfs + non-root mknod, v2 FICLONE, and X-Pro
   const conflict = await postAuthority('/api/sys', { proc: aliceToken, calls: ['getcreds'] }, { 'X-Process-Token': liveProc.token });
   assert.equal(conflict.results[0].err.errno, 'EPERM');
 
-  const sysWithHeader = call => postAuthority('/api/sys', { pid: liveProc.pid, calls: [call] }, { 'X-Process-Token': liveProc.token });
+  const fsHeaders = session => session ? { 'X-Fs-Session': session.id, 'X-Fs-Secret': session.secret } : {};
+  const sysWithHeader = (call, fsSession) => postAuthority('/api/sys', { pid: liveProc.pid, calls: [call] },
+    { 'X-Process-Token': liveProc.token, ...fsHeaders(fsSession) });
   for (const denied of [
     { stat: { path: '/etc/passwd' } },
     { lstat: { path: '/bin' } },
@@ -677,15 +686,21 @@ test('L2 root seeding + EROFS, v2 statfs + non-root mknod, v2 FICLONE, and X-Pro
   assert.equal(procTmp.metadata.file_type, 'dir');
 
   const forgedHandle = { ...procTmp.handle, proof: 'forged-proof' };
-  assert.equal((await sysWithHeader({ inotify_add_watch: { path: '/ignored', handle: forgedHandle } })).results[0].err.errno, 'EACCES');
-  const watchRes = await sysWithHeader({ inotify_add_watch: { path: '/ignored-outside-chroot', handle: procTmp.handle } });
+  assert.equal((await sysWithHeader({ inotify_add_watch: { path: '/ignored', handle: forgedHandle } }, procConn.session)).results[0].err.errno, 'EACCES');
+  const watch = { inotify_add_watch: { path: '/ignored', handle: procTmp.handle } };
+  const otherProcSession = (await rpcAs(liveProc.token, null, 'connect')).session;
+  for (const invalid of [null, otherProcSession, { ...procConn.session, secret: randomUUID() }]) {
+    assert.equal((await sysWithHeader(watch, invalid)).results[0].err.errno, 'EACCES');
+  }
+  const watchRes = await sysWithHeader(watch, procConn.session);
   assert.equal(typeof watchRes.results[0].ok, 'number');
   assert.equal((await sysWithHeader({ inotify_rm_watch: { wd: watchRes.results[0].ok } })).results[0].ok, null);
 
   // /dev/archive Open + SUBMIT with PathAt.open (v2 OpenRef) + Close.
   const tmpDirOpen = await rpcAs(aliceToken, session, { open: { ticket: randomUUID(), handle: tmp.handle, options: opts({ path: true }) } });
   const dstFileOpen = await rpcAs(aliceToken, session, { open: { ticket: randomUUID(), handle: dstEntry.handle, options: opts({ path: true }) } });
-  const sysAlice = call => postAuthority('/api/sys', { pid: 11, calls: [call] }, { 'X-Process-Token': aliceToken });
+  const sysAlice = (call, fsSession = session) => postAuthority('/api/sys', { pid: 11, calls: [call] },
+    { 'X-Process-Token': aliceToken, ...fsHeaders(fsSession) });
   const devOpen = await sysAlice({ open: { path: '/dev/archive', flags: 2 } });
   assert.equal(devOpen.results[0].ok.device, 'archive');
   const archiveFd = devOpen.results[0].ok.fd;
@@ -710,7 +725,7 @@ test('L2 root seeding + EROFS, v2 statfs + non-root mknod, v2 FICLONE, and X-Pro
     },
   });
   assert.equal(badSubmit.results[0].err.errno, 'ENOTDIR');
-  const okSubmit = await sysAlice({
+  const submit = {
     ioctl: {
       fd: archiveFd,
       request: 0x54570101,
@@ -728,7 +743,12 @@ test('L2 root seeding + EROFS, v2 statfs + non-root mknod, v2 FICLONE, and X-Pro
         },
       },
     },
-  });
+  };
+  const otherAliceSession = (await rpcAs(aliceToken, null, 'connect')).session;
+  for (const invalid of [null, otherAliceSession, { ...session, secret: randomUUID() }]) {
+    assert.equal((await sysAlice(submit, invalid)).results[0].err.errno, 'EACCES');
+  }
+  const okSubmit = await sysAlice(submit);
   assert.ok(okSubmit.results[0].ok.id, JSON.stringify(okSubmit));
   assert.ok('ok' in (await sysAlice({ close: { fd: archiveFd } })).results[0]);
 
@@ -740,6 +760,39 @@ test('L2 root seeding + EROFS, v2 statfs + non-root mknod, v2 FICLONE, and X-Pro
     aliceSessionKey, now + 600, now + 300,
   );
   const aliceCookie = `os_session=${aliceSessionToken}; ${guestCookie}`;
+  const guarded = async (call, target, epoch) => (await postAuthority('/api/sys', { calls: [call] }, {
+    Cookie: aliceCookie, ...(epoch ? { 'X-Fd-Epoch': epoch } : {}), ...(target ? { 'X-Fs-Target': JSON.stringify(target) } : {}),
+  })).results[0];
+  const path = '/tmp/client-guarded-upload';
+  const open = { open: { path, flags: 0o1101, mode: 0o600, size: 0 } };
+  const create = await guarded(open, { missing_in: tmp.handle.node.ino });
+  assert.ok(create.ok, JSON.stringify(create));
+  const inode = create.ok.stat.ino;
+  assert.match(create.ok.fd_epoch, /^[a-f0-9]{64}$/);
+  const close = { close: { fd: create.ok.fd } };
+  assert.equal((await guarded(close, null, '0'.repeat(64))).err.errno, 'EBADF');
+  assert.ok('ok' in await guarded(close, null, create.ok.fd_epoch));
+  assert.equal((await guarded(open, { missing_in: tmp.handle.node.ino })).err.errno, 'ESTALE');
+  assert.equal((await guarded(open, { inode: inode + 1 })).err.errno, 'ESTALE');
+  const current = await guarded({ lstat: { path } }, { inode });
+  assert.ok(current.ok.version);
+  assert.equal((await guarded({ open: { ...open.open, version: 'stale' } }, { inode })).err.errno, 'ESTALE');
+
+  const read = (await guarded({ open: { path, flags: 0 } }, { inode })).ok;
+  assert.equal(read.fd_epoch, create.ok.fd_epoch);
+  assert.ok('ok' in await guarded({ rename: { from: path, to: path + '.saved' } }));
+  const replacement = (await guarded(open, { missing_in: tmp.handle.node.ino })).ok;
+  assert.ok('ok' in await guarded({ close: { fd: replacement.fd } }, null, replacement.fd_epoch));
+  const chmod = await guarded({ fchmod: { fd: read.fd, mode: 0o640 } }, null, read.fd_epoch);
+  assert.equal(chmod.ok.ino, inode);
+  assert.equal(chmod.ok.mode & 0o777, 0o640);
+  assert.equal((await guarded({ stat: { path } })).ok.mode & 0o777, 0o600);
+  assert.ok('ok' in await guarded({ unlink: { path: path + '.saved' } }));
+  const unlinked = await guarded({ fchmod: { fd: read.fd, mode: 0o400 } }, null, read.fd_epoch);
+  assert.equal(unlinked.ok.ino, inode);
+  assert.equal(unlinked.ok.nlink, 0);
+  assert.ok('ok' in await guarded({ close: { fd: read.fd } }, null, read.fd_epoch));
+
   const sudoInit = await mf.dispatchFetch('http://localhost/api/sys', {
     method: 'POST',
     headers: { Origin: 'http://localhost', Cookie: aliceCookie, 'Content-Type': 'application/json', 'X-Registry': '1' },

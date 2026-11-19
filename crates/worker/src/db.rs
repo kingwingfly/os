@@ -34,7 +34,7 @@ const ROLLBACK: &str = "rollback";
 /// The version of the tables below, which local state made by an older one does not have.
 pub const SCHEMA_VERSION: &str = "10";
 
-const SCHEMA: [&str; 36] = [
+const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS execution_owners(lineage TEXT PRIMARY KEY, uid INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS device_tasks(id TEXT PRIMARY KEY, lineage TEXT NOT NULL, request TEXT NOT NULL, device TEXT NOT NULL, digest TEXT NOT NULL, sid TEXT NOT NULL, fd INTEGER NOT NULL, owner INTEGER NOT NULL, detached INTEGER NOT NULL DEFAULT 0, grants TEXT NOT NULL, UNIQUE(lineage, request))",
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
@@ -58,6 +58,7 @@ const SCHEMA: [&str; 36] = [
     // A file's content: `size` bytes in chunks of `chunk_size`, chunk i at i × chunk_size, the
     // last one short. An upload names its target path, and the file it replaces there, if any.
     "CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY, size INTEGER NOT NULL, chunk_size INTEGER NOT NULL, state TEXT NOT NULL, sha256 TEXT, uploader INTEGER NOT NULL, target TEXT NOT NULL, base TEXT, touched INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS upload_targets(file TEXT PRIMARY KEY, ino INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS chunks(file TEXT NOT NULL, idx INTEGER NOT NULL, key TEXT NOT NULL, sha256 TEXT, PRIMARY KEY(file, idx))",
     // File descriptors (fds.rs): a session's (each browser is one), by number; the content it
     // reads or writes (none once another writer took it over), where, its open(2) flags,
@@ -70,6 +71,7 @@ const SCHEMA: [&str; 36] = [
     "CREATE INDEX IF NOT EXISTS fds_token ON fds(token)",
     "CREATE INDEX IF NOT EXISTS fds_device ON fds(device)",
     "CREATE INDEX IF NOT EXISTS fds_file ON fds(file)",
+    "CREATE INDEX IF NOT EXISTS fds_ino ON fds(ino)",
     "CREATE INDEX IF NOT EXISTS fds_proc ON fds(proc)",
     // Directories a session watches (inotify), by its watch numbers: what changes in them is
     // told on its lines of the events socket.
@@ -214,7 +216,7 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
             ));
         }
     }
-    for statement in SCHEMA {
+    for &statement in SCHEMA {
         sql.exec(statement, None)?;
     }
     crate::provider_policy::create(sql)?;
@@ -390,6 +392,8 @@ pub struct File {
     pub target: String,
     /// ... and the file it replaces there, if it overwrites one.
     pub base: Option<String>,
+    /// Resolved inode for a page upload delegated by the client VFS.
+    pub target_ino: Option<u64>,
 }
 impl File {
     pub fn complete(&self) -> bool {
@@ -1034,15 +1038,19 @@ impl Db {
         struct Closed {
             file: Option<String>,
             flags: u32,
+            ino: Option<u64>,
         }
         let closed = self.rows::<Closed>(
-            "DELETE FROM fds WHERE sid = ? AND fd = ? RETURNING file, flags",
+            "DELETE FROM fds WHERE sid = ? AND fd = ? RETURNING file, flags, ino",
             vec![text(sid), int(fd)],
         );
         self.clear_expiry("fd", &fd_key(sid, fd));
         for closed in closed {
             if closed.flags & abi::O_ACCMODE == abi::O_RDONLY {
                 self.release(closed.file);
+            }
+            if let Some(ino) = closed.ino {
+                self.forget(ino);
             }
         }
     }
@@ -1092,9 +1100,16 @@ impl Db {
             ENDED.set(true);
         }
     }
+    pub fn bind_upload_target(&mut self, file: &str, ino: u64) {
+        self.run(
+            "INSERT OR IGNORE INTO upload_targets(file, ino) VALUES(?, ?)",
+            vec![text(file), int(ino)],
+        );
+    }
+
     pub fn file(&self, id: &str) -> Option<File> {
         self.rows(
-            "SELECT id, CAST(size AS TEXT) AS size, chunk_size, state, sha256, uploader, target, base FROM files WHERE id = ?",
+            "SELECT id, CAST(size AS TEXT) AS size, chunk_size, state, sha256, uploader, target, base, (SELECT ino FROM upload_targets WHERE file = files.id) AS target_ino FROM files WHERE id = ?",
             vec![text(id)],
         )
         .pop()
@@ -1150,7 +1165,29 @@ impl Db {
             }
         }
     }
+    fn close_file_fds(&mut self, file: &str, writers_only: bool) {
+        #[derive(Deserialize)]
+        struct Closed {
+            sid: String,
+            fd: u32,
+            ino: Option<u64>,
+        }
+        let closed = self.rows::<Closed>(
+            "DELETE FROM fds WHERE file = ? AND (? = 0 OR flags & 3 != 0) RETURNING sid, fd, ino",
+            vec![text(file), int(u8::from(writers_only))],
+        );
+        for fd in closed {
+            self.clear_expiry("fd", &fd_key(&fd.sid, fd.fd));
+            if let Some(ino) = fd.ino {
+                self.forget(ino);
+            }
+        }
+    }
     pub fn finish_file(&mut self, file: &str) {
+        self.run(
+            "DELETE FROM upload_targets WHERE file = ?",
+            vec![text(file)],
+        );
         for path in self.showing(file) {
             changes(&path);
         }
@@ -1159,21 +1196,22 @@ impl Db {
             vec![text(file)],
         );
         // Its writers are done: one closing it, or one whose page went (a recording).
-        self.run(
-            "DELETE FROM fds WHERE file = ? AND flags & 3 != 0",
-            vec![text(file)],
-        );
+        self.close_file_fds(file, true);
         self.clear_expiry("upload", file);
     }
     /// Delete `file` and send its chunks to the garbage, whatever refers to it: every object
     /// under its prefix, also those written but never committed.
     pub fn drop_file(&mut self, file: &str) {
+        self.run(
+            "DELETE FROM upload_targets WHERE file = ?",
+            vec![text(file)],
+        );
         self.drop_extents(file);
         self.discard(&format!("chunks/{file}/"));
         self.discard(&crate::compiler::prefix(file));
         self.run("DELETE FROM chunks WHERE file = ?", vec![text(file)]);
         self.run("DELETE FROM files WHERE id = ?", vec![text(file)]);
-        self.run("DELETE FROM fds WHERE file = ?", vec![text(file)]);
+        self.close_file_fds(file, false);
         self.clear_expiry("upload", file);
         ALARM.set(true);
     }
@@ -1213,9 +1251,13 @@ impl Db {
         .map(|k| k.key)
         .collect()
     }
-    /// Let the inode `ino` go, and what it shows, if nothing names it.
+    /// Collect an inode and its content after the last name and open reference are gone.
     pub(crate) fn forget(&mut self, ino: u64) {
-        if !self.names(ino).is_empty() || self.cloud_pinned(ino) {
+        let held = self.rows::<serde_json::Value>(
+            "SELECT 1 FROM nodes WHERE ino = ?1 UNION ALL SELECT 1 FROM vfs_opens WHERE ino = ?1 AND revoked = 0 UNION ALL SELECT 1 FROM fds WHERE ino = ?1 LIMIT 1",
+            vec![int(ino)],
+        );
+        if !held.is_empty() {
             return;
         }
         #[derive(Deserialize)]

@@ -145,24 +145,24 @@ function normalizeAbs(path) {
   }
   return '/' + parts.join('/');
 }
-const localNamespaceMount = path => /^\/?(?:\.\/)?dev\//.test(path) ? '/dev/fd' : '/proc/self';
+
 const procFdCandidate = path => typeof path === 'string' && /(?:^|\/)(?:proc\/(?:self|[0-9]+)\/fd|dev\/fd)\/[0-9]+$/.test(path);
 function hasProcFsMount(path) {
   try {
-    const sfs = vfsCall('statfs', { dirfd: OS_FD_ROOT, path: localNamespaceMount(path) });
+    const sfs = vfsCall('statfs', { dirfd: OS_FD_ROOT, path: path.replace(/\/[0-9]+$/, '') });
     return sfs?.f_type === 0x9fa0;
   } catch {
     return false;
   }
 }
-function resolveProcFd(anchor, rawPath) {
+function resolveProcFd(anchor, rawPath, info = false) {
   if (typeof rawPath !== 'string' || !rawPath) return null;
   let norm = null;
   if (rawPath.startsWith('/')) {
     norm = normalizeAbs(rawPath);
   } else if (anchor === OS_FD_ROOT) {
     norm = normalizeAbs('/' + rawPath);
-  } else if (anchor === OS_FD_CWD && (/(?:^|\/)(?:proc|dev|fd)\//.test(rawPath) || /^[0-9]+$/.test(rawPath))) {
+  } else if (anchor === OS_FD_CWD && (/(?:^|\/)(?:proc|dev|fd|fdinfo)\//.test(rawPath) || /^[0-9]+$/.test(rawPath))) {
     try {
       norm = normalizeAbs(vfsCall('getcwd', {}).cwd + '/' + rawPath);
     } catch {
@@ -177,13 +177,47 @@ function resolveProcFd(anchor, rawPath) {
     }
   }
   if (!norm) return null;
-  const match = /^\/(?:proc\/(self|[0-9]+)\/fd|dev\/fd)\/([0-9]+)$/.exec(norm);
+  const pattern = info ? /^\/proc\/(self|[0-9]+)\/fdinfo\/([0-9]+)$/
+    : /^\/(?:proc\/(self|[0-9]+)\/fd|dev\/fd)\/([0-9]+)$/;
+  const match = pattern.exec(norm);
   if (!match) return null;
   if (match[1] && match[1] !== 'self' && Number(match[1]) !== process.pid) return null;
   if (!hasProcFsMount(norm)) return null;
   const guestFd = Number(match[2]);
   return { guestFd, found: fds.get(guestFd) ?? null, procPath: norm };
 }
+function procInfo(anchor, path) {
+  const entry = resolveProcFd(anchor, path, true);
+  if (!entry) return null;
+  const { guestFd, found } = entry;
+  if (!found) throw new Errno(ENOENT);
+  if (found.kind === 'kfd') return { path: `/proc/self/fdinfo/${found.kfd}` };
+  const access = found.writable ? (found.read || found.readable ? O_RDWR : O_WRONLY) : O_RDONLY;
+  const flags = access | (found.append ? O_APPEND : 0) | (cloexec.has(guestFd) ? O_CLOEXEC : 0);
+  const data = encoder.encode(`pos:\t${found.pos ?? 0}\nflags:\t0${flags.toString(8)}\n`);
+  return { data, stat: { ino: guestFd + 1, mode: 0o100400, nlink: 1, uid: identity.uid, gid: identity.gid, size: data.length } };
+}
+
+function openProcInfo(info, flags) {
+  if (flags & O_DIRECTORY) throw new Errno(ENOTDIR);
+  if (flags & (3 | O_TRUNC)) throw new Errno(ERRNO.EACCES);
+  const fd = lowest();
+  install(fd, { kind: 'in', procInfo: true, stat: info.stat, data: info.data, pos: 0, pathOnly: !!(flags & O_PATH) });
+  if (flags & O_CLOEXEC) cloexec.add(fd);
+  return fd;
+}
+
+function procFdDirectory(path) {
+  if (typeof path !== 'string') return null;
+  const match = /^\/(?:proc\/(self|[0-9]+)\/(fd|fdinfo)|dev\/(fd))\/?$/.exec(path);
+  if (!match || (match[1] && match[1] !== 'self' && Number(match[1]) !== process.pid) || !hasProcFsMount(path)) return null;
+  const info = match[2] === 'fdinfo';
+  return Array.from(fds.keys()).sort((a, b) => a - b).map(fd => ({
+    name: String(fd), ino: fd + 1, type: info ? REGULAR_FILE : SYMBOLIC_LINK,
+    stat: { ino: fd + 1, mode: info ? 0o100400 : 0o120700, nlink: 1, uid: identity.uid, gid: identity.gid },
+  }));
+}
+
 function linkTextFor(found) {
   if (!found) return '';
   if (found.kind === 'pty') return found.master ? '/dev/ptmx' : `/dev/pts/${found.number}`;
@@ -274,7 +308,9 @@ function share(found) {
   postMessage({ described: { slot, gen: shares.gen(slot), description: describe(found) } });
 }
 
-function* uninstall(fd) {
+const kernelDescriptor = found => found?.kind === 'kfd' || found?.serverDev === true;
+
+function* uninstall(fd, kernelClosed = false) {
   const found = fds.get(fd);
   if (!found) throw new Errno(EBADF);
   fds.delete(fd);
@@ -288,21 +324,14 @@ function* uninstall(fd) {
     const gen = shares.gen(found.share);
     const left = shares.drop(found.share, process.pid);
     if (left <= 0) postMessage({ closed: { slot: found.share, gen } });
-    if (found.kind === 'kfd') {
-      if (found.refs <= 0 && found.kfd != null) {
-        vfsCall('close', { kfd: found.kfd });
-        forget();
-      }
-      return;
-    }
-    if (left > 0) return;
-  } else if (found.kind === 'kfd') {
-    if (found.refs <= 0 && found.kfd != null) {
-      vfsCall('close', { kfd: found.kfd });
-      forget();
-    }
+    if (!kernelDescriptor(found) && left > 0) return;
+  }
+  if (found.refs > 0) return;
+  if (kernelDescriptor(found)) {
+    if (!kernelClosed) vfsCall('close', { kfd: found.kfd });
+    forget();
     return;
-  } else if (found.refs > 0) return;
+  }
   yield* closeFd(found);
 }
 
@@ -317,6 +346,7 @@ function* exclusive(found, work) {
 }
 
 function filetype(found) {
+  if (found.procInfo) return REGULAR_FILE;
   if (found.preopen) return DIRECTORY;
   if (found.kind === 'kfd') {
     if (found.isDir) return DIRECTORY;
@@ -437,6 +467,7 @@ function* syncFd(fd, dataOnly) {
 }
 
 function statOf(found) {
+  if (found.procInfo) return found.stat;
   if (found.kind === 'kfd') return vfsCall('fstat', { kfd: found.kfd });
   if (found.preopen) return vfsCall('statat', { dirfd: OS_FD_ROOT, path: '/', follow: true });
   if (found.kind === 'pty') return { ino: found.number, filetype: CHARACTER_DEVICE, mode: 0o020600 };
@@ -519,6 +550,7 @@ function* readFrom(found, at, count) {
   if (found.kind === 'pty') return readPty(found, count);
   if (found.preopen) throw new Errno(EISDIR);
   if (found.kind === 'in') {
+    if (found.pathOnly) throw new Errno(EBADF);
     const out = found.data.subarray(found.pos, found.pos + count);
     found.pos += out.length;
     return out;
@@ -746,6 +778,10 @@ function openPathAt(dirfd, rawPath, dirflags, oflags, base, fdflags, noctty = fa
   const append = !pathOnly && (fdflags & FDFLAG_APPEND) !== 0;
   const cloexecFlag = (extraFlags & O_CLOEXEC) !== 0;
   let anchor = resolveAnchorForPath(dirfd, rawPath);
+
+  const info = procInfo(anchor, rawPath);
+  if (info?.data) return openProcInfo(info, (write ? O_WRONLY : 0) | extraFlags | (oflags & OFLAG_DIRECTORY ? O_DIRECTORY : 0));
+  if (info) { anchor = OS_FD_ROOT; rawPath = info.path; }
 
   // Reopening a descriptor via `/proc/self/fd/<N>`, `/proc/<pid>/fd/<N>`, or `/dev/fd/<N>`
   // verifies first that genuine `ProcFs` (`0x9fa0`) is mounted in this root/namespace.
@@ -1061,6 +1097,10 @@ const wasi = {
       }
     } else if (found.kind === 'kfd' && found.isDir) {
       entries = vfsCall('readdir', { kfd: found.kfd }).entries;
+      try {
+        const dir = vfsCall('readlinkat', { dirfd: OS_FD_ROOT, path: `/proc/self/fd/${found.kfd}` }).target;
+        entries = procFdDirectory(dir) ?? entries;
+      } catch { /* procfs may be absent in this namespace */ }
     } else {
       throw new Errno(ENOTDIR);
     }
@@ -1189,6 +1229,8 @@ const wasi = {
   path_filestat_get: (fd, flags, ptr, len, out) => attempt(function* () {
     const raw = string(ptr, len);
     const anchor = resolveAnchorForPath(fd, raw);
+    const info = procInfo(anchor, raw);
+    if (info) return writeFilestat(out, info.stat ?? vfsCall('statat', { dirfd: OS_FD_ROOT, path: info.path, follow: true }));
     const procEntry = resolveProcFd(anchor, raw);
     if (procEntry) {
       if (!procEntry.found) throw new Errno(ENOENT);
@@ -1230,6 +1272,7 @@ const wasi = {
   path_readlink: (fd, ptr, len, buf, bufLen, used) => attempt(function* () {
     const raw = string(ptr, len);
     const anchor = resolveAnchorForPath(fd, raw);
+    if (procInfo(anchor, raw)) throw new Errno(EINVAL);
     const procEntry = resolveProcFd(anchor, raw);
     let targetStr;
     if (procEntry) {
@@ -1441,7 +1484,7 @@ function* execOrExit(name, argv, env) {
 }
 
 function duplicateDescriptor(found, closeOnExec = false) {
-  if (found.kind === 'kfd') {
+  if (kernelDescriptor(found)) {
     const dupKfd = vfsCall('dup', { kfd: found.kfd }).kfd;
     if (closeOnExec) vfsCall('set_cloexec', { kfd: dupKfd, cloexec: true });
     return { ...found, kfd: dupKfd, refs: 0 };
@@ -1464,14 +1507,14 @@ const wasixCalls = {
   },
   fd_fdflags_get: (fd, ptr) => attempt(function* () {
     const found = descriptor(fd);
-    const isClo = found.kind === 'kfd' ? vfsCall('is_cloexec', { kfd: found.kfd }).cloexec : cloexec.has(fd);
+    const isClo = kernelDescriptor(found) ? vfsCall('is_cloexec', { kfd: found.kfd }).cloexec : cloexec.has(fd);
     view().setUint16(ptr, isClo ? 1 : 0, true);
   }),
   fd_fdflags_set: (fd, flags) => attempt(function* () {
     const found = descriptor(fd);
     if (flags & ~1) throw new Errno(EINVAL);
     const setClo = (flags & 1) !== 0;
-    if (found.kind === 'kfd') vfsCall('set_cloexec', { kfd: found.kfd, cloexec: setClo });
+    if (kernelDescriptor(found)) vfsCall('set_cloexec', { kfd: found.kfd, cloexec: setClo });
     if (setClo) cloexec.add(fd); else cloexec.delete(fd);
   }),
   tty_get: ptr => {
@@ -1619,22 +1662,23 @@ function forkState({ exec = false, stdin = 'inherit', tty = null, dup2 = [] } = 
   const inputAction = dup2.some(([, to]) => to === 0);
   const parentKfds = new Set();
   for (const found of fds.values()) {
-    if (found?.kind === 'kfd' && found.kfd != null) parentKfds.add(found.kfd);
+    if (kernelDescriptor(found)) parentKfds.add(found.kfd);
   }
   const keepOpenKfds = new Set();
   for (const [from, to] of dup2) {
     if (!inherited.has(from)) throw new Errno(EBADF);
     const src = inherited.get(from);
-    inherited.set(to, src);
+    if (from !== to) inherited.set(to, kernelDescriptor(src) ? { ...src, dupSource: src.kfd } : src);
     closes.delete(to);
-    if (src?.kind === 'kfd' && src.kfd != null) keepOpenKfds.add(src.kfd);
   }
   for (const [fd, found] of inherited) {
     if ((exec && closes.has(fd)) || (fd === 0 && stdin !== 'inherit' && !inputAction)) continue;
-    if (found.kind === 'kfd' && found.kfd != null) keepOpenKfds.add(found.kfd);
+    if (kernelDescriptor(found) && found.dupSource == null) keepOpenKfds.add(found.kfd);
     if (!ids.has(found)) {
       ids.set(found, descriptions.length);
-      descriptions.push({ ...describe(found), refs: 0 });
+      const description = { ...describe(found), refs: 0 };
+      if (found.dupSource != null) description.dupSource = found.dupSource;
+      descriptions.push(description);
     }
     descriptions[ids.get(found)].refs++;
     table.push([fd, ids.get(found), closes.has(fd)]);
@@ -1656,7 +1700,7 @@ function describe(found) {
     case 'in':
       if (shares && found.share == null) share(found);
       if (shares && found.share == null) throw new Errno(ERRNO.EMFILE);
-      return { kind: 'in', tty: found.tty, flags: found.flags, data: found.share == null ? found.data.slice(found.pos) : found.data, share: found.share, refs: found.refs };
+      return { kind: 'in', procInfo: found.procInfo, pathOnly: found.pathOnly, stat: found.stat, tty: found.tty, flags: found.flags, data: found.share == null ? found.data.slice(found.pos) : found.data, share: found.share, refs: found.refs };
     case 'out': return { kind: 'out', fd: found.fd, tty: found.tty, flags: found.flags, closed: found.closed?.buffer ?? null };
     case 'tty': case 'pipe-in': case 'pipe-out': return { fd: found.fd, kind: found.kind, tty: !!found.tty, flags: found.flags, readable: found.readable, writable: found.writable, buffer: found.pipe.buffer, refs: found.refs };
     case 'kfd': {
@@ -1678,7 +1722,7 @@ function adopt(state) {
     switch (description.kind) {
       case 'pty': { const { refs, ...found } = description; return found; }
       case 'in': {
-        const found = { kind: 'in', tty: description.tty, flags: description.flags, data: description.data, pos: 0 };
+        const found = { kind: 'in', procInfo: description.procInfo, pathOnly: description.pathOnly, stat: description.stat, tty: description.tty, flags: description.flags, data: description.data, pos: 0 };
         if (description.share != null) shares.attach(found, description.share);
         return found;
       }
@@ -1908,51 +1952,30 @@ function sleepUntil(until) {
 // ---- `os.sys` Batch & `(module "os")` Syscall Imports ----
 
 const ttyRequests = new Set(Object.values(IOCTL));
-const rawFds = new Map();
-
-function forgetRaw(fd) {
-  const found = rawFds.get(fd);
-  if (!found) return 0;
-  rawFds.delete(fd);
-  if (found.share == null) return 0;
-  const gen = shares.gen(found.share), left = shares.drop(found.share, process.pid);
-  if (!left) postMessage({ closed: { slot: found.share, gen } });
-  return left;
+function trackOpened(request, result) {
+  const opened = result?.ok;
+  if (!request || !Number.isInteger(opened?.fd)) return result;
+  const kfd = opened.fd, flags = request.flags ?? 0, pathOnly = !!(flags & O_PATH);
+  const access = flags & 3, serverDev = kfd >= 0x20000000 && kfd < 0x40000000;
+  const fd = lowest();
+  install(fd, {
+    kind: serverDev ? 'file' : 'kfd', serverDev, kfd, device: opened.device,
+    read: !pathOnly && access !== O_WRONLY, writable: !pathOnly && access !== O_RDONLY,
+    pathOnly, append: !!(flags & O_APPEND), isDir: !!(flags & O_DIRECTORY) || kindOf(opened.stat?.mode ?? 0) === DIRECTORY,
+    stat: opened.stat, pos: 0, size: opened.size,
+  });
+  if (flags & O_CLOEXEC) cloexec.add(fd);
+  return { ok: { ...opened, fd } };
 }
 
-function trackRaw(calls, results, reserved = null) {
-  for (let i = 0; i < calls.length; i++) {
-    const one = calls[i], result = results[i];
-    const openedReq = one?.open ?? one?.open_at;
-    if (openedReq && Number.isInteger(result?.ok?.fd)) {
-      const fd = result.ok.fd;
-      const found = { kind: 'file', kfd: fd, pos: 0, read: false, refs: 1 };
-      if (reserved != null) shares.attach(found, reserved);
-      rawFds.set(fd, found);
-      if (reserved != null) postMessage({ described: { slot: reserved, gen: shares.gen(reserved), description: describe(found) } });
-    } else if (openedReq && reserved != null) {
-      shares.drop(reserved, process.pid);
-    }
-    if (one?.close || one?.discard) {
-      const arg = one.close ?? one.discard;
-      const fd = arg.fd?.ref != null ? results[arg.fd.ref]?.ok?.fd : arg.fd;
-      if (Number.isInteger(fd)) forgetRaw(fd);
-    }
-  }
-  return results;
-}
-
-function translateGuestFd(rawFd) {
-  if (!Number.isInteger(rawFd)) return rawFd;
-  const u = rawFd >>> 0;
-  if (u === OS_FD_ROOT || u === OS_FD_CWD) return u;
-  if ((rawFd | 0) === -100) return OS_FD_CWD;
-  if (rawFds.has(rawFd)) return rawFd;
-  const found = fds.get(rawFd);
-  if (!found) return rawFd;
-  if (found.preopen && found.kfd == null) return OS_FD_ROOT;
-  if (found.kfd != null) return found.kfd;
-  return rawFd;
+function translateGuestFd(fd) {
+  if (!Number.isInteger(fd)) return fd;
+  const anchor = sentinelAnchor(fd);
+  if (anchor != null) return anchor;
+  if ((fd | 0) === -100) return OS_FD_CWD;
+  const found = fds.get(fd);
+  if (found?.preopen && found.kfd == null) return OS_FD_ROOT;
+  return found?.kfd ?? 0xffffffff;
 }
 
 function translateAcceleratorSubmit(arg) {
@@ -1963,16 +1986,14 @@ function translateAcceleratorSubmit(arg) {
       pa.directory = translateGuestFd(pa.directory);
     }
   };
-  if (op.create) {
-    patchPathAt(op.create.output);
-    for (const inp of op.create.inputs ?? []) patchPathAt(inp?.source);
-  } else if (op.extract) {
-    patchPathAt(op.extract.source);
-    patchPathAt(op.extract.destination);
-  } else if (op.list) {
-    patchPathAt(op.list.source);
-  } else if (op.faststart) {
-    patchPathAt(op.faststart.file);
+  switch (op.operation) {
+    case 'create':
+      patchPathAt(op.output);
+      for (const input of op.inputs ?? []) patchPathAt(input.source);
+      break;
+    case 'extract': patchPathAt(op.source); patchPathAt(op.destination); break;
+    case 'list': patchPathAt(op.source); break;
+    case 'faststart': patchPathAt(op.file); break;
   }
 }
 
@@ -2003,7 +2024,7 @@ const processCalls = call =>
 function isPtyIoctl(call) {
   if (!call?.ioctl) return false;
   if (ttyRequests.has(call.ioctl.request)) return true;
-  return Number.isInteger(call.ioctl.fd) && fds.get(call.ioctl.fd)?.kind === 'pty' && !rawFds.has(call.ioctl.fd);
+  return Number.isInteger(call.ioctl.fd) && fds.get(call.ioctl.fd)?.kind === 'pty';
 }
 
 function osBatch(calls) {
@@ -2011,17 +2032,18 @@ function osBatch(calls) {
     return calls.map(() => ({ err: { errno: 'EPERM' } }));
   }
   const split = calls.some(c =>
-    processCalls(c) ||
+    processCalls(c) || c?.getdents || c?.pread || c?.readlink_at || c?.fstat_at ||
+    /(?:^|\/)fdinfo\/[0-9]+$/.test((c?.stat ?? c?.lstat ?? c?.readlink ?? c?.fstat_at)?.path ?? '') ||
     procFdCandidate(c?.readlink?.path) ||
     procFdCandidate(c?.stat?.path) ||
-    procFdCandidate(c?.lstat?.path) ||
+    procFdCandidate(c?.lstat?.path) || procFdCandidate(c?.chmod?.path) ||
     c?.open || c?.open_at ||
     isPtyIoctl(c) ||
-    (Number.isInteger(c?.close?.fd) && rawFds.has(c.close.fd))
+    c?.close || c?.discard
   );
   if (!split) {
     const translated = calls.map(translateCallFds);
-    return trackRaw(calls, vfsCall('sys', { batch: { calls: translated, umask: process.umask } }).results);
+    return vfsCall('sys', { batch: { calls: translated, umask: process.umask } }).results;
   }
   const results = [];
   for (const original of calls) {
@@ -2037,39 +2059,88 @@ function osBatch(calls) {
       args[key] = fd;
     }
     if (args?.invalidReference) { results.push({ err: args.invalidReference }); continue; }
-    const procRL = call?.readlink?.path ? resolveProcFd(OS_FD_ROOT, call.readlink.path) : null;
-    const procSt = call?.stat?.path ? resolveProcFd(OS_FD_ROOT, call.stat.path) : null;
-    const procLst = call?.lstat?.path ? resolveProcFd(OS_FD_ROOT, call.lstat.path) : null;
-    if (procRL) {
-      if (!procRL.found) { results.push({ err: { errno: 'ENOENT' } }); continue; }
-      try { results.push({ ok: linkTextFor(procRL.found) }); }
-      catch (err) {
-        const errno = err instanceof Errno ? Object.keys(ERRNO).find(k => ERRNO[k] === err.errno) ?? 'EIO' : 'EIO';
-        results.push({ err: { errno } });
+    try {
+      const arg = call?.chmod ?? call?.pread ?? call?.stat ?? call?.lstat ?? call?.open ?? call?.open_at ?? call?.readlink ?? call?.readlink_at ?? call?.fstat_at;
+      const virtualPath = typeof arg?.path === 'string' && (arg.path.startsWith('/') || arg.dirfd != null);
+      const info = virtualPath && !call.chmod && procInfo(translateGuestFd(arg.dirfd ?? OS_FD_CWD), arg.path);
+      const dir = procFdDirectory(call?.getdents?.path);
+      if (dir) {
+        const { cookie = 0, count = dir.length } = call.getdents;
+        results.push({ ok: dir.slice(cookie, cookie + count) }); continue;
       }
-    } else if (procSt) {
-      if (!procSt.found) { results.push({ err: { errno: 'ENOENT' } }); continue; }
-      try { results.push({ ok: statOf(procSt.found) }); }
-      catch (err) {
-        const errno = err instanceof Errno ? Object.keys(ERRNO).find(k => ERRNO[k] === err.errno) ?? 'EIO' : 'EIO';
-        results.push({ err: { errno } });
+      if (info?.path) {
+        arg.path = info.path;
+      } else if (info || (call?.pread && fds.get(call.pread.fd)?.procInfo)) {
+        const value = info ?? fds.get(call.pread.fd);
+        if (call.readlink) throw new Errno(EINVAL);
+        if (call.pread) {
+          if (value.pathOnly) throw new Errno(EBADF);
+          const { offset = 0, count = INLINE } = call.pread;
+          results.push({ ok: { size: value.data.length, stat: value.stat, data: base64(value.data.subarray(offset, offset + count)) } });
+        } else if (call.open || call.open_at) {
+          results.push({ ok: { fd: openProcInfo(value, arg.flags ?? 0), size: value.data.length } });
+        } else results.push({ ok: value.stat });
+        continue;
       }
-    } else if (procLst && procLst.found == null) {
-      results.push({ err: { errno: 'ENOENT' } });
-    } else if (procLst && procLst.found.kind !== 'kfd') {
-      const targetStr = linkTextFor(procLst.found);
-      results.push({ ok: { dev: 0, ino: procLst.guestFd, mode: 0o120700, nlink: 1, uid: identity.uid, gid: identity.gid, size: targetStr.length } });
-    } else if (processCalls(call)) {
+      const entry = !info && virtualPath && resolveProcFd(translateGuestFd(arg.dirfd ?? OS_FD_CWD), arg.path);
+      if (entry) {
+        const { guestFd, found } = entry;
+        if (!found) throw new Errno(ENOENT);
+        if (call.open || call.open_at) {
+          if (arg.size != null || arg.sha256 != null || arg.version != null) throw new Errno(ERRNO.EOPNOTSUPP);
+          const fd = openLinuxPathAt(arg.dirfd ?? OS_FD_CWD, arg.path, arg.flags ?? 0, arg.mode);
+          const opened = descriptor(fd);
+          results.push({ ok: { fd, size: opened.size ?? 0, device: opened.device, stat: opened.stat } });
+          continue;
+        }
+        if (call.readlink || call.readlink_at) {
+          results.push({ ok: linkTextFor(found) });
+          continue;
+        }
+        if (call.stat || (call.fstat_at && !arg.nofollow)) {
+          results.push({ ok: statOf(found) });
+          continue;
+        }
+        if (call.chmod && found.serverDev) {
+          call.fchmod = { fd: guestFd, mode: arg.mode };
+          delete call.chmod;
+        } else if (call.chmod && found.preopen) arg.path = '/';
+        else if (call.chmod && found.kind !== 'kfd') throw new Errno(ERRNO.EOPNOTSUPP);
+        else if (found.kind === 'kfd') {
+          arg.path = `/proc/self/fd/${found.kfd}`;
+        } else if (call.lstat || call.fstat_at) {
+          results.push({ ok: { dev: 0, ino: guestFd, mode: 0o120700, nlink: 1, uid: identity.uid, gid: identity.gid, size: linkTextFor(found).length } });
+          continue;
+        } else if (call.pread) {
+          if (found.preopen) throw new Errno(ERRNO.EISDIR);
+          if (found.kind === 'in') {
+            const { offset = 0, count = INLINE } = arg;
+            results.push({ ok: { size: found.data.length, data: base64(found.data.subarray(offset, offset + Math.min(INLINE, count))) } });
+            continue;
+          }
+          if (!found.serverDev) throw new Errno(ERRNO.ESPIPE);
+          delete arg.path;
+          arg.fd = guestFd;
+        }
+      }
+    } catch (error) {
+      if (!(error instanceof Errno)) throw error;
+      results.push({ err: { errno: Object.keys(ERRNO).find(key => ERRNO[key] === error.errno) ?? 'EIO' } });
+      continue;
+    }
+    if (processCalls(call)) {
       const result = host('process_call', call);
       results.push(result?.errno ? { err: { errno: result.errno } } : { ok: result });
-    } else if (call?.close && Number.isInteger(call.close.fd) && rawFds.has(call.close.fd)) {
-      const remaining = forgetRaw(call.close.fd);
-      if (remaining) results.push({ ok: null });
-      else results.push(...vfsCall('sys', { batch: { calls: [call], umask: process.umask } }).results);
+    } else if (call?.close || call?.discard) {
+      const fd = (call.close ?? call.discard).fd, found = fds.get(fd);
+      if (!found) { results.push({ err: { errno: 'EBADF' } }); continue; }
+      if (call.discard && !kernelDescriptor(found)) { results.push({ err: { errno: 'EINVAL' } }); continue; }
+      const result = kernelDescriptor(found)
+        ? vfsCall('sys', { batch: { calls: [translateCallFds(call)], umask: process.umask } }).results[0]
+        : { ok: null };
+      drive(uninstall(fd, true));
+      results.push(result);
     } else {
-      if (procLst?.found?.kind === 'kfd' && procLst.found.kfd != null) {
-        call.lstat.path = `/proc/self/fd/${procLst.found.kfd}`;
-      }
       if (isPtyIoctl(call)) {
         try {
           const { fd, request: reqCode, arg } = call.ioctl;
@@ -2083,17 +2154,9 @@ function osBatch(calls) {
           results.push({ err: { errno } });
         }
       } else {
-        const isOpen = !!(call?.open || call?.open_at);
-        const reserved = isOpen && shares ? shares.claim(process.pid, 1, 0) : null;
-        if (reserved != null && reserved < 0) { results.push({ err: { errno: 'EMFILE' } }); continue; }
-        try {
-          const translated = translateCallFds(call);
-          const single = vfsCall('sys', { batch: { calls: [translated], umask: process.umask } }).results;
-          results.push(...trackRaw([call], single, reserved));
-        } catch (error) {
-          if (reserved != null) shares.drop(reserved, process.pid);
-          throw error;
-        }
+        const translated = translateCallFds(call);
+        const [result] = vfsCall('sys', { batch: { calls: [translated], umask: process.umask } }).results;
+        results.push(trackOpened(call?.open ?? call?.open_at, result));
       }
     }
   }
@@ -2129,17 +2192,18 @@ function ttyAccess(signal, found = null) {
 
 const optString = (ptr, len) => (ptr === 0 && len === 0) ? null : string(ptr, len);
 
+function openLinuxPathAt(dirfd, raw, flags, mode) {
+  const allowed = 3 | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_APPEND | O_NONBLOCK | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_PATH;
+  if ((flags & ~allowed) || (!(flags & O_PATH) && (flags & 3) === 3)) throw new Errno(EINVAL);
+  const oflags = (flags & O_CREAT ? OFLAG_CREAT : 0) | (flags & O_EXCL ? OFLAG_EXCL : 0) | (flags & O_TRUNC ? OFLAG_TRUNC : 0) | (flags & O_DIRECTORY ? OFLAG_DIRECTORY : 0);
+  const rights = (flags & 3) === O_RDONLY ? RIGHT_READ : (flags & 3) === O_WRONLY ? RIGHT_WRITE : RIGHT_READ | RIGHT_WRITE;
+  const fdflags = (flags & O_APPEND ? FDFLAG_APPEND : 0) | (flags & O_NONBLOCK ? FDFLAG_NONBLOCK : 0);
+  const extra = (flags & O_CLOEXEC) | (flags & O_PATH);
+  return openPathAt(dirfd, raw, (flags & O_NOFOLLOW) ? 0 : FOLLOW, oflags, rights, fdflags, !!(flags & O_NOCTTY), mode, extra);
+}
+
 const osApi = {
-  open: (ptr, len, flags, mode) => posixCall(() => {
-    const allowed = 3 | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_APPEND | O_NONBLOCK | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_PATH;
-    if ((flags & ~allowed) || (!(flags & O_PATH) && (flags & 3) === 3)) throw new Errno(EINVAL);
-    const raw = string(ptr, len);
-    const oflags = (flags & O_CREAT ? OFLAG_CREAT : 0) | (flags & O_EXCL ? OFLAG_EXCL : 0) | (flags & O_TRUNC ? OFLAG_TRUNC : 0) | (flags & O_DIRECTORY ? OFLAG_DIRECTORY : 0);
-    const rights = (flags & 3) === O_RDONLY ? RIGHT_READ : (flags & 3) === O_WRONLY ? RIGHT_WRITE : RIGHT_READ | RIGHT_WRITE;
-    const fdflags = (flags & O_APPEND ? FDFLAG_APPEND : 0) | (flags & O_NONBLOCK ? FDFLAG_NONBLOCK : 0);
-    const extra = (flags & O_CLOEXEC) | (flags & O_PATH);
-    return openPathAt(OS_FD_CWD, raw, (flags & O_NOFOLLOW) ? 0 : FOLLOW, oflags, rights, fdflags, !!(flags & O_NOCTTY), mode, extra);
-  }),
+  open: (ptr, len, flags, mode) => posixCall(() => openLinuxPathAt(OS_FD_CWD, string(ptr, len), flags, mode)),
   // ---- All 11 Wave 2 L2 `(module "os")` Wasm imports ----
   chdir: (pathPtr, pathLen) => posixCall(() => {
     const p = string(pathPtr, pathLen);
@@ -2341,7 +2405,10 @@ const osApi = {
   sys: (ptr, len) => {
     pause();
     const calls = JSON.parse(string(ptr, len));
-    reply = encoder.encode(JSON.stringify({ results: osBatch(calls) }));
+    const results = osBatch(calls).map(result => result.err?.detail != null
+      ? { err: { detail: result.err.detail, errno: result.err.errno } }
+      : result);
+    reply = encoder.encode(JSON.stringify({ results }));
     return reply.length;
   },
   reply: ptr => { bytes().set(reply, ptr); },

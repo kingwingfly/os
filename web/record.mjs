@@ -27,9 +27,9 @@ export async function record(destination, microphone, { acl = null, progress = (
   // Who may hear it, as it is made (stream -m), or it is not made.
   if (acl) {
     const why = await rust.setfacl(destination, acl);
-    if (why) { await sys([{ close: { fd } }, { unlink: { path: destination } }]).catch(() => {}); throw new Error(why.replace(/^setfacl:/, 'stream -m:')); }
+    if (why) { await sys([{ discard: { fd } }], { fdEpoch: begun.fd_epoch }).catch(() => {}); throw new Error(why.replace(/^setfacl:/, 'stream -m:')); }
   }
-  const leaving = () => closeOnLeaving([fd]);
+  const leaving = () => closeOnLeaving([fd], begun.fd_epoch);
   addEventListener('pagehide', leaving);
   there(begun);
   // `full`: the file reached the largest a file may be, and takes no more.
@@ -43,7 +43,7 @@ export async function record(destination, microphone, { acl = null, progress = (
         // Failed meanwhile (the hold lost, say), or full: nothing more goes.
         if (failure || full) return;
         try {
-          await pwrite(fd, at, bytes, rust.sha256(bytes)); sent += bytes.length; return;
+          await pwrite(fd, at, bytes, rust.sha256(bytes), begun.fd_epoch); sent += bytes.length; return;
         } catch (error) {
           // Refused, it is over; a 400 says R2 did not take it (files.rs), which goes again a few
           // times, as an upload's chunk does. Unreachable, it goes again for as long as the
@@ -92,7 +92,7 @@ export async function record(destination, microphone, { acl = null, progress = (
     await queue;
     // Stopped elsewhere (jobs cancel), or taken from this page: the file is what arrived.
     if (failure) throw failure.status === 409 ? new Error('stopped elsewhere; what arrived is kept') : failure;
-    const done = await call('close', { fd });
+    const done = await call('close', { fd }, { fdEpoch: begun.fd_epoch });
     return { ...done, seconds: (performance.now() - started) / 1000, ...(full ? { stopped: 'it reached the largest a file may be (1 GB)' } : itself ? { stopped: 'the microphone stopped' } : {}) };
   } finally {
     clearInterval(ticking); lease(); removeEventListener('pagehide', leaving);

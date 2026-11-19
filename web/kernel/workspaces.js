@@ -73,7 +73,14 @@ class SessionHost {
 }
 
 // Fresh account-bound inspection, not cached coordinator state or a caller's claimed uid.
-export async function currentWorkspace() {
+let inspecting = Promise.resolve();
+export function currentWorkspace() {
+  const next = inspecting.then(inspectWorkspace);
+  inspecting = next.catch(() => {});
+  return next;
+}
+
+async function inspectWorkspace() {
   let view = await globalThis.kernelRequest('login_lifecycle', { op: 'inspect' });
   // A cookie can change without a page event (for example while a shell has
   // exited). Join the new account before resolving its private namespace.
@@ -82,13 +89,15 @@ export async function currentWorkspace() {
     await globalThis.kernelRequest('login_refresh');
     view = await globalThis.kernelRequest('login_lifecycle', { op: 'inspect' });
   }
+  for (const id of spaces.keys()) {
+    if (id !== view?.id || view.shutdown) await endWorkspace(id);
+  }
   if (!view?.id || view.shutdown) {
     await globalThis.kernelRequest('set_active_session', { sessionId: null }).catch(() => {});
     throw bad('EACCES', 'login workspace is unavailable');
   }
   let host = spaces.get(view.id);
   if (!host) {
-    if (spaces.size >= 16) throw bad('ENOSPC', 'too many login workspaces in this host');
     const joining = (async () => {
       const creds = await globalThis.kernelRequest('workspace_credentials');
       if (!creds || creds.uid !== view.uid) throw bad('EACCES');
@@ -111,20 +120,18 @@ export async function currentWorkspace() {
   host = await host;
   if (host.identity.uid !== view.uid) throw bad('EACCES');
   host.check();
+  if (!spaces.has(view.id)) throw bad('EACCES');
   await globalThis.kernelRequest('set_active_session', { sessionId: host.id });
   return host;
 }
 
-export function endWorkspace(id) {
+export async function endWorkspace(id) {
+  const request = globalThis.kernelRequest;
   const space = spaces.get(id);
   spaces.delete(id);
-  if (space) {
-    void Promise.resolve(space)
-      .then(value => value.close())
-      .catch(() => {});
-  }
-  if (typeof globalThis.kernelRequest === 'function' && id) {
-    void globalThis.kernelRequest('session_end', { sessionId: id }).catch(() => {});
+  if (space) await Promise.resolve(space).then(value => value.close()).catch(() => {});
+  if (typeof request === 'function' && id) {
+    await request('session_end', { sessionId: id }).catch(() => {});
   }
 }
 
@@ -166,18 +173,19 @@ export async function mountRequest(type, args = {}) {
     const sessionId = await resolveOptionalSessionId();
     return (await globalThis.kernelRequest('vfs_sys', {
       sessionId,
+      fdEpoch: args.fdEpoch,
       batch: { calls: args.calls, sudo: !!args.sudo, umask: args.umask },
     })).results;
   }
   if (type === 'mount_vfs_open_read') {
-    const sessionId = await resolveOptionalSessionId();
+    const sessionId = (await currentWorkspace()).id;
     return globalThis.kernelRequest('vfs_open_read', { ...args, sessionId });
   }
   if (type === 'mount_vfs_read_chunk') {
-    return globalThis.kernelRequest('vfs_read_stream_chunk', args);
+    return globalThis.kernelRequest('vfs_read_stream_chunk', { ...args, sessionId: (await currentWorkspace()).id });
   }
   if (type === 'mount_vfs_close_read') {
-    return globalThis.kernelRequest('vfs_close_read_stream', args);
+    return globalThis.kernelRequest('vfs_close_read_stream', { ...args, sessionId: (await currentWorkspace()).id });
   }
   if (type === 'mount_vfs_read_file') {
     const sessionId = await resolveOptionalSessionId();
@@ -338,12 +346,6 @@ export async function mountRequest(type, args = {}) {
       target,
       flags: args.flags ?? 0,
     });
-    for (const [id, exported] of workspace.exports) {
-      if (exported.mountPath === target || exported.mount?.path === target) {
-        try { exported.connection.close(); } catch {}
-        workspace.exports.delete(id);
-      }
-    }
     // Leave active provider transports/cleanups to Rust `MountBacking`/`JsShareTransport` Drop so
     // `MNT_DETACH` keeps already-open file descriptors working until their last `MountPin` drops.
     workspace.sharedConnections.delete(target);

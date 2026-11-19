@@ -98,6 +98,7 @@ export async function request(type, args, send, seatChanged = () => {}) {
     return;
   }
   if (runs.has(args.run)) throw { errno: 'EINVAL', detail: 'duplicate run id' };
+  if (args.options?.serviceGrant != null) throw { errno: 'EPERM' };
   const managed = args.options?.managedLogin;
   const expectedSession = args.options?.expectedSession === undefined ? null : validateExpectedSession(args.options.expectedSession);
   if (managed) {

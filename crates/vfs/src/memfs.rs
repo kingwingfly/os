@@ -699,10 +699,20 @@ impl MemFs {
         Self::touch(inode, now, false);
         Ok(self.entry(&state, target))
     }
-    fn do_remove(&self, cred: &Cred, dir: &Handle, name: &str, directory: bool) -> Result<()> {
+    fn do_remove(
+        &self,
+        cred: &Cred,
+        dir: &Handle,
+        name: &str,
+        directory: bool,
+        expected: Option<NodeId>,
+    ) -> Result<()> {
         let mut state = self.state.borrow_mut();
         let dir = self.check(&state, dir)?;
         let victim = Self::child(&state, cred, dir, name)?.ok_or(Errno::ENOENT)?;
+        if expected.is_some_and(|node| self.handle(victim).node != node) {
+            return Err(Errno::ESTALE);
+        }
         let inode = &state.inodes[&victim];
         // As may_delete: whether the name may go, then what it names.
         inode::may_delete(&cred.identity, &state.inodes[&dir].meta, &inode.meta)?;
@@ -1345,10 +1355,19 @@ impl Filesystem for MemFs {
         ready!(self.do_link(cred, target, dir, name))
     }
     fn unlink<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
-        ready!(self.do_remove(cred, dir, name, false))
+        ready!(self.do_remove(cred, dir, name, false, None))
+    }
+    fn unlink_if<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        node: NodeId,
+    ) -> BoxFuture<'a, ()> {
+        ready!(self.do_remove(cred, dir, name, false, Some(node)))
     }
     fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
-        ready!(self.do_remove(cred, dir, name, true))
+        ready!(self.do_remove(cred, dir, name, true, None))
     }
     fn rename<'a>(
         &'a self,

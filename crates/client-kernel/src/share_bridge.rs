@@ -272,11 +272,29 @@ impl JsShareTransport {
         }
     }
 
-    async fn stat_rel(&self, rel: &str, follow: bool) -> Result<Entry, ShareError> {
+    fn checked_remote(&self, handles: &[&Handle]) -> Result<JsValue, ShareError> {
+        let checks: Vec<_> = handles
+            .iter()
+            .map(|h| Ok((self.rel_path(h)?, h.node)))
+            .collect::<Result<_, ShareError>>()?;
+        let checks = js_sys::JSON::parse(
+            &serde_json::to_string(&checks).map_err(|_| ShareError::Remote(Errno::EINVAL))?,
+        )
+        .map_err(|_| ShareError::Remote(Errno::EINVAL))?;
+        call_remote_sync(&self.remote, "withPathChecks", &[checks])
+            .map_err(|_| ShareError::Remote(Errno::EOPNOTSUPP))
+    }
+
+    async fn stat_rel(
+        &self,
+        remote: &JsValue,
+        rel: &str,
+        follow: bool,
+    ) -> Result<Entry, ShareError> {
         let opts = js_sys::Object::new();
         let _ = js_sys::Reflect::set(&opts, &"follow".into(), &JsValue::from_bool(follow));
         let val = call_remote(
-            &self.remote,
+            remote,
             "stat",
             &[self.grant.clone(), JsValue::from_str(rel), opts.into()],
         )
@@ -306,10 +324,11 @@ impl ShareTransport for JsShareTransport {
         name: &'a str,
     ) -> ShareFuture<'a, Entry> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[dir])?;
             check_component(name).map_err(ShareError::Remote)?;
             let base = self.rel_path(dir)?;
             let rel = join_rel(&base, name);
-            self.stat_rel(&rel, false).await
+            self.stat_rel(&remote, &rel, false).await
         })
     }
 
@@ -319,19 +338,30 @@ impl ShareTransport for JsShareTransport {
         dir: &'a Handle,
     ) -> ShareFuture<'a, Option<(Entry, String)>> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[dir])?;
             let rel = self.rel_path(dir)?;
             let Some((parent_rel, name)) = split_rel_parent(&rel) else {
                 return Ok(None);
             };
-            let parent_entry = self.stat_rel(&parent_rel, true).await?;
+            let expected = js_sys::JSON::parse(&json!(dir.node).to_string())
+                .map_err(|_| ShareError::Remote(Errno::EINVAL))?;
+            let val = call_remote(
+                &remote,
+                "parentOf",
+                &[self.grant.clone(), JsValue::from_str(&rel), expected],
+            )
+            .await?;
+            let (node, meta) = parse_remote_stat(&val, &self.next_synth_ino)?;
+            let parent_entry = self.record_entry(parent_rel, node, meta);
             Ok(Some((parent_entry, name)))
         })
     }
 
     fn metadata<'a>(&'a self, _cred: &'a Cred, handle: &'a Handle) -> ShareFuture<'a, Metadata> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[handle])?;
             let rel = self.rel_path(handle)?;
-            Ok(self.stat_rel(&rel, false).await?.metadata)
+            Ok(self.stat_rel(&remote, &rel, false).await?.metadata)
         })
     }
 
@@ -365,10 +395,11 @@ impl ShareTransport for JsShareTransport {
         attr: &'a SetAttr,
     ) -> ShareFuture<'a, Metadata> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[handle])?;
             let rel = self.rel_path(handle)?;
             if let Some(size) = attr.size {
                 call_remote(
-                    &self.remote,
+                    &remote,
                     "ftruncate",
                     &[
                         self.grant.clone(),
@@ -383,7 +414,7 @@ impl ShareTransport for JsShareTransport {
                     js_sys::JSON::parse(&json!({ "uid": attr.uid, "gid": attr.gid }).to_string())
                         .map_err(|_| ShareError::Remote(Errno::EINVAL))?;
                 call_remote(
-                    &self.remote,
+                    &remote,
                     "policy",
                     &[
                         self.grant.clone(),
@@ -398,7 +429,7 @@ impl ShareTransport for JsShareTransport {
                 let opts = js_sys::JSON::parse(&json!({ "mode": mode }).to_string())
                     .map_err(|_| ShareError::Remote(Errno::EINVAL))?;
                 call_remote(
-                    &self.remote,
+                    &remote,
                     "policy",
                     &[
                         self.grant.clone(),
@@ -415,7 +446,7 @@ impl ShareTransport for JsShareTransport {
                 )
                 .map_err(|_| ShareError::Remote(Errno::EINVAL))?;
                 call_remote(
-                    &self.remote,
+                    &remote,
                     "policy",
                     &[
                         self.grant.clone(),
@@ -426,12 +457,13 @@ impl ShareTransport for JsShareTransport {
                 )
                 .await?;
             }
-            Ok(self.stat_rel(&rel, false).await?.metadata)
+            Ok(self.stat_rel(&remote, &rel, false).await?.metadata)
         })
     }
 
     fn read_dir<'a>(&'a self, _cred: &'a Cred, dir: &'a Handle) -> ShareFuture<'a, Vec<DirEntry>> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[dir])?;
             let base = self.rel_path(dir)?;
             let mut out = Vec::new();
             let mut offset = 0usize;
@@ -440,7 +472,7 @@ impl ShareTransport for JsShareTransport {
                     js_sys::JSON::parse(&json!({ "offset": offset, "limit": 16 }).to_string())
                         .map_err(|_| ShareError::Remote(Errno::EINVAL))?;
                 let page = call_remote(
-                    &self.remote,
+                    &remote,
                     "list",
                     &[self.grant.clone(), JsValue::from_str(&base), opts],
                 )
@@ -479,9 +511,10 @@ impl ShareTransport for JsShareTransport {
 
     fn read_link<'a>(&'a self, _cred: &'a Cred, link: &'a Handle) -> ShareFuture<'a, String> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[link])?;
             let rel = self.rel_path(link)?;
             let val = call_remote(
-                &self.remote,
+                &remote,
                 "readlink",
                 &[self.grant.clone(), JsValue::from_str(&rel)],
             )
@@ -499,6 +532,7 @@ impl ShareTransport for JsShareTransport {
         options: &'a OpenOptions,
     ) -> ShareFuture<'a, (Entry, OpenRef)> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[dir])?;
             check_component(name).map_err(ShareError::Remote)?;
             let access = options.access().map_err(ShareError::Remote)?;
             let base = self.rel_path(dir)?;
@@ -518,7 +552,7 @@ impl ShareTransport for JsShareTransport {
                 flags |= abi::O_TRUNC;
             }
             let js_handle = call_remote(
-                &self.remote,
+                &remote,
                 "open",
                 &[
                     self.grant.clone(),
@@ -529,11 +563,14 @@ impl ShareTransport for JsShareTransport {
                 ],
             )
             .await?;
-            let entry = match self.stat_rel(&rel, false).await {
+            let stat = call_remote(&remote, "stat", &[self.grant.clone(), js_handle.clone()]).await;
+            let entry = match stat
+                .and_then(|val| parse_remote_stat(&val, &self.next_synth_ino))
+                .map(|(node, meta)| self.record_entry(rel.clone(), node, meta))
+            {
                 Ok(e) => e,
                 Err(err) => {
-                    let _ = call_remote(&self.remote, "release", &[self.grant.clone(), js_handle])
-                        .await;
+                    let _ = call_remote(&remote, "release", &[self.grant.clone(), js_handle]).await;
                     return Err(err);
                 }
             };
@@ -567,11 +604,12 @@ impl ShareTransport for JsShareTransport {
         mode: u16,
     ) -> ShareFuture<'a, Entry> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[dir])?;
             check_component(name).map_err(ShareError::Remote)?;
             let base = self.rel_path(dir)?;
             let rel = join_rel(&base, name);
             call_remote(
-                &self.remote,
+                &remote,
                 "mkdir",
                 &[
                     self.grant.clone(),
@@ -581,7 +619,7 @@ impl ShareTransport for JsShareTransport {
                 ],
             )
             .await?;
-            self.stat_rel(&rel, false).await
+            self.stat_rel(&remote, &rel, false).await
         })
     }
 
@@ -619,11 +657,12 @@ impl ShareTransport for JsShareTransport {
         target: &'a str,
     ) -> ShareFuture<'a, Entry> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[dir])?;
             check_component(name).map_err(ShareError::Remote)?;
             let base = self.rel_path(dir)?;
             let rel = join_rel(&base, name);
             call_remote(
-                &self.remote,
+                &remote,
                 "symlink",
                 &[
                     self.grant.clone(),
@@ -632,7 +671,7 @@ impl ShareTransport for JsShareTransport {
                 ],
             )
             .await?;
-            self.stat_rel(&rel, false).await
+            self.stat_rel(&remote, &rel, false).await
         })
     }
 
@@ -644,12 +683,13 @@ impl ShareTransport for JsShareTransport {
         name: &'a str,
     ) -> ShareFuture<'a, Entry> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[target, dir])?;
             check_component(name).map_err(ShareError::Remote)?;
             let from_rel = self.rel_path(target)?;
             let base = self.rel_path(dir)?;
             let to_rel = join_rel(&base, name);
             call_remote(
-                &self.remote,
+                &remote,
                 "link",
                 &[
                     self.grant.clone(),
@@ -659,7 +699,7 @@ impl ShareTransport for JsShareTransport {
                 ],
             )
             .await?;
-            self.stat_rel(&to_rel, false).await
+            self.stat_rel(&remote, &to_rel, false).await
         })
     }
 
@@ -670,11 +710,12 @@ impl ShareTransport for JsShareTransport {
         name: &'a str,
     ) -> ShareFuture<'a, ()> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[dir])?;
             check_component(name).map_err(ShareError::Remote)?;
             let base = self.rel_path(dir)?;
             let rel = join_rel(&base, name);
             call_remote(
-                &self.remote,
+                &remote,
                 "remove",
                 &[
                     self.grant.clone(),
@@ -687,13 +728,37 @@ impl ShareTransport for JsShareTransport {
         })
     }
 
+    fn unlink_if<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        node: NodeId,
+    ) -> ShareFuture<'a, ()> {
+        Box::pin(async move {
+            check_component(name).map_err(ShareError::Remote)?;
+            let rel = join_rel(&self.rel_path(dir)?, name);
+            let remote = self.checked_remote(&[dir])?;
+            let expected = js_sys::JSON::parse(&json!(node).to_string())
+                .map_err(|_| ShareError::Remote(Errno::EINVAL))?;
+            call_remote(
+                &remote,
+                "removeIf",
+                &[self.grant.clone(), JsValue::from_str(&rel), expected],
+            )
+            .await
+            .map(|_| ())
+        })
+    }
+
     fn rmdir<'a>(&'a self, _cred: &'a Cred, dir: &'a Handle, name: &'a str) -> ShareFuture<'a, ()> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[dir])?;
             check_component(name).map_err(ShareError::Remote)?;
             let base = self.rel_path(dir)?;
             let rel = join_rel(&base, name);
             call_remote(
-                &self.remote,
+                &remote,
                 "remove",
                 &[
                     self.grant.clone(),
@@ -716,12 +781,13 @@ impl ShareTransport for JsShareTransport {
         flags: RenameFlags,
     ) -> ShareFuture<'a, ()> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[from_dir, to_dir])?;
             check_component(from).map_err(ShareError::Remote)?;
             check_component(to).map_err(ShareError::Remote)?;
             let from_rel = join_rel(&self.rel_path(from_dir)?, from);
             let to_rel = join_rel(&self.rel_path(to_dir)?, to);
             call_remote(
-                &self.remote,
+                &remote,
                 "rename",
                 &[
                     self.grant.clone(),
@@ -757,11 +823,12 @@ impl ShareTransport for JsShareTransport {
         name: &'a str,
     ) -> ShareFuture<'a, Vec<u8>> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[handle])?;
             let rel = self.rel_path(handle)?;
             let opts = js_sys::JSON::parse(&json!({ "name": name, "nofollow": true }).to_string())
                 .map_err(|_| ShareError::Remote(Errno::EINVAL))?;
             let val = call_remote(
-                &self.remote,
+                &remote,
                 "policy",
                 &[
                     self.grant.clone(),
@@ -801,6 +868,7 @@ impl ShareTransport for JsShareTransport {
         flags: XattrFlags,
     ) -> ShareFuture<'a, ()> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[handle])?;
             let rel = self.rel_path(handle)?;
             let opts = js_sys::Object::new();
             let _ = js_sys::Reflect::set(&opts, &"name".into(), &JsValue::from_str(name));
@@ -816,7 +884,7 @@ impl ShareTransport for JsShareTransport {
             );
             let _ = js_sys::Reflect::set(&opts, &"nofollow".into(), &JsValue::from_bool(true));
             call_remote(
-                &self.remote,
+                &remote,
                 "policy",
                 &[
                     self.grant.clone(),
@@ -836,11 +904,12 @@ impl ShareTransport for JsShareTransport {
         handle: &'a Handle,
     ) -> ShareFuture<'a, Vec<String>> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[handle])?;
             let rel = self.rel_path(handle)?;
             let opts = js_sys::JSON::parse(&json!({ "nofollow": true }).to_string())
                 .map_err(|_| ShareError::Remote(Errno::EINVAL))?;
             let val = call_remote(
-                &self.remote,
+                &remote,
                 "policy",
                 &[
                     self.grant.clone(),
@@ -868,11 +937,12 @@ impl ShareTransport for JsShareTransport {
         name: &'a str,
     ) -> ShareFuture<'a, ()> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[handle])?;
             let rel = self.rel_path(handle)?;
             let opts = js_sys::JSON::parse(&json!({ "name": name, "nofollow": true }).to_string())
                 .map_err(|_| ShareError::Remote(Errno::EINVAL))?;
             call_remote(
-                &self.remote,
+                &remote,
                 "policy",
                 &[
                     self.grant.clone(),
@@ -923,10 +993,11 @@ impl ShareTransport for JsShareTransport {
         options: &'a OpenOptions,
     ) -> ShareFuture<'a, OpenRef> {
         Box::pin(async move {
+            let remote = self.checked_remote(&[handle])?;
             let access = options.access().map_err(ShareError::Remote)?;
             let rel = self.rel_path(handle)?;
             if access != Access::Path {
-                let meta = self.stat_rel(&rel, false).await?.metadata;
+                let meta = self.stat_rel(&remote, &rel, false).await?.metadata;
                 if meta.is_dir() {
                     if access == Access::Exec {
                         return Err(ShareError::Remote(Errno::EACCES));
@@ -946,7 +1017,7 @@ impl ShareTransport for JsShareTransport {
                 flags |= abi::O_TRUNC;
             }
             let js_handle = call_remote(
-                &self.remote,
+                &remote,
                 "open",
                 &[
                     self.grant.clone(),

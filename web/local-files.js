@@ -118,6 +118,7 @@ export function installLocalFiles() {
           if (hasFs && !hasAccountMut) {
             const results = await kernelCall('mount_vfs_sys', {
               calls: body.calls,
+              fdEpoch: request.headers.get('X-Fd-Epoch') ?? undefined,
               sudo: !!body.sudo,
               umask: body.umask,
             });
@@ -155,15 +156,44 @@ export function installLocalFiles() {
         const path = url.searchParams.get('path');
         const range = parseHttpRange(request.headers.get('Range'));
         if (range.invalid) return new Response(null, { status: 416 });
-        if (request.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        request.signal.throwIfAborted();
 
-        const res = await kernelCall('mount_vfs_open_read', {
-          path,
-          rangeStart: range.hasRange ? range.start : undefined,
-          rangeEnd: range.hasRange ? range.end : undefined,
-          headOnly: request.method === 'HEAD',
-          sudo: false,
+        let streamId;
+        const closeStream = () => {
+          request.signal.removeEventListener('abort', onAbort);
+          if (streamId != null) {
+            void kernelCall('mount_vfs_close_read', { streamId }).catch(() => {});
+            streamId = undefined;
+          }
+        };
+        let onAbort;
+        const aborted = new Promise((_, reject) => {
+          onAbort = () => {
+            closeStream();
+            reject(request.signal.reason);
+          };
+          request.signal.addEventListener('abort', onAbort, { once: true });
         });
+        let res;
+        try {
+          const opening = kernelCall('mount_vfs_open_read', {
+            path,
+            rangeStart: range.hasRange ? range.start : undefined,
+            rangeEnd: range.hasRange ? range.end : undefined,
+            headOnly: request.method === 'HEAD',
+            sudo: false,
+          }).then(opened => {
+            streamId = opened.streamId;
+            if (request.signal.aborted) closeStream();
+            return opened;
+          });
+          res = await Promise.race([opening, aborted]);
+          request.signal.throwIfAborted();
+        } catch (error) {
+          closeStream();
+          throw error;
+        }
+        if (streamId == null) closeStream();
         if (res.status === 416) return new Response(null, { status: 416 });
         const rangeLen = range.hasRange && res.contentRange
           ? (() => {
@@ -179,24 +209,16 @@ export function installLocalFiles() {
             'Cache-Control': 'no-store',
           };
           if (res.contentRange) headers['Content-Range'] = res.contentRange;
-          let closed = false;
-          const closeStream = () => {
-            if (closed) return;
-            closed = true;
-            request.signal?.removeEventListener('abort', closeStream);
-            void kernelCall('mount_vfs_close_read', { streamId: res.streamId }).catch(() => {});
-          };
-          request.signal?.addEventListener('abort', closeStream, { once: true });
           const stream = new ReadableStream({
             async pull(controller) {
-              if (closed) {
+              if (streamId == null) {
                 controller.close();
                 return;
               }
               try {
                 const chunk = await kernelCall('mount_vfs_read_chunk', { streamId: res.streamId });
                 const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk ?? []);
-                if (!bytes.byteLength) {
+                if (streamId == null || !bytes.byteLength) {
                   closeStream();
                   controller.close();
                   return;
@@ -235,7 +257,7 @@ export function installLocalFiles() {
 
       return network(request);
     } catch (error) {
-      if (error?.name === 'AbortError') throw error;
+      if (request.signal.aborted || error?.name === 'AbortError') throw error;
       return json(
         { errno: error.errno ?? 'EIO', error: error.detail ?? error.message ?? error.errno ?? 'Filesystem unavailable' },
         statusForErrno(error.errno),

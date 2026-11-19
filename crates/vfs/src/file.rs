@@ -97,6 +97,16 @@ impl ReleaseQueue {
         released
     }
 
+    /// Take independent release jobs so a blocked provider cannot hold up another.
+    pub fn take_pending(&self) -> impl Iterator<Item = impl Future<Output = Result<()>> + use<>> {
+        let items = std::mem::take(&mut *self.0.borrow_mut());
+        let queue = self.clone();
+        items.into_iter().map(move |item| {
+            let queue = queue.clone();
+            async move { queue.run_one(item).await }
+        })
+    }
+
     /// Release every open reference queued, and say how the first that failed did. Every
     /// release is tried, whatever an earlier one says.
     pub async fn flush(&self) -> Result<()> {
@@ -719,18 +729,15 @@ impl FileRef {
                         cred,
                         true,
                         true,
-                        self.file.fs.setattr(cred, &self.file.handle, attr),
+                        self.file
+                            .fs
+                            .setattr_open(cred, &self.file.handle, &self.file.open, attr),
                     )
                     .await?;
                 if pin.effective_flags().synchronous {
-                    match self
-                        .file
+                    self.file
                         .guard(cred, true, false, self.file.fs.sync_all(&self.file.open))
-                        .await
-                    {
-                        Ok(()) | Err(Errno::EINVAL) => {}
-                        Err(e) => return Err(e),
-                    }
+                        .await?;
                     pin.backing().record_sync();
                 }
                 Ok(meta)

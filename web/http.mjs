@@ -9,8 +9,10 @@ export async function json(response) {
 // System calls (owner's design, 2026-10-29: the page is user space): `calls`, one batch, each
 // answered on its own, `{ok}` or `{err: {errno, detail}}`; `options` are the process's (umask,
 // sudo).
-export async function sys(calls, options = {}) {
-  const response = await fetch('/api/sys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ calls, ...options }) });
+export async function sys(calls, { fdEpoch, ...options } = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (fdEpoch) headers['X-Fd-Epoch'] = fdEpoch;
+  const response = await fetch('/api/sys', { method: 'POST', headers, body: JSON.stringify({ calls, ...options }) });
   return (await json(response)).results;
 }
 
@@ -34,13 +36,15 @@ export function answered(answer) {
 // value, or an error with its errno.
 export async function call(name, args, options) { return answered((await sys([args === undefined ? name : { [name]: args }], options))[0]); }
 // Close the descriptors `fds` as the page goes, when no request may wait for an answer.
-export function closeOnLeaving(fds) {
-  if (fds.length) navigator.sendBeacon('/api/sys', new Blob([JSON.stringify({ calls: fds.map(fd => ({ close: { fd } })) })], { type: 'application/json' }));
+export function closeOnLeaving(fds, fdEpoch) {
+  const url = fdEpoch ? '/api/sys?fd_epoch=' + encodeURIComponent(fdEpoch) : '/api/sys';
+  if (fds.length) navigator.sendBeacon(url, new Blob([JSON.stringify({ calls: fds.map(fd => ({ close: { fd } })) })], { type: 'application/json' }));
 }
 // pwrite(2) of chunk `index` through the descriptor `fd`, which R2 checks against `sha256` if
 // given: the Worker's answer, or an error with its errno and HTTP status.
-export async function pwrite(fd, index, body, sha256) {
+export async function pwrite(fd, index, body, sha256, fdEpoch) {
   const headers = sha256 ? { 'X-Chunk-SHA256': sha256 } : {};
+  if (fdEpoch) headers['X-Fd-Epoch'] = fdEpoch;
   const response = await fetch(`/api/pwrite?fd=${fd}&index=${index}`, { method: 'PUT', headers, body });
   let reply = {}; try { reply = await response.json(); } catch {}
   if (!response.ok) { const error = new Error(reply.error || `Write failed (${response.status})`); error.status = response.status; error.errno = reply.errno; throw error; }

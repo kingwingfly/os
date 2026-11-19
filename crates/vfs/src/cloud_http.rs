@@ -28,6 +28,14 @@ pub const CONTROL_PATH: &str = "/api/fs";
 pub const DATA_PATH: &str = "/api/fs/data";
 pub const DATA_HEADER: &str = "X-OS-Filesystem";
 
+/// Identity precondition for cookie-authenticated page opens delegated by the client VFS.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageTarget {
+    Inode(u64),
+    MissingIn(u64),
+}
+
 /// An HTTP reply: its status and body.
 pub struct Reply {
     pub status: u16,

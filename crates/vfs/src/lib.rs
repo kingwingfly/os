@@ -133,6 +133,16 @@ pub trait Filesystem {
         handle: &'a Handle,
         attr: &'a SetAttr,
     ) -> BoxFuture<'a, Metadata>;
+    /// Descriptor metadata changes may use a provider's open capability directly.
+    fn setattr_open<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        _open: &'a OpenRef,
+        attr: &'a SetAttr,
+    ) -> BoxFuture<'a, Metadata> {
+        self.setattr(cred, handle, attr)
+    }
     fn read_dir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle) -> BoxFuture<'a, Vec<DirEntry>>;
     fn read_link<'a>(&'a self, cred: &'a Cred, link: &'a Handle) -> BoxFuture<'a, String>;
 
@@ -179,6 +189,17 @@ pub trait Filesystem {
         name: &'a str,
     ) -> BoxFuture<'a, Entry>;
     fn unlink<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()>;
+    /// Remove a newly created upload only if the same inode still occupies this name.
+    /// Drivers implement the comparison under their directory mutation lock.
+    fn unlink_if<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+        _node: NodeId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::EOPNOTSUPP) })
+    }
     fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()>;
     #[allow(clippy::too_many_arguments)]
     fn rename<'a>(
@@ -258,29 +279,21 @@ pub trait Filesystem {
             if self.capabilities().durability == abi::contract::Durability::Volatile {
                 return Ok(());
             }
-            let mut opts = OpenOptions::new();
-            opts.read(true);
-            let open = match self.open(cred, handle, &opts).await {
-                Ok(open) => open,
+            // The mutation was authorized with the acting credential. This internal
+            // description only flushes the inode, including write/search-only directories.
+            let mut options = OpenOptions::new();
+            options.read(true);
+            let open = match self.open(cred, handle, &options).await {
                 Err(Errno::EACCES) => {
-                    let root_cred = Cred {
+                    let service = Cred {
                         identity: Identity::root(),
-                        umask: cred.umask,
-                        token: cred.token.clone(),
+                        ..cred.clone()
                     };
-                    match self.open(&root_cred, handle, &opts).await {
-                        Ok(open) => open,
-                        Err(Errno::ELOOP) => return Ok(()),
-                        Err(e) => return Err(e),
-                    }
+                    self.open(&service, handle, &options).await?
                 }
-                Err(Errno::ELOOP) => return Ok(()),
-                Err(e) => return Err(e),
+                result => result?,
             };
-            let sync_res = match self.sync_all(&open).await {
-                Ok(()) | Err(Errno::EINVAL) => Ok(()),
-                Err(e) => Err(e),
-            };
+            let sync_res = self.sync_all(&open).await;
             let rel_res = self.release(&open).await;
             sync_res?;
             rel_res

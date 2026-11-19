@@ -70,7 +70,24 @@ pub async fn handle(
     let fs_session = req.headers().get("X-Fs-Session")?.filter(|s| !s.is_empty());
     let fs_secret = req.headers().get("X-Fs-Secret")?.filter(|s| !s.is_empty());
     // As whom each call is made: the page's session, or the process the batch names.
+    let page_target = match req
+        .headers()
+        .get("X-Fs-Target")?
+        .map(|v| serde_json::from_str(&v))
+        .transpose()
+    {
+        Ok(target) => target,
+        Err(_) => return Ok(Reply::error("Invalid filesystem target", 400)),
+    };
     let session = Rc::new(Session {
+        page_target,
+        fd_epoch: req.headers().get("X-Fd-Epoch")?.or_else(|| {
+            req.url()
+                .ok()?
+                .query_pairs()
+                .find(|(key, _)| key == "fd_epoch")
+                .map(|(_, value)| value.into_owned())
+        }),
         key: key.clone(),
         guest: guest.clone(),
         sudo: batch.sudo,
@@ -330,6 +347,8 @@ fn resolve(call: &mut Call, results: &[Return]) -> std::result::Result<(), Error
 
 /// The process a batch runs as, before a transaction finds its account.
 pub struct Session {
+    page_target: Option<os_vfs::cloud_http::PageTarget>,
+    fd_epoch: Option<String>,
     pub key: Option<String>,
     pub guest: Option<String>,
     pub sudo: bool,
@@ -409,6 +428,9 @@ impl Session {
             self.guest.as_deref(),
             credential.as_ref(),
         );
+        if let Some(epoch) = &self.fd_epoch {
+            crate::fds::check_epoch(sid.as_deref(), epoch)?;
+        }
         Ok(Acting {
             process,
             sid,
@@ -952,6 +974,43 @@ fn run(
             "a process cannot change its browser's session",
         ));
     }
+    // Compare inside the same authority transaction as the open, before it creates or truncates.
+    if let Some(expected) = session.page_target {
+        use os_vfs::cloud_http::PageTarget;
+        let path = match &call {
+            Call::Open { path, .. }
+            | Call::Lstat { path }
+            | Call::Unlink { path }
+            | Call::Chmod { path, .. }
+            | Call::Access { path, .. } => path,
+            _ => return Err(Errno::EINVAL.into()),
+        };
+        let name = kernel::namei(db, &process.cred, path, false)?;
+        if name.path != *path
+            || !match expected {
+                PageTarget::Inode(ino) => name
+                    .node
+                    .as_ref()
+                    .is_some_and(|n| n.ino == ino && n.link.is_none()),
+                PageTarget::MissingIn(ino) => {
+                    name.node.is_none()
+                        && db.node(os_core::parent(path)).is_some_and(|n| n.ino == ino)
+                }
+            }
+        {
+            return Err(Errno::ESTALE.into());
+        }
+        if matches!(call, Call::Lstat { .. }) {
+            let mut value = json!(kernel::stat(db, &process.cred, path, false)?);
+            value["version"] = json!(
+                name.node
+                    .and_then(|n| n.file)
+                    .as_deref()
+                    .map(crate::db::etag)
+            );
+            return Ok(value);
+        }
+    }
     // /proc/self/fd/N names what the descriptor has open; /proc is procfs's.
     let mut call = call;
     let mut proc = false;
@@ -1061,16 +1120,49 @@ fn run(
         | Call::Close { .. }
         | Call::Discard { .. }
         | Call::Fchmod { .. }
-        | Call::Ioctl { .. }) => crate::fds::call_in_namespace(
-            db,
-            sid,
-            &session.namespace(),
-            process,
-            acting.owner().as_deref(),
-            caller.as_ref(),
-            session.fs_auth(),
-            call,
-        ),
+        | Call::Ioctl { .. }) => {
+            let chmod_fd = match &call {
+                Call::Fchmod { fd, .. } if session.fd_epoch.is_some() => Some(fd.number()),
+                _ => None,
+            };
+            let opened_path = match &call {
+                Call::Open { path, .. } if session.page_target.is_some() => Some(path.clone()),
+                _ => None,
+            };
+            let mut value = crate::fds::call_in_namespace(
+                db,
+                sid,
+                &session.namespace(),
+                process,
+                acting.owner().as_deref(),
+                caller.as_ref(),
+                session.fs_auth(),
+                call,
+            )?;
+            if let Some(fd) = chmod_fd {
+                let ino = db
+                    .fd(sid.ok_or(Errno::EBADF)?, fd)
+                    .and_then(|f| f.ino)
+                    .ok_or(Errno::EBADF)?;
+                return Ok(json!(kernel::stat_of(
+                    db,
+                    &db.inode(ino).ok_or(Errno::ESTALE)?
+                )));
+            }
+            if let Some(path) = opened_path {
+                let stat = kernel::stat(db, &process.cred, &path, false)?;
+                if let (Some(sid), Some(fd)) = (sid, value["fd"].as_u64())
+                    && let Some(desc) = db.fd(sid, fd as u32)
+                    && desc.writes()
+                    && let Some(file) = desc.file
+                {
+                    db.bind_upload_target(&file, stat.ino);
+                }
+                value["stat"] = json!(stat);
+                value["fd_epoch"] = json!(os_image::digest(sid.ok_or(Errno::EBADF)?.as_bytes()));
+            }
+            Ok(value)
+        }
         call => kernel::call(db, process, call),
     }
 }
@@ -1660,6 +1752,8 @@ mod tests {
             chroot: false,
             fs_session: Some("fs-sid".into()),
             fs_secret: None,
+            page_target: None,
+            fd_epoch: None,
         };
         assert_eq!(s.fs_auth(), None);
         s.fs_secret = Some("fs-sec".into());

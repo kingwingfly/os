@@ -35,8 +35,10 @@ pub enum Readiness {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum MountNamespaceGrant {
-    /// Default: run in the supervisor's (system) mount namespace; no user mounts visible.
+    /// Ordinary units inherit their supervisor's namespace. System supervisors default to system.
     #[default]
+    #[serde(skip)]
+    Default,
     System,
     /// Clone a fresh private mount namespace from the supervisor's namespace at service start.
     Isolated,
@@ -48,6 +50,7 @@ pub enum MountNamespaceGrant {
 impl MountNamespaceGrant {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Default => "",
             Self::System => "system",
             Self::Isolated => "isolated",
             Self::Session => "session",
@@ -142,8 +145,9 @@ impl Unit {
         caller_uid: u32,
         has_user_session: bool,
     ) -> Result<(), abi::Errno> {
-        if self.mount_namespace == MountNamespaceGrant::Session
-            && (caller_uid == 0 || !has_user_session)
+        if (self.mount_namespace == MountNamespaceGrant::System && caller_uid != 0)
+            || (self.mount_namespace == MountNamespaceGrant::Session
+                && (caller_uid == 0 || !has_user_session))
         {
             return Err(abi::Errno::EPERM);
         }
@@ -213,7 +217,12 @@ impl Manifest {
             if unit.bind_mounts.len() > 32 {
                 return Err(format!("{}: too many bind_mounts (max 32)", unit.name));
             }
-            if !unit.bind_mounts.is_empty() && unit.mount_namespace == MountNamespaceGrant::System {
+            if !unit.bind_mounts.is_empty()
+                && matches!(
+                    unit.mount_namespace,
+                    MountNamespaceGrant::Default | MountNamespaceGrant::System
+                )
+            {
                 return Err(format!(
                     "{}: bind_mounts require isolated or session mount_namespace",
                     unit.name
@@ -502,7 +511,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn mount_namespace_and_bind_grants_parse_and_default_to_system() {
+    fn mount_namespace_and_bind_grants_parse_with_implicit_default() {
         let raw = serde_json::to_vec(&json!({
             "version": 1,
             "units": [
@@ -533,7 +542,7 @@ mod tests {
         let manifest = Manifest::parse(&raw).unwrap();
         assert_eq!(
             manifest.units[0].mount_namespace,
-            MountNamespaceGrant::System
+            MountNamespaceGrant::Default
         );
         assert!(manifest.units[0].bind_mounts.is_empty());
 
@@ -565,7 +574,7 @@ mod tests {
         );
         assert_eq!(manifest.authorize_namespace(1000, true), Ok(()));
 
-        // System and Isolated grants work for both root/system and user callers.
+        // The implicit default and isolated grants also work at system boot.
         assert_eq!(manifest.units[0].authorize_namespace(0, false), Ok(()));
         assert_eq!(manifest.units[1].authorize_namespace(0, false), Ok(()));
 

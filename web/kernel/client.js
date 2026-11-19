@@ -65,9 +65,10 @@ async function heard() {
 // The Rust kernel's transport: one POST to the browser's machine, its status and text.
 // Same-origin, so the browser's cookies go with it; the kernel never sees them.
 self.kernelSys = async (body, signal) => {
+  const token = JSON.parse(body).proc;
   const response = await fetch('/api/sys', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Registry': '1' },
+    headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Process-Token': token } : { 'X-Registry': '1' }) },
     body,
     signal,
   });
@@ -146,8 +147,17 @@ function boot() {
     const value = JSON.parse(await kernel.init());
     const [{ LoginCoordinator, LoginStartup }, { InitCoordinator, InitReaper }] = await Promise.all([import(asset('/login-session.js')), import(asset('/init-owner.js'))]);
     const proof = [...crypto.getRandomValues(new Uint8Array(32))].map(byte => byte.toString(16).padStart(2, '0')).join('');
+    let lastLogin;
     login = new LoginCoordinator({ host: kernelId, proof,
       changed: value => {
+        const id = value.session?.id;
+        if (id && id !== lastLogin) {
+          const previous = lastLogin;
+          lastLogin = id;
+          if (previous) void import(asset('/executor-host.js')).then(executor => {
+            if (lastLogin !== previous) return executor.endWorkspace(previous);
+          }).catch(() => {});
+        }
         login.startup?.update(value);
         broadcast({ v: VERSION, type: 'event', event: 'login', value: { ...value, services: login.startup?.current(value) } });
       },
@@ -299,13 +309,19 @@ function failure(error) {
   // Structured cloning an Error keeps its message, but drops errno and detail. The
   // protocol carries a plain record so loader failures survive the worker boundary.
   if (error && typeof error === 'object' && error.errno) {
-    return { errno: error.errno, detail: error.detail ?? error.message ?? error.errno };
+    return { errno: error.errno, detail: error.detail ?? error.message ?? error.errno,
+      ...(error.execCommitted ? { execCommitted: true } : {}) };
   }
   return { errno: 'EIO', detail: String(error?.message ?? error) };
 }
 
-async function dispatch(message, host, tab) {
+async function dispatch(message, host, tab, internal = false) {
   const { type, args = {} } = message;
+  if (!internal && ['vfs_open_read', 'vfs_read_stream_chunk', 'vfs_close_read_stream'].includes(type)) {
+    const executor = await import(asset('/executor-host.js'));
+    const { id } = await executor.currentWorkspace();
+    return dispatch({ type, args: { ...args, sessionId: id } }, host, tab, true);
+  }
   switch (type) {
     case 'init': return boot();
     case 'version': return kernel.version();
@@ -326,8 +342,11 @@ async function dispatch(message, host, tab) {
     case 'login_lifecycle': {
       if (!['end', 'restart', 'inspect'].includes(args.op)) throw { errno: 'EINVAL' };
       const value = await login.call({ op: args.op, ...(args.op === 'inspect' ? {} : { session: args.session }) });
-      if (args.op !== 'inspect') (await import(asset('/executor-host.js'))).endWorkspace(args.session);
-      if (args.op !== 'inspect') await login.reset();
+      if (args.op !== 'inspect') {
+        const executor = await import(asset('/executor-host.js'));
+        await executor.endWorkspace(args.session);
+        await login.reset();
+      }
       return value;
     }
     case 'login_status': { const value = login.current(); return { ...value, services: login.startup.current(value) }; }
@@ -348,8 +367,12 @@ async function dispatch(message, host, tab) {
       return login.checked(ticket, view);
     }
     case 'login_service_signal': return login.control('signal', { pid: args.pid, signal: args.signal }, args.expected);
-    case 'exec': return exec(args, tab, host);
-    case 'execs': return execs(args, tab, host);
+    case 'exec':
+      if (args.serviceGrant && !internal) throw { errno: 'EPERM' };
+      return exec(args, tab, host);
+    case 'execs':
+      if (!internal && args.stages?.some(stage => stage.serviceGrant)) throw { errno: 'EPERM' };
+      return execs(args, tab, host);
     // A process's own execve: its image replaced, its pid, credentials and descriptors kept.
     case 'reexec': return JSON.parse(await kernel.reexec(args.pid, JSON.stringify(args.local ?? null), args.path, JSON.stringify(args.argv ?? []), JSON.stringify(args.env ?? []), args.cwd ?? '/', tab ?? '', host));
     case 'fork': return JSON.parse(await kernel.fork(args.pid, host, args.emptyMemory === true));
@@ -383,7 +406,7 @@ async function dispatch(message, host, tab) {
     case 'lose_mount_provider': kernel.lose_mount_provider(args.sessionId, args.target); return null;
     case 'export_provider': return kernel.export_provider(args.sessionId, args.path);
     case 'list_mounts': return await kernel.list_mounts(args.sessionId ?? '');
-    case 'vfs_sys': return JSON.parse(await kernel.vfs_sys(args.sessionId ?? '', typeof args.batch === 'string' ? args.batch : JSON.stringify(args.batch)));
+    case 'vfs_sys': return JSON.parse(await kernel.vfs_sys(args.sessionId ?? '', typeof args.batch === 'string' ? args.batch : JSON.stringify(args.batch), args.fdEpoch));
     case 'vfs_open_read': return await kernel.vfs_open_read(
       args.sessionId ?? '',
       args.path,
@@ -392,8 +415,8 @@ async function dispatch(message, host, tab) {
       !!args.headOnly,
       !!args.sudo,
     );
-    case 'vfs_read_stream_chunk': return await kernel.vfs_read_stream_chunk(args.streamId, args.maxBytes ?? undefined);
-    case 'vfs_close_read_stream': await kernel.vfs_close_read_stream(args.streamId); return null;
+    case 'vfs_read_stream_chunk': return await kernel.vfs_read_stream_chunk(args.sessionId, args.streamId, args.maxBytes ?? undefined);
+    case 'vfs_close_read_stream': await kernel.vfs_close_read_stream(args.sessionId, args.streamId); return null;
     case 'vfs_read_file': {
       const sid = args.sessionId ?? '';
       const first = await kernel.vfs_read_file(sid, args.path, 0n, args.headOnly ? 0 : (args.rangeStart != null ? 0 : 4 * 1024 * 1024));
@@ -441,8 +464,15 @@ async function dispatch(message, host, tab) {
       );
       return typeof r === 'number' ? r : (r?.written ?? 0);
     }
-    case 'proc_spawn_init': return await kernel.proc_spawn_init(typeof args.opts === 'string' ? args.opts : JSON.stringify(args.opts));
-    case 'proc_apply_service_grant': return await kernel.proc_apply_service_grant(args.pid, args.parentPid, typeof args.grant === 'string' ? args.grant : JSON.stringify(args.grant));
+    case 'proc_spawn_init': {
+      const opts = typeof args.opts === 'string' ? JSON.parse(args.opts) : args.opts;
+      if (!internal && opts.serviceGrant != null) throw { errno: 'EPERM' };
+      return await kernel.proc_spawn_init(JSON.stringify(opts));
+    }
+    case 'proc_authorize_service_grant': return kernel.proc_authorize_service_grant(args.pid);
+    case 'proc_apply_service_grant':
+      if (!internal) throw { errno: 'EPERM' };
+      return await kernel.proc_apply_service_grant(args.pid, args.parentPid, typeof args.grant === 'string' ? args.grant : JSON.stringify(args.grant));
     case 'proc_fork': return kernel.proc_fork(args.parentPid, args.childPid, args.cloneFlags ?? 0);
     case 'proc_exec_preserve': await kernel.proc_exec_preserve(args.pid); return null;
     case 'proc_set_creds': kernel.proc_set_creds(args.pid, args.uid, args.gid, new Uint32Array(args.groups ?? []), args.token ?? undefined, args.cloudAccess !== false); return null;
@@ -504,6 +534,7 @@ async function dispatch(message, host, tab) {
     case 'pty_close': return kernel.pty_close(args.index);
     case 'proc_resolve_exec': return await kernel.proc_resolve_exec(args.pid, args.file, typeof args.argv === 'string' ? args.argv : JSON.stringify(args.argv ?? []), args.pathEnv ?? undefined, !!args.searchPath);
     case 'session_resolve_exec': return await kernel.session_resolve_exec(args.sessionId ?? '', args.file, typeof args.argv === 'string' ? args.argv : JSON.stringify(args.argv ?? []), args.cwd ?? '/', args.pathEnv ?? undefined, !!args.searchPath, !!args.sudo);
+    case 'release_exec_ticket': kernel.release_exec_ticket(args.ticket); return null;
     case 'take_local_exec_bytes': return kernel.take_local_exec_bytes(args.ticket ?? args.digest, args.checkOnly);
     default: throw { errno: 'ENOSYS', detail: `no client-kernel call ${type}` };
   }
@@ -522,7 +553,7 @@ const isConcurrentCall = type => (
   [
     'boot_vfs', 'set_active_session', 'mount_user', 'unmount_user',
     'revoke_mount_provider', 'lose_mount_provider', 'export_provider',
-    'list_mounts', 'take_local_exec_bytes',
+    'list_mounts', 'take_local_exec_bytes', 'release_exec_ticket',
   ].includes(type)
 );
 
@@ -547,7 +578,7 @@ async function handle(port, message) {
   try {
     self.kernel = kernel;
     self.kernelRequest = async (type, args) => {
-      const run = () => dispatch({ type, args }, host.id, host.tab);
+      const run = () => dispatch({ type, args }, host.id, host.tab, true);
       const answer = await (isConcurrentCall(type) ? run() : serially(run)).catch(error => {
         const refused = failure(error);
         throw Object.assign(new Error(refused.detail ?? refused.errno), refused);

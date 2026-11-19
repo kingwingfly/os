@@ -72,14 +72,24 @@ struct Handles {
 }
 impl Handles {
     fn open(&mut self, path: &str, flags: u32) -> Result<u32, String> {
-        let opened = call(abi::Call::Open {
-            path: path.into(),
-            flags,
-            mode: 0,
-            size: None,
-            sha256: None,
-            version: None,
-        })?;
+        let open = if path.starts_with('/') {
+            abi::Call::Open {
+                path: path.into(),
+                flags,
+                mode: 0,
+                size: None,
+                sha256: None,
+                version: None,
+            }
+        } else {
+            abi::Call::OpenAt {
+                dirfd: (abi::OS_FD_CWD as u32).into(),
+                path: path.into(),
+                flags,
+                mode: 0,
+            }
+        };
+        let opened = call(open)?;
         let fd = opened["fd"].as_u64().ok_or("open returned no descriptor")? as u32;
         self.all.push(fd);
         Ok(fd)

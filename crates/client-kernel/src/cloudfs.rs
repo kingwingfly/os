@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use vfs::cloud::{CloudFs, Transport};
-use vfs::cloud_http::{Host, HttpTransport, Reply};
+use vfs::cloud_http::{Host, HttpTransport, PageTarget, Reply};
 use vfs::memfs::MemFs;
 use vfs::{
     Access, BoxFuture, Conflict, Cred, DirEntry, Entry, FILE_MAX, FileType, Filesystem, FsId,
@@ -355,7 +355,7 @@ fn js_now_timespec() -> (u64, u32) {
 }
 
 fn stat_to_metadata(st: &Stat) -> Metadata {
-    let kind_bits = st.mode & abi::S_IFMT;
+    let kind_bits = st.mode & 0o170000;
     let file_type = if kind_bits == abi::S_IFDIR {
         FileType::Dir
     } else if kind_bits == abi::S_IFLNK {
@@ -449,14 +449,30 @@ pub(crate) async fn page_sys_batch_with_session(
     batch: Batch,
     fs_session: Option<(&str, &str)>,
 ) -> vfs::Result<Vec<Return>> {
+    page_batch_target(batch, fs_session, None, None).await
+}
+
+async fn page_batch_target(
+    batch: Batch,
+    fs_session: Option<(&str, &str)>,
+    target: Option<PageTarget>,
+    fd_epoch: Option<&str>,
+) -> vfs::Result<Vec<Return>> {
     let (global, post) = installed("pageSysPost")?;
     let body = serde_json::to_string(&batch).map_err(|_| Errno::EIO)?;
-    let answer = if let Some(headers) = session_headers_js(fs_session) {
-        post.call2(&global, &JsValue::from_str(&body), &headers)
-    } else {
-        post.call1(&global, &JsValue::from_str(&body))
+    let headers = session_headers_js(fs_session).unwrap_or_else(|| js_sys::Object::new().into());
+    if let Some(target) = target {
+        let json = serde_json::to_string(&target).map_err(|_| Errno::EIO)?;
+        js_sys::Reflect::set(&headers, &"X-Fs-Target".into(), &json.into())
+            .map_err(|_| Errno::EIO)?;
     }
-    .map_err(|_| Errno::EIO)?;
+    if let Some(epoch) = fd_epoch {
+        js_sys::Reflect::set(&headers, &"X-Fd-Epoch".into(), &epoch.into())
+            .map_err(|_| Errno::EIO)?;
+    }
+    let answer = post
+        .call2(&global, &body.into(), &headers)
+        .map_err(|_| Errno::EIO)?;
     let raw = promised(answer).await?;
     let reply_str = raw.as_string().ok_or(Errno::EIO)?;
     let text_val = parse_page_reply(&reply_str)?;
@@ -474,7 +490,17 @@ async fn page_sys_one_with_session(
     sudo: bool,
     fs_session: Option<(&str, &str)>,
 ) -> vfs::Result<Value> {
-    let mut results = page_sys_batch_with_session(
+    page_target_call(call, umask, sudo, fs_session, None).await
+}
+
+pub(crate) async fn page_target_call(
+    call: Call,
+    umask: Option<u16>,
+    sudo: bool,
+    fs_session: Option<(&str, &str)>,
+    target: Option<PageTarget>,
+) -> vfs::Result<Value> {
+    let mut results = page_batch_target(
         Batch {
             calls: vec![call],
             umask,
@@ -483,88 +509,73 @@ async fn page_sys_one_with_session(
             process: None,
         },
         fs_session,
+        target,
+        None,
     )
     .await?;
     let ret = results.pop().ok_or(Errno::EIO)?;
     ret.into_result().map_err(|e| e.errno)
 }
 
-async fn page_file_read_range_with_etag(
-    path: &str,
-    offset: u64,
-    len: usize,
-    sudo: bool,
-    fs_session: Option<(&str, &str)>,
-) -> vfs::Result<(Vec<u8>, Option<String>)> {
-    if len == 0 {
-        return Ok((Vec::new(), None));
-    }
-    if !sudo && let Ok((global, read_fn)) = installed("pageFileRead") {
-        let answer = read_fn
-            .call3(
-                &global,
-                &JsValue::from_str(path),
-                &JsValue::from_f64(offset as f64),
-                &JsValue::from_f64(len as f64),
-            )
-            .map_err(|_| Errno::EIO)?;
-        let reply = promised(answer).await?;
-        if reply.is_instance_of::<js_sys::Uint8Array>() {
-            return Ok((js_sys::Uint8Array::new(&reply).to_vec(), None));
-        }
-        let status = js_sys::Reflect::get(&reply, &"status".into())
-            .ok()
-            .and_then(|s| s.as_f64())
-            .unwrap_or(0.0) as u16;
-        let etag = js_sys::Reflect::get(&reply, &"etag".into())
-            .ok()
-            .and_then(|v| v.as_string())
-            .filter(|s| !s.is_empty());
-        if status == 416 {
-            return Ok((Vec::new(), etag));
-        }
-        if status == 200 || status == 206 {
-            let body = js_sys::Reflect::get(&reply, &"body".into()).map_err(|_| Errno::EIO)?;
-            return Ok((js_sys::Uint8Array::new(&body).to_vec(), etag));
-        }
-        if status == 404 {
-            return Err(Errno::ENOENT);
-        }
-        if status == 403 || status == 401 {
-            return Err(Errno::EACCES);
-        }
-        if status != 0 {
-            return Err(Errno::EIO);
-        }
-    }
-    // Fallback to chunked `Call::Pread` on `/api/sys` (`<= INLINE_MAX`).
-    let mut out = Vec::with_capacity(len);
-    let mut cur = offset;
-    while out.len() < len {
-        let chunk = (len - out.len()).min(usize::try_from(abi::INLINE_MAX).unwrap_or(usize::MAX));
-        let val = page_sys_one_with_session(
-            Call::Pread {
-                fd: None,
-                path: Some(path.to_string()),
-                offset: cur,
-                count: chunk as u64,
+#[derive(Clone, serde::Deserialize)]
+pub(crate) struct AuthorityPageFd {
+    pub(crate) fd: u32,
+    pub(crate) fd_epoch: String,
+}
+
+impl AuthorityPageFd {
+    pub(crate) async fn call(&self, call: Call, sudo: bool) -> vfs::Result<Value> {
+        page_batch_target(
+            Batch {
+                calls: vec![call],
+                umask: None,
+                sudo,
+                pid: None,
+                process: None,
             },
             None,
+            None,
+            Some(&self.fd_epoch),
+        )
+        .await?
+        .pop()
+        .ok_or(Errno::EIO)?
+        .into_result()
+        .map_err(|e| e.errno)
+    }
+
+    pub(crate) async fn close(&self, sudo: bool) -> vfs::Result<Value> {
+        self.call(Call::Close { fd: self.fd.into() }, sudo).await
+    }
+}
+
+async fn read_page_fd(
+    fd: &AuthorityPageFd,
+    offset: u64,
+    buf: &mut [u8],
+    sudo: bool,
+) -> vfs::Result<usize> {
+    let count = (buf.len() as u64).min(abi::INLINE_MAX);
+    if count == 0 {
+        return Ok(0);
+    }
+    let value = fd
+        .call(
+            Call::Pread {
+                fd: Some(fd.fd.into()),
+                path: None,
+                offset,
+                count,
+            },
             sudo,
-            fs_session,
         )
         .await?;
-        let data: Bytes = serde_json::from_value(val["data"].clone()).map_err(|_| Errno::EIO)?;
-        if data.0.is_empty() {
-            break;
-        }
-        cur = cur.checked_add(data.0.len() as u64).ok_or(Errno::EFBIG)?;
-        out.extend_from_slice(&data.0);
-        if data.0.len() < chunk {
-            break;
-        }
+    let data: Bytes = serde_json::from_value(value["data"].clone()).map_err(|_| Errno::EIO)?;
+    if data.0.len() > count as usize {
+        return Err(Errno::EIO);
     }
-    Ok((out, None))
+    buf[..data.0.len()].copy_from_slice(&data.0);
+    Ok(data.0.len())
 }
 
 enum OpenRecord {
@@ -577,6 +588,8 @@ enum OpenRecord {
         real: OpenRef,
     },
     Page {
+        read_fd: Option<AuthorityPageFd>,
+        read_meta: Option<Metadata>,
         path: String,
         node: NodeId,
         access: Access,
@@ -1279,6 +1292,7 @@ impl RootCloudDriver {
         walked
             .entries
             .last()
+            .filter(|e| e.handle.node.ino == self.page_ino(handle.node))
             .map(|e| e.handle.clone())
             .ok_or(Errno::ESTALE)
     }
@@ -1530,6 +1544,100 @@ impl RootCloudDriver {
         .await
     }
 
+    pub(crate) async fn guarded_page_call(
+        &self,
+        call: Call,
+        umask: Option<u16>,
+        sudo: bool,
+        target: PageTarget,
+    ) -> vfs::Result<Value> {
+        let session = self.current_fs_session();
+        page_target_call(
+            call,
+            umask,
+            sudo,
+            session
+                .as_ref()
+                .map(|(id, key)| (id.as_str(), key.as_str())),
+            Some(target),
+        )
+        .await
+    }
+
+    pub(crate) fn page_ino(&self, node: NodeId) -> u64 {
+        if node == self.root().node {
+            self.canonical_nodes
+                .borrow()
+                .get("/")
+                .map_or(node.ino, |n| n.ino)
+        } else {
+            node.ino
+        }
+    }
+
+    async fn page_read_open(
+        &self,
+        path: &str,
+        node: NodeId,
+        sudo: bool,
+    ) -> vfs::Result<(AuthorityPageFd, Stat)> {
+        let reply = self
+            .guarded_page_call(
+                Call::Open {
+                    path: path.into(),
+                    flags: abi::O_RDONLY,
+                    mode: 0,
+                    size: None,
+                    sha256: None,
+                    version: None,
+                },
+                None,
+                sudo,
+                PageTarget::Inode(self.page_ino(node)),
+            )
+            .await?;
+        let fd: AuthorityPageFd = serde_json::from_value(reply.clone()).map_err(|_| Errno::EIO)?;
+        match serde_json::from_value(reply["stat"].clone()) {
+            Ok(stat) => Ok((fd, stat)),
+            Err(_) => {
+                let _ = fd.close(sudo).await;
+                Err(Errno::EIO)
+            }
+        }
+    }
+
+    async fn read_page_prefix(
+        &self,
+        path: &str,
+        node: NodeId,
+        len: usize,
+        sudo: bool,
+    ) -> vfs::Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let (fd, _) = self.page_read_open(path, node, sudo).await?;
+        let result = async {
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(len).map_err(|_| Errno::EFBIG)?;
+            bytes.resize(len, 0);
+            let mut pos = 0;
+            while pos < len {
+                let n = read_page_fd(&fd, pos as u64, &mut bytes[pos..], sudo).await?;
+                if n == 0 {
+                    return Err(Errno::ESTALE);
+                }
+                pos += n;
+            }
+            Ok(bytes)
+        }
+        .await;
+        let close = fd.close(sudo).await;
+        let bytes = result?;
+        close?;
+        Ok(bytes)
+    }
+
     fn page_lock_for(&self, ino: u64) -> Rc<PageLock> {
         self.page_locks.borrow_mut().entry(ino).or_default().clone()
     }
@@ -1585,31 +1693,22 @@ impl RootCloudDriver {
         umask: u16,
         sudo: bool,
         mutation: PageMutation<'_>,
+        reader: Option<u64>,
     ) -> vfs::Result<Written> {
         self.bump_page_mutation();
         let _guard = lock_page(self.page_lock_for(expected_node.ino)).await;
         for attempt in 0..3 {
+            let target = PageTarget::Inode(self.page_ino(expected_node));
             let st_val = self
-                .page_sys_one(
-                    Call::Lstat {
-                        path: path.to_string(),
-                    },
-                    None,
-                    sudo,
-                )
+                .guarded_page_call(Call::Lstat { path: path.into() }, None, sudo, target)
                 .await?;
+            let version = st_val["version"].as_str().ok_or(Errno::ESTALE)?.to_owned();
             let st: Stat = serde_json::from_value(st_val).map_err(|_| Errno::EIO)?;
-            if expected_node.ino != 1
-                && (expected_node.ino & 0x8000_0000_0000_0000) == 0
-                && st.ino != expected_node.ino
-            {
-                return Err(Errno::ESTALE);
-            }
             let mode = (st.mode & 0o7777) as u16;
             let fs_session = self.connector.current_session();
             let fs_sess_ref = fs_session.as_ref().map(|(s, k)| (s.as_str(), k.as_str()));
 
-            let (next, written, version) = match mutation {
+            let (next, written) = match mutation {
                 PageMutation::WriteAt { buf, at } => {
                     let write_off = match at {
                         WriteAt::Offset(off) => off,
@@ -1617,6 +1716,11 @@ impl RootCloudDriver {
                     };
                     if write_off > FILE_MAX || buf.len() as u64 > FILE_MAX - write_off {
                         return Err(Errno::EINVAL);
+                    }
+                    if write_off + buf.len() as u64 > os_core::MAX_FILE
+                        || st.size > os_core::MAX_FILE
+                    {
+                        return Err(Errno::EFBIG);
                     }
                     if buf.is_empty() {
                         return Ok(Written {
@@ -1627,12 +1731,12 @@ impl RootCloudDriver {
                     let off = usize::try_from(write_off).map_err(|_| Errno::EFBIG)?;
                     let end = off.checked_add(buf.len()).ok_or(Errno::EFBIG)?;
                     let cur_len = usize::try_from(st.size).map_err(|_| Errno::EFBIG)?;
-                    let (mut next, version) = if cur_len > 0 {
-                        page_file_read_range_with_etag(path, 0, cur_len, sudo, fs_sess_ref).await?
-                    } else {
-                        (Vec::new(), None)
-                    };
+                    let mut next = self
+                        .read_page_prefix(path, expected_node, cur_len, sudo)
+                        .await?;
                     if next.len() < end {
+                        next.try_reserve_exact(end - next.len())
+                            .map_err(|_| Errno::EFBIG)?;
                         next.resize(end, 0);
                     }
                     next[off..end].copy_from_slice(buf);
@@ -1642,22 +1746,21 @@ impl RootCloudDriver {
                             offset: write_off,
                             len: buf.len(),
                         },
-                        version,
                     )
                 }
                 PageMutation::SetLen(size) => {
-                    if size > FILE_MAX {
+                    if size > os_core::MAX_FILE {
                         return Err(Errno::EFBIG);
                     }
                     let target_len = usize::try_from(size).map_err(|_| Errno::EFBIG)?;
                     let read_len = usize::try_from(st.size.min(size)).map_err(|_| Errno::EFBIG)?;
-                    let (mut next, version) = if target_len > 0 && read_len > 0 {
-                        page_file_read_range_with_etag(path, 0, read_len, sudo, fs_sess_ref).await?
-                    } else {
-                        (Vec::new(), None)
-                    };
+                    let mut next = self
+                        .read_page_prefix(path, expected_node, read_len, sudo)
+                        .await?;
+                    next.try_reserve_exact(target_len - next.len())
+                        .map_err(|_| Errno::EFBIG)?;
                     next.resize(target_len, 0);
-                    (next, Written { offset: 0, len: 0 }, version)
+                    (next, Written { offset: 0, len: 0 })
                 }
             };
 
@@ -1668,12 +1771,26 @@ impl RootCloudDriver {
                 false,
                 umask,
                 sudo,
-                version.as_deref(),
+                Some(&version),
                 fs_sess_ref,
+                target,
             )
             .await
             {
-                Ok(()) => return Ok(written),
+                Ok(_) => {
+                    if let Some(id) = reader {
+                        // Read/write descriptions must see their own newly committed content.
+                        let (fd, _) = self.page_read_open(path, expected_node, sudo).await?;
+                        let release = match self.opens.borrow_mut().get_mut(&id) {
+                            Some(OpenRecord::Page { read_fd, .. }) => read_fd.replace(fd),
+                            _ => Some(fd),
+                        };
+                        if let Some(old) = release {
+                            old.close(sudo).await?;
+                        }
+                    }
+                    return Ok(written);
+                }
                 Err(Errno::ESTALE) if attempt < 2 => continue,
                 Err(err) => return Err(err),
             }
@@ -2015,6 +2132,7 @@ impl Filesystem for RootCloudDriver {
                     cred.umask,
                     sudo,
                     PageMutation::SetLen(size),
+                    None,
                 )
                 .await?;
             }
@@ -2032,13 +2150,14 @@ impl Filesystem for RootCloudDriver {
                 .await?;
             }
             if let Some(mode) = attr.mode {
-                self.page_sys_one(
+                self.guarded_page_call(
                     Call::Chmod {
                         path: path.clone(),
                         mode,
                     },
                     Some(cred.umask),
                     sudo,
+                    PageTarget::Inode(self.page_ino(handle.node)),
                 )
                 .await?;
             }
@@ -2057,6 +2176,50 @@ impl Filesystem for RootCloudDriver {
             }
             self.path_entries.borrow_mut().remove(&path);
             self.metadata(cred, handle).await
+        })
+    }
+
+    fn setattr_open<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        open: &'a OpenRef,
+        attr: &'a SetAttr,
+    ) -> BoxFuture<'a, Metadata> {
+        Box::pin(async move {
+            let fd = match self.opens.borrow().get(&open.id) {
+                Some(OpenRecord::Page { read_fd, .. }) => read_fd.clone(),
+                _ => None,
+            };
+            if let (Some(fd), Some(mode)) = (fd, attr.mode)
+                && *attr
+                    == (SetAttr {
+                        mode: Some(mode),
+                        ..SetAttr::default()
+                    })
+            {
+                let value = fd
+                    .call(
+                        Call::Fchmod {
+                            fd: fd.fd.into(),
+                            mode,
+                        },
+                        self.page_sudo.get(),
+                    )
+                    .await?;
+                let stat: Stat = serde_json::from_value(value).map_err(|_| Errno::EIO)?;
+                let meta = stat_to_metadata(&stat);
+                self.bump_page_mutation();
+                if let Some(OpenRecord::Page {
+                    read_meta: Some(cached),
+                    ..
+                }) = self.opens.borrow_mut().get_mut(&open.id)
+                {
+                    *cached = meta.clone();
+                }
+                return Ok(meta);
+            }
+            self.setattr(cred, handle, attr).await
         })
     }
 
@@ -2222,46 +2385,36 @@ impl Filesystem for RootCloudDriver {
             let sudo = self.page_sudo.get();
             let fs_session = self.connector.current_session();
             let fs_sess_ref = fs_session.as_ref().map(|(s, k)| (s.as_str(), k.as_str()));
-            let existing = self
-                .page_sys_one(
-                    Call::Lstat {
-                        path: child_path.clone(),
-                    },
-                    Some(cred.umask),
-                    sudo,
-                )
-                .await;
-            if existing.is_ok() && options.is_create_new() {
-                return Err(Errno::EEXIST);
-            }
-            if existing.is_err() || options.is_truncate() {
-                write_whole_cloud_page(
-                    &child_path,
-                    &[],
-                    mode,
-                    options.is_create_new(),
-                    cred.umask,
-                    sudo,
-                    None,
-                    fs_sess_ref,
-                )
-                .await?;
-            }
-            let val = self
-                .page_sys_one(
-                    Call::Lstat {
-                        path: child_path.clone(),
-                    },
-                    Some(cred.umask),
-                    sudo,
-                )
-                .await?;
-            let st: Stat = serde_json::from_value(val).map_err(|_| Errno::EIO)?;
+            // The VFS resolved a missing final component. A racing creator owns its inode.
+            let st = write_whole_cloud_page(
+                &child_path,
+                &[],
+                mode,
+                true,
+                cred.umask,
+                sudo,
+                None,
+                fs_sess_ref,
+                PageTarget::MissingIn(self.page_ino(dir.node)),
+            )
+            .await?;
             let entry = self.record_path_stat(&child_path, &st);
+            let read_fd = if access.reads() {
+                Some(
+                    self.page_read_open(&child_path, entry.handle.node, sudo)
+                        .await?
+                        .0,
+                )
+            } else {
+                None
+            };
             let oref = self.alloc_open(
                 entry.handle.node,
                 access,
                 OpenRecord::Page {
+                    read_meta: (read_fd.is_some() && !access.writes())
+                        .then(|| entry.metadata.clone()),
+                    read_fd,
                     path: child_path,
                     node: entry.handle.node,
                     access,
@@ -2360,7 +2513,16 @@ impl Filesystem for RootCloudDriver {
             }
             let dir_path = self.path_for_handle(dir)?;
             let child_path = join_cloud_path(&dir_path, name);
-            let rdev_opt = (!rdev.is_empty()).then(|| rdev.to_string());
+            let rdev_opt =
+                if (rdev.is_empty() || rdev == "0") && u32::from(mode) & 0o170000 == abi::S_IFCHR {
+                    match dir_path.as_str() {
+                        "/dev/present" => Some("present".into()),
+                        "/dev/snd" => Some("snd".into()),
+                        _ => return Err(Errno::EINVAL),
+                    }
+                } else {
+                    (!rdev.is_empty()).then(|| rdev.to_string())
+                };
             if let Some(token) = &cred.token {
                 let pid = self.active_pid.get().unwrap_or(1);
                 let host = BrowserHost {
@@ -2581,6 +2743,34 @@ impl Filesystem for RootCloudDriver {
             )
             .await?;
             self.invalidate_page_path(&child_path, false);
+            Ok(())
+        })
+    }
+
+    fn unlink_if<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        node: NodeId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if !self.is_remote_mode() {
+                return self.mem.unlink_if(cred, dir, name, node).await;
+            }
+            if self.is_cloud_denied(cred) || cred.token.is_some() {
+                return Err(Errno::EACCES);
+            }
+            check_component(name)?;
+            let path = join_cloud_path(&self.path_for_handle(dir)?, name);
+            self.guarded_page_call(
+                Call::Unlink { path: path.clone() },
+                Some(cred.umask),
+                self.page_sudo.get(),
+                PageTarget::Inode(self.page_ino(node)),
+            )
+            .await?;
+            self.invalidate_page_path(&path, false);
             Ok(())
         })
     }
@@ -2952,37 +3142,48 @@ impl Filesystem for RootCloudDriver {
                 }
             }
             if mode_bits != 0 && installed("pageSysPost").is_ok() {
-                self.page_sys_one(
+                self.guarded_page_call(
                     Call::Access {
                         path: path.clone(),
                         mode: mode_bits,
                     },
                     Some(cred.umask),
                     sudo,
+                    PageTarget::Inode(self.page_ino(handle.node)),
                 )
                 .await?;
             }
             if options.is_truncate() && meta.is_file() {
                 self.bump_page_mutation();
                 self.path_entries.borrow_mut().remove(&path);
-                let _guard = lock_page(self.page_lock_for(handle.node.ino)).await;
-                let fs_session = self.connector.current_session();
-                write_whole_cloud_page(
+                self.page_rmw_mutate(
                     &path,
-                    &[],
-                    meta.mode,
-                    false,
+                    handle.node,
                     cred.umask,
                     sudo,
+                    PageMutation::SetLen(0),
                     None,
-                    fs_session.as_ref().map(|(s, k)| (s.as_str(), k.as_str())),
                 )
                 .await?;
             }
+            let (read_fd, read_meta) = if access.reads() && meta.is_file() {
+                match self.page_read_open(&path, handle.node, sudo).await {
+                    Ok((fd, st)) => (
+                        Some(fd),
+                        (!access.writes()).then(|| self.record_path_stat(&path, &st).metadata),
+                    ),
+                    Err(Errno::EACCES) if access == Access::Exec => (None, None),
+                    Err(e) => return Err(e),
+                }
+            } else {
+                (None, None)
+            };
             Ok(self.alloc_open(
                 handle.node,
                 access,
                 OpenRecord::Page {
+                    read_fd,
+                    read_meta,
                     path,
                     node: handle.node,
                     access,
@@ -3010,6 +3211,10 @@ impl Filesystem for RootCloudDriver {
                     Some(OpenRecord::Remote { cloud, real }) => {
                         MetaDispatch::Remote(Rc::clone(cloud), real.clone())
                     }
+                    Some(OpenRecord::Page {
+                        read_meta: Some(meta),
+                        ..
+                    }) => return Ok(meta.clone()),
                     Some(OpenRecord::Page { stale: true, .. }) => return Err(Errno::ESTALE),
                     Some(OpenRecord::Page {
                         path, node, sudo, ..
@@ -3043,7 +3248,12 @@ impl Filesystem for RootCloudDriver {
                     }
                     let sudo = self.page_sudo.get() || open_sudo;
                     let val = self
-                        .page_sys_one(Call::Lstat { path: path.clone() }, None, sudo)
+                        .guarded_page_call(
+                            Call::Lstat { path: path.clone() },
+                            None,
+                            sudo,
+                            PageTarget::Inode(self.page_ino(node)),
+                        )
                         .await?;
                     let st: Stat = serde_json::from_value(val).map_err(|_| Errno::EIO)?;
                     Ok(self.record_path_stat(&path, &st).metadata)
@@ -3068,7 +3278,7 @@ impl Filesystem for RootCloudDriver {
             enum Dispatch {
                 Mem(OpenRef),
                 Remote(Rc<Cloud>, OpenRef),
-                Page(String, Access, bool),
+                Page(Option<AuthorityPageFd>, Access, bool),
             }
             let disp = {
                 let opens = self.opens.borrow();
@@ -3077,10 +3287,13 @@ impl Filesystem for RootCloudDriver {
                     Some(OpenRecord::Remote { cloud, real }) => {
                         Dispatch::Remote(Rc::clone(cloud), real.clone())
                     }
-                    Some(OpenRecord::Page { stale: true, .. }) => return Err(Errno::ESTALE),
+
                     Some(OpenRecord::Page {
-                        path, access, sudo, ..
-                    }) => Dispatch::Page(path.clone(), *access, *sudo),
+                        read_fd,
+                        access,
+                        sudo,
+                        ..
+                    }) => Dispatch::Page(read_fd.clone(), *access, *sudo),
                     Some(OpenRecord::PathOnly { .. }) | None => return Err(Errno::EBADF),
                 }
             };
@@ -3091,42 +3304,13 @@ impl Filesystem for RootCloudDriver {
                     self.acted(actor, cloud.fs.read_at(&real, buf, offset))
                         .await
                 }
-                Dispatch::Page(path, access, open_sudo) => {
-                    if !access.reads() {
-                        return Err(Errno::EBADF);
-                    }
-                    if buf.is_empty() {
-                        return Ok(0);
-                    }
-                    let sudo = self.page_sudo.get() || open_sudo;
-                    let fs_session = self.connector.current_session();
-                    match page_file_read_range_with_etag(
-                        &path,
-                        offset,
-                        buf.len(),
-                        sudo,
-                        fs_session.as_ref().map(|(s, k)| (s.as_str(), k.as_str())),
-                    )
-                    .await
-                    {
-                        Ok((data, _)) => {
-                            let n = data.len().min(buf.len());
-                            buf[..n].copy_from_slice(&data[..n]);
-                            Ok(n)
-                        }
-                        // Execute-only (`0o111`) files cannot be fetched via page cookie
-                        // `/api/file`; return a stub Wasm header so `resolve_exec` reaches
-                        // the server `/internal/exec` grant path cleanly.
-                        Err(Errno::EACCES)
-                            if access == Access::Exec && offset == 0 && buf.len() >= 8 =>
-                        {
-                            const WASM_PROBE_STUB: [u8; 8] = *b"\0asm\x01\0\0\0";
-                            buf[..8].copy_from_slice(&WASM_PROBE_STUB);
-                            Ok(8)
-                        }
-                        Err(err) => Err(err),
-                    }
+                Dispatch::Page(Some(fd), _, sudo) => read_page_fd(&fd, offset, buf, sudo).await,
+                Dispatch::Page(None, Access::Exec, _) if offset == 0 && buf.len() >= 8 => {
+                    // The X_OK check authorized execution. The authority supplies this image.
+                    buf[..8].copy_from_slice(b"\0asm\x01\0\0\0");
+                    Ok(8)
                 }
+                Dispatch::Page(None, _, _) => Err(Errno::EBADF),
             }
         })
     }
@@ -3175,8 +3359,15 @@ impl Filesystem for RootCloudDriver {
                         return Err(Errno::EBADF);
                     }
                     let sudo = self.page_sudo.get() || open_sudo;
-                    self.page_rmw_mutate(&path, node, 0, sudo, PageMutation::WriteAt { buf, at })
-                        .await
+                    self.page_rmw_mutate(
+                        &path,
+                        node,
+                        0,
+                        sudo,
+                        PageMutation::WriteAt { buf, at },
+                        access.reads().then_some(open.id),
+                    )
+                    .await
                 }
             }
         })
@@ -3221,12 +3412,25 @@ impl Filesystem for RootCloudDriver {
                         return Err(Errno::EBADF);
                     }
                     let sudo = self.page_sudo.get() || open_sudo;
-                    self.page_rmw_mutate(&path, node, 0, sudo, PageMutation::SetLen(size))
-                        .await
-                        .map(|_| ())
+                    self.page_rmw_mutate(
+                        &path,
+                        node,
+                        0,
+                        sudo,
+                        PageMutation::SetLen(size),
+                        access.reads().then_some(open.id),
+                    )
+                    .await
+                    .map(|_| ())
                 }
             }
         })
+    }
+
+    fn sync_handle<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, ()> {
+        // Cloud metadata transactions are durable at acknowledgment. Authenticate the handle
+        // without requiring read permission on a write/search-only directory.
+        Box::pin(async move { self.metadata(cred, handle).await.map(|_| ()) })
     }
 
     fn sync_all<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
@@ -3454,6 +3658,11 @@ impl Filesystem for RootCloudDriver {
                     let actor = self.active_pid.get().map_or(Actor::None, Actor::Process);
                     self.acted(actor, cloud.fs.release(&real)).await
                 }
+                Some(OpenRecord::Page {
+                    read_fd: Some(fd),
+                    sudo,
+                    ..
+                }) => fd.close(sudo).await.map(|_| ()),
                 Some(OpenRecord::Page { .. }) | Some(OpenRecord::PathOnly { .. }) => Ok(()),
                 None => Err(Errno::EBADF),
             }
@@ -3482,13 +3691,14 @@ async fn write_whole_cloud_page(
     sudo: bool,
     version: Option<&str>,
     fs_session: Option<(&str, &str)>,
-) -> vfs::Result<()> {
+    target: PageTarget,
+) -> vfs::Result<Stat> {
     let mut flags = abi::O_WRONLY | abi::O_CREAT | abi::O_TRUNC;
     if excl {
         flags |= abi::O_EXCL;
     }
     let sha = image::digest(bytes);
-    let opened = page_sys_one_with_session(
+    let opened = page_target_call(
         Call::Open {
             path: path.to_string(),
             flags,
@@ -3500,10 +3710,11 @@ async fn write_whole_cloud_page(
         Some(umask),
         sudo,
         fs_session,
+        Some(target),
     )
     .await?;
-    let fd = opened["fd"].as_u64().ok_or(Errno::EIO)? as u32;
-    let fd_ref = FdRef::Fd(fd);
+    let fd: AuthorityPageFd = serde_json::from_value(opened.clone()).map_err(|_| Errno::EIO)?;
+    let fd_ref = FdRef::Fd(fd.fd);
     let raw_chunk_size = opened["chunk_size"]
         .as_u64()
         .unwrap_or(wire::DATA_MAX)
@@ -3512,24 +3723,24 @@ async fn write_whole_cloud_page(
     let inline_max = usize::try_from(abi::INLINE_MAX).unwrap_or(usize::MAX);
     for (idx, chunk) in bytes.chunks(chunk_size).enumerate() {
         let write_res: vfs::Result<()> = if chunk.len() <= inline_max {
-            page_sys_one_with_session(
+            fd.call(
                 Call::Pwrite {
                     fd: fd_ref,
                     index: idx as u64,
                     data: Bytes(chunk.to_vec()),
                 },
-                Some(umask),
                 sudo,
-                fs_session,
             )
             .await
             .map(|_| ())
         } else if let Ok((global, pwrite_fn)) = installed("pagePwrite") {
             let chunk_arr = js_sys::Uint8Array::from(chunk);
-            let headers = session_headers_js(fs_session).unwrap_or(JsValue::UNDEFINED);
+            let headers = js_sys::Object::new();
+            js_sys::Reflect::set(&headers, &"X-Fd-Epoch".into(), &fd.fd_epoch.as_str().into())
+                .map_err(|_| Errno::EIO)?;
             match pwrite_fn.call4(
                 &global,
-                &JsValue::from_f64(fd as f64),
+                &JsValue::from_f64(fd.fd as f64),
                 &JsValue::from_f64(idx as f64),
                 &chunk_arr.into(),
                 &headers,
@@ -3547,19 +3758,12 @@ async fn write_whole_cloud_page(
             Err(Errno::E2BIG)
         };
         if let Err(err) = write_res {
-            let _ = page_sys_one_with_session(
-                Call::Discard { fd: fd_ref },
-                Some(umask),
-                sudo,
-                fs_session,
-            )
-            .await;
+            let _ = fd.call(Call::Discard { fd: fd_ref }, sudo).await;
             return Err(err);
         }
     }
-    page_sys_one_with_session(Call::Close { fd: fd_ref }, Some(umask), sudo, fs_session)
-        .await
-        .map(|_| ())
+    fd.close(sudo).await?;
+    serde_json::from_value(opened["stat"].clone()).map_err(|_| Errno::EIO)
 }
 
 impl Kernel {
@@ -3569,37 +3773,42 @@ impl Kernel {
         if let Some(identity) = self.state.borrow().identities.get(token).cloned() {
             return Ok(identity);
         }
-        if installed("cloudFsPost").is_err() {
-            return Ok(Identity::root());
-        }
-        let body = serde_json::to_vec(&Batch {
+        let batch = Batch {
             calls: vec![Call::Getcreds],
             umask: None,
             sudo: false,
             pid: Some(pid),
             process: Some(token.to_string()),
-        })
-        .map_err(|error| fail(Error::because(Errno::EIO, error.to_string())))?;
-        let host = BrowserHost {
-            state: self.state.clone(),
-            current: self.current.clone(),
         };
-        let reply = host
-            .post(
-                "/api/sys",
-                vec![("Content-Type", "application/json".to_string())],
-                body,
-            )
-            .await
-            .map_err(errno)?;
-        if reply.status != 200 {
-            let detail = String::from_utf8_lossy(&reply.body).into_owned();
-            return Err(fail(Error::because(Errno::EIO, detail)));
-        }
-        let results: Results = serde_json::from_slice(&reply.body)
-            .map_err(|error| fail(Error::because(Errno::EIO, error.to_string())))?;
+        let results = if installed("cloudFsPost").is_err() {
+            crate::sys(batch).await.map_err(fail)?
+        } else {
+            let body = serde_json::to_vec(&batch)
+                .map_err(|e| fail(Error::because(Errno::EIO, e.to_string())))?;
+            let host = BrowserHost {
+                state: self.state.clone(),
+                current: self.current.clone(),
+            };
+            let reply = host
+                .post(
+                    "/api/sys",
+                    vec![
+                        ("Content-Type", "application/json".to_string()),
+                        ("X-Process-Token", token.to_string()),
+                    ],
+                    body,
+                )
+                .await
+                .map_err(errno)?;
+            if reply.status != 200 {
+                let detail = String::from_utf8_lossy(&reply.body).into_owned();
+                return Err(fail(Error::because(Errno::EIO, detail)));
+            }
+            let results: Results = serde_json::from_slice(&reply.body)
+                .map_err(|error| fail(Error::because(Errno::EIO, error.to_string())))?;
+            results.results
+        };
         let value = results
-            .results
             .into_iter()
             .next()
             .ok_or_else(|| fail(Errno::EIO.into()))?
@@ -3676,7 +3885,7 @@ impl Kernel {
                     }
                 }
                 if let Some(vfs) = self.vfs_instance() {
-                    let _ = vfs.releases().flush().await;
+                    crate::vfs_engine::drain_releases(&vfs);
                 }
                 if let Err(err) = result {
                     if err == Errno::ENOTCONN {

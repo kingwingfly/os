@@ -914,6 +914,15 @@ impl MountSlot {
 /// [`crate::context::PathAnchor`], and child [`MountAttachment`].
 pub struct MountPin(Rc<MountSlot>);
 
+/// A delegated writer keeps the mount busy just like a writable open description.
+pub struct WritableMountPin(MountPin);
+
+impl Drop for WritableMountPin {
+    fn drop(&mut self) {
+        self.0.slot().dec_writable_opens();
+    }
+}
+
 impl Clone for MountPin {
     fn clone(&self) -> Self {
         self.0.active_pins.set(self.0.active_pins.get() + 1);
@@ -945,6 +954,15 @@ impl std::fmt::Debug for MountPin {
 }
 
 impl MountPin {
+    pub fn pin_writer(&self, cred: &Cred) -> Result<WritableMountPin> {
+        self.guard_enter(cred)?;
+        if self.effective_rdonly() {
+            return Err(Errno::EROFS);
+        }
+        self.slot().inc_writable_opens();
+        Ok(WritableMountPin(self.clone()))
+    }
+
     pub fn slot(&self) -> &Rc<MountSlot> {
         &self.0
     }

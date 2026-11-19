@@ -957,21 +957,29 @@ test('a folder selection cannot be attached to a different login', async () => {
 
 test('a new account joins its workspace but explicit shutdown is never revived', async () => {
   const previous = globalThis.kernelRequest;
-  let joined = false, refreshes = 0, shutdown = false;
+  let joined = false, refreshes = 0, shutdown = false, id = 'new-account';
+  const ended = [];
   try {
-    globalThis.kernelRequest = async type => {
+    globalThis.kernelRequest = async (type, args) => {
       if (type === 'login_refresh') { joined = true; refreshes++; return; }
       if (type === 'workspace_credentials') return { uid: 42 };
-      if (type === 'session_begin' || type === 'set_active_session' || type === 'session_end') return null;
+      if (type === 'session_end') { ended.push(args.sessionId); return; }
+      if (type === 'vfs_read_stream_chunk' || type === 'vfs_close_read_stream') return args.sessionId;
+      if (type === 'session_begin' || type === 'set_active_session') return null;
       assert.equal(type, 'login_lifecycle');
-      return joined ? { id: 'new-account', uid: 42, shutdown } : null;
+      return joined ? { id, uid: 42, shutdown } : null;
     };
     assert.equal((await currentWorkspace()).identity.uid, 42);
     assert.equal(refreshes, 1);
+    id = 'next-login';
+    for (const type of ['mount_vfs_read_chunk', 'mount_vfs_close_read']) {
+      assert.equal(await mountRequest(type, { sessionId: 'new-account', streamId: 1 }), id);
+    }
+    assert.ok(ended.includes('new-account'));
     shutdown = true;
     await assert.rejects(currentWorkspace(), { errno: 'EACCES' });
     assert.equal(refreshes, 1);
-  } finally { endWorkspace('new-account'); globalThis.kernelRequest = previous; }
+  } finally { await endWorkspace(id); globalThis.kernelRequest = previous; }
 });
 
 test('descriptors are private to their process lineage and mount detaches cleanly on unmount', async () => {
@@ -1308,7 +1316,7 @@ test('Directory Handle enforces zero sidecars, EPERM on link/symlink, ESTALE and
   // Outside host edit changes size/mtime -> open fd returns ESTALE, path resets to private defaults (0o600, no ACL)!
   hostTree.hostWrite('hello.txt', 'modified-outside-os-with-different-size!', Date.now() + 99_999);
   await assert.rejects(tab1.read(openFd, 0, 16, tab1.page), { errno: 'ESTALE' });
-  await tab1.closeFd(openFd, tab1.page);
+  await assert.rejects(tab1.closeFd(openFd, tab1.page), { errno: 'ESTALE' });
 
   const resetStat = await tab2.stat('/mnt/local/proj/hello.txt');
   assert.notEqual(resetStat.ino, st1.ino);
@@ -1578,6 +1586,21 @@ test('RemoteMount and exportMount support O_EXCL, RENAME_NOREPLACE, links, fsync
     currentFetchUid = 51;
     const remoteOpfs = await attachMount(peer, { address: pubOpfs.address, writable: true, execute: true, port: makeRelayBridge(peer, false) });
     await peer.attachShared('/mnt/shared/sub', remoteOpfs);
+
+    // Publisher-side rename and replacement must not redirect a peer's retained directory.
+    const folder = '/mnt/local/opfs/sub/retained';
+    await owner.calls([{ mkdir: { path: folder, mode: 0o777 } }], owner.page, cloud);
+    const [pinned] = await peer.calls([{ open: { path: '/mnt/shared/sub/retained', flags: 0o200000 } }], peer.page, cloud);
+    assert.ok(pinned.ok, JSON.stringify(pinned));
+    const moved = await owner.calls([
+      { rename: { from: folder, to: folder + '-old' } }, { mkdir: { path: folder, mode: 0o777 } },
+    ], owner.page, cloud);
+    assert.ok(moved.every(r => 'ok' in r), JSON.stringify(moved));
+    const [stale] = await peer.calls([{ mkdir_at: { dirfd: pinned.ok.fd, path: 'child', mode: 0o755 } }], peer.page, cloud);
+    assert.equal(stale.err.errno, 'ESTALE');
+    const [replacement] = await owner.calls([{ stat: { path: folder + '/child' } }], owner.page, cloud);
+    assert.equal(replacement.err.errno, 'ENOENT');
+    await peer.calls([{ close: { fd: pinned.ok.fd } }], peer.page, cloud);
 
     // Direct RemoteMount confines escaping symlinks with ELOOP, while VFS mount walks `..` into `/mnt/shared` (`ENOENT`).
     await assert.rejects(remoteOpfs.open(remoteOpfs.grant, 'escape', 0), { errno: 'ELOOP' });
@@ -2809,7 +2832,7 @@ test('PR #73 P1-5: WASI process.js openPath rejects O_RDONLY|O_TRUNC on director
   }
 });
 
-test('PR #74 Track C: WASI process.js kfd FDFLAG_NONBLOCK, /proc/self/fd translation & ELOOP, rawFds separation, posix_spawn serviceGrant validation', async () => {
+test('PR #74 Track C: WASI process.js kfd FDFLAG_NONBLOCK, /proc/self/fd translation & ELOOP, raw descriptor mapping, posix_spawn serviceGrant validation', async () => {
   const { Worker } = await import('node:worker_threads');
   installBrowserEnv();
 
@@ -2823,11 +2846,19 @@ test('PR #74 Track C: WASI process.js kfd FDFLAG_NONBLOCK, /proc/self/fd transla
   const sTarget = 'mnt/local/proj/target';
   const sSubdir = 'mnt/local/proj/subdir';
   const sSelfFd4 = '/proc/self/fd/4';
+  const sInfo4 = '/proc/self/fdinfo/4';
   const sSelfFd5 = '/proc/self/fd/5';
   const sSelfFd99 = '/proc/self/fd/99';
   const sSysBatch = JSON.stringify([
     { open: { path: '/mnt/local/proj/target', flags: 0 } },
     { close: { fd: { ref: 0 } } },
+    { open: { path: sSelfFd4, flags: 0 } },
+    { pread: { fd: { ref: 2 }, offset: 0, count: 11 } },
+    { close: { fd: { ref: 2 } } },
+    { chmod: { path: sSelfFd4, mode: 0o640 } },
+    { ioctl: { fd: 4, request: 0x54570101, arg: { operation: {
+      operation: 'extract', source: { directory: 5 }, destination: { directory: 5 },
+    } } } },
   ]);
   const sBadGrant = JSON.stringify({
     argv: ['/usr/bin/true'],
@@ -2901,8 +2932,10 @@ test('PR #74 Track C: WASI process.js kfd FDFLAG_NONBLOCK, /proc/self/fd transla
     ...bailIfNe(0, 230),
     ...i32c(768), 0x29, 0x03, 0x20, 0x42, 0x0b, 0x52, // fstat.size == 11 ("target-data")
     0x04, 0x40, ...i32c(94), 0x10, 0x08, 0x0b,
-    // 5. os.sys batch raw open+close (rawFds) preserves guest $fd=4
-    ...i32c(220), ...i32c(sSysBatch.length), 0x10, 0x06, 0x1a,
+    ...i32c(3), ...i32c(1), ...i32c(1000), ...i32c(sInfo4.length), ...i32c(768), 0x10, 0x04,
+    ...bailIfNe(0, 235),
+    // 5. Raw opens, batch references and proc-fd reopens share the guest fd table.
+    ...i32c(1300), ...i32c(sSysBatch.length), 0x10, 0x06, 0x1a,
     0x20, 0x01, ...i32c(512), 0x10, 0x02, ...bailIfNe(0, 240),
     0x20, 0x01, 0x10, 0x05, ...bailIfNe(0, 250),
     0x20, 0x02, 0x10, 0x05, ...bailIfNe(0, 255),
@@ -2914,8 +2947,9 @@ test('PR #74 Track C: WASI process.js kfd FDFLAG_NONBLOCK, /proc/self/fd transla
   const dSegs = [
     [100, sTarget],
     [140, sSelfFd4],
+    [1000, sInfo4],
     [180, sSelfFd99],
-    [220, sSysBatch],
+    [1300, sSysBatch],
     [400, sBadGrant],
     [600, sSubdir],
     [640, sSelfFd5],
@@ -2969,6 +3003,7 @@ test('PR #74 Track C: WASI process.js kfd FDFLAG_NONBLOCK, /proc/self/fd transla
   const channelState = new Int32Array(channelBuf, 0, 2);
   const channelData = new Uint8Array(channelBuf, 8);
   const worker = new Worker(workerCode, { eval: true, workerData: { processUrl } });
+  let rawRead, archiveDirectories;
   try {
     const exitResult = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('worker timed out')), 5000);
@@ -2989,7 +3024,14 @@ test('PR #74 Track C: WASI process.js kfd FDFLAG_NONBLOCK, /proc/self/fd transla
             else if (op === 'readlinkat') reply = { target: await ws.kernel.proc_readlinkat(ws.page, vargs.dirfd, vargs.path) };
             else if (op === 'set_append') { ws.kernel.kfd_set_append(ws.page, vargs.kfd, !!vargs.append); reply = {}; }
             else if (op === 'is_append') reply = { append: ws.kernel.kfd_is_append(ws.page, vargs.kfd) };
-            else if (op === 'sys') reply = JSON.parse(await ws.kernel.proc_sys(ws.page, JSON.stringify(vargs.batch)));
+            else if (op === 'sys') {
+              const ioctl = vargs.batch.calls[0]?.ioctl;
+              if (ioctl?.request === 0x54570101) {
+                archiveDirectories = [ioctl.arg.operation.source.directory, ioctl.arg.operation.destination.directory];
+              }
+              reply = JSON.parse(await ws.kernel.proc_sys(ws.page, JSON.stringify(vargs.batch)));
+              if (vargs.batch.calls[0]?.pread) rawRead = reply.results[0];
+            }
             else reply = {};
           } catch (err) {
             reply = { errno: err.errno ?? 'EIO' };
@@ -3015,6 +3057,9 @@ test('PR #74 Track C: WASI process.js kfd FDFLAG_NONBLOCK, /proc/self/fd transla
         channel: channelBuf,
       });
     });
+    assert.equal(rawRead?.ok?.data, btoa('target-data'), JSON.stringify(rawRead));
+    assert.deepEqual(archiveDirectories, [1, 1]);
+    assert.equal((await ws.kernel.proc_statat(ws.page, OS_FD_ROOT, '/mnt/local/proj/target', true)).mode & 0o777, 0o640);
     assert.equal(exitResult.exit, 0, `unexpected exit code ${exitResult.exit}`);
   } finally {
     await worker.terminate();
@@ -3028,7 +3073,7 @@ test('PR #74 Track C: local-files.js routes groupmod to network, streams GET /ap
   const prevWorker = globalThis.Worker;
   const networkCalls = [];
   const kernelCalls = [];
-  let streamClosed = false;
+  let streamClosed = false, finishOpen;
   let readCalls = 0;
 
   globalThis.location = { origin: 'https://os.example', href: 'https://os.example/' };
@@ -3044,6 +3089,10 @@ test('PR #74 Track C: local-files.js routes groupmod to network, streams GET /ap
         let okVal = null;
         if (msg.type === 'mount_vfs_pwrite') okVal = msg.args.data.length;
         else if (msg.type === 'mount_vfs_open_read') {
+          if (msg.args.path === '/pending') {
+            finishOpen = () => this.onmessage({ data: { v: msg.v, id: msg.id, ok: { status: 200, totalSize: 600000, streamId: 78 } } });
+            return;
+          }
           readCalls = 0;
           okVal = { status: 200, totalSize: 600000, contentType: 'application/octet-stream', streamId: 77 };
         } else if (msg.type === 'mount_vfs_read_chunk') {
@@ -3097,6 +3146,16 @@ test('PR #74 Track C: local-files.js routes groupmod to network, streams GET /ap
     await reader.cancel().catch(() => {});
     await new Promise(r => setTimeout(r, 20));
     assert.equal(streamClosed, true);
+
+    const abortOpen = new AbortController();
+    const pending = globalThis.fetch('https://os.example/api/file?path=/pending', { signal: abortOpen.signal });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(finishOpen);
+    abortOpen.abort();
+    await assert.rejects(pending, { name: 'AbortError' });
+    finishOpen();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(kernelCalls.filter(c => c.type === 'mount_vfs_close_read' && c.args.streamId === 78).length, 1);
   } finally {
     globalThis.location = prevLocation;
     globalThis.fetch = prevFetch;

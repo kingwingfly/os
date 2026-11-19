@@ -1758,6 +1758,7 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         dir: &Handle,
         name: &str,
         directory: bool,
+        expected: Option<NodeId>,
     ) -> Result<()> {
         self.ensure_version().await?;
         let _ns = self.ns_lock(LockKind::Exclusive).await?;
@@ -1768,6 +1769,9 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
             .resolve_child(&mut dir_rec, name)
             .await?
             .ok_or(Errno::ENOENT)?;
+        if expected.is_some_and(|node| self.make_handle(victim.ino).node != node) {
+            return Err(Errno::ESTALE);
+        }
         self.require_writable_grant()?;
         inode::may_delete(&cred.identity, &dir_rec.meta, &victim.meta)?;
         match (directory, victim.meta.directory) {

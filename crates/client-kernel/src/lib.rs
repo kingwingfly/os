@@ -85,6 +85,12 @@ struct State {
     reported: u64,
 }
 
+fn is_supervisor_image(exec: &Exec) -> bool {
+    exec.asset.is_some()
+        && exec.local.is_none()
+        && exec.path.as_deref() == Some("/usr/bin/supervise")
+}
+
 #[wasm_bindgen]
 pub struct Kernel {
     state: Rc<RefCell<State>>,
@@ -289,16 +295,35 @@ impl Kernel {
             local.token = exec.token.clone();
         }
         self.state.borrow_mut().retain_spare();
-        let _ = self.proc_exec_preserve(pid).await;
-        let identity = self.cloud_identity(pid, &exec.token).await?;
-        let _ = self.proc_set_creds(
-            pid,
-            identity.id,
-            identity.group,
-            identity.groups.into_iter().collect(),
-            Some(exec.token.clone()),
-            cloud_allowed,
-        );
+        if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+            meta.supervisor = false;
+        }
+        let setup = async {
+            self.proc_exec_preserve(pid).await?;
+            let identity = self.cloud_identity(pid, &exec.token).await?;
+            self.proc_set_creds(
+                pid,
+                identity.id,
+                identity.group,
+                identity.groups.into_iter().collect(),
+                Some(exec.token.clone()),
+                cloud_allowed,
+            )
+        }
+        .await;
+        if let Err(error) = setup {
+            // The authority has already replaced the image and invalidated its old credential.
+            let _ = self.exit(pid, 126, None, host).await;
+            let error = error
+                .as_string()
+                .and_then(|s| js_sys::JSON::parse(&s).ok())
+                .unwrap_or(error);
+            let _ = js_sys::Reflect::set(&error, &"execCommitted".into(), &JsValue::TRUE);
+            return Err(error);
+        }
+        if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+            meta.supervisor = is_supervisor_image(&exec);
+        }
         to_json(&exec)
     }
 
@@ -905,7 +930,7 @@ impl Kernel {
             })
             .collect::<std::result::Result<Vec<_>, JsValue>>()?;
         let results = self.send(calls, sudo).await.map_err(fail)?;
-        let mut admitted: Vec<(std::result::Result<Exec, Error>, Value)> = results
+        let admitted: Vec<(std::result::Result<Exec, Error>, Value)> = results
             .into_iter()
             .zip(stages)
             .map(|(result, stage)| {
@@ -932,42 +957,36 @@ impl Kernel {
             })
             .collect();
 
-        for (res, stage) in &mut admitted {
-            if let Ok(exec) = res {
-                let cwd = stage["cwd"].as_str().unwrap_or("/");
-                let sid = stage["sessionId"].as_str();
-                let cloud_allowed = stage["local"]
-                    .get("cloud")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
-                if let Some(parent_pid) = stage["parentPid"].as_u64().map(|p| p as u32) {
-                    let identity = match self.cloud_identity(exec.pid, &exec.token).await {
-                        Ok(id) => id,
-                        Err(err) => {
-                            self.state.borrow_mut().processes.remove(&exec.pid);
-                            return Err(err);
+        let registered: Result<(), JsValue> = async {
+            for (res, stage) in &admitted {
+                if let Ok(exec) = res {
+                    let cwd = stage["cwd"].as_str().unwrap_or("/");
+                    let sid = stage["sessionId"].as_str();
+                    let cloud_allowed = stage["local"]
+                        .get("cloud")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    if let Some(parent_pid) = stage["parentPid"].as_u64().map(|p| p as u32) {
+                        let identity = self.cloud_identity(exec.pid, &exec.token).await?;
+                        self.proc_fork(parent_pid, exec.pid, 0)?;
+                        self.proc_exec_preserve(exec.pid).await?;
+                        self.proc_set_creds(
+                            exec.pid,
+                            identity.id,
+                            identity.group,
+                            identity.groups.into_iter().collect(),
+                            Some(exec.token.clone()),
+                            cloud_allowed,
+                        )?;
+                        if !cwd.is_empty() {
+                            self.sys_chdir(exec.pid, cwd.to_string()).await?;
                         }
-                    };
-                    let _ = self.proc_fork(parent_pid, exec.pid, 0);
-                    let _ = self.proc_exec_preserve(exec.pid).await;
-                    let _ = self.proc_set_creds(
-                        exec.pid,
-                        identity.id,
-                        identity.group,
-                        identity.groups.into_iter().collect(),
-                        Some(exec.token.clone()),
-                        cloud_allowed,
-                    );
-                    if !cwd.is_empty() {
-                        let _ = self.sys_chdir(exec.pid, cwd.to_string()).await;
-                    }
-                } else {
-                    let grant_json = stage
-                        .get("serviceGrant")
-                        .filter(|v| !v.is_null())
-                        .map(Value::to_string);
-                    if let Err(err) = self
-                        .register_exec_in_vfs(
+                    } else {
+                        let grant_json = stage
+                            .get("serviceGrant")
+                            .filter(|v| !v.is_null())
+                            .map(Value::to_string);
+                        self.register_exec_in_vfs(
                             exec.pid,
                             INIT,
                             &exec.token,
@@ -976,13 +995,27 @@ impl Kernel {
                             cloud_allowed,
                             grant_json.as_deref(),
                         )
-                        .await
-                    {
-                        self.state.borrow_mut().processes.remove(&exec.pid);
-                        return Err(err);
+                        .await?;
+                    }
+                    if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&exec.pid) {
+                        meta.supervisor = is_supervisor_image(exec);
                     }
                 }
             }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = registered {
+            // The authority already admitted every successful stage, including later entries.
+            for (exec, _) in &admitted {
+                if let Ok(exec) = exec {
+                    let _ = self.exit(exec.pid, 126, None, host).await;
+                    let _ = self.wait(exec.pid, host).await;
+                }
+            }
+            // Failed delivery stays in the normal retryable lifecycle report queue.
+            let _ = self.flush().await;
+            return Err(error);
         }
         Ok(admitted.into_iter().map(|(res, _)| res).collect())
     }

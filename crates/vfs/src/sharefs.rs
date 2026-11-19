@@ -140,6 +140,15 @@ pub trait ShareTransport {
         name: &'a str,
     ) -> ShareFuture<'a, Entry>;
     fn unlink<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> ShareFuture<'a, ()>;
+    fn unlink_if<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+        _node: crate::NodeId,
+    ) -> ShareFuture<'a, ()> {
+        Box::pin(async { Err(ShareError::Remote(Errno::EOPNOTSUPP)) })
+    }
     fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> ShareFuture<'a, ()>;
     #[allow(clippy::too_many_arguments)]
     fn rename<'a>(
@@ -429,6 +438,16 @@ impl<T: ShareTransport> Filesystem for ShareFs<T> {
 
     fn unlink<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(self.call(true, true, self.transport.unlink(cred, dir, name)))
+    }
+
+    fn unlink_if<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        node: crate::NodeId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(self.call(true, true, self.transport.unlink_if(cred, dir, name, node)))
     }
 
     fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
@@ -757,6 +776,15 @@ impl ShareTransport for LoopbackShareTransport {
     }
     fn unlink<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> ShareFuture<'a, ()> {
         loopback_op!(self, self.fs.unlink(cred, dir, name))
+    }
+    fn unlink_if<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        node: crate::NodeId,
+    ) -> ShareFuture<'a, ()> {
+        loopback_op!(self, self.fs.unlink_if(cred, dir, name, node))
     }
     fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> ShareFuture<'a, ()> {
         loopback_op!(self, self.fs.rmdir(cred, dir, name))

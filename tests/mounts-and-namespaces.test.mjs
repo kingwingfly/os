@@ -663,6 +663,8 @@ test('ImageFs mounts validated private extensions at /opt/private/<name>, enforc
   await assert.rejects(
     k.mount_user('sess-alice', JSON.stringify({ kind: 'image', name: 'badext', sources: ['/mnt/local/badsrc'], cloud: false }), null),
   );
+  await k.unmount_user('sess-alice', '/opt/private/devtools', 0);
+  await k.unmount_user('sess-alice', '/opt/private/devtools', 0);
 });
 
 test('all 4 unmount and provider ending states: EBUSY, MNT_DETACH with live open fds, Revoked -> EACCES, and Lost -> ENOTCONN + EIO uncertain writes', async t => {
@@ -815,6 +817,285 @@ test('unshare(CLONE_NEWNS) and setns enforce privilege, reject forged/non-ns/sha
   assert.equal(await h.readText(400, '/tmp/ns-only/inside.txt'), 'ns401');
 });
 
+function mockAdmissions(t, firstPid, uid, denyPid) {
+  const previous = globalThis.kernelSys;
+  const events = [];
+  let pid = firstPid, nextDevice = 0;
+  const tokens = new Map();
+  globalThis.kernelSys = async raw => {
+    const batch = JSON.parse(raw);
+    const results = batch.calls.map(call => {
+      events.push(call);
+      if (call.execve) {
+        const admitted = call.execve.pid ?? pid++;
+        const token = (call.execve.pid == null ? 'proc-' : 'exec-') + admitted;
+        tokens.set(admitted, token);
+        return { ok: { pid: admitted, token, path: call.execve.path,
+          asset: call.execve.path + '.wasm', size: 8, cgroup: '/',
+          placement: { cluster: '', executor: 'browser', cgroup: '/' } } };
+      }
+      if (call === 'getcreds') {
+        assert.equal(batch.proc, tokens.get(batch.pid));
+        if (batch.pid === denyPid || batch.proc === denyPid) return { err: { errno: 'EACCES' } };
+        return { ok: { uid, gid: uid, groups: [uid], user: 'user', group: 'user',
+          group_names: ['user'], home: '/', signed_in: true, can_sudo: false, sudo_active: false } };
+      }
+      if (call.open || call.close) {
+        assert.equal(batch.proc, tokens.get(batch.pid));
+        if (call.open) return { ok: { fd: nextDevice++, size: 0, device: 'archive' } };
+      }
+      return { ok: null };
+    });
+    return JSON.stringify({ status: 200, text: JSON.stringify({ results }) });
+  };
+  t.after(() => { if (previous) globalThis.kernelSys = previous; else delete globalThis.kernelSys; });
+  return events;
+}
+
+test('failed credential admission exits and reaps every successful pipeline stage', async t => {
+  const { k } = createHarness(t);
+  const events = mockAdmissions(t, 601, 1000, 602);
+  const stages = [1, 2, 3].map(() => ({ path: '/usr/bin/true', argv: ['true'], env: [] }));
+  await assert.rejects(k.execs(JSON.stringify(stages), false, '', 'host'));
+  for (const key of ['exit', 'wait']) {
+    assert.deepEqual(events.filter(c => c[key]).map(c => Number(c[key].pid)), [601, 602, 603]);
+  }
+});
+
+test('only an authorized supervisor outside a chroot can grant a namespace to its child', async t => {
+  const h = createHarness(t);
+  const { k } = h;
+  await h.spawn({ pid: 610, ppid: 1, uid: 0, gid: 0, groups: [0] });
+  h.fork(610, 611);
+  const grant = JSON.stringify({ mountNamespace: 'system', bindMounts: [] });
+  await expectErrno(() => k.proc_apply_service_grant(611, 610, grant), 'EPERM');
+  mockAdmissions(t, 612, 0);
+  const stages = [{ path: '/usr/bin/supervise', argv: ['supervise'], env: [] }];
+  assert.equal(JSON.parse(await k.execs(JSON.stringify(stages), false, '', 'host'))[0].ok.pid, 612);
+  k.proc_authorize_service_grant(612);
+  await k.proc_mkdirat(612, OS_FD_ROOT, '/tmp/service-root', 0o755);
+  await k.sys_chroot(612, '/tmp/service-root');
+  h.fork(612, 613);
+  await expectErrno(() => k.proc_apply_service_grant(613, 612, grant), 'EPERM');
+  await expectErrno(() => k.proc_statat(613, OS_FD_ROOT, '/usr', true), 'ENOENT');
+});
+
+test('an ordinary supervise image may grant default, session and isolated namespaces to its own account', async t => {
+  const h = createHarness(t), { k } = h;
+  await h.beginSession('ordinary', 1000);
+  mockAdmissions(t, 614, 1000);
+  const [admission] = JSON.parse(await k.execs(JSON.stringify([{
+    path: '/usr/bin/supervise', argv: ['supervise'], env: [], sessionId: 'ordinary',
+  }]), false, '', 'host'));
+  assert.equal(admission.ok.pid, 614);
+  for (const [index, mountNamespace] of ['', 'session', 'isolated'].entries()) {
+    const child = 700 + index;
+    const inherited = h.fork(614, child);
+    const granted = await k.proc_apply_service_grant(child, 614, JSON.stringify({ mountNamespace }));
+    assert.equal(granted.nsId === inherited.nsId, mountNamespace === '');
+    await expectErrno(() => k.proc_apply_service_grant(child, 614, '{"mountNamespace":"system"}'), 'EPERM');
+    k.proc_set_creds(child, 2000, 2000, new Uint32Array([2000]), undefined, true);
+    await expectErrno(() => k.proc_apply_service_grant(child, 614, '{}'), 'EPERM');
+  }
+});
+
+test('a credential failure after authority exec ends the replaced image', async t => {
+  const { k } = createHarness(t);
+  mockAdmissions(t, 615, 0, 'exec-615');
+  const path = '/usr/bin/true';
+  await k.execs(JSON.stringify([{ path, argv: ['true'], env: [] }]), false, '', 'host');
+  await assert.rejects(k.reexec(615, 'null', path, '["true"]', '[]', '/', '', 'host'),
+    { errno: 'EACCES', execCommitted: true });
+  await expectErrno(() => k.proc_statat(615, OS_FD_ROOT, '/', true), 'ESRCH');
+  await k.wait(615, 'host');
+});
+
+test('exec closes the final close-on-exec device mapping on the authority', async t => {
+  const { k } = createHarness(t);
+  const events = mockAdmissions(t, 620, 1000);
+  const path = '/usr/bin/true';
+  await k.execs(JSON.stringify([{ path, argv: ['true'], env: [] }]), false, '', 'host');
+  const device = await k.proc_openat(620, OS_FD_ROOT, '/dev/archive', O_RDWR, 0, true);
+  assert.equal(device.serverDev, true);
+  const kept = k.kfd_dup(620, device.kfd);
+  const second = await k.proc_openat(620, OS_FD_ROOT, '/dev/archive', O_RDWR, 0, false);
+  const previous = globalThis.cloudFsPost;
+  globalThis.cloudFsPost = async (path, headers, body) => {
+    assert.equal(path, '/api/sys');
+    const raw = new TextDecoder().decode(body);
+    assert.equal(headers['X-Process-Token'], JSON.parse(raw).proc);
+    const reply = JSON.parse(await globalThis.kernelSys(raw));
+    return { status: reply.status, body: new TextEncoder().encode(reply.text) };
+  };
+  t.after(() => { if (previous) globalThis.cloudFsPost = previous; else delete globalThis.cloudFsPost; });
+  await k.reexec(620, 'null', path, '["true"]', '[]', '/', '', 'host');
+  assert.equal(events.filter(c => c.close).length, 0);
+  assert.equal(k.kfd_is_cloexec(620, kept), false);
+  const transport = globalThis.cloudFsPost;
+  globalThis.cloudFsPost = async () => ({ status: 503, body: new Uint8Array() });
+  await assert.rejects(k.kfd_close(620, kept));
+  globalThis.cloudFsPost = transport;
+  await k.kfd_close(620, kept);
+  assert.deepEqual(events.filter(c => c.close).map(c => c.close.fd), [0]);
+  k.kfd_set_cloexec(620, second.kfd, true);
+  await k.reexec(620, 'null', path, '["true"]', '[]', '/', '', 'host');
+  assert.deepEqual(events.filter(c => c.close).map(c => c.close.fd), [0, 1]);
+});
+
+test('top-level admission applies binds and logout evicts executable tickets on system mounts', async t => {
+  const h = createHarness(t);
+  const { k } = h;
+  const sid = 'login-with-isolated-service';
+  await h.beginSession(sid, 0);
+  await h.spawn({ pid: 630, uid: 0, gid: 0, groups: [0] });
+  await k.proc_mkdirat(630, OS_FD_ROOT, '/tmp/service-run', 0o755);
+  await h.writeText(630, '/run/tool', '\x00asm\x01\x00\x00\x00', 0o755);
+  mockAdmissions(t, 631, 0);
+  const grant = { mountNamespace: 'isolated', bindMounts: [{ source: '/run', target: '/tmp/service-run', readOnly: true }] };
+  const stage = { path: '/usr/bin/true', argv: ['true'], env: [], sessionId: sid, serviceGrant: grant };
+  const [admitted] = JSON.parse(await k.execs(JSON.stringify([stage]), false, '', 'host'));
+  assert.equal(admitted.ok.pid, 631);
+  await expectErrno(() => k.proc_openat(631, OS_FD_ROOT, '/tmp/service-run/tool', O_WRONLY, 0, false), 'EROFS');
+  const tickets = [];
+  for (let stage = 0; stage < 40; stage++) {
+    const { execTicket } = await k.proc_resolve_exec(631, '/run/tool', '["tool"]', '/usr/bin', false);
+    tickets.push(execTicket);
+  }
+  for (const ticket of tickets.slice(0, -1)) {
+    assert.deepEqual(k.take_local_exec_bytes(ticket, false), WASM_HEADER);
+    assert.ok(k.take_local_exec_bytes(ticket, true));
+    k.release_exec_ticket(ticket);
+    assert.equal(k.take_local_exec_bytes(ticket, true), undefined);
+  }
+  await k.session_end(sid);
+  assert.equal(k.take_local_exec_bytes(tickets.at(-1), false), undefined);
+});
+
+test('write-only page upload verifies a sparse file above 128 MiB', async t => {
+  const { k } = createHarness(t);
+  const block = Buffer.alloc(1024 * 1024);
+  const size = 128 * block.length + 1;
+  const hash = createHash('sha256');
+  for (let i = 0; i < 128; i++) hash.update(block);
+  hash.update(block.subarray(0, 1));
+  const batch = async call => JSON.parse(await k.vfs_sys('', JSON.stringify({ calls: [call] }))).results[0];
+  const opened = await batch({ open: { path: '/tmp/large-upload', flags: O_WRONLY | O_CREAT | O_TRUNC, mode: 0o600, size, sha256: hash.digest('hex') } });
+  assert.ok(opened.ok, JSON.stringify(opened));
+  await k.vfs_ftruncate_fd('', opened.ok.fd, BigInt(size));
+  const closed = await batch({ close: { fd: opened.ok.fd } });
+  assert.equal(closed.ok?.size, size, JSON.stringify(closed));
+});
+
+test('ordinary page uploads verify mode 0200 files after sequential and out-of-order writes', async t => {
+  const h = createHarness(t), sid = 'write-only';
+  await h.beginSession(sid, 1001);
+  const batch = async call => JSON.parse(await h.k.vfs_sys(sid, JSON.stringify({ calls: [call] }))).results[0];
+  const sha256 = createHash('sha256').update('abcd').digest('hex');
+  for (const offsets of [[0, 2], [2, 0]]) {
+    const path = '/tmp/write-only-' + offsets[0];
+    const { ok: opened } = await batch({ open: { path, mode: 0o200, flags: O_CREAT | O_WRONLY, size: 4, sha256 } });
+    for (const offset of offsets) {
+      await h.k.vfs_pwrite_chunk(sid, opened.fd, BigInt(offset), encoder.encode(offset ? 'cd' : 'ab'));
+    }
+    const result = await batch({ close: { fd: opened.fd } });
+    assert.equal(result.ok?.size, 4, JSON.stringify(result));
+    assert.equal(result.ok.stat.uid, 1001);
+    assert.equal(result.ok.stat.mode & 0o777, 0o200);
+    assert.equal((await batch({ open: { path, flags: O_RDONLY } })).err.errno, 'EACCES');
+  }
+});
+
+test('Cloud page descriptors guard inode updates, sparse growth and delayed closes across login', async t => {
+  const MS_DIRSYNC = 128n;
+  const h = createHarness(t), { k } = h, sid = 'cloud-page', path = '/cloud-file';
+  await h.beginSession(sid, 1000);
+  let created = false;
+  let epoch = 'first-cookie', inode = 91, mode = 0o600;
+  const seen = [];
+  const stat = (ino, bits) => ({ ino, mode: bits, uid: 1000, gid: 1000, user: 'u', group: 'u',
+    nlink: 1, size: 4, mtime: 1, ctime: 1, version: 'v1' });
+  const saved = globalThis.pageSysPost;
+  globalThis.pageSysPost = async (raw, headers) => {
+    const { calls } = JSON.parse(raw);
+    const results = calls.map(call => {
+      const name = typeof call === 'string' ? call : Object.keys(call)[0], arg = call[name];
+      const fdEpoch = headers?.['X-Fd-Epoch'];
+      seen.push({ name, fdEpoch, arg });
+      if (fdEpoch && fdEpoch !== epoch) return { err: { errno: 'EBADF' } };
+      switch (name) {
+        case 'getcreds': return { ok: { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root',
+          group_names: ['root'], home: '/', signed_in: true, can_sudo: true, sudo_active: true } };
+        case 'mkdir': created = true; return { ok: null };
+        case 'lstat': case 'stat':
+          if (arg.path === '/') return { ok: stat(1, 0o40777) };
+          if (arg.path === '/dropbox') return { ok: stat(93, 0o40300) };
+          if (arg.path === '/dropbox/child' && created) return { ok: stat(94, 0o40700) };
+          if (arg.path === path) return { ok: stat(inode, 0o100000 | mode) };
+          return { err: { errno: 'ENOENT' } };
+        case 'access': return arg.path === '/dropbox' && (arg.mode & 4) ? { err: { errno: 'EACCES' } } : { ok: null };
+        case 'open': return { ok: { fd: 3, fd_epoch: epoch, stat: stat(inode, 0o100000 | mode) } };
+        case 'fchmod': mode = arg.mode; return { ok: stat(91, 0o100000 | mode) };
+        case 'close': return { ok: null };
+        default: return { err: { errno: 'ENOSYS' } };
+      }
+    });
+    return JSON.stringify({ status: 200, text: JSON.stringify({ results }) });
+  };
+  t.after(() => { if (saved) globalThis.pageSysPost = saved; else delete globalThis.pageSysPost; });
+  const sys = async (call, sudo = false) => JSON.parse(await k.vfs_sys(sid, JSON.stringify({ calls: [call], sudo }))).results[0];
+  const remount = flags => sys({ mount: { target: '/', flags: Number(MS_REMOUNT | flags) } }, true);
+  const dirsync = await remount(MS_DIRSYNC);
+  assert.ok('ok' in dirsync, JSON.stringify(dirsync));
+  const child = await sys({ mkdir: { path: '/dropbox/child', mode: 0o700 } });
+  assert.ok('ok' in child, JSON.stringify({ child, seen }));
+  assert.equal(created, true);
+  const opened = await sys({ open: { path, flags: O_RDWR } });
+  assert.ok(opened.ok, JSON.stringify({ opened, seen }));
+  const fd = opened.ok.fd;
+  await expectErrno(() => k.vfs_pwrite_chunk(sid, fd, 2n ** 31n, new Uint8Array([1])), 'EFBIG');
+  await expectErrno(() => k.vfs_ftruncate_fd(sid, fd, 2n ** 31n), 'EFBIG');
+  inode = 92;
+  const chmod = await sys({ fchmod: { fd, mode: 0o640 } });
+  assert.ok('ok' in chmod, JSON.stringify({ chmod, seen }));
+  assert.equal(seen.find(event => event.name === 'fchmod')?.fdEpoch, epoch);
+  epoch = 'next-cookie';
+  assert.equal((await sys({ pread: { fd, offset: 0, count: 1 } })).err.errno, 'EBADF');
+  await sys({ close: { fd } });
+  for (const name of ['pread', 'close']) assert.equal(seen.find(event => event.name === name)?.fdEpoch, 'first-cookie');
+
+  const upload = await sys({ open: { path, flags: O_WRONLY | O_TRUNC, size: 5 } });
+  assert.equal(upload.ok?.fd, 3, JSON.stringify(upload));
+  assert.equal((await remount(MS_RDONLY)).err?.errno, 'EBUSY');
+  const closeUpload = epoch => k.vfs_sys(sid, JSON.stringify({ calls: [{ close: { fd: 3 } }] }), epoch)
+    .then(raw => JSON.parse(raw).results[0]);
+  assert.equal((await closeUpload('first-cookie')).err?.errno, 'EBADF');
+  assert.equal((await remount(MS_RDONLY)).err?.errno, 'EBUSY');
+  assert.ok('ok' in await closeUpload(upload.ok.fd_epoch));
+  const mounted = await remount(MS_RDONLY);
+  assert.ok('ok' in mounted, JSON.stringify(mounted));
+});
+
+test('anonymous page directory descriptors survive batches and fdinfo uses the page descriptor', async t => {
+  const { k } = createHarness(t);
+  const batch = async (...calls) => JSON.parse(await k.vfs_sys('', JSON.stringify({ calls }))).results;
+  const [opened] = await batch({ open: { path: '/tmp', flags: O_RDONLY | O_DIRECTORY } });
+  const dirfd = opened.ok.fd;
+  assert.ok(dirfd >= 0x40000000);
+  const [child, info] = await batch(
+    { open_at: { dirfd, path: 'guest-file', flags: O_CREAT | O_RDWR, mode: 0o600 } },
+    { pread: { path: `/proc/self/fdinfo/${dirfd}`, count: 256 } },
+  );
+  assert.ok(child.ok.fd >= 0x40000000, JSON.stringify(child));
+  assert.match(atob(info.ok.data), /mnt_id:/);
+  const [st, fs, closed] = await batch(
+    { fstat_at: { dirfd, path: 'guest-file' } }, { fstatfs: { fd: dirfd } }, { close: { fd: dirfd } },
+  );
+  assert.equal(st.ok.mode & 0o170000, 0o100000);
+  assert.ok(fs.ok, JSON.stringify(fs));
+  assert.ok(closed.ok);
+  assert.ok((await batch({ close: { fd: child.ok.fd } }))[0].ok);
+});
+
 test('Contract 4 serviceGrant (system/isolated/session), streamed vfs_open_read, chunkIndex pwrite, and execTicket liveness', async t => {
   const h = createHarness(t);
   const { k } = h;
@@ -830,7 +1111,10 @@ test('Contract 4 serviceGrant (system/isolated/session), streamed vfs_open_read,
   }), opfsStore);
 
   // Root setup in session + supervisor process running in system_namespace while retaining session attribution
-  await h.spawn({ pid: 500, ppid: 1, sessionId: 'sess-svc', uid: 1000, gid: 1000, groups: [1000] });
+  mockAdmissions(t, 500, 1000);
+  const admitted = await k.execs(JSON.stringify([{ path: '/usr/bin/supervise', argv: ['supervise'], env: [],
+    sessionId: 'sess-svc', serviceGrant: { mountNamespace: 'session', bindMounts: [] } }]), false, '', 'host');
+  assert.equal(JSON.parse(admitted)[0].ok.pid, 500);
   await h.writeText(500, '/mnt/local/proj/hello.txt', 'from-session');
   const appFd = await k.proc_openat(500, OS_FD_ROOT, '/mnt/local/proj/app.wasm', O_RDWR | O_CREAT | O_TRUNC, 0o755, false);
   await k.kfd_write(500, appFd.kfd, new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02]));
@@ -889,36 +1173,69 @@ test('Contract 4 serviceGrant (system/isolated/session), streamed vfs_open_read,
   await k.kfd_close(500, openDir.kfd);
   await k.kfd_close(502, openDir.kfd);
 
-  // "system" serviceGrant hides user mounts
+  // An ordinary supervisor may inherit its namespace, but cannot select the system namespace.
   h.fork(500, 504, 0);
-  await k.proc_apply_service_grant(504, 500, JSON.stringify({ mountNamespace: 'system', bindMounts: [] }));
-  await expectErrno(() => k.proc_statat(504, OS_FD_ROOT, '/mnt/local/proj/hello.txt', true), 'ENOENT');
+  await expectErrno(() => k.proc_apply_service_grant(504, 500, JSON.stringify({ mountNamespace: 'system' })), 'EPERM');
+  await k.proc_apply_service_grant(504, 500, JSON.stringify({}));
+  assert.equal(await h.readText(504, '/mnt/local/proj/hello.txt'), 'from-session');
 
   // Streamed vfs_open_read (> 256 KiB inline cutoff) + vfs_pwrite_chunk with chunkIndex
   const bigSize = 300 * 1024;
+  const chunk = new Uint8Array(bigSize);
+  for (let i = 0; i < bigSize; i++) chunk[i] = i & 0xff;
   const openBatch = JSON.parse(await k.vfs_sys('sess-svc', JSON.stringify({
-    calls: [{ open: { path: '/mnt/local/proj/big.bin', flags: O_RDWR | O_CREAT | O_TRUNC, mode: 0o644 } }],
+    calls: [{ open: { path: '/mnt/local/proj/big.bin', flags: O_WRONLY | O_CREAT | O_TRUNC, mode: 0o644,
+      size: bigSize, sha256: createHash('sha256').update(chunk).digest('hex') } }],
     sudo: false,
     umask: 0o022,
   })));
   const pageFd = openBatch.results[0].ok.fd;
-  const chunk = new Uint8Array(bigSize);
-  for (let i = 0; i < bigSize; i++) chunk[i] = i & 0xff;
   await k.vfs_pwrite_chunk('sess-svc', pageFd, 0n, chunk, 0n);
-  await k.vfs_sys('sess-svc', JSON.stringify({ calls: [{ close: { fd: pageFd } }], sudo: false, umask: 0o022 }));
+  const closed = JSON.parse(await k.vfs_sys('sess-svc', JSON.stringify({ calls: [{ close: { fd: pageFd } }], sudo: false, umask: 0o022 })));
+  assert.equal(closed.results[0].ok.size, bigSize);
+
+  const pageSys = async (...calls) => JSON.parse(await k.vfs_sys('sess-svc', JSON.stringify({ calls }))).results;
+  const saved = '/mnt/local/proj/existing.txt';
+  await h.writeText(500, saved, 'old');
+  const [conflict] = await pageSys({ open: { path: saved, flags: O_WRONLY | O_CREAT, size: 3 } });
+  assert.equal(conflict.err.errno, 'EEXIST');
+  assert.equal(await h.readText(500, saved), 'old');
+  const badUpload = path => ({ open: { path, flags: O_WRONLY | O_CREAT | O_TRUNC, size: 1, sha256: '0'.repeat(64) } });
+  const [existing] = await pageSys(badUpload(saved));
+  const [write] = await pageSys({ pwrite: { fd: existing.ok.fd, index: 0, data: btoa('x') } });
+  assert.ok('ok' in write, JSON.stringify(write));
+  const [failedClose] = await pageSys({ close: { fd: existing.ok.fd } });
+  assert.equal(failedClose.err.errno, 'EIO');
+  assert.equal(await h.readText(500, saved), 'x');
+  const created = '/mnt/local/proj/created.txt';
+  const [fresh] = await pageSys(badUpload(created));
+  await pageSys({ discard: { fd: fresh.ok.fd } });
+  assert.equal((await pageSys({ stat: { path: created } }))[0].err.errno, 'ENOENT');
+  const [replaced] = await pageSys(badUpload(created));
+  await pageSys({ rename: { from: created, to: created + '.old' } });
+  await h.writeText(500, created, 'replacement');
+  await pageSys({ discard: { fd: replaced.ok.fd } });
+  assert.equal(await h.readText(500, created), 'replacement');
 
   const openedStream = await k.vfs_open_read('sess-svc', '/mnt/local/proj/big.bin', undefined, undefined, false, false);
   assert.ok(openedStream.streamId > 0);
   assert.equal(openedStream.totalSize, bigSize);
+  await h.beginSession('sess-other', 1001);
+  await expectErrno(() => k.vfs_read_stream_chunk('sess-other', openedStream.streamId, 1), 'EBADF');
+  await expectErrno(() => k.vfs_close_read_stream('sess-other', openedStream.streamId), 'EBADF');
   const parts = [];
   for (;;) {
-    const part = await k.vfs_read_stream_chunk(openedStream.streamId, 65536);
+    const part = await k.vfs_read_stream_chunk('sess-svc', openedStream.streamId, 65536);
     if (!part.length) break;
     parts.push(...part);
   }
-  await k.vfs_close_read_stream(openedStream.streamId);
+  await k.vfs_close_read_stream('sess-svc', openedStream.streamId);
   assert.equal(parts.length, bigSize);
   assert.equal(parts[299999], 299999 & 0xff);
+  const pending = await k.vfs_open_read('sess-svc', '/mnt/local/proj/big.bin', undefined, undefined, false, false);
+  await k.session_end('sess-svc');
+  await expectErrno(() => k.vfs_read_stream_chunk('sess-svc', pending.streamId, 1), 'EBADF');
+  assert.equal(k.take_local_exec_bytes(resolved.execTicket, true), undefined);
 });
 
 test('Contract 1: eval_fchmod and kfd_futimens enforce caller Cred, O_PATH EBADF, and MS_RDONLY EROFS via fsetattr', async t => {

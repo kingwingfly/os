@@ -96,7 +96,7 @@ async function closeHeld(of, pid, token, as) {
     of.descriptions.delete(slot);
     return known.description;
   }).filter(Boolean).filter(description => {
-    if (description.kind === 'kfd' || description.cloud != null) return false;
+    if (description.kind !== 'file' || description.serverDev || description.cloud != null) return false;
     return description.kfd != null;
   });
   if (!last.length) return;
@@ -225,6 +225,10 @@ export async function exec(stages, options = {}) {
   requireExecutionSupport();
   const workspace = options.workspace;
   const sessionId = options.sessionId ?? workspace?.identity?.id ?? '';
+  const tickets = new Set();
+  const releaseTicket = async ticket => {
+    if (ticket) await kernelCall('release_exec_ticket', { ticket }).catch(() => {});
+  };
   const loadImage = async image => {
     if (image.resolvedAsset) {
       image.asset = image.resolvedAsset;
@@ -382,6 +386,7 @@ export async function exec(stages, options = {}) {
           searchPath,
           sudo,
         });
+        if (resolved.execTicket) tickets.add(resolved.execTicket);
         if (resolved.local && !resolved.asset && !globalThis.crossOriginIsolated) {
           throw Object.assign(new Error('local execution requires cross-origin isolation'), { errno: 'ENOTSUP' });
         }
@@ -393,7 +398,7 @@ export async function exec(stages, options = {}) {
             local: resolved.local ?? undefined,
             runtime: resolved.runtime,
             sessionId: sessionId || undefined,
-            ...((stage.serviceGrant ?? (index === 0 ? options.serviceGrant : null)) ? { serviceGrant: stage.serviceGrant ?? options.serviceGrant } : {}),
+            ...(index === 0 && options.serviceGrant ? { serviceGrant: options.serviceGrant } : {}),
             argv: resolved.argv,
             env: envList,
             cwd,
@@ -626,6 +631,13 @@ export async function exec(stages, options = {}) {
         pathEnv,
         searchPath: !!search,
       });
+      try {
+        return await replaceResolved(resolved, targetFile, env);
+      } finally {
+        await releaseTicket(resolved.execTicket);
+      }
+    };
+    const replaceResolved = async (resolved, targetFile, env) => {
       if (resolved.local && !resolved.asset && !globalThis.crossOriginIsolated) {
         throw { errno: 'ENOTSUP', detail: 'local execution requires cross-origin isolation' };
       }
@@ -639,14 +651,22 @@ export async function exec(stages, options = {}) {
       const updatedEnv = hasCwd
         ? [...(env ?? []).filter(entry => !entry.startsWith('PWD=')), `PWD=${cwdNow}`]
         : [...(env ?? [])];
-      const image = await kernelCall('reexec', {
-        pid,
-        path: resolved.execPath,
-        local: resolved.local ?? null,
-        argv: resolved.argv,
-        env: updatedEnv,
-        cwd: cwdNow,
-      });
+      let image;
+      try {
+        image = await kernelCall('reexec', {
+          pid,
+          path: resolved.execPath,
+          local: resolved.local ?? null,
+          argv: resolved.argv,
+          env: updatedEnv,
+          cwd: cwdNow,
+        });
+      } catch (error) {
+        if (!error.execCommitted) throw error;
+        worker.postMessage({ image: { error: refused(resolved.argv?.[0] ?? targetFile, error).message,
+          argv: resolved.argv, env: updatedEnv } });
+        return {};
+      }
       image.resolvedArgv = resolved.argv;
       image.resolvedAsset = resolved.asset;
       image.resolvedExecPath = resolved.execPath;
@@ -684,12 +704,13 @@ export async function exec(stages, options = {}) {
     // posix_spawn: the same authorized fork/exec lifecycle, without copying guest memory.
     // The host derives credentials from this parent; the request cannot supply a token.
     const spawn = async state => {
-      let child, membership, held = false;
+      let child, membership, execTicket, held = false;
       const alive = () => {
         if (process.ended || killing != null || stopped) throw { errno: 'EINTR' };
       };
       try {
         alive();
+        if (state.serviceGrant != null) await kernelCall('proc_authorize_service_grant', { pid });
         checkInheritance(state);
         child = await kernelCall('fork', { pid, emptyMemory: true });
         alive();
@@ -722,17 +743,22 @@ export async function exec(stages, options = {}) {
           pathEnv,
           searchPath: !state.argv[0].includes('/'),
         });
+        execTicket = resolved.execTicket;
         if (resolved.local && !resolved.asset && !globalThis.crossOriginIsolated) {
           throw { errno: 'ENOTSUP', detail: 'local execution requires cross-origin isolation' };
         }
         alive();
-        // Clear FD_CLOEXEC on any kfd duplicated onto a target fd by posix_spawn dup2 actions,
-        // and close parent kfds overwritten by dup2/stdin redirections before reexec.
+        // Allocate each dup2 destination in the child's table before releasing any source.
+        for (const description of state.descriptions) {
+          if (description.dupSource == null) continue;
+          description.kfd = await kernelCall('kfd_dup', { pid: child.pid, kfd: description.dupSource });
+          delete description.dupSource;
+        }
         for (const kfd of state.keepOpenKfds ?? []) {
           await kernelCall('kfd_set_cloexec', { pid: child.pid, kfd, cloexec: false });
         }
         for (const kfd of state.closeKfds ?? []) {
-          await kernelCall('kfd_close', { pid: child.pid, kfd }).catch(() => {});
+          await kernelCall('kfd_close', { pid: child.pid, kfd });
         }
         const image = await kernelCall('reexec', {
           pid: child.pid,
@@ -769,6 +795,8 @@ export async function exec(stages, options = {}) {
           await kernelCall('waitchild', { ppid: pid, pid: child.pid }).catch(() => {});
         }
         throw error;
+      } finally {
+        await releaseTicket(execTicket);
       }
     };
     // fork(2): a child with a pid the client kernel gives, its parent's snapshot, and its pipes'
@@ -1017,7 +1045,10 @@ export async function exec(stages, options = {}) {
       image = await images[index];
       if (workspace && image.login_scope !== workspace.identity.id) throw { errno: 'EACCES', message: 'login changed during local workspace launch' };
       if (stopped) return await canceled(image);
-      const { module, memory, memoryBytes, startSection } = await loadImage(image).catch(error => { throw refused(argv[0], error); });
+      const { module, memory, memoryBytes, startSection } = await loadImage(image).catch(error => { throw refused(argv[0], error); })
+        .finally(async () => {
+          if (tickets.delete(image.execTicket)) await releaseTicket(image.execTicket);
+        });
       if (stopped) return await canceled(image);
       // Hosts may require a fresh authorization after slow loading, before any guest code.
       if (options.beforeStart) await options.beforeStart(image.pid, image);
@@ -1130,6 +1161,8 @@ export async function exec(stages, options = {}) {
       }
     }
   } finally {
+    await asked.catch(() => {});
+    await Promise.all([...tickets].map(releaseTicket));
     // What still runs, if starting one failed, ends with the pipeline; what was made for a
     // stage that never started is given back.
     for (const process of processes) process.kill(SIG.INT);

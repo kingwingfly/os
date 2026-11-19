@@ -737,6 +737,11 @@ impl<T: Transport> Filesystem for CloudFs<T> {
             .await
         })
     }
+    fn sync_handle<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, ()> {
+        // The authority commits metadata before replying to the mutation.
+        Box::pin(async move { self.metadata(cred, handle).await.map(|_| ()) })
+    }
+
     fn sync_all<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             self.opened(

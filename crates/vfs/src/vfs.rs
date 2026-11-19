@@ -563,6 +563,52 @@ impl Vfs {
         Ok(())
     }
 
+    /// A host service grant applies only to a direct child with an unrestricted inherited root.
+    pub fn check_service_child(&self, parent: u32, child: u32) -> Result<()> {
+        let processes = self.inner.processes.borrow();
+        let p = processes.get(&parent).ok_or(Errno::ESRCH)?;
+        let c = processes.get(&child).ok_or(Errno::ESRCH)?;
+        if parent == child
+            || c.ppid != parent
+            || [p, c].iter().any(|p| {
+                !p.fs_ctx
+                    .borrow()
+                    .root
+                    .same_anchor(&p.mnt_ns.borrow().root_anchor())
+            })
+        {
+            return Err(Errno::EPERM);
+        }
+        Ok(())
+    }
+
+    pub fn install_service_namespace(
+        &self,
+        parent: u32,
+        child: u32,
+        ns: Rc<RefCell<MountNamespace>>,
+    ) -> Result<()> {
+        self.check_service_child(parent, child)?;
+        let mut processes = self.inner.processes.borrow_mut();
+        let child = processes.get_mut(&child).ok_or(Errno::ESRCH)?;
+        let root = ns.borrow().root_anchor();
+        child.fs_ctx.unshare();
+        let mut ctx = child.fs_ctx.borrow_mut();
+        ctx.root = root.clone();
+        ctx.cwd = root;
+        child.mnt_ns = ns;
+        Ok(())
+    }
+
+    pub fn process_cred(&self, pid: u32) -> Result<Cred> {
+        self.inner
+            .processes
+            .borrow()
+            .get(&pid)
+            .map(|p| p.cred.clone())
+            .ok_or(Errno::ESRCH)
+    }
+
     pub fn process_namespace(&self, pid: u32) -> Result<Rc<RefCell<MountNamespace>>> {
         let procs = self.inner.processes.borrow();
         let p = procs.get(&pid).ok_or(Errno::ESRCH)?;
@@ -1859,6 +1905,16 @@ impl Vfs {
     }
 
     pub async fn umount2(&self, pid: u32, target: &str, flags: u32) -> Result<()> {
+        self.umount2_expected(pid, target, flags, None).await
+    }
+
+    pub async fn umount2_expected(
+        &self,
+        pid: u32,
+        target: &str,
+        flags: u32,
+        expected: Option<MountId>,
+    ) -> Result<()> {
         self.with_caller(pid, async move {
             let clean = umount_flags::accepted(flags)?;
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
@@ -1889,6 +1945,9 @@ impl Vfs {
             };
 
             let target_id = pin.id();
+            if expected.is_some_and(|id| id != target_id || !ns.borrow().contains_mount(id)) {
+                return Ok(());
+            }
             let root_node = pin.root_node();
             let owner_uid = pin.owner_uid();
             let provider = Rc::clone(pin.provider());
@@ -2151,6 +2210,18 @@ impl Vfs {
         oflags: u32,
         mode: u16,
     ) -> Result<(FileRef, Entry)> {
+        let target = self.resolve_open(pid, anchor, path, oflags).await?;
+        self.open_resolved(pid, target, oflags, mode).await
+    }
+
+    /// Resolve the mount, inode or parent/name once, including the target of a dangling link.
+    pub async fn resolve_open(
+        &self,
+        pid: u32,
+        anchor: StartAnchor,
+        path: &str,
+        oflags: u32,
+    ) -> Result<WalkResult> {
         self.with_caller(pid, async move {
             let options = OpenOptions::from_flags(oflags)?;
             let access = options.access()?;
@@ -2177,7 +2248,7 @@ impl Vfs {
                 wflags |= WalkFlags::ALLOW_MISSING_LAST;
             }
 
-            let resolved = walk(
+            walk(
                 &cred,
                 &ns,
                 &ctx_snap,
@@ -2187,8 +2258,25 @@ impl Vfs {
                 path,
                 wflags,
             )
-            .await?;
+            .await
+        })
+        .await
+    }
 
+    pub async fn open_resolved(
+        &self,
+        pid: u32,
+        resolved: WalkResult,
+        oflags: u32,
+        mode: u16,
+    ) -> Result<(FileRef, Entry)> {
+        self.with_caller(pid, async move {
+            let options = OpenOptions::from_flags(oflags)?;
+            let access = options.access()?;
+            let (cred, _, _, _) = self.snapshot_proc(pid)?;
+            let must_dir = oflags & abi::O_DIRECTORY != 0;
+            let is_creat = oflags & abi::O_CREAT != 0 && access != Access::Path;
+            let is_excl = oflags & abi::O_EXCL != 0;
             match resolved {
                 WalkResult::MissingLast {
                     parent_pin,

@@ -645,7 +645,8 @@ pub struct LocalMount {
     identity: Identity,
     boundary: Vec<String>,
     remote: bool,
-    next_local_open: Cell<u64>,
+    next_local_open: Rc<Cell<u64>>,
+    path_checks: HashMap<Vec<String>, NodeId>,
     opens: OpenMap,
 }
 
@@ -708,7 +709,8 @@ impl LocalMount {
             identity,
             boundary: Vec::new(),
             remote: false,
-            next_local_open: Cell::new(1),
+            next_local_open: Rc::new(Cell::new(1)),
+            path_checks: HashMap::new(),
             opens,
         }
     }
@@ -760,7 +762,8 @@ impl LocalMount {
             identity: self.state.grant.owner.clone(),
             boundary: Vec::new(),
             remote: false,
-            next_local_open: Cell::new(1),
+            next_local_open: Rc::new(Cell::new(1)),
+            path_checks: HashMap::new(),
             opens,
         }
     }
@@ -943,6 +946,13 @@ impl LocalMount {
         self.check_within_boundary(&initial_parts)?;
         let fs = &self.state.fs;
         let mut stack = self.walk_to_boundary(cred).await?;
+        if self
+            .path_checks
+            .get(&self.boundary)
+            .is_some_and(|n| *n != stack.last().expect("boundary").entry.handle.node)
+        {
+            return Err(Errno::ESTALE);
+        }
         let boundary_stack_len = stack.len();
         let mut queue: VecDeque<String> = initial_parts[self.boundary.len()..]
             .iter()
@@ -973,8 +983,27 @@ impl LocalMount {
                     }
                     let is_last = queue.is_empty();
                     let parent_entry = stack.last().expect("boundary").entry.clone();
+                    let checked_prefix: Vec<_> = if self.path_checks.is_empty() {
+                        Vec::new()
+                    } else {
+                        stack
+                            .iter()
+                            .filter_map(|frame| frame.component.clone())
+                            .chain(std::iter::once(name.clone()))
+                            .collect()
+                    };
+                    let expected = self.path_checks.get(&checked_prefix);
                     match fs.lookup(cred, &parent_entry.handle, &name).await {
                         Ok(next) => {
+                            if expected.is_some_and(|node| *node != next.handle.node)
+                                || next.metadata.is_symlink()
+                                    && self.path_checks.keys().any(|path| {
+                                        path.len() > checked_prefix.len()
+                                            && path.starts_with(&checked_prefix)
+                                    })
+                            {
+                                return Err(Errno::ESTALE);
+                            }
                             stack.last_mut().expect("boundary").searchable = true;
                             if next.metadata.file_type == FileType::Symlink
                                 && (!is_last || follow_last || trailing_dir)
@@ -1025,6 +1054,7 @@ impl LocalMount {
                                 searchable: false,
                             });
                         }
+                        Err(Errno::ENOENT) if expected.is_some() => return Err(Errno::ESTALE),
                         Err(Errno::ENOENT) if allow_missing_last && is_last => {
                             if trailing_dir {
                                 return Err(Errno::EISDIR);
@@ -1643,6 +1673,27 @@ impl LocalMount {
         self.state.fs.id().0.clone()
     }
 
+    #[wasm_bindgen(js_name = withPathChecks)]
+    pub fn with_path_checks(&self, checks: JsValue) -> Result<LocalMount, JsValue> {
+        let checks: Vec<(String, NodeId)> =
+            serde_json::from_value(js_to_json(&checks)?).map_err(|_| map_vfs_err(Errno::EINVAL))?;
+        let mut path_checks = HashMap::new();
+        for (path, node) in checks {
+            let (parts, _) = clean_rel_path(&path).map_err(map_vfs_err)?;
+            self.check_within_boundary(&parts).map_err(map_vfs_err)?;
+            path_checks.insert(parts, node);
+        }
+        Ok(Self {
+            state: self.state.clone(),
+            identity: self.identity.clone(),
+            boundary: self.boundary.clone(),
+            remote: self.remote,
+            next_local_open: self.next_local_open.clone(),
+            opens: self.opens.clone(),
+            path_checks,
+        })
+    }
+
     #[wasm_bindgen(js_name = forIdentity)]
     pub fn for_identity(&self, identity: JsValue, boundary: &str) -> Result<LocalMount, JsValue> {
         let parsed = parse_identity(&identity)?;
@@ -1654,7 +1705,8 @@ impl LocalMount {
             identity: parsed,
             boundary: boundary_parts,
             remote: true,
-            next_local_open: Cell::new(1),
+            next_local_open: Rc::new(Cell::new(1)),
+            path_checks: HashMap::new(),
             opens,
         })
     }
@@ -2121,7 +2173,12 @@ impl LocalMount {
             if !open.held && !open.open_ref.access.reads() {
                 return Err(map_vfs_err(Errno::EBADF));
             }
-            self.verify_remote_open_live(&cred, &open, Access::Read)
+            let access = if open.open_ref.access == Access::Exec {
+                Access::Exec
+            } else {
+                Access::Read
+            };
+            self.verify_remote_open_live(&cred, &open, access)
                 .await
                 .map_err(map_vfs_err)?;
             if open.open_ref.access == Access::Path {
@@ -2505,6 +2562,60 @@ impl LocalMount {
             .await
             .map_err(map_vfs_err)?;
         Ok(JsValue::NULL)
+    }
+
+    #[wasm_bindgen(js_name = parentOf)]
+    pub async fn parent_of(
+        &self,
+        grant: JsValue,
+        path: &str,
+        node: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        self.check_grant(&grant).map_err(map_vfs_err)?;
+        let expected: NodeId =
+            serde_json::from_value(js_to_json(&node)?).map_err(|_| map_vfs_err(Errno::EINVAL))?;
+        let cred = self.cred(None);
+        let (parent, name, _) = self
+            .resolve_parent(&cred, path)
+            .await
+            .map_err(map_vfs_err)?;
+        let child = self
+            .state
+            .fs
+            .lookup(&cred, &parent.handle, &name)
+            .await
+            .map_err(map_vfs_err)?;
+        if child.handle.node != expected {
+            return Err(map_vfs_err(Errno::ESTALE));
+        }
+        self.format_stat_js(&cred, &parent.handle, &parent.metadata, "")
+            .await
+    }
+
+    #[wasm_bindgen(js_name = removeIf)]
+    pub async fn remove_if(
+        &self,
+        grant: JsValue,
+        path: &str,
+        node: JsValue,
+    ) -> Result<(), JsValue> {
+        self.check_grant(&grant).map_err(map_vfs_err)?;
+        self.require_data_writable().map_err(map_vfs_err)?;
+        let node =
+            serde_json::from_value(js_to_json(&node)?).map_err(|_| map_vfs_err(Errno::EINVAL))?;
+        let cred = self.cred(None);
+        let (parent, name, parts) = self
+            .resolve_parent(&cred, path)
+            .await
+            .map_err(map_vfs_err)?;
+        self.state
+            .fs
+            .unlink_if(&cred, &parent.handle, &name, node)
+            .await
+            .map_err(map_vfs_err)?;
+        self.prune_known_paths(&parts.join("/"), false, None);
+        bump_fs_policy_rev(self.state.fs.id());
+        Ok(())
     }
 
     pub async fn remove(
@@ -2907,7 +3018,8 @@ impl LocalMount {
                     identity,
                     boundary,
                     remote,
-                    next_local_open: Cell::new(1),
+                    next_local_open: Rc::new(Cell::new(1)),
+                    path_checks: HashMap::new(),
                     opens: Rc::new(RefCell::new(HashMap::new())),
                 };
                 let check_cred = view.cred(None);

@@ -1639,7 +1639,6 @@ dependencies = [
  "uu_true",
  "uu_truncate",
  "uu_tsort",
- "uu_tty",
  "uu_uname",
  "uu_unexpand",
  "uu_uniq",
@@ -3119,19 +3118,6 @@ dependencies = [
  "rustc-hash",
  "rustix",
  "thiserror",
- "uucore",
- "windows-sys",
-]
-
-[[package]]
-name = "uu_tty"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e27119b92f4ac319f68ad9cb9902fb392283c15aaee01e3841b21b37a5011da"
-dependencies = [
- "clap",
- "fluent",
- "rustix",
  "uucore",
  "windows-sys",
 ]

@@ -300,29 +300,17 @@ fn raw_str(text: &str) -> io::Result<&str> {
 
 /// Read the full metadata of a path, following its last symlink only when requested.
 pub fn stat(path: &Path, follow: bool) -> io::Result<Stat> {
-    let path = raw_path(path)?;
-    let call = if follow {
-        abi::Call::Stat { path }
-    } else {
-        abi::Call::Lstat { path }
-    };
-    metadata(&request(&[call])?)
+    statat(None, path, follow)
 }
 
 /// mkdir(2), retaining mode bits that WASI preview 1 cannot carry.
 pub fn mkdir(path: &Path, mode: u32) -> io::Result<()> {
-    unit_call(abi::Call::Mkdir {
-        path: raw_path(path)?,
-        mode: (mode & 0o7777) as u16,
-    })
+    mkdirat(None, path, mode)
 }
 
 /// chmod(2), including permissions that WASI preview 1 cannot represent.
 pub fn chmod(path: &Path, mode: u32) -> io::Result<()> {
-    unit_call(abi::Call::Chmod {
-        path: raw_path(path)?,
-        mode: (mode & 0o7777) as u16,
-    })
+    fchmodat(None, path, mode)
 }
 
 /// fchmod(2): update permission bits on an open file descriptor.
@@ -346,22 +334,18 @@ pub fn fchmodat(dirfd: Option<u32>, path: &Path, mode: u32) -> io::Result<()> {
             mode: masked,
         });
     }
-    match dirfd {
-        None => unit_call(abi::Call::Chmod {
-            path: raw,
+    match dirfd.unwrap_or(abi::OS_FD_CWD as u32) as i32 {
+        abi::OS_FD_CWD => unit_call(abi::Call::Chmod {
+            path: raw_path(&getcwd()?.join(path))?,
             mode: masked,
         }),
-        Some(fd) if fd as i32 == abi::OS_FD_CWD => unit_call(abi::Call::Chmod {
-            path: raw,
-            mode: masked,
-        }),
-        Some(fd) if fd as i32 == abi::OS_FD_ROOT => unit_call(abi::Call::Chmod {
+        abi::OS_FD_ROOT => unit_call(abi::Call::Chmod {
             path: format!("/{raw}"),
             mode: masked,
         }),
-        Some(fd) => {
+        fd => {
             let opened = value_call(abi::Call::OpenAt {
-                dirfd: fd.into(),
+                dirfd: (fd as u32).into(),
                 path: raw,
                 flags: abi::O_RDONLY,
                 mode: 0,
@@ -606,10 +590,15 @@ pub fn setns(fd: u32, nstype: u32) -> io::Result<()> {
     }
 }
 
+// Absolute paths can use the original path-only calls. Relative paths need a live anchor.
+fn at_dirfd(dirfd: Option<u32>, path: &str) -> Option<u32> {
+    dirfd.or_else(|| (!path.starts_with('/')).then_some(abi::OS_FD_CWD as u32))
+}
+
 /// fstatat(2): stat `path` relative to `dirfd` (`None` = `AT_FDCWD`).
 pub fn statat(dirfd: Option<u32>, path: &Path, follow: bool) -> io::Result<Stat> {
     let path = raw_path(path)?;
-    let call = match dirfd {
+    let call = match at_dirfd(dirfd, &path) {
         Some(fd) => abi::Call::FstatAt {
             dirfd: fd.into(),
             path,
@@ -625,7 +614,7 @@ pub fn statat(dirfd: Option<u32>, path: &Path, follow: bool) -> io::Result<Stat>
 pub fn mkdirat(dirfd: Option<u32>, path: &Path, mode: u32) -> io::Result<()> {
     let path = raw_path(path)?;
     let mode = (mode & 0o7777) as u16;
-    let call = match dirfd {
+    let call = match at_dirfd(dirfd, &path) {
         Some(fd) => abi::Call::MkdirAt {
             dirfd: fd.into(),
             path,
@@ -639,7 +628,7 @@ pub fn mkdirat(dirfd: Option<u32>, path: &Path, mode: u32) -> io::Result<()> {
 /// unlinkat(2): unlink or rmdir (`rmdir == true`) `path` relative to `dirfd` (`None` = `AT_FDCWD`).
 pub fn unlinkat(dirfd: Option<u32>, path: &Path, rmdir: bool) -> io::Result<()> {
     let path = raw_path(path)?;
-    let call = match dirfd {
+    let call = match at_dirfd(dirfd, &path) {
         Some(fd) => abi::Call::UnlinkAt {
             dirfd: fd.into(),
             path,
@@ -662,7 +651,7 @@ pub fn renameat(
     let from = raw_path(from)?;
     let to = raw_path(to)?;
     let call = match (from_dirfd, to_dirfd) {
-        (None, None) => abi::Call::Rename {
+        (None, None) if from.starts_with('/') && to.starts_with('/') => abi::Call::Rename {
             from,
             to,
             noreplace,
@@ -689,7 +678,9 @@ pub fn linkat(
     let from = raw_path(from)?;
     let to = raw_path(to)?;
     let call = match (from_dirfd, to_dirfd) {
-        (None, None) => abi::Call::Link { from, to, follow },
+        (None, None) if from.starts_with('/') && to.starts_with('/') => {
+            abi::Call::Link { from, to, follow }
+        }
         (f, t) => abi::Call::LinkAt {
             from_dirfd: f.unwrap_or(abi::OS_FD_CWD as u32).into(),
             from,
@@ -705,7 +696,7 @@ pub fn linkat(
 pub fn symlinkat(target: &Path, dirfd: Option<u32>, path: &Path) -> io::Result<()> {
     let target = raw_path(target)?;
     let path = raw_path(path)?;
-    let call = match dirfd {
+    let call = match at_dirfd(dirfd, &path) {
         Some(fd) => abi::Call::SymlinkAt {
             target,
             dirfd: fd.into(),
@@ -719,7 +710,7 @@ pub fn symlinkat(target: &Path, dirfd: Option<u32>, path: &Path) -> io::Result<(
 /// readlinkat(2): read target of symbolic link `path` relative to `dirfd` (`None` = `AT_FDCWD`).
 pub fn readlinkat(dirfd: Option<u32>, path: &Path) -> io::Result<PathBuf> {
     let path = raw_path(path)?;
-    let call = match dirfd {
+    let call = match at_dirfd(dirfd, &path) {
         Some(fd) => abi::Call::ReadlinkAt {
             dirfd: fd.into(),
             path,
@@ -741,7 +732,7 @@ pub fn utimensat(
 ) -> io::Result<()> {
     let path = raw_path(path)?;
     let nofollow = !follow;
-    let call = match dirfd {
+    let call = match at_dirfd(dirfd, &path) {
         Some(fd) => abi::Call::UtimensAt {
             dirfd: fd.into(),
             path,

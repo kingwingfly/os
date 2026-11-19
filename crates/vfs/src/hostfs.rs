@@ -584,11 +584,20 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> Filesystem for HostFs<T, M, L> 
     }
 
     fn unlink<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
-        Box::pin(self.do_remove(cred, dir, name, false))
+        Box::pin(self.do_remove(cred, dir, name, false, None))
     }
 
+    fn unlink_if<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        node: crate::NodeId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(self.do_remove(cred, dir, name, false, Some(node)))
+    }
     fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
-        Box::pin(self.do_remove(cred, dir, name, true))
+        Box::pin(self.do_remove(cred, dir, name, true, None))
     }
 
     fn rename<'a>(

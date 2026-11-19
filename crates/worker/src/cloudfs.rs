@@ -857,19 +857,26 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             umask,
             rdev,
         } => {
+            check_component(name)?;
+            let (_, dir_path) = c.dir(db, dir, EXEC)?;
+            let rdev = if (rdev.is_empty() || rdev == "0")
+                && u32::from(*mode) & abi::S_IFMT == abi::S_IFCHR
+            {
+                crate::dev::driver(&dir_path).ok_or(Errno::EINVAL)?
+            } else {
+                rdev.as_str()
+            };
             if rdev.is_empty() || rdev.len() > 255 {
                 return Err(Errno::EINVAL);
             }
-            if !matches!(rdev.as_str(), "present" | "snd") {
+            if !matches!(rdev, "present" | "snd") {
                 return Err(Errno::EOPNOTSUPP);
             }
-            check_component(name)?;
-            let (_, dir_path) = c.dir(db, dir, EXEC)?;
             let path = join(&dir_path, name);
             if read_only(db, &path) {
                 return Err(Errno::EROFS);
             }
-            if crate::dev::driver(&dir_path) != Some(rdev.as_str()) {
+            if crate::dev::driver(&dir_path) != Some(rdev) {
                 return Err(Errno::EPERM);
             }
             if permissions::is_guest_id(who.id) {
@@ -1337,14 +1344,6 @@ impl Db {
             "INSERT OR IGNORE INTO vfs_open_grants(open, credential) SELECT g.open, successor.token FROM vfs_open_grants g JOIN vfs_opens o ON o.id = g.open JOIN credentials prior ON prior.token = g.credential JOIN credentials successor ON successor.token = ? WHERE g.credential = ? AND o.revoked = 0 AND prior.ns = ? AND successor.ns = prior.ns AND successor.owner = prior.owner AND prior.expires > ? AND successor.expires > ? AND prior.cloud_access != 0 AND successor.cloud_access != 0",
             vec![text(new), text(old), text(ns), int(auth::now()), int(auth::now())],
         );
-    }
-    pub(crate) fn cloud_pinned(&self, ino: u64) -> bool {
-        !self
-            .rows::<Value>(
-                "SELECT id FROM vfs_opens WHERE ino = ? AND revoked = 0 LIMIT 1",
-                vec![int(ino)],
-            )
-            .is_empty()
     }
     pub(crate) fn cloud_accessed(&mut self, ino: u64) {
         let times = self.times(ino);
