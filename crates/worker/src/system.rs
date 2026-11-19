@@ -478,11 +478,25 @@ fn validate_mount(db: &Db, composition: &Composition) -> Result<()> {
         let Some(existing) = db.persisted_node(&entry.path) else {
             continue;
         };
+        if let os_image::Node::Symlink { target } = &entry.node
+            && matches!(entry.path.as_str(), "/bin" | "/sbin" | "/lib" | "/lib64")
+            && existing.link.as_deref() == Some(target.as_str())
+            && existing.owner == entry.uid
+            && existing.group == entry.gid
+            && existing.acl.is_none()
+            && existing.default_acl.is_none()
+        {
+            continue;
+        }
+        let mode_matches = existing.mode == entry.mode
+            || (entry.path == "/sys"
+                && matches!(existing.mode, 0o555 | 0o755)
+                && matches!(entry.mode, 0o555 | 0o755));
         if !matches!(entry.node, os_image::Node::Directory)
             || !existing.directory
             || existing.owner != entry.uid
             || existing.group != entry.gid
-            || existing.mode != entry.mode
+            || !mode_matches
             || existing.acl.is_some()
             || existing.default_acl.is_some()
         {

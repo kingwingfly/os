@@ -306,6 +306,12 @@ struct Asked {
     /// it): the credentials the new image keeps, and the descriptors it keeps open.
     #[serde(default)]
     current: Option<String>,
+    /// Client-side chroot or explicit opt-out of server `/usr` fallback: `/internal/exec`
+    /// never resolves an ungranted server `/usr` (or outside-chroot) path behind the client's back.
+    #[serde(default)]
+    no_usr_fallback: bool,
+    #[serde(default)]
+    chroot: bool,
 }
 
 #[derive(Deserialize)]
@@ -315,6 +321,10 @@ struct Execs {
     sudo: bool,
     #[serde(default = "umask")]
     umask: u16,
+    #[serde(default)]
+    no_usr_fallback: bool,
+    #[serde(default)]
+    chroot: bool,
     execs: Vec<Asked>,
     /// Tokens whose processes are gone, which the registry was still to revoke.
     #[serde(default)]
@@ -365,7 +375,9 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
                 ((), true)
             })?;
             let mut results = Vec::with_capacity(asked.execs.len());
-            for one in asked.execs {
+            for mut one in asked.execs {
+                one.no_usr_fallback |= asked.no_usr_fallback;
+                one.chroot |= asked.chroot;
                 let (key, guest, ns) = (key.clone(), guest.clone(), asked.ns.clone());
                 let (sudo, umask) = (asked.sudo, asked.umask & 0o777);
                 let result = transact(state, move |db| {
@@ -511,28 +523,43 @@ fn exec(
     let cwd = asked.cwd;
     let path = if asked.path.starts_with('/') {
         asked.path
-    } else if cwd == "/" {
+    } else if cwd == "/" || cwd.is_empty() {
         format!("/{}", asked.path)
-    } else {
+    } else if cwd.starts_with('/') {
         format!("{}/{}", cwd.trim_end_matches('/'), asked.path)
+    } else {
+        format!("/{}/{}", cwd.trim_matches('/'), asked.path)
     };
     let mut local = asked.local;
     if let Some(image) = &mut local {
         if !image.valid() || !path.starts_with('/') || path.len() > 4096 || path.contains('\0') {
             return Err(Errno::EINVAL.into());
         }
-        if sudo && current.is_none() {
-            return Err(Errno::EPERM.into());
-        }
         // Exec may attenuate an existing delegation, never enlarge it.
         image.cloud &= current.as_ref().is_none_or(|c| c.cloud_access != 0);
-    } else if let Some(current) = &current {
-        current.cloud()?;
+    } else {
+        if let Some(current) = &current {
+            current.cloud()?;
+        }
+        if asked.chroot {
+            return Err(Errno::ENOENT.into());
+        }
+        if asked.no_usr_fallback
+            && (crate::system::owns(db, &path) || os_image::below(&path, "/usr"))
+        {
+            return Err(Errno::ENOENT.into());
+        }
     }
     let executable = if local.is_some() {
         None
     } else {
-        Some(kernel::executable(&*db, &cred, &path)?)
+        let resolved = kernel::executable(&*db, &cred, &path)?;
+        if asked.no_usr_fallback
+            && (crate::system::owns(db, &resolved.path) || os_image::below(&resolved.path, "/usr"))
+        {
+            return Err(Errno::ENOENT.into());
+        }
+        Some(resolved)
     };
     if executable.as_ref().is_some_and(|e| e.node.size > EXEC_MAX) {
         return Err(Error::because(

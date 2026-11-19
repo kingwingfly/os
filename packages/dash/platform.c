@@ -1,12 +1,21 @@
 /* WASIX libc integration for the single-threaded OS process host. */
 #include <errno.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <sys/wait.h>
-#include <sys/resource.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/statvfs.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <wasi/api.h>
+#include <wasi/libc-find-relpath.h>
 #include <wasi/libc.h>
+
+/* Reserved host pseudo-descriptors matching `abi::OS_FD_ROOT` / `abi::OS_FD_CWD`. */
+#define OS_FD_ROOT 0x7ffffffd
+#define OS_FD_CWD  0x7ffffffe
 
 #define HOST(name) __attribute__((import_module("os"), import_name(name)))
 HOST("getuid") extern uid_t host_uid(void);
@@ -67,28 +76,241 @@ int dup2(int source, int target) {
     if (error) { errno = error; return -1; }
     if (target < 0) { errno = EBADF; return -1; }
     if (source == target) return target;
-    __wasi_fd_close(target);
+    (void)__wasi_fd_close(target);
     __wasi_fd_t result;
     error = __wasi_fd_dup2(source, target, 0, &result);
     if (error) { errno = error; return -1; }
     return result;
 }
 
-/* A child may inherit ordinary fds before its preopens. The SDK constructor
- * stops at the first non-preopen; scan the host's bounded preopen range instead.
- * Register through libc's own table so normal path lookup stays in libc. */
-volatile int __wasilibc_populate_preopens_init = 1;
-__attribute__((constructor(51))) static void inherited_preopens(void) {
-    for (__wasi_fd_t fd = 3; fd < 1024; fd++) {
-        __wasi_prestat_t pre;
-        if (__wasi_fd_prestat_get(fd, &pre)) continue;
-        if (pre.tag != __WASI_PREOPENTYPE_DIR || pre.u.dir.pr_name_len > 4096) continue;
-        size_t length = pre.u.dir.pr_name_len;
-        char *name = malloc(length + 1);
-        if (!name) _Exit(71);
-        if (__wasi_fd_prestat_dir_name(fd, (uint8_t *)name, length)) { free(name); continue; }
-        name[length] = 0;
-        if (__wasilibc_register_preopened_fd(fd, name)) _Exit(71);
-        free(name);
+/* Fixed 80-byte raw statfs buffer matching `crates/posix/src/wasi_libc.rs`. */
+struct os_raw_statfs {
+    uint64_t f_type;
+    uint64_t f_bsize;
+    uint64_t f_frsize;
+    uint64_t f_blocks;
+    uint64_t f_bfree;
+    uint64_t f_bavail;
+    uint64_t f_files;
+    uint64_t f_ffree;
+    uint64_t f_namelen;
+    uint64_t f_flags;
+};
+
+/* Host-side process working directory, root jail, mount table, and namespaces. */
+HOST("chdir") extern int host_chdir(const char *, size_t);
+HOST("fchdir") extern int host_fchdir(int);
+HOST("getcwd") extern int host_getcwd(char *, size_t);
+HOST("chroot") extern int host_chroot(const char *, size_t);
+HOST("mount") extern int host_mount(
+    const char *, size_t,
+    const char *, size_t,
+    const char *, size_t,
+    uint64_t,
+    const char *, size_t
+);
+HOST("umount2") extern int host_umount2(const char *, size_t, uint32_t);
+HOST("statfs") extern int host_statfs(const char *, size_t, struct os_raw_statfs *);
+HOST("fstatfs") extern int host_fstatfs(int, struct os_raw_statfs *);
+HOST("unshare") extern int host_unshare(uint32_t);
+HOST("setns") extern int host_setns(int, uint32_t);
+
+int chdir(const char *path) {
+    if (!path) { errno = EFAULT; return -1; }
+    return posix_result(host_chdir(path, strlen(path)));
+}
+
+int fchdir(int fd) {
+    if (fd < 0) { errno = EBADF; return -1; }
+    return posix_result(host_fchdir(fd));
+}
+
+char *getcwd(char *buf, size_t size) {
+    if (buf) {
+        if (size == 0) { errno = EINVAL; return NULL; }
+        int rc = host_getcwd(buf, size);
+        if (rc < 0) { errno = -rc; return NULL; }
+        if ((size_t)rc == 0 || (size_t)rc > size) { errno = ERANGE; return NULL; }
+        buf[rc - 1] = '\0';
+        return buf;
     }
+    if (size != 0) {
+        char *alloc = malloc(size);
+        if (!alloc) { errno = ENOMEM; return NULL; }
+        int rc = host_getcwd(alloc, size);
+        if (rc < 0) { free(alloc); errno = -rc; return NULL; }
+        if ((size_t)rc == 0 || (size_t)rc > size) { free(alloc); errno = ERANGE; return NULL; }
+        alloc[rc - 1] = '\0';
+        return alloc;
+    }
+    for (size_t cap = 256; cap <= 65536; cap *= 2) {
+        char *alloc = malloc(cap);
+        if (!alloc) { errno = ENOMEM; return NULL; }
+        int rc = host_getcwd(alloc, cap);
+        if (rc == -ERANGE) { free(alloc); continue; }
+        if (rc < 0) { free(alloc); errno = -rc; return NULL; }
+        if ((size_t)rc == 0 || (size_t)rc > cap) { free(alloc); errno = ERANGE; return NULL; }
+        alloc[rc - 1] = '\0';
+        char *shrunk = realloc(alloc, (size_t)rc);
+        return shrunk ? shrunk : alloc;
+    }
+    errno = ERANGE;
+    return NULL;
+}
+
+int chroot(const char *path) {
+    if (!path) { errno = EFAULT; return -1; }
+    return posix_result(host_chroot(path, strlen(path)));
+}
+
+int mount(
+    const char *source,
+    const char *target,
+    const char *filesystemtype,
+    unsigned long mountflags,
+    const void *data
+) {
+    if (!target) { errno = EFAULT; return -1; }
+    const char *src = source ? source : (const char *)(uintptr_t)0;
+    size_t src_len = source ? strlen(source) : 0;
+    const char *fst = filesystemtype ? filesystemtype : (const char *)(uintptr_t)0;
+    size_t fst_len = filesystemtype ? strlen(filesystemtype) : 0;
+    const char *dat = data ? (const char *)data : (const char *)(uintptr_t)0;
+    size_t dat_len = data ? strlen((const char *)data) : 0;
+    return posix_result(host_mount(
+        src, src_len,
+        target, strlen(target),
+        fst, fst_len,
+        (uint64_t)mountflags,
+        dat, dat_len
+    ));
+}
+
+int umount2(const char *target, int flags) {
+    if (!target) { errno = EFAULT; return -1; }
+    return posix_result(host_umount2(target, strlen(target), (uint32_t)flags));
+}
+
+int umount(const char *target) {
+    return umount2(target, 0);
+}
+
+int statfs(const char *path, struct os_raw_statfs *buf) {
+    if (!path || !buf) { errno = EFAULT; return -1; }
+    return posix_result(host_statfs(path, strlen(path), buf));
+}
+
+int fstatfs(int fd, struct os_raw_statfs *buf) {
+    if (fd < 0) { errno = EBADF; return -1; }
+    if (!buf) { errno = EFAULT; return -1; }
+    return posix_result(host_fstatfs(fd, buf));
+}
+
+static void fill_statvfs(struct statvfs *dst, const struct os_raw_statfs *src) {
+    memset(dst, 0, sizeof(*dst));
+    dst->f_bsize = (unsigned long)src->f_bsize;
+    dst->f_frsize = (unsigned long)(src->f_frsize ? src->f_frsize : src->f_bsize);
+    dst->f_blocks = src->f_blocks;
+    dst->f_bfree = src->f_bfree;
+    dst->f_bavail = src->f_bavail;
+    dst->f_files = src->f_files;
+    dst->f_ffree = src->f_ffree;
+    dst->f_favail = src->f_ffree;
+    dst->f_fsid = 0;
+    dst->f_flag = (unsigned long)src->f_flags;
+    dst->f_namemax = (unsigned long)src->f_namelen;
+}
+
+int statvfs(const char *__restrict path, struct statvfs *__restrict buf) {
+    if (!path || !buf) { errno = EFAULT; return -1; }
+    struct os_raw_statfs raw;
+    if (posix_result(host_statfs(path, strlen(path), &raw)) < 0) return -1;
+    fill_statvfs(buf, &raw);
+    return 0;
+}
+
+int fstatvfs(int fd, struct statvfs *buf) {
+    if (fd < 0) { errno = EBADF; return -1; }
+    if (!buf) { errno = EFAULT; return -1; }
+    struct os_raw_statfs raw;
+    if (posix_result(host_fstatfs(fd, &raw)) < 0) return -1;
+    fill_statvfs(buf, &raw);
+    return 0;
+}
+
+int unshare(int flags) {
+    return posix_result(host_unshare((uint32_t)flags));
+}
+
+int setns(int fd, int nstype) {
+    if (fd < 0) { errno = EBADF; return -1; }
+    return posix_result(host_setns(fd, (uint32_t)nstype));
+}
+
+/* Route absolute paths through OS_FD_ROOT and relative paths through OS_FD_CWD
+ * without calling getcwd() or collapsing `.` / `..` in guest memory. */
+volatile int __wasilibc_populate_preopens_init = 1;
+
+int __wasilibc_register_preopened_fd(int fd, const char *prefix) {
+    (void)fd;
+    (void)prefix;
+    return 0;
+}
+
+int __wasilibc_find_abspath(
+    const char *path,
+    const char **__restrict__ abs_prefix,
+    const char **__restrict__ relative_path
+) {
+    if (!path) { errno = EFAULT; return -1; }
+    if (path[0] == '\0') { errno = ENOENT; return -1; }
+    const char *rel = path;
+    while (*rel == '/') rel++;
+    if (*rel == '\0') rel = "/";
+    if (abs_prefix) *abs_prefix = "";
+    if (relative_path) *relative_path = rel;
+    return OS_FD_ROOT;
+}
+
+int __wasilibc_find_relpath_alloc(
+    const char *path,
+    const char **abs_prefix,
+    char **relative_path,
+    size_t *relative_path_len,
+    int can_realloc
+) {
+    if (!path || !relative_path || !relative_path_len) { errno = EFAULT; return -1; }
+    if (path[0] == '\0') { errno = ENOENT; return -1; }
+    int dirfd;
+    const char *rel;
+    if (path[0] == '/') {
+        dirfd = OS_FD_ROOT;
+        rel = path;
+        while (*rel == '/') rel++;
+        if (*rel == '\0') rel = "/";
+    } else {
+        dirfd = OS_FD_CWD;
+        rel = path;
+    }
+    size_t need = strlen(rel) + 1;
+    if (!*relative_path || *relative_path_len < need) {
+        if (!can_realloc) { errno = ERANGE; return -1; }
+        char *grown = realloc(*relative_path, need);
+        if (!grown) { errno = ENOMEM; return -1; }
+        *relative_path = grown;
+        *relative_path_len = need;
+    }
+    memcpy(*relative_path, rel, need);
+    if (abs_prefix) *abs_prefix = "";
+    return dirfd;
+}
+
+int __wasilibc_find_relpath(
+    const char *path,
+    const char **__restrict__ abs_prefix,
+    char **relative_path,
+    size_t relative_path_len
+) {
+    size_t len = relative_path_len;
+    return __wasilibc_find_relpath_alloc(path, abs_prefix, relative_path, &len, 0);
 }

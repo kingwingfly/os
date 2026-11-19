@@ -146,6 +146,11 @@ pub enum Call {
     Release {
         open: OpenRef,
     },
+    /// FICLONE reflink: splice `source`'s immutable extents into `target` in O(1).
+    Clone {
+        source: OpenRef,
+        target: OpenRef,
+    },
     TryLock {
         open: OpenRef,
         family: LockFamily,
@@ -203,3 +208,46 @@ pub enum DataOperation {
     Write { at: WriteAt, length: u64 },
 }
 pub type Response<T> = Result<T, Errno>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clone_call_round_trips_and_rejects_unknown_fields() {
+        let source = OpenRef {
+            fs: FsId("cloud".into()),
+            id: 1,
+            node: NodeId {
+                ino: 10,
+                generation: 1,
+            },
+            access: Access::Read,
+        };
+        let target = OpenRef {
+            fs: FsId("cloud".into()),
+            id: 2,
+            node: NodeId {
+                ino: 11,
+                generation: 1,
+            },
+            access: Access::Write,
+        };
+        let call = Call::Clone {
+            source: source.clone(),
+            target: target.clone(),
+        };
+        let text = serde_json::to_string(&call).unwrap();
+        assert!(text.starts_with(r#"{"clone":"#), "{text}");
+        let decoded: Call = serde_json::from_str(&text).unwrap();
+        assert!(
+            matches!(decoded, Call::Clone { source: s, target: t } if s == source && t == target)
+        );
+        assert!(
+            serde_json::from_str::<Call>(
+                r#"{"clone":{"source":{"fs":"c","id":1,"node":{"ino":1,"generation":1},"access":"read"},"target":{"fs":"c","id":2,"node":{"ino":2,"generation":1},"access":"write"},"extra":1}}"#,
+            )
+            .is_err()
+        );
+    }
+}

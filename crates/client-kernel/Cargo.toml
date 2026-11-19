@@ -9,7 +9,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 abi = { package = "os-abi", path = "../abi" }
 image = { package = "os-image", path = "../image" }
+os-core = { path = "../core" }
 vfs = { package = "os-vfs", path = "../vfs" }
+sha2 = "0.10"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 wasm-bindgen.workspace = true

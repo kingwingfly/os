@@ -7,7 +7,9 @@ use journal::{Journals, Output};
 
 use notify::Notification;
 use os_core::cli::{self, terminal::Supervise};
-use os_posix::process::{Child, SpawnOptions, Stdin, reap, spawn_configured};
+use os_posix::process::{
+    Child, ServiceBindMount, ServiceGrant, SpawnOptions, Stdin, reap, spawn_configured,
+};
 use os_services::{Action, Manifest, Readiness, State, Supervisor};
 use std::{
     collections::BTreeMap,
@@ -198,6 +200,10 @@ fn run() -> Result<i32, String> {
     if options.check {
         return Ok(0);
     }
+    let creds: abi::Creds =
+        serde_json::from_value(call(abi::Call::Getcreds).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    authorize_manifest_for_creds(&manifest, &creds)?;
     signals().map_err(|e| e.to_string())?;
     call(abi::Call::Prctl {
         option: 36,
@@ -371,6 +377,11 @@ fn run() -> Result<i32, String> {
                                 })?;
                             }
                         }
+                        let bind_mounts = build_service_bind_mounts(&unit.bind_mounts);
+                        let service_grant = ServiceGrant {
+                            mount_namespace: unit.mount_namespace.as_str(),
+                            bind_mounts: &bind_mounts,
+                        };
                         spawn_configured(
                             &unit.argv,
                             Stdin::Null,
@@ -380,6 +391,7 @@ fn run() -> Result<i32, String> {
                             &SpawnOptions {
                                 cgroup: Some(&group),
                                 dup2: &actions,
+                                service_grant: Some(service_grant),
                             },
                         )
                     })();
@@ -456,6 +468,24 @@ fn run() -> Result<i32, String> {
         std::thread::sleep(Duration::from_millis(25));
     }
 }
+fn authorize_manifest_for_creds(manifest: &Manifest, creds: &abi::Creds) -> Result<(), String> {
+    let has_user_session = creds.signed_in && creds.uid != 0;
+    manifest
+        .authorize_namespace(creds.uid, has_user_session)
+        .map_err(|errno| format!("mount_namespace: {}", errno.text()))
+}
+
+fn build_service_bind_mounts(binds: &[os_services::BindGrant]) -> Vec<ServiceBindMount<'_>> {
+    binds
+        .iter()
+        .map(|b| ServiceBindMount {
+            source: b.source.as_str(),
+            target: b.target.as_str(),
+            read_only: b.read_only,
+        })
+        .collect()
+}
+
 fn main() {
     let code = run().unwrap_or_else(|e| {
         if let Ok(mut output) = forward::Forward::new() {
@@ -472,4 +502,68 @@ fn main() {
         1
     });
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn supervise_authorizes_namespace_against_caller_creds_and_maps_bind_grants() {
+        let raw = serde_json::to_vec(&json!({
+            "version": 1,
+            "units": [{
+                "name": "session-app",
+                "argv": ["/usr/bin/true"],
+                "mount_namespace": "session",
+                "bind_mounts": [
+                    { "source": "/mnt/local/proj", "target": "/work", "read_only": false },
+                    { "source": "/mnt/shared/docs", "target": "/docs", "read_only": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        let manifest = Manifest::parse(&raw).unwrap();
+
+        let root_creds = abi::Creds {
+            uid: 0,
+            signed_in: true,
+            ..abi::Creds::default()
+        };
+        assert!(authorize_manifest_for_creds(&manifest, &root_creds).is_err());
+
+        let guest_creds = abi::Creds {
+            uid: 65534,
+            signed_in: false,
+            ..abi::Creds::default()
+        };
+        assert!(authorize_manifest_for_creds(&manifest, &guest_creds).is_err());
+
+        let user_creds = abi::Creds {
+            uid: 1000,
+            signed_in: true,
+            ..abi::Creds::default()
+        };
+        assert_eq!(authorize_manifest_for_creds(&manifest, &user_creds), Ok(()));
+
+        let unit = &manifest.units[0];
+        let binds = build_service_bind_mounts(&unit.bind_mounts);
+        assert_eq!(
+            binds,
+            vec![
+                ServiceBindMount {
+                    source: "/mnt/local/proj",
+                    target: "/work",
+                    read_only: false,
+                },
+                ServiceBindMount {
+                    source: "/mnt/shared/docs",
+                    target: "/docs",
+                    read_only: true,
+                },
+            ]
+        );
+        assert_eq!(unit.mount_namespace.as_str(), "session");
+    }
 }

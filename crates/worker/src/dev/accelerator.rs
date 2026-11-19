@@ -23,9 +23,39 @@ fn decode<T: DeserializeOwned>(value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(|e| Error::because(Errno::EINVAL, e.to_string()))
 }
 
-fn path(db: &Db, request: &Request, resource: &protocol::PathAt) -> Result<String> {
+fn path(
+    db: &Db,
+    process: &Process,
+    request: &Request,
+    resource: &protocol::PathAt,
+) -> Result<String> {
     if !resource.valid() {
         return Err(Errno::EINVAL.into());
+    }
+    if let Some(open) = &resource.open {
+        let fs_auth = request
+            .fs_auth
+            .as_ref()
+            .map(|(id, sec)| (id.as_str(), sec.as_str()));
+        let dir_node = crate::cloudfs::opened_in_namespace(
+            db,
+            &request.ns,
+            request.credential.as_ref(),
+            fs_auth,
+            open,
+        )?;
+        if !dir_node.directory {
+            return Err(Errno::ENOTDIR.into());
+        }
+        if resource.name != "." {
+            os_core::inode::require(&process.cred, &dir_node, os_core::permissions::EXEC)?;
+        }
+        let name = db.name_of(dir_node.ino).ok_or(Errno::ESTALE)?;
+        return Ok(if resource.name == "." {
+            name
+        } else {
+            format!("{}/{}", name.trim_end_matches('/'), resource.name)
+        });
     }
     let control = db.fd(&request.sid, request.fd).ok_or(Errno::EBADF)?;
     crate::fds::yours(
@@ -42,7 +72,7 @@ fn path(db: &Db, request: &Request, resource: &protocol::PathAt) -> Result<Strin
         .and_then(|ino| {
             db.name_of(ino).or_else(|| {
                 // Immutable image directories have synthetic inodes and no mutable SQLite name.
-                (crate::usr::is(&directory.path)
+                ((crate::usr::is(&directory.path) || crate::system::owns(db, &directory.path))
                     && db
                         .node(&directory.path)
                         .is_some_and(|node| node.ino == ino && node.directory))
@@ -64,6 +94,7 @@ fn path(db: &Db, request: &Request, resource: &protocol::PathAt) -> Result<Strin
 /// derives its label from the operation, never by interpreting an executable name or argv.
 fn operation(
     db: &Db,
+    process: &Process,
     request: &Request,
     op: protocol::Operation,
 ) -> Result<(&'static str, Operation, Vec<String>)> {
@@ -91,14 +122,14 @@ fn operation(
                 {
                     return Err(Errno::EINVAL.into());
                 }
-                paths.push(path(db, request, &input.source)?);
+                paths.push(path(db, process, request, &input.source)?);
                 names.push(input.name);
             }
             (
                 if format == Format::Zip { "zip" } else { "tar" },
                 Operation::Create {
                     format,
-                    archive: path(db, request, &output)?,
+                    archive: path(db, process, request, &output)?,
                     paths,
                     recursive,
                     verbose,
@@ -123,8 +154,8 @@ fn operation(
             },
             Operation::Extract {
                 zip: format == Format::Zip,
-                archive: path(db, request, &source)?,
-                directory: Some(path(db, request, &destination)?),
+                archive: path(db, process, request, &source)?,
+                directory: Some(path(db, process, request, &destination)?),
                 existing,
                 members,
                 verbose,
@@ -143,7 +174,7 @@ fn operation(
             },
             Operation::List {
                 zip: format == Format::Zip,
-                archive: path(db, request, &source)?,
+                archive: path(db, process, request, &source)?,
                 verbose,
             },
             Vec::new(),
@@ -151,7 +182,7 @@ fn operation(
         Op::Faststart { file } => (
             "faststart",
             Operation::Faststart {
-                file: path(db, request, &file)?,
+                file: path(db, process, request, &file)?,
             },
             Vec::new(),
         ),
@@ -219,7 +250,7 @@ pub fn ioctl(
             if db.active_tasks(controller) >= policy.max_active as usize {
                 return Err(Errno::EAGAIN.into());
             }
-            let (label, operation, names) = operation(db, &request, submit.operation)?;
+            let (label, operation, names) = operation(db, process, &request, submit.operation)?;
             let started =
                 crate::jobs::start(db, &process.cred, controller, label, operation, &names)
                     .map_err(|why| {

@@ -60,11 +60,21 @@ export function load(image) {
 // digests nor filenames can be passed to the server as image-based authority.
 export async function loadLocal(pin) {
   const { bytes, check } = await localImage(pin);
-  const key = `${LOCAL_FORMAT}:${pin.digest}`;
+  return loadLocalBytes(pin.digest, bytes, check);
+}
+
+let localCompilation = Promise.resolve();
+
+export async function loadLocalBytes(digest, bytes, check = async () => {}) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength < 8) {
+    throw formatError(new Error('not a wasm module'));
+  }
+  const key = `${LOCAL_FORMAT}:${digest}`;
   let promise = localCompiled.get(key);
   if (promise) localCompiled.delete(key);
   else {
-    promise = compileLocal(bytes);
+    promise = localCompilation.then(() => compileLocal(bytes));
+    localCompilation = promise.catch(() => {});
     promise.catch(() => { if (localCompiled.get(key) === promise) localCompiled.delete(key); });
   }
   localCompiled.set(key, promise);

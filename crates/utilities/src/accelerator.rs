@@ -15,6 +15,56 @@ fn call(call: abi::Call) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
+pub(crate) fn anchor(
+    base: &str,
+    typed: &str,
+    allow_dir_self: bool,
+) -> Result<(String, String), String> {
+    if typed.is_empty() || typed.contains('\0') || base.contains('\0') {
+        return Err("invalid path".into());
+    }
+    let joined = if typed.starts_with('/') || base.is_empty() || base == "." {
+        typed.to_string()
+    } else if base == "/" {
+        format!("/{typed}")
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), typed)
+    };
+    let trimmed = joined.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return if allow_dir_self {
+            Ok(("/".into(), ".".into()))
+        } else {
+            Err("invalid path".into())
+        };
+    }
+    let (raw_parent, leaf) = match trimmed.rsplit_once('/') {
+        Some((parent, leaf)) => {
+            let dir = if parent.bytes().all(|b| b == b'/') {
+                "/"
+            } else {
+                parent
+            };
+            (dir, leaf)
+        }
+        None => (".", trimmed),
+    };
+    if leaf == "." || leaf == ".." {
+        return if allow_dir_self {
+            Ok((trimmed.to_string(), ".".into()))
+        } else {
+            Err("invalid path".into())
+        };
+    }
+    if leaf.is_empty() {
+        return Err("invalid path".into());
+    }
+    if leaf.len() > abi::NAME_MAX {
+        return Err("Filename is too long".into());
+    }
+    Ok((raw_parent.to_string(), leaf.to_string()))
+}
+
 #[derive(Default)]
 struct Handles {
     directories: HashMap<String, u32>,
@@ -22,38 +72,54 @@ struct Handles {
 }
 impl Handles {
     fn open(&mut self, path: &str, flags: u32) -> Result<u32, String> {
-        let opened = call(abi::Call::Open {
-            path: path.into(),
-            flags,
-            mode: 0,
-            size: None,
-            sha256: None,
-            version: None,
-        })?;
+        let open = if path.starts_with('/') {
+            abi::Call::Open {
+                path: path.into(),
+                flags,
+                mode: 0,
+                size: None,
+                sha256: None,
+                version: None,
+            }
+        } else {
+            abi::Call::OpenAt {
+                dirfd: (abi::OS_FD_CWD as u32).into(),
+                path: path.into(),
+                flags,
+                mode: 0,
+            }
+        };
+        let opened = call(open)?;
         let fd = opened["fd"].as_u64().ok_or("open returned no descriptor")? as u32;
         self.all.push(fd);
         Ok(fd)
     }
-    fn resource(&mut self, base: &str, typed: &str) -> Result<protocol::PathAt, String> {
-        let path = os_core::resolve(base, typed)?;
-        let (directory, name) = if path == "/" {
-            ("/", ".")
-        } else {
-            let (parent, name) = path.rsplit_once('/').ok_or("invalid path")?;
-            (if parent.is_empty() { "/" } else { parent }, name)
-        };
-        let fd = match self.directories.get(directory) {
+    fn resolve_with(
+        &mut self,
+        base: &str,
+        typed: &str,
+        allow_dir_self: bool,
+    ) -> Result<protocol::PathAt, String> {
+        let (directory, name) = anchor(base, typed, allow_dir_self)?;
+        let fd = match self.directories.get(&directory) {
             Some(fd) => *fd,
             None => {
-                let fd = self.open(directory, abi::O_PATH | abi::O_DIRECTORY)?;
-                self.directories.insert(directory.into(), fd);
+                let fd = self.open(&directory, abi::O_PATH | abi::O_DIRECTORY)?;
+                self.directories.insert(directory, fd);
                 fd
             }
         };
         Ok(protocol::PathAt {
             directory: fd,
-            name: name.into(),
+            name,
+            open: None,
         })
+    }
+    fn resource(&mut self, base: &str, typed: &str) -> Result<protocol::PathAt, String> {
+        self.resolve_with(base, typed, false)
+    }
+    fn dir_or_entry(&mut self, base: &str, typed: &str) -> Result<protocol::PathAt, String> {
+        self.resolve_with(base, typed, true)
     }
 }
 impl Drop for Handles {
@@ -72,7 +138,7 @@ fn ioctl(fd: u32, request: u32, arg: impl serde::Serialize) -> Result<Value, Str
     })
 }
 
-fn operation(handles: &mut Handles, cwd: &str, job: Job) -> Result<protocol::Operation, String> {
+fn operation(handles: &mut Handles, job: Job) -> Result<protocol::Operation, String> {
     use protocol::{Format, Operation as Op};
     Ok(match job {
         Job::Create {
@@ -84,12 +150,12 @@ fn operation(handles: &mut Handles, cwd: &str, job: Job) -> Result<protocol::Ope
             directory,
             links,
         } => {
-            let base = os_core::resolve(cwd, directory.as_deref().unwrap_or("."))?;
-            let output = handles.resource(cwd, &archive)?;
+            let base = directory.as_deref().unwrap_or(".");
+            let output = handles.resource(".", &archive)?;
             let mut inputs = Vec::new();
             for path in paths {
                 inputs.push(protocol::Input {
-                    source: handles.resource(&base, &path)?,
+                    source: handles.dir_or_entry(base, &path)?,
                     name: archive::stored_name(&path),
                 });
             }
@@ -110,17 +176,17 @@ fn operation(handles: &mut Handles, cwd: &str, job: Job) -> Result<protocol::Ope
             members,
             verbose,
         } => {
-            let source = handles.resource(cwd, &archive)?;
-            let destination = os_core::resolve(cwd, directory.as_deref().unwrap_or("."))?;
+            let source = handles.resource(".", &archive)?;
+            let destination = directory.as_deref().unwrap_or(".");
             if zip {
                 // Creating the destination is an ordinary user-space filesystem operation.
-                std::fs::metadata(os_core::resolve(cwd, &archive)?).map_err(|e| e.to_string())?;
-                std::fs::create_dir_all(&destination).map_err(|e| e.to_string())?;
+                std::fs::metadata(&archive).map_err(|e| e.to_string())?;
+                std::fs::create_dir_all(destination).map_err(|e| e.to_string())?;
             }
             Op::Extract {
                 format: if zip { Format::Zip } else { Format::Tar },
                 source,
-                destination: handles.resource(cwd, &destination)?,
+                destination: handles.dir_or_entry(".", destination)?,
                 existing,
                 members,
                 verbose,
@@ -132,11 +198,11 @@ fn operation(handles: &mut Handles, cwd: &str, job: Job) -> Result<protocol::Ope
             verbose,
         } => Op::List {
             format: if zip { Format::Zip } else { Format::Tar },
-            source: handles.resource(cwd, &archive)?,
+            source: handles.resource(".", &archive)?,
             verbose,
         },
         Job::Faststart { file } => Op::Faststart {
-            file: handles.resource(cwd, &file)?,
+            file: handles.resource(".", &file)?,
         },
     })
 }
@@ -184,11 +250,7 @@ pub fn run(name: &str, args: &[String]) -> Result<i32, String> {
         _ => return Err("unsupported client".into()),
     }?;
     let mut handles = Handles::default();
-    let cwd = std::env::current_dir()
-        .map_err(|e| e.to_string())?
-        .to_string_lossy()
-        .into_owned();
-    let operation = operation(&mut handles, &cwd, parsed)?;
+    let operation = operation(&mut handles, parsed)?;
     let device = handles.open(operation.device(), abi::O_RDWR)?;
     let info = ioctl(device, protocol::INFO, Value::Null)?;
     if info["version"] != protocol::VERSION {
@@ -266,5 +328,66 @@ pub fn run(name: &str, args: &[String]) -> Result<i32, String> {
             return Ok(status.into());
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::anchor;
+
+    #[test]
+    fn anchor_preserves_symlink_dotdot_and_posix_name_max() {
+        // Must NOT collapse `symlink_to_deep_dir/..` lexically before kernel O_PATH open.
+        assert_eq!(
+            anchor(".", "symlink_to_deep_dir/../archive.tar", false).unwrap(),
+            ("symlink_to_deep_dir/..".into(), "archive.tar".into())
+        );
+        assert_eq!(
+            anchor("sub/link/..", "nested/../bundle.tgz", false).unwrap(),
+            ("sub/link/../nested/..".into(), "bundle.tgz".into())
+        );
+        assert_eq!(
+            anchor(".", "plain.zip", false).unwrap(),
+            (".".into(), "plain.zip".into())
+        );
+        assert_eq!(
+            anchor(".", "/top.tar", false).unwrap(),
+            ("/".into(), "top.tar".into())
+        );
+        assert_eq!(
+            anchor(".", "///top.tar", false).unwrap(),
+            ("/".into(), "top.tar".into())
+        );
+
+        // 255-byte POSIX NAME_MAX and `.directory` are permitted on local/VFS mounts.
+        let max_leaf = "x".repeat(abi::NAME_MAX);
+        assert_eq!(
+            anchor("/mnt/local/proj", &max_leaf, false).unwrap(),
+            ("/mnt/local/proj".into(), max_leaf)
+        );
+        assert_eq!(
+            anchor("/mnt/local/proj", ".directory", false).unwrap(),
+            ("/mnt/local/proj".into(), ".directory".into())
+        );
+
+        // > 255-byte leaf fails.
+        let too_long = "x".repeat(abi::NAME_MAX + 1);
+        assert!(anchor("/mnt/local/proj", &too_long, false).is_err());
+
+        // Leaf-only resources reject `.` / `..` / `/` / NUL.
+        for bad in ["", "/", "///", ".", "..", "a/.", "a/..", "a\0b"] {
+            assert!(
+                anchor(".", bad, false).is_err(),
+                "expected error for {bad:?}"
+            );
+        }
+
+        // Directory destinations / archive inputs permit `.`, `/`, and `link/..` via `(raw_dir, ".")`.
+        assert_eq!(anchor(".", ".", true).unwrap(), (".".into(), ".".into()));
+        assert_eq!(anchor(".", "/", true).unwrap(), ("/".into(), ".".into()));
+        assert_eq!(
+            anchor(".", "link/..", true).unwrap(),
+            ("link/..".into(), ".".into())
+        );
     }
 }

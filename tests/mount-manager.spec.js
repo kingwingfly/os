@@ -7,7 +7,7 @@ import { createInterface } from 'node:readline';
 import { api } from './sys.js';
 
 const app = page => page.locator('#window-mounts');
-async function ready(page) { await page.goto('/'); await expect(page.locator('.files-mounts')).toBeVisible(); }
+async function ready(page) { await page.goto('/'); await expect(page.locator('.files-mounts')).toBeVisible(); await page.waitForFunction(() => Boolean(window.os?.localMountList)); }
 async function open(page, pane = 'mounted') {
   await page.evaluate(() => window.os.localMounts());
   await expect(app(page)).toBeVisible();
@@ -20,30 +20,58 @@ async function storage(page) {
   await expect(app(page).locator('[data-selected]')).toHaveText('/mnt/local/project');
 }
 
-test('the browser picker retains a live directory handle and writes back to it', async ({ page, browserName }) => {
+test('the browser picker retains a live directory handle and writes back to it', async ({ page, browserName, context }) => {
   test.skip(browserName !== 'chromium', 'Host directory handle transport is a Chromium feature; OPFS uses worker acquisition elsewhere.');
-  await ready(page);
-  // The native OS dialog is outside Playwright. Substitute only its selection,
-  // using a real browser directory handle so cloning and worker I/O remain real.
-  await page.evaluate(async () => {
-    window.pickedFolder = await (await navigator.storage.getDirectory()).getDirectoryHandle('picker-contract', { create: true });
-    window.writePicked = async text => { const f = await pickedFolder.getFileHandle('note', { create: true }), w = await f.createWritable(); await w.write(text); await w.close(); };
-    await writePicked('first');
-    window.showDirectoryPicker = async options => { window.pickerOptions = options; window.pickerActivated = navigator.userActivation.isActive; return pickedFolder; };
-  });
-  await open(page, 'add'); await app(page).getByLabel('User write', { exact: true }).check();
-  await app(page).getByRole('button', { name: 'Choose folder…', exact: true }).click();
-  await expect(app(page).locator('[data-selected]')).toHaveText('/mnt/local/project');
-  expect(await page.evaluate(() => ({ options: pickerOptions, activated: pickerActivated }))).toEqual({ options: { mode: 'readwrite', id: 'os-host-folder' }, activated: true });
-  await expect(app(page).locator('.mount-table')).toContainText('Host folder · browser');
-  const read = () => page.evaluate(async () => (await fetch('/api/file?path=/mnt/local/project/note')).text());
-  expect(await read()).toBe('first'); await page.evaluate(() => writePicked('external edit')); expect(await read()).toBe('external edit');
-  const results = await page.evaluate(async () => (await (await fetch('/api/sys', { method: 'POST', body: JSON.stringify({ calls: [
-    { open: { path: '/mnt/local/project/note', flags: 0o1001 } },
-    { pwrite: { fd: { ref: 0 }, index: 0, data: btoa('from OS') } }, { close: { fd: { ref: 0 } } },
-  ] }) })).json()).results);
-  expect(results.every(result => !result.err)).toBe(true);
-  expect(await page.evaluate(async () => (await (await pickedFolder.getFileHandle('note')).getFile()).text())).toBe('from OS');
+  const directory = await mkdtemp(join(tmpdir(), 'os-picker-contract-'));
+  try {
+    await writeFile(join(directory, 'note'), 'first');
+    await ready(page);
+    // 1. Passing an OPFS handle as a host directory is refused (EACCES boundary).
+    await page.evaluate(async () => {
+      const opfsDir = await (await navigator.storage.getDirectory()).getDirectoryHandle('picker-contract', { create: true });
+      window.showDirectoryPicker = async options => { window.pickerOptions = options; window.pickerActivated = navigator.userActivation.isActive; return opfsDir; };
+    });
+    await open(page, 'add'); await app(page).getByLabel('User write', { exact: true }).check();
+    await app(page).getByRole('button', { name: 'Choose folder…', exact: true }).click();
+    await expect(app(page).locator('.mount-notice')).toContainText('browser storage handles must use browser storage mount');
+    expect(await page.evaluate(() => ({ options: pickerOptions, activated: pickerActivated }))).toEqual({ options: { mode: 'readwrite', id: 'os-host-folder' }, activated: true });
+
+    // 2. A CDP-dropped host folder has read-only permission natively: User write fails closed,
+    // while read-only mount succeeds and reflects live host edits.
+    await page.evaluate(() => {
+      addEventListener('dragover', event => event.preventDefault());
+      addEventListener('drop', event => { event.preventDefault(); window.droppedFolder = event.dataTransfer.items[0].getAsFileSystemHandle(); }, { once: true });
+    });
+    const cdp = await context.newCDPSession(page);
+    for (const type of ['dragEnter', 'dragOver', 'drop']) await cdp.send('Input.dispatchDragEvent', { type, x: 500, y: 300, data: { items: [], files: [directory], dragOperationsMask: 1 } });
+    await page.evaluate(async () => {
+      window.pickedFolder = await window.droppedFolder;
+      window.showDirectoryPicker = async options => { window.pickerOptions = options; window.pickerActivated = navigator.userActivation.isActive; return pickedFolder; };
+    });
+    await app(page).getByRole('button', { name: 'Choose folder…', exact: true }).click();
+    await expect(app(page).locator('.mount-notice')).toContainText('local directory permission was not granted');
+    await app(page).getByLabel('User write', { exact: true }).uncheck();
+    await app(page).getByRole('button', { name: 'Choose folder…', exact: true }).click();
+    await expect(app(page).locator('[data-selected]')).toHaveText('/mnt/local/project');
+    expect(await page.evaluate(() => ({ options: pickerOptions, activated: pickerActivated }))).toEqual({ options: { mode: 'read', id: 'os-host-folder' }, activated: true });
+    await expect(app(page).locator('.mount-table')).toContainText('Host folder · browser');
+    const read = () => page.evaluate(async () => (await fetch('/api/file?path=/mnt/local/project/note')).text());
+    expect(await read()).toBe('first');
+    await writeFile(join(directory, 'note'), 'external edit');
+    expect(await read()).toBe('external edit');
+    await app(page).getByRole('button', { name: 'Unmount', exact: true }).click();
+    await expect(app(page).locator('[data-empty]')).toBeVisible();
+
+    // 3. Writable browser storage retains a live OPFS handle and writes OS bytes directly into it.
+    await storage(page);
+    await expect(app(page).locator('.mount-table')).toContainText('Browser storage');
+    const results = await page.evaluate(async () => (await (await fetch('/api/sys', { method: 'POST', body: JSON.stringify({ calls: [
+      { open: { path: '/mnt/local/project/note', flags: 0o1101 } },
+      { pwrite: { fd: { ref: 0 }, data: btoa('from OS') } }, { close: { fd: { ref: 0 } } },
+    ] }) })).json()).results);
+    expect(results.every(result => !result.err), JSON.stringify(results)).toBe(true);
+    expect(await page.evaluate(async () => (await fetch('/api/file?path=/mnt/local/project/note')).text())).toBe('from OS');
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test('picker cancellation and permission denial never downgrade to the helper', async ({ page }) => {

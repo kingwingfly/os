@@ -6,19 +6,27 @@ use std::collections::BTreeMap;
 
 use wasm_bindgen::prelude::*;
 
-/// WASI/WASIX errno values used by the Phase 0 subset.
+/// WASI/WASIX errno values used by the runtime subset.
 const SUCCESS: u16 = 0;
 const BADF: u16 = 8;
 const FAULT: u16 = 21;
 const INVAL: u16 = 28;
 const NOENT: u16 = 44;
 const NOSYS: u16 = 52;
+const NOTDIR: u16 = 54;
+const RANGE: u16 = 68;
 const SPIPE: u16 = 70;
+
+/// Reserved host pseudo-descriptors matching `abi::OS_FD_ROOT` / `abi::OS_FD_CWD`.
+pub const OS_FD_ROOT: u32 = 0x7fff_fffd;
+pub const OS_FD_CWD: u32 = 0x7fff_fffe;
 
 #[wasm_bindgen]
 extern "C" {
+    #[cfg_attr(test, allow(dead_code))]
     #[wasm_bindgen(js_namespace = ["globalThis", "wasixGuest"], js_name = read)]
     fn guest_read(pid: u32, ptr: u32, len: u32) -> js_sys::Uint8Array;
+    #[cfg_attr(test, allow(dead_code))]
     #[wasm_bindgen(js_namespace = ["globalThis", "wasixGuest"], js_name = write)]
     fn guest_write(pid: u32, ptr: u32, data: &[u8]);
     #[wasm_bindgen(js_namespace = ["globalThis", "wasixGuest"], js_name = output)]
@@ -31,9 +39,9 @@ extern "C" {
     fn guest_clone(parent: u32, child: u32, stack_pointer: u32) -> u32;
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum Outcome {
-    Ready(u16),
+    Ready(i32),
     Exit(i32),
     Unwind,
     Resume,
@@ -41,7 +49,17 @@ enum Outcome {
 }
 impl Outcome {
     fn ready(errno: u16) -> Self {
-        Self::Ready(errno)
+        Self::Ready(i32::from(errno))
+    }
+    fn os_value(value: i32) -> Self {
+        Self::Ready(value)
+    }
+    fn os_errno(errno: u16) -> Self {
+        if errno == SUCCESS {
+            Self::Ready(0)
+        } else {
+            Self::Ready(-i32::from(errno))
+        }
     }
     fn json(&self) -> String {
         match self {
@@ -60,7 +78,7 @@ enum Fd {
     Stdout,
     Stderr,
     File { data: Vec<u8>, offset: usize },
-    Dir,
+    Dir { path: String },
 }
 
 #[derive(Clone)]
@@ -70,6 +88,7 @@ struct Process {
     argv: Vec<String>,
     env: Vec<String>,
     cwd: String,
+    root: String,
     fds: BTreeMap<u32, Fd>,
     next_fd: u32,
     stack_lower: u32,
@@ -121,7 +140,7 @@ impl Runtime {
         fds.insert(0, Fd::Stdin);
         fds.insert(1, Fd::Stdout);
         fds.insert(2, Fd::Stderr);
-        fds.insert(3, Fd::Dir);
+        fds.insert(3, Fd::Dir { path: "/".into() });
         self.procs.insert(
             pid,
             Process {
@@ -129,7 +148,8 @@ impl Runtime {
                 ppid,
                 argv,
                 env,
-                cwd: cwd.to_string(),
+                cwd: normalize_abs(cwd, "/"),
+                root: "/".into(),
                 fds,
                 next_fd: 4,
                 stack_lower: 0,
@@ -148,7 +168,11 @@ impl Runtime {
 
     /// Add a file the Phase 0 probe may open (the executable and empty profile files).
     pub fn add_file(&mut self, path: &str, bytes: &[u8]) {
-        self.files.insert(clean(path), bytes.to_vec());
+        let canon = normalize_abs(path, "/");
+        let key = canon.trim_start_matches('/').to_string();
+        if !key.is_empty() {
+            self.files.insert(key, bytes.to_vec());
+        }
     }
 
     /// Called by the JS bridge after `_start` returns from an asyncify unwind. Captures the
@@ -212,10 +236,17 @@ impl Runtime {
         }
     }
 
-    /// One `wasix_32v1` import call. The JS bridge calls this from the guest's import function and
-    /// returns the resulting errno, throws on `exit`, or starts asyncify on `unwind`.
+    /// One `wasix_32v1` / `os` import call. Accepts bare `wasix_32v1` symbol names (`"getcwd"`)
+    /// or module-qualified `"<module>::<name>"` / `"<module>.<name>"` names (`"os::getcwd"`).
     pub fn syscall(&mut self, pid: u32, name: &str, args: &[u32]) -> String {
-        let outcome = self.dispatch(pid, name, args);
+        let (module, bare) = split_qualified_syscall(name);
+        let outcome = self.dispatch(pid, module, bare, args);
+        outcome.json()
+    }
+
+    /// Module-qualified import call (`module` = `"os"`, `"wasix_32v1"`, or `"wasi_snapshot_preview1"`).
+    pub fn syscall_module(&mut self, pid: u32, module: &str, name: &str, args: &[u32]) -> String {
+        let outcome = self.dispatch(pid, module, name, args);
         outcome.json()
     }
 }
@@ -338,18 +369,52 @@ impl Runtime {
         Outcome::Unwind
     }
 
-    fn dispatch(&mut self, pid: u32, name: &str, args: &[u32]) -> Outcome {
-        match name {
-            "stack_checkpoint" => return self.stack_checkpoint(pid, args),
-            "stack_restore" => return self.stack_restore(pid, args),
-            "proc_fork" => return self.proc_fork(pid, args),
-            _ => {}
+    fn dispatch(&mut self, pid: u32, module: &str, name: &str, args: &[u32]) -> Outcome {
+        if module != "os" {
+            match name {
+                "stack_checkpoint" => return self.stack_checkpoint(pid, args),
+                "stack_restore" => return self.stack_restore(pid, args),
+                "proc_fork" => return self.proc_fork(pid, args),
+                _ => {}
+            }
         }
         let files = &self.files;
         let Some(proc) = self.procs.get_mut(&pid) else {
-            return Outcome::ready(BADF);
+            return if module == "os" {
+                Outcome::os_errno(BADF)
+            } else {
+                Outcome::ready(BADF)
+            };
         };
         let arg = |i: usize| args.get(i).copied().unwrap_or(0);
+        if module == "os" {
+            return match name {
+                "getcwd" => {
+                    let (buf_ptr, cap) = (arg(0), arg(1) as usize);
+                    if buf_ptr == 0 && cap != 0 {
+                        return Outcome::os_errno(FAULT);
+                    }
+                    match proc_getcwd(proc, cap) {
+                        Ok(cwd) => {
+                            write_bytes(pid, buf_ptr, cwd.as_bytes());
+                            write_bytes(pid, buf_ptr + cwd.len() as u32, &[0]);
+                            Outcome::os_value((cwd.len() + 1) as i32)
+                        }
+                        Err(errno) => Outcome::os_errno(errno),
+                    }
+                }
+                "chdir" => {
+                    let path = read_string(pid, arg(0), arg(1));
+                    Outcome::os_errno(proc_chdir(files, proc, &path))
+                }
+                "fchdir" => Outcome::os_errno(proc_fchdir(proc, arg(0))),
+                "chroot" => {
+                    let path = read_string(pid, arg(0), arg(1));
+                    Outcome::os_errno(proc_chroot(files, proc, &path))
+                }
+                _ => Outcome::os_errno(NOSYS),
+            };
+        }
         match name {
             "args_sizes_get" => {
                 let size = strings_size(&proc.argv);
@@ -388,8 +453,7 @@ impl Runtime {
                         write_u32(pid, nwritten, (end - at) as u32);
                         Outcome::ready(SUCCESS)
                     }
-                    Some(_) => Outcome::ready(BADF),
-                    None => Outcome::ready(BADF),
+                    Some(_) | None => Outcome::ready(BADF),
                 }
             }
             "fd_read" => {
@@ -408,22 +472,27 @@ impl Runtime {
                         bytes
                     }
                     Some(Fd::Stdin) | Some(Fd::Stdout) | Some(Fd::Stderr) => Vec::new(),
-                    Some(Fd::Dir) => return Outcome::ready(BADF),
-                    None => return Outcome::ready(BADF),
+                    Some(Fd::Dir { .. }) | None => return Outcome::ready(BADF),
                 };
                 let written = write_iovs(pid, &iovs_vec, &bytes);
                 write_u32(pid, nread, written as u32);
                 Outcome::ready(SUCCESS)
             }
             "fd_close" => {
-                proc.fds.remove(&arg(0));
+                let fd = arg(0);
+                if fd == OS_FD_ROOT || fd == OS_FD_CWD {
+                    return Outcome::ready(BADF);
+                }
+                proc.fds.remove(&fd);
                 Outcome::ready(SUCCESS)
             }
             "fd_fdstat_get" => {
                 let fd = arg(0);
-                let filetype = filetype(proc, fd);
+                let Some(ft) = filetype(proc, fd) else {
+                    return Outcome::ready(BADF);
+                };
                 let mut stat = [0u8; 24];
-                stat[0] = filetype;
+                stat[0] = ft;
                 stat[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
                 write_bytes(pid, arg(1), &stat);
                 Outcome::ready(SUCCESS)
@@ -431,12 +500,17 @@ impl Runtime {
             "fd_fdstat_set_flags" => Outcome::ready(SUCCESS),
             "fd_filestat_get" => {
                 let fd = arg(0);
-                let size = match proc.fds.get(&fd) {
-                    Some(Fd::File { data, .. }) => data.len() as u64,
-                    Some(_) => 0,
-                    None => return Outcome::ready(BADF),
+                let (ft, size) = if fd == OS_FD_ROOT || fd == OS_FD_CWD {
+                    (3, 0)
+                } else {
+                    match proc.fds.get(&fd) {
+                        Some(Fd::File { data, .. }) => (4, data.len() as u64),
+                        Some(Fd::Dir { .. }) => (3, 0),
+                        Some(_) => (2, 0),
+                        None => return Outcome::ready(BADF),
+                    }
                 };
-                write_filestat(pid, arg(1), filetype(proc, fd), size);
+                write_filestat(pid, arg(1), ft, size);
                 Outcome::ready(SUCCESS)
             }
             "fd_prestat_get" => {
@@ -496,7 +570,7 @@ impl Runtime {
                         data: data.clone(),
                         offset: *offset,
                     },
-                    Some(Fd::Dir) => Fd::Dir,
+                    Some(Fd::Dir { path }) => Fd::Dir { path: path.clone() },
                     Some(Fd::Stdin) => Fd::Stdin,
                     Some(Fd::Stdout) => Fd::Stdout,
                     Some(Fd::Stderr) => Fd::Stderr,
@@ -511,60 +585,61 @@ impl Runtime {
             "fd_renumber" => Outcome::ready(SUCCESS),
             "fd_pipe" => Outcome::ready(NOSYS),
             "path_open" => {
-                let (path_ptr, path_len, opened_ptr) = (arg(2), arg(3), arg(8));
+                let (dirfd, path_ptr, path_len, opened_ptr) = (arg(0), arg(2), arg(3), arg(8));
                 let path = read_string(pid, path_ptr, path_len);
-                match resolve(files, &path) {
-                    Some(Node::File(data)) => {
-                        let new_fd = proc.next_fd;
-                        proc.next_fd += 1;
-                        proc.fds.insert(new_fd, Fd::File { data, offset: 0 });
-                        write_u32(pid, opened_ptr, new_fd);
+                match proc_open(files, proc, dirfd, &path) {
+                    Ok(opened) => {
+                        write_u32(pid, opened_ptr, opened);
                         Outcome::ready(SUCCESS)
                     }
-                    Some(Node::Dir) => {
-                        write_u32(pid, opened_ptr, 3);
-                        Outcome::ready(SUCCESS)
-                    }
-                    None => Outcome::ready(NOENT),
+                    Err(errno) => Outcome::ready(errno),
                 }
             }
             "path_filestat_get" => {
-                let (path_ptr, path_len, out) = (arg(2), arg(3), arg(4));
+                let (dirfd, path_ptr, path_len, out) = (arg(0), arg(2), arg(3), arg(4));
                 let path = read_string(pid, path_ptr, path_len);
-                match resolve(files, &path) {
-                    Some(Node::File(data)) => {
+                match resolve_at(files, proc, dirfd, &path) {
+                    Ok((_, Node::File(data))) => {
                         write_filestat(pid, out, 4, data.len() as u64);
                         Outcome::ready(SUCCESS)
                     }
-                    Some(Node::Dir) => {
+                    Ok((_, Node::Dir)) => {
                         write_filestat(pid, out, 3, 0);
                         Outcome::ready(SUCCESS)
                     }
-                    None => Outcome::ready(NOENT),
+                    Err(errno) => Outcome::ready(errno),
                 }
             }
             "getcwd" => {
-                let cwd = proc.cwd.clone();
-                if arg(1) < cwd.len() as u32 + 1 {
-                    return Outcome::ready(INVAL);
+                let (buf_ptr, len_ptr) = (arg(0), arg(1));
+                if len_ptr == 0 {
+                    return Outcome::ready(FAULT);
                 }
-                write_bytes(pid, arg(0), cwd.as_bytes());
-                write_bytes(pid, arg(0) + cwd.len() as u32, &[0]);
-                Outcome::ready(SUCCESS)
+                let cap = read_u32(pid, len_ptr) as usize;
+                let Some(cwd) = rebase_under_root(&proc.cwd, &proc.root) else {
+                    return Outcome::ready(NOENT);
+                };
+                let needed = cwd.len() + 1;
+                if cap < needed {
+                    write_u32(pid, len_ptr, needed as u32);
+                    Outcome::ready(RANGE)
+                } else if buf_ptr == 0 {
+                    Outcome::ready(FAULT)
+                } else {
+                    write_bytes(pid, buf_ptr, cwd.as_bytes());
+                    write_bytes(pid, buf_ptr + cwd.len() as u32, &[0]);
+                    write_u32(pid, len_ptr, cwd.len() as u32);
+                    Outcome::ready(SUCCESS)
+                }
             }
             "chdir" => {
                 let path = read_string(pid, arg(0), arg(1));
-                match resolve(files, &path) {
-                    Some(Node::Dir) => {
-                        proc.cwd = if path.trim().is_empty() || path == "/" {
-                            "/".into()
-                        } else {
-                            path
-                        };
-                        Outcome::ready(SUCCESS)
-                    }
-                    _ => Outcome::ready(NOENT),
-                }
+                Outcome::ready(proc_chdir(files, proc, &path))
+            }
+            "fchdir" => Outcome::ready(proc_fchdir(proc, arg(0))),
+            "chroot" => {
+                let path = read_string(pid, arg(0), arg(1));
+                Outcome::ready(proc_chroot(files, proc, &path))
             }
             "clock_time_get" => {
                 write_u64(pid, arg(2), (js_sys::Date::now() * 1_000_000.0) as u64);
@@ -594,34 +669,229 @@ impl Runtime {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Node {
     File(Vec<u8>),
     Dir,
 }
 
-fn clean(path: &str) -> String {
-    let clean = path.trim().trim_start_matches('/').trim_end_matches('/');
-    if clean == "." || clean == ".." {
-        String::new()
+fn normalize_abs(path: &str, root: &str) -> String {
+    let mut stack: Vec<&str> = root
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let root_depth = stack.len();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if stack.len() > root_depth {
+                    stack.pop();
+                }
+            }
+            seg => stack.push(seg),
+        }
+    }
+    if stack.is_empty() {
+        "/".into()
     } else {
-        clean.to_string()
+        format!("/{}", stack.join("/"))
     }
 }
 
-fn resolve(files: &BTreeMap<String, Vec<u8>>, path: &str) -> Option<Node> {
-    let name = clean(path);
-    if name.is_empty() || name == "etc" {
+fn rebase_under_root(cwd: &str, root: &str) -> Option<String> {
+    if root == "/" {
+        return Some(cwd.to_string());
+    }
+    if cwd == root {
+        return Some("/".into());
+    }
+    cwd.strip_prefix(root)
+        .filter(|rest| rest.starts_with('/'))
+        .map(ToOwned::to_owned)
+}
+
+fn lookup_node(files: &BTreeMap<String, Vec<u8>>, canon: &str) -> Option<Node> {
+    let key = canon.trim_start_matches('/');
+    if key.is_empty() || key == "etc" {
         return Some(Node::Dir);
     }
-    files.get(&name).cloned().map(Node::File)
+    if let Some(data) = files.get(key) {
+        return Some(Node::File(data.clone()));
+    }
+    let prefix = format!("{key}/");
+    if files.keys().any(|entry| entry.starts_with(&prefix)) {
+        return Some(Node::Dir);
+    }
+    None
 }
 
-fn filetype(proc: &Process, fd: u32) -> u8 {
+fn resolve_at(
+    files: &BTreeMap<String, Vec<u8>>,
+    proc: &Process,
+    dirfd: u32,
+    raw: &str,
+) -> Result<(String, Node), u16> {
+    let path = raw.trim();
+    if path.is_empty() {
+        return Err(NOENT);
+    }
+    let start = if path.starts_with('/') || dirfd == OS_FD_ROOT {
+        proc.root.as_str()
+    } else if dirfd == OS_FD_CWD {
+        proc.cwd.as_str()
+    } else {
+        match proc.fds.get(&dirfd) {
+            Some(Fd::Dir { path: dir }) => {
+                if dirfd == 3 && dir == "/" {
+                    proc.root.as_str()
+                } else {
+                    dir.as_str()
+                }
+            }
+            Some(_) => return Err(NOTDIR),
+            None => return Err(BADF),
+        }
+    };
+
+    let trailing_slash = path.len() > 1 && path.ends_with('/');
+    let mut parts: Vec<&str> = start.split('/').filter(|seg| !seg.is_empty()).collect();
+    let segments: Vec<&str> = path.split('/').filter(|seg| !seg.is_empty()).collect();
+
+    for (idx, seg) in segments.iter().enumerate() {
+        match *seg {
+            "." => {}
+            ".." => {
+                let current = if parts.is_empty() {
+                    "/".to_string()
+                } else {
+                    format!("/{}", parts.join("/"))
+                };
+                if current != proc.root {
+                    parts.pop();
+                }
+            }
+            name => {
+                parts.push(name);
+                let step = format!("/{}", parts.join("/"));
+                let is_last = idx + 1 == segments.len();
+                if !is_last {
+                    match lookup_node(files, &step) {
+                        Some(Node::Dir) => {}
+                        Some(Node::File(_)) => return Err(NOTDIR),
+                        None => return Err(NOENT),
+                    }
+                }
+            }
+        }
+    }
+
+    let canon = if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    };
+    match lookup_node(files, &canon) {
+        Some(Node::File(_)) if trailing_slash => Err(NOTDIR),
+        Some(node) => Ok((canon, node)),
+        None => Err(NOENT),
+    }
+}
+
+fn proc_open(
+    files: &BTreeMap<String, Vec<u8>>,
+    proc: &mut Process,
+    dirfd: u32,
+    path: &str,
+) -> Result<u32, u16> {
+    match resolve_at(files, proc, dirfd, path)? {
+        (_, Node::File(data)) => {
+            let new_fd = proc.next_fd;
+            proc.next_fd += 1;
+            proc.fds.insert(new_fd, Fd::File { data, offset: 0 });
+            Ok(new_fd)
+        }
+        (canon, Node::Dir) => {
+            let new_fd = proc.next_fd;
+            proc.next_fd += 1;
+            proc.fds.insert(new_fd, Fd::Dir { path: canon });
+            Ok(new_fd)
+        }
+    }
+}
+
+fn proc_chdir(files: &BTreeMap<String, Vec<u8>>, proc: &mut Process, path: &str) -> u16 {
+    let dirfd = if path.starts_with('/') {
+        OS_FD_ROOT
+    } else {
+        OS_FD_CWD
+    };
+    match resolve_at(files, proc, dirfd, path) {
+        Ok((canon, Node::Dir)) => {
+            proc.cwd = canon;
+            SUCCESS
+        }
+        Ok((_, Node::File(_))) => NOTDIR,
+        Err(errno) => errno,
+    }
+}
+
+fn proc_fchdir(proc: &mut Process, fd: u32) -> u16 {
+    if fd == OS_FD_ROOT {
+        proc.cwd = proc.root.clone();
+        return SUCCESS;
+    }
+    if fd == OS_FD_CWD {
+        return SUCCESS;
+    }
     match proc.fds.get(&fd) {
-        Some(Fd::Dir) => 3,
-        Some(Fd::File { .. }) => 4,
-        Some(_) => 2,
-        None => 0,
+        Some(Fd::Dir { path }) => {
+            proc.cwd = path.clone();
+            SUCCESS
+        }
+        Some(_) => NOTDIR,
+        None => BADF,
+    }
+}
+
+fn proc_chroot(files: &BTreeMap<String, Vec<u8>>, proc: &mut Process, path: &str) -> u16 {
+    let dirfd = if path.starts_with('/') {
+        OS_FD_ROOT
+    } else {
+        OS_FD_CWD
+    };
+    match resolve_at(files, proc, dirfd, path) {
+        Ok((canon, Node::Dir)) => {
+            proc.root = canon;
+            SUCCESS
+        }
+        Ok((_, Node::File(_))) => NOTDIR,
+        Err(errno) => errno,
+    }
+}
+
+fn proc_getcwd(proc: &Process, cap: usize) -> Result<String, u16> {
+    if cap == 0 {
+        return Err(INVAL);
+    }
+    let Some(cwd) = rebase_under_root(&proc.cwd, &proc.root) else {
+        return Err(NOENT);
+    };
+    if cap < cwd.len() + 1 {
+        return Err(RANGE);
+    }
+    Ok(cwd)
+}
+
+fn filetype(proc: &Process, fd: u32) -> Option<u8> {
+    if fd == OS_FD_ROOT || fd == OS_FD_CWD {
+        return Some(3);
+    }
+    match proc.fds.get(&fd) {
+        Some(Fd::Dir { .. }) => Some(3),
+        Some(Fd::File { .. }) => Some(4),
+        Some(_) => Some(2),
+        None => None,
     }
 }
 
@@ -686,12 +956,60 @@ fn write_filestat(pid: u32, out: u32, filetype: u8, size: u64) {
     write_bytes(pid, out, &stat);
 }
 
+fn split_qualified_syscall(name: &str) -> (&str, &str) {
+    if let Some((module, bare)) = name.split_once("::") {
+        return (module, bare);
+    }
+    if let Some((module, bare)) = name.split_once('.') {
+        return (module, bare);
+    }
+    ("wasix_32v1", name)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GUEST_MEM: std::cell::RefCell<BTreeMap<u32, Vec<u8>>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
 fn mem_read(pid: u32, ptr: u32, len: u32) -> Vec<u8> {
-    guest_read(pid, ptr, len).to_vec()
+    #[cfg(test)]
+    {
+        TEST_GUEST_MEM.with(|mem| {
+            let map = mem.borrow();
+            let Some(buf) = map.get(&pid) else {
+                return vec![0; len as usize];
+            };
+            let start = (ptr as usize).min(buf.len());
+            let end = (start + len as usize).min(buf.len());
+            let mut out = vec![0; len as usize];
+            out[..end - start].copy_from_slice(&buf[start..end]);
+            out
+        })
+    }
+    #[cfg(not(test))]
+    {
+        guest_read(pid, ptr, len).to_vec()
+    }
 }
 
 fn write_bytes(pid: u32, ptr: u32, data: &[u8]) {
-    guest_write(pid, ptr, data);
+    #[cfg(test)]
+    {
+        TEST_GUEST_MEM.with(|mem| {
+            let mut map = mem.borrow_mut();
+            let buf = map.entry(pid).or_insert_with(|| vec![0; 65536]);
+            let end = ptr as usize + data.len();
+            if buf.len() < end {
+                buf.resize(end, 0);
+            }
+            buf[ptr as usize..end].copy_from_slice(data);
+        });
+    }
+    #[cfg(not(test))]
+    {
+        guest_write(pid, ptr, data);
+    }
 }
 
 fn read_u32(pid: u32, ptr: u32) -> u32 {
@@ -712,4 +1030,145 @@ fn write_u32(pid: u32, ptr: u32, value: u32) {
 
 fn write_u64(pid: u32, ptr: u32, value: u64) {
     write_bytes(pid, ptr, &value.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_runtime() -> Runtime {
+        let mut rt = Runtime::new();
+        rt.add_file("/dash", b"elf");
+        rt.add_file("/etc/profile", b"# profile\n");
+        rt.add_file("/jail/bin/sh", b"#!/bin/sh\n");
+        rt.add_file("/jail/etc/motd", b"jailed\n");
+        rt.register(1, 0, "[\"dash\"]", "[]", "/");
+        rt
+    }
+
+    #[test]
+    fn resolves_os_fd_root_and_cwd_with_uncollapsed_dotdot() {
+        let mut rt = test_runtime();
+        let files = rt.files.clone();
+        let proc = rt.procs.get_mut(&1).expect("proc 1");
+
+        assert_eq!(proc_chdir(&files, proc, "jail/bin"), SUCCESS);
+        assert_eq!(proc_getcwd(proc, 64), Ok("/jail/bin".to_string()));
+        assert_eq!(proc_getcwd(proc, 0), Err(INVAL));
+        assert_eq!(proc_getcwd(proc, 4), Err(RANGE));
+
+        let (canon, node) =
+            resolve_at(&files, proc, OS_FD_CWD, "../etc/motd").expect("relative ..");
+        assert_eq!(canon, "/jail/etc/motd");
+        assert_eq!(node, Node::File(b"jailed\n".to_vec()));
+
+        let (root_canon, root_node) =
+            resolve_at(&files, proc, OS_FD_ROOT, "etc/profile").expect("root anchor");
+        assert_eq!(root_canon, "/etc/profile");
+        assert_eq!(root_node, Node::File(b"# profile\n".to_vec()));
+    }
+
+    #[test]
+    fn chroot_clamps_dotdot_and_rebases_getcwd() {
+        let mut rt = test_runtime();
+        let files = rt.files.clone();
+        let proc = rt.procs.get_mut(&1).expect("proc 1");
+
+        // chroot without chdir leaves cwd outside root -> getcwd returns ENOENT.
+        assert_eq!(proc_chroot(&files, proc, "/jail"), SUCCESS);
+        assert_eq!(proc_getcwd(proc, 64), Err(NOENT));
+
+        // chdir("/") enters the new root; `..` cannot escape `/jail`.
+        assert_eq!(proc_chdir(&files, proc, "/"), SUCCESS);
+        assert_eq!(proc_getcwd(proc, 64), Ok("/".to_string()));
+        assert_eq!(proc_chdir(&files, proc, "../../.."), SUCCESS);
+        assert_eq!(proc_getcwd(proc, 64), Ok("/".to_string()));
+        assert_eq!(resolve_at(&files, proc, OS_FD_ROOT, "dash"), Err(NOENT));
+
+        assert_eq!(proc_chdir(&files, proc, "/bin"), SUCCESS);
+        assert_eq!(proc_getcwd(proc, 64), Ok("/bin".to_string()));
+    }
+
+    #[test]
+    fn fchdir_switches_to_opened_directory_fd() {
+        let mut rt = test_runtime();
+        let files = rt.files.clone();
+        let proc = rt.procs.get_mut(&1).expect("proc 1");
+
+        let dir_fd = proc_open(&files, proc, OS_FD_ROOT, "jail/etc").expect("open dir");
+        let file_fd = proc_open(&files, proc, OS_FD_ROOT, "dash").expect("open file");
+        assert_eq!(proc_fchdir(proc, file_fd), NOTDIR);
+        assert_eq!(proc_fchdir(proc, 999), BADF);
+        assert_eq!(proc_fchdir(proc, dir_fd), SUCCESS);
+        assert_eq!(proc_getcwd(proc, 64), Ok("/jail/etc".to_string()));
+    }
+
+    #[test]
+    fn os_getcwd_returns_len_plus_one_and_negative_wasi_errno_while_wasix_uses_len_ptr() {
+        TEST_GUEST_MEM.with(|mem| mem.borrow_mut().insert(1, vec![0xaa; 4096]));
+        let mut rt = test_runtime();
+
+        // Write "jail/bin" at ptr 256 and chdir via `os::chdir`.
+        write_bytes(1, 256, b"jail/bin");
+        let chdir_reply: serde_json::Value =
+            serde_json::from_str(&rt.syscall_module(1, "os", "chdir", &[256, 8])).unwrap();
+        assert_eq!(chdir_reply["errno"], 0);
+
+        // `os::getcwd` with cap == 0 -> -EINVAL (-28).
+        let zero_cap: serde_json::Value =
+            serde_json::from_str(&rt.syscall_module(1, "os", "getcwd", &[512, 0])).unwrap();
+        assert_eq!(zero_cap["errno"], -i32::from(INVAL));
+
+        // `os::getcwd` with cap too small (4 < "/jail/bin\0".len() == 10) -> -ERANGE (-68),
+        // and guest buffer at 512 remains untouched (`0xaa`).
+        let small_cap: serde_json::Value =
+            serde_json::from_str(&rt.syscall(1, "os::getcwd", &[512, 4])).unwrap();
+        assert_eq!(small_cap["errno"], -i32::from(RANGE));
+        assert_eq!(mem_read(1, 512, 4), vec![0xaa; 4]);
+
+        // `os::getcwd` with sufficient capacity -> returns `len + 1` (10) and writes NUL-terminated path.
+        let ok_reply: serde_json::Value =
+            serde_json::from_str(&rt.syscall_module(1, "os", "getcwd", &[512, 64])).unwrap();
+        assert_eq!(ok_reply["errno"], 10);
+        assert_eq!(mem_read(1, 512, 10), b"/jail/bin\0");
+
+        // `wasix_32v1::getcwd` uses `(buf_ptr, len_ptr) -> 0 / +ERANGE (68)`.
+        write_u32(1, 1024, 4);
+        let wasix_small: serde_json::Value =
+            serde_json::from_str(&rt.syscall(1, "getcwd", &[1200, 1024])).unwrap();
+        assert_eq!(wasix_small["errno"], i32::from(RANGE));
+        assert_eq!(read_u32(1, 1024), 10);
+
+        write_u32(1, 1024, 64);
+        let wasix_ok: serde_json::Value =
+            serde_json::from_str(&rt.syscall(1, "getcwd", &[1200, 1024])).unwrap();
+        assert_eq!(wasix_ok["errno"], i32::from(SUCCESS));
+        assert_eq!(read_u32(1, 1024), 9);
+        assert_eq!(mem_read(1, 1200, 10), b"/jail/bin\0");
+
+        // `os::chroot` leaving cwd outside root -> `os::getcwd` returns -ENOENT (-44).
+        write_bytes(1, 256, b"/etc");
+        let chroot_reply: serde_json::Value =
+            serde_json::from_str(&rt.syscall_module(1, "os", "chroot", &[256, 4])).unwrap();
+        assert_eq!(chroot_reply["errno"], 0);
+        let unreachable: serde_json::Value =
+            serde_json::from_str(&rt.syscall_module(1, "os", "getcwd", &[512, 64])).unwrap();
+        assert_eq!(unreachable["errno"], -i32::from(NOENT));
+    }
+
+    #[test]
+    fn resolve_at_accepts_all_slash_root_path_inside_and_outside_chroot() {
+        let mut rt = test_runtime();
+        let files = rt.files.clone();
+        let proc = rt.procs.get_mut(&1).expect("proc 1");
+        assert_eq!(
+            resolve_at(&files, proc, OS_FD_ROOT, "/"),
+            Ok(("/".to_string(), Node::Dir))
+        );
+        assert_eq!(proc_chroot(&files, proc, "/jail"), SUCCESS);
+        assert_eq!(
+            resolve_at(&files, proc, OS_FD_ROOT, "/"),
+            Ok(("/jail".to_string(), Node::Dir))
+        );
+    }
 }

@@ -100,6 +100,24 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
         | Call::Pread { .. }
         | Call::Pwrite { .. }
         | Call::Statfs { .. }
+        | Call::Fstatfs { .. }
+        | Call::Mount { .. }
+        | Call::Umount2 { .. }
+        | Call::Chdir { .. }
+        | Call::Fchdir { .. }
+        | Call::Getcwd
+        | Call::Chroot { .. }
+        | Call::Unshare { .. }
+        | Call::Setns { .. }
+        | Call::OpenAt { .. }
+        | Call::FstatAt { .. }
+        | Call::MkdirAt { .. }
+        | Call::UnlinkAt { .. }
+        | Call::RenameAt { .. }
+        | Call::LinkAt { .. }
+        | Call::SymlinkAt { .. }
+        | Call::ReadlinkAt { .. }
+        | Call::UtimensAt { .. }
         | Call::InotifyAddWatch { .. }
         | Call::InotifyRmWatch { .. }
         | Call::Ioctl { .. }

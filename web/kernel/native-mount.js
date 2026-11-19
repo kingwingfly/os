@@ -348,12 +348,18 @@ export class NativeMount {
     return { dir: parent.handle, name };
   }
 
-  async open(grant, path, flags = 0) {
+  async open(grant, path, flags = 0, _mode = 0o666, _umask = 0o077, exec = false) {
     this.check(grant);
     const isPath = Boolean(flags & 0o10000000);
     const acc = flags & 3;
     if (!isPath && acc === 3) {
       throw bad('EINVAL', 'invalid access mode');
+    }
+    if (exec) {
+      if (isPath || acc !== 0 || (flags & (0o100 | 0o1000 | 0o200000)) !== 0) {
+        throw bad('EINVAL', 'invalid exec open flags');
+      }
+      if (!grant.execute) throw bad('EACCES');
     }
     if (!isPath && grant.readOnly && (acc !== 0 || (flags & (0o100 | 0o1000)) !== 0)) {
       throw bad('EROFS');
@@ -371,14 +377,14 @@ export class NativeMount {
           path: true,
         }
       : {
-          read: acc === 0 || acc === 2,
+          read: !exec && (acc === 0 || acc === 2),
           write: acc === 1 || acc === 2,
           append: Boolean(flags & 0o2000),
           append_implies_write: false,
           truncate: Boolean(flags & 0o1000),
           create: Boolean(flags & 0o100),
           create_new: Boolean((flags & 0o100) && (flags & 0o200)),
-          exec: false,
+          exec: Boolean(exec),
           path: false,
         };
     let openRef;

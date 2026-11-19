@@ -627,7 +627,9 @@ impl Copier {
             results.next();
             match (clone, closed) {
                 (Ok(_), Ok(_)) => copied[index] = true,
-                (Err(error), Ok(_)) if error.errno == Errno::EOPNOTSUPP => read.push(index),
+                (Err(error), Ok(_)) if matches!(error.errno, Errno::EOPNOTSUPP | Errno::EXDEV) => {
+                    read.push(index);
+                }
                 (Err(error), _) => {
                     io.fail(format!(
                         "cp: failed to clone {} from {}: {error}",

@@ -140,7 +140,7 @@ impl TerminalCommand for Asking {
                 && let Some(stage) = super::process(&shell, &args[1..]).or_else(|| {
                     program
                         .filter(|name| os_core::bin::UTILITIES.contains(&name.as_str()))
-                        .map(|name| (Some(name.clone()), args[1..].to_vec()))
+                        .map(|_| (None, args[1..].to_vec()))
                 })
             {
                 if !shell.authenticated().await? {

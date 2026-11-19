@@ -302,7 +302,7 @@ test('terminal and filesystem calls preserve descriptor references and failures 
   expect(result.slice(5).every(item => Object.hasOwn(item, 'ok'))).toBe(true);
 });
 
-test('without isolation the UI explains unavailable terminal input and keeps sequential pipelines working', async ({ page }) => {
+test('without isolation the UI shows the execution notice and refuses command execution', async ({ page }) => {
   await page.route('**/', async route => {
     const response = await route.fetch(); const headers = { ...response.headers() };
     delete headers['cross-origin-opener-policy']; delete headers['cross-origin-embedder-policy'];
@@ -310,11 +310,11 @@ test('without isolation the UI explains unavailable terminal input and keeps seq
   });
   await page.goto('/');
   expect(await page.evaluate(() => crossOriginIsolated)).toBe(false);
+  await expect(page.locator('.execution-notice')).toContainText('isolated browser page');
   await run(page, 'tty');
-  await expect(last(page)).toHaveText('not a tty');
-  await expect(page.locator('.transcript')).toContainText('Interactive terminal input is unavailable');
+  await expect(page.locator('.transcript')).toContainText('Command execution needs an isolated browser page');
   await run(page, 'coreutils seq 3 | coreutils tail -n 1');
-  await expect(last(page)).toHaveText('3');
+  await expect(last(page)).toContainText('Command execution needs an isolated browser page');
 });
 
 

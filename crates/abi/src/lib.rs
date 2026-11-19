@@ -18,6 +18,8 @@ pub mod local_helper;
 pub mod remote_fs;
 pub mod system;
 
+pub use contract::{fs_magic, mount_flags, statfs_flags, umount_flags, unshare_flags};
+
 /// Why a call failed, as Linux's errno says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[allow(clippy::upper_case_acronyms)]
@@ -538,6 +540,10 @@ pub const O_DIRECTORY: u32 = 0o200000;
 pub const O_NOFOLLOW: u32 = 0o400000;
 /// A metadata/path handle. This runtime currently supports directory O_PATH handles.
 pub const O_PATH: u32 = 0o10000000;
+/// Positive kernel path-anchor pseudo-descriptors resolved against the calling process's
+/// `FsContext.root` and `FsContext.cwd` without colliding with guest descriptors `[0, 1024)`.
+pub const OS_FD_ROOT: i32 = 0x7fff_fffd;
+pub const OS_FD_CWD: i32 = 0x7fff_fffe;
 /// ioctl(2)'s FICLONE, as Linux numbers it: the file the descriptor writes takes the content of
 /// the one `arg` reads, shared, nothing copied (what `cp` does).
 pub const FICLONE: u32 = 0x4004_9409;
@@ -670,18 +676,101 @@ pub enum Time {
 }
 
 /// What statfs(2) tells of the file system a path is on.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatFs {
+    /// Linux f_type magic number (`abi::fs_magic::*`).
+    #[serde(default)]
+    pub f_type: u64,
     /// Its block size, and how many blocks it has, has free, and has free to anyone.
     pub bsize: u64,
+    #[serde(default)]
+    pub frsize: u64,
     pub blocks: u64,
     pub bfree: u64,
     pub bavail: u64,
     /// How many inodes it has, and has free.
     pub files: u64,
     pub ffree: u64,
+    /// Stable 53-bit device identifier derived from `FsId::dev()`.
+    #[serde(default)]
+    pub fsid: u64,
     /// The longest name it takes.
     pub namelen: u64,
+    /// Effective `ST_*` flags combining mount flags and driver capability ceiling.
+    #[serde(default)]
+    pub flags: u64,
+    /// Canonical contract §5 fstype string (`"cloud"`, `"tmpfs"`, `"image"`, ...).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fstype: String,
+}
+
+/// Binary statfs(2) / fstatfs(2) layout written across the guest/host Wasm boundary
+/// (10 x u64 = 80 bytes, 8-byte aligned).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawStatFs {
+    pub f_type: u64,
+    pub f_bsize: u64,
+    pub f_frsize: u64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_namelen: u64,
+    pub f_flags: u64,
+}
+
+impl StatFs {
+    pub fn to_raw(&self) -> RawStatFs {
+        RawStatFs {
+            f_type: self.f_type,
+            f_bsize: self.bsize,
+            f_frsize: if self.frsize == 0 {
+                self.bsize
+            } else {
+                self.frsize
+            },
+            f_blocks: self.blocks,
+            f_bfree: self.bfree,
+            f_bavail: self.bavail,
+            f_files: self.files,
+            f_ffree: self.ffree,
+            f_namelen: self.namelen,
+            f_flags: self.flags,
+        }
+    }
+}
+
+impl From<&StatFs> for RawStatFs {
+    fn from(stat: &StatFs) -> Self {
+        stat.to_raw()
+    }
+}
+
+impl From<StatFs> for RawStatFs {
+    fn from(stat: StatFs) -> Self {
+        stat.to_raw()
+    }
+}
+
+impl From<RawStatFs> for StatFs {
+    fn from(raw: RawStatFs) -> Self {
+        Self {
+            f_type: raw.f_type,
+            bsize: raw.f_bsize,
+            frsize: raw.f_frsize,
+            blocks: raw.f_blocks,
+            bfree: raw.f_bfree,
+            bavail: raw.f_bavail,
+            files: raw.f_files,
+            ffree: raw.f_ffree,
+            fsid: 0,
+            namelen: raw.f_namelen,
+            flags: raw.f_flags,
+            fstype: String::new(),
+        }
+    }
 }
 
 /// The descriptor a call works on: its number, or `{"ref": i}`, the one call `i` of the same
@@ -944,6 +1033,122 @@ pub enum Call {
     Statfs {
         path: String,
     },
+    /// fstatfs(2): the file system the open descriptor `fd` is on.
+    Fstatfs {
+        fd: FdRef,
+    },
+    /// mount(2): attach, bind, move or remount a file system in the caller's mount namespace.
+    Mount {
+        #[serde(default)]
+        source: String,
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fstype: Option<String>,
+        #[serde(default)]
+        flags: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
+    },
+    /// umount2(2): unmount or lazily detach a mount in the caller's mount namespace.
+    Umount2 {
+        target: String,
+        #[serde(default)]
+        flags: u32,
+    },
+    /// chdir(2): set the calling process's working directory handle.
+    Chdir {
+        path: String,
+    },
+    /// fchdir(2): set the calling process's working directory from an open directory descriptor.
+    Fchdir {
+        fd: FdRef,
+    },
+    /// getcwd(2): reconstruct the calling process's working directory path within its root.
+    Getcwd,
+    /// chroot(2): set the calling process's root directory handle without changing cwd or fds.
+    Chroot {
+        path: String,
+    },
+    /// unshare(2): unshare mount namespace, filesystem context or descriptor table.
+    Unshare {
+        #[serde(default)]
+        flags: u32,
+    },
+    /// setns(2): join the mount namespace referenced by a `/proc/<pid>/ns/mnt` descriptor.
+    Setns {
+        fd: FdRef,
+        #[serde(default)]
+        nstype: u32,
+    },
+    /// openat(2) relative to a retained directory descriptor `dirfd`.
+    OpenAt {
+        dirfd: FdRef,
+        path: String,
+        #[serde(default)]
+        flags: u32,
+        #[serde(default = "creation_mode")]
+        mode: u16,
+    },
+    /// fstatat(2) relative to `dirfd` (`nofollow` = `AT_SYMLINK_NOFOLLOW`).
+    FstatAt {
+        dirfd: FdRef,
+        path: String,
+        #[serde(default)]
+        nofollow: bool,
+    },
+    /// mkdirat(2) relative to `dirfd`.
+    MkdirAt {
+        dirfd: FdRef,
+        path: String,
+        mode: u16,
+    },
+    /// unlinkat(2) relative to `dirfd` (`rmdir` = `AT_REMOVEDIR`).
+    UnlinkAt {
+        dirfd: FdRef,
+        path: String,
+        #[serde(default)]
+        rmdir: bool,
+    },
+    /// renameat2(2) relative to `from_dirfd` and `to_dirfd`.
+    RenameAt {
+        from_dirfd: FdRef,
+        from: String,
+        to_dirfd: FdRef,
+        to: String,
+        #[serde(default)]
+        noreplace: bool,
+    },
+    /// linkat(2) relative to `from_dirfd` and `to_dirfd` (`follow` = `AT_SYMLINK_FOLLOW`).
+    LinkAt {
+        from_dirfd: FdRef,
+        from: String,
+        to_dirfd: FdRef,
+        to: String,
+        #[serde(default)]
+        follow: bool,
+    },
+    /// symlinkat(2) relative to `dirfd`.
+    SymlinkAt {
+        target: String,
+        dirfd: FdRef,
+        path: String,
+    },
+    /// readlinkat(2) relative to `dirfd`.
+    ReadlinkAt {
+        dirfd: FdRef,
+        path: String,
+    },
+    /// utimensat(2) relative to `dirfd`.
+    UtimensAt {
+        dirfd: FdRef,
+        path: String,
+        #[serde(default)]
+        atime: Time,
+        #[serde(default)]
+        mtime: Time,
+        #[serde(default)]
+        nofollow: bool,
+    },
     Getxattr {
         path: String,
         name: String,
@@ -980,6 +1185,7 @@ pub enum Call {
     /// file, must be the one it has (ESTALE otherwise), as an editor's save needs.
     Open {
         path: String,
+        #[serde(default)]
         flags: u32,
         #[serde(default = "creation_mode")]
         mode: u16,
@@ -1018,12 +1224,14 @@ pub enum Call {
         path: Option<String>,
         #[serde(default)]
         offset: u64,
+        #[serde(default)]
         count: u64,
     },
     /// pwrite(2) of chunk `index` of the file `fd` writes, with its bytes: at most
     /// `INLINE_MAX`, so a small file whole, or the short end of a large one.
     Pwrite {
         fd: FdRef,
+        #[serde(default)]
         index: u64,
         data: Bytes,
     },
@@ -1121,6 +1329,8 @@ pub enum Call {
         path: String,
         #[serde(default = "modify")]
         mask: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handle: Option<fs::Handle>,
     },
     /// inotify_rm_watch(2).
     InotifyRmWatch {
@@ -1641,5 +1851,193 @@ mod tests {
         assert!(matches!(exec, Call::Execve { ref cwd, .. } if cwd == "/"));
         let list: Call = serde_json::from_str(r#"{"cgroup_list":{}}"#).unwrap();
         assert_eq!(list, Call::CgroupList { path: "/".into() });
+    }
+
+    #[test]
+    fn raw_statfs_has_80_byte_repr_c_layout_and_statfs_preserves_defaults() {
+        assert_eq!(std::mem::size_of::<RawStatFs>(), 80);
+        assert_eq!(std::mem::align_of::<RawStatFs>(), 8);
+        assert_eq!(std::mem::offset_of!(RawStatFs, f_type), 0);
+        assert_eq!(std::mem::offset_of!(RawStatFs, f_bsize), 8);
+        assert_eq!(std::mem::offset_of!(RawStatFs, f_frsize), 16);
+        assert_eq!(std::mem::offset_of!(RawStatFs, f_blocks), 24);
+        assert_eq!(std::mem::offset_of!(RawStatFs, f_bfree), 32);
+        assert_eq!(std::mem::offset_of!(RawStatFs, f_bavail), 40);
+        assert_eq!(std::mem::offset_of!(RawStatFs, f_files), 48);
+        assert_eq!(std::mem::offset_of!(RawStatFs, f_ffree), 56);
+        assert_eq!(std::mem::offset_of!(RawStatFs, f_namelen), 64);
+        assert_eq!(std::mem::offset_of!(RawStatFs, f_flags), 72);
+
+        const {
+            assert!(OS_FD_ROOT >= 1024 && OS_FD_CWD >= 1024 && OS_FD_ROOT != OS_FD_CWD);
+        }
+        assert_eq!(OS_FD_ROOT, 0x7fff_fffd);
+        assert_eq!(OS_FD_CWD, 0x7fff_fffe);
+
+        // Legacy 7-field StatFs payloads still deserialize cleanly with zeroed L2 metadata.
+        let legacy: StatFs = serde_json::from_str(
+            r#"{"bsize":4096,"blocks":100,"bfree":80,"bavail":80,"files":50,"ffree":40,"namelen":255}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.f_type, 0);
+        assert_eq!(legacy.frsize, 0);
+        assert_eq!(legacy.fsid, 0);
+        assert_eq!(legacy.flags, 0);
+        assert_eq!(legacy.fstype, "");
+        assert_eq!(legacy.to_raw().f_frsize, 4096);
+
+        let full = StatFs {
+            f_type: fs_magic::TMPFS_MAGIC,
+            bsize: 4096,
+            frsize: 4096,
+            blocks: 1024,
+            bfree: 512,
+            bavail: 512,
+            files: 2048,
+            ffree: 1000,
+            fsid: 42,
+            namelen: 255,
+            flags: statfs_flags::ST_RDONLY | statfs_flags::ST_NOSUID | statfs_flags::ST_NODEV,
+            fstype: "tmpfs".into(),
+        };
+        let encoded = serde_json::to_string(&full).unwrap();
+        assert_eq!(serde_json::from_str::<StatFs>(&encoded).unwrap(), full);
+        let raw = RawStatFs::from(&full);
+        assert_eq!(raw.f_type, fs_magic::TMPFS_MAGIC);
+        assert_eq!(raw.f_flags, full.flags);
+        assert_eq!(StatFs::from(raw).f_type, fs_magic::TMPFS_MAGIC);
+    }
+
+    #[test]
+    fn l2_vfs_and_at_calls_round_trip_and_stay_out_of_registry() {
+        let handle = fs::Handle {
+            fs: fs::FsId("cloud".into()),
+            node: fs::NodeId {
+                ino: 9,
+                generation: 1,
+            },
+            proof: "sig".into(),
+        };
+        let calls = vec![
+            Call::Mount {
+                source: "tmpfs".into(),
+                target: "/mnt/work".into(),
+                fstype: Some("tmpfs".into()),
+                flags: mount_flags::MS_NOSUID | mount_flags::MS_NODEV,
+                data: Some("mode=0755".into()),
+            },
+            Call::Mount {
+                source: "/a".into(),
+                target: "/b".into(),
+                fstype: None,
+                flags: mount_flags::MS_BIND,
+                data: None,
+            },
+            Call::Umount2 {
+                target: "/mnt/work".into(),
+                flags: umount_flags::MNT_DETACH,
+            },
+            Call::Chdir {
+                path: "relative/sub".into(),
+            },
+            Call::Fchdir { fd: 5.into() },
+            Call::Getcwd,
+            Call::Chroot {
+                path: "/jail".into(),
+            },
+            Call::Unshare {
+                flags: unshare_flags::CLONE_NEWNS,
+            },
+            Call::Setns {
+                fd: 6.into(),
+                nstype: unshare_flags::CLONE_NEWNS,
+            },
+            Call::Fstatfs { fd: 7.into() },
+            Call::OpenAt {
+                dirfd: 3.into(),
+                path: "file.txt".into(),
+                flags: O_CREAT | O_RDWR,
+                mode: 0o640,
+            },
+            Call::FstatAt {
+                dirfd: 3.into(),
+                path: "link".into(),
+                nofollow: true,
+            },
+            Call::MkdirAt {
+                dirfd: 3.into(),
+                path: "sub".into(),
+                mode: 0o755,
+            },
+            Call::UnlinkAt {
+                dirfd: 3.into(),
+                path: "sub".into(),
+                rmdir: true,
+            },
+            Call::RenameAt {
+                from_dirfd: 3.into(),
+                from: "old".into(),
+                to_dirfd: 4.into(),
+                to: "new".into(),
+                noreplace: true,
+            },
+            Call::LinkAt {
+                from_dirfd: 3.into(),
+                from: "src".into(),
+                to_dirfd: 4.into(),
+                to: "dst".into(),
+                follow: true,
+            },
+            Call::SymlinkAt {
+                target: "../src".into(),
+                dirfd: 4.into(),
+                path: "sym".into(),
+            },
+            Call::ReadlinkAt {
+                dirfd: 4.into(),
+                path: "sym".into(),
+            },
+            Call::UtimensAt {
+                dirfd: 3.into(),
+                path: "file.txt".into(),
+                atime: Time::Omit,
+                mtime: Time::At { sec: 12, nsec: 34 },
+                nofollow: true,
+            },
+            Call::InotifyAddWatch {
+                path: "/watched".into(),
+                mask: IN_MODIFY,
+                handle: Some(handle),
+            },
+        ];
+
+        for call in &calls {
+            assert!(!call.is_registry(), "{call:?} must not be a registry call");
+            let json = serde_json::to_string(call).unwrap();
+            let decoded: Call = serde_json::from_str(&json).unwrap();
+            assert_eq!(&decoded, call);
+        }
+
+        // Minimal JSON forms apply expected defaults (`mode = 0o666`, `nofollow = false`, etc.).
+        let open_at: Call = serde_json::from_str(r#"{"open_at":{"dirfd":3,"path":"x"}}"#).unwrap();
+        assert_eq!(
+            open_at,
+            Call::OpenAt {
+                dirfd: 3.into(),
+                path: "x".into(),
+                flags: 0,
+                mode: 0o666,
+            }
+        );
+        let watch: Call = serde_json::from_str(r#"{"inotify_add_watch":{"path":"/d"}}"#).unwrap();
+        assert_eq!(
+            watch,
+            Call::InotifyAddWatch {
+                path: "/d".into(),
+                mask: IN_MODIFY,
+                handle: None,
+            }
+        );
+        assert!(!serde_json::to_string(&watch).unwrap().contains("handle"));
     }
 }

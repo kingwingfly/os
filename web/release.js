@@ -52,7 +52,7 @@ export function verifyRelease() {
   return checking ??= (async () => {
     const get = async path => { const response = await fetch(path, { cache: 'no-store' }); if (!response.ok) throw new Error('The release is unavailable. Open recovery.'); return response; };
     const entries = await (await get('/boot/entries')).json();
-    if (entries.format !== 'os.boot' || entries.version !== 1 || entries.protocol !== 1 || entries.schema !== 9) throw new Error('The authority is incompatible with this release.');
+    if (entries.format !== 'os.boot' || entries.version !== 1 || entries.protocol !== 1 || entries.schema !== 10) throw new Error('The authority is incompatible with this release.');
     const bytes = new Uint8Array(await (await get(`/boot/releases/${releaseId}/manifest.json`)).arrayBuffer());
     if (hex(await crypto.subtle.digest('SHA-256', bytes)) !== releaseId) throw new Error('Release digest mismatch.');
     const signature = await (await get(`/boot/releases/${releaseId}/signature.json`)).json();
@@ -65,6 +65,6 @@ export function verifyRelease() {
     const message = new Uint8Array(domain.length + bytes.length); message.set(domain); message.set(bytes, domain.length);
     if (!await crypto.subtle.verify('Ed25519', key, unhex(signature.signature), message)) throw new Error('Invalid release signature.');
     const release = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-    if (release.format !== 'os.release' || release.version !== 1 || release.protocol.min > 1 || release.protocol.max < 1 || release.schema.min > 9 || release.schema.max < 9) throw new Error('Incompatible release metadata.');
+    if (release.format !== 'os.release' || release.version !== 1 || release.protocol.min > 1 || release.protocol.max < 1 || release.schema.min > 10 || release.schema.max < 10) throw new Error('Incompatible release metadata.');
   })();
 }

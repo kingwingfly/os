@@ -43,15 +43,62 @@ pub async fn handle(
         ));
     }
     let guest = auth::guest_key(req);
+    let header_token = req
+        .headers()
+        .get("X-Process-Token")?
+        .filter(|t| !t.is_empty());
+    let batch_token = batch.process.clone().filter(|t| !t.is_empty());
+    if let (Some(a), Some(b)) = (&header_token, &batch_token)
+        && a != b
+    {
+        return Ok(Reply::ok(json!(Results {
+            results: vec![
+                Return::Err(Error::because(Errno::EPERM, "not this process's token"));
+                batch.calls.len()
+            ],
+        })));
+    }
+    let token = batch_token.or(header_token);
+    let no_usr_fallback = req
+        .headers()
+        .get("X-OS-No-Usr-Fallback")?
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let chroot = req
+        .headers()
+        .get("X-OS-Chroot")?
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let fs_session = req.headers().get("X-Fs-Session")?.filter(|s| !s.is_empty());
+    let fs_secret = req.headers().get("X-Fs-Secret")?.filter(|s| !s.is_empty());
     // As whom each call is made: the page's session, or the process the batch names.
+    let page_target = match req
+        .headers()
+        .get("X-Fs-Target")?
+        .map(|v| serde_json::from_str(&v))
+        .transpose()
+    {
+        Ok(target) => target,
+        Err(_) => return Ok(Reply::error("Invalid filesystem target", 400)),
+    };
     let session = Rc::new(Session {
+        page_target,
+        fd_epoch: req.headers().get("X-Fd-Epoch")?.or_else(|| {
+            req.url()
+                .ok()?
+                .query_pairs()
+                .find(|(key, _)| key == "fd_epoch")
+                .map(|(_, value)| value.into_owned())
+        }),
         key: key.clone(),
         guest: guest.clone(),
         sudo: batch.sudo,
         umask: batch.umask.map(|mask| mask & 0o777),
         pid: batch.pid,
-        token: batch.process.clone(),
+        token,
         release: req.headers().get("X-OS-Release")?,
+        no_usr_fallback,
+        chroot,
+        fs_session,
+        fs_secret,
     });
     // The session was heard from: its descriptors are kept (a process's, its line's), and a
     // page's keeps those of the processes its tabs run, whatever account they run as.
@@ -300,6 +347,8 @@ fn resolve(call: &mut Call, results: &[Return]) -> std::result::Result<(), Error
 
 /// The process a batch runs as, before a transaction finds its account.
 pub struct Session {
+    page_target: Option<os_vfs::cloud_http::PageTarget>,
+    fd_epoch: Option<String>,
     pub key: Option<String>,
     pub guest: Option<String>,
     pub sudo: bool,
@@ -307,6 +356,10 @@ pub struct Session {
     pub pid: Option<u32>,
     pub token: Option<String>,
     pub release: Option<String>,
+    pub no_usr_fallback: bool,
+    pub chroot: bool,
+    pub fs_session: Option<String>,
+    pub fs_secret: Option<String>,
 }
 
 /// As whom a call acts, once a transaction found it: its process (credentials and umask), the
@@ -327,6 +380,10 @@ impl Session {
     /// The browser's process namespace.
     pub fn namespace(&self) -> String {
         Db::namespace(self.key.as_deref(), self.guest.as_deref())
+    }
+    /// Optional authenticated `/api/fs` v2 session `(id, secret)` attached via HTTP headers.
+    pub fn fs_auth(&self) -> Option<(&str, &str)> {
+        Some((self.fs_session.as_deref()?, self.fs_secret.as_deref()?))
     }
     /// As whom its calls act, as the store `db` knows it: a process token runs as the
     /// process's snapshot, never as the page signed in later; a page's batch as the session's
@@ -371,6 +428,9 @@ impl Session {
             self.guest.as_deref(),
             credential.as_ref(),
         );
+        if let Some(epoch) = &self.fd_epoch {
+            crate::fds::check_epoch(sid.as_deref(), epoch)?;
+        }
         Ok(Acting {
             process,
             sid,
@@ -456,11 +516,20 @@ async fn bytes(
             // A file of /proc that tells of processes is read again with its machine's list.
             let mut procs: Option<Rc<Vec<crate::procs::Row>>> = None;
             let read = loop {
-                let (asking, path, listed) = (session.clone(), path.clone(), procs.clone());
+                let (asking, path_arg, listed) = (session.clone(), path.clone(), procs.clone());
                 let read = transact(state, move |db| {
                     let read = asking.of(db).and_then(|acting| {
                         if acting.credential.as_ref().and_then(|c| c.job()).is_some() {
                             return Err(Errno::EPERM.into());
+                        }
+                        if let Some(credential) = &acting.credential {
+                            let probe = Call::Pread {
+                                fd,
+                                path: path_arg.clone(),
+                                offset,
+                                count,
+                            };
+                            authorize_process_v1(db, acting.sid.as_deref(), credential, &probe)?;
                         }
                         crate::fds::pread(
                             db,
@@ -468,7 +537,7 @@ async fn bytes(
                             listed.as_deref().map(Vec::as_slice),
                             &acting.process,
                             fd.map(FdRef::number),
-                            path.as_deref(),
+                            path_arg.as_deref(),
                             offset,
                             count,
                             acting.owner().as_deref(),
@@ -537,10 +606,19 @@ async fn bytes(
             if length > INLINE_MAX {
                 return Err(too_many());
             }
+            let fd_ref = fd;
             let fd = fd.number();
             let asking = session.clone();
             let target = transact(state, move |db| {
                 let target = asking.of(db).and_then(|acting| {
+                    if let Some(credential) = &acting.credential {
+                        let probe = Call::Pwrite {
+                            fd: fd_ref,
+                            index,
+                            data: Vec::new().into(),
+                        };
+                        authorize_process_v1(db, acting.sid.as_deref(), credential, &probe)?;
+                    }
                     let sid = acting.sid.as_deref().ok_or(Errno::EBADF)?;
                     crate::fds::pwrite(
                         db,
@@ -733,6 +811,146 @@ fn owner(
     }
 }
 
+fn canonical_subpath(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || (path.starts_with(&format!("{prefix}/"))
+            && !path.contains('\0')
+            && !path[prefix.len() + 1..]
+                .split('/')
+                .any(|seg| seg.is_empty() || seg == "." || seg == ".."))
+}
+
+fn allowed_proc_path(path: &str) -> bool {
+    canonical_subpath(path, "/proc")
+        && path != "/proc/self/fd"
+        && !path.starts_with("/proc/self/fd/")
+        && path != "/proc/self/fdinfo"
+        && !path.starts_with("/proc/self/fdinfo/")
+}
+
+fn allowed_dev_path_pure(path: &str, persisted_is_device: Option<bool>) -> bool {
+    canonical_subpath(path, "/dev")
+        && !matches!(path, "/dev" | "/dev/pts" | "/dev/present" | "/dev/snd")
+        && matches!(os_core::parent(path), "/dev" | "/dev/present" | "/dev/snd")
+        && persisted_is_device.unwrap_or(true)
+}
+
+fn allowed_dev_open_with(
+    path: &str,
+    flags: u32,
+    mut is_device: impl FnMut(&str) -> Option<bool>,
+) -> bool {
+    flags & abi::O_CREAT == 0 && allowed_dev_path_pure(path, is_device(path))
+}
+
+/// Ordinary OS process tokens (`credential.job().is_none()`) resolve all filesystem paths via
+/// the client kernel's VFS and `/api/fs` v2 handles; direct v1 `/api/sys` filesystem path calls
+/// are refused at the server boundary so a chrooted or namespaced process cannot escape.
+fn authorize_process_v1_with(
+    credential: &Credential,
+    call: &Call,
+    mut is_device: impl FnMut(&str) -> Option<bool>,
+    mut fd_info: impl FnMut(u32) -> Option<(bool, String)>,
+) -> std::result::Result<(), Error> {
+    if credential.job().is_some() {
+        return Ok(());
+    }
+    match call {
+        call if call.is_registry() => Ok(()),
+        Call::Getcreds
+        | Call::Useradd { .. }
+        | Call::Usermod { .. }
+        | Call::Userdel { .. }
+        | Call::Groupadd { .. }
+        | Call::Groupmod { .. }
+        | Call::Groupdel { .. }
+        | Call::Kill { .. }
+        | Call::Wait { .. } => Ok(()),
+        Call::InotifyAddWatch {
+            handle: Some(_), ..
+        }
+        | Call::InotifyRmWatch { .. } => Ok(()),
+        Call::Close { .. } | Call::Ioctl { .. } => Ok(()),
+        Call::Open { path, flags, .. } if allowed_dev_open_with(path, *flags, &mut is_device) => {
+            Ok(())
+        }
+        Call::Open { path, flags, .. }
+            if allowed_proc_path(path)
+                && flags & abi::O_ACCMODE == abi::O_RDONLY
+                && flags & (abi::O_CREAT | abi::O_TRUNC) == 0 =>
+        {
+            Ok(())
+        }
+        Call::Open {
+            path,
+            flags,
+            size: None,
+            sha256: None,
+            version: None,
+            ..
+        } if canonical_subpath(path, "/usr")
+            && (*flags & abi::O_PATH) != 0
+            && (*flags & !(abi::O_PATH | abi::O_DIRECTORY | abi::O_NOFOLLOW)) == 0 =>
+        {
+            Ok(())
+        }
+        Call::Mknod {
+            path,
+            rdev: Some(_),
+            ..
+        } if canonical_subpath(path, "/dev")
+            && matches!(os_core::parent(path), "/dev/present" | "/dev/snd") =>
+        {
+            Ok(())
+        }
+        Call::Stat { path } | Call::Lstat { path }
+            if allowed_dev_path_pure(path, is_device(path)) =>
+        {
+            Ok(())
+        }
+        Call::Stat { path }
+        | Call::Lstat { path }
+        | Call::Getdents { path, .. }
+        | Call::Access { path, .. }
+        | Call::Readlink { path }
+            if allowed_proc_path(path) =>
+        {
+            Ok(())
+        }
+        Call::Pread {
+            fd: None,
+            path: Some(path),
+            ..
+        } if allowed_proc_path(path) => Ok(()),
+        Call::Pread {
+            fd: Some(fd),
+            path: None,
+            ..
+        } if fd_info(fd.number()).is_none_or(|(is_dev, p)| is_dev || allowed_proc_path(&p)) => {
+            Ok(())
+        }
+        Call::Pwrite { fd, .. } if fd_info(fd.number()).is_none_or(|(is_dev, _)| is_dev) => Ok(()),
+        _ => Err(Errno::EPERM.into()),
+    }
+}
+
+fn authorize_process_v1(
+    db: &Db,
+    sid: Option<&str>,
+    credential: &Credential,
+    call: &Call,
+) -> std::result::Result<(), Error> {
+    authorize_process_v1_with(
+        credential,
+        call,
+        |path| db.persisted_node(path).map(|n| n.is_device()),
+        |fd_num| {
+            sid.and_then(|s| db.fd(s, fd_num))
+                .map(|f| (f.device.is_some(), f.path))
+        },
+    )
+}
+
 /// The call `call`, as `acting` found it: a process's own snapshot, or the session's account
 /// (signed in or not, under sudo if it asked). `procs` are the browser's processes, as its
 /// machine listed them, for a call on /proc.
@@ -747,6 +965,7 @@ fn run(
     let (process, sid, caller) = (&acting.process, acting.sid.as_deref(), &acting.credential);
     if let Some(credential) = caller {
         crate::executor::authorize(db, credential, &call)?;
+        authorize_process_v1(db, sid, credential, &call)?;
     }
     // A process acts as itself: it cannot sign the browser in or out, or mint sudo.
     if caller.is_some() && matches!(call, Call::Logout) {
@@ -754,6 +973,43 @@ fn run(
             Errno::EPERM,
             "a process cannot change its browser's session",
         ));
+    }
+    // Compare inside the same authority transaction as the open, before it creates or truncates.
+    if let Some(expected) = session.page_target {
+        use os_vfs::cloud_http::PageTarget;
+        let path = match &call {
+            Call::Open { path, .. }
+            | Call::Lstat { path }
+            | Call::Unlink { path }
+            | Call::Chmod { path, .. }
+            | Call::Access { path, .. } => path,
+            _ => return Err(Errno::EINVAL.into()),
+        };
+        let name = kernel::namei(db, &process.cred, path, false)?;
+        if name.path != *path
+            || !match expected {
+                PageTarget::Inode(ino) => name
+                    .node
+                    .as_ref()
+                    .is_some_and(|n| n.ino == ino && n.link.is_none()),
+                PageTarget::MissingIn(ino) => {
+                    name.node.is_none()
+                        && db.node(os_core::parent(path)).is_some_and(|n| n.ino == ino)
+                }
+            }
+        {
+            return Err(Errno::ESTALE.into());
+        }
+        if matches!(call, Call::Lstat { .. }) {
+            let mut value = json!(kernel::stat(db, &process.cred, path, false)?);
+            value["version"] = json!(
+                name.node
+                    .and_then(|n| n.file)
+                    .as_deref()
+                    .map(crate::db::etag)
+            );
+            return Ok(value);
+        }
     }
     // /proc/self/fd/N names what the descriptor has open; /proc is procfs's.
     let mut call = call;
@@ -791,8 +1047,29 @@ fn run(
             }
             Ok(json!(statfs(db)))
         }
-        Call::InotifyAddWatch { path, mask } => {
+        Call::InotifyAddWatch { path, mask, handle } => {
             let sid = sid.ok_or(Errno::EBADF)?;
+            if let Some(handle) = handle {
+                let node = crate::cloudfs::verify_handle(
+                    db,
+                    &session.namespace(),
+                    caller.as_ref(),
+                    session.fs_auth(),
+                    &handle,
+                )?;
+                if !node.directory {
+                    return Err(Error::because(
+                        Errno::ENOTDIR,
+                        "only a directory's changes are told",
+                    ));
+                }
+                os_core::inode::require(&process.cred, &node, READ | EXEC)?;
+                let real = db.name_of(node.ino).ok_or(Errno::ESTALE)?;
+                return db
+                    .add_watch(sid, &real, mask)
+                    .map(|wd| json!(wd))
+                    .ok_or_else(|| Errno::ENOSPC.into());
+            }
             let stat = kernel::stat(db, &process.cred, &path, true)?;
             if !stat.is_dir() {
                 return Err(Error::because(
@@ -844,7 +1121,47 @@ fn run(
         | Call::Discard { .. }
         | Call::Fchmod { .. }
         | Call::Ioctl { .. }) => {
-            crate::fds::call(db, sid, process, acting.owner().as_deref(), call)
+            let chmod_fd = match &call {
+                Call::Fchmod { fd, .. } if session.fd_epoch.is_some() => Some(fd.number()),
+                _ => None,
+            };
+            let opened_path = match &call {
+                Call::Open { path, .. } if session.page_target.is_some() => Some(path.clone()),
+                _ => None,
+            };
+            let mut value = crate::fds::call_in_namespace(
+                db,
+                sid,
+                &session.namespace(),
+                process,
+                acting.owner().as_deref(),
+                caller.as_ref(),
+                session.fs_auth(),
+                call,
+            )?;
+            if let Some(fd) = chmod_fd {
+                let ino = db
+                    .fd(sid.ok_or(Errno::EBADF)?, fd)
+                    .and_then(|f| f.ino)
+                    .ok_or(Errno::EBADF)?;
+                return Ok(json!(kernel::stat_of(
+                    db,
+                    &db.inode(ino).ok_or(Errno::ESTALE)?
+                )));
+            }
+            if let Some(path) = opened_path {
+                let stat = kernel::stat(db, &process.cred, &path, false)?;
+                if let (Some(sid), Some(fd)) = (sid, value["fd"].as_u64())
+                    && let Some(desc) = db.fd(sid, fd as u32)
+                    && desc.writes()
+                    && let Some(file) = desc.file
+                {
+                    db.bind_upload_target(&file, stat.ino);
+                }
+                value["stat"] = json!(stat);
+                value["fd_epoch"] = json!(os_image::digest(sid.ok_or(Errno::EBADF)?.as_bytes()));
+            }
+            Ok(value)
         }
         call => kernel::call(db, process, call),
     }
@@ -930,6 +1247,7 @@ fn statfs(db: &Db) -> abi::StatFs {
         files: inodes + FREE,
         ffree: FREE,
         namelen: abi::NAME_MAX as u64,
+        ..abi::StatFs::default()
     }
 }
 
@@ -986,30 +1304,45 @@ pub fn generated(db: &Db, path: &str) -> Option<String> {
 }
 
 /// Make /etc and the files the kernel writes in it, root's, where they are not; /proc, where
-/// procfs answers; and the rest of Arch's / that is the store's.
+/// procfs answers; and all root mountpoints and merged-/usr symlinks so CloudFs v2 sees them.
 pub fn ensure(db: &mut Db) {
-    if db.node("/etc").is_none() {
-        db.set_node("/etc", &Node::directory(0, 0, 0o755));
-    }
-    if db.node("/proc").is_none() {
-        db.set_node("/proc", &Node::directory(0, 0, 0o555));
-    }
-    // The rest of Arch's /, the store's: /tmp shared and sticky, as /guest is.
     for (path, mode) in [
+        ("/", 0o755),
+        ("/usr", 0o755),
+        ("/sys", 0o555),
+        ("/proc", 0o555),
+        ("/dev", 0o755),
+        ("/dev/pts", 0o755),
+        ("/dev/present", 0o755),
+        ("/dev/snd", 0o755),
+        ("/etc", 0o755),
         ("/boot", 0o755),
         ("/mnt", 0o755),
+        ("/mnt/local", 0o755),
+        ("/mnt/shared", 0o755),
         ("/opt", 0o755),
+        ("/opt/private", 0o755),
         ("/run", 0o755),
         ("/srv", 0o755),
         ("/tmp", 0o1777),
         ("/var", 0o755),
     ] {
-        if db.node(path).is_none() {
+        if db.persisted_node(path).is_none() {
             db.set_node(path, &Node::directory(0, 0, mode));
         }
     }
+    for (path, target) in [
+        ("/bin", "usr/bin"),
+        ("/sbin", "usr/bin"),
+        ("/lib", "usr/lib"),
+        ("/lib64", "usr/lib"),
+    ] {
+        if db.persisted_node(path).is_none() {
+            db.set_node(path, &Node::symlink(0, 0, target));
+        }
+    }
     for path in ["/etc/passwd", "/etc/group"] {
-        if db.node(path).is_none() {
+        if db.persisted_node(path).is_none() {
             let file = kernel::Fs::empty(db, 0, path);
             db.set_node(path, &Node::file(0, 0, 0o644, file, 0));
         }
@@ -1312,4 +1645,164 @@ fn account(
             };
             Error::because(errno, why)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proc_credential() -> Credential {
+        serde_json::from_value(json!({
+            "token": "tok-hash",
+            "ns": "user:1001",
+            "pid": 42,
+            "uid": 1001,
+            "gid": 1001,
+            "groups": "[1001]",
+            "umask": 0o022,
+            "generation": null,
+            "cloud_access": 1,
+            "owner": "user:1001 42 tok-hash"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn authorize_process_v1_permits_dev_stat_and_lstat_while_blocking_escapes() {
+        let cred = proc_credential();
+        let is_dev = |path: &str| match path {
+            "/dev/present/deck" | "/dev/snd/mic" | "/dev/archive" | "/dev/media"
+            | "/dev/system" => Some(true),
+            "/dev/not_a_device" => Some(false),
+            _ => None,
+        };
+
+        for path in [
+            "/dev/present/deck",
+            "/dev/present/missing",
+            "/dev/snd/mic",
+            "/dev/archive",
+            "/dev/media",
+            "/dev/system",
+        ] {
+            assert!(
+                authorize_process_v1_with(
+                    &cred,
+                    &Call::Lstat {
+                        path: path.to_string(),
+                    },
+                    is_dev,
+                    |_| None,
+                )
+                .is_ok(),
+                "expected Lstat Ok for {path}"
+            );
+            assert!(
+                authorize_process_v1_with(
+                    &cred,
+                    &Call::Stat {
+                        path: path.to_string(),
+                    },
+                    is_dev,
+                    |_| None,
+                )
+                .is_ok(),
+                "expected Stat Ok for {path}"
+            );
+        }
+
+        for denied in [
+            "/dev",
+            "/dev/present",
+            "/dev/snd",
+            "/dev/pts",
+            "/dev/pts/0",
+            "/dev/../etc/passwd",
+            "/dev/present/../pts/0",
+            "/dev/not_a_device",
+            "/etc/passwd",
+            "/proc/self/fd/0",
+        ] {
+            assert_eq!(
+                authorize_process_v1_with(
+                    &cred,
+                    &Call::Lstat {
+                        path: denied.to_string(),
+                    },
+                    is_dev,
+                    |_| None,
+                )
+                .unwrap_err()
+                .errno,
+                Errno::EPERM,
+                "expected EPERM for {denied}"
+            );
+        }
+
+        // Session::fs_auth requires both non-empty X-Fs-Session and X-Fs-Secret.
+        let mut s = Session {
+            key: None,
+            guest: None,
+            sudo: false,
+            umask: None,
+            pid: Some(42),
+            token: Some("tok".into()),
+            release: None,
+            no_usr_fallback: false,
+            chroot: false,
+            fs_session: Some("fs-sid".into()),
+            fs_secret: None,
+            page_target: None,
+            fd_epoch: None,
+        };
+        assert_eq!(s.fs_auth(), None);
+        s.fs_secret = Some("fs-sec".into());
+        assert_eq!(s.fs_auth(), Some(("fs-sid", "fs-sec")));
+
+        // `/usr` `O_PATH` opens are permitted for accelerator directory handles, while
+        // non-`O_PATH`, mutating, or non-canonical `/usr` opens are rejected with `EPERM`.
+        assert!(
+            authorize_process_v1_with(
+                &cred,
+                &Call::Open {
+                    path: "/usr/bin".to_string(),
+                    flags: abi::O_PATH | abi::O_DIRECTORY,
+                    mode: 0,
+                    size: None,
+                    sha256: None,
+                    version: None,
+                },
+                is_dev,
+                |_| None,
+            )
+            .is_ok()
+        );
+        for (bad_path, bad_flags, bad_size) in [
+            ("/usr/bin/utilities", abi::O_RDONLY, None),
+            ("/usr/bin", abi::O_PATH | abi::O_WRONLY, None),
+            ("/usr/bin", abi::O_PATH | abi::O_CREAT, None),
+            ("/usr/../etc", abi::O_PATH | abi::O_DIRECTORY, None),
+            ("/usr/bin", abi::O_PATH | abi::O_DIRECTORY, Some(4)),
+        ] {
+            assert_eq!(
+                authorize_process_v1_with(
+                    &cred,
+                    &Call::Open {
+                        path: bad_path.to_string(),
+                        flags: bad_flags,
+                        mode: 0,
+                        size: bad_size,
+                        sha256: None,
+                        version: None,
+                    },
+                    is_dev,
+                    |_| None,
+                )
+                .unwrap_err()
+                .errno,
+                Errno::EPERM,
+                "expected EPERM for {bad_path} flags={bad_flags:#o}"
+            );
+        }
+    }
 }

@@ -113,15 +113,63 @@ impl FdTable {
             .filter(|(_, slot)| slot.is_some())
             .map(|(fd, _)| fd as Fd)
     }
-    /// close(2): if this was the last reference to its description, the driver's open
-    /// reference is released before this returns, and its error, if any, is close's.
-    pub async fn close(&mut self, fd: Fd) -> Result<()> {
+    /// Synchronously remove `fd` from the table and return its [`FileRef`] so callers sharing
+    /// [`crate::SharedFdTable`] via `CLONE_FILES` never hold a `RefMut` across `close().await`.
+    pub fn take(&mut self, fd: Fd) -> Result<FileRef> {
         let slot = self
             .slots
             .get_mut(fd as usize)
             .and_then(Option::take)
             .ok_or(Errno::EBADF)?;
-        slot.file.close().await
+        Ok(slot.file)
+    }
+    /// Synchronously perform the table mutation of `dup2`/`dup3`, returning any displaced
+    /// [`FileRef`] to close outside a `RefCell` borrow.
+    pub fn replace_dup(
+        &mut self,
+        old: Fd,
+        new: Fd,
+        cloexec: bool,
+        is_dup3: bool,
+    ) -> Result<Option<FileRef>> {
+        self.slot(old)?;
+        if old == new {
+            return if is_dup3 {
+                Err(Errno::EINVAL)
+            } else {
+                Ok(None)
+            };
+        }
+        if new as usize >= FD_MAX {
+            return Err(Errno::EBADF);
+        }
+        let file = self.get(old)?;
+        Ok(self.place(new as usize, Slot { file, cloexec }))
+    }
+    /// Synchronously remove all `FD_CLOEXEC` descriptors for `execve(2)`.
+    pub fn take_cloexec(&mut self) -> Vec<FileRef> {
+        let mut out = Vec::new();
+        for slot in &mut self.slots {
+            if slot.as_ref().is_some_and(|s| s.cloexec)
+                && let Some(taken) = slot.take()
+            {
+                out.push(taken.file);
+            }
+        }
+        out
+    }
+    /// Synchronously remove all open descriptors for `exit(2)`.
+    pub fn take_all(&mut self) -> Vec<FileRef> {
+        self.slots
+            .iter_mut()
+            .filter_map(|s| s.take().map(|slot| slot.file))
+            .collect()
+    }
+    /// close(2): if this was the last reference to its description, the driver's open
+    /// reference is released before this returns, and its error, if any, is close's.
+    pub async fn close(&mut self, fd: Fd) -> Result<()> {
+        let file = self.take(fd)?;
+        file.close().await
     }
     /// execve(2)'s do_close_on_exec: the close-on-exec descriptors are closed, their errors
     /// unreported.

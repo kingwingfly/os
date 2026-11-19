@@ -111,6 +111,9 @@ const WRITING: &[&str] = &[
     "faststart",
     "imagectl",
     "providerctl",
+    "mount",
+    "umount",
+    "chroot",
 ];
 
 /// The utility of coreutils named `name`.
@@ -158,6 +161,10 @@ pub const UTILITIES: &[&str] = &[
     "faststart",
     "imagectl",
     "providerctl",
+    "mount",
+    "umount",
+    "findmnt",
+    "chroot",
 ];
 
 /// The installed multicall image that owns a program; UI actions have no executable image.
@@ -193,5 +200,17 @@ mod tests {
         assert_eq!(built, super::PROGRAMS);
         assert_eq!(super::program("cut"), Some("cut"));
         assert_eq!(super::program("zip"), None);
+    }
+
+    #[test]
+    fn mount_and_chroot_utilities_are_registered_and_classified() {
+        for util in ["mount", "umount", "findmnt", "chroot"] {
+            assert!(super::UTILITIES.contains(&util), "missing {util}");
+            assert_eq!(super::image(util), Some("utilities"));
+        }
+        assert!(super::writes("mount"));
+        assert!(super::writes("umount"));
+        assert!(super::writes("chroot"));
+        assert!(!super::writes("findmnt"));
     }
 }

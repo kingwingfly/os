@@ -2,7 +2,24 @@ import { kernelCall } from './kernel/protocol.js';
 import { shareMount, attachShared, sharedMounts, revokeMount } from './mount-sharing-ui.js';
 
 let manager;
-const kinds = { directory: 'Host folder · browser', 'native-directory': 'Host folder · helper', 'browser-storage': 'Browser storage', snapshot: 'File image', 'private-extension': 'Private extension' };
+const kinds = {
+  directory: 'Host folder · browser',
+  'native-directory': 'Host folder · helper',
+  'browser-storage': 'Browser storage',
+  snapshot: 'File image',
+  'private-extension': 'Private extension',
+  shared: 'Shared directory',
+  tmpfs: 'Memory filesystem · tmpfs',
+  image: 'Image filesystem',
+  cloud: 'Cloud filesystem',
+  proc: 'Process filesystem · proc',
+  devtmpfs: 'Device filesystem · devtmpfs',
+  devpts: 'Pseudo-terminals · devpts',
+  opfs: 'Browser storage',
+  hostfs: 'Host folder · browser',
+  helperfs: 'Host folder · helper',
+  sharefs: 'Shared directory',
+};
 const mode = mount => {
   if (!Number.isInteger(mount.mode)) return 'Unavailable';
   const bits = [...'rwxrwxrwx'].map((letter, index) => mount.mode & (1 << (8 - index)) ? letter : '-');
@@ -44,7 +61,7 @@ function createManager(root) {
       <div class="mount-pane-heading"><div><h2>Mount local storage</h2><p>Choose an existing filesystem and where to mount it.</p></div></div>
       <form class="mount-form" data-add-form>
         <div class="mount-fields"><label>Source<select name="kind"><option value="host">Host folder</option><option value="storage">Browser storage</option></select></label>
-          <label>Mount name<input name="name" aria-label="Mount name" aria-describedby="local-mount-path" value="project" required pattern="[a-zA-Z0-9_.-]+" maxlength="80" autocomplete="off"><small id="local-mount-path" data-mount-path>/mnt/local/project</small></label></div>
+          <label>Mount name<input name="name" aria-label="Mount name" aria-describedby="local-mount-path" value="project" required pattern="[a-zA-Z0-9_.\\-]+" maxlength="80" autocomplete="off"><small id="local-mount-path" data-mount-path>/mnt/local/project</small></label></div>
         <div class="mount-source" data-source="host"><p>Use a folder on this computer. Read and write its files in place.</p>
           <div data-helper hidden><p data-browser-limitation></p><p>Use <strong>Chrome or Edge on macOS, Windows or Linux</strong> to mount folders directly.</p>
             <p>To stay in this browser, connect <code>os-local-helper</code> (currently Linux only).</p>
@@ -71,7 +88,7 @@ function createManager(root) {
       <div class="mount-pane-heading"><div><h2>Connect to a shared folder</h2><p>Paste an address from its owner. Mount only the access you need.</p></div></div>
       <form class="mount-form" data-shared-form><div class="mount-fields">
         <label class="mount-field-wide">Export address<input name="address" placeholder="osfs:…" required autocomplete="off" spellcheck="false"></label>
-        <label>Mount name<input name="name" aria-label="Mount name" aria-describedby="shared-mount-path" value="shared" pattern="[a-zA-Z0-9_.-]+" maxlength="80" required><small id="shared-mount-path" data-shared-path>/mnt/shared/shared</small></label>
+        <label>Mount name<input name="name" aria-label="Mount name" aria-describedby="shared-mount-path" value="shared" pattern="[a-zA-Z0-9_.\\-]+" maxlength="80" required><small id="shared-mount-path" data-shared-path>/mnt/shared/shared</small></label>
         <label>Password (if needed)<input type="password" name="password" maxlength="256" autocomplete="off"></label></div>
         <fieldset class="mount-export-mode"><legend>Requested access</legend><label><input type="checkbox" checked disabled>r</label><label><input type="checkbox" name="writable">w</label><label><input type="checkbox" name="execute">x</label></fieldset>
         <div class="mount-actions"><button type="submit" class="primary">Mount</button></div></form>
@@ -89,7 +106,12 @@ function createManager(root) {
     selected = path; const current = mounts.find(mount => mount.path === path), serial = ++revision;
     query('[data-details]').hidden = !current;
     for (const row of query('[data-mounts]').rows) row.classList.toggle('selected', row.dataset.path === path);
-    if (!current) return;
+    if (!current) {
+      query('[data-selected]').textContent = '';
+      query('[data-description]').textContent = '';
+      query('[data-mount-actions]').replaceChildren();
+      return;
+    }
     query('[data-selected]').textContent = current.path;
     query('[data-description]').textContent = `${kinds[current.kind] ?? 'Shared directory'} · ${mode(current)}${current.writable ? '' : ' · read-only mount'}${current.execute ? '' : ' · noexec'}${current.cloud ? ' · cloud access' : ''}`;
     const actions = query('[data-mount-actions]'); actions.replaceChildren();
@@ -238,6 +260,10 @@ function createManager(root) {
     notice.textContent = 'Session changed. Refresh to view its mounts.';
   };
   addEventListener('os:login-changed', reset);
+  addEventListener('os:mounts-changed', () => {
+    if (pane === 'mounted') void action(refresh)();
+    else if (pane === 'publish') void action(refreshSharing)();
+  });
   let login;
   addEventListener('os:login-session', ({ detail }) => {
     if (!detail?.connected) return;

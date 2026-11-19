@@ -230,6 +230,7 @@ impl userland::Sys for HttpSys {
         outgoing.extend(watching.iter().map(|dir| Call::InotifyAddWatch {
             path: dir.clone(),
             mask: IN_MODIFY,
+            handle: None,
         }));
         outgoing.extend(unwatched.iter().map(|wd| Call::InotifyRmWatch { wd: *wd }));
         let signing = sending

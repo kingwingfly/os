@@ -257,7 +257,7 @@ export async function exec(stages, options = {}) {
     ? document.querySelector(`.terminal-panel[data-terminal="${CSS.escape(String(options.terminalId))}"] .transcript`)
     : document.querySelector('.terminal-panel:not([hidden]) .transcript');
   const plain = dimensions(transcript);
-  for (const key of ['terminalId', 'cwd', 'home', 'user', 'environment', 'stdin', 'sudo', 'umask', 'tty', 'enough', 'managedLogin', 'expectedSession']) {
+  for (const key of ['terminalId', 'cwd', 'home', 'user', 'environment', 'stdin', 'sudo', 'umask', 'tty', 'streamOutput', 'enough', 'managedLogin', 'expectedSession']) {
     if (options[key] !== undefined) plain[key] = options[key];
   }
   const observer = new ResizeObserver(() => {

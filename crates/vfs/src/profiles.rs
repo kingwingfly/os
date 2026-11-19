@@ -89,3 +89,54 @@ pub const MEMORY: FsCapabilities = FsCapabilities {
     durability: Durability::Volatile,
     locks: LockScope::Instance,
 };
+
+/// Signed release image (`image` fstype, global digest identity): read-only, content-addressed.
+pub const IMAGE_GLOBAL: FsCapabilities = FsCapabilities {
+    identity: IdentityScope::Global,
+    open_survives_unlink: Support::Refused(Errno::EROFS),
+    open_survives_rename: Support::Refused(Errno::EROFS),
+    hard_links: Support::Refused(Errno::EROFS),
+    symlinks: Support::Refused(Errno::EROFS),
+    exclusive_create: Support::Refused(Errno::EROFS),
+    atomic_rename: Support::Refused(Errno::EROFS),
+    rename_noreplace: Support::Refused(Errno::EROFS),
+    durability: Durability::ServiceCommit,
+    locks: LockScope::Instance,
+};
+
+/// Unsigned/private extension image (`image` fstype, instance-local identity): read-only.
+pub const IMAGE_PRIVATE: FsCapabilities = FsCapabilities {
+    identity: IdentityScope::Instance,
+    ..IMAGE_GLOBAL
+};
+
+/// Instance `/proc` virtual filesystem (`proc` fstype).
+pub const PROC: FsCapabilities = FsCapabilities {
+    identity: IdentityScope::Instance,
+    open_survives_unlink: Support::Refused(Errno::EPERM),
+    open_survives_rename: Support::Refused(Errno::EPERM),
+    hard_links: Support::Refused(Errno::EPERM),
+    symlinks: Support::Refused(Errno::EPERM),
+    exclusive_create: Support::Refused(Errno::EPERM),
+    atomic_rename: Support::Refused(Errno::EPERM),
+    rename_noreplace: Support::Refused(Errno::EPERM),
+    durability: Durability::Volatile,
+    locks: LockScope::Instance,
+};
+
+/// Instance `/dev` filesystem (`devtmpfs` fstype).
+pub const DEVTMPFS: FsCapabilities = MEMORY;
+
+/// Instance `/dev/pts` slave PTY filesystem (`devpts` fstype).
+pub const DEVPTS: FsCapabilities = FsCapabilities {
+    identity: IdentityScope::Instance,
+    open_survives_unlink: Support::Refused(Errno::EPERM),
+    open_survives_rename: Support::Refused(Errno::EPERM),
+    hard_links: Support::Refused(Errno::EPERM),
+    symlinks: Support::Refused(Errno::EPERM),
+    exclusive_create: Support::Refused(Errno::EPERM),
+    atomic_rename: Support::Refused(Errno::EPERM),
+    rename_noreplace: Support::Refused(Errno::EPERM),
+    durability: Durability::Volatile,
+    locks: LockScope::Instance,
+};

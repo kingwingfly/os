@@ -557,12 +557,17 @@ pub async fn pwrite(req: Request, env: &Env) -> Result<Response> {
         },
         None => None,
     };
+    let epoch = req.headers().get("X-Fd-Epoch")?;
+    let epoch_query = epoch
+        .as_ref()
+        .map(|e| format!("&epoch={}", encode(e)))
+        .unwrap_or_default();
     let mut grant = authority(
         env,
         &req,
         Method::Get,
         &format!(
-            "/internal/pwrite?fd={}&index={}&length={length}",
+            "/internal/pwrite?fd={}&index={}&length={length}{epoch_query}",
             encode(&fd),
             encode(&index)
         ),
@@ -603,7 +608,7 @@ pub async fn pwrite(req: Request, env: &Env) -> Result<Response> {
         "/internal/pwrite/commit",
         Some(json!({
             "fd": fd.parse::<u32>().unwrap_or(u32::MAX), "index": index.parse::<u64>().unwrap_or(u64::MAX),
-            "key": key, "sha256": sha256, "length": length,
+            "key": key, "sha256": sha256, "length": length, "epoch": epoch,
         })),
     )
     .await

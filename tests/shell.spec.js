@@ -168,7 +168,7 @@ test('mv and cp follow Linux defaults, ask with -i, share content, and refuse wh
   await page.locator('#command').fill('y'); await page.locator('#command').press('Enter');
   await expect(page.locator('.terminal-panel:not([hidden]) .command-line')).toHaveAttribute('data-state', 'idle');
   expect(await (await request.get(file(base + '/copy/b.md'))).text()).toBe('one\ntwo\nthree\n');
-  for (const [line, message] of [['mv docs docs/inner', 'subdirectory of itself'], ['cp docs docs-flat', '-r not specified'], ['mv . elsewhere', 'Device or resource busy'], ['cp -r copy copy/again', 'into itself'], ['mv /root elsewhere', '/root holds the home of root']]) {
+  for (const [line, message] of [['mv docs docs/inner', 'subdirectory of itself'], ['cp docs docs-flat', '-r not specified'], ['mv . elsewhere', 'Device or resource busy'], ['cp -r copy copy/again', 'into itself'], ['mv /root elsewhere', 'Device or resource busy']]) {
     await run(page, line); await expect(last(page)).toContainText(message);
   }
   // Several sources need a directory; each failure is reported while the others proceed.

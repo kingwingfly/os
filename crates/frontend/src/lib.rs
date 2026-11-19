@@ -482,6 +482,18 @@ fn App() -> impl IntoView {
         .add_event_listener_with_callback("os:changed", listener.as_ref().unchecked_ref())
         .unwrap();
     listener.forget();
+    let mounts_changed =
+        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_: web_sys::CustomEvent| {
+            sys::forget(false);
+            files.refresh();
+        });
+    window
+        .add_event_listener_with_callback(
+            "os:mounts-changed",
+            mounts_changed.as_ref().unchecked_ref(),
+        )
+        .unwrap();
+    mounts_changed.forget();
     // What the kernel told of the directories this page watches: their answers go at once,
     // and, a burst of changes later, tabs showing one list it again.
     let told = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
@@ -646,8 +658,8 @@ fn App() -> impl IntoView {
                                 let (index, shell) = item;
                                 let id = shell.id;
                                 view! {
-                                    <span class="tab" role="tab" aria-selected=move || (active.get() == id).to_string()>
-                                        <button type="button" class="tab-select" title=move || format!("Alt+{} · {}", index + 1, shell.cwd.get()) on:click=move |_| switch(id)>
+                                    <span class="tab">
+                                        <button type="button" class="tab-select" role="tab" aria-selected=move || (active.get() == id).to_string() title=move || format!("Alt+{} · {}", index + 1, shell.cwd.get()) on:click=move |_| switch(id)>
                                             {move || format!("{} {}", index + 1, shell.cwd.get().rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("/"))}
                                         </button>
                                         <Show when=move || { tabs.with(|t| t.len() > 1) }>

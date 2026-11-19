@@ -24,19 +24,39 @@
 
 pub mod cloud;
 pub mod cloud_http;
+pub mod context;
 pub mod descriptions;
+pub mod devfs;
 pub mod fdtable;
 pub mod file;
 pub mod helperfs;
 pub mod hostfs;
+pub mod imagefs;
 pub mod locks;
 pub mod memfs;
+pub mod mount;
+pub mod namespace;
+pub mod procfs;
 pub mod profiles;
+pub mod sharefs;
 pub mod stat;
+pub mod vfs;
+pub mod walk;
 
+pub use context::{FsContext, PathAnchor, SharedFdTable, SharedFsContext};
 pub use fdtable::{FD_MAX, Fd, FdTable};
-pub use file::{File, FileRef, ReleaseQueue};
+pub use file::{File, FileRef, MountNsFile, ReleaseQueue};
+pub use mount::{
+    AtimeMode, FsType, MountAttachment, MountBacking, MountEntry, MountFlags, MountId, MountPin,
+    MountSlot, NamespaceId, ProviderHealth, ProviderState,
+};
+pub use namespace::{MountNamespace, escape_mountinfo, format_mountinfo, format_mounts};
 pub use std::io::SeekFrom;
+pub use vfs::{
+    DefaultFilesystemFactory, FilesystemFactory, MAX_SHEBANG_DEPTH, MountedFs, ProcessCtx,
+    ResolvedExec, Vfs,
+};
+pub use walk::{StartAnchor, WalkFlags, WalkResult};
 
 use abi::Errno;
 pub use abi::Time;
@@ -113,6 +133,16 @@ pub trait Filesystem {
         handle: &'a Handle,
         attr: &'a SetAttr,
     ) -> BoxFuture<'a, Metadata>;
+    /// Descriptor metadata changes may use a provider's open capability directly.
+    fn setattr_open<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        _open: &'a OpenRef,
+        attr: &'a SetAttr,
+    ) -> BoxFuture<'a, Metadata> {
+        self.setattr(cred, handle, attr)
+    }
     fn read_dir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle) -> BoxFuture<'a, Vec<DirEntry>>;
     fn read_link<'a>(&'a self, cred: &'a Cred, link: &'a Handle) -> BoxFuture<'a, String>;
 
@@ -159,6 +189,17 @@ pub trait Filesystem {
         name: &'a str,
     ) -> BoxFuture<'a, Entry>;
     fn unlink<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()>;
+    /// Remove a newly created upload only if the same inode still occupies this name.
+    /// Drivers implement the comparison under their directory mutation lock.
+    fn unlink_if<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+        _node: NodeId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::EOPNOTSUPP) })
+    }
     fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()>;
     #[allow(clippy::too_many_arguments)]
     fn rename<'a>(
@@ -230,6 +271,33 @@ pub trait Filesystem {
     /// fdatasync: the data and what is needed to read it back, at least.
     fn sync_data<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
         self.sync_all(open)
+    }
+    /// Synchronize a file or directory addressed by `handle` (`MS_DIRSYNC` / `MS_SYNCHRONOUS` on
+    /// handle-based operations where the caller holds no [`OpenRef`]).
+    fn sync_handle<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if self.capabilities().durability == abi::contract::Durability::Volatile {
+                return Ok(());
+            }
+            // The mutation was authorized with the acting credential. This internal
+            // description only flushes the inode, including write/search-only directories.
+            let mut options = OpenOptions::new();
+            options.read(true);
+            let open = match self.open(cred, handle, &options).await {
+                Err(Errno::EACCES) => {
+                    let service = Cred {
+                        identity: Identity::root(),
+                        ..cred.clone()
+                    };
+                    self.open(&service, handle, &options).await?
+                }
+                result => result?,
+            };
+            let sync_res = self.sync_all(&open).await;
+            let rel_res = self.release(&open).await;
+            sync_res?;
+            rel_res
+        })
     }
     /// Take an advisory lock for `open`, waiting until it is granted (F_SETLKW, flock without
     /// LOCK_NB). Dropping the future gives up the wait. An fcntl wait that would deadlock fails

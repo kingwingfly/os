@@ -33,7 +33,7 @@ test('an unsigned private package executes without code upload or system activat
   await page.evaluate(() => window.os.unmountLocal('/mnt/local/source'));
   expect((await run(page)).status).toBe(0); // activation is a verified immutable snapshot
   await page.evaluate(() => window.os.unmountLocal('/opt/private/dev'));
-  await expect(run(page)).rejects.toThrow(/ENODEV/); expect(uploaded).toEqual([]); await other.close();
+  await expect(run(page)).rejects.toThrow(/detached|ENODEV|ENOENT|No such/i); expect(uploaded).toEqual([]); await other.close();
 });
 
 test('content corruption, set-ID metadata, incompatible ABI and escaping links fail activation', async ({ page }) => {

@@ -1009,66 +1009,68 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
       expect(reply.err, `expected error for ${type}`).toBeTruthy();
       return reply.err.errno;
     };
+    const ROOT_FD = 0x7ffffffd;
     const ENV = ['PWD=/', 'PATH=/usr/bin', 'LANG=C.UTF-8'];
     const sleepCmd = { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '60'], env: ENV, cwd: '/' };
     await k('init');
     const p1 = await k('exec', sleepCmd);
     const p2 = await k('exec', sleepCmd);
-    const child = await k('fork', { pid: p1.pid });
 
-    // 1. Open creates regular files with shared CloudFs st_dev and delegates /dev/null.
-    expect(await k('cloud_open', { pid: p1.pid, path: '/dev/null', flags: 2 })).toEqual({ fallback: true });
-    const f = await k('cloud_open', { pid: p1.pid, path: `${base}/f.txt`, flags: 0o2 | 0o100 | 0o200, mode: 0o644, umask: 0o022 });
-    const g = await k('cloud_open', { pid: p1.pid, path: `${base}/g.txt`, flags: 0o2 | 0o100 | 0o200, mode: 0o644, umask: 0o022 });
+    // 1. Open creates regular files with shared CloudFs st_dev and opens /dev/null via DevTmpFs.
+    const devNull = await k('proc_openat', { pid: p1.pid, dirfd: ROOT_FD, path: '/dev/null', oflags: 2, mode: 0 });
+    expect(devNull).toMatchObject({ device: 'null', fstype: 'devtmpfs' });
+    await k('kfd_close', { pid: p1.pid, kfd: devNull.kfd });
+    const f = await k('proc_openat', { pid: p1.pid, dirfd: ROOT_FD, path: `${base}/f.txt`, oflags: 0o2 | 0o100 | 0o200, mode: 0o644 });
+    const g = await k('proc_openat', { pid: p1.pid, dirfd: ROOT_FD, path: `${base}/g.txt`, oflags: 0o2 | 0o100 | 0o200, mode: 0o644 });
     expect(f.stat.dev).toBeGreaterThan(0);
     expect(g.stat.dev).toBe(f.stat.dev);
     expect(g.stat.ino).not.toBe(f.stat.ino);
     expect(f.stat.nlink).toBe(1);
 
     // 2. Write, SEEK_END, O_APPEND toggle (F_SETFL/F_GETFL), and fsync/fdatasync.
-    expect(await k('cloud_write', { pid: p1.pid, id: f.id, data: Array.from(Buffer.from('hello')) })).toBe(5);
-    expect(await k('cloud_seek', { pid: p1.pid, id: f.id, offset: '0', whence: 2 })).toBe('5');
-    expect(await k('cloud_append', { pid: p1.pid, id: f.id })).toBe(false);
-    await k('cloud_set_append', { pid: p1.pid, id: f.id, append: true });
-    expect(await k('cloud_append', { pid: p1.pid, id: f.id })).toBe(true);
-    expect(await k('cloud_seek', { pid: p1.pid, id: f.id, offset: '1', whence: 0 })).toBe('1');
-    expect(await k('cloud_write', { pid: p1.pid, id: f.id, data: Array.from(Buffer.from('!')) })).toBe(1);
-    expect(await k('cloud_seek', { pid: p1.pid, id: f.id, offset: '0', whence: 2 })).toBe('6');
-    await k('cloud_sync', { pid: p1.pid, id: f.id, data_only: false });
-    await k('cloud_sync', { pid: p1.pid, id: f.id, data_only: true });
+    expect(await k('kfd_write', { pid: p1.pid, kfd: f.kfd, data: Array.from(Buffer.from('hello')) })).toBe(5);
+    expect(await k('kfd_seek', { pid: p1.pid, kfd: f.kfd, offset: '0', whence: 2 })).toBe('5');
+    expect(await k('kfd_is_append', { pid: p1.pid, kfd: f.kfd })).toBe(false);
+    await k('kfd_set_append', { pid: p1.pid, kfd: f.kfd, append: true });
+    expect(await k('kfd_is_append', { pid: p1.pid, kfd: f.kfd })).toBe(true);
+    expect(await k('kfd_seek', { pid: p1.pid, kfd: f.kfd, offset: '1', whence: 0 })).toBe('1');
+    expect(await k('kfd_write', { pid: p1.pid, kfd: f.kfd, data: Array.from(Buffer.from('!')) })).toBe(1);
+    expect(await k('kfd_seek', { pid: p1.pid, kfd: f.kfd, offset: '0', whence: 2 })).toBe('6');
+    await k('kfd_fsync', { pid: p1.pid, kfd: f.kfd, dataOnly: false });
+    await k('kfd_fsync', { pid: p1.pid, kfd: f.kfd, dataOnly: true });
 
     // 3. Fork inheritance + parent close + unlink while child still holds the open inode.
-    await k('cloud_inherit', { pid: p1.pid, child: child.pid, ids: [f.id] });
-    await k('cloud_close', { pid: p1.pid, id: f.id });
-    expect(await kErr('cloud_fstat', { pid: p1.pid, id: f.id })).toBe('EBADF');
-    expect(await kErr('cloud_fstat', { pid: p2.pid, id: f.id })).toBe('EBADF');
+    const child = await k('fork', { pid: p1.pid });
+    await k('kfd_close', { pid: p1.pid, kfd: f.kfd });
+    expect(await kErr('kfd_fstat', { pid: p1.pid, kfd: f.kfd })).toBe('EBADF');
+    expect(await kErr('kfd_fstat', { pid: p2.pid, kfd: f.kfd })).toBe('EBADF');
     const [unlinked] = await sys(request, [{ unlink: { path: `${base}/f.txt` } }], {}, extra);
     expect(unlinked.ok).toBeNull();
-    const unlinkedStat = await k('cloud_fstat', { pid: child.pid, id: f.id });
+    const unlinkedStat = await k('kfd_fstat', { pid: child.pid, kfd: f.kfd });
     expect(unlinkedStat.dev).toBe(f.stat.dev);
     expect(unlinkedStat.ino).toBe(f.stat.ino);
     expect(unlinkedStat.nlink).toBe(0);
     expect(unlinkedStat.size).toBe(6);
-    const bytes = await k('cloud_read', { pid: child.pid, id: f.id, count: 16, offset: '0' });
+    const bytes = await k('kfd_pread', { pid: child.pid, kfd: f.kfd, len: 16, offset: '0' });
     expect(Buffer.from(bytes).toString()).toBe('hello!');
 
-    // 4. Blocking lock wait + cloud_cancel unblocks concurrently with EINTR.
-    const g2 = await k('cloud_open', { pid: p2.pid, path: `${base}/g.txt`, flags: 0o2 });
-    await k('cloud_lock', { pid: p1.pid, id: g.id, family: 'posix', kind: 'exclusive', start: '0', wait: false });
-    const conflict = await k('cloud_test_lock', { pid: p2.pid, id: g2.id, kind: 'exclusive', start: '0' });
+    // 4. Blocking lock wait + kfd_cancel unblocks concurrently with EINTR.
+    const g2 = await k('proc_openat', { pid: p2.pid, dirfd: ROOT_FD, path: `${base}/g.txt`, oflags: 0o2, mode: 0 });
+    await k('kfd_lock', { pid: p1.pid, kfd: g.kfd, family: 'posix', kind: 'exclusive', start: '0', wait: false });
+    const conflict = await k('kfd_test_lock', { pid: p2.pid, kfd: g2.kfd, kind: 'exclusive', start: '0' });
     expect(conflict).toBeTruthy();
-    const waitLock = kErr('cloud_lock', { pid: p2.pid, id: g2.id, family: 'posix', kind: 'exclusive', start: '0', wait: true });
+    const waitLock = kErr('kfd_lock', { pid: p2.pid, kfd: g2.kfd, family: 'posix', kind: 'exclusive', start: '0', wait: true });
     await page.waitForTimeout(100);
-    await k('cloud_cancel', { pid: p2.pid, id: g2.id });
+    await k('kfd_cancel', { pid: p2.pid, kfd: g2.kfd });
     expect(await waitLock).toBe('EINTR');
-    await k('cloud_unlock', { pid: p1.pid, id: g.id, family: 'posix', start: '0' });
-    await k('cloud_lock', { pid: p2.pid, id: g2.id, family: 'posix', kind: 'exclusive', start: '0', wait: false });
-    await k('cloud_close', { pid: p1.pid, id: g.id });
-    await k('cloud_close', { pid: p2.pid, id: g2.id });
+    await k('kfd_unlock', { pid: p1.pid, kfd: g.kfd, family: 'posix', start: '0' });
+    await k('kfd_lock', { pid: p2.pid, kfd: g2.kfd, family: 'posix', kind: 'exclusive', start: '0', wait: false });
+    await k('kfd_close', { pid: p1.pid, kfd: g.kfd });
+    await k('kfd_close', { pid: p2.pid, kfd: g2.kfd });
 
     // 5. Replacement reexec retains caller access & cloud_renew succeeds; exit releases unlinked file.
     await k('reexec', { pid: child.pid, ...sleepCmd });
-    expect(await k('cloud_write', { pid: child.pid, id: f.id, data: Array.from(Buffer.from('?')) })).toBe(1);
+    expect(await k('kfd_write', { pid: child.pid, kfd: f.kfd, data: Array.from(Buffer.from('?')) })).toBe(1);
     await k('cloud_renew');
     await k('exit', { pid: child.pid, status: 0 });
     await k('exit', { pid: p1.pid, status: 0 });
@@ -1096,29 +1098,35 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
     const pAlice = await k('exec', sleepCmd);
     expect(await call(context.request, { symlink: { target: 'target', path: `${base}/sticky/link` } }, { headers: extra })).toBeNull();
 
-    expect(await kErr('cloud_open', { pid: pGuest.pid, path: `${base}/blocked/../ok`, flags: 0 })).toBe('EACCES');
-    expect(await kErr('cloud_open', { pid: pGuest.pid, path: `${base}/sticky/link`, flags: 0 })).toBe('EACCES');
+    expect(await kErr('proc_openat', { pid: pGuest.pid, dirfd: ROOT_FD, path: `${base}/blocked/../ok`, oflags: 0, mode: 0 })).toBe('EACCES');
+    expect(await kErr('proc_openat', { pid: pGuest.pid, dirfd: ROOT_FD, path: `${base}/sticky/link`, oflags: 0, mode: 0 })).toBe('EACCES');
 
-    const aliceOpen = await k('cloud_open', { pid: pAlice.pid, path: `${base}/sticky/link`, flags: 0 });
-    expect(Buffer.from(await k('cloud_read', { pid: pAlice.pid, id: aliceOpen.id, count: 16, offset: '0' })).toString()).toBe('secret-ok');
-    await k('cloud_close', { pid: pAlice.pid, id: aliceOpen.id });
+    const aliceOpen = await k('proc_openat', { pid: pAlice.pid, dirfd: ROOT_FD, path: `${base}/sticky/link`, oflags: 0, mode: 0 });
+    expect(Buffer.from(await k('kfd_pread', { pid: pAlice.pid, kfd: aliceOpen.kfd, len: 16, offset: '0' })).toString()).toBe('secret-ok');
+    await k('kfd_close', { pid: pAlice.pid, kfd: aliceOpen.kfd });
 
-    const beforeReconnect = await k('cloud_open', { pid: pAlice.pid, path: `${base}/ok`, flags: 0 });
+    const beforeReconnect = await k('proc_openat', { pid: pAlice.pid, dirfd: ROOT_FD, path: `${base}/ok`, oflags: 0, mode: 0 });
     let dropRenew = true;
+    let reconnectConnects = 0;
     const dropOnce = async route => {
-      if (dropRenew && route.request().postData()?.includes('"renew"')) {
+      const post = route.request().postData();
+      if (dropRenew && post?.includes('"renew"')) {
         dropRenew = false;
         await route.fulfill({ status: 410, contentType: 'application/json', body: JSON.stringify({ errno: 'ENOTCONN' }) });
         return;
       }
+      if (!dropRenew && post?.includes('"connect"')) reconnectConnects++;
       await route.continue();
     };
     await context.route('**/api/fs', dropOnce);
     expect(await kErr('cloud_renew')).toBe('ENOTCONN');
+    const afterReconnect = await k('proc_openat', { pid: pAlice.pid, dirfd: ROOT_FD, path: `${base}/ok`, oflags: 0, mode: 0 });
     await context.unroute('**/api/fs', dropOnce);
-    expect(await kErr('cloud_fstat', { pid: pAlice.pid, id: beforeReconnect.id })).toBe('EBADF');
-    const afterReconnect = await k('cloud_open', { pid: pAlice.pid, path: `${base}/ok`, flags: 0 });
-    expect(afterReconnect.id).toBeGreaterThan(beforeReconnect.id);
+    expect(reconnectConnects).toBe(1);
+    expect(afterReconnect.kfd).toBeGreaterThan(beforeReconnect.kfd);
+    expect(Buffer.from(await k('kfd_pread', { pid: pAlice.pid, kfd: afterReconnect.kfd, len: 16, offset: '0' })).toString()).toBe('ok');
+    await k('kfd_close', { pid: pAlice.pid, kfd: beforeReconnect.kfd });
+    await k('kfd_close', { pid: pAlice.pid, kfd: afterReconnect.kfd });
 
     await k('exit', { pid: pAlice.pid, status: 0 });
     await k('exit', { pid: pGuest.pid, status: 0 });

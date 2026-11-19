@@ -19,6 +19,8 @@ mod cloudfs;
 mod helper;
 mod hostfs;
 mod mounts;
+mod share_bridge;
+mod vfs_engine;
 
 use abi::{Batch, Call, Errno, Error, Exec, PROC_POLL_MAX, Return, SIGTERM};
 use serde_json::{Value, json};
@@ -46,27 +48,6 @@ async fn kernel_sys(body: &str) -> Result<JsValue, JsValue> {
 
 /// The kernel's own protocol version, which the page checks at start.
 pub const VERSION: &str = "1";
-
-/// Local validation only. This does not verify an operator signature, activate a
-/// system generation, or confer credentials described by package metadata.
-#[wasm_bindgen]
-pub fn private_extension(manifests: &str) -> Result<String, JsValue> {
-    let validate = || -> image::Result<String> {
-        let texts: Vec<String> = image::parse(manifests.as_bytes())?;
-        let images: Vec<_> = texts
-            .iter()
-            .map(|text| image::Image::parse(text.as_bytes()))
-            .collect::<image::Result<_>>()?;
-        let composition = image::Composition::private(&images)?;
-        let aliases = composition
-            .entries
-            .keys()
-            .map(|path| Ok((path.clone(), composition.resolve(path)?)))
-            .collect::<image::Result<std::collections::BTreeMap<_, _>>>()?;
-        Ok(json!({"entries": composition.entries, "resolved": aliases}).to_string())
-    };
-    validate().map_err(|error| JsValue::from_str(&error.to_string()))
-}
 /// How many pids the kernel asks to be lent at a time, for its forks.
 const LEND: u32 = 8;
 /// Linux's init.
@@ -104,13 +85,21 @@ struct State {
     reported: u64,
 }
 
+fn is_supervisor_image(exec: &Exec) -> bool {
+    exec.asset.is_some()
+        && exec.local.is_none()
+        && exec.path.as_deref() == Some("/usr/bin/supervise")
+}
+
 #[wasm_bindgen]
 pub struct Kernel {
     state: Rc<RefCell<State>>,
     /// The process a cloud call acts for now (cloudfs.rs), read before the driver awaits.
     current: Rc<RefCell<cloudfs::Actor>>,
-    /// The instance's cloud filesystem session and descriptions (cloudfs.rs).
+    /// The instance's cloud filesystem session (cloudfs.rs).
     cloud: cloudfs::Connector,
+    /// Unified `os_vfs::Vfs` mount/namespace/descriptor engine (vfs_engine.rs).
+    vfs_rt: RefCell<vfs_engine::VfsRuntime>,
 }
 
 #[wasm_bindgen]
@@ -121,20 +110,31 @@ impl Kernel {
     /// must not reap the processes of the browser's other tabs. `id` is this kernel's own.
     #[wasm_bindgen(constructor)]
     pub fn new(boot: &str, id: &str) -> Kernel {
+        let current = Rc::default();
+        let state = Rc::new(RefCell::new(State {
+            namespace: String::new(),
+            boot: boot.to_string(),
+            id: id.to_string(),
+            processes: HashMap::new(),
+            spare: HashMap::new(),
+            identities: HashMap::new(),
+            reports: Vec::new(),
+            queued: 0,
+            reported: 0,
+        }));
+        let connector = cloudfs::Connector::default();
+        let root_cloud = Rc::new(cloudfs::RootCloudDriver::new(
+            Rc::clone(&state),
+            Rc::clone(&current),
+            connector.clone(),
+        ));
+        let inst_id = if !id.is_empty() { id } else { boot };
+        let vfs_rt = RefCell::new(vfs_engine::VfsRuntime::new_sync(inst_id, root_cloud));
         Kernel {
-            current: Rc::default(),
-            cloud: cloudfs::Connector::default(),
-            state: Rc::new(RefCell::new(State {
-                namespace: String::new(),
-                boot: boot.to_string(),
-                id: id.to_string(),
-                processes: HashMap::new(),
-                spare: HashMap::new(),
-                identities: HashMap::new(),
-                reports: Vec::new(),
-                queued: 0,
-                reported: 0,
-            })),
+            current,
+            cloud: connector,
+            state,
+            vfs_rt,
         }
     }
 
@@ -154,7 +154,8 @@ impl Kernel {
         let boot = (!boot.is_empty()).then_some(boot);
         let value = self.one(Call::ProcInit { boot }, false).await?;
         let namespace = value["namespace"].as_str().unwrap_or_default().to_string();
-        self.state.borrow_mut().namespace = namespace;
+        self.state.borrow_mut().namespace = namespace.clone();
+        let _ = self.sync_vfs_with_authority(&namespace).await;
         Ok(value.to_string())
     }
 
@@ -255,9 +256,30 @@ impl Kernel {
         host: &str,
     ) -> Result<String, JsValue> {
         let token = self.token(pid, host)?;
+        let local_exec: Option<abi::LocalExecutable> = parse(local, "local executable")?;
+        let runtime_tag = {
+            let rt = self.vfs_rt.borrow();
+            let chrooted = rt.vfs.process_fs_context(pid).ok().is_some_and(|ctx| {
+                let ns_root = rt
+                    .vfs
+                    .process_namespace(pid)
+                    .unwrap_or_else(|_| rt.vfs.system_namespace())
+                    .borrow()
+                    .root_anchor();
+                !ctx.borrow().root.same_anchor(&ns_root)
+            });
+            if chrooted {
+                "resources-v1:chroot"
+            } else if local_exec.is_none() && !path.starts_with("/usr/") {
+                "resources-v1:no-usr-fallback"
+            } else {
+                "resources-v1"
+            }
+        };
+        let cloud_allowed = local_exec.as_ref().is_none_or(|l| l.cloud);
         let call = Call::Execve {
-            local: parse(local, "local executable")?,
-            runtime: Some("resources-v1".into()),
+            local: local_exec,
+            runtime: Some(runtime_tag.into()),
             pid: Some(pid),
             token: Some(token),
             path: path.into(),
@@ -273,6 +295,35 @@ impl Kernel {
             local.token = exec.token.clone();
         }
         self.state.borrow_mut().retain_spare();
+        if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+            meta.supervisor = false;
+        }
+        let setup = async {
+            self.proc_exec_preserve(pid).await?;
+            let identity = self.cloud_identity(pid, &exec.token).await?;
+            self.proc_set_creds(
+                pid,
+                identity.id,
+                identity.group,
+                identity.groups.into_iter().collect(),
+                Some(exec.token.clone()),
+                cloud_allowed,
+            )
+        }
+        .await;
+        if let Err(error) = setup {
+            // The authority has already replaced the image and invalidated its old credential.
+            let _ = self.exit(pid, 126, None, host).await;
+            let error = error
+                .as_string()
+                .and_then(|s| js_sys::JSON::parse(&s).ok())
+                .unwrap_or(error);
+            let _ = js_sys::Reflect::set(&error, &"execCommitted".into(), &JsValue::TRUE);
+            return Err(error);
+        }
+        if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+            meta.supervisor = is_supervisor_image(&exec);
+        }
         to_json(&exec)
     }
 
@@ -350,16 +401,19 @@ impl Kernel {
             }
             None => return Err(fail(Errno::EIO.into())),
         }
-        let mut state = self.state.borrow_mut();
-        state.processes.insert(
-            child,
-            Local {
-                ppid: pid,
-                token: token.clone(),
-                host: host.to_string(),
-                ended: None,
-            },
-        );
+        {
+            let mut state = self.state.borrow_mut();
+            state.processes.insert(
+                child,
+                Local {
+                    ppid: pid,
+                    token: token.clone(),
+                    host: host.to_string(),
+                    ended: None,
+                },
+            );
+        }
+        let _ = self.proc_fork(pid, child, 0);
         to_json(&json!({ "pid": child, "token": token }))
     }
 
@@ -373,6 +427,20 @@ impl Kernel {
         signal: Option<u8>,
         host: &str,
     ) -> Result<String, JsValue> {
+        let can_exit = {
+            let state = self.state.borrow();
+            state
+                .processes
+                .get(&pid)
+                .filter(|local| local.host == host)
+                .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?
+                .ended
+                .is_none()
+        };
+        if !can_exit {
+            return Err(fail(Errno::ESRCH.into()));
+        }
+        self.close_process_server_fds(pid).await;
         let (token, ppid) = {
             let mut state = self.state.borrow_mut();
             let local = state
@@ -644,17 +712,20 @@ impl Kernel {
             false,
         )
         .await?;
-        let mut state = self.state.borrow_mut();
-        state.processes.insert(
-            INIT,
-            Local {
-                ppid: 0,
-                token: token.into(),
-                host: host.into(),
-                ended: None,
-            },
-        );
-        state.identities.insert(token.into(), vfs::Identity::root());
+        {
+            let mut state = self.state.borrow_mut();
+            state.processes.insert(
+                INIT,
+                Local {
+                    ppid: 0,
+                    token: token.into(),
+                    host: host.into(),
+                    ended: None,
+                },
+            );
+            state.identities.insert(token.into(), vfs::Identity::root());
+        }
+        let _ = self.proc_set_creds(INIT, 0, 0, vec![0], Some(token.into()), true);
         Ok(json!({ "pid": INIT, "ppid": 0, "token": token, "asset": "/usr/bin/init.wasm",
             "membership": { "pid": INIT, "ppid": 0, "pgid": INIT, "sid": INIT, "uid": 0, "ctty": 0 }
         }).to_string())
@@ -843,9 +914,10 @@ impl Kernel {
             .iter()
             .map(|stage| {
                 let cgroup = stage["cgroup"].as_str().unwrap_or_default();
+                let rt = stage["runtime"].as_str().unwrap_or("resources-v1");
                 Ok(Call::Execve {
                     local: from_value(stage["local"].clone(), "local executable")?,
-                    runtime: Some("resources-v1".into()),
+                    runtime: Some(rt.to_string()),
                     pid: None,
                     token: None,
                     path: stage["path"].as_str().unwrap_or_default().into(),
@@ -858,24 +930,94 @@ impl Kernel {
             })
             .collect::<std::result::Result<Vec<_>, JsValue>>()?;
         let results = self.send(calls, sudo).await.map_err(fail)?;
-        let mut state = self.state.borrow_mut();
-        Ok(results
+        let admitted: Vec<(std::result::Result<Exec, Error>, Value)> = results
             .into_iter()
-            .map(|result| {
-                let exec: Exec = serde_json::from_value(result.into_result()?)
-                    .map_err(|error| Error::because(Errno::EIO, error.to_string()))?;
-                state.processes.insert(
-                    exec.pid,
-                    Local {
-                        ppid: INIT,
-                        token: exec.token.clone(),
-                        host: host.to_string(),
-                        ended: None,
-                    },
-                );
-                Ok(exec)
+            .zip(stages)
+            .map(|(result, stage)| {
+                let res = result.into_result().and_then(|v| {
+                    serde_json::from_value::<Exec>(v)
+                        .map_err(|error| Error::because(Errno::EIO, error.to_string()))
+                });
+                if let Ok(exec) = &res {
+                    let ppid = stage["parentPid"]
+                        .as_u64()
+                        .map(|p| p as u32)
+                        .unwrap_or(INIT);
+                    self.state.borrow_mut().processes.insert(
+                        exec.pid,
+                        Local {
+                            ppid,
+                            token: exec.token.clone(),
+                            host: host.to_string(),
+                            ended: None,
+                        },
+                    );
+                }
+                (res, stage)
             })
-            .collect())
+            .collect();
+
+        let registered: Result<(), JsValue> = async {
+            for (res, stage) in &admitted {
+                if let Ok(exec) = res {
+                    let cwd = stage["cwd"].as_str().unwrap_or("/");
+                    let sid = stage["sessionId"].as_str();
+                    let cloud_allowed = stage["local"]
+                        .get("cloud")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    if let Some(parent_pid) = stage["parentPid"].as_u64().map(|p| p as u32) {
+                        let identity = self.cloud_identity(exec.pid, &exec.token).await?;
+                        self.proc_fork(parent_pid, exec.pid, 0)?;
+                        self.proc_exec_preserve(exec.pid).await?;
+                        self.proc_set_creds(
+                            exec.pid,
+                            identity.id,
+                            identity.group,
+                            identity.groups.into_iter().collect(),
+                            Some(exec.token.clone()),
+                            cloud_allowed,
+                        )?;
+                        if !cwd.is_empty() {
+                            self.sys_chdir(exec.pid, cwd.to_string()).await?;
+                        }
+                    } else {
+                        let grant_json = stage
+                            .get("serviceGrant")
+                            .filter(|v| !v.is_null())
+                            .map(Value::to_string);
+                        self.register_exec_in_vfs(
+                            exec.pid,
+                            INIT,
+                            &exec.token,
+                            cwd,
+                            sid,
+                            cloud_allowed,
+                            grant_json.as_deref(),
+                        )
+                        .await?;
+                    }
+                    if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&exec.pid) {
+                        meta.supervisor = is_supervisor_image(exec);
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = registered {
+            // The authority already admitted every successful stage, including later entries.
+            for (exec, _) in &admitted {
+                if let Ok(exec) = exec {
+                    let _ = self.exit(exec.pid, 126, None, host).await;
+                    let _ = self.wait(exec.pid, host).await;
+                }
+            }
+            // Failed delivery stays in the normal retryable lifecycle report queue.
+            let _ = self.flush().await;
+            return Err(error);
+        }
+        Ok(admitted.into_iter().map(|(res, _)| res).collect())
     }
 
     /// One call to the machine, its value.

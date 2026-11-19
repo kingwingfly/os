@@ -10,7 +10,7 @@ import { stats } from './loader.js';
 import { validateExpectedSession, checkExpectedSession } from './launch-context.js';
 import { sharingAllowed } from './sharing-policy.js';
 import { currentWorkspace, mountRequest, endWorkspace } from './workspaces.js';
-export { endWorkspace };
+export { endWorkspace, currentWorkspace };
 
 const runs = new Map();
 const consoles = new Consoles();
@@ -98,6 +98,7 @@ export async function request(type, args, send, seatChanged = () => {}) {
     return;
   }
   if (runs.has(args.run)) throw { errno: 'EINVAL', detail: 'duplicate run id' };
+  if (args.options?.serviceGrant != null) throw { errno: 'EPERM' };
   const managed = args.options?.managedLogin;
   const expectedSession = args.options?.expectedSession === undefined ? null : validateExpectedSession(args.options.expectedSession);
   if (managed) {
@@ -140,7 +141,7 @@ export async function request(type, args, send, seatChanged = () => {}) {
   runs.set(args.run, run); run.seatChanged(); reportSeat();
   try {
     return await exec(args.stages, { ...args.options, terminalState,
-      workspace: managed ? null : await currentWorkspace(),
+      workspace: managed ? null : await currentWorkspace().catch(err => (!expectedSession && err?.errno === 'EIO') ? null : Promise.reject(err)),
       beforeStart: async (pid, image) => {
         if (expectedSession) checkExpectedSession(expectedSession, image);
         if (managed) await globalThis.kernelRequest('login_service_attach', { pid, expected: managed });

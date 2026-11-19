@@ -500,7 +500,7 @@ impl Probe {
             );
         }
     }
-    fn hold(&self, cwd: bool) -> bool {
+    fn hold(&self, cwd: bool, self_detach: bool) -> bool {
         let case = if cwd { "unmount-cwd" } else { "unmount-open" };
         let path = self.root.join(case);
         unit(case, "create", "write(file)", write(&path, b"hello"));
@@ -523,16 +523,7 @@ impl Probe {
                 return false;
             }
         }
-        #[cfg(target_os = "wasi")]
-        {
-            // Runner detaches only after observing this barrier, then releases stdin.
-            println!("{}", json!({"barrier":case}));
-            std::io::stdout().flush().unwrap();
-            let mut line = String::new();
-            std::io::stdin().read_line(&mut line).unwrap();
-        }
-        #[cfg(target_os = "linux")]
-        let detached = {
+        let detached = if self_detach {
             let plain = platform::unmount(&self.root);
             let plain_detached = plain.is_ok();
             unit(case, "unmount", "umount(mount)", plain);
@@ -540,9 +531,14 @@ impl Probe {
             let detached = plain_detached || result.is_ok();
             unit(case, "detach", "umount2(mount, MNT_DETACH)", result);
             detached
+        } else {
+            // Runner detaches only after observing this barrier, then releases stdin.
+            println!("{}", json!({"barrier":case}));
+            std::io::stdout().flush().unwrap();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).unwrap();
+            false
         };
-        #[cfg(target_os = "wasi")]
-        let detached = false; // The runner records the actual attachment outcome.
         if let Some(f) = file.as_mut() {
             emit(case, "read", "pread(fd) after detach", read(f));
             emit(case, "fstat", "fstat(fd) after detach", platform::fdstat(f));
@@ -731,88 +727,81 @@ pub fn run() {
         "remount-prepare" => p.remount(true),
         "remount-observe" => p.remount(false),
         "hold-open" => {
-            p.hold(false);
+            p.hold(false, cfg!(target_os = "linux"));
         }
         "hold-cwd" => {
-            p.hold(true);
+            p.hold(true, cfg!(target_os = "linux"));
         }
         "latency" => unit("latency", &args[7], &args[7], p.latency(&args[7])),
         "namespace" => {
-            #[cfg(target_os = "linux")]
-            {
-                for name in ["tree", "root", "alias", "cross"] {
-                    fs::create_dir(p.root.join(name)).unwrap();
-                }
-                let q = Probe {
-                    root: p.root.join("root"),
-                    alias: p.root.join("alias"),
-                    cross: p.root.join("cross"),
-                    uid: p.uid,
-                    gid: p.gid,
-                };
-                platform::mount(&p.root.join("tree"), &q.root, false).unwrap();
-                platform::mount(&p.root.join("tree"), &q.alias, false).unwrap();
-                platform::mount(Path::new("tmpfs"), &q.cross, true).unwrap();
-                write(&q.cross.join("target"), b"target").unwrap();
-                q.basic(true, false);
-                write(&q.root.join("target"), b"target").unwrap();
-                unit(
-                    "cloud-to-provider",
-                    "link",
-                    "symlink(provider/target, cloud/link)",
-                    platform::symlink(&q.root.join("target"), &p.root.join("cloud-link")),
-                );
-                emit(
-                    "cloud-to-provider",
-                    "read",
-                    "read(cloud/link)",
-                    io(fs::read_to_string(p.root.join("cloud-link"))).map(|s| json!(s)),
-                );
-                platform::cd(&p.root).unwrap();
-                q.remount(true);
-                let detached = platform::unmount(&q.root);
-                unit("remount", "detach", "umount(mount)", detached.clone());
-                detached.expect("remount detach failed; refusing to stack a bind mount");
-                let attached = platform::mount(&p.root.join("tree"), &q.root, false);
-                unit(
-                    "remount",
-                    "attach",
-                    "mount(source, mount)",
-                    attached.clone(),
-                );
-                attached.expect("remount re-attach failed");
-                q.remount(false);
-                for cwd in [false, true] {
-                    if q.hold(cwd) {
-                        let case = if cwd { "unmount-cwd" } else { "unmount-open" };
-                        let result = platform::mount(&p.root.join("tree"), &q.root, false);
-                        unit(case, "attach", "mount(source, mount)", result.clone());
-                        result.expect("held-case re-attach failed");
-                    }
-                }
-                unit(
-                    "mount-api",
-                    "mount",
-                    "mount(source, mount)",
-                    platform::mount(&p.root.join("tree"), &q.root, false),
-                );
-                unit(
-                    "umount-api",
-                    "umount",
-                    "umount(mount)",
-                    platform::unmount(&q.root),
-                );
-                unit(
-                    "chroot-api",
-                    "chroot",
-                    "chroot(root)",
-                    platform::chroot(&q.root),
-                );
+            for name in ["tree", "root", "alias", "cross"] {
+                fs::create_dir(p.root.join(name)).unwrap();
             }
-            #[cfg(target_os = "wasi")]
-            for case in ["mount-api", "umount-api", "chroot-api"] {
-                skipped(case, "not implemented: absent from abi::Call");
+            let q = Probe {
+                root: p.root.join("root"),
+                alias: p.root.join("alias"),
+                cross: p.root.join("cross"),
+                uid: p.uid,
+                gid: p.gid,
+            };
+            platform::mount(&p.root.join("tree"), &q.root, false).unwrap();
+            platform::mount(&p.root.join("tree"), &q.alias, false).unwrap();
+            platform::mount(Path::new("tmpfs"), &q.cross, true).unwrap();
+            write(&q.cross.join("target"), b"target").unwrap();
+            q.basic(true, false);
+            write(&q.root.join("target"), b"target").unwrap();
+            unit(
+                "cloud-to-provider",
+                "link",
+                "symlink(provider/target, cloud/link)",
+                platform::symlink(&q.root.join("target"), &p.root.join("cloud-link")),
+            );
+            emit(
+                "cloud-to-provider",
+                "read",
+                "read(cloud/link)",
+                io(fs::read_to_string(p.root.join("cloud-link"))).map(|s| json!(s)),
+            );
+            platform::cd(&p.root).unwrap();
+            q.remount(true);
+            let detached = platform::unmount(&q.root);
+            unit("remount", "detach", "umount(mount)", detached.clone());
+            detached.expect("remount detach failed; refusing to stack a bind mount");
+            let attached = platform::mount(&p.root.join("tree"), &q.root, false);
+            unit(
+                "remount",
+                "attach",
+                "mount(source, mount)",
+                attached.clone(),
+            );
+            attached.expect("remount re-attach failed");
+            q.remount(false);
+            for cwd in [false, true] {
+                if q.hold(cwd, true) {
+                    let case = if cwd { "unmount-cwd" } else { "unmount-open" };
+                    let result = platform::mount(&p.root.join("tree"), &q.root, false);
+                    unit(case, "attach", "mount(source, mount)", result.clone());
+                    result.expect("held-case re-attach failed");
+                }
             }
+            unit(
+                "mount-api",
+                "mount",
+                "mount(source, mount)",
+                platform::mount(&p.root.join("tree"), &q.root, false),
+            );
+            unit(
+                "umount-api",
+                "umount",
+                "umount(mount)",
+                platform::unmount(&q.root),
+            );
+            unit(
+                "chroot-api",
+                "chroot",
+                "chroot(root)",
+                platform::chroot(&q.root),
+            );
         }
         "two-linux" => {
             #[cfg(target_os = "linux")]
@@ -874,9 +863,28 @@ pub fn run() {
             }
         }
         "unsupported" => {
-            for case in ["mount-api", "umount-api", "chroot-api"] {
-                skipped(case, "not implemented: absent from abi::Call");
-            }
+            let src = p.root.join("api-src");
+            let mnt = p.root.join("api-mnt");
+            let _ = fs::create_dir_all(&src);
+            let _ = fs::create_dir_all(&mnt);
+            unit(
+                "mount-api",
+                "mount",
+                "mount(source, mount)",
+                platform::mount(&src, &mnt, false),
+            );
+            unit(
+                "umount-api",
+                "umount",
+                "umount(mount)",
+                platform::unmount(&mnt),
+            );
+            unit(
+                "chroot-api",
+                "chroot",
+                "chroot(root)",
+                platform::chroot(&mnt),
+            );
         }
         "creator" => p.creator(&args[7]),
         _ => {

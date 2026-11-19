@@ -323,6 +323,11 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         // pwrite(2) through a descriptor, as the Worker streams its bytes to R2 (files.rs):
         // where the chunk goes, then that it is there.
         (Method::Get, "/internal/pwrite") => {
+            let epoch = req
+                .url()?
+                .query_pairs()
+                .find(|(k, _)| k == "epoch")
+                .map(|(_, v)| v.into_owned());
             let fd = param("fd").parse::<u32>().unwrap_or(u32::MAX);
             let index = param("index").parse::<u64>().unwrap_or(u64::MAX);
             let length = param("length").parse::<u64>().unwrap_or(0);
@@ -345,6 +350,11 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 );
                 let sid = crate::creds::sid_of(db, key.as_deref(), guest.as_deref(), row.as_ref())
                     .unwrap_or_default();
+                if let Some(epoch) = &epoch
+                    && let Err(error) = crate::fds::check_epoch(Some(&sid), epoch)
+                {
+                    return errno_reply(&error).keep();
+                }
                 let caller = row.map(|row| row.owner());
                 match crate::fds::pwrite(db, &sid, &who, fd, index, length, caller.as_deref()) {
                     Ok(Some((key, mime))) => Reply::ok(json!({"key": key, "mime": mime})),
@@ -361,6 +371,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 key: String,
                 sha256: Option<String>,
                 length: u64,
+                epoch: Option<String>,
             }
             let Ok(chunk) = req.json::<Written>().await else {
                 return Ok(Reply::error("Invalid write", 400));
@@ -384,6 +395,11 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 );
                 let sid = crate::creds::sid_of(db, key.as_deref(), guest.as_deref(), row.as_ref())
                     .unwrap_or_default();
+                if let Some(epoch) = &chunk.epoch
+                    && let Err(error) = crate::fds::check_epoch(Some(&sid), epoch)
+                {
+                    return errno_reply(&error).keep();
+                }
                 let caller = row.map(|row| row.owner());
                 let written = crate::fds::written(
                     db,

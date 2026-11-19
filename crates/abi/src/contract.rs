@@ -254,6 +254,8 @@ pub mod mount_flags {
 
 /// umount2(2) flags, with Linux's values (contract §5).
 pub mod umount_flags {
+    use crate::Errno;
+
     /// Instance root only (EPERM otherwise): fails the provider's outstanding requests with EIO,
     /// then unmounts as without it.
     pub const MNT_FORCE: u32 = 1;
@@ -262,15 +264,68 @@ pub mod umount_flags {
     pub const MNT_EXPIRE: u32 = 4;
     pub const UMOUNT_NOFOLLOW: u32 = 8;
     pub const SUPPORTED: u32 = MNT_FORCE | MNT_DETACH | UMOUNT_NOFOLLOW;
+
+    /// Validate umount2(2) flags, rejecting MNT_EXPIRE and any unknown bit with EINVAL.
+    pub const fn accepted(flags: u32) -> Result<u32, Errno> {
+        if flags & !SUPPORTED == 0 {
+            Ok(flags)
+        } else {
+            Err(Errno::EINVAL)
+        }
+    }
 }
 
 /// unshare(2) and setns(2) flags, with Linux's values (contract §5). CLONE_NEWNS is the only
 /// namespace; CLONE_FS and CLONE_FILES unshare process-local state.
 pub mod unshare_flags {
+    use crate::Errno;
+
     pub const CLONE_FS: u32 = 0x0200;
     pub const CLONE_FILES: u32 = 0x0400;
     pub const CLONE_NEWNS: u32 = 0x0002_0000;
     pub const SUPPORTED: u32 = CLONE_FS | CLONE_FILES | CLONE_NEWNS;
+
+    /// unshare(2): 0 is a valid no-op; any unknown bit (CLONE_NEWUSER, CLONE_NEWPID, etc.) -> EINVAL.
+    pub const fn accepted_unshare(flags: u32) -> Result<u32, Errno> {
+        if flags & !SUPPORTED == 0 {
+            Ok(flags)
+        } else {
+            Err(Errno::EINVAL)
+        }
+    }
+
+    /// setns(2): nstype is 0 (any/mount ns) or CLONE_NEWNS; any other flag -> EINVAL.
+    pub const fn accepted_setns(nstype: u32) -> Result<u32, Errno> {
+        if nstype == 0 || nstype == CLONE_NEWNS {
+            Ok(nstype)
+        } else {
+            Err(Errno::EINVAL)
+        }
+    }
+}
+
+/// statvfs / statfs f_flag bits (Linux ST_* values, matching MS_* for the low bits).
+pub mod statfs_flags {
+    pub const ST_RDONLY: u64 = 1;
+    pub const ST_NOSUID: u64 = 2;
+    pub const ST_NODEV: u64 = 4;
+    pub const ST_NOEXEC: u64 = 8;
+    pub const ST_SYNCHRONOUS: u64 = 16;
+    pub const ST_NOATIME: u64 = 1024;
+    pub const ST_NODIRATIME: u64 = 2048;
+    pub const ST_RELATIME: u64 = 4096;
+    pub const ST_NOSYMFOLLOW: u64 = 8192;
+}
+
+/// Linux f_type magic numbers returned by StatFs.
+pub mod fs_magic {
+    pub const TMPFS_MAGIC: u64 = 0x0102_1994;
+    pub const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
+    pub const DEVPTS_SUPER_MAGIC: u64 = 0x0000_1cd1;
+    pub const DEVTMPFS_MAGIC: u64 = 0x0102_1994;
+    pub const SQUASHFS_MAGIC: u64 = 0x7371_7368;
+    pub const FUSE_SUPER_MAGIC: u64 = 0x6573_5546;
+    pub const OS_CLOUD_MAGIC: u64 = 0x4f53_434c;
 }
 
 #[cfg(test)]
@@ -324,11 +379,52 @@ mod tests {
             accepted(MS_MGC_VAL | MS_RDONLY | MS_NOATIME),
             Ok(MS_RDONLY | MS_NOATIME)
         );
+        // Non-magic upper bits are rejected rather than masked away.
+        assert_eq!(accepted(0xDEAD_0000 | MS_RDONLY), Err(Errno::EINVAL));
         for propagation in [MS_SHARED, MS_SLAVE, MS_UNBINDABLE] {
             assert_eq!(accepted(MS_REC | propagation), Err(Errno::EINVAL));
         }
         assert_eq!(accepted(MS_PRIVATE | MS_REC), Ok(MS_PRIVATE | MS_REC));
-        assert_eq!(umount_flags::SUPPORTED & umount_flags::MNT_EXPIRE, 0);
-        assert_ne!(umount_flags::SUPPORTED & umount_flags::MNT_FORCE, 0);
+        assert_eq!(accepted(0), Ok(0));
+    }
+
+    #[test]
+    fn umount_and_unshare_flags_enforce_contract_subset() {
+        {
+            use umount_flags::*;
+            assert_eq!(SUPPORTED & MNT_EXPIRE, 0);
+            assert_ne!(SUPPORTED & MNT_FORCE, 0);
+            assert_eq!(accepted(0), Ok(0));
+            assert_eq!(
+                accepted(MNT_FORCE | MNT_DETACH | UMOUNT_NOFOLLOW),
+                Ok(MNT_FORCE | MNT_DETACH | UMOUNT_NOFOLLOW)
+            );
+            assert_eq!(accepted(MNT_EXPIRE), Err(Errno::EINVAL));
+            assert_eq!(accepted(MNT_DETACH | MNT_EXPIRE), Err(Errno::EINVAL));
+            assert_eq!(accepted(0x10), Err(Errno::EINVAL));
+        }
+
+        {
+            use unshare_flags::*;
+            assert_eq!(accepted_unshare(0), Ok(0));
+            assert_eq!(accepted_unshare(CLONE_NEWNS), Ok(CLONE_NEWNS));
+            assert_eq!(
+                accepted_unshare(CLONE_FS | CLONE_FILES | CLONE_NEWNS),
+                Ok(CLONE_FS | CLONE_FILES | CLONE_NEWNS)
+            );
+            // CLONE_NEWUSER (0x1000_0000), CLONE_NEWPID (0x2000_0000), etc. -> EINVAL.
+            assert_eq!(accepted_unshare(0x1000_0000), Err(Errno::EINVAL));
+            assert_eq!(
+                accepted_unshare(CLONE_NEWNS | 0x2000_0000),
+                Err(Errno::EINVAL)
+            );
+
+            assert_eq!(accepted_setns(0), Ok(0));
+            assert_eq!(accepted_setns(CLONE_NEWNS), Ok(CLONE_NEWNS));
+            assert_eq!(accepted_setns(CLONE_FS), Err(Errno::EINVAL));
+            assert_eq!(accepted_setns(CLONE_FILES), Err(Errno::EINVAL));
+            assert_eq!(accepted_setns(CLONE_NEWNS | CLONE_FS), Err(Errno::EINVAL));
+            assert_eq!(accepted_setns(0x1000_0000), Err(Errno::EINVAL));
+        }
     }
 }

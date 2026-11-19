@@ -623,7 +623,7 @@ impl MemFs {
                 file_type: state.inodes[ino].file_type(),
             })
             .collect();
-        self.accessed(state.inodes.get_mut(&ino).expect("checked directory"));
+        self.accessed(state.inodes.get_mut(&ino).expect("checked directory"), true);
         Ok(entries)
     }
     /// Make a node named `name` in `dir`, after the checks every creation shares.
@@ -699,10 +699,20 @@ impl MemFs {
         Self::touch(inode, now, false);
         Ok(self.entry(&state, target))
     }
-    fn do_remove(&self, cred: &Cred, dir: &Handle, name: &str, directory: bool) -> Result<()> {
+    fn do_remove(
+        &self,
+        cred: &Cred,
+        dir: &Handle,
+        name: &str,
+        directory: bool,
+        expected: Option<NodeId>,
+    ) -> Result<()> {
         let mut state = self.state.borrow_mut();
         let dir = self.check(&state, dir)?;
         let victim = Self::child(&state, cred, dir, name)?.ok_or(Errno::ENOENT)?;
+        if expected.is_some_and(|node| self.handle(victim).node != node) {
+            return Err(Errno::ESTALE);
+        }
         let inode = &state.inodes[&victim];
         // As may_delete: whether the name may go, then what it names.
         inode::may_delete(&cred.identity, &state.inodes[&dir].meta, &inode.meta)?;
@@ -879,14 +889,21 @@ impl MemFs {
             _ => Err(Errno::ENXIO),
         }
     }
-    /// Linux's default relatime policy. Access never changes mtime or ctime, and clock
-    /// rollback must not make a recent atime appear a day old through unsigned subtraction.
-    fn accessed(&self, inode: &mut Inode) {
+    /// Access-time update respecting active mount flags (`MS_NOATIME`, `MS_NODIRATIME`,
+    /// `MS_STRICTATIME`, `MS_RDONLY`), defaulting to Linux's relatime policy when unmounted.
+    fn accessed(&self, inode: &mut Inode, is_dir: bool) {
         let now = (self.clock)();
-        if inode.atime <= inode.mtime
-            || inode.atime <= inode.ctime
-            || now.0.saturating_sub(inode.atime.0) >= 24 * 60 * 60
-        {
+        let update = match crate::mount::active_mount_flags() {
+            Some(flags) => {
+                flags.should_update_atime(is_dir, inode.atime, inode.mtime, inode.ctime, now)
+            }
+            None => {
+                inode.atime <= inode.mtime
+                    || inode.atime <= inode.ctime
+                    || now.0.saturating_sub(inode.atime.0) >= 24 * 60 * 60
+            }
+        };
+        if update {
             inode.atime = now;
         }
     }
@@ -904,7 +921,7 @@ impl MemFs {
         }
         let len = buf.len().min(RW_MAX);
         let read = inode.read(offset, &mut buf[..len]);
-        self.accessed(inode);
+        self.accessed(inode, false);
         Ok(read)
     }
     fn do_write_at(&self, open: &OpenRef, buf: &[u8], at: WriteAt) -> Result<Written> {
@@ -1265,7 +1282,7 @@ impl Filesystem for MemFs {
             let ino = self.check(&state, link)?;
             let inode = state.inodes.get_mut(&ino).expect("checked inode");
             let target = inode.meta.link.clone().ok_or(Errno::EINVAL)?;
-            self.accessed(inode);
+            self.accessed(inode, false);
             Ok(target)
         })
     }
@@ -1338,10 +1355,19 @@ impl Filesystem for MemFs {
         ready!(self.do_link(cred, target, dir, name))
     }
     fn unlink<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
-        ready!(self.do_remove(cred, dir, name, false))
+        ready!(self.do_remove(cred, dir, name, false, None))
+    }
+    fn unlink_if<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        node: NodeId,
+    ) -> BoxFuture<'a, ()> {
+        ready!(self.do_remove(cred, dir, name, false, Some(node)))
     }
     fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
-        ready!(self.do_remove(cred, dir, name, true))
+        ready!(self.do_remove(cred, dir, name, true, None))
     }
     fn rename<'a>(
         &'a self,
@@ -1475,5 +1501,95 @@ impl Filesystem for MemFs {
     }
     fn release<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
         ready!(self.do_release(open))
+    }
+}
+
+/// Parsed `tmpfs` mount options (`-o mode=...,uid=...,gid=...,size=...`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TmpfsOptions {
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+}
+
+impl TmpfsOptions {
+    /// Parse comma-separated `tmpfs` mount options (`mode=`, `uid=`, `gid=`, `size=`).
+    /// Defaults match Linux `tmpfs`: `mode=01777`, caller `uid`/`gid`, [`DEFAULT_CAPACITY`].
+    /// Unknown or malformed options fail with `Errno::EINVAL`.
+    pub fn parse(cred: &Cred, data: Option<&str>) -> Result<Self> {
+        let mut opts = Self {
+            mode: 0o1777,
+            uid: cred.identity.id,
+            gid: cred.identity.group,
+            size: DEFAULT_CAPACITY,
+        };
+        let Some(raw) = data else {
+            return Ok(opts);
+        };
+        for item in raw.split(',').filter(|s| !s.is_empty()) {
+            let Some((key, val)) = item.split_once('=') else {
+                return Err(Errno::EINVAL);
+            };
+            if val.is_empty() {
+                return Err(Errno::EINVAL);
+            }
+            match key {
+                "mode" => {
+                    let mode = u16::from_str_radix(val, 8).map_err(|_| Errno::EINVAL)?;
+                    if mode > 0o7777 {
+                        return Err(Errno::EINVAL);
+                    }
+                    opts.mode = mode;
+                }
+                "uid" => {
+                    opts.uid = val.parse::<u32>().map_err(|_| Errno::EINVAL)?;
+                }
+                "gid" => {
+                    opts.gid = val.parse::<u32>().map_err(|_| Errno::EINVAL)?;
+                }
+                "size" => {
+                    opts.size = parse_tmpfs_size(val)?;
+                }
+                _ => return Err(Errno::EINVAL),
+            }
+        }
+        Ok(opts)
+    }
+}
+
+fn parse_tmpfs_size(val: &str) -> Result<u64> {
+    let bytes = val.as_bytes();
+    let (digits, mult) = match bytes.last().copied() {
+        Some(b'k' | b'K') => (&val[..val.len() - 1], 1024u64),
+        Some(b'm' | b'M') => (&val[..val.len() - 1], 1024u64 * 1024),
+        Some(b'g' | b'G') => (&val[..val.len() - 1], 1024u64 * 1024 * 1024),
+        _ => (val, 1u64),
+    };
+    if digits.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    let base = digits.parse::<u64>().map_err(|_| Errno::EINVAL)?;
+    let total = base.checked_mul(mult).ok_or(Errno::EINVAL)?;
+    if total > FILE_MAX {
+        return Err(Errno::EINVAL);
+    }
+    Ok(total)
+}
+
+impl MemFs {
+    /// Instantiate a `tmpfs` [`MemFs`] from `mount(2)` `data` options.
+    pub fn from_mount_options(
+        id: FsId,
+        generation: u64,
+        cred: &Cred,
+        data: Option<&str>,
+        clock: Clock,
+    ) -> Result<Self> {
+        let opts = TmpfsOptions::parse(cred, data)?;
+        Ok(
+            Self::new(id, generation, opts.uid, opts.gid, opts.mode, clock)
+                .with_capacity(opts.size),
+        )
     }
 }

@@ -1,4 +1,4 @@
-//! Process creation for WASI preview 1 programs, over the runtime's generic host adapter.
+//! Process creation and image replacement for WASI/WASIX programs over the OS host adapter.
 use std::io;
 
 #[derive(Clone, Copy)]
@@ -24,13 +24,16 @@ impl ExitStatus {
     }
 }
 
-/// Spawn through PATH, inheriting credentials, umask, cwd, environment and descriptors.
+/// Spawn through PATH, inheriting credentials, umask, cwd, root, mount namespace and descriptors.
 /// The stdin action is applied only in the child. Close-on-exec descriptors are excluded.
 pub fn spawn(argv: &[String], stdin: Stdin) -> io::Result<Child> {
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     spawn_with(
         argv,
         stdin,
-        &std::env::current_dir()?.to_string_lossy(),
+        &cwd,
         &std::env::vars()
             .map(|(name, value)| format!("{name}={value}"))
             .collect::<Vec<_>>(),
@@ -50,11 +53,91 @@ pub fn spawn_with(
     spawn_configured(argv, stdin, cwd, env, pgroup, &SpawnOptions::default())
 }
 
+/// Explicit bind-mount specification forwarded in a service's spawn grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServiceBindMount<'a> {
+    pub source: &'a str,
+    pub target: &'a str,
+    pub read_only: bool,
+}
+
+/// Mount-namespace and bind-mount grant applied before a supervised unit executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServiceGrant<'a> {
+    pub mount_namespace: &'a str,
+    pub bind_mounts: &'a [ServiceBindMount<'a>],
+}
+
 /// Additional generic child attributes, applied before guest instructions.
 #[derive(Default)]
 pub struct SpawnOptions<'a> {
     pub cgroup: Option<&'a str>,
     pub dup2: &'a [(u32, u32)],
+    pub service_grant: Option<ServiceGrant<'a>>,
+}
+
+pub(crate) fn encode_spawn_request(
+    argv: &[String],
+    stdin: Stdin,
+    cwd: &str,
+    env: &[String],
+    pgroup: Option<u32>,
+    options: &SpawnOptions<'_>,
+) -> io::Result<Vec<u8>> {
+    if argv.is_empty() || argv[0].is_empty() || argv.iter().any(|arg| arg.contains('\0')) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid argument vector",
+        ));
+    }
+    if cwd.contains('\0')
+        || env.iter().any(|entry| entry.contains('\0'))
+        || options.cgroup.is_some_and(|cg| cg.contains('\0'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "spawn attribute contains NUL byte",
+        ));
+    }
+    if let Some(grant) = options.service_grant
+        && (grant.mount_namespace.contains('\0')
+            || grant
+                .bind_mounts
+                .iter()
+                .any(|b| b.source.contains('\0') || b.target.contains('\0')))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "service grant contains NUL byte",
+        ));
+    }
+    let mut payload = serde_json::json!({
+        "argv": argv,
+        "cwd": cwd,
+        "env": env,
+        "pgroup": pgroup,
+        "cgroup": options.cgroup,
+        "dup2": options.dup2,
+        "stdin": match stdin { Stdin::Inherit => "inherit", Stdin::Null => "null", Stdin::Tty => "tty" },
+    });
+    if let Some(grant) = options.service_grant {
+        let bind_mounts: Vec<serde_json::Value> = grant
+            .bind_mounts
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "source": b.source,
+                    "target": b.target,
+                    "readOnly": b.read_only,
+                })
+            })
+            .collect();
+        payload["serviceGrant"] = serde_json::json!({
+            "mountNamespace": grant.mount_namespace,
+            "bindMounts": bind_mounts,
+        });
+    }
+    serde_json::to_vec(&payload).map_err(Into::into)
 }
 
 pub fn spawn_configured(
@@ -65,21 +148,7 @@ pub fn spawn_configured(
     pgroup: Option<u32>,
     options: &SpawnOptions<'_>,
 ) -> io::Result<Child> {
-    if argv.is_empty() || argv[0].is_empty() || argv.iter().any(|arg| arg.contains('\0')) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid argument vector",
-        ));
-    }
-    let request = serde_json::to_vec(&serde_json::json!({
-        "argv": argv,
-        "cwd": cwd,
-        "env": env,
-        "pgroup": pgroup,
-        "cgroup": options.cgroup,
-        "dup2": options.dup2,
-        "stdin": match stdin { Stdin::Inherit => "inherit", Stdin::Null => "null", Stdin::Tty => "tty" },
-    }))?;
+    let request = encode_spawn_request(argv, stdin, cwd, env, pgroup, options)?;
     #[cfg(target_os = "wasi")]
     {
         let mut pid = 0;
@@ -97,6 +166,63 @@ pub fn spawn_configured(
             io::ErrorKind::Unsupported,
             "requires the WASI process adapter",
         ))
+    }
+}
+
+/// Replace the current process image in place, searching `PATH` when `file` contains no `'/'`.
+///
+/// Preserves PID, process group, controlling TTY, open non-`FD_CLOEXEC` descriptors, mount
+/// namespace, `FsContext.root` (`chroot`), and `FsContext.cwd`. Never returns on success;
+/// returns the failure `io::Error` if the image could not be resolved or executed.
+pub fn execvp(file: &str, argv: &[String]) -> io::Error {
+    let env: Vec<String> = std::env::vars()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    exec_impl(file, argv, &env, !file.contains('/'))
+}
+
+/// Replace the current process image in place without searching `PATH`.
+pub fn execve(file: &str, argv: &[String], env: &[String]) -> io::Error {
+    exec_impl(file, argv, env, false)
+}
+
+fn exec_impl(file: &str, argv: &[String], env: &[String], search: bool) -> io::Error {
+    if file.is_empty() {
+        return crate::os_error(abi::Error::new(abi::Errno::ENOENT));
+    }
+    if file.contains('\0')
+        || argv.is_empty()
+        || argv.iter().any(|arg| arg.contains('\0'))
+        || env.iter().any(|entry| entry.contains('\0'))
+    {
+        return crate::os_error(abi::Error::new(abi::Errno::EINVAL));
+    }
+    let request = match serde_json::to_vec(&serde_json::json!({
+        "file": file,
+        "argv": argv,
+        "env": env,
+        "search": search,
+    })) {
+        Ok(bytes) => bytes,
+        Err(err) => return err.into(),
+    };
+    #[cfg(target_arch = "wasm32")]
+    {
+        // SAFETY: `request` lives across the host call; on success the host unwinds the image.
+        let rc = unsafe { crate::wasi_libc::host::host_execve(request.as_ptr(), request.len()) };
+        if rc < 0 {
+            crate::host_errno_error(-rc)
+        } else {
+            crate::os_error(abi::Error::new(abi::Errno::ENOEXEC))
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = request;
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "requires the WASI process adapter",
+        )
     }
 }
 
@@ -176,4 +302,95 @@ unsafe extern "C" {
     fn host_waitpid(pid: u32, status: *mut u32) -> u32;
     #[link_name = "waitpid2"]
     fn host_waitpid2(pid: i32, status: *mut u32, options: u32) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_spawn_options_omit_service_grant() {
+        let argv = vec!["/usr/bin/true".to_string()];
+        let env = vec!["PATH=/usr/bin".to_string()];
+        let raw = encode_spawn_request(
+            &argv,
+            Stdin::Null,
+            "/",
+            &env,
+            Some(0),
+            &SpawnOptions::default(),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(parsed["argv"], serde_json::json!(["/usr/bin/true"]));
+        assert_eq!(parsed["stdin"], "null");
+        assert!(parsed.get("serviceGrant").is_none());
+    }
+
+    #[test]
+    fn spawn_options_serializes_service_grant_contract() {
+        let argv = vec!["/usr/bin/worker".to_string()];
+        let env = vec!["LANG=C.UTF-8".to_string()];
+        let binds = [
+            ServiceBindMount {
+                source: "/srv/data",
+                target: "/var/lib/app",
+                read_only: true,
+            },
+            ServiceBindMount {
+                source: "/tmp/work",
+                target: "/work",
+                read_only: false,
+            },
+        ];
+        let opts = SpawnOptions {
+            cgroup: Some("/user/supervise-1-0-1"),
+            dup2: &[(4, 1), (5, 2)],
+            service_grant: Some(ServiceGrant {
+                mount_namespace: "isolated",
+                bind_mounts: &binds,
+            }),
+        };
+        let raw = encode_spawn_request(&argv, Stdin::Null, "/work", &env, Some(0), &opts).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            parsed["serviceGrant"],
+            serde_json::json!({
+                "mountNamespace": "isolated",
+                "bindMounts": [
+                    { "source": "/srv/data", "target": "/var/lib/app", "readOnly": true },
+                    { "source": "/tmp/work", "target": "/work", "readOnly": false }
+                ]
+            })
+        );
+        assert_eq!(parsed["cgroup"], "/user/supervise-1-0-1");
+        assert_eq!(parsed["dup2"], serde_json::json!([[4, 1], [5, 2]]));
+    }
+
+    #[test]
+    fn spawn_request_rejects_nul_bytes_in_service_grant() {
+        let argv = vec!["/usr/bin/true".to_string()];
+        let bad_binds = [ServiceBindMount {
+            source: "/srv/\0bad",
+            target: "/mnt",
+            read_only: true,
+        }];
+        let err = encode_spawn_request(
+            &argv,
+            Stdin::Null,
+            "/",
+            &[],
+            None,
+            &SpawnOptions {
+                cgroup: None,
+                dup2: &[],
+                service_grant: Some(ServiceGrant {
+                    mount_namespace: "isolated",
+                    bind_mounts: &bad_binds,
+                }),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
 }

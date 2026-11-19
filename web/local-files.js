@@ -1,96 +1,268 @@
-// Page-side VFS transport. Rust applications keep their usual filesystem calls;
-// private paths are served by the execution host and never fall through to HTTP.
-import { kernelCall } from './kernel/protocol.js';
-import { localPath, localFdPath, LOCAL_FD } from './kernel/workspace.js';
+// Page-side VFS transport. Routes page `POST /api/sys` filesystem calls, path-addressed
+// `GET`/`HEAD` `/api/file` reads, and client-fd `PUT /api/pwrite` chunks through
+// `crates/client-kernel`'s active session `MountNamespace` so `Files`, `shell.rs`, `Mounts`,
+// and CLI processes all observe the exact same mount table.
+import { kernelCall, kernelPort } from './kernel/protocol.js';
+import { CLIENT_PAGE_FD_BASE } from './kernel/workspace.js';
 
-const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
-const unbase64 = text => Uint8Array.from(atob(text), c => c.charCodeAt(0));
-const mounted = call => {
+const json = (value, status = 200) =>
+  new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
+
+const FS_CALL_NAMES = new Set([
+  'stat', 'lstat', 'fstat', 'fstat_at', 'getdents', 'access', 'access_at',
+  'readlink', 'readlink_at', 'mkdir', 'mkdir_at', 'mknod', 'mknod_at',
+  'rmdir', 'unlink', 'unlink_at', 'rename', 'rename_at', 'link', 'link_at',
+  'symlink', 'symlink_at', 'chmod', 'fchmod', 'fchmod_at', 'chown', 'fchown_at',
+  'utimens', 'utimens_at', 'statfs', 'fstatfs', 'mount', 'umount2',
+  'getxattr', 'setxattr', 'listxattr', 'removexattr',
+  'open', 'open_at', 'close', 'discard', 'pread', 'pwrite',
+  'ftruncate', 'fsync', 'lock', 'try_lock', 'unlock', 'test_lock',
+  'ioctl', 'inotify_add_watch', 'inotify_rm_watch',
+]);
+
+const ACCOUNT_MUTATION_CALLS = new Set([
+  'login', 'logout', 'sudo', 'passwd', 'register', 'useradd', 'userdel', 'usermod',
+  'groupadd', 'groupdel', 'groupmod', 'gpasswd', 'login_session', 'machine_init',
+]);
+
+function callName(call) {
+  return typeof call === 'string' ? call : (call && typeof call === 'object' ? Object.keys(call)[0] : '');
+}
+
+function isPrivateCarrierPath(raw) {
+  if (typeof raw !== 'string') return false;
+  const parts = [];
+  for (const seg of raw.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') parts.pop();
+    else parts.push(seg);
+  }
+  const norm = '/' + parts.join('/');
+  return ['/mnt/local', '/mnt/shared', '/opt/private'].some(
+    root => norm === root || norm.startsWith(root + '/') || raw === root || raw.startsWith(root + '/'),
+  );
+}
+
+function touchesPrivateCarrier(call) {
   const arg = typeof call === 'object' && call !== null ? Object.values(call)[0] : null;
-  return arg && (arg.fd >= LOCAL_FD || [arg.path, arg.from, arg.to].some(path => localPath(path) || localFdPath(path)) || ['/', '/mnt', '/opt'].includes(arg.path));
-};
-const privateCall = call => {
-  const arg = typeof call === 'object' && call !== null ? Object.values(call)[0] : null;
-  return arg && (arg.fd >= LOCAL_FD || [arg.path, arg.from, arg.to].some(path => localPath(path) || localFdPath(path)));
-};
+  if (!arg) return false;
+  if (typeof arg.fd === 'number' && arg.fd >= CLIENT_PAGE_FD_BASE) return true;
+  return [arg.path, arg.from, arg.to].some(isPrivateCarrierPath);
+}
+
+function parseHttpRange(header) {
+  if (!header) return { hasRange: false, start: undefined, end: undefined };
+  const match = /^bytes=(\d+)-(\d*)$/.exec(header.trim());
+  if (!match) return { invalid: true };
+  const start = Number(match[1]);
+  const end = match[2] ? Number(match[2]) : undefined;
+  if (!Number.isSafeInteger(start) || start < 0 || (end !== undefined && (!Number.isSafeInteger(end) || end < start))) {
+    return { invalid: true };
+  }
+  return { hasRange: true, start, end };
+}
+
+function statusForErrno(errno) {
+  switch (errno) {
+    case 'ENOENT': return 404;
+    case 'EACCES':
+    case 'EPERM': return 403;
+    case 'EINVAL':
+    case 'EISDIR':
+    case 'ENOTDIR': return 400;
+    default: return 403;
+  }
+}
+
 export function installLocalFiles() {
   const network = globalThis.fetch.bind(globalThis);
-  globalThis.fetch = async (input, options) => {
-    const request = new Request(input, options), url = new URL(request.url);
-    if (url.origin !== location.origin || !url.pathname.startsWith('/api/')) return network(request);
+
+  // Propagate kernel mount-table updates to `Files` (`crates/frontend`) and `Mounts` (`mount-manager.js`).
+  if (typeof globalThis.Worker === 'function') {
     try {
+      kernelPort().on('mounts-changed', value => {
+        globalThis.dispatchEvent?.(new CustomEvent('os:mounts-changed', { detail: value }));
+      });
+    } catch { /* headless environment without Worker */ }
+  }
+
+  globalThis.fetch = async (input, options) => {
+    const request = new Request(input, options);
+    const url = new URL(request.url);
+    if (url.origin !== location.origin || !url.pathname.startsWith('/api/')) return network(request);
+    if (request.headers.get('X-Registry') === '1' || request.headers.has('X-Process-Token')) {
+      return network(request);
+    }
+
+    try {
+      // 1. Page `POST /api/sys` batches containing filesystem calls
       if (url.pathname === '/api/sys' && request.method === 'POST') {
         const body = await request.clone().json();
-        if (Array.isArray(body.calls) && body.calls.some(mounted)) {
-          const privateAccess = body.calls.some(privateCall);
+        if (Array.isArray(body.calls) && body.calls.length > 0) {
+          const hasFs = body.calls.some(c => FS_CALL_NAMES.has(callName(c)));
+          const hasAccountMut = body.calls.some(c => ACCOUNT_MUTATION_CALLS.has(callName(c)));
           if (body.proc || body.pid) {
-            if (!privateAccess) return network(request);
-            return json({ error: 'process credentials are not page filesystem grants', errno: 'EACCES' }, 403);
+            if (body.calls.some(touchesPrivateCarrier)) {
+              return json({ error: 'process credentials are not page filesystem grants', errno: 'EACCES' }, 403);
+            }
+            return network(request);
           }
-          const results = await kernelCall(privateAccess ? 'mount_sys' : 'mount_overlay', body);
-          // Root listings can work before a login workspace exists. Only this
-          // explicit, pre-dispatch result permits ordinary cloud dispatch.
-          if (results === null) return network(request);
-          return json({ results });
+          // `hold` on a client page fd is a local no-op; on a server upload fd it goes to `/api/sys`.
+          if (body.calls.length === 1 && callName(body.calls[0]) === 'hold') {
+            const hfd = body.calls[0]?.hold?.fd;
+            if (typeof hfd === 'number' && hfd >= CLIENT_PAGE_FD_BASE) {
+              return json({ results: [{ ok: null }] });
+            }
+            return network(request);
+          }
+          if (hasFs && !hasAccountMut) {
+            const results = await kernelCall('mount_vfs_sys', {
+              calls: body.calls,
+              fdEpoch: request.headers.get('X-Fd-Epoch') ?? undefined,
+              sudo: !!body.sudo,
+              umask: body.umask,
+            });
+            return json({ results });
+          }
         }
+        return network(request);
       }
-      if (url.pathname === '/api/pwrite' && Number(url.searchParams.get('fd')) >= LOCAL_FD) {
+
+      // 2. Client-fd chunked uploads (`PUT /api/pwrite?fd=...&index=...` when `fd >= CLIENT_PAGE_FD_BASE`)
+      if (url.pathname === '/api/pwrite' && Number(url.searchParams.get('fd')) >= CLIENT_PAGE_FD_BASE) {
         if (request.method !== 'PUT') return json({ errno: 'EINVAL' }, 400);
-        const body = new Uint8Array(await request.arrayBuffer()), index = Number(url.searchParams.get('index'));
-        if (!Number.isSafeInteger(index) || index < 0 || body.length > 256 * 1024) return json({ errno: 'E2BIG' }, 400);
-        return json(await kernelCall('mount_write', { fd: Number(url.searchParams.get('fd')), offset: index * 256 * 1024, bytes: body }));
+        const body = new Uint8Array(await request.arrayBuffer());
+        const index = Number(url.searchParams.get('index'));
+        if (!Number.isSafeInteger(index) || index < 0 || body.length > 8 * 1024 * 1024) {
+          return json({ errno: 'E2BIG' }, 400);
+        }
+        const written = await kernelCall('mount_vfs_pwrite', {
+          fd: Number(url.searchParams.get('fd')),
+          offset: 0,
+          chunkIndex: index,
+          data: body,
+        });
+        return json({ written });
       }
-      if (url.pathname === '/api/file' && (localPath(url.searchParams.get('path')) || url.searchParams.get('token')?.startsWith('local:'))) {
+
+      // 3. Path-addressed page `/api/file?path=...` reads (leaving `?compile=` and `?token=` on `network`)
+      if (
+        url.pathname === '/api/file' &&
+        url.searchParams.has('path') &&
+        !url.searchParams.has('compile') &&
+        !url.searchParams.has('token')
+      ) {
         if (!['GET', 'HEAD'].includes(request.method)) return json({ errno: 'EINVAL' }, 400);
-        let source = Object.fromEntries([...url.searchParams].filter(([key]) => ['path', 'token'].includes(key)));
-        let owned, closed = false;
-        const close = async () => {
-          if (closed) return; closed = true;
-          request.signal.removeEventListener('abort', aborted);
-          if (owned !== undefined) await kernelCall('mount_sys', { calls: [{ close: { fd: owned } }] }).catch(() => {});
-        };
-        const aborted = () => { void close(); };
-        try {
-          let stat;
-          if (source.path) {
-            const [opened] = await kernelCall('mount_sys', { calls: [{ open: { path: source.path, flags: 0 } }] });
-            if (opened.err) throw Object.assign(new Error(opened.err.detail ?? opened.err.errno), opened.err);
-            owned = opened.ok.fd; source = { fd: owned }; stat = opened.ok.stat;
-          } else stat = await kernelCall('mount_read', { ...source, stat: true });
-          if ((stat.mode & 0o170000) !== 0o100000) throw Object.assign(new Error('not a regular file'), { errno: 'EISDIR' });
-          let start = 0, end = stat.size - 1;
-          const range = request.headers.get('Range');
-          if (range) {
-            const match = /^bytes=(\d+)-(\d*)$/.exec(range);
-            if (!match) { await close(); return new Response(null, { status: 416 }); }
-            start = Number(match[1]); end = match[2] ? Math.min(end, Number(match[2])) : end;
-            if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end) { await close(); return new Response(null, { status: 416 }); }
+        const path = url.searchParams.get('path');
+        const range = parseHttpRange(request.headers.get('Range'));
+        if (range.invalid) return new Response(null, { status: 416 });
+        request.signal.throwIfAborted();
+
+        let streamId;
+        const closeStream = () => {
+          request.signal.removeEventListener('abort', onAbort);
+          if (streamId != null) {
+            void kernelCall('mount_vfs_close_read', { streamId }).catch(() => {});
+            streamId = undefined;
           }
-          let at = start;
-          const headers = { 'Content-Type': 'application/octet-stream', 'Content-Length': String(Math.max(0, end - start + 1)), 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store' };
-          if (range) headers['Content-Range'] = `bytes ${start}-${end}/${stat.size}`;
-          if (request.method === 'HEAD') { await close(); return new Response(null, { status: range ? 206 : 200, headers }); }
-          request.signal.addEventListener('abort', aborted, { once: true });
-          if (request.signal.aborted) { await close(); throw new DOMException('Aborted', 'AbortError'); }
+        };
+        let onAbort;
+        const aborted = new Promise((_, reject) => {
+          onAbort = () => {
+            closeStream();
+            reject(request.signal.reason);
+          };
+          request.signal.addEventListener('abort', onAbort, { once: true });
+        });
+        let res;
+        try {
+          const opening = kernelCall('mount_vfs_open_read', {
+            path,
+            rangeStart: range.hasRange ? range.start : undefined,
+            rangeEnd: range.hasRange ? range.end : undefined,
+            headOnly: request.method === 'HEAD',
+            sudo: false,
+          }).then(opened => {
+            streamId = opened.streamId;
+            if (request.signal.aborted) closeStream();
+            return opened;
+          });
+          res = await Promise.race([opening, aborted]);
+          request.signal.throwIfAborted();
+        } catch (error) {
+          closeStream();
+          throw error;
+        }
+        if (streamId == null) closeStream();
+        if (res.status === 416) return new Response(null, { status: 416 });
+        const rangeLen = range.hasRange && res.contentRange
+          ? (() => {
+              const m = /^bytes (\d+)-(\d+)\//.exec(res.contentRange);
+              return m ? Number(m[2]) - Number(m[1]) + 1 : res.totalSize;
+            })()
+          : res.totalSize;
+        if (res.streamId != null) {
+          const headers = {
+            'Content-Type': res.contentType || 'application/octet-stream',
+            'Content-Length': String(rangeLen),
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'no-store',
+          };
+          if (res.contentRange) headers['Content-Range'] = res.contentRange;
           const stream = new ReadableStream({
             async pull(controller) {
-              if (closed) { controller.error(new DOMException('Aborted', 'AbortError')); return; }
-              if (at > end) { await close(); controller.close(); return; }
+              if (streamId == null) {
+                controller.close();
+                return;
+              }
               try {
-                const read = await kernelCall('mount_read', { ...source, offset: at, count: Math.min(256 * 1024, end - at + 1) });
-                const bytes = unbase64(read.data);
-                if (!bytes.length) throw new Error('local file changed during read');
-                at += bytes.length; controller.enqueue(bytes);
-                if (at > end) { await close(); controller.close(); }
-              } catch (error) { await close(); controller.error(error); }
+                const chunk = await kernelCall('mount_vfs_read_chunk', { streamId: res.streamId });
+                const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk ?? []);
+                if (streamId == null || !bytes.byteLength) {
+                  closeStream();
+                  controller.close();
+                  return;
+                }
+                controller.enqueue(bytes);
+              } catch (err) {
+                closeStream();
+                controller.error(err);
+              }
             },
-            cancel: close,
+            async cancel() {
+              closeStream();
+            },
           });
-          return new Response(stream, { status: range ? 206 : 200, headers });
-        } catch (error) { await close(); throw error; }
+          return new Response(stream, {
+            status: res.status || (range.hasRange ? 206 : 200),
+            headers,
+          });
+        }
+        const bodyBytes = res.inlineBytes instanceof Uint8Array
+          ? res.inlineBytes
+          : new Uint8Array(res.inlineBytes ?? res.bytes ?? []);
+        const contentLen = request.method === 'HEAD' ? rangeLen : bodyBytes.byteLength;
+        const headers = {
+          'Content-Type': res.contentType || 'application/octet-stream',
+          'Content-Length': String(contentLen),
+          'Accept-Ranges': 'bytes',
+          'Cache-Control': 'no-store',
+        };
+        if (res.contentRange) headers['Content-Range'] = res.contentRange;
+        return new Response(request.method === 'HEAD' ? null : bodyBytes, {
+          status: res.status || (range.hasRange ? 206 : 200),
+          headers,
+        });
       }
+
       return network(request);
-    } catch (error) { return json({ errno: error.errno ?? 'EIO', error: error.message ?? error.errno ?? 'Local filesystem unavailable' }, error.errno === 'ENOENT' ? 404 : 403); }
+    } catch (error) {
+      if (request.signal.aborted || error?.name === 'AbortError') throw error;
+      return json(
+        { errno: error.errno ?? 'EIO', error: error.detail ?? error.message ?? error.errno ?? 'Filesystem unavailable' },
+        statusForErrno(error.errno),
+      );
+    }
   };
 }
 

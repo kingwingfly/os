@@ -2654,12 +2654,15 @@ dependencies = [
 name = "os-client-kernel"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "js-sys",
  "os-abi",
+ "os-core",
  "os-image",
  "os-vfs",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "wasm-bindgen",
  "wasm-bindgen-futures",
 ]

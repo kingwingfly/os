@@ -95,7 +95,7 @@ test('ordinary utilities read and write the local VFS and Files previews use the
   expect(await run(page, './coreutils', ['cat', 'input'])).toMatchObject({ status: 0, stdout: 'private text\n', error: '' });
   expect(await run(page, './coreutils', ['ls', '-1'])).toMatchObject({ status: 0, error: '' });
   expect(await run(page, './coreutils', ['mkdir', 'child'])).toMatchObject({ status: 0, error: '' });
-  const checked = await run(page, './coreutils', ['syscall', JSON.stringify(['getcreds', { stat: { path: '/usr/bin/coreutils' } }])]);
+  const checked = await run(page, './coreutils', ['syscall', JSON.stringify(['getcreds', { stat: { path: '/etc/passwd' } }])]);
   const replies = JSON.parse(checked.stdout).results; expect(replies[0].ok).toBeTruthy(); expect(replies[1].err.errno).toBe('EACCES');
   await write(page, 'dash', dash);
   expect(await run(page, './dash', ['-c', './coreutils cat input; ./coreutils echo CHILD_DONE'])).toMatchObject({ status: 0, stdout: 'private text\nCHILD_DONE\n', error: '' });

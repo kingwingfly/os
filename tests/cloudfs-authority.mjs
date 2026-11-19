@@ -2,7 +2,7 @@
 // node --test tests/cloudfs-authority.mjs. All bindings/storage are disposable.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { Miniflare } from 'miniflare';
 
@@ -310,7 +310,17 @@ test('large >2^53 sparse files stream over /api/file, upload leases follow renew
   for (const o of [flockA, flockB, flockC]) await rpc(session, { release: { open: o } });
 
   // 4. Incomplete path-API uploads reject CloudFS byte opens/creates/links with EBUSY, and discard detaches pinned unlinked inodes.
-  const sysOpen = await post('/api/sys', { proc: token, calls: [{ open: { path: '/tmp/in-flight', flags: 1 | 64 | 512, mode: 0o644, size: 100 } }] });
+  const guestCookie = `os_guest=${randomBytes(32).toString('hex')}`;
+  const postCookie = async (path, value) => {
+    const body = JSON.stringify(value);
+    const response = await authority.fetch('https://authority' + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(body)), Cookie: guestCookie },
+      body,
+    });
+    return response.json();
+  };
+  const sysOpen = await postCookie('/api/sys', { calls: [{ open: { path: '/tmp/in-flight', flags: 1 | 64 | 512, mode: 0o644, size: 100 } }] });
   const uploadFd = sysOpen.results[0].ok.fd;
   const inFlight = await rpc(session, { lookup: { dir: tmp.handle, name: 'in-flight' } });
   assert.equal((await rpc(session, { open: { ticket: randomUUID(), handle: inFlight.handle, options: openOpts } })).errno, 'EBUSY');
@@ -319,11 +329,515 @@ test('large >2^53 sparse files stream over /api/file, upload leases follow renew
   const pathOpen = await rpc(session, { open: { ticket: randomUUID(), handle: inFlight.handle, options: { ...openOpts, read: false, write: false, path: true } } });
   assert.ok(pathOpen.id, pathOpen.errno);
   await rpc(session, { unlink: { dir: tmp.handle, name: 'in-flight' } });
-  const discarded = await post('/api/sys', { proc: token, calls: [{ discard: { fd: uploadFd } }] });
+  const discarded = await postCookie('/api/sys', { calls: [{ discard: { fd: uploadFd } }] });
   assert.equal(discarded.results[0].ok.discarded, true);
   const pinnedNode = (await sql.exec('SELECT file, size FROM inodes WHERE id = ?', inFlight.handle.node.ino))[0];
   assert.equal(pinnedNode.file, null);
   assert.equal(pinnedNode.size, 0);
   await rpc(session, { release: { open: pathOpen } });
   assert.equal((await sql.exec('SELECT count(*) AS n FROM inodes WHERE id = ?', inFlight.handle.node.ino))[0].n, 0);
+});
+
+test('L2 root seeding + EROFS, v2 statfs + non-root mknod, v2 FICLONE, and X-Process-Token v1 boundary enforcement', async t => {
+  const adminPassword = 'admin-secret-password-' + randomUUID();
+  const mf = new Miniflare({
+    port: 0, unsafeInspectDurableObjects: true,
+    workers: [{ config: {
+      name: 'cloudfs-l2-boundary',
+      compatibilityDate: '2026-10-24',
+      manifest: { mainModule: 'harness.js', modules: {
+        'harness.js': { type: 'esm', contents: `
+          import { DurableObject } from 'cloudflare:workers';
+          import { OsAuthority as Service, Machine as M } from './index.js';
+          export { default } from './index.js';
+          export { M as Machine };
+          export class OsAuthority extends DurableObject {
+            constructor(ctx, env) { super(ctx, env); this.service = new Service(ctx, env); }
+            fetch(request) { return this.service.fetch(request); }
+            alarm() { return this.service.alarm(); }
+            async triggerAlarm() { await this.service.alarm(); }
+          }
+        ` },
+        'index.js': { type: 'esm', contents: readFileSync('crates/worker/build/index.js', 'utf8') },
+        'index_bg.wasm': { type: 'wasm', contents: readFileSync('crates/worker/build/index_bg.wasm') },
+      } },
+      exports: {
+        OsAuthority: { type: 'durable-object', storage: 'sqlite' },
+        Machine: { type: 'durable-object', storage: 'sqlite' },
+      },
+      env: {
+        AUTHORITY: { type: 'durable-object', worker: 'cloudfs-l2-boundary', exportName: 'OsAuthority' },
+        MACHINE: { type: 'durable-object', worker: 'cloudfs-l2-boundary', exportName: 'Machine' },
+        FILES: { type: 'r2', name: 'files' },
+        ADMIN_PASSWORD: { type: 'text', value: adminPassword },
+        SESSION_SECRET: { type: 'text', value: randomUUID() },
+        ASSETS: { type: 'fetcher', handler: req => {
+          const url = new URL(req.url);
+          if (url.pathname === '/usr/manifest.json') {
+            return new Response(JSON.stringify({ '/usr/bin/coreutils.wasm': 64 }), { headers: { 'Content-Type': 'application/json' } });
+          }
+          return new Response(new Uint8Array(64));
+        } },
+      },
+    } }],
+  });
+  t.after(() => mf.dispose());
+  const namespace = await mf.getDurableObjectNamespace('AUTHORITY');
+  const authority = namespace.get(namespace.idFromName('filesystem'));
+  const bucket = await mf.getR2Bucket('FILES');
+
+  const guestKey = randomBytes(32).toString('hex');
+  const guestCookie = `os_guest=${guestKey}`;
+  const nsHash = 'guest.' + createHash('sha256').update(guestKey).digest('base64url');
+  const postAuthority = async (path, value, headers = {}) => {
+    const body = JSON.stringify(value);
+    const response = await authority.fetch('https://authority' + path, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(Buffer.byteLength(body)),
+        Cookie: guestCookie,
+        ...headers,
+      },
+      body,
+    });
+    return response.json();
+  };
+
+  await postAuthority('/api/sys', { calls: ['getcreds'] });
+  const sql = await mf.unsafeGetDurableObjectStorage('cloudfs-l2-boundary', 'OsAuthority', { name: 'filesystem' });
+  assert.equal((await sql.exec("SELECT v FROM meta WHERE k = 'schema'"))[0].v, '10');
+
+  const now = Math.floor(Date.now() / 1000);
+  const rootToken = randomUUID(), rootHash = createHash('sha256').update(rootToken).digest('base64url');
+  await sql.exec(
+    'INSERT INTO credentials(token,ns,pid,uid,gid,groups,umask,started,owner,expires,cloud_access) VALUES(?,?,?,?,?,?,?,?,?,?,1)',
+    rootHash, nsHash, 10, 0, 0, '[0]', 0o022, now, `${nsHash} 10 ${rootHash}`, now + 600,
+  );
+  await sql.exec(
+    "INSERT INTO users(id,name,gid,groups,home,locked,salt,hash) VALUES(1000,'alice',1000,'[1000,27]','/home/alice',0,'','')",
+  );
+  await sql.exec("INSERT INTO unix_groups(id,name) VALUES(1000,'alice')");
+  const aliceToken = randomUUID(), aliceHash = createHash('sha256').update(aliceToken).digest('base64url');
+  await sql.exec(
+    'INSERT INTO credentials(token,ns,pid,uid,gid,groups,umask,started,owner,expires,cloud_access) VALUES(?,?,?,?,?,?,?,?,?,?,1)',
+    aliceHash, nsHash, 11, 1000, 1000, '[1000,27]', 0o022, now, `${nsHash} 11 ${aliceHash}`, now + 600,
+  );
+  const guestToken = randomUUID(), guestHash = createHash('sha256').update(guestToken).digest('base64url');
+  await sql.exec(
+    'INSERT INTO credentials(token,ns,pid,uid,gid,groups,umask,started,owner,expires,cloud_access) VALUES(?,?,?,?,?,?,?,?,?,?,1)',
+    guestHash, nsHash, 12, 1000001, 65534, '[65534]', 0o022, now, `${nsHash} 12 ${guestHash}`, now + 600,
+  );
+
+  const rpcAs = (cred, session, call) => postAuthority('/api/fs', { version: 2, credential: cred, session, call });
+  const rpc = (session, call) => rpcAs(rootToken, session, call);
+  const { session, root } = await rpc(null, 'connect');
+
+  // (a) Seeded root mountpoints & merged-/usr symlinks over /api/fs v2 + EROFS protection.
+  const rootEntries = await rpc(session, { read_dir: { dir: root } });
+  const rootNames = new Map(rootEntries.map(e => [e.name, e.file_type]));
+  for (const dirName of ['usr', 'sys', 'proc', 'dev', 'etc', 'boot', 'mnt', 'opt', 'run', 'srv', 'tmp', 'var']) {
+    assert.equal(rootNames.get(dirName), 'dir', `missing seeded directory /${dirName}`);
+  }
+  for (const [linkName, target] of [['bin', 'usr/bin'], ['sbin', 'usr/bin'], ['lib', 'usr/lib'], ['lib64', 'usr/lib']]) {
+    assert.equal(rootNames.get(linkName), 'symlink', `missing seeded symlink /${linkName}`);
+    const looked = await rpc(session, { lookup: { dir: root, name: linkName } });
+    assert.equal(looked.metadata.file_type, 'symlink');
+    assert.equal(await rpc(session, { read_link: { handle: looked.handle } }), target);
+    assert.equal((await rpc(session, { unlink: { dir: root, name: linkName } })).errno, 'EROFS');
+  }
+  for (const [parts, expectedMode] of [
+    [['usr'], 0o755],
+    [['sys'], 0o555],
+    [['proc'], 0o555],
+    [['dev', 'pts'], 0o755],
+    [['dev', 'present'], 0o755],
+    [['dev', 'snd'], 0o755],
+    [['mnt', 'local'], 0o755],
+    [['mnt', 'shared'], 0o755],
+    [['opt', 'private'], 0o755],
+    [['tmp'], 0o1777],
+  ]) {
+    const walked = await rpc(session, { walk: { dir: root, names: parts } });
+    assert.equal(walked.stop, null, `walk failed for /${parts.join('/')}`);
+    assert.equal(walked.entries.at(-1).metadata.file_type, 'dir');
+    assert.equal(walked.entries.at(-1).metadata.mode, expectedMode);
+  }
+  const usrEntry = await rpc(session, { lookup: { dir: root, name: 'usr' } });
+  const sysEntry = await rpc(session, { lookup: { dir: root, name: 'sys' } });
+  const procEntry = await rpc(session, { lookup: { dir: root, name: 'proc' } });
+  const etcEntry = await rpc(session, { lookup: { dir: root, name: 'etc' } });
+  const passwdEntry = await rpc(session, { lookup: { dir: etcEntry.handle, name: 'passwd' } });
+  const groupEntry = await rpc(session, { lookup: { dir: etcEntry.handle, name: 'group' } });
+  assert.equal((await rpc(session, { mkdir: { dir: usrEntry.handle, name: 'local2', mode: 0o755, umask: 0o022 } })).errno, 'EROFS');
+  assert.equal((await rpc(session, { rmdir: { dir: root, name: 'usr' } })).errno, 'EROFS');
+  assert.equal((await rpc(session, { mkdir: { dir: sysEntry.handle, name: 'kernel', mode: 0o755, umask: 0o022 } })).errno, 'EROFS');
+  assert.equal((await rpc(session, { rmdir: { dir: root, name: 'sys' } })).errno, 'EROFS');
+  assert.equal((await rpc(session, { mkdir: { dir: procEntry.handle, name: 'fake', mode: 0o755, umask: 0o022 } })).errno, 'EROFS');
+  assert.equal((await rpc(session, { unlink: { dir: etcEntry.handle, name: 'passwd' } })).errno, 'EROFS');
+  assert.equal((await rpc(session, { unlink: { dir: etcEntry.handle, name: 'group' } })).errno, 'EROFS');
+
+  // (b) v2 Statfs free blocks > 0, and non-root signed-in Mknod on /dev/present and /dev/snd.
+  const statfs = await rpc(session, 'statfs');
+  const expectedFree = Number((1n << 50n) / 4096n);
+  assert.equal(statfs.block_size, 4096);
+  assert.equal(statfs.blocks_free, expectedFree);
+  assert.ok(statfs.blocks >= statfs.blocks_free);
+  assert.equal(statfs.files_free, expectedFree);
+  assert.ok(statfs.files >= statfs.files_free);
+  assert.equal(statfs.name_max, 255);
+
+  const tmp = await rpc(session, { lookup: { dir: root, name: 'tmp' } });
+  for (const driver of ['present', 'snd']) {
+    const devDir = (await rpc(session, { walk: { dir: root, names: ['dev', driver] } })).entries.at(-1).handle;
+    assert.equal(
+      (await rpcAs(guestToken, session, { mknod: { dir: devDir, name: 'guest-dev', mode: 0o644, umask: 0o022, rdev: driver } })).errno,
+      'EPERM',
+    );
+    assert.equal(
+      (await rpcAs(aliceToken, session, { mknod: { dir: tmp.handle, name: 'wrong-dir', mode: 0o644, umask: 0o022, rdev: driver } })).errno,
+      'EPERM',
+    );
+    const createdDev = await rpcAs(aliceToken, session, {
+      mknod: { dir: devDir, name: 'alice-' + driver, mode: 0o666, umask: 0o022, rdev: driver },
+    });
+    for (const rdev of ['', '0']) {
+      const name = 'inferred-' + (rdev || 'empty');
+      const req = { mknod: { dir: devDir, name, mode: 0o020640, umask: 0o022, rdev } };
+      assert.equal((await rpcAs(guestToken, session, req)).errno, 'EPERM');
+      assert.equal((await rpcAs(aliceToken, session, req)).metadata.rdev, driver);
+      assert.equal(await rpcAs(aliceToken, session, { unlink: { dir: devDir, name } }), null);
+    }
+    assert.equal(createdDev.metadata.file_type, 'char-device');
+    assert.equal(createdDev.metadata.uid, 1000);
+    assert.equal(createdDev.metadata.rdev, driver);
+    assert.equal(await rpcAs(aliceToken, session, { unlink: { dir: devDir, name: 'alice-' + driver } }), null);
+  }
+
+  // (c) remote_fs::Call::Clone (FICLONE) over v2 OpenRefs + access & type denials.
+  const opts = (overrides = {}) => ({
+    read: false, write: false, append: false, append_implies_write: false,
+    truncate: false, create: false, create_new: false, exec: false, path: false,
+    ...overrides,
+  });
+  const [srcEntry, srcInit] = await rpc(session, {
+    create: { ticket: randomUUID(), dir: tmp.handle, name: 'clone-src', mode: 0o700, umask: 0, options: opts({ read: true, write: true, create: true, create_new: true }) },
+  });
+  const writeSrc = { version: 2, credential: rootToken, pid: 10, session, open: srcInit, operation: { write: { at: 'end', length: 12 } } };
+  const srcPrep = await postAuthority('/internal/fs/data', { request: writeSrc });
+  await bucket.put(srcPrep.key, 'hello world!');
+  await postAuthority('/internal/fs/commit', { request: writeSrc, id: srcPrep.id });
+  await rpc(session, { release: { open: srcInit } });
+
+  const [dstEntry, dstWrite] = await rpcAs(aliceToken, session, {
+    create: { ticket: randomUUID(), dir: tmp.handle, name: 'clone-dst', mode: 0o600, umask: 0, options: opts({ write: true, create: true, create_new: true }) },
+  });
+  // Alice cannot open root's 0700 clone-src for reading -> EACCES.
+  assert.equal((await rpcAs(aliceToken, session, { open: { ticket: randomUUID(), handle: srcEntry.handle, options: opts({ read: true }) } })).errno, 'EACCES');
+  await rpc(session, { setattr: { handle: srcEntry.handle, attr: { mode: 0o755, uid: null, gid: null, size: null, atime: 'omit', mtime: 'omit' } } });
+
+  // Exec-only and write-only source OpenRefs cannot clone -> EBADF; read-only target cannot be cloned into -> EBADF.
+  const srcExec = await rpcAs(aliceToken, session, { open: { ticket: randomUUID(), handle: srcEntry.handle, options: opts({ exec: true }) } });
+  assert.equal((await rpcAs(aliceToken, session, { clone: { source: srcExec, target: dstWrite } })).errno, 'EBADF');
+  const srcPath = await rpcAs(aliceToken, session, { open: { ticket: randomUUID(), handle: srcEntry.handle, options: opts({ path: true }) } });
+  assert.equal((await rpcAs(aliceToken, session, { clone: { source: srcPath, target: dstWrite } })).errno, 'EBADF');
+  const srcRead = await rpcAs(aliceToken, session, { open: { ticket: randomUUID(), handle: srcEntry.handle, options: opts({ read: true }) } });
+  const dstRead = await rpcAs(aliceToken, session, { open: { ticket: randomUUID(), handle: dstEntry.handle, options: opts({ read: true }) } });
+  assert.equal((await rpcAs(aliceToken, session, { clone: { source: srcRead, target: dstRead } })).errno, 'EBADF');
+  // Same-inode clone -> EINVAL; directory clone -> EISDIR; generated /etc/passwd source -> EOPNOTSUPP.
+  const dstRw = await rpcAs(aliceToken, session, { open: { ticket: randomUUID(), handle: dstEntry.handle, options: opts({ read: true, write: true }) } });
+  assert.equal((await rpcAs(aliceToken, session, { clone: { source: dstRw, target: dstWrite } })).errno, 'EINVAL');
+  const tmpRead = await rpcAs(aliceToken, session, { open: { ticket: randomUUID(), handle: tmp.handle, options: opts({ read: true }) } });
+  assert.equal((await rpcAs(aliceToken, session, { clone: { source: tmpRead, target: dstWrite } })).errno, 'EISDIR');
+  const passwdRead = await rpcAs(aliceToken, session, { open: { ticket: randomUUID(), handle: passwdEntry.handle, options: opts({ read: true }) } });
+  assert.equal((await rpcAs(aliceToken, session, { clone: { source: passwdRead, target: dstWrite } })).errno, 'EOPNOTSUPP');
+  // OpenRef from an unrelated namespace -> EACCES.
+  const otherGuestKey = randomBytes(32).toString('hex');
+  const otherNs = 'guest.' + createHash('sha256').update(otherGuestKey).digest('base64url');
+  const otherToken = randomUUID(), otherHash = createHash('sha256').update(otherToken).digest('base64url');
+  await sql.exec(
+    'INSERT INTO credentials(token,ns,pid,uid,gid,groups,umask,started,owner,expires,cloud_access) VALUES(?,?,?,?,?,?,?,?,?,?,1)',
+    otherHash, otherNs, 99, 0, 0, '[0]', 0o022, now, `${otherNs} 99`, now + 600,
+  );
+  const otherConn = await postAuthority('/api/fs', { version: 2, credential: otherToken, session: null, call: 'connect' }, { Cookie: `os_guest=${otherGuestKey}` });
+  assert.equal((await postAuthority('/api/fs', { version: 2, credential: otherToken, session: otherConn.session, call: { clone: { source: srcRead, target: dstWrite } } }, { Cookie: `os_guest=${otherGuestKey}` })).errno, 'EACCES');
+
+  // Valid O(1) FICLONE succeeds, shares R2 extent key, and survives source unlink + alarm GC.
+  assert.equal(await rpcAs(aliceToken, session, { clone: { source: srcRead, target: dstWrite } }), null);
+  assert.equal((await rpcAs(aliceToken, session, { open_metadata: { open: dstWrite } })).size, 12);
+  const readClonedDenied = await mf.dispatchFetch('http://localhost/api/file?path=/tmp/clone-dst', {
+    headers: { Cookie: guestCookie },
+  });
+  assert.equal(readClonedDenied.status, 401);
+  await rpcAs(aliceToken, session, { setattr: { handle: dstEntry.handle, attr: { mode: 0o644, uid: null, gid: null, size: null, atime: 'omit', mtime: 'omit' } } });
+  const readCloned = await mf.dispatchFetch('http://localhost/api/file?path=/tmp/clone-dst', {
+    headers: { Cookie: guestCookie },
+  });
+  assert.equal(readCloned.status, 200);
+  assert.equal(await readCloned.text(), 'hello world!');
+  for (const o of [srcExec, srcPath, srcRead, dstRead, dstRw, tmpRead, passwdRead]) {
+    await rpcAs(aliceToken, session, { release: { open: o } });
+  }
+  await rpc(session, { unlink: { dir: tmp.handle, name: 'clone-src' } });
+  await authority.triggerAlarm();
+  assert.equal(await (await bucket.get(srcPrep.key))?.text(), 'hello world!');
+  await rpcAs(aliceToken, session, { release: { open: dstWrite } });
+
+  // (d) Server boundary denial for non-job X-Process-Token on v1 /api/sys path calls, while
+  // /proc status, /api/fs v2 handles, InotifyAddWatch(handle), /dev/archive PathAt.open, and
+  // /internal/exec LocalExecutable + chroot/no-usr-fallback work.
+  const initRes = await mf.dispatchFetch('http://localhost/api/sys', {
+    method: 'POST',
+    headers: { Origin: 'http://localhost', Cookie: guestCookie, 'Content-Type': 'application/json', 'X-Registry': '1' },
+    body: JSON.stringify({ calls: [{ proc_init: { boot: 'boot-1' } }] }),
+  });
+  assert.equal(initRes.status, 200);
+  const execRes = await mf.dispatchFetch('http://localhost/api/sys', {
+    method: 'POST',
+    headers: { Origin: 'http://localhost', Cookie: guestCookie, 'Content-Type': 'application/json', 'X-Registry': '1' },
+    body: JSON.stringify({
+      calls: [{
+        execve: {
+          path: '/usr/bin/coreutils',
+          argv: ['ls', '/tmp'],
+          env: [],
+          cwd: '/',
+          runtime: 'resources-v1',
+          local: { digest: 'b'.repeat(64), size: 64, cloud: true },
+        },
+      }],
+    }),
+  });
+  const execReply = await execRes.json();
+  assert.equal(execReply.results[0].err, undefined);
+  const liveProc = execReply.results[0].ok;
+  assert.ok(liveProc.token);
+  assert.equal(liveProc.asset, undefined);
+
+  // Chroot / no-usr-fallback prevents /internal/exec from resolving server /usr behind client's back.
+  for (const extraHeaders of [{ 'X-OS-Chroot': '1' }, { 'X-OS-No-Usr-Fallback': '1' }]) {
+    const chrootExec = await mf.dispatchFetch('http://localhost/api/sys', {
+      method: 'POST',
+      headers: {
+        Origin: 'http://localhost',
+        Cookie: guestCookie,
+        'Content-Type': 'application/json',
+        'X-Registry': '1',
+        ...extraHeaders,
+      },
+      body: JSON.stringify({ calls: [{ execve: { path: '/usr/bin/coreutils', argv: ['coreutils'], cwd: '/' } }] }),
+    });
+    assert.equal((await chrootExec.json()).results[0].err.errno, 'ENOENT');
+  }
+
+  // Conflicting X-Process-Token header vs JSON proc is rejected with EPERM.
+  const conflict = await postAuthority('/api/sys', { proc: aliceToken, calls: ['getcreds'] }, { 'X-Process-Token': liveProc.token });
+  assert.equal(conflict.results[0].err.errno, 'EPERM');
+
+  const fsHeaders = session => session ? { 'X-Fs-Session': session.id, 'X-Fs-Secret': session.secret } : {};
+  const sysWithHeader = (call, fsSession) => postAuthority('/api/sys', { pid: liveProc.pid, calls: [call] },
+    { 'X-Process-Token': liveProc.token, ...fsHeaders(fsSession) });
+  for (const denied of [
+    { stat: { path: '/etc/passwd' } },
+    { lstat: { path: '/bin' } },
+    { getdents: { path: '/' } },
+    { access: { path: '/tmp', mode: 4 } },
+    { readlink: { path: '/bin' } },
+    { mkdir: { path: '/tmp/escaped', mode: 0o755 } },
+    { mknod: { path: '/tmp/escaped-reg', mode: 0o644 } },
+    { rmdir: { path: '/tmp' } },
+    { unlink: { path: '/tmp/clone-dst' } },
+    { rename: { from: '/tmp/clone-dst', to: '/tmp/moved' } },
+    { link: { from: '/tmp/clone-dst', to: '/tmp/linked' } },
+    { symlink: { target: '/etc/passwd', path: '/tmp/sym' } },
+    { chmod: { path: '/tmp/clone-dst', mode: 0o644 } },
+    { chown: { path: '/tmp/clone-dst', uid: 0 } },
+    { utimens: { path: '/tmp/clone-dst' } },
+    { statfs: { path: '/' } },
+    { getxattr: { path: '/tmp/clone-dst', name: 'user.x' } },
+    { listxattr: { path: '/tmp/clone-dst' } },
+    { setxattr: { path: '/tmp/clone-dst', name: 'user.x', value: 'YQ==' } },
+    { removexattr: { path: '/tmp/clone-dst', name: 'user.x' } },
+    { open_at: { dirfd: 3, path: 'passwd', flags: 0 } },
+    { fstat_at: { dirfd: 3, path: 'passwd' } },
+    { inotify_add_watch: { path: '/tmp' } },
+    { open: { path: '/etc/passwd', flags: 0 } },
+    { open: { path: '/dev/../etc/passwd', flags: 0 } },
+    { stat: { path: '/proc/self/fd/0' } },
+    { pread: { path: '/etc/passwd', count: 32 } },
+  ]) {
+    const res = await sysWithHeader(denied);
+    assert.equal(res.results[0].err?.errno, 'EPERM', `expected EPERM for ${JSON.stringify(denied)}, got ${JSON.stringify(res)}`);
+  }
+  // Body `proc` token is equally gated at the server boundary.
+  assert.equal((await postAuthority('/api/sys', { pid: liveProc.pid, proc: liveProc.token, calls: [{ stat: { path: '/etc/passwd' } }] })).results[0].err.errno, 'EPERM');
+
+  // Allowed calls with X-Process-Token: Getcreds, read-only /proc status/cmdline, /api/fs v2 handles,
+  // InotifyAddWatch with verified Handle, and /dev/archive with v2 PathAt.open.
+  assert.ok((await sysWithHeader('getcreds')).results[0].ok.uid > 0);
+  const procStatus = await sysWithHeader({ pread: { path: `/proc/${liveProc.pid}/status`, count: 512 } });
+  assert.ok(Buffer.from(procStatus.results[0].ok.data, 'base64').toString().includes(`Pid:\t${liveProc.pid}`));
+  const procCmdline = await sysWithHeader({ pread: { path: `/proc/${liveProc.pid}/cmdline`, count: 512 } });
+  assert.equal(Buffer.from(procCmdline.results[0].ok.data, 'base64').toString(), 'ls\0/tmp\0');
+
+  const procConn = await rpcAs(liveProc.token, null, 'connect');
+  assert.ok(procConn.session);
+  const procTmp = await rpcAs(liveProc.token, procConn.session, { lookup: { dir: procConn.root, name: 'tmp' } });
+  assert.equal(procTmp.metadata.file_type, 'dir');
+
+  const forgedHandle = { ...procTmp.handle, proof: 'forged-proof' };
+  assert.equal((await sysWithHeader({ inotify_add_watch: { path: '/ignored', handle: forgedHandle } }, procConn.session)).results[0].err.errno, 'EACCES');
+  const watch = { inotify_add_watch: { path: '/ignored', handle: procTmp.handle } };
+  const otherProcSession = (await rpcAs(liveProc.token, null, 'connect')).session;
+  for (const invalid of [null, otherProcSession, { ...procConn.session, secret: randomUUID() }]) {
+    assert.equal((await sysWithHeader(watch, invalid)).results[0].err.errno, 'EACCES');
+  }
+  const watchRes = await sysWithHeader(watch, procConn.session);
+  assert.equal(typeof watchRes.results[0].ok, 'number');
+  assert.equal((await sysWithHeader({ inotify_rm_watch: { wd: watchRes.results[0].ok } })).results[0].ok, null);
+
+  // /dev/archive Open + SUBMIT with PathAt.open (v2 OpenRef) + Close.
+  const tmpDirOpen = await rpcAs(aliceToken, session, { open: { ticket: randomUUID(), handle: tmp.handle, options: opts({ path: true }) } });
+  const dstFileOpen = await rpcAs(aliceToken, session, { open: { ticket: randomUUID(), handle: dstEntry.handle, options: opts({ path: true }) } });
+  const sysAlice = (call, fsSession = session) => postAuthority('/api/sys', { pid: 11, calls: [call] },
+    { 'X-Process-Token': aliceToken, ...fsHeaders(fsSession) });
+  const devOpen = await sysAlice({ open: { path: '/dev/archive', flags: 2 } });
+  assert.equal(devOpen.results[0].ok.device, 'archive');
+  const archiveFd = devOpen.results[0].ok.fd;
+  // File OpenRef as directory -> ENOTDIR.
+  const badSubmit = await sysAlice({
+    ioctl: {
+      fd: archiveFd,
+      request: 0x54570101,
+      arg: {
+        version: 1,
+        request: 'req-bad',
+        operation: {
+          operation: 'create',
+          format: 'tar',
+          output: { directory: 0, open: dstFileOpen, name: 'out.tar' },
+          inputs: [{ source: { directory: 0, open: tmpDirOpen, name: 'clone-dst' }, name: 'clone-dst' }],
+          recursive: false,
+          links: false,
+          verbose: false,
+        },
+      },
+    },
+  });
+  assert.equal(badSubmit.results[0].err.errno, 'ENOTDIR');
+  const submit = {
+    ioctl: {
+      fd: archiveFd,
+      request: 0x54570101,
+      arg: {
+        version: 1,
+        request: 'req-ok',
+        operation: {
+          operation: 'create',
+          format: 'tar',
+          output: { directory: 0, open: tmpDirOpen, name: 'out.tar' },
+          inputs: [{ source: { directory: 0, open: tmpDirOpen, name: 'clone-dst' }, name: 'clone-dst' }],
+          recursive: false,
+          links: false,
+          verbose: false,
+        },
+      },
+    },
+  };
+  const otherAliceSession = (await rpcAs(aliceToken, null, 'connect')).session;
+  for (const invalid of [null, otherAliceSession, { ...session, secret: randomUUID() }]) {
+    assert.equal((await sysAlice(submit, invalid)).results[0].err.errno, 'EACCES');
+  }
+  const okSubmit = await sysAlice(submit);
+  assert.ok(okSubmit.results[0].ok.id, JSON.stringify(okSubmit));
+  assert.ok('ok' in (await sysAlice({ close: { fd: archiveFd } })).results[0]);
+
+  // Wheel account with active sudo_until admits LocalExecutable as uid 0 (for ImageFs / chroot sudo).
+  const aliceSessionToken = randomBytes(32).toString('hex');
+  const aliceSessionKey = createHash('sha256').update(aliceSessionToken).digest('base64url');
+  await sql.exec(
+    'INSERT INTO sessions(key, uid, expires, sudo_until) VALUES(?, 1000, ?, ?)',
+    aliceSessionKey, now + 600, now + 300,
+  );
+  const aliceCookie = `os_session=${aliceSessionToken}; ${guestCookie}`;
+  const guarded = async (call, target, epoch) => (await postAuthority('/api/sys', { calls: [call] }, {
+    Cookie: aliceCookie, ...(epoch ? { 'X-Fd-Epoch': epoch } : {}), ...(target ? { 'X-Fs-Target': JSON.stringify(target) } : {}),
+  })).results[0];
+  const path = '/tmp/client-guarded-upload';
+  const open = { open: { path, flags: 0o1101, mode: 0o600, size: 0 } };
+  const create = await guarded(open, { missing_in: tmp.handle.node.ino });
+  assert.ok(create.ok, JSON.stringify(create));
+  const inode = create.ok.stat.ino;
+  assert.match(create.ok.fd_epoch, /^[a-f0-9]{64}$/);
+  const close = { close: { fd: create.ok.fd } };
+  assert.equal((await guarded(close, null, '0'.repeat(64))).err.errno, 'EBADF');
+  assert.ok('ok' in await guarded(close, null, create.ok.fd_epoch));
+  assert.equal((await guarded(open, { missing_in: tmp.handle.node.ino })).err.errno, 'ESTALE');
+  assert.equal((await guarded(open, { inode: inode + 1 })).err.errno, 'ESTALE');
+  const current = await guarded({ lstat: { path } }, { inode });
+  assert.ok(current.ok.version);
+  assert.equal((await guarded({ open: { ...open.open, version: 'stale' } }, { inode })).err.errno, 'ESTALE');
+
+  const read = (await guarded({ open: { path, flags: 0 } }, { inode })).ok;
+  assert.equal(read.fd_epoch, create.ok.fd_epoch);
+  assert.ok('ok' in await guarded({ rename: { from: path, to: path + '.saved' } }));
+  const replacement = (await guarded(open, { missing_in: tmp.handle.node.ino })).ok;
+  assert.ok('ok' in await guarded({ close: { fd: replacement.fd } }, null, replacement.fd_epoch));
+  const chmod = await guarded({ fchmod: { fd: read.fd, mode: 0o640 } }, null, read.fd_epoch);
+  assert.equal(chmod.ok.ino, inode);
+  assert.equal(chmod.ok.mode & 0o777, 0o640);
+  assert.equal((await guarded({ stat: { path } })).ok.mode & 0o777, 0o600);
+  assert.ok('ok' in await guarded({ unlink: { path: path + '.saved' } }));
+  const unlinked = await guarded({ fchmod: { fd: read.fd, mode: 0o400 } }, null, read.fd_epoch);
+  assert.equal(unlinked.ok.ino, inode);
+  assert.equal(unlinked.ok.nlink, 0);
+  assert.ok('ok' in await guarded({ close: { fd: read.fd } }, null, read.fd_epoch));
+
+  const sudoInit = await mf.dispatchFetch('http://localhost/api/sys', {
+    method: 'POST',
+    headers: { Origin: 'http://localhost', Cookie: aliceCookie, 'Content-Type': 'application/json', 'X-Registry': '1' },
+    body: JSON.stringify({ calls: [{ proc_init: { boot: 'boot-sudo' } }] }),
+  });
+  assert.equal(sudoInit.status, 200);
+  const sudoExec = await mf.dispatchFetch('http://localhost/api/sys', {
+    method: 'POST',
+    headers: { Origin: 'http://localhost', Cookie: aliceCookie, 'Content-Type': 'application/json', 'X-Registry': '1' },
+    body: JSON.stringify({
+      sudo: true,
+      calls: [{
+        execve: {
+          path: '/usr/bin/coreutils',
+          argv: ['id'],
+          env: [],
+          cwd: '/',
+          runtime: 'resources-v1:chroot',
+          local: { digest: 'c'.repeat(64), size: 64, cloud: true },
+        },
+      }],
+    }),
+  });
+  const sudoProc = (await sudoExec.json()).results[0].ok;
+  assert.ok(sudoProc?.token);
+  const sudoCreds = await postAuthority(
+    '/api/sys',
+    { pid: sudoProc.pid, calls: ['getcreds'] },
+    { Cookie: aliceCookie, 'X-Process-Token': sudoProc.token },
+  );
+  assert.equal(sudoCreds.results[0].ok.uid, 0);
+
+  // Stale schema "9" is refused without SQL migration (contract §2.12).
+  const freshStale = namespace.get(namespace.idFromName('stale-schema-9-cold'));
+  const coldSql = await mf.unsafeGetDurableObjectStorage('cloudfs-l2-boundary', 'OsAuthority', { name: 'stale-schema-9-cold' });
+  await coldSql.exec('CREATE TABLE users(id INTEGER PRIMARY KEY)');
+  await coldSql.exec('CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)');
+  await coldSql.exec("INSERT INTO meta(k, v) VALUES('schema', '9')");
+  await assert.rejects(
+    () =>
+      freshStale.fetch('https://authority/api/sys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': '22' },
+        body: '{"calls":["getcreds"]}',
+      }),
+    /older version|not migrated/i,
+  );
 });

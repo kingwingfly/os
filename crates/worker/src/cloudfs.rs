@@ -146,6 +146,9 @@ pub(super) fn reply(result: Result<Value>) -> Reply {
         Err(errno) => api::errno_reply(&errno.into()),
     }
 }
+fn stored_identity(db: &Db) -> Option<(FsId, String)> {
+    Some((FsId(db.meta(FS_ID_KEY)?), db.meta("vfs_handle_key")?))
+}
 fn identity(db: &mut Db) -> (FsId, String) {
     let mut get = |name: &str| {
         db.meta(name).unwrap_or_else(|| {
@@ -155,6 +158,136 @@ fn identity(db: &mut Db) -> (FsId, String) {
         })
     };
     (FsId(get(FS_ID_KEY)), get("vfs_handle_key"))
+}
+fn proof_mac(key: &str, fs: &FsId, session_id: &str, node: NodeId) -> Hmac<Sha256> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts every key size");
+    mac.update(&serde_json::to_vec(&(fs, session_id, node)).expect("serializable handle"));
+    mac
+}
+fn check_fs_session_row(
+    session: Option<SessionRow>,
+    ns: &str,
+    fs_auth: Option<(&str, &str)>,
+    now: u64,
+) -> Result<SessionRow> {
+    let Some((_, fs_sec)) = fs_auth else {
+        return Err(Errno::EACCES);
+    };
+    let session = session.ok_or(Errno::ENOTCONN)?;
+    if session.ns != ns || session.secret != auth::token_hash(fs_sec) {
+        return Err(Errno::EACCES);
+    }
+    if session.expires <= now {
+        return Err(Errno::ENOTCONN);
+    }
+    Ok(session)
+}
+
+fn authenticate_fs_session(db: &Db, ns: &str, fs_auth: Option<(&str, &str)>) -> Result<SessionRow> {
+    let Some((fs_sid, _)) = fs_auth else {
+        return Err(Errno::EACCES);
+    };
+    let row = db
+        .rows::<SessionRow>(
+            "SELECT id, secret, ns, expires FROM vfs_sessions WHERE id = ?",
+            vec![text(fs_sid)],
+        )
+        .pop();
+    check_fs_session_row(row, ns, fs_auth, auth::now())
+}
+
+fn verify_handle_proof_for_session(
+    key: &str,
+    fs: &FsId,
+    session_id: &str,
+    handle: &Handle,
+) -> Result<()> {
+    let tag = URL_SAFE_NO_PAD
+        .decode(&handle.proof)
+        .map_err(|_| Errno::EACCES)?;
+    if &handle.fs != fs
+        || proof_mac(key, fs, session_id, handle.node)
+            .verify_slice(&tag)
+            .is_err()
+    {
+        return Err(Errno::EACCES);
+    }
+    if handle.node.generation != 1 {
+        return Err(Errno::ESTALE);
+    }
+    Ok(())
+}
+
+fn check_open_row_for_session(
+    fs: &FsId,
+    session_id: &str,
+    open_row: &OpenRow,
+    open: &OpenRef,
+) -> Result<()> {
+    if open_row.session != session_id
+        || &open.fs != fs
+        || open_row.ino != open.node.ino
+        || open.node.generation != 1
+        || open_row.access != serde_json::to_string(&open.access).map_err(|_| Errno::EIO)?
+        || open_row.revoked != 0
+    {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
+}
+
+pub(crate) fn opened_in_namespace(
+    db: &Db,
+    ns: &str,
+    credential: Option<&Credential>,
+    fs_auth: Option<(&str, &str)>,
+    open: &OpenRef,
+) -> Result<Node> {
+    if let Some(cred) = credential {
+        authorize(cred)?;
+        if cred.ns != ns {
+            return Err(Errno::EACCES);
+        }
+    }
+    let session = authenticate_fs_session(db, ns, fs_auth)?;
+    let open_row = db
+        .rows::<OpenRow>("SELECT * FROM vfs_opens WHERE id = ?", vec![int(open.id)])
+        .pop()
+        .ok_or(Errno::EBADF)?;
+    let (fs, key) = stored_identity(db).ok_or(Errno::EACCES)?;
+    if let Some(cred) = credential {
+        let caller = Caller {
+            session,
+            credential: cred.clone(),
+            fs,
+            key,
+        };
+        return caller.opened(db, open);
+    }
+    check_open_row_for_session(&fs, &session.id, &open_row, open)?;
+    if !db.cloud_granted(open.id, &session.ns) {
+        return Err(Errno::EACCES);
+    }
+    db.inode(open_row.ino).ok_or(Errno::ESTALE)
+}
+pub(crate) fn verify_handle(
+    db: &Db,
+    ns: &str,
+    credential: Option<&Credential>,
+    fs_auth: Option<(&str, &str)>,
+    handle: &Handle,
+) -> Result<Node> {
+    if let Some(cred) = credential {
+        authorize(cred)?;
+        if cred.ns != ns {
+            return Err(Errno::EACCES);
+        }
+    }
+    let session = authenticate_fs_session(db, ns, fs_auth)?;
+    let (fs, key) = stored_identity(db).ok_or(Errno::EACCES)?;
+    verify_handle_proof_for_session(&key, &fs, &session.id, handle)?;
+    db.inode(handle.node.ino).ok_or(Errno::ESTALE)
 }
 fn authorize(credential: &Credential) -> Result<()> {
     credential.cloud().map_err(|_| Errno::EACCES)?;
@@ -213,12 +346,7 @@ impl Caller {
         })
     }
     fn proof(&self, node: NodeId) -> Hmac<Sha256> {
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.key.as_bytes())
-            .expect("HMAC accepts every key size");
-        mac.update(
-            &serde_json::to_vec(&(&self.fs, &self.session.id, node)).expect("serializable handle"),
-        );
-        mac
+        proof_mac(&self.key, &self.fs, &self.session.id, node)
     }
     fn handle(&self, ino: u64) -> Handle {
         let node = NodeId { ino, generation: 1 };
@@ -349,15 +477,30 @@ fn join(dir: &str, name: &str) -> String {
 /// later activations (`system::validate_mount`).
 fn read_only(db: &Db, path: &str) -> bool {
     crate::system::owns(db, path)
+        || os_image::below(path, "/usr")
+        || os_image::below(path, "/sys")
         || crate::procfs::is(path)
-        || matches!(path, "/etc/passwd" | "/etc/group")
+        || matches!(
+            path,
+            "/bin" | "/sbin" | "/lib" | "/lib64" | "/etc/passwd" | "/etc/group"
+        )
 }
 fn read_only_descendant(db: &Db, path: &str) -> bool {
     let prefix = format!("{}/", path.trim_end_matches('/'));
     crate::system::owns_descendant(db, path)
-        || ["/etc/passwd", "/etc/group", "/proc"]
-            .iter()
-            .any(|ro| ro.starts_with(&prefix))
+        || [
+            "/usr",
+            "/sys",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/proc",
+            "/etc/passwd",
+            "/etc/group",
+        ]
+        .iter()
+        .any(|ro| ro.starts_with(&prefix))
 }
 /// `EROFS` if any name of `ino` is read-only.
 pub(super) fn unchanged_names(db: &Db, ino: u64) -> Result<()> {
@@ -370,6 +513,14 @@ pub(super) fn unchanged_names(db: &Db, ino: u64) -> Result<()> {
 const TICKET_MAX: usize = 128;
 fn ticket_valid(ticket: &str) -> bool {
     !ticket.is_empty() && ticket.len() <= TICKET_MAX
+}
+fn metadata_rdev(node: &Node, writing: Option<(u64, bool)>) -> Option<String> {
+    if node.is_file() {
+        writing
+            .map(|(received, recording)| format!("os.writing:{received}:{}", u8::from(recording)))
+    } else {
+        node.rdev.clone()
+    }
 }
 fn metadata(db: &Db, node: &Node) -> Metadata {
     let times = db.times(node.ino);
@@ -389,6 +540,7 @@ fn metadata(db: &Db, node: &Node) -> Metadata {
     } else {
         node.size
     };
+    let rdev = metadata_rdev(node, node.file.as_deref().and_then(|id| db.writing(id)));
     Metadata {
         file_type: file_type(node),
         mode: node.mode,
@@ -399,7 +551,7 @@ fn metadata(db: &Db, node: &Node) -> Metadata {
         atime: times.atime.into(),
         mtime: times.mtime.into(),
         ctime: times.ctime.into(),
-        rdev: node.rdev.clone(),
+        rdev,
         acl: node.acl.is_some(),
     }
 }
@@ -656,7 +808,11 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
                 return Err(Errno::EINVAL);
             }
             let node = match c.child(db, dir, name) {
-                Ok((node, _)) => {
+                Ok((node, path)) => {
+                    if (options.access()?.writes() || options.is_truncate()) && read_only(db, &path)
+                    {
+                        return Err(Errno::EROFS);
+                    }
                     if options.is_create_new() {
                         return Err(Errno::EEXIST);
                     }
@@ -701,16 +857,34 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             umask,
             rdev,
         } => {
-            if who.id != 0 {
-                return Err(Errno::EPERM);
-            }
+            check_component(name)?;
+            let (_, dir_path) = c.dir(db, dir, EXEC)?;
+            let rdev = if (rdev.is_empty() || rdev == "0")
+                && u32::from(*mode) & abi::S_IFMT == abi::S_IFCHR
+            {
+                crate::dev::driver(&dir_path).ok_or(Errno::EINVAL)?
+            } else {
+                rdev.as_str()
+            };
             if rdev.is_empty() || rdev.len() > 255 {
                 return Err(Errno::EINVAL);
             }
-            if !matches!(rdev.as_str(), "present" | "snd") {
+            if !matches!(rdev, "present" | "snd") {
                 return Err(Errno::EOPNOTSUPP);
             }
-            let (_, path) = new_name(db, &c, dir, name)?;
+            let path = join(&dir_path, name);
+            if read_only(db, &path) {
+                return Err(Errno::EROFS);
+            }
+            if crate::dev::driver(&dir_path) != Some(rdev) {
+                return Err(Errno::EPERM);
+            }
+            if permissions::is_guest_id(who.id) {
+                return Err(Errno::EPERM);
+            }
+            if db.persisted_node(&path).is_some() {
+                return Err(Errno::EEXIST);
+            }
             // The driver creates its inode, live state and expiry together. Unlike the
             // path driver's replace operation, VFS mknod requires an unused name.
             crate::dev::mknod(
@@ -787,7 +961,12 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             if node.is_device() {
                 return Err(Errno::EPERM);
             }
-            if directory && matches!(path.as_str(), "/dev" | "/dev/present" | "/dev/snd") {
+            if directory
+                && matches!(
+                    path.as_str(),
+                    "/dev" | "/dev/pts" | "/dev/present" | "/dev/snd"
+                )
+            {
                 return Err(Errno::EBUSY);
             }
             if directory && db.persisted_descendant(&path) {
@@ -902,13 +1081,16 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             Value::Null
         }
         Statfs => {
+            const FREE: u64 = (1 << 50) / 4096;
             let (bytes, files) = db.usage();
+            let used = bytes.div_ceil(4096);
             json!(StatFs {
                 block_size: 4096,
-                blocks: bytes.div_ceil(4096),
-                files,
+                blocks: used + FREE,
+                blocks_free: FREE,
+                files: files + FREE,
+                files_free: FREE,
                 name_max: abi::NAME_MAX as u64,
-                ..StatFs::default()
             })
         }
         Open {
@@ -968,6 +1150,36 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             // Cleanup can retire a revoked tombstone; it never renews the open's grant.
             c.open_row(db, open)?;
             db.release_cloud_open(open.id, false);
+            Value::Null
+        }
+        wire::Call::Clone { source, target } => {
+            let src_node = c.opened(db, source)?;
+            let mut dst_node = c.opened(db, target)?;
+            if !matches!(source.access, Access::Read | Access::ReadWrite) || !target.access.writes()
+            {
+                return Err(Errno::EBADF);
+            }
+            if src_node.directory || dst_node.directory {
+                return Err(Errno::EISDIR);
+            }
+            if !src_node.is_file() || !dst_node.is_file() || src_node.ino == dst_node.ino {
+                return Err(Errno::EINVAL);
+            }
+            if db
+                .names(src_node.ino)
+                .iter()
+                .any(|path| crate::sys::generated(db, path).is_some())
+            {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            unchanged_names(db, dst_node.ino)?;
+            if src_node.file.as_deref().is_some_and(|id| db.uploading(id))
+                || dst_node.file.as_deref().is_some_and(|id| db.uploading(id))
+            {
+                return Err(Errno::EBUSY);
+            }
+            db.cloud_clone(&src_node, &mut dst_node, c.actor())?;
+            db.cloud_accessed(src_node.ino);
             Value::Null
         }
         TryLock { .. }
@@ -1078,13 +1290,15 @@ fn rename(
         return Err(Errno::ENOTEMPTY);
     }
     if source.directory
-        && (matches!(old.as_str(), "/dev" | "/dev/present" | "/dev/snd")
-            || !db
-                .rows::<Value>(
-                    "SELECT 1 FROM nodes n JOIN inodes i ON i.id = n.ino WHERE (n.path = ? OR instr(n.path, ?) = 1) AND i.rdev IS NOT NULL LIMIT 1",
-                    vec![text(&old), text(&format!("{old}/"))],
-                )
-                .is_empty())
+        && (matches!(
+            old.as_str(),
+            "/dev" | "/dev/pts" | "/dev/present" | "/dev/snd"
+        ) || !db
+            .rows::<Value>(
+                "SELECT 1 FROM nodes n JOIN inodes i ON i.id = n.ino WHERE (n.path = ? OR instr(n.path, ?) = 1) AND i.rdev IS NOT NULL LIMIT 1",
+                vec![text(&old), text(&format!("{old}/"))],
+            )
+            .is_empty())
     {
         return Err(Errno::EPERM);
     }
@@ -1130,14 +1344,6 @@ impl Db {
             "INSERT OR IGNORE INTO vfs_open_grants(open, credential) SELECT g.open, successor.token FROM vfs_open_grants g JOIN vfs_opens o ON o.id = g.open JOIN credentials prior ON prior.token = g.credential JOIN credentials successor ON successor.token = ? WHERE g.credential = ? AND o.revoked = 0 AND prior.ns = ? AND successor.ns = prior.ns AND successor.owner = prior.owner AND prior.expires > ? AND successor.expires > ? AND prior.cloud_access != 0 AND successor.cloud_access != 0",
             vec![text(new), text(old), text(ns), int(auth::now()), int(auth::now())],
         );
-    }
-    pub(crate) fn cloud_pinned(&self, ino: u64) -> bool {
-        !self
-            .rows::<Value>(
-                "SELECT id FROM vfs_opens WHERE ino = ? AND revoked = 0 LIMIT 1",
-                vec![int(ino)],
-            )
-            .is_empty()
     }
     pub(crate) fn cloud_accessed(&mut self, ino: u64) {
         let times = self.times(ino);
@@ -1403,5 +1609,162 @@ impl Db {
         let mut state = self.cloud_locks(ino);
         state.release(owner);
         self.save_cloud_locks(ino, &mut state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_session_row(id: &str, raw_secret: &str, ns: &str, expires: u64) -> SessionRow {
+        SessionRow {
+            id: id.to_string(),
+            secret: auth::token_hash(raw_secret),
+            ns: ns.to_string(),
+            expires,
+        }
+    }
+
+    fn make_handle(key: &str, fs: &FsId, session_id: &str, ino: u64, generation: u64) -> Handle {
+        let node = NodeId { ino, generation };
+        Handle {
+            fs: fs.clone(),
+            node,
+            proof: URL_SAFE_NO_PAD
+                .encode(proof_mac(key, fs, session_id, node).finalize().into_bytes()),
+        }
+    }
+
+    #[test]
+    fn check_fs_session_row_enforces_secret_namespace_and_expiry() {
+        let now = 1_700_000_000;
+        let row = make_session_row("sess-a", "sec-a", "user:1001", now + 3600);
+
+        // Missing X-Fs-Session / X-Fs-Secret -> EACCES.
+        assert_eq!(
+            check_fs_session_row(Some(row), "user:1001", None, now).err(),
+            Some(Errno::EACCES)
+        );
+
+        // Non-existent session row -> ENOTCONN.
+        assert_eq!(
+            check_fs_session_row(None, "user:1001", Some(("sess-a", "sec-a")), now).err(),
+            Some(Errno::ENOTCONN)
+        );
+
+        // Wrong secret -> EACCES.
+        let row = make_session_row("sess-a", "sec-a", "user:1001", now + 3600);
+        assert_eq!(
+            check_fs_session_row(Some(row), "user:1001", Some(("sess-a", "wrong")), now).err(),
+            Some(Errno::EACCES)
+        );
+
+        // Cross-namespace session -> EACCES.
+        let row = make_session_row("sess-a", "sec-a", "user:1002", now + 3600);
+        assert_eq!(
+            check_fs_session_row(Some(row), "user:1001", Some(("sess-a", "sec-a")), now).err(),
+            Some(Errno::EACCES)
+        );
+
+        // Expired session (`expires <= now`) -> ENOTCONN.
+        let expired = make_session_row("sess-a", "sec-a", "user:1001", now);
+        assert_eq!(
+            check_fs_session_row(Some(expired), "user:1001", Some(("sess-a", "sec-a")), now).err(),
+            Some(Errno::ENOTCONN)
+        );
+
+        // Matching session, namespace, secret, and future expiry -> Ok.
+        let valid = make_session_row("sess-a", "sec-a", "user:1001", now + 60);
+        let checked =
+            check_fs_session_row(Some(valid), "user:1001", Some(("sess-a", "sec-a")), now).unwrap();
+        assert_eq!(checked.id, "sess-a");
+    }
+
+    #[test]
+    fn verify_handle_proof_and_open_row_reject_cross_session_capabilities() {
+        let key = "test-handle-hmac-key";
+        let fs = FsId("cloud:test".to_string());
+
+        let handle_a = make_handle(key, &fs, "sess-a", 42, 1);
+        assert_eq!(
+            verify_handle_proof_for_session(key, &fs, "sess-a", &handle_a),
+            Ok(())
+        );
+        // Handle minted for `sess-a` rejected when presented under `sess-b` in the same namespace!
+        assert_eq!(
+            verify_handle_proof_for_session(key, &fs, "sess-b", &handle_a),
+            Err(Errno::EACCES)
+        );
+        // Wrong FsId -> EACCES.
+        assert_eq!(
+            verify_handle_proof_for_session(key, &FsId("cloud:other".into()), "sess-a", &handle_a),
+            Err(Errno::EACCES)
+        );
+        // Stale generation -> ESTALE (when HMAC matches that generation).
+        let stale_handle = make_handle(key, &fs, "sess-a", 42, 2);
+        assert_eq!(
+            verify_handle_proof_for_session(key, &fs, "sess-a", &stale_handle),
+            Err(Errno::ESTALE)
+        );
+
+        // OpenRef bound to `sess-a` succeeds for `sess-a` and fails `EACCES` for `sess-b` or revoked.
+        let open = OpenRef {
+            fs: fs.clone(),
+            id: 7,
+            node: NodeId {
+                ino: 42,
+                generation: 1,
+            },
+            access: Access::Path,
+        };
+        let open_row = OpenRow {
+            id: 7,
+            session: "sess-a".to_string(),
+            ino: 42,
+            access: serde_json::to_string(&Access::Path).unwrap(),
+            revoked: 0,
+        };
+        assert_eq!(open_row.id, 7);
+        assert_eq!(
+            check_open_row_for_session(&fs, "sess-a", &open_row, &open),
+            Ok(())
+        );
+        assert_eq!(
+            check_open_row_for_session(&fs, "sess-b", &open_row, &open),
+            Err(Errno::EACCES)
+        );
+        let revoked_row = OpenRow {
+            revoked: 1,
+            ..open_row
+        };
+        assert_eq!(
+            check_open_row_for_session(&fs, "sess-a", &revoked_row, &open),
+            Err(Errno::EACCES)
+        );
+    }
+
+    #[test]
+    fn metadata_rdev_encodes_incomplete_upload_writing_tag_only_for_regular_files() {
+        let reg = Node::file(1001, 1001, 0o644, "file-1".into(), 1024);
+        assert_eq!(metadata_rdev(&reg, None), None);
+        assert_eq!(
+            metadata_rdev(&reg, Some((512, false))).as_deref(),
+            Some("os.writing:512:0")
+        );
+        assert_eq!(
+            metadata_rdev(&reg, Some((4096, true))).as_deref(),
+            Some("os.writing:4096:1")
+        );
+
+        let mut dev = Node::file(0, 0, 0o666, String::new(), 0);
+        dev.file = None;
+        dev.rdev = Some("null".into());
+        assert_eq!(
+            metadata_rdev(&dev, Some((128, false))).as_deref(),
+            Some("null")
+        );
+
+        let dir = Node::directory(0, 0, 0o755);
+        assert_eq!(metadata_rdev(&dir, Some((128, false))), None);
     }
 }

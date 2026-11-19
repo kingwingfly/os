@@ -308,8 +308,261 @@ struct CreatedPolicy {
     acl_bytes: Option<Vec<u8>>,
 }
 
+struct SnapshotFs(Rc<dyn Filesystem>);
+
+impl Filesystem for SnapshotFs {
+    fn id(&self) -> &FsId {
+        self.0.id()
+    }
+    fn capabilities(&self) -> abi::contract::FsCapabilities {
+        let mut caps = self.0.capabilities();
+        caps.open_survives_unlink = abi::contract::Support::Refused(Errno::EROFS);
+        caps
+    }
+    fn root(&self) -> Handle {
+        self.0.root()
+    }
+    fn lookup<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+    ) -> vfs::BoxFuture<'a, Entry> {
+        self.0.lookup(cred, dir, name)
+    }
+    fn walk<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        names: &'a [String],
+    ) -> vfs::BoxFuture<'a, vfs::Walked> {
+        self.0.walk(cred, dir, names)
+    }
+    fn parent<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+    ) -> vfs::BoxFuture<'a, Option<(Entry, String)>> {
+        self.0.parent(cred, dir)
+    }
+    fn metadata<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> vfs::BoxFuture<'a, Metadata> {
+        self.0.metadata(cred, handle)
+    }
+    fn setattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        attr: &'a SetAttr,
+    ) -> vfs::BoxFuture<'a, Metadata> {
+        if attr.size.is_some() {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.0.setattr(cred, handle, attr)
+    }
+    fn read_dir<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+    ) -> vfs::BoxFuture<'a, Vec<vfs::DirEntry>> {
+        self.0.read_dir(cred, dir)
+    }
+    fn read_link<'a>(&'a self, cred: &'a Cred, link: &'a Handle) -> vfs::BoxFuture<'a, String> {
+        self.0.read_link(cred, link)
+    }
+    fn create<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+        _mode: u16,
+        _options: &'a OpenOptions,
+    ) -> vfs::BoxFuture<'a, (Entry, OpenRef)> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn mkdir<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+        _mode: u16,
+    ) -> vfs::BoxFuture<'a, Entry> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn mknod<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+        _mode: u16,
+        _rdev: &'a str,
+    ) -> vfs::BoxFuture<'a, Entry> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn symlink<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+        _target: &'a str,
+    ) -> vfs::BoxFuture<'a, Entry> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn link<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _target: &'a Handle,
+        _dir: &'a Handle,
+        _name: &'a str,
+    ) -> vfs::BoxFuture<'a, Entry> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn unlink<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+    ) -> vfs::BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn rmdir<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+    ) -> vfs::BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn rename<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _from_dir: &'a Handle,
+        _from: &'a str,
+        _to_dir: &'a Handle,
+        _to: &'a str,
+        _flags: RenameFlags,
+    ) -> vfs::BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn getxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+    ) -> vfs::BoxFuture<'a, Vec<u8>> {
+        self.0.getxattr(cred, handle, name)
+    }
+    fn setxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+        value: &'a [u8],
+        flags: XattrFlags,
+    ) -> vfs::BoxFuture<'a, ()> {
+        self.0.setxattr(cred, handle, name, value, flags)
+    }
+    fn listxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+    ) -> vfs::BoxFuture<'a, Vec<String>> {
+        self.0.listxattr(cred, handle)
+    }
+    fn removexattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+    ) -> vfs::BoxFuture<'a, ()> {
+        self.0.removexattr(cred, handle, name)
+    }
+    fn statfs<'a>(&'a self, cred: &'a Cred) -> vfs::BoxFuture<'a, vfs::StatFs> {
+        self.0.statfs(cred)
+    }
+    fn open<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        options: &'a OpenOptions,
+    ) -> vfs::BoxFuture<'a, OpenRef> {
+        Box::pin(async move {
+            let access = options.access()?;
+            if access != Access::Path && (access.writes() || options.is_truncate()) {
+                return Err(Errno::EROFS);
+            }
+            self.0.open(cred, handle, options).await
+        })
+    }
+    fn open_metadata<'a>(&'a self, open: &'a OpenRef) -> vfs::BoxFuture<'a, Metadata> {
+        self.0.open_metadata(open)
+    }
+    fn read_at<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> vfs::BoxFuture<'a, usize> {
+        self.0.read_at(open, buf, offset)
+    }
+    fn write_at<'a>(
+        &'a self,
+        _open: &'a OpenRef,
+        _buf: &'a [u8],
+        _at: WriteAt,
+    ) -> vfs::BoxFuture<'a, vfs::Written> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn set_len<'a>(&'a self, _open: &'a OpenRef, _size: u64) -> vfs::BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::EROFS) })
+    }
+    fn sync_all<'a>(&'a self, open: &'a OpenRef) -> vfs::BoxFuture<'a, ()> {
+        self.0.sync_all(open)
+    }
+    fn sync_data<'a>(&'a self, open: &'a OpenRef) -> vfs::BoxFuture<'a, ()> {
+        self.0.sync_data(open)
+    }
+    fn lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
+    ) -> vfs::BoxFuture<'a, ()> {
+        self.0.lock(open, family, kind, range)
+    }
+    fn try_lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
+    ) -> vfs::BoxFuture<'a, ()> {
+        self.0.try_lock(open, family, kind, range)
+    }
+    fn unlock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        range: LockRange,
+    ) -> vfs::BoxFuture<'a, ()> {
+        self.0.unlock(open, family, range)
+    }
+    fn test_lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        kind: LockKind,
+        range: LockRange,
+    ) -> vfs::BoxFuture<'a, Option<vfs::Conflict>> {
+        self.0.test_lock(open, kind, range)
+    }
+    fn release<'a>(&'a self, open: &'a OpenRef) -> vfs::BoxFuture<'a, ()> {
+        self.0.release(open)
+    }
+}
+
 struct SharedMountState {
     fs: Rc<dyn Filesystem>,
+    provider_state: Rc<vfs::ProviderState>,
     grant: Grant,
     grant_js: JsValue,
     active: Cell<bool>,
@@ -324,6 +577,16 @@ impl SharedMountState {
         let mut views = self.views.borrow_mut();
         views.retain(|w| w.strong_count() > 0);
         views.push(Rc::downgrade(opens));
+    }
+
+    fn lose_provider(&self) {
+        self.provider_state.lose();
+        self.shutdown();
+    }
+
+    fn revoke_provider(&self) {
+        self.provider_state.revoke();
+        self.shutdown();
     }
 
     fn shutdown(&self) {
@@ -382,7 +645,8 @@ pub struct LocalMount {
     identity: Identity,
     boundary: Vec<String>,
     remote: bool,
-    next_local_open: Cell<u64>,
+    next_local_open: Rc<Cell<u64>>,
+    path_checks: HashMap<Vec<String>, NodeId>,
     opens: OpenMap,
 }
 
@@ -430,6 +694,7 @@ impl LocalMount {
         let opens = Rc::new(RefCell::new(HashMap::new()));
         let state = Rc::new(SharedMountState {
             fs,
+            provider_state: vfs::ProviderState::new(),
             grant,
             grant_js,
             active: Cell::new(true),
@@ -444,14 +709,63 @@ impl LocalMount {
             identity,
             boundary: Vec::new(),
             remote: false,
-            next_local_open: Cell::new(1),
+            next_local_open: Rc::new(Cell::new(1)),
+            path_checks: HashMap::new(),
             opens,
         }
     }
 
-    pub(crate) fn detach_callback(&self) -> Rc<dyn Fn()> {
+    pub(crate) fn lose_callback(&self) -> Rc<dyn Fn()> {
         let state = Rc::clone(&self.state);
-        Rc::new(move || state.shutdown())
+        Rc::new(move || state.lose_provider())
+    }
+
+    pub(crate) fn revoke_callback(&self) -> Rc<dyn Fn()> {
+        let state = Rc::clone(&self.state);
+        Rc::new(move || state.revoke_provider())
+    }
+
+    pub(crate) fn mount_backing(&self, fstype: vfs::FsType) -> Rc<vfs::MountBacking> {
+        let fs: Rc<dyn Filesystem> = if self.state.snapshot_data_ro {
+            Rc::new(SnapshotFs(Rc::clone(&self.state.fs)))
+        } else {
+            Rc::clone(&self.state.fs)
+        };
+        let rdonly_ceiling = self.state.grant.read_only && !self.state.snapshot_data_ro;
+        let noexec_ceiling = !self.state.grant.execute;
+        let state_for_release = Rc::clone(&self.state);
+        Rc::new(
+            vfs::MountBacking::new(fs, fstype)
+                .with_provider(Rc::clone(&self.state.provider_state))
+                .with_ceilings(rdonly_ceiling, noexec_ceiling)
+                .with_on_release(move || state_for_release.shutdown()),
+        )
+    }
+
+    pub(crate) fn provider_state(&self) -> Rc<vfs::ProviderState> {
+        Rc::clone(&self.state.provider_state)
+    }
+
+    pub(crate) fn grant_info(&self) -> &Grant {
+        &self.state.grant
+    }
+
+    pub(crate) fn grant_js(&self) -> JsValue {
+        self.state.grant_js.clone()
+    }
+
+    pub(crate) fn clone_owner(&self) -> Self {
+        let opens = Rc::new(RefCell::new(HashMap::new()));
+        self.state.register_view(&opens);
+        Self {
+            state: Rc::clone(&self.state),
+            identity: self.state.grant.owner.clone(),
+            boundary: Vec::new(),
+            remote: false,
+            next_local_open: Rc::new(Cell::new(1)),
+            path_checks: HashMap::new(),
+            opens,
+        }
     }
 
     fn check_grant(&self, grant: &JsValue) -> std::result::Result<(), Errno> {
@@ -632,6 +946,13 @@ impl LocalMount {
         self.check_within_boundary(&initial_parts)?;
         let fs = &self.state.fs;
         let mut stack = self.walk_to_boundary(cred).await?;
+        if self
+            .path_checks
+            .get(&self.boundary)
+            .is_some_and(|n| *n != stack.last().expect("boundary").entry.handle.node)
+        {
+            return Err(Errno::ESTALE);
+        }
         let boundary_stack_len = stack.len();
         let mut queue: VecDeque<String> = initial_parts[self.boundary.len()..]
             .iter()
@@ -662,12 +983,37 @@ impl LocalMount {
                     }
                     let is_last = queue.is_empty();
                     let parent_entry = stack.last().expect("boundary").entry.clone();
+                    let checked_prefix: Vec<_> = if self.path_checks.is_empty() {
+                        Vec::new()
+                    } else {
+                        stack
+                            .iter()
+                            .filter_map(|frame| frame.component.clone())
+                            .chain(std::iter::once(name.clone()))
+                            .collect()
+                    };
+                    let expected = self.path_checks.get(&checked_prefix);
                     match fs.lookup(cred, &parent_entry.handle, &name).await {
                         Ok(next) => {
+                            if expected.is_some_and(|node| *node != next.handle.node)
+                                || next.metadata.is_symlink()
+                                    && self.path_checks.keys().any(|path| {
+                                        path.len() > checked_prefix.len()
+                                            && path.starts_with(&checked_prefix)
+                                    })
+                            {
+                                return Err(Errno::ESTALE);
+                            }
                             stack.last_mut().expect("boundary").searchable = true;
                             if next.metadata.file_type == FileType::Symlink
                                 && (!is_last || follow_last || trailing_dir)
                             {
+                                if matches!(
+                                    fs.capabilities().identity,
+                                    abi::contract::IdentityScope::HostLocal
+                                ) {
+                                    return Err(Errno::ELOOP);
+                                }
                                 if !vfs::descriptions::may_follow_link(
                                     cred,
                                     &parent_entry.metadata,
@@ -708,6 +1054,7 @@ impl LocalMount {
                                 searchable: false,
                             });
                         }
+                        Err(Errno::ENOENT) if expected.is_some() => return Err(Errno::ESTALE),
                         Err(Errno::ENOENT) if allow_missing_last && is_last => {
                             if trailing_dir {
                                 return Err(Errno::EISDIR);
@@ -1279,6 +1626,8 @@ impl LocalMount {
             (meta.mtime.sec as f64) * 1000.0 + (meta.mtime.nsec as f64) / 1_000_000.0;
         let executable = meta.file_type == FileType::Dir
             || (self.state.grant.execute && (meta.mode & 0o111) != 0);
+        let mut st_val = serde_json::to_value(&st).unwrap_or(Value::Null);
+        st_val["generation"] = json!(handle.node.generation);
         let mut obj = json!({
             "kind": kind_str,
             "name": name,
@@ -1286,7 +1635,9 @@ impl LocalMount {
             "lastModified": last_modified_ms,
             "readOnly": self.state.grant.read_only || self.state.snapshot_data_ro,
             "executable": executable,
-            "vfs": st,
+            "nosymfollow": matches!(fs.capabilities().identity, abi::contract::IdentityScope::HostLocal),
+            "fsId": fs.id().0,
+            "vfs": st_val,
         });
         if let Some(ref link) = st.link {
             obj["link"] = Value::String(link.clone());
@@ -1322,6 +1673,27 @@ impl LocalMount {
         self.state.fs.id().0.clone()
     }
 
+    #[wasm_bindgen(js_name = withPathChecks)]
+    pub fn with_path_checks(&self, checks: JsValue) -> Result<LocalMount, JsValue> {
+        let checks: Vec<(String, NodeId)> =
+            serde_json::from_value(js_to_json(&checks)?).map_err(|_| map_vfs_err(Errno::EINVAL))?;
+        let mut path_checks = HashMap::new();
+        for (path, node) in checks {
+            let (parts, _) = clean_rel_path(&path).map_err(map_vfs_err)?;
+            self.check_within_boundary(&parts).map_err(map_vfs_err)?;
+            path_checks.insert(parts, node);
+        }
+        Ok(Self {
+            state: self.state.clone(),
+            identity: self.identity.clone(),
+            boundary: self.boundary.clone(),
+            remote: self.remote,
+            next_local_open: self.next_local_open.clone(),
+            opens: self.opens.clone(),
+            path_checks,
+        })
+    }
+
     #[wasm_bindgen(js_name = forIdentity)]
     pub fn for_identity(&self, identity: JsValue, boundary: &str) -> Result<LocalMount, JsValue> {
         let parsed = parse_identity(&identity)?;
@@ -1333,7 +1705,8 @@ impl LocalMount {
             identity: parsed,
             boundary: boundary_parts,
             remote: true,
-            next_local_open: Cell::new(1),
+            next_local_open: Rc::new(Cell::new(1)),
+            path_checks: HashMap::new(),
             opens,
         })
     }
@@ -1590,6 +1963,7 @@ impl LocalMount {
                     files: sfs.files,
                     ffree: sfs.files_free,
                     namelen: sfs.name_max,
+                    ..abi::StatFs::default()
                 };
                 json_to_js(&serde_json::to_value(out).unwrap_or(Value::Null))
             }
@@ -1604,6 +1978,7 @@ impl LocalMount {
         flags: u32,
         mode: Option<u16>,
         umask: Option<u16>,
+        exec: Option<bool>,
     ) -> Result<JsValue, JsValue> {
         self.check_grant(&grant).map_err(map_vfs_err)?;
         if self.opens.borrow().len() >= 1024 {
@@ -1622,7 +1997,22 @@ impl LocalMount {
         if flags & !allowed_mask != 0 {
             return Err(map_vfs_err(Errno::EOPNOTSUPP));
         }
-        let options = OpenOptions::from_flags(flags).map_err(map_vfs_err)?;
+        let exec_open = exec.unwrap_or(false);
+        let mut options = OpenOptions::from_flags(flags).map_err(map_vfs_err)?;
+        if exec_open {
+            if flags & abi::O_PATH != 0
+                || (flags & abi::O_ACCMODE) != abi::O_RDONLY
+                || flags & O_DIRECTORY != 0
+                || options.is_create()
+                || options.is_truncate()
+            {
+                return Err(map_vfs_err(Errno::EINVAL));
+            }
+            if !self.state.grant.execute {
+                return Err(map_vfs_err(Errno::EACCES));
+            }
+            options = *OpenOptions::new().exec(true);
+        }
         let access = options.access().map_err(map_vfs_err)?;
 
         let cred = self.cred(umask);
@@ -1676,6 +2066,9 @@ impl LocalMount {
             .map_err(map_vfs_err)?;
         if access != Access::Path && nofollow && entry.metadata.file_type == FileType::Symlink {
             return Err(map_vfs_err(Errno::ELOOP));
+        }
+        if access == Access::Exec && entry.metadata.file_type == FileType::Dir {
+            return Err(map_vfs_err(Errno::EACCES));
         }
         if access != Access::Path
             && (access.writes() || options.is_truncate())
@@ -1780,7 +2173,12 @@ impl LocalMount {
             if !open.held && !open.open_ref.access.reads() {
                 return Err(map_vfs_err(Errno::EBADF));
             }
-            self.verify_remote_open_live(&cred, &open, Access::Read)
+            let access = if open.open_ref.access == Access::Exec {
+                Access::Exec
+            } else {
+                Access::Read
+            };
+            self.verify_remote_open_live(&cred, &open, access)
                 .await
                 .map_err(map_vfs_err)?;
             if open.open_ref.access == Access::Path {
@@ -2164,6 +2562,60 @@ impl LocalMount {
             .await
             .map_err(map_vfs_err)?;
         Ok(JsValue::NULL)
+    }
+
+    #[wasm_bindgen(js_name = parentOf)]
+    pub async fn parent_of(
+        &self,
+        grant: JsValue,
+        path: &str,
+        node: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        self.check_grant(&grant).map_err(map_vfs_err)?;
+        let expected: NodeId =
+            serde_json::from_value(js_to_json(&node)?).map_err(|_| map_vfs_err(Errno::EINVAL))?;
+        let cred = self.cred(None);
+        let (parent, name, _) = self
+            .resolve_parent(&cred, path)
+            .await
+            .map_err(map_vfs_err)?;
+        let child = self
+            .state
+            .fs
+            .lookup(&cred, &parent.handle, &name)
+            .await
+            .map_err(map_vfs_err)?;
+        if child.handle.node != expected {
+            return Err(map_vfs_err(Errno::ESTALE));
+        }
+        self.format_stat_js(&cred, &parent.handle, &parent.metadata, "")
+            .await
+    }
+
+    #[wasm_bindgen(js_name = removeIf)]
+    pub async fn remove_if(
+        &self,
+        grant: JsValue,
+        path: &str,
+        node: JsValue,
+    ) -> Result<(), JsValue> {
+        self.check_grant(&grant).map_err(map_vfs_err)?;
+        self.require_data_writable().map_err(map_vfs_err)?;
+        let node =
+            serde_json::from_value(js_to_json(&node)?).map_err(|_| map_vfs_err(Errno::EINVAL))?;
+        let cred = self.cred(None);
+        let (parent, name, parts) = self
+            .resolve_parent(&cred, path)
+            .await
+            .map_err(map_vfs_err)?;
+        self.state
+            .fs
+            .unlink_if(&cred, &parent.handle, &name, node)
+            .await
+            .map_err(map_vfs_err)?;
+        self.prune_known_paths(&parts.join("/"), false, None);
+        bump_fs_policy_rev(self.state.fs.id());
+        Ok(())
     }
 
     pub async fn remove(
@@ -2566,7 +3018,8 @@ impl LocalMount {
                     identity,
                     boundary,
                     remote,
-                    next_local_open: Cell::new(1),
+                    next_local_open: Rc::new(Cell::new(1)),
+                    path_checks: HashMap::new(),
                     opens: Rc::new(RefCell::new(HashMap::new())),
                 };
                 let check_cred = view.cred(None);

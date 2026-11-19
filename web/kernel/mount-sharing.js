@@ -2,7 +2,7 @@ import { localImage, pinImage } from './local-mounts.js';
 import { NativeMount } from './native-mount.js';
 const bad = (errno, message = errno) => Object.assign(new Error(message), { errno });
 const CHUNK = 24 * 1024, MAX = 128 * 1024 * 1024;
-const mutations = new Set(['write', 'ftruncate', 'mkdir', 'remove', 'rename', 'link', 'symlink']);
+const mutations = new Set(['write', 'ftruncate', 'mkdir', 'remove', 'removeIf', 'rename', 'link', 'symlink']);
 const isMutation = (op, args) => mutations.has(op)
   || (op === 'open' && Number.isSafeInteger(args?.flags) && !(args.flags & 0o10000000) && (args.flags & 0o1100) !== 0);
 const disconnected = errno => bad(errno, errno === 'EACCES'
@@ -53,7 +53,8 @@ class Connection {
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.close('ETIMEDOUT'), 15000);
-      this.pending.set(id, { resolve, reject, timer, mutation: isMutation(op, args) });
+      const mutation = op === 'checked' ? isMutation(args.op, args.args) : isMutation(op, args);
+      this.pending.set(id, { resolve, reject, timer, mutation });
       try { this.send({ type: 'request', id, op, args }); } catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
     });
   }
@@ -66,7 +67,7 @@ class Connection {
       waiting.reject(waiting.mutation ? bad(errno, 'Connection lost before the file change was confirmed. It may already have been saved. Check the shared folder before repeating the change.') : error);
     }
     this.pending.clear();
-    this.port.postMessage({ type: 'close' }); this.port.close(); this.onclose?.();
+    this.port.postMessage({ type: 'close' }); this.port.close(); this.onclose?.(errno);
   }
 }
 async function connect(grant, port, role) {
@@ -79,9 +80,15 @@ const safePath = path => {
   return path.split('/').filter(name => name && name !== '.').join('/');
 };
 export async function exportMount(workspace, args) {
-  const found = workspace.resolve(args.path);
-  if (!found || !found.mount.provider.forIdentity) throw bad('EACCES', 'publish a local filesystem');
-  const { provider, grant: source } = found.mount;
+  const resolved = workspace.resolveExport
+    ? await workspace.resolveExport(args.path)
+    : (() => {
+        const f = workspace.resolve?.(args.path);
+        return f ? { mountPath: f.mount.path, relative: f.relative, grant: f.mount.grant, provider: f.mount.provider, mountRef: f.mount } : null;
+      })();
+  if (!resolved || !resolved.provider?.forIdentity) throw bad('EACCES', 'publish a local filesystem');
+  const { provider, grant: source, relative, mountPath } = resolved;
+  const found = { relative, mount: resolved.mountRef ?? { path: mountPath, provider, grant: source } };
   if ((await provider.stat(source, found.relative)).kind !== 'directory') throw bad('ENOTDIR');
   if (source.kind === 'native-directory' && provider.identitySupported !== true) throw bad('EPROTONOSUPPORT', 'Update os-local-helper before sharing this folder.');
   const grant = await mountApi(workspace, 'publish', { name: args.name, write: !source.readOnly, execute: source.execute, seconds: args.seconds, password: args.password ?? '' });
@@ -114,11 +121,11 @@ export async function exportMount(workspace, args) {
   port.onmessageerror = () => controller.close(); port.start();
   port.postMessage({ type: 'listen', url: '/api/mounts/listen/' + grant.id + '?ticket=' + grant.ticket, expires: grant.expires });
   try { await ready; } catch (error) { controller.close(); await mountApi(workspace, 'revoke/' + grant.id).catch(() => {}); throw error; }
-  workspace.exports ??= new Map(); workspace.exports.set(grant.id, { connection: controller, grant, mount: found.mount, clients });
+  workspace.exports ??= new Map(); workspace.exports.set(grant.id, { connection: controller, grant, mount: found.mount, mountPath: mountPath ?? found.mount.path, clients });
   const { ticket, ...publicGrant } = grant;
   return { ...publicGrant, address: 'osfs:' + grant.id };
 }
-const PATH_ONLY_OPS = new Set(['open', 'hold', 'list', 'mkdir', 'remove', 'rename', 'link', 'symlink', 'readlink', 'pin']);
+const PATH_ONLY_OPS = new Set(['open', 'hold', 'parentOf', 'list', 'mkdir', 'remove', 'removeIf', 'rename', 'link', 'symlink', 'readlink', 'pin']);
 const VFS_SAFE_MAX = 0x1fffffffffffff;
 const VFS_U32_MAX = 0xffffffff;
 const KIND_TYPE_BITS = { file: 0o100000, directory: 0o040000, symlink: 0o120000 };
@@ -153,6 +160,7 @@ function sanitizeRemoteStat(value, grant) {
     sanitizedVfs = {
       dev: raw.dev,
       ino: raw.ino,
+      ...(isSafePos53(raw.generation) ? { generation: raw.generation } : {}),
       mode,
       nlink: raw.nlink,
       uid: raw.uid,
@@ -175,39 +183,55 @@ function sanitizeRemoteStat(value, grant) {
     ...value,
     readOnly: grant.readOnly,
     executable: value.kind === 'directory' || (grant.execute && !!value.executable),
+    ...(typeof value.fsId === 'string' && value.fsId ? { fsId: value.fsId } : {}),
     ...(sanitizedVfs ? { vfs: sanitizedVfs } : {}),
   };
 }
 
-function serve(workspace, found, provider, source, grant, connection) {
+function serve(workspace, found, baseProvider, source, grant, connection) {
   const pins = new Map(), handles = new Map(), seen = new Set(); let busy = 0, highest = 0;
   const retainHandle = handle => {
     if (!connection.active) {
-      void provider.release?.(source, handle)?.catch(() => {});
+      void baseProvider.release?.(source, handle)?.catch(() => {});
       throw bad('ENODEV');
     }
     const id = crypto.randomUUID();
     handles.set(id, handle);
     return id;
   };
-  connection.onclose = () => { pins.clear(); for (const handle of handles.values()) void provider.release?.(source, handle)?.catch(() => {}); handles.clear(); };
+  connection.onclose = () => { pins.clear(); for (const handle of handles.values()) void baseProvider.release?.(source, handle)?.catch(() => {}); handles.clear(); };
   connection.serve = async message => {
     try {
       connection.check(); workspace.check();
       if (!Number.isSafeInteger(message.id) || message.id <= 0 || message.id <= highest - 16 || seen.has(message.id) || busy >= 4) throw bad('EAGAIN');
       seen.add(message.id); highest = Math.max(highest, message.id); for (const id of seen) if (id <= highest - 16) seen.delete(id);
       busy++;
-      let value;
+      let value, scoped;
       try {
-        const args = message.args ?? {};
-        if (args.handle !== undefined && PATH_ONLY_OPS.has(message.op)) throw bad('EINVAL', 'handle is not valid for path operation');
+        const checked = message.op === 'checked';
+        const op = checked ? message.args?.op : message.op;
+        const args = (checked ? message.args?.args : message.args) ?? {};
+        if (checked) {
+          const checks = message.args.checks;
+          if (!Array.isArray(checks) || checks.length > 2 || !baseProvider.withPathChecks) throw bad('EOPNOTSUPP');
+          scoped = baseProvider.withPathChecks(checks.map(([relative, node]) => [
+            [found.relative, safePath(relative)].filter(Boolean).join('/'), node,
+          ]));
+        }
+        const provider = scoped ?? baseProvider;
+        if (args.handle !== undefined && PATH_ONLY_OPS.has(op)) throw bad('EINVAL', 'handle is not valid for path operation');
         const path = args.handle === undefined ? args.path === undefined ? null : [found.relative, safePath(args.path)].filter(Boolean).join('/') : handles.get(args.handle);
         if (args.handle !== undefined && !path) throw bad('EBADF');
-        switch (message.op) {
+        switch (op) {
           case 'open': {
             if (handles.size >= 128) throw bad('EMFILE');
             const flags = Number.isSafeInteger(args.flags) ? args.flags : 0;
+            const exec = Boolean(args.exec);
             let openFlags = flags;
+            if (exec) {
+              if (!grant.execute) throw bad('EACCES');
+              if ((flags & 3) !== 0 || (flags & 0o10000000) || (flags & (0o100 | 0o1000 | 0o200000))) throw bad('EINVAL');
+            }
             if (!grant.write && !(flags & 0o10000000)) {
               if ((flags & 3) !== 0 || (flags & 0o1000) !== 0) throw bad('EROFS');
               if (flags & 0o100) {
@@ -225,20 +249,45 @@ function serve(workspace, found, provider, source, grant, connection) {
               if (openFlags & 0o200) throw bad('EOPNOTSUPP');
               const st = await provider.stat(source, path, { follow: !(openFlags & 0o400000) });
               if ((openFlags & 0o400000) && st.kind === 'symlink') throw bad('ELOOP');
-              if (st.kind === 'directory') throw bad((openFlags & 0o200000) ? 'EOPNOTSUPP' : 'EISDIR');
+              if (st.kind === 'directory') throw bad(exec ? 'EACCES' : (openFlags & 0o200000) ? 'EOPNOTSUPP' : 'EISDIR');
               if (openFlags & 0o200000) throw bad('ENOTDIR');
+              if (exec && !st.executable) throw bad('EACCES');
               value = retainHandle(await provider.hold(source, path, found.relative)); break;
             }
-            value = retainHandle(await provider.open(source, path, openFlags, args.mode ?? 0o666, args.umask ?? 0o077)); break;
+            value = retainHandle(await provider.open(source, path, openFlags, args.mode ?? 0o666, args.umask ?? 0o077, exec)); break;
           }
           case 'hold': {
             if (handles.size >= 128) throw bad('EMFILE');
             value = retainHandle(await provider.hold(source, path, found.relative)); break;
           }
           case 'release': { if (!handles.has(args.handle)) throw bad('EBADF'); await provider.release(source, path); handles.delete(args.handle); value = null; break; }
-          case 'policy':
-            if (!['access', 'getxattr', 'listxattr', 'statfs'].includes(args.name)) throw bad('EPERM');
+          case 'policy': {
+            const readOps = ['access', 'getxattr', 'listxattr', 'statfs'];
+            const writeOps = ['chmod', 'chown', 'utimens', 'setxattr', 'removexattr'];
+            if (!readOps.includes(args.name) && !(grant.write && writeOps.includes(args.name))) throw bad('EPERM');
+            if (!provider.policy) throw bad('EOPNOTSUPP');
             value = await provider.policy(source, path, args.name, args.options); break;
+          }
+          case 'tryLock':
+          case 'lock':
+          case 'unlock': {
+            if (args.handle === undefined) throw bad('EBADF');
+            const fn = provider[op];
+            if (typeof fn !== 'function') throw bad('EOPNOTSUPP');
+            value = op === 'unlock'
+              ? await fn.call(provider, source, path, args.family, args.start, args.end ?? null)
+              : await fn.call(provider, source, path, args.family, args.kind, args.start, args.end ?? null);
+            break;
+          }
+          case 'testLock': {
+            if (args.handle === undefined) throw bad('EBADF');
+            if (typeof provider.testLock !== 'function') throw bad('EOPNOTSUPP');
+            value = await provider.testLock(source, path, args.kind, args.start, args.end ?? null);
+            break;
+          }
+          case 'parentOf':
+            if (!provider.parentOf) throw bad('EOPNOTSUPP');
+            value = await provider.parentOf(source, path, args.node); break;
           case 'stat': value = await provider.stat(source, path, { follow: args.follow !== false }); break;
           case 'list': {
             value = await provider.list(source, path, { offset: args.offset, limit: Math.min(16, args.limit ?? 16) });
@@ -263,6 +312,10 @@ function serve(workspace, found, provider, source, grant, connection) {
           case 'mkdir':
             if (!grant.write) throw bad('EROFS');
             value = await provider.mkdir(source, path, args.mode ?? 0o777, args.umask ?? 0o077); break;
+          case 'removeIf':
+            if (!grant.write) throw bad('EROFS');
+            if (typeof provider.removeIf !== 'function') throw bad('EOPNOTSUPP');
+            value = await provider.removeIf(source, path, args.node); break;
           case 'remove':
             if (!grant.write) throw bad('EROFS');
             value = await provider.remove(source, path, !!args.directory); break;
@@ -300,7 +353,7 @@ function serve(workspace, found, provider, source, grant, connection) {
           case 'unpin': pins.delete(args.id); value = null; break;
           default: throw bad('EOPNOTSUPP');
         }
-      } finally { busy--; }
+      } finally { scoped?.free(); busy--; }
       connection.check(); connection.send({ type: 'reply', id: message.id, value });
     } catch (error) { try { connection.send({ type: 'reply', id: message.id, error: { errno: error.errno ?? 'EIO', message: error.message } }); } catch {} }
   };
@@ -315,10 +368,20 @@ export async function attachMount(workspace, args) {
 }
 class RemoteMount {
   #handles = new WeakMap();
-  constructor(connection, grant) {
+  constructor(connection, grant, parent, checks) {
     this.connection = connection; this.remote = grant;
+    if (parent) {
+      this.grant = parent.grant;
+      this.#handles = parent.#handles;
+      this.checks = checks;
+      return;
+    }
     this.grant = Object.freeze({ kind: 'shared', name: grant.name, readOnly: !grant.write, execute: grant.execute });
+    this.connection.onclose = errno => {
+      this.onProviderEvent?.(errno === 'EACCES' ? 'revoked' : 'lost');
+    };
   }
+  withPathChecks(checks) { return new RemoteMount(this.connection, this.remote, this, checks); }
   check(grant) { if (grant !== this.grant) throw bad('EACCES'); this.connection.check(); }
   request(grant, op, args) {
     this.check(grant);
@@ -326,15 +389,20 @@ class RemoteMount {
       const handle = this.#handles.get(args.path); if (!handle) throw bad('EBADF');
       const { path, ...rest } = args; args = { ...rest, handle };
     } else if (args.path !== undefined) safePath(args.path);
-    return this.connection.request(op, args);
+    return this.checks ? this.connection.request('checked', { op, args, checks: this.checks }) : this.connection.request(op, args);
   }
-  async open(grant, path, flags = 0, mode = 0o666, umask = 0o077) {
+  async open(grant, path, flags = 0, mode = 0o666, umask = 0o077, exec = false) {
+    if (exec && !grant.execute) throw bad('EACCES');
     if (!(flags & 0o10000000) && ((flags & 3) !== 0 || (flags & 0o1000) !== 0) && grant.readOnly) throw bad('EROFS');
-    const id = await this.request(grant, 'open', { path, flags, mode, umask });
+    const id = await this.request(grant, 'open', { path, flags, mode, umask, exec: Boolean(exec) });
     const handle = Object.freeze({}); this.#handles.set(handle, id); return handle;
   }
   async hold(grant, path) { const id = await this.request(grant, 'hold', { path }); const handle = Object.freeze({}); this.#handles.set(handle, id); return handle; }
   async release(grant, path) { try { await this.request(grant, 'release', { path }); } finally { this.#handles.delete(path); } }
+  tryLock(grant, handle, family, kind, start, end = null) { return this.request(grant, 'tryLock', { path: handle, family, kind, start, end }); }
+  lock(grant, handle, family, kind, start, end = null) { return this.request(grant, 'lock', { path: handle, family, kind, start, end }); }
+  unlock(grant, handle, family, start, end = null) { return this.request(grant, 'unlock', { path: handle, family, start, end }); }
+  testLock(grant, handle, kind, start, end = null) { return this.request(grant, 'testLock', { path: handle, kind, start, end }); }
   policy(grant, path, name, options) { return this.request(grant, 'policy', { path, name, options }); }
   async access(grant, path, mode) {
     if (mode & 2 && grant.readOnly) throw bad('EROFS');
@@ -371,6 +439,10 @@ class RemoteMount {
     return this.request(grant, 'fsync', { path, dataOnly: !!dataOnly });
   }
   mkdir(grant, path, mode = 0o777, umask = 0o077) { return this.request(grant, 'mkdir', { path, mode, umask }); }
+  async parentOf(grant, path, node) {
+    return sanitizeRemoteStat(await this.request(grant, 'parentOf', { path, node }), grant);
+  }
+  removeIf(grant, path, node) { return this.request(grant, 'removeIf', { path, node }); }
   remove(grant, path, directory) { return this.request(grant, 'remove', { path, directory }); }
   rename(grant, path, to, noreplace = false) { safePath(to); return this.request(grant, 'rename', { path, to, noreplace: !!noreplace }); }
   link(grant, path, to, follow = false) { safePath(to); return this.request(grant, 'link', { path, to, follow: !!follow }); }
