@@ -680,11 +680,10 @@ impl MemFs {
         let mut state = self.state.borrow_mut();
         let target = self.check(&state, target)?;
         let dir = self.check(&state, dir)?;
-        let existing = Self::child(&state, cred, dir, name)?;
-        inode::may_link(&cred.identity, &state.inodes[&target].meta)?;
-        if existing.is_some() {
+        if Self::child(&state, cred, dir, name)?.is_some() {
             return Err(Errno::EEXIST);
         }
+        inode::may_link(&cred.identity, &state.inodes[&target].meta)?;
         let parent = &state.inodes[&dir];
         inode::may_create(&cred.identity, &parent.meta, parent.removed())?;
         // An unlinked file, though still open, takes no name again.

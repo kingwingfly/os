@@ -514,6 +514,14 @@ const TICKET_MAX: usize = 128;
 fn ticket_valid(ticket: &str) -> bool {
     !ticket.is_empty() && ticket.len() <= TICKET_MAX
 }
+fn metadata_rdev(node: &Node, writing: Option<(u64, bool)>) -> Option<String> {
+    if node.is_file() {
+        writing
+            .map(|(received, recording)| format!("os.writing:{received}:{}", u8::from(recording)))
+    } else {
+        node.rdev.clone()
+    }
+}
 fn metadata(db: &Db, node: &Node) -> Metadata {
     let times = db.times(node.ino);
     let nlink = if node.directory && node.links != 0 {
@@ -532,6 +540,7 @@ fn metadata(db: &Db, node: &Node) -> Metadata {
     } else {
         node.size
     };
+    let rdev = metadata_rdev(node, node.file.as_deref().and_then(|id| db.writing(id)));
     Metadata {
         file_type: file_type(node),
         mode: node.mode,
@@ -542,7 +551,7 @@ fn metadata(db: &Db, node: &Node) -> Metadata {
         atime: times.atime.into(),
         mtime: times.mtime.into(),
         ctime: times.ctime.into(),
-        rdev: node.rdev.clone(),
+        rdev,
         acl: node.acl.is_some(),
     }
 }
@@ -899,6 +908,9 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             if read_only(db, &path) {
                 return Err(Errno::EROFS);
             }
+            if db.persisted_node(&path).is_some() {
+                return Err(Errno::EEXIST);
+            }
             // These drivers identify devices by pathname and cannot serve an alias.
             if node.is_device() {
                 return Err(Errno::EPERM);
@@ -907,9 +919,6 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             unchanged_names(db, node.ino)?;
             if node.file.as_deref().is_some_and(|id| db.uploading(id)) {
                 return Err(Errno::EBUSY);
-            }
-            if db.persisted_node(&path).is_some() {
-                return Err(Errno::EEXIST);
             }
             inode::may_create(&who, &parent, false)?;
             check_home(db, c.credential.uid, &path)?;
@@ -1733,5 +1742,30 @@ mod tests {
             check_open_row_for_session(&fs, "sess-a", &revoked_row, &open),
             Err(Errno::EACCES)
         );
+    }
+
+    #[test]
+    fn metadata_rdev_encodes_incomplete_upload_writing_tag_only_for_regular_files() {
+        let reg = Node::file(1001, 1001, 0o644, "file-1".into(), 1024);
+        assert_eq!(metadata_rdev(&reg, None), None);
+        assert_eq!(
+            metadata_rdev(&reg, Some((512, false))).as_deref(),
+            Some("os.writing:512:0")
+        );
+        assert_eq!(
+            metadata_rdev(&reg, Some((4096, true))).as_deref(),
+            Some("os.writing:4096:1")
+        );
+
+        let mut dev = Node::file(0, 0, 0o666, String::new(), 0);
+        dev.file = None;
+        dev.rdev = Some("null".into());
+        assert_eq!(
+            metadata_rdev(&dev, Some((128, false))).as_deref(),
+            Some("null")
+        );
+
+        let dir = Node::directory(0, 0, 0o755);
+        assert_eq!(metadata_rdev(&dir, Some((128, false))), None);
     }
 }
