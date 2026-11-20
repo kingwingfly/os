@@ -172,6 +172,7 @@ pub fn errno_from_raw(raw: i32) -> Errno {
         libc::EBADF => Errno::EBADF,
         libc::EAGAIN => Errno::EAGAIN, // Also covers EWOULDBLOCK on Linux.
         libc::EACCES => Errno::EACCES,
+        libc::ENOTBLK => Errno::ENOTBLK,
         libc::EBUSY => Errno::EBUSY,
         libc::EEXIST => Errno::EEXIST,
         libc::EXDEV => Errno::EXDEV,
