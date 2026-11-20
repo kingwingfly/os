@@ -17,6 +17,7 @@ pub mod fs;
 pub mod local_helper;
 pub mod remote_fs;
 pub mod system;
+pub mod volume;
 
 pub use contract::{cowfs_ioctl, fs_magic, mount_flags, statfs_flags, umount_flags, unshare_flags};
 

@@ -16,6 +16,7 @@
 //! ends it, waits for its children, or signals as it. A signal a process sends is the machine's
 //! to allow as that process, by its token; one the page sends, as the page's account.
 mod cloudfs;
+mod cowfs_bridge;
 mod helper;
 mod hostfs;
 mod mounts;

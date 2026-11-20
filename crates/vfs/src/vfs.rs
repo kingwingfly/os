@@ -152,6 +152,13 @@ impl FilesystemFactory for DefaultFilesystemFactory {
                         root_in_fs: "/".to_string(),
                     })
                 }
+                FsType::Cowfs => {
+                    crate::vblk::CowfsMountOptions::parse(data)?;
+                    if crate::vblk::is_non_block_tree_source(source) {
+                        return Err(Errno::ENOTBLK);
+                    }
+                    Err(Errno::ENODEV)
+                }
                 _ => Err(Errno::ENODEV),
             }
         })
@@ -3907,6 +3914,178 @@ impl Vfs {
 
                 let _ = file_ref.close().await;
                 return Err(Errno::ENOEXEC);
+            }
+        })
+        .await
+    }
+
+    // -------------------------------------------------------------------------
+    // Contract v2 additions (#77): read_dir_page, ficlone (FICLONE), syncfs
+    // -------------------------------------------------------------------------
+
+    /// Cursor-based paged directory enumeration by path (contract §3, R7, #77).
+    pub async fn read_dir_page(
+        &self,
+        pid: u32,
+        anchor: StartAnchor,
+        path: &str,
+        cookie: u64,
+        max_entries: usize,
+    ) -> Result<crate::DirPage> {
+        self.with_caller(pid, async move {
+            let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
+            let ctx_snap = fs_ctx.borrow().clone();
+            let bridge: &dyn ProcBridge = &*self.inner;
+            let resolved = walk(
+                &cred,
+                &ns,
+                &ctx_snap,
+                &fds,
+                Some(bridge),
+                &anchor,
+                path,
+                WalkFlags::FOLLOW_LAST | WalkFlags::MUST_BE_DIR,
+            )
+            .await?;
+            let WalkResult::Found { pin, entry, .. } = resolved else {
+                return Err(Errno::ENOENT);
+            };
+            pin.guard_op(
+                &cred,
+                false,
+                false,
+                pin.fs()
+                    .read_dir_page(&cred, &entry.handle, cookie, max_entries),
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Cursor-based paged directory enumeration on an open directory descriptor (#77).
+    pub async fn fd_read_dir_page(
+        &self,
+        pid: u32,
+        fd: Fd,
+        cookie: u64,
+        max_entries: usize,
+    ) -> Result<crate::DirPage> {
+        self.with_caller(pid, async move {
+            let (cred, _, _, fds) = self.snapshot_proc(pid)?;
+            let file = fds.borrow().get(fd)?;
+            if file.access() == Access::Path {
+                return Err(Errno::EBADF);
+            }
+            if file.mount_ns().is_some() {
+                return Err(Errno::ENOTDIR);
+            }
+            let meta = file.metadata_as(&cred).await?;
+            if !meta.is_dir() {
+                return Err(Errno::ENOTDIR);
+            }
+            if let Some(pin) = file.mount_pin() {
+                pin.guard_op(
+                    &cred,
+                    false,
+                    false,
+                    pin.fs()
+                        .read_dir_page(&cred, file.handle(), cookie, max_entries),
+                )
+                .await
+            } else {
+                file.fs()
+                    .read_dir_page(&cred, file.handle(), cookie, max_entries)
+                    .await
+            }
+        })
+        .await
+    }
+
+    /// Intra-filesystem O(1) extent reflink (`ioctl(dst_fd, FICLONE, src_fd)`, contract §5, #77).
+    /// Cross-filesystem or cross-volume calls fail with `Errno::EXDEV`; read-only destination
+    /// mounts fail with `Errno::EROFS`.
+    pub async fn ficlone(&self, pid: u32, dst_fd: Fd, src_fd: Fd) -> Result<()> {
+        self.with_caller(pid, async move {
+            let (cred, _, _, fds) = self.snapshot_proc(pid)?;
+            let (dst_file, src_file) = {
+                let table = fds.borrow();
+                (table.get(dst_fd)?, table.get(src_fd)?)
+            };
+            if dst_file.access() == Access::Path || src_file.access() == Access::Path {
+                return Err(Errno::EBADF);
+            }
+            if !src_file.access().reads() || !dst_file.access().writes() {
+                return Err(Errno::EBADF);
+            }
+            if dst_file.is_virtual() || src_file.is_virtual() {
+                return Err(Errno::EXDEV);
+            }
+            if src_file.fs().id() != dst_file.fs().id() {
+                return Err(Errno::EXDEV);
+            }
+            let Some(dst_pin) = dst_file.mount_pin() else {
+                return dst_file
+                    .fs()
+                    .reflink(&cred, src_file.open_ref(), dst_file.open_ref())
+                    .await;
+            };
+            if let Some(src_pin) = src_file.mount_pin() {
+                src_pin.guard_enter(&cred)?;
+                if src_pin.fs().id() != dst_pin.fs().id() {
+                    return Err(Errno::EXDEV);
+                }
+            }
+            if dst_pin.effective_rdonly() {
+                return Err(Errno::EROFS);
+            }
+            dst_pin
+                .guard_op(
+                    &cred,
+                    true,
+                    true,
+                    dst_pin
+                        .fs()
+                        .reflink(&cred, src_file.open_ref(), dst_file.open_ref()),
+                )
+                .await?;
+            if dst_pin.effective_flags().synchronous {
+                dst_pin
+                    .guard_op(
+                        &cred,
+                        true,
+                        false,
+                        dst_pin.fs().sync_all(dst_file.open_ref()),
+                    )
+                    .await?;
+                dst_pin.backing().record_sync();
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Whole-filesystem durability barrier (`syncfs(2)`, contract §5, #77).
+    pub async fn syncfs(&self, pid: u32, fd: Fd) -> Result<()> {
+        self.with_caller(pid, async move {
+            let (cred, _, _, fds) = self.snapshot_proc(pid)?;
+            let file = fds.borrow().get(fd)?;
+            if file.access() == Access::Path {
+                return Err(Errno::EBADF);
+            }
+            if file.is_virtual() {
+                return Err(Errno::EINVAL);
+            }
+            let meta = file.metadata_as(&cred).await?;
+            if meta.file_type == FileType::CharDevice {
+                return Err(Errno::EINVAL);
+            }
+            if let Some(pin) = file.mount_pin() {
+                pin.guard_op(&cred, true, false, pin.fs().sync_fs(&cred))
+                    .await?;
+                pin.backing().record_sync();
+                Ok(())
+            } else {
+                file.fs().sync_fs(&cred).await
             }
         })
         .await

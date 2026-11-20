@@ -22,6 +22,54 @@ pub const CLOUD: FsCapabilities = FsCapabilities {
     locks: LockScope::Service,
 };
 
+/// Local browser-profile MIT pure-Rust `os-cowfs` volume (OPFS packs + strict IDB + Web Locks).
+pub const COWFS_LOCAL_BROWSER: FsCapabilities = FsCapabilities {
+    identity: IdentityScope::ProfileLocal,
+    open_survives_unlink: Support::Yes,
+    open_survives_rename: Support::Yes,
+    hard_links: Support::Yes,
+    symlinks: Support::Yes,
+    exclusive_create: Support::Yes,
+    atomic_rename: Support::Yes,
+    rename_noreplace: Support::Yes,
+    snapshots: Support::Yes,
+    reflink: Support::Yes,
+    writer_model: WriterModel::Local,
+    durability: Durability::TreeCommit,
+    locks: LockScope::Instance,
+};
+
+/// Local native-host MIT pure-Rust `os-cowfs` volume (SQLite WAL+FULL + pack files + flock).
+pub const COWFS_LOCAL_NATIVE: FsCapabilities = FsCapabilities {
+    identity: IdentityScope::HostLocal,
+    ..COWFS_LOCAL_BROWSER
+};
+
+/// Remote fenced `os-cowfs` volume (R2 packs + Storage DO triple-fenced head; #80).
+pub const COWFS_REMOTE: FsCapabilities = FsCapabilities {
+    identity: IdentityScope::Global,
+    writer_model: WriterModel::Fenced,
+    durability: Durability::FencedCommit,
+    ..COWFS_LOCAL_BROWSER
+};
+
+/// Read-only pinned `os-cowfs` snapshot / RO view (immutable content-addressed root).
+pub const COWFS_SNAPSHOT: FsCapabilities = FsCapabilities {
+    identity: IdentityScope::Global,
+    open_survives_unlink: Support::Refused(Errno::EROFS),
+    open_survives_rename: Support::Refused(Errno::EROFS),
+    hard_links: Support::Refused(Errno::EROFS),
+    symlinks: Support::Refused(Errno::EROFS),
+    exclusive_create: Support::Refused(Errno::EROFS),
+    atomic_rename: Support::Refused(Errno::EROFS),
+    rename_noreplace: Support::Refused(Errno::EROFS),
+    snapshots: Support::Refused(Errno::EROFS),
+    reflink: Support::Refused(Errno::EROFS),
+    writer_model: WriterModel::Immutable,
+    durability: Durability::TreeCommit,
+    locks: LockScope::Instance,
+};
+
 /// Browser storage (`os-workspace` in OPFS).
 pub const OPFS: FsCapabilities = FsCapabilities {
     identity: IdentityScope::ProfileLocal,

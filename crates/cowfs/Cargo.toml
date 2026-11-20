@@ -1,0 +1,21 @@
+[package]
+name = "os-cowfs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+abi = { package = "os-abi", path = "../abi" }
+cowtree = { package = "os-cowtree", path = "../cowtree" }
+os-core = { path = "../core" }
+vfs = { package = "os-vfs", path = "../vfs" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+cowtree = { package = "os-cowtree", path = "../cowtree", features = ["test-store"] }

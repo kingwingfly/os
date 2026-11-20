@@ -2658,6 +2658,8 @@ dependencies = [
  "js-sys",
  "os-abi",
  "os-core",
+ "os-cowfs",
+ "os-cowtree",
  "os-image",
  "os-vfs",
  "serde",
@@ -2686,6 +2688,31 @@ dependencies = [
  "regex",
  "serde",
  "unicode-width",
+]
+
+[[package]]
+name = "os-cowfs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "os-abi",
+ "os-core",
+ "os-cowtree",
+ "os-vfs",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "os-cowtree"
+version = "0.1.0"
+dependencies = [
+ "os-abi",
+ "os-vfs",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

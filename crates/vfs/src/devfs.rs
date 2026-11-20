@@ -147,6 +147,16 @@ impl<D: DeviceBackend> DevTmpFs<D> {
     pub fn backend(&self) -> &D {
         &self.backend
     }
+
+    /// Register a `/dev/vdN` managed volume device node (contract §2.16, #77).
+    pub fn register_vblk(&self, name: &str, mode: u16) -> Result<Entry> {
+        let mut root_cred = Cred::root();
+        root_cred.umask = 0;
+        let root = self.inner.root();
+        let rdev = crate::vblk::vblk_rdev(name);
+        now_or_never(self.inner.mknod(&root_cred, &root, name, mode, &rdev))
+            .expect("sync memfs mknod")
+    }
 }
 
 impl<D: DeviceBackend> Filesystem for DevTmpFs<D> {

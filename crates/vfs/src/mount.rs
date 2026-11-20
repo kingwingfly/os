@@ -465,11 +465,13 @@ pub struct MountBacking {
 
 impl MountBacking {
     pub fn new(fs: Rc<dyn Filesystem>, fstype: FsType) -> Self {
+        let immutable = fstype == FsType::Image
+            || fs.capabilities().writer_model == abi::contract::WriterModel::Immutable;
         Self {
             fs,
             fstype,
             provider: ProviderState::new(),
-            ceiling_rdonly: fstype == FsType::Image,
+            ceiling_rdonly: immutable,
             ceiling_noexec: false,
             sync_count: Cell::new(0),
             on_release: RefCell::new(None),
