@@ -21,10 +21,12 @@ pub fn error_response(message: &str, status: u16) -> Result<Response> {
 
 /// Ask the authority, as the client whose session cookie is `cookie`, for the process whose
 /// token is `proc`, if a process's request it is.
+#[allow(clippy::too_many_arguments)]
 async fn authority_as(
     env: &Env,
     cookie: Option<&str>,
     proc: Option<&str>,
+    instance: Option<&str>,
     release: Option<&str>,
     method: Method,
     path_and_query: &str,
@@ -36,6 +38,9 @@ async fn authority_as(
     }
     if let Some(proc) = proc {
         headers.set("X-Process-Token", proc)?;
+    }
+    if let Some(instance) = instance {
+        headers.set("X-OS-Instance", instance)?;
     }
     if let Some(release) = release {
         headers.set("X-OS-Release", release)?;
@@ -64,10 +69,12 @@ async fn authority(
 ) -> Result<Response> {
     let cookie = req.headers().get("Cookie")?;
     let proc = req.headers().get("X-Process-Token")?;
+    let instance = req.headers().get("X-OS-Instance")?;
     authority_as(
         env,
         cookie.as_deref(),
         proc.as_deref(),
+        instance.as_deref(),
         req.headers().get("X-OS-Release")?.as_deref(),
         method,
         path_and_query,
@@ -128,11 +135,18 @@ fn session(req: &Request) -> String {
         .ok()
         .flatten()
         .unwrap_or_default();
+    let instance = req
+        .headers()
+        .get("X-OS-Instance")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     format!(
-        "{} {} {}",
+        "{} {} {} {}",
         cookie(crate::auth::COOKIE),
         cookie(crate::auth::GUEST_COOKIE),
-        proc
+        proc,
+        instance
     )
 }
 
@@ -338,6 +352,7 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
             env: env.clone(),
             cookie: req.headers().get("Cookie")?,
             proc: req.headers().get("X-Process-Token")?,
+            instance: req.headers().get("X-OS-Instance")?,
             query,
             complete: true,
             chunks: grant.chunks.iter().cloned().collect(),
@@ -389,6 +404,7 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
         env: env.clone(),
         cookie: req.headers().get("Cookie")?,
         proc: req.headers().get("X-Process-Token")?,
+        instance: req.headers().get("X-OS-Instance")?,
         query,
         complete: grant.state == "complete",
         chunks: grant.chunks.iter().cloned().collect(),
@@ -413,6 +429,7 @@ struct Reader {
     env: Env,
     cookie: Option<String>,
     proc: Option<String>,
+    instance: Option<String>,
     /// The file's path, as the authority's query.
     query: String,
     file: String,
@@ -490,6 +507,7 @@ impl Reader {
             &self.env,
             self.cookie.as_deref(),
             self.proc.as_deref(),
+            self.instance.as_deref(),
             None,
             Method::Get,
             &format!("/internal/read?{}", self.query),

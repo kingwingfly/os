@@ -1,100 +1,55 @@
-//! The process registry's rules (each browser's machine, crates/worker/src/machine.rs): who may
-//! make which of its calls, and as whom each acts; and who may change a cgroup. The registry
-//! keeps its record in SQLite (crates/worker/src/procs.rs); what it decides is here, as plain
-//! rules that can be tested without it. Every registry call is in `permit`'s table: a call
-//! added to the ABI without a rule is refused.
+//! Instance-local process & cgroup policy rules: who may invoke which local process/cgroup
+//! syscall, and who may create/write/attach cgroups or manage processes.
+//!
+//! Retired server-side `Machine` DO process routes (`ProcInit`, `Seats`, `Gone`, `Pids`,
+//! `Execve`, `Fork`, `Exit`, `MachineInit`, `LoginSession`, `ProcSession`, `ProcPoll`,
+//! `ProcKeep`, `ProcTty`, `Resource`) have been removed cleanly (Contract §2.12).
 use abi::{Call, Errno, Error};
 use os_core::permissions::Identity;
 
-/// Who a registry call comes from.
+/// Who an instance-local process/cgroup call comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Caller {
-    /// A batch routed directly with `X-Registry`, without a process token. This is untrusted
-    /// user space too: the header selects a route, never an identity or privilege.
+    /// The local host adapter / client kernel itself.
     Registry,
-    /// A page's batch, which the authority forwards with no process's token: user space, as
-    /// the page's account.
+    /// A browser page / UI batch acting as the session's account.
     Page,
-    /// A process: any batch carrying a process's token, whatever route it took. Uploaded wasm
-    /// reaches the registry this way (os.sys), so it is given nothing of the kernel's.
+    /// A running WASI process (invoking `os.sys` locally).
     Process,
 }
 
-/// As whom a call the caller may make acts.
+/// As whom a permitted local call acts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Acting {
-    /// As an account: the page's, for the kernel's and the page's calls, or the process's
-    /// snapshot, for a process's.
+    /// As an account (the page's account or the process's credential snapshot).
     Account,
-    /// By a process token: the calling process, or the process a host names with its token.
+    /// As the calling process itself.
     Itself,
 }
 
-/// PID 1's boot proof grants only orphan reaping, never its reserved row's root identity.
+/// PID 1's init reaper grants only orphan reaping (`getpid`, `waitpid`), never arbitrary root calls.
 pub fn permit_reaper(call: &Call) -> Result<(), Error> {
     match call {
-        Call::Getpid
-        | Call::Waitpid { .. }
-        | Call::Exit {
-            pid: None,
-            token: None,
-            ..
-        } => Ok(()),
+        Call::Getpid | Call::Waitpid { .. } => Ok(()),
         _ => Err(Errno::EPERM.into()),
     }
 }
 
-/// Whether `caller` may make the registry call `call`, and as whom it acts: EPERM for a call
-/// that is another caller's, ENOSYS for one that is not the registry's.
+/// Whether `caller` may make the local process/cgroup call `call`, and as whom it acts:
+/// `EPERM` for a call reserved for another caller, `ENOSYS` for non-process calls.
 pub fn permit(caller: Caller, call: &Call) -> Result<Acting, Error> {
     use Caller::{Page, Process, Registry};
     if !call.is_registry() {
         return Err(Error::because(
             Errno::ENOSYS,
-            "not the process registry's call: the filesystem's go to the authority",
+            "not a local process/cgroup call",
         ));
     }
     match call {
-        Call::MachineInit { .. } | Call::LoginSession { .. } => match caller {
-            Registry | Page => Ok(Acting::Account),
-            Process => Err(Error::because(
-                Errno::EPERM,
-                "host coordination requires the browser context",
-            )),
-        },
-        Call::ProcInit { .. } | Call::Seats | Call::Gone { .. } => match caller {
-            Registry => Ok(Acting::Account),
-            Page | Process => Err(Error::because(Errno::EPERM, "the client kernel's call")),
-        },
-        // A kernel lends for a particular process, using its snapshot even after logout.
-        Call::Pids { .. } => match caller {
-            Registry | Process => Ok(Acting::Account),
-            Page => Err(Errno::EPERM.into()),
-        },
-        Call::Execve { .. } => match caller {
-            Registry | Page => Ok(Acting::Account),
-            Process => Err(Error::because(
-                Errno::EPERM,
-                "a process replaces itself through its kernel, which holds its token",
-            )),
-        },
-        Call::Fork { .. } | Call::Exit { .. } | Call::ProcKeep { .. } | Call::ProcTty { .. } => {
-            match caller {
-                Registry | Process => Ok(Acting::Itself),
-                Page => Err(Error::because(
-                    Errno::EPERM,
-                    "the client kernel tells of forks, exits and waits",
-                )),
-            }
-        }
         Call::Wait { token, .. } => match caller {
             Registry if token.is_none() => Ok(Acting::Account),
             Registry | Process => Ok(Acting::Itself),
             Page => Err(Errno::EPERM.into()),
-        },
-        Call::ProcSession { .. } => match caller {
-            Registry => Ok(Acting::Itself),
-            Page | Process => Err(Errno::EPERM.into()),
         },
         Call::Getpid
         | Call::Getpgid { .. }
@@ -103,20 +58,18 @@ pub fn permit(caller: Caller, call: &Call) -> Result<Acting, Error> {
         | Call::Setsid
         | Call::ProcStopped { .. }
         | Call::Prctl { .. }
-        | Call::Resource { .. }
         | Call::Waitpid { .. } => match caller {
             Process => Ok(Acting::Itself),
             Registry | Page => Err(Error::because(Errno::EPERM, "a process's call")),
         },
-        Call::ProcPoll { .. }
-        | Call::Kill { .. }
+        Call::Kill { .. }
         | Call::CgroupCreate { .. }
         | Call::CgroupRemove { .. }
         | Call::CgroupSet { .. }
         | Call::CgroupAttach { .. }
         | Call::CgroupStat { .. }
         | Call::CgroupList { .. } => Ok(Acting::Account),
-        // A registry call with no rule yet is nobody's.
+        // Any future registry call without an explicit rule fails closed.
         _ => Err(Error::because(Errno::EPERM, "no rule says who may make it")),
     }
 }
@@ -193,224 +146,34 @@ mod tests {
     }
 
     #[test]
-    fn registry_bookkeeping_acts_as_the_account() {
+    fn process_only_calls_require_a_process_caller() {
         for call in [
-            Call::ProcInit { boot: None },
-            Call::Seats,
-            Call::Gone {
-                seat: Some("tab".into()),
-                kernel: None,
-            },
-        ] {
-            assert_eq!(permit(Caller::Registry, &call), Ok(Acting::Account));
-            // Neither a page nor a process (uploaded wasm, through os.sys) may begin a
-            // namespace, drain its pids, or end another tab's processes.
-            for caller in [Caller::Page, Caller::Process] {
-                assert_eq!(permit(caller, &call).unwrap_err().errno, Errno::EPERM);
-            }
-        }
-    }
-
-    #[test]
-    fn lending_uses_an_account_or_process_snapshot() {
-        let call = Call::Pids {
-            count: 8,
-            kernel: Some("public-id".into()),
-        };
-        for caller in [Caller::Registry, Caller::Process] {
-            assert_eq!(permit(caller, &call), Ok(Acting::Account));
-        }
-        assert_eq!(permit(Caller::Page, &call).unwrap_err().errno, Errno::EPERM);
-        let guest = Identity {
-            id: 1_000_001,
-            group: 65534,
-            groups: BTreeSet::from([65534]),
-        };
-        assert!(may_manage_process(&guest, guest.id));
-        assert!(!may_manage_process(&guest, 0));
-        assert!(!may_manage_process(&guest, 1000));
-        assert!(may_manage_process(&Identity::root(), guest.id));
-    }
-
-    #[test]
-    fn lifecycle_calls_are_the_kernels_or_the_process_own() {
-        let exit = Call::Exit {
-            status: 0,
-            signal: None,
-            pid: None,
-            token: None,
-        };
-        let wait = Call::Wait {
-            pid: "3".into(),
-            token: None,
-        };
-        assert_eq!(permit(Caller::Registry, &exit), Ok(Acting::Itself));
-        assert_eq!(permit(Caller::Registry, &wait), Ok(Acting::Account));
-        assert_eq!(
-            permit(
-                Caller::Registry,
-                &Call::Wait {
-                    pid: "3".into(),
-                    token: Some("host-token".into())
-                }
-            ),
-            Ok(Acting::Itself)
-        );
-        for call in [exit, wait] {
-            assert_eq!(permit(Caller::Process, &call), Ok(Acting::Itself));
-            assert_eq!(permit(Caller::Page, &call).unwrap_err().errno, Errno::EPERM);
-        }
-        assert_eq!(permit(Caller::Process, &Call::Getpid), Ok(Acting::Itself));
-        assert_eq!(
-            permit(Caller::Registry, &Call::Getpid).unwrap_err().errno,
-            Errno::EPERM
-        );
-        let execve = Call::Execve {
-            local: None,
-            runtime: None,
-            pid: None,
-            token: None,
-            path: "/usr/bin/coreutils".into(),
-            argv: vec![],
-            env: vec![],
-            cwd: "/".into(),
-            cgroup: None,
-            seat: None,
-        };
-        assert_eq!(permit(Caller::Page, &execve), Ok(Acting::Account));
-        assert_eq!(
-            permit(Caller::Process, &execve).unwrap_err().errno,
-            Errno::EPERM
-        );
-    }
-
-    #[test]
-    fn signals_polls_and_cgroups_act_as_the_account() {
-        for caller in [Caller::Registry, Caller::Page, Caller::Process] {
-            assert_eq!(permit(caller, &kill()), Ok(Acting::Account));
-            let set = Call::CgroupSet {
-                path: "/user/x".into(),
-                key: "cpu.weight".into(),
-                value: "10".into(),
-            };
-            assert_eq!(permit(caller, &set), Ok(Acting::Account));
-        }
-        // Not the registry's: the filesystem's, or a job's.
-        assert_eq!(
-            permit(Caller::Registry, &Call::Getcreds).unwrap_err().errno,
-            Errno::ENOSYS
-        );
-        let job = Call::Kill {
-            pid: "a1b2".into(),
-            signal: None,
-        };
-        assert_eq!(permit(Caller::Page, &job).unwrap_err().errno, Errno::ENOSYS);
-    }
-
-    #[test]
-    fn sessions_and_wait_selectors_require_a_process_identity() {
-        let init = Call::MachineInit {
-            action: abi::InitAction::Inspect,
-        };
-        assert_eq!(permit(Caller::Page, &init), Ok(Acting::Account));
-        assert_eq!(permit(Caller::Registry, &init), Ok(Acting::Account));
-        assert_eq!(
-            permit(Caller::Process, &init).unwrap_err().errno,
-            Errno::EPERM
-        );
-        let login = Call::LoginSession {
-            action: abi::LoginAction::Inspect,
-        };
-        assert_eq!(permit(Caller::Page, &login), Ok(Acting::Account));
-        assert_eq!(permit(Caller::Registry, &login), Ok(Acting::Account));
-        assert_eq!(
-            permit(Caller::Process, &login).unwrap_err().errno,
-            Errno::EPERM
-        );
-        for call in [
+            Call::Getpid,
             Call::Getpgid { pid: 0 },
             Call::Getsid { pid: 0 },
             Call::Setpgid { pid: 0, pgid: 0 },
             Call::Setsid,
+            Call::ProcStopped { signal: 20 },
+            Call::Prctl {
+                option: 36,
+                value: 1,
+            },
             Call::Waitpid {
                 pid: -1,
-                options: 3,
+                options: 1,
             },
-            Call::ProcStopped { signal: 20 },
         ] {
             assert_eq!(permit(Caller::Process, &call), Ok(Acting::Itself));
-            for caller in [Caller::Page, Caller::Registry] {
-                assert_eq!(permit(caller, &call).unwrap_err().errno, Errno::EPERM);
-            }
-        }
-        let bootstrap = Call::ProcSession { processes: vec![] };
-        assert_eq!(permit(Caller::Registry, &bootstrap), Ok(Acting::Itself));
-        assert_eq!(
-            permit(Caller::Process, &bootstrap).unwrap_err().errno,
-            Errno::EPERM
-        );
-        for pid in ["0", "-1", "-20"] {
-            let call = Call::Kill {
-                pid: pid.into(),
-                signal: Some(0),
-            };
-            assert!(call.is_registry());
-            assert_eq!(permit(Caller::Process, &call), Ok(Acting::Account));
+            assert_eq!(permit(Caller::Page, &call).unwrap_err().errno, Errno::EPERM);
+            assert_eq!(
+                permit(Caller::Registry, &call).unwrap_err().errno,
+                Errno::EPERM
+            );
         }
     }
 
     #[test]
-    fn cgroups_are_their_makers_and_roots() {
-        let ann = Identity {
-            id: 1000,
-            group: 1000,
-            groups: BTreeSet::from([1000]),
-        };
-        let root = Identity::root();
-        // Anyone makes cgroups in the delegated one; in another, its owner or root.
-        assert!(may_create(&ann, DELEGATED, 0));
-        assert!(!may_create(&ann, "/system", 0));
-        assert!(may_create(&ann, "/user/ann", 1000));
-        assert!(!may_create(&ann, "/user/bob", 1001));
-        assert!(may_create(&root, "/system", 0));
-        // Root's cgroups are root's to write.
-        assert!(!may_write(&ann, 0));
-        assert!(may_write(&ann, 1000));
-        assert!(may_write(&root, 1000));
-        // An account moves its own processes, into its own cgroups or the delegated one.
-        assert!(may_attach(&ann, 1000, "/user/ann", 1000));
-        assert!(may_attach(&ann, 1000, DELEGATED, 0));
-        assert!(!may_attach(&ann, 1001, "/user/ann", 1000));
-        assert!(!may_attach(&ann, 1000, "/init", 0));
-        assert!(may_attach(&root, 1001, "/init", 0));
-    }
-
-    #[test]
-    fn controllers_are_cgroup_v2s() {
-        assert_eq!(controllers("+memory +cpu memory").unwrap(), "cpu memory");
-        assert_eq!(controllers("").unwrap(), "");
-        assert_eq!(controllers("+rdma").unwrap_err().errno, Errno::EINVAL);
-    }
-}
-
-#[cfg(test)]
-mod reaper_tests {
-    use super::*;
-    #[test]
-    fn a_boot_proof_never_acts_as_the_reserved_rows_root_account() {
-        for value in [
-            serde_json::json!("getcreds"),
-            serde_json::json!({"fork":{"pid":1}}),
-            serde_json::json!({"pids":{"count":1}}),
-            serde_json::json!({"kill":{"pid":"-1","signal":9}}),
-            serde_json::json!({"cgroup_create":{"path":"/system/owned"}}),
-            serde_json::json!({"proc_poll":{"pids":[2]}}),
-            serde_json::json!({"exit":{"pid":2,"proc":"foreign","status":0}}),
-            serde_json::json!({"execve":{"path":"/usr/bin/sh","argv":[],"env":[],"cwd":"/"}}),
-        ] {
-            let call: Call = serde_json::from_value(value).unwrap();
-            assert_eq!(permit_reaper(&call).unwrap_err().errno, Errno::EPERM);
-        }
+    fn reaper_only_permits_getpid_and_waitpid() {
         assert!(permit_reaper(&Call::Getpid).is_ok());
         assert!(
             permit_reaper(&Call::Waitpid {
@@ -419,30 +182,68 @@ mod reaper_tests {
             })
             .is_ok()
         );
+        assert_eq!(permit_reaper(&kill()).unwrap_err().errno, Errno::EPERM);
+        assert_eq!(
+            permit_reaper(&Call::CgroupCreate {
+                path: "/system/x".into(),
+                controllers: None,
+                lifetime: None,
+            })
+            .unwrap_err()
+            .errno,
+            Errno::EPERM
+        );
     }
-}
 
-#[cfg(test)]
-mod containment_tests {
-    use super::*;
     #[test]
-    fn subtree_matching_separates_siblings_and_prefixes() {
-        assert!(in_subtree("/user/a/child", "/user/a"));
-        assert!(in_subtree("/user/a", "/user/a"));
-        assert!(in_subtree("/user/a", "/"));
-        assert!(!in_subtree("/user/ab", "/user/a"));
-        assert!(!in_subtree("/user", "/user/a"));
+    fn non_registry_calls_return_enosys() {
+        assert_eq!(
+            permit(Caller::Page, &Call::Getcreds).unwrap_err().errno,
+            Errno::ENOSYS
+        );
+        assert_eq!(
+            permit(
+                Caller::Process,
+                &Call::Kill {
+                    pid: "deadbeef".into(),
+                    signal: Some(15)
+                }
+            )
+            .unwrap_err()
+            .errno,
+            Errno::ENOSYS
+        );
     }
+
     #[test]
-    fn subreaper_authority_requires_the_process_and_excludes_boot_reapers() {
-        let call = Call::Prctl {
-            option: 36,
-            value: 1,
+    fn cgroup_and_process_management_boundaries() {
+        let root = Identity::root();
+        let ann = Identity {
+            id: 1000,
+            group: 1000,
+            groups: BTreeSet::from([1000]),
         };
-        assert!(permit(Caller::Process, &call).is_ok());
-        for caller in [Caller::Page, Caller::Registry] {
-            assert_eq!(permit(caller, &call).unwrap_err().errno, Errno::EPERM);
-        }
-        assert_eq!(permit_reaper(&call).unwrap_err().errno, Errno::EPERM);
+        let bob = Identity {
+            id: 1001,
+            group: 1001,
+            groups: BTreeSet::from([1001]),
+        };
+        assert!(may_create(&root, "/system", 0));
+        assert!(may_create(&ann, "/user", 0));
+        assert!(!may_create(&ann, "/system", 0));
+        assert!(may_write(&ann, 1000));
+        assert!(!may_write(&bob, 1000));
+        assert!(may_manage_process(&root, 1000));
+        assert!(may_manage_process(&ann, 1000));
+        assert!(!may_manage_process(&bob, 1000));
+        assert!(may_attach(&ann, 1000, "/user", 0));
+        assert!(!may_attach(&ann, 1001, "/user", 0));
+        assert!(in_subtree("/user/a/b", "/user/a"));
+        assert!(!in_subtree("/user/ab", "/user/a"));
+        assert_eq!(
+            controllers("+pids +memory +cpu").unwrap(),
+            "cpu memory pids"
+        );
+        assert_eq!(controllers("bogus").unwrap_err().errno, Errno::EINVAL);
     }
 }

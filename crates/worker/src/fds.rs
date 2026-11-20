@@ -717,8 +717,6 @@ pub enum Read {
     Chunks(Vec<(Option<String>, u64, u64)>, u64),
     /// Of a binary of /usr: the Worker's asset, from an offset, so many bytes; and its size.
     Asset(String, u64, u64, u64),
-    /// A file of /proc that tells of processes: read it again with the machine's list.
-    Processes,
 }
 
 /// pread(2) of `count` bytes from `offset`, through the descriptor `fd` of `sid`, or of the file
@@ -728,7 +726,6 @@ pub enum Read {
 pub fn pread(
     db: &mut Db,
     sid: Option<&str>,
-    procs: Option<&[crate::procs::Row]>,
     process: &Process,
     fd: Option<u32>,
     path: Option<&str>,
@@ -759,7 +756,7 @@ pub fn pread(
                 return Ok(made(text.into_bytes(), offset, count));
             }
             if found.file.is_none() && crate::procfs::is(&found.path) {
-                return proc(db, Some(sid), procs, process, &found.path, offset, count);
+                return proc(db, Some(sid), process, &found.path, offset, count);
             }
             if found.file.is_none() && !found.writes() {
                 return Err(Errno::EISDIR.into());
@@ -771,7 +768,7 @@ pub fn pread(
         (None, Some(path)) => {
             let path = &crate::procfs::follow(db, sid, path, true)?;
             if crate::procfs::is(path) {
-                return proc(db, sid, procs, process, path, offset, count);
+                return proc(db, sid, process, path, offset, count);
             }
             let Opening::Existing { path, node } = kernel::open(db, process, path, O_RDONLY, 0)?
             else {
@@ -830,23 +827,15 @@ pub fn pread(
     }
     Ok(Read::Chunks(parts, size))
 }
-/// pread(2) of a file of /proc: what it tells of processes needs the browser's machine's list
-/// (`procs`), which the caller asks for, and asks again with, when this says so.
 fn proc(
     db: &Db,
     sid: Option<&str>,
-    procs: Option<&[crate::procs::Row]>,
     process: &Process,
     path: &str,
     offset: u64,
     count: u64,
 ) -> Result<Read> {
-    let procs = match procs {
-        Some(procs) => procs,
-        None if crate::procfs::of_processes(path) => return Ok(Read::Processes),
-        None => &[],
-    };
-    let text = crate::procfs::read(db, sid, procs, &process.cred, path)?;
+    let text = crate::procfs::read(db, sid, &process.cred, path)?;
     Ok(made(text.into_bytes(), offset, count))
 }
 /// pread(2) of what the kernel makes as it is read: `count` bytes of `bytes` from `offset`, and

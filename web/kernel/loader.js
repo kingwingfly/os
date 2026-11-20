@@ -108,17 +108,26 @@ async function compileLocal(bytes) {
 // The image's bytes, as its exec allows them to be read.
 const read = image => image.asset
   ? fetch(image.asset)
-  : fetch(`/api/file?token=${encodeURIComponent(image.token_read)}`, { headers: { 'X-Process-Token': image.token, 'X-Process-Pid': String(image.pid) } });
+  : fetch(`/api/file?token=${encodeURIComponent(image.token_read)}`, {
+    headers: {
+      'X-Process-Token': image.token,
+      'X-Process-Pid': String(image.pid),
+      ...(image.instance_id ? { 'X-OS-Instance': image.instance_id } : {}),
+    },
+  });
 
 async function compile(image) {
   let module;
-  // An image made forkable before is compiled from what was made: what it imports and what it
-  // says before its code are the original's.
   const response = await read(image);
   if (!response.ok) throw await refusal(response);
-  // compileStreaming compiles as the bytes arrive, when the type says wasm; bytes always work.
-  // What a module says before its code (the memory it imports, a start section) is read from a
-  // copy of the response while the compiler reads the original.
+  // System `/usr/bin/*.wasm` assets transform locally via `/local-compiler.js` so local execution
+  // issues ZERO `/api/file?...&compile=...` RPCs (#54 L3a).
+  if (image.asset && image.pid !== 1) {
+    const rawBytes = new Uint8Array(await response.arrayBuffer());
+    const promise = localCompilation.then(() => compileLocal(rawBytes));
+    localCompilation = promise.catch(() => {});
+    return promise;
+  }
   const streamed = response.headers.get('Content-Type') === 'application/wasm';
   let prefix;
   if (streamed) {
@@ -130,15 +139,11 @@ async function compile(image) {
   }
   const imports = WebAssembly.Module.imports(module);
   const memoryImport = validateImports(imports);
-  // What the module says before its code: the memory it imports, and whether it has a start
-  // function, which runs as it is instantiated (a process runs such an image by synchronous
-  // requests: nothing can be suspended before `_start`, JSPI's promising frame).
   const { memory, start } = await heading(prefix).catch(error => {
     throw formatError(error);
   });
   if (memoryImport) {
     if (!memory) throw formatError(new Error('no env.memory type'));
-    // Shared memory must declare its maximum: the engine cannot grow it past one.
     if (memory.shared && memory.maximum == null) {
       throw formatError(new Error('shared memory without a maximum'));
     }
@@ -147,6 +152,12 @@ async function compile(image) {
   const unwinding = imports.filter(entry => entry.module === 'wasix_32v1' && UNWINDS.has(entry.name)).map(entry => `${entry.module}.${entry.name}`);
   let memoryBytes;
   if (image.pid !== 1 || unwinding.length) {
+    if (image.asset) {
+      const rawBytes = prefix instanceof Uint8Array ? prefix : new Uint8Array(await (await fetch(image.asset)).arrayBuffer());
+      const promise = localCompilation.then(() => compileLocal(rawBytes));
+      localCompilation = promise.catch(() => {});
+      return promise;
+    }
     const transformed = await forkable(image, image.pid === 1 ? FORKABLE : 'resources-v1');
     module = transformed.module;
     if (image.pid !== 1) memoryBytes = transformed.memoryBytes;
@@ -159,7 +170,13 @@ async function compile(image) {
 // request before a cached output is returned; no Binaryen bundle reaches the browser.
 async function forkable(image, profile) {
   const query = image.asset ? `path=${encodeURIComponent(image.path)}` : `token=${encodeURIComponent(image.token_read)}`;
-  const response = await fetch(`/api/file?${query}&compile=${profile}`, { headers: { 'X-Process-Token': image.token, 'X-Process-Pid': String(image.pid) } });
+  const response = await fetch(`/api/file?${query}&compile=${profile}`, {
+    headers: {
+      'X-Process-Token': image.token,
+      'X-Process-Pid': String(image.pid),
+      ...(image.instance_id ? { 'X-OS-Instance': image.instance_id } : {}),
+    },
+  });
   if (!response.ok) throw await refusal(response);
   const prefix = response.clone();
   const module = await WebAssembly.compileStreaming(response).catch(error => { throw formatError(error); });

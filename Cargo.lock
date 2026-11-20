@@ -2661,6 +2661,7 @@ dependencies = [
  "os-cowfs",
  "os-cowtree",
  "os-image",
+ "os-kernel",
  "os-vfs",
  "serde",
  "serde_json",

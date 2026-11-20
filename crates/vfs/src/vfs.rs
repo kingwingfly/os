@@ -8,7 +8,7 @@ use crate::mount::{
     NamespaceId,
 };
 use crate::namespace::MountNamespace;
-use crate::procfs::{ProcBridge, ProcCallerInfo, ProcTargetInfo};
+use crate::procfs::{ProcBridge, ProcCallerInfo, ProcMetaSnapshot, ProcTargetInfo};
 use crate::stat::stat as to_abi_stat;
 use crate::walk::{
     MagicResolved, ParentResolution, StartAnchor, WalkFlags, WalkResult, ensure_searchable, walk,
@@ -176,6 +176,10 @@ pub struct ResolvedExec {
     pub header: Vec<u8>,
 }
 
+pub type ProcSnapshotHook = Rc<dyn Fn(u32) -> Option<ProcMetaSnapshot>>;
+pub type ProcListHook = Rc<dyn Fn() -> Vec<u32>>;
+pub type UptimeHook = Rc<dyn Fn() -> u64>;
+
 pub struct ProcessCtx {
     pub pid: u32,
     pub ppid: u32,
@@ -183,6 +187,7 @@ pub struct ProcessCtx {
     pub mnt_ns: Rc<RefCell<MountNamespace>>,
     pub fs_ctx: SharedFsContext,
     pub fds: SharedFdTable,
+    pub snapshot: Option<ProcMetaSnapshot>,
 }
 
 struct VfsInner {
@@ -195,6 +200,9 @@ struct VfsInner {
     system_ns: Rc<RefCell<MountNamespace>>,
     namespaces: RefCell<HashMap<NamespaceId, Weak<RefCell<MountNamespace>>>>,
     processes: RefCell<BTreeMap<u32, ProcessCtx>>,
+    proc_snapshot: RefCell<Option<ProcSnapshotHook>>,
+    proc_list: RefCell<Option<ProcListHook>>,
+    uptime_clock: RefCell<Option<UptimeHook>>,
 }
 
 impl VfsInner {
@@ -238,21 +246,45 @@ impl ProcBridge for VfsInner {
     }
 
     fn local_pids(&self) -> Vec<u32> {
-        self.processes.borrow().keys().copied().collect()
+        let mut pids: std::collections::BTreeSet<u32> =
+            self.processes.borrow().keys().copied().collect();
+        if let Some(list) = self.proc_list.borrow().as_ref() {
+            pids.extend(list());
+        }
+        pids.into_iter().collect()
     }
 
     fn process_info(&self, pid: u32) -> Option<ProcTargetInfo> {
+        let snapshot_hook = self.proc_snapshot.borrow().clone();
+        let hook_snap = snapshot_hook.as_ref().and_then(|hook| hook(pid));
         let procs = self.processes.borrow();
-        let p = procs.get(&pid)?;
-        let ctx = p.fs_ctx.borrow();
+        if let Some(p) = procs.get(&pid) {
+            let ctx = p.fs_ctx.borrow();
+            let snapshot = hook_snap.or_else(|| p.snapshot.clone());
+            return Some(ProcTargetInfo {
+                pid: p.pid,
+                uid: p.cred.identity.id,
+                gid: p.cred.identity.group,
+                mnt_ns: Rc::clone(&p.mnt_ns),
+                root: ctx.root.clone(),
+                cwd: ctx.cwd.clone(),
+                fds: p.fds.clone(),
+                snapshot,
+            });
+        }
+        // Zombies (or processes in `LocalProcessTable` whose VFS FDs/mount pins were already
+        // released on exit) still render `/proc/<pid>/{status,stat,cmdline,cgroup}` until reaped.
+        let snap = hook_snap?;
+        let sys_root = self.system_ns.borrow().root_anchor();
         Some(ProcTargetInfo {
-            pid: p.pid,
-            uid: p.cred.identity.id,
-            gid: p.cred.identity.group,
-            mnt_ns: Rc::clone(&p.mnt_ns),
-            root: ctx.root.clone(),
-            cwd: ctx.cwd.clone(),
-            fds: p.fds.clone(),
+            pid,
+            uid: snap.uid,
+            gid: snap.gid,
+            mnt_ns: Rc::clone(&self.system_ns),
+            root: sys_root.clone(),
+            cwd: sys_root,
+            fds: SharedFdTable::new(),
+            snapshot: Some(snap),
         })
     }
 
@@ -261,6 +293,13 @@ impl ProcBridge for VfsInner {
             return Some(Rc::clone(&self.system_ns));
         }
         self.namespaces.borrow().get(&id).and_then(Weak::upgrade)
+    }
+
+    fn uptime_secs(&self) -> u64 {
+        self.uptime_clock
+            .borrow()
+            .as_ref()
+            .map_or(0, |clock| clock())
     }
 }
 
@@ -377,6 +416,7 @@ impl Vfs {
                 mnt_ns: Rc::clone(&system_ns),
                 fs_ctx: init_ctx,
                 fds: SharedFdTable::new(),
+                snapshot: None,
             },
         );
         let mut namespaces = HashMap::new();
@@ -393,6 +433,9 @@ impl Vfs {
                 system_ns,
                 namespaces: RefCell::new(namespaces),
                 processes: RefCell::new(processes),
+                proc_snapshot: RefCell::new(None),
+                proc_list: RefCell::new(None),
+                uptime_clock: RefCell::new(None),
             }),
         })
     }
@@ -412,6 +455,31 @@ impl Vfs {
     pub fn proc_bridge(&self) -> Weak<dyn ProcBridge> {
         let rc: Rc<dyn ProcBridge> = self.inner.clone();
         Rc::downgrade(&rc)
+    }
+
+    /// Install a dynamic metadata snapshot hook (e.g., querying `LocalProcessTable`) so `/proc`
+    /// renders process metadata 100% locally with `hidepid=invisible`.
+    pub fn set_proc_snapshot_hook(&self, hook: ProcSnapshotHook) {
+        *self.inner.proc_snapshot.borrow_mut() = Some(hook);
+    }
+
+    /// Install a dynamic PID listing hook (e.g., querying `LocalProcessTable`) so `/proc`
+    /// enumerates live and zombie processes 100% locally.
+    pub fn set_proc_list_hook(&self, hook: ProcListHook) {
+        *self.inner.proc_list.borrow_mut() = Some(hook);
+    }
+
+    /// Install an instance uptime clock (seconds since boot) for local `/proc/uptime` rendering.
+    pub fn set_uptime_hook(&self, hook: UptimeHook) {
+        *self.inner.uptime_clock.borrow_mut() = Some(hook);
+    }
+
+    /// Attach or update a static `ProcMetaSnapshot` on a specific process context.
+    pub fn set_process_snapshot(&self, pid: u32, snapshot: Option<ProcMetaSnapshot>) -> Result<()> {
+        let mut procs = self.inner.processes.borrow_mut();
+        let proc_ctx = procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
+        proc_ctx.snapshot = snapshot;
+        Ok(())
     }
 
     /// Mint a private clone of `ns` (used by login session creation and `CLONE_NEWNS`).
@@ -457,6 +525,7 @@ impl Vfs {
                 mnt_ns: ns,
                 fs_ctx: SharedFsContext::new(root_anchor, cwd_anchor, umask),
                 fds: SharedFdTable::new(),
+                snapshot: None,
             },
         );
         Ok(())
@@ -505,6 +574,7 @@ impl Vfs {
                 mnt_ns,
                 fs_ctx,
                 fds,
+                snapshot: None,
             },
         );
         Ok(())

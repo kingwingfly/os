@@ -239,11 +239,11 @@ fn regular(node: &Node, open: &OpenRef, write: bool) -> FsResult<()> {
     }
     Ok(())
 }
-fn prepare(db: &mut Db, request: &DataRequest) -> FsResult<Value> {
+fn prepare(db: &mut Db, request: &DataRequest, instance_id: Option<&str>) -> FsResult<Value> {
     if request.version != wire::VERSION {
         return Err(Errno::EPROTONOSUPPORT);
     }
-    let c = cloudfs::caller(db, &request.session, &request.credential)?;
+    let c = cloudfs::caller(db, &request.session, &request.credential, instance_id)?;
     let node = c.opened(db, &request.open)?;
     match request.operation {
         DataOperation::Read { offset, length } => {
@@ -318,11 +318,16 @@ fn prepare(db: &mut Db, request: &DataRequest) -> FsResult<Value> {
         }
     }
 }
-fn commit(db: &mut Db, request: &DataRequest, id: &str) -> FsResult<Value> {
+fn commit(
+    db: &mut Db,
+    request: &DataRequest,
+    id: &str,
+    instance_id: Option<&str>,
+) -> FsResult<Value> {
     if request.version != wire::VERSION {
         return Err(Errno::EPROTONOSUPPORT);
     }
-    let c = cloudfs::caller(db, &request.session, &request.credential)?;
+    let c = cloudfs::caller(db, &request.session, &request.credential, instance_id)?;
     let mut node = c.opened(db, &request.open)?;
     regular(&node, &request.open, true)?;
     cloudfs::unchanged_names(db, node.ino)?;
@@ -412,14 +417,23 @@ pub async fn authority(req: &mut Request, state: &State) -> Result<Reply> {
         return Ok(api::errno_reply(&Errno::EINVAL.into()));
     };
     let path = req.path();
+    let instance_id = req
+        .headers()
+        .get("X-OS-Instance")?
+        .filter(|s| !s.is_empty());
     crate::db::transact(state, |db| {
         db.sweep_cloud();
         ((), true)
     })?;
     api::run(state, move |db| {
         cloudfs::reply(match path.as_str() {
-            "/internal/fs/data" => prepare(db, &asked.request),
-            "/internal/fs/commit" => commit(db, &asked.request, asked.id.as_deref().unwrap_or("")),
+            "/internal/fs/data" => prepare(db, &asked.request, instance_id.as_deref()),
+            "/internal/fs/commit" => commit(
+                db,
+                &asked.request,
+                asked.id.as_deref().unwrap_or(""),
+                instance_id.as_deref(),
+            ),
             "/internal/fs/abandon" => {
                 let id = asked.id.as_deref().unwrap_or("");
                 if db
@@ -442,9 +456,20 @@ pub async fn authority(req: &mut Request, state: &State) -> Result<Reply> {
         })
     })
 }
-async fn ask(env: &Env, path: &str, request: &DataRequest, id: Option<&str>) -> Result<Response> {
+async fn ask(
+    env: &Env,
+    path: &str,
+    request: &DataRequest,
+    id: Option<&str>,
+    instance_id: Option<&str>,
+) -> Result<Response> {
+    let headers = Headers::new();
+    if let Some(instance) = instance_id {
+        headers.set("X-OS-Instance", instance)?;
+    }
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
+        .with_headers(headers)
         .with_body(Some(wasm_bindgen::JsValue::from_str(
             &json!({"request":request,"id":id}).to_string(),
         )));
@@ -461,6 +486,10 @@ pub async fn gateway(req: Request, env: &Env) -> Result<Response> {
     let Some(header) = req.headers().get("X-OS-Filesystem")? else {
         return api::errno_reply(&Errno::EINVAL.into()).response();
     };
+    let instance_id = req
+        .headers()
+        .get("X-OS-Instance")?
+        .filter(|s| !s.is_empty());
     let Ok(body) = serde_json::from_str::<Value>(&header) else {
         return api::errno_reply(&Errno::EINVAL.into()).response();
     };
@@ -470,7 +499,14 @@ pub async fn gateway(req: Request, env: &Env) -> Result<Response> {
     let Ok(request) = serde_json::from_value::<DataRequest>(body) else {
         return api::errno_reply(&Errno::EINVAL.into()).response();
     };
-    let mut response = ask(env, "/internal/fs/data", &request, None).await?;
+    let mut response = ask(
+        env,
+        "/internal/fs/data",
+        &request,
+        None,
+        instance_id.as_deref(),
+    )
+    .await?;
     if response.status_code() != 200 {
         return Ok(response);
     }
@@ -484,7 +520,7 @@ pub async fn gateway(req: Request, env: &Env) -> Result<Response> {
                     DataOperation::Read { .. } => "/internal/fs/read-done",
                     DataOperation::Write { .. } => "/internal/fs/abandon",
                 };
-                let _ = ask(env, cleanup, &request, Some(id)).await;
+                let _ = ask(env, cleanup, &request, Some(id), instance_id.as_deref()).await;
             }
             return crate::resources::refused(error);
         }
@@ -504,12 +540,21 @@ pub async fn gateway(req: Request, env: &Env) -> Result<Response> {
             let env = env.clone();
             let request = request.clone();
             let id = id.to_string();
+            let instance_done = instance_id.clone();
             let finished = Closure::<dyn FnMut() -> js_sys::Promise>::new(move || {
                 let env = env.clone();
                 let request = request.clone();
                 let id = id.clone();
+                let instance_done = instance_done.clone();
                 future_to_promise(async move {
-                    let _ = ask(&env, "/internal/fs/read-done", &request, Some(&id)).await;
+                    let _ = ask(
+                        &env,
+                        "/internal/fs/read-done",
+                        &request,
+                        Some(&id),
+                        instance_done.as_deref(),
+                    )
+                    .await;
                     Ok(JsValue::UNDEFINED)
                 })
             });
@@ -541,12 +586,33 @@ pub async fn gateway(req: Request, env: &Env) -> Result<Response> {
             )
             .await;
             if result.is_err() {
-                let _ = ask(env, "/internal/fs/abandon", &request, Some(id)).await;
+                let _ = ask(
+                    env,
+                    "/internal/fs/abandon",
+                    &request,
+                    Some(id),
+                    instance_id.as_deref(),
+                )
+                .await;
                 return api::errno_reply(&Errno::EIO.into()).response();
             }
-            let result = ask(env, "/internal/fs/commit", &request, Some(id)).await;
+            let result = ask(
+                env,
+                "/internal/fs/commit",
+                &request,
+                Some(id),
+                instance_id.as_deref(),
+            )
+            .await;
             if result.as_ref().is_err() || result.as_ref().is_ok_and(|r| r.status_code() != 200) {
-                let _ = ask(env, "/internal/fs/abandon", &request, Some(id)).await;
+                let _ = ask(
+                    env,
+                    "/internal/fs/abandon",
+                    &request,
+                    Some(id),
+                    instance_id.as_deref(),
+                )
+                .await;
             }
             result
         }

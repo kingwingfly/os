@@ -598,6 +598,8 @@ export async function exec(stages, options = {}) {
         }
         else if (type === 'reconcile') { await reconciling; await reconcile(); reply = {}; }
         else if (type === 'getpid') reply = await kernelCall('getpid', { pid: args.pid });
+        else if (type === 'getcreds') reply = await kernelCall('getcreds_proc', { pid });
+        else if (type === 'resource') { await kernelCall('reserve_memory', { pid, bytes: args.memory }); reply = {}; }
         // kill(2) from a process is the process's, by its own credentials.
         else if (type === 'kill') {
           reply = (await kernelCall('kill', { pid: args.pid, signal: args.signal, from: pid })) ?? {};

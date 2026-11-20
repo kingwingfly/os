@@ -1,61 +1,175 @@
 import { test, expect } from './test.js';
 import { sys, call } from './sys.js';
-const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const fsRpc = async (request, credential, session, fsCall) =>
-  (await request.post('/api/fs', { headers: { Origin: origin }, data: { version: 2, credential, session, call: fsCall } })).json();
-const image = { path: '/mnt/local/project/probe', argv: ['probe'], cwd: '/', runtime: 'resources-v1', local: { digest: 'a'.repeat(64), size: 8, cloud: false } };
-const proof = process => ({ pid: process.pid, proc: process.token });
-const result = async (request, call, options = {}) => (await sys(request, [call], options))[0];
-async function end(request, process) { if (process) await sys(request, [{ exit: { ...proof(process), status: 0 } }, { wait: { pid: String(process.pid), proc: process.token } }], {}, { 'X-Registry': '1' }); }
 
-test('local admission grants process resources but no implicit cloud filesystem authority', async ({ request }) => {
-  await call(request, 'getcreds'); let process;
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
+const OS_FD_ROOT = 0x7ffffffd;
+const O_RDONLY = 0;
+
+const image = {
+  path: '/mnt/local/project/probe',
+  argv: ['probe'],
+  cwd: '/',
+  runtime: 'resources-v1',
+  local: { digest: 'a'.repeat(64), size: 8, cloud: false },
+};
+
+async function connect(page) {
+  await page.goto('/login');
+  await page.evaluate(() => {
+    const worker = new Worker('/client-kernel.js');
+    const pending = new Map();
+    let next = 0;
+    worker.onmessage = ({ data }) => {
+      if (data?.id != null && pending.has(data.id)) {
+        pending.get(data.id)(data);
+        pending.delete(data.id);
+      }
+    };
+    window.localAdmKernel = (type, args = {}) => new Promise(resolve => {
+      const id = ++next;
+      pending.set(id, resolve);
+      worker.postMessage({ v: 2, id, type, args });
+    });
+  });
+  const init = await kc(page, 'init');
+  expect(init.err, JSON.stringify(init)).toBeUndefined();
+  await kc(page, 'sync_account_from_server');
+}
+const kc = (page, type, args = {}) => page.evaluate(([type, args]) => window.localAdmKernel(type, args), [type, args]);
+async function kv(page, type, args = {}) {
+  const r = await kc(page, type, args);
+  expect(r.err, `${type}: ${JSON.stringify(r)}`).toBeUndefined();
+  return r.ok;
+}
+async function end(page, proc) {
+  if (!proc) return;
+  await kc(page, 'exit', { pid: proc.pid, status: 0 });
+  await kc(page, 'wait', { pid: proc.pid });
+}
+
+const fsRpc = async (request, credential, session, fsCall, instanceId) =>
+  (await request.post('/api/fs', {
+    headers: { Origin: origin, ...(instanceId ? { 'X-OS-Instance': instanceId } : {}) },
+    data: { version: 2, credential, session, call: fsCall },
+  })).json();
+
+test('local admission grants process resources but no implicit cloud filesystem authority', async ({ page }) => {
+  await call(page.request, 'getcreds');
+  await connect(page);
+  let proc;
   try {
-    const admitted = await result(request, { execve: image }); expect(admitted.err).toBeUndefined(); process = admitted.ok;
-    expect(process.local).toEqual(image.local); expect(process.asset).toBeUndefined(); expect(process.fd).toBeUndefined();
-    const calls = await sys(request, ['getcreds', { stat: { path: '/usr/bin/coreutils' } }, { open: { path: '/usr/bin/coreutils', flags: 0 } }, { resource: { memory: 65536 } }], proof(process));
-    expect(calls[0].ok.uid).not.toBe(0); expect(calls[1].err.errno).toBe('EACCES'); expect(calls[2].err.errno).toBe('EACCES'); expect(calls[3].err).toBeUndefined();
-    const bytes = await request.get('/api/file?path=/usr/bin/coreutils', { headers: { 'X-Process-Token': process.token, 'X-Process-Pid': String(process.pid) } }); expect(bytes.ok()).toBe(false);
-    const escalation = await result(request, { execve: { ...image, ...proof(process), local: { ...image.local, cloud: true } } });
-    expect(escalation.err).toBeUndefined(); process = escalation.ok; expect(process.local.cloud).toBe(false);
-    expect((await result(request, { stat: { path: '/usr/bin/coreutils' } }, proof(process))).err.errno).toBe('EACCES');
-    expect((await result(request, { execve: { path: '/usr/bin/true', argv: ['true'], runtime: 'resources-v1', ...proof(process) } })).err.errno).toBe('EACCES');
-  } finally { await end(request, process); }
+    proc = await kv(page, 'exec', image);
+    expect(proc.local).toEqual(image.local);
+    expect(proc.asset).toBeUndefined();
+    expect(proc.fd).toBeUndefined();
+    expect(proc.token).toBe('');
+
+    const creds = await kv(page, 'getcreds_proc', { pid: proc.pid });
+    expect(creds.uid).not.toBe(0);
+    expect(creds.cloud_access).toBe(false);
+    expect(creds.has_remote).toBe(false);
+
+    // Local linear-memory reservation succeeds without touching any remote server.
+    await kv(page, 'reserve_memory', { pid: proc.pid, bytes: 65536 });
+
+    // Cloud filesystem access & remote credential minting are refused for cloud:false processes.
+    expect((await kc(page, 'proc_statat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: '/etc/passwd', follow: true })).err?.errno).toBe('EACCES');
+    expect((await kc(page, 'proc_openat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: '/etc/passwd', oflags: O_RDONLY, mode: 0, cloexec: false })).err?.errno).toBe('EACCES');
+    expect((await kc(page, 'mint_remote_cred', { pid: proc.pid })).err?.errno).toBe('EACCES');
+
+    // Re-exec cannot escalate cloud:false -> cloud:true.
+    proc = await kv(page, 'reexec', { ...image, pid: proc.pid, local: { ...image.local, cloud: true } });
+    expect(proc.local.cloud).toBe(false);
+    expect(proc.token).toBe('');
+    expect((await kc(page, 'proc_statat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: '/etc/passwd', follow: true })).err?.errno).toBe('EACCES');
+    expect((await kc(page, 'mint_remote_cred', { pid: proc.pid })).err?.errno).toBe('EACCES');
+  } finally {
+    await end(page, proc);
+  }
 });
 
-test('local fork and replacement preserve attenuation, while an explicitly delegated launch keeps ordinary ACL checks', async ({ request }) => {
-  await call(request, 'getcreds'); let parent, child, delegated;
+test('local fork and replacement preserve attenuation, while an explicitly delegated launch keeps ordinary ACL checks', async ({ page }) => {
+  const request = page.request;
+  await call(request, 'getcreds');
+  await connect(page);
+  const instanceId = await kv(page, 'instance_id');
+  let parent, child, delegated;
   try {
-    parent = (await result(request, { execve: image })).ok;
-    child = { ...(await result(request, { fork: { pid: parent.pid } }, proof(parent))).ok, token: parent.token };
-    expect((await result(request, { stat: { path: '/usr/bin/coreutils' } }, proof(child))).err.errno).toBe('EACCES');
-    const replacement = await result(request, { execve: { ...image, ...proof(child), local: { ...image.local, cloud: true } } }); expect(replacement.err).toBeUndefined(); child = replacement.ok; expect(child.local.cloud).toBe(false);
-    expect((await fsRpc(request, parent.token, null, 'connect')).errno).toBe('EACCES');
-    delegated = (await result(request, { execve: { ...image, local: { ...image.local, cloud: true } } })).ok;
-    // Ordinary processes resolve files via /api/fs v2 handles; direct /api/sys path calls are refused at the server boundary.
-    expect((await result(request, { stat: { path: '/usr/bin/coreutils' } }, proof(delegated))).err.errno).toBe('EPERM');
-    const conn = await fsRpc(request, delegated.token, null, 'connect');
-    expect(conn.session).toBeTruthy();
+    parent = await kv(page, 'exec', image);
+    child = await kv(page, 'fork', { pid: parent.pid });
+    expect(child.token).toBe('');
+    expect((await kc(page, 'proc_statat', { pid: child.pid, dirfd: OS_FD_ROOT, path: '/etc/passwd', follow: true })).err?.errno).toBe('EACCES');
+
+    // Re-exec of forked child preserves attenuation (cloud:false cannot escalate to cloud:true).
+    child = await kv(page, 'reexec', { ...image, pid: child.pid, local: { ...image.local, cloud: true } });
+    expect(child.local.cloud).toBe(false);
+    expect(child.token).toBe('');
+    expect((await fsRpc(request, '0'.repeat(64), null, 'connect', instanceId)).errno).toBe('EACCES');
+
+    // Explicitly delegated launch with cloud:true + remote:true receives a ServiceAuth v2 credential.
+    delegated = await kv(page, 'exec', { ...image, local: { ...image.local, cloud: true }, remote: true });
+    expect(delegated.token).toMatch(/^[0-9a-f]{64}$/);
+    // Direct v1 /api/sys path calls with a process credential are refused at the server boundary.
+    const [directStat] = await sys(request, [{ stat: { path: '/etc/passwd' } }], { pid: delegated.pid, proc: delegated.token }, { 'X-OS-Instance': instanceId });
+    expect(directStat.err?.errno).toBe('EPERM');
+
+    // /api/fs v2 honors ordinary ACL checks: /etc/passwd readable, /etc/shadow denied.
+    const conn = await fsRpc(request, delegated.token, null, 'connect', instanceId);
+    expect(conn.session, JSON.stringify(conn)).toBeTruthy();
     try {
-      const passwdWalk = await fsRpc(request, delegated.token, conn.session, { walk: { dir: conn.root, names: ['etc', 'passwd'] } });
+      const passwdWalk = await fsRpc(request, delegated.token, conn.session, { walk: { dir: conn.root, names: ['etc', 'passwd'] } }, instanceId);
       expect(passwdWalk.stop).toBeNull();
       expect(passwdWalk.entries).toHaveLength(2);
-      const shadowWalk = await fsRpc(request, delegated.token, conn.session, { walk: { dir: conn.root, names: ['etc', 'shadow'] } });
+      const shadowWalk = await fsRpc(request, delegated.token, conn.session, { walk: { dir: conn.root, names: ['etc', 'shadow'] } }, instanceId);
       if (shadowWalk.entries?.length === 2 && !shadowWalk.stop) {
-        const shadowOpen = await fsRpc(request, delegated.token, conn.session, { open: { ticket: 'shadow-acl-check', handle: shadowWalk.entries[1].handle, options: { read: true, write: false, append: false, append_implies_write: false, truncate: false, create: false, create_new: false, exec: false, path: false } } });
+        const shadowOpen = await fsRpc(request, delegated.token, conn.session, {
+          open: {
+            ticket: 'shadow-acl-check',
+            handle: shadowWalk.entries[1].handle,
+            options: { read: true, write: false, append: false, append_implies_write: false, truncate: false, create: false, create_new: false, exec: false, path: false },
+          },
+        }, instanceId);
         expect(['EACCES', 'ENOENT']).toContain(shadowOpen.errno);
       } else {
         expect(shadowWalk.stop).toBeTruthy();
       }
     } finally {
-      await fsRpc(request, delegated.token, conn.session, 'disconnect');
+      await fsRpc(request, delegated.token, conn.session, 'disconnect', instanceId);
     }
-  } finally { await end(request, child); await end(request, parent); await end(request, delegated); }
+  } finally {
+    if (child) {
+      await kc(page, 'exit', { pid: child.pid, status: 0 });
+      await kc(page, 'waitchild', { ppid: parent.pid, pid: child.pid });
+    }
+    await end(page, parent);
+    await end(page, delegated);
+  }
 });
 
-test('invalid local descriptors and uninstrumented claims are rejected before admission', async ({ request }) => {
+test('invalid local descriptors and uninstrumented claims are rejected before admission', async ({ page }) => {
+  const request = page.request;
   await call(request, 'getcreds');
-  for (const changed of [{ runtime: null }, { local: { ...image.local, size: 0 } }, { local: { ...image.local, size: 128 * 1024 * 1024 + 1 } }, { local: { ...image.local, digest: 'Z'.repeat(64) } }]) {
-    expect((await result(request, { execve: { ...image, ...changed } })).err).toBeTruthy();
+  await connect(page);
+  for (const changed of [
+    { local: { ...image.local, size: 0 } },
+    { local: { ...image.local, size: 128 * 1024 * 1024 + 1 } },
+    { local: { ...image.local, digest: 'Z'.repeat(64) } },
+  ]) {
+    expect((await kc(page, 'exec', { ...image, ...changed })).err?.errno).toBe('EINVAL');
   }
+  // Under a memory.max cgroup, uninstrumented runtime claims fail with EOPNOTSUPP.
+  const cg = '/user/local-adm-' + crypto.randomUUID();
+  await kv(page, 'cgroup_create', { path: cg });
+  try {
+    await kv(page, 'cgroup_set', { path: cg, key: 'memory.max', value: '65536' });
+    expect((await kc(page, 'exec', { ...image, cgroup: cg, runtime: 'untracked' })).err?.errno).toBe('EOPNOTSUPP');
+  } finally {
+    await kc(page, 'cgroup_remove', { path: cg });
+  }
+  // Retired server-side execve route fails closed on /api/sys.
+  const res = await request.post(origin + '/api/sys', {
+    headers: { Origin: origin, 'Content-Type': 'application/json' },
+    data: { calls: [{ execve: image }] },
+  });
+  expect(res.ok()).toBe(false);
 });

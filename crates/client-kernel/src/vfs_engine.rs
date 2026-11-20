@@ -7,8 +7,8 @@
 //! `vfs_sys`, and `proc_resolve_exec`.
 
 use crate::cloudfs::{
-    AuthorityPageFd, PageReadScope, RootCloudDriver, installed, page_sys_batch,
-    page_sys_batch_with_session, promised,
+    AuthorityPageFd, PageReadScope, RootCloudDriver, installed, page_sys_batch_with_session,
+    promised,
 };
 use crate::mounts::{Grant, LocalMount, errno_code};
 use crate::share_bridge::build_share_backing;
@@ -285,66 +285,63 @@ impl BlobStore for JsAssetBlobStore {
     }
 }
 
-/// `/proc` fallback provider querying `/api/sys` for server-authoritative `status`, `cmdline`,
-/// `stat`, and top-level `/proc` entries until L2b (#54).
-#[derive(Clone, Default)]
-pub(crate) struct BrowserProcProvider;
+/// `/proc` remote-job provider: numeric PIDs, `self`, `mounts`, and `uptime` are rendered 100%
+/// locally inside `os_vfs::ProcFs` via `ProcBridge` hooks with ZERO network RPCs (#54 L3a).
+/// Non-numeric remote server container job entries (`/proc/<hex-job-id>`) are queried ONLY when
+/// the caller already carries a remote `ServiceAuth v2` credential.
+#[derive(Clone)]
+pub(crate) struct BrowserProcProvider {
+    state: Rc<RefCell<crate::State>>,
+}
 
 impl BrowserProcProvider {
+    fn new(state: Rc<RefCell<crate::State>>) -> Self {
+        Self { state }
+    }
+
     async fn proc_call(&self, cred: &Cred, call: Call) -> vfs::Result<Value> {
-        if let Some(token) = &cred.token
-            && let Ok((global, post)) = installed("cloudFsPost")
-        {
-            let body = serde_json::to_vec(&Batch {
-                calls: vec![call],
-                umask: None,
-                sudo: false,
-                pid: None,
-                process: Some(token.clone()),
-            })
+        let Some(token) = cred.token.as_deref().filter(|t| !t.is_empty()) else {
+            return Err(Errno::ENOENT);
+        };
+        let Ok((global, post)) = installed("cloudFsPost") else {
+            return Err(Errno::ENOENT);
+        };
+        let instance_id = self.state.borrow().instance_id.clone();
+        let body = serde_json::to_vec(&Batch {
+            calls: vec![call],
+            umask: None,
+            sudo: false,
+            pid: None,
+            process: Some(token.to_string()),
+        })
+        .map_err(|_| Errno::EIO)?;
+        let headers = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&headers, &"Content-Type".into(), &"application/json".into());
+        let _ = js_sys::Reflect::set(&headers, &"X-Process-Token".into(), &token.into());
+        if !instance_id.is_empty() {
+            let _ = js_sys::Reflect::set(&headers, &"X-OS-Instance".into(), &instance_id.into());
+        }
+        let arr = js_sys::Uint8Array::from(body.as_slice());
+        let answer = post
+            .call3(&global, &"/api/sys".into(), &headers, &arr)
             .map_err(|_| Errno::EIO)?;
-            let headers = js_sys::Object::new();
-            let _ =
-                js_sys::Reflect::set(&headers, &"Content-Type".into(), &"application/json".into());
-            let arr = js_sys::Uint8Array::from(body.as_slice());
-            let answer = post
-                .call3(&global, &"/api/sys".into(), &headers, &arr)
-                .map_err(|_| Errno::EIO)?;
-            let reply = promised(answer).await?;
-            let status = js_sys::Reflect::get(&reply, &"status".into())
-                .ok()
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0) as u16;
-            if status != 200 {
-                return Err(Errno::ENOENT);
-            }
-            let raw = js_sys::Reflect::get(&reply, &"body".into()).map_err(|_| Errno::EIO)?;
-            let bytes = js_sys::Uint8Array::new(&raw).to_vec();
-            let res: abi::Results = serde_json::from_slice(&bytes).map_err(|_| Errno::EIO)?;
-            return res
-                .results
-                .into_iter()
-                .next()
-                .ok_or(Errno::EIO)?
-                .into_result()
-                .map_err(|e| e.errno);
+        let reply = promised(answer).await?;
+        let status = js_sys::Reflect::get(&reply, &"status".into())
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as u16;
+        if status != 200 {
+            return Err(Errno::ENOENT);
         }
-        if installed("pageSysPost").is_ok() {
-            let mut res = page_sys_batch(Batch {
-                calls: vec![call],
-                umask: None,
-                sudo: false,
-                pid: None,
-                process: None,
-            })
-            .await?;
-            return res
-                .pop()
-                .ok_or(Errno::EIO)?
-                .into_result()
-                .map_err(|e| e.errno);
-        }
-        Err(Errno::ENOENT)
+        let raw = js_sys::Reflect::get(&reply, &"body".into()).map_err(|_| Errno::EIO)?;
+        let bytes = js_sys::Uint8Array::new(&raw).to_vec();
+        let res: abi::Results = serde_json::from_slice(&bytes).map_err(|_| Errno::EIO)?;
+        res.results
+            .into_iter()
+            .next()
+            .ok_or(Errno::EIO)?
+            .into_result()
+            .map_err(|e| e.errno)
     }
 
     async fn read_proc_file(&self, cred: &Cred, path: &str) -> vfs::Result<Vec<u8>> {
@@ -365,131 +362,36 @@ impl BrowserProcProvider {
 }
 
 impl ProcProvider for BrowserProcProvider {
-    fn list_pids<'a>(&'a self, cred: &'a Cred) -> BoxFuture<'a, Vec<u32>> {
-        Box::pin(async move {
-            let Ok(val) = self
-                .proc_call(
-                    cred,
-                    Call::Getdents {
-                        path: "/proc".to_string(),
-                        cookie: 0,
-                        count: None,
-                    },
-                )
-                .await
-            else {
-                return Ok(Vec::new());
-            };
-            let Ok(entries) = serde_json::from_value::<Vec<Dirent>>(val) else {
-                return Ok(Vec::new());
-            };
-            Ok(entries
-                .into_iter()
-                .filter_map(|e| e.name.parse::<u32>().ok())
-                .collect())
-        })
+    fn list_pids<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, Vec<u32>> {
+        // Numeric PIDs are 100% instance-local in `LocalProcessTable` (ZERO network RPCs).
+        Box::pin(async { Ok(Vec::new()) })
     }
 
-    fn top_entries<'a>(&'a self, cred: &'a Cred) -> BoxFuture<'a, Vec<ProcDynamicEntry>> {
-        Box::pin(async move {
-            let Ok(val) = self
-                .proc_call(
-                    cred,
-                    Call::Getdents {
-                        path: "/proc".to_string(),
-                        cookie: 0,
-                        count: None,
-                    },
-                )
-                .await
-            else {
-                return Ok(Vec::new());
-            };
-            let Ok(entries) = serde_json::from_value::<Vec<Dirent>>(val) else {
-                return Ok(Vec::new());
-            };
-            let mut out = Vec::new();
-            for e in entries {
-                if e.name == "self" || e.name == "mounts" || e.name.parse::<u32>().is_ok() {
-                    continue;
-                }
-                let st = e.stat.unwrap_or_default();
-                let kind_bits = st.mode & abi::S_IFMT;
-                let file_type = if kind_bits == abi::S_IFDIR {
-                    FileType::Dir
-                } else if kind_bits == abi::S_IFLNK {
-                    FileType::Symlink
-                } else {
-                    FileType::File
-                };
-                out.push(ProcDynamicEntry {
-                    name: e.name,
-                    file_type,
-                    mode: (st.mode & 0o7777) as u16,
-                    uid: st.uid,
-                    gid: st.gid,
-                });
-            }
-            Ok(out)
-        })
+    fn top_entries<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, Vec<ProcDynamicEntry>> {
+        // `/proc` renders 100% locally inside this instance (ZERO `/api/sys` `/proc` RPCs).
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     fn read_top<'a>(&'a self, cred: &'a Cred, name: &'a str) -> BoxFuture<'a, Vec<u8>> {
         Box::pin(async move { self.read_proc_file(cred, &format!("/proc/{name}")).await })
     }
 
-    fn pid_entries<'a>(&'a self, cred: &'a Cred, pid: u32) -> BoxFuture<'a, Vec<ProcDynamicEntry>> {
-        Box::pin(async move {
-            let Ok(val) = self
-                .proc_call(
-                    cred,
-                    Call::Getdents {
-                        path: format!("/proc/{pid}"),
-                        cookie: 0,
-                        count: None,
-                    },
-                )
-                .await
-            else {
-                return Ok(Vec::new());
-            };
-            let Ok(entries) = serde_json::from_value::<Vec<Dirent>>(val) else {
-                return Ok(Vec::new());
-            };
-            let mut out = Vec::new();
-            for e in entries {
-                if matches!(
-                    e.name.as_str(),
-                    "mountinfo" | "mounts" | "ns" | "root" | "cwd" | "fd" | "fdinfo"
-                ) {
-                    continue;
-                }
-                let st = e.stat.unwrap_or_default();
-                let kind_bits = st.mode & abi::S_IFMT;
-                let file_type = if kind_bits == abi::S_IFDIR {
-                    FileType::Dir
-                } else if kind_bits == abi::S_IFLNK {
-                    FileType::Symlink
-                } else {
-                    FileType::File
-                };
-                out.push(ProcDynamicEntry {
-                    name: e.name,
-                    file_type,
-                    mode: (st.mode & 0o7777) as u16,
-                    uid: st.uid,
-                    gid: st.gid,
-                });
-            }
-            Ok(out)
-        })
+    fn pid_entries<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _pid: u32,
+    ) -> BoxFuture<'a, Vec<ProcDynamicEntry>> {
+        // All numeric `/proc/<pid>/*` entries render 100% locally (ZERO network RPCs).
+        Box::pin(async { Ok(Vec::new()) })
     }
 
-    fn read_pid<'a>(&'a self, cred: &'a Cred, pid: u32, name: &'a str) -> BoxFuture<'a, Vec<u8>> {
-        Box::pin(async move {
-            self.read_proc_file(cred, &format!("/proc/{pid}/{name}"))
-                .await
-        })
+    fn read_pid<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _pid: u32,
+        _name: &'a str,
+    ) -> BoxFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(Errno::ENOENT) })
     }
 }
 
@@ -505,6 +407,7 @@ fn proc_is_remote_ino(ino: u64) -> bool {
 fn proc_is_local_only_root_child(name: &str) -> bool {
     name == "mounts"
         || name == "self"
+        || name == "uptime"
         || name.parse::<u32>().is_ok_and(|pid| pid.to_string() == name)
 }
 
@@ -759,6 +662,9 @@ impl Filesystem for BrowserProcFs {
             }
             check_component(name)?;
             if dir.node.ino == PROC_ROOT_INO && !proc_is_local_only_root_child(name) {
+                if cred.token.as_deref().is_none_or(str::is_empty) {
+                    return Err(Errno::ENOENT);
+                }
                 return self.lookup_remote(cred, PROC_ROOT_INO, "/proc", name).await;
             }
             let entry = self.inner.lookup(cred, dir, name).await?;
@@ -1769,6 +1675,7 @@ impl LockCancel {
 pub(crate) struct VfsRuntime {
     pub(crate) vfs: Vfs,
     pub(crate) root_cloud: Rc<RootCloudDriver>,
+    pub(crate) dev_fs: Rc<DevTmpFs<JsDeviceBackend>>,
     pub(crate) dev_pts: Rc<DevPtsFs<JsDeviceBackend>>,
     pub(crate) usr_fs_id: FsId,
     pub(crate) usr_blob_paths: HashMap<u64, String>,
@@ -1786,6 +1693,39 @@ pub(crate) struct VfsRuntime {
     pub(crate) gid_names: HashMap<u32, String>,
     next_tmp_id: u64,
     next_scoped_pid: u32,
+}
+
+fn install_vfs_proc_hooks(vfs: &Vfs, state: &Rc<RefCell<crate::State>>) {
+    let s1 = Rc::clone(state);
+    vfs.set_proc_snapshot_hook(Rc::new(move |pid| {
+        let state = s1.try_borrow().ok()?;
+        let snap = state.table.proc_snapshot(pid)?;
+        Some(vfs::procfs::ProcMetaSnapshot {
+            ppid: snap.ppid,
+            pgid: snap.pgid,
+            sid: snap.sid,
+            uid: snap.uid,
+            gid: snap.gid,
+            state: snap.state,
+            cgroup: snap.cgroup,
+            comm: snap.comm,
+            argv: snap.argv,
+            started: snap.started,
+            tty: snap.tty,
+            tty_fds: snap.tty_fds,
+        })
+    }));
+    let s2 = Rc::clone(state);
+    vfs.set_proc_list_hook(Rc::new(move || {
+        s2.try_borrow()
+            .map(|st| st.table.all_pids())
+            .unwrap_or_default()
+    }));
+    let s3 = Rc::clone(state);
+    vfs.set_uptime_hook(Rc::new(move || {
+        let booted = s3.try_borrow().map(|st| st.table.booted_at()).unwrap_or(0);
+        crate::now_secs().saturating_sub(booted)
+    }));
 }
 
 fn default_uid_names() -> HashMap<u32, String> {
@@ -1809,9 +1749,11 @@ fn default_asset_sizes() -> BuildAssetSizes {
 async fn construct_vfs(
     instance_id: &str,
     root_cloud: Rc<RootCloudDriver>,
+    state: Rc<RefCell<crate::State>>,
     opts: Option<BootVfsOptions>,
 ) -> vfs::Result<(
     Vfs,
+    Rc<DevTmpFs<JsDeviceBackend>>,
     Rc<DevPtsFs<JsDeviceBackend>>,
     FsId,
     HashMap<u64, String>,
@@ -1822,6 +1764,7 @@ async fn construct_vfs(
         vfs::FsType::Cloud,
     ));
     let vfs = Vfs::boot(instance_id, root_backing.clone(), "cloud", factory).await?;
+    install_vfs_proc_hooks(&vfs, &state);
     let sys_ns = vfs.system_namespace();
     let mut root_cred = Cred::root();
     root_cred.umask = 0;
@@ -1874,18 +1817,20 @@ async fn construct_vfs(
     )
     .await?;
 
-    // 2. `/proc` (`ProcFs` bound to `vfs.proc_bridge()` + `BrowserProcProvider`, wrapped in
-    // `BrowserProcFs` so non-numeric `/proc/<job-id>` directory trees traverse cleanly).
+    // 2. `/proc` (`ProcFs` bound to `vfs.proc_bridge()` — 100% local rendering for all numeric
+    // PIDs, `self`, `mounts`, and `uptime`; `BrowserProcFs` handles remote container job ids only
+    // when a remote credential is attached).
+    let proc_provider = BrowserProcProvider::new(Rc::clone(&state));
     let proc_fs = Rc::new(ProcFs::new(
         FsId("proc".to_string()),
         mounted_at,
-        BrowserProcProvider,
+        proc_provider.clone(),
     ));
     proc_fs.bind_bridge(vfs.proc_bridge());
     let proc_wrapper = Rc::new(BrowserProcFs::new(
         FsId("proc".to_string()),
         proc_fs,
-        BrowserProcProvider,
+        proc_provider,
     ));
     let proc_backing = Rc::new(
         MountBacking::new(proc_wrapper as Rc<dyn Filesystem>, vfs::FsType::Proc)
@@ -1913,7 +1858,9 @@ async fn construct_vfs(
     )
     .await?;
 
-    // 3. `/dev` (`DevTmpFs`), `/dev/pts` (`DevPtsFs`), and `/dev/{present,snd}` (`CloudFs` bind)
+    // 3. `/dev` (`DevTmpFs` with instance-local devices only; remote devices `archive`, `media`,
+    // `present`, `snd` require explicit credentialed `attach_remote` per Contract §2.7) and
+    // `/dev/pts` (`DevPtsFs`).
     let dev_fs = Rc::new(DevTmpFs::new(
         FsId("devtmpfs".to_string()),
         1,
@@ -1921,7 +1868,7 @@ async fn construct_vfs(
         JsDeviceBackend::default(),
     ));
     let dev_backing = Rc::new(MountBacking::new(
-        dev_fs as Rc<dyn Filesystem>,
+        Rc::clone(&dev_fs) as Rc<dyn Filesystem>,
         vfs::FsType::DevTmpFs,
     ));
     vfs.mount_on_namespace(
@@ -1968,50 +1915,36 @@ async fn construct_vfs(
     )
     .await?;
 
-    let cloud_root = root_cloud.root();
-    if let Ok(dev_on_cloud) = root_cloud.lookup(&root_cred, &cloud_root, "dev").await {
-        for sub in ["present", "snd"] {
-            if let Ok(sub_entry) = root_cloud
-                .lookup(&root_cred, &dev_on_cloud.handle, sub)
-                .await
-            {
-                let target = format!("/dev/{sub}");
-                let _ = vfs
-                    .mount_on_namespace(
-                        &sys_ns,
-                        &root_cred,
-                        Rc::clone(&root_backing),
-                        Some((sub_entry.handle, target.clone())),
-                        "cloud",
-                        &target,
-                        MountFlags {
-                            nosuid: true,
-                            noexec: true,
-                            ..MountFlags::default()
-                        },
-                        0,
-                        None,
-                    )
-                    .await;
-            }
-        }
-    }
-
-    // 4. `/run`, `/mnt/local`, `/mnt/shared`, `/opt/private` (`MemFs` tmpfs carriers)
-    for (idx, target) in [
-        (1u64, "/run"),
-        (2u64, "/mnt/local"),
-        (3u64, "/mnt/shared"),
-        (4u64, "/opt/private"),
+    // 4. Instance-local `/run`, `/tmp` (`01777` sticky tmpfs, Contract §2.1), `/mnt/local`,
+    // `/mnt/shared`, `/opt/private` (`MemFs` tmpfs carriers).
+    for (idx, target, mode) in [
+        (1u64, "/run", 0o755u16),
+        (2u64, "/tmp", 0o1777u16),
+        (3u64, "/mnt/local", 0o755u16),
+        (4u64, "/mnt/shared", 0o755u16),
+        (5u64, "/opt/private", 0o755u16),
     ] {
         let fs = Rc::new(MemFs::new(
             FsId(format!("tmpfs:boot:{idx}")),
             idx,
             0,
             0,
-            0o755,
+            mode,
             Box::new(js_now_timespec),
         ));
+        if mode & 0o7000 != 0 {
+            let root = fs.root();
+            let _ = fs
+                .setattr(
+                    &root_cred,
+                    &root,
+                    &SetAttr {
+                        mode: Some(mode),
+                        ..SetAttr::default()
+                    },
+                )
+                .await;
+        }
         let backing = Rc::new(MountBacking::new(fs, vfs::FsType::TmpFs));
         vfs.mount_on_namespace(
             &sys_ns,
@@ -2044,27 +1977,32 @@ async fn construct_vfs(
         }
     }
 
-    Ok((vfs, dev_pts, usr_fs_id, usr_blob_paths))
+    Ok((vfs, dev_fs, dev_pts, usr_fs_id, usr_blob_paths))
 }
 
 impl VfsRuntime {
-    pub(crate) fn new_sync(instance_id: &str, root_cloud: Rc<RootCloudDriver>) -> Self {
+    pub(crate) fn new_sync(
+        instance_id: &str,
+        root_cloud: Rc<RootCloudDriver>,
+        state: Rc<RefCell<crate::State>>,
+    ) -> Self {
         let id = if instance_id.is_empty() {
             "local-instance"
         } else {
             instance_id
         };
         root_cloud.sync_boot_mem.set(true);
-        let booted = now_or_never(construct_vfs(id, Rc::clone(&root_cloud), None));
+        let booted = now_or_never(construct_vfs(id, Rc::clone(&root_cloud), state, None));
         root_cloud.sync_boot_mem.set(false);
-        let (vfs, dev_pts, usr_fs_id, usr_blob_paths) = booted
+        let (vfs, dev_fs, dev_pts, usr_fs_id, usr_blob_paths) = booted
             .expect("initial boot_vfs must resolve synchronously")
             .expect("initial boot_vfs must succeed");
         let mut proc_meta = HashMap::new();
-        proc_meta.insert(INIT, ProcessVfsMeta::new(None, true));
+        proc_meta.insert(INIT, ProcessVfsMeta::new(None, false));
         Self {
             vfs,
             root_cloud,
+            dev_fs,
             dev_pts,
             usr_fs_id,
             usr_blob_paths,
@@ -2281,7 +2219,7 @@ impl Kernel {
             (st.user.is_empty() && !rt.uid_names.contains_key(&st.uid))
                 || (st.group.is_empty() && !rt.gid_names.contains_key(&st.gid))
         };
-        if missing {
+        if missing && self.state.borrow().remote_attached {
             self.refresh_account_names(vfs, pid).await;
         }
         let mut rt = self.vfs_rt.borrow_mut();
@@ -2319,42 +2257,6 @@ impl Kernel {
 
     pub(crate) fn vfs_instance(&self) -> Option<Vfs> {
         Some(self.vfs_rt.borrow().vfs.clone())
-    }
-
-    /// Re-seed `RootCloudDriver` from `OsAuthority` during `Kernel::init()` when running in browser.
-    pub(crate) async fn sync_vfs_with_authority(&self, namespace: &str) -> vfs::Result<()> {
-        let root_cloud = Rc::clone(&self.vfs_rt.borrow().root_cloud);
-        if !root_cloud.seed_from_authority().await? {
-            return Ok(());
-        }
-        let sizes = query_authority_asset_sizes().await;
-        let opts = BootVfsOptions {
-            build_asset_sizes: sizes,
-            system_composition: None,
-            bind_mounts: Vec::new(),
-        };
-        let inst_id = if namespace.is_empty() {
-            "browser-instance"
-        } else {
-            namespace
-        };
-        struct SeedCacheGuard(Rc<RootCloudDriver>);
-        impl Drop for SeedCacheGuard {
-            fn drop(&mut self) {
-                self.0.use_seed_cache.set(false);
-            }
-        }
-        root_cloud.use_seed_cache.set(true);
-        let _seed_guard = SeedCacheGuard(Rc::clone(&root_cloud));
-        let (vfs, dev_pts, usr_fs_id, usr_blob_paths) =
-            construct_vfs(inst_id, Rc::clone(&root_cloud), Some(opts)).await?;
-        drop(_seed_guard);
-        let mut rt = self.vfs_rt.borrow_mut();
-        rt.vfs = vfs;
-        rt.dev_pts = dev_pts;
-        rt.usr_fs_id = usr_fs_id;
-        rt.usr_blob_paths = usr_blob_paths;
-        Ok(())
     }
 
     pub(crate) async fn close_process_server_fds(&self, pid: u32) {
@@ -2448,23 +2350,23 @@ impl Kernel {
         root_cloud.set_cloud_access(pid, true);
     }
 
-    /// Register a newly admitted `Execve` process in `Vfs` (`execs_of`).
+    /// Register a newly admitted local process in `Vfs` (`execs_of`) with ZERO network RPCs.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn register_exec_in_vfs(
+    pub(crate) async fn register_local_exec_in_vfs(
         &self,
         pid: u32,
         ppid: u32,
-        token: &str,
+        identity: Identity,
+        token: Option<String>,
         cwd: &str,
         session_id: Option<&str>,
         cloud_access: bool,
         service_grant_json: Option<&str>,
     ) -> Result<(), JsValue> {
-        let identity = self.cloud_identity(pid, token).await?;
         let cred = Cred {
             identity,
             umask: 0o022,
-            token: Some(token.to_string()),
+            token,
         };
         let grant = service_grant_json
             .map(serde_json::from_str::<ServiceGrantSpec>)
@@ -2489,12 +2391,11 @@ impl Kernel {
                     .0
                 }
                 None => match &sid {
-                    Some(id) => Rc::clone(
-                        &rt.sessions
-                            .get(id)
-                            .ok_or_else(|| map_errno(Errno::ENOENT))?
-                            .mnt_ns,
-                    ),
+                    Some(id) => rt
+                        .sessions
+                        .get(id)
+                        .map(|s| Rc::clone(&s.mnt_ns))
+                        .unwrap_or_else(|| rt.vfs.system_namespace()),
                     None => rt.vfs.system_namespace(),
                 },
             };
@@ -2607,50 +2508,6 @@ impl Kernel {
     }
 }
 
-async fn query_authority_asset_sizes() -> Option<BuildAssetSizes> {
-    if installed("pageSysPost").is_err() {
-        return None;
-    }
-    let paths = [
-        "/usr/bin/coreutils",
-        "/usr/bin/utilities",
-        "/usr/bin/dash",
-        "/usr/bin/supervise",
-        "/usr/bin/init",
-    ];
-    let calls = paths
-        .iter()
-        .map(|p| Call::Stat {
-            path: (*p).to_string(),
-        })
-        .collect();
-    let results = page_sys_batch(Batch {
-        calls,
-        umask: None,
-        sudo: false,
-        pid: None,
-        process: None,
-    })
-    .await
-    .ok()?;
-    let mut nums = [FILE_MAX; 5];
-    for (idx, ret) in results.into_iter().enumerate() {
-        if let Return::Ok(val) = ret
-            && let Some(sz) = val["size"].as_u64()
-            && sz >= 8
-        {
-            nums[idx] = sz;
-        }
-    }
-    Some(BuildAssetSizes {
-        coreutils: nums[0],
-        utilities: nums[1],
-        dash: nums[2],
-        supervise: nums[3],
-        init: nums[4],
-    })
-}
-
 async fn read_vfs_file_bounded(
     vfs: &Vfs,
     pid: u32,
@@ -2712,7 +2569,7 @@ impl Kernel {
     // 1. Boot, Login Session Lifecycle & User Mount Service
     // =========================================================================
 
-    /// Re-initialize `system_mnt_ns` with optional composition / build asset options.
+    /// Re-initialize `system_mnt_ns` with optional composition / build asset options (ZERO RPCs).
     pub async fn boot_vfs(&self, opts_json: Option<String>) -> Result<(), JsValue> {
         let opts: Option<BootVfsOptions> = opts_json
             .as_deref()
@@ -2722,30 +2579,31 @@ impl Kernel {
         let (inst_id, root_cloud) = {
             let state = self.state.borrow();
             let id = if state.namespace.is_empty() {
-                if state.id.is_empty() {
+                if state.instance_id.is_empty() {
                     "local-instance".to_string()
                 } else {
-                    state.id.clone()
+                    state.instance_id.clone()
                 }
             } else {
                 state.namespace.clone()
             };
             (id, Rc::clone(&self.vfs_rt.borrow().root_cloud))
         };
-        let _ = root_cloud.seed_from_authority().await;
-        let (vfs, dev_pts, usr_fs_id, usr_blob_paths) = construct_vfs(&inst_id, root_cloud, opts)
-            .await
-            .map_err(map_errno)?;
+        let (vfs, dev_fs, dev_pts, usr_fs_id, usr_blob_paths) =
+            construct_vfs(&inst_id, root_cloud, Rc::clone(&self.state), opts)
+                .await
+                .map_err(map_errno)?;
         let (old_vfs, old_sessions, old_streams) = {
             let mut rt = self.vfs_rt.borrow_mut();
             let old_vfs = std::mem::replace(&mut rt.vfs, vfs);
+            rt.dev_fs = dev_fs;
             rt.dev_pts = dev_pts;
             rt.usr_fs_id = usr_fs_id;
             rt.usr_blob_paths = usr_blob_paths;
             rt.active_session_id = None;
             rt.exec_tickets.clear();
             rt.proc_meta.clear();
-            rt.proc_meta.insert(INIT, ProcessVfsMeta::new(None, true));
+            rt.proc_meta.insert(INIT, ProcessVfsMeta::new(None, false));
             let mut old_sessions: Vec<_> = rt.sessions.drain().collect();
             if let Some(guest) = rt.guest_page.take() {
                 old_sessions.push((String::new(), guest));
@@ -5834,16 +5692,22 @@ impl Kernel {
 
         let owner = {
             let rt = self.vfs_rt.borrow();
-            let sid = page_session
-                .map(str::to_owned)
-                .or_else(|| rt.proc_meta.get(&pid).and_then(|m| m.login_session.clone()));
-            sid.map(|s| {
-                rt.sessions
-                    .get(&s)
-                    .map(|v| (s, v.mnt_ns.clone()))
-                    .ok_or_else(|| map_errno(Errno::ESTALE))
-            })
-            .transpose()?
+            if let Some(sid) = page_session {
+                Some(
+                    rt.sessions
+                        .get(sid)
+                        .map(|v| (sid.to_owned(), v.mnt_ns.clone()))
+                        .ok_or_else(|| map_errno(Errno::ESTALE))?,
+                )
+            } else {
+                // Already-running processes keep their own MountNamespace and ProviderState liveness
+                // checks even after login-session rotation or shutdown-scope end (e.g. cleanup
+                // handlers forking `/usr/bin/*` after `end-session`, or `sh -i` after login change).
+                rt.proc_meta
+                    .get(&pid)
+                    .and_then(|m| m.login_session.as_ref())
+                    .and_then(|s| rt.sessions.get(s).map(|v| (s.clone(), v.mnt_ns.clone())))
+            }
         };
         let chrooted = {
             let fs_ctx = vfs.process_fs_context(pid).map_err(map_errno)?;
@@ -5937,37 +5801,10 @@ impl Kernel {
                     })));
                 }
 
-                // Case 2: Mutable Cloud `/` executable when NOT chrooted, `!nosuid`, and cloud access allowed.
-                // Immutable Release v2 system-image (sysext/confext) executables (`ino >= 2 << 40`)
-                // fall through to Case 3 so their verified bytes execute via `LocalWasm` without
-                // tripping `creds.rs` `no_usr_fallback` on `system::owns`.
-                if resolved.pin.fstype() == vfs::FsType::Cloud
-                    && resolved.entry.handle.node.ino < (2u64 << 40)
-                    && !chrooted
-                    && !resolved.nosuid
-                    && !root_cloud.is_pid_cloud_denied(pid)
-                    && let Some(cloud_path) =
-                        root_cloud.canonical_cloud_path(resolved.entry.handle.node)
-                {
-                    let _ = resolved.file.close().await;
-                    drain_releases(&vfs);
-                    return Ok(ResolveOut::Immediate(json!({
-                        "path": resolved.resolved_path,
-                        "argv": resolved.argv,
-                        "resolvedPath": resolved.resolved_path,
-                        "execPath": cloud_path,
-                        "asset": Value::Null,
-                        "runtime": runtime,
-                        "noUsrFallback": true,
-                        "chroot": false,
-                        "chrooted": false,
-                        "nosuid": false,
-                        "local": Value::Null,
-                    })));
-                }
-
-                // Case 3: Local mount (`opfs`, `hostfs`, `helperfs`, `sharefs`), `tmpfs`, private
-                // extension `image`, or chrooted/cloud-attenuated executable -> snapshot & verify bytes!
+                // Case 2: All non-`/usr` executables (cloud files, Release v2 immutable
+                // sysext/confext overlays, local mounts, `tmpfs`, private extension `image`, or
+                // chrooted/cloud-attenuated executables) snapshot & verify bytes through `Vfs`
+                // and run locally without server `/internal/exec`.
                 let size = resolved.entry.metadata.size;
                 if size > abi::EXEC_MAX {
                     let _ = resolved.file.close().await;
@@ -7465,7 +7302,219 @@ impl Kernel {
                         }
                         Err(e) => Err(e.into()),
                     },
+                    Call::Getcreds if page_sid.is_none() && pid < SCOPED_PAGE_PID_BASE => {
+                        let host = self
+                            .state
+                            .borrow()
+                            .table
+                            .proc(pid)
+                            .map(|p| p.owner_host.clone());
+                        match host {
+                            Some(h) => match self.getcreds_proc(pid, &h) {
+                                Ok(raw) => serde_json::from_str::<Value>(&raw)
+                                    .map_err(|_| Errno::EIO.into()),
+                                Err(_) => Err(Errno::ESRCH.into()),
+                            },
+                            None => Err(Errno::ESRCH.into()),
+                        }
+                    }
+                    call @ (Call::Getpid
+                    | Call::Getpgid { .. }
+                    | Call::Getsid { .. }
+                    | Call::Setpgid { .. }
+                    | Call::Setsid
+                    | Call::Prctl { .. }
+                    | Call::ProcStopped { .. }
+                    | Call::Waitpid { .. }
+                    | Call::CgroupCreate { .. }
+                    | Call::CgroupRemove { .. }
+                    | Call::CgroupSet { .. }
+                    | Call::CgroupAttach { .. }
+                    | Call::CgroupStat { .. }
+                    | Call::CgroupList { .. }) => {
+                        let owner_host = self
+                            .state
+                            .borrow()
+                            .table
+                            .proc(pid)
+                            .map(|p| p.owner_host.clone());
+                        if let Some(h) = owner_host {
+                            self.eval_local_process_call(pid, &h, call).await
+                        } else if page_sid.is_some() || pid >= SCOPED_PAGE_PID_BASE {
+                            // Page-scoped cgroup operations act as the instance's local account.
+                            match call {
+                                Call::CgroupCreate {
+                                    path,
+                                    controllers,
+                                    lifetime,
+                                } => {
+                                    let mut state = self.state.borrow_mut();
+                                    let cred = state.account.identity();
+                                    state
+                                        .table
+                                        .cgroup_create(
+                                            &cred,
+                                            None,
+                                            &path,
+                                            controllers.as_deref(),
+                                            lifetime,
+                                        )
+                                        .map(|()| Value::Null)
+                                }
+                                Call::CgroupRemove { path } => {
+                                    let mut state = self.state.borrow_mut();
+                                    let cred = state.account.identity();
+                                    state
+                                        .table
+                                        .cgroup_remove(&cred, &path)
+                                        .map(|()| Value::Null)
+                                }
+                                Call::CgroupSet { path, key, value } => {
+                                    let res = {
+                                        let mut state = self.state.borrow_mut();
+                                        let cred = state.account.identity();
+                                        state
+                                            .table
+                                            .cgroup_set_with_revocations(
+                                                &cred,
+                                                &path,
+                                                &key,
+                                                &value,
+                                                crate::now_secs(),
+                                            )
+                                            .map(|(d, r)| {
+                                                let norm =
+                                                    kernel::local_cgroups::normalize_cgroup_path(
+                                                        &path,
+                                                    )
+                                                    .unwrap_or(path);
+                                                (d, r, norm)
+                                            })
+                                    };
+                                    match res {
+                                        Ok((deliveries, revoked, norm)) => {
+                                            for d in deliveries {
+                                                if d.killed {
+                                                    self.cloud_exited(d.pid, None).await;
+                                                }
+                                            }
+                                            crate::revoke_remote_tokens_state(&self.state, revoked)
+                                                .await;
+                                            if key == "io.max" {
+                                                self.sync_remote_io_quota_subtree(&norm).await;
+                                            }
+                                            Ok(Value::Null)
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                                Call::CgroupAttach {
+                                    pid: target_pid,
+                                    path,
+                                } => {
+                                    let res = {
+                                        let mut state = self.state.borrow_mut();
+                                        let cred = state.account.identity();
+                                        state.table.cgroup_attach(&cred, target_pid, &path).map(
+                                            |()| {
+                                                let norm =
+                                                    kernel::local_cgroups::normalize_cgroup_path(
+                                                        &path,
+                                                    )
+                                                    .unwrap_or(path);
+                                                let tok =
+                                                    state.table.proc(target_pid).and_then(|p| {
+                                                        p.cred
+                                                            .remote
+                                                            .as_ref()
+                                                            .map(|r| r.token.clone())
+                                                    });
+                                                (norm, tok)
+                                            },
+                                        )
+                                    };
+                                    match res {
+                                        Ok((norm, remote_tok)) => {
+                                            if let Some(token) = remote_tok {
+                                                self.sync_remote_io_quota_for_token(&token, &norm)
+                                                    .await;
+                                            }
+                                            Ok(Value::Null)
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                                Call::CgroupStat { path } => {
+                                    self.state.borrow().table.cgroup_stat(&path)
+                                }
+                                Call::CgroupList { path } => {
+                                    Ok(json!(self.state.borrow().table.cgroup_list(&path)))
+                                }
+                                _ => Err(Errno::ENOSYS.into()),
+                            }
+                        } else {
+                            Err(Errno::ESRCH.into())
+                        }
+                    }
+                    Call::Kill {
+                        pid: target_str,
+                        signal,
+                    } => {
+                        let target = abi::Target::of(&target_str);
+                        if !matches!(target, abi::Target::Job(_)) {
+                            let sig = signal.unwrap_or(abi::SIGTERM);
+                            let from =
+                                (page_sid.is_none() && pid < SCOPED_PAGE_PID_BASE).then_some(pid);
+                            let kill_res = {
+                                let mut state = self.state.borrow_mut();
+                                let caller_cred = if let Some(fp) = from {
+                                    state
+                                        .table
+                                        .proc(fp)
+                                        .filter(|p| p.state != abi::ProcState::Zombie)
+                                        .map(|p| p.cred.identity.clone())
+                                        .ok_or_else(|| abi::Error::from(Errno::ESRCH))
+                                } else {
+                                    Ok(state.account.identity())
+                                };
+                                caller_cred.and_then(|cred| {
+                                    state.table.kill_with_revocations(
+                                        &cred,
+                                        from,
+                                        target,
+                                        sig,
+                                        crate::now_secs(),
+                                    )
+                                })
+                            };
+                            match kill_res {
+                                Ok((deliveries, revoked)) => {
+                                    for d in deliveries {
+                                        if d.killed {
+                                            self.cloud_exited(d.pid, None).await;
+                                        }
+                                    }
+                                    crate::revoke_remote_tokens_state(&self.state, revoked).await;
+                                    Ok(Value::Null)
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            self.forward_server_call(
+                                pid,
+                                page_sudo,
+                                Call::Kill {
+                                    pid: target_str,
+                                    signal,
+                                },
+                            )
+                            .await
+                        }
+                    }
                     other => {
+                        let is_login = matches!(other, Call::Login { .. });
+                        let is_logout = matches!(other, Call::Logout);
+                        let is_getcreds = matches!(other, Call::Getcreds);
                         let invalidates_accounts = matches!(
                             other,
                             Call::Useradd { .. }
@@ -7478,6 +7527,16 @@ impl Kernel {
                                 | Call::Logout
                         );
                         let res = self.forward_server_call(pid, page_sudo, other).await;
+                        if let Ok(ref val) = res {
+                            if is_logout {
+                                self.apply_account_update(crate::LocalAccount::default());
+                            } else if (is_login || is_getcreds)
+                                && (page_sid.is_some() || pid >= SCOPED_PAGE_PID_BASE)
+                                && let Ok(acc) = crate::parse_account_from_value(val)
+                            {
+                                self.apply_account_update(acc);
+                            }
+                        }
                         if invalidates_accounts && res.is_ok() {
                             let mut rt = self.vfs_rt.borrow_mut();
                             rt.uid_names = default_uid_names();
@@ -7666,7 +7725,8 @@ impl Kernel {
             )
         {
             let mut combined: BTreeMap<String, Dirent> = BTreeMap::new();
-            if self.vfs_rt.borrow().root_cloud.is_remote_mode()
+            if self.state.borrow().remote_attached
+                && self.vfs_rt.borrow().root_cloud.is_remote_mode()
                 && let Ok(val) = self
                     .forward_server_call(
                         pid,
@@ -8784,20 +8844,13 @@ impl Kernel {
     ) -> std::result::Result<Value, abi::Error> {
         let fs_session = self.vfs_rt.borrow().root_cloud.current_fs_session();
         let is_page_call = page_sudo || pid >= SCOPED_PAGE_PID_BASE;
-        let token = if is_page_call {
-            None
-        } else {
-            let state = self.state.borrow();
-            state
-                .processes
-                .get(&pid)
-                .filter(|l| l.ended.is_none())
-                .map(|l| l.token.clone())
-        };
         if !is_page_call {
-            let Some(tok) = token else {
-                return Err(Errno::ESRCH.into());
-            };
+            if self.vfs_rt.borrow().root_cloud.is_pid_cloud_denied(pid) {
+                return Err(Errno::EACCES.into());
+            }
+            let rem = crate::lazy_mint_remote_cred(&self.state, pid).await?;
+            let tok = rem.token;
+            let instance_id = self.state.borrow().instance_id.clone();
             let batch = Batch {
                 calls: vec![call],
                 umask: None,
@@ -8806,14 +8859,7 @@ impl Kernel {
                 process: Some(tok.clone()),
             };
             let Ok((global, post)) = installed("cloudFsPost") else {
-                if fs_session.is_some() {
-                    return Err(Errno::EACCES.into());
-                }
-                return crate::sys(batch)
-                    .await?
-                    .pop()
-                    .ok_or(Errno::EIO)?
-                    .into_result();
+                return Err(Errno::ENOTCONN.into());
             };
             let body = serde_json::to_vec(&batch)
                 .map_err(|e| abi::Error::because(Errno::EIO, e.to_string()))?;
@@ -8822,6 +8868,10 @@ impl Kernel {
                 js_sys::Reflect::set(&headers, &"Content-Type".into(), &"application/json".into());
             js_sys::Reflect::set(&headers, &"X-Process-Token".into(), &tok.into())
                 .map_err(|_| Errno::EIO)?;
+            if !instance_id.is_empty() {
+                js_sys::Reflect::set(&headers, &"X-OS-Instance".into(), &instance_id.into())
+                    .map_err(|_| Errno::EIO)?;
+            }
             if let Some((ref sid, ref secret)) = fs_session
                 && !sid.is_empty()
                 && !secret.is_empty()

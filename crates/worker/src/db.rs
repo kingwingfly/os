@@ -578,6 +578,7 @@ impl Db {
     pub fn observe(&mut self, name: &str, count: u64) {
         self.run("INSERT INTO observations(name, value) VALUES(?, ?) ON CONFLICT(name) DO UPDATE SET value = value + excluded.value", vec![text(name), int(count)]);
     }
+    #[allow(dead_code)]
     pub fn observations(&self) -> std::collections::BTreeMap<String, u64> {
         #[derive(Deserialize)]
         struct Counter {
@@ -939,6 +940,7 @@ impl Db {
     /// A new descriptor of the process `proc` ("ns pid"), open for reading the executable `file`
     /// execve(2) found (fds::open_exec): its read token, stored hashed, revalidates with the X
     /// rule, so an x-only file runs; the page cannot name it.
+    #[allow(dead_code)]
     pub fn add_exec_fd(
         &mut self,
         sid: &str,
@@ -2121,12 +2123,17 @@ impl Store for Db {
         self.end_sessions("key = ?", vec![text(key)]);
     }
     fn delete_sessions(&mut self, user: u32) {
-        let credentials = self.rows::<crate::creds::Credential>(
+        let mut credentials = self.rows::<crate::creds::Credential>(
             &delete_sessions_credentials_sql(),
             vec![int(user), text(crate::creds::JOBS)],
         );
+        credentials.extend(self.rows::<crate::creds::Credential>(
+            &delete_sessions_controlled_credentials_sql(),
+            vec![text(crate::creds::JOBS), int(user)],
+        ));
+        let mut seen = std::collections::HashSet::new();
         for cred in credentials {
-            if cred.ns != crate::creds::JOBS {
+            if cred.ns != crate::creds::JOBS && seen.insert(cred.token.clone()) {
                 self.revoke(&cred.ns, &cred.token);
             }
         }
@@ -2235,6 +2242,14 @@ fn delete_sessions_credentials_sql() -> String {
     )
 }
 
+fn delete_sessions_controlled_credentials_sql() -> String {
+    format!(
+        "SELECT {} FROM credentials WHERE ns != ? AND {} IN (SELECT lineage FROM execution_owners WHERE uid = ?)",
+        crate::creds::columns(),
+        crate::creds::OWNER
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2244,5 +2259,15 @@ mod tests {
         let sql = delete_sessions_credentials_sql();
         assert!(sql.contains("WHERE uid = ? AND ns != ?"), "sql: {sql}");
         assert_eq!(crate::creds::JOBS, "jobs");
+    }
+
+    #[test]
+    fn delete_sessions_controlled_query_covers_sudo_owners_excluding_jobs() {
+        let sql = delete_sessions_controlled_credentials_sql();
+        assert!(sql.contains("WHERE ns != ?"), "sql: {sql}");
+        assert!(
+            sql.contains("SELECT lineage FROM execution_owners WHERE uid = ?"),
+            "sql: {sql}"
+        );
     }
 }

@@ -59,16 +59,12 @@ pub async fn handle(
         })));
     }
     let token = batch_token.or(header_token);
-    let no_usr_fallback = req
-        .headers()
-        .get("X-OS-No-Usr-Fallback")?
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    let chroot = req
-        .headers()
-        .get("X-OS-Chroot")?
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let fs_session = req.headers().get("X-Fs-Session")?.filter(|s| !s.is_empty());
     let fs_secret = req.headers().get("X-Fs-Secret")?.filter(|s| !s.is_empty());
+    let instance_id = req
+        .headers()
+        .get("X-OS-Instance")?
+        .filter(|s| !s.is_empty());
     // As whom each call is made: the page's session, or the process the batch names.
     let page_target = match req
         .headers()
@@ -94,9 +90,8 @@ pub async fn handle(
         umask: batch.umask.map(|mask| mask & 0o777),
         pid: batch.pid,
         token,
+        instance_id,
         release: req.headers().get("X-OS-Release")?,
-        no_usr_fallback,
-        chroot,
         fs_session,
         fs_secret,
     });
@@ -120,45 +115,36 @@ pub async fn handle(
         ((), true)
     })?;
     let mut results = Vec::with_capacity(batch.calls.len());
-    let mut calls = batch.calls.into_iter().peekable();
-    while let Some(mut call) = calls.next() {
-        // The process registry's calls are the browser's machine's (machine.rs): those in a row
-        // go there at once, with the caller found here.
-        if call.is_registry() && session.token.is_some() {
-            let checking = session.clone();
-            let remote = transact(state, move |db| {
-                (
-                    checking
-                        .of(db)
-                        .ok()
-                        .and_then(|a| a.credential)
-                        .and_then(|c| c.job())
-                        .is_some(),
-                    false,
-                )
-            })?;
-            if remote {
-                results.push(Return::Err(Errno::EPERM.into()));
-                continue;
-            }
-        }
+    for mut call in batch.calls {
+        // Under #54 (L3a), all process/cgroup registry calls are instance-local in
+        // `LocalProcessTable`; the server fails closed with `ENOSYS`.
         if call.is_registry() {
-            let mut registry = vec![call];
-            while calls.peek().is_some_and(Call::is_registry) {
-                registry.extend(calls.next());
-            }
-            let cookie = req.headers().get("Cookie")?;
-            results.extend(crate::machine::forward(env, state, &session, cookie, registry).await?);
+            results.push(Return::Err(Error::because(
+                Errno::ENOSYS,
+                "process and cgroup calls are instance-local",
+            )));
             continue;
         }
-        // Local process credentials carry an explicit cloud delegation. Keep this gate
+        if let Err(error) = resolve(&mut call, &results) {
+            results.push(Return::Err(error));
+            continue;
+        }
+        // Service credentials carry explicit cloud / remote-device scopes. Keep this gate
         // before byte transfers and asynchronous device routes as well as ordinary calls.
         if session.token.is_some() && !matches!(call, Call::Getcreds | Call::Close { .. }) {
             let checking = session.clone();
+            let probe = device_probe(&call);
             let allowed = transact(state, move |db| {
                 (
                     checking.of(db).and_then(|acting| {
-                        acting.credential.as_ref().map_or(Ok(()), Credential::cloud)
+                        let Some(cred) = acting.credential.as_ref() else {
+                            return Ok(());
+                        };
+                        if let Some(driver) = probe.driver(db, acting.sid.as_deref()) {
+                            cred.check_device(driver)
+                        } else {
+                            cred.cloud()
+                        }
                     }),
                     false,
                 )
@@ -167,10 +153,6 @@ pub async fn handle(
                 results.push(Return::Err(error));
                 continue;
             }
-        }
-        if let Err(error) = resolve(&mut call, &results) {
-            results.push(Return::Err(error));
-            continue;
         }
         // Bytes that go with the call move to or from R2 outside a transaction.
         if matches!(call, Call::Pread { .. } | Call::Pwrite { .. }) {
@@ -236,12 +218,6 @@ pub async fn handle(
             }
             _ => None,
         };
-        // A listing or file of /proc tells of the browser's processes, as its machine has them.
-        let procs = if lists_processes(&mut call) {
-            crate::machine::list(env, &session.namespace()).await?
-        } else {
-            Vec::new()
-        };
         let asking = session.clone();
         let result = transact(state, move |db| {
             // A descriptor call stands as it ends, failed or not: a close that fails closes.
@@ -251,7 +227,7 @@ pub async fn handle(
             );
             let result = asking
                 .of(db)
-                .and_then(|acting| run(db, &asking, &acting, &procs, call));
+                .and_then(|acting| run(db, &asking, &acting, call));
             let commit = result.is_ok() || descriptors;
             let result = match result {
                 Ok(value) => Return::Ok(value),
@@ -355,11 +331,48 @@ pub struct Session {
     pub umask: Option<u16>,
     pub pid: Option<u32>,
     pub token: Option<String>,
+    pub instance_id: Option<String>,
     pub release: Option<String>,
-    pub no_usr_fallback: bool,
-    pub chroot: bool,
     pub fs_session: Option<String>,
     pub fs_secret: Option<String>,
+}
+
+enum DeviceProbe {
+    Path(String),
+    Fd(u32),
+    None,
+}
+
+impl DeviceProbe {
+    fn driver(&self, db: &Db, sid: Option<&str>) -> Option<&'static str> {
+        match self {
+            Self::Path(path) => Credential::remote_device_driver(path),
+            Self::Fd(fd) => sid.and_then(|s| db.fd(s, *fd)).and_then(|f| {
+                f.device
+                    .as_deref()
+                    .and_then(Credential::remote_device_driver)
+            }),
+            Self::None => None,
+        }
+    }
+}
+
+fn device_probe(call: &Call) -> DeviceProbe {
+    match call {
+        Call::Open { path, .. }
+        | Call::Stat { path }
+        | Call::Lstat { path }
+        | Call::Mknod { path, .. }
+        | Call::Pread {
+            fd: None,
+            path: Some(path),
+            ..
+        } => DeviceProbe::Path(path.clone()),
+        Call::Ioctl { fd, .. } | Call::Pread { fd: Some(fd), .. } | Call::Pwrite { fd, .. } => {
+            DeviceProbe::Fd(fd.number())
+        }
+        _ => DeviceProbe::None,
+    }
 }
 
 /// As whom a call acts, once a transaction found it: its process (credentials and umask), the
@@ -395,6 +408,7 @@ impl Session {
                 let credential = db
                     .credential(token, &self.namespace())
                     .ok_or_else(|| Error::because(Errno::EPERM, "not this process's token"))?;
+                credential.check_instance(self.instance_id.as_deref())?;
                 (
                     Process {
                         cred: credential.identity(),
@@ -513,48 +527,35 @@ async fn bytes(
             if count > INLINE_MAX {
                 return Err(too_many());
             }
-            // A file of /proc that tells of processes is read again with its machine's list.
-            let mut procs: Option<Rc<Vec<crate::procs::Row>>> = None;
-            let read = loop {
-                let (asking, path_arg, listed) = (session.clone(), path.clone(), procs.clone());
-                let read = transact(state, move |db| {
-                    let read = asking.of(db).and_then(|acting| {
-                        if acting.credential.as_ref().and_then(|c| c.job()).is_some() {
-                            return Err(Errno::EPERM.into());
-                        }
-                        if let Some(credential) = &acting.credential {
-                            let probe = Call::Pread {
-                                fd,
-                                path: path_arg.clone(),
-                                offset,
-                                count,
-                            };
-                            authorize_process_v1(db, acting.sid.as_deref(), credential, &probe)?;
-                        }
-                        crate::fds::pread(
-                            db,
-                            acting.sid.as_deref(),
-                            listed.as_deref().map(Vec::as_slice),
-                            &acting.process,
-                            fd.map(FdRef::number),
-                            path_arg.as_deref(),
+            let (asking, path_arg) = (session.clone(), path.clone());
+            let read = transact(state, move |db| {
+                let read = asking.of(db).and_then(|acting| {
+                    if acting.credential.as_ref().and_then(|c| c.job()).is_some() {
+                        return Err(Errno::EPERM.into());
+                    }
+                    if let Some(credential) = &acting.credential {
+                        let probe = Call::Pread {
+                            fd,
+                            path: path_arg.clone(),
                             offset,
                             count,
-                            acting.owner().as_deref(),
-                        )
-                    });
-                    (read, false)
-                })
-                .map_err(io)??;
-                if !matches!(read, crate::fds::Read::Processes) || procs.is_some() {
-                    break read;
-                }
-                procs = Some(Rc::new(
-                    crate::machine::list(env, &session.namespace())
-                        .await
-                        .map_err(io)?,
-                ));
-            };
+                        };
+                        authorize_process_v1(db, acting.sid.as_deref(), credential, &probe)?;
+                    }
+                    crate::fds::pread(
+                        db,
+                        acting.sid.as_deref(),
+                        &acting.process,
+                        fd.map(FdRef::number),
+                        path_arg.as_deref(),
+                        offset,
+                        count,
+                        acting.owner().as_deref(),
+                    )
+                });
+                (read, false)
+            })
+            .map_err(io)??;
             let (data, size) = match read {
                 crate::fds::Read::Bytes(data, size) => (data, size),
                 crate::fds::Read::Chunks(parts, size) => {
@@ -594,7 +595,6 @@ async fn bytes(
                         .await?;
                     (asset_range(env, &asset, offset, length).await?, size)
                 }
-                crate::fds::Read::Processes => return Err(Errno::EIO.into()),
             };
             Ok(json!(Data {
                 data: data.into(),
@@ -856,7 +856,7 @@ fn authorize_process_v1_with(
         return Ok(());
     }
     match call {
-        call if call.is_registry() => Ok(()),
+        call if call.is_registry() => Err(Errno::ENOSYS.into()),
         Call::Getcreds
         | Call::Useradd { .. }
         | Call::Usermod { .. }
@@ -952,13 +952,11 @@ fn authorize_process_v1(
 }
 
 /// The call `call`, as `acting` found it: a process's own snapshot, or the session's account
-/// (signed in or not, under sudo if it asked). `procs` are the browser's processes, as its
-/// machine listed them, for a call on /proc.
+/// (signed in or not, under sudo if it asked).
 fn run(
     db: &mut Db,
     session: &Session,
     acting: &Acting,
-    procs: &[crate::procs::Row],
     call: Call,
 ) -> std::result::Result<serde_json::Value, Error> {
     let (key, guest) = (session.key.as_deref(), session.guest.as_deref());
@@ -966,6 +964,9 @@ fn run(
     if let Some(credential) = caller {
         crate::executor::authorize(db, credential, &call)?;
         authorize_process_v1(db, sid, credential, &call)?;
+        if let Some(driver) = device_probe(&call).driver(db, sid) {
+            credential.check_device(driver)?;
+        }
     }
     // A process acts as itself: it cannot sign the browser in or out, or mint sudo.
     if caller.is_some() && matches!(call, Call::Logout) {
@@ -1029,7 +1030,7 @@ fn run(
     }
     if proc {
         let opening = matches!(call, Call::Open { .. });
-        let value = crate::procfs::call(db, sid, procs, &process.cred, call)?;
+        let value = crate::procfs::call(db, sid, &process.cred, call)?;
         // A process's open of /proc is its own descriptor, as any open of its is (fds.rs).
         if opening
             && let (Some(sid), Some(credential), Some(fd)) = (sid, &caller, value["fd"].as_u64())
@@ -1165,13 +1166,6 @@ fn run(
         }
         call => kernel::call(db, process, call),
     }
-}
-
-/// Whether `call` names /proc's processes (not only /proc/self's descriptors).
-fn lists_processes(call: &mut Call) -> bool {
-    paths(call)
-        .iter()
-        .any(|(path, _)| crate::procfs::of_processes(path))
 }
 
 /// Whether `call` would change what it names.
@@ -1448,6 +1442,11 @@ async fn networked(
                 crate::fds::yours(db, &sid, fd, acting.owner().as_deref())?;
                 let request = dev::request(db, &sid, fd)?.ok_or(Errno::ENOTTY)?;
                 let rdev = request.node.rdev.clone().unwrap_or_default();
+                if let Some(cred) = &acting.credential
+                    && matches!(rdev.as_str(), "present" | "snd")
+                {
+                    cred.check_device(&rdev)?;
+                }
                 Ok(match (op, rdev.as_str()) {
                     (abi::SND_PUBLISH, "snd") => {
                         dev::snd::may_publish(&request)?;
@@ -1747,9 +1746,8 @@ mod tests {
             umask: None,
             pid: Some(42),
             token: Some("tok".into()),
+            instance_id: None,
             release: None,
-            no_usr_fallback: false,
-            chroot: false,
             fs_session: Some("fs-sid".into()),
             fs_secret: None,
             page_target: None,

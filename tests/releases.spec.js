@@ -90,14 +90,35 @@ test('activation is atomic, preserves writable data, and pins processes and desc
   expect(await read(request, '/etc/phase6/generation', ids.a)).toBe('generation A\n');
   const file = (await ok(request, { open: { path: '/etc/phase6/generation', flags: 0 } }, {}, view(ids.a))).fd;
   const directory = (await ok(request, { open: { path: '/etc/phase6', flags: 0o200000 } }, {}, view(ids.a))).fd;
-  const launched = await ok(request, { execve: { path: '/usr/bin/sleep', argv: ['sleep','60'], cwd: '/', env: [] } }, {}, { ...view(ids.a), 'X-Registry':'1' });
-  const proof = { pid: launched.pid, proc: launched.token };
+  const instanceId = `rel-pin-${crypto.randomUUID().slice(0, 8)}`;
+  const hostProof = crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '');
+  const serviceAuth = async (payload, extra = {}) => {
+    const res = await request.post('/api/service-auth', {
+      headers: { Origin: new URL(process.env.OS_TEST_URL || 'http://127.0.0.1:8787').origin, ...extra },
+      data: payload,
+    });
+    expect(res.ok(), await res.text()).toBe(true);
+    return res.json();
+  };
+  await serviceAuth({ attach_instance: { instance: { instance: instanceId, host: 'release-test' }, host_proof: hostProof } }, view(ids.a));
+  const minted = (await serviceAuth({
+    mint_service_cred: {
+      instance_id: instanceId,
+      host_proof: hostProof,
+      scope: { cloud_fs: true, devices: [], containers: false, relay: false },
+      cloud_access: true,
+      umask: 0o022,
+      cgroup: '/user',
+      generation: ids.a,
+      sudo: false,
+    },
+  }, view(ids.a))).cred;
   const marker = '/tmp/release-data-' + crypto.randomUUID();
   expect((await put(request, '/api/file?path=' + marker, { data: 'keep me' })).ok()).toBe(true);
   await activate(request, fd, ids.b);
   expect(await read(request, '/etc/phase6/generation', ids.b)).toBe('generation B\n');
   const procPinned = await request.get('/api/file?path=/etc/phase6/generation', {
-    headers: { ...view(ids.b), 'X-Process-Token': launched.token },
+    headers: { ...view(ids.b), 'X-Process-Token': minted.token, 'X-OS-Instance': instanceId },
   });
   expect(procPinned.status()).toBe(200);
   expect(await procPinned.text()).toBe('generation A\n');
@@ -114,7 +135,7 @@ test('activation is atomic, preserves writable data, and pins processes and desc
   expect((await answer(request, { ioctl: { fd, request: control, arg: { op: 'activate', id: ids.a, expected: 'stale' } } })).err?.errno).toBe('ESTALE');
   await activate(request, fd, ids.a, 'rollback');
   expect(await read(request, marker, ids.a)).toBe('keep me');
-  await sys(request, [{ exit: { ...proof, status: 0 } }, { wait: { pid: String(launched.pid), proc: launched.token } }], {}, { 'X-Registry': '1' });
+  await serviceAuth({ detach_instance: { instance_id: instanceId, host_proof: hostProof } });
   await sys(request, [{ close: { fd: file } }, { close: { fd: directory } }, { close: { fd } }, { unlink: { path: marker } }]);
 });
 

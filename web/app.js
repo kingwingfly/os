@@ -42,9 +42,20 @@ async function api(url, options) {
   return response;
 }
 // Who this session is (getcreds), and whether it may write in the directory `path` (access).
+let syncedAccount = null;
+async function syncAccount(who) {
+  if (!who || typeof who.uid !== 'number') return;
+  if (!syncedAccount || syncedAccount.uid !== who.uid || syncedAccount.signed_in !== who.signed_in || syncedAccount.user !== who.user) {
+    syncedAccount = { uid: who.uid, signed_in: who.signed_in, user: who.user };
+    await kernelCall('sync_account', who).catch(() => {});
+    await kernelCall('login_refresh', { fromServer: false }).catch(() => {});
+  }
+}
 async function session(path = directory) {
+  await bootstrapAccount;
   const [creds, writable] = await sys(['getcreds', { access: { path, mode: 3 } }]);
   const who = resultOf(creds);
+  await syncAccount(who);
   return { authenticated: who.signed_in, writable: who.signed_in, username: who.user, uid: who.uid, group: who.group,
     groups: who.group_names, home: who.home, can_sudo: who.can_sudo, sudo_active: who.sudo_active, can_write: 'ok' in writable };
 }
@@ -176,7 +187,12 @@ function listen() {
 }
 // The line opens once the browser has its session, signed out too (its os_guest cookie,
 // which the first request is given): a driver's news to it is for that session.
-sys(['getcreds']).catch(() => {}).finally(listen);
+// Coalesced through `bootstrapAccount` so concurrent cold `session()` calls never race on
+// cookie-less `/api/sys` and mint two competing `os_guest` cookies.
+const bootstrapAccount = sys(['getcreds'])
+  .then(([r]) => r?.ok && syncAccount(r.ok))
+  .catch(() => {});
+bootstrapAccount.finally(listen);
 // Slides and PDFs presented follow each other (owner's request, 2026-10-28): the place a page
 // presents (viewer.rs calls present) shows in this browser's other windows showing that file,
 // and in the account's pages signed in elsewhere, which the authority tells (store.rs relay).

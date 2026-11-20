@@ -2,6 +2,7 @@
 //! never capabilities. Remote executors remain disabled until registration and consent exist.
 use abi::Placement;
 
+#[allow(dead_code)]
 pub fn browser(ns: &str, uid: u32, seat: Option<&str>, cgroup: &str) -> Placement {
     Placement {
         cluster: format!("account:{uid}"),

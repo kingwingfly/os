@@ -110,13 +110,17 @@ pub async fn handle(req: &mut Request, state: &State) -> worker::Result<Reply> {
         auth::token_key(req).as_deref(),
         auth::guest_key(req).as_deref(),
     );
+    let instance_id = req
+        .headers()
+        .get("X-OS-Instance")?
+        .filter(|s| !s.is_empty());
     // Expiry cleanup has its own committed transaction, including when the ensuing call fails.
     crate::db::transact(state, |db| {
         db.sweep_cloud();
         ((), true)
     })?;
     api::run(state, move |db| {
-        let result = dispatch(db, &request, &ns);
+        let result = dispatch(db, &request, &ns, instance_id.as_deref());
         let conversion = matches!(
             (&request.call, &result),
             (
@@ -298,7 +302,12 @@ fn authorize(credential: &Credential) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn caller(db: &mut Db, session: &wire::Session, token: &str) -> Result<Caller> {
+pub(super) fn caller(
+    db: &mut Db,
+    session: &wire::Session,
+    token: &str,
+    instance_id: Option<&str>,
+) -> Result<Caller> {
     let row = db
         .rows::<SessionRow>(
             "SELECT id, secret, ns, expires FROM vfs_sessions WHERE id = ?",
@@ -313,6 +322,9 @@ pub(super) fn caller(db: &mut Db, session: &wire::Session, token: &str) -> Resul
         return Err(Errno::ENOTCONN);
     }
     let credential = db.credential(token, &row.ns).ok_or(Errno::EACCES)?;
+    credential
+        .check_instance(instance_id)
+        .map_err(|e| e.errno)?;
     authorize(&credential)?;
     // The caller's system generation decides which paths its image owns (read-only), as it
     // does on the path API.
@@ -340,7 +352,7 @@ impl Caller {
         Ok(crate::resources::IoRequest {
             ns: self.credential.ns.clone(),
             token: token.into(),
-            pid: Some(pid.ok_or(Errno::EINVAL)?),
+            pid,
             write,
             bytes,
         })
@@ -402,6 +414,11 @@ impl Caller {
         options: &OpenOptions,
         created: bool,
     ) -> Result<OpenRef> {
+        if let Some(rdev) = node.rdev.as_deref()
+            && matches!(rdev, "archive" | "media" | "present" | "snd")
+        {
+            self.credential.check_device(rdev).map_err(|e| e.errno)?;
+        }
         let access = options.access()?;
         if !created && access != Access::Path {
             let mut mask = access.mask();
@@ -467,7 +484,7 @@ impl Caller {
     }
     pub(super) fn opened(&self, db: &Db, open: &OpenRef) -> Result<Node> {
         let row = self.open_row(db, open)?;
-        if row.revoked != 0 || !db.cloud_granted(open.id, &self.session.ns) {
+        if row.revoked != 0 || !db.cloud_caller_granted(open.id, &self.credential.token) {
             return Err(Errno::EACCES);
         }
         db.inode(row.ino).ok_or(Errno::ESTALE)
@@ -609,7 +626,12 @@ fn make(
     db.set_node(&path, &node(&parent));
     db.persisted_node(&path).ok_or(Errno::EIO)
 }
-fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
+fn dispatch(
+    db: &mut Db,
+    request: &wire::Request,
+    ns: &str,
+    instance_id: Option<&str>,
+) -> Result<Value> {
     if request.version != wire::VERSION {
         return Err(Errno::EPROTONOSUPPORT);
     }
@@ -620,6 +642,9 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         let credential = db
             .credential(&request.credential, ns)
             .ok_or(Errno::EACCES)?;
+        credential
+            .check_instance(instance_id)
+            .map_err(|e| e.errno)?;
         authorize(&credential)?;
         let session = wire::Session {
             id: auth::random_token(),
@@ -636,7 +661,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             ],
         );
         db.set_expiry("vfs_session", &session.id, expires);
-        let c = caller(db, &session, &request.credential)?;
+        let c = caller(db, &session, &request.credential, instance_id)?;
         let root = db.persisted_node("/").ok_or(Errno::EIO)?;
         return Ok(json!(wire::Connected {
             version: wire::VERSION,
@@ -650,6 +675,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         db,
         request.session.as_ref().ok_or(Errno::EACCES)?,
         &request.credential,
+        instance_id,
     )?;
     let who = c.credential.identity();
     use Call::*;
@@ -901,6 +927,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             if !matches!(rdev, "present" | "snd") {
                 return Err(Errno::EOPNOTSUPP);
             }
+            c.credential.check_device(rdev).map_err(|e| e.errno)?;
             let path = join(&dir_path, name);
             if read_only(db, &path) {
                 return Err(Errno::EROFS);

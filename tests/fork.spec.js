@@ -8,7 +8,7 @@ import { test, expect } from './test.js';
 // client kernel (crates/client-kernel) and are told to the machine in batches. An orphan is
 // init's; a zombie orphan, init reaps.
 
-// A port to this tab's dedicated client kernel.
+// A port to this tab's dedicated client kernel (HostAdapter v2).
 async function connect(page) {
   await page.evaluate(() => {
     const port = new Worker('/client-kernel.js');
@@ -23,7 +23,7 @@ async function connect(page) {
     window.__kernel = (type, args = {}) => new Promise(resolve => {
       const id = ++next;
       pending.set(id, resolve);
-      port.postMessage({ v: 1, id, type, args });
+      port.postMessage({ v: 2, id, type, args });
     });
   });
 }
@@ -90,16 +90,15 @@ test('fork is the kernel\'s: its child is told after; an orphan is init\'s, and 
   } finally { await context.close(); }
 });
 
-test('a pipeline\'s stages are one execve, to the browser\'s machine; nothing else of a process goes to the authority', async ({ browser }) => {
-  // A kernel of the tab's own, whose requests the page sees.
+test('a pipeline\'s stages and forks run locally in the instance with zero /api/sys or /api/service-auth RPCs', async ({ browser }) => {
   const context = await browser.newContext();
-  await context.addInitScript(() => { delete globalThis.SharedWorker; });
   try {
     const page = await context.newPage();
     const sent = [];
     page.on('request', request => {
-      if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/sys') {
-        sent.push({ registry: request.headers()['x-registry'] === '1', body: request.postData() ?? '' });
+      const pathname = new URL(request.url()).pathname;
+      if (pathname.startsWith('/api/')) {
+        sent.push({ pathname, method: request.method(), body: request.postData() ?? '' });
       }
     });
     await page.goto('/');
@@ -107,34 +106,26 @@ test('a pipeline\'s stages are one execve, to the browser\'s machine; nothing el
     sent.length = 0;
     await command(page, 'seq 3 | tr 123 abc | coreutils cat');
     await expect(page.locator('.transcript pre').last()).toHaveText('a\nb\nc');
-    // Exits and waits are told a moment after.
-    await expect.poll(() => sent.filter(one => one.body.includes('"wait"')).length).toBeGreaterThan(0);
-    const execs = sent.filter(one => one.body.includes('"execve"'));
-    expect(execs).toHaveLength(1);
-    expect(execs[0].registry).toBe(true);
-    expect(JSON.parse(execs[0].body).calls.filter(one => one.execve)).toHaveLength(3);
-    const lifecycle = /"(execve|exit|wait|fork|proc_init|pids|seats|gone)"/;
-    expect(sent.filter(one => !one.registry && lifecycle.test(one.body))).toEqual([]);
-    // A fork asks once to be lent pids, and not again for the next ones.
+    expect(sent).toEqual([]);
+
+    // Local forks, exits, and waits make zero network calls.
     await connect(page);
     value(await call(page, 'init'));
     const parent = value(await call(page, 'exec', sleep));
     sent.length = 0;
     const forks = [];
     for (let i = 0; i < 3; i++) forks.push(value(await call(page, 'fork', { pid: parent.pid })));
-    expect(sent.filter(one => one.body.includes('"pids":{'))).toHaveLength(1);
-    for (const child of [...forks, parent]) {
+    for (const child of forks) {
       value(await call(page, 'exit', { pid: child.pid, status: 0 }));
-      value(await call(page, 'wait', { pid: child.pid }));
+      value(await call(page, 'waitchild', { ppid: parent.pid, pid: child.pid }));
     }
-    // The machine heard of each fork in a batch.
-    const told = sent.filter(one => one.body.includes('"fork"'));
-    expect(told.length).toBeGreaterThan(0);
-    expect(told.every(one => one.registry)).toBe(true);
+    value(await call(page, 'exit', { pid: parent.pid, status: 0 }));
+    value(await call(page, 'wait', { pid: parent.pid }));
+    expect(sent).toEqual([]);
   } finally { await context.close(); }
 });
 
-test('each browser is a machine of its own, and the machine takes only the registry\'s calls', async ({ browser }) => {
+test('each browser tab is an isolated instance of its own, and /api/sys refuses X-Registry', async ({ browser }) => {
   const [first, second] = [await browser.newContext(), await browser.newContext()];
   try {
     const one = await first.newPage(), two = await second.newPage();
@@ -142,24 +133,25 @@ test('each browser is a machine of its own, and the machine takes only the regis
     await connect(one); await connect(two);
     const a = value(await call(one, 'init')), b = value(await call(two, 'init'));
     expect(a.namespace).not.toBe(b.namespace);
-    const running = value(await call(one, 'exec', sleep));
+    const running = value(await call(one, 'exec', { ...sleep, remote: true }));
     // The other browser's pid 1 is its own init; its table has no process of the first's.
     const theirs = value(await call(two, 'poll', { pids: [] }));
     expect(theirs.map(process => process.argv)).not.toContainEqual(sleep.argv);
     expect(theirs.find(process => process.pid === 1)?.argv).toEqual(['init']);
-    // A token is its browser's: another's process token is no credential there.
+    // A token is its instance's: another browser cannot use it on /api/sys or /api/fs.
     const [foreign] = await two.evaluate(async ([pid, proc]) => {
       const response = await fetch('/api/sys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ calls: [{ getdents: { path: '/' } }], pid, proc }) });
       return (await response.json()).results;
     }, [running.pid, running.token]);
     expect(foreign.err.errno).toBe('EPERM');
-    // The filesystem's calls are not the machine's.
-    const [refused] = await one.evaluate(async () => {
+    // X-Registry is retired and refused with 403 EPERM.
+    const refused = await one.evaluate(async () => {
       const response = await fetch('/api/sys', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Registry': '1' }, body: JSON.stringify({ calls: ['getcreds'] }) });
-      return (await response.json()).results;
+      return { status: response.status, body: await response.json() };
     });
-    expect(refused.err.errno).toBe('ENOSYS');
-    // init is everyone's to see, in /proc too.
+    expect(refused.status).toBe(403);
+    expect(refused.body.errno).toBe('EPERM');
+    // init is everyone's to see, in local /proc too.
     await command(one, 'cat /proc/1/status');
     await expect(one.locator('.transcript pre').last()).toContainText(/Name:\s+init/);
     value(await call(one, 'exit', { pid: running.pid, status: 0 }));
@@ -176,7 +168,7 @@ const binaryen = (await import('binaryen')).default;
 const { readFile } = await import('node:fs/promises');
 const { api, call: sysCall, mkdirp, put, rmrf } = await import('./sys.js');
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const password = process.env.OS_TEST_ADMIN_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const assemble = wat => Buffer.from(binaryen.parseText(wat).emitBinary());
 
 // A module of WASIX's: its imports, a memory of its own, a shadow stack, and `say`, which
@@ -411,8 +403,8 @@ test.describe('fork in the terminal', () => {
     // Nothing of them is left in the machine: every child was waited for.
     await command(page, 'ps');
     await expect(last(page)).not.toContainText('fork-');
-    // Under L2, worker runtime calls bridge to client-kernel via Atomics/JSPI and hit the server via fetch (never raw XHR).
-    expect([...calls]).toEqual(['fetch']);
+    // Under L3a, process lifecycle and local syscalls run inside client-kernel (zero /api/sys process RPCs or raw XHRs).
+    expect([...calls]).toEqual([]);
   });
 
   test('runtime exec diagnostics follow redirected stderr and leave stdout untouched', async ({ page, request }) => {
@@ -441,15 +433,38 @@ test.describe('fork in the terminal', () => {
 
   test('a forked child is of its parent\'s job: Ctrl+C ends both; an orphan is init\'s, and reaped as it ends', async ({ page, request }) => {
     await uploads(request, { 'fork-sleep': FORK_SLEEP, 'fork-orphan': FORK_ORPHAN, 'fork-read': FORK_READ });
+    await page.addInitScript(() => {
+      const NativeWorker = window.Worker;
+      window.Worker = class extends NativeWorker {
+        constructor(url, options) {
+          super(url, options);
+          if (new URL(url, location.href).pathname.endsWith('/client-kernel.js')) {
+            const worker = this;
+            const pending = new Map();
+            let next = 900_000;
+            worker.addEventListener('message', ({ data }) => {
+              if (data?.id != null && pending.has(data.id)) {
+                pending.get(data.id)(data);
+                pending.delete(data.id);
+              }
+            });
+            window.__kernel = (type, args = {}) => new Promise(resolve => {
+              const id = ++next;
+              pending.set(id, resolve);
+              worker.postMessage({ v: 2, id, type, args });
+            });
+          }
+        }
+      };
+    });
     await page.goto('/');
     await command(page, `cd ${base}`);
-    await connect(page);
     const sleeping = async () => value(await call(page, 'poll', { pids: [] })).filter(process => process.argv.join(' ') === 'coreutils sleep 30');
     // The parent waits for its child, which sleeps: Ctrl+C reaches both, as the foreground's
     // process group.
     const input = page.getByRole('combobox', { name: 'Terminal command' });
     await input.fill('./fork-sleep'); await input.press('Enter');
-    await expect.poll(async () => (await sleeping()).length).toBe(1);
+    await expect.poll(async () => (await sleeping()).length, { timeout: 15000 }).toBe(1);
     await input.press('Control+c');
     await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle');
     await expect.poll(async () => (await sleeping()).length).toBe(0);

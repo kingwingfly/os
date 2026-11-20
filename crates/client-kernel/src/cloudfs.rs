@@ -8,7 +8,9 @@
 use crate::{Kernel, State, fail};
 use abi::contract::FsCapabilities;
 use abi::remote_fs as wire;
-use abi::{BATCH_MAX, Batch, Bytes, Call, Creds, Errno, Error, FdRef, Results, Return, Stat, Time};
+use abi::{
+    BATCH_MAX, Batch, Bytes, Call, Errno, Error, FdRef, ProcState, Results, Return, Stat, Time,
+};
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -77,6 +79,7 @@ fn is_local_carrier_path(path: &str) -> bool {
             | "/dev/present"
             | "/dev/snd"
             | "/run"
+            | "/tmp"
             | "/mnt"
             | "/mnt/local"
             | "/mnt/shared"
@@ -86,6 +89,13 @@ fn is_local_carrier_path(path: &str) -> bool {
             | "/sbin"
             | "/lib"
             | "/lib64"
+    )
+}
+
+fn is_mounted_carrier_dir(path: &str) -> bool {
+    matches!(
+        path,
+        "/usr" | "/proc" | "/dev" | "/run" | "/tmp" | "/mnt/local" | "/mnt/shared" | "/opt/private"
     )
 }
 
@@ -199,9 +209,20 @@ impl Host for BrowserHost {
         Box::pin(async move {
             let (global, post) = installed("cloudFsPost")?;
             let fields = js_sys::Object::new();
+            let mut has_instance = false;
             for (name, value) in headers {
+                if name.eq_ignore_ascii_case("X-OS-Instance") {
+                    has_instance = true;
+                }
                 js_sys::Reflect::set(&fields, &name.into(), &value.into())
                     .map_err(|_| Errno::EIO)?;
+            }
+            if !has_instance {
+                let inst_id = self.state.borrow().instance_id.clone();
+                if !inst_id.is_empty() {
+                    js_sys::Reflect::set(&fields, &"X-OS-Instance".into(), &inst_id.into())
+                        .map_err(|_| Errno::EIO)?;
+                }
             }
             let body = js_sys::Uint8Array::from(body.as_slice());
             let answer = post
@@ -240,19 +261,24 @@ impl Host for BrowserHost {
         match &*self.current.borrow() {
             Actor::None => Err(Errno::EACCES),
             Actor::Process(pid) => {
-                let local = state
-                    .processes
-                    .get(pid)
-                    .filter(|local| local.ended.is_none())
+                let proc = state
+                    .table
+                    .proc(*pid)
+                    .filter(|p| p.state != ProcState::Zombie)
                     .ok_or(Errno::EACCES)?;
-                Ok((local.token.clone(), Some(*pid)))
+                let rem = proc.cred.remote.as_ref().ok_or(Errno::EACCES)?;
+                if !proc.cred.cloud_access || !rem.cloud_access {
+                    return Err(Errno::EACCES);
+                }
+                Ok((rem.token.clone(), Some(*pid)))
             }
             Actor::Exiting(pid, token) => {
                 if let Some(token) = token {
                     return Ok((token.clone(), Some(*pid)));
                 }
-                let local = state.processes.get(pid).ok_or(Errno::EACCES)?;
-                Ok((local.token.clone(), Some(*pid)))
+                let proc = state.table.proc(*pid).ok_or(Errno::EACCES)?;
+                let rem = proc.cred.remote.as_ref().ok_or(Errno::EACCES)?;
+                Ok((rem.token.clone(), Some(*pid)))
             }
         }
     }
@@ -700,14 +726,19 @@ impl RootCloudDriver {
             dir_handles.insert(path.to_string(), entry.handle);
         }
 
+        let mut canonical_nodes = HashMap::new();
+        let mut node_paths = HashMap::new();
         for &(path, target) in SEED_SYMLINKS {
             let (parent_path, name) = split_cloud_parent(path).expect("symlink parent");
             let parent = dir_handles
                 .get(&parent_path)
                 .expect("parent seeded")
                 .clone();
-            let _ = now_or_never(mem.symlink(&root_cred, &parent, &name, target))
-                .expect("sync memfs symlink");
+            let entry = now_or_never(mem.symlink(&root_cred, &parent, &name, target))
+                .expect("sync memfs symlink")
+                .expect("seed symlink");
+            canonical_nodes.insert(path.to_string(), entry.handle.node);
+            node_paths.insert(entry.handle.node, path.to_string());
         }
 
         let etc = dir_handles.get("/etc").expect("/etc seeded").clone();
@@ -723,9 +754,11 @@ impl RootCloudDriver {
             }
         }
 
-        let mut node_paths = HashMap::new();
         for (path, handle) in &dir_handles {
-            node_paths.insert(handle.node, path.clone());
+            if is_local_carrier_path(path) {
+                canonical_nodes.insert(path.clone(), handle.node);
+                node_paths.insert(handle.node, path.clone());
+            }
         }
 
         Self {
@@ -740,7 +773,7 @@ impl RootCloudDriver {
             use_seed_cache: Cell::new(false),
             server_seeded: Cell::new(false),
             cloud_denied_pids: RefCell::new(HashSet::new()),
-            canonical_nodes: RefCell::new(HashMap::new()),
+            canonical_nodes: RefCell::new(canonical_nodes),
             node_paths: RefCell::new(node_paths),
             path_entries: RefCell::new(HashMap::new()),
             page_mut_epoch: Cell::new(0),
@@ -961,7 +994,7 @@ impl RootCloudDriver {
             .copied()
             .unwrap_or(NodeId {
                 ino: st.ino.max(1),
-                generation: 1,
+                generation: if path == "/" && st.ino <= 1 { 1 } else { 2 },
             });
         let entry = Entry {
             handle: Handle {
@@ -1074,11 +1107,26 @@ impl RootCloudDriver {
         cache.links.get(path).and_then(|v| v.clone())
     }
 
+    fn wrap_remote_node(&self, raw: NodeId, known_path: Option<&str>) -> NodeId {
+        if let Some(canon) = known_path.and_then(|p| self.canonical_nodes.borrow().get(p).copied())
+        {
+            return canon;
+        }
+        if raw.ino == 1 {
+            NodeId {
+                ino: 1,
+                generation: 1,
+            }
+        } else {
+            NodeId {
+                ino: raw.ino,
+                generation: raw.generation.saturating_add(1).max(2),
+            }
+        }
+    }
+
     fn wrap_cloud_entry(&self, mut real: Entry, known_path: Option<String>) -> Entry {
-        let canon_node = known_path
-            .as_deref()
-            .and_then(|p| self.canonical_nodes.borrow().get(p).copied());
-        let node = canon_node.unwrap_or(real.handle.node);
+        let node = self.wrap_remote_node(real.handle.node, known_path.as_deref());
         self.strip_and_record_writing(node.ino, &mut real.metadata);
         self.cloud_handles
             .borrow_mut()
@@ -1105,74 +1153,6 @@ impl RootCloudDriver {
                 metadata: real.metadata,
             }
         }
-    }
-
-    /// Query `OsAuthority` via `pageSysPost` so root mountpoints (`/usr`, `/proc`, `/dev`,
-    /// `/dev/present`, `/dev/snd`, `/run`, `/mnt/local`, `/mnt/shared`, `/opt/private`, etc.)
-    /// carry the server's exact `NodeId`s before mounting `system_mnt_ns`.
-    pub(crate) async fn seed_from_authority(&self) -> vfs::Result<bool> {
-        if installed("pageSysPost").is_err() {
-            return Ok(false);
-        }
-        let mut paths: Vec<&str> = SEED_DIRS.iter().map(|(p, _)| *p).collect();
-        for &(p, _) in SEED_SYMLINKS {
-            paths.push(p);
-        }
-        let calls: Vec<Call> = paths
-            .iter()
-            .map(|p| Call::Lstat {
-                path: (*p).to_string(),
-            })
-            .collect();
-        let fs_session = self.connector.current_session();
-        let results = page_sys_batch_with_session(
-            Batch {
-                calls,
-                umask: None,
-                sudo: false,
-                pid: None,
-                process: None,
-            },
-            fs_session.as_ref().map(|(s, k)| (s.as_str(), k.as_str())),
-        )
-        .await?;
-
-        self.canonical_nodes.borrow_mut().clear();
-        self.node_paths.borrow_mut().clear();
-        self.path_entries.borrow_mut().clear();
-        let mountpoints = [
-            "/",
-            "/usr",
-            "/proc",
-            "/dev",
-            "/run",
-            "/mnt",
-            "/mnt/local",
-            "/mnt/shared",
-            "/opt",
-            "/opt/private",
-        ];
-        for (path, ret) in paths.into_iter().zip(results) {
-            if let Return::Ok(val) = ret
-                && let Ok(st) = serde_json::from_value::<Stat>(val)
-            {
-                let entry = self.record_path_stat(path, &st);
-                if mountpoints.contains(&path) {
-                    self.canonical_nodes
-                        .borrow_mut()
-                        .insert(path.to_string(), entry.handle.node);
-                }
-            }
-        }
-        self.node_paths
-            .borrow_mut()
-            .entry(NodeId {
-                ino: 1,
-                generation: 1,
-            })
-            .or_insert_with(|| "/".to_string());
-        self.server_seeded.set(true);
-        Ok(true)
     }
 
     pub(crate) fn canonical_cloud_path(&self, node: NodeId) -> Option<String> {
@@ -1212,12 +1192,13 @@ impl RootCloudDriver {
         }
         if let Some(token) = &cred.token {
             let state = self.state.borrow();
-            if let Some((&pid, _)) = state
-                .processes
-                .iter()
-                .find(|(_, local)| local.ended.is_none() && &local.token == token)
-            {
-                return Actor::Process(pid);
+            for pid in state.table.all_pids() {
+                if let Some(proc) = state.table.proc(pid)
+                    && proc.state != ProcState::Zombie
+                    && proc.cred.remote.as_ref().map(|r| r.token.as_str()) == Some(token.as_str())
+                {
+                    return Actor::Process(pid);
+                }
             }
         }
         Actor::None
@@ -1231,19 +1212,45 @@ impl RootCloudDriver {
         }
     }
 
-    async fn connect_cloud(&self, cred: &Cred) -> vfs::Result<(Actor, Rc<Cloud>)> {
-        let token = cred.token.as_deref().ok_or(Errno::EACCES)?;
-        let actor = self.actor_for_cred(cred);
+    async fn connect_cloud(&self, cred: &Cred) -> vfs::Result<(Actor, Rc<Cloud>, Cred)> {
+        let token = if let Some(tok) = cred.token.as_deref().filter(|t| !t.is_empty()) {
+            tok.to_string()
+        } else if let Some(pid) = self.active_pid.get() {
+            let existing = self.state.borrow().table.proc(pid).and_then(|p| {
+                (p.state != ProcState::Zombie && p.cred.cloud_access)
+                    .then(|| {
+                        p.cred
+                            .remote
+                            .as_ref()
+                            .filter(|r| r.cloud_access)
+                            .map(|r| r.token.clone())
+                    })
+                    .flatten()
+            });
+            if let Some(tok) = existing {
+                tok
+            } else {
+                let rem = crate::lazy_mint_remote_cred(&self.state, pid)
+                    .await
+                    .map_err(|e| e.errno)?;
+                rem.token
+            }
+        } else {
+            return Err(Errno::EACCES);
+        };
+        let mut rcred = cred.clone();
+        rcred.token = Some(token.clone());
+        let actor = self.actor_for_cred(&rcred);
         let cloud = self
             .acted(
                 actor.clone(),
-                self.connector.get(&self.state, &self.current, token),
+                self.connector.get(&self.state, &self.current, &token),
             )
             .await?;
         self.cloud_handles
             .borrow_mut()
             .insert(cloud.fs.root().node, cloud.fs.root());
-        Ok((actor, cloud))
+        Ok((actor, cloud, rcred))
     }
 
     async fn ensure_cloud_handle(
@@ -1266,6 +1273,7 @@ impl RootCloudDriver {
         let Some(path) = self.node_paths.borrow().get(&handle.node).cloned() else {
             return Err(Errno::ESTALE);
         };
+        let is_canonical = self.canonical_nodes.borrow().get(&path) == Some(&handle.node);
         let names: Vec<String> = path
             .split('/')
             .filter(|s| !s.is_empty())
@@ -1279,15 +1287,23 @@ impl RootCloudDriver {
         for (seg, entry) in names.iter().zip(walked.entries.iter_mut()) {
             cur_path = format!("{cur_path}/{seg}");
             self.strip_and_record_writing(entry.handle.node.ino, &mut entry.metadata);
+            let mapped_node = self.wrap_remote_node(entry.handle.node, Some(&cur_path));
             self.cloud_handles
                 .borrow_mut()
-                .insert(entry.handle.node, entry.handle.clone());
+                .insert(mapped_node, entry.handle.clone());
             self.node_paths
                 .borrow_mut()
-                .insert(entry.handle.node, cur_path.clone());
+                .insert(mapped_node, cur_path.clone());
         }
         if walked.stop.is_some() {
             return Err(Errno::ESTALE);
+        }
+        if is_canonical {
+            return walked
+                .entries
+                .last()
+                .map(|e| e.handle.clone())
+                .ok_or(Errno::ESTALE);
         }
         walked
             .entries
@@ -1306,11 +1322,14 @@ impl RootCloudDriver {
         if self.is_cloud_denied(cred) {
             return Err(Errno::EACCES);
         }
-        if !self.is_remote_mode() || cred.token.is_none() || installed("cloudFsPost").is_err() {
+        if !self.is_remote_mode()
+            || !self.has_cloud_token(cred)
+            || installed("cloudFsPost").is_err()
+        {
             return Ok(handle.clone());
         }
-        let (actor, cloud) = self.connect_cloud(cred).await?;
-        self.acted(actor, self.ensure_cloud_handle(&cloud, cred, handle))
+        let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
+        self.acted(actor, self.ensure_cloud_handle(&cloud, &rcred, handle))
             .await
     }
 
@@ -1457,20 +1476,32 @@ impl RootCloudDriver {
 
     fn is_cloud_denied(&self, cred: &Cred) -> bool {
         let denied = self.cloud_denied_pids.borrow();
+        if let Some(pid) = self.active_pid.get() {
+            if denied.contains(&pid) {
+                return true;
+            }
+            if let Ok(state) = self.state.try_borrow()
+                && let Some(proc) = state.table.proc(pid)
+                && !proc.cred.cloud_access
+            {
+                return true;
+            }
+            return false;
+        }
         if denied.is_empty() {
             return false;
         }
-        if let Some(pid) = self.active_pid.get() {
-            return denied.contains(&pid);
-        }
         if let Some(token) = &cred.token
             && let Ok(state) = self.state.try_borrow()
-            && let Some((&pid, _)) = state
-                .processes
-                .iter()
-                .find(|(_, local)| local.ended.is_none() && &local.token == token)
         {
-            return denied.contains(&pid);
+            for pid in state.table.all_pids() {
+                if let Some(proc) = state.table.proc(pid)
+                    && proc.state != ProcState::Zombie
+                    && proc.cred.remote.as_ref().map(|r| r.token.as_str()) == Some(token.as_str())
+                {
+                    return denied.contains(&pid) || !proc.cred.cloud_access;
+                }
+            }
         }
         false
     }
@@ -1522,7 +1553,10 @@ impl RootCloudDriver {
     }
 
     fn has_cloud_token(&self, cred: &Cred) -> bool {
-        !self.is_cloud_denied(cred) && cred.token.is_some() && installed("cloudFsPost").is_ok()
+        if self.is_cloud_denied(cred) || installed("cloudFsPost").is_err() {
+            return false;
+        }
+        cred.token.as_deref().is_some_and(|t| !t.is_empty()) || self.active_pid.get().is_some()
     }
 
     pub(crate) fn current_fs_session(&self) -> Option<(String, String)> {
@@ -1831,6 +1865,9 @@ impl Filesystem for RootCloudDriver {
             check_component(name)?;
             if self.is_cloud_denied(cred) {
                 let dir_path = self.path_for_handle(dir).map_err(|_| Errno::EACCES)?;
+                if is_mounted_carrier_dir(&dir_path) {
+                    return Err(Errno::ENOENT);
+                }
                 let child_path = join_cloud_path(&dir_path, name);
                 if let Some(entry) = self.cached_or_mem_carrier_entry(&child_path) {
                     return Ok(entry);
@@ -1844,13 +1881,27 @@ impl Filesystem for RootCloudDriver {
                 }
                 return Err(Errno::EACCES);
             }
+            // Local mountpoint carriers (`/`, `/usr`, `/proc`, `/dev`, `/run`, `/tmp`, `/mnt/*`,
+            // `/opt/private`, `/bin`, `/sbin`, `/lib`, `/lib64`) resolve locally with ZERO RPCs.
+            let known_dir_path = self.node_paths.borrow().get(&dir.node).cloned();
+            if let Some(dir_path) = known_dir_path {
+                if is_mounted_carrier_dir(&dir_path) {
+                    return Err(Errno::ENOENT);
+                }
+                let child_path = join_cloud_path(&dir_path, name);
+                if is_local_carrier_path(&child_path)
+                    && let Some(entry) = self.cached_or_mem_carrier_entry(&child_path)
+                {
+                    return Ok(entry);
+                }
+            }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let dir_path = self.node_paths.borrow().get(&dir.node).cloned();
                 let res = self
                     .acted(actor, async {
-                        let real_dir = self.ensure_cloud_handle(&cloud, cred, dir).await?;
-                        cloud.fs.lookup(cred, &real_dir, name).await
+                        let real_dir = self.ensure_cloud_handle(&cloud, &rcred, dir).await?;
+                        cloud.fs.lookup(&rcred, &real_dir, name).await
                     })
                     .await;
                 if let Err(Errno::ENOTCONN) = res
@@ -1907,13 +1958,16 @@ impl Filesystem for RootCloudDriver {
                     stop: None,
                 });
             }
-            if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+            let starts_local_carrier = self.node_paths.borrow().get(&dir.node).is_some_and(|dp| {
+                is_mounted_carrier_dir(dp) || is_local_carrier_path(&join_cloud_path(dp, &names[0]))
+            });
+            if !starts_local_carrier && self.has_cloud_token(cred) {
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let base_path = self.node_paths.borrow().get(&dir.node).cloned();
                 let res = self
                     .acted(actor, async {
-                        let real_dir = self.ensure_cloud_handle(&cloud, cred, dir).await?;
-                        cloud.fs.walk(cred, &real_dir, names).await
+                        let real_dir = self.ensure_cloud_handle(&cloud, &rcred, dir).await?;
+                        cloud.fs.walk(&rcred, &real_dir, names).await
                     })
                     .await;
                 if let Err(Errno::ENOTCONN) = res
@@ -2003,13 +2057,21 @@ impl Filesystem for RootCloudDriver {
                     .ok_or(Errno::EACCES)?;
                 return Ok(Some((parent_entry, name)));
             }
+            let known_path = self.node_paths.borrow().get(&dir.node).cloned();
+            if let Some(path) = known_path
+                && is_local_carrier_path(&path)
+                && let Some((parent_path, name)) = split_cloud_parent(&path)
+                && let Some(parent_entry) = self.cached_or_mem_carrier_entry(&parent_path)
+            {
+                return Ok(Some((parent_entry, name)));
+            }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let child_path = self.node_paths.borrow().get(&dir.node).cloned();
                 let res = self
                     .acted(actor, async {
-                        let real_dir = self.ensure_cloud_handle(&cloud, cred, dir).await?;
-                        cloud.fs.parent(cred, &real_dir).await
+                        let real_dir = self.ensure_cloud_handle(&cloud, &rcred, dir).await?;
+                        cloud.fs.parent(&rcred, &real_dir).await
                     })
                     .await?;
                 return Ok(res.map(|(entry, name)| {
@@ -2065,12 +2127,20 @@ impl Filesystem for RootCloudDriver {
                     .map(|e| e.metadata)
                     .ok_or(Errno::EACCES);
             }
+            let known_path = self.node_paths.borrow().get(&handle.node).cloned();
+            if let Some(path) = known_path
+                && is_local_carrier_path(&path)
+                && (self.active_pid.get().is_some() || !self.server_seeded.get())
+                && let Some(entry) = self.cached_or_mem_carrier_entry(&path)
+            {
+                return Ok(entry.metadata);
+            }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let mut meta = self
                     .acted(actor, async {
-                        let real = self.ensure_cloud_handle(&cloud, cred, handle).await?;
-                        cloud.fs.metadata(cred, &real).await
+                        let real = self.ensure_cloud_handle(&cloud, &rcred, handle).await?;
+                        cloud.fs.metadata(&rcred, &real).await
                     })
                     .await?;
                 self.strip_and_record_writing(handle.node.ino, &mut meta);
@@ -2113,11 +2183,11 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let mut meta = self
                     .acted(actor, async {
-                        let real = self.ensure_cloud_handle(&cloud, cred, handle).await?;
-                        cloud.fs.setattr(cred, &real, attr).await
+                        let real = self.ensure_cloud_handle(&cloud, &rcred, handle).await?;
+                        cloud.fs.setattr(&rcred, &real, attr).await
                     })
                     .await?;
                 self.strip_and_record_writing(handle.node.ino, &mut meta);
@@ -2232,23 +2302,24 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let dir_path = self.node_paths.borrow().get(&dir.node).cloned();
                 let mut entries = self
                     .acted(actor, async {
-                        let real = self.ensure_cloud_handle(&cloud, cred, dir).await?;
-                        cloud.fs.read_dir(cred, &real).await
+                        let real = self.ensure_cloud_handle(&cloud, &rcred, dir).await?;
+                        cloud.fs.read_dir(&rcred, &real).await
                     })
                     .await?;
                 if let Some(base) = dir_path {
-                    let canon = self.canonical_nodes.borrow();
                     let mut paths = self.node_paths.borrow_mut();
                     for item in &mut entries {
                         let child = join_cloud_path(&base, &item.name);
-                        if let Some(&cnode) = canon.get(&child) {
-                            item.node = cnode;
-                        }
+                        item.node = self.wrap_remote_node(item.node, Some(&child));
                         paths.insert(item.node, child);
+                    }
+                } else {
+                    for item in &mut entries {
+                        item.node = self.wrap_remote_node(item.node, None);
                     }
                 }
                 return Ok(entries);
@@ -2312,12 +2383,20 @@ impl Filesystem for RootCloudDriver {
                     .find_map(|&(p, target)| (p == path).then(|| target.to_string()))
                     .ok_or(Errno::EACCES);
             }
+            let known_link_path = self.node_paths.borrow().get(&link.node).cloned();
+            if let Some(path) = known_link_path
+                && let Some(target) = SEED_SYMLINKS
+                    .iter()
+                    .find_map(|&(p, target)| (p == path).then(|| target.to_string()))
+            {
+                return Ok(target);
+            }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 return self
                     .acted(actor, async {
-                        let real = self.ensure_cloud_handle(&cloud, cred, link).await?;
-                        cloud.fs.read_link(cred, &real).await
+                        let real = self.ensure_cloud_handle(&cloud, &rcred, link).await?;
+                        cloud.fs.read_link(&rcred, &real).await
                     })
                     .await;
             }
@@ -2357,12 +2436,15 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let dir_path = self.node_paths.borrow().get(&dir.node).cloned();
                 let (entry, real_open) = self
                     .acted(actor, async {
-                        let real_dir = self.ensure_cloud_handle(&cloud, cred, dir).await?;
-                        cloud.fs.create(cred, &real_dir, name, mode, options).await
+                        let real_dir = self.ensure_cloud_handle(&cloud, &rcred, dir).await?;
+                        cloud
+                            .fs
+                            .create(&rcred, &real_dir, name, mode, options)
+                            .await
                     })
                     .await?;
                 cloud.live_opens.set(cloud.live_opens.get() + 1);
@@ -2443,12 +2525,12 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let dir_path = self.node_paths.borrow().get(&dir.node).cloned();
                 let entry = self
                     .acted(actor, async {
-                        let real = self.ensure_cloud_handle(&cloud, cred, dir).await?;
-                        cloud.fs.mkdir(cred, &real, name, mode).await
+                        let real = self.ensure_cloud_handle(&cloud, &rcred, dir).await?;
+                        cloud.fs.mkdir(&rcred, &real, name, mode).await
                     })
                     .await?;
                 return Ok(
@@ -2499,12 +2581,12 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let dir_path = self.node_paths.borrow().get(&dir.node).cloned();
                 let entry = self
                     .acted(actor, async {
-                        let real = self.ensure_cloud_handle(&cloud, cred, dir).await?;
-                        cloud.fs.mknod(cred, &real, name, mode, rdev).await
+                        let real = self.ensure_cloud_handle(&cloud, &rcred, dir).await?;
+                        cloud.fs.mknod(&rcred, &real, name, mode, rdev).await
                     })
                     .await?;
                 return Ok(
@@ -2612,12 +2694,12 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let dir_path = self.node_paths.borrow().get(&dir.node).cloned();
                 let entry = self
                     .acted(actor, async {
-                        let real = self.ensure_cloud_handle(&cloud, cred, dir).await?;
-                        cloud.fs.symlink(cred, &real, name, target).await
+                        let real = self.ensure_cloud_handle(&cloud, &rcred, dir).await?;
+                        cloud.fs.symlink(&rcred, &real, name, target).await
                     })
                     .await?;
                 return Ok(
@@ -2667,13 +2749,13 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let dir_path = self.node_paths.borrow().get(&dir.node).cloned();
                 let entry = self
                     .acted(actor, async {
-                        let real_target = self.ensure_cloud_handle(&cloud, cred, target).await?;
-                        let real_dir = self.ensure_cloud_handle(&cloud, cred, dir).await?;
-                        cloud.fs.link(cred, &real_target, &real_dir, name).await
+                        let real_target = self.ensure_cloud_handle(&cloud, &rcred, target).await?;
+                        let real_dir = self.ensure_cloud_handle(&cloud, &rcred, dir).await?;
+                        cloud.fs.link(&rcred, &real_target, &real_dir, name).await
                     })
                     .await?;
                 return Ok(
@@ -2719,11 +2801,11 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let dir_path = self.node_paths.borrow().get(&dir.node).cloned();
                 self.acted(actor, async {
-                    let real = self.ensure_cloud_handle(&cloud, cred, dir).await?;
-                    cloud.fs.unlink(cred, &real, name).await
+                    let real = self.ensure_cloud_handle(&cloud, &rcred, dir).await?;
+                    cloud.fs.unlink(&rcred, &real, name).await
                 })
                 .await?;
                 if let Some(base) = dir_path {
@@ -2786,11 +2868,11 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let dir_path = self.node_paths.borrow().get(&dir.node).cloned();
                 self.acted(actor, async {
-                    let real = self.ensure_cloud_handle(&cloud, cred, dir).await?;
-                    cloud.fs.rmdir(cred, &real, name).await
+                    let real = self.ensure_cloud_handle(&cloud, &rcred, dir).await?;
+                    cloud.fs.rmdir(&rcred, &real, name).await
                 })
                 .await?;
                 if let Some(base) = dir_path {
@@ -2837,13 +2919,13 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let from_base = self.node_paths.borrow().get(&from_dir.node).cloned();
                 let to_base = self.node_paths.borrow().get(&to_dir.node).cloned();
                 self.acted(actor, async {
-                    let rf = self.ensure_cloud_handle(&cloud, cred, from_dir).await?;
-                    let rt = self.ensure_cloud_handle(&cloud, cred, to_dir).await?;
-                    cloud.fs.rename(cred, &rf, from, &rt, to, flags).await
+                    let rf = self.ensure_cloud_handle(&cloud, &rcred, from_dir).await?;
+                    let rt = self.ensure_cloud_handle(&cloud, &rcred, to_dir).await?;
+                    cloud.fs.rename(&rcred, &rf, from, &rt, to, flags).await
                 })
                 .await?;
                 if let (Some(fb), Some(tb)) = (from_base, to_base) {
@@ -2887,11 +2969,11 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 return self
                     .acted(actor, async {
-                        let real = self.ensure_cloud_handle(&cloud, cred, handle).await?;
-                        cloud.fs.getxattr(cred, &real, name).await
+                        let real = self.ensure_cloud_handle(&cloud, &rcred, handle).await?;
+                        cloud.fs.getxattr(&rcred, &real, name).await
                     })
                     .await;
             }
@@ -2930,11 +3012,11 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 return self
                     .acted(actor, async {
-                        let real = self.ensure_cloud_handle(&cloud, cred, handle).await?;
-                        cloud.fs.setxattr(cred, &real, name, value, flags).await
+                        let real = self.ensure_cloud_handle(&cloud, &rcred, handle).await?;
+                        cloud.fs.setxattr(&rcred, &real, name, value, flags).await
                     })
                     .await;
             }
@@ -2965,11 +3047,11 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 return self
                     .acted(actor, async {
-                        let real = self.ensure_cloud_handle(&cloud, cred, handle).await?;
-                        cloud.fs.listxattr(cred, &real).await
+                        let real = self.ensure_cloud_handle(&cloud, &rcred, handle).await?;
+                        cloud.fs.listxattr(&rcred, &real).await
                     })
                     .await;
             }
@@ -3004,11 +3086,11 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 return self
                     .acted(actor, async {
-                        let real = self.ensure_cloud_handle(&cloud, cred, handle).await?;
-                        cloud.fs.removexattr(cred, &real, name).await
+                        let real = self.ensure_cloud_handle(&cloud, &rcred, handle).await?;
+                        cloud.fs.removexattr(&rcred, &real, name).await
                     })
                     .await;
             }
@@ -3037,8 +3119,8 @@ impl Filesystem for RootCloudDriver {
                 return Err(Errno::EACCES);
             }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
-                return self.acted(actor, cloud.fs.statfs(cred)).await;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
+                return self.acted(actor, cloud.fs.statfs(&rcred)).await;
             }
             let sudo = self.page_sudo.get();
             let val = self
@@ -3088,12 +3170,25 @@ impl Filesystem for RootCloudDriver {
                     OpenRecord::PathOnly { node: handle.node },
                 ));
             }
+            if access == Access::Path
+                && self
+                    .node_paths
+                    .borrow()
+                    .get(&handle.node)
+                    .is_some_and(|p| is_local_carrier_path(p))
+            {
+                return Ok(self.alloc_open(
+                    handle.node,
+                    Access::Path,
+                    OpenRecord::PathOnly { node: handle.node },
+                ));
+            }
             if self.has_cloud_token(cred) {
-                let (actor, cloud) = self.connect_cloud(cred).await?;
+                let (actor, cloud, rcred) = self.connect_cloud(cred).await?;
                 let real_open = self
                     .acted(actor, async {
-                        let real = self.ensure_cloud_handle(&cloud, cred, handle).await?;
-                        cloud.fs.open(cred, &real, options).await
+                        let real = self.ensure_cloud_handle(&cloud, &rcred, handle).await?;
+                        cloud.fs.open(&rcred, &real, options).await
                     })
                     .await?;
                 cloud.live_opens.set(cloud.live_opens.get() + 1);
@@ -3767,71 +3862,6 @@ async fn write_whole_cloud_page(
 }
 
 impl Kernel {
-    /// Fetch and cache the acting process's authenticated identity from `/api/sys` on the
-    /// authority (never `X-Registry`).
-    pub(crate) async fn cloud_identity(&self, pid: u32, token: &str) -> JsResult<Identity> {
-        if let Some(identity) = self.state.borrow().identities.get(token).cloned() {
-            return Ok(identity);
-        }
-        let batch = Batch {
-            calls: vec![Call::Getcreds],
-            umask: None,
-            sudo: false,
-            pid: Some(pid),
-            process: Some(token.to_string()),
-        };
-        let results = if installed("cloudFsPost").is_err() {
-            crate::sys(batch).await.map_err(fail)?
-        } else {
-            let body = serde_json::to_vec(&batch)
-                .map_err(|e| fail(Error::because(Errno::EIO, e.to_string())))?;
-            let host = BrowserHost {
-                state: self.state.clone(),
-                current: self.current.clone(),
-            };
-            let reply = host
-                .post(
-                    "/api/sys",
-                    vec![
-                        ("Content-Type", "application/json".to_string()),
-                        ("X-Process-Token", token.to_string()),
-                    ],
-                    body,
-                )
-                .await
-                .map_err(errno)?;
-            if reply.status != 200 {
-                let detail = String::from_utf8_lossy(&reply.body).into_owned();
-                return Err(fail(Error::because(Errno::EIO, detail)));
-            }
-            let results: Results = serde_json::from_slice(&reply.body)
-                .map_err(|error| fail(Error::because(Errno::EIO, error.to_string())))?;
-            results.results
-        };
-        let value = results
-            .into_iter()
-            .next()
-            .ok_or_else(|| fail(Errno::EIO.into()))?
-            .into_result()
-            .map_err(fail)?;
-        let creds: Creds = crate::from_value(value, "creds")?;
-        let identity = Identity {
-            id: creds.uid,
-            group: creds.gid,
-            groups: creds.groups.into_iter().collect(),
-        };
-        let mut state = self.state.borrow_mut();
-        if state
-            .processes
-            .get(&pid)
-            .is_some_and(|local| local.ended.is_none() && local.token == token)
-        {
-            state.identities.insert(token.to_string(), identity.clone());
-            state.retain_spare();
-        }
-        Ok(identity)
-    }
-
     /// Close `pid`'s VFS descriptors and drain deferred `CloudFs` releases upon process exit.
     pub(crate) async fn cloud_exited(&self, pid: u32, token: Option<String>) {
         self.vfs_process_exit_cleanup(pid, token.clone()).await;
@@ -3851,23 +3881,17 @@ impl Kernel {
 
 #[wasm_bindgen]
 impl Kernel {
-    /// Renew the `CloudFs` session's lease with a live process's credential (called periodically
-    /// by `web/kernel/client.js`), draining deferred cleanup first.
+    /// Renew the `ServiceAuth v2` instance lease and `CloudFs` session lease (called periodically
+    /// by `web/kernel/client.js`). Completely silent (ZERO network calls) when `!remote_attached`
+    /// and no `CloudFs` session is open.
     pub async fn cloud_renew(&self) -> JsResult<()> {
+        if self.state.borrow().remote_attached {
+            let _ = self.renew_instance().await;
+        }
         let Some(cloud) = self.cloud.current() else {
             return Ok(());
         };
-        let tokens: Vec<String> = {
-            let state = self.state.borrow();
-            let mut tokens: Vec<String> = state
-                .processes
-                .values()
-                .filter(|local| local.ended.is_none())
-                .map(|local| local.token.clone())
-                .collect();
-            tokens.dedup();
-            tokens
-        };
+        let tokens: Vec<String> = self.state.borrow().table.active_remote_tokens();
         Acted {
             current: self.current.clone(),
             actor: Actor::None,

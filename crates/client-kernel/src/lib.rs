@@ -1,20 +1,18 @@
-//! The client kernel (owner's plan, 2026-11-01): the browser's half of the kernel, in Rust→wasm
-//! inside a SharedWorker (or one tab's dedicated Worker). It keeps the processes its tabs host,
-//! and the tokens they make their calls with; every decision on files remains the worker
-//! kernel's, and the process record is the browser's machine's (a Durable Object of its own,
-//! reached by a batch marked `X-Registry`).
+//! The client kernel (`#54` L3a, `docs/architecture/contract.md` §2.1, §2.3, §2.4, §2.7, §2.10):
+//! the browser's instance-local kernel in Rust→wasm inside a dedicated Worker.
 //!
-//! Exec and fork await registry admission before guest execution. Fork may use a pid lent
-//! ahead of time, but that number grants no cgroup capacity. Exit and wait reports are batched
-//! with the next request (`flush`). A wait answers here; its
-//! host replies once the machine heard (`queued`, `reported`), so that /proc no longer names
-//! what was reaped.
+//! Each OS instance owns its own:
+//! - PID namespace, process table, process groups, sessions, signals, waitpid/reaping, subreapers,
+//!   and local cgroup v2 policies (`kernel::proc_table::LocalProcessTable`, zero network RPCs)
+//! - Local `/proc` rendering (`os_vfs::ProcFs` wired via `ProcBridge` hooks, zero network RPCs)
+//! - Local `/run`, `/tmp` (`01777`), `/dev` (local-only devices at boot; remote devices require
+//!   explicit credentialed attachment)
+//! - Local `Init` reaper and `Login` session scope coordinators
 //!
-//! It holds no policy. The page and the process hosts are untrusted user space; the tokens this
-//! kernel keeps are capabilities handed to the hosts that run the processes, and each process is
-//! its host's (the tab, or port, that executed it): only that host forks it, replaces its image,
-//! ends it, waits for its children, or signals as it. A signal a process sends is the machine's
-//! to allow as that process, by its token; one the page sends, as the page's account.
+//! Remote cloud services (`CloudFs`, remote `/dev/{archive,media,present,snd}`, containers, relay)
+//! attach lazily on first remote use through `ServiceAuth v2` (`POST /api/service-auth`), fencing
+//! `(instance_id, host_proof)` and immediately revoking remote credentials on exit, `SIGKILL`,
+//! privilege drop, or login-scope end.
 mod cloudfs;
 mod cowfs_bridge;
 mod helper;
@@ -24,73 +22,620 @@ mod release_v2;
 mod share_bridge;
 mod vfs_engine;
 
-use abi::{Batch, Call, Errno, Error, Exec, PROC_POLL_MAX, Return, SIGTERM};
+use abi::auth_v2::{
+    self, AttachInstance, DeriveServiceCred, DetachInstance, MintServiceCred, RemoteIoQuota,
+    RemoteScope, RenewInstance, RevokeTokens,
+};
+use abi::contract::{Boundary, Hello, InstanceIdentity};
+use abi::{
+    Call, Errno, Error, Exec, InitAction, InitOwner, LocalExecutable, LoginAction, PROC_POLL_MAX,
+    Placement, ProcState, SIGCONT, SIGHUP, SIGKILL, SIGTERM, SharingMode, Target,
+};
+use kernel::init::Init;
+use kernel::local_cgroups::normalize_cgroup_path;
+use kernel::login::Session as LoginSession;
+use kernel::proc_table::{
+    LocalCred, LocalProcessTable, ReexecSpec, RemoteCredRef, SpawnSpec, WaitOutcome,
+};
+use kernel::registry::in_subtree;
+use kernel::startup::{Profile as StartupProfile, Startup};
+use os_core::permissions::Identity;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
-/// The transport the worker's script installs (`self.kernelSys(body)`): POST /api/sys, marked
-/// for the browser's machine, answering `{status, text}` as JSON. Fetch and cookies are the
-/// browser's; the Rust kernel holds the calls and the tokens.
-async fn kernel_sys(body: &str) -> Result<JsValue, JsValue> {
-    let global = js_sys::global();
-    let function = js_sys::Reflect::get(&global, &JsValue::from_str("kernelSys"))?
-        .dyn_into::<js_sys::Function>()
-        .map_err(|_| JsValue::from_str("the client kernel's transport is not installed"))?;
-    let answer = function.call1(&global, &JsValue::from_str(body))?;
+/// The client kernel's `HostAdapter` protocol version (`abi::contract::HOST_ADAPTER_VERSION`).
+pub const VERSION: &str = "2";
+/// Linux's init PID.
+pub(crate) const INIT: u32 = 1;
+
+/// Monotonic wall clock in whole seconds (works on both `wasm32` and native host tests).
+pub(crate) fn now_secs() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ms = js_sys::Date::now();
+        if ms.is_finite() && ms > 0.0 {
+            (ms / 1000.0).floor() as u64
+        } else {
+            0
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(1_700_000_000)
+    }
+}
+
+/// Generate a 32-byte (64-hex-char) high-entropy local secret (e.g. `host_proof` or random id).
+pub(crate) fn random_hex(bytes_len: usize) -> String {
+    let mut buf = vec![0u8; bytes_len];
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut filled = false;
+        let global = js_sys::global();
+        if let Ok(crypto) = js_sys::Reflect::get(&global, &"crypto".into())
+            && let Ok(func) = js_sys::Reflect::get(&crypto, &"getRandomValues".into())
+                .and_then(|v| v.dyn_into::<js_sys::Function>())
+        {
+            let arr = js_sys::Uint8Array::new_with_length(bytes_len as u32);
+            if func.call1(&crypto, &arr).is_ok() {
+                arr.copy_to(&mut buf);
+                filled = true;
+            }
+        }
+        if !filled {
+            for b in &mut buf {
+                *b = (js_sys::Math::random() * 256.0) as u8;
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut seed = now_secs()
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        for chunk in buf.chunks_mut(8) {
+            seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            let raw = z.to_le_bytes();
+            chunk.copy_from_slice(&raw[..chunk.len()]);
+        }
+    }
+    let mut out = String::with_capacity(bytes_len * 2);
+    for b in buf {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+fn sha256_hex(input: &str) -> String {
+    image::digest(input.as_bytes())
+}
+
+/// Notify the page of a `ServiceAuth` / `HostAdapter` protocol version mismatch without
+/// auto-reloading (`docs/architecture/contract.md` §2.10).
+pub(crate) fn emit_protocol_mismatch(boundary: &str, detail: &str) {
+    if let Ok((global, cb)) = cloudfs::installed("onProtocolMismatch") {
+        let payload = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&payload, &"boundary".into(), &JsValue::from_str(boundary));
+        let _ = js_sys::Reflect::set(
+            &payload,
+            &"errno".into(),
+            &JsValue::from_str("EPROTONOSUPPORT"),
+        );
+        let _ = js_sys::Reflect::set(&payload, &"detail".into(), &JsValue::from_str(detail));
+        let _ = cb.call1(&global, &payload);
+    }
+}
+
+/// Transport for `POST /api/service-auth` installed as `self.serviceAuthPost(bodyJson)`.
+pub(crate) async fn service_auth_request(
+    req: &auth_v2::Request,
+) -> std::result::Result<auth_v2::Response, Error> {
+    let Ok((global, post)) = cloudfs::installed("serviceAuthPost") else {
+        return Err(Error::because(
+            Errno::ENOTCONN,
+            "service auth transport is not installed",
+        ));
+    };
+    let body = serde_json::to_string(req)
+        .map_err(|error| Error::because(Errno::EIO, error.to_string()))?;
+    let answer = post
+        .call1(&global, &JsValue::from_str(&body))
+        .map_err(|_| Error::because(Errno::EIO, "serviceAuthPost invocation failed"))?;
     let promise = answer
         .dyn_into::<js_sys::Promise>()
-        .map_err(|_| JsValue::from_str("the client kernel's transport did not answer a promise"))?;
-    JsFuture::from(promise).await
+        .map_err(|_| Error::because(Errno::EIO, "serviceAuthPost did not return a Promise"))?;
+    let raw = JsFuture::from(promise)
+        .await
+        .map_err(|_| Error::because(Errno::ENOTCONN, "service auth request failed"))?;
+    let raw_text = raw
+        .as_string()
+        .ok_or_else(|| Error::because(Errno::EIO, "serviceAuthPost reply is not text"))?;
+    let reply: Value = serde_json::from_str(&raw_text)
+        .map_err(|error| Error::because(Errno::EIO, error.to_string()))?;
+    let status = reply["status"].as_u64().unwrap_or(0);
+    let text = reply["text"].as_str().unwrap_or("");
+    if status != 200 {
+        let parsed_err = serde_json::from_str::<Value>(text).ok();
+        let detail = parsed_err
+            .as_ref()
+            .and_then(|v| v["detail"].as_str().or_else(|| v["error"].as_str()))
+            .unwrap_or(if text.is_empty() {
+                "service auth failed"
+            } else {
+                text
+            })
+            .to_string();
+        let errno = parsed_err
+            .as_ref()
+            .and_then(|v| v["errno"].as_str())
+            .and_then(|code| serde_json::from_value::<Errno>(Value::String(code.into())).ok())
+            .unwrap_or(match status {
+                400 => Errno::EINVAL,
+                401 | 403 => Errno::EACCES,
+                409 => Errno::ESTALE,
+                426 | 505 => Errno::EPROTONOSUPPORT,
+                429 => Errno::EAGAIN,
+                _ => Errno::EIO,
+            });
+        if errno == Errno::EPROTONOSUPPORT {
+            emit_protocol_mismatch("service-auth", &detail);
+        }
+        return Err(Error::because(errno, detail));
+    }
+    serde_json::from_str::<auth_v2::Response>(text)
+        .map_err(|error| Error::because(Errno::EIO, error.to_string()))
 }
 
-/// The kernel's own protocol version, which the page checks at start.
-pub const VERSION: &str = "1";
-/// How many pids the kernel asks to be lent at a time, for its forks.
-const LEND: u32 = 8;
-/// Linux's init.
-const INIT: u32 = 1;
-
-/// How a process ended: its exit status, or the signal that ended it.
-type Ended = (i32, Option<u8>);
-
-/// A process this kernel hosts: its parent, the token its calls carry (a fork's is its
-/// parent's), the host that runs it, and, once it ended, its wait status until its parent
-/// waits.
-struct Local {
-    ppid: u32,
-    token: String,
-    host: String,
-    ended: Option<Ended>,
+/// Ensure this instance is attached to `ServiceAuth v2` (lazy on first remote use).
+pub(crate) async fn ensure_remote_attached_state(
+    state: &Rc<RefCell<State>>,
+) -> std::result::Result<(String, String), Error> {
+    let (already, instance_id, host_proof) = {
+        let s = state.borrow();
+        (
+            s.remote_attached,
+            s.instance_id.clone(),
+            s.host_proof.clone(),
+        )
+    };
+    if already {
+        return Ok((instance_id, host_proof));
+    }
+    let req = auth_v2::Request::AttachInstance(AttachInstance {
+        instance: InstanceIdentity {
+            instance: instance_id.clone(),
+            host: "browser".into(),
+        },
+        host_proof: host_proof.clone(),
+    });
+    match service_auth_request(&req).await? {
+        auth_v2::Response::Attached(res) => {
+            let mut s = state.borrow_mut();
+            s.remote_attached = true;
+            s.host_epoch = res.host_epoch;
+            Ok((instance_id, host_proof))
+        }
+        _ => Err(Error::because(Errno::EIO, "unexpected attach reply")),
+    }
 }
 
-struct State {
-    namespace: String,
-    boot: String,
-    /// This kernel's own id, which it holds a Web Lock of while it runs: the pids it is lent
-    /// are its, and go back once it is gone.
-    id: String,
-    processes: HashMap<u32, Local>,
-    /// Pids lent for each process lineage. Never reuse another account's reservation after
-    /// login/logout; the server binds each pool to the process token that requested it.
-    spare: HashMap<String, Vec<u32>>,
-    /// Cached authenticated process identities keyed by process token.
-    identities: HashMap<String, vfs::Identity>,
-    /// What happened here that the machine is still to hear: forks, exits, waits, in order.
-    reports: Vec<Call>,
-    /// How many reports were made, and how many the machine heard, since the kernel started.
-    queued: u64,
-    reported: u64,
+/// Decide whether a lazily minted `ServiceAuth v2` credential with `issued_uid` may bind to a
+/// local process running as `proc_uid`.
+///
+/// A local uninitialized guest (`uid == GUEST`, `65534`) may only bind to a per-session guest uid
+/// (`is_guest_id(issued_uid)`) while `!signed_in && !account_changed` — NEVER to `root` (`0`) or
+/// any named account. All other processes require an exact `issued_uid == proc_uid` match.
+pub(crate) fn lazy_mint_uid_permitted(
+    proc_uid: u32,
+    issued_uid: u32,
+    signed_in: bool,
+    account_changed: bool,
+) -> bool {
+    if issued_uid == proc_uid {
+        return true;
+    }
+    proc_uid == os_core::permissions::GUEST
+        && os_core::permissions::is_guest_id(issued_uid)
+        && !signed_in
+        && !account_changed
+}
+
+/// Lazily mint and bind a `ServiceAuth v2` remote credential for an already-running local process
+/// `pid` on its first cloud/remote access. Refuses with `EACCES` (0 network calls) if `pid` was
+/// started with `cloud_access == false` or dropped local privilege via `set_cred`.
+pub(crate) async fn lazy_mint_remote_cred(
+    state: &Rc<RefCell<State>>,
+    pid: u32,
+) -> std::result::Result<RemoteCredRef, Error> {
+    let (existing, cloud_allowed, cgroup, proc_uid, proc_epoch, signed_in, cur_epoch) = {
+        let s = state.borrow();
+        let proc = s
+            .table
+            .proc(pid)
+            .filter(|p| p.state != ProcState::Zombie)
+            .ok_or_else(|| Error::from(Errno::ESRCH))?;
+        (
+            proc.cred.remote.clone(),
+            proc.cred.cloud_access,
+            proc.cgroup.clone(),
+            proc.cred.identity.id,
+            s.proc_account_epoch.get(&pid).copied().unwrap_or(0),
+            s.account.signed_in,
+            s.account_epoch,
+        )
+    };
+    if let Some(rem) = existing {
+        if !rem.cloud_access {
+            return Err(Errno::EACCES.into());
+        }
+        return Ok(rem);
+    }
+    if !cloud_allowed {
+        return Err(Errno::EACCES.into());
+    }
+    let (instance_id, host_proof) = ensure_remote_attached_state(state).await?;
+    let resp = service_auth_request(&auth_v2::Request::MintServiceCred(MintServiceCred {
+        instance_id: instance_id.clone(),
+        host_proof: host_proof.clone(),
+        scope: RemoteScope::full(),
+        cloud_access: true,
+        umask: 0o022,
+        cgroup: Some(cgroup.clone()),
+        generation: None,
+        sudo: false,
+    }))
+    .await?;
+    let issued = match resp {
+        auth_v2::Response::Cred(c) => c,
+        _ => return Err(Error::because(Errno::EIO, "unexpected service cred reply")),
+    };
+    // Prevent a guest or stale process from hijacking a signed-in/root account cookie!
+    let account_changed = proc_epoch != cur_epoch;
+    if !lazy_mint_uid_permitted(proc_uid, issued.uid, signed_in, account_changed) {
+        let _ = service_auth_request(&auth_v2::Request::RevokeTokens(RevokeTokens {
+            instance_id,
+            host_proof,
+            tokens: vec![issued.token],
+        }))
+        .await;
+        return Err(Error::because(
+            Errno::EACCES,
+            "process identity does not match current remote account",
+        ));
+    }
+    let rem = RemoteCredRef {
+        token: issued.token.clone(),
+        uid: issued.uid,
+        gid: issued.gid,
+        groups: issued.groups.clone(),
+        instance_id: issued.instance_id.clone(),
+        lineage: issued.lineage.clone(),
+        cloud_access: issued.cloud_access,
+        scope: issued.scope.clone(),
+    };
+    // Re-check process state after awaiting `MintServiceCred` so a concurrent privilege drop,
+    // `cloud_access=false` attenuation, or process exit mid-await can never be overwritten.
+    let rebind_result = {
+        let mut s = state.borrow_mut();
+        let current_proc = s
+            .table
+            .proc(pid)
+            .filter(|p| p.state != ProcState::Zombie)
+            .map(|p| {
+                (
+                    p.owner_host.clone(),
+                    p.cred.cloud_access,
+                    p.cred.identity.id,
+                    p.cgroup.clone(),
+                )
+            });
+        match current_proc {
+            None => Err(Errno::ESRCH),
+            Some((_, cloud_now, uid_now, _)) if !cloud_now || uid_now != proc_uid => {
+                Err(Errno::EACCES)
+            }
+            Some((host, _, _, cur_cg)) => {
+                let identity = Identity {
+                    id: rem.uid,
+                    group: rem.gid,
+                    groups: rem.groups.iter().copied().collect(),
+                };
+                match s.table.set_cred(&host, pid, identity, Some(rem.clone())) {
+                    Ok(_) => Ok((
+                        cur_cg.clone(),
+                        s.table.cgroups().effective_io_limit(&cur_cg),
+                    )),
+                    Err(e) => Err(e.errno),
+                }
+            }
+        }
+    };
+    let (active_cgroup, io_limit) = match rebind_result {
+        Ok(pair) => pair,
+        Err(errno) => {
+            let _ = service_auth_request(&auth_v2::Request::RevokeTokens(RevokeTokens {
+                instance_id,
+                host_proof,
+                tokens: vec![rem.token],
+            }))
+            .await;
+            return Err(errno.into());
+        }
+    };
+    if io_limit.read.is_some() || io_limit.write.is_some() {
+        let _ = service_auth_request(&auth_v2::Request::SetRemoteIoQuota(RemoteIoQuota {
+            instance_id,
+            host_proof,
+            token: rem.token.clone(),
+            cgroup: active_cgroup,
+            rbps: io_limit.read,
+            wbps: io_limit.write,
+        }))
+        .await;
+    }
+    Ok(rem)
+}
+
+/// Revoke one or more remote service tokens over `ServiceAuth v2`, queueing any transient failures
+/// into `state.pending_revocations` for durable retry.
+pub(crate) async fn revoke_remote_tokens_state(state: &Rc<RefCell<State>>, tokens: Vec<String>) {
+    if tokens.is_empty() {
+        return;
+    }
+    let (attached, instance_id, host_proof) = {
+        let s = state.borrow();
+        (
+            s.remote_attached,
+            s.instance_id.clone(),
+            s.host_proof.clone(),
+        )
+    };
+    if !attached || cloudfs::installed("serviceAuthPost").is_err() {
+        return;
+    }
+    let req = auth_v2::Request::RevokeTokens(RevokeTokens {
+        instance_id,
+        host_proof,
+        tokens: tokens.clone(),
+    });
+    if service_auth_request(&req).await.is_err() {
+        let mut s = state.borrow_mut();
+        for tok in tokens {
+            if !s.pending_revocations.contains(&tok) {
+                s.pending_revocations.push(tok);
+            }
+        }
+    }
+}
+
+/// Local account identity for this browser instance (starts as local guest with zero RPCs;
+/// updated on explicit login/logout or cloud sync).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct LocalAccount {
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: Vec<u32>,
+    pub user: String,
+    pub group: String,
+    pub home: String,
+    pub shell: String,
+    pub signed_in: bool,
+}
+
+impl Default for LocalAccount {
+    fn default() -> Self {
+        Self {
+            uid: 65534,
+            gid: 65534,
+            groups: vec![65534],
+            user: "guest".into(),
+            group: "guest".into(),
+            home: "/tmp".into(),
+            shell: "/usr/bin/dash".into(),
+            signed_in: false,
+        }
+    }
+}
+
+impl LocalAccount {
+    pub(crate) fn identity(&self) -> Identity {
+        let mut groups: BTreeSet<u32> = self.groups.iter().copied().collect();
+        groups.insert(self.gid);
+        Identity {
+            id: self.uid,
+            group: self.gid,
+            groups,
+        }
+    }
+
+    pub(crate) fn to_creds_json(&self) -> Value {
+        json!({
+            "uid": self.uid,
+            "gid": self.gid,
+            "groups": self.groups,
+            "user": self.user,
+            "group": self.group,
+            "home": self.home,
+            "shell": self.shell,
+            "signed_in": self.signed_in,
+        })
+    }
+}
+
+pub(crate) struct State {
+    pub(crate) instance_id: String,
+    pub(crate) host_proof: String,
+    pub(crate) boot: String,
+    pub(crate) namespace: String,
+    pub(crate) table: LocalProcessTable,
+    pub(crate) account: LocalAccount,
+    pub(crate) account_epoch: u64,
+    pub(crate) proc_account_epoch: HashMap<u32, u64>,
+    pub(crate) remote_attached: bool,
+    pub(crate) host_epoch: u64,
+    pub(crate) pending_revocations: Vec<String>,
+    pub(crate) attached_devices: BTreeMap<String, String>,
+    pub(crate) init_state: Init,
+    pub(crate) login_session: LoginSession,
+    pub(crate) login_profile: Option<StartupProfile>,
+    pub(crate) seat_sharing: String,
+    pub(crate) seat_revision: u64,
+    pub(crate) boot_seq: u64,
+    pub(crate) session_seq: u64,
+}
+
+impl State {
+    pub(crate) fn sync_account(&mut self, account: LocalAccount) {
+        let initial_guest_hydration = self.account.uid == os_core::permissions::GUEST
+            && !self.account.signed_in
+            && os_core::permissions::is_guest_id(account.uid)
+            && !account.signed_in;
+        let uid_changed = self.account.uid != account.uid
+            || self.account.signed_in != account.signed_in
+            || self.account.user != account.user;
+        self.account = account;
+        if initial_guest_hydration {
+            // Hydrating the boot fallback guest (65534) to this browser's own unauthenticated
+            // guest cookie UID keeps the same login scope and account epoch so in-flight local
+            // guest processes are not falsely rejected as cross-account.
+            self.login_session.uid = self.account.uid;
+        } else if uid_changed {
+            self.account_epoch = self.account_epoch.saturating_add(1);
+            let now = now_secs();
+            self.session_seq = self.session_seq.saturating_add(1);
+            let sid = format!("{}:s{}", self.instance_id, self.session_seq);
+            let mut next = LoginSession::new(sid, self.account.uid, now + 86_400, now);
+            if let Some(profile) = &self.login_profile {
+                next.startup = Some(Startup::new(profile.clone()));
+            }
+            self.login_session = next;
+        }
+    }
+
+    pub(crate) fn login_view(&self) -> Value {
+        let mut view = self.login_session.view();
+        if let Some(obj) = view.as_object_mut() {
+            obj.insert(
+                "seat_policy".into(),
+                json!({
+                    "sharing": self.seat_sharing,
+                    "revision": self.seat_revision,
+                }),
+            );
+        }
+        view
+    }
+
+    pub(crate) fn refresh_login_shutdown(&mut self, now: u64) -> Vec<String> {
+        let mut revoked = Vec::new();
+        let sid = self.login_session.id.clone();
+        if let Some(shutdown) = &mut self.login_session.shutdown
+            && !shutdown.complete
+        {
+            let live = self.table.login_scope_pids(&sid);
+            if live.is_empty() {
+                shutdown.complete = true;
+            } else if shutdown.due(now) {
+                for pid in live {
+                    if let Ok((_, rev)) = self.table.kill_with_revocations(
+                        &Identity::root(),
+                        None,
+                        Target::Pid(pid),
+                        SIGKILL,
+                        now,
+                    ) {
+                        revoked.extend(rev);
+                    }
+                }
+                if self.table.login_scope_pids(&sid).is_empty() {
+                    shutdown.complete = true;
+                }
+            }
+        }
+        revoked
+    }
 }
 
 fn is_supervisor_image(exec: &Exec) -> bool {
     exec.asset.is_some()
         && exec.local.is_none()
         && exec.path.as_deref() == Some("/usr/bin/supervise")
+}
+
+/// Paths that live purely inside this local instance (never require cloud attachment).
+fn is_local_only_path(path: &str) -> bool {
+    if path.is_empty() || path == "/" {
+        return true;
+    }
+    matches!(
+        path,
+        "/usr"
+            | "/bin"
+            | "/sbin"
+            | "/lib"
+            | "/lib64"
+            | "/proc"
+            | "/dev"
+            | "/run"
+            | "/tmp"
+            | "/mnt"
+            | "/mnt/local"
+            | "/mnt/shared"
+            | "/opt"
+            | "/opt/private"
+    ) || path.starts_with("/usr/")
+        || path.starts_with("/bin/")
+        || path.starts_with("/sbin/")
+        || path.starts_with("/lib/")
+        || path.starts_with("/lib64/")
+        || path.starts_with("/proc/")
+        || path.starts_with("/dev/")
+        || path.starts_with("/run/")
+        || path.starts_with("/tmp/")
+        || path.starts_with("/mnt/")
+        || path.starts_with("/opt/private/")
+}
+
+fn system_usr_asset(path: &str) -> Option<String> {
+    match path {
+        "/usr/bin/init" => Some("/usr/bin/init.wasm".into()),
+        "/usr/bin/supervise" => Some("/usr/bin/supervise.wasm".into()),
+        "/usr/bin/dash" | "/usr/bin/sh" | "/bin/sh" => Some("/usr/bin/dash.wasm".into()),
+        "/usr/bin/coreutils" => Some("/usr/bin/coreutils.wasm".into()),
+        "/usr/bin/utilities" => Some("/usr/bin/utilities.wasm".into()),
+        _ => None,
+    }
+}
+
+fn validate_local_exec(local: &LocalExecutable) -> std::result::Result<(), Error> {
+    if local.size == 0 || local.size > abi::EXEC_MAX {
+        return Err(Error::because(
+            Errno::EINVAL,
+            "invalid local executable size",
+        ));
+    }
+    if local.digest.len() != 64 || !local.digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::because(
+            Errno::EINVAL,
+            "invalid local executable digest",
+        ));
+    }
+    Ok(())
 }
 
 #[wasm_bindgen]
@@ -106,23 +651,55 @@ pub struct Kernel {
 
 #[wasm_bindgen]
 impl Kernel {
-    /// A kernel for one browser boot. The page gives the boot id; the SharedWorker keeps it
-    /// across that boot's tabs. An empty one reaps nothing by boot: where tabs hold Web Locks,
-    /// what a gone tab left is reaped by its seat (client.js), and a kernel of one tab alone
-    /// must not reap the processes of the browser's other tabs. `id` is this kernel's own.
+    /// Create a fresh isolated client kernel instance (ZERO network RPCs).
     #[wasm_bindgen(constructor)]
     pub fn new(boot: &str, id: &str) -> Kernel {
+        let now = now_secs();
+        let instance_id = if !id.is_empty() && auth_v2::valid_id(id) {
+            id.to_string()
+        } else if !boot.is_empty() && auth_v2::valid_id(boot) {
+            boot.to_string()
+        } else {
+            format!("inst-{}", random_hex(12))
+        };
+        let host_proof = random_hex(32);
+        let boot_id = if !boot.is_empty() {
+            boot.to_string()
+        } else {
+            format!("{instance_id}:b1")
+        };
+        let identity = InstanceIdentity {
+            instance: instance_id.clone(),
+            host: "browser".into(),
+        };
+        let mut table = LocalProcessTable::new(identity, now);
+        let _ = table.boot_init("boot", now);
+        let init_state = Init::new(boot_id.clone(), now);
+        let account = LocalAccount::default();
+        let login_session =
+            LoginSession::new(format!("{instance_id}:s1"), account.uid, now + 86_400, now);
+
         let current = Rc::default();
         let state = Rc::new(RefCell::new(State {
-            namespace: String::new(),
-            boot: boot.to_string(),
-            id: id.to_string(),
-            processes: HashMap::new(),
-            spare: HashMap::new(),
-            identities: HashMap::new(),
-            reports: Vec::new(),
-            queued: 0,
-            reported: 0,
+            instance_id: instance_id.clone(),
+            host_proof,
+            boot: boot_id,
+            namespace: instance_id.clone(),
+            table,
+            account,
+            account_epoch: 1,
+            proc_account_epoch: HashMap::new(),
+            remote_attached: false,
+            host_epoch: 0,
+            pending_revocations: Vec::new(),
+            attached_devices: BTreeMap::new(),
+            init_state,
+            login_session,
+            login_profile: None,
+            seat_sharing: "none".into(),
+            seat_revision: 1,
+            boot_seq: 1,
+            session_seq: 1,
         }));
         let connector = cloudfs::Connector::default();
         let root_cloud = Rc::new(cloudfs::RootCloudDriver::new(
@@ -130,8 +707,11 @@ impl Kernel {
             Rc::clone(&current),
             connector.clone(),
         ));
-        let inst_id = if !id.is_empty() { id } else { boot };
-        let vfs_rt = RefCell::new(vfs_engine::VfsRuntime::new_sync(inst_id, root_cloud));
+        let vfs_rt = RefCell::new(vfs_engine::VfsRuntime::new_sync(
+            &instance_id,
+            root_cloud,
+            Rc::clone(&state),
+        ));
         Kernel {
             current,
             cloud: connector,
@@ -140,31 +720,521 @@ impl Kernel {
         }
     }
 
-    /// The protocol version, so a page built another way does not talk past this kernel.
+    /// The `HostAdapter` protocol version (`"2"`).
     pub fn version(&self) -> String {
         VERSION.into()
     }
 
-    /// The namespace this kernel is of.
+    /// This instance's globally unique identifier.
+    pub fn instance_id(&self) -> String {
+        self.state.borrow().instance_id.clone()
+    }
+
+    /// The namespace/instance identifier.
     pub fn namespace(&self) -> String {
         self.state.borrow().namespace.clone()
     }
 
-    /// proc_init: begin (or continue) this browser's namespace, as init does.
-    pub async fn init(&self) -> Result<String, JsValue> {
-        let boot = self.state.borrow().boot.clone();
-        let boot = (!boot.is_empty()).then_some(boot);
-        let value = self.one(Call::ProcInit { boot }, false).await?;
-        let namespace = value["namespace"].as_str().unwrap_or_default().to_string();
-        self.state.borrow_mut().namespace = namespace.clone();
-        let _ = self.sync_vfs_with_authority(&namespace).await;
-        Ok(value.to_string())
+    /// Instance-local account credentials for workspace binding (ZERO network RPCs).
+    pub fn workspace_credentials(&self) -> String {
+        self.state.borrow().account.to_creds_json().to_string()
     }
 
-    /// execve: ask for the image at `path`, run as this browser's account. `argv`, `env` and
-    /// `pids` are JSON arrays; `cgroup` is empty for the default; `sudo` snapshots root for the
-    /// new process, once the page has authenticated it; `seat` is the tab that runs it, empty
-    /// if none said; `host`, the host (tab or port) whose process it is.
+    /// Update the instance-local account snapshot (ZERO network RPCs).
+    pub fn sync_account(&self, account_json: &str) -> Result<String, JsValue> {
+        let val: Value = parse(account_json, "account")?;
+        let account = parse_account_from_value(&val)?;
+        self.apply_account_update(account);
+        Ok(self.state.borrow().account.to_creds_json().to_string())
+    }
+
+    /// Refresh the instance-local account snapshot from the browser's current session cookie
+    /// (called explicitly on `os:login-changed`, NEVER at cold boot).
+    pub async fn sync_account_from_server(&self) -> Result<String, JsValue> {
+        let mut results = cloudfs::page_sys_batch(abi::Batch {
+            calls: vec![Call::Getcreds],
+            umask: None,
+            sudo: false,
+            pid: None,
+            process: None,
+        })
+        .await
+        .map_err(|e| fail(Error::from(e)))?;
+        let val = results
+            .pop()
+            .ok_or_else(|| fail(Errno::EIO.into()))?
+            .into_result()
+            .map_err(fail)?;
+        let account = parse_account_from_value(&val)?;
+        self.apply_account_update(account);
+        Ok(self.state.borrow().account.to_creds_json().to_string())
+    }
+
+    /// Boot/initialize this local instance (ZERO network RPCs).
+    pub async fn init(&self) -> Result<String, JsValue> {
+        let (instance_id, boot, namespace) = {
+            let mut state = self.state.borrow_mut();
+            let now = now_secs();
+            let _ = state.table.boot_init("boot", now);
+            (
+                state.instance_id.clone(),
+                state.boot.clone(),
+                state.namespace.clone(),
+            )
+        };
+        Ok(json!({
+            "namespace": namespace,
+            "instance_id": instance_id,
+            "boot": boot,
+            "version": abi::contract::HOST_ADAPTER_VERSION,
+            "local": true,
+        })
+        .to_string())
+    }
+
+    /// Local `MachineInit` state-machine action (`inspect`, `claim`, `renew`, `release`, `reboot`).
+    /// Runs 100% locally (ZERO network RPCs; `reboot` revokes remote tokens if any are live).
+    pub async fn machine_init_action(
+        &self,
+        action_json: &str,
+        _host: &str,
+    ) -> Result<String, JsValue> {
+        let action: InitAction = parse(action_json, "machine_init action")?;
+        let now = now_secs();
+        let proof_hash = match &action {
+            InitAction::Claim { owner }
+            | InitAction::Renew { owner }
+            | InitAction::Release { owner }
+            | InitAction::Start { owner, .. } => {
+                if owner.proof.len() != 64 || !owner.proof.bytes().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(fail(Errno::EINVAL.into()));
+                }
+                if let InitAction::Start { token, .. } = &action
+                    && (token.len() != 64 || !token.bytes().all(|c| c.is_ascii_hexdigit()))
+                {
+                    return Err(fail(Errno::EINVAL.into()));
+                }
+                sha256_hex(&owner.proof)
+            }
+            InitAction::Inspect | InitAction::Reboot { .. } => String::new(),
+        };
+
+        let (view, revoked) = {
+            let mut state = self.state.borrow_mut();
+            if let InitAction::Reboot { .. } = &action
+                && state.account.uid != 0
+            {
+                return Err(fail(Error::because(
+                    Errno::EPERM,
+                    "only root may reboot the instance",
+                )));
+            }
+            state
+                .init_state
+                .apply(&action, &proof_hash, now)
+                .map_err(fail)?;
+
+            let mut revoked = Vec::new();
+            if matches!(action, InitAction::Reboot { .. }) {
+                let victims = state.table.live_user_pids();
+                // Revoke all remote credentials from this boot immediately while signalling
+                // user processes gracefully with SIGHUP + SIGTERM + SIGCONT so trap handlers run.
+                let active_tokens = state.table.active_remote_tokens();
+                for tok in &active_tokens {
+                    state.table.drop_revoked_remote_token(tok);
+                }
+                revoked.extend(active_tokens);
+                for vpid in victims {
+                    for sig in [SIGHUP, SIGTERM, SIGCONT] {
+                        let _ = state.table.kill_with_revocations(
+                            &Identity::root(),
+                            None,
+                            Target::Pid(vpid),
+                            sig,
+                            now,
+                        );
+                    }
+                }
+                // Advance to a fresh boot generation and login scope, preserving startup profile.
+                state.boot_seq = state.boot_seq.saturating_add(1);
+                let next_boot = format!("{}:b{}", state.instance_id, state.boot_seq);
+                state.boot = next_boot.clone();
+                state.init_state = Init::new(next_boot, now);
+                state.session_seq = state.session_seq.saturating_add(1);
+                let next_sid = format!("{}:s{}", state.instance_id, state.session_seq);
+                let mut next_login =
+                    LoginSession::new(next_sid, state.account.uid, now + 86_400, now);
+                if let Some(profile) = &state.login_profile {
+                    next_login.startup = Some(Startup::new(profile.clone()));
+                }
+                state.login_session = next_login;
+            }
+            (state.init_state.view(), revoked)
+        };
+        revoke_remote_tokens_state(&self.state, revoked).await;
+        Ok(view.to_string())
+    }
+
+    /// Local `LoginSession` state-machine action (`inspect`, `join`, `keep`, `claim`, `renew`,
+    /// `leave`, `configure`, `begin`, `attach`, `finish`, `signal`, `end`, `restart`, `seat_policy`).
+    /// Runs 100% locally (ZERO network RPCs; `end`/`restart` revoke remote tokens of ended procs).
+    pub async fn login_session_action(
+        &self,
+        action_json: &str,
+        host: &str,
+    ) -> Result<String, JsValue> {
+        let raw: Value = parse(action_json, "login_session action")?;
+        let now = now_secs();
+        // Support `seat_policy` action directly in addition to `abi::LoginAction`.
+        if raw.get("op").and_then(Value::as_str) == Some("seat_policy") {
+            let sharing = raw["sharing"]
+                .as_str()
+                .ok_or_else(|| fail(Errno::EINVAL.into()))?;
+            if !matches!(sharing, "none" | "view" | "control") {
+                return Err(fail(Errno::EINVAL.into()));
+            }
+            let expected_session = raw["session"].as_str();
+            let expected_rev = raw["expected"].as_u64();
+            let mut state = self.state.borrow_mut();
+            state.login_session.expire(now);
+            if let Some(sid) = expected_session
+                && sid != state.login_session.id
+            {
+                return Err(fail(Errno::ESTALE.into()));
+            }
+            if let Some(rev) = expected_rev
+                && rev != state.seat_revision
+            {
+                return Err(fail(Errno::ESTALE.into()));
+            }
+            state.seat_sharing = sharing.to_string();
+            state.seat_revision = state.seat_revision.saturating_add(1);
+            return Ok(state.login_view().to_string());
+        }
+
+        let action: LoginAction = from_value(raw, "login_session action")?;
+        let mut revoked = Vec::new();
+        let mut killed_pids = Vec::new();
+
+        let view = {
+            let mut state = self.state.borrow_mut();
+            state.login_session.expire(now);
+            revoked.extend(state.refresh_login_shutdown(now));
+            match action {
+                LoginAction::Inspect => state.login_view(),
+                LoginAction::SeatPolicy {
+                    session,
+                    expected,
+                    sharing,
+                } => {
+                    if session != state.login_session.id || expected != state.seat_revision {
+                        return Err(fail(Errno::ESTALE.into()));
+                    }
+                    state.seat_sharing = match sharing {
+                        SharingMode::None => "none",
+                        SharingMode::View => "view",
+                        SharingMode::Control => "control",
+                    }
+                    .to_string();
+                    state.seat_revision = state.seat_revision.saturating_add(1);
+                    state.login_view()
+                }
+                LoginAction::Join { host: h, proof } => {
+                    let hash = sha256_hex(&proof);
+                    state.login_session.join(&h, &hash).map_err(fail)?;
+                    state.login_view()
+                }
+                LoginAction::Keep { member } => {
+                    if member.session != state.login_session.id {
+                        return Err(fail(Errno::ESTALE.into()));
+                    }
+                    let hash = sha256_hex(&member.proof);
+                    state
+                        .login_session
+                        .keep(&member.host, &hash)
+                        .map_err(fail)?;
+                    state.login_view()
+                }
+                LoginAction::Claim { member, generation } => {
+                    if member.session != state.login_session.id {
+                        return Err(fail(Errno::ESTALE.into()));
+                    }
+                    let hash = sha256_hex(&member.proof);
+                    state
+                        .login_session
+                        .claim(&member.host, &hash, generation)
+                        .map_err(fail)?;
+                    state.login_view()
+                }
+                LoginAction::Renew { member, generation } => {
+                    if member.session != state.login_session.id {
+                        return Err(fail(Errno::ESTALE.into()));
+                    }
+                    let hash = sha256_hex(&member.proof);
+                    state
+                        .login_session
+                        .renew(&member.host, &hash, generation)
+                        .map_err(fail)?;
+                    state.login_view()
+                }
+                LoginAction::Leave { member } => {
+                    if member.session != state.login_session.id {
+                        return Err(fail(Errno::ESTALE.into()));
+                    }
+                    let hash = sha256_hex(&member.proof);
+                    state
+                        .login_session
+                        .leave(&member.host, &hash)
+                        .map_err(fail)?;
+                    state.login_view()
+                }
+                LoginAction::Configure {
+                    member,
+                    generation,
+                    file,
+                } => {
+                    if member.session != state.login_session.id {
+                        return Err(fail(Errno::ESTALE.into()));
+                    }
+                    let hash = sha256_hex(&member.proof);
+                    state
+                        .login_session
+                        .authorize(&member.host, &hash, generation)
+                        .map_err(fail)?;
+                    match file {
+                        Some(path) => {
+                            let rev = random_hex(8);
+                            let profile = StartupProfile::new(rev, path).map_err(fail)?;
+                            state.login_profile = Some(profile.clone());
+                            state.login_session.startup = Some(Startup::new(profile));
+                        }
+                        None => {
+                            state.login_profile = None;
+                            if let Some(startup) = &mut state.login_session.startup {
+                                startup.disable();
+                            }
+                        }
+                    }
+                    state.login_view()
+                }
+                LoginAction::Begin {
+                    member,
+                    generation,
+                    launch,
+                } => {
+                    if member.session != state.login_session.id {
+                        return Err(fail(Errno::ESTALE.into()));
+                    }
+                    let hash = sha256_hex(&member.proof);
+                    state
+                        .login_session
+                        .authorize(&member.host, &hash, generation)
+                        .map_err(fail)?;
+                    let lhash = sha256_hex(&launch.proof);
+                    state
+                        .login_session
+                        .startup
+                        .as_mut()
+                        .ok_or_else(|| fail(Errno::ESTALE.into()))?
+                        .begin(&member.host, generation, &launch.revision, &lhash)
+                        .map_err(fail)?;
+                    state.login_view()
+                }
+                LoginAction::Attach {
+                    member,
+                    generation,
+                    launch,
+                    process,
+                } => {
+                    if member.session != state.login_session.id {
+                        return Err(fail(Errno::ESTALE.into()));
+                    }
+                    let proc = state
+                        .table
+                        .proc(process.pid)
+                        .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+                        .ok_or_else(|| fail(Errno::ESRCH.into()))?;
+                    if proc.login_scope.as_deref() != Some(state.login_session.id.as_str()) {
+                        return Err(fail(Error::because(
+                            Errno::EPERM,
+                            "process does not belong to this login scope",
+                        )));
+                    }
+                    let hash = sha256_hex(&member.proof);
+                    if let Some(launch) = launch {
+                        let lhash = sha256_hex(&launch.proof);
+                        state
+                            .login_session
+                            .attach_startup(
+                                &member.host,
+                                &hash,
+                                generation,
+                                process.pid,
+                                &launch.revision,
+                                &lhash,
+                            )
+                            .map_err(fail)?;
+                    } else {
+                        state
+                            .login_session
+                            .attach(&member.host, &hash, generation, process.pid)
+                            .map_err(fail)?;
+                    }
+                    state.login_view()
+                }
+                LoginAction::Finish {
+                    session,
+                    launch,
+                    status,
+                    error,
+                } => {
+                    if session != state.login_session.id {
+                        return Err(fail(Errno::ESTALE.into()));
+                    }
+                    let lhash = sha256_hex(&launch.proof);
+                    if let Some(startup) = &mut state.login_session.startup {
+                        startup
+                            .finish(&launch.revision, &lhash, status, error)
+                            .map_err(fail)?;
+                    }
+                    state.login_view()
+                }
+                LoginAction::Signal {
+                    member,
+                    generation,
+                    pid,
+                    signal,
+                } => {
+                    if member.session != state.login_session.id {
+                        return Err(fail(Errno::ESTALE.into()));
+                    }
+                    let hash = sha256_hex(&member.proof);
+                    state
+                        .login_session
+                        .signal(&member.host, &hash, generation, pid)
+                        .map_err(fail)?;
+                    let cred = state.account.identity();
+                    let (deliveries, rev) = state
+                        .table
+                        .kill_with_revocations(&cred, None, Target::Pid(pid), signal, now)
+                        .map_err(fail)?;
+                    for d in deliveries {
+                        if d.killed {
+                            killed_pids.push(d.pid);
+                        }
+                    }
+                    revoked.extend(rev);
+                    state.login_view()
+                }
+                LoginAction::End { session } => {
+                    let newly_ended = state.login_session.end(&session).map_err(fail)?;
+                    let sid = state.login_session.id.clone();
+                    state.table.close_login_scope(&sid);
+                    if newly_ended {
+                        let live = state.table.login_scope_pids(&sid);
+                        let cred = Identity::root();
+                        for pid in live {
+                            if let Ok((_, rev)) = state.table.kill_with_revocations(
+                                &cred,
+                                None,
+                                Target::Pid(pid),
+                                SIGTERM,
+                                now,
+                            ) {
+                                revoked.extend(rev);
+                            }
+                            // Revoke remote credentials immediately on login-scope end.
+                            if let Some(tok) = state
+                                .table
+                                .proc(pid)
+                                .and_then(|p| p.cred.remote.as_ref().map(|r| r.token.clone()))
+                            {
+                                state.table.drop_revoked_remote_token(&tok);
+                                revoked.push(tok);
+                            }
+                        }
+                    }
+                    revoked.extend(state.refresh_login_shutdown(now));
+                    state.login_view()
+                }
+                LoginAction::Restart { session } => {
+                    if session != state.login_session.id {
+                        return Err(fail(Errno::ESTALE.into()));
+                    }
+                    let complete = state
+                        .login_session
+                        .shutdown
+                        .as_ref()
+                        .is_some_and(|s| s.complete);
+                    if !complete && state.account.uid != 0 {
+                        return Err(fail(Error::because(
+                            Errno::EPERM,
+                            "only root may restart an active login session",
+                        )));
+                    }
+                    let old_sid = state.login_session.id.clone();
+                    state.table.close_login_scope(&old_sid);
+                    for pid in state.table.login_scope_pids(&old_sid) {
+                        if let Ok((deliveries, rev)) = state.table.kill_with_revocations(
+                            &Identity::root(),
+                            None,
+                            Target::Pid(pid),
+                            SIGKILL,
+                            now,
+                        ) {
+                            for d in deliveries {
+                                if d.killed {
+                                    killed_pids.push(d.pid);
+                                }
+                            }
+                            revoked.extend(rev);
+                        }
+                    }
+                    state.session_seq = state.session_seq.saturating_add(1);
+                    let next_sid = format!("{}:s{}", state.instance_id, state.session_seq);
+                    let mut next =
+                        LoginSession::new(next_sid, state.account.uid, now + 86_400, now);
+                    if let Some(profile) = &state.login_profile {
+                        next.startup = Some(Startup::new(profile.clone()));
+                    }
+                    state.login_session = next;
+                    state.login_view()
+                }
+            }
+        };
+
+        for kpid in killed_pids {
+            self.cloud_exited(kpid, None).await;
+        }
+        revoke_remote_tokens_state(&self.state, revoked).await;
+        Ok(view.to_string())
+    }
+
+    /// Bind a hosted process to the local login coordinator before guest code starts (0 RPCs).
+    pub async fn login_attach(
+        &self,
+        pid: u32,
+        member: &str,
+        generation: u64,
+        launch: Option<String>,
+        host: &str,
+    ) -> Result<String, JsValue> {
+        let member_val: Value = parse(member, "login member")?;
+        let launch_val: Option<Value> = launch
+            .as_deref()
+            .map(|value| parse(value, "login launch"))
+            .transpose()?;
+        let action = json!({
+            "op": "attach",
+            "member": member_val,
+            "generation": generation,
+            "launch": launch_val,
+            "process": { "pid": pid, "token": "", "signals": [] },
+        });
+        self.login_session_action(&action.to_string(), host).await
+    }
+
+    /// execve: spawn one local process (ZERO network RPCs for local paths & non-sudo).
     #[allow(clippy::too_many_arguments)]
     pub async fn exec(
         &self,
@@ -177,7 +1247,13 @@ impl Kernel {
         seat: &str,
         host: &str,
     ) -> Result<String, JsValue> {
-        let stage = json!({ "path": path, "argv": parse::<Value>(argv, "argv")?, "env": parse::<Value>(env, "env")?, "cwd": cwd, "cgroup": cgroup });
+        let stage = json!({
+            "path": path,
+            "argv": parse::<Value>(argv, "argv")?,
+            "env": parse::<Value>(env, "env")?,
+            "cwd": cwd,
+            "cgroup": cgroup,
+        });
         let mut results = self.execs_of(vec![stage], sudo, seat, host).await?;
         match results.pop() {
             Some(Ok(exec)) => to_json(&exec),
@@ -186,8 +1262,7 @@ impl Kernel {
         }
     }
 
-    /// execve of each stage of a pipeline at once (a JSON array of `{path, argv, env, cwd,
-    /// cgroup}`): one request, each stage's process or its errno, in order.
+    /// execve of each stage of a pipeline at once.
     pub async fn execs(
         &self,
         stages: &str,
@@ -207,44 +1282,7 @@ impl Kernel {
         Ok(Value::Array(results).to_string())
     }
 
-    /// Bind a hosted process to a proven login coordinator before guest code starts.
-    /// The process token stays inside this kernel and its authenticated registry request.
-    pub async fn login_attach(
-        &self,
-        pid: u32,
-        member: &str,
-        generation: u64,
-        launch: Option<String>,
-        host: &str,
-    ) -> Result<String, JsValue> {
-        let token = self.token(pid, host)?;
-        let value = self
-            .one(
-                Call::LoginSession {
-                    action: abi::LoginAction::Attach {
-                        member: parse(member, "login member")?,
-                        generation,
-                        launch: launch
-                            .as_deref()
-                            .map(|value| parse(value, "login launch"))
-                            .transpose()?,
-                        process: abi::ProcessProof {
-                            pid,
-                            token,
-                            signals: Vec::new(),
-                        },
-                    },
-                },
-                false,
-            )
-            .await?;
-        to_json(&value)
-    }
-
-    /// execve of the process `pid` itself, as its own image calls it: the image at `path`
-    /// replaces its own, with its pid, its credentials and its open descriptors; the process
-    /// carries a new token from now on (its forks keep the old one). `argv` and `env` are JSON
-    /// arrays.
+    /// Replace image of `pid` (`execve(2)`): 100% local unless rotating an attached `RemoteCredRef`.
     #[allow(clippy::too_many_arguments)]
     pub async fn reexec(
         &self,
@@ -254,67 +1292,136 @@ impl Kernel {
         argv: &str,
         env: &str,
         cwd: &str,
-        seat: &str,
+        _seat: &str,
         host: &str,
     ) -> Result<String, JsValue> {
-        let token = self.token(pid, host)?;
-        let local_exec: Option<abi::LocalExecutable> = parse(local, "local executable")?;
-        let runtime_tag = {
-            let rt = self.vfs_rt.borrow();
-            let chrooted = rt.vfs.process_fs_context(pid).ok().is_some_and(|ctx| {
-                let ns_root = rt
-                    .vfs
-                    .process_namespace(pid)
-                    .unwrap_or_else(|_| rt.vfs.system_namespace())
-                    .borrow()
-                    .root_anchor();
-                !ctx.borrow().root.same_anchor(&ns_root)
-            });
-            if chrooted {
-                "resources-v1:chroot"
-            } else if local_exec.is_none() && !path.starts_with("/usr/") {
-                "resources-v1:no-usr-fallback"
-            } else {
-                "resources-v1"
-            }
-        };
-        let cloud_allowed = local_exec.as_ref().is_none_or(|l| l.cloud);
-        let call = Call::Execve {
-            local: local_exec,
-            runtime: Some(runtime_tag.into()),
-            pid: Some(pid),
-            token: Some(token),
-            path: path.into(),
-            argv: parse(argv, "argv")?,
-            env: parse(env, "env")?,
-            cwd: cwd.into(),
-            cgroup: None,
-            seat: (!seat.is_empty()).then(|| seat.to_string()),
-        };
-        let value = self.one(call, false).await?;
-        let exec: Exec = from_value(value, "execve")?;
-        if let Some(local) = self.state.borrow_mut().processes.get_mut(&pid) {
-            local.token = exec.token.clone();
+        let local_exec: Option<LocalExecutable> = parse(local, "local executable")?;
+        if let Some(le) = &local_exec {
+            validate_local_exec(le).map_err(fail)?;
         }
-        self.state.borrow_mut().retain_spare();
+        let argv_vec: Vec<String> = parse(argv, "argv")?;
+        let env_vec: Vec<String> = parse(env, "env")?;
+        let cloud_req = local_exec.as_ref().is_none_or(|l| l.cloud);
+
+        let (prev_remote, prev_cloud, cgroup, other_holders) = {
+            let state = self.state.borrow();
+            let proc = state
+                .table
+                .proc(pid)
+                .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+                .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?;
+            let old_tok = proc.cred.remote.as_ref().map(|r| r.token.clone());
+            let others = old_tok.as_ref().is_some_and(|tok| {
+                state
+                    .table
+                    .all_pids()
+                    .into_iter()
+                    .filter(|&p| p != pid)
+                    .filter_map(|p| state.table.proc(p))
+                    .any(|p| {
+                        p.state != ProcState::Zombie
+                            && p.cred.remote.as_ref().map(|r| r.token.as_str())
+                                == Some(tok.as_str())
+                    })
+            });
+            (
+                proc.cred.remote.clone(),
+                proc.cred.cloud_access,
+                proc.cgroup.clone(),
+                others,
+            )
+        };
+
+        let next_cloud = prev_cloud && cloud_req;
+        // Rotate remote credential on reexec if this process already held one.
+        let mut derived_remote: Option<RemoteCredRef> = None;
+        if let Some(old_rem) = &prev_remote {
+            if next_cloud && cloudfs::installed("serviceAuthPost").is_ok() {
+                let (instance_id, host_proof) = ensure_remote_attached_state(&self.state)
+                    .await
+                    .map_err(fail)?;
+                let resp =
+                    service_auth_request(&auth_v2::Request::DeriveServiceCred(DeriveServiceCred {
+                        instance_id,
+                        host_proof,
+                        parent_token: old_rem.token.clone(),
+                        scope: old_rem.scope.clone(),
+                        cloud_access: next_cloud,
+                        umask: None,
+                        cgroup: Some(cgroup.clone()),
+                        revoke_parent: !other_holders,
+                    }))
+                    .await
+                    .map_err(fail)?;
+                if let auth_v2::Response::Cred(issued) = resp {
+                    derived_remote = Some(RemoteCredRef {
+                        token: issued.token,
+                        uid: issued.uid,
+                        gid: issued.gid,
+                        groups: issued.groups,
+                        instance_id: issued.instance_id,
+                        lineage: issued.lineage,
+                        cloud_access: issued.cloud_access,
+                        scope: issued.scope,
+                    });
+                }
+            } else if !next_cloud && !other_holders {
+                revoke_remote_tokens_state(&self.state, vec![old_rem.token.clone()]).await;
+            }
+        }
+
+        let updated_proc = {
+            let mut state = self.state.borrow_mut();
+            let proc = state
+                .table
+                .reexec(
+                    host,
+                    pid,
+                    ReexecSpec {
+                        path: path.into(),
+                        argv: argv_vec,
+                        env: env_vec,
+                        cwd: (!cwd.is_empty()).then(|| cwd.to_string()),
+                        runtime: Some(kernel::local_cgroups::RESOURCE_CONTRACT.into()),
+                        cloud_access: next_cloud,
+                        new_remote: derived_remote.clone(),
+                    },
+                    now_secs(),
+                )
+                .map_err(fail)?;
+            state.table.proc(pid).cloned().unwrap_or(proc)
+        };
+        if let Some(ref rem) = updated_proc.cred.remote {
+            let io = self
+                .state
+                .borrow()
+                .table
+                .cgroups()
+                .effective_io_limit(&updated_proc.cgroup);
+            if io.read.is_some() || io.write.is_some() {
+                self.sync_remote_io_quota_for_token(&rem.token, &updated_proc.cgroup)
+                    .await;
+            }
+        }
+
         if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
             meta.supervisor = false;
         }
+        let new_token = updated_proc.cred.remote.as_ref().map(|r| r.token.clone());
+        let id = updated_proc.cred.identity.clone();
         let setup = async {
             self.proc_exec_preserve(pid).await?;
-            let identity = self.cloud_identity(pid, &exec.token).await?;
             self.proc_set_creds(
                 pid,
-                identity.id,
-                identity.group,
-                identity.groups.into_iter().collect(),
-                Some(exec.token.clone()),
-                cloud_allowed,
+                id.id,
+                id.group,
+                id.groups.into_iter().collect(),
+                new_token.clone(),
+                updated_proc.cred.cloud_access,
             )
         }
         .await;
         if let Err(error) = setup {
-            // The authority has already replaced the image and invalidated its old credential.
             let _ = self.exit(pid, 126, None, host).await;
             let error = error
                 .as_string()
@@ -323,105 +1430,71 @@ impl Kernel {
             let _ = js_sys::Reflect::set(&error, &"execCommitted".into(), &JsValue::TRUE);
             return Err(error);
         }
+
+        let boot_id = self.state.borrow().boot.clone();
+        let exec = Exec {
+            pid,
+            boot: Some(boot_id),
+            login_scope: updated_proc.login_scope.clone(),
+            token: new_token.unwrap_or_default(),
+            local: local_exec.as_ref().map(|l| LocalExecutable {
+                digest: l.digest.clone(),
+                size: l.size,
+                cloud: updated_proc.cred.cloud_access,
+            }),
+            fd: None,
+            asset: if local_exec.is_some() {
+                None
+            } else {
+                system_usr_asset(&updated_proc.path)
+            },
+            path: Some(updated_proc.path.clone()),
+            size: local_exec.as_ref().map_or(0, |l| l.size),
+            token_read: None,
+            version: None,
+            cgroup: updated_proc.cgroup.clone(),
+            placement: Placement {
+                cluster: "local".into(),
+                executor: "browser".into(),
+                cgroup: updated_proc.cgroup.clone(),
+            },
+        };
         if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
             meta.supervisor = is_supervisor_image(&exec);
         }
         to_json(&exec)
     }
 
-    /// Fork admits the child in the registry before the host clones/runs its wasm state.
+    /// Fork locally in `LocalProcessTable` (ZERO network RPCs).
     pub async fn fork(&self, pid: u32, host: &str, empty_memory: bool) -> Result<String, JsValue> {
-        let token = self.token(pid, host)?;
-        if self
-            .state
-            .borrow()
-            .spare
-            .get(&token)
-            .is_none_or(Vec::is_empty)
-        {
-            let kernel = Some(self.state.borrow().id.clone()).filter(|id| !id.is_empty());
-            self.flush().await?;
-            let lent = sys(Batch {
-                calls: vec![Call::Pids {
-                    count: LEND,
-                    kernel,
-                }],
-                umask: None,
-                sudo: false,
-                pid: Some(pid),
-                process: Some(token.clone()),
-            })
-            .await
-            .map_err(fail)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| fail(Errno::EIO.into()))?
-            .into_result()
-            .map_err(fail)?;
-            let lent: Vec<u32> = from_value(lent, "pids")?;
-            self.state
-                .borrow_mut()
-                .spare
-                .entry(token.clone())
-                .or_default()
-                .extend(lent);
-        }
-        // A fork taken while the lending was asked may have left none.
-        let child = self
-            .state
-            .borrow_mut()
-            .spare
-            .get_mut(&token)
-            .and_then(Vec::pop)
-            .ok_or_else(|| fail(Errno::EAGAIN.into()))?;
-        let answer = self
-            .send(
-                vec![Call::Fork {
-                    empty_memory,
-                    pid,
-                    child: Some(child),
-                    token: Some(token.clone()),
-                }],
-                false,
-            )
-            .await
-            .map_err(fail)?;
-        match answer.into_iter().next() {
-            Some(Return::Ok(_)) => {}
-            Some(Return::Err(error)) => {
-                // A definite rejection never consumed this lend. Reuse it when
-                // capacity becomes available instead of exhausting the pool.
-                if error.errno == Errno::EAGAIN {
-                    self.state
-                        .borrow_mut()
-                        .spare
-                        .entry(token)
-                        .or_default()
-                        .push(child);
-                }
-                return Err(fail(error));
-            }
-            None => return Err(fail(Errno::EIO.into())),
-        }
-        {
+        let child = {
             let mut state = self.state.borrow_mut();
-            state.processes.insert(
-                child,
-                Local {
-                    ppid: pid,
-                    token: token.clone(),
-                    host: host.to_string(),
-                    ended: None,
-                },
-            );
+            let child = state
+                .table
+                .fork(host, pid, empty_memory, now_secs())
+                .map_err(fail)?;
+            if let Some(ep) = state.proc_account_epoch.get(&pid).copied() {
+                state.proc_account_epoch.insert(child.pid, ep);
+            }
+            child
+        };
+        if let Err(err) = self.proc_fork(pid, child.pid, 0) {
+            let mut state = self.state.borrow_mut();
+            let _ = state.table.exit(host, child.pid, 126, None, now_secs());
+            let _ = state.table.waitpid(host, pid, child.pid as i32, 1);
+            return Err(err);
         }
-        let _ = self.proc_fork(pid, child, 0);
-        to_json(&json!({ "pid": child, "token": token }))
+        let token = child
+            .cred
+            .remote
+            .as_ref()
+            .map(|r| r.token.clone())
+            .unwrap_or_default();
+        to_json(&json!({ "pid": child.pid, "token": token }))
     }
 
-    /// exit: the process `pid` ends with `status`, or by `signal`: a zombie until its parent
-    /// waits; its children are init's, and those that ended, init reaps. Its parent, which is
-    /// to wait for it: init's are their host's to reap, as init would.
+    /// Process exit: zombie + subreaper/init orphan reparenting + immediate remote token revoke
+    /// only when the exiting process was the last live holder of a remote credential.
     pub async fn exit(
         &self,
         pid: u32,
@@ -429,154 +1502,103 @@ impl Kernel {
         signal: Option<u8>,
         host: &str,
     ) -> Result<String, JsValue> {
-        let can_exit = {
+        let (has_live, token_before) = {
             let state = self.state.borrow();
-            state
-                .processes
-                .get(&pid)
-                .filter(|local| local.host == host)
-                .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?
-                .ended
-                .is_none()
+            let proc = state
+                .table
+                .proc(pid)
+                .filter(|p| p.owner_host == host)
+                .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?;
+            (
+                proc.state != ProcState::Zombie,
+                proc.cred.remote.as_ref().map(|r| r.token.clone()),
+            )
         };
-        if !can_exit {
+        if !has_live {
             return Err(fail(Errno::ESRCH.into()));
         }
         self.close_process_server_fds(pid).await;
-        let (token, ppid) = {
+        let outcome = {
             let mut state = self.state.borrow_mut();
-            let local = state
-                .processes
-                .get_mut(&pid)
-                .filter(|local| local.host == host)
-                .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))?;
-            if local.ended.is_some() {
-                return Err(fail(Errno::ESRCH.into()));
+            let out = state
+                .table
+                .exit(host, pid, status, signal, now_secs())
+                .map_err(fail)?;
+            if state
+                .login_session
+                .managed
+                .as_ref()
+                .is_some_and(|m| m.pid == pid)
+            {
+                state.login_session.managed = None;
             }
-            local.ended = Some((status, signal));
-            let (token, ppid) = (local.token.clone(), local.ppid);
-            let orphans: Vec<u32> = state
-                .processes
-                .iter()
-                .filter(|(_, child)| pid != INIT && child.ppid == pid)
-                .map(|(child, _)| *child)
-                .collect();
-            for orphan in orphans {
-                if state.processes[&orphan].ended.is_some() {
-                    state.processes.remove(&orphan);
-                } else if let Some(child) = state.processes.get_mut(&orphan) {
-                    child.ppid = INIT;
-                }
-            }
-            state.report(Call::Exit {
-                status,
-                signal,
-                pid: Some(pid),
-                token: Some(token.clone()),
-            });
-            state.retain_spare();
-            (token, ppid)
+            out
         };
-        // What it held of cloud files it lets go, as its descriptors close at exit.
-        self.cloud_exited(pid, Some(token)).await;
-        Ok(json!({ "ppid": ppid }).to_string())
+        self.cloud_exited(pid, token_before).await;
+        for kpid in outcome.killed_pids {
+            if kpid != pid {
+                self.cloud_exited(kpid, None).await;
+            }
+        }
+        revoke_remote_tokens_state(&self.state, outcome.revoked_tokens).await;
+        Ok(json!({ "ppid": outcome.ppid }).to_string())
     }
 
-    /// waitpid: the zombie `pid`, now reaped, told to the machine with the next batch; EAGAIN
-    /// while it runs. One this kernel does not host is the machine's to answer.
+    /// Reap an ended direct child of PID 1 (ZERO network RPCs).
     pub async fn wait(&self, pid: u32, host: &str) -> Result<String, JsValue> {
-        let ended = self
-            .state
-            .borrow()
-            .processes
-            .get(&pid)
-            .filter(|local| local.host == host)
-            .map(|local| (local.ppid, local.ended));
-        let value = match ended {
-            Some((_, None)) => return Err(fail(Errno::EAGAIN.into())),
-            Some((ppid, Some((status, signal)))) => {
-                let mut state = self.state.borrow_mut();
-                let local = state.processes.remove(&pid).unwrap();
-                state.report(Call::Wait {
-                    pid: pid.to_string(),
-                    token: Some(local.token),
-                });
-                let wait = match signal {
-                    Some(signal) => abi::signal_status(signal),
-                    None => abi::exit_status(status),
-                };
-                json!({ "pid": pid, "ppid": ppid, "state": "zombie", "status": wait, "signal": signal })
-            }
-            None => {
-                let value = self
-                    .one(
-                        Call::Wait {
-                            pid: pid.to_string(),
-                            token: None,
-                        },
-                        false,
-                    )
-                    .await?;
-                // Another authorized account/port may have reaped an init child we kept.
-                // Do not return the cached status again to its original host afterwards.
-                self.state.borrow_mut().processes.remove(&pid);
-                value
-            }
-        };
-        Ok(value.to_string())
+        let mut state = self.state.borrow_mut();
+        let cred = state.account.identity();
+        let reaped = state
+            .table
+            .reap_init_child(host, &cred, pid)
+            .map_err(fail)?;
+        state.proc_account_epoch.remove(&pid);
+        let _ = state.refresh_login_shutdown(now_secs());
+        to_json(&reaped)
     }
 
-    /// wait4(2), as the process `ppid` asks it: its child `pid`, or any of its children with
-    /// none, once ended, reaped now (told to the machine with the next batch), with its exit
-    /// status (`code`) or the signal that ended it; EAGAIN while those it may wait for run;
-    /// ECHILD when it has none of them.
+    /// `wait4(2)` of parent `ppid` for child `pid` (or any child) (ZERO network RPCs).
     pub async fn waitchild(
         &self,
         ppid: u32,
         pid: Option<u32>,
         host: &str,
     ) -> Result<String, JsValue> {
-        // Only the parent's host waits for its children.
-        self.token(ppid, host)?;
-        let found = {
-            let state = self.state.borrow();
-            let mut children: Vec<(u32, Option<Ended>)> = state
-                .processes
-                .iter()
-                .filter(|(child, local)| local.ppid == ppid && pid.is_none_or(|pid| **child == pid))
-                .map(|(child, local)| (*child, local.ended))
-                .collect();
-            if children.is_empty() {
-                return Err(fail(Errno::ECHILD.into()));
-            }
-            children.sort_unstable_by_key(|(child, _)| *child);
-            children
-                .into_iter()
-                .find_map(|(child, ended)| ended.map(|ended| (child, ended)))
-        };
-        let Some((child, (code, signal))) = found else {
-            return Err(fail(Errno::EAGAIN.into()));
-        };
+        let selector = pid.map_or(-1, |p| p as i32);
         let mut state = self.state.borrow_mut();
-        let local = state.processes.remove(&child).unwrap();
-        state.report(Call::Wait {
-            pid: child.to_string(),
-            token: Some(local.token),
-        });
-        let wait = match signal {
-            Some(signal) => abi::signal_status(signal),
-            None => abi::exit_status(code),
-        };
-        Ok(
-            json!({ "pid": child, "ppid": ppid, "status": wait, "code": code, "signal": signal })
-                .to_string(),
-        )
+        match state
+            .table
+            .waitpid(host, ppid, selector, kernel::proc_table::WNOHANG)
+            .map_err(fail)?
+        {
+            WaitOutcome::Reaped(proc) => {
+                state.proc_account_epoch.remove(&proc.pid);
+                let code = if proc.signal.is_some() {
+                    128 + i32::from(proc.signal.unwrap_or(0))
+                } else {
+                    (proc.status >> 8) & 0xff
+                };
+                Ok(json!({
+                    "pid": proc.pid,
+                    "ppid": ppid,
+                    "status": proc.status,
+                    "code": code,
+                    "signal": proc.signal,
+                })
+                .to_string())
+            }
+            WaitOutcome::Event { pid, status } => Ok(json!({
+                "pid": pid,
+                "ppid": ppid,
+                "status": status,
+            })
+            .to_string()),
+            WaitOutcome::Pending => Err(fail(Errno::EAGAIN.into())),
+        }
     }
 
-    /// kill: send `signal` (SIGTERM by default) to `pid`: as the page's account, or, `from` a
-    /// process `host` runs, as that process (its token: its snapshot's credentials, whoever the
-    /// page is signed in as now). What the machine is still to hear goes first, as this
-    /// kernel's: the signal may be to a child it has not heard of yet.
+    /// `kill(2)`: 100% local in `LocalProcessTable` (revokes remote token only if `SIGKILL` ended
+    /// the last live holder of a remote credential).
     pub async fn kill(
         &self,
         pid: i32,
@@ -584,95 +1606,74 @@ impl Kernel {
         from: Option<u32>,
         host: &str,
     ) -> Result<String, JsValue> {
-        let call = Call::Kill {
-            pid: pid.to_string(),
-            signal: Some(signal.unwrap_or(SIGTERM)),
+        let sig = signal.unwrap_or(SIGTERM);
+        let target_str = pid.to_string();
+        let target = Target::of(&target_str);
+        let (deliveries, revoked) = {
+            let mut state = self.state.borrow_mut();
+            let caller_cred = if let Some(from_pid) = from {
+                state
+                    .table
+                    .proc(from_pid)
+                    .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+                    .ok_or_else(|| {
+                        fail(Error::because(
+                            Errno::ESRCH,
+                            format!("no process {from_pid}"),
+                        ))
+                    })?
+                    .cred
+                    .identity
+                    .clone()
+            } else {
+                state.account.identity()
+            };
+            state
+                .table
+                .kill_with_revocations(&caller_cred, from, target, sig, now_secs())
+                .map_err(fail)?
         };
-        let Some(from) = from else {
-            self.one(call, false).await?;
-            return Ok("null".into());
-        };
-        let token = self.token(from, host)?;
-        self.flush().await?;
-        let batch = Batch {
-            calls: vec![call],
-            umask: None,
-            sudo: false,
-            pid: Some(from),
-            process: Some(token),
-        };
-        match sys(batch).await.map_err(fail)?.into_iter().next() {
-            Some(Return::Ok(_)) => Ok("null".into()),
-            Some(Return::Err(error)) => Err(fail(error)),
-            None => Err(fail(Error::because(
-                Errno::EIO,
-                "the kernel answered no call",
-            ))),
+        for d in deliveries {
+            if d.killed {
+                self.cloud_exited(d.pid, None).await;
+            }
         }
+        revoke_remote_tokens_state(&self.state, revoked).await;
+        Ok("null".into())
     }
 
-    /// Invoke a lifecycle operation with this host's authenticated process identity.
+    /// Invoke a process lifecycle operation locally in `LocalProcessTable` (ZERO network RPCs).
     pub async fn process_call(&self, pid: u32, call: &str, host: &str) -> Result<String, JsValue> {
-        let token = self.token(pid, host)?;
         let call: Call = parse(call, "process call")?;
-        if !matches!(
-            call,
-            Call::Getpgid { .. }
-                | Call::Getsid { .. }
-                | Call::Setpgid { .. }
-                | Call::Setsid
-                | Call::Getpid
-                | Call::Waitpid { .. }
-                | Call::ProcStopped { .. }
-                | Call::Prctl { .. }
-                | Call::CgroupAttach { .. }
-        ) {
-            return Err(fail(Errno::EPERM.into()));
-        }
-        let waiting = matches!(call, Call::Waitpid { .. });
-        self.flush().await?;
-        let value = sys(Batch {
-            calls: vec![call],
-            pid: Some(pid),
-            process: Some(token),
-            ..Batch::default()
-        })
-        .await
-        .map_err(fail)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| fail(Errno::EIO.into()))?
-        .into_result()
-        .map_err(fail)?;
-        if waiting
-            && value.get("code").is_some()
-            && let Some(child) = value["pid"].as_u64()
-        {
-            self.state.borrow_mut().processes.remove(&(child as u32));
-        }
-        Ok(value.to_string())
+        let val = self
+            .eval_local_process_call(pid, host, call)
+            .await
+            .map_err(fail)?;
+        Ok(val.to_string())
     }
 
-    /// Bootstrap only processes owned by this port, before their Workers start.
+    /// Bootstrap a pipeline's session/pgid locally before guest code starts (ZERO network RPCs).
     pub async fn session(&self, pids: &str, host: &str) -> Result<String, JsValue> {
         let pids: Vec<u32> = parse(pids, "session processes")?;
-        let processes = pids
-            .into_iter()
-            .map(|pid| {
-                Ok(abi::ProcessProof {
-                    pid,
-                    token: self.token(pid, host)?,
-                    signals: Vec::new(),
-                })
-            })
-            .collect::<Result<Vec<_>, JsValue>>()?;
-        Ok(self
-            .one(Call::ProcSession { processes }, false)
-            .await?
-            .to_string())
+        let mut state = self.state.borrow_mut();
+        let _sid = state.table.bootstrap_session(host, &pids).map_err(fail)?;
+        let mut rows = Vec::with_capacity(pids.len());
+        for pid in pids {
+            if let Some(p) = state.table.proc(pid) {
+                rows.push(json!({
+                    "pid": p.pid,
+                    "ppid": p.ppid,
+                    "pgid": p.pgid,
+                    "sid": p.sid,
+                    "uid": p.cred.identity.id,
+                    "ctty": p.ctty.unwrap_or(0),
+                }));
+            }
+        }
+        Ok(Value::Array(rows).to_string())
     }
 
-    /// What those processes (JSON array of pids; none for all) are now.
+    /// Poll visible local processes (`hidepid=invisible`, ZERO network RPCs).
     pub async fn poll(&self, pids: &str) -> Result<String, JsValue> {
         let pids: Vec<u32> = parse(pids, "pids")?;
         if pids.len() > PROC_POLL_MAX {
@@ -681,295 +1682,1200 @@ impl Kernel {
                 format!("at most {PROC_POLL_MAX} processes at a time"),
             )));
         }
-        let value = self.one(Call::ProcPoll { pids }, false).await?;
-        Ok(value.to_string())
+        let state = self.state.borrow();
+        let cred = state.account.identity();
+        let procs = state.table.poll(&cred, &pids);
+        to_json(&procs)
     }
 
-    /// Project descriptors of a process hosted by this port, with its process proof.
+    /// Record controlling terminal & tty fds for a local process (ZERO network RPCs).
     pub fn terminal(&self, pid: u32, tty: u32, fds: &str, host: &str) -> Result<(), JsValue> {
-        let token = self.token(pid, host)?;
         let fds: Vec<u32> = parse(fds, "terminal descriptors")?;
         if fds.len() > 256 {
             return Err(fail(Errno::E2BIG.into()));
         }
-        self.state.borrow_mut().report(Call::ProcTty {
-            pid,
-            token,
-            tty,
-            fds,
-        });
-        Ok(())
+        self.state
+            .borrow_mut()
+            .table
+            .set_tty(host, pid, tty, fds)
+            .map_err(fail)
     }
 
-    /// Install a restricted boot proof only after the Machine accepts its owner fence.
+    /// Start local PID 1 (`init`) under local `InitOwner` fence (ZERO network RPCs).
     pub async fn boot_init(&self, owner: &str, token: &str, host: &str) -> Result<String, JsValue> {
-        let owner: abi::InitOwner = parse(owner, "init owner")?;
-        self.one(
-            Call::MachineInit {
-                action: abi::InitAction::Start {
-                    owner,
-                    token: token.into(),
-                },
-            },
-            false,
-        )
-        .await?;
+        let owner: InitOwner = parse(owner, "init owner")?;
+        let now = now_secs();
+        let proof_hash = sha256_hex(&owner.proof);
         {
             let mut state = self.state.borrow_mut();
-            state.processes.insert(
-                INIT,
-                Local {
-                    ppid: 0,
-                    token: token.into(),
-                    host: host.into(),
-                    ended: None,
-                },
-            );
-            state.identities.insert(token.into(), vfs::Identity::root());
+            state
+                .init_state
+                .apply(
+                    &InitAction::Start {
+                        owner,
+                        token: token.into(),
+                    },
+                    &proof_hash,
+                    now,
+                )
+                .map_err(fail)?;
+            let _ = state.table.boot_init(host, now);
+            // Update PID 1's owner_host to this host so `init` Worker can call waitpid/sync.
+            let _ = state.table.set_tty(host, INIT, 0, Vec::new());
         }
-        let _ = self.proc_set_creds(INIT, 0, 0, vec![0], Some(token.into()), true);
-        Ok(json!({ "pid": INIT, "ppid": 0, "token": token, "asset": "/usr/bin/init.wasm",
+        let _ = self.proc_set_creds(INIT, 0, 0, vec![0], None, false);
+        Ok(json!({
+            "pid": INIT,
+            "ppid": 0,
+            "token": "",
+            "asset": "/usr/bin/init.wasm",
+            "path": "/usr/bin/init",
             "membership": { "pid": INIT, "ppid": 0, "pgid": INIT, "sid": INIT, "uid": 0, "ctty": 0 }
-        }).to_string())
+        })
+        .to_string())
     }
 
-    /// Recover the state of processes owned by this host, including earlier login sessions.
+    /// Reconcile local processes owned by `host` and acknowledge delivered signals (ZERO network RPCs).
     pub async fn sync(&self, host: &str, acknowledgements: &str) -> Result<String, JsValue> {
-        let acknowledgements: std::collections::BTreeMap<u32, Vec<u64>> =
-            serde_json::from_str(acknowledgements)
-                .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let processes = self
-            .state
-            .borrow()
-            .processes
+        let acknowledgements: BTreeMap<u32, Vec<u64>> = serde_json::from_str(acknowledgements)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let mut state = self.state.borrow_mut();
+        let host_pids: Vec<u32> = state
+            .table
+            .all_pids()
+            .into_iter()
+            .filter(|&pid| state.table.proc(pid).is_some_and(|p| p.owner_host == host))
+            .collect();
+        let mut rows = Vec::with_capacity(host_pids.len());
+        for pid in host_pids {
+            if let Some(seqs) = acknowledgements.get(&pid)
+                && !seqs.is_empty()
+            {
+                let _ = state.table.ack_signals(host, pid, seqs);
+            }
+            if let Some(p) = state.table.proc(pid) {
+                rows.push(p.to_abi_proc());
+            }
+        }
+        to_json(&rows)
+    }
+
+    /// Authoritative local `(pid, ppid)` (ZERO network RPCs).
+    pub async fn getpid(&self, pid: u32) -> Result<String, JsValue> {
+        let state = self.state.borrow();
+        let proc = state
+            .table
+            .proc(pid)
+            .ok_or_else(|| fail(Error::from(Errno::ESRCH)))?;
+        Ok(json!({ "pid": proc.pid, "ppid": proc.ppid }).to_string())
+    }
+
+    /// Return a hosted process's local credential snapshot (ZERO network RPCs).
+    pub fn getcreds_proc(&self, pid: u32, host: &str) -> Result<String, JsValue> {
+        let state = self.state.borrow();
+        let proc = state
+            .table
+            .proc(pid)
+            .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+            .ok_or_else(|| fail(Errno::ESRCH.into()))?;
+        let rt = self.vfs_rt.borrow();
+        let uid = proc.cred.identity.id;
+        let gid = proc.cred.identity.group;
+        let user = rt.uid_names.get(&uid).cloned().unwrap_or_else(|| {
+            if uid == 0 {
+                "root".into()
+            } else if uid == 65534 {
+                "guest".into()
+            } else {
+                uid.to_string()
+            }
+        });
+        let group = rt.gid_names.get(&gid).cloned().unwrap_or_else(|| {
+            if gid == 0 {
+                "root".into()
+            } else if gid == 65534 {
+                "guest".into()
+            } else {
+                gid.to_string()
+            }
+        });
+        let groups: Vec<u32> = proc.cred.identity.groups.iter().copied().collect();
+        let group_names: Vec<String> = groups
             .iter()
-            .filter(|(_, local)| local.host == host && local.ended.is_none())
-            .map(|(&pid, local)| abi::ProcessProof {
-                signals: acknowledgements.get(&pid).cloned().unwrap_or_default(),
-                pid,
-                token: local.token.clone(),
+            .map(|&g| {
+                rt.gid_names.get(&g).cloned().unwrap_or_else(|| {
+                    if g == 0 {
+                        "root".into()
+                    } else if g == 65534 {
+                        "guest".into()
+                    } else {
+                        g.to_string()
+                    }
+                })
             })
             .collect();
-        let rows = self.one(Call::ProcKeep { processes }, false).await?;
-        Ok(rows.to_string())
+        let can_sudo = uid == 0 || groups.contains(&0) || group_names.iter().any(|n| n == "wheel");
+        Ok(json!({
+            "uid": uid,
+            "gid": gid,
+            "groups": groups,
+            "user": user,
+            "group": group,
+            "group_names": group_names,
+            "home": if uid == 0 { "/root" } else { state.account.home.as_str() },
+            "shell": state.account.shell,
+            "signed_in": state.account.signed_in,
+            "can_sudo": can_sudo,
+            "sudo_active": uid == 0,
+            "cloud_access": proc.cred.cloud_access,
+            "has_remote": proc.cred.remote.is_some(),
+        })
+        .to_string())
     }
 
-    /// Authoritative parent identity, including adoption by a living subreaper.
-    pub async fn getpid(&self, pid: u32) -> Result<String, JsValue> {
-        let local = self
-            .state
-            .borrow()
-            .processes
-            .get(&pid)
-            .filter(|local| local.ended.is_none())
-            .map(|local| (local.token.clone(), local.host.clone()));
-        if let Some((_, host)) = local {
-            return self.process_call(pid, "\"getpid\"", &host).await;
-        }
-        let rows = self.one(Call::ProcPoll { pids: vec![pid] }, false).await?;
-        let row = rows
-            .as_array()
-            .and_then(|rows| rows.first())
-            .ok_or_else(|| fail(Error::from(Errno::ESRCH)))?;
-        Ok(json!({"pid":pid,"ppid":row["ppid"]}).to_string())
+    /// Local linear-memory reservation (`resources-v1`, ZERO network RPCs).
+    pub fn reserve_memory(&self, pid: u32, bytes: u64, host: &str) -> Result<(), JsValue> {
+        self.state
+            .borrow_mut()
+            .table
+            .reserve_memory(host, pid, bytes)
+            .map_err(fail)
     }
 
-    /// The tabs whose processes still run, and the kernels holding pids they were lent, by the
-    /// machine's record: `{seats, kernels}`.
-    pub async fn seats(&self) -> Result<String, JsValue> {
-        Ok(self.one(Call::Seats, false).await?.to_string())
-    }
-
-    /// The kernel `kernel` is gone: the pids it was lent and did not take go back.
-    pub async fn reclaim(&self, kernel: &str) -> Result<String, JsValue> {
-        let call = Call::Gone {
-            seat: None,
-            kernel: Some(kernel.into()),
+    /// Local credential update / privilege drop (`docs/architecture/contract.md` §2.4).
+    /// Dropping local privilege clears any ambient remote credential unless an explicit lower
+    /// remote credential is supplied, immediately revoking any dropped token via `ServiceAuth v2`.
+    pub async fn set_proc_cred(
+        &self,
+        pid: u32,
+        uid: u32,
+        gid: u32,
+        groups: Vec<u32>,
+        explicit_remote_json: Option<String>,
+        host: &str,
+    ) -> Result<String, JsValue> {
+        let explicit_remote: Option<RemoteCredRef> = explicit_remote_json
+            .as_deref()
+            .filter(|s| !s.is_empty() && *s != "null")
+            .map(|s| parse(s, "explicit remote cred"))
+            .transpose()?;
+        let mut gset: BTreeSet<u32> = groups.iter().copied().collect();
+        gset.insert(gid);
+        let identity = Identity {
+            id: uid,
+            group: gid,
+            groups: gset,
         };
-        Ok(self.one(call, false).await?.to_string())
-    }
-
-    /// The tab `seat` is gone: what it ran ended with it.
-    pub async fn gone(&self, seat: &str) -> Result<String, JsValue> {
-        let call = Call::Gone {
-            seat: Some(seat.into()),
-            kernel: None,
+        let (revoked, next_token, next_cloud) = {
+            let mut state = self.state.borrow_mut();
+            let rev = state
+                .table
+                .set_cred(host, pid, identity.clone(), explicit_remote)
+                .map_err(fail)?;
+            let proc = state
+                .table
+                .proc(pid)
+                .ok_or_else(|| fail(Errno::ESRCH.into()))?;
+            (
+                rev,
+                proc.cred.remote.as_ref().map(|r| r.token.clone()),
+                proc.cred.cloud_access,
+            )
         };
-        let value = self.one(call, false).await?;
-        // What it ran that this kernel kept goes too.
-        let reaped: Vec<u32> = serde_json::from_value(value.clone()).unwrap_or_default();
-        for pid in reaped {
-            let removed = {
-                let mut state = self.state.borrow_mut();
-                let removed = state.processes.remove(&pid);
-                state.retain_spare();
-                removed
-            };
-            self.cloud_exited(pid, removed.map(|local| local.token))
-                .await;
-        }
-        Ok(value.to_string())
+        let _ = self.proc_set_creds(
+            pid,
+            uid,
+            gid,
+            identity.groups.into_iter().collect(),
+            next_token.clone(),
+            next_cloud,
+        );
+        revoke_remote_tokens_state(&self.state, revoked).await;
+        Ok(json!({
+            "pid": pid,
+            "uid": uid,
+            "gid": gid,
+            "cloud_access": next_cloud,
+            "has_remote": next_token.is_some(),
+        })
+        .to_string())
     }
 
-    /// Whether the machine is still to hear of something.
+    /// Legacy batching hooks retained as no-ops (all process state is synchronous & local).
     pub fn pending(&self) -> bool {
-        !self.state.borrow().reports.is_empty()
+        false
     }
-
-    /// How many reports were made since the kernel started: the machine heard the one made
-    /// last once `reported` is as many.
     pub fn queued(&self) -> f64 {
-        self.state.borrow().queued as f64
+        0.0
     }
-
-    /// How many reports the machine heard since the kernel started.
     pub fn reported(&self) -> f64 {
-        self.state.borrow().reported as f64
+        0.0
     }
-
-    /// Tell the machine what happened here since it last heard: one request, if anything did.
     pub async fn flush(&self) -> Result<(), JsValue> {
-        if self.pending() {
-            self.send(Vec::new(), false).await.map_err(fail)?;
-        }
         Ok(())
     }
 
-    /// cgroup_create, cgroup_set, cgroup_attach, cgroup_remove and cgroup_stat, as the page
-    /// asks them for this namespace.
+    /// Local cgroup v2 policy operations (ZERO network RPCs except `io.max` push when remote
+    /// attached or `cgroup.kill` revoking remote tokens).
     pub async fn cgroup_create(&self, path: &str) -> Result<String, JsValue> {
-        self.one(
-            Call::CgroupCreate {
-                path: path.into(),
-                controllers: None,
-                lifetime: None,
-            },
-            false,
-        )
-        .await?;
+        let mut state = self.state.borrow_mut();
+        let cred = state.account.identity();
+        state
+            .table
+            .cgroup_create(&cred, None, path, None, None)
+            .map_err(fail)?;
         Ok("null".into())
     }
+
     pub async fn cgroup_set(&self, path: &str, key: &str, value: &str) -> Result<String, JsValue> {
-        self.one(
-            Call::CgroupSet {
-                path: path.into(),
-                key: key.into(),
-                value: value.into(),
-            },
-            false,
-        )
-        .await?;
+        let (deliveries, revoked, norm) = {
+            let mut state = self.state.borrow_mut();
+            let cred = state.account.identity();
+            let (d, r) = state
+                .table
+                .cgroup_set_with_revocations(&cred, path, key, value, now_secs())
+                .map_err(fail)?;
+            let norm = normalize_cgroup_path(path).unwrap_or_else(|_| path.to_string());
+            (d, r, norm)
+        };
+        for d in deliveries {
+            if d.killed {
+                self.cloud_exited(d.pid, None).await;
+            }
+        }
+        revoke_remote_tokens_state(&self.state, revoked).await;
+        if key == "io.max" {
+            self.sync_remote_io_quota_subtree(&norm).await;
+        }
         Ok("null".into())
     }
+
     pub async fn cgroup_attach(&self, pid: u32, path: &str) -> Result<String, JsValue> {
-        self.one(
-            Call::CgroupAttach {
-                pid,
-                path: path.into(),
-            },
-            false,
-        )
-        .await?;
+        let (norm, remote_tok) = {
+            let mut state = self.state.borrow_mut();
+            let cred = state.account.identity();
+            state.table.cgroup_attach(&cred, pid, path).map_err(fail)?;
+            let norm = normalize_cgroup_path(path).unwrap_or_else(|_| path.to_string());
+            let tok = state
+                .table
+                .proc(pid)
+                .and_then(|p| p.cred.remote.as_ref().map(|r| r.token.clone()));
+            (norm, tok)
+        };
+        if let Some(token) = remote_tok {
+            self.sync_remote_io_quota_for_token(&token, &norm).await;
+        }
         Ok("null".into())
     }
+
     pub async fn cgroup_remove(&self, path: &str) -> Result<String, JsValue> {
-        self.one(Call::CgroupRemove { path: path.into() }, false)
-            .await?;
+        let mut state = self.state.borrow_mut();
+        let cred = state.account.identity();
+        state.table.cgroup_remove(&cred, path).map_err(fail)?;
         Ok("null".into())
     }
+
     pub async fn cgroup_stat(&self, path: &str) -> Result<String, JsValue> {
-        let value = self
-            .one(Call::CgroupStat { path: path.into() }, false)
-            .await?;
-        Ok(value.to_string())
+        let state = self.state.borrow();
+        let val = state.table.cgroup_stat(path).map_err(fail)?;
+        Ok(val.to_string())
     }
+
     pub async fn cgroup_list(&self, path: &str) -> Result<String, JsValue> {
-        let value = self
-            .one(Call::CgroupList { path: path.into() }, false)
-            .await?;
-        Ok(value.to_string())
+        let state = self.state.borrow();
+        let list = state.table.cgroup_list(path);
+        to_json(&list)
+    }
+
+    /// Negotiate `ServiceAuth` protocol version (`Hello` -> `Welcome` or `EPROTONOSUPPORT` without
+    /// auto-reload, Contract §2.10).
+    pub async fn service_auth_hello(
+        &self,
+        versions_json: Option<String>,
+    ) -> Result<String, JsValue> {
+        let versions: Vec<u32> = match versions_json.as_deref() {
+            Some(s) if !s.is_empty() => parse(s, "versions")?,
+            _ => vec![auth_v2::VERSION],
+        };
+        let resp = service_auth_request(&auth_v2::Request::Hello(Hello {
+            boundary: Boundary::ServiceAuth,
+            versions,
+        }))
+        .await
+        .map_err(fail)?;
+        to_json(&resp)
+    }
+
+    /// Explicitly attach this instance to `ServiceAuth v2`.
+    pub async fn service_auth_attach(&self) -> Result<String, JsValue> {
+        let (instance_id, _) = ensure_remote_attached_state(&self.state)
+            .await
+            .map_err(fail)?;
+        let epoch = self.state.borrow().host_epoch;
+        Ok(json!({
+            "version": auth_v2::VERSION,
+            "instance_id": instance_id,
+            "host_epoch": epoch,
+        })
+        .to_string())
+    }
+
+    /// Explicitly mint and bind a `ServiceAuth v2` remote credential to local process `pid`.
+    pub async fn mint_remote_cred(
+        &self,
+        pid: u32,
+        scope_json: Option<String>,
+        sudo: bool,
+        host: &str,
+    ) -> Result<String, JsValue> {
+        let scope: RemoteScope = match scope_json.as_deref() {
+            Some(s) if !s.is_empty() && s != "null" => parse(s, "remote scope")?,
+            _ => RemoteScope::full(),
+        };
+        let cgroup = {
+            let state = self.state.borrow();
+            let proc = state
+                .table
+                .proc(pid)
+                .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+                .ok_or_else(|| fail(Errno::ESRCH.into()))?;
+            if !proc.cred.cloud_access {
+                return Err(fail(Error::because(
+                    Errno::EACCES,
+                    "process has no cloud access",
+                )));
+            }
+            proc.cgroup.clone()
+        };
+        let (instance_id, host_proof) = ensure_remote_attached_state(&self.state)
+            .await
+            .map_err(fail)?;
+        let resp = service_auth_request(&auth_v2::Request::MintServiceCred(MintServiceCred {
+            instance_id: instance_id.clone(),
+            host_proof: host_proof.clone(),
+            scope: scope.clone(),
+            cloud_access: scope.cloud_fs,
+            umask: 0o022,
+            cgroup: Some(cgroup.clone()),
+            generation: None,
+            sudo,
+        }))
+        .await
+        .map_err(fail)?;
+        let issued = match resp {
+            auth_v2::Response::Cred(c) => c,
+            _ => return Err(fail(Error::because(Errno::EIO, "unexpected cred reply"))),
+        };
+        let rem = RemoteCredRef {
+            token: issued.token.clone(),
+            uid: issued.uid,
+            gid: issued.gid,
+            groups: issued.groups.clone(),
+            instance_id: issued.instance_id.clone(),
+            lineage: issued.lineage.clone(),
+            cloud_access: issued.cloud_access,
+            scope: issued.scope.clone(),
+        };
+        let identity = Identity {
+            id: rem.uid,
+            group: rem.gid,
+            groups: rem.groups.iter().copied().collect(),
+        };
+        let revoked = {
+            let mut state = self.state.borrow_mut();
+            state
+                .table
+                .set_cred(host, pid, identity.clone(), Some(rem.clone()))
+                .map_err(fail)?
+        };
+        let _ = self.proc_set_creds(
+            pid,
+            rem.uid,
+            rem.gid,
+            rem.groups.clone(),
+            Some(rem.token.clone()),
+            rem.cloud_access,
+        );
+        revoke_remote_tokens_state(&self.state, revoked).await;
+        self.sync_remote_io_quota_for_token(&rem.token, &cgroup)
+            .await;
+        Ok(json!({
+            "uid": rem.uid,
+            "gid": rem.gid,
+            "groups": rem.groups,
+            "instance_id": rem.instance_id,
+            "lineage": rem.lineage,
+            "cloud_access": rem.cloud_access,
+            "scope": rem.scope,
+        })
+        .to_string())
+    }
+
+    /// Explicitly attach a remote device driver (`archive`, `media`, `present`, `snd`) into `/dev`
+    /// only after authenticating a `ServiceAuth v2` credential whose scope authorizes `driver`
+    /// (`docs/architecture/contract.md` §2.7).
+    pub async fn attach_remote_device(
+        &self,
+        driver: &str,
+        pid: Option<u32>,
+        host: &str,
+    ) -> Result<String, JsValue> {
+        if !vfs::devfs::REMOTE_DEVICE_DRIVERS.contains(&driver) {
+            return Err(fail(Errno::ENODEV.into()));
+        }
+        let scope_label = if let Some(p) = pid {
+            let existing = {
+                let state = self.state.borrow();
+                let proc = state
+                    .table
+                    .proc(p)
+                    .filter(|pr| pr.state != ProcState::Zombie && pr.owner_host == host)
+                    .ok_or_else(|| fail(Errno::ESRCH.into()))?;
+                proc.cred.remote.clone()
+            };
+            let rem = existing.ok_or_else(|| {
+                fail(Error::because(
+                    Errno::EACCES,
+                    "remote device attachment requires a verified remote credential",
+                ))
+            })?;
+            if !rem.scope.allows_device(driver) {
+                return Err(fail(Error::because(
+                    Errno::EACCES,
+                    format!("remote credential scope does not permit /dev/{driver}"),
+                )));
+            }
+            format!("service-auth-v2:{}:{driver}", rem.instance_id)
+        } else {
+            let (instance_id, host_proof) = ensure_remote_attached_state(&self.state)
+                .await
+                .map_err(fail)?;
+            let req = auth_v2::Request::MintServiceCred(MintServiceCred {
+                instance_id: instance_id.clone(),
+                host_proof: host_proof.clone(),
+                scope: RemoteScope {
+                    cloud_fs: false,
+                    devices: vec![driver.to_string()],
+                    containers: false,
+                    relay: false,
+                },
+                cloud_access: false,
+                umask: 0o022,
+                cgroup: None,
+                generation: None,
+                sudo: false,
+            });
+            let resp = service_auth_request(&req).await.map_err(fail)?;
+            let issued = match resp {
+                auth_v2::Response::Cred(c) => c,
+                _ => return Err(fail(Errno::EIO.into())),
+            };
+            if !issued.scope.allows_device(driver) {
+                revoke_remote_tokens_state(&self.state, vec![issued.token]).await;
+                return Err(fail(Errno::EACCES.into()));
+            }
+            revoke_remote_tokens_state(&self.state, vec![issued.token]).await;
+            format!("service-auth-v2:{instance_id}:{driver}")
+        };
+
+        let mode = match driver {
+            "archive" | "media" => 0o666,
+            _ => 0o755,
+        };
+        let dev_fs = Rc::clone(&self.vfs_rt.borrow().dev_fs);
+        dev_fs
+            .attach_remote(driver, mode, &scope_label)
+            .map_err(|e| fail(Error::from(e)))?;
+        self.state
+            .borrow_mut()
+            .attached_devices
+            .insert(driver.to_string(), scope_label.clone());
+        Ok(json!({ "driver": driver, "attached": true, "scope": scope_label }).to_string())
+    }
+
+    /// Detach a previously attached remote device driver from `/dev`.
+    pub fn detach_remote_device(&self, driver: &str) -> Result<(), JsValue> {
+        let dev_fs = Rc::clone(&self.vfs_rt.borrow().dev_fs);
+        dev_fs
+            .detach_remote(driver)
+            .map_err(|e| fail(Error::from(e)))?;
+        self.state.borrow_mut().attached_devices.remove(driver);
+        Ok(())
+    }
+
+    /// Cleanly detach this instance from `ServiceAuth v2`, revoking all remote credentials and
+    /// releasing its host fence immediately.
+    pub async fn detach_instance(&self) -> Result<String, JsValue> {
+        let (attached, instance_id, host_proof) = {
+            let s = self.state.borrow();
+            (
+                s.remote_attached,
+                s.instance_id.clone(),
+                s.host_proof.clone(),
+            )
+        };
+        if !attached {
+            return Ok(json!({ "detached": 0 }).to_string());
+        }
+        let resp = service_auth_request(&auth_v2::Request::DetachInstance(DetachInstance {
+            instance_id,
+            host_proof,
+        }))
+        .await
+        .map_err(fail)?;
+        {
+            let mut s = self.state.borrow_mut();
+            s.remote_attached = false;
+            s.pending_revocations.clear();
+            let tokens = s.table.active_remote_tokens();
+            for tok in tokens {
+                s.table.drop_revoked_remote_token(&tok);
+            }
+        }
+        to_json(&resp)
+    }
+
+    /// Renew this instance's remote lease and active tokens via `ServiceAuth v2` (no-op with 0
+    /// network requests when `!remote_attached`).
+    pub async fn renew_instance(&self) -> Result<String, JsValue> {
+        let (attached, instance_id, host_proof, active_tokens, pending) = {
+            let mut s = self.state.borrow_mut();
+            if !s.remote_attached {
+                return Ok(json!({ "attached": false }).to_string());
+            }
+            let pending = std::mem::take(&mut s.pending_revocations);
+            (
+                true,
+                s.instance_id.clone(),
+                s.host_proof.clone(),
+                s.table.active_remote_tokens(),
+                pending,
+            )
+        };
+        if !attached {
+            return Ok(json!({ "attached": false }).to_string());
+        }
+        if !pending.is_empty() {
+            revoke_remote_tokens_state(&self.state, pending).await;
+        }
+        let resp = service_auth_request(&auth_v2::Request::RenewInstance(RenewInstance {
+            instance_id,
+            host_proof,
+            active_tokens,
+        }))
+        .await
+        .map_err(fail)?;
+        if let auth_v2::Response::Renewed(ref res) = resp
+            && !res.revoked.is_empty()
+        {
+            let mut state = self.state.borrow_mut();
+            let root_cloud = Rc::clone(&self.vfs_rt.borrow().root_cloud);
+            for tok in &res.revoked {
+                let affected: Vec<u32> = state
+                    .table
+                    .all_pids()
+                    .into_iter()
+                    .filter(|&pid| {
+                        state.table.proc(pid).is_some_and(|p| {
+                            p.cred.remote.as_ref().map(|r| r.token.as_str()) == Some(tok.as_str())
+                        })
+                    })
+                    .collect();
+                state.table.drop_revoked_remote_token(tok);
+                for pid in affected {
+                    root_cloud.set_cloud_access(pid, false);
+                }
+            }
+        }
+        to_json(&resp)
     }
 }
 
 impl Kernel {
-    /// The token of the live process `pid`, which `host` runs: ESRCH for another host's, as
-    /// for none, so that a page learns nothing of processes it does not run.
-    fn token(&self, pid: u32, host: &str) -> std::result::Result<String, JsValue> {
-        self.state
-            .borrow()
-            .processes
-            .get(&pid)
-            .filter(|local| local.ended.is_none() && local.host == host)
-            .map(|local| local.token.clone())
-            .ok_or_else(|| fail(Error::because(Errno::ESRCH, format!("no process {pid}"))))
+    pub(crate) fn apply_account_update(&self, account: LocalAccount) {
+        let uid = account.uid;
+        let gid = account.gid;
+        let user = account.user.clone();
+        let group = account.group.clone();
+        self.state.borrow_mut().sync_account(account);
+        let mut rt = self.vfs_rt.borrow_mut();
+        if !user.is_empty() {
+            rt.uid_names.insert(uid, user);
+        }
+        if !group.is_empty() {
+            rt.gid_names.insert(gid, group);
+        }
     }
 
-    /// execve of `stages`, in one request: each stage's process, kept here, or its error.
+    pub(crate) async fn eval_local_process_call(
+        &self,
+        pid: u32,
+        host: &str,
+        call: Call,
+    ) -> std::result::Result<Value, Error> {
+        match call {
+            Call::Getpid => {
+                let state = self.state.borrow();
+                let proc = state
+                    .table
+                    .proc(pid)
+                    .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+                    .ok_or(Errno::ESRCH)?;
+                Ok(json!({ "pid": proc.pid, "ppid": proc.ppid }))
+            }
+            Call::Getpgid { pid: target } => {
+                let state = self.state.borrow();
+                let _pgid = state.table.getpgid(host, pid, target)?;
+                let target_pid = if target == 0 { pid } else { target as u32 };
+                let p = state.table.proc(target_pid).ok_or(Errno::ESRCH)?;
+                Ok(json!({
+                    "pid": p.pid,
+                    "ppid": p.ppid,
+                    "pgid": p.pgid,
+                    "sid": p.sid,
+                }))
+            }
+            Call::Getsid { pid: target } => {
+                let state = self.state.borrow();
+                let _sid = state.table.getsid(host, pid, target)?;
+                let target_pid = if target == 0 { pid } else { target as u32 };
+                let p = state.table.proc(target_pid).ok_or(Errno::ESRCH)?;
+                Ok(json!({
+                    "pid": p.pid,
+                    "ppid": p.ppid,
+                    "pgid": p.pgid,
+                    "sid": p.sid,
+                }))
+            }
+            Call::Setpgid { pid: target, pgid } => {
+                let mut state = self.state.borrow_mut();
+                state.table.setpgid(host, pid, target, pgid)?;
+                let target_pid = if target == 0 { pid } else { target as u32 };
+                let p = state.table.proc(target_pid).ok_or(Errno::ESRCH)?;
+                Ok(json!({
+                    "pid": p.pid,
+                    "ppid": p.ppid,
+                    "pgid": p.pgid,
+                    "sid": p.sid,
+                }))
+            }
+            Call::Setsid => {
+                let mut state = self.state.borrow_mut();
+                let sid = state.table.setsid(host, pid)?;
+                let p = state.table.proc(pid).ok_or(Errno::ESRCH)?;
+                Ok(json!({
+                    "pid": p.pid,
+                    "ppid": p.ppid,
+                    "pgid": p.pgid,
+                    "sid": sid,
+                }))
+            }
+            Call::Prctl { option, value } => {
+                let res = self
+                    .state
+                    .borrow_mut()
+                    .table
+                    .prctl(host, pid, option, value)?;
+                Ok(json!(res))
+            }
+            Call::ProcStopped { signal } => {
+                self.state
+                    .borrow_mut()
+                    .table
+                    .report_stopped(host, pid, signal)?;
+                Ok(Value::Null)
+            }
+            Call::Waitpid {
+                pid: selector,
+                options,
+            } => {
+                let mut state = self.state.borrow_mut();
+                match state.table.waitpid(host, pid, selector, options)? {
+                    WaitOutcome::Reaped(proc) => {
+                        state.proc_account_epoch.remove(&proc.pid);
+                        if pid == INIT {
+                            state.init_state.reaped();
+                        }
+                        let code = if proc.signal.is_some() {
+                            128 + i32::from(proc.signal.unwrap_or(0))
+                        } else {
+                            (proc.status >> 8) & 0xff
+                        };
+                        Ok(json!({
+                            "pid": proc.pid,
+                            "ppid": pid,
+                            "status": proc.status,
+                            "code": code,
+                            "signal": proc.signal,
+                        }))
+                    }
+                    WaitOutcome::Event { pid: cpid, status } => Ok(json!({
+                        "pid": cpid,
+                        "ppid": pid,
+                        "status": status,
+                        "stopped": status != 0xffff,
+                        "continued": status == 0xffff,
+                    })),
+                    WaitOutcome::Pending => {
+                        if options & kernel::proc_table::WNOHANG != 0 {
+                            Ok(json!({ "nothing": true }))
+                        } else {
+                            Err(Errno::EAGAIN.into())
+                        }
+                    }
+                }
+            }
+            Call::CgroupCreate {
+                path,
+                controllers,
+                lifetime,
+            } => {
+                let mut state = self.state.borrow_mut();
+                let cred = state
+                    .table
+                    .proc(pid)
+                    .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+                    .ok_or(Errno::ESRCH)?
+                    .cred
+                    .identity
+                    .clone();
+                state.table.cgroup_create(
+                    &cred,
+                    Some(pid),
+                    &path,
+                    controllers.as_deref(),
+                    lifetime,
+                )?;
+                Ok(Value::Null)
+            }
+            Call::CgroupRemove { path } => {
+                let mut state = self.state.borrow_mut();
+                let cred = state
+                    .table
+                    .proc(pid)
+                    .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+                    .ok_or(Errno::ESRCH)?
+                    .cred
+                    .identity
+                    .clone();
+                state.table.cgroup_remove(&cred, &path)?;
+                Ok(Value::Null)
+            }
+            Call::CgroupSet { path, key, value } => {
+                let (deliveries, revoked, norm) = {
+                    let mut state = self.state.borrow_mut();
+                    let cred = state
+                        .table
+                        .proc(pid)
+                        .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+                        .ok_or(Errno::ESRCH)?
+                        .cred
+                        .identity
+                        .clone();
+                    let (d, r) = state.table.cgroup_set_with_revocations(
+                        &cred,
+                        &path,
+                        &key,
+                        &value,
+                        now_secs(),
+                    )?;
+                    let norm = normalize_cgroup_path(&path).unwrap_or(path);
+                    (d, r, norm)
+                };
+                for d in deliveries {
+                    if d.killed {
+                        self.cloud_exited(d.pid, None).await;
+                    }
+                }
+                revoke_remote_tokens_state(&self.state, revoked).await;
+                if key == "io.max" {
+                    self.sync_remote_io_quota_subtree(&norm).await;
+                }
+                Ok(Value::Null)
+            }
+            Call::CgroupAttach {
+                pid: target_pid,
+                path,
+            } => {
+                let (norm, remote_tok) = {
+                    let mut state = self.state.borrow_mut();
+                    let cred = state
+                        .table
+                        .proc(pid)
+                        .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+                        .ok_or(Errno::ESRCH)?
+                        .cred
+                        .identity
+                        .clone();
+                    state.table.cgroup_attach(&cred, target_pid, &path)?;
+                    let norm = normalize_cgroup_path(&path).unwrap_or(path);
+                    let tok = state
+                        .table
+                        .proc(target_pid)
+                        .and_then(|p| p.cred.remote.as_ref().map(|r| r.token.clone()));
+                    (norm, tok)
+                };
+                if let Some(token) = remote_tok {
+                    self.sync_remote_io_quota_for_token(&token, &norm).await;
+                }
+                Ok(Value::Null)
+            }
+            Call::CgroupStat { path } => self.state.borrow().table.cgroup_stat(&path),
+            Call::CgroupList { path } => {
+                let list = self.state.borrow().table.cgroup_list(&path);
+                Ok(json!(list))
+            }
+            _ => Err(Errno::EPERM.into()),
+        }
+    }
+
+    async fn sync_remote_io_quota_for_token(&self, token: &str, cgroup: &str) {
+        let (attached, instance_id, host_proof, io) = {
+            let s = self.state.borrow();
+            (
+                s.remote_attached,
+                s.instance_id.clone(),
+                s.host_proof.clone(),
+                s.table.cgroups().effective_io_limit(cgroup),
+            )
+        };
+        if !attached || cloudfs::installed("serviceAuthPost").is_err() {
+            return;
+        }
+        let _ = service_auth_request(&auth_v2::Request::SetRemoteIoQuota(RemoteIoQuota {
+            instance_id,
+            host_proof,
+            token: token.to_string(),
+            cgroup: cgroup.to_string(),
+            rbps: io.read,
+            wbps: io.write,
+        }))
+        .await;
+    }
+
+    async fn sync_remote_io_quota_subtree(&self, cgroup: &str) {
+        let targets: Vec<(String, String)> = {
+            let s = self.state.borrow();
+            if !s.remote_attached {
+                return;
+            }
+            let mut seen = BTreeSet::new();
+            let mut out = Vec::new();
+            for pid in s.table.all_pids() {
+                if let Some(p) = s.table.proc(pid)
+                    && p.state != ProcState::Zombie
+                    && in_subtree(&p.cgroup, cgroup)
+                    && let Some(rem) = &p.cred.remote
+                    && seen.insert(rem.token.clone())
+                {
+                    out.push((rem.token.clone(), p.cgroup.clone()));
+                }
+            }
+            out
+        };
+        for (token, cg) in targets {
+            self.sync_remote_io_quota_for_token(&token, &cg).await;
+        }
+    }
+
+    /// Local multi-stage `execve` admission + lazy `ServiceAuth v2` credential minting.
     async fn execs_of(
         &self,
         stages: Vec<Value>,
         sudo: bool,
-        seat: &str,
+        _seat: &str,
         host: &str,
     ) -> std::result::Result<Vec<std::result::Result<Exec, Error>>, JsValue> {
-        let calls = stages
-            .iter()
-            .map(|stage| {
-                let cgroup = stage["cgroup"].as_str().unwrap_or_default();
-                let rt = stage["runtime"].as_str().unwrap_or("resources-v1");
-                Ok(Call::Execve {
-                    local: from_value(stage["local"].clone(), "local executable")?,
-                    runtime: Some(rt.to_string()),
-                    pid: None,
-                    token: None,
-                    path: stage["path"].as_str().unwrap_or_default().into(),
-                    argv: from_value(stage["argv"].clone(), "argv")?,
-                    env: from_value(stage["env"].clone(), "env")?,
-                    cwd: stage["cwd"].as_str().unwrap_or("/").into(),
-                    cgroup: (!cgroup.is_empty()).then(|| cgroup.to_string()),
-                    seat: (!seat.is_empty()).then(|| seat.to_string()),
-                })
-            })
-            .collect::<std::result::Result<Vec<_>, JsValue>>()?;
-        let results = self.send(calls, sudo).await.map_err(fail)?;
-        let admitted: Vec<(std::result::Result<Exec, Error>, Value)> = results
-            .into_iter()
-            .zip(stages)
-            .map(|(result, stage)| {
-                let res = result.into_result().and_then(|v| {
-                    serde_json::from_value::<Exec>(v)
-                        .map_err(|error| Error::because(Errno::EIO, error.to_string()))
-                });
-                if let Ok(exec) = &res {
-                    let ppid = stage["parentPid"]
-                        .as_u64()
-                        .map(|p| p as u32)
-                        .unwrap_or(INIT);
-                    self.state.borrow_mut().processes.insert(
-                        exec.pid,
-                        Local {
-                            ppid,
-                            token: exec.token.clone(),
-                            host: host.to_string(),
-                            ended: None,
-                        },
-                    );
-                }
-                (res, stage)
-            })
-            .collect();
+        let mut admitted: Vec<(std::result::Result<Exec, Error>, Value)> =
+            Vec::with_capacity(stages.len());
 
+        for stage in stages {
+            let path = stage["path"].as_str().unwrap_or_default().to_string();
+            let argv: Vec<String> = match serde_json::from_value(stage["argv"].clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    admitted.push((
+                        Err(Error::because(Errno::EINVAL, format!("argv: {e}"))),
+                        stage,
+                    ));
+                    continue;
+                }
+            };
+            let env: Vec<String> = match serde_json::from_value(stage["env"].clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    admitted.push((
+                        Err(Error::because(Errno::EINVAL, format!("env: {e}"))),
+                        stage,
+                    ));
+                    continue;
+                }
+            };
+            let cwd = stage["cwd"].as_str().unwrap_or("/").to_string();
+            let cgroup = stage["cgroup"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let runtime = stage["runtime"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| Some(kernel::local_cgroups::RESOURCE_CONTRACT.into()));
+            let parent_pid = stage["parentPid"].as_u64().map(|p| p as u32);
+            let local_exec: Option<LocalExecutable> =
+                match serde_json::from_value(stage["local"].clone()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        admitted.push((
+                            Err(Error::because(
+                                Errno::EINVAL,
+                                format!("local executable: {e}"),
+                            )),
+                            stage,
+                        ));
+                        continue;
+                    }
+                };
+            if let Some(le) = &local_exec
+                && let Err(err) = validate_local_exec(le)
+            {
+                admitted.push((Err(err), stage));
+                continue;
+            }
+
+            let explicit_remote_val = stage.get("remote");
+            let remote_explicit_false = explicit_remote_val == Some(&Value::Bool(false));
+            let explicit_scope: Option<RemoteScope> = match explicit_remote_val {
+                Some(Value::Bool(true)) => Some(RemoteScope::full()),
+                Some(Value::Object(_)) => {
+                    match serde_json::from_value::<RemoteScope>(
+                        explicit_remote_val.unwrap().clone(),
+                    ) {
+                        Ok(sc) => Some(sc),
+                        Err(e) => {
+                            admitted.push((
+                                Err(Error::because(Errno::EINVAL, format!("remote scope: {e}"))),
+                                stage,
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                _ => None,
+            };
+
+            let mut cloud_allowed =
+                local_exec.as_ref().is_none_or(|l| l.cloud) && !remote_explicit_false;
+            let (parent_cred, default_identity, active_login_scope, account_epoch) = {
+                let s = self.state.borrow();
+                let pcred = parent_pid.and_then(|pp| {
+                    s.table
+                        .proc(pp)
+                        .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+                        .map(|p| p.cred.clone())
+                });
+                let sid = stage["sessionId"]
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| Some(s.login_session.id.clone()));
+                (pcred, s.account.identity(), sid, s.account_epoch)
+            };
+            if let Some(pp) = parent_pid
+                && parent_cred.is_none()
+            {
+                admitted.push((
+                    Err(Error::because(Errno::ESRCH, format!("no process {pp}"))),
+                    stage,
+                ));
+                continue;
+            }
+            if let Some(pc) = &parent_cred {
+                cloud_allowed &= pc.cloud_access;
+            }
+
+            let is_cloud_target =
+                (local_exec.is_none() && !is_local_only_path(&path)) || !is_local_only_path(&cwd);
+            let should_mint_remote = cloud_allowed
+                && cloudfs::installed("serviceAuthPost").is_ok()
+                && (sudo || explicit_scope.is_some() || is_cloud_target);
+
+            let cred_result: std::result::Result<LocalCred, Error> = if let Some(pc) = parent_cred {
+                let mut c = pc;
+                c.cloud_access &= cloud_allowed;
+                if !c.cloud_access {
+                    c.remote = None;
+                } else if let Some(rem) = &mut c.remote {
+                    rem.cloud_access &= cloud_allowed;
+                }
+                Ok(c)
+            } else if should_mint_remote {
+                match ensure_remote_attached_state(&self.state).await {
+                    Ok((instance_id, host_proof)) => {
+                        let scope = explicit_scope.unwrap_or_else(RemoteScope::full);
+                        match service_auth_request(&auth_v2::Request::MintServiceCred(
+                            MintServiceCred {
+                                instance_id,
+                                host_proof,
+                                scope,
+                                cloud_access: cloud_allowed,
+                                umask: 0o022,
+                                cgroup: cgroup.clone(),
+                                generation: None,
+                                sudo,
+                            },
+                        ))
+                        .await
+                        {
+                            Ok(auth_v2::Response::Cred(issued)) => {
+                                let identity = Identity {
+                                    id: issued.uid,
+                                    group: issued.gid,
+                                    groups: issued.groups.iter().copied().collect(),
+                                };
+                                let rem = RemoteCredRef {
+                                    token: issued.token,
+                                    uid: issued.uid,
+                                    gid: issued.gid,
+                                    groups: issued.groups,
+                                    instance_id: issued.instance_id,
+                                    lineage: issued.lineage,
+                                    cloud_access: issued.cloud_access && cloud_allowed,
+                                    scope: issued.scope,
+                                };
+                                Ok(LocalCred::with_remote(identity, issued.umask, rem))
+                            }
+                            Ok(_) => Err(Error::because(Errno::EIO, "unexpected cred reply")),
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            } else if sudo && cloudfs::installed("serviceAuthPost").is_ok() {
+                // `sudo: true` when `!cloud_allowed` still cannot synthesize root locally.
+                Err(Error::because(
+                    Errno::EPERM,
+                    "sudo requires authenticated elevation",
+                ))
+            } else {
+                Ok(LocalCred {
+                    identity: default_identity,
+                    umask: 0o022,
+                    remote: None,
+                    cloud_access: cloud_allowed,
+                })
+            };
+
+            let local_cred = match cred_result {
+                Ok(c) => c,
+                Err(err) => {
+                    admitted.push((Err(err), stage));
+                    continue;
+                }
+            };
+            let minted_token = local_cred.remote.as_ref().map(|r| r.token.clone());
+
+            let spawn_res = {
+                let mut state = self.state.borrow_mut();
+                let spec = SpawnSpec {
+                    path: path.clone(),
+                    argv,
+                    env,
+                    cwd: cwd.clone(),
+                    cred: local_cred,
+                    cgroup: cgroup.clone(),
+                    owner_host: host.to_string(),
+                    login_scope: active_login_scope,
+                    runtime,
+                    ppid: parent_pid,
+                    pgid: None,
+                    sid: None,
+                    initial_state: ProcState::Running,
+                };
+                let res = state.table.spawn(spec, now_secs());
+                if let Ok(ref p) = res {
+                    state.proc_account_epoch.insert(p.pid, account_epoch);
+                }
+                res
+            };
+
+            match spawn_res {
+                Ok(proc) => {
+                    let boot_id = self.state.borrow().boot.clone();
+                    if let Some(ref rem) = proc.cred.remote {
+                        let io = self
+                            .state
+                            .borrow()
+                            .table
+                            .cgroups()
+                            .effective_io_limit(&proc.cgroup);
+                        if io.read.is_some() || io.write.is_some() {
+                            self.sync_remote_io_quota_for_token(&rem.token, &proc.cgroup)
+                                .await;
+                        }
+                    }
+                    let exec = Exec {
+                        pid: proc.pid,
+                        boot: Some(boot_id),
+                        login_scope: proc.login_scope.clone(),
+                        token: proc
+                            .cred
+                            .remote
+                            .as_ref()
+                            .map(|r| r.token.clone())
+                            .unwrap_or_default(),
+                        local: local_exec.as_ref().map(|l| LocalExecutable {
+                            digest: l.digest.clone(),
+                            size: l.size,
+                            cloud: proc.cred.cloud_access,
+                        }),
+                        fd: None,
+                        asset: if local_exec.is_some() {
+                            None
+                        } else {
+                            system_usr_asset(&proc.path)
+                        },
+                        path: Some(proc.path.clone()),
+                        size: local_exec.as_ref().map_or(0, |l| l.size),
+                        token_read: None,
+                        version: None,
+                        cgroup: proc.cgroup.clone(),
+                        placement: Placement {
+                            cluster: "local".into(),
+                            executor: "browser".into(),
+                            cgroup: proc.cgroup.clone(),
+                        },
+                    };
+                    admitted.push((Ok(exec), stage));
+                }
+                Err(err) => {
+                    // Failed local admission must never leak a minted remote token.
+                    if let Some(tok) = minted_token {
+                        revoke_remote_tokens_state(&self.state, vec![tok]).await;
+                    }
+                    admitted.push((Err(err), stage));
+                }
+            }
+        }
+
+        // Register all admitted stages in `Vfs` locally (ZERO network RPCs).
         let registered: Result<(), JsValue> = async {
             for (res, stage) in &admitted {
                 if let Ok(exec) = res {
                     let cwd = stage["cwd"].as_str().unwrap_or("/");
                     let sid = stage["sessionId"].as_str();
-                    let cloud_allowed = stage["local"]
-                        .get("cloud")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true);
+                    let (identity, token, cloud_allowed) = {
+                        let state = self.state.borrow();
+                        let p = state
+                            .table
+                            .proc(exec.pid)
+                            .ok_or_else(|| fail(Errno::ESRCH.into()))?;
+                        (
+                            p.cred.identity.clone(),
+                            p.cred.remote.as_ref().map(|r| r.token.clone()),
+                            p.cred.cloud_access,
+                        )
+                    };
                     if let Some(parent_pid) = stage["parentPid"].as_u64().map(|p| p as u32) {
-                        let identity = self.cloud_identity(exec.pid, &exec.token).await?;
                         self.proc_fork(parent_pid, exec.pid, 0)?;
                         self.proc_exec_preserve(exec.pid).await?;
                         self.proc_set_creds(
@@ -977,7 +2883,7 @@ impl Kernel {
                             identity.id,
                             identity.group,
                             identity.groups.into_iter().collect(),
-                            Some(exec.token.clone()),
+                            token,
                             cloud_allowed,
                         )?;
                         if !cwd.is_empty() {
@@ -988,10 +2894,11 @@ impl Kernel {
                             .get("serviceGrant")
                             .filter(|v| !v.is_null())
                             .map(Value::to_string);
-                        self.register_exec_in_vfs(
+                        self.register_local_exec_in_vfs(
                             exec.pid,
                             INIT,
-                            &exec.token,
+                            identity,
+                            token,
                             cwd,
                             sid,
                             cloud_allowed,
@@ -1007,109 +2914,73 @@ impl Kernel {
             Ok(())
         }
         .await;
+
         if let Err(error) = registered {
-            // The authority already admitted every successful stage, including later entries.
             for (exec, _) in &admitted {
                 if let Ok(exec) = exec {
                     let _ = self.exit(exec.pid, 126, None, host).await;
                     let _ = self.wait(exec.pid, host).await;
                 }
             }
-            // Failed delivery stays in the normal retryable lifecycle report queue.
-            let _ = self.flush().await;
             return Err(error);
         }
+
         Ok(admitted.into_iter().map(|(res, _)| res).collect())
     }
-
-    /// One call to the machine, its value.
-    async fn one(&self, call: Call, sudo: bool) -> Result<Value, JsValue> {
-        let results = self.send(vec![call], sudo).await.map_err(fail)?;
-        match results.into_iter().next() {
-            Some(Return::Ok(value)) => Ok(value),
-            Some(Return::Err(error)) => Err(fail(error)),
-            None => Err(fail(Error::because(
-                Errno::EIO,
-                "the kernel answered no call",
-            ))),
-        }
-    }
-
-    /// `calls`, after what the machine is still to hear, in one batch: the calls' results. What
-    /// it was to hear goes again with the next batch if this one does not arrive.
-    async fn send(&self, calls: Vec<Call>, sudo: bool) -> std::result::Result<Vec<Return>, Error> {
-        let reports = std::mem::take(&mut self.state.borrow_mut().reports);
-        let told = reports.len();
-        let mut batch = reports.clone();
-        batch.extend(calls);
-        let batch = Batch {
-            calls: batch,
-            umask: None,
-            sudo,
-            pid: None,
-            process: None,
-        };
-        match sys(batch).await {
-            Ok(mut results) => {
-                self.state.borrow_mut().reported += told as u64;
-                Ok(results.split_off(told.min(results.len())))
-            }
-            Err(error) => {
-                let mut state = self.state.borrow_mut();
-                let later = std::mem::take(&mut state.reports);
-                state.reports = reports;
-                state.reports.extend(later);
-                Err(error)
-            }
-        }
-    }
 }
 
-impl State {
-    /// The server releases unused lends when the last live holder of their token ends.
-    fn retain_spare(&mut self) {
-        self.spare.retain(|token, _| {
-            self.processes
-                .values()
-                .any(|local| local.ended.is_none() && &local.token == token)
-        });
-        self.identities.retain(|token, _| {
-            self.processes
-                .values()
-                .any(|local| local.ended.is_none() && &local.token == token)
-        });
+fn parse_account_from_value(val: &Value) -> std::result::Result<LocalAccount, JsValue> {
+    let uid = val["uid"]
+        .as_u64()
+        .ok_or_else(|| fail(Error::because(Errno::EINVAL, "account uid required")))?
+        as u32;
+    let gid = val["gid"].as_u64().unwrap_or(u64::from(uid)) as u32;
+    let mut groups: Vec<u32> = val["groups"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !groups.contains(&gid) {
+        groups.push(gid);
     }
-
-    /// Something the machine is to hear.
-    fn report(&mut self, call: Call) {
-        self.reports.push(call);
-        self.queued += 1;
-    }
-}
-
-/// One batch to the machine: the calls' results.
-async fn sys(batch: Batch) -> std::result::Result<Vec<Return>, Error> {
-    let body = serde_json::to_string(&batch)
-        .map_err(|error| Error::because(Errno::EIO, error.to_string()))?;
-    let raw = kernel_sys(&body)
-        .await
-        .map_err(|error| Error::because(Errno::EIO, format!("{error:?}")))?;
-    let raw = raw
-        .as_string()
-        .ok_or_else(|| Error::because(Errno::EIO, "the kernel's reply is not text"))?;
-    let reply: Value = serde_json::from_str(&raw)
-        .map_err(|error| Error::because(Errno::EIO, error.to_string()))?;
-    let status = reply["status"].as_u64().unwrap_or(0);
-    if status != 200 {
-        let detail = reply["text"].as_str().unwrap_or("system call failed");
-        return Err(Error::because(Errno::EIO, detail.to_string()));
-    }
-    let text = reply["text"]
+    let user = val["user"].as_str().map(str::to_string).unwrap_or_else(|| {
+        if uid == 0 {
+            "root".into()
+        } else if uid == 65534 {
+            "guest".into()
+        } else {
+            uid.to_string()
+        }
+    });
+    let group = val["group"]
         .as_str()
-        .ok_or_else(|| Error::because(Errno::EIO, "the kernel's reply is not text"))?;
-    let results: abi::Results = serde_json::from_str(text)
-        .map_err(|error| Error::because(Errno::EIO, error.to_string()))?;
-    Ok(results.results)
+        .map(str::to_string)
+        .unwrap_or_else(|| user.clone());
+    let home = val["home"].as_str().map(str::to_string).unwrap_or_else(|| {
+        if uid == 0 {
+            "/root".into()
+        } else {
+            "/tmp".into()
+        }
+    });
+    let shell = val["shell"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| "/usr/bin/dash".into());
+    let signed_in = val["signed_in"].as_bool().unwrap_or(uid != 65534);
+    Ok(LocalAccount {
+        uid,
+        gid,
+        groups,
+        user,
+        group,
+        home,
+        shell,
+        signed_in,
+    })
 }
 
 fn parse<T: serde::de::DeserializeOwned>(
@@ -1134,7 +3005,7 @@ fn to_json<T: serde::Serialize>(value: &T) -> std::result::Result<String, JsValu
 }
 
 /// An error as the page reads it: its errno, and what it says.
-fn fail(error: Error) -> JsValue {
+pub(crate) fn fail(error: Error) -> JsValue {
     JsValue::from_str(
         &json!({
             "errno": error.errno,
@@ -1146,15 +3017,59 @@ fn fail(error: Error) -> JsValue {
 
 #[cfg(test)]
 mod tests {
-    /// Contract v2 (L0c, #76) defines HostAdapter v2 and Release v2 ahead of runtime adoption in
-    /// L2.5a/L2.5b (#77, #78). Keep runtime constants at v1 here with zero runtime behavior
-    /// changes until those steps implement v2 and tighten the equality back to `==`.
+    /// All three Contract v2 boundaries (`HostAdapter v2`, `ServiceAuth v2`, `Release v2`) match
+    /// `abi::contract` across `#54` (L3a), `#77` (L2.5a), and `#78` (L2.5b).
     #[test]
     fn versions_match_the_contract() {
-        assert_eq!(super::VERSION, "1");
+        assert_eq!(
+            super::VERSION,
+            abi::contract::HOST_ADAPTER_VERSION.to_string()
+        );
         assert_eq!(abi::contract::HOST_ADAPTER_VERSION, 2);
+        assert_eq!(abi::auth_v2::VERSION, abi::contract::SERVICE_AUTH_VERSION);
         assert_eq!(image::PROTOCOL, abi::contract::RELEASE_VERSION);
         assert_eq!(image::PROTOCOL, 2);
         assert_eq!(image::HOST_ADAPTER, abi::contract::HOST_ADAPTER_VERSION);
+    }
+
+    #[test]
+    fn lazy_mint_refuses_guest_to_root_or_user_escalation() {
+        let guest = os_core::permissions::GUEST;
+        let session_guest = os_core::permissions::GUEST_UID_MIN + 7;
+        // Exact match always allowed.
+        assert!(super::lazy_mint_uid_permitted(0, 0, true, false));
+        assert!(super::lazy_mint_uid_permitted(1000, 1000, true, false));
+        assert!(super::lazy_mint_uid_permitted(guest, guest, false, false));
+        // Uninitialized local guest may bind to a per-session guest uid while unsigned-in.
+        assert!(super::lazy_mint_uid_permitted(
+            guest,
+            session_guest,
+            false,
+            false
+        ));
+        // Guest MUST NEVER rebind to root (0) or a real user (1000), even if !signed_in.
+        assert!(!super::lazy_mint_uid_permitted(guest, 0, false, false));
+        assert!(!super::lazy_mint_uid_permitted(guest, 1000, false, false));
+        assert!(!super::lazy_mint_uid_permitted(guest, 0, true, false));
+        assert!(!super::lazy_mint_uid_permitted(
+            guest,
+            session_guest,
+            true,
+            false
+        ));
+        assert!(!super::lazy_mint_uid_permitted(
+            guest,
+            session_guest,
+            false,
+            true
+        ));
+        // Cross-uid mismatch between real accounts or guest->root is always refused.
+        assert!(!super::lazy_mint_uid_permitted(1000, 0, true, false));
+        assert!(!super::lazy_mint_uid_permitted(
+            session_guest,
+            0,
+            false,
+            false
+        ));
     }
 }

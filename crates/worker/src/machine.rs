@@ -1,54 +1,28 @@
-//! Each browser's machine (owner's plan, 2026-11-02): a Durable Object per process namespace,
-//! by its name (`Db::namespace`), which keeps the process registry (procs.rs) apart from the
-//! filesystem's one authority. Its calls are the registry's (`Call::is_registry`); the client
-//! kernel sends them straight here (the Worker routes a batch marked `X-Registry` by its
-//! browser's cookies), and the authority forwards those a page's batch carries
-//! (`/internal/sys`), with the caller it found.
+//! Narrowed `Machine` Durable Object (`ServiceAuth v2` + per-credential remote `io.max` +
+//! bounded host-loss lease cleanup & durable token revocation).
 //!
-//! Execve asks the authority for the image and credentials (`/internal/exec`); tokenless
-//! account operations resolve the browser identity there once per batch (`/internal/identity`). A pipeline's stages are one such request. What else a
-//! process does, fork, exit, wait, signals, cgroups, stays here, told of in batches by the
-//! kernel that hosts it. A batch that ended processes revokes their tokens at the authority
-//! once, as it answers, so that what they opened closes as they end, as on Linux; one that
-//! cannot is tried again by the alarm.
-//!
-//! Who may make which call, and as whom it acts, is `kernel::registry`'s table: the
-//! registry route and the page both act as the authenticated account; the routing header
-//! grants no privilege. A process acts by its token and snapshot (including os.sys).
+//! Retired process, PID, signal, seat, init-owner, and login-session tables & routes have been
+//! removed cleanly (`docs/architecture/contract.md` §2.1, §2.3, §2.10, §2.12).
 use crate::db::{Db, transact};
-use crate::procs::{Begun, Snapshot};
 use crate::{auth, procs};
-use abi::{BATCH_MAX, Batch, Call, Errno, Error, Exec, Forked, Return};
-use kernel::registry::{self, Acting};
-use os_core::permissions::Identity;
-use serde::Deserialize;
+use abi::auth_v2::{
+    self, AttachResult, INSTANCE_LEASE_SECONDS, RenewResult, Request as AuthRequest,
+    Response as AuthResponse, ServiceCredIssued, TOKENS_MAX, VERSION, negotiate_hello, valid_id,
+};
+use abi::{Errno, Error, Return};
 use serde_json::{Value, json};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+use std::collections::BTreeMap;
 use worker::*;
 
-/// How long a revocation that failed waits to be tried again, in milliseconds.
-const REVOKE_AFTER: i64 = 10_000;
+/// Retry interval (ms) when flushing durable revocations to `OsAuthority` fails transiently.
+const REVOKE_RETRY_MS: i64 = 10_000;
 
 #[durable_object]
 pub struct Machine {
     state: State,
     env: Env,
     ready: Cell<bool>,
-    /// New processes execs were given pids for and have not started yet, as they wait on the
-    /// authority: they count against the namespace's room (`PROC_MAX`) with those running.
-    reserved: Cell<usize>,
-}
-
-/// Pids an exec reserved, given back as it ends, however it ends.
-struct Reservation<'a> {
-    reserved: &'a Cell<usize>,
-    count: usize,
-}
-impl Drop for Reservation<'_> {
-    fn drop(&mut self) {
-        self.reserved
-            .set(self.reserved.get().saturating_sub(self.count));
-    }
 }
 
 impl DurableObject for Machine {
@@ -57,148 +31,38 @@ impl DurableObject for Machine {
             state,
             env,
             ready: Cell::new(false),
-            reserved: Cell::new(0),
         }
     }
+
     async fn fetch(&self, mut req: Request) -> Result<Response> {
-        if !self.ready.get() {
-            procs::create(&self.state.storage().sql())?;
-            self.ready.set(true);
-        }
-        transact(&self.state, |db| {
-            db.expire_processes(auth::now());
-            db.expire_logins(auth::now());
-            db.expire_init(auth::now());
+        self.ensure_schema()?;
+        let now = auth::now();
+        transact(&self.state, move |db| {
+            db.expire_machine_leases(now);
             ((), true)
         })?;
         let path = req.path();
-        let reply = match (req.method(), path.as_str()) {
-            (Method::Post, "/internal/io") => {
-                let ask: crate::resources::IoRequest = req.json().await?;
-                let result = transact(&self.state, move |db| {
-                    let result = db
-                        .resource_io(&ask, js_sys::Date::now() as u64)
-                        .map(|delay| json!({"delay_ms":delay}));
-                    let commit = result.is_ok();
-                    (result, commit)
-                })?;
-                return Response::from_json(&match result {
-                    Ok(v) => Return::Ok(v),
-                    Err(e) => Return::Err(e),
-                });
-            }
-            // A directly routed batch. Any page can set the header; account/token checks
-            // below are the authority for every operation.
-            (Method::Post, "/api/sys") => {
-                if req
-                    .headers()
-                    .get("Content-Length")?
-                    .and_then(|length| length.parse::<u64>().ok())
-                    .is_none_or(|length| length > abi::BATCH_BYTES)
-                {
-                    return Response::error("A batch says its length, and is at most 4 MB", 400);
-                }
-                let Ok(batch) = req.json::<Batch>().await else {
-                    return Response::error("Invalid system call batch", 400);
-                };
-                let header_token = req
-                    .headers()
-                    .get("X-Process-Token")?
-                    .filter(|t| !t.is_empty());
-                let batch_token = batch.process.clone().filter(|t| !t.is_empty());
-                if let (Some(a), Some(b)) = (&header_token, &batch_token)
-                    && a != b
-                {
-                    let reply =
-                        vec![
-                            Return::Err(Error::because(Errno::EPERM, "not this process's token"));
-                            batch.calls.len()
-                        ];
-                    return Response::from_json(&json!(abi::Results { results: reply }));
-                }
-                let token = batch_token.or(header_token);
-                let no_usr_fallback = req
-                    .headers()
-                    .get("X-OS-No-Usr-Fallback")?
-                    .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-                let chroot = req
-                    .headers()
-                    .get("X-OS-Chroot")?
-                    .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-                let ns = Db::namespace(
-                    auth::token_key(&req).as_deref(),
-                    auth::guest_key(&req).as_deref(),
-                );
-                let caller = Caller {
-                    class: if token.is_some() {
-                        registry::Caller::Process
-                    } else {
-                        registry::Caller::Registry
-                    },
-                    ns,
-                    cookie: req.headers().get("Cookie")?,
-                    release: req.headers().get("X-OS-Release")?,
-                    sudo: batch.sudo,
-                    umask: batch.umask.unwrap_or(0o022) & 0o777,
-                    pid: batch.pid,
-                    token,
-                    no_usr_fallback,
-                    chroot,
-                    identity: RefCell::new(None),
-                };
-                self.batch(&caller, batch.calls).await?
-            }
-            // A page's registry calls, as the authority forwards them, with the caller it found.
-            (Method::Post, "/internal/sys") => {
-                let Ok(forwarded) = req.json::<Forwarded>().await else {
-                    return Response::error("Invalid forwarded calls", 400);
-                };
-                let caller = Caller {
-                    class: if forwarded.token.is_some() {
-                        registry::Caller::Process
-                    } else {
-                        registry::Caller::Page
-                    },
-                    ns: forwarded.ns,
-                    cookie: forwarded.cookie,
-                    release: forwarded.release,
-                    sudo: forwarded.sudo,
-                    umask: forwarded.umask & 0o777,
-                    pid: forwarded.pid,
-                    token: forwarded.token,
-                    no_usr_fallback: forwarded.no_usr_fallback,
-                    chroot: forwarded.chroot,
-                    identity: RefCell::new(forwarded.identity.map(Ok)),
-                };
-                self.batch(&caller, forwarded.calls).await?
-            }
-            // The namespace's processes, as /proc lists them at the authority.
-            (Method::Get, "/internal/list") => {
-                let ns = req
-                    .url()?
-                    .query_pairs()
-                    .find(|(name, _)| name == "ns")
-                    .map(|(_, value)| value.into_owned())
-                    .unwrap_or_default();
-                let rows = transact(&self.state, move |db| (db.processes(&ns), false))?;
-                return Response::from_json(&rows);
+        let response = match (req.method(), path.as_str()) {
+            (Method::Post, "/api/service-auth") => self.handle_service_auth(&mut req).await?,
+            (Method::Post, "/internal/io") => self.handle_internal_io(&mut req).await?,
+            // All retired server process registry routes fail closed.
+            (Method::Post, "/api/sys" | "/internal/sys") => {
+                return auth_error_response(&Error::because(
+                    Errno::ENOSYS,
+                    "server process registry has been removed; processes are instance-local",
+                ));
             }
             _ => return Response::error("Not found", 404),
         };
-        // What the batch ended closes at the authority before it answers. Its calls stand
-        // whether or not that can be done now: what cannot, the alarm does.
         self.settle().await;
-        Response::from_json(&json!(abi::Results { results: reply }))
+        Ok(response)
     }
+
     async fn alarm(&self) -> Result<Response> {
-        if !self.ready.get() {
-            procs::create(&self.state.storage().sql())?;
-            self.ready.set(true);
-        }
-        transact(&self.state, |db| {
-            db.expire_processes(auth::now());
-            db.expire_logins(auth::now());
-            db.expire_init(auth::now());
+        self.ensure_schema()?;
+        let now = auth::now();
+        transact(&self.state, move |db| {
+            db.expire_machine_leases(now);
             ((), true)
         })?;
         self.settle().await;
@@ -206,900 +70,572 @@ impl DurableObject for Machine {
     }
 }
 
-/// Registry calls a page's batch carried, as the authority forwards them.
-#[derive(Deserialize)]
-pub struct Forwarded {
-    pub ns: String,
-    #[serde(default)]
-    pub cookie: Option<String>,
-    #[serde(default)]
-    pub release: Option<String>,
-    #[serde(default)]
-    pub sudo: bool,
-    #[serde(default = "umask")]
-    pub umask: u16,
-    #[serde(default)]
-    pub pid: Option<u32>,
-    #[serde(default, rename = "proc")]
-    pub token: Option<String>,
-    #[serde(default)]
-    pub no_usr_fallback: bool,
-    #[serde(default)]
-    pub chroot: bool,
-    /// The page's caller, as the authority found it (root under sudo, if it may).
-    #[serde(default)]
-    pub identity: Option<Identity>,
-    pub calls: Vec<Call>,
-}
-fn umask() -> u16 {
-    0o022
-}
-
-/// Who a batch's calls are from: a browser (its namespace and cookies), as its client kernel,
-/// a page or, with a token, one of its processes; the page's account, once asked of the
-/// authority.
-struct Caller {
-    class: registry::Caller,
-    ns: String,
-    cookie: Option<String>,
-    release: Option<String>,
-    sudo: bool,
-    umask: u16,
-    pid: Option<u32>,
-    token: Option<String>,
-    no_usr_fallback: bool,
-    chroot: bool,
-    identity: RefCell<Option<std::result::Result<Identity, Error>>>,
-}
-
 impl Machine {
-    /// The calls of a batch, in order, each in a transaction of its own. Consecutive execve
-    /// calls, a pipeline's stages, are asked of the authority at once.
-    async fn batch(&self, caller: &Caller, calls: Vec<Call>) -> Result<Vec<Return>> {
-        if calls.len() > BATCH_MAX {
-            return Ok(vec![Return::Err(Error::because(
-                Errno::E2BIG,
-                format!("A batch takes at most {BATCH_MAX} calls"),
-            ))]);
+    fn ensure_schema(&self) -> Result<()> {
+        if !self.ready.get() {
+            procs::create(&self.state.storage().sql())?;
+            self.ready.set(true);
         }
-        let count = calls.len() as u64;
-        transact(&self.state, move |db| {
-            db.observe("syscalls", count);
-            ((), true)
-        })?;
-        let mut results = Vec::with_capacity(calls.len());
-        let mut calls = calls.into_iter().peekable();
-        while let Some(call) = calls.next() {
-            if let Call::Execve { .. } = call {
-                let mut execs = vec![call];
-                while matches!(calls.peek(), Some(Call::Execve { .. })) {
-                    execs.extend(calls.next());
-                }
-                results.extend(self.execve(caller, execs).await?);
-                continue;
-            }
-            results.push(match self.call(caller, call).await? {
-                Ok(value) => Return::Ok(value),
-                Err(error) => Return::Err(error),
-            });
-        }
-        Ok(results)
+        Ok(())
     }
 
-    /// The page's account, as the authority finds it, once a batch asks.
-    async fn identity(&self, caller: &Caller) -> Result<std::result::Result<Identity, Error>> {
-        if let Some(found) = caller.identity.borrow().as_ref() {
-            return Ok(found.clone());
-        }
-        let answer = self
-            .authority(
-                "/internal/identity",
-                caller.cookie.as_deref(),
-                &json!({ "sudo": caller.sudo }),
-            )
-            .await?;
-        let found = match answer {
-            Ok(value) => serde_json::from_value::<Identity>(value)
-                .map_err(|error| Error::because(Errno::EIO, error.to_string())),
-            Err(error) => Err(error),
+    async fn handle_internal_io(&self, req: &mut Request) -> Result<Response> {
+        let ask: crate::resources::IoRequest = match req.json().await {
+            Ok(ask) => ask,
+            Err(_) => {
+                return Response::from_json(&Return::Err(Error::new(Errno::EINVAL)));
+            }
         };
-        *caller.identity.borrow_mut() = Some(found.clone());
-        Ok(found)
-    }
-
-    /// One call that is not an execve.
-    async fn call(&self, caller: &Caller, call: Call) -> Result<std::result::Result<Value, Error>> {
-        let acting = match registry::permit(caller.class, &call) {
-            Ok(acting) => acting,
-            Err(error) => return Ok(Err(error)),
-        };
-        if let Call::MachineInit { action } = call {
-            if caller.sudo {
-                return Ok(Err(Errno::EPERM.into()));
-            }
-            // Validate the current browser context, but never give the host its account's
-            // credentials. Ownership spans login changes inside this same Machine.
-            match self
-                .authority("/internal/login", caller.cookie.as_deref(), &json!({}))
-                .await?
-            {
-                Ok(value) => {
-                    if matches!(action, abi::InitAction::Reboot { .. })
-                        && value["uid"].as_u64() != Some(0)
-                    {
-                        return Ok(Err(Errno::EPERM.into()));
-                    }
-                }
-                Err(error) => return Ok(Err(error)),
-            }
-            let ns = caller.ns.clone();
-            return transact(&self.state, move |db| {
-                let result = db.machine_init(&ns, action, auth::now());
-                let commit = result.is_ok();
-                (result, commit)
-            });
-        }
-        if let Call::LoginSession { action } = call {
-            if caller.sudo {
-                return Ok(Err(Errno::EPERM.into()));
-            }
-            let context = if matches!(
-                action,
-                abi::LoginAction::Leave { .. } | abi::LoginAction::Finish { .. }
-            ) {
-                None
-            } else {
-                match self
-                    .authority("/internal/login", caller.cookie.as_deref(), &json!({}))
-                    .await?
-                {
-                    Ok(value) => match serde_json::from_value::<crate::login::Context>(value) {
-                        Ok(context) => Some(context),
-                        Err(_) => return Ok(Err(Errno::EIO.into())),
-                    },
-                    Err(error) => return Ok(Err(error)),
-                }
-            };
-            let ns = caller.ns.clone();
-            let wake = if let abi::LoginAction::Signal { pid, signal, .. } = &action {
-                Some((*pid, *signal))
-            } else {
-                None
-            };
-            let result = transact(&self.state, move |db| {
-                let result = db.login_session(&ns, context.as_ref(), action, auth::now());
-                let commit = result.is_ok();
-                (result, commit)
-            })?;
-            if let (Ok(_), Some((pid, signal))) = (&result, wake) {
-                let told = json!({ "ns": caller.ns, "value": { "signal": { "pid": pid, "signal": signal } } });
-                let _ = self.authority("/internal/tell", None, &told).await;
-            }
-            return Ok(result);
-        }
-        // What acts as an account acts as the page's, unless a process's token says whose.
-        let identity = match acting {
-            Acting::Account if caller.token.is_none() => match self.identity(caller).await? {
-                Ok(identity) => Some(identity),
-                Err(error) => return Ok(Err(error)),
-            },
-            _ => None,
-        };
-        let (ns, pid, token) = (caller.ns.clone(), caller.pid, caller.token.clone());
-        let reserved = self.reserved.get();
-        let told = call.clone();
+        let now_secs = auth::now();
+        let now_ms = js_sys::Date::now() as u64;
         let result = transact(&self.state, move |db| {
-            let asked = Asked {
-                ns: &ns,
-                pid,
-                token: token.as_deref(),
-                identity: identity.as_ref(),
-                reserved,
-            };
-            let result = run(db, &asked, call);
-            let commit = result.is_ok();
-            (result, commit)
+            let res = db
+                .charge_remote_io(&ask.ns, &ask.token, ask.write, ask.bytes, now_secs, now_ms)
+                .map(|delay_ms| json!({ "delay_ms": delay_ms }));
+            let commit = res.is_ok();
+            (res, commit)
         })?;
-        // A signal is told to the tab that runs the process, on its browser's events line.
-        if let (Ok(_), Call::Kill { pid, signal }) = (&result, told)
-            && signal != Some(0)
-        {
-            // A group signal is only a wakeup hint. Hosts fetch authorized pending
-            // deliveries; the event never supplies membership or credentials.
-            let pid = match abi::Target::of(&pid) {
-                abi::Target::Pid(pid) => pid,
-                _ => 0,
-            };
-            let told = json!({ "ns": caller.ns, "value": { "signal": {
-                "pid": pid,
-                "signal": signal.unwrap_or(abi::SIGTERM),
-            } } });
-            let _ = self.authority("/internal/tell", None, &told).await;
-        }
-        Ok(result)
+        Response::from_json(&match result {
+            Ok(v) => Return::Ok(v),
+            Err(e) => Return::Err(e),
+        })
     }
 
-    /// execve of each of `calls`, a pipeline's stages: the registry gives each a pid, the
-    /// authority checks each image and snapshots the caller in one request, and each process
-    /// starts.
-    async fn execve(&self, caller: &Caller, calls: Vec<Call>) -> Result<Vec<Return>> {
-        if let Some(Err(error)) = calls
-            .first()
-            .map(|call| registry::permit(caller.class, call))
+    async fn handle_service_auth(&self, req: &mut Request) -> Result<Response> {
+        if req
+            .headers()
+            .get("Content-Length")?
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_none_or(|len| len > abi::BATCH_BYTES)
         {
-            return Ok(calls.iter().map(|_| Return::Err(error.clone())).collect());
+            return auth_error_response(&Errno::E2BIG.into());
         }
-        let context = if calls
-            .iter()
-            .any(|call| matches!(call, Call::Execve { pid: None, .. }))
-        {
-            match self
-                .authority("/internal/login", caller.cookie.as_deref(), &json!({}))
-                .await?
-            {
-                Ok(value) => match serde_json::from_value::<crate::login::Context>(value) {
-                    Ok(context) => Some(context),
-                    Err(_) => {
-                        return Ok(calls
-                            .iter()
-                            .map(|_| Return::Err(Errno::EIO.into()))
-                            .collect());
-                    }
-                },
-                Err(error) => {
-                    return Ok(calls.iter().map(|_| Return::Err(error.clone())).collect());
-                }
-            }
-        } else {
-            None
+        let body = req.text().await?;
+        let Ok(raw_val) = serde_json::from_str::<Value>(&body) else {
+            return auth_error_response(&Error::because(Errno::EINVAL, "invalid ServiceAuth JSON"));
         };
+        // Check explicit top-level `version` field if present on non-hello messages.
+        if let Some(ver) = raw_val.get("version").and_then(Value::as_u64)
+            && ver != u64::from(VERSION)
+        {
+            return auth_error_response(&Error::because(
+                Errno::EPROTONOSUPPORT,
+                format!("ServiceAuth v{VERSION} required"),
+            ));
+        }
+        let Ok(parsed) = serde_json::from_value::<AuthRequest>(raw_val) else {
+            return auth_error_response(&Error::because(
+                Errno::EINVAL,
+                "invalid ServiceAuth v2 request",
+            ));
+        };
+        let ns = Db::namespace(
+            auth::token_key(req).as_deref(),
+            auth::guest_key(req).as_deref(),
+        );
+        let cookie = req.headers().get("Cookie")?;
+        let release = req.headers().get("X-OS-Release")?;
         let now = auth::now();
-        let ns = caller.ns.clone();
-        let asked: Vec<Call> = calls.clone();
-        let reserved = self.reserved.get();
-        // First, each stage's pid; what fails here is not asked further. A new process's pid
-        // counts against the namespace's room until it starts, with those other execs hold.
-        let begun: Vec<std::result::Result<Begun, Error>> = transact(&self.state, move |db| {
-            let mut new = 0;
-            let begun: Vec<_> = asked
-                .iter()
-                .map(|call| match call {
-                    Call::Execve {
-                        pid,
-                        token,
-                        argv,
-                        env,
-                        cgroup,
-                        local,
-                        runtime,
-                        ..
-                    } => {
-                        if local.is_some()
-                            && !matches!(
-                                runtime.as_deref(),
-                                Some(
-                                    "resources-v1"
-                                        | "resources-v1:chroot"
-                                        | "resources-v1:no-usr-fallback"
-                                )
-                            )
-                        {
-                            return Err(Errno::EINVAL.into());
-                        }
-                        let scope = if pid.is_none() {
-                            match context
-                                .as_ref()
-                                .ok_or(Error::from(Errno::EACCES))
-                                .and_then(|context| db.admit_login(&ns, context, now))
-                            {
-                                Ok(scope) => Some(scope),
-                                Err(error) => return Err(error),
-                            }
-                        } else {
-                            None
-                        };
-                        let mut begun = db.exec_begin(
-                            &ns,
-                            *pid,
-                            token.as_deref(),
-                            argv,
-                            env,
-                            cgroup.as_deref(),
-                            reserved + new,
-                            now,
-                        );
-                        if let Ok(begun) = &mut begun
-                            && begun.replacing.is_none()
-                        {
-                            begun.scope = scope;
-                        }
-                        if matches!(&begun, Ok(begun) if begun.replacing.is_none()) {
-                            new += 1;
-                        }
-                        begun
-                    }
-                    _ => Err(Errno::EINVAL.into()),
-                })
-                .collect();
-            (begun, true)
-        })?;
-        let count = begun
-            .iter()
-            .filter(|begun| matches!(begun, Ok(begun) if begun.replacing.is_none()))
-            .count();
-        self.reserved.set(self.reserved.get() + count);
-        let _reservation = Reservation {
-            reserved: &self.reserved,
-            count,
-        };
-        let tokens: Vec<String> = calls.iter().map(|_| auth::random_token()).collect();
-        let execs: Vec<Value> = calls
-            .iter()
-            .zip(&begun)
-            .zip(&tokens)
-            .filter_map(|((call, begun), token)| {
-                let (
-                    Call::Execve {
-                        path,
-                        local,
-                        cwd,
-                        seat,
-                        cgroup,
-                        runtime,
-                        ..
-                    },
-                    Ok(begun),
-                ) = (call, begun)
-                else {
-                    return None;
-                };
-                let rt_chroot =
-                    matches!(runtime.as_deref(), Some("chroot" | "resources-v1:chroot"));
-                let rt_no_usr = matches!(
-                    runtime.as_deref(),
-                    Some("no-usr-fallback" | "resources-v1:no-usr-fallback")
-                );
-                Some(json!({
-                    "pid": begun.pid,
-                    "token": auth::token_hash(token),
-                    "path": path,
-                    "local": local,
-                    "cwd": cwd,
-                    "seat": seat.as_ref().or(begun.seat.as_ref()),
-                    "cgroup": begun.cgroup.as_ref().or(cgroup.as_ref()),
-                    "replacing": begun.replacing,
-                    "old": begun.old,
-                    "current": begun.current,
-                    "generation": caller.release,
-                    "no_usr_fallback": caller.no_usr_fallback || rt_no_usr || rt_chroot,
-                    "chroot": caller.chroot || rt_chroot,
-                }))
-            })
-            .collect();
-        let revoke = transact(&self.state, |db| (db.revoking(), false))?;
-        let answered = if execs.is_empty() {
-            Ok(Value::Null)
-        } else {
-            self.authority(
-                "/internal/exec",
-                caller.cookie.as_deref(),
-                &json!({
-                    "ns": caller.ns,
-                    "sudo": caller.sudo,
-                    "umask": caller.umask,
-                    "no_usr_fallback": caller.no_usr_fallback,
-                    "chroot": caller.chroot,
-                    "execs": execs,
-                    "revoke": revoke,
-                }),
-            )
-            .await?
-        };
-        // The revocations it took went with an answer, not a refusal: only then are they done.
-        let mut images: Vec<Return> = match answered {
-            Ok(value) => {
-                let images = serde_json::from_value(value["results"].clone()).unwrap_or_default();
-                let revoked = revoke.clone();
-                transact(&self.state, move |db| {
-                    db.revoked(&revoked);
-                    ((), true)
+
+        match parsed {
+            AuthRequest::Hello(hello) => match negotiate_hello(&hello) {
+                Ok(welcome) => Response::from_json(&AuthResponse::Welcome(welcome)),
+                Err(err) => auth_error_response(&err),
+            },
+            AuthRequest::AttachInstance(attach) => {
+                if !valid_id(&attach.instance.instance)
+                    || !valid_id(&attach.instance.host)
+                    || !valid_id(&attach.host_proof)
+                {
+                    return auth_error_response(&Errno::EINVAL.into());
+                }
+                let ns_c = ns.clone();
+                let res = transact(&self.state, move |db| {
+                    let r = db.attach_instance(
+                        &ns_c,
+                        &attach.instance.instance,
+                        &attach.instance.host,
+                        &attach.host_proof,
+                        now,
+                    );
+                    let commit = r.is_ok();
+                    (r, commit)
                 })?;
-                images
+                match res {
+                    Ok(row) => Response::from_json(&AuthResponse::Attached(AttachResult {
+                        version: VERSION,
+                        instance_id: row.instance_id,
+                        lease_seconds: INSTANCE_LEASE_SECONDS,
+                        host_epoch: row.host_epoch,
+                    })),
+                    Err(err) => auth_error_response(&err),
+                }
             }
-            Err(error) => execs.iter().map(|_| Return::Err(error.clone())).collect(),
-        };
-        images.reverse();
-        let mut results = Vec::with_capacity(calls.len());
-        for ((call, begun), token) in calls.into_iter().zip(begun).zip(tokens) {
-            let begun = match begun {
-                Ok(begun) => begun,
-                Err(error) => {
-                    results.push(Return::Err(error));
-                    continue;
+            AuthRequest::MintServiceCred(mint) => {
+                if !valid_id(&mint.instance_id) || !valid_id(&mint.host_proof) {
+                    return auth_error_response(&Errno::EINVAL.into());
                 }
-            };
-            let image = match images.pop() {
-                Some(Return::Ok(image)) => image,
-                Some(Return::Err(error)) => {
-                    results.push(Return::Err(error));
-                    continue;
+                let ns_v = ns.clone();
+                let inst_v = mint.instance_id.clone();
+                let proof_v = mint.host_proof.clone();
+                let verified = transact(&self.state, move |db| {
+                    (db.verify_instance(&ns_v, &inst_v, &proof_v, now), false)
+                })?;
+                if let Err(err) = verified {
+                    return auth_error_response(&err);
                 }
-                None => {
-                    results.push(Return::Err(Error::because(
-                        Errno::EIO,
-                        "the authority answered no image",
-                    )));
-                    continue;
+                let raw_token = auth::random_token();
+                let token_hash = auth::token_hash(&raw_token);
+                let cgroup = mint.cgroup.clone().unwrap_or_else(|| "/user".into());
+                let generation = mint.generation.clone().or_else(|| release.clone());
+                let authority_body = json!({
+                    "ns": ns,
+                    "instance_id": mint.instance_id,
+                    "token_hash": token_hash,
+                    "scope": mint.scope,
+                    "cloud_access": mint.cloud_access,
+                    "umask": mint.umask & 0o777,
+                    "cgroup": cgroup,
+                    "generation": generation,
+                    "sudo": mint.sudo,
+                });
+                let auth_resp = self
+                    .call_authority(
+                        "/internal/service-auth/mint",
+                        cookie.as_deref(),
+                        release.as_deref(),
+                        authority_body,
+                    )
+                    .await;
+                let minted = match auth_resp {
+                    Ok(val) => val,
+                    Err(err) => return auth_error_response(&err),
+                };
+                let uid = minted["uid"].as_u64().unwrap_or(65534) as u32;
+                let gid = minted["gid"].as_u64().unwrap_or(65534) as u32;
+                let groups: Vec<u32> =
+                    serde_json::from_value(minted["groups"].clone()).unwrap_or_else(|_| vec![gid]);
+                let umask = minted["umask"].as_u64().unwrap_or(0o022) as u16;
+                let cloud_access = minted["cloud_access"].as_bool().unwrap_or(false);
+                let scope: auth_v2::RemoteScope =
+                    serde_json::from_value(minted["scope"].clone()).unwrap_or_default();
+                let expires = minted["expires"]
+                    .as_u64()
+                    .unwrap_or_else(|| now.saturating_add(abi::PROCESS_TOKEN_TTL));
+                let lineage = minted["lineage"].as_str().unwrap_or_default().to_string();
+
+                let ns_r = ns.clone();
+                let inst_r = mint.instance_id.clone();
+                let tok_r = raw_token.clone();
+                let lin_r = lineage.clone();
+                let cg_r = cgroup.clone();
+                let scope_r = scope.clone();
+                let rec = transact(&self.state, move |db| {
+                    let r = db.record_service_token(
+                        &ns_r,
+                        &inst_r,
+                        &tok_r,
+                        uid,
+                        gid,
+                        &lin_r,
+                        &cg_r,
+                        &scope_r,
+                        cloud_access,
+                        expires,
+                        now,
+                    );
+                    let commit = r.is_ok();
+                    (r, commit)
+                })?;
+                if let Err(err) = rec {
+                    return auth_error_response(&err);
                 }
-            };
-            let Call::Execve {
-                argv,
-                env,
-                cwd,
-                cgroup,
-                seat,
-                runtime,
-                ..
-            } = call
-            else {
-                continue;
-            };
-            let snapshot: Snapshot = match serde_json::from_value(image.clone()) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    results.push(Return::Err(Error::because(Errno::EIO, error.to_string())));
-                    continue;
+                Response::from_json(&AuthResponse::Cred(ServiceCredIssued {
+                    version: VERSION,
+                    token: raw_token,
+                    uid,
+                    gid,
+                    groups,
+                    umask,
+                    cloud_access,
+                    scope,
+                    expires,
+                    instance_id: mint.instance_id,
+                    lineage,
+                }))
+            }
+            AuthRequest::DeriveServiceCred(derive) => {
+                if !valid_id(&derive.instance_id)
+                    || !valid_id(&derive.host_proof)
+                    || derive.parent_token.is_empty()
+                {
+                    return auth_error_response(&Errno::EINVAL.into());
                 }
-            };
-            // A replaced process stays in its cgroup.
-            let cgroup = begun
-                .cgroup
-                .clone()
-                .or(cgroup)
-                .unwrap_or_else(|| "/user".into());
-            let seat = seat.or_else(|| begun.seat.clone());
-            let path = image["path"].as_str().unwrap_or_default().to_string();
-            let (ns, hash) = (caller.ns.clone(), auth::token_hash(&token));
-            let row = (begun.clone(), path.clone(), cgroup.clone());
-            let uid = snapshot.uid;
-            let placement_seat = seat.clone();
-            let normalized_runtime = match runtime.as_deref() {
-                Some("resources-v1:chroot" | "resources-v1:no-usr-fallback") => {
-                    Some("resources-v1".to_string())
+                let ns_v = ns.clone();
+                let inst_v = derive.instance_id.clone();
+                let proof_v = derive.host_proof.clone();
+                let ptok_v = derive.parent_token.clone();
+                let parent_row = transact(&self.state, move |db| {
+                    let r = db
+                        .verify_instance(&ns_v, &inst_v, &proof_v, now)
+                        .and_then(|_| {
+                            db.service_token_for_instance(&ns_v, &inst_v, &ptok_v, now)
+                                .ok_or_else(|| {
+                                    Error::because(
+                                        Errno::EACCES,
+                                        "parent token not owned by instance",
+                                    )
+                                })
+                        });
+                    (r, false)
+                })?;
+                let parent_row = match parent_row {
+                    Ok(r) => r,
+                    Err(err) => return auth_error_response(&err),
+                };
+                let parent_scope: auth_v2::RemoteScope =
+                    serde_json::from_str(&parent_row.scope).unwrap_or_default();
+                let attenuated_scope = parent_scope.attenuate(&derive.scope);
+                let attenuated_cloud = (parent_row.cloud_access != 0) && derive.cloud_access;
+                let new_raw = auth::random_token();
+                let new_hash = auth::token_hash(&new_raw);
+                let cgroup = derive.cgroup.clone().unwrap_or(parent_row.cgroup.clone());
+                let body = json!({
+                    "ns": ns,
+                    "instance_id": derive.instance_id,
+                    "parent_hash": parent_row.token_hash,
+                    "new_hash": new_hash,
+                    "scope": attenuated_scope,
+                    "cloud_access": attenuated_cloud,
+                    "umask": derive.umask.map(|m| m & 0o777),
+                    "cgroup": cgroup,
+                    "revoke_parent": derive.revoke_parent,
+                });
+                let derived = match self
+                    .call_authority(
+                        "/internal/service-auth/derive",
+                        cookie.as_deref(),
+                        release.as_deref(),
+                        body,
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(err) => return auth_error_response(&err),
+                };
+                let uid = derived["uid"].as_u64().unwrap_or(u64::from(parent_row.uid)) as u32;
+                let gid = derived["gid"].as_u64().unwrap_or(u64::from(parent_row.gid)) as u32;
+                let groups: Vec<u32> =
+                    serde_json::from_value(derived["groups"].clone()).unwrap_or_else(|_| vec![gid]);
+                let umask = derived["umask"].as_u64().unwrap_or(0o022) as u16;
+                let expires = derived["expires"]
+                    .as_u64()
+                    .unwrap_or_else(|| now.saturating_add(abi::PROCESS_TOKEN_TTL));
+                let lineage = derived["lineage"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or(parent_row.lineage);
+                let ns_r = ns.clone();
+                let inst_r = derive.instance_id.clone();
+                let raw_r = new_raw.clone();
+                let lin_r = lineage.clone();
+                let cg_r = cgroup.clone();
+                let sc_r = attenuated_scope.clone();
+                let ph_r = parent_row.token_hash.clone();
+                let revoke_parent = derive.revoke_parent;
+                let rec = transact(&self.state, move |db| {
+                    let r = db.record_service_token(
+                        &ns_r,
+                        &inst_r,
+                        &raw_r,
+                        uid,
+                        gid,
+                        &lin_r,
+                        &cg_r,
+                        &sc_r,
+                        attenuated_cloud,
+                        expires,
+                        now,
+                    );
+                    if r.is_ok() {
+                        db.inherit_remote_io_quota(&ns_r, &inst_r, &ph_r, &raw_r, &cg_r);
+                        if revoke_parent {
+                            db.drop_service_token_hash(&ns_r, &ph_r);
+                        }
+                    }
+                    let commit = r.is_ok();
+                    (r, commit)
+                })?;
+                if let Err(err) = rec {
+                    return auth_error_response(&err);
                 }
-                Some("chroot" | "no-usr-fallback") => None,
-                other => other.map(str::to_string),
-            };
-            let started = transact(&self.state, move |db| {
-                let (begun, path, cgroup) = row;
-                let started = db.exec_end(
-                    &ns,
-                    &begun,
-                    &snapshot,
-                    &hash,
-                    &path,
-                    &argv,
-                    &env,
-                    &cwd,
-                    &cgroup,
-                    seat.as_deref(),
-                    normalized_runtime.as_deref(),
-                    now,
-                );
-                if started.is_ok() {
-                    db.observe("execs", 1);
+                Response::from_json(&AuthResponse::Cred(ServiceCredIssued {
+                    version: VERSION,
+                    token: new_raw,
+                    uid,
+                    gid,
+                    groups,
+                    umask,
+                    cloud_access: attenuated_cloud,
+                    scope: attenuated_scope,
+                    expires,
+                    instance_id: derive.instance_id,
+                    lineage,
+                }))
+            }
+            AuthRequest::RenewInstance(renew) => {
+                if !valid_id(&renew.instance_id)
+                    || !valid_id(&renew.host_proof)
+                    || renew.active_tokens.len() > TOKENS_MAX
+                {
+                    return auth_error_response(&Errno::EINVAL.into());
                 }
-                (started, true)
-            })?;
-            let cgroup = match started {
-                Ok(cgroup) => cgroup,
-                Err(error) => {
-                    results.push(Return::Err(error));
-                    continue;
+                let ns_r = ns.clone();
+                let inst_r = renew.instance_id.clone();
+                let proof_r = renew.host_proof.clone();
+                let active_r = renew.active_tokens.clone();
+                let owned = transact(&self.state, move |db| {
+                    let r = db.renew_instance_tokens(&ns_r, &inst_r, &proof_r, &active_r, now);
+                    let commit = r.is_ok();
+                    (r, commit)
+                })?;
+                let owned = match owned {
+                    Ok(v) => v,
+                    Err(err) => return auth_error_response(&err),
+                };
+                let mut revoked_raw = Vec::new();
+                // Any active token NOT owned by this instance is reported revoked immediately.
+                for raw in &renew.active_tokens {
+                    if !owned.iter().any(|(r, _)| r == raw) {
+                        revoked_raw.push(raw.clone());
+                    }
                 }
-            };
-            let placement =
-                crate::placement::browser(&caller.ns, uid, placement_seat.as_deref(), &cgroup);
-            results.push(Return::Ok(json!(Exec {
-                pid: begun.pid,
-                boot: Some(begun.boot),
-                login_scope: begun.scope,
-                token,
-                local: serde_json::from_value(image["local"].clone()).unwrap_or(None),
-                fd: image["fd"].as_u64().map(|fd| fd as u32),
-                asset: image["asset"].as_str().map(str::to_string),
-                path: Some(path),
-                size: image["size"].as_u64().unwrap_or(0),
-                token_read: image["token_read"].as_str().map(str::to_string),
-                version: image["version"].as_str().map(str::to_string),
-                cgroup,
-                placement,
-            })));
+                if !owned.is_empty() {
+                    let hashes: Vec<String> = owned.iter().map(|(_, h)| h.clone()).collect();
+                    if let Ok(val) = self
+                        .call_authority(
+                            "/internal/service-auth/renew",
+                            cookie.as_deref(),
+                            release.as_deref(),
+                            json!({ "ns": ns, "hashes": hashes }),
+                        )
+                        .await
+                    {
+                        let dead_hashes: Vec<String> =
+                            serde_json::from_value(val["revoked"].clone()).unwrap_or_default();
+                        if !dead_hashes.is_empty() {
+                            let ns_d = ns.clone();
+                            let dead_d = dead_hashes.clone();
+                            let _ = transact(&self.state, move |db| {
+                                for h in &dead_d {
+                                    db.drop_service_token_hash(&ns_d, h);
+                                }
+                                ((), true)
+                            });
+                            for (raw, hash) in &owned {
+                                if dead_hashes.contains(hash) {
+                                    revoked_raw.push(raw.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                Response::from_json(&AuthResponse::Renewed(RenewResult {
+                    version: VERSION,
+                    lease_seconds: INSTANCE_LEASE_SECONDS,
+                    revoked: revoked_raw,
+                }))
+            }
+            AuthRequest::RevokeTokens(rev) => {
+                if !valid_id(&rev.instance_id)
+                    || !valid_id(&rev.host_proof)
+                    || rev.tokens.len() > TOKENS_MAX
+                {
+                    return auth_error_response(&Errno::EINVAL.into());
+                }
+                let ns_r = ns.clone();
+                let inst_r = rev.instance_id.clone();
+                let proof_r = rev.host_proof.clone();
+                let toks_r = rev.tokens.clone();
+                let res = transact(&self.state, move |db| {
+                    let r = db
+                        .verify_instance(&ns_r, &inst_r, &proof_r, now)
+                        .map(|_| db.queue_token_revocations(&ns_r, &inst_r, &toks_r, now));
+                    let commit = r.is_ok();
+                    (r, commit)
+                })?;
+                match res {
+                    Ok(count) => Response::from_json(&AuthResponse::Revoked { count }),
+                    Err(err) => auth_error_response(&err),
+                }
+            }
+            AuthRequest::DetachInstance(det) => {
+                if !valid_id(&det.instance_id) || !valid_id(&det.host_proof) {
+                    return auth_error_response(&Errno::EINVAL.into());
+                }
+                let ns_d = ns.clone();
+                let inst_d = det.instance_id.clone();
+                let proof_d = det.host_proof.clone();
+                let res = transact(&self.state, move |db| {
+                    let r = db.detach_instance(&ns_d, &inst_d, &proof_d, now);
+                    let commit = r.is_ok();
+                    (r, commit)
+                })?;
+                match res {
+                    Ok(revoked) => Response::from_json(&AuthResponse::Detached { revoked }),
+                    Err(err) => auth_error_response(&err),
+                }
+            }
+            AuthRequest::SetRemoteIoQuota(quota) => {
+                if !valid_id(&quota.instance_id)
+                    || !valid_id(&quota.host_proof)
+                    || quota.token.is_empty()
+                    || quota.cgroup.is_empty()
+                    || quota.cgroup.len() > 256
+                {
+                    return auth_error_response(&Errno::EINVAL.into());
+                }
+                let ns_q = ns.clone();
+                let res = transact(&self.state, move |db| {
+                    let r = db.set_remote_io_quota(
+                        &ns_q,
+                        &quota.instance_id,
+                        &quota.host_proof,
+                        &quota.token,
+                        &quota.cgroup,
+                        quota.rbps,
+                        quota.wbps,
+                        now,
+                    );
+                    let commit = r.is_ok();
+                    (r, commit)
+                })?;
+                match res {
+                    Ok(()) => Response::from_json(&AuthResponse::QuotaSet),
+                    Err(err) => auth_error_response(&err),
+                }
+            }
         }
-        Ok(results)
     }
 
-    /// Ask the authority `endpoint`, with the browser's cookies: its value, or its errno.
-    async fn authority(
+    async fn call_authority(
         &self,
         endpoint: &str,
         cookie: Option<&str>,
-        body: &Value,
-    ) -> Result<std::result::Result<Value, Error>> {
+        release: Option<&str>,
+        body: Value,
+    ) -> std::result::Result<Value, Error> {
+        let map = |e: worker::Error| Error::because(Errno::EIO, e.to_string());
         let headers = Headers::new();
-        headers.set("Content-Type", "application/json")?;
+        headers
+            .set("Content-Type", "application/json")
+            .map_err(map)?;
         if let Some(cookie) = cookie {
-            headers.set("Cookie", cookie)?;
+            headers.set("Cookie", cookie).map_err(map)?;
+        }
+        if let Some(release) = release {
+            headers.set("X-OS-Release", release).map_err(map)?;
         }
         let mut init = RequestInit::new();
         init.with_method(Method::Post)
             .with_headers(headers)
             .with_body(Some(body.to_string().into()));
-        let req = Request::new_with_init(&format!("https://authority{endpoint}"), &init)?;
-        let mut response = self
+        let req =
+            Request::new_with_init(&format!("https://authority{endpoint}"), &init).map_err(map)?;
+        let mut resp = self
             .env
-            .durable_object("AUTHORITY")?
-            .id_from_name("filesystem")?
-            .get_stub()?
+            .durable_object("AUTHORITY")
+            .map_err(map)?
+            .id_from_name("filesystem")
+            .map_err(map)?
+            .get_stub()
+            .map_err(map)?
             .fetch_with_request(req)
-            .await?;
-        let status = response.status_code();
-        let value: Value = response.json().await.unwrap_or(Value::Null);
-        if status == 200 {
-            return Ok(Ok(value));
+            .await
+            .map_err(map)?;
+        let status = resp.status_code();
+        let val: Value = resp.json().await.map_err(map)?;
+        if status >= 400 {
+            let errno = val
+                .get("errno")
+                .and_then(|v| serde_json::from_value::<Errno>(v.clone()).ok())
+                .unwrap_or(match status {
+                    401 | 403 => Errno::EACCES,
+                    404 => Errno::ENOENT,
+                    409 => Errno::EBUSY,
+                    412 => Errno::ESTALE,
+                    _ => Errno::EIO,
+                });
+            let detail = val["error"]
+                .as_str()
+                .unwrap_or_else(|| errno.text())
+                .to_string();
+            return Err(Error::because(errno, detail));
         }
-        let errno = serde_json::from_value(value["errno"].clone()).unwrap_or(Errno::EIO);
-        let detail = value["error"]
-            .as_str()
-            .unwrap_or("the authority refused")
-            .to_string();
-        Ok(Err(Error::because(errno, detail)))
+        Ok(val)
     }
 
-    /// Revoke what waits to be revoked, and wake to try again if any of it is left: a failure
-    /// is logged, not answered, as the calls that ended the processes stand.
+    /// Flush all queued token revocations to `OsAuthority` `/internal/revoke` and schedule the
+    /// next DO alarm for host-loss expiration or durable revocation retry.
     async fn settle(&self) {
-        if let Err(error) = self.flush().await {
-            console_error!("revocation failed: {error}");
+        let pending = match transact(&self.state, |db| (db.pending_revocations(), false)) {
+            Ok(list) => list,
+            Err(_) => return,
+        };
+        let mut by_ns: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for item in pending {
+            by_ns.entry(item.ns).or_default().push(item.token_hash);
         }
-        if let Err(error) = self.schedule().await {
-            console_error!("the revocation alarm could not be set: {error}");
-        }
-    }
-
-    /// Revoke at the authority the tokens no process holds any more.
-    async fn flush(&self) -> Result<()> {
-        let (ns, tokens, renew) = transact(&self.state, |db| {
-            ((db.namespace_id(), db.revoking(), db.renewing()), false)
-        })?;
-        let Some(ns) = ns else { return Ok(()) };
-        if tokens.is_empty() && renew.is_empty() {
-            return Ok(());
-        }
-        if self
-            .authority(
-                "/internal/revoke",
-                None,
-                &json!({ "ns": ns, "tokens": tokens, "renew": renew }),
-            )
-            .await?
-            .is_ok()
-        {
-            transact(&self.state, move |db| {
-                db.revoked(&tokens);
-                db.renewed(&renew);
-                ((), true)
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Wake to revoke what waits, if anything does and no alarm is set.
-    async fn schedule(&self) -> Result<()> {
-        let deadline = transact(&self.state, |db| {
-            let retry = (!db.revoking().is_empty() || !db.renewing().is_empty())
-                .then_some(auth::now() + REVOKE_AFTER as u64 / 1000);
-            let next = [
-                retry,
-                db.lease_deadline(),
-                db.login_deadline(),
-                db.init_deadline(),
-            ]
-            .into_iter()
-            .flatten()
-            .min();
-            (next, false)
-        })?;
-        if let Some(deadline) = deadline {
-            let storage = self.state.storage();
-            let when = deadline as f64 * 1000.0;
-            if storage
-                .get_alarm()
-                .await?
-                .is_none_or(|alarm| alarm as f64 > when)
+        let mut retry_needed = false;
+        for (ns, hashes) in by_ns {
+            let body = json!({ "ns": ns, "tokens": hashes, "renew": [] });
+            match self
+                .call_authority("/internal/revoke", None, None, body)
+                .await
             {
-                storage
-                    .set_alarm(((deadline.saturating_sub(auth::now()) * 1000) as i64).max(1))
-                    .await?;
+                Ok(_) => {
+                    let ns_c = ns.clone();
+                    let hashes_c = hashes.clone();
+                    let _ = transact(&self.state, move |db| {
+                        db.clear_revocations(&ns_c, &hashes_c);
+                        ((), true)
+                    });
+                }
+                Err(_) => {
+                    retry_needed = true;
+                }
             }
         }
-        Ok(())
+        let next_exp = transact(&self.state, |db| (db.next_machine_expiry(), false))
+            .ok()
+            .flatten();
+        let now_ms = js_sys::Date::now() as i64;
+        let next_ms = match (retry_needed, next_exp) {
+            (true, Some(exp)) => Some((now_ms + REVOKE_RETRY_MS).min((exp as i64) * 1000)),
+            (true, None) => Some(now_ms + REVOKE_RETRY_MS),
+            (false, Some(exp)) => Some(((exp as i64) * 1000).max(now_ms + 1000)),
+            (false, None) => None,
+        };
+        if let Some(at) = next_ms {
+            let _ = self.state.storage().set_alarm(at).await;
+        }
     }
 }
 
-/// The machine of the namespace `ns`.
-fn stub(env: &Env, ns: &str) -> Result<Stub> {
-    env.durable_object("MACHINE")?.id_from_name(ns)?.get_stub()
-}
-
-/// The registry calls a page's batch carried, asked of its browser's machine with the caller
-/// the authority finds (root under sudo, if it may; none, and the machine asks again for the
-/// error, if not).
-pub async fn forward(
-    env: &Env,
-    state: &State,
-    session: &crate::sys::Session,
-    cookie: Option<String>,
-    calls: Vec<Call>,
-) -> Result<Vec<Return>> {
-    let (key, guest, sudo) = (session.key.clone(), session.guest.clone(), session.sudo);
-    let identity = transact(state, move |db| {
-        (
-            crate::sys::caller(db, key.as_deref(), guest.as_deref(), sudo).ok(),
-            true,
-        )
-    })?;
-    let ns = Db::namespace(session.key.as_deref(), session.guest.as_deref());
-    let count = calls.len();
-    let body = json!({
-        "ns": ns,
-        "cookie": cookie,
-        "release": session.release,
-        "sudo": session.sudo,
-        "umask": session.umask.unwrap_or(0o022),
-        "pid": session.pid,
-        "proc": session.token,
-        "no_usr_fallback": session.no_usr_fallback,
-        "chroot": session.chroot,
-        "identity": identity,
-        "calls": calls,
-    });
-    let headers = Headers::new();
-    headers.set("Content-Type", "application/json")?;
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post)
-        .with_headers(headers)
-        .with_body(Some(body.to_string().into()));
-    let req = Request::new_with_init("https://machine/internal/sys", &init)?;
-    let mut response = stub(env, &ns)?.fetch_with_request(req).await?;
-    let results = match response.json::<abi::Results>().await {
-        Ok(results) if response.status_code() == 200 => results.results,
-        _ => (0..count)
-            .map(|_| {
-                Return::Err(Error::because(
-                    Errno::EIO,
-                    "the browser's machine did not answer",
-                ))
-            })
-            .collect(),
+fn auth_error_response(err: &Error) -> Result<Response> {
+    let status = match err.errno {
+        Errno::EACCES | Errno::EPERM => 403,
+        Errno::ENOENT => 404,
+        Errno::EBUSY | Errno::EEXIST => 409,
+        Errno::ESTALE => 412,
+        Errno::E2BIG => 413,
+        Errno::EAGAIN => 429,
+        Errno::ENOSYS => 501,
+        _ => 400,
     };
-    Ok(results)
-}
-
-/// The processes of the namespace `ns`, as its machine has them, for /proc.
-pub async fn list(env: &Env, ns: &str) -> Result<Vec<procs::Row>> {
-    let url = format!(
-        "https://machine/internal/list?ns={}",
-        js_sys::encode_uri_component(ns)
-    );
-    let mut response = stub(env, ns)?.fetch_with_str(&url).await?;
-    Ok(response.json().await.unwrap_or_default())
-}
-
-/// Who a registry call is from, as the machine found it: its namespace, the process's pid and
-/// token (a process's call), the account it acts as (the page's, for the kernel's and the
-/// page's calls that act as one), and the pids reserved by execs still asking the authority.
-struct Asked<'a> {
-    ns: &'a str,
-    pid: Option<u32>,
-    token: Option<&'a str>,
-    identity: Option<&'a Identity>,
-    reserved: usize,
-}
-
-/// A registry call that is not an execve, which `registry::permit` let its caller make.
-fn run(db: &mut Db, asked: &Asked, call: Call) -> std::result::Result<Value, Error> {
-    let ns = asked.ns;
-    let caller = match asked.token {
-        Some(token) => Some(
-            db.process_token(token, asked.pid, ns)
-                .ok_or_else(|| Error::because(Errno::EPERM, "not this process's token"))?,
-        ),
-        None => None,
-    };
-    if caller.as_ref().is_some_and(|row| row.pid == procs::INIT) {
-        registry::permit_reaper(&call)?;
-    }
-    let now = auth::now();
-    let process = || {
-        caller
-            .as_ref()
-            .ok_or_else(|| Error::because(Errno::EPERM, "a process's call"))
-    };
-    // The account a call acts as: the process's snapshot, or the page's.
-    let account = || {
-        caller
-            .as_ref()
-            .map(procs::Row::identity)
-            .or_else(|| asked.identity.cloned())
-            .ok_or(Error::from(Errno::EPERM))
-    };
-    match call {
-        Call::Resource { memory } => db.resource_memory(process()?, memory).map(|_| json!(null)),
-        Call::ProcInit { boot } => Ok(db.proc_init(ns, &account()?, boot.as_deref(), now)),
-        Call::Fork {
-            pid,
-            empty_memory,
-            child,
-            token: named,
-        } => {
-            // The parent itself, or the parent its kernel names by its token.
-            let (row, token) = match named {
-                Some(named) => (
-                    db.process_token(&named, Some(pid), ns).ok_or_else(|| {
-                        Error::because(Errno::ESRCH, "no such process, or not its token")
-                    })?,
-                    named,
-                ),
-                None => (
-                    process()?.clone(),
-                    asked.token.unwrap_or_default().to_string(),
-                ),
-            };
-            if pid != row.pid {
-                return Err(Error::because(
-                    Errno::EINVAL,
-                    "fork is called by its parent",
-                ));
-            }
-            let forked = db.fork(&row, child, asked.reserved, now, empty_memory)?;
-            db.observe("forks", 1);
-            Ok(json!(Forked {
-                pid: forked.pid,
-                // The child carries its parent's token, as it keeps its credentials.
-                token,
-            }))
-        }
-        Call::Exit {
-            status,
-            signal,
-            pid: named,
-            token: named_token,
-        } => {
-            // The process itself, or one its kernel names by pid and token.
-            let row = match (named, named_token) {
-                (Some(named), Some(named_token)) => db
-                    .process_token(&named_token, Some(named), ns)
-                    .ok_or_else(|| {
-                        Error::because(Errno::ESRCH, "no such process, or not its token")
-                    })?,
-                _ => process()?.clone(),
-            };
-            db.exit(&row, status, signal, now)?;
-            Ok(Value::Null)
-        }
-        Call::Pids { count, kernel } => Ok(json!(db.lend(
-            ns,
-            &account()?,
-            asked.token,
-            count,
-            kernel.as_deref(),
-            asked.reserved,
-            now
-        )?)),
-        Call::Seats => Ok(db.seats(ns, &account()?)),
-        Call::Gone { seat, kernel } => {
-            let cred = account()?;
-            let reaped = seat
-                .map(|seat| db.gone(ns, &cred, &seat, now))
-                .transpose()?
-                .unwrap_or_default();
-            if let Some(kernel) = kernel {
-                db.reclaim(&kernel, &cred)?;
-            }
-            Ok(json!(reaped))
-        }
-        Call::Getpid => {
-            let row = process()?;
-            Ok(json!({ "pid": row.pid, "ppid": row.ppid }))
-        }
-        Call::Getpgid { pid } | Call::Getsid { pid } => {
-            let row = db.group_target(process()?, pid)?;
-            Ok(json!({ "pid": row.pid, "ppid": row.ppid, "pgid": row.pgid, "sid": row.sid }))
-        }
-        Call::Setpgid { pid, pgid } => Ok(json!(db.setpgid(process()?, pid, pgid)?)),
-        Call::Setsid => Ok(json!(db.setsid(process()?)?)),
-        Call::ProcSession { processes } => Ok(json!(db.start_session(ns, &processes)?)),
-        Call::ProcStopped { signal } => {
-            db.stopped(process()?, signal)?;
-            Ok(Value::Null)
-        }
-        Call::Prctl { option, value } => db.prctl(process()?, option, value),
-        Call::Waitpid { pid, options } => db.waitpid(process()?, pid, options),
-        Call::ProcPoll { pids } => {
-            if pids.len() > abi::PROC_POLL_MAX {
-                return Err(Error::because(
-                    Errno::E2BIG,
-                    format!("at most {} processes at a time", abi::PROC_POLL_MAX),
-                ));
-            }
-            Ok(json!(db.poll(ns, &pids, &account()?)))
-        }
-        Call::ProcTty {
-            pid,
-            token,
-            tty,
-            fds,
-        } => {
-            db.terminal(ns, pid, &token, tty, &fds)?;
-            Ok(Value::Null)
-        }
-        Call::ProcKeep { processes } => {
-            if processes.len() > abi::PROC_POLL_MAX {
-                return Err(Errno::E2BIG.into());
-            }
-            Ok(json!(db.keep_processes(ns, &processes, now)))
-        }
-        Call::Kill {
-            pid: target,
-            signal,
-        } => {
-            db.kill_targets(
-                ns,
-                &account()?,
-                caller.as_ref(),
-                abi::Target::of(&target),
-                signal.unwrap_or(abi::SIGTERM),
-                now,
-            )?;
-            Ok(Value::Null)
-        }
-        Call::Wait {
-            pid: target, token, ..
-        } => {
-            let abi::Target::Pid(want) = abi::Target::of(&target) else {
-                return Err(Errno::ECHILD.into());
-            };
-            let waited = match caller.as_ref() {
-                Some(row) => db.wait(ns, Some(row.pid), want),
-                None => db.reap(ns, asked.identity, want, token.as_deref()),
-            }?;
-            Ok(json!(waited))
-        }
-        Call::CgroupCreate {
-            path,
-            controllers,
-            lifetime,
-        } => db
-            .cgroup_create(
-                ns,
-                &account()?,
-                &path,
-                controllers.as_deref(),
-                lifetime.map(|_| process()).transpose()?,
-            )
-            .map(|()| Value::Null),
-        Call::CgroupRemove { path } => db
-            .cgroup_remove(ns, &account()?, &path)
-            .map(|()| Value::Null),
-        Call::CgroupSet { path, key, value } => db
-            .cgroup_set(ns, &account()?, &path, &key, &value, now)
-            .map(|()| Value::Null),
-        Call::CgroupAttach { pid, path } => db
-            .cgroup_attach(ns, &account()?, pid, &path)
-            .map(|()| Value::Null),
-        Call::CgroupStat { path } => db.cgroup_stat(ns, &path),
-        Call::CgroupList { path } => Ok(json!(db.cgroup_list(ns, &path))),
-        _ => Err(Errno::ENOSYS.into()),
-    }
+    Ok(Response::from_json(&json!({
+        "errno": err.errno,
+        "error": err.to_string(),
+    }))?
+    .with_status(status))
 }

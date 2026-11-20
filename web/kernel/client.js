@@ -1,79 +1,48 @@
 import { asset } from '../release.js';
 import { imageBlobRead } from './image-pager.js';
-// The client kernel: a classic worker, so it can importScripts the no-modules wasm-bindgen
-// build, with the Rust kernel (crates/client-kernel) holding the processes its tabs host and
-// their tokens. Each tab owns a dedicated Worker, which owns its process Workers and pipes.
-// The page communicates through messages. Its requests go to the browser's machine (a Durable Object of
-// its own, by a batch marked X-Registry). The machine verifies account identity with the
-// authority for tokenless batches; process-token calls use their stored snapshot.
-// Forks await registry admission before the child runs. Exits and waits are batched with
-// the next request or a moment after. Requests run serially so pending exit/wait reports
-// reach the registry before another fork asks for capacity.
+// The client kernel: a classic dedicated Worker (one isolated OS instance per tab), so it can
+// importScripts the no-modules wasm-bindgen build. The Rust kernel (crates/client-kernel) owns
+// this instance's LocalProcessTable, local /proc, instance-local /run and /tmp, local cgroup v2
+// policy, and explicit remote ServiceAuth v2 credentials. Boot, exec, fork, wait, kill, pipe,
+// setsid, and /proc run 100% locally with zero network RPCs; remote cloud filesystem and remote
+// devices attach lazily over ServiceAuth v2 (/api/service-auth) only when needed.
 //
-// Each tab holds a Web Lock, `tw-tab-<tab>`, for as long as it lives (web/kernel/protocol.js),
-// and each process says which tab runs it (its seat). A process whose seat's lock is free was
-// left by a tab that closed, crashed or reloaded while it ran: the kernel reaps it, at once
-// where it waits on that tab's lock, and at boot, or when the namespace has no room for another
-// process, by asking which locks are held. Each kernel holds one too, `tw-kernel-<id>`: the pids
-// a kernel that is gone was lent go back the same way.
-//
-// A process is its host's: the port that executed it, under an identity of the port's own (not
-// the tab it said it was, whose lock any same-origin page can see). Only that port forks it,
-// replaces its image, ends it, waits for its children, or signals as it; another tab's page
-// learns nothing of its token.
+// A process belongs exclusively to its port's host identity (never the public tab label). Only
+// that port forks it, replaces its image, ends it, waits for its children, or signals as it;
+// another tab runs its own isolated Worker instance and cannot observe or address its processes.
 importScripts(asset('/client_kernel.js'));
 
-const VERSION = 1;
+const VERSION = 2;
 const ports = new Set();
-const locks = self.navigator?.locks;
-// The tabs waited on, by seat.
 let kernel;
 let starting;
 let login, machineInit;
-// This kernel's id, and the lock it holds of it while it runs.
+// This instance's unique local identifier (never shared across tabs).
 const kernelId = self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
-const kernelLock = id => `tw-kernel-${id}`;
-if (locks) void locks.request(kernelLock(kernelId), () => new Promise(() => {})).catch(() => {});
-// Each port's host: an identity of its own, made here, and the tab it first said it was. A tab
-// id is a Web Lock's name, which any same-origin page can read: it says whose lock ends the
-// port's processes, never which port owns them.
+// Each port's host: an identity of its own, made here, and the tab it first said it was.
 const hosts = new WeakMap();
-// What the kernel does, one thing at a time.
+// What the kernel does, one thing at a time for serialized lifecycle ops.
 let queue = Promise.resolve();
 const serially = task => {
   const done = queue.then(task);
   queue = done.catch(() => {});
   return done;
 };
-// What happened here goes to the machine a moment after, if nothing took it sooner: the
-// exits and waits of a pipeline's stages, which end together, go together.
-const REPORT_AFTER = 25;
-let reporting = null;
-function report() {
-  if (!kernel?.pending()) return reporting ?? Promise.resolve();
-  reporting ??= new Promise(resolve => setTimeout(resolve, REPORT_AFTER))
-    .then(() => serially(() => kernel.flush()))
-    .catch(() => {})
-    .finally(() => { reporting = null; void report(); });
-  return reporting;
-}
-// Once the machine heard what happened here so far (a few tries, if it cannot be reached).
-async function heard() {
-  const mine = kernel.queued();
-  for (let tries = 0; kernel.reported() < mine && tries < 5; tries++) await report();
-}
 
-// The Rust kernel's transport: one POST to the browser's machine, its status and text.
-// Same-origin, so the browser's cookies go with it; the kernel never sees them.
-self.kernelSys = async (body, signal) => {
-  const token = JSON.parse(body).proc;
-  const response = await fetch('/api/sys', {
+// ServiceAuth v2 transport: POST /api/service-auth (lazy first-remote-use only; NEVER X-Registry).
+self.serviceAuthPost = async (body, signal) => {
+  const response = await fetch('/api/service-auth', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Process-Token': token } : { 'X-Registry': '1' }) },
+    headers: { 'Content-Type': 'application/json' },
     body,
     signal,
   });
   return JSON.stringify({ status: response.status, text: await response.text() });
+};
+
+// Surface version mismatch notices without auto-reloading (docs/architecture/contract.md §2.10).
+self.onProtocolMismatch = value => {
+  broadcast({ v: VERSION, type: 'event', event: 'protocol-mismatch', value });
 };
 
 // Cookie-authenticated authority batch transport for page VFS calls (NEVER X-Registry).
@@ -128,9 +97,7 @@ self.cloudFsTicket = () => self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.
 function boot() {
   starting ??= wasm_bindgen(asset('/client_kernel_bg.wasm')).then(async () => {
     self.wasm_bindgen = wasm_bindgen;
-    // A dedicated kernel never resets the namespace on boot; locks and leases reclaim it.
-    const id = '';
-    kernel = new wasm_bindgen.Kernel(id, locks ? kernelId : '');
+    kernel = new wasm_bindgen.Kernel('', kernelId);
     const value = JSON.parse(await kernel.init());
     const [{ LoginCoordinator, LoginStartup }, { InitCoordinator, InitReaper }] = await Promise.all([import(asset('/login-session.js')), import(asset('/init-owner.js'))]);
     const proof = [...crypto.getRandomValues(new Uint8Array(32))].map(byte => byte.toString(16).padStart(2, '0')).join('');
@@ -149,11 +116,11 @@ function boot() {
         broadcast({ v: VERSION, type: 'event', event: 'login', value: { ...value, services: login.startup?.current(value) } });
       },
       call: async action => {
-        const answer = JSON.parse(await self.kernelSys(JSON.stringify({ calls: [{ login_session: { action } }] }), AbortSignal.timeout(10000)));
-        if (answer.status !== 200) throw { errno: 'EIO', detail: 'login coordinator is unavailable' };
-        const result = JSON.parse(answer.text).results[0];
-        if (result.err) throw result.err;
-        return result.ok;
+        try {
+          return JSON.parse(await kernel.login_session_action(JSON.stringify(action), kernelId));
+        } catch (error) {
+          throw failure(error);
+        }
       },
     });
     login.startup = new LoginStartup({
@@ -175,8 +142,6 @@ function boot() {
           onJob: job => { run.job = job; },
           beforeStart: async pid => {
             await self.kernelRequest('login_service_attach', { pid, expected: run.expected, launch: run.launch });
-            // Graceful shutdown targets the supervisor, which owns dependency/group policy.
-            // Its original process proof remains valid after cookie logout.
             run.stop = async () => {
               try {
                 await self.kernelRequest('kill', { pid, from: pid, signal: 15 });
@@ -195,19 +160,25 @@ function boot() {
         broadcast({ v: VERSION, type: 'event', event: 'machine_init', value: { ...value, reaper: machineInit.reaper?.current() } });
       },
       call: async action => {
-        const answer = JSON.parse(await self.kernelSys(JSON.stringify({ calls: [{ machine_init: { action } }] }), AbortSignal.timeout(10000)));
-        if (answer.status !== 200) throw { errno: 'EIO', detail: 'init coordinator is unavailable' };
-        const result = JSON.parse(answer.text).results[0];
-        if (result.err) throw result.err;
-        return result.ok;
+        try {
+          return JSON.parse(await kernel.machine_init_action(JSON.stringify(action), kernelId));
+        } catch (error) {
+          throw failure(error);
+        }
       },
     });
     machineInit.reaper = new InitReaper({
       token: () => [...crypto.getRandomValues(new Uint8Array(32))].map(byte => byte.toString(16).padStart(2, '0')).join(''),
       release: owner => machineInit.call({ op: 'release', owner }),
       exhausted: () => { void machineInit.stop(); },
-      changed: () => broadcast({ v: VERSION, type: 'event', event: 'machine_init',
-        value: { ...machineInit.current(), reaper: machineInit.reaper.current() } }),
+      changed: () => {
+        if (!machineInit.reaper.run && machineInit.reaper.state === 'stopped'
+          && machineInit.current().coordinator && machineInit.ownership) {
+          queueMicrotask(() => machineInit.reaper.update(machineInit.current(), machineInit.ownership));
+        }
+        broadcast({ v: VERSION, type: 'event', event: 'machine_init',
+          value: { ...machineInit.current(), reaper: machineInit.reaper.current() } });
+      },
       start: async (owner, token, cancelled, running) => {
         const { exec } = await import(asset('/executor-host.js'));
         let error = '';
@@ -219,14 +190,11 @@ function boot() {
         if (!cancelled()) throw new Error(error.trim() || `init exited (${result.status})`);
       },
     });
+    await login.tick();
     void machineInit.tick();
-    void login.tick();
     broadcast({ v: VERSION, type: 'event', event: 'started', value });
-    void serially(() => reapGone()).catch(() => {});
     return value;
   }).catch(error => {
-    // A boot that failed (offline, a 5xx) is tried again by the next request, not kept as
-    // every tab's answer for as long as this worker lives.
     kernel = undefined;
     starting = undefined;
     throw error;
@@ -238,26 +206,7 @@ function broadcast(message) {
   for (const port of ports) port.postMessage(message);
 }
 
-// The lock a tab holds while it lives.
-const tabLock = seat => `tw-tab-${seat}`;
-// Reap the processes whose tab is gone: those of `seat`, or of any seat whose lock is free.
-// The machine ends them as SIGKILL would, and init reaps them. The pids lent to kernels whose
-// lock is free go back.
-async function reapGone(seat) {
-  if (!locks || !kernel) return;
-  if (seat) { await kernel.gone(seat); return; }
-  const held = new Set(((await locks.query()).held ?? []).map(lock => lock.name));
-  const { seats = [], kernels = [] } = JSON.parse(await kernel.seats());
-  for (const running of seats) {
-    if (!held.has(tabLock(running))) await kernel.gone(running);
-  }
-  for (const lender of kernels) {
-    if (lender !== kernelId && !held.has(kernelLock(lender))) await kernel.reclaim(lender);
-  }
-}
-// execve of a pipeline's stages, in one request, as the tab `seat` asks it: each stage's
-// process, or its error. Where the namespace has no room (EAGAIN), what gone tabs left is
-// reaped, and it is asked once more.
+// execve of a pipeline's stages locally inside this instance's LocalProcessTable.
 async function execs(args, seat, host) {
   const stages = (args.stages ?? []).map(stage => ({
     path: stage.path,
@@ -266,21 +215,13 @@ async function execs(args, seat, host) {
     parentPid: stage.parentPid,
     sessionId: stage.sessionId,
     serviceGrant: stage.serviceGrant,
+    ...(stage.remote !== undefined ? { remote: stage.remote } : {}),
     argv: stage.argv ?? [],
     env: stage.env ?? [],
     cwd: stage.cwd ?? '/',
     cgroup: stage.cgroup ?? '',
   }));
-  const call = async () => JSON.parse(await kernel.execs(JSON.stringify(stages), !!args.sudo, seat ?? '', host));
-  const results = await call();
-  if (!locks || !results.some(result => result.err?.errno === 'EAGAIN')) return results;
-  // The stages that were given processes give them back before the pipeline is asked again.
-  for (const result of results) {
-    if (!result.ok) continue;
-    try { await kernel.exit(result.ok.pid, 126, undefined, host); await kernel.wait(result.ok.pid, host); } catch { /* gone already */ }
-  }
-  await reapGone();
-  return call();
+  return JSON.parse(await kernel.execs(JSON.stringify(stages), !!args.sudo, seat ?? '', host));
 }
 // execve of one image: a pipeline of one stage.
 async function exec(args, seat, host) {
@@ -312,18 +253,23 @@ async function dispatch(message, host, tab, internal = false) {
   switch (type) {
     case 'init': return boot();
     case 'version': return kernel.version();
+    case 'instance_id': return kernel.instance_id();
     case 'namespace': return kernel.namespace();
-    case 'workspace_credentials': {
-      const response = await fetch('/api/sys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ calls: ['getcreds'] }) });
-      if (!response.ok) throw { errno: 'EACCES' };
-      return (await response.json()).results?.[0]?.ok;
-    }
+    case 'workspace_credentials': return JSON.parse(kernel.workspace_credentials());
+    case 'sync_account': return JSON.parse(kernel.sync_account(typeof args === 'string' ? args : JSON.stringify(args)));
+    case 'sync_account_from_server': return JSON.parse(await kernel.sync_account_from_server());
+    case 'machine_init_action': return JSON.parse(await kernel.machine_init_action(JSON.stringify(args.action ?? args), host));
+    case 'login_session_action': return JSON.parse(await kernel.login_session_action(JSON.stringify(args.action ?? args), host));
     case 'machine_init_status': return { ...machineInit.current(), reaper: machineInit.reaper.current() };
     case 'machine_init_resume': return machineInit.resume();
     case 'machine_init_leave': await machineInit.stop(); return null;
     case 'machine_reboot': {
       const value = await machineInit.call({ op: 'reboot', boot: args.boot });
-      await machineInit.resume(); return value;
+      const executor = await import(asset('/executor-host.js'));
+      void executor.reconcile().catch(() => {});
+      await login.reset();
+      await machineInit.resume();
+      return value;
     }
     case 'machine_inspect': return machineInit.call({ op: 'inspect' });
     case 'login_lifecycle': {
@@ -331,12 +277,22 @@ async function dispatch(message, host, tab, internal = false) {
       const value = await login.call({ op: args.op, ...(args.op === 'inspect' ? {} : { session: args.session }) });
       if (args.op !== 'inspect') {
         const executor = await import(asset('/executor-host.js'));
+        void executor.reconcile().catch(() => {});
         await executor.endWorkspace(args.session);
         await login.reset();
       }
       return value;
     }
-    case 'login_status': { const value = login.current(); return { ...value, services: login.startup.current(value) }; }
+    case 'login_status': {
+      if (login.view?.shutdown && !login.view.shutdown.complete) {
+        try {
+          const fresh = JSON.parse(await kernel.login_session_action(JSON.stringify({ op: 'inspect' }), kernelId));
+          if (fresh?.id === login.view.id) login.view = fresh;
+        } catch { /* keep cached view */ }
+      }
+      const value = login.current();
+      return { ...value, services: login.startup.current(value) };
+    }
     case 'login_configure': return login.control('configure', { file: args.file }, args.expected);
     case 'login_seat_policy': {
       const value = await login.call({ op: 'seat_policy', session: args.session, expected: args.expected, sharing: args.sharing });
@@ -345,7 +301,12 @@ async function dispatch(message, host, tab, internal = false) {
       executor.setSharingPolicy(() => login.current());
       return value;
     }
-    case 'login_refresh': return login.reset();
+    case 'login_refresh': {
+      if (args?.fromServer !== false) {
+        try { await kernel.sync_account_from_server(); } catch { /* offline or guest */ }
+      }
+      return login.reset();
+    }
     case 'login_leave': await login.stop(); return null;
     case 'login_service_check': login.capture(args.expected); return null;
     case 'login_service_attach': {
@@ -354,6 +315,15 @@ async function dispatch(message, host, tab, internal = false) {
       return login.checked(ticket, view);
     }
     case 'login_service_signal': return login.control('signal', { pid: args.pid, signal: args.signal }, args.expected);
+    case 'reserve_memory': kernel.reserve_memory(args.pid, BigInt(args.bytes ?? 0), host); return null;
+    case 'getcreds_proc': return JSON.parse(kernel.getcreds_proc(args.pid, host));
+    case 'set_proc_cred': return JSON.parse(await kernel.set_proc_cred(args.pid, args.uid, args.gid ?? args.uid, new Uint32Array(args.groups ?? []), args.remote != null ? JSON.stringify(args.remote) : undefined, host));
+    case 'attach_remote_device': return JSON.parse(await kernel.attach_remote_device(args.driver, args.pid ?? undefined, host));
+    case 'detach_remote_device': kernel.detach_remote_device(args.driver); return null;
+    case 'service_auth_hello': return JSON.parse(await kernel.service_auth_hello(args.versions ? JSON.stringify(args.versions) : undefined));
+    case 'service_auth_attach': return JSON.parse(await kernel.service_auth_attach());
+    case 'mint_remote_cred': return JSON.parse(await kernel.mint_remote_cred(args.pid, args.scope ? JSON.stringify(args.scope) : undefined, !!args.sudo, host));
+    case 'detach_instance': return JSON.parse(await kernel.detach_instance());
     case 'exec':
       if (args.serviceGrant && !internal) throw { errno: 'EPERM' };
       return exec(args, tab, host);
@@ -545,8 +515,22 @@ const isConcurrentCall = type => (
 );
 
 async function handle(port, message) {
+  if (message?.type === 'hello') {
+    const versions = Array.isArray(message.versions) ? message.versions : [];
+    const boundary = message.boundary ?? 'host-adapter';
+    if (boundary !== 'host-adapter' || !versions.includes(VERSION)) {
+      const err = { errno: 'EPROTONOSUPPORT', detail: `HostAdapter v${VERSION} required` };
+      port.postMessage({ v: VERSION, id: message.id, err });
+      port.postMessage({ v: VERSION, type: 'event', event: 'protocol-mismatch', value: { boundary: 'host-adapter', ...err } });
+      return;
+    }
+    port.postMessage({ v: VERSION, id: message.id, ok: { boundary: 'host-adapter', version: VERSION } });
+    return;
+  }
   if (message?.v !== VERSION) {
-    port.postMessage({ v: VERSION, id: message?.id, err: { errno: 'EPROTO', detail: `client kernel speaks version ${VERSION}` } });
+    const err = { errno: 'EPROTONOSUPPORT', detail: `HostAdapter v${VERSION} required (received v${message?.v})` };
+    port.postMessage({ v: VERSION, id: message?.id, err });
+    port.postMessage({ v: VERSION, type: 'event', event: 'protocol-mismatch', value: { boundary: 'host-adapter', ...err } });
     return;
   }
   ports.add(port);
@@ -557,26 +541,23 @@ async function handle(port, message) {
     tab: message.tab,
   });
   const host = hosts.get(port);
-  if (message.tab != null && message.tab !== host.tab) {
-    port.postMessage({ v: VERSION, id: message.id, err: { errno: 'EPERM', detail: 'a port speaks for the tab it first said it was' } });
-    return;
+  if (message.tab != null) {
+    if (host.tab == null) host.tab = message.tab;
+    else if (message.tab !== host.tab) {
+      port.postMessage({ v: VERSION, id: message.id, err: { errno: 'EPERM', detail: 'a port speaks for the tab it first said it was' } });
+      return;
+    }
   }
-  // This kernel goes with its tab; other kernels and the Machine lease reclaim what it leaves.
   try {
     self.kernel = kernel;
     self.kernelRequest = async (type, args) => {
       const run = () => dispatch({ type, args }, host.id, host.tab, true);
-      const answer = await (isConcurrentCall(type) ? run() : serially(run)).catch(error => {
+      return await (isConcurrentCall(type) ? run() : serially(run)).catch(error => {
         const refused = failure(error);
         throw Object.assign(new Error(refused.detail ?? refused.errno), refused);
       });
-      if (type === 'wait' || type === 'waitchild') await heard();
-      void report();
-      return answer;
     };
     try { await boot(); self.kernel = kernel; } catch (error) {
-      // An optional root-listing overlay must not prevent ordinary filesystem
-      // access before this execution host boots. No call has been dispatched.
       if (message.type === 'mount_overlay') {
         port.postMessage({ v: VERSION, id: message.id, ok: null }); return;
       }
@@ -590,17 +571,13 @@ async function handle(port, message) {
       value = await executor.request(message.type, message.args ?? {}, value => port.postMessage({ v: VERSION, type: 'event', event: message.type.startsWith('attachment_') ? 'attachment' : 'run', value }), value => broadcast({ v: VERSION, type: 'event', event: 'seat', value }));
     } else if (isConcurrentCall(message.type)) value = await dispatch(message, host.id, host.tab);
     else value = await serially(() => dispatch(message, host.id, host.tab));
-    // A wait answers once the machine heard of it, so that /proc agrees.
-    if (message.type === 'wait' || message.type === 'waitchild') await heard();
     port.postMessage({ v: VERSION, id: message.id, ok: value });
   } catch (error) {
     port.postMessage({ v: VERSION, id: message.id, err: failure(error) });
   }
-  void report();
 }
 
-// Exactly one host owns this worker. SharedWorker is not part of process execution.
+// Exactly one host owns this dedicated Worker instance.
 self.onmessage = ({ data }) => handle(self, data);
-setInterval(() => { if (kernel) void serially(() => reapGone()).catch(() => {}); }, 10000);
-setInterval(() => { if (login) void login.tick(); if (machineInit) void machineInit.tick(); }, 5000);
+// Renew remote ServiceAuth v2 & CloudFs leases only when this instance has attached remotely.
 setInterval(() => { if (kernel) void kernel.cloud_renew().catch(() => {}); }, 30000);
