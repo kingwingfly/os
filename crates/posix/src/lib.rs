@@ -93,6 +93,7 @@ fn linux_errno_to_abi(code: i32) -> Option<abi::Errno> {
         11 => EAGAIN,
         13 => EACCES,
         14 => EINVAL, // EFAULT
+        15 => ENOTBLK,
         16 => EBUSY,
         17 => EEXIST,
         18 => EXDEV,
@@ -176,6 +177,7 @@ fn bsd_errno_to_abi(code: i32, flavour: BsdFlavour) -> Option<abi::Errno> {
         11 => EDEADLK,
         13 => EACCES,
         14 => EINVAL, // EFAULT
+        15 => ENOTBLK,
         16 => EBUSY,
         17 => EEXIST,
         18 => EXDEV,

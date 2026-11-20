@@ -109,6 +109,7 @@ fn wasi_errno_num(errno: Errno) -> i32 {
         Errno::ENOTTY => 59,
         Errno::ENXIO => 60,
         Errno::ENODATA => 61,
+        Errno::ENOTBLK => 218,
         Errno::EPERM => 63,
         Errno::EPIPE => 64,
         Errno::EPROTONOSUPPORT => 66,

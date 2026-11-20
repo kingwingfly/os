@@ -1144,14 +1144,14 @@ fn fail(error: Error) -> JsValue {
 
 #[cfg(test)]
 mod tests {
-    /// The contract's version constants (crates/abi/src/contract.rs) name these protocols; they
-    /// must not drift apart.
+    /// Contract v2 (L0c, #76) defines HostAdapter v2 and Release v2 ahead of runtime adoption in
+    /// L2.5a/L2.5b (#77, #78). Keep runtime constants at v1 here with zero runtime behavior
+    /// changes until those steps implement v2 and tighten the equality back to `==`.
     #[test]
     fn versions_match_the_contract() {
-        assert_eq!(
-            super::VERSION,
-            abi::contract::HOST_ADAPTER_VERSION.to_string()
-        );
-        assert_eq!(image::PROTOCOL, abi::contract::RELEASE_VERSION);
+        assert_eq!(super::VERSION, "1");
+        assert_eq!(abi::contract::HOST_ADAPTER_VERSION, 2);
+        assert_eq!(image::PROTOCOL, 1);
+        assert_eq!(abi::contract::RELEASE_VERSION, 2);
     }
 }

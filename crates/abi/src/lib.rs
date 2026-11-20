@@ -18,7 +18,7 @@ pub mod local_helper;
 pub mod remote_fs;
 pub mod system;
 
-pub use contract::{fs_magic, mount_flags, statfs_flags, umount_flags, unshare_flags};
+pub use contract::{cowfs_ioctl, fs_magic, mount_flags, statfs_flags, umount_flags, unshare_flags};
 
 /// Why a call failed, as Linux's errno says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -33,6 +33,7 @@ pub enum Errno {
     EBADF,
     EAGAIN,
     EACCES,
+    ENOTBLK,
     EBUSY,
     EEXIST,
     EXDEV,
@@ -81,6 +82,7 @@ impl Errno {
             EBADF => "Bad file descriptor",
             EAGAIN => "Resource temporarily unavailable",
             EACCES => "Permission denied",
+            ENOTBLK => "Block device required",
             EBUSY => "Device or resource busy",
             EEXIST => "File exists",
             EXDEV => "Invalid cross-device link",
