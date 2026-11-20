@@ -802,3 +802,342 @@ fn reachability_gc_honors_locks_grace_window_and_snapshot_pins() {
     assert!(run(verify_volume(&*hs, &*ps, &vol)).unwrap().ok);
     run(fs.close_clean()).unwrap();
 }
+
+// -----------------------------------------------------------------------------
+// 7. Regression tests for verifier findings (#77):
+//    (a) Grace-window GC preserves still-indexed packs across delete_volume + cross-volume dedupe.
+//    (b) ForkOnBusy unmodified fork still auto-prunes after reads / read_dir_page / read_link (atime).
+//    (c) Mounted Snapshot reports snapshot head/epoch, forks snapshot (not live), rejects refresh_ro.
+//    (d) Fenced writer immediately refuses open(O_TRUNC) and open(O_WRONLY) with ESTALE without mutating.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn gc_grace_window_preserves_indexed_pack_for_cross_volume_dedupe() {
+    // Exercise BOTH in-memory store and native SQLite + pack files backend.
+    let dir = TempDir::new("gc-dedupe-grace");
+    let clock = ManualClock::new(20_000);
+    let hs = Rc::new(NativeSqliteHeadStore::open(&dir.0).unwrap());
+    let ps = Rc::new(NativePackStore::open(&dir.0).unwrap());
+    hs.set_grace_window_secs(600);
+    let admin = Cred::root();
+
+    let v1 = VolumeId("vol-v1".into());
+    let v2 = VolumeId("vol-v2".into());
+    run(CowFs::format_volume(
+        &*hs,
+        &*ps,
+        v1.clone(),
+        0,
+        0,
+        0o755,
+        clock.now(),
+    ))
+    .unwrap();
+    run(CowFs::format_volume(
+        &*hs,
+        &*ps,
+        v2.clone(),
+        0,
+        0,
+        0o755,
+        clock.now(),
+    ))
+    .unwrap();
+
+    let block_payload = vec![0x5Au8; 64 * 1024];
+
+    // Write block B on V1 at t = 20_010, commit, close, and delete V1.
+    clock.advance(10);
+    let fs1 = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        v1.clone(),
+        CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+        CowFsConfig::local_native(clock.clock()),
+    ))
+    .unwrap();
+    let (_, o1) = run(fs1.create(&admin, &fs1.root(), "b.bin", 0o644, &rw_create())).unwrap();
+    run(fs1.write_at(&o1, &block_payload, WriteAt::Offset(0))).unwrap();
+    run(fs1.release(&o1)).unwrap();
+    run(fs1.close_clean()).unwrap();
+    assert_eq!(run(ps.list_packs()).unwrap().len(), 1);
+    run(hs.delete_volume(&v1)).unwrap();
+
+    // Run GC with grace_before < pack.created_at (t = 20_005 < 20_010):
+    // HeadStore keeps packs/blocks within grace -> GC MUST NOT delete the pack from PackStore!
+    let gc_early = run(collect_garbage(
+        &*hs,
+        &*ps,
+        Timespec {
+            sec: 20_005,
+            nsec: 0,
+        },
+    ))
+    .unwrap();
+    assert_eq!(gc_early.swept_packs.len(), 0);
+    assert_eq!(run(ps.list_packs()).unwrap().len(), 1);
+
+    // Write the EXACT same bytes B on V2 -> dedupe hits HeadStore.blocks[B] -> must remain readable!
+    clock.advance(5);
+    let fs2 = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        v2.clone(),
+        CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+        CowFsConfig::local_native(clock.clock()),
+    ))
+    .unwrap();
+    let (_, o2) = run(fs2.create(&admin, &fs2.root(), "b2.bin", 0o644, &rw_create())).unwrap();
+    run(fs2.write_at(&o2, &block_payload, WriteAt::Offset(0))).unwrap();
+    run(fs2.release(&o2)).unwrap();
+    run(fs2.close_clean()).unwrap();
+
+    // Cold reopen V2 and verify read + cowfsck both succeed!
+    let fs2_ro = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        v2.clone(),
+        CowFsOpenMode::ReadOnly,
+        CowFsConfig::local_native(clock.clock()),
+    ))
+    .unwrap();
+    let ent = run(fs2_ro.lookup(&admin, &fs2_ro.root(), "b2.bin")).unwrap();
+    let ro_fd = run(fs2_ro.open(&admin, &ent.handle, &ro_open())).unwrap();
+    let mut got = vec![0u8; block_payload.len()];
+    let n = run(fs2_ro.read_at(&ro_fd, &mut got, 0)).unwrap();
+    assert_eq!(n, block_payload.len());
+    assert_eq!(got, block_payload);
+    run(fs2_ro.release(&ro_fd)).unwrap();
+    assert!(run(verify_volume(&*hs, &*ps, &v2)).unwrap().ok);
+
+    // After deleting V2 and advancing past grace_before, GC sweeps the pack completely.
+    run(hs.delete_volume(&v2)).unwrap();
+    let gc_late = run(collect_garbage(
+        &*hs,
+        &*ps,
+        Timespec {
+            sec: 25_000,
+            nsec: 0,
+        },
+    ))
+    .unwrap();
+    assert_eq!(gc_late.swept_packs.len(), 1);
+    assert_eq!(run(ps.list_packs()).unwrap().len(), 0);
+}
+
+#[test]
+fn fork_on_busy_unmodified_after_reads_and_readdir_still_prunes() {
+    let clock = ManualClock::new(30_000);
+    let hs = Rc::new(MemoryHeadStore::new());
+    let ps = Rc::new(MemoryPackStore::new());
+    let vol = VolumeId("vol-atime-fork".into());
+    let admin = Cred::root();
+    run(CowFs::format_volume(
+        &*hs,
+        &*ps,
+        vol.clone(),
+        0,
+        0,
+        0o755,
+        clock.now(),
+    ))
+    .unwrap();
+
+    let w1 = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        vol.clone(),
+        CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+        CowFsConfig::local_browser(clock.clock()),
+    ))
+    .unwrap();
+    let (_, o) = run(w1.create(&admin, &w1.root(), "readme.txt", 0o644, &rw_create())).unwrap();
+    run(w1.write_at(&o, b"hello world", WriteAt::Offset(0))).unwrap();
+    run(w1.release(&o)).unwrap();
+    run(w1.symlink(&admin, &w1.root(), "link.txt", "readme.txt")).unwrap();
+    run(w1.commit_tx_group()).unwrap();
+
+    // Advance clock past 24h so relatime triggers on read_at, read_dir, read_dir_page, and read_link.
+    clock.advance(90_000);
+
+    let fork = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        vol.clone(),
+        CowFsOpenMode::ReadWrite(WriterMode::ForkOnBusy),
+        CowFsConfig::local_browser(clock.clock()),
+    ))
+    .unwrap();
+    let fork_vol = fork.volume_id().clone();
+    assert_eq!(fork.forked_from(), Some(vol.clone()));
+
+    // Perform read_dir, read_dir_page, read_link, and read_at (all trigger update_atime_if_needed).
+    let _ = run(fork.read_dir(&admin, &fork.root())).unwrap();
+    let page = run(fork.read_dir_page(&admin, &fork.root(), 0, 64)).unwrap();
+    assert_eq!(page.entries.len(), 2);
+    let sym = run(fork.lookup(&admin, &fork.root(), "link.txt")).unwrap();
+    assert_eq!(
+        run(fork.read_link(&admin, &sym.handle)).unwrap(),
+        "readme.txt"
+    );
+    let ent = run(fork.lookup(&admin, &fork.root(), "readme.txt")).unwrap();
+    let rfd = run(fork.open(&admin, &ent.handle, &ro_open())).unwrap();
+    let mut buf = [0u8; 16];
+    let n = run(fork.read_at(&rfd, &mut buf, 0)).unwrap();
+    assert_eq!(&buf[..n], b"hello world");
+    run(fork.release(&rfd)).unwrap();
+    // Verify atime DID update visibly in-session, yet sync_fs/close_clean still prunes the unmodified fork!
+    let st_after = run(fork.metadata(&admin, &ent.handle)).unwrap();
+    assert_eq!(st_after.atime.sec, 120_000);
+    let _ = run(fork.commit_tx_group()).unwrap();
+    run(fork.close_clean()).unwrap();
+    assert_eq!(run(hs.read_head(&fork_vol)).unwrap_err(), Errno::ENOENT);
+
+    run(w1.close_clean()).unwrap();
+}
+
+#[test]
+fn mounted_snapshot_reports_snapshot_head_forks_snapshot_and_rejects_refresh() {
+    let clock = ManualClock::new(40_000);
+    let hs = Rc::new(MemoryHeadStore::new());
+    let ps = Rc::new(MemoryPackStore::new());
+    let vol = VolumeId("vol-snap-pin".into());
+    let admin = Cred::root();
+    run(CowFs::format_volume(
+        &*hs,
+        &*ps,
+        vol.clone(),
+        0,
+        0,
+        0o755,
+        clock.now(),
+    ))
+    .unwrap();
+
+    let w = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        vol.clone(),
+        CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+        CowFsConfig::local_browser(clock.clock()),
+    ))
+    .unwrap();
+    let (_, o1) = run(w.create(&admin, &w.root(), "state.txt", 0o644, &rw_create())).unwrap();
+    run(w.write_at(&o1, b"v1", WriteAt::Offset(0))).unwrap();
+    run(w.release(&o1)).unwrap();
+    let snap = run(w.create_snapshot("s1")).unwrap();
+    assert_eq!(snap.epoch, 1);
+
+    // Advance live volume to epoch 2 with different contents.
+    clock.advance(50);
+    let e = run(w.lookup(&admin, &w.root(), "state.txt")).unwrap();
+    let mut trunc_opt = OpenOptions::new();
+    trunc_opt.write(true).truncate(true);
+    let o2 = run(w.open(&admin, &e.handle, &trunc_opt)).unwrap();
+    run(w.write_at(&o2, b"v2-live", WriteAt::Offset(0))).unwrap();
+    run(w.release(&o2)).unwrap();
+    let live_head = run(w.commit_tx_group()).unwrap();
+    assert_eq!(live_head.epoch, 2);
+
+    // Open named snapshot "s1" -> MUST report snapshot root/epoch, NOT live head!
+    let snap_fs = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        vol.clone(),
+        CowFsOpenMode::Snapshot("s1".into()),
+        CowFsConfig::local_browser(clock.clock()),
+    ))
+    .unwrap();
+    let info = snap_fs.volume_info();
+    assert_eq!(info.epoch, snap.epoch);
+    assert_eq!(info.root, cowtree::digest_to_hex(&snap.root));
+    assert_eq!(snap_fs.current_head().root, snap.root);
+    assert_eq!(snap_fs.current_head().epoch, snap.epoch);
+
+    // refresh_ro() MUST be rejected on a pinned named snapshot mount!
+    assert_eq!(run(snap_fs.refresh_ro()).unwrap_err(), Errno::EINVAL);
+
+    // fork_volume(None, ...) on the mounted snapshot MUST fork the snapshot ("v1"), NOT live ("v2-live")!
+    let fork_id = VolumeId("vol-from-mounted-snap".into());
+    let fork_head = run(snap_fs.fork_volume(None, fork_id.clone(), false)).unwrap();
+    assert_eq!(fork_head.root, snap.root);
+    let fork_fs = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        fork_id,
+        CowFsOpenMode::ReadOnly,
+        CowFsConfig::local_browser(clock.clock()),
+    ))
+    .unwrap();
+    let fe = run(fork_fs.lookup(&admin, &fork_fs.root(), "state.txt")).unwrap();
+    let ffd = run(fork_fs.open(&admin, &fe.handle, &ro_open())).unwrap();
+    let mut buf = [0u8; 16];
+    let n = run(fork_fs.read_at(&ffd, &mut buf, 0)).unwrap();
+    assert_eq!(&buf[..n], b"v1");
+    run(fork_fs.release(&ffd)).unwrap();
+    run(w.close_clean()).unwrap();
+}
+
+#[test]
+fn fenced_writer_refuses_open_o_trunc_and_o_wronly_immediately_with_estale() {
+    let clock = ManualClock::new(50_000);
+    let hs = Rc::new(MemoryHeadStore::new());
+    let ps = Rc::new(MemoryPackStore::new());
+    let vol = VolumeId("vol-fence-trunc".into());
+    let admin = Cred::root();
+    run(CowFs::format_volume(
+        &*hs,
+        &*ps,
+        vol.clone(),
+        0,
+        0,
+        0o755,
+        clock.now(),
+    ))
+    .unwrap();
+
+    let w1 = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        vol.clone(),
+        CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+        CowFsConfig::local_browser(clock.clock()),
+    ))
+    .unwrap();
+    let (ent, o) = run(w1.create(&admin, &w1.root(), "keep.txt", 0o644, &rw_create())).unwrap();
+    run(w1.write_at(&o, b"important-bytes", WriteAt::Offset(0))).unwrap();
+    run(w1.release(&o)).unwrap();
+    run(w1.commit_tx_group()).unwrap();
+
+    // W2 forces takeover -> W1 discovers fence on commit/sync.
+    let w2 = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        vol.clone(),
+        CowFsOpenMode::ReadWrite(WriterMode::ForceTakeover),
+        CowFsConfig::local_browser(clock.clock()),
+    ))
+    .unwrap();
+    assert_eq!(run(w1.commit_tx_group()).unwrap_err(), Errno::ESTALE);
+
+    // Once fenced, W1 MUST refuse open(O_TRUNC) and open(O_WRONLY) immediately with ESTALE
+    // without mutating `st.overlay`!
+    let mut o_trunc = OpenOptions::new();
+    o_trunc.write(true).truncate(true);
+    assert_eq!(
+        run(w1.open(&admin, &ent.handle, &o_trunc)).unwrap_err(),
+        Errno::ESTALE
+    );
+    let mut o_wronly = OpenOptions::new();
+    o_wronly.write(true);
+    assert_eq!(
+        run(w1.open(&admin, &ent.handle, &o_wronly)).unwrap_err(),
+        Errno::ESTALE
+    );
+    // In-memory metadata of W1 was NOT truncated to 0!
+    assert_eq!(
+        run(w1.metadata(&admin, &ent.handle)).unwrap().size,
+        b"important-bytes".len() as u64
+    );
+    run(w2.close_clean()).unwrap();
+}

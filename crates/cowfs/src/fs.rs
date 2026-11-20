@@ -209,6 +209,8 @@ struct CowFsState {
     lease: Option<WriterLease>,
     forked_from: Option<VolumeId>,
     fenced: bool,
+    /// True once an explicit user mutation (not an internal `relatime` update) has been staged.
+    user_modified: bool,
     overlay: TreeOverlay,
     /// Uncommitted data blocks keyed by SHA-256 digest: `(bytes, refcount)`.
     dirty_blocks: HashMap<Digest, (Rc<Vec<u8>>, usize)>,
@@ -284,6 +286,8 @@ pub struct CowFs<H: HeadStore + 'static, P: PackStore + 'static> {
     volume_id: VolumeId,
     subvol: String,
     read_only: bool,
+    /// Set when mounted via `CowFsOpenMode::Snapshot(name)`; pins the mount immutably to that snapshot.
+    pinned_snapshot: Option<String>,
     capabilities: FsCapabilities,
     capacity_bytes: Option<u64>,
     root_generation: u64,
@@ -383,7 +387,16 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             return Err(Errno::EPROTONOSUPPORT);
         }
 
-        let (head, root_digest, lease, forked_from, read_only, capabilities, fs_id) = match mode {
+        let (
+            head,
+            root_digest,
+            lease,
+            forked_from,
+            read_only,
+            pinned_snapshot,
+            capabilities,
+            fs_id,
+        ) = match mode {
             CowFsOpenMode::ReadWrite(writer_mode) => {
                 let lease = head_store.acquire_writer(&volume, writer_mode).await?;
                 if lease.head.format_version != COWFS_FORMAT_VERSION {
@@ -400,6 +413,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                     Some(lease),
                     forked_from,
                     false,
+                    None,
                     config.capabilities,
                     fs_id,
                 )
@@ -417,15 +431,18 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 ));
                 let mut caps = profiles::COWFS_SNAPSHOT;
                 caps.durability = config.capabilities.durability;
-                (head, root_digest, None, None, true, caps, fs_id)
+                (head, root_digest, None, None, true, None, caps, fs_id)
             }
             CowFsOpenMode::Snapshot(snap_name) => {
-                let head = head_store.read_head(&volume).await?;
+                let mut head = head_store.read_head(&volume).await?;
                 if head.format_version != COWFS_FORMAT_VERSION {
                     return Err(Errno::EPROTONOSUPPORT);
                 }
                 let snap = head_store.get_snapshot(&volume, &snap_name).await?;
                 let root_digest = snap.root;
+                head.root = snap.root;
+                head.epoch = snap.epoch;
+                head.updated_at = snap.created_at;
                 let fs_id = FsId(format!(
                     "cowfs:{}@{}",
                     volume.0,
@@ -433,7 +450,16 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 ));
                 let mut caps = profiles::COWFS_SNAPSHOT;
                 caps.durability = config.capabilities.durability;
-                (head, root_digest, None, None, true, caps, fs_id)
+                (
+                    head,
+                    root_digest,
+                    None,
+                    None,
+                    true,
+                    Some(snap_name),
+                    caps,
+                    fs_id,
+                )
             }
         };
 
@@ -490,11 +516,13 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         };
 
         let actual_volume = head.volume.clone();
+        let initial_modified = head.modified;
         let fs = Self {
             fs_id,
             volume_id: actual_volume,
             subvol: config.subvol,
             read_only,
+            pinned_snapshot,
             capabilities,
             capacity_bytes: config.capacity_bytes,
             root_generation: root_inode.generation,
@@ -509,6 +537,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 lease,
                 forked_from,
                 fenced: false,
+                user_modified: initial_modified,
                 overlay: TreeOverlay::new(),
                 dirty_blocks: HashMap::new(),
                 dirty_block_bytes: 0,
@@ -588,8 +617,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     }
 
     /// Refresh an RO view to the volume's latest committed head (`-o remount,refresh`).
+    /// Named snapshot mounts are pinned immutably and reject refresh (`EINVAL`).
     pub async fn refresh_ro(&self) -> Result<VolumeHead> {
-        if !self.read_only {
+        if !self.read_only || self.pinned_snapshot.is_some() {
             return Err(Errno::EINVAL);
         }
         let latest = self.head_store.read_head(&self.volume_id).await?;
@@ -638,7 +668,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         };
         let req = ForkRequest {
             source_volume: self.volume_id.clone(),
-            source_snapshot: snapshot.map(str::to_owned),
+            source_snapshot: snapshot
+                .map(str::to_owned)
+                .or_else(|| self.pinned_snapshot.clone()),
             source_root,
             new_volume,
             ephemeral_if_unmodified,
@@ -650,20 +682,19 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     /// Commit any dirty transaction group, release the writer lease, and auto-prune an unmodified
     /// ephemeral tab fork (`ephemeral_if_unmodified && !modified`, contract §2.1, Blueprint §3.2).
     pub async fn close_clean(&self) -> Result<()> {
-        if !self.read_only {
-            let should_commit = {
-                let st = self.state.borrow();
-                !st.fenced && st.is_dirty()
-            };
-            if should_commit {
-                self.commit_tx_group().await?;
-            }
+        let (should_commit, should_prune) = {
+            let st = self.state.borrow();
+            let prune = st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
+            let commit = !self.read_only && !st.fenced && !prune && st.is_dirty();
+            (commit, prune)
+        };
+        if should_commit {
+            self.commit_tx_group().await?;
         }
-        let (lease, should_prune, vol) = {
+        let (lease, vol) = {
             let mut st = self.state.borrow_mut();
             let lease = st.lease.take();
-            let prune = st.head.ephemeral_if_unmodified && !st.head.modified;
-            (lease, prune, st.head.volume.clone())
+            (lease, st.head.volume.clone())
         };
         if let Some(l) = lease {
             self.head_store.release_writer(l).await?;
@@ -685,11 +716,13 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     }
 
     async fn commit_tx_group_locked(&self) -> Result<VolumeHead> {
-        let (fenced, is_dirty, head_snap, subvol_root, root_obj_snap) = {
+        let (fenced, skip_commit, head_snap, subvol_root, root_obj_snap) = {
             let st = self.state.borrow();
+            let ephemeral_atime_only =
+                st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
             (
                 st.fenced,
-                st.is_dirty(),
+                !st.is_dirty() || ephemeral_atime_only,
                 st.head.clone(),
                 st.subvol_root,
                 st.root_obj.clone(),
@@ -698,7 +731,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if fenced {
             return Err(Errno::ESTALE);
         }
-        if !is_dirty {
+        if skip_commit {
             // Even when clean, verify our writer fence hasn't been stolen (`ESTALE`).
             let latest = self.head_store.read_head(&self.volume_id).await?;
             if latest.incarnation != head_snap.incarnation || latest.fence != head_snap.fence {
@@ -930,6 +963,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
     fn stage_perm_acls(&self, ino: u64, node: &PermNode) -> Result<()> {
         let mut st = self.state.borrow_mut();
+        st.user_modified = true;
         if node.acl.is_some() {
             let entries = node.entries();
             let raw = serde_json::to_vec(&entries).map_err(|_| Errno::EIO)?;
@@ -952,6 +986,15 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     }
 
     fn stage_inode(&self, ino: u64, item: &InodeItem) {
+        {
+            let mut st = self.state.borrow_mut();
+            st.user_modified = true;
+            st.overlay.put(TreeKey::inode_item(ino), item.encode());
+        }
+        self.sync_arena_dirty();
+    }
+
+    fn stage_inode_atime(&self, ino: u64, item: &InodeItem) {
         self.state
             .borrow_mut()
             .overlay
@@ -1049,7 +1092,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         };
         if update {
             item.atime = now;
-            self.stage_inode(ino, item);
+            self.stage_inode_atime(ino, item);
         }
     }
 
@@ -1368,12 +1411,15 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                                 let tail_blk_start = (new_size / blk_size) * blk_size;
                                 let block_bytes = self.read_verified_block(&digest).await?;
 
-                                // Remove old extent.
-                                {
+                                // Remove old extent, preserving whether its backing block was
+                                // staged uncommitted so a refcount-1 multi-block split stays staged.
+                                let was_dirty = {
                                     let mut st = self.state.borrow_mut();
+                                    let dirty = st.dirty_blocks.contains_key(&digest);
                                     st.unstage_dirty_block(&digest);
                                     st.overlay.delete(ext_key);
-                                }
+                                    dirty
+                                };
 
                                 // Re-emit prefix if `tail_blk_start > ext_start`.
                                 if tail_blk_start > ext_start {
@@ -1385,7 +1431,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                                     }
                                     .encode()?;
                                     let mut st = self.state.borrow_mut();
-                                    if st.dirty_blocks.contains_key(&digest) {
+                                    if was_dirty {
                                         st.stage_dirty_block(digest, Rc::clone(&block_bytes));
                                     }
                                     st.overlay
@@ -1590,6 +1636,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 let blk_end = blk_start.saturating_add(blk_size);
                 {
                     let mut st = self.state.borrow_mut();
+                    let was_dirty = st.dirty_blocks.contains_key(&old_digest);
                     st.unstage_dirty_block(&old_digest);
                     st.overlay.delete(old_key);
 
@@ -1601,9 +1648,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                             block_offset: old_blk_off,
                         }
                         .encode()?;
-                        if let Some(ref bytes) = old_bytes
-                            && st.dirty_blocks.contains_key(&old_digest)
-                        {
+                        if was_dirty && let Some(ref bytes) = old_bytes {
                             st.stage_dirty_block(old_digest, Rc::clone(bytes));
                         }
                         st.overlay
@@ -1618,9 +1663,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                             block_offset: suf_off,
                         }
                         .encode()?;
-                        if let Some(ref bytes) = old_bytes
-                            && st.dirty_blocks.contains_key(&old_digest)
-                        {
+                        if was_dirty && let Some(ref bytes) = old_bytes {
                             st.stage_dirty_block(old_digest, Rc::clone(bytes));
                         }
                         st.overlay.put(TreeKey::extent_data(ino, blk_end), suf_enc);
@@ -1858,6 +1901,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
         {
             let mut st = self.state.borrow_mut();
+            st.user_modified = true;
             st.overlay.put(TreeKey::inode_item(ino), item.encode());
             st.overlay
                 .put(TreeKey::inode_ref(ino, dir_ino, name), Vec::new());
@@ -1914,8 +1958,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if access == Access::Path {
             return Ok(access);
         }
-        if self.read_only && (access.writes() || options.is_truncate()) {
-            return Err(Errno::EROFS);
+        if access.writes() || options.is_truncate() {
+            self.check_rw()?;
         }
         let mut mask = access.mask();
         if options.is_truncate() {
@@ -2423,6 +2467,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             };
             {
                 let mut st = self.state.borrow_mut();
+                st.user_modified = true;
                 st.overlay
                     .put(TreeKey::dir_item(dir_ino, name), di.encode());
                 st.overlay
@@ -2588,6 +2633,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             };
             {
                 let mut st = self.state.borrow_mut();
+                st.user_modified = true;
                 st.overlay.delete(TreeKey::dir_item(from_dir_ino, from));
                 st.overlay
                     .delete(TreeKey::dir_index(from_dir_ino, src_di.dir_index));
@@ -3156,6 +3202,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
         {
             let mut st = self.state.borrow_mut();
+            st.user_modified = true;
             st.overlay.delete(TreeKey::dir_item(dir_ino, name));
             st.overlay.delete(TreeKey::dir_index(dir_ino, di.dir_index));
             st.overlay
@@ -3168,5 +3215,166 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         self.sync_arena_dirty();
         self.reclaim_if_dead(di.child_ino, &victim).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::verify_volume;
+    use cowtree::memory::{MemoryHeadStore, MemoryPackStore};
+
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        vfs::now_or_never(fut).expect("memory cowfs future ready")
+    }
+
+    #[test]
+    fn uncommitted_multiblock_extent_split_preserves_dirty_block_on_write_and_truncate() {
+        let hs = Rc::new(MemoryHeadStore::new());
+        let ps = Rc::new(MemoryPackStore::new());
+        let vol = VolumeId("vol-multiblk-split".into());
+        let now = Timespec { sec: 1000, nsec: 0 };
+        block_on(CowFs::format_volume(
+            &*hs,
+            &*ps,
+            vol.clone(),
+            0,
+            0,
+            0o755,
+            now,
+        ))
+        .unwrap();
+        let fs = block_on(CowFs::open(
+            hs.clone(),
+            ps.clone(),
+            vol.clone(),
+            CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+            CowFsConfig::local_browser(Rc::new(move || now)),
+        ))
+        .unwrap();
+        let admin = Cred::root();
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true);
+
+        // (a) Stage a single 192 KiB (3 * 64 KiB) uncommitted multi-block extent with refcount 1,
+        // then overwrite its middle 64 KiB block -> splits into prefix [0, 64K), new [64K, 128K),
+        // and suffix [128K, 192K). Both prefix and suffix must keep the dirty block staged!
+        let (e_write, o_write) =
+            block_on(fs.create(&admin, &fs.root(), "split_write.bin", 0o644, &opts)).unwrap();
+        let ino_w = e_write.handle.node.ino;
+        let mut multi_w = vec![0u8; 3 * BLOCK_SIZE as usize];
+        multi_w[0..BLOCK_SIZE as usize].fill(0x11);
+        multi_w[BLOCK_SIZE as usize..2 * BLOCK_SIZE as usize].fill(0x22);
+        multi_w[2 * BLOCK_SIZE as usize..3 * BLOCK_SIZE as usize].fill(0x33);
+        let dig_w = sha256(&multi_w);
+        let ext_w = ExtentDataValue::Extent {
+            len: 3 * BLOCK_SIZE,
+            digest: dig_w,
+            block_offset: 0,
+        }
+        .encode()
+        .unwrap();
+        {
+            let mut item = block_on(fs.load_inode(ino_w)).unwrap().unwrap();
+            item.size = (3 * BLOCK_SIZE) as u64;
+            let mut st = fs.state.borrow_mut();
+            st.stage_dirty_block(dig_w, Rc::new(multi_w));
+            st.overlay.put(TreeKey::extent_data(ino_w, 0), ext_w);
+            st.overlay.put(TreeKey::inode_item(ino_w), item.encode());
+            st.user_modified = true;
+        }
+        // Overwrite 4 bytes inside the middle 64 KiB block [64K, 128K).
+        block_on(fs.write_at(
+            &o_write,
+            b"MID!",
+            WriteAt::Offset(u64::from(BLOCK_SIZE) + 8),
+        ))
+        .unwrap();
+
+        // (b) Stage a single 192 KiB uncommitted multi-block extent with refcount 1, then truncate
+        // to `128 KiB + 17` -> splits into untouched prefix [0, 128K) + zero-padded tail [128K, 192K).
+        let (e_trunc, o_trunc) =
+            block_on(fs.create(&admin, &fs.root(), "split_trunc.bin", 0o644, &opts)).unwrap();
+        let ino_t = e_trunc.handle.node.ino;
+        let mut multi_t = vec![0u8; 3 * BLOCK_SIZE as usize];
+        multi_t[0..BLOCK_SIZE as usize].fill(0x44);
+        multi_t[BLOCK_SIZE as usize..2 * BLOCK_SIZE as usize].fill(0x55);
+        multi_t[2 * BLOCK_SIZE as usize..3 * BLOCK_SIZE as usize].fill(0x66);
+        let dig_t = sha256(&multi_t);
+        let ext_t = ExtentDataValue::Extent {
+            len: 3 * BLOCK_SIZE,
+            digest: dig_t,
+            block_offset: 0,
+        }
+        .encode()
+        .unwrap();
+        {
+            let mut item = block_on(fs.load_inode(ino_t)).unwrap().unwrap();
+            item.size = (3 * BLOCK_SIZE) as u64;
+            let mut st = fs.state.borrow_mut();
+            st.stage_dirty_block(dig_t, Rc::new(multi_t));
+            st.overlay.put(TreeKey::extent_data(ino_t, 0), ext_t);
+            st.overlay.put(TreeKey::inode_item(ino_t), item.encode());
+            st.user_modified = true;
+        }
+        let trunc_len = 2 * u64::from(BLOCK_SIZE) + 17;
+        block_on(fs.set_len(&o_trunc, trunc_len)).unwrap();
+
+        // Commit, drop caches, and verify BOTH split files read back intact from PackStore!
+        block_on(fs.commit_tx_group()).unwrap();
+        block_on(fs.release(&o_write)).unwrap();
+        block_on(fs.release(&o_trunc)).unwrap();
+        block_on(fs.close_clean()).unwrap();
+
+        let report = block_on(verify_volume(&*hs, &*ps, &vol)).unwrap();
+        assert!(report.ok, "fsck errors: {:?}", report.errors);
+
+        let ro = block_on(CowFs::open(
+            hs.clone(),
+            ps.clone(),
+            vol,
+            CowFsOpenMode::ReadOnly,
+            CowFsConfig::local_browser(Rc::new(move || now)),
+        ))
+        .unwrap();
+        let mut ro_opt = OpenOptions::new();
+        ro_opt.read(true);
+
+        let w_ent = block_on(ro.lookup(&admin, &ro.root(), "split_write.bin")).unwrap();
+        let w_fd = block_on(ro.open(&admin, &w_ent.handle, &ro_opt)).unwrap();
+        let mut buf = vec![0u8; 3 * BLOCK_SIZE as usize];
+        let mut off = 0;
+        while off < buf.len() {
+            let n = block_on(ro.read_at(&w_fd, &mut buf[off..], off as u64)).unwrap();
+            assert!(n > 0);
+            off += n;
+        }
+        assert!(buf[0..BLOCK_SIZE as usize].iter().all(|&b| b == 0x11));
+        assert_eq!(
+            &buf[BLOCK_SIZE as usize + 8..BLOCK_SIZE as usize + 12],
+            b"MID!"
+        );
+        assert_eq!(buf[BLOCK_SIZE as usize], 0x22);
+        assert!(buf[2 * BLOCK_SIZE as usize..].iter().all(|&b| b == 0x33));
+        block_on(ro.release(&w_fd)).unwrap();
+
+        let t_ent = block_on(ro.lookup(&admin, &ro.root(), "split_trunc.bin")).unwrap();
+        assert_eq!(t_ent.metadata.size, trunc_len);
+        let t_fd = block_on(ro.open(&admin, &t_ent.handle, &ro_opt)).unwrap();
+        let mut tbuf = vec![0u8; trunc_len as usize];
+        let mut toff = 0;
+        while toff < tbuf.len() {
+            let n = block_on(ro.read_at(&t_fd, &mut tbuf[toff..], toff as u64)).unwrap();
+            assert!(n > 0);
+            toff += n;
+        }
+        assert!(tbuf[0..BLOCK_SIZE as usize].iter().all(|&b| b == 0x44));
+        assert!(
+            tbuf[BLOCK_SIZE as usize..2 * BLOCK_SIZE as usize]
+                .iter()
+                .all(|&b| b == 0x55)
+        );
+        assert!(tbuf[2 * BLOCK_SIZE as usize..].iter().all(|&b| b == 0x66));
+        block_on(ro.release(&t_fd)).unwrap();
     }
 }

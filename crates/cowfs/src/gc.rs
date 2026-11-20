@@ -68,15 +68,36 @@ pub async fn collect_garbage<H: HeadStore, P: PackStore>(
         .into_iter()
         .collect();
 
-    // Also unlink any orphan packs in PackStore that are not reachable from any live/grace root
-    // (for example, packs written just before a crash prior to `commit_head`). Because we hold
-    // the exclusive GC lock, no commit is concurrently in flight.
+    // Also unlink any genuine unindexed crash-orphan packs in PackStore (for example, packs
+    // written just before a crash prior to `commit_head`). Packs still indexed in `HeadStore`
+    // (such as packs from a deleted volume still protected inside `grace_before`) MUST NOT be
+    // deleted from `PackStore`, otherwise a later dedupe hit in `HeadStore::lookup_block` would
+    // point at a deleted pack (`ENOENT`). Because we hold the exclusive GC lock, no commit is
+    // concurrently in flight.
     let all_packs = pack_store.list_packs().await?;
     for pack_id in all_packs {
-        if !keep_packs.contains(&pack_id) {
-            // Confirm it isn't still protected inside grace window by checking whether sweep
-            // kept it or whether it's an unindexed orphan: since every grace-window root was
-            // marked above, any pack not in `keep_packs` has zero live/grace references!
+        if keep_packs.contains(&pack_id) || swept_set.contains(&pack_id) {
+            continue;
+        }
+        let still_indexed = match pack_store.read_pack_trailer(&pack_id).await {
+            Ok(trailer) => {
+                let mut indexed = false;
+                for entry in &trailer.entries {
+                    if let Some(loc) = head_store.lookup_block(&entry.digest).await?
+                        && loc.pack_id == pack_id
+                    {
+                        indexed = true;
+                        break;
+                    }
+                }
+                indexed
+            }
+            Err(_) => {
+                // Corrupt or truncated unindexed crash-orphan pack: safe to sweep.
+                false
+            }
+        };
+        if !still_indexed {
             swept_set.insert(pack_id);
         }
     }
