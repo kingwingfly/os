@@ -289,7 +289,7 @@ test('two accounts cannot see or traverse each other user mounts (/mnt/local/*, 
   const dirEntry = path => ({ path, uid: 0, gid: 0, mode: 0o755, node: { type: 'directory' } });
   const extManifest = {
     format: 'os.image',
-    version: 1,
+    version: 2,
     kind: 'sysext',
     name: 'alicepkg',
     revision: '1',
@@ -301,7 +301,7 @@ test('two accounts cannot see or traverse each other user mounts (/mnt/local/*, 
       dirEntry('/'),
       dirEntry('/usr'),
       dirEntry('/usr/bin'),
-      { path: '/usr/bin/probe', uid: 0, gid: 0, mode: 0o755, node: { type: 'file', sha256: probeHash, size: probeBytes.length } },
+      { path: '/usr/bin/probe', uid: 0, gid: 0, mode: 0o755, node: { type: 'file', sha256: probeHash, size: probeBytes.length, chunk_size: 262144, chunks: [probeHash] } },
     ],
   };
 

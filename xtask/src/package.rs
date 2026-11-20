@@ -1,7 +1,8 @@
 use crate::Result;
 use os_image::{
-    ABI, Composition, Entry, Image, Kind, LEVEL, Node, PROTOCOL, Range, Release, SCHEMA, Trust,
-    digest, hex,
+    ABI, CHUNK_SIZE_DEFAULT, Composition, Entry, HOST_ADAPTER, IMAGE_VERSION, Image, Kind, LEVEL,
+    LoaderMeta, Node, PROTOCOL, RELEASE_VERSION, Range, ReleaseV2, SCHEMA, SIGNING_DOMAIN_IMAGE_V2,
+    SIGNING_DOMAIN_RELEASE_V2, Trust, chunk_digests, digest, hex,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -56,18 +57,21 @@ fn no_overlap(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 fn directory(path: &str) -> Entry {
+    directory_mode(path, 0, 0, 0o755)
+}
+fn directory_mode(path: &str, uid: u32, gid: u32, mode: u16) -> Entry {
     Entry {
         path: path.into(),
-        uid: 0,
-        gid: 0,
-        mode: 0o755,
+        uid,
+        gid,
+        mode,
         node: Node::Directory,
     }
 }
 fn image(kind: Kind, name: &str, revision: &str, entries: Vec<Entry>) -> Image {
     Image {
         format: "os.image".into(),
-        version: 1,
+        version: IMAGE_VERSION,
         kind,
         name: name.into(),
         revision: revision.into(),
@@ -80,10 +84,13 @@ fn image(kind: Kind, name: &str, revision: &str, entries: Vec<Entry>) -> Image {
 }
 fn blob(out: &Path, bytes: &[u8]) -> Result<Node> {
     let sha256 = digest(bytes);
+    let chunks = chunk_digests(bytes, CHUNK_SIZE_DEFAULT)?;
     immutable(&out.join("blobs").join(&sha256), bytes)?;
     Ok(Node::File {
         sha256,
         size: bytes.len() as u64,
+        chunk_size: CHUNK_SIZE_DEFAULT,
+        chunks,
     })
 }
 fn walk(root: &Path, at: &Path, out: &Path, entries: &mut Vec<Entry>, boot: bool) -> Result<()> {
@@ -161,6 +168,133 @@ pub fn tree(root: &Path, kind: Kind, name: &str, revision: &str, out: &Path) -> 
     let id = write_image(out, &manifest)?;
     replace(&out.join("manifest.json"), &serde_json::to_vec(&manifest)?)?;
     Ok(id)
+}
+/// Stage 1 `Initramfs` image: `/init`, `/bin/mount`, `/bin/switch_root`, `/bin/cowfsck`,
+/// `/bin/sh` backed by built WASI applet bundles (`init.wasm`, `utilities.wasm`, `dash.wasm`).
+fn initramfs(assets: &Path, out: &Path, name: &str) -> Result<Image> {
+    let mut entries = vec![
+        directory("/"),
+        directory("/bin"),
+        directory("/dev"),
+        directory_mode("/proc", 0, 0, 0o555),
+        directory("/run"),
+        directory("/sysroot"),
+        directory_mode("/tmp", 0, 0, 0o1777),
+        directory("/usr"),
+        Entry {
+            path: "/init".into(),
+            uid: 0,
+            gid: 0,
+            mode: 0o755,
+            node: blob(out, &read_regular(&assets.join("usr/bin/init.wasm"))?)?,
+        },
+        Entry {
+            path: "/bin/utilities".into(),
+            uid: 0,
+            gid: 0,
+            mode: 0o755,
+            node: blob(out, &read_regular(&assets.join("usr/bin/utilities.wasm"))?)?,
+        },
+        Entry {
+            path: "/bin/dash".into(),
+            uid: 0,
+            gid: 0,
+            mode: 0o755,
+            node: blob(out, &read_regular(&assets.join("usr/bin/dash.wasm"))?)?,
+        },
+    ];
+    for (path, target) in [
+        ("/bin/mount", "utilities"),
+        ("/bin/switch_root", "utilities"),
+        ("/bin/cowfsck", "utilities"),
+        ("/bin/sh", "dash"),
+    ] {
+        entries.push(Entry {
+            path: path.into(),
+            uid: 0,
+            gid: 0,
+            mode: 0o777,
+            node: Node::Symlink {
+                target: target.into(),
+            },
+        });
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let manifest = image(Kind::Initramfs, name, "1", entries);
+    manifest.validate()?;
+    Ok(manifest)
+}
+/// Stage 1 first-boot `RootTemplate` image: deterministic `/etc`, `/var`, `/root`, `/home`
+/// defaults (including default local user `uid 1000` in `wheel` with passwordless `sudo`,
+/// Contract §2.1 & §2.15). Never overwrites an existing root volume.
+fn root_template(out: &Path, name: &str) -> Result<Image> {
+    let mut entries = vec![
+        directory("/"),
+        directory("/boot"),
+        directory("/dev"),
+        directory("/dev/pts"),
+        directory("/etc"),
+        directory("/home"),
+        directory_mode("/home/user", 1000, 1000, 0o755),
+        directory("/mnt"),
+        directory("/mnt/local"),
+        directory("/mnt/shared"),
+        directory("/opt"),
+        directory("/opt/private"),
+        directory_mode("/proc", 0, 0, 0o555),
+        directory_mode("/root", 0, 0, 0o700),
+        directory("/run"),
+        directory("/srv"),
+        directory_mode("/sys", 0, 0, 0o555),
+        directory_mode("/tmp", 0, 0, 0o1777),
+        directory("/usr"),
+        directory("/var"),
+        directory("/var/cache"),
+        directory("/var/lib"),
+        directory("/var/log"),
+        directory_mode("/var/tmp", 0, 0, 0o1777),
+    ];
+    let defaults: &[(&str, u16, &[u8])] = &[
+        (
+            "/etc/passwd",
+            0o644,
+            b"root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:Local User:/home/user:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/false\n",
+        ),
+        (
+            "/etc/group",
+            0o644,
+            b"root:x:0:\nwheel:x:10:root,user\nuser:x:1000:\nnogroup:x:65534:\n",
+        ),
+        (
+            "/etc/shadow",
+            0o600,
+            b"root:!:0:0:99999:7:::\nuser:!:0:0:99999:7:::\nnobody:!:0:0:99999:7:::\n",
+        ),
+        (
+            "/etc/sudoers",
+            0o440,
+            b"root ALL=(ALL:ALL) ALL\n%wheel ALL=(ALL:ALL) NOPASSWD: ALL\n",
+        ),
+        ("/etc/hostname", 0o644, b"os\n"),
+        (
+            "/etc/os-release",
+            0o644,
+            b"NAME=\"OS\"\nID=os\nVERSION_ID=\"2\"\nPRETTY_NAME=\"OS Release v2\"\n",
+        ),
+    ];
+    for &(path, mode, content) in defaults {
+        entries.push(Entry {
+            path: path.into(),
+            uid: 0,
+            gid: 0,
+            mode,
+            node: blob(out, content)?,
+        });
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let manifest = image(Kind::RootTemplate, name, "1", entries);
+    manifest.validate()?;
+    Ok(manifest)
 }
 fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
     let mut entries: Vec<Entry> = [
@@ -345,13 +479,41 @@ pub fn boot(
     let p = crate::build::verify(assets)?;
     let mut boot = image(Kind::Boot, name, "1", entries);
     boot.provenance = p.clone();
+    let client_kernel_sha256 = boot
+        .entries
+        .iter()
+        .find_map(|entry| {
+            if entry.path == "/client_kernel_bg.wasm"
+                && let Node::File { sha256, .. } = &entry.node
+            {
+                return Some(sha256.clone());
+            }
+            None
+        })
+        .ok_or("boot assets missing required /client_kernel_bg.wasm")?;
+    let mut initramfs_img = initramfs(assets, out, name)?;
+    initramfs_img.provenance = p.clone();
+    let mut root_template_img = root_template(out, name)?;
+    root_template_img.provenance = p.clone();
     let mut base = installed(assets, out, name)?;
     base.provenance = p.clone();
-    let mut release = Release {
+    let mut release = ReleaseV2 {
         format: "os.release".into(),
-        version: 1,
+        version: RELEASE_VERSION,
         name: name.into(),
+        loader: LoaderMeta {
+            entry: "/index.html".into(),
+            client_kernel_js: "/client-kernel.js".into(),
+            client_kernel_wasm: "/client_kernel_bg.wasm".into(),
+            client_kernel_sha256,
+            host_adapter: Range {
+                min: HOST_ADAPTER,
+                max: HOST_ADAPTER,
+            },
+        },
         boot: write_image(out, &boot)?,
+        initramfs: write_image(out, &initramfs_img)?,
+        root_template: write_image(out, &root_template_img)?,
         base: write_image(out, &base)?,
         sysext: vec![],
         confext: vec![],
@@ -377,6 +539,9 @@ pub fn boot(
             }
         }
     }
+    release.verify_boot_loader(&boot)?;
+    Composition::standalone(&initramfs_img)?;
+    Composition::standalone(&root_template_img)?;
     Composition::new(&base, &extensions)?;
     release.validate()?;
     let bytes = serde_json::to_vec(&release)?;
@@ -397,42 +562,101 @@ pub fn boot(
     verify(out, None)?;
     Ok(id)
 }
+fn check_file_chunks(
+    path: &Path,
+    expected_sha256: &str,
+    expected_size: u64,
+    chunk_size: u32,
+    expected_chunks: &[String],
+    label: &str,
+) -> Result<()> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(format!("artifact is not a regular file: {label}").into());
+    }
+    let mut file = fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut chunk_hash = Sha256::new();
+    let mut chunk_filled = 0usize;
+    let mut chunk_index = 0usize;
+    let cs = chunk_size as usize;
+    let mut length = 0u64;
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+        length += n as u64;
+        if length > expected_size {
+            return Err(format!("content length mismatch: {label}").into());
+        }
+        let mut slice = &buffer[..n];
+        while !slice.is_empty() {
+            let take = slice.len().min(cs - chunk_filled);
+            chunk_hash.update(&slice[..take]);
+            chunk_filled += take;
+            slice = &slice[take..];
+            if chunk_filled == cs {
+                let expected = expected_chunks
+                    .get(chunk_index)
+                    .ok_or_else(|| format!("chunk index out of range: {label}"))?;
+                if hex(&chunk_hash.finalize_reset()) != *expected {
+                    return Err(format!("chunk {chunk_index} digest mismatch: {label}").into());
+                }
+                chunk_filled = 0;
+                chunk_index += 1;
+            }
+        }
+    }
+    if chunk_filled > 0 {
+        let expected = expected_chunks
+            .get(chunk_index)
+            .ok_or_else(|| format!("chunk index out of range: {label}"))?;
+        if hex(&chunk_hash.finalize()) != *expected {
+            return Err(format!("chunk {chunk_index} digest mismatch: {label}").into());
+        }
+        chunk_index += 1;
+    }
+    if length != expected_size
+        || chunk_index != expected_chunks.len()
+        || hex(&hash.finalize()) != expected_sha256
+    {
+        return Err(format!("content digest/length mismatch: {label}").into());
+    }
+    Ok(())
+}
 fn check_contents(root: &Path, image: &Image) -> Result<()> {
     for entry in &image.entries {
-        if let Node::File { sha256, size } = &entry.node {
-            let path = root.join("blobs").join(sha256);
-            if !fs::symlink_metadata(&path)?.is_file() {
-                return Err("blob is not a regular file".into());
-            }
-            let mut file = fs::File::open(path)?;
-            let mut hash = Sha256::new();
-            let mut length = 0u64;
-            let mut buffer = [0; 65536];
-            loop {
-                let n = file.read(&mut buffer)?;
-                if n == 0 {
-                    break;
-                }
-                hash.update(&buffer[..n]);
-                length += n as u64;
-            }
-            if length != *size || hex(&hash.finalize()) != *sha256 {
-                return Err(format!("content digest/length mismatch: {}", entry.path).into());
-            }
+        if let Node::File {
+            sha256,
+            size,
+            chunk_size,
+            chunks,
+        } = &entry.node
+        {
+            check_file_chunks(
+                &root.join("blobs").join(sha256),
+                sha256,
+                *size,
+                *chunk_size,
+                chunks,
+                &entry.path,
+            )?;
         }
     }
     Ok(())
 }
 pub fn verify(bundle: &Path, trust: Option<&Trust>) -> Result<String> {
     let bytes = read_regular(&bundle.join("release.json"))?;
-    let release = Release::parse(&bytes)?;
+    let release = ReleaseV2::parse(&bytes)?;
     let id = digest(&bytes);
     if read_regular(&bundle.join(format!("releases/{id}/manifest.json")))? != bytes {
         return Err("release projection mismatch".into());
     }
     if let Some(trust) = trust {
         trust.verify(
-            "os.release.v1",
+            SIGNING_DOMAIN_RELEASE_V2,
             &bytes,
             &read_regular(&bundle.join(format!("releases/{id}/signature.json")))?,
         )?;
@@ -445,7 +669,7 @@ pub fn verify(bundle: &Path, trust: Option<&Trust>) -> Result<String> {
         }
         if let Some(trust) = trust {
             trust.verify(
-                "os.image.v1",
+                SIGNING_DOMAIN_IMAGE_V2,
                 &bytes,
                 &read_regular(&bundle.join(format!("images/{hash}.sig")))?,
             )?;
@@ -454,10 +678,15 @@ pub fn verify(bundle: &Path, trust: Option<&Trust>) -> Result<String> {
         check_contents(bundle, &image)?;
         images.push(image);
     }
-    if images[0].kind != Kind::Boot || images[1].kind != Kind::Base {
-        return Err("release boot/base kind mismatch".into());
+    if images.len() < 4
+        || images[0].kind != Kind::Boot
+        || images[1].kind != Kind::Initramfs
+        || images[2].kind != Kind::RootTemplate
+        || images[3].kind != Kind::Base
+    {
+        return Err("release boot/initramfs/root_template/base kind mismatch".into());
     }
-    for (i, image) in images[2..].iter().enumerate() {
+    for (i, image) in images[4..].iter().enumerate() {
         if image.kind
             != if i < release.sysext.len() {
                 Kind::Sysext
@@ -468,13 +697,26 @@ pub fn verify(bundle: &Path, trust: Option<&Trust>) -> Result<String> {
             return Err("release extension kind mismatch".into());
         }
     }
-    Composition::new(&images[1], &images[2..])?;
+    release.verify_boot_loader(&images[0])?;
+    Composition::standalone(&images[1])?;
+    Composition::standalone(&images[2])?;
+    Composition::new(&images[3], &images[4..])?;
     for entry in &images[0].entries {
-        if let Node::File { sha256, size } = &entry.node {
-            let bytes = read_regular(&bundle.join(format!("releases/{id}/assets{}", entry.path)))?;
-            if bytes.len() as u64 != *size || digest(&bytes) != *sha256 {
-                return Err(format!("boot asset mismatch: {}", entry.path).into());
-            }
+        if let Node::File {
+            sha256,
+            size,
+            chunk_size,
+            chunks,
+        } = &entry.node
+        {
+            check_file_chunks(
+                &bundle.join(format!("releases/{id}/assets{}", entry.path)),
+                sha256,
+                *size,
+                *chunk_size,
+                chunks,
+                &entry.path,
+            )?;
         } else if matches!(entry.node, Node::Symlink { .. }) {
             return Err("boot assets cannot contain symlinks".into());
         }

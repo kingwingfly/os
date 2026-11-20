@@ -1,4 +1,5 @@
 import { asset } from '../release.js';
+import { imageBlobRead } from './image-pager.js';
 // The client kernel: a classic worker, so it can importScripts the no-modules wasm-bindgen
 // build, with the Rust kernel (crates/client-kernel) holding the processes its tabs host and
 // their tokens. Each tab owns a dedicated Worker, which owns its process Workers and pipes.
@@ -111,21 +112,7 @@ self.pageFileRead = async (path, offset, len) => {
   return { status: response.status, body, etag };
 };
 
-self.imageBlobRead = async (blobId, offset, len) => {
-  const start = Number(offset);
-  const count = Number(len);
-  if (count <= 0) return new Uint8Array(0);
-  const url = blobId.startsWith('sha256:')
-    ? `/boot/blobs/${blobId.slice(7)}`
-    : asset(blobId.startsWith('/') ? blobId : `/${blobId}`);
-  const response = await fetch(url);
-  if (response.status === 404) throw { errno: 'ENOENT' };
-  if (!response.ok) throw { errno: 'EIO' };
-  const full = new Uint8Array(await response.arrayBuffer());
-  if (start === 0 && count >= full.length) return full;
-  if (start >= full.length) return new Uint8Array(0);
-  return full.subarray(start, start + count);
-};
+self.imageBlobRead = imageBlobRead;
 
 self.onKernelMountsChanged = value => {
   broadcast({ v: VERSION, type: 'event', event: 'mounts-changed', value });

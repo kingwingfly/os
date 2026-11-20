@@ -64,7 +64,7 @@ impl Package {
         TRUST
             .with(|t| {
                 t.borrow().verify(
-                    "os.release.v1",
+                    os_image::SIGNING_DOMAIN_RELEASE_V2,
                     self.release.bytes.as_bytes(),
                     self.release.signature.as_bytes(),
                 )
@@ -81,7 +81,7 @@ impl Package {
             TRUST
                 .with(|t| {
                     t.borrow().verify(
-                        "os.image.v1",
+                        os_image::SIGNING_DOMAIN_IMAGE_V2,
                         signed.bytes.as_bytes(),
                         signed.signature.as_bytes(),
                     )
@@ -92,15 +92,20 @@ impl Package {
         for (i, image) in images.iter().enumerate() {
             let kind = match i {
                 0 => Kind::Boot,
-                1 => Kind::Base,
-                n if n < 2 + release.sysext.len() => Kind::Sysext,
+                1 => Kind::Initramfs,
+                2 => Kind::RootTemplate,
+                3 => Kind::Base,
+                n if n < 4 + release.sysext.len() => Kind::Sysext,
                 _ => Kind::Confext,
             };
             if image.kind != kind {
                 return Err(invalid("release image kind mismatch"));
             }
         }
-        let composition = Composition::new(&images[1], &images[2..]).map_err(invalid)?;
+        release.verify_boot_loader(&images[0]).map_err(invalid)?;
+        Composition::standalone(&images[1]).map_err(invalid)?;
+        Composition::standalone(&images[2]).map_err(invalid)?;
+        let composition = Composition::new(&images[3], &images[4..]).map_err(invalid)?;
         // Early boot has a fixed protocol entry point. An incomplete generation cannot
         // become the default just because a publisher signed its manifest.
         for required in [
@@ -174,7 +179,7 @@ pub fn select(db: &mut Db, id: Option<&str>) -> Result<()> {
         let node = match &entry.node {
             os_image::Node::Directory => Node::directory(entry.uid, entry.gid, entry.mode),
             os_image::Node::Symlink { target } => Node::symlink(entry.uid, entry.gid, target),
-            os_image::Node::File { sha256, size } => Node::file(
+            os_image::Node::File { sha256, size, .. } => Node::file(
                 entry.uid,
                 entry.gid,
                 entry.mode,
@@ -211,6 +216,15 @@ pub fn select(db: &mut Db, id: Option<&str>) -> Result<()> {
 impl Mounted {
     pub fn node(&self, path: &str) -> Option<Node> {
         self.entries.get(path).cloned()
+    }
+    pub fn by_ino(&self, ino: u64) -> Option<Node> {
+        self.entries.values().find(|n| n.ino == ino).cloned()
+    }
+    pub fn path_of(&self, ino: u64) -> Option<String> {
+        self.entries
+            .iter()
+            .find(|(_, n)| n.ino == ino)
+            .map(|(p, _)| p.clone())
     }
     pub fn owns(&self, path: &str) -> bool {
         // Merge-point metadata is immutable; unclaimed children remain mutable.
@@ -342,6 +356,8 @@ struct Content {
     path: String,
     sha256: String,
     size: u64,
+    chunk_size: u32,
+    chunks: Vec<String>,
     wasm: bool,
 }
 pub async fn stage(
@@ -373,20 +389,29 @@ pub async fn stage(
     let verified_package = package.verify(&id)?;
     let package = serde_json::to_string(&package).map_err(invalid)?;
     // SQLite rows and pending verification plans have a bounded deployment footprint.
-    if package.len() > 1024 * 1024 {
+    if package.len() > os_image::MANIFEST_MAX {
         return Err(Errno::E2BIG.into());
     }
     let mut content = BTreeMap::new();
     for image in &verified_package.images {
         for entry in &image.entries {
-            if let os_image::Node::File { sha256, size } = &entry.node {
+            if let os_image::Node::File {
+                sha256,
+                size,
+                chunk_size,
+                chunks,
+            } = &entry.node
+            {
                 let path = format!("/boot/blobs/{sha256}");
                 let wasm = entry.path.ends_with(".wasm")
-                    || (image.kind == Kind::Base && entry.mode & 0o111 != 0);
+                    || (matches!(image.kind, Kind::Base | Kind::Initramfs)
+                        && entry.mode & 0o111 != 0);
                 content.entry(path.clone()).or_insert(Content {
                     path,
                     sha256: sha256.clone(),
                     size: *size,
+                    chunk_size: *chunk_size,
+                    chunks: chunks.clone(),
                     wasm,
                 });
                 if image.kind == Kind::Boot {
@@ -397,6 +422,8 @@ pub async fn stage(
                             path,
                             sha256: sha256.clone(),
                             size: *size,
+                            chunk_size: *chunk_size,
+                            chunks: chunks.clone(),
                             wasm,
                         },
                     );
@@ -531,7 +558,7 @@ pub async fn internal(req: &mut Request, state: &State) -> worker::Result<Reply>
                     verified(&row)?;
                 }
                 Ok::<_, Error>(
-                    json!({"format":"os.boot","version":1,"default":db.meta("system.active"),"protocol":os_image::PROTOCOL,"schema":os_image::SCHEMA,"trust":TRUST.with(|t| t.borrow().clone())}),
+                    json!({"format":"os.boot","version":2,"default":db.meta("system.active"),"protocol":os_image::PROTOCOL,"schema":os_image::SCHEMA,"trust":TRUST.with(|t| t.borrow().clone())}),
                 )
             })();
             (
@@ -651,6 +678,9 @@ async fn check_content(env: &Env, plan: &Value) -> worker::Result<()> {
     use sha2::{Digest, Sha256};
     let entries: Vec<Content> = serde_json::from_value(plan["content"].clone())?;
     for entry in entries {
+        if !os_image::valid_chunk_size(entry.chunk_size) {
+            return Err(worker::Error::RustError("invalid chunk size".into()));
+        }
         let mut response = env
             .assets("ASSETS")?
             .fetch_request(Request::new(&asset_url(&entry.path), Method::Get)?)
@@ -662,6 +692,10 @@ async fn check_content(env: &Env, plan: &Value) -> worker::Result<()> {
         }
         let mut stream = response.stream()?;
         let mut hash = Sha256::new();
+        let mut chunk_hash = Sha256::new();
+        let mut chunk_filled = 0usize;
+        let mut chunk_index = 0usize;
+        let chunk_size = entry.chunk_size as usize;
         let mut size = 0u64;
         let mut prefix = Vec::new();
         while let Some(chunk) = stream.next().await {
@@ -678,8 +712,40 @@ async fn check_content(env: &Env, plan: &Value) -> worker::Result<()> {
                 prefix.extend_from_slice(&bytes[..bytes.len().min(8 - prefix.len())]);
             }
             hash.update(&bytes);
+            let mut slice = bytes.as_slice();
+            while !slice.is_empty() {
+                let take = slice.len().min(chunk_size - chunk_filled);
+                chunk_hash.update(&slice[..take]);
+                chunk_filled += take;
+                slice = &slice[take..];
+                if chunk_filled == chunk_size {
+                    let expected = entry.chunks.get(chunk_index).ok_or_else(|| {
+                        worker::Error::RustError("chunk index out of range".into())
+                    })?;
+                    if os_image::hex(&chunk_hash.finalize_reset()) != *expected {
+                        return Err(worker::Error::RustError(
+                            "release chunk digest mismatch".into(),
+                        ));
+                    }
+                    chunk_filled = 0;
+                    chunk_index += 1;
+                }
+            }
+        }
+        if chunk_filled > 0 {
+            let expected = entry
+                .chunks
+                .get(chunk_index)
+                .ok_or_else(|| worker::Error::RustError("chunk index out of range".into()))?;
+            if os_image::hex(&chunk_hash.finalize()) != *expected {
+                return Err(worker::Error::RustError(
+                    "release chunk digest mismatch".into(),
+                ));
+            }
+            chunk_index += 1;
         }
         if size != entry.size
+            || chunk_index != entry.chunks.len()
             || os_image::hex(&hash.finalize()) != entry.sha256
             || (entry.wasm && prefix != b"\0asm\x01\0\0\0")
         {
@@ -803,8 +869,11 @@ pub async fn checked_asset(req: Request, env: &Env) -> worker::Result<Response> 
             }
             TRUST
                 .with(|t| {
-                    t.borrow()
-                        .verify("os.release.v1", release.as_bytes(), signature.as_bytes())
+                    t.borrow().verify(
+                        os_image::SIGNING_DOMAIN_RELEASE_V2,
+                        release.as_bytes(),
+                        signature.as_bytes(),
+                    )
                 })
                 .map_err(invalid)?;
             let release = Release::parse(release.as_bytes()).map_err(invalid)?;
@@ -815,8 +884,11 @@ pub async fn checked_asset(req: Request, env: &Env) -> worker::Result<Response> 
             }
             TRUST
                 .with(|t| {
-                    t.borrow()
-                        .verify("os.image.v1", image.as_bytes(), signature.as_bytes())
+                    t.borrow().verify(
+                        os_image::SIGNING_DOMAIN_IMAGE_V2,
+                        image.as_bytes(),
+                        signature.as_bytes(),
+                    )
                 })
                 .map_err(invalid)?;
             let image = Image::parse(image.as_bytes()).map_err(invalid)?;
@@ -865,8 +937,9 @@ pub async fn checked_asset(req: Request, env: &Env) -> worker::Result<Response> 
         }
     }
     // Revalidate revocation on each request; retain immutable bytes without promising a
-    // year of cached execution after an operator revokes a publisher.
-    headers.set("Cache-Control", "no-cache")?;
+    // year of cached execution after an operator revokes a publisher. `no-transform`
+    // prevents intermediaries from gzip-splicing partial 206 range responses.
+    headers.set("Cache-Control", "no-cache, no-transform")?;
     let etag = format!("\"{expected}\"");
     headers.set("ETag", &etag)?;
     headers.set("Accept-Ranges", "bytes")?;

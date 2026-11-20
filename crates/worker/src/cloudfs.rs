@@ -382,7 +382,12 @@ impl Caller {
         check_component(name)?;
         let (_, path) = self.dir(db, dir, EXEC)?;
         let path = join(&path, name);
-        Ok((db.persisted_node(&path).ok_or(Errno::ENOENT)?, path))
+        let node = if db.image.is_some() {
+            db.node(&path)
+        } else {
+            db.persisted_node(&path)
+        };
+        Ok((node.ok_or(Errno::ENOENT)?, path))
     }
     fn entry(&self, db: &Db, node: &Node) -> Entry {
         Entry {
@@ -525,10 +530,16 @@ fn metadata_rdev(node: &Node, writing: Option<(u64, bool)>) -> Option<String> {
 fn metadata(db: &Db, node: &Node) -> Metadata {
     let times = db.times(node.ino);
     let nlink = if node.directory && node.links != 0 {
-        2 + db
-            .names(node.ino)
-            .first()
-            .map_or(0, |path| db.persisted_subdirs(path))
+        2 + db.names(node.ino).first().map_or(0, |path| {
+            if db.image.is_some() {
+                db.children(path)
+                    .into_iter()
+                    .filter(|(_, child)| child.directory)
+                    .count() as u32
+            } else {
+                db.persisted_subdirs(path)
+            }
+        })
     } else {
         node.links
     };
@@ -754,9 +765,14 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
                 Value::Null
             } else {
                 let (parent, name) = path.rsplit_once('/').ok_or(Errno::EIO)?;
-                let parent = db
-                    .persisted_node(if parent.is_empty() { "/" } else { parent })
-                    .ok_or(Errno::ENOENT)?;
+                let parent = if parent.is_empty() {
+                    db.persisted_node("/")
+                } else if db.image.is_some() {
+                    db.node(parent)
+                } else {
+                    db.persisted_node(parent)
+                }
+                .ok_or(Errno::ENOENT)?;
                 json!((c.entry(db, &parent), name))
             }
         }
@@ -764,16 +780,28 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         OpenMetadata { open } => json!(metadata(db, &c.opened(db, open)?)),
         ReadDir { dir } => {
             let (_, path) = c.dir(db, dir, READ)?;
-            #[derive(Deserialize)]
-            struct Child {
-                path: String,
-                ino: u64,
-                file_type: FileType,
-            }
-            // Only names, identities and types are needed: avoid loading descendants or
-            // computing their metadata/link counts inside this synchronous transaction.
-            let entries: Vec<_> = db
-                .rows::<Child>(
+            let entries: Vec<_> = if db.image.is_some() {
+                db.children(&path)
+                    .into_iter()
+                    .map(|(child_path, node)| DirEntry {
+                        name: child_path.rsplit('/').next().unwrap_or("").into(),
+                        node: NodeId {
+                            ino: node.ino,
+                            generation: 1,
+                        },
+                        file_type: file_type(&node),
+                    })
+                    .collect()
+            } else {
+                #[derive(Deserialize)]
+                struct Child {
+                    path: String,
+                    ino: u64,
+                    file_type: FileType,
+                }
+                // Only names, identities and types are needed: avoid loading descendants or
+                // computing their metadata/link counts inside this synchronous transaction.
+                db.rows::<Child>(
                     "SELECT n.path,i.id AS ino,CASE WHEN i.directory = 1 THEN 'dir' WHEN i.link IS NOT NULL THEN 'symlink' WHEN i.rdev IS NOT NULL THEN 'char-device' ELSE 'file' END AS file_type FROM nodes n JOIN inodes i ON i.id = n.ino WHERE n.parent = ? AND n.path != ? ORDER BY n.path",
                     vec![text(&path), text(&path)],
                 )
@@ -786,7 +814,8 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
                     },
                     file_type: child.file_type,
                 })
-                .collect();
+                .collect()
+            };
             db.cloud_accessed(dir.node.ino);
             json!(entries)
         }
@@ -1240,7 +1269,11 @@ fn rename(
     check_component(to)?;
     let (dest_parent, dest) = c.dir(db, to_dir, EXEC)?;
     let new = join(&dest, to);
-    let existing = db.persisted_node(&new);
+    let existing = if db.image.is_some() {
+        db.node(&new)
+    } else {
+        db.persisted_node(&new)
+    };
     if existing.is_some() && flags.contains(RenameFlags::NOREPLACE) {
         return Err(Errno::EEXIST);
     }
@@ -1346,6 +1379,9 @@ impl Db {
         );
     }
     pub(crate) fn cloud_accessed(&mut self, ino: u64) {
+        if crate::system::immutable_inode(ino) {
+            return;
+        }
         let times = self.times(ino);
         let now = auth::clock();
         if times.atime <= times.mtime

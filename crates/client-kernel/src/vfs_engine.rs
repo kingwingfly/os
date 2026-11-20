@@ -49,6 +49,7 @@ const SCOPED_PAGE_PID_BASE: u32 = 0x7fff_0000;
 const READ_STREAM_MAX: usize = 64;
 const MANIFEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const PRIVATE_EXT_MAX_BYTES: u64 = 128 * 1024 * 1024;
+#[allow(dead_code)]
 const WASM_HEADER_STUB: [u8; 8] = [0x00, b'a', b's', b'm', 0x01, 0x00, 0x00, 0x00];
 
 pub(crate) fn vfs_js_err(errno: Errno, detail: impl Into<String>) -> JsValue {
@@ -226,6 +227,7 @@ impl DeviceBackend for JsDeviceBackend {
 
 /// Blob store fetching `/usr/bin/*.wasm` or `/boot/blobs/<sha>` via `self.imageBlobRead`,
 /// falling back to a valid 8-byte Wasm header stub in headless unit tests.
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 pub(crate) struct JsAssetBlobStore {
     cache: Rc<RefCell<HashMap<String, Vec<u8>>>>,
@@ -1831,7 +1833,7 @@ async fn construct_vfs(
         .as_ref()
         .and_then(|o| o.build_asset_sizes)
         .unwrap_or_else(default_asset_sizes);
-    let blob_store = JsAssetBlobStore::default();
+    let blob_store = crate::release_v2::VerifiedAssetBlobStore;
     let usr_image = if let Some(comp_json) =
         opts.as_ref().and_then(|o| o.system_composition.as_ref())
     {
@@ -3446,7 +3448,7 @@ impl Kernel {
                 let mut seen_blobs = BTreeSet::new();
                 for (src_dir, img) in &parsed_imgs {
                     for entry in &img.entries {
-                        if let image::Node::File { sha256, size } = &entry.node {
+                        if let image::Node::File { sha256, size, .. } = &entry.node {
                             if !seen_blobs.insert(sha256.clone()) {
                                 continue;
                             }
@@ -3488,7 +3490,7 @@ impl Kernel {
 
         // Verify all referenced blobs are present when loaded via `spec.manifests`.
         for entry in composition.entries.values() {
-            if let image::Node::File { sha256, size } = &entry.node {
+            if let image::Node::File { sha256, size, .. } = &entry.node {
                 let mut probe = [0u8; 1];
                 if *size > 0
                     && now_or_never(blob_store.read_at(sha256, 0, &mut probe)) != Some(Ok(1))
@@ -3513,9 +3515,16 @@ impl Kernel {
                 mode: e.mode & 0o0777,
                 node: match e.node {
                     image::Node::Directory => ImageNodeKind::Directory,
-                    image::Node::File { sha256, size } => ImageNodeKind::File {
+                    image::Node::File {
+                        sha256,
+                        size,
+                        chunk_size,
+                        chunks,
+                    } => ImageNodeKind::File {
                         blob_id: sha256,
                         size,
+                        chunk_size: Some(chunk_size),
+                        chunks,
                     },
                     image::Node::Symlink { target } => {
                         let rebased = if target.starts_with('/') {
@@ -5928,8 +5937,12 @@ impl Kernel {
                     })));
                 }
 
-                // Case 2: Cloud `/` executable when NOT chrooted, `!nosuid`, and cloud access allowed.
+                // Case 2: Mutable Cloud `/` executable when NOT chrooted, `!nosuid`, and cloud access allowed.
+                // Immutable Release v2 system-image (sysext/confext) executables (`ino >= 2 << 40`)
+                // fall through to Case 3 so their verified bytes execute via `LocalWasm` without
+                // tripping `creds.rs` `no_usr_fallback` on `system::owns`.
                 if resolved.pin.fstype() == vfs::FsType::Cloud
+                    && resolved.entry.handle.node.ino < (2u64 << 40)
                     && !chrooted
                     && !resolved.nosuid
                     && !root_cloud.is_pid_cloud_denied(pid)

@@ -24,6 +24,65 @@ use std::task::{Context, Poll, Waker};
 const ROOT_INO: u64 = 1;
 const GENERATION: u64 = 1;
 const BLOCK_SIZE: u64 = 4096;
+const CHUNK_SIZE_MIN: u32 = 64 * 1024;
+const CHUNK_SIZE_MAX: u32 = 1024 * 1024;
+
+/// Per-file chunk verification manifest carried by Release v2 [`ImageFs`] nodes (Blueprint §2.4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkManifest {
+    pub sha256: String,
+    pub size: u64,
+    pub chunk_size: u32,
+    pub chunks: Vec<String>,
+}
+
+fn is_lower_hex_sha256(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn validate_chunk_manifest(
+    blob_id: &str,
+    size: u64,
+    chunk_size: Option<u32>,
+    chunks: &[String],
+) -> Result<Option<ChunkManifest>> {
+    match chunk_size {
+        None => {
+            if !chunks.is_empty() {
+                return Err(Errno::EINVAL);
+            }
+            Ok(None)
+        }
+        Some(cs) => {
+            if !(CHUNK_SIZE_MIN..=CHUNK_SIZE_MAX).contains(&cs) || !cs.is_power_of_two() {
+                return Err(Errno::EINVAL);
+            }
+            let expected = if size == 0 {
+                0usize
+            } else {
+                usize::try_from(size.div_ceil(u64::from(cs))).map_err(|_| Errno::EINVAL)?
+            };
+            if chunks.len() != expected || !chunks.iter().all(|c| is_lower_hex_sha256(c)) {
+                return Err(Errno::EINVAL);
+            }
+            let sha = blob_id.strip_prefix("sha256:").unwrap_or(blob_id);
+            if !is_lower_hex_sha256(sha) {
+                return Err(Errno::EINVAL);
+            }
+            if chunks.len() == 1 && chunks[0] != sha {
+                return Err(Errno::EINVAL);
+            }
+            Ok(Some(ChunkManifest {
+                sha256: sha.to_string(),
+                size,
+                chunk_size: cs,
+                chunks: chunks.to_vec(),
+            }))
+        }
+    }
+}
 
 /// Content-addressed or URL-addressed byte store backing [`ImageFs`] regular files.
 pub trait BlobStore {
@@ -33,6 +92,19 @@ pub trait BlobStore {
         offset: u64,
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, usize>;
+
+    /// Chunk-verified range read: passes expected chunk size & SHA-256 digest(s) so
+    /// JS/native adapters verify every chunk before exposing bytes and never buffer whole blobs.
+    fn read_verified_at<'a>(
+        &'a self,
+        blob_id: &'a str,
+        manifest: Option<&'a ChunkManifest>,
+        offset: u64,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, usize> {
+        let _ = manifest;
+        self.read_at(blob_id, offset, buf)
+    }
 }
 
 /// In-memory [`BlobStore`] keyed by `blob_id` (`sha256` digest or asset path).
@@ -91,6 +163,10 @@ pub enum ImageNodeKind {
         #[serde(alias = "sha256")]
         blob_id: String,
         size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_size: Option<u32>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        chunks: Vec<String>,
     },
     Symlink {
         target: String,
@@ -113,6 +189,7 @@ struct ImageNode {
     nlink: u32,
     size: u64,
     blob_id: Option<String>,
+    chunk_manifest: Option<ChunkManifest>,
     parent: u64,
     name: String,
     children: BTreeMap<String, u64>,
@@ -301,26 +378,34 @@ impl<B: BlobStore> ImageFs<B> {
                 let (par, nm) = parent_and_name(path);
                 (path_index[par], nm.to_string())
             };
-            let (mut meta, size, blob_id, nlink) = match &entry.node {
+            let (mut meta, size, blob_id, chunk_manifest, nlink) = match &entry.node {
                 ImageNodeKind::Directory => (
                     Node::directory(entry.uid, entry.gid, entry.mode),
                     BLOCK_SIZE,
                     None,
+                    None,
                     2u32,
                 ),
-                ImageNodeKind::File { blob_id, size } => {
+                ImageNodeKind::File {
+                    blob_id,
+                    size,
+                    chunk_size,
+                    chunks,
+                } => {
+                    let manifest = validate_chunk_manifest(blob_id, *size, *chunk_size, chunks)?;
                     total_bytes = total_bytes.saturating_add(*size);
                     (
                         Node::file(entry.uid, entry.gid, entry.mode, blob_id.clone(), *size),
                         *size,
                         Some(blob_id.clone()),
+                        manifest,
                         1u32,
                     )
                 }
                 ImageNodeKind::Symlink { target } => {
                     let mut n = Node::symlink(entry.uid, entry.gid, target);
                     n.mode = entry.mode;
-                    (n, target.len() as u64, None, 1u32)
+                    (n, target.len() as u64, None, None, 1u32)
                 }
             };
             meta.ino = ino;
@@ -332,6 +417,7 @@ impl<B: BlobStore> ImageFs<B> {
                     nlink,
                     size,
                     blob_id,
+                    chunk_manifest,
                     parent: parent_ino,
                     name,
                     children: BTreeMap::new(),
@@ -529,6 +615,8 @@ impl<B: BlobStore> ImageFs<B> {
                 node: ImageNodeKind::File {
                     blob_id: "/usr/bin/init.wasm".into(),
                     size: sizes.init,
+                    chunk_size: None,
+                    chunks: Vec::new(),
                 },
             },
             ImageEntry {
@@ -539,6 +627,8 @@ impl<B: BlobStore> ImageFs<B> {
                 node: ImageNodeKind::File {
                     blob_id: "/usr/bin/supervise.wasm".into(),
                     size: sizes.supervise,
+                    chunk_size: None,
+                    chunks: Vec::new(),
                 },
             },
             ImageEntry {
@@ -549,6 +639,8 @@ impl<B: BlobStore> ImageFs<B> {
                 node: ImageNodeKind::File {
                     blob_id: "/usr/bin/dash.wasm".into(),
                     size: sizes.dash,
+                    chunk_size: None,
+                    chunks: Vec::new(),
                 },
             },
             ImageEntry {
@@ -568,6 +660,8 @@ impl<B: BlobStore> ImageFs<B> {
                 node: ImageNodeKind::File {
                     blob_id: "/usr/bin/coreutils.wasm".into(),
                     size: sizes.coreutils,
+                    chunk_size: None,
+                    chunks: Vec::new(),
                 },
             },
             ImageEntry {
@@ -578,6 +672,8 @@ impl<B: BlobStore> ImageFs<B> {
                 node: ImageNodeKind::File {
                     blob_id: "/usr/bin/utilities.wasm".into(),
                     size: sizes.utilities,
+                    chunk_size: None,
+                    chunks: Vec::new(),
                 },
             },
         ];
@@ -609,6 +705,13 @@ impl<B: BlobStore> ImageFs<B> {
 
     pub fn entry_at(&self, path: &str) -> Option<Entry> {
         self.path_index.get(path).map(|&ino| self.entry(ino))
+    }
+
+    pub fn chunk_manifest_at(&self, path: &str) -> Option<&ChunkManifest> {
+        self.path_index
+            .get(path)
+            .and_then(|ino| self.nodes.get(ino))
+            .and_then(|node| node.chunk_manifest.as_ref())
     }
 
     pub fn blobs(&self) -> &B {
@@ -1274,7 +1377,12 @@ impl<B: BlobStore> Filesystem for ImageFs<B> {
             let max_len =
                 usize::try_from(node.size - offset).map_or(buf.len(), |r| r.min(buf.len()));
             self.blobs
-                .read_at(blob_id, offset, &mut buf[..max_len])
+                .read_verified_at(
+                    blob_id,
+                    node.chunk_manifest.as_ref(),
+                    offset,
+                    &mut buf[..max_len],
+                )
                 .await
         })
     }
@@ -1413,5 +1521,152 @@ impl<B: BlobStore> Filesystem for ImageFs<B> {
             Self::wake_waiters(&mut state, ino);
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::now_or_never;
+    use std::cell::Cell;
+
+    #[derive(Default)]
+    struct SpyBlobStore {
+        blobs: BTreeMap<String, Vec<u8>>,
+        verified_calls: Cell<usize>,
+        last_manifest: RefCell<Option<ChunkManifest>>,
+    }
+
+    impl BlobStore for SpyBlobStore {
+        fn read_at<'a>(
+            &'a self,
+            blob_id: &'a str,
+            offset: u64,
+            buf: &'a mut [u8],
+        ) -> BoxFuture<'a, usize> {
+            Box::pin(async move {
+                let bytes = self.blobs.get(blob_id).ok_or(Errno::EIO)?;
+                if offset >= bytes.len() as u64 {
+                    return Ok(0);
+                }
+                let start = offset as usize;
+                let n = (bytes.len() - start).min(buf.len());
+                buf[..n].copy_from_slice(&bytes[start..start + n]);
+                Ok(n)
+            })
+        }
+
+        fn read_verified_at<'a>(
+            &'a self,
+            blob_id: &'a str,
+            manifest: Option<&'a ChunkManifest>,
+            offset: u64,
+            buf: &'a mut [u8],
+        ) -> BoxFuture<'a, usize> {
+            self.verified_calls.set(self.verified_calls.get() + 1);
+            *self.last_manifest.borrow_mut() = manifest.cloned();
+            self.read_at(blob_id, offset, buf)
+        }
+    }
+
+    #[test]
+    fn imagefs_parses_chunk_manifest_and_dispatches_read_verified_at() {
+        let sha = "a".repeat(64);
+        let c0 = "b".repeat(64);
+        let c1 = "c".repeat(64);
+        let size = (64 * 1024 + 17) as u64;
+        let json = serde_json::json!({
+            "entries": {
+                "/": { "path": "/", "uid": 0, "gid": 0, "mode": 0o755, "node": { "type": "directory" } },
+                "/blob": {
+                    "path": "/blob",
+                    "uid": 0,
+                    "gid": 0,
+                    "mode": 0o644,
+                    "node": {
+                        "type": "file",
+                        "sha256": sha,
+                        "size": size,
+                        "chunk_size": 65536,
+                        "chunks": [c0, c1]
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let mut store = SpyBlobStore::default();
+        store.blobs.insert(sha.clone(), vec![0x42u8; size as usize]);
+        let fs = ImageFs::from_composition_json(
+            FsId("image:v2".into()),
+            true,
+            Timespec::default(),
+            &json,
+            store,
+        )
+        .unwrap();
+
+        let manifest = fs.chunk_manifest_at("/blob").unwrap().clone();
+        assert_eq!(manifest.sha256, sha);
+        assert_eq!(manifest.chunk_size, 65536);
+        assert_eq!(manifest.chunks, vec![c0, c1]);
+
+        let cred = Cred::root();
+        let entry = now_or_never(fs.lookup(&cred, &fs.root(), "blob"))
+            .unwrap()
+            .unwrap();
+        let mut read_opts = OpenOptions::new();
+        read_opts.read(true);
+        let open = now_or_never(fs.open(&cred, &entry.handle, &read_opts))
+            .unwrap()
+            .unwrap();
+        let mut buf = [0u8; 32];
+        let n = now_or_never(fs.read_at(&open, &mut buf, 65530))
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 23);
+        assert!(buf[..23].iter().all(|&b| b == 0x42));
+        assert_eq!(fs.blobs().verified_calls.get(), 1);
+        assert_eq!(fs.blobs().last_manifest.borrow().as_ref(), Some(&manifest));
+    }
+
+    #[test]
+    fn imagefs_rejects_invalid_chunk_manifests() {
+        let sha = "a".repeat(64);
+        let bad_cases = [
+            // Non-power-of-two chunk_size
+            (10u64, Some(96 * 1024u32), vec![sha.clone()]),
+            // Below 64 KiB
+            (10, Some(32 * 1024), vec![sha.clone()]),
+            // Above 1 MiB
+            (10, Some(2 * 1024 * 1024), vec![sha.clone()]),
+            // Wrong chunk count
+            (64 * 1024 + 1, Some(64 * 1024), vec![sha.clone()]),
+            // Chunks without chunk_size
+            (10, None, vec![sha.clone()]),
+            // Single-chunk digest mismatch
+            (10, Some(64 * 1024), vec!["b".repeat(64)]),
+        ];
+        for (size, chunk_size, chunks) in bad_cases {
+            let res = ImageFs::new(
+                FsId("image:bad".into()),
+                true,
+                Timespec::default(),
+                [ImageEntry {
+                    path: "/f".into(),
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o644,
+                    node: ImageNodeKind::File {
+                        blob_id: sha.clone(),
+                        size,
+                        chunk_size,
+                        chunks,
+                    },
+                }],
+                MemoryBlobStore::new(),
+            );
+            assert_eq!(res.err(), Some(Errno::EINVAL));
+        }
     }
 }

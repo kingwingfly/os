@@ -13,9 +13,22 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const MANIFEST_MAX: usize = 4 * 1024 * 1024;
 pub const ENTRIES_MAX: usize = 16_384;
 pub const ABI: u32 = 1;
-pub const PROTOCOL: u32 = 1;
+/// Matches `abi::contract::RELEASE_VERSION` (Release v2, Contract v2 #76/#78).
+pub const PROTOCOL: u32 = 2;
+pub const IMAGE_VERSION: u32 = 2;
+pub const RELEASE_VERSION: u32 = 2;
+/// Matches `abi::contract::HOST_ADAPTER_VERSION` (HostAdapter v2, Contract v2).
+pub const HOST_ADAPTER: u32 = 2;
+/// `OsAuthority` schema version (kept at 10 during parallel L2.5b).
 pub const SCHEMA: u32 = 10;
 pub const LEVEL: u32 = 1;
+pub const CHUNK_SIZE_MIN: u32 = 64 * 1024;
+pub const CHUNK_SIZE_DEFAULT: u32 = 256 * 1024;
+pub const CHUNK_SIZE_MAX: u32 = 1024 * 1024;
+pub const MAX_CONCURRENT_CHUNK_FETCHES: usize = 4;
+pub const SIGNING_DOMAIN_IMAGE_V2: &str = "os.image.v2";
+pub const SIGNING_DOMAIN_RELEASE_V2: &str = "os.release.v2";
+pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 pub const FEATURES: &[&str] = &["wasi-preview1", "os-abi-1", "wasix-fork-v4"];
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -32,7 +45,7 @@ impl From<serde_json::Error> for Error {
         Self(value.to_string())
     }
 }
-fn require(ok: bool, message: &str) -> Result<()> {
+pub(crate) fn require(ok: bool, message: &str) -> Result<()> {
     if ok {
         Ok(())
     } else {
@@ -58,6 +71,30 @@ pub fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
             .map_err(|_| Error("invalid hex".into()))?;
     }
     Ok(out)
+}
+pub fn valid_chunk_size(chunk_size: u32) -> bool {
+    (CHUNK_SIZE_MIN..=CHUNK_SIZE_MAX).contains(&chunk_size) && chunk_size.is_power_of_two()
+}
+pub fn expected_chunk_count(size: u64, chunk_size: u32) -> Result<usize> {
+    require(
+        valid_chunk_size(chunk_size),
+        "invalid chunk size (must be power of two in 64 KiB..=1 MiB)",
+    )?;
+    if size == 0 {
+        return Ok(0);
+    }
+    let count = size.div_ceil(u64::from(chunk_size));
+    usize::try_from(count).map_err(|_| Error("chunk count overflow".into()))
+}
+pub fn chunk_digests(bytes: &[u8], chunk_size: u32) -> Result<Vec<String>> {
+    require(
+        valid_chunk_size(chunk_size),
+        "invalid chunk size (must be power of two in 64 KiB..=1 MiB)",
+    )?;
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(bytes.chunks(chunk_size as usize).map(digest).collect())
 }
 pub fn valid_path(path: &str) -> bool {
     path.starts_with('/')
@@ -93,6 +130,8 @@ pub fn protected(path: &str) -> bool {
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Boot,
+    Initramfs,
+    RootTemplate,
     Base,
     Sysext,
     Confext,
@@ -112,8 +151,18 @@ pub struct Entry {
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Node {
     Directory,
-    File { sha256: String, size: u64 },
-    Symlink { target: String },
+    File {
+        sha256: String,
+        size: u64,
+        /// Power-of-two chunk size in `[64 KiB, 1 MiB]` (default `256 KiB`).
+        chunk_size: u32,
+        /// Ordered lowercase hex SHA-256 of each chunk (`ceil(size / chunk_size)` entries; empty iff `size == 0`).
+        /// Enables streaming range verification of any slice without buffering the whole blob.
+        chunks: Vec<String>,
+    },
+    Symlink {
+        target: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,8 +186,15 @@ impl Image {
         Ok(image)
     }
     pub fn validate(&self) -> Result<()> {
+        self.validate_shallow()?;
+        if matches!(self.kind, Kind::Initramfs | Kind::RootTemplate) {
+            Composition::standalone(self)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn validate_shallow(&self) -> Result<()> {
         require(
-            self.format == "os.image" && self.version == 1,
+            self.format == "os.image" && self.version == IMAGE_VERSION,
             "unsupported image format/version",
         )?;
         require(
@@ -175,9 +231,30 @@ impl Image {
             )?;
             match &entry.node {
                 Node::Directory => {}
-                Node::File { sha256, size } => {
+                Node::File {
+                    sha256,
+                    size,
+                    chunk_size,
+                    chunks,
+                } => {
                     unhex::<32>(sha256)?;
                     require(*size <= i64::MAX as u64, "file too large")?;
+                    let expected = expected_chunk_count(*size, *chunk_size)?;
+                    require(chunks.len() == expected, "chunk digest count mismatch")?;
+                    for chunk in chunks {
+                        unhex::<32>(chunk)?;
+                    }
+                    if *size == 0 {
+                        require(
+                            sha256 == EMPTY_SHA256 && chunks.is_empty(),
+                            "empty file digest/chunks mismatch",
+                        )?;
+                    } else if chunks.len() == 1 {
+                        require(
+                            chunks[0] == *sha256,
+                            "single-chunk digest must match file sha256",
+                        )?;
+                    }
                     total = total
                         .checked_add(*size)
                         .ok_or_else(|| Error("image size overflow".into()))?;
@@ -195,6 +272,42 @@ impl Image {
         }
         match self.kind {
             Kind::Boot => !below(path, "/boot") && !below(path, "/api"),
+            Kind::Initramfs => {
+                path == "/init"
+                    || below(path, "/bin")
+                    || below(path, "/sbin")
+                    || below(path, "/lib")
+                    || below(path, "/lib64")
+                    || below(path, "/usr")
+                    || (below(path, "/etc") && !protected(path))
+                    || (directory
+                        && matches!(path, "/dev" | "/proc" | "/run" | "/sysroot" | "/tmp"))
+            }
+            Kind::RootTemplate => {
+                !below(path, "/etc/os-trust")
+                    && (below(path, "/etc")
+                        || below(path, "/var")
+                        || below(path, "/root")
+                        || below(path, "/home")
+                        || (directory
+                            && matches!(
+                                path,
+                                "/boot"
+                                    | "/dev"
+                                    | "/dev/pts"
+                                    | "/mnt"
+                                    | "/mnt/local"
+                                    | "/mnt/shared"
+                                    | "/opt"
+                                    | "/opt/private"
+                                    | "/proc"
+                                    | "/run"
+                                    | "/srv"
+                                    | "/sys"
+                                    | "/tmp"
+                                    | "/usr"
+                            )))
+            }
             Kind::Base => {
                 below(path, "/usr")
                     || below(path, "/sys")
@@ -208,7 +321,7 @@ impl Image {
     }
     pub fn verify_content(&self, mut read: impl FnMut(&str, u64) -> Result<()>) -> Result<()> {
         for entry in &self.entries {
-            if let Node::File { sha256, size } = &entry.node {
+            if let Node::File { sha256, size, .. } = &entry.node {
                 read(sha256, *size)?;
             }
         }
@@ -241,13 +354,47 @@ impl Range {
         self.min <= value && value <= self.max
     }
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct Release {
+pub struct LoaderMeta {
+    pub entry: String,
+    pub client_kernel_js: String,
+    pub client_kernel_wasm: String,
+    pub client_kernel_sha256: String,
+    pub host_adapter: Range,
+}
+impl LoaderMeta {
+    pub fn validate(&self) -> Result<()> {
+        for path in [
+            &self.entry,
+            &self.client_kernel_js,
+            &self.client_kernel_wasm,
+        ] {
+            require(
+                valid_path(path) && path != "/" && !below(path, "/boot") && !below(path, "/api"),
+                "invalid loader asset path",
+            )?;
+        }
+        unhex::<32>(&self.client_kernel_sha256)?;
+        require(
+            self.host_adapter.contains(HOST_ADAPTER),
+            "incompatible host adapter version range",
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseV2 {
     pub format: String,
     pub version: u32,
     pub name: String,
+    pub loader: LoaderMeta,
     pub boot: String,
+    pub initramfs: String,
+    pub root_template: String,
     pub base: String,
     pub sysext: Vec<String>,
     pub confext: Vec<String>,
@@ -255,18 +402,31 @@ pub struct Release {
     pub schema: Range,
     pub provenance: BTreeMap<String, String>,
 }
-impl Release {
+
+pub type Release = ReleaseV2;
+
+impl ReleaseV2 {
+    pub const REQUIRED_INITRAMFS_BINS: &'static [&'static str] = &[
+        "/init",
+        "/bin/mount",
+        "/bin/switch_root",
+        "/bin/cowfsck",
+        "/bin/sh",
+    ];
+
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let release: Self = parse(bytes)?;
         release.validate()?;
         Ok(release)
     }
+
     pub fn validate(&self) -> Result<()> {
         require(
-            self.format == "os.release" && self.version == 1,
+            self.format == "os.release" && self.version == RELEASE_VERSION,
             "unsupported release format/version",
         )?;
         bounded(&self.name, 128)?;
+        self.loader.validate()?;
         provenance(&self.provenance)?;
         require(
             self.protocol.contains(PROTOCOL) && self.schema.contains(SCHEMA),
@@ -283,12 +443,41 @@ impl Release {
         }
         Ok(())
     }
+
+    /// Yields `[boot, initramfs, root_template, base, sysext..., confext...]`.
     pub fn images(&self) -> impl Iterator<Item = &str> {
-        [&self.boot, &self.base]
+        [&self.boot, &self.initramfs, &self.root_template, &self.base]
             .into_iter()
             .chain(&self.sysext)
             .chain(&self.confext)
             .map(String::as_str)
+    }
+
+    /// Verifies that the signed `Kind::Boot` image carries every loader asset named in
+    /// `self.loader` and binds `client_kernel_sha256` to the exact Wasm artifact digest.
+    pub fn verify_boot_loader(&self, boot: &Image) -> Result<()> {
+        require(boot.kind == Kind::Boot, "expected boot image")?;
+        let find_file = |path: &str| -> Result<&str> {
+            boot.entries
+                .iter()
+                .find_map(|entry| {
+                    if entry.path == path
+                        && let Node::File { sha256, .. } = &entry.node
+                    {
+                        return Some(sha256.as_str());
+                    }
+                    None
+                })
+                .ok_or_else(|| Error(format!("boot loader asset missing: {path}")))
+        };
+        let _ = find_file(&self.loader.entry)?;
+        let _ = find_file(&self.loader.client_kernel_js)?;
+        let wasm_sha = find_file(&self.loader.client_kernel_wasm)?;
+        require(
+            wasm_sha == self.loader.client_kernel_sha256,
+            "loader client_kernel_sha256 mismatch",
+        )?;
+        Ok(())
     }
 }
 
@@ -308,7 +497,7 @@ pub struct Trust {
 }
 pub fn signing_message(domain: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     require(
-        matches!(domain, "os.image.v1" | "os.release.v1"),
+        matches!(domain, SIGNING_DOMAIN_IMAGE_V2 | SIGNING_DOMAIN_RELEASE_V2),
         "unknown signing domain",
     )?;
     require(bytes.len() <= MANIFEST_MAX, "manifest too large")?;

@@ -13,7 +13,7 @@ async function ok(request, command, options = {}, headers = {}) {
   expect(result.err, JSON.stringify(result)).toBeUndefined(); return result.ok;
 }
 async function login(request) {
-  const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+  const password = process.env.OS_TEST_ADMIN_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
   expect((await api(request, 'login', { headers: { 'CF-Connecting-IP': 'release-' + crypto.randomUUID() }, data: { password } })).ok()).toBe(true);
 }
 async function open(request, flags = 2) { return (await ok(request, { open: { path: '/dev/system', flags } })).fd; }
@@ -71,7 +71,8 @@ test('only authenticated root can stage; signatures, bytes and schema fail close
   expect((await answer(request, { open: { path: '/dev/system', flags: 2 } })).err?.errno).toBe('EACCES');
   const readonly = await open(request, 0);
   expect((await answer(request, { ioctl: { fd: readonly, request: control, arg: { op: 'stage', id: ids.a } } })).err?.errno).toBe('EPERM');
-  await login(request); const fd = await open(request); const before = (await status(request, fd)).active;
+  await login(request); const fd = await open(request); const current = await status(request, fd); const before = current.active;
+  expect(current.protocol).toBe(2); expect(current.schema).toBe(10);
   for (const id of [ids.untrusted, ids.incompatible]) {
     expect((await answer(request, { ioctl: { fd, request: control, arg: { op: 'stage', id } } })).err?.errno).toBe('EINVAL');
   }
@@ -95,7 +96,11 @@ test('activation is atomic, preserves writable data, and pins processes and desc
   expect((await put(request, '/api/file?path=' + marker, { data: 'keep me' })).ok()).toBe(true);
   await activate(request, fd, ids.b);
   expect(await read(request, '/etc/phase6/generation', ids.b)).toBe('generation B\n');
-  expect(await read(request, '/etc/phase6/generation', ids.b, proof)).toBe('generation A\n');
+  const procPinned = await request.get('/api/file?path=/etc/phase6/generation', {
+    headers: { ...view(ids.b), 'X-Process-Token': launched.token },
+  });
+  expect(procPinned.status()).toBe(200);
+  expect(await procPinned.text()).toBe('generation A\n');
   expect(await read(request, `/proc/self/fd/${directory}/generation`, ids.b)).toBe('generation A\n');
   const old = await ok(request, { pread: { fd: file, offset: 0, count: 1024 } }, {}, view(ids.b));
   expect(Buffer.from(old.data,'base64').toString()).toBe('generation A\n');

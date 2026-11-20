@@ -591,6 +591,9 @@ impl Db {
     }
     /// Read an inode even after its last name was removed. Numbers are never recycled.
     pub(crate) fn inode(&self, ino: u64) -> Option<Node> {
+        if crate::system::immutable_inode(ino) {
+            return self.image.as_ref().and_then(|v| v.by_ino(ino));
+        }
         self.rows::<NodeRow>(
             "SELECT '' AS path, i.id AS ino, i.owner, i.grp, i.mode, i.directory, i.file, CAST(i.size AS TEXT) AS size, i.link, i.rdev, i.acl, i.default_acl, (SELECT COUNT(*) FROM nodes WHERE ino = i.id) AS links FROM inodes i WHERE i.id = ?",
             vec![int(ino)],
@@ -1243,6 +1246,14 @@ impl Db {
     }
     /// The names of the inode `ino`.
     pub(crate) fn names(&self, ino: u64) -> Vec<String> {
+        if crate::system::immutable_inode(ino) {
+            return self
+                .image
+                .as_ref()
+                .and_then(|v| v.path_of(ino))
+                .into_iter()
+                .collect();
+        }
         self.rows::<Key>(
             "SELECT path AS key FROM nodes WHERE ino = ?",
             vec![int(ino)],
@@ -1253,6 +1264,9 @@ impl Db {
     }
     /// Collect an inode and its content after the last name and open reference are gone.
     pub(crate) fn forget(&mut self, ino: u64) {
+        if crate::system::immutable_inode(ino) {
+            return;
+        }
         let held = self.rows::<serde_json::Value>(
             "SELECT 1 FROM nodes WHERE ino = ?1 UNION ALL SELECT 1 FROM vfs_opens WHERE ino = ?1 AND revoked = 0 UNION ALL SELECT 1 FROM fds WHERE ino = ?1 LIMIT 1",
             vec![int(ino)],

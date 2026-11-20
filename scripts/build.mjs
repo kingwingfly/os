@@ -72,6 +72,9 @@ await build({ absWorkingDir: root, entryPoints: { 'console-window': 'web/console
 for (const name of ['greeter', 'shell-session']) await build({ absWorkingDir: root, entryPoints: { [name]: 'web/' + name + '.js' }, external: ['./pkg/*'], bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'login-session': 'web/kernel/login.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'init-owner': 'web/kernel/init.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
+await build({ absWorkingDir: root, entryPoints: { 'image-pager': 'web/kernel/image-pager.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
+await build({ absWorkingDir: root, entryPoints: { 'offline-installer': 'web/kernel/offline-installer.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
+await build({ absWorkingDir: root, entryPoints: { 'offline-sw': 'web/kernel/offline-installer.js' }, bundle: true, format: 'iife', outdir: out, minify: true });
 // Remove obsolete pre-overhaul compiler artifacts; local-compiler.js is the scoped replacement.
 for (const name of ['wasi-asyncify.js', 'binaryen.js']) await rm(join(out, name), { force: true });
 // The client kernel (crates/client-kernel), a classic dedicated Worker: no-modules wasm-bindgen,
@@ -94,6 +97,63 @@ const sizes = {};
 for (const asset of ['/usr/bin/coreutils.wasm', '/usr/bin/utilities.wasm', '/usr/bin/dash.wasm', '/usr/bin/supervise.wasm', '/usr/bin/init.wasm', '/pkg/frontend_bg.wasm']) sizes[asset] = (await stat(join(out, asset))).size;
 await writeFile(join(out, 'usr/manifest.json'), JSON.stringify(sizes));
 for (const name of ['index.html', 'console.html', 'login.html', 'shell.html', 'style.css', '_headers']) await copy('web/' + name, join(out, name));
+await writeFile(join(out, 'offline-boot.html'), `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>OS Offline Boot (Release v2)</title><link rel="icon" href="data:,"></head>
+<body><pre id="status">Booting offline Release v2…</pre>
+<script src="./client_kernel.js"></script>
+<script type="module">
+import { createOfflineInstaller, registerOfflineServiceWorker } from './offline-installer.js';
+import { createImagePager } from './image-pager.js';
+const installer = createOfflineInstaller();
+const pager = createImagePager();
+globalThis.imageBlobRead = pager.imageBlobRead;
+globalThis.osOffline = { installer, pager, registerOfflineServiceWorker };
+const params = new URLSearchParams(location.search);
+async function bootStage1() {
+  const statusEl = document.getElementById('status');
+  const state = await installer.getState();
+  if (!state.active) {
+    statusEl.textContent = 'No offline Release v2 installed.';
+    globalThis.__osOfflineBoot = { status: 'not-installed', state };
+    return;
+  }
+  const boot = await installer.beginOfflineBoot({ verifyAllBlobs: true });
+  const wasmUrl = '/boot/releases/' + boot.releaseId + '/assets' + boot.release.loader.client_kernel_wasm;
+  await wasm_bindgen(wasmUrl);
+  const bundleSummary = wasm_bindgen.verify_release_v2_bundle(
+    boot.manifestText,
+    boot.signatureText,
+    boot.trustText,
+    boot.imagesRaw,
+    boot.sigsRaw,
+  );
+  if (params.get('simulate_crash') === '1') {
+    const err = new Error('Simulated crash before markBootHealthy');
+    globalThis.__osOfflineBoot = { status: 'crashed', releaseId: boot.releaseId, rolledBack: boot.rolledBack, error: err.message };
+    statusEl.textContent = 'Boot crashed before markBootHealthy: ' + boot.releaseId;
+    return;
+  }
+  const stage1 = await wasm_bindgen.boot_stage1_initramfs(boot.imagesRaw[1]);
+  const healthyState = await installer.markBootHealthy(boot.releaseId);
+  globalThis.__osOfflineBoot = {
+    status: 'ready',
+    releaseId: boot.releaseId,
+    rolledBack: boot.rolledBack,
+    rolledBackFrom: boot.rolledBackFrom,
+    bundleSummary,
+    stage1,
+    pagerStats: pager.stats(),
+    state: healthyState,
+  };
+  statusEl.textContent = 'Stage 1 offline boot healthy: ' + boot.releaseId;
+}
+bootStage1().catch(err => {
+  globalThis.__osOfflineBoot = { status: 'error', error: String(err?.message ?? err) };
+  document.getElementById('status').textContent = 'Offline boot failed: ' + String(err?.message ?? err);
+  console.error(err);
+});
+</script></body></html>
+`);
 if (assets) await copyTree(assets, join(out, 'content'));
 await writeFile(join(out, 'os-config.json'), JSON.stringify({ branding, games }));
 await rm(join(out, 'terminal-config.json'), { force: true });

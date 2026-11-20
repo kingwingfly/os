@@ -20,6 +20,7 @@ mod cowfs_bridge;
 mod helper;
 mod hostfs;
 mod mounts;
+mod release_v2;
 mod share_bridge;
 mod vfs_engine;
 
@@ -1152,7 +1153,8 @@ mod tests {
     fn versions_match_the_contract() {
         assert_eq!(super::VERSION, "1");
         assert_eq!(abi::contract::HOST_ADAPTER_VERSION, 2);
-        assert_eq!(image::PROTOCOL, 1);
-        assert_eq!(abi::contract::RELEASE_VERSION, 2);
+        assert_eq!(image::PROTOCOL, abi::contract::RELEASE_VERSION);
+        assert_eq!(image::PROTOCOL, 2);
+        assert_eq!(image::HOST_ADAPTER, abi::contract::HOST_ADAPTER_VERSION);
     }
 }

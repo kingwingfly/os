@@ -2,7 +2,10 @@ mod build;
 mod conformance;
 mod package;
 use ed25519_dalek::{Signer, SigningKey};
-use os_image::{Detached, Image, Kind, Release, Trust, digest, hex, signing_message, unhex};
+use os_image::{
+    Detached, Image, Kind, Release, SIGNING_DOMAIN_IMAGE_V2, SIGNING_DOMAIN_RELEASE_V2, Trust,
+    digest, hex, signing_message, unhex,
+};
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -12,7 +15,7 @@ use std::{
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const HELP: &str = "cargo xtask conformance --target linux|os [--out DIR] | --check [--recorded] [--out DIR] | --report [--out DIR]\n\
 cargo xtask build [build.mjs options]\n\
-cargo xtask image --root TREE --kind base|sysext|confext|workload --out PACKAGE [--name NAME] [--revision REV]\n\
+cargo xtask image --root TREE --kind initramfs|root-template|base|sysext|confext|workload --out PACKAGE [--name NAME] [--revision REV]\n\
 cargo xtask boot --assets DIST --out BUNDLE [--name NAME] [--sysext PACKAGE] [--confext PACKAGE]\n\
 cargo xtask verify --bundle BUNDLE --trust PUBLIC_TRUST_JSON\n\
 cargo xtask verify --bundle BUNDLE --unsigned-development\n\
@@ -75,6 +78,8 @@ fn run() -> Result<()> {
     match command.as_str() {
         "image" => {
             let kind = match required("--kind")? {
+                "initramfs" => Kind::Initramfs,
+                "root-template" | "roottemplate" => Kind::RootTemplate,
                 "base" => Kind::Base,
                 "sysext" => Kind::Sysext,
                 "confext" => Kind::Confext,
@@ -88,7 +93,7 @@ fn run() -> Result<()> {
                 get("--revision").unwrap_or("1"),
                 Path::new(required("--out")?),
             )?;
-            println!("{}", image);
+            println!("{image}");
         }
         "boot" => {
             let paths = |key: &str| {
@@ -157,12 +162,12 @@ fn run() -> Result<()> {
                 Image::parse(&data)?;
                 package::replace(
                     &bundle.join(format!("images/{image}.sig")),
-                    &sign("os.image.v1", &data)?,
+                    &sign(SIGNING_DOMAIN_IMAGE_V2, &data)?,
                 )?;
             }
             package::replace(
                 &bundle.join(format!("releases/{id}/signature.json")),
-                &sign("os.release.v1", &release_bytes)?,
+                &sign(SIGNING_DOMAIN_RELEASE_V2, &release_bytes)?,
             )?;
             let mut trust = Trust::default();
             trust.keys.insert(
