@@ -328,6 +328,7 @@ function makeSignedReleaseBundle(name, { keyPair, extraConfext, mutate = () => {
   const initramfsId = registerImage(ctx.initramfsImg);
   const rootTemplateId = registerImage(ctx.rootTemplateImg);
   const baseId = registerImage(ctx.baseImg);
+  const sysextIds = (ctx.extraSysext ?? []).map(registerImage);
   const confextIds = ctx.confextImgs.map(registerImage);
 
   const releaseObj = {
@@ -345,7 +346,7 @@ function makeSignedReleaseBundle(name, { keyPair, extraConfext, mutate = () => {
     initramfs: initramfsId,
     root_template: rootTemplateId,
     base: baseId,
-    sysext: [],
+    sysext: sysextIds,
     confext: confextIds,
     protocol: { min: 2, max: 2 },
     schema: { min: 10, max: 10 },
@@ -532,4 +533,216 @@ test('OfflineInstaller pins Release v2 atomically, refuses tampered/incomplete/r
   assert.equal(recovered.releaseId, genA.releaseId);
   assert.equal((await installer.getState()).active, genA.releaseId);
   assert.equal((await installer.getState()).activeBootVerified, true);
+});
+
+test('OfflineInstaller preserves known-good previous A across back-to-back unverified installs (A healthy -> B unverified -> C crash -> restores A)', async () => {
+  const keyPair = generateKeyPairSync('ed25519');
+  const genA = makeSignedReleaseBundle('gen-A', { keyPair });
+  const genB = makeSignedReleaseBundle('gen-B', { keyPair });
+  const genC = makeSignedReleaseBundle('gen-C', { keyPair });
+
+  const stores = buildMemoryStores();
+  let activeRoutes = genA.routes;
+  let networkEnabled = true;
+
+  const installer = createOfflineInstaller({
+    ...stores,
+    fetch: async url => {
+      if (!networkEnabled) throw new Error('Network disabled (offline boot)');
+      const buf = activeRoutes.get(url);
+      if (!buf) return new Response(null, { status: 404 });
+      return new Response(buf, { status: 200 });
+    },
+  });
+
+  // Install A and verify healthy boot.
+  await installer.install(genA.releaseId);
+  networkEnabled = false;
+  await installer.beginOfflineBoot();
+  await installer.markBootHealthy(genA.releaseId);
+  assert.equal((await installer.getState()).activeBootVerified, true);
+
+  // Install B without booting/marking B healthy -> previous = A.
+  networkEnabled = true;
+  activeRoutes = genB.routes;
+  await installer.install(genB.releaseId);
+  let state = await installer.getState();
+  assert.equal(state.active, genB.releaseId);
+  assert.equal(state.previous, genA.releaseId);
+  assert.equal(state.activeBootVerified, false);
+
+  // Install C before B ever boots cleanly -> previous MUST remain healthy A (NOT unverified B)!
+  activeRoutes = genC.routes;
+  await installer.install(genC.releaseId);
+  state = await installer.getState();
+  assert.equal(state.active, genC.releaseId);
+  assert.equal(state.previous, genA.releaseId);
+  assert.equal(state.activeBootVerified, false);
+
+  // Simulate crash of C before markBootHealthy(C) -> next offline boot rolls back to healthy A!
+  networkEnabled = false;
+  const attemptC = await installer.beginOfflineBoot();
+  assert.equal(attemptC.releaseId, genC.releaseId);
+  assert.equal(attemptC.rolledBack, false);
+
+  const recovered = await installer.beginOfflineBoot();
+  assert.equal(recovered.rolledBack, true);
+  assert.equal(recovered.rolledBackFrom, genC.releaseId);
+  assert.equal(recovered.releaseId, genA.releaseId);
+  state = await installer.getState();
+  assert.equal(state.active, genA.releaseId);
+  assert.equal(state.previous, null);
+  assert.equal(state.activeBootVerified, true);
+
+  // Also verify rolling back to an unverified previous generation does NOT falsely mark it healthy.
+  const stores2 = buildMemoryStores();
+  let routes2 = genA.routes;
+  const installer2 = createOfflineInstaller({
+    ...stores2,
+    fetch: async url => {
+      const buf = routes2.get(url);
+      return buf ? new Response(buf, { status: 200 }) : new Response(null, { status: 404 });
+    },
+  });
+  await installer2.install(genA.releaseId);
+  routes2 = genB.routes;
+  await installer2.install(genB.releaseId);
+  const rolledUnverified = await installer2.rollback();
+  assert.equal(rolledUnverified.active, genA.releaseId);
+  assert.equal(rolledUnverified.activeBootVerified, false);
+});
+
+test('OfflineInstaller enforces image ABI/level and full kind path allowlists (boot, initramfs, roottemplate, base, sysext)', async () => {
+  const keyPair = generateKeyPairSync('ed25519');
+  const genA = makeSignedReleaseBundle('gen-A-policy', { keyPair });
+  const stores = buildMemoryStores();
+  let activeRoutes = genA.routes;
+
+  const installer = createOfflineInstaller({
+    ...stores,
+    fetch: async url => {
+      const buf = activeRoutes.get(url);
+      if (!buf) return new Response(null, { status: 404 });
+      return new Response(buf, { status: 200 });
+    },
+  });
+
+  await installer.install(genA.releaseId);
+  await installer.beginOfflineBoot();
+  await installer.markBootHealthy(genA.releaseId);
+
+  const fileNodeOf = (blobs, buf) => {
+    const sha256 = hash(buf);
+    blobs.set(sha256, buf);
+    return { type: 'file', sha256, size: buf.length, chunk_size: 262144, chunks: [sha256] };
+  };
+  const dir = path => ({ path, uid: 0, gid: 0, mode: 0o755, node: { type: 'directory' } });
+
+  const policyCases = [
+    ['wrong image ABI', makeSignedReleaseBundle('bad-abi', {
+      keyPair,
+      mutate: ctx => { ctx.baseImg.abi = 99; },
+    })],
+    ['wrong image level', makeSignedReleaseBundle('bad-level', {
+      keyPair,
+      mutate: ctx => { ctx.baseImg.level = 99; },
+    })],
+    ['unknown image feature', makeSignedReleaseBundle('bad-feature', {
+      keyPair,
+      mutate: ctx => { ctx.baseImg.features = ['nonexistent-feature']; },
+    })],
+    ['boot image containing /boot/override', makeSignedReleaseBundle('bad-boot-path', {
+      keyPair,
+      mutate: ctx => {
+        ctx.bootImg.entries.push(dir('/boot'), { path: '/boot/entries', uid: 0, gid: 0, mode: 0o644, node: fileNodeOf(ctx.blobs, Buffer.from('{}')) });
+      },
+    })],
+    ['boot image containing /api/spoof', makeSignedReleaseBundle('bad-api-path', {
+      keyPair,
+      mutate: ctx => {
+        ctx.bootImg.entries.push(dir('/api'), { path: '/api/sys', uid: 0, gid: 0, mode: 0o644, node: fileNodeOf(ctx.blobs, Buffer.from('{}')) });
+      },
+    })],
+    ['initramfs containing protected /etc/passwd', makeSignedReleaseBundle('bad-initramfs-passwd', {
+      keyPair,
+      mutate: ctx => {
+        ctx.initramfsImg.entries.push(dir('/etc'), { path: '/etc/passwd', uid: 0, gid: 0, mode: 0o644, node: fileNodeOf(ctx.blobs, Buffer.from('evil')) });
+      },
+    })],
+    ['initramfs containing disallowed /home/evil', makeSignedReleaseBundle('bad-initramfs-home', {
+      keyPair,
+      mutate: ctx => {
+        ctx.initramfsImg.entries.push(dir('/home'), { path: '/home/evil', uid: 0, gid: 0, mode: 0o644, node: fileNodeOf(ctx.blobs, Buffer.from('evil')) });
+      },
+    })],
+    ['roottemplate containing nested /etc/os-trust/key.json', makeSignedReleaseBundle('bad-roottemplate-trust', {
+      keyPair,
+      mutate: ctx => {
+        ctx.rootTemplateImg.entries.push(
+          dir('/etc/os-trust'),
+          { path: '/etc/os-trust/key.json', uid: 0, gid: 0, mode: 0o644, node: fileNodeOf(ctx.blobs, Buffer.from('{}')) },
+        );
+      },
+    })],
+    ['base image containing disallowed /var/evil', makeSignedReleaseBundle('bad-base-var', {
+      keyPair,
+      mutate: ctx => {
+        ctx.baseImg.entries.push(dir('/var'), { path: '/var/evil', uid: 0, gid: 0, mode: 0o644, node: fileNodeOf(ctx.blobs, Buffer.from('evil')) });
+      },
+    })],
+    ['sysext image containing disallowed /etc/evil', makeSignedReleaseBundle('bad-sysext-etc', {
+      keyPair,
+      mutate: ctx => {
+        ctx.extraSysext = [{
+          format: 'os.image',
+          version: 2,
+          kind: 'sysext',
+          name: 'evil-sysext',
+          revision: '1',
+          abi: 1,
+          features: [],
+          level: 1,
+          provenance: {},
+          entries: [
+            dir('/'),
+            dir('/etc'),
+            { path: '/etc/evil', uid: 0, gid: 0, mode: 0o644, node: fileNodeOf(ctx.blobs, Buffer.from('evil')) },
+          ],
+        }];
+      },
+    })],
+  ];
+
+  for (const [label, bad] of policyCases) {
+    activeRoutes = bad.routes;
+    await assert.rejects(installer.install(bad.releaseId), undefined, `expected policy refusal for ${label}`);
+    const st = await installer.getState();
+    assert.equal(st.active, genA.releaseId, `active must stay on A after ${label}`);
+    assert.equal(st.activeBootVerified, true, `activeBootVerified must stay true after ${label}`);
+  }
+});
+
+test('OfflineInstaller repairs pre-existing truncated or corrupted OPFS blob on reinstall', async () => {
+  const keyPair = generateKeyPairSync('ed25519');
+  const genA = makeSignedReleaseBundle('gen-A-repair', { keyPair });
+  const stores = buildMemoryStores();
+
+  // Pre-seed OPFS with a truncated/corrupted copy of one of genA's blobs (as if a prior crash interrupted promotion).
+  const targetSha = [...genA.blobs.keys()][0];
+  await stores.opfs.writeFile(`os-releases/blobs/${targetSha}`, new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+
+  const installer = createOfflineInstaller({
+    ...stores,
+    fetch: async url => {
+      const buf = genA.routes.get(url);
+      if (!buf) return new Response(null, { status: 404 });
+      return new Response(buf, { status: 200 });
+    },
+  });
+
+  await installer.install(genA.releaseId);
+  const verified = await installer.verifyInstalledOffline(genA.releaseId, { verifyAllBlobs: true });
+  assert.equal(verified.releaseId, genA.releaseId);
+  const repaired = await stores.opfs.readFile(`os-releases/blobs/${targetSha}`);
+  assert.equal(hash(Buffer.from(repaired)), targetSha);
 });

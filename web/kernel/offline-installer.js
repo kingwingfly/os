@@ -19,6 +19,8 @@ export const CACHE_PREFIX = 'os-release-v2:';
 
 export const RELEASE_VERSION = 2;
 export const IMAGE_VERSION = 2;
+export const IMAGE_ABI = 1;
+export const IMAGE_LEVEL = 1;
 export const PROTOCOL_VERSION = 2;
 export const SCHEMA_VERSION = 10;
 export const HOST_ADAPTER_VERSION = 2;
@@ -27,6 +29,15 @@ export const CHUNK_SIZE_MAX = 1024 * 1024;
 export const SIGNING_DOMAIN_RELEASE_V2 = 'os.release.v2';
 export const SIGNING_DOMAIN_IMAGE_V2 = 'os.image.v2';
 export const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+
+const ALLOWED_IMAGE_FEATURES = new Set(['wasi-preview1', 'os-abi-1', 'wasix-fork-v4']);
+const INITRAMFS_DIRS = new Set(['/dev', '/proc', '/run', '/sysroot', '/tmp']);
+const ROOT_TEMPLATE_DIRS = new Set([
+  '/boot', '/dev', '/dev/pts', '/mnt', '/mnt/local', '/mnt/shared',
+  '/opt', '/opt/private', '/proc', '/run', '/srv', '/sys', '/tmp', '/usr',
+]);
+const BASE_TOP_LINKS = new Set(['/bin', '/sbin', '/lib', '/lib64']);
+const BASE_MERGE_DIRS = new Set(['/opt', '/etc']);
 
 export const REQUIRED_INITRAMFS_BINS = [
   '/init',
@@ -230,10 +241,74 @@ function resolveInMap(entriesMap, path) {
   return '/' + parts.join('/');
 }
 
+function allowsImagePath(kind, path, isDir) {
+  if (path === '/') return isDir;
+  switch (kind) {
+    case 'boot':
+      return !below(path, '/boot') && !below(path, '/api');
+    case 'initramfs':
+      return (
+        path === '/init'
+        || below(path, '/bin')
+        || below(path, '/sbin')
+        || below(path, '/lib')
+        || below(path, '/lib64')
+        || below(path, '/usr')
+        || (below(path, '/etc') && !isProtected(path))
+        || (isDir && INITRAMFS_DIRS.has(path))
+      );
+    case 'roottemplate':
+      return (
+        !below(path, '/etc/os-trust')
+        && (
+          below(path, '/etc')
+          || below(path, '/var')
+          || below(path, '/root')
+          || below(path, '/home')
+          || (isDir && ROOT_TEMPLATE_DIRS.has(path))
+        )
+      );
+    case 'base':
+      return (
+        below(path, '/usr')
+        || below(path, '/sys')
+        || BASE_TOP_LINKS.has(path)
+        || (isDir && BASE_MERGE_DIRS.has(path))
+      );
+    case 'sysext':
+      return below(path, '/usr') || below(path, '/opt');
+    case 'confext':
+      return below(path, '/etc') && !isProtected(path);
+    case 'workload':
+      return below(path, '/workload');
+    default:
+      return false;
+  }
+}
+
 export function validateImageV2Manifest(image, expectedKind) {
   if (!image || typeof image !== 'object') throw new Error('Invalid image manifest.');
   if (image.format !== 'os.image' || image.version !== IMAGE_VERSION) {
     throw new Error(`Unsupported image format/version (${image.format} v${image.version}).`);
+  }
+  if (image.abi !== IMAGE_ABI || image.level !== IMAGE_LEVEL) {
+    throw new Error(`Incompatible image ABI/level (abi=${image.abi}, level=${image.level}).`);
+  }
+  if (typeof image.name !== 'string' || !image.name || image.name.length > 128) {
+    throw new Error('Invalid image name.');
+  }
+  if (typeof image.revision !== 'string' || !image.revision || image.revision.length > 128) {
+    throw new Error('Invalid image revision.');
+  }
+  if (!Array.isArray(image.features)) {
+    throw new Error('Invalid image features.');
+  }
+  const seenFeatures = new Set();
+  for (const feat of image.features) {
+    if (typeof feat !== 'string' || !ALLOWED_IMAGE_FEATURES.has(feat) || seenFeatures.has(feat)) {
+      throw new Error(`Unknown or duplicate image feature: ${feat}`);
+    }
+    seenFeatures.add(feat);
   }
   if (expectedKind && image.kind !== expectedKind) {
     throw new Error(`Image kind mismatch: expected ${expectedKind}, got ${image.kind}.`);
@@ -250,10 +325,9 @@ export function validateImageV2Manifest(image, expectedKind) {
     if (!Number.isInteger(entry.mode) || entry.mode < 0 || entry.mode > 0o1777) {
       throw new Error('Unsupported permission bits in image.');
     }
-    if (entry.path === '/') {
-      if (entry.node?.type !== 'directory') throw new Error('Image root entry must be a directory.');
-    } else if (image.kind === 'confext' && (!below(entry.path, '/etc') || isProtected(entry.path))) {
-      throw new Error(`Confext entry disallowed: ${entry.path}`);
+    const isDir = entry.node?.type === 'directory';
+    if (!allowsImagePath(image.kind, entry.path, isDir)) {
+      throw new Error(`Image ${image.kind} entry disallowed: ${entry.path}`);
     }
     if (image.kind === 'boot' && entry.node?.type === 'symlink') {
       throw new Error('Boot assets cannot contain symlinks.');
@@ -274,7 +348,12 @@ export function validateImageV2Manifest(image, expectedKind) {
       }
       if (size === 0 && sha256 !== EMPTY_SHA256) throw new Error('Empty file sha256 mismatch.');
       if (chunks.length === 1 && chunks[0] !== sha256) throw new Error('Single-chunk digest mismatch.');
-    } else if (entry.node?.type !== 'directory' && entry.node?.type !== 'symlink') {
+    } else if (entry.node?.type === 'symlink') {
+      const target = entry.node.target;
+      if (typeof target !== 'string' || !target || target.length > 4096 || target.includes('\0')) {
+        throw new Error(`Invalid symlink target on ${entry.path}.`);
+      }
+    } else if (!isDir) {
       throw new Error('Unknown image node type.');
     }
     byPath.set(entry.path, entry);
@@ -302,7 +381,9 @@ export function validateImageV2Manifest(image, expectedKind) {
       for (const file of ['/etc/passwd', '/etc/group']) {
         if (byPath.get(file)?.node?.type !== 'file') throw new Error(`RootTemplate missing file ${file}`);
       }
-      if (byPath.has('/etc/os-trust')) throw new Error('RootTemplate cannot include /etc/os-trust.');
+      if (image.entries.some(e => below(e.path, '/etc/os-trust'))) {
+        throw new Error('RootTemplate cannot include /etc/os-trust.');
+      }
     }
   }
   return byPath;
@@ -709,9 +790,15 @@ export function createOfflineInstaller(options = {}) {
       }
 
       // 6. Promote staged files into committed OPFS store (`/os-releases/blobs/*` and `/os-releases/releases/<id>/*`).
+      // Verify any pre-existing committed blob before skipping so a truncated/corrupt blob from a prior crash is repaired.
       for (const [sha, bytes] of stagedBlobs.entries()) {
-        if (!(await opfs.exists(`os-releases/blobs/${sha}`))) {
-          await opfs.writeFile(`os-releases/blobs/${sha}`, bytes);
+        const blobPath = `os-releases/blobs/${sha}`;
+        const existing = await opfs.readFile(blobPath).catch(() => null);
+        const validExisting = existing !== null
+          && existing.byteLength === bytes.byteLength
+          && (await sha256Hex(existing, cryptoApi)) === sha;
+        if (!validExisting) {
+          await opfs.writeFile(blobPath, bytes);
         }
       }
       const committedDir = `os-releases/releases/${releaseId}`;
@@ -725,7 +812,8 @@ export function createOfflineInstaller(options = {}) {
       await opfs.removeDir(stagingDir);
 
       // 7. Atomically swap IndexedDB `{ durability: "strict" }` generation pointer.
-      // Preserves `previous` generation intact until `markBootHealthy(releaseId)` is called!
+      // Preserves known-good `previous` generation intact across back-to-back unverified installs
+      // until `markBootHealthy(releaseId)` is called!
       const activate = installOpts.activate !== false;
       const nextState = await stateStore.updateStrict(state => {
         state.generations[releaseId] = {
@@ -746,8 +834,11 @@ export function createOfflineInstaller(options = {}) {
           blobs: [...stagedBlobs.keys()],
         };
         if (activate) {
-          if (state.active && state.active !== releaseId) {
+          if (state.active && state.active !== releaseId && (state.activeBootVerified || !state.previous)) {
             state.previous = state.active;
+          }
+          if (state.previous === releaseId) {
+            state.previous = null;
           }
           state.active = releaseId;
           state.activeBootVerified = false;
@@ -864,11 +955,12 @@ export function createOfflineInstaller(options = {}) {
     const state = await stateStore.updateStrict(cur => {
       if (!cur.active) return cur;
       if (!cur.activeBootVerified && cur.bootAttempts >= 1 && cur.previous && cur.generations[cur.previous]) {
+        const prevId = cur.previous;
         rolledBack = true;
         rolledBackFrom = cur.active;
-        cur.active = cur.previous;
+        cur.active = prevId;
         cur.previous = null;
-        cur.activeBootVerified = true;
+        cur.activeBootVerified = Boolean(cur.generations[prevId]?.healthy);
         cur.bootAttempts = 0;
         return cur;
       }
@@ -893,7 +985,7 @@ export function createOfflineInstaller(options = {}) {
         const rolledState = await stateStore.updateStrict(cur => {
           cur.active = prevId;
           cur.previous = null;
-          cur.activeBootVerified = true;
+          cur.activeBootVerified = Boolean(cur.generations?.[prevId]?.healthy);
           cur.bootAttempts = 0;
           return cur;
         });
@@ -928,9 +1020,10 @@ export function createOfflineInstaller(options = {}) {
       if (!cur.previous || !cur.generations[cur.previous]) {
         throw new Error('No previous healthy generation available for rollback.');
       }
-      cur.active = cur.previous;
+      const prevId = cur.previous;
+      cur.active = prevId;
       cur.previous = null;
-      cur.activeBootVerified = true;
+      cur.activeBootVerified = Boolean(cur.generations[prevId]?.healthy);
       cur.bootAttempts = 0;
       return cur;
     });
@@ -1041,10 +1134,11 @@ if (typeof ServiceWorkerGlobalScope !== 'undefined' && self instanceof ServiceWo
       ) {
         state = await swStateStore.updateStrict(cur => {
           if (!cur.activeBootVerified && cur.bootAttempts >= 1 && cur.previous && cur.generations?.[cur.previous]) {
+            const prevId = cur.previous;
             cur.rolledBackFrom = cur.active;
-            cur.active = cur.previous;
+            cur.active = prevId;
             cur.previous = null;
-            cur.activeBootVerified = true;
+            cur.activeBootVerified = Boolean(cur.generations[prevId]?.healthy);
             cur.bootAttempts = 0;
           }
           return cur;
