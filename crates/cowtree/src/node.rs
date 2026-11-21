@@ -11,6 +11,11 @@ use vfs::Result;
 pub const NODE_MAGIC: [u8; 4] = *b"COWN";
 pub const NODE_VERSION: u16 = 1;
 pub const NODE_HEADER_BYTES: usize = 12;
+/// Maximum key tail length (bytes). Guarantees >= 3 internal separators always fit in one
+/// `NODE_MAX_BYTES` (16 KiB) internal node so B+tree root-split passes strictly shrink.
+pub const KEY_TAIL_MAX_BYTES: usize = 4096;
+/// `RootObject::features` flag indicating trailing `(allocated_bytes, inode_count)` accounting.
+pub const ROOT_FEATURE_ACCOUNTING: u64 = 1 << 0;
 
 /// One sorted item inside a B+tree leaf node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +84,31 @@ impl Node {
         }
     }
 
+    /// Approximate retained heap footprint of the decoded `Node` (struct + `Vec` capacities +
+    /// per-entry `tail`/`value` allocations) for accurate `Arena` LRU eviction accounting.
+    pub fn heap_bytes(&self) -> usize {
+        let base = std::mem::size_of::<Node>();
+        match self {
+            Node::Leaf { entries } => {
+                let vec_buf = entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<LeafEntry>());
+                let items: usize = entries
+                    .iter()
+                    .map(|e| e.key.tail.capacity().saturating_add(e.value.capacity()))
+                    .sum();
+                base.saturating_add(vec_buf).saturating_add(items)
+            }
+            Node::Internal { entries, .. } => {
+                let vec_buf = entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<InternalEntry>());
+                let items: usize = entries.iter().map(|e| e.key.tail.capacity()).sum();
+                base.saturating_add(vec_buf).saturating_add(items)
+            }
+        }
+    }
+
     /// Encode node deterministically, enforcing `encoded.len() <= NODE_MAX_BYTES`.
     pub fn encode(&self) -> Result<(Digest, Vec<u8>)> {
         let size = self.encoded_size();
@@ -95,6 +125,9 @@ impl Node {
                 let count = u32::try_from(entries.len()).map_err(|_| Errno::EIO)?;
                 buf.extend_from_slice(&count.to_be_bytes());
                 for entry in entries {
+                    if entry.key.tail.len() > KEY_TAIL_MAX_BYTES {
+                        return Err(Errno::E2BIG);
+                    }
                     let tail_len = u16::try_from(entry.key.tail.len()).map_err(|_| Errno::EIO)?;
                     let val_len = u32::try_from(entry.value.len()).map_err(|_| Errno::EIO)?;
                     buf.extend_from_slice(&entry.key.ino.to_be_bytes());
@@ -114,6 +147,9 @@ impl Node {
                 let count = u32::try_from(entries.len()).map_err(|_| Errno::EIO)?;
                 buf.extend_from_slice(&count.to_be_bytes());
                 for entry in entries {
+                    if entry.key.tail.len() > KEY_TAIL_MAX_BYTES {
+                        return Err(Errno::E2BIG);
+                    }
                     let tail_len = u16::try_from(entry.key.tail.len()).map_err(|_| Errno::EIO)?;
                     buf.extend_from_slice(&entry.key.ino.to_be_bytes());
                     buf.push(entry.key.kind);
@@ -156,7 +192,11 @@ impl Node {
         let mut cursor = NODE_HEADER_BYTES;
 
         if level == 0 {
-            let mut entries = Vec::with_capacity(count.min(1024));
+            let max_possible = (bytes.len() - NODE_HEADER_BYTES) / 15;
+            if count > max_possible {
+                return Err(Errno::EIO);
+            }
+            let mut entries = Vec::with_capacity(count);
             let mut prev: Option<&TreeKey> = None;
             for _ in 0..count {
                 let key = read_key(bytes, &mut cursor)?;
@@ -178,7 +218,11 @@ impl Node {
             if count == 0 {
                 return Err(Errno::EIO);
             }
-            let mut entries = Vec::with_capacity(count.min(512));
+            let max_possible = (bytes.len() - NODE_HEADER_BYTES) / 43;
+            if count > max_possible {
+                return Err(Errno::EIO);
+            }
+            let mut entries = Vec::with_capacity(count);
             let mut prev: Option<&TreeKey> = None;
             for _ in 0..count {
                 let key = read_key(bytes, &mut cursor)?;
@@ -212,14 +256,24 @@ pub struct RootObject {
     pub next_ino: u64,
     pub generation: u64,
     pub parent_root: Option<Digest>,
+    pub allocated_bytes: u64,
+    pub inode_count: u64,
 }
 
 impl RootObject {
     pub fn encode(&self) -> Result<(Digest, Vec<u8>)> {
+        let include_accounting = (self.features & ROOT_FEATURE_ACCOUNTING) != 0
+            || self.allocated_bytes != 0
+            || self.inode_count != 0;
+        let features = if include_accounting {
+            self.features | ROOT_FEATURE_ACCOUNTING
+        } else {
+            self.features
+        };
         let mut buf = Vec::with_capacity(256);
         buf.extend_from_slice(&COWFS_ROOT_MAGIC);
         buf.extend_from_slice(&self.format_version.to_be_bytes());
-        buf.extend_from_slice(&self.features.to_be_bytes());
+        buf.extend_from_slice(&features.to_be_bytes());
         let uuid_bytes = self.volume_uuid.as_bytes();
         let uuid_len = u16::try_from(uuid_bytes.len()).map_err(|_| Errno::EINVAL)?;
         buf.extend_from_slice(&uuid_len.to_be_bytes());
@@ -241,6 +295,10 @@ impl RootObject {
             buf.extend_from_slice(&nlen.to_be_bytes());
             buf.extend_from_slice(nb);
             buf.extend_from_slice(digest);
+        }
+        if include_accounting {
+            buf.extend_from_slice(&self.allocated_bytes.to_be_bytes());
+            buf.extend_from_slice(&self.inode_count.to_be_bytes());
         }
         if buf.len() > NODE_MAX_BYTES {
             return Err(Errno::ENOSPC);
@@ -299,6 +357,13 @@ impl RootObject {
                 return Err(Errno::EIO);
             }
         }
+        let (allocated_bytes, inode_count) = if (features & ROOT_FEATURE_ACCOUNTING) != 0 {
+            let alloc = read_u64(bytes, &mut cursor)?;
+            let inos = read_u64(bytes, &mut cursor)?;
+            (alloc, inos)
+        } else {
+            (0, 0)
+        };
         if cursor != bytes.len() {
             return Err(Errno::EIO);
         }
@@ -310,6 +375,8 @@ impl RootObject {
             next_ino,
             generation,
             parent_root,
+            allocated_bytes,
+            inode_count,
         })
     }
 }
@@ -349,6 +416,9 @@ fn read_key(bytes: &[u8], cursor: &mut usize) -> Result<TreeKey> {
     let ino = read_u64(bytes, cursor)?;
     let kind = read_u8(bytes, cursor)?;
     let tail_len = read_u16(bytes, cursor)? as usize;
+    if tail_len > KEY_TAIL_MAX_BYTES {
+        return Err(Errno::EIO);
+    }
     let tail = read_slice(bytes, cursor, tail_len)?.to_vec();
     Ok(TreeKey { ino, kind, tail })
 }
@@ -389,9 +459,21 @@ mod tests {
             next_ino: 2,
             generation: 1,
             parent_root: None,
+            allocated_bytes: 0,
+            inode_count: 0,
         };
         let (digest, bytes) = root.encode().unwrap();
         assert_eq!(RootObject::decode_verified(&digest, &bytes).unwrap(), root);
+
+        let mut acct = root.clone();
+        acct.features = ROOT_FEATURE_ACCOUNTING;
+        acct.allocated_bytes = 256 * 1024;
+        acct.inode_count = 42;
+        let (acct_digest, acct_bytes) = acct.encode().unwrap();
+        assert_eq!(
+            RootObject::decode_verified(&acct_digest, &acct_bytes).unwrap(),
+            acct
+        );
 
         let mut bad = root.clone();
         bad.format_version = COWFS_FORMAT_VERSION + 1;

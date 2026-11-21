@@ -207,6 +207,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
                     epoch: snap.epoch,
                 });
             }
+            let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
             let head = self.head_store.read_head(&self.volume).await?;
             let now = (self.clock)();
             let snap = self
@@ -242,6 +243,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
                     epoch: forked.epoch,
                 });
             }
+            // Hold shared GC lock from root selection through fork publication so GC cannot sweep
+            // the selected root concurrently.
+            let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
             let source_root = match &req.snapshot {
                 Some(snap_name) => {
                     self.head_store
@@ -277,33 +281,46 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
             if self.mounted.is_some() {
                 return Err(Errno::EBUSY);
             }
+            let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
+            let now = (self.clock)();
             // Refuse if another writer currently holds the volume lease (`EBUSY`).
-            match self.head_store.read_head(&self.volume).await {
+            // On `--force`, replace the volume head, bump `incarnation`, and wipe prior snapshots
+            // and receipts atomically WHILE holding the exclusive writer lease.
+            let head = match self.head_store.read_head(&self.volume).await {
                 Ok(_) => {
-                    // Check writer lock before deciding EBUSY vs EEXIST.
                     let lease = self
                         .head_store
                         .acquire_writer(&self.volume, WriterMode::Exclusive)
                         .await?;
-                    self.head_store.release_writer(lease).await?;
                     if !force {
+                        let _ = self.head_store.release_writer(lease).await;
                         return Err(Errno::EEXIST);
                     }
-                    self.head_store.delete_volume(&self.volume).await?;
+                    let (new_head, initial_nodes) = CowFs::<H, P>::build_initial_volume_nodes(
+                        self.volume.clone(),
+                        0,
+                        0,
+                        0o755,
+                        now,
+                    )?;
+                    self.head_store
+                        .reformat_volume_with_lease(lease, &new_head, &initial_nodes)
+                        .await?
                 }
-                Err(Errno::ENOENT) => {}
+                Err(Errno::ENOENT) => {
+                    CowFs::format_volume(
+                        &*self.head_store,
+                        &*self.pack_store,
+                        self.volume.clone(),
+                        0,
+                        0,
+                        0o755,
+                        now,
+                    )
+                    .await?
+                }
                 Err(e) => return Err(e),
-            }
-            let head = CowFs::format_volume(
-                &*self.head_store,
-                &*self.pack_store,
-                self.volume.clone(),
-                0,
-                0,
-                0o755,
-                (self.clock)(),
-            )
-            .await?;
+            };
             Ok(CowfsInfoResp {
                 format_version: COWFS_FORMAT_VERSION,
                 volume: head.volume.0,

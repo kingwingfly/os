@@ -9,10 +9,11 @@
 use crate::NODE_MAX_BYTES;
 use crate::arena::Arena;
 use crate::key::TreeKey;
-use crate::node::{InternalEntry, LeafEntry, NODE_HEADER_BYTES, Node};
+use crate::node::{InternalEntry, KEY_TAIL_MAX_BYTES, LeafEntry, NODE_HEADER_BYTES, Node};
 use crate::store::{Digest, HeadStore};
+use abi::Errno;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::rc::Rc;
 use vfs::Result;
@@ -67,9 +68,45 @@ impl TreeOverlay {
         self.ops.get(key).map(|v| v.as_deref())
     }
 
+    pub fn contains_key(&self, key: &TreeKey) -> bool {
+        self.ops.contains_key(key)
+    }
+
     pub fn clear(&mut self) {
         self.ops.clear();
         self.bytes = 0;
+    }
+
+    /// Merge `lower` underneath `self`, inserting entries from `lower` only when `self` does not
+    /// already override the same key. Used when rolling back a failed committing transaction group
+    /// underneath newer live mutations.
+    pub fn merge_under(&mut self, lower: TreeOverlay) {
+        for (k, v) in lower.ops {
+            if !self.ops.contains_key(&k) {
+                match v {
+                    Some(val) => self.put(k, val),
+                    None => self.delete(k),
+                }
+            }
+        }
+    }
+
+    /// Build a combined read overlay where `upper` takes precedence over `self`.
+    pub fn merged_with(&self, upper: &TreeOverlay) -> TreeOverlay {
+        if self.is_empty() {
+            return upper.clone();
+        }
+        if upper.is_empty() {
+            return self.clone();
+        }
+        let mut combined = self.clone();
+        for (k, v) in &upper.ops {
+            match v {
+                Some(val) => combined.put(k.clone(), val.clone()),
+                None => combined.delete(k.clone()),
+            }
+        }
+        combined
     }
 
     pub fn take_sorted_ops(&mut self) -> Vec<(TreeKey, Option<Vec<u8>>)> {
@@ -185,6 +222,79 @@ impl<'a, H: HeadStore> CowTree<'a, H> {
         }
     }
 
+    /// Find the largest entry `(k, v)` with `min_key <= k < upper_excl` in O(log N).
+    pub async fn find_lt(
+        &self,
+        root: &Digest,
+        min_key: &TreeKey,
+        upper_excl: &TreeKey,
+    ) -> Result<Option<(TreeKey, Vec<u8>)>> {
+        if min_key >= upper_excl {
+            return Ok(None);
+        }
+        let mut cur = *root;
+        let mut stack: Vec<(Rc<Node>, usize)> = Vec::new();
+        loop {
+            let node = self.load_node(&cur).await?;
+            match &*node {
+                Node::Leaf { entries } => {
+                    let pos = match entries.binary_search_by(|e| e.key.cmp(upper_excl)) {
+                        Ok(0) | Err(0) => None,
+                        Ok(i) | Err(i) => Some(i - 1),
+                    };
+                    if let Some(p) = pos {
+                        let entry = &entries[p];
+                        if &entry.key >= min_key {
+                            return Ok(Some((entry.key.clone(), entry.value.clone())));
+                        }
+                        return Ok(None);
+                    }
+                    // Step back to previous leaf sibling if this leaf had no key < upper_excl.
+                    let mut prev_child = None;
+                    while let Some((parent, idx)) = stack.pop() {
+                        if let Node::Internal { entries, .. } = &*parent
+                            && idx > 0
+                        {
+                            let child = entries[idx - 1].child;
+                            stack.push((parent, idx - 1));
+                            prev_child = Some(child);
+                            break;
+                        }
+                    }
+                    let Some(mut down) = prev_child else {
+                        return Ok(None);
+                    };
+                    loop {
+                        let n = self.load_node(&down).await?;
+                        match &*n {
+                            Node::Leaf { entries } => {
+                                if let Some(last) = entries.last()
+                                    && &last.key >= min_key
+                                    && &last.key < upper_excl
+                                {
+                                    return Ok(Some((last.key.clone(), last.value.clone())));
+                                }
+                                return Ok(None);
+                            }
+                            Node::Internal { entries, .. } => {
+                                let last_idx = entries.len().checked_sub(1).ok_or(Errno::EIO)?;
+                                down = entries[last_idx].child;
+                            }
+                        }
+                    }
+                }
+                Node::Internal { entries, .. } => {
+                    let idx = match entries.binary_search_by(|e| e.key.cmp(upper_excl)) {
+                        Ok(0) | Err(0) => return Ok(None),
+                        Ok(i) | Err(i) => i - 1,
+                    };
+                    cur = entries[idx].child;
+                    stack.push((node, idx));
+                }
+            }
+        }
+    }
+
     /// Floor lookup `min_key <= k <= max_key` respecting uncommitted puts and deletes in `overlay`.
     pub async fn find_le_with_overlay(
         &self,
@@ -203,11 +313,16 @@ impl<'a, H: HeadStore> CowTree<'a, H> {
             .rev()
             .find_map(|(k, v)| v.as_ref().map(|bytes| (k.clone(), bytes.clone())));
 
-        // Search committed tree backwards past any tombstones until we find a live key > staged_live.
-        let mut cursor_max = max_key.clone();
+        // Search committed tree backwards past any tombstones using an exact exclusive upper bound
+        // so arbitrary variable-length keys (e.g. `aa` < `b`) are never skipped.
         let lower_bound = staged_live.as_ref().map(|(k, _)| k).unwrap_or(min_key);
+        let mut exclusive_upper: Option<TreeKey> = None;
         loop {
-            let Some((ck, cv)) = self.find_le(root, lower_bound, &cursor_max).await? else {
+            let committed = match &exclusive_upper {
+                None => self.find_le(root, lower_bound, max_key).await?,
+                Some(upper) => self.find_lt(root, lower_bound, upper).await?,
+            };
+            let Some((ck, cv)) = committed else {
                 return Ok(staged_live);
             };
             if let Some((sk, _)) = &staged_live
@@ -220,13 +335,10 @@ impl<'a, H: HeadStore> CowTree<'a, H> {
                 Some(Some(val)) => return Ok(Some((ck, val.to_vec()))),
                 Some(None) => {
                     // Tombstoned in overlay; step strictly below `ck`.
-                    let Some(prev) = predecessor_key(&ck) else {
-                        return Ok(staged_live);
-                    };
-                    if prev < *lower_bound {
+                    if ck <= *lower_bound {
                         return Ok(staged_live);
                     }
-                    cursor_max = prev;
+                    exclusive_upper = Some(ck);
                 }
             }
         }
@@ -359,7 +471,12 @@ impl<'a, H: HeadStore> CowTree<'a, H> {
 
             while out.len() < limit {
                 match (base_batch.get(b_idx), staged.get(s_idx)) {
-                    (None, None) => return Ok(out),
+                    (None, None) => {
+                        if base_exhausted {
+                            return Ok(out);
+                        }
+                        break;
+                    }
                     (None, Some((sk, sv))) => {
                         if !base_exhausted {
                             // Need more base items before emitting staged items past last base key.
@@ -425,54 +542,93 @@ impl<'a, H: HeadStore> CowTree<'a, H> {
         if ops.is_empty() {
             return Ok((*root, Vec::new()));
         }
-        let mut new_nodes = Vec::new();
+        // Validate every key and value against B+tree leaf/internal size bounds before mutating.
+        for (k, v) in ops {
+            if k.tail.len() > KEY_TAIL_MAX_BYTES {
+                return Err(Errno::E2BIG);
+            }
+            if let Some(val) = v
+                && NODE_HEADER_BYTES + Node::leaf_entry_encoded_size(k, val.len()) > NODE_MAX_BYTES
+            {
+                return Err(Errno::E2BIG);
+            }
+        }
+        let mut pending: PendingNodes = HashMap::new();
         let root_node = self.load_node(root).await?;
         let root_level = root_node.level();
-        let mut children = self.apply_node(root, ops, &mut new_nodes).await?;
+        let mut children = self.apply_node(root, ops, &mut pending).await?;
 
         if children.is_empty() {
-            let empty = Node::empty_leaf();
-            let (d, bytes) = empty.encode()?;
-            new_nodes.push((d, bytes));
+            let d = insert_pending(Node::empty_leaf(), &mut pending)?;
+            let new_nodes = collect_reachable_pending(d, &pending);
             return Ok((d, new_nodes));
         }
 
         if children.len() == 1 {
-            // Collapse redundant root internal node with 1 child if we shrank it.
-            return Ok((children[0].1, new_nodes));
+            // Collapse redundant single-child internal nodes ONLY at the root so all non-root
+            // levels remain strictly uniform.
+            let mut root_dig = children[0].1;
+            loop {
+                let node = self.load_node_with_pending(&root_dig, &pending).await?;
+                match &*node {
+                    Node::Internal { entries, .. } if entries.len() == 1 => {
+                        root_dig = entries[0].child;
+                    }
+                    _ => break,
+                }
+            }
+            let new_nodes = collect_reachable_pending(root_dig, &pending);
+            return Ok((root_dig, new_nodes));
         }
 
         // Grow tree height upward until a single root node holds all children.
-        let mut level = root_level.saturating_add(1);
+        let mut level = root_level.checked_add(1).ok_or(Errno::EIO)?;
         loop {
+            let prev_count = children.len();
             let entries: Vec<InternalEntry> = children
                 .into_iter()
                 .map(|(key, child)| InternalEntry { key, child })
                 .collect();
-            let packed = pack_internal_nodes(level, entries, &mut new_nodes)?;
+            let packed = pack_internal_nodes(level, entries, &mut pending)?;
             if packed.len() == 1 {
-                return Ok((packed[0].1, new_nodes));
+                let root_dig = packed[0].1;
+                let new_nodes = collect_reachable_pending(root_dig, &pending);
+                return Ok((root_dig, new_nodes));
+            }
+            if packed.len() >= prev_count {
+                return Err(Errno::E2BIG);
             }
             children = packed;
-            level = level.saturating_add(1);
+            level = level.checked_add(1).ok_or(Errno::EIO)?;
         }
+    }
+
+    async fn load_node_with_pending(
+        &self,
+        digest: &Digest,
+        pending: &PendingNodes,
+    ) -> Result<Rc<Node>> {
+        if let Some((node, _)) = pending.get(digest) {
+            return Ok(Rc::clone(node));
+        }
+        self.load_node(digest).await
     }
 
     fn apply_node<'b>(
         &'b self,
         digest: &'b Digest,
         ops: &'b [(TreeKey, Option<Vec<u8>>)],
-        new_nodes: &'b mut Vec<(Digest, Vec<u8>)>,
+        pending: &'b mut PendingNodes,
     ) -> vfs::BoxFuture<'b, Vec<(TreeKey, Digest)>> {
         Box::pin(async move {
-            let node = self.load_node(digest).await?;
+            let node = self.load_node_with_pending(digest, pending).await?;
             match &*node {
                 Node::Leaf { entries } => {
                     let merged = merge_leaf_entries(entries, ops);
                     if merged.is_empty() {
                         return Ok(Vec::new());
                     }
-                    pack_leaf_nodes(merged, new_nodes)
+                    pack_leaf_nodes(merged, pending)
                 }
                 Node::Internal { level, entries } => {
                     let mut next_children: Vec<InternalEntry> = Vec::with_capacity(entries.len());
@@ -492,7 +648,7 @@ impl<'a, H: HeadStore> CowTree<'a, H> {
                             next_children.push(entries[i].clone());
                         } else {
                             let sub = self
-                                .apply_node(&entries[i].child, &ops[start..op_idx], new_nodes)
+                                .apply_node(&entries[i].child, &ops[start..op_idx], pending)
                                 .await?;
                             for (min_key, child_digest) in sub {
                                 next_children.push(InternalEntry {
@@ -505,16 +661,94 @@ impl<'a, H: HeadStore> CowTree<'a, H> {
                     if next_children.is_empty() {
                         return Ok(Vec::new());
                     }
-                    if next_children.len() == 1 && *level >= 1 {
-                        // Allow caller (or root) to collapse single-child internal chains cleanly.
-                        let only = next_children.pop().unwrap();
-                        return Ok(vec![(only.key, only.child)]);
+                    // Rebalance any single-entry internal children at `level - 1` by merging them
+                    // with an adjacent sibling at the same height, preserving uniform tree depth.
+                    if *level >= 2 && next_children.len() >= 2 {
+                        let mut i = 0usize;
+                        while i < next_children.len() {
+                            let child_dig = next_children[i].child;
+                            let is_single = pending.get(&child_dig).is_some_and(|(n, _)| {
+                                matches!(&**n, Node::Internal { entries, .. } if entries.len() < 2)
+                            });
+                            if is_single && next_children.len() >= 2 {
+                                let (left_idx, right_idx) =
+                                    if i > 0 { (i - 1, i) } else { (i, i + 1) };
+                                let left_dig = next_children[left_idx].child;
+                                let right_dig = next_children[right_idx].child;
+                                let left_node =
+                                    self.load_node_with_pending(&left_dig, pending).await?;
+                                let right_node =
+                                    self.load_node_with_pending(&right_dig, pending).await?;
+                                let (
+                                    Node::Internal {
+                                        level: l1,
+                                        entries: e1,
+                                    },
+                                    Node::Internal {
+                                        level: l2,
+                                        entries: e2,
+                                    },
+                                ) = (&*left_node, &*right_node)
+                                else {
+                                    return Err(Errno::EIO);
+                                };
+                                if *l1 != *level - 1 || *l2 != *level - 1 {
+                                    return Err(Errno::EIO);
+                                }
+                                let mut merged = Vec::with_capacity(e1.len() + e2.len());
+                                merged.extend(e1.iter().cloned());
+                                merged.extend(e2.iter().cloned());
+                                let repacked = pack_internal_nodes(*level - 1, merged, pending)?;
+                                let repacked_entries: Vec<InternalEntry> = repacked
+                                    .into_iter()
+                                    .map(|(key, child)| InternalEntry { key, child })
+                                    .collect();
+                                let added = repacked_entries.len();
+                                next_children.splice(left_idx..=right_idx, repacked_entries);
+                                i = left_idx + added;
+                                continue;
+                            }
+                            i += 1;
+                        }
                     }
-                    pack_internal_nodes(*level, next_children, new_nodes)
+                    // Always emit nodes at `*level`; single-child root collapse happens only in
+                    // `apply_batch` so parent/sibling heights remain strictly uniform.
+                    pack_internal_nodes(*level, next_children, pending)
                 }
             }
         })
     }
+}
+
+type PendingNodes = HashMap<Digest, (Rc<Node>, Vec<u8>)>;
+
+fn insert_pending(node: Node, pending: &mut PendingNodes) -> Result<Digest> {
+    let (digest, bytes) = node.encode()?;
+    pending.entry(digest).or_insert((Rc::new(node), bytes));
+    Ok(digest)
+}
+
+fn collect_reachable_pending(root: Digest, pending: &PendingNodes) -> Vec<(Digest, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(d) = stack.pop() {
+        if !visited.insert(d) {
+            continue;
+        }
+        let Some((node, bytes)) = pending.get(&d) else {
+            continue;
+        };
+        if let Node::Internal { entries, .. } = &**node {
+            for e in entries {
+                if pending.contains_key(&e.child) && !visited.contains(&e.child) {
+                    stack.push(e.child);
+                }
+            }
+        }
+        out.push((d, bytes.clone()));
+    }
+    out
 }
 
 fn merge_leaf_entries(
@@ -571,7 +805,7 @@ fn merge_leaf_entries(
 
 fn pack_leaf_nodes(
     entries: Vec<LeafEntry>,
-    new_nodes: &mut Vec<(Digest, Vec<u8>)>,
+    pending: &mut PendingNodes,
 ) -> Result<Vec<(TreeKey, Digest)>> {
     let total_size = NODE_HEADER_BYTES
         + entries
@@ -580,9 +814,7 @@ fn pack_leaf_nodes(
             .sum::<usize>();
     if total_size <= NODE_MAX_BYTES {
         let first_key = entries[0].key.clone();
-        let node = Node::Leaf { entries };
-        let (digest, bytes) = node.encode()?;
-        new_nodes.push((digest, bytes));
+        let digest = insert_pending(Node::Leaf { entries }, pending)?;
         return Ok(vec![(first_key, digest)]);
     }
 
@@ -596,11 +828,12 @@ fn pack_leaf_nodes(
                 || (chunk_bytes >= SPLIT_TARGET_BYTES && chunk_bytes + sz > SPLIT_TARGET_BYTES))
         {
             let first_key = chunk[0].key.clone();
-            let node = Node::Leaf {
-                entries: std::mem::take(&mut chunk),
-            };
-            let (digest, bytes) = node.encode()?;
-            new_nodes.push((digest, bytes));
+            let digest = insert_pending(
+                Node::Leaf {
+                    entries: std::mem::take(&mut chunk),
+                },
+                pending,
+            )?;
             out.push((first_key, digest));
             chunk_bytes = NODE_HEADER_BYTES;
         }
@@ -609,9 +842,7 @@ fn pack_leaf_nodes(
     }
     if !chunk.is_empty() {
         let first_key = chunk[0].key.clone();
-        let node = Node::Leaf { entries: chunk };
-        let (digest, bytes) = node.encode()?;
-        new_nodes.push((digest, bytes));
+        let digest = insert_pending(Node::Leaf { entries: chunk }, pending)?;
         out.push((first_key, digest));
     }
     Ok(out)
@@ -620,7 +851,7 @@ fn pack_leaf_nodes(
 fn pack_internal_nodes(
     level: u8,
     entries: Vec<InternalEntry>,
-    new_nodes: &mut Vec<(Digest, Vec<u8>)>,
+    pending: &mut PendingNodes,
 ) -> Result<Vec<(TreeKey, Digest)>> {
     let total_size = NODE_HEADER_BYTES
         + entries
@@ -629,13 +860,11 @@ fn pack_internal_nodes(
             .sum::<usize>();
     if total_size <= NODE_MAX_BYTES {
         let first_key = entries[0].key.clone();
-        let node = Node::Internal { level, entries };
-        let (digest, bytes) = node.encode()?;
-        new_nodes.push((digest, bytes));
+        let digest = insert_pending(Node::Internal { level, entries }, pending)?;
         return Ok(vec![(first_key, digest)]);
     }
 
-    let mut out = Vec::new();
+    let mut chunks: Vec<Vec<InternalEntry>> = Vec::new();
     let mut chunk: Vec<InternalEntry> = Vec::new();
     let mut chunk_bytes = NODE_HEADER_BYTES;
     for entry in entries {
@@ -644,27 +873,34 @@ fn pack_internal_nodes(
             && (chunk_bytes + sz > NODE_MAX_BYTES
                 || (chunk_bytes >= SPLIT_TARGET_BYTES && chunk_bytes + sz > SPLIT_TARGET_BYTES))
         {
-            let first_key = chunk[0].key.clone();
-            let node = Node::Internal {
-                level,
-                entries: std::mem::take(&mut chunk),
-            };
-            let (digest, bytes) = node.encode()?;
-            new_nodes.push((digest, bytes));
-            out.push((first_key, digest));
+            chunks.push(std::mem::take(&mut chunk));
             chunk_bytes = NODE_HEADER_BYTES;
         }
         chunk_bytes += sz;
         chunk.push(entry);
     }
     if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    // Never leave a trailing 1-entry internal chunk when the preceding chunk has >= 3 entries.
+    if chunks.len() >= 2 && chunks.last().is_some_and(|c| c.len() == 1) {
+        let prev_idx = chunks.len() - 2;
+        if chunks[prev_idx].len() >= 3 {
+            let moved = chunks[prev_idx].pop().unwrap();
+            chunks.last_mut().unwrap().insert(0, moved);
+        }
+    }
+
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
         let first_key = chunk[0].key.clone();
-        let node = Node::Internal {
-            level,
-            entries: chunk,
-        };
-        let (digest, bytes) = node.encode()?;
-        new_nodes.push((digest, bytes));
+        let digest = insert_pending(
+            Node::Internal {
+                level,
+                entries: chunk,
+            },
+            pending,
+        )?;
         out.push((first_key, digest));
     }
     Ok(out)
@@ -679,66 +915,6 @@ fn successor_key(key: &TreeKey) -> TreeKey {
         kind: key.kind,
         tail,
     }
-}
-
-/// Immediate predecessor key (best-effort for tombstone stepping on fixed-width or arbitrary tails).
-fn predecessor_key(key: &TreeKey) -> Option<TreeKey> {
-    if !key.tail.is_empty() {
-        let mut tail = key.tail.clone();
-        if let Some(last) = tail.last_mut() {
-            if *last > 0 {
-                *last -= 1;
-                // Extend with max bytes? No — for fixed-width u64 tails (EXTENT_DATA), decrementing
-                // big-endian integer is exact! Handle big-endian decrement when len == 8.
-                if key.tail.len() == 8 {
-                    let v = u64::from_be_bytes(key.tail.as_slice().try_into().unwrap());
-                    if v > 0 {
-                        return Some(TreeKey {
-                            ino: key.ino,
-                            kind: key.kind,
-                            tail: (v - 1).to_be_bytes().to_vec(),
-                        });
-                    }
-                }
-                return Some(TreeKey {
-                    ino: key.ino,
-                    kind: key.kind,
-                    tail,
-                });
-            }
-            if key.tail.len() == 8 {
-                let v = u64::from_be_bytes(key.tail.as_slice().try_into().unwrap());
-                if v > 0 {
-                    return Some(TreeKey {
-                        ino: key.ino,
-                        kind: key.kind,
-                        tail: (v - 1).to_be_bytes().to_vec(),
-                    });
-                }
-            }
-            tail.pop();
-            return Some(TreeKey {
-                ino: key.ino,
-                kind: key.kind,
-                tail,
-            });
-        }
-    }
-    if key.kind > 0 {
-        return Some(TreeKey {
-            ino: key.ino,
-            kind: key.kind - 1,
-            tail: vec![0xff; 16],
-        });
-    }
-    if key.ino > 0 {
-        return Some(TreeKey {
-            ino: key.ino - 1,
-            kind: u8::MAX,
-            tail: vec![0xff; 16],
-        });
-    }
-    None
 }
 
 #[cfg(test)]

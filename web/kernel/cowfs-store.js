@@ -8,9 +8,9 @@
 export const COWFS_FORMAT_VERSION = 1;
 export const PACK_MAX_BYTES = 8 * 1024 * 1024;
 const DEFAULT_DB_NAME = 'os-cowfs-v1';
-const PACKS_DIR_PATH = ['os-cowfs', 'packs'];
-const GC_LOCK_NAME = 'os-cowfs-gc';
+const PACKS_DIR_ROOT = ['os-cowfs', 'packs'];
 const DEFAULT_GRACE_WINDOW_SECS = 600;
+const IDB_SCHEMA_VERSION = 2;
 
 const errnoError = (errno, message = errno) => Object.assign(new Error(message), { errno });
 
@@ -19,6 +19,7 @@ function mapDomError(reason) {
   const errno = {
     QuotaExceededError: 'ENOSPC',
     NotFoundError: 'ENOENT',
+    ConstraintError: 'EEXIST',
     NotAllowedError: 'EACCES',
     SecurityError: 'EACCES',
     NoModificationAllowedError: 'EBUSY',
@@ -55,9 +56,51 @@ function digestArrayToHex(arr) {
   return bytesToHex(arr instanceof Uint8Array ? arr : Uint8Array.from(arr));
 }
 
+async function sha256Hex(bytes) {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle || typeof subtle.digest !== 'function') {
+    throw errnoError('EOPNOTSUPP', 'WebCrypto SHA-256 is unavailable');
+  }
+  const input = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
+  const digest = await subtle.digest('SHA-256', input);
+  return bytesToHex(new Uint8Array(digest));
+}
+
+function randomId() {
+  if (typeof globalThis.crypto?.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+  if (typeof globalThis.crypto?.getRandomValues === 'function') {
+    const buf = new Uint8Array(16);
+    globalThis.crypto.getRandomValues(buf);
+    return bytesToHex(buf);
+  }
+  throw errnoError('EOPNOTSUPP', 'CSPRNG is unavailable');
+}
+
 function reqPromise(req) {
   return new Promise((resolve, reject) => {
     req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(mapDomError(req.error));
+  });
+}
+
+function forEachCursor(store, onRecord) {
+  return new Promise((resolve, reject) => {
+    const req = store.openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) {
+        resolve();
+        return;
+      }
+      try {
+        onRecord(cursor);
+        cursor.continue();
+      } catch (err) {
+        reject(mapDomError(err));
+      }
+    };
     req.onerror = () => reject(mapDomError(req.error));
   });
 }
@@ -67,13 +110,28 @@ const TX_DONE = Symbol('os.cowfs.txDone');
 function openTx(db, stores, mode, strict = false) {
   let tx;
   if (strict && mode === 'readwrite') {
+    // Contract §2.15: NEVER silently fall back from `{ durability: 'strict' }` to relaxed/default!
     try {
       tx = db.transaction(stores, mode, { durability: 'strict' });
-    } catch {
-      tx = db.transaction(stores, mode);
+    } catch (err) {
+      if (err?.name === 'TypeError' || err?.name === 'NotSupportedError') {
+        throw errnoError('EOPNOTSUPP', 'IndexedDB strict durability transactions are unsupported');
+      }
+      throw mapDomError(err);
+    }
+    if (tx.durability !== undefined && tx.durability !== 'strict') {
+      try { tx.abort(); } catch {}
+      throw errnoError(
+        'EOPNOTSUPP',
+        `IndexedDB returned durability=${tx.durability} instead of strict`,
+      );
     }
   } else {
-    tx = db.transaction(stores, mode);
+    try {
+      tx = db.transaction(stores, mode);
+    } catch (err) {
+      throw mapDomError(err);
+    }
   }
   const done = new Promise((resolve, reject) => {
     tx.oncomplete = () => resolve();
@@ -91,7 +149,7 @@ function txDone(tx) {
 
 function openCowfsDb(idb, dbName) {
   return new Promise((resolve, reject) => {
-    const req = idb.open(dbName, 1);
+    const req = idb.open(dbName, IDB_SCHEMA_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains('meta')) {
@@ -119,6 +177,9 @@ function openCowfsDb(idb, dbName) {
       if (!db.objectStoreNames.contains('gracePins')) {
         db.createObjectStore('gracePins', { keyPath: 'id', autoIncrement: true });
       }
+      if (!db.objectStoreNames.contains('roPins')) {
+        db.createObjectStore('roPins', { keyPath: 'pinId' });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(mapDomError(req.error));
@@ -129,6 +190,13 @@ function openCowfsDb(idb, dbName) {
 function tsGt(a, b) {
   if (!a || !b) return false;
   return a.sec > b.sec || (a.sec === b.sec && a.nsec > b.nsec);
+}
+
+function tsExpired(createdAt, now, graceWindowSecs) {
+  if (!createdAt || !now) return true;
+  const expSec = (createdAt.sec ?? 0) + (graceWindowSecs ?? 0);
+  const nowSec = now.sec ?? 0;
+  return expSec < nowSec || (expSec === nowSec && (createdAt.nsec ?? 0) <= (now.nsec ?? 0));
 }
 
 /**
@@ -152,15 +220,16 @@ export function createCowfsStore(options = {}) {
   const storageApi = options.storage ?? globalThis.navigator?.storage;
 
   let dbPromise = null;
+  let dbKeyPromise = null;
   let packsDirPromise = null;
   let persistRequested = false;
   let nextLeaseSeq = 1;
-  let nextForkSeq = 1;
   let nextGcSeq = 1;
 
-  // Active held Web Lock releasers keyed by leaseId / gcLockId.
+  // Active held Web Lock releasers keyed by leaseId / gcLockId / roPinId.
   const writerReleasers = new Map();
   const gcReleasers = new Map();
+  const roPinReleasers = new Map();
   const lockReleasePromises = new Set();
 
   // Telemetry counters for verification tests (zero-copy snapshot/fork/FICLONE assertions).
@@ -174,12 +243,58 @@ export function createCowfsStore(options = {}) {
     persistCalled: false,
   };
 
+  async function getDbKey() {
+    if (!dbKeyPromise) {
+      dbKeyPromise = sha256Hex(new TextEncoder().encode(`os-cowfs-db-v1:${dbName}`)).catch(err => {
+        dbKeyPromise = null;
+        throw err;
+      });
+    }
+    return dbKeyPromise;
+  }
+
+  async function volLockName(volume) {
+    if (dbName === DEFAULT_DB_NAME) {
+      return `os-vol:${volume}`;
+    }
+    const key = await getDbKey();
+    return `os-vol:${key.slice(0, 16)}:${volume}`;
+  }
+
+  async function gcLockName() {
+    const key = await getDbKey();
+    return `os-cowfs-gc:${key.slice(0, 16)}`;
+  }
+
+  async function roPinLockName(pinId) {
+    const key = await getDbKey();
+    return `os-cowfs-ro:${key.slice(0, 16)}:${pinId}`;
+  }
+
+  async function packLockName(packId) {
+    const key = await getDbKey();
+    return `os-cowfs-pack:${key.slice(0, 16)}:${packId}`;
+  }
+
   async function getDb() {
     if (!idbFactory || typeof idbFactory.open !== 'function') {
       throw errnoError('EOPNOTSUPP', 'IndexedDB is unavailable');
     }
     if (!dbPromise) {
-      dbPromise = openCowfsDb(idbFactory, dbName);
+      dbPromise = (async () => {
+        const db = await openCowfsDb(idbFactory, dbName);
+        // Verify `{ durability: 'strict' }` support immediately on store open so relaxed/unsupported
+        // backends fail closed rather than silently acknowledging non-durable commits.
+        const probe = openTx(db, ['meta'], 'readwrite', true);
+        await Promise.all([
+          reqPromise(probe.objectStore('meta').get('format_version')),
+          txDone(probe),
+        ]);
+        return db;
+      })().catch(err => {
+        dbPromise = null;
+        throw mapDomError(err);
+      });
     }
     return dbPromise;
   }
@@ -194,7 +309,8 @@ export function createCowfsStore(options = {}) {
           }
           dir = await storageApi.getDirectory();
         }
-        for (const seg of PACKS_DIR_PATH) {
+        const dbKey = await getDbKey();
+        for (const seg of [...PACKS_DIR_ROOT, dbKey]) {
           dir = await dir.getDirectoryHandle(seg, { create: true });
         }
         return dir;
@@ -284,7 +400,7 @@ export function createCowfsStore(options = {}) {
         createdAt: head.updated_at,
       });
     }
-    headsStore.put(head);
+    headsStore.add(head);
     await txDone(tx);
     return head;
   }
@@ -317,22 +433,27 @@ export function createCowfsStore(options = {}) {
         releaseFn = r;
       });
       let req;
-      req = locksApi.request(lockName, opts, lock => {
-        if (!lock) {
-          if (!settled) {
-            settled = true;
-            resolve(null);
+      try {
+        req = locksApi.request(lockName, opts, lock => {
+          if (!lock) {
+            if (!settled) {
+              settled = true;
+              resolve(null);
+            }
+            return;
           }
-          return;
-        }
-        queueMicrotask(() => {
-          if (!settled) {
-            settled = true;
-            resolve({ release: releaseFn, done: req });
-          }
+          queueMicrotask(() => {
+            if (!settled) {
+              settled = true;
+              resolve({ release: releaseFn, done: req });
+            }
+          });
+          return holdPromise;
         });
-        return holdPromise;
-      });
+      } catch (err) {
+        reject(mapDomError(err));
+        return;
+      }
       req.catch(err => {
         if (!settled) {
           settled = true;
@@ -342,64 +463,174 @@ export function createCowfsStore(options = {}) {
     });
   }
 
-  async function acquireWriter(volume, mode = 'exclusive') {
-    await ensureFormatCompatible();
-    const existing = await readHead(volume);
-    const lockName = `os-vol:${volume}`;
+  function releaseHeldLock(held) {
+    if (!held) return;
+    held.release();
+    if (held.done) {
+      const p = held.done.catch(() => {});
+      lockReleasePromises.add(p);
+      p.finally(() => lockReleasePromises.delete(p));
+    }
+  }
 
-    if (mode === 'force-takeover') {
-      // Steal Web Lock (best-effort; browsers support `{ steal: true }`) AND bump local_fence
-      // atomically in strict IndexedDB so any paused/bfcached tab fails with ESTALE.
-      let held = null;
-      try {
-        held = await requestHeldWebLock(lockName, { mode: 'exclusive', steal: true });
-      } catch {
-        // If lock steal isn't supported in a minimal environment, rely on local_fence CAS.
+  async function pinRoRoot(volume, snapshot = null) {
+    await ensureFormatCompatible();
+    const gcLockId = await acquireGcLock(false);
+    let pinLock = null;
+    try {
+      const pinId = randomId();
+      const lName = await roPinLockName(pinId);
+      pinLock = await requestHeldWebLock(lName, { mode: 'exclusive', ifAvailable: true });
+      if (!pinLock) {
+        throw errnoError('ENOLCK', 'failed to acquire RO root pin lock');
       }
       const db = await getDb();
-      const tx = openTx(db, ['heads'], 'readwrite', true);
+      const tx = openTx(db, ['heads', 'snapshots', 'nodes', 'roPins'], 'readwrite', true);
       const headsStore = tx.objectStore('heads');
+      const snapsStore = tx.objectStore('snapshots');
+      const nodesStore = tx.objectStore('nodes');
+      const pinsStore = tx.objectStore('roPins');
+
       const cur = await reqPromise(headsStore.get(volume));
       if (!cur) {
         try { tx.abort(); } catch {}
-        held?.release?.();
         throw errnoError('ENOENT', `volume ${volume} not found`);
       }
-      const nextHead = { ...cur, fence: Number(cur.fence) + 1 };
-      headsStore.put(nextHead);
-      await txDone(tx);
-
-      const leaseId = `lease-${nextLeaseSeq++}`;
-      if (held) {
-        writerReleasers.set(leaseId, held);
+      if (cur.format_version !== COWFS_FORMAT_VERSION) {
+        try { tx.abort(); } catch {}
+        throw errnoError('EPROTONOSUPPORT', 'incompatible volume head format_version');
       }
-      return {
-        leaseId,
-        volume: nextHead.volume,
-        incarnation: nextHead.incarnation,
-        fence: nextHead.fence,
-        epoch: nextHead.epoch,
-        head: nextHead,
-        forkedFrom: null,
-        expiresAt: null,
-      };
+      const pinnedHead = { ...cur };
+      if (snapshot !== null && snapshot !== undefined) {
+        const snap = await reqPromise(snapsStore.get(`${volume}\0${snapshot}`));
+        if (!snap) {
+          try { tx.abort(); } catch {}
+          throw errnoError('ENOENT', `snapshot ${snapshot} not found`);
+        }
+        pinnedHead.root = snap.root;
+        pinnedHead.epoch = snap.epoch;
+        pinnedHead.updated_at = snap.created_at;
+      }
+      const rootHex = digestArrayToHex(pinnedHead.root);
+      const rootNode = await reqPromise(nodesStore.get(rootHex));
+      if (!rootNode) {
+        try { tx.abort(); } catch {}
+        throw errnoError('ENOENT', 'pinned root node missing');
+      }
+      pinsStore.put({ pinId, volume, root: pinnedHead.root });
+      await txDone(tx);
+      roPinReleasers.set(pinId, pinLock);
+      return { pinId, head: pinnedHead };
+    } catch (err) {
+      if (pinLock) releaseHeldLock(pinLock);
+      throw err;
+    } finally {
+      releaseGcLock(gcLockId);
+    }
+  }
+
+  function unpinRoRootSync(pinId) {
+    const held = roPinReleasers.get(pinId);
+    if (held) {
+      roPinReleasers.delete(pinId);
+      releaseHeldLock(held);
+    }
+    // Best-effort async delete of IDB record; GC also reaps any record whose Web Lock is free.
+    getDb()
+      .then(db => {
+        const tx = openTx(db, ['roPins'], 'readwrite', true);
+        tx.objectStore('roPins').delete(pinId);
+        return txDone(tx);
+      })
+      .catch(() => {});
+  }
+
+  async function unpinRoRoot(pinId) {
+    const held = roPinReleasers.get(pinId);
+    if (held) {
+      roPinReleasers.delete(pinId);
+      releaseHeldLock(held);
+    }
+    try {
+      const db = await getDb();
+      const tx = openTx(db, ['roPins'], 'readwrite', true);
+      tx.objectStore('roPins').delete(pinId);
+      await txDone(tx);
+    } catch {
+      // Lock is already released; GC will reap any leftover row.
+    }
+    await flushLocks();
+  }
+
+  async function acquireWriter(volume, mode = 'exclusive') {
+    await ensureFormatCompatible();
+    await readHead(volume);
+    const lockName = await volLockName(volume);
+
+    if (mode === 'force-takeover') {
+      // Fail closed if Web Lock steal cannot be established: NEVER issue a writer lease without
+      // an active exclusion lock (`held == null` would permit split-brain writers once the prior
+      // holder exits).
+      let held;
+      try {
+        held = await requestHeldWebLock(lockName, { mode: 'exclusive', steal: true });
+      } catch (err) {
+        throw err?.errno ? err : errnoError('ENOLCK', 'force-takeover failed to steal writer lock');
+      }
+      if (!held) {
+        throw errnoError('ENOLCK', 'force-takeover did not acquire writer lock');
+      }
+      try {
+        const db = await getDb();
+        const tx = openTx(db, ['heads'], 'readwrite', true);
+        const headsStore = tx.objectStore('heads');
+        const cur = await reqPromise(headsStore.get(volume));
+        if (!cur) {
+          try { tx.abort(); } catch {}
+          throw errnoError('ENOENT', `volume ${volume} not found`);
+        }
+        const nextHead = { ...cur, fence: Number(cur.fence) + 1 };
+        headsStore.put(nextHead);
+        await txDone(tx);
+
+        const leaseId = `lease-${nextLeaseSeq++}`;
+        writerReleasers.set(leaseId, held);
+        return {
+          leaseId,
+          volume: nextHead.volume,
+          incarnation: nextHead.incarnation,
+          fence: nextHead.fence,
+          epoch: nextHead.epoch,
+          head: nextHead,
+          forkedFrom: null,
+          expiresAt: null,
+        };
+      } catch (err) {
+        releaseHeldLock(held);
+        throw err;
+      }
     }
 
     const held = await requestHeldWebLock(lockName, { mode: 'exclusive', ifAvailable: true });
     if (held) {
-      const latest = await readHead(volume);
-      const leaseId = `lease-${nextLeaseSeq++}`;
-      writerReleasers.set(leaseId, held);
-      return {
-        leaseId,
-        volume: latest.volume,
-        incarnation: latest.incarnation,
-        fence: latest.fence,
-        epoch: latest.epoch,
-        head: latest,
-        forkedFrom: null,
-        expiresAt: null,
-      };
+      try {
+        const latest = await readHead(volume);
+        const leaseId = `lease-${nextLeaseSeq++}`;
+        writerReleasers.set(leaseId, held);
+        return {
+          leaseId,
+          volume: latest.volume,
+          incarnation: latest.incarnation,
+          fence: latest.fence,
+          epoch: latest.epoch,
+          head: latest,
+          forkedFrom: null,
+          expiresAt: null,
+        };
+      } catch (err) {
+        releaseHeldLock(held);
+        throw err;
+      }
     }
 
     if (mode === 'exclusive') {
@@ -407,46 +638,72 @@ export function createCowfsStore(options = {}) {
     }
 
     if (mode === 'fork-on-busy') {
-      // O(1) persistent fork of the last committed head (`ephemeral_if_unmodified: true`).
-      const latest = await readHead(volume);
-      const suffix = globalThis.crypto?.randomUUID?.().slice(0, 8) ?? String(nextForkSeq++);
-      const forkVol = `${volume}-fork-${suffix}-${nextForkSeq++}`;
-      const forkHead = {
-        format_version: COWFS_FORMAT_VERSION,
-        volume: forkVol,
-        incarnation: 1,
-        fence: 1,
-        epoch: 0,
-        root: latest.root,
-        parent_volume: volume,
-        ephemeral_if_unmodified: true,
-        modified: false,
-        updated_at: latest.updated_at,
-      };
-      const db = await getDb();
-      const tx = openTx(db, ['heads'], 'readwrite', true);
-      tx.objectStore('heads').put(forkHead);
-      await txDone(tx);
+      // Hold shared GC lock across source-root selection and fork head publication so GC cannot
+      // sweep the selected root concurrently.
+      const gcLockId = await acquireGcLock(false);
+      try {
+        const db = await getDb();
+        for (let attempt = 0; attempt < 16; attempt++) {
+          const forkVol = `${volume}-fork-${randomId()}`;
+          const forkLockName = await volLockName(forkVol);
+          const forkLock = await requestHeldWebLock(forkLockName, {
+            mode: 'exclusive',
+            ifAvailable: true,
+          });
+          if (!forkLock) continue;
+          try {
+            const tx = openTx(db, ['heads', 'nodes'], 'readwrite', true);
+            const headsStore = tx.objectStore('heads');
+            const nodesStore = tx.objectStore('nodes');
+            const latest = await reqPromise(headsStore.get(volume));
+            if (!latest) {
+              try { tx.abort(); } catch {}
+              throw errnoError('ENOENT', `volume ${volume} not found`);
+            }
+            const rootHex = digestArrayToHex(latest.root);
+            const rootNode = await reqPromise(nodesStore.get(rootHex));
+            if (!rootNode) {
+              try { tx.abort(); } catch {}
+              throw errnoError('ENOENT', 'source root missing');
+            }
+            const forkHead = {
+              format_version: COWFS_FORMAT_VERSION,
+              volume: forkVol,
+              incarnation: 1,
+              fence: 1,
+              epoch: 0,
+              root: latest.root,
+              parent_volume: volume,
+              ephemeral_if_unmodified: true,
+              modified: false,
+              updated_at: latest.updated_at,
+            };
+            // Create-only `add()` NEVER overwrites an existing volume head.
+            await reqPromise(headsStore.add(forkHead));
+            await txDone(tx);
 
-      const forkLock = await requestHeldWebLock(`os-vol:${forkVol}`, {
-        mode: 'exclusive',
-        ifAvailable: true,
-      });
-      if (!forkLock) {
-        throw errnoError('EBUSY', `failed to acquire lock for forked volume ${forkVol}`);
+            const leaseId = `lease-${nextLeaseSeq++}`;
+            writerReleasers.set(leaseId, forkLock);
+            return {
+              leaseId,
+              volume: forkHead.volume,
+              incarnation: forkHead.incarnation,
+              fence: forkHead.fence,
+              epoch: forkHead.epoch,
+              head: forkHead,
+              forkedFrom: volume,
+              expiresAt: null,
+            };
+          } catch (err) {
+            releaseHeldLock(forkLock);
+            if (err?.errno === 'EEXIST') continue;
+            throw err;
+          }
+        }
+        throw errnoError('EEXIST', `failed to allocate unique fork name for ${volume}`);
+      } finally {
+        releaseGcLock(gcLockId);
       }
-      const leaseId = `lease-${nextLeaseSeq++}`;
-      writerReleasers.set(leaseId, forkLock);
-      return {
-        leaseId,
-        volume: forkHead.volume,
-        incarnation: forkHead.incarnation,
-        fence: forkHead.fence,
-        epoch: forkHead.epoch,
-        head: forkHead,
-        forkedFrom: volume,
-        expiresAt: null,
-      };
     }
 
     throw errnoError('EINVAL', `unknown writer mode: ${mode}`);
@@ -464,12 +721,7 @@ export function createCowfsStore(options = {}) {
     const held = writerReleasers.get(leaseId);
     if (!held) return;
     writerReleasers.delete(leaseId);
-    held.release();
-    if (held.done) {
-      const p = held.done.catch(() => {});
-      lockReleasePromises.add(p);
-      p.finally(() => lockReleasePromises.delete(p));
-    }
+    releaseHeldLock(held);
   }
 
   async function flushLocks() {
@@ -612,8 +864,11 @@ export function createCowfsStore(options = {}) {
     headsStore.put(nextHead);
     receiptsStore.put({
       opId: meta.opId,
+      volume: meta.volume,
+      epoch: nextHead.epoch,
       rootHex: meta.newRoot,
       head: nextHead,
+      createdAt: meta.committedAt,
     });
 
     await txDone(tx);
@@ -665,14 +920,16 @@ export function createCowfsStore(options = {}) {
   async function listSnapshots(volume) {
     const db = await getDb();
     const tx = openTx(db, ['snapshots'], 'readonly');
-    const [all] = await Promise.all([
-      reqPromise(tx.objectStore('snapshots').getAll()),
-      txDone(tx),
-    ]);
-    return (all ?? [])
-      .filter(r => r.volume === volume)
-      .map(({ key: _k, ...rec }) => rec)
-      .sort((a, b) => a.name.localeCompare(b.name));
+    const out = [];
+    await forEachCursor(tx.objectStore('snapshots'), cursor => {
+      const r = cursor.value;
+      if (r.volume === volume) {
+        const { key: _k, ...rec } = r;
+        out.push(rec);
+      }
+    });
+    await txDone(tx);
+    return out.sort((a, b) => a.name.localeCompare(b.name));
   }
 
   async function deleteSnapshot(volume, name) {
@@ -721,14 +978,30 @@ export function createCowfsStore(options = {}) {
       modified: false,
       updated_at: req.created_at,
     };
-    headsStore.put(head);
+    headsStore.add(head);
     await txDone(tx);
     return head;
   }
 
+  async function deleteVolumeSnapshotsAndReceiptsInTx(tx, volume) {
+    await forEachCursor(tx.objectStore('snapshots'), cursor => {
+      if (cursor.value?.volume === volume) {
+        cursor.delete();
+      }
+    });
+    await forEachCursor(tx.objectStore('receipts'), cursor => {
+      const rec = cursor.value;
+      const recVol = rec?.volume ?? rec?.head?.volume;
+      if (recVol === volume) {
+        cursor.delete();
+      }
+    });
+  }
+
   async function deleteVolume(volume) {
     // Refuse deletion if another writer currently holds the volume lock.
-    const held = await requestHeldWebLock(`os-vol:${volume}`, {
+    const lockName = await volLockName(volume);
+    const held = await requestHeldWebLock(lockName, {
       mode: 'exclusive',
       ifAvailable: true,
     });
@@ -737,14 +1010,15 @@ export function createCowfsStore(options = {}) {
     }
     try {
       const db = await getDb();
-      const tx = openTx(db, ['heads'], 'readwrite', true);
-      const store = tx.objectStore('heads');
-      const existing = await reqPromise(store.get(volume));
+      const tx = openTx(db, ['heads', 'snapshots', 'receipts'], 'readwrite', true);
+      const headsStore = tx.objectStore('heads');
+      const existing = await reqPromise(headsStore.get(volume));
       if (!existing) {
         try { tx.abort(); } catch {}
         throw errnoError('ENOENT', `volume ${volume} not found`);
       }
-      store.delete(volume);
+      await deleteVolumeSnapshotsAndReceiptsInTx(tx, volume);
+      headsStore.delete(volume);
       await txDone(tx);
     } finally {
       held.release();
@@ -752,9 +1026,103 @@ export function createCowfsStore(options = {}) {
     }
   }
 
+  async function deleteVolumeWithLease(
+    leaseId,
+    volume,
+    incarnation,
+    fence,
+    epoch,
+    onlyIfUnmodifiedEphemeral = false,
+  ) {
+    try {
+      const db = await getDb();
+      const tx = openTx(db, ['heads', 'snapshots', 'receipts'], 'readwrite', true);
+      const headsStore = tx.objectStore('heads');
+      const cur = await reqPromise(headsStore.get(volume));
+      if (!cur) {
+        try { tx.abort(); } catch {}
+        throw errnoError('ENOENT', `volume ${volume} not found`);
+      }
+      if (cur.incarnation !== incarnation || cur.fence !== fence || cur.epoch !== epoch) {
+        try { tx.abort(); } catch {}
+        throw errnoError('ESTALE', 'writer lease fenced or stale');
+      }
+      if (onlyIfUnmodifiedEphemeral && (!cur.ephemeral_if_unmodified || cur.modified)) {
+        await txDone(tx);
+        return false;
+      }
+      await deleteVolumeSnapshotsAndReceiptsInTx(tx, volume);
+      headsStore.delete(volume);
+      await txDone(tx);
+      return true;
+    } finally {
+      releaseWriter(leaseId);
+      await flushLocks();
+    }
+  }
+
+  async function reformatVolumeWithLease(
+    leaseId,
+    volume,
+    incarnation,
+    fence,
+    epoch,
+    newHeadJson,
+    initialNodes = [],
+  ) {
+    try {
+      await ensureFormatCompatible();
+      const newHead = typeof newHeadJson === 'string' ? JSON.parse(newHeadJson) : newHeadJson;
+      const db = await getDb();
+      const tx = openTx(db, ['heads', 'nodes', 'snapshots', 'receipts'], 'readwrite', true);
+      const headsStore = tx.objectStore('heads');
+      const nodesStore = tx.objectStore('nodes');
+      const cur = await reqPromise(headsStore.get(volume));
+      if (!cur) {
+        try { tx.abort(); } catch {}
+        throw errnoError('ENOENT', `volume ${volume} not found`);
+      }
+      if (cur.incarnation !== incarnation || cur.fence !== fence || cur.epoch !== epoch) {
+        try { tx.abort(); } catch {}
+        throw errnoError('ESTALE', 'writer lease fenced or stale');
+      }
+      await deleteVolumeSnapshotsAndReceiptsInTx(tx, volume);
+      for (const node of initialNodes) {
+        const bytes = node.bytes instanceof Uint8Array ? new Uint8Array(node.bytes) : Uint8Array.from(node.bytes);
+        nodesStore.put({
+          digest: node.digest,
+          bytes,
+          createdAt: newHead.updated_at,
+        });
+      }
+      const replaced = {
+        format_version: COWFS_FORMAT_VERSION,
+        volume,
+        incarnation: Number(cur.incarnation) + 1,
+        fence: 1,
+        epoch: 0,
+        root: newHead.root,
+        parent_volume: null,
+        ephemeral_if_unmodified: false,
+        modified: false,
+        updated_at: newHead.updated_at,
+      };
+      headsStore.put(replaced);
+      await txDone(tx);
+      return replaced;
+    } finally {
+      releaseWriter(leaseId);
+      await flushLocks();
+    }
+  }
+
   async function acquireGcLock(exclusive) {
-    const mode = exclusive ? 'exclusive' : 'shared';
-    const held = await requestHeldWebLock(GC_LOCK_NAME, { mode, ifAvailable: true });
+    const lName = await gcLockName();
+    // Writers (`exclusive === false`) queue cleanly for the shared lock (no `ifAvailable: true`)
+    // so live commits never fail with `EBUSY` while GC runs. GC (`exclusive === true`) uses
+    // `ifAvailable: true` and returns `EBUSY` if writers are currently committing.
+    const opts = exclusive ? { mode: 'exclusive', ifAvailable: true } : { mode: 'shared' };
+    const held = await requestHeldWebLock(lName, opts);
     if (!held) {
       throw errnoError('EBUSY', 'GC lock is contended');
     }
@@ -767,80 +1135,186 @@ export function createCowfsStore(options = {}) {
     const held = gcReleasers.get(lockId);
     if (!held) return;
     gcReleasers.delete(lockId);
-    held.release();
-    if (held.done) {
-      const p = held.done.catch(() => {});
-      lockReleasePromises.add(p);
-      p.finally(() => lockReleasePromises.delete(p));
-    }
+    releaseHeldLock(held);
   }
 
   async function listAllRoots() {
     const db = await getDb();
-    const tx = openTx(db, ['heads', 'snapshots', 'gracePins'], 'readonly');
-    const [heads, snaps, pins] = await Promise.all([
-      reqPromise(tx.objectStore('heads').getAll()),
-      reqPromise(tx.objectStore('snapshots').getAll()),
-      reqPromise(tx.objectStore('gracePins').getAll()),
-      txDone(tx),
-    ]);
+    const tx = openTx(db, ['heads', 'snapshots', 'gracePins', 'roPins'], 'readonly');
     const out = [];
-    for (const h of heads ?? []) {
-      out.push({ volume: h.volume, root: h.root, pinned_until: null });
+    const roPinRows = [];
+    await Promise.all([
+      forEachCursor(tx.objectStore('heads'), cursor => {
+        const h = cursor.value;
+        out.push({ volume: h.volume, root: h.root, pinned_until: null });
+      }),
+      forEachCursor(tx.objectStore('snapshots'), cursor => {
+        const s = cursor.value;
+        out.push({ volume: s.volume, root: s.root, pinned_until: null });
+      }),
+      forEachCursor(tx.objectStore('gracePins'), cursor => {
+        const p = cursor.value;
+        out.push({ volume: p.volume, root: p.root, pinned_until: p.pinnedUntil ?? null });
+      }),
+      forEachCursor(tx.objectStore('roPins'), cursor => {
+        roPinRows.push(cursor.value);
+      }),
+    ]);
+    await txDone(tx);
+
+    // Check which RO pins are still backed by a live tab/Worker Web Lock; reap crashed pins.
+    const stalePinIds = [];
+    for (const p of roPinRows) {
+      const lName = await roPinLockName(p.pinId);
+      try {
+        const probe = await requestHeldWebLock(lName, { mode: 'exclusive', ifAvailable: true });
+        if (!probe) {
+          // Lock is held by an active RO/snapshot mount -> keep root live!
+          out.push({ volume: p.volume, root: p.root, pinned_until: null });
+        } else {
+          probe.release();
+          await probe.done?.catch(() => {});
+          stalePinIds.push(p.pinId);
+        }
+      } catch {
+        // Fail safe on transient lock query error: preserve pinned root.
+        out.push({ volume: p.volume, root: p.root, pinned_until: null });
+      }
     }
-    for (const s of snaps ?? []) {
-      out.push({ volume: s.volume, root: s.root, pinned_until: null });
-    }
-    for (const p of pins ?? []) {
-      out.push({ volume: p.volume, root: p.root, pinned_until: p.pinnedUntil ?? null });
+    if (stalePinIds.length > 0) {
+      const delTx = openTx(db, ['roPins'], 'readwrite', true);
+      const pinsStore = delTx.objectStore('roPins');
+      for (const id of stalePinIds) pinsStore.delete(id);
+      await txDone(delTx);
     }
     return out;
   }
 
+  async function listIndexedPacks() {
+    const db = await getDb();
+    const tx = openTx(db, ['packs', 'blocks'], 'readonly');
+    const packIds = new Set();
+    await Promise.all([
+      forEachCursor(tx.objectStore('packs'), cursor => {
+        if (cursor.value?.packId) packIds.add(cursor.value.packId);
+      }),
+      forEachCursor(tx.objectStore('blocks'), cursor => {
+        if (cursor.value?.packId) packIds.add(cursor.value.packId);
+      }),
+    ]);
+    await txDone(tx);
+    return [...packIds];
+  }
+
+  async function pruneAbandonedEphemeralForks(nowJson, graceSecs = graceWindowSecs) {
+    const now = typeof nowJson === 'string' ? JSON.parse(nowJson) : nowJson;
+    const db = await getDb();
+    const candidates = [];
+    {
+      const tx = openTx(db, ['heads'], 'readonly');
+      await forEachCursor(tx.objectStore('heads'), cursor => {
+        const h = cursor.value;
+        if (h?.ephemeral_if_unmodified && !h.modified && tsExpired(h.updated_at, now, graceSecs)) {
+          candidates.push(h.volume);
+        }
+      });
+      await txDone(tx);
+    }
+    let pruned = 0;
+    for (const volume of candidates) {
+      const lockName = await volLockName(volume);
+      const held = await requestHeldWebLock(lockName, { mode: 'exclusive', ifAvailable: true });
+      if (!held) continue;
+      try {
+        const tx = openTx(db, ['heads', 'snapshots', 'receipts'], 'readwrite', true);
+        const headsStore = tx.objectStore('heads');
+        const cur = await reqPromise(headsStore.get(volume));
+        if (cur && cur.ephemeral_if_unmodified && !cur.modified && tsExpired(cur.updated_at, now, graceSecs)) {
+          await deleteVolumeSnapshotsAndReceiptsInTx(tx, volume);
+          headsStore.delete(volume);
+          await txDone(tx);
+          pruned += 1;
+        } else {
+          await txDone(tx);
+        }
+      } finally {
+        held.release();
+        await held.done?.catch(() => {});
+      }
+    }
+    return pruned;
+  }
+
   async function sweepMetadata(payloadJson) {
-    const { keepNodes, keepPacks, graceBefore } =
-      typeof payloadJson === 'string' ? JSON.parse(payloadJson) : payloadJson;
-    const keepNodeSet = new Set(keepNodes ?? []);
-    const keepPackSet = new Set(keepPacks ?? []);
+    const payload = typeof payloadJson === 'string' ? JSON.parse(payloadJson) : payloadJson;
+    const keepNodeSet = new Set(payload.keepNodes ?? []);
+    const keepPackSet = new Set(payload.keepPacks ?? []);
+    const now = payload.now ?? payload.graceBefore;
+    const graceSecs = payload.graceWindowSecs ?? (payload.now ? graceWindowSecs : 0);
 
     const db = await getDb();
-    const tx = openTx(db, ['nodes', 'packs', 'blocks', 'gracePins'], 'readwrite', true);
+    const tx = openTx(
+      db,
+      ['heads', 'nodes', 'packs', 'blocks', 'gracePins', 'receipts'],
+      'readwrite',
+      true,
+    );
+    const headsStore = tx.objectStore('heads');
     const nodesStore = tx.objectStore('nodes');
     const packsStore = tx.objectStore('packs');
     const blocksStore = tx.objectStore('blocks');
     const graceStore = tx.objectStore('gracePins');
+    const receiptsStore = tx.objectStore('receipts');
 
-    const [allNodes, allPacks, allBlocks, allPins] = await Promise.all([
-      reqPromise(nodesStore.getAll()),
-      reqPromise(packsStore.getAll()),
-      reqPromise(blocksStore.getAll()),
-      reqPromise(graceStore.getAll()),
-    ]);
+    const liveEpochs = new Map();
+    await forEachCursor(headsStore, cursor => {
+      const h = cursor.value;
+      if (h?.volume) liveEpochs.set(h.volume, h.epoch);
+    });
 
-    for (const p of allPins ?? []) {
-      if (p.pinnedUntil && !tsGt(p.pinnedUntil, graceBefore)) {
-        graceStore.delete(p.id);
+    // Cursor-based streaming sweep: never materializes all node payloads into RAM at once.
+    await forEachCursor(graceStore, cursor => {
+      const p = cursor.value;
+      if (p?.pinnedUntil && !tsGt(p.pinnedUntil, now)) {
+        cursor.delete();
       }
-    }
-    for (const n of allNodes ?? []) {
-      if (!keepNodeSet.has(n.digest) && !tsGt(n.createdAt, graceBefore)) {
-        nodesStore.delete(n.digest);
+    });
+
+    await forEachCursor(nodesStore, cursor => {
+      const n = cursor.value;
+      if (!keepNodeSet.has(n.digest) && tsExpired(n.createdAt, now, graceSecs)) {
+        cursor.delete();
       }
-    }
+    });
+
     const sweptPacks = [];
     const sweptPackSet = new Set();
-    for (const p of allPacks ?? []) {
-      if (!keepPackSet.has(p.packId) && !tsGt(p.createdAt, graceBefore)) {
-        packsStore.delete(p.packId);
+    await forEachCursor(packsStore, cursor => {
+      const p = cursor.value;
+      if (!keepPackSet.has(p.packId) && tsExpired(p.createdAt, now, graceSecs)) {
+        cursor.delete();
         sweptPacks.push(p.packId);
         sweptPackSet.add(p.packId);
       }
+    });
+
+    if (sweptPackSet.size > 0) {
+      await forEachCursor(blocksStore, cursor => {
+        if (sweptPackSet.has(cursor.value?.packId)) {
+          cursor.delete();
+        }
+      });
     }
-    for (const b of allBlocks ?? []) {
-      if (sweptPackSet.has(b.packId)) {
-        blocksStore.delete(b.digest);
+
+    await forEachCursor(receiptsStore, cursor => {
+      const rec = cursor.value;
+      const vol = rec?.volume ?? rec?.head?.volume;
+      const ep = rec?.epoch ?? rec?.head?.epoch;
+      if (liveEpochs.get(vol) !== ep && tsExpired(rec?.createdAt ?? rec?.head?.updated_at, now, graceSecs)) {
+        cursor.delete();
       }
-    }
+    });
+
     await txDone(tx);
     return sweptPacks;
   }
@@ -850,42 +1324,20 @@ export function createCowfsStore(options = {}) {
   // `getFile().slice()` reads for concurrent cross-tab access)
   // ---------------------------------------------------------------------------
 
-  async function writePack(packId, bytes) {
-    const raw = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
-    if (raw.byteLength > PACK_MAX_BYTES) {
-      throw errnoError('EFBIG', 'pack exceeds 8 MiB limit');
-    }
-    if (hooks.onWritePack) {
-      await hooks.onWritePack(packId, raw);
-    }
-    await checkQuotaEstimate(raw.byteLength);
-
-    const dir = await getPacksDir();
-    const filename = `${packId}.pack`;
-
-    // Immutable content-addressed pack: if already sealed, skip rewrite.
+  async function existingPackVerified(dir, filename, packId, expectedLen) {
     try {
       const existingHandle = await dir.getFileHandle(filename, { create: false });
       const existingFile = await existingHandle.getFile();
-      if (existingFile.size === raw.byteLength) {
-        return {
-          pack_id: packId,
-          size: raw.byteLength,
-          entry_count: 0,
-          created_at: { sec: 0, nsec: 0 },
-        };
-      }
+      if (existingFile.size !== expectedLen) return false;
+      const existingBytes = new Uint8Array(await existingFile.arrayBuffer());
+      return (await sha256Hex(existingBytes)) === packId;
     } catch {
-      // Not present yet.
+      return false;
     }
+  }
 
-    const fileHandle = await dir.getFileHandle(filename, { create: true }).catch(err => {
-      throw mapDomError(err);
-    });
-
+  async function writeBytesToHandle(fileHandle, raw) {
     if (typeof fileHandle.createSyncAccessHandle === 'function') {
-      // Dedicated Worker fast & crash-safe OPFS path: write + flush + close!
-      let writeFailed = false;
       const syncHandle = await fileHandle.createSyncAccessHandle().catch(err => {
         throw mapDomError(err);
       });
@@ -900,20 +1352,13 @@ export function createCowfsStore(options = {}) {
         syncHandle.flush();
         stats.syncHandleWrites += 1;
       } catch (err) {
-        writeFailed = true;
         throw mapDomError(err);
       } finally {
         try {
           syncHandle.close();
         } catch {}
-        if (writeFailed) {
-          try {
-            await dir.removeEntry(filename);
-          } catch {}
-        }
       }
     } else if (typeof fileHandle.createWritable === 'function') {
-      // Main-thread / test fallback using FileSystemWritableFileStream.
       const writable = await fileHandle.createWritable().catch(err => {
         throw mapDomError(err);
       });
@@ -924,17 +1369,98 @@ export function createCowfsStore(options = {}) {
         try {
           await writable.abort();
         } catch {}
-        try {
-          await dir.removeEntry(filename);
-        } catch {}
         throw mapDomError(err);
       }
     } else {
       throw errnoError('EOPNOTSUPP', 'OPFS file handle supports neither sync access nor writable');
     }
+  }
 
-    stats.packWrites += 1;
-    stats.packBytesWritten += raw.byteLength;
+  async function withOptionalPackLock(packId, fn) {
+    if (!locksApi || typeof locksApi.request !== 'function') {
+      return await fn();
+    }
+    const lName = await packLockName(packId);
+    const held = await requestHeldWebLock(lName, { mode: 'exclusive' });
+    try {
+      return await fn();
+    } finally {
+      if (held) {
+        held.release();
+        await held.done?.catch(() => {});
+      }
+    }
+  }
+
+  async function writePack(packId, bytes) {
+    const raw = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
+    if (raw.byteLength > PACK_MAX_BYTES) {
+      throw errnoError('EFBIG', 'pack exceeds 8 MiB limit');
+    }
+    if ((await sha256Hex(raw)) !== packId) {
+      throw errnoError('EINVAL', 'pack bytes do not match packId SHA-256');
+    }
+    if (hooks.onWritePack) {
+      await hooks.onWritePack(packId, raw);
+    }
+    await checkQuotaEstimate(raw.byteLength);
+
+    const dir = await getPacksDir();
+    const filename = `${packId}.pack`;
+
+    // Fast path: verify full SHA-256 (never length alone!) before skipping rewrite.
+    if (await existingPackVerified(dir, filename, packId, raw.byteLength)) {
+      return {
+        pack_id: packId,
+        size: raw.byteLength,
+        entry_count: 0,
+        created_at: { sec: 0, nsec: 0 },
+      };
+    }
+
+    // Write to a unique temporary file, flush & close, then atomically publish under a per-pack
+    // lock via `move()` (or serialized fallback when `move()` is unavailable).
+    const tmpName = `.tmp-${packId.slice(0, 16)}-${randomId()}`;
+    let tmpExists = false;
+    try {
+      const tmpHandle = await dir.getFileHandle(tmpName, { create: true }).catch(err => {
+        throw mapDomError(err);
+      });
+      tmpExists = true;
+      await writeBytesToHandle(tmpHandle, raw);
+
+      await withOptionalPackLock(packId, async () => {
+        if (await existingPackVerified(dir, filename, packId, raw.byteLength)) {
+          return;
+        }
+        if (typeof tmpHandle.move === 'function') {
+          try {
+            await tmpHandle.move(filename);
+            tmpExists = false;
+          } catch (moveErr) {
+            if (await existingPackVerified(dir, filename, packId, raw.byteLength)) {
+              return;
+            }
+            throw mapDomError(moveErr);
+          }
+        } else {
+          // Fallback for OPFS mocks/environments without `FileSystemFileHandle.move()`.
+          const finalHandle = await dir.getFileHandle(filename, { create: true }).catch(err => {
+            throw mapDomError(err);
+          });
+          await writeBytesToHandle(finalHandle, raw);
+        }
+        stats.packWrites += 1;
+        stats.packBytesWritten += raw.byteLength;
+      });
+    } finally {
+      if (tmpExists) {
+        try {
+          await dir.removeEntry(tmpName);
+        } catch {}
+      }
+    }
+
     return {
       pack_id: packId,
       size: raw.byteLength,
@@ -1035,25 +1561,13 @@ export function createCowfsStore(options = {}) {
     const bytes = new Uint8Array(await file.arrayBuffer());
     if (byteOffset >= bytes.length) return false;
     bytes[byteOffset] ^= 0x01;
-    if (typeof handle.createSyncAccessHandle === 'function') {
-      const sh = await handle.createSyncAccessHandle();
-      try {
-        sh.truncate(0);
-        sh.write(bytes, { at: 0 });
-        sh.flush();
-      } finally {
-        sh.close();
-      }
-    } else {
-      const w = await handle.createWritable();
-      await w.write(bytes);
-      await w.close();
-    }
+    await writeBytesToHandle(handle, bytes);
     return true;
   }
 
   return {
     dbName,
+    graceWindowSecs,
     stats,
     resetStats() {
       stats.packWrites = 0;
@@ -1066,6 +1580,9 @@ export function createCowfsStore(options = {}) {
     formatVersion,
     createVolume,
     readHead,
+    pinRoRoot,
+    unpinRoRoot,
+    unpinRoRootSync,
     acquireWriter,
     renewWriter,
     releaseWriter,
@@ -1079,9 +1596,13 @@ export function createCowfsStore(options = {}) {
     deleteSnapshot,
     forkVolume,
     deleteVolume,
+    deleteVolumeWithLease,
+    reformatVolumeWithLease,
     acquireGcLock,
     releaseGcLock,
     listAllRoots,
+    listIndexedPacks,
+    pruneAbandonedEphemeralForks,
     sweepMetadata,
     writePack,
     readPackRange,

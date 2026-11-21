@@ -7,7 +7,10 @@
 //! instance crashes after committing while the file is still open, the next `rw` mount scans
 //! `ORPHAN_ITEM`s and reaps all unreachable open-unlinked inodes cleanly.
 
-use cowtree::{CowTree, Digest, HeadStore, KIND_ORPHAN_ITEM, TreeKey, TreeOverlay};
+use crate::inode::ExtentDataValue;
+use cowtree::{
+    CowTree, Digest, HeadStore, KIND_EXTENT_DATA, KIND_ORPHAN_ITEM, TreeKey, TreeOverlay,
+};
 use vfs::Result;
 
 /// Mark `ino` as an open-unlinked orphan in `overlay`.
@@ -20,27 +23,43 @@ pub fn clear_orphan(overlay: &mut TreeOverlay, ino: u64) {
     overlay.delete(TreeKey::orphan_item(ino));
 }
 
-/// Stage full reclamation of all B+tree items belonging to `ino` (`INODE_ITEM`, `INODE_REF`,
-/// `DIR_ITEM`, `DIR_INDEX`, `EXTENT_DATA`, `XATTR_ITEM`, and `ORPHAN_ITEM`).
-pub async fn reclaim_inode_items<H: HeadStore>(
+/// Private reclamation plan gathered without mutating the live overlay across `.await`.
+pub struct ReclaimPlan {
+    pub delete_keys: Vec<TreeKey>,
+    pub dropped_digests: Vec<Digest>,
+    pub freed_extent_bytes: u64,
+}
+
+/// Scan all B+tree items belonging to `ino` against a read-only `(base_root, read_overlay)` view
+/// without mutating any live state across `.await`.
+pub async fn collect_inode_reclaim_plan<H: HeadStore>(
     tree: &CowTree<'_, H>,
     base_root: &Digest,
-    overlay: &mut TreeOverlay,
+    read_overlay: &TreeOverlay,
     ino: u64,
-) -> Result<()> {
+) -> Result<ReclaimPlan> {
+    let mut delete_keys = Vec::new();
+    let mut dropped_digests = Vec::new();
+    let mut freed_extent_bytes = 0u64;
     let mut start = TreeKey::ino_start(ino);
     let end = TreeKey::ino_end(ino);
     loop {
         let batch = tree
-            .scan_range_with_overlay(base_root, overlay, &start, &end, 512)
+            .scan_range_with_overlay(base_root, read_overlay, &start, &end, 512)
             .await?;
         if batch.is_empty() {
             break;
         }
         let last_key = batch.last().unwrap().0.clone();
         let full = batch.len() == 512;
-        for (k, _) in batch {
-            overlay.delete(k);
+        for (k, v) in batch {
+            if k.kind == KIND_EXTENT_DATA
+                && let Ok(ExtentDataValue::Extent { len, digest, .. }) = ExtentDataValue::decode(&v)
+            {
+                dropped_digests.push(digest);
+                freed_extent_bytes = freed_extent_bytes.saturating_add(u64::from(len));
+            }
+            delete_keys.push(k);
         }
         if !full {
             break;
@@ -49,17 +68,37 @@ pub async fn reclaim_inode_items<H: HeadStore>(
         next_tail.push(0);
         start = TreeKey::new(last_key.ino, last_key.kind, next_tail);
     }
+    Ok(ReclaimPlan {
+        delete_keys,
+        dropped_digests,
+        freed_extent_bytes,
+    })
+}
+
+/// Stage full reclamation of all B+tree items belonging to `ino` (`INODE_ITEM`, `INODE_REF`,
+/// `DIR_ITEM`, `DIR_INDEX`, `EXTENT_DATA`, `XATTR_ITEM`, and `ORPHAN_ITEM`).
+/// Returns the total freed out-of-line extent bytes for `ino`.
+pub async fn reclaim_inode_items<H: HeadStore>(
+    tree: &CowTree<'_, H>,
+    base_root: &Digest,
+    overlay: &mut TreeOverlay,
+    ino: u64,
+) -> Result<u64> {
+    let plan = collect_inode_reclaim_plan(tree, base_root, overlay, ino).await?;
+    for k in plan.delete_keys {
+        overlay.delete(k);
+    }
     clear_orphan(overlay, ino);
-    Ok(())
+    Ok(plan.freed_extent_bytes)
 }
 
 /// Scan all `ORPHAN_ITEM` entries recorded in `base_root` and stage their complete reclamation.
-/// Returns the number of reaped orphan inodes.
+/// Returns `(reaped_inode_count, freed_extent_bytes)`.
 pub async fn reap_all_orphans<H: HeadStore>(
     tree: &CowTree<'_, H>,
     base_root: &Digest,
     overlay: &mut TreeOverlay,
-) -> Result<usize> {
+) -> Result<(usize, u64)> {
     let mut orphan_inos = Vec::new();
     let mut start = TreeKey::kind_start(0, KIND_ORPHAN_ITEM);
     let end = TreeKey::kind_end(0, KIND_ORPHAN_ITEM);
@@ -83,8 +122,10 @@ pub async fn reap_all_orphans<H: HeadStore>(
         start = TreeKey::new(last_key.ino, last_key.kind, next_tail);
     }
 
+    let mut freed_bytes = 0u64;
     for &ino in &orphan_inos {
-        reclaim_inode_items(tree, base_root, overlay, ino).await?;
+        freed_bytes =
+            freed_bytes.saturating_add(reclaim_inode_items(tree, base_root, overlay, ino).await?);
     }
-    Ok(orphan_inos.len())
+    Ok((orphan_inos.len(), freed_bytes))
 }

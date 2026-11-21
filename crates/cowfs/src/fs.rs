@@ -15,9 +15,10 @@ use abi::volume::CowfsInfoResp;
 use cowtree::{
     Arena, ArenaConfig, ArenaStats, BLOCK_SIZE, COWFS_FORMAT_VERSION, CommitRequest, CowTree,
     Digest, ForkRequest, HeadStore, INLINE_MAX_BYTES, KIND_DIR_INDEX, KIND_DIR_ITEM,
-    KIND_EXTENT_DATA, KIND_INODE_REF, KIND_XATTR_ITEM, Node, PackBuilder, PackMeta, PackStore,
-    RootObject, SnapshotRecord, TreeKey, TreeOverlay, VolumeHead, VolumeId, WriterLease,
-    WriterMode, digest_to_hex, sha256, verify_block_digest,
+    KIND_EXTENT_DATA, KIND_INODE_ITEM, KIND_INODE_REF, KIND_XATTR_ITEM, Node, PackBuilder,
+    PackMeta, PackStore, ROOT_FEATURE_ACCOUNTING, RoPinGuard, RootObject, SnapshotRecord, TreeKey,
+    TreeOverlay, VolumeHead, VolumeId, WriterLease, WriterMode, digest_to_hex, sha256,
+    verify_block_digest,
 };
 use os_core::acl::Entries;
 use os_core::inode;
@@ -36,6 +37,8 @@ use vfs::{BoxFuture, Cred, DIR_PAGE_MAX, Filesystem, Result, profiles};
 pub const ROOT_INO: u64 = 1;
 /// Default primary subvolume name (`contract.md` §2.15).
 pub const DEFAULT_SUBVOL: &str = "@";
+/// Maximum dirty transaction-group commit deadline while dirty (`contract.md` §2.15: 5 seconds).
+pub const DIRTY_COMMIT_DEADLINE_SECS: u64 = 5;
 /// Max single read/write byte count (Linux `MAX_RW_COUNT`).
 const RW_MAX: usize = 0x7fff_f000;
 
@@ -202,31 +205,59 @@ impl AsyncMutex {
     }
 }
 
+struct PendingCommit {
+    commit_req: CommitRequest,
+    next_root_obj: RootObject,
+    new_subvol_root: Digest,
+}
+
+struct CommittingGroup {
+    first_dirty_at: Option<Timespec>,
+    overlay: TreeOverlay,
+    dirty_blocks: HashMap<Digest, (Rc<Vec<u8>>, usize)>,
+    dirty_block_bytes: usize,
+    /// Retained across an ambiguous `EIO` from `commit_head` so retry replays the exact same
+    /// `op_id` + payload and resolves its receipt instead of self-fencing (`ESTALE`).
+    pending: Option<PendingCommit>,
+}
+
 struct CowFsState {
     head: VolumeHead,
     root_obj: RootObject,
     subvol_root: Digest,
     lease: Option<WriterLease>,
+    ro_pin: Option<Box<dyn RoPinGuard>>,
     forked_from: Option<VolumeId>,
     fenced: bool,
+    closed: bool,
     /// True once an explicit user mutation (not an internal `relatime` update) has been staged.
     user_modified: bool,
+    /// Timestamp when the live overlay first became dirty (drives the 5s dirty commit deadline).
+    first_dirty_at: Option<Timespec>,
     overlay: TreeOverlay,
     /// Uncommitted data blocks keyed by SHA-256 digest: `(bytes, refcount)`.
     dirty_blocks: HashMap<Digest, (Rc<Vec<u8>>, usize)>,
     dirty_block_bytes: usize,
+    /// Frozen transaction group currently committing to storage (or awaiting EIO reconciliation).
+    committing: Option<CommittingGroup>,
     /// Open-file reference tracking (per-mount instance).
     opens: HashMap<u64, OpenRecord>,
     open_counts: HashMap<u64, u32>,
     locks: HashMap<u64, Vec<Lock>>,
     waiters: HashMap<u64, Waiter>,
     next_waiter: u64,
-    /// Approximate allocated data blocks (for `statfs` & optional capacity checks).
+    /// Persisted allocated out-of-line extent bytes (for `statfs` & optional capacity checks).
     allocated_bytes: u64,
-    inode_count_estimate: u64,
+    inode_count: u64,
 }
 
 impl CowFsState {
+    fn mark_dirty(&mut self, now: Timespec) {
+        if self.first_dirty_at.is_none() {
+            self.first_dirty_at = Some(now);
+        }
+    }
+
     fn stage_dirty_block(&mut self, digest: Digest, bytes: Rc<Vec<u8>>) {
         if let Some((_, count)) = self.dirty_blocks.get_mut(&digest) {
             *count += 1;
@@ -250,11 +281,60 @@ impl CowFsState {
     }
 
     fn total_dirty_bytes(&self) -> usize {
-        self.overlay.dirty_bytes() + self.dirty_block_bytes
+        let committing_bytes = self
+            .committing
+            .as_ref()
+            .map_or(0, |c| c.overlay.dirty_bytes() + c.dirty_block_bytes);
+        self.overlay.dirty_bytes() + self.dirty_block_bytes + committing_bytes
+    }
+
+    fn is_live_dirty(&self) -> bool {
+        !self.overlay.is_empty() || !self.dirty_blocks.is_empty()
     }
 
     fn is_dirty(&self) -> bool {
-        !self.overlay.is_empty() || !self.dirty_blocks.is_empty()
+        self.is_live_dirty() || self.committing.is_some()
+    }
+
+    fn combined_read_overlay(&self) -> TreeOverlay {
+        match &self.committing {
+            Some(c) => c.overlay.merged_with(&self.overlay),
+            None => self.overlay.clone(),
+        }
+    }
+
+    fn dirty_block_bytes(&self, digest: &Digest) -> Option<Rc<Vec<u8>>> {
+        if let Some((bytes, _)) = self.dirty_blocks.get(digest) {
+            return Some(Rc::clone(bytes));
+        }
+        if let Some(c) = &self.committing
+            && let Some((bytes, _)) = c.dirty_blocks.get(digest)
+        {
+            return Some(Rc::clone(bytes));
+        }
+        None
+    }
+
+    fn rollback_committing(&mut self) {
+        let Some(c) = self.committing.take() else {
+            return;
+        };
+        self.overlay.merge_under(c.overlay);
+        for (digest, (bytes, count)) in c.dirty_blocks {
+            if let Some((_, live_cnt)) = self.dirty_blocks.get_mut(&digest) {
+                *live_cnt = live_cnt.saturating_add(count);
+            } else {
+                let sz = bytes.len();
+                self.dirty_blocks.insert(digest, (bytes, count));
+                self.dirty_block_bytes = self.dirty_block_bytes.saturating_add(sz);
+            }
+        }
+        if let Some(prev) = c.first_dirty_at {
+            self.first_dirty_at = Some(match self.first_dirty_at {
+                Some(cur) if (cur.sec, cur.nsec) < (prev.sec, prev.nsec) => cur,
+                _ => prev,
+            });
+        }
     }
 
     fn deadlocks(&self, ino: u64, wanted: Lock) -> bool {
@@ -280,6 +360,23 @@ impl CowFsState {
     }
 }
 
+struct CommitRollbackGuard<'a, H: HeadStore + 'static, P: PackStore + 'static> {
+    fs: &'a CowFs<H, P>,
+    armed: bool,
+}
+
+impl<H: HeadStore + 'static, P: PackStore + 'static> Drop for CommitRollbackGuard<'_, H, P> {
+    fn drop(&mut self) {
+        if self.armed {
+            {
+                let mut st = self.fs.state.borrow_mut();
+                st.rollback_committing();
+            }
+            self.fs.sync_arena_dirty();
+        }
+    }
+}
+
 /// MIT pure-Rust POSIX Copy-on-Write filesystem driver (`FsType::Cowfs`).
 pub struct CowFs<H: HeadStore + 'static, P: PackStore + 'static> {
     fs_id: FsId,
@@ -296,25 +393,29 @@ pub struct CowFs<H: HeadStore + 'static, P: PackStore + 'static> {
     pack_store: Rc<P>,
     arena: RefCell<Arena>,
     state: RefCell<CowFsState>,
+    /// Serializes mutating read-modify-stage windows (lock hierarchy: ALWAYS `op_lock` -> `commit_lock`).
+    op_lock: AsyncMutex,
     commit_lock: AsyncMutex,
 }
 
+/// Serialized `(digest, bytes)` node list created when formatting or reformatting a volume.
+pub type InitialVolumeNodes = Vec<(Digest, Vec<u8>)>;
+
+struct EncodedAcls {
+    access: Option<Vec<u8>>,
+    default: Option<Vec<u8>>,
+}
+
 impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
-    /// Initialize a brand-new `os-cowfs` volume (`mkfs.cowfs`) with root directory inode `1`.
-    pub async fn format_volume(
-        head_store: &H,
-        _pack_store: &P,
+    /// Build initial empty-volume metadata nodes (`RootObject` + root directory leaf) for
+    /// `format_volume` and `mkfs --force` reformatting.
+    pub fn build_initial_volume_nodes(
         volume: VolumeId,
         root_uid: u32,
         root_gid: u32,
         root_mode: u16,
         now: Timespec,
-    ) -> Result<VolumeHead> {
-        if let Some(v) = head_store.format_version().await?
-            && v != COWFS_FORMAT_VERSION
-        {
-            return Err(Errno::EPROTONOSUPPORT);
-        }
+    ) -> Result<(VolumeHead, InitialVolumeNodes)> {
         let root_inode = InodeItem {
             file_type: FileType::Dir,
             mode: root_mode & 0o7777,
@@ -344,18 +445,20 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         subvols.insert(DEFAULT_SUBVOL.to_string(), leaf_digest);
         let root_obj = RootObject {
             format_version: COWFS_FORMAT_VERSION,
-            features: 0,
+            features: ROOT_FEATURE_ACCOUNTING,
             volume_uuid: volume.0.clone(),
             subvols,
             next_ino: ROOT_INO + 1,
             generation: 1,
             parent_root: None,
+            allocated_bytes: 0,
+            inode_count: 1,
         };
         let (root_digest, root_bytes) = root_obj.encode()?;
 
         let head = VolumeHead {
             format_version: COWFS_FORMAT_VERSION,
-            volume: volume.clone(),
+            volume,
             incarnation: 1,
             fence: 1,
             epoch: 0,
@@ -365,12 +468,77 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             modified: false,
             updated_at: now,
         };
-        head_store
-            .create_volume(
-                &head,
-                &[(leaf_digest, leaf_bytes), (root_digest, root_bytes)],
-            )
-            .await
+        Ok((
+            head,
+            vec![(leaf_digest, leaf_bytes), (root_digest, root_bytes)],
+        ))
+    }
+
+    /// Initialize a brand-new `os-cowfs` volume (`mkfs.cowfs`) with root directory inode `1`.
+    pub async fn format_volume(
+        head_store: &H,
+        _pack_store: &P,
+        volume: VolumeId,
+        root_uid: u32,
+        root_gid: u32,
+        root_mode: u16,
+        now: Timespec,
+    ) -> Result<VolumeHead> {
+        if let Some(v) = head_store.format_version().await?
+            && v != COWFS_FORMAT_VERSION
+        {
+            return Err(Errno::EPROTONOSUPPORT);
+        }
+        let (head, nodes) =
+            Self::build_initial_volume_nodes(volume, root_uid, root_gid, root_mode, now)?;
+        head_store.create_volume(&head, &nodes).await
+    }
+
+    async fn release_open_handles(
+        head_store: &H,
+        lease: Option<WriterLease>,
+        ro_pin: Option<Box<dyn RoPinGuard>>,
+    ) {
+        if let Some(pin) = ro_pin {
+            let _ = head_store.unpin_ro_root(pin).await;
+        }
+        if let Some(l) = lease {
+            let _ = head_store.release_writer(l).await;
+        }
+    }
+
+    async fn scan_subvol_accounting(
+        tree: &CowTree<'_, H>,
+        subvol_root: &Digest,
+    ) -> Result<(u64, u64)> {
+        let mut allocated_bytes = 0u64;
+        let mut inode_count = 0u64;
+        let mut start = TreeKey::new(0, 0, Vec::new());
+        let end = TreeKey::new(u64::MAX, u8::MAX, Vec::new());
+        loop {
+            let batch = tree.scan_range(subvol_root, &start, &end, 512).await?;
+            if batch.is_empty() {
+                break;
+            }
+            let last = batch.last().unwrap().0.clone();
+            let full = batch.len() == 512;
+            for (k, raw) in batch {
+                if k.kind == KIND_INODE_ITEM {
+                    inode_count = inode_count.saturating_add(1);
+                } else if k.kind == KIND_EXTENT_DATA
+                    && let Ok(ExtentDataValue::Extent { len, .. }) = ExtentDataValue::decode(&raw)
+                {
+                    allocated_bytes = allocated_bytes.saturating_add(u64::from(len));
+                }
+            }
+            if !full {
+                break;
+            }
+            let mut next_tail = last.tail;
+            next_tail.push(0);
+            start = TreeKey::new(last.ino, last.kind, next_tail);
+        }
+        Ok((allocated_bytes, inode_count.max(1)))
     }
 
     /// Open a `cowfs` volume in read-write, read-only, or pinned-snapshot mode.
@@ -391,6 +559,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             head,
             root_digest,
             lease,
+            ro_pin,
             forked_from,
             read_only,
             pinned_snapshot,
@@ -411,6 +580,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                     head,
                     root_digest,
                     Some(lease),
+                    None,
                     forked_from,
                     false,
                     None,
@@ -419,8 +589,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 )
             }
             CowFsOpenMode::ReadOnly => {
-                let head = head_store.read_head(&volume).await?;
+                let (head, pin) = head_store.pin_ro_root(&volume, None).await?;
                 if head.format_version != COWFS_FORMAT_VERSION {
+                    let _ = head_store.unpin_ro_root(pin).await;
                     return Err(Errno::EPROTONOSUPPORT);
                 }
                 let root_digest = head.root;
@@ -431,18 +602,25 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 ));
                 let mut caps = profiles::COWFS_SNAPSHOT;
                 caps.durability = config.capabilities.durability;
-                (head, root_digest, None, None, true, None, caps, fs_id)
+                (
+                    head,
+                    root_digest,
+                    None,
+                    Some(pin),
+                    None,
+                    true,
+                    None,
+                    caps,
+                    fs_id,
+                )
             }
             CowFsOpenMode::Snapshot(snap_name) => {
-                let mut head = head_store.read_head(&volume).await?;
+                let (head, pin) = head_store.pin_ro_root(&volume, Some(&snap_name)).await?;
                 if head.format_version != COWFS_FORMAT_VERSION {
+                    let _ = head_store.unpin_ro_root(pin).await;
                     return Err(Errno::EPROTONOSUPPORT);
                 }
-                let snap = head_store.get_snapshot(&volume, &snap_name).await?;
-                let root_digest = snap.root;
-                head.root = snap.root;
-                head.epoch = snap.epoch;
-                head.updated_at = snap.created_at;
+                let root_digest = head.root;
                 let fs_id = FsId(format!(
                     "cowfs:{}@{}",
                     volume.0,
@@ -454,6 +632,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                     head,
                     root_digest,
                     None,
+                    Some(pin),
                     None,
                     true,
                     Some(snap_name),
@@ -466,25 +645,19 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         let raw_root = match head_store.get_node(&root_digest).await {
             Ok(bytes) => bytes,
             Err(e) => {
-                if let Some(l) = lease {
-                    let _ = head_store.release_writer(l).await;
-                }
+                Self::release_open_handles(&*head_store, lease, ro_pin).await;
                 return Err(e);
             }
         };
         let root_obj = match RootObject::decode_verified(&root_digest, &raw_root) {
             Ok(r) => r,
             Err(e) => {
-                if let Some(l) = lease {
-                    let _ = head_store.release_writer(l).await;
-                }
+                Self::release_open_handles(&*head_store, lease, ro_pin).await;
                 return Err(e);
             }
         };
         let Some(&subvol_root) = root_obj.subvols.get(&config.subvol) else {
-            if let Some(l) = lease {
-                let _ = head_store.release_writer(l).await;
-            }
+            Self::release_open_handles(&*head_store, lease, ro_pin).await;
             return Err(Errno::ENOENT);
         };
 
@@ -493,25 +666,31 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         let root_raw = match tree.get(&subvol_root, &TreeKey::inode_item(ROOT_INO)).await {
             Ok(Some(b)) => b,
             Ok(None) => {
-                if let Some(l) = lease {
-                    let _ = head_store.release_writer(l).await;
-                }
+                Self::release_open_handles(&*head_store, lease, ro_pin).await;
                 return Err(Errno::EIO);
             }
             Err(e) => {
-                if let Some(l) = lease {
-                    let _ = head_store.release_writer(l).await;
-                }
+                Self::release_open_handles(&*head_store, lease, ro_pin).await;
                 return Err(e);
             }
         };
         let root_inode = match InodeItem::decode(&root_raw) {
             Ok(i) => i,
             Err(e) => {
-                if let Some(l) = lease {
-                    let _ = head_store.release_writer(l).await;
-                }
+                Self::release_open_handles(&*head_store, lease, ro_pin).await;
                 return Err(e);
+            }
+        };
+
+        let (allocated_bytes, inode_count) = if (root_obj.features & ROOT_FEATURE_ACCOUNTING) != 0 {
+            (root_obj.allocated_bytes, root_obj.inode_count.max(1))
+        } else {
+            match Self::scan_subvol_accounting(&tree, &subvol_root).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    Self::release_open_handles(&*head_store, lease, ro_pin).await;
+                    return Err(e);
+                }
             }
         };
 
@@ -535,29 +714,47 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 root_obj,
                 subvol_root,
                 lease,
+                ro_pin,
                 forked_from,
                 fenced: false,
+                closed: false,
                 user_modified: initial_modified,
+                first_dirty_at: None,
                 overlay: TreeOverlay::new(),
                 dirty_blocks: HashMap::new(),
                 dirty_block_bytes: 0,
+                committing: None,
                 opens: HashMap::new(),
                 open_counts: HashMap::new(),
                 locks: HashMap::new(),
                 waiters: HashMap::new(),
                 next_waiter: 1,
-                allocated_bytes: 0,
-                inode_count_estimate: 1,
+                allocated_bytes,
+                inode_count,
             }),
+            op_lock: AsyncMutex::default(),
             commit_lock: AsyncMutex::default(),
         };
 
         // On RW mount, reap any persisted `ORPHAN_ITEM`s left behind by an earlier crash while
         // unlinked files were still open (contract §2.15, §3).
         if !read_only {
-            let reaped = fs.reap_orphans_on_mount().await?;
-            if reaped > 0 {
-                fs.commit_tx_group().await?;
+            let reap_res = async {
+                let reaped = fs.reap_orphans_on_mount().await?;
+                if reaped > 0 {
+                    fs.commit_tx_group().await?;
+                }
+                Ok::<(), Errno>(())
+            }
+            .await;
+            if let Err(e) = reap_res {
+                let (lease, ro_pin) = {
+                    let mut st = fs.state.borrow_mut();
+                    st.closed = true;
+                    (st.lease.take(), st.ro_pin.take())
+                };
+                Self::release_open_handles(&*fs.head_store, lease, ro_pin).await;
+                return Err(e);
             }
         }
         Ok(fs)
@@ -573,6 +770,80 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.state.borrow().closed
+    }
+
+    /// Returns `true` when this RW mount has dirty uncommitted mutations whose 5-second commit
+    /// deadline (`DIRTY_COMMIT_DEADLINE_SECS`) has elapsed (or an ambiguous `EIO` commit awaits
+    /// idempotent retry).
+    pub fn dirty_deadline_elapsed(&self) -> bool {
+        if self.read_only {
+            return false;
+        }
+        let st = self.state.borrow();
+        if st.closed || st.fenced || st.lease.is_none() || !st.is_dirty() {
+            return false;
+        }
+        let ephemeral_atime_only =
+            st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
+        if ephemeral_atime_only {
+            return false;
+        }
+        if st.committing.as_ref().is_some_and(|c| c.pending.is_some()) {
+            return true;
+        }
+        let Some(since) = st.first_dirty_at else {
+            return false;
+        };
+        let now = (self.clock)();
+        let elapsed_ns = (i128::from(now.sec) - i128::from(since.sec)) * 1_000_000_000
+            + (i128::from(now.nsec) - i128::from(since.nsec));
+        elapsed_ns >= i128::from(DIRTY_COMMIT_DEADLINE_SECS) * 1_000_000_000
+    }
+
+    /// Milliseconds remaining until the 5-second dirty commit deadline fires, or `None` if clean /
+    /// read-only / closed / unmodified ephemeral fork.
+    pub fn ms_until_dirty_deadline(&self) -> Option<u64> {
+        if self.read_only {
+            return None;
+        }
+        let st = self.state.borrow();
+        if st.closed || st.fenced || st.lease.is_none() || !st.is_dirty() {
+            return None;
+        }
+        let ephemeral_atime_only =
+            st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
+        if ephemeral_atime_only {
+            return None;
+        }
+        if st.committing.as_ref().is_some_and(|c| c.pending.is_some()) {
+            return Some(500);
+        }
+        let since = st.first_dirty_at?;
+        let now = (self.clock)();
+        let deadline_ns = i128::from(DIRTY_COMMIT_DEADLINE_SECS) * 1_000_000_000;
+        let elapsed_ns = (i128::from(now.sec) - i128::from(since.sec)) * 1_000_000_000
+            + (i128::from(now.nsec) - i128::from(since.nsec));
+        if elapsed_ns <= 0 {
+            return Some(DIRTY_COMMIT_DEADLINE_SECS * 1000);
+        }
+        if elapsed_ns >= deadline_ns {
+            return Some(0);
+        }
+        let remaining_ns = deadline_ns - elapsed_ns;
+        Some(((remaining_ns + 999_999) / 1_000_000) as u64)
+    }
+
+    /// Commit dirty state if the 5-second dirty commit deadline has elapsed.
+    pub async fn flush_if_dirty_deadline_elapsed(&self) -> Result<bool> {
+        if !self.dirty_deadline_elapsed() {
+            return Ok(false);
+        }
+        self.commit_tx_group().await?;
+        Ok(true)
     }
 
     pub fn head_store_rc(&self) -> Rc<H> {
@@ -622,23 +893,66 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if !self.read_only || self.pinned_snapshot.is_some() {
             return Err(Errno::EINVAL);
         }
-        let latest = self.head_store.read_head(&self.volume_id).await?;
-        let raw_root = self.head_store.get_node(&latest.root).await?;
-        let root_obj = RootObject::decode_verified(&latest.root, &raw_root)?;
-        let &subvol_root = root_obj.subvols.get(&self.subvol).ok_or(Errno::ENOENT)?;
-        let mut st = self.state.borrow_mut();
-        st.head = latest.clone();
-        st.root_obj = root_obj;
-        st.subvol_root = subvol_root;
+        if self.state.borrow().closed {
+            return Err(Errno::EBADF);
+        }
+        let (latest, new_pin) = self.head_store.pin_ro_root(&self.volume_id, None).await?;
+        if latest.format_version != COWFS_FORMAT_VERSION {
+            let _ = self.head_store.unpin_ro_root(new_pin).await;
+            return Err(Errno::EPROTONOSUPPORT);
+        }
+        let raw_root = match self.head_store.get_node(&latest.root).await {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = self.head_store.unpin_ro_root(new_pin).await;
+                return Err(e);
+            }
+        };
+        let root_obj = match RootObject::decode_verified(&latest.root, &raw_root) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.head_store.unpin_ro_root(new_pin).await;
+                return Err(e);
+            }
+        };
+        let Some(&subvol_root) = root_obj.subvols.get(&self.subvol) else {
+            let _ = self.head_store.unpin_ro_root(new_pin).await;
+            return Err(Errno::ENOENT);
+        };
+        let swap_res = {
+            let mut st = self.state.borrow_mut();
+            if st.closed {
+                Err(new_pin)
+            } else {
+                if (root_obj.features & ROOT_FEATURE_ACCOUNTING) != 0 {
+                    st.allocated_bytes = root_obj.allocated_bytes;
+                    st.inode_count = root_obj.inode_count.max(1);
+                }
+                st.head = latest.clone();
+                st.root_obj = root_obj;
+                st.subvol_root = subvol_root;
+                Ok(st.ro_pin.replace(new_pin))
+            }
+        };
+        let old_pin = match swap_res {
+            Ok(old) => old,
+            Err(pin) => {
+                let _ = self.head_store.unpin_ro_root(pin).await;
+                return Err(Errno::EBADF);
+            }
+        };
+        if let Some(old) = old_pin {
+            let _ = self.head_store.unpin_ro_root(old).await;
+        }
         Ok(latest)
     }
 
     /// Create an O(1) named snapshot (`name -> root_digest`), committing any dirty state first.
     pub async fn create_snapshot(&self, name: &str) -> Result<SnapshotRecord> {
-        if self.read_only {
-            return Err(Errno::EROFS);
-        }
-        self.commit_tx_group().await?;
+        let _op = self.op_lock.lock().await;
+        self.check_rw()?;
+        self.commit_tx_group_with_lock_mode(true).await?;
+        let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
         let head = self.state.borrow().head.clone();
         let now = (self.clock)();
         self.head_store
@@ -654,9 +968,16 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         new_volume: VolumeId,
         ephemeral_if_unmodified: bool,
     ) -> Result<VolumeHead> {
-        if !self.read_only && snapshot.is_none() {
-            self.commit_tx_group().await?;
+        let _op = self.op_lock.lock().await;
+        if self.state.borrow().closed {
+            return Err(Errno::EBADF);
         }
+        if !self.read_only && snapshot.is_none() {
+            self.commit_tx_group_with_lock_mode(true).await?;
+        }
+        // Hold shared GC lock across root selection + fork publication so GC cannot sweep the
+        // selected root concurrently.
+        let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
         let source_root = match snapshot {
             Some(snap_name) => {
                 self.head_store
@@ -679,28 +1000,54 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         self.head_store.fork_volume(&req).await
     }
 
-    /// Commit any dirty transaction group, release the writer lease, and auto-prune an unmodified
-    /// ephemeral tab fork (`ephemeral_if_unmodified && !modified`, contract §2.1, Blueprint §3.2).
+    /// Commit any dirty transaction group, release the writer lease or RO pin, and auto-prune an
+    /// unmodified ephemeral tab fork ONLY when this mount is its live, unfenced RW lease holder.
     pub async fn close_clean(&self) -> Result<()> {
-        let (should_commit, should_prune) = {
+        let _op = self.op_lock.lock().await;
+        if self.state.borrow().closed {
+            return Ok(());
+        }
+        let (should_commit, can_prune) = {
             let st = self.state.borrow();
-            let prune = st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
-            let commit = !self.read_only && !st.fenced && !prune && st.is_dirty();
-            (commit, prune)
+            let can_prune = !self.read_only
+                && !st.fenced
+                && st.lease.is_some()
+                && st.head.ephemeral_if_unmodified
+                && !st.head.modified
+                && !st.user_modified;
+            let should_commit =
+                !self.read_only && !st.fenced && st.lease.is_some() && !can_prune && st.is_dirty();
+            (should_commit, can_prune)
         };
         if should_commit {
-            self.commit_tx_group().await?;
+            self.commit_tx_group_with_lock_mode(true).await?;
         }
-        let (lease, vol) = {
+        let _commit = self.commit_lock.lock().await;
+        let (lease, ro_pin, final_prune) = {
             let mut st = self.state.borrow_mut();
-            let lease = st.lease.take();
-            (lease, st.head.volume.clone())
+            if st.closed {
+                return Ok(());
+            }
+            let prune = can_prune
+                && !self.read_only
+                && !st.fenced
+                && st.lease.is_some()
+                && st.head.ephemeral_if_unmodified
+                && !st.head.modified
+                && !st.user_modified;
+            st.closed = true;
+            st.first_dirty_at = None;
+            (st.lease.take(), st.ro_pin.take(), prune)
         };
-        if let Some(l) = lease {
-            self.head_store.release_writer(l).await?;
+        if let Some(pin) = ro_pin {
+            let _ = self.head_store.unpin_ro_root(pin).await;
         }
-        if should_prune {
-            let _ = self.head_store.delete_volume(&vol).await;
+        if let Some(l) = lease {
+            if final_prune {
+                let _ = self.head_store.delete_volume_with_lease(l, true).await;
+            } else {
+                self.head_store.release_writer(l).await?;
+            }
         }
         Ok(())
     }
@@ -709,56 +1056,59 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     /// CoW B+tree node generation -> `HeadStore::commit_head` CAS).
     pub async fn commit_tx_group(&self) -> Result<VolumeHead> {
         if self.read_only {
-            return Ok(self.state.borrow().head.clone());
+            let st = self.state.borrow();
+            if st.closed {
+                return Err(Errno::EBADF);
+            }
+            return Ok(st.head.clone());
         }
-        let _guard = self.commit_lock.lock().await;
-        self.commit_tx_group_locked().await
+        self.commit_tx_group_with_lock_mode(false).await
     }
 
-    async fn commit_tx_group_locked(&self) -> Result<VolumeHead> {
-        let (fenced, skip_commit, head_snap, subvol_root, root_obj_snap) = {
-            let st = self.state.borrow();
-            let ephemeral_atime_only =
-                st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
-            (
-                st.fenced,
-                !st.is_dirty() || ephemeral_atime_only,
-                st.head.clone(),
-                st.subvol_root,
-                st.root_obj.clone(),
-            )
-        };
-        if fenced {
-            return Err(Errno::ESTALE);
+    fn retire_committing_success(
+        &self,
+        committed_head: VolumeHead,
+        next_root_obj: RootObject,
+        new_subvol_root: Digest,
+    ) {
+        let mut st = self.state.borrow_mut();
+        st.head = committed_head.clone();
+        st.subvol_root = new_subvol_root;
+        st.root_obj.format_version = next_root_obj.format_version;
+        st.root_obj.features = next_root_obj.features;
+        st.root_obj.subvols = next_root_obj.subvols;
+        st.root_obj.parent_root = next_root_obj.parent_root;
+        st.root_obj.generation = next_root_obj.generation;
+        // Preserve any concurrent `alloc_ino()` / live mutations staged while committing!
+        st.root_obj.next_ino = st.root_obj.next_ino.max(next_root_obj.next_ino);
+        st.root_obj.allocated_bytes = st.allocated_bytes;
+        st.root_obj.inode_count = st.inode_count;
+        if let Some(lease) = st.lease.as_mut() {
+            lease.epoch = committed_head.epoch;
+            lease.head = committed_head;
         }
-        if skip_commit {
-            // Even when clean, verify our writer fence hasn't been stolen (`ESTALE`).
-            let latest = self.head_store.read_head(&self.volume_id).await?;
-            if latest.incarnation != head_snap.incarnation || latest.fence != head_snap.fence {
-                self.state.borrow_mut().fenced = true;
-                return Err(Errno::ESTALE);
+        let finished = st.committing.take();
+        let remaining_dirty = st.total_dirty_bytes();
+        let mut arena = self.arena.borrow_mut();
+        arena.set_dirty_bytes(remaining_dirty);
+        if let Some(c) = finished {
+            for (d, (bytes, _)) in c.dirty_blocks {
+                arena.put_data(d, bytes);
             }
-            return Ok(head_snap);
         }
+    }
 
-        // Acquire shared GC lock across pack write + head CAS so GC never sweeps in-flight packs.
-        let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
-
-        // Snapshot dirty blocks & sorted overlay ops without clearing until CAS succeeds.
-        let (dirty_blocks_snap, sorted_ops) = {
-            let st = self.state.borrow();
-            let blocks: Vec<(Digest, Rc<Vec<u8>>)> = st
-                .dirty_blocks
-                .iter()
-                .map(|(d, (b, _))| (*d, Rc::clone(b)))
-                .collect();
-            let ops = st.overlay.clone_sorted_ops();
-            (blocks, ops)
-        };
-
+    async fn build_commit_request(
+        &self,
+        head_snap: &VolumeHead,
+        subvol_root: &Digest,
+        mut next_root_obj: RootObject,
+        dirty_blocks_snap: &[(Digest, Rc<Vec<u8>>)],
+        sorted_ops: &[(TreeKey, Option<Vec<u8>>)],
+    ) -> Result<PendingCommit> {
         // 1. Pack & flush any new dirty data blocks (skipping intra-store dedupe hits).
         let mut builder = PackBuilder::new();
-        for (digest, bytes) in &dirty_blocks_snap {
+        for (digest, bytes) in dirty_blocks_snap {
             if self.head_store.lookup_block(digest).await?.is_none() {
                 builder.push(*digest, bytes)?;
             }
@@ -779,9 +1129,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
         // 2. Apply sorted mutations to CoW B+tree (leaves -> parents -> new subvol root).
         let tree = CowTree::new(&*self.head_store, &self.arena);
-        let (new_subvol_root, mut put_nodes) = tree.apply_batch(&subvol_root, &sorted_ops).await?;
+        let (new_subvol_root, mut put_nodes) = tree.apply_batch(subvol_root, sorted_ops).await?;
 
-        let mut next_root_obj = root_obj_snap;
         next_root_obj
             .subvols
             .insert(self.subvol.clone(), new_subvol_root);
@@ -789,8 +1138,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         let (new_root_digest, root_bytes) = next_root_obj.encode()?;
         put_nodes.push((new_root_digest, root_bytes));
 
-        // 3. Atomic strict HeadStore CAS checked against `(incarnation, fence, epoch)`.
-        // Derive a globally collision-free idempotency key across tabs/processes/restarts from
+        // 3. Derive a globally collision-free idempotency key from
         // `(volume, incarnation, fence, epoch, new_root_digest)`.
         let mut op_seed = Vec::with_capacity(16 + self.volume_id.0.len() + 64);
         op_seed.extend_from_slice(b"os-cowfs-op-v1\0");
@@ -816,35 +1164,201 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             put_blocks,
             committed_at: now,
         };
-        let committed_head = match self.head_store.commit_head(&commit_req).await {
-            Ok(h) => h,
-            Err(Errno::ESTALE) => {
-                self.state.borrow_mut().fenced = true;
-                return Err(Errno::ESTALE);
-            }
-            Err(e) => return Err(e),
-        };
+        Ok(PendingCommit {
+            commit_req,
+            next_root_obj,
+            new_subvol_root,
+        })
+    }
 
-        // 4. Advance in-memory committed state and move flushed blocks to clean LRU cache.
-        {
-            let mut st = self.state.borrow_mut();
-            st.head = committed_head.clone();
-            st.root_obj = next_root_obj;
-            st.subvol_root = new_subvol_root;
-            if let Some(lease) = st.lease.as_mut() {
-                lease.epoch = committed_head.epoch;
-                lease.head = committed_head.clone();
+    async fn commit_tx_group_with_lock_mode(&self, op_lock_held: bool) -> Result<VolumeHead> {
+        loop {
+            // Strict lock hierarchy: ALWAYS `op_lock` -> `commit_lock`.
+            let mut op_guard = if op_lock_held {
+                None
+            } else {
+                Some(self.op_lock.lock().await)
+            };
+            let commit_guard = self.commit_lock.lock().await;
+
+            {
+                let st = self.state.borrow();
+                if st.closed {
+                    return Err(Errno::EBADF);
+                }
+                if st.fenced || st.lease.is_none() {
+                    return Err(Errno::ESTALE);
+                }
             }
-            st.overlay.clear();
-            let old_dirty = std::mem::take(&mut st.dirty_blocks);
-            st.dirty_block_bytes = 0;
-            let mut arena = self.arena.borrow_mut();
-            arena.set_dirty_bytes(0);
-            for (d, (bytes, _)) in old_dirty {
-                arena.put_data(d, bytes);
+
+            // Phase A: If a previous `commit_head` returned an ambiguous error (e.g., `EIO`),
+            // replay its exact `CommitRequest` (`op_id`) to reconcile via receipt before freezing
+            // any new live mutations.
+            let pending_replay = {
+                let st = self.state.borrow();
+                st.committing.as_ref().and_then(|c| {
+                    c.pending.as_ref().map(|p| {
+                        (
+                            p.commit_req.clone(),
+                            p.next_root_obj.clone(),
+                            p.new_subvol_root,
+                        )
+                    })
+                })
+            };
+            if let Some((commit_req, next_root_obj, new_subvol_root)) = pending_replay {
+                drop(op_guard.take());
+                let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
+                match self.head_store.commit_head(&commit_req).await {
+                    Ok(committed_head) => {
+                        self.retire_committing_success(
+                            committed_head.clone(),
+                            next_root_obj,
+                            new_subvol_root,
+                        );
+                        let still_dirty = {
+                            let st = self.state.borrow();
+                            let ephemeral_atime_only = st.head.ephemeral_if_unmodified
+                                && !st.head.modified
+                                && !st.user_modified;
+                            st.is_live_dirty() && !ephemeral_atime_only
+                        };
+                        if !still_dirty {
+                            return Ok(committed_head);
+                        }
+                        // Loop to re-acquire `op_lock` -> `commit_lock` cleanly and flush live state.
+                        drop(commit_guard);
+                        continue;
+                    }
+                    Err(Errno::ESTALE) => {
+                        {
+                            let mut st = self.state.borrow_mut();
+                            st.fenced = true;
+                            st.rollback_committing();
+                        }
+                        self.sync_arena_dirty();
+                        return Err(Errno::ESTALE);
+                    }
+                    Err(e @ (Errno::ENOSPC | Errno::EDQUOT)) => {
+                        self.state.borrow_mut().rollback_committing();
+                        self.sync_arena_dirty();
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        // Still ambiguous — keep `st.committing.pending` intact for retry.
+                        return Err(e);
+                    }
+                }
+            }
+
+            // Phase B: Freeze the live dirty transaction group into `st.committing` while holding
+            // `op_lock`, then release `op_lock` BEFORE async storage I/O so concurrent VFS
+            // mutations stage safely into fresh `st.overlay` / `st.dirty_blocks`.
+            let (skip_commit, head_snap, subvol_root, root_obj_snap, dirty_blocks_snap, sorted_ops) = {
+                let mut st = self.state.borrow_mut();
+                let ephemeral_atime_only =
+                    st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
+                if !st.is_live_dirty() || ephemeral_atime_only {
+                    (
+                        true,
+                        st.head.clone(),
+                        st.subvol_root,
+                        st.root_obj.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                } else {
+                    let head_snap = st.head.clone();
+                    let subvol_root = st.subvol_root;
+                    let mut root_obj_snap = st.root_obj.clone();
+                    root_obj_snap.features |= ROOT_FEATURE_ACCOUNTING;
+                    root_obj_snap.allocated_bytes = st.allocated_bytes;
+                    root_obj_snap.inode_count = st.inode_count;
+                    let first_dirty_at = st.first_dirty_at.take();
+                    let live_overlay = std::mem::take(&mut st.overlay);
+                    let live_blocks = std::mem::take(&mut st.dirty_blocks);
+                    let live_block_bytes = std::mem::take(&mut st.dirty_block_bytes);
+
+                    let blocks_vec: Vec<(Digest, Rc<Vec<u8>>)> = live_blocks
+                        .iter()
+                        .map(|(d, (b, _))| (*d, Rc::clone(b)))
+                        .collect();
+                    let sorted_ops = live_overlay.clone_sorted_ops();
+                    st.committing = Some(CommittingGroup {
+                        first_dirty_at,
+                        overlay: live_overlay,
+                        dirty_blocks: live_blocks,
+                        dirty_block_bytes: live_block_bytes,
+                        pending: None,
+                    });
+                    (
+                        false,
+                        head_snap,
+                        subvol_root,
+                        root_obj_snap,
+                        blocks_vec,
+                        sorted_ops,
+                    )
+                }
+            };
+
+            drop(op_guard.take());
+
+            if skip_commit {
+                // Even when clean, verify our writer fence hasn't been stolen (`ESTALE`).
+                let latest = self.head_store.read_head(&self.volume_id).await?;
+                if latest.incarnation != head_snap.incarnation || latest.fence != head_snap.fence {
+                    self.state.borrow_mut().fenced = true;
+                    return Err(Errno::ESTALE);
+                }
+                return Ok(head_snap);
+            }
+
+            let mut rollback = CommitRollbackGuard {
+                fs: self,
+                armed: true,
+            };
+
+            // Acquire shared GC lock across pack write + head CAS so GC never sweeps in-flight packs.
+            let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
+            let pending = self
+                .build_commit_request(
+                    &head_snap,
+                    &subvol_root,
+                    root_obj_snap,
+                    &dirty_blocks_snap,
+                    &sorted_ops,
+                )
+                .await?;
+
+            match self.head_store.commit_head(&pending.commit_req).await {
+                Ok(committed_head) => {
+                    rollback.armed = false;
+                    self.retire_committing_success(
+                        committed_head.clone(),
+                        pending.next_root_obj,
+                        pending.new_subvol_root,
+                    );
+                    return Ok(committed_head);
+                }
+                Err(Errno::ESTALE) => {
+                    self.state.borrow_mut().fenced = true;
+                    return Err(Errno::ESTALE);
+                }
+                Err(e @ (Errno::ENOSPC | Errno::EDQUOT)) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    // Ambiguous failure (e.g. `EIO`): the commit may have applied on storage.
+                    // Retain `pending` inside `st.committing` so retry replays the exact `op_id`.
+                    rollback.armed = false;
+                    if let Some(c) = self.state.borrow_mut().committing.as_mut() {
+                        c.pending = Some(pending);
+                    }
+                    return Err(e);
+                }
             }
         }
-        Ok(committed_head)
     }
 
     fn sync_arena_dirty(&self) {
@@ -852,13 +1366,18 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         self.arena.borrow_mut().set_dirty_bytes(bytes);
     }
 
+    /// Flush when arena dirty budget is approached OR when the 5-second dirty commit deadline has
+    /// elapsed. Caller MUST already hold `op_lock`.
     async fn maybe_backpressure_flush(&self, incoming_bytes: usize) -> Result<()> {
         if self.read_only {
             return Ok(());
         }
-        if self.arena.borrow().needs_backpressure_flush(incoming_bytes) {
-            self.commit_tx_group().await?;
-            self.arena.borrow_mut().record_backpressure_flush();
+        let bp = self.arena.borrow().needs_backpressure_flush(incoming_bytes);
+        if bp || self.dirty_deadline_elapsed() {
+            self.commit_tx_group_with_lock_mode(true).await?;
+            if bp {
+                self.arena.borrow_mut().record_backpressure_flush();
+            }
         }
         Ok(())
     }
@@ -867,15 +1386,21 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         let subvol_root = self.state.borrow().subvol_root;
         let tree = CowTree::new(&*self.head_store, &self.arena);
         let mut overlay = TreeOverlay::new();
-        let reaped = orphan::reap_all_orphans(&tree, &subvol_root, &mut overlay).await?;
+        let (reaped, freed_bytes) =
+            orphan::reap_all_orphans(&tree, &subvol_root, &mut overlay).await?;
         if reaped > 0 {
+            let now = (self.clock)();
             let mut st = self.state.borrow_mut();
+            st.user_modified = true;
+            st.mark_dirty(now);
             for (k, v) in overlay.take_sorted_ops() {
                 match v {
                     Some(val) => st.overlay.put(k, val),
                     None => st.overlay.delete(k),
                 }
             }
+            st.allocated_bytes = st.allocated_bytes.saturating_sub(freed_bytes);
+            st.inode_count = st.inode_count.saturating_sub(reaped as u64).max(1);
             let dirty = st.total_dirty_bytes();
             self.arena.borrow_mut().set_dirty_bytes(dirty);
         }
@@ -887,14 +1412,18 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     // -------------------------------------------------------------------------
 
     async fn tree_get(&self, key: &TreeKey) -> Result<Option<Vec<u8>>> {
-        let (staged, base_root) = {
+        let base_root = {
             let st = self.state.borrow();
             if let Some(opt) = st.overlay.get(key) {
                 return Ok(opt.map(|v| v.to_vec()));
             }
-            (None::<()>, st.subvol_root)
+            if let Some(c) = &st.committing
+                && let Some(opt) = c.overlay.get(key)
+            {
+                return Ok(opt.map(|v| v.to_vec()));
+            }
+            st.subvol_root
         };
-        let _ = staged;
         let tree = CowTree::new(&*self.head_store, &self.arena);
         tree.get(&base_root, key).await
     }
@@ -907,7 +1436,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     ) -> Result<Vec<(TreeKey, Vec<u8>)>> {
         let (base_root, overlay_clone) = {
             let st = self.state.borrow();
-            (st.subvol_root, st.overlay.clone())
+            (st.subvol_root, st.combined_read_overlay())
         };
         let tree = CowTree::new(&*self.head_store, &self.arena);
         tree.scan_range_with_overlay(&base_root, &overlay_clone, start, end, limit)
@@ -921,7 +1450,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     ) -> Result<Option<(TreeKey, Vec<u8>)>> {
         let (base_root, overlay_clone) = {
             let st = self.state.borrow();
-            (st.subvol_root, st.overlay.clone())
+            (st.subvol_root, st.combined_read_overlay())
         };
         let tree = CowTree::new(&*self.head_store, &self.arena);
         tree.find_le_with_overlay(&base_root, &overlay_clone, min_key, max_key)
@@ -961,44 +1490,75 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         Ok(item.to_perm_node(ino, acl_entries, default_acl))
     }
 
-    fn stage_perm_acls(&self, ino: u64, node: &PermNode) -> Result<()> {
-        let mut st = self.state.borrow_mut();
-        st.user_modified = true;
-        if node.acl.is_some() {
-            let entries = node.entries();
-            let raw = serde_json::to_vec(&entries).map_err(|_| Errno::EIO)?;
-            st.overlay
-                .put(TreeKey::xattr_item(ino, abi::ACL_ACCESS), raw);
+    /// Serialize & validate POSIX ACLs against `xattr::VALUE_MAX` BEFORE mutating overlay state.
+    fn encode_perm_acls(node: &PermNode) -> Result<EncodedAcls> {
+        let access = if node.acl.is_some() {
+            let raw = serde_json::to_vec(&node.entries()).map_err(|_| Errno::EIO)?;
+            if raw.len() > xattr::VALUE_MAX {
+                return Err(Errno::E2BIG);
+            }
+            Some(raw)
         } else {
-            st.overlay.delete(TreeKey::xattr_item(ino, abi::ACL_ACCESS));
-        }
-        if let Some(ref def) = node.default_acl {
+            None
+        };
+        let default = if let Some(ref def) = node.default_acl {
             let raw = serde_json::to_vec(def).map_err(|_| Errno::EIO)?;
-            st.overlay
-                .put(TreeKey::xattr_item(ino, abi::ACL_DEFAULT), raw);
+            if raw.len() > xattr::VALUE_MAX {
+                return Err(Errno::E2BIG);
+            }
+            Some(raw)
         } else {
-            st.overlay
-                .delete(TreeKey::xattr_item(ino, abi::ACL_DEFAULT));
-        }
-        drop(st);
-        self.sync_arena_dirty();
-        Ok(())
+            None
+        };
+        Ok(EncodedAcls { access, default })
     }
 
-    fn stage_inode(&self, ino: u64, item: &InodeItem) {
+    fn stage_encoded_acls(&self, ino: u64, acls: EncodedAcls) {
+        let now = (self.clock)();
         {
             let mut st = self.state.borrow_mut();
             st.user_modified = true;
+            st.mark_dirty(now);
+            match acls.access {
+                Some(raw) => st
+                    .overlay
+                    .put(TreeKey::xattr_item(ino, abi::ACL_ACCESS), raw),
+                None => st.overlay.delete(TreeKey::xattr_item(ino, abi::ACL_ACCESS)),
+            }
+            match acls.default {
+                Some(raw) => st
+                    .overlay
+                    .put(TreeKey::xattr_item(ino, abi::ACL_DEFAULT), raw),
+                None => st
+                    .overlay
+                    .delete(TreeKey::xattr_item(ino, abi::ACL_DEFAULT)),
+            }
+        }
+        self.sync_arena_dirty();
+    }
+
+    fn stage_inode(&self, ino: u64, item: &InodeItem) {
+        let now = (self.clock)();
+        {
+            let mut st = self.state.borrow_mut();
+            st.user_modified = true;
+            st.mark_dirty(now);
             st.overlay.put(TreeKey::inode_item(ino), item.encode());
         }
         self.sync_arena_dirty();
     }
 
     fn stage_inode_atime(&self, ino: u64, item: &InodeItem) {
-        self.state
-            .borrow_mut()
-            .overlay
-            .put(TreeKey::inode_item(ino), item.encode());
+        let now = (self.clock)();
+        {
+            let mut st = self.state.borrow_mut();
+            let ephemeral_unmodified =
+                st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
+            if !ephemeral_unmodified {
+                st.mark_dirty(now);
+            }
+            st.overlay.put(TreeKey::inode_item(ino), item.encode());
+        }
         self.sync_arena_dirty();
     }
 
@@ -1018,6 +1578,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     }
 
     async fn check_handle(&self, handle: &Handle) -> Result<(u64, InodeItem)> {
+        if self.state.borrow().closed {
+            return Err(Errno::EBADF);
+        }
         if handle.fs != self.fs_id || !handle.proof.is_empty() {
             return Err(Errno::EACCES);
         }
@@ -1035,6 +1598,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             return Err(Errno::EBADF);
         }
         let st = self.state.borrow();
+        if st.closed {
+            return Err(Errno::EBADF);
+        }
         let rec = st.opens.get(&open.id).ok_or(Errno::EBADF)?;
         if rec.ino != open.node.ino || rec.generation != open.node.generation {
             return Err(Errno::EBADF);
@@ -1067,32 +1633,61 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        if self.state.borrow().fenced {
+        let st = self.state.borrow();
+        if st.closed {
+            return Err(Errno::EBADF);
+        }
+        if st.fenced || st.lease.is_none() {
             return Err(Errno::ESTALE);
         }
         Ok(())
     }
 
-    fn update_atime_if_needed(&self, ino: u64, item: &mut InodeItem, is_dir: bool) {
-        if self.read_only {
-            return;
-        }
-        let now = (self.clock)();
+    fn should_update_atime(item: &InodeItem, is_dir: bool, now: Timespec) -> bool {
         let atime = (item.atime.sec, item.atime.nsec);
         let mtime = (item.mtime.sec, item.mtime.nsec);
         let ctime = (item.ctime.sec, item.ctime.nsec);
         let now_t = (now.sec, now.nsec);
-        let update = match vfs::mount::active_mount_flags() {
+        match vfs::mount::active_mount_flags() {
             Some(flags) => flags.should_update_atime(is_dir, atime, mtime, ctime, now_t),
             None => {
                 atime <= mtime
                     || atime <= ctime
                     || now.sec.saturating_sub(item.atime.sec) >= 24 * 60 * 60
             }
-        };
-        if update {
-            item.atime = now;
-            self.stage_inode_atime(ino, item);
+        }
+    }
+
+    async fn update_atime_if_needed(
+        &self,
+        ino: u64,
+        expected_gen: u64,
+        item: &InodeItem,
+        is_dir: bool,
+    ) {
+        if self.read_only {
+            return;
+        }
+        let now = (self.clock)();
+        if !Self::should_update_atime(item, is_dir, now) {
+            return;
+        }
+        let _op = self.op_lock.lock().await;
+        {
+            let st = self.state.borrow();
+            if st.closed || st.fenced || st.lease.is_none() {
+                return;
+            }
+        }
+        if let Ok(Some(mut cur)) = self.load_inode(ino).await
+            && cur.generation == expected_gen
+            && cur.nlink > 0
+        {
+            let now = (self.clock)();
+            if Self::should_update_atime(&cur, is_dir, now) {
+                cur.atime = now;
+                self.stage_inode_atime(ino, &cur);
+            }
         }
     }
 
@@ -1161,11 +1756,16 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         let ino = st.root_obj.next_ino;
         st.root_obj.next_ino += 1;
         let generation = st.root_obj.generation;
-        st.inode_count_estimate = st.inode_count_estimate.saturating_add(1);
+        st.inode_count = st.inode_count.saturating_add(1);
         (ino, generation)
     }
 
-    async fn reclaim_if_dead(&self, ino: u64, item: &InodeItem) -> Result<()> {
+    /// Reclaim all items belonging to an unlinked inode when its open count reaches zero.
+    /// Caller MUST hold `op_lock`. Never takes `st.overlay` across `.await`.
+    async fn reclaim_if_dead_locked(&self, ino: u64, item: &InodeItem) -> Result<()> {
+        if item.nlink != 0 {
+            return Ok(());
+        }
         let opens = self
             .state
             .borrow()
@@ -1173,72 +1773,55 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             .get(&ino)
             .copied()
             .unwrap_or(0);
-        if item.nlink == 0 {
-            if opens == 0 {
-                let (base_root, mut overlay) = {
-                    let mut st = self.state.borrow_mut();
-                    (st.subvol_root, std::mem::take(&mut st.overlay))
-                };
-                // Collect digests of dirty blocks we are about to drop.
-                let mut dropped_digests = Vec::new();
-                {
-                    let tree = CowTree::new(&*self.head_store, &self.arena);
-                    let mut start = TreeKey::kind_start(ino, KIND_EXTENT_DATA);
-                    let end = TreeKey::kind_end(ino, KIND_EXTENT_DATA);
-                    loop {
-                        let batch = tree
-                            .scan_range_with_overlay(&base_root, &overlay, &start, &end, 256)
-                            .await?;
-                        if batch.is_empty() {
-                            break;
-                        }
-                        let last = batch.last().unwrap().0.clone();
-                        let full = batch.len() == 256;
-                        for (_, val) in batch {
-                            if let Ok(ExtentDataValue::Extent { digest, .. }) =
-                                ExtentDataValue::decode(&val)
-                            {
-                                dropped_digests.push(digest);
-                            }
-                        }
-                        if !full {
-                            break;
-                        }
-                        let mut tail = last.tail;
-                        tail.push(0);
-                        start = TreeKey::new(last.ino, last.kind, tail);
+        if opens == 0 {
+            let (base_root, read_overlay) = {
+                let st = self.state.borrow();
+                (st.subvol_root, st.combined_read_overlay())
+            };
+            let tree = CowTree::new(&*self.head_store, &self.arena);
+            let plan =
+                orphan::collect_inode_reclaim_plan(&tree, &base_root, &read_overlay, ino).await?;
+            let now = (self.clock)();
+            {
+                let mut st = self.state.borrow_mut();
+                if st.open_counts.get(&ino).copied().unwrap_or(0) > 0 {
+                    st.user_modified = true;
+                    st.mark_dirty(now);
+                    orphan::stage_orphan(&mut st.overlay, ino);
+                } else {
+                    st.user_modified = true;
+                    st.mark_dirty(now);
+                    for k in plan.delete_keys {
+                        st.overlay.delete(k);
                     }
-                    let res =
-                        orphan::reclaim_inode_items(&tree, &base_root, &mut overlay, ino).await;
-                    let mut st = self.state.borrow_mut();
-                    st.overlay = overlay;
-                    res?;
-                }
-                {
-                    let mut st = self.state.borrow_mut();
-                    for d in &dropped_digests {
+                    orphan::clear_orphan(&mut st.overlay, ino);
+                    for d in &plan.dropped_digests {
                         st.unstage_dirty_block(d);
                     }
                     st.locks.remove(&ino);
-                    st.inode_count_estimate = st.inode_count_estimate.saturating_sub(1);
+                    st.allocated_bytes = st.allocated_bytes.saturating_sub(plan.freed_extent_bytes);
+                    st.inode_count = st.inode_count.saturating_sub(1).max(1);
                 }
-                self.sync_arena_dirty();
-            } else {
-                // Still open after last link gone -> persist ORPHAN_ITEM for crash recovery!
-                {
-                    let mut st = self.state.borrow_mut();
-                    orphan::stage_orphan(&mut st.overlay, ino);
-                }
-                self.sync_arena_dirty();
             }
+            self.sync_arena_dirty();
+        } else {
+            // Still open after last link gone -> persist ORPHAN_ITEM for crash recovery!
+            let now = (self.clock)();
+            {
+                let mut st = self.state.borrow_mut();
+                st.user_modified = true;
+                st.mark_dirty(now);
+                orphan::stage_orphan(&mut st.overlay, ino);
+            }
+            self.sync_arena_dirty();
         }
         Ok(())
     }
 
     async fn read_verified_block(&self, digest: &Digest) -> Result<Rc<Vec<u8>>> {
-        // 1. Check dirty uncommitted blocks.
-        if let Some((bytes, _)) = self.state.borrow().dirty_blocks.get(digest) {
-            return Ok(Rc::clone(bytes));
+        // 1. Check live & committing dirty uncommitted blocks.
+        if let Some(bytes) = self.state.borrow().dirty_block_bytes(digest) {
+            return Ok(bytes);
         }
         // 2. Check clean data LRU cache in Arena.
         if let Some(hit) = self.arena.borrow_mut().get_data(digest) {
@@ -1340,8 +1923,225 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         Ok(target_len)
     }
 
-    /// Resize regular file `ino` to `new_size`, freeing extents past `new_size` and zeroing any
-    /// partial tail block.
+    /// Shrink file extents past `new_size`, performing all async reads and verification BEFORE
+    /// mutating the live overlay so an I/O error leaves the file completely unchanged.
+    /// Caller MUST hold `op_lock`.
+    async fn resize_file_extents(
+        &self,
+        ino: u64,
+        old_size: u64,
+        new_size: u64,
+        now: Timespec,
+    ) -> Result<()> {
+        if new_size >= old_size {
+            return Ok(());
+        }
+
+        // 1. Collect all extents starting at >= new_size without mutating `st.overlay` yet.
+        let mut delete_extents: Vec<(TreeKey, Option<Digest>, u64)> = Vec::new();
+        let mut start = TreeKey::extent_data(ino, new_size);
+        let end = TreeKey::kind_end(ino, KIND_EXTENT_DATA);
+        let (base_root, read_overlay) = {
+            let st = self.state.borrow();
+            (st.subvol_root, st.combined_read_overlay())
+        };
+        let tree = CowTree::new(&*self.head_store, &self.arena);
+        loop {
+            let batch = tree
+                .scan_range_with_overlay(&base_root, &read_overlay, &start, &end, 256)
+                .await?;
+            if batch.is_empty() {
+                break;
+            }
+            let last = batch.last().unwrap().0.clone();
+            let full = batch.len() == 256;
+            for (k, raw) in batch {
+                let (dig, len) = match ExtentDataValue::decode(&raw)? {
+                    ExtentDataValue::Extent { len, digest, .. } => (Some(digest), u64::from(len)),
+                    ExtentDataValue::Inline(_) => (None, 0),
+                };
+                delete_extents.push((k, dig, len));
+            }
+            if !full {
+                break;
+            }
+            let mut tail = last.tail;
+            tail.push(0);
+            start = TreeKey::new(last.ino, last.kind, tail);
+        }
+
+        // 2. Inspect any extent starting strictly before `new_size` that straddles `new_size`,
+        // reading its verified backing block BEFORE staging any mutation.
+        struct TailBlockPlan {
+            key: TreeKey,
+            digest: Digest,
+            block: Rc<Vec<u8>>,
+            encoded: Vec<u8>,
+        }
+
+        enum StraddlePlan {
+            None,
+            InlineReplace {
+                key: TreeKey,
+                encoded: Vec<u8>,
+            },
+            ExtentSplit {
+                old_key: TreeKey,
+                old_digest: Digest,
+                old_len: u32,
+                old_bytes: Rc<Vec<u8>>,
+                prefix: Option<(TreeKey, Vec<u8>, u32)>,
+                tail: Option<TailBlockPlan>,
+            },
+        }
+
+        let mut straddle = StraddlePlan::None;
+        if new_size > 0 {
+            let min_k = TreeKey::kind_start(ino, KIND_EXTENT_DATA);
+            let max_k = TreeKey::extent_data(ino, new_size - 1);
+            if let Some((ext_key, ext_raw)) = tree
+                .find_le_with_overlay(&base_root, &read_overlay, &min_k, &max_k)
+                .await?
+                && let Some(ext_start) = ext_key.tail_u64()
+            {
+                match ExtentDataValue::decode(&ext_raw)? {
+                    ExtentDataValue::Inline(mut data) => {
+                        // Compare in `u64` BEFORE narrowing to `usize` so >= 4 GiB truncates on
+                        // 32-bit `wasm32` never wrap `(new_size - ext_start) as usize` to 0!
+                        let keep_u64 = new_size - ext_start;
+                        if keep_u64 < data.len() as u64 {
+                            data.truncate(keep_u64 as usize);
+                            let encoded = ExtentDataValue::Inline(data).encode()?;
+                            straddle = StraddlePlan::InlineReplace {
+                                key: ext_key,
+                                encoded,
+                            };
+                        }
+                    }
+                    ExtentDataValue::Extent {
+                        len: ext_len,
+                        digest,
+                        block_offset,
+                    } => {
+                        let ext_end = ext_start.saturating_add(u64::from(ext_len));
+                        if new_size < ext_end {
+                            let blk_size = u64::from(BLOCK_SIZE);
+                            let tail_blk_start = (new_size / blk_size) * blk_size;
+                            let block_bytes = self.read_verified_block(&digest).await?;
+
+                            let prefix = if tail_blk_start > ext_start {
+                                let prefix_len = (tail_blk_start - ext_start) as u32;
+                                let prefix_val = ExtentDataValue::Extent {
+                                    len: prefix_len,
+                                    digest,
+                                    block_offset,
+                                }
+                                .encode()?;
+                                Some((TreeKey::extent_data(ino, ext_start), prefix_val, prefix_len))
+                            } else {
+                                None
+                            };
+
+                            let keep_in_blk = (new_size - tail_blk_start) as usize;
+                            let tail = if keep_in_blk > 0 {
+                                let mut new_blk = vec![0u8; BLOCK_SIZE as usize];
+                                let src_off =
+                                    (block_offset as usize) + (tail_blk_start - ext_start) as usize;
+                                let avail = block_bytes.len().saturating_sub(src_off);
+                                let copy_len = keep_in_blk.min(avail);
+                                new_blk[..copy_len]
+                                    .copy_from_slice(&block_bytes[src_off..src_off + copy_len]);
+                                let new_dig = sha256(&new_blk);
+                                let val = ExtentDataValue::Extent {
+                                    len: BLOCK_SIZE,
+                                    digest: new_dig,
+                                    block_offset: 0,
+                                }
+                                .encode()?;
+                                Some(TailBlockPlan {
+                                    key: TreeKey::extent_data(ino, tail_blk_start),
+                                    digest: new_dig,
+                                    block: Rc::new(new_blk),
+                                    encoded: val,
+                                })
+                            } else {
+                                None
+                            };
+
+                            straddle = StraddlePlan::ExtentSplit {
+                                old_key: ext_key,
+                                old_digest: digest,
+                                old_len: ext_len,
+                                old_bytes: block_bytes,
+                                prefix,
+                                tail,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Apply the verified resize plan atomically in one synchronous borrow.
+        {
+            let mut st = self.state.borrow_mut();
+            if !delete_extents.is_empty() || !matches!(straddle, StraddlePlan::None) {
+                st.user_modified = true;
+                st.mark_dirty(now);
+            }
+            for (k, dig, len) in delete_extents {
+                if let Some(d) = dig {
+                    st.unstage_dirty_block(&d);
+                }
+                st.allocated_bytes = st.allocated_bytes.saturating_sub(len);
+                st.overlay.delete(k);
+            }
+            match straddle {
+                StraddlePlan::None => {}
+                StraddlePlan::InlineReplace { key, encoded } => {
+                    st.overlay.put(key, encoded);
+                }
+                StraddlePlan::ExtentSplit {
+                    old_key,
+                    old_digest,
+                    old_len,
+                    old_bytes,
+                    prefix,
+                    tail,
+                } => {
+                    let was_dirty = st.dirty_block_bytes(&old_digest).is_some();
+                    st.unstage_dirty_block(&old_digest);
+                    st.overlay.delete(old_key);
+                    st.allocated_bytes = st.allocated_bytes.saturating_sub(u64::from(old_len));
+                    if let Some((pre_key, pre_val, pre_len)) = prefix {
+                        if was_dirty {
+                            st.stage_dirty_block(old_digest, Rc::clone(&old_bytes));
+                        }
+                        st.overlay.put(pre_key, pre_val);
+                        st.allocated_bytes = st.allocated_bytes.saturating_add(u64::from(pre_len));
+                    }
+                    if let Some(TailBlockPlan {
+                        key: tail_key,
+                        digest: tail_dig,
+                        block: tail_blk,
+                        encoded: tail_val,
+                    }) = tail
+                    {
+                        st.stage_dirty_block(tail_dig, tail_blk);
+                        st.overlay.put(tail_key, tail_val);
+                        st.allocated_bytes =
+                            st.allocated_bytes.saturating_add(u64::from(BLOCK_SIZE));
+                    }
+                }
+            }
+        }
+        self.sync_arena_dirty();
+        Ok(())
+    }
+
+    /// Resize regular file `ino` to `new_size`, freeing extents past `new_size`, zeroing any
+    /// partial tail block, stripping setuid/setgid privileges, and staging the updated inode.
+    /// Caller MUST hold `op_lock`.
     async fn resize_file(
         &self,
         ino: u64,
@@ -1350,125 +2150,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         by: &Identity,
         now: Timespec,
     ) -> Result<()> {
-        let old_size = inode_item.size;
-        if new_size < old_size {
-            // 1. Delete all extents starting at >= new_size.
-            let mut start = TreeKey::extent_data(ino, new_size);
-            let end = TreeKey::kind_end(ino, KIND_EXTENT_DATA);
-            loop {
-                let batch = self.tree_scan(&start, &end, 256).await?;
-                if batch.is_empty() {
-                    break;
-                }
-                let last = batch.last().unwrap().0.clone();
-                let full = batch.len() == 256;
-                {
-                    let mut st = self.state.borrow_mut();
-                    for (k, raw) in batch {
-                        if let Ok(ExtentDataValue::Extent { digest, .. }) =
-                            ExtentDataValue::decode(&raw)
-                        {
-                            st.unstage_dirty_block(&digest);
-                        }
-                        st.overlay.delete(k);
-                    }
-                }
-                if !full {
-                    break;
-                }
-                let mut tail = last.tail;
-                tail.push(0);
-                start = TreeKey::new(last.ino, last.kind, tail);
-            }
-
-            // 2. Trim any extent starting strictly before `new_size` that straddles `new_size`.
-            if new_size > 0 {
-                let min_k = TreeKey::kind_start(ino, KIND_EXTENT_DATA);
-                let max_k = TreeKey::extent_data(ino, new_size - 1);
-                if let Some((ext_key, ext_raw)) = self.tree_find_le(&min_k, &max_k).await?
-                    && let Some(ext_start) = ext_key.tail_u64()
-                {
-                    match ExtentDataValue::decode(&ext_raw)? {
-                        ExtentDataValue::Inline(mut data) => {
-                            let keep = (new_size - ext_start) as usize;
-                            if keep < data.len() {
-                                data.truncate(keep);
-                                let enc = ExtentDataValue::Inline(data).encode()?;
-                                self.state.borrow_mut().overlay.put(ext_key, enc);
-                            }
-                        }
-                        ExtentDataValue::Extent {
-                            len: ext_len,
-                            digest,
-                            block_offset,
-                        } => {
-                            let ext_end = ext_start.saturating_add(u64::from(ext_len));
-                            if new_size < ext_end {
-                                // Split: keep untouched full 64 KiB blocks before the tail block,
-                                // and rewrite the single straddling 64 KiB block zero-padded past
-                                // `new_size`.
-                                let blk_size = u64::from(BLOCK_SIZE);
-                                let tail_blk_start = (new_size / blk_size) * blk_size;
-                                let block_bytes = self.read_verified_block(&digest).await?;
-
-                                // Remove old extent, preserving whether its backing block was
-                                // staged uncommitted so a refcount-1 multi-block split stays staged.
-                                let was_dirty = {
-                                    let mut st = self.state.borrow_mut();
-                                    let dirty = st.dirty_blocks.contains_key(&digest);
-                                    st.unstage_dirty_block(&digest);
-                                    st.overlay.delete(ext_key);
-                                    dirty
-                                };
-
-                                // Re-emit prefix if `tail_blk_start > ext_start`.
-                                if tail_blk_start > ext_start {
-                                    let prefix_len = (tail_blk_start - ext_start) as u32;
-                                    let prefix_val = ExtentDataValue::Extent {
-                                        len: prefix_len,
-                                        digest,
-                                        block_offset,
-                                    }
-                                    .encode()?;
-                                    let mut st = self.state.borrow_mut();
-                                    if was_dirty {
-                                        st.stage_dirty_block(digest, Rc::clone(&block_bytes));
-                                    }
-                                    st.overlay
-                                        .put(TreeKey::extent_data(ino, ext_start), prefix_val);
-                                }
-
-                                // Rewrite straddling 64 KiB block zeroed past `new_size`.
-                                let keep_in_blk = (new_size - tail_blk_start) as usize;
-                                if keep_in_blk > 0 {
-                                    let mut new_blk = vec![0u8; BLOCK_SIZE as usize];
-                                    let src_off = (block_offset as usize)
-                                        + (tail_blk_start - ext_start) as usize;
-                                    let avail = block_bytes.len().saturating_sub(src_off);
-                                    let copy_len = keep_in_blk.min(avail);
-                                    new_blk[..copy_len]
-                                        .copy_from_slice(&block_bytes[src_off..src_off + copy_len]);
-                                    let new_dig = sha256(&new_blk);
-                                    let val = ExtentDataValue::Extent {
-                                        len: BLOCK_SIZE,
-                                        digest: new_dig,
-                                        block_offset: 0,
-                                    }
-                                    .encode()?;
-                                    let mut st = self.state.borrow_mut();
-                                    st.stage_dirty_block(new_dig, Rc::new(new_blk));
-                                    st.overlay
-                                        .put(TreeKey::extent_data(ino, tail_blk_start), val);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            self.sync_arena_dirty();
-        }
-
         let mut perm = self.load_perm_node(ino, inode_item).await?;
+        self.resize_file_extents(ino, inode_item.size, new_size, now)
+            .await?;
         inode::remove_privs(by, &mut perm);
         inode_item.apply_perm_node(&perm);
         inode_item.size = new_size;
@@ -1479,8 +2163,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     }
 
     /// Promote an inline extent at offset 0 (if present) into a 64 KiB block so larger/offset
-    /// writes operate uniformly on 64 KiB aligned blocks.
-    async fn promote_inline_if_present(&self, ino: u64) -> Result<()> {
+    /// writes operate uniformly on 64 KiB aligned blocks. Caller MUST hold `op_lock`.
+    async fn promote_inline_if_present(&self, ino: u64, now: Timespec) -> Result<()> {
         let key0 = TreeKey::extent_data(ino, 0);
         let Some(raw) = self.tree_get(&key0).await? else {
             return Ok(());
@@ -1488,6 +2172,16 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         let ExtentDataValue::Inline(inline_bytes) = ExtentDataValue::decode(&raw)? else {
             return Ok(());
         };
+        if let Some(cap) = self.capacity_bytes
+            && self
+                .state
+                .borrow()
+                .allocated_bytes
+                .saturating_add(u64::from(BLOCK_SIZE))
+                > cap
+        {
+            return Err(Errno::ENOSPC);
+        }
         self.maybe_backpressure_flush(BLOCK_SIZE as usize).await?;
         let mut blk = vec![0u8; BLOCK_SIZE as usize];
         blk[..inline_bytes.len()].copy_from_slice(&inline_bytes);
@@ -1500,6 +2194,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         .encode()?;
         {
             let mut st = self.state.borrow_mut();
+            st.user_modified = true;
+            st.mark_dirty(now);
+            st.allocated_bytes = st.allocated_bytes.saturating_add(u64::from(BLOCK_SIZE));
             st.stage_dirty_block(digest, Rc::new(blk));
             st.overlay.put(key0, enc);
         }
@@ -1509,13 +2206,15 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
     /// Write `data` to regular file `ino` starting at `offset`, using `<= 2 KiB` inline storage
     /// for tiny files and `64 KiB` CoW aligned blocks with `Arena` dirty backpressure for larger
-    /// or sparse files.
+    /// or sparse files. Caller MUST hold `op_lock`.
     async fn write_file_bytes(
         &self,
         ino: u64,
         inode_item: &mut InodeItem,
         offset: u64,
         data: &[u8],
+        stripped_mode: u16,
+        now: Timespec,
     ) -> Result<usize> {
         let end = offset.saturating_add(data.len() as u64);
 
@@ -1541,7 +2240,12 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 buf[offset as usize..end as usize].copy_from_slice(data);
                 let enc = ExtentDataValue::Inline(buf).encode()?;
                 self.maybe_backpressure_flush(enc.len() + 64).await?;
-                self.state.borrow_mut().overlay.put(key0, enc);
+                {
+                    let mut st = self.state.borrow_mut();
+                    st.user_modified = true;
+                    st.mark_dirty(now);
+                    st.overlay.put(key0, enc);
+                }
                 inode_item.size = inode_item.size.max(end);
                 self.sync_arena_dirty();
                 return Ok(data.len());
@@ -1549,7 +2253,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         }
 
         // Promote any existing inline data into block 0 before 64 KiB block writes.
-        self.promote_inline_if_present(ino).await?;
+        self.promote_inline_if_present(ino, now).await?;
 
         let blk_size = u64::from(BLOCK_SIZE);
         let mut done = 0usize;
@@ -1596,21 +2300,29 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 }
             }
 
-            // Enforce Arena 8 MiB dirty slab backpressure BEFORE allocating another dirty block.
-            if self
+            // Enforce Arena 8 MiB dirty slab backpressure (or 5s dirty deadline) BEFORE allocating
+            // another dirty block. When `done > 0`, strip S_ISUID/S_ISGID and stage the consistent
+            // intermediate inode BEFORE committing so a crash never leaves setuid on modified data.
+            let bp = self
                 .arena
                 .borrow()
-                .needs_backpressure_flush(BLOCK_SIZE as usize + 256)
-            {
-                // Persist current inode size so the intermediate flush is consistent.
-                self.stage_inode(ino, inode_item);
-                if let Err(e) = self.commit_tx_group().await {
+                .needs_backpressure_flush(BLOCK_SIZE as usize + 256);
+            if bp || self.dirty_deadline_elapsed() {
+                if done > 0 {
+                    inode_item.mode = stripped_mode;
+                    inode_item.mtime = now;
+                    inode_item.ctime = now;
+                    self.stage_inode(ino, inode_item);
+                }
+                if let Err(e) = self.commit_tx_group_with_lock_mode(true).await {
                     if done > 0 && matches!(e, Errno::ENOSPC | Errno::EDQUOT) {
                         return Ok(done);
                     }
                     return Err(e);
                 }
-                self.arena.borrow_mut().record_backpressure_flush();
+                if bp {
+                    self.arena.borrow_mut().record_backpressure_flush();
+                }
             }
 
             // Build the new 64 KiB block content (copy-on-write).
@@ -1636,12 +2348,14 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 let blk_end = blk_start.saturating_add(blk_size);
                 {
                     let mut st = self.state.borrow_mut();
-                    let was_dirty = st.dirty_blocks.contains_key(&old_digest);
+                    let was_dirty = st.dirty_block_bytes(&old_digest).is_some();
                     st.unstage_dirty_block(&old_digest);
                     st.overlay.delete(old_key);
+                    let mut retained_len = blk_size;
 
                     if blk_start > ext_start {
                         let pre_len = (blk_start - ext_start) as u32;
+                        retained_len = retained_len.saturating_add(u64::from(pre_len));
                         let pre_enc = ExtentDataValue::Extent {
                             len: pre_len,
                             digest: old_digest,
@@ -1656,6 +2370,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                     }
                     if ext_end > blk_end {
                         let suf_len = (ext_end - blk_end) as u32;
+                        retained_len = retained_len.saturating_add(u64::from(suf_len));
                         let suf_off = old_blk_off + (blk_end - ext_start) as u32;
                         let suf_enc = ExtentDataValue::Extent {
                             len: suf_len,
@@ -1668,9 +2383,14 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                         }
                         st.overlay.put(TreeKey::extent_data(ino, blk_end), suf_enc);
                     }
+                    st.allocated_bytes = st
+                        .allocated_bytes
+                        .saturating_sub(u64::from(ext_len))
+                        .saturating_add(retained_len);
                 }
             } else {
-                self.state.borrow_mut().allocated_bytes += blk_size;
+                let mut st = self.state.borrow_mut();
+                st.allocated_bytes = st.allocated_bytes.saturating_add(blk_size);
             }
 
             blk[within..within + chunk].copy_from_slice(&data[done..done + chunk]);
@@ -1683,6 +2403,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             .encode()?;
             {
                 let mut st = self.state.borrow_mut();
+                st.user_modified = true;
+                st.mark_dirty(now);
                 st.stage_dirty_block(new_digest, Rc::new(blk));
                 st.overlay.put(TreeKey::extent_data(ino, blk_start), enc);
             }
@@ -1847,6 +2569,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         name: &str,
         node: PermNode,
     ) -> Result<(u64, InodeItem)> {
+        let acls = Self::encode_perm_acls(&node)?;
         self.maybe_backpressure_flush(1024).await?;
         let (ino, generation) = self.alloc_ino();
         let now = (self.clock)();
@@ -1902,6 +2625,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         {
             let mut st = self.state.borrow_mut();
             st.user_modified = true;
+            st.mark_dirty(now);
             st.overlay.put(TreeKey::inode_item(ino), item.encode());
             st.overlay
                 .put(TreeKey::inode_ref(ino, dir_ino, name), Vec::new());
@@ -1912,8 +2636,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             st.overlay
                 .put(TreeKey::inode_item(dir_ino), dir_item.encode());
         }
-        if node.acl.is_some() || node.default_acl.is_some() {
-            self.stage_perm_acls(ino, &node)?;
+        if acls.access.is_some() || acls.default.is_some() {
+            self.stage_encoded_acls(ino, acls);
         } else {
             self.sync_arena_dirty();
         }
@@ -2140,6 +2864,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         attr: &'a SetAttr,
     ) -> BoxFuture<'a, Metadata> {
         Box::pin(async move {
+            let _op = self.op_lock.lock().await;
             self.check_rw()?;
             let (ino, mut item) = self.check_handle(handle).await?;
             if *attr == SetAttr::default() {
@@ -2163,13 +2888,18 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 if size > FILE_MAX {
                     return Err(Errno::EFBIG);
                 }
+                inode::remove_privs(who, &mut perm);
             }
+            // Validate & encode ACLs BEFORE mutating overlay or resizing extents.
+            let acls = Self::encode_perm_acls(&perm)?;
             let now = (self.clock)();
-            item.apply_perm_node(&perm);
-            self.stage_perm_acls(ino, &perm)?;
             if let Some(size) = attr.size {
-                self.resize_file(ino, &mut item, size, who, now).await?;
+                self.resize_file_extents(ino, item.size, size, now).await?;
+                item.size = size;
+                item.mtime = now;
             }
+            item.apply_perm_node(&perm);
+            self.stage_encoded_acls(ino, acls);
             if let Some((sec, nsec)) = inode::time(attr.atime, (now.sec, now.nsec)) {
                 item.atime = Timespec { sec, nsec };
             }
@@ -2184,7 +2914,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
 
     fn read_dir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle) -> BoxFuture<'a, Vec<DirEntry>> {
         Box::pin(async move {
-            let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
+            let (dir_ino, dir_item) = self.check_handle(dir).await?;
             if dir_item.file_type != FileType::Dir {
                 return Err(Errno::ENOTDIR);
             }
@@ -2222,7 +2952,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 tail.push(0);
                 start = TreeKey::new(last.ino, last.kind, tail);
             }
-            self.update_atime_if_needed(dir_ino, &mut dir_item, true);
+            self.update_atime_if_needed(dir_ino, dir_item.generation, &dir_item, true)
+                .await;
             Ok(out)
         })
     }
@@ -2238,7 +2969,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         max_entries: usize,
     ) -> BoxFuture<'a, DirPage> {
         Box::pin(async move {
-            let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
+            let (dir_ino, dir_item) = self.check_handle(dir).await?;
             if dir_item.file_type != FileType::Dir {
                 return Err(Errno::ENOTDIR);
             }
@@ -2254,7 +2985,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             if max_entries == 0 {
                 let peek = self.tree_scan(&start, &end, 1).await?;
                 let next_cookie = peek.first().and_then(|(k, _)| k.tail_u64());
-                self.update_atime_if_needed(dir_ino, &mut dir_item, true);
+                self.update_atime_if_needed(dir_ino, dir_item.generation, &dir_item, true)
+                    .await;
                 return Ok(DirPage {
                     entries: Vec::new(),
                     next_cookie,
@@ -2281,7 +3013,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                     file_type: dv.file_type,
                 });
             }
-            self.update_atime_if_needed(dir_ino, &mut dir_item, true);
+            self.update_atime_if_needed(dir_ino, dir_item.generation, &dir_item, true)
+                .await;
             Ok(DirPage {
                 entries,
                 next_cookie,
@@ -2291,9 +3024,10 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
 
     fn read_link<'a>(&'a self, _cred: &'a Cred, link: &'a Handle) -> BoxFuture<'a, String> {
         Box::pin(async move {
-            let (ino, mut item) = self.check_handle(link).await?;
+            let (ino, item) = self.check_handle(link).await?;
             let target = item.symlink_target.clone().ok_or(Errno::EINVAL)?;
-            self.update_atime_if_needed(ino, &mut item, false);
+            self.update_atime_if_needed(ino, item.generation, &item, false)
+                .await;
             Ok(target)
         })
     }
@@ -2307,6 +3041,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         options: &'a OpenOptions,
     ) -> BoxFuture<'a, (Entry, OpenRef)> {
         Box::pin(async move {
+            let _op = self.op_lock.lock().await;
             self.check_rw()?;
             let access = options.access()?;
             if matches!(access, Access::Exec | Access::Path) {
@@ -2352,6 +3087,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         mode: u16,
     ) -> BoxFuture<'a, Entry> {
         Box::pin(async move {
+            let _op = self.op_lock.lock().await;
             self.check_rw()?;
             let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
             check_component(name)?;
@@ -2377,6 +3113,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         rdev: &'a str,
     ) -> BoxFuture<'a, Entry> {
         Box::pin(async move {
+            let _op = self.op_lock.lock().await;
             self.check_rw()?;
             if cred.identity.id != 0 {
                 return Err(Errno::EPERM);
@@ -2405,6 +3142,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         target: &'a str,
     ) -> BoxFuture<'a, Entry> {
         Box::pin(async move {
+            let _op = self.op_lock.lock().await;
             self.check_rw()?;
             inode::check_link_target(target)?;
             let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
@@ -2430,6 +3168,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         name: &'a str,
     ) -> BoxFuture<'a, Entry> {
         Box::pin(async move {
+            let _op = self.op_lock.lock().await;
             self.check_rw()?;
             let (target_ino, mut target_item) = self.check_handle(target).await?;
             let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
@@ -2468,6 +3207,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             {
                 let mut st = self.state.borrow_mut();
                 st.user_modified = true;
+                st.mark_dirty(now);
                 st.overlay
                     .put(TreeKey::dir_item(dir_ino, name), di.encode());
                 st.overlay
@@ -2512,6 +3252,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         flags: RenameFlags,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            let _op = self.op_lock.lock().await;
             self.check_rw()?;
             let who = &cred.identity;
             let (from_dir_ino, mut from_dir_item) = self.check_handle(from_dir).await?;
@@ -2577,6 +3318,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             if let Some((tdi, mut target_item)) = target_opt {
                 {
                     let mut st = self.state.borrow_mut();
+                    st.user_modified = true;
+                    st.mark_dirty(now);
                     st.overlay.delete(TreeKey::dir_item(to_dir_ino, to));
                     st.overlay
                         .delete(TreeKey::dir_index(to_dir_ino, tdi.dir_index));
@@ -2591,7 +3334,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 }
                 target_item.ctime = now;
                 self.stage_inode(tdi.child_ino, &target_item);
-                self.reclaim_if_dead(tdi.child_ino, &target_item).await?;
+                self.reclaim_if_dead_locked(tdi.child_ino, &target_item)
+                    .await?;
             }
 
             // Reload `from_dir_item` / `to_dir_item` cleanly if they are the same directory.
@@ -2634,6 +3378,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             {
                 let mut st = self.state.borrow_mut();
                 st.user_modified = true;
+                st.mark_dirty(now);
                 st.overlay.delete(TreeKey::dir_item(from_dir_ino, from));
                 st.overlay
                     .delete(TreeKey::dir_index(from_dir_ino, src_di.dir_index));
@@ -2698,6 +3443,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         flags: XattrFlags,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            let _op = self.op_lock.lock().await;
             self.check_rw()?;
             let space = xattr::space(name)?;
             let (ino, mut item) = self.check_handle(handle).await?;
@@ -2706,11 +3452,20 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             match space {
                 Space::Access | Space::Default => {
                     xattr::check_flags(flags.bits(), xattr::has_acl(&perm, space))?;
+                    if value.len() > xattr::VALUE_MAX * 4 {
+                        return Err(Errno::E2BIG);
+                    }
                     let entries: Entries =
                         serde_json::from_slice(value).map_err(|_| Errno::EINVAL)?;
                     xattr::set_acl(&cred.identity, &mut perm, space, entries)?;
+                    // Enforce `xattr::VALUE_MAX` BEFORE mutating `item` or `st.overlay`!
+                    let acls = Self::encode_perm_acls(&perm)?;
+                    let est = acls.access.as_ref().map_or(0, Vec::len)
+                        + acls.default.as_ref().map_or(0, Vec::len)
+                        + 128;
+                    self.maybe_backpressure_flush(est).await?;
                     item.apply_perm_node(&perm);
-                    self.stage_perm_acls(ino, &perm)?;
+                    self.stage_encoded_acls(ino, acls);
                 }
                 Space::User | Space::Trusted => {
                     let mut attrs = self.load_user_trusted_xattrs(ino).await?;
@@ -2718,10 +3473,14 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                     xattr::store(&mut attrs, name, value)?;
                     self.maybe_backpressure_flush(name.len() + value.len() + 64)
                         .await?;
-                    self.state
-                        .borrow_mut()
-                        .overlay
-                        .put(TreeKey::xattr_item(ino, name), value.to_vec());
+                    let now = (self.clock)();
+                    {
+                        let mut st = self.state.borrow_mut();
+                        st.user_modified = true;
+                        st.mark_dirty(now);
+                        st.overlay
+                            .put(TreeKey::xattr_item(ino, name), value.to_vec());
+                    }
                 }
             }
             item.ctime = (self.clock)();
@@ -2746,6 +3505,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         name: &'a str,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            let _op = self.op_lock.lock().await;
             self.check_rw()?;
             let space = xattr::space(name)?;
             let (ino, mut item) = self.check_handle(handle).await?;
@@ -2754,8 +3514,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             match space {
                 Space::Access | Space::Default => {
                     xattr::remove_acl(&mut perm, space)?;
+                    let acls = Self::encode_perm_acls(&perm)?;
                     item.apply_perm_node(&perm);
-                    self.stage_perm_acls(ino, &perm)?;
+                    self.stage_encoded_acls(ino, acls);
                 }
                 Space::User | Space::Trusted => {
                     if self
@@ -2765,10 +3526,13 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                     {
                         return Err(Errno::ENODATA);
                     }
-                    self.state
-                        .borrow_mut()
-                        .overlay
-                        .delete(TreeKey::xattr_item(ino, name));
+                    let now = (self.clock)();
+                    {
+                        let mut st = self.state.borrow_mut();
+                        st.user_modified = true;
+                        st.mark_dirty(now);
+                        st.overlay.delete(TreeKey::xattr_item(ino, name));
+                    }
                 }
             }
             item.ctime = (self.clock)();
@@ -2780,6 +3544,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
     fn statfs<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, StatFs> {
         Box::pin(async move {
             let st = self.state.borrow();
+            if st.closed {
+                return Err(Errno::EBADF);
+            }
             let blk_size = u64::from(BLOCK_SIZE);
             let total_bytes = self.capacity_bytes.unwrap_or(1024 * 1024 * 1024);
             let blocks = total_bytes.div_ceil(blk_size);
@@ -2788,7 +3555,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 block_size: blk_size,
                 blocks,
                 blocks_free: blocks.saturating_sub(used_blocks),
-                files: st.inode_count_estimate,
+                files: st.inode_count,
                 files_free: u64::MAX.saturating_sub(st.root_obj.next_ino),
                 name_max: abi::NAME_MAX as u64,
             })
@@ -2802,6 +3569,11 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         options: &'a OpenOptions,
     ) -> BoxFuture<'a, OpenRef> {
         Box::pin(async move {
+            let _op = if options.is_truncate() {
+                Some(self.op_lock.lock().await)
+            } else {
+                None
+            };
             let (ino, mut item) = self.check_handle(handle).await?;
             let access = self.openable(cred, ino, &item, options).await?;
             if access != Access::Path && options.is_truncate() && item.file_type == FileType::File {
@@ -2835,7 +3607,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             if !access.reads() {
                 return Err(Errno::EBADF);
             }
-            let mut item = self.load_inode(ino).await?.ok_or(Errno::ESTALE)?;
+            let item = self.load_inode(ino).await?.ok_or(Errno::ESTALE)?;
             if item.generation != generation {
                 return Err(Errno::ESTALE);
             }
@@ -2851,7 +3623,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             let n = self
                 .read_file_bytes(ino, item.size, offset, &mut buf[..len])
                 .await?;
-            self.update_atime_if_needed(ino, &mut item, false);
+            self.update_atime_if_needed(ino, generation, &item, false)
+                .await;
             Ok(n)
         })
     }
@@ -2863,6 +3636,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         at: WriteAt,
     ) -> BoxFuture<'a, Written> {
         Box::pin(async move {
+            let _op = self.op_lock.lock().await;
             self.check_rw()?;
             let (ino, generation, access, writer) = self.open_record_clone(open)?;
             if !access.writes() {
@@ -2889,16 +3663,24 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             }
             let room = usize::try_from(FILE_MAX - offset).unwrap_or(usize::MAX);
             let len = buf.len().min(room).min(RW_MAX);
+
+            // Compute privilege-stripped mode BEFORE `write_file_bytes` so any intermediate
+            // backpressure commit strips `S_ISUID`/`S_ISGID` before persisting modified blocks.
+            let mut perm = self.load_perm_node(ino, &item).await?;
+            inode::remove_privs(&writer, &mut perm);
+            let mut stripped_item = item.clone();
+            stripped_item.apply_perm_node(&perm);
+            let stripped_mode = stripped_item.mode;
+            let now = (self.clock)();
+
             let written = self
-                .write_file_bytes(ino, &mut item, offset, &buf[..len])
+                .write_file_bytes(ino, &mut item, offset, &buf[..len], stripped_mode, now)
                 .await?;
             if written > 0 {
-                let mut perm = self.load_perm_node(ino, &item).await?;
-                inode::remove_privs(&writer, &mut perm);
-                item.apply_perm_node(&perm);
-                let now = (self.clock)();
-                item.mtime = now;
-                item.ctime = now;
+                item.mode = stripped_mode;
+                let finish_now = (self.clock)();
+                item.mtime = finish_now;
+                item.ctime = finish_now;
                 self.stage_inode(ino, &item);
             }
             Ok(Written {
@@ -2910,6 +3692,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
 
     fn set_len<'a>(&'a self, open: &'a OpenRef, size: u64) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            let _op = self.op_lock.lock().await;
             let (ino, generation, access, writer) = self.open_record_clone(open)?;
             if access == Access::Path {
                 return Err(Errno::EBADF);
@@ -2946,6 +3729,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
     fn sync_fs<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             if self.read_only {
+                if self.state.borrow().closed {
+                    return Err(Errno::EBADF);
+                }
                 return Ok(());
             }
             self.commit_tx_group().await.map(|_| ())
@@ -2954,6 +3740,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
 
     /// Intra-volume O(extents) extent clone (`FICLONE`, contract §5, Blueprint §3.2): copies
     /// `EXTENT_DATA` B+tree references with ZERO data bytes written to `PackStore`.
+    /// Read-verifies all `src` and `dst` extents BEFORE mutating `dst`, using a single overlay
+    /// snapshot (no O(N²) overlay cloning) and arena backpressure for very large files.
     fn reflink<'a>(
         &'a self,
         _cred: &'a Cred,
@@ -2964,6 +3752,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             if src_open.fs != self.fs_id || dst_open.fs != self.fs_id {
                 return Err(Errno::EXDEV);
             }
+            let _op = self.op_lock.lock().await;
             self.check_rw()?;
             let (src_ino, src_gen, src_acc, _) = self.open_record_clone(src_open)?;
             let (dst_ino, dst_gen, dst_acc, writer) = self.open_record_clone(dst_open)?;
@@ -2985,56 +3774,56 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 return Ok(());
             }
 
-            // 1. Delete existing extents on dst_ino.
-            let mut start = TreeKey::kind_start(dst_ino, KIND_EXTENT_DATA);
-            let end = TreeKey::kind_end(dst_ino, KIND_EXTENT_DATA);
-            loop {
-                let batch = self.tree_scan(&start, &end, 256).await?;
-                if batch.is_empty() {
-                    break;
-                }
-                let last = batch.last().unwrap().0.clone();
-                let full = batch.len() == 256;
-                {
-                    let mut st = self.state.borrow_mut();
-                    for (k, raw) in batch {
-                        if let Ok(ExtentDataValue::Extent { digest, .. }) =
-                            ExtentDataValue::decode(&raw)
-                        {
-                            st.unstage_dirty_block(&digest);
-                        }
-                        st.overlay.delete(k);
-                    }
-                }
-                if !full {
-                    break;
-                }
-                let mut tail = last.tail;
-                tail.push(0);
-                start = TreeKey::new(last.ino, last.kind, tail);
-            }
+            let mut dst_perm = self.load_perm_node(dst_ino, &dst_item).await?;
+            inode::remove_privs(&writer, &mut dst_perm);
 
-            // 2. Clone EXTENT_DATA B+tree items from src_ino to dst_ino (zero pack bytes copied).
+            // Take ONE read-only `(base_root, read_overlay)` snapshot for the verification pass.
+            let (base_root, read_overlay) = {
+                let st = self.state.borrow();
+                (st.subvol_root, st.combined_read_overlay())
+            };
+            let tree = CowTree::new(&*self.head_store, &self.arena);
+
+            let mut streaming = false;
+            let mut src_extent_bytes = 0u64;
+            let mut dst_extent_bytes = 0u64;
+            let mut estimated_overlay_bytes = 0usize;
+            let mut src_entries: Vec<(TreeKey, Vec<u8>, Option<Digest>)> = Vec::new();
+            let mut dst_deletes: Vec<(TreeKey, Option<Digest>)> = Vec::new();
+
+            // 1. Read-only verification pass over ALL `src` extents BEFORE touching `dst`.
             let mut s_start = TreeKey::kind_start(src_ino, KIND_EXTENT_DATA);
             let s_end = TreeKey::kind_end(src_ino, KIND_EXTENT_DATA);
             loop {
-                let batch = self.tree_scan(&s_start, &s_end, 256).await?;
+                let batch = tree
+                    .scan_range_with_overlay(&base_root, &read_overlay, &s_start, &s_end, 256)
+                    .await?;
                 if batch.is_empty() {
                     break;
                 }
                 let last = batch.last().unwrap().0.clone();
                 let full = batch.len() == 256;
-                {
-                    let mut st = self.state.borrow_mut();
-                    for (k, raw) in batch {
-                        if let Ok(ExtentDataValue::Extent { digest, .. }) =
-                            ExtentDataValue::decode(&raw)
-                            && let Some((bytes, _)) = st.dirty_blocks.get(&digest).cloned()
-                        {
-                            st.stage_dirty_block(digest, bytes);
+                for (k, raw) in batch {
+                    let dig = match ExtentDataValue::decode(&raw)? {
+                        ExtentDataValue::Extent { len, digest, .. } => {
+                            src_extent_bytes = src_extent_bytes.saturating_add(u64::from(len));
+                            Some(digest)
                         }
-                        let dst_key = TreeKey::new(dst_ino, KIND_EXTENT_DATA, k.tail);
-                        st.overlay.put(dst_key, raw);
+                        ExtentDataValue::Inline(_) => None,
+                    };
+                    estimated_overlay_bytes =
+                        estimated_overlay_bytes.saturating_add(k.tail.len() + 11 + raw.len() + 32);
+                    if !streaming {
+                        if self
+                            .arena
+                            .borrow()
+                            .needs_backpressure_flush(estimated_overlay_bytes.saturating_mul(2))
+                        {
+                            streaming = true;
+                            src_entries.clear();
+                        } else {
+                            src_entries.push((k, raw, dig));
+                        }
                     }
                 }
                 if !full {
@@ -3045,15 +3834,189 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 s_start = TreeKey::new(last.ino, last.kind, tail);
             }
 
-            let mut perm = self.load_perm_node(dst_ino, &dst_item).await?;
-            inode::remove_privs(&writer, &mut perm);
-            dst_item.apply_perm_node(&perm);
-            dst_item.size = src_item.size;
+            // 2. Read-only verification pass over ALL `dst` extents BEFORE touching `dst`.
+            let mut d_start = TreeKey::kind_start(dst_ino, KIND_EXTENT_DATA);
+            let d_end = TreeKey::kind_end(dst_ino, KIND_EXTENT_DATA);
+            loop {
+                let batch = tree
+                    .scan_range_with_overlay(&base_root, &read_overlay, &d_start, &d_end, 256)
+                    .await?;
+                if batch.is_empty() {
+                    break;
+                }
+                let last = batch.last().unwrap().0.clone();
+                let full = batch.len() == 256;
+                for (k, raw) in batch {
+                    let dig = match ExtentDataValue::decode(&raw)? {
+                        ExtentDataValue::Extent { len, digest, .. } => {
+                            dst_extent_bytes = dst_extent_bytes.saturating_add(u64::from(len));
+                            Some(digest)
+                        }
+                        ExtentDataValue::Inline(_) => None,
+                    };
+                    estimated_overlay_bytes =
+                        estimated_overlay_bytes.saturating_add(k.tail.len() + 11 + 32);
+                    if !streaming {
+                        if self
+                            .arena
+                            .borrow()
+                            .needs_backpressure_flush(estimated_overlay_bytes.saturating_mul(2))
+                        {
+                            streaming = true;
+                            src_entries.clear();
+                            dst_deletes.clear();
+                        } else {
+                            dst_deletes.push((k, dig));
+                        }
+                    }
+                }
+                if !full {
+                    break;
+                }
+                let mut tail = last.tail;
+                tail.push(0);
+                d_start = TreeKey::new(last.ino, last.kind, tail);
+            }
+            drop(read_overlay);
+
+            if let Some(cap) = self.capacity_bytes {
+                let cur = self.state.borrow().allocated_bytes;
+                let projected = cur
+                    .saturating_sub(dst_extent_bytes)
+                    .saturating_add(src_extent_bytes);
+                if projected > cap {
+                    return Err(Errno::ENOSPC);
+                }
+            }
+
             let now = (self.clock)();
-            dst_item.mtime = now;
-            dst_item.ctime = now;
+            if !streaming {
+                // Fast atomic path: flush pre-existing dirty state if needed, then apply all
+                // `dst` deletes + `src` clones + `dst_item` in one synchronous block.
+                self.maybe_backpressure_flush(estimated_overlay_bytes.saturating_add(512))
+                    .await?;
+                dst_item.apply_perm_node(&dst_perm);
+                dst_item.size = src_item.size;
+                dst_item.mtime = now;
+                dst_item.ctime = now;
+                {
+                    let mut st = self.state.borrow_mut();
+                    st.user_modified = true;
+                    st.mark_dirty(now);
+                    for (k, dig) in dst_deletes {
+                        if let Some(d) = dig {
+                            st.unstage_dirty_block(&d);
+                        }
+                        st.overlay.delete(k);
+                    }
+                    for (k, raw, dig) in src_entries {
+                        if let Some(d) = dig
+                            && let Some(bytes) = st.dirty_block_bytes(&d)
+                        {
+                            st.stage_dirty_block(d, bytes);
+                        }
+                        let dst_key = TreeKey::new(dst_ino, KIND_EXTENT_DATA, k.tail);
+                        st.overlay.put(dst_key, raw);
+                    }
+                    st.allocated_bytes = st
+                        .allocated_bytes
+                        .saturating_sub(dst_extent_bytes)
+                        .saturating_add(src_extent_bytes);
+                    st.overlay
+                        .put(TreeKey::inode_item(dst_ino), dst_item.encode());
+                }
+                self.sync_arena_dirty();
+                return Ok(());
+            }
+
+            // Streaming path for huge files whose extent metadata exceeds half the dirty slab
+            // budget: commit any pre-existing dirty state so both `src` and `dst` live cleanly
+            // in `st.subvol_root` (zero overlay cloning!), then stream deletes & clones with
+            // arena backpressure flushes.
+            self.commit_tx_group_with_lock_mode(true).await?;
+
+            // Delete existing `dst` extents in bounded batches directly from committed root.
+            let mut cur_root = self.state.borrow().subvol_root;
+            let mut d_start = TreeKey::kind_start(dst_ino, KIND_EXTENT_DATA);
+            loop {
+                let batch = tree.scan_range(&cur_root, &d_start, &d_end, 256).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                let last = batch.last().unwrap().0.clone();
+                let full = batch.len() == 256;
+                let batch_bytes: usize = batch.iter().map(|(k, _)| k.tail.len() + 11 + 32).sum();
+                self.maybe_backpressure_flush(batch_bytes).await?;
+                {
+                    let mut st = self.state.borrow_mut();
+                    st.user_modified = true;
+                    st.mark_dirty(now);
+                    for (k, raw) in batch {
+                        if let Ok(ExtentDataValue::Extent { len, digest, .. }) =
+                            ExtentDataValue::decode(&raw)
+                        {
+                            st.unstage_dirty_block(&digest);
+                            st.allocated_bytes = st.allocated_bytes.saturating_sub(u64::from(len));
+                        }
+                        st.overlay.delete(k);
+                    }
+                }
+                self.sync_arena_dirty();
+                if !full {
+                    break;
+                }
+                let mut tail = last.tail;
+                tail.push(0);
+                d_start = TreeKey::new(last.ino, last.kind, tail);
+                cur_root = self.state.borrow().subvol_root;
+            }
+
+            // Clone `src` extents in bounded batches directly from `st.subvol_root` (`src_ino` is
+            // untouched, so every committed `cur_root` contains identical `src` extents).
+            cur_root = self.state.borrow().subvol_root;
+            let mut s_start = TreeKey::kind_start(src_ino, KIND_EXTENT_DATA);
+            loop {
+                let batch = tree.scan_range(&cur_root, &s_start, &s_end, 256).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                let last = batch.last().unwrap().0.clone();
+                let full = batch.len() == 256;
+                let batch_bytes: usize = batch
+                    .iter()
+                    .map(|(k, v)| k.tail.len() + 11 + v.len() + 32)
+                    .sum();
+                self.maybe_backpressure_flush(batch_bytes).await?;
+                {
+                    let mut st = self.state.borrow_mut();
+                    st.user_modified = true;
+                    st.mark_dirty(now);
+                    for (k, raw) in batch {
+                        if let Ok(ExtentDataValue::Extent { len, .. }) =
+                            ExtentDataValue::decode(&raw)
+                        {
+                            st.allocated_bytes = st.allocated_bytes.saturating_add(u64::from(len));
+                        }
+                        let dst_key = TreeKey::new(dst_ino, KIND_EXTENT_DATA, k.tail);
+                        st.overlay.put(dst_key, raw);
+                    }
+                }
+                self.sync_arena_dirty();
+                if !full {
+                    break;
+                }
+                let mut tail = last.tail;
+                tail.push(0);
+                s_start = TreeKey::new(last.ino, last.kind, tail);
+                cur_root = self.state.borrow().subvol_root;
+            }
+
+            dst_item.apply_perm_node(&dst_perm);
+            dst_item.size = src_item.size;
+            let finish_now = (self.clock)();
+            dst_item.mtime = finish_now;
+            dst_item.ctime = finish_now;
             self.stage_inode(dst_ino, &dst_item);
-            self.sync_arena_dirty();
             Ok(())
         })
     }
@@ -3129,24 +4092,42 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
 
     fn release<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let (ino, _, _, _) = self.open_record_clone(open)?;
-            {
+            let _op = if !self.read_only {
+                Some(self.op_lock.lock().await)
+            } else {
+                None
+            };
+            if open.fs != self.fs_id {
+                return Err(Errno::EBADF);
+            }
+            let (ino, should_reclaim) = {
                 let mut st = self.state.borrow_mut();
+                let rec = st.opens.get(&open.id).ok_or(Errno::EBADF)?;
+                if rec.ino != open.node.ino || rec.generation != open.node.generation {
+                    return Err(Errno::EBADF);
+                }
+                let ino = rec.ino;
                 st.opens.remove(&open.id);
                 if let Some(locks) = st.locks.get_mut(&ino) {
                     locks.retain(|l| l.owner != open.id);
                 }
+                let mut remaining = 0u32;
                 if let Some(cnt) = st.open_counts.get_mut(&ino) {
                     *cnt = cnt.saturating_sub(1);
+                    remaining = *cnt;
                     if *cnt == 0 {
                         st.open_counts.remove(&ino);
                     }
                 }
-            }
-            if !self.read_only
-                && let Some(item) = self.load_inode(ino).await?
-            {
-                self.reclaim_if_dead(ino, &item).await?;
+                let can_reclaim = !self.read_only
+                    && !st.closed
+                    && !st.fenced
+                    && st.lease.is_some()
+                    && remaining == 0;
+                (ino, can_reclaim)
+            };
+            if should_reclaim && let Some(item) = self.load_inode(ino).await? {
+                self.reclaim_if_dead_locked(ino, &item).await?;
             }
             self.wake_lock_waiters(ino);
             Ok(())
@@ -3163,6 +4144,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         directory: bool,
         expected: Option<NodeId>,
     ) -> Result<()> {
+        let _op = self.op_lock.lock().await;
         self.check_rw()?;
         let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
         check_component(name)?;
@@ -3203,6 +4185,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         {
             let mut st = self.state.borrow_mut();
             st.user_modified = true;
+            st.mark_dirty(now);
             st.overlay.delete(TreeKey::dir_item(dir_ino, name));
             st.overlay.delete(TreeKey::dir_index(dir_ino, di.dir_index));
             st.overlay
@@ -3213,7 +4196,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 .put(TreeKey::inode_item(di.child_ino), victim.encode());
         }
         self.sync_arena_dirty();
-        self.reclaim_if_dead(di.child_ino, &victim).await?;
+        self.reclaim_if_dead_locked(di.child_ino, &victim).await?;
         Ok(())
     }
 }

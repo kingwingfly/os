@@ -320,12 +320,14 @@ impl VblkRegistry {
             let (_, dev) = self.find_by_volume(vol_id).ok_or(Errno::ENODEV)?;
             return dev.mkfs(force).await;
         }
-        // Reject explicit non-block tree prefixes (hostfs:, opfs:, helperfs:, sharefs:, cloud:).
-        if target.contains(':') && !target.starts_with('/') {
+        // Reject explicit non-block tree prefixes (hostfs:, opfs:, helperfs:, sharefs:, cloud:)
+        // and trailing slashes (never valid for a block device target).
+        if (target.contains(':') && !target.starts_with('/')) || target.ends_with('/') {
             return Err(Errno::ENOTBLK);
         }
-        // Resolve path inside `pid`'s namespace & chroot.
-        let stat = match vfs.statat(pid, StartAnchor::AtFdCwd, target, true).await {
+        // Resolve path inside `pid`'s namespace & chroot WITHOUT following a final symlink:
+        // contract §2.7 / §4 mandates `ENOTBLK` for symlink targets.
+        let stat = match vfs.statat(pid, StartAnchor::AtFdCwd, target, false).await {
             Ok(s) => s,
             Err(Errno::ENOENT) => {
                 // Non-existent path: if it doesn't name a /dev/vdN block device, refuse ENOTBLK.
@@ -336,7 +338,7 @@ impl VblkRegistry {
             }
             Err(e) => return Err(e),
         };
-        if !stat.is_device() {
+        if (stat.mode & abi::S_IFMT) == abi::S_IFLNK || !stat.is_device() {
             return Err(Errno::ENOTBLK);
         }
         let Some(rdev) = stat.rdev.as_deref() else {

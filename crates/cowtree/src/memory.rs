@@ -7,16 +7,23 @@
 use crate::pack::decode_pack_trailer;
 use crate::store::{
     BlockLoc, CommitRequest, Digest, ForkRequest, GcLockGuard, GcRoot, HeadStore, PackId, PackMeta,
-    PackStore, PackTrailer, SnapshotRecord, VolumeHead, VolumeId, WriterLease, WriterLockGuard,
-    WriterMode,
+    PackStore, PackTrailer, RoPinGuard, SnapshotRecord, VolumeHead, VolumeId, WriterLease,
+    WriterLockGuard, WriterMode,
 };
-use crate::{COWFS_FORMAT_VERSION, PACK_MAX_BYTES};
+use crate::{COWFS_FORMAT_VERSION, PACK_MAX_BYTES, digest_to_hex, sha256};
 use abi::Errno;
 use abi::fs::Timespec;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::future::poll_fn;
 use std::rc::Rc;
+use std::task::{Poll, Waker};
 use vfs::BoxFuture;
+
+fn ts_expired(created_at: Timespec, now: Timespec, grace_window_secs: u64) -> bool {
+    let exp_sec = created_at.sec.saturating_add(grace_window_secs);
+    exp_sec < now.sec || (exp_sec == now.sec && created_at.nsec <= now.nsec)
+}
 
 struct MemWriterGuard {
     state: Rc<RefCell<HeadState>>,
@@ -44,17 +51,44 @@ impl GcLockGuard for MemGcGuard {}
 
 impl Drop for MemGcGuard {
     fn drop(&mut self) {
-        let mut st = self.state.borrow_mut();
-        if self.exclusive {
-            st.gc_exclusive = false;
-        } else {
-            st.gc_shared = st.gc_shared.saturating_sub(1);
+        let wakers = {
+            let mut st = self.state.borrow_mut();
+            if self.exclusive {
+                st.gc_exclusive = false;
+                std::mem::take(&mut st.gc_waiters)
+            } else {
+                st.gc_shared = st.gc_shared.saturating_sub(1);
+                Vec::new()
+            }
+        };
+        for w in wakers {
+            w.wake();
         }
+    }
+}
+
+struct MemRoPinGuard {
+    state: Rc<RefCell<HeadState>>,
+    pin_id: u64,
+}
+
+impl RoPinGuard for MemRoPinGuard {}
+
+impl Drop for MemRoPinGuard {
+    fn drop(&mut self) {
+        self.state.borrow_mut().ro_pins.remove(&self.pin_id);
     }
 }
 
 struct NodeRecord {
     bytes: Vec<u8>,
+    created_at: Timespec,
+}
+
+struct ReceiptRecord {
+    volume: VolumeId,
+    root: Digest,
+    head: VolumeHead,
     created_at: Timespec,
 }
 
@@ -65,14 +99,18 @@ struct HeadState {
     packs: HashMap<PackId, PackMeta>,
     blocks: HashMap<Digest, BlockLoc>,
     snapshots: HashMap<(VolumeId, String), SnapshotRecord>,
-    receipts: HashMap<[u8; 16], (Digest, VolumeHead)>,
+    receipts: HashMap<[u8; 16], ReceiptRecord>,
     grace_pins: Vec<GcRoot>,
+    ro_pins: HashMap<u64, (VolumeId, Digest)>,
+    next_ro_pin: u64,
     active_locks: HashMap<VolumeId, u64>,
     next_lock_token: u64,
     next_fork_seq: u64,
     gc_shared: usize,
     gc_exclusive: bool,
+    gc_waiters: Vec<Waker>,
     fail_next_commit: Option<Errno>,
+    fail_after_next_commit: Option<Errno>,
     grace_window_secs: u64,
 }
 
@@ -87,12 +125,16 @@ impl Default for HeadState {
             snapshots: HashMap::new(),
             receipts: HashMap::new(),
             grace_pins: Vec::new(),
+            ro_pins: HashMap::new(),
+            next_ro_pin: 1,
             active_locks: HashMap::new(),
             next_lock_token: 1,
             next_fork_seq: 1,
             gc_shared: 0,
             gc_exclusive: false,
+            gc_waiters: Vec::new(),
             fail_next_commit: None,
+            fail_after_next_commit: None,
             grace_window_secs: 600,
         }
     }
@@ -118,9 +160,15 @@ impl MemoryHeadStore {
         self.state.borrow_mut().grace_window_secs = secs;
     }
 
-    /// Inject a one-shot error on the next `commit_head` call (e.g. `ENOSPC` or `EIO` crash).
+    /// Inject a one-shot error on the next `commit_head` call BEFORE applying (e.g. `ENOSPC` or `EIO`).
     pub fn fail_next_commit(&self, err: Errno) {
         self.state.borrow_mut().fail_next_commit = Some(err);
+    }
+
+    /// Inject a one-shot ambiguous error AFTER applying the next `commit_head` (simulating a lost
+    /// commit acknowledgement where the head advanced and the receipt was recorded).
+    pub fn fail_after_next_commit(&self, err: Errno) {
+        self.state.borrow_mut().fail_after_next_commit = Some(err);
     }
 
     /// Bit-flip one byte in a stored B+tree node to test fail-closed SHA-256 verification.
@@ -133,6 +181,11 @@ impl MemoryHeadStore {
             return true;
         }
         false
+    }
+
+    /// Drop a single block index entry (for testing GC abort on unresolved live references).
+    pub fn remove_block_index(&self, digest: &Digest) -> Option<BlockLoc> {
+        self.state.borrow_mut().blocks.remove(digest)
     }
 
     pub fn node_count(&self) -> usize {
@@ -152,6 +205,10 @@ impl MemoryHeadStore {
 impl HeadStore for MemoryHeadStore {
     fn format_version(&self) -> BoxFuture<'_, Option<u32>> {
         Box::pin(async move { Ok(self.state.borrow().format_version) })
+    }
+
+    fn grace_window_secs(&self) -> u64 {
+        self.state.borrow().grace_window_secs
     }
 
     fn create_volume<'a>(
@@ -193,12 +250,68 @@ impl HeadStore for MemoryHeadStore {
         })
     }
 
+    fn pin_ro_root<'a>(
+        &'a self,
+        volume: &'a VolumeId,
+        snapshot: Option<&'a str>,
+    ) -> BoxFuture<'a, (VolumeHead, Box<dyn RoPinGuard>)> {
+        Box::pin(async move {
+            let _gc = self.acquire_gc_lock(false).await?;
+            let mut st = self.state.borrow_mut();
+            if let Some(v) = st.format_version
+                && v != COWFS_FORMAT_VERSION
+            {
+                return Err(Errno::EPROTONOSUPPORT);
+            }
+            let mut head = st.heads.get(volume).cloned().ok_or(Errno::ENOENT)?;
+            if head.format_version != COWFS_FORMAT_VERSION {
+                return Err(Errno::EPROTONOSUPPORT);
+            }
+            if let Some(snap_name) = snapshot {
+                let snap = st
+                    .snapshots
+                    .get(&(volume.clone(), snap_name.to_string()))
+                    .cloned()
+                    .ok_or(Errno::ENOENT)?;
+                head.root = snap.root;
+                head.epoch = snap.epoch;
+                head.updated_at = snap.created_at;
+            }
+            if !st.nodes.contains_key(&head.root) {
+                return Err(Errno::ENOENT);
+            }
+            let pin_id = st.next_ro_pin;
+            st.next_ro_pin += 1;
+            st.ro_pins.insert(pin_id, (volume.clone(), head.root));
+            Ok((
+                head,
+                Box::new(MemRoPinGuard {
+                    state: Rc::clone(&self.state),
+                    pin_id,
+                }) as Box<dyn RoPinGuard>,
+            ))
+        })
+    }
+
+    fn unpin_ro_root<'a>(&'a self, pin: Box<dyn RoPinGuard>) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            drop(pin);
+            Ok(())
+        })
+    }
+
     fn acquire_writer<'a>(
         &'a self,
         volume: &'a VolumeId,
         mode: WriterMode,
     ) -> BoxFuture<'a, WriterLease> {
         Box::pin(async move {
+            let needs_gc = matches!(mode, WriterMode::ForkOnBusy);
+            let _gc = if needs_gc {
+                Some(self.acquire_gc_lock(false).await?)
+            } else {
+                None
+            };
             let mut st = self.state.borrow_mut();
             if let Some(v) = st.format_version
                 && v != COWFS_FORMAT_VERSION
@@ -213,9 +326,19 @@ impl HeadStore for MemoryHeadStore {
             match (held, mode) {
                 (true, WriterMode::Exclusive) => Err(Errno::EBUSY),
                 (true, WriterMode::ForkOnBusy) => {
-                    let seq = st.next_fork_seq;
-                    st.next_fork_seq += 1;
-                    let fork_vol = VolumeId(format!("{}-fork-{seq}", volume.0));
+                    if !st.nodes.contains_key(&existing.root) {
+                        return Err(Errno::ENOENT);
+                    }
+                    let fork_vol = loop {
+                        let seq = st.next_fork_seq;
+                        st.next_fork_seq += 1;
+                        let candidate = VolumeId(format!("{}-fork-{seq}", volume.0));
+                        if !st.heads.contains_key(&candidate)
+                            && !st.active_locks.contains_key(&candidate)
+                        {
+                            break candidate;
+                        }
+                    };
                     let fork_head = VolumeHead {
                         format_version: COWFS_FORMAT_VERSION,
                         volume: fork_vol.clone(),
@@ -331,11 +454,11 @@ impl HeadStore for MemoryHeadStore {
             if let Some(err) = st.fail_next_commit.take() {
                 return Err(err);
             }
-            if let Some((rec_root, rec_head)) = st.receipts.get(&req.op_id) {
-                if *rec_root != req.new_root {
+            if let Some(rec) = st.receipts.get(&req.op_id) {
+                if rec.root != req.new_root {
                     return Err(Errno::EINVAL);
                 }
-                return Ok(rec_head.clone());
+                return Ok(rec.head.clone());
             }
             let cur = st.heads.get(&req.volume).cloned().ok_or(Errno::ENOENT)?;
             if cur.incarnation != req.expected_incarnation
@@ -383,8 +506,18 @@ impl HeadStore for MemoryHeadStore {
                 updated_at: req.committed_at,
             };
             st.heads.insert(req.volume.clone(), next_head.clone());
-            st.receipts
-                .insert(req.op_id, (req.new_root, next_head.clone()));
+            st.receipts.insert(
+                req.op_id,
+                ReceiptRecord {
+                    volume: req.volume.clone(),
+                    root: req.new_root,
+                    head: next_head.clone(),
+                    created_at: req.committed_at,
+                },
+            );
+            if let Some(err) = st.fail_after_next_commit.take() {
+                return Err(err);
+            }
             Ok(next_head)
         })
     }
@@ -491,28 +624,117 @@ impl HeadStore for MemoryHeadStore {
                 return Err(Errno::EBUSY);
             }
             st.heads.remove(volume).ok_or(Errno::ENOENT)?;
+            st.snapshots.retain(|(v, _), _| v != volume);
+            st.receipts.retain(|_, r| &r.volume != volume);
             Ok(())
+        })
+    }
+
+    fn delete_volume_with_lease<'a>(
+        &'a self,
+        lease: WriterLease,
+        only_if_unmodified_ephemeral: bool,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let res = {
+                let mut st = self.state.borrow_mut();
+                let cur = st.heads.get(&lease.volume).cloned().ok_or(Errno::ENOENT)?;
+                if cur.incarnation != lease.incarnation
+                    || cur.fence != lease.fence
+                    || cur.epoch != lease.epoch
+                {
+                    Err(Errno::ESTALE)
+                } else if only_if_unmodified_ephemeral
+                    && (!cur.ephemeral_if_unmodified || cur.modified)
+                {
+                    Ok(false)
+                } else {
+                    st.heads.remove(&lease.volume);
+                    st.snapshots.retain(|(v, _), _| v != &lease.volume);
+                    st.receipts.retain(|_, r| r.volume != lease.volume);
+                    Ok(true)
+                }
+            };
+            drop(lease);
+            res
+        })
+    }
+
+    fn reformat_volume_with_lease<'a>(
+        &'a self,
+        lease: WriterLease,
+        new_head: &'a VolumeHead,
+        initial_nodes: &'a [(Digest, Vec<u8>)],
+    ) -> BoxFuture<'a, VolumeHead> {
+        Box::pin(async move {
+            let res = {
+                let mut st = self.state.borrow_mut();
+                if let Some(v) = st.format_version
+                    && v != COWFS_FORMAT_VERSION
+                {
+                    Err(Errno::EPROTONOSUPPORT)
+                } else {
+                    let cur = st.heads.get(&lease.volume).cloned().ok_or(Errno::ENOENT)?;
+                    if cur.incarnation != lease.incarnation
+                        || cur.fence != lease.fence
+                        || cur.epoch != lease.epoch
+                    {
+                        Err(Errno::ESTALE)
+                    } else {
+                        st.snapshots.retain(|(v, _), _| v != &lease.volume);
+                        st.receipts.retain(|_, r| r.volume != lease.volume);
+                        for (digest, bytes) in initial_nodes {
+                            st.nodes.entry(*digest).or_insert_with(|| NodeRecord {
+                                bytes: bytes.clone(),
+                                created_at: new_head.updated_at,
+                            });
+                        }
+                        let mut replaced = new_head.clone();
+                        replaced.volume = lease.volume.clone();
+                        replaced.incarnation = cur.incarnation.saturating_add(1);
+                        replaced.fence = 1;
+                        replaced.epoch = 0;
+                        replaced.modified = false;
+                        replaced.ephemeral_if_unmodified = false;
+                        replaced.parent_volume = None;
+                        st.heads.insert(lease.volume.clone(), replaced.clone());
+                        Ok(replaced)
+                    }
+                }
+            };
+            drop(lease);
+            res
         })
     }
 
     fn acquire_gc_lock(&self, exclusive: bool) -> BoxFuture<'_, Box<dyn GcLockGuard>> {
         Box::pin(async move {
-            let mut st = self.state.borrow_mut();
             if exclusive {
+                let mut st = self.state.borrow_mut();
                 if st.gc_exclusive || st.gc_shared > 0 {
                     return Err(Errno::EBUSY);
                 }
                 st.gc_exclusive = true;
-            } else {
-                if st.gc_exclusive {
-                    return Err(Errno::EBUSY);
-                }
-                st.gc_shared += 1;
+                return Ok(Box::new(MemGcGuard {
+                    state: Rc::clone(&self.state),
+                    exclusive: true,
+                }) as Box<dyn GcLockGuard>);
             }
-            Ok(Box::new(MemGcGuard {
-                state: Rc::clone(&self.state),
-                exclusive,
-            }) as Box<dyn GcLockGuard>)
+            // Shared writer GC lock waits cleanly while exclusive GC sweep finishes.
+            poll_fn(|cx| {
+                let mut st = self.state.borrow_mut();
+                if st.gc_exclusive {
+                    st.gc_waiters.push(cx.waker().clone());
+                    Poll::Pending
+                } else {
+                    st.gc_shared += 1;
+                    Poll::Ready(Ok(Box::new(MemGcGuard {
+                        state: Rc::clone(&self.state),
+                        exclusive: false,
+                    }) as Box<dyn GcLockGuard>))
+                }
+            })
+            .await
         })
     }
 
@@ -534,8 +756,53 @@ impl HeadStore for MemoryHeadStore {
                     pinned_until: None,
                 });
             }
+            for (vol, root) in st.ro_pins.values() {
+                out.push(GcRoot {
+                    volume: vol.clone(),
+                    root: *root,
+                    pinned_until: None,
+                });
+            }
             out.extend(st.grace_pins.iter().cloned());
             Ok(out)
+        })
+    }
+
+    fn list_indexed_packs(&self) -> BoxFuture<'_, HashSet<PackId>> {
+        Box::pin(async move {
+            let st = self.state.borrow();
+            let mut out: HashSet<PackId> = st.packs.keys().cloned().collect();
+            for loc in st.blocks.values() {
+                out.insert(loc.pack_id.clone());
+            }
+            Ok(out)
+        })
+    }
+
+    fn prune_abandoned_ephemeral_forks(
+        &self,
+        now: Timespec,
+        grace_window_secs: u64,
+    ) -> BoxFuture<'_, usize> {
+        Box::pin(async move {
+            let mut st = self.state.borrow_mut();
+            let dead: Vec<VolumeId> = st
+                .heads
+                .iter()
+                .filter(|(vol, head)| {
+                    head.ephemeral_if_unmodified
+                        && !head.modified
+                        && !st.active_locks.contains_key(*vol)
+                        && ts_expired(head.updated_at, now, grace_window_secs)
+                })
+                .map(|(vol, _)| vol.clone())
+                .collect();
+            for vol in &dead {
+                st.heads.remove(vol);
+                st.snapshots.retain(|(v, _), _| v != vol);
+                st.receipts.retain(|_, r| &r.volume != vol);
+            }
+            Ok(dead.len())
         })
     }
 
@@ -543,19 +810,23 @@ impl HeadStore for MemoryHeadStore {
         &'a self,
         keep_nodes: &'a HashSet<Digest>,
         keep_packs: &'a HashSet<PackId>,
-        grace_before: Timespec,
+        now: Timespec,
+        grace_window_secs: u64,
     ) -> BoxFuture<'a, Vec<PackId>> {
         Box::pin(async move {
             let mut st = self.state.borrow_mut();
-            // Prune expired grace pins first.
+            // Expire grace pins when `pinned_until <= now`.
             st.grace_pins
-                .retain(|pin| pin.pinned_until.is_none_or(|until| until > grace_before));
-            st.nodes
-                .retain(|d, rec| keep_nodes.contains(d) || rec.created_at > grace_before);
+                .retain(|pin| pin.pinned_until.is_none_or(|until| until > now));
+            // Sweep unreachable nodes whose `created_at + grace_window_secs <= now`.
+            st.nodes.retain(|d, rec| {
+                keep_nodes.contains(d) || !ts_expired(rec.created_at, now, grace_window_secs)
+            });
             let mut swept = Vec::new();
             let mut kept_pack_ids = HashSet::new();
             for (pid, meta) in &st.packs {
-                if keep_packs.contains(pid) || meta.created_at > grace_before {
+                if keep_packs.contains(pid) || !ts_expired(meta.created_at, now, grace_window_secs)
+                {
                     kept_pack_ids.insert(pid.clone());
                 } else {
                     swept.push(pid.clone());
@@ -564,6 +835,12 @@ impl HeadStore for MemoryHeadStore {
             st.packs.retain(|pid, _| kept_pack_ids.contains(pid));
             st.blocks
                 .retain(|_, loc| kept_pack_ids.contains(&loc.pack_id));
+            let live_epochs: HashMap<VolumeId, u64> =
+                st.heads.iter().map(|(v, h)| (v.clone(), h.epoch)).collect();
+            st.receipts.retain(|_, rec| {
+                live_epochs.get(&rec.volume) == Some(&rec.head.epoch)
+                    || !ts_expired(rec.created_at, now, grace_window_secs)
+            });
             Ok(swept)
         })
     }
@@ -644,11 +921,8 @@ impl PackStore for MemoryPackStore {
             if let Some(err) = st.fail_next_write.take() {
                 return Err(err);
             }
-            if let Some(quota) = st.quota_bytes {
-                let current: u64 = st.packs.values().map(|p| p.len() as u64).sum();
-                if !st.packs.contains_key(pack_id) && current + bytes.len() as u64 > quota {
-                    return Err(Errno::ENOSPC);
-                }
+            if digest_to_hex(&sha256(bytes)) != pack_id.0 {
+                return Err(Errno::EINVAL);
             }
             let trailer = decode_pack_trailer(bytes)?;
             let meta = PackMeta {
@@ -657,7 +931,21 @@ impl PackStore for MemoryPackStore {
                 entry_count: trailer.entries.len() as u32,
                 created_at: Timespec { sec: 0, nsec: 0 },
             };
-            if !st.packs.contains_key(pack_id) {
+            let existing_valid = st.packs.get(pack_id).is_some_and(|existing| {
+                existing.len() == bytes.len() && digest_to_hex(&sha256(existing)) == pack_id.0
+            });
+            if !existing_valid {
+                if let Some(quota) = st.quota_bytes {
+                    let current: u64 = st
+                        .packs
+                        .iter()
+                        .filter(|(k, _)| *k != pack_id)
+                        .map(|(_, p)| p.len() as u64)
+                        .sum();
+                    if current + bytes.len() as u64 > quota {
+                        return Err(Errno::ENOSPC);
+                    }
+                }
                 st.packs.insert(pack_id.clone(), bytes.to_vec());
                 st.bytes_written += bytes.len() as u64;
                 st.pack_writes += 1;

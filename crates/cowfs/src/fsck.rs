@@ -91,7 +91,7 @@ pub async fn verify_volume<H: HeadStore, P: PackStore>(
     };
 
     let mut verified_nodes: HashSet<Digest> = HashSet::new();
-    let mut verified_blocks: HashSet<Digest> = HashSet::new();
+    let mut verified_blocks: HashMap<Digest, Option<u32>> = HashMap::new();
     let mut verified_packs: HashSet<PackId> = HashSet::new();
 
     for (subvol_name, subvol_root) in &root_obj.subvols {
@@ -134,7 +134,7 @@ async fn verify_subvol<H: HeadStore, P: PackStore>(
     subvol_name: &str,
     root_digest: Digest,
     verified_nodes: &mut HashSet<Digest>,
-    verified_blocks: &mut HashSet<Digest>,
+    verified_blocks: &mut HashMap<Digest, Option<u32>>,
     verified_packs: &mut HashSet<PackId>,
     report: &mut FsckReport,
 ) {
@@ -142,11 +142,11 @@ async fn verify_subvol<H: HeadStore, P: PackStore>(
     let mut dir_items: Vec<(u64, String, DirItemValue)> = Vec::new();
     let mut dir_indices: HashMap<(u64, u64), DirIndexValue> = HashMap::new();
 
-    // Stack of (digest, lower_bound_inclusive, upper_bound_exclusive).
-    let mut stack: Vec<(Digest, Option<TreeKey>, Option<TreeKey>)> =
-        vec![(root_digest, None, None)];
+    type WalkFrame = (Digest, Option<u8>, Option<TreeKey>, Option<TreeKey>);
+    // Stack of (digest, expected_level, lower_bound_inclusive, upper_bound_exclusive).
+    let mut stack: Vec<WalkFrame> = vec![(root_digest, None, None, None)];
 
-    while let Some((digest, lo, hi)) = stack.pop() {
+    while let Some((digest, expected_level, lo, hi)) = stack.pop() {
         let raw = match head_store.get_node(&digest).await {
             Ok(b) => b,
             Err(e) => {
@@ -165,11 +165,25 @@ async fn verify_subvol<H: HeadStore, P: PackStore>(
                 continue;
             }
         };
+        if let Some(exp) = expected_level
+            && node.level() != exp
+        {
+            report.errors.push(format!(
+                "subvol {subvol_name}: B+tree level mismatch: expected {exp}, got {}",
+                node.level()
+            ));
+        }
         if verified_nodes.insert(digest) {
             report.nodes_verified += 1;
         }
         match node {
-            Node::Internal { entries, .. } => {
+            Node::Internal { level, entries } => {
+                if entries.len() < 2 {
+                    report.errors.push(format!(
+                        "subvol {subvol_name}: uncollapsed single-child internal node at level {level}"
+                    ));
+                }
+                let child_expected_level = level.checked_sub(1);
                 for (idx, entry) in entries.iter().enumerate() {
                     if let Some(ref l) = lo
                         && entry.key < *l
@@ -190,7 +204,7 @@ async fn verify_subvol<H: HeadStore, P: PackStore>(
                         .get(idx + 1)
                         .map(|next| next.key.clone())
                         .or_else(|| hi.clone());
-                    stack.push((entry.child, child_lo, child_hi));
+                    stack.push((entry.child, child_expected_level, child_lo, child_hi));
                 }
             }
             Node::Leaf { entries } => {
@@ -245,9 +259,16 @@ async fn verify_subvol<H: HeadStore, P: PackStore>(
                             Ok(ExtentDataValue::Inline(_)) => {
                                 report.extents_verified += 1;
                             }
-                            Ok(ExtentDataValue::Extent { digest: bdig, .. }) => {
-                                if verified_blocks.insert(bdig) {
-                                    verify_extent_block(
+                            Ok(ExtentDataValue::Extent {
+                                len,
+                                digest: bdig,
+                                block_offset,
+                            }) => {
+                                let backing_len = if let Some(&cached) = verified_blocks.get(&bdig)
+                                {
+                                    cached
+                                } else {
+                                    let len_opt = verify_extent_block(
                                         head_store,
                                         pack_store,
                                         subvol_name,
@@ -256,6 +277,16 @@ async fn verify_subvol<H: HeadStore, P: PackStore>(
                                         report,
                                     )
                                     .await;
+                                    verified_blocks.insert(bdig, len_opt);
+                                    len_opt
+                                };
+                                if let Some(backing_len) = backing_len {
+                                    match block_offset.checked_add(len) {
+                                        Some(end) if end <= backing_len => {}
+                                        _ => report.errors.push(format!(
+                                            "subvol {subvol_name}: extent slice [{block_offset}..+{len}] exceeds backing block length {backing_len}"
+                                        )),
+                                    }
                                 }
                                 report.extents_verified += 1;
                             }
@@ -308,22 +339,29 @@ async fn verify_extent_block<H: HeadStore, P: PackStore>(
     block_digest: &Digest,
     verified_packs: &mut HashSet<PackId>,
     report: &mut FsckReport,
-) {
+) -> Option<u32> {
     let loc = match head_store.lookup_block(block_digest).await {
         Ok(Some(loc)) => loc,
         Ok(None) => {
             report
                 .errors
                 .push(format!("subvol {subvol_name}: unindexed block digest"));
-            return;
+            return None;
         }
         Err(e) => {
             report
                 .errors
                 .push(format!("subvol {subvol_name}: block lookup failed: {e:?}"));
-            return;
+            return None;
         }
     };
+    if loc.flags != 0 || loc.raw_len != loc.len || loc.len > cowtree::EXTENT_MAX_BYTES {
+        report.errors.push(format!(
+            "subvol {subvol_name}: invalid v1 block index entry in pack {}",
+            loc.pack_id.0
+        ));
+        return None;
+    }
     if verified_packs.insert(loc.pack_id.clone())
         && let Err(e) = pack_store.read_pack_trailer(&loc.pack_id).await
     {
@@ -337,16 +375,28 @@ async fn verify_extent_block<H: HeadStore, P: PackStore>(
         .await
     {
         Ok(bytes) => {
+            if bytes.len() != loc.len as usize {
+                report.errors.push(format!(
+                    "subvol {subvol_name}: short pack read in pack {}",
+                    loc.pack_id.0
+                ));
+                return None;
+            }
             if let Err(e) = verify_block_digest(block_digest, &bytes) {
                 report.errors.push(format!(
                     "subvol {subvol_name}: block digest mismatch in pack {}: {e:?}",
                     loc.pack_id.0
                 ));
+                return None;
             }
+            Some(loc.len)
         }
-        Err(e) => report.errors.push(format!(
-            "subvol {subvol_name}: pack read failed for {}: {e:?}",
-            loc.pack_id.0
-        )),
+        Err(e) => {
+            report.errors.push(format!(
+                "subvol {subvol_name}: pack read failed for {}: {e:?}",
+                loc.pack_id.0
+            ));
+            None
+        }
     }
 }

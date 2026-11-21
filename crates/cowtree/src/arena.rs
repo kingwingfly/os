@@ -198,7 +198,14 @@ impl Arena {
     }
 
     pub fn put_node(&mut self, digest: Digest, encoded_bytes: usize, node: Rc<Node>) {
-        self.tree_lru.insert(digest, encoded_bytes.max(1), node);
+        // Charge actual retained heap footprint (struct + Vec capacities + per-entry allocations +
+        // LRU table overhead) so the decoded tree cache never exceeds the 8 MiB budget.
+        let retained = node
+            .heap_bytes()
+            .max(encoded_bytes)
+            .saturating_add(128)
+            .max(1);
+        self.tree_lru.insert(digest, retained, node);
         self.update_total_peak();
     }
 
@@ -207,7 +214,7 @@ impl Arena {
     }
 
     pub fn put_data(&mut self, digest: Digest, data: Rc<Vec<u8>>) {
-        let size = data.len().max(1);
+        let size = data.capacity().max(data.len()).max(1);
         self.clean_data.insert(digest, size, data);
         self.update_total_peak();
     }

@@ -26,6 +26,23 @@ pub fn verify_block_digest(expected: &Digest, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Shared v1 pack entry validation enforced across [`PackBuilder`], [`encode_pack`], and
+/// [`decode_pack_trailer_bytes`]: `len <= EXTENT_MAX_BYTES` (`1 MiB`), `raw_len == len`, and
+/// `flags == 0` (raw uncompressed layout in v1).
+pub fn validate_v1_pack_entry(
+    entry: &PackIndexEntry,
+    oversize_err: Errno,
+    invalid_err: Errno,
+) -> Result<()> {
+    if entry.len > EXTENT_MAX_BYTES || entry.raw_len > EXTENT_MAX_BYTES {
+        return Err(oversize_err);
+    }
+    if entry.flags != 0 || entry.raw_len != entry.len {
+        return Err(invalid_err);
+    }
+    Ok(())
+}
+
 /// Sealed immutable pack ready to be written once to [`crate::PackStore`].
 #[derive(Clone, Debug)]
 pub struct BuiltPack {
@@ -111,21 +128,34 @@ pub fn encode_pack(blocks: &[(Digest, Vec<u8>)]) -> Result<BuiltPack> {
     let mut payload = Vec::new();
     let mut entries = Vec::with_capacity(blocks.len());
     for (digest, bytes) in blocks {
+        if bytes.len() > EXTENT_MAX_BYTES as usize {
+            return Err(Errno::EFBIG);
+        }
         let offset = u32::try_from(payload.len()).map_err(|_| Errno::EFBIG)?;
         let len = u32::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
-        payload.extend_from_slice(bytes);
-        entries.push(PackIndexEntry {
+        let entry = PackIndexEntry {
             digest: *digest,
             offset,
             len,
             raw_len: len,
             flags: 0,
-        });
+        };
+        validate_v1_pack_entry(&entry, Errno::EFBIG, Errno::EINVAL)?;
+        payload.extend_from_slice(bytes);
+        entries.push(entry);
     }
     encode_pack_parts(payload, entries)
 }
 
 fn encode_pack_parts(mut payload: Vec<u8>, entries: Vec<PackIndexEntry>) -> Result<BuiltPack> {
+    let payload_limit = u32::try_from(payload.len()).map_err(|_| Errno::EFBIG)?;
+    for entry in &entries {
+        validate_v1_pack_entry(entry, Errno::EFBIG, Errno::EINVAL)?;
+        let end = entry.offset.checked_add(entry.len).ok_or(Errno::EFBIG)?;
+        if end > payload_limit {
+            return Err(Errno::EINVAL);
+        }
+    }
     let trailer_len = PACK_TRAILER_HEADER_BYTES + entries.len() * PACK_INDEX_ENTRY_BYTES;
     let total_len = payload.len() + trailer_len + PACK_FOOTER_BYTES;
     if total_len > PACK_MAX_BYTES {
@@ -247,17 +277,19 @@ pub fn decode_pack_trailer_bytes(
         cursor += 4;
         let flags = u16::from_be_bytes(trailer_bytes[cursor..cursor + 2].try_into().unwrap());
         cursor += 2;
-        let end = offset.checked_add(len).ok_or(Errno::EIO)?;
-        if end > payload_limit {
-            return Err(Errno::EIO);
-        }
-        entries.push(PackIndexEntry {
+        let entry = PackIndexEntry {
             digest,
             offset,
             len,
             raw_len,
             flags,
-        });
+        };
+        validate_v1_pack_entry(&entry, Errno::EIO, Errno::EIO)?;
+        let end = offset.checked_add(len).ok_or(Errno::EIO)?;
+        if end > payload_limit {
+            return Err(Errno::EIO);
+        }
+        entries.push(entry);
     }
     Ok(PackTrailer {
         magic,

@@ -908,6 +908,7 @@ fn gc_grace_window_preserves_indexed_pack_for_cross_volume_dedupe() {
     assert_eq!(n, block_payload.len());
     assert_eq!(got, block_payload);
     run(fs2_ro.release(&ro_fd)).unwrap();
+    run(fs2_ro.close_clean()).unwrap();
     assert!(run(verify_volume(&*hs, &*ps, &v2)).unwrap().ok);
 
     // After deleting V2 and advancing past grace_before, GC sweeps the pack completely.

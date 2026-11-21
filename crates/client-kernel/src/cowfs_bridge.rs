@@ -7,28 +7,47 @@
 
 use crate::mounts::{extract_js_errno, js_errno, map_vfs_err, parse_identity};
 use abi::Errno;
-use abi::fs::{OpenOptions, RenameFlags, SetAttr, Timespec, XattrFlags};
+use abi::contract::mount_flags;
+use abi::fs::{
+    Access, Conflict, DirEntry, DirPage, Entry, FileType, FsId, Handle, LockFamily, LockKind,
+    LockRange, Metadata, NodeId, OpenOptions, OpenRef, RenameFlags, SetAttr, StatFs, Stop,
+    Timespec, Walked, WriteAt, Written, XattrFlags,
+};
 use cowfs::{CowFs, CowFsConfig, CowFsOpenMode, CowFsVolumeDevice, cowfs_ioctl_mounted};
 use cowtree::pack::{PACK_FOOTER_BYTES, decode_pack_footer, decode_pack_trailer_bytes};
 use cowtree::{
     ArenaConfig, BlockLoc, CommitRequest, Digest, ForkRequest, GcLockGuard, GcRoot, HeadStore,
-    PACK_MAX_BYTES, PackId, PackMeta, PackStore, PackTrailer, SnapshotRecord, VolumeHead, VolumeId,
-    WriterLease, WriterLockGuard, WriterMode, digest_to_hex,
+    PACK_MAX_BYTES, PackId, PackMeta, PackStore, PackTrailer, RoPinGuard, SnapshotRecord,
+    VolumeHead, VolumeId, WriterLease, WriterLockGuard, WriterMode, digest_to_hex,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::cell::Cell;
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use vfs::devfs::{DefaultDeviceBackend, DevTmpFs};
 use vfs::vblk::{VblkDeviceBackend, VblkRegistry};
 use vfs::{
-    BoxFuture, Cred, DefaultFilesystemFactory, Filesystem, FsId, FsType, MountBacking, StartAnchor,
-    Vfs,
+    BoxFuture, Cred, DefaultFilesystemFactory, Filesystem, FsType, MountBacking, MountFlags,
+    StartAnchor, Vfs,
 };
 use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
+
+/// Maximum integer exactly representable as an IEEE-754 `f64` (`2^53 - 1`).
+const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// Validate a JS `f64` length/offset/cookie parameter before converting to `u64`.
+/// Rejects negative values, `NaN`, infinities, non-integers, and values above `MAX_SAFE_INTEGER`
+/// with `Errno::EINVAL` instead of silently truncating to `0`.
+fn validate_js_u64(value: f64) -> vfs::Result<u64> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > JS_MAX_SAFE_INTEGER {
+        return Err(Errno::EINVAL);
+    }
+    Ok(value as u64)
+}
 
 fn cowfs_extract_js_errno(err: &JsValue) -> Errno {
     if let Some(code) = js_sys::Reflect::get(err, &JsValue::from_str("errno"))
@@ -140,7 +159,11 @@ struct JsWriterGuard {
     released: Rc<Cell<bool>>,
 }
 
-impl WriterLockGuard for JsWriterGuard {}
+impl WriterLockGuard for JsWriterGuard {
+    fn lease_id(&self) -> Option<&str> {
+        Some(&self.lease_id)
+    }
+}
 
 impl Drop for JsWriterGuard {
     fn drop(&mut self) {
@@ -171,6 +194,26 @@ impl Drop for JsGcGuard {
     }
 }
 
+struct JsRoPinGuard {
+    store: JsValue,
+    pin_id: String,
+    released: Rc<Cell<bool>>,
+}
+
+impl RoPinGuard for JsRoPinGuard {}
+
+impl Drop for JsRoPinGuard {
+    fn drop(&mut self) {
+        if !self.released.replace(true) {
+            let _ = call_js_method(
+                &self.store,
+                "unpinRoRootSync",
+                &[JsValue::from_str(&self.pin_id)],
+            );
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JsLeaseWire {
@@ -182,6 +225,13 @@ struct JsLeaseWire {
     head: VolumeHead,
     forked_from: Option<String>,
     expires_at: Option<Timespec>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsRoPinWire {
+    pin_id: String,
+    head: VolumeHead,
 }
 
 #[derive(Serialize)]
@@ -234,6 +284,14 @@ impl HeadStore for JsCowfsStore {
         })
     }
 
+    fn grace_window_secs(&self) -> u64 {
+        js_sys::Reflect::get(&self.obj, &JsValue::from_str("graceWindowSecs"))
+            .ok()
+            .and_then(|v| v.as_f64())
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .map_or(600, |n| n as u64)
+    }
+
     fn create_volume<'a>(
         &'a self,
         head: &'a VolumeHead,
@@ -256,6 +314,42 @@ impl HeadStore for JsCowfsStore {
         Box::pin(async move {
             let res = call_js_async(&self.obj, "readHead", &[JsValue::from_str(&volume.0)]).await?;
             from_js_json(&res)
+        })
+    }
+
+    fn pin_ro_root<'a>(
+        &'a self,
+        volume: &'a VolumeId,
+        snapshot: Option<&'a str>,
+    ) -> BoxFuture<'a, (VolumeHead, Box<dyn RoPinGuard>)> {
+        Box::pin(async move {
+            let snap_js = match snapshot {
+                Some(s) => JsValue::from_str(s),
+                None => JsValue::NULL,
+            };
+            let res = call_js_async(
+                &self.obj,
+                "pinRoRoot",
+                &[JsValue::from_str(&volume.0), snap_js],
+            )
+            .await?;
+            let wire: JsRoPinWire = from_js_json(&res)?;
+            Ok((
+                wire.head,
+                Box::new(JsRoPinGuard {
+                    store: self.obj.clone(),
+                    pin_id: wire.pin_id,
+                    released: Rc::new(Cell::new(false)),
+                }) as Box<dyn RoPinGuard>,
+            ))
+        })
+    }
+
+    fn unpin_ro_root<'a>(&'a self, pin: Box<dyn RoPinGuard>) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            drop(pin);
+            let _ = call_js_async(&self.obj, "flushLocks", &[]).await;
+            Ok(())
         })
     }
 
@@ -447,6 +541,61 @@ impl HeadStore for JsCowfsStore {
         })
     }
 
+    fn delete_volume_with_lease<'a>(
+        &'a self,
+        lease: WriterLease,
+        only_if_unmodified_ephemeral: bool,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let lease_id = lease.guard.lease_id().ok_or(Errno::EIO)?.to_string();
+            let res = call_js_async(
+                &self.obj,
+                "deleteVolumeWithLease",
+                &[
+                    JsValue::from_str(&lease_id),
+                    JsValue::from_str(&lease.volume.0),
+                    JsValue::from_f64(lease.incarnation as f64),
+                    JsValue::from_f64(lease.fence as f64),
+                    JsValue::from_f64(lease.epoch as f64),
+                    JsValue::from_bool(only_if_unmodified_ephemeral),
+                ],
+            )
+            .await;
+            drop(lease);
+            res.map(|v| v.as_bool().unwrap_or(false))
+        })
+    }
+
+    fn reformat_volume_with_lease<'a>(
+        &'a self,
+        lease: WriterLease,
+        new_head: &'a VolumeHead,
+        initial_nodes: &'a [(Digest, Vec<u8>)],
+    ) -> BoxFuture<'a, VolumeHead> {
+        Box::pin(async move {
+            let lease_id = lease.guard.lease_id().ok_or(Errno::EIO)?.to_string();
+            let head_json = serde_json::to_string(new_head).map_err(|_| Errno::EIO)?;
+            let nodes = js_nodes_array(initial_nodes);
+            let res = call_js_async(
+                &self.obj,
+                "reformatVolumeWithLease",
+                &[
+                    JsValue::from_str(&lease_id),
+                    JsValue::from_str(&lease.volume.0),
+                    JsValue::from_f64(lease.incarnation as f64),
+                    JsValue::from_f64(lease.fence as f64),
+                    JsValue::from_f64(lease.epoch as f64),
+                    JsValue::from_str(&head_json),
+                    nodes,
+                ],
+            )
+            .await;
+            drop(lease);
+            let val = res?;
+            from_js_json(&val)
+        })
+    }
+
     fn acquire_gc_lock(&self, exclusive: bool) -> BoxFuture<'_, Box<dyn GcLockGuard>> {
         Box::pin(async move {
             let res =
@@ -466,11 +615,40 @@ impl HeadStore for JsCowfsStore {
         })
     }
 
+    fn list_indexed_packs(&self) -> BoxFuture<'_, HashSet<PackId>> {
+        Box::pin(async move {
+            let res = call_js_async(&self.obj, "listIndexedPacks", &[]).await?;
+            let ids: Vec<String> = from_js_json(&res)?;
+            Ok(ids.into_iter().map(PackId).collect())
+        })
+    }
+
+    fn prune_abandoned_ephemeral_forks(
+        &self,
+        now: Timespec,
+        grace_window_secs: u64,
+    ) -> BoxFuture<'_, usize> {
+        Box::pin(async move {
+            let now_json = serde_json::to_string(&now).map_err(|_| Errno::EIO)?;
+            let res = call_js_async(
+                &self.obj,
+                "pruneAbandonedEphemeralForks",
+                &[
+                    JsValue::from_str(&now_json),
+                    JsValue::from_f64(grace_window_secs as f64),
+                ],
+            )
+            .await?;
+            Ok(res.as_f64().unwrap_or(0.0).max(0.0) as usize)
+        })
+    }
+
     fn sweep_metadata<'a>(
         &'a self,
         keep_nodes: &'a HashSet<Digest>,
         keep_packs: &'a HashSet<PackId>,
-        grace_before: Timespec,
+        now: Timespec,
+        grace_window_secs: u64,
     ) -> BoxFuture<'a, Vec<PackId>> {
         Box::pin(async move {
             let keep_nodes_hex: Vec<String> = keep_nodes.iter().map(digest_to_hex).collect();
@@ -478,7 +656,8 @@ impl HeadStore for JsCowfsStore {
             let payload = serde_json::to_string(&json!({
                 "keepNodes": keep_nodes_hex,
                 "keepPacks": keep_packs_str,
-                "graceBefore": grace_before,
+                "now": now,
+                "graceWindowSecs": grace_window_secs,
             }))
             .map_err(|_| Errno::EIO)?;
             let res =
@@ -576,6 +755,564 @@ impl PackStore for JsCowfsStore {
 }
 
 // -----------------------------------------------------------------------------
+// Virtual `/dev` mountpoint wrapper so `/dev/vd0` is ALWAYS mounted and reachable
+// on RW, RO, Snapshot, and unmodified ForkOnBusy mounts without mutating the volume.
+// -----------------------------------------------------------------------------
+
+const VIRTUAL_DEV_INO: u64 = u64::MAX - 1;
+const VIRTUAL_DEV_GEN: u64 = 1;
+
+struct BridgeRootFs {
+    inner: Rc<CowFs<JsCowfsStore, JsCowfsStore>>,
+}
+
+impl BridgeRootFs {
+    fn virtual_dev_handle(&self) -> Handle {
+        Handle {
+            fs: self.inner.id().clone(),
+            node: NodeId {
+                ino: VIRTUAL_DEV_INO,
+                generation: VIRTUAL_DEV_GEN,
+            },
+            proof: String::new(),
+        }
+    }
+
+    fn virtual_dev_meta(&self) -> Metadata {
+        Metadata {
+            file_type: FileType::Dir,
+            mode: 0o755,
+            nlink: 2,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            rdev: None,
+            acl: false,
+        }
+    }
+
+    fn virtual_dev_entry(&self) -> Entry {
+        Entry {
+            handle: self.virtual_dev_handle(),
+            metadata: self.virtual_dev_meta(),
+        }
+    }
+
+    fn is_virtual_dev(handle: &Handle) -> bool {
+        handle.node.ino == VIRTUAL_DEV_INO && handle.node.generation == VIRTUAL_DEV_GEN
+    }
+}
+
+impl Filesystem for BridgeRootFs {
+    fn id(&self) -> &FsId {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> abi::contract::FsCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn root(&self) -> Handle {
+        self.inner.root()
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, Entry> {
+        Box::pin(async move {
+            if Self::is_virtual_dev(dir) {
+                return Err(Errno::ENOENT);
+            }
+            if dir.node == self.inner.root().node && name == "dev" {
+                match self.inner.lookup(cred, dir, name).await {
+                    Ok(e) => return Ok(e),
+                    Err(Errno::ENOENT) => return Ok(self.virtual_dev_entry()),
+                    Err(e) => return Err(e),
+                }
+            }
+            self.inner.lookup(cred, dir, name).await
+        })
+    }
+
+    fn walk<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        names: &'a [String],
+    ) -> BoxFuture<'a, Walked> {
+        Box::pin(async move {
+            if Self::is_virtual_dev(dir) {
+                return Ok(Walked {
+                    entries: Vec::new(),
+                    stop: if names.is_empty() {
+                        None
+                    } else {
+                        Some(Stop::Missing(0))
+                    },
+                });
+            }
+            if dir.node == self.inner.root().node
+                && let Some(first) = names.first()
+                && first == "dev"
+            {
+                match self.inner.lookup(cred, dir, "dev").await {
+                    Ok(_) => return self.inner.walk(cred, dir, names).await,
+                    Err(Errno::ENOENT) => {
+                        return Ok(Walked {
+                            entries: vec![self.virtual_dev_entry()],
+                            stop: if names.len() > 1 {
+                                Some(Stop::Missing(1))
+                            } else {
+                                None
+                            },
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            self.inner.walk(cred, dir, names).await
+        })
+    }
+
+    fn parent<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+    ) -> BoxFuture<'a, Option<(Entry, String)>> {
+        Box::pin(async move {
+            if Self::is_virtual_dev(dir) {
+                let root_h = self.inner.root();
+                let root_meta = self.inner.metadata(cred, &root_h).await?;
+                return Ok(Some((
+                    Entry {
+                        handle: root_h,
+                        metadata: root_meta,
+                    },
+                    "dev".to_string(),
+                )));
+            }
+            self.inner.parent(cred, dir).await
+        })
+    }
+
+    fn metadata<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, Metadata> {
+        Box::pin(async move {
+            if Self::is_virtual_dev(handle) {
+                return Ok(self.virtual_dev_meta());
+            }
+            self.inner.metadata(cred, handle).await
+        })
+    }
+
+    fn setattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        attr: &'a SetAttr,
+    ) -> BoxFuture<'a, Metadata> {
+        if Self::is_virtual_dev(handle) {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.inner.setattr(cred, handle, attr)
+    }
+
+    fn read_dir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle) -> BoxFuture<'a, Vec<DirEntry>> {
+        if Self::is_virtual_dev(dir) {
+            return Box::pin(async { Ok(Vec::new()) });
+        }
+        self.inner.read_dir(cred, dir)
+    }
+
+    fn read_dir_page<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        cookie: u64,
+        max_entries: usize,
+    ) -> BoxFuture<'a, DirPage> {
+        if Self::is_virtual_dev(dir) {
+            return Box::pin(async {
+                Ok(DirPage {
+                    entries: Vec::new(),
+                    next_cookie: None,
+                })
+            });
+        }
+        self.inner.read_dir_page(cred, dir, cookie, max_entries)
+    }
+
+    fn read_link<'a>(&'a self, cred: &'a Cred, link: &'a Handle) -> BoxFuture<'a, String> {
+        self.inner.read_link(cred, link)
+    }
+
+    fn create<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+        options: &'a OpenOptions,
+    ) -> BoxFuture<'a, (Entry, OpenRef)> {
+        if Self::is_virtual_dev(dir) {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.inner.create(cred, dir, name, mode, options)
+    }
+
+    fn mkdir<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+    ) -> BoxFuture<'a, Entry> {
+        if Self::is_virtual_dev(dir) {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.inner.mkdir(cred, dir, name, mode)
+    }
+
+    fn mknod<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+        rdev: &'a str,
+    ) -> BoxFuture<'a, Entry> {
+        if Self::is_virtual_dev(dir) {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.inner.mknod(cred, dir, name, mode, rdev)
+    }
+
+    fn symlink<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        target: &'a str,
+    ) -> BoxFuture<'a, Entry> {
+        if Self::is_virtual_dev(dir) {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.inner.symlink(cred, dir, name, target)
+    }
+
+    fn link<'a>(
+        &'a self,
+        cred: &'a Cred,
+        target: &'a Handle,
+        dir: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, Entry> {
+        if Self::is_virtual_dev(dir) {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.inner.link(cred, target, dir, name)
+    }
+
+    fn unlink<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
+        if Self::is_virtual_dev(dir) {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.inner.unlink(cred, dir, name)
+    }
+
+    fn unlink_if<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        node: NodeId,
+    ) -> BoxFuture<'a, ()> {
+        if Self::is_virtual_dev(dir) {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.inner.unlink_if(cred, dir, name, node)
+    }
+
+    fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
+        if Self::is_virtual_dev(dir) {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.inner.rmdir(cred, dir, name)
+    }
+
+    fn rename<'a>(
+        &'a self,
+        cred: &'a Cred,
+        from_dir: &'a Handle,
+        from: &'a str,
+        to_dir: &'a Handle,
+        to: &'a str,
+        flags: RenameFlags,
+    ) -> BoxFuture<'a, ()> {
+        if Self::is_virtual_dev(from_dir) || Self::is_virtual_dev(to_dir) {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.inner.rename(cred, from_dir, from, to_dir, to, flags)
+    }
+
+    fn getxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, Vec<u8>> {
+        if Self::is_virtual_dev(handle) {
+            return Box::pin(async { Err(Errno::ENODATA) });
+        }
+        self.inner.getxattr(cred, handle, name)
+    }
+
+    fn setxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+        value: &'a [u8],
+        flags: XattrFlags,
+    ) -> BoxFuture<'a, ()> {
+        if Self::is_virtual_dev(handle) {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.inner.setxattr(cred, handle, name, value, flags)
+    }
+
+    fn listxattr<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, Vec<String>> {
+        if Self::is_virtual_dev(handle) {
+            return Box::pin(async { Ok(Vec::new()) });
+        }
+        self.inner.listxattr(cred, handle)
+    }
+
+    fn removexattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        if Self::is_virtual_dev(handle) {
+            return Box::pin(async { Err(Errno::EROFS) });
+        }
+        self.inner.removexattr(cred, handle, name)
+    }
+
+    fn statfs<'a>(&'a self, cred: &'a Cred) -> BoxFuture<'a, StatFs> {
+        self.inner.statfs(cred)
+    }
+
+    fn open<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        options: &'a OpenOptions,
+    ) -> BoxFuture<'a, OpenRef> {
+        if Self::is_virtual_dev(handle) {
+            return Box::pin(async move {
+                let access = options.access()?;
+                if access == Access::Path {
+                    return Ok(OpenRef {
+                        fs: self.inner.id().clone(),
+                        id: u64::MAX - 1,
+                        node: handle.node,
+                        access,
+                    });
+                }
+                Err(Errno::EISDIR)
+            });
+        }
+        self.inner.open(cred, handle, options)
+    }
+
+    fn open_metadata<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, Metadata> {
+        if open.node.ino == VIRTUAL_DEV_INO {
+            let meta = self.virtual_dev_meta();
+            return Box::pin(async move { Ok(meta) });
+        }
+        self.inner.open_metadata(open)
+    }
+
+    fn read_at<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> BoxFuture<'a, usize> {
+        self.inner.read_at(open, buf, offset)
+    }
+
+    fn write_at<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        buf: &'a [u8],
+        at: WriteAt,
+    ) -> BoxFuture<'a, Written> {
+        self.inner.write_at(open, buf, at)
+    }
+
+    fn set_len<'a>(&'a self, open: &'a OpenRef, size: u64) -> BoxFuture<'a, ()> {
+        self.inner.set_len(open, size)
+    }
+
+    fn sync_all<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
+        self.inner.sync_all(open)
+    }
+
+    fn sync_fs<'a>(&'a self, cred: &'a Cred) -> BoxFuture<'a, ()> {
+        self.inner.sync_fs(cred)
+    }
+
+    fn reflink<'a>(
+        &'a self,
+        cred: &'a Cred,
+        src_open: &'a OpenRef,
+        dst_open: &'a OpenRef,
+    ) -> BoxFuture<'a, ()> {
+        self.inner.reflink(cred, src_open, dst_open)
+    }
+
+    fn lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
+    ) -> BoxFuture<'a, ()> {
+        self.inner.lock(open, family, kind, range)
+    }
+
+    fn try_lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
+    ) -> BoxFuture<'a, ()> {
+        self.inner.try_lock(open, family, kind, range)
+    }
+
+    fn unlock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        range: LockRange,
+    ) -> BoxFuture<'a, ()> {
+        self.inner.unlock(open, family, range)
+    }
+
+    fn test_lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        kind: LockKind,
+        range: LockRange,
+    ) -> BoxFuture<'a, Option<Conflict>> {
+        self.inner.test_lock(open, kind, range)
+    }
+
+    fn release<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
+        if open.node.ino == VIRTUAL_DEV_INO {
+            return Box::pin(async { Ok(()) });
+        }
+        self.inner.release(open)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 5-second dirty commit deadline timer (`contract.md` §2.15)
+// -----------------------------------------------------------------------------
+
+#[derive(Default)]
+struct DirtyFlushTimer {
+    handle: Option<JsValue>,
+    closure: Option<Closure<dyn FnMut()>>,
+    canceled: bool,
+}
+
+fn clear_js_timeout(handle: &JsValue) {
+    let global = js_sys::global();
+    if let Ok(func) = js_sys::Reflect::get(&global, &JsValue::from_str("clearTimeout"))
+        && let Ok(f) = func.dyn_into::<js_sys::Function>()
+    {
+        let _ = f.call1(&global, handle);
+    }
+}
+
+fn schedule_js_timeout(cb: &Closure<dyn FnMut()>, delay_ms: u64) -> Option<JsValue> {
+    let global = js_sys::global();
+    let func = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
+        .ok()?
+        .dyn_into::<js_sys::Function>()
+        .ok()?;
+    let handle = func
+        .call2(
+            &global,
+            cb.as_ref().unchecked_ref(),
+            &JsValue::from_f64(delay_ms as f64),
+        )
+        .ok()?;
+    // In Node.js tests, unref() would let process exit, while real handles still fire normally;
+    // we also explicitly `clearTimeout` in `close_clean` and `Drop`.
+    Some(handle)
+}
+
+fn arm_dirty_timer(
+    fs: &Rc<CowFs<JsCowfsStore, JsCowfsStore>>,
+    timer: &Rc<RefCell<DirtyFlushTimer>>,
+) {
+    let mut t = timer.borrow_mut();
+    if t.canceled || t.handle.is_some() {
+        return;
+    }
+    let Some(delay_ms) = fs.ms_until_dirty_deadline() else {
+        return;
+    };
+    let fs_c = Rc::clone(fs);
+    let timer_c = Rc::clone(timer);
+    let cb = Closure::once(move || {
+        {
+            let mut st = timer_c.borrow_mut();
+            st.handle = None;
+            if st.canceled {
+                return;
+            }
+        }
+        spawn_local(async move {
+            // Drop the fired closure after the JS trampoline has unwound.
+            let _old_closure = timer_c.borrow_mut().closure.take();
+            if timer_c.borrow().canceled || fs_c.is_closed() {
+                return;
+            }
+            let _ = fs_c.flush_if_dirty_deadline_elapsed().await;
+            // Re-arm if still dirty (e.g., transient commit error or newly arrived writes).
+            if !timer_c.borrow().canceled && !fs_c.is_closed() {
+                arm_dirty_timer(&fs_c, &timer_c);
+            }
+        });
+    });
+    if let Some(handle) = schedule_js_timeout(&cb, delay_ms.max(10)) {
+        t.handle = Some(handle);
+        t.closure = Some(cb);
+    }
+}
+
+fn cancel_dirty_timer(timer: &Rc<RefCell<DirtyFlushTimer>>) {
+    let mut t = timer.borrow_mut();
+    t.canceled = true;
+    if let Some(h) = t.handle.take() {
+        clear_js_timeout(&h);
+    }
+    t.closure = None;
+}
+
+// -----------------------------------------------------------------------------
 // Exported `wasm-bindgen` CowFs volume handle & helpers
 // -----------------------------------------------------------------------------
 
@@ -620,22 +1357,32 @@ pub async fn cowfs_verify_volume(store: JsValue, volume_id: String) -> Result<Js
     to_js_json(&report)
 }
 
-/// Run reachability GC over `store`, sweeping unreachable nodes/packs older than `grace_before_sec`.
+/// Run reachability GC over `store` at wall-clock timestamp `now_sec`.
 #[wasm_bindgen]
-pub async fn cowfs_collect_garbage(
-    store: JsValue,
-    grace_before_sec: f64,
-) -> Result<JsValue, JsValue> {
+pub async fn cowfs_collect_garbage(store: JsValue, now_sec: f64) -> Result<JsValue, JsValue> {
     let adapter = JsCowfsStore { obj: store };
-    let sec = if grace_before_sec.is_finite() && grace_before_sec >= 0.0 {
-        grace_before_sec as u64
-    } else {
-        0
-    };
+    let sec = validate_js_u64(now_sec).map_err(map_vfs_err)?;
     let report = cowfs::collect_garbage(&adapter, &adapter, Timespec { sec, nsec: 0 })
         .await
         .map_err(map_vfs_err)?;
     to_js_json(&report)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct IdentityKey {
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+}
+
+impl IdentityKey {
+    fn from_cred(cred: &Cred) -> Self {
+        Self {
+            uid: cred.identity.id,
+            gid: cred.identity.group,
+            groups: cred.identity.groups.iter().copied().collect(),
+        }
+    }
 }
 
 /// Mounted `os-cowfs` volume handle exposed to browser JS/Workers (backed by portable `CowFs` +
@@ -645,6 +1392,15 @@ pub struct CowFsVolume {
     fs: Rc<CowFs<JsCowfsStore, JsCowfsStore>>,
     vfs: Vfs,
     vblk: VblkRegistry,
+    identity_pids: RefCell<HashMap<IdentityKey, u32>>,
+    next_pid: Cell<u32>,
+    dirty_timer: Rc<RefCell<DirtyFlushTimer>>,
+}
+
+impl Drop for CowFsVolume {
+    fn drop(&mut self) {
+        cancel_dirty_timer(&self.dirty_timer);
+    }
 }
 
 #[wasm_bindgen]
@@ -660,7 +1416,8 @@ impl CowFsVolume {
         Self::open_internal(store, volume_id, CowFsOpenMode::ReadWrite(mode)).await
     }
 
-    /// Open a volume read-only (acquires NO writer lock; uses lock-free `getFile().slice()`).
+    /// Open a volume read-only (acquires NO writer lock; pins root against GC; uses lock-free
+    /// `getFile().slice()`).
     pub async fn open_ro(store: JsValue, volume_id: String) -> Result<CowFsVolume, JsValue> {
         Self::open_internal(store, volume_id, CowFsOpenMode::ReadOnly).await
     }
@@ -694,7 +1451,10 @@ impl CowFsVolume {
             .map_err(map_vfs_err)?,
         );
 
-        let backing = Rc::new(MountBacking::new(fs.clone(), FsType::Cowfs));
+        let root_wrapper = Rc::new(BridgeRootFs {
+            inner: Rc::clone(&fs),
+        });
+        let backing = Rc::new(MountBacking::new(root_wrapper, FsType::Cowfs));
         let factory = Rc::new(DefaultFilesystemFactory::new(Rc::new(|| {
             let ts = now_timespec();
             (ts.sec, ts.nsec)
@@ -703,7 +1463,9 @@ impl CowFsVolume {
             .await
             .map_err(map_vfs_err)?;
 
-        // Wire `/dev` with `/dev/vd0` pointing to this volume for `BLK_INFO` / `COWFS_IOC_*` / `mkfs` tests.
+        // Mount `DevTmpFs` at `/dev` with `/dev/vd0` pointing to this volume so `stat("/dev/vd0")`,
+        // `BLK_INFO`, `COWFS_IOC_*`, and `mkfs_target("/dev/vd0", ...)` work directly on the
+        // volume's mounted namespace without mutating the underlying `CowFs` root tree.
         let vblk = VblkRegistry::new();
         let dev_node = Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&fs)));
         let vd_name = vblk.attach(dev_node);
@@ -716,11 +1478,33 @@ impl CowFsVolume {
             }),
             VblkDeviceBackend::new(DefaultDeviceBackend),
         ));
-        let _ = dev_fs.register_vblk(&vd_name, 0o660);
-        // Mount `/dev` if `/dev` exists or mount lazily on demand (keep root clean for POSIX tests).
-        let _ = dev_fs;
+        dev_fs.register_vblk(&vd_name, 0o660).map_err(map_vfs_err)?;
+        let sys_ns = vfs.system_namespace();
+        vfs.mount_on_namespace(
+            &sys_ns,
+            &Cred::root(),
+            Rc::new(MountBacking::new(dev_fs, FsType::DevTmpFs)),
+            None,
+            "devtmpfs",
+            "/dev",
+            MountFlags::from_accepted(mount_flags::MS_NOSUID),
+            0,
+            None,
+        )
+        .await
+        .map_err(map_vfs_err)?;
 
-        Ok(CowFsVolume { fs, vfs, vblk })
+        let mut identity_pids = HashMap::new();
+        identity_pids.insert(IdentityKey::from_cred(&Cred::root()), 1);
+
+        Ok(CowFsVolume {
+            fs,
+            vfs,
+            vblk,
+            identity_pids: RefCell::new(identity_pids),
+            next_pid: Cell::new(2),
+            dirty_timer: Rc::new(RefCell::new(DirtyFlushTimer::default())),
+        })
     }
 
     pub fn volume_id(&self) -> String {
@@ -745,12 +1529,17 @@ impl CowFsVolume {
 
     pub async fn mkdir(&self, path: String, mode: u16, identity: JsValue) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
-        self.vfs
+        let pid = self.ensure_pid(&cred)?;
+        let res = self
+            .vfs
             .mkdirat(pid, StartAnchor::Root, &path, mode)
             .await
             .map(|_| ())
-            .map_err(map_vfs_err)
+            .map_err(map_vfs_err);
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
+        res
     }
 
     pub async fn write_file(
@@ -761,7 +1550,7 @@ impl CowFsVolume {
         identity: JsValue,
     ) -> Result<usize, JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         let fd = self
             .vfs
             .openat(
@@ -775,6 +1564,9 @@ impl CowFsVolume {
             .map_err(map_vfs_err)?;
         let res = self.vfs.write(pid, fd, bytes).await;
         let _ = self.vfs.close(pid, fd).await;
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
         res.map_err(map_vfs_err)
     }
 
@@ -786,8 +1578,9 @@ impl CowFsVolume {
         mode: u16,
         identity: JsValue,
     ) -> Result<usize, JsValue> {
+        let off = validate_js_u64(offset).map_err(map_vfs_err)?;
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         let fd = self
             .vfs
             .openat(
@@ -799,14 +1592,17 @@ impl CowFsVolume {
             )
             .await
             .map_err(map_vfs_err)?;
-        let res = self.vfs.pwrite(pid, fd, bytes, offset as u64).await;
+        let res = self.vfs.pwrite(pid, fd, bytes, off).await;
         let _ = self.vfs.close(pid, fd).await;
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
         res.map_err(map_vfs_err)
     }
 
     pub async fn read_file(&self, path: String, identity: JsValue) -> Result<Vec<u8>, JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         let fd = self
             .vfs
             .openat(pid, StartAnchor::Root, &path, abi::O_RDONLY, 0)
@@ -835,15 +1631,16 @@ impl CowFsVolume {
         len: usize,
         identity: JsValue,
     ) -> Result<Vec<u8>, JsValue> {
+        let off = validate_js_u64(offset).map_err(map_vfs_err)?;
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         let fd = self
             .vfs
             .openat(pid, StartAnchor::Root, &path, abi::O_RDONLY, 0)
             .await
             .map_err(map_vfs_err)?;
         let mut buf = vec![0u8; len];
-        let res = self.vfs.pread(pid, fd, &mut buf, offset as u64).await;
+        let res = self.vfs.pread(pid, fd, &mut buf, off).await;
         let _ = self.vfs.close(pid, fd).await;
         let n = res.map_err(map_vfs_err)?;
         buf.truncate(n);
@@ -856,22 +1653,28 @@ impl CowFsVolume {
         size: f64,
         identity: JsValue,
     ) -> Result<(), JsValue> {
+        let sz = validate_js_u64(size).map_err(map_vfs_err)?;
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
-        self.vfs
+        let pid = self.ensure_pid(&cred)?;
+        let res = self
+            .vfs
             .setattrat(
                 pid,
                 StartAnchor::Root,
                 &path,
                 &SetAttr {
-                    size: Some(size as u64),
+                    size: Some(sz),
                     ..SetAttr::default()
                 },
                 true,
             )
             .await
             .map(|_| ())
-            .map_err(map_vfs_err)
+            .map_err(map_vfs_err);
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
+        res
     }
 
     pub async fn stat(
@@ -881,7 +1684,7 @@ impl CowFsVolume {
         identity: JsValue,
     ) -> Result<JsValue, JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         let st = self
             .vfs
             .statat(pid, StartAnchor::Root, &path, follow)
@@ -892,8 +1695,9 @@ impl CowFsVolume {
 
     pub async fn chmod(&self, path: String, mode: u16, identity: JsValue) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
-        self.vfs
+        let pid = self.ensure_pid(&cred)?;
+        let res = self
+            .vfs
             .setattrat(
                 pid,
                 StartAnchor::Root,
@@ -906,7 +1710,11 @@ impl CowFsVolume {
             )
             .await
             .map(|_| ())
-            .map_err(map_vfs_err)
+            .map_err(map_vfs_err);
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
+        res
     }
 
     pub async fn setxattr(
@@ -918,12 +1726,17 @@ impl CowFsVolume {
         identity: JsValue,
     ) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         let xf = XattrFlags::from_bits(flags).ok_or_else(|| map_vfs_err(Errno::EINVAL))?;
-        self.vfs
+        let res = self
+            .vfs
             .setxattrat(pid, StartAnchor::Root, &path, &name, value, xf, true)
             .await
-            .map_err(map_vfs_err)
+            .map_err(map_vfs_err);
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
+        res
     }
 
     pub async fn getxattr(
@@ -933,7 +1746,7 @@ impl CowFsVolume {
         identity: JsValue,
     ) -> Result<Vec<u8>, JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         self.vfs
             .getxattrat(pid, StartAnchor::Root, &path, &name, true)
             .await
@@ -947,17 +1760,22 @@ impl CowFsVolume {
         identity: JsValue,
     ) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
-        self.vfs
+        let pid = self.ensure_pid(&cred)?;
+        let res = self
+            .vfs
             .symlinkat(pid, &target, StartAnchor::Root, &linkpath)
             .await
             .map(|_| ())
-            .map_err(map_vfs_err)
+            .map_err(map_vfs_err);
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
+        res
     }
 
     pub async fn readlink(&self, path: String, identity: JsValue) -> Result<String, JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         self.vfs
             .readlinkat(pid, StartAnchor::Root, &path)
             .await
@@ -971,8 +1789,9 @@ impl CowFsVolume {
         identity: JsValue,
     ) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
-        self.vfs
+        let pid = self.ensure_pid(&cred)?;
+        let res = self
+            .vfs
             .linkat(
                 pid,
                 StartAnchor::Root,
@@ -983,25 +1802,39 @@ impl CowFsVolume {
             )
             .await
             .map(|_| ())
-            .map_err(map_vfs_err)
+            .map_err(map_vfs_err);
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
+        res
     }
 
     pub async fn unlink(&self, path: String, identity: JsValue) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
-        self.vfs
+        let pid = self.ensure_pid(&cred)?;
+        let res = self
+            .vfs
             .unlinkat(pid, StartAnchor::Root, &path, false)
             .await
-            .map_err(map_vfs_err)
+            .map_err(map_vfs_err);
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
+        res
     }
 
     pub async fn rmdir(&self, path: String, identity: JsValue) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
-        self.vfs
+        let pid = self.ensure_pid(&cred)?;
+        let res = self
+            .vfs
             .unlinkat(pid, StartAnchor::Root, &path, true)
             .await
-            .map_err(map_vfs_err)
+            .map_err(map_vfs_err);
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
+        res
     }
 
     pub async fn rename(
@@ -1012,16 +1845,21 @@ impl CowFsVolume {
         identity: JsValue,
     ) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         let flags = if noreplace {
             RenameFlags::NOREPLACE
         } else {
             RenameFlags::empty()
         };
-        self.vfs
+        let res = self
+            .vfs
             .renameat(pid, StartAnchor::Root, &from, StartAnchor::Root, &to, flags)
             .await
-            .map_err(map_vfs_err)
+            .map_err(map_vfs_err);
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
+        res
     }
 
     pub async fn read_dir_page(
@@ -1031,11 +1869,12 @@ impl CowFsVolume {
         max_entries: usize,
         identity: JsValue,
     ) -> Result<JsValue, JsValue> {
+        let ck = validate_js_u64(cookie).map_err(map_vfs_err)?;
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         let page = self
             .vfs
-            .read_dir_page(pid, StartAnchor::Root, &path, cookie as u64, max_entries)
+            .read_dir_page(pid, StartAnchor::Root, &path, ck, max_entries)
             .await
             .map_err(map_vfs_err)?;
         to_js_json(&page)
@@ -1050,12 +1889,15 @@ impl CowFsVolume {
         identity: JsValue,
     ) -> Result<u32, JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         let fd = self
             .vfs
             .openat(pid, StartAnchor::Root, &path, flags, mode)
             .await
             .map_err(map_vfs_err)?;
+        if (flags & (abi::O_CREAT | abi::O_TRUNC)) != 0 {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
         Ok(fd)
     }
 
@@ -1066,12 +1908,13 @@ impl CowFsVolume {
         len: usize,
         identity: JsValue,
     ) -> Result<Vec<u8>, JsValue> {
+        let off = validate_js_u64(offset).map_err(map_vfs_err)?;
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         let mut buf = vec![0u8; len];
         let n = self
             .vfs
-            .pread(pid, fd, &mut buf, offset as u64)
+            .pread(pid, fd, &mut buf, off)
             .await
             .map_err(map_vfs_err)?;
         buf.truncate(n);
@@ -1085,18 +1928,28 @@ impl CowFsVolume {
         bytes: &[u8],
         identity: JsValue,
     ) -> Result<usize, JsValue> {
+        let off = validate_js_u64(offset).map_err(map_vfs_err)?;
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
-        self.vfs
-            .pwrite(pid, fd, bytes, offset as u64)
+        let pid = self.ensure_pid(&cred)?;
+        let res = self
+            .vfs
+            .pwrite(pid, fd, bytes, off)
             .await
-            .map_err(map_vfs_err)
+            .map_err(map_vfs_err);
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
+        res
     }
 
     pub async fn fd_close(&self, fd: u32, identity: JsValue) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
-        self.vfs.close(pid, fd).await.map_err(map_vfs_err)
+        let pid = self.ensure_pid(&cred)?;
+        let res = self.vfs.close(pid, fd).await.map_err(map_vfs_err);
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
+        res
     }
 
     /// Intra-volume `FICLONE` between two paths (creates `dst` if needed).
@@ -1107,7 +1960,7 @@ impl CowFsVolume {
         identity: JsValue,
     ) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         let src_fd = self
             .vfs
             .openat(pid, StartAnchor::Root, &src_path, abi::O_RDONLY, 0)
@@ -1133,6 +1986,9 @@ impl CowFsVolume {
         let res = self.vfs.ficlone(pid, dst_fd, src_fd).await;
         let _ = self.vfs.close(pid, src_fd).await;
         let _ = self.vfs.close(pid, dst_fd).await;
+        if res.is_ok() {
+            arm_dirty_timer(&self.fs, &self.dirty_timer);
+        }
         res.map_err(map_vfs_err)
     }
 
@@ -1237,7 +2093,7 @@ impl CowFsVolume {
         identity: JsValue,
     ) -> Result<JsValue, JsValue> {
         let cred = self.cred_or_root(&identity)?;
-        let pid = self.ensure_pid(&cred);
+        let pid = self.ensure_pid(&cred)?;
         let resp = self
             .vblk
             .mkfs_cowfs(&self.vfs, pid, &target, force)
@@ -1247,6 +2103,7 @@ impl CowFsVolume {
     }
 
     pub async fn close_clean(&self) -> Result<(), JsValue> {
+        cancel_dirty_timer(&self.dirty_timer);
         self.fs.close_clean().await.map_err(map_vfs_err)
     }
 
@@ -1259,16 +2116,22 @@ impl CowFsVolume {
         }
     }
 
-    fn ensure_pid(&self, cred: &Cred) -> u32 {
-        let pid = if cred.identity.id == 0 {
-            1
-        } else {
-            1000 + (cred.identity.id % 10_000)
-        };
-        if self.vfs.process_cred(pid).is_err() {
-            let _ = self.vfs.fork_process(1, pid, 0);
+    /// Allocate a unique monotonic VFS PID per distinct `(uid, gid, groups)` identity with an
+    /// empty `FdTable` (never colliding modulo 10,000 and never inheriting PID 1's descriptors).
+    fn ensure_pid(&self, cred: &Cred) -> Result<u32, JsValue> {
+        let key = IdentityKey::from_cred(cred);
+        if let Some(&pid) = self.identity_pids.borrow().get(&key) {
+            return Ok(pid);
         }
-        let _ = self.vfs.set_cred(pid, cred.clone());
-        pid
+        let pid = self.next_pid.get();
+        let next = pid
+            .checked_add(1)
+            .ok_or_else(|| map_vfs_err(Errno::EAGAIN))?;
+        self.vfs
+            .spawn_process(pid, 1, cred.clone(), None, None, None)
+            .map_err(map_vfs_err)?;
+        self.next_pid.set(next);
+        self.identity_pids.borrow_mut().insert(key, pid);
+        Ok(pid)
     }
 }

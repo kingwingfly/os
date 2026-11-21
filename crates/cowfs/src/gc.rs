@@ -7,6 +7,7 @@
 //! crashes between `PackStore::write_pack` and `HeadStore::commit_head`) from `PackStore`.
 
 use crate::inode::ExtentDataValue;
+use abi::Errno;
 use abi::fs::Timespec;
 use cowtree::{Digest, HeadStore, KIND_EXTENT_DATA, Node, PackId, PackStore, RootObject};
 use serde::{Deserialize, Serialize};
@@ -23,13 +24,35 @@ pub struct GcReport {
     pub swept_packs: Vec<PackId>,
 }
 
-/// Run one full mark-and-sweep garbage-collection pass.
+/// Run one full mark-and-sweep garbage-collection pass at wall-clock timestamp `now`, honoring the
+/// store's configured `grace_window_secs`.
 pub async fn collect_garbage<H: HeadStore, P: PackStore>(
     head_store: &H,
     pack_store: &P,
-    grace_before: Timespec,
+    now: Timespec,
+) -> Result<GcReport> {
+    let grace_window_secs = head_store.grace_window_secs();
+    collect_garbage_with_grace(head_store, pack_store, now, grace_window_secs).await
+}
+
+/// Run one full mark-and-sweep garbage-collection pass with an explicit `now` timestamp and
+/// `grace_window_secs` duration:
+/// - `grace_pins` expire when `pinned_until <= now`
+/// - unreachable `nodes` / `packs` / abandoned unmodified ephemeral forks sweep when
+///   `created_at + grace_window_secs <= now`.
+pub async fn collect_garbage_with_grace<H: HeadStore, P: PackStore>(
+    head_store: &H,
+    pack_store: &P,
+    now: Timespec,
+    grace_window_secs: u64,
 ) -> Result<GcReport> {
     let _gc_guard = head_store.acquire_gc_lock(true).await?;
+
+    // Reap abandoned unmodified ephemeral forks older than grace whose writer lock is not held.
+    let _ = head_store
+        .prune_abandoned_ephemeral_forks(now, grace_window_secs)
+        .await?;
+
     let all_roots = head_store.list_all_roots().await?;
 
     let mut keep_nodes: HashSet<Digest> = HashSet::new();
@@ -38,9 +61,9 @@ pub async fn collect_garbage<H: HeadStore, P: PackStore>(
     let mut live_roots = 0usize;
 
     for gc_root in &all_roots {
-        // Skip expired grace pins; live heads/snapshots have `pinned_until == None`.
+        // Expire grace pins when `pinned_until <= now`; live heads/snapshots/RO pins have `None`.
         if let Some(until) = gc_root.pinned_until
-            && until <= grace_before
+            && until <= now
         {
             continue;
         }
@@ -63,43 +86,25 @@ pub async fn collect_garbage<H: HeadStore, P: PackStore>(
     }
 
     let mut swept_set: HashSet<PackId> = head_store
-        .sweep_metadata(&keep_nodes, &keep_packs, grace_before)
+        .sweep_metadata(&keep_nodes, &keep_packs, now, grace_window_secs)
         .await?
         .into_iter()
         .collect();
 
-    // Also unlink any genuine unindexed crash-orphan packs in PackStore (for example, packs
-    // written just before a crash prior to `commit_head`). Packs still indexed in `HeadStore`
-    // (such as packs from a deleted volume still protected inside `grace_before`) MUST NOT be
-    // deleted from `PackStore`, otherwise a later dedupe hit in `HeadStore::lookup_block` would
-    // point at a deleted pack (`ENOENT`). Because we hold the exclusive GC lock, no commit is
-    // concurrently in flight.
+    // Unlink any genuine unindexed crash-orphan packs in `PackStore` (packs written just before
+    // a crash prior to `commit_head`). Confirm orphan status authoritatively against `HeadStore`'s
+    // `packs` and `blocks` indexes instead of guessing from pack trailer reads, so transient I/O
+    // errors or grace-protected packs can never be deleted while still indexed.
+    let indexed_packs = head_store.list_indexed_packs().await?;
     let all_packs = pack_store.list_packs().await?;
     for pack_id in all_packs {
-        if keep_packs.contains(&pack_id) || swept_set.contains(&pack_id) {
+        if keep_packs.contains(&pack_id)
+            || swept_set.contains(&pack_id)
+            || indexed_packs.contains(&pack_id)
+        {
             continue;
         }
-        let still_indexed = match pack_store.read_pack_trailer(&pack_id).await {
-            Ok(trailer) => {
-                let mut indexed = false;
-                for entry in &trailer.entries {
-                    if let Some(loc) = head_store.lookup_block(&entry.digest).await?
-                        && loc.pack_id == pack_id
-                    {
-                        indexed = true;
-                        break;
-                    }
-                }
-                indexed
-            }
-            Err(_) => {
-                // Corrupt or truncated unindexed crash-orphan pack: safe to sweep.
-                false
-            }
-        };
-        if !still_indexed {
-            swept_set.insert(pack_id);
-        }
+        swept_set.insert(pack_id);
     }
 
     let mut swept_packs: Vec<PackId> = swept_set.into_iter().collect();
@@ -141,13 +146,19 @@ async fn mark_tree<H: HeadStore>(
             }
             Node::Leaf { entries } => {
                 for entry in entries {
-                    if entry.key.kind == KIND_EXTENT_DATA
-                        && let Ok(ExtentDataValue::Extent { digest: bdig, .. }) =
-                            ExtentDataValue::decode(&entry.value)
-                        && keep_blocks.insert(bdig)
-                        && let Some(loc) = head_store.lookup_block(&bdig).await?
-                    {
-                        keep_packs.insert(loc.pack_id);
+                    if entry.key.kind == KIND_EXTENT_DATA {
+                        match ExtentDataValue::decode(&entry.value)? {
+                            ExtentDataValue::Inline(_) => {}
+                            ExtentDataValue::Extent { digest: bdig, .. } => {
+                                if keep_blocks.insert(bdig) {
+                                    // Abort destructive sweep if any live extent references a
+                                    // block digest missing from the HeadStore block index.
+                                    let loc =
+                                        head_store.lookup_block(&bdig).await?.ok_or(Errno::EIO)?;
+                                    keep_packs.insert(loc.pack_id);
+                                }
+                            }
+                        }
                     }
                 }
             }

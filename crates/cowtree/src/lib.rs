@@ -21,12 +21,14 @@ pub use key::{
     KIND_DIR_INDEX, KIND_DIR_ITEM, KIND_EXTENT_DATA, KIND_INODE_ITEM, KIND_INODE_REF,
     KIND_ORPHAN_ITEM, KIND_XATTR_ITEM, TreeKey,
 };
-pub use node::{InternalEntry, LeafEntry, Node, RootObject};
+pub use node::{
+    InternalEntry, KEY_TAIL_MAX_BYTES, LeafEntry, Node, ROOT_FEATURE_ACCOUNTING, RootObject,
+};
 pub use pack::{PackBuilder, decode_pack_trailer, encode_pack, verify_block_digest};
 pub use store::{
     BlockLoc, CommitRequest, Digest, ForkRequest, GcLockGuard, GcRoot, HeadStore, PackId,
-    PackIndexEntry, PackMeta, PackStore, PackTrailer, SnapshotRecord, VolumeHead, VolumeId,
-    WriterLease, WriterLockGuard, WriterMode,
+    PackIndexEntry, PackMeta, PackStore, PackTrailer, RoPinGuard, SnapshotRecord, VolumeHead,
+    VolumeId, WriterLease, WriterLockGuard, WriterMode,
 };
 
 /// On-disk / IndexedDB format version (`contract.md` §2.15, §6).

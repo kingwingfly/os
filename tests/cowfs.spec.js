@@ -548,3 +548,75 @@ test('two browser tabs sharing profile Web Locks: Exclusive EBUSY, ForkOnBusy au
   await tab1.close();
   await tab2.close();
 });
+
+test('F1 hardening in real browser: multi-dbName OPFS isolation, /dev/vd0 & symlink ENOTBLK, negative truncate EINVAL, 4 GiB wasm32 truncate, and RO GC pin', async ({ page }) => {
+  await page.goto(origin + '/');
+  const res = await page.evaluate(async () => {
+    const dbA = 'os-cowfs-iso-a';
+    const dbB = 'os-cowfs-iso-b';
+    await rpc('format', { dbName: dbA, volume: 'vol-a' });
+    await rpc('format', { dbName: dbB, volume: 'vol-b' });
+
+    const openA = await rpc('open_rw', { dbName: dbA, volume: 'vol-a', mode: 'exclusive' });
+    const openB = await rpc('open_rw', { dbName: dbB, volume: 'vol-b', mode: 'exclusive' });
+    const payloadB = [...new Uint8Array(65536).fill(0x6b)];
+    await rpc('write_file', { dbName: dbA, hid: openA.hid, path: '/a.bin', bytes: [...new Uint8Array(65536).fill(0x1a)] });
+    await rpc('write_file', { dbName: dbB, hid: openB.hid, path: '/b.bin', bytes: payloadB });
+    await rpc('sync_fs', { dbName: dbA, hid: openA.hid });
+    await rpc('sync_fs', { dbName: dbB, hid: openB.hid });
+    await rpc('close_clean', { dbName: dbA, hid: openA.hid });
+    await rpc('close_clean', { dbName: dbB, hid: openB.hid });
+
+    // GC on dbA far in the future MUST NOT delete dbB's packs on shared OPFS origin!
+    const farFuture = Math.floor(Date.now() / 1000) + 86400;
+    await rpc('gc', { dbName: dbA, graceBeforeSec: farFuture });
+    const verifyB = await rpc('verify', { dbName: dbB, volume: 'vol-b' });
+    const roB = await rpc('open_ro', { dbName: dbB, volume: 'vol-b' });
+    const readB = await rpc('read_file', { dbName: dbB, hid: roB.hid, path: '/b.bin' });
+
+    // Overwrite & delete on dbB while roB is open, then run GC past grace window:
+    // roB's RO root pin MUST protect v1's pack from being swept!
+    const rwB2 = await rpc('open_rw', { dbName: dbB, volume: 'vol-b', mode: 'exclusive' });
+    await rpc('unlink', { dbName: dbB, hid: rwB2.hid, path: '/b.bin' });
+    await rpc('sync_fs', { dbName: dbB, hid: rwB2.hid });
+    await rpc('gc', { dbName: dbB, graceBeforeSec: farFuture });
+    await rpc('drop_caches', { dbName: dbB, hid: roB.hid });
+    const readBAfterGc = await rpc('read_file', { dbName: dbB, hid: roB.hid, path: '/b.bin' });
+    await rpc('close_clean', { dbName: dbB, hid: roB.hid });
+
+    // /dev/vd0 reachability, mounted mkfs EBUSY, symlink -> /dev/vd0 ENOTBLK, negative truncate EINVAL.
+    const vd0Stat = await rpc('stat', { dbName: dbB, hid: rwB2.hid, path: '/dev/vd0' });
+    const vd0MkfsErr = await rpcErrno('mkfs_target', { dbName: dbB, hid: rwB2.hid, target: '/dev/vd0', force: true });
+    await rpc('symlink', { dbName: dbB, hid: rwB2.hid, target: '/dev/vd0', linkpath: '/sym-vd0' });
+    const symMkfsErr = await rpcErrno('mkfs_target', { dbName: dbB, hid: rwB2.hid, target: '/sym-vd0', force: true });
+    const negTruncErr = await rpcErrno('truncate', { dbName: dbB, hid: rwB2.hid, path: '/neg.bin', size: -1 });
+
+    // 8 GiB -> 4 GiB sparse truncate of file with inline prefix on real wasm32 (32-bit usize)!
+    const prefix = [...new TextEncoder().encode('KEEP-INLINE-PREFIX')];
+    await rpc('write_file', { dbName: dbB, hid: rwB2.hid, path: '/inline4g.bin', bytes: prefix });
+    await rpc('truncate', { dbName: dbB, hid: rwB2.hid, path: '/inline4g.bin', size: 8 * 1024 * 1024 * 1024 });
+    await rpc('truncate', { dbName: dbB, hid: rwB2.hid, path: '/inline4g.bin', size: 4 * 1024 * 1024 * 1024 });
+    const keptPrefix = await rpc('read_range', { dbName: dbB, hid: rwB2.hid, path: '/inline4g.bin', offset: 0, len: prefix.length });
+    await rpc('close_clean', { dbName: dbB, hid: rwB2.hid });
+
+    return {
+      verifyBOk: verifyB.ok,
+      readBOk: readB.length === 65536 && readB[0] === 0x6b,
+      readBAfterGcOk: readBAfterGc.length === 65536 && readBAfterGc[0] === 0x6b,
+      vd0StatOk: vd0Stat?.rdev === 'vblk:vd0',
+      vd0MkfsErr,
+      symMkfsErr,
+      negTruncErr,
+      keptPrefix: new TextDecoder().decode(new Uint8Array(keptPrefix)),
+    };
+  });
+
+  expect(res.verifyBOk).toBe(true);
+  expect(res.readBOk).toBe(true);
+  expect(res.readBAfterGcOk).toBe(true);
+  expect(res.vd0StatOk).toBe(true);
+  expect(res.vd0MkfsErr).toBe('EBUSY');
+  expect(res.symMkfsErr).toBe('ENOTBLK');
+  expect(res.negTruncErr).toBe('EINVAL');
+  expect(res.keptPrefix).toBe('KEEP-INLINE-PREFIX');
+});

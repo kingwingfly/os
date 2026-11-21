@@ -54,11 +54,20 @@ pub enum WriterMode {
 }
 
 /// RAII guard holding the profile Web Lock (`os-vol:<uuid>`) or native exclusive `flock`.
-pub trait WriterLockGuard {}
+pub trait WriterLockGuard {
+    /// Optional backend-specific lease identifier (used by the JS Web Lock adapter for atomic
+    /// lease-validated delete/reformat).
+    fn lease_id(&self) -> Option<&str> {
+        None
+    }
+}
 
 /// RAII guard for GC coordination: commits take shared (`exclusive = false`),
 /// sweep takes exclusive (`exclusive = true`).
 pub trait GcLockGuard {}
+
+/// RAII guard keeping an open read-only or snapshot mount's root digest pinned against GC.
+pub trait RoPinGuard {}
 
 pub struct WriterLease {
     pub volume: VolumeId,
@@ -172,8 +181,23 @@ pub trait HeadStore {
         initial_nodes: &'a [(Digest, Vec<u8>)],
     ) -> BoxFuture<'a, VolumeHead>;
 
+    /// Configured GC grace window in seconds (default 600s).
+    fn grace_window_secs(&self) -> u64;
+
     /// Read last committed head for RO mount or fork source (takes NO exclusive writer lock).
     fn read_head<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, VolumeHead>;
+
+    /// Atomically select `volume`'s committed head (or named `snapshot`), verify its root node
+    /// exists, and register an active GC reader pin keeping that root reachable until unpinned
+    /// or dropped.
+    fn pin_ro_root<'a>(
+        &'a self,
+        volume: &'a VolumeId,
+        snapshot: Option<&'a str>,
+    ) -> BoxFuture<'a, (VolumeHead, Box<dyn RoPinGuard>)>;
+
+    /// Release an active RO/snapshot root pin cleanly (also released automatically on drop).
+    fn unpin_ro_root<'a>(&'a self, pin: Box<dyn RoPinGuard>) -> BoxFuture<'a, ()>;
 
     /// Acquire writer exclusion (`os-vol:<uuid>` / `flock`) and validate/bump fence per `mode`.
     fn acquire_writer<'a>(
@@ -222,22 +246,59 @@ pub trait HeadStore {
     /// O(1) persistent volume fork seeded at `source_root` (zero data bytes copied).
     fn fork_volume<'a>(&'a self, req: &'a ForkRequest) -> BoxFuture<'a, VolumeHead>;
 
-    /// Delete a volume head (e.g. clean-shutdown auto-prune of an unmodified tab fork).
+    /// Delete a volume head, along with its snapshots and receipts, refusing if leased (`EBUSY`).
     fn delete_volume<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, ()>;
 
-    /// Reachability GC lock: `exclusive == false` for commits, `exclusive == true` for sweep.
+    /// Atomically delete `lease.volume` (plus its snapshots and receipts) while holding `lease`,
+    /// verifying stored `(incarnation, fence, epoch)` (`ESTALE` on mismatch). When
+    /// `only_if_unmodified_ephemeral` is true, deletes ONLY if the stored head still has
+    /// `ephemeral_if_unmodified && !modified` (returning `Ok(false)` without deleting otherwise).
+    /// Always releases `lease` before returning.
+    fn delete_volume_with_lease<'a>(
+        &'a self,
+        lease: WriterLease,
+        only_if_unmodified_ephemeral: bool,
+    ) -> BoxFuture<'a, bool>;
+
+    /// Atomically replace an existing volume's head with a newly formatted head while holding its
+    /// exclusive writer `lease`: verifies `(incarnation, fence, epoch)` (`ESTALE` on mismatch),
+    /// deletes all prior snapshots and receipts for `lease.volume`, inserts `initial_nodes`, and
+    /// bumps `incarnation = cur.incarnation + 1` (`fence = 1, epoch = 0`). Releases `lease`.
+    fn reformat_volume_with_lease<'a>(
+        &'a self,
+        lease: WriterLease,
+        new_head: &'a VolumeHead,
+        initial_nodes: &'a [(Digest, Vec<u8>)],
+    ) -> BoxFuture<'a, VolumeHead>;
+
+    /// Reachability GC lock: `exclusive == false` for commits/forks/pins (waits while GC runs),
+    /// `exclusive == true` for sweep (non-blocking `EBUSY` if writers are active).
     fn acquire_gc_lock(&self, exclusive: bool) -> BoxFuture<'_, Box<dyn GcLockGuard>>;
 
-    /// Enumerate all reachable roots (all live heads, snapshots, and grace-window pins).
+    /// Enumerate all reachable roots (live heads, snapshots, active RO pins, and grace pins).
     fn list_all_roots(&self) -> BoxFuture<'_, Vec<GcRoot>>;
 
-    /// Remove unreachable nodes and pack index rows older than `grace_before`; returns
-    /// unreachable `PackId`s that the caller may now unlink from `PackStore`.
+    /// Enumerate all pack IDs currently referenced by `packs` or `blocks` metadata tables.
+    fn list_indexed_packs(&self) -> BoxFuture<'_, HashSet<PackId>>;
+
+    /// Prune abandoned unmodified ephemeral fork heads (`ephemeral_if_unmodified && !modified`)
+    /// whose writer lock is not held and whose timestamp is older than `grace_window_secs` before
+    /// `now`. Called by GC under the exclusive GC lock before marking.
+    fn prune_abandoned_ephemeral_forks(
+        &self,
+        now: Timespec,
+        grace_window_secs: u64,
+    ) -> BoxFuture<'_, usize>;
+
+    /// Remove expired grace pins (`pinned_until <= now`), unreachable nodes/packs whose
+    /// `created_at` is at least `grace_window_secs` older than `now`, and aged receipts.
+    /// Returns unreachable `PackId`s that the caller may now unlink from `PackStore`.
     fn sweep_metadata<'a>(
         &'a self,
         keep_nodes: &'a HashSet<Digest>,
         keep_packs: &'a HashSet<PackId>,
-        grace_before: Timespec,
+        now: Timespec,
+        grace_window_secs: u64,
     ) -> BoxFuture<'a, Vec<PackId>>;
 }
 
