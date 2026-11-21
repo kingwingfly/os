@@ -16,7 +16,7 @@ const GUEST_ACCOUNT = { uid: 65534, gid: 65534, groups: [65534], user: 'guest', 
 const AF_UNIX = 1;
 const SOCK_STREAM = 1, SOCK_DGRAM = 2, SOCK_SEQPACKET = 5;
 const SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000;
-const SHUT_WR = 1;
+const SHUT_RD = 0, SHUT_WR = 1;
 const SOL_SOCKET = 1, SO_TYPE = 3, SO_ACCEPTCONN = 30;
 const MSG_PEEK = 0x2, MSG_CTRUNC = 0x8, MSG_TRUNC = 0x20, MSG_DONTWAIT = 0x40, MSG_NOSIGNAL = 0x4000, MSG_CMSG_CLOEXEC = 0x40000000;
 
@@ -176,6 +176,7 @@ async function uploadWasm(page, base, name, build, { sync = false, withFork = fa
     (import "wasix_32v1" "fd_renumber" (func $dup2 (param i32 i32) (result i32)))
     (import "wasix_32v1" "fd_fdflags_get" (func $fdflags_get (param i32 i32) (result i32)))
     (import "wasix_32v1" "proc_id" (func $proc_id (param i32) (result i32)))
+    (import "wasix_32v1" "proc_signal" (func $proc_signal (param i32 i32) (result i32)))
     ${withFork ? '(import "wasix_32v1" "proc_fork" (func $proc_fork (param i32 i32) (result i32)))' : ''}
     ${withFork ? '(import "wasix_32v1" "proc_exec" (func $proc_exec (param i32 i32 i32 i32)))' : ''}
     (memory (export "memory") 4)
@@ -532,8 +533,8 @@ for (const syncMode of [false, true]) {
       ${eq('(call $fd_close (local.get $c))', 0)}
       ${eq('(call $fd_close (local.get $d))', 0)}
 
-      ;; Call recvmsg #2 -> MUST receive ONLY "BBB" (3 bytes) + 3 fds [pty, subsock, cloud]!
-      ${eq(`(call $sock_recvmsg (local.get $b) (i32.const 4096) (i32.const 64) (i32.const 1024) (i32.const 4) (i32.const 108) (i32.const 120) (i32.const ${MSG_CMSG_CLOEXEC}) (i32.const 112) (i32.const 116))`, 0)}
+      ;; Call recvmsg #2 WITHOUT MSG_CMSG_CLOEXEC -> MUST receive ONLY "BBB" (3 bytes) + 3 fds [pty, subsock, cloud] with FD_CLOEXEC == 0!
+      ${eq('(call $sock_recvmsg (local.get $b) (i32.const 4096) (i32.const 64) (i32.const 1024) (i32.const 4) (i32.const 108) (i32.const 120) (i32.const 0) (i32.const 112) (i32.const 116))', 0)}
       ${eq('(i32.load (i32.const 112))', 3)}
       ${eq('(i32.load8_u (i32.const 4096))', 66)} ;; 'B'
       ${eq('(i32.load8_u (i32.const 4098))', 66)}
@@ -541,6 +542,14 @@ for (const syncMode of [false, true]) {
       (local.set $c (i32.load (i32.const 1024))) ;; pty slave fd
       (local.set $d (i32.load (i32.const 1028))) ;; sub-unix-sock fd
       (local.set $e (i32.load (i32.const 1032))) ;; CloudFs fd
+
+      ;; Verify FD_CLOEXEC is 0 when MSG_CMSG_CLOEXEC was NOT requested!
+      ${eq('(call $fdflags_get (local.get $c) (i32.const 140))', 0)}
+      ${eq('(i32.load16_u (i32.const 140))', 0)}
+      ${eq('(call $fdflags_get (local.get $d) (i32.const 140))', 0)}
+      ${eq('(i32.load16_u (i32.const 140))', 0)}
+      ${eq('(call $fdflags_get (local.get $e) (i32.const 140))', 0)}
+      ${eq('(i32.load16_u (i32.const 140))', 0)}
 
       ;; Read PTY slave -> gets "pty-hi\\n" (7 bytes)
       (call $read_exact (local.get $c) (i32.const 4400) (i32.const 7))
@@ -689,6 +698,22 @@ test('U-06: poll_oneoff readiness & hangup + SIGPIPE / MSG_NOSIGNAL', async ({ p
     ;; Close $b, then send on $a with MSG_NOSIGNAL -> returns EPIPE (64) WITHOUT killing process!
     ${eq('(call $fd_close (local.get $b))', 0)}
     ${eq(`(call $sock_sendmsg (local.get $a) ${text('x')} (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const ${MSG_NOSIGNAL}) (i32.const 112))`, ERR.EPIPE)}
+    ${eq('(call $fd_close (local.get $a))', 0)}
+
+    ;; SHUT_RD on SOCK_STREAM -> poll_oneoff reports hangup (1) AND recvmsg returns EOF (0) immediately!
+    ${eq(`(call $sock_socketpair (i32.const ${AF_UNIX}) (i32.const ${SOCK_STREAM}) (i32.const 0) (i32.const 100))`, 0)}
+    (local.set $a (i32.load (i32.const 100)))
+    (local.set $b (i32.load (i32.const 104)))
+    ${eq(`(call $sock_shutdown (local.get $b) (i32.const ${SHUT_RD}))`, 0)}
+    (i64.store (i32.const 200) (i64.const 33))
+    (i32.store8 (i32.const 208) (i32.const 1))
+    (i32.store (i32.const 216) (local.get $b))
+    ${eq('(call $poll_oneoff (i32.const 200) (i32.const 300) (i32.const 1) (i32.const 108))', 0)}
+    ${eq('(i32.load (i32.const 108))', 1)}
+    ${eq('(i32.load16_u (i32.const 324))', 1)}
+    ${eq('(call $sock_recvmsg (local.get $b) (i32.const 4096) (i32.const 16) (i32.const 0) (i32.const 0) (i32.const 112) (i32.const 120) (i32.const 0) (i32.const 116) (i32.const 136))', 0)}
+    ${eq('(i32.load (i32.const 116))', 0)}
+    ${eq('(call $fd_close (local.get $b))', 0)}
     ${eq('(call $fd_close (local.get $a))', 0)}
     ${say('POLL_NOSIGNAL_OK\n')}
   `);
@@ -877,10 +902,15 @@ test('U-10: SCM_RIGHTS remote CloudFs open-ref attenuation & revocation on sende
     ${eq('(i32.load (i32.const 104))', 1)}
     (local.set $b (i32.load (i32.const 1024))) ;; attenuated CloudFs fd
 
-    ;; 1. Reading attenuated fd succeeds!
+    ;; 1. Reading attenuated fd (and a dup'd copy of it!) succeeds!
     (call $read_exact (local.get $b) (i32.const 4200) (i32.const 21))
     ${eq('(i32.load8_u (i32.const 4200))', 116)} ;; 't'
     ${eq('(i32.load8_u (i32.const 4220))', 97)}  ;; 'a'
+    ${eq('(call $fd_dup (local.get $b) (i32.const 140))', 0)}
+    (local.set $d (i32.load (i32.const 140)))
+    ${eq('(call $fd_seek (local.get $d) (i64.const 0) (i32.const 0) (i32.const 200))', 0)}
+    (call $read_exact (local.get $d) (i32.const 4300) (i32.const 21))
+    ${eq('(i32.load8_u (i32.const 4300))', 116)} ;; 't'
 
     ;; 2. Direct open of another 0600 root CloudFs file MUST fail -EACCES!
     ${eq(`(call $open ${text(secret2)} (i32.const 0) (i32.const 0))`, -ERR.EACCES)}
@@ -889,13 +919,15 @@ test('U-10: SCM_RIGHTS remote CloudFs open-ref attenuation & revocation on sende
     ;; 3. Wait for sender to be SIGKILLed (EOF on $a)
     ${eq('(call $read_once (local.get $a) (i32.const 4096) (i32.const 16))', 0)}
 
-    ;; 4. After sender's token is revoked, seeking/reading attenuated fd MUST fail with EACCES!
+    ;; 4. After sender's token is revoked, seeking/reading BOTH original & dup'd attenuated fd MUST fail with EACCES!
     (local.set $n (call $fd_seek (local.get $b) (i64.const 0) (i32.const 0) (i32.const 200)))
     ${assertExpr(`(i32.eq (local.get $n) (i32.const ${ERR.EACCES}))`)}
     (i32.store (i32.const 16) (i32.const 4200))
     (i32.store (i32.const 20) (i32.const 21))
     ${eq('(call $fd_read (local.get $b) (i32.const 16) (i32.const 1) (i32.const 24))', ERR.EACCES)}
+    ${eq('(call $fd_read (local.get $d) (i32.const 16) (i32.const 1) (i32.const 24))', ERR.EACCES)}
 
+    ${eq('(call $fd_close (local.get $d))', 0)}
     ${eq('(call $fd_close (local.get $b))', 0)}
     ${eq('(call $fd_close (local.get $a))', 0)}
     ${say('REVOKED_OK\n')}
@@ -1000,6 +1032,87 @@ test('U-11: SCM_RIGHTS DoS limits (>64 EINVAL, quota ETOOMANYREFS), invalid-fd a
   expect(await hostOutput(page, 'u11')).toContain('U11_OK');
 
   // Verify ZERO leaked sockets, bound inodes, in-flight fds, or SockArena slots in client-kernel!
+  const stats = (await hostCall(page, 'run_sock_stats')).ok;
+  expect(stats).toEqual({
+    activeSockets: 0,
+    boundInodes: 0,
+    inflightGlobal: 0,
+    allocatedArenaSlots: 0,
+  });
+});
+
+test('U-06 & U-11 (SIGKILL cleanup): POSIX kill(pid, 9) unblocks peer SAB stream with EOF and drains queued PTY + ArenaPipe with zero leaks', async ({ page }) => {
+  const killSock = '/tmp/u11-kill.sock';
+
+  // Peer binds killSock, accepts victim, then blocks reading until victim is killed via POSIX proc_signal(pid, 9).
+  const peerPath = await uploadWasm(page, base, 'u11-kill-peer', ({ text, say, sysJson, eq }) => `
+    ${eq(`(call $sock_socket (i32.const ${AF_UNIX}) (i32.const ${SOCK_STREAM}) (i32.const 0) (i32.const 100))`, 0)}
+    (local.set $a (i32.load (i32.const 100)))
+    ${eq(`(call $sock_bind (local.get $a) ${text(killSock)})`, 0)}
+    ${sysJson([{ chmod: { path: killSock, mode: 0o666 } }])}
+    ${eq('(call $sock_listen (local.get $a) (i32.const 4))', 0)}
+    ${say('PEER_READY\n')}
+    ${eq('(call $sock_accept (local.get $a) (i32.const 0) (i32.const 104))', 0)}
+    (local.set $b (i32.load (i32.const 104)))
+    ${say('PEER_ACCEPTED\n')}
+    ;; Block reading $b -> MUST unblock immediately with EOF (0) when victim receives POSIX SIGKILL!
+    ${eq('(call $read_once (local.get $b) (i32.const 4096) (i32.const 16))', 0)}
+    ${eq('(call $fd_close (local.get $b))', 0)}
+    ${eq('(call $fd_close (local.get $a))', 0)}
+    ${eq(`(call $unlink (i32.const 3) ${text(killSock)})`, 0)}
+    ${say('PEER_EOF_OK\n')}
+  `);
+
+  // Victim connects to peer AND queues an ArenaPipe + PTY handle in-flight via SCM_RIGHTS, then blocks until SIGKILL!
+  const victimPath = await uploadWasm(page, base, 'u11-kill-victim', ({ text, say, eq, assertExpr }) => `
+    ${eq(`(call $sock_socket (i32.const ${AF_UNIX}) (i32.const ${SOCK_STREAM}) (i32.const 0) (i32.const 100))`, 0)}
+    (local.set $a (i32.load (i32.const 100)))
+    ${eq(`(call $sock_connect (local.get $a) ${text(killSock)})`, 0)}
+
+    ;; Create ArenaPipe ($b/$c) and PTY master ($d), queue all three in-flight onto an unread local socketpair ($e/$f).
+    ${eq('(call $fd_pipe (i32.const 104) (i32.const 108))', 0)}
+    (local.set $b (i32.load (i32.const 104)))
+    (local.set $c (i32.load (i32.const 108)))
+    (local.set $d (call $open ${text('/dev/ptmx')} (i32.const 2) (i32.const 0)))
+    ${assertExpr('(i32.ge_s (local.get $d) (i32.const 0))')}
+    ${eq(`(call $sock_socketpair (i32.const ${AF_UNIX}) (i32.const ${SOCK_STREAM}) (i32.const 0) (i32.const 112))`, 0)}
+    (local.set $e (i32.load (i32.const 112)))
+    (local.set $f (i32.load (i32.const 116)))
+    (i32.store (i32.const 1024) (local.get $b))
+    (i32.store (i32.const 1028) (local.get $c))
+    (i32.store (i32.const 1032) (local.get $d))
+    ${eq(`(call $sock_sendmsg (local.get $e) ${text('Q')} (i32.const 1024) (i32.const 3) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 120))`, 0)}
+
+    ;; Publish our PID and block waiting on $a until POSIX proc_signal(pid, 9) kills us!
+    ${eq('(call $proc_id (i32.const 124))', 0)}
+    ${say('VICTIM_PID=')} (call $say_u32 (i32.load (i32.const 124))) ${say('\n')}
+    (drop (call $read_once (local.get $a) (i32.const 4096) (i32.const 16)))
+  `);
+
+  await startHost(page, 'u11-peer', peerPath);
+  await hostReady(page, 'u11-peer', 'PEER_READY');
+  await startHost(page, 'u11-victim', victimPath);
+  await hostReady(page, 'u11-victim', 'VICTIM_PID=');
+  await hostReady(page, 'u11-peer', 'PEER_ACCEPTED');
+
+  const victimOut = await hostOutput(page, 'u11-victim');
+  const victimPid = Number(victimOut.match(/VICTIM_PID=(\d+)/)[1]);
+  expect(victimPid).toBeGreaterThan(0);
+
+  // Spawn an unrelated POSIX killer calling wasix_32v1::proc_signal(victimPid, 9)!
+  const killerPath = await uploadWasm(page, base, 'u11-killer', ({ say, eq }) => `
+    ${eq(`(call $proc_signal (i32.const ${victimPid}) (i32.const 9))`, 0)}
+    ${say('KILLED_OK\n')}
+  `);
+  await startHost(page, 'u11-killer', killerPath);
+  await hostResult(page, 'u11-killer', 0);
+  expect(await hostOutput(page, 'u11-killer')).toContain('KILLED_OK');
+
+  // Peer MUST observe EOF without hanging, victim exits 128 + 9, and ZERO sockets/slots/inflight fds remain!
+  await hostResult(page, 'u11-peer', 0);
+  expect(await hostOutput(page, 'u11-peer')).toContain('PEER_EOF_OK');
+  await hostResult(page, 'u11-victim', 128 + 9);
+
   const stats = (await hostCall(page, 'run_sock_stats')).ok;
   expect(stats).toEqual({
     activeSockets: 0,

@@ -17,6 +17,19 @@ use vfs::unix_sock::{
 };
 use wasm_bindgen::prelude::*;
 
+/// Deferred JS-side socket cleanup buffered when a process is torn down via `kill(pid, 9)` /
+/// `cgroup.kill` (`vfs_process_exit_cleanup` / `proc_exit`) before `exec.mjs` calls
+/// `sock_release_process(pid)`. Drained and applied via `applySockCleanup` so peer SAB rings
+/// never hang, freed arena slots are always fenced, and queued PTY/ArenaPipe handles never leak.
+#[derive(Default)]
+pub(crate) struct PendingSockCleanup {
+    pub(crate) freed_slots: Vec<ArenaSlot>,
+    pub(crate) peer_wr_closed: Vec<ArenaSlot>,
+    pub(crate) peer_rd_closed: Vec<ArenaSlot>,
+    pub(crate) dropped_ptys: Vec<Value>,
+    pub(crate) dropped_pipes: Vec<Value>,
+}
+
 const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn b64_encode(input: &[u8]) -> String {
@@ -265,6 +278,43 @@ impl Kernel {
         (dropped_ptys, dropped_pipes)
     }
 
+    /// Dispose Rust-side dropped fds from `batch` and buffer JS-side SAB/PTY/ArenaPipe cleanup
+    /// on `VfsRuntime` so `exec.mjs` can never lose wakeups or leak handles across `SIGKILL`.
+    pub(crate) async fn record_unix_sock_cleanup(&self, batch: CleanupBatch) {
+        if batch.dropped_fds.is_empty()
+            && batch.freed_slots.is_empty()
+            && batch.peer_wr_closed.is_empty()
+            && batch.peer_rd_closed.is_empty()
+        {
+            return;
+        }
+        let (dropped_ptys, dropped_pipes) =
+            self.dispose_unix_sock_dropped_fds(batch.dropped_fds).await;
+        let mut rt = self.vfs_rt.borrow_mut();
+        rt.pending_sock_cleanup
+            .freed_slots
+            .extend(batch.freed_slots);
+        rt.pending_sock_cleanup
+            .peer_wr_closed
+            .extend(batch.peer_wr_closed);
+        rt.pending_sock_cleanup
+            .peer_rd_closed
+            .extend(batch.peer_rd_closed);
+        rt.pending_sock_cleanup.dropped_ptys.extend(dropped_ptys);
+        rt.pending_sock_cleanup.dropped_pipes.extend(dropped_pipes);
+    }
+
+    pub(crate) fn take_pending_sock_cleanup_json(&self) -> Result<JsValue, JsValue> {
+        let pending = std::mem::take(&mut self.vfs_rt.borrow_mut().pending_sock_cleanup);
+        json_to_js(&json!({
+            "freedSlots": slots_json(&pending.freed_slots),
+            "peerWrClosed": slots_json(&pending.peer_wr_closed),
+            "peerRdClosed": slots_json(&pending.peer_rd_closed),
+            "droppedPtys": pending.dropped_ptys,
+            "droppedPipes": pending.dropped_pipes,
+        }))
+    }
+
     async fn cleanup_batch_json(&self, batch: CleanupBatch) -> Result<JsValue, JsValue> {
         let (dropped_ptys, dropped_pipes) =
             self.dispose_unix_sock_dropped_fds(batch.dropped_fds).await;
@@ -476,11 +526,18 @@ impl Kernel {
         self.cleanup_batch_json(batch).await
     }
 
-    /// Release all sockets held by an exiting or crashed process `pid`.
+    /// Release all sockets held by an exiting or crashed process `pid`, merging and draining any
+    /// cleanup already buffered by `vfs_process_exit_cleanup` / `proc_exit` (e.g. `SIGKILL`).
     pub async fn sock_release_process(&self, pid: u32) -> Result<JsValue, JsValue> {
         let unix_sock = Rc::clone(&self.vfs_rt.borrow().unix_sock);
         let batch = unix_sock.borrow_mut().release_process(pid);
-        self.cleanup_batch_json(batch).await
+        self.record_unix_sock_cleanup(batch).await;
+        self.take_pending_sock_cleanup_json()
+    }
+
+    /// Drain any JS-side socket cleanup buffered during `kill(pid, 9)` / `cgroup.kill` teardown.
+    pub fn sock_drain_cleanup(&self) -> Result<JsValue, JsValue> {
+        self.take_pending_sock_cleanup_json()
     }
 
     /// Send payload + optional `SCM_RIGHTS` fds + optional destination path (`sendmsg(2)`).
@@ -736,9 +793,11 @@ impl Kernel {
                             let same_token =
                                 receiver_cloud_access && receiver_remote_token == origin_token;
                             let needs_attenuation = is_cloud_file && !same_token;
-                            if needs_attenuation
-                                && let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid)
-                            {
+                            if needs_attenuation {
+                                let mut rt = self.vfs_rt.borrow_mut();
+                                let meta = rt.proc_meta.entry(pid).or_insert_with(|| {
+                                    crate::vfs_engine::ProcessVfsMeta::new(None, false)
+                                });
                                 meta.attenuated_kfds
                                     .insert(new_kfd, (origin_pid, origin_token.clone()));
                             }

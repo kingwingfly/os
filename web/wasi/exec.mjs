@@ -153,6 +153,12 @@ function releaseArenaPipes(pid) {
 }
 async function applySockCleanup(res) {
   if (!res) return;
+  const hasWork = (res.peerWrClosed?.length ?? 0) > 0
+    || (res.peerRdClosed?.length ?? 0) > 0
+    || (res.freedSlots?.length ?? 0) > 0
+    || (res.droppedPtys?.length ?? 0) > 0
+    || (res.droppedPipes?.length ?? 0) > 0;
+  if (!hasWork) return;
   if (sockArena) {
     for (const s of res.peerWrClosed ?? []) new ArenaRing(sockArena, s.slot, s.gen).closeWriter();
     for (const s of res.peerRdClosed ?? []) new ArenaRing(sockArena, s.slot, s.gen).closeReader();
@@ -175,6 +181,13 @@ async function applySockCleanup(res) {
     }
   }
   notifySockets();
+}
+async function drainPendingSockCleanup() {
+  if (!globalThis.kernel?.sock_drain_cleanup) return;
+  try {
+    const res = globalThis.kernel.sock_drain_cleanup();
+    await applySockCleanup(res);
+  } catch { /* kernel torn down */ }
 }
 // A process line's open files (web/wasi/shared.js): the table a process started here shares
 // with what it forks, and what each of its descriptions is, as its processes said when they
@@ -279,6 +292,7 @@ const devices = new PtyDevices({
 // Retain an exiting host's completion while its shared descriptors are closing.
 const completing = new Map();
 export const deliverSignal = async ({ pid }) => {
+  await drainPendingSockCleanup();
   if (pid && !hosted.has(pid)) return;
   await reconciling;
   await reconcile();
@@ -286,11 +300,11 @@ export const deliverSignal = async ({ pid }) => {
 
 let reconciling;
 export function reconcile() {
-  if (!hosted.size) return Promise.resolve();
+  if (!hosted.size) return drainPendingSockCleanup();
   if (reconciling) return reconciling;
   const checking = new Map(hosted);
   const versions = new Map([...checking].map(([pid, process]) => [pid, process.membershipVersion]));
-  return reconciling = kernelCall('sync', { acknowledged: Object.fromEntries([...checking].map(([pid, process]) => [pid, [...process.received.values()]])) }).then(rows => {
+  return reconciling = kernelCall('sync', { acknowledged: Object.fromEntries([...checking].map(([pid, process]) => [pid, [...process.received.values()]])) }).then(async rows => {
     let acknowledge = false;
     const found = new Map(rows.map(row => [row.pid, row]));
     // Pass 1: terminate dead/zombie processes first so their pipes and PTY masters
@@ -314,6 +328,7 @@ export function reconcile() {
         acknowledge = true;
       }
     }
+    await drainPendingSockCleanup();
     if (acknowledge) setTimeout(() => { void reconcile(); }, 0);
   }).catch(() => {}).finally(() => { reconciling = null; });
 }

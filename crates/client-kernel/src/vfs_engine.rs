@@ -1866,6 +1866,7 @@ pub(crate) struct VfsRuntime {
     next_read_stream: u32,
     pub(crate) lock_waits: HashMap<(u32, u32), Rc<LockCancel>>,
     pub(crate) unix_sock: Rc<RefCell<vfs::unix_sock::UnixSocketTable>>,
+    pub(crate) pending_sock_cleanup: crate::unix_sock_bridge::PendingSockCleanup,
     pub(crate) uid_names: HashMap<u32, String>,
     pub(crate) gid_names: HashMap<u32, String>,
     next_tmp_id: u64,
@@ -2248,6 +2249,7 @@ impl VfsRuntime {
             next_read_stream: 1,
             lock_waits: HashMap::new(),
             unix_sock: Rc::new(RefCell::new(vfs::unix_sock::UnixSocketTable::new())),
+            pending_sock_cleanup: crate::unix_sock_bridge::PendingSockCleanup::default(),
             uid_names: default_uid_names(),
             gid_names: default_gid_names(),
             next_tmp_id: 100,
@@ -2677,6 +2679,7 @@ impl Kernel {
         } else {
             Call::Close { fd: remote }
         };
+        let is_attenuated = attenuated.is_some();
         let result = match attenuated {
             Some((owner_pid, owner_tok)) => {
                 self.forward_server_call_attenuated(owner_pid, &owner_tok, call)
@@ -2687,12 +2690,20 @@ impl Kernel {
                     .await
             }
         };
+        let revoked_attenuated =
+            is_attenuated && result.as_ref().is_err_and(|e| e.errno == Errno::EACCES);
         if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
-            if result.is_ok() || result.as_ref().is_err_and(|e| e.errno == Errno::EBADF) {
+            if result.is_ok()
+                || result.as_ref().is_err_and(|e| e.errno == Errno::EBADF)
+                || revoked_attenuated
+            {
                 meta.server_fds.remove(&fd);
             } else if let Some(entry) = meta.server_fds.get_mut(&fd) {
                 entry.closing = false;
             }
+        }
+        if revoked_attenuated {
+            return Ok(Value::Null);
         }
         result
     }
@@ -2720,8 +2731,7 @@ impl Kernel {
             )
         };
         let sock_cleanup = unix_sock.borrow_mut().release_process(pid);
-        self.dispose_unix_sock_dropped_fds(sock_cleanup.dropped_fds)
-            .await;
+        self.record_unix_sock_cleanup(sock_cleanup).await;
         for w in waits {
             w.cancel();
         }
@@ -5169,9 +5179,19 @@ impl Kernel {
 
     pub async fn proc_exec_preserve(&self, pid: u32) -> Result<(), JsValue> {
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move { vfs.exec_preserve(pid).await })
-            .await
-            .map_err(map_errno)?;
+        self.with_proc_scope(pid, {
+            let vfs = vfs.clone();
+            async move { vfs.exec_preserve(pid).await }
+        })
+        .await
+        .map_err(map_errno)?;
+        if let Ok(fds) = vfs.process_fds(pid) {
+            let table = fds.borrow();
+            if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+                meta.attenuated_kfds
+                    .retain(|&kfd, _| table.get(kfd).is_ok());
+            }
+        }
         self.close_server_descriptors(pid, true)
             .await
             .map_err(map_errno)
@@ -5291,8 +5311,7 @@ impl Kernel {
             )
         };
         let sock_cleanup = unix_sock.borrow_mut().release_process(pid);
-        self.dispose_unix_sock_dropped_fds(sock_cleanup.dropped_fds)
-            .await;
+        self.record_unix_sock_cleanup(sock_cleanup).await;
         for w in waits {
             w.cancel();
         }
@@ -5975,9 +5994,10 @@ impl Kernel {
     }
 
     pub async fn kfd_readdir(&self, pid: u32, kfd: u32) -> Result<JsValue, JsValue> {
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let entries = self
-            .with_proc_scope(pid, async move { vfs.fd_readdir(pid, kfd).await })
+            .with_proc_scope(scope_pid, async move { vfs.fd_readdir(pid, kfd).await })
             .await
             .map_err(map_errno)?;
         let out: Vec<Value> = entries
@@ -6012,10 +6032,14 @@ impl Kernel {
     }
 
     pub async fn kfd_ftruncate(&self, pid: u32, kfd: u32, size: u64) -> Result<(), JsValue> {
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move { vfs.ftruncate(pid, kfd, size).await })
-            .await
-            .map_err(map_errno)
+        self.with_proc_scope(
+            scope_pid,
+            async move { vfs.ftruncate(pid, kfd, size).await },
+        )
+        .await
+        .map_err(map_errno)
     }
 
     pub async fn kfd_futimens(
@@ -6029,8 +6053,9 @@ impl Kernel {
             .map_err(|e| vfs_js_err(Errno::EINVAL, e.to_string()))?;
         let mtime: Time = serde_json::from_str(&mtime_json)
             .map_err(|e| vfs_js_err(Errno::EINVAL, e.to_string()))?;
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move {
+        self.with_proc_scope(scope_pid, async move {
             vfs.fsetattr(
                 pid,
                 kfd,
@@ -6048,8 +6073,9 @@ impl Kernel {
     }
 
     pub async fn kfd_fsync(&self, pid: u32, kfd: u32, data_only: bool) -> Result<(), JsValue> {
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move {
+        self.with_proc_scope(scope_pid, async move {
             if data_only {
                 vfs.fdatasync(pid, kfd).await
             } else {
@@ -6097,6 +6123,7 @@ impl Kernel {
             _ => return Err(map_errno(Errno::EINVAL)),
         };
         let range = LockRange::new(start, end).ok_or_else(|| map_errno(Errno::EINVAL))?;
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let cancel = if wait {
             let c = Rc::new(LockCancel::default());
@@ -6113,7 +6140,7 @@ impl Kernel {
             None
         };
         let res = self
-            .with_proc_scope(pid, async move {
+            .with_proc_scope(scope_pid, async move {
                 let fds = vfs.process_fds(pid)?;
                 let file = fds.borrow().get(kfd)?;
                 if let Some(c) = &cancel {
@@ -6149,8 +6176,9 @@ impl Kernel {
             _ => return Err(map_errno(Errno::EINVAL)),
         };
         let range = LockRange::new(start, end).ok_or_else(|| map_errno(Errno::EINVAL))?;
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move {
+        self.with_proc_scope(scope_pid, async move {
             let fds = vfs.process_fds(pid)?;
             let file = fds.borrow().get(kfd)?;
             file.unlock(fam, range).await
@@ -6173,9 +6201,10 @@ impl Kernel {
             _ => return Err(map_errno(Errno::EINVAL)),
         };
         let range = LockRange::new(start, end).ok_or_else(|| map_errno(Errno::EINVAL))?;
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let conflict = self
-            .with_proc_scope(pid, async move {
+            .with_proc_scope(scope_pid, async move {
                 let fds = vfs.process_fds(pid)?;
                 let file = fds.borrow().get(kfd)?;
                 file.test_lock(lk, range).await
@@ -6192,22 +6221,43 @@ impl Kernel {
                 .proc_meta
                 .get_mut(&pid)
                 .ok_or_else(|| map_errno(Errno::ESRCH))?;
-            let sfd = meta
-                .server_fds
-                .get(&kfd)
-                .filter(|e| !e.closing)
-                .ok_or_else(|| map_errno(Errno::EBADF))?
-                .sfd
-                .clone();
-            return meta.alloc_server_fd(sfd, false).map_err(map_errno);
+            let (sfd, attenuated_token) = {
+                let entry = meta
+                    .server_fds
+                    .get(&kfd)
+                    .filter(|e| !e.closing)
+                    .ok_or_else(|| map_errno(Errno::EBADF))?;
+                (entry.sfd.clone(), entry.attenuated_token.clone())
+            };
+            return meta
+                .alloc_server_fd_with_attenuation(sfd, false, attenuated_token)
+                .map_err(map_errno);
         }
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        vfs.dup(pid, kfd, 0, false).map_err(map_errno)
+        let new_kfd = vfs.dup(pid, kfd, 0, false).map_err(map_errno)?;
+        if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+            if let Some(att) = meta.attenuated_kfds.get(&kfd).cloned() {
+                meta.attenuated_kfds.insert(new_kfd, att);
+            } else {
+                meta.attenuated_kfds.remove(&new_kfd);
+            }
+        }
+        Ok(new_kfd)
     }
 
     pub async fn kfd_dup2(&self, pid: u32, old_kfd: u32, new_kfd: u32) -> Result<u32, JsValue> {
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        vfs.dup2(pid, old_kfd, new_kfd).await.map_err(map_errno)
+        let res = vfs.dup2(pid, old_kfd, new_kfd).await.map_err(map_errno)?;
+        if old_kfd != res
+            && let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid)
+        {
+            if let Some(att) = meta.attenuated_kfds.get(&old_kfd).cloned() {
+                meta.attenuated_kfds.insert(res, att);
+            } else {
+                meta.attenuated_kfds.remove(&res);
+            }
+        }
+        Ok(res)
     }
 
     pub fn kfd_set_cloexec(&self, pid: u32, kfd: u32, cloexec: bool) -> Result<(), JsValue> {

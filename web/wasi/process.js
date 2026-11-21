@@ -859,6 +859,9 @@ function sockRecvStream(found, bufLen, maxFds, flags) {
   for (;;) {
     pause(true);
     const seen = Atomics.load(ring.hdr, HDR_CHANGES);
+    if (ring.rdClosed) {
+      return { data: new Uint8Array(0), fds: [], peerCred: cachedPeerCred(found), outFlags: 0 };
+    }
     if (ring.hasAncillary) {
       const tail = ring.tailOffset;
       const ancOff = ring.ancillaryOffset;
@@ -880,18 +883,19 @@ function sockRecvStream(found, bufLen, maxFds, flags) {
           return { data, fds: res.fds ?? [], peerCred: res.peerCred, outFlags: res.flags ?? 0 };
         }
       } else if (ring.queued > 0) {
-        const data = ring.read(bufLen, undefined, { nonblock: true, peek, maxOffset: ancOff });
+        const data = ring.read(bufLen, undefined, { nonblock: true, peek, maxOffset: ancOff, stopAtAncillary: true });
         if (data && data.length > 0) {
           return { data, fds: [], peerCred: cachedPeerCred(found), outFlags: 0 };
         }
       }
     } else if (ring.queued > 0) {
-      const data = ring.read(bufLen, undefined, { nonblock: true, peek });
+      const data = ring.read(bufLen, undefined, { nonblock: true, peek, stopAtAncillary: true });
       if (data && data.length > 0) {
         return { data, fds: [], peerCred: cachedPeerCred(found), outFlags: 0 };
       }
+      if (ring.hasAncillary) continue;
     }
-    if (ring.wrClosed && ring.queued === 0 && !ring.hasAncillary) {
+    if ((ring.wrClosed || ring.rdClosed) && ring.queued === 0 && !ring.hasAncillary) {
       return { data: new Uint8Array(0), fds: [], peerCred: cachedPeerCred(found), outFlags: 0 };
     }
     if (nonblock) throw new Errno(ERRNO.EAGAIN);
@@ -1772,7 +1776,7 @@ const wasi = {
           hasSocketLike = true;
           if (found.sockType === SOCK_STREAM && found.rxRing && found.txRing) {
             if (sub.type === 1) {
-              hangup = found.rxRing.wrClosed;
+              hangup = found.rxRing.wrClosed || found.rxRing.rdClosed;
               const hasData = found.rxRing.queued > 0 || found.rxRing.hasAncillary;
               if (!hasData && !hangup) continue;
               nbytes = found.rxRing.queued;
@@ -2972,7 +2976,6 @@ const osApi = {
       const rawFlags = flags >>> 0;
       if (rawFlags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) throw new Errno(EINVAL);
       const outPtr = checkWritable(outFd, 4);
-      const newFd = lowest();
       const nb = nonblocking(found);
       for (;;) {
         pause(true);
@@ -2983,6 +2986,13 @@ const osApi = {
           waitSockNotify(seen, 20);
           continue;
         }
+        let targetFd;
+        try {
+          targetFd = lowest();
+        } catch (err) {
+          try { sockCall('close', { sockId: res.sockId, count: 1 }); } catch { /* ignore */ }
+          throw err;
+        }
         const desc = {
           kind: 'unix-sock',
           sockId: res.sockId,
@@ -2992,10 +3002,10 @@ const osApi = {
           peerCred: res.peerCred ?? null,
         };
         attachSockRings(desc);
-        install(newFd, desc, true);
+        install(targetFd, desc, true);
         if (rawFlags & SOCK_NONBLOCK) Atomics.store(new Int32Array(desc.flags), 0, FDFLAG_NONBLOCK);
-        if (rawFlags & SOCK_CLOEXEC) cloexec.add(newFd);
-        view().setUint32(outPtr, newFd, true);
+        if (rawFlags & SOCK_CLOEXEC) cloexec.add(targetFd);
+        view().setUint32(outPtr, targetFd, true);
         return 0;
       }
     } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }

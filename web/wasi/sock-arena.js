@@ -86,6 +86,7 @@ export class ArenaRing {
     this.owner = (owner | 0) || 1;
     const base = slot * SLOT_BYTES;
     this.hdr = new Int32Array(arenaBuffer, base, HEADER_BYTES / 4);
+    this.ancU64 = new BigUint64Array(arenaBuffer, base + HDR_ANCILLARY_OFFSET_LO * 4, 1);
     this.data = new Uint8Array(arenaBuffer, base + HEADER_BYTES, RING_CAPACITY);
   }
 
@@ -137,9 +138,7 @@ export class ArenaRing {
   }
 
   get ancillaryOffset() {
-    const lo = Atomics.load(this.hdr, HDR_ANCILLARY_OFFSET_LO) >>> 0;
-    const hi = Atomics.load(this.hdr, HDR_ANCILLARY_OFFSET_HI) >>> 0;
-    return hi * 0x100000000 + lo;
+    return Number(Atomics.load(this.ancU64, 0));
   }
 
   get empty() {
@@ -153,10 +152,7 @@ export class ArenaRing {
 
   setAncillary(offset) {
     if (!this.alive) return;
-    const lo = offset >>> 0;
-    const hi = Math.floor(offset / 0x100000000) >>> 0;
-    Atomics.store(this.hdr, HDR_ANCILLARY_OFFSET_LO, lo | 0);
-    Atomics.store(this.hdr, HDR_ANCILLARY_OFFSET_HI, hi | 0);
+    Atomics.store(this.ancU64, 0, BigInt(offset));
     Atomics.or(this.hdr, HDR_FLAGS, FLAG_HAS_ANCILLARY);
     this.changed();
   }
@@ -329,11 +325,13 @@ export class ArenaRing {
   }
 
   /**
-   * Read up to `count` bytes (stopping at `maxOffset` if set so `SCM_RIGHTS` boundaries are
-   * never coalesced!). Returns `Uint8Array` (length 0 on EOF) or `null` on `EAGAIN` when
+   * Read up to `count` bytes (stopping at `maxOffset` if set, and when `stopAtAncillary` is true,
+   * atomically refusing to cross `ancillaryOffset` under `HDR_RD_LOCK` by loading `headOffset`
+   * BEFORE checking `hasAncillary`, matching the sender's `setAncillary` -> `_copyIn` order).
+   * Returns `Uint8Array` (length 0 on EOF) or `null` on `EAGAIN` / ancillary boundary hit when
    * `nonblock` is true. If `peek` is true, bytes are copied without advancing `HDR_TAIL`.
    */
-  read(count, meanwhile, { nonblock = false, peek = false, maxOffset = Infinity } = {}) {
+  read(count, meanwhile, { nonblock = false, peek = false, maxOffset = Infinity, stopAtAncillary = false } = {}) {
     if (count === 0) return new Uint8Array(0);
     for (;;) {
       if (!this.alive) return new Uint8Array(0);
@@ -342,12 +340,21 @@ export class ArenaRing {
       if (queued > 0 && this.lock(HDR_RD_LOCK)) {
         try {
           if (!this.alive) return new Uint8Array(0);
-          const now = this.queued;
+          // Snapshot `head` BEFORE checking `hasAncillary`: because `sendmsg` executes
+          // `setAncillary` before `_copyIn` advances `HDR_HEAD`, any bytes written by an
+          // ancillary send that are visible in `head` guarantee `hasAncillary` is also visible.
+          const tail = this.tailOffset;
+          const head = this.headOffset;
+          let limit = maxOffset;
+          if (stopAtAncillary && this.hasAncillary) {
+            limit = Math.min(limit, this.ancillaryOffset);
+          }
+          const now = Math.max(0, head - tail);
           if (now > 0) {
-            const tail = this.tailOffset;
-            const allowed = Number.isFinite(maxOffset) ? Math.max(0, maxOffset - tail) : now;
+            const allowed = Number.isFinite(limit) ? Math.max(0, limit - tail) : now;
             const take = Math.min(count, now, allowed);
             if (take > 0) return this._copyOut(take, !peek);
+            if (stopAtAncillary && allowed === 0) return null;
             if (allowed === 0) return new Uint8Array(0);
           }
         } finally {

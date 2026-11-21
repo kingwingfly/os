@@ -168,6 +168,135 @@ test('ArenaRing multi-MiB concurrent streaming across two independent Workers ov
   assert.equal(rRes.tailOffset, totalBytes);
 });
 
+test('ArenaRing concurrent multi-Worker stopAtAncillary prevents TOCTOU coalescing across SCM_RIGHTS boundaries (U-05)', async () => {
+  const arena = createSockArenaBuffer();
+  initArenaSlot(arena, 15, 1, 1, 1);
+  // Small lock-free coordination buffer modeling the kernel Worker's ancillary queue state:
+  // [0]=queuedCount, [1]=ackCount, [2..]=ancillary [startOff, endOff] spans (up to 512 entries).
+  const rounds = 200;
+  const ctrl = new Int32Array(new SharedArrayBuffer((2 + rounds * 2) * 4));
+
+  const writerCode = `
+    import { workerData, parentPort } from 'node:worker_threads';
+    import { ArenaRing, HDR_WR_LOCK } from ${JSON.stringify(new URL('../web/wasi/sock-arena.js', import.meta.url).href)};
+    const { arena, slot, gen, ctrlBuf, rounds } = workerData;
+    const ring = new ArenaRing(arena, slot, gen, 301);
+    const ctrl = new Int32Array(ctrlBuf);
+    const plain = new Uint8Array([0x50, 0x4c, 0x4e]); // "PLN"
+    const anc = new Uint8Array([0x41, 0x4e, 0x43, 0x21]); // "ANC!"
+
+    let totalPlain = 0;
+    let totalAnc = 0;
+    for (let r = 0; r < rounds; r++) {
+      // 1. Interleave plain stream bytes (varying 0..3 chunks) before each ancillary send.
+      const bursts = (r % 3) + 1;
+      for (let b = 0; b < bursts; b++) {
+        const res = ring.write(plain, undefined, { atomicLimit: 1 });
+        if (res.broken || res.written !== plain.length) throw new Error('plain write failed');
+        totalPlain += res.written;
+      }
+      // 2. Wait for previous ancillary barrier to drain (1-deep kernel mark simulation), then
+      //    atomically setAncillary BEFORE _copyIn under HDR_WR_LOCK — identical to exec.mjs!
+      while (Atomics.load(ctrl, 1) < r) {
+        Atomics.wait(ctrl, 1, Atomics.load(ctrl, 1), 1);
+      }
+      for (;;) {
+        if (ring.room >= anc.length && ring.lock(HDR_WR_LOCK)) break;
+      }
+      try {
+        const startOff = ring.headOffset;
+        const endOff = startOff + anc.length;
+        Atomics.store(ctrl, 2 + r * 2, startOff);
+        Atomics.store(ctrl, 2 + r * 2 + 1, endOff);
+        ring.setAncillary(startOff);
+        ring._copyIn(anc);
+        Atomics.store(ctrl, 0, r + 1);
+        Atomics.notify(ctrl, 0);
+        totalAnc += anc.length;
+      } finally {
+        ring.unlock(HDR_WR_LOCK);
+      }
+    }
+    ring.closeWriter();
+    parentPort.postMessage({ totalPlain, totalAnc, headOffset: ring.headOffset });
+  `;
+
+  const readerCode = `
+    import { workerData, parentPort } from 'node:worker_threads';
+    import { ArenaRing } from ${JSON.stringify(new URL('../web/wasi/sock-arena.js', import.meta.url).href)};
+    const { arena, slot, gen, ctrlBuf, rounds } = workerData;
+    const ring = new ArenaRing(arena, slot, gen, 302);
+    const ctrl = new Int32Array(ctrlBuf);
+
+    let plainBytes = 0;
+    let ancMsgs = 0;
+    let ancBytes = 0;
+    for (;;) {
+      // Continuously hammer fast-path read with stopAtAncillary: true (exact race window of sockRecvStream!).
+      const fast = ring.read(64, undefined, { nonblock: true, stopAtAncillary: true });
+      if (fast && fast.length > 0) {
+        for (let i = 0; i < fast.length; i++) {
+          if (fast[i] === 0x41 || fast[i] === 0x21) {
+            throw new Error(\`TOCTOU breach: plain stopAtAncillary read stole ancillary byte 0x\${fast[i].toString(16)} at tail=\${ring.tailOffset}\`);
+          }
+        }
+        plainBytes += fast.length;
+        continue;
+      }
+      if (ring.hasAncillary) {
+        const tail = ring.tailOffset;
+        const ancOff = ring.ancillaryOffset;
+        if (tail > ancOff) {
+          throw new Error(\`TOCTOU desync: tail (\${tail}) > ancillaryOffset (\${ancOff})\`);
+        }
+        if (tail === ancOff) {
+          const idx = ancMsgs;
+          while (Atomics.load(ctrl, 0) <= idx) {
+            Atomics.wait(ctrl, 0, Atomics.load(ctrl, 0), 1);
+          }
+          const startOff = Atomics.load(ctrl, 2 + idx * 2);
+          const endOff = Atomics.load(ctrl, 2 + idx * 2 + 1);
+          if (tail !== startOff) {
+            throw new Error(\`ancillary start mismatch: tail=\${tail} startOff=\${startOff}\`);
+          }
+          ring.clearAncillary();
+          const payload = ring.read(endOff - startOff, undefined, { nonblock: false, maxOffset: endOff });
+          if (payload.length !== 4 || payload[0] !== 0x41 || payload[1] !== 0x4e || payload[2] !== 0x43 || payload[3] !== 0x21) {
+            throw new Error(\`corrupt ancillary payload at round \${idx}: \${[...payload]}\`);
+          }
+          ancBytes += payload.length;
+          ancMsgs++;
+          Atomics.store(ctrl, 1, ancMsgs);
+          Atomics.notify(ctrl, 1);
+          continue;
+        }
+      }
+      if (ring.wrClosed && ring.queued === 0 && !ring.hasAncillary) break;
+    }
+    parentPort.postMessage({ plainBytes, ancMsgs, ancBytes, tailOffset: ring.tailOffset });
+  `;
+
+  const runWorker = (code, workerData) =>
+    new Promise((resolve, reject) => {
+      const w = new Worker(code, { eval: true, workerData });
+      w.once('message', resolve);
+      w.once('error', reject);
+      w.once('exit', codeExit => {
+        if (codeExit !== 0) reject(new Error(`worker exited ${codeExit}`));
+      });
+    });
+
+  const [wRes, rRes] = await Promise.all([
+    runWorker(writerCode, { arena, slot: 15, gen: 1, ctrlBuf: ctrl.buffer, rounds }),
+    runWorker(readerCode, { arena, slot: 15, gen: 1, ctrlBuf: ctrl.buffer, rounds }),
+  ]);
+
+  assert.equal(rRes.ancMsgs, rounds);
+  assert.equal(rRes.ancBytes, wRes.totalAnc);
+  assert.equal(rRes.plainBytes, wRes.totalPlain);
+  assert.equal(rRes.tailOffset, wRes.headOffset);
+});
+
 test('ArenaPipe honors PIPE_ATOMIC, EAGAIN, EOF, and EPIPE broken-reader semantics', () => {
   const arena = createSockArenaBuffer();
   initArenaSlot(arena, 0, 1, 1, 1);
