@@ -20,6 +20,7 @@ mod hostfs;
 mod mounts;
 mod release_v2;
 mod share_bridge;
+pub mod unix_sock_bridge;
 mod vfs_engine;
 
 use abi::auth_v2::{

@@ -337,6 +337,7 @@ fn encode_file_type(ft: FileType) -> u8 {
         FileType::Dir => 2,
         FileType::Symlink => 3,
         FileType::CharDevice => 4,
+        FileType::Socket => 5,
     }
 }
 
@@ -346,6 +347,7 @@ fn decode_file_type(tag: u8) -> Result<FileType> {
         2 => Ok(FileType::Dir),
         3 => Ok(FileType::Symlink),
         4 => Ok(FileType::CharDevice),
+        5 => Ok(FileType::Socket),
         _ => Err(Errno::EIO),
     }
 }
@@ -405,4 +407,137 @@ fn read_u64(bytes: &[u8], c: &mut usize) -> Result<u64> {
     Ok(u64::from_be_bytes([
         s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_inode_tag5_roundtrips_under_inode_version_1() {
+        let item = InodeItem {
+            file_type: FileType::Socket,
+            mode: 0o660,
+            nlink: 1,
+            uid: 1000,
+            gid: 1000,
+            size: 0,
+            generation: 7,
+            atime: Timespec { sec: 10, nsec: 1 },
+            mtime: Timespec { sec: 20, nsec: 2 },
+            ctime: Timespec { sec: 30, nsec: 3 },
+            rdev: None,
+            symlink_target: None,
+            next_dir_index: 1,
+            acl_present: false,
+            default_acl_present: false,
+        };
+        let encoded = item.encode();
+        assert_eq!(encoded[0], INODE_VERSION);
+        assert_eq!(encoded[1], 5);
+        let decoded = InodeItem::decode(&encoded).unwrap();
+        assert_eq!(decoded, item);
+        assert_eq!(decoded.to_metadata().st_mode(), abi::S_IFSOCK | 0o660);
+
+        let di = DirItemValue {
+            child_ino: 42,
+            child_gen: 7,
+            file_type: FileType::Socket,
+            dir_index: 3,
+        };
+        assert_eq!(DirItemValue::decode(&di.encode()).unwrap(), di);
+
+        let didx = DirIndexValue {
+            child_ino: 42,
+            child_gen: 7,
+            file_type: FileType::Socket,
+            name: "control.sock".into(),
+        };
+        assert_eq!(DirIndexValue::decode(&didx.encode()).unwrap(), didx);
+    }
+
+    #[test]
+    fn cowfs_mksock_persists_tag5_and_open_returns_enxio() {
+        use crate::{CowFs, CowFsConfig, CowFsOpenMode};
+        use cowtree::memory::{MemoryHeadStore, MemoryPackStore};
+        use cowtree::{VolumeId, WriterMode};
+        use std::rc::Rc;
+        use vfs::{Cred, Filesystem, OpenOptions, now_or_never};
+
+        let hs = Rc::new(MemoryHeadStore::new());
+        let ps = Rc::new(MemoryPackStore::new());
+        let now = Timespec {
+            sec: 1_700_000_000,
+            nsec: 0,
+        };
+        let vol = VolumeId("cowfs-sock-test".into());
+        now_or_never(CowFs::format_volume(
+            &*hs,
+            &*ps,
+            vol.clone(),
+            0,
+            0,
+            0o755,
+            now,
+        ))
+        .unwrap()
+        .unwrap();
+        let fs = now_or_never(CowFs::open(
+            hs.clone(),
+            ps.clone(),
+            vol.clone(),
+            CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+            CowFsConfig::local_browser(Rc::new(move || now)),
+        ))
+        .unwrap()
+        .unwrap();
+        let admin = Cred::root();
+        let entry = now_or_never(fs.mksock(&admin, &fs.root(), "daemon.sock", 0o660))
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.metadata.file_type, FileType::Socket);
+        assert_eq!(
+            entry.metadata.st_mode(),
+            abi::S_IFSOCK | (0o660 & !admin.umask as u32)
+        );
+
+        // open(2) on a socket inode returns ENXIO; O_PATH succeeds.
+        let mut ro = OpenOptions::new();
+        ro.read(true);
+        assert_eq!(
+            now_or_never(fs.open(&admin, &entry.handle, &ro)).unwrap(),
+            Err(Errno::ENXIO)
+        );
+        let mut path_opts = OpenOptions::new();
+        path_opts.path(true);
+        let oref = now_or_never(fs.open(&admin, &entry.handle, &path_opts))
+            .unwrap()
+            .unwrap();
+        now_or_never(fs.release(&oref)).unwrap().unwrap();
+
+        // Commit & reopen -> tag 5 persists intact!
+        now_or_never(fs.commit_tx_group()).unwrap().unwrap();
+        now_or_never(fs.close_clean()).unwrap().unwrap();
+
+        let reopened = now_or_never(CowFs::open(
+            hs,
+            ps,
+            vol,
+            CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+            CowFsConfig::local_browser(Rc::new(move || now)),
+        ))
+        .unwrap()
+        .unwrap();
+        let found = now_or_never(reopened.lookup(&admin, &reopened.root(), "daemon.sock"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.metadata.file_type, FileType::Socket);
+        assert_eq!(
+            now_or_never(reopened.open(&admin, &found.handle, &ro)).unwrap(),
+            Err(Errno::ENXIO)
+        );
+        now_or_never(reopened.unlink(&admin, &reopened.root(), "daemon.sock"))
+            .unwrap()
+            .unwrap();
+    }
 }

@@ -220,7 +220,43 @@ export class Pipe {
     finally { this.unlock(READING); }
     return true;
   }
-  // An end gone at once, whoever holds it: one its process never started to hold.
+// An end gone at once, whoever holds it: one its process never started to hold.
   closeWriter() { Atomics.store(this.state, WRITER_GONE, 1); this.changed(); }
   closeReader() { Atomics.store(this.state, READER_GONE, 1); this.changed(); }
+}
+
+import { ArenaRing } from './sock-arena.js';
+
+/**
+ * Arena-backed pipe adapter (`#55` L3b): draws a 64 KiB ring slot from the instance-wide 8 MiB
+ * `SockArena` SAB so pipe descriptors can be passed over `SCM_RIGHTS` between arbitrary unrelated
+ * Workers with zero mid-syscall SAB transfers.
+ */
+export class ArenaPipe {
+  constructor(arenaBuffer, slot, gen, owner = PAGE, notifyWord = null) {
+    this.ring = new ArenaRing(arenaBuffer, slot, gen, owner, notifyWord);
+    this.slot = slot;
+    this.gen = gen;
+    this.owner = owner;
+  }
+  get queued() { return this.ring.queued; }
+  get room() { return this.ring.room; }
+  get empty() { return this.ring.empty; }
+  get readerGone() { return this.ring.rdClosed; }
+  get writerGone() { return this.ring.wrClosed; }
+  nonblock(end) { return this.ring.pipeNonblock(end); }
+  setNonblock(end, enabled) { this.ring.setPipeNonblock(end, enabled); }
+  read(count, meanwhile, _line = false, nonblock = false) {
+    return this.ring.read(count, meanwhile, { nonblock });
+  }
+  tryWrite(bytes) {
+    const { written, broken } = this.ring.tryWrite(bytes, { atomicLimit: PIPE_ATOMIC });
+    return { written, broken };
+  }
+  write(bytes, meanwhile) {
+    const { written, broken } = this.ring.write(bytes, meanwhile, { atomicLimit: PIPE_ATOMIC });
+    return { written, broken };
+  }
+  closeWriter() { this.ring.closeWriter(); }
+  closeReader() { this.ring.closeReader(); }
 }

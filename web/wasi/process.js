@@ -4,7 +4,8 @@ import { releaseId } from '../release.js';
 // descriptions are owned by `os_vfs::Vfs` inside `crates/client-kernel`, reached over the
 // shared-memory host channel (`vfsCall`).
 import { Signals, bit, valid, ignoredByDefault, stoppedByDefault, SA_RESTART, SA_NODEFER, SA_RESETHAND } from './signals.mjs';
-import { Pipe, pipeBuffer, PIPE_ATOMIC } from './pipe.js';
+import { Pipe, ArenaPipe, pipeBuffer, PIPE_ATOMIC } from './pipe.js';
+import { ArenaRing, HDR_CHANGES, RING_CAPACITY } from './sock-arena.js';
 import { Engine } from './fork.js';
 import { Shares } from './shared.js';
 import { TtyState, TtyControl, IOCTL, CC, LF } from '../kernel/pty.js';
@@ -12,16 +13,25 @@ import { isByteDevice, readDevice } from './devices.mjs';
 
 // WASI's errno numbers, by Linux's names, as the kernel answers.
 const ERRNO = {
-  E2BIG: 1, EACCES: 2, EAGAIN: 6, EBADF: 8, EBUSY: 10, ECANCELED: 11, ECHILD: 12, EDEADLK: 16, EEXIST: 20, EFAULT: 21, EFBIG: 22, EINTR: 27,
-  EINVAL: 28, EIO: 29, EISDIR: 31, ELOOP: 32, EMFILE: 33, EMLINK: 34, ENAMETOOLONG: 37, ENODEV: 43, ENOENT: 44,
-  ENOEXEC: 45, ENOMEM: 48, ENOSPC: 51, ENOSYS: 52, ENOTCONN: 53, ENOTDIR: 54, ENOTEMPTY: 55, ENOTSUP: 58, EOPNOTSUPP: 58,
-  ENOTTY: 59, ENXIO: 60, EPERM: 63, EPIPE: 64, EPROTONOSUPPORT: 66, ERANGE: 68, EROFS: 69, ESPIPE: 70, ESRCH: 71, ESTALE: 72,
-  ETIMEDOUT: 73, ETXTBSY: 74, EXDEV: 75, ENODATA: 44, EDQUOT: 19, ENOLCK: 46, ENOTBLK: 218,
+  E2BIG: 1, EACCES: 2, EADDRINUSE: 3, EADDRNOTAVAIL: 4, EAFNOSUPPORT: 5, EAGAIN: 6, EBADF: 8, EBUSY: 10, ECANCELED: 11, ECHILD: 12,
+  ECONNABORTED: 13, ECONNREFUSED: 14, ECONNRESET: 15, EDEADLK: 16, EDQUOT: 19, EEXIST: 20, EFAULT: 21, EFBIG: 22, EINTR: 27,
+  EINVAL: 28, EIO: 29, EISCONN: 30, EISDIR: 31, ELOOP: 32, EMFILE: 33, EMLINK: 34, EMSGSIZE: 35, ENAMETOOLONG: 37, ENOBUFS: 42,
+  ENODEV: 43, ENOENT: 44, ENOEXEC: 45, ENOLCK: 46, ENOMEM: 48, ENOSPC: 51, ENOSYS: 52, ENOTCONN: 53, ENOTDIR: 54, ENOTEMPTY: 55,
+  ENOTSOCK: 57, ENOTSUP: 58, EOPNOTSUPP: 58, ENOTTY: 59, ENXIO: 60, EPERM: 63, EPIPE: 64, EPROTONOSUPPORT: 66, EPROTOTYPE: 67,
+  ERANGE: 68, EROFS: 69, ESPIPE: 70, ESRCH: 71, ESTALE: 72, ETIMEDOUT: 73, ETXTBSY: 74, EXDEV: 75, ENODATA: 44, ETOOMANYREFS: 109,
+  ENOTBLK: 218,
 };
 const { EBADF, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, ENOTDIR, ESPIPE } = ERRNO;
 const STRERROR = { 2: 'Permission denied', 44: 'No such file or directory', 45: 'Exec format error', 54: 'Not a directory', 31: 'Is a directory' };
-const STDIO = new Set(['in', 'out', 'pipe-in', 'pipe-out', 'tty', 'pty']);
-const CHARACTER_DEVICE = 2, DIRECTORY = 3, REGULAR_FILE = 4, SYMBOLIC_LINK = 7, UNKNOWN = 0;
+const STDIO = new Set(['in', 'out', 'pipe-in', 'pipe-out', 'arena-pipe-in', 'arena-pipe-out', 'tty', 'pty']);
+const CHARACTER_DEVICE = 2, DIRECTORY = 3, REGULAR_FILE = 4, SOCKET_DGRAM = 5, SOCKET_STREAM = 6, SYMBOLIC_LINK = 7, UNKNOWN = 0;
+
+// AF_UNIX / SCM_RIGHTS / SO_PEERCRED ABI constants (`crates/abi/src/socket.rs`).
+const AF_UNIX = 1;
+const SOCK_STREAM = 1, SOCK_DGRAM = 2, SOCK_SEQPACKET = 5;
+const SOCK_TYPE_MASK = 0xf, SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000;
+const MSG_PEEK = 0x2, MSG_CTRUNC = 0x8, MSG_TRUNC = 0x20, MSG_DONTWAIT = 0x40, MSG_NOSIGNAL = 0x4000, MSG_CMSG_CLOEXEC = 0x40000000;
+const SCM_MAX_FD = 64, FD_MAX = 1024;
 
 // Sentinel anchor descriptors (`abi::OS_FD_ROOT` and `abi::OS_FD_CWD`).
 const OS_FD_ROOT = 0x7ffffffd;
@@ -134,6 +144,7 @@ const ok = result => { if ('err' in result) throw new Errno(errnoOf(result.err))
 const fds = new Map();
 const cloexec = new Set();
 let shares = null, ttyState = null, ttyControl = null, membership = null;
+let sockArena = null, sockNotify = null;
 let lastTtyFds = '';
 
 function reportTty() {
@@ -237,6 +248,8 @@ function linkTextFor(found) {
     const d = found.device ?? 'null';
     return (d.startsWith('present:') || d.startsWith('snd:')) ? `/dev/${d.replace(':', '/')}` : `/dev/${d}`;
   }
+  if (found.kind === 'unix-sock') return `socket:[${found.sockId}]`;
+  if (found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out') return `pipe:[${found.slot}]`;
   if (found.tty && process.pty) return `/dev/pts/${process.pty.number}`;
   return 'pipe:[0]';
 }
@@ -247,6 +260,31 @@ const ttyCall = (found, request, arg) => {
   return hostErrno(host('tty', { handle: found.handle, request, arg, readable: found.readable !== false }));
 };
 const vfsCall = (op, args = {}) => hostErrno(host('vfs', { op, ...args }));
+const sockCall = (op, args = {}) => hostErrno(host('sock', { op, ...args }));
+
+function attachSockRings(found) {
+  if (!sockArena) { found.txRing = null; found.rxRing = null; return; }
+  found.txRing = found.txSlot ? new ArenaRing(sockArena, found.txSlot.slot, found.txSlot.gen, process.pid, sockNotify) : null;
+  found.rxRing = found.rxSlot ? new ArenaRing(sockArena, found.rxSlot.slot, found.rxSlot.gen, process.pid, sockNotify) : null;
+}
+
+function syncStreamTransport(found) {
+  if (found.sockType !== SOCK_STREAM || (found.txRing && found.rxRing) || !sockArena) return;
+  try {
+    const info = sockCall('describe', { sockId: found.sockId });
+    if (info.txSlot || info.rxSlot) {
+      found.txSlot = info.txSlot ?? null;
+      found.rxSlot = info.rxSlot ?? null;
+      attachSockRings(found);
+    }
+  } catch { /* unbound/listening or closed; caller handles */ }
+}
+
+function sockDescriptor(fd) {
+  const found = descriptor(fd);
+  if (found.kind !== 'unix-sock') throw new Errno(ERRNO.ENOTSOCK);
+  return found;
+}
 
 const terminalFd = (fd, readable = true, writable = true) => ({ kind: 'tty', tty: true, fd, readable, writable, pipe: new Pipe(process.pty.input, process.pid) });
 function descriptor(fd) {
@@ -258,7 +296,13 @@ function lowest(min = 0) {
   if (min < 0) throw new Errno(EBADF);
   let fd = min;
   while (fds.has(fd) || fd === OS_FD_ROOT || fd === OS_FD_CWD) fd++;
+  if (fd >= FD_MAX) throw new Errno(ERRNO.EMFILE);
   return fd;
+}
+function lowestPair(min = 0) {
+  const first = lowest(min);
+  const second = lowest(first + 1);
+  return [first, second];
 }
 
 const descriptorFlags = () => typeof SharedArrayBuffer === 'function' ? new SharedArrayBuffer(4) : new ArrayBuffer(4);
@@ -287,20 +331,34 @@ function resolveAnchorForPath(dirfd, rawPath) {
 }
 
 function install(fd, found, counted = false) {
-  if (STDIO.has(found.kind) && found.kind !== 'pty') found.flags ??= descriptorFlags();
+  if ((STDIO.has(found.kind) && found.kind !== 'pty') || found.kind === 'unix-sock') found.flags ??= descriptorFlags();
   if (!counted && found.kind === 'pty') ptyCall(found, 'hold');
+  if (!counted && found.kind === 'unix-sock') sockCall('hold', { sockId: found.sockId, count: 1 });
+  if (!counted && found.kind === 'arena-pipe-in') sockCall('pipe_hold', { slot: found.slot, gen: found.gen, end: 'r', count: 1 });
+  if (!counted && found.kind === 'arena-pipe-out') sockCall('pipe_hold', { slot: found.slot, gen: found.gen, end: 'w', count: 1 });
   found.refs = (found.refs ?? 0) + 1;
   fds.set(fd, found);
   reportTty();
   if (counted) return;
   if (found.kind === 'pipe-in' || found.kind === 'tty') found.pipe.hold(process.pid, 'r');
   else if (found.kind === 'pipe-out') found.pipe.hold(process.pid, 'w');
+  else if (found.kind === 'unix-sock' || found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out') return;
   else if (found.share != null) shares.add(found.share, process.pid, 1);
   else if (shares && (found.kind === 'file' || (found.kind === 'kfd' && !found.isDir && !found.mountNs && !found.pathOnly && !isByteDevice(found.device)))) share(found);
 }
 
-const nonblocking = found => found.kind === 'pty' ? ptyCall(found, 'flags').nonblock
-  : !!(found.flags && Atomics.load(new Int32Array(found.flags), 0) & FDFLAG_NONBLOCK);
+const nonblocking = found => {
+  if (found.kind === 'pty') return ptyCall(found, 'flags').nonblock;
+  if (found.kind === 'unix-sock') {
+    if (found.txRing?.alive) return found.txRing.sockNonblock;
+    return sockCall('get_nonblock', { sockId: found.sockId }).nonblock;
+  }
+  if (found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out') {
+    if (found.privateFlags) return !!(Atomics.load(new Int32Array(found.privateFlags), 0) & FDFLAG_NONBLOCK);
+    return found.pipe.nonblock(found.kind === 'arena-pipe-in' ? 'r' : 'w');
+  }
+  return !!(found.flags && Atomics.load(new Int32Array(found.flags), 0) & FDFLAG_NONBLOCK);
+};
 
 function share(found) {
   const slot = shares.claim(process.pid, found.refs, found.pos ?? 0);
@@ -325,6 +383,12 @@ function* uninstall(fd, kernelClosed = false) {
   cloexec.delete(fd);
   found.refs--;
   if (found.kind === 'pty') return ptyCall(found, 'close');
+  if (found.kind === 'unix-sock') {
+    if (!kernelClosed) sockCall('close', { sockId: found.sockId, count: 1 });
+    return;
+  }
+  if (found.kind === 'arena-pipe-in') return sockCall('pipe_close', { slot: found.slot, gen: found.gen, end: 'r', count: 1 });
+  if (found.kind === 'arena-pipe-out') return sockCall('pipe_close', { slot: found.slot, gen: found.gen, end: 'w', count: 1 });
   if (found.kind === 'pipe-in' || found.kind === 'tty') return found.pipe.drop(process.pid, 'r');
   if (found.kind === 'pipe-out') return found.pipe.drop(process.pid, 'w');
   if (found.share != null) {
@@ -355,6 +419,7 @@ function* exclusive(found, work) {
 function filetype(found) {
   if (found.procInfo) return REGULAR_FILE;
   if (found.preopen) return DIRECTORY;
+  if (found.kind === 'unix-sock') return found.sockType === SOCK_DGRAM ? SOCKET_DGRAM : SOCKET_STREAM;
   if (found.kind === 'kfd') {
     if (found.isDir) return DIRECTORY;
     if (found.device) return CHARACTER_DEVICE;
@@ -371,6 +436,7 @@ function kindOf(mode) {
     case 0o040000: return DIRECTORY;
     case 0o120000: return SYMBOLIC_LINK;
     case 0o020000: return CHARACTER_DEVICE;
+    case 0o140000: return SOCKET_STREAM;
     default: return REGULAR_FILE;
   }
 }
@@ -477,6 +543,7 @@ function statOf(found) {
   if (found.procInfo) return found.stat;
   if (found.kind === 'kfd') return vfsCall('fstat', { kfd: found.kfd });
   if (found.preopen) return vfsCall('statat', { dirfd: OS_FD_ROOT, path: '/', follow: true });
+  if (found.kind === 'unix-sock') return { ino: found.sockId, filetype: filetype(found), mode: 0o140777 };
   if (found.kind === 'pty') return { ino: found.number, filetype: CHARACTER_DEVICE, mode: 0o020600 };
   if (STDIO.has(found.kind)) return { filetype: filetype(found), mode: found.tty ? 0o020620 : 0o010600 };
   return found.stat ?? { filetype: REGULAR_FILE, mode: 0o100644, size: found.size ?? 0 };
@@ -552,9 +619,376 @@ function writePty(found, data) {
   return total;
 }
 
+function waitSockNotify(seen, timeoutMs = 20) {
+  flush();
+  pause(true);
+  if (sockNotify) {
+    if (Atomics.wait(sockNotify, 0, seen, timeoutMs) === 'timed-out') pause(true);
+    return;
+  }
+  sleepUntil(performance.now() + timeoutMs);
+}
+
+function checkedSlice(ptr, len) {
+  const b = bytes();
+  const p = ptr >>> 0, n = len >>> 0;
+  if (p + n > b.length) throw new Errno(ERRNO.EFAULT);
+  return b.slice(p, p + n);
+}
+
+function checkedString(ptr, len) {
+  return decoder.decode(checkedSlice(ptr, len));
+}
+
+function checkWritable(ptr, len) {
+  const b = bytes();
+  const p = ptr >>> 0, n = len >>> 0;
+  if (p + n > b.length) throw new Errno(ERRNO.EFAULT);
+  return p;
+}
+
+function writePeerCred(ptr, cred) {
+  if (!ptr) return;
+  const p = checkWritable(ptr, 12);
+  const v = view();
+  v.setUint32(p, cred?.pid ?? 0, true);
+  v.setUint32(p + 4, cred?.uid ?? 0, true);
+  v.setUint32(p + 8, cred?.gid ?? 0, true);
+}
+
+function cachedPeerCred(found) {
+  if (found.peerCred) return found.peerCred;
+  try {
+    found.peerCred = sockCall('peercred', { sockId: found.sockId });
+    return found.peerCred;
+  } catch {
+    return { pid: 0, uid: 0, gid: 0 };
+  }
+}
+
+function encodeSendFd(guestFd) {
+  const fd = guestFd | 0;
+  const found = fd >= 0 ? fds.get(fd) : null;
+  if (!found) throw new Errno(EBADF);
+  if (found.kind === 'kfd' && found.kfd != null) {
+    return {
+      kind: 'kfd',
+      kfd: found.kfd,
+      isDir: !!found.isDir,
+      mountNs: !!found.mountNs,
+      device: found.device ?? null,
+      read: !!found.read,
+      writable: !!found.writable,
+      append: !!found.append,
+      pathOnly: !!found.pathOnly,
+    };
+  }
+  if (found.serverDev && found.kfd != null) {
+    return {
+      kind: 'server_dev',
+      vfd: found.kfd,
+      device: found.device ?? '',
+      read: !!found.read,
+      writable: !!found.writable,
+    };
+  }
+  if (found.kind === 'unix-sock') {
+    return { kind: 'unix_sock', sockId: found.sockId };
+  }
+  if (found.kind === 'arena-pipe-in') {
+    return { kind: 'arena_pipe', slot: found.slot, gen: found.gen, end: 'r', pathOnly: !!found.pathOnly };
+  }
+  if (found.kind === 'arena-pipe-out') {
+    return { kind: 'arena_pipe', slot: found.slot, gen: found.gen, end: 'w', pathOnly: !!found.pathOnly };
+  }
+  if (found.kind === 'pty') {
+    return {
+      kind: 'pty',
+      handle: found.handle,
+      master: !!found.master,
+      number: found.number ?? 0,
+      read: found.readable !== false,
+      writable: found.writable !== false,
+    };
+  }
+  throw new Errno(ERRNO.EOPNOTSUPP);
+}
+
+function disposeUninstalledFd(spec) {
+  try {
+    if (spec.kind === 'kfd') vfsCall('close', { kfd: spec.kfd });
+    else if (spec.kind === 'server_dev') vfsCall('sys', { batch: { calls: [{ close: { fd: spec.kfd } }], umask: process.umask } });
+    else if (spec.kind === 'unix_sock') sockCall('close', { sockId: spec.sockId, count: 1 });
+    else if (spec.kind === 'arena_pipe') sockCall('pipe_close', { slot: spec.slot, gen: spec.gen, end: spec.end, count: 1 });
+    else if (spec.kind === 'pty') host('pty', { handle: spec.handle, op: 'close' });
+  } catch { /* best-effort cleanup */ }
+}
+
+function installReceivedFd(spec, cmsgCloexec) {
+  const num = lowest();
+  let desc;
+  let counted = false;
+  if (spec.kind === 'kfd') {
+    desc = {
+      kind: 'kfd',
+      kfd: spec.kfd,
+      isDir: !!spec.isDir,
+      mountNs: !!spec.mountNs,
+      device: spec.device ?? null,
+      read: spec.read !== false,
+      writable: !!spec.writable,
+      append: !!spec.append,
+      pathOnly: !!spec.pathOnly,
+      stat: spec.stat ?? null,
+    };
+  } else if (spec.kind === 'server_dev') {
+    desc = {
+      kind: 'file',
+      serverDev: true,
+      kfd: spec.kfd,
+      device: spec.device ?? '',
+      read: spec.read !== false,
+      writable: !!spec.writable,
+      pos: 0,
+      size: 0,
+    };
+  } else if (spec.kind === 'unix_sock') {
+    desc = {
+      kind: 'unix-sock',
+      sockId: spec.sockId,
+      sockType: spec.sockType,
+      txSlot: spec.txSlot ?? null,
+      rxSlot: spec.rxSlot ?? null,
+      peerCred: null,
+    };
+    attachSockRings(desc);
+    counted = true;
+  } else if (spec.kind === 'arena_pipe') {
+    desc = {
+      kind: spec.end === 'r' ? 'arena-pipe-in' : 'arena-pipe-out',
+      slot: spec.slot,
+      gen: spec.gen,
+      pipe: new ArenaPipe(sockArena, spec.slot, spec.gen, process.pid, sockNotify),
+      ...(spec.pathOnly ? { pathOnly: true } : {}),
+    };
+    counted = true;
+  } else if (spec.kind === 'pty') {
+    desc = {
+      kind: 'pty',
+      tty: true,
+      handle: spec.handle,
+      master: !!spec.master,
+      number: spec.number ?? 0,
+      readable: spec.read !== false,
+      writable: spec.writable !== false,
+    };
+    counted = true;
+  } else {
+    throw new Errno(EIO);
+  }
+  install(num, desc, counted);
+  if (cmsgCloexec) cloexec.add(num);
+  return num;
+}
+
+function sockSendMsg(found, data, fdsList, addr, flags) {
+  syncStreamTransport(found);
+  const nonblock = nonblocking(found) || !!(flags & MSG_DONTWAIT);
+  const nosignal = !!(flags & MSG_NOSIGNAL);
+  // Fast zero-copy SAB ring path for connected SOCK_STREAM without ancillary fds, dest addr,
+  // or peer `SO_PASSCRED` (which requires per-write sender credentials from LocalProcessTable).
+  if (found.sockType === SOCK_STREAM && found.txRing && fdsList.length === 0 && addr == null && !found.txRing.passcred) {
+    const ring = found.txRing;
+    if (data.length === 0) {
+      if (!ring.alive || ring.rdClosed || ring.wrClosed) return brokenPipe(0, nosignal);
+      return 0;
+    }
+    if (nonblock) {
+      const { written, broken } = ring.tryWrite(data, { atomicLimit: 1 });
+      if (broken) return brokenPipe(written, nosignal);
+      if (!written && data.length) throw new Errno(ERRNO.EAGAIN);
+      return written;
+    }
+    if (ring.room < data.length) flush();
+    const { written, broken } = ring.write(data, done => {
+      try { pause(true); }
+      catch (error) {
+        if (done && error instanceof Errno && error.errno === ERRNO.EINTR) return false;
+        throw error;
+      }
+    }, { atomicLimit: 1 });
+    return broken ? brokenPipe(written, nosignal) : written;
+  }
+
+  // Atomic SOCK_STREAM SAB send with SCM_RIGHTS or SO_PASSCRED: exec.mjs validates & reserves
+  // quota BEFORE copying bytes into `txRing`.
+  if (found.sockType === SOCK_STREAM && found.txRing && addr == null) {
+    const ring = found.txRing;
+    const chunk = data.length > RING_CAPACITY ? data.subarray(0, RING_CAPACITY) : data;
+    for (;;) {
+      pause(true);
+      if (!ring.alive || ring.rdClosed || ring.wrClosed) return brokenPipe(0, nosignal);
+      if (chunk.length === 0) return 0;
+      const seen = Atomics.load(ring.hdr, HDR_CHANGES);
+      if (ring.room === 0) {
+        if (nonblock) throw new Errno(ERRNO.EAGAIN);
+        flush();
+        if (Atomics.wait(ring.hdr, HDR_CHANGES, seen, 20) === 'timed-out') pause(true);
+        continue;
+      }
+      try {
+        const res = sockCall('sendmsg', {
+          sockId: found.sockId,
+          txSlot: found.txSlot,
+          data: base64(chunk),
+          fds: fdsList,
+        });
+        return res.sent ?? chunk.length;
+      } catch (err) {
+        if (err instanceof Errno && err.errno === ERRNO.EPIPE) return brokenPipe(0, nosignal);
+        if (err instanceof Errno && err.errno === ERRNO.EAGAIN && !nonblock) {
+          if (Atomics.wait(ring.hdr, HDR_CHANGES, seen, 20) === 'timed-out') pause(true);
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
+  // SOCK_DGRAM / SOCK_SEQPACKET / unconnected SOCK_STREAM -> Rust UnixSocketTable.
+  for (;;) {
+    pause(true);
+    const seen = sockNotify ? Atomics.load(sockNotify, 0) : 0;
+    try {
+      const res = sockCall('sendmsg', {
+        sockId: found.sockId,
+        data: data.length ? base64(data) : '',
+        fds: fdsList,
+        addr,
+      });
+      return res.sent ?? data.length;
+    } catch (err) {
+      if (err instanceof Errno && err.errno === ERRNO.EPIPE) return brokenPipe(0, nosignal);
+      if (err instanceof Errno && err.errno === ERRNO.EAGAIN && !nonblock) {
+        waitSockNotify(seen, 20);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+function sockRecvStream(found, bufLen, maxFds, flags) {
+  const ring = found.rxRing;
+  const nonblock = nonblocking(found) || !!(flags & MSG_DONTWAIT);
+  const peek = !!(flags & MSG_PEEK);
+  const cmsgCloexec = !!(flags & MSG_CMSG_CLOEXEC);
+  for (;;) {
+    pause(true);
+    const seen = Atomics.load(ring.hdr, HDR_CHANGES);
+    if (ring.rdClosed) {
+      return { data: new Uint8Array(0), reportedLen: 0, fds: [], peerCred: cachedPeerCred(found), outFlags: 0 };
+    }
+    if (bufLen === 0 && ring.queued > 0) {
+      return { data: new Uint8Array(0), reportedLen: 0, fds: [], peerCred: cachedPeerCred(found), outFlags: 0 };
+    }
+    if (ring.hasAncillary) {
+      const tail = ring.tailOffset;
+      const ancOff = ring.ancillaryOffset;
+      if (tail >= ancOff) {
+        const res = sockCall('recvmsg', {
+          sockId: found.sockId,
+          rxSlot: found.rxSlot,
+          sabStream: true,
+          bufLen,
+          maxFds,
+          flags,
+          cmsgCloexec,
+        });
+        if (res.lockBusy) {
+          Atomics.wait(ring.hdr, HDR_CHANGES, seen, 2);
+          continue;
+        }
+        if (!res.wouldBlock) {
+          const data = res.data ? unbase64(res.data) : new Uint8Array(0);
+          return {
+            data,
+            reportedLen: res.reportedLen ?? data.length,
+            fds: res.fds ?? [],
+            peerCred: res.peerCred,
+            outFlags: res.flags ?? 0,
+          };
+        }
+      } else if (ring.queued > 0) {
+        const data = ring.read(bufLen, undefined, { nonblock: true, peek, maxOffset: ancOff, stopAtAncillary: true });
+        if (data && (data.length > 0 || bufLen === 0)) {
+          return { data, reportedLen: data.length, fds: [], peerCred: cachedPeerCred(found), outFlags: 0 };
+        }
+      }
+    } else if (ring.queued > 0) {
+      const data = ring.read(bufLen, undefined, { nonblock: true, peek, stopAtAncillary: true });
+      if (data && (data.length > 0 || bufLen === 0)) {
+        return { data, reportedLen: data.length, fds: [], peerCred: cachedPeerCred(found), outFlags: 0 };
+      }
+      if (ring.hasAncillary) continue;
+    }
+    if ((ring.wrClosed || ring.rdClosed) && ring.queued === 0 && !ring.hasAncillary) {
+      return { data: new Uint8Array(0), reportedLen: 0, fds: [], peerCred: cachedPeerCred(found), outFlags: 0 };
+    }
+    if (nonblock) throw new Errno(ERRNO.EAGAIN);
+    flush();
+    if (Atomics.wait(ring.hdr, HDR_CHANGES, seen, 20) === 'timed-out') pause(true);
+  }
+}
+
+function sockRecvMsg(found, bufLen, maxFds, flags) {
+  syncStreamTransport(found);
+  if (found.sockType === SOCK_STREAM && found.rxRing) {
+    return sockRecvStream(found, bufLen, maxFds, flags);
+  }
+  const nonblock = nonblocking(found) || !!(flags & MSG_DONTWAIT);
+  const cmsgCloexec = !!(flags & MSG_CMSG_CLOEXEC);
+  for (;;) {
+    pause(true);
+    const seen = sockNotify ? Atomics.load(sockNotify, 0) : 0;
+    const res = sockCall('recvmsg', {
+      sockId: found.sockId,
+      bufLen,
+      maxFds,
+      flags,
+      cmsgCloexec,
+    });
+    if (res.wouldBlock) {
+      if (nonblock) throw new Errno(ERRNO.EAGAIN);
+      waitSockNotify(seen, 20);
+      continue;
+    }
+    const data = res.data ? unbase64(res.data) : new Uint8Array(0);
+    return {
+      data,
+      reportedLen: res.reportedLen ?? data.length,
+      fds: res.fds ?? [],
+      peerCred: res.peerCred,
+      outFlags: res.flags ?? 0,
+    };
+  }
+}
+
+function sockReadBytes(found, count) {
+  if (count === 0) return new Uint8Array(0);
+  const res = sockRecvMsg(found, count, 0, 0);
+  for (const spec of res.fds) disposeUninstalledFd(spec);
+  return res.data;
+}
+
+function sockWriteBytes(found, data) {
+  return sockSendMsg(found, data, [], null, 0);
+}
+
 function* readFrom(found, at, count) {
   if (found.tty && found.readable === false) throw new Errno(EBADF);
   if (found.kind === 'pty') return readPty(found, count);
+  if (found.kind === 'unix-sock') return sockReadBytes(found, count);
   if (found.preopen) throw new Errno(EISDIR);
   if (found.kind === 'in') {
     if (found.pathOnly) throw new Errno(EBADF);
@@ -562,7 +996,8 @@ function* readFrom(found, at, count) {
     found.pos += out.length;
     return out;
   }
-  if (found.kind === 'pipe-in' || found.kind === 'tty') {
+  if (found.kind === 'pipe-in' || found.kind === 'arena-pipe-in' || found.kind === 'tty') {
+    if (found.pathOnly) throw new Errno(EBADF);
     if (count === 0) return new Uint8Array(0);
     const nonblock = nonblocking(found);
     if (nonblock && found.tty) ttyAccess(21);
@@ -573,7 +1008,7 @@ function* readFrom(found, at, count) {
     pause();
     return read;
   }
-  if (found.kind === 'out' || found.kind === 'pipe-out') throw new Errno(EBADF);
+  if (found.kind === 'out' || found.kind === 'pipe-out' || found.kind === 'arena-pipe-out') throw new Errno(EBADF);
   if (!found.read) throw new Errno(EBADF);
   if (isByteDevice(found.device)) {
     try { return readDevice(found.device, count); } catch { throw new Errno(EIO); }
@@ -591,6 +1026,7 @@ function* readFrom(found, at, count) {
 function* writeTo(found, at, data) {
   if (found.tty && found.writable === false) throw new Errno(EBADF);
   if (found.kind === 'pty') return writePty(found, data);
+  if (found.kind === 'unix-sock') return sockWriteBytes(found, data);
   if (found.kind === 'tty' && ttyControl.hungup) throw new Errno(EIO);
   if (isByteDevice(found.device)) {
     if (!found.writable) throw new Errno(EBADF);
@@ -619,7 +1055,8 @@ function* writeTo(found, at, data) {
     output(found.fd, found.tty && ttyState ? ttyState.output(data) : data);
     return data.length;
   }
-  if (found.kind === 'pipe-out') {
+  if (found.kind === 'pipe-out' || found.kind === 'arena-pipe-out') {
+    if (found.pathOnly) throw new Errno(EBADF);
     if (nonblocking(found)) {
       const { written, broken } = found.pipe.tryWrite(data);
       if (broken) return brokenPipe(written);
@@ -639,10 +1076,12 @@ function* writeTo(found, at, data) {
   throw new Errno(EBADF);
 }
 
-function brokenPipe(written = 0) {
-  signals.queue(SIGPIPE);
-  dispatchSignals();
+function brokenPipe(written = 0, nosignal = false) {
   if (written) return written;
+  if (!nosignal) {
+    signals.queue(SIGPIPE);
+    dispatchSignals();
+  }
   throw new Errno(ERRNO.EPIPE);
 }
 
@@ -797,21 +1236,33 @@ function openPathAt(dirfd, rawPath, dirflags, oflags, base, fdflags, noctty = fa
     if (!procEntry.found) throw new Errno(ENOENT);
     if (!(dirflags & FOLLOW) && !pathOnly) throw new Errno(ERRNO.ELOOP);
     const original = procEntry.found;
-    if (original.kind === 'pty') {
+    if (original.kind === 'unix-sock') {
+      throw new Errno(ERRNO.ENXIO);
+    } else if (original.kind === 'pty') {
       if (original.master) throw new Errno(ERRNO.EACCES);
       rawPath = `/dev/pts/${original.number}`;
       anchor = OS_FD_ROOT;
-    } else if (['out', 'pipe-in', 'pipe-out', 'tty'].includes(original.kind)) {
+    } else if (['out', 'pipe-in', 'pipe-out', 'arena-pipe-in', 'arena-pipe-out', 'tty'].includes(original.kind)) {
       if (oflags & OFLAG_DIRECTORY) throw new Errno(ENOTDIR);
       if ((oflags & OFLAG_CREAT) && (oflags & OFLAG_EXCL)) throw new Errno(ERRNO.EEXIST);
       if (fdflags & ~FDFLAG_NONBLOCK) throw new Errno(ERRNO.EOPNOTSUPP);
-      const readable = original.kind === 'pipe-in' || (original.kind === 'tty' && original.readable !== false);
-      const writable = ['out', 'pipe-out'].includes(original.kind) || (original.kind === 'tty' && original.writable !== false);
+      const readable = ['pipe-in', 'arena-pipe-in'].includes(original.kind) || (original.kind === 'tty' && original.readable !== false);
+      const writable = ['out', 'pipe-out', 'arena-pipe-out'].includes(original.kind) || (original.kind === 'tty' && original.writable !== false);
       if ((read && !readable) || (write && !writable)) throw new Errno(ERRNO.EACCES);
-      const found = { ...original, refs: 0, flags: descriptorFlags(), readable: read, writable: write, ...(pathOnly ? { pathOnly: true } : {}) };
+      const isArenaPipe = original.kind === 'arena-pipe-in' || original.kind === 'arena-pipe-out';
+      const reopenedFlags = descriptorFlags();
+      const found = {
+        ...original,
+        refs: 0,
+        flags: reopenedFlags,
+        ...(isArenaPipe ? { privateFlags: reopenedFlags } : {}),
+        readable: read,
+        writable: write,
+        ...(pathOnly ? { pathOnly: true } : {}),
+      };
       const number = lowest();
       install(number, found, false);
-      if (found.flags) Atomics.store(new Int32Array(found.flags), 0, fdflags & FDFLAG_NONBLOCK);
+      Atomics.store(new Int32Array(reopenedFlags), 0, fdflags & FDFLAG_NONBLOCK);
       if (cloexecFlag) cloexec.add(number);
       return number;
     } else if (original.kind === 'in') {
@@ -952,7 +1403,8 @@ const wasi = {
       : !!found.append;
     v.setUint8(ptr, filetype(found));
     v.setUint16(ptr + 2, (appending ? FDFLAG_APPEND : 0) | (nonblocking(found) ? FDFLAG_NONBLOCK : 0), true);
-    let rights = found.tty ? ALL_RIGHTS & ~(RIGHT_SEEK | RIGHT_TELL) : ALL_RIGHTS;
+    const nonSeekable = found.tty || found.kind === 'unix-sock' || found.kind === 'pipe-in' || found.kind === 'pipe-out' || found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out';
+    let rights = nonSeekable ? ALL_RIGHTS & ~(RIGHT_SEEK | RIGHT_TELL) : ALL_RIGHTS;
     if (found.tty && found.readable === false) rights &= ~RIGHT_READ;
     if (found.tty && found.writable === false) rights &= ~RIGHT_WRITE;
     v.setBigUint64(ptr + 8, rights, true);
@@ -966,6 +1418,17 @@ const wasi = {
       found.append = !!(flags & FDFLAG_APPEND);
       found.flags ??= descriptorFlags();
       Atomics.store(new Int32Array(found.flags), 0, flags & FDFLAG_NONBLOCK);
+      return;
+    }
+    if (found.kind === 'unix-sock') {
+      if (flags & ~FDFLAG_NONBLOCK) throw new Errno(ERRNO.EOPNOTSUPP);
+      sockCall('set_nonblock', { sockId: found.sockId, nonblock: !!(flags & FDFLAG_NONBLOCK) });
+      return;
+    }
+    if (found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out') {
+      if (flags & ~FDFLAG_NONBLOCK) throw new Errno(ERRNO.EOPNOTSUPP);
+      if (found.privateFlags) Atomics.store(new Int32Array(found.privateFlags), 0, flags & FDFLAG_NONBLOCK);
+      else found.pipe.setNonblock(found.kind === 'arena-pipe-in' ? 'r' : 'w', !!(flags & FDFLAG_NONBLOCK));
       return;
     }
     if (found.kind === 'pty') {
@@ -1010,6 +1473,7 @@ const wasi = {
   }),
   fd_pread: (fd, iovs, count, offset, nread) => attempt(function* () {
     const found = descriptor(fd);
+    if (found.kind === 'unix-sock' || found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out') throw new Errno(ESPIPE);
     if (found.kind === 'kfd') {
       if (offset < 0n) throw new Errno(EINVAL);
       let at = offset, total = 0;
@@ -1045,6 +1509,7 @@ const wasi = {
   },
   fd_pwrite: (fd, iovs, count, offset, nwritten) => attempt(function* () {
     const found = descriptor(fd);
+    if (found.kind === 'unix-sock' || found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out') throw new Errno(ESPIPE);
     if (found.kind === 'kfd') {
       if (offset < 0n) throw new Errno(EINVAL);
       let at = offset, total = 0;
@@ -1069,7 +1534,21 @@ const wasi = {
     let total = 0;
     try {
       yield* exclusive(found, function* () {
-        for (const [ptr, len] of iovecs(iovs, count)) {
+        const vectors = iovecs(iovs, count);
+        if (found.kind === 'unix-sock') {
+          const want = vectors.reduce((sum, [, len]) => sum + len, 0);
+          const data = sockReadBytes(found, want);
+          let off = 0;
+          for (const [ptr, len] of vectors) {
+            if (off >= data.length) break;
+            const take = Math.min(len, data.length - off);
+            bytes().set(data.subarray(off, off + take), ptr);
+            off += take;
+          }
+          total = off;
+          return;
+        }
+        for (const [ptr, len] of vectors) {
           if (found.kind === 'kfd') {
             const data = kfdRead(found, null, len);
             bytes().set(data, ptr); total += data.length;
@@ -1081,7 +1560,7 @@ const wasi = {
           bytes().set(data, ptr); total += data.length;
           if (!STDIO.has(found.kind)) found.pos = isByteDevice(found.device) ? 0 : at + data.length;
           if (data.length < len) break;
-          if (['pipe-in', 'tty'].includes(found.kind) && total > 0 && found.pipe.queued === 0) break;
+          if (['pipe-in', 'arena-pipe-in', 'tty'].includes(found.kind) && total > 0 && found.pipe.queued === 0) break;
           if (found.kind === 'pty' && total > 0 && !ptyCall(found, 'poll', { writing: false }).nbytes) break;
         }
       });
@@ -1114,13 +1593,21 @@ const wasi = {
     const all = [{ name: '.', ino: 0, type: DIRECTORY }, { name: '..', ino: 0, type: DIRECTORY }, ...entries];
     const out = [];
     let total = 0;
+    const wireType = t => typeof t === 'number' ? t : ({
+      dir: DIRECTORY,
+      file: REGULAR_FILE,
+      symlink: SYMBOLIC_LINK,
+      char: CHARACTER_DEVICE,
+      socket: SOCKET_STREAM,
+      dgram: SOCKET_DGRAM,
+    }[t] ?? UNKNOWN);
     for (let i = Number(cookie); i < all.length && total < len; i++) {
       const entry = all[i], name = encoder.encode(entry.name);
       const record = new Uint8Array(24 + name.length), v = new DataView(record.buffer);
       v.setBigUint64(0, BigInt(i + 1), true);
       v.setBigUint64(8, BigInt(entry.ino ?? 0), true);
       v.setUint32(16, name.length, true);
-      v.setUint8(20, entry.type ?? UNKNOWN);
+      v.setUint8(20, wireType(entry.type));
       record.set(name, 24);
       out.push(record); total += record.length;
     }
@@ -1130,7 +1617,7 @@ const wasi = {
   }),
   fd_renumber: (from, to) => attempt(function* () {
     const found = descriptor(from);
-    if (to < 0) throw new Errno(EBADF);
+    if (to < 0 || to >= FD_MAX) throw new Errno(EBADF);
     if (from === to) return;
     if (fds.has(to)) yield* uninstall(to);
     fds.set(to, found);
@@ -1192,7 +1679,18 @@ const wasi = {
       yield* exclusive(found, function* () {
         const vectors = iovecs(iovs, count);
         if (found.kind === 'kfd' && !found.writable && !vectors.length) throw new Errno(EBADF);
-        if (found.kind === 'pipe-out' && vectors.length > 1 && nonblocking(found)) {
+        if (found.kind === 'unix-sock' && vectors.length > 1) {
+          const length = vectors.reduce((sum, [, len]) => sum + len, 0);
+          const data = new Uint8Array(length), mem = bytes();
+          let at = 0;
+          for (const [ptr, len] of vectors) {
+            if (ptr + len > mem.length) throw new Errno(ERRNO.EFAULT);
+            data.set(mem.subarray(ptr, ptr + len), at); at += len;
+          }
+          total = sockWriteBytes(found, data);
+          return;
+        }
+        if ((found.kind === 'pipe-out' || found.kind === 'arena-pipe-out') && vectors.length > 1) {
           const length = vectors.reduce((sum, [, len]) => sum + len, 0);
           if (length <= PIPE_ATOMIC) {
             const data = new Uint8Array(length), memory = bytes();
@@ -1330,6 +1828,8 @@ const wasi = {
     flush();
     for (;;) {
       pause(); let ready = 0;
+      const seenNotify = sockNotify ? Atomics.load(sockNotify, 0) : 0;
+      let hasSocketLike = false;
       for (const sub of subscriptions) {
         const found = fds.get(sub.fd); let error = 0, nbytes = 0, hangup = false;
         if (sub.type === 0) { if (performance.now() < sub.until) continue; }
@@ -1343,21 +1843,67 @@ const wasi = {
             nbytes = result.nbytes; hangup = result.hangup;
           } catch (err) { error = err instanceof Errno ? err.errno : EIO; }
         }
-        else if (sub.type === 1 && ['pipe-in', 'tty'].includes(found.kind)) {
+        else if (found.kind === 'unix-sock') {
+          hasSocketLike = true;
+          const pollSabStream = () => {
+            if (sub.type === 1) {
+              hangup = found.rxRing.wrClosed || found.rxRing.rdClosed;
+              const hasData = found.rxRing.queued > 0 || found.rxRing.hasAncillary;
+              if (!hasData && !hangup) return false;
+              nbytes = found.rxRing.queued;
+              return true;
+            }
+            hangup = found.txRing.rdClosed || found.txRing.wrClosed;
+            if (!hangup && !found.txRing.room) return false;
+            nbytes = hangup ? 0 : found.txRing.room;
+            return true;
+          };
+          if (found.sockType === SOCK_STREAM && found.rxRing && found.txRing) {
+            if (!pollSabStream()) continue;
+          } else {
+            try {
+              const result = sockCall('poll', { sockId: found.sockId, writing: sub.type === 2 });
+              if (found.sockType === SOCK_STREAM && sockArena && (result.txSlot || result.rxSlot)) {
+                found.txSlot = result.txSlot ?? null;
+                found.rxSlot = result.rxSlot ?? null;
+                attachSockRings(found);
+                if (found.rxRing && found.txRing) {
+                  if (!pollSabStream()) continue;
+                } else {
+                  if (!result.ready) continue;
+                  nbytes = result.nbytes ?? 0; hangup = !!result.hangup;
+                }
+              } else {
+                if (!result.ready) continue;
+                nbytes = result.nbytes ?? 0; hangup = !!result.hangup;
+              }
+            } catch (err) { error = err instanceof Errno ? err.errno : EIO; }
+          }
+        }
+        else if (sub.type === 1 && ['pipe-in', 'arena-pipe-in', 'tty'].includes(found.kind)) {
+          if (found.kind === 'arena-pipe-in') hasSocketLike = true;
           if (found.pipe.empty) continue;
           nbytes = found.pipe.queued; hangup = found.pipe.writerGone;
-        } else if (sub.type === 2 && found.kind === 'pipe-out') {
+        } else if (sub.type === 2 && ['pipe-out', 'arena-pipe-out'].includes(found.kind)) {
+          if (found.kind === 'arena-pipe-out') hasSocketLike = true;
           hangup = found.pipe.readerGone;
           if (!hangup && !found.pipe.room) continue;
           nbytes = found.pipe.room;
-        } else if (sub.type === 1 && ['out', 'pipe-out'].includes(found.kind) || sub.type === 2 && ['in', 'pipe-in'].includes(found.kind)) error = EBADF;
+        } else if (sub.type === 1 && ['out', 'pipe-out', 'arena-pipe-out'].includes(found.kind) || sub.type === 2 && ['in', 'pipe-in', 'arena-pipe-in'].includes(found.kind)) error = EBADF;
         const at = output + ready++ * 32;
         v.setBigUint64(at, sub.userdata, true); v.setUint16(at + 8, error, true); v.setUint8(at + 10, sub.type);
         v.setBigUint64(at + 16, BigInt(nbytes), true); v.setUint16(at + 24, hangup ? 1 : 0, true);
       }
       if (ready) { v.setUint32(events, ready, true); return; }
       const until = Math.min(...subscriptions.map(sub => sub.until));
-      sleepUntil(Math.min(until, performance.now() + 10));
+      const waitMs = Math.max(0, Math.min(until - performance.now(), 10));
+      if (waitMs > 0) {
+        if (hasSocketLike && sockNotify) {
+          Atomics.wait(sockNotify, 0, seenNotify, waitMs);
+        } else {
+          sleepUntil(performance.now() + waitMs);
+        }
+      }
     }
   }),
   proc_exit: code => { throw new Exit(code); },
@@ -1547,7 +2093,7 @@ const wasixCalls = {
   }),
   fd_renumber: (from, to) => attempt(function* () {
     const found = descriptor(from);
-    if (to < 0) throw new Errno(EBADF);
+    if (to < 0 || to >= FD_MAX) throw new Errno(EBADF);
     if (from === to) return;
     const duped = duplicateDescriptor(found, false);
     if (fds.has(to)) yield* uninstall(to);
@@ -1566,10 +2112,17 @@ const wasixCalls = {
   }),
   fd_pipe: (readEnd, writeEnd) => attempt(function* () {
     if (typeof SharedArrayBuffer !== 'function') throw new Errno(ENOSYS);
+    const [r, w] = lowestPair();
+    if (sockArena && channel) {
+      const { slot, gen } = sockCall('pipe_alloc');
+      install(r, { kind: 'arena-pipe-in', slot, gen, pipe: new ArenaPipe(sockArena, slot, gen, process.pid, sockNotify) }, true);
+      install(w, { kind: 'arena-pipe-out', slot, gen, pipe: new ArenaPipe(sockArena, slot, gen, process.pid, sockNotify) }, true);
+      view().setUint32(readEnd, r, true);
+      view().setUint32(writeEnd, w, true);
+      return;
+    }
     const pipe = new Pipe(pipeBuffer(), process.pid);
-    const r = lowest();
     install(r, { kind: 'pipe-in', pipe });
-    const w = lowest();
     install(w, { kind: 'pipe-out', pipe });
     view().setUint32(readEnd, r, true);
     view().setUint32(writeEnd, w, true);
@@ -1704,12 +2257,14 @@ function describe(found) {
   if (found.preopen && found.kfd == null) return { kind: 'preopen', preopen: true };
   switch (found.kind) {
     case 'pty': return { kind: 'pty', tty: true, handle: found.handle, master: found.master, number: found.number, readable: found.readable, writable: found.writable, refs: found.refs };
+    case 'unix-sock': return { kind: 'unix-sock', sockId: found.sockId, sockType: found.sockType, txSlot: found.txSlot, rxSlot: found.rxSlot, flags: found.flags, refs: found.refs };
+    case 'arena-pipe-in': case 'arena-pipe-out': return { kind: found.kind, slot: found.slot, gen: found.gen, flags: found.flags, ...(found.privateFlags ? { privateFlags: found.privateFlags } : {}), ...(found.pathOnly ? { pathOnly: true } : {}), refs: found.refs };
     case 'in':
       if (shares && found.share == null) share(found);
       if (shares && found.share == null) throw new Errno(ERRNO.EMFILE);
       return { kind: 'in', procInfo: found.procInfo, pathOnly: found.pathOnly, stat: found.stat, tty: found.tty, flags: found.flags, data: found.share == null ? found.data.slice(found.pos) : found.data, share: found.share, refs: found.refs };
     case 'out': return { kind: 'out', fd: found.fd, tty: found.tty, flags: found.flags, closed: found.closed?.buffer ?? null };
-    case 'tty': case 'pipe-in': case 'pipe-out': return { fd: found.fd, kind: found.kind, tty: !!found.tty, flags: found.flags, readable: found.readable, writable: found.writable, buffer: found.pipe.buffer, refs: found.refs };
+    case 'tty': case 'pipe-in': case 'pipe-out': return { fd: found.fd, kind: found.kind, tty: !!found.tty, flags: found.flags, ...(found.pathOnly ? { pathOnly: true } : {}), readable: found.readable, writable: found.writable, buffer: found.pipe.buffer, refs: found.refs };
     case 'kfd': {
       const { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, flags, stat, share: slot } = found;
       return { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, ...(flags ? { flags } : {}), stat, ...(slot != null ? { share: slot } : {}), refs: found.refs };
@@ -1728,13 +2283,20 @@ function adopt(state) {
     if (description.preopen || description.kind === 'preopen') return { kind: 'preopen', preopen: true };
     switch (description.kind) {
       case 'pty': { const { refs, ...found } = description; return found; }
+      case 'unix-sock': {
+        const desc = { kind: 'unix-sock', sockId: description.sockId, sockType: description.sockType, txSlot: description.txSlot ?? null, rxSlot: description.rxSlot ?? null, flags: description.flags, peerCred: null };
+        attachSockRings(desc);
+        return desc;
+      }
+      case 'arena-pipe-in': case 'arena-pipe-out':
+        return { kind: description.kind, slot: description.slot, gen: description.gen, flags: description.flags, ...(description.privateFlags ? { privateFlags: description.privateFlags } : {}), ...(description.pathOnly ? { pathOnly: true } : {}), pipe: new ArenaPipe(sockArena, description.slot, description.gen, process.pid, sockNotify) };
       case 'in': {
         const found = { kind: 'in', procInfo: description.procInfo, pathOnly: description.pathOnly, stat: description.stat, tty: description.tty, flags: description.flags, data: description.data, pos: 0 };
         if (description.share != null) shares.attach(found, description.share);
         return found;
       }
       case 'out': return { kind: 'out', fd: description.fd, tty: description.tty, flags: description.flags, closed: description.closed ? new Int32Array(description.closed) : null };
-      case 'tty': case 'pipe-in': case 'pipe-out': return { fd: description.fd, kind: description.kind, tty: description.tty, flags: description.flags, readable: description.readable, writable: description.writable, pipe: new Pipe(description.buffer, process.pid) };
+      case 'tty': case 'pipe-in': case 'pipe-out': return { fd: description.fd, kind: description.kind, tty: description.tty, flags: description.flags, ...(description.pathOnly ? { pathOnly: true } : {}), readable: description.readable, writable: description.writable, pipe: new Pipe(description.buffer, process.pid) };
       case 'kfd': { const { refs, ...rest } = description; return { ...rest }; }
       default: {
         const found = adopted(description);
@@ -1867,6 +2429,9 @@ const NEVER_SUSPENDS = new Set([
   'proc_exit2', 'proc_signals_get', 'proc_signals_sizes_get', 'fd_fdflags_get', 'fd_fdflags_set',
   'sigpoll', 'getuid', 'getgid', 'getgroups', 'getpgid', 'getsid', 'setpgid', 'setsid', 'tcgetpgrp', 'tcsetpgrp', 'waitpid2', 'sigaction', 'sigmask', 'sigpending', 'sigsuspend',
   'futex_wake_all', 'reply', 'umask', 'tty_get', 'tty_set', 'posix_spawn', 'waitpid',
+  'sock_socket', 'sock_socketpair', 'sock_bind', 'sock_listen', 'sock_accept', 'sock_connect',
+  'sock_shutdown', 'sock_sendmsg', 'sock_recvmsg', 'sock_peercred', 'sock_getsockname',
+  'sock_getpeername', 'sock_getsockopt', 'sock_setsockopt',
 ]);
 
 function suspendable(namespace) {
@@ -2142,11 +2707,12 @@ function osBatch(calls) {
     } else if (call?.close || call?.discard) {
       const fd = (call.close ?? call.discard).fd, found = fds.get(fd);
       if (!found) { results.push({ err: { errno: 'EBADF' } }); continue; }
-      if (call.discard && !kernelDescriptor(found)) { results.push({ err: { errno: 'EINVAL' } }); continue; }
-      const result = kernelDescriptor(found)
+      const isKernel = kernelDescriptor(found);
+      if (call.discard && !isKernel) { results.push({ err: { errno: 'EINVAL' } }); continue; }
+      const result = isKernel
         ? vfsCall('sys', { batch: { calls: [translateCallFds(call)], umask: process.umask } }).results[0]
         : { ok: null };
-      drive(uninstall(fd, true));
+      drive(uninstall(fd, isKernel));
       results.push(result);
     } else {
       if (isPtyIoctl(call)) {
@@ -2282,7 +2848,11 @@ const osApi = {
       writeRawStatFs(outPtr, { f_type: 0x00001cd1, bsize: 4096, frsize: 4096, namelen: 255, flags: 6 });
       return 0;
     }
-    if (found.kind === 'pipe-in' || found.kind === 'pipe-out') {
+    if (found.kind === 'unix-sock') {
+      writeRawStatFs(outPtr, { f_type: 0x534f434b, bsize: 4096, frsize: 4096, namelen: 255, flags: 0 });
+      return 0;
+    }
+    if (found.kind === 'pipe-in' || found.kind === 'pipe-out' || found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out') {
       writeRawStatFs(outPtr, { f_type: 0x50495045, bsize: 4096, frsize: 4096, namelen: 255, flags: 0 });
       return 0;
     }
@@ -2420,6 +2990,262 @@ const osApi = {
     return reply.length;
   },
   reply: ptr => { bytes().set(reply, ptr); },
+  // ---- Wave 4A Track 1 (`#55` L3b): AF_UNIX / SCM_RIGHTS / SO_PEERCRED `(module "os")` imports ----
+  sock_socket: (domain, sockType, protocol, outFd) => {
+    pause();
+    try {
+      if ((domain >>> 0) !== AF_UNIX) throw new Errno(ERRNO.EAFNOSUPPORT);
+      if ((protocol >>> 0) !== 0) throw new Errno(ERRNO.EPROTONOSUPPORT);
+      const rawType = sockType >>> 0;
+      if (rawType & ~(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC)) throw new Errno(EINVAL);
+      const baseType = rawType & SOCK_TYPE_MASK;
+      if (baseType !== SOCK_STREAM && baseType !== SOCK_DGRAM && baseType !== SOCK_SEQPACKET) throw new Errno(ERRNO.EPROTOTYPE);
+      const outPtr = checkWritable(outFd, 4);
+      const fd = lowest();
+      const { sockId } = sockCall('create', { sockType: baseType });
+      const desc = { kind: 'unix-sock', sockId, sockType: baseType, txSlot: null, rxSlot: null, txRing: null, rxRing: null, peerCred: null };
+      install(fd, desc, true);
+      if (rawType & SOCK_NONBLOCK) sockCall('set_nonblock', { sockId, nonblock: true });
+      if (rawType & SOCK_CLOEXEC) cloexec.add(fd);
+      view().setUint32(outPtr, fd, true);
+      return 0;
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
+  sock_socketpair: (domain, sockType, protocol, outFds) => {
+    pause();
+    try {
+      if ((domain >>> 0) !== AF_UNIX) throw new Errno(ERRNO.EAFNOSUPPORT);
+      if ((protocol >>> 0) !== 0) throw new Errno(ERRNO.EPROTONOSUPPORT);
+      const rawType = sockType >>> 0;
+      if (rawType & ~(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC)) throw new Errno(EINVAL);
+      const baseType = rawType & SOCK_TYPE_MASK;
+      if (baseType !== SOCK_STREAM && baseType !== SOCK_DGRAM && baseType !== SOCK_SEQPACKET) throw new Errno(ERRNO.EPROTOTYPE);
+      const outPtr = checkWritable(outFds, 8);
+      const [fdA, fdB] = lowestPair();
+      const res = sockCall('socketpair', { sockType: baseType });
+      const descA = { kind: 'unix-sock', sockId: res.sockA, sockType: baseType, txSlot: res.slotAB ?? null, rxSlot: res.slotBA ?? null, peerCred: null };
+      const descB = { kind: 'unix-sock', sockId: res.sockB, sockType: baseType, txSlot: res.slotBA ?? null, rxSlot: res.slotAB ?? null, peerCred: null };
+      attachSockRings(descA);
+      attachSockRings(descB);
+      install(fdA, descA, true);
+      install(fdB, descB, true);
+      if (rawType & SOCK_NONBLOCK) {
+        sockCall('set_nonblock', { sockId: res.sockA, nonblock: true });
+        sockCall('set_nonblock', { sockId: res.sockB, nonblock: true });
+      }
+      if (rawType & SOCK_CLOEXEC) { cloexec.add(fdA); cloexec.add(fdB); }
+      const v = view();
+      v.setUint32(outPtr, fdA, true);
+      v.setUint32(outPtr + 4, fdB, true);
+      return 0;
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
+  sock_bind: (fd, pathPtr, pathLen) => {
+    pause();
+    try {
+      const found = sockDescriptor(fd);
+      const path = checkedString(pathPtr, pathLen);
+      sockCall('bind', { sockId: found.sockId, path });
+      return 0;
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
+  sock_listen: (fd, backlog) => {
+    pause();
+    try {
+      const found = sockDescriptor(fd);
+      sockCall('listen', { sockId: found.sockId, backlog: backlog >>> 0 });
+      return 0;
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
+  sock_accept: (fd, flags, outFd) => {
+    pause();
+    try {
+      const found = sockDescriptor(fd);
+      const rawFlags = flags >>> 0;
+      if (rawFlags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) throw new Errno(EINVAL);
+      const outPtr = checkWritable(outFd, 4);
+      for (;;) {
+        pause(true);
+        // Reserve a guest fd BEFORE dequeueing so transient EMFILE never drops a pending client!
+        const targetFd = lowest();
+        const nb = nonblocking(found);
+        const seen = sockNotify ? Atomics.load(sockNotify, 0) : 0;
+        const res = sockCall('accept', { sockId: found.sockId });
+        if (res.wouldBlock) {
+          if (nb) throw new Errno(ERRNO.EAGAIN);
+          waitSockNotify(seen, 20);
+          continue;
+        }
+        const desc = {
+          kind: 'unix-sock',
+          sockId: res.sockId,
+          sockType: found.sockType,
+          txSlot: res.txSlot ?? null,
+          rxSlot: res.rxSlot ?? null,
+          peerCred: res.peerCred ?? null,
+        };
+        attachSockRings(desc);
+        install(targetFd, desc, true);
+        if (rawFlags & SOCK_NONBLOCK) sockCall('set_nonblock', { sockId: res.sockId, nonblock: true });
+        if (rawFlags & SOCK_CLOEXEC) cloexec.add(targetFd);
+        view().setUint32(outPtr, targetFd, true);
+        return 0;
+      }
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
+  sock_connect: (fd, pathPtr, pathLen) => {
+    pause();
+    try {
+      const found = sockDescriptor(fd);
+      const path = checkedString(pathPtr, pathLen);
+      for (;;) {
+        pause(true);
+        const nb = nonblocking(found);
+        const seen = sockNotify ? Atomics.load(sockNotify, 0) : 0;
+        let res;
+        try {
+          res = sockCall('connect', { sockId: found.sockId, path });
+        } catch (err) {
+          if (err instanceof Errno && err.errno === ERRNO.EAGAIN && !nb) {
+            waitSockNotify(seen, 20);
+            continue;
+          }
+          throw err;
+        }
+        if (res.txSlot || res.rxSlot) {
+          found.txSlot = res.txSlot ?? null;
+          found.rxSlot = res.rxSlot ?? null;
+          attachSockRings(found);
+        }
+        if (res.peerCred) found.peerCred = res.peerCred;
+        return 0;
+      }
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
+  sock_shutdown: (fd, how) => {
+    pause();
+    try {
+      const found = sockDescriptor(fd);
+      sockCall('shutdown', { sockId: found.sockId, how: how >>> 0 });
+      return 0;
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
+  sock_sendmsg: (fd, dataPtr, dataLen, fdsPtr, fdsLen, addrPtr, addrLen, flags, outSent) => {
+    pause();
+    try {
+      const found = sockDescriptor(fd);
+      const nFds = fdsLen >>> 0;
+      if (nFds > SCM_MAX_FD) throw new Errno(EINVAL);
+      const outPtr = checkWritable(outSent, 4);
+      const data = (dataLen >>> 0) > 0 ? checkedSlice(dataPtr, dataLen) : new Uint8Array(0);
+      const addr = (addrLen >>> 0) > 0 ? checkedString(addrPtr, addrLen) : null;
+      const fdsList = [];
+      if (nFds > 0) {
+        const fPtr = checkWritable(fdsPtr, nFds * 4);
+        const v = view();
+        for (let i = 0; i < nFds; i++) fdsList.push(encodeSendFd(v.getUint32(fPtr + i * 4, true)));
+      }
+      const sent = sockSendMsg(found, data, fdsList, addr, flags >>> 0);
+      view().setUint32(outPtr, sent, true);
+      return 0;
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
+  sock_recvmsg: (fd, bufPtr, bufLen, fdsPtr, fdsCap, outFdsLen, outPeerPtr, flags, outRecv, outFlags) => {
+    pause();
+    try {
+      const found = sockDescriptor(fd);
+      const bLen = bufLen >>> 0;
+      const cap = fdsCap >>> 0;
+      const bPtr = bLen > 0 ? checkWritable(bufPtr, bLen) : 0;
+      const fPtr = cap > 0 ? checkWritable(fdsPtr, cap * 4) : 0;
+      const fdsLenPtr = checkWritable(outFdsLen, 4);
+      const recvPtr = checkWritable(outRecv, 4);
+      const flagsPtr = checkWritable(outFlags, 4);
+      if (outPeerPtr) checkWritable(outPeerPtr, 12);
+      const rawFlags = flags >>> 0;
+      const cmsgCloexec = !!(rawFlags & MSG_CMSG_CLOEXEC);
+      const availFds = Math.max(0, FD_MAX - fds.size);
+      const effectiveMaxFds = Math.min(cap, availFds);
+      const res = sockRecvMsg(found, bLen, effectiveMaxFds, rawFlags);
+      const installed = [];
+      let resFlags = res.outFlags ?? 0;
+      for (const spec of res.fds) {
+        try {
+          installed.push(installReceivedFd(spec, cmsgCloexec));
+        } catch {
+          disposeUninstalledFd(spec);
+          resFlags |= MSG_CTRUNC;
+        }
+      }
+      const copyLen = Math.min(bLen, res.data.length);
+      if (copyLen > 0) bytes().set(res.data.subarray(0, copyLen), bPtr);
+      const v = view();
+      for (let i = 0; i < installed.length; i++) v.setUint32(fPtr + i * 4, installed[i], true);
+      v.setUint32(fdsLenPtr, installed.length, true);
+      writePeerCred(outPeerPtr, res.peerCred);
+      v.setUint32(recvPtr, res.reportedLen ?? copyLen, true);
+      v.setUint32(flagsPtr, resFlags, true);
+      return 0;
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
+  sock_peercred: (fd, outCred) => {
+    pause();
+    try {
+      const found = sockDescriptor(fd);
+      const cred = sockCall('peercred', { sockId: found.sockId });
+      found.peerCred = cred;
+      writePeerCred(outCred, cred);
+      return 0;
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
+  sock_getsockname: (fd, bufPtr, bufLen, outLen) => {
+    pause();
+    try {
+      const found = sockDescriptor(fd);
+      const bLen = bufLen >>> 0;
+      const bPtr = bLen > 0 ? checkWritable(bufPtr, bLen) : 0;
+      const lPtr = checkWritable(outLen, 4);
+      const { path } = sockCall('getsockname', { sockId: found.sockId });
+      const encoded = encoder.encode(path ?? '');
+      const take = Math.min(bLen, encoded.length);
+      if (take > 0) bytes().set(encoded.subarray(0, take), bPtr);
+      view().setUint32(lPtr, encoded.length, true);
+      return 0;
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
+  sock_getpeername: (fd, bufPtr, bufLen, outLen) => {
+    pause();
+    try {
+      const found = sockDescriptor(fd);
+      const bLen = bufLen >>> 0;
+      const bPtr = bLen > 0 ? checkWritable(bufPtr, bLen) : 0;
+      const lPtr = checkWritable(outLen, 4);
+      const { path } = sockCall('getpeername', { sockId: found.sockId });
+      const encoded = encoder.encode(path ?? '');
+      const take = Math.min(bLen, encoded.length);
+      if (take > 0) bytes().set(encoded.subarray(0, take), bPtr);
+      view().setUint32(lPtr, encoded.length, true);
+      return 0;
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
+  sock_getsockopt: (fd, level, optname, outVal) => {
+    pause();
+    try {
+      const found = sockDescriptor(fd);
+      const outPtr = checkWritable(outVal, 4);
+      const { val } = sockCall('getsockopt', { sockId: found.sockId, level: level >>> 0, optname: optname >>> 0 });
+      view().setInt32(outPtr, val | 0, true);
+      return 0;
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
+  sock_setsockopt: (fd, level, optname, val) => {
+    pause();
+    try {
+      const found = sockDescriptor(fd);
+      sockCall('setsockopt', { sockId: found.sockId, level: level >>> 0, optname: optname >>> 0, val: val | 0 });
+      return 0;
+    } catch (err) { if (!(err instanceof Errno)) throw err; return err.errno; }
+  },
 };
 
 let started = false;
@@ -2442,6 +3268,8 @@ async function start(data) {
   outputCredit = data.outputCredit ? new Int32Array(data.outputCredit) : null;
   control = data.control ? new Int32Array(data.control) : null;
   channel = data.channel ? { state: new Int32Array(data.channel, 0, 2), data: new Uint8Array(data.channel, 8) } : null;
+  sockArena = data.sockArena ?? null;
+  sockNotify = data.sockNotify ? new Int32Array(data.sockNotify) : null;
   const { stdin = {}, stdout = {}, stderr = {} } = data;
   const parent = data.fork ?? data.inherit;
   signals = new Signals(control, parent?.signals);

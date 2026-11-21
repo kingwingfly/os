@@ -40,6 +40,7 @@ pub mod procfs;
 pub mod profiles;
 pub mod sharefs;
 pub mod stat;
+pub mod unix_sock;
 pub mod vblk;
 pub mod vfs;
 pub mod walk;
@@ -178,6 +179,18 @@ pub trait Filesystem {
         mode: u16,
         rdev: &'a str,
     ) -> BoxFuture<'a, Entry>;
+    /// Create a Unix-domain socket inode (`S_IFSOCK`, `FileType::Socket`).
+    /// Unlike `mknod` for character devices, any caller with write+search permission on `dir`
+    /// may create a socket inode.
+    fn mksock<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _dir: &'a Handle,
+        _name: &'a str,
+        _mode: u16,
+    ) -> BoxFuture<'a, Entry> {
+        Box::pin(async { Err(Errno::EOPNOTSUPP) })
+    }
     fn symlink<'a>(
         &'a self,
         cred: &'a Cred,

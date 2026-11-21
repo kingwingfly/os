@@ -50,6 +50,7 @@ pub type Clock = Box<dyn Fn() -> (u64, u32)>;
 
 struct Inode {
     meta: Node,
+    is_socket: bool,
     nlink: u32,
     /// A regular file's size, and the pages of its content written, by index: the rest reads as
     /// zeros, and every byte past the size is zero.
@@ -70,6 +71,7 @@ impl Inode {
     fn new(meta: Node, nlink: u32, parent: u64, name: &str, now: (u64, u32)) -> Self {
         Self {
             meta,
+            is_socket: false,
             nlink,
             size: 0,
             pages: BTreeMap::new(),
@@ -88,6 +90,8 @@ impl Inode {
             FileType::Dir
         } else if self.meta.link.is_some() {
             FileType::Symlink
+        } else if self.is_socket {
+            FileType::Socket
         } else if self.meta.rdev.is_some() {
             FileType::CharDevice
         } else {
@@ -476,6 +480,9 @@ impl MemFs {
         let access = options.access()?;
         if access == Access::Path {
             return Ok(access);
+        }
+        if inode.file_type() == FileType::Socket {
+            return Err(Errno::ENXIO);
         }
         let mut mask = access.mask();
         if options.is_truncate() {
@@ -1328,6 +1335,29 @@ impl Filesystem for MemFs {
             node.rdev = Some(rdev.to_string());
             node
         }))
+    }
+    fn mksock<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+    ) -> BoxFuture<'a, Entry> {
+        ready!({
+            let mut state = self.state.borrow_mut();
+            let dir_ino = self.check(&state, dir)?;
+            Self::creatable(&state, cred, dir_ino, name)?;
+            let meta = created(
+                &cred.identity,
+                &state.inodes[&dir_ino].meta,
+                mode,
+                false,
+                cred.umask,
+            );
+            let ino = self.add(&mut state, dir_ino, name, meta);
+            state.inodes.get_mut(&ino).expect("socket inode").is_socket = true;
+            Ok(self.entry(&state, ino))
+        })
     }
     fn symlink<'a>(
         &'a self,

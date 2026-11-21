@@ -2453,6 +2453,9 @@ impl<T: HostTree, M: MetaStore, L: ProfileLocks> HostFs<T, M, L> {
         let _ns = self.ns_lock(LockKind::Exclusive).await?;
         let inode = self.check_live_inode(handle).await?;
         let access = self.check_openable(cred, &inode, options)?;
+        if access != Access::Path && inode.file_type() == FileType::Socket {
+            return Err(Errno::ENXIO);
+        }
         let (_, open) = self
             .finish_open_existing(cred, inode, options, access)
             .await?;
