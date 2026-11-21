@@ -8,10 +8,10 @@ description = "Reads and writes zip and tar archives for OS, in its container"
 os-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 tiny_http = "0.12"
 # Pure Rust deflate (miniz_oxide), the same on every host, so that archives rebuilt after an
 # interruption are byte for byte the ones begun.
 flate2 = "1.1"
 tar = { version = "0.4", default-features = false }
-zip = { version = "9.1", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.8", default-features = false, features = ["deflate-flate2"] }

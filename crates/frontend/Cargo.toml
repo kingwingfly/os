@@ -7,9 +7,9 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-leptos = { version = "=0.8.20", features = ["csr"] }
+leptos = { version = "=0.8.23", features = ["csr"] }
 wasm-bindgen.workspace = true
-wasm-bindgen-futures = "=0.4.79"
+wasm-bindgen-futures = "=0.4.80"
 js-sys.workspace = true
 web-sys = { workspace = true, features = [
     "Blob",
@@ -59,7 +59,7 @@ web-sys = { workspace = true, features = [
 serde.workspace = true
 serde_json.workspace = true
 serde-wasm-bindgen = "0.6"
-gloo-net = "0.6"
+gloo-net = "0.8"
 os-core = { path = "../core" }
 # User space: the programs, over system calls (owner's design, 2026-10-29).
 abi = { package = "os-abi", path = "../abi" }
@@ -70,7 +70,7 @@ futures = "0.3"
 # The viewer's search, with the regular expressions grep takes.
 regex = { version = "1.13", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
 # Uploads hash files, to resume them and so that R2 checks every chunk.
-sha2 = "0.10"
+sha2 = "0.11"
 # File previews: sanitized Markdown with maths as MathML, and CSV tables; PDF pages, archive
 # listings, diagrams and highlighted code come from the preview workers.
 ammonia = "4.2"

@@ -12,7 +12,7 @@ use abi::{
     remote_fs::{self as wire, Call},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use kernel::Fs;
 use os_core::{
     inode,

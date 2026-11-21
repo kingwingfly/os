@@ -2,7 +2,7 @@
 // Usage: WASIX_DASH=/path/to/dash node scripts/wasix-phase0.mjs [argv...]
 // The fixture is not committed; the test skips when WASIX_DASH is absent.
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,6 +23,7 @@ execFileSync('cargo', ['build', '-p', 'os-wasix-runtime', '--target', 'wasm32-un
 // own bindings: wasm-bindgen rewrites the wasm while the other probe may be loading it.
 const bindings = mkdtempSync(join(target, 'wasix-node-'));
 process.on('exit', () => rmSync(bindings, { recursive: true, force: true }));
+writeFileSync(join(bindings, 'package.json'), '{"type":"commonjs"}\n');
 execFileSync('wasm-bindgen', [
   '--target', 'nodejs',
   '--out-dir', bindings,

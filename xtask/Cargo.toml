@@ -8,5 +8,5 @@ os-image = { path = "../crates/image" }
 os-core = { path = "../crates/core" }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
-ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "fast", "zeroize"] }
+sha2 = "0.11"
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["fast", "zeroize"] }

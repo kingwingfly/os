@@ -7,7 +7,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-worker = "=0.8.7"
+worker = "=0.9.0"
 serde.workspace = true
 serde_json.workspace = true
 os-core = { path = "../core" }
@@ -18,9 +18,9 @@ abi = { package = "os-abi", path = "../abi" }
 kernel = { package = "os-kernel", path = "../kernel" }
 # getfattr -m patterns, with the regular expressions fd takes.
 regex = { version = "1.13", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
-hmac = "0.12"
-sha2 = "0.10"
-base64 = "0.22"
+hmac = "0.13"
+sha2 = "0.11"
+base64 = "0.23"
 wasm-bindgen.workspace = true
 js-sys.workspace = true
 
