@@ -1,7 +1,8 @@
 import { executableAsset } from './executable-asset.js';
 import { test, expect } from './test.js';
 import { api, call, put, rmrf, sys } from './sys.js';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { hookPageKernel } from './service-auth.js';
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const input = page => page.getByLabel('Shell input', { exact: true });
@@ -17,34 +18,29 @@ async function command(page, text, expected) {
 async function signIn(request) {
   expect((await api(request, 'login', { headers: { 'CF-Connecting-IP': 'targets-' + randomUUID() }, data: { password } })).ok()).toBe(true);
 }
-async function loginAction(request, action) {
-  const [answer] = await sys(request, [{ login_session: { action } }], {}, { 'X-Registry': '1' });
-  expect(answer.err, JSON.stringify(answer)).toBeUndefined(); return answer.ok;
-}
-const secret = () => randomBytes(32).toString('hex');
 
 test.beforeEach(async ({ context }) => { await context.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'targets-' + randomUUID() }); });
 
-test('greeter offers fixed session choices and guest desktop without booting an execution host', async ({ page }) => {
+test('greeter offers fixed session choices and guest desktop without booting an execution host', async ({ page }, testInfo) => {
   const hosts = []; page.on('request', request => { if (/client-kernel|executor-host|usr\/bin/.test(request.url())) hosts.push(request.url()); });
   await page.goto('/login.html?target=https://example.invalid');
   await expect(page.getByLabel('Desktop', { exact: true })).toBeChecked();
   await expect(page.getByRole('button', { name: 'Continue as guest', exact: true })).toBeEnabled();
   expect(hosts).toEqual([]);
-  await page.screenshot({ path: '/home/ai/os-session-targets-validation/greeter.png' });
+  await page.screenshot({ path: testInfo.outputPath('greeter.png') });
   await page.getByRole('button', { name: 'Continue as guest', exact: true }).click();
   await expect(page).toHaveURL(/\/(?:index\.html)?$/); await expect(page.locator('#command')).toBeVisible();
   await expect(page.getByRole('link', { name: 'Start session', exact: true })).toHaveCount(0);
 });
 
-test('sign-in selects a real root shell with its account home and no credentials in the URL', async ({ page }) => {
+test('sign-in selects a real root shell with its account home and no credentials in the URL', async ({ page }, testInfo) => {
   await page.goto('/login.html?target=shell'); await expect(page.getByLabel('Shell', { exact: true })).toBeChecked();
   await page.getByLabel('Username', { exact: true }).fill('root');
   await page.getByLabel('Password', { exact: true }).fill(password);
   await page.getByRole('button', { name: 'Sign in and start', exact: true }).click();
   await expect(page).toHaveURL(/\/shell(?:\.html)?$/); await expect(input(page)).toBeEnabled({ timeout: 30_000 });
   await command(page, 'id -u; pwd', /\n0\n\/root\n/);
-  await page.screenshot({ path: '/home/ai/os-session-targets-validation/shell.png' });
+  await page.screenshot({ path: testInfo.outputPath('shell.png') });
   await end(page).click(); await expect(input(page)).toBeDisabled();
   await expect(status(page)).toContainText('Shell exited', { timeout: 15_000 });
 });
@@ -153,36 +149,38 @@ test('ending while the shell image loads abandons the candidate and cannot reviv
 });
 
 test('the selected shell starts automatic login units once; the greeter does not start them', async ({ page }) => {
+  const kernel = await hookPageKernel(page);
   await call(page.request, 'getcreds'); const base = '/guest/target-units-' + randomUUID();
   await call(page.request, { mkdir: { path: base, mode: 0o700 } });
   const file = base + '/units.json';
   expect((await put(page.request, '/api/file?path=' + file, { data: JSON.stringify({ version: 1, units: [{ name: 'once', argv: ['sh', '-c', `echo once >> ${base}/count`] }] }) })).ok()).toBe(true);
-  const host = { host: randomUUID(), proof: secret() };
-  const joined = await loginAction(page.request, { op: 'join', ...host });
-  const member = { session: joined.id, ...host };
-  const owned = await loginAction(page.request, { op: 'claim', member, generation: joined.generation });
-  await loginAction(page.request, { op: 'configure', member, generation: owned.generation, file });
-  await loginAction(page.request, { op: 'leave', member });
   try {
     await page.goto('/login.html?target=shell'); await expect(page.getByRole('button', { name: 'Continue as guest', exact: true })).toBeEnabled();
     expect((await sys(page.request, [{ stat: { path: base + '/count' } }]))[0].err?.errno).toBe('ENOENT');
     await page.getByRole('button', { name: 'Continue as guest', exact: true }).click(); await expect(input(page)).toBeEnabled({ timeout: 30_000 });
-    await expect.poll(async () => (await loginAction(page.request, { op: 'inspect' })).startup.status, { timeout: 30_000 }).toBe(0);
+    await kernel.ready();
+    await expect.poll(async () => (await kernel.value('login_status'))?.coordinator).toBe(true);
+    const before = await kernel.value('login_status');
+    await kernel.value('login_configure', { file, expected: { session: before.session.id, generation: before.session.generation } });
+    await expect.poll(async () => (await kernel.value('login_status'))?.session?.startup?.status, { timeout: 30_000 }).toBe(0);
     expect(await (await page.request.get('/api/file?path=' + base + '/count')).text()).toBe('once\n');
-    await page.reload(); await expect(input(page)).toBeEnabled({ timeout: 30_000 });
-    expect((await loginAction(page.request, { op: 'inspect' })).startup.status).toBe(0);
-    expect(await (await page.request.get('/api/file?path=' + base + '/count')).text()).toBe('once\n'); await end(page).click();
+    // Re-evaluating coordinator membership on the same login session must not rerun completed units.
+    await kernel.value('login_refresh', { fromServer: false });
+    await expect.poll(async () => (await kernel.value('login_status'))?.coordinator).toBe(true);
+    expect((await kernel.value('login_status')).session.startup.status).toBe(0);
+    expect(await (await page.request.get('/api/file?path=' + base + '/count')).text()).toBe('once\n');
+    await end(page).click();
   } finally { await rmrf(page.request, base); }
 });
 
-test('short mobile viewports can scroll the greeter and run the selected shell', async ({ page }) => {
+test('short mobile viewports can scroll the greeter and run the selected shell', async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 375, height: 380 }); await page.goto('/login.html?target=shell');
   await page.getByLabel('Password', { exact: true }).click();
   expect(await page.locator('.greeter').evaluate(element => element.scrollTop)).toBeGreaterThan(0);
   const box = await page.getByLabel('Password', { exact: true }).boundingBox();
   expect(box.y).toBeGreaterThanOrEqual(0); expect(box.y + box.height).toBeLessThanOrEqual(380);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(375);
-  await page.screenshot({ path: '/home/ai/os-session-targets-validation/greeter-mobile.png' });
+  await page.screenshot({ path: testInfo.outputPath('greeter-mobile.png') });
   await page.getByRole('button', { name: 'Continue as guest', exact: true }).click();
   await expect(input(page)).toBeEnabled({ timeout: 30_000 }); await command(page, 'echo mobile-ok', /\nmobile-ok\n/); await end(page).click();
 });

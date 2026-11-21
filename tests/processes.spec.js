@@ -124,7 +124,7 @@ test('a process reads one file after another; cp copies what the kernel makes, r
   await ready(page);
   await run(page, 'coreutils md5sum /etc/passwd /etc/group');
   await expect(last(page)).toHaveText(/^[0-9a-f]{32}  \/etc\/passwd\n[0-9a-f]{32}  \/etc\/group$/);
-  const copy = '/tmp/passwd-' + Date.now().toString(36);
+  const copy = '/guest/passwd-' + Date.now().toString(36);
   try {
     await run(page, `cp /etc/passwd ${copy}`);
     // Preserved test stores can have more accounts than the transcript retains.
@@ -142,10 +142,12 @@ test('a process reads one file after another; cp copies what the kernel makes, r
 
 test('cp copies generated size-zero files beyond the inline syscall limit', async ({ page }) => {
   await ready(page);
-  const source = '/tmp/copy-large-' + crypto.randomUUID(), target = source + '-copy';
+  const source = '/guest/copy-large-' + crypto.randomUUID(), target = source + '-copy';
   const bytes = Buffer.from('large fallback data\n'.repeat(20000));
   expect(bytes.length).toBeGreaterThan(256 * 1024);
   expect((await put(page.request, '/api/file?path=' + source, { data: bytes })).ok()).toBe(true);
+  // Intercept both v1 /api/sys and v2 /api/fs to model generated size-zero metadata and EOPNOTSUPP reflink
+  // while all opens, reads, writes and closes still use real authenticated storage.
   await page.route('**/api/sys', async route => {
     const body = route.request().postDataJSON(), indexes = [], metadata = [];
     body.calls = body.calls.map((call, i) => {
@@ -154,13 +156,30 @@ test('cp copies generated size-zero files beyond the inline syscall limit', asyn
       indexes.push(i); return { stat: { path: source } };
     });
     if (!indexes.length && !metadata.length) return route.continue();
-    // Model generated-file metadata and lack of reflinks with bounded fixture data;
-    // all opens, reads, writes and closes still use real authenticated storage.
     const response = await route.fetch({ postData: JSON.stringify(body) });
     const reply = await response.json();
     for (const i of metadata) if (reply.results[i].ok) reply.results[i].ok.size = 0;
     for (const i of indexes) reply.results[i] = { err: { errno: 'EOPNOTSUPP' } };
     await route.fulfill({ response, json: reply });
+  });
+  const sourceName = source.split('/').pop();
+  await page.route('**/api/fs', async route => {
+    const body = route.request().postDataJSON();
+    if (body?.call?.clone) {
+      return route.fulfill({ status: 400, json: { errno: 'EOPNOTSUPP', error: 'Operation not supported' } });
+    }
+    const response = await route.fetch();
+    const reply = await response.json().catch(() => null);
+    if (reply && typeof reply === 'object') {
+      if (body?.call?.lookup?.name === sourceName && reply.metadata) reply.metadata.size = 0;
+      if (body?.call?.walk && Array.isArray(reply.entries)) {
+        const names = body.call.walk.names ?? [];
+        const idx = names.indexOf(sourceName);
+        if (idx >= 0 && reply.entries[idx]?.metadata) reply.entries[idx].metadata.size = 0;
+      }
+      return route.fulfill({ response, json: reply });
+    }
+    return route.fulfill({ response });
   });
   try {
     await run(page, `cp ${source} ${target}`);
@@ -169,6 +188,7 @@ test('cp copies generated size-zero files beyond the inline syscall limit', asyn
     const result = await copied.body(); expect(result.length).toBe(bytes.length); expect(Buffer.compare(result, bytes)).toBe(0);
   } finally {
     await page.unroute('**/api/sys');
+    await page.unroute('**/api/fs');
     await rmrf(page.request, target); await rmrf(page.request, source);
   }
 });

@@ -139,7 +139,7 @@ test('seat activation cannot be replayed against another host or a newer generat
   const one = await state(page), two = await state(other); expect(two.id).not.toBe(one.id);
   const result = await page.evaluate(async foreign => {
     const worker = new Worker('/client-kernel.js'), pending = new Map(); let next = 0;
-    const call = (type, args = {}) => new Promise(resolve => { const id = ++next; pending.set(id, resolve); worker.postMessage({ v: 1, id, type, args }); });
+    const call = (type, args = {}) => new Promise(resolve => { const id = ++next; pending.set(id, resolve); worker.postMessage({ v: 2, id, type, args }); });
     worker.onmessage = ({ data }) => { if (data.id != null) { pending.get(data.id)?.(data); pending.delete(data.id); } };
     try {
       const original = (await call('seat_status')).ok;

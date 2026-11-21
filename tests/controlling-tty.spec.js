@@ -2,6 +2,7 @@ import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
 import { api, call, put, rmrf } from './sys.js';
+import { hookPageKernel } from './service-auth.js';
 
 const prompt = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const screen = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
@@ -141,6 +142,9 @@ test('leader detachment clears the whole session and resumes its stopped foregro
 });
 
 test('an acquired terminal follows fork and is released with HUP when its leader exits', async ({ page }) => {
+  const kernel = await hookPageKernel(page);
+  await page.reload();
+  await kernel.ready();
   const transfer = (fn, fd) => `
     (i32.store (i32.const 0) (i32.const 300)) (i32.store (i32.const 4) (i32.const 1))
     ${eq(`(call $${fn} (i32.load (i32.const ${fd})) (i32.const 0) (i32.const 1) (i32.const 8))`, 0)}
@@ -164,7 +168,7 @@ test('an acquired terminal follows fork and is released with HUP when its leader
   await run(page, path);
   expect(await results(page)).toEqual([{ ok: {} }, { ok: {} }]);
   await expect(screen(page)).toContainText('leader-exit-ok');
-  await expect.poll(async () => (await call(page.request, { proc_poll: { pids: [] } })).filter(p => p.path === path)).toHaveLength(0);
+  await expect.poll(async () => (await kernel.value('poll', { pids: [] })).filter(p => p.path === path)).toHaveLength(0);
 });
 
 for (const privileged of [false, true]) test(`terminal stealing uses process credentials after browser ${privileged ? 'logout' : 'root login'}`, async ({ page }) => {
@@ -203,8 +207,82 @@ test('terminal control refuses pipes and guessed foreign PTY paths', async ({ pa
   await expect(screen(page)).toContainText('pipe-ok');
 });
 
+async function gateImageLoad(page, { needle, onExit } = {}) {
+  let release, blocked = false;
+  const released = new Promise(resolve => { release = resolve; });
+  const gatePath = `/__test_ctty_gate_${crypto.randomUUID()}`;
+  const exitPath = `/__test_ctty_exit_${crypto.randomUUID()}`;
+  const gateRoute = async route => {
+    blocked = true;
+    await released;
+    await route.fulfill({ status: 200, body: 'ok' }).catch(() => {});
+  };
+  const exitRoute = async route => {
+    const url = new URL(route.request().url());
+    const pid = Number(url.searchParams.get('pid'));
+    const status = Number(url.searchParams.get('status'));
+    const sigRaw = url.searchParams.get('signal');
+    onExit?.({ pid, status, signal: sigRaw ? Number(sigRaw) : null });
+    await route.fulfill({ status: 200, body: 'ok' }).catch(() => {});
+  };
+  const needleBytes = [...Buffer.from(needle)];
+  const kernelRoute = async route => {
+    const response = await route.fetch();
+    const shim = `(() => {
+      const pat = ${JSON.stringify(needleBytes)};
+      const match = buf => {
+        if (!buf || buf.length < pat.length) return false;
+        outer: for (let i = 0; i <= buf.length - pat.length; i++) {
+          for (let j = 0; j < pat.length; j++) if (buf[i + j] !== pat[j]) continue outer;
+          return true;
+        }
+        return false;
+      };
+      Object.defineProperty(self, 'wasm_bindgen', {
+        configurable: true,
+        set(wb) {
+          Object.defineProperty(self, 'wasm_bindgen', { value: wb, writable: true, configurable: true, enumerable: true });
+          const proto = wb?.Kernel?.prototype;
+          if (proto?.take_local_exec_bytes && !proto.take_local_exec_bytes.__testGate) {
+            const origTake = proto.take_local_exec_bytes;
+            proto.take_local_exec_bytes = function(key, checkOnly) {
+              const bytes = origTake.call(this, key, checkOnly);
+              if (!checkOnly && match(bytes)) return fetch(${JSON.stringify(gatePath)}).then(() => bytes);
+              return bytes;
+            };
+            proto.take_local_exec_bytes.__testGate = true;
+          }
+          if (${Boolean(onExit)} && proto?.exit && !proto.exit.__testExit) {
+            const origExit = proto.exit;
+            proto.exit = function(pid, status, signal, host) {
+              void fetch(${JSON.stringify(exitPath)} + '?pid=' + pid + '&status=' + (status ?? 0) + '&signal=' + (signal ?? '')).catch(() => {});
+              return origExit.call(this, pid, status, signal, host);
+            };
+            proto.exit.__testExit = true;
+          }
+        },
+      });
+    })();\n`;
+    await route.fulfill({ response, body: shim + await response.text() });
+  };
+  await page.route(`**${gatePath}`, gateRoute);
+  if (onExit) await page.route(`**${exitPath}**`, exitRoute);
+  await page.route('**/client-kernel.js', kernelRoute);
+  return {
+    blocked: () => blocked,
+    release: () => release(),
+    cleanup: async () => {
+      release();
+      await page.unroute('**/client-kernel.js', kernelRoute).catch(() => {});
+      await page.unroute(`**${gatePath}`, gateRoute).catch(() => {});
+      if (onExit) await page.unroute(`**${exitPath}**`, exitRoute).catch(() => {});
+    },
+  };
+}
+
 test('a delayed pipeline stage stays detached when the leader reacquires the terminal', async ({ page }) => {
   expect((await api(page.request, 'login', { headers: { Origin: origin, 'CF-Connecting-IP': 'ctty-delay-' + crypto.randomUUID() }, data: { password } })).ok()).toBe(true);
+  const gate = await gateImageLoad(page, { needle: 'delayed-detached' });
   await page.reload();
   const producer = await upload(page, 'producer', ({ q, text }) => `${ignoreHup}
     ${fork}
@@ -217,81 +295,59 @@ test('a delayed pipeline stage stays detached when the leader reacquires the ter
   const consumer = await upload(page, 'consumer', ({ say }) => `
     (if (i32.const 0) (then ${fork}))
     ${eq('(call $foreground (i32.const 2))', -59)} ${noTerminal} ${say('delayed-detached\n')}`);
-  let release, blocked = false;
-  const released = new Promise(resolve => { release = resolve; });
-  await page.route('**/api/file?**', async route => {
-    if (!new URL(route.request().url()).searchParams.has('compile')) return route.continue();
-    // Delay only the consumer's real compiler response; the producer forks too.
-    const response = await route.fetch(), data = await response.body();
-    if (data.includes(Buffer.from('delayed-detached'))) { blocked = true; await released; }
-    await route.fulfill({ response, body: data }).catch(() => {});
-  });
   try {
     await send(page, `${producer} | ${consumer}`);
     await expect(screen(page)).toContainText('producer-ready', { timeout: 60_000 });
-    await expect.poll(() => blocked, { timeout: 60_000 }).toBe(true);
-    release();
+    await expect.poll(() => gate.blocked(), { timeout: 60_000 }).toBe(true);
+    gate.release();
     await expect(screen(page)).toContainText('delayed-detached', { timeout: 30_000 });
     await send(page, 'x');
     await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-  } finally { release(); }
+  } finally { await gate.cleanup(); }
 });
 
 test('terminal hangup reaches a foreground stage still waiting for its image', async ({ page }) => {
+  const hangups = [];
+  const gate = await gateImageLoad(page, {
+    needle: 'unexpected-start',
+    onExit: ({ pid, signal }) => { if (signal === 1) hangups.push(pid); },
+  });
+  await page.reload();
   const producer = await upload(page, 'hangup', ({ q, text }) => `${ignoreHup} ${q(DROP)} ${q(SET)}
     (call $sayerr ${text('hangup-ready\n')})
     (i32.store (i32.const 0) (i32.const 200)) (i32.store (i32.const 4) (i32.const 1))
     ${eq('(call $read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8))', 0)}`);
   const consumer = await upload(page, 'unstarted', ({ say }) => `(if (i32.const 0) (then ${fork})) ${say('unexpected-start\n')}`);
-  const hangups = [];
-  page.on('request', request => {
-    if (!request.url().endsWith('/api/sys') || request.method() !== 'POST') return;
-    for (const call of request.postDataJSON()?.calls ?? []) if (call.exit?.signal === 1) hangups.push(call.exit.pid);
-  });
-  let release, blocked = false; const released = new Promise(resolve => { release = resolve; });
-  await page.route('**/api/file?**', async route => {
-    if (!new URL(route.request().url()).searchParams.has('compile')) return route.continue();
-    const response = await route.fetch(), data = await response.body();
-    if (data.includes(Buffer.from('unexpected-start'))) { blocked = true; await released; }
-    await route.fulfill({ response, body: data }).catch(() => {});
-  });
   try {
     await send(page, `${producer} | ${consumer}`);
     await expect(screen(page)).toContainText('hangup-ready', { timeout: 60_000 });
-    await expect.poll(() => blocked, { timeout: 60_000 }).toBe(true); release();
+    await expect.poll(() => gate.blocked(), { timeout: 60_000 }).toBe(true); gate.release();
     await expect.poll(() => hangups.length, { timeout: 30_000 }).toBe(1);
     await send(page, 'x');
     await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
     await expect(screen(page)).not.toContainText('unexpected-start');
-  } finally { release(); }
+  } finally { await gate.cleanup(); }
 });
 
 test('a fast producer cannot hang up a pipeline consumer still loading its image', async ({ page }) => {
+  let exited = false;
+  const gate = await gateImageLoad(page, {
+    needle: 'proc_fork',
+    onExit: () => { exited = true; },
+  });
+  await page.reload();
   const producer = await upload(page, 'fast', ({ say }) => say('pipeline-data\n'));
   const consumer = await upload(page, 'late-reader', () => `
     (if (i32.const 0) (then ${fork}))
     (i32.store (i32.const 0) (i32.const 300)) (i32.store (i32.const 4) (i32.const 100))
     ${eq('(call $read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8))', 0)}
     (call $say (i32.const 300) (i32.load (i32.const 8)))`);
-  let exited = false;
-  page.on('request', request => {
-    if (!request.url().endsWith('/api/sys') || request.method() !== 'POST') return;
-    if (request.postDataJSON()?.calls.some(call => call.exit)) exited = true;
-  });
-  let release, blocked = false; const released = new Promise(resolve => { release = resolve; });
-  await page.route('**/api/file?**', async route => {
-    if (!new URL(route.request().url()).searchParams.has('compile')) return route.continue();
-    const response = await route.fetch(), data = await response.body();
-    // Only this pipeline's consumer imports proc_fork. Every ordinary image is
-    // now transformed for resource accounting, including the simple producer.
-    if (data.includes(Buffer.from('proc_fork'))) { blocked = true; await released; }
-    await route.fulfill({ response, body: data }).catch(() => {});
-  });
   try {
+    exited = false;
     await send(page, `${producer} | ${consumer}`);
     await expect.poll(() => exited, { timeout: 60_000 }).toBe(true);
-    await expect.poll(() => blocked, { timeout: 60_000 }).toBe(true); release();
+    await expect.poll(() => gate.blocked(), { timeout: 60_000 }).toBe(true); gate.release();
     await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
     await expect(screen(page)).toHaveText('pipeline-data');
-  } finally { release(); }
+  } finally { await gate.cleanup(); }
 });

@@ -2,6 +2,7 @@ import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
 import { api, call, errno, put, rmrf } from './sys.js';
+import { hookPageKernel } from './service-auth.js';
 
 const names = ['zero', 'full', 'random', 'urandom'];
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
@@ -126,12 +127,15 @@ test('installed tools use byte devices locally, report full writes and inherit t
 });
 
 for (const name of ['zero', 'urandom']) test(`continuous ${name} reads remain interruptible without terminal output`, async ({ page }) => {
+  const kernel = await hookPageKernel(page);
   await page.goto('/');
+  await kernel.ready();
+  const poll = () => kernel.value('poll', { pids: [] });
   await page.locator('#command').fill(`sh -c 'cat /dev/${name} >/dev/null'`); await page.locator('#command').press('Enter');
-  await expect.poll(async () => (await call(page.request, { proc_poll: { pids: [] } })).some(p => p.argv.includes('/dev/' + name))).toBe(true);
+  await expect.poll(async () => (await poll()).some(p => p.argv?.includes('/dev/' + name)), { timeout: 30_000 }).toBe(true);
   await page.locator('#command').press('Control+c');
   await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-  await expect.poll(async () => (await call(page.request, { proc_poll: { pids: [] } })).filter(p => p.pid !== 1).length).toBe(0);
+  await expect.poll(async () => (await poll()).filter(p => p.pid !== 1).length).toBe(0);
   await run(page, 'printf recovered'); await expect(last(page)).toHaveText('recovered');
 });
 

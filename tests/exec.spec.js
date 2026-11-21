@@ -104,12 +104,18 @@ test('an uploaded wasm runs by its path, with the working directory, environment
   await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 5_000 });
 });
 
-// Guest calls use fetch suspended by JSPI, or synchronous XHR. Private runtime
-// memory reservations also use XHR before instantiation, outside a JSPI frame.
+// Under L2/#54, worker runtime calls bridge to client-kernel via Atomics/JSPI and hit
+// `/api/fs` & `/api/fs/data` via fetch (never raw XHR or legacy `/api/sys` process writes).
 function processCalls(page) {
   const kinds = new Set();
   page.context().on('request', request => {
-    if (request.method() !== 'POST' || new URL(request.url()).pathname !== '/api/sys' || request.headers()['x-registry']) return;
+    if (request.method() !== 'POST') return;
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/fs' || path === '/api/fs/data') {
+      if (request.headers()['x-os-instance']) kinds.add(request.resourceType());
+      return;
+    }
+    if (path !== '/api/sys' || request.headers()['x-registry']) return;
     const body = JSON.parse(request.postData() || '{}');
     if (body.proc && body.calls?.some(call => !call.resource)) kinds.add(request.resourceType());
   });
@@ -118,9 +124,9 @@ function processCalls(page) {
 const hasJspi = page => page.evaluate(() => typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function');
 
 for (const jspi of [true, false]) test(`a process writes a file larger than a batch carries, through its own descriptor (${jspi ? 'JSPI' : 'synchronous XHR'})`, async ({ page, request }) => {
-  // Past abi::INLINE_MAX (256 KiB), a process's write goes as a chunk (PUT /api/pwrite, with
-  // its token): the descriptor is its own, as its credentials name it. Its calls are fetches
-  // its image is suspended on (JSPI), or, where the browser has no JSPI, synchronous requests.
+  // Past abi::INLINE_MAX (256 KiB), a process's write streams through its own `/api/fs/data`
+  // descriptor with its ServiceAuth v2 credential. Calls bridge through client-kernel via fetch
+  // whether the process Worker runs with JSPI or synchronous fallback.
   if (!jspi) await withoutJspi(page);
   const calls = processCalls(page);
   const big = 'abcdefghijklmnopqrstuvwxyz0123456789\n'.repeat(10_000);
@@ -135,25 +141,29 @@ for (const jspi of [true, false]) test(`a process writes a file larger than a ba
   await expect(page.locator('.transcript pre').last()).toHaveText('abcdefghijklmnopqrstuvwxyz0123456789');
   await run(page, './coreutils cat copy.txt | ./coreutils wc -l');
   await expect(page.locator('.transcript pre').last()).toHaveText('10000');
-  // Under L2, worker runtime calls bridge to client-kernel via Atomics/JSPI and hit the server via fetch (never raw XHR).
+  // Under L2/#54, worker runtime calls bridge to client-kernel via Atomics/JSPI and hit `/api/fs` via fetch (never raw XHR).
   expect([...calls]).toEqual(['fetch']);
 });
 
 test('an image initializer runs once before main after resource instrumentation', async ({ page, request }) => {
   // The resource transform moves the initializer into the prepared entry point,
   // where JSPI can suspend it. Its imported memory and before-main order remain.
+  const cloudTarget = `${base.slice(1)}/coreutils`;
   const started = assemble(`(module
     (import "env" "memory" (memory 1 2))
     (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
     (import "wasi_snapshot_preview1" "path_filestat_get" (func $stat (param i32 i32 i32 i32 i32) (result i32)))
     (data (i32.const 1024) "started\\n") (data (i32.const 1040) "ran\\n") (data (i32.const 1056) "usr/bin/coreutils")
+    (data (i32.const 1120) "${cloudTarget}")
     (func $say (param $ptr i32) (param $len i32)
       (i32.store (i32.const 2048) (local.get $ptr)) (i32.store (i32.const 2052) (local.get $len))
       (drop (call $write (i32.const 1) (i32.const 2048) (i32.const 1) (i32.const 2056))))
     (func $begin (call $say (i32.const 1024) (i32.const 8)))
     (start $begin)
     (func (export "_start")
-      (if (i32.eqz (call $stat (i32.const 3) (i32.const 1) (i32.const 1056) (i32.const 17) (i32.const 3000)))
+      (if (i32.and
+        (i32.eqz (call $stat (i32.const 3) (i32.const 1) (i32.const 1056) (i32.const 17) (i32.const 3000)))
+        (i32.eqz (call $stat (i32.const 3) (i32.const 1) (i32.const 1120) (i32.const ${cloudTarget.length}) (i32.const 3200))))
         (then (call $say (i32.const 1040) (i32.const 4))))))`);
   expect((await put(request, file(`${base}/started`), { headers, data: started })).status()).toBe(201);
   expect(await call(request, { chmod: { path: `${base}/started`, mode: 0o755 } }, { headers })).toBeNull();
@@ -161,7 +171,7 @@ test('an image initializer runs once before main after resource instrumentation'
   await terminal(page);
   await run(page, './started');
   await expect(page.locator('.transcript pre').last()).toHaveText('started\nran');
-  expect([...calls]).toEqual([await hasJspi(page) ? 'fetch' : 'xhr']);
+  expect([...calls]).toEqual(['fetch']);
 });
 
 test('the loader and the X rule refuse as Linux refuses, with its words', async ({ page }) => {

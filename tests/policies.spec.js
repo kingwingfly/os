@@ -1,37 +1,67 @@
 import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { api, call, errno, sys, mkdirp, put, rmrf } from './sys.js';
+import { api, call, errno, mkdirp, put, rmrf } from './sys.js';
+import { connectKernel } from './service-auth.js';
 import { device, directory, ACCEL } from './accelerator.js';
 import { zipOf } from './archive-fixtures.js';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password=(await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
-const registry={'X-Registry':'1'};
+const ROOT_ACCOUNT={uid:0,gid:0,groups:[0],user:'root',group:'root',home:'/root',shell:'/usr/bin/dash',signed_in:true};
+const GUEST_ACCOUNT={uid:65534,gid:65534,groups:[65534],user:'guest',group:'guest',home:'/tmp',shell:'/usr/bin/dash',signed_in:false};
 async function login(r) { expect((await api(r,'login',{headers:{'CF-Connecting-IP':'policy-'+randomUUID()},data:{password}})).ok()).toBe(true); }
-async function action(r,action,options={}) {return (await sys(r,[{login_session:{action}}],options))[0];}
-async function join(r) {
-  await call(r,'getcreds');const answer=await action(r,{op:'join',host:randomUUID(),proof:randomBytes(32).toString('hex')});
-  expect(answer.err).toBeUndefined();return answer.ok;
+async function freshKernel(page, name='__policyKernel') {
+  await page.goto('/login');
+  const kernel=await connectKernel(page,{name});
+  await kernel.value('login_leave');
+  await kernel.value('machine_init_leave');
+  return kernel;
 }
-const configure=(r,session,sharing,expected=session.seat_policy.revision)=>action(r,{op:'seat_policy',session:session.id,expected,sharing});
+const action=(kernel,act)=>kernel.call('login_session_action',{action:act});
+async function join(kernel) {
+  const answer=await action(kernel,{op:'join',host:randomUUID(),proof:randomBytes(32).toString('hex')});
+  expect(answer.err,JSON.stringify(answer)).toBeUndefined();return answer.ok;
+}
+const configure=(kernel,session,sharing,expected=session.seat_policy.revision)=>action(kernel,{op:'seat_policy',session:session.id,expected,sharing});
 
-test('seat policy persists across logins and rejects stale, process, sudo and foreign session updates',async({request:r,browser})=>{
-  const session=await join(r), initial=session.seat_policy;
-  expect(initial.sharing).toBe('control');
-  const changed=await configure(r,session,'view');expect(changed.err).toBeUndefined();
-  expect(changed.ok.seat_policy).toEqual({revision:initial.revision+1,sharing:'view'});
-  expect((await configure(r,session,'none')).err?.errno).toBe('ESTALE');
-  const p=await call(r,{execve:{path:'/usr/bin/sleep',argv:['sleep','10'],cwd:'/'}});
+test('seat policy persists across logins and rejects stale, process, sudo and foreign session updates',async({page,browser})=>{
+  const r=page.request;
+  await call(r,'getcreds');
+  const kernel=await freshKernel(page);
+  let p;
   try {
+    const session=await join(kernel), initial=session.seat_policy;
+    expect(initial.sharing).toBe('control');
+    const changed=await configure(kernel,session,'view');expect(changed.err).toBeUndefined();
+    expect(changed.ok.seat_policy).toEqual({revision:initial.revision+1,sharing:'view'});
+    expect((await configure(kernel,session,'none')).err?.errno).toBe('ESTALE');
+    p=await kernel.value('exec',{path:'/usr/bin/sleep',argv:['sleep','10'],cwd:'/',env:[]});
     const operation={op:'seat_policy',session:session.id,expected:initial.revision+1,sharing:'none'};
-    expect((await action(r,operation,{pid:p.pid,proc:p.token})).err?.errno).toBe('EPERM');
-    expect((await action(r,operation,{sudo:true})).err).toBeTruthy();
+    // Process calls and retired server /api/sys routes (process token or sudo) cannot mutate seat policy.
+    expect((await kernel.call('process_call',{pid:p.pid,call:{login_session:{action:operation}}})).err).toBeTruthy();
+    for(const options of [{pid:p.pid,proc:p.token||randomBytes(32).toString('hex')},{sudo:true}]) {
+      const res=await r.post(origin+'/api/sys',{headers:{Origin:origin,'Content-Type':'application/json'},data:{calls:[{login_session:{action:operation}}],...options}});
+      expect(res.ok()).toBe(false);
+    }
     const foreign=await browser.newContext();
-    try {await join(foreign.request);expect((await action(foreign.request,operation)).err?.errno).toBe('ESTALE');}finally{await foreign.close();}
-    await login(r);const root=await join(r);expect(root.seat_policy.sharing).toBe('control');
-    await api(r,'logout');const next=await join(r);
+    try {
+      const foreignPage=await foreign.newPage();
+      const foreignKernel=await freshKernel(foreignPage,'__policyForeignKernel');
+      try {
+        await join(foreignKernel);
+        expect((await action(foreignKernel,operation)).err?.errno).toBe('ESTALE');
+      }finally{await foreignKernel.terminate();}
+    }finally{await foreign.close();}
+    await kernel.value('sync_account',ROOT_ACCOUNT);
+    const root=await join(kernel);expect(root.seat_policy.sharing).toBe('control');
+    await kernel.value('sync_account',GUEST_ACCOUNT);
+    const next=await join(kernel);
     expect(next.seat_policy).toEqual(changed.ok.seat_policy);
-    expect((await configure(r,next,'control')).err).toBeUndefined();
-  }finally{await sys(r,[{exit:{pid:p.pid,proc:p.token,status:0}},{wait:{pid:String(p.pid),proc:p.token}}],{},registry);}
+    expect((await configure(kernel,next,'control')).err).toBeUndefined();
+  }finally{
+    if(p){await kernel.call('exit',{pid:p.pid,status:0});await kernel.call('wait',{pid:p.pid});}
+    await kernel.terminate();
+  }
 });
 
 test('sharing preference UI revokes live control and remains saved after reload',async({page})=>{

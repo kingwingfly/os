@@ -73,10 +73,11 @@ test('uutils runs as programs of /bin: arguments, the working directory, pipes a
   // A program of /bin reaches the kernel's own calls too, which WASI has no words for, through
   // the engine's os.sys: the batch goes as it is.
   await run(page, `syscall '["getcreds",{"lstat":{"path":"names.txt"}},{"stat":{"path":"${base}/names.txt"}}]'`);
-  await expect(page.locator('.transcript pre').last()).toContainText('"user":"root"');
+  const syscallOut = (await page.locator('.transcript pre').last().innerText()).replace(/\n/g, '');
+  expect(syscallOut).toContain('"user":"root"');
   // The kernel takes absolute paths only, as user space makes them.
-  await expect(page.locator('.transcript pre').last()).toContainText('{"err":{"detail":"a path must be absolute","errno":"EINVAL"}}');
-  await expect(page.locator('.transcript pre').last()).toContainText('"mode":33188');
+  expect(syscallOut).toContain('{"err":{"detail":"a path must be absolute","errno":"EINVAL"}}');
+  expect(syscallOut).toContain('"mode":33188');
   await run(page, 'coreutils');
   await expect(transcript(page)).toContainText('coreutils (uutils 0.12.0, multi-call binary)');
   await expect(transcript(page)).toContainText('Usage: coreutils UTILITY [ARGUMENT]...');

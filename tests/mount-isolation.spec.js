@@ -131,12 +131,12 @@ test('CLI sudo mount -t tmpfs syncs across findmnt, mount, df, Files UI, and Mou
   test.setTimeout(120_000);
   const alice = await createWheelUser(rootApi, 'mntsync');
   const scratch = `/tmp/scratch-${crypto.randomUUID()}`;
-  await mkdirp(rootApi, scratch, 0o755);
   let session;
   try {
     session = await openUserSession(browser, alice, { sudo: true });
     const { page } = session;
 
+    await runCli(page, `mkdir -p ${scratch}`);
     await runCli(page, `sudo mount -t tmpfs -o size=4194304,mode=1777 tmpfs ${scratch}`);
     await runCli(page, `/usr/bin/sh -c 'printf "hello-tmpfs\\n" > ${scratch}/visible.txt'`);
 
@@ -197,7 +197,7 @@ test('CLI sudo mount -t tmpfs syncs across findmnt, mount, df, Files UI, and Mou
 test('child unshare(CLONE_NEWNS) requires privilege and keeps child mounts invisible to parent shell and Files UI', async ({ browser }) => {
   test.setTimeout(120_000);
   const alice = await createWheelUser(rootApi, 'nsiso');
-  const work = `/tmp/unshare-${crypto.randomUUID()}`;
+  const work = `/guest/unshare-${crypto.randomUUID()}`;
   const mnt = `${work}/mnt`;
   const script = `${work}/child.sh`;
   const helperBin = `${work}/unshare-exec.wasm`;
@@ -404,7 +404,7 @@ test('two accounts cannot see or traverse each other user mounts (/mnt/local/*, 
 test('ordinary umount fails with EBUSY while open descriptors or cwd hold a mount, whereas umount -l detaches immediately and preserves open files', async ({ browser }) => {
   test.setTimeout(120_000);
   const alice = await createWheelUser(rootApi, 'busylazy');
-  const base = `/tmp/busy-${crypto.randomUUID()}`;
+  const base = `/guest/busy-${crypto.randomUUID()}`;
   const mnt = `${base}/mnt`;
   const stopFlag = `${base}/stop`;
   await mkdirp(rootApi, mnt, 0o755);

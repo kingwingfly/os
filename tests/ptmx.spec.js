@@ -2,6 +2,7 @@ import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
 import { api, call, put, rmrf } from './sys.js';
+import { hookPageKernel } from './service-auth.js';
 
 const prompt = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const screen = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
@@ -32,7 +33,7 @@ async function connectHost(page) {
     const port = new Worker('/client-kernel.js'), pending = new Map(), runs = new Map();
     let next = 0;
     const request = (type, args = {}) => new Promise(resolve => {
-      const id = ++next; pending.set(id, resolve); port.postMessage({ v: 1, id, type, args });
+      const id = ++next; pending.set(id, resolve); port.postMessage({ v: 2, id, type, args });
     });
     port.onmessage = ({ data }) => {
       if (data.id != null) { pending.get(data.id)?.(data); pending.delete(data.id); return; }
@@ -48,6 +49,7 @@ async function connectHost(page) {
         .then(result => { run.result = result; });
     } };
   });
+  await hostCall(page, 'sync_account_from_server');
 }
 const startHost = (page, id, path, options) => page.evaluate(([id, path, options]) => window.ptyHost.start(id, path, options), [id, path, options]);
 const hostOutput = (page, id) => page.evaluate(id => window.ptyHost.runs.get(id).output.replace(/\r\n/g, '\n'), id);
@@ -289,7 +291,7 @@ test('independent runs share host PTYs and last-master close resumes a stopped s
       ${eq('(call $fg (i32.const 4))', -59)} ${say('client-resumed-with-eof\n')}`);
     await startHost(page, 'client', client);
     await hostReady(page, 'client', 'hello\nclient-stopping');
-    await expect.poll(async () => (await call(page.request, { proc_poll: { pids: [] } })).find(p => p.path === client)?.state).toBe('stopped');
+    await expect.poll(async () => ((await hostCall(page, 'poll', { pids: [] })).ok ?? []).find(p => p.path === client)?.state).toBe('stopped');
     await hostInput(page, 'owner', 'x\n');
     await hostResult(page, 'owner'); await hostResult(page, 'client');
     expect(await hostOutput(page, 'client')).toContain('client-resumed-with-eof');
@@ -319,7 +321,7 @@ test('host PTY input signals the controlling foreground group in another run', a
 });
 
 test('host PTY permissions use the process snapshot after a browser root login', async ({ page }) => {
-  await connectHost(page); await login(page);
+  await connectHost(page); await login(page); await hostCall(page, 'sync_account_from_server');
   const owner = await upload(page, 'root-owner', ({ setup, say }) => `${setup(2 | 256)} ${say('owner-ready\n')}
     ${eq('(call $receive (i32.const 0) (i32.const 1))', 0)}`);
   try {
@@ -329,14 +331,16 @@ test('host PTY permissions use the process snapshot after a browser root login',
       ${eq('(call $receive (i32.const 0) (i32.const 1))', 0)}
       ${eq(`(call $open ${text(`/dev/pts/${number}`)} (i32.const 2) (i32.const 0))`, -2)} ${say('guest-denied\n')}`);
     expect((await api(page.request, 'logout')).ok()).toBe(true);
+    await hostCall(page, 'sync_account_from_server');
     await startHost(page, 'probe', probe, { environment: { UID: '0', USER: 'root' } }); await hostReady(page, 'probe', 'guest-ready');
-    await login(page); await hostInput(page, 'probe', 'x\n'); await hostResult(page, 'probe');
+    await login(page); await hostCall(page, 'sync_account_from_server');
+    await hostInput(page, 'probe', 'x\n'); await hostResult(page, 'probe');
     expect(await hostOutput(page, 'probe')).toContain('guest-denied');
     const allowed = await upload(page, 'root-peer', ({ text, say }) => `
       ${eq(`(call $open ${text(`/dev/pts/${number}`)} (i32.const 2) (i32.const 0))`, 4)} ${say('root-allowed\n')}`);
     await startHost(page, 'allowed', allowed); await hostResult(page, 'allowed');
     expect(await hostOutput(page, 'allowed')).toContain('root-allowed');
-  } finally { await login(page); await closeHost(page); }
+  } finally { await login(page); await hostCall(page, 'sync_account_from_server'); await closeHost(page); }
 });
 
 test('root retains cross-run terminal reassignment authority after browser logout', async ({ page }) => {
@@ -354,7 +358,7 @@ test('root retains cross-run terminal reassignment authority after browser logou
     await startHost(page, 'denied', denied); await hostResult(page, 'denied');
     const replies = (await hostOutput(page, 'denied')).split('\n').filter(s => s.startsWith('{')).map(s => JSON.parse(s).results[0]);
     expect(replies.at(-1).err.errno).toBe('EPERM');
-    await login(page);
+    await login(page); await hostCall(page, 'sync_account_from_server');
     const peer = await upload(page, 'steal-peer', ({ q, text, say }) => `${ignoreHup} ${q(0x5422, 0)} ${say('root-ready\n')}
       ${eq('(call $receive (i32.const 0) (i32.const 1))', 0)}
       ${eq(`(call $open ${text(`/dev/pts/${number}`)} (i32.const 2) (i32.const 0))`, 4)} ${q(0x540e, 4, 1)}
@@ -362,11 +366,12 @@ test('root retains cross-run terminal reassignment authority after browser logou
       ${eq('(call $receive (i32.const 4) (i32.const 1))', 0)} ${eq('(i32.load (i32.const 136))', 0)} ${say('root-hung-up\n')}`);
     await startHost(page, 'peer', peer); await hostReady(page, 'peer', 'root-ready');
     expect((await api(page.request, 'logout')).ok()).toBe(true);
+    await hostCall(page, 'sync_account_from_server');
     await hostInput(page, 'peer', 'x\n'); await hostReady(page, 'peer', 'root-reassigned');
     await hostInput(page, 'owner', 'x\n'); await hostResult(page, 'owner'); await hostResult(page, 'peer');
     expect(await hostOutput(page, 'owner')).toContain('old-session-detached');
     expect(await hostOutput(page, 'peer')).toContain('root-hung-up');
-  } finally { await login(page); await closeHost(page); }
+  } finally { await login(page); await hostCall(page, 'sync_account_from_server'); await closeHost(page); }
 });
 
 test('a child keeps the host PTY alive after its launching run completes', async ({ page }) => {
@@ -440,7 +445,7 @@ test('closing a console resumes stopped runs and leaves inherited terminal fds h
     for (const id of ['a', 'b']) {
       await startHost(page, id, reader, { terminalId: 'close-me' }); await hostReady(page, id, 'console-stopping');
     }
-    await expect.poll(async () => (await call(page.request, { proc_poll: { pids: [] } })).filter(p => p.path === reader && p.state === 'stopped').length).toBe(2);
+    await expect.poll(async () => ((await hostCall(page, 'poll', { pids: [] })).ok ?? []).filter(p => p.path === reader && p.state === 'stopped').length).toBe(2);
     expect((await hostCall(page, 'console_close', { terminalId: 'close-me' })).err).toBeUndefined();
     await hostResult(page, 'a'); await hostResult(page, 'b');
     const reopened = await upload(page, 'console-reopened', ({ say, q }) => `${q(0x5401, 0)} ${say('new-console-ready\n')}
@@ -453,19 +458,70 @@ test('closing a console resumes stopped runs and leaves inherited terminal fds h
 });
 
 for (const phase of ['authorization', 'image loading', 'input signal', 'job stop']) test(`console ${phase === 'input signal' ? 'interrupt during image loading' : phase === 'job stop' ? 'job stop before authorization' : `close during ${phase}`} cannot enter user code`, async ({ page }) => {
-  await connectHost(page);
   const path = await upload(page, 'console-loading', ({ say }) => `${say('must-not-start\n')}`);
   let release, reached;
   const released = new Promise(resolve => { release = resolve; });
   const loading = new Promise(resolve => { reached = resolve; });
   const authorizing = phase === 'authorization' || phase === 'job stop';
-  await page.route(authorizing ? '**/api/sys' : '**/api/file?**', async route => {
-    if (authorizing
-      ? !route.request().postDataJSON()?.calls?.some(call => call.execve)
-      : !new URL(route.request().url()).searchParams.has('compile')) return route.continue();
-    const response = await route.fetch(); reached(); await released;
-    await route.fulfill({ response }).catch(() => {});
-  });
+  const gatePath = `/__test_ptmx_gate_${crypto.randomUUID()}`;
+  const needleBytes = [...Buffer.from('must-not-start')];
+  const gateRoute = async route => {
+    reached();
+    await released;
+    await route.fulfill({ status: 200, body: 'ok' }).catch(() => {});
+  };
+  const kernelRoute = async route => {
+    const response = await route.fetch();
+    const shim = authorizing
+      ? `(() => {
+        Object.defineProperty(self, 'wasm_bindgen', {
+          configurable: true,
+          set(wb) {
+            Object.defineProperty(self, 'wasm_bindgen', { value: wb, writable: true, configurable: true, enumerable: true });
+            const proto = wb?.Kernel?.prototype;
+            if (proto?.execs && !proto.execs.__testPtmxGate) {
+              const origExecs = proto.execs;
+              proto.execs = async function(stages, sudo, seat, host) {
+                if (typeof stages === 'string' && stages.includes('console-loading')) await fetch(${JSON.stringify(gatePath)});
+                return origExecs.call(this, stages, sudo, seat, host);
+              };
+              proto.execs.__testPtmxGate = true;
+            }
+          },
+        });
+      })();\n`
+      : `(() => {
+        const pat = ${JSON.stringify(needleBytes)};
+        const match = buf => {
+          if (!buf || buf.length < pat.length) return false;
+          outer: for (let i = 0; i <= buf.length - pat.length; i++) {
+            for (let j = 0; j < pat.length; j++) if (buf[i + j] !== pat[j]) continue outer;
+            return true;
+          }
+          return false;
+        };
+        Object.defineProperty(self, 'wasm_bindgen', {
+          configurable: true,
+          set(wb) {
+            Object.defineProperty(self, 'wasm_bindgen', { value: wb, writable: true, configurable: true, enumerable: true });
+            const proto = wb?.Kernel?.prototype;
+            if (proto?.take_local_exec_bytes && !proto.take_local_exec_bytes.__testPtmxGate) {
+              const origTake = proto.take_local_exec_bytes;
+              proto.take_local_exec_bytes = function(key, checkOnly) {
+                const bytes = origTake.call(this, key, checkOnly);
+                if (!checkOnly && match(bytes)) return fetch(${JSON.stringify(gatePath)}).then(() => bytes);
+                return bytes;
+              };
+              proto.take_local_exec_bytes.__testPtmxGate = true;
+            }
+          },
+        });
+      })();\n`;
+    await route.fulfill({ response, body: shim + await response.text() });
+  };
+  await page.route(`**${gatePath}`, gateRoute);
+  await page.route('**/client-kernel.js', kernelRoute);
+  await connectHost(page);
   try {
     await startHost(page, 'loading', path, { terminalId: 'loading' }); await loading;
     const result = phase === 'input signal' ? await hostInput(page, 'loading', '\x03')
@@ -474,12 +530,17 @@ for (const phase of ['authorization', 'image loading', 'input signal', 'job stop
     expect(result.err).toBeUndefined();
     release();
     if (phase === 'job stop') {
-      await expect.poll(async () => (await call(page.request, { proc_poll: { pids: [] } })).find(p => p.path === path)?.state).toBe('stopped');
+      await expect.poll(async () => ((await hostCall(page, 'poll', { pids: [] })).ok ?? []).find(p => p.path === path)?.state).toBe('stopped');
       await hostCall(page, 'console_close', { terminalId: 'loading' });
     }
     await hostResult(page, 'loading', phase === 'input signal' ? 130 : 129);
     expect(await hostOutput(page, 'loading')).not.toContain('must-not-start');
-  } finally { release(); await closeHost(page); }
+  } finally {
+    release();
+    await page.unroute('**/client-kernel.js', kernelRoute).catch(() => {});
+    await page.unroute(`**${gatePath}`, gateRoute).catch(() => {});
+    await closeHost(page);
+  }
 });
 
 test('console IDs do not give another execution host control over a live pane', async ({ page, context }) => {
@@ -524,6 +585,9 @@ test('raw file ioctls keep their descriptor namespace when local PTY numbers ove
 });
 
 test('killing an unresponsive session leader closes its last master and resumes a stopped foreground child', async ({ page }) => {
+  const kernel = await hookPageKernel(page);
+  await page.reload();
+  await kernel.ready();
   const path = await upload(page, 'killed-leader', ({ master, openSlave, q, say }) => `${ignoreHup}
     ${eq('(call $pipe (i32.const 32) (i32.const 36))', 0)} ${fork}
     (if (i32.eqz (i32.load (i32.const 48))) (then
@@ -553,7 +617,7 @@ test('killing an unresponsive session leader closes its last master and resumes 
     await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
     await expect(screen(page)).toContainText('killed-leader-cleanup-ok');
   } finally {
-    for (const process of await call(page.request, { proc_poll: { pids: [] } }))
-      if (process.path === path) await call(page.request, { kill: { pid: process.pid, signal: 9 } }).catch(() => {});
+    for (const process of await kernel.value('poll', { pids: [] }).catch(() => []))
+      if (process.path === path) await kernel.call('kill', { pid: process.pid, signal: 9 }).catch(() => {});
   }
 });

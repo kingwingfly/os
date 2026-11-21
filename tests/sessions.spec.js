@@ -1,135 +1,199 @@
 import { test, expect } from './test.js';
-import { sys, call, api, put, rmrf } from './sys.js';
-import { readFile } from 'node:fs/promises';
+import { call, put, rmrf } from './sys.js';
+import { connectKernel, hookPageKernel } from './service-auth.js';
 import binaryen from 'binaryen';
 
 const sleep = { path: '/usr/bin/sleep', argv: ['sleep', '60'], env: [], cwd: '/' };
-const owned = process => ({ pid: process.pid, proc: process.token });
-async function invoke(request, process, command, errno) {
-  const [result] = await sys(request, [command], owned(process));
-  if (errno) { expect(result.err?.errno, JSON.stringify(result)).toBe(errno); return; }
+const ROOT_ACCOUNT = { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root', home: '/root', shell: '/usr/bin/dash', signed_in: true };
+
+async function freshKernel(page, name = '__sessionsKernel') {
+  await page.goto('/login');
+  const kernel = await connectKernel(page, { name });
+  await kernel.value('machine_init_leave');
+  return kernel;
+}
+
+async function invoke(kernel, proc, command, errno) {
+  const result = await kernel.call('process_call', { pid: proc.pid, call: command });
+  if (errno) {
+    expect(result.err?.errno, JSON.stringify(result)).toBe(errno);
+    return;
+  }
   expect(result.err, JSON.stringify(result)).toBeUndefined();
   return result.ok;
 }
-async function exec(request) { return call(request, { execve: sleep }); }
-async function fork(request, parent) {
-  return invoke(request, parent, { fork: { pid: parent.pid } });
-}
-async function cleanup(request, processes) {
+
+const execProc = kernel => kernel.value('exec', sleep);
+const forkProc = (kernel, parent) => kernel.value('fork', { pid: parent.pid });
+
+async function cleanup(kernel, processes) {
   for (const p of processes.reverse()) {
-    await sys(request, [{ kill: { pid: String(p.pid), signal: 9 } }, { wait: { pid: String(p.pid), proc: p.token } }]);
+    await kernel.call('kill', { pid: p.pid, signal: 9 });
+    if (p.ppid != null) await kernel.call('waitchild', { ppid: p.ppid, pid: p.pid });
+    else await kernel.call('wait', { pid: p.pid });
   }
 }
 
 test('session and group membership obey parent, exec and session boundaries', async ({ page }) => {
-  await page.goto('/');
-  const request = page.request, parent = await exec(request), processes = [parent];
+  const kernel = await freshKernel(page);
+  const stranger = await connectKernel(page, { name: '__sessionsStranger' });
+  const launcher = await execProc(kernel);
+  const parent = { ...await forkProc(kernel, launcher), ppid: launcher.pid };
+  const processes = [launcher, parent];
   try {
-    const session = await invoke(request, parent, 'setsid');
+    const session = await invoke(kernel, parent, 'setsid');
     expect([session.sid, session.pgid]).toEqual([parent.pid, parent.pid]);
-    await invoke(request, parent, 'setsid', 'EPERM');
-    await invoke(request, parent, { setpgid: { pid: 0, pgid: 0 } }, 'EPERM');
-    const child = await fork(request, parent); processes.push(child);
-    expect(await invoke(request, child, { getsid: { pid: 0 } })).toMatchObject({ sid: parent.pid, pgid: parent.pid });
-    await invoke(request, parent, { setpgid: { pid: child.pid, pgid: child.pid } });
-    expect(await invoke(request, child, { getpgid: { pid: 0 } })).toMatchObject({ pgid: child.pid });
-    await invoke(request, child, 'setsid', 'EPERM');
-    await invoke(request, child, { setpgid: { pid: 0, pgid: parent.pid } });
-    expect(await invoke(request, child, 'setsid')).toMatchObject({ sid: child.pid, pgid: child.pid });
-    await invoke(request, parent, { setpgid: { pid: child.pid, pgid: parent.pid } }, 'EPERM');
-    const foreign = await exec(request); processes.push(foreign);
-    await invoke(request, parent, { setpgid: { pid: foreign.pid, pgid: parent.pid } }, 'ESRCH');
-    await invoke(request, parent, { setpgid: { pid: -1, pgid: 0 } }, 'EINVAL');
-    const next = await fork(request, parent); processes.push(next);
-    const replacement = await call(request, { execve: { ...sleep, pid: next.pid, proc: next.token } });
-    next.token = replacement.token;
-    await invoke(request, parent, { setpgid: { pid: next.pid, pgid: parent.pid } }, 'EACCES');
-    expect(await invoke(request, next, { getsid: { pid: 0 } })).toMatchObject({ sid: parent.pid, pgid: parent.pid });
-    const [forged] = await sys(request, ['setsid'], { pid: parent.pid, proc: 'forged' });
-    expect(forged.err.errno).toBe('EPERM');
-  } finally { await cleanup(request, processes); }
+    await invoke(kernel, parent, 'setsid', 'EPERM');
+    await invoke(kernel, parent, { setpgid: { pid: 0, pgid: 0 } }, 'EPERM');
+    const child = { ...await forkProc(kernel, parent), ppid: parent.pid };
+    processes.push(child);
+    expect(await invoke(kernel, child, { getsid: { pid: 0 } })).toMatchObject({ sid: parent.pid, pgid: parent.pid });
+    await invoke(kernel, parent, { setpgid: { pid: child.pid, pgid: child.pid } });
+    expect(await invoke(kernel, child, { getpgid: { pid: 0 } })).toMatchObject({ pgid: child.pid });
+    await invoke(kernel, child, 'setsid', 'EPERM');
+    await invoke(kernel, child, { setpgid: { pid: 0, pgid: parent.pid } });
+    expect(await invoke(kernel, child, 'setsid')).toMatchObject({ sid: child.pid, pgid: child.pid });
+    await invoke(kernel, parent, { setpgid: { pid: child.pid, pgid: parent.pid } }, 'EPERM');
+    const foreign = await execProc(kernel);
+    processes.push(foreign);
+    await invoke(kernel, parent, { setpgid: { pid: foreign.pid, pgid: parent.pid } }, 'ESRCH');
+    await invoke(kernel, parent, { setpgid: { pid: -1, pgid: 0 } }, 'EINVAL');
+    const next = { ...await forkProc(kernel, parent), ppid: parent.pid };
+    processes.push(next);
+    await kernel.value('reexec', { ...sleep, pid: next.pid });
+    await invoke(kernel, parent, { setpgid: { pid: next.pid, pgid: parent.pid } }, 'EACCES');
+    expect(await invoke(kernel, next, { getsid: { pid: 0 } })).toMatchObject({ sid: parent.pid, pgid: parent.pid });
+    // Foreign host cannot invoke setsid on another instance's process.
+    expect((await stranger.call('process_call', { pid: parent.pid, call: 'setsid' })).err?.errno).toBe('ESRCH');
+  } finally {
+    await cleanup(kernel, processes);
+    await stranger.terminate();
+    await kernel.terminate();
+  }
 });
 
 test('group signals and wait selectors preserve siblings and report each state once', async ({ page }) => {
-  await page.goto('/');
-  const request = page.request, parent = await exec(request), processes = [parent];
+  const kernel = await freshKernel(page);
+  const launcher = await execProc(kernel);
+  const parent = { ...await forkProc(kernel, launcher), ppid: launcher.pid };
+  const processes = [launcher, parent];
   try {
-    await invoke(request, parent, 'setsid');
-    const a = await fork(request, parent), b = await fork(request, parent), other = await fork(request, parent);
+    await invoke(kernel, parent, 'setsid');
+    const a = { ...await forkProc(kernel, parent), ppid: parent.pid };
+    const b = { ...await forkProc(kernel, parent), ppid: parent.pid };
+    const other = { ...await forkProc(kernel, parent), ppid: parent.pid };
     processes.push(a, b, other);
-    await invoke(request, parent, { setpgid: { pid: a.pid, pgid: a.pid } });
-    await invoke(request, parent, { setpgid: { pid: b.pid, pgid: a.pid } });
-    await invoke(request, parent, { kill: { pid: String(-a.pid), signal: 0 } });
-    await invoke(request, parent, { kill: { pid: String(-a.pid), signal: 19 } });
+    await invoke(kernel, parent, { setpgid: { pid: a.pid, pgid: a.pid } });
+    await invoke(kernel, parent, { setpgid: { pid: b.pid, pgid: a.pid } });
+    await kernel.value('kill', { pid: -a.pid, signal: 0, from: parent.pid });
+    await kernel.value('kill', { pid: -a.pid, signal: 19, from: parent.pid });
     for (const child of [a, b]) {
-      expect(await invoke(request, parent, { waitpid: { pid: -a.pid, options: 3 } })).toMatchObject({ pid: child.pid, stopped: true, status: 19 * 256 + 127 });
+      expect(await invoke(kernel, parent, { waitpid: { pid: -a.pid, options: 3 } })).toMatchObject({
+        pid: child.pid,
+        stopped: true,
+        status: 19 * 256 + 127,
+      });
     }
-    expect(await invoke(request, parent, { waitpid: { pid: -a.pid, options: 3 } })).toEqual({ nothing: true });
-    await invoke(request, parent, { kill: { pid: String(-a.pid), signal: 18 } });
-    for (const child of [a, b]) expect(await invoke(request, parent, { waitpid: { pid: -a.pid, options: 9 } })).toMatchObject({ pid: child.pid, continued: true, status: 65535 });
-    expect(await invoke(request, parent, { waitpid: { pid: 0, options: 1 } })).toEqual({ nothing: true });
-    await invoke(request, parent, { kill: { pid: String(-a.pid), signal: 9 } });
-    for (const child of [a, b]) expect(await invoke(request, parent, { waitpid: { pid: -a.pid, options: 1 } })).toMatchObject({ pid: child.pid, signal: 9 });
-    await invoke(request, parent, { waitpid: { pid: -a.pid, options: 1 } }, 'ECHILD');
-    expect(await invoke(request, parent, { getpgid: { pid: other.pid } })).toMatchObject({ pgid: parent.pid });
-    expect(await invoke(request, parent, { waitpid: { pid: other.pid, options: 1 } })).toEqual({ nothing: true });
-  } finally { await cleanup(request, processes); }
+    expect(await invoke(kernel, parent, { waitpid: { pid: -a.pid, options: 3 } })).toEqual({ nothing: true });
+    await kernel.value('kill', { pid: -a.pid, signal: 18, from: parent.pid });
+    for (const child of [a, b]) {
+      expect(await invoke(kernel, parent, { waitpid: { pid: -a.pid, options: 9 } })).toMatchObject({
+        pid: child.pid,
+        continued: true,
+        status: 65535,
+      });
+    }
+    expect(await invoke(kernel, parent, { waitpid: { pid: 0, options: 1 } })).toEqual({ nothing: true });
+    await kernel.value('kill', { pid: -a.pid, signal: 9, from: parent.pid });
+    for (const child of [a, b]) {
+      expect(await invoke(kernel, parent, { waitpid: { pid: -a.pid, options: 1 } })).toMatchObject({
+        pid: child.pid,
+        signal: 9,
+      });
+    }
+    await invoke(kernel, parent, { waitpid: { pid: -a.pid, options: 1 } }, 'ECHILD');
+    expect(await invoke(kernel, parent, { getpgid: { pid: other.pid } })).toMatchObject({ pgid: parent.pid });
+    expect(await invoke(kernel, parent, { waitpid: { pid: other.pid, options: 1 } })).toEqual({ nothing: true });
+  } finally {
+    await cleanup(kernel, processes);
+    await kernel.terminate();
+  }
 });
 
 test('session bootstrap checks every proof before changing any process', async ({ page }) => {
-  await page.goto('/');
-  const request = page.request, a = await exec(request), b = await exec(request), processes = [a, b];
-  const bootstrap = proofs => sys(request, [{ proc_session: { processes: proofs } }], {}, { 'X-Registry': '1' });
+  const kernel = await freshKernel(page);
+  const stranger = await connectKernel(page, { name: '__sessionBootStranger' });
+  const a = await execProc(kernel), b = await execProc(kernel), processes = [a, b];
   try {
-    expect((await bootstrap([owned(a), { ...owned(b), proc: 'forged' }]))[0].err.errno).toBe('EPERM');
-    expect(await invoke(request, a, { getsid: { pid: 0 } })).toMatchObject({ sid: 1, pgid: 1 });
-    expect((await bootstrap([owned(a), owned(a)]))[0].err.errno).toBe('EPERM');
-    await invoke(request, a, { proc_session: { processes: [owned(a)] } }, 'EPERM');
-    const [started] = await bootstrap([owned(a), owned(b)]);
-    expect(started.err).toBeUndefined();
-    expect(started.ok.map(row => [row.sid, row.pgid])).toEqual([[a.pid, a.pid], [a.pid, a.pid]]);
-    expect((await bootstrap([owned(b)]))[0].err.errno).toBe('EPERM');
-  } finally { await cleanup(request, processes); }
+    const beforeA = await invoke(kernel, a, { getsid: { pid: 0 } });
+    // Any unowned/nonexistent pid in the batch fails atomically without modifying `a`.
+    expect((await kernel.call('session', { pids: [a.pid, 99999] })).err?.errno).toBe('ESRCH');
+    expect(await invoke(kernel, a, { getsid: { pid: 0 } })).toEqual(beforeA);
+    // Duplicate pid in bootstrap fails EINVAL.
+    expect((await kernel.call('session', { pids: [a.pid, a.pid] })).err?.errno).toBe('EINVAL');
+    // Another kernel host cannot bootstrap `a`'s session.
+    expect((await stranger.call('session', { pids: [a.pid] })).err?.errno).toBe('ESRCH');
+    // Process calls cannot invoke session bootstrap.
+    expect((await kernel.call('process_call', { pid: a.pid, call: { proc_session: { processes: [{ pid: a.pid, proc: '' }] } } })).err).toBeTruthy();
+
+    const started = await kernel.value('session', { pids: [a.pid, b.pid] });
+    expect(started.map(row => [row.sid, row.pgid])).toEqual([[a.pid, a.pid], [a.pid, a.pid]]);
+    // Second bootstrap on an already-bootstrapped process is refused.
+    expect((await kernel.call('session', { pids: [b.pid] })).err?.errno).toBe('EPERM');
+  } finally {
+    await cleanup(kernel, processes);
+    await stranger.terminate();
+    await kernel.terminate();
+  }
 });
 
 test('orphaning a stopped group sends HUP and CONT and preserves group identity', async ({ page }) => {
-  await page.goto('/');
-  const request = page.request, parent = await exec(request), processes = [parent];
+  const kernel = await freshKernel(page);
+  const launcher = await execProc(kernel);
+  const parent = { ...await forkProc(kernel, launcher), ppid: launcher.pid };
+  const processes = [launcher, parent];
   try {
-    await invoke(request, parent, 'setsid');
-    const child = await fork(request, parent); processes.push(child);
-    await invoke(request, parent, { setpgid: { pid: child.pid, pgid: 0 } });
-    await invoke(request, parent, { kill: { pid: String(child.pid), signal: 19 } });
-    await invoke(request, parent, { exit: { status: 0 } });
-    const [kept] = await sys(request, [{ proc_keep: { processes: [owned(child)] } }], {}, { 'X-Registry': '1' });
-    expect(kept.ok[0]).toMatchObject({ ppid: 1, sid: parent.pid, pgid: child.pid, state: 'running' });
-    expect(kept.ok[0].pending_signals.map(event => event.signal)).toEqual([1, 18]);
-  } finally { await cleanup(request, processes); }
+    await invoke(kernel, parent, 'setsid');
+    const child = { ...await forkProc(kernel, parent), ppid: parent.pid };
+    processes.push(child);
+    await invoke(kernel, parent, { setpgid: { pid: child.pid, pgid: 0 } });
+    await kernel.value('kill', { pid: child.pid, signal: 19, from: parent.pid });
+    await kernel.value('exit', { pid: parent.pid, status: 0 });
+    // Reparented to PID 1 when `parent` exited; update cleanup ppid.
+    child.ppid = null;
+    const kept = (await kernel.value('sync')).find(row => row.pid === child.pid);
+    expect(kept).toMatchObject({ ppid: 1, sid: parent.pid, pgid: child.pid, state: 'running' });
+    expect(kept.pending_signals.map(event => event.signal)).toEqual([1, 18]);
+  } finally {
+    await cleanup(kernel, processes);
+    await kernel.terminate();
+  }
 });
 
 test('a group signal reaches permitted members without enlarging account authority', async ({ page }) => {
-  await page.goto('/');
-  const request = page.request;
-  const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
-  expect((await api(request, 'login', { headers: { 'CF-Connecting-IP': crypto.randomUUID() }, data: { username: 'root', password } })).ok()).toBe(true);
-  const root = await exec(request), processes = [root];
+  const kernel = await freshKernel(page);
+  await kernel.value('sync_account', ROOT_ACCOUNT);
+  const sessionLeader = await execProc(kernel);
+  const root = { ...await forkProc(kernel, sessionLeader), ppid: sessionLeader.pid };
+  const guest = { ...await forkProc(kernel, sessionLeader), ppid: sessionLeader.pid };
+  const processes = [sessionLeader, root, guest];
   try {
-    await invoke(request, root, { setpgid: { pid: 0, pgid: 0 } });
-    expect((await api(request, 'logout')).ok()).toBe(true);
-    const guest = await exec(request); processes.push(guest);
-    // The initial compatibility session can hold different credentials, just as
-    // setuid execution can. Group membership must never grant signaling rights.
-    await invoke(request, guest, { setpgid: { pid: 0, pgid: root.pid } });
-    await invoke(request, guest, { kill: { pid: String(-root.pid), signal: 10 } });
-    const [kept] = await sys(request, [{ proc_keep: { processes: [owned(root), owned(guest)] } }], {}, { 'X-Registry': '1' });
-    expect(kept.ok.find(row => row.pid === root.pid).pending_signals ?? []).toEqual([]);
-    expect(kept.ok.find(row => row.pid === guest.pid).pending_signals.map(event => event.signal)).toEqual([10]);
-    const metadata = await invoke(request, guest, { getpgid: { pid: root.pid } });
+    await invoke(kernel, root, { setpgid: { pid: 0, pgid: 0 } });
+    // Drop `guest` to unprivileged UID 65534 within the same session; group membership must never grant signaling rights over root.
+    await kernel.value('set_proc_cred', { pid: guest.pid, uid: 65534, gid: 65534, groups: [65534] });
+    await invoke(kernel, guest, { setpgid: { pid: 0, pgid: root.pid } });
+    await kernel.value('kill', { pid: -root.pid, signal: 10, from: guest.pid });
+
+    const rows = await kernel.value('sync');
+    expect(rows.find(row => row.pid === root.pid).pending_signals ?? []).toEqual([]);
+    expect(rows.find(row => row.pid === guest.pid).pending_signals.map(event => event.signal)).toEqual([10]);
+
+    const metadata = await invoke(kernel, guest, { getpgid: { pid: root.pid } });
     expect(Object.keys(metadata).sort()).toEqual(['pgid', 'pid', 'ppid', 'sid']);
-    await invoke(request, guest, { kill: { pid: String(root.pid), signal: 0 } }, 'EPERM');
+    expect((await kernel.call('kill', { pid: root.pid, signal: 0, from: guest.pid })).err?.errno).toBe('EPERM');
   } finally {
-    await api(request, 'login', { headers: { 'CF-Connecting-IP': crypto.randomUUID() }, data: { username: 'root', password } });
-    await cleanup(request, processes);
+    await cleanup(kernel, processes);
+    await kernel.terminate();
   }
 });
 
@@ -140,9 +204,13 @@ async function send(page, text) {
   await page.locator('#command').press('Enter');
 }
 async function interactive(page) {
-  await page.goto('/'); await send(page, 'sh -i');
+  const pageKernel = await hookPageKernel(page);
+  await page.goto('/');
+  await pageKernel.ready();
+  await send(page, 'sh -i');
   await expect(prompt(page)).toHaveAttribute('data-state', 'input', { timeout: 60_000 });
   await expect(screen(page)).toContainText('$ ');
+  return pageKernel;
 }
 
 test('dash owns stopped foreground jobs and can resume them without stopping its shell', async ({ page }) => {
@@ -165,9 +233,9 @@ test('dash owns stopped foreground jobs and can resume them without stopping its
 });
 
 test('background reads stop with SIGTTIN and fg gives the child terminal input', async ({ page }) => {
-  await interactive(page);
+  const pageKernel = await interactive(page);
   await send(page, 'cat &');
-  await expect.poll(async () => (await call(page.request, { proc_poll: { pids: [] } })).some(row => row.argv[0] === 'cat' && row.state === 'stopped')).toBe(true);
+  await expect.poll(async () => (await pageKernel.value('poll', { pids: [] })).some(row => row.argv[0] === 'cat' && row.state === 'stopped'), { timeout: 20_000 }).toBe(true);
   await send(page, 'jobs');
   await expect(screen(page)).toContainText('Stopped', { timeout: 20_000 });
   await send(page, 'fg');
@@ -181,9 +249,9 @@ test('background reads stop with SIGTTIN and fg gives the child terminal input',
 });
 
 test('Ctrl+C targets the foreground pipeline while a background job and the shell survive', async ({ page }) => {
-  await interactive(page);
+  const pageKernel = await interactive(page);
   await send(page, 'sleep 60 &');
-  const rows = () => call(page.request, { proc_poll: { pids: [] } });
+  const rows = () => pageKernel.value('poll', { pids: [] });
   await expect.poll(async () => (await rows()).some(row => row.argv[0] === 'sleep')).toBe(true);
   const background = (await rows()).find(row => row.argv[0] === 'sleep');
   await send(page, 'yes | cat');
@@ -200,11 +268,11 @@ test('Ctrl+C targets the foreground pipeline while a background job and the shel
 });
 
 test('stty tostop stops background terminal writes and fg lets them complete', async ({ page }) => {
-  await interactive(page);
+  const pageKernel = await interactive(page);
   await send(page, 'stty tostop; echo configured');
   await expect(screen(page)).toContainText('configured\n$');
   await send(page, 'echo background-write &');
-  await expect.poll(async () => (await call(page.request, { proc_poll: { pids: [] } })).some(row => row.ppid !== 1 && row.state === 'stopped')).toBe(true);
+  await expect.poll(async () => (await pageKernel.value('poll', { pids: [] })).some(row => row.ppid !== 1 && row.state === 'stopped')).toBe(true);
   // Registry stop state can precede dash consuming SIGCHLD/wait status. Each
   // jobs invocation is a snapshot; ask again until the shell has observed it.
   await expect.poll(async () => {
@@ -252,5 +320,8 @@ test('setsid detaches the controlling terminal without closing inherited descrip
     await send(page, `sh -c '${base}/probe; echo :$?'`);
     await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
     await expect(screen(page)).toHaveText('detached:0');
-  } finally { module.dispose(); await rmrf(page.request, base); }
+  } finally {
+    module.dispose();
+    await rmrf(page.request, base);
+  }
 });
