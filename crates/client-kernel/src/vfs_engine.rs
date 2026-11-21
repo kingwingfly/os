@@ -286,63 +286,151 @@ impl BlobStore for JsAssetBlobStore {
     }
 }
 
-/// `/proc` remote-job provider: numeric PIDs, `self`, `mounts`, and `uptime` are rendered 100%
+/// `/proc` provider: numeric PIDs (`1`, `2`, ...), `self`, `mounts`, and `uptime` are served 100%
 /// locally inside `os_vfs::ProcFs` via `ProcBridge` hooks with ZERO network RPCs (#54 L3a).
-/// Non-numeric remote server container job entries (`/proc/<hex-job-id>`) are queried ONLY when
-/// the caller already carries a remote `ServiceAuth v2` credential.
+/// Non-numeric remote server accelerator/container job entries (`/proc/<hex-job-id>`) are queried
+/// ONLY when remote accelerator devices (`archive` or `media`) are attached on this instance.
 #[derive(Clone)]
 pub(crate) struct BrowserProcProvider {
     state: Rc<RefCell<crate::State>>,
+    root_cloud: Rc<RootCloudDriver>,
 }
 
 impl BrowserProcProvider {
-    fn new(state: Rc<RefCell<crate::State>>) -> Self {
-        Self { state }
+    fn new(state: Rc<RefCell<crate::State>>, root_cloud: Rc<RootCloudDriver>) -> Self {
+        Self { state, root_cloud }
+    }
+
+    fn can_query_remote(&self, cred: &Cred) -> bool {
+        let (remote_attached, has_accel) = {
+            let st = self.state.borrow();
+            (
+                st.remote_attached,
+                st.attached_devices.contains_key("archive")
+                    || st.attached_devices.contains_key("media"),
+            )
+        };
+        if !remote_attached || !has_accel || !self.root_cloud.is_remote_mode() {
+            return false;
+        }
+        if cred.token.as_deref().is_some_and(|t| !t.is_empty()) {
+            return installed("cloudFsPost").is_ok();
+        }
+        if let Some(pid) = self
+            .root_cloud
+            .active_pid
+            .get()
+            .filter(|&p| p < SCOPED_PAGE_PID_BASE)
+        {
+            if self.root_cloud.is_pid_cloud_denied(pid) {
+                return false;
+            }
+            let cloud_allowed = self
+                .state
+                .borrow()
+                .table
+                .proc(pid)
+                .is_some_and(|p| p.state != abi::ProcState::Zombie && p.cred.cloud_access);
+            return cloud_allowed
+                && installed("cloudFsPost").is_ok()
+                && installed("serviceAuthPost").is_ok();
+        }
+        installed("pageSysPost").is_ok()
     }
 
     async fn proc_call(&self, cred: &Cred, call: Call) -> vfs::Result<Value> {
-        let Some(token) = cred.token.as_deref().filter(|t| !t.is_empty()) else {
+        if !self.can_query_remote(cred) {
             return Err(Errno::ENOENT);
-        };
-        let Ok((global, post)) = installed("cloudFsPost") else {
-            return Err(Errno::ENOENT);
-        };
-        let instance_id = self.state.borrow().instance_id.clone();
-        let body = serde_json::to_vec(&Batch {
-            calls: vec![call],
-            umask: None,
-            sudo: false,
-            pid: None,
-            process: Some(token.to_string()),
-        })
-        .map_err(|_| Errno::EIO)?;
-        let headers = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(&headers, &"Content-Type".into(), &"application/json".into());
-        let _ = js_sys::Reflect::set(&headers, &"X-Process-Token".into(), &token.into());
-        if !instance_id.is_empty() {
-            let _ = js_sys::Reflect::set(&headers, &"X-OS-Instance".into(), &instance_id.into());
         }
-        let arr = js_sys::Uint8Array::from(body.as_slice());
-        let answer = post
-            .call3(&global, &"/api/sys".into(), &headers, &arr)
+        let proc_pid = self
+            .root_cloud
+            .active_pid
+            .get()
+            .filter(|&p| p < SCOPED_PAGE_PID_BASE);
+        let token = if let Some(tok) = cred.token.as_deref().filter(|t| !t.is_empty()) {
+            Some(tok.to_string())
+        } else if let Some(pid) = proc_pid {
+            let existing = self.state.borrow().table.proc(pid).and_then(|p| {
+                p.cred
+                    .remote
+                    .as_ref()
+                    .filter(|r| r.cloud_access)
+                    .map(|r| r.token.clone())
+            });
+            if let Some(tok) = existing {
+                Some(tok)
+            } else {
+                let rem = crate::lazy_mint_remote_cred(&self.state, pid)
+                    .await
+                    .map_err(|_| Errno::ENOENT)?;
+                Some(rem.token)
+            }
+        } else {
+            None
+        };
+        if let Some(token) = token {
+            let Ok((global, post)) = installed("cloudFsPost") else {
+                return Err(Errno::ENOENT);
+            };
+            let instance_id = self.state.borrow().instance_id.clone();
+            let body = serde_json::to_vec(&Batch {
+                calls: vec![call],
+                umask: None,
+                sudo: false,
+                pid: proc_pid,
+                process: Some(token.clone()),
+            })
             .map_err(|_| Errno::EIO)?;
-        let reply = promised(answer).await?;
-        let status = js_sys::Reflect::get(&reply, &"status".into())
-            .ok()
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as u16;
-        if status != 200 {
+            let headers = js_sys::Object::new();
+            let _ =
+                js_sys::Reflect::set(&headers, &"Content-Type".into(), &"application/json".into());
+            let _ = js_sys::Reflect::set(&headers, &"X-Process-Token".into(), &token.into());
+            if !instance_id.is_empty() {
+                let _ =
+                    js_sys::Reflect::set(&headers, &"X-OS-Instance".into(), &instance_id.into());
+            }
+            let arr = js_sys::Uint8Array::from(body.as_slice());
+            let answer = post
+                .call3(&global, &"/api/sys".into(), &headers, &arr)
+                .map_err(|_| Errno::EIO)?;
+            let reply = promised(answer).await?;
+            let status = js_sys::Reflect::get(&reply, &"status".into())
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as u16;
+            if status != 200 {
+                return Err(Errno::ENOENT);
+            }
+            let raw = js_sys::Reflect::get(&reply, &"body".into()).map_err(|_| Errno::EIO)?;
+            let bytes = js_sys::Uint8Array::new(&raw).to_vec();
+            let res: abi::Results = serde_json::from_slice(&bytes).map_err(|_| Errno::EIO)?;
+            return res
+                .results
+                .into_iter()
+                .next()
+                .ok_or(Errno::EIO)?
+                .into_result()
+                .map_err(|e| e.errno);
+        }
+        if proc_pid.is_some() {
             return Err(Errno::ENOENT);
         }
-        let raw = js_sys::Reflect::get(&reply, &"body".into()).map_err(|_| Errno::EIO)?;
-        let bytes = js_sys::Uint8Array::new(&raw).to_vec();
-        let res: abi::Results = serde_json::from_slice(&bytes).map_err(|_| Errno::EIO)?;
-        res.results
-            .into_iter()
-            .next()
-            .ok_or(Errno::EIO)?
-            .into_result()
-            .map_err(|e| e.errno)
+        if installed("pageSysPost").is_ok() {
+            let mut res = crate::cloudfs::page_sys_batch(Batch {
+                calls: vec![call],
+                umask: None,
+                sudo: self.root_cloud.page_sudo.get(),
+                pid: None,
+                process: None,
+            })
+            .await?;
+            return res
+                .pop()
+                .ok_or(Errno::EIO)?
+                .into_result()
+                .map_err(|e| e.errno);
+        }
+        Err(Errno::ENOENT)
     }
 
     async fn read_proc_file(&self, cred: &Cred, path: &str) -> vfs::Result<Vec<u8>> {
@@ -360,6 +448,39 @@ impl BrowserProcProvider {
         let data: Bytes = serde_json::from_value(val["data"].clone()).map_err(|_| Errno::EIO)?;
         Ok(data.0)
     }
+    async fn remote_job_entries(&self, cred: &Cred) -> Vec<(String, FileType)> {
+        if !self.can_query_remote(cred) {
+            return Vec::new();
+        }
+        let Ok(val) = self
+            .proc_call(
+                cred,
+                Call::Getdents {
+                    path: "/proc".to_string(),
+                    cookie: 0,
+                    count: None,
+                },
+            )
+            .await
+        else {
+            return Vec::new();
+        };
+        let Ok(entries) = serde_json::from_value::<Vec<Dirent>>(val) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for e in entries {
+            if !proc_is_remote_job_id(&e.name) {
+                continue;
+            }
+            let file_type = e
+                .stat
+                .as_ref()
+                .map_or(FileType::Dir, |s| proc_file_type_from_mode(s.mode));
+            out.push((e.name, file_type));
+        }
+        out
+    }
 }
 
 impl ProcProvider for BrowserProcProvider {
@@ -369,7 +490,9 @@ impl ProcProvider for BrowserProcProvider {
     }
 
     fn top_entries<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, Vec<ProcDynamicEntry>> {
-        // `/proc` renders 100% locally inside this instance (ZERO `/api/sys` `/proc` RPCs).
+        // Keep `ProcFs::lookup` 100% local (ZERO network RPCs for `/proc/uptime`, `/proc/mounts`,
+        // `/proc/self`, or `/proc/<pid>`). Remote accelerator jobs are merged directly in
+        // `BrowserProcFs::read_dir` and resolved on demand in `BrowserProcFs::lookup`.
         Box::pin(async { Ok(Vec::new()) })
     }
 
@@ -410,6 +533,13 @@ fn proc_is_local_only_root_child(name: &str) -> bool {
         || name == "self"
         || name == "uptime"
         || name.parse::<u32>().is_ok_and(|pid| pid.to_string() == name)
+}
+
+fn proc_is_remote_job_id(name: &str) -> bool {
+    !name.is_empty()
+        && !proc_is_local_only_root_child(name)
+        && (name.len() == 32 || !name.bytes().all(|b| b.is_ascii_digit()))
+        && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn proc_file_type_from_mode(mode: u32) -> FileType {
@@ -663,7 +793,7 @@ impl Filesystem for BrowserProcFs {
             }
             check_component(name)?;
             if dir.node.ino == PROC_ROOT_INO && !proc_is_local_only_root_child(name) {
-                if cred.token.as_deref().is_none_or(str::is_empty) {
+                if !proc_is_remote_job_id(name) || !self.provider.can_query_remote(cred) {
                     return Err(Errno::ENOENT);
                 }
                 return self.lookup_remote(cred, PROC_ROOT_INO, "/proc", name).await;
@@ -832,12 +962,28 @@ impl Filesystem for BrowserProcFs {
             }
             let mut entries = self.inner.read_dir(cred, dir).await?;
             if dir.node.ino == PROC_ROOT_INO {
+                let remote_jobs = self.provider.remote_job_entries(cred).await;
                 let mut state = self.state.borrow_mut();
                 for de in &mut entries {
                     if !proc_is_local_only_root_child(&de.name) {
                         let child_path = format!("/proc/{}", de.name);
                         de.node.ino = state.intern_remote(PROC_ROOT_INO, &de.name, &child_path)?;
                     }
+                }
+                for (name, file_type) in remote_jobs {
+                    if entries.iter().any(|de| de.name == name) {
+                        continue;
+                    }
+                    let child_path = format!("/proc/{name}");
+                    let ino = state.intern_remote(PROC_ROOT_INO, &name, &child_path)?;
+                    entries.push(vfs::DirEntry {
+                        name,
+                        node: NodeId {
+                            ino,
+                            generation: PROC_GENERATION,
+                        },
+                        file_type,
+                    });
                 }
             }
             Ok(entries)
@@ -1850,7 +1996,7 @@ async fn construct_vfs(
     // 2. `/proc` (`ProcFs` bound to `vfs.proc_bridge()` — 100% local rendering for all numeric
     // PIDs, `self`, `mounts`, and `uptime`; `BrowserProcFs` handles remote container job ids only
     // when a remote credential is attached).
-    let proc_provider = BrowserProcProvider::new(Rc::clone(&state));
+    let proc_provider = BrowserProcProvider::new(Rc::clone(&state), Rc::clone(&root_cloud));
     let proc_fs = Rc::new(ProcFs::new(
         FsId("proc".to_string()),
         mounted_at,

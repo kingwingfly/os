@@ -1,7 +1,9 @@
 //! Content-addressed compilation outside the filesystem authority. Every request reaches
 //! this internal binding only after files.rs has authorized access to the original image.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::time::Duration;
+use wasm_bindgen::{JsCast, JsValue};
 use worker::*;
 
 pub const VERSION: &str = "fork-v4";
@@ -76,23 +78,63 @@ impl ModuleCompiler {
             .ok_or_else(|| Error::RustError("Compiler container unavailable".into()))?;
         // An alarm also bounds a stalled compiler. No executable or account token enters it.
         self.state.storage().set_alarm(120_000).await?;
+        let ended = Rc::new(RefCell::new(None::<String>));
         if !container.running() {
-            let mut options = ContainerStartupOptions::new();
-            options.enable_internet(false);
-            container.start(Some(options))?;
+            // Pass a plain `{ enableInternet: false }` JS object directly to `container.start`.
+            // `worker = "=0.8.7"`'s `From<ContainerStartupOptions> for Object` leaks an empty
+            // `entrypoint: []` and `env: Map {}` because its `delete_property` guards are inverted
+            // on a wasm-bindgen prototype wrapper, preventing the compiler container from starting.
+            let opts = js_sys::Object::new();
+            js_sys::Reflect::set(&opts, &JsValue::from_str("enableInternet"), &JsValue::FALSE)
+                .map_err(|e| Error::RustError(format!("Compiler startup options failed: {e:?}")))?;
+            let start_fn = js_sys::Reflect::get(container.as_ref(), &JsValue::from_str("start"))
+                .map_err(|e| Error::RustError(format!("Compiler start lookup failed: {e:?}")))?;
+            let start_fn: js_sys::Function = start_fn.dyn_into().map_err(|_| {
+                Error::RustError("Compiler container start is not a function".into())
+            })?;
+            start_fn
+                .call1(container.as_ref(), &opts)
+                .map_err(|e| Error::RustError(format!("Compiler start failed: {e:?}")))?;
+            if let Some(watched) = self.state.container() {
+                let ended = ended.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let why = match watched.wait_for_exit().await {
+                        Ok(()) => "it exited".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    *ended.borrow_mut() = Some(why);
+                });
+            }
         }
         let fetcher = container.get_tcp_port(8080)?;
         let mut ready = false;
+        let mut last_err: Option<String> = None;
         for _ in 0..100 {
-            if let Ok(response) = fetcher.fetch("http://compiler/status", None).await
-                && response.status_code() == 200
-            {
-                ready = true;
-                break;
+            let early_exit = ended.borrow_mut().take();
+            if let Some(why) = early_exit {
+                console_error!("compiler container exited before ready: {why}");
+                let _ = container.destroy(None).await;
+                return Response::error(format!("Compiler did not start: {why}"), 503);
+            }
+            match fetcher.fetch("http://compiler/status", None).await {
+                Ok(response) if response.status_code() == 200 => {
+                    ready = true;
+                    break;
+                }
+                Ok(response) => {
+                    last_err = Some(format!("status {}", response.status_code()));
+                }
+                Err(err) => {
+                    last_err = Some(err.to_string());
+                }
             }
             Delay::from(Duration::from_millis(500)).await;
         }
         if !ready {
+            if let Some(why) = last_err {
+                console_error!("compiler container timed out waiting for /status: {why}");
+            }
+            let _ = container.destroy(None).await;
             return Response::error("Compiler did not start", 503);
         }
         let mut init = RequestInit::new();
