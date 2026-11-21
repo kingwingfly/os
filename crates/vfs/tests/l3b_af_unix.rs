@@ -1102,6 +1102,10 @@ fn codex_high13_high14_low1_listener_cred_passcred_dgram_peer_and_bound_name() {
     .unwrap();
 
     let cli = table.create(10, SockType::Stream, c10).unwrap();
+    // Enable SO_PASSCRED on client BEFORE connect() so ConnectResult reports client_passcred = true!
+    table
+        .setsockopt(10, cli, SOL_SOCKET, SO_PASSCRED, 1)
+        .unwrap();
     let resolved =
         block_on(vfs.resolve_socket_inode(10, StartAnchor::Root, "/tmp/renamed.sock")).unwrap();
     let conn = table
@@ -1113,6 +1117,7 @@ fn codex_high13_high14_low1_listener_cred_passcred_dgram_peer_and_bound_name() {
             c10,
         )
         .unwrap();
+    assert!(conn.client_passcred);
     // Client MUST see listener's credentials at listen() time (pid 20, NOT creator pid 10)!
     assert_eq!(conn.peer_cred, c20);
     // Low #1: getpeername & accepted getsockname MUST report bound name "/tmp/orig.sock", NOT "/tmp/renamed.sock"!
@@ -1122,6 +1127,14 @@ fn codex_high13_high14_low1_listener_cred_passcred_dgram_peer_and_bound_name() {
         table.getsockname(20, acc.sock_id).unwrap(),
         "/tmp/orig.sock"
     );
+    // Pre-connect client SO_PASSCRED attributes writes from a forwarded server holder (pid 30) to pid 30!
+    table.hold(30, acc.sock_id, 1).unwrap();
+    table
+        .sendmsg(30, acc.sock_id, b"srv30", Vec::new(), None, c30, None)
+        .unwrap();
+    let cli_got = table.recvmsg(10, cli, 16, 0, 0, None).unwrap();
+    assert_eq!(cli_got.data, b"srv30");
+    assert_eq!(cli_got.peer_cred, c30);
 
     // High #13: SO_PASSCRED on accepted socket attributes plain writes from another holder (pid 30) to pid 30!
     let opt = table

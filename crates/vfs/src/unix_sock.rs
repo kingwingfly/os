@@ -169,6 +169,7 @@ pub struct ConnectResult {
     pub rx_slot: Option<ArenaSlot>,
     pub nonblock: bool,
     pub peer_passcred: bool,
+    pub client_passcred: bool,
 }
 
 /// Result of `accept()`.
@@ -882,6 +883,7 @@ impl UnixSocketTable {
                 rx_slot: None,
                 nonblock: client_nonblock,
                 peer_passcred: target_passcred,
+                client_passcred,
             });
         }
 
@@ -981,7 +983,6 @@ impl UnixSocketTable {
             pending.push_back(server_id);
         }
 
-        let _ = client_passcred;
         Ok(ConnectResult {
             peer_id: server_id,
             listener_id: Some(target_id),
@@ -990,6 +991,7 @@ impl UnixSocketTable {
             rx_slot: slot_s2c,
             nonblock: client_nonblock,
             peer_passcred: target_passcred,
+            client_passcred,
         })
     }
 

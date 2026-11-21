@@ -513,6 +513,7 @@ impl Kernel {
             "rxSlot": slot_json(res.rx_slot),
             "nonblock": res.nonblock,
             "peerPasscred": res.peer_passcred,
+            "clientPasscred": res.client_passcred,
         }))
     }
 

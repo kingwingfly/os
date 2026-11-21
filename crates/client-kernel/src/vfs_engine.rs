@@ -5426,9 +5426,10 @@ impl Kernel {
     }
 
     pub async fn sys_fstatfs(&self, pid: u32, kfd: u32) -> Result<JsValue, JsValue> {
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let sfs = self
-            .with_proc_scope(pid, async move { vfs.fstatfs(pid, kfd).await })
+            .with_proc_scope(scope_pid, async move { vfs.fstatfs(pid, kfd).await })
             .await
             .map_err(map_errno)?;
         json_to_js(&json!(safe_statfs_for_js(sfs)))
@@ -7764,8 +7765,16 @@ impl Kernel {
                             if page_sid.is_none()
                                 && (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd)
                             {
-                                match self.resolve_process_server_fd(pid, raw_fd) {
-                                    Ok(sfd) => {
+                                match self.resolve_process_server_fd_entry(pid, raw_fd) {
+                                    Ok((sfd, Some((owner_pid, owner_tok)))) => {
+                                        self.forward_server_call_attenuated(
+                                            owner_pid,
+                                            &owner_tok,
+                                            Call::Fstatfs { fd: FdRef::Fd(sfd) },
+                                        )
+                                        .await
+                                    }
+                                    Ok((sfd, None)) => {
                                         self.forward_server_call(
                                             pid,
                                             page_sudo,
@@ -7776,10 +7785,14 @@ impl Kernel {
                                     Err(e) => Err(e),
                                 }
                             } else {
-                                vfs.fstatfs(pid, raw_fd)
-                                    .await
-                                    .map(|s| json!(safe_statfs_for_js(s)))
-                                    .map_err(Into::into)
+                                match self.scope_pid_for_kfd(pid, raw_fd) {
+                                    Ok(scope_pid) => self
+                                        .with_proc_scope(scope_pid, vfs.fstatfs(pid, raw_fd))
+                                        .await
+                                        .map(|s| json!(safe_statfs_for_js(s)))
+                                        .map_err(Into::into),
+                                    Err(e) => Err(e.into()),
+                                }
                             }
                         }
                         Err(e) => Err(e.into()),
@@ -8402,23 +8415,6 @@ impl Kernel {
             .next()
             .ok_or_else(|| abi::Error::from(Errno::EIO))?
             .into_result()
-    }
-
-    fn resolve_process_server_fd(
-        &self,
-        pid: u32,
-        vfd: u32,
-    ) -> std::result::Result<u32, abi::Error> {
-        let rt = self.vfs_rt.borrow();
-        rt.proc_meta
-            .get(&pid)
-            .and_then(|m| {
-                m.server_fds
-                    .get(&vfd)
-                    .filter(|e| !e.closing)
-                    .map(|e| *e.sfd)
-            })
-            .ok_or_else(|| Errno::EBADF.into())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9506,41 +9502,25 @@ impl Kernel {
             };
         let mut temp_usr_fds: Vec<u32> = Vec::new();
         let ioctl_res = async {
+            // High #1 (`U-10`): ioctls that resolve external paths or authorize privileged
+            // control mutations under the server request token (`accelerator::SUBMIT`,
+            // `accelerator::CONFIGURE`, `abi::PRESENT_SHOW`, and non-`"status"`
+            // `abi::system::CONTROL`) must NEVER delegate a sender's identity to a
+            // cloud-denied or lower-privileged receiver. Fail closed with `EACCES` unless
+            // the receiver is active, has `cloud_access`, the owner's token is live and
+            // unrevoked, and `(uid, gid, groups)` match identically.
+            let requires_identity_match = request == accelerator::SUBMIT
+                || request == accelerator::CONFIGURE
+                || request == abi::PRESENT_SHOW
+                || (request == abi::system::CONTROL
+                    && arg.get("op").and_then(|v| v.as_str()) != Some("status"));
+            if requires_identity_match
+                && let Some((owner_pid, owner_tok)) = &attenuated_dev
+                && !self.attenuated_owner_identity_matches(pid, *owner_pid, owner_tok)
+            {
+                return Err(Errno::EACCES.into());
+            }
             if request == accelerator::SUBMIT {
-                // High #1 (`U-10`): `accelerator::SUBMIT` carries external `PathAt` file/dir
-                // operands evaluated by the server under the request token's identity. Never
-                // delegate a higher-privileged sender's identity to authorize files the receiver
-                // cannot access: fail closed with `EACCES` unless the receiver has `cloud_access`
-                // and identical `(uid, gid, groups)` to the active, unrevoked sender!
-                if let Some((owner_pid, owner_tok)) = &attenuated_dev {
-                    let receiver_denied = self.vfs_rt.borrow().root_cloud.is_pid_cloud_denied(pid);
-                    let authorized = !receiver_denied && {
-                        let st = self.state.borrow();
-                        if st.pending_revocations.contains(owner_tok) {
-                            false
-                        } else if let (Some(recv), Some(owner)) =
-                            (st.table.proc(pid), st.table.proc(*owner_pid))
-                        {
-                            recv.state != abi::ProcState::Zombie
-                                && owner.state != abi::ProcState::Zombie
-                                && recv.cred.cloud_access
-                                && owner.cred.cloud_access
-                                && owner
-                                    .cred
-                                    .remote
-                                    .as_ref()
-                                    .is_some_and(|r| r.token == *owner_tok)
-                                && recv.cred.identity.id == owner.cred.identity.id
-                                && recv.cred.identity.group == owner.cred.identity.group
-                                && recv.cred.identity.groups == owner.cred.identity.groups
-                        } else {
-                            false
-                        }
-                    };
-                    if !authorized {
-                        return Err(Errno::EACCES.into());
-                    }
-                }
                 let mut submit: Submit =
                     serde_json::from_value(arg).map_err(|_| abi::Error::from(Errno::EINVAL))?;
                 match &mut submit.operation {
@@ -9549,6 +9529,7 @@ impl Kernel {
                             vfs,
                             pid,
                             page_sudo,
+                            attenuated_dev.as_ref(),
                             output,
                             true,
                             &mut temp_usr_fds,
@@ -9559,6 +9540,7 @@ impl Kernel {
                                 vfs,
                                 pid,
                                 page_sudo,
+                                attenuated_dev.as_ref(),
                                 &mut inp.source,
                                 false,
                                 &mut temp_usr_fds,
@@ -9575,6 +9557,7 @@ impl Kernel {
                             vfs,
                             pid,
                             page_sudo,
+                            attenuated_dev.as_ref(),
                             source,
                             false,
                             &mut temp_usr_fds,
@@ -9584,6 +9567,7 @@ impl Kernel {
                             vfs,
                             pid,
                             page_sudo,
+                            attenuated_dev.as_ref(),
                             destination,
                             true,
                             &mut temp_usr_fds,
@@ -9595,6 +9579,7 @@ impl Kernel {
                             vfs,
                             pid,
                             page_sudo,
+                            attenuated_dev.as_ref(),
                             source,
                             false,
                             &mut temp_usr_fds,
@@ -9606,6 +9591,7 @@ impl Kernel {
                             vfs,
                             pid,
                             page_sudo,
+                            attenuated_dev.as_ref(),
                             file,
                             true,
                             &mut temp_usr_fds,
@@ -9631,18 +9617,50 @@ impl Kernel {
         }
         .await;
         for sfd in temp_usr_fds {
-            let _ = self
-                .forward_server_call(pid, page_sudo, Call::Close { fd: FdRef::Fd(sfd) })
-                .await;
+            let close_call = Call::Close { fd: FdRef::Fd(sfd) };
+            let _ = match &attenuated_dev {
+                Some((owner_pid, owner_tok)) => {
+                    self.forward_server_call_attenuated(*owner_pid, owner_tok, close_call)
+                        .await
+                }
+                None => self.forward_server_call(pid, page_sudo, close_call).await,
+            };
         }
         ioctl_res
     }
 
+    fn attenuated_owner_identity_matches(&self, pid: u32, owner_pid: u32, owner_tok: &str) -> bool {
+        if self.vfs_rt.borrow().root_cloud.is_pid_cloud_denied(pid) {
+            return false;
+        }
+        let st = self.state.borrow();
+        if st.pending_revocations.iter().any(|t| t == owner_tok) {
+            return false;
+        }
+        let (Some(recv), Some(owner)) = (st.table.proc(pid), st.table.proc(owner_pid)) else {
+            return false;
+        };
+        recv.state != abi::ProcState::Zombie
+            && owner.state != abi::ProcState::Zombie
+            && recv.cred.cloud_access
+            && owner.cred.cloud_access
+            && owner
+                .cred
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.token == owner_tok)
+            && recv.cred.identity.id == owner.cred.identity.id
+            && recv.cred.identity.group == owner.cred.identity.group
+            && recv.cred.identity.groups == owner.cred.identity.groups
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn rewrite_accel_path_at(
         &self,
         vfs: &Vfs,
         pid: u32,
         page_sudo: bool,
+        attenuated_dev: Option<&(u32, String)>,
         pat: &mut PathAt,
         mutating: bool,
         temp_usr_fds: &mut Vec<u32>,
@@ -9708,20 +9726,21 @@ impl Kernel {
             if usr_dir_path != "/usr" && !usr_dir_path.starts_with("/usr/") {
                 return Err(Errno::EXDEV.into());
             }
-            let opened = self
-                .forward_server_call(
-                    pid,
-                    page_sudo,
-                    Call::Open {
-                        path: usr_dir_path,
-                        flags: abi::O_PATH | abi::O_DIRECTORY,
-                        mode: 0,
-                        size: None,
-                        sha256: None,
-                        version: None,
-                    },
-                )
-                .await?;
+            let open_call = Call::Open {
+                path: usr_dir_path,
+                flags: abi::O_PATH | abi::O_DIRECTORY,
+                mode: 0,
+                size: None,
+                sha256: None,
+                version: None,
+            };
+            let opened = match attenuated_dev {
+                Some((owner_pid, owner_tok)) => {
+                    self.forward_server_call_attenuated(*owner_pid, owner_tok, open_call)
+                        .await?
+                }
+                None => self.forward_server_call(pid, page_sudo, open_call).await?,
+            };
             let server_fd = opened
                 .get("fd")
                 .and_then(|v| v.as_u64())

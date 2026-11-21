@@ -1227,7 +1227,12 @@ export async function exec(stages, options = {}) {
             if (res.nonblock) txRing.setSockNonblock(true);
             if (res.peerPasscred) txRing.setPasscred(true);
           }
-          if (res.rxSlot) initArenaSlot(sockArena, res.rxSlot.slot, res.rxSlot.gen, 1, 1, sockNotify);
+          if (res.rxSlot) {
+            initArenaSlot(sockArena, res.rxSlot.slot, res.rxSlot.gen, 1, 1, sockNotify);
+            if (res.clientPasscred) {
+              new ArenaRing(sockArena, res.rxSlot.slot, res.rxSlot.gen, 1, sockNotify).setPasscred(true);
+            }
+          }
         }
         notifySockets();
         return res;
