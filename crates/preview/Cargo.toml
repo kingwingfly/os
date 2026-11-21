@@ -99,15 +99,15 @@ arborium-yaml = { version = "2.18", optional = true }
 arborium-zig = { version = "2.18", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 flate2 = { version = "1.1", optional = true }
-hayro = { version = "0.8", optional = true }
+hayro = { version = "0.9", optional = true }
 js-sys = { workspace = true, optional = true }
 # Without the ELK layout, which is under the EPL-2.0.
-merman = { version = "0.9.2", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape", "math"], optional = true }
+merman = { version = "0.10", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape", "math"], optional = true }
 serde_json = { workspace = true, optional = true }
 tar = { version = "0.4", default-features = false, optional = true }
 wasm-bindgen = { workspace = true, optional = true }
 web-sys = { workspace = true, features = ["console", "DedicatedWorkerGlobalScope", "MessageEvent"], optional = true }
-zip = { version = "9.1", default-features = false, optional = true }
+zip = { version = "9.8", default-features = false, optional = true }
 
 # The workers, which scripts/build.mjs compiles to WebAssembly.
 [[bin]]

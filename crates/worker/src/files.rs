@@ -345,12 +345,11 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
         // Asset paths/content IDs survive deployments. Hash the authoritative bytes,
         // not `usr:dash`, so an upgrade cannot reuse a previous image's transform.
         // The asset binding has a 25 MiB per-file limit; these are our installed images.
-        use sha2::{Digest, Sha256};
         let bytes = response.cloned()?.bytes().await?;
         if !(8..=abi::EXEC_MAX as usize).contains(&bytes.len()) {
             return error_response("Not a complete executable image", 400);
         }
-        let content = format!("asset:{:x}", Sha256::digest(&bytes));
+        let content = format!("asset:{}", os_image::digest(&bytes));
         return crate::compiler::image(env, &content, response, &compile).await;
     }
     let grant: Grant = serde_json::from_value(grant)?;

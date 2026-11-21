@@ -81,7 +81,7 @@ impl ModuleCompiler {
         let ended = Rc::new(RefCell::new(None::<String>));
         if !container.running() {
             // Pass a plain `{ enableInternet: false }` JS object directly to `container.start`.
-            // `worker = "=0.8.7"`'s `From<ContainerStartupOptions> for Object` leaks an empty
+            // `worker = "=0.9.0"`'s `From<ContainerStartupOptions> for Object` leaks an empty
             // `entrypoint: []` and `env: Map {}` because its `delete_property` guards are inverted
             // on a wasm-bindgen prototype wrapper, preventing the compiler container from starting.
             let opts = js_sys::Object::new();

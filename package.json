@@ -26,9 +26,9 @@
     "codemirror": "^6.0.2"
   },
   "devDependencies": {
-    "@playwright/test": "^1.56.0",
+    "@playwright/test": "^1.65.1",
     "binaryen": "^132.0.0",
-    "esbuild": "^0.25.0",
-    "wrangler": "4.152.0"
+    "esbuild": "^0.28.2",
+    "wrangler": "4.166.0"
   }
 }

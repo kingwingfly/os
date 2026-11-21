@@ -12,7 +12,7 @@ os-core = { path = "../core" }
 vfs = { package = "os-vfs", path = "../vfs" }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libc = "0.2"

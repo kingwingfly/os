@@ -1,5 +1,5 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use os_core::permissions::{Identity, Session, Store, User, is_guest_id};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
