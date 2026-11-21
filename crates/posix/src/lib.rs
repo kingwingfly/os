@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 
 pub mod pipe;
 pub mod process;
+pub mod socket;
 pub(crate) mod wasi_libc;
 
 pub use abi::contract::{fs_magic, mount_flags, statfs_flags, umount_flags, unshare_flags};
@@ -117,10 +118,22 @@ fn linux_errno_to_abi(code: i32) -> Option<abi::Errno> {
         39 => ENOTEMPTY,
         40 => ELOOP,
         61 => ENODATA,
+        88 => ENOTSOCK,
+        90 => EMSGSIZE,
+        91 => EPROTOTYPE,
         93 => EPROTONOSUPPORT,
         95 => EOPNOTSUPP,
+        97 => EAFNOSUPPORT,
+        98 => EADDRINUSE,
+        99 => EADDRNOTAVAIL,
+        103 => ECONNABORTED,
+        104 => ECONNRESET,
+        105 => ENOBUFS,
+        106 => EISCONN,
         107 => ENOTCONN,
+        109 => ETOOMANYREFS,
         110 => ETIMEDOUT,
+        111 => ECONNREFUSED,
         116 => ESTALE,
         122 => EDQUOT,
         125 => ECANCELED,
@@ -195,10 +208,22 @@ fn bsd_errno_to_abi(code: i32, flavour: BsdFlavour) -> Option<abi::Errno> {
         32 => EPIPE,
         34 => ERANGE,
         35 => EAGAIN,
+        38 => ENOTSOCK,
+        40 => EMSGSIZE,
+        41 => EPROTOTYPE,
         43 => EPROTONOSUPPORT,
         45 => EOPNOTSUPP,
+        47 => EAFNOSUPPORT,
+        48 => EADDRINUSE,
+        49 => EADDRNOTAVAIL,
+        53 => ECONNABORTED,
+        54 => ECONNRESET,
+        55 => ENOBUFS,
+        56 => EISCONN,
         57 => ENOTCONN,
+        59 => ETOOMANYREFS,
         60 => ETIMEDOUT,
+        61 => ECONNREFUSED,
         62 => ELOOP,
         63 => ENAMETOOLONG,
         66 => ENOTEMPTY,
@@ -817,6 +842,11 @@ pub(crate) fn os_error(error: abi::Error) -> io::Error {
         abi::Errno::EFBIG => io::ErrorKind::FileTooLarge,
         abi::Errno::ETXTBSY => io::ErrorKind::ExecutableFileBusy,
         abi::Errno::EMLINK => io::ErrorKind::TooManyLinks,
+        abi::Errno::EADDRINUSE => io::ErrorKind::AddrInUse,
+        abi::Errno::EADDRNOTAVAIL => io::ErrorKind::AddrNotAvailable,
+        abi::Errno::ECONNREFUSED => io::ErrorKind::ConnectionRefused,
+        abi::Errno::ECONNRESET => io::ErrorKind::ConnectionReset,
+        abi::Errno::ECONNABORTED => io::ErrorKind::ConnectionAborted,
         _ => io::ErrorKind::Other,
     };
     io::Error::new(kind, OsCallError(error))

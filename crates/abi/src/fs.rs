@@ -55,6 +55,7 @@ pub enum FileType {
     Dir,
     Symlink,
     CharDevice,
+    Socket,
 }
 impl FileType {
     pub fn is_file(self) -> bool {
@@ -69,6 +70,9 @@ impl FileType {
     pub fn is_char_device(self) -> bool {
         self == FileType::CharDevice
     }
+    pub fn is_socket(self) -> bool {
+        self == FileType::Socket
+    }
     /// The `S_IFMT` bits of `st_mode`.
     pub fn mode(self) -> u32 {
         match self {
@@ -76,7 +80,12 @@ impl FileType {
             FileType::Dir => crate::S_IFDIR,
             FileType::Symlink => crate::S_IFLNK,
             FileType::CharDevice => crate::S_IFCHR,
+            FileType::Socket => crate::S_IFSOCK,
         }
+    }
+    /// Alias for [`Self::mode`].
+    pub fn mode_bits(self) -> u32 {
+        self.mode()
     }
 }
 
@@ -121,6 +130,9 @@ impl Metadata {
     }
     pub fn is_symlink(&self) -> bool {
         self.file_type.is_symlink()
+    }
+    pub fn is_socket(&self) -> bool {
+        self.file_type.is_socket()
     }
     /// `st_mode`: the type bits and the permission bits.
     pub fn st_mode(&self) -> u32 {

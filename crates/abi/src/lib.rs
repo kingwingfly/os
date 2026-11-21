@@ -17,6 +17,7 @@ pub mod contract;
 pub mod fs;
 pub mod local_helper;
 pub mod remote_fs;
+pub mod socket;
 pub mod system;
 pub mod volume;
 
@@ -69,6 +70,18 @@ pub enum Errno {
     ENOLCK,
     EDQUOT,
     EINTR,
+    EADDRINUSE,
+    EADDRNOTAVAIL,
+    EAFNOSUPPORT,
+    ECONNABORTED,
+    ECONNREFUSED,
+    ECONNRESET,
+    EISCONN,
+    EMSGSIZE,
+    ENOBUFS,
+    ENOTSOCK,
+    EPROTOTYPE,
+    ETOOMANYREFS,
 }
 impl Errno {
     /// What glibc's strerror says of it.
@@ -118,6 +131,18 @@ impl Errno {
             ENOLCK => "No locks available",
             EDQUOT => "Disk quota exceeded",
             EINTR => "Interrupted system call",
+            EADDRINUSE => "Address already in use",
+            EADDRNOTAVAIL => "Cannot assign requested address",
+            EAFNOSUPPORT => "Address family not supported by protocol",
+            ECONNABORTED => "Software caused connection abort",
+            ECONNREFUSED => "Connection refused",
+            ECONNRESET => "Connection reset by peer",
+            EISCONN => "Transport endpoint is already connected",
+            EMSGSIZE => "Message too long",
+            ENOBUFS => "No buffer space available",
+            ENOTSOCK => "Socket operation on non-socket",
+            EPROTOTYPE => "Protocol wrong type for socket",
+            ETOOMANYREFS => "Too many references: cannot splice",
         }
     }
 }
@@ -163,6 +188,7 @@ pub const S_IFREG: u32 = 0o100_000;
 pub const S_IFDIR: u32 = 0o040_000;
 pub const S_IFLNK: u32 = 0o120_000;
 pub const S_IFCHR: u32 = 0o020_000;
+pub const S_IFSOCK: u32 = 0o140_000;
 /// ... and its special and permission bits.
 pub const S_ISUID: u32 = 0o4000;
 pub const S_ISGID: u32 = 0o2000;
@@ -479,6 +505,9 @@ impl Stat {
     }
     pub fn is_device(&self) -> bool {
         self.kind() == S_IFCHR
+    }
+    pub fn is_socket(&self) -> bool {
+        self.kind() == S_IFSOCK
     }
     /// Its permission and special bits.
     pub fn perm(&self) -> u16 {

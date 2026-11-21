@@ -2569,10 +2569,6 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         name: &str,
         node: PermNode,
     ) -> Result<(u64, InodeItem)> {
-        let acls = Self::encode_perm_acls(&node)?;
-        self.maybe_backpressure_flush(1024).await?;
-        let (ino, generation) = self.alloc_ino();
-        let now = (self.clock)();
         let file_type = if node.directory {
             FileType::Dir
         } else if node.link.is_some() {
@@ -2582,6 +2578,22 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         } else {
             FileType::File
         };
+        self.add_node_in_dir_with_type(dir_ino, dir_item, name, node, file_type)
+            .await
+    }
+
+    async fn add_node_in_dir_with_type(
+        &self,
+        dir_ino: u64,
+        dir_item: &mut InodeItem,
+        name: &str,
+        node: PermNode,
+        file_type: FileType,
+    ) -> Result<(u64, InodeItem)> {
+        let acls = Self::encode_perm_acls(&node)?;
+        self.maybe_backpressure_flush(1024).await?;
+        let (ino, generation) = self.alloc_ino();
+        let now = (self.clock)();
         let nlink = if file_type == FileType::Dir { 2 } else { 1 };
         let item = InodeItem {
             file_type,
@@ -3058,6 +3070,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 if existing.file_type == FileType::Dir {
                     return Err(Errno::EISDIR);
                 }
+                if existing.file_type == FileType::Socket {
+                    return Err(Errno::ENXIO);
+                }
                 self.openable(cred, di.child_ino, &existing, options)
                     .await?;
                 if options.is_truncate() && existing.file_type == FileType::File {
@@ -3129,6 +3144,31 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             node.rdev = Some(rdev.to_string());
             let (ino, item) = self
                 .add_node_in_dir(dir_ino, &mut dir_item, name, node)
+                .await?;
+            Ok(self.entry_for(ino, &item))
+        })
+    }
+
+    fn mksock<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+    ) -> BoxFuture<'a, Entry> {
+        Box::pin(async move {
+            let _op = self.op_lock.lock().await;
+            self.check_rw()?;
+            let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
+            check_component(name)?;
+            let parent_perm = self.searchable(cred, dir_ino, &dir_item).await?;
+            if self.lookup_dir_item(dir_ino, name).await?.is_some() {
+                return Err(Errno::EEXIST);
+            }
+            inode::may_create(&cred.identity, &parent_perm, dir_item.nlink == 0)?;
+            let node = created(&cred.identity, &parent_perm, mode, false, cred.umask);
+            let (ino, item) = self
+                .add_node_in_dir_with_type(dir_ino, &mut dir_item, name, node, FileType::Socket)
                 .await?;
             Ok(self.entry_for(ino, &item))
         })
@@ -3576,6 +3616,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             };
             let (ino, mut item) = self.check_handle(handle).await?;
             let access = self.openable(cred, ino, &item, options).await?;
+            if access != Access::Path && item.file_type == FileType::Socket {
+                return Err(Errno::ENXIO);
+            }
             if access != Access::Path && options.is_truncate() && item.file_type == FileType::File {
                 let now = (self.clock)();
                 self.resize_file(ino, &mut item, 0, &cred.identity, now)

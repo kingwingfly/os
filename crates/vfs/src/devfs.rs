@@ -397,6 +397,15 @@ impl<D: DeviceBackend> Filesystem for DevTmpFs<D> {
     ) -> BoxFuture<'a, Entry> {
         self.inner.mknod(cred, dir, name, mode, rdev)
     }
+    fn mksock<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+    ) -> BoxFuture<'a, Entry> {
+        self.inner.mksock(cred, dir, name, mode)
+    }
     fn symlink<'a>(
         &'a self,
         cred: &'a Cred,

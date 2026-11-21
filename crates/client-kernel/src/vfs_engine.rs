@@ -72,20 +72,26 @@ pub(crate) fn vfs_js_err(errno: Errno, detail: impl Into<String>) -> JsValue {
     err.into()
 }
 
-fn map_errno(errno: Errno) -> JsValue {
+pub(crate) fn map_errno(errno: Errno) -> JsValue {
     let detail = crate::cloudfs::take_last_page_error_detail(errno).unwrap_or_default();
     vfs_js_err(errno, detail)
 }
 
-fn wasi_errno_num(errno: Errno) -> i32 {
+pub(crate) fn wasi_errno_num(errno: Errno) -> i32 {
     match errno {
         Errno::E2BIG => 1,
         Errno::EACCES => 2,
+        Errno::EADDRINUSE => 3,
+        Errno::EADDRNOTAVAIL => 4,
+        Errno::EAFNOSUPPORT => 5,
         Errno::EAGAIN => 6,
         Errno::EBADF => 8,
         Errno::EBUSY => 10,
         Errno::ECANCELED => 11,
         Errno::ECHILD => 12,
+        Errno::ECONNABORTED => 13,
+        Errno::ECONNREFUSED => 14,
+        Errno::ECONNRESET => 15,
         Errno::EDEADLK => 16,
         Errno::EDQUOT => 19,
         Errno::EEXIST => 20,
@@ -93,11 +99,14 @@ fn wasi_errno_num(errno: Errno) -> i32 {
         Errno::EINTR => 27,
         Errno::EINVAL => 28,
         Errno::EIO => 29,
+        Errno::EISCONN => 30,
         Errno::EISDIR => 31,
         Errno::ELOOP => 32,
         Errno::EMFILE => 33,
         Errno::EMLINK => 34,
+        Errno::EMSGSIZE => 35,
         Errno::ENAMETOOLONG => 37,
+        Errno::ENOBUFS => 42,
         Errno::ENODEV => 43,
         Errno::ENOENT => 44,
         Errno::ENOEXEC => 45,
@@ -107,6 +116,7 @@ fn wasi_errno_num(errno: Errno) -> i32 {
         Errno::ENOTCONN => 53,
         Errno::ENOTDIR => 54,
         Errno::ENOTEMPTY => 55,
+        Errno::ENOTSOCK => 57,
         Errno::EOPNOTSUPP => 58,
         Errno::ENOTTY => 59,
         Errno::ENXIO => 60,
@@ -115,6 +125,7 @@ fn wasi_errno_num(errno: Errno) -> i32 {
         Errno::EPERM => 63,
         Errno::EPIPE => 64,
         Errno::EPROTONOSUPPORT => 66,
+        Errno::EPROTOTYPE => 67,
         Errno::ERANGE => 68,
         Errno::EROFS => 69,
         Errno::ESRCH => 71,
@@ -122,10 +133,11 @@ fn wasi_errno_num(errno: Errno) -> i32 {
         Errno::ETIMEDOUT => 73,
         Errno::ETXTBSY => 74,
         Errno::EXDEV => 75,
+        Errno::ETOOMANYREFS => 109,
     }
 }
 
-fn json_to_js(val: &Value) -> Result<JsValue, JsValue> {
+pub(crate) fn json_to_js(val: &Value) -> Result<JsValue, JsValue> {
     let text = serde_json::to_string(val).map_err(|e| vfs_js_err(Errno::EIO, e.to_string()))?;
     js_sys::JSON::parse(&text).map_err(|_| vfs_js_err(Errno::EIO, "JSON parse failed"))
 }
@@ -547,6 +559,7 @@ fn proc_file_type_from_mode(mode: u32) -> FileType {
         abi::S_IFDIR => FileType::Dir,
         abi::S_IFLNK => FileType::Symlink,
         abi::S_IFCHR => FileType::CharDevice,
+        abi::S_IFSOCK => FileType::Socket,
         _ => FileType::File,
     }
 }
@@ -1702,8 +1715,11 @@ impl SessionVfs {
 #[derive(Clone)]
 pub(crate) struct ServerFdEntry {
     pub(crate) sfd: Rc<u32>,
-    closing: bool,
+    pub(crate) closing: bool,
     pub(crate) cloexec: bool,
+    /// When transferred over `SCM_RIGHTS` (`U-10`), pins this single fd to the sender's
+    /// originating `(owner_pid, token)` without granting the receiver broader cloud scope.
+    pub(crate) attenuated_token: Option<(u32, String)>,
 }
 
 pub(crate) struct ProcessVfsMeta {
@@ -1714,6 +1730,8 @@ pub(crate) struct ProcessVfsMeta {
     pub(crate) cred: Cred,
     pub(crate) server_fds: HashMap<u32, ServerFdEntry>,
     pub(crate) next_server_fd: u32,
+    /// Single-fd `CloudFs` open refs received via `SCM_RIGHTS` (`kfd -> (origin_pid, origin_token)`).
+    pub(crate) attenuated_kfds: HashMap<u32, (u32, Option<String>)>,
 }
 
 impl ProcessVfsMeta {
@@ -1730,10 +1748,20 @@ impl ProcessVfsMeta {
             cred,
             server_fds: HashMap::new(),
             next_server_fd: SERVER_DEV_FD_BASE,
+            attenuated_kfds: HashMap::new(),
         }
     }
 
-    fn alloc_server_fd(&mut self, sfd: Rc<u32>, cloexec: bool) -> vfs::Result<u32> {
+    pub(crate) fn alloc_server_fd(&mut self, sfd: Rc<u32>, cloexec: bool) -> vfs::Result<u32> {
+        self.alloc_server_fd_with_attenuation(sfd, cloexec, None)
+    }
+
+    pub(crate) fn alloc_server_fd_with_attenuation(
+        &mut self,
+        sfd: Rc<u32>,
+        cloexec: bool,
+        attenuated_token: Option<(u32, String)>,
+    ) -> vfs::Result<u32> {
         if self.server_fds.len() >= 1024 {
             return Err(Errno::EMFILE);
         }
@@ -1757,6 +1785,7 @@ impl ProcessVfsMeta {
                         sfd,
                         cloexec,
                         closing: false,
+                        attenuated_token,
                     },
                 );
                 return Ok(candidate);
@@ -1836,6 +1865,7 @@ pub(crate) struct VfsRuntime {
     read_streams: HashMap<u32, ReadStreamEntry>,
     next_read_stream: u32,
     pub(crate) lock_waits: HashMap<(u32, u32), Rc<LockCancel>>,
+    pub(crate) unix_sock: Rc<RefCell<vfs::unix_sock::UnixSocketTable>>,
     pub(crate) uid_names: HashMap<u32, String>,
     pub(crate) gid_names: HashMap<u32, String>,
     next_tmp_id: u64,
@@ -2217,6 +2247,7 @@ impl VfsRuntime {
             read_streams: HashMap::new(),
             next_read_stream: 1,
             lock_waits: HashMap::new(),
+            unix_sock: Rc::new(RefCell::new(vfs::unix_sock::UnixSocketTable::new())),
             uid_names: default_uid_names(),
             gid_names: default_gid_names(),
             next_tmp_id: 100,
@@ -2274,7 +2305,7 @@ impl VfsRuntime {
     }
 }
 
-struct RootCloudScope<F> {
+pub(crate) struct RootCloudScope<F> {
     active_pid_cell: Rc<Cell<Option<u32>>>,
     page_sudo_cell: Rc<Cell<bool>>,
     active_pid: Option<u32>,
@@ -2626,7 +2657,7 @@ impl Kernel {
         fd: u32,
         discard: bool,
     ) -> Result<Value, abi::Error> {
-        let sfd = {
+        let (sfd, attenuated) = {
             let mut rt = self.vfs_rt.borrow_mut();
             let table = &mut rt.proc_meta.get_mut(&pid).ok_or(Errno::EBADF)?.server_fds;
             let entry = table
@@ -2638,7 +2669,7 @@ impl Kernel {
                 return Ok(Value::Null);
             }
             entry.closing = true;
-            *entry.sfd
+            (*entry.sfd, entry.attenuated_token.clone())
         };
         let remote = FdRef::Fd(sfd);
         let call = if discard {
@@ -2646,9 +2677,16 @@ impl Kernel {
         } else {
             Call::Close { fd: remote }
         };
-        let result = self
-            .with_proc_scope(pid, self.forward_server_call(pid, false, call))
-            .await;
+        let result = match attenuated {
+            Some((owner_pid, owner_tok)) => {
+                self.forward_server_call_attenuated(owner_pid, &owner_tok, call)
+                    .await
+            }
+            None => {
+                self.with_proc_scope(pid, self.forward_server_call(pid, false, call))
+                    .await
+            }
+        };
         if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
             if result.is_ok() || result.as_ref().is_err_and(|e| e.errno == Errno::EBADF) {
                 meta.server_fds.remove(&fd);
@@ -2661,7 +2699,7 @@ impl Kernel {
 
     pub(crate) async fn vfs_process_exit_cleanup(&self, pid: u32, _token: Option<String>) {
         self.close_process_server_fds(pid).await;
-        let (vfs, root_cloud, waits) = {
+        let (vfs, root_cloud, waits, unix_sock) = {
             let mut rt = self.vfs_rt.borrow_mut();
             rt.proc_meta.remove(&pid);
             let keys: Vec<(u32, u32)> = rt
@@ -2674,8 +2712,16 @@ impl Kernel {
                 .into_iter()
                 .filter_map(|k| rt.lock_waits.remove(&k))
                 .collect();
-            (rt.vfs.clone(), Rc::clone(&rt.root_cloud), waits)
+            (
+                rt.vfs.clone(),
+                Rc::clone(&rt.root_cloud),
+                waits,
+                Rc::clone(&rt.unix_sock),
+            )
         };
+        let sock_cleanup = unix_sock.borrow_mut().release_process(pid);
+        self.dispose_unix_sock_dropped_fds(sock_cleanup.dropped_fds)
+            .await;
         for w in waits {
             w.cancel();
         }
@@ -2828,14 +2874,58 @@ impl Kernel {
         }
     }
 
-    fn with_proc_scope<F>(&self, pid: u32, fut: F) -> RootCloudScope<F>
+    pub(crate) fn with_proc_scope<F>(&self, pid: u32, fut: F) -> RootCloudScope<F>
     where
         F: std::future::Future,
     {
         self.with_root_cloud_scope(Some(pid), false, fut)
     }
 
-    async fn with_proc_scope_retry<T, F, Fut>(&self, pid: u32, mut make: F) -> vfs::Result<T>
+    /// Resolve which PID's `RootCloudDriver` scope should execute a single-fd `kfd_*` I/O call.
+    /// Ordinarily returns `pid`. For a `CloudFs` open reference transferred over `SCM_RIGHTS`
+    /// (`U-10`) to a receiver without cloud scope, permits ONLY single-fd I/O under the
+    /// originating sender's scope while the sender's originating token remains active and unrevoked.
+    pub(crate) fn scope_pid_for_kfd(&self, pid: u32, kfd: u32) -> vfs::Result<u32> {
+        let attenuated = {
+            let rt = self.vfs_rt.borrow();
+            let Some(meta) = rt.proc_meta.get(&pid) else {
+                return Ok(pid);
+            };
+            meta.attenuated_kfds.get(&kfd).cloned()
+        };
+        let Some((origin_pid, origin_token)) = attenuated else {
+            return Ok(pid);
+        };
+        let state = self.state.borrow();
+        if let Some(ref tok) = origin_token {
+            if state.pending_revocations.contains(tok) {
+                return Err(Errno::EACCES);
+            }
+            let valid_owner = state.table.proc(origin_pid).is_some_and(|p| {
+                p.state != abi::ProcState::Zombie
+                    && p.cred.cloud_access
+                    && p.cred.remote.as_ref().is_some_and(|r| r.token == *tok)
+            });
+            if !valid_owner {
+                return Err(Errno::EACCES);
+            }
+        } else {
+            let valid_owner = state
+                .table
+                .proc(origin_pid)
+                .is_some_and(|p| p.state != abi::ProcState::Zombie && p.cred.cloud_access);
+            if !valid_owner {
+                return Err(Errno::EACCES);
+            }
+        }
+        Ok(origin_pid)
+    }
+
+    pub(crate) async fn with_proc_scope_retry<T, F, Fut>(
+        &self,
+        pid: u32,
+        mut make: F,
+    ) -> vfs::Result<T>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = vfs::Result<T>>,
@@ -5055,6 +5145,7 @@ impl Kernel {
                     .map(|(&fd, e)| (fd, e.clone()))
                     .collect(),
                 next_server_fd: m.next_server_fd,
+                attenuated_kfds: m.attenuated_kfds.clone(),
             });
             (rt.vfs.clone(), Rc::clone(&rt.root_cloud), meta)
         };
@@ -5179,7 +5270,7 @@ impl Kernel {
 
     pub async fn proc_exit(&self, pid: u32) -> Result<(), JsValue> {
         self.close_process_server_fds(pid).await;
-        let (vfs, root_cloud, waits) = {
+        let (vfs, root_cloud, waits, unix_sock) = {
             let mut rt = self.vfs_rt.borrow_mut();
             rt.proc_meta.remove(&pid);
             let keys: Vec<(u32, u32)> = rt
@@ -5192,8 +5283,16 @@ impl Kernel {
                 .into_iter()
                 .filter_map(|k| rt.lock_waits.remove(&k))
                 .collect();
-            (rt.vfs.clone(), Rc::clone(&rt.root_cloud), waits)
+            (
+                rt.vfs.clone(),
+                Rc::clone(&rt.root_cloud),
+                waits,
+                Rc::clone(&rt.unix_sock),
+            )
         };
+        let sock_cleanup = unix_sock.borrow_mut().release_process(pid);
+        self.dispose_unix_sock_dropped_fds(sock_cleanup.dropped_fds)
+            .await;
         for w in waits {
             w.cancel();
         }
@@ -5794,11 +5893,12 @@ impl Kernel {
     }
 
     pub async fn kfd_read(&self, pid: u32, kfd: u32, len: u32) -> Result<Vec<u8>, JsValue> {
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let cap = (len as usize).min(abi::remote_fs::DATA_MAX as usize);
         let mut buf = vec![0u8; cap];
         let n = self
-            .with_proc_scope(pid, async { vfs.read(pid, kfd, &mut buf).await })
+            .with_proc_scope(scope_pid, async { vfs.read(pid, kfd, &mut buf).await })
             .await
             .map_err(map_errno)?;
         buf.truncate(n);
@@ -5806,9 +5906,10 @@ impl Kernel {
     }
 
     pub async fn kfd_write(&self, pid: u32, kfd: u32, data: &[u8]) -> Result<u32, JsValue> {
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let n = self
-            .with_proc_scope(pid, async { vfs.write(pid, kfd, data).await })
+            .with_proc_scope(scope_pid, async { vfs.write(pid, kfd, data).await })
             .await
             .map_err(map_errno)?;
         Ok(n as u32)
@@ -5821,11 +5922,14 @@ impl Kernel {
         len: u32,
         offset: u64,
     ) -> Result<Vec<u8>, JsValue> {
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let cap = (len as usize).min(abi::remote_fs::DATA_MAX as usize);
         let mut buf = vec![0u8; cap];
         let n = self
-            .with_proc_scope(pid, async { vfs.pread(pid, kfd, &mut buf, offset).await })
+            .with_proc_scope(scope_pid, async {
+                vfs.pread(pid, kfd, &mut buf, offset).await
+            })
             .await
             .map_err(map_errno)?;
         buf.truncate(n);
@@ -5839,9 +5943,12 @@ impl Kernel {
         data: &[u8],
         offset: u64,
     ) -> Result<u32, JsValue> {
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let n = self
-            .with_proc_scope(pid, async { vfs.pwrite(pid, kfd, data, offset).await })
+            .with_proc_scope(scope_pid, async {
+                vfs.pwrite(pid, kfd, data, offset).await
+            })
             .await
             .map_err(map_errno)?;
         Ok(n as u32)
@@ -5860,8 +5967,9 @@ impl Kernel {
             2 => SeekFrom::End(offset),
             _ => return Err(map_errno(Errno::EINVAL)),
         };
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move { vfs.lseek(pid, kfd, from).await })
+        self.with_proc_scope(scope_pid, async move { vfs.lseek(pid, kfd, from).await })
             .await
             .map_err(map_errno)
     }
@@ -5882,6 +5990,7 @@ impl Kernel {
                         FileType::Dir => "dir",
                         FileType::Symlink => "symlink",
                         FileType::CharDevice => "char",
+                        FileType::Socket => "socket",
                         FileType::File => "file",
                     },
                 })
@@ -5891,9 +6000,10 @@ impl Kernel {
     }
 
     pub async fn kfd_fstat(&self, pid: u32, kfd: u32) -> Result<JsValue, JsValue> {
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let mut st = self
-            .with_proc_scope(pid, async move { vfs.fstat(pid, kfd).await })
+            .with_proc_scope(scope_pid, async move { vfs.fstat(pid, kfd).await })
             .await
             .map_err(map_errno)?;
         let vfs_for_names = self.vfs_rt.borrow().vfs.clone();
@@ -6141,8 +6251,12 @@ impl Kernel {
                 .map(|_| ())
                 .map_err(|e| map_errno(e.errno));
         }
+        let scope_pid = self.scope_pid_for_kfd(pid, kfd).unwrap_or(pid);
+        if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+            meta.attenuated_kfds.remove(&kfd);
+        }
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move { vfs.close(pid, kfd).await })
+        self.with_proc_scope(scope_pid, async move { vfs.close(pid, kfd).await })
             .await
             .map_err(map_errno)
     }
@@ -8084,6 +8198,108 @@ impl Kernel {
         results
     }
 
+    fn resolve_process_server_fd_entry(
+        &self,
+        pid: u32,
+        vfd: u32,
+    ) -> std::result::Result<(u32, Option<(u32, String)>), abi::Error> {
+        let rt = self.vfs_rt.borrow();
+        rt.proc_meta
+            .get(&pid)
+            .and_then(|m| {
+                m.server_fds
+                    .get(&vfd)
+                    .filter(|e| !e.closing)
+                    .map(|e| (*e.sfd, e.attenuated_token.clone()))
+            })
+            .ok_or_else(|| Errno::EBADF.into())
+    }
+
+    pub(crate) async fn forward_server_call_attenuated(
+        &self,
+        owner_pid: u32,
+        owner_token: &str,
+        call: Call,
+    ) -> std::result::Result<Value, abi::Error> {
+        // Verify originating token has NOT been revoked locally (e.g. privilege drop / exit / sign-out).
+        let (instance_id, revoked_or_gone) = {
+            let state = self.state.borrow();
+            let gone = state.pending_revocations.iter().any(|t| t == owner_token)
+                || !state.table.proc(owner_pid).is_some_and(|p| {
+                    p.state != abi::ProcState::Zombie
+                        && p.cred.cloud_access
+                        && p.cred
+                            .remote
+                            .as_ref()
+                            .is_some_and(|r| r.token == owner_token)
+                });
+            (state.instance_id.clone(), gone)
+        };
+        if revoked_or_gone {
+            return Err(Errno::EACCES.into());
+        }
+        let fs_session = self.vfs_rt.borrow().root_cloud.current_fs_session();
+        let batch = Batch {
+            calls: vec![call],
+            umask: None,
+            sudo: false,
+            pid: Some(owner_pid),
+            process: Some(owner_token.to_string()),
+        };
+        let Ok((global, post)) = installed("cloudFsPost") else {
+            return Err(Errno::ENOTCONN.into());
+        };
+        let body = serde_json::to_vec(&batch)
+            .map_err(|e| abi::Error::because(Errno::EIO, e.to_string()))?;
+        let headers = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&headers, &"Content-Type".into(), &"application/json".into());
+        js_sys::Reflect::set(&headers, &"X-Process-Token".into(), &owner_token.into())
+            .map_err(|_| Errno::EIO)?;
+        if !instance_id.is_empty() {
+            js_sys::Reflect::set(&headers, &"X-OS-Instance".into(), &instance_id.into())
+                .map_err(|_| Errno::EIO)?;
+        }
+        if let Some((ref sid, ref secret)) = fs_session
+            && !sid.is_empty()
+            && !secret.is_empty()
+        {
+            let _ = js_sys::Reflect::set(&headers, &"X-Fs-Session".into(), &sid.into());
+            let _ = js_sys::Reflect::set(&headers, &"X-Fs-Secret".into(), &secret.into());
+        }
+        let arr = js_sys::Uint8Array::from(body.as_slice());
+        let answer = post
+            .call3(&global, &"/api/sys".into(), &headers, &arr)
+            .map_err(|_| abi::Error::from(Errno::EIO))?;
+        let reply = promised(answer).await?;
+        let status = js_sys::Reflect::get(&reply, &"status".into())
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as u16;
+        let raw = js_sys::Reflect::get(&reply, &"body".into())
+            .map_err(|_| abi::Error::from(Errno::EIO))?;
+        let bytes = js_sys::Uint8Array::new(&raw).to_vec();
+        if status != 200 {
+            let text = String::from_utf8_lossy(&bytes);
+            if let Ok(err_val) = serde_json::from_str::<Value>(&text)
+                && let Some(code) = err_val["errno"].as_str()
+                && let Ok(parsed) = serde_json::from_value::<Errno>(Value::String(code.to_string()))
+            {
+                return Err(abi::Error::because(
+                    parsed,
+                    err_val["error"].as_str().unwrap_or(""),
+                ));
+            }
+            return Err(abi::Error::because(Errno::EIO, text.into_owned()));
+        }
+        let res: abi::Results = serde_json::from_slice(&bytes)
+            .map_err(|e| abi::Error::because(Errno::EIO, e.to_string()))?;
+        res.results
+            .into_iter()
+            .next()
+            .ok_or_else(|| abi::Error::from(Errno::EIO))?
+            .into_result()
+    }
+
     fn resolve_process_server_fd(
         &self,
         pid: u32,
@@ -8970,19 +9186,20 @@ impl Kernel {
                 .await;
         }
         if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
-            let sfd = self.resolve_process_server_fd(pid, raw_fd)?;
-            return self
-                .forward_server_call(
-                    pid,
-                    page_sudo,
-                    Call::Pread {
-                        fd: Some(FdRef::Fd(sfd)),
-                        path: None,
-                        offset,
-                        count,
-                    },
-                )
-                .await;
+            let (sfd, attenuated) = self.resolve_process_server_fd_entry(pid, raw_fd)?;
+            let call = Call::Pread {
+                fd: Some(FdRef::Fd(sfd)),
+                path: None,
+                offset,
+                count,
+            };
+            return match attenuated {
+                Some((owner_pid, owner_tok)) => {
+                    self.forward_server_call_attenuated(owner_pid, &owner_tok, call)
+                        .await
+                }
+                None => self.forward_server_call(pid, page_sudo, call).await,
+            };
         }
         if let Ok(fds) = vfs.process_fds(pid)
             && let Ok(file) = {
@@ -9036,18 +9253,19 @@ impl Kernel {
                 .await;
         }
         if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
-            let sfd = self.resolve_process_server_fd(pid, raw_fd)?;
-            return self
-                .forward_server_call(
-                    pid,
-                    page_sudo,
-                    Call::Pwrite {
-                        fd: FdRef::Fd(sfd),
-                        index,
-                        data: Bytes(data),
-                    },
-                )
-                .await;
+            let (sfd, attenuated) = self.resolve_process_server_fd_entry(pid, raw_fd)?;
+            let call = Call::Pwrite {
+                fd: FdRef::Fd(sfd),
+                index,
+                data: Bytes(data),
+            };
+            return match attenuated {
+                Some((owner_pid, owner_tok)) => {
+                    self.forward_server_call_attenuated(owner_pid, &owner_tok, call)
+                        .await
+                }
+                None => self.forward_server_call(pid, page_sudo, call).await,
+            };
         }
         if let Ok(fds) = vfs.process_fds(pid)
             && fds.borrow().get(raw_fd).is_ok()
@@ -9153,11 +9371,12 @@ impl Kernel {
         //    client descriptors (`kfd`, `OS_FD_CWD`, `OS_FD_ROOT`) into `PathAt.open` (`OpenRef`)
         //    for `CloudFs`, or a temporary server `O_PATH | O_DIRECTORY` fd for system `/usr`
         //    `ImageFs` directories!
-        let target_fd = if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
-            self.resolve_process_server_fd(pid, raw_fd)?
-        } else {
-            raw_fd
-        };
+        let (target_fd, attenuated_dev) =
+            if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
+                self.resolve_process_server_fd_entry(pid, raw_fd)?
+            } else {
+                (raw_fd, None)
+            };
         let mut temp_usr_fds: Vec<u32> = Vec::new();
         let ioctl_res = async {
             if request == accelerator::SUBMIT {
@@ -9236,16 +9455,18 @@ impl Kernel {
                 arg = serde_json::to_value(submit).map_err(|_| abi::Error::from(Errno::EIO))?;
             }
 
-            self.forward_server_call(
-                pid,
-                page_sudo,
-                Call::Ioctl {
-                    fd: FdRef::Fd(target_fd),
-                    request,
-                    arg,
-                },
-            )
-            .await
+            let ioctl_call = Call::Ioctl {
+                fd: FdRef::Fd(target_fd),
+                request,
+                arg,
+            };
+            match &attenuated_dev {
+                Some((owner_pid, owner_tok)) => {
+                    self.forward_server_call_attenuated(*owner_pid, owner_tok, ioctl_call)
+                        .await
+                }
+                None => self.forward_server_call(pid, page_sudo, ioctl_call).await,
+            }
         }
         .await;
         for sfd in temp_usr_fds {

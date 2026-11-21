@@ -2508,6 +2508,9 @@ impl Vfs {
                     {
                         return Err(Errno::EISDIR);
                     }
+                    if access != Access::Path && entry.metadata.is_socket() {
+                        return Err(Errno::ENXIO);
+                    }
                     let is_char_dev = entry.metadata.file_type == FileType::CharDevice;
                     let wants_write =
                         access != Access::Path && (access.writes() || options.is_truncate());
@@ -2739,7 +2742,10 @@ impl Vfs {
                 return Ok(());
             }
             if mode & abi::W_OK != 0
-                && entry.metadata.file_type != FileType::CharDevice
+                && !matches!(
+                    entry.metadata.file_type,
+                    FileType::CharDevice | FileType::Socket
+                )
                 && pin.effective_rdonly()
             {
                 return Err(Errno::EROFS);
@@ -2767,6 +2773,9 @@ impl Vfs {
             };
             if !entry.metadata.acl {
                 inode::require(&cred.identity, &node, mode)
+            } else if entry.metadata.is_socket() {
+                self.check_acl_permission(&cred, &pin, &entry.handle, &node, mode)
+                    .await
             } else {
                 // Delegate ACL-bearing permission evaluation to the authoritative driver.
                 if mode & abi::R_OK != 0 {
@@ -3007,6 +3016,146 @@ impl Vfs {
             }
         })
         .await
+    }
+
+    async fn check_acl_permission(
+        &self,
+        cred: &Cred,
+        pin: &MountPin,
+        handle: &Handle,
+        base_node: &os_core::permissions::Node,
+        mode: u16,
+    ) -> Result<()> {
+        let root_cred = Cred {
+            identity: os_core::permissions::Identity::root(),
+            ..cred.clone()
+        };
+        let raw = pin
+            .guard_op(
+                &root_cred,
+                false,
+                false,
+                pin.fs().getxattr(&root_cred, handle, abi::ACL_ACCESS),
+            )
+            .await?;
+        let entries: os_core::acl::Entries =
+            serde_json::from_slice(&raw).map_err(|_| Errno::EIO)?;
+        let (acl_mode, acl_ext) = entries.split();
+        let mut acl_node = base_node.clone();
+        acl_node.mode = (acl_node.mode & !0o777) | acl_mode;
+        acl_node.acl = acl_ext;
+        inode::require(&cred.identity, &acl_node, mode)
+    }
+
+    /// Create a Unix-domain socket inode (`S_IFSOCK`, `FileType::Socket`) in `pid`'s mount
+    /// namespace and `chroot`, enforcing parent directory write+search permissions and `EROFS`.
+    pub async fn mksockat(
+        &self,
+        pid: u32,
+        anchor: StartAnchor,
+        path: &str,
+        mode: u16,
+    ) -> Result<Entry> {
+        self.with_caller(pid, async move {
+            let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
+            let ctx_snap = fs_ctx.borrow().clone();
+            let bridge: &dyn ProcBridge = &*self.inner;
+            match walk_parent(&cred, &ns, &ctx_snap, &fds, Some(bridge), &anchor, path).await? {
+                ParentResolution::Root { .. } | ParentResolution::DotOrDotDot { .. } => {
+                    Err(Errno::EEXIST)
+                }
+                ParentResolution::Child(t) => {
+                    if t.trailing_slash {
+                        return Err(Errno::ENOENT);
+                    }
+                    if t.parent_pin.effective_rdonly() {
+                        return Err(Errno::EROFS);
+                    }
+                    let entry = t
+                        .parent_pin
+                        .guard_op(
+                            &cred,
+                            true,
+                            true,
+                            t.parent_pin
+                                .fs()
+                                .mksock(&cred, &t.parent.handle, &t.name, mode),
+                        )
+                        .await?;
+                    self.sync_dir_if_needed(&cred, &t.parent_pin, &t.parent.handle)
+                        .await?;
+                    Ok(entry)
+                }
+            }
+        })
+        .await
+    }
+
+    /// Resolve a socket pathname for `connect(2)` or `sendto(2)` in `pid`'s mount namespace and
+    /// `chroot`, verifying the target is a `FileType::Socket` inode (`ECONNREFUSED` otherwise) and
+    /// enforcing DAC + POSIX ACL write permission (`W_OK`, returning `EACCES` if denied).
+    pub async fn resolve_socket_inode(
+        &self,
+        pid: u32,
+        anchor: StartAnchor,
+        path: &str,
+    ) -> Result<Entry> {
+        self.with_caller(pid, async move {
+            let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
+            let ctx_snap = fs_ctx.borrow().clone();
+            let bridge: &dyn ProcBridge = &*self.inner;
+            let resolved = walk(
+                &cred,
+                &ns,
+                &ctx_snap,
+                &fds,
+                Some(bridge),
+                &anchor,
+                path,
+                WalkFlags::FOLLOW_LAST,
+            )
+            .await?;
+            let WalkResult::Found { pin, entry, .. } = resolved else {
+                return Err(Errno::ENOENT);
+            };
+            if !entry.metadata.is_socket() {
+                return Err(Errno::ECONNREFUSED);
+            }
+            let node = os_core::permissions::Node {
+                ino: entry.handle.node.ino,
+                directory: false,
+                owner: entry.metadata.uid,
+                group: entry.metadata.gid,
+                mode: entry.metadata.mode,
+                links: entry.metadata.nlink,
+                size: entry.metadata.size,
+                file: None,
+                rdev: None,
+                link: None,
+                acl: None,
+                default_acl: None,
+            };
+            if !entry.metadata.acl {
+                inode::require(&cred.identity, &node, abi::W_OK)?;
+            } else {
+                self.check_acl_permission(&cred, &pin, &entry.handle, &node, abi::W_OK)
+                    .await?;
+            }
+            Ok(entry)
+        })
+        .await
+    }
+
+    /// Borrow a cloned open file description (`FileRef`) from `pid`'s fd table (`SCM_RIGHTS` send).
+    pub fn get_file(&self, pid: u32, fd: Fd) -> Result<FileRef> {
+        let fds = self.process_fds(pid)?;
+        fds.borrow().get(fd)
+    }
+
+    /// Install an existing open file description (`FileRef`) into `pid`'s fd table (`SCM_RIGHTS` recv).
+    pub fn insert_file(&self, pid: u32, file: FileRef, cloexec: bool) -> Result<Fd> {
+        let fds = self.process_fds(pid)?;
+        fds.borrow_mut().insert(file, cloexec)
     }
 
     pub async fn symlinkat(

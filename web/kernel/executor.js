@@ -39,6 +39,7 @@ export async function request(type, args, send, seatChanged = () => {}) {
   if (type.startsWith('seat_')) throw { errno: 'ENOSYS', detail: 'unsupported seat request' };
   if (type === 'deliver_signal') return deliverSignal(args);
   if (type === 'reconcile') return reconcile();
+  if (type === 'run_sock_stats') return globalThis.kernel?.sock_stats?.() ?? null;
   if (type === 'console_close') return consoles.close(String(args.terminalId));
   if (type === 'console_grant') {
     const run = consoles.entries.get(String(args.terminalId))?.active;
