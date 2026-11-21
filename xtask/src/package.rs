@@ -194,8 +194,38 @@ pub fn tree(root: &Path, kind: Kind, name: &str, revision: &str, out: &Path) -> 
     replace(&out.join("manifest.json"), &serde_json::to_vec(&manifest)?)?;
     Ok(id)
 }
-/// Stage 1 `Initramfs` image: `/init`, `/bin/mount`, `/bin/switch_root`, `/bin/cowfsck`,
-/// `/bin/sh` backed by built WASI applet bundles (`init.wasm`, `utilities.wasm`, `dash.wasm`).
+/// Resolve the Stage 1 `early_init` Wasm binary for `Initramfs`'s `/init`.
+///
+/// Prefers `assets/usr/bin/early_init.wasm` when explicitly bundled, then falls back to the
+/// workspace Cargo `wasm32-wasip1/release/early_init.wasm` artifact produced alongside `init.wasm`
+/// during real `cargo xtask build` runs, and finally falls back to `assets/usr/bin/init.wasm` for
+/// self-contained synthetic packaging fixtures.
+fn resolve_early_init_wasm(assets: &Path) -> Result<Vec<u8>> {
+    let explicit = assets.join("usr/bin/early_init.wasm");
+    if explicit.exists() {
+        return read_regular(&explicit);
+    }
+    let fallback = read_regular(&assets.join("usr/bin/init.wasm"))?;
+    if fallback.len() > 8 {
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .map(|root| root.join("target"))
+            });
+        if let Some(dir) = target_dir {
+            let compiled = dir.join("wasm32-wasip1/release/early_init.wasm");
+            if compiled.exists() {
+                return read_regular(&compiled);
+            }
+        }
+    }
+    Ok(fallback)
+}
+
+/// Stage 1 `Initramfs` image: `/init` (`early_init.wasm`), `/bin/mount`, `/bin/switch_root`,
+/// `/bin/cowfsck`, `/bin/sh` backed by built WASI applet bundles.
 fn initramfs(assets: &Path, out: &Path, name: &str) -> Result<Image> {
     let mut entries = vec![
         directory("/"),
@@ -211,7 +241,7 @@ fn initramfs(assets: &Path, out: &Path, name: &str) -> Result<Image> {
             uid: 0,
             gid: 0,
             mode: 0o755,
-            node: blob(out, &read_regular(&assets.join("usr/bin/init.wasm"))?)?,
+            node: blob(out, &resolve_early_init_wasm(assets)?)?,
         },
         Entry {
             path: "/bin/utilities".into(),
@@ -260,7 +290,7 @@ fn root_template(out: &Path, name: &str) -> Result<Image> {
         directory("/dev/pts"),
         directory("/etc"),
         directory("/home"),
-        directory_mode("/home/user", 1000, 1000, 0o755),
+        directory_mode("/home/user", 1000, 1000, 0o750),
         directory("/mnt"),
         directory("/mnt/local"),
         directory("/mnt/shared"),
@@ -283,7 +313,7 @@ fn root_template(out: &Path, name: &str) -> Result<Image> {
         (
             "/etc/passwd",
             0o644,
-            b"root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:Local User:/home/user:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/false\n",
+            b"root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:Local User:/home/user:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n",
         ),
         (
             "/etc/group",
@@ -782,5 +812,65 @@ mod tests {
             h.join().unwrap();
         }
         let _ = fs::remove_dir_all(dir.as_ref());
+    }
+
+    #[test]
+    fn initramfs_packs_early_init_and_root_template_enforces_exact_account_modes() {
+        let dir = std::env::temp_dir().join(format!("os-xtask-stage1-pkg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let assets = dir.join("assets");
+        let out = dir.join("out");
+        fs::create_dir_all(assets.join("usr/bin")).unwrap();
+        let early_bytes = b"\0asm\x01\0\0\0early-init-stage1";
+        let main_init_bytes = b"\0asm\x01\0\0\0main-init-stage2";
+        fs::write(assets.join("usr/bin/early_init.wasm"), early_bytes).unwrap();
+        fs::write(assets.join("usr/bin/init.wasm"), main_init_bytes).unwrap();
+        fs::write(
+            assets.join("usr/bin/utilities.wasm"),
+            b"\0asm\x01\0\0\0utils",
+        )
+        .unwrap();
+        fs::write(assets.join("usr/bin/dash.wasm"), b"\0asm\x01\0\0\0dash").unwrap();
+
+        let initramfs_img = super::initramfs(&assets, &out, "stage1-test").unwrap();
+        let init_entry = initramfs_img
+            .entries
+            .iter()
+            .find(|e| e.path == "/init")
+            .expect("/init entry");
+        assert_eq!(init_entry.mode, 0o755);
+        match &init_entry.node {
+            os_image::Node::File { sha256, .. } => {
+                assert_eq!(sha256, &os_image::digest(early_bytes));
+            }
+            other => panic!("expected file node for /init, got {other:?}"),
+        }
+
+        let tpl = super::root_template(&out, "stage1-test").unwrap();
+        let find = |p: &str| tpl.entries.iter().find(|e| e.path == p).expect(p);
+
+        let passwd = find("/etc/passwd");
+        assert_eq!((passwd.uid, passwd.gid, passwd.mode), (0, 0, 0o644));
+        let group = find("/etc/group");
+        assert_eq!((group.uid, group.gid, group.mode), (0, 0, 0o644));
+        let shadow = find("/etc/shadow");
+        assert_eq!((shadow.uid, shadow.gid, shadow.mode), (0, 0, 0o600));
+        let sudoers = find("/etc/sudoers");
+        assert_eq!((sudoers.uid, sudoers.gid, sudoers.mode), (0, 0, 0o440));
+        if let os_image::Node::File { sha256, .. } = &sudoers.node {
+            let text = fs::read_to_string(out.join("blobs").join(sha256)).unwrap();
+            assert!(text.contains("%wheel ALL=(ALL:ALL) NOPASSWD: ALL"));
+        } else {
+            panic!("expected file node for /etc/sudoers");
+        }
+        let home_user = find("/home/user");
+        assert_eq!(
+            (home_user.uid, home_user.gid, home_user.mode),
+            (1000, 1000, 0o750)
+        );
+        let root_dir = find("/root");
+        assert_eq!((root_dir.uid, root_dir.gid, root_dir.mode), (0, 0, 0o700));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

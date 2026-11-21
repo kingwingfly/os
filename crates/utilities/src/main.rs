@@ -5,10 +5,12 @@ use os_userland::{Io, Sys};
 use std::io::{self, BufRead, Write};
 mod accelerator;
 mod chroot;
+mod cowfsck;
 mod findmnt;
 mod imagectl;
 mod mount;
 mod providerctl;
+mod switch_root;
 mod xargs;
 
 struct Os;
@@ -106,6 +108,12 @@ fn main() {
     }
     if args[0] == "chroot" {
         std::process::exit(chroot::run(&args[1..]));
+    }
+    if args[0] == "switch_root" {
+        std::process::exit(switch_root::run(&args[1..]));
+    }
+    if args[0] == "cowfsck" {
+        std::process::exit(cowfsck::run(&args[1..]));
     }
     if cli::wants_help(&args)
         && let Some(help) = cli::help(&args[0])
