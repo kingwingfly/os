@@ -1,3 +1,5 @@
+#[allow(dead_code)]
+pub mod cloud_panel;
 mod console;
 mod desktop;
 mod files;

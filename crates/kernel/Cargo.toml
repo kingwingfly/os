@@ -8,3 +8,6 @@ serde.workspace = true
 serde_json.workspace = true
 abi = { package = "os-abi", path = "../abi" }
 os-core = { path = "../core" }
+hmac = "0.13"
+sha2 = "0.11"
+base64 = "0.23"
