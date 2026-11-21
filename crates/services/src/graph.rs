@@ -183,21 +183,26 @@ impl UnitGraph {
         Ok(())
     }
 
-    /// Instantiate a template unit on demand (e.g. `devattach@snd.service` from `devattach@.service`).
-    pub fn instantiate_template(&mut self, full_name: &str) -> Result<&UnitSpec, GraphError> {
-        if self.units.contains_key(full_name) {
-            return Ok(self.units.get(full_name).unwrap());
-        }
+    /// Build a concrete instance spec from a registered template WITHOUT mutating the graph,
+    /// allowing callers to authorize the instantiated spec before committing it.
+    pub fn preview_template_instance(&self, full_name: &str) -> Result<UnitSpec, GraphError> {
         let (template_name, instance) = split_template_instance(full_name)
             .ok_or_else(|| GraphError::UnknownUnit(full_name.to_owned()))?;
         let template = self
             .templates
             .get(&template_name)
-            .cloned()
             .ok_or(GraphError::UnknownUnit(template_name))?;
-        let concrete = template
+        template
             .instantiate(&instance)
-            .map_err(GraphError::InvalidUnit)?;
+            .map_err(GraphError::InvalidUnit)
+    }
+
+    /// Instantiate a template unit on demand (e.g. `devattach@snd.service` from `devattach@.service`).
+    pub fn instantiate_template(&mut self, full_name: &str) -> Result<&UnitSpec, GraphError> {
+        if self.units.contains_key(full_name) {
+            return Ok(self.units.get(full_name).unwrap());
+        }
+        let concrete = self.preview_template_instance(full_name)?;
         self.register_unit(concrete)?;
         Ok(self.units.get(full_name).unwrap())
     }
@@ -212,6 +217,10 @@ impl UnitGraph {
 
     pub fn units(&self) -> &BTreeMap<String, UnitSpec> {
         &self.units
+    }
+
+    pub fn templates(&self) -> &BTreeMap<String, UnitSpec> {
+        &self.templates
     }
 
     /// All concrete units in deterministic topological start order.

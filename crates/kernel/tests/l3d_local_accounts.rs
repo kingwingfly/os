@@ -665,3 +665,57 @@ fn input_validation_rejects_injection_delimiters_and_duplicates() {
         .unwrap();
     assert!(store.authenticate(&fs, "bob", "short").is_ok());
 }
+
+#[test]
+fn sudoers_rejects_non_root_runas_and_restricted_command_rules() {
+    let mut fs = MemoryAccountFs::seeded();
+    let store = LocalAccountStore::new();
+    let root = Identity::root();
+
+    let alice = store
+        .useradd(
+            &mut fs,
+            &root,
+            UseraddReq {
+                name: "alice".into(),
+                ..Default::default()
+            },
+            [0xaa; 16],
+        )
+        .unwrap();
+
+    // Non-root RunAs targets and command-restricted rules MUST NOT grant local root (`uid 0`) sudo.
+    for denied_sudoers in [
+        "root ALL=(ALL:ALL) ALL\nalice ALL=(nobody) ALL\n",
+        "root ALL=(ALL:ALL) ALL\nalice ALL=(bob:bob) NOPASSWD: ALL\n",
+        "root ALL=(ALL:ALL) ALL\nalice ALL=(ALL:ALL) /bin/ls\n",
+        "root ALL=(ALL:ALL) ALL\nalice ALL=(ALL:ALL) NOPASSWD: /bin/ls\n",
+        "root ALL=(ALL:ALL) ALL\nalice ALL=(ALL:ALL) /bin/ls, ALL\n",
+    ] {
+        fs.write_file(SUDOERS_PATH, denied_sudoers.as_bytes(), SUDOERS_MODE, 0, 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .check_sudo(&fs, alice.uid, &[alice.gid], 1, 1000)
+                .unwrap(),
+            SudoCheck::Denied,
+            "expected Denied for sudoers rule: {denied_sudoers:?}"
+        );
+    }
+
+    // Explicit root RunAs rules are accepted accurately.
+    fs.write_file(
+        SUDOERS_PATH,
+        b"root ALL=(ALL:ALL) ALL\nalice ALL=(root:root) ALL\n",
+        SUDOERS_MODE,
+        0,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .check_sudo(&fs, alice.uid, &[alice.gid], 1, 1000)
+            .unwrap(),
+        SudoCheck::RequiresPassword
+    );
+}

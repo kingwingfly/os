@@ -98,7 +98,7 @@ pub fn parse_args(args: &[String]) -> Result<SudoAction, (String, i32)> {
         }
         return Ok(SudoAction::Validate { non_interactive });
     }
-    if command.is_empty() && user.is_none() {
+    if command.is_empty() {
         return Err(("sudo: missing command (use sudo -h for usage)".into(), 1));
     }
 
@@ -400,5 +400,22 @@ mod tests {
         let (_, err, code) = run_with(&s(&["id"]), &mut denied);
         assert_eq!(code, 1);
         assert!(err.unwrap().contains("not in the sudoers"));
+
+        // `sudo -u USER` without a command is rejected before invoking any backend operation.
+        let mut no_cmd = MockSudo {
+            creds: Creds {
+                uid: 1000,
+                user: "user".into(),
+                can_sudo: true,
+                sudo_active: true,
+                ..Creds::default()
+            },
+            password: None,
+            steps: Vec::new(),
+        };
+        let (_, err, code) = run_with(&s(&["-u", "alice"]), &mut no_cmd);
+        assert_eq!(code, 1);
+        assert!(err.unwrap().contains("missing command"));
+        assert!(no_cmd.steps.is_empty());
     }
 }

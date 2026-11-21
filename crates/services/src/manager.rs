@@ -160,6 +160,9 @@ impl ServiceManager {
             spec.authorize_for_manager(manager_uid)?;
             units.insert(name.clone(), UnitRuntime::new(spec.enabled));
         }
+        for spec in graph.templates().values() {
+            spec.authorize_for_manager(manager_uid)?;
+        }
         Ok(Self {
             manager_uid,
             notify_socket_path,
@@ -843,7 +846,7 @@ impl ServiceManager {
                     );
                 }
                 if self.graph.unit(&unit).is_none()
-                    && let Ok(spec) = self.graph.instantiate_template(&unit).cloned()
+                    && let Ok(spec) = self.graph.preview_template_instance(&unit)
                 {
                     if let Err(err) = spec.authorize_for_manager(self.manager_uid) {
                         return (
@@ -854,8 +857,17 @@ impl ServiceManager {
                             Vec::new(),
                         );
                     }
-                    self.units
-                        .insert(unit.clone(), UnitRuntime::new(spec.enabled));
+                    let enabled = spec.enabled;
+                    if let Err(err) = self.graph.register_unit(spec) {
+                        return (
+                            ControlResponse::Error {
+                                errno: Errno::EINVAL,
+                                message: err.to_string(),
+                            },
+                            Vec::new(),
+                        );
+                    }
+                    self.units.insert(unit.clone(), UnitRuntime::new(enabled));
                 }
                 let plan = match self.graph.start_plan_for(&unit) {
                     Ok(p) => p,
@@ -915,6 +927,15 @@ impl ServiceManager {
                 )
             }
             ControlRequest::Restart { unit } => {
+                if self.shutdown_mode != ShutdownMode::None {
+                    return (
+                        ControlResponse::Error {
+                            errno: Errno::EBUSY,
+                            message: "system shutdown is in progress".into(),
+                        },
+                        Vec::new(),
+                    );
+                }
                 if self.graph.unit(&unit).is_none() {
                     return (
                         ControlResponse::Error {

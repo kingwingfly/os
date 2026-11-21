@@ -578,3 +578,94 @@ fn ordered_reverse_shutdown_unmounts_cloud_escalates_sigkill_and_closes_root() {
     assert!(actions.contains(&ManagerAction::CloseCleanRoot { reboot: false }));
     assert!(mgr.is_shutdown_complete());
 }
+
+#[test]
+fn template_authorization_and_shutdown_restart_guards_prevent_desync_or_escalation() {
+    // 1. Per-user manager MUST reject a graph containing a template with `grant.user` elevation.
+    let mut bad_tmpl = simple_service("elevate@.service", vec![], vec![]);
+    bad_tmpl.grant.mount_namespace = MountNsPolicy::Session;
+    bad_tmpl.grant.user = Some("%i".into());
+    let bad_graph = UnitGraph::build(vec![bad_tmpl]).unwrap();
+    assert_eq!(
+        ServiceManager::new_user(1000, bad_graph)
+            .err()
+            .unwrap()
+            .errno,
+        Errno::EPERM
+    );
+
+    // 2. Dynamic registration of a forbidden template on a per-user manager fails EPERM without
+    // mutating graph or desyncing runtime state; subsequent ticks never panic.
+    let mut ok_tmpl = simple_service("worker@.service", vec![], vec![]);
+    ok_tmpl.grant.mount_namespace = MountNsPolicy::Session;
+    let mut user_mgr =
+        ServiceManager::new_user(1000, UnitGraph::build(vec![ok_tmpl]).unwrap()).unwrap();
+    let owner = PeerCred {
+        pid: 88,
+        uid: 1000,
+        gid: 1000,
+    };
+    let mut sys_tmpl = simple_service("escape@.service", vec![], vec![]);
+    sys_tmpl.grant.mount_namespace = MountNsPolicy::System;
+    let (resp, _) = user_mgr.handle_control(
+        owner,
+        ControlRequest::RegisterUnit {
+            spec: Box::new(sys_tmpl),
+        },
+        0,
+    );
+    assert!(matches!(
+        resp,
+        ControlResponse::Error {
+            errno: Errno::EPERM,
+            ..
+        }
+    ));
+    // Starting an allowed template instance works cleanly and stays in sync with `tick()`.
+    let (resp, actions) = user_mgr.handle_control(
+        owner,
+        ControlRequest::Start {
+            unit: "worker@alpha.service".into(),
+        },
+        10,
+    );
+    assert!(matches!(resp, ControlResponse::Ok { .. }));
+    assert_eq!(actions.len(), 1);
+    assert!(user_mgr.graph().unit("worker@alpha.service").is_some());
+    assert_eq!(
+        user_mgr.unit_state("worker@alpha.service"),
+        Some(UnitState::Starting)
+    );
+    let _ = user_mgr.tick(20);
+
+    // 3. `ControlRequest::Restart` during active shutdown returns `EBUSY` (matching `Start`).
+    let graph = default_boot_graph(1000).unwrap();
+    let mut sys_mgr = ServiceManager::new_system(graph).unwrap();
+    let root = PeerCred {
+        pid: 1,
+        uid: 0,
+        gid: 0,
+    };
+    sys_mgr.boot_target("multi-user.target").unwrap();
+    let _ = sys_mgr.tick(0);
+    sys_mgr
+        .on_spawned("user-session@1000.service", 10, 0)
+        .unwrap();
+    let (resp, _) = sys_mgr.handle_control(root, ControlRequest::Poweroff, 100);
+    assert!(matches!(resp, ControlResponse::Ok { .. }));
+    let (resp, actions) = sys_mgr.handle_control(
+        root,
+        ControlRequest::Restart {
+            unit: "user-session@1000.service".into(),
+        },
+        110,
+    );
+    assert!(matches!(
+        resp,
+        ControlResponse::Error {
+            errno: Errno::EBUSY,
+            ..
+        }
+    ));
+    assert!(actions.is_empty());
+}

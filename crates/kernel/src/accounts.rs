@@ -604,33 +604,30 @@ fn parse_sudoers(text: &str) -> Vec<SudoRule> {
         } else {
             SudoSubject::User(subject_tok.to_owned())
         };
-        // Expect `ALL=(ALL:ALL)` or `ALL=(ALL)` followed by optional `NOPASSWD:` / `PASSWD:` and `ALL`.
+        // Allow ONLY explicit root-granting RunAs targets (`ALL` or `root`). Non-root RunAs rules
+        // such as `alice ALL=(nobody) ALL` or `alice ALL=(bob:bob) NOPASSWD: ALL` MUST NOT grant
+        // local root (`uid 0`) sudo!
         let host_runas = tokens[1];
-        if !host_runas.starts_with("ALL=") {
+        if !matches!(
+            host_runas,
+            "ALL=(ALL:ALL)"
+                | "ALL=(ALL)"
+                | "ALL=(root)"
+                | "ALL=(root:root)"
+                | "ALL=(ALL:root)"
+                | "ALL=(root:ALL)"
+        ) {
             continue;
         }
+        // Only full `ALL` command rules grant general local root sudo; command-restricted rules
+        // such as `alice ALL=(ALL:ALL) /bin/ls` fail closed.
         let tail = &tokens[2..];
-        let mut nopasswd = false;
-        let mut grants_all = false;
-        for &tok in tail {
-            if tok == "NOPASSWD:" {
-                nopasswd = true;
-            } else if tok == "PASSWD:" {
-                nopasswd = false;
-            } else if let Some(cmd) = tok.strip_prefix("NOPASSWD:") {
-                nopasswd = true;
-                if cmd == "ALL" {
-                    grants_all = true;
-                }
-            } else if let Some(cmd) = tok.strip_prefix("PASSWD:") {
-                nopasswd = false;
-                if cmd == "ALL" {
-                    grants_all = true;
-                }
-            } else if tok == "ALL" {
-                grants_all = true;
-            }
-        }
+        let (nopasswd, grants_all) = match tail {
+            ["ALL"] => (false, true),
+            ["NOPASSWD:", "ALL"] | ["NOPASSWD:ALL"] => (true, true),
+            ["PASSWD:", "ALL"] | ["PASSWD:ALL"] => (false, true),
+            _ => (false, false),
+        };
         if grants_all {
             rules.push(SudoRule { subject, nopasswd });
         }
