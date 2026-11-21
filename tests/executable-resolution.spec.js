@@ -1,14 +1,15 @@
 import { test, expect } from './test.js';
 import binaryen from 'binaryen';
 import { readFile } from 'node:fs/promises';
-import { api, call, mkdirp, put, rmrf, processes } from './sys.js';
+import { api, call, mkdirp, put, rmrf } from './sys.js';
+import { hookPageKernel } from './service-auth.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
-let base;
+let base, pageKernel;
 async function run(page, command) {
   await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   await page.locator('#command').fill(command);
@@ -29,6 +30,7 @@ test.beforeEach(async ({ page, request }) => {
   for (const name of ['alpha.txt', 'beta.txt', '.hidden']) {
     expect((await put(request, file(base + '/' + name), { data: 'content\n' })).ok()).toBe(true);
   }
+  pageKernel = await hookPageKernel(page);
   await page.goto('/');
   await run(page, 'cd ' + base);
 });
@@ -246,13 +248,13 @@ test('streaming xargs runs before EOF and Ctrl+C reaps both parent and children'
   await page.locator('#command').fill('yes item | xargs -n1 echo');
   await page.locator('#command').press('Enter');
   await expect(last(page)).toContainText('item\nitem');
-  expect((await processes(page.request)).some(row => row.cmdline[0] === 'xargs')).toBe(true);
+  expect((await pageKernel.value('poll', { pids: [] })).some(row => row.argv?.[0] === 'xargs')).toBe(true);
   await page.locator('#command').press('Control+c');
   await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 5000 });
   await run(page, 'echo responsive'); await expect(last(page)).toHaveText('responsive');
   await expect.poll(async () => {
-    const rows = await processes(page.request);
-    return rows.filter(row => ['yes', 'xargs', 'echo'].includes(row.cmdline[0]));
+    const rows = await pageKernel.value('poll', { pids: [] });
+    return rows.filter(row => ['yes', 'xargs', 'echo'].includes(row.argv?.[0]));
   }).toEqual([]);
 });
 

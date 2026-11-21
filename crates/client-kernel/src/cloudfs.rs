@@ -773,7 +773,7 @@ pub(crate) struct RootCloudDriver {
     page_mut_epoch: Cell<u64>,
     page_read_depth: Cell<u32>,
     page_read_cache: RefCell<Option<PageReadCache>>,
-    cloud_handles: RefCell<HashMap<NodeId, Handle>>,
+    cloud_handles: RefCell<HashMap<(String, NodeId), Handle>>,
     next_open: Cell<u64>,
     opens: RefCell<HashMap<u64, OpenRecord>>,
     page_locks: RefCell<HashMap<u64, Rc<PageLock>>>,
@@ -1288,12 +1288,17 @@ impl RootCloudDriver {
         }
     }
 
-    fn wrap_cloud_entry(&self, mut real: Entry, known_path: Option<String>) -> Entry {
+    fn wrap_cloud_entry(
+        &self,
+        session_id: &str,
+        mut real: Entry,
+        known_path: Option<String>,
+    ) -> Entry {
         let node = self.wrap_remote_node(real.handle.node, known_path.as_deref());
         self.strip_and_record_writing(node.ino, &mut real.metadata);
         self.cloud_handles
             .borrow_mut()
-            .insert(node, real.handle.clone());
+            .insert((session_id.to_string(), node), real.handle.clone());
         if let Some(p) = known_path {
             self.node_paths.borrow_mut().insert(node, p.clone());
             let wrapped = Entry {
@@ -1432,9 +1437,10 @@ impl RootCloudDriver {
                     .get(&self.state, &self.current, session_uid, &token),
             )
             .await?;
+        let session_id = cloud.fs.session().id.clone();
         self.cloud_handles
             .borrow_mut()
-            .insert(cloud.fs.root().node, cloud.fs.root());
+            .insert((session_id, cloud.fs.root().node), cloud.fs.root());
         Ok((actor, cloud, rcred))
     }
 
@@ -1450,7 +1456,12 @@ impl RootCloudDriver {
         if handle.node.ino == 1 {
             return Ok(cloud.fs.root());
         }
-        if let Some(real) = self.cloud_handles.borrow().get(&handle.node).cloned()
+        let session_id = cloud.fs.session().id.clone();
+        if let Some(real) = self
+            .cloud_handles
+            .borrow()
+            .get(&(session_id.clone(), handle.node))
+            .cloned()
             && real.fs == *cloud.fs.id()
         {
             return Ok(real);
@@ -1475,7 +1486,7 @@ impl RootCloudDriver {
             let mapped_node = self.wrap_remote_node(entry.handle.node, Some(&cur_path));
             self.cloud_handles
                 .borrow_mut()
-                .insert(mapped_node, entry.handle.clone());
+                .insert((session_id.clone(), mapped_node), entry.handle.clone());
             self.node_paths
                 .borrow_mut()
                 .insert(mapped_node, cur_path.clone());
@@ -2120,7 +2131,7 @@ impl Filesystem for RootCloudDriver {
                 }
                 let entry = res?;
                 let child_path = dir_path.map(|p| join_cloud_path(&p, name));
-                return Ok(self.wrap_cloud_entry(entry, child_path));
+                return Ok(self.wrap_cloud_entry(&cloud.fs.session().id, entry, child_path));
             }
 
             let dir_path = self.path_for_handle(dir)?;
@@ -2193,7 +2204,7 @@ impl Filesystem for RootCloudDriver {
                     .map(|(idx, e)| {
                         let next_path = cur_path.as_ref().map(|p| join_cloud_path(p, &names[idx]));
                         cur_path = next_path.clone();
-                        self.wrap_cloud_entry(e, next_path)
+                        self.wrap_cloud_entry(&cloud.fs.session().id, e, next_path)
                     })
                     .collect();
                 return Ok(Walked {
@@ -2288,7 +2299,10 @@ impl Filesystem for RootCloudDriver {
                         .as_deref()
                         .and_then(split_cloud_parent)
                         .map(|(p, _)| p);
-                    (self.wrap_cloud_entry(entry, parent_path), name)
+                    (
+                        self.wrap_cloud_entry(&cloud.fs.session().id, entry, parent_path),
+                        name,
+                    )
                 }));
             }
             let path = self.path_for_handle(dir)?;
@@ -2658,7 +2672,8 @@ impl Filesystem for RootCloudDriver {
                     .await?;
                 cloud.live_opens.set(cloud.live_opens.get() + 1);
                 let child_path = dir_path.map(|p| join_cloud_path(&p, name));
-                let wrapped_entry = self.wrap_cloud_entry(entry, child_path);
+                let wrapped_entry =
+                    self.wrap_cloud_entry(&cloud.fs.session().id, entry, child_path);
                 let oref = self.alloc_open(
                     wrapped_entry.handle.node,
                     real_open.access,
@@ -2742,9 +2757,11 @@ impl Filesystem for RootCloudDriver {
                         cloud.fs.mkdir(&rcred, &real, name, mode).await
                     })
                     .await?;
-                return Ok(
-                    self.wrap_cloud_entry(entry, dir_path.map(|p| join_cloud_path(&p, name)))
-                );
+                return Ok(self.wrap_cloud_entry(
+                    &cloud.fs.session().id,
+                    entry,
+                    dir_path.map(|p| join_cloud_path(&p, name)),
+                ));
             }
             let dir_path = self.path_for_handle(dir)?;
             let child_path = join_cloud_path(&dir_path, name);
@@ -2798,9 +2815,11 @@ impl Filesystem for RootCloudDriver {
                         cloud.fs.mknod(&rcred, &real, name, mode, rdev).await
                     })
                     .await?;
-                return Ok(
-                    self.wrap_cloud_entry(entry, dir_path.map(|p| join_cloud_path(&p, name)))
-                );
+                return Ok(self.wrap_cloud_entry(
+                    &cloud.fs.session().id,
+                    entry,
+                    dir_path.map(|p| join_cloud_path(&p, name)),
+                ));
             }
             let dir_path = self.path_for_handle(dir)?;
             let child_path = join_cloud_path(&dir_path, name);
@@ -2911,9 +2930,11 @@ impl Filesystem for RootCloudDriver {
                         cloud.fs.symlink(&rcred, &real, name, target).await
                     })
                     .await?;
-                return Ok(
-                    self.wrap_cloud_entry(entry, dir_path.map(|p| join_cloud_path(&p, name)))
-                );
+                return Ok(self.wrap_cloud_entry(
+                    &cloud.fs.session().id,
+                    entry,
+                    dir_path.map(|p| join_cloud_path(&p, name)),
+                ));
             }
             let dir_path = self.path_for_handle(dir)?;
             let child_path = join_cloud_path(&dir_path, name);
@@ -2967,9 +2988,11 @@ impl Filesystem for RootCloudDriver {
                         cloud.fs.link(&rcred, &real_target, &real_dir, name).await
                     })
                     .await?;
-                return Ok(
-                    self.wrap_cloud_entry(entry, dir_path.map(|p| join_cloud_path(&p, name)))
-                );
+                return Ok(self.wrap_cloud_entry(
+                    &cloud.fs.session().id,
+                    entry,
+                    dir_path.map(|p| join_cloud_path(&p, name)),
+                ));
             }
             let from_path = self.path_for_handle(target)?;
             let dir_path = self.path_for_handle(dir)?;
@@ -3530,9 +3553,10 @@ impl Filesystem for RootCloudDriver {
                                         ),
                                     )
                                     .await?;
-                                self.cloud_handles
-                                    .borrow_mut()
-                                    .insert(cloud.fs.root().node, cloud.fs.root());
+                                self.cloud_handles.borrow_mut().insert(
+                                    (cloud.fs.session().id.clone(), cloud.fs.root().node),
+                                    cloud.fs.root(),
+                                );
                                 let real_open = self
                                     .acted(Actor::Ephemeral(tok.clone()), async {
                                         let real = self

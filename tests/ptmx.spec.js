@@ -18,7 +18,7 @@ const login = async page => expect((await api(page.request, 'login', {
   headers: { 'CF-Connecting-IP': 'host-pty-' + crypto.randomUUID() }, data: { password },
 })).ok()).toBe(true);
 let base;
-test.beforeEach(async ({ page }) => { await page.goto('/'); base = '/guest/ptmx-' + crypto.randomUUID(); await call(page.request, { mkdir: { path: base, mode: 0o755 } }); });
+test.beforeEach(async ({ page }) => { base = '/guest/ptmx-' + crypto.randomUUID(); await call(page.request, { mkdir: { path: base, mode: 0o755 } }); await page.goto('/'); });
 test.afterEach(async ({ page }) => { await rmrf(page.request, base); });
 async function run(page, path) {
   await expect(prompt(page)).toHaveAttribute('data-state', 'idle');

@@ -228,6 +228,8 @@ test('a granted run keeps its original process identity across browser login and
   await expect.poll(() => output(page)).toContain(String(guest.uid));
   const other = await target(page); await connect(page, other, 'control');
   expect((await api(page.request, 'login', { headers: { 'CF-Connecting-IP': 'console-attachment-' + crypto.randomUUID() }, data: { password } })).ok()).toBe(true);
+  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+  await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(0);
   await remoteWrite(other, 'continue\n'); await expect.poll(() => remoteOutput(other)).toContain(String(guest.uid));
   await remoteWrite(other, 'finish\n'); await ended(page, 0);
   await expect.poll(() => other.evaluate(() => window.receiving.closed?.errno)).toBe('EPIPE');

@@ -17,9 +17,9 @@ async function run(page, command) {
 const shell = (page, script) => run(page, `sh -c '${script}'`);
 let base;
 test.beforeEach(async ({ page }) => {
-  await page.goto('/');
   base = '/guest/signals-' + crypto.randomUUID();
   await call(page.request, { mkdir: { path: base, mode: 0o755 } });
+  await page.goto('/');
   await run(page, 'cd ' + base);
 });
 test.afterEach(async ({ page }) => { await rmrf(page.request, base); });

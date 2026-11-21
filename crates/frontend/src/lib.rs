@@ -296,7 +296,6 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
                 }
                 node_ref=command_input/>
         </form>
-        </div>
         <Show when=move || shell.completion.get().is_some() || !shell.completion_status.get().is_empty()>
             <div class="completion-pager">
                 <p class="completion-hint" role="status">{move || shell.completion.get().map(|s| match s.selected {
@@ -314,6 +313,7 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
                 </div>
             </div>
         </Show>
+        </div>
 
         // The keys a phone's keyboard lacks. Pressing one keeps the focus, and the keyboard, where
         // they are.

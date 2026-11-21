@@ -286,9 +286,9 @@ test('stty tostop stops background terminal writes and fg lets them complete', a
 });
 
 test('setsid detaches the controlling terminal without closing inherited descriptors', async ({ page }) => {
-  await page.goto('/');
   const base = '/guest/session-' + crypto.randomUUID();
   await call(page.request, { mkdir: { path: base, mode: 0o755 } });
+  await page.goto('/');
   const module = binaryen.parseText(`(module
     (import "os" "getpgid" (func $pgid (param i32) (result i32)))
     (import "os" "getsid" (func $sid (param i32) (result i32)))

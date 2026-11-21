@@ -43,15 +43,13 @@ async function api(url, options) {
 }
 // Who this session is (getcreds), and whether it may write in the directory `path` (access).
 let syncedAccount = null;
-let attachedRemoteDevices = false;
-async function attachRemoteDevices() {
-  if (attachedRemoteDevices) return;
-  attachedRemoteDevices = true;
-  await Promise.all(
+let remoteDevicesPromise = null;
+function attachRemoteDevices() {
+  return (remoteDevicesPromise ??= Promise.all(
     ['archive', 'media', 'present', 'snd'].map(driver =>
       kernelCall('attach_remote_device', { driver }).catch(() => {}),
     ),
-  );
+  ));
 }
 async function syncAccount(who) {
   if (!who || typeof who.uid !== 'number') return;

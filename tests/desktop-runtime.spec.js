@@ -34,7 +34,7 @@ test('isolated processes fork, supervise services and interrupt unbounded termin
     await field.press('Control+c'); await expect(state).toHaveAttribute('data-state', 'idle', { timeout: 10000 });
     await field.fill('yes'); await field.press('Enter');
     await expect(state).not.toHaveAttribute('data-state', 'idle');
-    await expect(page.locator('.terminal-screen').filter({ visible: true })).toContainText('y');
+    await expect(page.locator('.terminal-screen[data-live="true"]').filter({ visible: true })).toContainText('y');
     await field.press('Control+c'); await expect(state).toHaveAttribute('data-state', 'idle', { timeout: 10000 });
     await expect(page.locator('#window-terminal')).not.toContainText('output larger than');
   } finally { await rmrf(page.request, base); }

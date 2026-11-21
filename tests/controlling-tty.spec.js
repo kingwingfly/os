@@ -27,8 +27,9 @@ async function run(page, text) {
 }
 const results = async page => (await screen(page).textContent()).split('\n').filter(s => s.startsWith('{')).map(s => JSON.parse(s).results[0]);
 test.beforeEach(async ({ page }) => {
-  await page.goto('/'); base = '/guest/ctty-' + crypto.randomUUID();
+  base = '/guest/ctty-' + crypto.randomUUID();
   await call(page.request, { mkdir: { path: base, mode: 0o755 } });
+  await page.goto('/');
 });
 test.afterEach(async ({ page }) => { await rmrf(page.request, base); });
 

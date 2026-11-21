@@ -31,7 +31,8 @@ export class LoginStartup {
     if (this.flushing) return this.flushing;
     this.flushing = (async () => {
       for (const [key, value] of this.completions) {
-        try { await this.finish(value); this.completions.delete(key); }
+        const { cancelled: _cancelled, ...payload } = value;
+        try { await this.finish(payload); this.completions.delete(key); }
         catch (error) {
           // A superseded revision/expired login has nothing left for this receipt to change.
           if (['ESTALE', 'EACCES', 'EPERM', 'EINVAL'].includes(error.errno)) this.completions.delete(key);
@@ -58,8 +59,12 @@ export class LoginStartup {
     // only until shutdown. Public snapshots above still hide it immediately on login change.
     for (const id of this.logs.keys()) if (id !== session?.id && !this.runs.has(id)) this.logs.delete(id);
     const startup = session?.startup;
+    const active = session ? this.runs.get(session.id) : null;
+    const hasPendingCompletion = session && [...this.completions.values()].some(
+      value => value.session === session.id && value.launch.revision === startup?.revision && !value.cancelled,
+    );
     if (!status.coordinator || !startup?.enabled || startup.state !== 'pending' || session.managed ||
-        this.runs.has(session.id) || this.completions.has(session.id)) return;
+        (active && !active.cancelled) || hasPendingCompletion) return;
     const run = { session: session.id, expected: { session: session.id, generation: session.generation },
       launch: { revision: startup.revision, proof: this.token() }, file: startup.file,
       cancelled: false, attached: false, stopping: false };
@@ -79,8 +84,9 @@ export class LoginStartup {
       this.output(run, `startup: ${error}\n`);
     } finally {
       this.clearTimer(run.deadline);
-      this.runs.delete(run.session);
-      this.completions.set(run.session, { session: run.session, launch: run.launch, status, error });
+      if (this.runs.get(run.session) === run) this.runs.delete(run.session);
+      const completionKey = run.cancelled ? `${run.session}:${run.launch.proof}` : run.session;
+      this.completions.set(completionKey, { session: run.session, launch: run.launch, status, error, cancelled: run.cancelled });
       await this.flush();
       this.changed();
     }

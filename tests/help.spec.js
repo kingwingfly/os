@@ -6,21 +6,36 @@ const definitions = await Promise.all((await readdir('crates/core/src/cli')).fil
 const commands = definitions.flatMap(source => [...source.matchAll(/#\[command\(\s*name = "([a-z]+)"/g)].map(match => match[1]));
 
 test('every command has side-effect-free help, including privileged and interactive commands', async ({ page }) => {
-  // Wait for the page's asynchronous kernel bootstrap before observing help commands.
-  // ProcInit creates the namespace and is unrelated to any command typed afterward.
-  const initialized = page.waitForResponse(response => response.url().endsWith('/api/sys')
-    && response.request().method() === 'POST'
-    && JSON.parse(response.request().postData() || '{}').calls?.some(call => typeof call === 'object' && 'proc_init' in call));
+  // Wait for the page's asynchronous kernel, guest account, and remote device bootstrap before observing help commands.
   await page.goto('/');
-  await initialized;
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
+  await expect.poll(() => page.evaluate(async () => {
+    const s = await window.os?.loginSession?.();
+    if (!s?.connected || s?.session?.uid == null) return false;
+    const res = await fetch('/api/sys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        calls: ['/dev/archive', '/dev/media', '/dev/present', '/dev/snd'].map(path => ({ lstat: { path } })),
+      }),
+    });
+    if (!res.ok) return false;
+    const { results } = await res.json();
+    return Array.isArray(results) && results.length === 4 && results.every(r => r && 'ok' in r);
+  }), { timeout: 30_000 }).toBe(true);
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   const requests = [];
   // External help has a normal exec/exit lifecycle. It may read files and descriptors, but
   // must not mutate filesystem contents, permissions, or identity.
-  // Directory watches and the kernel's periodic seat listing change nothing either.
+  // Directory watches, periodic seat listings, and empty ServiceAuth v2 instance lease renewals change nothing either.
   const looking = new Set(['getcreds', 'stat', 'lstat', 'getdents', 'access', 'readlink', 'getxattr', 'listxattr', 'inotify_add_watch', 'inotify_rm_watch', 'seats', 'execve', 'exit', 'wait', 'proc_init', 'proc_poll', 'proc_keep', 'proc_tty', 'pids', 'pread', 'close']);
   const changes = request => {
     if (request.method() === 'GET' || request.method() === 'HEAD') return false;
+    if (request.url().endsWith('/api/service-auth')) {
+      const body = JSON.parse(request.postData() || '{}');
+      const keys = Object.keys(body);
+      return !(keys.length === 1 && keys[0] === 'renew_instance' && Array.isArray(body.renew_instance?.active_tokens) && body.renew_instance.active_tokens.length === 0);
+    }
     if (!request.url().endsWith('/api/sys')) return true;
     return JSON.parse(request.postData() || '{}').calls?.some(call => {
       if (typeof call === 'object' && call.open) return !!(call.open.flags & (3 | 0o100 | 0o1000 | 0o2000));

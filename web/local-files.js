@@ -136,16 +136,16 @@ export function installLocalFiles() {
   let sessionBootstrapped = false;
   let lastSyncedKey = null;
 
-  async function serializedNetwork(request) {
+  async function serializedNetwork(send) {
     if (!sessionBootstrapped) {
       if (cookieBootstrap) {
         await cookieBootstrap;
-        return network(request);
+        return send();
       }
       let release;
       cookieBootstrap = new Promise(resolve => { release = resolve; });
       try {
-        const res = await network(request);
+        const res = await send();
         sessionBootstrapped = true;
         return res;
       } finally {
@@ -153,7 +153,7 @@ export function installLocalFiles() {
         release();
       }
     }
-    return network(request);
+    return send();
   }
 
   globalThis.fetch = async (input, options) => {
@@ -167,7 +167,17 @@ export function installLocalFiles() {
     try {
       // 1. Page `POST /api/sys` batches containing filesystem calls
       if (url.pathname === '/api/sys' && request.method === 'POST') {
-        const body = await request.clone().json();
+        const rawBody = typeof options?.body === 'string' ? options.body : await request.clone().text();
+        const body = JSON.parse(rawBody);
+        const sendSys = typeof input === 'string' && typeof options?.body === 'string'
+          ? () => network(input, options)
+          : () => network(request.url, {
+              method: request.method,
+              headers: request.headers,
+              body: rawBody,
+              credentials: request.credentials,
+              signal: request.signal,
+            });
         if (Array.isArray(body.calls) && body.calls.length > 0) {
           const hasFs = body.calls.some(c => FS_CALL_NAMES.has(callName(c)));
           const hasAccountMut = body.calls.some(c => ACCOUNT_MUTATION_CALLS.has(callName(c)));
@@ -175,7 +185,7 @@ export function installLocalFiles() {
             if (body.calls.some(touchesPrivateCarrier)) {
               return json({ error: 'process credentials are not page filesystem grants', errno: 'EACCES' }, 403);
             }
-            return network(request);
+            return sendSys();
           }
           // `hold` on a client page fd is a local no-op; on a server upload fd it goes to `/api/sys`.
           if (body.calls.length === 1 && callName(body.calls[0]) === 'hold') {
@@ -183,11 +193,11 @@ export function installLocalFiles() {
             if (typeof hfd === 'number' && hfd >= CLIENT_PAGE_FD_BASE) {
               return json({ results: [{ ok: null }] });
             }
-            return serializedNetwork(request);
+            return serializedNetwork(sendSys);
           }
           if (hasFs && !hasAccountMut) {
             if (isRemoteServerDevBatch(body.calls)) {
-              return serializedNetwork(request);
+              return serializedNetwork(sendSys);
             }
             const results = await kernelCall('mount_vfs_sys', {
               calls: body.calls,
@@ -198,7 +208,7 @@ export function installLocalFiles() {
             return json({ results });
           }
         }
-        const response = await serializedNetwork(request);
+        const response = await serializedNetwork(sendSys);
         if (response.ok && Array.isArray(body?.calls) && !body.proc && !body.pid) {
           const hasServerAccountMut = body.calls.some(c => SERVER_ACCOUNT_MUTATION_CALLS.has(callName(c)));
           const getcredsIndex = body.calls.findIndex(c => callName(c) === 'getcreds');
@@ -229,7 +239,7 @@ export function installLocalFiles() {
       }
 
       if ((url.pathname === '/api/login' || url.pathname === '/api/logout') && request.method === 'POST') {
-        const response = await serializedNetwork(request);
+        const response = await serializedNetwork(() => network(request));
         if (response.ok) {
           lastSyncedKey = null;
           await kernelCall('login_refresh').catch(() => {});

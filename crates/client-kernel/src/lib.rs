@@ -1232,15 +1232,20 @@ impl Kernel {
                     if session != state.login_session.id {
                         return Err(fail(Errno::ESTALE.into()));
                     }
-                    if state.login_session.managed.is_some() {
+                    let lhash = sha256_hex(&launch.proof);
+                    let is_managed = state.login_session.managed.is_some();
+                    let Some(startup) = &mut state.login_session.startup else {
+                        return Err(fail(Errno::ESTALE.into()));
+                    };
+                    startup
+                        .authorize_finish(&launch.revision, &lhash)
+                        .map_err(fail)?;
+                    if is_managed {
                         return Err(fail(Errno::EBUSY.into()));
                     }
-                    let lhash = sha256_hex(&launch.proof);
-                    if let Some(startup) = &mut state.login_session.startup {
-                        startup
-                            .finish(&launch.revision, &lhash, status, error)
-                            .map_err(fail)?;
-                    }
+                    startup
+                        .finish(&launch.revision, &lhash, status, error)
+                        .map_err(fail)?;
                     state.login_view()
                 }
                 LoginAction::Signal {

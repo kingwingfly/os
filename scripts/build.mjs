@@ -94,7 +94,7 @@ run(process.execPath, ['scripts/build-shell.mjs', '--out-dir', out]);
 // browser contexts compile system tools directly without running Binaryen in-browser. Raw `.wasm`
 // binaries remain untouched for `/api/file`, inspection, and Release v2 packaging.
 const transformedDigests = {};
-for (const asset of ['/usr/bin/coreutils.wasm', '/usr/bin/utilities.wasm', '/usr/bin/dash.wasm', '/usr/bin/supervise.wasm']) {
+for (const asset of ['/usr/bin/coreutils.wasm', '/usr/bin/utilities.wasm', '/usr/bin/dash.wasm', '/usr/bin/supervise.wasm', '/usr/bin/init.wasm']) {
   const raw = new Uint8Array(await readFile(join(out, asset)));
   const rv1 = await transformImage(binaryen, raw, 'resources-v1');
   await writeFile(join(out, asset + '.rv1'), rv1);

@@ -1174,9 +1174,14 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
     await k('kfd_close', { pid: pAlice.pid, kfd: afterReconnect.kfd });
 
     await k('exit', { pid: pAlice.pid, status: 0 });
-    await k('exit', { pid: pGuest.pid, status: 0 });
     await k('wait', { pid: pAlice.pid });
-    await k('wait', { pid: pGuest.pid });
+    await k('exit', { pid: pGuest.pid, status: 0 });
+    // Non-root Alice cannot reap another account's (guest's) zombie process; root (or PID 1) can.
+    expect(await kErr('wait', { pid: pGuest.pid })).toBe('EPERM');
+    expect((await api(context.request, 'login', { headers: extra, data: { password } })).ok()).toBe(true);
+    await k('sync_account_from_server');
+    const rootWait = await page.evaluate(pid => window.__kernel('wait', { pid }), pGuest.pid);
+    expect(rootWait.ok != null || rootWait.err?.errno === 'ECHILD').toBe(true);
   } finally {
     await rmrf(request, base);
   }

@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { call } from './sys.js';
+import { hookPageKernel } from './service-auth.js';
 
 const command = page => page.locator('#command');
 const panel = page => page.locator('.terminal-panel:not([hidden])');
@@ -7,7 +7,12 @@ const prompt = page => panel(page).locator('.command-line');
 const screen = page => panel(page).locator('.terminal-screen').last();
 const attachedInput = page => page.getByLabel('Attached terminal input');
 const connection = page => page.locator('.console-connection');
-test.beforeEach(async ({ page }) => { await page.goto('/'); await expect(prompt(page)).toHaveAttribute('data-state', 'idle'); });
+let pageKernel;
+test.beforeEach(async ({ page }) => {
+  pageKernel = await hookPageKernel(page);
+  await page.goto('/');
+  await expect(prompt(page)).toHaveAttribute('data-state', 'idle');
+});
 
 async function start(page, text = 'cat') {
   await command(page).fill(text); await command(page).press('Enter');
@@ -83,9 +88,9 @@ test('an attached interactive shell uses the existing ANSI renderer, resize and 
   // another command. Polling stale output must not queue additional shell input.
   await expect.poll(size).not.toBe(before);
   await other.keyboard.type('sleep 60'); await other.keyboard.press('Enter');
-  await expect.poll(async () => (await call(page.request, { proc_poll: { pids: [] } })).some(row => row.argv[0] === 'sleep')).toBe(true);
+  await expect.poll(async () => (await pageKernel.value('poll', { pids: [] })).some(row => row.argv[0] === 'sleep')).toBe(true);
   await other.keyboard.press('Control+c');
-  await expect.poll(async () => (await call(page.request, { proc_poll: { pids: [] } })).some(row => row.argv[0] === 'sleep')).toBe(false);
+  await expect.poll(async () => (await pageKernel.value('poll', { pids: [] })).some(row => row.argv[0] === 'sleep')).toBe(false);
   await expect(other.locator('.terminal-screen')).toContainText(/\^C\n\$\s*$/);
   await other.keyboard.type('echo after-interrupt'); await other.keyboard.press('Enter');
   await expect(other.locator('.terminal-screen')).toContainText(/\nafter-interrupt/);

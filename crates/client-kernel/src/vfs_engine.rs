@@ -2378,7 +2378,7 @@ impl Kernel {
             if already {
                 continue;
             }
-            let _ = self
+            if let Ok(mount_id) = self
                 .with_page_scope(
                     false,
                     vfs.mount_on_namespace(
@@ -2397,7 +2397,20 @@ impl Kernel {
                         None,
                     ),
                 )
-                .await;
+                .await
+            {
+                let mut rt = self.vfs_rt.borrow_mut();
+                for sess in rt.sessions.values_mut() {
+                    if Rc::ptr_eq(&sess.mnt_ns, &ns) {
+                        sess.baseline_mounts.insert(mount_id);
+                    }
+                }
+                if let Some(guest) = &mut rt.guest_page
+                    && Rc::ptr_eq(&guest.mnt_ns, &ns)
+                {
+                    guest.baseline_mounts.insert(mount_id);
+                }
+            }
         }
     }
 
@@ -3902,7 +3915,8 @@ impl Kernel {
                 "nodev": flags.nodev,
                 "noexec": flags.noexec,
                 "ownerUid": owner_uid,
-                "baseline": baseline_mounts.contains(&MountId(mid)),
+                "baseline": baseline_mounts.contains(&MountId(mid))
+                    || (um.is_none() && matches!(target.as_str(), "/dev/present" | "/dev/snd")),
                 "userMount": um.is_some() || owner_uid.is_some(),
                 "kind": um.map(|u| u.kind.as_str()).unwrap_or(fstype),
                 "name": um.map(|u| u.name.as_str()).unwrap_or(""),
