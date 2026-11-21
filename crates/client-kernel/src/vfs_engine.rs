@@ -1767,6 +1767,34 @@ async fn construct_vfs(
     ));
     let vfs = Vfs::boot(instance_id, root_backing.clone(), "cloud", factory).await?;
     install_vfs_proc_hooks(&vfs, &state);
+    {
+        let vfs_hook = vfs.clone();
+        let state_hook = Rc::clone(&state);
+        root_cloud.set_on_lazy_mint(Rc::new(move |pid| {
+            let info = state_hook.try_borrow().ok().and_then(|st| {
+                st.table.proc(pid).map(|p| {
+                    (
+                        p.cred.identity.clone(),
+                        p.cred.remote.as_ref().map(|r| r.token.clone()),
+                    )
+                })
+            });
+            if let Some((identity, token)) = info {
+                let umask = vfs_hook
+                    .process_fs_context(pid)
+                    .map(|c| c.borrow().umask)
+                    .unwrap_or(0o022);
+                let _ = vfs_hook.set_cred(
+                    pid,
+                    Cred {
+                        identity,
+                        umask,
+                        token,
+                    },
+                );
+            }
+        }));
+    }
     let sys_ns = vfs.system_namespace();
     let mut root_cred = Cred::root();
     root_cred.umask = 0;
@@ -2646,6 +2674,48 @@ impl Kernel {
         F: std::future::Future,
     {
         self.with_root_cloud_scope(Some(pid), false, fut)
+    }
+
+    async fn with_proc_scope_retry<T, F, Fut>(&self, pid: u32, mut make: F) -> vfs::Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = vfs::Result<T>>,
+    {
+        let before_uid = self
+            .state
+            .borrow()
+            .table
+            .proc(pid)
+            .map(|p| p.cred.identity.id);
+        let res = self.with_proc_scope(pid, make()).await;
+        let after_uid = self
+            .state
+            .borrow()
+            .table
+            .proc(pid)
+            .map(|p| p.cred.identity.id);
+        let hydrated = before_uid == Some(os_core::permissions::GUEST)
+            && after_uid.is_some_and(os_core::permissions::is_guest_id);
+        if hydrated || after_uid != before_uid {
+            self.sync_vfs_proc_creds(pid);
+            if hydrated {
+                let other_pids: Vec<u32> = self
+                    .state
+                    .borrow()
+                    .table
+                    .all_pids()
+                    .into_iter()
+                    .filter(|&p| p != pid && p != 1)
+                    .collect();
+                for opid in other_pids {
+                    self.sync_vfs_proc_creds(opid);
+                }
+            }
+        }
+        if hydrated && matches!(res, Err(Errno::EACCES | Errno::EPERM)) {
+            return self.with_proc_scope(pid, make()).await;
+        }
+        res
     }
 
     fn with_page_scope<F>(&self, sudo: bool, fut: F) -> RootCloudScope<F>
@@ -4603,7 +4673,7 @@ impl Kernel {
             if let Some(cwd) = &opts.cwd
                 && !cwd.is_empty()
             {
-                self.with_proc_scope(opts.pid, vfs.chdir(opts.pid, cwd))
+                self.with_proc_scope_retry(opts.pid, || vfs.chdir(opts.pid, cwd))
                     .await
                     .map_err(map_errno)?;
             }
@@ -4684,7 +4754,7 @@ impl Kernel {
             && !cwd.is_empty()
             && cwd != "/"
             && let Err(err) = self
-                .with_proc_scope(opts.pid, vfs.chdir(opts.pid, cwd))
+                .with_proc_scope_retry(opts.pid, || vfs.chdir(opts.pid, cwd))
                 .await
         {
             let _ = self
@@ -4694,11 +4764,22 @@ impl Kernel {
             return Err(map_errno(err));
         }
 
+        let live_cred = self
+            .state
+            .borrow()
+            .table
+            .proc(opts.pid)
+            .map(|p| Cred {
+                identity: p.cred.identity.clone(),
+                umask: opts.umask,
+                token: p.cred.remote.as_ref().map(|r| r.token.clone()),
+            })
+            .unwrap_or(cred);
         {
             let mut rt = self.vfs_rt.borrow_mut();
             rt.proc_meta.insert(
                 opts.pid,
-                ProcessVfsMeta::with_cred(resolved_sess, opts.cloud_access, cred),
+                ProcessVfsMeta::with_cred(resolved_sess, opts.cloud_access, live_cred),
             );
         }
         let ns_id = base_ns.borrow().id().0;
@@ -4969,9 +5050,13 @@ impl Kernel {
 
     pub async fn sys_chdir(&self, pid: u32, path: String) -> Result<(), JsValue> {
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move { vfs.chdir(pid, &path).await })
-            .await
-            .map_err(map_errno)
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let path = path.clone();
+            async move { vfs.chdir(pid, &path).await }
+        })
+        .await
+        .map_err(map_errno)
     }
 
     pub async fn sys_fchdir(&self, pid: u32, kfd: u32) -> Result<(), JsValue> {
@@ -4983,9 +5068,13 @@ impl Kernel {
 
     pub async fn sys_chroot(&self, pid: u32, path: String) -> Result<(), JsValue> {
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move { vfs.chroot(pid, &path).await })
-            .await
-            .map_err(map_errno)
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let path = path.clone();
+            async move { vfs.chroot(pid, &path).await }
+        })
+        .await
+        .map_err(map_errno)
     }
 
     pub async fn sys_getcwd(&self, pid: u32) -> Result<String, JsValue> {
@@ -5047,7 +5136,12 @@ impl Kernel {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let sfs = self
-            .with_proc_scope(pid, async move { vfs.statfs(pid, anchor, &path).await })
+            .with_proc_scope_retry(pid, || {
+                let vfs = vfs.clone();
+                let anchor = anchor.clone();
+                let path = path.clone();
+                async move { vfs.statfs(pid, anchor, &path).await }
+            })
             .await
             .map_err(map_errno)?;
         json_to_js(&json!(safe_statfs_for_js(sfs)))
@@ -5126,48 +5220,56 @@ impl Kernel {
             },
         }
         let outcome = self
-            .with_proc_scope(pid, async move {
-                let (file_ref, entry) = vfs.open_file(pid, anchor, &path, pass_flags, mode).await?;
-                if (oflags & abi::O_DIRECTORY) != 0 && !entry.metadata.is_dir() {
-                    let _ = file_ref.close().await;
-                    drain_releases(&vfs);
-                    return Err(Errno::ENOTDIR);
-                }
-                let mut st = vfs::stat::stat(&entry.handle.fs, entry.handle.node, &entry.metadata);
-                if (oflags & abi::O_PATH) == 0
-                    && entry.metadata.file_type == FileType::CharDevice
-                    && let Some(rdev) = &entry.metadata.rdev
-                    && let Some(canonical_dev) =
-                        canonical_server_dev_path(&root_cloud, &entry.handle, rdev)
-                {
-                    let device = Some(rdev.clone());
-                    let _ = file_ref.close().await;
-                    drain_releases(&vfs);
-                    return Ok(OpenOutcome::ServerDev {
-                        canonical_dev,
-                        stat: st,
-                        device,
-                    });
-                }
-                let is_ns = file_ref.mount_ns().is_some();
-                let fstype = file_ref.mount_pin().map(|p| p.fstype());
-                let fds = vfs.process_fds(pid)?;
-                let insert_res = fds.borrow_mut().insert(file_ref, cloexec);
-                let fd = match insert_res {
-                    Ok(fd) => fd,
-                    Err(e) => {
+            .with_proc_scope_retry(pid, || {
+                let vfs = vfs.clone();
+                let root_cloud = Rc::clone(&root_cloud);
+                let anchor = anchor.clone();
+                let path = path.clone();
+                async move {
+                    let (file_ref, entry) =
+                        vfs.open_file(pid, anchor, &path, pass_flags, mode).await?;
+                    if (oflags & abi::O_DIRECTORY) != 0 && !entry.metadata.is_dir() {
+                        let _ = file_ref.close().await;
                         drain_releases(&vfs);
-                        return Err(e);
+                        return Err(Errno::ENOTDIR);
                     }
-                };
-                st = vfs::stat::stat(&entry.handle.fs, entry.handle.node, &entry.metadata);
-                Ok::<_, Errno>(OpenOutcome::Kfd {
-                    kfd: fd,
-                    stat: st,
-                    entry_meta: entry.metadata,
-                    is_ns,
-                    pin_fstype: fstype,
-                })
+                    let mut st =
+                        vfs::stat::stat(&entry.handle.fs, entry.handle.node, &entry.metadata);
+                    if (oflags & abi::O_PATH) == 0
+                        && entry.metadata.file_type == FileType::CharDevice
+                        && let Some(rdev) = &entry.metadata.rdev
+                        && let Some(canonical_dev) =
+                            canonical_server_dev_path(&root_cloud, &entry.handle, rdev)
+                    {
+                        let device = Some(rdev.clone());
+                        let _ = file_ref.close().await;
+                        drain_releases(&vfs);
+                        return Ok(OpenOutcome::ServerDev {
+                            canonical_dev,
+                            stat: st,
+                            device,
+                        });
+                    }
+                    let is_ns = file_ref.mount_ns().is_some();
+                    let fstype = file_ref.mount_pin().map(|p| p.fstype());
+                    let fds = vfs.process_fds(pid)?;
+                    let insert_res = fds.borrow_mut().insert(file_ref, cloexec);
+                    let fd = match insert_res {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            drain_releases(&vfs);
+                            return Err(e);
+                        }
+                    };
+                    st = vfs::stat::stat(&entry.handle.fs, entry.handle.node, &entry.metadata);
+                    Ok::<_, Errno>(OpenOutcome::Kfd {
+                        kfd: fd,
+                        stat: st,
+                        entry_meta: entry.metadata,
+                        is_ns,
+                        pin_fstype: fstype,
+                    })
+                }
             })
             .await
             .map_err(map_errno)?;
@@ -5243,16 +5345,21 @@ impl Kernel {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let mut st = self
-            .with_proc_scope(pid, async move {
-                let mut st = vfs.statat(pid, anchor.clone(), &path, follow).await?;
-                if !follow
-                    && st.link.is_none()
-                    && (st.mode & abi::S_IFMT) == abi::S_IFLNK
-                    && let Ok(target) = vfs.readlinkat(pid, anchor, &path).await
-                {
-                    st.link = Some(target);
+            .with_proc_scope_retry(pid, || {
+                let vfs = vfs.clone();
+                let anchor = anchor.clone();
+                let path = path.clone();
+                async move {
+                    let mut st = vfs.statat(pid, anchor.clone(), &path, follow).await?;
+                    if !follow
+                        && st.link.is_none()
+                        && (st.mode & abi::S_IFMT) == abi::S_IFLNK
+                        && let Ok(target) = vfs.readlinkat(pid, anchor, &path).await
+                    {
+                        st.link = Some(target);
+                    }
+                    Ok(st)
                 }
-                Ok(st)
             })
             .await
             .map_err(map_errno)?;
@@ -5271,8 +5378,11 @@ impl Kernel {
     ) -> Result<(), JsValue> {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move {
-            vfs.accessat(pid, anchor, &path, mode, follow).await
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let anchor = anchor.clone();
+            let path = path.clone();
+            async move { vfs.accessat(pid, anchor, &path, mode, follow).await }
         })
         .await
         .map_err(map_errno)
@@ -5287,10 +5397,12 @@ impl Kernel {
     ) -> Result<(), JsValue> {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(
-            pid,
-            async move { vfs.mkdirat(pid, anchor, &path, mode).await },
-        )
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let anchor = anchor.clone();
+            let path = path.clone();
+            async move { vfs.mkdirat(pid, anchor, &path, mode).await }
+        })
         .await
         .map(|_| ())
         .map_err(map_errno)
@@ -5307,8 +5419,12 @@ impl Kernel {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let rdev_str = rdev.unwrap_or_default();
-        self.with_proc_scope(pid, async move {
-            vfs.mknodat(pid, anchor, &path, mode, &rdev_str).await
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let anchor = anchor.clone();
+            let path = path.clone();
+            let rdev_str = rdev_str.clone();
+            async move { vfs.mknodat(pid, anchor, &path, mode, &rdev_str).await }
         })
         .await
         .map(|_| ())
@@ -5324,10 +5440,12 @@ impl Kernel {
     ) -> Result<(), JsValue> {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(
-            pid,
-            async move { vfs.unlinkat(pid, anchor, &path, dir).await },
-        )
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let anchor = anchor.clone();
+            let path = path.clone();
+            async move { vfs.unlinkat(pid, anchor, &path, dir).await }
+        })
         .await
         .map_err(map_errno)
     }
@@ -5349,9 +5467,16 @@ impl Kernel {
             RenameFlags::empty()
         };
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move {
-            vfs.renameat(pid, from_anchor, &old_path, to_anchor, &new_path, flags)
-                .await
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let from_anchor = from_anchor.clone();
+            let to_anchor = to_anchor.clone();
+            let old_path = old_path.clone();
+            let new_path = new_path.clone();
+            async move {
+                vfs.renameat(pid, from_anchor, &old_path, to_anchor, &new_path, flags)
+                    .await
+            }
         })
         .await
         .map_err(map_errno)
@@ -5369,9 +5494,16 @@ impl Kernel {
         let from_anchor = parse_anchor(old_kfd).map_err(map_errno)?;
         let to_anchor = parse_anchor(new_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move {
-            vfs.linkat(pid, from_anchor, &old_path, to_anchor, &new_path, follow)
-                .await
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let from_anchor = from_anchor.clone();
+            let to_anchor = to_anchor.clone();
+            let old_path = old_path.clone();
+            let new_path = new_path.clone();
+            async move {
+                vfs.linkat(pid, from_anchor, &old_path, to_anchor, &new_path, follow)
+                    .await
+            }
         })
         .await
         .map(|_| ())
@@ -5387,8 +5519,12 @@ impl Kernel {
     ) -> Result<(), JsValue> {
         let anchor = parse_anchor(dir_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move {
-            vfs.symlinkat(pid, &target, anchor, &link_path).await
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let target = target.clone();
+            let anchor = anchor.clone();
+            let link_path = link_path.clone();
+            async move { vfs.symlinkat(pid, &target, anchor, &link_path).await }
         })
         .await
         .map(|_| ())
@@ -5403,9 +5539,14 @@ impl Kernel {
     ) -> Result<String, JsValue> {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move { vfs.readlinkat(pid, anchor, &path).await })
-            .await
-            .map_err(map_errno)
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let anchor = anchor.clone();
+            let path = path.clone();
+            async move { vfs.readlinkat(pid, anchor, &path).await }
+        })
+        .await
+        .map_err(map_errno)
     }
 
     pub async fn proc_utimensat(
@@ -5423,19 +5564,24 @@ impl Kernel {
         let mtime: Time = serde_json::from_str(&mtime_json)
             .map_err(|e| vfs_js_err(Errno::EINVAL, e.to_string()))?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move {
-            vfs.setattrat(
-                pid,
-                anchor,
-                &path,
-                &SetAttr {
-                    atime,
-                    mtime,
-                    ..SetAttr::default()
-                },
-                follow,
-            )
-            .await
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let anchor = anchor.clone();
+            let path = path.clone();
+            async move {
+                vfs.setattrat(
+                    pid,
+                    anchor,
+                    &path,
+                    &SetAttr {
+                        atime,
+                        mtime,
+                        ..SetAttr::default()
+                    },
+                    follow,
+                )
+                .await
+            }
         })
         .await
         .map(|_| ())
@@ -5452,6 +5598,12 @@ impl Kernel {
         if let Some(um) = batch.umask {
             let _ = vfs.set_umask(pid, um);
         }
+        let before_uid = self
+            .state
+            .borrow()
+            .table
+            .proc(pid)
+            .map(|p| p.cred.identity.id);
         let results = self
             .with_proc_scope(
                 pid,
@@ -5468,6 +5620,15 @@ impl Kernel {
                 ),
             )
             .await;
+        let after_uid = self
+            .state
+            .borrow()
+            .table
+            .proc(pid)
+            .map(|p| p.cred.identity.id);
+        if after_uid != before_uid {
+            self.sync_vfs_proc_creds(pid);
+        }
         serde_json::to_string(&abi::Results { results })
             .map_err(|e| vfs_js_err(Errno::EIO, e.to_string()))
     }

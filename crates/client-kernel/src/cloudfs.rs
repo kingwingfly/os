@@ -752,6 +752,8 @@ impl Drop for PageReadScope {
     }
 }
 
+type LazyMintHook = Rc<dyn Fn(u32)>;
+
 /// Unified `/` cloud filesystem driver mounted at the root of `system_mnt_ns`.
 pub(crate) struct RootCloudDriver {
     fs_id: FsId,
@@ -778,6 +780,7 @@ pub(crate) struct RootCloudDriver {
     writing_by_ino: RefCell<HashMap<u64, abi::Writing>>,
     uid_names: RefCell<HashMap<u32, String>>,
     gid_names: RefCell<HashMap<u32, String>>,
+    on_lazy_mint: RefCell<Option<LazyMintHook>>,
 }
 
 impl RootCloudDriver {
@@ -879,6 +882,17 @@ impl RootCloudDriver {
             writing_by_ino: RefCell::new(HashMap::new()),
             uid_names: RefCell::new(HashMap::new()),
             gid_names: RefCell::new(HashMap::new()),
+            on_lazy_mint: RefCell::new(None),
+        }
+    }
+
+    pub(crate) fn set_on_lazy_mint(&self, hook: LazyMintHook) {
+        *self.on_lazy_mint.borrow_mut() = Some(hook);
+    }
+
+    fn notify_lazy_mint(&self, pid: u32) {
+        if let Some(hook) = self.on_lazy_mint.borrow().as_ref().cloned() {
+            hook(pid);
         }
     }
 
@@ -1382,6 +1396,7 @@ impl RootCloudDriver {
                 let rem = crate::lazy_mint_remote_cred(&self.state, pid)
                     .await
                     .map_err(|e| e.errno)?;
+                self.notify_lazy_mint(pid);
                 rem.token
             }
         } else {
@@ -1389,6 +1404,16 @@ impl RootCloudDriver {
         };
         let mut rcred = cred.clone();
         rcred.token = Some(token.clone());
+        if let Some(pid) = self.active_pid.get()
+            && let Some(id) = self
+                .state
+                .borrow()
+                .table
+                .proc(pid)
+                .map(|p| p.cred.identity.clone())
+        {
+            rcred.identity = id;
+        }
         let actor = self.actor_for_cred(&rcred);
         let session_uid = if let Some(pid) = self.active_pid.get() {
             self.state
@@ -1569,10 +1594,12 @@ impl RootCloudDriver {
             if let Some(tok) = existing {
                 tok
             } else {
-                crate::lazy_mint_remote_cred(&self.state, pid)
+                let tok = crate::lazy_mint_remote_cred(&self.state, pid)
                     .await
                     .map_err(|e| e.errno)?
-                    .token
+                    .token;
+                self.notify_lazy_mint(pid);
+                tok
             }
         };
         let (cloud, src_real, dst_real) = {

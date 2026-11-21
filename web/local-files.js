@@ -30,7 +30,7 @@ const SERVER_ACCOUNT_MUTATION_CALLS = new Set([
   'groupadd', 'groupdel', 'groupmod', 'gpasswd',
 ]);
 
-function isRemoteServerDevPath(raw) {
+function isRemoteServerDevPath(raw, includeDir = false) {
   if (typeof raw !== 'string') return false;
   const parts = [];
   for (const seg of raw.split('/')) {
@@ -39,7 +39,36 @@ function isRemoteServerDevPath(raw) {
     else parts.push(seg);
   }
   const norm = '/' + parts.join('/');
+  if (includeDir && (norm === '/dev/present' || norm === '/dev/snd')) return true;
   return norm.startsWith('/dev/present/') || norm.startsWith('/dev/snd/');
+}
+
+const REMOTE_DEV_PATH_OPS = new Set([
+  'stat', 'lstat', 'getdents', 'mknod', 'unlink', 'getxattr', 'setxattr', 'listxattr', 'removexattr', 'open',
+]);
+const REMOTE_DEV_REF_OPS = new Set(['ioctl', 'close', 'fstat', 'pread', 'pwrite']);
+
+function isRemoteServerDevBatch(calls) {
+  if (!Array.isArray(calls) || calls.length === 0) return false;
+  const devOpenIndices = new Set();
+  for (let i = 0; i < calls.length; i++) {
+    const c = calls[i];
+    const name = callName(c);
+    const arg = typeof c === 'object' && c !== null ? Object.values(c)[0] : null;
+    if (!arg || typeof arg !== 'object') return false;
+    if (REMOTE_DEV_PATH_OPS.has(name)) {
+      if (!isRemoteServerDevPath(arg.path, name === 'getdents' || name === 'stat' || name === 'lstat')) {
+        return false;
+      }
+      if (name === 'open') devOpenIndices.add(i);
+    } else if (REMOTE_DEV_REF_OPS.has(name)) {
+      const ref = arg.fd && typeof arg.fd === 'object' ? arg.fd.ref : null;
+      if (typeof ref !== 'number' || !devOpenIndices.has(ref)) return false;
+    } else {
+      return false;
+    }
+  }
+  return true;
 }
 
 function callName(call) {
@@ -157,6 +186,9 @@ export function installLocalFiles() {
             return serializedNetwork(request);
           }
           if (hasFs && !hasAccountMut) {
+            if (isRemoteServerDevBatch(body.calls)) {
+              return serializedNetwork(request);
+            }
             const results = await kernelCall('mount_vfs_sys', {
               calls: body.calls,
               fdEpoch: request.headers.get('X-Fd-Epoch') ?? undefined,

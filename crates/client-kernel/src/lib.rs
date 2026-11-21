@@ -349,9 +349,9 @@ pub(crate) async fn lazy_mint_remote_cred(
                 Err(Errno::EACCES)
             }
             Some((host, _, cur_id, cur_cg)) => {
-                let res = if proc_uid == os_core::permissions::GUEST
-                    && os_core::permissions::is_guest_id(rem.uid)
-                {
+                let hydrate = proc_uid == os_core::permissions::GUEST
+                    && os_core::permissions::is_guest_id(rem.uid);
+                let res = if hydrate {
                     let hydrated = Identity {
                         id: rem.uid,
                         group: rem.gid,
@@ -363,10 +363,19 @@ pub(crate) async fn lazy_mint_remote_cred(
                     s.table.set_cred(&host, pid, cur_id, Some(rem.clone()))
                 };
                 match res {
-                    Ok(_) => Ok((
-                        cur_cg.clone(),
-                        s.table.cgroups().effective_io_limit(&cur_cg),
-                    )),
+                    Ok(_) => {
+                        if hydrate {
+                            let _ = s.hydrate_guest_account_if_uninitialized(
+                                rem.uid,
+                                rem.gid,
+                                &rem.groups,
+                            );
+                        }
+                        Ok((
+                            cur_cg.clone(),
+                            s.table.cgroups().effective_io_limit(&cur_cg),
+                        ))
+                    }
                     Err(e) => Err(e.errno),
                 }
             }
@@ -514,7 +523,7 @@ impl State {
         self.seat_policies.insert(uid, (sharing, revision));
     }
 
-    pub(crate) fn sync_account(&mut self, account: LocalAccount) {
+    pub(crate) fn sync_account(&mut self, account: LocalAccount) -> Vec<u32> {
         let prev_uid = self.account.uid;
         let initial_guest_hydration = prev_uid == os_core::permissions::GUEST
             && !self.account.signed_in
@@ -524,6 +533,7 @@ impl State {
             || self.account.signed_in != account.signed_in
             || self.account.user != account.user;
         self.account = account;
+        let mut hydrated_pids = Vec::new();
         if initial_guest_hydration {
             // Hydrating the boot fallback guest (65534) to this browser's own unauthenticated
             // guest cookie UID keeps the same login scope and account epoch so in-flight local
@@ -534,6 +544,35 @@ impl State {
             }
             if let Some(pol) = self.seat_policies.remove(&prev_uid) {
                 self.seat_policies.entry(self.account.uid).or_insert(pol);
+            }
+            let cur_epoch = self.account_epoch;
+            let hydrated_id = self.account.identity();
+            let candidates: Vec<(u32, String)> = self
+                .table
+                .all_pids()
+                .into_iter()
+                .filter_map(|pid| {
+                    let p = self.table.proc(pid)?;
+                    if p.pid != 1
+                        && p.state != ProcState::Zombie
+                        && p.cred.identity.id == os_core::permissions::GUEST
+                        && p.cred.remote.is_none()
+                        && self.proc_account_epoch.get(&pid).copied().unwrap_or(0) == cur_epoch
+                    {
+                        Some((pid, p.owner_host.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (pid, host) in candidates {
+                if self
+                    .table
+                    .hydrate_guest_identity(&host, pid, hydrated_id.clone(), None)
+                    .is_ok()
+                {
+                    hydrated_pids.push(pid);
+                }
             }
         } else if uid_changed {
             self.account_epoch = self.account_epoch.saturating_add(1);
@@ -546,6 +585,30 @@ impl State {
             }
             self.login_session = next;
         }
+        hydrated_pids
+    }
+
+    pub(crate) fn hydrate_guest_account_if_uninitialized(
+        &mut self,
+        uid: u32,
+        gid: u32,
+        groups: &[u32],
+    ) -> Vec<u32> {
+        if self.account.uid == os_core::permissions::GUEST
+            && !self.account.signed_in
+            && os_core::permissions::is_guest_id(uid)
+        {
+            let mut next = self.account.clone();
+            next.uid = uid;
+            next.gid = gid;
+            next.groups = if groups.is_empty() {
+                vec![gid]
+            } else {
+                groups.to_vec()
+            };
+            return self.sync_account(next);
+        }
+        Vec::new()
     }
 
     pub(crate) fn login_view(&self) -> Value {
@@ -2238,6 +2301,13 @@ impl Kernel {
                 state.account_epoch,
             )
         };
+        let account_changed = proc_epoch != cur_epoch;
+        if sudo && (proc_uid != 0 || account_changed) {
+            return Err(fail(Error::because(
+                Errno::EPERM,
+                "sudo remote mint requires an active root process in the current account epoch",
+            )));
+        }
         let (instance_id, host_proof) = ensure_remote_attached_state(&self.state)
             .await
             .map_err(fail)?;
@@ -2260,9 +2330,8 @@ impl Kernel {
             _ => return Err(fail(Error::because(Errno::EIO, "unexpected cred reply"))),
         };
         // F3-01: Prevent a guest or stale process from hijacking a signed-in/root account cookie,
-        // and never let `sudo: true` rewrite an existing non-root process's local UID to 0!
-        let account_changed = proc_epoch != cur_epoch;
-        if !sudo && !lazy_mint_uid_permitted(proc_uid, issued.uid, signed_in, account_changed) {
+        // and never let `sudo: true` bind a root remote token onto a non-root or stale process.
+        if !lazy_mint_uid_permitted(proc_uid, issued.uid, signed_in, account_changed) {
             revoke_remote_tokens_state(&self.state, vec![issued.token]).await;
             return Err(fail(Error::because(
                 Errno::EACCES,
@@ -2330,14 +2399,23 @@ impl Kernel {
                             .set_cred(host, pid, next_local_id.clone(), Some(rem.clone()))
                     };
                     set_res.map(|rev| {
+                        let hydrated_pids = if hydrate {
+                            state.hydrate_guest_account_if_uninitialized(
+                                rem.uid,
+                                rem.gid,
+                                &rem.groups,
+                            )
+                        } else {
+                            Vec::new()
+                        };
                         let actual_cloud =
                             state.table.proc(pid).is_some_and(|p| p.cred.cloud_access);
-                        (rev, next_local_id, cur_cg, actual_cloud)
+                        (rev, next_local_id, cur_cg, actual_cloud, hydrated_pids)
                     })
                 }
             }
         };
-        let (revoked, local_id, active_cg, actual_cloud) = match bind_res {
+        let (revoked, local_id, active_cg, actual_cloud, hydrated_pids) = match bind_res {
             Ok(tuple) => tuple,
             Err(err) => {
                 revoke_remote_tokens_state(&self.state, vec![rem.token]).await;
@@ -2352,6 +2430,11 @@ impl Kernel {
             Some(rem.token.clone()),
             actual_cloud,
         );
+        for hpid in hydrated_pids {
+            if hpid != pid {
+                self.sync_vfs_proc_creds(hpid);
+            }
+        }
         revoke_remote_tokens_state(&self.state, revoked).await;
         if active_cg != cgroup {
             self.sync_remote_io_quota_for_token(&rem.token, &active_cg)
@@ -2650,14 +2733,19 @@ impl Kernel {
         let gid = account.gid;
         let user = account.user.clone();
         let group = account.group.clone();
-        self.state.borrow_mut().sync_account(account);
-        let mut rt = self.vfs_rt.borrow_mut();
-        rt.root_cloud.clear_cached_account_names();
-        if !user.is_empty() {
-            rt.uid_names.insert(uid, user);
+        let hydrated_pids = self.state.borrow_mut().sync_account(account);
+        {
+            let mut rt = self.vfs_rt.borrow_mut();
+            rt.root_cloud.clear_cached_account_names();
+            if !user.is_empty() {
+                rt.uid_names.insert(uid, user);
+            }
+            if !group.is_empty() {
+                rt.gid_names.insert(gid, group);
+            }
         }
-        if !group.is_empty() {
-            rt.gid_names.insert(gid, group);
+        for pid in hydrated_pids {
+            self.sync_vfs_proc_creds(pid);
         }
     }
 
@@ -3152,40 +3240,65 @@ impl Kernel {
                         .await
                         {
                             Ok(auth_v2::Response::Cred(issued)) => {
-                                // F3-01: On `!sudo`, NEVER silently overwrite local `Identity`
-                                // when remote and local UIDs diverge (except initial 65534 -> guest
-                                // hydration, or signed-out guest -> guest cookie rotation). Keep
-                                // `sudo: true` remote root identity for #54 Gate 3b.
+                                // F3-01: On `!sudo`, NEVER overwrite local `Identity` OR attach a
+                                // higher-privilege remote token when remote and local UIDs diverge
+                                // (except initial 65534 -> guest hydration, or signed-out guest ->
+                                // guest cookie rotation). Keep `sudo: true` remote root identity
+                                // for #54 Gate 3b.
                                 let guest_cookie_rotated = !signed_in
                                     && os_core::permissions::is_guest_id(default_identity.id)
                                     && os_core::permissions::is_guest_id(issued.uid);
-                                let identity = if sudo
-                                    || guest_cookie_rotated
-                                    || lazy_mint_uid_permitted(
+                                if !sudo
+                                    && !guest_cookie_rotated
+                                    && !lazy_mint_uid_permitted(
                                         default_identity.id,
                                         issued.uid,
                                         signed_in,
                                         false,
-                                    ) {
-                                    Identity {
+                                    )
+                                {
+                                    revoke_remote_tokens_state(&self.state, vec![issued.token])
+                                        .await;
+                                    Err(Error::because(
+                                        Errno::EACCES,
+                                        "remote account identity does not match local account",
+                                    ))
+                                } else {
+                                    let hydrated_pids = if !sudo
+                                        && default_identity.id == os_core::permissions::GUEST
+                                        && !signed_in
+                                        && os_core::permissions::is_guest_id(issued.uid)
+                                    {
+                                        self.state
+                                            .borrow_mut()
+                                            .hydrate_guest_account_if_uninitialized(
+                                                issued.uid,
+                                                issued.gid,
+                                                &issued.groups,
+                                            )
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    for hpid in hydrated_pids {
+                                        self.sync_vfs_proc_creds(hpid);
+                                    }
+                                    let identity = Identity {
                                         id: issued.uid,
                                         group: issued.gid,
                                         groups: issued.groups.iter().copied().collect(),
-                                    }
-                                } else {
-                                    default_identity.clone()
-                                };
-                                let rem = RemoteCredRef {
-                                    token: issued.token,
-                                    uid: issued.uid,
-                                    gid: issued.gid,
-                                    groups: issued.groups,
-                                    instance_id: issued.instance_id,
-                                    lineage: issued.lineage,
-                                    cloud_access: issued.cloud_access && req_cloud,
-                                    scope: issued.scope,
-                                };
-                                Ok(LocalCred::with_remote(identity, issued.umask, rem))
+                                    };
+                                    let rem = RemoteCredRef {
+                                        token: issued.token,
+                                        uid: issued.uid,
+                                        gid: issued.gid,
+                                        groups: issued.groups,
+                                        instance_id: issued.instance_id,
+                                        lineage: issued.lineage,
+                                        cloud_access: issued.cloud_access && req_cloud,
+                                        scope: issued.scope,
+                                    };
+                                    Ok(LocalCred::with_remote(identity, issued.umask, rem))
+                                }
                             }
                             Ok(_) => Err(Error::because(Errno::EIO, "unexpected cred reply")),
                             Err(e) => Err(e),
@@ -3514,5 +3627,81 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn guest_account_hydration_updates_account_login_session_and_inflight_procs() {
+        let mut table = super::LocalProcessTable::new(
+            super::InstanceIdentity {
+                instance: "inst-test".into(),
+                host: "browser".into(),
+            },
+            100,
+        );
+        let host = "host-local";
+        let _ = table.boot_init(host, 100);
+        let p = table
+            .spawn(
+                super::SpawnSpec::new(
+                    "/usr/bin/sh",
+                    super::LocalCred::local_only(super::LocalAccount::default().identity(), 0o022),
+                    host,
+                ),
+                101,
+            )
+            .expect("spawn local guest");
+        let mut proc_epochs = std::collections::HashMap::new();
+        proc_epochs.insert(p.pid, 1);
+        let mut state = super::State {
+            instance_id: "inst-test".into(),
+            namespace: "ns-test".into(),
+            host_proof: String::new(),
+            boot: "boot-1".into(),
+            table,
+            account: super::LocalAccount::default(),
+            account_epoch: 1,
+            proc_account_epoch: proc_epochs,
+            remote_attached: false,
+            host_epoch: 0,
+            pending_revocations: Vec::new(),
+            attached_devices: std::collections::BTreeMap::new(),
+            init_state: super::Init::new("boot-1".into(), 100),
+            login_session: super::LoginSession::new(
+                "inst-test:s1".into(),
+                os_core::permissions::GUEST,
+                86_500,
+                100,
+            ),
+            login_profiles: std::collections::BTreeMap::new(),
+            seat_policies: std::collections::BTreeMap::new(),
+            boot_seq: 1,
+            session_seq: 1,
+        };
+        let session_guest = os_core::permissions::GUEST_UID_MIN + 42;
+        // Must ignore root/non-guest UIDs.
+        assert!(
+            state
+                .hydrate_guest_account_if_uninitialized(0, 0, &[0])
+                .is_empty()
+        );
+        assert_eq!(state.account.uid, os_core::permissions::GUEST);
+        // Hydrating 65534 -> session guest updates account, login_session, and in-flight proc
+        // without bumping account_epoch, allowing reap_init_child to succeed!
+        let hydrated = state.hydrate_guest_account_if_uninitialized(
+            session_guest,
+            session_guest,
+            &[session_guest],
+        );
+        assert_eq!(hydrated, vec![p.pid]);
+        assert_eq!(state.account.uid, session_guest);
+        assert_eq!(state.login_session.uid, session_guest);
+        assert_eq!(state.account_epoch, 1);
+        assert_eq!(
+            state.table.proc(p.pid).unwrap().cred.identity.id,
+            session_guest
+        );
+        state.table.exit(host, p.pid, 0, None, 102).unwrap();
+        let caller = state.account.identity();
+        assert!(state.table.reap_init_child(host, &caller, p.pid).is_ok());
     }
 }

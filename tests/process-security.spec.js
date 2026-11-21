@@ -512,6 +512,14 @@ test('exec replacement rotates remote token while preserving lineage open-refs a
 test('F3-01: set_proc_cred and mint_remote_cred block privilege escalation and preserve non-root local UID', async ({ page, context }) => {
   await page.goto('/login');
   await connect(page);
+
+  // Spawn a pre-login guest process (cloud_access: true) BEFORE logging in as root.
+  const preLoginGuest = value(await kernel(page, 'exec', { ...sleep }));
+  expect(value(await kernel(page, 'getcreds_proc', { pid: preLoginGuest.pid }))).toMatchObject({
+    uid: 65534,
+    has_remote: false,
+  });
+
   await login(context.request);
   value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
 
@@ -519,6 +527,15 @@ test('F3-01: set_proc_cred and mint_remote_cred block privilege escalation and p
   const proc = value(await kernel(page, 'exec', { ...sleep }));
   const noCloud = value(await kernel(page, 'exec', { ...sleep, remote: false }));
   try {
+    // F3-01: Pre-login guest process with cloud_access=true MUST NOT escalate to remote root
+    // via mint_remote_cred(sudo: true) OR mint_remote_cred(sudo: false) after root sign-in!
+    expect((await kernel(page, 'mint_remote_cred', { pid: preLoginGuest.pid, sudo: true })).err?.errno).toBe('EPERM');
+    expect((await kernel(page, 'mint_remote_cred', { pid: preLoginGuest.pid, sudo: false })).err?.errno).toBe('EACCES');
+    expect(value(await kernel(page, 'getcreds_proc', { pid: preLoginGuest.pid }))).toMatchObject({
+      uid: 65534,
+      has_remote: false,
+    });
+
     value(await kernel(page, 'set_proc_cred', { pid: proc.pid, uid: 1001, gid: 1001, groups: [1001] }));
     expect(value(await kernel(page, 'getcreds_proc', { pid: proc.pid })).uid).toBe(1001);
 
@@ -550,7 +567,7 @@ test('F3-01: set_proc_cred and mint_remote_cred block privilege escalation and p
     })).err?.errno).toBe('EPERM');
     expect((await kernel(page, 'mint_remote_cred', { pid: noCloud.pid, sudo: false })).err?.errno).toBe('EACCES');
   } finally {
-    for (const p of [proc, noCloud]) {
+    for (const p of [preLoginGuest, proc, noCloud]) {
       await kernel(page, 'exit', { pid: p.pid, status: 0 });
       await kernel(page, 'wait', { pid: p.pid });
     }
