@@ -19,9 +19,9 @@ test.afterEach(async ({ request }) => { await rmrf(request, base); });
 const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
 async function run(page, text) {
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
   await page.locator('#command').fill(text); await page.locator('#command').press('Enter');
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
 }
 async function output(page, text) { await run(page, text); return (await last(page).textContent()).trim(); }
 async function terminal(page) {

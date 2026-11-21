@@ -32,6 +32,8 @@ pub fn error(e: io::Error) -> String {
         (libc::ENOTCONN, "ENOTCONN"),
         (libc::ENOLCK, "ENOLCK"),
         (libc::EACCES, "EACCES"),
+        #[cfg(target_os = "linux")]
+        (libc::ENOTBLK, "ENOTBLK"),
         (libc::EBUSY, "EBUSY"),
         (libc::EEXIST, "EEXIST"),
         (libc::EXDEV, "EXDEV"),
@@ -672,6 +674,8 @@ mod tests {
             (libc::ENOTCONN, "ENOTCONN"),
             #[cfg(target_os = "linux")]
             (libc::ENODATA, "ENODATA"),
+            #[cfg(target_os = "linux")]
+            (libc::ENOTBLK, "ENOTBLK"),
         ] {
             assert_eq!(error(io::Error::from_raw_os_error(code)), name);
         }

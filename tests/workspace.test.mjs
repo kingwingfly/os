@@ -2330,7 +2330,7 @@ test('PR #73 P1-4 & P2-5: RemoteMount validates/clamps vfs, rejects args.handle 
     const shaHan = await shaHex(blobBytesHan);
     const manifest = JSON.stringify({
       format: 'os.image',
-      version: 1,
+      version: 2,
       kind: 'sysext',
       name: 'unicode-pkg',
       revision: '1',
@@ -2341,8 +2341,8 @@ test('PR #73 P1-4 & P2-5: RemoteMount validates/clamps vfs, rejects args.handle 
       entries: [
         { path: '/', uid: 0, gid: 0, mode: 0o755, node: { type: 'directory' } },
         { path: '/usr', uid: 0, gid: 0, mode: 0o755, node: { type: 'directory' } },
-        { path: '/usr/I', uid: 0, gid: 0, mode: 0o644, node: { type: 'file', sha256: shaI, size: blobBytesI.length } },
-        { path: '/usr/汉', uid: 0, gid: 0, mode: 0o644, node: { type: 'file', sha256: shaHan, size: blobBytesHan.length } },
+        { path: '/usr/I', uid: 0, gid: 0, mode: 0o644, node: { type: 'file', sha256: shaI, size: blobBytesI.length, chunk_size: 262144, chunks: [shaI] } },
+        { path: '/usr/汉', uid: 0, gid: 0, mode: 0o644, node: { type: 'file', sha256: shaHan, size: blobBytesHan.length, chunk_size: 262144, chunks: [shaHan] } },
       ],
     });
     await owner.calls([

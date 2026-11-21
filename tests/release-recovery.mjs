@@ -95,9 +95,9 @@ try {
   const keyId = createHash('sha256').update(publicKey).digest('hex');
   const releasePath = `${assets}/boot/releases/${ids.a}`;
   const manifest = JSON.parse(await readFile(releasePath + '/manifest.json', 'utf8'));
-  const files = [[releasePath + '/manifest.json', releasePath + '/signature.json', 'os.release.v1'],
-    ...[manifest.boot, manifest.base, ...manifest.sysext, ...manifest.confext]
-      .map(id => [`${assets}/boot/images/${id}.json`, `${assets}/boot/images/${id}.sig`, 'os.image.v1'])];
+  const files = [[releasePath + '/manifest.json', releasePath + '/signature.json', 'os.release.v2'],
+    ...[manifest.boot, manifest.initramfs, manifest.root_template, manifest.base, ...manifest.sysext, ...manifest.confext]
+      .map(id => [`${assets}/boot/images/${id}.json`, `${assets}/boot/images/${id}.sig`, 'os.image.v2'])];
   for (const [input, output, domain] of files) {
     signatures.set(output, await readFile(output));
     const signature = sign(null, Buffer.concat([Buffer.from(domain + '\0'), await readFile(input)]), key).toString('hex');

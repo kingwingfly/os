@@ -1,7 +1,8 @@
 import { test, expect } from './storage-test.js';
 import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
-import { api, sys } from './sys.js';
+import { api } from './sys.js';
+import { hookPageKernel } from './service-auth.js';
 
 const coreutils = await readFile('dist/usr/bin/coreutils.wasm');
 const dash = await readFile('dist/usr/bin/dash.wasm');
@@ -117,36 +118,73 @@ test('a private namespace is absent from a second host and native images fail ex
   await other.close();
 });
 
-test('local code requires explicit matching authority admission before any guest instructions', async ({ page, context }) => {
-  await ready(page); await storage(page); await write(page, 'probe', hello('MUST_NOT_RUN'));
+test('local code requires explicit matching authority admission before any guest instructions', async ({ page }) => {
   let variant, admitted;
-  await context.route('**/api/sys', async route => {
-    const body = route.request().postDataJSON();
-    if (!body.calls?.some(call => call.execve?.local)) return route.fallback();
-    const response = await route.fetch(), answer = await response.json();
-    for (const result of answer.results) if (result.ok?.local) {
+  const tamperRoute = async route => {
+    const results = JSON.parse(route.request().postData() || '[]');
+    for (const result of results) if (result?.ok?.local) {
       admitted = result.ok.pid;
       if (variant === 'missing') delete result.ok.local;
       if (variant === 'cloud') result.ok.local.cloud = true;
       if (variant === 'digest') result.ok.local.digest = '0'.repeat(64);
       if (variant === 'asset') result.ok.asset = '/usr/bin/true';
     }
-    await route.fulfill({ response, json: answer });
-  });
-  for (variant of ['missing', 'cloud', 'digest', 'asset']) {
-    admitted = null;
-    const result = await page.evaluate(async () => {
-      let stdout = '';
-      try {
-        await window.os.exec([{ path: './probe', argv: ['./probe'] }], {
-          cwd: '/mnt/local/project', stdin: '',
-          onOutput: (fd, text) => { if (fd === 1) stdout += text; },
-        });
-        return { rejected: false, stdout };
-      } catch (error) { return { rejected: true, stdout, error: error.message }; }
-    });
-    expect(admitted).toBeTruthy(); expect(result.rejected).toBe(true); expect(result.stdout).toBe('');
-    expect(result.error).toMatch(/authority.*local execution/i);
-    expect((await sys(page.request, [{ stat: { path: '/proc/' + admitted } }]))[0].err.errno).toBe('ENOENT');
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(results) });
+  };
+  const kernelRoute = async route => {
+    const response = await route.fetch();
+    const shim = `(() => {
+      Object.defineProperty(self, 'wasm_bindgen', {
+        configurable: true,
+        set(wb) {
+          Object.defineProperty(self, 'wasm_bindgen', { value: wb, writable: true, configurable: true, enumerable: true });
+          const proto = wb?.Kernel?.prototype;
+          if (proto?.execs && !proto.execs.__testTamperExecs) {
+            const origExecs = proto.execs;
+            proto.execs = async function(stages, sudo, seat, host) {
+              const raw = await origExecs.call(this, stages, sudo, seat, host);
+              if (typeof stages === 'string' && stages.includes('probe')) {
+                const tampered = await fetch('/__test_tamper_execs__', { method: 'POST', body: raw });
+                return await tampered.text();
+              }
+              return raw;
+            };
+            proto.execs.__testTamperExecs = true;
+          }
+        },
+      });
+    })();\n`;
+    await route.fulfill({ response, body: shim + await response.text() });
+  };
+  const kernel = await hookPageKernel(page);
+  await page.route('**/__test_tamper_execs__', tamperRoute);
+  await page.route('**/client-kernel.js', kernelRoute);
+  try {
+    await ready(page); await kernel.ready(); await storage(page); await write(page, 'probe', hello('MUST_NOT_RUN'));
+    const sessionId = (await page.evaluate(() => window.os.loginSession()))?.session?.id ?? '';
+    for (variant of ['missing', 'cloud', 'digest', 'asset']) {
+      admitted = null;
+      const result = await page.evaluate(async () => {
+        let stdout = '';
+        try {
+          await window.os.exec([{ path: './probe', argv: ['./probe'] }], {
+            cwd: '/mnt/local/project', stdin: '',
+            onOutput: (fd, text) => { if (fd === 1) stdout += text; },
+          });
+          return { rejected: false, stdout };
+        } catch (error) { return { rejected: true, stdout, error: error.message }; }
+      });
+      expect(admitted).toBeTruthy(); expect(result.rejected).toBe(true); expect(result.stdout).toBe('');
+      expect(result.error).toMatch(/authority.*local execution/i);
+      expect(await kernel.value('poll', { pids: [admitted] })).toEqual([]);
+      const [procStat] = (await kernel.value('vfs_sys', {
+        sessionId,
+        batch: { calls: [{ stat: { path: '/proc/' + admitted } }] },
+      })).results;
+      expect(procStat.err.errno).toBe('ENOENT');
+    }
+  } finally {
+    await page.unroute('**/client-kernel.js', kernelRoute);
+    await page.unroute('**/__test_tamper_execs__', tamperRoute);
   }
 });

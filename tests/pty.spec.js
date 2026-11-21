@@ -1,7 +1,8 @@
 import { test, expect } from './test.js';
 import binaryen from 'binaryen';
 import { readFile } from 'node:fs/promises';
-import { errno, put, rmrf, sys } from './sys.js';
+import { errno, put, rmrf } from './sys.js';
+import { hookPageKernel } from './service-auth.js';
 
 const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const input = page => page.locator('#command');
@@ -65,8 +66,10 @@ test('tty/stty expose a stable terminal, persistent modes and actual resized dim
 });
 
 test('closing a terminal pane hangs up its running and stopped jobs while another pane survives', async ({ page }) => {
+  const kernel = await hookPageKernel(page);
   await page.goto('/');
-  const rows = async () => (await sys(page.request, [{ proc_poll: { pids: [] } }]))[0].ok;
+  await kernel.ready();
+  const rows = async () => kernel.value('poll', { pids: [] });
   const sleep = (process, seconds) => process.argv?.includes('sleep') && process.argv.includes(String(seconds));
   try {
     await input(page).fill('sleep 61'); await input(page).press('Enter');
@@ -84,8 +87,8 @@ test('closing a terminal pane hangs up its running and stopped jobs while anothe
     await input(page).press('Control+c'); await expect(busy(page)).toHaveAttribute('data-state', 'idle');
     await run(page, 'echo console-alive'); await expect(last(page)).toContainText('console-alive');
   } finally {
-    for (const process of await rows()) if ([61, 62, 63].some(n => sleep(process, n)))
-      await sys(page.request, [{ kill: { pid: String(process.pid), signal: 9 } }]);
+    for (const process of await rows().catch(() => [])) if ([61, 62, 63].some(n => sleep(process, n)))
+      await kernel.call('kill', { pid: process.pid, signal: 9 }).catch(() => {});
   }
 });
 
@@ -144,16 +147,18 @@ test('WASIX raw input and cursor addressing render a full-screen application and
   } finally { await rmrf(request, path); }
 });
 
-test('PTY Ctrl+C and Ctrl+Z reach the foreground job; descriptors name the slave', async ({ page, request }) => {
+test('PTY Ctrl+C and Ctrl+Z reach the foreground job; descriptors name the slave', async ({ page }) => {
+  const kernel = await hookPageKernel(page);
   await page.goto('/');
+  await kernel.ready();
   await input(page).fill('coreutils cat'); await input(page).press('Enter');
   await expect(busy(page)).toHaveAttribute('data-state', 'input');
-  const rows = await sys(page.request, [{ proc_poll: { pids: [] } }]);
-  const running = rows[0].ok.find(p => p.argv.includes('cat'));
+  const rows = await kernel.value('poll', { pids: [] });
+  const running = rows.find(p => p.argv?.includes('cat'));
   expect(running).toBeTruthy();
   await expect.poll(async () => {
-    const result = await sys(page.request, [{ readlink: { path: `/proc/${running.pid}/fd/0` } }]);
-    return result[0].ok;
+    const reply = await kernel.call('proc_readlinkat', { pid: running.pid, dirfd: 0x7ffffffd, path: `/proc/${running.pid}/fd/0` });
+    return reply.ok;
   }).toMatch(/^\/dev\/pts\/\d+$/);
   await input(page).fill('canonical'); await input(page).press('Enter'); await expect(last(page)).toHaveText('canonical\ncanonical');
   await input(page).press('Control+z'); await expect(busy(page)).toHaveAttribute('data-state', 'idle');
@@ -254,20 +259,66 @@ const slaveWat = String.raw`(module
 const slaveModule = binaryen.parseText(slaveWat); const slave = Buffer.from(slaveModule.emitBinary()); slaveModule.dispose();
 test('an opened PTY slave polls for real input, reads canonical data and keeps no-echo input private', async ({ page, request }) => {
   const path = `/guest/pty-slave-${crypto.randomUUID()}.wasm`;
-  await page.goto('/'); await upload(request, path, slave);
   let release, blocked = false, producerExited = false;
   const released = new Promise(resolve => { release = resolve; });
-  page.on('request', request => {
-    if (new URL(request.url()).pathname !== '/api/sys' || request.method() !== 'POST') return;
-    if (request.postDataJSON()?.calls.some(call => call.exit?.status === 0)) producerExited = true;
-  });
-  await page.route('**/api/file?**', async route => {
-    if (!new URL(route.request().url()).searchParams.has('compile')) return route.continue();
-    const response = await route.fetch(), data = await response.body();
-    if (data.includes(Buffer.from('POLL_WAITED'))) { blocked = true; await released; }
-    await route.fulfill({ response, body: data }).catch(() => {});
-  });
+  const gatePath = `/__test_pty_gate_${crypto.randomUUID()}`;
+  const exitPath = `/__test_pty_exit_${crypto.randomUUID()}`;
+  const needleBytes = [...Buffer.from('POLL_WAITED')];
+  const gateRoute = async route => {
+    blocked = true;
+    await released;
+    await route.fulfill({ status: 200, body: 'ok' }).catch(() => {});
+  };
+  const exitRoute = async route => {
+    const status = Number(new URL(route.request().url()).searchParams.get('status'));
+    if (status === 0) producerExited = true;
+    await route.fulfill({ status: 200, body: 'ok' }).catch(() => {});
+  };
+  const kernelRoute = async route => {
+    const response = await route.fetch();
+    const shim = `(() => {
+      const pat = ${JSON.stringify(needleBytes)};
+      const match = buf => {
+        if (!buf || buf.length < pat.length) return false;
+        outer: for (let i = 0; i <= buf.length - pat.length; i++) {
+          for (let j = 0; j < pat.length; j++) if (buf[i + j] !== pat[j]) continue outer;
+          return true;
+        }
+        return false;
+      };
+      Object.defineProperty(self, 'wasm_bindgen', {
+        configurable: true,
+        set(wb) {
+          Object.defineProperty(self, 'wasm_bindgen', { value: wb, writable: true, configurable: true, enumerable: true });
+          const proto = wb?.Kernel?.prototype;
+          if (proto?.take_local_exec_bytes && !proto.take_local_exec_bytes.__testPtyGate) {
+            const origTake = proto.take_local_exec_bytes;
+            proto.take_local_exec_bytes = function(key, checkOnly) {
+              const bytes = origTake.call(this, key, checkOnly);
+              if (!checkOnly && match(bytes)) return fetch(${JSON.stringify(gatePath)}).then(() => bytes);
+              return bytes;
+            };
+            proto.take_local_exec_bytes.__testPtyGate = true;
+          }
+          if (proto?.exit && !proto.exit.__testPtyExit) {
+            const origExit = proto.exit;
+            proto.exit = function(pid, status, signal, host) {
+              void fetch(${JSON.stringify(exitPath)} + '?status=' + (status ?? 0)).catch(() => {});
+              return origExit.call(this, pid, status, signal, host);
+            };
+            proto.exit.__testPtyExit = true;
+          }
+        },
+      });
+    })();\n`;
+    await route.fulfill({ response, body: shim + await response.text() });
+  };
+  await page.route(`**${gatePath}`, gateRoute);
+  await page.route(`**${exitPath}**`, exitRoute);
+  await page.route('**/client-kernel.js', kernelRoute);
+  await page.goto('/'); await upload(request, path, slave);
   try {
+    producerExited = false;
     await input(page).fill(`echo pipeline | ${path}`); await input(page).press('Enter');
     // The master must retain input after the first stage closes its slave and
     // before the delayed consumer opens /dev/tty as a new reader.
@@ -280,7 +331,13 @@ test('an opened PTY slave polls for real input, reads canonical data and keeps n
     await expect(last(page)).toContainText('SLAVE_READ');
     await expect(page.locator('.transcript')).not.toContainText('secret-text');
     await expect(input(page)).toHaveAttribute('type', 'text');
-  } finally { release(); await rmrf(request, path); }
+  } finally {
+    release();
+    await page.unroute('**/client-kernel.js', kernelRoute).catch(() => {});
+    await page.unroute(`**${gatePath}`, gateRoute).catch(() => {});
+    await page.unroute(`**${exitPath}**`, exitRoute).catch(() => {});
+    await rmrf(request, path);
+  }
 });
 
 test('terminal and filesystem calls preserve descriptor references and failures in mixed batches', async ({ page }) => {

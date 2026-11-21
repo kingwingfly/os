@@ -1,6 +1,8 @@
 import { test, expect, request as requests } from './test.js';
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { api, call, errno, mkdirp, program, put, rmrf } from './sys.js';
+import { api, call, errno, mkdirp, program, put, rmrf, sys } from './sys.js';
+import { attachInstance, FULL_SCOPE } from './service-auth.js';
 import { device, directory, ACCEL } from './accelerator.js';
 import { zipOf } from './archive-fixtures.js';
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
@@ -112,19 +114,74 @@ test('sudo preserves the initiating account as controller while execution retain
   expect((await program(request, ['useradd', '-m', '-G', 'wheel', name])).ok()).toBe(true);
   await api(request, 'passwd', { data: { username: name, password: secret, force: true, sudo: true } });
   const user = await requests.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin } });
-  let process;
+  let inst, cred, fsConn;
+  const fsCall = async (token, session, fsOp) => {
+    const res = await user.post(origin + '/api/fs', {
+      headers: { Origin: origin, 'X-OS-Instance': inst.instanceId },
+      data: { version: 2, credential: token, session, call: fsOp },
+    });
+    const body = await res.json();
+    expect(res.ok(), JSON.stringify(body)).toBe(true);
+    return body;
+  };
   try {
     expect((await api(user, 'login', { data: { username: name, password: secret } })).ok()).toBe(true);
     expect((await api(user, 'sudo', { data: { password: secret } })).ok()).toBe(true);
-    process = await call(user, { execve: { path: '/usr/bin/utilities', argv: ['unzip'], cwd: base } }, { sudo: true });
-    const options = { pid: process.pid, proc: process.token };
-    const driver = await device(user, '/dev/archive', options), at = await directory(user, base, options);
-    const task = await driver.submit({ operation: 'extract', format: 'zip', source: at('source.zip'),
-      destination: at('dest'), existing: 'ask', members: [], verbose: false });
+    inst = await attachInstance(user, { origin });
+    cred = await inst.mint({ scope: FULL_SCOPE, cloud_access: true, sudo: true });
+    expect(cred.uid).toBe(0);
+
+    // Open base directory as a v2 O_PATH OpenRef under the sudo ServiceAuth v2 credential.
+    fsConn = await fsCall(cred.token, null, 'connect');
+    const walked = await fsCall(cred.token, fsConn.session, { walk: { dir: fsConn.root, names: base.split('/').filter(Boolean) } });
+    const baseHandle = walked.entries.at(-1).handle;
+    const baseOpen = await fsCall(cred.token, fsConn.session, {
+      open: {
+        ticket: randomUUID(),
+        handle: baseHandle,
+        options: { read: false, write: false, append: false, append_implies_write: false, truncate: false, create: false, create_new: false, exec: false, path: true },
+      },
+    });
+    const at = entry => ({ directory: 0, open: baseOpen, name: entry });
+    const extra = {
+      'X-OS-Instance': inst.instanceId,
+      'X-Fs-Session': fsConn.session.id,
+      'X-Fs-Secret': fsConn.session.secret,
+    };
+    const procCall = async c => {
+      const [res] = await sys(user, [c], { proc: cred.token }, extra);
+      expect(res.err, JSON.stringify(res)).toBeUndefined();
+      return res.ok;
+    };
+    const { fd } = await procCall({ open: { path: '/dev/archive', flags: 2 } });
+    const ioctl = (op, arg) => procCall({ ioctl: { fd, request: ACCEL[op], arg } });
+    const submitted = await ioctl('submit', {
+      version: 1,
+      request: randomUUID(),
+      operation: {
+        operation: 'extract',
+        format: 'zip',
+        source: at('source.zip'),
+        destination: at('dest'),
+        existing: 'ask',
+        members: [],
+        verbose: false,
+      },
+    });
+    const task = {
+      id: submitted.id,
+      poll: (after = 0, limit = 128) => ioctl('poll', { version: 1, id: submitted.id, after, limit }),
+      detach: () => ioctl('detach', { version: 1, id: submitted.id }),
+    };
     await question(task);
     await task.detach();
-    await call(user, { exit: { status: 0 } }, options);
-    process = null;
+    await procCall({ close: { fd } });
+    await fsCall(cred.token, fsConn.session, { release: { open: baseOpen } });
+    await fsCall(cred.token, fsConn.session, 'disconnect');
+    fsConn = null;
+    await inst.revoke([cred.token]);
+    cred = null;
+
     const resumed = await (await device(user)).attach(task.id);
     const conflict = await question(resumed);
     await resumed.answer(conflict.sequence, Object.fromEntries(conflict.paths.map(p => [p, true])));
@@ -133,7 +190,8 @@ test('sudo preserves the initiating account as controller while execution retain
     expect((await call(request, { stat: { path: base + '/dest/file.txt' } })).uid).toBe(0);
     await resumed.close();
   } finally {
-    if (process) await call(user, { exit: { status: 1 } }, { pid: process.pid, proc: process.token }).catch(() => {});
+    if (fsConn && cred && inst) await fsCall(cred.token, fsConn.session, 'disconnect').catch(() => {});
+    if (inst) await inst.detach().catch(() => {});
     await user.dispose();
     await call(request, { userdel: { name, remove: true } }, { sudo: true }).catch(() => {});
   }

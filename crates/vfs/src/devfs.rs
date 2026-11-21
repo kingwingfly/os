@@ -14,6 +14,7 @@ use os_core::permissions::{EXEC, Node, READ};
 use os_core::xattr;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 /// Host backend for character devices beyond the built-in byte devices (`null`, `zero`, `full`).
 pub trait DeviceBackend {
@@ -76,10 +77,19 @@ impl DeviceBackend for DefaultDeviceBackend {
     }
 }
 
+/// Remote character device drivers that require explicit credentialed attachment
+/// (`docs/architecture/contract.md` §2.7). None of these are seeded at standalone boot.
+pub const REMOTE_DEVICE_DRIVERS: [&str; 4] = ["archive", "media", "present", "snd"];
+
+/// Optional per-caller authorization hook invoked when opening an attached remote device node.
+pub type RemoteDeviceOpenHook = Rc<dyn Fn(&Cred, &str) -> Result<()>>;
+
 /// `/dev` filesystem (`devtmpfs` fstype).
 pub struct DevTmpFs<D = DefaultDeviceBackend> {
     inner: MemFs,
     backend: D,
+    attached_remotes: RefCell<HashMap<String, String>>,
+    remote_open_hook: RefCell<Option<RemoteDeviceOpenHook>>,
 }
 
 impl<D: DeviceBackend> DevTmpFs<D> {
@@ -89,6 +99,9 @@ impl<D: DeviceBackend> DevTmpFs<D> {
         let inner = MemFs::new(id, generation, 0, 0, 0o755, clock);
         let root = inner.root();
 
+        // Seed ONLY instance-local devices at boot (Contract §2.7). Remote drivers
+        // (`archive`, `media`, `present`, `snd`) are attached explicitly with a verified
+        // remote credential via `attach_remote`.
         for (name, mode, rdev) in [
             ("null", 0o666, "null"),
             ("zero", 0o666, "zero"),
@@ -99,20 +112,13 @@ impl<D: DeviceBackend> DevTmpFs<D> {
             ("console", 0o600, "console"),
             ("ptmx", 0o666, "ptmx"),
             ("system", 0o644, "system"),
-            ("archive", 0o666, "archive"),
-            ("media", 0o666, "media"),
         ] {
             now_or_never(inner.mknod(&root_cred, &root, name, mode, rdev))
                 .expect("sync memfs mknod")
                 .expect("seed dev node");
         }
 
-        for (name, mode) in [
-            ("pts", 0o755),
-            ("present", 0o755),
-            ("snd", 0o755),
-            ("shm", 0o1777),
-        ] {
+        for (name, mode) in [("pts", 0o755), ("shm", 0o1777)] {
             let entry = now_or_never(inner.mkdir(&root_cred, &root, name, mode))
                 .expect("sync memfs mkdir")
                 .expect("seed dev dir");
@@ -141,11 +147,174 @@ impl<D: DeviceBackend> DevTmpFs<D> {
                 .expect("seed dev symlink");
         }
 
-        Self { inner, backend }
+        Self {
+            inner,
+            backend,
+            attached_remotes: RefCell::new(HashMap::new()),
+            remote_open_hook: RefCell::new(None),
+        }
+    }
+
+    /// Install a per-caller authorization check for opening attached remote device nodes
+    /// (`archive`, `media`, `present`, `snd`). `stat`/`lookup` remain permitted on attached nodes.
+    pub fn set_remote_open_hook(&self, hook: RemoteDeviceOpenHook) {
+        *self.remote_open_hook.borrow_mut() = Some(hook);
     }
 
     pub fn backend(&self) -> &D {
         &self.backend
+    }
+
+    /// Register a `/dev/vdN` managed volume device node (contract §2.16, #77).
+    pub fn register_vblk(&self, name: &str, mode: u16) -> Result<Entry> {
+        let mut root_cred = Cred::root();
+        root_cred.umask = 0;
+        let root = self.inner.root();
+        let rdev = crate::vblk::vblk_rdev(name);
+        now_or_never(self.inner.mknod(&root_cred, &root, name, mode, &rdev))
+            .expect("sync memfs mknod")
+    }
+
+    /// Explicitly attach a remote device driver (`archive`, `media`, `present`, or `snd`)
+    /// after verifying a non-empty remote credential/scope handle.
+    pub fn attach_remote(&self, driver: &str, mode: u16, credential_scope: &str) -> Result<()> {
+        if !REMOTE_DEVICE_DRIVERS.contains(&driver) {
+            return Err(Errno::ENODEV);
+        }
+        if credential_scope.trim().is_empty() {
+            return Err(Errno::EACCES);
+        }
+        let mut root_cred = Cred::root();
+        root_cred.umask = 0;
+        let root = self.inner.root();
+        match driver {
+            "archive" | "media" => {
+                if now_or_never(self.inner.lookup(&root_cred, &root, driver))
+                    .expect("sync memfs lookup")
+                    .is_err()
+                {
+                    now_or_never(
+                        self.inner
+                            .mknod(&root_cred, &root, driver, mode & 0o777, driver),
+                    )
+                    .expect("sync memfs mknod")?;
+                }
+            }
+            "present" | "snd" => {
+                if now_or_never(self.inner.lookup(&root_cred, &root, driver))
+                    .expect("sync memfs lookup")
+                    .is_err()
+                {
+                    now_or_never(self.inner.mkdir(&root_cred, &root, driver, mode & 0o777))
+                        .expect("sync memfs mkdir")?;
+                }
+            }
+            _ => return Err(Errno::ENODEV),
+        }
+        self.attached_remotes
+            .borrow_mut()
+            .insert(driver.to_string(), credential_scope.to_string());
+        Ok(())
+    }
+
+    /// Seed or update a named remote device node inside an attached `/dev/present` or `/dev/snd`
+    /// directory. Refuses with `ENOTCONN` if the driver has not been explicitly attached.
+    pub fn attach_remote_node(
+        &self,
+        driver: &str,
+        name: &str,
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> Result<()> {
+        if !matches!(driver, "present" | "snd") {
+            return Err(Errno::ENODEV);
+        }
+        if !self.is_remote_attached(driver) {
+            return Err(Errno::ENOTCONN);
+        }
+        check_component(name)?;
+        let mut root_cred = Cred::root();
+        root_cred.umask = 0;
+        let root = self.inner.root();
+        let dir = now_or_never(self.inner.lookup(&root_cred, &root, driver))
+            .expect("sync memfs lookup")?;
+        if now_or_never(self.inner.lookup(&root_cred, &dir.handle, name))
+            .expect("sync memfs lookup")
+            .is_ok()
+        {
+            let _ = now_or_never(self.inner.unlink(&root_cred, &dir.handle, name))
+                .expect("sync memfs unlink");
+        }
+        let entry =
+            now_or_never(
+                self.inner
+                    .mknod(&root_cred, &dir.handle, name, mode & 0o777, driver),
+            )
+            .expect("sync memfs mknod")?;
+        let _ = now_or_never(self.inner.setattr(
+            &root_cred,
+            &entry.handle,
+            &SetAttr {
+                uid: Some(uid),
+                gid: Some(gid),
+                mode: Some(mode & 0o777),
+                ..SetAttr::default()
+            },
+        ))
+        .expect("sync memfs setattr");
+        Ok(())
+    }
+
+    /// Detach a remote device driver and remove its device node(s) from `/dev`.
+    pub fn detach_remote(&self, driver: &str) -> Result<()> {
+        if !REMOTE_DEVICE_DRIVERS.contains(&driver) {
+            return Err(Errno::ENODEV);
+        }
+        self.attached_remotes.borrow_mut().remove(driver);
+        let mut root_cred = Cred::root();
+        root_cred.umask = 0;
+        let root = self.inner.root();
+        match driver {
+            "archive" | "media" => {
+                match now_or_never(self.inner.unlink(&root_cred, &root, driver))
+                    .expect("sync memfs unlink")
+                {
+                    Ok(()) | Err(Errno::ENOENT) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
+            "present" | "snd" => {
+                if let Ok(dir) = now_or_never(self.inner.lookup(&root_cred, &root, driver))
+                    .expect("sync memfs lookup")
+                {
+                    if let Ok(entries) = now_or_never(self.inner.read_dir(&root_cred, &dir.handle))
+                        .expect("sync memfs readdir")
+                    {
+                        for child in entries {
+                            let _ = now_or_never(self.inner.unlink(
+                                &root_cred,
+                                &dir.handle,
+                                &child.name,
+                            ))
+                            .expect("sync memfs unlink");
+                        }
+                    }
+                    let _ = now_or_never(self.inner.rmdir(&root_cred, &root, driver))
+                        .expect("sync memfs rmdir");
+                }
+                Ok(())
+            }
+            _ => Err(Errno::ENODEV),
+        }
+    }
+
+    pub fn is_remote_attached(&self, driver: &str) -> bool {
+        self.attached_remotes.borrow().contains_key(driver)
+    }
+
+    pub fn remote_credential_scope(&self, driver: &str) -> Option<String> {
+        self.attached_remotes.borrow().get(driver).cloned()
     }
 }
 
@@ -301,7 +470,20 @@ impl<D: DeviceBackend> Filesystem for DevTmpFs<D> {
         handle: &'a Handle,
         options: &'a OpenOptions,
     ) -> BoxFuture<'a, OpenRef> {
-        self.inner.open(cred, handle, options)
+        Box::pin(async move {
+            let meta = self.inner.metadata(cred, handle).await?;
+            if let Some(driver) = meta.rdev.as_deref()
+                && REMOTE_DEVICE_DRIVERS.contains(&driver)
+            {
+                if !self.is_remote_attached(driver) {
+                    return Err(Errno::ENOTCONN);
+                }
+                if let Some(hook) = self.remote_open_hook.borrow().clone() {
+                    hook(cred, driver)?;
+                }
+            }
+            self.inner.open(cred, handle, options).await
+        })
     }
     fn open_metadata<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, Metadata> {
         self.inner.open_metadata(open)
@@ -1234,5 +1416,159 @@ impl<D: DeviceBackend> Filesystem for DevPtsFs<D> {
             state.opens.remove(&open.id);
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boot_seeding_omits_remote_devices_and_attach_requires_credential() {
+        let dev = DevTmpFs::new(
+            FsId("devtmpfs:test".into()),
+            1,
+            Box::new(|| (1_700_000_000, 0)),
+            DefaultDeviceBackend,
+        );
+        let root_cred = Cred::root();
+        let root = dev.root();
+
+        // Local boot devices exist.
+        for local in [
+            "null", "zero", "full", "random", "urandom", "tty", "console", "ptmx", "system", "pts",
+            "shm", "fd",
+        ] {
+            assert!(
+                now_or_never(dev.lookup(&root_cred, &root, local))
+                    .unwrap()
+                    .is_ok(),
+                "expected boot device /dev/{local}"
+            );
+        }
+        // Remote drivers are absent at standalone boot.
+        for remote in REMOTE_DEVICE_DRIVERS {
+            assert_eq!(
+                now_or_never(dev.lookup(&root_cred, &root, remote))
+                    .unwrap()
+                    .unwrap_err(),
+                Errno::ENOENT,
+                "remote driver /dev/{remote} must not exist at boot"
+            );
+            assert!(!dev.is_remote_attached(remote));
+        }
+
+        // Empty credential scope is refused with EACCES; unknown driver -> ENODEV.
+        assert_eq!(dev.attach_remote("archive", 0o666, ""), Err(Errno::EACCES));
+        assert_eq!(
+            dev.attach_remote("bogus", 0o666, "cred"),
+            Err(Errno::ENODEV)
+        );
+        assert_eq!(
+            dev.attach_remote_node("present", "deck", 1000, 1000, 0o644),
+            Err(Errno::ENOTCONN)
+        );
+
+        // Explicit credentialed attach creates device nodes and detach removes them cleanly.
+        dev.attach_remote("archive", 0o666, "scope:ann").unwrap();
+        dev.attach_remote("present", 0o755, "scope:ann").unwrap();
+        dev.attach_remote_node("present", "deck", 1000, 1000, 0o644)
+            .unwrap();
+        assert!(dev.is_remote_attached("archive"));
+        assert!(dev.is_remote_attached("present"));
+        assert!(
+            now_or_never(dev.lookup(&root_cred, &root, "archive"))
+                .unwrap()
+                .is_ok()
+        );
+        let present_dir = now_or_never(dev.lookup(&root_cred, &root, "present"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            now_or_never(dev.lookup(&root_cred, &present_dir.handle, "deck"))
+                .unwrap()
+                .is_ok()
+        );
+
+        dev.detach_remote("archive").unwrap();
+        dev.detach_remote("present").unwrap();
+        assert!(!dev.is_remote_attached("archive"));
+        assert!(!dev.is_remote_attached("present"));
+        assert_eq!(
+            now_or_never(dev.lookup(&root_cred, &root, "archive"))
+                .unwrap()
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+        assert_eq!(
+            now_or_never(dev.lookup(&root_cred, &root, "present"))
+                .unwrap()
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn remote_device_open_hook_enforces_per_caller_scope_while_allowing_stat() {
+        let dev = DevTmpFs::new(
+            FsId("devtmpfs:scope".into()),
+            1,
+            Box::new(|| (1_700_000_000, 0)),
+            DefaultDeviceBackend,
+        );
+        dev.set_remote_open_hook(Rc::new(|cred, driver| {
+            if cred.token.as_deref() == Some("tok-archive") && driver == "archive" {
+                Ok(())
+            } else {
+                Err(Errno::EACCES)
+            }
+        }));
+        dev.attach_remote("archive", 0o666, "scope:archive")
+            .unwrap();
+        dev.attach_remote("media", 0o666, "scope:media").unwrap();
+
+        let root = dev.root();
+        let denied = Cred {
+            identity: os_core::permissions::Identity {
+                id: 1000,
+                group: 1000,
+                groups: std::collections::BTreeSet::from([1000]),
+            },
+            umask: 0o022,
+            token: None,
+        };
+        let allowed = Cred {
+            token: Some("tok-archive".into()),
+            ..denied.clone()
+        };
+
+        // Lookup/stat succeeds for both callers on attached devices.
+        let arch = now_or_never(dev.lookup(&denied, &root, "archive"))
+            .unwrap()
+            .unwrap();
+        let media = now_or_never(dev.lookup(&allowed, &root, "media"))
+            .unwrap()
+            .unwrap();
+
+        let opts = OpenOptions::from_flags(0).unwrap();
+        // Caller without remote token/scope is denied EACCES on open.
+        assert_eq!(
+            now_or_never(dev.open(&denied, &arch.handle, &opts))
+                .unwrap()
+                .unwrap_err(),
+            Errno::EACCES
+        );
+        // Caller with archive scope can open /dev/archive but NOT /dev/media.
+        assert!(
+            now_or_never(dev.open(&allowed, &arch.handle, &opts))
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(
+            now_or_never(dev.open(&allowed, &media.handle, &opts))
+                .unwrap()
+                .unwrap_err(),
+            Errno::EACCES
+        );
     }
 }

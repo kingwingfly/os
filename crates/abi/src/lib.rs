@@ -12,13 +12,15 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 pub mod accelerator;
+pub mod auth_v2;
 pub mod contract;
 pub mod fs;
 pub mod local_helper;
 pub mod remote_fs;
 pub mod system;
+pub mod volume;
 
-pub use contract::{fs_magic, mount_flags, statfs_flags, umount_flags, unshare_flags};
+pub use contract::{cowfs_ioctl, fs_magic, mount_flags, statfs_flags, umount_flags, unshare_flags};
 
 /// Why a call failed, as Linux's errno says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -33,6 +35,7 @@ pub enum Errno {
     EBADF,
     EAGAIN,
     EACCES,
+    ENOTBLK,
     EBUSY,
     EEXIST,
     EXDEV,
@@ -81,6 +84,7 @@ impl Errno {
             EBADF => "Bad file descriptor",
             EAGAIN => "Resource temporarily unavailable",
             EACCES => "Permission denied",
+            ENOTBLK => "Block device required",
             EBUSY => "Device or resource busy",
             EEXIST => "File exists",
             EXDEV => "Invalid cross-device link",
@@ -1336,112 +1340,6 @@ pub enum Call {
     InotifyRmWatch {
         wd: u32,
     },
-    /// Begin a browser's process namespace, as init does. A new `boot` reaps only the calling
-    /// account's old processes and lends. The browser's guest cookie names the namespace;
-    /// a caller-supplied boot id grants no authority over another account.
-    ProcInit {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        boot: Option<String>,
-    },
-    /// execve(2): run the executable at `path` as a new child of the namespace's init, or, with
-    /// `pid` and that process's own token (`proc`), as that process, its image replaced. The
-    /// kernel checks the path, regular and whole, and execute permission (X, not read: an
-    /// x-only file runs), and gives the loader the image's descriptor or asset and the process's
-    /// new token. A new process runs as the caller (root under sudo); a replaced one keeps its
-    /// credentials and its open descriptors, as Linux's execve does.
-    Execve {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        local: Option<LocalExecutable>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pid: Option<u32>,
-        /// The token of the process `pid`, which only that process holds: the proof that it
-        /// replaces itself.
-        #[serde(default, rename = "proc", skip_serializing_if = "Option::is_none")]
-        token: Option<String>,
-        path: String,
-        #[serde(default)]
-        argv: Vec<String>,
-        #[serde(default)]
-        env: Vec<String>,
-        #[serde(default = "slash")]
-        cwd: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cgroup: Option<String>,
-        /// The tab that runs it (the client kernel's "seat"), which holds a Web Lock while it
-        /// lives: a process whose seat's lock is free was left by a tab that is gone.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        seat: Option<String>,
-        /// Execution-host resource contract. This is capability negotiation, not trust.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        runtime: Option<String>,
-    },
-    /// The host's projection of its local terminal descriptors. Metadata only: knowing
-    /// a PTY number grants no access to its buffers or another process's descriptors.
-    ProcTty {
-        pid: u32,
-        #[serde(rename = "proc")]
-        token: String,
-        tty: u32,
-        fds: Vec<u32>,
-    },
-    /// fork(2)'s registry half: a child of `pid`, with its credentials, cgroup and descriptors
-    /// copied. The client kernel clones the guest's wasm state (asyncify snapshot). The child
-    /// is `child`, a pid the kernel was lent (`Pids`), when it forked at once and tells of it
-    /// after; with none, the registry gives one.
-    Fork {
-        pid: u32,
-        /// posix_spawn creates a pending child without cloning the parent's VM.
-        #[serde(default)]
-        empty_memory: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        child: Option<u32>,
-        /// The parent's token, when its kernel tells of the fork in a batch of others' calls.
-        #[serde(default, rename = "proc", skip_serializing_if = "Option::is_none")]
-        token: Option<String>,
-    },
-    /// exit(2): the calling process (its token) ends with `status`, or by `signal`. It becomes a
-    /// zombie until its parent waits for it; init reaps orphans. The kernel that hosts several
-    /// tells of their ends in one batch, each naming its process by `pid` and token (`proc`).
-    Exit {
-        #[serde(default)]
-        status: i32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        signal: Option<u8>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pid: Option<u32>,
-        #[serde(default, rename = "proc", skip_serializing_if = "Option::is_none")]
-        token: Option<String>,
-    },
-    /// Lend the client kernel `kernel` (its own id, which it holds a Web Lock of while it runs)
-    /// `count` pids of its namespace, which its forks take at once, without asking (`Fork`'s
-    /// `child`). What a kernel was lent and did not take goes back once it is gone (`Gone`).
-    /// Reservations belong to the caller's account and, for a process batch, its token.
-    Pids {
-        count: u32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        kernel: Option<String>,
-    },
-    /// What the client kernel checks is still there: the tabs (seats) whose processes still
-    /// run, and the kernels holding lent pids (`{seats, kernels}`), for the account or all for root.
-    Seats,
-    /// Machine-wide init host ownership. This grants no process or account privilege.
-    MachineInit {
-        action: InitAction,
-    },
-    /// Login-session coordination, separate from POSIX sessions and process credentials.
-    /// The authority selects the login from cookies; public host/session IDs grant nothing.
-    LoginSession {
-        action: LoginAction,
-    },
-    /// The tab `seat`, or the kernel `kernel`, is gone (its Web Lock is free): what the tab ran
-    /// ended with it, as by SIGKILL, and init reaps it; the pids the kernel was lent go back.
-    /// Every affected row must belong to the caller's account, or the caller must be root.
-    Gone {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        seat: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        kernel: Option<String>,
-    },
     /// getpid(2), of the calling process.
     Getpid,
     /// POSIX process groups and sessions, always as an authenticated process.
@@ -1456,11 +1354,6 @@ pub enum Call {
         pgid: i32,
     },
     Setsid,
-    /// Host bootstrap of a fresh pipeline's session. Each init child proves ownership;
-    /// this does not change credentials or grant access to terminal buffers.
-    ProcSession {
-        processes: Vec<ProcessProof>,
-    },
     /// Linux prctl subset: PR_SET_CHILD_SUBREAPER (36), PR_GET_CHILD_SUBREAPER (37).
     Prctl {
         option: u32,
@@ -1476,16 +1369,6 @@ pub enum Call {
     Waitpid {
         pid: i32,
         options: u32,
-    },
-    /// What those processes are now, as waitid(2) with WNOHANG tells it, for the caller's
-    /// namespace and account.
-    ProcPoll {
-        #[serde(default)]
-        pids: Vec<u32>,
-    },
-    /// Renew hosted processes and recover their current state after a missed event.
-    ProcKeep {
-        processes: Vec<ProcessProof>,
     },
     /// A cgroup of the namespace's hierarchy, as cgroup v2 makes one.
     CgroupCreate {
@@ -1515,11 +1398,6 @@ pub enum Call {
     CgroupStat {
         path: String,
     },
-    /// Runtime-only linear-memory reservation, before allocation. Ordinary guest
-    /// syscall imports cannot issue it; the owning execution host carries its proof.
-    Resource {
-        memory: u64,
-    },
     /// The cgroups below `path`, or the root's, as getdents lists a directory.
     CgroupList {
         #[serde(default = "slash")]
@@ -1548,7 +1426,7 @@ pub enum Call {
         arg: serde_json::Value,
     },
 }
-/// What a `Kill` or a `Wait` names: a process of the browser's registry (a number), or an
+/// What a `Kill` or a `Wait` names: a process of the instance's process table (a number), or an
 /// archive job (its id, a word of hexadecimal digits that is never a number).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target<'a> {
@@ -1572,38 +1450,24 @@ impl<'a> Target<'a> {
 }
 
 impl Call {
-    /// Whether the call is the process registry's (each browser's own, not the filesystem's):
-    /// the namespace, its processes and cgroups. A Kill or Wait of a number names a process; of
-    /// a word, an archive job (`Target`).
+    /// Whether the call belongs to the instance-local process/cgroup table (handled locally by
+    /// the client kernel, never by `OsAuthority`). A `Kill` or `Wait` of a number names a local
+    /// process; of a hex job id, a remote job (`Target::Job`).
     pub fn is_registry(&self) -> bool {
         match self {
-            Call::ProcInit { .. }
-            | Call::Execve { .. }
-            | Call::Fork { .. }
-            | Call::Exit { .. }
-            | Call::Pids { .. }
-            | Call::Seats
-            | Call::MachineInit { .. }
-            | Call::LoginSession { .. }
-            | Call::Gone { .. }
-            | Call::Getpid
+            Call::Getpid
             | Call::Getpgid { .. }
             | Call::Getsid { .. }
             | Call::Setpgid { .. }
             | Call::Setsid
-            | Call::ProcSession { .. }
             | Call::ProcStopped { .. }
             | Call::Prctl { .. }
             | Call::Waitpid { .. }
-            | Call::ProcPoll { .. }
-            | Call::ProcKeep { .. }
-            | Call::ProcTty { .. }
             | Call::CgroupCreate { .. }
             | Call::CgroupRemove { .. }
             | Call::CgroupSet { .. }
             | Call::CgroupAttach { .. }
             | Call::CgroupStat { .. }
-            | Call::Resource { .. }
             | Call::CgroupList { .. } => true,
             Call::Kill { pid, .. } | Call::Wait { pid, .. } => {
                 !matches!(Target::of(pid), Target::Job(_))
@@ -1766,25 +1630,6 @@ mod tests {
 
     #[test]
     fn process_calls_carry_linuxs_values_and_old_batches_still_parse() {
-        let call: Call = serde_json::from_str(
-            r#"{"execve":{"path":"/usr/bin/coreutils","argv":["seq","3"],"env":["LANG=C"],"cwd":"/work"}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            call,
-            Call::Execve {
-                local: None,
-                runtime: None,
-                pid: None,
-                token: None,
-                path: "/usr/bin/coreutils".into(),
-                argv: vec!["seq".into(), "3".into()],
-                env: vec!["LANG=C".into()],
-                cwd: "/work".into(),
-                cgroup: None,
-                seat: None,
-            }
-        );
         assert_eq!(signal_named("SIGTSTP"), Some(SIGTSTP));
         assert_eq!(signal_named("kill"), Some(SIGKILL));
         assert_eq!(signal_named("15"), Some(SIGTERM));
@@ -1805,30 +1650,14 @@ mod tests {
         assert_eq!(signaled(9), Some(SIGKILL));
         assert_eq!(signaled(3 << 8), None);
         assert_eq!(Errno::ENOEXEC.text(), "Exec format error");
-        // A kernel tells of several processes' ends in one batch, each by its pid and token.
-        let exit: Call =
-            serde_json::from_str(r#"{"exit":{"status":3,"pid":9,"proc":"cd"}}"#).unwrap();
-        assert_eq!(
-            exit,
-            Call::Exit {
-                status: 3,
-                signal: None,
-                pid: Some(9),
-                token: Some("cd".into()),
-            }
-        );
-        let old: Call = serde_json::from_str(r#"{"fork":{"pid":4}}"#).unwrap();
-        assert_eq!(
-            old,
-            Call::Fork {
-                empty_memory: false,
-                pid: 4,
-                child: None,
-                token: None,
-            }
-        );
-        // The registry's calls, and a Kill or Wait of a number, are the browser's own.
-        assert!(Call::Seats.is_registry());
+        // Retired server-only registry calls fail deserialization cleanly.
+        assert!(serde_json::from_str::<Call>(r#"{"proc_init":{"boot":"x"}}"#).is_err());
+        assert!(serde_json::from_str::<Call>(r#""seats""#).is_err());
+        assert!(serde_json::from_str::<Call>(r#"{"execve":{"path":"x"}}"#).is_err());
+        assert!(serde_json::from_str::<Call>(r#"{"fork":{"pid":4}}"#).is_err());
+        assert!(serde_json::from_str::<Call>(r#"{"exit":{"status":3}}"#).is_err());
+        // Local process & cgroup calls are marked as instance-local (`is_registry`).
+        assert!(Call::Getpid.is_registry());
         assert!(
             Call::Kill {
                 pid: "12".into(),
@@ -1846,9 +1675,6 @@ mod tests {
         assert!(!Call::Getcreds.is_registry());
         assert_eq!(Target::of("12"), Target::Pid(12));
         assert_eq!(Target::of("a1b2"), Target::Job("a1b2"));
-        // A path not given is the root's, as a cgroup not given is.
-        let exec: Call = serde_json::from_str(r#"{"execve":{"path":"x"}}"#).unwrap();
-        assert!(matches!(exec, Call::Execve { ref cwd, .. } if cwd == "/"));
         let list: Call = serde_json::from_str(r#"{"cgroup_list":{}}"#).unwrap();
         assert_eq!(list, Call::CgroupList { path: "/".into() });
     }

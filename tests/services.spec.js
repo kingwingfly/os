@@ -1,13 +1,18 @@
 import { test, expect } from './test.js';
 import { api, call, errno, put, rmrf } from './sys.js';
+import { hookPageKernel } from './service-auth.js';
 import { readFile } from 'node:fs/promises';
 
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
-let base, sequence;
+let base, sequence, pageKernel;
 const unit = (name, argv, extra = {}) => ({ name, argv, ...extra });
 const text = page => page.evaluate(() => window.serviceRun.output.replace(/\r\n/g, '\n'));
 test.beforeEach(async ({ page }) => {
+  await call(page.request, 'getcreds');
+  pageKernel = await hookPageKernel(page);
   await page.goto('/'); await page.waitForFunction(() => !!window.os?.exec);
+  await pageKernel.ready();
+  await pageKernel.value('sync_account_from_server');
   base = '/guest/services-' + crypto.randomUUID(); sequence = 0;
   await call(page.request, { mkdir: { path: base, mode: 0o700 } });
 });
@@ -36,9 +41,12 @@ async function done(page, status = 0) {
   return output;
 }
 async function waitText(page, value) { await expect.poll(() => text(page), { timeout: 60_000 }).toContain(value); }
+async function procGone(pid) {
+  return (await pageKernel.value('poll', { pids: [Number(pid)] })).length === 0;
+}
 async function terminate(page) {
   const pid = await page.evaluate(() => window.serviceRun.group.pids[0]);
-  await call(page.request, { kill: { pid: String(pid), signal: 15 } });
+  await pageKernel.value('kill', { pid, signal: 15 });
 }
 
 test('supervise is an immutable ordinary executable with generated help and check-only validation', async ({ page }) => {
@@ -106,17 +114,17 @@ test('TERM reaches the service process group and allows its shutdown handler to 
   await terminate(page);
   const output = await done(page, 143);
   expect(output).toContain('CLEAN_STOP'); expect(output).not.toContain('signal 9');
-  for (const pid of pids) await expect.poll(() => errno(page.request, { stat: { path: `/proc/${pid}` } })).toBe('ENOENT');
+  for (const pid of pids) await expect.poll(() => procGone(pid)).toBe(true);
 });
 
 test('shutdown continues stopped groups and escalates TERM-ignoring services to KILL', async ({ page }) => {
   await start(page, [unit('stubborn', ['sh', '-c', 'trap "" TERM; echo IGNORING_TERM; while :; do sleep 1; done'], { stop_timeout_ms: 200 })]);
   await waitText(page, 'IGNORING_TERM');
   const output = await text(page), pid = Number(output.match(/stubborn: started pid (\d+)/)[1]);
-  await call(page.request, { kill: { pid: '-' + pid, signal: 19 } });
+  await pageKernel.value('kill', { pid: -pid, signal: 19 });
   await terminate(page);
   expect(await done(page, 143)).toContain('stubborn: signal 9');
-  await expect.poll(() => errno(page.request, { stat: { path: `/proc/${pid}` } })).toBe('ENOENT');
+  await expect.poll(() => procGone(pid)).toBe(true);
 });
 
 test('shutdown during restart backoff cannot launch another attempt', async ({ page }) => {
@@ -151,7 +159,7 @@ test('same-group background children are killed when the service leader exits', 
   await start(page, [unit('children', ['sh', '-c', 'sleep 30 & echo CHILD:$!; exit 0'])]);
   const output = await done(page);
   const pid = output.match(/CHILD:(\d+)/)?.[1]; expect(pid).toBeTruthy();
-  await expect.poll(() => errno(page.request, { stat: { path: `/proc/${pid}` } })).toBe('ENOENT');
+  await expect.poll(() => procGone(pid)).toBe(true);
 });
 
 test('installed dash resolves and executes the same supervisor through PATH', async ({ page }) => {
@@ -171,7 +179,7 @@ test('idle services do not continuously poll the registry for child exits', asyn
   page.on('request', request => {
     if (!request.url().endsWith('/api/sys') || request.method() !== 'POST') return;
     const body = request.postDataJSON();
-    if (body.pid === supervisor) waits += body.calls.filter(call => call.waitpid).length;
+    if (body?.pid === supervisor && Array.isArray(body.calls)) waits += body.calls.filter(call => call?.waitpid).length;
   });
   await start(page, [unit('idle', ['sleep', '30'])]);
   await waitText(page, 'idle: started pid');
@@ -249,7 +257,7 @@ test('startup deadlines kill TERM-ignoring groups and use a bounded retry budget
   expect(output.match(/timeout: signal 9/g)).toHaveLength(2);
   expect(output).not.toContain('INCORRECT_START');
   for (const [, pid] of output.matchAll(/timeout: started pid (\d+)/g)) {
-    await expect.poll(() => errno(page.request, { stat: { path: `/proc/${pid}` } })).toBe('ENOENT');
+    await expect.poll(() => procGone(pid)).toBe(true);
   }
 });
 
@@ -292,7 +300,7 @@ test('readiness polling uses the local pipe without repeated registry waits', as
   page.on('request', request => {
     if (!request.url().endsWith('/api/sys') || request.method() !== 'POST') return;
     const body = request.postDataJSON();
-    if (body.pid === supervisor) waits += body.calls.filter(call => call.waitpid).length;
+    if (body?.pid === supervisor && Array.isArray(body.calls)) waits += body.calls.filter(call => call?.waitpid).length;
   });
   await start(page, [unit('pending', ['sh', '-c', 'echo WAITING_IN_PIPE; exec sleep 30'], { readiness: 'notify', startup_timeout_ms: 30000 })]);
   await waitText(page, 'WAITING_IN_PIPE');

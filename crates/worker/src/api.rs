@@ -90,9 +90,11 @@ pub fn errno_reply(error: &abi::Error) -> Reply {
 fn process_caller(
     db: &mut Db,
     token: Option<&str>,
+    instance_id: Option<&str>,
     key: Option<&str>,
     guest: Option<&str>,
     release: Option<&str>,
+    device_driver: Option<&str>,
 ) -> std::result::Result<Option<crate::creds::Credential>, abi::Error> {
     let Some(token) = token else {
         crate::system::select(db, release)?;
@@ -102,8 +104,13 @@ fn process_caller(
     let credential = db
         .credential(token, &ns)
         .ok_or_else(|| abi::Error::because(abi::Errno::EPERM, "not this browser's process"))?;
+    credential.check_instance(instance_id)?;
     crate::system::select(db, credential.generation.as_deref())?;
-    credential.cloud()?;
+    if let Some(driver) = device_driver {
+        credential.check_device(driver)?;
+    } else {
+        credential.cloud()?;
+    }
     Ok(Some(credential))
 }
 pub fn denied(message: &str, who: &Identity) -> Reply {
@@ -187,10 +194,14 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         }
         // System calls (sys.rs): what user space, the page, asks of the kernel.
         (Method::Post, "/api/sys") => crate::sys::handle(req, env, state, key).await,
-        // What each browser's machine asks of the authority (creds.rs): never a browser's.
+        // What `Machine` DO asks of `OsAuthority` (creds.rs): never routed from a browser.
         (
             Method::Post,
-            "/internal/exec" | "/internal/identity" | "/internal/login" | "/internal/revoke"
+            "/internal/service-auth/mint"
+            | "/internal/service-auth/derive"
+            | "/internal/service-auth/renew"
+            | "/internal/identity"
+            | "/internal/revoke"
             | "/internal/tell",
         ) => Ok(crate::creds::internal(req, state, &endpoint)
             .await?
@@ -198,22 +209,19 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         (Method::Get, "/internal/read") => {
             let guest = auth::guest_key(req);
             let proc_token = req.headers().get("X-Process-Token")?;
-            // /proc's files tell of the browser's processes, as its machine has them.
-            let procs = if crate::procfs::of_processes(&path) {
-                let ns = Db::namespace(key.as_deref(), guest.as_deref());
-                crate::machine::list(env, &ns).await?
-            } else {
-                Vec::new()
-            };
+            let instance_id = req.headers().get("X-OS-Instance")?;
             run(state, move |db| {
                 // A process's byte request carries its token: it reads as its snapshot, never
                 // as the page signed in later.
+                let dev_driver = crate::creds::Credential::remote_device_driver(&path);
                 let row = match process_caller(
                     db,
                     proc_token.as_deref(),
+                    instance_id.as_deref(),
                     key.as_deref(),
                     guest.as_deref(),
                     release.as_deref(),
+                    dev_driver,
                 ) {
                     Ok(row) => row,
                     Err(error) => return errno_reply(&error).keep(),
@@ -233,12 +241,26 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     Err(error) => return errno_reply(&error),
                 };
                 if crate::procfs::is(&path) {
-                    return match crate::procfs::read(db, sid.as_deref(), &procs, &who, &path) {
+                    if let Some(cred) = &row
+                        && let Err(error) = cred.cloud()
+                    {
+                        return errno_reply(&error).keep();
+                    }
+                    return match crate::procfs::read(db, sid.as_deref(), &who, &path) {
                         Ok(text) => Reply::ok(json!({ "generated": text })),
                         Err(error) => errno_reply(&error),
                     };
                 }
                 let real = real!(db, &who, &path, true);
+                if let Some(cred) = &row {
+                    if let Some(driver) = crate::creds::Credential::remote_device_driver(&real) {
+                        if let Err(error) = cred.check_device(driver) {
+                            return errno_reply(&error).keep();
+                        }
+                    } else if let Err(error) = cred.cloud() {
+                        return errno_reply(&error).keep();
+                    }
+                }
                 let node = acl!(db.access(&who, &real, READ), &who);
                 // /etc/passwd and /etc/group are the kernel's to write as they are read; a device's
                 // content is its driver's state.
@@ -281,13 +303,16 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let token = param("token");
             let guest = auth::guest_key(req);
             let proc_token = req.headers().get("X-Process-Token")?;
+            let instance_id = req.headers().get("X-OS-Instance")?;
             run(state, move |db| {
                 let row = match process_caller(
                     db,
                     proc_token.as_deref(),
+                    instance_id.as_deref(),
                     key.as_deref(),
                     guest.as_deref(),
                     release.as_deref(),
+                    None,
                 ) {
                     Ok(row) => row,
                     Err(error) => return errno_reply(&error).keep(),
@@ -333,13 +358,16 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let length = param("length").parse::<u64>().unwrap_or(0);
             let guest = auth::guest_key(req);
             let proc_token = req.headers().get("X-Process-Token")?;
+            let instance_id = req.headers().get("X-OS-Instance")?;
             run(state, move |db| {
                 let row = match process_caller(
                     db,
                     proc_token.as_deref(),
+                    instance_id.as_deref(),
                     key.as_deref(),
                     guest.as_deref(),
                     release.as_deref(),
+                    None,
                 ) {
                     Ok(row) => row,
                     Err(error) => return errno_reply(&error).keep(),
@@ -378,13 +406,16 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             };
             let guest = auth::guest_key(req);
             let proc_token = req.headers().get("X-Process-Token")?;
+            let instance_id = req.headers().get("X-OS-Instance")?;
             run(state, move |db| {
                 let row = match process_caller(
                     db,
                     proc_token.as_deref(),
+                    instance_id.as_deref(),
                     key.as_deref(),
                     guest.as_deref(),
                     release.as_deref(),
+                    None,
                 ) {
                     Ok(row) => row,
                     Err(error) => return errno_reply(&error).keep(),

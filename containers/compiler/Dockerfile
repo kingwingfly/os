@@ -6,4 +6,4 @@ COPY web/kernel/asyncify.js web/kernel/image.js web/kernel/memory.js web/kernel/
 COPY containers/compiler/server.mjs ./containers/compiler/server.mjs
 USER node
 EXPOSE 8080
-CMD ["node", "containers/compiler/server.mjs"]
+ENTRYPOINT ["node", "containers/compiler/server.mjs"]

@@ -8,7 +8,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 abi = { package = "os-abi", path = "../abi" }
+cowfs = { package = "os-cowfs", path = "../cowfs" }
+cowtree = { package = "os-cowtree", path = "../cowtree" }
 image = { package = "os-image", path = "../image" }
+kernel = { package = "os-kernel", path = "../kernel" }
 os-core = { path = "../core" }
 vfs = { package = "os-vfs", path = "../vfs" }
 sha2 = "0.10"

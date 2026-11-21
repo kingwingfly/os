@@ -7,8 +7,8 @@
 //! `vfs_sys`, and `proc_resolve_exec`.
 
 use crate::cloudfs::{
-    AuthorityPageFd, PageReadScope, RootCloudDriver, installed, page_sys_batch,
-    page_sys_batch_with_session, promised,
+    AuthorityPageFd, PageReadScope, RootCloudDriver, installed, page_sys_batch_with_session,
+    promised,
 };
 use crate::mounts::{Grant, LocalMount, errno_code};
 use crate::share_bridge::build_share_backing;
@@ -49,6 +49,7 @@ const SCOPED_PAGE_PID_BASE: u32 = 0x7fff_0000;
 const READ_STREAM_MAX: usize = 64;
 const MANIFEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const PRIVATE_EXT_MAX_BYTES: u64 = 128 * 1024 * 1024;
+#[allow(dead_code)]
 const WASM_HEADER_STUB: [u8; 8] = [0x00, b'a', b's', b'm', 0x01, 0x00, 0x00, 0x00];
 
 pub(crate) fn vfs_js_err(errno: Errno, detail: impl Into<String>) -> JsValue {
@@ -72,7 +73,8 @@ pub(crate) fn vfs_js_err(errno: Errno, detail: impl Into<String>) -> JsValue {
 }
 
 fn map_errno(errno: Errno) -> JsValue {
-    vfs_js_err(errno, "")
+    let detail = crate::cloudfs::take_last_page_error_detail(errno).unwrap_or_default();
+    vfs_js_err(errno, detail)
 }
 
 fn wasi_errno_num(errno: Errno) -> i32 {
@@ -109,6 +111,7 @@ fn wasi_errno_num(errno: Errno) -> i32 {
         Errno::ENOTTY => 59,
         Errno::ENXIO => 60,
         Errno::ENODATA => 61,
+        Errno::ENOTBLK => 218,
         Errno::EPERM => 63,
         Errno::EPIPE => 64,
         Errno::EPROTONOSUPPORT => 66,
@@ -225,6 +228,7 @@ impl DeviceBackend for JsDeviceBackend {
 
 /// Blob store fetching `/usr/bin/*.wasm` or `/boot/blobs/<sha>` via `self.imageBlobRead`,
 /// falling back to a valid 8-byte Wasm header stub in headless unit tests.
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 pub(crate) struct JsAssetBlobStore {
     cache: Rc<RefCell<HashMap<String, Vec<u8>>>>,
@@ -282,27 +286,109 @@ impl BlobStore for JsAssetBlobStore {
     }
 }
 
-/// `/proc` fallback provider querying `/api/sys` for server-authoritative `status`, `cmdline`,
-/// `stat`, and top-level `/proc` entries until L2b (#54).
-#[derive(Clone, Default)]
-pub(crate) struct BrowserProcProvider;
+/// `/proc` provider: numeric PIDs (`1`, `2`, ...), `self`, `mounts`, and `uptime` are served 100%
+/// locally inside `os_vfs::ProcFs` via `ProcBridge` hooks with ZERO network RPCs (#54 L3a).
+/// Non-numeric remote server accelerator/container job entries (`/proc/<hex-job-id>`) are queried
+/// ONLY when remote accelerator devices (`archive` or `media`) are attached on this instance.
+#[derive(Clone)]
+pub(crate) struct BrowserProcProvider {
+    state: Rc<RefCell<crate::State>>,
+    root_cloud: Rc<RootCloudDriver>,
+}
 
 impl BrowserProcProvider {
-    async fn proc_call(&self, cred: &Cred, call: Call) -> vfs::Result<Value> {
-        if let Some(token) = &cred.token
-            && let Ok((global, post)) = installed("cloudFsPost")
+    fn new(state: Rc<RefCell<crate::State>>, root_cloud: Rc<RootCloudDriver>) -> Self {
+        Self { state, root_cloud }
+    }
+
+    fn can_query_remote(&self, cred: &Cred) -> bool {
+        let (remote_attached, has_accel) = {
+            let st = self.state.borrow();
+            (
+                st.remote_attached,
+                st.attached_devices.contains_key("archive")
+                    || st.attached_devices.contains_key("media"),
+            )
+        };
+        if !remote_attached || !has_accel || !self.root_cloud.is_remote_mode() {
+            return false;
+        }
+        if cred.token.as_deref().is_some_and(|t| !t.is_empty()) {
+            return installed("cloudFsPost").is_ok();
+        }
+        if let Some(pid) = self
+            .root_cloud
+            .active_pid
+            .get()
+            .filter(|&p| p < SCOPED_PAGE_PID_BASE)
         {
+            if self.root_cloud.is_pid_cloud_denied(pid) {
+                return false;
+            }
+            let cloud_allowed = self
+                .state
+                .borrow()
+                .table
+                .proc(pid)
+                .is_some_and(|p| p.state != abi::ProcState::Zombie && p.cred.cloud_access);
+            return cloud_allowed
+                && installed("cloudFsPost").is_ok()
+                && installed("serviceAuthPost").is_ok();
+        }
+        installed("pageSysPost").is_ok()
+    }
+
+    async fn proc_call(&self, cred: &Cred, call: Call) -> vfs::Result<Value> {
+        if !self.can_query_remote(cred) {
+            return Err(Errno::ENOENT);
+        }
+        let proc_pid = self
+            .root_cloud
+            .active_pid
+            .get()
+            .filter(|&p| p < SCOPED_PAGE_PID_BASE);
+        let token = if let Some(tok) = cred.token.as_deref().filter(|t| !t.is_empty()) {
+            Some(tok.to_string())
+        } else if let Some(pid) = proc_pid {
+            let existing = self.state.borrow().table.proc(pid).and_then(|p| {
+                p.cred
+                    .remote
+                    .as_ref()
+                    .filter(|r| r.cloud_access)
+                    .map(|r| r.token.clone())
+            });
+            if let Some(tok) = existing {
+                Some(tok)
+            } else {
+                let rem = crate::lazy_mint_remote_cred(&self.state, pid)
+                    .await
+                    .map_err(|_| Errno::ENOENT)?;
+                Some(rem.token)
+            }
+        } else {
+            None
+        };
+        if let Some(token) = token {
+            let Ok((global, post)) = installed("cloudFsPost") else {
+                return Err(Errno::ENOENT);
+            };
+            let instance_id = self.state.borrow().instance_id.clone();
             let body = serde_json::to_vec(&Batch {
                 calls: vec![call],
                 umask: None,
                 sudo: false,
-                pid: None,
+                pid: proc_pid,
                 process: Some(token.clone()),
             })
             .map_err(|_| Errno::EIO)?;
             let headers = js_sys::Object::new();
             let _ =
                 js_sys::Reflect::set(&headers, &"Content-Type".into(), &"application/json".into());
+            let _ = js_sys::Reflect::set(&headers, &"X-Process-Token".into(), &token.into());
+            if !instance_id.is_empty() {
+                let _ =
+                    js_sys::Reflect::set(&headers, &"X-OS-Instance".into(), &instance_id.into());
+            }
             let arr = js_sys::Uint8Array::from(body.as_slice());
             let answer = post
                 .call3(&global, &"/api/sys".into(), &headers, &arr)
@@ -326,11 +412,14 @@ impl BrowserProcProvider {
                 .into_result()
                 .map_err(|e| e.errno);
         }
+        if proc_pid.is_some() {
+            return Err(Errno::ENOENT);
+        }
         if installed("pageSysPost").is_ok() {
-            let mut res = page_sys_batch(Batch {
+            let mut res = crate::cloudfs::page_sys_batch(Batch {
                 calls: vec![call],
                 umask: None,
-                sudo: false,
+                sudo: self.root_cloud.page_sudo.get(),
                 pid: None,
                 process: None,
             })
@@ -359,134 +448,74 @@ impl BrowserProcProvider {
         let data: Bytes = serde_json::from_value(val["data"].clone()).map_err(|_| Errno::EIO)?;
         Ok(data.0)
     }
+    async fn remote_job_entries(&self, cred: &Cred) -> Vec<(String, FileType)> {
+        if !self.can_query_remote(cred) {
+            return Vec::new();
+        }
+        let Ok(val) = self
+            .proc_call(
+                cred,
+                Call::Getdents {
+                    path: "/proc".to_string(),
+                    cookie: 0,
+                    count: None,
+                },
+            )
+            .await
+        else {
+            return Vec::new();
+        };
+        let Ok(entries) = serde_json::from_value::<Vec<Dirent>>(val) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for e in entries {
+            if !proc_is_remote_job_id(&e.name) {
+                continue;
+            }
+            let file_type = e
+                .stat
+                .as_ref()
+                .map_or(FileType::Dir, |s| proc_file_type_from_mode(s.mode));
+            out.push((e.name, file_type));
+        }
+        out
+    }
 }
 
 impl ProcProvider for BrowserProcProvider {
-    fn list_pids<'a>(&'a self, cred: &'a Cred) -> BoxFuture<'a, Vec<u32>> {
-        Box::pin(async move {
-            let Ok(val) = self
-                .proc_call(
-                    cred,
-                    Call::Getdents {
-                        path: "/proc".to_string(),
-                        cookie: 0,
-                        count: None,
-                    },
-                )
-                .await
-            else {
-                return Ok(Vec::new());
-            };
-            let Ok(entries) = serde_json::from_value::<Vec<Dirent>>(val) else {
-                return Ok(Vec::new());
-            };
-            Ok(entries
-                .into_iter()
-                .filter_map(|e| e.name.parse::<u32>().ok())
-                .collect())
-        })
+    fn list_pids<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, Vec<u32>> {
+        // Numeric PIDs are 100% instance-local in `LocalProcessTable` (ZERO network RPCs).
+        Box::pin(async { Ok(Vec::new()) })
     }
 
-    fn top_entries<'a>(&'a self, cred: &'a Cred) -> BoxFuture<'a, Vec<ProcDynamicEntry>> {
-        Box::pin(async move {
-            let Ok(val) = self
-                .proc_call(
-                    cred,
-                    Call::Getdents {
-                        path: "/proc".to_string(),
-                        cookie: 0,
-                        count: None,
-                    },
-                )
-                .await
-            else {
-                return Ok(Vec::new());
-            };
-            let Ok(entries) = serde_json::from_value::<Vec<Dirent>>(val) else {
-                return Ok(Vec::new());
-            };
-            let mut out = Vec::new();
-            for e in entries {
-                if e.name == "self" || e.name == "mounts" || e.name.parse::<u32>().is_ok() {
-                    continue;
-                }
-                let st = e.stat.unwrap_or_default();
-                let kind_bits = st.mode & abi::S_IFMT;
-                let file_type = if kind_bits == abi::S_IFDIR {
-                    FileType::Dir
-                } else if kind_bits == abi::S_IFLNK {
-                    FileType::Symlink
-                } else {
-                    FileType::File
-                };
-                out.push(ProcDynamicEntry {
-                    name: e.name,
-                    file_type,
-                    mode: (st.mode & 0o7777) as u16,
-                    uid: st.uid,
-                    gid: st.gid,
-                });
-            }
-            Ok(out)
-        })
+    fn top_entries<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, Vec<ProcDynamicEntry>> {
+        // Keep `ProcFs::lookup` 100% local (ZERO network RPCs for `/proc/uptime`, `/proc/mounts`,
+        // `/proc/self`, or `/proc/<pid>`). Remote accelerator jobs are merged directly in
+        // `BrowserProcFs::read_dir` and resolved on demand in `BrowserProcFs::lookup`.
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     fn read_top<'a>(&'a self, cred: &'a Cred, name: &'a str) -> BoxFuture<'a, Vec<u8>> {
         Box::pin(async move { self.read_proc_file(cred, &format!("/proc/{name}")).await })
     }
 
-    fn pid_entries<'a>(&'a self, cred: &'a Cred, pid: u32) -> BoxFuture<'a, Vec<ProcDynamicEntry>> {
-        Box::pin(async move {
-            let Ok(val) = self
-                .proc_call(
-                    cred,
-                    Call::Getdents {
-                        path: format!("/proc/{pid}"),
-                        cookie: 0,
-                        count: None,
-                    },
-                )
-                .await
-            else {
-                return Ok(Vec::new());
-            };
-            let Ok(entries) = serde_json::from_value::<Vec<Dirent>>(val) else {
-                return Ok(Vec::new());
-            };
-            let mut out = Vec::new();
-            for e in entries {
-                if matches!(
-                    e.name.as_str(),
-                    "mountinfo" | "mounts" | "ns" | "root" | "cwd" | "fd" | "fdinfo"
-                ) {
-                    continue;
-                }
-                let st = e.stat.unwrap_or_default();
-                let kind_bits = st.mode & abi::S_IFMT;
-                let file_type = if kind_bits == abi::S_IFDIR {
-                    FileType::Dir
-                } else if kind_bits == abi::S_IFLNK {
-                    FileType::Symlink
-                } else {
-                    FileType::File
-                };
-                out.push(ProcDynamicEntry {
-                    name: e.name,
-                    file_type,
-                    mode: (st.mode & 0o7777) as u16,
-                    uid: st.uid,
-                    gid: st.gid,
-                });
-            }
-            Ok(out)
-        })
+    fn pid_entries<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _pid: u32,
+    ) -> BoxFuture<'a, Vec<ProcDynamicEntry>> {
+        // All numeric `/proc/<pid>/*` entries render 100% locally (ZERO network RPCs).
+        Box::pin(async { Ok(Vec::new()) })
     }
 
-    fn read_pid<'a>(&'a self, cred: &'a Cred, pid: u32, name: &'a str) -> BoxFuture<'a, Vec<u8>> {
-        Box::pin(async move {
-            self.read_proc_file(cred, &format!("/proc/{pid}/{name}"))
-                .await
-        })
+    fn read_pid<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _pid: u32,
+        _name: &'a str,
+    ) -> BoxFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(Errno::ENOENT) })
     }
 }
 
@@ -502,7 +531,15 @@ fn proc_is_remote_ino(ino: u64) -> bool {
 fn proc_is_local_only_root_child(name: &str) -> bool {
     name == "mounts"
         || name == "self"
+        || name == "uptime"
         || name.parse::<u32>().is_ok_and(|pid| pid.to_string() == name)
+}
+
+fn proc_is_remote_job_id(name: &str) -> bool {
+    !name.is_empty()
+        && !proc_is_local_only_root_child(name)
+        && (name.len() == 32 || !name.bytes().all(|b| b.is_ascii_digit()))
+        && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn proc_file_type_from_mode(mode: u32) -> FileType {
@@ -756,6 +793,9 @@ impl Filesystem for BrowserProcFs {
             }
             check_component(name)?;
             if dir.node.ino == PROC_ROOT_INO && !proc_is_local_only_root_child(name) {
+                if !proc_is_remote_job_id(name) || !self.provider.can_query_remote(cred) {
+                    return Err(Errno::ENOENT);
+                }
                 return self.lookup_remote(cred, PROC_ROOT_INO, "/proc", name).await;
             }
             let entry = self.inner.lookup(cred, dir, name).await?;
@@ -922,12 +962,28 @@ impl Filesystem for BrowserProcFs {
             }
             let mut entries = self.inner.read_dir(cred, dir).await?;
             if dir.node.ino == PROC_ROOT_INO {
+                let remote_jobs = self.provider.remote_job_entries(cred).await;
                 let mut state = self.state.borrow_mut();
                 for de in &mut entries {
                     if !proc_is_local_only_root_child(&de.name) {
                         let child_path = format!("/proc/{}", de.name);
                         de.node.ino = state.intern_remote(PROC_ROOT_INO, &de.name, &child_path)?;
                     }
+                }
+                for (name, file_type) in remote_jobs {
+                    if entries.iter().any(|de| de.name == name) {
+                        continue;
+                    }
+                    let child_path = format!("/proc/{name}");
+                    let ino = state.intern_remote(PROC_ROOT_INO, &name, &child_path)?;
+                    entries.push(vfs::DirEntry {
+                        name,
+                        node: NodeId {
+                            ino,
+                            generation: PROC_GENERATION,
+                        },
+                        file_type,
+                    });
                 }
             }
             Ok(entries)
@@ -1431,11 +1487,11 @@ impl Filesystem for BrowserProcFs {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BootVfsOptions {
-    #[serde(default)]
+    #[serde(default, alias = "build_asset_sizes")]
     build_asset_sizes: Option<BuildAssetSizes>,
-    #[serde(default)]
+    #[serde(default, alias = "system_composition")]
     system_composition: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "bind_mounts")]
     bind_mounts: Vec<ServiceBindSpec>,
 }
 
@@ -1766,6 +1822,7 @@ impl LockCancel {
 pub(crate) struct VfsRuntime {
     pub(crate) vfs: Vfs,
     pub(crate) root_cloud: Rc<RootCloudDriver>,
+    pub(crate) dev_fs: Rc<DevTmpFs<JsDeviceBackend>>,
     pub(crate) dev_pts: Rc<DevPtsFs<JsDeviceBackend>>,
     pub(crate) usr_fs_id: FsId,
     pub(crate) usr_blob_paths: HashMap<u64, String>,
@@ -1783,6 +1840,40 @@ pub(crate) struct VfsRuntime {
     pub(crate) gid_names: HashMap<u32, String>,
     next_tmp_id: u64,
     next_scoped_pid: u32,
+}
+
+fn install_vfs_proc_hooks(vfs: &Vfs, state: &Rc<RefCell<crate::State>>) {
+    let s1 = Rc::clone(state);
+    vfs.set_proc_snapshot_hook(Rc::new(move |pid| {
+        let state = s1.try_borrow().ok()?;
+        let snap = state.table.proc_snapshot(pid)?;
+        Some(vfs::procfs::ProcMetaSnapshot {
+            ppid: snap.ppid,
+            pgid: snap.pgid,
+            sid: snap.sid,
+            uid: snap.uid,
+            gid: snap.gid,
+            state: snap.state,
+            cgroup: snap.cgroup,
+            comm: snap.comm,
+            argv: snap.argv,
+            start_ticks: snap.started_ticks,
+            tty: snap.tty,
+            tty_fds: snap.tty_fds,
+        })
+    }));
+    let s2 = Rc::clone(state);
+    vfs.set_proc_list_hook(Rc::new(move || {
+        s2.try_borrow()
+            .map(|st| st.table.all_pids())
+            .unwrap_or_default()
+    }));
+    let s3 = Rc::clone(state);
+    vfs.set_uptime_hook(Rc::new(move || {
+        s3.try_borrow()
+            .map(|st| st.table.uptime_secs(crate::now_secs()))
+            .unwrap_or(0)
+    }));
 }
 
 fn default_uid_names() -> HashMap<u32, String> {
@@ -1806,9 +1897,11 @@ fn default_asset_sizes() -> BuildAssetSizes {
 async fn construct_vfs(
     instance_id: &str,
     root_cloud: Rc<RootCloudDriver>,
+    state: Rc<RefCell<crate::State>>,
     opts: Option<BootVfsOptions>,
 ) -> vfs::Result<(
     Vfs,
+    Rc<DevTmpFs<JsDeviceBackend>>,
     Rc<DevPtsFs<JsDeviceBackend>>,
     FsId,
     HashMap<u64, String>,
@@ -1819,6 +1912,35 @@ async fn construct_vfs(
         vfs::FsType::Cloud,
     ));
     let vfs = Vfs::boot(instance_id, root_backing.clone(), "cloud", factory).await?;
+    install_vfs_proc_hooks(&vfs, &state);
+    {
+        let vfs_hook = vfs.clone();
+        let state_hook = Rc::clone(&state);
+        root_cloud.set_on_lazy_mint(Rc::new(move |pid| {
+            let info = state_hook.try_borrow().ok().and_then(|st| {
+                st.table.proc(pid).map(|p| {
+                    (
+                        p.cred.identity.clone(),
+                        p.cred.remote.as_ref().map(|r| r.token.clone()),
+                    )
+                })
+            });
+            if let Some((identity, token)) = info {
+                let umask = vfs_hook
+                    .process_fs_context(pid)
+                    .map(|c| c.borrow().umask)
+                    .unwrap_or(0o022);
+                let _ = vfs_hook.set_cred(
+                    pid,
+                    Cred {
+                        identity,
+                        umask,
+                        token,
+                    },
+                );
+            }
+        }));
+    }
     let sys_ns = vfs.system_namespace();
     let mut root_cred = Cred::root();
     root_cred.umask = 0;
@@ -1830,7 +1952,7 @@ async fn construct_vfs(
         .as_ref()
         .and_then(|o| o.build_asset_sizes)
         .unwrap_or_else(default_asset_sizes);
-    let blob_store = JsAssetBlobStore::default();
+    let blob_store = crate::release_v2::VerifiedAssetBlobStore;
     let usr_image = if let Some(comp_json) =
         opts.as_ref().and_then(|o| o.system_composition.as_ref())
     {
@@ -1871,18 +1993,20 @@ async fn construct_vfs(
     )
     .await?;
 
-    // 2. `/proc` (`ProcFs` bound to `vfs.proc_bridge()` + `BrowserProcProvider`, wrapped in
-    // `BrowserProcFs` so non-numeric `/proc/<job-id>` directory trees traverse cleanly).
+    // 2. `/proc` (`ProcFs` bound to `vfs.proc_bridge()` — 100% local rendering for all numeric
+    // PIDs, `self`, `mounts`, and `uptime`; `BrowserProcFs` handles remote container job ids only
+    // when a remote credential is attached).
+    let proc_provider = BrowserProcProvider::new(Rc::clone(&state), Rc::clone(&root_cloud));
     let proc_fs = Rc::new(ProcFs::new(
         FsId("proc".to_string()),
         mounted_at,
-        BrowserProcProvider,
+        proc_provider.clone(),
     ));
     proc_fs.bind_bridge(vfs.proc_bridge());
     let proc_wrapper = Rc::new(BrowserProcFs::new(
         FsId("proc".to_string()),
         proc_fs,
-        BrowserProcProvider,
+        proc_provider,
     ));
     let proc_backing = Rc::new(
         MountBacking::new(proc_wrapper as Rc<dyn Filesystem>, vfs::FsType::Proc)
@@ -1910,15 +2034,42 @@ async fn construct_vfs(
     )
     .await?;
 
-    // 3. `/dev` (`DevTmpFs`), `/dev/pts` (`DevPtsFs`), and `/dev/{present,snd}` (`CloudFs` bind)
+    // 3. `/dev` (`DevTmpFs` with instance-local devices only; remote devices `archive`, `media`,
+    // `present`, `snd` require explicit credentialed `attach_remote` per Contract §2.7) and
+    // `/dev/pts` (`DevPtsFs`).
     let dev_fs = Rc::new(DevTmpFs::new(
         FsId("devtmpfs".to_string()),
         1,
         Box::new(js_now_timespec),
         JsDeviceBackend::default(),
     ));
+    {
+        let active_pid = Rc::clone(&root_cloud.active_pid);
+        let st_hook = Rc::clone(&state);
+        dev_fs.set_remote_open_hook(Rc::new(move |_cred, driver| {
+            let Some(pid) = active_pid.get() else {
+                // Page-scoped operation (e.g. built-in app / page API): permitted once attached.
+                return Ok(());
+            };
+            if pid >= SCOPED_PAGE_PID_BASE {
+                return Ok(());
+            }
+            let st = st_hook.try_borrow().map_err(|_| Errno::EACCES)?;
+            let proc = st.table.proc(pid).ok_or(Errno::EACCES)?;
+            if let Some(rem) = &proc.cred.remote {
+                if !rem.scope.allows_device(driver) {
+                    return Err(Errno::EACCES);
+                }
+                return Ok(());
+            }
+            if !proc.cred.cloud_access {
+                return Err(Errno::EACCES);
+            }
+            Ok(())
+        }));
+    }
     let dev_backing = Rc::new(MountBacking::new(
-        dev_fs as Rc<dyn Filesystem>,
+        Rc::clone(&dev_fs) as Rc<dyn Filesystem>,
         vfs::FsType::DevTmpFs,
     ));
     vfs.mount_on_namespace(
@@ -1965,50 +2116,36 @@ async fn construct_vfs(
     )
     .await?;
 
-    let cloud_root = root_cloud.root();
-    if let Ok(dev_on_cloud) = root_cloud.lookup(&root_cred, &cloud_root, "dev").await {
-        for sub in ["present", "snd"] {
-            if let Ok(sub_entry) = root_cloud
-                .lookup(&root_cred, &dev_on_cloud.handle, sub)
-                .await
-            {
-                let target = format!("/dev/{sub}");
-                let _ = vfs
-                    .mount_on_namespace(
-                        &sys_ns,
-                        &root_cred,
-                        Rc::clone(&root_backing),
-                        Some((sub_entry.handle, target.clone())),
-                        "cloud",
-                        &target,
-                        MountFlags {
-                            nosuid: true,
-                            noexec: true,
-                            ..MountFlags::default()
-                        },
-                        0,
-                        None,
-                    )
-                    .await;
-            }
-        }
-    }
-
-    // 4. `/run`, `/mnt/local`, `/mnt/shared`, `/opt/private` (`MemFs` tmpfs carriers)
-    for (idx, target) in [
-        (1u64, "/run"),
-        (2u64, "/mnt/local"),
-        (3u64, "/mnt/shared"),
-        (4u64, "/opt/private"),
+    // 4. Instance-local `/run`, `/tmp` (`01777` sticky tmpfs, Contract §2.1), `/mnt/local`,
+    // `/mnt/shared`, `/opt/private` (`MemFs` tmpfs carriers).
+    for (idx, target, mode) in [
+        (1u64, "/run", 0o755u16),
+        (2u64, "/tmp", 0o1777u16),
+        (3u64, "/mnt/local", 0o755u16),
+        (4u64, "/mnt/shared", 0o755u16),
+        (5u64, "/opt/private", 0o755u16),
     ] {
         let fs = Rc::new(MemFs::new(
             FsId(format!("tmpfs:boot:{idx}")),
             idx,
             0,
             0,
-            0o755,
+            mode,
             Box::new(js_now_timespec),
         ));
+        if mode & 0o7000 != 0 {
+            let root = fs.root();
+            let _ = fs
+                .setattr(
+                    &root_cred,
+                    &root,
+                    &SetAttr {
+                        mode: Some(mode),
+                        ..SetAttr::default()
+                    },
+                )
+                .await;
+        }
         let backing = Rc::new(MountBacking::new(fs, vfs::FsType::TmpFs));
         vfs.mount_on_namespace(
             &sys_ns,
@@ -2041,27 +2178,32 @@ async fn construct_vfs(
         }
     }
 
-    Ok((vfs, dev_pts, usr_fs_id, usr_blob_paths))
+    Ok((vfs, dev_fs, dev_pts, usr_fs_id, usr_blob_paths))
 }
 
 impl VfsRuntime {
-    pub(crate) fn new_sync(instance_id: &str, root_cloud: Rc<RootCloudDriver>) -> Self {
+    pub(crate) fn new_sync(
+        instance_id: &str,
+        root_cloud: Rc<RootCloudDriver>,
+        state: Rc<RefCell<crate::State>>,
+    ) -> Self {
         let id = if instance_id.is_empty() {
             "local-instance"
         } else {
             instance_id
         };
         root_cloud.sync_boot_mem.set(true);
-        let booted = now_or_never(construct_vfs(id, Rc::clone(&root_cloud), None));
+        let booted = now_or_never(construct_vfs(id, Rc::clone(&root_cloud), state, None));
         root_cloud.sync_boot_mem.set(false);
-        let (vfs, dev_pts, usr_fs_id, usr_blob_paths) = booted
+        let (vfs, dev_fs, dev_pts, usr_fs_id, usr_blob_paths) = booted
             .expect("initial boot_vfs must resolve synchronously")
             .expect("initial boot_vfs must succeed");
         let mut proc_meta = HashMap::new();
-        proc_meta.insert(INIT, ProcessVfsMeta::new(None, true));
+        proc_meta.insert(INIT, ProcessVfsMeta::new(None, false));
         Self {
             vfs,
             root_cloud,
+            dev_fs,
             dev_pts,
             usr_fs_id,
             usr_blob_paths,
@@ -2268,33 +2410,57 @@ impl Kernel {
 
     async fn fill_stat_names(&self, vfs: &Vfs, pid: u32, st: &mut abi::Stat) {
         let root_cloud = Rc::clone(&self.vfs_rt.borrow().root_cloud);
-        if (st.mode & abi::S_IFMT) == abi::S_IFREG && st.dev == root_cloud.fs_id().dev() {
+        let is_cloud = st.dev == root_cloud.fs_id().dev();
+        if (st.mode & abi::S_IFMT) == abi::S_IFREG && is_cloud {
             st.writing = root_cloud.writing_of(st.ino);
         } else {
             st.writing = None;
+        }
+        // Harvest any real usernames/group names learned from cloud `Lstat` responses first.
+        {
+            let mut rt = self.vfs_rt.borrow_mut();
+            if st.user.is_empty()
+                && !rt.uid_names.contains_key(&st.uid)
+                && let Some(name) = root_cloud.cached_uid_name(st.uid)
+            {
+                rt.uid_names.insert(st.uid, name);
+            }
+            if st.group.is_empty()
+                && !rt.gid_names.contains_key(&st.gid)
+                && let Some(name) = root_cloud.cached_gid_name(st.gid)
+            {
+                rt.gid_names.insert(st.gid, name);
+            }
         }
         let missing = {
             let rt = self.vfs_rt.borrow();
             (st.user.is_empty() && !rt.uid_names.contains_key(&st.uid))
                 || (st.group.is_empty() && !rt.gid_names.contains_key(&st.gid))
         };
-        if missing {
+        // Only query `/etc/passwd` + `/etc/group` when remote-attached OR statting an actual
+        // cloud inode (preserving Gate 2's 0 `/api/*` RPCs for `/tmp`, `/run`, `/usr`, `/dev`).
+        if missing
+            && (self.state.borrow().remote_attached
+                || (is_cloud && crate::cloudfs::installed("pageSysPost").is_ok()))
+        {
             self.refresh_account_names(vfs, pid).await;
         }
-        let mut rt = self.vfs_rt.borrow_mut();
+        let rt = self.vfs_rt.borrow();
         if st.user.is_empty() {
             st.user = rt
                 .uid_names
-                .entry(st.uid)
-                .or_insert_with(|| st.uid.to_string())
-                .clone();
+                .get(&st.uid)
+                .cloned()
+                .or_else(|| root_cloud.cached_uid_name(st.uid))
+                .unwrap_or_else(|| st.uid.to_string());
         }
         if st.group.is_empty() {
             st.group = rt
                 .gid_names
-                .entry(st.gid)
-                .or_insert_with(|| st.gid.to_string())
-                .clone();
+                .get(&st.gid)
+                .cloned()
+                .or_else(|| root_cloud.cached_gid_name(st.gid))
+                .unwrap_or_else(|| st.gid.to_string());
         }
     }
 
@@ -2318,40 +2484,114 @@ impl Kernel {
         Some(self.vfs_rt.borrow().vfs.clone())
     }
 
-    /// Re-seed `RootCloudDriver` from `OsAuthority` during `Kernel::init()` when running in browser.
-    pub(crate) async fn sync_vfs_with_authority(&self, namespace: &str) -> vfs::Result<()> {
-        let root_cloud = Rc::clone(&self.vfs_rt.borrow().root_cloud);
-        if !root_cloud.seed_from_authority().await? {
-            return Ok(());
+    /// Bind-mount `root_cloud`'s `/dev/{driver}` (`present` or `snd`) onto `/dev/{driver}` in
+    /// `system_mnt_ns` and every active session namespace (F3-11 / E2E A1).
+    pub(crate) async fn mount_remote_cloud_dev(&self, driver: &str) {
+        if !matches!(driver, "present" | "snd") {
+            return;
         }
-        let sizes = query_authority_asset_sizes().await;
-        let opts = BootVfsOptions {
-            build_asset_sizes: sizes,
-            system_composition: None,
-            bind_mounts: Vec::new(),
+        let target = format!("/dev/{driver}");
+        let (vfs, root_cloud, namespaces) = {
+            let rt = self.vfs_rt.borrow();
+            let mut nss = vec![rt.vfs.system_namespace()];
+            for sess in rt.sessions.values() {
+                nss.push(Rc::clone(&sess.mnt_ns));
+            }
+            if let Some(guest) = &rt.guest_page {
+                nss.push(Rc::clone(&guest.mnt_ns));
+            }
+            (rt.vfs.clone(), Rc::clone(&rt.root_cloud), nss)
         };
-        let inst_id = if namespace.is_empty() {
-            "browser-instance"
-        } else {
-            namespace
+        let entry = match self
+            .with_page_scope(false, root_cloud.lookup_remote_dir_handle(&target))
+            .await
+        {
+            Ok(e) => e,
+            Err(_) => return,
         };
-        struct SeedCacheGuard(Rc<RootCloudDriver>);
-        impl Drop for SeedCacheGuard {
-            fn drop(&mut self) {
-                self.0.use_seed_cache.set(false);
+        let backing = Rc::new(MountBacking::new(
+            Rc::clone(&root_cloud) as Rc<dyn Filesystem>,
+            vfs::FsType::Cloud,
+        ));
+        let mut root_cred = Cred::root();
+        root_cred.umask = 0;
+        for ns in namespaces {
+            let already = ns
+                .borrow()
+                .mounts()
+                .values()
+                .any(|m| m.slot.backing.fstype == vfs::FsType::Cloud && m.root_in_fs == target);
+            if already {
+                continue;
+            }
+            if let Ok(mount_id) = self
+                .with_page_scope(
+                    false,
+                    vfs.mount_on_namespace(
+                        &ns,
+                        &root_cred,
+                        Rc::clone(&backing),
+                        Some((entry.handle.clone(), target.clone())),
+                        "cloud",
+                        &target,
+                        MountFlags {
+                            nosuid: true,
+                            noexec: true,
+                            ..MountFlags::default()
+                        },
+                        mount_flags::MS_NOSUID | mount_flags::MS_NOEXEC,
+                        None,
+                    ),
+                )
+                .await
+            {
+                let mut rt = self.vfs_rt.borrow_mut();
+                for sess in rt.sessions.values_mut() {
+                    if Rc::ptr_eq(&sess.mnt_ns, &ns) {
+                        sess.baseline_mounts.insert(mount_id);
+                    }
+                }
+                if let Some(guest) = &mut rt.guest_page
+                    && Rc::ptr_eq(&guest.mnt_ns, &ns)
+                {
+                    guest.baseline_mounts.insert(mount_id);
+                }
             }
         }
-        root_cloud.use_seed_cache.set(true);
-        let _seed_guard = SeedCacheGuard(Rc::clone(&root_cloud));
-        let (vfs, dev_pts, usr_fs_id, usr_blob_paths) =
-            construct_vfs(inst_id, Rc::clone(&root_cloud), Some(opts)).await?;
-        drop(_seed_guard);
-        let mut rt = self.vfs_rt.borrow_mut();
-        rt.vfs = vfs;
-        rt.dev_pts = dev_pts;
-        rt.usr_fs_id = usr_fs_id;
-        rt.usr_blob_paths = usr_blob_paths;
-        Ok(())
+    }
+
+    /// Unmount any cloud bind-mount for `/dev/{driver}` from `system_mnt_ns` and all active
+    /// session namespaces before detaching the `DevTmpFs` node.
+    pub(crate) fn unmount_remote_cloud_dev(&self, driver: &str) {
+        if !matches!(driver, "present" | "snd") {
+            return;
+        }
+        let target = format!("/dev/{driver}");
+        let namespaces = {
+            let rt = self.vfs_rt.borrow();
+            let mut nss = vec![rt.vfs.system_namespace()];
+            for sess in rt.sessions.values() {
+                nss.push(Rc::clone(&sess.mnt_ns));
+            }
+            if let Some(guest) = &rt.guest_page {
+                nss.push(Rc::clone(&guest.mnt_ns));
+            }
+            nss
+        };
+        for ns in namespaces {
+            let ids: Vec<MountId> = ns
+                .borrow()
+                .mounts()
+                .iter()
+                .filter(|(_, m)| {
+                    m.slot.backing.fstype == vfs::FsType::Cloud && m.root_in_fs == target
+                })
+                .map(|(&id, _)| id)
+                .collect();
+            for id in ids {
+                let _ = ns.borrow_mut().detach_subtree(id);
+            }
+        }
     }
 
     pub(crate) async fn close_process_server_fds(&self, pid: u32) {
@@ -2445,23 +2685,23 @@ impl Kernel {
         root_cloud.set_cloud_access(pid, true);
     }
 
-    /// Register a newly admitted `Execve` process in `Vfs` (`execs_of`).
+    /// Register a newly admitted local process in `Vfs` (`execs_of`) with ZERO network RPCs.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn register_exec_in_vfs(
+    pub(crate) async fn register_local_exec_in_vfs(
         &self,
         pid: u32,
         ppid: u32,
-        token: &str,
+        identity: Identity,
+        token: Option<String>,
         cwd: &str,
         session_id: Option<&str>,
         cloud_access: bool,
         service_grant_json: Option<&str>,
     ) -> Result<(), JsValue> {
-        let identity = self.cloud_identity(pid, token).await?;
         let cred = Cred {
             identity,
             umask: 0o022,
-            token: Some(token.to_string()),
+            token,
         };
         let grant = service_grant_json
             .map(serde_json::from_str::<ServiceGrantSpec>)
@@ -2486,12 +2726,11 @@ impl Kernel {
                     .0
                 }
                 None => match &sid {
-                    Some(id) => Rc::clone(
-                        &rt.sessions
-                            .get(id)
-                            .ok_or_else(|| map_errno(Errno::ENOENT))?
-                            .mnt_ns,
-                    ),
+                    Some(id) => rt
+                        .sessions
+                        .get(id)
+                        .map(|s| Rc::clone(&s.mnt_ns))
+                        .unwrap_or_else(|| rt.vfs.system_namespace()),
                     None => rt.vfs.system_namespace(),
                 },
             };
@@ -2596,56 +2835,54 @@ impl Kernel {
         self.with_root_cloud_scope(Some(pid), false, fut)
     }
 
+    async fn with_proc_scope_retry<T, F, Fut>(&self, pid: u32, mut make: F) -> vfs::Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = vfs::Result<T>>,
+    {
+        let before_uid = self
+            .state
+            .borrow()
+            .table
+            .proc(pid)
+            .map(|p| p.cred.identity.id);
+        let res = self.with_proc_scope(pid, make()).await;
+        let after_uid = self
+            .state
+            .borrow()
+            .table
+            .proc(pid)
+            .map(|p| p.cred.identity.id);
+        let hydrated = before_uid == Some(os_core::permissions::GUEST)
+            && after_uid.is_some_and(os_core::permissions::is_guest_id);
+        if hydrated || after_uid != before_uid {
+            self.sync_vfs_proc_creds(pid);
+            if hydrated {
+                let other_pids: Vec<u32> = self
+                    .state
+                    .borrow()
+                    .table
+                    .all_pids()
+                    .into_iter()
+                    .filter(|&p| p != pid && p != 1)
+                    .collect();
+                for opid in other_pids {
+                    self.sync_vfs_proc_creds(opid);
+                }
+            }
+        }
+        if hydrated && matches!(res, Err(Errno::EACCES | Errno::EPERM)) {
+            return self.with_proc_scope(pid, make()).await;
+        }
+        res
+    }
+
     fn with_page_scope<F>(&self, sudo: bool, fut: F) -> RootCloudScope<F>
     where
         F: std::future::Future,
     {
         self.with_root_cloud_scope(None, sudo, fut)
     }
-}
-
-async fn query_authority_asset_sizes() -> Option<BuildAssetSizes> {
-    if installed("pageSysPost").is_err() {
-        return None;
-    }
-    let paths = [
-        "/usr/bin/coreutils",
-        "/usr/bin/utilities",
-        "/usr/bin/dash",
-        "/usr/bin/supervise",
-        "/usr/bin/init",
-    ];
-    let calls = paths
-        .iter()
-        .map(|p| Call::Stat {
-            path: (*p).to_string(),
-        })
-        .collect();
-    let results = page_sys_batch(Batch {
-        calls,
-        umask: None,
-        sudo: false,
-        pid: None,
-        process: None,
-    })
-    .await
-    .ok()?;
-    let mut nums = [FILE_MAX; 5];
-    for (idx, ret) in results.into_iter().enumerate() {
-        if let Return::Ok(val) = ret
-            && let Some(sz) = val["size"].as_u64()
-            && sz >= 8
-        {
-            nums[idx] = sz;
-        }
-    }
-    Some(BuildAssetSizes {
-        coreutils: nums[0],
-        utilities: nums[1],
-        dash: nums[2],
-        supervise: nums[3],
-        init: nums[4],
-    })
 }
 
 async fn read_vfs_file_bounded(
@@ -2709,7 +2946,7 @@ impl Kernel {
     // 1. Boot, Login Session Lifecycle & User Mount Service
     // =========================================================================
 
-    /// Re-initialize `system_mnt_ns` with optional composition / build asset options.
+    /// Re-initialize `system_mnt_ns` with optional composition / build asset options (ZERO RPCs).
     pub async fn boot_vfs(&self, opts_json: Option<String>) -> Result<(), JsValue> {
         let opts: Option<BootVfsOptions> = opts_json
             .as_deref()
@@ -2719,30 +2956,31 @@ impl Kernel {
         let (inst_id, root_cloud) = {
             let state = self.state.borrow();
             let id = if state.namespace.is_empty() {
-                if state.id.is_empty() {
+                if state.instance_id.is_empty() {
                     "local-instance".to_string()
                 } else {
-                    state.id.clone()
+                    state.instance_id.clone()
                 }
             } else {
                 state.namespace.clone()
             };
             (id, Rc::clone(&self.vfs_rt.borrow().root_cloud))
         };
-        let _ = root_cloud.seed_from_authority().await;
-        let (vfs, dev_pts, usr_fs_id, usr_blob_paths) = construct_vfs(&inst_id, root_cloud, opts)
-            .await
-            .map_err(map_errno)?;
+        let (vfs, dev_fs, dev_pts, usr_fs_id, usr_blob_paths) =
+            construct_vfs(&inst_id, root_cloud, Rc::clone(&self.state), opts)
+                .await
+                .map_err(map_errno)?;
         let (old_vfs, old_sessions, old_streams) = {
             let mut rt = self.vfs_rt.borrow_mut();
             let old_vfs = std::mem::replace(&mut rt.vfs, vfs);
+            rt.dev_fs = dev_fs;
             rt.dev_pts = dev_pts;
             rt.usr_fs_id = usr_fs_id;
             rt.usr_blob_paths = usr_blob_paths;
             rt.active_session_id = None;
             rt.exec_tickets.clear();
             rt.proc_meta.clear();
-            rt.proc_meta.insert(INIT, ProcessVfsMeta::new(None, true));
+            rt.proc_meta.insert(INIT, ProcessVfsMeta::new(None, false));
             let mut old_sessions: Vec<_> = rt.sessions.drain().collect();
             if let Some(guest) = rt.guest_page.take() {
                 old_sessions.push((String::new(), guest));
@@ -3445,7 +3683,7 @@ impl Kernel {
                 let mut seen_blobs = BTreeSet::new();
                 for (src_dir, img) in &parsed_imgs {
                     for entry in &img.entries {
-                        if let image::Node::File { sha256, size } = &entry.node {
+                        if let image::Node::File { sha256, size, .. } = &entry.node {
                             if !seen_blobs.insert(sha256.clone()) {
                                 continue;
                             }
@@ -3487,7 +3725,7 @@ impl Kernel {
 
         // Verify all referenced blobs are present when loaded via `spec.manifests`.
         for entry in composition.entries.values() {
-            if let image::Node::File { sha256, size } = &entry.node {
+            if let image::Node::File { sha256, size, .. } = &entry.node {
                 let mut probe = [0u8; 1];
                 if *size > 0
                     && now_or_never(blob_store.read_at(sha256, 0, &mut probe)) != Some(Ok(1))
@@ -3512,9 +3750,16 @@ impl Kernel {
                 mode: e.mode & 0o0777,
                 node: match e.node {
                     image::Node::Directory => ImageNodeKind::Directory,
-                    image::Node::File { sha256, size } => ImageNodeKind::File {
+                    image::Node::File {
+                        sha256,
+                        size,
+                        chunk_size,
+                        chunks,
+                    } => ImageNodeKind::File {
                         blob_id: sha256,
                         size,
+                        chunk_size: Some(chunk_size),
+                        chunks,
                     },
                     image::Node::Symlink { target } => {
                         let rebased = if target.starts_with('/') {
@@ -3816,7 +4061,8 @@ impl Kernel {
                 "nodev": flags.nodev,
                 "noexec": flags.noexec,
                 "ownerUid": owner_uid,
-                "baseline": baseline_mounts.contains(&MountId(mid)),
+                "baseline": baseline_mounts.contains(&MountId(mid))
+                    || (um.is_none() && matches!(target.as_str(), "/dev/present" | "/dev/snd")),
                 "userMount": um.is_some() || owner_uid.is_some(),
                 "kind": um.map(|u| u.kind.as_str()).unwrap_or(fstype),
                 "name": um.map(|u| u.name.as_str()).unwrap_or(""),
@@ -3992,6 +4238,7 @@ impl Kernel {
         range_end: Option<u64>,
         head_only: bool,
     ) -> Result<JsValue, JsValue> {
+        crate::cloudfs::clear_last_page_error();
         let (vfs, scoped_pid) = {
             let mut rt = self.vfs_rt.borrow_mut();
             (rt.vfs.clone(), rt.alloc_scoped_pid())
@@ -4416,6 +4663,7 @@ impl Kernel {
         bytes: &[u8],
         chunk_index: Option<u64>,
     ) -> Result<JsValue, JsValue> {
+        crate::cloudfs::clear_last_page_error();
         let (entry, cred) = {
             let rt = self.vfs_rt.borrow();
             let sess = rt
@@ -4585,7 +4833,7 @@ impl Kernel {
             if let Some(cwd) = &opts.cwd
                 && !cwd.is_empty()
             {
-                self.with_proc_scope(opts.pid, vfs.chdir(opts.pid, cwd))
+                self.with_proc_scope_retry(opts.pid, || vfs.chdir(opts.pid, cwd))
                     .await
                     .map_err(map_errno)?;
             }
@@ -4666,7 +4914,7 @@ impl Kernel {
             && !cwd.is_empty()
             && cwd != "/"
             && let Err(err) = self
-                .with_proc_scope(opts.pid, vfs.chdir(opts.pid, cwd))
+                .with_proc_scope_retry(opts.pid, || vfs.chdir(opts.pid, cwd))
                 .await
         {
             let _ = self
@@ -4676,11 +4924,22 @@ impl Kernel {
             return Err(map_errno(err));
         }
 
+        let live_cred = self
+            .state
+            .borrow()
+            .table
+            .proc(opts.pid)
+            .map(|p| Cred {
+                identity: p.cred.identity.clone(),
+                umask: opts.umask,
+                token: p.cred.remote.as_ref().map(|r| r.token.clone()),
+            })
+            .unwrap_or(cred);
         {
             let mut rt = self.vfs_rt.borrow_mut();
             rt.proc_meta.insert(
                 opts.pid,
-                ProcessVfsMeta::with_cred(resolved_sess, opts.cloud_access, cred),
+                ProcessVfsMeta::with_cred(resolved_sess, opts.cloud_access, live_cred),
             );
         }
         let ns_id = base_ns.borrow().id().0;
@@ -4802,7 +5061,8 @@ impl Kernel {
         vfs.fork_process(parent_pid, child_pid, clone_flags)
             .map_err(map_errno)?;
         if let Some(meta) = parent_meta {
-            root_cloud.set_cloud_access(child_pid, meta.cloud_access);
+            let parent_usr_denied = root_cloud.is_pid_cloud_denied(parent_pid);
+            root_cloud.set_cloud_access(child_pid, !parent_usr_denied);
             self.vfs_rt.borrow_mut().proc_meta.insert(child_pid, meta);
         } else {
             root_cloud.set_cloud_access(child_pid, true);
@@ -4824,6 +5084,46 @@ impl Kernel {
         self.close_server_descriptors(pid, true)
             .await
             .map_err(map_errno)
+    }
+
+    /// Strip `pid`'s remote cloud token & `proc_meta.cloud_access` in `Vfs` on `LoginAction::End`
+    /// without revoking its local `/usr` system image exec grant so shutdown traps can still run
+    /// local utilities while being completely blocked from remote cloud access or token minting.
+    pub(crate) fn proc_revoke_remote_creds(
+        &self,
+        pid: u32,
+        uid: u32,
+        gid: u32,
+        groups: Vec<u32>,
+    ) -> Result<(), JsValue> {
+        let (vfs, old_umask) = {
+            let mut rt = self.vfs_rt.borrow_mut();
+            if let Some(meta) = rt.proc_meta.get_mut(&pid) {
+                meta.cloud_access = false;
+            }
+            let um = rt
+                .vfs
+                .process_fs_context(pid)
+                .map(|c| c.borrow().umask)
+                .unwrap_or(0o022);
+            (rt.vfs.clone(), um)
+        };
+        let mut gset: BTreeSet<u32> = groups.into_iter().collect();
+        gset.insert(gid);
+        let cred = Cred {
+            identity: Identity {
+                id: uid,
+                group: gid,
+                groups: gset,
+            },
+            umask: old_umask,
+            token: None,
+        };
+        vfs.set_cred(pid, cred.clone()).map_err(map_errno)?;
+        if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+            meta.cred = cred;
+        }
+        Ok(())
     }
 
     pub fn proc_set_creds(
@@ -4910,9 +5210,13 @@ impl Kernel {
 
     pub async fn sys_chdir(&self, pid: u32, path: String) -> Result<(), JsValue> {
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move { vfs.chdir(pid, &path).await })
-            .await
-            .map_err(map_errno)
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let path = path.clone();
+            async move { vfs.chdir(pid, &path).await }
+        })
+        .await
+        .map_err(map_errno)
     }
 
     pub async fn sys_fchdir(&self, pid: u32, kfd: u32) -> Result<(), JsValue> {
@@ -4924,9 +5228,13 @@ impl Kernel {
 
     pub async fn sys_chroot(&self, pid: u32, path: String) -> Result<(), JsValue> {
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move { vfs.chroot(pid, &path).await })
-            .await
-            .map_err(map_errno)
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let path = path.clone();
+            async move { vfs.chroot(pid, &path).await }
+        })
+        .await
+        .map_err(map_errno)
     }
 
     pub async fn sys_getcwd(&self, pid: u32) -> Result<String, JsValue> {
@@ -4988,7 +5296,12 @@ impl Kernel {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let sfs = self
-            .with_proc_scope(pid, async move { vfs.statfs(pid, anchor, &path).await })
+            .with_proc_scope_retry(pid, || {
+                let vfs = vfs.clone();
+                let anchor = anchor.clone();
+                let path = path.clone();
+                async move { vfs.statfs(pid, anchor, &path).await }
+            })
             .await
             .map_err(map_errno)?;
         json_to_js(&json!(safe_statfs_for_js(sfs)))
@@ -5067,48 +5380,56 @@ impl Kernel {
             },
         }
         let outcome = self
-            .with_proc_scope(pid, async move {
-                let (file_ref, entry) = vfs.open_file(pid, anchor, &path, pass_flags, mode).await?;
-                if (oflags & abi::O_DIRECTORY) != 0 && !entry.metadata.is_dir() {
-                    let _ = file_ref.close().await;
-                    drain_releases(&vfs);
-                    return Err(Errno::ENOTDIR);
-                }
-                let mut st = vfs::stat::stat(&entry.handle.fs, entry.handle.node, &entry.metadata);
-                if (oflags & abi::O_PATH) == 0
-                    && entry.metadata.file_type == FileType::CharDevice
-                    && let Some(rdev) = &entry.metadata.rdev
-                    && let Some(canonical_dev) =
-                        canonical_server_dev_path(&root_cloud, &entry.handle, rdev)
-                {
-                    let device = Some(rdev.clone());
-                    let _ = file_ref.close().await;
-                    drain_releases(&vfs);
-                    return Ok(OpenOutcome::ServerDev {
-                        canonical_dev,
-                        stat: st,
-                        device,
-                    });
-                }
-                let is_ns = file_ref.mount_ns().is_some();
-                let fstype = file_ref.mount_pin().map(|p| p.fstype());
-                let fds = vfs.process_fds(pid)?;
-                let insert_res = fds.borrow_mut().insert(file_ref, cloexec);
-                let fd = match insert_res {
-                    Ok(fd) => fd,
-                    Err(e) => {
+            .with_proc_scope_retry(pid, || {
+                let vfs = vfs.clone();
+                let root_cloud = Rc::clone(&root_cloud);
+                let anchor = anchor.clone();
+                let path = path.clone();
+                async move {
+                    let (file_ref, entry) =
+                        vfs.open_file(pid, anchor, &path, pass_flags, mode).await?;
+                    if (oflags & abi::O_DIRECTORY) != 0 && !entry.metadata.is_dir() {
+                        let _ = file_ref.close().await;
                         drain_releases(&vfs);
-                        return Err(e);
+                        return Err(Errno::ENOTDIR);
                     }
-                };
-                st = vfs::stat::stat(&entry.handle.fs, entry.handle.node, &entry.metadata);
-                Ok::<_, Errno>(OpenOutcome::Kfd {
-                    kfd: fd,
-                    stat: st,
-                    entry_meta: entry.metadata,
-                    is_ns,
-                    pin_fstype: fstype,
-                })
+                    let mut st =
+                        vfs::stat::stat(&entry.handle.fs, entry.handle.node, &entry.metadata);
+                    if (oflags & abi::O_PATH) == 0
+                        && entry.metadata.file_type == FileType::CharDevice
+                        && let Some(rdev) = &entry.metadata.rdev
+                        && let Some(canonical_dev) =
+                            canonical_server_dev_path(&root_cloud, &entry.handle, rdev)
+                    {
+                        let device = Some(rdev.clone());
+                        let _ = file_ref.close().await;
+                        drain_releases(&vfs);
+                        return Ok(OpenOutcome::ServerDev {
+                            canonical_dev,
+                            stat: st,
+                            device,
+                        });
+                    }
+                    let is_ns = file_ref.mount_ns().is_some();
+                    let fstype = file_ref.mount_pin().map(|p| p.fstype());
+                    let fds = vfs.process_fds(pid)?;
+                    let insert_res = fds.borrow_mut().insert(file_ref, cloexec);
+                    let fd = match insert_res {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            drain_releases(&vfs);
+                            return Err(e);
+                        }
+                    };
+                    st = vfs::stat::stat(&entry.handle.fs, entry.handle.node, &entry.metadata);
+                    Ok::<_, Errno>(OpenOutcome::Kfd {
+                        kfd: fd,
+                        stat: st,
+                        entry_meta: entry.metadata,
+                        is_ns,
+                        pin_fstype: fstype,
+                    })
+                }
             })
             .await
             .map_err(map_errno)?;
@@ -5184,16 +5505,21 @@ impl Kernel {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let mut st = self
-            .with_proc_scope(pid, async move {
-                let mut st = vfs.statat(pid, anchor.clone(), &path, follow).await?;
-                if !follow
-                    && st.link.is_none()
-                    && (st.mode & abi::S_IFMT) == abi::S_IFLNK
-                    && let Ok(target) = vfs.readlinkat(pid, anchor, &path).await
-                {
-                    st.link = Some(target);
+            .with_proc_scope_retry(pid, || {
+                let vfs = vfs.clone();
+                let anchor = anchor.clone();
+                let path = path.clone();
+                async move {
+                    let mut st = vfs.statat(pid, anchor.clone(), &path, follow).await?;
+                    if !follow
+                        && st.link.is_none()
+                        && (st.mode & abi::S_IFMT) == abi::S_IFLNK
+                        && let Ok(target) = vfs.readlinkat(pid, anchor, &path).await
+                    {
+                        st.link = Some(target);
+                    }
+                    Ok(st)
                 }
-                Ok(st)
             })
             .await
             .map_err(map_errno)?;
@@ -5212,8 +5538,11 @@ impl Kernel {
     ) -> Result<(), JsValue> {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move {
-            vfs.accessat(pid, anchor, &path, mode, follow).await
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let anchor = anchor.clone();
+            let path = path.clone();
+            async move { vfs.accessat(pid, anchor, &path, mode, follow).await }
         })
         .await
         .map_err(map_errno)
@@ -5228,10 +5557,12 @@ impl Kernel {
     ) -> Result<(), JsValue> {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(
-            pid,
-            async move { vfs.mkdirat(pid, anchor, &path, mode).await },
-        )
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let anchor = anchor.clone();
+            let path = path.clone();
+            async move { vfs.mkdirat(pid, anchor, &path, mode).await }
+        })
         .await
         .map(|_| ())
         .map_err(map_errno)
@@ -5248,8 +5579,12 @@ impl Kernel {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let rdev_str = rdev.unwrap_or_default();
-        self.with_proc_scope(pid, async move {
-            vfs.mknodat(pid, anchor, &path, mode, &rdev_str).await
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let anchor = anchor.clone();
+            let path = path.clone();
+            let rdev_str = rdev_str.clone();
+            async move { vfs.mknodat(pid, anchor, &path, mode, &rdev_str).await }
         })
         .await
         .map(|_| ())
@@ -5265,10 +5600,12 @@ impl Kernel {
     ) -> Result<(), JsValue> {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(
-            pid,
-            async move { vfs.unlinkat(pid, anchor, &path, dir).await },
-        )
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let anchor = anchor.clone();
+            let path = path.clone();
+            async move { vfs.unlinkat(pid, anchor, &path, dir).await }
+        })
         .await
         .map_err(map_errno)
     }
@@ -5290,9 +5627,16 @@ impl Kernel {
             RenameFlags::empty()
         };
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move {
-            vfs.renameat(pid, from_anchor, &old_path, to_anchor, &new_path, flags)
-                .await
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let from_anchor = from_anchor.clone();
+            let to_anchor = to_anchor.clone();
+            let old_path = old_path.clone();
+            let new_path = new_path.clone();
+            async move {
+                vfs.renameat(pid, from_anchor, &old_path, to_anchor, &new_path, flags)
+                    .await
+            }
         })
         .await
         .map_err(map_errno)
@@ -5310,9 +5654,16 @@ impl Kernel {
         let from_anchor = parse_anchor(old_kfd).map_err(map_errno)?;
         let to_anchor = parse_anchor(new_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move {
-            vfs.linkat(pid, from_anchor, &old_path, to_anchor, &new_path, follow)
-                .await
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let from_anchor = from_anchor.clone();
+            let to_anchor = to_anchor.clone();
+            let old_path = old_path.clone();
+            let new_path = new_path.clone();
+            async move {
+                vfs.linkat(pid, from_anchor, &old_path, to_anchor, &new_path, follow)
+                    .await
+            }
         })
         .await
         .map(|_| ())
@@ -5328,8 +5679,12 @@ impl Kernel {
     ) -> Result<(), JsValue> {
         let anchor = parse_anchor(dir_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move {
-            vfs.symlinkat(pid, &target, anchor, &link_path).await
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let target = target.clone();
+            let anchor = anchor.clone();
+            let link_path = link_path.clone();
+            async move { vfs.symlinkat(pid, &target, anchor, &link_path).await }
         })
         .await
         .map(|_| ())
@@ -5344,9 +5699,14 @@ impl Kernel {
     ) -> Result<String, JsValue> {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move { vfs.readlinkat(pid, anchor, &path).await })
-            .await
-            .map_err(map_errno)
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let anchor = anchor.clone();
+            let path = path.clone();
+            async move { vfs.readlinkat(pid, anchor, &path).await }
+        })
+        .await
+        .map_err(map_errno)
     }
 
     pub async fn proc_utimensat(
@@ -5364,19 +5724,24 @@ impl Kernel {
         let mtime: Time = serde_json::from_str(&mtime_json)
             .map_err(|e| vfs_js_err(Errno::EINVAL, e.to_string()))?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        self.with_proc_scope(pid, async move {
-            vfs.setattrat(
-                pid,
-                anchor,
-                &path,
-                &SetAttr {
-                    atime,
-                    mtime,
-                    ..SetAttr::default()
-                },
-                follow,
-            )
-            .await
+        self.with_proc_scope_retry(pid, || {
+            let vfs = vfs.clone();
+            let anchor = anchor.clone();
+            let path = path.clone();
+            async move {
+                vfs.setattrat(
+                    pid,
+                    anchor,
+                    &path,
+                    &SetAttr {
+                        atime,
+                        mtime,
+                        ..SetAttr::default()
+                    },
+                    follow,
+                )
+                .await
+            }
         })
         .await
         .map(|_| ())
@@ -5393,6 +5758,12 @@ impl Kernel {
         if let Some(um) = batch.umask {
             let _ = vfs.set_umask(pid, um);
         }
+        let before_uid = self
+            .state
+            .borrow()
+            .table
+            .proc(pid)
+            .map(|p| p.cred.identity.id);
         let results = self
             .with_proc_scope(
                 pid,
@@ -5409,6 +5780,15 @@ impl Kernel {
                 ),
             )
             .await;
+        let after_uid = self
+            .state
+            .borrow()
+            .table
+            .proc(pid)
+            .map(|p| p.cred.identity.id);
+        if after_uid != before_uid {
+            self.sync_vfs_proc_creds(pid);
+        }
         serde_json::to_string(&abi::Results { results })
             .map_err(|e| vfs_js_err(Errno::EIO, e.to_string()))
     }
@@ -5824,16 +6204,22 @@ impl Kernel {
 
         let owner = {
             let rt = self.vfs_rt.borrow();
-            let sid = page_session
-                .map(str::to_owned)
-                .or_else(|| rt.proc_meta.get(&pid).and_then(|m| m.login_session.clone()));
-            sid.map(|s| {
-                rt.sessions
-                    .get(&s)
-                    .map(|v| (s, v.mnt_ns.clone()))
-                    .ok_or_else(|| map_errno(Errno::ESTALE))
-            })
-            .transpose()?
+            if let Some(sid) = page_session {
+                Some(
+                    rt.sessions
+                        .get(sid)
+                        .map(|v| (sid.to_owned(), v.mnt_ns.clone()))
+                        .ok_or_else(|| map_errno(Errno::ESTALE))?,
+                )
+            } else {
+                // Already-running processes keep their own MountNamespace and ProviderState liveness
+                // checks even after login-session rotation or shutdown-scope end (e.g. cleanup
+                // handlers forking `/usr/bin/*` after `end-session`, or `sh -i` after login change).
+                rt.proc_meta
+                    .get(&pid)
+                    .and_then(|m| m.login_session.as_ref())
+                    .and_then(|s| rt.sessions.get(s).map(|v| (s.clone(), v.mnt_ns.clone())))
+            }
         };
         let chrooted = {
             let fs_ctx = vfs.process_fs_context(pid).map_err(map_errno)?;
@@ -5927,33 +6313,10 @@ impl Kernel {
                     })));
                 }
 
-                // Case 2: Cloud `/` executable when NOT chrooted, `!nosuid`, and cloud access allowed.
-                if resolved.pin.fstype() == vfs::FsType::Cloud
-                    && !chrooted
-                    && !resolved.nosuid
-                    && !root_cloud.is_pid_cloud_denied(pid)
-                    && let Some(cloud_path) =
-                        root_cloud.canonical_cloud_path(resolved.entry.handle.node)
-                {
-                    let _ = resolved.file.close().await;
-                    drain_releases(&vfs);
-                    return Ok(ResolveOut::Immediate(json!({
-                        "path": resolved.resolved_path,
-                        "argv": resolved.argv,
-                        "resolvedPath": resolved.resolved_path,
-                        "execPath": cloud_path,
-                        "asset": Value::Null,
-                        "runtime": runtime,
-                        "noUsrFallback": true,
-                        "chroot": false,
-                        "chrooted": false,
-                        "nosuid": false,
-                        "local": Value::Null,
-                    })));
-                }
-
-                // Case 3: Local mount (`opfs`, `hostfs`, `helperfs`, `sharefs`), `tmpfs`, private
-                // extension `image`, or chrooted/cloud-attenuated executable -> snapshot & verify bytes!
+                // Case 2: All non-`/usr` executables (cloud files, Release v2 immutable
+                // sysext/confext overlays, local mounts, `tmpfs`, private extension `image`, or
+                // chrooted/cloud-attenuated executables) snapshot & verify bytes through `Vfs`
+                // and run locally without server `/internal/exec`.
                 let size = resolved.entry.metadata.size;
                 if size > abi::EXEC_MAX {
                     let _ = resolved.file.close().await;
@@ -6801,6 +7164,7 @@ impl Kernel {
                 }
             }
             let mut call = calls[idx].clone();
+            crate::cloudfs::clear_last_page_error();
             let mut aliases = Vec::new();
             let bound = page_session_id.map_or(Ok(false), |sid| {
                 self.bind_page_descriptors(vfs, pid, sid, &mut call, &fd_refs, &mut aliases)
@@ -7451,7 +7815,219 @@ impl Kernel {
                         }
                         Err(e) => Err(e.into()),
                     },
+                    Call::Getcreds if page_sid.is_none() && pid < SCOPED_PAGE_PID_BASE => {
+                        let host = self
+                            .state
+                            .borrow()
+                            .table
+                            .proc(pid)
+                            .map(|p| p.owner_host.clone());
+                        match host {
+                            Some(h) => match self.getcreds_proc(pid, &h) {
+                                Ok(raw) => serde_json::from_str::<Value>(&raw)
+                                    .map_err(|_| Errno::EIO.into()),
+                                Err(_) => Err(Errno::ESRCH.into()),
+                            },
+                            None => Err(Errno::ESRCH.into()),
+                        }
+                    }
+                    call @ (Call::Getpid
+                    | Call::Getpgid { .. }
+                    | Call::Getsid { .. }
+                    | Call::Setpgid { .. }
+                    | Call::Setsid
+                    | Call::Prctl { .. }
+                    | Call::ProcStopped { .. }
+                    | Call::Waitpid { .. }
+                    | Call::CgroupCreate { .. }
+                    | Call::CgroupRemove { .. }
+                    | Call::CgroupSet { .. }
+                    | Call::CgroupAttach { .. }
+                    | Call::CgroupStat { .. }
+                    | Call::CgroupList { .. }) => {
+                        let owner_host = self
+                            .state
+                            .borrow()
+                            .table
+                            .proc(pid)
+                            .map(|p| p.owner_host.clone());
+                        if let Some(h) = owner_host {
+                            self.eval_local_process_call(pid, &h, call).await
+                        } else if page_sid.is_some() || pid >= SCOPED_PAGE_PID_BASE {
+                            // Page-scoped cgroup operations act as the instance's local account.
+                            match call {
+                                Call::CgroupCreate {
+                                    path,
+                                    controllers,
+                                    lifetime,
+                                } => {
+                                    let mut state = self.state.borrow_mut();
+                                    let cred = state.account.identity();
+                                    state
+                                        .table
+                                        .cgroup_create(
+                                            &cred,
+                                            None,
+                                            &path,
+                                            controllers.as_deref(),
+                                            lifetime,
+                                        )
+                                        .map(|()| Value::Null)
+                                }
+                                Call::CgroupRemove { path } => {
+                                    let mut state = self.state.borrow_mut();
+                                    let cred = state.account.identity();
+                                    state
+                                        .table
+                                        .cgroup_remove(&cred, &path)
+                                        .map(|()| Value::Null)
+                                }
+                                Call::CgroupSet { path, key, value } => {
+                                    let res = {
+                                        let mut state = self.state.borrow_mut();
+                                        let cred = state.account.identity();
+                                        state
+                                            .table
+                                            .cgroup_set_with_revocations(
+                                                &cred,
+                                                &path,
+                                                &key,
+                                                &value,
+                                                crate::now_secs(),
+                                            )
+                                            .map(|(d, r)| {
+                                                let norm =
+                                                    kernel::local_cgroups::normalize_cgroup_path(
+                                                        &path,
+                                                    )
+                                                    .unwrap_or(path);
+                                                (d, r, norm)
+                                            })
+                                    };
+                                    match res {
+                                        Ok((deliveries, revoked, norm)) => {
+                                            for d in deliveries {
+                                                if d.killed {
+                                                    self.cloud_exited(d.pid, None).await;
+                                                }
+                                            }
+                                            crate::revoke_remote_tokens_state(&self.state, revoked)
+                                                .await;
+                                            if key == "io.max" {
+                                                self.sync_remote_io_quota_subtree(&norm).await;
+                                            }
+                                            Ok(Value::Null)
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                                Call::CgroupAttach {
+                                    pid: target_pid,
+                                    path,
+                                } => {
+                                    let res = {
+                                        let mut state = self.state.borrow_mut();
+                                        let cred = state.account.identity();
+                                        state.table.cgroup_attach(&cred, target_pid, &path).map(
+                                            |()| {
+                                                let norm =
+                                                    kernel::local_cgroups::normalize_cgroup_path(
+                                                        &path,
+                                                    )
+                                                    .unwrap_or(path);
+                                                let tok =
+                                                    state.table.proc(target_pid).and_then(|p| {
+                                                        p.cred
+                                                            .remote
+                                                            .as_ref()
+                                                            .map(|r| r.token.clone())
+                                                    });
+                                                (norm, tok)
+                                            },
+                                        )
+                                    };
+                                    match res {
+                                        Ok((norm, remote_tok)) => {
+                                            if let Some(token) = remote_tok {
+                                                self.sync_remote_io_quota_for_token(&token, &norm)
+                                                    .await;
+                                            }
+                                            Ok(Value::Null)
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                                Call::CgroupStat { path } => {
+                                    self.state.borrow().table.cgroup_stat(&path)
+                                }
+                                Call::CgroupList { path } => {
+                                    Ok(json!(self.state.borrow().table.cgroup_list(&path)))
+                                }
+                                _ => Err(Errno::ENOSYS.into()),
+                            }
+                        } else {
+                            Err(Errno::ESRCH.into())
+                        }
+                    }
+                    Call::Kill {
+                        pid: target_str,
+                        signal,
+                    } => {
+                        let target = abi::Target::of(&target_str);
+                        if !matches!(target, abi::Target::Job(_)) {
+                            let sig = signal.unwrap_or(abi::SIGTERM);
+                            let from =
+                                (page_sid.is_none() && pid < SCOPED_PAGE_PID_BASE).then_some(pid);
+                            let kill_res = {
+                                let mut state = self.state.borrow_mut();
+                                let caller_cred = if let Some(fp) = from {
+                                    state
+                                        .table
+                                        .proc(fp)
+                                        .filter(|p| p.state != abi::ProcState::Zombie)
+                                        .map(|p| p.cred.identity.clone())
+                                        .ok_or_else(|| abi::Error::from(Errno::ESRCH))
+                                } else {
+                                    Ok(state.account.identity())
+                                };
+                                caller_cred.and_then(|cred| {
+                                    state.table.kill_with_revocations(
+                                        &cred,
+                                        from,
+                                        target,
+                                        sig,
+                                        crate::now_secs(),
+                                    )
+                                })
+                            };
+                            match kill_res {
+                                Ok((deliveries, revoked)) => {
+                                    for d in deliveries {
+                                        if d.killed {
+                                            self.cloud_exited(d.pid, None).await;
+                                        }
+                                    }
+                                    crate::revoke_remote_tokens_state(&self.state, revoked).await;
+                                    Ok(Value::Null)
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            self.forward_server_call(
+                                pid,
+                                page_sudo,
+                                Call::Kill {
+                                    pid: target_str,
+                                    signal,
+                                },
+                            )
+                            .await
+                        }
+                    }
                     other => {
+                        let is_login = matches!(other, Call::Login { .. });
+                        let is_logout = matches!(other, Call::Logout);
+                        let is_getcreds = matches!(other, Call::Getcreds);
                         let invalidates_accounts = matches!(
                             other,
                             Call::Useradd { .. }
@@ -7464,10 +8040,21 @@ impl Kernel {
                                 | Call::Logout
                         );
                         let res = self.forward_server_call(pid, page_sudo, other).await;
+                        if let Ok(ref val) = res {
+                            if is_logout {
+                                self.apply_account_update(crate::LocalAccount::default());
+                            } else if (is_login || is_getcreds)
+                                && (page_sid.is_some() || pid >= SCOPED_PAGE_PID_BASE)
+                                && let Ok(acc) = crate::parse_account_from_value(val)
+                            {
+                                self.apply_account_update(acc);
+                            }
+                        }
                         if invalidates_accounts && res.is_ok() {
                             let mut rt = self.vfs_rt.borrow_mut();
                             rt.uid_names = default_uid_names();
                             rt.gid_names = default_gid_names();
+                            rt.root_cloud.clear_cached_account_names();
                         }
                         res
                     }
@@ -7485,7 +8072,12 @@ impl Kernel {
             fd_refs.push(opened_fd);
             results.push(match outcome {
                 Ok(v) => Return::Ok(v),
-                Err(e) => Return::Err(e),
+                Err(mut e) => {
+                    if e.detail.is_none() {
+                        e.detail = crate::cloudfs::take_last_page_error_detail(e.errno);
+                    }
+                    Return::Err(e)
+                }
             });
         }
 
@@ -7652,7 +8244,8 @@ impl Kernel {
             )
         {
             let mut combined: BTreeMap<String, Dirent> = BTreeMap::new();
-            if self.vfs_rt.borrow().root_cloud.is_remote_mode()
+            if self.state.borrow().remote_attached
+                && self.vfs_rt.borrow().root_cloud.is_remote_mode()
                 && let Ok(val) = self
                     .forward_server_call(
                         pid,
@@ -7918,7 +8511,12 @@ impl Kernel {
             }
         };
         let created = creation.is_some();
-        if page_sid.is_some() && (size.is_some() || sha256.is_some() || version.is_some()) {
+        let is_streaming_recording = (flags & abi::O_APPEND) != 0
+            && (flags & abi::O_ACCMODE) != abi::O_RDONLY
+            && (flags & abi::O_CREAT) != 0;
+        if page_sid.is_some()
+            && (size.is_some() || sha256.is_some() || version.is_some() || is_streaming_recording)
+        {
             if pin.effective_rdonly() {
                 return Err(Errno::EROFS.into());
             }
@@ -8218,13 +8816,17 @@ impl Kernel {
                 let released = result.is_ok()
                     || matches!(result, Err(Errno::EBADF))
                     || matches!(remote.close(page_sudo).await, Ok(_) | Err(Errno::EBADF));
-                if released
-                    && let Some(session) = self.vfs_rt.borrow_mut().page_session_mut(sid)
-                    && let std::collections::hash_map::Entry::Occupied(entry) =
-                        session.delegated_uploads.entry(raw_fd)
-                    && entry.get().0.fd_epoch == remote.fd_epoch
-                {
-                    entry.remove();
+                if released {
+                    let mut rt = self.vfs_rt.borrow_mut();
+                    if let Some(session) = rt.page_session_mut(sid)
+                        && let std::collections::hash_map::Entry::Occupied(entry) =
+                            session.delegated_uploads.entry(raw_fd)
+                        && entry.get().0.fd_epoch == remote.fd_epoch
+                    {
+                        entry.remove();
+                    }
+                    let closed_path = result.as_ref().ok().and_then(|v| v["path"].as_str());
+                    rt.root_cloud.invalidate_uploaded_path(closed_path);
                 }
                 return result.map_err(Into::into);
             }
@@ -8770,20 +9372,21 @@ impl Kernel {
     ) -> std::result::Result<Value, abi::Error> {
         let fs_session = self.vfs_rt.borrow().root_cloud.current_fs_session();
         let is_page_call = page_sudo || pid >= SCOPED_PAGE_PID_BASE;
-        let token = if is_page_call {
-            None
-        } else {
-            let state = self.state.borrow();
-            state
-                .processes
-                .get(&pid)
-                .filter(|l| l.ended.is_none())
-                .map(|l| l.token.clone())
-        };
         if !is_page_call {
-            let Some(tok) = token else {
-                return Err(Errno::ESRCH.into());
-            };
+            if self.vfs_rt.borrow().root_cloud.is_pid_cloud_denied(pid)
+                || self
+                    .state
+                    .borrow()
+                    .table
+                    .proc(pid)
+                    .is_some_and(|p| !p.cred.cloud_access)
+            {
+                return Err(Errno::EACCES.into());
+            }
+            let rem = crate::lazy_mint_remote_cred(&self.state, pid).await?;
+            self.sync_vfs_proc_creds(pid);
+            let tok = rem.token;
+            let instance_id = self.state.borrow().instance_id.clone();
             let batch = Batch {
                 calls: vec![call],
                 umask: None,
@@ -8792,14 +9395,7 @@ impl Kernel {
                 process: Some(tok.clone()),
             };
             let Ok((global, post)) = installed("cloudFsPost") else {
-                if fs_session.is_some() {
-                    return Err(Errno::EACCES.into());
-                }
-                return crate::sys(batch)
-                    .await?
-                    .pop()
-                    .ok_or(Errno::EIO)?
-                    .into_result();
+                return Err(Errno::ENOTCONN.into());
             };
             let body = serde_json::to_vec(&batch)
                 .map_err(|e| abi::Error::because(Errno::EIO, e.to_string()))?;
@@ -8808,6 +9404,10 @@ impl Kernel {
                 js_sys::Reflect::set(&headers, &"Content-Type".into(), &"application/json".into());
             js_sys::Reflect::set(&headers, &"X-Process-Token".into(), &tok.into())
                 .map_err(|_| Errno::EIO)?;
+            if !instance_id.is_empty() {
+                js_sys::Reflect::set(&headers, &"X-OS-Instance".into(), &instance_id.into())
+                    .map_err(|_| Errno::EIO)?;
+            }
             if let Some((ref sid, ref secret)) = fs_session
                 && !sid.is_empty()
                 && !secret.is_empty()

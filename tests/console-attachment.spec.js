@@ -1,6 +1,7 @@
 import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, call } from './sys.js';
+import { hookPageKernel } from './service-auth.js';
 
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 test.beforeEach(async ({ page }) => { await page.goto('/'); await page.waitForFunction(() => !!window.os?.attachConsole); });
@@ -59,42 +60,92 @@ const write = (page, text) => page.evaluate(text => window.consoleRun.input.writ
 const remoteWrite = (page, text) => page.evaluate(text => window.receiving.peer.input.write(text), text);
 const ended = (page, status) => expect.poll(() => page.evaluate(() => window.consoleRun.result?.status), { timeout: 60_000 }).toBe(status);
 
-test('SIGKILL while fetching an admitted image settles as a killed process despite token revocation', async ({page})=>{
-  let release, blocked=false;const held=new Promise(resolve=>{release=resolve;});
-  await page.route(url=>url.pathname==='/api/file' && url.searchParams.has('compile'),async route=>{
-    blocked=true;await held;await route.continue();
-  });
+test('SIGKILL while fetching an admitted image settles as a killed process despite token revocation', async ({ page }) => {
+  let release, blocked = false;
+  const held = new Promise(resolve => { release = resolve; });
+  const kernel = await hookPageKernel(page);
+  await page.reload();
+  await page.waitForFunction(() => !!window.os?.attachConsole);
+  await kernel.ready();
+  await kernel.value('sync_account_from_server');
+  const isCoreutils = url => /^\/usr\/bin\/coreutils\.wasm(\.rv1)?$/.test(url.pathname);
+  const holdImage = async route => {
+    // Allow session_resolve_exec's Range probe through so kernel.execs admits the process first;
+    // hold loader.js's full image fetch after admission.
+    if (route.request().headers()['range']) return route.continue();
+    blocked = true;
+    await held;
+    await route.continue().catch(() => {});
+  };
+  await page.route(isCoreutils, holdImage);
   try {
-    await start(page,['cat'],'attachment-pane',false);
-    await expect.poll(()=>blocked,{timeout:60000}).toBe(true);
-    const killed=page.waitForResponse(response=>response.url().endsWith('/api/sys') &&
-      response.request().postDataJSON()?.calls?.some(call=>call.kill?.signal===9));
-    await page.evaluate(()=>window.consoleRun.group.signal(9));await killed;
-    release();await ended(page,137);
-  }finally{release();}
+    await start(page, ['cat'], 'attachment-pane', false);
+    await expect.poll(() => blocked, { timeout: 60_000 }).toBe(true);
+    let catProc;
+    await expect.poll(async () => {
+      catProc = (await kernel.value('poll', { pids: [] })).find(p => p.argv?.includes('cat'));
+      return Boolean(catProc);
+    }, { timeout: 10_000 }).toBe(true);
+    await page.evaluate(() => window.consoleRun.group.signal(9));
+    // Wait until client-kernel records the SIGKILL (and revokes any remote cred) BEFORE unblocking the fetch.
+    await expect.poll(async () => (await kernel.value('poll', { pids: [catProc.pid] }))[0]?.state).toBe('zombie');
+    release();
+    await ended(page, 137);
+    await expect.poll(async () => (await kernel.value('poll', { pids: [catProc.pid] })).length).toBe(0);
+  } finally {
+    release();
+    await page.unroute(isCoreutils, holdImage).catch(() => {});
+  }
 });
 
 test('a console grant waits for authenticated process startup', async ({ page }) => {
   let release, continued, blocked = false;
   const waiting = new Promise(resolve => { release = resolve; });
   const continuation = new Promise(resolve => { continued = resolve; });
-  const delay = async route => {
-    const calls = route.request().postDataJSON()?.calls ?? [];
-    if (calls.some(call => call.execve?.argv?.includes('cat'))) {
-      blocked = true; await waiting;
-      try { await route.continue(); } finally { continued(); }
-    } else await route.continue();
+  const gateRoute = async route => {
+    blocked = true;
+    await waiting;
+    try { await route.fulfill({ status: 200, body: 'ok' }); } finally { continued(); }
   };
-  await page.route('**/api/sys', delay);
+  const kernelRoute = async route => {
+    const response = await route.fetch();
+    const shim = `(() => {
+      Object.defineProperty(self, 'wasm_bindgen', {
+        configurable: true,
+        set(wb) {
+          Object.defineProperty(self, 'wasm_bindgen', { value: wb, writable: true, configurable: true, enumerable: true });
+          const proto = wb?.Kernel?.prototype;
+          if (proto?.execs && !proto.execs.__testExecsGate) {
+            const origExecs = proto.execs;
+            proto.execs = async function(stages, sudo, seat, host) {
+              if (typeof stages === 'string' && stages.includes('"cat"')) await fetch('/__test_execs_gate__');
+              return origExecs.call(this, stages, sudo, seat, host);
+            };
+            proto.execs.__testExecsGate = true;
+          }
+        },
+      });
+    })();\n`;
+    await route.fulfill({ response, body: shim + await response.text() });
+  };
+  await page.route('**/__test_execs_gate__', gateRoute);
+  await page.route('**/client-kernel.js', kernelRoute);
+  await page.reload();
+  await page.waitForFunction(() => !!window.os?.attachConsole);
   try {
     await start(page, ['cat'], 'attachment-pane', false);
-    await expect.poll(() => blocked).toBe(true);
+    await expect.poll(() => blocked, { timeout: 30_000 }).toBe(true);
     expect(await page.evaluate(async () => {
       const channel = new MessageChannel();
       try { await window.os.grantConsole('attachment-pane', channel.port1); return 'allowed'; }
       catch (error) { return error.errno; } finally { channel.port2.close(); }
     })).toBe('EAGAIN');
-  } finally { release(); if (blocked) await continuation; await page.unroute('**/api/sys', delay); }
+  } finally {
+    release();
+    if (blocked) await continuation;
+    await page.unroute('**/client-kernel.js', kernelRoute);
+    await page.unroute('**/__test_execs_gate__', gateRoute);
+  }
   await expect.poll(() => page.evaluate(() => !!window.consoleRun.input), { timeout: 60_000 }).toBe(true);
   const other = await target(page); await connect(page, other, 'control');
   await remoteWrite(other, 'authorized\n'); await expect.poll(() => output(page)).toContain('authorized');
@@ -177,6 +228,8 @@ test('a granted run keeps its original process identity across browser login and
   await expect.poll(() => output(page)).toContain(String(guest.uid));
   const other = await target(page); await connect(page, other, 'control');
   expect((await api(page.request, 'login', { headers: { 'CF-Connecting-IP': 'console-attachment-' + crypto.randomUUID() }, data: { password } })).ok()).toBe(true);
+  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+  await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(0);
   await remoteWrite(other, 'continue\n'); await expect.poll(() => remoteOutput(other)).toContain(String(guest.uid));
   await remoteWrite(other, 'finish\n'); await ended(page, 0);
   await expect.poll(() => other.evaluate(() => window.receiving.closed?.errno)).toBe('EPIPE');

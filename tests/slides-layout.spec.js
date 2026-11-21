@@ -1,23 +1,23 @@
 import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
-import { fakeKernel } from './sys.js';
+import { createFakeCloud } from './service-auth.js';
 
 // Exercise the real Rust preview and shipped CSS without accounts, an R2 upload or a dev server.
 test('image-only slides fit the preview and fullscreen without shrinking into Markdown', async ({ page }) => {
   const source='![Wide slide](wide.svg)\n\nNote:\nSpeaker notes.\n\n---\n\n![Portrait slide](portrait.svg)\n\n---\n\nA caption ![Inline image](wide.svg)\n\n---\n\n# A heading\n\n![Illustration](wide.svg)\n';
-  const entry={name:'fit.slides.md',path:'/fit.slides.md',directory:false,kind:'slides',size:source.length,mode:420,owner:'guest',group:'guest',readable:true,writable:false};
+  const svg=(w,h)=>`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}"><rect width="100%" height="100%" fill="#091012"/><text x="60" y="120" fill="#76c2aa" font-size="64">Presentation frame</text></svg>`;
+  const cloud=createFakeCloud({
+    '/fit.slides.md':{content:source,contentType:'text/markdown'},
+    '/wide.svg':{content:svg(1600,900),contentType:'image/svg+xml'},
+    '/portrait.svg':{content:svg(900,1600),contentType:'image/svg+xml'},
+  });
   await page.routeWebSocket('**/api/events',()=>{});
   await page.route('**/*',async route=>{
     const url=new URL(route.request().url());
     if(url.pathname==='/api/session')return route.fulfill({json:{authenticated:false,username:'guest',uid:65534,home:'/guest',can_write:false}});
-    if(url.pathname==='/api/sys')return fakeKernel({'/fit.slides.md':{size:source.length}})(route);
-    if(url.pathname==='/api/file'){
-      const path=url.searchParams.get('path');
-      if(path==='/fit.slides.md')return route.fulfill({body:source,contentType:'text/markdown'});
-      const [w,h]=path==='/portrait.svg'?[900,1600]:[1600,900];
-      return route.fulfill({body:`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}"><rect width="100%" height="100%" fill="#091012"/><text x="60" y="120" fill="#76c2aa" font-size="64">Presentation frame</text></svg>`,contentType:'image/svg+xml'});
-    }
+    if(url.pathname==='/api/sys')return cloud.handleSys(route);
+    if(url.pathname==='/api/file')return cloud.handleFile(route);
     if(url.pathname.startsWith('/api/'))return route.fulfill({status:404,json:{error:'Unexpected test request'}});
     const path=resolve('dist','.'+(url.pathname==='/'?'/index.html':decodeURIComponent(url.pathname)));
     if(!path.startsWith(resolve('dist')+'/'))return route.fulfill({status:403});

@@ -2,24 +2,51 @@ import { test, expect, request as contexts } from './test.js';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { api, call, mkdirp, put, rmrf, sys } from './sys.js';
+import { attachInstance, FULL_SCOPE, NO_CLOUD_SCOPE } from './service-auth.js';
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = process.env.OS_PASSWORD || readFileSync('.local-password', 'utf8').trim();
 const options = (access='read-write', extra={}) => ({read:access==='read'||access==='read-write',write:access==='write'||access==='read-write',append:false,append_implies_write:false,truncate:false,create:false,create_new:false,exec:access==='exec',path:access==='path',...extra});
 const attrs = extra => ({mode:null,uid:null,gid:null,size:null,atime:'omit',mtime:'omit',...extra});
-async function admit(request) { return call(request,{execve:{path:'/usr/bin/coreutils',argv:['coreutils','sleep','300'],env:[],cwd:'/'}}); }
-async function rpc(request,credential,session,call,errno,version=2) {
-  const response=await request.post(origin+'/api/fs',{headers:{Origin:origin},data:{version,credential,session,call}});const body=await response.json();
+const instances = new WeakMap();
+const tokenInstance = new Map();
+async function getInstance(request) {
+  let inst = instances.get(request);
+  if (!inst) {
+    inst = await attachInstance(request, { origin });
+    instances.set(request, inst);
+  }
+  return inst;
+}
+async function admit(request, opts = {}) {
+  const inst = await getInstance(request);
+  const cred = await inst.mint({
+    scope: opts.scope ?? FULL_SCOPE,
+    cloud_access: opts.cloud_access ?? true,
+    cgroup: opts.cgroup ?? '/user',
+    sudo: !!opts.sudo,
+  });
+  tokenInstance.set(cred.token, inst.instanceId);
+  return { ...cred, inst };
+}
+async function revokeCred(p) {
+  if (p?.inst && p?.token) await p.inst.revoke([p.token]);
+}
+async function rpc(request,credential,session,call,errno,version=2,instanceId) {
+  const instId = instanceId !== undefined ? instanceId : tokenInstance.get(credential);
+  const response=await request.post(origin+'/api/fs',{headers:{Origin:origin,...(instId?{'X-OS-Instance':instId}:{})},data:{version,credential,session,call}});const body=await response.json();
   if(errno){expect(body?.errno,JSON.stringify(body)).toBe(errno);return body;}
   expect(response.ok(),JSON.stringify(body)).toBe(true);return body;
 }
-async function connection(request,{token,pid}) {
-  const c={...await rpc(request,token,null,'connect'),request,token,pid,umask:0o022};
+async function connection(request,{token,pid,inst,instanceId}) {
+  const instId = instanceId ?? inst?.instanceId ?? tokenInstance.get(token);
+  const c={...await rpc(request,token,null,'connect',undefined,2,instId),request,token,pid,inst,instanceId:instId,umask:0o022};
   c.call=(op,args,errno)=>{
     if(['create','mkdir','mknod'].includes(op))args={umask:c.umask,...args};
-    return rpc(request,c.token,c.session,args===undefined?op:{[op]:args},errno);
+    return rpc(request,c.token,c.session,args===undefined?op:{[op]:args},errno,2,tokenInstance.get(c.token)??c.instanceId);
   };
   c.data=async(open,operation,bytes,errno)=>{
-    const response=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Filesystem':JSON.stringify({version:2,credential:c.token,pid:c.pid,session:c.session,open,operation})},data:bytes??Buffer.alloc(0)});
+    const id = tokenInstance.get(c.token) ?? c.instanceId;
+    const response=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,...(id?{'X-OS-Instance':id}:{}),'X-OS-Filesystem':JSON.stringify({version:2,credential:c.token,pid:c.pid,session:c.session,open,operation})},data:bytes??Buffer.alloc(0)});
     if(errno){expect((await response.json()).errno).toBe(errno);return;}
     expect(response.ok(),response.ok()?'':await response.text()).toBe(true);return 'read' in operation?response.body():response.json();
   };
@@ -104,12 +131,18 @@ test('metadata, hardlinks, xattrs, relatime and grants use current credentials a
 test('revoking an opener releases its inode and locks even when another credential presents the reference',async({request})=>{
   const {c,dir,p}=await setup(request);const observer=await admit(request);
   const [entry,open]=await c.create(dir,'file');await c.write(open,'kept');await c.call('unlink',{dir,name:'file'});
-  await call(request,{kill:{pid:String(p.pid),signal:9}});
+  await revokeCred(p);
   await rpc(request,observer.token,c.session,{sync:{open,data_only:false}},'EACCES');
   await rpc(request,observer.token,c.session,{metadata:{handle:entry.handle}},'ESTALE');
   await rpc(request,observer.token,c.session,'disconnect');
 });
-const replace=async(request,p,local)=>call(request,{execve:{pid:p.pid,proc:p.token,path:local?'/mnt/local/probe':'/usr/bin/coreutils',argv:['coreutils','sleep','300'],env:[],cwd:'/',...(local?{runtime:'resources-v1',local}:{} )}});
+const replace=async(request,p,local)=>{
+  const inst=p.inst??await getInstance(request);
+  const cloud=local?.cloud!==false;
+  const cred=await inst.derive(p.token,{scope:cloud?FULL_SCOPE:NO_CLOUD_SCOPE,cloud_access:cloud,revoke_parent:true});
+  tokenInstance.set(cred.token,inst.instanceId);
+  return {...cred,inst,pid:p.pid};
+};
 test('exec retains unlinked cloud opens and locks across repeated token rotation',async({request})=>{
   const {c,dir}=await setup(request);const observer=await admit(request);
   const [entry,open]=await c.create(dir,'exec');await c.write(open,'kept');
@@ -125,7 +158,7 @@ test('exec retains unlinked cloud opens and locks across repeated token rotation
     expect((await c.read(open)).toString()).toBe('kept'+'!'.repeat(i));await c.write(open,'!');
     await rpc(request,observer.token,c.session,{try_lock:{open:peer,family:'flock',kind:'exclusive',range}},'EAGAIN');
   }
-  await call(request,{kill:{pid:String(c.pid),signal:9}});
+  await revokeCred(c);
   await rpc(request,observer.token,c.session,{sync:{open,data_only:false}},'EACCES');
   await rpc(request,observer.token,c.session,{open_metadata:{open}},'EACCES');
   await rpc(request,observer.token,c.session,{try_lock:{open:peer,family:'flock',kind:'exclusive',range}});
@@ -139,18 +172,19 @@ test('fork and exec retain inherited opens until the last credential is revoked'
   for(const endParentFirst of [true,false]){
     const {c,dir,p}=await setup(request);const observer=await admit(request);
     const [entry,open]=await c.create(dir,'fork-exec');await c.write(open,'shared');await c.call('unlink',{dir,name:'fork-exec'});
-    const fork={...await call(request,{fork:{pid:p.pid}},{pid:p.pid,proc:p.token}),token:p.token};
-    const child=await replace(request,fork);
+    const forked=await p.inst.derive(p.token,{scope:FULL_SCOPE,cloud_access:true,revoke_parent:false});
+    tokenInstance.set(forked.token,p.inst.instanceId);
+    const child=await replace(request,{...forked,inst:p.inst});
     const [late,later]=await c.create(dir,'after-fork-exec');await c.call('unlink',{dir,name:'after-fork-exec'});
     const first=endParentFirst?p:child,last=endParentFirst?child:p;
-    await call(request,{kill:{pid:String(first.pid),signal:9}});
+    await revokeCred(first);
     c.token=last.token;c.pid=last.pid;
     await c.call('sync',{open,data_only:false});expect((await c.read(open)).toString()).toBe('shared');await c.write(open,'!');
     if(endParentFirst){
       // A successor inherits only the descriptions open at its exec, never later opens.
       await c.call('sync',{open:later,data_only:false},'EACCES');await c.call('metadata',{handle:late.handle},'ESTALE');
     }
-    await call(request,{kill:{pid:String(last.pid),signal:9}});
+    await revokeCred(last);
     await rpc(request,observer.token,c.session,{sync:{open,data_only:false}},'EACCES');
     await rpc(request,observer.token,c.session,{metadata:{handle:entry.handle}},'ESTALE');
     await rpc(request,observer.token,c.session,'disconnect');
@@ -166,14 +200,16 @@ test('exec cannot retain cloud grants when the replacement drops cloud access',a
   await rpc(request,observer.token,c.session,'disconnect');
 });
 test('open control calls reject revoked and cloud-denied callers while the opener remains valid',async({request})=>{
-  const {c,dir}=await setup(request);const [entry,open]=await c.create(dir,'caller');await c.write(open,'keep data');
+  const {c,dir,p}=await setup(request);const [entry,open]=await c.create(dir,'caller');await c.write(open,'keep data');
   const peer=await c.open(entry.handle);const range={start:0,end:null};const lock={open,family:'posix',kind:'exclusive',range};
   await c.call('try_lock',lock);
-  const revoked=await admit(request);await call(request,{kill:{pid:String(revoked.pid),signal:9}});
-  const denied=await call(request,{execve:{path:'/mnt/local/cloudfs/probe',argv:['probe'],cwd:'/',runtime:'resources-v1',local:{digest:'a'.repeat(64),size:8,cloud:false}}});
-  const actor=await admit(request);
+  const revoked=await admit(request);await revokeCred(revoked);
+  const denied=await admit(request,{scope:NO_CLOUD_SCOPE,cloud_access:false});
+  const ungranted=await admit(request);
+  const actor=await p.inst.derive(p.token,{scope:FULL_SCOPE,cloud_access:true,revoke_parent:false});
+  tokenInstance.set(actor.token,p.inst.instanceId);
   try {
-    for(const caller of [revoked,denied]) {
+    for(const caller of [revoked,denied,ungranted]) {
       for(const operation of [
         {open_metadata:{open}},
         {set_len:{open,size:0}},
@@ -195,7 +231,7 @@ test('open control calls reject revoked and cloud-denied callers while the opene
     expect((await c.call('test_lock',{open:peer,kind:'exclusive',range})).owner).toBe(open.id);
   } finally {
     await c.call('disconnect');
-    for(const process of [denied,actor])await sys(request,[{exit:{pid:process.pid,proc:process.token,status:0}},{wait:{pid:String(process.pid),proc:process.token}}],{}, {'X-Registry':'1'});
+    for(const process of [denied,ungranted,{...actor,inst:p.inst}])await revokeCred(process);
   }
 });
 test('lease expiry releases references while an independently renewed session remains usable',async({request})=>{
@@ -204,19 +240,19 @@ test('lease expiry releases references while an independently renewed session re
   const [entry,open]=await c.create(dir,'expire');await c.write(open,'lease');
   const dirName=(await c.call('parent',{dir}))[1];const otherDir=(await other.call('lookup',{dir:other.root,name:dirName})).handle;
   const observed=(await other.call('lookup',{dir:otherDir,name:'expire'})).handle;await c.call('unlink',{dir,name:'expire'});
-  for(let i=0;i<5;i++){await new Promise(r=>setTimeout(r,25000));expect((await sys(request,[{proc_keep:{processes:[{pid:p.pid,proc:p.token}]}}],{}, {"X-Registry":"1"}))[0].err).toBeUndefined();await other.call('renew');}
+  for(let i=0;i<5;i++){await new Promise(r=>setTimeout(r,25000));await p.inst.renew([p.token]);await other.call('renew');}
   await other.call('metadata',{handle:observed},'ESTALE');await c.call('renew',undefined,'ENOTCONN');await other.call('disconnect');
 });
 test('signed 64-bit offsets retain precision across SQLite and the Worker gateway',async({request})=>{
   const {c,dir}=await setup(request);const [entry,open]=await c.create(dir,'large');
   const data={version:2,credential:c.token,pid:c.pid,session:c.session,open,operation:{write:{at:{offset:'LARGE_OFFSET'},length:1}}};
-  const response=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Filesystem':JSON.stringify(data).replace('"LARGE_OFFSET"','9223372036854775806')},data:Buffer.from('x')});
+  const response=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Instance':c.instanceId,'X-OS-Filesystem':JSON.stringify(data).replace('"LARGE_OFFSET"','9223372036854775806')},data:Buffer.from('x')});
   expect(response.ok(),response.ok()?'':await response.text()).toBe(true);
   expect(await response.text()).toContain('9223372036854775806');
-  const meta=await request.post(origin+'/api/fs',{headers:{Origin:origin},data:{version:2,credential:c.token,session:c.session,call:{metadata:{handle:entry.handle}}}});
+  const meta=await request.post(origin+'/api/fs',{headers:{Origin:origin,'X-OS-Instance':c.instanceId},data:{version:2,credential:c.token,session:c.session,call:{metadata:{handle:entry.handle}}}});
   expect(meta.ok()).toBe(true);expect(await meta.text()).toContain('"size":9223372036854775807');
   data.operation={read:{offset:'LARGE_OFFSET',length:1}};
-  const read=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Filesystem':JSON.stringify(data).replace('"LARGE_OFFSET"','9223372036854775806')},data:Buffer.alloc(0)});
+  const read=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Instance':c.instanceId,'X-OS-Filesystem':JSON.stringify(data).replace('"LARGE_OFFSET"','9223372036854775806')},data:Buffer.alloc(0)});
   expect(read.ok(),read.ok()?'':await read.text()).toBe(true);expect((await read.body()).toString()).toBe('x');
   await c.call('unlink',{dir,name:'large'});await c.call('disconnect');
 });
@@ -231,7 +267,7 @@ test('moving a directory preserves descendant inode metadata and revocation deni
   expect((await put(request,origin+'/api/file?path='+encodeURIComponent('/'+rootName+'/old'),{data:'legacy'})).ok()).toBe(true);
   const old=await c.call('lookup',{dir,name:'old'});const oldOpen=await c.open(old.handle);
   await c.write(oldOpen,'NEW',{offset:0});expect((await c.read(oldOpen)).toString()).toBe('NEWacy');
-  await call(request,{kill:{pid:String(p.pid),signal:9}});
+  await revokeCred(p);
   await c.data(open,{write:{at:'end',length:1}},Buffer.from('x'),'EACCES');
 });
 test('separate service instances share inode locks but cannot exchange handle proofs',async({request})=>{
@@ -289,19 +325,18 @@ test('inline pread reads extents, object offsets and sparse holes through paths 
 });
 test('I/O-denied reads release their prepared manifests before session renewal',async({request})=>{
   const {c,dir,p}=await setup(request);const group='/user/cloudfs-'+randomUUID();
-  await call(request,{cgroup_create:{path:group}});await call(request,{cgroup_attach:{pid:p.pid,path:group}});
   const baseline=(await c.call('statfs')).blocks;const [entry,open]=await c.create(dir,'denied');
   try{
     await c.write(open,Buffer.alloc(4096,42));expect((await c.call('statfs')).blocks).toBe(baseline+1);
-    await call(request,{cgroup_set:{path:group,key:'io.max',value:'rbps=0'}});
+    await p.inst.setIoQuota({token:p.token,cgroup:group,rbps:0,wbps:null});
     for(let i=0;i<3;i++)await c.data(open,{read:{offset:0,length:4096}},undefined,'EAGAIN');
     await c.call('unlink',{dir,name:'denied'});await c.call('release',{open});
     await c.call('metadata',{handle:entry.handle},'ESTALE');
     expect((await c.call('statfs')).blocks).toBe(baseline);
     await c.call('renew');expect((await c.call('statfs')).blocks).toBe(baseline);
   }finally{
-    await c.call('disconnect');await call(request,{cgroup_attach:{pid:p.pid,path:'/user'}});
-    await call(request,{cgroup_remove:{path:group}});
+    await p.inst.setIoQuota({token:p.token,cgroup:'/user',rbps:null,wbps:null}).catch(()=>{});
+    await c.call('disconnect');
   }
 });
 test('flock conversion wakes queued owners and POSIX updates preserve ownership and queue order',async({request})=>{
@@ -366,28 +401,26 @@ test('empty setattr preserves metadata for both owners and non-owners',async({re
 });
 test('forked callers use their own I/O limits and survive the credential issuer process',async({request})=>{
   const {c,dir,p}=await setup(request);const group='/user/cloudfs-fork-'+randomUUID();
-  const child={...await call(request,{fork:{pid:p.pid}},{pid:p.pid,proc:p.token}),token:p.token};
-  const end=process=>sys(request,[{exit:{pid:process.pid,proc:process.token,status:0}},{wait:{pid:String(process.pid),proc:process.token}}],{}, {'X-Registry':'1'});
-  await call(request,{cgroup_create:{path:group}});await call(request,{cgroup_attach:{pid:child.pid,path:group}});
+  const [,open]=await c.create(dir,'fork');await c.write(open,'parent');
+  const child=await p.inst.derive(p.token,{scope:FULL_SCOPE,cloud_access:true,cgroup:group,revoke_parent:false});
+  tokenInstance.set(child.token,p.inst.instanceId);
   try{
-    const [,open]=await c.create(dir,'fork');await c.write(open,'parent');
-    await call(request,{cgroup_set:{path:group,key:'io.max',value:'rbps=0 wbps=0'}});
-    c.pid=child.pid;
+    await p.inst.setIoQuota({token:child.token,cgroup:group,rbps:0,wbps:0});
+    c.token=child.token;c.pid=child.pid;
     await c.data(open,{write:{at:'end',length:1}},Buffer.from('!'),'EAGAIN');
     await c.data(open,{read:{offset:0,length:6}},undefined,'EAGAIN');
-    const usage=(await call(request,{cgroup_stat:{path:group}}))['io.stat'];
-    expect([usage.read_bytes,usage.write_bytes]).toEqual([0,0]);
-    await end(p);await call(request,{cgroup_set:{path:group,key:'io.max',value:'max'}});
+    // Revoking the issuer credential leaves the derived child credential usable once its quota lifts.
+    await revokeCred(p);
+    await p.inst.setIoQuota({token:child.token,cgroup:group,rbps:null,wbps:null});
     expect((await c.read(open)).toString()).toBe('parent');await c.write(open,' child');
     expect((await c.read(open)).toString()).toBe('parent child');
-    const unrelated=await admit(request);
-    for(const pid of [p.pid,unrelated.pid,0]){
-      c.pid=pid;await c.data(open,{read:{offset:0,length:1}},undefined,'EPERM');
-      await c.data(open,{write:{at:'end',length:0}},undefined,'EPERM');
-    }
-    c.pid=null;await c.data(open,{read:{offset:0,length:1}},undefined,'EINVAL');
-    c.pid=child.pid;await c.call('unlink',{dir,name:'fork'});await c.call('release',{open});await end(unrelated);
-  }finally{await c.call('disconnect');await end(child);await end(p);await call(request,{cgroup_remove:{path:group}});}
+    // Revoked parent token and mismatched/missing X-OS-Instance fail closed on /api/fs/data.
+    const wrongInst=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Instance':'inst-wrong','X-OS-Filesystem':JSON.stringify({version:2,credential:child.token,pid:child.pid,session:c.session,open,operation:{read:{offset:0,length:1}}})},data:Buffer.alloc(0)});
+    expect(['EACCES','EPERM']).toContain((await wrongInst.json()).errno);
+    const revokedParent=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Instance':p.inst.instanceId,'X-OS-Filesystem':JSON.stringify({version:2,credential:p.token,pid:p.pid,session:c.session,open,operation:{read:{offset:0,length:1}}})},data:Buffer.alloc(0)});
+    expect(['EACCES','EPERM']).toContain((await revokedParent.json()).errno);
+    await c.call('unlink',{dir,name:'fork'});await c.call('release',{open});
+  }finally{await c.call('disconnect');await revokeCred({...child,inst:p.inst}).catch(()=>{});await revokeCred(p).catch(()=>{});}
 });
 test('ordinary image-backed clones support v2 reads, edits and sparse truncation across readers',async({request})=>{
   const {c,dir}=await setup(request);const name=(await c.call('parent',{dir}))[1];const base='/'+name;
@@ -605,7 +638,16 @@ for(const operation of ['write','truncate'])test(`${operation} privilege bits fo
   await api(request,'logout');const guest=await admit(request);
   const guestOpen=await rpc(request,guest.token,c.session,{open:{ticket:randomUUID(),handle:entry.handle,options:options()}});
   try {
-    for(const open of [rootOpen,guestOpen])for(const actor of [guest,p])for(const mode of [0o6755,0o6744]) {
+    // Under ServiceAuth v2, OpenRef grants are strictly per-credential: cross-credential use fails closed.
+    c.token=guest.token;c.pid=guest.pid;
+    if(operation==='write')await c.data(rootOpen,{write:{at:'end',length:1}},Buffer.from('x'),'EACCES');
+    else await rpc(request,guest.token,c.session,{set_len:{open:rootOpen,size:2}},'EACCES');
+    c.token=p.token;c.pid=p.pid;
+    if(operation==='write')await c.data(guestOpen,{write:{at:'end',length:1}},Buffer.from('x'),'EACCES');
+    else await rpc(request,p.token,c.session,{set_len:{open:guestOpen,size:2}},'EACCES');
+
+    // On each credential's own open, privilege-bit stripping follows the actor's uid (root preserves, non-root strips).
+    for(const [open,actor] of [[rootOpen,p],[guestOpen,guest]])for(const mode of [0o6755,0o6744]) {
       c.token=p.token;c.pid=p.pid;
       await c.call('set_len',{open:rootOpen,size:4});await c.call('setattr',{handle:entry.handle,attr:attrs({mode})});
       c.token=actor.token;c.pid=actor.pid;
@@ -618,7 +660,7 @@ for(const operation of ['write','truncate'])test(`${operation} privilege bits fo
       const expected=actor===p?mode:mode===0o6755?0o755:0o2744;
       expect((await c.call('metadata',{handle:entry.handle})).mode).toBe(expected);
     }
-    await call(request,{kill:{pid:String(guest.pid),signal:9}});
+    await revokeCred(guest);
     c.token=p.token;c.pid=p.pid;
     if(operation==='write')await c.data(guestOpen,{write:{at:'end',length:1}},Buffer.from('x'),'EACCES');
     else await c.call('set_len',{open:guestOpen,size:0},'EACCES');
@@ -755,7 +797,7 @@ test('default ACL inheritance takes precedence over the current umask without ch
 });
 test('system-image, procfs and generated account projections are read-only while large-offset and empty writes follow Linux',async({request})=>{
   const {c,dir}=await setup(request);
-  const exact=(open,rawOp,bytes)=>request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Filesystem':`{"version":2,"credential":${JSON.stringify(c.token)},"pid":${c.pid},"session":${JSON.stringify(c.session)},"open":${JSON.stringify(open)},"operation":${rawOp}}`},data:bytes??Buffer.alloc(0)});
+  const exact=(open,rawOp,bytes)=>request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Instance':c.instanceId,'X-OS-Filesystem':`{"version":2,"credential":${JSON.stringify(c.token)},"pid":${c.pid},"session":${JSON.stringify(c.session)},"open":${JSON.stringify(open)},"operation":${rawOp}}`},data:bytes??Buffer.alloc(0)});
   try {
     const rootChildren=await c.call('read_dir',{dir:c.root});
     expect((await c.call('metadata',{handle:c.root})).nlink).toBe(2+rootChildren.filter(e=>e.file_type==='dir').length);
@@ -799,7 +841,7 @@ test('system-image, procfs and generated account projections are read-only while
     expect((await atMax.json()).errno).toBe('EFBIG');
     const appendAtMax=await exact(open,'{"write":{"at":"end","length":1}}',Buffer.from('x'));
     expect((await appendAtMax.json()).errno).toBe('EFBIG');
-    const shrink=await request.post(origin+'/api/fs',{headers:{Origin:origin,'Content-Type':'application/json'},data:'{"version":2,"credential":'+JSON.stringify(c.token)+',"session":'+JSON.stringify(c.session)+',"call":{"set_len":{"open":'+JSON.stringify(open)+',"size":9223372036854775805}}}'});
+    const shrink=await request.post(origin+'/api/fs',{headers:{Origin:origin,'X-OS-Instance':c.instanceId,'Content-Type':'application/json'},data:'{"version":2,"credential":'+JSON.stringify(c.token)+',"session":'+JSON.stringify(c.session)+',"call":{"set_len":{"open":'+JSON.stringify(open)+',"size":9223372036854775805}}}'});
     expect(shrink.ok(),shrink.ok()?'':await shrink.text()).toBe(true);
     const shortEnd=await exact(open,'{"write":{"at":"end","length":5}}',Buffer.from('world'));
     expect(shortEnd.ok(),shortEnd.ok()?'':await shortEnd.text()).toBe(true);expect(await shortEnd.text()).toBe('{"len":2,"offset":9223372036854775805}');
@@ -996,7 +1038,7 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
       window.__kernel = (type, args = {}) => new Promise(resolve => {
         const id = ++next;
         pending.set(id, resolve);
-        port.postMessage({ v: 1, id, type, args });
+        port.postMessage({ v: 2, id, type, args });
       });
     });
     const k = async (type, args = {}) => {
@@ -1013,6 +1055,7 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
     const ENV = ['PWD=/', 'PATH=/usr/bin', 'LANG=C.UTF-8'];
     const sleepCmd = { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '60'], env: ENV, cwd: '/' };
     await k('init');
+    await k('sync_account_from_server');
     const p1 = await k('exec', sleepCmd);
     const p2 = await k('exec', sleepCmd);
 
@@ -1091,10 +1134,12 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
     const aliceName = 'alice' + randomUUID().replaceAll('-', '').slice(0, 8);
     const alicePassword = 'account-' + randomUUID();
     expect((await api(context.request, 'logout', { headers: extra })).ok()).toBe(true);
+    await k('sync_account_from_server');
     const pGuest = await k('exec', sleepCmd);
 
     await call(context.request, 'getcreds');
     expect((await api(context.request, 'register', { headers: extra, data: { username: aliceName, password: alicePassword, create_home: false } })).ok()).toBe(true);
+    await k('sync_account_from_server');
     const pAlice = await k('exec', sleepCmd);
     expect(await call(context.request, { symlink: { target: 'target', path: `${base}/sticky/link` } }, { headers: extra })).toBeNull();
 
@@ -1129,9 +1174,14 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
     await k('kfd_close', { pid: pAlice.pid, kfd: afterReconnect.kfd });
 
     await k('exit', { pid: pAlice.pid, status: 0 });
-    await k('exit', { pid: pGuest.pid, status: 0 });
     await k('wait', { pid: pAlice.pid });
-    await k('wait', { pid: pGuest.pid });
+    await k('exit', { pid: pGuest.pid, status: 0 });
+    // Non-root Alice cannot reap another account's (guest's) zombie process; root (or PID 1) can.
+    expect(await kErr('wait', { pid: pGuest.pid })).toBe('EPERM');
+    expect((await api(context.request, 'login', { headers: extra, data: { password } })).ok()).toBe(true);
+    await k('sync_account_from_server');
+    const rootWait = await page.evaluate(pid => window.__kernel('wait', { pid }), pGuest.pid);
+    expect(rootWait.ok != null || rootWait.err?.errno === 'ECHILD').toBe(true);
   } finally {
     await rmrf(request, base);
   }

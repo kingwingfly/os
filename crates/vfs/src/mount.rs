@@ -3,7 +3,8 @@
 
 use crate::{Cred, FileRef, Filesystem, FsId, Handle, NodeId, Result};
 use abi::Errno;
-use abi::contract::{fs_magic, mount_flags, statfs_flags};
+pub use abi::contract::FsType;
+use abi::contract::{mount_flags, statfs_flags};
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -60,77 +61,6 @@ pub struct MountId(pub u64);
 /// Kernel-monotonic mount namespace identifier across the OS instance (never recycled, starts at 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NamespaceId(pub u64);
-
-/// Exact 10 filesystem types defined by `contract.md` §5.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FsType {
-    Cloud,
-    Opfs,
-    HostFs,
-    HelperFs,
-    ShareFs,
-    Image,
-    TmpFs,
-    Proc,
-    DevTmpFs,
-    DevPts,
-}
-
-impl FsType {
-    /// Contract §5: unknown types (explicitly including `"sysfs"`) return `Err(Errno::ENODEV)`.
-    pub fn parse(name: &str) -> Result<Self> {
-        match name {
-            "cloud" => Ok(Self::Cloud),
-            "opfs" => Ok(Self::Opfs),
-            "hostfs" => Ok(Self::HostFs),
-            "helperfs" => Ok(Self::HelperFs),
-            "sharefs" => Ok(Self::ShareFs),
-            "image" => Ok(Self::Image),
-            "tmpfs" => Ok(Self::TmpFs),
-            "proc" => Ok(Self::Proc),
-            "devtmpfs" => Ok(Self::DevTmpFs),
-            "devpts" => Ok(Self::DevPts),
-            _ => Err(Errno::ENODEV),
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Cloud => "cloud",
-            Self::Opfs => "opfs",
-            Self::HostFs => "hostfs",
-            Self::HelperFs => "helperfs",
-            Self::ShareFs => "sharefs",
-            Self::Image => "image",
-            Self::TmpFs => "tmpfs",
-            Self::Proc => "proc",
-            Self::DevTmpFs => "devtmpfs",
-            Self::DevPts => "devpts",
-        }
-    }
-
-    pub const fn magic(self) -> u64 {
-        match self {
-            Self::Cloud => fs_magic::OS_CLOUD_MAGIC,
-            Self::Opfs | Self::HostFs | Self::HelperFs | Self::ShareFs => {
-                fs_magic::FUSE_SUPER_MAGIC
-            }
-            Self::Image => fs_magic::SQUASHFS_MAGIC,
-            Self::TmpFs => fs_magic::TMPFS_MAGIC,
-            Self::Proc => fs_magic::PROC_SUPER_MAGIC,
-            Self::DevTmpFs => fs_magic::DEVTMPFS_MAGIC,
-            Self::DevPts => fs_magic::DEVPTS_SUPER_MAGIC,
-        }
-    }
-
-    pub const fn is_user_mountable(self) -> bool {
-        matches!(
-            self,
-            Self::Opfs | Self::HostFs | Self::HelperFs | Self::ShareFs | Self::Image
-        )
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AtimeMode {
@@ -535,11 +465,13 @@ pub struct MountBacking {
 
 impl MountBacking {
     pub fn new(fs: Rc<dyn Filesystem>, fstype: FsType) -> Self {
+        let immutable = fstype == FsType::Image
+            || fs.capabilities().writer_model == abi::contract::WriterModel::Immutable;
         Self {
             fs,
             fstype,
             provider: ProviderState::new(),
-            ceiling_rdonly: fstype == FsType::Image,
+            ceiling_rdonly: immutable,
             ceiling_noexec: false,
             sync_count: Cell::new(0),
             on_release: RefCell::new(None),

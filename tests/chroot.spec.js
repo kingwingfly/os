@@ -75,14 +75,6 @@ test('sudo chroot /tmp/jail clamps ../../.. at /, resolves #! interpreters insid
   const outsideSentinel = `${base}/outside-only.txt`;
   const outsideTool = `${base}/outside-true`;
 
-  await mkdirp(rootApi, `${jail}/usr`, 0o755);
-  await mkdirp(rootApi, `${jail}/tmp`, 0o1777);
-  await mkdirp(rootApi, emptyJail, 0o755);
-  await call(rootApi, { symlink: { target: 'usr/bin', path: `${jail}/bin` } });
-
-  expect((await put(rootApi, fileUrl(outsideSentinel), { data: 'host-outside\n' })).ok()).toBe(true);
-  expect((await put(rootApi, fileUrl(`${jail}/jail-id.txt`), { data: 'jailed-root\n' })).ok()).toBe(true);
-
   const shebangScript = [
     '#!/bin/sh -e',
     'pwd',
@@ -94,12 +86,6 @@ test('sudo chroot /tmp/jail clamps ../../.. at /, resolves #! interpreters insid
     'echo "arg=$1"',
     '',
   ].join('\n');
-  expect((await put(rootApi, fileUrl(`${jail}/run-inside.sh`), { data: shebangScript })).ok()).toBe(true);
-  await call(rootApi, { chmod: { path: `${jail}/run-inside.sh`, mode: 0o755 } });
-
-  // Script inside emptyJail whose #! interpreter (/usr/bin/sh) does NOT exist inside emptyJail
-  expect((await put(rootApi, fileUrl(`${emptyJail}/dangling-shebang.sh`), { data: '#!/usr/bin/sh\necho unreachable\n' })).ok()).toBe(true);
-  await call(rootApi, { chmod: { path: `${emptyJail}/dangling-shebang.sh`, mode: 0o755 } });
 
   const ip = nextIp(username);
   const context = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': ip } });
@@ -112,6 +98,24 @@ test('sudo chroot /tmp/jail clamps ../../.. at /, resolves #! interpreters insid
     await page.goto(origin + '/');
     await page.waitForFunction(() => Boolean(window.os?.exec));
     await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
+
+    // Stage the chroot tree inside the browser instance's own tmpfs `/tmp` (Contract v2 §2.1).
+    const stageRes = await execCmd(page, [
+      '/usr/bin/sh',
+      '-ec',
+      [
+        `mkdir -p "${jail}/usr" "${jail}/tmp" "${emptyJail}"`,
+        `chmod 1777 "${jail}/tmp"`,
+        `ln -s usr/bin "${jail}/bin"`,
+        `printf 'host-outside\\n' > "${outsideSentinel}"`,
+        `printf 'jailed-root\\n' > "${jail}/jail-id.txt"`,
+        `cat > "${jail}/run-inside.sh"`,
+        `chmod 755 "${jail}/run-inside.sh"`,
+        `printf '#!/usr/bin/sh\\necho unreachable\\n' > "${emptyJail}/dangling-shebang.sh"`,
+        `chmod 755 "${emptyJail}/dangling-shebang.sh"`,
+      ].join('\n'),
+    ], { stdin: shebangScript });
+    expect(stageRes.status, stageRes.stderr).toBe(0);
 
     // Create an executable binary outside the jail
     await runCli(page, `cp /usr/bin/true ${outsideTool} && chmod 755 ${outsideTool}`);

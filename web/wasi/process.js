@@ -16,7 +16,7 @@ const ERRNO = {
   EINVAL: 28, EIO: 29, EISDIR: 31, ELOOP: 32, EMFILE: 33, EMLINK: 34, ENAMETOOLONG: 37, ENODEV: 43, ENOENT: 44,
   ENOEXEC: 45, ENOMEM: 48, ENOSPC: 51, ENOSYS: 52, ENOTCONN: 53, ENOTDIR: 54, ENOTEMPTY: 55, ENOTSUP: 58, EOPNOTSUPP: 58,
   ENOTTY: 59, ENXIO: 60, EPERM: 63, EPIPE: 64, EPROTONOSUPPORT: 66, ERANGE: 68, EROFS: 69, ESPIPE: 70, ESRCH: 71, ESTALE: 72,
-  ETIMEDOUT: 73, ETXTBSY: 74, EXDEV: 75, ENODATA: 44, EDQUOT: 19, ENOLCK: 46,
+  ETIMEDOUT: 73, ETXTBSY: 74, EXDEV: 75, ENODATA: 44, EDQUOT: 19, ENOLCK: 46, ENOTBLK: 218,
 };
 const { EBADF, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, ENOTDIR, ESPIPE } = ERRNO;
 const STRERROR = { 2: 'Permission denied', 44: 'No such file or directory', 45: 'Exec format error', 54: 'Not a directory', 31: 'Is a directory' };
@@ -103,7 +103,9 @@ function drive(work) {
   })();
 }
 
-// Direct server `/api/sys` batch (used ONLY for non-VFS calls such as `getcreds` or closing raw server device fds).
+// Process batch helper: routes through the client kernel (`proc_sys`) when isolated so
+// local calls (`getcreds`, cgroups, signals) execute with ZERO network RPCs and remote calls
+// carry verified `ServiceAuth v2` credentials + `X-OS-Instance`.
 function* serverBatch(calls) {
   const sent = [...calls, ...closing.map(fd => ({ close: { fd } }))];
   closing = [];
@@ -111,6 +113,11 @@ function* serverBatch(calls) {
   const body = { calls: sent, umask: process.umask, sudo: process.sudo };
   if (process.pid) body.pid = process.pid;
   if (process.proc) body.proc = process.proc;
+  if (channel) {
+    const res = host('vfs', { op: 'sys', batch: JSON.stringify(body) });
+    if (res?.errno) return calls.map(() => ({ err: { errno: res.errno } }));
+    return (res?.results ?? []).slice(0, calls.length);
+  }
   const answer = yield* request('POST', '/api/sys', JSON.stringify(body), { 'Content-Type': 'application/json' });
   if (answer.status !== 200) return calls.map(() => ({ err: { errno: 'EIO' } }));
   return JSON.parse(answer.text).results.slice(0, calls.length);
@@ -1782,15 +1789,10 @@ function checkTermination() {
 }
 function reserveMemory(bytesCount) {
   checkTermination();
+  if (!channel) { linearBytes = bytesCount; return; }
   try {
-    const answer = sendSync({
-      method: 'POST',
-      url: '/api/sys',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pid: process.pid, proc: process.proc, calls: [{ resource: { memory: bytesCount } }] }),
-    });
-    if (answer.status !== 200) throw new Errno(EIO);
-    ok(JSON.parse(answer.text).results[0]);
+    const answer = host('resource', { memory: bytesCount });
+    if (answer?.errno) throw new Errno(ERRNO[answer.errno] ?? EIO);
     linearBytes = bytesCount;
   } catch (error) {
     if (error.errno === ERRNO.EPERM && channel) host('reconcile', {});
@@ -1826,7 +1828,13 @@ async function instantiate(module, type, snapshot, startSection = false, memoryB
   }
   const required = WebAssembly.Module.imports(module);
   if (required.some(entry => entry.module === 'os' && ['getuid', 'getgid', 'getgroups'].includes(entry.name))) {
-    identity = await drive(serverCall('getcreds'));
+    if (channel) {
+      const answer = host('getcreds', {});
+      if (answer?.errno) throw new Errno(ERRNO[answer.errno] ?? EIO);
+      identity = answer;
+    } else {
+      identity = await drive(serverCall('getcreds'));
+    }
   }
   suspending = capable && !startSection && !required.some(entry => entry.module === 'os' && entry.name === 'sigaction');
   const pages = snapshot ? snapshot.memory.byteLength / 65536 : 0;

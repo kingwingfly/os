@@ -1,1887 +1,857 @@
-//! The process registry (owner's plan, 2026-11-01; moved out of the authority 2026-11-03): each
-//! browser is a namespace with PID 1, kept by a Durable Object of its own (machine.rs), and
-//! every process is a row here: who it runs as, its cgroup, its image, its state, and the hash
-//! of the token its calls carry. The client kernel in the browser owns the wasm state and tells
-//! of forks, exits and waits as they happen, in batches; this registry keeps the record and the
-//! decisions. A process's exit makes it a zombie until its parent waits for it; init reaps
-//! orphans.
+//! Narrowed `Machine` Durable Object SQLite store (`MACHINE_SCHEMA_VERSION = 2`).
 //!
-//! The authority (the filesystem's Durable Object) keeps only each exec's credentials
-//! (creds.rs): a token whose process is gone, and that no process forked from it still holds,
-//! is revoked there in a batch (`revoked`, flushed with the next execve or by the alarm).
+//! Holds ONLY:
+//! - `instances`: active remote-attached instance leases and host-proof fences (one live host per `instance_id`)
+//! - `service_tokens`: active remote service credentials bound to `(ns, instance_id)`
+//! - `pending_revocations`: durable revocation queue flushed to `OsAuthority` `/internal/revoke`
+//! - `io_quotas`: server-side per-credential remote `io.max` accounting & pacing state
+//!
+//! Retired process, PID-lending, signal, seat, terminal, init-owner, login-session, and
+//! process-memory tables have been removed cleanly (Contract §2.12 — no legacy `ALTER TABLE`
+//! migrations).
+use crate::auth;
 use crate::db::{Db, int, text};
-use abi::{
-    ARG_MAX, ENV_MAX, Errno, Error, Forked, PIDS_MAX, PROC_MAX, Proc, ProcState, SIGCONT, SIGKILL,
-    SIGSTOP,
-};
-use kernel::registry;
-use os_core::permissions::Identity;
-use serde::de::IgnoredAny;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use abi::auth_v2::{INSTANCE_LEASE_SECONDS, RemoteScope};
+use abi::{Errno, Error};
+use serde::Deserialize;
 use worker::{SqlStorage, SqlStorageValue};
 
-/// The namespace's init, the first process of every browser.
-pub const INIT: u32 = 1;
-/// The cgroups every namespace starts with.
-pub const ROOT_CGROUPS: [&str; 4] = ["/init", "/user", "/system", "/cluster"];
+/// Independent schema version for `Machine` DO (decoupled from `OsAuthority` `SCHEMA_VERSION = "10"`).
+pub const MACHINE_SCHEMA_VERSION: u32 = 3;
 
-type Result<T> = std::result::Result<T, Error>;
+/// Server-side hard remote I/O ceiling per cgroup bucket (128 MiB/s) that clients can never
+/// exceed or clear to unlimited. Client-requested `io.max` rates below this floor are respected.
+pub const SERVER_IO_CEILING_BPS: u64 = 128 * 1024 * 1024;
 
-/// The registry's tables, in its namespace's own Durable Object.
-const SCHEMA: [&str; 14] = [
-    "CREATE TABLE IF NOT EXISTS pending_signals(sequence INTEGER PRIMARY KEY AUTOINCREMENT, pid INTEGER NOT NULL, signal INTEGER NOT NULL, UNIQUE(pid, signal))",
-    // The namespace, one small machine: the browser it is (its guest, or session, key), the
-    // boot it is of (a reload resets stale processes), and the next pid.
-    "CREATE TABLE IF NOT EXISTS namespaces(id TEXT PRIMARY KEY, guest TEXT NOT NULL, boot TEXT, next_pid INTEGER NOT NULL, created INTEGER NOT NULL, last_seen INTEGER NOT NULL)",
-    // Processes: their parent and credentials, cgroup, image, argument vector and environment,
-    // state, the hash of the token their calls carry (a forked child's is its parent's, as its
-    // credentials are), and the tab that runs them.
-    "CREATE TABLE IF NOT EXISTS processes(ns TEXT NOT NULL, pid INTEGER NOT NULL, ppid INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, groups TEXT NOT NULL, umask INTEGER NOT NULL, cgroup TEXT NOT NULL, path TEXT NOT NULL, argv TEXT NOT NULL, env TEXT NOT NULL, cwd TEXT NOT NULL, state TEXT NOT NULL, status INTEGER NOT NULL DEFAULT 0, signal INTEGER, token TEXT NOT NULL, started INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0, seat TEXT, PRIMARY KEY(ns, pid))",
-    // cgroup v2's hierarchy: its subtree, controllers, control files, and the account that
-    // made it (root's for the namespace's own), which may write it.
-    "CREATE TABLE IF NOT EXISTS cgroups(ns TEXT NOT NULL, path TEXT NOT NULL, parent TEXT NOT NULL, controllers TEXT NOT NULL, cpu_max TEXT, cpu_weight INTEGER NOT NULL DEFAULT 100, memory_max TEXT, pids_max INTEGER, io_max TEXT, freeze INTEGER NOT NULL DEFAULT 0, devices TEXT NOT NULL DEFAULT '', owner INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(ns, path))",
-    // Pids lent to a client kernel (its id), which its forks take at once and tell of after;
-    // what a kernel that is gone did not take goes back.
-    "CREATE TABLE IF NOT EXISTS spare(pid INTEGER PRIMARY KEY, kernel TEXT, owner INTEGER NOT NULL DEFAULT 0, token TEXT)",
-    // Boot ids describe only an account's processes; another account cannot reset them.
-    "CREATE TABLE IF NOT EXISTS account_boots(ns TEXT NOT NULL, owner INTEGER NOT NULL, boot TEXT NOT NULL, PRIMARY KEY(ns, owner))",
-    // Tokens no process holds any more, which the authority is still to revoke.
-    "CREATE TABLE IF NOT EXISTS revoked(token TEXT PRIMARY KEY)",
-    "CREATE INDEX IF NOT EXISTS processes_token ON processes(token)",
-    "CREATE TABLE IF NOT EXISTS leases(pid INTEGER PRIMARY KEY, expires INTEGER NOT NULL, renewed INTEGER NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS renewals(token TEXT PRIMARY KEY)",
-    "CREATE TABLE IF NOT EXISTS terminals(pid INTEGER PRIMARY KEY, tty INTEGER NOT NULL, fds TEXT NOT NULL)",
-    "CREATE TRIGGER IF NOT EXISTS terminals_remove AFTER DELETE ON processes BEGIN DELETE FROM terminals WHERE pid = old.pid; END",
-    "CREATE TRIGGER IF NOT EXISTS signals_remove AFTER DELETE ON processes BEGIN DELETE FROM pending_signals WHERE pid = old.pid; END",
-    "CREATE TABLE IF NOT EXISTS observations(name TEXT PRIMARY KEY, value INTEGER NOT NULL)",
-];
-
-/// Create the registry's tables, if they are not there yet.
-pub fn create(sql: &SqlStorage) -> worker::Result<()> {
-    crate::login::create(sql)?;
-    crate::init::create(sql)?;
-    for statement in SCHEMA {
-        sql.exec(statement, None)?;
-    }
-    crate::cgroup_lifetime::create(sql)?;
-    crate::resources::create(sql)?;
-    sql.exec(&format!("INSERT OR IGNORE INTO leases(pid, expires, renewed) SELECT pid, started + {}, started FROM processes WHERE pid != 1", abi::PROCESS_LEASE), None)?;
-    // Pids lent before a kernel said who it was are no kernel's, and cgroups made before they
-    // had an owner are root's.
-    if sql.exec("SELECT kernel FROM spare LIMIT 0", None).is_err() {
-        sql.exec("ALTER TABLE spare ADD COLUMN kernel TEXT", None)?;
-    }
-    if sql.exec("SELECT owner FROM cgroups LIMIT 0", None).is_err() {
-        sql.exec(
-            "ALTER TABLE cgroups ADD COLUMN owner INTEGER NOT NULL DEFAULT 0",
-            None,
-        )?;
-    }
-    if sql.exec("SELECT owner FROM spare LIMIT 0", None).is_err() {
-        sql.exec(
-            "ALTER TABLE spare ADD COLUMN owner INTEGER NOT NULL DEFAULT 0",
-            None,
-        )?;
-    }
-    if sql.exec("SELECT token FROM spare LIMIT 0", None).is_err() {
-        sql.exec("ALTER TABLE spare ADD COLUMN token TEXT", None)?;
-    }
-    // Additive migration: old processes share init's session/group. Mark their
-    // images execed conservatively, so a parent cannot regroup an old exec child.
-    for (name, definition) in [
-        ("pgid", "INTEGER NOT NULL DEFAULT 1"),
-        ("sid", "INTEGER NOT NULL DEFAULT 1"),
-        ("execed", "INTEGER NOT NULL DEFAULT 1"),
-        ("wait_event", "INTEGER NOT NULL DEFAULT 0"),
-        ("login_scope", "TEXT"),
-        ("subreaper", "INTEGER NOT NULL DEFAULT 0"),
-    ] {
-        if sql
-            .exec(&format!("SELECT {name} FROM processes LIMIT 0"), None)
-            .is_err()
-        {
-            sql.exec(
-                &format!("ALTER TABLE processes ADD COLUMN {name} {definition}"),
-                None,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Row {
-    pub ns: String,
-    pub login_scope: Option<String>,
-    pub subreaper: u32,
-    pub pid: u32,
-    pub ppid: u32,
-    pub pgid: u32,
-    pub sid: u32,
-    pub execed: u32,
-    pub wait_event: i32,
-    pub uid: u32,
-    pub gid: u32,
-    pub groups: String,
-    pub umask: u16,
-    pub cgroup: String,
-    pub path: String,
-    pub argv: String,
-    pub env: String,
-    pub cwd: String,
-    pub state: String,
-    pub status: i64,
-    pub signal: Option<i64>,
-    pub started: u64,
-    pub ended: u64,
-    pub seat: Option<String>,
-    #[serde(default)]
-    pub tty: Option<u32>,
-    #[serde(default)]
-    pub tty_fds: String,
-}
-impl Row {
-    pub fn proc(&self) -> Proc {
-        Proc {
-            pending_signals: Vec::new(),
-            pid: self.pid,
-            ppid: self.ppid,
-            pgid: self.pgid,
-            sid: self.sid,
-            state: state_of(&self.state),
-            status: self.status as i32,
-            signal: self.signal.and_then(|signal| u8::try_from(signal).ok()),
-            uid: self.uid,
-            gid: self.gid,
-            cgroup: self.cgroup.clone(),
-            path: self.path.clone(),
-            argv: serde_json::from_str(&self.argv).unwrap_or_default(),
-            started: self.started,
-            ended: self.ended,
-            seat: self.seat.clone(),
-            placement: crate::placement::browser(
-                &self.ns,
-                self.uid,
-                self.seat.as_deref(),
-                &self.cgroup,
-            ),
-        }
-    }
-    pub fn identity(&self) -> Identity {
-        Identity {
-            id: self.uid,
-            group: self.gid,
-            groups: serde_json::from_str(&self.groups)
-                .unwrap_or_else(|_| BTreeSet::from([self.gid])),
-        }
-    }
-    pub fn zombie(&self) -> bool {
-        self.state == "zombie"
+/// Clamp a client-supplied optional rate against the server ceiling floor.
+pub fn effective_server_io_rate(client_min_rate: Option<u64>) -> u64 {
+    match client_min_rate {
+        Some(r) => r.min(SERVER_IO_CEILING_BPS),
+        None => SERVER_IO_CEILING_BPS,
     }
 }
 
-fn state_of(state: &str) -> ProcState {
-    match state {
-        "zombie" => ProcState::Zombie,
-        "stopped" => ProcState::Stopped,
-        "sleeping" => ProcState::Sleeping,
-        _ => ProcState::Running,
+fn min_opt_rate(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
     }
 }
 
-const COLUMNS: &str = "ns, login_scope, subreaper, pid, ppid, pgid, sid, execed, wait_event, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, started, ended, seat, (SELECT tty FROM terminals WHERE terminals.pid = processes.pid) AS tty, COALESCE((SELECT fds FROM terminals WHERE terminals.pid = processes.pid), '[]') AS tty_fds";
-
-/// What an execve asks of the registry, once its arguments are checked: the pid it runs as,
-/// and, replacing a process, whose that was and the token it held (`Begun`); then, once the
-/// authority has checked the image and snapshotted the caller, the row (`Db::exec_end`).
-#[derive(Clone, Debug)]
-pub struct Begun {
-    pub boot: String,
-    pub scope: Option<String>,
-    pub pid: u32,
-    /// The account of the process it replaces, if it replaces one.
-    pub replacing: Option<u32>,
-    /// The token hash the replaced image held, which dies with it: none while a process forked
-    /// from it (or that forked it) still holds it.
-    pub old: Option<String>,
-    /// The token hash the replaced process proved itself with: the credentials the new image
-    /// keeps, and the descriptors it keeps open.
-    pub current: Option<String>,
-    /// The cgroup the replaced process is in, which it stays in.
-    pub cgroup: Option<String>,
-    /// The executor seat retained when execve does not supply a new one.
-    pub seat: Option<String>,
-}
-
-/// The credentials an execve snapshotted (the authority's answer).
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Snapshot {
-    pub login: Option<crate::login::Context>,
-    pub uid: u32,
-    pub gid: u32,
-    pub groups: BTreeSet<u32>,
-    pub umask: u16,
-}
-
-impl Db {
-    fn lease(&mut self, pid: u32, now: u64) {
-        self.run(
-            "INSERT OR REPLACE INTO leases(pid, expires, renewed) VALUES(?, ?, ?)",
-            vec![int(pid), int(now + abi::PROCESS_LEASE), int(now)],
-        );
-    }
-    /// A host that disappears cannot leave executable credentials or process rows forever.
-    /// Web Locks clean up promptly; this deadline also works when every browser tab is gone.
-    pub fn expire_processes(&mut self, now: u64) {
-        let rows = self.rows::<Row>(&format!("SELECT {COLUMNS} FROM processes WHERE pid != 1 AND pid IN (SELECT pid FROM leases WHERE expires <= ?)"), vec![int(now)]);
-        for row in rows {
-            if row.zombie() && row.ppid != INIT {
-                // A live parent's lease preserves the status until wait, even for a child
-                // that exited hours ago. Once the parent disappears it is reaped as usual.
-                #[derive(Deserialize)]
-                struct Deadline {
-                    expires: u64,
-                }
-                if let Some(deadline) = self
-                    .rows::<Deadline>(
-                        "SELECT expires FROM leases WHERE pid = ? AND expires > ?",
-                        vec![int(row.ppid), int(now)],
-                    )
-                    .first()
-                {
-                    self.run(
-                        "UPDATE leases SET expires = ? WHERE pid = ?",
-                        vec![int(deadline.expires), int(row.pid)],
-                    );
-                    continue;
-                }
-            }
-            self.observe("processes_expired", 1);
-            if !row.zombie() {
-                let _ = self.exit(&row, 128 + i32::from(SIGKILL), Some(SIGKILL), now);
-            }
-            self.remove(&row);
-        }
-    }
-    pub fn lease_deadline(&self) -> Option<u64> {
-        #[derive(Deserialize)]
-        struct Deadline {
-            expires: Option<u64>,
-        }
-        self.rows::<Deadline>("SELECT MIN(expires) AS expires FROM leases", vec![])
-            .into_iter()
-            .next()
-            .and_then(|row| row.expires)
-    }
-    pub fn renewing(&self) -> Vec<String> {
-        #[derive(Deserialize)]
-        struct Token {
-            token: String,
-        }
-        self.rows::<Token>("SELECT token FROM renewals", vec![])
-            .into_iter()
-            .map(|row| row.token)
-            .collect()
-    }
-    pub fn renewed(&mut self, tokens: &[String]) {
-        for token in tokens {
-            self.run("DELETE FROM renewals WHERE token = ?", vec![text(token)]);
-        }
-    }
-    /// A host may inspect even a zombie by its token, without gaining access to another
-    /// account's processes after a session change. Missing or invalid proofs reveal no row.
-    pub fn keep_processes(
-        &mut self,
-        ns: &str,
-        proofs: &[abi::ProcessProof],
-        now: u64,
-    ) -> Vec<Proc> {
-        proofs
-            .iter()
-            .filter_map(|proof| {
-                if proof.pid == INIT
-                    && !self.init_token(ns, &crate::auth::token_hash(&proof.token), now)
-                {
-                    return None;
-                }
-                if proof.pid != INIT
-                    && self.token_of(ns, proof.pid).as_deref()
-                        != Some(crate::auth::token_hash(&proof.token).as_str())
-                {
-                    return None;
-                }
-                let row = self.process(ns, proof.pid)?;
-                if !row.zombie() {
-                    let hash = crate::auth::token_hash(&proof.token);
-                    if self.any(
-                        "SELECT pid FROM leases WHERE pid = ? AND renewed <= ?",
-                        vec![int(proof.pid), int(now.saturating_sub(600))],
-                    ) {
-                        self.run(
-                            "INSERT OR IGNORE INTO renewals(token) VALUES(?)",
-                            vec![text(&hash)],
-                        );
-                        self.run(
-                            "UPDATE leases SET renewed = ? WHERE pid = ?",
-                            vec![int(now), int(proof.pid)],
-                        );
-                    }
-                    self.run(
-                        "UPDATE leases SET expires = ? WHERE pid = ?",
-                        vec![int(now + abi::PROCESS_LEASE), int(proof.pid)],
-                    );
-                }
-                for sequence in proof.signals.iter().take(31) {
-                    self.run(
-                        "DELETE FROM pending_signals WHERE pid = ? AND sequence = ?",
-                        vec![int(proof.pid), int(*sequence)],
-                    );
-                }
-                let mut value = row.proc();
-                value.pending_signals = self.rows::<abi::PendingSignal>(
-                    "SELECT sequence, signal FROM pending_signals WHERE pid = ? ORDER BY sequence",
-                    vec![int(proof.pid)],
-                );
-                Some(value)
-            })
-            .collect()
-    }
-    /// The process `pid` of namespace `ns`.
-    pub fn process(&self, ns: &str, pid: u32) -> Option<Row> {
-        self.rows::<Row>(
-            &format!("SELECT {COLUMNS} FROM processes WHERE ns = ? AND pid = ?"),
-            vec![text(ns), int(pid)],
-        )
-        .into_iter()
-        .next()
-    }
-    /// The live process `pid` of `ns`, if `token` is its token. Tokens are stored hashed, so a
-    /// copy of the store is not a set of capabilities; a zombie's token is dead with the
-    /// process. A forked child holds its parent's token, as it holds its credentials, so a
-    /// token alone does not say which process calls: its pid does.
-    pub fn process_token(&self, token: &str, pid: Option<u32>, ns: &str) -> Option<Row> {
-        let pid = pid?;
-        if pid == INIT {
-            return self
-                .init_token(ns, &crate::auth::token_hash(token), crate::auth::now())
-                .then(|| self.process(ns, pid))
-                .flatten();
-        }
-        self.rows::<Row>(
-            &format!(
-                "SELECT {COLUMNS} FROM processes WHERE ns = ? AND pid = ? AND token = ? AND state != 'zombie'"
-            ),
-            vec![text(ns), int(pid), text(&crate::auth::token_hash(token))],
-        )
-        .into_iter()
-        .next()
-    }
-    /// The namespace a request is of: the browser's guest, or, with no guest cookie, its
-    /// signed-in session (or the anonymous namespace of a request with neither).
+impl crate::db::Db {
+    /// Process/credential namespace for a browser session or guest cookie.
     pub fn namespace(key: Option<&str>, guest: Option<&str>) -> String {
         guest
             .map(str::to_string)
             .or_else(|| key.map(|key| format!("session.{key}")))
             .unwrap_or_else(|| "anonymous".into())
     }
-    /// The namespace this registry keeps, once anything began it.
-    pub fn namespace_id(&self) -> Option<String> {
-        #[derive(Deserialize)]
-        struct Id {
-            id: String,
-        }
-        self.rows::<Id>("SELECT id FROM namespaces LIMIT 1", vec![])
-            .into_iter()
-            .next()
-            .map(|row| row.id)
-    }
-    /// Begin (or continue) a namespace. A new boot reaps only this account's old processes
-    /// and lends; a caller-supplied boot id proves nothing about other accounts' lifetimes.
-    pub fn proc_init(&mut self, ns: &str, cred: &Identity, boot: Option<&str>, now: u64) -> Value {
-        let existing = self.account_boot(ns, cred.id);
-        if let Some(boot) = boot
-            && existing.as_deref() != Some(boot)
-        {
-            for row in self.processes(ns) {
-                if row.pid != INIT && row.uid == cred.id {
-                    self.orphan(ns, row.pid);
-                    self.remove(&row);
-                }
-            }
-            self.retire_cgroups(ns, now);
-            self.run("DELETE FROM spare WHERE owner = ?", vec![int(cred.id)]);
-            self.run(
-                "INSERT INTO account_boots(ns, owner, boot) VALUES(?, ?, ?) ON CONFLICT(ns, owner) DO UPDATE SET boot = excluded.boot",
-                vec![text(ns), int(cred.id), text(boot)],
-            );
-        }
-        self.ensure_namespace(ns, now);
-        json!({
-            "namespace": ns,
-            "pid": INIT,
-            "machine_boot": self.machine_boot(ns),
-            "boot": self.account_boot(ns, cred.id),
-            "features": abi::Features { wasix: true, cgroups: true, cluster: false, completion_queue: false },
-            "lease_seconds": abi::PROCESS_LEASE,
-            "counters": self.observations(),
-            "pids": self.poll(ns, &[], cred).iter().map(|row| row.pid).collect::<Vec<_>>(),
-        })
-    }
-    /// A namespace that is there, without a boot's reap: its row, init, and root cgroups.
-    pub(crate) fn ensure_namespace(&mut self, ns: &str, now: u64) {
-        self.run(
-            "INSERT INTO namespaces(id, guest, boot, next_pid, created, last_seen) VALUES(?, ?, NULL, 2, ?, ?) ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen",
-            vec![text(ns), text(ns), int(now), int(now)],
-        );
-        self.ensure_init(ns, now);
-        self.ensure_init_owner(ns, now);
-    }
-    /// Whether `query` finds a row.
-    fn any(&self, query: &str, args: Vec<SqlStorageValue>) -> bool {
-        !self.rows::<IgnoredAny>(query, args).is_empty()
-    }
-    /// The count `query` selects, as `n`.
-    fn count(&self, query: &str, args: Vec<SqlStorageValue>) -> usize {
-        #[derive(Deserialize)]
-        struct Count {
-            n: usize,
-        }
-        self.rows::<Count>(query, args)
-            .first()
-            .map_or(0, |row| row.n)
-    }
-    fn ensure_init(&mut self, ns: &str, now: u64) {
-        if self.process(ns, INIT).is_none() {
-            self.run(
-                "INSERT INTO processes(ns, pid, ppid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, token, started, ended) VALUES(?, 1, 0, 0, 0, '[0]', 18, '/init', '/init', '[\"init\"]', '[]', '/', 'running', 0, NULL, ?, ?, 0)",
-                vec![
-                    text(ns),
-                    // Init makes no calls of its own: nobody holds its token.
-                    text(&crate::auth::token_hash(&crate::auth::random_token())),
-                    int(now),
-                ],
-            );
-        }
-        self.ensure_cgroup(ns, "/", 0);
-        for path in ROOT_CGROUPS {
-            self.ensure_cgroup(ns, path, 0);
-        }
-    }
-    fn account_boot(&self, ns: &str, owner: u32) -> Option<String> {
-        #[derive(Deserialize)]
-        struct Boot {
-            boot: Option<String>,
-        }
-        self.rows::<Boot>(
-            "SELECT boot FROM account_boots WHERE ns = ? AND owner = ?",
-            vec![text(ns), int(owner)],
-        )
-        .into_iter()
-        .next()
-        .and_then(|row| row.boot)
-    }
-    /// Every process of `ns`, by pid.
-    pub fn processes(&self, ns: &str) -> Vec<Row> {
-        self.rows::<Row>(
-            &format!("SELECT {COLUMNS} FROM processes WHERE ns = ? ORDER BY pid"),
-            vec![text(ns)],
-        )
-    }
-    /// A host starts a fresh pipeline in one session/group, before running its images.
-    /// Validate every proof before changing anything; a public seat or pid is not a grant.
-    pub fn start_session(&mut self, ns: &str, proofs: &[abi::ProcessProof]) -> Result<Vec<Proc>> {
-        if proofs.is_empty() || proofs.len() > abi::PROC_POLL_MAX {
-            return Err(Errno::EINVAL.into());
-        }
-        let mut pids = BTreeSet::new();
-        let mut rows = Vec::new();
-        for proof in proofs {
-            let row = self
-                .process_token(&proof.token, Some(proof.pid), ns)
-                .ok_or(Errno::EPERM)?;
-            if row.pid == INIT
-                || row.ppid != INIT
-                || row.sid != INIT
-                || row.pgid != INIT
-                || !pids.insert(row.pid)
-                || rows
-                    .first()
-                    .is_some_and(|first: &Row| first.uid != row.uid || first.seat != row.seat)
-            {
-                return Err(Errno::EPERM.into());
-            }
-            rows.push(row);
-        }
-        let leader = rows[0].pid;
-        for row in &mut rows {
-            self.run(
-                "UPDATE processes SET sid = ?, pgid = ? WHERE ns = ? AND pid = ?",
-                vec![int(leader), int(leader), text(ns), int(row.pid)],
-            );
-            row.sid = leader;
-            row.pgid = leader;
-        }
-        Ok(rows.iter().map(Row::proc).collect())
-    }
-    pub fn group_target(&self, caller: &Row, pid: i32) -> Result<Row> {
-        if pid < 0 {
-            return Err(Errno::EINVAL.into());
-        }
-        let target = self
-            .process(&caller.ns, if pid == 0 { caller.pid } else { pid as u32 })
-            .ok_or(Errno::ESRCH)?;
-        if caller.uid != 0 && caller.uid != target.uid && caller.sid != target.sid {
-            return Err(Errno::EPERM.into());
-        }
-        Ok(target)
-    }
-    pub fn setsid(&mut self, caller: &Row) -> Result<Proc> {
-        if self.any(
-            "SELECT pid FROM processes WHERE ns = ? AND pgid = ?",
-            vec![text(&caller.ns), int(caller.pid)],
-        ) {
-            return Err(Errno::EPERM.into());
-        }
-        let orphaned = self.orphaned_groups(&caller.ns);
-        self.run(
-            "UPDATE processes SET sid = pid, pgid = pid WHERE ns = ? AND pid = ?",
-            vec![text(&caller.ns), int(caller.pid)],
-        );
-        self.wake_orphans(&caller.ns, &orphaned);
-        Ok(self
-            .process(&caller.ns, caller.pid)
-            .ok_or(Errno::ESRCH)?
-            .proc())
-    }
-    pub fn setpgid(&mut self, caller: &Row, pid: i32, pgid: i32) -> Result<Proc> {
-        if pid < 0 || pgid < 0 {
-            return Err(Errno::EINVAL.into());
-        }
-        let pid = if pid == 0 { caller.pid } else { pid as u32 };
-        let target = self.process(&caller.ns, pid).ok_or(Errno::ESRCH)?;
-        if target.pid != caller.pid && target.ppid != caller.pid {
-            return Err(Errno::ESRCH.into());
-        }
-        if target.pid != caller.pid && target.execed != 0 {
-            return Err(Errno::EACCES.into());
-        }
-        if target.zombie() || target.sid != caller.sid || target.pid == target.sid {
-            return Err(Errno::EPERM.into());
-        }
-        let pgid = if pgid == 0 { pid } else { pgid as u32 };
-        if pgid != pid
-            && !self.any(
-                "SELECT pid FROM processes WHERE ns = ? AND sid = ? AND pgid = ?",
-                vec![text(&caller.ns), int(caller.sid), int(pgid)],
-            )
-        {
-            return Err(Errno::EPERM.into());
-        }
-        let orphaned = self.orphaned_groups(&caller.ns);
-        self.run(
-            "UPDATE processes SET pgid = ? WHERE ns = ? AND pid = ?",
-            vec![int(pgid), text(&caller.ns), int(pid)],
-        );
-        self.wake_orphans(&caller.ns, &orphaned);
-        Ok(self.process(&caller.ns, pid).ok_or(Errno::ESRCH)?.proc())
-    }
-    fn child_changed(&mut self, row: &Row) {
-        if row.ppid != INIT || self.init_active(&row.ns) {
-            self.run("INSERT OR IGNORE INTO pending_signals(pid, signal) SELECT pid, 17 FROM processes WHERE ns = ? AND pid = ? AND state != 'zombie'",
-                vec![text(&row.ns), int(row.ppid)]);
-        }
-    }
-    fn orphaned_groups(&self, ns: &str) -> BTreeSet<(u32, u32)> {
-        let rows = self.processes(ns);
-        rows.iter()
-            .filter(|row| !row.zombie())
-            .map(|row| (row.sid, row.pgid))
-            .filter(|&(sid, pgid)| {
-                !rows.iter().any(|member| {
-                    member.sid == sid
-                        && member.pgid == pgid
-                        && !member.zombie()
-                        && rows.iter().any(|parent| {
-                            parent.pid == member.ppid
-                                && parent.sid == sid
-                                && parent.pgid != pgid
-                                && !parent.zombie()
-                        })
-                })
-            })
-            .collect()
-    }
-    /// Newly orphaned stopped groups receive HUP followed by CONT, so stopped
-    /// children cannot remain waiting for a parent that can no longer resume them.
-    fn wake_orphans(&mut self, ns: &str, before: &BTreeSet<(u32, u32)>) {
-        let after = self.orphaned_groups(ns);
-        for &(sid, pgid) in after.difference(before) {
-            let members: Vec<_> = self
-                .processes(ns)
-                .into_iter()
-                .filter(|row| row.sid == sid && row.pgid == pgid && !row.zombie())
-                .collect();
-            if members.iter().any(|row| row.state == "stopped") {
-                for row in members {
-                    let _ = self.kill(
-                        ns,
-                        &row.identity(),
-                        row.pid,
-                        abi::SIGHUP,
-                        crate::auth::now(),
-                    );
-                    let _ = self.kill(ns, &row.identity(), row.pid, SIGCONT, crate::auth::now());
-                }
-            }
-        }
-    }
-    /// Record an actual default stop, without echoing an uncatchable STOP to the host.
-    pub fn stopped(&mut self, row: &Row, signal: u8) -> Result<()> {
-        if !matches!(signal, 19..=22) {
-            return Err(Errno::EINVAL.into());
-        }
-        if row.state != "stopped" {
-            self.run(
-                "UPDATE processes SET state = 'stopped', wait_event = ? WHERE ns = ? AND pid = ?",
-                vec![
-                    int(((signal as u32) << 8) | 0x7f),
-                    text(&row.ns),
-                    int(row.pid),
-                ],
-            );
-            self.child_changed(row);
-        }
-        Ok(())
-    }
-    pub fn waitpid(&mut self, parent: &Row, selector: i32, options: u32) -> Result<Value> {
-        if options & !11 != 0 {
-            return Err(Errno::EINVAL.into());
-        }
-        let children: Vec<_> = self
-            .processes(&parent.ns)
-            .into_iter()
-            .filter(|row| {
-                row.ppid == parent.pid
-                    && match selector {
-                        -1 => true,
-                        0 => row.pgid == parent.pgid,
-                        n if n < -1 => row.pgid == n.unsigned_abs(),
-                        n => row.pid == n as u32,
-                    }
-            })
-            .collect();
-        if children.is_empty() {
-            return Err(Errno::ECHILD.into());
-        }
-        for child in children {
-            let event = child.wait_event;
-            if child.zombie() {
-                self.remove(&child);
-                if parent.pid == INIT {
-                    self.init_reaped(&parent.ns);
-                }
-                return Ok(
-                    json!({ "pid": child.pid, "ppid": parent.pid, "status": child.status,
-                    "code": abi::exited(child.status as i32), "signal": child.signal }),
-                );
-            }
-            if event != 0
-                && ((event == 0xffff && options & 8 != 0) || (event != 0xffff && options & 2 != 0))
-            {
-                self.run(
-                    "UPDATE processes SET wait_event = 0 WHERE ns = ? AND pid = ?",
-                    vec![text(&parent.ns), int(child.pid)],
-                );
-                return Ok(
-                    json!({ "pid": child.pid, "ppid": parent.pid, "status": event,
-                    "stopped": event != 0xffff, "continued": event == 0xffff }),
-                );
-            }
-        }
-        if options & 1 != 0 {
-            Ok(json!({ "nothing": true }))
-        } else {
-            Err(Errno::EAGAIN.into())
-        }
-    }
-    /// execve(2)'s first half, before the authority checks the image: its arguments' sizes,
-    /// its cgroup, and its pid, a new one or the process it replaces, which proves itself by
-    /// its token (`token`): only a process replaces itself, as only it can call execve. A new
-    /// pid counts against the namespace's processes with the `reserved` ones other execs were
-    /// given and have not started yet.
-    #[allow(clippy::too_many_arguments)]
-    pub fn exec_begin(
-        &mut self,
-        ns: &str,
-        pid: Option<u32>,
-        token: Option<&str>,
-        argv: &[String],
-        env: &[String],
-        cgroup: Option<&str>,
-        reserved: usize,
-        now: u64,
-    ) -> Result<Begun> {
-        if argv.iter().map(|arg| arg.len() + 1).sum::<usize>() > ARG_MAX {
-            return Err(Error::because(
-                Errno::E2BIG,
-                "the argument vector is too long",
-            ));
-        }
-        if env.iter().map(|entry| entry.len() + 1).sum::<usize>() > ENV_MAX {
-            return Err(Error::because(Errno::E2BIG, "the environment is too long"));
-        }
-        self.ensure_namespace(ns, now);
-        let cgroup = cgroup.unwrap_or("/user");
-        self.cgroup_available(ns, cgroup)?;
-        if self.cgroup(ns, cgroup).is_none() {
-            return Err(Error::because(
-                Errno::ENOENT,
-                format!("{cgroup} is not a cgroup of this namespace"),
-            ));
-        }
-        match pid {
-            Some(pid) => {
-                // Init is not the caller's to take over.
-                if pid == INIT {
-                    return Err(Errno::EPERM.into());
-                }
-                self.process(ns, pid)
-                    .filter(|existing| !existing.zombie())
-                    .ok_or(Errno::ESRCH)?;
-                let existing = token
-                    .and_then(|token| self.process_token(token, Some(pid), ns))
-                    .ok_or_else(|| {
-                        Error::because(Errno::EPERM, "only a process replaces its own image")
-                    })?;
-                // The token the image held dies with it, unless a process forked from it, or
-                // forked it, holds it still.
-                let token = self.token_of(ns, pid).unwrap_or_default();
-                let shared = self.processes(ns).iter().any(|row| {
-                    row.pid != pid && self.token_of(ns, row.pid).as_ref() == Some(&token)
-                });
-                Ok(Begun {
-                    boot: self.machine_boot(ns).ok_or(Errno::EIO)?,
-                    scope: existing.login_scope,
-                    pid,
-                    replacing: Some(existing.uid),
-                    old: (!shared).then(|| token.clone()),
-                    current: Some(token),
-                    cgroup: Some(existing.cgroup),
-                    seat: existing.seat,
-                })
-            }
-            None => Ok(Begun {
-                boot: self.machine_boot(ns).ok_or(Errno::EIO)?,
-                scope: None,
-                pid: self.new_pid(ns, reserved)?,
-                replacing: None,
-                old: None,
-                current: None,
-                cgroup: None,
-                seat: None,
-            }),
-        }
-    }
-    pub fn terminal(
-        &mut self,
-        ns: &str,
-        pid: u32,
-        token: &str,
-        tty: u32,
-        fds: &[u32],
-    ) -> Result<()> {
-        if pid == INIT {
-            return Err(Errno::EPERM.into());
-        }
-        self.process_token(token, Some(pid), ns)
-            .ok_or(Errno::ESRCH)?;
-        if fds.len() > 256 || fds.iter().any(|fd| *fd > 65535) || tty < 2 {
-            return Err(Errno::EINVAL.into());
-        }
-        self.run("INSERT INTO terminals(pid, tty, fds) VALUES(?, ?, ?) ON CONFLICT(pid) DO UPDATE SET tty=excluded.tty, fds=excluded.fds",
-            vec![int(pid), int(tty), text(&serde_json::to_string(fds).unwrap_or_default())]);
-        Ok(())
-    }
+}
 
-    /// execve(2)'s second half: the process, with the credentials the authority snapshotted
-    /// and its new token's hash, runs the image. A process replacing its image does so only if
-    /// it still holds the token it proved itself with, alive: one that ended, or that another
-    /// execve replaced first, meanwhile, does not, and the new token is revoked on error. The
-    /// token it held goes once no process holds it, as a fork may still.
-    #[allow(clippy::too_many_arguments)]
-    pub fn exec_end(
-        &mut self,
-        ns: &str,
-        begun: &Begun,
-        cred: &Snapshot,
-        token_hash: &str,
-        path: &str,
-        argv: &[String],
-        env: &[String],
-        cwd: &str,
-        cgroup: &str,
-        seat: Option<&str>,
-        runtime: Option<&str>,
-        now: u64,
-    ) -> Result<String> {
-        // Exec preserves membership if migration completes during authorization.
-        let current_group = begun
-            .replacing
-            .and_then(|_| self.process(ns, begun.pid))
-            .map(|p| p.cgroup);
-        let cgroup = current_group.as_deref().unwrap_or(cgroup);
-        let admission = if self.machine_boot(ns).as_deref() != Some(&begun.boot) {
-            Err(Errno::ESTALE.into())
-        } else if begun.replacing.is_none() {
-            self.check_login_admission(ns, begun.scope.as_deref(), cred.login.as_ref())
-        } else {
-            Ok(())
-        };
-        if let Err(error) = admission
-            .and_then(|_| self.cgroup_available(ns, cgroup))
-            .and_then(|_| self.resource_admit(ns, cgroup, runtime, 0, None))
-        {
-            self.run(
-                "INSERT OR IGNORE INTO revoked(token) VALUES(?)",
-                vec![text(token_hash)],
-            );
-            return Err(error);
-        }
-        // The authority has now verified the executable and the caller's snapshot. Check
-        // placement with that identity, including changes made while exec awaited it.
-        if begun.replacing.is_none() {
-            let allowed = self
-                .cgroup(ns, cgroup)
-                .ok_or(Errno::ENOENT)
-                .and_then(|group| {
-                    let identity = os_core::permissions::Identity {
-                        id: cred.uid,
-                        group: cred.gid,
-                        groups: cred.groups.clone(),
-                    };
-                    registry::may_attach(&identity, cred.uid, cgroup, group.owner)
-                        .then_some(())
-                        .ok_or(Errno::EACCES)
-                });
-            if let Err(error) = allowed {
-                self.run(
-                    "INSERT OR IGNORE INTO revoked(token) VALUES(?)",
-                    vec![text(token_hash)],
-                );
-                return Err(error.into());
-            }
-        }
-        if begun.replacing.is_none() {
-            // Admission is serialized with every other fork, exec and migration.
-            if let Err(error) = self.admit_pid(ns, cgroup, None) {
-                self.run(
-                    "INSERT OR IGNORE INTO revoked(token) VALUES(?)",
-                    vec![text(token_hash)],
-                );
-                return Err(error);
-            }
-        }
-        let groups = serde_json::to_string(&cred.groups).unwrap_or_default();
-        let argv = serde_json::to_string(argv).unwrap_or_default();
-        let env = serde_json::to_string(env).unwrap_or_default();
-        let seat = seat.map_or(SqlStorageValue::Null, text);
-        if begun.replacing.is_some() {
-            let current = begun.current.clone().unwrap_or_default();
-            let replaced = self.any(
-                "UPDATE processes SET execed = 1, uid = ?, gid = ?, groups = ?, umask = ?, cgroup = ?, path = ?, argv = ?, env = ?, cwd = ?, state = 'running', status = 0, signal = NULL, token = ?, started = ?, ended = 0, seat = COALESCE(?, seat) WHERE ns = ? AND pid = ? AND token = ? AND state != 'zombie' RETURNING pid",
-                vec![
-                    int(cred.uid),
-                    int(cred.gid),
-                    text(&groups),
-                    int(cred.umask),
-                    text(cgroup),
-                    text(path),
-                    text(&argv),
-                    text(&env),
-                    text(cwd),
-                    text(token_hash),
-                    int(now),
-                    seat,
-                    text(ns),
-                    int(begun.pid),
-                    text(&current),
-                ],
-            );
-            if !replaced {
-                self.run(
-                    "INSERT OR IGNORE INTO revoked(token) VALUES(?)",
-                    vec![text(token_hash)],
-                );
-                return Err(Error::because(
-                    Errno::ESRCH,
-                    "the process ended, or replaced its image, as it executed",
-                ));
-            }
-            // The image it ran before died with the exec at the authority (`Begun::old`), or,
-            // shared then, dies once no fork of it holds it.
-            if begun.old.is_none() {
-                self.revoke_unheld(ns, &current);
-            }
-            self.lease(begun.pid, now);
-            self.resource_exec(begun.pid, runtime);
-            Ok(cgroup.to_owned())
-        } else {
-            self.run(
-                "INSERT INTO processes(ns, pid, ppid, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, token, started, ended, seat) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 0, NULL, ?, ?, 0, ?)",
-                vec![
-                    text(ns),
-                    int(begun.pid),
-                    int(INIT),
-                    int(cred.uid),
-                    int(cred.gid),
-                    text(&groups),
-                    int(cred.umask),
-                    text(cgroup),
-                    text(path),
-                    text(&argv),
-                    text(&env),
-                    text(cwd),
-                    text(token_hash),
-                    int(now),
-                    seat,
-                ],
-            );
-            self.run(
-                "UPDATE processes SET login_scope = ? WHERE ns = ? AND pid = ?",
-                vec![
-                    begun.scope.as_deref().map_or(SqlStorageValue::Null, text),
-                    text(ns),
-                    int(begun.pid),
-                ],
-            );
-            self.lease(begun.pid, now);
-            self.resource_exec(begun.pid, runtime);
-            Ok(cgroup.to_owned())
-        }
+/// Maximum attached instances per namespace.
+pub const INSTANCES_MAX: usize = 64;
+
+/// Maximum active remote service tokens per namespace.
+pub const SERVICE_TOKENS_MAX: usize = 512;
+
+/// Clean-break initialization of `Machine` DO SQLite schema (`MACHINE_SCHEMA_VERSION = 2`).
+pub fn create(sql: &SqlStorage) -> worker::Result<()> {
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
+        None,
+    )?;
+    #[derive(Deserialize)]
+    struct Ver {
+        v: String,
     }
-    /// Whether any process still holds the token `hash` (a fork shares its parent's).
-    pub fn token_held(&self, ns: &str, hash: &str) -> bool {
-        self.any(
-            "SELECT pid FROM processes WHERE ns = ? AND token = ? LIMIT 1",
-            vec![text(ns), text(hash)],
-        )
-    }
-    pub(crate) fn token_of(&self, ns: &str, pid: u32) -> Option<String> {
-        #[derive(Deserialize)]
-        struct Token {
-            token: String,
-        }
-        self.rows::<Token>(
-            "SELECT token FROM processes WHERE ns = ? AND pid = ?",
-            vec![text(ns), int(pid)],
-        )
+    let current = sql
+        .exec("SELECT v FROM meta WHERE k = 'machine_schema'", None)?
+        .to_array::<Ver>()?
         .into_iter()
         .next()
-        .map(|row| row.token)
-    }
-    /// Revoke the token `hash` at the authority, unless a process still holds it.
-    pub fn revoke_unheld(&mut self, ns: &str, hash: &str) {
-        if !hash.is_empty() && !self.token_held(ns, hash) {
-            self.run("DELETE FROM spare WHERE token = ?", vec![text(hash)]);
-            self.run(
-                "INSERT OR IGNORE INTO revoked(token) VALUES(?)",
-                vec![text(hash)],
-            );
+        .map(|row| row.v);
+    let expected = MACHINE_SCHEMA_VERSION.to_string();
+    if current.as_deref() != Some(expected.as_str()) {
+        // Clean break: drop all retired v1 tables (and any previous v2 tables) with zero legacy migrations.
+        for table in [
+            "processes",
+            "spare",
+            "pending_signals",
+            "terminals",
+            "account_boots",
+            "init_owner",
+            "login_sessions",
+            "login_profiles",
+            "seat_policies",
+            "process_resources",
+            "cgroup_lifetimes",
+            "cgroups",
+            "cgroup_io",
+            "revocations",
+            "instances",
+            "service_tokens",
+            "pending_revocations",
+            "io_quotas",
+            "io_buckets",
+        ] {
+            sql.exec(&format!("DROP TABLE IF EXISTS {table}"), None)?;
         }
-    }
-    /// The tokens waiting to be revoked at the authority.
-    pub fn revoking(&self) -> Vec<String> {
-        #[derive(Deserialize)]
-        struct Token {
-            token: String,
-        }
-        self.rows::<Token>("SELECT token FROM revoked LIMIT 256", vec![])
-            .into_iter()
-            .map(|row| row.token)
-            .collect()
-    }
-    /// The tokens the authority revoked.
-    pub fn revoked(&mut self, tokens: &[String]) {
-        for token in tokens {
-            self.run("DELETE FROM revoked WHERE token = ?", vec![text(token)]);
-        }
-    }
-    /// How many processes `ns` has, or is to have: those alive, the pids lent to its kernels
-    /// and not taken yet, and `reserved`, execs begun and not ended.
-    fn taken(&self, ns: &str, reserved: usize) -> usize {
-        let alive = self.count(
-            "SELECT COUNT(*) AS n FROM processes WHERE ns = ? AND state != 'zombie'",
-            vec![text(ns)],
-        );
-        alive + self.count("SELECT COUNT(*) AS n FROM spare", vec![]) + reserved
-    }
-    /// A new pid, if the namespace has room for one more process (`reserved` others are to
-    /// start): EAGAIN, as fork(2) and execve's new process say, if not.
-    fn new_pid(&mut self, ns: &str, reserved: usize) -> Result<u32> {
-        if self.taken(ns, reserved) >= PROC_MAX {
-            return Err(Errno::EAGAIN.into());
-        }
-        self.next_pids(ns, 1).pop().ok_or(Errno::EAGAIN.into())
-    }
-    /// The next `count` pids no process has, taken.
-    fn next_pids(&mut self, ns: &str, count: usize) -> Vec<u32> {
-        #[derive(Deserialize)]
-        struct Next {
-            next_pid: u32,
-        }
-        let mut next = self
-            .rows::<Next>(
-                "SELECT next_pid FROM namespaces WHERE id = ?",
-                vec![text(ns)],
-            )
-            .into_iter()
-            .next()
-            .map_or(2, |row| row.next_pid);
-        let mut pids = Vec::with_capacity(count);
-        while pids.len() < count && next < i32::MAX as u32 {
-            if self.process(ns, next).is_none() && !self.spare(next) {
-                pids.push(next);
-            }
-            next += 1;
-        }
-        self.run(
-            "UPDATE namespaces SET next_pid = ? WHERE id = ?",
-            vec![int(next), text(ns)],
-        );
-        pids
-    }
-    fn spare(&self, pid: u32) -> bool {
-        self.any("SELECT pid FROM spare WHERE pid = ?", vec![int(pid)])
-    }
-    /// Lend the client kernel `kernel` up to `count` pids, as many as the namespace has room
-    /// for (`reserved` execs are to start), which its forks take without asking. None when it
-    /// has no room: EAGAIN, as fork(2) says.
-    #[allow(clippy::too_many_arguments)]
-    pub fn lend(
-        &mut self,
-        ns: &str,
-        cred: &Identity,
-        token: Option<&str>,
-        count: u32,
-        kernel: Option<&str>,
-        reserved: usize,
-        now: u64,
-    ) -> Result<Vec<u32>> {
-        self.ensure_namespace(ns, now);
-        let room = PROC_MAX.saturating_sub(self.taken(ns, reserved));
-        let count = (count.min(PIDS_MAX) as usize).min(room);
-        if count == 0 {
-            return Err(Errno::EAGAIN.into());
-        }
-        let pids = self.next_pids(ns, count);
-        let kernel = kernel.map_or(SqlStorageValue::Null, text);
-        for pid in &pids {
-            self.run(
-                "INSERT INTO spare(pid, kernel, owner, token) VALUES(?, ?, ?, ?)",
-                vec![
-                    int(*pid),
-                    kernel.clone(),
-                    int(cred.id),
-                    token
-                        .map(|token| text(&crate::auth::token_hash(token)))
-                        .unwrap_or(SqlStorageValue::Null),
-                ],
-            );
-        }
-        Ok(pids)
-    }
-    /// The kernel `kernel` is gone (its Web Lock is free): what it was lent and did not take
-    /// goes back. A kernel that never said who it was is "".
-    pub fn reclaim(&mut self, kernel: &str, cred: &Identity) -> Result<usize> {
-        if cred.id != 0
-            && self.any(
-                "SELECT pid FROM spare WHERE COALESCE(kernel, '') = ? AND owner != ? LIMIT 1",
-                vec![text(kernel), int(cred.id)],
-            )
-        {
-            return Err(Errno::EPERM.into());
-        }
-        Ok(self
-            .rows::<IgnoredAny>(
-                "DELETE FROM spare WHERE COALESCE(kernel, '') = ? RETURNING pid",
-                vec![text(kernel)],
-            )
-            .len())
-    }
-    /// fork(2)'s registry half: a child of `parent`, with its credentials, cgroup, image,
-    /// environment and token copied (a child acts as its parent was executed, and shares its
-    /// descriptors). Its pid is `child`, one lent to the kernel that forked, or a new one.
-    pub fn fork(
-        &mut self,
-        parent: &Row,
-        child: Option<u32>,
-        reserved: usize,
-        now: u64,
-        empty_memory: bool,
-    ) -> Result<Forked> {
-        if parent.pid == INIT {
-            return Err(Errno::EPERM.into());
-        }
-        self.cgroup_available(&parent.ns, &parent.cgroup)?;
-        self.admit_pid(&parent.ns, &parent.cgroup, None)?;
-        let usage = self.resource_usage(parent.pid);
-        self.resource_admit(
-            &parent.ns,
-            &parent.cgroup,
-            usage.as_ref().map(|u| u.runtime.as_str()),
-            if empty_memory {
-                0
-            } else {
-                usage.as_ref().map_or(0, |u| u.memory)
-            },
+        sql.exec(
+            "CREATE TABLE instances(instance_id TEXT PRIMARY KEY, ns TEXT NOT NULL, host TEXT NOT NULL, host_proof_hash TEXT NOT NULL, host_epoch INTEGER NOT NULL, expires INTEGER NOT NULL, updated INTEGER NOT NULL)",
             None,
         )?;
-        let pid = match child {
-            Some(child) => {
-                if !self.any(
-                    "SELECT pid FROM spare WHERE pid = ? AND owner = ? AND (token IS NULL OR token = ?)",
-                    vec![int(child), int(parent.uid), text(&self.token_of(&parent.ns, parent.pid).unwrap_or_default())],
-                ) {
-                    return Err(Error::because(
-                        Errno::EINVAL,
-                        format!("{child} is no pid lent to this kernel"),
-                    ));
-                }
-                self.run("DELETE FROM spare WHERE pid = ?", vec![int(child)]);
-                child
-            }
-            None => self.new_pid(&parent.ns, reserved)?,
-        };
-        self.run(
-            "INSERT INTO processes(ns, pid, ppid, pgid, sid, execed, uid, gid, groups, umask, cgroup, path, argv, env, cwd, state, status, signal, token, started, ended, seat) SELECT ns, ?, pid, pgid, sid, 0, uid, gid, groups, umask, cgroup, path, argv, env, cwd, 'running', 0, NULL, token, ?, 0, seat FROM processes WHERE ns = ? AND pid = ?",
-            vec![int(pid), int(now), text(&parent.ns), int(parent.pid)],
-        );
-        self.run(
-            "INSERT INTO terminals(pid, tty, fds) SELECT ?, tty, fds FROM terminals WHERE pid = ?",
-            vec![int(pid), int(parent.pid)],
-        );
-        self.run(
-            "UPDATE processes SET login_scope = ? WHERE ns = ? AND pid = ?",
-            vec![
-                parent
-                    .login_scope
-                    .as_deref()
-                    .map_or(SqlStorageValue::Null, text),
-                text(&parent.ns),
-                int(pid),
-            ],
-        );
-        self.lease(pid, now);
-        self.resource_fork(parent.pid, pid, empty_memory);
-        Ok(Forked {
-            pid,
-            // The child's calls carry its parent's token, with its own pid.
-            token: String::new(),
-        })
-    }
-    /// exit(2): the process ends, by `status` or `signal`, and waits as a zombie for its
-    /// parent. Its children are init's from now on, and those that ended already, init reaps.
-    pub fn exit(&mut self, row: &Row, status: i32, signal: Option<u8>, now: u64) -> Result<()> {
-        if row.pid == INIT {
-            self.finish_init(&row.ns);
-            self.run("DELETE FROM pending_signals WHERE pid = 1", vec![]);
-            return Ok(());
-        }
-        if row.zombie() {
-            return Err(Errno::ESRCH.into());
-        }
-        let wait = match signal {
-            Some(signal) => abi::signal_status(signal),
-            None => abi::exit_status(status),
-        };
-        self.end(row, wait, signal, now);
-        Ok(())
-    }
-    /// The process `row` ends with the wait status `wait`: a zombie, its children init's, and
-    /// its token revoked unless a fork of it still runs.
-    fn end(&mut self, row: &Row, wait: i32, signal: Option<u8>, now: u64) {
-        // An earlier owner cleanup in this same transaction may have ended or
-        // reparented a row from a caller's snapshot already.
-        let Some(current) = self.process(&row.ns, row.pid).filter(|p| !p.zombie()) else {
-            return;
-        };
-        let row = &current;
-        let orphaned = self.orphaned_groups(&row.ns);
-        self.run(
-            "DELETE FROM pending_signals WHERE pid = ?",
-            vec![int(row.pid)],
-        );
-        let token = self.token_of(&row.ns, row.pid).unwrap_or_default();
-        self.run(
-            "UPDATE processes SET state = 'zombie', status = ?, signal = ?, ended = ? WHERE ns = ? AND pid = ?",
-            vec![
-                int(wait),
-                signal.map_or(SqlStorageValue::Null, int),
-                int(now),
-                text(&row.ns),
-                int(row.pid),
-            ],
-        );
-        self.retire_cgroups(&row.ns, now);
-        self.orphan(&row.ns, row.pid);
-        self.child_changed(row);
-        self.wake_orphans(&row.ns, &orphaned);
-        // A zombie's token is dead with it, though its row keeps the hash until it is reaped.
-        if !self.token_live(&row.ns, &token) {
-            self.run("DELETE FROM spare WHERE token = ?", vec![text(&token)]);
-            self.run(
-                "INSERT OR IGNORE INTO revoked(token) VALUES(?)",
-                vec![text(&token)],
-            );
-        }
-    }
-    /// Whether a live process holds the token `hash`.
-    fn token_live(&self, ns: &str, hash: &str) -> bool {
-        self.any(
-            "SELECT pid FROM processes WHERE ns = ? AND token = ? AND state != 'zombie' LIMIT 1",
-            vec![text(ns), text(hash)],
-        )
-    }
-    /// Reparent to the nearest living ancestor subreaper, or init.
-    fn orphan(&mut self, ns: &str, pid: u32) {
-        let mut ancestor = self.process(ns, pid).map(|p| p.ppid).unwrap_or(INIT);
-        let mut adopter = INIT;
-        for _ in 0..abi::PROC_MAX {
-            if ancestor == INIT {
-                break;
-            }
-            let Some(row) = self.process(ns, ancestor) else {
-                break;
-            };
-            if !row.zombie() && row.subreaper != 0 {
-                adopter = row.pid;
-                break;
-            }
-            ancestor = row.ppid;
-        }
-        let reaper = adopter != INIT || self.init_active(ns);
-        let children = self.rows::<Row>(
-            &format!("SELECT {COLUMNS} FROM processes WHERE ns = ? AND ppid = ?"),
-            vec![text(ns), int(pid)],
-        );
-        for child in children {
-            if child.zombie() && !reaper {
-                self.remove(&child);
-            } else {
-                self.run(
-                    "UPDATE processes SET ppid = ? WHERE ns = ? AND pid = ?",
-                    vec![int(adopter), text(ns), int(child.pid)],
-                );
-                if child.zombie() {
-                    self.child_changed(&Row {
-                        ppid: adopter,
-                        ..child
-                    });
-                }
-            }
-        }
-    }
-    pub fn prctl(&mut self, row: &Row, option: u32, value: u32) -> Result<Value> {
-        match option {
-            36 => {
-                self.run(
-                    "UPDATE processes SET subreaper = ? WHERE ns = ? AND pid = ?",
-                    vec![int(u32::from(value != 0)), text(&row.ns), int(row.pid)],
-                );
-                Ok(json!(0))
-            }
-            37 if value == 0 => Ok(json!(row.subreaper)),
-            _ => Err(Errno::EINVAL.into()),
-        }
-    }
-    /// The process `row` is gone from the table, its token revoked unless another holds it.
-    fn remove(&mut self, row: &Row) {
-        let token = self.token_of(&row.ns, row.pid).unwrap_or_default();
-        self.run(
-            "DELETE FROM processes WHERE ns = ? AND pid = ?",
-            vec![text(&row.ns), int(row.pid)],
-        );
-        self.run("DELETE FROM leases WHERE pid = ?", vec![int(row.pid)]);
-        self.revoke_unheld(&row.ns, &token);
-        self.prune_cgroups(&row.ns);
-    }
-    /// waitpid(2): the zombie `pid`, now reaped, or EAGAIN while it runs, or ECHILD when it is
-    /// no child of `parent` (none: the client kernel, which waits as init).
-    pub fn wait(&mut self, ns: &str, parent: Option<u32>, pid: u32) -> Result<Proc> {
-        let row = self.process(ns, pid).ok_or(Errno::ECHILD)?;
-        if pid == INIT || parent.is_some_and(|parent| row.ppid != parent) {
-            return Err(Errno::ECHILD.into());
-        }
-        if !row.zombie() {
-            return Err(Errno::EAGAIN.into());
-        }
-        self.remove(&row);
-        Ok(row.proc())
-    }
-    /// A host's wait: prove possession of this zombie's token, or act as its account/root.
-    /// Without a token the caller waits only for init's children, never another parent's.
-    pub fn reap(
-        &mut self,
-        ns: &str,
-        cred: Option<&Identity>,
-        pid: u32,
-        token: Option<&str>,
-    ) -> Result<Proc> {
-        let row = self.process(ns, pid).ok_or(Errno::ECHILD)?;
-        if let Some(token) = token {
-            if self.token_of(ns, pid).as_deref() != Some(crate::auth::token_hash(token).as_str()) {
-                return Err(Errno::EPERM.into());
-            }
-        } else {
-            let cred = cred.ok_or(Errno::EPERM)?;
-            if !registry::may_manage_process(cred, row.uid) {
-                return Err(Errno::EPERM.into());
-            }
-            if row.ppid != INIT {
-                return Err(Errno::ECHILD.into());
-            }
-        }
-        self.wait(ns, None, pid)
-    }
-    pub fn kill_targets(
-        &mut self,
-        ns: &str,
-        cred: &Identity,
-        caller: Option<&Row>,
-        target: abi::Target<'_>,
-        signal: u8,
-        now: u64,
-    ) -> Result<()> {
-        if signal > 31 {
-            return Err(Errno::EINVAL.into());
-        }
-        let own_group = if matches!(target, abi::Target::Pid(0)) {
-            Some(caller.ok_or(Errno::EPERM)?.pgid)
-        } else {
-            None
-        };
-        let rows: Vec<_> = self
-            .processes(ns)
-            .into_iter()
-            .filter(|row| {
-                !row.zombie()
-                    && match target {
-                        abi::Target::Pid(0) => Some(row.pgid) == own_group,
-                        abi::Target::Pid(pid) => row.pid == pid,
-                        abi::Target::Group(pgid) => row.pid != INIT && row.pgid == pgid,
-                        abi::Target::All => {
-                            row.pid != INIT && caller.is_none_or(|caller| row.pid != caller.pid)
-                        }
-                        abi::Target::Job(_) => false,
-                    }
-            })
-            .collect();
-        if rows.is_empty() {
-            return Err(Errno::ESRCH.into());
-        }
-        let mut permitted = false;
-        for row in rows {
-            if registry::may_manage_process(cred, row.uid)
-                || signal == SIGCONT && caller.is_some_and(|caller| caller.sid == row.sid)
-            {
-                self.kill(ns, &row.identity(), row.pid, signal, now)?;
-                permitted = true;
-            }
-        }
-        if permitted {
-            Ok(())
-        } else {
-            Err(Errno::EPERM.into())
-        }
-    }
-    /// Authorize and queue catchable signals for the process host. Only SIGKILL
-    /// ends credentials immediately; STOP/CONT also update the registry state.
-    /// A signal from another account needs root.
-    pub fn kill(
-        &mut self,
-        ns: &str,
-        cred: &Identity,
-        pid: u32,
-        signal: u8,
-        now: u64,
-    ) -> Result<()> {
-        let row = self.process(ns, pid).ok_or(Errno::ESRCH)?;
-        if cred.id != 0 && cred.id != row.uid {
-            return Err(Errno::EPERM.into());
-        }
-        if row.zombie() {
-            return Err(Errno::ESRCH.into());
-        }
-        if signal > 31 {
-            return Err(Errno::EINVAL.into());
-        }
-        // Init ignores signals without handlers, including SIGKILL.
-        if pid == INIT || signal == 0 {
-            return Ok(());
-        }
-        if signal == SIGCONT {
-            self.run(
-                "DELETE FROM pending_signals WHERE pid = ? AND signal IN (19, 20, 21, 22)",
-                vec![int(pid)],
-            );
-        } else if matches!(signal, 19..=22) {
-            self.run(
-                "DELETE FROM pending_signals WHERE pid = ? AND signal = 18",
-                vec![int(pid)],
-            );
-        }
-        if signal != SIGKILL {
-            self.run(
-                "INSERT OR IGNORE INTO pending_signals(pid, signal) VALUES(?, ?)",
-                vec![int(pid), int(signal)],
-            );
-        }
-        match signal {
-            SIGKILL => {
-                self.end(&row, abi::signal_status(signal), Some(signal), now);
-                Ok(())
-            }
-            SIGSTOP => self.stopped(&row, signal),
-            SIGCONT => {
-                self.run(
-                    "UPDATE processes SET state = 'running', wait_event = 65535 WHERE ns = ? AND pid = ? AND state = 'stopped'",
-                    vec![text(ns), int(pid)],
-                );
-                if row.state == "stopped" {
-                    self.child_changed(&row);
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-    /// The tab `seat` is gone: what it ran ended with it, as by SIGKILL, and is reaped (it was
-    /// init's, or is now). What it forked that another tab runs goes on, init's.
-    pub fn gone(&mut self, ns: &str, cred: &Identity, seat: &str, now: u64) -> Result<Vec<u32>> {
-        let rows = self.rows::<Row>(
-            &format!("SELECT {COLUMNS} FROM processes WHERE ns = ? AND seat = ? AND pid != 1"),
-            vec![text(ns), text(seat)],
-        );
-        // Check the entire seat before changing anything: a tab may hold multiple accounts'
-        // processes after login/logout, and its public lock name confers no authority.
-        if rows
-            .iter()
-            .any(|row| !registry::may_manage_process(cred, row.uid))
-        {
-            return Err(Errno::EPERM.into());
-        }
-        let mut reaped = Vec::new();
-        for row in &rows {
-            if !row.zombie() {
-                self.end(row, abi::signal_status(SIGKILL), Some(SIGKILL), now);
-            }
-        }
-        for row in rows {
-            // Its parent may be gone with it, which made it init's.
-            if let Some(now) = self.process(ns, row.pid)
-                && now.ppid == INIT
-            {
-                self.remove(&now);
-                reaped.push(row.pid);
-            }
-        }
-        Ok(reaped)
-    }
-    /// The tabs whose processes still run, and the kernels that hold pids they were lent.
-    pub fn seats(&self, ns: &str, cred: &Identity) -> Value {
-        #[derive(Deserialize)]
-        struct Seat {
-            seat: String,
-        }
-        #[derive(Deserialize)]
-        struct Kernel {
-            kernel: String,
-        }
-        let seats: Vec<String> = self
-            .rows::<Seat>(
-                "SELECT DISTINCT seat FROM processes WHERE ns = ? AND seat IS NOT NULL AND state != 'zombie' AND (uid = ? OR ? = 0) ORDER BY seat",
-                vec![text(ns), int(cred.id), int(cred.id)],
-            )
-            .into_iter()
-            .map(|row| row.seat)
-            .collect();
-        let kernels: Vec<String> = self
-            .rows::<Kernel>(
-                "SELECT DISTINCT COALESCE(kernel, '') AS kernel FROM spare WHERE owner = ? OR ? = 0 ORDER BY kernel",
-                vec![int(cred.id), int(cred.id)],
-            )
-            .into_iter()
-            .map(|row| row.kernel)
-            .collect();
-        json!({ "seats": seats, "kernels": kernels })
-    }
-    /// What the processes `pids` (all of `ns` if none) are now, as /proc shows them. A process
-    /// sees its own account's; root sees the namespace's.
-    pub fn poll(&self, ns: &str, pids: &[u32], cred: &Identity) -> Vec<Proc> {
-        let rows = if pids.is_empty() {
-            self.processes(ns)
-        } else {
-            pids.iter()
-                .filter_map(|pid| self.process(ns, *pid))
-                .collect()
-        };
-        rows.into_iter()
-            .filter(|row| cred.id == 0 || row.uid == cred.id || row.pid == INIT)
-            .map(|row| row.proc())
-            .collect()
-    }
-
-    // ---- cgroups ----
-
-    fn cgroup(&self, ns: &str, path: &str) -> Option<Cgroup> {
-        self.rows::<Cgroup>(
-            "SELECT ns, path, parent, controllers, cpu_max, cpu_weight, memory_max, pids_max, io_max, freeze, devices, owner FROM cgroups WHERE ns = ? AND path = ?",
-            vec![text(ns), text(path)],
-        )
-        .into_iter()
-        .next()
-    }
-    fn ensure_cgroup(&mut self, ns: &str, path: &str, owner: u32) {
-        // The root's parent is the empty string, so that it is nobody's child, its own included
-        // (a listing of "/" would otherwise name "/" among its children).
-        let parent = if path == "/" {
-            ""
-        } else {
-            os_core::parent(path)
-        };
-        if self.cgroup(ns, path).is_none() {
-            self.run(
-                "INSERT INTO cgroups(ns, path, parent, controllers, cpu_max, cpu_weight, memory_max, pids_max, io_max, freeze, devices, owner) VALUES(?, ?, ?, '', NULL, 100, NULL, NULL, NULL, 0, '', ?)",
-                vec![text(ns), text(path), text(parent), int(owner)],
-            );
-        }
-    }
-    /// mkdir(2) of a cgroup, as `cred`, enabling `controllers` for its subtree: it is its
-    /// maker's (`registry::may_create`).
-    pub fn cgroup_create(
-        &mut self,
-        ns: &str,
-        cred: &Identity,
-        path: &str,
-        controllers: Option<&str>,
-        lifetime: Option<&Row>,
-    ) -> Result<()> {
-        self.ensure_namespace(ns, crate::auth::now());
-        let path = cgroup_path(path);
-        if path.len() > 4096
-            || path
-                .split('/')
-                .skip(1)
-                .any(|part| part.is_empty() || matches!(part, "." | "..") || part.contains('\0'))
-        {
-            return Err(Errno::EINVAL.into());
-        }
-        let parent = os_core::parent(&path);
-        let Some(above) = self.cgroup(ns, parent) else {
-            return Err(Errno::ENOENT.into());
-        };
-        if self.cgroup(ns, &path).is_some() {
-            return Err(Errno::EEXIST.into());
-        }
-        if !registry::may_create(cred, parent, above.owner) {
-            return Err(Errno::EACCES.into());
-        }
-        self.cgroup_available(ns, parent)?;
-        if let Some(owner) = lifetime {
-            self.check_cgroup_lifetime(owner, &path)?;
-        }
-        let controllers = registry::controllers(controllers.unwrap_or_default())?;
-        self.ensure_cgroup(ns, &path, cred.id);
-        if let Some(owner) = lifetime {
-            self.bind_cgroup(owner, &path);
-        }
-        self.run(
-            "UPDATE cgroups SET controllers = ? WHERE ns = ? AND path = ?",
-            vec![text(&controllers), text(ns), text(&path)],
-        );
-        Ok(())
-    }
-    /// rmdir(2) of a cgroup: its maker's or root's, once nothing is in it.
-    pub fn cgroup_remove(&mut self, ns: &str, cred: &Identity, path: &str) -> Result<()> {
-        let path = cgroup_path(path);
-        if ROOT_CGROUPS.contains(&path.as_str()) || path == "/" {
-            return Err(Errno::EBUSY.into());
-        }
-        let cgroup = self.cgroup(ns, &path).ok_or(Errno::ENOENT)?;
-        if !registry::may_write(cred, cgroup.owner) {
-            return Err(Errno::EACCES.into());
-        }
-        if self.processes(ns).iter().any(|row| row.cgroup == path) {
-            return Err(Errno::EBUSY.into());
-        }
-        if !self.cgroup_list(ns, &path).is_empty() {
-            return Err(Errno::ENOTEMPTY.into());
-        }
-        self.run(
-            "DELETE FROM cgroups WHERE ns = ? AND path = ?",
-            vec![text(ns), text(&path)],
-        );
-        Ok(())
-    }
-    /// A write of one of a cgroup's control files: its maker's or root's.
-    pub fn cgroup_set(
-        &mut self,
-        ns: &str,
-        cred: &Identity,
-        path: &str,
-        key: &str,
-        value: &str,
-        now: u64,
-    ) -> Result<()> {
-        let path = cgroup_path(path);
-        let cgroup = self.cgroup(ns, &path).ok_or(Errno::ENOENT)?;
-        if !registry::may_write(cred, cgroup.owner) {
-            return Err(Errno::EACCES.into());
-        }
-        if key == "cgroup.kill" {
-            if path == "/" || value.trim() != "1" {
-                return Err(Errno::EINVAL.into());
-            }
-            self.kill_cgroup(ns, &path, now);
-            return Ok(());
-        }
-        let mut updated = cgroup.clone();
-        match key {
-            "cpu.max" => {
-                let value = value.trim();
-                // cgroup v2's "$MAX [$PERIOD]": a quota or "max", and a period, if given.
-                let parts: Vec<&str> = value.split_whitespace().collect();
-                let quota = parts
-                    .first()
-                    .is_some_and(|quota| *quota == "max" || quota.parse::<u64>().is_ok());
-                let period = parts
-                    .get(1)
-                    .is_none_or(|period| period.parse::<u64>().is_ok());
-                if !quota || !period || parts.len() > 2 {
-                    return Err(Errno::EINVAL.into());
-                }
-                if parts[0] != "max" {
-                    return Err(Errno::EOPNOTSUPP.into());
-                }
-                updated.cpu_max = Some(value.to_string());
-            }
-            "cpu.weight" => {
-                let weight: u32 = value.trim().parse().map_err(|_| Errno::EINVAL)?;
-                if !(1..=10000).contains(&weight) {
-                    return Err(Errno::EINVAL.into());
-                }
-                if weight != 100 {
-                    return Err(Errno::EOPNOTSUPP.into());
-                }
-                updated.cpu_weight = weight;
-            }
-            "memory.max" => {
-                let value = value.trim();
-                if value != "max" && value.parse::<u64>().is_err() {
-                    return Err(Errno::EINVAL.into());
-                }
-                if value != "max" && self.memory_untracked(ns, &path) != 0 {
-                    return Err(Error::because(
-                        Errno::EOPNOTSUPP,
-                        "live legacy processes have no memory accounting",
-                    ));
-                }
-                updated.memory_max = Some(value.to_string());
-            }
-            "pids.max" => {
-                let value = value.trim();
-                if value == "max" {
-                    updated.pids_max = None;
-                } else {
-                    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-                        return Err(Errno::EINVAL.into());
-                    }
-                    updated.pids_max = Some(value.parse().map_err(|_| Errno::EINVAL)?);
-                }
-            }
-            "io.max" => {
-                kernel::resource::IoLimit::parse(value.trim())?;
-                updated.io_max = Some(value.trim().to_string());
-            }
-            "cgroup.freeze" => {
-                updated.freeze = match value.trim() {
-                    "0" => 0,
-                    "1" => return Err(Errno::EOPNOTSUPP.into()),
-                    _ => return Err(Errno::EINVAL.into()),
-                };
-            }
-            "devices.allow" | "devices.deny" => {
-                if updated.devices.lines().count() >= registry::DEVICE_RULES_MAX {
-                    return Err(Error::because(
-                        Errno::ENOSPC,
-                        format!(
-                            "a cgroup keeps at most {} device rules",
-                            registry::DEVICE_RULES_MAX
-                        ),
-                    ));
-                }
-                updated.devices.push_str(key);
-                updated.devices.push(' ');
-                updated.devices.push_str(value.trim());
-                updated.devices.push('\n');
-            }
-            _ => return Err(Errno::EINVAL.into()),
-        }
-        self.run(
-            "UPDATE cgroups SET cpu_max = ?, cpu_weight = ?, memory_max = ?, pids_max = ?, io_max = ?, freeze = ?, devices = ? WHERE ns = ? AND path = ?",
-            vec![
-                updated.cpu_max.clone().map_or(SqlStorageValue::Null, |v| text(&v)),
-                int(updated.cpu_weight),
-                updated.memory_max.clone().map_or(SqlStorageValue::Null, |v| text(&v)),
-                updated.pids_max.map_or(SqlStorageValue::Null, int),
-                updated.io_max.clone().map_or(SqlStorageValue::Null, |v| text(&v)),
-                int(updated.freeze),
-                text(&updated.devices),
-                text(ns),
-                text(&path),
-            ],
-        );
-        Ok(())
-    }
-    /// A write of the process `pid` to the cgroup's `cgroup.procs`: as `registry::may_attach`.
-    pub fn cgroup_attach(&mut self, ns: &str, cred: &Identity, pid: u32, path: &str) -> Result<()> {
-        let path = cgroup_path(path);
-        let cgroup = self.cgroup(ns, &path).ok_or(Errno::ENOENT)?;
-        self.cgroup_available(ns, &path)?;
-        let row = self.process(ns, pid).ok_or(Errno::ESRCH)?;
-        if row.zombie() {
-            return Err(Errno::ESRCH.into());
-        }
-        if !registry::may_attach(cred, row.uid, &path, cgroup.owner) {
-            return Err(Errno::EACCES.into());
-        }
-        self.admit_pid(ns, &path, Some(&row.cgroup))?;
-        let usage = self.resource_usage(pid);
-        self.resource_admit(
-            ns,
-            &path,
-            usage.as_ref().map(|u| u.runtime.as_str()),
-            usage.as_ref().map_or(0, |u| u.memory),
-            Some(&row.cgroup),
+        sql.exec("CREATE INDEX instances_ns ON instances(ns, expires)", None)?;
+        sql.exec(
+            "CREATE TABLE service_tokens(token_hash TEXT PRIMARY KEY, ns TEXT NOT NULL, instance_id TEXT NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, lineage TEXT NOT NULL, cgroup TEXT NOT NULL, scope TEXT NOT NULL, cloud_access INTEGER NOT NULL, expires INTEGER NOT NULL)",
+            None,
         )?;
-        self.run(
-            "UPDATE processes SET cgroup = ? WHERE ns = ? AND pid = ?",
-            vec![text(&path), text(ns), int(pid)],
-        );
-        Ok(())
+        sql.exec(
+            "CREATE INDEX service_tokens_instance ON service_tokens(ns, instance_id)",
+            None,
+        )?;
+        sql.exec(
+            "CREATE TABLE pending_revocations(token_hash TEXT PRIMARY KEY, ns TEXT NOT NULL, created INTEGER NOT NULL)",
+            None,
+        )?;
+        sql.exec(
+            "CREATE TABLE io_quotas(token_hash TEXT PRIMARY KEY, ns TEXT NOT NULL, instance_id TEXT NOT NULL, cgroup TEXT NOT NULL, rbps INTEGER, wbps INTEGER)",
+            None,
+        )?;
+        sql.exec(
+            "CREATE INDEX io_quotas_bucket ON io_quotas(ns, instance_id, cgroup)",
+            None,
+        )?;
+        sql.exec(
+            "CREATE TABLE io_buckets(ns TEXT NOT NULL, instance_id TEXT NOT NULL, cgroup TEXT NOT NULL, read_end INTEGER NOT NULL DEFAULT 0, write_end INTEGER NOT NULL DEFAULT 0, read_bytes INTEGER NOT NULL DEFAULT 0, write_bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (ns, instance_id, cgroup))",
+            None,
+        )?;
+        sql.exec(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES('machine_schema', ?)",
+            Some(vec![text(&expected)]),
+        )?;
     }
-    /// Admitted rows include loading processes and unreaped zombies. Unused PID
-    /// numbers and execs still being authorized are not group members.
-    fn pids_current(&self, ns: &str, path: &str) -> usize {
-        self.processes(ns)
-            .iter()
-            .filter(|p| registry::in_subtree(&p.cgroup, path))
-            .count()
-    }
-    /// Only ancestors gaining a member need capacity during migration. The same
-    /// transaction checks and inserts/moves the row, so no separate credits leak.
-    fn admit_pid(&self, ns: &str, path: &str, from: Option<&str>) -> Result<()> {
-        #[derive(Deserialize)]
-        struct Limit {
-            path: String,
-            pids_max: usize,
-        }
-        let limits = self.rows::<Limit>(
-            "SELECT path, pids_max FROM cgroups WHERE ns = ? AND pids_max IS NOT NULL",
-            vec![text(ns)],
-        );
-        let processes = self.processes(ns);
-        for limit in limits {
-            if registry::in_subtree(path, &limit.path)
-                && !from.is_some_and(|old| registry::in_subtree(old, &limit.path))
-                && processes
-                    .iter()
-                    .filter(|p| registry::in_subtree(&p.cgroup, &limit.path))
-                    .count()
-                    >= limit.pids_max
-            {
-                return Err(Error::because(
-                    Errno::EAGAIN,
-                    format!("pids.max reached at {}", limit.path),
-                ));
-            }
-        }
-        Ok(())
-    }
-    pub fn cgroup_stat(&self, ns: &str, path: &str) -> Result<Value> {
-        let path = cgroup_path(path);
-        let cgroup = self.cgroup(ns, &path).ok_or(Errno::ENOENT)?;
-        let processes: Vec<u32> = self
-            .processes(ns)
-            .iter()
-            .filter(|row| row.cgroup == path)
-            .map(|row| row.pid)
-            .collect();
-        Ok(json!({
-            "path": cgroup.path,
-            "parent": cgroup.parent,
-            "controllers": cgroup.controllers,
-            "cpu.max": cgroup.cpu_max,
-            "cpu.weight": cgroup.cpu_weight,
-            "memory.max": cgroup.memory_max,
-            "pids.max": cgroup.pids_max,
-            "pids.current": self.pids_current(ns, &path),
-            "resource.enforced": if self.memory_untracked(ns, &path) == 0 { vec!["pids.max", "memory.max", "io.max"] } else { vec!["pids.max", "io.max"] },
-            "io.scope": "authorized filesystem byte transfers; rbps/wbps admission pacing, at most 30 seconds reserved; excludes metadata, local devices and compiler work",
-            "io.stat": self.io_usage(ns, &path),
-            "resource.unsupported": ["cpu.max", "cpu.weight", "cgroup.freeze"],
-            "memory.scope": "WASM linear memory, including runtime scratch; excludes host heap, tables, compiled code and retained GC backing stores",
-            "memory.current": self.memory_current(ns, &path),
-            "memory.untracked": self.memory_untracked(ns, &path),
-            "io.max": cgroup.io_max,
-            "cgroup.freeze": if cgroup.freeze != 0 { "1" } else { "0" },
-            "devices": cgroup.devices,
-            "owner": cgroup.owner,
-            "cgroup.procs": processes,
-            "children": self.cgroup_list(ns, &path),
-            "subtree.procs": self.processes(ns).iter().filter(|p| registry::in_subtree(&p.cgroup, &path)).map(|p| p.pid).collect::<Vec<_>>(),
-            "lifetime": self.cgroup_lifetime(ns, &path),
-        }))
-    }
-    pub fn cgroup_list(&self, ns: &str, path: &str) -> Vec<String> {
-        let path = cgroup_path(path);
-        self.rows::<Cgroup>(
-            "SELECT ns, path, parent, controllers, cpu_max, cpu_weight, memory_max, pids_max, io_max, freeze, devices, owner FROM cgroups WHERE ns = ? AND parent = ? ORDER BY path",
-            vec![text(ns), text(&path)],
-        )
-        .into_iter()
-        .map(|child| child.path)
-        .collect()
-    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[allow(dead_code)]
-struct Cgroup {
-    ns: String,
-    path: String,
-    parent: String,
-    controllers: String,
-    cpu_max: Option<String>,
-    cpu_weight: u32,
-    memory_max: Option<String>,
-    pids_max: Option<u32>,
-    io_max: Option<String>,
-    freeze: i64,
-    devices: String,
-    owner: u32,
+pub struct InstanceRow {
+    pub instance_id: String,
+    pub ns: String,
+    pub host: String,
+    pub host_proof_hash: String,
+    pub host_epoch: u64,
+    pub expires: u64,
+    pub updated: u64,
 }
 
-/// A cgroup path as cgroup v2 writes one: absolute, its subtree's name relative to it.
-fn cgroup_path(path: &str) -> String {
-    if path == "/" {
-        return "/".into();
+#[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct ServiceTokenRow {
+    pub token_hash: String,
+    pub ns: String,
+    pub instance_id: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub lineage: String,
+    pub cgroup: String,
+    pub scope: String,
+    pub cloud_access: u8,
+    pub expires: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PendingRevocation {
+    pub token_hash: String,
+    pub ns: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct IoQuotaRow {
+    pub token_hash: String,
+    pub ns: String,
+    pub instance_id: String,
+    pub cgroup: String,
+    pub rbps: Option<u64>,
+    pub wbps: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct IoBucketRow {
+    pub ns: String,
+    pub instance_id: String,
+    pub cgroup: String,
+    pub read_end: u64,
+    pub write_end: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+}
+
+#[derive(Deserialize)]
+struct MinRatesRow {
+    min_rbps: Option<u64>,
+    min_wbps: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct CountRow {
+    n: usize,
+}
+
+#[derive(Deserialize)]
+struct MinRow {
+    min_exp: Option<u64>,
+}
+
+impl Db {
+    /// Attach or renew an instance lease with strict single-host `host_proof` fencing.
+    /// Presenting a mismatched or stale `host_proof` for a live `instance_id` fails closed
+    /// with `ESTALE` (same namespace) or `EACCES` (cross-namespace).
+    pub fn attach_instance(
+        &mut self,
+        ns: &str,
+        instance_id: &str,
+        host: &str,
+        host_proof: &str,
+        now: u64,
+    ) -> Result<InstanceRow, Error> {
+        let proof_hash = auth::token_hash(host_proof);
+        let expires = now.saturating_add(INSTANCE_LEASE_SECONDS);
+        if let Some(existing) = self
+            .rows::<InstanceRow>(
+                "SELECT * FROM instances WHERE instance_id = ?",
+                vec![text(instance_id)],
+            )
+            .pop()
+        {
+            if existing.expires > now {
+                if existing.ns != ns {
+                    return Err(Error::because(
+                        Errno::EACCES,
+                        "instance_id is bound to another session",
+                    ));
+                }
+                if existing.host_proof_hash != proof_hash {
+                    return Err(Error::because(
+                        Errno::ESTALE,
+                        "instance_id is fenced to another live host",
+                    ));
+                }
+                self.run(
+                    "UPDATE instances SET host = ?, expires = ?, updated = ? WHERE instance_id = ?",
+                    vec![text(host), int(expires), int(now), text(instance_id)],
+                );
+                return Ok(InstanceRow {
+                    host: host.to_string(),
+                    expires,
+                    updated: now,
+                    ..existing
+                });
+            }
+            // Expired previous host: queue all of its tokens for revocation before taking over.
+            self.queue_instance_revocations(&existing.ns, instance_id, now);
+            let next_epoch = existing.host_epoch.saturating_add(1);
+            self.run(
+                "UPDATE instances SET ns = ?, host = ?, host_proof_hash = ?, host_epoch = ?, expires = ?, updated = ? WHERE instance_id = ?",
+                vec![
+                    text(ns),
+                    text(host),
+                    text(&proof_hash),
+                    int(next_epoch),
+                    int(expires),
+                    int(now),
+                    text(instance_id),
+                ],
+            );
+            return Ok(InstanceRow {
+                instance_id: instance_id.to_string(),
+                ns: ns.to_string(),
+                host: host.to_string(),
+                host_proof_hash: proof_hash,
+                host_epoch: next_epoch,
+                expires,
+                updated: now,
+            });
+        }
+
+        let count = self
+            .rows::<CountRow>(
+                "SELECT COUNT(*) AS n FROM instances WHERE ns = ? AND expires > ?",
+                vec![text(ns), int(now)],
+            )
+            .pop()
+            .map_or(0, |r| r.n);
+        if count >= INSTANCES_MAX {
+            return Err(Errno::ENOSPC.into());
+        }
+        self.run(
+            "INSERT INTO instances(instance_id, ns, host, host_proof_hash, host_epoch, expires, updated) VALUES(?, ?, ?, ?, 1, ?, ?)",
+            vec![
+                text(instance_id),
+                text(ns),
+                text(host),
+                text(&proof_hash),
+                int(expires),
+                int(now),
+            ],
+        );
+        Ok(InstanceRow {
+            instance_id: instance_id.to_string(),
+            ns: ns.to_string(),
+            host: host.to_string(),
+            host_proof_hash: proof_hash,
+            host_epoch: 1,
+            expires,
+            updated: now,
+        })
     }
-    if path.starts_with('/') {
-        path.trim_end_matches('/').to_string()
-    } else {
-        format!("/{}", path.trim_end_matches('/'))
+
+    /// Verify that `(ns, instance_id, host_proof)` names a currently live, fenced host.
+    pub fn verify_instance(
+        &self,
+        ns: &str,
+        instance_id: &str,
+        host_proof: &str,
+        now: u64,
+    ) -> Result<InstanceRow, Error> {
+        let row = self
+            .rows::<InstanceRow>(
+                "SELECT * FROM instances WHERE instance_id = ?",
+                vec![text(instance_id)],
+            )
+            .pop()
+            .ok_or_else(|| Error::because(Errno::EACCES, "unknown or detached instance"))?;
+        if row.ns != ns {
+            return Err(Error::because(
+                Errno::EACCES,
+                "instance_id does not belong to this session",
+            ));
+        }
+        if row.expires <= now {
+            return Err(Error::because(Errno::ESTALE, "instance lease expired"));
+        }
+        if row.host_proof_hash != auth::token_hash(host_proof) {
+            return Err(Error::because(
+                Errno::EACCES,
+                "forged or stale host_proof for instance",
+            ));
+        }
+        Ok(row)
+    }
+
+    pub fn active_service_token_count(&self, ns: &str, now: u64) -> usize {
+        self.rows::<CountRow>(
+            "SELECT COUNT(*) AS n FROM service_tokens WHERE ns = ? AND expires > ?",
+            vec![text(ns), int(now)],
+        )
+        .pop()
+        .map_or(0, |r| r.n)
+    }
+
+    pub fn queue_orphan_revocation(&mut self, ns: &str, token_hash: &str, now: u64) {
+        self.run(
+            "INSERT OR IGNORE INTO pending_revocations(token_hash, ns, created) VALUES(?, ?, ?)",
+            vec![text(token_hash), text(ns), int(now)],
+        );
+    }
+
+    /// Record a freshly minted or derived remote service credential bound to `(ns, instance_id)`
+    /// and atomically initialize its `io_quotas` entry & cgroup pacing bucket (zero unthrottled window).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_service_token(
+        &mut self,
+        ns: &str,
+        instance_id: &str,
+        raw_token: &str,
+        uid: u32,
+        gid: u32,
+        lineage: &str,
+        cgroup: &str,
+        scope: &RemoteScope,
+        cloud_access: bool,
+        expires: u64,
+        rbps: Option<u64>,
+        wbps: Option<u64>,
+        now: u64,
+    ) -> Result<String, Error> {
+        if self.active_service_token_count(ns, now) >= SERVICE_TOKENS_MAX {
+            return Err(Errno::ENOSPC.into());
+        }
+        let hash = auth::token_hash(raw_token);
+        let scope_json = serde_json::to_string(scope).map_err(|_| Errno::EIO)?;
+        self.run(
+            "INSERT OR REPLACE INTO service_tokens(token_hash, ns, instance_id, uid, gid, lineage, cgroup, scope, cloud_access, expires) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                text(&hash),
+                text(ns),
+                text(instance_id),
+                int(uid),
+                int(gid),
+                text(lineage),
+                text(cgroup),
+                text(&scope_json),
+                int(u8::from(cloud_access)),
+                int(expires),
+            ],
+        );
+        let rbps_val = rbps.map_or(SqlStorageValue::Null, int);
+        let wbps_val = wbps.map_or(SqlStorageValue::Null, int);
+        self.run(
+            "INSERT INTO io_quotas(token_hash, ns, instance_id, cgroup, rbps, wbps) VALUES(?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(token_hash) DO UPDATE SET cgroup = excluded.cgroup, rbps = excluded.rbps, wbps = excluded.wbps",
+            vec![
+                text(&hash),
+                text(ns),
+                text(instance_id),
+                text(cgroup),
+                rbps_val,
+                wbps_val,
+            ],
+        );
+        self.run(
+            "INSERT OR IGNORE INTO io_buckets(ns, instance_id, cgroup) VALUES(?, ?, ?)",
+            vec![text(ns), text(instance_id), text(cgroup)],
+        );
+        Ok(hash)
+    }
+
+    pub fn service_token_for_instance(
+        &self,
+        ns: &str,
+        instance_id: &str,
+        raw_token: &str,
+        now: u64,
+    ) -> Option<ServiceTokenRow> {
+        let hash = auth::token_hash(raw_token);
+        self.rows::<ServiceTokenRow>(
+            "SELECT * FROM service_tokens WHERE token_hash = ? AND ns = ? AND instance_id = ? AND expires > ?",
+            vec![text(&hash), text(ns), text(instance_id), int(now)],
+        )
+        .pop()
+    }
+
+    pub fn service_token_by_raw(
+        &self,
+        ns: &str,
+        raw_token: &str,
+        now: u64,
+    ) -> Option<ServiceTokenRow> {
+        let hash = auth::token_hash(raw_token);
+        self.rows::<ServiceTokenRow>(
+            "SELECT * FROM service_tokens WHERE token_hash = ? AND ns = ? AND expires > ?",
+            vec![text(&hash), text(ns), int(now)],
+        )
+        .pop()
+    }
+
+    /// Verify `(ns, instance_id, host_proof)` and collect `(raw, hash)` pairs for tokens currently
+    /// owned by this instance WITHOUT extending any expiry before `OsAuthority` confirms renewal.
+    pub fn collect_owned_tokens(
+        &self,
+        ns: &str,
+        instance_id: &str,
+        host_proof: &str,
+        active_tokens: &[String],
+        now: u64,
+    ) -> Result<Vec<(String, String)>, Error> {
+        self.verify_instance(ns, instance_id, host_proof, now)?;
+        let mut owned = Vec::new();
+        for raw in active_tokens {
+            let hash = auth::token_hash(raw);
+            let exists = !self
+                .rows::<ServiceTokenRow>(
+                    "SELECT * FROM service_tokens WHERE token_hash = ? AND ns = ? AND instance_id = ? AND expires > ?",
+                    vec![text(&hash), text(ns), text(instance_id), int(now)],
+                )
+                .is_empty();
+            if exists {
+                owned.push((raw.clone(), hash));
+            }
+        }
+        Ok(owned)
+    }
+
+    /// Commit an instance lease & token renewal ONLY AFTER `OsAuthority` confirmed live tokens.
+    pub fn commit_instance_renewal(
+        &mut self,
+        ns: &str,
+        instance_id: &str,
+        host_proof: &str,
+        live_hashes: &[String],
+        dead_hashes: &[String],
+        now: u64,
+    ) -> Result<(), Error> {
+        self.verify_instance(ns, instance_id, host_proof, now)?;
+        let inst_expires = now.saturating_add(INSTANCE_LEASE_SECONDS);
+        let tok_expires = now.saturating_add(abi::PROCESS_TOKEN_TTL);
+        self.run(
+            "UPDATE instances SET expires = ?, updated = ? WHERE instance_id = ? AND ns = ?",
+            vec![int(inst_expires), int(now), text(instance_id), text(ns)],
+        );
+        for hash in live_hashes {
+            self.run(
+                "UPDATE service_tokens SET expires = ? WHERE token_hash = ? AND ns = ? AND instance_id = ?",
+                vec![int(tok_expires), text(hash), text(ns), text(instance_id)],
+            );
+        }
+        for hash in dead_hashes {
+            self.drop_service_token_hash(ns, hash);
+        }
+        Ok(())
+    }
+
+    pub fn drop_service_token_hash(&mut self, ns: &str, token_hash: &str) {
+        self.run(
+            "DELETE FROM service_tokens WHERE token_hash = ? AND ns = ?",
+            vec![text(token_hash), text(ns)],
+        );
+        self.run(
+            "DELETE FROM io_quotas WHERE token_hash = ? AND ns = ?",
+            vec![text(token_hash), text(ns)],
+        );
+    }
+
+    /// Queue explicit token revocations owned by `(ns, instance_id)` into `pending_revocations`.
+    pub fn queue_token_revocations(
+        &mut self,
+        ns: &str,
+        instance_id: &str,
+        raw_tokens: &[String],
+        now: u64,
+    ) -> usize {
+        let mut count = 0usize;
+        for raw in raw_tokens {
+            let hash = auth::token_hash(raw);
+            let deleted = self.rows::<ServiceTokenRow>(
+                "DELETE FROM service_tokens WHERE token_hash = ? AND ns = ? AND instance_id = ? RETURNING *",
+                vec![text(&hash), text(ns), text(instance_id)],
+            );
+            if !deleted.is_empty() {
+                count += 1;
+                self.run(
+                    "DELETE FROM io_quotas WHERE token_hash = ? AND ns = ?",
+                    vec![text(&hash), text(ns)],
+                );
+                self.run(
+                    "INSERT OR IGNORE INTO pending_revocations(token_hash, ns, created) VALUES(?, ?, ?)",
+                    vec![text(&hash), text(ns), int(now)],
+                );
+            }
+        }
+        count
+    }
+
+    /// Queue revocation of EVERY token belonging to `(ns, instance_id)` (used on detach & host-loss expiry).
+    pub fn queue_instance_revocations(&mut self, ns: &str, instance_id: &str, now: u64) -> usize {
+        let rows = self.rows::<ServiceTokenRow>(
+            "DELETE FROM service_tokens WHERE ns = ? AND instance_id = ? RETURNING *",
+            vec![text(ns), text(instance_id)],
+        );
+        let count = rows.len();
+        for row in rows {
+            self.run(
+                "INSERT OR IGNORE INTO pending_revocations(token_hash, ns, created) VALUES(?, ?, ?)",
+                vec![text(&row.token_hash), text(&row.ns), int(now)],
+            );
+        }
+        self.run(
+            "DELETE FROM io_quotas WHERE ns = ? AND instance_id = ?",
+            vec![text(ns), text(instance_id)],
+        );
+        self.run(
+            "DELETE FROM io_buckets WHERE ns = ? AND instance_id = ?",
+            vec![text(ns), text(instance_id)],
+        );
+        count
+    }
+
+    pub fn detach_instance(
+        &mut self,
+        ns: &str,
+        instance_id: &str,
+        host_proof: &str,
+        now: u64,
+    ) -> Result<usize, Error> {
+        self.verify_instance(ns, instance_id, host_proof, now)?;
+        let revoked = self.queue_instance_revocations(ns, instance_id, now);
+        self.run(
+            "DELETE FROM instances WHERE instance_id = ? AND ns = ?",
+            vec![text(instance_id), text(ns)],
+        );
+        Ok(revoked)
+    }
+
+    /// Expire lost hosts & stale tokens, queueing their tokens into `pending_revocations`.
+    pub fn expire_machine_leases(&mut self, now: u64) -> usize {
+        let expired_instances = self.rows::<InstanceRow>(
+            "DELETE FROM instances WHERE expires <= ? RETURNING *",
+            vec![int(now)],
+        );
+        let mut count = 0usize;
+        for inst in expired_instances {
+            count += self.queue_instance_revocations(&inst.ns, &inst.instance_id, now);
+        }
+        let expired_tokens = self.rows::<ServiceTokenRow>(
+            "DELETE FROM service_tokens WHERE expires <= ? RETURNING *",
+            vec![int(now)],
+        );
+        for tok in expired_tokens {
+            count += 1;
+            self.run(
+                "DELETE FROM io_quotas WHERE token_hash = ? AND ns = ?",
+                vec![text(&tok.token_hash), text(&tok.ns)],
+            );
+            self.run(
+                "INSERT OR IGNORE INTO pending_revocations(token_hash, ns, created) VALUES(?, ?, ?)",
+                vec![text(&tok.token_hash), text(&tok.ns), int(now)],
+            );
+        }
+        count
+    }
+
+    fn carry_bucket_debt(
+        &mut self,
+        ns: &str,
+        instance_id: &str,
+        from_cgroup: &str,
+        to_cgroup: &str,
+    ) {
+        self.run(
+            "INSERT OR IGNORE INTO io_buckets(ns, instance_id, cgroup) VALUES(?, ?, ?)",
+            vec![text(ns), text(instance_id), text(to_cgroup)],
+        );
+        if from_cgroup == to_cgroup {
+            return;
+        }
+        if let Some(src) = self
+            .rows::<IoBucketRow>(
+                "SELECT * FROM io_buckets WHERE ns = ? AND instance_id = ? AND cgroup = ?",
+                vec![text(ns), text(instance_id), text(from_cgroup)],
+            )
+            .pop()
+        {
+            self.run(
+                "UPDATE io_buckets SET read_end = MAX(read_end, ?), write_end = MAX(write_end, ?) WHERE ns = ? AND instance_id = ? AND cgroup = ?",
+                vec![
+                    int(src.read_end),
+                    int(src.write_end),
+                    text(ns),
+                    text(instance_id),
+                    text(to_cgroup),
+                ],
+            );
+        }
+    }
+
+    /// Configure or clear server-side remote `io.max` policy for a live token owned by `(ns, instance_id)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_remote_io_quota(
+        &mut self,
+        ns: &str,
+        instance_id: &str,
+        host_proof: &str,
+        raw_token: &str,
+        cgroup: &str,
+        rbps: Option<u64>,
+        wbps: Option<u64>,
+        now: u64,
+    ) -> Result<(), Error> {
+        self.verify_instance(ns, instance_id, host_proof, now)?;
+        let tok = self
+            .service_token_for_instance(ns, instance_id, raw_token, now)
+            .ok_or_else(|| Error::because(Errno::EACCES, "unknown service token for instance"))?;
+        let prev_cg = self
+            .rows::<IoQuotaRow>(
+                "SELECT * FROM io_quotas WHERE token_hash = ? AND ns = ?",
+                vec![text(&tok.token_hash), text(ns)],
+            )
+            .pop()
+            .map(|r| r.cgroup);
+        let rbps_val = rbps.map_or(SqlStorageValue::Null, int);
+        let wbps_val = wbps.map_or(SqlStorageValue::Null, int);
+        self.run(
+            "INSERT INTO io_quotas(token_hash, ns, instance_id, cgroup, rbps, wbps) VALUES(?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(token_hash) DO UPDATE SET cgroup = excluded.cgroup, rbps = excluded.rbps, wbps = excluded.wbps",
+            vec![
+                text(&tok.token_hash),
+                text(ns),
+                text(instance_id),
+                text(cgroup),
+                rbps_val,
+                wbps_val,
+            ],
+        );
+        self.carry_bucket_debt(
+            ns,
+            instance_id,
+            prev_cg.as_deref().unwrap_or(&tok.cgroup),
+            cgroup,
+        );
+        Ok(())
+    }
+
+    pub fn io_quota_of(&self, ns: &str, token_hash: &str) -> Option<IoQuotaRow> {
+        self.rows::<IoQuotaRow>(
+            "SELECT * FROM io_quotas WHERE token_hash = ? AND ns = ?",
+            vec![text(token_hash), text(ns)],
+        )
+        .pop()
+    }
+
+    /// Atomically inherit any existing `io_quotas` policy and cgroup pacing debt from `parent_row`
+    /// onto a derived token so `reexec` / `DeriveServiceCred` can never escape server-side `io.max`
+    /// or reset pacing debt (even when `revoke_parent` already dropped the parent's row).
+    #[allow(clippy::too_many_arguments)]
+    pub fn inherit_remote_io_quota_from(
+        &mut self,
+        ns: &str,
+        instance_id: &str,
+        parent_row: Option<&IoQuotaRow>,
+        new_raw: &str,
+        cgroup: &str,
+        override_rbps: Option<u64>,
+        override_wbps: Option<u64>,
+    ) {
+        let new_hash = auth::token_hash(new_raw);
+        let (parent_cg, eff_rbps, eff_wbps) = match parent_row {
+            Some(p) => (
+                p.cgroup.as_str(),
+                min_opt_rate(p.rbps, override_rbps),
+                min_opt_rate(p.wbps, override_wbps),
+            ),
+            None => (cgroup, override_rbps, override_wbps),
+        };
+        let rbps_val = eff_rbps.map_or(SqlStorageValue::Null, int);
+        let wbps_val = eff_wbps.map_or(SqlStorageValue::Null, int);
+        self.run(
+            "INSERT INTO io_quotas(token_hash, ns, instance_id, cgroup, rbps, wbps) VALUES(?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(token_hash) DO UPDATE SET cgroup = excluded.cgroup, rbps = excluded.rbps, wbps = excluded.wbps",
+            vec![
+                text(&new_hash),
+                text(ns),
+                text(instance_id),
+                text(cgroup),
+                rbps_val,
+                wbps_val,
+            ],
+        );
+        self.carry_bucket_debt(ns, instance_id, parent_cg, cgroup);
+    }
+
+    /// Enforce server-side remote `io.max` pacing/rate limits bucketed by `(ns, instance_id, cgroup)`
+    /// against the strictest limit in the bucket and the server-side ceiling floor.
+    pub fn charge_remote_io(
+        &mut self,
+        ns: &str,
+        raw_token: &str,
+        write: bool,
+        bytes: u64,
+        now_secs: u64,
+        now_ms: u64,
+    ) -> Result<u64, Error> {
+        let tok = self
+            .service_token_by_raw(ns, raw_token, now_secs)
+            .ok_or_else(|| {
+                Error::because(Errno::EPERM, "service token not registered or expired")
+            })?;
+        // Verify owning instance is still attached & live (host-loss enforcement!).
+        let live_inst = !self
+            .rows::<InstanceRow>(
+                "SELECT * FROM instances WHERE instance_id = ? AND ns = ? AND expires > ?",
+                vec![text(&tok.instance_id), text(ns), int(now_secs)],
+            )
+            .is_empty();
+        if !live_inst {
+            return Err(Error::because(
+                Errno::EACCES,
+                "owning instance lease has expired",
+            ));
+        }
+        let quota_cg = self
+            .rows::<IoQuotaRow>(
+                "SELECT * FROM io_quotas WHERE token_hash = ? AND ns = ?",
+                vec![text(&tok.token_hash), text(ns)],
+            )
+            .pop()
+            .map_or(tok.cgroup, |q| q.cgroup);
+        // Aggregate the strictest client rate across ALL tokens sharing `(ns, instance_id, cgroup)`,
+        // clamped by `SERVER_IO_CEILING_BPS` so clients can never bypass or multiply bandwidth N×.
+        let min_rates = self
+            .rows::<MinRatesRow>(
+                "SELECT MIN(rbps) AS min_rbps, MIN(wbps) AS min_wbps FROM io_quotas WHERE ns = ? AND instance_id = ? AND cgroup = ?",
+                vec![text(ns), text(&tok.instance_id), text(&quota_cg)],
+            )
+            .pop();
+        let client_rate = min_rates.and_then(|r| if write { r.min_wbps } else { r.min_rbps });
+        let rate = Some(effective_server_io_rate(client_rate));
+        self.run(
+            "INSERT OR IGNORE INTO io_buckets(ns, instance_id, cgroup) VALUES(?, ?, ?)",
+            vec![text(ns), text(&tok.instance_id), text(&quota_cg)],
+        );
+        let bucket = self
+            .rows::<IoBucketRow>(
+                "SELECT * FROM io_buckets WHERE ns = ? AND instance_id = ? AND cgroup = ?",
+                vec![text(ns), text(&tok.instance_id), text(&quota_cg)],
+            )
+            .pop()
+            .ok_or(Errno::EIO)?;
+        let prev = if write {
+            bucket.write_end
+        } else {
+            bucket.read_end
+        };
+        let end = kernel::resource::io_deadline(now_ms, prev, rate, bytes)?;
+        let (col_end, col_bytes) = if write {
+            ("write_end", "write_bytes")
+        } else {
+            ("read_end", "read_bytes")
+        };
+        self.run(
+            &format!(
+                "UPDATE io_buckets SET {col_end} = ?, {col_bytes} = {col_bytes} + ? WHERE ns = ? AND instance_id = ? AND cgroup = ?"
+            ),
+            vec![
+                int(end),
+                int(bytes),
+                text(ns),
+                text(&tok.instance_id),
+                text(&quota_cg),
+            ],
+        );
+        Ok(end.saturating_sub(now_ms))
+    }
+
+    pub fn pending_revocations(&self) -> Vec<PendingRevocation> {
+        self.rows(
+            "SELECT token_hash, ns FROM pending_revocations ORDER BY created LIMIT 256",
+            vec![],
+        )
+    }
+
+    pub fn clear_revocations(&mut self, ns: &str, hashes: &[String]) {
+        for hash in hashes {
+            self.run(
+                "DELETE FROM pending_revocations WHERE token_hash = ? AND ns = ?",
+                vec![text(hash), text(ns)],
+            );
+        }
+    }
+
+    pub fn next_machine_expiry(&self) -> Option<u64> {
+        let a = self
+            .rows::<MinRow>("SELECT MIN(expires) AS min_exp FROM instances", vec![])
+            .pop()
+            .and_then(|r| r.min_exp);
+        let b = self
+            .rows::<MinRow>("SELECT MIN(expires) AS min_exp FROM service_tokens", vec![])
+            .pop()
+            .and_then(|r| r.min_exp);
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, y) => x.or(y),
+        }
     }
 }

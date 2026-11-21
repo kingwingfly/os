@@ -610,7 +610,7 @@ test('ImageFs mounts validated private extensions at /opt/private/<name>, enforc
   const dirEntry = path => ({ path, uid: 0, gid: 0, mode: 0o755, node: { type: 'directory' } });
   const validManifest = {
     format: 'os.image',
-    version: 1,
+    version: 2,
     kind: 'sysext',
     name: 'devtools',
     revision: '1',
@@ -622,7 +622,7 @@ test('ImageFs mounts validated private extensions at /opt/private/<name>, enforc
       dirEntry('/'),
       dirEntry('/usr'),
       dirEntry('/usr/bin'),
-      { path: '/usr/bin/probe', uid: 0, gid: 0, mode: 0o755, node: { type: 'file', sha256: hash, size: WASM_HEADER.length } },
+      { path: '/usr/bin/probe', uid: 0, gid: 0, mode: 0o755, node: { type: 'file', sha256: hash, size: WASM_HEADER.length, chunk_size: 262144, chunks: [hash] } },
       { path: '/usr/bin/probe-link', uid: 0, gid: 0, mode: 0o777, node: { type: 'symlink', target: '/usr/bin/probe' } },
     ],
   };
@@ -817,49 +817,102 @@ test('unshare(CLONE_NEWNS) and setns enforce privilege, reject forged/non-ns/sha
   assert.equal(await h.readText(400, '/tmp/ns-only/inside.txt'), 'ns401');
 });
 
-function mockAdmissions(t, firstPid, uid, denyPid) {
-  const previous = globalThis.kernelSys;
+function syncLocalAccount(k, uid) {
+  const user = uid === 0 ? 'root' : `user${uid}`;
+  k.sync_account(JSON.stringify({
+    uid, gid: uid, groups: [uid], user, group: user,
+    home: uid === 0 ? '/root' : `/home/${user}`, shell: '/usr/bin/dash', signed_in: uid !== 65534,
+  }));
+}
+
+function mockRemoteAuthAndDevices(t, uid) {
+  const prevAuth = globalThis.serviceAuthPost;
+  const prevCloud = globalThis.cloudFsPost;
   const events = [];
-  let pid = firstPid, nextDevice = 0;
-  const tokens = new Map();
-  globalThis.kernelSys = async raw => {
+  let seq = 0, nextDevice = 0;
+  const tokens = new Set();
+  globalThis.serviceAuthPost = async raw => {
+    const req = JSON.parse(raw);
+    events.push({ auth: req });
+    if (req.attach_instance) {
+      return JSON.stringify({
+        status: 200,
+        text: JSON.stringify({
+          attached: {
+            version: 2,
+            instance_id: req.attach_instance.instance.instance,
+            lease_seconds: 1800,
+            host_epoch: 1,
+          },
+        }),
+      });
+    }
+    if (req.mint_service_cred || req.derive_service_cred) {
+      const m = req.mint_service_cred ?? req.derive_service_cred;
+      const token = (`${(++seq).toString(16)}`).padStart(64, 'a');
+      tokens.add(token);
+      if (req.derive_service_cred?.revoke_parent) tokens.delete(req.derive_service_cred.parent_token);
+      return JSON.stringify({
+        status: 200,
+        text: JSON.stringify({
+          cred: {
+            version: 2,
+            token,
+            uid,
+            gid: uid,
+            groups: [uid],
+            umask: m.umask ?? 0o022,
+            cloud_access: m.cloud_access !== false,
+            scope: m.scope ?? { cloud_fs: true, devices: ['archive', 'media', 'present', 'snd'], containers: true, relay: true },
+            expires: Math.floor(Date.now() / 1000) + 3600,
+            instance_id: m.instance_id,
+            lineage: 'lin-1',
+          },
+        }),
+      });
+    }
+    if (req.revoke_tokens) {
+      for (const tok of req.revoke_tokens.tokens) tokens.delete(tok);
+      return JSON.stringify({ status: 200, text: JSON.stringify({ revoked: { count: req.revoke_tokens.tokens.length } }) });
+    }
+    return JSON.stringify({ status: 200, text: JSON.stringify({ ok: null }) });
+  };
+  globalThis.cloudFsPost = async (path, headers, body) => {
+    if (path === '/api/fs') {
+      return { status: 404, body: new TextEncoder().encode(JSON.stringify({ errno: 'ENOENT' })) };
+    }
+    assert.equal(path, '/api/sys');
+    const raw = new TextDecoder().decode(body);
     const batch = JSON.parse(raw);
+    assert.equal(headers['X-Process-Token'], batch.proc);
+    assert.ok(tokens.has(batch.proc), 'remote token must be active');
     const results = batch.calls.map(call => {
       events.push(call);
-      if (call.execve) {
-        const admitted = call.execve.pid ?? pid++;
-        const token = (call.execve.pid == null ? 'proc-' : 'exec-') + admitted;
-        tokens.set(admitted, token);
-        return { ok: { pid: admitted, token, path: call.execve.path,
-          asset: call.execve.path + '.wasm', size: 8, cgroup: '/',
-          placement: { cluster: '', executor: 'browser', cgroup: '/' } } };
-      }
-      if (call === 'getcreds') {
-        assert.equal(batch.proc, tokens.get(batch.pid));
-        if (batch.pid === denyPid || batch.proc === denyPid) return { err: { errno: 'EACCES' } };
-        return { ok: { uid, gid: uid, groups: [uid], user: 'user', group: 'user',
-          group_names: ['user'], home: '/', signed_in: true, can_sudo: false, sudo_active: false } };
-      }
-      if (call.open || call.close) {
-        assert.equal(batch.proc, tokens.get(batch.pid));
-        if (call.open) return { ok: { fd: nextDevice++, size: 0, device: 'archive' } };
-      }
+      if (call.open) return { ok: { fd: nextDevice++, size: 0, device: 'archive' } };
       return { ok: null };
     });
-    return JSON.stringify({ status: 200, text: JSON.stringify({ results }) });
+    return { status: 200, body: new TextEncoder().encode(JSON.stringify({ results })) };
   };
-  t.after(() => { if (previous) globalThis.kernelSys = previous; else delete globalThis.kernelSys; });
+  t.after(() => {
+    if (prevAuth) globalThis.serviceAuthPost = prevAuth; else delete globalThis.serviceAuthPost;
+    if (prevCloud) globalThis.cloudFsPost = prevCloud; else delete globalThis.cloudFsPost;
+  });
   return events;
 }
 
 test('failed credential admission exits and reaps every successful pipeline stage', async t => {
   const { k } = createHarness(t);
-  const events = mockAdmissions(t, 601, 1000, 602);
-  const stages = [1, 2, 3].map(() => ({ path: '/usr/bin/true', argv: ['true'], env: [] }));
+  syncLocalAccount(k, 1000);
+  // Stage 2 requests a nonexistent session namespace -> VFS registration fails with EPERM/ENOENT;
+  // all admitted stages must be exited and reaped from LocalProcessTable with zero leaks.
+  const stages = [
+    { path: '/usr/bin/true', argv: ['true'], env: [] },
+    { path: '/usr/bin/true', argv: ['true'], env: [], sessionId: 'no-such-session', serviceGrant: { mountNamespace: 'session', bindMounts: [] } },
+    { path: '/usr/bin/true', argv: ['true'], env: [] },
+  ];
   await assert.rejects(k.execs(JSON.stringify(stages), false, '', 'host'));
-  for (const key of ['exit', 'wait']) {
-    assert.deepEqual(events.filter(c => c[key]).map(c => Number(c[key].pid)), [601, 602, 603]);
-  }
+  const remaining = JSON.parse(await k.poll('[]'));
+  assert.deepEqual(remaining.map(p => p.pid), [1]);
 });
 
 test('only an authorized supervisor outside a chroot can grant a namespace to its child', async t => {
@@ -869,76 +922,76 @@ test('only an authorized supervisor outside a chroot can grant a namespace to it
   h.fork(610, 611);
   const grant = JSON.stringify({ mountNamespace: 'system', bindMounts: [] });
   await expectErrno(() => k.proc_apply_service_grant(611, 610, grant), 'EPERM');
-  mockAdmissions(t, 612, 0);
+  syncLocalAccount(k, 0);
   const stages = [{ path: '/usr/bin/supervise', argv: ['supervise'], env: [] }];
-  assert.equal(JSON.parse(await k.execs(JSON.stringify(stages), false, '', 'host'))[0].ok.pid, 612);
-  k.proc_authorize_service_grant(612);
-  await k.proc_mkdirat(612, OS_FD_ROOT, '/tmp/service-root', 0o755);
-  await k.sys_chroot(612, '/tmp/service-root');
-  h.fork(612, 613);
-  await expectErrno(() => k.proc_apply_service_grant(613, 612, grant), 'EPERM');
+  const supPid = JSON.parse(await k.execs(JSON.stringify(stages), false, '', 'host'))[0].ok.pid;
+  assert.ok(supPid > 1);
+  k.proc_authorize_service_grant(supPid);
+  await k.proc_mkdirat(supPid, OS_FD_ROOT, '/tmp/service-root', 0o755);
+  await k.sys_chroot(supPid, '/tmp/service-root');
+  h.fork(supPid, 613);
+  await expectErrno(() => k.proc_apply_service_grant(613, supPid, grant), 'EPERM');
   await expectErrno(() => k.proc_statat(613, OS_FD_ROOT, '/usr', true), 'ENOENT');
 });
 
 test('an ordinary supervise image may grant default, session and isolated namespaces to its own account', async t => {
   const h = createHarness(t), { k } = h;
   await h.beginSession('ordinary', 1000);
-  mockAdmissions(t, 614, 1000);
+  syncLocalAccount(k, 1000);
   const [admission] = JSON.parse(await k.execs(JSON.stringify([{
     path: '/usr/bin/supervise', argv: ['supervise'], env: [], sessionId: 'ordinary',
   }]), false, '', 'host'));
-  assert.equal(admission.ok.pid, 614);
+  const supPid = admission.ok.pid;
+  assert.ok(supPid > 1);
   for (const [index, mountNamespace] of ['', 'session', 'isolated'].entries()) {
     const child = 700 + index;
-    const inherited = h.fork(614, child);
-    const granted = await k.proc_apply_service_grant(child, 614, JSON.stringify({ mountNamespace }));
+    const inherited = h.fork(supPid, child);
+    const granted = await k.proc_apply_service_grant(child, supPid, JSON.stringify({ mountNamespace }));
     assert.equal(granted.nsId === inherited.nsId, mountNamespace === '');
-    await expectErrno(() => k.proc_apply_service_grant(child, 614, '{"mountNamespace":"system"}'), 'EPERM');
+    await expectErrno(() => k.proc_apply_service_grant(child, supPid, '{"mountNamespace":"system"}'), 'EPERM');
     k.proc_set_creds(child, 2000, 2000, new Uint32Array([2000]), undefined, true);
-    await expectErrno(() => k.proc_apply_service_grant(child, 614, '{}'), 'EPERM');
+    await expectErrno(() => k.proc_apply_service_grant(child, supPid, '{}'), 'EPERM');
   }
 });
 
 test('a credential failure after authority exec ends the replaced image', async t => {
   const { k } = createHarness(t);
-  mockAdmissions(t, 615, 0, 'exec-615');
+  syncLocalAccount(k, 0);
+  mockRemoteAuthAndDevices(t, 0);
   const path = '/usr/bin/true';
-  await k.execs(JSON.stringify([{ path, argv: ['true'], env: [] }]), false, '', 'host');
-  await assert.rejects(k.reexec(615, 'null', path, '["true"]', '[]', '/', '', 'host'),
-    { errno: 'EACCES', execCommitted: true });
-  await expectErrno(() => k.proc_statat(615, OS_FD_ROOT, '/', true), 'ESRCH');
-  await k.wait(615, 'host');
+  const pid = JSON.parse(await k.execs(JSON.stringify([{ path, argv: ['true'], env: [], remote: true }]), false, '', 'host'))[0].ok.pid;
+  await k.attach_remote_device('archive', pid, 'host');
+  await k.proc_openat(pid, OS_FD_ROOT, '/dev/archive', O_RDWR, 0, true);
+  // Fail remote cloexec close after local reexec commits -> reexec rejects with execCommitted and exits the process.
+  globalThis.cloudFsPost = async () => ({ status: 503, body: new Uint8Array() });
+  await assert.rejects(k.reexec(pid, 'null', path, '["true"]', '[]', '/', '', 'host'),
+    err => err?.execCommitted === true);
+  await expectErrno(() => k.proc_statat(pid, OS_FD_ROOT, '/', true), 'ESRCH');
+  await k.wait(pid, 'host');
 });
 
 test('exec closes the final close-on-exec device mapping on the authority', async t => {
   const { k } = createHarness(t);
-  const events = mockAdmissions(t, 620, 1000);
+  syncLocalAccount(k, 1000);
+  const events = mockRemoteAuthAndDevices(t, 1000);
   const path = '/usr/bin/true';
-  await k.execs(JSON.stringify([{ path, argv: ['true'], env: [] }]), false, '', 'host');
-  const device = await k.proc_openat(620, OS_FD_ROOT, '/dev/archive', O_RDWR, 0, true);
+  const pid = JSON.parse(await k.execs(JSON.stringify([{ path, argv: ['true'], env: [], remote: true }]), false, '', 'host'))[0].ok.pid;
+  await k.attach_remote_device('archive', pid, 'host');
+  const device = await k.proc_openat(pid, OS_FD_ROOT, '/dev/archive', O_RDWR, 0, true);
   assert.equal(device.serverDev, true);
-  const kept = k.kfd_dup(620, device.kfd);
-  const second = await k.proc_openat(620, OS_FD_ROOT, '/dev/archive', O_RDWR, 0, false);
-  const previous = globalThis.cloudFsPost;
-  globalThis.cloudFsPost = async (path, headers, body) => {
-    assert.equal(path, '/api/sys');
-    const raw = new TextDecoder().decode(body);
-    assert.equal(headers['X-Process-Token'], JSON.parse(raw).proc);
-    const reply = JSON.parse(await globalThis.kernelSys(raw));
-    return { status: reply.status, body: new TextEncoder().encode(reply.text) };
-  };
-  t.after(() => { if (previous) globalThis.cloudFsPost = previous; else delete globalThis.cloudFsPost; });
-  await k.reexec(620, 'null', path, '["true"]', '[]', '/', '', 'host');
+  const kept = k.kfd_dup(pid, device.kfd);
+  const second = await k.proc_openat(pid, OS_FD_ROOT, '/dev/archive', O_RDWR, 0, false);
+  await k.reexec(pid, 'null', path, '["true"]', '[]', '/', '', 'host');
   assert.equal(events.filter(c => c.close).length, 0);
-  assert.equal(k.kfd_is_cloexec(620, kept), false);
+  assert.equal(k.kfd_is_cloexec(pid, kept), false);
   const transport = globalThis.cloudFsPost;
   globalThis.cloudFsPost = async () => ({ status: 503, body: new Uint8Array() });
-  await assert.rejects(k.kfd_close(620, kept));
+  await assert.rejects(k.kfd_close(pid, kept));
   globalThis.cloudFsPost = transport;
-  await k.kfd_close(620, kept);
+  await k.kfd_close(pid, kept);
   assert.deepEqual(events.filter(c => c.close).map(c => c.close.fd), [0]);
-  k.kfd_set_cloexec(620, second.kfd, true);
-  await k.reexec(620, 'null', path, '["true"]', '[]', '/', '', 'host');
+  k.kfd_set_cloexec(pid, second.kfd, true);
+  await k.reexec(pid, 'null', path, '["true"]', '[]', '/', '', 'host');
   assert.deepEqual(events.filter(c => c.close).map(c => c.close.fd), [0, 1]);
 });
 
@@ -947,18 +1000,19 @@ test('top-level admission applies binds and logout evicts executable tickets on 
   const { k } = h;
   const sid = 'login-with-isolated-service';
   await h.beginSession(sid, 0);
+  syncLocalAccount(k, 0);
   await h.spawn({ pid: 630, uid: 0, gid: 0, groups: [0] });
   await k.proc_mkdirat(630, OS_FD_ROOT, '/tmp/service-run', 0o755);
   await h.writeText(630, '/run/tool', '\x00asm\x01\x00\x00\x00', 0o755);
-  mockAdmissions(t, 631, 0);
   const grant = { mountNamespace: 'isolated', bindMounts: [{ source: '/run', target: '/tmp/service-run', readOnly: true }] };
   const stage = { path: '/usr/bin/true', argv: ['true'], env: [], sessionId: sid, serviceGrant: grant };
   const [admitted] = JSON.parse(await k.execs(JSON.stringify([stage]), false, '', 'host'));
-  assert.equal(admitted.ok.pid, 631);
-  await expectErrno(() => k.proc_openat(631, OS_FD_ROOT, '/tmp/service-run/tool', O_WRONLY, 0, false), 'EROFS');
+  const pid = admitted.ok.pid;
+  assert.ok(pid > 1);
+  await expectErrno(() => k.proc_openat(pid, OS_FD_ROOT, '/tmp/service-run/tool', O_WRONLY, 0, false), 'EROFS');
   const tickets = [];
   for (let stage = 0; stage < 40; stage++) {
-    const { execTicket } = await k.proc_resolve_exec(631, '/run/tool', '["tool"]', '/usr/bin', false);
+    const { execTicket } = await k.proc_resolve_exec(pid, '/run/tool', '["tool"]', '/usr/bin', false);
     tickets.push(execTicket);
   }
   for (const ticket of tickets.slice(0, -1)) {
@@ -1111,17 +1165,18 @@ test('Contract 4 serviceGrant (system/isolated/session), streamed vfs_open_read,
   }), opfsStore);
 
   // Root setup in session + supervisor process running in system_namespace while retaining session attribution
-  mockAdmissions(t, 500, 1000);
+  syncLocalAccount(k, 1000);
   const admitted = await k.execs(JSON.stringify([{ path: '/usr/bin/supervise', argv: ['supervise'], env: [],
     sessionId: 'sess-svc', serviceGrant: { mountNamespace: 'session', bindMounts: [] } }]), false, '', 'host');
-  assert.equal(JSON.parse(admitted)[0].ok.pid, 500);
-  await h.writeText(500, '/mnt/local/proj/hello.txt', 'from-session');
-  const appFd = await k.proc_openat(500, OS_FD_ROOT, '/mnt/local/proj/app.wasm', O_RDWR | O_CREAT | O_TRUNC, 0o755, false);
-  await k.kfd_write(500, appFd.kfd, new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02]));
-  await k.kfd_close(500, appFd.kfd);
+  const supPid = JSON.parse(admitted)[0].ok.pid;
+  assert.ok(supPid > 1);
+  await h.writeText(supPid, '/mnt/local/proj/hello.txt', 'from-session');
+  const appFd = await k.proc_openat(supPid, OS_FD_ROOT, '/mnt/local/proj/app.wasm', O_RDWR | O_CREAT | O_TRUNC, 0o755, false);
+  await k.kfd_write(supPid, appFd.kfd, new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02]));
+  await k.kfd_close(supPid, appFd.kfd);
 
   // One-shot execTicket + non-consuming checkOnly
-  const resolved = await k.proc_resolve_exec(500, '/mnt/local/proj/app.wasm', JSON.stringify(['app.wasm']), '/usr/bin', false);
+  const resolved = await k.proc_resolve_exec(supPid, '/mnt/local/proj/app.wasm', JSON.stringify(['app.wasm']), '/usr/bin', false);
   assert.ok(resolved.execTicket, 'expected execTicket');
   assert.ok(k.take_local_exec_bytes(resolved.execTicket, true), 'checkOnly must report live without consuming ticket');
   const took = k.take_local_exec_bytes(resolved.execTicket, false);
@@ -1137,8 +1192,8 @@ test('Contract 4 serviceGrant (system/isolated/session), streamed vfs_open_read,
   );
 
   // Forked child inheriting an open kfd switches to "session" + read-only bindMount and retains kfd
-  const openDir = await k.proc_openat(500, OS_FD_ROOT, '/mnt/local/proj', O_RDONLY | O_DIRECTORY, 0, false);
-  h.fork(500, 502, 0);
+  const openDir = await k.proc_openat(supPid, OS_FD_ROOT, '/mnt/local/proj', O_RDONLY | O_DIRECTORY, 0, false);
+  h.fork(supPid, 502, 0);
   await k.proc_spawn_init(JSON.stringify({
     pid: 503,
     ppid: 1,
@@ -1150,15 +1205,15 @@ test('Contract 4 serviceGrant (system/isolated/session), streamed vfs_open_read,
   // user-owned target (/tmp/svc-ro created by uid 1000) succeeds while keeping inherited kfd.
   await k.proc_mkdirat(503, OS_FD_ROOT, '/tmp/root-only-svc', 0o755);
   await expectErrno(
-    () => k.proc_apply_service_grant(502, 500, JSON.stringify({
+    () => k.proc_apply_service_grant(502, supPid, JSON.stringify({
       mountNamespace: 'session',
       bindMounts: [{ source: '/mnt/local/proj', target: '/tmp/root-only-svc', readOnly: true }],
     })),
     'EPERM',
   );
-  await k.proc_mkdirat(500, OS_FD_ROOT, '/tmp/svc-ro', 0o755);
+  await k.proc_mkdirat(supPid, OS_FD_ROOT, '/tmp/svc-ro', 0o755);
 
-  await k.proc_apply_service_grant(502, 500, JSON.stringify({
+  await k.proc_apply_service_grant(502, supPid, JSON.stringify({
     mountNamespace: 'session',
     bindMounts: [{ source: '/mnt/local/proj', target: '/tmp/svc-ro', readOnly: true }],
   }));
@@ -1170,13 +1225,13 @@ test('Contract 4 serviceGrant (system/isolated/session), streamed vfs_open_read,
   // Inherited kfd survived namespace switch
   const fstatKeep = await k.kfd_fstat(502, openDir.kfd);
   assert.equal(fstatKeep.mode & 0o170000, 0o040000);
-  await k.kfd_close(500, openDir.kfd);
+  await k.kfd_close(supPid, openDir.kfd);
   await k.kfd_close(502, openDir.kfd);
 
   // An ordinary supervisor may inherit its namespace, but cannot select the system namespace.
-  h.fork(500, 504, 0);
-  await expectErrno(() => k.proc_apply_service_grant(504, 500, JSON.stringify({ mountNamespace: 'system' })), 'EPERM');
-  await k.proc_apply_service_grant(504, 500, JSON.stringify({}));
+  h.fork(supPid, 504, 0);
+  await expectErrno(() => k.proc_apply_service_grant(504, supPid, JSON.stringify({ mountNamespace: 'system' })), 'EPERM');
+  await k.proc_apply_service_grant(504, supPid, JSON.stringify({}));
   assert.equal(await h.readText(504, '/mnt/local/proj/hello.txt'), 'from-session');
 
   // Streamed vfs_open_read (> 256 KiB inline cutoff) + vfs_pwrite_chunk with chunkIndex
@@ -1196,26 +1251,26 @@ test('Contract 4 serviceGrant (system/isolated/session), streamed vfs_open_read,
 
   const pageSys = async (...calls) => JSON.parse(await k.vfs_sys('sess-svc', JSON.stringify({ calls }))).results;
   const saved = '/mnt/local/proj/existing.txt';
-  await h.writeText(500, saved, 'old');
+  await h.writeText(supPid, saved, 'old');
   const [conflict] = await pageSys({ open: { path: saved, flags: O_WRONLY | O_CREAT, size: 3 } });
   assert.equal(conflict.err.errno, 'EEXIST');
-  assert.equal(await h.readText(500, saved), 'old');
+  assert.equal(await h.readText(supPid, saved), 'old');
   const badUpload = path => ({ open: { path, flags: O_WRONLY | O_CREAT | O_TRUNC, size: 1, sha256: '0'.repeat(64) } });
   const [existing] = await pageSys(badUpload(saved));
   const [write] = await pageSys({ pwrite: { fd: existing.ok.fd, index: 0, data: btoa('x') } });
   assert.ok('ok' in write, JSON.stringify(write));
   const [failedClose] = await pageSys({ close: { fd: existing.ok.fd } });
   assert.equal(failedClose.err.errno, 'EIO');
-  assert.equal(await h.readText(500, saved), 'x');
+  assert.equal(await h.readText(supPid, saved), 'x');
   const created = '/mnt/local/proj/created.txt';
   const [fresh] = await pageSys(badUpload(created));
   await pageSys({ discard: { fd: fresh.ok.fd } });
   assert.equal((await pageSys({ stat: { path: created } }))[0].err.errno, 'ENOENT');
   const [replaced] = await pageSys(badUpload(created));
   await pageSys({ rename: { from: created, to: created + '.old' } });
-  await h.writeText(500, created, 'replacement');
+  await h.writeText(supPid, created, 'replacement');
   await pageSys({ discard: { fd: replaced.ok.fd } });
-  assert.equal(await h.readText(500, created), 'replacement');
+  assert.equal(await h.readText(supPid, created), 'replacement');
 
   const openedStream = await k.vfs_open_read('sess-svc', '/mnt/local/proj/big.bin', undefined, undefined, false, false);
   assert.ok(openedStream.streamId > 0);

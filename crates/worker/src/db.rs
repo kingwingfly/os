@@ -578,6 +578,7 @@ impl Db {
     pub fn observe(&mut self, name: &str, count: u64) {
         self.run("INSERT INTO observations(name, value) VALUES(?, ?) ON CONFLICT(name) DO UPDATE SET value = value + excluded.value", vec![text(name), int(count)]);
     }
+    #[allow(dead_code)]
     pub fn observations(&self) -> std::collections::BTreeMap<String, u64> {
         #[derive(Deserialize)]
         struct Counter {
@@ -591,6 +592,9 @@ impl Db {
     }
     /// Read an inode even after its last name was removed. Numbers are never recycled.
     pub(crate) fn inode(&self, ino: u64) -> Option<Node> {
+        if crate::system::immutable_inode(ino) {
+            return self.image.as_ref().and_then(|v| v.by_ino(ino));
+        }
         self.rows::<NodeRow>(
             "SELECT '' AS path, i.id AS ino, i.owner, i.grp, i.mode, i.directory, i.file, CAST(i.size AS TEXT) AS size, i.link, i.rdev, i.acl, i.default_acl, (SELECT COUNT(*) FROM nodes WHERE ino = i.id) AS links FROM inodes i WHERE i.id = ?",
             vec![int(ino)],
@@ -936,6 +940,7 @@ impl Db {
     /// A new descriptor of the process `proc` ("ns pid"), open for reading the executable `file`
     /// execve(2) found (fds::open_exec): its read token, stored hashed, revalidates with the X
     /// rule, so an x-only file runs; the page cannot name it.
+    #[allow(dead_code)]
     pub fn add_exec_fd(
         &mut self,
         sid: &str,
@@ -1243,6 +1248,14 @@ impl Db {
     }
     /// The names of the inode `ino`.
     pub(crate) fn names(&self, ino: u64) -> Vec<String> {
+        if crate::system::immutable_inode(ino) {
+            return self
+                .image
+                .as_ref()
+                .and_then(|v| v.path_of(ino))
+                .into_iter()
+                .collect();
+        }
         self.rows::<Key>(
             "SELECT path AS key FROM nodes WHERE ino = ?",
             vec![int(ino)],
@@ -1253,6 +1266,9 @@ impl Db {
     }
     /// Collect an inode and its content after the last name and open reference are gone.
     pub(crate) fn forget(&mut self, ino: u64) {
+        if crate::system::immutable_inode(ino) {
+            return;
+        }
         let held = self.rows::<serde_json::Value>(
             "SELECT 1 FROM nodes WHERE ino = ?1 UNION ALL SELECT 1 FROM vfs_opens WHERE ino = ?1 AND revoked = 0 UNION ALL SELECT 1 FROM fds WHERE ino = ?1 LIMIT 1",
             vec![int(ino)],
@@ -2107,12 +2123,17 @@ impl Store for Db {
         self.end_sessions("key = ?", vec![text(key)]);
     }
     fn delete_sessions(&mut self, user: u32) {
-        let credentials = self.rows::<crate::creds::Credential>(
+        let mut credentials = self.rows::<crate::creds::Credential>(
             &delete_sessions_credentials_sql(),
             vec![int(user), text(crate::creds::JOBS)],
         );
+        credentials.extend(self.rows::<crate::creds::Credential>(
+            &delete_sessions_controlled_credentials_sql(),
+            vec![text(crate::creds::JOBS), int(user)],
+        ));
+        let mut seen = std::collections::HashSet::new();
         for cred in credentials {
-            if cred.ns != crate::creds::JOBS {
+            if cred.ns != crate::creds::JOBS && seen.insert(cred.token.clone()) {
                 self.revoke(&cred.ns, &cred.token);
             }
         }
@@ -2221,6 +2242,14 @@ fn delete_sessions_credentials_sql() -> String {
     )
 }
 
+fn delete_sessions_controlled_credentials_sql() -> String {
+    format!(
+        "SELECT {} FROM credentials WHERE ns != ? AND {} IN (SELECT lineage FROM execution_owners WHERE uid = ?)",
+        crate::creds::columns(),
+        crate::creds::OWNER
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2230,5 +2259,15 @@ mod tests {
         let sql = delete_sessions_credentials_sql();
         assert!(sql.contains("WHERE uid = ? AND ns != ?"), "sql: {sql}");
         assert_eq!(crate::creds::JOBS, "jobs");
+    }
+
+    #[test]
+    fn delete_sessions_controlled_query_covers_sudo_owners_excluding_jobs() {
+        let sql = delete_sessions_controlled_credentials_sql();
+        assert!(sql.contains("WHERE ns != ?"), "sql: {sql}");
+        assert!(
+            sql.contains("SELECT lineage FROM execution_owners WHERE uid = ?"),
+            "sql: {sql}"
+        );
     }
 }

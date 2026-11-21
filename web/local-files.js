@@ -25,6 +25,52 @@ const ACCOUNT_MUTATION_CALLS = new Set([
   'groupadd', 'groupdel', 'groupmod', 'gpasswd', 'login_session', 'machine_init',
 ]);
 
+const SERVER_ACCOUNT_MUTATION_CALLS = new Set([
+  'login', 'logout', 'sudo', 'passwd', 'register', 'useradd', 'userdel', 'usermod',
+  'groupadd', 'groupdel', 'groupmod', 'gpasswd',
+]);
+
+function isRemoteServerDevPath(raw, includeDir = false) {
+  if (typeof raw !== 'string') return false;
+  const parts = [];
+  for (const seg of raw.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') parts.pop();
+    else parts.push(seg);
+  }
+  const norm = '/' + parts.join('/');
+  if (includeDir && (norm === '/dev/present' || norm === '/dev/snd')) return true;
+  return norm.startsWith('/dev/present/') || norm.startsWith('/dev/snd/');
+}
+
+const REMOTE_DEV_PATH_OPS = new Set([
+  'stat', 'lstat', 'getdents', 'mknod', 'unlink', 'getxattr', 'setxattr', 'listxattr', 'removexattr', 'open',
+]);
+const REMOTE_DEV_REF_OPS = new Set(['ioctl', 'close', 'fstat', 'pread', 'pwrite']);
+
+function isRemoteServerDevBatch(calls) {
+  if (!Array.isArray(calls) || calls.length === 0) return false;
+  const devOpenIndices = new Set();
+  for (let i = 0; i < calls.length; i++) {
+    const c = calls[i];
+    const name = callName(c);
+    const arg = typeof c === 'object' && c !== null ? Object.values(c)[0] : null;
+    if (!arg || typeof arg !== 'object') return false;
+    if (REMOTE_DEV_PATH_OPS.has(name)) {
+      if (!isRemoteServerDevPath(arg.path, name === 'getdents' || name === 'stat' || name === 'lstat')) {
+        return false;
+      }
+      if (name === 'open') devOpenIndices.add(i);
+    } else if (REMOTE_DEV_REF_OPS.has(name)) {
+      const ref = arg.fd && typeof arg.fd === 'object' ? arg.fd.ref : null;
+      if (typeof ref !== 'number' || !devOpenIndices.has(ref)) return false;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
 function callName(call) {
   return typeof call === 'string' ? call : (call && typeof call === 'object' ? Object.keys(call)[0] : '');
 }
@@ -86,18 +132,52 @@ export function installLocalFiles() {
     } catch { /* headless environment without Worker */ }
   }
 
+  let cookieBootstrap = null;
+  let sessionBootstrapped = false;
+  let lastSyncedKey = null;
+
+  async function serializedNetwork(send) {
+    if (!sessionBootstrapped) {
+      if (cookieBootstrap) {
+        await cookieBootstrap;
+        return send();
+      }
+      let release;
+      cookieBootstrap = new Promise(resolve => { release = resolve; });
+      try {
+        const res = await send();
+        sessionBootstrapped = true;
+        return res;
+      } finally {
+        cookieBootstrap = null;
+        release();
+      }
+    }
+    return send();
+  }
+
   globalThis.fetch = async (input, options) => {
     const request = new Request(input, options);
     const url = new URL(request.url);
     if (url.origin !== location.origin || !url.pathname.startsWith('/api/')) return network(request);
-    if (request.headers.get('X-Registry') === '1' || request.headers.has('X-Process-Token')) {
+    if (request.headers.has('X-Process-Token')) {
       return network(request);
     }
 
     try {
       // 1. Page `POST /api/sys` batches containing filesystem calls
       if (url.pathname === '/api/sys' && request.method === 'POST') {
-        const body = await request.clone().json();
+        const rawBody = typeof options?.body === 'string' ? options.body : await request.clone().text();
+        const body = JSON.parse(rawBody);
+        const sendSys = typeof input === 'string' && typeof options?.body === 'string'
+          ? () => network(input, options)
+          : () => network(request.url, {
+              method: request.method,
+              headers: request.headers,
+              body: rawBody,
+              credentials: request.credentials,
+              signal: request.signal,
+            });
         if (Array.isArray(body.calls) && body.calls.length > 0) {
           const hasFs = body.calls.some(c => FS_CALL_NAMES.has(callName(c)));
           const hasAccountMut = body.calls.some(c => ACCOUNT_MUTATION_CALLS.has(callName(c)));
@@ -105,7 +185,7 @@ export function installLocalFiles() {
             if (body.calls.some(touchesPrivateCarrier)) {
               return json({ error: 'process credentials are not page filesystem grants', errno: 'EACCES' }, 403);
             }
-            return network(request);
+            return sendSys();
           }
           // `hold` on a client page fd is a local no-op; on a server upload fd it goes to `/api/sys`.
           if (body.calls.length === 1 && callName(body.calls[0]) === 'hold') {
@@ -113,9 +193,12 @@ export function installLocalFiles() {
             if (typeof hfd === 'number' && hfd >= CLIENT_PAGE_FD_BASE) {
               return json({ results: [{ ok: null }] });
             }
-            return network(request);
+            return serializedNetwork(sendSys);
           }
           if (hasFs && !hasAccountMut) {
+            if (isRemoteServerDevBatch(body.calls)) {
+              return serializedNetwork(sendSys);
+            }
             const results = await kernelCall('mount_vfs_sys', {
               calls: body.calls,
               fdEpoch: request.headers.get('X-Fd-Epoch') ?? undefined,
@@ -125,7 +208,43 @@ export function installLocalFiles() {
             return json({ results });
           }
         }
-        return network(request);
+        const response = await serializedNetwork(sendSys);
+        if (response.ok && Array.isArray(body?.calls) && !body.proc && !body.pid) {
+          const hasServerAccountMut = body.calls.some(c => SERVER_ACCOUNT_MUTATION_CALLS.has(callName(c)));
+          const getcredsIndex = body.calls.findIndex(c => callName(c) === 'getcreds');
+          if (hasServerAccountMut) {
+            try {
+              const payload = await response.clone().json();
+              const anyOk = Array.isArray(payload?.results) && payload.results.some(r => r && 'ok' in r);
+              if (anyOk) {
+                lastSyncedKey = null;
+                await kernelCall('login_refresh').catch(() => {});
+              }
+            } catch { /* ignore non-JSON */ }
+          } else if (getcredsIndex >= 0) {
+            try {
+              const payload = await response.clone().json();
+              const who = payload?.results?.[getcredsIndex]?.ok;
+              if (who && typeof who.uid === 'number') {
+                const key = `${who.uid}:${who.user ?? ''}:${!!who.signed_in}`;
+                if (key !== lastSyncedKey) {
+                  lastSyncedKey = key;
+                  await kernelCall('sync_account', who).catch(() => {});
+                }
+              }
+            } catch { /* ignore non-JSON */ }
+          }
+        }
+        return response;
+      }
+
+      if ((url.pathname === '/api/login' || url.pathname === '/api/logout') && request.method === 'POST') {
+        const response = await serializedNetwork(() => network(request));
+        if (response.ok) {
+          lastSyncedKey = null;
+          await kernelCall('login_refresh').catch(() => {});
+        }
+        return response;
       }
 
       // 2. Client-fd chunked uploads (`PUT /api/pwrite?fd=...&index=...` when `fd >= CLIENT_PAGE_FD_BASE`)
@@ -145,12 +264,14 @@ export function installLocalFiles() {
         return json({ written });
       }
 
-      // 3. Path-addressed page `/api/file?path=...` reads (leaving `?compile=` and `?token=` on `network`)
+      // 3. Path-addressed page `/api/file?path=...` reads (leaving `?compile=`, `?token=`, and
+      // live server character devices `/dev/{present,snd}/*` on `network`)
       if (
         url.pathname === '/api/file' &&
         url.searchParams.has('path') &&
         !url.searchParams.has('compile') &&
-        !url.searchParams.has('token')
+        !url.searchParams.has('token') &&
+        !isRemoteServerDevPath(url.searchParams.get('path'))
       ) {
         if (!['GET', 'HEAD'].includes(request.method)) return json({ errno: 'EINVAL' }, 400);
         const path = url.searchParams.get('path');

@@ -137,6 +137,7 @@ pub(crate) fn wasi_errno_to_abi(code: i32) -> Option<abi::Errno> {
         WASI_ETXTBSY => ETXTBSY,
         WASI_EXDEV => EXDEV,
         217 => ENODATA,
+        218 => ENOTBLK,
         _ => return None,
     })
 }
@@ -154,6 +155,7 @@ pub(crate) fn abi_errno_to_wasi(errno: abi::Errno) -> i32 {
         EBADF => WASI_EBADF,
         EAGAIN => WASI_EAGAIN,
         EACCES => WASI_EACCES,
+        ENOTBLK => 218,
         EBUSY => WASI_EBUSY,
         EEXIST => WASI_EEXIST,
         EXDEV => WASI_EXDEV,

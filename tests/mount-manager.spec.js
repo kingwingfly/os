@@ -205,7 +205,7 @@ test('a selected package activates into a separate immutable private mount', asy
   await page.evaluate(async () => {
     const bytes = new TextEncoder().encode('private package'), hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(b => b.toString(16).padStart(2, '0')).join('');
     const directory = path => ({ path, uid: 0, gid: 0, mode: 0o755, node: { type: 'directory' } });
-    const image = { format: 'os.image', version: 1, kind: 'sysext', name: 'package', revision: '1', abi: 1, level: 1, features: [], provenance: {}, entries: [directory('/'), directory('/usr'), directory('/usr/share'), { path: '/usr/share/readme', uid: 0, gid: 0, mode: 0o644, node: { type: 'file', sha256: hash, size: bytes.length } }] };
+    const image = { format: 'os.image', version: 2, kind: 'sysext', name: 'package', revision: '1', abi: 1, level: 1, features: [], provenance: {}, entries: [directory('/'), directory('/usr'), directory('/usr/share'), { path: '/usr/share/readme', uid: 0, gid: 0, mode: 0o644, node: { type: 'file', sha256: hash, size: bytes.length, chunk_size: 262144, chunks: [hash] } }] };
     await window.os.mountLocal({ name: 'package', cloud: false, execute: false, files: [new File([JSON.stringify(image)], 'manifest.json'), new File([bytes], 'blobs/' + hash)] });
   });
   await open(page);

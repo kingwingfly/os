@@ -78,7 +78,7 @@ test('cp -p keeps times; df tells of the store and of /proc', async ({ page, req
   expect(fresh.mtime).toBeGreaterThan(kept.mtime);
   await run(page, 'df -h');
   await expect(last(page)).toContainText('Filesystem');
-  await expect(last(page)).toContainText(/^r2 +\S+ +\S+ +1\.0P +\d+% \/$/m);
+  await expect(last(page)).toContainText(/^cloud +\S+ +\S+ +1\.0P +\d+% \/$/m);
   await run(page, 'df /proc');
   await expect(last(page)).toContainText(/^proc +0 +0 +0 +- \/proc$/m);
 });

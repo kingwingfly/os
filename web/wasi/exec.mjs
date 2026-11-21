@@ -194,12 +194,20 @@ export function reconcile() {
   return reconciling = kernelCall('sync', { acknowledged: Object.fromEntries([...checking].map(([pid, process]) => [pid, [...process.received.values()]])) }).then(rows => {
     let acknowledge = false;
     const found = new Map(rows.map(row => [row.pid, row]));
+    // Pass 1: terminate dead/zombie processes first so their pipes and PTY masters
+    // close (and clear controlling terminals) before siblings/children receive SIGHUP/SIGCONT.
     for (const [pid, process] of checking) {
       if (hosted.get(pid) !== process) continue;
       const row = found.get(pid);
       if (!row) process.signal(SIG.KILL);
       else if (row.state === 'zombie') process.kill(row.signal ?? SIG.KILL);
-      else if (process.membershipVersion === versions.get(pid)) process.membership(row);
+    }
+    // Pass 2: update live memberships and deliver queued signals.
+    for (const [pid, process] of checking) {
+      if (hosted.get(pid) !== process) continue;
+      const row = found.get(pid);
+      if (!row || row.state === 'zombie') continue;
+      if (process.membershipVersion === versions.get(pid)) process.membership(row);
       // STOP/CONT come from the ordered, acknowledged queue too. Reapplying a
       // stale state snapshot here can stop a process again after `fg` resumes it.
       for (const event of row?.pending_signals ?? []) {
@@ -301,7 +309,17 @@ export async function exec(stages, options = {}) {
       if (terminal) { try { await releaseTerminal(true); } finally { terminal.close(); } }
       else await hangupWithoutTerminal();
     },
-    get pids() { return group().filter(process => !process.ended).map(process => process.pid); },
+    get pids() {
+      const ended = new Set(group().filter(process => process.ended).map(process => process.pid));
+      const live = new Set();
+      for (const process of group()) {
+        if (!process.ended) live.add(process.pid);
+      }
+      for (const pid of memberships.keys()) {
+        if (!ended.has(pid)) live.add(pid);
+      }
+      return [...live];
+    },
     stoppable: !!isolated,
     signal: signal => {
       if (!valid(signal)) return;
@@ -519,11 +537,12 @@ export async function exec(stages, options = {}) {
       const reaped = closing.then(() => reap(pid, { status: code, signal }, forked));
       void Promise.allSettled([reaped, ...displaying]).then(() => { completing.delete(pid); settle(code); });
     };
-    // A signal that ends it: heeded at its next call, as it exits; outright if it cannot.
+    // A signal that ends it: heeded at its next call, as it exits; outright immediately for
+    // uncatchable SIGKILL or after GRACE if it cannot heed a catchable signal.
     const kill = signal => {
       if (status != null || killing != null) return;
       process.ending = true;
-      if (!control) return end(killedBy(signal), true);
+      if (!control || signal === SIG.KILL) return end(killedBy(signal), true);
       Atomics.store(control, 0, KILLED | signal);
       Atomics.notify(control, 0);
       killing = setTimeout(() => end(killedBy(signal), true), GRACE);
@@ -598,6 +617,8 @@ export async function exec(stages, options = {}) {
         }
         else if (type === 'reconcile') { await reconciling; await reconcile(); reply = {}; }
         else if (type === 'getpid') reply = await kernelCall('getpid', { pid: args.pid });
+        else if (type === 'getcreds') reply = await kernelCall('getcreds_proc', { pid });
+        else if (type === 'resource') { await kernelCall('reserve_memory', { pid, bytes: args.memory }); reply = {}; }
         // kill(2) from a process is the process's, by its own credentials.
         else if (type === 'kill') {
           reply = (await kernelCall('kill', { pid: args.pid, signal: args.signal, from: pid })) ?? {};
@@ -1090,6 +1111,7 @@ export async function exec(stages, options = {}) {
       : await kernelCall('session', { pids: ready.map(image => image.pid) });
     for (const row of session) { memberships.set(row.pid, row); pendingMemberships.set(row.pid, row); }
     pgid = session[0].pgid; savedForeground = pgid;
+    onJob(job);
     if (terminal) terminal.session = session[0].sid;
     if (isolated) {
       // Resolve the leader before starting stages concurrently: every stage must inherit

@@ -7,8 +7,10 @@
 //! is SQLite in its Durable Object; tests use `MemStore`.
 pub mod init;
 pub mod lifecycle;
+pub mod local_cgroups;
 pub mod login;
 mod namei;
+pub mod proc_table;
 pub mod registry;
 pub mod resource;
 pub mod startup;
@@ -123,28 +125,14 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
         | Call::Ioctl { .. }
         | Call::Kill { .. }
         | Call::Wait { .. }
-        | Call::ProcInit { .. }
-        | Call::Execve { .. }
-        | Call::Resource { .. }
-        | Call::Fork { .. }
-        | Call::Exit { .. }
-        | Call::Pids { .. }
-        | Call::Seats
-        | Call::MachineInit { .. }
-        | Call::LoginSession { .. }
-        | Call::Gone { .. }
         | Call::Getpid
         | Call::Getpgid { .. }
         | Call::Getsid { .. }
         | Call::Setpgid { .. }
         | Call::Setsid
-        | Call::ProcSession { .. }
         | Call::ProcStopped { .. }
         | Call::Prctl { .. }
         | Call::Waitpid { .. }
-        | Call::ProcPoll { .. }
-        | Call::ProcKeep { .. }
-        | Call::ProcTty { .. }
         | Call::CgroupCreate { .. }
         | Call::CgroupRemove { .. }
         | Call::CgroupSet { .. }

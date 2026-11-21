@@ -1,9 +1,12 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { rm, mkdir, readFile, writeFile, readdir, stat, realpath } from 'node:fs/promises';
 import { resolve, dirname, join, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import binaryen from 'binaryen';
 import { build } from 'esbuild';
+import { LOCAL_FORMAT, transformImage } from '../web/kernel/transform.js';
 const { values } = parseArgs({ options: { content: { type: 'string' }, 'out-dir': { type: 'string' }, 'web-only': { type: 'boolean' } } });
 const caller = process.cwd();
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -64,7 +67,6 @@ await build({ absWorkingDir: root, entryPoints: { bridge: 'web/app.js' },
 // The WASI engine's process, a Worker of its own (web/wasi/process.js), and /usr/bin's binary:
 // uutils' coreutils, built for wasm32-wasip1 (rustup target add wasm32-wasip1).
 await build({ absWorkingDir: root, entryPoints: { 'wasi-process': 'web/wasi/process.js' }, bundle: true, format: 'iife', outdir: out, minify: true });
-await build({ absWorkingDir: root, entryPoints: { 'executor-host': 'web/kernel/executor.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
 // Local-only images must never use the container compiler. Binaryen is embedded in this
 // separate Worker and loaded only for a local launch, not by the page or cloud loader.
 await build({ absWorkingDir: root, entryPoints: { 'local-compiler': 'web/kernel/local-compiler.js' }, external: ['node:*'], bundle: true, format: 'esm', outdir: out, minify: true });
@@ -72,13 +74,13 @@ await build({ absWorkingDir: root, entryPoints: { 'console-window': 'web/console
 for (const name of ['greeter', 'shell-session']) await build({ absWorkingDir: root, entryPoints: { [name]: 'web/' + name + '.js' }, external: ['./pkg/*'], bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'login-session': 'web/kernel/login.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'init-owner': 'web/kernel/init.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
+await build({ absWorkingDir: root, entryPoints: { 'image-pager': 'web/kernel/image-pager.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
+await build({ absWorkingDir: root, entryPoints: { 'offline-installer': 'web/kernel/offline-installer.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
+await build({ absWorkingDir: root, entryPoints: { 'offline-sw': 'web/kernel/offline-installer.js' }, bundle: true, format: 'iife', outdir: out, minify: true });
 // Remove obsolete pre-overhaul compiler artifacts; local-compiler.js is the scoped replacement.
 for (const name of ['wasi-asyncify.js', 'binaryen.js']) await rm(join(out, name), { force: true });
-// The client kernel (crates/client-kernel), a classic dedicated Worker: no-modules wasm-bindgen,
-// imported by web/kernel/client.js, with the page's protocol module bundled into the bridge.
-run('cargo', ['build', '--locked', '-p', 'os-client-kernel', '--target', 'wasm32-unknown-unknown', '--release']);
-run('wasm-bindgen', ['--target', 'no-modules', '--no-typescript', '--out-dir', out, '--out-name', 'client_kernel', join(target, 'wasm32-unknown-unknown/release/os_client_kernel.wasm')]);
-await build({ absWorkingDir: root, entryPoints: { 'client-kernel': 'web/kernel/client.js' }, bundle: true, format: 'iife', outdir: out, minify: true });
+// Build /usr/bin/*.wasm binaries first so their exact sizes and pre-transformed `.rv1` sidecars
+// can be embedded into `client-kernel.js`, `executor-host.js`, and `usr/manifest.json`.
 run('cargo', ['build', '--locked', '--release', '--target', 'wasm32-wasip1', '--manifest-path', 'crates/coreutils/Cargo.toml', '--target-dir', join(target, 'coreutils')]);
 await mkdir(join(out, 'usr/bin'), { recursive: true });
 await copy(join(target, 'coreutils/wasm32-wasip1/release/coreutils.wasm'), join(out, 'usr/bin/coreutils.wasm'));
@@ -88,12 +90,120 @@ run('cargo', ['build', '--locked', '--release', '--target', 'wasm32-wasip1', '-p
 await copy(join(target, 'wasm32-wasip1/release/supervise.wasm'), join(out, 'usr/bin/supervise.wasm'));
 await copy(join(target, 'wasm32-wasip1/release/init.wasm'), join(out, 'usr/bin/init.wasm'));
 run(process.execPath, ['scripts/build-shell.mjs', '--out-dir', out]);
+// Emit pre-transformed static `.rv1` sidecars alongside raw `/usr/bin/*.wasm` binaries so cold
+// browser contexts compile system tools directly without running Binaryen in-browser. Raw `.wasm`
+// binaries remain untouched for `/api/file`, inspection, and Release v2 packaging.
+const transformedDigests = {};
+for (const asset of ['/usr/bin/coreutils.wasm', '/usr/bin/utilities.wasm', '/usr/bin/dash.wasm', '/usr/bin/supervise.wasm', '/usr/bin/init.wasm']) {
+  const raw = new Uint8Array(await readFile(join(out, asset)));
+  const rv1 = await transformImage(binaryen, raw, 'resources-v1');
+  await writeFile(join(out, asset + '.rv1'), rv1);
+  transformedDigests[asset] = createHash('sha256').update(rv1).digest('hex');
+}
+const transformed = { format: LOCAL_FORMAT, digests: transformedDigests };
 // What the kernel's /usr says of its binaries (crates/worker/src/usr.rs), which it cannot ask the
-// assets: their sizes.
+// assets: their sizes, plus pre-transformed sidecar integrity metadata.
 const sizes = {};
 for (const asset of ['/usr/bin/coreutils.wasm', '/usr/bin/utilities.wasm', '/usr/bin/dash.wasm', '/usr/bin/supervise.wasm', '/usr/bin/init.wasm', '/pkg/frontend_bg.wasm']) sizes[asset] = (await stat(join(out, asset))).size;
-await writeFile(join(out, 'usr/manifest.json'), JSON.stringify(sizes));
+await writeFile(join(out, 'usr/manifest.json'), JSON.stringify({ ...sizes, transformed }));
+await build({
+  absWorkingDir: root,
+  entryPoints: { 'executor-host': 'web/kernel/executor.js' },
+  bundle: true,
+  format: 'esm',
+  outdir: out,
+  minify: true,
+  define: { __OS_BUILD_TRANSFORMED__: JSON.stringify(transformed) },
+});
+// The client kernel (crates/client-kernel), a classic dedicated Worker: no-modules wasm-bindgen,
+// imported by web/kernel/client.js, with the page's protocol module bundled into the bridge.
+run('cargo', ['build', '--locked', '-p', 'os-client-kernel', '--target', 'wasm32-unknown-unknown', '--release']);
+run('wasm-bindgen', ['--target', 'no-modules', '--no-typescript', '--out-dir', out, '--out-name', 'client_kernel', join(target, 'wasm32-unknown-unknown/release/os_client_kernel.wasm')]);
+await build({
+  absWorkingDir: root,
+  entryPoints: { 'client-kernel': 'web/kernel/client.js' },
+  bundle: true,
+  format: 'iife',
+  outdir: out,
+  minify: true,
+  define: { __OS_BUILD_ASSET_SIZES__: JSON.stringify(sizes) },
+});
 for (const name of ['index.html', 'console.html', 'login.html', 'shell.html', 'style.css', '_headers']) await copy('web/' + name, join(out, name));
+await writeFile(join(out, 'offline-boot.html'), `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>OS Offline Boot (Release v2)</title><link rel="icon" href="data:,"></head>
+<body><pre id="status">Booting offline Release v2…</pre>
+<script src="./client_kernel.js"></script>
+<script type="module">
+import { createOfflineInstaller, registerOfflineServiceWorker } from './offline-installer.js';
+import { createImagePager } from './image-pager.js';
+const installer = createOfflineInstaller();
+const pager = createImagePager();
+globalThis.imageBlobRead = pager.imageBlobRead;
+globalThis.osOffline = { installer, pager, registerOfflineServiceWorker };
+const params = new URLSearchParams(location.search);
+function hexOf(buf) {
+  const bytes = new Uint8Array(buf);
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, '0');
+  return out;
+}
+async function bootStage1() {
+  const statusEl = document.getElementById('status');
+  const state = await installer.getState();
+  if (!state.active) {
+    statusEl.textContent = 'No offline Release v2 installed.';
+    globalThis.__osOfflineBoot = { status: 'not-installed', state };
+    return;
+  }
+  const boot = await installer.beginOfflineBoot({ verifyAllBlobs: true });
+  const wasmUrl = '/boot/releases/' + boot.releaseId + '/assets' + boot.release.loader.client_kernel_wasm;
+  const wasmRes = await fetch(wasmUrl, { cache: 'no-store' });
+  if (!wasmRes.ok) {
+    await installer.abortOfflineBoot(boot.releaseId).catch(() => {});
+    throw new Error('Failed to load client kernel Wasm (HTTP ' + wasmRes.status + ')');
+  }
+  const wasmBytes = new Uint8Array(await wasmRes.arrayBuffer());
+  const actualWasmSha = hexOf(await crypto.subtle.digest('SHA-256', wasmBytes));
+  if (actualWasmSha !== boot.release.loader.client_kernel_sha256) {
+    await installer.abortOfflineBoot(boot.releaseId).catch(() => {});
+    throw new Error('Client kernel Wasm SHA-256 mismatch before instantiation.');
+  }
+  await wasm_bindgen({ module_or_path: wasmBytes });
+  const bundleSummary = wasm_bindgen.verify_release_v2_bundle(
+    boot.manifestText,
+    boot.signatureText,
+    boot.trustText,
+    boot.imagesRaw,
+    boot.sigsRaw,
+  );
+  if (params.get('simulate_crash') === '1') {
+    await installer.abortOfflineBoot(boot.releaseId);
+    const err = new Error('Simulated crash before markBootHealthy');
+    globalThis.__osOfflineBoot = { status: 'crashed', releaseId: boot.releaseId, rolledBack: boot.rolledBack, error: err.message };
+    statusEl.textContent = 'Boot crashed before markBootHealthy: ' + boot.releaseId;
+    return;
+  }
+  const stage1 = await wasm_bindgen.boot_stage1_initramfs(boot.imagesRaw[1]);
+  const healthyState = await installer.markBootHealthy(boot.releaseId);
+  globalThis.__osOfflineBoot = {
+    status: 'ready',
+    releaseId: boot.releaseId,
+    rolledBack: boot.rolledBack,
+    rolledBackFrom: boot.rolledBackFrom,
+    bundleSummary,
+    stage1,
+    pagerStats: pager.stats(),
+    state: healthyState,
+  };
+  statusEl.textContent = 'Stage 1 offline boot healthy: ' + boot.releaseId;
+}
+bootStage1().catch(err => {
+  globalThis.__osOfflineBoot = { status: 'error', error: String(err?.message ?? err) };
+  document.getElementById('status').textContent = 'Offline boot failed: ' + String(err?.message ?? err);
+  console.error(err);
+});
+</script></body></html>
+`);
 if (assets) await copyTree(assets, join(out, 'content'));
 await writeFile(join(out, 'os-config.json'), JSON.stringify({ branding, games }));
 await rm(join(out, 'terminal-config.json'), { force: true });

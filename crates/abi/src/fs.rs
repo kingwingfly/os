@@ -162,6 +162,16 @@ pub struct DirEntry {
     pub file_type: FileType,
 }
 
+/// One page of directory entries returned by `Filesystem::read_dir_page` (contract §3, R7).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DirPage {
+    pub entries: Vec<DirEntry>,
+    /// Opaque monotonic cursor for the next page; `None` indicates EOF.
+    /// `cookie == 0` starts from the beginning of the directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cookie: Option<u64>,
+}
+
 /// The access an open reference grants (contract §2.3), as Linux's `FMODE_*`. Exec is checked
 /// against execute permission, not read, and serves only the loader. Path (`O_PATH`) grants no
 /// access at all: it keeps the object alive and anchors later calls, as a working directory, a

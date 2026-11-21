@@ -5,7 +5,7 @@ const module = binaryen.parseText('(module (memory (export "memory") 1) (func (e
 const bytes = Buffer.from(module.emitBinary()); module.dispose();
 const hash = createHash('sha256').update(bytes).digest('hex');
 const directory = path => ({ path, uid: 0, gid: 0, mode: 0o755, node: { type: 'directory' } });
-const manifest = () => ({ format: 'os.image', version: 1, kind: 'sysext', name: 'developer', revision: 'local', abi: 1, level: 1, features: [], provenance: {}, entries: [directory('/'), directory('/usr'), directory('/usr/bin'), { path: '/usr/bin/probe', uid: 0, gid: 0, mode: 0o755, node: { type: 'file', sha256: hash, size: bytes.length } }] });
+const manifest = () => ({ format: 'os.image', version: 2, kind: 'sysext', name: 'developer', revision: 'local', abi: 1, level: 1, features: [], provenance: {}, entries: [directory('/'), directory('/usr'), directory('/usr/bin'), { path: '/usr/bin/probe', uid: 0, gid: 0, mode: 0o755, node: { type: 'file', sha256: hash, size: bytes.length, chunk_size: 262144, chunks: [hash] } }] });
 async function ready(page) { await page.goto('/'); await page.waitForFunction(() => window.os?.activatePrivate); }
 async function source(page, image, content = bytes, name = 'source') {
   return page.evaluate(async ({ image, bytes, hash, name }) => window.os.mountLocal({ name, cloud: false, execute: false, files: [new File([JSON.stringify(image)], 'manifest.json'), new File([Uint8Array.from(atob(bytes), c => c.charCodeAt(0))], 'blobs/' + hash)] }), { image, bytes: content.toString('base64'), hash, name });

@@ -3,6 +3,12 @@ import { prepareUserMount, CLIENT_PAGE_FD_BASE } from './workspace.js';
 import { mountApi, exportMount, attachMount } from './mount-sharing.js';
 
 const spaces = new Map();
+let hasUserMounts = false;
+const ACCOUNT_SENSITIVE_MOUNT_TYPES = new Set([
+  'mount_list', 'mount_attach', 'mount_activate', 'mount_shared', 'mount_sys',
+  'mount_overlay', 'mount_identity', 'mount_detach', 'mount_exports',
+  'mount_export', 'mount_revoke', 'mount_transports', 'mount_write',
+]);
 const FORBIDDEN_SYS_CALLS = new Set([
   'login', 'logout', 'sudo', 'passwd', 'useradd', 'userdel', 'usermod', 'login_lifecycle', 'init',
 ]);
@@ -89,8 +95,11 @@ async function inspectWorkspace() {
     await globalThis.kernelRequest('login_refresh');
     view = await globalThis.kernelRequest('login_lifecycle', { op: 'inspect' });
   }
-  for (const id of spaces.keys()) {
-    if (id !== view?.id || view.shutdown) await endWorkspace(id);
+  for (const [id, entry] of [...spaces.entries()]) {
+    const resolved = await Promise.resolve(entry).catch(() => null);
+    if (id !== view?.id || view?.shutdown || (resolved && resolved.identity.uid !== view?.uid)) {
+      await endWorkspace(id);
+    }
   }
   if (!view?.id || view.shutdown) {
     await globalThis.kernelRequest('set_active_session', { sessionId: null }).catch(() => {});
@@ -129,6 +138,7 @@ export async function endWorkspace(id) {
   const request = globalThis.kernelRequest;
   const space = spaces.get(id);
   spaces.delete(id);
+  if (spaces.size === 0) hasUserMounts = false;
   if (space) await Promise.resolve(space).then(value => value.close()).catch(() => {});
   if (typeof request === 'function' && id) {
     await request('session_end', { sessionId: id }).catch(() => {});
@@ -137,7 +147,7 @@ export async function endWorkspace(id) {
 
 async function formatSessionMountList(sessionId) {
   const info = await globalThis.kernelRequest('list_mounts', { sessionId });
-  return (info.mounts ?? [])
+  const list = (info.mounts ?? [])
     .filter(m => !m.baseline)
     .map(m => ({
       path: m.path,
@@ -152,6 +162,8 @@ async function formatSessionMountList(sessionId) {
       health: m.health,
       uncertainWrites: m.uncertainWrites ?? 0,
     }));
+  hasUserMounts = list.some(m => m.userMount);
+  return list;
 }
 
 async function resolveOptionalSessionId() {
@@ -164,7 +176,33 @@ async function resolveOptionalSessionId() {
   }
 }
 
+async function refreshAccountBeforePrivateAccess() {
+  if (typeof globalThis.kernelRequest !== 'function') return;
+  const before = await globalThis.kernelRequest('workspace_credentials').catch(() => null);
+  const after = await globalThis.kernelRequest('sync_account_from_server').catch(() => null);
+  if (before && after && (before.uid !== after.uid || before.signed_in !== after.signed_in || before.user !== after.user)) {
+    await globalThis.kernelRequest('login_refresh', { fromServer: false }).catch(() => {});
+  }
+}
+
 export async function mountRequest(type, args = {}) {
+  if (type === 'mount_overlay') {
+    if (!Array.isArray(args.calls) || args.calls.some(callTouchesPrivateCarrier)) {
+      throw bad('EACCES');
+    }
+  }
+  // Revalidate browser session cookies before serving mount APIs or private carrier paths
+  // (or whenever user mounts are active) so external login/logout tears down stale private
+  // namespaces immediately while preserving zero-RPC local execution when no user mounts exist.
+  const needsAccountCheck =
+    ACCOUNT_SENSITIVE_MOUNT_TYPES.has(type) ||
+    hasUserMounts ||
+    ((type === 'mount_vfs_open_read' || type === 'mount_vfs_read_file') && isPrivateCarrierPath(args.path)) ||
+    (type === 'mount_vfs_pwrite' && typeof args.fd === 'number' && args.fd >= CLIENT_PAGE_FD_BASE) ||
+    (type === 'mount_vfs_sys' && Array.isArray(args.calls) && args.calls.some(callTouchesPrivateCarrier));
+  if (needsAccountCheck) {
+    await refreshAccountBeforePrivateAccess();
+  }
   // Unified page VFS entrypoints (work for both authenticated login sessions and guest `system_mnt_ns`).
   if (type === 'mount_vfs_sys') {
     if (!Array.isArray(args.calls) || args.calls.some(call => FORBIDDEN_SYS_CALLS.has(typeof call === 'string' ? call : Object.keys(call)[0]))) {

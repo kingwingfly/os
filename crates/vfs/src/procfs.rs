@@ -22,6 +22,7 @@ const GENERATION: u64 = 1;
 const ROOT_INO: u64 = 1;
 const TOP_MOUNTS_INO: u64 = 2;
 const TOP_SELF_INO: u64 = 3;
+const TOP_UPTIME_INO: u64 = 4;
 
 const TAG_TOP_DYN: u64 = 1;
 const TAG_PID_FIXED: u64 = 2;
@@ -38,6 +39,10 @@ const SUB_ROOT: u16 = 5;
 const SUB_CWD: u16 = 6;
 const SUB_FD_DIR: u16 = 7;
 const SUB_FDINFO_DIR: u16 = 8;
+const SUB_STATUS: u16 = 9;
+const SUB_CMDLINE: u16 = 10;
+const SUB_STAT: u16 = 11;
+const SUB_CGROUP: u16 = 12;
 
 /// Decoded 53-bit `/proc` inode kind (`<= abi::fs::JS_SAFE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +50,7 @@ pub enum ProcNode {
     Root,
     TopMounts,
     TopSelf,
+    TopUptime,
     TopDynamic(u16),
     PidDir(u32),
     PidMountinfo(u32),
@@ -55,6 +61,10 @@ pub enum ProcNode {
     PidCwd(u32),
     PidFdDir(u32),
     PidFdinfoDir(u32),
+    PidStatus(u32),
+    PidCmdline(u32),
+    PidStat(u32),
+    PidCgroup(u32),
     PidFd(u32, u16),
     PidFdinfo(u32, u16),
     PidDynamic(u32, u16),
@@ -66,6 +76,7 @@ pub fn encode_proc_ino(node: ProcNode) -> u64 {
         ProcNode::Root => ROOT_INO,
         ProcNode::TopMounts => TOP_MOUNTS_INO,
         ProcNode::TopSelf => TOP_SELF_INO,
+        ProcNode::TopUptime => TOP_UPTIME_INO,
         ProcNode::TopDynamic(idx) => pack(TAG_TOP_DYN, 0, idx),
         ProcNode::PidDir(pid) => pack(TAG_PID_FIXED, pid, SUB_PID_DIR),
         ProcNode::PidMountinfo(pid) => pack(TAG_PID_FIXED, pid, SUB_MOUNTINFO),
@@ -76,6 +87,10 @@ pub fn encode_proc_ino(node: ProcNode) -> u64 {
         ProcNode::PidCwd(pid) => pack(TAG_PID_FIXED, pid, SUB_CWD),
         ProcNode::PidFdDir(pid) => pack(TAG_PID_FIXED, pid, SUB_FD_DIR),
         ProcNode::PidFdinfoDir(pid) => pack(TAG_PID_FIXED, pid, SUB_FDINFO_DIR),
+        ProcNode::PidStatus(pid) => pack(TAG_PID_FIXED, pid, SUB_STATUS),
+        ProcNode::PidCmdline(pid) => pack(TAG_PID_FIXED, pid, SUB_CMDLINE),
+        ProcNode::PidStat(pid) => pack(TAG_PID_FIXED, pid, SUB_STAT),
+        ProcNode::PidCgroup(pid) => pack(TAG_PID_FIXED, pid, SUB_CGROUP),
         ProcNode::PidFd(pid, fd) => pack(TAG_PID_FD, pid, fd),
         ProcNode::PidFdinfo(pid, fd) => pack(TAG_PID_FDINFO, pid, fd),
         ProcNode::PidDynamic(pid, idx) => pack(TAG_PID_DYN, pid, idx),
@@ -91,6 +106,9 @@ pub fn decode_proc_ino(ino: u64) -> Option<ProcNode> {
     }
     if ino == TOP_SELF_INO {
         return Some(ProcNode::TopSelf);
+    }
+    if ino == TOP_UPTIME_INO {
+        return Some(ProcNode::TopUptime);
     }
     if ino > abi::fs::JS_SAFE {
         return None;
@@ -110,6 +128,10 @@ pub fn decode_proc_ino(ino: u64) -> Option<ProcNode> {
             SUB_CWD => Some(ProcNode::PidCwd(pid)),
             SUB_FD_DIR => Some(ProcNode::PidFdDir(pid)),
             SUB_FDINFO_DIR => Some(ProcNode::PidFdinfoDir(pid)),
+            SUB_STATUS => Some(ProcNode::PidStatus(pid)),
+            SUB_CMDLINE => Some(ProcNode::PidCmdline(pid)),
+            SUB_STAT => Some(ProcNode::PidStat(pid)),
+            SUB_CGROUP => Some(ProcNode::PidCgroup(pid)),
             _ => None,
         },
         TAG_PID_FD => Some(ProcNode::PidFd(pid, sub)),
@@ -126,6 +148,28 @@ pub struct ProcCallerInfo {
     pub is_at_ns_root: bool,
 }
 
+/// Linux-compatible `CLK_TCK` (`USER_HZ`) frequency for `/proc/<pid>/stat` start time.
+pub const PROC_CLK_TCK: u64 = 100;
+
+/// Local process metadata snapshot for 100% local `/proc/<pid>/{status,cmdline,stat,cgroup}`
+/// rendering without any network RPCs (`docs/architecture/contract.md` §2.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcMetaSnapshot {
+    pub ppid: u32,
+    pub pgid: u32,
+    pub sid: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub state: abi::ProcState,
+    pub cgroup: String,
+    pub comm: String,
+    pub argv: Vec<String>,
+    /// Monotonic boot-relative process start time in `PROC_CLK_TCK` (100 Hz) ticks.
+    pub start_ticks: u64,
+    pub tty: Option<u32>,
+    pub tty_fds: Vec<u32>,
+}
+
 #[derive(Clone)]
 pub struct ProcTargetInfo {
     pub pid: u32,
@@ -135,6 +179,7 @@ pub struct ProcTargetInfo {
     pub root: PathAnchor,
     pub cwd: PathAnchor,
     pub fds: SharedFdTable,
+    pub snapshot: Option<ProcMetaSnapshot>,
 }
 
 /// Bridge implemented by [`crate::Vfs`] supplying live local process/namespace/fd state to [`ProcFs`].
@@ -149,6 +194,20 @@ pub trait ProcBridge {
     ) -> Option<Rc<RefCell<MountNamespace>>> {
         None
     }
+    fn uptime_secs(&self) -> u64 {
+        0
+    }
+}
+
+fn snapshot_tty_fd(info: &ProcTargetInfo, fd: u16) -> Option<u32> {
+    let snap = info.snapshot.as_ref()?;
+    let tty = snap.tty?;
+    snap.tty_fds.contains(&u32::from(fd)).then_some(tty)
+}
+
+/// `hidepid=invisible`: root sees all; non-root sees own uid + PID 1.
+pub fn proc_visible(cred: &Cred, pid: u32, target_uid: u32) -> bool {
+    cred.identity.id == 0 || cred.identity.id == target_uid || pid == 1
 }
 
 pub fn may_inspect_proc(cred: &Cred, target_uid: u32) -> Result<()> {
@@ -318,6 +377,9 @@ impl<P: ProcProvider> ProcFs<P> {
         if let Some(bridge) = self.bridge()
             && let Some(info) = bridge.process_info(pid)
         {
+            if info.snapshot.is_some() && !proc_visible(cred, pid, info.uid) {
+                return Err(Errno::ENOENT);
+            }
             return Ok((info.uid, info.gid, true));
         }
         let remote = self.provider.list_pids(cred).await?;
@@ -326,6 +388,16 @@ impl<P: ProcProvider> ProcFs<P> {
         } else {
             Err(Errno::ENOENT)
         }
+    }
+
+    fn local_snapshot(&self, cred: &Cred, pid: u32) -> Result<(ProcTargetInfo, ProcMetaSnapshot)> {
+        let bridge = self.bridge().ok_or(Errno::ENOENT)?;
+        let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
+        let snap = info.snapshot.clone().ok_or(Errno::ENOENT)?;
+        if !proc_visible(cred, pid, info.uid) {
+            return Err(Errno::ENOENT);
+        }
+        Ok((info, snap))
     }
 
     async fn metadata_for(&self, cred: &Cred, node: ProcNode) -> Result<Metadata> {
@@ -347,6 +419,7 @@ impl<P: ProcProvider> ProcFs<P> {
                     caller_pid.to_string().len() as u64,
                 ))
             }
+            ProcNode::TopUptime => Ok(self.make_meta(FileType::File, 0o444, 0, 0, 0)),
             ProcNode::TopDynamic(idx) => {
                 let name = self
                     .state
@@ -372,6 +445,13 @@ impl<P: ProcProvider> ProcFs<P> {
                 }
                 Ok(self.make_meta(FileType::File, 0o444, uid, gid, 0))
             }
+            ProcNode::PidStatus(pid)
+            | ProcNode::PidCmdline(pid)
+            | ProcNode::PidStat(pid)
+            | ProcNode::PidCgroup(pid) => {
+                let (info, _) = self.local_snapshot(cred, pid)?;
+                Ok(self.make_meta(FileType::File, 0o444, info.uid, info.gid, 0))
+            }
             ProcNode::PidNsDir(pid) => {
                 let (uid, gid, is_local) = self.pid_owner(cred, pid).await?;
                 if !is_local {
@@ -396,7 +476,12 @@ impl<P: ProcProvider> ProcFs<P> {
             ProcNode::PidFd(pid, fd) => {
                 let bridge = self.bridge().ok_or(Errno::ENOENT)?;
                 let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
-                if info.fds.borrow().get(Fd::from(fd)).is_err() {
+                if info.snapshot.is_some() && !proc_visible(cred, pid, info.uid) {
+                    return Err(Errno::ENOENT);
+                }
+                if info.fds.borrow().get(Fd::from(fd)).is_err()
+                    && snapshot_tty_fd(&info, fd).is_none()
+                {
                     return Err(Errno::ENOENT);
                 }
                 Ok(self.make_meta(FileType::Symlink, 0o700, info.uid, info.gid, 0))
@@ -404,6 +489,9 @@ impl<P: ProcProvider> ProcFs<P> {
             ProcNode::PidFdinfo(pid, fd) => {
                 let bridge = self.bridge().ok_or(Errno::ENOENT)?;
                 let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
+                if info.snapshot.is_some() && !proc_visible(cred, pid, info.uid) {
+                    return Err(Errno::ENOENT);
+                }
                 if info.fds.borrow().get(Fd::from(fd)).is_err() {
                     return Err(Errno::ENOENT);
                 }
@@ -442,26 +530,34 @@ impl<P: ProcProvider> ProcFs<P> {
                     ProcNode::PidDir(pid)
                 } else {
                     let entries = self.provider.top_entries(cred).await?;
-                    let found = entries
-                        .into_iter()
-                        .find(|e| e.name == name)
-                        .ok_or(Errno::ENOENT)?;
-                    let idx = self.state.borrow_mut().top_names.intern(&found.name)?;
-                    let ino = encode_proc_ino(ProcNode::TopDynamic(idx));
-                    return Ok(Entry {
-                        handle: self.handle(ino),
-                        metadata: self.make_meta(
-                            found.file_type,
-                            found.mode,
-                            found.uid,
-                            found.gid,
-                            0,
-                        ),
-                    });
+                    if let Some(found) = entries.into_iter().find(|e| e.name == name) {
+                        let idx = self.state.borrow_mut().top_names.intern(&found.name)?;
+                        let ino = encode_proc_ino(ProcNode::TopDynamic(idx));
+                        return Ok(Entry {
+                            handle: self.handle(ino),
+                            metadata: self.make_meta(
+                                found.file_type,
+                                found.mode,
+                                found.uid,
+                                found.gid,
+                                0,
+                            ),
+                        });
+                    }
+                    if name == "uptime" {
+                        ProcNode::TopUptime
+                    } else {
+                        return Err(Errno::ENOENT);
+                    }
                 }
             }
             ProcNode::PidDir(pid) => {
                 let (uid, _, is_local) = self.pid_owner(cred, pid).await?;
+                let has_snapshot = is_local
+                    && self
+                        .bridge()
+                        .and_then(|b| b.process_info(pid))
+                        .is_some_and(|i| i.snapshot.is_some());
                 match name {
                     "mountinfo" if is_local => {
                         may_inspect_proc(cred, uid)?;
@@ -471,12 +567,19 @@ impl<P: ProcProvider> ProcFs<P> {
                         may_inspect_proc(cred, uid)?;
                         ProcNode::PidMounts(pid)
                     }
+                    "status" if has_snapshot => ProcNode::PidStatus(pid),
+                    "cmdline" if has_snapshot => ProcNode::PidCmdline(pid),
+                    "stat" if has_snapshot => ProcNode::PidStat(pid),
+                    "cgroup" if has_snapshot => ProcNode::PidCgroup(pid),
                     "ns" if is_local => ProcNode::PidNsDir(pid),
                     "root" if is_local => ProcNode::PidRoot(pid),
                     "cwd" if is_local => ProcNode::PidCwd(pid),
                     "fd" if is_local => ProcNode::PidFdDir(pid),
                     "fdinfo" if is_local => ProcNode::PidFdinfoDir(pid),
                     _ => {
+                        if has_snapshot {
+                            return Err(Errno::ENOENT);
+                        }
                         let entries = self.provider.pid_entries(cred, pid).await?;
                         let found = entries
                             .into_iter()
@@ -509,7 +612,10 @@ impl<P: ProcProvider> ProcFs<P> {
                 let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
                 may_inspect_proc(cred, info.uid)?;
                 let fd: u16 = name.parse().map_err(|_| Errno::ENOENT)?;
-                if fd.to_string() != name || info.fds.borrow().get(Fd::from(fd)).is_err() {
+                if fd.to_string() != name
+                    || (info.fds.borrow().get(Fd::from(fd)).is_err()
+                        && snapshot_tty_fd(&info, fd).is_none())
+                {
                     return Err(Errno::ENOENT);
                 }
                 ProcNode::PidFd(pid, fd)
@@ -545,6 +651,74 @@ impl<P: ProcProvider> ProcFs<P> {
 
     async fn read_proc_bytes(&self, cred: &Cred, node: ProcNode) -> Result<Vec<u8>> {
         match node {
+            ProcNode::TopUptime => {
+                let secs = self.bridge().map_or(0, |b| b.uptime_secs());
+                Ok(format!("{secs}.00 0.00\n").into_bytes())
+            }
+            ProcNode::PidStatus(pid) => {
+                let (info, snap) = self.local_snapshot(cred, pid)?;
+                let (code, word) = match snap.state {
+                    abi::ProcState::Running => ('R', "running"),
+                    abi::ProcState::Sleeping => ('S', "sleeping"),
+                    abi::ProcState::Stopped => ('T', "stopped"),
+                    abi::ProcState::Zombie => ('Z', "zombie"),
+                };
+                Ok(format!(
+                    "Name:\t{}\nState:\t{} ({})\nPid:\t{}\nPPid:\t{}\nPgid:\t{}\nSid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n",
+                    snap.comm,
+                    code,
+                    word,
+                    info.pid,
+                    snap.ppid,
+                    snap.pgid,
+                    snap.sid,
+                    info.uid,
+                    info.uid,
+                    info.uid,
+                    info.uid,
+                    info.gid,
+                    info.gid,
+                    info.gid,
+                    info.gid
+                )
+                .into_bytes())
+            }
+            ProcNode::PidCmdline(pid) => {
+                let (_, snap) = self.local_snapshot(cred, pid)?;
+                if snap.argv.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    let mut out = snap.argv.join("\0").into_bytes();
+                    out.push(0);
+                    Ok(out)
+                }
+            }
+            ProcNode::PidStat(pid) => {
+                let (info, snap) = self.local_snapshot(cred, pid)?;
+                let code = match snap.state {
+                    abi::ProcState::Running => 'R',
+                    abi::ProcState::Sleeping => 'S',
+                    abi::ProcState::Stopped => 'T',
+                    abi::ProcState::Zombie => 'Z',
+                };
+                let tty_nr = snap.tty.unwrap_or(0);
+                Ok(format!(
+                    "{} ({}) {} {} {} {} {} -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {} 0 0\n",
+                    info.pid,
+                    snap.comm,
+                    code,
+                    snap.ppid,
+                    snap.pgid,
+                    snap.sid,
+                    tty_nr,
+                    snap.start_ticks
+                )
+                .into_bytes())
+            }
+            ProcNode::PidCgroup(pid) => {
+                let (_, snap) = self.local_snapshot(cred, pid)?;
+                Ok(format!("0::{}\n", snap.cgroup).into_bytes())
+            }
             ProcNode::PidMountinfo(pid) => {
                 let bridge = self.bridge().ok_or(Errno::ENOENT)?;
                 let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
@@ -904,7 +1078,11 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
                         },
                         file_type: FileType::Symlink,
                     });
+                    let mut provider_has_uptime = false;
                     for dyn_entry in self.provider.top_entries(cred).await? {
+                        if dyn_entry.name == "uptime" {
+                            provider_has_uptime = true;
+                        }
                         let idx = self.state.borrow_mut().top_names.intern(&dyn_entry.name)?;
                         out.push(DirEntry {
                             name: dyn_entry.name,
@@ -915,9 +1093,25 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
                             file_type: dyn_entry.file_type,
                         });
                     }
+                    if !provider_has_uptime {
+                        out.push(DirEntry {
+                            name: "uptime".into(),
+                            node: NodeId {
+                                ino: TOP_UPTIME_INO,
+                                generation: GENERATION,
+                            },
+                            file_type: FileType::File,
+                        });
+                    }
                     let mut pids: BTreeSet<u32> = BTreeSet::new();
                     if let Some(bridge) = self.bridge() {
-                        pids.extend(bridge.local_pids());
+                        for pid in bridge.local_pids() {
+                            if let Some(info) = bridge.process_info(pid)
+                                && (info.snapshot.is_none() || proc_visible(cred, pid, info.uid))
+                            {
+                                pids.insert(pid);
+                            }
+                        }
                     }
                     pids.extend(self.provider.list_pids(cred).await?);
                     for pid in pids {
@@ -933,7 +1127,27 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
                 }
                 ProcNode::PidDir(pid) => {
                     let (_, _, is_local) = self.pid_owner(cred, pid).await?;
+                    let has_snapshot = is_local
+                        && self
+                            .bridge()
+                            .and_then(|b| b.process_info(pid))
+                            .is_some_and(|i| i.snapshot.is_some());
                     if is_local {
+                        if has_snapshot {
+                            for (name, sub, ft) in [
+                                ("cgroup", ProcNode::PidCgroup(pid), FileType::File),
+                                ("cmdline", ProcNode::PidCmdline(pid), FileType::File),
+                            ] {
+                                out.push(DirEntry {
+                                    name: name.into(),
+                                    node: NodeId {
+                                        ino: encode_proc_ino(sub),
+                                        generation: GENERATION,
+                                    },
+                                    file_type: ft,
+                                });
+                            }
+                        }
                         for (name, sub, ft) in [
                             ("cwd", ProcNode::PidCwd(pid), FileType::Symlink),
                             ("fd", ProcNode::PidFdDir(pid), FileType::Dir),
@@ -952,17 +1166,34 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
                                 file_type: ft,
                             });
                         }
+                        if has_snapshot {
+                            for (name, sub, ft) in [
+                                ("stat", ProcNode::PidStat(pid), FileType::File),
+                                ("status", ProcNode::PidStatus(pid), FileType::File),
+                            ] {
+                                out.push(DirEntry {
+                                    name: name.into(),
+                                    node: NodeId {
+                                        ino: encode_proc_ino(sub),
+                                        generation: GENERATION,
+                                    },
+                                    file_type: ft,
+                                });
+                            }
+                        }
                     }
-                    for dyn_entry in self.provider.pid_entries(cred, pid).await? {
-                        let idx = self.state.borrow_mut().pid_names.intern(&dyn_entry.name)?;
-                        out.push(DirEntry {
-                            name: dyn_entry.name,
-                            node: NodeId {
-                                ino: encode_proc_ino(ProcNode::PidDynamic(pid, idx)),
-                                generation: GENERATION,
-                            },
-                            file_type: dyn_entry.file_type,
-                        });
+                    if !has_snapshot {
+                        for dyn_entry in self.provider.pid_entries(cred, pid).await? {
+                            let idx = self.state.borrow_mut().pid_names.intern(&dyn_entry.name)?;
+                            out.push(DirEntry {
+                                name: dyn_entry.name,
+                                node: NodeId {
+                                    ino: encode_proc_ino(ProcNode::PidDynamic(pid, idx)),
+                                    generation: GENERATION,
+                                },
+                                file_type: dyn_entry.file_type,
+                            });
+                        }
                     }
                 }
                 ProcNode::PidNsDir(pid) => {
@@ -983,9 +1214,12 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
                     let bridge = self.bridge().ok_or(Errno::ENOENT)?;
                     let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
                     may_inspect_proc(cred, info.uid)?;
+                    let mut seen_fds = BTreeSet::new();
                     let fds: Vec<Fd> = info.fds.borrow().fds().collect();
                     for fd in fds {
-                        if let Ok(fd16) = u16::try_from(fd) {
+                        if let Ok(fd16) = u16::try_from(fd)
+                            && seen_fds.insert(fd16)
+                        {
                             out.push(DirEntry {
                                 name: fd.to_string(),
                                 node: NodeId {
@@ -994,6 +1228,24 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
                                 },
                                 file_type: FileType::Symlink,
                             });
+                        }
+                    }
+                    if let Some(snap) = &info.snapshot
+                        && snap.tty.is_some()
+                    {
+                        for &tfd in &snap.tty_fds {
+                            if let Ok(fd16) = u16::try_from(tfd)
+                                && seen_fds.insert(fd16)
+                            {
+                                out.push(DirEntry {
+                                    name: fd16.to_string(),
+                                    node: NodeId {
+                                        ino: encode_proc_ino(ProcNode::PidFd(pid, fd16)),
+                                        generation: GENERATION,
+                                    },
+                                    file_type: FileType::Symlink,
+                                });
+                            }
                         }
                     }
                 }
@@ -1076,11 +1328,16 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
                     let bridge = self.bridge().ok_or(Errno::ENOENT)?;
                     let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
                     may_inspect_proc(cred, info.uid)?;
-                    let file = info
-                        .fds
-                        .borrow()
-                        .get(Fd::from(fd))
-                        .map_err(|_| Errno::ENOENT)?;
+                    let file_res = info.fds.borrow().get(Fd::from(fd));
+                    let file = match file_res {
+                        Ok(f) => f,
+                        Err(_) => {
+                            if let Some(tty) = snapshot_tty_fd(&info, fd) {
+                                return Ok(format!("/dev/pts/{tty}"));
+                            }
+                            return Err(Errno::ENOENT);
+                        }
+                    };
                     if let Some(ns_file) = file.mount_ns() {
                         let ns_id = ns_file.ns.borrow().id().0;
                         return Ok(format!("mnt:[{ns_id}]"));
@@ -1527,5 +1784,196 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
             state.opens.remove(&open.id);
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memfs::MemFs;
+    use crate::mount::{FsType, MountBacking, MountFlags};
+    use crate::now_or_never;
+    use crate::vfs::{DefaultFilesystemFactory, Vfs};
+    use crate::walk::StartAnchor;
+    use os_core::permissions::Identity;
+
+    fn read_str(vfs: &Vfs, pid: u32, path: &str) -> Result<String> {
+        let fd =
+            now_or_never(vfs.openat(pid, StartAnchor::Root, path, abi::O_RDONLY, 0)).unwrap()?;
+        let mut buf = vec![0u8; 4096];
+        let n = now_or_never(vfs.read(pid, fd, &mut buf)).unwrap()?;
+        let _ = now_or_never(vfs.close(pid, fd)).unwrap();
+        Ok(String::from_utf8(buf[..n].to_vec()).unwrap())
+    }
+
+    #[test]
+    fn local_proc_renders_status_cmdline_stat_cgroup_uptime_and_hidepid() {
+        let root_fs = Rc::new(MemFs::new(
+            FsId("mem:root".into()),
+            1,
+            0,
+            0,
+            0o755,
+            Box::new(|| (1_700_000_000, 0)),
+        ));
+        let root_backing = Rc::new(MountBacking::new(root_fs, FsType::TmpFs));
+        let vfs = now_or_never(Vfs::boot(
+            "inst-proc-test",
+            root_backing,
+            "tmpfs",
+            Rc::new(DefaultFilesystemFactory::default()),
+        ))
+        .unwrap()
+        .unwrap();
+        now_or_never(vfs.mkdirat(1, StartAnchor::Root, "/proc", 0o555))
+            .unwrap()
+            .unwrap();
+        let proc_fs = Rc::new(ProcFs::local(
+            FsId("proc:local".into()),
+            Timespec { sec: 100, nsec: 0 },
+        ));
+        proc_fs.bind_bridge(vfs.proc_bridge());
+        let sys_ns = vfs.system_namespace();
+        now_or_never(vfs.mount_on_namespace(
+            &sys_ns,
+            &Cred::root(),
+            Rc::new(MountBacking::new(proc_fs, FsType::Proc)),
+            None,
+            "proc",
+            "/proc",
+            MountFlags::default(),
+            0,
+            None,
+        ))
+        .unwrap()
+        .unwrap();
+
+        vfs.set_uptime_hook(Rc::new(|| 123));
+        vfs.set_process_snapshot(
+            1,
+            Some(ProcMetaSnapshot {
+                ppid: 0,
+                pgid: 1,
+                sid: 1,
+                uid: 0,
+                gid: 0,
+                state: abi::ProcState::Running,
+                cgroup: "/init".into(),
+                comm: "init".into(),
+                argv: vec!["/usr/bin/init".into()],
+                start_ticks: 0,
+                tty: None,
+                tty_fds: Vec::new(),
+            }),
+        )
+        .unwrap();
+
+        let ann_cred = Cred {
+            identity: Identity {
+                id: 1000,
+                group: 1000,
+                groups: BTreeSet::from([1000]),
+            },
+            umask: 0o022,
+            token: None,
+        };
+        let bob_cred = Cred {
+            identity: Identity {
+                id: 1001,
+                group: 1001,
+                groups: BTreeSet::from([1001]),
+            },
+            umask: 0o022,
+            token: None,
+        };
+        vfs.spawn_process(2, 1, ann_cred, None, None, None).unwrap();
+        vfs.spawn_process(3, 1, bob_cred, None, None, None).unwrap();
+        vfs.set_process_snapshot(
+            2,
+            Some(ProcMetaSnapshot {
+                ppid: 1,
+                pgid: 2,
+                sid: 2,
+                uid: 1000,
+                gid: 1000,
+                state: abi::ProcState::Running,
+                cgroup: "/user/ann".into(),
+                comm: "sh".into(),
+                argv: vec!["sh".into(), "-c".into(), "echo hi".into()],
+                start_ticks: 250,
+                tty: Some(0),
+                tty_fds: vec![0, 1, 2],
+            }),
+        )
+        .unwrap();
+        vfs.set_process_snapshot(
+            3,
+            Some(ProcMetaSnapshot {
+                ppid: 1,
+                pgid: 3,
+                sid: 3,
+                uid: 1001,
+                gid: 1001,
+                state: abi::ProcState::Stopped,
+                cgroup: "/user/bob".into(),
+                comm: "sleep".into(),
+                argv: vec!["sleep".into(), "60".into()],
+                start_ticks: 500,
+                tty: None,
+                tty_fds: Vec::new(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(read_str(&vfs, 2, "/proc/uptime").unwrap(), "123.00 0.00\n");
+        let status = read_str(&vfs, 2, "/proc/self/status").unwrap();
+        assert!(status.contains("Name:\tsh\n"));
+        assert!(status.contains("Pid:\t2\n"));
+        assert!(status.contains("PPid:\t1\n"));
+        assert_eq!(
+            read_str(&vfs, 2, "/proc/2/cmdline").unwrap(),
+            "sh\0-c\0echo hi\0"
+        );
+        assert_eq!(
+            read_str(&vfs, 2, "/proc/2/cgroup").unwrap(),
+            "0::/user/ann\n"
+        );
+        let stat = read_str(&vfs, 2, "/proc/2/stat").unwrap();
+        assert!(stat.starts_with("2 (sh) R 1 2 2 0 "));
+        // Field 22 (index 19 after `) `) MUST be boot-relative ticks in CLK_TCK (100 Hz).
+        let after_comm: Vec<&str> = stat
+            .split(") ")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        assert_eq!(after_comm[19], "250");
+        // Snapshot tty_fds project `/proc/<pid>/fd/<n>` -> `/dev/pts/<tty>`.
+        assert_eq!(
+            now_or_never(vfs.readlinkat(2, StartAnchor::Root, "/proc/2/fd/0"))
+                .unwrap()
+                .unwrap(),
+            "/dev/pts/0"
+        );
+        // Non-root Ann can read PID 1's cmdline, cannot see Bob's PID 3 (`hidepid=invisible`).
+        assert_eq!(
+            read_str(&vfs, 2, "/proc/1/cmdline").unwrap(),
+            "/usr/bin/init\0"
+        );
+        assert_eq!(read_str(&vfs, 2, "/proc/3/status"), Err(Errno::ENOENT));
+        let ann_entries: Vec<String> = now_or_never(vfs.readdir(2, StartAnchor::Root, "/proc"))
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(ann_entries.contains(&"1".to_string()));
+        assert!(ann_entries.contains(&"2".to_string()));
+        assert!(ann_entries.contains(&"uptime".to_string()));
+        assert!(!ann_entries.contains(&"3".to_string()));
+
+        // Root sees all PIDs including Bob's PID 3.
+        let root_status = read_str(&vfs, 1, "/proc/3/status").unwrap();
+        assert!(root_status.contains("State:\tT (stopped)\n"));
     }
 }

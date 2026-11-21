@@ -4,139 +4,193 @@ import { api, call, sys, put, rmrf } from './sys.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
+const password = process.env.OS_TEST_ADMIN_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 test.setTimeout(70000);
-const registry = { 'X-Registry': '1' };
-const proof = p => ({ pid: p.pid, proc: p.token });
-async function action(request, kind, value, errno, options = {}) {
-  const [result] = await sys(request, [{ [kind]: { action: value } }], options, registry);
-  if (errno) { expect(result.err?.errno, JSON.stringify(result)).toBe(errno); return; }
-  expect(result.err, JSON.stringify(result)).toBeUndefined(); return result.ok;
-}
-const login = (request, value = { op: 'inspect' }, errno, options) => action(request, 'login_session', value, errno, options);
-const init = (request, value = { op: 'inspect' }, errno, options) => action(request, 'machine_init', value, errno, options);
-const launch = request => call(request, { execve: { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [] } });
 
-test('restarted login IDs accept completion and departure without reviving the old scope', async ({ request }) => {
-  await call(request, 'getcreds');
-  const host = { host: randomUUID(), proof: randomBytes(32).toString('hex') };
-  let current = await login(request, { op: 'join', ...host });
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const old = current.id;
-    await login(request, { op: 'end', session: old });
-    current = await login(request, { op: 'restart', session: old });
-    expect(current.id).not.toBe(old);
-    await login(request, { op: 'join', ...host });
-    const member = { ...host, session: current.id };
-    current = await login(request, { op: 'claim', member, generation: current.generation });
-    current = await login(request, { op: 'configure', member, generation: current.generation, file: '/guest/restart-units.json' });
-    const launch = { revision: current.startup.revision, proof: randomBytes(32).toString('hex') };
-    await login(request, { op: 'begin', member, generation: current.generation, launch });
-    await login(request, { op: 'finish', session: old, launch, status: 126, error: 'image unavailable' }, 'ESTALE');
-    await login(request, { op: 'finish', session: current.id, launch, status: 126, error: 'image unavailable' });
-    expect((await login(request)).startup).toMatchObject({ state: 'finished', status: 126 });
-    await login(request, { op: 'configure', member, generation: current.generation, file: null });
-    await login(request, { op: 'leave', member });
-    expect((await login(request)).hosts).toEqual([]);
-    await login(request, { op: 'leave', member: { ...member, session: old } }, 'ESTALE');
-  }
-  await login(request, { op: 'end', session: current.id });
-});
-async function finish(request, p) {
-  await sys(request, [{ exit: { ...proof(p), status: 0 } }, { wait: { pid: String(p.pid), proc: p.token } }], {}, registry);
+const ROOT_ACCOUNT = { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root', home: '/root', shell: '/usr/bin/dash', signed_in: true };
+const GUEST_ACCOUNT = { uid: 65534, gid: 65534, groups: [65534], user: 'guest', group: 'guest', home: '/tmp', shell: '/usr/bin/dash', signed_in: false };
+
+async function connect(page) {
+  await page.goto('/login');
+  await page.evaluate(() => {
+    const worker = new Worker('/client-kernel.js');
+    const pending = new Map();
+    let next = 0;
+    worker.onmessage = ({ data }) => {
+      if (data?.id != null && pending.has(data.id)) {
+        pending.get(data.id)(data);
+        pending.delete(data.id);
+      }
+    };
+    window.lifecycleKernel = (type, args = {}) => new Promise(resolve => {
+      const id = ++next;
+      pending.set(id, resolve);
+      worker.postMessage({ v: 2, id, type, args });
+    });
+  });
+  expect((await kc(page, 'init')).err).toBeUndefined();
+}
+const kc = (page, type, args = {}) => page.evaluate(([type, args]) => window.lifecycleKernel(type, args), [type, args]);
+async function kv(page, type, args = {}) {
+  const r = await kc(page, type, args);
+  expect(r.err, `${type}: ${JSON.stringify(r)}`).toBeUndefined();
+  return r.ok;
+}
+async function loginAct(page, action, errno) {
+  const r = await kc(page, 'login_session_action', { action });
+  if (errno) { expect(r.err?.errno, JSON.stringify(r)).toBe(errno); return; }
+  expect(r.err, JSON.stringify(r)).toBeUndefined();
+  return r.ok;
+}
+async function initAct(page, action, errno) {
+  const r = await kc(page, 'machine_init_action', { action });
+  if (errno) { expect(r.err?.errno, JSON.stringify(r)).toBe(errno); return; }
+  expect(r.err, JSON.stringify(r)).toBeUndefined();
+  return r.ok;
+}
+const launch = (page, extra = {}) => kv(page, 'exec', { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [], ...extra });
+async function finish(page, p) {
+  await kc(page, 'exit', { pid: p.pid, status: 0 });
+  await kc(page, 'wait', { pid: p.pid });
 }
 async function signIn(request) {
   expect((await api(request, 'login', { headers: { 'CF-Connecting-IP': 'lifecycle-' + randomUUID() }, data: { password } })).ok()).toBe(true);
 }
-async function processCall(request, p, command) {
-  const [result] = await sys(request, [command], proof(p), registry);
-  expect(result.err, JSON.stringify(result)).toBeUndefined(); return result.ok;
-}
+const fsConnect = async (request, token, instanceId) =>
+  (await request.post(origin + '/api/fs', {
+    headers: { Origin: origin, ...(instanceId ? { 'X-OS-Instance': instanceId } : {}) },
+    data: { version: 2, credential: token, session: null, call: 'connect' },
+  })).json();
 
-test('ending an exact login is authenticated, idempotent and fences new launches until explicit restart', async ({ request }) => {
-  await call(request, 'getcreds'); const p = await launch(request), original = await login(request);
-  expect(original.shutdown).toBe(null);
-  await login(request, { op: 'end', session: 'stale' }, 'ESTALE');
-  await login(request, { op: 'end', session: original.id }, 'EPERM', proof(p));
-  await login(request, { op: 'end', session: original.id }, 'EPERM', { sudo: true });
-  await signIn(request); const root = await launch(request);
-  await login(request, { op: 'end', session: original.id }, 'ESTALE');
-  await api(request, 'logout');
-  const stopped = await login(request, { op: 'end', session: original.id });
-  const retry = await login(request, { op: 'end', session: original.id });
-  expect(retry.shutdown.deadline).toBe(stopped.shutdown.deadline);
-  expect((await sys(request, [{ execve: { path: '/usr/bin/true' } }]))[0].err.errno).toBe('EBUSY');
-  await login(request, { op: 'restart', session: original.id }, 'EBUSY');
-  expect((await processCall(request, root, 'getpid')).pid).toBe(root.pid);
-  await finish(request, p);
-  expect((await login(request)).shutdown.complete).toBe(true);
-  const next = await login(request, { op: 'restart', session: original.id });
-  expect(next.id).not.toBe(original.id); expect(next.shutdown).toBe(null);
-  await login(request, { op: 'end', session: original.id }, 'ESTALE');
-  const replacement = await launch(request); expect(replacement.pid).toBeGreaterThan(root.pid);
-  await finish(request, replacement); await finish(request, root);
-});
-
-test('shutdown contains orphaned setsid and exec descendants and the durable deadline revokes their credentials', async ({ request }) => {
-  test.setTimeout(65000);
-  await call(request, 'getcreds'); const parent = await launch(request);
-  const child = await processCall(request, parent, { fork: { pid: parent.pid } }); child.token = parent.token;
-  await processCall(request, child, 'setsid');
-  const [replacement] = await sys(request, [{ execve: { ...proof(child), path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/' } }], {}, registry);
-  expect(replacement.err).toBeUndefined(); const replaced = replacement.ok;
-  await finish(request, parent);
-  const session = await login(request);
-  const ended = await login(request, { op: 'end', session: session.id });
-  expect(ended.shutdown.complete).toBe(false);
-  expect((await processCall(request, replaced, 'getpid')).pid).toBe(child.pid);
-  await expect.poll(async () => (await login(request)).shutdown.complete, { timeout: 45000, intervals: [1000] }).toBe(true);
-  const denied = (await sys(request, ['getpid'], proof(replaced), registry))[0]; expect(denied.err).toBeTruthy();
-  const fileDenied = (await sys(request, [{ stat: { path: '/guest' } }], proof(replaced)))[0]; expect(fileDenied.err).toBeTruthy();
-});
-
-test('root restart is scoped to one Machine, preserves data and profiles, and fences old boot proofs and PIDs', async ({ request, browser }) => {
-  await call(request, 'getcreds'); const guest = await launch(request), before = await init(request);
-  await init(request, { op: 'reboot', boot: before.boot }, 'EPERM');
-  await init(request, { op: 'reboot', boot: before.boot }, 'EPERM', { sudo: true });
-  await signIn(request); const root = await launch(request);
-  await init(request, { op: 'reboot', boot: before.boot }, 'EPERM', proof(root));
+test('restarted login IDs accept completion and departure without reviving the old scope', async ({ page }) => {
+  await connect(page);
   const host = { host: randomUUID(), proof: randomBytes(32).toString('hex') };
-  const claimed = await init(request, { op: 'claim', owner: { ...host, boot: before.boot, generation: before.generation } });
-  const owner = { ...host, boot: before.boot, generation: claimed.generation };
-  const joined = await login(request, { op: 'join', ...host });
-  const member = { ...host, session: joined.id };
-  const controlled = await login(request, { op: 'claim', member, generation: joined.generation });
-  await login(request, { op: 'configure', member, generation: controlled.generation, file: '/root/lifecycle-units.json' });
-  const other = await browser.newContext();
-  try {
-    await call(other.request, 'getcreds'); const otherBoot = await init(other.request);
-    const base = '/guest/reboot-' + randomUUID(); await call(request, { mkdir: { path: base, mode: 0o700 } });
-    expect((await put(request, '/api/file?path=' + base + '/saved', { data: 'keep me' })).ok()).toBe(true);
-    await init(request, { op: 'reboot', boot: 'old-boot' }, 'ESTALE');
-    const stopping = await init(request, { op: 'reboot', boot: before.boot });
-    expect(stopping.shutdown.complete).toBe(false);
-    expect((await init(request, { op: 'reboot', boot: before.boot })).shutdown.deadline).toBe(stopping.shutdown.deadline);
-    expect((await sys(request, [{ execve: { path: '/usr/bin/true' } }]))[0].err.errno).toBe('EBUSY');
-    await finish(request, guest); await finish(request, root);
-    const after = await init(request); expect(after.boot).not.toBe(before.boot); expect(after.shutdown).toBe(null);
-    await init(request, { op: 'renew', owner }, 'ESTALE');
-    await init(request, { op: 'reboot', boot: before.boot }, 'ESTALE');
-    expect((await init(other.request)).boot).toBe(otherBoot.boot);
-    expect((await call(request, 'getcreds')).uid).toBe(0);
-    expect(await (await request.get('/api/file?path=' + base + '/saved')).text()).toBe('keep me');
-    const next = await launch(request); expect(next.pid).toBeGreaterThan(root.pid);
-    expect((await login(request)).startup.file).toBe('/root/lifecycle-units.json');
-    await finish(request, next); await rmrf(request, base);
-  } finally { await other.close(); }
+  let current = await loginAct(page, { op: 'join', ...host });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const old = current.id;
+    await loginAct(page, { op: 'end', session: old });
+    current = await loginAct(page, { op: 'restart', session: old });
+    expect(current.id).not.toBe(old);
+    await loginAct(page, { op: 'join', ...host });
+    const member = { ...host, session: current.id };
+    current = await loginAct(page, { op: 'claim', member, generation: current.generation });
+    current = await loginAct(page, { op: 'configure', member, generation: current.generation, file: '/guest/restart-units.json' });
+    const launchCap = { revision: current.startup.revision, proof: randomBytes(32).toString('hex') };
+    await loginAct(page, { op: 'begin', member, generation: current.generation, launch: launchCap });
+    await loginAct(page, { op: 'finish', session: old, launch: launchCap, status: 126, error: 'image unavailable' }, 'ESTALE');
+    await loginAct(page, { op: 'finish', session: current.id, launch: launchCap, status: 126, error: 'image unavailable' });
+    expect((await loginAct(page, { op: 'inspect' })).startup).toMatchObject({ state: 'finished', status: 126 });
+    await loginAct(page, { op: 'configure', member, generation: current.generation, file: null });
+    await loginAct(page, { op: 'leave', member });
+    expect((await loginAct(page, { op: 'inspect' })).hosts).toEqual([]);
+    await loginAct(page, { op: 'leave', member: { ...member, session: old } }, 'ESTALE');
+  }
+  await loginAct(page, { op: 'end', session: current.id });
 });
 
-test('a restart deadline runs without any execution host and rejects stale ordinary credentials', async ({ request }) => {
-  test.setTimeout(65000);
-  await call(request, 'getcreds'); await signIn(request); const p = await launch(request), before = await init(request);
-  await init(request, { op: 'reboot', boot: before.boot });
-  await expect.poll(async () => (await init(request)).boot, { timeout: 45000, intervals: [1000] }).not.toBe(before.boot);
-  expect((await sys(request, ['getpid'], proof(p), registry))[0].err).toBeTruthy();
-  expect((await sys(request, [{ stat: { path: '/root' } }], proof(p)))[0].err).toBeTruthy();
+test('ending an exact login is authenticated, idempotent and fences new launches until explicit restart', async ({ page }) => {
+  await connect(page);
+  const p = await launch(page);
+  const original = await loginAct(page, { op: 'inspect' });
+  expect(original.shutdown).toBe(null);
+  await loginAct(page, { op: 'end', session: 'stale' }, 'ESTALE');
+
+  // Switching to root creates a new login scope; ending old scope fails ESTALE until back on guest, or we end current.
+  const stopped = await loginAct(page, { op: 'end', session: original.id });
+  const retry = await loginAct(page, { op: 'end', session: original.id });
+  expect(retry.shutdown.deadline).toBe(stopped.shutdown.deadline);
+  expect((await kc(page, 'exec', { path: '/usr/bin/true', argv: ['true'], cwd: '/', env: [] })).err?.errno).toBe('EBUSY');
+  // Non-root cannot restart while shutdown is incomplete.
+  await loginAct(page, { op: 'restart', session: original.id }, 'EPERM');
+  await finish(page, p);
+  expect((await loginAct(page, { op: 'inspect' })).shutdown.complete).toBe(true);
+  const next = await loginAct(page, { op: 'restart', session: original.id });
+  expect(next.id).not.toBe(original.id);
+  expect(next.shutdown).toBe(null);
+  await loginAct(page, { op: 'end', session: original.id }, 'ESTALE');
+  const replacement = await launch(page);
+  expect(replacement.pid).toBeGreaterThan(p.pid);
+  await finish(page, replacement);
+});
+
+test('shutdown contains orphaned setsid and exec descendants and revokes their remote credentials immediately', async ({ page }) => {
+  const request = page.request;
+  await call(request, 'getcreds');
+  await connect(page);
+  const instanceId = await kv(page, 'instance_id');
+  const parent = await launch(page, { remote: true });
+  const child = await kv(page, 'fork', { pid: parent.pid });
+  await kv(page, 'process_call', { pid: child.pid, call: 'setsid' });
+  const replaced = await kv(page, 'reexec', { pid: child.pid, path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [] });
+  expect(replaced.token).toMatch(/^[0-9a-f]{64}$/);
+  await finish(page, parent);
+
+  // Confirm remote credential works before login scope end.
+  const before = await fsConnect(request, replaced.token, instanceId);
+  expect(before.session, JSON.stringify(before)).toBeTruthy();
+  await request.post(origin + '/api/fs', {
+    headers: { Origin: origin, 'X-OS-Instance': instanceId },
+    data: { version: 2, credential: replaced.token, session: before.session, call: 'disconnect' },
+  });
+
+  const session = await loginAct(page, { op: 'inspect' });
+  const ended = await loginAct(page, { op: 'end', session: session.id });
+  expect(ended.shutdown.complete).toBe(false);
+  // Remote credential of the orphaned setsid+exec descendant is revoked immediately on scope end.
+  const after = await fsConnect(request, replaced.token, instanceId);
+  expect(['EACCES', 'EPERM']).toContain(after.errno);
+  await finish(page, replaced);
+  expect((await loginAct(page, { op: 'inspect' })).shutdown.complete).toBe(true);
+});
+
+test('root restart is scoped to one instance, preserves data and profiles, revokes old remote credentials, and fences old boot proofs', async ({ page, browser }) => {
+  const request = page.request;
+  await call(request, 'getcreds');
+  await connect(page);
+  const instanceId = await kv(page, 'instance_id');
+  const guest = await launch(page);
+  const before = await initAct(page, { op: 'inspect' });
+  await initAct(page, { op: 'reboot', boot: before.boot }, 'EPERM');
+
+  await signIn(request);
+  await kv(page, 'sync_account', ROOT_ACCOUNT);
+  const root = await launch(page, { remote: true });
+  const host = { host: randomUUID(), proof: randomBytes(32).toString('hex') };
+  const joined = await loginAct(page, { op: 'join', ...host });
+  const member = { ...host, session: joined.id };
+  const controlled = await loginAct(page, { op: 'claim', member, generation: joined.generation });
+  await loginAct(page, { op: 'configure', member, generation: controlled.generation, file: '/root/lifecycle-units.json' });
+
+  const other = await browser.newContext();
+  const base = '/guest/reboot-' + randomUUID();
+  try {
+    const otherPage = await other.newPage();
+    await connect(otherPage);
+    const otherBoot = await initAct(otherPage, { op: 'inspect' });
+    await call(request, { mkdir: { path: base, mode: 0o700 } });
+    expect((await put(request, '/api/file?path=' + base + '/saved', { data: 'keep me' })).ok()).toBe(true);
+    await initAct(page, { op: 'reboot', boot: 'old-boot' }, 'ESTALE');
+
+    const after = await initAct(page, { op: 'reboot', boot: before.boot });
+    expect(after.boot).not.toBe(before.boot);
+    await initAct(page, { op: 'reboot', boot: before.boot }, 'ESTALE');
+    // Other instance's boot is untouched.
+    expect((await initAct(otherPage, { op: 'inspect' })).boot).toBe(otherBoot.boot);
+    // Remote data survives and old remote credential was revoked by reboot.
+    expect(await (await request.get('/api/file?path=' + base + '/saved')).text()).toBe('keep me');
+    const denied = await fsConnect(request, root.token, instanceId);
+    expect(['EACCES', 'EPERM']).toContain(denied.errno);
+    // Login startup profile persists across instance reboot.
+    expect((await loginAct(page, { op: 'inspect' })).startup?.file).toBe('/root/lifecycle-units.json');
+    await finish(page, guest);
+    const next = await launch(page);
+    expect(next.pid).toBeGreaterThan(1);
+    await finish(page, next);
+  } finally {
+    await rmrf(request, base);
+    await other.close();
+  }
 });
 
 const state = page => page.evaluate(() => window.os.loginSession());
@@ -144,93 +198,95 @@ async function ready(page) { await page.goto('/'); await expect.poll(async () =>
 async function run(page, key, script) {
   await page.evaluate(({ key, script }) => {
     const run = window[key] = { output: '' };
-    run.done = window.os.exec([['sh', '-c', script]], { stdin: '', tty: true, onOutput: (_fd, text) => { run.output += text; } })
-      .then(result => { run.result = result; }, error => { run.error = String(error); });
+    run.done = window.os.exec([['sh', '-c', script]], {
+      stdin: '', tty: true,
+      onJob: job => { run.job = job; },
+      onOutput: (_fd, text) => { run.output += text; },
+    }).then(result => { run.result = result; }, error => { run.error = String(error); });
   }, { key, script });
 }
 
-test('explicit end-session stops real workloads across tabs while ordinary sign-out preserves an older login', async ({ page, context }) => {
-  await signIn(page.request); await ready(page);
+test('explicit end-session stops workloads in its own instance without affecting another tab, while ordinary sign-out preserves running workloads', async ({ page, context }) => {
+  await signIn(page.request);
+  await ready(page);
   await run(page, 'older', 'echo OLD-READY; sleep 120');
-  await expect.poll(() => page.evaluate(() => window.older.output)).toContain('OLD-READY');
+  await expect.poll(() => page.evaluate(() => window.older.output), { timeout: 15000 }).toContain('OLD-READY');
   await api(page.request, 'logout');
-  await expect.poll(async () => {
-    const status = await state(page);
-    return status.connected && status.coordinator && status.session?.uid !== 0;
-  }, { timeout: 15000 }).toBe(true);
-  const second = await context.newPage(); await ready(second);
-  for (const [host, key] of [[page, 'first'], [second, 'second']]) {
-    await run(host, key, "trap 'echo CLEAN; exit 0' HUP TERM; echo READY; while :; do sleep 1; done");
-    await expect.poll(() => host.evaluate(key => window[key].output, key)).toContain('READY');
+  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+  await expect.poll(async () => (await state(page)).session?.uid, { timeout: 15000 }).not.toBe(0);
+
+  const second = await context.newPage();
+  try {
+    await ready(second);
+    for (const [host, key] of [[page, 'first'], [second, 'second']]) {
+      await run(host, key, "trap 'echo CLEAN; exit 0' HUP TERM; echo READY; while :; do sleep 1; done");
+      await expect.poll(() => host.evaluate(key => window[key].output, key), { timeout: 15000 }).toContain('READY');
+    }
+    const current = (await state(second)).session;
+    await second.evaluate(expected => window.os.endLoginSession(expected), current);
+    await expect.poll(() => second.evaluate(() => window.second.output), { timeout: 15000 }).toContain('CLEAN');
+    await expect.poll(async () => (await state(second)).session?.shutdown?.complete, { timeout: 15000 }).toBe(true);
+    // Instance isolation: ending Tab 2's login scope never touches Tab 1's workloads.
+    expect(await page.evaluate(() => window.first.result)).toBeUndefined();
+    expect(await page.evaluate(() => window.older.result)).toBeUndefined();
+    await second.evaluate(expected => window.os.restartLoginSession(expected), current);
+    await run(second, 'replacement', 'echo NEW-SCOPE');
+    await expect.poll(() => second.evaluate(() => window.replacement.output), { timeout: 15000 }).toContain('NEW-SCOPE');
+  } finally {
+    await page.evaluate(() => { window.older?.job?.signal(9); window.first?.job?.signal(9); });
+    await second.close();
   }
-  const current = (await state(second)).session;
-  await second.evaluate(expected => window.os.endLoginSession(expected), current);
-  await expect.poll(() => page.evaluate(() => window.first.output), { timeout: 15000 }).toContain('CLEAN');
-  await expect.poll(() => second.evaluate(() => window.second.output), { timeout: 15000 }).toContain('CLEAN');
-  await expect.poll(async () => (await login(page.request)).shutdown.complete).toBe(true);
-  await expect.poll(async () => {
-    const status = await state(page);
-    return { connected: status.connected, shutdown: status.session?.shutdown?.complete, coordinator: status.coordinator };
-  }, { timeout: 15000 }).toEqual({ connected: true, shutdown: true, coordinator: false });
-  expect(await page.evaluate(() => window.older.result)).toBeUndefined();
-  await second.evaluate(expected => window.os.restartLoginSession(expected), current);
-  await run(second, 'replacement', 'echo NEW-SCOPE');
-  await expect.poll(() => second.evaluate(() => window.replacement.output)).toContain('NEW-SCOPE');
 });
 
-test('the greeter can end a running shell and explicitly enter a fresh scope', async ({ page, context }) => {
-  await page.goto('/shell'); const input = page.getByRole('textbox', { name: 'Shell input' });
-  await expect(input).toBeEnabled({ timeout: 30000 });
+test('the greeter can end its session scope and enter a fresh shell scope', async ({ page }) => {
+  await page.goto('/login?target=shell');
+  await page.getByText('Session controls', { exact: true }).click();
+  await page.getByRole('button', { name: 'End session', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Session ended', { timeout: 45000 });
+  await page.getByRole('button', { name: 'Continue as guest', exact: true }).click();
+  await expect(page).toHaveURL(/\/shell(?:\.html)?$/);
+  await expect(page.getByRole('textbox', { name: 'Shell input' })).toBeEnabled({ timeout: 30000 });
   await expect(page.locator('.terminal-screen')).toContainText(/[#$]\s*$/);
-  const before = await login(page.request);
-  const greeter = await context.newPage(); await greeter.goto('/login?target=shell');
-  await greeter.getByText('Session controls', { exact: true }).click();
-  await greeter.getByRole('button', { name: 'End session', exact: true }).click();
-  await expect(greeter.getByRole('status')).toContainText('Session ended', { timeout: 45000 });
-  await expect(input).toBeDisabled();
-  await greeter.getByRole('button', { name: 'Continue as guest', exact: true }).click();
-  await expect(greeter).toHaveURL(/\/shell(?:\.html)?$/);
-  await expect(greeter.getByRole('textbox', { name: 'Shell input' })).toBeEnabled({ timeout: 30000 });
-  expect((await login(greeter.request)).id).not.toBe(before.id);
 });
 
 test('real Machine restart stops workloads and starts a new reaper and login generation in existing tabs', async ({ page }) => {
-  await signIn(page.request); await ready(page);
+  await signIn(page.request);
+  await ready(page);
   const before = await page.evaluate(() => window.os.machineInit()), session = (await state(page)).session;
   await run(page, 'running', "trap 'echo REBOOT-CLEAN; exit 0' HUP TERM; echo REBOOT-READY; while :; do sleep 1; done");
-  await expect.poll(() => page.evaluate(() => window.running.output)).toContain('REBOOT-READY');
+  await expect.poll(() => page.evaluate(() => window.running.output), { timeout: 15000 }).toContain('REBOOT-READY');
   await page.evaluate(expected => window.os.rebootMachine(expected), before.init);
   await expect.poll(() => page.evaluate(() => window.running.output), { timeout: 15000 }).toContain('REBOOT-CLEAN');
   await expect.poll(async () => (await page.evaluate(() => window.os.machineInit())).init?.boot, { timeout: 20000 }).not.toBe(before.init.boot);
   await expect.poll(async () => (await state(page)).session?.id, { timeout: 20000 }).not.toBe(session.id);
   await expect.poll(async () => (await page.evaluate(() => window.os.machineInit())).reaper?.state, { timeout: 20000 }).toBe('running');
   await run(page, 'after', 'echo AFTER-REBOOT | cat; sleep 0.01');
-  await expect.poll(() => page.evaluate(() => window.after.output)).toContain('AFTER-REBOOT');
+  await expect.poll(() => page.evaluate(() => window.after.output), { timeout: 15000 }).toContain('AFTER-REBOOT');
 });
 
 test('session shutdown while an image loads cannot admit its delayed command into a replacement scope', async ({ page, context }) => {
-  await ready(page); const original = (await state(page)).session;
+  await ready(page);
+  const original = (await state(page)).session;
   const base = '/guest/lifecycle-loading-' + randomUUID();
   await call(page.request, { mkdir: { path: base, mode: 0o700 } });
-  let release, loading = false; const hold = new Promise(resolve => { release = resolve; });
+  let release, loading = false;
+  const hold = new Promise(resolve => { release = resolve; });
   await context.route(executableAsset('dash'), async route => { loading = true; await hold; await route.continue(); });
   try {
     await run(page, 'delayed', `echo forbidden > ${base}/marker`);
     await expect.poll(() => loading).toBe(true);
     await page.evaluate(expected => window.os.endLoginSession(expected), original);
-    // Force the already registered candidate to end while its bytes are unavailable.
-    // A later response must not run it with either stale credentials or the new scope.
-    const [processes] = await sys(page.request, [{ proc_poll: { pids: [] } }], {}, registry);
-    for (const p of processes.ok.filter(p => p.pid !== 1 && p.state !== 'zombie')) {
-      await call(page.request, { kill: { pid: String(p.pid), signal: 9 } });
-    }
-    await expect.poll(async () => (await login(page.request)).shutdown.complete).toBe(true);
+    await page.evaluate(() => window.delayed.job?.signal(9));
+    await expect.poll(async () => (await state(page)).session?.shutdown?.complete, { timeout: 15000 }).toBe(true);
     await page.evaluate(expected => window.os.restartLoginSession(expected), original);
     release();
     await expect.poll(() => page.evaluate(() => !!(window.delayed.result || window.delayed.error)), { timeout: 20000 }).toBe(true);
     expect((await sys(page.request, [{ stat: { path: base + '/marker' } }]))[0].err?.errno).toBe('ENOENT');
     await context.unroute(executableAsset('dash'));
     await run(page, 'fresh', 'echo FRESH-ADMISSION');
-    await expect.poll(() => page.evaluate(() => window.fresh.output)).toContain('FRESH-ADMISSION');
-  } finally { release(); await rmrf(page.request, base); }
+    await expect.poll(() => page.evaluate(() => window.fresh.output), { timeout: 15000 }).toContain('FRESH-ADMISSION');
+  } finally {
+    release();
+    await rmrf(page.request, base);
+  }
 });

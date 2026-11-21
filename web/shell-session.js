@@ -2,6 +2,7 @@ import { verifyRelease } from './release.js';
 import init from './pkg/frontend.js';
 import './session-viewport.js';
 import { call } from './http.mjs';
+import { kernelCall } from './kernel/protocol.js';
 import { ShellSession } from './shell-session-controller.js';
 import { executionSupport } from './kernel/capabilities.js';
 
@@ -10,7 +11,16 @@ async function boot() {
   let listener;
   const windows = 'BroadcastChannel' in window ? new BroadcastChannel('os-session') : null;
   if (windows) windows.onmessage = () => dispatchEvent(new Event('os:login-changed'));
-  const session = new ShellSession({ identity: () => call('getcreds'), execute: exec, close: closeConsole,
+  const session = new ShellSession({
+    identity: async () => {
+      const who = await call('getcreds');
+      if (who && typeof who.uid === 'number') {
+        await kernelCall('sync_account', who).catch(() => {});
+        await kernelCall('login_refresh', { fromServer: false }).catch(() => {});
+      }
+      return who;
+    },
+    execute: exec, close: closeConsole,
     emit: event => listener?.(event) });
   window.osConsole = {
     listen(callback) { listener = callback; session.notify(); },

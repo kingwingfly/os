@@ -583,60 +583,72 @@ test('L2 root seeding + EROFS, v2 statfs + non-root mknod, v2 FICLONE, and X-Pro
   assert.equal(await (await bucket.get(srcPrep.key))?.text(), 'hello world!');
   await rpcAs(aliceToken, session, { release: { open: dstWrite } });
 
-  // (d) Server boundary denial for non-job X-Process-Token on v1 /api/sys path calls, while
-  // /proc status, /api/fs v2 handles, InotifyAddWatch(handle), /dev/archive PathAt.open, and
-  // /internal/exec LocalExecutable + chroot/no-usr-fallback work.
-  const initRes = await mf.dispatchFetch('http://localhost/api/sys', {
+  // (d) Retired X-Registry rejection + ServiceAuth v2 minting + X-Process-Token v1 boundary enforcement,
+  // while /api/fs v2 handles, InotifyAddWatch(handle), /dev/archive PathAt.open, and sudo minting work.
+  const retiredRegistry = await mf.dispatchFetch('http://localhost/api/sys', {
     method: 'POST',
     headers: { Origin: 'http://localhost', Cookie: guestCookie, 'Content-Type': 'application/json', 'X-Registry': '1' },
     body: JSON.stringify({ calls: [{ proc_init: { boot: 'boot-1' } }] }),
   });
-  assert.equal(initRes.status, 200);
-  const execRes = await mf.dispatchFetch('http://localhost/api/sys', {
-    method: 'POST',
-    headers: { Origin: 'http://localhost', Cookie: guestCookie, 'Content-Type': 'application/json', 'X-Registry': '1' },
-    body: JSON.stringify({
-      calls: [{
-        execve: {
-          path: '/usr/bin/coreutils',
-          argv: ['ls', '/tmp'],
-          env: [],
-          cwd: '/',
-          runtime: 'resources-v1',
-          local: { digest: 'b'.repeat(64), size: 64, cloud: true },
-        },
-      }],
-    }),
-  });
-  const execReply = await execRes.json();
-  assert.equal(execReply.results[0].err, undefined);
-  const liveProc = execReply.results[0].ok;
-  assert.ok(liveProc.token);
-  assert.equal(liveProc.asset, undefined);
+  assert.equal(retiredRegistry.status, 403);
+  assert.equal((await retiredRegistry.json()).errno, 'EPERM');
 
-  // Chroot / no-usr-fallback prevents /internal/exec from resolving server /usr behind client's back.
-  for (const extraHeaders of [{ 'X-OS-Chroot': '1' }, { 'X-OS-No-Usr-Fallback': '1' }]) {
-    const chrootExec = await mf.dispatchFetch('http://localhost/api/sys', {
+  const serviceAuth = async (payload, cookie = guestCookie) => {
+    const res = await mf.dispatchFetch('http://localhost/api/service-auth', {
       method: 'POST',
-      headers: {
-        Origin: 'http://localhost',
-        Cookie: guestCookie,
-        'Content-Type': 'application/json',
-        'X-Registry': '1',
-        ...extraHeaders,
-      },
-      body: JSON.stringify({ calls: [{ execve: { path: '/usr/bin/coreutils', argv: ['coreutils'], cwd: '/' } }] }),
+      headers: { Origin: 'http://localhost', Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
     });
-    assert.equal((await chrootExec.json()).results[0].err.errno, 'ENOENT');
-  }
+    return { status: res.status, body: await res.json() };
+  };
+  const liveInstId = 'inst-' + randomUUID();
+  const liveHostProof = randomBytes(32).toString('hex');
+  const attached = await serviceAuth({
+    attach_instance: { instance: { instance: liveInstId, host: 'authority-test' }, host_proof: liveHostProof },
+  });
+  assert.equal(attached.status, 200, JSON.stringify(attached));
+  assert.equal(attached.body.attached.instance_id, liveInstId);
+
+  const minted = await serviceAuth({
+    mint_service_cred: {
+      instance_id: liveInstId,
+      host_proof: liveHostProof,
+      scope: { cloud_fs: true, devices: ['archive'], containers: false, relay: false },
+      cloud_access: true,
+      umask: 0o022,
+    },
+  });
+  assert.equal(minted.status, 200, JSON.stringify(minted));
+  const liveProc = minted.body.cred;
+  assert.ok(liveProc.token);
+  assert.equal(liveProc.instance_id, liveInstId);
+  assert.equal(liveProc.cloud_access, true);
+
+  // Forged host_proof on ServiceAuth v2 fails closed with EACCES.
+  const forgedMint = await serviceAuth({
+    mint_service_cred: {
+      instance_id: liveInstId,
+      host_proof: 'f'.repeat(64),
+      scope: { cloud_fs: true, devices: [], containers: false, relay: false },
+      cloud_access: true,
+    },
+  });
+  assert.notEqual(forgedMint.status, 200);
+  assert.equal(forgedMint.body.errno, 'EACCES');
+
+  // Missing or mismatched X-OS-Instance on a ServiceAuth v2 token fails closed.
+  const missingInst = await postAuthority('/api/sys', { calls: ['getcreds'] }, { 'X-Process-Token': liveProc.token });
+  assert.equal(missingInst.results[0].err.errno, 'EACCES');
+  const wrongInst = await postAuthority('/api/sys', { calls: ['getcreds'] }, { 'X-Process-Token': liveProc.token, 'X-OS-Instance': 'inst-wrong' });
+  assert.equal(wrongInst.results[0].err.errno, 'EACCES');
 
   // Conflicting X-Process-Token header vs JSON proc is rejected with EPERM.
-  const conflict = await postAuthority('/api/sys', { proc: aliceToken, calls: ['getcreds'] }, { 'X-Process-Token': liveProc.token });
+  const conflict = await postAuthority('/api/sys', { proc: aliceToken, calls: ['getcreds'] }, { 'X-Process-Token': liveProc.token, 'X-OS-Instance': liveInstId });
   assert.equal(conflict.results[0].err.errno, 'EPERM');
 
   const fsHeaders = session => session ? { 'X-Fs-Session': session.id, 'X-Fs-Secret': session.secret } : {};
-  const sysWithHeader = (call, fsSession) => postAuthority('/api/sys', { pid: liveProc.pid, calls: [call] },
-    { 'X-Process-Token': liveProc.token, ...fsHeaders(fsSession) });
+  const sysWithHeader = (call, fsSession) => postAuthority('/api/sys', { calls: [call] },
+    { 'X-Process-Token': liveProc.token, 'X-OS-Instance': liveInstId, ...fsHeaders(fsSession) });
   for (const denied of [
     { stat: { path: '/etc/passwd' } },
     { lstat: { path: '/bin' } },
@@ -670,25 +682,22 @@ test('L2 root seeding + EROFS, v2 statfs + non-root mknod, v2 FICLONE, and X-Pro
     assert.equal(res.results[0].err?.errno, 'EPERM', `expected EPERM for ${JSON.stringify(denied)}, got ${JSON.stringify(res)}`);
   }
   // Body `proc` token is equally gated at the server boundary.
-  assert.equal((await postAuthority('/api/sys', { pid: liveProc.pid, proc: liveProc.token, calls: [{ stat: { path: '/etc/passwd' } }] })).results[0].err.errno, 'EPERM');
+  assert.equal((await postAuthority('/api/sys', { proc: liveProc.token, calls: [{ stat: { path: '/etc/passwd' } }] }, { 'X-OS-Instance': liveInstId })).results[0].err.errno, 'EPERM');
 
-  // Allowed calls with X-Process-Token: Getcreds, read-only /proc status/cmdline, /api/fs v2 handles,
+  // Allowed calls with X-Process-Token + X-OS-Instance: Getcreds, /api/fs v2 handles,
   // InotifyAddWatch with verified Handle, and /dev/archive with v2 PathAt.open.
   assert.ok((await sysWithHeader('getcreds')).results[0].ok.uid > 0);
-  const procStatus = await sysWithHeader({ pread: { path: `/proc/${liveProc.pid}/status`, count: 512 } });
-  assert.ok(Buffer.from(procStatus.results[0].ok.data, 'base64').toString().includes(`Pid:\t${liveProc.pid}`));
-  const procCmdline = await sysWithHeader({ pread: { path: `/proc/${liveProc.pid}/cmdline`, count: 512 } });
-  assert.equal(Buffer.from(procCmdline.results[0].ok.data, 'base64').toString(), 'ls\0/tmp\0');
 
-  const procConn = await rpcAs(liveProc.token, null, 'connect');
-  assert.ok(procConn.session);
-  const procTmp = await rpcAs(liveProc.token, procConn.session, { lookup: { dir: procConn.root, name: 'tmp' } });
+  const rpcInst = (cred, sess, call) => postAuthority('/api/fs', { version: 2, credential: cred, session: sess, call }, { 'X-OS-Instance': liveInstId });
+  const procConn = await rpcInst(liveProc.token, null, 'connect');
+  assert.ok(procConn.session, JSON.stringify(procConn));
+  const procTmp = await rpcInst(liveProc.token, procConn.session, { lookup: { dir: procConn.root, name: 'tmp' } });
   assert.equal(procTmp.metadata.file_type, 'dir');
 
   const forgedHandle = { ...procTmp.handle, proof: 'forged-proof' };
   assert.equal((await sysWithHeader({ inotify_add_watch: { path: '/ignored', handle: forgedHandle } }, procConn.session)).results[0].err.errno, 'EACCES');
   const watch = { inotify_add_watch: { path: '/ignored', handle: procTmp.handle } };
-  const otherProcSession = (await rpcAs(liveProc.token, null, 'connect')).session;
+  const otherProcSession = (await rpcInst(liveProc.token, null, 'connect')).session;
   for (const invalid of [null, otherProcSession, { ...procConn.session, secret: randomUUID() }]) {
     assert.equal((await sysWithHeader(watch, invalid)).results[0].err.errno, 'EACCES');
   }
@@ -793,37 +802,54 @@ test('L2 root seeding + EROFS, v2 statfs + non-root mknod, v2 FICLONE, and X-Pro
   assert.equal(unlinked.ok.nlink, 0);
   assert.ok('ok' in await guarded({ close: { fd: read.fd } }, null, read.fd_epoch));
 
-  const sudoInit = await mf.dispatchFetch('http://localhost/api/sys', {
-    method: 'POST',
-    headers: { Origin: 'http://localhost', Cookie: aliceCookie, 'Content-Type': 'application/json', 'X-Registry': '1' },
-    body: JSON.stringify({ calls: [{ proc_init: { boot: 'boot-sudo' } }] }),
-  });
-  assert.equal(sudoInit.status, 200);
-  const sudoExec = await mf.dispatchFetch('http://localhost/api/sys', {
-    method: 'POST',
-    headers: { Origin: 'http://localhost', Cookie: aliceCookie, 'Content-Type': 'application/json', 'X-Registry': '1' },
-    body: JSON.stringify({
-      sudo: true,
-      calls: [{
-        execve: {
-          path: '/usr/bin/coreutils',
-          argv: ['id'],
-          env: [],
-          cwd: '/',
-          runtime: 'resources-v1:chroot',
-          local: { digest: 'c'.repeat(64), size: 64, cloud: true },
-        },
-      }],
-    }),
-  });
-  const sudoProc = (await sudoExec.json()).results[0].ok;
+  const sudoInstId = 'inst-sudo-' + randomUUID();
+  const sudoHostProof = randomBytes(32).toString('hex');
+  const sudoAttach = await serviceAuth(
+    { attach_instance: { instance: { instance: sudoInstId, host: 'authority-sudo' }, host_proof: sudoHostProof } },
+    aliceCookie,
+  );
+  assert.equal(sudoAttach.status, 200, JSON.stringify(sudoAttach));
+  const sudoMint = await serviceAuth(
+    {
+      mint_service_cred: {
+        instance_id: sudoInstId,
+        host_proof: sudoHostProof,
+        scope: { cloud_fs: true, devices: [], containers: false, relay: false },
+        cloud_access: true,
+        sudo: true,
+      },
+    },
+    aliceCookie,
+  );
+  assert.equal(sudoMint.status, 200, JSON.stringify(sudoMint));
+  const sudoProc = sudoMint.body.cred;
   assert.ok(sudoProc?.token);
+  assert.equal(sudoProc.uid, 0);
   const sudoCreds = await postAuthority(
     '/api/sys',
-    { pid: sudoProc.pid, calls: ['getcreds'] },
-    { Cookie: aliceCookie, 'X-Process-Token': sudoProc.token },
+    { calls: ['getcreds'] },
+    { Cookie: aliceCookie, 'X-Process-Token': sudoProc.token, 'X-OS-Instance': sudoInstId },
   );
   assert.equal(sudoCreds.results[0].ok.uid, 0);
+  // Missing X-OS-Instance on sudo token fails closed.
+  const sudoNoInst = await postAuthority(
+    '/api/sys',
+    { calls: ['getcreds'] },
+    { Cookie: aliceCookie, 'X-Process-Token': sudoProc.token },
+  );
+  assert.equal(sudoNoInst.results[0].err.errno, 'EACCES');
+  // Detaching the instance revokes its minted token immediately.
+  const sudoDetach = await serviceAuth(
+    { detach_instance: { instance_id: sudoInstId, host_proof: sudoHostProof } },
+    aliceCookie,
+  );
+  assert.equal(sudoDetach.status, 200, JSON.stringify(sudoDetach));
+  const afterDetach = await postAuthority(
+    '/api/sys',
+    { calls: ['getcreds'] },
+    { Cookie: aliceCookie, 'X-Process-Token': sudoProc.token, 'X-OS-Instance': sudoInstId },
+  );
+  assert.equal(afterDetach.results[0].err.errno, 'EPERM');
 
   // Stale schema "9" is refused without SQL migration (contract §2.12).
   const freshStale = namespace.get(namespace.idFromName('stale-schema-9-cold'));

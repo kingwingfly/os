@@ -30,10 +30,12 @@ test('stdout and errors scroll after DOM updates; completion uses a separate pag
     await expect.poll(() => log.evaluate(e => e.scrollHeight - e.clientHeight - e.scrollTop)).toBeLessThanOrEqual(2);
     const input = page.getByRole('combobox', { name: 'Terminal command' });
     const transcript = await log.innerText();
+    const linesBefore = await log.locator('pre').allInnerTexts();
     await input.fill(''); await input.press('Tab');
     await expect(page.getByRole('listbox', { name: 'Completions' })).toBeVisible();
-    expect(await log.innerText()).toBe(transcript);
+    expect(await log.locator('pre').allInnerTexts()).toEqual(linesBefore);
     await input.press('Escape');
+    expect(await log.innerText()).toBe(transcript);
   }
 });
 

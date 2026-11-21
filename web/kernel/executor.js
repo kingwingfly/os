@@ -2,7 +2,7 @@
 // terminal events, while Workers and shared memory remain owned here.
 import { exec, deliverSignal, reconcile } from '../wasi/exec.mjs';
 // The private boot path shares the same process host and signal reconciliation.
-export { exec };
+export { exec, reconcile };
 import { Consoles } from './console.js';
 import { SeatDevices } from './seat.js';
 import { ConsoleGrants, ConsolePeer, consoleInput } from './attachment.js';

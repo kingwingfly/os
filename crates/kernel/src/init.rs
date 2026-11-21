@@ -96,10 +96,6 @@ impl Init {
                     .get_or_insert_with(|| crate::lifecycle::Shutdown::new(self.observed));
             }
             InitAction::Claim { owner } => {
-                if self.shutdown.is_some() {
-                    return Err(Errno::EBUSY.into());
-                }
-                self.fence(owner)?;
                 if owner.host.is_empty()
                     || owner.host.len() > 128
                     || !owner
@@ -109,6 +105,10 @@ impl Init {
                 {
                     return Err(Errno::EINVAL.into());
                 }
+                if self.shutdown.is_some() {
+                    return Err(Errno::EBUSY.into());
+                }
+                self.fence(owner)?;
                 if self.owner.is_some() {
                     // A claim is a compare-and-swap, not a way to prolong an existing lease.
                     return Err(Errno::EBUSY.into());

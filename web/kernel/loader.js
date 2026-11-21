@@ -65,6 +65,104 @@ export async function loadLocal(pin) {
 
 let localCompilation = Promise.resolve();
 
+const TRANSFORM_CACHE_DB = 'os-wasm-transform-cache-v1';
+const TRANSFORM_CACHE_STORE = 'modules';
+let transformDbPromise = null;
+
+function openTransformCacheDb() {
+  if (typeof indexedDB === 'undefined') return Promise.resolve(null);
+  transformDbPromise ??= new Promise(resolve => {
+    try {
+      const req = indexedDB.open(TRANSFORM_CACHE_DB, 1);
+      req.onupgradeneeded = () => {
+        if (!req.result.objectStoreNames.contains(TRANSFORM_CACHE_STORE)) {
+          req.result.createObjectStore(TRANSFORM_CACHE_STORE);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+  return transformDbPromise;
+}
+
+async function readTransformCache(key) {
+  try {
+    const db = await openTransformCacheDb();
+    if (!db) return null;
+    return await new Promise(resolve => {
+      const tx = db.transaction(TRANSFORM_CACHE_STORE, 'readonly');
+      const req = tx.objectStore(TRANSFORM_CACHE_STORE).get(key);
+      req.onsuccess = () => {
+        const val = req.result;
+        if (val instanceof Uint8Array) resolve(val);
+        else if (val instanceof ArrayBuffer) resolve(new Uint8Array(val));
+        else resolve(null);
+      };
+      req.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function writeTransformCache(key, bytes) {
+  try {
+    const db = await openTransformCacheDb();
+    if (!db) return;
+    await new Promise(resolve => {
+      const tx = db.transaction(TRANSFORM_CACHE_STORE, 'readwrite');
+      tx.objectStore(TRANSFORM_CACHE_STORE).put(bytes.slice(), key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    });
+  } catch { /* best-effort cache */ }
+}
+
+async function sha256Hex(bytes) {
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function buildTransformedManifest() {
+  const manifest = typeof __OS_BUILD_TRANSFORMED__ !== 'undefined'
+    ? __OS_BUILD_TRANSFORMED__
+    : globalThis.__OS_BUILD_TRANSFORMED__;
+  return manifest && typeof manifest === 'object' ? manifest : null;
+}
+
+async function tryLoadPretransformedAsset(assetPath) {
+  const manifest = buildTransformedManifest();
+  if (!manifest || manifest.format !== LOCAL_FORMAT || !manifest.digests) return null;
+  const expected = manifest.digests[assetPath];
+  if (typeof expected !== 'string' || !/^[0-9a-f]{64}$/i.test(expected)) return null;
+  try {
+    const response = await fetch(`${assetPath}.rv1`);
+    if (!response.ok) return null;
+    const transformed = new Uint8Array(await response.arrayBuffer());
+    const actual = await sha256Hex(transformed);
+    if (actual.toLowerCase() !== expected.toLowerCase()) return null;
+    const module = await WebAssembly.compile(transformed);
+    const { memory, memories } = await heading(transformed);
+    const imported = WebAssembly.Module.imports(module).some(
+      entry => entry.kind === 'memory' && entry.module === MEMORY.module && entry.name === MEMORY.name,
+    );
+    if (imported && !memory) return null;
+    stats.compiled++;
+    return Object.freeze({
+      module,
+      memory: imported ? Object.freeze(memory) : undefined,
+      memoryBytes: memories.reduce((sum, value) => sum + value.initial * 65536, 0),
+      startSection: false,
+    });
+  } catch {
+    return null;
+  }
+}
+
 export async function loadLocalBytes(digest, bytes, check = async () => {}) {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength < 8) {
     throw formatError(new Error('not a wasm module'));
@@ -73,7 +171,7 @@ export async function loadLocalBytes(digest, bytes, check = async () => {}) {
   let promise = localCompiled.get(key);
   if (promise) localCompiled.delete(key);
   else {
-    promise = localCompilation.then(() => compileLocal(bytes));
+    promise = localCompilation.then(() => compileLocal(bytes, digest));
     localCompilation = promise.catch(() => {});
     promise.catch(() => { if (localCompiled.get(key) === promise) localCompiled.delete(key); });
   }
@@ -86,14 +184,28 @@ export async function loadLocalBytes(digest, bytes, check = async () => {}) {
   return result;
 }
 
-async function compileLocal(bytes) {
+async function compileLocal(bytes, knownDigest = null) {
   try {
     const original = await WebAssembly.compile(bytes);
     const imported = validateImports(WebAssembly.Module.imports(original));
     validateExports(original, imported);
     const { memory } = await heading(bytes);
     if (imported && !memory) fail('no env.memory type');
-    const transformed = await transformLocal(bytes);
+    let cacheKey = null;
+    let transformed = null;
+    if (globalThis.crypto?.subtle) {
+      try {
+        const digest = knownDigest ?? await sha256Hex(bytes);
+        cacheKey = `${LOCAL_FORMAT}:${digest}`;
+        transformed = await readTransformCache(cacheKey);
+      } catch {
+        transformed = null;
+      }
+    }
+    if (!transformed) {
+      transformed = await transformLocal(bytes);
+      if (cacheKey) void writeTransformCache(cacheKey, transformed);
+    }
     const module = await WebAssembly.compile(transformed);
     const { memories } = await heading(transformed);
     stats.compiled++;
@@ -108,17 +220,31 @@ async function compileLocal(bytes) {
 // The image's bytes, as its exec allows them to be read.
 const read = image => image.asset
   ? fetch(image.asset)
-  : fetch(`/api/file?token=${encodeURIComponent(image.token_read)}`, { headers: { 'X-Process-Token': image.token, 'X-Process-Pid': String(image.pid) } });
+  : fetch(`/api/file?token=${encodeURIComponent(image.token_read)}`, {
+    headers: {
+      'X-Process-Token': image.token,
+      'X-Process-Pid': String(image.pid),
+      ...(image.instance_id ? { 'X-OS-Instance': image.instance_id } : {}),
+    },
+  });
 
 async function compile(image) {
   let module;
-  // An image made forkable before is compiled from what was made: what it imports and what it
-  // says before its code are the original's.
+  // System `/usr/bin/*.wasm` assets prefer verified build-time `.rv1` transforms (zero Binaryen)
+  // and fall back to local IDB-cached `/local-compiler.js` so local execution issues ZERO
+  // `/api/file?...&compile=...` RPCs (#54 L3a).
+  if (image.asset && image.pid !== 1) {
+    const pretransformed = await tryLoadPretransformedAsset(image.asset);
+    if (pretransformed) return pretransformed;
+    const response = await read(image);
+    if (!response.ok) throw await refusal(response);
+    const rawBytes = new Uint8Array(await response.arrayBuffer());
+    const promise = localCompilation.then(() => compileLocal(rawBytes));
+    localCompilation = promise.catch(() => {});
+    return promise;
+  }
   const response = await read(image);
   if (!response.ok) throw await refusal(response);
-  // compileStreaming compiles as the bytes arrive, when the type says wasm; bytes always work.
-  // What a module says before its code (the memory it imports, a start section) is read from a
-  // copy of the response while the compiler reads the original.
   const streamed = response.headers.get('Content-Type') === 'application/wasm';
   let prefix;
   if (streamed) {
@@ -130,15 +256,11 @@ async function compile(image) {
   }
   const imports = WebAssembly.Module.imports(module);
   const memoryImport = validateImports(imports);
-  // What the module says before its code: the memory it imports, and whether it has a start
-  // function, which runs as it is instantiated (a process runs such an image by synchronous
-  // requests: nothing can be suspended before `_start`, JSPI's promising frame).
   const { memory, start } = await heading(prefix).catch(error => {
     throw formatError(error);
   });
   if (memoryImport) {
     if (!memory) throw formatError(new Error('no env.memory type'));
-    // Shared memory must declare its maximum: the engine cannot grow it past one.
     if (memory.shared && memory.maximum == null) {
       throw formatError(new Error('shared memory without a maximum'));
     }
@@ -147,6 +269,12 @@ async function compile(image) {
   const unwinding = imports.filter(entry => entry.module === 'wasix_32v1' && UNWINDS.has(entry.name)).map(entry => `${entry.module}.${entry.name}`);
   let memoryBytes;
   if (image.pid !== 1 || unwinding.length) {
+    if (image.asset) {
+      const rawBytes = prefix instanceof Uint8Array ? prefix : new Uint8Array(await (await fetch(image.asset)).arrayBuffer());
+      const promise = localCompilation.then(() => compileLocal(rawBytes));
+      localCompilation = promise.catch(() => {});
+      return promise;
+    }
     const transformed = await forkable(image, image.pid === 1 ? FORKABLE : 'resources-v1');
     module = transformed.module;
     if (image.pid !== 1) memoryBytes = transformed.memoryBytes;
@@ -159,7 +287,13 @@ async function compile(image) {
 // request before a cached output is returned; no Binaryen bundle reaches the browser.
 async function forkable(image, profile) {
   const query = image.asset ? `path=${encodeURIComponent(image.path)}` : `token=${encodeURIComponent(image.token_read)}`;
-  const response = await fetch(`/api/file?${query}&compile=${profile}`, { headers: { 'X-Process-Token': image.token, 'X-Process-Pid': String(image.pid) } });
+  const response = await fetch(`/api/file?${query}&compile=${profile}`, {
+    headers: {
+      'X-Process-Token': image.token,
+      'X-Process-Pid': String(image.pid),
+      ...(image.instance_id ? { 'X-OS-Instance': image.instance_id } : {}),
+    },
+  });
   if (!response.ok) throw await refusal(response);
   const prefix = response.clone();
   const module = await WebAssembly.compileStreaming(response).catch(error => { throw formatError(error); });

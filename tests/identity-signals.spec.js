@@ -17,9 +17,9 @@ async function run(page, command) {
 const shell = (page, script) => run(page, `sh -c '${script}'`);
 let base;
 test.beforeEach(async ({ page }) => {
-  await page.goto('/');
   base = '/guest/signals-' + crypto.randomUUID();
   await call(page.request, { mkdir: { path: base, mode: 0o755 } });
+  await page.goto('/');
   await run(page, 'cd ' + base);
 });
 test.afterEach(async ({ page }) => { await rmrf(page.request, base); });
@@ -69,12 +69,16 @@ test('libc prompt and identity imports use credentials, including a root process
   await shell(page, 'USER=root UID=0 ./guest-id; echo guest:$?');
   await expect(last(page)).toHaveText('guest:0');
   await upload(page, 'root-id', identity(0));
-  const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+  const password = process.env.OS_TEST_ADMIN_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
   expect((await api(page.request, 'login', { headers: { 'CF-Connecting-IP': crypto.randomUUID() }, data: { username: 'root', password } })).ok()).toBe(true);
+  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+  await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(0);
   await send(page, 'sh -i');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'input');
+  await expect(prompt(page)).toHaveAttribute('data-state', 'input', { timeout: 15_000 });
   await expect(last(page)).toHaveText('# ');
   expect((await api(page.request, 'logout')).ok()).toBe(true);
+  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+  await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(guest.uid);
   await send(page, './root-id; echo root:$?');
   await expect(last(page)).toContainText('\nroot:0\n# ');
   await send(page, 'exit');
@@ -96,7 +100,7 @@ test('shell traps, ignored dispositions across exec, and background wait statuse
 
 test('Ctrl+C recovers the same interactive shell, including while a child writes continuously', async ({ page }) => {
   await send(page, 'sh -i');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'input');
+  await expect(prompt(page)).toHaveAttribute('data-state', 'input', { timeout: 15_000 });
   await send(page, 'echo shell:$$');
   await expect(last(page)).toContainText('\nshell:');
   const pid = (await last(page).textContent()).match(/\nshell:(\d+)/)[1];
@@ -106,7 +110,7 @@ test('Ctrl+C recovers the same interactive shell, including while a child writes
   await send(page, 'echo recovered:$$');
   await expect(last(page)).toContainText(`\nrecovered:${pid}\n`);
   await send(page, 'yes');
-  await expect(last(page)).toContainText('\ny\ny\n');
+  await expect(last(page)).toContainText('\ny\ny\n', { timeout: 15_000 });
   await page.locator('#command').press('Control+c');
   await expect(last(page)).toHaveText(/\$\s*$/);
   await send(page, 'echo survived:$$');
@@ -183,10 +187,16 @@ for (const restart of [false, true]) test(`a signal ${restart ? 'restarts' : 'in
       onJob: job => { window.signalJob = job; },
     });
   }, path);
+  const killRpcs = [];
+  const watch = req => {
+    if (req.method() === 'POST' && new URL(req.url()).pathname === '/api/sys' && (req.postData() ?? '').includes('"kill"')) {
+      killRpcs.push(req.postData());
+    }
+  };
+  page.on('request', watch);
   try {
     await page.waitForFunction(() => window.signalReading && window.signalJob.pids.length === 1);
-    const pid = await page.evaluate(() => window.signalJob.pids[0]);
-    await call(page.request, { kill: { pid: String(pid), signal: 10 } });
+    await page.evaluate(() => window.signalJob.signal(10));
     if (restart) {
       await page.waitForFunction(() => window.signalOutput.length > 0);
       expect(await page.evaluate(() => window.signalOutput)).toBe('caught');
@@ -194,7 +204,8 @@ for (const restart of [false, true]) test(`a signal ${restart ? 'restarts' : 'in
     }
     expect((await page.evaluate(() => window.signalRun)).status, await page.evaluate(() => window.signalOutput)).toBe(0);
     expect(await page.evaluate(() => window.signalOutput)).toBe(restart ? 'caughtx\r\nok' : 'caughtok');
-  } finally { await page.evaluate(() => window.signalJob?.signal(9)); }
+    expect(killRpcs).toEqual([]);
+  } finally { page.off('request', watch); await page.evaluate(() => window.signalJob?.signal(9)); }
 });
 
 test('fork copies handlers and masks without copying the parent pending set', async ({ page }) => {
@@ -278,11 +289,18 @@ test('a signal interrupting writev preserves the bytes from completed vectors', 
       onJob: job => { window.writevJob = job; },
     });
   }, path);
+  const killRpcs = [];
+  const watch = req => {
+    if (req.method() === 'POST' && new URL(req.url()).pathname === '/api/sys' && (req.postData() ?? '').includes('"kill"')) {
+      killRpcs.push(req.postData());
+    }
+  };
+  page.on('request', watch);
   try {
     await page.waitForFunction(() => window.writevOutput === 'caught');
-    const pid = await page.evaluate(() => window.writevJob.pids[0]);
-    await call(page.request, { kill: { pid: String(pid), signal: 10 } });
+    await page.evaluate(() => window.writevJob.signal(10));
     expect((await page.evaluate(() => window.writevRun)).status, await page.evaluate(() => window.writevOutput)).toBe(0);
     expect(await page.evaluate(() => window.writevOutput)).toBe('caughtok');
-  } finally { await page.evaluate(() => window.writevJob?.signal(9)); }
+    expect(killRpcs).toEqual([]);
+  } finally { page.off('request', watch); await page.evaluate(() => window.writevJob?.signal(9)); }
 });

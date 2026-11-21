@@ -110,13 +110,18 @@ pub async fn handle(req: &mut Request, state: &State) -> worker::Result<Reply> {
         auth::token_key(req).as_deref(),
         auth::guest_key(req).as_deref(),
     );
+    let instance_id = req
+        .headers()
+        .get("X-OS-Instance")?
+        .filter(|s| !s.is_empty());
     // Expiry cleanup has its own committed transaction, including when the ensuing call fails.
     crate::db::transact(state, |db| {
         db.sweep_cloud();
         ((), true)
     })?;
     api::run(state, move |db| {
-        let result = dispatch(db, &request, &ns);
+        let mut detail = None;
+        let result = dispatch(db, &request, &ns, instance_id.as_deref(), &mut detail);
         let conversion = matches!(
             (&request.call, &result),
             (
@@ -133,7 +138,10 @@ pub async fn handle(req: &mut Request, state: &State) -> worker::Result<Reply> {
                 Err(Errno::ENOSPC),
             )
         );
-        let mut reply = reply(result);
+        let mut reply = match result {
+            Ok(value) => Reply::ok(value),
+            Err(errno) => api::errno_reply(&abi::Error { errno, detail }),
+        };
         if conversion {
             reply.commit = true;
         }
@@ -298,7 +306,12 @@ fn authorize(credential: &Credential) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn caller(db: &mut Db, session: &wire::Session, token: &str) -> Result<Caller> {
+pub(super) fn caller(
+    db: &mut Db,
+    session: &wire::Session,
+    token: &str,
+    instance_id: Option<&str>,
+) -> Result<Caller> {
     let row = db
         .rows::<SessionRow>(
             "SELECT id, secret, ns, expires FROM vfs_sessions WHERE id = ?",
@@ -313,6 +326,9 @@ pub(super) fn caller(db: &mut Db, session: &wire::Session, token: &str) -> Resul
         return Err(Errno::ENOTCONN);
     }
     let credential = db.credential(token, &row.ns).ok_or(Errno::EACCES)?;
+    credential
+        .check_instance(instance_id)
+        .map_err(|e| e.errno)?;
     authorize(&credential)?;
     // The caller's system generation decides which paths its image owns (read-only), as it
     // does on the path API.
@@ -340,7 +356,7 @@ impl Caller {
         Ok(crate::resources::IoRequest {
             ns: self.credential.ns.clone(),
             token: token.into(),
-            pid: Some(pid.ok_or(Errno::EINVAL)?),
+            pid,
             write,
             bytes,
         })
@@ -382,7 +398,12 @@ impl Caller {
         check_component(name)?;
         let (_, path) = self.dir(db, dir, EXEC)?;
         let path = join(&path, name);
-        Ok((db.persisted_node(&path).ok_or(Errno::ENOENT)?, path))
+        let node = if db.image.is_some() {
+            db.node(&path)
+        } else {
+            db.persisted_node(&path)
+        };
+        Ok((node.ok_or(Errno::ENOENT)?, path))
     }
     fn entry(&self, db: &Db, node: &Node) -> Entry {
         Entry {
@@ -397,6 +418,11 @@ impl Caller {
         options: &OpenOptions,
         created: bool,
     ) -> Result<OpenRef> {
+        if let Some(rdev) = node.rdev.as_deref()
+            && matches!(rdev, "archive" | "media" | "present" | "snd")
+        {
+            self.credential.check_device(rdev).map_err(|e| e.errno)?;
+        }
         let access = options.access()?;
         if !created && access != Access::Path {
             let mut mask = access.mask();
@@ -462,7 +488,7 @@ impl Caller {
     }
     pub(super) fn opened(&self, db: &Db, open: &OpenRef) -> Result<Node> {
         let row = self.open_row(db, open)?;
-        if row.revoked != 0 || !db.cloud_granted(open.id, &self.session.ns) {
+        if row.revoked != 0 || !db.cloud_caller_granted(open.id, &self.credential.token) {
             return Err(Errno::EACCES);
         }
         db.inode(row.ino).ok_or(Errno::ESTALE)
@@ -525,10 +551,16 @@ fn metadata_rdev(node: &Node, writing: Option<(u64, bool)>) -> Option<String> {
 fn metadata(db: &Db, node: &Node) -> Metadata {
     let times = db.times(node.ino);
     let nlink = if node.directory && node.links != 0 {
-        2 + db
-            .names(node.ino)
-            .first()
-            .map_or(0, |path| db.persisted_subdirs(path))
+        2 + db.names(node.ino).first().map_or(0, |path| {
+            if db.image.is_some() {
+                db.children(path)
+                    .into_iter()
+                    .filter(|(_, child)| child.directory)
+                    .count() as u32
+            } else {
+                db.persisted_subdirs(path)
+            }
+        })
     } else {
         node.links
     };
@@ -566,14 +598,21 @@ fn file_type(node: &Node) -> FileType {
         FileType::File
     }
 }
-fn check_home(db: &Db, uid: u32, path: &str) -> Result<()> {
+fn check_home(db: &Db, uid: u32, path: &str, detail: &mut Option<String>) -> Result<()> {
     // An absent home belongs to its account (or root), even in a writable parent.
     if uid != 0 && db.home_of(path).is_some_and(|owner| owner != uid) {
+        *detail = Some(format!("{path} is another account's home"));
         return Err(Errno::EACCES);
     }
     Ok(())
 }
-fn new_name(db: &Db, c: &Caller, dir: &Handle, name: &str) -> Result<(Node, String)> {
+fn new_name(
+    db: &Db,
+    c: &Caller,
+    dir: &Handle,
+    name: &str,
+    detail: &mut Option<String>,
+) -> Result<(Node, String)> {
     check_component(name)?;
     let (parent, path) = c.dir(db, dir, EXEC)?;
     let path = join(&path, name);
@@ -584,7 +623,7 @@ fn new_name(db: &Db, c: &Caller, dir: &Handle, name: &str) -> Result<(Node, Stri
         return Err(Errno::EEXIST);
     }
     inode::may_create(&c.credential.identity(), &parent, false)?;
-    check_home(db, c.credential.uid, &path)?;
+    check_home(db, c.credential.uid, &path, detail)?;
     Ok((parent, path))
 }
 fn make(
@@ -592,13 +631,20 @@ fn make(
     c: &Caller,
     dir: &Handle,
     name: &str,
+    detail: &mut Option<String>,
     node: impl FnOnce(&Node) -> Node,
 ) -> Result<Node> {
-    let (parent, path) = new_name(db, c, dir, name)?;
+    let (parent, path) = new_name(db, c, dir, name, detail)?;
     db.set_node(&path, &node(&parent));
     db.persisted_node(&path).ok_or(Errno::EIO)
 }
-fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
+fn dispatch(
+    db: &mut Db,
+    request: &wire::Request,
+    ns: &str,
+    instance_id: Option<&str>,
+    detail: &mut Option<String>,
+) -> Result<Value> {
     if request.version != wire::VERSION {
         return Err(Errno::EPROTONOSUPPORT);
     }
@@ -609,6 +655,9 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         let credential = db
             .credential(&request.credential, ns)
             .ok_or(Errno::EACCES)?;
+        credential
+            .check_instance(instance_id)
+            .map_err(|e| e.errno)?;
         authorize(&credential)?;
         let session = wire::Session {
             id: auth::random_token(),
@@ -625,7 +674,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             ],
         );
         db.set_expiry("vfs_session", &session.id, expires);
-        let c = caller(db, &session, &request.credential)?;
+        let c = caller(db, &session, &request.credential, instance_id)?;
         let root = db.persisted_node("/").ok_or(Errno::EIO)?;
         return Ok(json!(wire::Connected {
             version: wire::VERSION,
@@ -639,6 +688,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         db,
         request.session.as_ref().ok_or(Errno::EACCES)?,
         &request.credential,
+        instance_id,
     )?;
     let who = c.credential.identity();
     use Call::*;
@@ -754,9 +804,14 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
                 Value::Null
             } else {
                 let (parent, name) = path.rsplit_once('/').ok_or(Errno::EIO)?;
-                let parent = db
-                    .persisted_node(if parent.is_empty() { "/" } else { parent })
-                    .ok_or(Errno::ENOENT)?;
+                let parent = if parent.is_empty() {
+                    db.persisted_node("/")
+                } else if db.image.is_some() {
+                    db.node(parent)
+                } else {
+                    db.persisted_node(parent)
+                }
+                .ok_or(Errno::ENOENT)?;
                 json!((c.entry(db, &parent), name))
             }
         }
@@ -764,16 +819,28 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
         OpenMetadata { open } => json!(metadata(db, &c.opened(db, open)?)),
         ReadDir { dir } => {
             let (_, path) = c.dir(db, dir, READ)?;
-            #[derive(Deserialize)]
-            struct Child {
-                path: String,
-                ino: u64,
-                file_type: FileType,
-            }
-            // Only names, identities and types are needed: avoid loading descendants or
-            // computing their metadata/link counts inside this synchronous transaction.
-            let entries: Vec<_> = db
-                .rows::<Child>(
+            let entries: Vec<_> = if db.image.is_some() {
+                db.children(&path)
+                    .into_iter()
+                    .map(|(child_path, node)| DirEntry {
+                        name: child_path.rsplit('/').next().unwrap_or("").into(),
+                        node: NodeId {
+                            ino: node.ino,
+                            generation: 1,
+                        },
+                        file_type: file_type(&node),
+                    })
+                    .collect()
+            } else {
+                #[derive(Deserialize)]
+                struct Child {
+                    path: String,
+                    ino: u64,
+                    file_type: FileType,
+                }
+                // Only names, identities and types are needed: avoid loading descendants or
+                // computing their metadata/link counts inside this synchronous transaction.
+                db.rows::<Child>(
                     "SELECT n.path,i.id AS ino,CASE WHEN i.directory = 1 THEN 'dir' WHEN i.link IS NOT NULL THEN 'symlink' WHEN i.rdev IS NOT NULL THEN 'char-device' ELSE 'file' END AS file_type FROM nodes n JOIN inodes i ON i.id = n.ino WHERE n.parent = ? AND n.path != ? ORDER BY n.path",
                     vec![text(&path), text(&path)],
                 )
@@ -786,7 +853,8 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
                     },
                     file_type: child.file_type,
                 })
-                .collect();
+                .collect()
+            };
             db.cloud_accessed(dir.node.ino);
             json!(entries)
         }
@@ -828,7 +896,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
                         json!((c.entry(db, &db.inode(node.ino).ok_or(Errno::EIO)?), open)),
                     );
                 }
-                Err(Errno::ENOENT) => make(db, &c, dir, name, |p| {
+                Err(Errno::ENOENT) => make(db, &c, dir, name, detail, |p| {
                     permissions::created(&who, p, *mode, false, *umask)
                 })?,
                 Err(e) => return Err(e),
@@ -845,7 +913,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             mode,
             umask,
         } => {
-            let node = make(db, &c, dir, name, |p| {
+            let node = make(db, &c, dir, name, detail, |p| {
                 permissions::created(&who, p, *mode, true, *umask)
             })?;
             json!(c.entry(db, &node))
@@ -872,6 +940,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             if !matches!(rdev, "present" | "snd") {
                 return Err(Errno::EOPNOTSUPP);
             }
+            c.credential.check_device(rdev).map_err(|e| e.errno)?;
             let path = join(&dir_path, name);
             if read_only(db, &path) {
                 return Err(Errno::EROFS);
@@ -897,13 +966,18 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
                 *mode,
                 rdev,
             )
-            .map_err(|error| error.errno)?;
+            .map_err(|error| {
+                *detail = error.detail;
+                error.errno
+            })?;
             let node = db.persisted_node(&path).ok_or(Errno::EIO)?;
             json!(c.entry(db, &node))
         }
         Symlink { dir, name, target } => {
             inode::check_link_target(target)?;
-            let node = make(db, &c, dir, name, |p| inode::new_symlink(&who, p, target))?;
+            let node = make(db, &c, dir, name, detail, |p| {
+                inode::new_symlink(&who, p, target)
+            })?;
             json!(c.entry(db, &node))
         }
         Link { target, dir, name } => {
@@ -928,7 +1002,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
                 return Err(Errno::EBUSY);
             }
             inode::may_create(&who, &parent, false)?;
-            check_home(db, c.credential.uid, &path)?;
+            check_home(db, c.credential.uid, &path, detail)?;
             if node.links == 0 {
                 return Err(Errno::ENOENT);
             }
@@ -946,7 +1020,10 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             if matches!(&request.call, Unlink { .. })
                 && let Some(done) = db.unlink_device(&who, &path)
             {
-                return done.map(|()| Value::Null).map_err(|error| error.errno);
+                return done.map(|()| Value::Null).map_err(|error| {
+                    *detail = error.detail;
+                    error.errno
+                });
             }
             let (parent, _) = c.dir(db, dir, 0)?;
             inode::may_delete(&who, &parent, &node)?;
@@ -983,7 +1060,7 @@ fn dispatch(db: &mut Db, request: &wire::Request, ns: &str) -> Result<Value> {
             to,
             flags,
         } => {
-            rename(db, &c, from_dir, from, to_dir, to, *flags)?;
+            rename(db, &c, from_dir, from, to_dir, to, *flags, detail)?;
             Value::Null
         }
         Setattr { handle, attr } => {
@@ -1230,6 +1307,7 @@ fn rename(
     to_dir: &Handle,
     to: &str,
     flags: RenameFlags,
+    detail: &mut Option<String>,
 ) -> Result<()> {
     if flags.bits() & !RenameFlags::NOREPLACE.bits() != 0 {
         return Err(Errno::EINVAL);
@@ -1240,7 +1318,11 @@ fn rename(
     check_component(to)?;
     let (dest_parent, dest) = c.dir(db, to_dir, EXEC)?;
     let new = join(&dest, to);
-    let existing = db.persisted_node(&new);
+    let existing = if db.image.is_some() {
+        db.node(&new)
+    } else {
+        db.persisted_node(&new)
+    };
     if existing.is_some() && flags.contains(RenameFlags::NOREPLACE) {
         return Err(Errno::EEXIST);
     }
@@ -1277,7 +1359,7 @@ fn rename(
         }
         None => {
             inode::may_create(&who, &dest_parent, false)?;
-            check_home(db, c.credential.uid, &new)?;
+            check_home(db, c.credential.uid, &new, detail)?;
         }
     }
     if source.directory && parent.ino != dest_parent.ino {
@@ -1346,6 +1428,9 @@ impl Db {
         );
     }
     pub(crate) fn cloud_accessed(&mut self, ino: u64) {
+        if crate::system::immutable_inode(ino) {
+            return;
+        }
         let times = self.times(ino);
         let now = auth::clock();
         if times.atime <= times.mtime

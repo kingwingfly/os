@@ -31,7 +31,7 @@ test('menus stay within a narrow viewport, close on outside click and follow the
   const geometry = await menu.evaluate(e => { const r = e.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: innerWidth, height: innerHeight }; });
   expect(geometry.left).toBeGreaterThanOrEqual(0); expect(geometry.right).toBeLessThanOrEqual(geometry.width);
   expect(geometry.top).toBeGreaterThanOrEqual(0); expect(geometry.bottom).toBeLessThanOrEqual(geometry.height);
-  await app.getByRole('heading', { name: 'Add a filesystem', exact: true }).click(); await expect(menu).toHaveCount(0);
+  await app.getByRole('heading', { name: 'Mount local storage', exact: true }).click(); await expect(menu).toHaveCount(0);
   await app.locator('[name=kind]').selectOption('storage'); await expect(source).toContainText('Browser storage');
   await page.evaluate(() => dispatchEvent(new Event('os:login-changed'))); await expect(source).toContainText('Host folder');
 });

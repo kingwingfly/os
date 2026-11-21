@@ -1,55 +1,132 @@
-//! What the authority keeps of processes (owner's plan, 2026-11-02): only each exec's
-//! credentials. The process table is each browser's own Durable Object (machine.rs, procs.rs);
-//! of all a process's life, only execve needs the filesystem's authority, which checks the
-//! image (X, not R), snapshots the caller (root under sudo), and records the snapshot by the
-//! hash of the token the process's calls carry from then on. Its forks carry the same token,
-//! as they keep its credentials and share its descriptors; the registry revokes it, in
-//! batches, once no process holds it.
+//! Remote service credentials stored in `OsAuthority` (`credentials` table, `SCHEMA_VERSION = "10"`).
 //!
-//! The registry asks here by internal requests, which the Worker never routes from a browser
-//! (it routes /api/* alone): `/internal/exec`, `/internal/identity`, `/internal/revoke` and
-//! `/internal/tell`. Each carries the browser's cookies, as the request it serves did.
+//! Under `#54` (`L3a`), processes live locally in each instance's `LocalProcessTable`.
+//! `OsAuthority` stores ONLY explicit remote service credentials minted/derived/renewed/revoked
+//! through `ServiceAuth v2` (`Machine` DO -> `/internal/service-auth/{mint,derive,renew}` and
+//! `/internal/revoke`), plus server-hosted container job credentials (`JOBS`).
 use crate::api::Reply;
 use crate::auth;
 use crate::db::{Db, int, text, transact};
-use abi::{EXEC_MAX, Errno, Error, Return};
-use os_core::permissions::Identity;
-use serde::{Deserialize, Serialize};
+use abi::auth_v2::RemoteScope;
+use abi::{Errno, Error};
+use os_core::permissions::{Identity, Store};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use worker::*;
 
-/// An exec's credentials, as its process (and what it forked) acts.
+/// Hard absolute maximum lifetime for any browser `ServiceAuth v2` credential lineage (24h).
+/// Repeated renewals or derivations can NEVER extend a credential past `started + MAX_CREDENTIAL_LIFETIME`.
+pub const MAX_CREDENTIAL_LIFETIME: u64 = 24 * 3600;
+
+/// A remote service credential (or remote container job credential).
 #[derive(Clone, Debug, Deserialize)]
 pub struct Credential {
-    /// The hash of the token its calls carry.
+    /// The SHA-256 hash of the token carried in requests.
     pub token: String,
     pub ns: String,
-    /// The process that executed.
+    /// Legacy/job numeric pid field (0 for ServiceAuth v2 instance-scoped credentials).
     pub pid: u32,
     pub uid: u32,
     pub gid: u32,
     pub groups: String,
     pub umask: u16,
+    #[serde(default)]
+    pub started: u64,
     pub generation: Option<String>,
     pub cloud_access: u8,
-    /// The key its process's descriptors are owned by: its own exec's (`owner`), or, for an
-    /// image a process replaced its own with, the one that process had, as execve keeps a
-    /// process's open files.
+    /// JSON metadata holding `instance_id`, `cgroup`, and `scope` (`RemoteScope`) without
+    /// altering `OsAuthority`'s `SCHEMA_VERSION = "10"`.
+    #[serde(default)]
+    pub placement: String,
+    /// Descriptor lineage owner key.
     #[serde(rename = "owner")]
     lineage: String,
 }
 
-/// A credential's descriptors' owner, in SQL: an exec made before credentials named it owns
-/// them by its own key (`owner`).
-const OWNER: &str = "COALESCE(owner, ns || ' ' || pid || ' ' || substr(token, 1, 16))";
-/// The columns a `Credential` is read from.
+pub(crate) const OWNER: &str = "COALESCE(owner, ns || ' ' || pid || ' ' || substr(token, 1, 16))";
+
 pub(crate) fn columns() -> String {
-    format!("token, ns, pid, uid, gid, groups, umask, generation, cloud_access, {OWNER} AS owner")
+    format!(
+        "token, ns, pid, uid, gid, groups, umask, started, generation, cloud_access, placement, {OWNER} AS owner"
+    )
 }
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct PlacementMeta {
+    #[serde(default)]
+    instance_id: Option<String>,
+    #[serde(default)]
+    scope: Option<RemoteScope>,
+}
+
 impl Credential {
+    fn placement_meta(&self) -> PlacementMeta {
+        serde_json::from_str(&self.placement).unwrap_or_default()
+    }
+
+    pub fn instance_id(&self) -> Option<String> {
+        self.placement_meta().instance_id
+    }
+
+    pub fn scope(&self) -> Option<RemoteScope> {
+        self.placement_meta().scope
+    }
+
+    /// Reject requests missing or presenting a mismatched `X-OS-Instance` header against this
+    /// credential's bound `instance_id` (`EACCES`).
+    pub fn check_instance(&self, presented: Option<&str>) -> std::result::Result<(), Error> {
+        if let Some(bound) = self.instance_id() {
+            match presented.filter(|s| !s.is_empty()) {
+                Some(got) if got == bound => {}
+                _ => {
+                    return Err(Error::because(
+                        Errno::EACCES,
+                        "missing or mismatched instance_id for service credential",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce explicit `RemoteScope` device attachment authorization (`archive`, `media`,
+    /// `present`, `snd`).
+    pub fn check_device(&self, driver: &str) -> std::result::Result<(), Error> {
+        if let Some(scope) = self.scope() {
+            if !scope.allows_device(driver) {
+                return Err(Error::because(
+                    Errno::EACCES,
+                    format!(
+                        "remote device driver '{driver}' is not granted to this service credential"
+                    ),
+                ));
+            }
+            return Ok(());
+        }
+        self.cloud()
+    }
+
+    /// Map a remote device path to its driver name (`archive`, `media`, `present`, `snd`).
+    pub fn remote_device_driver(path: &str) -> Option<&'static str> {
+        if path == abi::accelerator::ARCHIVE {
+            Some("archive")
+        } else if path == abi::accelerator::MEDIA {
+            Some("media")
+        } else if path == crate::dev::PRESENT
+            || path.starts_with(&format!("{}/", crate::dev::PRESENT))
+        {
+            Some("present")
+        } else if path == crate::dev::SOUND || path.starts_with(&format!("{}/", crate::dev::SOUND))
+        {
+            Some("snd")
+        } else {
+            None
+        }
+    }
+
     pub fn cloud(&self) -> std::result::Result<(), abi::Error> {
-        if self.cloud_access == 0 {
+        if self.cloud_access == 0 || self.scope().is_some_and(|s| !s.cloud_fs) {
             Err(abi::Error::because(
                 Errno::EACCES,
                 "cloud filesystem access was not delegated to this process",
@@ -58,6 +135,42 @@ impl Credential {
             Ok(())
         }
     }
+
+    /// Enforce `RemoteScope.containers` for server-hosted container jobs (`Call::Kill { Job }`,
+    /// `Call::Wait { Job }`, and accelerator job submission/control ioctls).
+    pub fn check_containers(&self) -> std::result::Result<(), Error> {
+        if let Some(scope) = self.scope() {
+            if !scope.containers {
+                return Err(Error::because(
+                    Errno::EACCES,
+                    "remote container job access is not granted to this service credential",
+                ));
+            }
+            return Ok(());
+        }
+        self.cloud()
+    }
+
+    /// Enforce `RemoteScope.relay` for shared-mount relay operations.
+    #[allow(dead_code)]
+    pub fn check_relay(&self) -> std::result::Result<(), Error> {
+        if let Some(scope) = self.scope() {
+            if !scope.relay {
+                return Err(Error::because(
+                    Errno::EACCES,
+                    "shared-mount relay access is not granted to this service credential",
+                ));
+            }
+            return Ok(());
+        }
+        self.cloud()
+    }
+
+    /// Absolute hard expiration ceiling for this credential lineage (`started + 24h`).
+    pub fn max_expires(&self) -> Option<u64> {
+        (self.started > 0).then(|| self.started.saturating_add(MAX_CREDENTIAL_LIFETIME))
+    }
+
     pub fn identity(&self) -> Identity {
         Identity {
             id: self.uid,
@@ -66,38 +179,28 @@ impl Credential {
                 .unwrap_or_else(|_| BTreeSet::from([self.gid])),
         }
     }
-    /// The key its descriptors are owned by (fds.rs): its process's and its forks', and those
-    /// of the images they replace their own with, which keep them open. A process whose image
-    /// another of the line replaced, while a fork kept this one, shares them: they hold the
-    /// same credentials, which an execve does not change.
+
     pub fn owner(&self) -> String {
         self.lineage.clone()
     }
-    /// The key of what this exec alone owns: its image's descriptor, which closes with it.
+
     pub fn image(&self) -> String {
         owner(&self.ns, self.pid, &self.token)
     }
 }
 
-/// The namespace jobs' credentials are in (Phase 4): a job is no browser's process, and its
-/// token never leaves the server, as its runner alone holds it (runner.rs).
 pub const JOBS: &str = "jobs";
-/// The namespace of a request with no browser's cookies (procs.rs `Db::namespace`).
 const ANONYMOUS: &str = "anonymous";
 
-/// The key the descriptors of the job `id` are owned by, and the session they are kept in.
 pub fn job_owner(id: &str) -> String {
     format!("job {id}")
 }
 
 impl Credential {
-    /// The session its descriptors are kept in: its line's own, whatever the browser's page is
-    /// signed in as meanwhile, as a process's open files outlive any change to its user's
-    /// login session (a job's is the job's own).
     pub fn session(&self) -> String {
         session_of(&self.ns, &self.lineage)
     }
-    /// The job these credentials are, if they are a job's.
+
     pub fn job(&self) -> Option<String> {
         (self.ns == JOBS)
             .then(|| self.lineage.strip_prefix("job ").map(str::to_string))
@@ -105,8 +208,6 @@ impl Credential {
     }
 }
 
-/// The session the descriptors of a request are kept in: its process's line's, or else the
-/// browser's (the cookies' session).
 pub fn sid_of(
     db: &Db,
     key: Option<&str>,
@@ -118,8 +219,6 @@ pub fn sid_of(
         .or_else(|| auth::sid(db, key, guest))
 }
 
-/// The session of the descriptors the line of credentials `lineage` of `ns` owns: a job's is
-/// its owner key; a browser's process's, its line's.
 fn session_of(ns: &str, lineage: &str) -> String {
     if ns == JOBS {
         lineage.to_string()
@@ -128,27 +227,18 @@ fn session_of(ns: &str, lineage: &str) -> String {
     }
 }
 
-/// The key the descriptors of the credentials of token hash `token`, executed as `pid` of
-/// `ns`, are owned by.
 fn owner(ns: &str, pid: u32, token: &str) -> String {
     format!("{ns} {pid} {}", token.get(..16).unwrap_or(token))
 }
 
 impl Db {
-    /// The credentials the token `token` carries, in namespace `ns`, while it is not revoked:
-    /// a browser's process's, or a job's, whose token only its runner has.
     pub fn credential(&self, token: &str, ns: &str) -> Option<Credential> {
         let hash = auth::token_hash(token);
-        // A job's token comes from its runner alone, whose requests carry no browser's cookies
-        // (the anonymous namespace): a browser's request never finds a job's.
         self.credential_of(&hash, ns)
             .or_else(|| (ns == ANONYMOUS).then(|| self.credential_of(&hash, JOBS))?)
     }
-    /// The credentials of the job `id`, as `cred` spawned it with `umask`, by its token's hash
-    /// `hash`: they are the job's for its life, whatever becomes of the account.
+
     pub fn job_credential(&mut self, id: &str, hash: &str, cred: &Identity, umask: u16, now: u64) {
-        // Enforce the same absolute deadline on byte streams and syscall batches,
-        // even if the durable cleanup alarm is delivered late.
         let expires = self.provider_deadline(id).unwrap_or(now + 7 * 24 * 3600);
         self.run(
             "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner, expires) VALUES(?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
@@ -181,7 +271,7 @@ impl Db {
             ],
         );
     }
-    /// The job `id` ended: its credentials are revoked, and what it had open closes.
+
     pub fn revoke_job(&mut self, id: &str) {
         for row in self.rows::<Credential>(
             &format!(
@@ -199,8 +289,7 @@ impl Db {
         );
         self.end_line(JOBS, &job_owner(id));
     }
-    /// The line of credentials `lineage` of `ns` has none left: what its processes opened
-    /// closes, and its session of descriptors goes, numbers and all.
+
     fn end_line(&mut self, ns: &str, lineage: &str) {
         self.close_proc_fds(lineage);
         let session = session_of(ns, lineage);
@@ -210,8 +299,7 @@ impl Db {
         self.forget_fd_numbers(&session);
         self.forget_controller(lineage);
     }
-    /// Keep the descriptors of every process line of the namespace `ns` (its pages were heard
-    /// from, which host its processes).
+
     pub fn renew_lines(&mut self, ns: &str, now: u64) {
         #[derive(Deserialize)]
         struct Line {
@@ -225,18 +313,44 @@ impl Db {
             crate::fds::renew(self, &session_of(ns, &line.owner), now);
         }
     }
-    /// The credentials whose token's hash is `hash`, in `ns`.
+
     pub(crate) fn credential_of(&self, hash: &str, ns: &str) -> Option<Credential> {
-        self.rows::<Credential>(
-            &format!(
-                "SELECT {} FROM credentials WHERE token = ? AND ns = ? AND expires > ?",
-                columns()
-            ),
-            vec![text(hash), text(ns), int(auth::now())],
-        )
-        .into_iter()
-        .next()
+        let cred = self
+            .rows::<Credential>(
+                &format!(
+                    "SELECT {} FROM credentials WHERE token = ? AND ns = ? AND expires > ?",
+                    columns()
+                ),
+                vec![text(hash), text(ns), int(auth::now())],
+            )
+            .into_iter()
+            .next()?;
+        // Fail closed immediately if a non-guest, non-job account (or the controlling account
+        // that minted a sudo-elevated credential) was locked/deleted, or if the lineage exceeded
+        // its absolute hard lifetime cap (`started + MAX_CREDENTIAL_LIFETIME`).
+        if cred.ns != JOBS {
+            if cred.max_expires().is_some_and(|cap| auth::now() >= cap) {
+                return None;
+            }
+            if !os_core::permissions::is_guest_id(cred.uid) {
+                let (_, user) = self.user_by_id(cred.uid)?;
+                if user.locked {
+                    return None;
+                }
+            }
+            if let Some(ctrl_uid) = self.controller(&cred.owner())
+                && ctrl_uid != cred.uid
+                && !os_core::permissions::is_guest_id(ctrl_uid)
+            {
+                let (_, ctrl) = self.user_by_id(ctrl_uid)?;
+                if ctrl.locked {
+                    return None;
+                }
+            }
+        }
+        Some(cred)
     }
+
     pub fn expire_credential(&mut self, hash: &str, now: u64) {
         let expired = self.rows::<Credential>(
             &format!(
@@ -250,8 +364,7 @@ impl Db {
         }
         self.clear_expiry("credential", hash);
     }
-    /// Revoke the credentials whose token's hash is `hash`: its image's descriptor closes, and
-    /// what its processes opened, once no image of theirs holds the credentials still.
+
     pub fn revoke(&mut self, ns: &str, hash: &str) {
         let found = self.rows::<Credential>(
             &format!(
@@ -280,131 +393,239 @@ impl Db {
     }
 }
 
-/// One execve the registry asks the authority about.
-#[derive(Deserialize)]
-struct Asked {
-    #[serde(default)]
-    local: Option<abi::LocalExecutable>,
-    pid: u32,
-    /// The hash of the token its process will carry.
-    token: String,
-    path: String,
-    cwd: String,
-    #[serde(default)]
-    seat: Option<String>,
-    #[serde(default)]
-    cgroup: Option<String>,
-    #[serde(default)]
-    generation: Option<String>,
-    /// The account of the process it replaces, if any: only that account, or root, may.
-    #[serde(default)]
-    replacing: Option<u32>,
-    /// The hash of the token the replaced image held, which dies with it.
-    #[serde(default)]
-    old: Option<String>,
-    /// The hash of the token the replacing process proved itself with (the registry checked
-    /// it): the credentials the new image keeps, and the descriptors it keeps open.
-    #[serde(default)]
-    current: Option<String>,
-    /// Client-side chroot or explicit opt-out of server `/usr` fallback: `/internal/exec`
-    /// never resolves an ungranted server `/usr` (or outside-chroot) path behind the client's back.
-    #[serde(default)]
-    no_usr_fallback: bool,
-    #[serde(default)]
-    chroot: bool,
-}
-
-#[derive(Deserialize)]
-struct Execs {
-    ns: String,
-    #[serde(default)]
-    sudo: bool,
-    #[serde(default = "umask")]
-    umask: u16,
-    #[serde(default)]
-    no_usr_fallback: bool,
-    #[serde(default)]
-    chroot: bool,
-    execs: Vec<Asked>,
-    /// Tokens whose processes are gone, which the registry was still to revoke.
-    #[serde(default)]
-    revoke: Vec<String>,
-}
-fn umask() -> u16 {
-    0o022
-}
-
-/// What an execve gives: the credentials snapshotted, and how the loader reads the image.
-#[derive(Serialize)]
-struct Image {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    local: Option<abi::LocalExecutable>,
-    login: Option<crate::login::Context>,
-    uid: u32,
-    gid: u32,
-    groups: BTreeSet<u32>,
-    umask: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fd: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    asset: Option<String>,
-    path: String,
-    size: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token_read: Option<String>,
-    version: String,
-}
-
-/// The internal requests the registry makes, as the Worker's routes are: `None` when
-/// `endpoint` is none of them.
+/// Internal endpoints called ONLY by `Machine` DO (never routed from browsers).
 pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Result<Option<Reply>> {
     let key = auth::token_key(req);
     let guest = auth::guest_key(req);
     Ok(Some(match endpoint {
-        "/internal/exec" => {
-            let Ok(asked) = req.json::<Execs>().await else {
-                return Ok(Some(Reply::error("Invalid execve request", 400)));
+        "/internal/service-auth/mint" => {
+            #[derive(Deserialize)]
+            struct MintAsked {
+                ns: String,
+                instance_id: String,
+                token_hash: String,
+                #[serde(default)]
+                scope: RemoteScope,
+                #[serde(default = "default_true")]
+                cloud_access: bool,
+                #[serde(default = "default_umask")]
+                umask: u16,
+                #[serde(default)]
+                cgroup: Option<String>,
+                #[serde(default)]
+                generation: Option<String>,
+                #[serde(default)]
+                sudo: bool,
+            }
+            let header_release = req.headers().get("X-OS-Release").ok().flatten();
+            let Ok(asked) = req.json::<MintAsked>().await else {
+                return Ok(Some(Reply::error("Invalid mint request", 400)));
             };
             let now = auth::now();
-            let ns = asked.ns.clone();
-            let revoke = asked.revoke;
             transact(state, move |db| {
-                for hash in &revoke {
-                    db.revoke(&ns, hash);
+                let cred =
+                    match crate::sys::caller(db, key.as_deref(), guest.as_deref(), asked.sudo) {
+                        Ok(c) => c,
+                        Err(e) => return (crate::api::errno_reply(&e), false),
+                    };
+                let generation = asked
+                    .generation
+                    .or(header_release)
+                    .filter(|g| g != "legacy");
+                if let Err(e) = crate::system::select(db, generation.as_deref()) {
+                    return (crate::api::errno_reply(&e), false);
                 }
-                ((), true)
-            })?;
-            let mut results = Vec::with_capacity(asked.execs.len());
-            for mut one in asked.execs {
-                one.no_usr_fallback |= asked.no_usr_fallback;
-                one.chroot |= asked.chroot;
-                let (key, guest, ns) = (key.clone(), guest.clone(), asked.ns.clone());
-                let (sudo, umask) = (asked.sudo, asked.umask & 0o777);
-                let result = transact(state, move |db| {
-                    let result = exec(
-                        db,
-                        key.as_deref(),
-                        guest.as_deref(),
-                        &ns,
-                        sudo,
-                        umask,
-                        one,
-                        now,
-                    );
-                    let commit = result.is_ok();
-                    (
-                        match result {
-                            Ok(value) => Return::Ok(value),
-                            Err(error) => Return::Err(error),
-                        },
-                        commit,
-                    )
-                })?;
-                results.push(result);
-            }
-            Reply::ok(json!({ "results": results }))
+                let effective_cloud = asked.cloud_access && asked.scope.cloud_fs;
+                let expires = now.saturating_add(abi::PROCESS_TOKEN_TTL);
+                let lineage = format!(
+                    "inst:{}:{}",
+                    asked.instance_id,
+                    asked.token_hash.get(..16).unwrap_or(&asked.token_hash)
+                );
+                let controller = auth::identity_of(db, key.as_deref(), guest.as_deref()).id;
+                db.set_controller(&lineage, controller);
+                let groups_vec: Vec<u32> = cred.groups.iter().copied().collect();
+                let placement = json!({
+                    "instance_id": asked.instance_id,
+                    "cgroup": asked.cgroup.unwrap_or_else(|| "/user".into()),
+                    "scope": asked.scope,
+                });
+                db.run(
+                    "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner, expires, placement, generation, cloud_access) VALUES(?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    vec![
+                        text(&asked.token_hash),
+                        text(&asked.ns),
+                        int(cred.id),
+                        int(cred.group),
+                        text(&serde_json::to_string(&cred.groups).unwrap_or_default()),
+                        int(asked.umask & 0o777),
+                        int(now),
+                        text(&lineage),
+                        int(expires),
+                        text(&placement.to_string()),
+                        generation.as_deref().into(),
+                        int(u8::from(effective_cloud)),
+                    ],
+                );
+                db.set_expiry("credential", &asked.token_hash, expires);
+                (
+                    Reply::ok(json!({
+                        "uid": cred.id,
+                        "gid": cred.group,
+                        "groups": groups_vec,
+                        "umask": asked.umask & 0o777,
+                        "cloud_access": effective_cloud,
+                        "scope": asked.scope,
+                        "expires": expires,
+                        "lineage": lineage,
+                    })),
+                    true,
+                )
+            })?
         }
-        // The caller's credentials, as a page's batch acts (root under sudo, if it may).
+        "/internal/service-auth/derive" => {
+            #[derive(Deserialize)]
+            struct DeriveAsked {
+                ns: String,
+                instance_id: String,
+                parent_hash: String,
+                new_hash: String,
+                #[serde(default)]
+                scope: RemoteScope,
+                #[serde(default = "default_true")]
+                cloud_access: bool,
+                #[serde(default)]
+                umask: Option<u16>,
+                #[serde(default)]
+                cgroup: Option<String>,
+                #[serde(default)]
+                revoke_parent: bool,
+            }
+            let Ok(asked) = req.json::<DeriveAsked>().await else {
+                return Ok(Some(Reply::error("Invalid derive request", 400)));
+            };
+            let now = auth::now();
+            transact(state, move |db| {
+                let Some(parent) = db.credential_of(&asked.parent_hash, &asked.ns) else {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "parent service credential expired or revoked",
+                        )),
+                        false,
+                    );
+                };
+                if parent.instance_id().as_deref() != Some(asked.instance_id.as_str()) {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "parent credential belongs to another instance",
+                        )),
+                        false,
+                    );
+                }
+                let origin_started = if parent.started > 0 {
+                    parent.started
+                } else {
+                    now
+                };
+                let max_exp = origin_started.saturating_add(MAX_CREDENTIAL_LIFETIME);
+                if now >= max_exp {
+                    db.revoke(&asked.ns, &asked.parent_hash);
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "service credential exceeded maximum lifetime",
+                        )),
+                        true,
+                    );
+                }
+                let parent_scope = parent.scope().unwrap_or_else(RemoteScope::full);
+                let new_scope = parent_scope.attenuate(&asked.scope);
+                let new_cloud =
+                    (parent.cloud_access != 0) && asked.cloud_access && new_scope.cloud_fs;
+                let umask = asked.umask.unwrap_or(parent.umask) & 0o777;
+                let expires = now.saturating_add(abi::PROCESS_TOKEN_TTL).min(max_exp);
+                let lineage = parent.owner();
+                let placement = json!({
+                    "instance_id": asked.instance_id,
+                    "cgroup": asked.cgroup.unwrap_or_else(|| "/user".into()),
+                    "scope": new_scope,
+                });
+                db.run(
+                    "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner, expires, placement, generation, cloud_access) VALUES(?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    vec![
+                        text(&asked.new_hash),
+                        text(&asked.ns),
+                        int(parent.uid),
+                        int(parent.gid),
+                        text(&parent.groups),
+                        int(umask),
+                        int(origin_started),
+                        text(&lineage),
+                        int(expires),
+                        text(&placement.to_string()),
+                        parent.generation.as_deref().into(),
+                        int(u8::from(new_cloud)),
+                    ],
+                );
+                db.set_expiry("credential", &asked.new_hash, expires);
+                if new_cloud {
+                    db.inherit_cloud_opens(&asked.ns, &asked.parent_hash, &asked.new_hash);
+                }
+                if asked.revoke_parent {
+                    db.revoke(&asked.ns, &asked.parent_hash);
+                }
+                let groups_vec: Vec<u32> = parent.identity().groups.into_iter().collect();
+                (
+                    Reply::ok(json!({
+                        "uid": parent.uid,
+                        "gid": parent.gid,
+                        "groups": groups_vec,
+                        "umask": umask,
+                        "cloud_access": new_cloud,
+                        "scope": new_scope,
+                        "expires": expires,
+                        "lineage": lineage,
+                    })),
+                    true,
+                )
+            })?
+        }
+        "/internal/service-auth/renew" => {
+            #[derive(Deserialize)]
+            struct RenewAsked {
+                ns: String,
+                hashes: Vec<String>,
+            }
+            let Ok(asked) = req.json::<RenewAsked>().await else {
+                return Ok(Some(Reply::error("Invalid renew request", 400)));
+            };
+            let now = auth::now();
+            transact(state, move |db| {
+                let mut revoked = Vec::new();
+                for hash in &asked.hashes {
+                    if let Some(cred) = db.credential_of(hash, &asked.ns) {
+                        let max_exp = cred.max_expires().unwrap_or(u64::MAX);
+                        if now >= max_exp {
+                            db.revoke(&asked.ns, hash);
+                            revoked.push(hash.clone());
+                            continue;
+                        }
+                        let deadline = now.saturating_add(abi::PROCESS_TOKEN_TTL).min(max_exp);
+                        db.run(
+                            "UPDATE credentials SET expires = ? WHERE ns = ? AND token = ?",
+                            vec![int(deadline), text(&asked.ns), text(hash)],
+                        );
+                        db.set_expiry("credential", hash, deadline);
+                        crate::fds::renew(self_db_ref(db), &cred.session(), now);
+                    } else {
+                        revoked.push(hash.clone());
+                    }
+                }
+                (Reply::ok(json!({ "revoked": revoked })), true)
+            })?
+        }
         "/internal/identity" => {
             #[derive(Deserialize)]
             struct Asked {
@@ -424,14 +645,6 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
                 (reply, true)
             })?
         }
-        "/internal/login" => transact(state, move |db| {
-            let context = login_context(db, key.as_deref(), guest.as_deref());
-            let reply = match context {
-                Some(context) => Reply::ok(json!(context)),
-                None => crate::api::errno_reply(&Errno::EACCES.into()),
-            };
-            (reply, true)
-        })?,
         "/internal/revoke" => {
             #[derive(Deserialize)]
             struct Asked {
@@ -445,7 +658,6 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
             };
             transact(state, move |db| {
                 for hash in &asked.renew {
-                    // Expiry and revocation are final: a late heartbeat cannot revive a token.
                     if db.credential_of(hash, &asked.ns).is_some() {
                         let deadline = auth::now() + abi::PROCESS_TOKEN_TTL;
                         db.run(
@@ -461,7 +673,6 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
                 (Reply::ok(Value::Null), true)
             })?
         }
-        // What the pages of a browser are to hear: a signal to a process one of its tabs runs.
         "/internal/tell" => {
             #[derive(Deserialize)]
             struct Asked {
@@ -480,241 +691,89 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
     }))
 }
 
-/// execve(2), as the authority decides it: the caller (root under sudo, if it may) for a new
-/// process, the process's own credentials for one replacing its image; the image (a regular,
-/// whole file it may execute: X, not R); how the loader reads it (the build's asset for /usr, a
-/// descriptor of the process's own for an uploaded one); and the credentials its process
-/// carries from now on.
-#[allow(clippy::too_many_arguments)]
-fn exec(
-    db: &mut Db,
-    key: Option<&str>,
-    guest: Option<&str>,
-    ns: &str,
-    sudo: bool,
-    umask: u16,
-    asked: Asked,
-    now: u64,
-) -> std::result::Result<Value, Error> {
-    // A process replacing its image keeps its credentials, as execve keeps them (there is no
-    // setuid), and its open descriptors; a new process is the caller's.
-    let current = match &asked.current {
-        Some(hash) => Some(db.credential_of(hash, ns).ok_or(Errno::ESRCH)?),
-        None => None,
-    };
-    let (cred, umask) = match &current {
-        Some(current) => (current.identity(), current.umask),
-        None => (crate::sys::caller(db, key, guest, sudo)?, umask),
-    };
-    // Only one's own process may be replaced (root's any).
-    if current.is_none()
-        && asked
-            .replacing
-            .is_some_and(|uid| cred.id != 0 && uid != cred.id)
-    {
-        return Err(Errno::EPERM.into());
-    }
-    let generation = current
-        .as_ref()
-        .map(|c| c.generation.clone())
-        .unwrap_or(asked.generation)
-        .filter(|g| g != "legacy");
-    crate::system::select(db, generation.as_deref())?;
-    let cwd = asked.cwd;
-    let path = if asked.path.starts_with('/') {
-        asked.path
-    } else if cwd == "/" || cwd.is_empty() {
-        format!("/{}", asked.path)
-    } else if cwd.starts_with('/') {
-        format!("{}/{}", cwd.trim_end_matches('/'), asked.path)
-    } else {
-        format!("/{}/{}", cwd.trim_matches('/'), asked.path)
-    };
-    let mut local = asked.local;
-    if let Some(image) = &mut local {
-        if !image.valid() || !path.starts_with('/') || path.len() > 4096 || path.contains('\0') {
-            return Err(Errno::EINVAL.into());
-        }
-        // Exec may attenuate an existing delegation, never enlarge it.
-        image.cloud &= current.as_ref().is_none_or(|c| c.cloud_access != 0);
-    } else {
-        if let Some(current) = &current {
-            current.cloud()?;
-        }
-        if asked.chroot {
-            return Err(Errno::ENOENT.into());
-        }
-        if asked.no_usr_fallback
-            && (crate::system::owns(db, &path) || os_image::below(&path, "/usr"))
-        {
-            return Err(Errno::ENOENT.into());
-        }
-    }
-    let executable = if local.is_some() {
-        None
-    } else {
-        let resolved = kernel::executable(&*db, &cred, &path)?;
-        if asked.no_usr_fallback
-            && (crate::system::owns(db, &resolved.path) || os_image::below(&resolved.path, "/usr"))
-        {
-            return Err(Errno::ENOENT.into());
-        }
-        Some(resolved)
-    };
-    if executable.as_ref().is_some_and(|e| e.node.size > EXEC_MAX) {
-        return Err(Error::because(
-            Errno::E2BIG,
-            format!("{path} is larger than an executable may be"),
-        ));
-    }
-    // The image: a binary of /usr, or any file whose content is one (a FICLONE copy or a hard
-    // link of /usr/bin/coreutils), is the build's asset; anything else is uploaded, and the
-    // loader reads it by a token of the process's own descriptor, revalidated with the X rule.
-    let asset = executable
-        .as_ref()
-        .and_then(|e| crate::system::asset(&e.content));
-    if executable
-        .as_ref()
-        .is_some_and(|e| crate::system::owns(db, &e.path))
-        && asset.is_none()
-    {
-        return Err(Error::because(
-            Errno::ENOEXEC,
-            format!("{path} is not an executable image"),
-        ));
-    }
-    let lineage = current
-        .as_ref()
-        .map_or_else(|| owner(ns, asked.pid, &asked.token), Credential::owner);
-    let controller = match &current {
-        Some(c) => db.controller(&c.owner()).unwrap_or(c.uid),
-        None => auth::identity_of(db, key, guest).id,
-    };
-    db.set_controller(&lineage, controller);
-    // The image's descriptor is kept in its process's line's session, as what it opens is.
-    let sid = session_of(ns, &lineage);
-    db.run(
-        "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner, expires) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        vec![
-            text(&asked.token),
-            text(ns),
-            int(asked.pid),
-            int(cred.id),
-            int(cred.group),
-            text(&serde_json::to_string(&cred.groups).unwrap_or_default()),
-            int(umask),
-            int(now),
-            text(&lineage),
-            int(now + abi::PROCESS_TOKEN_TTL),
-        ],
-    );
-    db.run(
-        "UPDATE credentials SET generation = ?, cloud_access = ? WHERE token = ?",
-        vec![
-            generation.as_deref().into(),
-            int(u8::from(local.as_ref().is_none_or(|l| l.cloud))),
-            text(&asked.token),
-        ],
-    );
-    db.set_expiry("credential", &asked.token, now + abi::PROCESS_TOKEN_TTL);
-    let placement = crate::placement::browser(
-        ns,
-        cred.id,
-        asked.seat.as_deref(),
-        asked.cgroup.as_deref().unwrap_or("/user"),
-    );
-    db.run(
-        "UPDATE credentials SET placement = ? WHERE token = ?",
-        vec![
-            text(&serde_json::to_string(&placement).unwrap_or_default()),
-            text(&asked.token),
-        ],
-    );
-    // The image the process ran before is replaced: its token and its image's descriptor die
-    // with the exec, not only when the process ends; what it opened stays open for the new one.
-    if let Some(current) = &current {
-        db.inherit_cloud_opens(ns, &current.token, &asked.token);
-    }
-    if let Some(old) = &asked.old {
-        db.revoke(ns, old);
-    }
-    // The new image's own descriptor is its exec's alone.
-    let owner = owner(ns, asked.pid, &asked.token);
-    let (fd, token_read, size, version, path) = match executable {
-        Some(executable) if asset.is_none() => {
-            let read = auth::random_token();
-            let fd = db.add_exec_fd(
-                &sid,
-                &executable.content,
-                &executable.path,
-                &owner,
-                &auth::token_hash(&read),
-                now,
-            );
-            (
-                Some(fd),
-                Some(read),
-                executable.node.size,
-                executable.content,
-                executable.path,
-            )
-        }
-        // A binary of /usr is as large as the build's (`usr::size` takes its content id).
-        Some(executable) => (
-            None,
-            None,
-            crate::system::size(&executable.content),
-            executable.content,
-            executable.path,
-        ),
-        None => {
-            let image = local.as_ref().ok_or(Errno::EINVAL)?;
-            (
-                None,
-                None,
-                image.size,
-                format!("local:{}", image.digest),
-                path,
-            )
-        }
-    };
-    Ok(json!(Image {
-        local,
-        login: if current.is_none() {
-            login_context(db, key, guest)
-        } else {
-            None
-        },
-        uid: cred.id,
-        gid: cred.group,
-        groups: cred.groups.clone(),
-        umask,
-        fd,
-        asset,
-        path,
-        size,
-        token_read,
-        version,
-    }))
+fn self_db_ref(db: &mut Db) -> &mut Db {
+    db
 }
 
-// Authenticated login provenance is internal registry metadata, never supplied by a page.
-fn login_context(
-    db: &mut Db,
-    key: Option<&str>,
-    guest: Option<&str>,
-) -> Option<crate::login::Context> {
-    use os_core::permissions::Store;
-    let uid = auth::identity_of(db, key, guest).id;
-    auth::sid(db, key, guest).map(|binding| {
-        let expires = key
-            .and_then(|key| db.session(key))
-            .filter(|session| session.user == uid && session.expires > auth::now())
-            .map_or(auth::now() + 24 * 60 * 60, |session| session.expires);
-        crate::login::Context {
-            binding,
-            uid,
-            expires,
+fn default_true() -> bool {
+    true
+}
+
+fn default_umask() -> u16 {
+    0o022
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cred_with_scope(scope: RemoteScope, cloud_access: u8, started: u64) -> Credential {
+        Credential {
+            token: "hash-1".into(),
+            ns: "guest.abc".into(),
+            pid: 0,
+            uid: 1000,
+            gid: 1000,
+            groups: "[1000]".into(),
+            umask: 0o022,
+            started,
+            generation: None,
+            cloud_access,
+            placement: json!({
+                "instance_id": "inst-1",
+                "cgroup": "/user",
+                "scope": scope,
+            })
+            .to_string(),
+            lineage: "inst:inst-1:hash".into(),
         }
-    })
+    }
+
+    #[test]
+    fn remote_scope_enforces_containers_relay_devices_and_max_lifetime() {
+        let cloud_only = cred_with_scope(RemoteScope::cloud_only(), 1, 1000);
+        assert!(cloud_only.cloud().is_ok());
+        assert_eq!(
+            cloud_only.check_containers().unwrap_err().errno,
+            Errno::EACCES
+        );
+        assert_eq!(cloud_only.check_relay().unwrap_err().errno, Errno::EACCES);
+        assert_eq!(
+            cloud_only.check_device("archive").unwrap_err().errno,
+            Errno::EACCES
+        );
+        assert_eq!(
+            cloud_only.max_expires(),
+            Some(1000 + MAX_CREDENTIAL_LIFETIME)
+        );
+
+        let full = cred_with_scope(RemoteScope::full(), 1, 2000);
+        assert!(full.cloud().is_ok());
+        assert!(full.check_containers().is_ok());
+        assert!(full.check_relay().is_ok());
+        assert!(full.check_device("archive").is_ok());
+        assert!(full.check_device("present").is_ok());
+
+        let containers_only = cred_with_scope(
+            RemoteScope {
+                cloud_fs: false,
+                devices: vec!["archive".into()],
+                containers: true,
+                relay: false,
+            },
+            0,
+            3000,
+        );
+        assert_eq!(containers_only.cloud().unwrap_err().errno, Errno::EACCES);
+        assert!(containers_only.check_containers().is_ok());
+        assert!(containers_only.check_device("archive").is_ok());
+        assert_eq!(
+            containers_only.check_device("media").unwrap_err().errno,
+            Errno::EACCES
+        );
+        assert_eq!(
+            containers_only.check_relay().unwrap_err().errno,
+            Errno::EACCES
+        );
+    }
 }

@@ -40,6 +40,7 @@ pub mod procfs;
 pub mod profiles;
 pub mod sharefs;
 pub mod stat;
+pub mod vblk;
 pub mod vfs;
 pub mod walk;
 
@@ -93,6 +94,9 @@ impl Cred {
         Self::new(Identity::root())
     }
 }
+
+/// Hard cap on entries per `read_dir_page` call so callers cannot blow the 32 MiB wasm32 arena.
+pub const DIR_PAGE_MAX: usize = 1024;
 
 /// A filesystem driver: the version 2 calls of the contract §2.3, as Linux's
 /// `inode_operations` and `file_operations` together. Every call names the credential acting;
@@ -333,6 +337,60 @@ pub trait Filesystem {
     /// End the open reference: its locks go, and an unlinked file's content goes with its last
     /// open reference.
     fn release<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()>;
+
+    /// Cursor-based paged directory enumeration (R7, #77).
+    /// - `cookie == 0` begins at the first entry.
+    /// - `max_entries` is clamped to `DIR_PAGE_MAX`; `max_entries == 0` returns an empty page.
+    /// - Drivers with native indexed directories (e.g. `CowFs` `DIR_INDEX`) override this to
+    ///   enumerate O(page) entries without loading the whole directory into memory.
+    fn read_dir_page<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        cookie: u64,
+        max_entries: usize,
+    ) -> BoxFuture<'a, DirPage> {
+        Box::pin(async move {
+            let all = self.read_dir(cred, dir).await?;
+            let start = usize::try_from(cookie).unwrap_or(all.len()).min(all.len());
+            if max_entries == 0 {
+                let next_cookie = (start < all.len()).then_some(start as u64);
+                return Ok(DirPage {
+                    entries: Vec::new(),
+                    next_cookie,
+                });
+            }
+            let limit = max_entries.min(DIR_PAGE_MAX);
+            let end = start.saturating_add(limit).min(all.len());
+            let next_cookie = (end < all.len()).then_some(end as u64);
+            Ok(DirPage {
+                entries: all[start..end].to_vec(),
+                next_cookie,
+            })
+        })
+    }
+
+    /// Intra-filesystem O(1) extent reflink (`FICLONE`, contract §5).
+    /// Cross-filesystem calls are rejected by `Vfs` with `Errno::EXDEV`.
+    fn reflink<'a>(
+        &'a self,
+        _cred: &'a Cred,
+        _src_open: &'a OpenRef,
+        _dst_open: &'a OpenRef,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::EOPNOTSUPP) })
+    }
+
+    /// Whole-filesystem durability barrier (`syncfs(2)`, contract §5).
+    fn sync_fs<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if self.capabilities().durability == abi::contract::Durability::Volatile {
+                Ok(())
+            } else {
+                Err(Errno::EOPNOTSUPP)
+            }
+        })
+    }
 }
 
 /// Poll a future once: its output if it is ready, as `futures::FutureExt::now_or_never`.

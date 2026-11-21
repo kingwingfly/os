@@ -21,10 +21,12 @@ pub fn error_response(message: &str, status: u16) -> Result<Response> {
 
 /// Ask the authority, as the client whose session cookie is `cookie`, for the process whose
 /// token is `proc`, if a process's request it is.
+#[allow(clippy::too_many_arguments)]
 async fn authority_as(
     env: &Env,
     cookie: Option<&str>,
     proc: Option<&str>,
+    instance: Option<&str>,
     release: Option<&str>,
     method: Method,
     path_and_query: &str,
@@ -36,6 +38,9 @@ async fn authority_as(
     }
     if let Some(proc) = proc {
         headers.set("X-Process-Token", proc)?;
+    }
+    if let Some(instance) = instance {
+        headers.set("X-OS-Instance", instance)?;
     }
     if let Some(release) = release {
         headers.set("X-OS-Release", release)?;
@@ -64,10 +69,12 @@ async fn authority(
 ) -> Result<Response> {
     let cookie = req.headers().get("Cookie")?;
     let proc = req.headers().get("X-Process-Token")?;
+    let instance = req.headers().get("X-OS-Instance")?;
     authority_as(
         env,
         cookie.as_deref(),
         proc.as_deref(),
+        instance.as_deref(),
         req.headers().get("X-OS-Release")?.as_deref(),
         method,
         path_and_query,
@@ -128,11 +135,18 @@ fn session(req: &Request) -> String {
         .ok()
         .flatten()
         .unwrap_or_default();
+    let instance = req
+        .headers()
+        .get("X-OS-Instance")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     format!(
-        "{} {} {}",
+        "{} {} {} {}",
         cookie(crate::auth::COOKIE),
         cookie(crate::auth::GUEST_COOKIE),
-        proc
+        proc,
+        instance
     )
 }
 
@@ -143,16 +157,27 @@ async fn by_token(
     env: &Env,
     token: &str,
 ) -> Result<std::result::Result<Value, Response>> {
+    // F3-08: Never serve isolate-cached grants when a ServiceAuth v2 `X-Process-Token` is
+    // presented, so `usermod -L` / `passwd` / `userdel` / `RevokeTokens` / `DetachInstance`
+    // takes effect immediately on `/api/file?token=...`.
+    let has_proc_token = req
+        .headers()
+        .get("X-Process-Token")
+        .ok()
+        .flatten()
+        .is_some_and(|v| !v.is_empty());
     let (session, now) = (session(req), crate::auth::now());
-    let known = TOKENS.with(|tokens| {
-        tokens
-            .borrow()
-            .get(token)
-            .filter(|(of, at, _)| *of == session && now < at + abi::TOKEN_FRESH)
-            .map(|(_, _, grant)| grant.clone())
-    });
-    if let Some(grant) = known {
-        return Ok(Ok(grant));
+    if !has_proc_token {
+        let known = TOKENS.with(|tokens| {
+            tokens
+                .borrow()
+                .get(token)
+                .filter(|(of, at, _)| *of == session && now < at + abi::TOKEN_FRESH)
+                .map(|(_, _, grant)| grant.clone())
+        });
+        if let Some(grant) = known {
+            return Ok(Ok(grant));
+        }
     }
     let mut asked = authority(
         env,
@@ -168,9 +193,9 @@ async fn by_token(
     }
     let grant: Value = asked.json().await?;
     // An exec image's leave dies with its process descriptor. Caching it for TOKEN_FRESH would
-    // keep serving the image after exit/kill/wait closed the descriptor; only read tokens,
+    // keep serving the image after exit/kill/wait closed the descriptor; only page read tokens,
     // whose lifetime already includes that grace, are cached.
-    if grant["exec"].as_bool() != Some(true) {
+    if !has_proc_token && grant["exec"].as_bool() != Some(true) {
         TOKENS.with(|tokens| {
             let mut tokens = tokens.borrow_mut();
             if tokens.len() > 4096 {
@@ -338,6 +363,7 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
             env: env.clone(),
             cookie: req.headers().get("Cookie")?,
             proc: req.headers().get("X-Process-Token")?,
+            instance: req.headers().get("X-OS-Instance")?,
             query,
             complete: true,
             chunks: grant.chunks.iter().cloned().collect(),
@@ -389,6 +415,7 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
         env: env.clone(),
         cookie: req.headers().get("Cookie")?,
         proc: req.headers().get("X-Process-Token")?,
+        instance: req.headers().get("X-OS-Instance")?,
         query,
         complete: grant.state == "complete",
         chunks: grant.chunks.iter().cloned().collect(),
@@ -413,6 +440,7 @@ struct Reader {
     env: Env,
     cookie: Option<String>,
     proc: Option<String>,
+    instance: Option<String>,
     /// The file's path, as the authority's query.
     query: String,
     file: String,
@@ -490,6 +518,7 @@ impl Reader {
             &self.env,
             self.cookie.as_deref(),
             self.proc.as_deref(),
+            self.instance.as_deref(),
             None,
             Method::Get,
             &format!("/internal/read?{}", self.query),

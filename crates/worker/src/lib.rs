@@ -1,6 +1,5 @@
 mod api;
 mod auth;
-mod cgroup_lifetime;
 mod cloud_data;
 mod cloudfs;
 mod commands;
@@ -12,10 +11,7 @@ mod executor;
 mod fds;
 mod files;
 mod guests;
-mod init;
 mod jobs;
-mod lifecycle;
-mod login;
 mod machine;
 mod placement;
 mod procfs;
@@ -23,7 +19,6 @@ mod procs;
 mod provider_policy;
 mod resources;
 mod runner;
-mod seat_policy;
 mod store;
 mod streams;
 mod sys;
@@ -77,10 +72,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             (Method::Get | Method::Head, "/api/file") => files::read(req, &env).await,
             (Method::Post, "/api/fs/data") => cloud_data::gateway(req, &env).await,
             (Method::Put, "/api/pwrite") => files::pwrite(req, &env).await,
-            // The client kernel's batches of process calls go to its browser's own machine
-            // (machine.rs), not the filesystem's one authority. The header is routing only:
-            // the machine authenticates the account or process and checks ownership.
-            (Method::Post, "/api/sys") if req.headers().get("X-Registry")?.is_some() => {
+            // ServiceAuth v2: instance host fencing, remote credential mint/derive/renew/revoke,
+            // and per-credential remote `io.max` policy (Contract §2.3, §2.10).
+            (Method::Post, "/api/service-auth") => {
                 let ns = db::Db::namespace(
                     auth::token_key(&req).as_deref(),
                     auth::guest_key(&req).as_deref(),
@@ -90,6 +84,14 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     .get_stub()?
                     .fetch_with_request(req)
                     .await
+            }
+            // Retired `X-Registry` server process registry routing fails closed (Contract §2.12).
+            (Method::Post, "/api/sys") if req.headers().get("X-Registry")?.is_some() => {
+                Ok(Response::from_json(&serde_json::json!({
+                    "errno": "EPERM",
+                    "error": "server process registry route has been removed; use ServiceAuth v2",
+                }))?
+                .with_status(403))
             }
             _ => {
                 env.durable_object("AUTHORITY")?

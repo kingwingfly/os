@@ -408,6 +408,11 @@ pub fn ioctl(
     op: u32,
     arg: Value,
 ) -> Result<Value> {
+    if let (Some(cred), Some(rdev)) = (&request.credential, request.node.rdev.as_deref())
+        && matches!(rdev, "archive" | "media" | "present" | "snd")
+    {
+        cred.check_device(rdev)?;
+    }
     match request.node.rdev.as_deref() {
         Some("archive" | "media") => accelerator::ioctl(db, process, request, op, arg),
         Some("system") => crate::system::control(db, process, request, op, arg),

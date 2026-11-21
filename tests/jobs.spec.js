@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { call as syscall } from './sys.js';
+import { hookPageKernel } from './service-auth.js';
 
 // Job control (crates/frontend/src/shell/jobs.rs, web/wasi/exec.mjs): a pipeline of /usr/bin run
 // with & is a job; Ctrl+Z stops the one in the foreground, a job from then on; fg, bg and
@@ -71,30 +71,39 @@ test('Ctrl+Z stops the program in the foreground; fg gives it the terminal again
   await expect(last(page)).toHaveText('fg: current: no such job');
 });
 
-test('a signal from another tab reaches the process where it runs: stopped, then ended', async ({ browser }) => {
+test('signals stay isolated across tabs and control local jobs: stopped, then ended', async ({ browser }) => {
   const context = await browser.newContext();
   try {
     const [one, two] = [await context.newPage(), await context.newPage()];
+    const kernelOne = await hookPageKernel(one);
     await ready(one); await ready(two);
+    await kernelOne.ready();
+    // Advance tab one's PID counter so its job PID does not coincide with another tab's init/shell.
+    await run(one, 'coreutils true');
     await run(one, 'coreutils sleep 60 &');
     await expect(last(one)).toHaveText(/^\[1\] \d+$/);
     const pid = (await last(one).innerText()).split(' ')[1];
+    // Contract v2 §2.1: another tab's kernel instance cannot signal tab one's process.
     await run(two, `kill -STOP ${pid}`);
-    await expect(last(one)).toHaveText('[1]+  Stopped                 coreutils sleep 60');
+    await expect(last(two)).toContainText(/No such process|ESRCH/i);
+    expect((await kernelOne.value('poll', { pids: [Number(pid)] }))[0]?.state).toBe('running');
     await run(two, 'kill -l');
     // The terminal may wrap inside a signal name. Compare the ordered catalog without visual whitespace.
     await expect.poll(async () => (await last(two).textContent()).replace(/\s/g, '')).toBe(
       'HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM STKFLT CHLD CONT STOP TSTP TTIN TTOU URG XCPU XFSZ VTALRM PROF WINCH IO PWR SYS'.replace(/\s/g, ''));
-    await run(two, `kill ${pid}`);
+    // Signals within the owning instance stop, hold catchable signals while stopped, and terminate on CONT.
+    await run(one, `kill -STOP ${pid}`);
+    await expect(last(one)).toHaveText('[1]+  Stopped                 coreutils sleep 60');
+    await run(one, `kill ${pid}`);
     // Catchable signals stay pending while stopped, even past the host's fallback deadline.
     await one.waitForTimeout(1500);
-    expect((await syscall(one.request, { proc_poll: { pids: [Number(pid)] } }))[0].state).toBe('stopped');
-    await run(two, `kill -CONT ${pid}`);
+    expect((await kernelOne.value('poll', { pids: [Number(pid)] }))[0]?.state).toBe('stopped');
+    await run(one, `kill -CONT ${pid}`);
     await expect(last(one)).toHaveText('[1]+  Terminated              coreutils sleep 60');
   } finally { await context.close(); }
 });
 
-test('registry polling recovers a kill missed during an events outage', async ({ page }) => {
+test('local sync polling recovers a kill missed during an events outage', async ({ page }) => {
   await page.addInitScript(() => {
     const Native = WebSocket;
     window.eventsSockets = [];
@@ -102,15 +111,16 @@ test('registry polling recovers a kill missed during an events outage', async ({
       constructor(...args) { super(...args); window.eventsSockets.push(this); }
     };
   });
+  const kernel = await hookPageKernel(page);
   await ready(page);
+  await kernel.ready();
   await run(page, 'coreutils sleep 60 &');
   await expect(last(page)).toHaveText(/^\[1\] \d+$/);
   const pid = Number((await last(page).innerText()).split(' ')[1]);
   await page.evaluate(() => { for (const socket of window.eventsSockets) socket.close(); });
-  const result = await page.evaluate(async pid => (await (await fetch('/api/sys', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ calls: [{ kill: { pid: String(pid), signal: 15 } }] }),
-  })).json()).results[0], pid);
+  // Queue SIGTERM directly in the local client-kernel without sending deliver_signal,
+  // verifying that periodic local `sync` reconciliation recovers the signal offline.
+  const result = await kernel.call('kill', { pid, signal: 15 });
   expect(result).toHaveProperty('ok');
   await expect(last(page)).toHaveText('[1]+  Terminated              coreutils sleep 60', { timeout: 15_000 });
   await run(page, 'jobs');

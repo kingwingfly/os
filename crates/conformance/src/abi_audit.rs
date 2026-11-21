@@ -62,33 +62,19 @@ const _: fn(Call) = |call| match call {
     | Call::Groupdel { .. }
     | Call::InotifyAddWatch { .. }
     | Call::InotifyRmWatch { .. }
-    | Call::ProcInit { .. }
-    | Call::Execve { .. }
-    | Call::ProcTty { .. }
-    | Call::Fork { .. }
-    | Call::Exit { .. }
-    | Call::Pids { .. }
-    | Call::Seats
-    | Call::MachineInit { .. }
-    | Call::LoginSession { .. }
-    | Call::Gone { .. }
     | Call::Getpid
     | Call::Getpgid { .. }
     | Call::Getsid { .. }
     | Call::Setpgid { .. }
     | Call::Setsid
-    | Call::ProcSession { .. }
     | Call::Prctl { .. }
     | Call::ProcStopped { .. }
     | Call::Waitpid { .. }
-    | Call::ProcPoll { .. }
-    | Call::ProcKeep { .. }
     | Call::CgroupCreate { .. }
     | Call::CgroupRemove { .. }
     | Call::CgroupSet { .. }
     | Call::CgroupAttach { .. }
     | Call::CgroupStat { .. }
-    | Call::Resource { .. }
     | Call::CgroupList { .. }
     | Call::Kill { .. }
     | Call::Wait { .. }

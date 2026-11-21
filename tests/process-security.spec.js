@@ -3,8 +3,12 @@ import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
 import { api, call as syscall, put, rmrf } from './sys.js';
 
-const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
+const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const sleep = { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '60'], env: [], cwd: '/' };
+const ROOT_ACCOUNT = { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root', home: '/root', shell: '/usr/bin/dash', signed_in: true };
+const GUEST_ACCOUNT = { uid: 65534, gid: 65534, groups: [65534], user: 'guest', group: 'guest', home: '/tmp', shell: '/usr/bin/dash', signed_in: false };
+
 let sequence = 0;
 async function login(request) {
   const response = await api(request, 'login', {
@@ -14,8 +18,7 @@ async function login(request) {
   expect(response.ok()).toBe(true);
 }
 
-// A separate client-kernel port per page. Omitting a tab id exercises the port's own host
-// identity without inventing a Web Lock that would outlive this test's connection.
+// A separate dedicated client-kernel Worker per page (HostAdapter v2).
 async function connect(page, { tab, hold = false } = {}) {
   await page.evaluate(async ({ tab, hold }) => {
     if (hold) await new Promise(resolve => {
@@ -33,7 +36,7 @@ async function connect(page, { tab, hold = false } = {}) {
     window.securityKernel = (type, args) => new Promise(resolve => {
       const id = ++next;
       pending.set(id, resolve);
-      port.postMessage({ v: 1, id, type, args, tab });
+      port.postMessage({ v: 2, id, type, args, tab });
     });
   }, { tab, hold });
   value(await kernel(page, 'init'));
@@ -44,217 +47,157 @@ function value(reply) {
   return reply.ok;
 }
 
-test('signal queues survive missed events and only a valid process proof acknowledges them', async ({ page, context }) => {
+async function batch(page, calls, options = {}, extraHeaders = {}) {
+  return page.evaluate(async ({ calls, options, extraHeaders }) => {
+    const response = await fetch('/api/sys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...extraHeaders },
+      body: JSON.stringify({ calls, ...options }),
+    });
+    return { status: response.status, ok: response.ok, body: await response.json().catch(() => ({})) };
+  }, { calls, options, extraHeaders });
+}
+
+test('signal queues survive missed events, monotonic acks cannot clear newer signals, and SIGKILL revokes remote creds immediately', async ({ page, context }) => {
   await page.goto('/');
   await connect(page);
   await login(context.request);
-  const process = value(await kernel(page, 'exec', sleep));
-  const poll = async () => value(await kernel(page, 'sync')).find(row => row.pid === process.pid);
-  const kill = signal => syscall(context.request, { kill: { pid: String(process.pid), signal } });
+  value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+  const instanceId = value(await kernel(page, 'instance_id'));
+  const proc = value(await kernel(page, 'exec', { ...sleep, remote: true }));
+  expect(proc.token).toMatch(/^[0-9a-f]{64}$/);
+  const poll = async () => value(await kernel(page, 'sync')).find(row => row.pid === proc.pid);
+  const kill = signal => kernel(page, 'kill', { pid: proc.pid, signal });
   try {
-    await kill(0);
+    value(await kill(0));
     expect((await poll()).pending_signals ?? []).toEqual([]);
-    const [invalidSignal] = await batch(page, [{ kill: { pid: String(process.pid), signal: 32 } }]);
-    expect(invalidSignal.err.errno).toBe('EINVAL');
-    await kill(10); await kill(10); await kill(15);
+    expect((await kill(32)).err?.errno).toBe('EINVAL');
+
+    // Standard signals coalesce in order; repeated poll preserves unacknowledged queue.
+    value(await kill(10));
+    value(await kill(10));
+    value(await kill(15));
     const queued = await poll();
     expect(queued.state).toBe('running');
     expect(queued.pending_signals.map(event => event.signal)).toEqual([10, 15]);
     expect((await poll()).pending_signals).toEqual(queued.pending_signals);
     const sequences = queued.pending_signals.map(event => event.sequence);
-    const invalid = value((await batch(page, [{ proc_keep: { processes: [{ pid: process.pid, proc: 'invalid', signals: sequences }] } }], {}, true))[0]);
-    expect(invalid).toEqual([]);
-    expect((await poll()).pending_signals).toEqual(queued.pending_signals);
-    expect(value(await kernel(page, 'sync', { acknowledged: { [process.pid]: sequences } })).find(row => row.pid === process.pid).pending_signals ?? []).toEqual([]);
-    // A new delivery of the same signal cannot be cleared by an older acknowledgement.
-    await kill(10);
-    const fresh = value(await kernel(page, 'sync', { acknowledged: { [process.pid]: sequences } })).find(row => row.pid === process.pid);
+
+    // Acknowledging clears delivered sequences.
+    expect(value(await kernel(page, 'sync', { acknowledged: { [proc.pid]: sequences } }))
+      .find(row => row.pid === proc.pid).pending_signals ?? []).toEqual([]);
+
+    // A new delivery of the same signal cannot be cleared by an older acknowledgement sequence.
+    value(await kill(10));
+    const fresh = value(await kernel(page, 'sync', { acknowledged: { [proc.pid]: sequences } }))
+      .find(row => row.pid === proc.pid);
     expect(fresh.pending_signals[0].sequence).toBeGreaterThan(Math.max(...sequences));
-    await kill(19); await kill(18);
+
+    value(await kill(19));
+    value(await kill(18));
     const resumed = await poll();
     expect(resumed.state).toBe('running');
     expect(resumed.pending_signals.map(event => event.signal)).toEqual([10, 18]);
+
+    // Logout changes the instance's ambient account to guest: cross-uid kill fails EPERM,
+    // while the running root process keeps its stored credentials & pending signals.
     expect((await api(context.request, 'logout')).ok()).toBe(true);
-    const [denied] = await batch(page, [{ kill: { pid: String(process.pid), signal: 12 } }]);
-    expect(denied.err.errno).toBe('EPERM');
-    // A process's stored credentials and signal proof survive a browser logout.
-    expect((await poll()).pending_signals).toEqual(resumed.pending_signals);
+    value(await kernel(page, 'sync_account', GUEST_ACCOUNT));
+    expect((await kill(12)).err?.errno).toBe('EPERM');
+    expect((await kernel(page, 'getcreds_proc', { pid: proc.pid })).ok.uid).toBe(0);
+
+    // Re-authenticate as root and send SIGKILL -> immediate zombie + immediate remote token revocation.
     await login(context.request);
-    await kill(9);
+    value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+    value(await kill(9));
     expect((await poll()).state).toBe('zombie');
-    const [revoked] = await batch(page, ['getcreds'], { pid: process.pid, proc: process.token });
-    expect(revoked.err.errno).toBe('EPERM');
+    const revokedSys = await batch(page, ['getcreds'], { pid: proc.pid, proc: proc.token }, { 'X-OS-Instance': instanceId });
+    expect(revokedSys.body.results?.[0]?.err?.errno).toBe('EPERM');
+    const revokedFs = await (await context.request.post(origin + '/api/fs', {
+      headers: { Origin: origin, 'X-OS-Instance': instanceId },
+      data: { version: 2, credential: proc.token, session: null, call: 'connect' },
+    })).json();
+    expect(['EACCES', 'EPERM']).toContain(revokedFs.errno);
   } finally {
     await login(context.request);
-    await kernel(page, 'exit', { pid: process.pid, status: 0 });
-    await kernel(page, 'wait', { pid: process.pid });
+    value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+    await kernel(page, 'exit', { pid: proc.pid, status: 0 });
+    await kernel(page, 'wait', { pid: proc.pid });
   }
 });
-async function batch(page, calls, options = {}, registry = false) {
-  return page.evaluate(async ({ calls, options, registry }) => {
-    const response = await fetch('/api/sys', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', ...(registry ? { 'X-Registry': '1' } : {}) },
-      body: JSON.stringify({ calls, ...options }),
-    });
-    if (!response.ok) throw new Error(`sys: ${response.status} ${await response.text()}`);
-    return (await response.json()).results;
-  }, { calls, options, registry });
-}
 
-test('the machine refuses route-only bookkeeping from pages and process tokens on either route', async ({ page, context }) => {
-  await page.goto('/');
+test('retired server registry routes, X-Registry header, and forged ServiceAuth proofs fail closed', async ({ page, context }) => {
+  await page.goto('/login');
+  await login(context.request);
+
+  // X-Registry header is unconditionally rejected (403 EPERM).
+  const regHeader = await batch(page, ['getcreds'], {}, { 'X-Registry': '1' });
+  expect(regHeader.status).toBe(403);
+  expect(regHeader.body.errno).toBe('EPERM');
+
+  // Every retired server-side registry Call fails closed on /api/sys.
+  const retiredCalls = [
+    { proc_init: { boot: 'untrusted-reset' } },
+    'seats',
+    { gone: { seat: '' } },
+    { execve: sleep },
+    { fork: { pid: 1 } },
+    { exit: { status: 0 } },
+    { pids: { count: 2 } },
+    { proc_keep: { processes: [] } },
+    { machine_init: { action: { op: 'inspect' } } },
+    { login_session: { action: { op: 'inspect' } } },
+  ];
+  for (const call of retiredCalls) {
+    const res = await batch(page, [call]);
+    expect(res.ok, JSON.stringify(call)).toBe(false);
+  }
+
+  // Forged instance_id / host_proof on /api/service-auth fail closed with EACCES.
+  const forged = await context.request.post(origin + '/api/service-auth', {
+    headers: { Origin: origin, 'Content-Type': 'application/json' },
+    data: {
+      mint_service_cred: {
+        instance_id: 'inst-forged-0000',
+        host_proof: 'f'.repeat(64),
+      },
+    },
+  });
+  expect(forged.ok()).toBe(false);
+  expect((await forged.json()).errno).toBe('EACCES');
+});
+
+test('a rejected sudo launch does not block local exit, wait, or remote token revocation', async ({ page, context }) => {
+  await page.goto('/login');
   await connect(page);
-  // Even root's page and root's process are user space, not the client kernel.
   await login(context.request);
-  const process = value(await kernel(page, 'exec', sleep));
-  const own = { pid: process.pid, proc: process.token };
-  const calls = [{ proc_init: { boot: 'untrusted-reset' } }, 'seats', { gone: { seat: '' } }];
-  try {
-    for (const [options, registry] of [[{}, false], [own, false], [own, true]]) {
-      const refused = await batch(page, calls, options, registry);
-      expect(refused.map(result => result.err?.errno)).toEqual(calls.map(() => 'EPERM'));
-      // In particular, proc_init and gone must not have reaped the running process.
-      expect(value((await batch(page, ['getpid'], own))[0]).pid).toBe(process.pid);
-      expect(value(await kernel(page, 'poll', { pids: [process.pid] }))[0].state).toBe('running');
-    }
-    const lifecycle = [{ fork: { pid: process.pid } }, { exit: { status: 0 } }, { wait: { pid: String(process.pid) } }];
-    expect((await batch(page, lifecycle)).map(result => result.err?.errno)).toEqual(lifecycle.map(() => 'EPERM'));
-    expect((await batch(page, [{ pids: { count: 2 } }]))[0].err?.errno).toBe('EPERM');
-    // A process can reserve pids, scoped to its snapshot and token, on either route.
-    for (const route of [false, true]) {
-      expect(value((await batch(page, [{ pids: { count: 1 } }], own, route))[0])).toHaveLength(1);
-    }
-    expect(value((await batch(page, ['seats'], {}, true))[0])).toHaveProperty('seats');
-    expect(value((await batch(page, ['getpid'], own, true))[0]).pid).toBe(process.pid);
-  } finally {
-    await kernel(page, 'exit', { pid: process.pid, status: 0 });
-    await kernel(page, 'wait', { pid: process.pid });
-  }
-});
-
-test('a forged registry header cannot reset, reap, inspect or reclaim another account', async ({ page, context }) => {
-  const seat = `registry-owner-${Date.now()}-${++sequence}`;
-  const lender = `${seat}-kernel`;
-  // These registry-only processes model a live host. Claim its locks before the app
-  // boots, so ordinary abandoned-host cleanup cannot race the authorization checks.
-  await page.addInitScript(({ seat, lender }) => {
-    window.registryLocks = Promise.all([`tw-tab-${seat}`, `tw-kernel-${lender}`].map(name =>
-      new Promise(resolve => { void navigator.locks.request(name, () => { resolve(); return new Promise(() => {}); }); })));
-  }, { seat, lender });
-  // This fixture explicitly owns its registry rows; do not boot the desktop's
-  // asynchronous PID 1 reaper, which can collect its top-level zombie.
-  await page.goto('/login.html');
-  await page.evaluate(() => window.registryLocks);
-  await login(context.request);
-  const call = async (entry, options = {}, route = true) => (await batch(page, [entry], options, route))[0];
-  const exec = async seat => value(await call({ execve: { ...sleep, seat } }));
-  value(await call({ proc_init: { boot: 'root-boot' } }));
-  const parent = await exec(seat);
-  const zombie = await exec(seat);
-  value(await call({ exit: { pid: zombie.pid, proc: zombie.token, status: 7 } }));
-  const [reserved] = value(await call({ pids: { count: 1, kernel: lender } }));
+  value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+  const instanceId = value(await kernel(page, 'instance_id'));
+  const proc = value(await kernel(page, 'exec', { ...sleep, remote: true }));
   try {
     expect((await api(context.request, 'logout')).ok()).toBe(true);
-    const guest = await exec(seat); // A tab can contain both accounts' processes.
-    for (const route of [false, true]) {
-      expect((await call({ kill: { pid: String(parent.pid), signal: 9 } }, {}, route)).err?.errno).toBe('EPERM');
-    }
-    const listed = value(await call('seats'));
-    expect(listed.kernels).not.toContain(lender);
-    // The shared seat is visible because it also contains the guest's process. A mixed seat
-    // is checked as a whole before any process or reservation is changed.
-    for (const entry of [
-      { gone: { seat } },
-      { gone: { kernel: lender } },
-      { gone: { seat, kernel: lender } },
-      { wait: { pid: String(zombie.pid) } },
-      { wait: { pid: String(zombie.pid), proc: 'invalid-token' } },
-    ]) expect((await call(entry)).err?.errno).toBe('EPERM');
-    expect(value(await call('getpid', { pid: guest.pid, proc: guest.token })).pid).toBe(guest.pid);
-    // A guest cannot consume a reservation belonging to root, even if it guesses the pid.
-    expect((await call({ fork: { pid: guest.pid, child: reserved } }, { pid: guest.pid, proc: guest.token })).err?.errno).toBe('EINVAL');
-    const reset = value(await call({ proc_init: { boot: 'guest-boot' } }));
-    expect(reset.pids).toEqual([1]);
-    expect(value(await call('seats'))).toEqual({ seats: [], kernels: [] });
-    // Root's old process and lend survived. Possessing that process's token still authorizes
-    // its fork after logout, unlike merely setting the routing header.
-    expect(value(await call('getpid', { pid: parent.pid, proc: parent.token })).pid).toBe(parent.pid);
-    const child = value(await call({ fork: { pid: parent.pid, child: reserved, proc: parent.token } }));
-    expect(child.pid).toBe(reserved);
-    await login(context.request);
-    const rows = value(await call({ proc_poll: { pids: [parent.pid, zombie.pid, child.pid, guest.pid] } }));
-    expect(rows.map(row => row.pid).sort()).toEqual([parent.pid, zombie.pid, child.pid].sort());
-    expect(rows.find(row => row.pid === parent.pid).state).toBe('running');
-    expect(rows.find(row => row.pid === zombie.pid)).toMatchObject({ state: 'zombie', status: 7 << 8 });
-    expect(value(await call({ wait: { pid: String(zombie.pid) } })).status).toBe(7 << 8);
-  } finally {
-    await login(context.request);
-    value(await call({ gone: { seat, kernel: lender } }));
-  }
-});
-
-test('a rejected sudo command does not discard token-authorized exit and wait reports', async ({ page, context }) => {
-  await page.goto('/');
-  await login(context.request);
-  const process = value((await batch(page, [{ execve: sleep }], {}, true))[0]);
-  try {
-    expect((await api(context.request, 'logout')).ok()).toBe(true);
-    const [ended, waited, denied] = await batch(page, [
-      { exit: { pid: process.pid, proc: process.token, status: 3 } },
-      { wait: { pid: String(process.pid), proc: process.token } },
-      { execve: sleep },
-    ], { sudo: true }, true);
-    expect(value(ended)).toBeNull();
-    expect(value(waited)).toMatchObject({ pid: process.pid, status: 3 << 8 });
+    value(await kernel(page, 'sync_account', GUEST_ACCOUNT));
+    // Rejected sudo exec fails without affecting local process exit/wait.
+    const denied = await kernel(page, 'exec', { ...sleep, sudo: true });
     expect(denied.err).toBeTruthy();
-    expect((await batch(page, ['getpid'], { pid: process.pid, proc: process.token }, true))[0].err?.errno).toBe('EPERM');
+
+    value(await kernel(page, 'exit', { pid: proc.pid, status: 3 }));
+    // F3-02: A signed-out guest cannot reap root's PID 1 child; root still can.
+    expect((await kernel(page, 'wait', { pid: proc.pid })).err?.errno).toBe('EPERM');
+
+    // Exiting the last local holder revoked its remote token even after logout.
+    const revokedFs = await (await context.request.post(origin + '/api/fs', {
+      headers: { Origin: origin, 'X-OS-Instance': instanceId },
+      data: { version: 2, credential: proc.token, session: null, call: 'connect' },
+    })).json();
+    expect(['EACCES', 'EPERM']).toContain(revokedFs.errno);
+
+    // Restoring root allows reaping the exited root child cleanly.
+    value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+    const waited = value(await kernel(page, 'wait', { pid: proc.pid }));
+    expect(waited).toMatchObject({ pid: proc.pid, status: 3 << 8 });
   } finally {
     await login(context.request);
-    await batch(page, [{ kill: { pid: String(process.pid), signal: 9 } }, { wait: { pid: String(process.pid) } }], {}, true);
-  }
-});
-
-test('PID lends belong to a process lineage and are released with its last live holder', async ({ page }) => {
-  await page.goto('/');
-  const lender = `lineage-${Date.now()}-${++sequence}`;
-  const call = async (entry, options = {}) => (await batch(page, [entry], options, true))[0];
-  const exec = async () => value(await call({ execve: { ...sleep, seat: lender } }));
-  const one = await exec(), two = await exec();
-  const as = process => ({ pid: process.pid, proc: process.token });
-  try {
-    const [first, second] = value(await call({ pids: { count: 2, kernel: lender } }, as(one)));
-    expect((await call({ fork: { pid: two.pid, child: first } }, as(two))).err?.errno).toBe('EINVAL');
-    const child = value(await call({ fork: { pid: one.pid, child: first } }, as(one)));
-    value(await call({ exit: { status: 0 } }, as(one)));
-    // A fork shares the lineage and keeps its unused reservations alive after its parent exits.
-    const grandchild = value(await call({ fork: { pid: child.pid, child: second } }, as(child)));
-    value(await call({ pids: { count: 2, kernel: lender } }, as(grandchild)));
-    value(await call({ exit: { status: 0 } }, as(child)));
-    expect(value(await call('seats')).kernels).toContain(lender);
-    value(await call({ exit: { status: 0 } }, as(grandchild)));
-    expect(value(await call('seats')).kernels).not.toContain(lender);
-  } finally {
-    value(await call({ gone: { seat: lender, kernel: lender } }));
-  }
-});
-
-test('a registry caller can clean up its own seat and lends without affecting other accounts', async ({ page, context }) => {
-  await page.goto('/');
-  await login(context.request);
-  const seat = `registry-cleanup-${Date.now()}-${++sequence}`;
-  const call = async entry => (await batch(page, [entry], {}, true))[0];
-  const root = value(await call({ execve: { ...sleep, seat: seat + '-root' } }));
-  try {
-    expect((await api(context.request, 'logout')).ok()).toBe(true);
-    const guest = value(await call({ execve: { ...sleep, seat } }));
-    value(await call({ pids: { count: 2, kernel: seat } }));
-    expect(value(await call('seats'))).toEqual({ seats: [seat], kernels: [seat] });
-    expect(value(await call({ gone: { seat, kernel: seat } }))).toEqual([guest.pid]);
-    expect(value(await call('seats'))).toEqual({ seats: [], kernels: [] });
-    expect(value((await batch(page, ['getpid'], { pid: root.pid, proc: root.token }))[0]).pid).toBe(root.pid);
-  } finally {
-    await login(context.request);
-    value(await call({ gone: { seat: seat + '-root' } }));
   }
 });
 
@@ -274,19 +217,62 @@ function signalProgram(pid) {
   try { return Buffer.from(module.emitBinary()); } finally { module.dispose(); }
 }
 
+async function hookPageKernel(page) {
+  await page.addInitScript(() => {
+    const NativeWorker = window.Worker;
+    window.Worker = class extends NativeWorker {
+      constructor(url, options) {
+        super(url, options);
+        if (new URL(url, location.href).pathname.endsWith('/client-kernel.js')) {
+          const worker = this;
+          const pending = new Map();
+          let next = 900_000;
+          worker.addEventListener('message', ({ data }) => {
+            if (data?.id != null && pending.has(data.id)) {
+              pending.get(data.id)(data);
+              pending.delete(data.id);
+            }
+          });
+          window.__pageKernel = (type, args = {}) => new Promise(resolve => {
+            const id = ++next;
+            pending.set(id, resolve);
+            worker.postMessage({ v: 2, id, type, args });
+          });
+        }
+      }
+    };
+  });
+}
+
 for (const startsRoot of [false, true]) {
   test(`proc_signal keeps the process's ${startsRoot ? 'root credentials after logout' : 'guest credentials after root login'}`, async ({ page, context }) => {
-    await page.goto('/');
-    await connect(page);
+    await hookPageKernel(page);
     await login(context.request);
-    const target = value(await kernel(page, 'exec', sleep));
-    const path = `/tmp/proc-signal-${Date.now()}-${++sequence}.wasm`;
+    await page.goto('/');
+    await page.waitForFunction(() => !!window.os?.exec && !!window.__pageKernel);
+    await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+    await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(0);
+
+    // Start a root target process inside THIS page's kernel instance.
+    await page.evaluate(() => {
+      window.targetRun = window.os.exec([{ path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '60'] }], {
+        stdin: '',
+        onJob: job => { window.targetJob = job; },
+      });
+    });
+    await page.waitForFunction(() => window.targetJob?.pids?.length === 1);
+    const targetPid = await page.evaluate(() => window.targetJob.pids[0]);
+
+    const path = `/guest/proc-signal-${Date.now()}-${++sequence}.wasm`;
     try {
-      expect((await put(context.request, `/api/file?path=${path}`, { data: signalProgram(target.pid) })).ok()).toBe(true);
+      expect((await put(context.request, `/api/file?path=${path}`, { data: signalProgram(targetPid) })).ok()).toBe(true);
       await syscall(context.request, { chmod: { path, mode: 0o755 } });
-      if (!startsRoot) expect((await api(context.request, 'logout')).ok()).toBe(true);
+      if (!startsRoot) {
+        expect((await api(context.request, 'logout')).ok()).toBe(true);
+        await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+        await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).not.toBe(0);
+      }
       const before = await syscall(context.request, 'getcreds');
-      await page.waitForFunction(() => !!window.os?.exec);
       await page.evaluate(path => {
         window.securityReading = false;
         window.securityRun = window.os.exec([{ path, argv: [path] }], {
@@ -297,23 +283,29 @@ for (const startsRoot of [false, true]) {
       }, path);
       await page.waitForFunction(() => window.securityReading && window.securityInput && window.securityJob.pids.length === 1);
       const pid = await page.evaluate(() => window.securityJob.pids[0]);
-      expect(value(await kernel(page, 'poll', { pids: [pid] }))[0].uid).toBe(before.uid);
+      const polled = await page.evaluate(pid => window.__pageKernel('poll', { pids: [pid] }), pid);
+      expect(value(polled)[0].uid).toBe(before.uid);
 
-      if (startsRoot) expect((await api(context.request, 'logout')).ok()).toBe(true);
-      else await login(context.request);
-      expect((await syscall(context.request, 'getcreds')).uid === 0).toBe(!startsRoot);
-      await page.evaluate(() => window.securityInput.write('x\n')); // Commit the canonical input line.
+      if (startsRoot) {
+        expect((await api(context.request, 'logout')).ok()).toBe(true);
+        await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+        await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).not.toBe(0);
+      } else {
+        await login(context.request);
+        await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+        await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(0);
+      }
+      await page.evaluate(() => window.securityInput.write('x\n'));
       expect((await page.evaluate(() => window.securityRun)).status).toBe(startsRoot ? 0 : 63);
-      // Inspect as root: the guest page must not be able to see root's process list.
-      if (startsRoot) await login(context.request);
-      const [after] = value(await kernel(page, 'poll', { pids: [target.pid] }));
-      expect(after.state).toBe(startsRoot ? 'zombie' : 'running');
-      if (startsRoot) expect(after.status).toBe(9);
+      if (startsRoot) {
+        expect((await page.evaluate(() => window.targetRun)).status).toBe(137);
+      } else {
+        const targetState = await page.evaluate(pid => window.__pageKernel('poll', { pids: [pid] }), targetPid);
+        expect(value(targetState)[0]?.state).toBe('running');
+      }
     } finally {
-      await page.evaluate(() => window.securityJob?.signal(9));
+      await page.evaluate(() => { window.securityJob?.signal(9); window.targetJob?.signal(9); });
       await login(context.request);
-      await kernel(page, 'exit', { pid: target.pid, status: 0 });
-      await kernel(page, 'wait', { pid: target.pid });
       await rmrf(context.request, path);
     }
   });
@@ -322,17 +314,20 @@ for (const startsRoot of [false, true]) {
 for (const removed of [false, true]) {
   test(`another tab cannot fork, replace, exit, wait for children or signal as a hosted process (SharedWorker ${removed ? 'removed' : 'unchanged'})`, async ({ page, context }) => {
     if (removed) await context.addInitScript(() => { delete globalThis.SharedWorker; });
-    await page.goto('/');
+    await page.goto('/login');
     await connect(page);
     await login(context.request);
-    const parent = value(await kernel(page, 'exec', sleep));
+    value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+    const instanceId = value(await kernel(page, 'instance_id'));
+    const parent = value(await kernel(page, 'exec', { ...sleep, remote: true }));
     const child = value(await kernel(page, 'fork', { pid: parent.pid }));
     value(await kernel(page, 'exit', { pid: child.pid, status: 7 }));
     // Drop the page's privileges; the already running parent remains root.
     expect((await api(context.request, 'logout')).ok()).toBe(true);
+    value(await kernel(page, 'sync_account', GUEST_ACCOUNT));
     const other = await context.newPage();
     try {
-      await other.goto('/');
+      await other.goto('/login');
       await connect(other);
       const attempts = [
         ['fork', { pid: parent.pid }],
@@ -342,24 +337,23 @@ for (const removed of [false, true]) {
         ['exit', { pid: parent.pid, status: 99 }],
         ['waitchild', { ppid: parent.pid, pid: child.pid }],
         ['kill', { pid: parent.pid, signal: 9, from: parent.pid }],
+        ['wait', { pid: child.pid }],
       ];
       for (const [type, args] of attempts) {
         const reply = await kernel(other, type, args);
         expect(reply.ok, type).toBeUndefined();
-        expect(reply.err?.errno, type).toBe('ESRCH');
+        expect(reply.err?.errno, type).toBe(type === 'wait' ? 'ECHILD' : 'ESRCH');
       }
-      // A generic wait must not let another port use the kernel's retained zombie token.
-      expect((await kernel(other, 'wait', { pid: child.pid })).err?.errno).toBe('EPERM');
-      // PID lending uses the parent's snapshot, even though the page is now guest.
+      // Tab A can still fork, reap its zombie child, and reexec with its root snapshot preserved.
       const later = value(await kernel(page, 'fork', { pid: parent.pid }));
       value(await kernel(page, 'exit', { pid: later.pid, status: 0 }));
       value(await kernel(page, 'waitchild', { ppid: parent.pid, pid: later.pid }));
-      // The owning port can still act, and the other tab did not steal the child's status.
       expect(value(await kernel(page, 'waitchild', { ppid: parent.pid, pid: child.pid }))).toMatchObject({ pid: child.pid, status: 7 << 8 });
       const replaced = value(await kernel(page, 'reexec', { ...sleep, pid: parent.pid }));
       expect(replaced.pid).toBe(parent.pid);
       expect(replaced.token).toMatch(/^[0-9a-f]{64}$/);
-      expect(value((await batch(page, ['getcreds'], { pid: parent.pid, proc: replaced.token }))[0]).uid).toBe(0);
+      const credsReply = await batch(page, ['getcreds'], { pid: parent.pid, proc: replaced.token }, { 'X-OS-Instance': instanceId });
+      expect(credsReply.body.results[0].ok.uid).toBe(0);
       expect(value(await kernel(page, 'kill', { pid: parent.pid, signal: 0, from: parent.pid }))).toBeNull();
     } finally {
       await kernel(page, 'exit', { pid: parent.pid, status: 0 });
@@ -370,24 +364,23 @@ for (const removed of [false, true]) {
 }
 
 test('a new port cannot impersonate the tab named by a visible Web Lock', async ({ page, context }) => {
-  await page.goto('/');
+  await page.goto('/login');
   const tab = `security-owner-${Date.now()}-${++sequence}`;
   await connect(page, { tab, hold: true });
   await login(context.request);
+  value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
   const parent = value(await kernel(page, 'exec', sleep));
   expect((await api(context.request, 'logout')).ok()).toBe(true);
+  value(await kernel(page, 'sync_account', GUEST_ACCOUNT));
   const other = await context.newPage();
   let stolen;
   try {
-    await other.goto('/');
-    // Same-origin tabs can enumerate the lock names; the tab id is not a secret.
+    await other.goto('/login');
     const visible = await other.evaluate(async () => (await navigator.locks.query()).held
       .map(lock => lock.name).find(name => name.startsWith('tw-tab-security-owner-')));
     expect(visible).toBe(`tw-tab-${tab}`);
     await connect(other, { tab: visible.slice('tw-tab-'.length) });
     stolen = await kernel(other, 'fork', { pid: parent.pid });
-    // The tab id is public; it names the lock that ends the port's processes, not the port that
-    // runs them. Another port claiming it is still another host, and gets no token.
     expect(stolen.err?.errno).toBe('ESRCH');
     expect(stolen.ok).toBeUndefined();
   } finally {
@@ -398,21 +391,24 @@ test('a new port cannot impersonate the tab named by a visible Web Lock', async 
   }
 });
 
-test('exec replacement revokes its image grant while preserving ordinary descriptors', async ({ page, context }) => {
-  await page.goto('/');
+test('exec replacement rotates remote token while preserving lineage open-refs and rejecting strangers', async ({ page, context }) => {
+  await page.goto('/login');
   await connect(page);
   await login(context.request);
+  value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+  const instanceId = value(await kernel(page, 'instance_id'));
   const path = `/guest/exec-lineage-${crypto.randomUUID()}.wasm`;
   const output = path + '.txt';
   const image = Buffer.from(binaryen.parseText('(module (memory (export "memory") 1) (func (export "_start")))').emitBinary());
   expect((await put(context.request, '/api/file?path=' + encodeURIComponent(path), { data: image })).ok()).toBe(true);
   await syscall(context.request, { chmod: { path, mode: 0o755 } });
   const first = value(await kernel(page, 'exec', { ...sleep, path, argv: [path] }));
+  expect(first.token).toMatch(/^[0-9a-f]{64}$/);
   let stranger;
   const fsOrigin = await page.evaluate(() => location.origin);
   const fsRpc = async (credential, session, call) => {
     const response = await context.request.post(fsOrigin + '/api/fs', {
-      headers: { Origin: fsOrigin },
+      headers: { Origin: fsOrigin, 'X-OS-Instance': instanceId },
       data: { version: 2, credential, session, call },
     });
     return { ok: response.ok(), status: response.status(), body: await response.json() };
@@ -422,7 +418,9 @@ test('exec replacement revokes its image grant while preserving ordinary descrip
   try {
     const old = { pid: first.pid, proc: first.token };
     // Processes use /api/fs v2 handles; direct v1 /api/sys regular-file path opens are refused.
-    expect((await batch(page, [{ open: { path: output, flags: 0o101, mode: 0o600 } }], old))[0].err?.errno).toBe('EPERM');
+    const directOpen = await batch(page, [{ open: { path: output, flags: 0o101, mode: 0o600 } }], old, { 'X-OS-Instance': instanceId });
+    expect(directOpen.body.results[0].err?.errno).toBe('EPERM');
+
     const conn = await fsRpc(first.token, null, 'connect');
     expect(conn.ok, JSON.stringify(conn.body)).toBe(true);
     fsSession = conn.body.session;
@@ -440,21 +438,23 @@ test('exec replacement revokes its image grant while preserving ordinary descrip
     });
     expect(created.ok, JSON.stringify(created.body)).toBe(true);
     openRef = created.body[1];
-    const sink = value((await batch(page, [{ open: { path: '/dev/null', flags: 2 } }], old))[0]);
+
     const replaced = value(await kernel(page, 'reexec', { ...sleep, pid: first.pid }));
-    const current = { pid: replaced.pid, proc: replaced.token };
+    expect(replaced.token).toMatch(/^[0-9a-f]{64}$/);
     expect(replaced.token).not.toBe(first.token);
-    expect((await batch(page, ['getcreds'], old))[0].err?.errno).toBe('EPERM');
-    // The loader's descriptor is image-specific even when its owner key is also the original
-    // process lineage. A replacement must not retain this old image capability.
-    expect((await batch(page, [{ pread: { fd: first.fd, count: 4 } }], current))[0].err?.errno).toBe('EBADF');
-    stranger = value(await kernel(page, 'exec', sleep));
+    // Old token is revoked immediately on reexec rotation.
+    const oldCreds = await batch(page, ['getcreds'], old, { 'X-OS-Instance': instanceId });
+    expect(oldCreds.body.results[0].err?.errno).toBe('EPERM');
+
+    // A stranger process with its own remote token cannot write to another lineage's /api/fs open-ref.
+    stranger = value(await kernel(page, 'exec', { ...sleep, remote: true }));
     const strangerConn = await fsRpc(stranger.token, null, 'connect');
     expect(strangerConn.ok, JSON.stringify(strangerConn.body)).toBe(true);
     const payload = Buffer.from('survived exec\n');
     const strangerWrite = await context.request.post(fsOrigin + '/api/fs/data', {
       headers: {
         Origin: fsOrigin,
+        'X-OS-Instance': instanceId,
         'X-OS-Filesystem': JSON.stringify({
           version: 2,
           credential: stranger.token,
@@ -469,16 +469,13 @@ test('exec replacement revokes its image grant while preserving ordinary descrip
     await fsRpc(stranger.token, strangerConn.body.session, 'disconnect').catch(() => {});
     expect(strangerWrite.ok()).toBe(false);
     expect(['EACCES', 'EPERM']).toContain((await strangerWrite.json()).errno);
-    // Stateless device I/O still belongs to its process lineage, including after exec.
-    const nullWrite = { pwrite: { fd: sink.fd, index: 0, data: 'eA==' } };
-    expect((await batch(page, [nullWrite]))[0].err?.errno).toBe('EBADF');
-    expect((await batch(page, [nullWrite], { pid: stranger.pid, proc: stranger.token }))[0].err?.errno).toBe('EBADF');
-    expect(value((await batch(page, [nullWrite], current))[0])).toEqual({ written: 1 });
-    expect(value((await batch(page, [{ pread: { fd: sink.fd, count: 1 } }], current))[0])).toEqual({ data: '', size: 0 });
-    value((await batch(page, [{ close: { fd: sink.fd } }], current))[0]);
+
+    // Browser logout does not kill the running process's remote descriptors.
+    expect((await api(context.request, 'logout')).ok()).toBe(true);
     const currentWrite = await context.request.post(fsOrigin + '/api/fs/data', {
       headers: {
         Origin: fsOrigin,
+        'X-OS-Instance': instanceId,
         'X-OS-Filesystem': JSON.stringify({
           version: 2,
           credential: replaced.token,
@@ -496,16 +493,152 @@ test('exec replacement revokes its image grant while preserving ordinary descrip
     openRef = null;
     await fsRpc(replaced.token, fsSession, 'disconnect');
     fsSession = null;
+    await login(context.request);
     expect(await (await context.request.get('/api/file?path=' + encodeURIComponent(output))).text()).toBe('survived exec\n');
   } finally {
     if (fsSession) {
       await fsRpc(first.token, fsSession, 'disconnect').catch(() => {});
     }
-    for (const process of [first, stranger].filter(Boolean)) {
-      await kernel(page, 'exit', { pid: process.pid, status: 0 });
-      await kernel(page, 'wait', { pid: process.pid });
+    for (const proc of [first, stranger].filter(Boolean)) {
+      await kernel(page, 'exit', { pid: proc.pid, status: 0 });
+      await kernel(page, 'wait', { pid: proc.pid });
     }
+    await login(context.request);
     await rmrf(context.request, output);
     await rmrf(context.request, path);
+  }
+});
+
+test('F3-01: set_proc_cred and mint_remote_cred block privilege escalation and preserve non-root local UID', async ({ page, context }) => {
+  await page.goto('/login');
+  await connect(page);
+
+  // Spawn a pre-login guest process (cloud_access: true) BEFORE logging in as root.
+  const preLoginGuest = value(await kernel(page, 'exec', { ...sleep }));
+  expect(value(await kernel(page, 'getcreds_proc', { pid: preLoginGuest.pid }))).toMatchObject({
+    uid: 65534,
+    has_remote: false,
+  });
+
+  await login(context.request);
+  value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+
+  // Spawn a root process, then drop it to non-root uid 1001.
+  const proc = value(await kernel(page, 'exec', { ...sleep }));
+  const noCloud = value(await kernel(page, 'exec', { ...sleep, remote: false }));
+  try {
+    // F3-01: Pre-login guest process with cloud_access=true MUST NOT escalate to remote root
+    // via mint_remote_cred(sudo: true) OR mint_remote_cred(sudo: false) after root sign-in!
+    expect((await kernel(page, 'mint_remote_cred', { pid: preLoginGuest.pid, sudo: true })).err?.errno).toBe('EPERM');
+    expect((await kernel(page, 'mint_remote_cred', { pid: preLoginGuest.pid, sudo: false })).err?.errno).toBe('EACCES');
+    expect(value(await kernel(page, 'getcreds_proc', { pid: preLoginGuest.pid }))).toMatchObject({
+      uid: 65534,
+      has_remote: false,
+    });
+
+    value(await kernel(page, 'set_proc_cred', { pid: proc.pid, uid: 1001, gid: 1001, groups: [1001] }));
+    expect(value(await kernel(page, 'getcreds_proc', { pid: proc.pid })).uid).toBe(1001);
+
+    // Non-root process cannot re-escalate to uid 0 via set_proc_cred.
+    expect((await kernel(page, 'set_proc_cred', { pid: proc.pid, uid: 0, gid: 0, groups: [0] })).err?.errno).toBe('EPERM');
+
+    // F3-01: Non-root local process (uid 1001) cannot mint or bind a root (uid 0) remote cred
+    // from the browser's root cookie, and its local UID remains 1001.
+    expect((await kernel(page, 'mint_remote_cred', { pid: proc.pid, sudo: false })).err?.errno).toBe('EACCES');
+    expect(['EACCES', 'EPERM']).toContain((await kernel(page, 'mint_remote_cred', { pid: proc.pid, sudo: true })).err?.errno);
+    expect(value(await kernel(page, 'getcreds_proc', { pid: proc.pid })).uid).toBe(1001);
+
+    // Cloud-denied process cannot re-enable cloud_access via set_proc_cred or mint_remote_cred.
+    expect((await kernel(page, 'set_proc_cred', {
+      pid: noCloud.pid,
+      uid: 0,
+      gid: 0,
+      groups: [0],
+      remote: {
+        token: '0'.repeat(64),
+        uid: 0,
+        gid: 0,
+        groups: [0],
+        instance_id: 'inst-forged',
+        lineage: 'lin-forged',
+        cloud_access: true,
+        scope: { cloud_fs: true, devices: [], containers: false, relay: false },
+      },
+    })).err?.errno).toBe('EPERM');
+    expect((await kernel(page, 'mint_remote_cred', { pid: noCloud.pid, sudo: false })).err?.errno).toBe('EACCES');
+  } finally {
+    for (const p of [preLoginGuest, proc, noCloud]) {
+      await kernel(page, 'exit', { pid: p.pid, status: 0 });
+      await kernel(page, 'wait', { pid: p.pid });
+    }
+  }
+});
+
+test('F3-08/F3-10: immediate /api/file revocation bypasses TOKEN_FRESH cache, /dev/present/../../proc is denied, and DevTmpFs gates remote opens per caller', async ({ page, context }) => {
+  await page.goto('/login');
+  await connect(page);
+  await login(context.request);
+  value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+  const instanceId = value(await kernel(page, 'instance_id'));
+  const filePath = `/guest/revoke-immediate-${crypto.randomUUID()}.txt`;
+  expect((await put(context.request, '/api/file?path=' + encodeURIComponent(filePath), { data: 'SECRET_TOKEN_DATA' })).ok()).toBe(true);
+
+  const remoteProc = value(await kernel(page, 'exec', { ...sleep, remote: true }));
+  const presentOnly = value(await kernel(page, 'exec', {
+    ...sleep,
+    remote: { cloud_fs: false, devices: ['present'], containers: false, relay: false },
+  }));
+  const noCloud = value(await kernel(page, 'exec', { ...sleep, remote: false }));
+  const OS_FD_ROOT = 0x7ffffffd;
+  try {
+    // 1. /api/file?path=... with X-Process-Token succeeds while live, then fails IMMEDIATELY after SIGKILL (no TOKEN_FRESH lag).
+    const liveRes = await context.request.get(origin + '/api/file?path=' + encodeURIComponent(filePath), {
+      headers: {
+        Origin: origin,
+        'X-Process-Token': remoteProc.token,
+        'X-Process-Pid': String(remoteProc.pid),
+        'X-OS-Instance': instanceId,
+      },
+    });
+    expect(liveRes.status()).toBe(200);
+    expect(await liveRes.text()).toBe('SECRET_TOKEN_DATA');
+
+    value(await kernel(page, 'kill', { pid: remoteProc.pid, signal: 9 }));
+    const revokedRes = await context.request.get(origin + '/api/file?path=' + encodeURIComponent(filePath), {
+      headers: {
+        Origin: origin,
+        'X-Process-Token': remoteProc.token,
+        'X-Process-Pid': String(remoteProc.pid),
+        'X-OS-Instance': instanceId,
+      },
+    });
+    expect(revokedRes.status()).not.toBe(200);
+    expect([401, 403]).toContain(revokedRes.status());
+
+    // 2. Cloud-denied token with present device scope cannot escape into /proc via /dev/present/../../proc.
+    const traversalRes = await context.request.get(origin + '/api/file?path=' + encodeURIComponent('/dev/present/../../proc/uptime'), {
+      headers: {
+        Origin: origin,
+        'X-Process-Token': presentOnly.token,
+        'X-Process-Pid': String(presentOnly.pid),
+        'X-OS-Instance': instanceId,
+      },
+    });
+    expect(traversalRes.ok()).toBe(false);
+    expect([403, 404]).toContain(traversalRes.status());
+
+    // 3. DevTmpFs remote device open hook: after attaching /dev/archive, stat succeeds for all,
+    //    but open is denied (EACCES) for cloud_access=false or device-scope-denied callers.
+    value(await kernel(page, 'attach_remote_device', { driver: 'archive' }));
+    expect((await kernel(page, 'proc_statat', { pid: noCloud.pid, dirfd: OS_FD_ROOT, path: '/dev/archive', follow: true })).ok).toBeTruthy();
+    expect((await kernel(page, 'proc_openat', { pid: noCloud.pid, dirfd: OS_FD_ROOT, path: '/dev/archive', oflags: 0, mode: 0, cloexec: false })).err?.errno).toBe('EACCES');
+    expect((await kernel(page, 'proc_openat', { pid: presentOnly.pid, dirfd: OS_FD_ROOT, path: '/dev/archive', oflags: 0, mode: 0, cloexec: false })).err?.errno).toBe('EACCES');
+  } finally {
+    await kernel(page, 'detach_remote_device', { driver: 'archive' }).catch(() => {});
+    for (const p of [remoteProc, presentOnly, noCloud]) {
+      await kernel(page, 'exit', { pid: p.pid, status: 0 }).catch(() => {});
+      await kernel(page, 'wait', { pid: p.pid }).catch(() => {});
+    }
+    await rmrf(context.request, filePath);
   }
 });

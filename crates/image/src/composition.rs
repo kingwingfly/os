@@ -1,4 +1,6 @@
-use crate::{Entry, Error, Image, Kind, Node, Result, parent, protected, require, valid_path};
+use crate::{
+    Entry, Error, Image, Kind, Node, ReleaseV2, Result, parent, protected, require, valid_path,
+};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
@@ -6,6 +8,98 @@ pub struct Composition {
     pub entries: BTreeMap<String, Entry>,
 }
 impl Composition {
+    /// Validate a standalone self-contained Stage 1 `Initramfs` or `RootTemplate` image tree.
+    pub fn standalone(image: &Image) -> Result<Self> {
+        image.validate_shallow()?;
+        require(
+            matches!(image.kind, Kind::Initramfs | Kind::RootTemplate),
+            "standalone validation requires initramfs or root-template image",
+        )?;
+        let mut entries: BTreeMap<String, Entry> = BTreeMap::new();
+        for entry in &image.entries {
+            require(
+                entries.insert(entry.path.clone(), entry.clone()).is_none(),
+                "duplicate image entry",
+            )?;
+        }
+        require(
+            entries
+                .get("/")
+                .is_some_and(|root| matches!(root.node, Node::Directory)),
+            "standalone image requires root directory",
+        )?;
+        for entry in entries.values() {
+            if entry.path != "/" {
+                require(
+                    entries
+                        .get(parent(&entry.path))
+                        .is_some_and(|p| matches!(p.node, Node::Directory)),
+                    "missing/non-directory image parent",
+                )?;
+            }
+        }
+        let composition = Self { entries };
+        for entry in &image.entries {
+            if matches!(entry.node, Node::Symlink { .. }) {
+                let physical = composition.resolve(&entry.path)?;
+                let target_is_dir = composition
+                    .entries
+                    .get(&physical)
+                    .is_some_and(|e| matches!(e.node, Node::Directory));
+                require(
+                    image.allows(&physical, target_is_dir),
+                    "image symlink escapes its roots",
+                )?;
+                if image.kind == Kind::Initramfs {
+                    require(
+                        !protected(&physical),
+                        "initramfs symlink targets protected path",
+                    )?;
+                }
+            }
+        }
+        match image.kind {
+            Kind::Initramfs => {
+                for required in ReleaseV2::REQUIRED_INITRAMFS_BINS {
+                    let resolved = composition.resolve(required).map_err(|_| {
+                        Error(format!("required initramfs binary missing: {required}"))
+                    })?;
+                    let ok = composition.entries.get(&resolved).is_some_and(|e| {
+                        e.mode & 0o111 != 0 && matches!(e.node, Node::File { .. })
+                    });
+                    require(
+                        ok,
+                        &format!(
+                            "required initramfs executable missing or non-executable: {required}"
+                        ),
+                    )?;
+                }
+            }
+            Kind::RootTemplate => {
+                for dir in ["/etc", "/var", "/root"] {
+                    require(
+                        composition
+                            .entries
+                            .get(dir)
+                            .is_some_and(|e| matches!(e.node, Node::Directory)),
+                        &format!("root template missing required directory: {dir}"),
+                    )?;
+                }
+                for file in ["/etc/passwd", "/etc/group"] {
+                    require(
+                        composition
+                            .entries
+                            .get(file)
+                            .is_some_and(|e| matches!(e.node, Node::File { .. })),
+                        &format!("root template missing required file: {file}"),
+                    )?;
+                }
+            }
+            _ => unreachable!(),
+        }
+        Ok(composition)
+    }
+
     /// An unsigned development view has the same validation and collision rules as
     /// system composition, but no system base and no publisher/activation authority.
     pub fn private(extensions: &[Image]) -> Result<Self> {
