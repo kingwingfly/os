@@ -1045,6 +1045,7 @@ fn b03_switch_root_preserves_pid1_reclaims_stage1_tmpfs_and_detaches_stage1_usr(
         .unwrap()
         .unwrap();
     let parsed_root: MountedRootInfo = serde_json::from_slice(&moved_root).unwrap();
+    assert_eq!(parsed_root.fstype, "cowfs");
     assert_eq!(parsed_root.volume_uuid, "vol-b03");
 
     // 4. `/proc/self/mountinfo` has no leftover Stage 1 `initramfs-usr` mount!

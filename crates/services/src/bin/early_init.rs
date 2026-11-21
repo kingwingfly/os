@@ -78,6 +78,8 @@ pub struct MountedRootInfo {
     pub ephemeral_if_unmodified: bool,
     pub writer_mode: String,
     pub first_boot_seeded: bool,
+    #[serde(default)]
+    pub mounted_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -315,7 +317,7 @@ pub fn run_early_init(backend: &mut impl EarlyInitBackend) -> io::Result<EarlyBo
             {
                 if let (Some(fork_uuid), Some(_parent)) = (&parsed.volume_uuid, &parsed.forked_from)
                 {
-                    let short = &fork_uuid[..fork_uuid.len().min(12)];
+                    let short: String = fork_uuid.chars().take(12).collect();
                     backend.log(&format!(
                         "os: root volume busy; booted O(1) fork {short} (pruned on clean shutdown if unmodified)"
                     ));
@@ -333,6 +335,7 @@ pub fn run_early_init(backend: &mut impl EarlyInitBackend) -> io::Result<EarlyBo
                         BootWriterMode::Exclusive => "exclusive".into(),
                     },
                     first_boot_seeded: volume_uuid.is_none(),
+                    mounted_at: 0,
                 }
             }
         }
@@ -353,6 +356,7 @@ pub fn run_early_init(backend: &mut impl EarlyInitBackend) -> io::Result<EarlyBo
                 ephemeral_if_unmodified: false,
                 writer_mode: "multi-writer".into(),
                 first_boot_seeded: false,
+                mounted_at: 0,
             }
         }
     };
@@ -575,5 +579,62 @@ mod tests {
             }
         ));
         assert!(m3.recovered.unwrap().contains("EBUSY"));
+    }
+
+    #[test]
+    fn early_init_round_trips_boot_stage_mounted_root_json_and_emits_fork_banner() {
+        let profile = BootProfile {
+            root: RootSpec::CowFs {
+                volume_uuid: Some("vol-parent-primary".into()),
+                writer_mode: BootWriterMode::ForkOnBusy,
+            },
+            ..BootProfile::default()
+        };
+        let mut mock = MockEarlyInit::new(&profile);
+        // Exact wire format emitted by `os_client_kernel::boot_stage::MountedRootInfo` (includes
+        // `fstype: "cowfs"`, `mounted_at`, and non-ASCII UTF-8 safety test in `volume_uuid`).
+        let boot_stage_json = r#"{
+  "fstype": "cowfs",
+  "volume_uuid": "vol-førk-9876543210",
+  "forked_from": "vol-parent-primary",
+  "base_epoch": 7,
+  "ephemeral_if_unmodified": true,
+  "first_boot_seeded": false,
+  "writer_mode": "fork_on_busy",
+  "mounted_at": 1735001234
+}"#;
+        mock.files
+            .insert(MOUNTED_ROOT_PATH.into(), boot_stage_json.into());
+
+        let outcome = run_early_init(&mut mock).unwrap();
+        assert_eq!(
+            outcome,
+            EarlyBootOutcome::SwitchedToStage2 {
+                init: STAGE2_INIT_PATH.into()
+            }
+        );
+
+        let persisted: MountedRootInfo =
+            serde_json::from_str(mock.files.get(MOUNTED_ROOT_PATH).unwrap()).unwrap();
+        assert_eq!(persisted.fstype, "cowfs");
+        assert_eq!(
+            persisted.volume_uuid.as_deref(),
+            Some("vol-førk-9876543210")
+        );
+        assert_eq!(persisted.forked_from.as_deref(), Some("vol-parent-primary"));
+        assert_eq!(persisted.base_epoch, 7);
+        assert!(persisted.ephemeral_if_unmodified);
+        assert!(!persisted.first_boot_seeded);
+        assert_eq!(persisted.writer_mode, "fork_on_busy");
+        assert_eq!(persisted.mounted_at, 1_735_001_234);
+
+        assert!(
+            mock.logs
+                .iter()
+                .any(|l| l.contains("booted O(1) fork vol-førk-987")
+                    && l.contains("pruned on clean shutdown if unmodified")),
+            "expected O(1) fork banner in logs: {:?}",
+            mock.logs
+        );
     }
 }

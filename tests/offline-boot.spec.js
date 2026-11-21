@@ -326,6 +326,7 @@ test('B-01..03 & B-08: installed Release v2 boots /console.html offline (0 reque
   }
   expect(inspect1.devEntries).toContain('vd0');
   expect(inspect1.devEntries).toContain('null');
+  expect(inspect1.runRoot.fstype).toBe('cowfs');
   expect(inspect1.runRoot.volume_uuid).toBe(boot1.status.mounted_root.volume_uuid);
   expect(inspect1.runProfile.root.cow_fs.volume_uuid).toBe(boot1.status.mounted_root.volume_uuid);
   expect(inspect1.syncedEpoch).toBeGreaterThan(1);

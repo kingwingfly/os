@@ -164,6 +164,7 @@ impl BootProfile {
 /// Metadata written atomically to `/run/os/root` (`0444`) before `switch_root`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountedRootInfo {
+    pub fstype: String,
     pub volume_uuid: String,
     pub forked_from: Option<String>,
     pub base_epoch: u64,
@@ -1213,6 +1214,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
         }
 
         let info = MountedRootInfo {
+            fstype: "cowfs".to_string(),
             volume_uuid: opened.volume_uuid.clone(),
             forked_from: opened.forked_from.clone(),
             base_epoch: opened.base_epoch,
@@ -1462,12 +1464,30 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
             moved.push((sub, dst));
         }
 
-        // Step 7 & 8: `chdir(newroot)`, `mount(".", "/", MS_MOVE)`, `chroot(".")`, `chdir("/")`.
+        // Step 7: `chdir(newroot)` and `mount(".", "/", MS_MOVE)` — if either fails before the
+        // root pivot succeeds, restore cwd to `/` and roll back moved `/proc`, `/dev`, `/run`.
         if let Err(e) = async {
             self.vfs.chdir(1, clean_newroot).await?;
             self.vfs
                 .mount(1, ".", "/", None, mount_flags::MS_MOVE, None)
                 .await?;
+            Ok::<(), Errno>(())
+        }
+        .await
+        {
+            let _ = self.vfs.chdir(1, "/").await;
+            for (orig, target) in moved.into_iter().rev() {
+                let _ = self
+                    .vfs
+                    .mount(1, &target, orig, None, mount_flags::MS_MOVE, None)
+                    .await;
+            }
+            let _ = self.vfs.close(1, oldroot_fd).await;
+            return Err(e);
+        }
+
+        // Step 8: `chroot(".")`, `chdir("/")`.
+        if let Err(e) = async {
             self.vfs.chroot(1, ".").await?;
             self.vfs.chdir(1, "/").await?;
             Ok::<(), Errno>(())
