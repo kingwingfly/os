@@ -14,6 +14,7 @@ use os_core::permissions::{EXEC, Node, READ};
 use os_core::xattr;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 /// Host backend for character devices beyond the built-in byte devices (`null`, `zero`, `full`).
 pub trait DeviceBackend {
@@ -80,11 +81,15 @@ impl DeviceBackend for DefaultDeviceBackend {
 /// (`docs/architecture/contract.md` §2.7). None of these are seeded at standalone boot.
 pub const REMOTE_DEVICE_DRIVERS: [&str; 4] = ["archive", "media", "present", "snd"];
 
+/// Optional per-caller authorization hook invoked when opening an attached remote device node.
+pub type RemoteDeviceOpenHook = Rc<dyn Fn(&Cred, &str) -> Result<()>>;
+
 /// `/dev` filesystem (`devtmpfs` fstype).
 pub struct DevTmpFs<D = DefaultDeviceBackend> {
     inner: MemFs,
     backend: D,
     attached_remotes: RefCell<HashMap<String, String>>,
+    remote_open_hook: RefCell<Option<RemoteDeviceOpenHook>>,
 }
 
 impl<D: DeviceBackend> DevTmpFs<D> {
@@ -146,7 +151,14 @@ impl<D: DeviceBackend> DevTmpFs<D> {
             inner,
             backend,
             attached_remotes: RefCell::new(HashMap::new()),
+            remote_open_hook: RefCell::new(None),
         }
+    }
+
+    /// Install a per-caller authorization check for opening attached remote device nodes
+    /// (`archive`, `media`, `present`, `snd`). `stat`/`lookup` remain permitted on attached nodes.
+    pub fn set_remote_open_hook(&self, hook: RemoteDeviceOpenHook) {
+        *self.remote_open_hook.borrow_mut() = Some(hook);
     }
 
     pub fn backend(&self) -> &D {
@@ -458,7 +470,20 @@ impl<D: DeviceBackend> Filesystem for DevTmpFs<D> {
         handle: &'a Handle,
         options: &'a OpenOptions,
     ) -> BoxFuture<'a, OpenRef> {
-        self.inner.open(cred, handle, options)
+        Box::pin(async move {
+            let meta = self.inner.metadata(cred, handle).await?;
+            if let Some(driver) = meta.rdev.as_deref()
+                && REMOTE_DEVICE_DRIVERS.contains(&driver)
+            {
+                if !self.is_remote_attached(driver) {
+                    return Err(Errno::ENOTCONN);
+                }
+                if let Some(hook) = self.remote_open_hook.borrow().clone() {
+                    hook(cred, driver)?;
+                }
+            }
+            self.inner.open(cred, handle, options).await
+        })
     }
     fn open_metadata<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, Metadata> {
         self.inner.open_metadata(open)
@@ -1480,6 +1505,70 @@ mod tests {
                 .unwrap()
                 .unwrap_err(),
             Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn remote_device_open_hook_enforces_per_caller_scope_while_allowing_stat() {
+        let dev = DevTmpFs::new(
+            FsId("devtmpfs:scope".into()),
+            1,
+            Box::new(|| (1_700_000_000, 0)),
+            DefaultDeviceBackend,
+        );
+        dev.set_remote_open_hook(Rc::new(|cred, driver| {
+            if cred.token.as_deref() == Some("tok-archive") && driver == "archive" {
+                Ok(())
+            } else {
+                Err(Errno::EACCES)
+            }
+        }));
+        dev.attach_remote("archive", 0o666, "scope:archive")
+            .unwrap();
+        dev.attach_remote("media", 0o666, "scope:media").unwrap();
+
+        let root = dev.root();
+        let denied = Cred {
+            identity: os_core::permissions::Identity {
+                id: 1000,
+                group: 1000,
+                groups: std::collections::BTreeSet::from([1000]),
+            },
+            umask: 0o022,
+            token: None,
+        };
+        let allowed = Cred {
+            token: Some("tok-archive".into()),
+            ..denied.clone()
+        };
+
+        // Lookup/stat succeeds for both callers on attached devices.
+        let arch = now_or_never(dev.lookup(&denied, &root, "archive"))
+            .unwrap()
+            .unwrap();
+        let media = now_or_never(dev.lookup(&allowed, &root, "media"))
+            .unwrap()
+            .unwrap();
+
+        let opts = OpenOptions::from_flags(0).unwrap();
+        // Caller without remote token/scope is denied EACCES on open.
+        assert_eq!(
+            now_or_never(dev.open(&denied, &arch.handle, &opts))
+                .unwrap()
+                .unwrap_err(),
+            Errno::EACCES
+        );
+        // Caller with archive scope can open /dev/archive but NOT /dev/media.
+        assert!(
+            now_or_never(dev.open(&allowed, &arch.handle, &opts))
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(
+            now_or_never(dev.open(&allowed, &media.handle, &opts))
+                .unwrap()
+                .unwrap_err(),
+            Errno::EACCES
         );
     }
 }

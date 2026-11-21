@@ -129,19 +129,39 @@ pub async fn handle(
             results.push(Return::Err(error));
             continue;
         }
-        // Service credentials carry explicit cloud / remote-device scopes. Keep this gate
-        // before byte transfers and asynchronous device routes as well as ordinary calls.
+        // Service credentials carry explicit cloud / remote-device / container scopes. Keep this
+        // gate before byte transfers and asynchronous device routes as well as ordinary calls.
         if session.token.is_some() && !matches!(call, Call::Getcreds | Call::Close { .. }) {
             let checking = session.clone();
             let probe = device_probe(&call);
+            let is_container_call = matches!(call, Call::Kill { .. } | Call::Wait { .. });
+            let is_container_ioctl = matches!(
+                call,
+                Call::Ioctl { request, .. }
+                    if matches!(
+                        request,
+                        abi::accelerator::SUBMIT
+                            | abi::accelerator::ATTACH
+                            | abi::accelerator::POLL
+                            | abi::accelerator::ANSWER
+                            | abi::accelerator::CANCEL
+                            | abi::accelerator::DETACH
+                    )
+            );
             let allowed = transact(state, move |db| {
                 (
                     checking.of(db).and_then(|acting| {
                         let Some(cred) = acting.credential.as_ref() else {
                             return Ok(());
                         };
-                        if let Some(driver) = probe.driver(db, acting.sid.as_deref()) {
-                            cred.check_device(driver)
+                        if is_container_call {
+                            cred.check_containers()
+                        } else if let Some(driver) = probe.driver(db, acting.sid.as_deref()) {
+                            cred.check_device(driver)?;
+                            if is_container_ioctl && matches!(driver, "archive" | "media") {
+                                cred.check_containers()?;
+                            }
+                            Ok(())
                         } else {
                             cred.cloud()
                         }

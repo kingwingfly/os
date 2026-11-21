@@ -129,7 +129,12 @@ pub struct LocalProc {
     pub wait_event: Option<WaitEvent>,
     pub pending_signals: Vec<PendingSignal>,
     pub started: u64,
+    pub started_ticks: u64,
     pub ended: u64,
+    pub bootstrap_eligible: bool,
+    last_stop_seq: u64,
+    reported_stop_seq: u64,
+    last_cont_seq: u64,
 }
 
 impl LocalProc {
@@ -190,6 +195,7 @@ impl LocalProc {
             path: self.path.clone(),
             argv: self.argv.clone(),
             started: self.started,
+            started_ticks: self.started_ticks,
             tty: self.ctty,
             tty_fds: self.tty_fds.clone(),
             login_scope: self.login_scope.clone(),
@@ -294,6 +300,7 @@ pub struct ProcSnapshot {
     pub path: String,
     pub argv: Vec<String>,
     pub started: u64,
+    pub started_ticks: u64,
     pub tty: Option<u32>,
     pub tty_fds: Vec<u32>,
     pub login_scope: Option<String>,
@@ -304,6 +311,7 @@ pub struct ProcSnapshot {
 pub struct LocalProcessTable {
     identity: InstanceIdentity,
     booted_at: u64,
+    max_seen_now: u64,
     next_pid: u32,
     next_signal_seq: u64,
     procs: BTreeMap<u32, LocalProc>,
@@ -347,6 +355,7 @@ impl LocalProcessTable {
         Self {
             identity,
             booted_at: now,
+            max_seen_now: now,
             next_pid: 2,
             next_signal_seq: 0,
             procs: BTreeMap::new(),
@@ -361,6 +370,19 @@ impl LocalProcessTable {
 
     pub fn booted_at(&self) -> u64 {
         self.booted_at
+    }
+
+    pub fn uptime_secs(&self, now: u64) -> u64 {
+        now.max(self.max_seen_now).saturating_sub(self.booted_at)
+    }
+
+    fn monotonic_start_ticks(&mut self, now: u64) -> u64 {
+        if now > self.max_seen_now {
+            self.max_seen_now = now;
+        }
+        self.max_seen_now
+            .saturating_sub(self.booted_at)
+            .saturating_mul(100)
     }
 
     pub fn cgroups(&self) -> &CgroupTable {
@@ -431,6 +453,14 @@ impl LocalProcessTable {
         }
     }
 
+    fn pid_in_use(&self, candidate: u32) -> bool {
+        self.procs.contains_key(&candidate)
+            || self
+                .procs
+                .values()
+                .any(|p| p.pgid == candidate || p.sid == candidate)
+    }
+
     fn alloc_pid(&mut self) -> Result<u32, Error> {
         if self.procs.len() >= PROC_MAX {
             return Err(Errno::EAGAIN.into());
@@ -438,7 +468,7 @@ impl LocalProcessTable {
         let start = self.next_pid.clamp(2, PID_MAX);
         let mut candidate = start;
         loop {
-            if !self.procs.contains_key(&candidate) {
+            if !self.pid_in_use(candidate) {
                 self.next_pid = if candidate >= PID_MAX {
                     2
                 } else {
@@ -525,6 +555,7 @@ impl LocalProcessTable {
             existing.state = ProcState::Running;
             return Ok(self.procs.get(&1).unwrap());
         }
+        let started_ticks = self.monotonic_start_ticks(now);
         let init = LocalProc {
             pid: 1,
             ppid: 0,
@@ -551,7 +582,12 @@ impl LocalProcessTable {
             wait_event: None,
             pending_signals: Vec::new(),
             started: now,
+            started_ticks,
             ended: 0,
+            bootstrap_eligible: false,
+            last_stop_seq: 0,
+            reported_stop_seq: 0,
+            last_cont_seq: 0,
         };
         self.procs.insert(1, init);
         Ok(self.procs.get(&1).unwrap())
@@ -587,6 +623,7 @@ impl LocalProcessTable {
                 self.subtree_memory_bytes(root)
             })?;
         let pid = self.alloc_pid()?;
+        let started_ticks = self.monotonic_start_ticks(now);
         let ppid = spec.ppid.unwrap_or(1);
         let pgid = spec.pgid.unwrap_or(pid);
         let sid = spec.sid.unwrap_or(pid);
@@ -620,7 +657,12 @@ impl LocalProcessTable {
             wait_event: None,
             pending_signals: Vec::new(),
             started: now,
+            started_ticks,
             ended: 0,
+            bootstrap_eligible: ppid == 1 && spec.pgid.is_none() && spec.sid.is_none(),
+            last_stop_seq: 0,
+            reported_stop_seq: 0,
+            last_cont_seq: 0,
         };
         self.procs.insert(pid, proc.clone());
         Ok(proc)
@@ -641,13 +683,15 @@ impl LocalProcessTable {
 
     /// Replace image of `pid` (must be owned by `caller_host`; preserves `pid`/`ppid`/`pgid`/`sid`/
     /// `cgroup`/`login_scope`, sets `execed = true`, attenuates `cloud_access` monotonically).
+    /// Returns the updated `LocalProc` plus any replaced/dropped remote tokens that now have zero
+    /// live local holders so the host can revoke them immediately via `ServiceAuth v2`.
     pub fn reexec(
         &mut self,
         caller_host: &str,
         pid: u32,
         spec: ReexecSpec,
         _now: u64,
-    ) -> Result<LocalProc, Error> {
+    ) -> Result<(LocalProc, Vec<String>), Error> {
         validate_exec_vectors(&spec.path, &spec.argv, &spec.env)?;
         let (cg, prev_mem, runtime_tracked) = {
             let proc = self.verify_owner(caller_host, pid)?;
@@ -667,35 +711,48 @@ impl LocalProcessTable {
             ));
         }
         let _ = prev_mem;
-        let proc = self.procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
-        proc.path = spec.path;
-        proc.argv = spec.argv;
-        proc.env = spec.env;
-        if let Some(cwd) = spec.cwd
-            && !cwd.is_empty()
+        let (updated, dropped_token) = {
+            let proc = self.procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
+            let old_token = proc.cred.remote.as_ref().map(|r| r.token.clone());
+            proc.path = spec.path;
+            proc.argv = spec.argv;
+            proc.env = spec.env;
+            if let Some(cwd) = spec.cwd
+                && !cwd.is_empty()
+            {
+                proc.cwd = cwd;
+            }
+            // Monotonic cloud_access attenuation: reexec can NEVER escalate `false -> true`, and
+            // attenuating to `false` without an explicit replacement clears any ambient remote cred.
+            let next_cloud = proc.cred.cloud_access && spec.cloud_access;
+            proc.cred.cloud_access = next_cloud;
+            if let Some(mut new_remote) = spec.new_remote {
+                new_remote.cloud_access &= next_cloud;
+                proc.cred.remote = Some(new_remote);
+            } else if !next_cloud {
+                proc.cred.remote = None;
+            } else if let Some(rem) = &mut proc.cred.remote {
+                rem.cloud_access &= next_cloud;
+            }
+            proc.execed = true;
+            proc.loading = false;
+            proc.runtime_tracked = runtime_tracked;
+            proc.memory_bytes = 0;
+            if proc.state == ProcState::Sleeping {
+                proc.state = ProcState::Running;
+            }
+            let dropped = old_token.filter(|old| {
+                proc.cred.remote.as_ref().map(|r| r.token.as_str()) != Some(old.as_str())
+            });
+            (proc.clone(), dropped)
+        };
+        let mut revoked = Vec::new();
+        if let Some(tok) = dropped_token
+            && !self.token_has_live_holder(&tok)
         {
-            proc.cwd = cwd;
+            revoked.push(tok);
         }
-        // Monotonic cloud_access attenuation: reexec can NEVER escalate `false -> true`, and
-        // attenuating to `false` without an explicit replacement clears any ambient remote cred.
-        let next_cloud = proc.cred.cloud_access && spec.cloud_access;
-        proc.cred.cloud_access = next_cloud;
-        if let Some(mut new_remote) = spec.new_remote {
-            new_remote.cloud_access &= next_cloud;
-            proc.cred.remote = Some(new_remote);
-        } else if !next_cloud {
-            proc.cred.remote = None;
-        } else if let Some(rem) = &mut proc.cred.remote {
-            rem.cloud_access &= next_cloud;
-        }
-        proc.execed = true;
-        proc.loading = false;
-        proc.runtime_tracked = runtime_tracked;
-        proc.memory_bytes = 0;
-        if proc.state == ProcState::Sleeping {
-            proc.state = ProcState::Running;
-        }
-        Ok(proc.clone())
+        Ok((updated, revoked))
     }
 
     /// Local fork (ZERO network calls): checks `PROC_MAX`, hierarchical `pids.max`, `memory.max`;
@@ -725,6 +782,7 @@ impl LocalProcessTable {
             |root| self.subtree_memory_bytes(root),
         )?;
         let child_pid = self.alloc_pid()?;
+        let started_ticks = self.monotonic_start_ticks(now);
         let child = LocalProc {
             pid: child_pid,
             ppid: parent.pid,
@@ -752,7 +810,12 @@ impl LocalProcessTable {
             wait_event: None,
             pending_signals: Vec::new(),
             started: now,
+            started_ticks,
             ended: 0,
+            bootstrap_eligible: false,
+            last_stop_seq: 0,
+            reported_stop_seq: 0,
+            last_cont_seq: 0,
         };
         self.procs.insert(child_pid, child.clone());
         Ok(child)
@@ -802,6 +865,7 @@ impl LocalProcessTable {
                 continue;
             }
             let cur_ppid = cur.ppid;
+            let cur_pgid = cur.pgid;
             let cur_sid = cur.sid;
             if cur_pid == pid {
                 outcome.ppid = cur_ppid;
@@ -811,34 +875,44 @@ impl LocalProcessTable {
             if let Some(rem) = &cur.cred.remote {
                 dropped_tokens.insert(rem.token.clone());
             }
-            cur.state = ProcState::Zombie;
-            cur.loading = false;
-            cur.memory_bytes = 0;
-            cur.pending_signals.clear();
-            cur.exit_status = Some(cur_status);
-            cur.exit_signal = cur_sig;
-            cur.ended = now;
-            cur.wait_event = Some(WaitEvent::Exited {
-                status: cur_status,
-                signal: cur_sig,
-            });
 
-            // 1. Reparent any children of `cur_pid` to the nearest living subreaper ancestor, else PID 1.
-            let new_parent = self.nearest_reaper(cur_ppid);
+            // Collect candidate process groups and snapshot orphan status BEFORE mutating
+            // state or reparenting children (POSIX §2.2.2.52).
+            let mut candidate_pgroups = BTreeSet::new();
+            candidate_pgroups.insert((cur_sid, cur_pgid));
             let child_pids: Vec<u32> = self
                 .procs
                 .values()
                 .filter(|p| p.ppid == cur_pid)
-                .map(|p| p.pid)
+                .map(|p| {
+                    if p.state != ProcState::Zombie {
+                        candidate_pgroups.insert((p.sid, p.pgid));
+                    }
+                    p.pid
+                })
                 .collect();
-            let mut affected_pgroups = BTreeSet::new();
+            let was_orphaned = self.snapshot_pgroup_orphan_state(&candidate_pgroups);
+
+            if let Some(cur) = self.procs.get_mut(&cur_pid) {
+                cur.state = ProcState::Zombie;
+                cur.loading = false;
+                cur.memory_bytes = 0;
+                cur.pending_signals.clear();
+                cur.exit_status = Some(cur_status);
+                cur.exit_signal = cur_sig;
+                cur.ended = now;
+                cur.wait_event = Some(WaitEvent::Exited {
+                    status: cur_status,
+                    signal: cur_sig,
+                });
+            }
+
+            // 1. Reparent any children of `cur_pid` to the nearest living subreaper ancestor, else PID 1.
+            let new_parent = self.nearest_reaper(cur_ppid);
             let mut reparented_zombie = false;
             for cpid in child_pids {
                 if let Some(child) = self.procs.get_mut(&cpid) {
                     child.ppid = new_parent;
-                    if child.sid == cur_sid {
-                        affected_pgroups.insert((child.sid, child.pgid));
-                    }
                     if child.state == ProcState::Zombie {
                         reparented_zombie = true;
                     }
@@ -858,32 +932,10 @@ impl LocalProcessTable {
                 outcome.signals.push(sig);
             }
 
-            // 2. Check for orphaned stopped process groups (POSIX §2.2.2.52).
-            for (sid, pgid) in affected_pgroups {
-                if self.is_orphaned_stopped_pgroup(sid, pgid) {
-                    let members: Vec<u32> = self
-                        .procs
-                        .values()
-                        .filter(|p| p.sid == sid && p.pgid == pgid && p.state != ProcState::Zombie)
-                        .map(|p| p.pid)
-                        .collect();
-                    for mpid in members {
-                        if let Some(p) = self.procs.get_mut(&mpid) {
-                            if p.state == ProcState::Stopped {
-                                p.state = ProcState::Running;
-                                p.wait_event = Some(WaitEvent::Continued);
-                            }
-                            p.pending_signals.retain(|s| !is_stop_signal(s.signal));
-                        }
-                        if let Some(s) = self.queue_signal(mpid, SIGHUP) {
-                            outcome.signals.push(s);
-                        }
-                        if let Some(s) = self.queue_signal(mpid, SIGCONT) {
-                            outcome.signals.push(s);
-                        }
-                    }
-                }
-            }
+            // 2. Check for newly orphaned stopped process groups (POSIX §2.2.2.52).
+            outcome.signals.extend(
+                self.notify_newly_orphaned_stopped_groups(&candidate_pgroups, &was_orphaned),
+            );
 
             // 3. Retire any `CgroupLifetime::Process` cgroups owned by `cur_pid` & SIGKILL their subtrees.
             let retired_roots = self.cgroups.retire_owned_by(cur_pid);
@@ -944,16 +996,14 @@ impl LocalProcessTable {
         if self.procs.contains_key(&1) { 1 } else { 0 }
     }
 
-    fn is_orphaned_stopped_pgroup(&self, sid: u32, pgid: u32) -> bool {
-        let mut has_stopped = false;
+    fn is_pgroup_orphaned(&self, sid: u32, pgid: u32) -> bool {
+        let mut has_member = false;
         for p in self.procs.values() {
             if p.sid != sid || p.pgid != pgid || p.state == ProcState::Zombie {
                 continue;
             }
-            if p.state == ProcState::Stopped {
-                has_stopped = true;
-            }
-            // A process group is NOT orphaned if any member has a parent in a different
+            has_member = true;
+            // A process group is NOT orphaned if any live member has a live parent in a different
             // process group within the same session.
             if let Some(parent) = self.procs.get(&p.ppid)
                 && parent.state != ProcState::Zombie
@@ -963,7 +1013,64 @@ impl LocalProcessTable {
                 return false;
             }
         }
-        has_stopped
+        has_member
+    }
+
+    fn pgroup_has_stopped(&self, sid: u32, pgid: u32) -> bool {
+        self.procs
+            .values()
+            .any(|p| p.sid == sid && p.pgid == pgid && p.state == ProcState::Stopped)
+    }
+
+    fn snapshot_pgroup_orphan_state(
+        &self,
+        groups: &BTreeSet<(u32, u32)>,
+    ) -> BTreeMap<(u32, u32), bool> {
+        groups
+            .iter()
+            .map(|&(sid, pgid)| ((sid, pgid), self.is_pgroup_orphaned(sid, pgid)))
+            .collect()
+    }
+
+    fn notify_newly_orphaned_stopped_groups(
+        &mut self,
+        candidates: &BTreeSet<(u32, u32)>,
+        was_orphaned: &BTreeMap<(u32, u32), bool>,
+    ) -> Vec<SignalDelivery> {
+        let mut deliveries = Vec::new();
+        for &(sid, pgid) in candidates {
+            if was_orphaned.get(&(sid, pgid)).copied().unwrap_or(false) {
+                continue;
+            }
+            if !self.is_pgroup_orphaned(sid, pgid) || !self.pgroup_has_stopped(sid, pgid) {
+                continue;
+            }
+            let members: Vec<u32> = self
+                .procs
+                .values()
+                .filter(|p| p.sid == sid && p.pgid == pgid && p.state != ProcState::Zombie)
+                .map(|p| p.pid)
+                .collect();
+            for mpid in members {
+                if let Some(p) = self.procs.get_mut(&mpid) {
+                    if p.state == ProcState::Stopped {
+                        p.state = ProcState::Running;
+                        p.wait_event = Some(WaitEvent::Continued);
+                    }
+                    p.pending_signals.retain(|s| !is_stop_signal(s.signal));
+                }
+                if let Some(s) = self.queue_signal(mpid, SIGHUP) {
+                    deliveries.push(s);
+                }
+                if let Some(s) = self.queue_signal(mpid, SIGCONT) {
+                    if let Some(p) = self.procs.get_mut(&mpid) {
+                        p.last_cont_seq = s.sequence;
+                    }
+                    deliveries.push(s);
+                }
+            }
+        }
+        deliveries
     }
 
     /// POSIX `waitpid(selector, options)` (`WNOHANG=1`, `WUNTRACED=2`, `WCONTINUED=8`).
@@ -1045,7 +1152,7 @@ impl LocalProcessTable {
             return Err(Errno::ECHILD.into());
         }
         if target.owner_host != caller_host
-            && !may_manage_process(caller_cred, target.cred.identity.id)
+            || !may_manage_process(caller_cred, target.cred.identity.id)
         {
             return Err(Errno::EPERM.into());
         }
@@ -1186,17 +1293,23 @@ impl LocalProcessTable {
             }
             if signal == SIGSTOP {
                 let ppid = p.ppid;
+                let was_stopped = p.state == ProcState::Stopped;
                 if let Some(p_mut) = self.procs.get_mut(&pid) {
                     p_mut.pending_signals.retain(|s| s.signal != SIGCONT);
-                    if p_mut.state != ProcState::Stopped {
+                    if !was_stopped {
                         p_mut.state = ProcState::Stopped;
                         p_mut.wait_event = Some(WaitEvent::Stopped { signal: SIGSTOP });
                     }
                 }
                 if let Some(d) = self.queue_signal(pid, SIGSTOP) {
+                    if let Some(p_mut) = self.procs.get_mut(&pid) {
+                        p_mut.last_stop_seq = d.sequence;
+                        p_mut.reported_stop_seq = d.sequence;
+                    }
                     deliveries.push(d);
                 }
-                if ppid != 0
+                if !was_stopped
+                    && ppid != 0
                     && let Some(d) = self.queue_signal(ppid, SIGCHLD)
                 {
                     deliveries.push(d);
@@ -1214,6 +1327,9 @@ impl LocalProcessTable {
                     }
                 }
                 if let Some(d) = self.queue_signal(pid, SIGCONT) {
+                    if let Some(p_mut) = self.procs.get_mut(&pid) {
+                        p_mut.last_cont_seq = d.sequence;
+                    }
                     deliveries.push(d);
                 }
                 if was_stopped
@@ -1230,6 +1346,11 @@ impl LocalProcessTable {
                 p_mut.pending_signals.retain(|s| s.signal != SIGCONT);
             }
             if let Some(d) = self.queue_signal(pid, signal) {
+                if is_stop_signal(signal)
+                    && let Some(p_mut) = self.procs.get_mut(&pid)
+                {
+                    p_mut.last_stop_seq = d.sequence;
+                }
                 deliveries.push(d);
             }
         }
@@ -1259,13 +1380,30 @@ impl LocalProcessTable {
             return Err(Errno::EINVAL.into());
         }
         let ppid = {
-            let proc = self.procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
+            let proc = self.procs.get(&pid).ok_or(Errno::ESRCH)?;
             if proc.owner_host != caller_host {
                 return Err(Errno::ESRCH.into());
             }
             if proc.state == ProcState::Zombie {
                 return Err(Errno::ESRCH.into());
             }
+            // Ignore duplicate stop reports for an already-stopped process or already-reported
+            // signal, and never let a delayed stop report undo a newer `SIGCONT`.
+            if proc.state == ProcState::Stopped
+                || proc.last_cont_seq > proc.last_stop_seq
+                || (proc.last_stop_seq > 0 && proc.reported_stop_seq >= proc.last_stop_seq)
+            {
+                return Ok(());
+            }
+            let stop_seq = if proc.last_stop_seq > 0 {
+                proc.last_stop_seq
+            } else {
+                self.next_signal_seq = self.next_signal_seq.saturating_add(1);
+                self.next_signal_seq
+            };
+            let proc = self.procs.get_mut(&pid).unwrap();
+            proc.last_stop_seq = stop_seq;
+            proc.reported_stop_seq = stop_seq;
             proc.state = ProcState::Stopped;
             proc.wait_event = Some(WaitEvent::Stopped { signal });
             proc.ppid
@@ -1358,7 +1496,21 @@ impl LocalProcessTable {
                 return Err(Errno::EPERM.into());
             }
         }
-        self.procs.get_mut(&target_pid).unwrap().pgid = new_pgid;
+        let mut candidate_pgroups = BTreeSet::new();
+        candidate_pgroups.insert((target.sid, target.pgid));
+        candidate_pgroups.insert((target.sid, new_pgid));
+        for child in self.procs.values() {
+            if child.ppid == target_pid && child.state != ProcState::Zombie {
+                candidate_pgroups.insert((child.sid, child.pgid));
+            }
+        }
+        let was_orphaned = self.snapshot_pgroup_orphan_state(&candidate_pgroups);
+        {
+            let proc = self.procs.get_mut(&target_pid).unwrap();
+            proc.pgid = new_pgid;
+            proc.bootstrap_eligible = false;
+        }
+        let _ = self.notify_newly_orphaned_stopped_groups(&candidate_pgroups, &was_orphaned);
         Ok(())
     }
 
@@ -1375,10 +1527,22 @@ impl LocalProcessTable {
         if is_group_leader {
             return Err(Errno::EPERM.into());
         }
-        let proc = self.procs.get_mut(&caller_pid).unwrap();
-        proc.sid = caller_pid;
-        proc.pgid = caller_pid;
-        proc.ctty = None;
+        let mut candidate_pgroups = BTreeSet::new();
+        candidate_pgroups.insert((caller.sid, caller.pgid));
+        for child in self.procs.values() {
+            if child.ppid == caller_pid && child.state != ProcState::Zombie {
+                candidate_pgroups.insert((child.sid, child.pgid));
+            }
+        }
+        let was_orphaned = self.snapshot_pgroup_orphan_state(&candidate_pgroups);
+        {
+            let proc = self.procs.get_mut(&caller_pid).unwrap();
+            proc.sid = caller_pid;
+            proc.pgid = caller_pid;
+            proc.ctty = None;
+            proc.bootstrap_eligible = false;
+        }
+        let _ = self.notify_newly_orphaned_stopped_groups(&candidate_pgroups, &was_orphaned);
         Ok(caller_pid)
     }
 
@@ -1395,7 +1559,7 @@ impl LocalProcessTable {
                 return Err(Errno::EINVAL.into());
             }
             let p = self.verify_owner(caller_host, pid)?;
-            if p.ppid != 1 || p.state == ProcState::Zombie {
+            if !p.bootstrap_eligible || p.ppid != 1 || p.state == ProcState::Zombie {
                 return Err(Errno::EPERM.into());
             }
             match expected_uid {
@@ -1408,6 +1572,7 @@ impl LocalProcessTable {
             if let Some(p) = self.procs.get_mut(&pid) {
                 p.sid = leader;
                 p.pgid = leader;
+                p.bootstrap_eligible = false;
             }
         }
         Ok(leader)
@@ -1453,9 +1618,10 @@ impl LocalProcessTable {
         }
     }
 
-    /// Local credential update (Contract §2.4): privilege drop clears ambient `remote` unless
-    /// `explicit_remote` is passed. Returns any remote token whose last live local holder just
-    /// dropped it so the host revokes it immediately via `ServiceAuth v2`.
+    /// Local credential update (Contract §2.4): non-root callers cannot alter local UID/GID/groups;
+    /// privilege drop clears ambient `remote` unless `explicit_remote` is passed with
+    /// `rem.cloud_access <= prev_cloud_access`. Returns any remote token whose last live local
+    /// holder just dropped it so the host revokes it immediately via `ServiceAuth v2`.
     pub fn set_cred(
         &mut self,
         caller_host: &str,
@@ -1474,15 +1640,29 @@ impl LocalProcessTable {
             let prev_uid = proc.cred.identity.id;
             let prev_gid = proc.cred.identity.group;
             let prev_groups = proc.cred.identity.groups.clone();
+            let prev_cloud_access = proc.cred.cloud_access;
             let old_token = proc.cred.remote.as_ref().map(|r| r.token.clone());
             let identity_changed = identity.id != prev_uid
                 || identity.group != prev_gid
                 || identity.groups != prev_groups;
 
+            // Non-root processes can NEVER change local UID, GID, or supplementary groups.
+            if identity_changed && prev_uid != 0 {
+                return Err(Errno::EPERM.into());
+            }
+            // Monotonic cloud_access: explicit_remote can never re-enable cloud_access on a
+            // process that already has `cloud_access == false`.
+            if let Some(ref rem) = explicit_remote
+                && rem.cloud_access
+                && !prev_cloud_access
+            {
+                return Err(Errno::EPERM.into());
+            }
+
             proc.cred.identity = identity;
             match explicit_remote {
                 Some(rem) => {
-                    proc.cred.cloud_access = rem.cloud_access;
+                    proc.cred.cloud_access = prev_cloud_access && rem.cloud_access;
                     proc.cred.remote = Some(rem);
                 }
                 None if identity_changed => {
@@ -1504,6 +1684,76 @@ impl LocalProcessTable {
             revoked.push(tok);
         }
         Ok(revoked)
+    }
+
+    /// Hydrate an uninitialized local guest (`uid == GUEST`, 65534) to a server-assigned
+    /// per-session guest identity (`is_guest_id(identity.id)`) while binding its remote credential.
+    /// Rejects any non-guest source or target identity with `EPERM`.
+    pub fn hydrate_guest_identity(
+        &mut self,
+        caller_host: &str,
+        pid: u32,
+        identity: Identity,
+        explicit_remote: Option<RemoteCredRef>,
+    ) -> Result<Vec<String>, Error> {
+        let dropped_token = {
+            let proc = self.procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
+            if proc.owner_host != caller_host {
+                return Err(Errno::ESRCH.into());
+            }
+            if proc.state == ProcState::Zombie {
+                return Err(Errno::ESRCH.into());
+            }
+            let prev_uid = proc.cred.identity.id;
+            let prev_cloud_access = proc.cred.cloud_access;
+            if prev_uid != os_core::permissions::GUEST
+                || !os_core::permissions::is_guest_id(identity.id)
+            {
+                return Err(Errno::EPERM.into());
+            }
+            if let Some(ref rem) = explicit_remote
+                && rem.cloud_access
+                && !prev_cloud_access
+            {
+                return Err(Errno::EPERM.into());
+            }
+            let old_token = proc.cred.remote.as_ref().map(|r| r.token.clone());
+            proc.cred.identity = identity;
+            if let Some(rem) = explicit_remote {
+                proc.cred.cloud_access = prev_cloud_access && rem.cloud_access;
+                proc.cred.remote = Some(rem);
+            }
+            old_token.filter(|old| {
+                proc.cred.remote.as_ref().map(|r| r.token.as_str()) != Some(old.as_str())
+            })
+        };
+
+        let mut revoked = Vec::new();
+        if let Some(tok) = dropped_token
+            && !self.token_has_live_holder(&tok)
+        {
+            revoked.push(tok);
+        }
+        Ok(revoked)
+    }
+
+    /// Immediately clear `cloud_access` and any remote credential from a live process (e.g. when
+    /// ending a login scope), returning any token whose last live holder just dropped it.
+    pub fn clear_remote_access(&mut self, pid: u32) -> Vec<String> {
+        let old_token = {
+            let Some(proc) = self.procs.get_mut(&pid) else {
+                return Vec::new();
+            };
+            proc.cred.cloud_access = false;
+            proc.cred.remote.take().map(|r| r.token)
+        };
+        let mut revoked = Vec::new();
+        if let Some(tok) = old_token
+            && !self.token_has_live_holder(&tok)
+        {
+            revoked.push(tok);
+        }
+        revoked
     }
 
     /// Local `memory.max` linear-memory reservation (`resources-v1`, 64 KiB aligned).
@@ -1569,7 +1819,15 @@ impl LocalProcessTable {
         value: &str,
         now: u64,
     ) -> Result<(Vec<SignalDelivery>, Vec<String>), Error> {
-        let effect = self.cgroups.set(cred, path, key, value)?;
+        let untracked_cgroups: Vec<String> = self
+            .procs
+            .values()
+            .filter(|p| p.state != ProcState::Zombie && !p.runtime_tracked)
+            .map(|p| p.cgroup.clone())
+            .collect();
+        let effect = self.cgroups.set_checked(cred, path, key, value, |root| {
+            untracked_cgroups.iter().any(|cg| in_subtree(cg, root))
+        })?;
         let mut deliveries = Vec::new();
         let mut revoked = Vec::new();
         if let CgroupSetEffect::KillSubtree(root) = effect {
@@ -1865,7 +2123,7 @@ mod tests {
                 101,
             )
             .unwrap();
-        // Drop from uid 0 -> uid 1000 without explicit remote cred.
+        // Drop from uid 0 -> uid 1000 without explicit remote cred clears cloud_access & revokes.
         let revoked = t.set_cred("host-a", p.pid, id(1000), None).unwrap();
         assert_eq!(revoked, vec!["tok-root".to_string()]);
         let after = t.proc(p.pid).unwrap();
@@ -1873,18 +2131,55 @@ mod tests {
         assert!(after.cred.remote.is_none());
         assert!(!after.cred.cloud_access);
 
-        // Passing explicit lower-identity remote cred binds it cleanly.
-        let revoked2 = t
-            .set_cred(
+        // Once cloud_access is false, set_cred MUST refuse to re-enable cloud_access=true or
+        // escalate local UID back to 0 / another UID.
+        assert_eq!(
+            t.set_cred(
                 "host-a",
                 p.pid,
                 id(1000),
                 Some(remote("tok-ann", 1000, true)),
             )
-            .unwrap();
-        assert!(revoked2.is_empty());
+            .unwrap_err()
+            .errno,
+            Errno::EPERM
+        );
         assert_eq!(
-            t.proc(p.pid).unwrap().cred.remote.as_ref().unwrap().token,
+            t.set_cred("host-a", p.pid, Identity::root(), None)
+                .unwrap_err()
+                .errno,
+            Errno::EPERM
+        );
+        assert_eq!(
+            t.set_cred("host-a", p.pid, id(1001), None)
+                .unwrap_err()
+                .errno,
+            Errno::EPERM
+        );
+
+        // Dropping from uid 0 -> uid 1000 WITH an explicit lower-identity remote cred in one
+        // atomic transition revokes the old root token and binds the lower token cleanly.
+        let p2 = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/sh",
+                    LocalCred::with_remote(Identity::root(), 0o022, remote("tok-root-2", 0, true)),
+                    "host-a",
+                ),
+                102,
+            )
+            .unwrap();
+        let revoked2 = t
+            .set_cred(
+                "host-a",
+                p2.pid,
+                id(1000),
+                Some(remote("tok-ann", 1000, true)),
+            )
+            .unwrap();
+        assert_eq!(revoked2, vec!["tok-root-2".to_string()]);
+        assert_eq!(
+            t.proc(p2.pid).unwrap().cred.remote.as_ref().unwrap().token,
             "tok-ann"
         );
     }
@@ -1903,8 +2198,8 @@ mod tests {
             )
             .unwrap();
         assert!(!p.cred.cloud_access);
-        // Reexec requesting cloud_access = true MUST remain false!
-        let replaced = t
+        // Reexec requesting cloud_access = true MUST remain false and drop old token!
+        let (replaced, revoked) = t
             .reexec(
                 "host-a",
                 p.pid,
@@ -1921,6 +2216,7 @@ mod tests {
             )
             .unwrap();
         assert!(!replaced.cred.cloud_access);
+        assert_eq!(revoked, vec!["tok-no-cloud".to_string()]);
         let child = t.fork("host-a", p.pid, false, 103).unwrap();
         assert!(!child.cred.cloud_access);
     }
@@ -2089,7 +2385,7 @@ mod tests {
         // Fork a child so parent still holds `tok-parent`; then child reexecs with cloud_access=false.
         let child = t.fork("host-a", p.pid, false, 101).unwrap();
         assert!(child.cred.remote.is_some());
-        let attenuated = t
+        let (attenuated, rev_child) = t
             .reexec(
                 "host-a",
                 child.pid,
@@ -2110,8 +2406,10 @@ mod tests {
             attenuated.cred.remote.is_none(),
             "cloud_access=false reexec must clear inherited remote cred"
         );
+        // Parent still holds tok-parent, so child's reexec MUST NOT revoke it yet!
+        assert!(rev_child.is_empty());
         // Subsequent reexec requesting cloud_access=true cannot escalate back.
-        let again = t
+        let (again, _) = t
             .reexec(
                 "host-a",
                 child.pid,
@@ -2130,8 +2428,8 @@ mod tests {
         assert!(!again.cred.cloud_access);
         assert!(again.cred.remote.is_none());
 
-        // Now parent also reexecs with cloud_access=false -> no live holders remain.
-        let parent_att = t
+        // Now parent also reexecs with cloud_access=false -> no live holders remain, token revoked.
+        let (parent_att, rev_parent) = t
             .reexec(
                 "host-a",
                 p.pid,
@@ -2148,6 +2446,7 @@ mod tests {
             )
             .unwrap();
         assert!(parent_att.cred.remote.is_none());
+        assert_eq!(rev_parent, vec!["tok-parent".to_string()]);
         assert!(t.active_remote_tokens().is_empty());
     }
 
@@ -2191,5 +2490,324 @@ mod tests {
             assert!(!after.iter().any(|s| is_stop_signal(s.signal)));
             assert!(after.iter().any(|s| s.signal == SIGCONT));
         }
+    }
+
+    #[test]
+    fn reap_init_child_enforces_both_host_and_uid_permissions() {
+        let mut t = table_with_init();
+        let ann = id(1000);
+        let bob = id(1001);
+        let root_proc = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/sh",
+                    LocalCred::local_only(Identity::root(), 0o022),
+                    "host-a",
+                ),
+                101,
+            )
+            .unwrap();
+        t.exit("host-a", root_proc.pid, 0, None, 102).unwrap();
+
+        // F3-02: Same host-a, non-root Ann MUST NOT reap root's PID 1 child!
+        assert_eq!(
+            t.reap_init_child("host-a", &ann, root_proc.pid)
+                .unwrap_err()
+                .errno,
+            Errno::EPERM
+        );
+        // Different host, even as root, MUST NOT reap host-a's PID 1 child!
+        assert_eq!(
+            t.reap_init_child("host-b", &Identity::root(), root_proc.pid)
+                .unwrap_err()
+                .errno,
+            Errno::EPERM
+        );
+        // Same host AND matching/root cred succeeds.
+        assert_eq!(
+            t.reap_init_child("host-a", &Identity::root(), root_proc.pid)
+                .unwrap()
+                .pid,
+            root_proc.pid
+        );
+
+        let ann_proc = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/sh",
+                    LocalCred::local_only(ann.clone(), 0o022),
+                    "host-a",
+                ),
+                103,
+            )
+            .unwrap();
+        t.exit("host-a", ann_proc.pid, 0, None, 104).unwrap();
+        assert_eq!(
+            t.reap_init_child("host-a", &bob, ann_proc.pid)
+                .unwrap_err()
+                .errno,
+            Errno::EPERM
+        );
+        assert_eq!(
+            t.reap_init_child("host-a", &ann, ann_proc.pid).unwrap().pid,
+            ann_proc.pid
+        );
+    }
+
+    #[test]
+    fn delayed_report_stopped_cannot_undo_sigcont_or_duplicate_wuntraced() {
+        let mut t = table_with_init();
+        let ann = id(1000);
+        let parent = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/sh",
+                    LocalCred::local_only(ann.clone(), 0o022),
+                    "host-a",
+                ),
+                101,
+            )
+            .unwrap();
+        let child = t.fork("host-a", parent.pid, false, 102).unwrap();
+
+        // SIGSTOP immediately stops and produces one WUNTRACED event.
+        t.kill(&ann, Some(parent.pid), Target::Pid(child.pid), SIGSTOP, 103)
+            .unwrap();
+        assert!(matches!(
+            t.waitpid("host-a", parent.pid, child.pid as i32, WUNTRACED | WNOHANG)
+                .unwrap(),
+            WaitOutcome::Event { pid, status } if pid == child.pid && (status & 0x7f) == 0x7f
+        ));
+        // A duplicate/late report_stopped for the already-handled SIGSTOP MUST NOT re-emit WUNTRACED.
+        t.report_stopped("host-a", child.pid, SIGSTOP).unwrap();
+        assert_eq!(
+            t.waitpid("host-a", parent.pid, child.pid as i32, WUNTRACED | WNOHANG)
+                .unwrap(),
+            WaitOutcome::Pending
+        );
+
+        // SIGCONT resumes the child; a late report_stopped(SIGSTOP) MUST NOT undo SIGCONT!
+        t.kill(&ann, Some(parent.pid), Target::Pid(child.pid), SIGCONT, 104)
+            .unwrap();
+        assert_eq!(t.proc(child.pid).unwrap().state, ProcState::Running);
+        t.report_stopped("host-a", child.pid, SIGSTOP).unwrap();
+        assert_eq!(t.proc(child.pid).unwrap().state, ProcState::Running);
+
+        // SIGTSTP queued -> SIGCONT arrives before report_stopped -> late report_stopped ignored!
+        t.kill(&ann, Some(parent.pid), Target::Pid(child.pid), SIGTSTP, 105)
+            .unwrap();
+        t.kill(&ann, Some(parent.pid), Target::Pid(child.pid), SIGCONT, 106)
+            .unwrap();
+        t.report_stopped("host-a", child.pid, SIGTSTP).unwrap();
+        assert_eq!(t.proc(child.pid).unwrap().state, ProcState::Running);
+
+        // Fresh SIGTSTP without SIGCONT -> first report_stopped transitions & emits WUNTRACED,
+        // second report_stopped is a no-op.
+        t.kill(&ann, Some(parent.pid), Target::Pid(child.pid), SIGTSTP, 107)
+            .unwrap();
+        t.report_stopped("host-a", child.pid, SIGTSTP).unwrap();
+        assert_eq!(t.proc(child.pid).unwrap().state, ProcState::Stopped);
+        assert!(matches!(
+            t.waitpid("host-a", parent.pid, child.pid as i32, WUNTRACED | WNOHANG)
+                .unwrap(),
+            WaitOutcome::Event { pid, .. } if pid == child.pid
+        ));
+        t.report_stopped("host-a", child.pid, SIGTSTP).unwrap();
+        assert_eq!(
+            t.waitpid("host-a", parent.pid, child.pid as i32, WUNTRACED | WNOHANG)
+                .unwrap(),
+            WaitOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn memory_max_rejects_existing_untracked_member_and_root_kill_rejected() {
+        let mut t = table_with_init();
+        let ann = id(1000);
+        t.cgroup_create(&ann, None, "/user/untracked", None, None)
+            .unwrap();
+        let mut spec = SpawnSpec::new(
+            "/usr/bin/legacy",
+            LocalCred::local_only(ann.clone(), 0o022),
+            "host-a",
+        );
+        spec.runtime = None; // untracked runtime
+        spec.cgroup = Some("/user/untracked".into());
+        let p = t.spawn(spec, 101).unwrap();
+        assert!(!p.runtime_tracked);
+
+        // F3-05: setting finite memory.max with an existing untracked member fails EOPNOTSUPP.
+        assert_eq!(
+            t.cgroup_set(&ann, "/user/untracked", "memory.max", "131072", 102)
+                .unwrap_err()
+                .errno,
+            Errno::EOPNOTSUPP
+        );
+        // Root cgroup.kill fails EINVAL even for root.
+        assert_eq!(
+            t.cgroup_set(&Identity::root(), "/", "cgroup.kill", "1", 103)
+                .unwrap_err()
+                .errno,
+            Errno::EINVAL
+        );
+    }
+
+    #[test]
+    fn orphan_stopped_group_signaled_on_setpgid_setsid_and_group_member_exit() {
+        let mut t = table_with_init();
+        let ann = id(1000);
+
+        // Case 1: setpgid moving parent (whose own parent is in another session) into child's
+        // stopped pgroup orphans that group -> SIGHUP+SIGCONT.
+        let sh = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/sh",
+                    LocalCred::local_only(ann.clone(), 0o022),
+                    "host-a",
+                ),
+                101,
+            )
+            .unwrap();
+        let p1 = t.fork("host-a", sh.pid, false, 102).unwrap();
+        let p2 = t.fork("host-a", p1.pid, false, 103).unwrap();
+        t.setpgid("host-a", p2.pid, 0, 0).unwrap();
+        // Session leader `sh` exits so `p1` is reparented to PID 1 (session 1 != sh's session),
+        // while `p1` stays in `sh`'s session and pgroup (so `p2` is NOT orphaned yet).
+        t.exit("host-a", sh.pid, 0, None, 104).unwrap();
+        t.kill(&ann, Some(p1.pid), Target::Pid(p2.pid), SIGSTOP, 105)
+            .unwrap();
+        assert_eq!(t.proc(p2.pid).unwrap().state, ProcState::Stopped);
+        // Move p1 (p2's parent) into p2's process group -> p2's group now has no member with
+        // a parent in the same session and a different pgroup -> orphaned!
+        t.setpgid("host-a", p1.pid, 0, p2.pid as i32).unwrap();
+        let p2_after = t.proc(p2.pid).unwrap();
+        assert_eq!(p2_after.state, ProcState::Running);
+        assert!(p2_after.pending_signals.iter().any(|s| s.signal == SIGHUP));
+        assert!(p2_after.pending_signals.iter().any(|s| s.signal == SIGCONT));
+
+        // Case 2: setsid moving parent to a new session orphans its stopped child's pgroup!
+        let s_lead = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/sh",
+                    LocalCred::local_only(ann.clone(), 0o022),
+                    "host-a",
+                ),
+                110,
+            )
+            .unwrap();
+        let mid = t.fork("host-a", s_lead.pid, false, 111).unwrap();
+        let worker = t.fork("host-a", mid.pid, false, 112).unwrap();
+        t.setpgid("host-a", worker.pid, 0, 0).unwrap();
+        t.kill(&ann, Some(mid.pid), Target::Pid(worker.pid), SIGSTOP, 113)
+            .unwrap();
+        assert_eq!(t.proc(worker.pid).unwrap().state, ProcState::Stopped);
+        // mid creates a new session -> worker's parent is now in a different session -> orphaned!
+        t.setsid("host-a", mid.pid).unwrap();
+        let w_after = t.proc(worker.pid).unwrap();
+        assert_eq!(w_after.state, ProcState::Running);
+        assert!(w_after.pending_signals.iter().any(|s| s.signal == SIGHUP));
+        assert!(w_after.pending_signals.iter().any(|s| s.signal == SIGCONT));
+
+        // Case 3: member of a stopped pgroup whose parent was in same session exits -> remaining
+        // stopped member of THAT SAME pgroup becomes orphaned!
+        let shell2 = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/sh",
+                    LocalCred::local_only(ann.clone(), 0o022),
+                    "host-a",
+                ),
+                120,
+            )
+            .unwrap();
+        let job_lead = t.fork("host-a", shell2.pid, false, 121).unwrap();
+        t.setpgid("host-a", job_lead.pid, 0, 0).unwrap();
+        let job_child = t.fork("host-a", job_lead.pid, false, 122).unwrap();
+        t.kill(
+            &ann,
+            Some(shell2.pid),
+            Target::Pid(job_child.pid),
+            SIGSTOP,
+            123,
+        )
+        .unwrap();
+        // job_lead exits -> job_child is reparented to PID 1 (different session) and job_lead was
+        // the only member with a parent in shell2's session!
+        let out = t.exit("host-a", job_lead.pid, 0, None, 124).unwrap();
+        assert!(
+            out.signals
+                .iter()
+                .any(|s| s.pid == job_child.pid && s.signal == SIGHUP)
+        );
+        assert!(
+            out.signals
+                .iter()
+                .any(|s| s.pid == job_child.pid && s.signal == SIGCONT)
+        );
+        assert_eq!(t.proc(job_child.pid).unwrap().state, ProcState::Running);
+    }
+
+    #[test]
+    fn bootstrap_session_single_use_and_alloc_pid_skips_live_pgid_sid_and_boot_ticks() {
+        let mut t = table_with_init();
+        let ann = id(1000);
+        let a = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/sh",
+                    LocalCred::local_only(ann.clone(), 0o022),
+                    "host-a",
+                ),
+                105,
+            )
+            .unwrap();
+        let b = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/cat",
+                    LocalCred::local_only(ann.clone(), 0o022),
+                    "host-a",
+                ),
+                103, // wall-clock skew backwards: monotonic ticks MUST NOT go backwards!
+            )
+            .unwrap();
+        // Boot was at 100 -> a at 105 = 500 ticks; b at 103 clamps monotonically to >= 500 ticks.
+        assert_eq!(a.started_ticks, 500);
+        assert_eq!(b.started_ticks, 500);
+        assert_eq!(t.proc_snapshot(a.pid).unwrap().started_ticks, 500);
+
+        // F3-09: bootstrap_session succeeds once, second call fails EPERM and leaves sid/pgid intact.
+        assert_eq!(
+            t.bootstrap_session("host-a", &[a.pid, b.pid]).unwrap(),
+            a.pid
+        );
+        assert_eq!(
+            t.bootstrap_session("host-a", &[b.pid, a.pid])
+                .unwrap_err()
+                .errno,
+            Errno::EPERM
+        );
+        assert_eq!(t.proc(a.pid).unwrap().sid, a.pid);
+        assert_eq!(t.proc(b.pid).unwrap().sid, a.pid);
+
+        // F3-09: Reap leader `a` while `b` still holds `sid == pgid == a.pid`. Wrap `next_pid` to
+        // `a.pid` and verify `alloc_pid` skips `a.pid`!
+        let old_leader_pid = a.pid;
+        t.exit("host-a", old_leader_pid, 0, None, 106).unwrap();
+        t.reap_init_child("host-a", &ann, old_leader_pid).unwrap();
+        assert!(t.proc(old_leader_pid).is_none());
+        t.next_pid = old_leader_pid;
+        let c = t
+            .spawn(
+                SpawnSpec::new("/usr/bin/true", LocalCred::local_only(ann, 0o022), "host-a"),
+                107,
+            )
+            .unwrap();
+        assert_ne!(
+            c.pid, old_leader_pid,
+            "alloc_pid must not reuse a PID still referenced by a live pgid/sid"
+        );
     }
 }

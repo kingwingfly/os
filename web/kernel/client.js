@@ -94,10 +94,94 @@ self.cloudFsPost = async (path, headers, body) => {
 self.cloudFsSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 self.cloudFsTicket = () => self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
+const SEAT_POLICY_DB = 'os-seat-policy-v1';
+const SEAT_POLICY_STORE = 'policies';
+let seatPolicyDbPromise = null;
+
+function openSeatPolicyDb() {
+  if (typeof indexedDB === 'undefined') return Promise.resolve(null);
+  seatPolicyDbPromise ??= new Promise(resolve => {
+    try {
+      const req = indexedDB.open(SEAT_POLICY_DB, 1);
+      req.onupgradeneeded = () => {
+        if (!req.result.objectStoreNames.contains(SEAT_POLICY_STORE)) {
+          req.result.createObjectStore(SEAT_POLICY_STORE);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+  return seatPolicyDbPromise;
+}
+
+async function readSeatPolicy(uid) {
+  try {
+    const db = await openSeatPolicyDb();
+    if (!db) return null;
+    return await new Promise(resolve => {
+      const tx = db.transaction(SEAT_POLICY_STORE, 'readonly');
+      const req = tx.objectStore(SEAT_POLICY_STORE).get(uid);
+      req.onsuccess = () => resolve(req.result ?? null);
+      req.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function writeSeatPolicy(uid, sharing, revision) {
+  try {
+    const db = await openSeatPolicyDb();
+    if (!db) return;
+    await new Promise(resolve => {
+      const tx = db.transaction(SEAT_POLICY_STORE, 'readwrite');
+      tx.objectStore(SEAT_POLICY_STORE).put({ sharing, revision }, uid);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    });
+  } catch { /* best-effort persistence */ }
+}
+
+async function restoreSeatPolicyForAccount() {
+  if (!kernel) return;
+  try {
+    const creds = JSON.parse(kernel.workspace_credentials());
+    if (typeof creds?.uid !== 'number') return;
+    const saved = await readSeatPolicy(creds.uid);
+    if (saved && typeof saved.sharing === 'string' && typeof saved.revision === 'number') {
+      kernel.restore_seat_policy(creds.uid, saved.sharing, BigInt(saved.revision));
+    }
+  } catch { /* ignore unavailable IDB */ }
+}
+
+function buildAssetSizesOption() {
+  const raw = typeof __OS_BUILD_ASSET_SIZES__ !== 'undefined'
+    ? __OS_BUILD_ASSET_SIZES__
+    : globalThis.__OS_BUILD_ASSET_SIZES__;
+  if (!raw || typeof raw !== 'object') return null;
+  const sizes = {};
+  for (const name of ['coreutils', 'utilities', 'dash', 'supervise', 'init']) {
+    const value = raw[`/usr/bin/${name}.wasm`] ?? raw[name];
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      sizes[name] = value;
+    }
+  }
+  return Object.keys(sizes).length > 0 ? { buildAssetSizes: sizes } : null;
+}
+
 function boot() {
   starting ??= wasm_bindgen(asset('/client_kernel_bg.wasm')).then(async () => {
     self.wasm_bindgen = wasm_bindgen;
     kernel = new wasm_bindgen.Kernel('', kernelId);
+    const bootOpts = buildAssetSizesOption();
+    if (bootOpts) {
+      await kernel.boot_vfs(JSON.stringify(bootOpts));
+    }
+    await restoreSeatPolicyForAccount();
     const value = JSON.parse(await kernel.init());
     const [{ LoginCoordinator, LoginStartup }, { InitCoordinator, InitReaper }] = await Promise.all([import(asset('/login-session.js')), import(asset('/init-owner.js'))]);
     const proof = [...crypto.getRandomValues(new Uint8Array(32))].map(byte => byte.toString(16).padStart(2, '0')).join('');
@@ -172,9 +256,12 @@ function boot() {
       release: owner => machineInit.call({ op: 'release', owner }),
       exhausted: () => { void machineInit.stop(); },
       changed: () => {
-        if (!machineInit.reaper.run && machineInit.reaper.state === 'stopped'
+        if (!machineInit.reaper.run && ['stopped', 'failed'].includes(machineInit.reaper.state)
+          && machineInit.reaper.failures < 3
           && machineInit.current().coordinator && machineInit.ownership) {
-          queueMicrotask(() => machineInit.reaper.update(machineInit.current(), machineInit.ownership));
+          queueMicrotask(() => {
+            void machineInit.tick().catch(() => {});
+          });
         }
         broadcast({ v: VERSION, type: 'event', event: 'machine_init',
           value: { ...machineInit.current(), reaper: machineInit.reaper.current() } });
@@ -256,10 +343,25 @@ async function dispatch(message, host, tab, internal = false) {
     case 'instance_id': return kernel.instance_id();
     case 'namespace': return kernel.namespace();
     case 'workspace_credentials': return JSON.parse(kernel.workspace_credentials());
-    case 'sync_account': return JSON.parse(kernel.sync_account(typeof args === 'string' ? args : JSON.stringify(args)));
-    case 'sync_account_from_server': return JSON.parse(await kernel.sync_account_from_server());
+    case 'sync_account': {
+      const value = JSON.parse(kernel.sync_account(typeof args === 'string' ? args : JSON.stringify(args)));
+      await restoreSeatPolicyForAccount();
+      return value;
+    }
+    case 'sync_account_from_server': {
+      const value = JSON.parse(await kernel.sync_account_from_server());
+      await restoreSeatPolicyForAccount();
+      return value;
+    }
     case 'machine_init_action': return JSON.parse(await kernel.machine_init_action(JSON.stringify(args.action ?? args), host));
-    case 'login_session_action': return JSON.parse(await kernel.login_session_action(JSON.stringify(args.action ?? args), host));
+    case 'login_session_action': {
+      const action = args.action ?? args;
+      const value = JSON.parse(await kernel.login_session_action(JSON.stringify(action), host));
+      if (action?.op === 'seat_policy' && typeof value?.uid === 'number' && value?.seat_policy) {
+        await writeSeatPolicy(value.uid, value.seat_policy.sharing, value.seat_policy.revision);
+      }
+      return value;
+    }
     case 'machine_init_status': return { ...machineInit.current(), reaper: machineInit.reaper.current() };
     case 'machine_init_resume': return machineInit.resume();
     case 'machine_init_leave': await machineInit.stop(); return null;
@@ -296,6 +398,9 @@ async function dispatch(message, host, tab, internal = false) {
     case 'login_configure': return login.control('configure', { file: args.file }, args.expected);
     case 'login_seat_policy': {
       const value = await login.call({ op: 'seat_policy', session: args.session, expected: args.expected, sharing: args.sharing });
+      if (typeof value?.uid === 'number' && value?.seat_policy) {
+        await writeSeatPolicy(value.uid, value.seat_policy.sharing, value.seat_policy.revision);
+      }
       await login.tick();
       const executor = await import(asset('/executor-host.js'));
       executor.setSharingPolicy(() => login.current());
@@ -305,6 +410,7 @@ async function dispatch(message, host, tab, internal = false) {
       if (args?.fromServer !== false) {
         try { await kernel.sync_account_from_server(); } catch { /* offline or guest */ }
       }
+      await restoreSeatPolicyForAccount();
       return login.reset();
     }
     case 'login_leave': await login.stop(); return null;
@@ -579,5 +685,10 @@ async function handle(port, message) {
 
 // Exactly one host owns this dedicated Worker instance.
 self.onmessage = ({ data }) => handle(self, data);
-// Renew remote ServiceAuth v2 & CloudFs leases only when this instance has attached remotely.
+// Renew local init/login leases (zero network RPCs) and remote ServiceAuth v2 / CloudFs leases
+// only when this instance has attached remotely.
+setInterval(() => {
+  if (machineInit) void machineInit.tick().catch(() => {});
+  if (login) void login.tick().catch(() => {});
+}, 5000);
 setInterval(() => { if (kernel) void kernel.cloud_renew().catch(() => {}); }, 30000);

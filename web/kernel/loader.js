@@ -65,6 +65,104 @@ export async function loadLocal(pin) {
 
 let localCompilation = Promise.resolve();
 
+const TRANSFORM_CACHE_DB = 'os-wasm-transform-cache-v1';
+const TRANSFORM_CACHE_STORE = 'modules';
+let transformDbPromise = null;
+
+function openTransformCacheDb() {
+  if (typeof indexedDB === 'undefined') return Promise.resolve(null);
+  transformDbPromise ??= new Promise(resolve => {
+    try {
+      const req = indexedDB.open(TRANSFORM_CACHE_DB, 1);
+      req.onupgradeneeded = () => {
+        if (!req.result.objectStoreNames.contains(TRANSFORM_CACHE_STORE)) {
+          req.result.createObjectStore(TRANSFORM_CACHE_STORE);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+  return transformDbPromise;
+}
+
+async function readTransformCache(key) {
+  try {
+    const db = await openTransformCacheDb();
+    if (!db) return null;
+    return await new Promise(resolve => {
+      const tx = db.transaction(TRANSFORM_CACHE_STORE, 'readonly');
+      const req = tx.objectStore(TRANSFORM_CACHE_STORE).get(key);
+      req.onsuccess = () => {
+        const val = req.result;
+        if (val instanceof Uint8Array) resolve(val);
+        else if (val instanceof ArrayBuffer) resolve(new Uint8Array(val));
+        else resolve(null);
+      };
+      req.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function writeTransformCache(key, bytes) {
+  try {
+    const db = await openTransformCacheDb();
+    if (!db) return;
+    await new Promise(resolve => {
+      const tx = db.transaction(TRANSFORM_CACHE_STORE, 'readwrite');
+      tx.objectStore(TRANSFORM_CACHE_STORE).put(bytes.slice(), key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    });
+  } catch { /* best-effort cache */ }
+}
+
+async function sha256Hex(bytes) {
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function buildTransformedManifest() {
+  const manifest = typeof __OS_BUILD_TRANSFORMED__ !== 'undefined'
+    ? __OS_BUILD_TRANSFORMED__
+    : globalThis.__OS_BUILD_TRANSFORMED__;
+  return manifest && typeof manifest === 'object' ? manifest : null;
+}
+
+async function tryLoadPretransformedAsset(assetPath) {
+  const manifest = buildTransformedManifest();
+  if (!manifest || manifest.format !== LOCAL_FORMAT || !manifest.digests) return null;
+  const expected = manifest.digests[assetPath];
+  if (typeof expected !== 'string' || !/^[0-9a-f]{64}$/i.test(expected)) return null;
+  try {
+    const response = await fetch(`${assetPath}.rv1`);
+    if (!response.ok) return null;
+    const transformed = new Uint8Array(await response.arrayBuffer());
+    const actual = await sha256Hex(transformed);
+    if (actual.toLowerCase() !== expected.toLowerCase()) return null;
+    const module = await WebAssembly.compile(transformed);
+    const { memory, memories } = await heading(transformed);
+    const imported = WebAssembly.Module.imports(module).some(
+      entry => entry.kind === 'memory' && entry.module === MEMORY.module && entry.name === MEMORY.name,
+    );
+    if (imported && !memory) return null;
+    stats.compiled++;
+    return Object.freeze({
+      module,
+      memory: imported ? Object.freeze(memory) : undefined,
+      memoryBytes: memories.reduce((sum, value) => sum + value.initial * 65536, 0),
+      startSection: false,
+    });
+  } catch {
+    return null;
+  }
+}
+
 export async function loadLocalBytes(digest, bytes, check = async () => {}) {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength < 8) {
     throw formatError(new Error('not a wasm module'));
@@ -73,7 +171,7 @@ export async function loadLocalBytes(digest, bytes, check = async () => {}) {
   let promise = localCompiled.get(key);
   if (promise) localCompiled.delete(key);
   else {
-    promise = localCompilation.then(() => compileLocal(bytes));
+    promise = localCompilation.then(() => compileLocal(bytes, digest));
     localCompilation = promise.catch(() => {});
     promise.catch(() => { if (localCompiled.get(key) === promise) localCompiled.delete(key); });
   }
@@ -86,14 +184,28 @@ export async function loadLocalBytes(digest, bytes, check = async () => {}) {
   return result;
 }
 
-async function compileLocal(bytes) {
+async function compileLocal(bytes, knownDigest = null) {
   try {
     const original = await WebAssembly.compile(bytes);
     const imported = validateImports(WebAssembly.Module.imports(original));
     validateExports(original, imported);
     const { memory } = await heading(bytes);
     if (imported && !memory) fail('no env.memory type');
-    const transformed = await transformLocal(bytes);
+    let cacheKey = null;
+    let transformed = null;
+    if (globalThis.crypto?.subtle) {
+      try {
+        const digest = knownDigest ?? await sha256Hex(bytes);
+        cacheKey = `${LOCAL_FORMAT}:${digest}`;
+        transformed = await readTransformCache(cacheKey);
+      } catch {
+        transformed = null;
+      }
+    }
+    if (!transformed) {
+      transformed = await transformLocal(bytes);
+      if (cacheKey) void writeTransformCache(cacheKey, transformed);
+    }
     const module = await WebAssembly.compile(transformed);
     const { memories } = await heading(transformed);
     stats.compiled++;
@@ -118,16 +230,21 @@ const read = image => image.asset
 
 async function compile(image) {
   let module;
-  const response = await read(image);
-  if (!response.ok) throw await refusal(response);
-  // System `/usr/bin/*.wasm` assets transform locally via `/local-compiler.js` so local execution
-  // issues ZERO `/api/file?...&compile=...` RPCs (#54 L3a).
+  // System `/usr/bin/*.wasm` assets prefer verified build-time `.rv1` transforms (zero Binaryen)
+  // and fall back to local IDB-cached `/local-compiler.js` so local execution issues ZERO
+  // `/api/file?...&compile=...` RPCs (#54 L3a).
   if (image.asset && image.pid !== 1) {
+    const pretransformed = await tryLoadPretransformedAsset(image.asset);
+    if (pretransformed) return pretransformed;
+    const response = await read(image);
+    if (!response.ok) throw await refusal(response);
     const rawBytes = new Uint8Array(await response.arrayBuffer());
     const promise = localCompilation.then(() => compileLocal(rawBytes));
     localCompilation = promise.catch(() => {});
     return promise;
   }
+  const response = await read(image);
+  if (!response.ok) throw await refusal(response);
   const streamed = response.headers.get('Content-Type') === 'application/wasm';
   let prefix;
   if (streamed) {

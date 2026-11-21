@@ -20,6 +20,9 @@ pub const ROOT_CGROUPS: [&str; 4] = ["/init", "/user", "/system", "/cluster"];
 /// Maximum total cgroups in one instance.
 pub const CGROUP_MAX: usize = 512;
 
+/// Maximum active `CgroupLifetime::Process` cgroups owned by a single PID.
+pub const PROCESS_CGROUP_MAX: usize = 32;
+
 /// Maximum cgroup path length in bytes.
 pub const CGROUP_PATH_MAX: usize = 256;
 
@@ -249,7 +252,22 @@ impl CgroupTable {
         }
         let lifetime_owner = match lifetime {
             None => None,
-            Some(CgroupLifetime::Process) => Some(owner_pid.ok_or(Errno::EPERM)?),
+            Some(CgroupLifetime::Process) => {
+                let pid = owner_pid.ok_or(Errno::EPERM)?;
+                let owned_count = self
+                    .groups
+                    .values()
+                    .filter(|g| {
+                        !g.retired
+                            && g.lifetime == Some(CgroupLifetime::Process)
+                            && g.lifetime_owner == Some(pid)
+                    })
+                    .count();
+                if owned_count >= PROCESS_CGROUP_MAX {
+                    return Err(Errno::ENOSPC.into());
+                }
+                Some(pid)
+            }
         };
         let enabled = match ctrl_spec {
             Some(spec) => controllers(spec)?,
@@ -294,46 +312,69 @@ impl CgroupTable {
         key: &str,
         value: &str,
     ) -> Result<CgroupSetEffect, Error> {
+        self.set_checked(cred, raw_path, key, value, |_| false)
+    }
+
+    pub fn set_checked(
+        &mut self,
+        cred: &Identity,
+        raw_path: &str,
+        key: &str,
+        value: &str,
+        subtree_has_untracked: impl Fn(&str) -> bool,
+    ) -> Result<CgroupSetEffect, Error> {
         let path = normalize_cgroup_path(raw_path)?;
-        let group = self.groups.get_mut(&path).ok_or(Errno::ENOENT)?;
-        if !may_write(cred, group.owner) {
+        let (owner, retired) = {
+            let group = self.groups.get(&path).ok_or(Errno::ENOENT)?;
+            (group.owner, group.retired)
+        };
+        if !may_write(cred, owner) {
             return Err(Errno::EACCES.into());
         }
-        if group.retired && key != "cgroup.kill" {
+        if retired && key != "cgroup.kill" {
             return Err(Errno::ENOENT.into());
         }
         let trimmed = value.trim();
         match key {
             "cgroup.subtree_control" => {
-                group.controllers = controllers(trimmed)?;
+                let next = controllers(trimmed)?;
+                self.groups.get_mut(&path).unwrap().controllers = next;
                 Ok(CgroupSetEffect::None)
             }
             "pids.max" => {
-                if trimmed == "max" {
-                    group.pids_max = None;
+                let next = if trimmed == "max" {
+                    None
                 } else {
                     if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
                         return Err(Errno::EINVAL.into());
                     }
-                    let limit = trimmed.parse::<u32>().map_err(|_| Errno::EINVAL)?;
-                    group.pids_max = Some(limit);
-                }
+                    Some(trimmed.parse::<u32>().map_err(|_| Errno::EINVAL)?)
+                };
+                self.groups.get_mut(&path).unwrap().pids_max = next;
                 Ok(CgroupSetEffect::None)
             }
             "memory.max" => {
-                if trimmed == "max" {
-                    group.memory_max = None;
+                let next = if trimmed == "max" {
+                    None
                 } else {
                     if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
                         return Err(Errno::EINVAL.into());
                     }
                     let limit = trimmed.parse::<u64>().map_err(|_| Errno::EINVAL)?;
-                    group.memory_max = Some(limit);
-                }
+                    if subtree_has_untracked(&path) {
+                        return Err(Error::because(
+                            Errno::EOPNOTSUPP,
+                            "memory.max requires resources-v1 runtime enforcement",
+                        ));
+                    }
+                    Some(limit)
+                };
+                self.groups.get_mut(&path).unwrap().memory_max = next;
                 Ok(CgroupSetEffect::None)
             }
             "io.max" => {
                 let parsed = IoLimit::parse(trimmed)?;
+                let group = self.groups.get_mut(&path).unwrap();
                 group.io_read_bps = parsed.read;
                 group.io_write_bps = parsed.write;
                 group.io_max = if parsed.read.is_none() && parsed.write.is_none() {
@@ -353,7 +394,7 @@ impl CgroupTable {
             }
             "cpu.max" => {
                 if trimmed == "max" {
-                    group.cpu_max = None;
+                    self.groups.get_mut(&path).unwrap().cpu_max = None;
                 } else {
                     let parts: Vec<&str> = trimmed.split_whitespace().collect();
                     if parts.len() != 2 {
@@ -369,7 +410,13 @@ impl CgroupTable {
                     if !quota_ok || !period_ok {
                         return Err(Errno::EINVAL.into());
                     }
-                    group.cpu_max = Some(format!("{} {}", parts[0], parts[1]));
+                    if parts[0] != "max" {
+                        return Err(Error::because(
+                            Errno::EOPNOTSUPP,
+                            "cpu.max quota enforcement is not supported",
+                        ));
+                    }
+                    self.groups.get_mut(&path).unwrap().cpu_max = None;
                 }
                 Ok(CgroupSetEffect::None)
             }
@@ -381,13 +428,24 @@ impl CgroupTable {
                 if !(1..=10_000).contains(&weight) {
                     return Err(Errno::EINVAL.into());
                 }
-                group.cpu_weight = weight;
+                if weight != 100 {
+                    return Err(Error::because(
+                        Errno::EOPNOTSUPP,
+                        "cpu.weight enforcement is not supported",
+                    ));
+                }
+                self.groups.get_mut(&path).unwrap().cpu_weight = weight;
                 Ok(CgroupSetEffect::None)
             }
             "cgroup.freeze" => {
                 match trimmed {
-                    "0" => group.frozen = false,
-                    "1" => group.frozen = true,
+                    "0" => self.groups.get_mut(&path).unwrap().frozen = false,
+                    "1" => {
+                        return Err(Error::because(
+                            Errno::EOPNOTSUPP,
+                            "cgroup.freeze is not supported",
+                        ));
+                    }
                     _ => return Err(Errno::EINVAL.into()),
                 }
                 Ok(CgroupSetEffect::None)
@@ -396,6 +454,7 @@ impl CgroupTable {
                 if trimmed.is_empty() || trimmed.len() > 128 || trimmed.contains('\0') {
                     return Err(Errno::EINVAL.into());
                 }
+                let group = self.groups.get_mut(&path).unwrap();
                 if !group.devices_allow.iter().any(|r| r == trimmed) {
                     if group.devices_allow.len() >= DEVICE_RULES_MAX {
                         return Err(Errno::ENOSPC.into());
@@ -409,6 +468,7 @@ impl CgroupTable {
                 if trimmed.is_empty() || trimmed.len() > 128 || trimmed.contains('\0') {
                     return Err(Errno::EINVAL.into());
                 }
+                let group = self.groups.get_mut(&path).unwrap();
                 if !group.devices_deny.iter().any(|r| r == trimmed) {
                     if group.devices_deny.len() >= DEVICE_RULES_MAX {
                         return Err(Errno::ENOSPC.into());
@@ -419,7 +479,7 @@ impl CgroupTable {
                 Ok(CgroupSetEffect::None)
             }
             "cgroup.kill" => {
-                if trimmed != "1" {
+                if path == "/" || trimmed != "1" {
                     return Err(Errno::EINVAL.into());
                 }
                 Ok(CgroupSetEffect::KillSubtree(path))
@@ -829,5 +889,104 @@ mod tests {
         table.prune_retired(|_| false);
         assert!(table.get("/user/sup-42").is_none());
         assert!(table.get("/user/sup-42/nested").is_none());
+    }
+
+    #[test]
+    fn root_cgroup_kill_untracked_memory_and_unenforced_controls_fail_closed() {
+        let mut table = CgroupTable::new();
+        let root = Identity::root();
+        let ann = user(1000);
+        table
+            .create(&ann, Some(2), "/user/strict", None, None)
+            .unwrap();
+
+        // F3-05: cgroup.kill on root "/" MUST fail with EINVAL.
+        assert_eq!(
+            table.set(&root, "/", "cgroup.kill", "1").unwrap_err().errno,
+            Errno::EINVAL
+        );
+        assert_eq!(
+            table
+                .set(&root, "///", "cgroup.kill", "1")
+                .unwrap_err()
+                .errno,
+            Errno::EINVAL
+        );
+        // Non-root cgroup.kill still succeeds.
+        assert_eq!(
+            table.set(&ann, "/user/strict", "cgroup.kill", "1").unwrap(),
+            CgroupSetEffect::KillSubtree("/user/strict".into())
+        );
+
+        // F3-05: finite memory.max with an untracked live member fails EOPNOTSUPP without mutating.
+        assert_eq!(
+            table
+                .set_checked(&ann, "/user/strict", "memory.max", "131072", |_| true)
+                .unwrap_err()
+                .errno,
+            Errno::EOPNOTSUPP
+        );
+        assert_eq!(table.get("/user/strict").unwrap().memory_max, None);
+        // "max" clears without error even if untracked members exist.
+        table
+            .set_checked(&ann, "/user/strict", "memory.max", "max", |_| true)
+            .unwrap();
+
+        // F3-09: finite cpu.max, non-default cpu.weight, and cgroup.freeze=1 return EOPNOTSUPP.
+        assert_eq!(
+            table
+                .set(&ann, "/user/strict", "cpu.max", "50000 100000")
+                .unwrap_err()
+                .errno,
+            Errno::EOPNOTSUPP
+        );
+        table
+            .set(&ann, "/user/strict", "cpu.max", "max 100000")
+            .unwrap();
+        table.set(&ann, "/user/strict", "cpu.max", "max").unwrap();
+        assert_eq!(
+            table
+                .set(&ann, "/user/strict", "cpu.max", "bogus")
+                .unwrap_err()
+                .errno,
+            Errno::EINVAL
+        );
+
+        assert_eq!(
+            table
+                .set(&ann, "/user/strict", "cpu.weight", "200")
+                .unwrap_err()
+                .errno,
+            Errno::EOPNOTSUPP
+        );
+        table
+            .set(&ann, "/user/strict", "cpu.weight", "100")
+            .unwrap();
+        assert_eq!(
+            table
+                .set(&ann, "/user/strict", "cpu.weight", "0")
+                .unwrap_err()
+                .errno,
+            Errno::EINVAL
+        );
+
+        assert_eq!(
+            table
+                .set(&ann, "/user/strict", "cgroup.freeze", "1")
+                .unwrap_err()
+                .errno,
+            Errno::EOPNOTSUPP
+        );
+        assert!(!table.get("/user/strict").unwrap().frozen);
+        table
+            .set(&ann, "/user/strict", "cgroup.freeze", "0")
+            .unwrap();
+        assert_eq!(
+            table
+                .set(&ann, "/user/strict", "cgroup.freeze", "2")
+                .unwrap_err()
+                .errno,
+            Errno::EINVAL
+        );
     }
 }

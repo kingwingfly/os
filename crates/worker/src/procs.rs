@@ -17,7 +17,27 @@ use serde::Deserialize;
 use worker::{SqlStorage, SqlStorageValue};
 
 /// Independent schema version for `Machine` DO (decoupled from `OsAuthority` `SCHEMA_VERSION = "10"`).
-pub const MACHINE_SCHEMA_VERSION: u32 = 2;
+pub const MACHINE_SCHEMA_VERSION: u32 = 3;
+
+/// Server-side hard remote I/O ceiling per cgroup bucket (128 MiB/s) that clients can never
+/// exceed or clear to unlimited. Client-requested `io.max` rates below this floor are respected.
+pub const SERVER_IO_CEILING_BPS: u64 = 128 * 1024 * 1024;
+
+/// Clamp a client-supplied optional rate against the server ceiling floor.
+pub fn effective_server_io_rate(client_min_rate: Option<u64>) -> u64 {
+    match client_min_rate {
+        Some(r) => r.min(SERVER_IO_CEILING_BPS),
+        None => SERVER_IO_CEILING_BPS,
+    }
+}
+
+fn min_opt_rate(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
 
 impl crate::db::Db {
     /// Process/credential namespace for a browser session or guest cookie.
@@ -73,6 +93,7 @@ pub fn create(sql: &SqlStorage) -> worker::Result<()> {
             "service_tokens",
             "pending_revocations",
             "io_quotas",
+            "io_buckets",
         ] {
             sql.exec(&format!("DROP TABLE IF EXISTS {table}"), None)?;
         }
@@ -94,11 +115,15 @@ pub fn create(sql: &SqlStorage) -> worker::Result<()> {
             None,
         )?;
         sql.exec(
-            "CREATE TABLE io_quotas(token_hash TEXT PRIMARY KEY, ns TEXT NOT NULL, instance_id TEXT NOT NULL, cgroup TEXT NOT NULL, rbps INTEGER, wbps INTEGER, read_end INTEGER NOT NULL DEFAULT 0, write_end INTEGER NOT NULL DEFAULT 0, read_bytes INTEGER NOT NULL DEFAULT 0, write_bytes INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE io_quotas(token_hash TEXT PRIMARY KEY, ns TEXT NOT NULL, instance_id TEXT NOT NULL, cgroup TEXT NOT NULL, rbps INTEGER, wbps INTEGER)",
             None,
         )?;
         sql.exec(
-            "CREATE INDEX io_quotas_instance ON io_quotas(ns, instance_id)",
+            "CREATE INDEX io_quotas_bucket ON io_quotas(ns, instance_id, cgroup)",
+            None,
+        )?;
+        sql.exec(
+            "CREATE TABLE io_buckets(ns TEXT NOT NULL, instance_id TEXT NOT NULL, cgroup TEXT NOT NULL, read_end INTEGER NOT NULL DEFAULT 0, write_end INTEGER NOT NULL DEFAULT 0, read_bytes INTEGER NOT NULL DEFAULT 0, write_bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (ns, instance_id, cgroup))",
             None,
         )?;
         sql.exec(
@@ -151,10 +176,24 @@ pub struct IoQuotaRow {
     pub cgroup: String,
     pub rbps: Option<u64>,
     pub wbps: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct IoBucketRow {
+    pub ns: String,
+    pub instance_id: String,
+    pub cgroup: String,
     pub read_end: u64,
     pub write_end: u64,
     pub read_bytes: u64,
     pub write_bytes: u64,
+}
+
+#[derive(Deserialize)]
+struct MinRatesRow {
+    min_rbps: Option<u64>,
+    min_wbps: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -303,7 +342,24 @@ impl Db {
         Ok(row)
     }
 
-    /// Record a freshly minted or derived remote service credential bound to `(ns, instance_id)`.
+    pub fn active_service_token_count(&self, ns: &str, now: u64) -> usize {
+        self.rows::<CountRow>(
+            "SELECT COUNT(*) AS n FROM service_tokens WHERE ns = ? AND expires > ?",
+            vec![text(ns), int(now)],
+        )
+        .pop()
+        .map_or(0, |r| r.n)
+    }
+
+    pub fn queue_orphan_revocation(&mut self, ns: &str, token_hash: &str, now: u64) {
+        self.run(
+            "INSERT OR IGNORE INTO pending_revocations(token_hash, ns, created) VALUES(?, ?, ?)",
+            vec![text(token_hash), text(ns), int(now)],
+        );
+    }
+
+    /// Record a freshly minted or derived remote service credential bound to `(ns, instance_id)`
+    /// and atomically initialize its `io_quotas` entry & cgroup pacing bucket (zero unthrottled window).
     #[allow(clippy::too_many_arguments)]
     pub fn record_service_token(
         &mut self,
@@ -317,16 +373,11 @@ impl Db {
         scope: &RemoteScope,
         cloud_access: bool,
         expires: u64,
+        rbps: Option<u64>,
+        wbps: Option<u64>,
         now: u64,
     ) -> Result<String, Error> {
-        let count = self
-            .rows::<CountRow>(
-                "SELECT COUNT(*) AS n FROM service_tokens WHERE ns = ? AND expires > ?",
-                vec![text(ns), int(now)],
-            )
-            .pop()
-            .map_or(0, |r| r.n);
-        if count >= SERVICE_TOKENS_MAX {
+        if self.active_service_token_count(ns, now) >= SERVICE_TOKENS_MAX {
             return Err(Errno::ENOSPC.into());
         }
         let hash = auth::token_hash(raw_token);
@@ -345,6 +396,24 @@ impl Db {
                 int(u8::from(cloud_access)),
                 int(expires),
             ],
+        );
+        let rbps_val = rbps.map_or(SqlStorageValue::Null, int);
+        let wbps_val = wbps.map_or(SqlStorageValue::Null, int);
+        self.run(
+            "INSERT INTO io_quotas(token_hash, ns, instance_id, cgroup, rbps, wbps) VALUES(?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(token_hash) DO UPDATE SET cgroup = excluded.cgroup, rbps = excluded.rbps, wbps = excluded.wbps",
+            vec![
+                text(&hash),
+                text(ns),
+                text(instance_id),
+                text(cgroup),
+                rbps_val,
+                wbps_val,
+            ],
+        );
+        self.run(
+            "INSERT OR IGNORE INTO io_buckets(ns, instance_id, cgroup) VALUES(?, ?, ?)",
+            vec![text(ns), text(instance_id), text(cgroup)],
         );
         Ok(hash)
     }
@@ -378,10 +447,10 @@ impl Db {
         .pop()
     }
 
-    /// Renew an instance lease and return the token hashes owned by `(ns, instance_id)` that
-    /// match `active_tokens` (so only tokens belonging to this instance are renewed at `OsAuthority`).
-    pub fn renew_instance_tokens(
-        &mut self,
+    /// Verify `(ns, instance_id, host_proof)` and collect `(raw, hash)` pairs for tokens currently
+    /// owned by this instance WITHOUT extending any expiry before `OsAuthority` confirms renewal.
+    pub fn collect_owned_tokens(
+        &self,
         ns: &str,
         instance_id: &str,
         host_proof: &str,
@@ -389,30 +458,49 @@ impl Db {
         now: u64,
     ) -> Result<Vec<(String, String)>, Error> {
         self.verify_instance(ns, instance_id, host_proof, now)?;
+        let mut owned = Vec::new();
+        for raw in active_tokens {
+            let hash = auth::token_hash(raw);
+            let exists = !self
+                .rows::<ServiceTokenRow>(
+                    "SELECT * FROM service_tokens WHERE token_hash = ? AND ns = ? AND instance_id = ? AND expires > ?",
+                    vec![text(&hash), text(ns), text(instance_id), int(now)],
+                )
+                .is_empty();
+            if exists {
+                owned.push((raw.clone(), hash));
+            }
+        }
+        Ok(owned)
+    }
+
+    /// Commit an instance lease & token renewal ONLY AFTER `OsAuthority` confirmed live tokens.
+    pub fn commit_instance_renewal(
+        &mut self,
+        ns: &str,
+        instance_id: &str,
+        host_proof: &str,
+        live_hashes: &[String],
+        dead_hashes: &[String],
+        now: u64,
+    ) -> Result<(), Error> {
+        self.verify_instance(ns, instance_id, host_proof, now)?;
         let inst_expires = now.saturating_add(INSTANCE_LEASE_SECONDS);
         let tok_expires = now.saturating_add(abi::PROCESS_TOKEN_TTL);
         self.run(
             "UPDATE instances SET expires = ?, updated = ? WHERE instance_id = ? AND ns = ?",
             vec![int(inst_expires), int(now), text(instance_id), text(ns)],
         );
-        let mut owned = Vec::new();
-        for raw in active_tokens {
-            let hash = auth::token_hash(raw);
-            let exists = !self
-                .rows::<ServiceTokenRow>(
-                    "SELECT * FROM service_tokens WHERE token_hash = ? AND ns = ? AND instance_id = ?",
-                    vec![text(&hash), text(ns), text(instance_id)],
-                )
-                .is_empty();
-            if exists {
-                self.run(
-                    "UPDATE service_tokens SET expires = ? WHERE token_hash = ?",
-                    vec![int(tok_expires), text(&hash)],
-                );
-                owned.push((raw.clone(), hash));
-            }
+        for hash in live_hashes {
+            self.run(
+                "UPDATE service_tokens SET expires = ? WHERE token_hash = ? AND ns = ? AND instance_id = ?",
+                vec![int(tok_expires), text(hash), text(ns), text(instance_id)],
+            );
         }
-        Ok(owned)
+        for hash in dead_hashes {
+            self.drop_service_token_hash(ns, hash);
+        }
+        Ok(())
     }
 
     pub fn drop_service_token_hash(&mut self, ns: &str, token_hash: &str) {
@@ -473,6 +561,10 @@ impl Db {
             "DELETE FROM io_quotas WHERE ns = ? AND instance_id = ?",
             vec![text(ns), text(instance_id)],
         );
+        self.run(
+            "DELETE FROM io_buckets WHERE ns = ? AND instance_id = ?",
+            vec![text(ns), text(instance_id)],
+        );
         count
     }
 
@@ -520,6 +612,40 @@ impl Db {
         count
     }
 
+    fn carry_bucket_debt(
+        &mut self,
+        ns: &str,
+        instance_id: &str,
+        from_cgroup: &str,
+        to_cgroup: &str,
+    ) {
+        self.run(
+            "INSERT OR IGNORE INTO io_buckets(ns, instance_id, cgroup) VALUES(?, ?, ?)",
+            vec![text(ns), text(instance_id), text(to_cgroup)],
+        );
+        if from_cgroup == to_cgroup {
+            return;
+        }
+        if let Some(src) = self
+            .rows::<IoBucketRow>(
+                "SELECT * FROM io_buckets WHERE ns = ? AND instance_id = ? AND cgroup = ?",
+                vec![text(ns), text(instance_id), text(from_cgroup)],
+            )
+            .pop()
+        {
+            self.run(
+                "UPDATE io_buckets SET read_end = MAX(read_end, ?), write_end = MAX(write_end, ?) WHERE ns = ? AND instance_id = ? AND cgroup = ?",
+                vec![
+                    int(src.read_end),
+                    int(src.write_end),
+                    text(ns),
+                    text(instance_id),
+                    text(to_cgroup),
+                ],
+            );
+        }
+    }
+
     /// Configure or clear server-side remote `io.max` policy for a live token owned by `(ns, instance_id)`.
     #[allow(clippy::too_many_arguments)]
     pub fn set_remote_io_quota(
@@ -537,6 +663,13 @@ impl Db {
         let tok = self
             .service_token_for_instance(ns, instance_id, raw_token, now)
             .ok_or_else(|| Error::because(Errno::EACCES, "unknown service token for instance"))?;
+        let prev_cg = self
+            .rows::<IoQuotaRow>(
+                "SELECT * FROM io_quotas WHERE token_hash = ? AND ns = ?",
+                vec![text(&tok.token_hash), text(ns)],
+            )
+            .pop()
+            .map(|r| r.cgroup);
         let rbps_val = rbps.map_or(SqlStorageValue::Null, int);
         let wbps_val = wbps.map_or(SqlStorageValue::Null, int);
         self.run(
@@ -551,40 +684,65 @@ impl Db {
                 wbps_val,
             ],
         );
+        self.carry_bucket_debt(
+            ns,
+            instance_id,
+            prev_cg.as_deref().unwrap_or(&tok.cgroup),
+            cgroup,
+        );
         Ok(())
     }
 
-    /// Atomically inherit any existing `io_quotas` policy and pacing debt (`rbps`, `wbps`,
-    /// `read_end`, `write_end`, `read_bytes`, `write_bytes`) from `parent_hash` onto a derived
-    /// token so `reexec` / `DeriveServiceCred` can never escape server-side `io.max` or reset debt.
-    pub fn inherit_remote_io_quota(
+    pub fn io_quota_of(&self, ns: &str, token_hash: &str) -> Option<IoQuotaRow> {
+        self.rows::<IoQuotaRow>(
+            "SELECT * FROM io_quotas WHERE token_hash = ? AND ns = ?",
+            vec![text(token_hash), text(ns)],
+        )
+        .pop()
+    }
+
+    /// Atomically inherit any existing `io_quotas` policy and cgroup pacing debt from `parent_row`
+    /// onto a derived token so `reexec` / `DeriveServiceCred` can never escape server-side `io.max`
+    /// or reset pacing debt (even when `revoke_parent` already dropped the parent's row).
+    #[allow(clippy::too_many_arguments)]
+    pub fn inherit_remote_io_quota_from(
         &mut self,
         ns: &str,
         instance_id: &str,
-        parent_hash: &str,
+        parent_row: Option<&IoQuotaRow>,
         new_raw: &str,
         cgroup: &str,
+        override_rbps: Option<u64>,
+        override_wbps: Option<u64>,
     ) {
         let new_hash = auth::token_hash(new_raw);
+        let (parent_cg, eff_rbps, eff_wbps) = match parent_row {
+            Some(p) => (
+                p.cgroup.as_str(),
+                min_opt_rate(p.rbps, override_rbps),
+                min_opt_rate(p.wbps, override_wbps),
+            ),
+            None => (cgroup, override_rbps, override_wbps),
+        };
+        let rbps_val = eff_rbps.map_or(SqlStorageValue::Null, int);
+        let wbps_val = eff_wbps.map_or(SqlStorageValue::Null, int);
         self.run(
-            "INSERT INTO io_quotas(token_hash, ns, instance_id, cgroup, rbps, wbps, read_end, write_end, read_bytes, write_bytes) \
-             SELECT ?, ns, ?, ?, rbps, wbps, read_end, write_end, read_bytes, write_bytes \
-             FROM io_quotas WHERE token_hash = ? AND ns = ? \
-             ON CONFLICT(token_hash) DO UPDATE SET \
-               cgroup = excluded.cgroup, rbps = excluded.rbps, wbps = excluded.wbps, \
-               read_end = excluded.read_end, write_end = excluded.write_end, \
-               read_bytes = excluded.read_bytes, write_bytes = excluded.write_bytes",
+            "INSERT INTO io_quotas(token_hash, ns, instance_id, cgroup, rbps, wbps) VALUES(?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(token_hash) DO UPDATE SET cgroup = excluded.cgroup, rbps = excluded.rbps, wbps = excluded.wbps",
             vec![
                 text(&new_hash),
+                text(ns),
                 text(instance_id),
                 text(cgroup),
-                text(parent_hash),
-                text(ns),
+                rbps_val,
+                wbps_val,
             ],
         );
+        self.carry_bucket_debt(ns, instance_id, parent_cg, cgroup);
     }
 
-    /// Enforce server-side remote `io.max` pacing/rate limits per credential regardless of client claims.
+    /// Enforce server-side remote `io.max` pacing/rate limits bucketed by `(ns, instance_id, cgroup)`
+    /// against the strictest limit in the bucket and the server-side ceiling floor.
     pub fn charge_remote_io(
         &mut self,
         ns: &str,
@@ -612,20 +770,38 @@ impl Db {
                 "owning instance lease has expired",
             ));
         }
-        let Some(quota) = self
+        let quota_cg = self
             .rows::<IoQuotaRow>(
                 "SELECT * FROM io_quotas WHERE token_hash = ? AND ns = ?",
                 vec![text(&tok.token_hash), text(ns)],
             )
             .pop()
-        else {
-            return Ok(0);
-        };
-        let rate = if write { quota.wbps } else { quota.rbps };
+            .map_or(tok.cgroup, |q| q.cgroup);
+        // Aggregate the strictest client rate across ALL tokens sharing `(ns, instance_id, cgroup)`,
+        // clamped by `SERVER_IO_CEILING_BPS` so clients can never bypass or multiply bandwidth N×.
+        let min_rates = self
+            .rows::<MinRatesRow>(
+                "SELECT MIN(rbps) AS min_rbps, MIN(wbps) AS min_wbps FROM io_quotas WHERE ns = ? AND instance_id = ? AND cgroup = ?",
+                vec![text(ns), text(&tok.instance_id), text(&quota_cg)],
+            )
+            .pop();
+        let client_rate = min_rates.and_then(|r| if write { r.min_wbps } else { r.min_rbps });
+        let rate = Some(effective_server_io_rate(client_rate));
+        self.run(
+            "INSERT OR IGNORE INTO io_buckets(ns, instance_id, cgroup) VALUES(?, ?, ?)",
+            vec![text(ns), text(&tok.instance_id), text(&quota_cg)],
+        );
+        let bucket = self
+            .rows::<IoBucketRow>(
+                "SELECT * FROM io_buckets WHERE ns = ? AND instance_id = ? AND cgroup = ?",
+                vec![text(ns), text(&tok.instance_id), text(&quota_cg)],
+            )
+            .pop()
+            .ok_or(Errno::EIO)?;
         let prev = if write {
-            quota.write_end
+            bucket.write_end
         } else {
-            quota.read_end
+            bucket.read_end
         };
         let end = kernel::resource::io_deadline(now_ms, prev, rate, bytes)?;
         let (col_end, col_bytes) = if write {
@@ -635,9 +811,15 @@ impl Db {
         };
         self.run(
             &format!(
-                "UPDATE io_quotas SET {col_end} = ?, {col_bytes} = {col_bytes} + ? WHERE token_hash = ? AND ns = ?"
+                "UPDATE io_buckets SET {col_end} = ?, {col_bytes} = {col_bytes} + ? WHERE ns = ? AND instance_id = ? AND cgroup = ?"
             ),
-            vec![int(end), int(bytes), text(&tok.token_hash), text(ns)],
+            vec![
+                int(end),
+                int(bytes),
+                text(ns),
+                text(&tok.instance_id),
+                text(&quota_cg),
+            ],
         );
         Ok(end.saturating_sub(now_ms))
     }

@@ -179,7 +179,18 @@ impl Machine {
                 let inst_v = mint.instance_id.clone();
                 let proof_v = mint.host_proof.clone();
                 let verified = transact(&self.state, move |db| {
-                    (db.verify_instance(&ns_v, &inst_v, &proof_v, now), false)
+                    let r = db
+                        .verify_instance(&ns_v, &inst_v, &proof_v, now)
+                        .and_then(|_| {
+                            if db.active_service_token_count(&ns_v, now)
+                                >= procs::SERVICE_TOKENS_MAX
+                            {
+                                Err(Errno::ENOSPC.into())
+                            } else {
+                                Ok(())
+                            }
+                        });
+                    (r, false)
                 })?;
                 if let Err(err) = verified {
                     return auth_error_response(&err);
@@ -226,26 +237,40 @@ impl Machine {
 
                 let ns_r = ns.clone();
                 let inst_r = mint.instance_id.clone();
+                let proof_r = mint.host_proof.clone();
                 let tok_r = raw_token.clone();
+                let hash_r = token_hash.clone();
                 let lin_r = lineage.clone();
                 let cg_r = cgroup.clone();
                 let scope_r = scope.clone();
+                let rbps = mint.rbps;
+                let wbps = mint.wbps;
+                let post_now = auth::now();
                 let rec = transact(&self.state, move |db| {
-                    let r = db.record_service_token(
-                        &ns_r,
-                        &inst_r,
-                        &tok_r,
-                        uid,
-                        gid,
-                        &lin_r,
-                        &cg_r,
-                        &scope_r,
-                        cloud_access,
-                        expires,
-                        now,
-                    );
-                    let commit = r.is_ok();
-                    (r, commit)
+                    let r = db
+                        .verify_instance(&ns_r, &inst_r, &proof_r, post_now)
+                        .and_then(|_| {
+                            db.record_service_token(
+                                &ns_r,
+                                &inst_r,
+                                &tok_r,
+                                uid,
+                                gid,
+                                &lin_r,
+                                &cg_r,
+                                &scope_r,
+                                cloud_access,
+                                expires,
+                                rbps,
+                                wbps,
+                                post_now,
+                            )
+                        });
+                    if r.is_err() {
+                        // Queue orphan authority credential for immediate revocation in `settle()`.
+                        db.queue_orphan_revocation(&ns_r, &hash_r, post_now);
+                    }
+                    (r, true)
                 })?;
                 if let Err(err) = rec {
                     return auth_error_response(&err);
@@ -275,10 +300,15 @@ impl Machine {
                 let inst_v = derive.instance_id.clone();
                 let proof_v = derive.host_proof.clone();
                 let ptok_v = derive.parent_token.clone();
+                let revoke_parent_v = derive.revoke_parent;
                 let parent_row = transact(&self.state, move |db| {
                     let r = db
                         .verify_instance(&ns_v, &inst_v, &proof_v, now)
                         .and_then(|_| {
+                            let count = db.active_service_token_count(&ns_v, now);
+                            if !revoke_parent_v && count >= procs::SERVICE_TOKENS_MAX {
+                                return Err(Errno::ENOSPC.into());
+                            }
                             db.service_token_for_instance(&ns_v, &inst_v, &ptok_v, now)
                                 .ok_or_else(|| {
                                     Error::because(
@@ -295,8 +325,10 @@ impl Machine {
                 };
                 let parent_scope: auth_v2::RemoteScope =
                     serde_json::from_str(&parent_row.scope).unwrap_or_default();
-                let attenuated_scope = parent_scope.attenuate(&derive.scope);
-                let attenuated_cloud = (parent_row.cloud_access != 0) && derive.cloud_access;
+                let requested_scope = parent_scope.attenuate(&derive.scope);
+                let requested_cloud = (parent_row.cloud_access != 0)
+                    && derive.cloud_access
+                    && requested_scope.cloud_fs;
                 let new_raw = auth::random_token();
                 let new_hash = auth::token_hash(&new_raw);
                 let cgroup = derive.cgroup.clone().unwrap_or(parent_row.cgroup.clone());
@@ -305,8 +337,8 @@ impl Machine {
                     "instance_id": derive.instance_id,
                     "parent_hash": parent_row.token_hash,
                     "new_hash": new_hash,
-                    "scope": attenuated_scope,
-                    "cloud_access": attenuated_cloud,
+                    "scope": requested_scope,
+                    "cloud_access": requested_cloud,
                     "umask": derive.umask.map(|m| m & 0o777),
                     "cgroup": cgroup,
                     "revoke_parent": derive.revoke_parent,
@@ -328,6 +360,10 @@ impl Machine {
                 let groups: Vec<u32> =
                     serde_json::from_value(derived["groups"].clone()).unwrap_or_else(|_| vec![gid]);
                 let umask = derived["umask"].as_u64().unwrap_or(0o022) as u16;
+                let auth_scope: auth_v2::RemoteScope =
+                    serde_json::from_value(derived["scope"].clone()).unwrap_or_default();
+                let auth_cloud =
+                    derived["cloud_access"].as_bool().unwrap_or(false) && auth_scope.cloud_fs;
                 let expires = derived["expires"]
                     .as_u64()
                     .unwrap_or_else(|| now.saturating_add(abi::PROCESS_TOKEN_TTL));
@@ -337,34 +373,56 @@ impl Machine {
                     .unwrap_or(parent_row.lineage);
                 let ns_r = ns.clone();
                 let inst_r = derive.instance_id.clone();
+                let proof_r = derive.host_proof.clone();
+                let ptok_r = derive.parent_token.clone();
                 let raw_r = new_raw.clone();
+                let new_hash_r = new_hash.clone();
                 let lin_r = lineage.clone();
                 let cg_r = cgroup.clone();
-                let sc_r = attenuated_scope.clone();
+                let sc_r = auth_scope.clone();
                 let ph_r = parent_row.token_hash.clone();
                 let revoke_parent = derive.revoke_parent;
+                let rbps = derive.rbps;
+                let wbps = derive.wbps;
+                let post_now = auth::now();
                 let rec = transact(&self.state, move |db| {
-                    let r = db.record_service_token(
-                        &ns_r,
-                        &inst_r,
-                        &raw_r,
-                        uid,
-                        gid,
-                        &lin_r,
-                        &cg_r,
-                        &sc_r,
-                        attenuated_cloud,
-                        expires,
-                        now,
-                    );
-                    if r.is_ok() {
-                        db.inherit_remote_io_quota(&ns_r, &inst_r, &ph_r, &raw_r, &cg_r);
-                        if revoke_parent {
-                            db.drop_service_token_hash(&ns_r, &ph_r);
-                        }
+                    let r = db
+                        .verify_instance(&ns_r, &inst_r, &proof_r, post_now)
+                        .and_then(|_| {
+                            if db
+                                .service_token_for_instance(&ns_r, &inst_r, &ptok_r, post_now)
+                                .is_none()
+                            {
+                                return Err(Error::because(
+                                    Errno::ESTALE,
+                                    "parent token was revoked concurrently",
+                                ));
+                            }
+                            let parent_quota = db.io_quota_of(&ns_r, &ph_r);
+                            if revoke_parent {
+                                db.drop_service_token_hash(&ns_r, &ph_r);
+                            }
+                            let res = db.record_service_token(
+                                &ns_r, &inst_r, &raw_r, uid, gid, &lin_r, &cg_r, &sc_r, auth_cloud,
+                                expires, rbps, wbps, post_now,
+                            );
+                            if res.is_ok() {
+                                db.inherit_remote_io_quota_from(
+                                    &ns_r,
+                                    &inst_r,
+                                    parent_quota.as_ref(),
+                                    &raw_r,
+                                    &cg_r,
+                                    rbps,
+                                    wbps,
+                                );
+                            }
+                            res
+                        });
+                    if r.is_err() {
+                        db.queue_orphan_revocation(&ns_r, &new_hash_r, post_now);
                     }
-                    let commit = r.is_ok();
-                    (r, commit)
+                    (r, true)
                 })?;
                 if let Err(err) = rec {
                     return auth_error_response(&err);
@@ -376,8 +434,8 @@ impl Machine {
                     gid,
                     groups,
                     umask,
-                    cloud_access: attenuated_cloud,
-                    scope: attenuated_scope,
+                    cloud_access: auth_cloud,
+                    scope: auth_scope,
                     expires,
                     instance_id: derive.instance_id,
                     lineage,
@@ -395,9 +453,8 @@ impl Machine {
                 let proof_r = renew.host_proof.clone();
                 let active_r = renew.active_tokens.clone();
                 let owned = transact(&self.state, move |db| {
-                    let r = db.renew_instance_tokens(&ns_r, &inst_r, &proof_r, &active_r, now);
-                    let commit = r.is_ok();
-                    (r, commit)
+                    let r = db.collect_owned_tokens(&ns_r, &inst_r, &proof_r, &active_r, now);
+                    (r, false)
                 })?;
                 let owned = match owned {
                     Ok(v) => v,
@@ -410,9 +467,10 @@ impl Machine {
                         revoked_raw.push(raw.clone());
                     }
                 }
+                let mut dead_hashes = Vec::new();
                 if !owned.is_empty() {
                     let hashes: Vec<String> = owned.iter().map(|(_, h)| h.clone()).collect();
-                    if let Ok(val) = self
+                    let val = match self
                         .call_authority(
                             "/internal/service-auth/renew",
                             cookie.as_deref(),
@@ -421,24 +479,40 @@ impl Machine {
                         )
                         .await
                     {
-                        let dead_hashes: Vec<String> =
-                            serde_json::from_value(val["revoked"].clone()).unwrap_or_default();
-                        if !dead_hashes.is_empty() {
-                            let ns_d = ns.clone();
-                            let dead_d = dead_hashes.clone();
-                            let _ = transact(&self.state, move |db| {
-                                for h in &dead_d {
-                                    db.drop_service_token_hash(&ns_d, h);
-                                }
-                                ((), true)
-                            });
-                            for (raw, hash) in &owned {
-                                if dead_hashes.contains(hash) {
-                                    revoked_raw.push(raw.clone());
-                                }
-                            }
+                        Ok(v) => v,
+                        Err(err) => return auth_error_response(&err),
+                    };
+                    dead_hashes =
+                        serde_json::from_value(val["revoked"].clone()).unwrap_or_default();
+                    for (raw, hash) in &owned {
+                        if dead_hashes.contains(hash) {
+                            revoked_raw.push(raw.clone());
                         }
                     }
+                }
+                let live_hashes: Vec<String> = owned
+                    .iter()
+                    .filter(|(_, h)| !dead_hashes.contains(h))
+                    .map(|(_, h)| h.clone())
+                    .collect();
+                let ns_c = ns.clone();
+                let inst_c = renew.instance_id.clone();
+                let proof_c = renew.host_proof.clone();
+                let post_now = auth::now();
+                let commit_res = transact(&self.state, move |db| {
+                    let r = db.commit_instance_renewal(
+                        &ns_c,
+                        &inst_c,
+                        &proof_c,
+                        &live_hashes,
+                        &dead_hashes,
+                        post_now,
+                    );
+                    let commit = r.is_ok();
+                    (r, commit)
+                })?;
+                if let Err(err) = commit_res {
+                    return auth_error_response(&err);
                 }
                 Response::from_json(&AuthResponse::Renewed(RenewResult {
                     version: VERSION,

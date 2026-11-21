@@ -76,8 +76,6 @@ fn is_local_carrier_path(path: &str) -> bool {
             | "/proc"
             | "/dev"
             | "/dev/pts"
-            | "/dev/present"
-            | "/dev/snd"
             | "/run"
             | "/tmp"
             | "/mnt"
@@ -169,6 +167,7 @@ pub(crate) enum Actor {
     None,
     Process(u32),
     Exiting(u32, Option<String>),
+    Ephemeral(String),
 }
 
 pub(crate) struct Acted<F> {
@@ -234,9 +233,21 @@ impl Host for BrowserHost {
                 .and_then(|status| status.as_f64())
                 .ok_or(Errno::EIO)? as u16;
             let body = js_sys::Reflect::get(&reply, &"body".into()).map_err(|_| Errno::EIO)?;
+            let bytes = js_sys::Uint8Array::new(&body).to_vec();
+            if status != 200
+                && let Ok(val) = serde_json::from_slice::<Value>(&bytes)
+                && let Some(code) = val["errno"].as_str()
+                && let Ok(parsed) = serde_json::from_value::<Errno>(Value::String(code.to_string()))
+            {
+                let detail = val["detail"]
+                    .as_str()
+                    .or_else(|| val["error"].as_str())
+                    .filter(|s| !s.is_empty());
+                record_last_page_error(parsed, detail);
+            }
             Ok(Reply {
                 status,
-                body: js_sys::Uint8Array::new(&body).to_vec(),
+                body: bytes,
             })
         })
     }
@@ -280,6 +291,7 @@ impl Host for BrowserHost {
                 let rem = proc.cred.remote.as_ref().ok_or(Errno::EACCES)?;
                 Ok((rem.token.clone(), Some(*pid)))
             }
+            Actor::Ephemeral(token) => Ok((token.clone(), None)),
         }
     }
 }
@@ -289,12 +301,15 @@ type Fs = CloudFs<HttpTransport<BrowserHost>>;
 pub(crate) struct Cloud {
     pub(crate) fs: Rc<Fs>,
     pub(crate) live_opens: Cell<usize>,
+    pub(crate) session_uid: u32,
 }
 
-/// Connects the session once, for every caller that needs it meanwhile.
+/// Connects one `CloudFs` session per account/guest UID so cookie/account rotations (e.g.
+/// guest->guest or guest->root) never mismatch `vfs_sessions.ns` while existing opens stay alive.
 #[derive(Default)]
 pub(crate) struct ConnectorInner {
-    pub(crate) cloud: RefCell<Option<Rc<Cloud>>>,
+    pub(crate) clouds: RefCell<HashMap<u32, Rc<Cloud>>>,
+    latest_uid: Cell<Option<u32>>,
     busy: Cell<bool>,
     waiters: RefCell<Vec<Waker>>,
 }
@@ -314,7 +329,17 @@ impl Drop for Connecting<'_> {
 
 impl Connector {
     pub(crate) fn current(&self) -> Option<Rc<Cloud>> {
-        self.0.cloud.borrow().clone()
+        let clouds = self.0.clouds.borrow();
+        if let Some(uid) = self.0.latest_uid.get()
+            && let Some(c) = clouds.get(&uid)
+        {
+            return Some(Rc::clone(c));
+        }
+        clouds.values().next().cloned()
+    }
+
+    pub(crate) fn all(&self) -> Vec<Rc<Cloud>> {
+        self.0.clouds.borrow().values().cloned().collect()
     }
 
     pub(crate) fn current_session(&self) -> Option<(String, String)> {
@@ -325,9 +350,12 @@ impl Connector {
     }
 
     pub(crate) fn drop_if_same(&self, cloud: &Rc<Cloud>) {
-        let mut slot = self.0.cloud.borrow_mut();
-        if slot.as_ref().is_some_and(|cur| Rc::ptr_eq(cur, cloud)) {
-            *slot = None;
+        let mut clouds = self.0.clouds.borrow_mut();
+        if clouds
+            .get(&cloud.session_uid)
+            .is_some_and(|cur| Rc::ptr_eq(cur, cloud))
+        {
+            clouds.remove(&cloud.session_uid);
         }
     }
 
@@ -335,10 +363,11 @@ impl Connector {
         &self,
         state: &Rc<RefCell<State>>,
         current: &Rc<RefCell<Actor>>,
+        uid: u32,
         token: &str,
     ) -> vfs::Result<Rc<Cloud>> {
         poll_fn(|context| {
-            if self.0.cloud.borrow().is_some() || !self.0.busy.get() {
+            if self.0.clouds.borrow().contains_key(&uid) || !self.0.busy.get() {
                 Poll::Ready(())
             } else {
                 self.0.waiters.borrow_mut().push(context.waker().clone());
@@ -346,7 +375,8 @@ impl Connector {
             }
         })
         .await;
-        if let Some(cloud) = self.current() {
+        if let Some(cloud) = self.0.clouds.borrow().get(&uid).cloned() {
+            self.0.latest_uid.set(Some(uid));
             return Ok(cloud);
         }
         self.0.busy.set(true);
@@ -359,8 +389,15 @@ impl Connector {
         let cloud = Rc::new(Cloud {
             fs,
             live_opens: Cell::new(0),
+            session_uid: uid,
         });
-        *self.0.cloud.borrow_mut() = Some(cloud.clone());
+        // Prune idle sessions belonging to superseded accounts/guests so we don't accumulate them.
+        self.0
+            .clouds
+            .borrow_mut()
+            .retain(|&k, c| k == uid || c.live_opens.get() > 0);
+        self.0.clouds.borrow_mut().insert(uid, cloud.clone());
+        self.0.latest_uid.set(Some(uid));
         Ok(cloud)
     }
 }
@@ -435,15 +472,58 @@ fn split_cloud_parent(path: &str) -> Option<(String, String)> {
     }
 }
 
+thread_local! {
+    static LAST_PAGE_ERROR_DETAIL: RefCell<Option<(Errno, String)>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn clear_last_page_error() {
+    LAST_PAGE_ERROR_DETAIL.with(|slot| *slot.borrow_mut() = None);
+}
+
+pub(crate) fn record_last_page_error(errno: Errno, detail: Option<&str>) {
+    if let Some(d) = detail
+        && !d.is_empty()
+        && d != errno.text()
+    {
+        LAST_PAGE_ERROR_DETAIL.with(|slot| {
+            *slot.borrow_mut() = Some((errno, d.to_string()));
+        });
+    }
+}
+
+pub(crate) fn take_last_page_error_detail(errno: Errno) -> Option<String> {
+    LAST_PAGE_ERROR_DETAIL.with(|slot| {
+        let matches = slot.borrow().as_ref().is_some_and(|(e, _)| *e == errno);
+        if matches {
+            slot.borrow_mut().take().map(|(_, d)| d)
+        } else {
+            None
+        }
+    })
+}
+
 fn parse_page_reply(reply_str: &str) -> vfs::Result<Value> {
     let reply: Value = serde_json::from_str(reply_str).map_err(|_| Errno::EIO)?;
     let status = reply["status"].as_u64().unwrap_or(0);
     let text = reply["text"].as_str().unwrap_or("");
     if status != 200 {
-        if let Ok(err_val) = serde_json::from_str::<Value>(text)
-            && let Some(code) = err_val["errno"].as_str()
-            && let Ok(parsed) = serde_json::from_value::<Errno>(Value::String(code.to_string()))
-        {
+        if let Ok(err_val) = serde_json::from_str::<Value>(text) {
+            let parsed = err_val["errno"]
+                .as_str()
+                .and_then(|code| {
+                    serde_json::from_value::<Errno>(Value::String(code.to_string())).ok()
+                })
+                .unwrap_or(match status {
+                    401 | 403 => Errno::EACCES,
+                    404 => Errno::ENOENT,
+                    409 => Errno::ESTALE,
+                    413 => Errno::EFBIG,
+                    _ => Errno::EIO,
+                });
+            let detail = err_val["detail"]
+                .as_str()
+                .or_else(|| err_val["error"].as_str());
+            record_last_page_error(parsed, detail);
             return Err(parsed);
         }
         return Err(match status {
@@ -540,7 +620,10 @@ pub(crate) async fn page_target_call(
     )
     .await?;
     let ret = results.pop().ok_or(Errno::EIO)?;
-    ret.into_result().map_err(|e| e.errno)
+    ret.into_result().map_err(|e| {
+        record_last_page_error(e.errno, e.detail.as_deref());
+        e.errno
+    })
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -567,7 +650,10 @@ impl AuthorityPageFd {
         .pop()
         .ok_or(Errno::EIO)?
         .into_result()
-        .map_err(|e| e.errno)
+        .map_err(|e| {
+            record_last_page_error(e.errno, e.detail.as_deref());
+            e.errno
+        })
     }
 
     pub(crate) async fn close(&self, sudo: bool) -> vfs::Result<Value> {
@@ -612,6 +698,11 @@ enum OpenRecord {
     Remote {
         cloud: Rc<Cloud>,
         real: OpenRef,
+    },
+    RemoteExec {
+        cloud: Rc<Cloud>,
+        real: OpenRef,
+        token: String,
     },
     Page {
         read_fd: Option<AuthorityPageFd>,
@@ -685,6 +776,8 @@ pub(crate) struct RootCloudDriver {
     opens: RefCell<HashMap<u64, OpenRecord>>,
     page_locks: RefCell<HashMap<u64, Rc<PageLock>>>,
     writing_by_ino: RefCell<HashMap<u64, abi::Writing>>,
+    uid_names: RefCell<HashMap<u32, String>>,
+    gid_names: RefCell<HashMap<u32, String>>,
 }
 
 impl RootCloudDriver {
@@ -784,11 +877,61 @@ impl RootCloudDriver {
             opens: RefCell::new(HashMap::new()),
             page_locks: RefCell::new(HashMap::new()),
             writing_by_ino: RefCell::new(HashMap::new()),
+            uid_names: RefCell::new(HashMap::new()),
+            gid_names: RefCell::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn cached_uid_name(&self, uid: u32) -> Option<String> {
+        self.uid_names.borrow().get(&uid).cloned()
+    }
+
+    pub(crate) fn cached_gid_name(&self, gid: u32) -> Option<String> {
+        self.gid_names.borrow().get(&gid).cloned()
+    }
+
+    pub(crate) fn clear_cached_account_names(&self) {
+        self.uid_names.borrow_mut().clear();
+        self.gid_names.borrow_mut().clear();
+    }
+
+    /// Resolve a remote cloud directory (such as `/dev/present` or `/dev/snd`) directly via
+    /// `Lstat` for bind-mounting into `/dev` on explicit `attach_remote_device`.
+    pub(crate) async fn lookup_remote_dir_handle(&self, path: &str) -> vfs::Result<Entry> {
+        if !self.is_remote_mode() || installed("pageSysPost").is_err() {
+            return Err(Errno::ENOTCONN);
+        }
+        let val = self
+            .page_sys_one(
+                Call::Lstat {
+                    path: path.to_string(),
+                },
+                None,
+                false,
+            )
+            .await?;
+        let st: Stat = serde_json::from_value(val).map_err(|_| Errno::EIO)?;
+        let entry = self.record_path_stat(path, &st);
+        if !entry.metadata.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        Ok(entry)
     }
 
     pub(crate) fn writing_of(&self, ino: u64) -> Option<abi::Writing> {
         self.writing_by_ino.borrow().get(&ino).cloned()
+    }
+
+    /// Clear cached upload/recording progress tags and invalidate the uploaded path after a
+    /// delegated server upload closes or discards so subsequent listings show the final size.
+    pub(crate) fn invalidate_uploaded_path(&self, path: Option<&str>) {
+        self.writing_by_ino.borrow_mut().clear();
+        if let Some(p) = path {
+            self.invalidate_page_path(p, false);
+        } else {
+            self.bump_page_mutation();
+            self.path_entries.borrow_mut().clear();
+        }
     }
 
     /// Parse and clear the internal `os.writing:<received>:<0|1>` wire tag from `Metadata.rdev`
@@ -1004,6 +1147,12 @@ impl RootCloudDriver {
             },
             metadata: stat_to_metadata(st),
         };
+        if !st.user.is_empty() && st.user != st.uid.to_string() {
+            self.uid_names.borrow_mut().insert(st.uid, st.user.clone());
+        }
+        if !st.group.is_empty() && st.group != st.gid.to_string() {
+            self.gid_names.borrow_mut().insert(st.gid, st.group.clone());
+        }
         if let Some(writing) = &st.writing {
             self.writing_by_ino
                 .borrow_mut()
@@ -1241,10 +1390,21 @@ impl RootCloudDriver {
         let mut rcred = cred.clone();
         rcred.token = Some(token.clone());
         let actor = self.actor_for_cred(&rcred);
+        let session_uid = if let Some(pid) = self.active_pid.get() {
+            self.state
+                .borrow()
+                .table
+                .proc(pid)
+                .and_then(|p| p.cred.remote.as_ref().map(|r| r.uid))
+                .unwrap_or(rcred.identity.id)
+        } else {
+            rcred.identity.id
+        };
         let cloud = self
             .acted(
                 actor.clone(),
-                self.connector.get(&self.state, &self.current, &token),
+                self.connector
+                    .get(&self.state, &self.current, session_uid, &token),
             )
             .await?;
         self.cloud_handles
@@ -1392,7 +1552,29 @@ impl RootCloudDriver {
             return Ok(());
         }
 
-        let token = cred.token.as_deref().ok_or(Errno::EACCES)?;
+        let token = if let Some(tok) = cred.token.as_deref().filter(|t| !t.is_empty()) {
+            tok.to_string()
+        } else {
+            let existing = self.state.borrow().table.proc(pid).and_then(|p| {
+                (p.state != ProcState::Zombie && p.cred.cloud_access)
+                    .then(|| {
+                        p.cred
+                            .remote
+                            .as_ref()
+                            .filter(|r| r.cloud_access)
+                            .map(|r| r.token.clone())
+                    })
+                    .flatten()
+            });
+            if let Some(tok) = existing {
+                tok
+            } else {
+                crate::lazy_mint_remote_cred(&self.state, pid)
+                    .await
+                    .map_err(|e| e.errno)?
+                    .token
+            }
+        };
         let (cloud, src_real, dst_real) = {
             let opens = self.opens.borrow();
             let (c1, s) = match opens.get(&src_open.id) {
@@ -3267,7 +3449,95 @@ impl Filesystem for RootCloudDriver {
                         Some(fd),
                         (!access.writes()).then(|| self.record_path_stat(&path, &st).metadata),
                     ),
-                    Err(Errno::EACCES) if access == Access::Exec => (None, None),
+                    Err(Errno::EACCES) if access == Access::Exec => {
+                        // F3-16: Execute-only (`0111`/`0100`) cloud WASM cannot be opened O_RDONLY
+                        // on the page path; open via `/api/fs` v2 `Access::Exec` with a short-lived
+                        // ServiceAuth v2 credential (revoked immediately on `release`).
+                        if installed("cloudFsPost").is_ok() && installed("serviceAuthPost").is_ok()
+                        {
+                            let (instance_id, host_proof) =
+                                crate::ensure_remote_attached_state(&self.state)
+                                    .await
+                                    .map_err(|e| e.errno)?;
+                            let resp = crate::service_auth_request(
+                                &abi::auth_v2::Request::MintServiceCred(
+                                    abi::auth_v2::MintServiceCred {
+                                        instance_id,
+                                        host_proof,
+                                        scope: abi::auth_v2::RemoteScope::cloud_only(),
+                                        cloud_access: true,
+                                        umask: cred.umask,
+                                        cgroup: Some("/user".into()),
+                                        generation: None,
+                                        sudo,
+                                        rbps: None,
+                                        wbps: None,
+                                    },
+                                ),
+                            )
+                            .await
+                            .map_err(|e| e.errno)?;
+                            let issued = match resp {
+                                abi::auth_v2::Response::Cred(c) => c,
+                                _ => return Err(Errno::EIO),
+                            };
+                            let tok = issued.token.clone();
+                            let exec_cred = Cred {
+                                identity: Identity {
+                                    id: issued.uid,
+                                    group: issued.gid,
+                                    groups: issued.groups.into_iter().collect(),
+                                },
+                                umask: issued.umask,
+                                token: Some(tok.clone()),
+                            };
+                            let open_res = async {
+                                let cloud = self
+                                    .acted(
+                                        Actor::Ephemeral(tok.clone()),
+                                        self.connector.get(
+                                            &self.state,
+                                            &self.current,
+                                            issued.uid,
+                                            &tok,
+                                        ),
+                                    )
+                                    .await?;
+                                self.cloud_handles
+                                    .borrow_mut()
+                                    .insert(cloud.fs.root().node, cloud.fs.root());
+                                let real_open = self
+                                    .acted(Actor::Ephemeral(tok.clone()), async {
+                                        let real = self
+                                            .ensure_cloud_handle(&cloud, &exec_cred, handle)
+                                            .await?;
+                                        cloud.fs.open(&exec_cred, &real, options).await
+                                    })
+                                    .await?;
+                                Ok::<_, Errno>((cloud, real_open))
+                            }
+                            .await;
+                            match open_res {
+                                Ok((cloud, real_open)) => {
+                                    cloud.live_opens.set(cloud.live_opens.get() + 1);
+                                    return Ok(self.alloc_open(
+                                        handle.node,
+                                        real_open.access,
+                                        OpenRecord::RemoteExec {
+                                            cloud,
+                                            real: real_open,
+                                            token: tok,
+                                        },
+                                    ));
+                                }
+                                Err(err) => {
+                                    crate::revoke_remote_tokens_state(&self.state, vec![tok]).await;
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        (None, None)
+                    }
                     Err(e) => return Err(e),
                 }
             } else {
@@ -3297,6 +3567,7 @@ impl Filesystem for RootCloudDriver {
             enum MetaDispatch {
                 Mem(OpenRef),
                 Remote(Rc<Cloud>, OpenRef),
+                RemoteExec(Rc<Cloud>, OpenRef, String),
                 Page(Option<String>, NodeId, bool),
             }
             let disp = {
@@ -3305,6 +3576,9 @@ impl Filesystem for RootCloudDriver {
                     Some(OpenRecord::Mem(m)) => MetaDispatch::Mem(m.clone()),
                     Some(OpenRecord::Remote { cloud, real }) => {
                         MetaDispatch::Remote(Rc::clone(cloud), real.clone())
+                    }
+                    Some(OpenRecord::RemoteExec { cloud, real, token }) => {
+                        MetaDispatch::RemoteExec(Rc::clone(cloud), real.clone(), token.clone())
                     }
                     Some(OpenRecord::Page {
                         read_meta: Some(meta),
@@ -3325,6 +3599,13 @@ impl Filesystem for RootCloudDriver {
                 MetaDispatch::Remote(cloud, real) => {
                     let actor = self.active_pid.get().map_or(Actor::None, Actor::Process);
                     let mut meta = self.acted(actor, cloud.fs.open_metadata(&real)).await?;
+                    self.strip_and_record_writing(open.node.ino, &mut meta);
+                    Ok(meta)
+                }
+                MetaDispatch::RemoteExec(cloud, real, token) => {
+                    let mut meta = self
+                        .acted(Actor::Ephemeral(token), cloud.fs.open_metadata(&real))
+                        .await?;
                     self.strip_and_record_writing(open.node.ino, &mut meta);
                     Ok(meta)
                 }
@@ -3373,6 +3654,7 @@ impl Filesystem for RootCloudDriver {
             enum Dispatch {
                 Mem(OpenRef),
                 Remote(Rc<Cloud>, OpenRef),
+                RemoteExec(Rc<Cloud>, OpenRef, String),
                 Page(Option<AuthorityPageFd>, Access, bool),
             }
             let disp = {
@@ -3381,6 +3663,9 @@ impl Filesystem for RootCloudDriver {
                     Some(OpenRecord::Mem(m)) => Dispatch::Mem(m.clone()),
                     Some(OpenRecord::Remote { cloud, real }) => {
                         Dispatch::Remote(Rc::clone(cloud), real.clone())
+                    }
+                    Some(OpenRecord::RemoteExec { cloud, real, token }) => {
+                        Dispatch::RemoteExec(Rc::clone(cloud), real.clone(), token.clone())
                     }
 
                     Some(OpenRecord::Page {
@@ -3398,6 +3683,13 @@ impl Filesystem for RootCloudDriver {
                     let actor = self.active_pid.get().map_or(Actor::None, Actor::Process);
                     self.acted(actor, cloud.fs.read_at(&real, buf, offset))
                         .await
+                }
+                Dispatch::RemoteExec(cloud, real, token) => {
+                    self.acted(
+                        Actor::Ephemeral(token),
+                        cloud.fs.read_at(&real, buf, offset),
+                    )
+                    .await
                 }
                 Dispatch::Page(Some(fd), _, sudo) => read_page_fd(&fd, offset, buf, sudo).await,
                 Dispatch::Page(None, Access::Exec, _) if offset == 0 && buf.len() >= 8 => {
@@ -3440,7 +3732,9 @@ impl Filesystem for RootCloudDriver {
                         sudo,
                         ..
                     }) => Dispatch::Page(path.clone(), *node, *access, *sudo),
-                    Some(OpenRecord::PathOnly { .. }) | None => return Err(Errno::EBADF),
+                    Some(OpenRecord::PathOnly { .. })
+                    | Some(OpenRecord::RemoteExec { .. })
+                    | None => return Err(Errno::EBADF),
                 }
             };
             match disp {
@@ -3493,7 +3787,9 @@ impl Filesystem for RootCloudDriver {
                         sudo,
                         ..
                     }) => Dispatch::Page(path.clone(), *node, *access, *sudo),
-                    Some(OpenRecord::PathOnly { .. }) | None => return Err(Errno::EBADF),
+                    Some(OpenRecord::PathOnly { .. })
+                    | Some(OpenRecord::RemoteExec { .. })
+                    | None => return Err(Errno::EBADF),
                 }
             };
             match disp {
@@ -3546,7 +3842,9 @@ impl Filesystem for RootCloudDriver {
                         SyncDispatch::Remote(Rc::clone(cloud), real.clone())
                     }
                     Some(OpenRecord::Page { .. }) => SyncDispatch::Page,
-                    Some(OpenRecord::PathOnly { .. }) | None => return Err(Errno::EBADF),
+                    Some(OpenRecord::PathOnly { .. })
+                    | Some(OpenRecord::RemoteExec { .. })
+                    | None => return Err(Errno::EBADF),
                 }
             };
             match disp {
@@ -3578,7 +3876,9 @@ impl Filesystem for RootCloudDriver {
                         SyncDispatch::Remote(Rc::clone(cloud), real.clone())
                     }
                     Some(OpenRecord::Page { .. }) => SyncDispatch::Page,
-                    Some(OpenRecord::PathOnly { .. }) | None => return Err(Errno::EBADF),
+                    Some(OpenRecord::PathOnly { .. })
+                    | Some(OpenRecord::RemoteExec { .. })
+                    | None => return Err(Errno::EBADF),
                 }
             };
             match disp {
@@ -3753,6 +4053,16 @@ impl Filesystem for RootCloudDriver {
                     let actor = self.active_pid.get().map_or(Actor::None, Actor::Process);
                     self.acted(actor, cloud.fs.release(&real)).await
                 }
+                Some(OpenRecord::RemoteExec { cloud, real, token }) => {
+                    cloud
+                        .live_opens
+                        .set(cloud.live_opens.get().saturating_sub(1));
+                    let res = self
+                        .acted(Actor::Ephemeral(token.clone()), cloud.fs.release(&real))
+                        .await;
+                    crate::revoke_remote_tokens_state(&self.state, vec![token]).await;
+                    res
+                }
                 Some(OpenRecord::Page {
                     read_fd: Some(fd),
                     sudo,
@@ -3865,14 +4175,17 @@ impl Kernel {
     /// Close `pid`'s VFS descriptors and drain deferred `CloudFs` releases upon process exit.
     pub(crate) async fn cloud_exited(&self, pid: u32, token: Option<String>) {
         self.vfs_process_exit_cleanup(pid, token.clone()).await;
-        let Some(cloud) = self.cloud.current() else {
+        let clouds = self.cloud.all();
+        if clouds.is_empty() {
             return;
-        };
+        }
         Acted {
             current: self.current.clone(),
             actor: Actor::Exiting(pid, token),
             future: async {
-                let _ = cloud.fs.drain().await;
+                for cloud in clouds {
+                    let _ = cloud.fs.drain().await;
+                }
             },
         }
         .await;
@@ -3881,46 +4194,52 @@ impl Kernel {
 
 #[wasm_bindgen]
 impl Kernel {
-    /// Renew the `ServiceAuth v2` instance lease and `CloudFs` session lease (called periodically
+    /// Renew the `ServiceAuth v2` instance lease and `CloudFs` session leases (called periodically
     /// by `web/kernel/client.js`). Completely silent (ZERO network calls) when `!remote_attached`
     /// and no `CloudFs` session is open.
     pub async fn cloud_renew(&self) -> JsResult<()> {
         if self.state.borrow().remote_attached {
             let _ = self.renew_instance().await;
         }
-        let Some(cloud) = self.cloud.current() else {
+        let clouds = self.cloud.all();
+        if clouds.is_empty() {
             return Ok(());
-        };
+        }
         let tokens: Vec<String> = self.state.borrow().table.active_remote_tokens();
         Acted {
             current: self.current.clone(),
             actor: Actor::None,
             future: async {
-                let mut result = Err(Errno::EACCES);
-                for token in tokens {
-                    let cred = Cred {
-                        identity: Identity::guest(),
-                        umask: 0,
-                        token: Some(token),
-                    };
-                    result = cloud.fs.renew(&cred).await;
-                    if result.is_ok() || matches!(result, Err(Errno::ENOTCONN)) {
-                        break;
+                let mut final_res: vfs::Result<()> = Ok(());
+                for cloud in clouds {
+                    let mut result = Err(Errno::EACCES);
+                    for token in &tokens {
+                        let cred = Cred {
+                            identity: Identity::guest(),
+                            umask: 0,
+                            token: Some(token.clone()),
+                        };
+                        result = cloud.fs.renew(&cred).await;
+                        if result.is_ok() || matches!(result, Err(Errno::ENOTCONN)) {
+                            break;
+                        }
+                    }
+                    if let Err(err) = result {
+                        if err == Errno::ENOTCONN {
+                            self.cloud.drop_if_same(&cloud);
+                        } else if cloud.live_opens.get() == 0
+                            && cloud.fs.pending_cancellations() == 0
+                        {
+                            self.cloud.drop_if_same(&cloud);
+                            continue;
+                        }
+                        final_res = Err(err);
                     }
                 }
                 if let Some(vfs) = self.vfs_instance() {
                     crate::vfs_engine::drain_releases(&vfs);
                 }
-                if let Err(err) = result {
-                    if err == Errno::ENOTCONN {
-                        self.cloud.drop_if_same(&cloud);
-                    }
-                    if cloud.live_opens.get() == 0 && cloud.fs.pending_cancellations() == 0 {
-                        self.cloud.drop_if_same(&cloud);
-                        return Ok(());
-                    }
-                }
-                result.map_err(errno)
+                final_res.map_err(errno)
             },
         }
         .await

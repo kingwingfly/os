@@ -15,6 +15,10 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use worker::*;
 
+/// Hard absolute maximum lifetime for any browser `ServiceAuth v2` credential lineage (24h).
+/// Repeated renewals or derivations can NEVER extend a credential past `started + MAX_CREDENTIAL_LIFETIME`.
+pub const MAX_CREDENTIAL_LIFETIME: u64 = 24 * 3600;
+
 /// A remote service credential (or remote container job credential).
 #[derive(Clone, Debug, Deserialize)]
 pub struct Credential {
@@ -27,6 +31,8 @@ pub struct Credential {
     pub gid: u32,
     pub groups: String,
     pub umask: u16,
+    #[serde(default)]
+    pub started: u64,
     pub generation: Option<String>,
     pub cloud_access: u8,
     /// JSON metadata holding `instance_id`, `cgroup`, and `scope` (`RemoteScope`) without
@@ -42,7 +48,7 @@ pub(crate) const OWNER: &str = "COALESCE(owner, ns || ' ' || pid || ' ' || subst
 
 pub(crate) fn columns() -> String {
     format!(
-        "token, ns, pid, uid, gid, groups, umask, generation, cloud_access, placement, {OWNER} AS owner"
+        "token, ns, pid, uid, gid, groups, umask, started, generation, cloud_access, placement, {OWNER} AS owner"
     )
 }
 
@@ -128,6 +134,41 @@ impl Credential {
         } else {
             Ok(())
         }
+    }
+
+    /// Enforce `RemoteScope.containers` for server-hosted container jobs (`Call::Kill { Job }`,
+    /// `Call::Wait { Job }`, and accelerator job submission/control ioctls).
+    pub fn check_containers(&self) -> std::result::Result<(), Error> {
+        if let Some(scope) = self.scope() {
+            if !scope.containers {
+                return Err(Error::because(
+                    Errno::EACCES,
+                    "remote container job access is not granted to this service credential",
+                ));
+            }
+            return Ok(());
+        }
+        self.cloud()
+    }
+
+    /// Enforce `RemoteScope.relay` for shared-mount relay operations.
+    #[allow(dead_code)]
+    pub fn check_relay(&self) -> std::result::Result<(), Error> {
+        if let Some(scope) = self.scope() {
+            if !scope.relay {
+                return Err(Error::because(
+                    Errno::EACCES,
+                    "shared-mount relay access is not granted to this service credential",
+                ));
+            }
+            return Ok(());
+        }
+        self.cloud()
+    }
+
+    /// Absolute hard expiration ceiling for this credential lineage (`started + 24h`).
+    pub fn max_expires(&self) -> Option<u64> {
+        (self.started > 0).then(|| self.started.saturating_add(MAX_CREDENTIAL_LIFETIME))
     }
 
     pub fn identity(&self) -> Identity {
@@ -285,8 +326,12 @@ impl Db {
             .into_iter()
             .next()?;
         // Fail closed immediately if a non-guest, non-job account (or the controlling account
-        // that minted a sudo-elevated credential) was locked or deleted.
+        // that minted a sudo-elevated credential) was locked/deleted, or if the lineage exceeded
+        // its absolute hard lifetime cap (`started + MAX_CREDENTIAL_LIFETIME`).
         if cred.ns != JOBS {
+            if cred.max_expires().is_some_and(|cap| auth::now() >= cap) {
+                return None;
+            }
             if !os_core::permissions::is_guest_id(cred.uid) {
                 let (_, user) = self.user_by_id(cred.uid)?;
                 if user.locked {
@@ -479,12 +524,28 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
                         false,
                     );
                 }
+                let origin_started = if parent.started > 0 {
+                    parent.started
+                } else {
+                    now
+                };
+                let max_exp = origin_started.saturating_add(MAX_CREDENTIAL_LIFETIME);
+                if now >= max_exp {
+                    db.revoke(&asked.ns, &asked.parent_hash);
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "service credential exceeded maximum lifetime",
+                        )),
+                        true,
+                    );
+                }
                 let parent_scope = parent.scope().unwrap_or_else(RemoteScope::full);
                 let new_scope = parent_scope.attenuate(&asked.scope);
                 let new_cloud =
                     (parent.cloud_access != 0) && asked.cloud_access && new_scope.cloud_fs;
                 let umask = asked.umask.unwrap_or(parent.umask) & 0o777;
-                let expires = now.saturating_add(abi::PROCESS_TOKEN_TTL);
+                let expires = now.saturating_add(abi::PROCESS_TOKEN_TTL).min(max_exp);
                 let lineage = parent.owner();
                 let placement = json!({
                     "instance_id": asked.instance_id,
@@ -500,7 +561,7 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
                         int(parent.gid),
                         text(&parent.groups),
                         int(umask),
-                        int(now),
+                        int(origin_started),
                         text(&lineage),
                         int(expires),
                         text(&placement.to_string()),
@@ -545,7 +606,13 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
                 let mut revoked = Vec::new();
                 for hash in &asked.hashes {
                     if let Some(cred) = db.credential_of(hash, &asked.ns) {
-                        let deadline = now.saturating_add(abi::PROCESS_TOKEN_TTL);
+                        let max_exp = cred.max_expires().unwrap_or(u64::MAX);
+                        if now >= max_exp {
+                            db.revoke(&asked.ns, hash);
+                            revoked.push(hash.clone());
+                            continue;
+                        }
+                        let deadline = now.saturating_add(abi::PROCESS_TOKEN_TTL).min(max_exp);
                         db.run(
                             "UPDATE credentials SET expires = ? WHERE ns = ? AND token = ?",
                             vec![int(deadline), text(&asked.ns), text(hash)],
@@ -634,4 +701,79 @@ fn default_true() -> bool {
 
 fn default_umask() -> u16 {
     0o022
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cred_with_scope(scope: RemoteScope, cloud_access: u8, started: u64) -> Credential {
+        Credential {
+            token: "hash-1".into(),
+            ns: "guest.abc".into(),
+            pid: 0,
+            uid: 1000,
+            gid: 1000,
+            groups: "[1000]".into(),
+            umask: 0o022,
+            started,
+            generation: None,
+            cloud_access,
+            placement: json!({
+                "instance_id": "inst-1",
+                "cgroup": "/user",
+                "scope": scope,
+            })
+            .to_string(),
+            lineage: "inst:inst-1:hash".into(),
+        }
+    }
+
+    #[test]
+    fn remote_scope_enforces_containers_relay_devices_and_max_lifetime() {
+        let cloud_only = cred_with_scope(RemoteScope::cloud_only(), 1, 1000);
+        assert!(cloud_only.cloud().is_ok());
+        assert_eq!(
+            cloud_only.check_containers().unwrap_err().errno,
+            Errno::EACCES
+        );
+        assert_eq!(cloud_only.check_relay().unwrap_err().errno, Errno::EACCES);
+        assert_eq!(
+            cloud_only.check_device("archive").unwrap_err().errno,
+            Errno::EACCES
+        );
+        assert_eq!(
+            cloud_only.max_expires(),
+            Some(1000 + MAX_CREDENTIAL_LIFETIME)
+        );
+
+        let full = cred_with_scope(RemoteScope::full(), 1, 2000);
+        assert!(full.cloud().is_ok());
+        assert!(full.check_containers().is_ok());
+        assert!(full.check_relay().is_ok());
+        assert!(full.check_device("archive").is_ok());
+        assert!(full.check_device("present").is_ok());
+
+        let containers_only = cred_with_scope(
+            RemoteScope {
+                cloud_fs: false,
+                devices: vec!["archive".into()],
+                containers: true,
+                relay: false,
+            },
+            0,
+            3000,
+        );
+        assert_eq!(containers_only.cloud().unwrap_err().errno, Errno::EACCES);
+        assert!(containers_only.check_containers().is_ok());
+        assert!(containers_only.check_device("archive").is_ok());
+        assert_eq!(
+            containers_only.check_device("media").unwrap_err().errno,
+            Errno::EACCES
+        );
+        assert_eq!(
+            containers_only.check_relay().unwrap_err().errno,
+            Errno::EACCES
+        );
+    }
 }

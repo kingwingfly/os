@@ -157,16 +157,27 @@ async fn by_token(
     env: &Env,
     token: &str,
 ) -> Result<std::result::Result<Value, Response>> {
+    // F3-08: Never serve isolate-cached grants when a ServiceAuth v2 `X-Process-Token` is
+    // presented, so `usermod -L` / `passwd` / `userdel` / `RevokeTokens` / `DetachInstance`
+    // takes effect immediately on `/api/file?token=...`.
+    let has_proc_token = req
+        .headers()
+        .get("X-Process-Token")
+        .ok()
+        .flatten()
+        .is_some_and(|v| !v.is_empty());
     let (session, now) = (session(req), crate::auth::now());
-    let known = TOKENS.with(|tokens| {
-        tokens
-            .borrow()
-            .get(token)
-            .filter(|(of, at, _)| *of == session && now < at + abi::TOKEN_FRESH)
-            .map(|(_, _, grant)| grant.clone())
-    });
-    if let Some(grant) = known {
-        return Ok(Ok(grant));
+    if !has_proc_token {
+        let known = TOKENS.with(|tokens| {
+            tokens
+                .borrow()
+                .get(token)
+                .filter(|(of, at, _)| *of == session && now < at + abi::TOKEN_FRESH)
+                .map(|(_, _, grant)| grant.clone())
+        });
+        if let Some(grant) = known {
+            return Ok(Ok(grant));
+        }
     }
     let mut asked = authority(
         env,
@@ -182,9 +193,9 @@ async fn by_token(
     }
     let grant: Value = asked.json().await?;
     // An exec image's leave dies with its process descriptor. Caching it for TOKEN_FRESH would
-    // keep serving the image after exit/kill/wait closed the descriptor; only read tokens,
+    // keep serving the image after exit/kill/wait closed the descriptor; only page read tokens,
     // whose lifetime already includes that grace, are cached.
-    if grant["exec"].as_bool() != Some(true) {
+    if !has_proc_token && grant["exec"].as_bool() != Some(true) {
         TOKENS.with(|tokens| {
             let mut tokens = tokens.borrow_mut();
             if tokens.len() > 4096 {

@@ -43,6 +43,16 @@ async function api(url, options) {
 }
 // Who this session is (getcreds), and whether it may write in the directory `path` (access).
 let syncedAccount = null;
+let attachedRemoteDevices = false;
+async function attachRemoteDevices() {
+  if (attachedRemoteDevices) return;
+  attachedRemoteDevices = true;
+  await Promise.all(
+    ['archive', 'media', 'present', 'snd'].map(driver =>
+      kernelCall('attach_remote_device', { driver }).catch(() => {}),
+    ),
+  );
+}
 async function syncAccount(who) {
   if (!who || typeof who.uid !== 'number') return;
   if (!syncedAccount || syncedAccount.uid !== who.uid || syncedAccount.signed_in !== who.signed_in || syncedAccount.user !== who.user) {
@@ -50,6 +60,7 @@ async function syncAccount(who) {
     await kernelCall('sync_account', who).catch(() => {});
     await kernelCall('login_refresh', { fromServer: false }).catch(() => {});
   }
+  await attachRemoteDevices();
 }
 async function session(path = directory) {
   await bootstrapAccount;
@@ -827,6 +838,7 @@ async function cleanupViewer() {
   }
   return version;
 }
+let closingViewerVersion = 0;
 async function closeViewer() {
   // Release a game's audio while its iframe is still visible and active.
   // Waiting for the dialog's queued close event can be too late in Chromium.
@@ -834,7 +846,10 @@ async function closeViewer() {
     ? document.exitFullscreen().catch(error => console.warn('Failed to exit preview fullscreen', error)) : Promise.resolve();
   const version = await cleanupViewer();
   await exit;
-  if (version === viewerVersion) $('viewer').close();
+  if (version === viewerVersion) {
+    closingViewerVersion = version;
+    $('viewer').close();
+  }
 }
 $('viewer').addEventListener('cancel', event => { event.preventDefault(); void closeViewer(); });
 // Escape closes a modal dialog (a password asked), or else the window that has the keyboard (the
@@ -858,7 +873,8 @@ $('viewer').addEventListener('close', async () => {
   // and restore focus after the browser finishes its fullscreen transition.
   const exit = document.fullscreenElement && $('viewer-surface').contains(document.fullscreenElement)
     ? document.exitFullscreen() : Promise.resolve();
-  const closedVersion = await cleanupViewer();
+  const alreadyCleaned = closingViewerVersion === viewerVersion && !shown && !releasePreview;
+  const closedVersion = alreadyCleaned ? viewerVersion : await cleanupViewer();
   await exit.catch(error => console.warn('Failed to exit preview fullscreen', error));
   if (viewerVersion === closedVersion && !$('viewer').open && !$('auth').open) {
     (returnFocus?.isConnected ? returnFocus : $('command'))?.focus();
@@ -938,29 +954,33 @@ async function open(path, kind, followed = false, attending = false) {
   viewerTitle(path); $('download').href = fileUrl(path); $('download').download = path.split('/').pop();
   if (!dialog.open) { opener = document.activeElement; showWindow(dialog); placePlayer(); }
   content.textContent = 'Loading...';
-  try {
-    if (kind === 'game') {
-      const meta = await api(fileUrl(path), { method: 'HEAD' });
-      if (Number(meta.headers.get('Content-Length')) > 2_000_000) throw new Error('Text exceeds 2 MB; use the download button in the top right.');
-      const text = await (await api(fileUrl(path))).text();
-      if (version !== viewerVersion) return;
-      const manifest = JSON.parse(text);
-      if (manifest.engine !== 'bevy' || !Object.hasOwn(configuration.games, manifest.entry)) throw new Error('Game entry is not registered; add it to the site content configuration and rebuild');
-      content.replaceChildren(); dialog.classList.add('game-view');
-      const iframe = document.createElement('iframe'); iframe.src = configuration.games[manifest.entry]; iframe.title = manifest.title || manifest.entry; iframe.allow = 'autoplay; fullscreen'; content.append(iframe); iframe.focus();
-      return;
-    }
-    if (kind === 'slides') dialog.classList.add('slides-view');
-    // The preview mounts only while the viewer still shows this file.
-    content.dataset.version = String(version);
-    const release = await window.osPreview.show(content, path, kind, String(version));
-    if (version === viewerVersion) releasePreview = release; else return release();
-    // Back where it was left.
-    const saved = place(path);
-    if (saved?.scroll) requestAnimationFrame(() => { content.scrollTop = saved.scroll; });
-    const media = content.querySelector('video,audio');
-    if (media && saved?.time) media.addEventListener('loadedmetadata', () => { if (saved.time < media.duration - 1) media.currentTime = saved.time; }, { once: true });
-  } catch (error) { if (version === viewerVersion) { content.textContent = error.message; content.classList.add('viewer-error'); } }
+  // Load preview contents asynchronously once the viewer window is visible so closing the preview
+  // or typing the next command in the terminal is never blocked by an in-flight preview fetch.
+  void (async () => {
+    try {
+      if (kind === 'game') {
+        const meta = await api(fileUrl(path), { method: 'HEAD' });
+        if (Number(meta.headers.get('Content-Length')) > 2_000_000) throw new Error('Text exceeds 2 MB; use the download button in the top right.');
+        const text = await (await api(fileUrl(path))).text();
+        if (version !== viewerVersion) return;
+        const manifest = JSON.parse(text);
+        if (manifest.engine !== 'bevy' || !Object.hasOwn(configuration.games, manifest.entry)) throw new Error('Game entry is not registered; add it to the site content configuration and rebuild');
+        content.replaceChildren(); dialog.classList.add('game-view');
+        const iframe = document.createElement('iframe'); iframe.src = configuration.games[manifest.entry]; iframe.title = manifest.title || manifest.entry; iframe.allow = 'autoplay; fullscreen'; content.append(iframe); iframe.focus();
+        return;
+      }
+      if (kind === 'slides') dialog.classList.add('slides-view');
+      // The preview mounts only while the viewer still shows this file.
+      content.dataset.version = String(version);
+      const release = await window.osPreview.show(content, path, kind, String(version));
+      if (version === viewerVersion) releasePreview = release; else return release();
+      // Back where it was left.
+      const saved = place(path);
+      if (saved?.scroll) requestAnimationFrame(() => { content.scrollTop = saved.scroll; });
+      const media = content.querySelector('video,audio');
+      if (media && saved?.time) media.addEventListener('loadedmetadata', () => { if (saved.time < media.duration - 1) media.currentTime = saved.time; }, { once: true });
+    } catch (error) { if (version === viewerVersion) { content.textContent = error.message; content.classList.add('viewer-error'); } }
+  })();
 }
 // Leptos updates the DOM asynchronously. Observe committed output, then scroll
 // at the next layout frame instead of measuring the previous command's height.

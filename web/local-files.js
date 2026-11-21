@@ -25,6 +25,23 @@ const ACCOUNT_MUTATION_CALLS = new Set([
   'groupadd', 'groupdel', 'groupmod', 'gpasswd', 'login_session', 'machine_init',
 ]);
 
+const SERVER_ACCOUNT_MUTATION_CALLS = new Set([
+  'login', 'logout', 'sudo', 'passwd', 'register', 'useradd', 'userdel', 'usermod',
+  'groupadd', 'groupdel', 'groupmod', 'gpasswd',
+]);
+
+function isRemoteServerDevPath(raw) {
+  if (typeof raw !== 'string') return false;
+  const parts = [];
+  for (const seg of raw.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') parts.pop();
+    else parts.push(seg);
+  }
+  const norm = '/' + parts.join('/');
+  return norm.startsWith('/dev/present/') || norm.startsWith('/dev/snd/');
+}
+
 function callName(call) {
   return typeof call === 'string' ? call : (call && typeof call === 'object' ? Object.keys(call)[0] : '');
 }
@@ -86,11 +103,35 @@ export function installLocalFiles() {
     } catch { /* headless environment without Worker */ }
   }
 
+  let cookieBootstrap = null;
+  let sessionBootstrapped = false;
+  let lastSyncedKey = null;
+
+  async function serializedNetwork(request) {
+    if (!sessionBootstrapped) {
+      if (cookieBootstrap) {
+        await cookieBootstrap;
+        return network(request);
+      }
+      let release;
+      cookieBootstrap = new Promise(resolve => { release = resolve; });
+      try {
+        const res = await network(request);
+        sessionBootstrapped = true;
+        return res;
+      } finally {
+        cookieBootstrap = null;
+        release();
+      }
+    }
+    return network(request);
+  }
+
   globalThis.fetch = async (input, options) => {
     const request = new Request(input, options);
     const url = new URL(request.url);
     if (url.origin !== location.origin || !url.pathname.startsWith('/api/')) return network(request);
-    if (request.headers.get('X-Registry') === '1' || request.headers.has('X-Process-Token')) {
+    if (request.headers.has('X-Process-Token')) {
       return network(request);
     }
 
@@ -113,7 +154,7 @@ export function installLocalFiles() {
             if (typeof hfd === 'number' && hfd >= CLIENT_PAGE_FD_BASE) {
               return json({ results: [{ ok: null }] });
             }
-            return network(request);
+            return serializedNetwork(request);
           }
           if (hasFs && !hasAccountMut) {
             const results = await kernelCall('mount_vfs_sys', {
@@ -125,7 +166,43 @@ export function installLocalFiles() {
             return json({ results });
           }
         }
-        return network(request);
+        const response = await serializedNetwork(request);
+        if (response.ok && Array.isArray(body?.calls) && !body.proc && !body.pid) {
+          const hasServerAccountMut = body.calls.some(c => SERVER_ACCOUNT_MUTATION_CALLS.has(callName(c)));
+          const getcredsIndex = body.calls.findIndex(c => callName(c) === 'getcreds');
+          if (hasServerAccountMut) {
+            try {
+              const payload = await response.clone().json();
+              const anyOk = Array.isArray(payload?.results) && payload.results.some(r => r && 'ok' in r);
+              if (anyOk) {
+                lastSyncedKey = null;
+                await kernelCall('login_refresh').catch(() => {});
+              }
+            } catch { /* ignore non-JSON */ }
+          } else if (getcredsIndex >= 0) {
+            try {
+              const payload = await response.clone().json();
+              const who = payload?.results?.[getcredsIndex]?.ok;
+              if (who && typeof who.uid === 'number') {
+                const key = `${who.uid}:${who.user ?? ''}:${!!who.signed_in}`;
+                if (key !== lastSyncedKey) {
+                  lastSyncedKey = key;
+                  await kernelCall('sync_account', who).catch(() => {});
+                }
+              }
+            } catch { /* ignore non-JSON */ }
+          }
+        }
+        return response;
+      }
+
+      if ((url.pathname === '/api/login' || url.pathname === '/api/logout') && request.method === 'POST') {
+        const response = await serializedNetwork(request);
+        if (response.ok) {
+          lastSyncedKey = null;
+          await kernelCall('login_refresh').catch(() => {});
+        }
+        return response;
       }
 
       // 2. Client-fd chunked uploads (`PUT /api/pwrite?fd=...&index=...` when `fd >= CLIENT_PAGE_FD_BASE`)
@@ -145,12 +222,14 @@ export function installLocalFiles() {
         return json({ written });
       }
 
-      // 3. Path-addressed page `/api/file?path=...` reads (leaving `?compile=` and `?token=` on `network`)
+      // 3. Path-addressed page `/api/file?path=...` reads (leaving `?compile=`, `?token=`, and
+      // live server character devices `/dev/{present,snd}/*` on `network`)
       if (
         url.pathname === '/api/file' &&
         url.searchParams.has('path') &&
         !url.searchParams.has('compile') &&
-        !url.searchParams.has('token')
+        !url.searchParams.has('token') &&
+        !isRemoteServerDevPath(url.searchParams.get('path'))
       ) {
         if (!['GET', 'HEAD'].includes(request.method)) return json({ errno: 'EINVAL' }, 400);
         const path = url.searchParams.get('path');

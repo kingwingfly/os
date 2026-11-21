@@ -131,6 +131,12 @@ pub struct MintServiceCred {
     /// Whether the cloud session's active sudo timestamp elevates this credential to remote root.
     #[serde(default)]
     pub sudo: bool,
+    /// Optional initial server-side read bytes-per-second quota installed atomically at mint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rbps: Option<u64>,
+    /// Optional initial server-side write bytes-per-second quota installed atomically at mint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wbps: Option<u64>,
 }
 
 /// Derive a monotonically attenuated remote credential from an existing live parent token
@@ -150,6 +156,12 @@ pub struct DeriveServiceCred {
     pub cgroup: Option<String>,
     #[serde(default)]
     pub revoke_parent: bool,
+    /// Optional server-side read bytes-per-second quota installed atomically on derive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rbps: Option<u64>,
+    /// Optional server-side write bytes-per-second quota installed atomically on derive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wbps: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -120,7 +120,8 @@ pub async fn handle(req: &mut Request, state: &State) -> worker::Result<Reply> {
         ((), true)
     })?;
     api::run(state, move |db| {
-        let result = dispatch(db, &request, &ns, instance_id.as_deref());
+        let mut detail = None;
+        let result = dispatch(db, &request, &ns, instance_id.as_deref(), &mut detail);
         let conversion = matches!(
             (&request.call, &result),
             (
@@ -137,7 +138,10 @@ pub async fn handle(req: &mut Request, state: &State) -> worker::Result<Reply> {
                 Err(Errno::ENOSPC),
             )
         );
-        let mut reply = reply(result);
+        let mut reply = match result {
+            Ok(value) => Reply::ok(value),
+            Err(errno) => api::errno_reply(&abi::Error { errno, detail }),
+        };
         if conversion {
             reply.commit = true;
         }
@@ -594,14 +598,21 @@ fn file_type(node: &Node) -> FileType {
         FileType::File
     }
 }
-fn check_home(db: &Db, uid: u32, path: &str) -> Result<()> {
+fn check_home(db: &Db, uid: u32, path: &str, detail: &mut Option<String>) -> Result<()> {
     // An absent home belongs to its account (or root), even in a writable parent.
     if uid != 0 && db.home_of(path).is_some_and(|owner| owner != uid) {
+        *detail = Some(format!("{path} is another account's home"));
         return Err(Errno::EACCES);
     }
     Ok(())
 }
-fn new_name(db: &Db, c: &Caller, dir: &Handle, name: &str) -> Result<(Node, String)> {
+fn new_name(
+    db: &Db,
+    c: &Caller,
+    dir: &Handle,
+    name: &str,
+    detail: &mut Option<String>,
+) -> Result<(Node, String)> {
     check_component(name)?;
     let (parent, path) = c.dir(db, dir, EXEC)?;
     let path = join(&path, name);
@@ -612,7 +623,7 @@ fn new_name(db: &Db, c: &Caller, dir: &Handle, name: &str) -> Result<(Node, Stri
         return Err(Errno::EEXIST);
     }
     inode::may_create(&c.credential.identity(), &parent, false)?;
-    check_home(db, c.credential.uid, &path)?;
+    check_home(db, c.credential.uid, &path, detail)?;
     Ok((parent, path))
 }
 fn make(
@@ -620,9 +631,10 @@ fn make(
     c: &Caller,
     dir: &Handle,
     name: &str,
+    detail: &mut Option<String>,
     node: impl FnOnce(&Node) -> Node,
 ) -> Result<Node> {
-    let (parent, path) = new_name(db, c, dir, name)?;
+    let (parent, path) = new_name(db, c, dir, name, detail)?;
     db.set_node(&path, &node(&parent));
     db.persisted_node(&path).ok_or(Errno::EIO)
 }
@@ -631,6 +643,7 @@ fn dispatch(
     request: &wire::Request,
     ns: &str,
     instance_id: Option<&str>,
+    detail: &mut Option<String>,
 ) -> Result<Value> {
     if request.version != wire::VERSION {
         return Err(Errno::EPROTONOSUPPORT);
@@ -883,7 +896,7 @@ fn dispatch(
                         json!((c.entry(db, &db.inode(node.ino).ok_or(Errno::EIO)?), open)),
                     );
                 }
-                Err(Errno::ENOENT) => make(db, &c, dir, name, |p| {
+                Err(Errno::ENOENT) => make(db, &c, dir, name, detail, |p| {
                     permissions::created(&who, p, *mode, false, *umask)
                 })?,
                 Err(e) => return Err(e),
@@ -900,7 +913,7 @@ fn dispatch(
             mode,
             umask,
         } => {
-            let node = make(db, &c, dir, name, |p| {
+            let node = make(db, &c, dir, name, detail, |p| {
                 permissions::created(&who, p, *mode, true, *umask)
             })?;
             json!(c.entry(db, &node))
@@ -953,13 +966,18 @@ fn dispatch(
                 *mode,
                 rdev,
             )
-            .map_err(|error| error.errno)?;
+            .map_err(|error| {
+                *detail = error.detail;
+                error.errno
+            })?;
             let node = db.persisted_node(&path).ok_or(Errno::EIO)?;
             json!(c.entry(db, &node))
         }
         Symlink { dir, name, target } => {
             inode::check_link_target(target)?;
-            let node = make(db, &c, dir, name, |p| inode::new_symlink(&who, p, target))?;
+            let node = make(db, &c, dir, name, detail, |p| {
+                inode::new_symlink(&who, p, target)
+            })?;
             json!(c.entry(db, &node))
         }
         Link { target, dir, name } => {
@@ -984,7 +1002,7 @@ fn dispatch(
                 return Err(Errno::EBUSY);
             }
             inode::may_create(&who, &parent, false)?;
-            check_home(db, c.credential.uid, &path)?;
+            check_home(db, c.credential.uid, &path, detail)?;
             if node.links == 0 {
                 return Err(Errno::ENOENT);
             }
@@ -1002,7 +1020,10 @@ fn dispatch(
             if matches!(&request.call, Unlink { .. })
                 && let Some(done) = db.unlink_device(&who, &path)
             {
-                return done.map(|()| Value::Null).map_err(|error| error.errno);
+                return done.map(|()| Value::Null).map_err(|error| {
+                    *detail = error.detail;
+                    error.errno
+                });
             }
             let (parent, _) = c.dir(db, dir, 0)?;
             inode::may_delete(&who, &parent, &node)?;
@@ -1039,7 +1060,7 @@ fn dispatch(
             to,
             flags,
         } => {
-            rename(db, &c, from_dir, from, to_dir, to, *flags)?;
+            rename(db, &c, from_dir, from, to_dir, to, *flags, detail)?;
             Value::Null
         }
         Setattr { handle, attr } => {
@@ -1286,6 +1307,7 @@ fn rename(
     to_dir: &Handle,
     to: &str,
     flags: RenameFlags,
+    detail: &mut Option<String>,
 ) -> Result<()> {
     if flags.bits() & !RenameFlags::NOREPLACE.bits() != 0 {
         return Err(Errno::EINVAL);
@@ -1337,7 +1359,7 @@ fn rename(
         }
         None => {
             inode::may_create(&who, &dest_parent, false)?;
-            check_home(db, c.credential.uid, &new)?;
+            check_home(db, c.credential.uid, &new, detail)?;
         }
     }
     if source.directory && parent.ino != dest_parent.ino {

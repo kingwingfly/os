@@ -241,6 +241,11 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     Err(error) => return errno_reply(&error),
                 };
                 if crate::procfs::is(&path) {
+                    if let Some(cred) = &row
+                        && let Err(error) = cred.cloud()
+                    {
+                        return errno_reply(&error).keep();
+                    }
                     return match crate::procfs::read(db, sid.as_deref(), &who, &path) {
                         Ok(text) => Reply::ok(json!({ "generated": text })),
                         Err(error) => errno_reply(&error),

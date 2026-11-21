@@ -16,30 +16,24 @@ async function greeterCall(op, args) {
     if ('login_session' in op) return kernelCall('login_session_action', { action: op.login_session.action });
     if ('machine_init' in op) return kernelCall('machine_init_action', { action: op.machine_init.action });
   }
-  const value = await call(op, args);
-  if (op === 'login' || op === 'logout' || op === 'getcreds') {
-    if (op === 'logout') await kernelCall('sync_account', { uid: 65534, gid: 65534, groups: [65534], user: 'guest', group: 'guest', home: '/tmp', shell: '/usr/bin/dash', signed_in: false }).catch(() => {});
-    else if (value && typeof value.uid === 'number') await kernelCall('sync_account', value).catch(() => {});
-  }
-  return value;
+  return call(op, args);
 }
 
 window.osGreeter = {
   target: () => target,
   state: () => ({ session, boot }),
   identity: async () => {
+    // Keep `/login.html` completely lazy: inspect account credentials over HTTP without
+    // booting a client-kernel Worker, executor-host, or `/usr/bin/init.wasm` before sign-in.
     const who = await call('getcreds');
     const confirm = await call('getcreds');
     if (confirm.uid !== who.uid || confirm.signed_in !== who.signed_in) {
       throw new Error('The account changed while loading. Refresh to try again.');
     }
-    await kernelCall('sync_account', who).catch(() => {});
-    const nextSession = await kernelCall('login_session_action', { action: { op: 'inspect' } });
-    if (nextSession && nextSession.uid !== who.uid) throw new Error('The account changed while loading. Refresh to try again.');
-    const nextBoot = who.uid === 0 ? await kernelCall('machine_init_action', { action: { op: 'inspect' } }) : null;
     expected = { uid: who.uid, signed_in: who.signed_in };
-    session = nextSession; boot = nextBoot;
-    return { user: who.user, signed_in: who.signed_in, can_end: !!session && !session.shutdown?.complete, root: who.uid === 0 };
+    session = null;
+    boot = null;
+    return { user: who.user, signed_in: who.signed_in, can_end: false, root: who.uid === 0 };
   },
   lifecycle: async operation => {
     if (!['end', 'reboot'].includes(operation)) throw new TypeError('Unknown session operation.');

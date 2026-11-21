@@ -598,3 +598,83 @@ test('Gate 6: HostAdapter and ServiceAuth version mismatches return EPROTONOSUPP
     await kc(page, 'wait', { pid: alive.pid });
   }
 });
+
+test('F3-04/F3-05/F3-09: atomic mint io.max, shared-token min-across-holders, and fail-closed cgroup controls', async ({ page, context }) => {
+  await page.goto('/login');
+  await connectKernel(page);
+  await loginAs(context.request, 'root', rootPassword);
+  await kv(page, 'sync_account', { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root', home: '/root', shell: '/usr/bin/dash', signed_in: true });
+  const instanceId = await kv(page, 'instance_id');
+  const cg = `/user/strict-io-${randomUUID().slice(0, 8)}`;
+  const path = `/guest/strict-io-${randomUUID()}.bin`;
+  expect((await put(context.request, '/api/file?path=' + encodeURIComponent(path), { data: Buffer.alloc(4096, 0x42) })).ok()).toBe(true);
+
+  await kv(page, 'cgroup_create', { path: cg });
+  await kv(page, 'cgroup_set', { path: cg, key: 'io.max', value: 'rbps=100' });
+
+  // Fail-closed cgroup controls: root kill -> EINVAL; unenforced cpu.max/cpu.weight/freeze -> EOPNOTSUPP.
+  expect((await kc(page, 'cgroup_set', { path: '/', key: 'cgroup.kill', value: '1' })).err?.errno).toBe('EINVAL');
+  expect((await kc(page, 'cgroup_set', { path: cg, key: 'cpu.max', value: '5000 100000' })).err?.errno).toBe('EOPNOTSUPP');
+  expect((await kc(page, 'cgroup_set', { path: cg, key: 'cpu.weight', value: '200' })).err?.errno).toBe('EOPNOTSUPP');
+  expect((await kc(page, 'cgroup_set', { path: cg, key: 'cgroup.freeze', value: '1' })).err?.errno).toBe('EOPNOTSUPP');
+
+  // Atomic mint inside throttled cgroup enforces rbps=100 from byte zero (no post-mint unthrottled window).
+  const parent = await kv(page, 'exec', { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [], cgroup: cg, remote: true });
+  let child = null;
+  let session = null;
+  try {
+    const conn = await fsRpc(context.request, parent.token, null, 'connect', instanceId);
+    expect(conn.ok, JSON.stringify(conn)).toBe(true);
+    session = conn.body.session;
+    const walked = await fsRpc(context.request, parent.token, session, { walk: { dir: conn.body.root, names: ['guest', path.split('/').pop()] } }, instanceId);
+    expect(walked.ok, JSON.stringify(walked)).toBe(true);
+    const opened = await fsRpc(context.request, parent.token, session, {
+      open: {
+        ticket: `strict-io-open-${randomUUID()}`,
+        handle: walked.body.entries[1].handle,
+        options: { read: true, write: false, append: false, append_implies_write: false, truncate: false, create: false, create_new: false, exec: false, path: false },
+      },
+    }, instanceId);
+    expect(opened.ok, JSON.stringify(opened)).toBe(true);
+
+    const doRead4k = () => context.request.post(origin + '/api/fs/data', {
+      headers: {
+        Origin: origin,
+        'X-OS-Instance': instanceId,
+        'X-OS-Filesystem': JSON.stringify({
+          version: 2,
+          credential: parent.token,
+          pid: parent.pid,
+          session,
+          open: opened.body,
+          operation: { read: { offset: 0, length: 4096 } },
+        }),
+      },
+    });
+
+    // Immediate first read after atomic mint must already be refused with EAGAIN (429).
+    const first = await doRead4k();
+    expect(first.ok()).toBe(false);
+    const firstBody = await first.json().catch(() => ({}));
+    expect(firstBody.errno === 'EAGAIN' || first.status() === 429, JSON.stringify(firstBody)).toBe(true);
+
+    // Fork a child sharing parent.token and move ONLY the child to unthrottled `/user`:
+    // min-across-holders must keep rbps=100 active while parent stays in `cg`.
+    child = await kv(page, 'fork', { pid: parent.pid });
+    await kv(page, 'cgroup_attach', { pid: child.pid, path: '/user' });
+    const afterChildEscape = await doRead4k();
+    expect(afterChildEscape.ok()).toBe(false);
+    const afterBody = await afterChildEscape.json().catch(() => ({}));
+    expect(afterBody.errno === 'EAGAIN' || afterChildEscape.status() === 429, JSON.stringify(afterBody)).toBe(true);
+  } finally {
+    if (session) await fsRpc(context.request, parent.token, session, 'disconnect', instanceId).catch(() => {});
+    if (child) {
+      await kc(page, 'exit', { pid: child.pid, status: 0 });
+      await kc(page, 'waitchild', { ppid: parent.pid, pid: child.pid });
+    }
+    await kc(page, 'exit', { pid: parent.pid, status: 0 });
+    await kc(page, 'wait', { pid: parent.pid });
+    await kc(page, 'cgroup_remove', { path: cg });
+    await rmrf(context.request, path);
+  }
+});

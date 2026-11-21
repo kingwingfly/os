@@ -182,8 +182,8 @@ test('a rejected sudo launch does not block local exit, wait, or remote token re
     expect(denied.err).toBeTruthy();
 
     value(await kernel(page, 'exit', { pid: proc.pid, status: 3 }));
-    const waited = value(await kernel(page, 'wait', { pid: proc.pid }));
-    expect(waited).toMatchObject({ pid: proc.pid, status: 3 << 8 });
+    // F3-02: A signed-out guest cannot reap root's PID 1 child; root still can.
+    expect((await kernel(page, 'wait', { pid: proc.pid })).err?.errno).toBe('EPERM');
 
     // Exiting the last local holder revoked its remote token even after logout.
     const revokedFs = await (await context.request.post(origin + '/api/fs', {
@@ -191,6 +191,11 @@ test('a rejected sudo launch does not block local exit, wait, or remote token re
       data: { version: 2, credential: proc.token, session: null, call: 'connect' },
     })).json();
     expect(['EACCES', 'EPERM']).toContain(revokedFs.errno);
+
+    // Restoring root allows reaping the exited root child cleanly.
+    value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+    const waited = value(await kernel(page, 'wait', { pid: proc.pid }));
+    expect(waited).toMatchObject({ pid: proc.pid, status: 3 << 8 });
   } finally {
     await login(context.request);
   }
@@ -501,5 +506,122 @@ test('exec replacement rotates remote token while preserving lineage open-refs a
     await login(context.request);
     await rmrf(context.request, output);
     await rmrf(context.request, path);
+  }
+});
+
+test('F3-01: set_proc_cred and mint_remote_cred block privilege escalation and preserve non-root local UID', async ({ page, context }) => {
+  await page.goto('/login');
+  await connect(page);
+  await login(context.request);
+  value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+
+  // Spawn a root process, then drop it to non-root uid 1001.
+  const proc = value(await kernel(page, 'exec', { ...sleep }));
+  const noCloud = value(await kernel(page, 'exec', { ...sleep, remote: false }));
+  try {
+    value(await kernel(page, 'set_proc_cred', { pid: proc.pid, uid: 1001, gid: 1001, groups: [1001] }));
+    expect(value(await kernel(page, 'getcreds_proc', { pid: proc.pid })).uid).toBe(1001);
+
+    // Non-root process cannot re-escalate to uid 0 via set_proc_cred.
+    expect((await kernel(page, 'set_proc_cred', { pid: proc.pid, uid: 0, gid: 0, groups: [0] })).err?.errno).toBe('EPERM');
+
+    // F3-01: Non-root local process (uid 1001) cannot mint or bind a root (uid 0) remote cred
+    // from the browser's root cookie, and its local UID remains 1001.
+    expect((await kernel(page, 'mint_remote_cred', { pid: proc.pid, sudo: false })).err?.errno).toBe('EACCES');
+    expect(['EACCES', 'EPERM']).toContain((await kernel(page, 'mint_remote_cred', { pid: proc.pid, sudo: true })).err?.errno);
+    expect(value(await kernel(page, 'getcreds_proc', { pid: proc.pid })).uid).toBe(1001);
+
+    // Cloud-denied process cannot re-enable cloud_access via set_proc_cred or mint_remote_cred.
+    expect((await kernel(page, 'set_proc_cred', {
+      pid: noCloud.pid,
+      uid: 0,
+      gid: 0,
+      groups: [0],
+      remote: {
+        token: '0'.repeat(64),
+        uid: 0,
+        gid: 0,
+        groups: [0],
+        instance_id: 'inst-forged',
+        lineage: 'lin-forged',
+        cloud_access: true,
+        scope: { cloud_fs: true, devices: [], containers: false, relay: false },
+      },
+    })).err?.errno).toBe('EPERM');
+    expect((await kernel(page, 'mint_remote_cred', { pid: noCloud.pid, sudo: false })).err?.errno).toBe('EACCES');
+  } finally {
+    for (const p of [proc, noCloud]) {
+      await kernel(page, 'exit', { pid: p.pid, status: 0 });
+      await kernel(page, 'wait', { pid: p.pid });
+    }
+  }
+});
+
+test('F3-08/F3-10: immediate /api/file revocation bypasses TOKEN_FRESH cache, /dev/present/../../proc is denied, and DevTmpFs gates remote opens per caller', async ({ page, context }) => {
+  await page.goto('/login');
+  await connect(page);
+  await login(context.request);
+  value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+  const instanceId = value(await kernel(page, 'instance_id'));
+  const filePath = `/guest/revoke-immediate-${crypto.randomUUID()}.txt`;
+  expect((await put(context.request, '/api/file?path=' + encodeURIComponent(filePath), { data: 'SECRET_TOKEN_DATA' })).ok()).toBe(true);
+
+  const remoteProc = value(await kernel(page, 'exec', { ...sleep, remote: true }));
+  const presentOnly = value(await kernel(page, 'exec', {
+    ...sleep,
+    remote: { cloud_fs: false, devices: ['present'], containers: false, relay: false },
+  }));
+  const noCloud = value(await kernel(page, 'exec', { ...sleep, remote: false }));
+  const OS_FD_ROOT = 0x7ffffffd;
+  try {
+    // 1. /api/file?path=... with X-Process-Token succeeds while live, then fails IMMEDIATELY after SIGKILL (no TOKEN_FRESH lag).
+    const liveRes = await context.request.get(origin + '/api/file?path=' + encodeURIComponent(filePath), {
+      headers: {
+        Origin: origin,
+        'X-Process-Token': remoteProc.token,
+        'X-Process-Pid': String(remoteProc.pid),
+        'X-OS-Instance': instanceId,
+      },
+    });
+    expect(liveRes.status()).toBe(200);
+    expect(await liveRes.text()).toBe('SECRET_TOKEN_DATA');
+
+    value(await kernel(page, 'kill', { pid: remoteProc.pid, signal: 9 }));
+    const revokedRes = await context.request.get(origin + '/api/file?path=' + encodeURIComponent(filePath), {
+      headers: {
+        Origin: origin,
+        'X-Process-Token': remoteProc.token,
+        'X-Process-Pid': String(remoteProc.pid),
+        'X-OS-Instance': instanceId,
+      },
+    });
+    expect(revokedRes.status()).not.toBe(200);
+    expect([401, 403]).toContain(revokedRes.status());
+
+    // 2. Cloud-denied token with present device scope cannot escape into /proc via /dev/present/../../proc.
+    const traversalRes = await context.request.get(origin + '/api/file?path=' + encodeURIComponent('/dev/present/../../proc/uptime'), {
+      headers: {
+        Origin: origin,
+        'X-Process-Token': presentOnly.token,
+        'X-Process-Pid': String(presentOnly.pid),
+        'X-OS-Instance': instanceId,
+      },
+    });
+    expect(traversalRes.ok()).toBe(false);
+    expect([403, 404]).toContain(traversalRes.status());
+
+    // 3. DevTmpFs remote device open hook: after attaching /dev/archive, stat succeeds for all,
+    //    but open is denied (EACCES) for cloud_access=false or device-scope-denied callers.
+    value(await kernel(page, 'attach_remote_device', { driver: 'archive' }));
+    expect((await kernel(page, 'proc_statat', { pid: noCloud.pid, dirfd: OS_FD_ROOT, path: '/dev/archive', follow: true })).ok).toBeTruthy();
+    expect((await kernel(page, 'proc_openat', { pid: noCloud.pid, dirfd: OS_FD_ROOT, path: '/dev/archive', oflags: 0, mode: 0, cloexec: false })).err?.errno).toBe('EACCES');
+    expect((await kernel(page, 'proc_openat', { pid: presentOnly.pid, dirfd: OS_FD_ROOT, path: '/dev/archive', oflags: 0, mode: 0, cloexec: false })).err?.errno).toBe('EACCES');
+  } finally {
+    await kernel(page, 'detach_remote_device', { driver: 'archive' }).catch(() => {});
+    for (const p of [remoteProc, presentOnly, noCloud]) {
+      await kernel(page, 'exit', { pid: p.pid, status: 0 }).catch(() => {});
+      await kernel(page, 'wait', { pid: p.pid }).catch(() => {});
+    }
+    await rmrf(context.request, filePath);
   }
 });

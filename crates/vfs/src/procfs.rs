@@ -148,6 +148,9 @@ pub struct ProcCallerInfo {
     pub is_at_ns_root: bool,
 }
 
+/// Linux-compatible `CLK_TCK` (`USER_HZ`) frequency for `/proc/<pid>/stat` start time.
+pub const PROC_CLK_TCK: u64 = 100;
+
 /// Local process metadata snapshot for 100% local `/proc/<pid>/{status,cmdline,stat,cgroup}`
 /// rendering without any network RPCs (`docs/architecture/contract.md` §2.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,7 +164,8 @@ pub struct ProcMetaSnapshot {
     pub cgroup: String,
     pub comm: String,
     pub argv: Vec<String>,
-    pub started: u64,
+    /// Monotonic boot-relative process start time in `PROC_CLK_TCK` (100 Hz) ticks.
+    pub start_ticks: u64,
     pub tty: Option<u32>,
     pub tty_fds: Vec<u32>,
 }
@@ -193,6 +197,12 @@ pub trait ProcBridge {
     fn uptime_secs(&self) -> u64 {
         0
     }
+}
+
+fn snapshot_tty_fd(info: &ProcTargetInfo, fd: u16) -> Option<u32> {
+    let snap = info.snapshot.as_ref()?;
+    let tty = snap.tty?;
+    snap.tty_fds.contains(&u32::from(fd)).then_some(tty)
 }
 
 /// `hidepid=invisible`: root sees all; non-root sees own uid + PID 1.
@@ -469,7 +479,9 @@ impl<P: ProcProvider> ProcFs<P> {
                 if info.snapshot.is_some() && !proc_visible(cred, pid, info.uid) {
                     return Err(Errno::ENOENT);
                 }
-                if info.fds.borrow().get(Fd::from(fd)).is_err() {
+                if info.fds.borrow().get(Fd::from(fd)).is_err()
+                    && snapshot_tty_fd(&info, fd).is_none()
+                {
                     return Err(Errno::ENOENT);
                 }
                 Ok(self.make_meta(FileType::Symlink, 0o700, info.uid, info.gid, 0))
@@ -600,7 +612,10 @@ impl<P: ProcProvider> ProcFs<P> {
                 let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
                 may_inspect_proc(cred, info.uid)?;
                 let fd: u16 = name.parse().map_err(|_| Errno::ENOENT)?;
-                if fd.to_string() != name || info.fds.borrow().get(Fd::from(fd)).is_err() {
+                if fd.to_string() != name
+                    || (info.fds.borrow().get(Fd::from(fd)).is_err()
+                        && snapshot_tty_fd(&info, fd).is_none())
+                {
                     return Err(Errno::ENOENT);
                 }
                 ProcNode::PidFd(pid, fd)
@@ -689,7 +704,14 @@ impl<P: ProcProvider> ProcFs<P> {
                 let tty_nr = snap.tty.unwrap_or(0);
                 Ok(format!(
                     "{} ({}) {} {} {} {} {} -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {} 0 0\n",
-                    info.pid, snap.comm, code, snap.ppid, snap.pgid, snap.sid, tty_nr, snap.started
+                    info.pid,
+                    snap.comm,
+                    code,
+                    snap.ppid,
+                    snap.pgid,
+                    snap.sid,
+                    tty_nr,
+                    snap.start_ticks
                 )
                 .into_bytes())
             }
@@ -1192,9 +1214,12 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
                     let bridge = self.bridge().ok_or(Errno::ENOENT)?;
                     let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
                     may_inspect_proc(cred, info.uid)?;
+                    let mut seen_fds = BTreeSet::new();
                     let fds: Vec<Fd> = info.fds.borrow().fds().collect();
                     for fd in fds {
-                        if let Ok(fd16) = u16::try_from(fd) {
+                        if let Ok(fd16) = u16::try_from(fd)
+                            && seen_fds.insert(fd16)
+                        {
                             out.push(DirEntry {
                                 name: fd.to_string(),
                                 node: NodeId {
@@ -1203,6 +1228,24 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
                                 },
                                 file_type: FileType::Symlink,
                             });
+                        }
+                    }
+                    if let Some(snap) = &info.snapshot
+                        && snap.tty.is_some()
+                    {
+                        for &tfd in &snap.tty_fds {
+                            if let Ok(fd16) = u16::try_from(tfd)
+                                && seen_fds.insert(fd16)
+                            {
+                                out.push(DirEntry {
+                                    name: fd16.to_string(),
+                                    node: NodeId {
+                                        ino: encode_proc_ino(ProcNode::PidFd(pid, fd16)),
+                                        generation: GENERATION,
+                                    },
+                                    file_type: FileType::Symlink,
+                                });
+                            }
                         }
                     }
                 }
@@ -1285,11 +1328,16 @@ impl<P: ProcProvider> Filesystem for ProcFs<P> {
                     let bridge = self.bridge().ok_or(Errno::ENOENT)?;
                     let info = bridge.process_info(pid).ok_or(Errno::ENOENT)?;
                     may_inspect_proc(cred, info.uid)?;
-                    let file = info
-                        .fds
-                        .borrow()
-                        .get(Fd::from(fd))
-                        .map_err(|_| Errno::ENOENT)?;
+                    let file_res = info.fds.borrow().get(Fd::from(fd));
+                    let file = match file_res {
+                        Ok(f) => f,
+                        Err(_) => {
+                            if let Some(tty) = snapshot_tty_fd(&info, fd) {
+                                return Ok(format!("/dev/pts/{tty}"));
+                            }
+                            return Err(Errno::ENOENT);
+                        }
+                    };
                     if let Some(ns_file) = file.mount_ns() {
                         let ns_id = ns_file.ns.borrow().id().0;
                         return Ok(format!("mnt:[{ns_id}]"));
@@ -1813,7 +1861,7 @@ mod tests {
                 cgroup: "/init".into(),
                 comm: "init".into(),
                 argv: vec!["/usr/bin/init".into()],
-                started: 100,
+                start_ticks: 0,
                 tty: None,
                 tty_fds: Vec::new(),
             }),
@@ -1852,7 +1900,7 @@ mod tests {
                 cgroup: "/user/ann".into(),
                 comm: "sh".into(),
                 argv: vec!["sh".into(), "-c".into(), "echo hi".into()],
-                started: 101,
+                start_ticks: 250,
                 tty: Some(0),
                 tty_fds: vec![0, 1, 2],
             }),
@@ -1870,7 +1918,7 @@ mod tests {
                 cgroup: "/user/bob".into(),
                 comm: "sleep".into(),
                 argv: vec!["sleep".into(), "60".into()],
-                started: 102,
+                start_ticks: 500,
                 tty: None,
                 tty_fds: Vec::new(),
             }),
@@ -1892,6 +1940,21 @@ mod tests {
         );
         let stat = read_str(&vfs, 2, "/proc/2/stat").unwrap();
         assert!(stat.starts_with("2 (sh) R 1 2 2 0 "));
+        // Field 22 (index 19 after `) `) MUST be boot-relative ticks in CLK_TCK (100 Hz).
+        let after_comm: Vec<&str> = stat
+            .split(") ")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        assert_eq!(after_comm[19], "250");
+        // Snapshot tty_fds project `/proc/<pid>/fd/<n>` -> `/dev/pts/<tty>`.
+        assert_eq!(
+            now_or_never(vfs.readlinkat(2, StartAnchor::Root, "/proc/2/fd/0"))
+                .unwrap()
+                .unwrap(),
+            "/dev/pts/0"
+        );
         // Non-root Ann can read PID 1's cmdline, cannot see Bob's PID 3 (`hidepid=invisible`).
         assert_eq!(
             read_str(&vfs, 2, "/proc/1/cmdline").unwrap(),
