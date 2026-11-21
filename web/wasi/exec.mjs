@@ -11,7 +11,8 @@ import { Signals, CONTROL_WORDS, bit, valid, ignoredByDefault, stoppedByDefault 
 // another, each given what the one before wrote, and nothing reads the terminal.
 import { Pipe, pipeBuffer } from './pipe.js';
 import {
-  createSockArenaBuffer, initArenaSlot, fenceArenaSlot, ArenaRing, HDR_WR_LOCK,
+  createSockArenaBuffer, initArenaSlot, fenceArenaSlot, releaseWorkerLocks,
+  ArenaRing, HDR_RD_LOCK, HDR_WR_LOCK, HOST_LOCK_BIT,
 } from './sock-arena.js';
 import { Pty, TtyState, IOCTL, LF, IF } from '../kernel/pty.js';
 import { PtyDevices } from '../kernel/ptmx.js';
@@ -92,6 +93,17 @@ const notifySockets = () => {
 };
 // Sentinel PID used to keep `PtyDevices` handles alive while queued inside `SCM_RIGHTS`.
 const PTY_INFLIGHT_PID = -1;
+const MSG_PEEK = 0x2;
+// Unified PTY close path for both ordinary and in-flight last-master disposal so `/dev/pts/<N>`
+// is always deregistered even when zero slave fds remain open.
+async function closeInflightPty(handle) {
+  let pair = null;
+  try { pair = devices.get(PTY_INFLIGHT_PID, handle).pair; } catch { /* already closed */ }
+  await devices.close(PTY_INFLIGHT_PID, handle).catch(() => {});
+  if (pair?.masterClosed) {
+    await kernelCall('pty_close', { index: pair.number }).catch(() => {});
+  }
+}
 // Active arena-backed pipe slots: slot -> { gen, readers: Map<pid, n>, writers: Map<pid, n>, inflightR, inflightW }.
 const arenaPipes = new Map();
 function arenaPipeTotal(map) {
@@ -103,14 +115,14 @@ function settleArenaPipe(slot, entry) {
   if (!sockArena || !entry) return;
   const rTotal = arenaPipeTotal(entry.readers) + entry.inflightR;
   const wTotal = arenaPipeTotal(entry.writers) + entry.inflightW;
-  const ring = new ArenaRing(sockArena, slot, entry.gen);
+  const ring = new ArenaRing(sockArena, slot, entry.gen, 1, sockNotify);
   if (rTotal === 0) ring.closeReader();
   if (wTotal === 0) ring.closeWriter();
   if (rTotal === 0 && wTotal === 0) {
     arenaPipes.delete(slot);
     try {
       const res = globalThis.kernel?.sock_arena_free_pipe?.(slot, entry.gen);
-      if (res?.freed) fenceArenaSlot(sockArena, slot, res.gen);
+      if (res?.freed) fenceArenaSlot(sockArena, res.slot, res.expectedGen, res.gen, sockNotify);
     } catch { /* kernel torn down */ }
   }
   notifySockets();
@@ -121,7 +133,7 @@ function holdArenaPipe(slot, gen, end, pid, count = 1) {
   const map = end === 'r' ? entry.readers : entry.writers;
   map.set(pid, (map.get(pid) ?? 0) + count);
   if (sockArena) {
-    const ring = new ArenaRing(sockArena, slot, gen);
+    const ring = new ArenaRing(sockArena, slot, gen, 1, sockNotify);
     if (end === 'r') ring.holdReader(count);
     else ring.holdWriter(count);
   }
@@ -136,7 +148,7 @@ function dropArenaPipe(slot, gen, end, pid, count = 1) {
   if (cur - taken <= 0) map.delete(pid);
   else map.set(pid, cur - taken);
   if (sockArena) {
-    const ring = new ArenaRing(sockArena, slot, gen);
+    const ring = new ArenaRing(sockArena, slot, gen, 1, sockNotify);
     if (end === 'r') ring.dropReader(taken);
     else ring.dropWriter(taken);
   }
@@ -144,7 +156,7 @@ function dropArenaPipe(slot, gen, end, pid, count = 1) {
 }
 function releaseArenaPipes(pid) {
   for (const [slot, entry] of [...arenaPipes]) {
-    if (sockArena) new ArenaRing(sockArena, slot, entry.gen).releaseLocks(pid);
+    if (sockArena) new ArenaRing(sockArena, slot, entry.gen, 1, sockNotify).releaseLocks(pid);
     const r = entry.readers.get(pid) ?? 0;
     const w = entry.writers.get(pid) ?? 0;
     if (r) dropArenaPipe(slot, entry.gen, 'r', pid, r);
@@ -160,12 +172,12 @@ async function applySockCleanup(res) {
     || (res.droppedPipes?.length ?? 0) > 0;
   if (!hasWork) return;
   if (sockArena) {
-    for (const s of res.peerWrClosed ?? []) new ArenaRing(sockArena, s.slot, s.gen).closeWriter();
-    for (const s of res.peerRdClosed ?? []) new ArenaRing(sockArena, s.slot, s.gen).closeReader();
-    for (const s of res.freedSlots ?? []) fenceArenaSlot(sockArena, s.slot, s.gen);
+    for (const s of res.peerWrClosed ?? []) new ArenaRing(sockArena, s.slot, s.gen, 1, sockNotify).closeWriter();
+    for (const s of res.peerRdClosed ?? []) new ArenaRing(sockArena, s.slot, s.gen, 1, sockNotify).closeReader();
+    for (const s of res.freedSlots ?? []) fenceArenaSlot(sockArena, s.slot, s.expectedGen, s.gen, sockNotify);
   }
   for (const p of res.droppedPtys ?? []) {
-    await devices.close(PTY_INFLIGHT_PID, p.handle).catch(() => {});
+    await closeInflightPty(p.handle);
   }
   for (const p of res.droppedPipes ?? []) {
     const entry = arenaPipes.get(p.slot);
@@ -173,7 +185,7 @@ async function applySockCleanup(res) {
       if (p.end === 'r') entry.inflightR = Math.max(0, entry.inflightR - 1);
       else entry.inflightW = Math.max(0, entry.inflightW - 1);
       if (sockArena) {
-        const ring = new ArenaRing(sockArena, p.slot, p.gen);
+        const ring = new ArenaRing(sockArena, p.slot, p.gen, 1, sockNotify);
         if (p.end === 'r') ring.dropReader(1);
         else ring.dropWriter(1);
       }
@@ -292,8 +304,10 @@ const devices = new PtyDevices({
 // Retain an exiting host's completion while its shared descriptors are closing.
 const completing = new Map();
 export const deliverSignal = async ({ pid }) => {
-  await drainPendingSockCleanup();
-  if (pid && !hosted.has(pid)) return;
+  if (pid && !hosted.has(pid)) {
+    await drainPendingSockCleanup();
+    return;
+  }
   await reconciling;
   await reconcile();
 };
@@ -304,7 +318,10 @@ export function reconcile() {
   if (reconciling) return reconciling;
   const checking = new Map(hosted);
   const versions = new Map([...checking].map(([pid, process]) => [pid, process.membershipVersion]));
-  return reconciling = kernelCall('sync', { acknowledged: Object.fromEntries([...checking].map(([pid, process]) => [pid, [...process.received.values()]])) }).then(async rows => {
+  // Complete the sync reconciliation (and clear `reconciling = null`) BEFORE awaiting
+  // `drainPendingSockCleanup()`, because last-master PTY disposal invokes `hangupTerminal()`
+  // which awaits `reconciling` and calls `reconcile()`.
+  const run = kernelCall('sync', { acknowledged: Object.fromEntries([...checking].map(([pid, process]) => [pid, [...process.received.values()]])) }).then(rows => {
     let acknowledge = false;
     const found = new Map(rows.map(row => [row.pid, row]));
     // Pass 1: terminate dead/zombie processes first so their pipes and PTY masters
@@ -328,9 +345,10 @@ export function reconcile() {
         acknowledge = true;
       }
     }
-    await drainPendingSockCleanup();
     if (acknowledge) setTimeout(() => { void reconcile(); }, 0);
-  }).catch(() => {}).finally(() => { reconciling = null; });
+  }).catch(() => {}).finally(() => { if (reconciling === run) reconciling = null; });
+  reconciling = run;
+  return run.then(() => drainPendingSockCleanup());
 }
 
 // Run the pipeline `stages`, each an argv, as `options` say: {cwd, home, user, sudo, umask;
@@ -635,15 +653,19 @@ export async function exec(stages, options = {}) {
         (processes.includes(process) && processes.length === stages.length && processes.every(stage => stage.ended))) ? releaseTerminal(false) : Promise.resolve();
       worker.terminate();
       changed();
+      // Recover any abandoned guest-Worker ring mutexes across ALL SockArena slots (streams AND
+      // arena-pipes) without disturbing active host-side transactions tagged with `HOST_LOCK_BIT`.
+      releaseWorkerLocks(sockArena, pid, sockNotify);
       // What it held of pipes goes as it goes, its locks too.
       release(pid);
       releaseArenaPipes(pid);
       for (const fd of [1, 2]) { const text = decoders[fd].decode(); if (text) void publish(fd, text); }
-      const owned = [...devices.pairs.values()].filter(pair => pair.terminal.session === pid);
+      const trackedPairs = [...devices.pairs.values()];
+      const owned = trackedPairs.filter(pair => pair.terminal.session === pid);
       // Last-master close needs the owning session/foreground group to send
       // HUP+CONT, including when a stuck Worker could not close its own fds.
       const deviceCleanup = devices.release(pid).then(() => {
-        for (const pair of devices.pairs.values()) {
+        for (const pair of trackedPairs) {
           if (pair.masterClosed) void kernelCall('pty_close', { index: pair.number }).catch(() => {});
         }
         return Promise.all(owned.filter(pair => pair.terminal.session === pid).map(pair => releaseTerminal(false, pair.terminal)));
@@ -1113,11 +1135,60 @@ export async function exec(stages, options = {}) {
     const k = globalThis.kernel;
     if (!k) throw { errno: 'ENOSYS' };
     const { op } = args;
+    const hostOwner = (HOST_LOCK_BIT | process.pid) | 0;
+    const releaseInflightPipe = p => {
+      const entry = arenaPipes.get(p.slot);
+      if (entry && entry.gen === p.gen) {
+        if (p.end === 'r') entry.inflightR = Math.max(0, entry.inflightR - 1);
+        else entry.inflightW = Math.max(0, entry.inflightW - 1);
+        if (sockArena) {
+          const ring = new ArenaRing(sockArena, p.slot, p.gen, 1, sockNotify);
+          if (p.end === 'r') ring.dropReader(1);
+          else ring.dropWriter(1);
+        }
+        settleArenaPipe(p.slot, entry);
+      }
+    };
+    const cleanupDeadRecv = async (res, peek) => {
+      for (const fdSpec of res?.fds ?? []) {
+        if (fdSpec.kind === 'kfd' || fdSpec.kind === 'server_dev') {
+          await kernelCall('kfd_close', { pid: process.pid, kfd: fdSpec.kfd }).catch(() => {});
+        } else if (fdSpec.kind === 'unix_sock') {
+          await k.sock_close(process.pid, fdSpec.sockId, 1).then(c => applySockCleanup(c)).catch(() => {});
+        } else if (fdSpec.kind === 'pty' && !peek) {
+          await closeInflightPty(fdSpec.handle);
+        } else if (fdSpec.kind === 'arena_pipe' && !peek) {
+          releaseInflightPipe(fdSpec);
+        }
+      }
+      await applySockCleanup(res);
+      throw { errno: 'ESRCH' };
+    };
+    const transferRecvJsFds = async (res, peek) => {
+      for (const fdSpec of res.fds ?? []) {
+        if (fdSpec.kind === 'pty') {
+          devices.hold(PTY_INFLIGHT_PID, process.pid, fdSpec.handle, 1);
+          if (!peek) await closeInflightPty(fdSpec.handle);
+        } else if (fdSpec.kind === 'arena_pipe') {
+          if (peek) {
+            holdArenaPipe(fdSpec.slot, fdSpec.gen, fdSpec.end, process.pid, 1);
+          } else {
+            const entry = arenaPipes.get(fdSpec.slot);
+            if (entry && entry.gen === fdSpec.gen) {
+              const map = fdSpec.end === 'r' ? entry.readers : entry.writers;
+              map.set(process.pid, (map.get(process.pid) ?? 0) + 1);
+              if (fdSpec.end === 'r') entry.inflightR = Math.max(0, entry.inflightR - 1);
+              else entry.inflightW = Math.max(0, entry.inflightW - 1);
+            }
+          }
+        }
+      }
+    };
     switch (op) {
       case 'pipe_alloc': {
         if (!sockArena) throw { errno: 'ENOSYS' };
         const res = k.sock_arena_alloc_pipe();
-        initArenaSlot(sockArena, res.slot, res.gen, 1, 1);
+        initArenaSlot(sockArena, res.slot, res.gen, 1, 1, sockNotify);
         arenaPipes.set(res.slot, {
           gen: res.gen,
           readers: new Map([[process.pid, 1]]),
@@ -1138,8 +1209,8 @@ export async function exec(stages, options = {}) {
       case 'socketpair': {
         const res = k.sock_socketpair(process.pid, args.sockType);
         if (sockArena) {
-          if (res.slotAB) initArenaSlot(sockArena, res.slotAB.slot, res.slotAB.gen, 1, 1);
-          if (res.slotBA) initArenaSlot(sockArena, res.slotBA.slot, res.slotBA.gen, 1, 1);
+          if (res.slotAB) initArenaSlot(sockArena, res.slotAB.slot, res.slotAB.gen, 1, 1, sockNotify);
+          if (res.slotBA) initArenaSlot(sockArena, res.slotBA.slot, res.slotBA.gen, 1, 1, sockNotify);
         }
         return res;
       }
@@ -1150,20 +1221,46 @@ export async function exec(stages, options = {}) {
       case 'connect': {
         const res = await k.sock_connect(process.pid, args.sockId, args.path);
         if (sockArena) {
-          if (res.txSlot) initArenaSlot(sockArena, res.txSlot.slot, res.txSlot.gen, 1, 1);
-          if (res.rxSlot) initArenaSlot(sockArena, res.rxSlot.slot, res.rxSlot.gen, 1, 1);
+          if (res.txSlot) {
+            initArenaSlot(sockArena, res.txSlot.slot, res.txSlot.gen, 1, 1, sockNotify);
+            const txRing = new ArenaRing(sockArena, res.txSlot.slot, res.txSlot.gen, 1, sockNotify);
+            if (res.nonblock) txRing.setSockNonblock(true);
+            if (res.peerPasscred) txRing.setPasscred(true);
+          }
+          if (res.rxSlot) initArenaSlot(sockArena, res.rxSlot.slot, res.rxSlot.gen, 1, 1, sockNotify);
         }
         notifySockets();
         return res;
       }
-      case 'accept':
-        return k.sock_accept(process.pid, args.sockId);
-      case 'shutdown': {
-        const res = k.sock_shutdown(process.pid, args.sockId, args.how);
-        if (sockArena) {
-          if (res.shutWr && res.txSlot) new ArenaRing(sockArena, res.txSlot.slot, res.txSlot.gen).closeWriter();
-          if (res.shutRd && res.rxSlot) new ArenaRing(sockArena, res.rxSlot.slot, res.rxSlot.gen).closeReader();
+      case 'accept': {
+        const res = k.sock_accept(process.pid, args.sockId);
+        if (!res.wouldBlock) notifySockets();
+        return res;
+      }
+      case 'describe':
+        return k.sock_describe(process.pid, args.sockId);
+      case 'set_nonblock': {
+        const res = k.sock_set_nonblock(process.pid, args.sockId, !!args.nonblock);
+        if (sockArena && res?.txSlot) {
+          new ArenaRing(sockArena, res.txSlot.slot, res.txSlot.gen, 1, sockNotify).setSockNonblock(!!res.nonblock);
         }
+        return res;
+      }
+      case 'get_nonblock':
+        return k.sock_get_nonblock(process.pid, args.sockId);
+      case 'shutdown': {
+        const res = await k.sock_shutdown(process.pid, args.sockId, args.how);
+        if (sockArena) {
+          if (res.closeTxWr && res.txSlot) {
+            new ArenaRing(sockArena, res.txSlot.slot, res.txSlot.gen, 1, sockNotify).closeWriter();
+          }
+          if (res.closeRxRd && res.rxSlot) {
+            const rx = new ArenaRing(sockArena, res.rxSlot.slot, res.rxSlot.gen, 1, sockNotify);
+            rx.closeReader();
+            rx.clearAncillary();
+          }
+        }
+        await applySockCleanup(res);
         notifySockets();
         return res;
       }
@@ -1172,6 +1269,7 @@ export async function exec(stages, options = {}) {
       case 'close': {
         const res = await k.sock_close(process.pid, args.sockId, args.count ?? 1);
         await applySockCleanup(res);
+        notifySockets();
         return {};
       }
       case 'sendmsg': {
@@ -1180,20 +1278,8 @@ export async function exec(stages, options = {}) {
         const heldPtys = [];
         const heldPipes = [];
         const rollback = async () => {
-          for (const h of heldPtys) await devices.close(PTY_INFLIGHT_PID, h).catch(() => {});
-          for (const p of heldPipes) {
-            const entry = arenaPipes.get(p.slot);
-            if (entry && entry.gen === p.gen) {
-              if (p.end === 'r') entry.inflightR = Math.max(0, entry.inflightR - 1);
-              else entry.inflightW = Math.max(0, entry.inflightW - 1);
-              if (sockArena) {
-                const ring = new ArenaRing(sockArena, p.slot, p.gen);
-                if (p.end === 'r') ring.dropReader(1);
-                else ring.dropWriter(1);
-              }
-              settleArenaPipe(p.slot, entry);
-            }
-          }
+          for (const h of heldPtys) await closeInflightPty(h);
+          for (const p of heldPipes) releaseInflightPipe(p);
         };
         let lockedRing = null;
         try {
@@ -1209,25 +1295,37 @@ export async function exec(stages, options = {}) {
               if (spec.end === 'r') entry.inflightR++;
               else entry.inflightW++;
               if (sockArena) {
-                const ring = new ArenaRing(sockArena, spec.slot, spec.gen);
+                const ring = new ArenaRing(sockArena, spec.slot, spec.gen, 1, sockNotify);
                 if (spec.end === 'r') ring.holdReader(1);
                 else ring.holdWriter(1);
               }
               heldPipes.push({ slot: spec.slot, gen: spec.gen, end: spec.end });
             }
           }
-          // Atomic SOCK_STREAM SAB send with SCM_RIGHTS: validate & reserve quota in Rust
-          // BEFORE copying payload into `txSlot` so failures leave zero partial bytes!
-          if (args.txSlot && sockArena) {
-            const ring = new ArenaRing(sockArena, args.txSlot.slot, args.txSlot.gen, process.pid);
-            if (!ring.alive || ring.rdClosed) throw { errno: 'EPIPE' };
+          // Resolve `txSlot` from kernel if the sender held a pre-connect snapshot of a shared stream.
+          let txSlot = args.txSlot ?? null;
+          if (!txSlot && sockArena && args.addr == null) {
+            try {
+              const info = k.sock_describe(process.pid, args.sockId);
+              if (info?.sockType === 1 && info.txSlot) txSlot = info.txSlot;
+            } catch { /* let sock_sendmsg return the authoritative errno */ }
+          }
+          // Atomic SOCK_STREAM SAB send with SCM_RIGHTS or SO_PASSCRED: validate & reserve quota
+          // in Rust BEFORE copying payload into `txSlot` so failures leave zero partial bytes!
+          if (txSlot && sockArena) {
+            const ring = new ArenaRing(sockArena, txSlot.slot, txSlot.gen, hostOwner, sockNotify);
+            if (!ring.alive || ring.rdClosed || ring.wrClosed) throw { errno: 'EPIPE' };
             const raw = args.data ? fromBase64(args.data) : new Uint8Array(0);
-            if (raw.length > 0 && ring.room === 0) throw { errno: 'EAGAIN' };
+            if (raw.length === 0) {
+              await rollback();
+              return { sent: 0 };
+            }
+            if (ring.room === 0) throw { errno: 'EAGAIN' };
             if (!ring.lock(HDR_WR_LOCK)) throw { errno: 'EAGAIN' };
             lockedRing = ring;
-            if (!ring.alive || ring.rdClosed) throw { errno: 'EPIPE' };
+            if (!ring.alive || ring.rdClosed || ring.wrClosed) throw { errno: 'EPIPE' };
             const chunkLen = Math.min(raw.length, ring.room);
-            if (raw.length > 0 && chunkLen === 0) throw { errno: 'EAGAIN' };
+            if (chunkLen === 0) throw { errno: 'EAGAIN' };
             const startOff = ring.headOffset;
             const endOff = startOff + chunkLen;
             const res = await k.sock_sendmsg(process.pid, args.sockId, JSON.stringify({
@@ -1236,7 +1334,7 @@ export async function exec(stages, options = {}) {
               sabSpan: [startOff, endOff],
             }));
             if (res.hasAncillary) ring.setAncillary(res.headAncillaryOffset);
-            if (chunkLen > 0) ring._copyIn(raw.subarray(0, chunkLen));
+            ring._copyIn(raw.subarray(0, chunkLen));
             notifySockets();
             return { ...res, sent: chunkLen };
           }
@@ -1245,8 +1343,15 @@ export async function exec(stages, options = {}) {
             fds: fdsList,
             addr: args.addr ?? null,
           }));
+          // On SOCK_STREAM without SAB, a 0-byte send commits no bytes and drops ancillary fds;
+          // SOCK_DGRAM / SOCK_SEQPACKET legitimately carry SCM_RIGHTS on 0-byte packets.
+          if (res.sent === 0 && fdsList.length > 0 && !sockArena && !args.addr) {
+            let isStream = false;
+            try { isStream = k.sock_describe(process.pid, args.sockId)?.sockType === 1; } catch { /* ignore */ }
+            if (isStream) await rollback();
+          }
           if (res.targetRxSlot && res.hasAncillary && sockArena) {
-            new ArenaRing(sockArena, res.targetRxSlot.slot, res.targetRxSlot.gen).setAncillary(res.headAncillaryOffset);
+            new ArenaRing(sockArena, res.targetRxSlot.slot, res.targetRxSlot.gen, 1, sockNotify).setAncillary(res.headAncillaryOffset);
           }
           notifySockets();
           return res;
@@ -1258,6 +1363,59 @@ export async function exec(stages, options = {}) {
         }
       }
       case 'recvmsg': {
+        const peek = !!((args.flags ?? 0) & MSG_PEEK);
+        if (args.sabStream && sockArena) {
+          let rxSlot = args.rxSlot ?? null;
+          if (!rxSlot) {
+            const info = k.sock_describe(process.pid, args.sockId);
+            rxSlot = info?.rxSlot ?? null;
+          }
+          if (rxSlot) {
+            const ring = new ArenaRing(sockArena, rxSlot.slot, rxSlot.gen, hostOwner, sockNotify);
+            if (!ring.lock(HDR_RD_LOCK)) return { wouldBlock: true, lockBusy: true };
+            try {
+              const safePeerCred = () => {
+                try { return k.sock_peercred(process.pid, args.sockId); } catch { return { pid: 0, uid: 0, gid: 0 }; }
+              };
+              if (!ring.alive || ring.rdClosed) {
+                return { data: '', reportedLen: 0, fds: [], peerCred: safePeerCred(), flags: 0 };
+              }
+              const tail = ring.tailOffset;
+              const queued = ring.queued;
+              if (queued === 0) {
+                if (ring.wrClosed) {
+                  return { data: '', reportedLen: 0, fds: [], peerCred: safePeerCred(), flags: 0 };
+                }
+                return { wouldBlock: true };
+              }
+              const bufLen = args.bufLen ?? 0;
+              if (bufLen === 0) {
+                return { data: '', reportedLen: 0, fds: [], peerCred: safePeerCred(), flags: 0 };
+              }
+              const res = await k.sock_recvmsg(process.pid, args.sockId, JSON.stringify({
+                bufLen,
+                maxFds: args.maxFds ?? 0,
+                flags: args.flags ?? 0,
+                sabRxTail: tail,
+                cmsgCloexec: !!args.cmsgCloexec,
+              }));
+              if (process.ended) await cleanupDeadRecv(res, peek);
+              if (!res.wouldBlock) {
+                const take = Math.min(bufLen, res.maxStreamBytes ?? bufLen, ring.queued);
+                const payload = take > 0 ? ring._copyOut(take, !peek) : new Uint8Array(0);
+                if (res.hasNextAncillary) ring.setAncillary(res.nextAncillaryOffset);
+                else ring.clearAncillary();
+                res.data = payload.length ? toBase64(payload) : '';
+                res.reportedLen = payload.length;
+                await transferRecvJsFds(res, peek);
+                await applySockCleanup(res);
+              }
+              return res;
+            } finally {
+              ring.unlock(HDR_RD_LOCK);
+            }
+          }
+        }
         const res = await k.sock_recvmsg(process.pid, args.sockId, JSON.stringify({
           bufLen: args.bufLen ?? 0,
           maxFds: args.maxFds ?? 0,
@@ -1265,26 +1423,9 @@ export async function exec(stages, options = {}) {
           sabRxTail: args.sabRxTail ?? null,
           cmsgCloexec: !!args.cmsgCloexec,
         }));
+        if (process.ended) await cleanupDeadRecv(res, peek);
         if (!res.wouldBlock) {
-          if (sockArena && res.rxSlot && args.sabRxTail != null) {
-            const ring = new ArenaRing(sockArena, res.rxSlot.slot, res.rxSlot.gen);
-            if (res.hasNextAncillary) ring.setAncillary(res.nextAncillaryOffset);
-            else ring.clearAncillary();
-          }
-          for (const fdSpec of res.fds ?? []) {
-            if (fdSpec.kind === 'pty') {
-              devices.hold(PTY_INFLIGHT_PID, process.pid, fdSpec.handle, 1);
-              await devices.close(PTY_INFLIGHT_PID, fdSpec.handle).catch(() => {});
-            } else if (fdSpec.kind === 'arena_pipe') {
-              const entry = arenaPipes.get(fdSpec.slot);
-              if (entry && entry.gen === fdSpec.gen) {
-                const map = fdSpec.end === 'r' ? entry.readers : entry.writers;
-                map.set(process.pid, (map.get(process.pid) ?? 0) + 1);
-                if (fdSpec.end === 'r') entry.inflightR = Math.max(0, entry.inflightR - 1);
-                else entry.inflightW = Math.max(0, entry.inflightW - 1);
-              }
-            }
-          }
+          await transferRecvJsFds(res, peek);
           await applySockCleanup(res);
         }
         return res;
@@ -1297,9 +1438,13 @@ export async function exec(stages, options = {}) {
         return { path: k.sock_getpeername(process.pid, args.sockId) };
       case 'getsockopt':
         return { val: k.sock_getsockopt(process.pid, args.sockId, args.level, args.optname) };
-      case 'setsockopt':
-        k.sock_setsockopt(process.pid, args.sockId, args.level, args.optname, args.val);
-        return {};
+      case 'setsockopt': {
+        const res = k.sock_setsockopt(process.pid, args.sockId, args.level, args.optname, args.val);
+        if (sockArena && res?.rxSlot && typeof res.passcred === 'boolean') {
+          new ArenaRing(sockArena, res.rxSlot.slot, res.rxSlot.gen, 1, sockNotify).setPasscred(res.passcred);
+        }
+        return res ?? {};
+      }
       case 'poll':
         return k.sock_poll(process.pid, args.sockId, !!args.writing);
       case 'stats':

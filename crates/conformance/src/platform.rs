@@ -65,6 +65,19 @@ pub fn error(e: io::Error) -> String {
         (libc::EDEADLK, "EDEADLK"),
         (libc::EPROTONOSUPPORT, "EPROTONOSUPPORT"),
         (libc::ENOTCONN, "ENOTCONN"),
+        (libc::EADDRINUSE, "EADDRINUSE"),
+        (libc::EADDRNOTAVAIL, "EADDRNOTAVAIL"),
+        (libc::EAFNOSUPPORT, "EAFNOSUPPORT"),
+        (libc::ECONNABORTED, "ECONNABORTED"),
+        (libc::ECONNREFUSED, "ECONNREFUSED"),
+        (libc::ECONNRESET, "ECONNRESET"),
+        (libc::EISCONN, "EISCONN"),
+        (libc::EMSGSIZE, "EMSGSIZE"),
+        (libc::ENOBUFS, "ENOBUFS"),
+        (libc::ENOTSOCK, "ENOTSOCK"),
+        (libc::EPROTOTYPE, "EPROTOTYPE"),
+        #[cfg(target_os = "linux")]
+        (libc::ETOOMANYREFS, "ETOOMANYREFS"),
     ] {
         if n == Some(code) {
             return name.into();

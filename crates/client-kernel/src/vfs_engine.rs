@@ -2653,7 +2653,7 @@ impl Kernel {
         result
     }
 
-    async fn release_server_fd(
+    pub(crate) async fn release_server_fd(
         &self,
         pid: u32,
         fd: u32,
@@ -5592,6 +5592,9 @@ impl Kernel {
                 is_ns,
                 pin_fstype,
             } => {
+                if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+                    meta.attenuated_kfds.remove(&kfd);
+                }
                 let vfs_for_names = self.vfs_rt.borrow().vfs.clone();
                 self.fill_stat_names(&vfs_for_names, pid, &mut stat).await;
                 let device = if entry_meta.file_type == FileType::CharDevice {
@@ -6246,6 +6249,57 @@ impl Kernel {
     }
 
     pub async fn kfd_dup2(&self, pid: u32, old_kfd: u32, new_kfd: u32) -> Result<u32, JsValue> {
+        let old_is_server = (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&old_kfd);
+        let new_is_server = (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&new_kfd);
+        if old_is_server || new_is_server {
+            if !old_is_server || !new_is_server {
+                return Err(map_errno(Errno::EBADF));
+            }
+            let (sfd, attenuated_token) = {
+                let rt = self.vfs_rt.borrow();
+                let meta = rt
+                    .proc_meta
+                    .get(&pid)
+                    .ok_or_else(|| map_errno(Errno::ESRCH))?;
+                let entry = meta
+                    .server_fds
+                    .get(&old_kfd)
+                    .filter(|e| !e.closing)
+                    .ok_or_else(|| map_errno(Errno::EBADF))?;
+                (entry.sfd.clone(), entry.attenuated_token.clone())
+            };
+            if old_kfd == new_kfd {
+                return Ok(new_kfd);
+            }
+            let target_occupied = self
+                .vfs_rt
+                .borrow()
+                .proc_meta
+                .get(&pid)
+                .is_some_and(|m| m.server_fds.contains_key(&new_kfd));
+            if target_occupied {
+                // POSIX dup2 ignores errors when closing the replaced target descriptor.
+                let _ = self.release_server_fd(pid, new_kfd, false).await;
+            }
+            let mut rt = self.vfs_rt.borrow_mut();
+            let meta = rt
+                .proc_meta
+                .get_mut(&pid)
+                .ok_or_else(|| map_errno(Errno::ESRCH))?;
+            if !meta.server_fds.contains_key(&new_kfd) && meta.server_fds.len() >= 1024 {
+                return Err(map_errno(Errno::EMFILE));
+            }
+            meta.server_fds.insert(
+                new_kfd,
+                ServerFdEntry {
+                    sfd,
+                    cloexec: false,
+                    closing: false,
+                    attenuated_token,
+                },
+            );
+            return Ok(new_kfd);
+        }
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let res = vfs.dup2(pid, old_kfd, new_kfd).await.map_err(map_errno)?;
         if old_kfd != res
@@ -8945,6 +8999,9 @@ impl Kernel {
                 return Err(e.into());
             }
         };
+        if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+            meta.attenuated_kfds.remove(&fd);
+        }
         Ok((
             fd,
             json!({
@@ -9106,7 +9163,12 @@ impl Kernel {
         if let Ok(fds) = vfs.process_fds(pid)
             && fds.borrow().get(raw_fd).is_ok()
         {
-            vfs.close(pid, raw_fd).await?;
+            let scope_pid = self.scope_pid_for_kfd(pid, raw_fd).unwrap_or(pid);
+            if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+                meta.attenuated_kfds.remove(&raw_fd);
+            }
+            self.with_proc_scope(scope_pid, async { vfs.close(pid, raw_fd).await })
+                .await?;
             return Ok(Value::Null);
         }
         Err(Errno::EBADF.into())
@@ -9156,19 +9218,22 @@ impl Kernel {
                 .await;
         }
         if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
-            let sfd = self.resolve_process_server_fd(pid, raw_fd)?;
-            return self
-                .forward_server_call(
-                    pid,
-                    page_sudo,
-                    Call::Fchmod {
-                        fd: FdRef::Fd(sfd),
-                        mode,
-                    },
-                )
-                .await;
+            let (sfd, attenuated) = self.resolve_process_server_fd_entry(pid, raw_fd)?;
+            let call = Call::Fchmod {
+                fd: FdRef::Fd(sfd),
+                mode,
+            };
+            return match attenuated {
+                Some((owner_pid, owner_tok)) => {
+                    self.forward_server_call_attenuated(owner_pid, &owner_tok, call)
+                        .await
+                }
+                None => self.forward_server_call(pid, page_sudo, call).await,
+            };
         }
-        vfs.fsetattr(pid, raw_fd, &attr).await?;
+        let scope_pid = self.scope_pid_for_kfd(pid, raw_fd)?;
+        self.with_proc_scope(scope_pid, async { vfs.fsetattr(pid, raw_fd, &attr).await })
+            .await?;
         Ok(Value::Null)
     }
 
@@ -9257,9 +9322,16 @@ impl Kernel {
                 tbl.get(raw_fd)
             }
         {
+            let scope_pid = self.scope_pid_for_kfd(pid, raw_fd)?;
             let mut buf = vec![0u8; cap];
-            let n = vfs.pread(pid, raw_fd, &mut buf, offset).await?;
-            let size = file.metadata().await.map(|m| m.size).unwrap_or(n as u64);
+            let (n, meta) = self
+                .with_proc_scope(scope_pid, async {
+                    let n = vfs.pread(pid, raw_fd, &mut buf, offset).await?;
+                    let meta = file.metadata().await.ok();
+                    Ok::<_, Errno>((n, meta))
+                })
+                .await?;
+            let size = meta.map(|m| m.size).unwrap_or(n as u64);
             buf.truncate(n);
             return Ok(json!({ "data": Bytes(buf), "size": size }));
         }
@@ -9320,8 +9392,13 @@ impl Kernel {
         if let Ok(fds) = vfs.process_fds(pid)
             && fds.borrow().get(raw_fd).is_ok()
         {
+            let scope_pid = self.scope_pid_for_kfd(pid, raw_fd)?;
             let offset = index.checked_mul(abi::INLINE_MAX).ok_or(Errno::EFBIG)?;
-            let written = vfs.pwrite(pid, raw_fd, &data, offset).await?;
+            let written = self
+                .with_proc_scope(scope_pid, async {
+                    vfs.pwrite(pid, raw_fd, &data, offset).await
+                })
+                .await?;
             return Ok(json!({ "written": written }));
         }
         Err(Errno::EBADF.into())
@@ -9430,6 +9507,40 @@ impl Kernel {
         let mut temp_usr_fds: Vec<u32> = Vec::new();
         let ioctl_res = async {
             if request == accelerator::SUBMIT {
+                // High #1 (`U-10`): `accelerator::SUBMIT` carries external `PathAt` file/dir
+                // operands evaluated by the server under the request token's identity. Never
+                // delegate a higher-privileged sender's identity to authorize files the receiver
+                // cannot access: fail closed with `EACCES` unless the receiver has `cloud_access`
+                // and identical `(uid, gid, groups)` to the active, unrevoked sender!
+                if let Some((owner_pid, owner_tok)) = &attenuated_dev {
+                    let receiver_denied = self.vfs_rt.borrow().root_cloud.is_pid_cloud_denied(pid);
+                    let authorized = !receiver_denied && {
+                        let st = self.state.borrow();
+                        if st.pending_revocations.contains(owner_tok) {
+                            false
+                        } else if let (Some(recv), Some(owner)) =
+                            (st.table.proc(pid), st.table.proc(*owner_pid))
+                        {
+                            recv.state != abi::ProcState::Zombie
+                                && owner.state != abi::ProcState::Zombie
+                                && recv.cred.cloud_access
+                                && owner.cred.cloud_access
+                                && owner
+                                    .cred
+                                    .remote
+                                    .as_ref()
+                                    .is_some_and(|r| r.token == *owner_tok)
+                                && recv.cred.identity.id == owner.cred.identity.id
+                                && recv.cred.identity.group == owner.cred.identity.group
+                                && recv.cred.identity.groups == owner.cred.identity.groups
+                        } else {
+                            false
+                        }
+                    };
+                    if !authorized {
+                        return Err(Errno::EACCES.into());
+                    }
+                }
                 let mut submit: Submit =
                     serde_json::from_value(arg).map_err(|_| abi::Error::from(Errno::EINVAL))?;
                 match &mut submit.operation {

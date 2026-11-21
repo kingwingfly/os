@@ -8,7 +8,7 @@ use abi::Errno;
 use abi::fs::{FileType, FsId, OpenOptions};
 use abi::socket::{
     MAX_INFLIGHT_FDS_GLOBAL, MAX_INFLIGHT_FDS_PER_USER, MSG_CTRUNC, MSG_PEEK, MSG_TRUNC, PeerCred,
-    SCM_MAX_FD, SHUT_WR, SO_ACCEPTCONN, SO_PASSCRED, SO_TYPE, SOCK_DGRAM, SOCK_SEQPACKET,
+    SCM_MAX_FD, SHUT_RD, SHUT_WR, SO_ACCEPTCONN, SO_PASSCRED, SO_TYPE, SOCK_DGRAM, SOCK_SEQPACKET,
     SOCK_STREAM, SOL_SOCKET, UNIX_DGRAM_MAX,
 };
 use os_core::acl::Entries;
@@ -161,7 +161,7 @@ fn u01_u07_stream_lifecycle_and_unlink_rebind() {
     table
         .bind(1, srv_sock, inode_key(&entry1), "/run/test.sock".into())
         .unwrap();
-    table.listen(1, srv_sock, 16).unwrap();
+    table.listen(1, srv_sock, 16, root_cred).unwrap();
     assert_eq!(
         table.getsockopt(1, srv_sock, SOL_SOCKET, SO_ACCEPTCONN),
         Ok(1)
@@ -209,7 +209,7 @@ fn u01_u07_stream_lifecycle_and_unlink_rebind() {
     table
         .bind(1, srv_sock2, inode_key(&entry2), "/run/test.sock".into())
         .unwrap();
-    table.listen(1, srv_sock2, 8).unwrap();
+    table.listen(1, srv_sock2, 8, root_cred).unwrap();
 
     // Old connection STILL exchanges data cleanly!
     table
@@ -271,7 +271,7 @@ fn u03_dgram_and_seqpacket_framing_and_limits() {
         .bind(1, srv, inode_key(&entry), "/run/notify.sock".into())
         .unwrap();
     // listen() on DGRAM returns EOPNOTSUPP.
-    assert_eq!(table.listen(1, srv, 4), Err(Errno::EOPNOTSUPP));
+    assert_eq!(table.listen(1, srv, 4, root_cred), Err(Errno::EOPNOTSUPP));
     assert_eq!(
         table.getsockopt(1, srv, SOL_SOCKET, SO_TYPE),
         Ok(SOCK_DGRAM as i32)
@@ -414,7 +414,7 @@ fn u04_u05_scm_rights_and_stream_ancillary_boundary_splitting() {
     table
         .bind(20, lis, inode_key(&ent), "/tmp/pass.sock".into())
         .unwrap();
-    table.listen(20, lis, 4).unwrap();
+    table.listen(20, lis, 4, c2).unwrap();
     let cli = table.create(10, SockType::Stream, c1).unwrap();
     table
         .connect(10, cli, &inode_key(&ent), "/tmp/pass.sock".into(), c1)
@@ -448,6 +448,7 @@ fn u04_u05_scm_rights_and_stream_ancillary_boundary_splitting() {
                     slot: pipe_slot.slot,
                     generation: pipe_slot.generation,
                     end: PipeEnd::Read,
+                    path_only: false,
                 },
             ],
             None,
@@ -960,4 +961,361 @@ fn u07_memfs_socket_inode_ops() {
     let updated = block_on(fs.setattr(&u, &sock.handle, &attr)).unwrap();
     assert_eq!(updated.mode, 0o660);
     block_on(fs.unlink(&u, &dir.handle, "app.sock")).unwrap();
+}
+
+/// Regression tests for Codex audit findings (High #8, #9, #13, #14, #16; Medium #2, #4, #5; Low #1).
+#[test]
+fn codex_high8_half_close_preserves_data_and_shut_rd_drains_rights() {
+    let mut table = UnixSocketTable::new();
+    let cred = PeerCred {
+        pid: 10,
+        uid: 1000,
+        gid: 1000,
+    };
+    let pair = table.socketpair(10, SockType::Stream, cred).unwrap();
+
+    // A writes "queued" and calls SHUT_WR; then B calls SHUT_WR: B MUST still read "queued" before EOF!
+    table
+        .sendmsg(10, pair.sock_a, b"queued", Vec::new(), None, cred, None)
+        .unwrap();
+    let sh_a = table.shutdown(10, pair.sock_a, SHUT_WR).unwrap();
+    assert!(sh_a.close_tx_wr && !sh_a.close_rx_rd);
+    let sh_b = table.shutdown(10, pair.sock_b, SHUT_WR).unwrap();
+    assert!(sh_b.close_tx_wr && !sh_b.close_rx_rd);
+    // Subsequent send on A or B fails EPIPE.
+    assert_eq!(
+        table.sendmsg(10, pair.sock_a, b"x", Vec::new(), None, cred, None),
+        Err(Errno::EPIPE)
+    );
+    // B reads all queued bytes from A, then sees EOF.
+    let got = table.recvmsg(10, pair.sock_b, 16, 0, 0, None).unwrap();
+    assert_eq!(got.data, b"queued");
+    let eof = table.recvmsg(10, pair.sock_b, 16, 0, 0, None).unwrap();
+    assert!(eof.data.is_empty());
+    table.close(10, pair.sock_a, 1).unwrap();
+    table.close(10, pair.sock_b, 1).unwrap();
+
+    // Explicit SHUT_RD immediately discards queued rights & frees quotas/orphan sockets!
+    let p2 = table.socketpair(10, SockType::Stream, cred).unwrap();
+    let orphan = table.create(10, SockType::Dgram, cred).unwrap();
+    table
+        .sendmsg(
+            10,
+            p2.sock_a,
+            b"X",
+            vec![InFlightFd::UnixSocket(orphan)],
+            None,
+            cred,
+            None,
+        )
+        .unwrap();
+    table.close(10, orphan, 1).unwrap();
+    assert_eq!(table.stats().inflight_global, 1);
+    assert_eq!(table.stats().active_sockets, 3);
+
+    let sh_rd = table.shutdown(10, p2.sock_b, SHUT_RD).unwrap();
+    assert!(sh_rd.close_rx_rd && !sh_rd.close_tx_wr);
+    assert_eq!(table.stats().inflight_global, 0);
+    assert_eq!(table.stats().active_sockets, 2);
+    let eof2 = table.recvmsg(10, p2.sock_b, 16, 4, 0, None).unwrap();
+    assert!(eof2.data.is_empty() && eof2.fds.is_empty());
+    table.close(10, p2.sock_a, 1).unwrap();
+    table.close(10, p2.sock_b, 1).unwrap();
+    assert_eq!(table.stats().active_sockets, 0);
+    assert_eq!(table.stats().allocated_arena_slots, 0);
+}
+
+#[test]
+fn codex_high9_ctrunc_propagates_peer_close_notifications() {
+    let mut table = UnixSocketTable::new();
+    let cred = PeerCred {
+        pid: 10,
+        uid: 1000,
+        gid: 1000,
+    };
+    let outer = table.socketpair(10, SockType::Stream, cred).unwrap();
+    let inner = table.socketpair(10, SockType::Stream, cred).unwrap();
+
+    // Pass inner.sock_a over outer.sock_a and drop our external ref so ONLY the in-flight queue holds it.
+    table
+        .sendmsg(
+            10,
+            outer.sock_a,
+            b"Z",
+            vec![InFlightFd::UnixSocket(inner.sock_a)],
+            None,
+            cred,
+            None,
+        )
+        .unwrap();
+    table.close(10, inner.sock_a, 1).unwrap();
+
+    // Receiver accepts max_fds = 0 -> MSG_CTRUNC reclaims inner.sock_a -> MUST report peer_wr_closed & peer_rd_closed!
+    let r = table.recvmsg(10, outer.sock_b, 16, 0, 0, None).unwrap();
+    assert_eq!(r.out_flags & MSG_CTRUNC, MSG_CTRUNC);
+    assert!(r.fds.is_empty());
+    assert_eq!(r.peer_wr_closed, vec![inner.slot_ab.unwrap()]);
+    assert_eq!(r.peer_rd_closed, vec![inner.slot_ba.unwrap()]);
+
+    table.release_process(10);
+    assert_eq!(table.stats().active_sockets, 0);
+    assert_eq!(table.stats().allocated_arena_slots, 0);
+}
+
+#[test]
+fn codex_high13_high14_low1_listener_cred_passcred_dgram_peer_and_bound_name() {
+    let vfs = setup_vfs();
+    let mut table = UnixSocketTable::new();
+    let c10 = PeerCred {
+        pid: 10,
+        uid: 1000,
+        gid: 1000,
+    };
+    let c20 = PeerCred {
+        pid: 20,
+        uid: 2000,
+        gid: 2000,
+    };
+    let c30 = PeerCred {
+        pid: 30,
+        uid: 3000,
+        gid: 3000,
+    };
+
+    // High #13 + Low #1: pid 10 creates & binds /tmp/orig.sock, pid 20 calls listen(),
+    // then /tmp/orig.sock is renamed to /tmp/renamed.sock before pid 10 connects.
+    let lis = table.create(10, SockType::Stream, c10).unwrap();
+    let ent = block_on(vfs.mksockat(10, StartAnchor::Root, "/tmp/orig.sock", 0o666)).unwrap();
+    table
+        .bind(10, lis, inode_key(&ent), "/tmp/orig.sock".into())
+        .unwrap();
+    table.hold(20, lis, 1).unwrap();
+    table.listen(20, lis, 4, c20).unwrap();
+    block_on(vfs.renameat(
+        1,
+        StartAnchor::Root,
+        "/tmp/orig.sock",
+        StartAnchor::Root,
+        "/tmp/renamed.sock",
+        abi::fs::RenameFlags::empty(),
+    ))
+    .unwrap();
+
+    let cli = table.create(10, SockType::Stream, c10).unwrap();
+    let resolved =
+        block_on(vfs.resolve_socket_inode(10, StartAnchor::Root, "/tmp/renamed.sock")).unwrap();
+    let conn = table
+        .connect(
+            10,
+            cli,
+            &inode_key(&resolved),
+            "/tmp/renamed.sock".into(),
+            c10,
+        )
+        .unwrap();
+    // Client MUST see listener's credentials at listen() time (pid 20, NOT creator pid 10)!
+    assert_eq!(conn.peer_cred, c20);
+    // Low #1: getpeername & accepted getsockname MUST report bound name "/tmp/orig.sock", NOT "/tmp/renamed.sock"!
+    assert_eq!(table.getpeername(10, cli).unwrap(), "/tmp/orig.sock");
+    let acc = table.accept(20, lis, c20).unwrap();
+    assert_eq!(
+        table.getsockname(20, acc.sock_id).unwrap(),
+        "/tmp/orig.sock"
+    );
+
+    // High #13: SO_PASSCRED on accepted socket attributes plain writes from another holder (pid 30) to pid 30!
+    let opt = table
+        .setsockopt(20, acc.sock_id, SOL_SOCKET, SO_PASSCRED, 1)
+        .unwrap();
+    assert_eq!(opt.passcred, Some(true));
+    assert_eq!(opt.rx_slot, acc.rx_slot);
+    table.hold(30, cli, 1).unwrap();
+    table
+        .sendmsg(30, cli, b"from30", Vec::new(), None, c30, None)
+        .unwrap();
+    let got = table.recvmsg(20, acc.sock_id, 16, 0, 0, None).unwrap();
+    assert_eq!(got.data, b"from30");
+    assert_eq!(got.peer_cred, c30);
+
+    // High #14: Connected SOCK_DGRAM rejects third-party senders before charging quota!
+    let d_a = table.create(10, SockType::Dgram, c10).unwrap();
+    let ent_a = block_on(vfs.mksockat(10, StartAnchor::Root, "/tmp/da.sock", 0o666)).unwrap();
+    table
+        .bind(10, d_a, inode_key(&ent_a), "/tmp/da.sock".into())
+        .unwrap();
+    let d_b = table.create(20, SockType::Dgram, c20).unwrap();
+    let ent_b = block_on(vfs.mksockat(20, StartAnchor::Root, "/tmp/db.sock", 0o666)).unwrap();
+    table
+        .bind(20, d_b, inode_key(&ent_b), "/tmp/db.sock".into())
+        .unwrap();
+    // B connects to A -> B now accepts datagrams ONLY from A!
+    table
+        .connect(20, d_b, &inode_key(&ent_a), "/tmp/da.sock".into(), c20)
+        .unwrap();
+    let d_c = table.create(30, SockType::Dgram, c30).unwrap();
+    assert_eq!(
+        table.sendmsg(
+            30,
+            d_c,
+            b"spoof",
+            vec![InFlightFd::UnixSocket(d_c)],
+            Some(&inode_key(&ent_b)),
+            c30,
+            None
+        ),
+        Err(Errno::ECONNREFUSED)
+    );
+    assert_eq!(table.stats().inflight_global, 0);
+    // A sending to B succeeds!
+    table
+        .sendmsg(
+            10,
+            d_a,
+            b"legit",
+            Vec::new(),
+            Some(&inode_key(&ent_b)),
+            c10,
+            None,
+        )
+        .unwrap();
+    let dg = table.recvmsg(20, d_b, 16, 0, 0, None).unwrap();
+    assert_eq!(dg.data, b"legit");
+
+    table.release_process(10);
+    table.release_process(20);
+    table.release_process(30);
+    assert_eq!(table.stats().active_sockets, 0);
+}
+
+#[test]
+fn codex_high16_med4_med5_bind_rollback_trunc_peek_and_zero_len_stream() {
+    let vfs = setup_vfs();
+    let mut table = UnixSocketTable::new();
+    let cred = PeerCred {
+        pid: 10,
+        uid: 1000,
+        gid: 1000,
+    };
+
+    // High #16: begin_bind rejects concurrent second bind; rollback_created_inode won't unlink a replacement!
+    let s = table.create(10, SockType::Stream, cred).unwrap();
+    table.begin_bind(10, s, "/tmp/race.sock").unwrap();
+    assert_eq!(
+        table.begin_bind(10, s, "/tmp/race2.sock"),
+        Err(Errno::EINVAL)
+    );
+    let (created, parent_pin, parent_handle, name) =
+        block_on(vfs.mksockat_with_parent(10, StartAnchor::Root, "/tmp/race.sock", 0o666)).unwrap();
+    // Simulate another process renaming away and replacing `/tmp/race.sock` with a regular file!
+    block_on(vfs.renameat(
+        10,
+        StartAnchor::Root,
+        "/tmp/race.sock",
+        StartAnchor::Root,
+        "/tmp/moved.sock",
+        abi::fs::RenameFlags::empty(),
+    ))
+    .unwrap();
+    let repl = block_on(vfs.openat(
+        10,
+        StartAnchor::Root,
+        "/tmp/race.sock",
+        abi::O_RDWR | abi::O_CREAT,
+        0o644,
+    ))
+    .unwrap();
+    block_on(vfs.close(10, repl)).unwrap();
+    table.abort_bind(s);
+    // Rollback targeting `created.handle.node` MUST NOT delete the replacement regular file!
+    let _ = block_on(vfs.rollback_created_inode(
+        10,
+        &parent_pin,
+        &parent_handle,
+        &name,
+        created.handle.node,
+    ));
+    let st = block_on(vfs.statat(10, StartAnchor::Root, "/tmp/race.sock", true)).unwrap();
+    assert!(
+        !st.is_socket(),
+        "replacement regular file must survive bind rollback"
+    );
+    table.close(10, s, 1).unwrap();
+
+    // Medium #4: MSG_TRUNC orig_len + MSG_PEEK delivering fds without consuming message/quota!
+    let dp = table.socketpair(10, SockType::Dgram, cred).unwrap();
+    let pass_sock = table.create(10, SockType::Dgram, cred).unwrap();
+    table
+        .sendmsg(
+            10,
+            dp.sock_a,
+            b"12345678",
+            vec![InFlightFd::UnixSocket(pass_sock)],
+            None,
+            cred,
+            None,
+        )
+        .unwrap();
+    let peeked = table
+        .recvmsg(10, dp.sock_b, 1, 1, MSG_PEEK | MSG_TRUNC, None)
+        .unwrap();
+    assert_eq!(peeked.data, b"1");
+    assert_eq!(peeked.orig_len, 8);
+    assert_eq!(peeked.out_flags & MSG_TRUNC, MSG_TRUNC);
+    assert_eq!(peeked.fds.len(), 1);
+    assert_eq!(table.stats().inflight_global, 1);
+    // Close peeked duplicate ref, then consume the real message cleanly!
+    table.close(10, pass_sock, 1).unwrap();
+    let real = table.recvmsg(10, dp.sock_b, 16, 1, 0, None).unwrap();
+    assert_eq!(real.data, b"12345678");
+    assert_eq!(real.orig_len, 8);
+    assert_eq!(real.fds.len(), 1);
+    assert_eq!(table.stats().inflight_global, 0);
+
+    // Medium #5: 0-byte SOCK_STREAM sendmsg with SCM_RIGHTS charges 0 quota and installs no mark;
+    // 0-byte recvmsg with queued stream bytes returns 0 without consuming bytes or marks!
+    let sp = table.socketpair(10, SockType::Stream, cred).unwrap();
+    let zero_send = table
+        .sendmsg(
+            10,
+            sp.sock_a,
+            b"",
+            vec![InFlightFd::UnixSocket(pass_sock)],
+            None,
+            cred,
+            None,
+        )
+        .unwrap();
+    assert_eq!(zero_send.sent, 0);
+    assert!(!zero_send.has_ancillary);
+    assert_eq!(table.stats().inflight_global, 0);
+
+    table
+        .sendmsg(
+            10,
+            sp.sock_a,
+            b"AB",
+            vec![InFlightFd::UnixSocket(pass_sock)],
+            None,
+            cred,
+            None,
+        )
+        .unwrap();
+    let zero_recv = table.recvmsg(10, sp.sock_b, 0, 1, 0, None).unwrap();
+    assert!(zero_recv.data.is_empty() && zero_recv.fds.is_empty());
+    assert_eq!(table.stats().inflight_global, 1);
+    // Stream MSG_PEEK delivers fd without consuming bytes or mark!
+    let sp_peek = table.recvmsg(10, sp.sock_b, 2, 1, MSG_PEEK, None).unwrap();
+    assert_eq!(sp_peek.data, b"AB");
+    assert_eq!(sp_peek.fds.len(), 1);
+    assert_eq!(table.stats().inflight_global, 1);
+    table.close(10, pass_sock, 1).unwrap();
+    // Real receive still gets "AB" + [pass_sock].
+    let sp_real = table.recvmsg(10, sp.sock_b, 2, 1, 0, None).unwrap();
+    assert_eq!(sp_real.data, b"AB");
+    assert_eq!(sp_real.fds.len(), 1);
+    assert_eq!(table.stats().inflight_global, 0);
+
+    table.release_process(10);
+    assert_eq!(table.stats().active_sockets, 0);
+    assert_eq!(table.stats().allocated_arena_slots, 0);
 }

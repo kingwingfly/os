@@ -77,14 +77,24 @@ pub struct SocketInodeKey {
     pub node: NodeId,
 }
 
-/// Allocated `SockArena` slot with generation counter fenced on slot reuse.
+/// Allocated `SockArena` slot with monotonic 64-bit generation counter fenced on slot reuse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArenaSlot {
     pub slot: ArenaSlotId,
-    pub generation: u32,
+    pub generation: u64,
+}
+
+/// Slot freed by `ArenaPool::free`, carrying both the `expected_gen` being retired and the
+/// `fence_gen` to store via CAS so delayed cleanup can NEVER clobber a newly allocated live slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FreedSlot {
+    pub slot: ArenaSlotId,
+    pub expected_gen: u64,
+    pub fence_gen: u64,
 }
 
 /// One open file description queued inside an `SCM_RIGHTS` ancillary control message.
+#[derive(Clone)]
 pub enum InFlightFd {
     /// Local (`cowfs`/`tmpfs`/`hostfs`/`devfs`/`procfs`) OR remote `CloudFs` open description.
     /// `origin_pid` / `origin_token` record the sender's remote scope so an attenuated receiver
@@ -106,8 +116,9 @@ pub enum InFlightFd {
     /// Arena-backed pipe end (zero-copy across unrelated Workers via shared `SockArena` SAB).
     ArenaPipe {
         slot: ArenaSlotId,
-        generation: u32,
+        generation: u64,
         end: PipeEnd,
+        path_only: bool,
     },
     /// Local PTY master/slave handle owned by `PtyDevices`.
     Pty {
@@ -117,9 +128,8 @@ pub enum InFlightFd {
         readable: bool,
         writable: bool,
     },
-    /// Single-fd attenuated remote device transfer: grants ONLY `pread`/`pwrite`/`ioctl`/`close`
-    /// on this exact `sfd` while the originating `ServiceAuth v2` token remains unrevoked;
-    /// NEVER grants broader scope.
+    /// Single-fd attenuated remote device transfer: grants ONLY single-fd I/O on this exact `sfd`
+    /// while the originating `ServiceAuth v2` token remains unrevoked; NEVER grants broader scope.
     AttenuatedServerFd {
         sfd: Rc<u32>,
         owner_pid: u32,
@@ -157,6 +167,8 @@ pub struct ConnectResult {
     pub peer_cred: PeerCred,
     pub tx_slot: Option<ArenaSlot>,
     pub rx_slot: Option<ArenaSlot>,
+    pub nonblock: bool,
+    pub peer_passcred: bool,
 }
 
 /// Result of `accept()`.
@@ -178,12 +190,34 @@ pub struct PairResult {
 }
 
 /// Result of `shutdown()`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShutdownResult {
     pub tx_slot: Option<ArenaSlot>,
     pub rx_slot: Option<ArenaSlot>,
+    /// True iff THIS call shut down local reads (so SAB `rx_slot` reader must be closed).
+    pub close_rx_rd: bool,
+    /// True iff THIS call shut down local writes (so SAB `tx_slot` writer must be closed).
+    pub close_tx_wr: bool,
     pub shut_rd: bool,
     pub shut_wr: bool,
+    /// Any queued rights / orphaned sockets / arena slots drained by local `SHUT_RD`.
+    pub cleanup: CleanupBatch,
+}
+
+/// Result of `setsockopt()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetSockOptResult {
+    pub rx_slot: Option<ArenaSlot>,
+    pub passcred: Option<bool>,
+}
+
+/// Snapshot of a socket's transport and flags (`describe()`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketInfo {
+    pub sock_type: SockType,
+    pub tx_slot: Option<ArenaSlot>,
+    pub rx_slot: Option<ArenaSlot>,
+    pub passcred: bool,
+    pub nonblock: bool,
 }
 
 /// Readiness snapshot returned by `poll()`.
@@ -207,6 +241,8 @@ pub struct SendOutcome {
 /// Outcome of `recvmsg()`.
 pub struct RecvOutcome {
     pub data: Vec<u8>,
+    /// Original pre-truncation message byte length (returned when input `MSG_TRUNC` is set).
+    pub orig_len: usize,
     pub fds: Vec<InFlightFd>,
     pub dropped_fds: Vec<InFlightFd>,
     pub peer_cred: PeerCred,
@@ -217,13 +253,15 @@ pub struct RecvOutcome {
     pub max_stream_bytes: Option<usize>,
     pub has_next_ancillary: bool,
     pub next_ancillary_offset: u64,
-    pub freed_slots: Vec<ArenaSlot>,
+    pub freed_slots: Vec<FreedSlot>,
+    pub peer_wr_closed: Vec<ArenaSlot>,
+    pub peer_rd_closed: Vec<ArenaSlot>,
 }
 
 /// Cleanup items produced when sockets or cycles are reclaimed.
 #[derive(Default)]
 pub struct CleanupBatch {
-    pub freed_slots: Vec<ArenaSlot>,
+    pub freed_slots: Vec<FreedSlot>,
     pub dropped_fds: Vec<InFlightFd>,
     /// Peer `ArenaSlot`s that should be marked `WR_CLOSED` (we closed our tx end).
     pub peer_wr_closed: Vec<ArenaSlot>,
@@ -243,10 +281,10 @@ pub struct SocketStats {
 #[derive(Clone, Copy, Debug)]
 struct ArenaEntry {
     allocated: bool,
-    generation: u32,
+    generation: u64,
 }
 
-/// Fixed 128-slot `SockArena` allocator with generation fencing.
+/// Fixed 128-slot `SockArena` allocator with monotonic 64-bit generation fencing.
 struct ArenaPool {
     slots: Vec<ArenaEntry>,
     allocated_count: usize,
@@ -275,30 +313,39 @@ impl ArenaPool {
         for i in 0..ARENA_SLOTS {
             let idx = (self.next_cursor + i) % ARENA_SLOTS;
             if !self.slots[idx].allocated {
+                // Keep generation strictly within JS safe integer range (< 2^53) and monotonic.
+                let Some(next_gen) = self.slots[idx].generation.checked_add(1) else {
+                    continue;
+                };
+                if next_gen >= (1u64 << 52) {
+                    continue;
+                }
                 self.slots[idx].allocated = true;
-                self.slots[idx].generation = self.slots[idx].generation.wrapping_add(1).max(1);
+                self.slots[idx].generation = next_gen;
                 self.allocated_count += 1;
                 self.next_cursor = (idx + 1) % ARENA_SLOTS;
                 return Ok(ArenaSlot {
                     slot: idx as ArenaSlotId,
-                    generation: self.slots[idx].generation,
+                    generation: next_gen,
                 });
             }
         }
         Err(Errno::ENOBUFS)
     }
 
-    fn free(&mut self, slot: ArenaSlot) -> Option<ArenaSlot> {
+    fn free(&mut self, slot: ArenaSlot) -> Option<FreedSlot> {
         let entry = self.slots.get_mut(slot.slot as usize)?;
         if !entry.allocated || entry.generation != slot.generation {
             return None;
         }
         entry.allocated = false;
-        entry.generation = entry.generation.wrapping_add(1).max(1);
+        let fence_gen = entry.generation.saturating_add(1);
+        entry.generation = fence_gen;
         self.allocated_count = self.allocated_count.saturating_sub(1);
-        Some(ArenaSlot {
+        Some(FreedSlot {
             slot: slot.slot,
-            generation: entry.generation,
+            expected_gen: slot.generation,
+            fence_gen,
         })
     }
 
@@ -315,6 +362,8 @@ impl ArenaPool {
 
 enum SockState {
     Unbound,
+    /// Transitional reservation while creating the filesystem socket inode for `bind(2)`.
+    Binding,
     Bound,
     Listening {
         backlog: usize,
@@ -332,13 +381,19 @@ enum SockState {
         stream_enqueued: u64,
         /// Total stream bytes read from this socket's recv queue (pure-Rust mode).
         stream_read: u64,
-        /// Ancillary `SCM_RIGHTS` marks anchored to stream byte spans.
+        /// Ancillary `SCM_RIGHTS` / `SO_PASSCRED` marks anchored to stream byte spans.
         ancillary: VecDeque<AncillaryMark>,
         /// Discrete packet queue for `SOCK_SEQPACKET`.
         packets: VecDeque<PacketMsg>,
         queued_packet_bytes: usize,
+        /// Local `SHUT_RD` invoked on this endpoint (discards queued data/rights and returns EOF).
         shut_rd: bool,
+        /// Local `SHUT_WR` invoked on this endpoint (subsequent writes fail `EPIPE`).
         shut_wr: bool,
+        /// Peer invoked `SHUT_WR` (returns EOF only AFTER queued data/rights are drained).
+        peer_shut_wr: bool,
+        /// Peer invoked `SHUT_RD` (subsequent writes fail `EPIPE`).
+        peer_shut_rd: bool,
         peer_closed: bool,
     },
 }
@@ -363,6 +418,8 @@ struct UnixSocket {
     dgram_shut_wr: bool,
     /// `SO_PASSCRED` option flag.
     passcred: bool,
+    /// Shared open-file description `O_NONBLOCK` status flag (propagates across `SCM_RIGHTS`).
+    nonblock: bool,
     /// Pending `SO_ERROR` value.
     so_error: i32,
     state: SockState,
@@ -422,7 +479,7 @@ impl UnixSocketTable {
     }
 
     /// Free an arena-backed `fd_pipe` slot when both ends are closed.
-    pub fn free_pipe_slot(&mut self, slot: ArenaSlot) -> Option<ArenaSlot> {
+    pub fn free_pipe_slot(&mut self, slot: ArenaSlot) -> Option<FreedSlot> {
         self.arena.free(slot)
     }
 
@@ -435,9 +492,14 @@ impl UnixSocketTable {
         if self.sockets.len() >= UNIX_SOCK_MAX {
             return Err(Errno::ENOBUFS);
         }
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1).max(1);
-        Ok(id)
+        for _ in 0..=UNIX_SOCK_MAX {
+            let candidate = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1).max(1);
+            if candidate != 0 && !self.sockets.contains_key(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        Err(Errno::ENOBUFS)
     }
 
     /// Create an unbound `AF_UNIX` socket held by `pid` with kernel-authenticated `cred`.
@@ -461,6 +523,7 @@ impl UnixSocketTable {
                 dgram_shut_rd: false,
                 dgram_shut_wr: false,
                 passcred: false,
+                nonblock: false,
                 so_error: 0,
                 state: SockState::Unbound,
             },
@@ -493,7 +556,11 @@ impl UnixSocketTable {
         };
 
         let id_a = self.alloc_sock_id()?;
-        let id_b = self.alloc_sock_id()?;
+        // Reserve `id_a` briefly so `alloc_sock_id` cannot return the same ID for `id_b`.
+        let mut id_b = self.alloc_sock_id()?;
+        if id_b == id_a {
+            id_b = self.alloc_sock_id()?;
+        }
 
         let make_sock =
             |id: SockId, peer: SockId, tx_slot: Option<ArenaSlot>, rx_slot: Option<ArenaSlot>| {
@@ -518,6 +585,8 @@ impl UnixSocketTable {
                             queued_packet_bytes: 0,
                             shut_rd: false,
                             shut_wr: false,
+                            peer_shut_wr: false,
+                            peer_shut_rd: false,
                             peer_closed: false,
                         },
                     )
@@ -536,6 +605,7 @@ impl UnixSocketTable {
                     dgram_shut_rd: false,
                     dgram_shut_wr: false,
                     passcred: false,
+                    nonblock: false,
                     so_error: 0,
                     state,
                 }
@@ -582,27 +652,81 @@ impl UnixSocketTable {
         }
     }
 
-    /// Verify a socket is held by `pid` and return its type and `SockArena` slots (if connected).
-    pub fn describe(
-        &self,
-        pid: u32,
-        sock_id: SockId,
-    ) -> Result<(SockType, Option<ArenaSlot>, Option<ArenaSlot>)> {
+    /// Verify a socket is held by `pid` and return its type, `SockArena` slots, and shared flags.
+    pub fn describe(&self, pid: u32, sock_id: SockId) -> Result<SocketInfo> {
         let sock = self.sockets.get(&sock_id).ok_or(Errno::EBADF)?;
         if !sock.is_held_by(pid) {
             return Err(Errno::EBADF);
         }
-        let (tx, rx) = match &sock.state {
+        let (tx_slot, rx_slot) = match &sock.state {
             SockState::Connected {
                 tx_slot, rx_slot, ..
             } => (*tx_slot, *rx_slot),
             _ => (None, None),
         };
-        Ok((sock.sock_type, tx, rx))
+        Ok(SocketInfo {
+            sock_type: sock.sock_type,
+            tx_slot,
+            rx_slot,
+            passcred: sock.passcred,
+            nonblock: sock.nonblock,
+        })
     }
 
-    /// Bind an unbound socket to a freshly created filesystem socket inode `(fs_id, node)`.
-    pub fn bind(
+    /// Update the shared open-file description `O_NONBLOCK` flag on `sock_id`.
+    /// Returns `tx_slot` (if connected stream) so JS can mirror `FLAG_SOCK_NONBLOCK` in SAB.
+    pub fn set_nonblock(
+        &mut self,
+        pid: u32,
+        sock_id: SockId,
+        nonblock: bool,
+    ) -> Result<Option<ArenaSlot>> {
+        let sock = self.sockets.get_mut(&sock_id).ok_or(Errno::EBADF)?;
+        if !sock.is_held_by(pid) {
+            return Err(Errno::EBADF);
+        }
+        sock.nonblock = nonblock;
+        let tx = match &sock.state {
+            SockState::Connected { tx_slot, .. } => *tx_slot,
+            _ => None,
+        };
+        Ok(tx)
+    }
+
+    /// Query the shared open-file description `O_NONBLOCK` flag on `sock_id`.
+    pub fn is_nonblock(&self, pid: u32, sock_id: SockId) -> Result<bool> {
+        let sock = self.sockets.get(&sock_id).ok_or(Errno::EBADF)?;
+        if !sock.is_held_by(pid) {
+            return Err(Errno::EBADF);
+        }
+        Ok(sock.nonblock)
+    }
+
+    /// Atomically reserve an unbound socket for `bind(2)` BEFORE creating any filesystem inode.
+    pub fn begin_bind(&mut self, pid: u32, sock_id: SockId, path: &str) -> Result<()> {
+        validate_unix_path(path)?;
+        let sock = self.sockets.get_mut(&sock_id).ok_or(Errno::EBADF)?;
+        if !sock.is_held_by(pid) {
+            return Err(Errno::EBADF);
+        }
+        if sock.bound_key.is_some() || !matches!(sock.state, SockState::Unbound) {
+            return Err(Errno::EINVAL);
+        }
+        sock.state = SockState::Binding;
+        Ok(())
+    }
+
+    /// Abort a reserved `bind(2)` transition (if inode creation failed).
+    pub fn abort_bind(&mut self, sock_id: SockId) {
+        if let Some(sock) = self.sockets.get_mut(&sock_id)
+            && matches!(sock.state, SockState::Binding)
+        {
+            sock.state = SockState::Unbound;
+        }
+    }
+
+    /// Complete a reserved `bind(2)` transition once the socket inode exists.
+    pub fn finish_bind(
         &mut self,
         pid: u32,
         sock_id: SockId,
@@ -617,7 +741,7 @@ impl UnixSocketTable {
         if !sock.is_held_by(pid) {
             return Err(Errno::EBADF);
         }
-        if sock.bound_key.is_some() || !matches!(sock.state, SockState::Unbound) {
+        if sock.bound_key.is_some() || !matches!(sock.state, SockState::Binding) {
             return Err(Errno::EINVAL);
         }
         sock.bound_key = Some(key.clone());
@@ -627,8 +751,31 @@ impl UnixSocketTable {
         Ok(())
     }
 
-    /// Mark a bound `SOCK_STREAM` or `SOCK_SEQPACKET` socket as listening.
-    pub fn listen(&mut self, pid: u32, sock_id: SockId, backlog: u32) -> Result<()> {
+    /// Bind an unbound socket to a freshly created filesystem socket inode `(fs_id, node)`.
+    pub fn bind(
+        &mut self,
+        pid: u32,
+        sock_id: SockId,
+        key: SocketInodeKey,
+        path: String,
+    ) -> Result<()> {
+        self.begin_bind(pid, sock_id, &path)?;
+        if let Err(err) = self.finish_bind(pid, sock_id, key, path) {
+            self.abort_bind(sock_id);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Mark a bound `SOCK_STREAM` or `SOCK_SEQPACKET` socket as listening, capturing the
+    /// listener's credentials from `LocalProcessTable` at `listen(2)` time (Linux `unix(7)`).
+    pub fn listen(
+        &mut self,
+        pid: u32,
+        sock_id: SockId,
+        backlog: u32,
+        caller_cred: PeerCred,
+    ) -> Result<()> {
         let sock = self.sockets.get_mut(&sock_id).ok_or(Errno::EBADF)?;
         if !sock.is_held_by(pid) {
             return Err(Errno::EBADF);
@@ -639,6 +786,7 @@ impl UnixSocketTable {
         let clamped = (backlog as usize).clamp(1, UNIX_SOMAXCONN);
         match &mut sock.state {
             SockState::Bound => {
+                sock.owner_cred = caller_cred;
                 sock.state = SockState::Listening {
                     backlog: clamped,
                     pending: VecDeque::new(),
@@ -649,6 +797,7 @@ impl UnixSocketTable {
                 backlog: cur_backlog,
                 ..
             } => {
+                sock.owner_cred = caller_cred;
                 *cur_backlog = clamped;
                 Ok(())
             }
@@ -669,7 +818,14 @@ impl UnixSocketTable {
         target_path: String,
         caller_cred: PeerCred,
     ) -> Result<ConnectResult> {
-        let (client_type, client_is_conn, client_is_listening, client_bound_path) = {
+        let (
+            client_type,
+            client_is_conn,
+            client_is_listening,
+            client_bound_path,
+            client_nonblock,
+            client_passcred,
+        ) = {
             let client = self.sockets.get(&client_id).ok_or(Errno::EBADF)?;
             if !client.is_held_by(pid) {
                 return Err(Errno::EBADF);
@@ -679,11 +835,20 @@ impl UnixSocketTable {
                 matches!(client.state, SockState::Connected { .. }),
                 matches!(client.state, SockState::Listening { .. }),
                 client.bound_path.clone(),
+                client.nonblock,
+                client.passcred,
             )
         };
 
         let target_id = *self.bindings.get(target_key).ok_or(Errno::ECONNREFUSED)?;
-        let (target_type, target_cred, target_listening, target_full) = {
+        let (
+            target_type,
+            target_cred,
+            target_listening,
+            target_full,
+            target_bound_path,
+            target_passcred,
+        ) = {
             let target = self.sockets.get(&target_id).ok_or(Errno::ECONNREFUSED)?;
             let (listening, full) = match &target.state {
                 SockState::Listening {
@@ -691,8 +856,16 @@ impl UnixSocketTable {
                 } => (true, pending.len() >= *backlog),
                 _ => (false, false),
             };
-            (target.sock_type, target.owner_cred, listening, full)
+            (
+                target.sock_type,
+                target.owner_cred,
+                listening,
+                full,
+                target.bound_path.clone(),
+                target.passcred,
+            )
         };
+        let canonical_target_path = target_bound_path.unwrap_or(target_path);
 
         if client_type != target_type {
             return Err(Errno::EPROTOTYPE);
@@ -700,13 +873,15 @@ impl UnixSocketTable {
 
         if client_type == SockType::Dgram {
             let client = self.sockets.get_mut(&client_id).ok_or(Errno::EBADF)?;
-            client.dgram_peer = Some((target_id, target_path));
+            client.dgram_peer = Some((target_id, canonical_target_path));
             return Ok(ConnectResult {
                 peer_id: target_id,
                 listener_id: None,
                 peer_cred: target_cred,
                 tx_slot: None,
                 rx_slot: None,
+                nonblock: client_nonblock,
+                peer_passcred: target_passcred,
             });
         }
 
@@ -748,13 +923,14 @@ impl UnixSocketTable {
             external_holders: HashMap::new(),
             inflight_refs: 0,
             bound_key: None,
-            bound_path: Some(target_path.clone()),
+            bound_path: Some(canonical_target_path.clone()),
             dgram_peer: None,
             dgram_queue: VecDeque::new(),
             dgram_queued_bytes: 0,
             dgram_shut_rd: false,
             dgram_shut_wr: false,
-            passcred: false,
+            passcred: target_passcred,
+            nonblock: false,
             so_error: 0,
             state: SockState::Connected {
                 peer: Some(client_id),
@@ -770,6 +946,8 @@ impl UnixSocketTable {
                 queued_packet_bytes: 0,
                 shut_rd: false,
                 shut_wr: false,
+                peer_shut_wr: false,
+                peer_shut_rd: false,
                 peer_closed: false,
             },
         };
@@ -780,7 +958,7 @@ impl UnixSocketTable {
             client.state = SockState::Connected {
                 peer: Some(server_id),
                 peer_cred: target_cred,
-                peer_path: Some(target_path),
+                peer_path: Some(canonical_target_path),
                 tx_slot: slot_c2s,
                 rx_slot: slot_s2c,
                 stream_buf: VecDeque::new(),
@@ -791,6 +969,8 @@ impl UnixSocketTable {
                 queued_packet_bytes: 0,
                 shut_rd: false,
                 shut_wr: false,
+                peer_shut_wr: false,
+                peer_shut_rd: false,
                 peer_closed: false,
             };
         }
@@ -801,12 +981,15 @@ impl UnixSocketTable {
             pending.push_back(server_id);
         }
 
+        let _ = client_passcred;
         Ok(ConnectResult {
             peer_id: server_id,
             listener_id: Some(target_id),
             peer_cred: target_cred,
             tx_slot: slot_c2s,
             rx_slot: slot_s2c,
+            nonblock: client_nonblock,
+            peer_passcred: target_passcred,
         })
     }
 
@@ -854,30 +1037,48 @@ impl UnixSocketTable {
     }
 
     /// Shut down reads, writes, or both on a socket (`shutdown(2)`).
+    ///
+    /// Tracks local `shut_rd`/`shut_wr` separately from peer `peer_shut_wr`/`peer_shut_rd` so
+    /// peer half-close preserves unread queued bytes, while local `SHUT_RD` immediately discards
+    /// queued data & `SCM_RIGHTS` descriptors (decrementing quotas and running GC as needed).
     pub fn shutdown(&mut self, pid: u32, sock_id: SockId, how: u32) -> Result<ShutdownResult> {
         if how != SHUT_RD && how != SHUT_WR && how != SHUT_RDWR {
             return Err(Errno::EINVAL);
         }
         let shut_r = how == SHUT_RD || how == SHUT_RDWR;
         let shut_w = how == SHUT_WR || how == SHUT_RDWR;
+        let mut cleanup = CleanupBatch::default();
 
-        let (peer_id, tx_slot, rx_slot, out_rd, out_wr) = {
+        let (peer_id, tx_slot, rx_slot, out_rd, out_wr, drained_items) = {
             let sock = self.sockets.get_mut(&sock_id).ok_or(Errno::EBADF)?;
             if !sock.is_held_by(pid) {
                 return Err(Errno::EBADF);
             }
             if sock.sock_type == SockType::Dgram {
+                let mut drained: Vec<(u32, Vec<InFlightFd>)> = Vec::new();
                 if shut_r {
                     sock.dgram_shut_rd = true;
+                    sock.dgram_queued_bytes = 0;
+                    for msg in sock.dgram_queue.drain(..) {
+                        if !msg.fds.is_empty() {
+                            drained.push((msg.sender_uid, msg.fds));
+                        }
+                    }
                 }
                 if shut_w {
                     sock.dgram_shut_wr = true;
                 }
+                let out_rd = sock.dgram_shut_rd;
+                let out_wr = sock.dgram_shut_wr;
+                self.drain_shutdown_rights(drained, &mut cleanup);
                 return Ok(ShutdownResult {
                     tx_slot: None,
                     rx_slot: None,
-                    shut_rd: sock.dgram_shut_rd,
-                    shut_wr: sock.dgram_shut_wr,
+                    close_rx_rd: shut_r,
+                    close_tx_wr: shut_w,
+                    shut_rd: out_rd,
+                    shut_wr: out_wr,
+                    cleanup,
                 });
             }
             match &mut sock.state {
@@ -885,44 +1086,90 @@ impl UnixSocketTable {
                     peer,
                     tx_slot,
                     rx_slot,
+                    stream_buf,
+                    stream_read,
+                    stream_enqueued,
+                    ancillary,
+                    packets,
+                    queued_packet_bytes,
                     shut_rd,
                     shut_wr,
                     ..
                 } => {
+                    let mut drained: Vec<(u32, Vec<InFlightFd>)> = Vec::new();
                     if shut_r {
                         *shut_rd = true;
+                        stream_buf.clear();
+                        *stream_read = *stream_enqueued;
+                        *queued_packet_bytes = 0;
+                        for mark in ancillary.drain(..) {
+                            if !mark.fds.is_empty() {
+                                drained.push((mark.sender_uid, mark.fds));
+                            }
+                        }
+                        for msg in packets.drain(..) {
+                            if !msg.fds.is_empty() {
+                                drained.push((msg.sender_uid, msg.fds));
+                            }
+                        }
                     }
                     if shut_w {
                         *shut_wr = true;
                     }
-                    (*peer, *tx_slot, *rx_slot, *shut_rd, *shut_wr)
+                    (*peer, *tx_slot, *rx_slot, *shut_rd, *shut_wr, drained)
                 }
                 _ => return Err(Errno::ENOTCONN),
             }
         };
 
+        self.drain_shutdown_rights(drained_items, &mut cleanup);
+
         if let Some(peer_id) = peer_id
             && let Some(peer) = self.sockets.get_mut(&peer_id)
             && let SockState::Connected {
-                shut_rd: peer_rd,
-                shut_wr: peer_wr,
+                peer_shut_wr,
+                peer_shut_rd,
                 ..
             } = &mut peer.state
         {
             if shut_r {
-                *peer_wr = true;
+                *peer_shut_rd = true;
             }
             if shut_w {
-                *peer_rd = true;
+                *peer_shut_wr = true;
             }
         }
 
         Ok(ShutdownResult {
             tx_slot,
             rx_slot,
+            close_rx_rd: shut_r,
+            close_tx_wr: shut_w,
             shut_rd: out_rd,
             shut_wr: out_wr,
+            cleanup,
         })
+    }
+
+    fn drain_shutdown_rights(
+        &mut self,
+        drained: Vec<(u32, Vec<InFlightFd>)>,
+        batch: &mut CleanupBatch,
+    ) {
+        if drained.is_empty() {
+            return;
+        }
+        let mut work = VecDeque::new();
+        let mut needs_gc = false;
+        for (sender_uid, fds) in drained {
+            self.drain_inflight_fds(sender_uid, fds, batch, &mut work, &mut needs_gc);
+        }
+        while let Some(id) = work.pop_front() {
+            self.reap_socket_cascade(id, batch);
+        }
+        if needs_gc {
+            self.unix_gc(batch);
+        }
     }
 
     /// Query kernel-authenticated `SO_PEERCRED` (`PeerCred`).
@@ -1003,7 +1250,7 @@ impl UnixSocketTable {
         level: u32,
         optname: u32,
         val: i32,
-    ) -> Result<()> {
+    ) -> Result<SetSockOptResult> {
         if level != SOL_SOCKET {
             return Err(Errno::EOPNOTSUPP);
         }
@@ -1014,7 +1261,14 @@ impl UnixSocketTable {
         match optname {
             SO_PASSCRED => {
                 sock.passcred = val != 0;
-                Ok(())
+                let rx_slot = match &sock.state {
+                    SockState::Connected { rx_slot, .. } => *rx_slot,
+                    _ => None,
+                };
+                Ok(SetSockOptResult {
+                    rx_slot,
+                    passcred: Some(sock.passcred),
+                })
             }
             _ => Err(Errno::EOPNOTSUPP),
         }
@@ -1131,6 +1385,13 @@ impl UnixSocketTable {
                 if target.sock_type != SockType::Dgram {
                     return Err(Errno::EPROTOTYPE);
                 }
+                // POSIX connect(3p): a connected SOCK_DGRAM socket accepts datagrams ONLY from its
+                // connected peer (rejects third-party senders before charging quota or enqueueing).
+                if let Some((expected_peer, _)) = target.dgram_peer
+                    && expected_peer != sock_id
+                {
+                    return Err(Errno::ECONNREFUSED);
+                }
                 if target.dgram_shut_rd {
                     return Err(Errno::EPIPE);
                 }
@@ -1173,10 +1434,11 @@ impl UnixSocketTable {
                         SockState::Connected {
                             peer,
                             shut_wr,
+                            peer_shut_rd,
                             peer_closed,
                             ..
                         } => {
-                            if *shut_wr || *peer_closed {
+                            if *shut_wr || *peer_shut_rd || *peer_closed {
                                 return Err(Errno::EPIPE);
                             }
                             (*peer).ok_or(Errno::EPIPE)?
@@ -1241,10 +1503,11 @@ impl UnixSocketTable {
                         SockState::Connected {
                             peer,
                             shut_wr,
+                            peer_shut_rd,
                             peer_closed,
                             ..
                         } => {
-                            if *shut_wr || *peer_closed {
+                            if *shut_wr || *peer_shut_rd || *peer_closed {
                                 return Err(Errno::EPIPE);
                             }
                             (*peer).ok_or(Errno::EPIPE)?
@@ -1253,8 +1516,8 @@ impl UnixSocketTable {
                     }
                 };
 
-                // Check peer readiness & stream capacity.
-                let (peer_rx_slot, write_len) = {
+                // Check peer readiness, `SO_PASSCRED`, & stream capacity.
+                let (peer_rx_slot, write_len, peer_passcred) = {
                     let peer = self.sockets.get(&peer_id).ok_or(Errno::EPIPE)?;
                     match &peer.state {
                         SockState::Connected {
@@ -1267,9 +1530,6 @@ impl UnixSocketTable {
                             if *shut_rd {
                                 return Err(Errno::EPIPE);
                             }
-                            if !fds.is_empty() && ancillary.len() >= UNIX_MAX_QUEUED_MSGS {
-                                return Err(Errno::EAGAIN);
-                            }
                             let len = if let Some((s, e)) = sab_stream_span {
                                 (e.saturating_sub(s)) as usize
                             } else {
@@ -1279,11 +1539,37 @@ impl UnixSocketTable {
                                 }
                                 data.len().min(room)
                             };
-                            (*rx_slot, len)
+                            let wants_mark = len > 0 && (!fds.is_empty() || peer.passcred);
+                            if wants_mark && ancillary.len() >= UNIX_MAX_QUEUED_MSGS {
+                                return Err(Errno::EAGAIN);
+                            }
+                            (*rx_slot, len, peer.passcred)
                         }
                         _ => return Err(Errno::EPIPE),
                     }
                 };
+
+                // Linux unix(7): on SOCK_STREAM, SCM_RIGHTS / SO_PASSCRED marks attach ONLY when
+                // at least 1 real payload byte is committed (zero-length send charges 0 fds).
+                if write_len == 0 {
+                    let (has_anc, head_off) = {
+                        let peer = self.sockets.get(&peer_id).ok_or(Errno::EPIPE)?;
+                        match &peer.state {
+                            SockState::Connected { ancillary, .. } => match ancillary.front() {
+                                Some(mark) => (true, mark.start_offset),
+                                None => (false, 0),
+                            },
+                            _ => (false, 0),
+                        }
+                    };
+                    return Ok(SendOutcome {
+                        sent: 0,
+                        target_id: peer_id,
+                        target_rx_slot: peer_rx_slot,
+                        has_ancillary: has_anc,
+                        head_ancillary_offset: head_off,
+                    });
+                }
 
                 self.account_inflight_enqueue(sender_uid, &fds);
                 let peer = self.sockets.get_mut(&peer_id).ok_or(Errno::EPIPE)?;
@@ -1302,7 +1588,7 @@ impl UnixSocketTable {
                             *stream_enqueued = stream_enqueued.saturating_add(write_len as u64);
                             (start, *stream_enqueued)
                         };
-                        if !fds.is_empty() {
+                        if !fds.is_empty() || peer_passcred {
                             ancillary.push_back(AncillaryMark {
                                 start_offset: start_off,
                                 end_offset: end_off,
@@ -1362,14 +1648,14 @@ impl UnixSocketTable {
             SockType::Dgram => {
                 let (msg_opt, shut_rd) = {
                     let sock = self.sockets.get_mut(&sock_id).ok_or(Errno::EBADF)?;
-                    if sock.dgram_queue.is_empty() {
+                    if sock.dgram_shut_rd || sock.dgram_queue.is_empty() {
                         (None, sock.dgram_shut_rd)
                     } else if peek {
                         let front = sock.dgram_queue.front().unwrap();
                         (
                             Some((
                                 front.data.clone(),
-                                Vec::new(),
+                                front.fds.clone(),
                                 front.sender_cred,
                                 front.sender_uid,
                                 front.sender_path.clone(),
@@ -1391,6 +1677,7 @@ impl UnixSocketTable {
                     if shut_rd {
                         return Ok(RecvOutcome {
                             data: Vec::new(),
+                            orig_len: 0,
                             fds: Vec::new(),
                             dropped_fds: Vec::new(),
                             peer_cred: PeerCred::default(),
@@ -1400,6 +1687,8 @@ impl UnixSocketTable {
                             has_next_ancillary: false,
                             next_ancillary_offset: 0,
                             freed_slots: Vec::new(),
+                            peer_wr_closed: Vec::new(),
+                            peer_rd_closed: Vec::new(),
                         });
                     }
                     return Err(Errno::EAGAIN);
@@ -1425,17 +1714,20 @@ impl UnixSocketTable {
                             packets,
                             queued_packet_bytes,
                             shut_rd,
+                            peer_shut_wr,
                             peer_closed,
                             ..
                         } => {
-                            if packets.is_empty() {
-                                (None, *shut_rd || *peer_closed)
+                            if *shut_rd {
+                                (None, true)
+                            } else if packets.is_empty() {
+                                (None, *peer_shut_wr || *peer_closed)
                             } else if peek {
                                 let front = packets.front().unwrap();
                                 (
                                     Some((
                                         front.data.clone(),
-                                        Vec::new(),
+                                        front.fds.clone(),
                                         front.sender_cred,
                                         front.sender_uid,
                                         front.sender_path.clone(),
@@ -1466,6 +1758,7 @@ impl UnixSocketTable {
                     if eof {
                         return Ok(RecvOutcome {
                             data: Vec::new(),
+                            orig_len: 0,
                             fds: Vec::new(),
                             dropped_fds: Vec::new(),
                             peer_cred: PeerCred::default(),
@@ -1475,6 +1768,8 @@ impl UnixSocketTable {
                             has_next_ancillary: false,
                             next_ancillary_offset: 0,
                             freed_slots: Vec::new(),
+                            peer_wr_closed: Vec::new(),
+                            peer_rd_closed: Vec::new(),
                         });
                     }
                     return Err(Errno::EAGAIN);
@@ -1513,6 +1808,7 @@ impl UnixSocketTable {
         _want_full_len: bool,
     ) -> Result<RecvOutcome> {
         let mut out_flags = 0u32;
+        let orig_len = raw_data.len();
         let data = if raw_data.len() > buf_len {
             out_flags |= MSG_TRUNC;
             raw_data[..buf_len].to_vec()
@@ -1522,10 +1818,14 @@ impl UnixSocketTable {
         let mut delivered = Vec::new();
         let mut dropped = Vec::new();
         let mut freed_slots = Vec::new();
+        let mut peer_wr_closed = Vec::new();
+        let mut peer_rd_closed = Vec::new();
 
-        if !peek && !raw_fds.is_empty() {
-            self.account_inflight_dequeue(sender_uid, raw_fds);
+        if !raw_fds.is_empty() {
             let all = std::mem::take(raw_fds);
+            if !peek {
+                self.account_inflight_dequeue(sender_uid, &all);
+            }
             if all.len() > max_fds {
                 out_flags |= MSG_CTRUNC;
             }
@@ -1537,7 +1837,9 @@ impl UnixSocketTable {
                         *s.external_holders.entry(pid).or_insert(0) += 1;
                     }
                     delivered.push(fd);
-                } else {
+                } else if !peek {
+                    // Only non-peek calls discard truncated descriptors; peek leaves the
+                    // original queued message (and its quota charge) untouched.
                     dropped.push(fd);
                 }
             }
@@ -1545,12 +1847,15 @@ impl UnixSocketTable {
                 let mut gc_batch = CleanupBatch::default();
                 self.dispose_dropped_fds(&mut dropped, &mut gc_batch);
                 freed_slots.extend(gc_batch.freed_slots);
+                peer_wr_closed.extend(gc_batch.peer_wr_closed);
+                peer_rd_closed.extend(gc_batch.peer_rd_closed);
                 dropped.extend(gc_batch.dropped_fds);
             }
         }
 
         Ok(RecvOutcome {
             data,
+            orig_len,
             fds: delivered,
             dropped_fds: dropped,
             peer_cred: sender_cred,
@@ -1560,6 +1865,8 @@ impl UnixSocketTable {
             has_next_ancillary: false,
             next_ancillary_offset: 0,
             freed_slots,
+            peer_wr_closed,
+            peer_rd_closed,
         })
     }
 
@@ -1573,7 +1880,7 @@ impl UnixSocketTable {
         sab_rx_tail: Option<u64>,
     ) -> Result<RecvOutcome> {
         // Phase 1: inspect stream queue & ancillary marks.
-        let mut delivered_mark: Option<AncillaryMark> = None;
+        let mut delivered_mark: Option<(Vec<InFlightFd>, PeerCred, u32, bool)> = None;
         let data: Vec<u8>;
         let max_stream_bytes: Option<usize>;
         let peer_cred: PeerCred;
@@ -1589,15 +1896,28 @@ impl UnixSocketTable {
                     stream_read,
                     ancillary,
                     shut_rd,
+                    peer_shut_wr,
                     peer_closed,
                     ..
                 } => {
                     peer_cred = *pcred;
                     if let Some(rx_tail) = sab_rx_tail {
                         // Browser SockArena SAB mode: bytes live in the shared ring; we enforce
-                        // exact ancillary byte-offset boundaries and pop marks at `rx_tail`.
+                        // exact ancillary byte-offset boundaries and pop/peek marks at `rx_tail`.
                         data = Vec::new();
-                        if let Some(front) = ancillary.front() {
+                        if *shut_rd || buf_len == 0 {
+                            max_stream_bytes = Some(0);
+                            match ancillary.front() {
+                                Some(m) if !*shut_rd => {
+                                    has_next_ancillary = true;
+                                    next_ancillary_offset = m.start_offset;
+                                }
+                                _ => {
+                                    has_next_ancillary = false;
+                                    next_ancillary_offset = 0;
+                                }
+                            }
+                        } else if let Some(front) = ancillary.front() {
                             if rx_tail < front.start_offset {
                                 let until_mark = (front.start_offset - rx_tail) as usize;
                                 max_stream_bytes = Some(buf_len.min(until_mark));
@@ -1615,8 +1935,16 @@ impl UnixSocketTable {
                                 };
                                 let span = stop_at.saturating_sub(rx_tail) as usize;
                                 max_stream_bytes = Some(buf_len.min(span));
-                                if !peek {
-                                    delivered_mark = ancillary.pop_front();
+                                if peek {
+                                    delivered_mark = Some((
+                                        front.fds.clone(),
+                                        front.sender_cred,
+                                        front.sender_uid,
+                                        true,
+                                    ));
+                                } else if let Some(m) = ancillary.pop_front() {
+                                    delivered_mark =
+                                        Some((m.fds, m.sender_cred, m.sender_uid, false));
                                 }
                                 match ancillary.front() {
                                     Some(m) => {
@@ -1637,10 +1965,11 @@ impl UnixSocketTable {
                     } else {
                         // Pure-Rust mode: read directly from `stream_buf`.
                         max_stream_bytes = None;
-                        if stream_buf.is_empty() && ancillary.is_empty() {
-                            if *shut_rd || *peer_closed {
+                        if *shut_rd || (stream_buf.is_empty() && ancillary.is_empty()) {
+                            if *shut_rd || *peer_shut_wr || *peer_closed {
                                 return Ok(RecvOutcome {
                                     data: Vec::new(),
+                                    orig_len: 0,
                                     fds: Vec::new(),
                                     dropped_fds: Vec::new(),
                                     peer_cred,
@@ -1650,9 +1979,32 @@ impl UnixSocketTable {
                                     has_next_ancillary: false,
                                     next_ancillary_offset: 0,
                                     freed_slots: Vec::new(),
+                                    peer_wr_closed: Vec::new(),
+                                    peer_rd_closed: Vec::new(),
                                 });
                             }
                             return Err(Errno::EAGAIN);
+                        }
+                        if buf_len == 0 {
+                            let (has_next, next_off) = match ancillary.front() {
+                                Some(m) => (true, m.start_offset),
+                                None => (false, 0),
+                            };
+                            return Ok(RecvOutcome {
+                                data: Vec::new(),
+                                orig_len: 0,
+                                fds: Vec::new(),
+                                dropped_fds: Vec::new(),
+                                peer_cred,
+                                sender_path: None,
+                                out_flags: 0,
+                                max_stream_bytes: None,
+                                has_next_ancillary: has_next,
+                                next_ancillary_offset: next_off,
+                                freed_slots: Vec::new(),
+                                peer_wr_closed: Vec::new(),
+                                peer_rd_closed: Vec::new(),
+                            });
                         }
 
                         let limit = if let Some(front) = ancillary.front() {
@@ -1668,8 +2020,16 @@ impl UnixSocketTable {
                                     None => end_bound,
                                 };
                                 let span = stop_at.saturating_sub(*stream_read) as usize;
-                                if !peek {
-                                    delivered_mark = ancillary.pop_front();
+                                if peek {
+                                    delivered_mark = Some((
+                                        front.fds.clone(),
+                                        front.sender_cred,
+                                        front.sender_uid,
+                                        true,
+                                    ));
+                                } else if let Some(m) = ancillary.pop_front() {
+                                    delivered_mark =
+                                        Some((m.fds, m.sender_cred, m.sender_uid, false));
                                 }
                                 if span == 0 && next_start.is_none() {
                                     buf_len.min(stream_buf.len())
@@ -1703,20 +2063,24 @@ impl UnixSocketTable {
             }
         }
 
-        // Phase 2: deliver/truncate any popped `AncillaryMark`.
+        // Phase 2: deliver/truncate any popped or peeked `AncillaryMark`.
         let mut out_flags = 0u32;
         let mut delivered = Vec::new();
         let mut dropped = Vec::new();
         let mut freed_slots = Vec::new();
+        let mut peer_wr_closed = Vec::new();
+        let mut peer_rd_closed = Vec::new();
         let mut out_cred = peer_cred;
 
-        if let Some(mark) = delivered_mark {
-            out_cred = mark.sender_cred;
-            self.account_inflight_dequeue(mark.sender_uid, &mark.fds);
-            if mark.fds.len() > max_fds {
+        if let Some((fds, sender_cred, sender_uid, is_peek)) = delivered_mark {
+            out_cred = sender_cred;
+            if !is_peek {
+                self.account_inflight_dequeue(sender_uid, &fds);
+            }
+            if fds.len() > max_fds {
                 out_flags |= MSG_CTRUNC;
             }
-            for (idx, fd) in mark.fds.into_iter().enumerate() {
+            for (idx, fd) in fds.into_iter().enumerate() {
                 if idx < max_fds {
                     if let InFlightFd::UnixSocket(id) = fd
                         && let Some(s) = self.sockets.get_mut(&id)
@@ -1724,7 +2088,7 @@ impl UnixSocketTable {
                         *s.external_holders.entry(pid).or_insert(0) += 1;
                     }
                     delivered.push(fd);
-                } else {
+                } else if !is_peek {
                     dropped.push(fd);
                 }
             }
@@ -1732,12 +2096,16 @@ impl UnixSocketTable {
                 let mut gc_batch = CleanupBatch::default();
                 self.dispose_dropped_fds(&mut dropped, &mut gc_batch);
                 freed_slots.extend(gc_batch.freed_slots);
+                peer_wr_closed.extend(gc_batch.peer_wr_closed);
+                peer_rd_closed.extend(gc_batch.peer_rd_closed);
                 dropped.extend(gc_batch.dropped_fds);
             }
         }
 
+        let orig_len = data.len();
         Ok(RecvOutcome {
             data,
+            orig_len,
             fds: delivered,
             dropped_fds: dropped,
             peer_cred: out_cred,
@@ -1747,6 +2115,8 @@ impl UnixSocketTable {
             has_next_ancillary,
             next_ancillary_offset,
             freed_slots,
+            peer_wr_closed,
+            peer_rd_closed,
         })
     }
 
@@ -1826,6 +2196,8 @@ impl UnixSocketTable {
                     packets,
                     shut_rd,
                     shut_wr,
+                    peer_shut_wr,
+                    peer_shut_rd,
                     peer_closed,
                     ..
                 } => {
@@ -1841,14 +2213,14 @@ impl UnixSocketTable {
                                 packets.front().map_or(0, |m| m.data.len()),
                             )
                         };
-                        let hangup = *shut_rd || *peer_closed;
+                        let hangup = *shut_rd || *peer_shut_wr || *peer_closed;
                         Ok(PollStatus {
                             ready: has_data || hangup,
                             nbytes,
                             hangup,
                         })
                     } else {
-                        if *shut_wr || *peer_closed {
+                        if *shut_wr || *peer_shut_rd || *peer_closed {
                             return Ok(PollStatus {
                                 ready: true,
                                 nbytes: 0,
@@ -2199,7 +2571,7 @@ impl UnixSocketTable {
                     }
                 }
             }
-            SockState::Unbound | SockState::Bound => {}
+            SockState::Unbound | SockState::Binding | SockState::Bound => {}
         }
     }
 

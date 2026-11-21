@@ -17,7 +17,7 @@ const AF_UNIX = 1;
 const SOCK_STREAM = 1, SOCK_DGRAM = 2, SOCK_SEQPACKET = 5;
 const SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000;
 const SHUT_RD = 0, SHUT_WR = 1;
-const SOL_SOCKET = 1, SO_TYPE = 3, SO_ACCEPTCONN = 30;
+const SOL_SOCKET = 1, SO_TYPE = 3, SO_PASSCRED = 16, SO_ACCEPTCONN = 30;
 const MSG_PEEK = 0x2, MSG_CTRUNC = 0x8, MSG_TRUNC = 0x20, MSG_DONTWAIT = 0x40, MSG_NOSIGNAL = 0x4000, MSG_CMSG_CLOEXEC = 0x40000000;
 
 const ERR = {
@@ -165,7 +165,9 @@ async function uploadWasm(page, base, name, build, { sync = false, withFork = fa
     (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
     (import "wasi_snapshot_preview1" "fd_close" (func $fd_close (param i32) (result i32)))
     (import "wasi_snapshot_preview1" "fd_seek" (func $fd_seek (param i32 i64 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_fdstat_get" (func $fd_getstat (param i32 i32) (result i32)))
     (import "wasi_snapshot_preview1" "fd_fdstat_set_flags" (func $fd_setflags (param i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_readdir" (func $fd_readdir (param i32 i32 i32 i64 i32) (result i32)))
     (import "wasi_snapshot_preview1" "path_open" (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
     (import "wasi_snapshot_preview1" "path_unlink_file" (func $unlink (param i32 i32 i32) (result i32)))
     (import "wasi_snapshot_preview1" "path_filestat_get" (func $path_stat (param i32 i32 i32 i32 i32) (result i32)))
@@ -902,15 +904,24 @@ test('U-10: SCM_RIGHTS remote CloudFs open-ref attenuation & revocation on sende
     ${eq('(i32.load (i32.const 104))', 1)}
     (local.set $b (i32.load (i32.const 1024))) ;; attenuated CloudFs fd
 
-    ;; 1. Reading attenuated fd (and a dup'd copy of it!) succeeds!
+    ;; 1. Reading attenuated fd (and a dup'd copy of it!) succeeds, including via os.sys batch pread (High #2)!
     (call $read_exact (local.get $b) (i32.const 4200) (i32.const 21))
     ${eq('(i32.load8_u (i32.const 4200))', 116)} ;; 't'
     ${eq('(i32.load8_u (i32.const 4220))', 97)}  ;; 'a'
+    ${eq('(local.get $b)', 5)}
+    (local.set $n (call $sys ${text(JSON.stringify([{ pread: { fd: 5, offset: 0, count: 10 } }]))}))
+    (call $reply (i32.const 4400))
+    ;; Reply starts with '{"results":[{"ok":' -> byte 14 MUST be 'o' (111), NOT 'e' ('err')!
+    ${eq('(i32.load8_u (i32.const 4414))', 111)}
     ${eq('(call $fd_dup (local.get $b) (i32.const 140))', 0)}
     (local.set $d (i32.load (i32.const 140)))
     ${eq('(call $fd_seek (local.get $d) (i64.const 0) (i32.const 0) (i32.const 200))', 0)}
     (call $read_exact (local.get $d) (i32.const 4300) (i32.const 21))
     ${eq('(i32.load8_u (i32.const 4300))', 116)} ;; 't'
+    ;; Dup to fd 7 and close via os.sys batch close (High #2: must clear attenuated_kfds so reused kfd works after SIGKILL!)
+    ${eq('(call $fd_dup (local.get $b) (i32.const 144))', 0)}
+    ${eq('(i32.load (i32.const 144))', 7)}
+    (drop (call $sys ${text(JSON.stringify([{ close: { fd: 7 } }]))}))
 
     ;; 2. Direct open of another 0600 root CloudFs file MUST fail -EACCES!
     ${eq(`(call $open ${text(secret2)} (i32.const 0) (i32.const 0))`, -ERR.EACCES)}
@@ -919,13 +930,21 @@ test('U-10: SCM_RIGHTS remote CloudFs open-ref attenuation & revocation on sende
     ;; 3. Wait for sender to be SIGKILLed (EOF on $a)
     ${eq('(call $read_once (local.get $a) (i32.const 4096) (i32.const 16))', 0)}
 
-    ;; 4. After sender's token is revoked, seeking/reading BOTH original & dup'd attenuated fd MUST fail with EACCES!
+    ;; 4. After sender's token is revoked, seeking/reading BOTH original & dup'd attenuated fd MUST fail with EACCES,
+    ;;    AND opening a brand-new local file reusing the batch-closed kfd slot MUST succeed cleanly (High #2)!
     (local.set $n (call $fd_seek (local.get $b) (i64.const 0) (i32.const 0) (i32.const 200)))
     ${assertExpr(`(i32.eq (local.get $n) (i32.const ${ERR.EACCES}))`)}
     (i32.store (i32.const 16) (i32.const 4200))
     (i32.store (i32.const 20) (i32.const 21))
     ${eq('(call $fd_read (local.get $b) (i32.const 16) (i32.const 1) (i32.const 24))', ERR.EACCES)}
     ${eq('(call $fd_read (local.get $d) (i32.const 16) (i32.const 1) (i32.const 24))', ERR.EACCES)}
+    (local.set $e (call $open ${text('/tmp/u10-reuse.txt')} (i32.const ${2 | 0o100 | 0o1000}) (i32.const ${0o600})))
+    ${assertExpr('(i32.ge_s (local.get $e) (i32.const 0))')}
+    (call $write_all (local.get $e) ${text('fresh')})
+    ${eq('(call $fd_seek (local.get $e) (i64.const 0) (i32.const 0) (i32.const 200))', 0)}
+    (call $read_exact (local.get $e) (i32.const 4500) (i32.const 5))
+    ${eq('(i32.load8_u (i32.const 4500))', 102)} ;; 'f'
+    ${eq('(call $fd_close (local.get $e))', 0)}
 
     ${eq('(call $fd_close (local.get $d))', 0)}
     ${eq('(call $fd_close (local.get $b))', 0)}
@@ -1115,6 +1134,260 @@ test('U-06 & U-11 (SIGKILL cleanup): POSIX kill(pid, 9) unblocks peer SAB stream
 
   const stats = (await hostCall(page, 'run_sock_stats')).ok;
   expect(stats).toEqual({
+    activeSockets: 0,
+    boundInodes: 0,
+    inflightGlobal: 0,
+    allocatedArenaSlots: 0,
+  });
+});
+
+test('Codex audit regressions: shared transport, SHUT_WR/half-close, batch close, SO_PASSCRED, O_PATH arena-pipe, shared O_NONBLOCK, MSG_TRUNC/PEEK, backlog wait, fd_readdir', async ({ page }) => {
+  // 1. Single-process regression suite:
+  //    - High #7/#8: SHUT_WR rejects plain write; half-close preserves queued bytes; SHUT_RD drains rights
+  //    - High #11: os.sys batch close on unix-sock releases holder & triggers peer EOF
+  //    - High #15: O_PATH reopen of arena-pipe via /proc/self/fd/<N> fails EBADF before & after SCM_RIGHTS
+  //    - Medium #1: shared O_NONBLOCK across SCM_RIGHTS for both unix-sock and arena-pipe
+  //    - Medium #4: input MSG_TRUNC returns full length (8); MSG_PEEK delivers fds & keeps msg queued
+  //    - Medium #5: 0-byte stream recvmsg with queued bytes returns 0; 0-byte sendmsg drops rights
+  //    - Low #2: fd_readdir reports bound socket inode with WASI filetype SOCKET_STREAM (6)
+  const monoPath = await uploadWasm(page, base, 'codex-mono', ({ text, say, eq, assertExpr }) => `
+    ;; (A) High #7 & #8: A writes "HALF", A calls SHUT_WR, B calls SHUT_WR -> plain write fails EPIPE,
+    ;;     yet B STILL reads "HALF" then EOF!
+    ${eq(`(call $sock_socketpair (i32.const ${AF_UNIX}) (i32.const ${SOCK_STREAM}) (i32.const 0) (i32.const 100))`, 0)}
+    (local.set $a (i32.load (i32.const 100)))
+    (local.set $b (i32.load (i32.const 104)))
+    (call $write_all (local.get $a) ${text('HALF')})
+    ${eq(`(call $sock_shutdown (local.get $a) (i32.const ${SHUT_WR}))`, 0)}
+    ${eq(`(call $sock_shutdown (local.get $b) (i32.const ${SHUT_WR}))`, 0)}
+    ;; Plain sendmsg with MSG_NOSIGNAL on A MUST return EPIPE (64)!
+    ${eq(`(call $sock_sendmsg (local.get $a) ${text('X')} (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const ${MSG_NOSIGNAL}) (i32.const 108))`, ERR.EPIPE)}
+    ;; Medium #5: 0-byte recvmsg with queued bytes returns 0 immediately without consuming "HALF"!
+    ${eq(`(call $sock_recvmsg (local.get $b) (i32.const 4096) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 112) (i32.const 120) (i32.const ${MSG_DONTWAIT}) (i32.const 116) (i32.const 136))`, 0)}
+    ${eq('(i32.load (i32.const 116))', 0)}
+    ;; Now read "HALF" (4 bytes), then EOF (0 bytes)!
+    ${eq('(call $read_once (local.get $b) (i32.const 4096) (i32.const 16))', 4)}
+    ${eq('(i32.load8_u (i32.const 4096))', 72)} ;; 'H'
+    ${eq('(call $read_once (local.get $b) (i32.const 4096) (i32.const 16))', 0)}
+    ${eq('(call $fd_close (local.get $a))', 0)}
+    ${eq('(call $fd_close (local.get $b))', 0)}
+
+    ;; (B) High #11: os.sys batch { close: { fd } } on a unix-sock MUST release external holder -> peer sees EOF!
+    ${eq(`(call $sock_socketpair (i32.const ${AF_UNIX}) (i32.const ${SOCK_STREAM}) (i32.const 0) (i32.const 100))`, 0)}
+    (local.set $a (i32.load (i32.const 100))) ;; deterministic fd 4
+    (local.set $b (i32.load (i32.const 104))) ;; deterministic fd 5
+    ${eq('(local.get $a)', 4)}
+    (drop (call $sys ${text(JSON.stringify([{ close: { fd: 4 } }]))}))
+    ;; Peer $b MUST observe EOF (0) immediately!
+    ${eq('(call $read_once (local.get $b) (i32.const 4096) (i32.const 16))', 0)}
+    ${eq('(call $fd_close (local.get $b))', 0)}
+
+    ;; (C) High #15: O_PATH arena-pipe rejects read/write locally AND after SCM_RIGHTS!
+    ${eq('(call $fd_pipe (i32.const 100) (i32.const 104))', 0)}
+    (local.set $a (i32.load (i32.const 100))) ;; fd 4 = pipe-r
+    (local.set $b (i32.load (i32.const 104))) ;; fd 5 = pipe-w
+    ${eq('(local.get $a)', 4)}
+    (call $write_all (local.get $b) ${text('secret')})
+    ;; Reopen /proc/self/fd/4 with O_PATH (0o10000000 = 2097152)
+    (local.set $c (call $open ${text('/proc/self/fd/4')} (i32.const ${0o10000000}) (i32.const 0)))
+    ${assertExpr('(i32.ge_s (local.get $c) (i32.const 0))')}
+    (i32.store (i32.const 16) (i32.const 4096))
+    (i32.store (i32.const 20) (i32.const 6))
+    ${eq('(call $fd_read (local.get $c) (i32.const 16) (i32.const 1) (i32.const 24))', ERR.EBADF)}
+    ;; Pass O_PATH arena-pipe over SCM_RIGHTS -> received fd MUST STILL reject read with EBADF!
+    ${eq(`(call $sock_socketpair (i32.const ${AF_UNIX}) (i32.const ${SOCK_STREAM}) (i32.const 0) (i32.const 108))`, 0)}
+    (local.set $d (i32.load (i32.const 108)))
+    (local.set $e (i32.load (i32.const 112)))
+    (i32.store (i32.const 1024) (local.get $c))
+    ${eq(`(call $sock_sendmsg (local.get $d) ${text('P')} (i32.const 1024) (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 116))`, 0)}
+    ${eq('(call $sock_recvmsg (local.get $e) (i32.const 4096) (i32.const 16) (i32.const 1500) (i32.const 4) (i32.const 120) (i32.const 124) (i32.const 0) (i32.const 136) (i32.const 140))', 0)}
+    ${eq('(i32.load (i32.const 120))', 1)}
+    (local.set $f (i32.load (i32.const 1500)))
+    ${eq('(call $fd_read (local.get $f) (i32.const 16) (i32.const 1) (i32.const 24))', ERR.EBADF)}
+    ${eq('(call $fd_close (local.get $f))', 0)}
+    ${eq('(call $fd_close (local.get $c))', 0)}
+
+    ;; (D) Medium #1: shared O_NONBLOCK across SCM_RIGHTS for arena-pipe AND unix-sock!
+    ${eq('(call $fd_setflags (local.get $a) (i32.const 4))', 0)} ;; FDFLAG_NONBLOCK on pipe-r $a
+    (i32.store (i32.const 1024) (local.get $a))
+    ${eq(`(call $sock_sendmsg (local.get $d) ${text('N')} (i32.const 1024) (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 116))`, 0)}
+    ${eq('(call $sock_recvmsg (local.get $e) (i32.const 4096) (i32.const 16) (i32.const 1500) (i32.const 4) (i32.const 120) (i32.const 124) (i32.const 0) (i32.const 136) (i32.const 140))', 0)}
+    (local.set $f (i32.load (i32.const 1500)))
+    ;; Drain the 6 bytes ("secret"), then read on received $f MUST immediately return EAGAIN (not block)!
+    ${eq('(call $read_once (local.get $f) (i32.const 4096) (i32.const 6))', 6)}
+    ${eq('(call $fd_read (local.get $f) (i32.const 16) (i32.const 1) (i32.const 24))', ERR.EAGAIN)}
+    ${eq('(call $fd_close (local.get $f))', 0)}
+    ${eq('(call $fd_close (local.get $a))', 0)}
+    ${eq('(call $fd_close (local.get $b))', 0)}
+
+    ;; Same shared O_NONBLOCK test for a unix-sock passed via SCM_RIGHTS!
+    ${eq(`(call $sock_socketpair (i32.const ${AF_UNIX}) (i32.const ${SOCK_STREAM | SOCK_NONBLOCK}) (i32.const 0) (i32.const 100))`, 0)}
+    (local.set $a (i32.load (i32.const 100)))
+    (local.set $b (i32.load (i32.const 104)))
+    (i32.store (i32.const 1024) (local.get $a))
+    ${eq(`(call $sock_sendmsg (local.get $d) ${text('S')} (i32.const 1024) (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 116))`, 0)}
+    ${eq('(call $sock_recvmsg (local.get $e) (i32.const 4096) (i32.const 16) (i32.const 1500) (i32.const 4) (i32.const 120) (i32.const 124) (i32.const 0) (i32.const 136) (i32.const 140))', 0)}
+    (local.set $f (i32.load (i32.const 1500)))
+    ;; Received socket $f inherits O_NONBLOCK -> empty fd_read returns EAGAIN!
+    ${eq('(call $fd_read (local.get $f) (i32.const 16) (i32.const 1) (i32.const 24))', ERR.EAGAIN)}
+    ;; Toggling O_NONBLOCK off on $a is immediately visible via fd_fdstat_get on $f!
+    ${eq('(call $fd_setflags (local.get $a) (i32.const 0))', 0)}
+    ${eq('(call $fd_getstat (local.get $f) (i32.const 600))', 0)}
+    ${eq('(i32.and (i32.load16_u (i32.const 602)) (i32.const 4))', 0)}
+    ${eq('(call $fd_close (local.get $f))', 0)}
+    ${eq('(call $fd_close (local.get $a))', 0)}
+    ${eq('(call $fd_close (local.get $b))', 0)}
+    ${eq('(call $fd_close (local.get $d))', 0)}
+    ${eq('(call $fd_close (local.get $e))', 0)}
+
+    ;; (E) Medium #4: input MSG_TRUNC returns full 8 bytes on 1-byte buffer + MSG_PEEK delivers fds!
+    ${eq(`(call $sock_socketpair (i32.const ${AF_UNIX}) (i32.const ${SOCK_DGRAM}) (i32.const 0) (i32.const 100))`, 0)}
+    (local.set $a (i32.load (i32.const 100)))
+    (local.set $b (i32.load (i32.const 104)))
+    (i32.store (i32.const 1024) (local.get $a))
+    ${eq(`(call $sock_sendmsg (local.get $a) ${text('12345678')} (i32.const 1024) (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 108))`, 0)}
+    ${eq(`(call $sock_recvmsg (local.get $b) (i32.const 4096) (i32.const 1) (i32.const 1500) (i32.const 2) (i32.const 112) (i32.const 120) (i32.const ${MSG_PEEK | MSG_TRUNC}) (i32.const 116) (i32.const 136))`, 0)}
+    ${eq('(i32.load (i32.const 116))', 8)} ;; reportedLen == full 8 bytes!
+    ${eq('(i32.load (i32.const 112))', 1)} ;; MSG_PEEK delivered 1 fd!
+    ${eq('(call $fd_close (i32.load (i32.const 1500)))', 0)}
+    ;; Real recvmsg still gets all 8 bytes + 1 fd!
+    ${eq('(call $sock_recvmsg (local.get $b) (i32.const 4096) (i32.const 16) (i32.const 1500) (i32.const 2) (i32.const 112) (i32.const 120) (i32.const 0) (i32.const 116) (i32.const 136))', 0)}
+    ${eq('(i32.load (i32.const 116))', 8)}
+    ${eq('(i32.load (i32.const 112))', 1)}
+    ${eq('(call $fd_close (i32.load (i32.const 1500)))', 0)}
+    ${eq('(call $fd_close (local.get $a))', 0)}
+    ${eq('(call $fd_close (local.get $b))', 0)}
+
+    ;; (F) Low #2: fd_readdir on /tmp reports bound socket inode as WASI SOCKET_STREAM (6)!
+    ${eq(`(call $sock_socket (i32.const ${AF_UNIX}) (i32.const ${SOCK_STREAM}) (i32.const 0) (i32.const 100))`, 0)}
+    (local.set $a (i32.load (i32.const 100)))
+    ${eq(`(call $sock_bind (local.get $a) ${text('/tmp/rd.sock')})`, 0)}
+    (local.set $b (call $open ${text('/tmp')} (i32.const ${0o200000}) (i32.const 0))) ;; O_DIRECTORY
+    ${assertExpr('(i32.ge_s (local.get $b) (i32.const 0))')}
+    ${eq('(call $fd_readdir (local.get $b) (i32.const 16384) (i32.const 4096) (i64.const 0) (i32.const 104))', 0)}
+    (local.set $n (i32.load (i32.const 104)))
+    (local.set $i (i32.const 0))
+    (local.set $c (i32.const 0)) ;; found flag
+    (loop $scan
+      (if (i32.lt_u (i32.add (local.get $i) (i32.const 24)) (local.get $n)) (then
+        (local.set $d (i32.load (i32.add (i32.const 16384) (i32.add (local.get $i) (i32.const 16))))) ;; namelen
+        (if (i32.and
+              (i32.eq (local.get $d) (i32.const 7))
+              (i32.eq (i32.load8_u (i32.add (i32.const 16384) (i32.add (local.get $i) (i32.const 24)))) (i32.const 114))) ;; 'r' of rd.sock
+          (then
+            ;; dirent d_type at offset +20 MUST be SOCKET_STREAM (6)!
+            ${eq('(i32.load8_u (i32.add (i32.const 16384) (i32.add (local.get $i) (i32.const 20))))', 6)}
+            (local.set $c (i32.const 1))))
+        (local.set $i (i32.add (local.get $i) (i32.add (i32.const 24) (local.get $d))))
+        (br $scan))))
+    ${eq('(local.get $c)', 1)}
+    ${eq('(call $fd_close (local.get $b))', 0)}
+    ${eq('(call $fd_close (local.get $a))', 0)}
+    ${eq(`(call $unlink (i32.const 3) ${text('/tmp/rd.sock')})`, 0)}
+    ${say('CODEX_MONO_OK\n')}
+  `);
+
+  await startHost(page, 'codex-mono', monoPath);
+  await hostResult(page, 'codex-mono', 0);
+  expect(await hostOutput(page, 'codex-mono')).toContain('CODEX_MONO_OK');
+
+  // 2. Multi-process regression suite:
+  //    - High #6: fork an unconnected SOCK_STREAM, child connects it, parent writes/reads over SAB!
+  //    - High #13: SO_PASSCRED on server reports child's real PID when child writes on inherited stream!
+  //    - Medium #3: backlog=1 listener blocks 2nd connecting client until server accepts 1st!
+  const multiSrv = await uploadWasm(page, base, 'codex-multi-srv', ({ text, say, eq, assertExpr }) => `
+    ${eq(`(call $sock_socket (i32.const ${AF_UNIX}) (i32.const ${SOCK_STREAM}) (i32.const 0) (i32.const 100))`, 0)}
+    (local.set $a (i32.load (i32.const 100)))
+    ${eq(`(call $sock_bind (local.get $a) ${text('/tmp/codex-multi.sock')})`, 0)}
+    ${eq('(call $sock_listen (local.get $a) (i32.const 1))', 0)}
+    ${say('MULTI_READY\n')}
+
+    ;; Wait until client #1 connects, enable SO_PASSCRED on accepted fd $b, receive from parent & child!
+    ${eq('(call $sock_accept (local.get $a) (i32.const 0) (i32.const 104))', 0)}
+    (local.set $b (i32.load (i32.const 104)))
+    ${eq(`(call $sock_setsockopt (local.get $b) (i32.const ${SOL_SOCKET}) (i32.const ${SO_PASSCRED}) (i32.const 1))`, 0)}
+    ;; Signal client #1 that SO_PASSCRED is active ("GO")
+    (call $write_all (local.get $b) ${text('GO')})
+    ;; Read "PARENT" with parent PID (stored in $c)
+    ${eq('(call $sock_recvmsg (local.get $b) (i32.const 4096) (i32.const 16) (i32.const 0) (i32.const 0) (i32.const 108) (i32.const 120) (i32.const 0) (i32.const 112) (i32.const 116))', 0)}
+    ${eq('(i32.load (i32.const 112))', 6)}
+    (local.set $c (i32.load (i32.const 120))) ;; parent pid
+    ;; Read "CHILD!" with child PID (stored in $d) -> MUST differ from parent PID!
+    ${eq('(call $sock_recvmsg (local.get $b) (i32.const 4096) (i32.const 16) (i32.const 0) (i32.const 0) (i32.const 108) (i32.const 120) (i32.const 0) (i32.const 112) (i32.const 116))', 0)}
+    ${eq('(i32.load (i32.const 112))', 6)}
+    (local.set $d (i32.load (i32.const 120))) ;; child pid
+    ${assertExpr('(i32.ne (local.get $c) (local.get $d))')}
+    ${eq('(call $fd_close (local.get $b))', 0)}
+
+    ;; Accept 2nd & 3rd clients (testing backlog=1 wait for 3rd client!)
+    ${eq('(call $sock_accept (local.get $a) (i32.const 0) (i32.const 104))', 0)}
+    (local.set $e (i32.load (i32.const 104)))
+    ${eq('(call $sock_accept (local.get $a) (i32.const 0) (i32.const 104))', 0)}
+    (local.set $f (i32.load (i32.const 104)))
+    ${eq('(call $fd_close (local.get $e))', 0)}
+    ${eq('(call $fd_close (local.get $f))', 0)}
+    ${eq('(call $fd_close (local.get $a))', 0)}
+    ${eq(`(call $unlink (i32.const 3) ${text('/tmp/codex-multi.sock')})`, 0)}
+    ${say('MULTI_SRV_OK\n')}
+  `);
+
+  // Client 1: creates UNCONNECTED SOCK_STREAM, forks child, child connects it, parent reads "GO"
+  // via syncStreamTransport (High #6!), parent writes "PARENT", child writes "CHILD!" (High #13!)
+  const multiCli1 = await uploadWasm(page, base, 'codex-multi-c1', ({ text, say, eq, assertExpr }) => `
+    ${eq(`(call $sock_socket (i32.const ${AF_UNIX}) (i32.const ${SOCK_STREAM}) (i32.const 0) (i32.const 100))`, 0)}
+    (local.set $a (i32.load (i32.const 100)))
+    ${eq('(call $fd_pipe (i32.const 104) (i32.const 108))', 0)}
+    (local.set $b (i32.load (i32.const 104))) ;; pipe-r (child->parent connected notify)
+    (local.set $c (i32.load (i32.const 108))) ;; pipe-w
+    ${eq('(call $fd_pipe (i32.const 112) (i32.const 116))', 0)}
+    (local.set $d (i32.load (i32.const 112))) ;; pipe2-r (parent->child turn notify)
+    (local.set $e (i32.load (i32.const 116))) ;; pipe2-w
+
+    ${eq('(call $proc_fork (i32.const 1) (i32.const 120))', 0)}
+    (if (i32.eqz (i32.load (i32.const 120))) (then
+      ;; Child connects the shared unconnected socket $a!
+      ${eq(`(call $sock_connect (local.get $a) ${text('/tmp/codex-multi.sock')})`, 0)}
+      (call $write_all (local.get $c) ${text('C')})
+      ;; Wait for parent to write "PARENT" first, then child writes "CHILD!"
+      (call $read_exact (local.get $d) (i32.const 4096) (i32.const 1))
+      (call $write_all (local.get $a) ${text('CHILD!')})
+      ${eq('(call $fd_close (local.get $a))', 0)}
+      (call $proc_exit (i32.const 0))
+    ))
+    ;; Parent waits for child to connect $a, then reads "GO" from $a (MUST sync tx/rx SAB slots!)
+    (call $read_exact (local.get $b) (i32.const 4096) (i32.const 1))
+    (call $read_exact (local.get $a) (i32.const 4100) (i32.const 2))
+    ${eq('(i32.load8_u (i32.const 4100))', 71)} ;; 'G'
+    ;; Parent writes "PARENT", then signals child to write "CHILD!"
+    (call $write_all (local.get $a) ${text('PARENT')})
+    (call $write_all (local.get $e) ${text('T')})
+    ${assertExpr('(i32.eq (call $waitpid2 (i32.load (i32.const 120)) (i32.const 128) (i32.const 0)) (i32.load (i32.const 120)))')}
+    ${eq('(i32.load (i32.const 128))', 0)}
+    ${eq('(call $fd_close (local.get $a))', 0)}
+    ${say('MULTI_C1_OK\n')}
+  `, { withFork: true });
+
+  // Client 2 & 3 connect concurrently while backlog=1 -> both MUST succeed (blocking connect waits instead of EAGAIN)!
+  const multiCliBacklog = await uploadWasm(page, base, 'codex-multi-c2', ({ text, say, eq }) => `
+    ${eq(`(call $sock_socket (i32.const ${AF_UNIX}) (i32.const ${SOCK_STREAM}) (i32.const 0) (i32.const 100))`, 0)}
+    (local.set $a (i32.load (i32.const 100)))
+    ${eq(`(call $sock_connect (local.get $a) ${text('/tmp/codex-multi.sock')})`, 0)}
+    ${eq('(call $fd_close (local.get $a))', 0)}
+    ${say('BACKLOG_OK\n')}
+  `);
+
+  await startHost(page, 'codex-multi-srv', multiSrv);
+  await hostReady(page, 'codex-multi-srv', 'MULTI_READY');
+  await startHost(page, 'codex-multi-c1', multiCli1);
+  await hostResult(page, 'codex-multi-c1', 0);
+  await startHost(page, 'codex-multi-c2', multiCliBacklog);
+  await startHost(page, 'codex-multi-c3', multiCliBacklog);
+  await hostResult(page, 'codex-multi-c2', 0);
+  await hostResult(page, 'codex-multi-c3', 0);
+  await hostResult(page, 'codex-multi-srv', 0);
+  expect(await hostOutput(page, 'codex-multi-srv')).toContain('MULTI_SRV_OK');
+
+  const finalStats = (await hostCall(page, 'run_sock_stats')).ok;
+  expect(finalStats).toEqual({
     activeSockets: 0,
     boundInodes: 0,
     inflightGlobal: 0,

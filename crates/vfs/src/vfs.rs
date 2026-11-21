@@ -3032,7 +3032,7 @@ impl Vfs {
         };
         let raw = pin
             .guard_op(
-                &root_cred,
+                cred,
                 false,
                 false,
                 pin.fs().getxattr(&root_cred, handle, abi::ACL_ACCESS),
@@ -3056,6 +3056,19 @@ impl Vfs {
         path: &str,
         mode: u16,
     ) -> Result<Entry> {
+        let (entry, _, _, _) = self.mksockat_with_parent(pid, anchor, path, mode).await?;
+        Ok(entry)
+    }
+
+    /// Variant of [`Self::mksockat`] that also returns the parent `(MountPin, Handle, name)` so a
+    /// failed `bind(2)` rollback can remove ONLY the newly created `NodeId` via `unlink_if`.
+    pub async fn mksockat_with_parent(
+        &self,
+        pid: u32,
+        anchor: StartAnchor,
+        path: &str,
+        mode: u16,
+    ) -> Result<(Entry, MountPin, Handle, String)> {
         self.with_caller(pid, async move {
             let (cred, ns, fs_ctx, fds) = self.snapshot_proc(pid)?;
             let ctx_snap = fs_ctx.borrow().clone();
@@ -3084,9 +3097,33 @@ impl Vfs {
                         .await?;
                     self.sync_dir_if_needed(&cred, &t.parent_pin, &t.parent.handle)
                         .await?;
-                    Ok(entry)
+                    Ok((entry, t.parent_pin, t.parent.handle, t.name))
                 }
             }
+        })
+        .await
+    }
+
+    /// Roll back a freshly created inode ONLY if `(parent, name)` still points to `expected`.
+    pub async fn rollback_created_inode(
+        &self,
+        pid: u32,
+        pin: &MountPin,
+        parent: &Handle,
+        name: &str,
+        expected: NodeId,
+    ) -> Result<()> {
+        self.with_caller(pid, async move {
+            let (cred, _, _, _) = self.snapshot_proc(pid)?;
+            pin.guard_op(
+                &cred,
+                true,
+                true,
+                pin.fs().unlink_if(&cred, parent, name, expected),
+            )
+            .await?;
+            self.sync_dir_if_needed(&cred, pin, parent).await?;
+            Ok(())
         })
         .await
     }

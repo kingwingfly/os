@@ -233,8 +233,8 @@ import { ArenaRing } from './sock-arena.js';
  * Workers with zero mid-syscall SAB transfers.
  */
 export class ArenaPipe {
-  constructor(arenaBuffer, slot, gen, owner = PAGE) {
-    this.ring = new ArenaRing(arenaBuffer, slot, gen, owner);
+  constructor(arenaBuffer, slot, gen, owner = PAGE, notifyWord = null) {
+    this.ring = new ArenaRing(arenaBuffer, slot, gen, owner, notifyWord);
     this.slot = slot;
     this.gen = gen;
     this.owner = owner;
@@ -244,6 +244,8 @@ export class ArenaPipe {
   get empty() { return this.ring.empty; }
   get readerGone() { return this.ring.rdClosed; }
   get writerGone() { return this.ring.wrClosed; }
+  nonblock(end) { return this.ring.pipeNonblock(end); }
+  setNonblock(end, enabled) { this.ring.setPipeNonblock(end, enabled); }
   read(count, meanwhile, _line = false, nonblock = false) {
     return this.ring.read(count, meanwhile, { nonblock });
   }

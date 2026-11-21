@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::rc::Rc;
 use vfs::StartAnchor;
 use vfs::unix_sock::{
-    ArenaSlot, CleanupBatch, InFlightFd, PipeEnd, SockId, SockType, SocketInodeKey,
+    ArenaSlot, CleanupBatch, FreedSlot, InFlightFd, PipeEnd, SockId, SockType, SocketInodeKey,
 };
 use wasm_bindgen::prelude::*;
 
@@ -23,7 +23,7 @@ use wasm_bindgen::prelude::*;
 /// never hang, freed arena slots are always fenced, and queued PTY/ArenaPipe handles never leak.
 #[derive(Default)]
 pub(crate) struct PendingSockCleanup {
-    pub(crate) freed_slots: Vec<ArenaSlot>,
+    pub(crate) freed_slots: Vec<FreedSlot>,
     pub(crate) peer_wr_closed: Vec<ArenaSlot>,
     pub(crate) peer_rd_closed: Vec<ArenaSlot>,
     pub(crate) dropped_ptys: Vec<Value>,
@@ -135,8 +135,10 @@ enum SendFdSpec {
     ArenaPipe {
         slot: u16,
         #[serde(rename = "gen")]
-        generation: u32,
+        generation: u64,
         end: String,
+        #[serde(default, rename = "pathOnly")]
+        path_only: bool,
     },
     Pty {
         handle: u32,
@@ -195,11 +197,33 @@ fn slots_json(slots: &[ArenaSlot]) -> Vec<Value> {
         .collect()
 }
 
+fn freed_slots_json(slots: &[FreedSlot]) -> Vec<Value> {
+    slots
+        .iter()
+        .map(|s| {
+            json!({
+                "slot": s.slot,
+                "expectedGen": s.expected_gen,
+                "gen": s.fence_gen,
+            })
+        })
+        .collect()
+}
+
 fn cred_json(cred: PeerCred) -> Value {
     json!({ "pid": cred.pid, "uid": cred.uid, "gid": cred.gid })
 }
 
 impl Kernel {
+    /// Returns true iff `pid` still exists and has not exited/become a zombie.
+    pub(crate) fn is_proc_live(&self, pid: u32) -> bool {
+        self.state
+            .borrow()
+            .table
+            .proc(pid)
+            .is_some_and(|p| p.state != abi::ProcState::Zombie)
+    }
+
     /// Read authentic `PeerCred` EXCLUSIVELY from `LocalProcessTable` (`U-08`).
     /// Guest Workers can NEVER supply or override `pid`, `uid`, or `gid`.
     pub(crate) fn kernel_peer_cred(&self, pid: u32) -> Result<PeerCred, Errno> {
@@ -262,6 +286,7 @@ impl Kernel {
                     slot,
                     generation,
                     end,
+                    ..
                 } => {
                     dropped_pipes.push(json!({
                         "slot": slot,
@@ -307,7 +332,7 @@ impl Kernel {
     pub(crate) fn take_pending_sock_cleanup_json(&self) -> Result<JsValue, JsValue> {
         let pending = std::mem::take(&mut self.vfs_rt.borrow_mut().pending_sock_cleanup);
         json_to_js(&json!({
-            "freedSlots": slots_json(&pending.freed_slots),
+            "freedSlots": freed_slots_json(&pending.freed_slots),
             "peerWrClosed": slots_json(&pending.peer_wr_closed),
             "peerRdClosed": slots_json(&pending.peer_rd_closed),
             "droppedPtys": pending.dropped_ptys,
@@ -319,7 +344,7 @@ impl Kernel {
         let (dropped_ptys, dropped_pipes) =
             self.dispose_unix_sock_dropped_fds(batch.dropped_fds).await;
         json_to_js(&json!({
-            "freedSlots": slots_json(&batch.freed_slots),
+            "freedSlots": freed_slots_json(&batch.freed_slots),
             "peerWrClosed": slots_json(&batch.peer_wr_closed),
             "peerRdClosed": slots_json(&batch.peer_rd_closed),
             "droppedPtys": dropped_ptys,
@@ -364,6 +389,9 @@ impl Kernel {
     }
 
     /// Bind socket `sock_id` to pathname `path` in `pid`'s mount namespace and `chroot`.
+    /// Reserves the `Unbound -> Binding` state transition BEFORE creating the inode and rolls back
+    /// using `(parent_pin, parent_handle, name, expected_node)` via `unlink_if` so a failed bind
+    /// can NEVER unlink a replacement file created at `path` by another process.
     pub async fn sock_bind(
         &self,
         pid: u32,
@@ -375,36 +403,54 @@ impl Kernel {
             let rt = self.vfs_rt.borrow();
             (rt.vfs.clone(), Rc::clone(&rt.unix_sock))
         };
-        // Verify socket exists and is owned by `pid` before creating filesystem inode.
         unix_sock
-            .borrow()
-            .describe(pid, sock_id)
+            .borrow_mut()
+            .begin_bind(pid, sock_id, &path)
             .map_err(map_errno)?;
 
-        let entry = self
+        let created = self
             .with_proc_scope_retry(pid, || {
                 let vfs = vfs.clone();
                 let path = path.clone();
-                async move { vfs.mksockat(pid, StartAnchor::AtFdCwd, &path, 0o777).await }
+                async move {
+                    vfs.mksockat_with_parent(pid, StartAnchor::AtFdCwd, &path, 0o777)
+                        .await
+                }
             })
-            .await
-            .map_err(|e| {
-                if e == Errno::EEXIST {
+            .await;
+
+        let (entry, parent_pin, parent_handle, name) = match created {
+            Ok(tuple) => tuple,
+            Err(e) => {
+                unix_sock.borrow_mut().abort_bind(sock_id);
+                return Err(if e == Errno::EEXIST {
                     map_errno(Errno::EADDRINUSE)
                 } else {
                     map_errno(e)
-                }
-            })?;
+                });
+            }
+        };
 
         let key = SocketInodeKey {
             fs_id: entry.handle.fs.clone(),
             node: entry.handle.node,
         };
-        let bind_res = unix_sock.borrow_mut().bind(pid, sock_id, key, path.clone());
+        let bind_res = unix_sock
+            .borrow_mut()
+            .finish_bind(pid, sock_id, key, path.clone());
         if let Err(err) = bind_res {
-            // Roll back the socket inode if binding failed (e.g. socket already bound).
+            unix_sock.borrow_mut().abort_bind(sock_id);
             let _ = self
-                .with_proc_scope(pid, vfs.unlinkat(pid, StartAnchor::AtFdCwd, &path, false))
+                .with_proc_scope(
+                    pid,
+                    vfs.rollback_created_inode(
+                        pid,
+                        &parent_pin,
+                        &parent_handle,
+                        &name,
+                        entry.handle.node,
+                    ),
+                )
                 .await;
             return Err(map_errno(err));
         }
@@ -414,13 +460,14 @@ impl Kernel {
         }))
     }
 
-    /// Mark bound socket `sock_id` as listening.
+    /// Mark bound socket `sock_id` as listening, capturing listener credentials at `listen(2)`.
     pub fn sock_listen(&self, pid: u32, sock_id: u32, backlog: u32) -> Result<JsValue, JsValue> {
+        let cred = self.kernel_peer_cred(pid).map_err(map_errno)?;
         self.vfs_rt
             .borrow()
             .unix_sock
             .borrow_mut()
-            .listen(pid, sock_id, backlog)
+            .listen(pid, sock_id, backlog, cred)
             .map_err(map_errno)?;
         json_to_js(&json!({ "ok": true }))
     }
@@ -464,6 +511,8 @@ impl Kernel {
             "peerCred": cred_json(res.peer_cred),
             "txSlot": slot_json(res.tx_slot),
             "rxSlot": slot_json(res.rx_slot),
+            "nonblock": res.nonblock,
+            "peerPasscred": res.peer_passcred,
         }))
     }
 
@@ -488,21 +537,84 @@ impl Kernel {
         }
     }
 
-    /// Shut down reads, writes, or both on `sock_id`.
-    pub fn sock_shutdown(&self, pid: u32, sock_id: u32, how: u32) -> Result<JsValue, JsValue> {
-        let res = self
+    /// Shut down reads, writes, or both on `sock_id`, draining discarded rights on local `SHUT_RD`.
+    pub async fn sock_shutdown(
+        &self,
+        pid: u32,
+        sock_id: u32,
+        how: u32,
+    ) -> Result<JsValue, JsValue> {
+        let unix_sock = Rc::clone(&self.vfs_rt.borrow().unix_sock);
+        let res = unix_sock
+            .borrow_mut()
+            .shutdown(pid, sock_id, how)
+            .map_err(map_errno)?;
+        let (dropped_ptys, dropped_pipes) = self
+            .dispose_unix_sock_dropped_fds(res.cleanup.dropped_fds)
+            .await;
+        json_to_js(&json!({
+            "txSlot": slot_json(res.tx_slot),
+            "rxSlot": slot_json(res.rx_slot),
+            "closeRxRd": res.close_rx_rd,
+            "closeTxWr": res.close_tx_wr,
+            "shutRd": res.shut_rd,
+            "shutWr": res.shut_wr,
+            "freedSlots": freed_slots_json(&res.cleanup.freed_slots),
+            "peerWrClosed": slots_json(&res.cleanup.peer_wr_closed),
+            "peerRdClosed": slots_json(&res.cleanup.peer_rd_closed),
+            "droppedPtys": dropped_ptys,
+            "droppedPipes": dropped_pipes,
+        }))
+    }
+
+    /// Query a socket's current transport slots and shared open-file-description flags.
+    pub fn sock_describe(&self, pid: u32, sock_id: u32) -> Result<JsValue, JsValue> {
+        let info = self
+            .vfs_rt
+            .borrow()
+            .unix_sock
+            .borrow()
+            .describe(pid, sock_id)
+            .map_err(map_errno)?;
+        json_to_js(&json!({
+            "sockType": info.sock_type.to_raw(),
+            "txSlot": slot_json(info.tx_slot),
+            "rxSlot": slot_json(info.rx_slot),
+            "passcred": info.passcred,
+            "nonblock": info.nonblock,
+        }))
+    }
+
+    /// Update the shared `O_NONBLOCK` flag on `sock_id`'s open-file description.
+    pub fn sock_set_nonblock(
+        &self,
+        pid: u32,
+        sock_id: u32,
+        nonblock: bool,
+    ) -> Result<JsValue, JsValue> {
+        let tx_slot = self
             .vfs_rt
             .borrow()
             .unix_sock
             .borrow_mut()
-            .shutdown(pid, sock_id, how)
+            .set_nonblock(pid, sock_id, nonblock)
             .map_err(map_errno)?;
         json_to_js(&json!({
-            "txSlot": slot_json(res.tx_slot),
-            "rxSlot": slot_json(res.rx_slot),
-            "shutRd": res.shut_rd,
-            "shutWr": res.shut_wr,
+            "txSlot": slot_json(tx_slot),
+            "nonblock": nonblock,
         }))
+    }
+
+    /// Query the shared `O_NONBLOCK` flag on `sock_id`'s open-file description.
+    pub fn sock_get_nonblock(&self, pid: u32, sock_id: u32) -> Result<JsValue, JsValue> {
+        let nonblock = self
+            .vfs_rt
+            .borrow()
+            .unix_sock
+            .borrow()
+            .is_nonblock(pid, sock_id)
+            .map_err(map_errno)?;
+        json_to_js(&json!({ "nonblock": nonblock }))
     }
 
     /// Add `count` external holder references to `sock_id` for `pid` (`dup`/`fork`/`spawn`).
@@ -669,6 +781,7 @@ impl Kernel {
                     slot,
                     generation,
                     end,
+                    path_only,
                 } => {
                     let pipe_end = match end.as_str() {
                         "r" => PipeEnd::Read,
@@ -685,6 +798,7 @@ impl Kernel {
                         slot,
                         generation,
                         end: pipe_end,
+                        path_only,
                     });
                 }
                 SendFdSpec::Pty {
@@ -729,6 +843,9 @@ impl Kernel {
 
     /// Receive payload + optional `SCM_RIGHTS` fds (`recvmsg(2)`).
     /// Returns `{ wouldBlock: true }` on `EAGAIN`.
+    /// Ties descriptor installation strictly to receiver process liveness across all `.await`
+    /// points so a process that terminates mid-`fstat` never leaks PTY/pipe/socket/server-fd refs
+    /// or resurrects stale `proc_meta`.
     pub async fn sock_recvmsg(
         &self,
         pid: u32,
@@ -737,6 +854,10 @@ impl Kernel {
     ) -> Result<JsValue, JsValue> {
         let req: RecvMsgReq =
             serde_json::from_str(&req_json).map_err(|_| map_errno(Errno::EINVAL))?;
+        if !self.is_proc_live(pid) {
+            return Err(map_errno(Errno::ESRCH));
+        }
+        let peek = (req.flags & abi::socket::MSG_PEEK) != 0;
         let (vfs, unix_sock) = {
             let rt = self.vfs_rt.borrow();
             (rt.vfs.clone(), Rc::clone(&rt.unix_sock))
@@ -758,11 +879,11 @@ impl Kernel {
         let (receiver_cloud_access, receiver_remote_token) = {
             let state = self.state.borrow();
             match state.table.proc(pid) {
-                Some(p) => (
+                Some(p) if p.state != abi::ProcState::Zombie => (
                     p.cred.cloud_access,
                     p.cred.remote.as_ref().map(|r| r.token.clone()),
                 ),
-                None => (false, None),
+                _ => (false, None),
             }
         };
 
@@ -770,7 +891,17 @@ impl Kernel {
         let mut installed_fds = Vec::with_capacity(outcome.fds.len());
         let mut extra_dropped = outcome.dropped_fds;
         let mut extra_freed = outcome.freed_slots;
+        let mut extra_peer_wr_closed = outcome.peer_wr_closed;
+        let mut extra_peer_rd_closed = outcome.peer_rd_closed;
 
+        // Rollback tracking in case `pid` dies while awaiting `vfs.fstat` / fd disposal.
+        let mut stat_targets: Vec<(usize, u32, u32)> = Vec::new();
+        let mut installed_kfds: Vec<(u32, u32)> = Vec::new();
+        let mut installed_server_vfds: Vec<u32> = Vec::new();
+        let mut installed_unix_socks: Vec<SockId> = Vec::new();
+        let mut installed_js_fds: Vec<InFlightFd> = Vec::new();
+
+        // Phase 1 (synchronous): install every fd while `pid` is guaranteed live.
         for fd in outcome.fds {
             match fd {
                 InFlightFd::VfsFile {
@@ -802,12 +933,9 @@ impl Kernel {
                                     .insert(new_kfd, (origin_pid, origin_token.clone()));
                             }
                             let scope_pid = if needs_attenuation { origin_pid } else { pid };
-                            let st_val = self
-                                .with_proc_scope(scope_pid, vfs.fstat(pid, new_kfd))
-                                .await
-                                .ok()
-                                .map(|st| json!(st))
-                                .unwrap_or(Value::Null);
+                            let idx = installed_fds.len();
+                            stat_targets.push((idx, new_kfd, scope_pid));
+                            installed_kfds.push((new_kfd, scope_pid));
                             installed_fds.push(json!({
                                 "kind": "kfd",
                                 "kfd": new_kfd,
@@ -818,23 +946,25 @@ impl Kernel {
                                 "writable": writable,
                                 "append": append,
                                 "pathOnly": path_only,
-                                "stat": st_val,
+                                "stat": Value::Null,
                             }));
                         }
                         Err(_) => {
                             out_flags |= abi::socket::MSG_CTRUNC;
-                            extra_dropped.push(InFlightFd::VfsFile {
-                                file,
-                                origin_pid,
-                                origin_token,
-                                is_dir,
-                                mount_ns,
-                                device,
-                                read,
-                                writable,
-                                append,
-                                path_only,
-                            });
+                            if !peek {
+                                extra_dropped.push(InFlightFd::VfsFile {
+                                    file,
+                                    origin_pid,
+                                    origin_token,
+                                    is_dir,
+                                    mount_ns,
+                                    device,
+                                    read,
+                                    writable,
+                                    append,
+                                    path_only,
+                                });
+                            }
                         }
                     }
                 }
@@ -860,6 +990,7 @@ impl Kernel {
                     };
                     match alloc {
                         Ok(vfd) => {
+                            installed_server_vfds.push(vfd);
                             installed_fds.push(json!({
                                 "kind": "server_dev",
                                 "kfd": vfd,
@@ -870,26 +1001,31 @@ impl Kernel {
                         }
                         Err(_) => {
                             out_flags |= abi::socket::MSG_CTRUNC;
-                            extra_dropped.push(InFlightFd::AttenuatedServerFd {
-                                sfd,
-                                owner_pid,
-                                owner_token,
-                                device,
-                                readable,
-                                writable,
-                            });
+                            if !peek {
+                                extra_dropped.push(InFlightFd::AttenuatedServerFd {
+                                    sfd,
+                                    owner_pid,
+                                    owner_token,
+                                    device,
+                                    readable,
+                                    writable,
+                                });
+                            }
                         }
                     }
                 }
                 InFlightFd::UnixSocket(recv_sock_id) => {
                     match unix_sock.borrow().describe(pid, recv_sock_id) {
-                        Ok((st, tx, rx)) => {
+                        Ok(info) => {
+                            installed_unix_socks.push(recv_sock_id);
                             installed_fds.push(json!({
                                 "kind": "unix_sock",
                                 "sockId": recv_sock_id,
-                                "sockType": st.to_raw(),
-                                "txSlot": slot_json(tx),
-                                "rxSlot": slot_json(rx),
+                                "sockType": info.sock_type.to_raw(),
+                                "txSlot": slot_json(info.tx_slot),
+                                "rxSlot": slot_json(info.rx_slot),
+                                "nonblock": info.nonblock,
+                                "passcred": info.passcred,
                             }));
                         }
                         Err(_) => {
@@ -897,6 +1033,8 @@ impl Kernel {
                             if let Ok(b) = unix_sock.borrow_mut().close(pid, recv_sock_id, 1) {
                                 extra_freed.extend(b.freed_slots);
                                 extra_dropped.extend(b.dropped_fds);
+                                extra_peer_wr_closed.extend(b.peer_wr_closed);
+                                extra_peer_rd_closed.extend(b.peer_rd_closed);
                             }
                         }
                     }
@@ -905,7 +1043,16 @@ impl Kernel {
                     slot,
                     generation,
                     end,
+                    path_only,
                 } => {
+                    if !peek {
+                        installed_js_fds.push(InFlightFd::ArenaPipe {
+                            slot,
+                            generation,
+                            end,
+                            path_only,
+                        });
+                    }
                     installed_fds.push(json!({
                         "kind": "arena_pipe",
                         "slot": slot,
@@ -914,6 +1061,7 @@ impl Kernel {
                             PipeEnd::Read => "r",
                             PipeEnd::Write => "w",
                         },
+                        "pathOnly": path_only,
                     }));
                 }
                 InFlightFd::Pty {
@@ -923,6 +1071,15 @@ impl Kernel {
                     readable,
                     writable,
                 } => {
+                    if !peek {
+                        installed_js_fds.push(InFlightFd::Pty {
+                            handle,
+                            master,
+                            number,
+                            readable,
+                            writable,
+                        });
+                    }
                     installed_fds.push(json!({
                         "kind": "pty",
                         "handle": handle,
@@ -935,7 +1092,88 @@ impl Kernel {
             }
         }
 
+        // Phase 2 (async): populate `stat` for received `VfsFile`s while receiver stays live.
+        for (idx, new_kfd, scope_pid) in stat_targets {
+            if !self.is_proc_live(pid) {
+                break;
+            }
+            let st_val = self
+                .with_proc_scope(scope_pid, vfs.fstat(pid, new_kfd))
+                .await
+                .ok()
+                .map(|st| json!(st))
+                .unwrap_or(Value::Null);
+            if let Some(obj) = installed_fds[idx].as_object_mut() {
+                obj.insert("stat".to_string(), st_val);
+            }
+        }
+
+        // Phase 3: if receiver terminated during `fstat`, roll back ALL installed descriptors
+        // and queue cleanup into `pending_sock_cleanup` so zero handles leak.
+        if !self.is_proc_live(pid) {
+            for (kfd, scope_pid) in installed_kfds {
+                if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+                    meta.attenuated_kfds.remove(&kfd);
+                }
+                let _ = self.with_proc_scope(scope_pid, vfs.close(pid, kfd)).await;
+            }
+            for vfd in installed_server_vfds {
+                let _ = self.release_server_fd(pid, vfd, false).await;
+            }
+            for recv_sock_id in installed_unix_socks {
+                if let Ok(b) = unix_sock.borrow_mut().close(pid, recv_sock_id, 1) {
+                    extra_freed.extend(b.freed_slots);
+                    extra_dropped.extend(b.dropped_fds);
+                    extra_peer_wr_closed.extend(b.peer_wr_closed);
+                    extra_peer_rd_closed.extend(b.peer_rd_closed);
+                }
+            }
+            extra_dropped.extend(installed_js_fds);
+            self.record_unix_sock_cleanup(CleanupBatch {
+                freed_slots: extra_freed,
+                dropped_fds: extra_dropped,
+                peer_wr_closed: extra_peer_wr_closed,
+                peer_rd_closed: extra_peer_rd_closed,
+            })
+            .await;
+            return Err(map_errno(Errno::ESRCH));
+        }
+
         let (dropped_ptys, dropped_pipes) = self.dispose_unix_sock_dropped_fds(extra_dropped).await;
+
+        // Re-check process liveness after `dispose_unix_sock_dropped_fds` await as well.
+        if !self.is_proc_live(pid) {
+            for (kfd, scope_pid) in installed_kfds {
+                if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+                    meta.attenuated_kfds.remove(&kfd);
+                }
+                let _ = self.with_proc_scope(scope_pid, vfs.close(pid, kfd)).await;
+            }
+            for vfd in installed_server_vfds {
+                let _ = self.release_server_fd(pid, vfd, false).await;
+            }
+            for recv_sock_id in installed_unix_socks {
+                if let Ok(b) = unix_sock.borrow_mut().close(pid, recv_sock_id, 1) {
+                    extra_freed.extend(b.freed_slots);
+                    extra_peer_wr_closed.extend(b.peer_wr_closed);
+                    extra_peer_rd_closed.extend(b.peer_rd_closed);
+                    installed_js_fds.extend(b.dropped_fds);
+                }
+            }
+            self.record_unix_sock_cleanup(CleanupBatch {
+                freed_slots: extra_freed,
+                dropped_fds: installed_js_fds,
+                peer_wr_closed: extra_peer_wr_closed,
+                peer_rd_closed: extra_peer_rd_closed,
+            })
+            .await;
+            {
+                let mut rt = self.vfs_rt.borrow_mut();
+                rt.pending_sock_cleanup.dropped_ptys.extend(dropped_ptys);
+                rt.pending_sock_cleanup.dropped_pipes.extend(dropped_pipes);
+            }
+            return Err(map_errno(Errno::ESRCH));
+        }
 
         // Re-read current ancillary queue head AFTER all awaits so JS updates the shared ring
         // atomically without ever clobbering a concurrent `sendmsg` mark (`U-05`).
@@ -944,9 +1182,16 @@ impl Kernel {
             let head = table.head_ancillary_offset(sock_id);
             (head.is_some(), head.unwrap_or(0), table.rx_slot(sock_id))
         };
+        let reported_len = if (req.flags & abi::socket::MSG_TRUNC) != 0 {
+            outcome.orig_len
+        } else {
+            outcome.data.len()
+        };
 
         json_to_js(&json!({
             "data": b64_encode(&outcome.data),
+            "origLen": outcome.orig_len,
+            "reportedLen": reported_len,
             "fds": installed_fds,
             "peerCred": cred_json(outcome.peer_cred),
             "senderPath": outcome.sender_path,
@@ -955,7 +1200,9 @@ impl Kernel {
             "rxSlot": slot_json(rx_slot),
             "hasNextAncillary": has_next_ancillary,
             "nextAncillaryOffset": next_ancillary_offset,
-            "freedSlots": slots_json(&extra_freed),
+            "freedSlots": freed_slots_json(&extra_freed),
+            "peerWrClosed": slots_json(&extra_peer_wr_closed),
+            "peerRdClosed": slots_json(&extra_peer_rd_closed),
             "droppedPtys": dropped_ptys,
             "droppedPipes": dropped_pipes,
         }))
@@ -1017,28 +1264,33 @@ impl Kernel {
         level: u32,
         optname: u32,
         val: i32,
-    ) -> Result<(), JsValue> {
-        self.vfs_rt
+    ) -> Result<JsValue, JsValue> {
+        let res = self
+            .vfs_rt
             .borrow()
             .unix_sock
             .borrow_mut()
             .setsockopt(pid, sock_id, level, optname, val)
-            .map_err(map_errno)
+            .map_err(map_errno)?;
+        json_to_js(&json!({
+            "rxSlot": slot_json(res.rx_slot),
+            "passcred": res.passcred,
+        }))
     }
 
-    /// Query `poll_oneoff` readiness for `sock_id`.
+    /// Query `poll_oneoff` readiness for `sock_id` (plus current transport slots so shared
+    /// sockets connected by another Worker pick up their SAB rings immediately).
     pub fn sock_poll(&self, pid: u32, sock_id: u32, writing: bool) -> Result<JsValue, JsValue> {
-        let status = self
-            .vfs_rt
-            .borrow()
-            .unix_sock
-            .borrow()
-            .poll(pid, sock_id, writing)
-            .map_err(map_errno)?;
+        let rt = self.vfs_rt.borrow();
+        let table = rt.unix_sock.borrow();
+        let status = table.poll(pid, sock_id, writing).map_err(map_errno)?;
+        let info = table.describe(pid, sock_id).ok();
         json_to_js(&json!({
             "ready": status.ready,
             "nbytes": status.nbytes,
             "hangup": status.hangup,
+            "txSlot": slot_json(info.and_then(|i| i.tx_slot)),
+            "rxSlot": slot_json(info.and_then(|i| i.rx_slot)),
         }))
     }
 
@@ -1055,17 +1307,24 @@ impl Kernel {
     }
 
     /// Free an arena-backed `fd_pipe` slot when both pipe ends have closed.
-    pub fn sock_arena_free_pipe(&self, slot: u16, generation: u32) -> Result<JsValue, JsValue> {
+    pub fn sock_arena_free_pipe(&self, slot: u16, generation: f64) -> Result<JsValue, JsValue> {
+        let gen_u64 = generation as u64;
         let freed = self
             .vfs_rt
             .borrow()
             .unix_sock
             .borrow_mut()
-            .free_pipe_slot(ArenaSlot { slot, generation });
+            .free_pipe_slot(ArenaSlot {
+                slot,
+                generation: gen_u64,
+            });
         match freed {
-            Some(next) => {
-                json_to_js(&json!({ "freed": true, "slot": next.slot, "gen": next.generation }))
-            }
+            Some(next) => json_to_js(&json!({
+                "freed": true,
+                "slot": next.slot,
+                "expectedGen": next.expected_gen,
+                "gen": next.fence_gen,
+            })),
             None => json_to_js(&json!({ "freed": false })),
         }
     }

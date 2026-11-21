@@ -6,12 +6,18 @@ import {
   ARENA_BYTES,
   ARENA_SLOTS,
   HEADER_BYTES,
+  HDR_RD_LOCK,
+  HDR_WR_LOCK,
+  HOST_LOCK_BIT,
   RING_CAPACITY,
   SLOT_BYTES,
+  U64_HEAD,
+  U64_TAIL,
   ArenaRing,
   createSockArenaBuffer,
   fenceArenaSlot,
   initArenaSlot,
+  releaseWorkerLocks,
 } from '../web/wasi/sock-arena.js';
 import { ArenaPipe, PIPE_ATOMIC } from '../web/wasi/pipe.js';
 
@@ -41,8 +47,8 @@ test('ArenaRing generation fencing invalidates stale holders on slot reuse', () 
   assert.equal(res.written, 9);
   assert.equal(new TextDecoder().decode(reader.read(32, undefined, { nonblock: true })), 'first-gen');
 
-  // Fence and reuse slot 7 at generation 2.
-  fenceArenaSlot(arena, 7, 2);
+  // Fence gen 1 -> 2 and reuse slot 7 at generation 3.
+  assert.equal(fenceArenaSlot(arena, 7, 1, 2), true);
   assert.equal(writer.alive, false);
   assert.equal(reader.alive, false);
   assert.equal(writer.rdClosed, true);
@@ -50,11 +56,16 @@ test('ArenaRing generation fencing invalidates stale holders on slot reuse', () 
   assert.equal(writer.tryWrite(new Uint8Array([1, 2, 3])).broken, true);
   assert.equal(reader.read(8, undefined, { nonblock: true }).length, 0);
 
-  initArenaSlot(arena, 7, 2, 1, 1);
-  const writer2 = new ArenaRing(arena, 7, 2, 30);
-  const reader2 = new ArenaRing(arena, 7, 2, 40);
+  initArenaSlot(arena, 7, 3, 1, 1);
+  const writer2 = new ArenaRing(arena, 7, 3, 30);
+  const reader2 = new ArenaRing(arena, 7, 3, 40);
   assert.equal(writer.alive, false, 'gen-1 handle remains permanently fenced');
   assert.equal(writer2.alive, true);
+  // Delayed stale fence for gen 1 MUST fail CAS and leave live gen 3 completely untouched!
+  assert.equal(fenceArenaSlot(arena, 7, 1, 2), false);
+  assert.equal(writer2.alive, true);
+  assert.equal(writer2.rdClosed, false);
+  assert.equal(writer2.wrClosed, false);
   assert.equal(writer2.tryWrite(new TextEncoder().encode('second-gen')).written, 10);
   assert.equal(new TextDecoder().decode(reader2.read(32, undefined, { nonblock: true })), 'second-gen');
 });
@@ -345,4 +356,82 @@ test('WASI socket errno constants stay synchronized across JS and Rust', () => {
   for (const [name, num] of Object.entries(expected)) {
     assert.match(processJs, new RegExp(`\\b${name}:\\s*${num}\\b`), `missing ${name}=${num} in web/wasi/process.js`);
   }
+});
+
+test('ArenaRing 64-bit cursors cross 4 GiB boundary with zero tearing and bound occupancy by RING_CAPACITY', () => {
+  const arena = createSockArenaBuffer();
+  initArenaSlot(arena, 21, 5, 1, 1);
+  const tx = new ArenaRing(arena, 21, 5, 10);
+  const rx = new ArenaRing(arena, 21, 5, 20);
+
+  // Position both cursors 4 bytes below 4 GiB (0xfffffffc) and write/read across 2^32.
+  const start = 0xfffffffcn;
+  Atomics.store(tx.u64, U64_HEAD, start);
+  Atomics.store(tx.u64, U64_TAIL, start);
+
+  const msg = new TextEncoder().encode('cross-4gib-boundary!');
+  const w = tx.tryWrite(msg);
+  assert.equal(w.broken, false);
+  assert.equal(w.written, msg.length);
+  assert.equal(w.startOffset, Number(start));
+  assert.equal(w.endOffset, Number(start) + msg.length);
+  assert.equal(rx.queued, msg.length);
+
+  const got = rx.read(64, undefined, { nonblock: true });
+  assert.equal(new TextDecoder().decode(got), 'cross-4gib-boundary!');
+  assert.equal(rx.tailOffset, Number(start) + msg.length);
+  assert.equal(rx.queued, 0);
+
+  // Occupancy is strictly clamped to RING_CAPACITY even if head is far ahead.
+  Atomics.store(tx.u64, U64_HEAD, start + BigInt(RING_CAPACITY) + 50000n);
+  assert.equal(rx.queued, RING_CAPACITY);
+});
+
+test('ArenaRing closeWriter() rejects subsequent tryWrite/write (SHUT_WR) and notifies sockNotify', () => {
+  const arena = createSockArenaBuffer();
+  const sockNotify = new Int32Array(new SharedArrayBuffer(4));
+  initArenaSlot(arena, 22, 9, 1, 1, sockNotify);
+  const tx = new ArenaRing(arena, 22, 9, 10, sockNotify);
+  const rx = new ArenaRing(arena, 22, 9, 20, sockNotify);
+
+  const before = Atomics.load(sockNotify, 0);
+  const w1 = tx.tryWrite(new TextEncoder().encode('ok'));
+  assert.equal(w1.written, 2);
+  assert.ok(Atomics.load(sockNotify, 0) > before, 'fast ring write must notify sockNotify');
+
+  // After closeWriter (SHUT_WR), further writes MUST fail broken=true while queued bytes stay readable.
+  tx.closeWriter();
+  assert.equal(tx.tryWrite(new TextEncoder().encode('late')).broken, true);
+  assert.equal(tx.write(new TextEncoder().encode('late')).broken, true);
+  assert.equal(new TextDecoder().decode(rx.read(16, undefined, { nonblock: true })), 'ok');
+  assert.equal(rx.read(16, undefined, { nonblock: true }).length, 0);
+});
+
+test('releaseWorkerLocks clears dead Worker stream mutexes without touching HOST_LOCK_BIT host locks', () => {
+  const arena = createSockArenaBuffer();
+  initArenaSlot(arena, 30, 1, 1, 1);
+  initArenaSlot(arena, 31, 1, 1, 1);
+
+  const workerRing = new ArenaRing(arena, 30, 1, 42);
+  const hostRing = new ArenaRing(arena, 31, 1, (HOST_LOCK_BIT | 42) | 0);
+  assert.equal(workerRing.lock(HDR_RD_LOCK), true);
+  assert.equal(workerRing.lock(HDR_WR_LOCK), true);
+  assert.equal(hostRing.lock(HDR_RD_LOCK), true);
+  assert.equal(hostRing.lock(HDR_WR_LOCK), true);
+
+  // Forced Worker termination for pid 42 clears ONLY slot 30's guest locks, never slot 31's host locks!
+  assert.equal(releaseWorkerLocks(arena, 42), 2);
+  const other = new ArenaRing(arena, 30, 1, 99);
+  assert.equal(other.lock(HDR_RD_LOCK), true);
+  assert.equal(other.lock(HDR_WR_LOCK), true);
+  other.unlock(HDR_RD_LOCK);
+  other.unlock(HDR_WR_LOCK);
+
+  const contendHost = new ArenaRing(arena, 31, 1, 99);
+  assert.equal(contendHost.lock(HDR_RD_LOCK), false);
+  assert.equal(contendHost.lock(HDR_WR_LOCK), false);
+  hostRing.unlock(HDR_RD_LOCK);
+  hostRing.unlock(HDR_WR_LOCK);
+  assert.equal(contendHost.lock(HDR_RD_LOCK), true);
+  contendHost.unlock(HDR_RD_LOCK);
 });

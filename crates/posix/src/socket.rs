@@ -437,7 +437,12 @@ impl UnixListener {
         fd
     }
 
-    pub fn from_raw_fd(fd: u32) -> Self {
+    /// Construct a wrapper taking exclusive ownership of a raw WASI `AF_UNIX` descriptor.
+    ///
+    /// # Safety
+    /// `fd` must be a valid, open `AF_UNIX` descriptor of the matching socket type that is not
+    /// owned by any other wrapper (dropping two wrappers over the same raw fd causes a double close).
+    pub unsafe fn from_raw_fd(fd: u32) -> Self {
         Self { fd }
     }
 }
@@ -523,7 +528,12 @@ impl UnixStream {
         fd
     }
 
-    pub fn from_raw_fd(fd: u32) -> Self {
+    /// Construct a wrapper taking exclusive ownership of a raw WASI `AF_UNIX` descriptor.
+    ///
+    /// # Safety
+    /// `fd` must be a valid, open `AF_UNIX` descriptor of the matching socket type that is not
+    /// owned by any other wrapper (dropping two wrappers over the same raw fd causes a double close).
+    pub unsafe fn from_raw_fd(fd: u32) -> Self {
         Self { fd }
     }
 }
@@ -600,7 +610,12 @@ impl UnixDatagram {
         fd
     }
 
-    pub fn from_raw_fd(fd: u32) -> Self {
+    /// Construct a wrapper taking exclusive ownership of a raw WASI `AF_UNIX` descriptor.
+    ///
+    /// # Safety
+    /// `fd` must be a valid, open `AF_UNIX` descriptor of the matching socket type that is not
+    /// owned by any other wrapper (dropping two wrappers over the same raw fd causes a double close).
+    pub unsafe fn from_raw_fd(fd: u32) -> Self {
         Self { fd }
     }
 }
@@ -688,7 +703,12 @@ impl UnixSeqpacket {
         fd
     }
 
-    pub fn from_raw_fd(fd: u32) -> Self {
+    /// Construct a wrapper taking exclusive ownership of a raw WASI `AF_UNIX` descriptor.
+    ///
+    /// # Safety
+    /// `fd` must be a valid, open `AF_UNIX` descriptor of the matching socket type that is not
+    /// owned by any other wrapper (dropping two wrappers over the same raw fd causes a double close).
+    pub unsafe fn from_raw_fd(fd: u32) -> Self {
         Self { fd }
     }
 }
