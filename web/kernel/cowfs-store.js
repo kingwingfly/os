@@ -848,7 +848,8 @@ export function createCowfsStore(options = {}) {
       });
     }
 
-    // 4. Advance head atomically.
+    // 4. Advance head atomically. Once a fork commits a user modification (`modified: true`),
+    // it is retained permanently (`ephemeral_if_unmodified: false`) and surfaced in `listVolumes()`.
     const nextHead = {
       format_version: COWFS_FORMAT_VERSION,
       volume: meta.volume,
@@ -857,7 +858,7 @@ export function createCowfsStore(options = {}) {
       epoch: cur.epoch + 1,
       root: [...hexToBytes(meta.newRoot)],
       parent_volume: cur.parent_volume ?? null,
-      ephemeral_if_unmodified: Boolean(cur.ephemeral_if_unmodified),
+      ephemeral_if_unmodified: false,
       modified: true,
       updated_at: meta.committedAt,
     };
@@ -1526,6 +1527,49 @@ export function createCowfsStore(options = {}) {
     }
   }
 
+  async function listVolumes({ probeLocks = true } = {}) {
+    const db = await getDb();
+    const tx = openTx(db, ['heads'], 'readonly');
+    const heads = [];
+    await forEachCursor(tx.objectStore('heads'), cursor => {
+      if (cursor.value) heads.push(structuredClone(cursor.value));
+    });
+    await txDone(tx);
+
+    const out = [];
+    for (const h of heads) {
+      let busy = false;
+      if (probeLocks && locksApi && typeof locksApi.request === 'function') {
+        try {
+          const lName = await volLockName(h.volume);
+          const probe = await requestHeldWebLock(lName, { mode: 'exclusive', ifAvailable: true });
+          if (!probe) {
+            busy = true;
+          } else {
+            probe.release();
+            await probe.done?.catch(() => {});
+          }
+        } catch {
+          busy = false;
+        }
+      }
+      out.push({
+        volume: h.volume,
+        format_version: h.format_version,
+        incarnation: h.incarnation,
+        fence: h.fence,
+        epoch: h.epoch,
+        root: digestArrayToHex(h.root),
+        parent_volume: h.parent_volume ?? null,
+        ephemeral_if_unmodified: Boolean(h.ephemeral_if_unmodified),
+        modified: Boolean(h.modified),
+        updated_at: h.updated_at ?? null,
+        busy,
+      });
+    }
+    return out.sort((a, b) => a.volume.localeCompare(b.volume));
+  }
+
   // Test helpers (explicitly named for diagnostics / corruption injection in tests).
   async function _setFormatVersionForTest(version) {
     const db = await getDb();
@@ -1578,6 +1622,7 @@ export function createCowfsStore(options = {}) {
       stats.sliceReads = 0;
     },
     formatVersion,
+    listVolumes,
     createVolume,
     readHead,
     pinRoRoot,

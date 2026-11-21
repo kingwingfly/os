@@ -1,3 +1,18 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content"><meta name="color-scheme" content="dark"><title>Attached terminal · OS</title><link rel="icon" href="data:,"><link rel="stylesheet" href="./style.css"></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content"><meta name="color-scheme" content="dark"><title>Attached terminal · OS</title><link rel="icon" href="data:,"><link rel="stylesheet" href="./style.css"><style>
+.standalone-boot{display:flex;flex-direction:column;height:100vh;padding:12px;box-sizing:border-box;gap:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6edf3;background:#0d1117}
+.standalone-header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;border:1px solid #30363d;border-radius:6px;background:#161b22}
+.standalone-badges{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12px}
+.standalone-badge{padding:2px 8px;border-radius:999px;background:#21262d;border:1px solid #30363d}
+.standalone-badge.fork{background:#2d2208;border-color:#9e6a03;color:#f0c674}
+.standalone-badge.recovery{background:#341215;border-color:#da3633;color:#ffa198}
+.standalone-banner{padding:8px 12px;border:1px solid #9e6a03;border-radius:6px;background:#2d2208;color:#f0c674;font-size:13px}
+.standalone-recovery{padding:14px;border:1px solid #da3633;border-radius:6px;background:#1f1215;display:flex;flex-direction:column;gap:10px}
+.standalone-actions{display:flex;flex-wrap:wrap;gap:8px}
+.standalone-btn{padding:6px 12px;border-radius:6px;border:1px solid #30363d;background:#21262d;color:#e6edf3;cursor:pointer;font:inherit;font-size:13px}
+.standalone-btn:hover{background:#30363d}
+.standalone-output{flex:1;overflow:auto;margin:0;padding:12px;border:1px solid #30363d;border-radius:6px;background:#010409;white-space:pre-wrap;font-size:13px;line-height:1.45}
+.standalone-form{display:flex;gap:8px}
+.standalone-input{flex:1;padding:8px 10px;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#e6edf3;font:inherit;font-size:13px}
+</style></head>
 <body><div id="app" data-attached-console><p class="loading">Opening terminal…</p></div><script type="module" src="./console-window.js"></script></body></html>

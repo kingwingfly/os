@@ -2077,10 +2077,80 @@ export function createOfflineInstaller(options = {}) {
     return stateStore.read();
   }
 
+  /**
+   * Zero-network Stage 0 boot resolver: selects either the BootProfile's pinned `generation`
+   * (verified offline against profile-wide monotonic trust) or the active generation via
+   * `beginOfflineBoot`. Makes ZERO `fetch()` calls.
+   */
+  async function resolveInstalledForBoot({ generation = null, verifyAllBlobs = true, verifyCache = true } = {}) {
+    if (generation) {
+      if (typeof generation !== 'string' || !HEX64.test(generation)) {
+        throw new Error(`Invalid BootProfile pinned generation: ${generation}`);
+      }
+      const state = await stateStore.read();
+      if (!state.generations?.[generation]) {
+        throw new Error(`Pinned Release v2 generation ${generation} is not installed locally.`);
+      }
+      const verified = await verifyInstalledOffline(generation, { verifyAllBlobs, verifyCache });
+      return {
+        ...verified,
+        rolledBack: false,
+        rolledBackFrom: null,
+        pinnedGeneration: true,
+        state,
+      };
+    }
+    const booted = await beginOfflineBoot({ verifyAllBlobs, verifyCache });
+    return { ...booted, pinnedGeneration: false };
+  }
+
+  /**
+   * Read a verified boot asset (`client_kernel.js`, `client_kernel_bg.wasm`, etc.) strictly from
+   * local OPFS / Cache Storage with ZERO network requests, checking its exact SHA-256 digest
+   * against the signed `Boot` image manifest before returning bytes.
+   */
+  async function readVerifiedBootAsset(boot, assetPath) {
+    const bootImg = boot?.images?.boot;
+    if (!bootImg || !Array.isArray(bootImg.entries)) {
+      throw new Error('Missing verified Boot image metadata.');
+    }
+    const entry = bootImg.entries.find(e => e.path === assetPath && e.node?.type === 'file');
+    if (!entry) {
+      throw new Error(`Boot image missing asset ${assetPath}`);
+    }
+    const expectedSha = entry.node.sha256;
+    const opfsBytes = await opfs.readFile(`os-releases/blobs/${expectedSha}`);
+    if (opfsBytes && opfsBytes.byteLength === entry.node.size) {
+      if (await sha256Hex(opfsBytes, cryptoApi) !== expectedSha) {
+        throw new Error(`OPFS boot asset SHA-256 mismatch for ${assetPath}`);
+      }
+      return opfsBytes;
+    }
+    if (cacheStore && typeof cacheStore.match === 'function') {
+      const cacheName = `${CACHE_PREFIX}${boot.releaseId}`;
+      for (const candidate of [
+        `/boot/releases/${boot.releaseId}/assets${encodeAssetPath(assetPath)}`,
+        encodeAssetPath(assetPath),
+      ]) {
+        const hit = await cacheStore.match(cacheName, candidate);
+        const bytes = await readCacheHitBytes(hit);
+        if (bytes) {
+          if (await sha256Hex(bytes, cryptoApi) !== expectedSha) {
+            throw new Error(`Cached boot asset SHA-256 mismatch for ${assetPath}`);
+          }
+          return bytes;
+        }
+      }
+    }
+    throw new Error(`Local boot asset unavailable offline: ${assetPath}`);
+  }
+
   return {
     install,
     verifyInstalledOffline,
     beginOfflineBoot,
+    resolveInstalledForBoot,
+    readVerifiedBootAsset,
     abortOfflineBoot,
     markBootHealthy,
     rollback,

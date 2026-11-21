@@ -91,26 +91,42 @@ async fn call_js_async(target: &JsValue, method: &str, args: &[JsValue]) -> vfs:
     }
 }
 
-fn now_timespec() -> Timespec {
-    let ms = js_sys::Date::now();
-    if !ms.is_finite() || ms <= 0.0 {
-        return Timespec { sec: 0, nsec: 0 };
+pub(crate) fn now_timespec() -> Timespec {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ms = js_sys::Date::now();
+        if !ms.is_finite() || ms <= 0.0 {
+            return Timespec { sec: 0, nsec: 0 };
+        }
+        let whole_ms = ms.trunc() as u64;
+        let sub_ns = ((ms.fract() * 1_000_000.0).round() as u64).min(999_999);
+        let total_ns = whole_ms.saturating_mul(1_000_000).saturating_add(sub_ns);
+        Timespec {
+            sec: total_ns / 1_000_000_000,
+            nsec: (total_ns % 1_000_000_000) as u32,
+        }
     }
-    let whole_ms = ms.trunc() as u64;
-    let sub_ns = ((ms.fract() * 1_000_000.0).round() as u64).min(999_999);
-    let total_ns = whole_ms.saturating_mul(1_000_000).saturating_add(sub_ns);
-    Timespec {
-        sec: total_ns / 1_000_000_000,
-        nsec: (total_ns % 1_000_000_000) as u32,
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| Timespec {
+                sec: d.as_secs(),
+                nsec: d.subsec_nanos(),
+            })
+            .unwrap_or(Timespec {
+                sec: 1_700_000_000,
+                nsec: 0,
+            })
     }
 }
 
-fn to_js_json<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
+pub(crate) fn to_js_json<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
     let s = serde_json::to_string(value).map_err(|_| js_errno(Errno::EIO, "serialize"))?;
     js_sys::JSON::parse(&s).map_err(|_| js_errno(Errno::EIO, "json parse"))
 }
 
-fn from_js_json<T: for<'de> Deserialize<'de>>(val: &JsValue) -> vfs::Result<T> {
+pub(crate) fn from_js_json<T: for<'de> Deserialize<'de>>(val: &JsValue) -> vfs::Result<T> {
     let s = js_sys::JSON::stringify(val)
         .map_err(|_| Errno::EIO)?
         .as_string()
@@ -149,8 +165,8 @@ fn js_to_vec_u8(val: &JsValue) -> vfs::Result<Vec<u8>> {
 // -----------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct JsCowfsStore {
-    obj: JsValue,
+pub(crate) struct JsCowfsStore {
+    pub(crate) obj: JsValue,
 }
 
 struct JsWriterGuard {
@@ -1325,6 +1341,296 @@ fn parse_writer_mode(mode: &str) -> vfs::Result<WriterMode> {
     }
 }
 
+/// Result of a clean `os-cowfs` unmount/shutdown with automatic unmodified-fork pruning.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseCleanPruneOutcome {
+    pub volume_uuid: String,
+    pub forked_from: Option<String>,
+    pub base_epoch: u64,
+    pub final_epoch: u64,
+    pub pruned: bool,
+    pub retained: bool,
+}
+
+/// Result of `open_for_boot`: either a newly created & atomically seeded root volume (epoch 1)
+/// or a verified existing volume / O(1) `ForkOnBusy` fork.
+pub struct BootOpenResult<H: HeadStore + 'static, P: PackStore + 'static> {
+    pub fs: Rc<CowFs<H, P>>,
+    pub volume_uuid: String,
+    pub forked_from: Option<String>,
+    pub base_epoch: u64,
+    pub ephemeral_if_unmodified: bool,
+    pub first_boot_seeded: bool,
+    pub fsck_report: Option<cowfs::FsckReport>,
+}
+
+/// Atomically seed every directory, regular file, and symlink from a verified `Kind::RootTemplate`
+/// image into `fs`, setting exact `uid`/`gid`/`mode` (`shadow` `0600`, `sudoers` `0440`,
+/// `/home/user` `0750`, `/root` `0700`) and committing epoch 1 in a single transaction group.
+///
+/// Also ensures merged-`/usr` compatibility symlinks (`/bin -> usr/bin`, `/sbin -> usr/bin`,
+/// `/lib -> usr/lib`, `/lib64 -> usr/lib`) and `/mnt/cloud` exist on the newly provisioned root.
+pub async fn seed_root_template_fs<
+    H: HeadStore + 'static,
+    P: PackStore + 'static,
+    B: vfs::imagefs::BlobStore,
+>(
+    fs: &CowFs<H, P>,
+    template: &image::Image,
+    blobs: &B,
+) -> vfs::Result<VolumeHead> {
+    if template.kind != image::Kind::RootTemplate {
+        return Err(Errno::EINVAL);
+    }
+    let mut root_cred = Cred::root();
+    root_cred.umask = 0;
+
+    let mut handles: HashMap<String, Handle> = HashMap::new();
+    handles.insert("/".to_string(), fs.root());
+
+    for entry in &template.entries {
+        if entry.path == "/" {
+            continue;
+        }
+        let (parent_path, name) = match entry.path.rsplit_once('/') {
+            Some(("", n)) => ("/", n),
+            Some((p, n)) => (p, n),
+            None => return Err(Errno::EINVAL),
+        };
+        let parent_h = handles.get(parent_path).cloned().ok_or(Errno::ENOENT)?;
+        match &entry.node {
+            image::Node::Directory => {
+                let created = match fs.mkdir(&root_cred, &parent_h, name, entry.mode).await {
+                    Ok(e) => e,
+                    Err(Errno::EEXIST) => fs.lookup(&root_cred, &parent_h, name).await?,
+                    Err(e) => return Err(e),
+                };
+                fs.setattr(
+                    &root_cred,
+                    &created.handle,
+                    &SetAttr {
+                        mode: Some(entry.mode),
+                        uid: Some(entry.uid),
+                        gid: Some(entry.gid),
+                        ..SetAttr::default()
+                    },
+                )
+                .await?;
+                handles.insert(entry.path.clone(), created.handle);
+            }
+            image::Node::File {
+                sha256,
+                size,
+                chunk_size,
+                chunks,
+            } => {
+                let bytes = crate::release_v2::read_verified_image_file(
+                    blobs,
+                    sha256,
+                    *size,
+                    *chunk_size,
+                    chunks,
+                )
+                .await?;
+                let mut opts = OpenOptions::new();
+                opts.write(true).create(true).truncate(true);
+                let (created, open) = fs
+                    .create(&root_cred, &parent_h, name, entry.mode, &opts)
+                    .await?;
+                let mut written_off = 0u64;
+                while (written_off as usize) < bytes.len() {
+                    let slice = &bytes[written_off as usize..];
+                    let w = fs
+                        .write_at(&open, slice, WriteAt::Offset(written_off))
+                        .await?;
+                    if w.len == 0 {
+                        let _ = fs.release(&open).await;
+                        return Err(Errno::EIO);
+                    }
+                    written_off += w.len as u64;
+                }
+                fs.release(&open).await?;
+                fs.setattr(
+                    &root_cred,
+                    &created.handle,
+                    &SetAttr {
+                        mode: Some(entry.mode),
+                        uid: Some(entry.uid),
+                        gid: Some(entry.gid),
+                        ..SetAttr::default()
+                    },
+                )
+                .await?;
+                handles.insert(entry.path.clone(), created.handle);
+            }
+            image::Node::Symlink { target } => {
+                let created = fs.symlink(&root_cred, &parent_h, name, target).await?;
+                handles.insert(entry.path.clone(), created.handle);
+            }
+        }
+    }
+
+    // Ensure `/mnt/cloud` optional mountpoint directory exists alongside `/mnt/{local,shared}`.
+    if let Some(mnt_h) = handles.get("/mnt").cloned()
+        && fs.lookup(&root_cred, &mnt_h, "cloud").await.is_err()
+    {
+        let _ = fs.mkdir(&root_cred, &mnt_h, "cloud", 0o755).await;
+    }
+
+    // Ensure merged-`/usr` compatibility symlinks exist on the local root so `/bin/sh` etc. work
+    // immediately after `switch_root` once Release v2 `/usr` is mounted.
+    let root_h = fs.root();
+    for (name, target) in [
+        ("bin", "usr/bin"),
+        ("sbin", "usr/bin"),
+        ("lib", "usr/lib"),
+        ("lib64", "usr/lib"),
+    ] {
+        if fs.lookup(&root_cred, &root_h, name).await.is_err() {
+            let _ = fs.symlink(&root_cred, &root_h, name, target).await;
+        }
+    }
+
+    fs.commit_tx_group().await
+}
+
+/// Pre-mount integrity & format-version verifier (`cowfsck`) that NEVER mutates user data and
+/// fails closed with `Errno::EPROTONOSUPPORT` on any incompatible `COWFS_FORMAT_VERSION`.
+pub async fn cowfsck_volume_stores<H: HeadStore, P: PackStore>(
+    head_store: &H,
+    pack_store: &P,
+    volume: &VolumeId,
+) -> vfs::Result<cowfs::FsckReport> {
+    if let Some(ver) = head_store.format_version().await?
+        && ver != cowtree::COWFS_FORMAT_VERSION
+    {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+    cowfs::verify_volume(head_store, pack_store, volume).await
+}
+
+/// Open or provision an `os-cowfs` root volume for Stage 1 boot:
+/// - Always checks `COWFS_FORMAT_VERSION` FIRST (`EPROTONOSUPPORT`, NEVER wipes/formats!).
+/// - On first boot (`volume_uuid == None`): formats a fresh volume, atomically seeds
+///   `RootTemplate`, and commits epoch 1.
+/// - On subsequent boot (`volume_uuid == Some(uuid)`): runs `cowfsck` first (returning `EIO`
+///   if corrupt, preserving the volume untouched), then opens with `writer_mode` (`ForkOnBusy`
+///   or `Exclusive`).
+#[allow(clippy::too_many_arguments)]
+pub async fn open_for_boot_stores<
+    H: HeadStore + 'static,
+    P: PackStore + 'static,
+    B: vfs::imagefs::BlobStore,
+>(
+    head_store: Rc<H>,
+    pack_store: Rc<P>,
+    volume_uuid: Option<String>,
+    writer_mode: WriterMode,
+    template: Option<&image::Image>,
+    blobs: Option<&B>,
+    config: CowFsConfig,
+    new_volume_uuid: impl FnOnce() -> String,
+) -> vfs::Result<BootOpenResult<H, P>> {
+    // 1. Check store-wide format version FIRST — NEVER format or wipe an incompatible store!
+    if let Some(ver) = head_store.format_version().await?
+        && ver != cowtree::COWFS_FORMAT_VERSION
+    {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+
+    match volume_uuid {
+        None => {
+            let uuid = new_volume_uuid();
+            let vol_id = VolumeId(uuid.clone());
+            let now = (config.clock)();
+            CowFs::format_volume(&*head_store, &*pack_store, vol_id.clone(), 0, 0, 0o755, now)
+                .await?;
+            let fs = Rc::new(
+                CowFs::open(
+                    Rc::clone(&head_store),
+                    Rc::clone(&pack_store),
+                    vol_id,
+                    CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+                    config,
+                )
+                .await?,
+            );
+            let mut seeded = false;
+            if let (Some(tpl), Some(blob_store)) = (template, blobs) {
+                seed_root_template_fs(&fs, tpl, blob_store).await?;
+                seeded = true;
+            }
+            let head = fs.current_head();
+            Ok(BootOpenResult {
+                fs,
+                volume_uuid: uuid,
+                forked_from: None,
+                base_epoch: head.epoch,
+                ephemeral_if_unmodified: false,
+                first_boot_seeded: seeded,
+                fsck_report: None,
+            })
+        }
+        Some(uuid) => {
+            let vol_id = VolumeId(uuid);
+            // 2. Pre-mount format & Merkle integrity check BEFORE mounting rw!
+            let report = cowfsck_volume_stores(&*head_store, &*pack_store, &vol_id).await?;
+            if !report.ok {
+                return Err(Errno::EIO);
+            }
+            // 3. Open volume with requested writer mode (`ForkOnBusy` creates an O(1) persistent
+            //    fork with `ephemeral_if_unmodified = true`; `Exclusive` fails `EBUSY`).
+            let fs = Rc::new(
+                CowFs::open(
+                    Rc::clone(&head_store),
+                    Rc::clone(&pack_store),
+                    vol_id,
+                    CowFsOpenMode::ReadWrite(writer_mode),
+                    config,
+                )
+                .await?,
+            );
+            let head = fs.current_head();
+            Ok(BootOpenResult {
+                volume_uuid: fs.volume_id().0.clone(),
+                forked_from: fs.forked_from().map(|v| v.0),
+                base_epoch: head.epoch,
+                ephemeral_if_unmodified: head.ephemeral_if_unmodified,
+                first_boot_seeded: false,
+                fsck_report: Some(report),
+                fs,
+            })
+        }
+    }
+}
+
+/// Clean shutdown helper: flushes dirty transactions if modified, invokes `CowFs::close_clean()`,
+/// and verifies whether an unmodified `ForkOnBusy` fork (`epoch == base_epoch`) was pruned vs
+/// retained.
+pub async fn close_clean_with_prune_fs<H: HeadStore + 'static, P: PackStore + 'static>(
+    fs: &CowFs<H, P>,
+    base_epoch: u64,
+) -> vfs::Result<CloseCleanPruneOutcome> {
+    let volume_uuid = fs.volume_id().0.clone();
+    let forked_from = fs.forked_from().map(|v| v.0);
+    let head_store = fs.head_store_rc();
+    fs.close_clean().await?;
+    let head_after = fs.current_head();
+    let still_exists = match head_store.read_head(&VolumeId(volume_uuid.clone())).await {
+        Ok(_) => true,
+        Err(Errno::ENOENT) => false,
+        Err(_) => true,
+    };
+    Ok(CloseCleanPruneOutcome {
+        volume_uuid,
+        forked_from,
+        base_epoch,
+        final_epoch: head_after.epoch,
+        pruned: !still_exists,
+        retained: still_exists,
+    })
+}
+
 /// Format a new `os-cowfs` volume on the supplied JS `cowfs-store.js` adapter.
 #[wasm_bindgen]
 pub async fn cowfs_format_volume(
@@ -1351,10 +1657,16 @@ pub async fn cowfs_format_volume(
 #[wasm_bindgen]
 pub async fn cowfs_verify_volume(store: JsValue, volume_id: String) -> Result<JsValue, JsValue> {
     let adapter = JsCowfsStore { obj: store };
-    let report = cowfs::verify_volume(&adapter, &adapter, &VolumeId(volume_id))
+    let report = cowfsck_volume_stores(&adapter, &adapter, &VolumeId(volume_id))
         .await
         .map_err(map_vfs_err)?;
     to_js_json(&report)
+}
+
+/// Alias exported for Stage 1 `cowfsck` browser callers.
+#[wasm_bindgen]
+pub async fn cowfsck_volume(store: JsValue, volume_id: String) -> Result<JsValue, JsValue> {
+    cowfs_verify_volume(store, volume_id).await
 }
 
 /// Run reachability GC over `store` at wall-clock timestamp `now_sec`.
@@ -2102,9 +2414,28 @@ impl CowFsVolume {
         to_js_json(&resp)
     }
 
+    pub async fn seed_root_template(&self, root_template_json: String) -> Result<JsValue, JsValue> {
+        let tpl = image::Image::parse(root_template_json.as_bytes())
+            .map_err(|e| js_errno(Errno::EINVAL, &e.to_string()))?;
+        let blobs = crate::release_v2::VerifiedAssetBlobStore;
+        let head = seed_root_template_fs(&self.fs, &tpl, &blobs)
+            .await
+            .map_err(map_vfs_err)?;
+        to_js_json(&head)
+    }
+
     pub async fn close_clean(&self) -> Result<(), JsValue> {
         cancel_dirty_timer(&self.dirty_timer);
         self.fs.close_clean().await.map_err(map_vfs_err)
+    }
+
+    pub async fn close_clean_with_prune(&self, base_epoch: f64) -> Result<JsValue, JsValue> {
+        let base = validate_js_u64(base_epoch).map_err(map_vfs_err)?;
+        cancel_dirty_timer(&self.dirty_timer);
+        let outcome = close_clean_with_prune_fs(&self.fs, base)
+            .await
+            .map_err(map_vfs_err)?;
+        to_js_json(&outcome)
     }
 
     // Internal helpers

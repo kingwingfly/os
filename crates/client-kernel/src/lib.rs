@@ -13,6 +13,7 @@
 //! attach lazily on first remote use through `ServiceAuth v2` (`POST /api/service-auth`), fencing
 //! `(instance_id, host_proof)` and immediately revoking remote credentials on exit, `SIGKILL`,
 //! privilege drop, or login-scope end.
+pub mod boot_stage;
 mod cloudfs;
 mod cowfs_bridge;
 mod helper;
