@@ -141,6 +141,7 @@ fn release_v2() -> ReleaseV2 {
             min: SCHEMA,
             max: SCHEMA,
         },
+        release_seq: None,
         provenance: BTreeMap::new(),
     }
 }
@@ -545,4 +546,109 @@ fn release_v2_compatibility_and_loader_binding_fail_closed() {
     // Tampered loader sha256 fails verify_boot_loader.
     r.loader.client_kernel_sha256 = digest(b"wrong");
     assert!(r.verify_boot_loader(&boot_image()).is_err());
+
+    // Optional monotonic release_seq parses and omits cleanly when None.
+    r = release_v2();
+    let without_seq = serde_json::to_vec(&r).unwrap();
+    assert!(!String::from_utf8_lossy(&without_seq).contains("release_seq"));
+    r.release_seq = Some(42);
+    let with_seq = serde_json::to_vec(&r).unwrap();
+    let parsed = ReleaseV2::parse(&with_seq).unwrap();
+    assert_eq!(parsed.release_seq, Some(42));
+}
+
+#[test]
+fn verify_content_checks_multi_chunk_digests_and_rejects_mismatch() {
+    let mut payload = vec![0u8; CHUNK_SIZE_MIN as usize * 2 + 321];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = ((i * 37) & 0xff) as u8;
+    }
+    let full_sha = digest(&payload);
+    let valid_chunks = chunk_digests(&payload, CHUNK_SIZE_MIN).unwrap();
+    assert_eq!(valid_chunks.len(), 3);
+
+    let make_img = |chunks: Vec<String>| {
+        image(
+            Kind::Base,
+            vec![
+                dir("/"),
+                dir("/usr"),
+                Entry {
+                    path: "/usr/multi.bin".into(),
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o644,
+                    node: Node::File {
+                        sha256: full_sha.clone(),
+                        size: payload.len() as u64,
+                        chunk_size: CHUNK_SIZE_MIN,
+                        chunks,
+                    },
+                },
+                file_bytes("/usr/empty.bin", b""),
+            ],
+        )
+    };
+
+    let empty_sha = digest(b"");
+    let valid_img = make_img(valid_chunks.clone());
+    assert!(valid_img.validate().is_ok());
+    assert!(
+        valid_img
+            .verify_content(|sha| {
+                if sha == full_sha {
+                    Ok(std::io::Cursor::new(payload.as_slice()))
+                } else if sha == empty_sha {
+                    Ok(std::io::Cursor::new(&[][..]))
+                } else {
+                    Err(Error("missing blob".into()))
+                }
+            })
+            .is_ok()
+    );
+
+    // Same valid whole-file sha256 and exact length, but corrupted 2nd chunk digest -> MUST fail!
+    let mut bad_chunks = valid_chunks.clone();
+    bad_chunks[1] = digest(b"wrong-chunk-1");
+    let bad_img = make_img(bad_chunks);
+    assert!(bad_img.validate().is_ok());
+    assert!(
+        bad_img
+            .verify_content(|sha| {
+                if sha == full_sha {
+                    Ok(std::io::Cursor::new(payload.as_slice()))
+                } else {
+                    Ok(std::io::Cursor::new(&[][..]))
+                }
+            })
+            .is_err()
+    );
+
+    // Valid manifest, but 1-bit flipped payload -> MUST fail!
+    let mut flipped = payload.clone();
+    flipped[CHUNK_SIZE_MIN as usize + 5] ^= 0x01;
+    assert!(
+        valid_img
+            .verify_content(|sha| {
+                if sha == full_sha {
+                    Ok(std::io::Cursor::new(flipped.as_slice()))
+                } else {
+                    Ok(std::io::Cursor::new(&[][..]))
+                }
+            })
+            .is_err()
+    );
+
+    // Truncated stream -> MUST fail!
+    assert!(
+        valid_img
+            .verify_content(|sha| {
+                if sha == full_sha {
+                    Ok(std::io::Cursor::new(&payload[..payload.len() - 1]))
+                } else {
+                    Ok(std::io::Cursor::new(&[][..]))
+                }
+            })
+            .is_err()
+    );
 }

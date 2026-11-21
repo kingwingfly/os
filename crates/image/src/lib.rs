@@ -96,6 +96,80 @@ pub fn chunk_digests(bytes: &[u8], chunk_size: u32) -> Result<Vec<String>> {
     }
     Ok(bytes.chunks(chunk_size as usize).map(digest).collect())
 }
+/// Stream-verifies a content reader against its declared whole-file SHA-256, exact size,
+/// chunk size, and every ordered chunk SHA-256 digest using bounded 64 KiB buffering.
+pub fn verify_reader_chunks<R: std::io::Read>(
+    mut reader: R,
+    expected_sha256: &str,
+    expected_size: u64,
+    chunk_size: u32,
+    expected_chunks: &[String],
+) -> Result<()> {
+    let expected_count = expected_chunk_count(expected_size, chunk_size)?;
+    require(
+        expected_chunks.len() == expected_count,
+        "chunk digest count mismatch",
+    )?;
+    unhex::<32>(expected_sha256)?;
+    for c in expected_chunks {
+        unhex::<32>(c)?;
+    }
+    let cs = chunk_size as usize;
+    let mut whole_hash = Sha256::new();
+    let mut chunk_hash = Sha256::new();
+    let mut chunk_filled = 0usize;
+    let mut chunk_index = 0usize;
+    let mut total_len = 0u64;
+    let mut buf = [0u8; 65_536];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| Error(format!("content read error: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        total_len = total_len
+            .checked_add(n as u64)
+            .ok_or_else(|| Error("content length overflow".into()))?;
+        require(total_len <= expected_size, "content length mismatch")?;
+        whole_hash.update(&buf[..n]);
+        let mut slice = &buf[..n];
+        while !slice.is_empty() {
+            let take = slice.len().min(cs - chunk_filled);
+            chunk_hash.update(&slice[..take]);
+            chunk_filled += take;
+            slice = &slice[take..];
+            if chunk_filled == cs {
+                let expected = expected_chunks
+                    .get(chunk_index)
+                    .ok_or_else(|| Error("chunk index out of range".into()))?;
+                require(
+                    hex(&chunk_hash.finalize_reset()) == *expected,
+                    "chunk digest mismatch",
+                )?;
+                chunk_filled = 0;
+                chunk_index += 1;
+            }
+        }
+    }
+    if chunk_filled > 0 {
+        let expected = expected_chunks
+            .get(chunk_index)
+            .ok_or_else(|| Error("chunk index out of range".into()))?;
+        require(
+            hex(&chunk_hash.finalize()) == *expected,
+            "chunk digest mismatch",
+        )?;
+        chunk_index += 1;
+    }
+    require(
+        total_len == expected_size
+            && chunk_index == expected_chunks.len()
+            && hex(&whole_hash.finalize()) == expected_sha256,
+        "content digest or length mismatch",
+    )?;
+    Ok(())
+}
 pub fn valid_path(path: &str) -> bool {
     path.starts_with('/')
         && path.len() <= 4096
@@ -319,10 +393,22 @@ impl Image {
             Kind::Workload => below(path, "/workload"),
         }
     }
-    pub fn verify_content(&self, mut read: impl FnMut(&str, u64) -> Result<()>) -> Result<()> {
+    /// Stream-verifies every regular file in the image against its whole-file SHA-256, exact size,
+    /// and every per-chunk SHA-256 digest in `entry.chunks`.
+    pub fn verify_content<R: std::io::Read>(
+        &self,
+        mut open: impl FnMut(&str) -> Result<R>,
+    ) -> Result<()> {
         for entry in &self.entries {
-            if let Node::File { sha256, size, .. } = &entry.node {
-                read(sha256, *size)?;
+            if let Node::File {
+                sha256,
+                size,
+                chunk_size,
+                chunks,
+            } = &entry.node
+            {
+                let reader = open(sha256)?;
+                verify_reader_chunks(reader, sha256, *size, *chunk_size, chunks)?;
             }
         }
         Ok(())
@@ -400,6 +486,8 @@ pub struct ReleaseV2 {
     pub confext: Vec<String>,
     pub protocol: Range,
     pub schema: Range,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_seq: Option<u64>,
     pub provenance: BTreeMap<String, String>,
 }
 

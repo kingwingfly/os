@@ -358,3 +358,126 @@ test('single-chunk blob accepts 200 OK after verifying exact length and SHA-256'
   const got = await pager.imageBlobRead(`sha256:${manifest.sha256}`, 100, 200, manifest);
   assert.deepEqual(got, data.subarray(100, 300));
 });
+
+test('two manifests sharing one blob sha256 with different chunk_size never cross-contaminate cache', async () => {
+  const SIZE = CHUNK_SIZE_DEFAULT * 2 + 1024;
+  const { data, manifest: manifest64k } = makeBlob(SIZE, CHUNK_SIZE_MIN);
+  // Build second manifest for the exact same blob bytes using 256 KiB chunk_size.
+  const chunks256k = [];
+  for (let off = 0; off < SIZE; off += CHUNK_SIZE_DEFAULT) {
+    chunks256k.push(sha256(data.subarray(off, Math.min(SIZE, off + CHUNK_SIZE_DEFAULT))));
+  }
+  const manifest256k = {
+    sha256: manifest64k.sha256,
+    size: SIZE,
+    chunk_size: CHUNK_SIZE_DEFAULT,
+    chunks: chunks256k,
+  };
+
+  const pager = createImagePager({
+    readLocalRange: async () => null,
+    maxCacheBytes: 4 * 1024 * 1024,
+    fetch: async (_url, init) => {
+      const [, s, e] = /^bytes=(\d+)-(\d+)$/.exec(init.headers.Range);
+      const start = Number(s);
+      const end = Number(e);
+      const slice = data.subarray(start, end + 1);
+      return new Response(streamFromPieces([slice]), {
+        status: 206,
+        headers: {
+          'Content-Range': `bytes ${start}-${end}/${SIZE}`,
+          'Content-Length': String(slice.byteLength),
+        },
+      });
+    },
+  });
+
+  // Populate cache with chunk index 1 of 64 KiB manifest (file offset 64 KiB).
+  const slice64k = await pager.imageBlobRead(`sha256:${manifest64k.sha256}`, CHUNK_SIZE_MIN + 16, 64, manifest64k);
+  assert.deepEqual(slice64k, data.subarray(CHUNK_SIZE_MIN + 16, CHUNK_SIZE_MIN + 80));
+
+  // Now read chunk index 1 of 256 KiB manifest (file offset 256 KiB) -> MUST NOT return 64 KiB cached bytes!
+  const slice256k = await pager.imageBlobRead(`sha256:${manifest256k.sha256}`, CHUNK_SIZE_DEFAULT + 16, 64, manifest256k);
+  assert.deepEqual(slice256k, data.subarray(CHUNK_SIZE_DEFAULT + 16, CHUNK_SIZE_DEFAULT + 80));
+  assert.equal(pager.stats().totalNetworkFetches, 2);
+
+  // Reading the same chunk again under manifest256k hits cache cleanly.
+  const cachedAgain = await pager.imageBlobRead(`sha256:${manifest256k.sha256}`, CHUNK_SIZE_DEFAULT + 32, 64, manifest256k);
+  assert.deepEqual(cachedAgain, data.subarray(CHUNK_SIZE_DEFAULT + 32, CHUNK_SIZE_DEFAULT + 96));
+  assert.equal(pager.stats().totalNetworkFetches, 2);
+  assert.equal(pager.stats().cacheHits, 1);
+});
+
+test('unmanifested sha256 reads are refused (EINVAL) and unmanifested asset 206 validates Content-Range strictly', async () => {
+  const { data, manifest } = makeBlob(CHUNK_SIZE_MIN, CHUNK_SIZE_MIN);
+
+  // 1. Unmanifested content-addressed sha256 read fails closed even when OPFS has bytes.
+  {
+    let localCalls = 0;
+    const pager = createImagePager({
+      readLocalRange: async () => {
+        localCalls++;
+        return data.slice(0, 16);
+      },
+      fetch: async () => { throw new Error('must not fetch'); },
+    });
+    for (const id of [`sha256:${manifest.sha256}`, manifest.sha256]) {
+      await assert.rejects(
+        pager.imageBlobRead(id, 0, 16, null),
+        err => err.errno === 'EINVAL',
+      );
+    }
+    assert.equal(localCalls, 0);
+  }
+
+  // 2. Unmanifested asset path (`/usr/bin/foo.wasm`) rejects wrong/missing HTTP 206 Content-Range.
+  const assetBytes = new Uint8Array(4096);
+  for (let i = 0; i < assetBytes.length; i++) assetBytes[i] = i & 0xff;
+
+  for (const badRange of [
+    '',
+    'invalid',
+    'bytes 0-15/4096',     // wrong start offset (requested 100..115)
+    'bytes 100-120/4096',  // exceeds requested end (115)
+    'bytes 100-110/4096',  // short range not at EOF
+  ]) {
+    let cancelled = false;
+    const pager = createImagePager({
+      fetch: async () => new Response(
+        streamFromPieces([assetBytes.slice(100, 116)], { onCancel: () => { cancelled = true; } }),
+        {
+          status: 206,
+          headers: badRange ? { 'Content-Range': badRange } : {},
+        },
+      ),
+    });
+    await assert.rejects(
+      pager.imageBlobRead('/usr/bin/foo.wasm', 100, 16, null),
+      err => err.errno === 'EIO',
+    );
+    assert.equal(cancelled, true, `bad Content-Range "${badRange}" must cancel stream`);
+  }
+
+  // 3. Valid HTTP 206 Content-Range on unmanifested asset succeeds (including EOF clamp).
+  {
+    const pager = createImagePager({
+      fetch: async (_url, init) => {
+        const [, s, e] = /^bytes=(\d+)-(\d+)$/.exec(init.headers.Range);
+        const start = Number(s);
+        const end = Math.min(Number(e), assetBytes.length - 1);
+        const slice = assetBytes.subarray(start, end + 1);
+        return new Response(streamFromPieces([slice]), {
+          status: 206,
+          headers: {
+            'Content-Range': `bytes ${start}-${end}/${assetBytes.length}`,
+            'Content-Length': String(slice.byteLength),
+          },
+        });
+      },
+    });
+    const exact = await pager.imageBlobRead('/usr/bin/foo.wasm', 100, 16, null);
+    assert.deepEqual(exact, assetBytes.subarray(100, 116));
+    const eofClamped = await pager.imageBlobRead('/usr/bin/foo.wasm', 4090, 32, null);
+    assert.deepEqual(eofClamped, assetBytes.subarray(4090, 4096));
+  }
+});

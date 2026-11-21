@@ -2,10 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, sign, webcrypto } from 'node:crypto';
 import {
+  BOOT_LOCK_PREFIX,
   CHUNK_SIZE_MIN,
+  MANIFEST_MAX,
   SIGNING_DOMAIN_IMAGE_V2,
   SIGNING_DOMAIN_RELEASE_V2,
+  SIGNING_DOMAIN_TRUST_V2,
+  createBrowserOpfsStore,
   createOfflineInstaller,
+  createOfflineSwHandler,
 } from '../web/kernel/offline-installer.js';
 
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -157,6 +162,7 @@ function buildMemoryStores() {
     previous: null,
     activeBootVerified: false,
     bootAttempts: 0,
+    trustRoot: null,
     generations: {},
   };
   let strictTransactions = 0;
@@ -378,8 +384,14 @@ function makeSignedReleaseBundle(name, { keyPair, extraConfext, mutate = () => {
 
 test('OfflineInstaller pins Release v2 atomically, refuses tampered/incomplete/revoked/v1 updates keeping active A intact, and rolls back on crash before markBootHealthy', async () => {
   const keyPair = generateKeyPairSync('ed25519');
-  const genA = makeSignedReleaseBundle('gen-A', { keyPair });
-  const genB = makeSignedReleaseBundle('gen-B', { keyPair });
+  const revokedKeyPair = generateKeyPairSync('ed25519');
+  const revokedRawPub = revokedKeyPair.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
+  const revokedKeyId = hash(revokedRawPub);
+  const addSecondaryKey = ctx => {
+    ctx.trust.keys[revokedKeyId] = revokedRawPub.toString('hex');
+  };
+  const genA = makeSignedReleaseBundle('gen-A', { keyPair, mutate: addSecondaryKey });
+  const genB = makeSignedReleaseBundle('gen-B', { keyPair, mutate: addSecondaryKey });
 
   const stores = buildMemoryStores();
   let activeRoutes = genA.routes;
@@ -437,9 +449,10 @@ test('OfflineInstaller pins Release v2 atomically, refuses tampered/incomplete/r
       },
     })],
     ['revoked publisher key', makeSignedReleaseBundle('bad-revoked', {
-      keyPair,
+      keyPair: revokedKeyPair,
       mutate: ctx => {
         ctx.postMutate = ({ trust, keyId, routes, releaseId }) => {
+          Object.assign(trust.keys, genA.trust.keys);
           trust.revoked.push(keyId);
           routes.set('/boot/entries', Buffer.from(JSON.stringify({ format: 'os.boot', version: 2, default: releaseId, protocol: 2, schema: 10, trust })));
         };
@@ -745,4 +758,621 @@ test('OfflineInstaller repairs pre-existing truncated or corrupted OPFS blob on 
   assert.equal(verified.releaseId, genA.releaseId);
   const repaired = await stores.opfs.readFile(`os-releases/blobs/${targetSha}`);
   assert.equal(hash(Buffer.from(repaired)), targetSha);
+});
+
+// --- Track F2 security, durability, streaming, and concurrency regression tests ---
+
+function createMockWebLocks() {
+  const sharedCounts = new Map();
+  const exclusiveHeld = new Set();
+  return {
+    async request(name, opts, cb) {
+      const mode = opts?.mode ?? 'exclusive';
+      const ifAvailable = Boolean(opts?.ifAvailable);
+      if (mode === 'exclusive') {
+        const busy = exclusiveHeld.has(name) || (sharedCounts.get(name) ?? 0) > 0;
+        if (busy) {
+          if (ifAvailable) return cb(null);
+          throw new Error('exclusive lock busy');
+        }
+        exclusiveHeld.add(name);
+        try {
+          return await cb({ name, mode });
+        } finally {
+          exclusiveHeld.delete(name);
+        }
+      }
+      if (exclusiveHeld.has(name)) {
+        if (ifAvailable) return cb(null);
+        throw new Error('shared lock blocked by exclusive');
+      }
+      sharedCounts.set(name, (sharedCounts.get(name) ?? 0) + 1);
+      try {
+        return await cb({ name, mode });
+      } finally {
+        const next = (sharedCounts.get(name) ?? 1) - 1;
+        if (next <= 0) sharedCounts.delete(name);
+        else sharedCounts.set(name, next);
+      }
+    },
+    isHeld(name) {
+      return exclusiveHeld.has(name) || (sharedCounts.get(name) ?? 0) > 0;
+    },
+  };
+}
+
+function makeMemoryCachesApi(cacheStore) {
+  return {
+    async open(name) {
+      return {
+        async match(urlPath) {
+          const hit = await cacheStore.match(name, urlPath);
+          if (!hit) return undefined;
+          return new Response(hit.bytes, {
+            status: 200,
+            headers: { 'Content-Type': hit.contentType ?? 'application/octet-stream' },
+          });
+        },
+      };
+    },
+  };
+}
+
+test('F2-01: SW network-first /boot/entries propagates revocations monotonically to active & rollback targets, blocks unanchored keys & downgrades, and supports signed rotation', async () => {
+  const keyA = generateKeyPairSync('ed25519');
+  const keyB = generateKeyPairSync('ed25519');
+  const keyC = generateKeyPairSync('ed25519');
+  const attackerKey = generateKeyPairSync('ed25519');
+
+  const pubHex = kp => kp.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex');
+  const keyIdOf = kp => hash(kp.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32));
+  const idA = keyIdOf(keyA);
+  const idB = keyIdOf(keyB);
+  const idC = keyIdOf(keyC);
+  const idAttacker = keyIdOf(attackerKey);
+
+  const initialKeys = { [idA]: pubHex(keyA), [idB]: pubHex(keyB) };
+  const gen1 = makeSignedReleaseBundle('seq-1', {
+    keyPair: keyA,
+    mutate: ctx => {
+      ctx.trust = { keys: { ...initialKeys }, revoked: [] };
+      ctx.postMutate = ({ routes }) => {
+        // Re-wrap with explicit release_seq = 1 via provenance.release_seq
+      };
+    },
+  });
+  // Build sequenced releases cleanly by injecting provenance.release_seq into manifests.
+  const makeSequenced = (name, keyPair, seq, extraTrust = null) => {
+    const b = makeSignedReleaseBundle(name, {
+      keyPair,
+      mutate: ctx => {
+        ctx.trust = extraTrust ? structuredClone(extraTrust) : { keys: { ...initialKeys }, revoked: [] };
+      },
+    });
+    const rel = JSON.parse(b.routes.get(`/boot/releases/${b.releaseId}/manifest.json`).toString('utf8'));
+    rel.release_seq = seq;
+    const relBuf = Buffer.from(JSON.stringify(rel));
+    const newId = hash(relBuf);
+    const sig = Buffer.from(JSON.stringify({
+      format: 'os.signature',
+      version: 1,
+      key: keyIdOf(keyPair),
+      signature: sign(null, Buffer.concat([Buffer.from(SIGNING_DOMAIN_RELEASE_V2 + '\0'), relBuf]), keyPair.privateKey).toString('hex'),
+    }));
+    const routes = new Map(b.routes);
+    routes.set(`/boot/releases/${newId}/manifest.json`, relBuf);
+    routes.set(`/boot/releases/${newId}/signature.json`, sig);
+    for (const [k, v] of [...b.routes.entries()]) {
+      if (k.startsWith(`/boot/releases/${b.releaseId}/assets/`)) {
+        routes.set(k.replace(b.releaseId, newId), v);
+      }
+    }
+    routes.set('/boot/entries', Buffer.from(JSON.stringify({
+      format: 'os.boot',
+      version: 2,
+      default: newId,
+      protocol: 2,
+      schema: 10,
+      trust: b.trust,
+    })));
+    return { ...b, releaseId: newId, routes };
+  };
+
+  const rel1 = makeSequenced('rel-1', keyA, 1);
+  const rel2 = makeSequenced('rel-2', keyB, 2);
+  const relDowngrade = makeSequenced('rel-old', keyB, 1);
+  const relUnsequenced = gen1;
+  const relAttacker = makeSequenced('rel-evil', attackerKey, 3, {
+    keys: { ...initialKeys, [idAttacker]: pubHex(attackerKey) },
+    revoked: [],
+  });
+  const relRotated = makeSequenced('rel-rot', keyC, 3, {
+    keys: { ...initialKeys, [idC]: pubHex(keyC) },
+    revoked: [idA],
+  });
+
+  const stores = buildMemoryStores();
+  let activeRoutes = rel1.routes;
+  let online = true;
+  const origin = 'https://os.test';
+
+  const networkFetch = async url => {
+    if (!online) throw new Error('offline');
+    const rawUrl = typeof url === 'string' ? url : url.url;
+    const path = new URL(rawUrl, origin).pathname;
+    const buf = activeRoutes.get(path);
+    return buf ? new Response(buf, { status: 200 }) : new Response(null, { status: 404 });
+  };
+
+  const swFetch = createOfflineSwHandler({
+    stateStore: stores.stateStore,
+    opfs: stores.opfs,
+    cachesApi: makeMemoryCachesApi(stores.cacheStore),
+    fetchFn: networkFetch,
+    origin,
+  });
+
+  const installer = createOfflineInstaller({
+    ...stores,
+    fetch: async (url, init) => swFetch(new Request(new URL(url, origin), init)),
+  });
+
+  // 1. Install rel1 (seq 1, signed by keyA) and boot healthy.
+  await installer.install(rel1.releaseId);
+  await installer.beginOfflineBoot();
+  await installer.markBootHealthy(rel1.releaseId);
+
+  // 2. Unanchored attacker key in /boot/entries MUST be rejected!
+  activeRoutes = relAttacker.routes;
+  await assert.rejects(installer.install(relAttacker.releaseId), /not trusted/);
+
+  // 3. Install rel2 (seq 2, signed by keyB). Previous = rel1 (signed by keyA).
+  activeRoutes = rel2.routes;
+  await installer.install(rel2.releaseId);
+  assert.equal((await installer.getState()).previous, rel1.releaseId);
+
+  // 4. Downgrade below minReleaseSeq (seq 1 < 2) and unsequenced release MUST be refused!
+  activeRoutes = relDowngrade.routes;
+  await assert.rejects(installer.install(relDowngrade.releaseId), /downgrade refused/i);
+  activeRoutes = relUnsequenced.routes;
+  await assert.rejects(installer.install(relUnsequenced.releaseId), /downgrade refused/i);
+
+  // 5. Online SW `/boot/entries` revokes keyA (network-first, NEVER cache-first!).
+  const revokedEntries = Buffer.from(JSON.stringify({
+    format: 'os.boot',
+    version: 2,
+    default: rel2.releaseId,
+    protocol: 2,
+    schema: 10,
+    trust: { keys: { ...initialKeys }, revoked: [idA] },
+  }));
+  activeRoutes = new Map([['/boot/entries', revokedEntries]]);
+  const entriesRes = await swFetch(new Request(`${origin}/boot/entries`));
+  assert.equal(entriesRes.status, 200);
+  const parsedEntries = await entriesRes.json();
+  assert.ok(parsedEntries.trust.revoked.includes(idA));
+  assert.ok((await installer.getState()).trustRoot.revoked.includes(idA));
+
+  // 6. Even offline AND even if a stale server later drops keyA from `revoked`,
+  //    rel1 (signed by revoked keyA) CANNOT verify, CANNOT boot, CANNOT be rolled back to,
+  //    and SW refuses its cached assets!
+  online = false;
+  await assert.rejects(installer.verifyInstalledOffline(rel1.releaseId), /revoked/);
+  await assert.rejects(installer.rollback(), /revoked/);
+  const pinnedAssetRes = await swFetch(new Request(`${origin}/boot/releases/${rel1.releaseId}/assets/index.html`));
+  assert.equal(pinnedAssetRes.status, 409);
+
+  // Stale /boot/entries omitting keyA cannot un-revoke keyA!
+  online = true;
+  activeRoutes = rel1.routes;
+  const staleRes = await swFetch(new Request(`${origin}/boot/entries`));
+  assert.ok((await staleRes.json()).trust.revoked.includes(idA));
+
+  // 7. Signed key rotation (`os.trust.v2`) by non-revoked keyB adds keyC cleanly!
+  const rotPayload = JSON.stringify({ add_keys: { [idC]: pubHex(keyC) }, revoke_keys: [idA] });
+  const trustRotation = {
+    format: 'os.trust.rotation',
+    version: 1,
+    payload: rotPayload,
+    signature: {
+      format: 'os.signature',
+      version: 1,
+      key: idB,
+      signature: sign(null, Buffer.concat([Buffer.from(SIGNING_DOMAIN_TRUST_V2 + '\0'), Buffer.from(rotPayload)]), keyB.privateKey).toString('hex'),
+    },
+  };
+  relRotated.routes.set('/boot/entries', Buffer.from(JSON.stringify({
+    format: 'os.boot',
+    version: 2,
+    default: relRotated.releaseId,
+    protocol: 2,
+    schema: 10,
+    trust: { keys: { ...initialKeys, [idC]: pubHex(keyC) }, revoked: [idA] },
+    trust_rotation: trustRotation,
+  })));
+  activeRoutes = relRotated.routes;
+  await installer.install(relRotated.releaseId);
+  assert.equal((await installer.getState()).active, relRotated.releaseId);
+});
+
+test('F2-02: OfflineInstaller rejects symlink escapes, Base+Sysext+Confext composition violations, and tampered Cache Storage loader assets', async () => {
+  const keyPair = generateKeyPairSync('ed25519');
+  const genGood = makeSignedReleaseBundle('good-comp', { keyPair });
+  const stores = buildMemoryStores();
+  let activeRoutes = genGood.routes;
+  const installer = createOfflineInstaller({
+    ...stores,
+    fetch: async url => {
+      const buf = activeRoutes.get(url);
+      return buf ? new Response(buf, { status: 200 }) : new Response(null, { status: 404 });
+    },
+  });
+
+  await installer.install(genGood.releaseId);
+
+  const dir = path => ({ path, uid: 0, gid: 0, mode: 0o755, node: { type: 'directory' } });
+  const link = (path, target) => ({ path, uid: 0, gid: 0, mode: 0o777, node: { type: 'symlink', target } });
+  const fileOf = (blobs, text) => {
+    const buf = Buffer.from(text);
+    const sha256 = hash(buf);
+    blobs.set(sha256, buf);
+    return { type: 'file', sha256, size: buf.length, chunk_size: CHUNK_SIZE_MIN, chunks: [sha256] };
+  };
+
+  const badCases = [
+    ['initramfs extra symlink escaping root', makeSignedReleaseBundle('escape-initramfs', {
+      keyPair,
+      mutate: ctx => {
+        ctx.initramfsImg.entries.push(link('/bin/escape', '../../../outside'));
+      },
+    })],
+    ['roottemplate symlink escaping to /etc/os-trust', makeSignedReleaseBundle('escape-roottpl', {
+      keyPair,
+      mutate: ctx => {
+        ctx.rootTemplateImg.entries.push(link('/etc/escape-trust', 'os-trust'));
+      },
+    })],
+    ['sysext symlink escaping to /etc', makeSignedReleaseBundle('escape-sysext', {
+      keyPair,
+      mutate: ctx => {
+        ctx.extraSysext = [{
+          format: 'os.image',
+          version: 2,
+          kind: 'sysext',
+          name: 'bad-link',
+          revision: '1',
+          abi: 1,
+          features: [],
+          level: 1,
+          provenance: {},
+          entries: [dir('/'), dir('/usr'), link('/usr/leak', '/etc')],
+        }];
+      },
+    })],
+    ['sysext symlink-parent shadowing (/usr/alias/file)', makeSignedReleaseBundle('shadow-sysext', {
+      keyPair,
+      mutate: ctx => {
+        ctx.extraSysext = [{
+          format: 'os.image',
+          version: 2,
+          kind: 'sysext',
+          name: 'shadow',
+          revision: '1',
+          abi: 1,
+          features: [],
+          level: 1,
+          provenance: {},
+          entries: [
+            dir('/'),
+            dir('/usr'),
+            link('/usr/alias', 'bin'),
+            { path: '/usr/alias/hidden', uid: 0, gid: 0, mode: 0o644, node: fileOf(ctx.blobs, 'x') },
+          ],
+        }];
+      },
+    })],
+  ];
+
+  for (const [label, bad] of badCases) {
+    activeRoutes = bad.routes;
+    await assert.rejects(installer.install(bad.releaseId), undefined, `expected rejection for ${label}`);
+  }
+
+  // Tampering cached client_kernel_bg.wasm in Cache Storage MUST fail verifyInstalledOffline!
+  const cacheMap = stores.cacheStore.cachesMap.get(`os-release-v2:${genGood.releaseId}`);
+  const wasmUrl = `/boot/releases/${genGood.releaseId}/assets/client_kernel_bg.wasm`;
+  cacheMap.get(wasmUrl).bytes = new Uint8Array([0, 1, 2, 3, 4]);
+  await assert.rejects(installer.verifyInstalledOffline(genGood.releaseId), /Cached loader asset digest mismatch/);
+});
+
+test('F2-04: install streams blobs via bounded openWriter, cancels oversized responses, and SW serveOpfsBlob slices bounded Range without full-file read', async () => {
+  const keyPair = generateKeyPairSync('ed25519');
+  const gen = makeSignedReleaseBundle('stream-gen', { keyPair });
+  const stores = buildMemoryStores();
+
+  let maxStreamWriteChunk = 0;
+  let fullReadCallsOnLargeBlob = 0;
+  let rangeReadBytes = 0;
+
+  // Enhance OPFS mock with streaming openWriter, fileSize, readRange, and moveFile.
+  const files = stores.opfs.files;
+  const streamingOpfs = {
+    ...stores.opfs,
+    async openWriter(relPath) {
+      const chunks = [];
+      return {
+        async write(chunk) {
+          maxStreamWriteChunk = Math.max(maxStreamWriteChunk, chunk.byteLength);
+          chunks.push(new Uint8Array(chunk));
+        },
+        async commit() {
+          const total = chunks.reduce((s, c) => s + c.byteLength, 0);
+          const out = new Uint8Array(total);
+          let off = 0;
+          for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+          files.set(relPath, out);
+        },
+        async abort() {},
+      };
+    },
+    async fileSize(relPath) {
+      return files.has(relPath) ? files.get(relPath).byteLength : null;
+    },
+    async readRange(relPath, start, endExclusive) {
+      const v = files.get(relPath);
+      if (!v) return null;
+      const slice = new Uint8Array(v.subarray(start, endExclusive));
+      if (relPath.startsWith('os-releases/blobs/')) rangeReadBytes += slice.byteLength;
+      return slice;
+    },
+    async readFile(relPath) {
+      if (relPath.startsWith('os-releases/blobs/')) fullReadCallsOnLargeBlob++;
+      return stores.opfs.readFile(relPath);
+    },
+    async moveFile(fromPath, toPath) {
+      files.set(toPath, files.get(fromPath));
+      files.delete(fromPath);
+    },
+  };
+
+  // 1. Oversized /boot/entries stream (> MANIFEST_MAX) cancels stream and rejects!
+  {
+    let cancelled = false;
+    const badInstaller = createOfflineInstaller({
+      opfs: streamingOpfs,
+      stateStore: stores.stateStore,
+      cacheStore: stores.cacheStore,
+      fetch: async () => new Response(new ReadableStream({
+        pull(controller) { controller.enqueue(new Uint8Array(1024 * 1024)); },
+        cancel() { cancelled = true; },
+      }), { status: 200 }),
+    });
+    await assert.rejects(badInstaller.install(gen.releaseId), new RegExp(String(MANIFEST_MAX)));
+    assert.equal(cancelled, true);
+  }
+
+  // 2. Normal install streams multi-chunk wasm via openWriter in <= CHUNK_SIZE_MIN writes.
+  const installer = createOfflineInstaller({
+    opfs: streamingOpfs,
+    stateStore: stores.stateStore,
+    cacheStore: stores.cacheStore,
+    fetch: async url => {
+      const buf = gen.routes.get(url);
+      return buf ? new Response(buf, { status: 200 }) : new Response(null, { status: 404 });
+    },
+  });
+  await installer.install(gen.releaseId);
+  assert.ok(maxStreamWriteChunk > 0 && maxStreamWriteChunk <= CHUNK_SIZE_MIN, `maxStreamWriteChunk=${maxStreamWriteChunk}`);
+
+  // 3. SW serveOpfsBlob serves a 206 Range request for the multi-chunk wasm blob by reading ONLY
+  //    the covering chunk via readRange (0 full-file reads!).
+  const largeEntry = [...gen.blobs.entries()].find(([, b]) => b.length > CHUNK_SIZE_MIN);
+  assert.ok(largeEntry);
+  const [largeSha, largeBytes] = largeEntry;
+  fullReadCallsOnLargeBlob = 0;
+  rangeReadBytes = 0;
+
+  const swFetch = createOfflineSwHandler({
+    stateStore: stores.stateStore,
+    opfs: streamingOpfs,
+    cachesApi: makeMemoryCachesApi(stores.cacheStore),
+    fetchFn: async () => new Response(null, { status: 404 }),
+    origin: 'https://os.test',
+  });
+
+  const rangeRes = await swFetch(new Request(`https://os.test/boot/blobs/${largeSha}`, {
+    headers: { Range: `bytes=${CHUNK_SIZE_MIN}-${CHUNK_SIZE_MIN + 15}`, 'If-Range': `"${largeSha}"` },
+  }));
+  assert.equal(rangeRes.status, 206);
+  assert.equal(rangeRes.headers.get('Content-Range'), `bytes ${CHUNK_SIZE_MIN}-${CHUNK_SIZE_MIN + 15}/${largeBytes.length}`);
+  assert.deepEqual(Buffer.from(await rangeRes.arrayBuffer()), largeBytes.subarray(CHUNK_SIZE_MIN, CHUNK_SIZE_MIN + 16));
+  assert.equal(fullReadCallsOnLargeBlob, 0, 'SW Range must never read full blob');
+  assert.equal(rangeReadBytes, largeBytes.length - CHUNK_SIZE_MIN, 'SW Range must read only the covering tail chunk');
+
+  // Corrupting that tail chunk in OPFS causes SW Range to fail closed with 409!
+  files.get(`os-releases/blobs/${largeSha}`)[CHUNK_SIZE_MIN + 3] ^= 0xff;
+  const corruptRes = await swFetch(new Request(`https://os.test/boot/blobs/${largeSha}`, {
+    headers: { Range: `bytes=${CHUNK_SIZE_MIN}-${CHUNK_SIZE_MIN + 15}`, 'If-Range': `"${largeSha}"` },
+  }));
+  assert.equal(corruptRes.status, 409);
+});
+
+test('F2-05: Web Lock boot-attempt guard prevents concurrent tab/SW navigation from rolling back healthy upgrade', async () => {
+  const keyPair = generateKeyPairSync('ed25519');
+  const genA = makeSignedReleaseBundle('lock-A', { keyPair });
+  const genB = makeSignedReleaseBundle('lock-B', { keyPair });
+  const stores = buildMemoryStores();
+  const locks = createMockWebLocks();
+  let activeRoutes = genA.routes;
+
+  const makeInstaller = () => createOfflineInstaller({
+    ...stores,
+    locks,
+    fetch: async url => {
+      const buf = activeRoutes.get(url);
+      return buf ? new Response(buf, { status: 200 }) : new Response(null, { status: 404 });
+    },
+  });
+
+  const tab1 = makeInstaller();
+  const tab2 = makeInstaller();
+  const swFetch = createOfflineSwHandler({
+    stateStore: stores.stateStore,
+    opfs: stores.opfs,
+    cachesApi: makeMemoryCachesApi(stores.cacheStore),
+    fetchFn: async () => new Response(null, { status: 404 }),
+    locksApi: locks,
+    origin: 'https://os.test',
+  });
+
+  // Install A -> healthy -> install B.
+  await tab1.install(genA.releaseId);
+  await tab1.beginOfflineBoot();
+  await tab1.markBootHealthy(genA.releaseId);
+  assert.equal(locks.isHeld(`${BOOT_LOCK_PREFIX}${genA.releaseId}`), false);
+
+  activeRoutes = genB.routes;
+  await tab1.install(genB.releaseId);
+
+  // Tab 1 begins Stage 1 boot of B (holds shared Web Lock `os-boot-attempt:<B>`).
+  const boot1 = await tab1.beginOfflineBoot();
+  assert.equal(boot1.releaseId, genB.releaseId);
+  assert.equal(boot1.rolledBack, false);
+  assert.equal(locks.isHeld(`${BOOT_LOCK_PREFIX}${genB.releaseId}`), true);
+
+  // Concurrent SW navigation while Tab 1 is still booting MUST NOT roll back to A!
+  const navReq = { url: 'https://os.test/index.html', method: 'GET', mode: 'navigate', headers: new Headers() };
+  const navRes = await swFetch(navReq);
+  assert.equal(navRes.status, 200);
+  assert.equal((await tab1.getState()).active, genB.releaseId);
+
+  // Concurrent Tab 2 beginOfflineBoot() MUST ALSO NOT roll back to A!
+  const boot2 = await tab2.beginOfflineBoot();
+  assert.equal(boot2.releaseId, genB.releaseId);
+  assert.equal(boot2.rolledBack, false);
+  assert.equal((await tab1.getState()).active, genB.releaseId);
+
+  // Tab 1 finishes Stage 1 boot -> markBootHealthy succeeds cleanly!
+  await tab1.markBootHealthy(genB.releaseId);
+  await tab2.abortOfflineBoot(genB.releaseId);
+  assert.equal((await tab1.getState()).active, genB.releaseId);
+  assert.equal((await tab1.getState()).activeBootVerified, true);
+  assert.equal(locks.isHeld(`${BOOT_LOCK_PREFIX}${genB.releaseId}`), false);
+});
+
+test('F2-06: createBrowserOpfsStore writes atomically via temp+move with checked sync.write count and install cleans failed promotion dirs', async () => {
+  // 1. Mock OPFS directory verifying temp-file write, partial sync.write loop, flush, close, atomic move, and error cleanup.
+  const entries = new Map();
+  let failZeroWrite = false;
+  let partialStep = 3;
+  const moveLog = [];
+
+  function makeDirHandle() {
+    const dir = {
+      async getDirectoryHandle(name, { create = false } = {}) {
+        if (!entries.has(name)) {
+          if (!create) throw Object.assign(new Error('not found'), { name: 'NotFoundError' });
+          entries.set(name, makeDirHandle());
+        }
+        return entries.get(name);
+      },
+      async getFileHandle(name, { create = false } = {}) {
+        if (!entries.has(name)) {
+          if (!create) throw Object.assign(new Error('not found'), { name: 'NotFoundError' });
+          entries.set(name, { kind: 'file', data: new Uint8Array(0) });
+        }
+        const rec = entries.get(name);
+        let curName = name;
+        return {
+          async createSyncAccessHandle() {
+            let buf = new Uint8Array(rec.data);
+            let flushed = false;
+            return {
+              truncate(len) { buf = buf.slice(0, len); },
+              write(view, { at = 0 } = {}) {
+                if (failZeroWrite) return 0;
+                const take = Math.min(view.byteLength, partialStep);
+                const needed = at + take;
+                if (needed > buf.byteLength) {
+                  const next = new Uint8Array(needed);
+                  next.set(buf);
+                  buf = next;
+                }
+                buf.set(view.subarray(0, take), at);
+                return take;
+              },
+              flush() { flushed = true; rec.data = new Uint8Array(buf); },
+              close() { if (!flushed) rec.data = new Uint8Array(buf); },
+            };
+          },
+          async getFile() {
+            return {
+              size: rec.data.byteLength,
+              slice: (s, e) => ({ arrayBuffer: async () => rec.data.slice(s, e).buffer }),
+              arrayBuffer: async () => rec.data.slice().buffer,
+            };
+          },
+          async move(_targetDir, newName) {
+            moveLog.push({ from: curName, to: newName });
+            entries.delete(curName);
+            entries.set(newName, rec);
+            curName = newName;
+          },
+        };
+      },
+      async removeEntry(name) {
+        entries.delete(name);
+      },
+      entries,
+    };
+    return dir;
+  }
+
+  const rootDir = makeDirHandle();
+  const opfs = createBrowserOpfsStore(async () => rootDir);
+
+  // Partial writes (3 bytes at a time) loop until complete, then atomically move tmp -> target.
+  const payload = new TextEncoder().encode('atomic-payload-0123456789');
+  await opfs.writeFile('manifest.json', payload);
+  assert.deepEqual(await opfs.readFile('manifest.json'), payload);
+  assert.equal(moveLog.length, 1);
+  assert.ok(moveLog[0].from.startsWith('.manifest.json.tmp-'));
+  assert.equal(moveLog[0].to, 'manifest.json');
+  assert.equal([...entries.keys()].some(k => k.includes('.tmp-')), false);
+
+  // Zero-byte short write throws and cleans up temp file while leaving committed manifest.json untouched!
+  failZeroWrite = true;
+  await assert.rejects(opfs.writeFile('manifest.json', new Uint8Array([1, 2, 3, 4])), /short write/);
+  assert.deepEqual(await opfs.readFile('manifest.json'), payload);
+  assert.equal([...entries.keys()].some(k => k.includes('.tmp-')), false);
+
+  // 2. Failed promotion in install() cleans up `os-releases/releases/<id>` when !keepCacheOnFailure!
+  const keyPair = generateKeyPairSync('ed25519');
+  const gen = makeSignedReleaseBundle('fail-promote', { keyPair });
+  const stores = buildMemoryStores();
+  const failingOpfs = {
+    ...stores.opfs,
+    async writeFile(relPath, bytes) {
+      if (relPath === `os-releases/releases/${gen.releaseId}/signature.json`) {
+        throw new Error('simulated mid-promotion crash');
+      }
+      return stores.opfs.writeFile(relPath, bytes);
+    },
+  };
+  const installer = createOfflineInstaller({
+    opfs: failingOpfs,
+    stateStore: stores.stateStore,
+    cacheStore: stores.cacheStore,
+    fetch: async url => {
+      const buf = gen.routes.get(url);
+      return buf ? new Response(buf, { status: 200 }) : new Response(null, { status: 404 });
+    },
+  });
+  await assert.rejects(installer.install(gen.releaseId), /simulated mid-promotion crash/);
+  assert.equal(
+    [...stores.opfs.files.keys()].some(k => k.startsWith(`os-releases/releases/${gen.releaseId}/`)),
+    false,
+    'failed promotion must clean up partial release dir',
+  );
+  assert.equal(stores.cacheStore.cachesMap.has(`os-release-v2:${gen.releaseId}`), false);
 });

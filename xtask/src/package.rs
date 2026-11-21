@@ -8,19 +8,31 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().ok_or("missing parent")?;
     fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(".xtask-{}", std::process::id()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
+    let pid = std::process::id();
+    let (tmp, mut file) = loop {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".xtask-{pid}-{seq}"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    };
     let result = (|| {
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -114,13 +126,26 @@ fn walk(root: &Path, at: &Path, out: &Path, entries: &mut Vec<Entry>, boot: bool
             .ok_or("non-UTF8 image path")?;
         let virtual_path = format!("/{relative}");
         let meta = fs::symlink_metadata(&path)?;
-        #[cfg(unix)]
-        let mode = {
-            use std::os::unix::fs::PermissionsExt;
-            (meta.permissions().mode() & 0o7777) as u16
+        // Normalize modes deterministically across host umasks and SGID/SUID directories.
+        let mode: u16 = if meta.is_dir() {
+            0o755
+        } else if meta.is_symlink() {
+            0o777
+        } else {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if (meta.permissions().mode() & 0o111) != 0 {
+                    0o755
+                } else {
+                    0o644
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                0o644
+            }
         };
-        #[cfg(not(unix))]
-        let mode = if meta.is_dir() { 0o755 } else { 0o644 };
         let node = if meta.is_dir() {
             Node::Directory
         } else if meta.is_symlink() {
@@ -525,6 +550,7 @@ pub fn boot(
             min: SCHEMA,
             max: SCHEMA,
         },
+        release_seq: None,
         provenance: p,
     };
     let mut extensions = Vec::new();
@@ -722,4 +748,39 @@ pub fn verify(bundle: &Path, trust: Option<&Trust>) -> Result<String> {
         }
     }
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replace;
+    use std::{fs, sync::Arc, thread};
+
+    #[test]
+    fn concurrent_replace_uses_unique_temp_paths_without_collision() {
+        let dir = std::env::temp_dir().join(format!(
+            "os-xtask-replace-concurrent-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir = Arc::new(dir);
+
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let dir = Arc::clone(&dir);
+                thread::spawn(move || {
+                    for iter in 0..25 {
+                        let target = dir.join(format!("file-{t}-{iter}.bin"));
+                        let payload = format!("thread-{t}-iter-{iter}");
+                        replace(&target, payload.as_bytes()).unwrap();
+                        assert_eq!(fs::read(&target).unwrap(), payload.as_bytes());
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let _ = fs::remove_dir_all(dir.as_ref());
+    }
 }

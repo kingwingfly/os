@@ -181,8 +181,14 @@ export function createImagePager(options = {}) {
     // Refresh LRU order.
     cache.delete(key);
     cache.set(key, hit);
-    cacheHits++;
     return hit;
+  }
+
+  function cacheDelete(key) {
+    const existing = cache.get(key);
+    if (!existing) return;
+    cacheBytes -= existing.byteLength;
+    cache.delete(key);
   }
 
   function cachePut(key, bytes) {
@@ -310,19 +316,25 @@ export function createImagePager(options = {}) {
 
   async function getVerifiedChunk(url, manifest, chunkIdx) {
     const { sha256, size, chunkSize, chunks } = manifest;
-    const key = `${sha256}:${chunkIdx}`;
+    const cStart = chunkIdx * chunkSize;
+    const cEnd = Math.min(size, cStart + chunkSize) - 1;
+    const expectedLen = cEnd - cStart + 1;
+    const expectedChunkSha = chunks[chunkIdx];
+    const key = `${sha256}:${chunkSize}:${chunkIdx}:${expectedChunkSha}`;
+
     const cached = cacheGet(key);
-    if (cached) return cached;
+    if (cached) {
+      if (cached.byteLength === expectedLen && (await sha256Hex(cached)) === expectedChunkSha) {
+        cacheHits++;
+        return cached;
+      }
+      cacheDelete(key);
+    }
 
     if (inFlight.has(key)) {
       coalescedHits++;
       return inFlight.get(key);
     }
-
-    const cStart = chunkIdx * chunkSize;
-    const cEnd = Math.min(size, cStart + chunkSize) - 1;
-    const expectedLen = cEnd - cStart + 1;
-    const expectedChunkSha = chunks[chunkIdx];
 
     const promise = (async () => {
       // 1. OPFS-first local read (ZERO network calls when Release v2 is installed).
@@ -372,12 +384,9 @@ export function createImagePager(options = {}) {
         ? blobId
         : null;
 
+    // Content-addressed blobs MUST supply a chunk manifest so every exposed byte is SHA-256 verified.
     if (sha) {
-      const localBytes = await readLocalRange(sha, start, start + count);
-      if (localBytes !== null && localBytes !== undefined) {
-        localOpfsHits++;
-        return localBytes;
-      }
+      throw errnoError('EINVAL', 'chunk manifest is required for content-addressed sha256 blob reads');
     }
 
     const out = new Uint8Array(count);
@@ -392,7 +401,6 @@ export function createImagePager(options = {}) {
       try {
         totalNetworkFetches++;
         const headers = { Range: `bytes=${sliceStart}-${sliceEnd}` };
-        if (sha) headers['If-Range'] = `"${sha}"`;
         const response = await fetchFn(url, { headers, cache: 'no-store', signal: controller.signal });
         if (response.status === 404) {
           await cancelBody(response, 'not found');
@@ -412,10 +420,36 @@ export function createImagePager(options = {}) {
           throw errnoError('EIO', 'streaming response body is required');
         }
 
-        const reader = response.body.getReader();
         if (response.status === 206) {
-          const buf = new Uint8Array(sliceLen);
-          trackedBytes = sliceLen;
+          const cr = response.headers?.get?.('Content-Range') ?? '';
+          const match = CONTENT_RANGE_RE.exec(cr.trim());
+          if (!match) {
+            await cancelBody(response, 'missing Content-Range');
+            controller.abort();
+            throw errnoError('EIO', `invalid Content-Range: ${cr}`);
+          }
+          const rStart = Number(match[1]);
+          const rEnd = Number(match[2]);
+          const rTotal = Number(match[3]);
+          const validEnd = rEnd >= rStart && rEnd <= sliceEnd && rEnd < rTotal
+            && (rEnd === sliceEnd || rEnd === rTotal - 1);
+          if (rStart !== sliceStart || !validEnd) {
+            await cancelBody(response, 'Content-Range mismatch');
+            controller.abort();
+            throw errnoError('EIO', `Content-Range mismatch: got ${cr}, expected start ${sliceStart}..=${sliceEnd}`);
+          }
+          const expectedSliceLen = rEnd - rStart + 1;
+          const contentLength = response.headers?.get?.('Content-Length');
+          if (contentLength !== null && contentLength !== undefined && contentLength !== '') {
+            if (!DIGITS_RE.test(contentLength.trim()) || Number(contentLength) !== expectedSliceLen) {
+              await cancelBody(response, 'Content-Length mismatch');
+              controller.abort();
+              throw errnoError('EIO', `Content-Length mismatch: got ${contentLength}, expected ${expectedSliceLen}`);
+            }
+          }
+          const reader = response.body.getReader();
+          const buf = new Uint8Array(expectedSliceLen);
+          trackedBytes = expectedSliceLen;
           currentBufferedBytes += trackedBytes;
           if (currentBufferedBytes > peakBufferedBytes) peakBufferedBytes = currentBufferedBytes;
           let got = 0;
@@ -425,10 +459,10 @@ export function createImagePager(options = {}) {
               if (done) break;
               if (!value || value.byteLength === 0) continue;
               const piece = value instanceof Uint8Array ? value : new Uint8Array(value);
-              if (got + piece.byteLength > sliceLen) {
+              if (got + piece.byteLength > expectedSliceLen) {
                 await reader.cancel('oversized range stream').catch(() => {});
                 controller.abort();
-                throw errnoError('EIO', 'range stream exceeded requested byte count');
+                throw errnoError('EIO', 'range stream exceeded expected Content-Range length');
               }
               buf.set(piece, got);
               got += piece.byteLength;
@@ -436,11 +470,15 @@ export function createImagePager(options = {}) {
           } finally {
             try { reader.releaseLock?.(); } catch {}
           }
-          out.set(buf.subarray(0, got), filled);
+          if (got !== expectedSliceLen) {
+            throw errnoError('EIO', `truncated range stream: got ${got}, expected ${expectedSliceLen}`);
+          }
+          out.set(buf, filled);
           filled += got;
-          if (got < sliceLen) break;
+          if (rEnd === rTotal - 1 || got < sliceLen) break;
         } else {
           // Dev server without Range support: stream and retain ONLY the requested slice.
+          const reader = response.body.getReader();
           let streamPos = 0;
           let got = 0;
           const targetEnd = sliceStart + sliceLen;

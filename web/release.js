@@ -48,20 +48,139 @@ const unhex = value => {
   return Uint8Array.from(value.match(/../g), s => Number.parseInt(s, 16));
 };
 
+const OFFLINE_DB_NAME = 'os-offline-releases-v2';
+const OFFLINE_DB_VERSION = 1;
+const OFFLINE_STORE = 'state';
+const OFFLINE_STATE_KEY = 'generations';
+
+function openOfflineDb() {
+  const idb = globalThis.indexedDB;
+  if (!idb) return Promise.resolve(null);
+  return new Promise(resolve => {
+    try {
+      const req = idb.open(OFFLINE_DB_NAME, OFFLINE_DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(OFFLINE_STORE)) {
+          db.createObjectStore(OFFLINE_STORE);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function readProfileTrustRoot() {
+  const db = await openOfflineDb();
+  if (!db) return null;
+  try {
+    const state = await new Promise((resolve, reject) => {
+      const tx = db.transaction(OFFLINE_STORE, 'readonly');
+      const req = tx.objectStore(OFFLINE_STORE).get(OFFLINE_STATE_KEY);
+      req.onsuccess = () => resolve(req.result ?? null);
+      req.onerror = () => reject(req.error);
+    });
+    return state?.trustRoot ?? null;
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
+async function ratchetProfileTrust(incomingTrust, incomingMinSeq) {
+  if (!incomingTrust || typeof incomingTrust !== 'object') return null;
+  const db = await openOfflineDb();
+  if (!db) return null;
+  try {
+    return await new Promise((resolve, reject) => {
+      let tx;
+      try {
+        tx = db.transaction(OFFLINE_STORE, 'readwrite', { durability: 'strict' });
+      } catch {
+        tx = db.transaction(OFFLINE_STORE, 'readwrite');
+      }
+      const store = tx.objectStore(OFFLINE_STORE);
+      let updatedRoot = null;
+      const getReq = store.get(OFFLINE_STATE_KEY);
+      getReq.onsuccess = () => {
+        try {
+          const cur = getReq.result;
+          if (!cur?.trustRoot) {
+            updatedRoot = null;
+            return;
+          }
+          const root = structuredClone(cur.trustRoot);
+          const revoked = new Set(Array.isArray(root.revoked) ? root.revoked : []);
+          let changed = false;
+          if (Array.isArray(incomingTrust.revoked)) {
+            for (const keyId of incomingTrust.revoked) {
+              if (typeof keyId === 'string' && HEX64.test(keyId) && !revoked.has(keyId)) {
+                revoked.add(keyId);
+                changed = true;
+              }
+            }
+          }
+          if (Number.isSafeInteger(incomingMinSeq) && incomingMinSeq > (root.minReleaseSeq || 0)) {
+            root.minReleaseSeq = incomingMinSeq;
+            changed = true;
+          }
+          root.revoked = [...revoked].sort();
+          updatedRoot = root;
+          if (changed) {
+            cur.trustRoot = root;
+            store.put(cur, OFFLINE_STATE_KEY);
+          }
+        } catch (err) {
+          try { tx.abort(); } catch {}
+          reject(err);
+        }
+      };
+      getReq.onerror = () => reject(getReq.error);
+      tx.oncomplete = () => resolve(updatedRoot);
+      tx.onerror = () => reject(tx.error ?? new Error('Failed to ratchet profile trust.'));
+      tx.onabort = () => reject(tx.error ?? new Error('Profile trust update aborted.'));
+    });
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
+function mergeMonotonicTrust(profileRoot, incomingTrust) {
+  if (!profileRoot) return incomingTrust;
+  const keys = { ...(profileRoot.keys ?? {}) };
+  const revoked = new Set(Array.isArray(profileRoot.revoked) ? profileRoot.revoked : []);
+  if (incomingTrust && typeof incomingTrust === 'object') {
+    if (Array.isArray(incomingTrust.revoked)) {
+      for (const k of incomingTrust.revoked) {
+        if (typeof k === 'string' && HEX64.test(k)) revoked.add(k);
+      }
+    }
+    if (incomingTrust.keys && typeof incomingTrust.keys === 'object') {
+      for (const [k, v] of Object.entries(incomingTrust.keys)) {
+        if (k in keys && keys[k] !== v) {
+          throw new Error('Publisher key identifier mismatch.');
+        }
+      }
+    }
+  }
+  return { keys, revoked: [...revoked].sort() };
+}
+
 async function readLocalPinned(id) {
   try {
     const root = await globalThis.navigator?.storage?.getDirectory?.();
     if (!root) return null;
     const relDir = await (await (await root.getDirectoryHandle('os-releases')).getDirectoryHandle('releases')).getDirectoryHandle(id);
     const read = async name => new Uint8Array(await (await (await relDir.getFileHandle(name)).getFile()).arrayBuffer());
-    const [bytes, sigBytes, trustBytes] = await Promise.all([read('manifest.json'), read('signature.json'), read('trust.json')]);
+    const [bytes, sigBytes] = await Promise.all([read('manifest.json'), read('signature.json')]);
     const signature = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(sigBytes));
-    const trust = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(trustBytes));
-    return {
-      entries: { format: 'os.boot', version: 2, protocol: 2, schema: 10, default: id, trust },
-      bytes,
-      signature,
-    };
+    return { bytes, signature };
   } catch {
     return null;
   }
@@ -71,13 +190,59 @@ let checking;
 export function verifyRelease() {
   if (releaseId === 'legacy') return Promise.resolve();
   return checking ??= (async () => {
-    let entries, bytes, signature;
+    let entries = null;
+    let bytes;
+    let signature;
+    let profileRoot = await readProfileTrustRoot();
     const local = await readLocalPinned(releaseId);
+
     if (local) {
-      ({ entries, bytes, signature } = local);
+      ({ bytes, signature } = local);
+      // Network-first trust check when online so newly revoked keys cannot execute from pinned OPFS.
+      try {
+        const res = await fetch('/boot/entries', { cache: 'no-store' });
+        if (res.status === 503) {
+          throw new Error('Release publisher is not trusted.');
+        }
+        if (res.ok) {
+          const liveEntries = await res.json();
+          if (liveEntries.format !== 'os.boot' || liveEntries.version !== 2 || liveEntries.protocol !== 2 || liveEntries.schema !== 10) {
+            throw new Error('The authority is incompatible with this release.');
+          }
+          const ratcheted = await ratchetProfileTrust(liveEntries.trust, liveEntries.min_release_seq);
+          if (ratcheted) profileRoot = ratcheted;
+          entries = { ...liveEntries, trust: mergeMonotonicTrust(profileRoot, liveEntries.trust) };
+        }
+      } catch (err) {
+        if (err?.message === 'Release publisher is not trusted.' || err?.message === 'The authority is incompatible with this release.' || err?.message === 'Publisher key identifier mismatch.') {
+          throw err;
+        }
+        // Offline fallback: verify strictly against profile-wide monotonic trustRoot (never frozen per-release trust.json).
+      }
+      if (!entries) {
+        if (!profileRoot) {
+          throw new Error('Release publisher is not trusted.');
+        }
+        entries = {
+          format: 'os.boot',
+          version: 2,
+          protocol: 2,
+          schema: 10,
+          default: releaseId,
+          trust: { keys: { ...(profileRoot.keys ?? {}) }, revoked: [...(profileRoot.revoked ?? [])] },
+        };
+      }
     } else {
       const get = async path => { const response = await fetch(path, { cache: 'no-store' }); if (!response.ok) throw new Error('The release is unavailable. Open recovery.'); return response; };
       entries = await (await get('/boot/entries')).json();
+      if (entries.format !== 'os.boot' || entries.version !== 2 || entries.protocol !== 2 || entries.schema !== 10) {
+        throw new Error('The authority is incompatible with this release.');
+      }
+      if (profileRoot) {
+        const ratcheted = await ratchetProfileTrust(entries.trust, entries.min_release_seq);
+        if (ratcheted) profileRoot = ratcheted;
+        entries = { ...entries, trust: mergeMonotonicTrust(profileRoot, entries.trust) };
+      }
       bytes = new Uint8Array(await (await get(`/boot/releases/${releaseId}/manifest.json`)).arrayBuffer());
       signature = await (await get(`/boot/releases/${releaseId}/signature.json`)).json();
     }
@@ -86,7 +251,8 @@ export function verifyRelease() {
     }
     if (hex(await crypto.subtle.digest('SHA-256', bytes)) !== releaseId) throw new Error('Release digest mismatch.');
     const trusted = entries.trust?.keys?.[signature.key];
-    if (signature.format !== 'os.signature' || signature.version !== 1 || !trusted || entries.trust.revoked.includes(signature.key)) throw new Error('Release publisher is not trusted.');
+    const revoked = Array.isArray(entries.trust?.revoked) ? entries.trust.revoked : [];
+    if (signature.format !== 'os.signature' || signature.version !== 1 || !trusted || revoked.includes(signature.key)) throw new Error('Release publisher is not trusted.');
     const publicKey = unhex(trusted);
     if (hex(await crypto.subtle.digest('SHA-256', publicKey)) !== signature.key) throw new Error('Publisher key identifier mismatch.');
     const key = await crypto.subtle.importKey('raw', publicKey, 'Ed25519', false, ['verify']);

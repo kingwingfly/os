@@ -364,3 +364,84 @@ fn verifier_rejects_v1_manifests_and_incomplete_initramfs() {
         false,
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn host_modes_are_normalized_deterministically_across_umask_and_sgid() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = Directory::new();
+    let root = &temp.0;
+
+    // Tree 1: standard 0o755 dirs, 0o644 regular file, 0o755 executable.
+    fs::create_dir_all(root.join("t1/opt/tool/bin")).unwrap();
+    fs::write(root.join("t1/opt/tool/data.txt"), b"hello").unwrap();
+    fs::write(root.join("t1/opt/tool/bin/run"), b"\0asm\x01\0\0\0").unwrap();
+    fs::set_permissions(root.join("t1/opt"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(root.join("t1/opt/tool"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(
+        root.join("t1/opt/tool/bin"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::set_permissions(
+        root.join("t1/opt/tool/data.txt"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    fs::set_permissions(
+        root.join("t1/opt/tool/bin/run"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    // Tree 2: identical bytes, but host umask 0002 / SGID dir (0o2775) / group-writable (0o664) / setuid exec (0o4755).
+    fs::create_dir_all(root.join("t2/opt/tool/bin")).unwrap();
+    fs::write(root.join("t2/opt/tool/data.txt"), b"hello").unwrap();
+    fs::write(root.join("t2/opt/tool/bin/run"), b"\0asm\x01\0\0\0").unwrap();
+    fs::set_permissions(root.join("t2/opt"), fs::Permissions::from_mode(0o2755)).unwrap();
+    fs::set_permissions(root.join("t2/opt/tool"), fs::Permissions::from_mode(0o2775)).unwrap();
+    fs::set_permissions(
+        root.join("t2/opt/tool/bin"),
+        fs::Permissions::from_mode(0o775),
+    )
+    .unwrap();
+    fs::set_permissions(
+        root.join("t2/opt/tool/data.txt"),
+        fs::Permissions::from_mode(0o664),
+    )
+    .unwrap();
+    fs::set_permissions(
+        root.join("t2/opt/tool/bin/run"),
+        fs::Permissions::from_mode(0o4755),
+    )
+    .unwrap();
+
+    let id1 = run(
+        root,
+        &[
+            "image", "--root", "t1", "--kind", "sysext", "--out", "out1", "--name", "det",
+        ],
+        true,
+    );
+    let id2 = run(
+        root,
+        &[
+            "image", "--root", "t2", "--kind", "sysext", "--out", "out2", "--name", "det",
+        ],
+        true,
+    );
+    assert_eq!(
+        id1, id2,
+        "manifest digests must be deterministic across host umask/SGID/SUID"
+    );
+
+    let manifest =
+        os_image::Image::parse(&fs::read(root.join("out2/manifest.json")).unwrap()).unwrap();
+    let mode_of = |p: &str| manifest.entries.iter().find(|e| e.path == p).unwrap().mode;
+    assert_eq!(mode_of("/opt"), 0o755);
+    assert_eq!(mode_of("/opt/tool"), 0o755);
+    assert_eq!(mode_of("/opt/tool/bin"), 0o755);
+    assert_eq!(mode_of("/opt/tool/data.txt"), 0o644);
+    assert_eq!(mode_of("/opt/tool/bin/run"), 0o755);
+}

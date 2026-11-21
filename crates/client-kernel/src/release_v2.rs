@@ -76,6 +76,66 @@ fn is_lower_hex_sha256(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Reads the covering aligned chunks for `[offset, offset + buf.len())`, verifies every
+/// chunk's exact length and SHA-256 digest in Rust before exposing any bytes, and copies
+/// the requested sub-range into `buf`. Zeroes `buf` and returns `Err(Errno::EIO)` on any
+/// short read, zero-byte premature EOF, or digest mismatch.
+async fn read_verified_chunks<F>(
+    manifest: &ChunkManifest,
+    offset: u64,
+    buf: &mut [u8],
+    mut fetch_chunk: F,
+) -> vfs::Result<usize>
+where
+    F: FnMut(u64, usize) -> BoxFuture<'static, Vec<u8>>,
+{
+    if buf.is_empty() || offset >= manifest.size {
+        return Ok(0);
+    }
+    let cs = u64::from(manifest.chunk_size);
+    if cs == 0
+        || !manifest.chunk_size.is_power_of_two()
+        || !(image::CHUNK_SIZE_MIN..=image::CHUNK_SIZE_MAX).contains(&manifest.chunk_size)
+    {
+        return Err(Errno::EINVAL);
+    }
+    let total_want =
+        usize::try_from(manifest.size - offset).map_or(buf.len(), |rem| rem.min(buf.len()));
+    let end_off = offset.checked_add(total_want as u64).ok_or(Errno::EINVAL)?;
+    let first_chunk = usize::try_from(offset / cs).map_err(|_| Errno::EINVAL)?;
+    let last_chunk = usize::try_from((end_off - 1) / cs).map_err(|_| Errno::EINVAL)?;
+    if last_chunk >= manifest.chunks.len() {
+        return Err(Errno::EINVAL);
+    }
+    let mut dst = 0usize;
+    for idx in first_chunk..=last_chunk {
+        let c_start = (idx as u64).checked_mul(cs).ok_or(Errno::EINVAL)?;
+        let expected_len = usize::try_from(manifest.size.saturating_sub(c_start).min(cs))
+            .map_err(|_| Errno::EINVAL)?;
+        let chunk_bytes = match fetch_chunk(c_start, expected_len).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                buf[..dst].fill(0);
+                return Err(err);
+            }
+        };
+        if chunk_bytes.len() != expected_len {
+            buf[..dst].fill(0);
+            return Err(Errno::EIO);
+        }
+        if let Err(err) = verify_chunk_bytes(manifest, idx, &chunk_bytes) {
+            buf[..dst].fill(0);
+            return Err(err);
+        }
+        let copy_start = offset.saturating_sub(c_start) as usize;
+        let copy_end = (end_off - c_start).min(expected_len as u64) as usize;
+        let take = copy_end - copy_start;
+        buf[dst..dst + take].copy_from_slice(&chunk_bytes[copy_start..copy_end]);
+        dst += take;
+    }
+    Ok(dst)
+}
+
 /// Chunk-verified, zero-whole-blob-buffering [`BlobStore`] backed by `self.imageBlobRead`.
 #[derive(Clone, Default)]
 pub(crate) struct VerifiedAssetBlobStore;
@@ -107,22 +167,50 @@ impl BlobStore for VerifiedAssetBlobStore {
                 return Ok(0);
             }
             if let Ok((global, reader)) = installed("imageBlobRead") {
-                let effective_id = if manifest.is_some() && is_lower_hex_sha256(blob_id) {
-                    format!("sha256:{blob_id}")
-                } else {
-                    blob_id.to_string()
-                };
+                if let Some(m) = manifest {
+                    let effective_id = if is_lower_hex_sha256(blob_id) {
+                        format!("sha256:{blob_id}")
+                    } else {
+                        blob_id.to_string()
+                    };
+                    let manifest_js = manifest_to_js(m)?;
+                    return read_verified_chunks(m, offset, buf, |c_start, expected_len| {
+                        let global = global.clone();
+                        let reader = reader.clone();
+                        let effective_id = effective_id.clone();
+                        let manifest_js = manifest_js.clone();
+                        Box::pin(async move {
+                            let args = js_sys::Array::new_with_length(4);
+                            args.set(0, JsValue::from_str(&effective_id));
+                            args.set(1, JsValue::from_f64(c_start as f64));
+                            args.set(2, JsValue::from_f64(expected_len as f64));
+                            args.set(3, manifest_js);
+                            let answer = reader
+                                .apply(&global, &args)
+                                .map_err(|e| errno_from_js(&e))?;
+                            let promise = answer
+                                .dyn_into::<js_sys::Promise>()
+                                .map_err(|_| Errno::EIO)?;
+                            let val = JsFuture::from(promise)
+                                .await
+                                .map_err(|e| errno_from_js(&e))?;
+                            let bytes = js_sys::Uint8Array::new(&val);
+                            let len = bytes.length() as usize;
+                            if len != expected_len {
+                                return Err(Errno::EIO);
+                            }
+                            let mut out = vec![0u8; len];
+                            bytes.copy_to(&mut out);
+                            Ok(out)
+                        })
+                    })
+                    .await;
+                }
                 let args = js_sys::Array::new_with_length(4);
-                args.set(0, JsValue::from_str(&effective_id));
+                args.set(0, JsValue::from_str(blob_id));
                 args.set(1, JsValue::from_f64(offset as f64));
                 args.set(2, JsValue::from_f64(buf.len() as f64));
-                args.set(
-                    3,
-                    match manifest {
-                        Some(m) => manifest_to_js(m)?,
-                        None => JsValue::UNDEFINED,
-                    },
-                );
+                args.set(3, JsValue::UNDEFINED);
                 let answer = reader
                     .apply(&global, &args)
                     .map_err(|e| errno_from_js(&e))?;
@@ -139,21 +227,6 @@ impl BlobStore for VerifiedAssetBlobStore {
                     return Err(Errno::EIO);
                 }
                 bytes.copy_to(&mut buf[..len]);
-                // Defense in depth: if this read covers an exact full chunk, re-verify in Rust.
-                if let Some(m) = manifest {
-                    let cs = u64::from(m.chunk_size);
-                    if cs > 0 && offset.is_multiple_of(cs) {
-                        let idx = (offset / cs) as usize;
-                        let expected_chunk_len = m.size.saturating_sub(offset).min(cs) as usize;
-                        if len == expected_chunk_len
-                            && idx < m.chunks.len()
-                            && let Err(err) = verify_chunk_bytes(m, idx, &buf[..len])
-                        {
-                            buf[..len].fill(0);
-                            return Err(err);
-                        }
-                    }
-                }
                 return Ok(len);
             }
             // Headless unit test fallback for unsigned local build assets only.
@@ -437,5 +510,109 @@ mod tests {
         );
         // Out of range chunk index -> EINVAL
         assert_eq!(verify_chunk_bytes(&manifest, 2, &[]), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn read_verified_chunks_verifies_subchunk_and_rejects_short_or_tampered_reads() {
+        let mut payload = vec![0u8; CHUNK_SIZE_MIN as usize + 512];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i * 19 + 3) & 0xff) as u8;
+        }
+        let manifest = ChunkManifest {
+            sha256: digest(&payload),
+            size: payload.len() as u64,
+            chunk_size: CHUNK_SIZE_MIN,
+            chunks: chunk_digests(&payload, CHUNK_SIZE_MIN).unwrap(),
+        };
+
+        // 1. Sub-chunk 8-byte probe at offset 0 verifies the ENTIRE chunk 0.
+        let mut header = [0u8; 8];
+        let n = vfs::now_or_never(read_verified_chunks(
+            &manifest,
+            0,
+            &mut header,
+            |c_start, len| {
+                let slice = payload[c_start as usize..c_start as usize + len].to_vec();
+                Box::pin(async move { Ok(slice) })
+            },
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(&header, &payload[..8]);
+
+        // 2. Flipping a byte in the tail of chunk 0 (outside the 8-byte slice) fails EIO!
+        let mut tampered = payload.clone();
+        tampered[CHUNK_SIZE_MIN as usize - 1] ^= 0x01;
+        let mut probe = [0xCCu8; 8];
+        let res = vfs::now_or_never(read_verified_chunks(
+            &manifest,
+            0,
+            &mut probe,
+            |c_start, len| {
+                let slice = tampered[c_start as usize..c_start as usize + len].to_vec();
+                Box::pin(async move { Ok(slice) })
+            },
+        ))
+        .unwrap();
+        assert_eq!(res, Err(Errno::EIO));
+
+        // 3. Cross-chunk read splices accurately; corrupted chunk 1 zeroes prefix and fails EIO.
+        let mut cross = [0u8; 32];
+        let n_cross = vfs::now_or_never(read_verified_chunks(
+            &manifest,
+            u64::from(CHUNK_SIZE_MIN) - 16,
+            &mut cross,
+            |c_start, len| {
+                let slice = payload[c_start as usize..c_start as usize + len].to_vec();
+                Box::pin(async move { Ok(slice) })
+            },
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(n_cross, 32);
+        assert_eq!(
+            &cross,
+            &payload[CHUNK_SIZE_MIN as usize - 16..CHUNK_SIZE_MIN as usize + 16]
+        );
+
+        let mut bad_c1 = payload.clone();
+        bad_c1[CHUNK_SIZE_MIN as usize + 100] ^= 0x40;
+        let mut cross_bad = [0xEEu8; 32];
+        let res_bad = vfs::now_or_never(read_verified_chunks(
+            &manifest,
+            u64::from(CHUNK_SIZE_MIN) - 16,
+            &mut cross_bad,
+            |c_start, len| {
+                let slice = bad_c1[c_start as usize..c_start as usize + len].to_vec();
+                Box::pin(async move { Ok(slice) })
+            },
+        ))
+        .unwrap();
+        assert_eq!(res_bad, Err(Errno::EIO));
+        assert!(cross_bad[..16].iter().all(|&b| b == 0));
+
+        // 4. Short read or 0-byte read when offset < manifest.size returns Err(Errno::EIO), NEVER Ok(0).
+        let mut short_buf = [0u8; 16];
+        let res_zero = vfs::now_or_never(read_verified_chunks(
+            &manifest,
+            0,
+            &mut short_buf,
+            |_c_start, _len| Box::pin(async move { Ok(Vec::new()) }),
+        ))
+        .unwrap();
+        assert_eq!(res_zero, Err(Errno::EIO));
+
+        let res_short = vfs::now_or_never(read_verified_chunks(
+            &manifest,
+            0,
+            &mut short_buf,
+            |c_start, len| {
+                let slice = payload[c_start as usize..c_start as usize + len - 1].to_vec();
+                Box::pin(async move { Ok(slice) })
+            },
+        ))
+        .unwrap();
+        assert_eq!(res_short, Err(Errno::EIO));
     }
 }
