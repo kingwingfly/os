@@ -166,7 +166,7 @@ async function post(endpoint, data) {
 // The account system calls, as the dialogs below ask them (crates/worker/src/sys.rs).
 async function postJson(endpoint, data) {
   switch (endpoint) {
-    case 'login': return call('login', { username: data.username ?? 'root', password: data.password ?? '' }, { sudo: !!data.sudo });
+    case 'login': return call('login', { username: data.username ?? 'root', password: data.password ?? '', force: !!data.force }, { sudo: !!data.sudo });
     case 'logout': return call('logout');
     case 'sudo': return call('sudo', { password: data.password ?? '', revoke: !!data.revoke });
     case 'passwd': return call('passwd', { username: data.username ?? null, password: data.password ?? '', current_password: data.current_password ?? null, force: !!data.force }, { sudo: !!data.sudo });
@@ -431,7 +431,7 @@ async function identityChanged(reason = null) {
 }
 async function signIn(username, switching = false) {
   let result;
-  if (switching && (await session()).uid === 0) result = await post('login', { username, switch: true });
+  if (switching && (await session()).uid === 0) result = await post('login', { username, switch: true, force: true });
   else result = await credentials({ title: switching ? `Switch to ${username}` : 'Sign in', description: 'Access is determined by the file owner, group, and rwx permissions.', username, chooseUser: !switching,
     submit: fields => post('login', { username: switching ? username : fields.username, password: fields.password, switch: switching }) });
   if (result) await identityChanged();
@@ -484,7 +484,7 @@ async function accountCommand(args, cwd) {
     if (args[0] === '-u') {
       if (args.length !== 2 || args[1].startsWith('-')) throw new Error('Usage: sudo -u USER (switch accounts; exit returns to guest)');
       if (!await sudoAuthenticate()) throw new Error('sudo canceled');
-      const result = await post('login', { username: args[1], sudo: true });
+      const result = await post('login', { username: args[1], sudo: true, force: true });
       await identityChanged();
       return { output: `Current account: ${result.username}`, home: result.home };
     }

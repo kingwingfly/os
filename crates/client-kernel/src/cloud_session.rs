@@ -16,8 +16,8 @@ use crate::boot_stage::{
     MOUNTED_ROOT_INFO_PATH, MountedRootInfo, RecoveryReason, RecoveryState, RootSpec,
 };
 use crate::cowfs_bridge::{
-    JsCowfsStore, close_clean_with_prune_fs, cowfsck_volume_stores, now_timespec,
-    open_for_boot_stores,
+    BootOpenError, DirtyFlushGuard, JsCowfsStore, bind_dirty_flush_timer,
+    close_clean_with_prune_fs, cowfsck_volume_stores, now_timespec, open_for_boot_stores_detailed,
 };
 use crate::local_accounts::seed_fresh_cowfs_root;
 use crate::release_v2::{VerifiedAssetBlobStore, read_verified_image_file};
@@ -33,6 +33,7 @@ use cowfs::{CowFs, CowFsConfig, CowFsVolumeDevice};
 use cowtree::{ArenaConfig, COWFS_FORMAT_VERSION, HeadStore, RootObject, VolumeId};
 use image::{Image, Kind, Node};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use vfs::imagefs::{BuildAssetSizes, ImageFs};
@@ -171,12 +172,7 @@ async fn populate_ephemeral_memfs(fs: &MemFs, root_template: Option<&Image>) -> 
 }
 
 async fn teardown_sysroot_mounts(vfs: &Vfs) {
-    for target in [
-        "/sysroot/tmp",
-        "/sysroot/usr",
-        "/sysroot/home",
-        "/sysroot",
-    ] {
+    for target in ["/sysroot/tmp", "/sysroot/usr", "/sysroot/home", "/sysroot"] {
         let _ = vfs.umount2(INIT, target, umount_flags::MNT_DETACH).await;
     }
 }
@@ -302,6 +298,53 @@ fn unlink_oldroot_bounded<'a>(
     })
 }
 
+fn extract_supervisor_digests_from_image(img: &Image) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for entry in &img.entries {
+        if matches!(entry.path.as_str(), "/usr/bin/init" | "/usr/bin/supervise")
+            && let Node::File { sha256, .. } = &entry.node
+        {
+            out.insert(entry.path.clone(), sha256.clone());
+        }
+    }
+    out
+}
+
+fn extract_supervisor_digests_from_composition(json_text: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(val) = serde_json::from_str::<Value>(json_text) else {
+        return out;
+    };
+    let entries_val = val.get("entries").unwrap_or(&val);
+    let record = |out: &mut HashMap<String, String>, entry: &Value| {
+        let Some(path) = entry.get("path").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if !matches!(path, "/usr/bin/init" | "/usr/bin/supervise") {
+            return;
+        }
+        let sha = entry.get("sha256").and_then(|v| v.as_str()).or_else(|| {
+            entry
+                .get("node")
+                .and_then(|n| n.get("sha256"))
+                .and_then(|v| v.as_str())
+        });
+        if let Some(s) = sha {
+            out.insert(path.to_string(), s.to_string());
+        }
+    };
+    if let Some(map) = entries_val.as_object() {
+        for entry in map.values() {
+            record(&mut out, entry);
+        }
+    } else if let Some(arr) = entries_val.as_array() {
+        for entry in arr {
+            record(&mut out, entry);
+        }
+    }
+    out
+}
+
 fn default_asset_sizes() -> BuildAssetSizes {
     BuildAssetSizes {
         coreutils: 64 * 1024,
@@ -376,70 +419,132 @@ impl Kernel {
         }
     }
 
-    /// Mount optional `FsType::Cloud` at `/mnt/cloud` in `system_mnt_ns` and every active session
-    /// namespace. Requires an active `CloudSession` with `scope.cloud_fs == true`.
-    pub(crate) async fn mount_cloud_fs_internal(&self) -> vfs::Result<()> {
-        let allowed = self
-            .state
-            .borrow()
-            .cloud_session
-            .as_ref()
-            .is_some_and(|cs| cs.scope.cloud_fs);
-        if !allowed {
+    /// Ensure `/mnt/cloud` (`FsType::Cloud`) is mounted onto `ns` when an active `CloudSession`
+    /// with `scope.cloud_fs == true` is present. Safe against concurrent `session_begin` and
+    /// `cloud_sign_out` interleavings.
+    pub(crate) async fn ensure_cloud_fs_mounted_on(
+        &self,
+        ns: &Rc<RefCell<vfs::MountNamespace>>,
+    ) -> vfs::Result<()> {
+        let allowed = || {
+            self.state
+                .borrow()
+                .cloud_session
+                .as_ref()
+                .is_some_and(|cs| cs.scope.cloud_fs)
+        };
+        if !allowed() {
             return Err(Errno::ENOTCONN);
         }
-        let (vfs, cloud_mount, namespaces) = {
+        let has_cloud = |target: &Rc<RefCell<vfs::MountNamespace>>| {
+            target
+                .borrow()
+                .mounts()
+                .values()
+                .any(|m| m.slot.backing.fstype == FsType::Cloud && m.root_in_fs == "/")
+        };
+        if has_cloud(ns) {
+            return Ok(());
+        }
+        let (vfs, cloud_mount) = {
             let rt = self.vfs_rt.borrow();
-            let mut nss = vec![rt.vfs.system_namespace()];
-            for sess in rt.sessions.values() {
-                nss.push(Rc::clone(&sess.mnt_ns));
-            }
-            if let Some(guest) = &rt.guest_page {
-                nss.push(Rc::clone(&guest.mnt_ns));
-            }
-            (rt.vfs.clone(), Rc::clone(&rt.cloud_mount), nss)
+            (rt.vfs.clone(), Rc::clone(&rt.cloud_mount))
         };
         let _ = ensure_dir_vfs(&vfs, "/mnt/cloud", 0o755).await;
+        if !allowed() {
+            return Err(Errno::ENOTCONN);
+        }
+        if has_cloud(ns) {
+            return Ok(());
+        }
         let backing = Rc::new(MountBacking::new(
-            Rc::clone(&cloud_mount) as Rc<dyn Filesystem>,
+            cloud_mount as Rc<dyn Filesystem>,
             FsType::Cloud,
         ));
         let mut root_cred = Cred::root();
         root_cred.umask = 0;
-        let mut mounted_any = false;
-        for ns in namespaces {
-            let already = ns
+        self.with_page_scope(
+            false,
+            vfs.mount_on_namespace(
+                ns,
+                &root_cred,
+                backing,
+                None,
+                "cloud",
+                "/mnt/cloud",
+                MountFlags {
+                    nosuid: true,
+                    nodev: true,
+                    ..MountFlags::default()
+                },
+                mount_flags::MS_NOSUID | mount_flags::MS_NODEV,
+                None,
+            ),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Mount optional `FsType::Cloud` at `/mnt/cloud` in `system_mnt_ns` and every active session
+    /// namespace. Requires an active `CloudSession` with `scope.cloud_fs == true`.
+    pub(crate) async fn mount_cloud_fs_internal(&self) -> vfs::Result<()> {
+        let allowed = || {
+            self.state
                 .borrow()
-                .mounts()
-                .values()
-                .any(|m| m.slot.backing.fstype == FsType::Cloud && m.root_in_fs == "/");
-            if already {
-                mounted_any = true;
-                continue;
+                .cloud_session
+                .as_ref()
+                .is_some_and(|cs| cs.scope.cloud_fs)
+        };
+        if !allowed() {
+            return Err(Errno::ENOTCONN);
+        }
+        let sys_ns = self.vfs_rt.borrow().vfs.system_namespace();
+        let mut mounted_any = self.ensure_cloud_fs_mounted_on(&sys_ns).await.is_ok();
+        // Re-scan session namespaces after awaiting so any `session_begin` that completed
+        // concurrently while `sys_ns` was being mounted also receives `/mnt/cloud`.
+        for _ in 0..4 {
+            if !allowed() {
+                break;
             }
-            if self
-                .with_page_scope(
-                    false,
-                    vfs.mount_on_namespace(
-                        &ns,
-                        &root_cred,
-                        Rc::clone(&backing),
-                        None,
-                        "cloud",
-                        "/mnt/cloud",
-                        MountFlags {
-                            nosuid: true,
-                            nodev: true,
-                            ..MountFlags::default()
-                        },
-                        mount_flags::MS_NOSUID | mount_flags::MS_NODEV,
-                        None,
-                    ),
-                )
-                .await
-                .is_ok()
-            {
-                mounted_any = true;
+            let pending: Vec<Rc<RefCell<vfs::MountNamespace>>> =
+                {
+                    let rt = self.vfs_rt.borrow();
+                    let mut list = Vec::new();
+                    for sess in rt.sessions.values() {
+                        let already =
+                            sess.mnt_ns.borrow().mounts().values().any(|m| {
+                                m.slot.backing.fstype == FsType::Cloud && m.root_in_fs == "/"
+                            });
+                        if !already {
+                            list.push(Rc::clone(&sess.mnt_ns));
+                        }
+                    }
+                    if let Some(guest) = &rt.guest_page {
+                        let already =
+                            guest.mnt_ns.borrow().mounts().values().any(|m| {
+                                m.slot.backing.fstype == FsType::Cloud && m.root_in_fs == "/"
+                            });
+                        if !already {
+                            list.push(Rc::clone(&guest.mnt_ns));
+                        }
+                    }
+                    list
+                };
+            if pending.is_empty() {
+                break;
+            }
+            let mut progressed = false;
+            for ns in pending {
+                if !allowed() {
+                    break;
+                }
+                if self.ensure_cloud_fs_mounted_on(&ns).await.is_ok() {
+                    mounted_any = true;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
             }
         }
         if mounted_any {
@@ -535,8 +640,12 @@ impl Kernel {
             .filter(|s| !s.is_empty() && *s != "null")
         {
             Some(raw) => {
-                let img = Image::parse(raw.as_bytes())
-                    .map_err(|e| fail(Error::because(Errno::EINVAL, format!("invalid root_template: {e}"))))?;
+                let img = Image::parse(raw.as_bytes()).map_err(|e| {
+                    fail(Error::because(
+                        Errno::EINVAL,
+                        format!("invalid root_template: {e}"),
+                    ))
+                })?;
                 if img.kind != Kind::RootTemplate {
                     return Err(fail(Error::because(
                         Errno::EINVAL,
@@ -549,6 +658,7 @@ impl Kernel {
         };
 
         let mut opened_cowfs: Option<Rc<CowFs<JsCowfsStore, JsCowfsStore>>> = None;
+        let mut opened_dirty_guard: Option<DirtyFlushGuard> = None;
         let mut opened_ro_home_cowfs: Option<Rc<dyn Filesystem>> = None;
         let mounted_root_fs: Rc<dyn Filesystem>;
         let mut mounted_root_fstype = FsType::Cowfs;
@@ -605,7 +715,9 @@ impl Kernel {
                         (ts.sec, ts.nsec)
                     }),
                 ));
-                if let Err(e) = populate_ephemeral_memfs(&eph_fs, parsed_root_template.as_ref()).await {
+                if let Err(e) =
+                    populate_ephemeral_memfs(&eph_fs, parsed_root_template.as_ref()).await
+                {
                     return Ok(enter_recovery(
                         RecoveryReason::IoError {
                             errno: format!("{e:?}"),
@@ -740,6 +852,18 @@ impl Kernel {
                         opened_ro_home_cowfs = Some(Rc::new(home_fs) as Rc<dyn Filesystem>);
                     }
                 }
+                {
+                    let (vblk, dev_fs) = {
+                        let rt = self.vfs_rt.borrow();
+                        (Rc::clone(&rt.vblk), Rc::clone(&rt.dev_fs))
+                    };
+                    let _ = vblk.detach("vd0");
+                    let _ = vblk.attach_named(
+                        "vd0",
+                        Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&snap_fs))),
+                    );
+                    let _ = dev_fs.register_vblk("vd0", 0o660);
+                }
                 mounted_root_fs = Rc::clone(&snap_fs) as Rc<dyn Filesystem>;
                 opened_cowfs = Some(snap_fs);
                 mounted_root_fstype = FsType::Cowfs;
@@ -802,61 +926,102 @@ impl Kernel {
                     }
                 }
 
-                // 2. If opening an existing volume, run `cowfsck` pre-mount integrity check.
+                // 2. Provision or open `os-cowfs` root volume (`ForkOnBusy` default):
+                //    - Codex #13: acquires writer/fork FIRST and verifies THAT EXACT live head!
+                //    - Codex #14: binds the 5-second dirty commit deadline timer via `on_dirty`.
+                //    - Codex #7: when a verified Release v2 `RootTemplate` is supplied, seeds
+                //      strictly from it; otherwise on fresh dev boot only, seeds built-in defaults.
+                let clock: Rc<dyn Fn() -> abi::fs::Timespec> = Rc::new(now_timespec);
                 let mut existing_volume_present = false;
-                if let Some(ref existing_uuid) = volume_uuid {
-                    let vol_id = VolumeId(existing_uuid.clone());
-                    match cowfsck_volume_stores(&*js_store, &*js_store, &vol_id).await {
-                        Ok(report) => {
+                let (mut opened, dirty_binder) = if let Some(ref existing_uuid) = volume_uuid {
+                    let (config, binder) = bind_dirty_flush_timer::<JsCowfsStore, JsCowfsStore>(
+                        CowFsConfig::local_browser(Rc::clone(&clock))
+                            .with_arena(ArenaConfig::fixed_32mib()),
+                    );
+                    match open_for_boot_stores_detailed(
+                        Rc::clone(&js_store),
+                        Rc::clone(&js_store),
+                        Some(existing_uuid.clone()),
+                        writer_mode.to_cowtree_mode(),
+                        parsed_root_template.as_ref(),
+                        parsed_root_template
+                            .as_ref()
+                            .map(|_| &VerifiedAssetBlobStore),
+                        config,
+                        || existing_uuid.clone(),
+                    )
+                    .await
+                    {
+                        Ok(res) => {
                             existing_volume_present = true;
-                            let report_bytes =
-                                serde_json::to_vec_pretty(&report).unwrap_or_else(|_| b"{}".to_vec());
-                            let _ = write_file_vfs(&vfs, COWFSCK_REPORT_PATH, &report_bytes, 0o444).await;
-                            if !report.ok {
-                                let detail = if report.errors.is_empty() {
-                                    "cowfsck reported volume corruption".into()
-                                } else {
-                                    report.errors.join("; ")
-                                };
-                                let snaps: Vec<String> = js_store
-                                    .list_snapshots(&vol_id)
-                                    .await
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .map(|s| s.name)
-                                    .collect();
-                                return Ok(enter_recovery(
-                                    RecoveryReason::CorruptVolume {
-                                        detail: detail.clone(),
-                                        snapshots: snaps.clone(),
-                                    },
-                                    Some(existing_uuid.clone()),
-                                    snaps,
-                                    format!(
-                                        "Stage 1 cowfsck detected corruption on volume {existing_uuid}: {detail}"
-                                    ),
-                                ));
+                            (res, binder)
+                        }
+                        Err(BootOpenError::Errno(Errno::ENOENT))
+                            if matches!(
+                                js_store.read_head(&VolumeId(existing_uuid.clone())).await,
+                                Err(Errno::ENOENT)
+                            ) =>
+                        {
+                            // Pre-minted first-boot UUID does not exist in IDB yet: provision it!
+                            let preferred = existing_uuid.clone();
+                            let (fresh_cfg, fresh_binder) =
+                                bind_dirty_flush_timer::<JsCowfsStore, JsCowfsStore>(
+                                    CowFsConfig::local_browser(Rc::clone(&clock))
+                                        .with_arena(ArenaConfig::fixed_32mib()),
+                                );
+                            match open_for_boot_stores_detailed(
+                                Rc::clone(&js_store),
+                                Rc::clone(&js_store),
+                                None,
+                                writer_mode.to_cowtree_mode(),
+                                parsed_root_template.as_ref(),
+                                parsed_root_template
+                                    .as_ref()
+                                    .map(|_| &VerifiedAssetBlobStore),
+                                fresh_cfg,
+                                move || preferred,
+                            )
+                            .await
+                            {
+                                Ok(res) => (res, fresh_binder),
+                                Err(BootOpenError::Errno(Errno::EPROTONOSUPPORT)) => {
+                                    return Ok(enter_recovery(
+                                        RecoveryReason::IncompatibleFormat {
+                                            found_version: None,
+                                            expected_version: COWFS_FORMAT_VERSION,
+                                        },
+                                        volume_uuid,
+                                        Vec::new(),
+                                        "Incompatible os-cowfs format version (EPROTONOSUPPORT)."
+                                            .into(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    let errno = e.errno();
+                                    return Ok(enter_recovery(
+                                        RecoveryReason::IoError {
+                                            errno: format!("{errno:?}"),
+                                            detail: format!("os-cowfs provision failed: {errno:?}"),
+                                        },
+                                        volume_uuid,
+                                        Vec::new(),
+                                        format!("Failed to provision os-cowfs root ({errno:?})."),
+                                    ));
+                                }
                             }
                         }
-                        Err(Errno::EPROTONOSUPPORT) => {
-                            return Ok(enter_recovery(
-                                RecoveryReason::IncompatibleFormat {
-                                    found_version: None,
-                                    expected_version: COWFS_FORMAT_VERSION,
-                                },
-                                Some(existing_uuid.clone()),
-                                Vec::new(),
-                                format!(
-                                    "cowfsck rejected volume {existing_uuid}: incompatible format version (EPROTONOSUPPORT)."
-                                ),
-                            ));
-                        }
-                        Err(Errno::ENOENT) => {
-                            // Volume UUID not yet present in store — fall through to provision below.
-                        }
-                        Err(e) => {
+                        Err(BootOpenError::Corrupt { volume, report }) => {
+                            let report_bytes = serde_json::to_vec_pretty(&report)
+                                .unwrap_or_else(|_| b"{}".to_vec());
+                            let _ = write_file_vfs(&vfs, COWFSCK_REPORT_PATH, &report_bytes, 0o444)
+                                .await;
+                            let detail = if report.errors.is_empty() {
+                                "cowfsck reported volume corruption".into()
+                            } else {
+                                report.errors.join("; ")
+                            };
                             let snaps: Vec<String> = js_store
-                                .list_snapshots(&vol_id)
+                                .list_snapshots(&VolumeId(existing_uuid.clone()))
                                 .await
                                 .unwrap_or_default()
                                 .into_iter()
@@ -864,89 +1029,163 @@ impl Kernel {
                                 .collect();
                             return Ok(enter_recovery(
                                 RecoveryReason::CorruptVolume {
-                                    detail: format!("cowfsck failed: {e:?}"),
+                                    detail: detail.clone(),
                                     snapshots: snaps.clone(),
                                 },
                                 Some(existing_uuid.clone()),
                                 snaps,
-                                format!("Stage 1 cowfsck failed on volume {existing_uuid} ({e:?})."),
+                                format!(
+                                    "Stage 1 cowfsck detected corruption on volume {volume}: {detail}"
+                                ),
+                            ));
+                        }
+                        Err(BootOpenError::Errno(Errno::EPROTONOSUPPORT)) => {
+                            return Ok(enter_recovery(
+                                RecoveryReason::IncompatibleFormat {
+                                    found_version: None,
+                                    expected_version: COWFS_FORMAT_VERSION,
+                                },
+                                volume_uuid,
+                                Vec::new(),
+                                "Incompatible os-cowfs format version (EPROTONOSUPPORT).".into(),
+                            ));
+                        }
+                        Err(BootOpenError::Errno(Errno::EBUSY)) => {
+                            let busy = existing_uuid.clone();
+                            let snaps: Vec<String> = js_store
+                                .list_snapshots(&VolumeId(busy.clone()))
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|s| s.name)
+                                .collect();
+                            return Ok(enter_recovery(
+                                RecoveryReason::VolumeBusy {
+                                    volume_uuid: busy.clone(),
+                                },
+                                volume_uuid,
+                                snaps,
+                                format!(
+                                    "Volume {busy} is locked exclusively by another tab (EBUSY). Choose Fork & Boot or close the other tab."
+                                ),
+                            ));
+                        }
+                        Err(BootOpenError::Errno(e)) => {
+                            let vol_id = VolumeId(existing_uuid.clone());
+                            let snaps: Vec<String> = js_store
+                                .list_snapshots(&vol_id)
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|s| s.name)
+                                .collect();
+                            match cowfsck_volume_stores(&*js_store, &*js_store, &vol_id).await {
+                                Ok(report) => {
+                                    let report_bytes = serde_json::to_vec_pretty(&report)
+                                        .unwrap_or_else(|_| b"{}".to_vec());
+                                    let _ = write_file_vfs(
+                                        &vfs,
+                                        COWFSCK_REPORT_PATH,
+                                        &report_bytes,
+                                        0o444,
+                                    )
+                                    .await;
+                                    let detail = if report.errors.is_empty() {
+                                        format!("os-cowfs open failed: {e:?}")
+                                    } else {
+                                        report.errors.join("; ")
+                                    };
+                                    return Ok(enter_recovery(
+                                        RecoveryReason::CorruptVolume {
+                                            detail: detail.clone(),
+                                            snapshots: snaps.clone(),
+                                        },
+                                        Some(existing_uuid.clone()),
+                                        snaps,
+                                        format!(
+                                            "Stage 1 cowfsck detected corruption on volume {existing_uuid}: {detail}"
+                                        ),
+                                    ));
+                                }
+                                Err(Errno::EPROTONOSUPPORT) => {
+                                    return Ok(enter_recovery(
+                                        RecoveryReason::IncompatibleFormat {
+                                            found_version: None,
+                                            expected_version: COWFS_FORMAT_VERSION,
+                                        },
+                                        Some(existing_uuid.clone()),
+                                        Vec::new(),
+                                        "Incompatible os-cowfs format version (EPROTONOSUPPORT)."
+                                            .into(),
+                                    ));
+                                }
+                                Err(_) => {
+                                    return Ok(enter_recovery(
+                                        RecoveryReason::CorruptVolume {
+                                            detail: format!("os-cowfs open failed: {e:?}"),
+                                            snapshots: snaps.clone(),
+                                        },
+                                        Some(existing_uuid.clone()),
+                                        snaps,
+                                        format!(
+                                            "Stage 1 cowfsck failed on volume {existing_uuid} ({e:?})."
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let (config, binder) = bind_dirty_flush_timer::<JsCowfsStore, JsCowfsStore>(
+                        CowFsConfig::local_browser(Rc::clone(&clock))
+                            .with_arena(ArenaConfig::fixed_32mib()),
+                    );
+                    match open_for_boot_stores_detailed(
+                        Rc::clone(&js_store),
+                        Rc::clone(&js_store),
+                        None,
+                        writer_mode.to_cowtree_mode(),
+                        parsed_root_template.as_ref(),
+                        parsed_root_template
+                            .as_ref()
+                            .map(|_| &VerifiedAssetBlobStore),
+                        config,
+                        || format!("vol-{}", crate::random_hex(8)),
+                    )
+                    .await
+                    {
+                        Ok(res) => (res, binder),
+                        Err(BootOpenError::Errno(Errno::EPROTONOSUPPORT)) => {
+                            return Ok(enter_recovery(
+                                RecoveryReason::IncompatibleFormat {
+                                    found_version: None,
+                                    expected_version: COWFS_FORMAT_VERSION,
+                                },
+                                None,
+                                Vec::new(),
+                                "Incompatible os-cowfs format version (EPROTONOSUPPORT).".into(),
+                            ));
+                        }
+                        Err(e) => {
+                            let errno = e.errno();
+                            return Ok(enter_recovery(
+                                RecoveryReason::IoError {
+                                    errno: format!("{errno:?}"),
+                                    detail: format!("os-cowfs open failed: {errno:?}"),
+                                },
+                                None,
+                                Vec::new(),
+                                format!("Failed to open os-cowfs root volume ({errno:?})."),
                             ));
                         }
                     }
+                };
+                if let Some(ref rep) = opened.fsck_report {
+                    let report_bytes =
+                        serde_json::to_vec_pretty(rep).unwrap_or_else(|_| b"{}".to_vec());
+                    let _ = write_file_vfs(&vfs, COWFSCK_REPORT_PATH, &report_bytes, 0o444).await;
                 }
-
-                // 3. Provision or open `os-cowfs` root volume (`ForkOnBusy` default).
-                //    When a verified Release v2 `RootTemplate` is supplied (Codex #7), seed strictly
-                //    from that template via `VerifiedAssetBlobStore`; otherwise on fresh dev boot
-                //    only, seed built-in defaults (NEVER overwrite an existing volume!).
-                let clock: Rc<dyn Fn() -> abi::fs::Timespec> = Rc::new(now_timespec);
-                let config = CowFsConfig::local_browser(Rc::clone(&clock))
-                    .with_arena(ArenaConfig::fixed_32mib());
-                let open_uuid = if existing_volume_present {
-                    volume_uuid.clone()
-                } else {
-                    None
-                };
-                let preferred_fresh_uuid = volume_uuid.clone();
-                let mut opened = match open_for_boot_stores(
-                    Rc::clone(&js_store),
-                    Rc::clone(&js_store),
-                    open_uuid,
-                    writer_mode.to_cowtree_mode(),
-                    parsed_root_template.as_ref(),
-                    parsed_root_template.as_ref().map(|_| &VerifiedAssetBlobStore),
-                    config,
-                    move || {
-                        preferred_fresh_uuid
-                            .unwrap_or_else(|| format!("vol-{}", crate::random_hex(8)))
-                    },
-                )
-                .await
-                {
-                    Ok(res) => res,
-                    Err(Errno::EPROTONOSUPPORT) => {
-                        return Ok(enter_recovery(
-                            RecoveryReason::IncompatibleFormat {
-                                found_version: None,
-                                expected_version: COWFS_FORMAT_VERSION,
-                            },
-                            volume_uuid,
-                            Vec::new(),
-                            "Incompatible os-cowfs format version (EPROTONOSUPPORT).".into(),
-                        ));
-                    }
-                    Err(Errno::EBUSY) => {
-                        let busy = volume_uuid.clone().unwrap_or_default();
-                        let snaps: Vec<String> = js_store
-                            .list_snapshots(&VolumeId(busy.clone()))
-                            .await
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|s| s.name)
-                            .collect();
-                        return Ok(enter_recovery(
-                            RecoveryReason::VolumeBusy {
-                                volume_uuid: busy.clone(),
-                            },
-                            volume_uuid,
-                            snaps,
-                            format!(
-                                "Volume {busy} is locked exclusively by another tab (EBUSY). Choose Fork & Boot or close the other tab."
-                            ),
-                        ));
-                    }
-                    Err(e) => {
-                        return Ok(enter_recovery(
-                            RecoveryReason::IoError {
-                                errno: format!("{e:?}"),
-                                detail: format!("os-cowfs open failed: {e:?}"),
-                            },
-                            volume_uuid,
-                            Vec::new(),
-                            format!("Failed to open os-cowfs root volume ({e:?})."),
-                        ));
-                    }
-                };
+                opened_dirty_guard = Some(dirty_binder.attach(&opened.fs));
 
                 // Only seed built-in dev defaults on a freshly formatted volume with NO verified
                 // `RootTemplate` (Codex #7 & #24: never overwrite existing volumes or templates!).
@@ -1029,7 +1268,8 @@ impl Kernel {
         let root_fs = mounted_root_fs;
         let profile_bytes = serde_json::to_vec_pretty(&profile).unwrap_or_else(|_| b"{}".to_vec());
         let _ = write_file_vfs(&vfs, BOOT_PROFILE_PATH, &profile_bytes, 0o444).await;
-        let info_bytes = serde_json::to_vec_pretty(&info).map_err(|_| fail(Error::from(Errno::EIO)))?;
+        let info_bytes =
+            serde_json::to_vec_pretty(&info).map_err(|_| fail(Error::from(Errno::EIO)))?;
         let _ = write_file_vfs(&vfs, MOUNTED_ROOT_INFO_PATH, &info_bytes, 0o444).await;
 
         // 4. Mount prepared root at `/sysroot`, optional `@home`, Stage 2 `/usr`, fresh `/tmp`,
@@ -1108,16 +1348,15 @@ impl Kernel {
                 ));
             }
 
-            // Mount RO `@home` subvolume if present on snapshot root (RW `@home` wired post-merge).
+            // Mount RO `@home` subvolume on snapshot roots or RW `@home` subvolume on RW roots (Codex #32).
             if let Some(home_fs) = opened_ro_home_cowfs.take()
                 && vfs
                     .statat(INIT, StartAnchor::Root, "/sysroot/home", false)
                     .await
                     .is_ok_and(|st| st.kind() == S_IFDIR)
             {
-                let home_backing = Rc::new(
-                    MountBacking::new(home_fs, FsType::Cowfs).with_ceilings(true, false),
-                );
+                let home_backing =
+                    Rc::new(MountBacking::new(home_fs, FsType::Cowfs).with_ceilings(true, false));
                 if let Err(e) = vfs
                     .mount_on_namespace(
                         &sys_ns,
@@ -1143,6 +1382,42 @@ impl Kernel {
                         RecoveryReason::IoError {
                             errno: format!("{e:?}"),
                             detail: format!("mount @home on /sysroot/home failed: {e:?}"),
+                        },
+                        format!("Failed to mount @home subvolume ({e:?})."),
+                    ));
+                }
+            } else if !mounted_root_rdonly
+                && let Some(ref cowfs) = opened_cowfs
+                && cowfs.has_subvol("@home")
+            {
+                let mount_home_res: vfs::Result<()> = async {
+                    ensure_dir_vfs(&vfs, "/sysroot/home", 0o755).await?;
+                    let home_view = cowfs.open_subvol_view("@home")?;
+                    let home_backing = Rc::new(MountBacking::new(home_view, FsType::Cowfs));
+                    vfs.mount_on_namespace(
+                        &sys_ns,
+                        &root_cred,
+                        home_backing,
+                        None,
+                        &format!("{mounted_root_source}:@home"),
+                        "/sysroot/home",
+                        MountFlags::default(),
+                        0,
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+                .await;
+                if let Err(e) = mount_home_res {
+                    teardown_sysroot_mounts(&vfs).await;
+                    if let Some(fs) = opened_cowfs.take() {
+                        let _ = fs.close_clean().await;
+                    }
+                    return Ok(abort_before_pivot(
+                        RecoveryReason::IoError {
+                            errno: format!("{e:?}"),
+                            detail: format!("mount RW @home on /sysroot/home failed: {e:?}"),
                         },
                         format!("Failed to mount @home subvolume ({e:?})."),
                     ));
@@ -1214,12 +1489,16 @@ impl Kernel {
             let has_composition = opts
                 .as_ref()
                 .is_some_and(|o| o.system_composition.is_some() || o.base_image.is_some());
+            let mut trusted_supervisor_digests = HashMap::new();
             let usr_image = if let Some(base_json) =
                 opts.as_ref().and_then(|o| o.base_image.as_ref())
             {
-                let build_res: vfs::Result<ImageFs<VerifiedAssetBlobStore>> = (|| {
-                    let base_img =
-                        Image::parse(base_json.as_bytes()).map_err(|_| Errno::EINVAL)?;
+                let build_res: vfs::Result<(
+                    ImageFs<VerifiedAssetBlobStore>,
+                    HashMap<String, String>,
+                )> = (|| {
+                    let base_img = Image::parse(base_json.as_bytes()).map_err(|_| Errno::EINVAL)?;
+                    let sup_digests = extract_supervisor_digests_from_image(&base_img);
                     let mut ext_imgs = Vec::new();
                     if let Some(o) = opts.as_ref() {
                         for ext_json in &o.extension_images {
@@ -1231,10 +1510,16 @@ impl Kernel {
                     let entries =
                         crate::release_v2::compose_system_image_entries(&base_img, &ext_imgs)
                             .map_err(|_| Errno::EINVAL)?;
-                    ImageFs::new(usr_fs_id.clone(), true, mounted_at, entries, blob_store)
+                    Ok((
+                        ImageFs::new(usr_fs_id.clone(), true, mounted_at, entries, blob_store)?,
+                        sup_digests,
+                    ))
                 })();
                 match build_res {
-                    Ok(img) => img,
+                    Ok((img, sup)) => {
+                        trusted_supervisor_digests = sup;
+                        img
+                    }
                     Err(e) => {
                         teardown_sysroot_mounts(&vfs).await;
                         if let Some(fs) = opened_cowfs.take() {
@@ -1243,7 +1528,9 @@ impl Kernel {
                         return Ok(abort_before_pivot(
                             RecoveryReason::IoError {
                                 errno: format!("{e:?}"),
-                                detail: format!("invalid Release v2 base/extension composition: {e:?}"),
+                                detail: format!(
+                                    "invalid Release v2 base/extension composition: {e:?}"
+                                ),
                             },
                             format!("Failed to compose Release v2 /usr ({e:?})."),
                         ));
@@ -1259,7 +1546,11 @@ impl Kernel {
                     comp_json,
                     blob_store,
                 ) {
-                    Ok(img) => img,
+                    Ok(img) => {
+                        trusted_supervisor_digests =
+                            extract_supervisor_digests_from_composition(comp_json);
+                        img
+                    }
                     Err(e) => {
                         teardown_sysroot_mounts(&vfs).await;
                         if let Some(fs) = opened_cowfs.take() {
@@ -1481,7 +1772,9 @@ impl Kernel {
                 return Ok(abort_before_pivot(
                     RecoveryReason::IoError {
                         errno: format!("{e:?}"),
-                        detail: format!("MS_MOVE {failed_sub} -> /sysroot{failed_sub} failed: {e:?}"),
+                        detail: format!(
+                            "MS_MOVE {failed_sub} -> /sysroot{failed_sub} failed: {e:?}"
+                        ),
                     },
                     format!(
                         "Refusing to switch_root: failed to move {failed_sub} ({e:?}); rolled back to Stage 1."
@@ -1547,6 +1840,7 @@ impl Kernel {
             let mut rt = self.vfs_rt.borrow_mut();
             rt.usr_fs_id = usr_fs_id;
             rt.usr_blob_paths = usr_blob_paths;
+            rt.trusted_supervisor_digests = trusted_supervisor_digests;
             rt.stage1_reclaimed_entries = reclaimed;
         }
 
@@ -1561,6 +1855,7 @@ impl Kernel {
                 {
                     let mut rt = self.vfs_rt.borrow_mut();
                     rt.root_cowfs = opened_cowfs;
+                    rt.root_dirty_guard = opened_dirty_guard;
                     rt.mounted_root = Some(info);
                     rt.boot_profile = profile.clone();
                     rt.boot_stage = BootStage::Stage2;
@@ -1576,6 +1871,7 @@ impl Kernel {
                 {
                     let mut rt = self.vfs_rt.borrow_mut();
                     rt.root_cowfs = opened_cowfs;
+                    rt.root_dirty_guard = opened_dirty_guard;
                     rt.mounted_root = Some(info.clone());
                     rt.boot_profile = profile.clone();
                     rt.boot_stage = BootStage::Stage1Recovery;
@@ -1640,6 +1936,7 @@ impl Kernel {
             .unwrap_or(true);
         {
             let mut rt = self.vfs_rt.borrow_mut();
+            rt.root_dirty_guard = None;
             rt.root_cowfs = None;
             rt.last_shutdown = Some(recorded.clone());
         }
@@ -1662,20 +1959,13 @@ impl Kernel {
         let Some(fs) = cowfs else {
             return Ok(json!({ "flushed": false }).to_string());
         };
-        if fs.is_read_only() || fs.is_closed() || fs.ms_until_dirty_deadline().is_none() {
-            return Ok(json!({
-                "flushed": false,
-                "epoch": fs.current_head().epoch,
-                "volume_uuid": fs.volume_id().0,
-            })
-            .to_string());
-        }
+        let before_epoch = fs.current_head().epoch;
         let head = fs
-            .commit_tx_group()
+            .flush_for_suspend()
             .await
             .map_err(|e| fail(Error::from(e)))?;
         Ok(json!({
-            "flushed": true,
+            "flushed": head.epoch != before_epoch,
             "epoch": head.epoch,
             "volume_uuid": head.volume.0,
         })
@@ -2053,12 +2343,20 @@ impl Kernel {
         base_json: String,
         extensions_json: JsValue,
     ) -> Result<String, JsValue> {
-        let mut profile: BootProfile = serde_json::from_str(&boot_profile_json)
-            .map_err(|e| fail(Error::because(Errno::EINVAL, format!("invalid boot profile: {e}"))))?;
+        let mut profile: BootProfile = serde_json::from_str(&boot_profile_json).map_err(|e| {
+            fail(Error::because(
+                Errno::EINVAL,
+                format!("invalid boot profile: {e}"),
+            ))
+        })?;
         profile.validate().map_err(|e| fail(Error::from(e)))?;
 
-        let initramfs = Image::parse(initramfs_json.as_bytes())
-            .map_err(|e| fail(Error::because(Errno::EINVAL, format!("invalid initramfs: {e}"))))?;
+        let initramfs = Image::parse(initramfs_json.as_bytes()).map_err(|e| {
+            fail(Error::because(
+                Errno::EINVAL,
+                format!("invalid initramfs: {e}"),
+            ))
+        })?;
         let root_template = Image::parse(root_template_json.as_bytes()).map_err(|e| {
             fail(Error::because(
                 Errno::EINVAL,
@@ -2099,10 +2397,14 @@ impl Kernel {
         let mut root_cred = Cred::root();
         root_cred.umask = 0;
 
-        // Replace Stage 1 `/usr` with verified `Kind::Initramfs` `/usr` (`ro,nodev`) and populate
-        // Stage 1 `/` entries (`/init`, `/bin`, `/sbin`, `/lib`, `/lib64`, etc.).
-        let _ = vfs.umount2(INIT, "/usr", umount_flags::MNT_DETACH).await;
-        let _ = vfs.umount2(INIT, "/tmp", umount_flags::MNT_DETACH).await;
+        // Replace Stage 1 `/usr` with verified `Kind::Initramfs` `/usr` (`ro,nodev`), remove
+        // desktop-only tmpfs carriers from Stage 1 `/` so `switch_root` reclaims Stage 1 `tmpfs`
+        // completely, and populate Stage 1 `/` entries (`/init`, `/bin`, `/sbin`, `/lib`, `/lib64`).
+        for stage1_drop in ["/usr", "/tmp", "/mnt/local", "/mnt/shared", "/opt/private"] {
+            let _ = vfs
+                .umount2(INIT, stage1_drop, umount_flags::MNT_DETACH)
+                .await;
+        }
         let stage1_usr_entries = crate::release_v2::image_to_vfs_entries(&initramfs);
         let stage1_usr_fs = ImageFs::new(
             FsId("image:stage1-usr".to_string()),
@@ -2137,6 +2439,11 @@ impl Kernel {
             .await
             .map_err(|e| fail(Error::from(e)))?;
         }
+        // Remove pre-seeded merged-`/usr` symlinks on Stage 1 `tmpfs` so `Kind::Initramfs`
+        // directories like `/bin` populate cleanly without hitting `ENOTDIR`!
+        for link in ["/bin", "/sbin", "/lib", "/lib64"] {
+            let _ = vfs.unlinkat(INIT, StartAnchor::Root, link, false).await;
+        }
         // Populate Stage 1 `/init` and initramfs root files/symlinks onto Stage 1 `tmpfs` `/`.
         let mut stage1_entry_count = 0usize;
         for entry in &initramfs.entries {
@@ -2168,7 +2475,9 @@ impl Kernel {
                         .map_err(|e| fail(Error::from(e)))?;
                 }
                 Node::Symlink { target } => {
-                    let _ = vfs.unlinkat(INIT, StartAnchor::Root, &entry.path, false).await;
+                    let _ = vfs
+                        .unlinkat(INIT, StartAnchor::Root, &entry.path, false)
+                        .await;
                     let _ = vfs
                         .symlinkat(INIT, target, StartAnchor::Root, &entry.path)
                         .await;
@@ -2190,26 +2499,25 @@ impl Kernel {
         let _ = write_file_vfs(&vfs, BOOT_PROFILE_PATH, &profile_bytes, 0o444).await;
 
         let js_store = Rc::new(JsCowfsStore { obj: store });
-        let enter_recovery =
-            |prof: &BootProfile,
-             reason: RecoveryReason,
-             vol: Option<String>,
-             snaps: Vec<String>,
-             msg: String,
-             fsck_rep: Option<cowfs::FsckReport>| {
-                let mut rt = self.vfs_rt.borrow_mut();
-                rt.boot_profile = prof.clone();
-                rt.boot_stage = BootStage::Stage1Recovery;
-                rt.fsck_report = fsck_rep;
-                rt.recovery = Some(RecoveryState {
-                    reason,
-                    volume_uuid: vol,
-                    available_snapshots: snaps,
-                    message: msg,
-                });
-                drop(rt);
-                self.standalone_status_json().to_string()
-            };
+        let enter_recovery = |prof: &BootProfile,
+                              reason: RecoveryReason,
+                              vol: Option<String>,
+                              snaps: Vec<String>,
+                              msg: String,
+                              fsck_rep: Option<cowfs::FsckReport>| {
+            let mut rt = self.vfs_rt.borrow_mut();
+            rt.boot_profile = prof.clone();
+            rt.boot_stage = BootStage::Stage1Recovery;
+            rt.fsck_report = fsck_rep;
+            rt.recovery = Some(RecoveryState {
+                reason,
+                volume_uuid: vol,
+                available_snapshots: snaps,
+                message: msg,
+            });
+            drop(rt);
+            self.standalone_status_json().to_string()
+        };
 
         if profile.recovery {
             let vol = match &profile.root {
@@ -2238,6 +2546,7 @@ impl Kernel {
         }
 
         let mut opened_cowfs: Option<Rc<CowFs<JsCowfsStore, JsCowfsStore>>> = None;
+        let mut opened_dirty_guard: Option<DirtyFlushGuard> = None;
         let mut opened_ro_home: Option<Rc<dyn Filesystem>> = None;
         let root_fs: Rc<dyn Filesystem>;
         let mut root_fstype = FsType::Cowfs;
@@ -2412,6 +2721,18 @@ impl Kernel {
                         opened_ro_home = Some(Rc::new(hfs) as Rc<dyn Filesystem>);
                     }
                 }
+                {
+                    let (vblk, dev_fs) = {
+                        let rt = self.vfs_rt.borrow();
+                        (Rc::clone(&rt.vblk), Rc::clone(&rt.dev_fs))
+                    };
+                    let _ = vblk.detach("vd0");
+                    let _ = vblk.attach_named(
+                        "vd0",
+                        Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&snap_fs))),
+                    );
+                    let _ = dev_fs.register_vblk("vd0", 0o660);
+                }
                 root_fs = Rc::clone(&snap_fs) as Rc<dyn Filesystem>;
                 opened_cowfs = Some(snap_fs);
                 root_fstype = FsType::Cowfs;
@@ -2479,87 +2800,12 @@ impl Kernel {
                     }
                 }
 
-                if let Some(ref existing_uuid) = volume_uuid {
-                    let vol_id = VolumeId(existing_uuid.clone());
-                    match cowfsck_volume_stores(&*js_store, &*js_store, &vol_id).await {
-                        Ok(report) => {
-                            let report_bytes = serde_json::to_vec_pretty(&report)
-                                .unwrap_or_else(|_| b"{}".to_vec());
-                            let _ =
-                                write_file_vfs(&vfs, COWFSCK_REPORT_PATH, &report_bytes, 0o444)
-                                    .await;
-                            let ok = report.ok;
-                            let detail = if report.errors.is_empty() {
-                                "cowfsck reported volume corruption".into()
-                            } else {
-                                report.errors.join("; ")
-                            };
-                            fsck_report = Some(report);
-                            if !ok {
-                                let snaps: Vec<String> = js_store
-                                    .list_snapshots(&vol_id)
-                                    .await
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .map(|s| s.name)
-                                    .collect();
-                                return Ok(enter_recovery(
-                                    &profile,
-                                    RecoveryReason::CorruptVolume {
-                                        detail: detail.clone(),
-                                        snapshots: snaps.clone(),
-                                    },
-                                    Some(existing_uuid.clone()),
-                                    snaps,
-                                    format!(
-                                        "Stage 1 cowfsck detected corruption on volume {existing_uuid}: {detail}"
-                                    ),
-                                    fsck_report,
-                                ));
-                            }
-                        }
-                        Err(Errno::EPROTONOSUPPORT) => {
-                            return Ok(enter_recovery(
-                                &profile,
-                                RecoveryReason::IncompatibleFormat {
-                                    found_version: None,
-                                    expected_version: COWFS_FORMAT_VERSION,
-                                },
-                                Some(existing_uuid.clone()),
-                                Vec::new(),
-                                format!(
-                                    "cowfsck rejected volume {existing_uuid}: incompatible format version (EPROTONOSUPPORT)."
-                                ),
-                                None,
-                            ));
-                        }
-                        Err(e) => {
-                            let snaps: Vec<String> = js_store
-                                .list_snapshots(&vol_id)
-                                .await
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|s| s.name)
-                                .collect();
-                            return Ok(enter_recovery(
-                                &profile,
-                                RecoveryReason::CorruptVolume {
-                                    detail: format!("cowfsck failed: {e:?}"),
-                                    snapshots: snaps.clone(),
-                                },
-                                Some(existing_uuid.clone()),
-                                snaps,
-                                format!("Stage 1 cowfsck failed on volume {existing_uuid} ({e:?})."),
-                                None,
-                            ));
-                        }
-                    }
-                }
-
                 let clock: Rc<dyn Fn() -> abi::fs::Timespec> = Rc::new(now_timespec);
-                let cfg = CowFsConfig::local_browser(Rc::clone(&clock))
-                    .with_arena(ArenaConfig::fixed_32mib());
-                let opened = match open_for_boot_stores(
+                let (cfg, dirty_binder) = bind_dirty_flush_timer::<JsCowfsStore, JsCowfsStore>(
+                    CowFsConfig::local_browser(Rc::clone(&clock))
+                        .with_arena(ArenaConfig::fixed_32mib()),
+                );
+                let opened = match open_for_boot_stores_detailed(
                     Rc::clone(&js_store),
                     Rc::clone(&js_store),
                     volume_uuid.clone(),
@@ -2582,7 +2828,39 @@ impl Kernel {
                 .await
                 {
                     Ok(res) => res,
-                    Err(Errno::EPROTONOSUPPORT) => {
+                    Err(BootOpenError::Corrupt { volume, report }) => {
+                        let report_bytes =
+                            serde_json::to_vec_pretty(&report).unwrap_or_else(|_| b"{}".to_vec());
+                        let _ =
+                            write_file_vfs(&vfs, COWFSCK_REPORT_PATH, &report_bytes, 0o444).await;
+                        let detail = if report.errors.is_empty() {
+                            "cowfsck reported volume corruption".into()
+                        } else {
+                            report.errors.join("; ")
+                        };
+                        let snap_vol = volume_uuid.clone().unwrap_or_else(|| volume.clone());
+                        let snaps: Vec<String> = js_store
+                            .list_snapshots(&VolumeId(snap_vol.clone()))
+                            .await
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|s| s.name)
+                            .collect();
+                        return Ok(enter_recovery(
+                            &profile,
+                            RecoveryReason::CorruptVolume {
+                                detail: detail.clone(),
+                                snapshots: snaps.clone(),
+                            },
+                            Some(snap_vol),
+                            snaps,
+                            format!(
+                                "Stage 1 cowfsck detected corruption on volume {volume}: {detail}"
+                            ),
+                            Some(*report),
+                        ));
+                    }
+                    Err(BootOpenError::Errno(Errno::EPROTONOSUPPORT)) => {
                         return Ok(enter_recovery(
                             &profile,
                             RecoveryReason::IncompatibleFormat {
@@ -2595,7 +2873,7 @@ impl Kernel {
                             fsck_report,
                         ));
                     }
-                    Err(Errno::EBUSY) => {
+                    Err(BootOpenError::Errno(Errno::EBUSY)) => {
                         let busy = volume_uuid.clone().unwrap_or_default();
                         let snaps: Vec<String> = js_store
                             .list_snapshots(&VolumeId(busy.clone()))
@@ -2617,7 +2895,77 @@ impl Kernel {
                             fsck_report,
                         ));
                     }
-                    Err(e) => {
+                    Err(BootOpenError::Errno(e)) => {
+                        if let Some(ref existing_uuid) = volume_uuid {
+                            let vol_id = VolumeId(existing_uuid.clone());
+                            let snaps: Vec<String> = js_store
+                                .list_snapshots(&vol_id)
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|s| s.name)
+                                .collect();
+                            match cowfsck_volume_stores(&*js_store, &*js_store, &vol_id).await {
+                                Ok(report) => {
+                                    let report_bytes = serde_json::to_vec_pretty(&report)
+                                        .unwrap_or_else(|_| b"{}".to_vec());
+                                    let _ = write_file_vfs(
+                                        &vfs,
+                                        COWFSCK_REPORT_PATH,
+                                        &report_bytes,
+                                        0o444,
+                                    )
+                                    .await;
+                                    let detail = if report.errors.is_empty() {
+                                        format!("os-cowfs open failed: {e:?}")
+                                    } else {
+                                        report.errors.join("; ")
+                                    };
+                                    return Ok(enter_recovery(
+                                        &profile,
+                                        RecoveryReason::CorruptVolume {
+                                            detail: detail.clone(),
+                                            snapshots: snaps.clone(),
+                                        },
+                                        Some(existing_uuid.clone()),
+                                        snaps,
+                                        format!(
+                                            "Stage 1 cowfsck detected corruption on volume {existing_uuid}: {detail}"
+                                        ),
+                                        Some(report),
+                                    ));
+                                }
+                                Err(Errno::EPROTONOSUPPORT) => {
+                                    return Ok(enter_recovery(
+                                        &profile,
+                                        RecoveryReason::IncompatibleFormat {
+                                            found_version: None,
+                                            expected_version: COWFS_FORMAT_VERSION,
+                                        },
+                                        Some(existing_uuid.clone()),
+                                        Vec::new(),
+                                        "Incompatible os-cowfs format version (EPROTONOSUPPORT)."
+                                            .into(),
+                                        None,
+                                    ));
+                                }
+                                Err(_) => {
+                                    return Ok(enter_recovery(
+                                        &profile,
+                                        RecoveryReason::CorruptVolume {
+                                            detail: format!("os-cowfs open failed: {e:?}"),
+                                            snapshots: snaps.clone(),
+                                        },
+                                        Some(existing_uuid.clone()),
+                                        snaps,
+                                        format!(
+                                            "Stage 1 cowfsck failed on volume {existing_uuid} ({e:?})."
+                                        ),
+                                        None,
+                                    ));
+                                }
+                            }
+                        }
                         return Ok(enter_recovery(
                             &profile,
                             RecoveryReason::IoError {
@@ -2631,9 +2979,15 @@ impl Kernel {
                         ));
                     }
                 };
+                if let Some(ref rep) = opened.fsck_report {
+                    let report_bytes =
+                        serde_json::to_vec_pretty(rep).unwrap_or_else(|_| b"{}".to_vec());
+                    let _ = write_file_vfs(&vfs, COWFSCK_REPORT_PATH, &report_bytes, 0o444).await;
+                }
                 if opened.fsck_report.is_some() {
                     fsck_report = opened.fsck_report;
                 }
+                opened_dirty_guard = Some(dirty_binder.attach(&opened.fs));
                 if opened.first_boot_seeded
                     && let RootSpec::CowFs {
                         volume_uuid: ref mut vu,
@@ -2700,7 +3054,11 @@ impl Kernel {
                 rdonly: root_rdonly,
                 ..MountFlags::default()
             },
-            if root_rdonly { mount_flags::MS_RDONLY } else { 0 },
+            if root_rdonly {
+                mount_flags::MS_RDONLY
+            } else {
+                0
+            },
             None,
         )
         .await
@@ -2726,6 +3084,30 @@ impl Kernel {
                     ..MountFlags::default()
                 },
                 mount_flags::MS_RDONLY,
+                None,
+            )
+            .await
+            .map_err(|e| fail(Error::from(e)))?;
+        } else if !root_rdonly
+            && let Some(ref cowfs) = opened_cowfs
+            && cowfs.has_subvol("@home")
+        {
+            ensure_dir_vfs(&vfs, "/sysroot/home", 0o755)
+                .await
+                .map_err(|e| fail(Error::from(e)))?;
+            let home_view = cowfs
+                .open_subvol_view("@home")
+                .map_err(|e| fail(Error::from(e)))?;
+            let home_backing = Rc::new(MountBacking::new(home_view, FsType::Cowfs));
+            vfs.mount_on_namespace(
+                &sys_ns,
+                &root_cred,
+                home_backing,
+                None,
+                &format!("{root_source}:@home"),
+                "/sysroot/home",
+                MountFlags::default(),
+                0,
                 None,
             )
             .await
@@ -2759,8 +3141,9 @@ impl Kernel {
         }
 
         // Compose Stage 2 `/usr` strictly from verified Release v2 `base` + `extensions`.
-        let stage2_usr_entries = crate::release_v2::compose_system_image_entries(&base, &extensions)
-            .map_err(|e| fail(Error::because(Errno::EINVAL, e.to_string())))?;
+        let stage2_usr_entries =
+            crate::release_v2::compose_system_image_entries(&base, &extensions)
+                .map_err(|e| fail(Error::because(Errno::EINVAL, e.to_string())))?;
         let stage2_usr_fs = ImageFs::new(
             FsId("image:stage2-usr".to_string()),
             true,
@@ -2840,16 +3223,23 @@ impl Kernel {
         // (Codex Finding #24: never synthesize hardcoded UID 1000 `wheel`!).
         let passwd_check: Result<(), String> = async {
             let p_fd = vfs
-                .openat(INIT, StartAnchor::Root, "/sysroot/etc/passwd", abi::O_RDONLY, 0)
+                .openat(
+                    INIT,
+                    StartAnchor::Root,
+                    "/sysroot/etc/passwd",
+                    abi::O_RDONLY,
+                    0,
+                )
                 .await
                 .map_err(|e| format!("failed to open /sysroot/etc/passwd: {}", e.text()))?;
             let mut p_buf = Vec::new();
             let mut off = 0u64;
             let mut chunk = vec![0u8; 16384];
             loop {
-                let n = vfs.pread(INIT, p_fd, &mut chunk, off).await.map_err(|e| {
-                    format!("failed to read /sysroot/etc/passwd: {}", e.text())
-                })?;
+                let n = vfs
+                    .pread(INIT, p_fd, &mut chunk, off)
+                    .await
+                    .map_err(|e| format!("failed to read /sysroot/etc/passwd: {}", e.text()))?;
                 if n == 0 {
                     break;
                 }
@@ -2857,10 +3247,10 @@ impl Kernel {
                 off += n as u64;
             }
             let _ = vfs.close(INIT, p_fd).await;
-            let text =
-                std::str::from_utf8(&p_buf).map_err(|_| "/etc/passwd is not valid UTF-8".to_string())?;
-            let entries =
-                kernel::accounts::parse_passwd(text).map_err(|e| format!("invalid /etc/passwd: {e}"))?;
+            let text = std::str::from_utf8(&p_buf)
+                .map_err(|_| "/etc/passwd is not valid UTF-8".to_string())?;
+            let entries = kernel::accounts::parse_passwd(text)
+                .map_err(|e| format!("invalid /etc/passwd: {e}"))?;
             if !entries.iter().any(|e| e.name == profile.default_user) {
                 return Err(format!(
                     "configured default_user {:?} not found in /etc/passwd",
@@ -2892,6 +3282,7 @@ impl Kernel {
         {
             let mut rt = self.vfs_rt.borrow_mut();
             rt.root_cowfs = opened_cowfs;
+            rt.root_dirty_guard = opened_dirty_guard;
             rt.mounted_root = Some(info);
             rt.boot_profile = profile;
             rt.boot_stage = BootStage::Stage1;
@@ -2900,6 +3291,7 @@ impl Kernel {
             rt.fsck_report = fsck_report;
             rt.usr_fs_id = FsId("image:stage2-usr".to_string());
             rt.usr_blob_paths.clear();
+            rt.trusted_supervisor_digests = extract_supervisor_digests_from_image(&base);
         }
         Ok(self.standalone_status_json().to_string())
     }
@@ -3132,9 +3524,7 @@ impl Kernel {
             out.extend_from_slice(&chunk[..n]);
             off += n as u64;
         }
-        vfs.close(pid, fd)
-            .await
-            .map_err(|e| fail(Error::from(e)))?;
+        vfs.close(pid, fd).await.map_err(|e| fail(Error::from(e)))?;
         Ok(out)
     }
 
@@ -3175,9 +3565,7 @@ impl Kernel {
             }
             off += n as u64;
         }
-        vfs.close(pid, fd)
-            .await
-            .map_err(|e| fail(Error::from(e)))?;
+        vfs.close(pid, fd).await.map_err(|e| fail(Error::from(e)))?;
         Ok(bytes.len())
     }
 
@@ -3198,11 +3586,7 @@ impl Kernel {
             .map_err(|e| fail(Error::from(e)))
     }
 
-    pub async fn standalone_unlink(
-        &self,
-        path: String,
-        sudo: Option<bool>,
-    ) -> Result<(), JsValue> {
+    pub async fn standalone_unlink(&self, path: String, sudo: Option<bool>) -> Result<(), JsValue> {
         let pid = self
             .standalone_effective_pid(sudo.unwrap_or(false))
             .await

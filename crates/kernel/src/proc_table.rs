@@ -116,11 +116,14 @@ pub fn intersect_remote_scope(a: &RemoteScope, b: &RemoteScope) -> RemoteScope {
 /// service supervision never race for the same child's exit status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitOwner {
-    /// Owned and reaped by the browser/host executor (`reap_init_child`).
+    /// Owned by the browser/host executor (`reap_init_child`), with a short host-wait grace window
+    /// before PID 1 adopts abandoned zombies.
     Host,
-    /// Owned and reaped by its parent process via POSIX `waitpid` (including PID 1 for services
-    /// it spawned via `fork(1)`).
+    /// Owned by its non-PID-1 parent process via POSIX `waitpid`.
     Parent,
+    /// Owned exclusively by PID 1 (forked directly via `fork(1)` as a supervised service, or an
+    /// already-zombified orphan adopted by active PID 1); NEVER reaped by `reap_init_child`.
+    InitService,
 }
 
 /// Unconsumed POSIX `waitpid` state change for a child process.
@@ -349,6 +352,7 @@ pub struct LocalProcessTable {
     next_pid: u32,
     next_signal_seq: u64,
     procs: BTreeMap<u32, LocalProc>,
+    host_wait_grace_until_ms: BTreeMap<u32, u64>,
     cgroups: CgroupTable,
     closed_scopes: BTreeSet<String>,
 }
@@ -393,6 +397,7 @@ impl LocalProcessTable {
             next_pid: 2,
             next_signal_seq: 0,
             procs: BTreeMap::new(),
+            host_wait_grace_until_ms: BTreeMap::new(),
             cgroups: CgroupTable::new(),
             closed_scopes: BTreeSet::new(),
         }
@@ -853,7 +858,11 @@ impl LocalProcessTable {
             started_ticks,
             ended: 0,
             bootstrap_eligible: false,
-            wait_owner: WaitOwner::Parent,
+            wait_owner: if parent_pid == 1 {
+                WaitOwner::InitService
+            } else {
+                WaitOwner::Parent
+            },
             last_stop_seq: 0,
             reported_stop_seq: 0,
             last_cont_seq: 0,
@@ -960,11 +969,16 @@ impl LocalProcessTable {
             for cpid in child_pids {
                 if let Some(child) = self.procs.get_mut(&cpid) {
                     child.ppid = new_parent;
-                    // Adopted orphans belong to PID 1 when a real PID 1 process is active;
-                    // if no PID 1 host is active (`owner_host == "boot"`), hand reaping to the
-                    // host executor so zombies cannot leak.
-                    if new_parent == 1 && !init_is_active {
-                        child.wait_owner = WaitOwner::Host;
+                    if new_parent == 1 {
+                        // Already-zombified orphans have no pending host `wait()` and belong
+                        // immediately to active PID 1 (`InitService`); running orphans adopted by
+                        // PID 1 become `Host`-reapable (with grace fallback to PID 1 on exit) so
+                        // both immediate host `wait()` and PID 1 orphan reaping work cleanly.
+                        child.wait_owner = if child.state == ProcState::Zombie && init_is_active {
+                            WaitOwner::InitService
+                        } else {
+                            WaitOwner::Host
+                        };
                     }
                     if child.state == ProcState::Zombie {
                         reparented_zombie = true;
@@ -1138,6 +1152,33 @@ impl LocalProcessTable {
         self.waitpid_excluding(caller_host, caller_pid, selector, options, |_| false)
     }
 
+    /// Record a host-wait grace deadline (milliseconds) for a newly exited `WaitOwner::Host`
+    /// zombie so PID 1 wildcard `waitpid(-1)` does not steal it mid-flight before `reap_init_child`,
+    /// while still reaping it automatically after the grace window if the host abandons it.
+    pub fn set_host_wait_grace(&mut self, pid: u32, until_ms: u64) {
+        self.host_wait_grace_until_ms.insert(pid, until_ms);
+    }
+
+    /// POSIX `waitpid(selector, options)` with millisecond grace awareness for PID 1 wildcard
+    /// reaping of abandoned `WaitOwner::Host` zombies.
+    pub fn waitpid_at_ms(
+        &mut self,
+        caller_host: &str,
+        caller_pid: u32,
+        selector: i32,
+        options: u32,
+        now_ms: u64,
+    ) -> Result<WaitOutcome, Error> {
+        self.waitpid_inner(
+            caller_host,
+            caller_pid,
+            selector,
+            options,
+            Some(now_ms),
+            |_| false,
+        )
+    }
+
     /// POSIX `waitpid(selector, options)` with an optional filter that defers reaping selected
     /// zombie PIDs (used so wildcard PID 1 reaping does not steal a host-waited child mid-flight
     /// between `exit(pid)` and `reap_init_child(pid)`).
@@ -1147,6 +1188,25 @@ impl LocalProcessTable {
         caller_pid: u32,
         selector: i32,
         options: u32,
+        skip_zombie: impl FnMut(u32) -> bool,
+    ) -> Result<WaitOutcome, Error> {
+        self.waitpid_inner(
+            caller_host,
+            caller_pid,
+            selector,
+            options,
+            None,
+            skip_zombie,
+        )
+    }
+
+    fn waitpid_inner(
+        &mut self,
+        caller_host: &str,
+        caller_pid: u32,
+        selector: i32,
+        options: u32,
+        reap_expired_host_at_ms: Option<u64>,
         mut skip_zombie: impl FnMut(u32) -> bool,
     ) -> Result<WaitOutcome, Error> {
         if options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
@@ -1157,9 +1217,18 @@ impl LocalProcessTable {
             .procs
             .values()
             .filter(|p| {
+                let host_excluded = caller_pid == 1
+                    && selector == -1
+                    && p.wait_owner == WaitOwner::Host
+                    && !reap_expired_host_at_ms.is_some_and(|now_ms| {
+                        p.state == ProcState::Zombie
+                            && self
+                                .host_wait_grace_until_ms
+                                .get(&p.pid)
+                                .is_none_or(|&until| now_ms >= until)
+                    });
                 p.ppid == caller_pid
-                    // Never allow PID 1 wildcard `waitpid(-1)` to steal host-owned children.
-                    && !(caller_pid == 1 && selector == -1 && p.wait_owner == WaitOwner::Host)
+                    && !host_excluded
                     && match selector {
                         s if s > 0 => p.pid == s as u32,
                         0 => p.pgid == caller_pgid,
@@ -1180,6 +1249,7 @@ impl LocalProcessTable {
                 && child.state == ProcState::Zombie
             {
                 let reaped = self.procs.remove(cpid).unwrap();
+                self.host_wait_grace_until_ms.remove(cpid);
                 let proc_cgroups: Vec<String> =
                     self.procs.values().map(|p| p.cgroup.clone()).collect();
                 self.cgroups
@@ -1233,6 +1303,7 @@ impl LocalProcessTable {
             return Err(Errno::EAGAIN.into());
         }
         let reaped = self.procs.remove(&pid).unwrap();
+        self.host_wait_grace_until_ms.remove(&pid);
         let proc_cgroups: Vec<String> = self.procs.values().map(|p| p.cgroup.clone()).collect();
         self.cgroups
             .prune_retired(|root| proc_cgroups.iter().any(|cg| in_subtree(cg, root)));
@@ -2974,15 +3045,19 @@ mod tests {
         t.boot_init("host-init", 100).unwrap();
         let ann = id(1000);
 
-        // 1. PID 1 forks a supervised service (then drops its uid to 1000): WaitOwner::Parent!
+        // 1. PID 1 forks a supervised service (then drops its uid to 1000): WaitOwner::InitService!
         let svc = t.fork("host-init", 1, false, 101).unwrap();
-        assert_eq!(svc.wait_owner, WaitOwner::Parent);
+        assert_eq!(svc.wait_owner, WaitOwner::InitService);
         t.set_cred("host-init", svc.pid, ann.clone(), None).unwrap();
 
         // 2. Host spawns an interactive command: WaitOwner::Host!
         let host_cmd = t
             .spawn(
-                SpawnSpec::new("/usr/bin/echo", LocalCred::local_only(ann.clone(), 0o022), "host-init"),
+                SpawnSpec::new(
+                    "/usr/bin/echo",
+                    LocalCred::local_only(ann.clone(), 0o022),
+                    "host-init",
+                ),
                 102,
             )
             .unwrap();
@@ -2990,13 +3065,21 @@ mod tests {
 
         // Both exit.
         let svc_out = t.exit("host-init", svc.pid, 42, None, 103).unwrap();
-        assert!(!svc_out.host_reap, "PID 1 forked service must NOT be host-reaped");
+        assert!(
+            !svc_out.host_reap,
+            "PID 1 forked service must NOT be host-reaped"
+        );
         let cmd_out = t.exit("host-init", host_cmd.pid, 0, None, 104).unwrap();
-        assert!(cmd_out.host_reap, "host-spawned command MUST be host-reaped");
+        assert!(
+            cmd_out.host_reap,
+            "host-spawned command MUST be host-reaped"
+        );
 
         // Host executor attempting `reap_init_child` on PID 1's service MUST fail ECHILD!
         assert_eq!(
-            t.reap_init_child("host-init", &ann, svc.pid).unwrap_err().errno,
+            t.reap_init_child("host-init", &ann, svc.pid)
+                .unwrap_err()
+                .errno,
             Errno::ECHILD
         );
 
@@ -3016,6 +3099,33 @@ mod tests {
         // Host reaps `host_cmd` cleanly!
         let reaped_cmd = t.reap_init_child("host-init", &ann, host_cmd.pid).unwrap();
         assert_eq!(reaped_cmd.pid, host_cmd.pid);
+
+        // 3. Abandoned host child: protected during grace window, then reaped by PID 1 after grace!
+        let orphan_cmd = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/true",
+                    LocalCred::local_only(ann.clone(), 0o022),
+                    "host-init",
+                ),
+                105,
+            )
+            .unwrap();
+        let o_out = t.exit("host-init", orphan_cmd.pid, 0, None, 106).unwrap();
+        assert!(o_out.host_reap);
+        t.set_host_wait_grace(orphan_cmd.pid, 1350);
+        assert_eq!(
+            t.waitpid_at_ms("host-init", 1, -1, WNOHANG, 1200)
+                .unwrap_err()
+                .errno,
+            Errno::ECHILD
+        );
+        let WaitOutcome::Reaped(reaped_orphan) =
+            t.waitpid_at_ms("host-init", 1, -1, WNOHANG, 1350).unwrap()
+        else {
+            panic!("PID 1 must reap abandoned host zombie once grace expires");
+        };
+        assert_eq!(reaped_orphan.pid, orphan_cmd.pid);
     }
 
     #[test]

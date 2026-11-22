@@ -127,7 +127,13 @@ export async function exportMount(workspace, args) {
     else if (data.type === 'client') void (async () => {
       // The authenticated listener supplies this identity; request frames from
       // the receiver never supply or replace it. Password auth is scoped here.
-      const identity = data.password ? provider.owner : data.identity;
+      // Same-account tabs share the publisher's relay UID (`grant.uid`) and act as the
+      // local mount owner (`provider.owner`) while distinct relay accounts remain gated by
+      // POSIX permissions/ACLs against their own relay UID.
+      const ownerRelayId = grant.owner?.id ?? grant.uid;
+      const clientRelayId = data.identity?.id ?? data.identity?.uid;
+      const isPublisherAccount = typeof ownerRelayId === 'number' && clientRelayId === ownerRelayId;
+      const identity = (data.password || isPublisherAccount) ? provider.owner : data.identity;
       const service = provider.forIdentity(identity, found.relative);
       await service.access(source, found.relative, 1);
       workspace.check(); if (!active) throw bad('ENODEV');

@@ -59,6 +59,11 @@ test('default local user auto-logs in with wheel NOPASSWD sudo and 0 outbound au
   expect(sudoId.status).toBe(0);
   expect(sudoId.stdout).toContain('uid=0(root)');
 
+  // Codex #25: `sudo -n` evaluates real `/etc/sudoers` (`NOPASSWD` for `wheel`) instead of stale false.
+  const sudoDashN = await execLocal(page, ['sudo', '-n', 'id']);
+  expect(sudoDashN.status, sudoDashN.stderr).toBe(0);
+  expect(sudoDashN.stdout).toContain('uid=0(root)');
+
   // `/etc/shadow` is mode 0600 owned by root: unprivileged uid 1000 cannot read it.
   const shadowDenied = await execLocal(page, ['cat', '/etc/shadow']);
   expect(shadowDenied.status).not.toBe(0);
@@ -102,11 +107,16 @@ test('local useradd, usermod, passwd, su, groupadd, groupmod, groupdel, and user
   expect(suOk.stdout).toContain(`(${uname})`);
   expect(suOk.stdout).toContain(`(${gname2})`);
 
-  // Lock account -> `su` fails with EACCES; unlock -> `su` succeeds again.
+  // Lock account -> `su` fails with EACCES AND root-invoked `login` without `-f` ALSO fails (Codex #3);
+  // unlock -> `su` succeeds again.
   expect((await execLocal(page, ['usermod', '-L', uname], { sudo: true })).status).toBe(0);
   const suLocked = await execLocal(page, ['sh', '-c', `printf '%s\\n' '${pw}' | su '${uname}' -c id`]);
   expect(suLocked.status).not.toBe(0);
+  const rootLoginLocked = await execLocal(page, ['sh', '-c', `printf '%s\\n' '${pw}' | login '${uname}'`], { sudo: true });
+  expect(rootLoginLocked.status).not.toBe(0);
   expect((await execLocal(page, ['usermod', '-U', uname], { sudo: true })).status).toBe(0);
+  const rootLoginWrongPw = await execLocal(page, ['sh', '-c', `printf 'wrong-pass\\n' | login '${uname}'`], { sudo: true });
+  expect(rootLoginWrongPw.status).not.toBe(0);
   const suUnlocked = await execLocal(page, ['sh', '-c', `printf '%s\\n' '${pw}' | su '${uname}' -c id`]);
   expect(suUnlocked.status, suUnlocked.stderr).toBe(0);
 

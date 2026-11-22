@@ -662,6 +662,7 @@ mod runtime {
                                 prepare_user_runtime_dir(&mut ops, uid, gid)
                             });
                         if let Err(err) = prep {
+                            eprintln!("init: {unit}: prepare user runtime dir: {err}");
                             let _ = manager.on_spawn_failed(
                                 &unit,
                                 &format!("prepare user runtime dir: {err}"),
@@ -768,6 +769,7 @@ mod runtime {
                             }
                         }
                         Err(err) => {
+                            eprintln!("init: {unit}: spawn failed: {err}");
                             let _ = manager.on_spawn_failed(&unit, &err.to_string(), now_ms);
                         }
                     }
@@ -817,7 +819,9 @@ mod runtime {
                     }
                     should_exit = true;
                 }
-                ManagerAction::Log { .. } => {}
+                ManagerAction::Log { unit, message } => {
+                    eprintln!("init: {unit}: {message}");
+                }
             }
         }
         should_exit

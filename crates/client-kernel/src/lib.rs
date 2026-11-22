@@ -58,6 +58,26 @@ pub const VERSION: &str = "2";
 /// Linux's init PID.
 pub(crate) const INIT: u32 = 1;
 
+/// Monotonic wall clock in whole milliseconds (works on both `wasm32` and native host tests).
+pub(crate) fn now_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ms = js_sys::Date::now();
+        if ms.is_finite() && ms > 0.0 {
+            ms.floor() as u64
+        } else {
+            0
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(1_700_000_000_000)
+    }
+}
+
 /// Monotonic wall clock in whole seconds (works on both `wasm32` and native host tests).
 pub(crate) fn now_secs() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -365,15 +385,15 @@ pub(crate) async fn lazy_mint_remote_cred(
     // Re-check process & cloud session state after awaiting `MintServiceCred` so a concurrent
     // privilege drop, cloud sign-out, or process exit mid-await can never be overwritten.
     let rebind_result = {
-            let mut s = state.borrow_mut();
-            if s.cloud_session.as_ref().is_none_or(|cur| {
-                cur.cloud_uid != cs.cloud_uid
-                    || cur.local_uid != s.account.uid
-                    || cur.login_generation != s.account_epoch
-                    || cur.revoked
-            }) {
-                Err(Errno::ENOTCONN)
-            } else {
+        let mut s = state.borrow_mut();
+        if s.cloud_session.as_ref().is_none_or(|cur| {
+            cur.cloud_uid != cs.cloud_uid
+                || cur.local_uid != s.account.uid
+                || cur.login_generation != s.account_epoch
+                || cur.revoked
+        }) {
+            Err(Errno::ENOTCONN)
+        } else {
             let current_proc = s
                 .table
                 .proc(pid)
@@ -719,13 +739,21 @@ impl State {
     }
 }
 
-fn is_supervisor_image(exec: &Exec) -> bool {
-    exec.asset.is_some()
-        && exec.local.is_none()
-        && matches!(
-            exec.path.as_deref(),
-            Some("/usr/bin/supervise" | "/usr/bin/init")
-        )
+fn is_supervisor_image(exec: &Exec, trusted_digests: &HashMap<String, String>) -> bool {
+    let Some(path) = exec.path.as_deref() else {
+        return false;
+    };
+    if !matches!(path, "/usr/bin/supervise" | "/usr/bin/init") {
+        return false;
+    }
+    if exec.asset.is_some() && exec.local.is_none() {
+        return true;
+    }
+    exec.local.as_ref().is_some_and(|local| {
+        trusted_digests
+            .get(path)
+            .is_some_and(|expected| expected == &local.digest)
+    })
 }
 
 fn system_usr_asset(path: &str) -> Option<String> {
@@ -1726,8 +1754,12 @@ impl Kernel {
                 cgroup: updated_proc.cgroup.clone(),
             },
         };
-        if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
-            meta.supervisor = is_supervisor_image(&exec);
+        {
+            let mut rt = self.vfs_rt.borrow_mut();
+            let is_sup = is_supervisor_image(&exec, &rt.trusted_supervisor_digests);
+            if let Some(meta) = rt.proc_meta.get_mut(&pid) {
+                meta.supervisor = is_sup;
+            }
         }
         to_json(&exec)
     }
@@ -1791,6 +1823,11 @@ impl Kernel {
                 .table
                 .exit(host, pid, status, signal, now_secs())
                 .map_err(fail)?;
+            if out.host_reap {
+                state
+                    .table
+                    .set_host_wait_grace(pid, now_ms().saturating_add(350));
+            }
             if state
                 .login_session
                 .managed
@@ -2103,7 +2140,12 @@ impl Kernel {
             (
                 proc.cred.identity.id,
                 proc.cred.identity.group,
-                proc.cred.identity.groups.iter().copied().collect::<Vec<u32>>(),
+                proc.cred
+                    .identity
+                    .groups
+                    .iter()
+                    .copied()
+                    .collect::<Vec<u32>>(),
                 proc.cred.cloud_access,
                 proc.cred.remote.is_some(),
                 if proc.cred.identity.id == 0 {
@@ -2464,7 +2506,8 @@ impl Kernel {
                 cs,
             )
         };
-        let session_capped = kernel::proc_table::intersect_remote_scope(&requested_scope, &cs.scope);
+        let session_capped =
+            kernel::proc_table::intersect_remote_scope(&requested_scope, &cs.scope);
         let effective_scope = match &scope_cap {
             Some(cap) => kernel::proc_table::intersect_remote_scope(&session_capped, cap),
             None => session_capped,
@@ -3022,7 +3065,9 @@ impl Kernel {
                 options,
             } => {
                 let mut state = self.state.borrow_mut();
-                let outcome = state.table.waitpid(host, pid, selector, options)?;
+                let outcome = state
+                    .table
+                    .waitpid_at_ms(host, pid, selector, options, now_ms())?;
                 match outcome {
                     WaitOutcome::Reaped(proc) => {
                         state.proc_account_epoch.remove(&proc.pid);
@@ -3645,8 +3690,12 @@ impl Kernel {
                         )
                         .await?;
                     }
-                    if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&exec.pid) {
-                        meta.supervisor = is_supervisor_image(exec);
+                    {
+                        let mut rt = self.vfs_rt.borrow_mut();
+                        let is_sup = is_supervisor_image(exec, &rt.trusted_supervisor_digests);
+                        if let Some(meta) = rt.proc_meta.get_mut(&exec.pid) {
+                            meta.supervisor = is_sup;
+                        }
                     }
                 }
             }

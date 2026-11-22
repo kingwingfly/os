@@ -1756,3 +1756,115 @@ fn codex_24_and_32_ephemeral_snapshot_roots_and_missing_default_user_fail_closed
         .unwrap()
         .unwrap();
 }
+
+#[test]
+fn codex_32_rw_home_subvol_mounts_at_home_and_persists_separately() {
+    let (release, blobs) = synthetic_release();
+    let head = Rc::new(TestHeadStore::new());
+    let pack = Rc::new(TestPackStore::new());
+    let (_tick, clk) = fixed_clock(1_735_007_000);
+
+    // 1. Seed a normal volume, create `@home` subvolume on the live open `CowFs`, and reboot!
+    let mut boot1 = vfs::now_or_never(TwoStageBoot::new_cowfs_root(
+        "inst-subvol-1",
+        BootProfile::default(),
+        release.clone(),
+        Rc::clone(&head),
+        Rc::clone(&pack),
+        blobs.clone(),
+        Rc::clone(&clk),
+        || "vol-rw-home".to_string(),
+    ))
+    .unwrap()
+    .unwrap();
+    // Write a marker inside `@`'s `/home/user/in-root-subvol.txt`, then create `@home`.
+    vfs::now_or_never(boot1.write_file("/home/user/in-root-subvol.txt", b"root-at\n", 0o644))
+        .unwrap()
+        .unwrap();
+    vfs::now_or_never(boot1.cowfs().unwrap().create_subvol("@home", 0o755))
+        .unwrap()
+        .unwrap();
+    let _ = vfs::now_or_never(boot1.close_clean_with_prune())
+        .unwrap()
+        .unwrap();
+    drop(boot1);
+
+    // 2. Reboot: Stage 1 discovers `@home`, mounts it RW at `/sysroot/home`, pivots to Stage 2!
+    let profile = BootProfile {
+        version: BOOT_PROFILE_VERSION,
+        root: RootSpec::CowFs {
+            volume_uuid: Some("vol-rw-home".to_string()),
+            writer_mode: BootWriterMode::Exclusive,
+        },
+        default_user: "user".to_string(),
+        generation: None,
+        recovery: false,
+    };
+    let mut boot2 = vfs::now_or_never(TwoStageBoot::new_cowfs_root(
+        "inst-subvol-2",
+        profile.clone(),
+        release.clone(),
+        Rc::clone(&head),
+        Rc::clone(&pack),
+        blobs.clone(),
+        Rc::clone(&clk),
+        || panic!("must open existing volume"),
+    ))
+    .unwrap()
+    .unwrap();
+    assert_eq!(boot2.stage(), BootStage::Stage2);
+    let mounts = String::from_utf8(
+        vfs::now_or_never(boot2.read_file("/proc/mounts"))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        mounts.contains("cowfs:vol-rw-home:@home /home cowfs rw"),
+        "expected RW @home mounted at /home in /proc/mounts, got:\n{mounts}"
+    );
+    // `@`'s `/home/user/in-root-subvol.txt` is shadowed by the fresh `@home` subvolume!
+    assert_eq!(
+        vfs::now_or_never(boot2.stat("/home/user/in-root-subvol.txt", false)).unwrap(),
+        Err(Errno::ENOENT)
+    );
+    // Create `/home/user` (0750 owned by uid 1000 via sudo) and write inside `@home`!
+    vfs::now_or_never(boot2.mkdir_sudo("/home/user", 0o755))
+        .unwrap()
+        .unwrap();
+    vfs::now_or_never(boot2.write_file_sudo(
+        "/home/user/from-at-home.txt",
+        b"subvol-home-persisted\n",
+        0o644,
+    ))
+    .unwrap()
+    .unwrap();
+    vfs::now_or_never(boot2.sync_fs()).unwrap().unwrap();
+    let _ = vfs::now_or_never(boot2.close_clean_with_prune())
+        .unwrap()
+        .unwrap();
+    drop(boot2);
+
+    // 3. Third cold boot confirms writes into `@home` persisted cleanly!
+    let mut boot3 = vfs::now_or_never(TwoStageBoot::new_cowfs_root(
+        "inst-subvol-3",
+        profile,
+        release,
+        Rc::clone(&head),
+        Rc::clone(&pack),
+        blobs,
+        clk,
+        || panic!("must open existing volume"),
+    ))
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        vfs::now_or_never(boot3.read_file("/home/user/from-at-home.txt"))
+            .unwrap()
+            .unwrap(),
+        b"subvol-home-persisted\n"
+    );
+    let _ = vfs::now_or_never(boot3.close_clean_with_prune())
+        .unwrap()
+        .unwrap();
+}

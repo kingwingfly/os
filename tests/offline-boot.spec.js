@@ -235,12 +235,29 @@ test('B-01..03 & B-08: installed Release v2 boots /console.html offline (0 reque
   expect(outboundRequests).toEqual([]);
   expect(serverHits).toEqual([]);
 
-  // 4. B-02: Verify exact RootTemplate account files, statfs magic, `/proc/mounts`, and zero remote `/dev` nodes.
+  // 4. B-02: Verify exact RootTemplate account files, non-PID-1 console login process DAC enforcement
+  //    (Codex #2 & #10), statfs magic, `/proc/mounts`, `/run/os/boot-healthy`, and zero remote `/dev` nodes.
+  expect(boot1.status.console_proc).toBeTruthy();
+  expect(boot1.status.console_proc.pid).toBeGreaterThan(1);
+  expect(boot1.status.console_proc.ppid).toBe(1);
+  expect(boot1.status.console_proc.uid).toBe(1000);
+  expect(boot1.status.console_proc.user).toBe('user');
+  expect(boot1.status.console_proc.tty).toBe('/dev/pts/0');
+
   const inspect1 = await page.evaluate(async () => {
     const c = window.osStandaloneConsole;
     const shadowSt = await c.stat('/etc/shadow', false);
     const sudoersSt = await c.stat('/etc/sudoers', false);
-    const sudoersText = await c.readText('/etc/sudoers');
+    // Codex #2: unprivileged console process (uid 1000, pid != 1) MUST be denied `/etc/shadow`,
+    // `/etc/sudoers`, and writing `/etc/motd` without explicit `sudo`!
+    let shadowReadErrno = null;
+    try { await c.readText('/etc/shadow'); } catch (e) { shadowReadErrno = e.errno ?? e.message; }
+    let sudoersReadErrno = null;
+    try { await c.readText('/etc/sudoers'); } catch (e) { sudoersReadErrno = e.errno ?? e.message; }
+    let motdWriteErrno = null;
+    try { await c.writeFile('/etc/motd', 'denied\n', 0o644); } catch (e) { motdWriteErrno = e.errno ?? e.message; }
+
+    const sudoersText = await c.readText('/etc/sudoers', { sudo: true });
     const homeSt = await c.stat('/home/user', false);
     const sfRoot = await c.statfs('/');
     const mounts = await c.readText('/proc/mounts');
@@ -248,10 +265,15 @@ test('B-01..03 & B-08: installed Release v2 boots /console.html offline (0 reque
     const devEntries = await c.readdir('/dev');
     const runRoot = JSON.parse(await c.readText('/run/os/root'));
     const runProfile = JSON.parse(await c.readText('/run/os/boot-profile.json'));
+    const bootHealthyText = await c.readText('/run/os/boot-healthy');
 
-    // Write persistent files and commit transaction group.
-    await c.writeFile('/etc/motd', 'hello standalone offline\n', 0o644);
+    // Write persistent files (explicit sudo for `/etc/motd`, normal uid 1000 for `/home/user/notes.txt`),
+    // test resumable bfcache flush (`flushForSuspend`, Codex #16), and commit transaction group.
+    await c.writeFile('/etc/motd', 'hello standalone offline\n', 0o644, { sudo: true });
     await c.writeFile('/home/user/notes.txt', 'persisted across offline reboot\n', 0o644);
+    const suspendHead = await c.flushForSuspend();
+    // Root MUST remain open & writable after `flushForSuspend()`!
+    await c.writeFile('/home/user/after-suspend.txt', 'writable-after-bfcache\n', 0o644);
     const syncedHead = await c.syncFs();
 
     // B-03: Stage 1 marker must be absent, and Stage 1 tmpfs must be dropped.
@@ -276,17 +298,21 @@ test('B-01..03 & B-08: installed Release v2 boots /console.html offline (0 reque
       cowfsRootErrno = e.errno ?? e.message;
     }
 
-    // Interactive console built-in command execution.
+    // Interactive console command execution runs under real shell/binaries as uid 1000.
     const uname = await c.exec('uname');
-    const fsck = await c.exec('cowfsck');
+    const idOut = await c.exec('id');
+    const fsck = await c.exec('sudo cowfsck /dev/vd0');
 
     return {
       shadowMode: shadowSt.mode & 0o7777,
       shadowUid: shadowSt.uid,
       shadowGid: shadowSt.gid,
+      shadowReadErrno,
       sudoersMode: sudoersSt.mode & 0o7777,
       sudoersUid: sudoersSt.uid,
       sudoersGid: sudoersSt.gid,
+      sudoersReadErrno,
+      motdWriteErrno,
       sudoersText,
       homeMode: homeSt.mode & 0o7777,
       homeUid: homeSt.uid,
@@ -297,11 +323,14 @@ test('B-01..03 & B-08: installed Release v2 boots /console.html offline (0 reque
       devEntries,
       runRoot,
       runProfile,
+      bootHealthyText,
+      suspendEpoch: suspendHead?.epoch ?? 0,
       syncedEpoch: syncedHead.epoch,
       markerErrno,
       nonPid1Errno,
       cowfsRootErrno,
       uname,
+      idOut,
       fsck,
     };
   });
@@ -309,10 +338,15 @@ test('B-01..03 & B-08: installed Release v2 boots /console.html offline (0 reque
   expect(inspect1.shadowMode).toBe(0o600);
   expect(inspect1.shadowUid).toBe(0);
   expect(inspect1.shadowGid).toBe(0);
+  expect(inspect1.shadowReadErrno).toBe('EACCES');
   expect(inspect1.sudoersMode).toBe(0o440);
   expect(inspect1.sudoersUid).toBe(0);
   expect(inspect1.sudoersGid).toBe(0);
+  expect(inspect1.sudoersReadErrno).toBe('EACCES');
+  expect(inspect1.motdWriteErrno).toBe('EACCES');
   expect(inspect1.sudoersText).toContain('%wheel ALL=(ALL:ALL) NOPASSWD: ALL');
+  expect(inspect1.bootHealthyText).toContain('healthy');
+  expect(inspect1.suspendEpoch).toBeGreaterThan(1);
   expect(inspect1.homeMode).toBe(0o750);
   expect(inspect1.homeUid).toBe(1000);
   expect(inspect1.homeGid).toBe(1000);
@@ -334,6 +368,8 @@ test('B-01..03 & B-08: installed Release v2 boots /console.html offline (0 reque
   expect(inspect1.nonPid1Errno).toBe('EPERM');
   expect(inspect1.cowfsRootErrno).toBe('EINVAL');
   expect(inspect1.uname.code).toBe(0);
+  expect(inspect1.idOut.code).toBe(0);
+  expect(inspect1.idOut.output).toContain('uid=1000(user)');
   expect(inspect1.fsck.code).toBe(0);
   expect(boot1.status.pid1.pid).toBe(1);
   expect(boot1.status.pid1.path).toBe('/usr/bin/init');

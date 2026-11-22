@@ -36,6 +36,7 @@ if (IS_WORKER) {
   let pid1Owner = null;
   let pid1Ended = false;
   let pid1Error = '';
+  let standaloneSessionId = '';
   const kernelId = self.crypto?.randomUUID?.() ?? `standalone-${Date.now()}-${Math.random()}`;
 
   function randomHex32() {
@@ -185,7 +186,11 @@ if (IS_WORKER) {
     if (executorMod && pid1Job && !pid1Ended) {
       try {
         await Promise.race([
-          executorMod.exec([['/usr/bin/service', 'poweroff']], { stdin: '', sudo: true }).catch(() => {}),
+          executorMod.exec([['/usr/bin/service', 'poweroff']], {
+            stdin: '',
+            sudo: true,
+            sessionId: standaloneSessionId || undefined,
+          }).catch(() => {}),
           new Promise(r => setTimeout(r, 2500)),
         ]);
       } catch { /* fallback to signal */ }
@@ -226,6 +231,7 @@ if (IS_WORKER) {
     pid1Owner = null;
     pid1Ended = false;
     pid1Error = '';
+    standaloneSessionId = '';
 
     const stage1Status = JSON.parse(await kernel.boot_stage1_standalone(
       store,
@@ -242,7 +248,8 @@ if (IS_WORKER) {
     // Codex Findings #2 & #10: execute real packaged Stage 1 `/init` (`early_init.wasm`) ->
     // `/bin/switch_root` -> Stage 2 `/usr/bin/init` (`init.wasm`) as PID 1 through the executor
     // preserving PID 1 & start time, and wait for PID 1 to write `/run/os/boot-healthy`!
-    executorMod ??= await import('/executor-host.js');
+    const execUrl = new URL('/executor-host.js', self.location.href).href;
+    executorMod ??= await import(/* @vite-ignore */ execUrl);
     const proof = randomHex32();
     const inspected = JSON.parse(await kernel.machine_init_action(JSON.stringify({ op: 'inspect' }), kernelId));
     const claimed = JSON.parse(await kernel.machine_init_action(
@@ -275,7 +282,7 @@ if (IS_WORKER) {
         throw new Error(`PID 1 init exited prematurely before boot-healthy: ${pid1Error.trim() || 'exit'}`);
       }
       try {
-        await kernel.proc_statat(1, 0x7ffffffe, '/run/os/boot-healthy', true);
+        await kernel.proc_statat(1, 0x7ffffffd, '/run/os/boot-healthy', true);
         healthy = true;
         break;
       } catch {
@@ -287,6 +294,13 @@ if (IS_WORKER) {
     }
 
     const finalStatus = JSON.parse(await kernel.standalone_finalize_stage2(kernelId));
+    if (finalStatus.stage === 'stage2' && finalStatus.console_proc) {
+      const cp = finalStatus.console_proc;
+      const sid = `standalone-${cp.uid}-${Date.now()}`;
+      await kernel.session_begin(sid, cp.uid, cp.gid, new Uint32Array(cp.groups ?? [cp.gid]));
+      kernel.set_active_session(sid);
+      standaloneSessionId = sid;
+    }
     return {
       status: finalStatus,
       bootHealthy: finalStatus.stage === 'stage2',
@@ -398,6 +412,7 @@ if (IS_WORKER) {
             const res = await executorMod.exec([['/bin/sh', '-c', args.line ?? '']], {
               stdin: '',
               sudo: false,
+              sessionId: standaloneSessionId || undefined,
               cwd: cp?.home ?? '/',
               home: cp?.home ?? '/',
               user: cp?.user ?? 'user',

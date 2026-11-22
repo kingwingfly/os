@@ -20,8 +20,8 @@
 //!   reclaiming Stage 1 `tmpfs` strictly within `st_dev`).
 
 use crate::cowfs_bridge::{
-    CloseCleanPruneOutcome, JsCowfsStore, close_clean_with_prune_fs, cowfsck_volume_stores,
-    now_timespec, open_for_boot_stores,
+    BootOpenError, CloseCleanPruneOutcome, DirtyFlushGuard, JsCowfsStore, bind_dirty_flush_timer,
+    close_clean_with_prune_fs, cowfsck_volume_stores, now_timespec, open_for_boot_stores_detailed,
 };
 use crate::mounts::{js_errno, map_vfs_err};
 use crate::release_v2::{
@@ -37,9 +37,7 @@ use cowtree::{
     WriterMode,
 };
 use image::{Image, Kind, Node};
-use kernel::accounts::{
-    AccountFs, LocalAccountStore, MemoryAccountFs, parse_group, parse_passwd,
-};
+use kernel::accounts::{AccountFs, LocalAccountStore, MemoryAccountFs, parse_group, parse_passwd};
 use kernel::proc_table::{LocalCred, LocalProcessTable, ReexecSpec, SpawnSpec};
 use os_core::permissions::Identity;
 use serde::{Deserialize, Serialize};
@@ -160,7 +158,11 @@ impl BootProfile {
             RootSpec::CowFs {
                 volume_uuid: Some(uuid),
                 ..
-            } if uuid.is_empty() || uuid.len() > 128 || uuid.contains('/') || uuid.contains('\0') => {
+            } if uuid.is_empty()
+                || uuid.len() > 128
+                || uuid.contains('/')
+                || uuid.contains('\0') =>
+            {
                 return Err(Errno::EINVAL);
             }
             RootSpec::Snapshot {
@@ -324,6 +326,7 @@ pub struct TwoStageBoot<
     blobs: B,
     release: ReleaseImages,
     cowfs: Option<Rc<CowFs<H, P>>>,
+    dirty_flush_guard: Option<DirtyFlushGuard>,
     home_cowfs: Option<Rc<dyn Filesystem>>,
     mounted_root: Option<MountedRootInfo>,
     recovery: Option<RecoveryState>,
@@ -527,7 +530,9 @@ async fn resolve_default_account_at_prefix(
     let entry = passwd_entries
         .into_iter()
         .find(|e| e.name == default_user)
-        .ok_or_else(|| format!("configured default_user {default_user:?} not found in {passwd_path}"))?;
+        .ok_or_else(|| {
+            format!("configured default_user {default_user:?} not found in {passwd_path}")
+        })?;
 
     let group_bytes = read_file_as_pid(vfs, 1, &group_path)
         .await
@@ -586,7 +591,7 @@ async fn validate_init_executable_in_root(
     if let Some(rest) = head.strip_prefix(b"#!") {
         let line_end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
         let line = std::str::from_utf8(&rest[..line_end]).map_err(|_| Errno::ENOEXEC)?;
-        let interp = line.trim().split_whitespace().next().ok_or(Errno::ENOEXEC)?;
+        let interp = line.split_whitespace().next().ok_or(Errno::ENOEXEC)?;
         if !interp.starts_with('/') || interp.contains('\0') {
             return Err(Errno::ENOEXEC);
         }
@@ -1126,6 +1131,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
             blobs,
             release,
             cowfs: None,
+            dirty_flush_guard: None,
             home_cowfs: None,
             mounted_root: None,
             recovery: None,
@@ -1286,92 +1292,15 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
             }
         }
 
-        // 2. If opening an existing volume, run `cowfsck` pre-mount integrity check BEFORE
-        //    mounting read-write so corrupt volumes NEVER mount and ALWAYS offer recovery/rollback.
-        if let Some(ref existing_uuid) = volume_uuid {
-            let vol_id = VolumeId(existing_uuid.clone());
-            match cowfsck_volume_stores(&*self.head_store, &*self.pack_store, &vol_id).await {
-                Ok(report) => {
-                    let report_bytes =
-                        serde_json::to_vec_pretty(&report).unwrap_or_else(|_| b"{}".to_vec());
-                    let _ = write_file_on_vfs(&self.vfs, COWFSCK_REPORT_PATH, &report_bytes, 0o444)
-                        .await;
-                    let ok = report.ok;
-                    let detail = if report.errors.is_empty() {
-                        "cowfsck reported volume corruption".to_string()
-                    } else {
-                        report.errors.join("; ")
-                    };
-                    self.fsck_report = Some(report);
-                    if !ok {
-                        let snaps: Vec<String> = self
-                            .head_store
-                            .list_snapshots(&vol_id)
-                            .await
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|s| s.name)
-                            .collect();
-                        return Ok(self
-                            .enter_recovery(
-                                RecoveryReason::CorruptVolume {
-                                    detail: detail.clone(),
-                                    snapshots: snaps.clone(),
-                                },
-                                Some(existing_uuid.clone()),
-                                snaps,
-                                format!(
-                                    "Stage 1 cowfsck detected corruption on volume {existing_uuid}: {detail}"
-                                ),
-                            )
-                            .await);
-                    }
-                }
-                Err(Errno::EPROTONOSUPPORT) => {
-                    return Ok(self
-                        .enter_recovery(
-                            RecoveryReason::IncompatibleFormat {
-                                found_version: None,
-                                expected_version: COWFS_FORMAT_VERSION,
-                            },
-                            Some(existing_uuid.clone()),
-                            Vec::new(),
-                            format!(
-                                "cowfsck rejected volume {existing_uuid}: incompatible format version (EPROTONOSUPPORT)."
-                            ),
-                        )
-                        .await);
-                }
-                Err(e) => {
-                    let snaps: Vec<String> = self
-                        .head_store
-                        .list_snapshots(&vol_id)
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|s| s.name)
-                        .collect();
-                    return Ok(self
-                        .enter_recovery(
-                            RecoveryReason::CorruptVolume {
-                                detail: format!("cowfsck failed: {}", errno_name(e)),
-                                snapshots: snaps.clone(),
-                            },
-                            Some(existing_uuid.clone()),
-                            snaps,
-                            format!(
-                                "Stage 1 cowfsck failed on volume {existing_uuid} ({e:?}); refusing to mount."
-                            ),
-                        )
-                        .await);
-                }
-            }
-        }
-
-        // 3. Provision or open `os-cowfs` root volume.
-        let config = CowFsConfig::local_browser(Rc::clone(&self.clock_fn))
-            .with_arena(ArenaConfig::fixed_32mib());
-        let opened = match open_for_boot_stores(
+        // 2. Provision or open `os-cowfs` root volume:
+        //    - Codex #13: acquires the writer lease / `ForkOnBusy` fork FIRST and verifies THAT
+        //      EXACT live-leased head via `cowfs::fsck::verify_head` (no TOCTOU window!).
+        //    - Codex #14: binds the 5-second dirty commit deadline timer via `on_dirty` callback.
+        let (config, dirty_binder) = bind_dirty_flush_timer::<H, P>(
+            CowFsConfig::local_browser(Rc::clone(&self.clock_fn))
+                .with_arena(ArenaConfig::fixed_32mib()),
+        );
+        let opened = match open_for_boot_stores_detailed(
             Rc::clone(&self.head_store),
             Rc::clone(&self.pack_store),
             volume_uuid.clone(),
@@ -1384,7 +1313,39 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
         .await
         {
             Ok(res) => res,
-            Err(Errno::EPROTONOSUPPORT) => {
+            Err(BootOpenError::Corrupt { volume, report }) => {
+                let report_bytes =
+                    serde_json::to_vec_pretty(&report).unwrap_or_else(|_| b"{}".to_vec());
+                let _ =
+                    write_file_on_vfs(&self.vfs, COWFSCK_REPORT_PATH, &report_bytes, 0o444).await;
+                let detail = if report.errors.is_empty() {
+                    "cowfsck reported volume corruption".to_string()
+                } else {
+                    report.errors.join("; ")
+                };
+                self.fsck_report = Some(*report);
+                let snap_vol = volume_uuid.clone().unwrap_or_else(|| volume.clone());
+                let snaps: Vec<String> = self
+                    .head_store
+                    .list_snapshots(&VolumeId(snap_vol.clone()))
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| s.name)
+                    .collect();
+                return Ok(self
+                    .enter_recovery(
+                        RecoveryReason::CorruptVolume {
+                            detail: detail.clone(),
+                            snapshots: snaps.clone(),
+                        },
+                        Some(snap_vol),
+                        snaps,
+                        format!("Stage 1 cowfsck detected corruption on volume {volume}: {detail}"),
+                    )
+                    .await);
+            }
+            Err(BootOpenError::Errno(Errno::EPROTONOSUPPORT)) => {
                 return Ok(self
                     .enter_recovery(
                         RecoveryReason::IncompatibleFormat {
@@ -1397,7 +1358,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
                     )
                     .await);
             }
-            Err(Errno::EBUSY) => {
+            Err(BootOpenError::Errno(Errno::EBUSY)) => {
                 let busy_uuid = volume_uuid.clone().unwrap_or_default();
                 let snaps = self
                     .head_store
@@ -1420,7 +1381,82 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
                     )
                     .await);
             }
-            Err(e) => {
+            Err(BootOpenError::Errno(e)) => {
+                // If opening an existing volume failed before post-acquire `verify_head` (e.g.
+                // corrupt root object decoding failed in `CowFs::open`), run `cowfsck` to record
+                // `/run/os/cowfsck.json` and offer snapshot rollback recovery.
+                if let Some(ref existing_uuid) = volume_uuid {
+                    let vol_id = VolumeId(existing_uuid.clone());
+                    let snaps: Vec<String> = self
+                        .head_store
+                        .list_snapshots(&vol_id)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|s| s.name)
+                        .collect();
+                    match cowfsck_volume_stores(&*self.head_store, &*self.pack_store, &vol_id).await
+                    {
+                        Ok(report) => {
+                            let report_bytes = serde_json::to_vec_pretty(&report)
+                                .unwrap_or_else(|_| b"{}".to_vec());
+                            let _ = write_file_on_vfs(
+                                &self.vfs,
+                                COWFSCK_REPORT_PATH,
+                                &report_bytes,
+                                0o444,
+                            )
+                            .await;
+                            let detail = if report.errors.is_empty() {
+                                format!("os-cowfs open failed: {}", errno_name(e))
+                            } else {
+                                report.errors.join("; ")
+                            };
+                            self.fsck_report = Some(report);
+                            return Ok(self
+                                .enter_recovery(
+                                    RecoveryReason::CorruptVolume {
+                                        detail: detail.clone(),
+                                        snapshots: snaps.clone(),
+                                    },
+                                    Some(existing_uuid.clone()),
+                                    snaps,
+                                    format!(
+                                        "Stage 1 cowfsck detected corruption on volume {existing_uuid}: {detail}"
+                                    ),
+                                )
+                                .await);
+                        }
+                        Err(Errno::EPROTONOSUPPORT) => {
+                            return Ok(self
+                                .enter_recovery(
+                                    RecoveryReason::IncompatibleFormat {
+                                        found_version: None,
+                                        expected_version: COWFS_FORMAT_VERSION,
+                                    },
+                                    Some(existing_uuid.clone()),
+                                    Vec::new(),
+                                    "Incompatible os-cowfs format version (EPROTONOSUPPORT).",
+                                )
+                                .await);
+                        }
+                        Err(_) => {
+                            return Ok(self
+                                .enter_recovery(
+                                    RecoveryReason::CorruptVolume {
+                                        detail: format!("os-cowfs open failed: {}", errno_name(e)),
+                                        snapshots: snaps.clone(),
+                                    },
+                                    Some(existing_uuid.clone()),
+                                    snaps,
+                                    format!(
+                                        "Failed to open os-cowfs root volume {existing_uuid} ({e:?}); refusing to mount."
+                                    ),
+                                )
+                                .await);
+                        }
+                    }
+                }
                 return Ok(self
                     .enter_recovery(
                         RecoveryReason::IoError {
@@ -1435,7 +1471,12 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
             }
         };
 
-        self.mount_opened_cowfs_at_sysroot(opened, writer_mode)
+        if let Some(ref report) = opened.fsck_report {
+            let report_bytes = serde_json::to_vec_pretty(report).unwrap_or_else(|_| b"{}".to_vec());
+            let _ = write_file_on_vfs(&self.vfs, COWFSCK_REPORT_PATH, &report_bytes, 0o444).await;
+        }
+        let dirty_guard = dirty_binder.attach(&opened.fs);
+        self.mount_opened_cowfs_at_sysroot(opened, writer_mode, dirty_guard)
             .await?;
         // Fail closed BEFORE pivoting if `/sysroot/etc/passwd` is missing/corrupt or the
         // configured `default_user` cannot be resolved (Codex Finding #24).
@@ -1452,6 +1493,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
                 .take()
                 .map(|r| r.volume_uuid)
                 .or(volume_uuid);
+            self.dirty_flush_guard = None;
             if let Some(fs) = self.cowfs.take() {
                 let _ = fs.close_clean().await;
             }
@@ -1882,6 +1924,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
         &mut self,
         opened: crate::cowfs_bridge::BootOpenResult<H, P>,
         writer_mode: BootWriterMode,
+        dirty_guard: DirtyFlushGuard,
     ) -> vfs::Result<()> {
         let now = (self.clock_fn)();
         if let Some(report) = opened.fsck_report {
@@ -1958,9 +2001,32 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
             )
             .await?;
 
+        // Discover & mount RW `@home` subvolume if present on the mounted volume (Codex #32).
+        let mut home_cowfs: Option<Rc<dyn Filesystem>> = None;
+        if opened.fs.has_subvol("@home") {
+            ensure_dir_on_vfs(&self.vfs, "/sysroot/home", 0o755).await?;
+            let home_view = opened.fs.open_subvol_view("@home")?;
+            let home_backing = Rc::new(MountBacking::new(Rc::clone(&home_view), FsType::Cowfs));
+            self.vfs
+                .mount_on_namespace(
+                    &sys_ns,
+                    &root_cred,
+                    home_backing,
+                    None,
+                    &format!("cowfs:{}:@home", info.volume_uuid),
+                    "/sysroot/home",
+                    MountFlags::default(),
+                    0,
+                    None,
+                )
+                .await?;
+            home_cowfs = Some(home_view);
+        }
+
         self.mount_stage2_usr_and_tmp(now).await?;
         self.cowfs = Some(opened.fs);
-        self.home_cowfs = None;
+        self.dirty_flush_guard = Some(dirty_guard);
+        self.home_cowfs = home_cowfs;
         self.mounted_root = Some(info);
         Ok(())
     }
@@ -2134,11 +2200,11 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
 
         // Spawn a separate non-PID-1 Stage 2 console login process on a local PTY (`/dev/pts/0`)
         // with the resolved `default_user` identity (Codex Findings #2 & #24).
-        let acct = resolve_default_account_at_prefix(&self.vfs, "", &self.boot_profile.default_user)
-            .await
-            .map_err(|_| Errno::ENOENT)?;
-        self._dev_pts
-            .register_pty(0, acct.uid, acct.gid, 0o620);
+        let acct =
+            resolve_default_account_at_prefix(&self.vfs, "", &self.boot_profile.default_user)
+                .await
+                .map_err(|_| Errno::ENOENT)?;
+        self._dev_pts.register_pty(0, acct.uid, acct.gid, 0o620);
         let identity = Identity {
             id: acct.uid,
             group: acct.gid,
@@ -2294,6 +2360,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
         };
         let base_epoch = self.mounted_root.as_ref().map_or(0, |info| info.base_epoch);
         let outcome = close_clean_with_prune_fs(&cowfs, base_epoch).await?;
+        self.dirty_flush_guard = None;
         self.closed = true;
         Ok(Some(outcome))
     }
@@ -2308,13 +2375,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
         let Some(cowfs) = self.cowfs.as_ref() else {
             return Ok(None);
         };
-        if cowfs.is_read_only() || cowfs.is_closed() {
-            return Ok(None);
-        }
-        if cowfs.ms_until_dirty_deadline().is_none() {
-            return Ok(None);
-        }
-        let head = cowfs.commit_tx_group().await?;
+        let head = cowfs.flush_for_suspend().await?;
         Ok(Some(head))
     }
 
@@ -2944,11 +3005,7 @@ impl OfflineBootRuntime {
     }
 
     pub async fn flush_for_suspend(&self) -> Result<JsValue, JsValue> {
-        let head = self
-            .inner
-            .flush_for_suspend()
-            .await
-            .map_err(map_vfs_err)?;
+        let head = self.inner.flush_for_suspend().await.map_err(map_vfs_err)?;
         crate::cowfs_bridge::to_js_json(&head)
     }
 

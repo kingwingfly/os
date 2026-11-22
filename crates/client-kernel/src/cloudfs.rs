@@ -692,20 +692,51 @@ impl CloudMountDriver {
         Ok(())
     }
 
+    /// Re-verify an ALREADY-MINTED live process credential after an `.await` (`connector.get`).
+    /// Requires the `CloudSession` to remain signed-in and unrevoked for the same `cloud_uid`,
+    /// while allowing an already-running process (or an `SCM_RIGHTS` attenuated fd scoped to that
+    /// live sender) to keep using its own minted `ServiceAuth v2` token even if the browser's
+    /// ambient local account switches before the process exits or Cloud signs out.
+    fn recheck_existing_proc_cloud_access(
+        &self,
+        pid: u32,
+        expected_cloud_uid: u32,
+        expected_token: &str,
+    ) -> vfs::Result<()> {
+        if self.is_pid_cloud_denied(pid) {
+            return Err(Errno::EACCES);
+        }
+        let st = self.state.borrow();
+        let session = st.cloud_session.as_ref().ok_or(Errno::ENOTCONN)?;
+        if session.revoked || session.cloud_uid != expected_cloud_uid {
+            return Err(Errno::EACCES);
+        }
+        let proc = st
+            .table
+            .proc(pid)
+            .filter(|p| p.state != ProcState::Zombie)
+            .ok_or(Errno::EACCES)?;
+        if !proc.cred.cloud_access {
+            return Err(Errno::EACCES);
+        }
+        let rem = proc.cred.remote.as_ref().ok_or(Errno::EACCES)?;
+        if !rem.cloud_access || rem.token != expected_token {
+            return Err(Errno::EACCES);
+        }
+        Ok(())
+    }
+
     /// Resolve the active `CloudFs` connection and remote `Actor` + remote `Cred`.
     /// - Signed out of Cloud -> `Err(Errno::ENOTCONN)` with ZERO network RPCs.
-    /// - Local user / login generation mismatch or revoked session -> `Err(Errno::EACCES)` with
-    ///   ZERO network RPCs, AND rechecked after every asynchronous credential / connect `.await`!
+    /// - Page-scoped access and lazy process credential minting enforce `(local_uid, login_generation)`
+    ///   binding against the active local account before and after every `.await` (Codex Finding #1).
+    /// - A live process that ALREADY holds its own minted `ServiceAuth v2` token (including `SCM_RIGHTS`
+    ///   attenuated fds scoped to a live sender) keeps access until it exits, drops privileges, or the
+    ///   Cloud session is signed out / revoked.
     /// - Process without `cloud_access` or after privilege drop -> `Err(Errno::EACCES)` with ZERO RPCs.
     /// - Local `uid 0` / `sudo` NEVER synthesizes remote root: always acts strictly with the
     ///   signed-in cloud user's own non-elevated `ServiceAuth v2` token!
     async fn resolve_cloud(&self, cred: &Cred) -> vfs::Result<(Rc<Cloud>, Actor, Cred)> {
-        let session = self.verify_cloud_session_binding(None)?;
-        let binding = (
-            session.cloud_uid,
-            session.local_uid,
-            session.login_generation,
-        );
         let proc_pid = self.active_pid.get().filter(|&p| p < SCOPED_PAGE_PID_BASE);
 
         if let Some(pid) = proc_pid {
@@ -724,9 +755,22 @@ impl CloudMountDriver {
                 }
                 proc.cred.remote.clone()
             };
-            let rem = match existing {
-                Some(r) => r,
+            let (rem, minted_binding) = match existing {
+                Some(r) => {
+                    let st = self.state.borrow();
+                    let session = st.cloud_session.as_ref().ok_or(Errno::ENOTCONN)?;
+                    if session.revoked || session.cloud_uid != r.uid {
+                        return Err(Errno::EACCES);
+                    }
+                    (r, None)
+                }
                 None => {
+                    let session = self.verify_cloud_session_binding(None)?;
+                    let binding = (
+                        session.cloud_uid,
+                        session.local_uid,
+                        session.login_generation,
+                    );
                     let minted = crate::lazy_mint_remote_cred(&self.state, pid)
                         .await
                         .map_err(|e| e.errno)?;
@@ -744,7 +788,7 @@ impl CloudMountDriver {
                     if let Some(hook) = self.on_lazy_mint.borrow().clone() {
                         hook(pid);
                     }
-                    minted
+                    (minted, Some(binding))
                 }
             };
             if !rem.cloud_access {
@@ -759,7 +803,11 @@ impl CloudMountDriver {
                 )
                 .await?;
             // Recheck cloud session binding and process state after awaiting `connector.get`.
-            self.recheck_proc_cloud_access(pid, binding, &rem.token)?;
+            if let Some(binding) = minted_binding {
+                self.recheck_proc_cloud_access(pid, binding, &rem.token)?;
+            } else {
+                self.recheck_existing_proc_cloud_access(pid, rem.uid, &rem.token)?;
+            }
             let remote_cred = Cred {
                 identity: Identity {
                     id: rem.uid,
@@ -771,6 +819,13 @@ impl CloudMountDriver {
             };
             return Ok((cloud, actor, remote_cred));
         }
+
+        let session = self.verify_cloud_session_binding(None)?;
+        let binding = (
+            session.cloud_uid,
+            session.local_uid,
+            session.login_generation,
+        );
 
         // Page-scoped access: uses the signed-in CloudSession's non-elevated `ServiceAuth v2`
         // page token bound to `(state.account.uid, state.account_epoch)` (NEVER elevates to remote
@@ -1488,6 +1543,7 @@ mod tests {
             remote_attached: false,
             host_epoch: 0,
             pending_revocations: Vec::new(),
+            pending_detach: false,
             attached_devices: BTreeMap::new(),
             init_state: Init::new("boot-1".into(), now),
             login_session: LoginSession::new(format!("{id}:s1"), account.uid, now + 86_400, now),
@@ -1495,7 +1551,6 @@ mod tests {
             seat_policies: BTreeMap::new(),
             boot_seq: 1,
             session_seq: 1,
-            init_wait_grace_until_ms: BTreeMap::new(),
         }));
         let driver = CloudMountDriver::new(
             Rc::clone(&state),

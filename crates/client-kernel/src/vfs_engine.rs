@@ -28,12 +28,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use vfs::devfs::{DefaultDeviceBackend, DevPtsFs, DevTmpFs, DeviceBackend};
-use vfs::vblk::{VblkDeviceBackend, VblkRegistry};
 use vfs::imagefs::{
     BlobStore, BuildAssetSizes, ImageEntry, ImageFs, ImageNodeKind, MemoryBlobStore,
 };
 use vfs::memfs::MemFs;
 use vfs::procfs::{ProcDynamicEntry, ProcFs, ProcProvider};
+use vfs::vblk::{VblkDeviceBackend, VblkRegistry};
 use vfs::{
     BoxFuture, Cred, FILE_MAX, FileRef, FileType, Filesystem, FsId, Handle, Identity, LockFamily,
     LockKind, LockRange, MountBacking, MountFlags, MountId, MountNamespace, NodeId, ProviderHealth,
@@ -1497,8 +1497,6 @@ pub(crate) struct BootVfsOptions {
     pub(crate) extension_images: Vec<String>,
     #[serde(default, alias = "root_template")]
     pub(crate) root_template: Option<String>,
-    #[serde(default)]
-    pub(crate) initramfs: Option<String>,
     #[serde(default, alias = "bind_mounts")]
     pub(crate) bind_mounts: Vec<ServiceBindSpec>,
 }
@@ -1860,6 +1858,7 @@ pub(crate) struct VfsRuntime {
     pub(crate) root_cowfs: Option<
         Rc<cowfs::CowFs<crate::cowfs_bridge::JsCowfsStore, crate::cowfs_bridge::JsCowfsStore>>,
     >,
+    pub(crate) root_dirty_guard: Option<crate::cowfs_bridge::DirtyFlushGuard>,
     pub(crate) mounted_root: Option<crate::boot_stage::MountedRootInfo>,
     pub(crate) boot_profile: crate::boot_stage::BootProfile,
     pub(crate) boot_stage: crate::boot_stage::BootStage,
@@ -1879,6 +1878,10 @@ pub(crate) struct VfsRuntime {
     pub(crate) console_shell: Option<String>,
     pub(crate) usr_fs_id: FsId,
     pub(crate) usr_blob_paths: HashMap<u64, String>,
+    /// Verified SHA-256 digests of trusted supervisor binaries (`/usr/bin/init`, `/usr/bin/supervise`)
+    /// from the active verified Release v2 `Kind::Base` system image (used when `/usr` executes via
+    /// local verified OPFS bytes instead of HTTP build-asset URLs).
+    pub(crate) trusted_supervisor_digests: HashMap<String, String>,
     pub(crate) sessions: HashMap<String, SessionVfs>,
     pub(crate) guest_page: Option<SessionVfs>,
     pub(crate) active_session_id: Option<String>,
@@ -2032,17 +2035,15 @@ async fn construct_vfs(
         .and_then(|o| o.build_asset_sizes)
         .unwrap_or_else(default_asset_sizes);
     let blob_store = crate::release_v2::VerifiedAssetBlobStore;
-    let has_composition = opts.as_ref().is_some_and(|o| {
-        o.system_composition.is_some() || o.base_image.is_some()
-    });
+    let has_composition = opts
+        .as_ref()
+        .is_some_and(|o| o.system_composition.is_some() || o.base_image.is_some());
     let usr_image = if let Some(base_json) = opts.as_ref().and_then(|o| o.base_image.as_ref()) {
         let base_img = image::Image::parse(base_json.as_bytes()).map_err(|_| Errno::EINVAL)?;
         let mut ext_imgs = Vec::new();
         if let Some(o) = opts.as_ref() {
             for ext_json in &o.extension_images {
-                ext_imgs.push(
-                    image::Image::parse(ext_json.as_bytes()).map_err(|_| Errno::EINVAL)?,
-                );
+                ext_imgs.push(image::Image::parse(ext_json.as_bytes()).map_err(|_| Errno::EINVAL)?);
             }
         }
         let entries = crate::release_v2::compose_system_image_entries(&base_img, &ext_imgs)
@@ -2277,7 +2278,15 @@ async fn construct_vfs(
         }
     }
 
-    Ok((vfs, dev_fs, dev_pts, vblk, stage1_fs_weak, usr_fs_id, usr_blob_paths))
+    Ok((
+        vfs,
+        dev_fs,
+        dev_pts,
+        vblk,
+        stage1_fs_weak,
+        usr_fs_id,
+        usr_blob_paths,
+    ))
 }
 
 impl VfsRuntime {
@@ -2306,13 +2315,14 @@ impl VfsRuntime {
             .expect("initial boot_vfs must resolve synchronously")
             .expect("initial boot_vfs must succeed");
         let mut proc_meta = HashMap::new();
-        let mut init_meta = ProcessVfsMeta::new(None, false);
+        let mut init_meta = ProcessVfsMeta::with_cred(None, false, Cred::root());
         init_meta.supervisor = true;
         proc_meta.insert(INIT, init_meta);
         Self {
             vfs,
             cloud_mount,
             root_cowfs: None,
+            root_dirty_guard: None,
             mounted_root: None,
             boot_profile: crate::boot_stage::BootProfile::default(),
             boot_stage: crate::boot_stage::BootStage::Stage1,
@@ -2332,6 +2342,7 @@ impl VfsRuntime {
             console_shell: None,
             usr_fs_id,
             usr_blob_paths,
+            trusted_supervisor_digests: HashMap::new(),
             sessions: HashMap::new(),
             guest_page: None,
             active_session_id: None,
@@ -2472,16 +2483,38 @@ impl Kernel {
                 rt.usr_blob_paths.clone(),
             )
         };
+        // Fast path for unsigned dev build assets (`!usr_blob_paths.is_empty()`): avoid probing
+        // the binary's 256-byte Wasm magic header over HTTP via `imageBlobRead` before `loader.js`
+        // fetches the asset URL, which would double-fetch and hide HTTP error JSON bodies.
+        // Verified Release v2 compositions leave `usr_blob_paths` empty and always take the
+        // chunk-verified `resolve_exec` + OPFS path below.
+        if !usr_blob_paths.is_empty() {
+            let st_res = self
+                .with_proc_scope(INIT, vfs.statat(INIT, StartAnchor::Root, init_path, true))
+                .await;
+            let usr_st_res = self
+                .with_proc_scope(INIT, vfs.statat(INIT, StartAnchor::Root, "/usr", true))
+                .await;
+            let fs_res = self
+                .with_proc_scope(INIT, vfs.statfs(INIT, StartAnchor::Root, init_path))
+                .await;
+            if let (Ok(st), Ok(usr_st), Ok(sfs)) = (st_res, usr_st_res, fs_res)
+                && st.dev == usr_st.dev
+                && st.kind() == abi::S_IFREG
+                && (st.mode & 0o111) != 0
+                && (sfs.flags & abi::contract::statfs_flags::ST_NOEXEC) == 0
+                && let Some(asset_url) = usr_blob_paths.get(&st.ino).cloned()
+            {
+                return Ok(json!({
+                    "asset": asset_url,
+                    "path": init_path,
+                }));
+            }
+        }
         let resolved = self
             .with_proc_scope(
                 INIT,
-                vfs.resolve_exec(
-                    INIT,
-                    init_path,
-                    vec![init_path.to_string()],
-                    None,
-                    false,
-                ),
+                vfs.resolve_exec(INIT, init_path, vec![init_path.to_string()], None, false),
             )
             .await?;
         if resolved.entry.handle.fs == usr_fs_id
@@ -2527,12 +2560,15 @@ impl Kernel {
         drain_releases(&vfs);
         let digest = image::digest(&bytes);
         let actual_size = bytes.len() as u64;
-        let ticket = self.vfs_rt.borrow_mut().alloc_exec_ticket(CachedExecTicket {
-            session_id: None,
-            bytes: Some(bytes),
-            mount_id,
-            provider,
-        })?;
+        let ticket = self
+            .vfs_rt
+            .borrow_mut()
+            .alloc_exec_ticket(CachedExecTicket {
+                session_id: None,
+                bytes: Some(bytes),
+                mount_id,
+                provider,
+            })?;
         let local = json!({
             "digest": digest,
             "size": actual_size,
@@ -3157,10 +3193,11 @@ impl Kernel {
             rt.stage1_reclaimed_entries = 0;
             rt.usr_fs_id = usr_fs_id;
             rt.usr_blob_paths = usr_blob_paths;
+            rt.trusted_supervisor_digests.clear();
             rt.active_session_id = None;
             rt.exec_tickets.clear();
             rt.proc_meta.clear();
-            let mut init_meta = ProcessVfsMeta::new(None, false);
+            let mut init_meta = ProcessVfsMeta::with_cred(None, false, Cred::root());
             init_meta.supervisor = true;
             rt.proc_meta.insert(INIT, init_meta);
             let mut old_sessions: Vec<_> = rt.sessions.drain().collect();
@@ -3212,7 +3249,11 @@ impl Kernel {
                 existing.gid = gid;
                 existing.groups = groups.iter().copied().collect();
                 existing.groups.insert(gid);
-                Some((existing.mnt_ns.borrow().id().0, existing.generation))
+                Some((
+                    existing.mnt_ns.borrow().id().0,
+                    existing.generation,
+                    Rc::clone(&existing.mnt_ns),
+                ))
             } else {
                 None
             };
@@ -3221,7 +3262,8 @@ impl Kernel {
             }
             ns_opt
         };
-        if let Some((ns_id, generation)) = existing_ns {
+        if let Some((ns_id, generation, existing_mnt_ns)) = existing_ns {
+            let _ = self.ensure_cloud_fs_mounted_on(&existing_mnt_ns).await;
             return json_to_js(&json!({ "nsId": ns_id, "generation": generation }));
         }
 
@@ -3268,6 +3310,8 @@ impl Kernel {
             .map_err(map_errno)?;
         }
 
+        let _ = self.ensure_cloud_fs_mounted_on(&sess_ns).await;
+
         let ns_id = sess_ns.borrow().id().0;
         let baseline_mounts = sess_ns.borrow().mounts().keys().copied().collect();
         let mut group_set: BTreeSet<u32> = groups.into_iter().collect();
@@ -3286,7 +3330,7 @@ impl Kernel {
                     uid,
                     gid,
                     groups: group_set,
-                    mnt_ns: sess_ns,
+                    mnt_ns: Rc::clone(&sess_ns),
                     baseline_mounts,
                     generation: 1,
                     user_mounts: BTreeMap::new(),
@@ -3297,6 +3341,8 @@ impl Kernel {
                 },
             );
         }
+        // Re-check in case `cloud_sign_in` finished while awaiting `session_end` above.
+        let _ = self.ensure_cloud_fs_mounted_on(&sess_ns).await;
         emit_mounts_changed(&session_id, 1);
         json_to_js(&json!({ "nsId": ns_id, "generation": 1u64 }))
     }
@@ -4244,7 +4290,8 @@ impl Kernel {
                 "noexec": flags.noexec,
                 "ownerUid": owner_uid,
                 "baseline": baseline_mounts.contains(&MountId(mid))
-                    || (um.is_none() && matches!(target.as_str(), "/dev/present" | "/dev/snd")),
+                    || (um.is_none()
+                        && matches!(target.as_str(), "/dev/present" | "/dev/snd" | "/mnt/cloud")),
                 "userMount": um.is_some() || owner_uid.is_some(),
                 "kind": um.map(|u| u.kind.as_str()).unwrap_or(fstype),
                 "name": um.map(|u| u.name.as_str()).unwrap_or(""),
@@ -5089,10 +5136,11 @@ impl Kernel {
             .unwrap_or(cred);
         {
             let mut rt = self.vfs_rt.borrow_mut();
-            rt.proc_meta.insert(
-                opts.pid,
-                ProcessVfsMeta::with_cred(resolved_sess, opts.cloud_access, live_cred),
-            );
+            let mut meta = ProcessVfsMeta::with_cred(resolved_sess, opts.cloud_access, live_cred);
+            if opts.pid == INIT {
+                meta.supervisor = true;
+            }
+            rt.proc_meta.insert(opts.pid, meta);
         }
         let ns_id = base_ns.borrow().id().0;
         json_to_js(&json!({ "pid": opts.pid, "nsId": ns_id }))
@@ -7032,10 +7080,8 @@ fn check_proc_device_allowlist(
         }
         return Err(Errno::EPERM);
     }
-    let is_dev_node = matches!(
-        meta.file_type,
-        FileType::CharDevice
-    ) || pin_fstype == Some(vfs::FsType::DevTmpFs);
+    let is_dev_node =
+        matches!(meta.file_type, FileType::CharDevice) || pin_fstype == Some(vfs::FsType::DevTmpFs);
     if !is_dev_node {
         return Ok(());
     }
@@ -7058,7 +7104,13 @@ fn check_proc_device_allowlist(
 
 async fn resolve_local_group_gid(vfs: &Vfs, group_spec: &str) -> vfs::Result<u32> {
     let (file, entry) = vfs
-        .open_file(crate::INIT, StartAnchor::Root, "/etc/group", abi::O_RDONLY, 0)
+        .open_file(
+            crate::INIT,
+            StartAnchor::Root,
+            "/etc/group",
+            abi::O_RDONLY,
+            0,
+        )
         .await?;
     let cap = usize::try_from(entry.metadata.size.min(4 * 1024 * 1024)).unwrap_or(0);
     let mut raw = vec![0u8; cap];
@@ -9572,9 +9624,7 @@ impl Kernel {
             } else {
                 serde_json::to_vec(&arg).map_err(|_| abi::Error::from(Errno::EINVAL))?
             };
-            let reply_bytes = vblk
-                .ioctl_fd(vfs, pid, raw_fd, request, &payload)
-                .await?;
+            let reply_bytes = vblk.ioctl_fd(vfs, pid, raw_fd, request, &payload).await?;
             let val: Value =
                 serde_json::from_slice(&reply_bytes).map_err(|_| abi::Error::from(Errno::EIO))?;
             return Ok(val);

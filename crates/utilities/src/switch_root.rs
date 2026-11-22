@@ -222,9 +222,11 @@ impl SwitchRootBackend for OsSwitchRootBackend {
                 abi::OS_FD_CWD as u32
             });
             let lookup_flags = if nofollow { 0 } else { 1 };
-            // WASI OFLAG_DIRECTORY = 2; rights: PATH_OPEN | FD_READDIR | PATH_FILESTAT_GET | PATH_UNLINK_FILE | PATH_REMOVE_DIRECTORY
+            // WASI OFLAG_DIRECTORY = 2; read-only directory rights (MUST NOT set RIGHT_FD_WRITE
+            // `1 << 6`, which causes `O_WRONLY`/`O_RDWR` on a directory -> `EISDIR`!).
             const WASI_OFLAG_DIRECTORY: u16 = 2;
-            const DIR_RIGHTS: u64 = 0x0fff_ffff;
+            const DIR_RIGHTS: u64 =
+                (1 << 1) | (1 << 13) | (1 << 14) | (1 << 18) | (1 << 21) | (1 << 25) | (1 << 26);
             let mut out_fd = 0u32;
             // SAFETY: `path` and `out_fd` live across the synchronous WASI host call.
             let rc = unsafe {

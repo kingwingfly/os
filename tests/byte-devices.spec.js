@@ -132,11 +132,12 @@ for (const name of ['zero', 'urandom']) test(`continuous ${name} reads remain in
   await page.goto('/');
   await kernel.ready();
   const poll = () => kernel.value('poll', { pids: [] });
+  const baselinePids = new Set((await poll()).map(p => p.pid));
   await page.locator('#command').fill(`sh -c 'cat /dev/${name} >/dev/null'`); await page.locator('#command').press('Enter');
   await expect.poll(async () => (await poll()).some(p => p.argv?.includes('/dev/' + name)), { timeout: 30_000 }).toBe(true);
   await page.locator('#command').press('Control+c');
   await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-  await expect.poll(async () => (await poll()).filter(p => p.pid !== 1).length).toBe(0);
+  await expect.poll(async () => (await poll()).filter(p => p.pid !== 1 && p.path !== '/usr/bin/init' && !baselinePids.has(p.pid)).length).toBe(0);
   await run(page, 'printf recovered'); await expect(last(page)).toHaveText('recovered');
 });
 

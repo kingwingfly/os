@@ -277,9 +277,10 @@ test('S-01, S-02 & S-06: local PID 1 init boots multi-user.target, enforces SO_P
   await page.goto(origin + '/');
   await page.waitForFunction(() => Boolean(window.os?.bootStatus && window.os?.exec));
 
-  // Wait for local PID 1 `/usr/bin/init` to reach `multi-user.target` and bind `/run/init/control.sock`.
+  // Wait for local PID 1 `/usr/bin/init` to reach `multi-user.target` and bind `/run/init/control.sock`
+  // AND prepare `/run/user/1000/manager.sock` (Codex #17).
   await expect.poll(
-    async () => (await execSh(page, 'test -S /run/init/control.sock && echo READY')).stdout.trim(),
+    async () => (await execSh(page, 'test -S /run/init/control.sock && test -S /run/user/1000/manager.sock && test -f /run/os/boot-healthy && echo READY')).stdout.trim(),
     { timeout: 25_000 },
   ).toBe('READY');
 
@@ -293,6 +294,20 @@ test('S-01, S-02 & S-06: local PID 1 init boots multi-user.target, enforces SO_P
   const unprivPoweroff = await execLocal(page, ['service', 'poweroff']);
   expect(unprivPoweroff.status).not.toBe(0);
   expect(unprivPoweroff.stderr).toMatch(/EPERM|Permission denied|Operation not permitted|not permitted|root/i);
+
+  // Codex #21: non-root `rebootMachine` rejects with EPERM BEFORE stopping PID 1 or closing root!
+  const nonRootReboot = await page.evaluate(async () => {
+    try {
+      await window.os.rebootMachine();
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, errno: e?.errno ?? e?.message ?? String(e) };
+    }
+  });
+  expect(nonRootReboot.ok).toBe(false);
+  expect(String(nonRootReboot.errno)).toMatch(/EPERM|Permission denied/i);
+  // PID 1 `/run/init/control.sock` MUST still be alive after rejected non-root reboot!
+  expect((await execLocal(page, ['service', 'list'])).status).toBe(0);
 
   // S-06: `ServiceGrant.user = "root"` from non-root fails `EPERM`.
   const pageKernel = await hookPageKernel(page);
@@ -333,16 +348,22 @@ test('S-09: retired /api/sys OS-account calls fail closed with ENOSYS and legacy
   }
 
   // Explicit `/api/cloud-auth/login` + `/api/cloud-auth/status` + `/api/cloud-auth/logout` work cleanly!
+  // Codex #23: `/api/cloud-auth/login` MUST return numeric `uid`, `gid`, and `groups`.
   const loginRes = await cloudAuth(request, 'login', {
     headers: { 'CF-Connecting-IP': 's09-' + randomUUID() },
     data: { username: 'root', password: rootPassword },
   });
   expect(loginRes.ok(), await loginRes.text()).toBe(true);
+  const loginJson = await loginRes.json();
+  expect(typeof loginJson.uid).toBe('number');
+  expect(loginJson.uid).toBe(0);
+  expect(typeof loginJson.gid).toBe('number');
   const statusRes = await cloudAuth(request, 'status');
   expect(statusRes.ok()).toBe(true);
   const statusJson = await statusRes.json();
   expect(statusJson.signed_in).toBe(true);
   expect(statusJson.cloud_user).toBe('root');
+  expect(statusJson.uid).toBe(0);
   const logoutRes = await cloudAuth(request, 'logout');
   expect(logoutRes.ok()).toBe(true);
 

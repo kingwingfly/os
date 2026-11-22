@@ -238,7 +238,7 @@ async function waitForPid1BootHealthyAndMark(runId) {
   while (Date.now() < deadline) {
     if (runId !== localInitRunId || localInitAbort || !localInitRunning || !kernel) return;
     try {
-      await kernel.proc_statat(1, 0x7ffffffe, '/run/os/boot-healthy', true);
+      await kernel.proc_statat(1, 0x7ffffffd, '/run/os/boot-healthy', true);
       if (runId !== localInitRunId || localInitAbort || !localInitRunning) return;
       if (bootedOfflineReleaseId !== targetReleaseId || bootHealthMarked) return;
       const { createOfflineInstaller } = await import(asset('/offline-installer.js'));

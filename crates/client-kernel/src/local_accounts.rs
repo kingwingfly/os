@@ -2221,6 +2221,7 @@ mod tests {
                 remote_attached: false,
                 host_epoch: 0,
                 pending_revocations: Vec::new(),
+                pending_detach: false,
                 attached_devices: BTreeMap::new(),
                 init_state: Init::new("boot-1".into(), now),
                 login_session: LoginSession::new(
@@ -2233,7 +2234,6 @@ mod tests {
                 seat_policies: BTreeMap::new(),
                 boot_seq: 1,
                 session_seq: 1,
-                init_wait_grace_until_ms: BTreeMap::new(),
             }));
             let cloud_mount = Rc::new(CloudMountDriver::new(
                 Rc::clone(&state),

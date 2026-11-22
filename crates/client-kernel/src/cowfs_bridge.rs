@@ -1813,7 +1813,7 @@ pub async fn open_for_boot_stores_detailed<
 /// - On subsequent boot (`volume_uuid == Some(uuid)`): acquires the writer lease / `ForkOnBusy`
 ///   fork FIRST and verifies THAT EXACT head via `cowfs::fsck::verify_head` before exposing `fs`
 ///   (closing cleanly and returning `EIO` if corrupt, or `EPROTONOSUPPORT` on format mismatch).
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub async fn open_for_boot_stores<
     H: HeadStore + 'static,
     P: PackStore + 'static,
