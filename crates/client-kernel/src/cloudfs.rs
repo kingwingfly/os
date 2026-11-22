@@ -625,21 +625,87 @@ impl CloudMountDriver {
         .await
     }
 
+    /// Verify that the currently active `CloudSession` is live, unrevoked, and still bound to the
+    /// active local account `(state.account.uid, state.account_epoch)`. When `expected` is
+    /// provided (post-await recheck), also verify that `(cloud_uid, local_uid, login_generation)`
+    /// did not change across the `.await`.
+    fn verify_cloud_session_binding(
+        &self,
+        expected: Option<(u32, u32, u64)>,
+    ) -> vfs::Result<crate::CloudSession> {
+        let st = self.state.borrow();
+        let session = st.cloud_session.as_ref().ok_or(Errno::ENOTCONN)?;
+        if session.revoked {
+            return Err(Errno::EACCES);
+        }
+        if session.local_uid != st.account.uid || session.login_generation != st.account_epoch {
+            return Err(Errno::EACCES);
+        }
+        if let Some((exp_cloud_uid, exp_local_uid, exp_gen)) = expected
+            && (session.cloud_uid != exp_cloud_uid
+                || session.local_uid != exp_local_uid
+                || session.login_generation != exp_gen)
+        {
+            return Err(Errno::EACCES);
+        }
+        Ok(session.clone())
+    }
+
+    /// Re-verify process cloud authorization + active `CloudSession` binding after an `.await`
+    /// (`lazy_mint_remote_cred` or `connector.get`).
+    fn recheck_proc_cloud_access(
+        &self,
+        pid: u32,
+        expected_binding: (u32, u32, u64),
+        expected_token: &str,
+    ) -> vfs::Result<()> {
+        self.verify_cloud_session_binding(Some(expected_binding))?;
+        if self.is_pid_cloud_denied(pid) {
+            return Err(Errno::EACCES);
+        }
+        let st = self.state.borrow();
+        let proc = st
+            .table
+            .proc(pid)
+            .filter(|p| p.state != ProcState::Zombie)
+            .ok_or(Errno::EACCES)?;
+        if !proc.cred.cloud_access {
+            return Err(Errno::EACCES);
+        }
+        let rem = proc.cred.remote.as_ref().ok_or(Errno::EACCES)?;
+        if !rem.cloud_access || rem.token != expected_token {
+            return Err(Errno::EACCES);
+        }
+        Ok(())
+    }
+
+    /// Re-verify page-scoped cloud session binding and token stability after an `.await`.
+    fn recheck_page_cloud_access(
+        &self,
+        expected_binding: (u32, u32, u64),
+        expected_token: &str,
+    ) -> vfs::Result<()> {
+        let post = self.verify_cloud_session_binding(Some(expected_binding))?;
+        if post.page_token.is_empty() || post.page_token != expected_token {
+            return Err(Errno::EACCES);
+        }
+        Ok(())
+    }
+
     /// Resolve the active `CloudFs` connection and remote `Actor` + remote `Cred`.
     /// - Signed out of Cloud -> `Err(Errno::ENOTCONN)` with ZERO network RPCs.
+    /// - Local user / login generation mismatch or revoked session -> `Err(Errno::EACCES)` with
+    ///   ZERO network RPCs, AND rechecked after every asynchronous credential / connect `.await`!
     /// - Process without `cloud_access` or after privilege drop -> `Err(Errno::EACCES)` with ZERO RPCs.
     /// - Local `uid 0` / `sudo` NEVER synthesizes remote root: always acts strictly with the
     ///   signed-in cloud user's own non-elevated `ServiceAuth v2` token!
     async fn resolve_cloud(&self, cred: &Cred) -> vfs::Result<(Rc<Cloud>, Actor, Cred)> {
-        let session = self
-            .state
-            .borrow()
-            .cloud_session
-            .clone()
-            .ok_or(Errno::ENOTCONN)?;
-        if session.revoked {
-            return Err(Errno::EACCES);
-        }
+        let session = self.verify_cloud_session_binding(None)?;
+        let binding = (
+            session.cloud_uid,
+            session.local_uid,
+            session.login_generation,
+        );
         let proc_pid = self.active_pid.get().filter(|&p| p < SCOPED_PAGE_PID_BASE);
 
         if let Some(pid) = proc_pid {
@@ -664,6 +730,17 @@ impl CloudMountDriver {
                     let minted = crate::lazy_mint_remote_cred(&self.state, pid)
                         .await
                         .map_err(|e| e.errno)?;
+                    // Recheck `(local_uid, login_generation, !revoked)` and process state after
+                    // awaiting `lazy_mint_remote_cred` so a mid-await local user switch or
+                    // revocation is rejected immediately!
+                    if let Err(err) = self.recheck_proc_cloud_access(pid, binding, &minted.token) {
+                        self.state
+                            .borrow_mut()
+                            .table
+                            .drop_revoked_remote_token(&minted.token);
+                        crate::revoke_remote_tokens_state(&self.state, vec![minted.token]).await;
+                        return Err(err);
+                    }
                     if let Some(hook) = self.on_lazy_mint.borrow().clone() {
                         hook(pid);
                     }
@@ -681,6 +758,8 @@ impl CloudMountDriver {
                         .get(&self.state, &self.current, rem.uid, &rem.token),
                 )
                 .await?;
+            // Recheck cloud session binding and process state after awaiting `connector.get`.
+            self.recheck_proc_cloud_access(pid, binding, &rem.token)?;
             let remote_cred = Cred {
                 identity: Identity {
                     id: rem.uid,
@@ -694,7 +773,8 @@ impl CloudMountDriver {
         }
 
         // Page-scoped access: uses the signed-in CloudSession's non-elevated `ServiceAuth v2`
-        // page token (NEVER elevates to remote root!).
+        // page token bound to `(state.account.uid, state.account_epoch)` (NEVER elevates to remote
+        // root, and rejects stale sessions after a local user switch!).
         let token = session.page_token.clone();
         if token.is_empty() {
             return Err(Errno::ENOTCONN);
@@ -707,6 +787,9 @@ impl CloudMountDriver {
                     .get(&self.state, &self.current, session.cloud_uid, &token),
             )
             .await?;
+        // Recheck `(local_uid, login_generation, !revoked, page_token)` after awaiting
+        // `connector.get` so a mid-await local user switch or logout rejects immediately!
+        self.recheck_page_cloud_access(binding, &token)?;
         let remote_cred = Cred {
             identity: Identity {
                 id: session.cloud_uid,
@@ -784,8 +867,24 @@ impl CloudMountDriver {
         let opens = self.opens.borrow();
         let rec = opens.get(&open.id).ok_or(Errno::EBADF)?;
         let actor = match self.active_pid.get().filter(|&p| p < SCOPED_PAGE_PID_BASE) {
-            Some(pid) => Actor::Process(pid),
-            None => rec.actor.clone(),
+            Some(pid) => {
+                if self.is_pid_cloud_denied(pid) {
+                    return Err(Errno::EACCES);
+                }
+                Actor::Process(pid)
+            }
+            None => {
+                let cs = self.verify_cloud_session_binding(None)?;
+                if cs.cloud_uid != rec.cloud.session_uid || cs.page_token.is_empty() {
+                    return Err(Errno::EACCES);
+                }
+                if let Actor::Ephemeral(ref tok) = rec.actor
+                    && cs.page_token != *tok
+                {
+                    return Err(Errno::EACCES);
+                }
+                rec.actor.clone()
+            }
         };
         Ok((Rc::clone(&rec.cloud), rec.real.clone(), actor))
     }
@@ -1327,5 +1426,229 @@ impl Kernel {
             },
         }
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CloudSession, LocalAccount};
+    use abi::auth_v2::RemoteScope;
+    use abi::contract::InstanceIdentity;
+    use kernel::init::Init;
+    use kernel::login::Session as LoginSession;
+    use kernel::proc_table::{LocalCred, LocalProcessTable, RemoteCredRef, SpawnSpec};
+    use std::collections::BTreeMap;
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn noop_waker() -> Waker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        unsafe fn wake(_: *const ()) {}
+        unsafe fn wake_by_ref(_: *const ()) {}
+        unsafe fn drop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    fn make_test_state_and_driver(id: &str) -> (Rc<RefCell<State>>, CloudMountDriver) {
+        let now = 1_700_000_000;
+        let mut table = LocalProcessTable::new(
+            InstanceIdentity {
+                instance: id.into(),
+                host: "browser".into(),
+            },
+            now,
+        );
+        let _ = table.boot_init("boot", now);
+        let account = LocalAccount::default();
+        let state = Rc::new(RefCell::new(State {
+            instance_id: id.into(),
+            host_proof: "proof".into(),
+            boot: "boot-1".into(),
+            namespace: id.into(),
+            table,
+            account: account.clone(),
+            account_epoch: 1,
+            proc_account_epoch: HashMap::new(),
+            cloud_session: None,
+            sudo_timestamps: BTreeMap::new(),
+            remote_attached: false,
+            host_epoch: 0,
+            pending_revocations: Vec::new(),
+            attached_devices: BTreeMap::new(),
+            init_state: Init::new("boot-1".into(), now),
+            login_session: LoginSession::new(format!("{id}:s1"), account.uid, now + 86_400, now),
+            login_profiles: BTreeMap::new(),
+            seat_policies: BTreeMap::new(),
+            boot_seq: 1,
+            session_seq: 1,
+            init_wait_grace_until_ms: BTreeMap::new(),
+        }));
+        let driver = CloudMountDriver::new(
+            Rc::clone(&state),
+            Rc::default(),
+            Connector::default(),
+            Rc::new(Cell::new(None)),
+            Rc::new(Cell::new(false)),
+        );
+        (state, driver)
+    }
+
+    fn make_session(local_uid: u32, login_generation: u64, token: &str) -> CloudSession {
+        CloudSession {
+            cloud_user: "cloud-alice".into(),
+            cloud_uid: 2001,
+            cloud_gid: 2001,
+            cloud_groups: vec![2001],
+            local_uid,
+            login_generation,
+            scope: RemoteScope::full(),
+            page_token: token.into(),
+            signed_in_at: 100,
+            revoked: false,
+        }
+    }
+
+    #[test]
+    fn page_resolve_cloud_rejects_local_user_switch_stale_generation_and_revocation() {
+        let (state, driver) = make_test_state_and_driver("inst-cloud-1");
+        let cred = Cred::root();
+
+        // 1. Signed out -> ENOTCONN.
+        assert_eq!(
+            block_on(driver.resolve_cloud(&cred)).err(),
+            Some(Errno::ENOTCONN)
+        );
+
+        // 2. User A (uid 1000, epoch 1) signs into Cloud.
+        let epoch1 = state.borrow().account_epoch;
+        state.borrow_mut().cloud_session = Some(make_session(1000, epoch1, "tok-alice"));
+        assert!(driver.verify_cloud_session_binding(None).is_ok());
+
+        // 3. Page switches local user from A (1000) to B (1001) via sync_account.
+        state.borrow_mut().sync_account(LocalAccount {
+            uid: 1001,
+            gid: 1001,
+            groups: vec![1001],
+            user: "bob".into(),
+            group: "bob".into(),
+            home: "/home/bob".into(),
+            shell: "/bin/sh".into(),
+            signed_in: true,
+        });
+        assert!(state.borrow().account_epoch > epoch1);
+        // Page-scoped `/mnt/cloud` MUST reject user A's stale CloudSession with EACCES!
+        assert_eq!(
+            block_on(driver.resolve_cloud(&cred)).err(),
+            Some(Errno::EACCES)
+        );
+
+        // 4. Even if the page switches BACK to user A (uid 1000), `account_epoch` advanced so the
+        //    old CloudSession bound to `epoch1` is STILL rejected!
+        state.borrow_mut().sync_account(LocalAccount::default());
+        assert_eq!(state.borrow().account.uid, 1000);
+        assert!(state.borrow().account_epoch > epoch1);
+        assert_eq!(
+            block_on(driver.resolve_cloud(&cred)).err(),
+            Some(Errno::EACCES)
+        );
+
+        // 5. Re-binding a fresh CloudSession to the new epoch succeeds until revoked.
+        let epoch3 = state.borrow().account_epoch;
+        state.borrow_mut().cloud_session = Some(make_session(1000, epoch3, "tok-alice-2"));
+        assert!(driver.verify_cloud_session_binding(None).is_ok());
+        state.borrow_mut().cloud_session.as_mut().unwrap().revoked = true;
+        assert_eq!(
+            block_on(driver.resolve_cloud(&cred)).err(),
+            Some(Errno::EACCES)
+        );
+    }
+
+    #[test]
+    fn post_await_rechecks_reject_mid_await_user_switch_for_page_and_process() {
+        let (state, driver) = make_test_state_and_driver("inst-cloud-2");
+        let epoch1 = state.borrow().account_epoch;
+        state.borrow_mut().cloud_session = Some(make_session(1000, epoch1, "tok-page-1"));
+        let binding = (2001, 1000, epoch1);
+
+        // Spawn a real process owned by uid 1000 with an active remote cred.
+        let proc_token = "tok-proc-1".to_string();
+        let pid = {
+            let mut st = state.borrow_mut();
+            let mut cred = LocalCred::local_only(st.account.identity(), 0o022);
+            cred.cloud_access = true;
+            cred.remote = Some(RemoteCredRef {
+                token: proc_token.clone(),
+                uid: 2001,
+                gid: 2001,
+                groups: vec![2001],
+                instance_id: st.instance_id.clone(),
+                lineage: "lin-1".into(),
+                cloud_access: true,
+                scope: RemoteScope::full(),
+            });
+            st.table
+                .spawn(SpawnSpec::new("/bin/sh", cred, "browser"), 100)
+                .unwrap()
+                .pid
+        };
+
+        // While suspended on connector.get (connector.0.busy == true), verify resolve_cloud passes
+        // the pre-await check and yields Pending.
+        driver.connector.0.busy.set(true);
+        let cred = Cred::root();
+        let mut fut = Box::pin(driver.resolve_cloud(&cred));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        drop(fut);
+        driver.connector.0.busy.set(false);
+
+        // Before switching users, both page and process post-await rechecks pass.
+        assert!(
+            driver
+                .recheck_page_cloud_access(binding, "tok-page-1")
+                .is_ok()
+        );
+        assert!(
+            driver
+                .recheck_proc_cloud_access(pid, binding, &proc_token)
+                .is_ok()
+        );
+
+        // Simulate a local user switch happening mid-await!
+        state.borrow_mut().sync_account(LocalAccount {
+            uid: 1001,
+            gid: 1001,
+            groups: vec![1001],
+            user: "bob".into(),
+            group: "bob".into(),
+            home: "/home/bob".into(),
+            shell: "/bin/sh".into(),
+            signed_in: true,
+        });
+
+        // Both page-scoped and process-scoped post-await rechecks MUST fail closed with EACCES!
+        assert_eq!(
+            driver.recheck_page_cloud_access(binding, "tok-page-1"),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(
+            driver.recheck_proc_cloud_access(pid, binding, &proc_token),
+            Err(Errno::EACCES)
+        );
     }
 }
