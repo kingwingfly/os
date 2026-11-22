@@ -11,23 +11,68 @@ pub const GUEST_COOKIE: &str = "os_guest";
 pub const LEGACY_COOKIE: &str = "terminal_session";
 pub const LEGACY_GUEST_COOKIE: &str = "terminal_guest";
 pub const TTL: u64 = 8 * 60 * 60;
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(inline_js = "
 export function randomToken() { const bytes=crypto.getRandomValues(new Uint8Array(32)); return Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join(''); }
-export async function passwordKdf(password,salt) { const e=new TextEncoder(); const key=await crypto.subtle.importKey('raw',e.encode(password),'PBKDF2',false,['deriveBits']); const hash=await crypto.subtle.deriveBits({name:'PBKDF2',salt:e.encode(salt),iterations:100000,hash:'SHA-256'},key,256); return Array.from(new Uint8Array(hash),b=>b.toString(16).padStart(2,'0')).join(''); }
 ")]
 extern "C" {
     #[wasm_bindgen(js_name=randomToken)]
-    pub fn random_token() -> String;
+    fn random_token_js() -> String;
+}
+#[wasm_bindgen(inline_js = "
+export async function passwordKdf(password,salt) { const e=new TextEncoder(); const key=await crypto.subtle.importKey('raw',e.encode(password),'PBKDF2',false,['deriveBits']); const hash=await crypto.subtle.deriveBits({name:'PBKDF2',salt:e.encode(salt),iterations:100000,hash:'SHA-256'},key,256); return Array.from(new Uint8Array(hash),b=>b.toString(16).padStart(2,'0')).join(''); }
+")]
+extern "C" {
     #[wasm_bindgen(catch,js_name=passwordKdf)]
     async fn password_kdf(password: &str, salt: &str) -> std::result::Result<JsValue, JsValue>;
 }
+pub fn random_token() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        random_token_js()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut h = Sha256::new();
+        h.update(n.to_le_bytes());
+        h.update(now_ns.to_le_bytes());
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
 pub fn now() -> u64 {
-    Date::now().as_millis() / 1000
+    #[cfg(target_arch = "wasm32")]
+    {
+        Date::now().as_millis() / 1000
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(1_700_000_000)
+    }
 }
 /// Seconds since 1970 and nanoseconds past them, to the millisecond the clock gives.
 pub fn clock() -> (u64, u32) {
-    let ms = Date::now().as_millis();
-    (ms / 1000, (ms % 1000) as u32 * 1_000_000)
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ms = Date::now().as_millis();
+        (ms / 1000, (ms % 1000) as u32 * 1_000_000)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let dur = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        (dur.as_secs(), dur.subsec_nanos())
+    }
 }
 /// The token of the cookie `name` the request carries, if it is one (64 hexadecimal digits).
 fn raw_cookie(req: &Request, name: &str) -> Option<String> {
@@ -185,9 +230,27 @@ pub fn issue(c: &mut impl Store, key: Option<&str>, uid: u32) -> (Value, String)
             sudo_until: 0,
         },
     );
-    let home = c.user_by_id(uid).map(|(_, u)| u.home).unwrap_or_default();
+    let (who, home) = match c.user_by_id(uid) {
+        Some((_, u)) => (Identity::of(&u), u.home),
+        None => (
+            Identity {
+                id: uid,
+                group: uid,
+                groups: [uid].into(),
+            },
+            String::new(),
+        ),
+    };
+    let groups: Vec<u32> = who.groups.iter().copied().collect();
     (
-        json!({"writable":true,"username":c.username(uid),"home":home}),
+        json!({
+            "writable": true,
+            "username": c.username(uid),
+            "uid": uid,
+            "gid": who.group,
+            "groups": groups,
+            "home": home,
+        }),
         token,
     )
 }
@@ -233,4 +296,148 @@ pub async fn limited_by(req: &Request, env: &Env, binding: &str, action: &str) -
         .limit(format!("{action}:{ip}"))
         .await?
         .success)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use os_core::permissions::{Id, Node};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[derive(Default)]
+    struct MockStore {
+        users: BTreeMap<String, User>,
+        groups: BTreeMap<String, u32>,
+        sessions: BTreeMap<String, Session>,
+        next_uid: u32,
+        next_gid: u32,
+    }
+
+    impl Store for MockStore {
+        fn node(&self, _path: &str) -> Option<Node> {
+            None
+        }
+        fn children(&self, _path: &str) -> Vec<(String, Node)> {
+            Vec::new()
+        }
+        fn subtree(&self, _path: &str) -> Vec<(String, Node)> {
+            Vec::new()
+        }
+        fn set_node(&mut self, _path: &str, _node: &Node) {}
+        fn delete_node(&mut self, _path: &str) {}
+        fn xattrs(&self, _ino: u64) -> BTreeMap<String, Vec<u8>> {
+            BTreeMap::new()
+        }
+        fn set_xattrs(&mut self, _ino: u64, _attrs: &BTreeMap<String, Vec<u8>>) {}
+        fn user(&self, name: &str) -> Option<User> {
+            self.users.get(name).cloned()
+        }
+        fn user_by_id(&self, id: u32) -> Option<(String, User)> {
+            self.users
+                .iter()
+                .find(|(_, u)| u.id == id)
+                .map(|(n, u)| (n.clone(), u.clone()))
+        }
+        fn users(&self) -> Vec<(String, User)> {
+            self.users
+                .iter()
+                .map(|(n, u)| (n.clone(), u.clone()))
+                .collect()
+        }
+        fn set_user(&mut self, name: &str, user: &User) {
+            self.users.insert(name.to_owned(), user.clone());
+        }
+        fn delete_user(&mut self, name: &str) {
+            self.users.remove(name);
+        }
+        fn group(&self, name: &str) -> Option<u32> {
+            self.groups.get(name).copied()
+        }
+        fn group_name(&self, id: u32) -> Option<String> {
+            self.groups
+                .iter()
+                .find(|(_, g)| **g == id)
+                .map(|(n, _)| n.clone())
+        }
+        fn groups(&self) -> Vec<(String, u32)> {
+            self.groups.iter().map(|(n, g)| (n.clone(), *g)).collect()
+        }
+        fn set_group(&mut self, name: &str, id: u32) {
+            self.groups.insert(name.to_owned(), id);
+        }
+        fn delete_group(&mut self, name: &str) {
+            self.groups.remove(name);
+        }
+        fn session(&self, key: &str) -> Option<Session> {
+            self.sessions.get(key).cloned()
+        }
+        fn set_session(&mut self, key: &str, session: &Session) {
+            self.sessions.insert(key.to_owned(), session.clone());
+        }
+        fn delete_session(&mut self, key: &str) {
+            self.sessions.remove(key);
+        }
+        fn delete_sessions(&mut self, user: u32) {
+            self.sessions.retain(|_, s| s.user != user);
+        }
+        fn delete_expired_sessions(&mut self, ts: u64) {
+            self.sessions.retain(|_, s| s.expires > ts);
+        }
+        fn next_id(&mut self, kind: Id) -> u32 {
+            match kind {
+                Id::User => {
+                    self.next_uid += 1;
+                    self.next_uid
+                }
+                Id::Group => {
+                    self.next_gid += 1;
+                    self.next_gid
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issue_includes_numeric_uid_gid_and_groups_and_replaces_session() {
+        let mut store = MockStore::default();
+        store.set_group("alice", 1005);
+        store.set_group("wheel", 10);
+        store.set_group("devs", 2000);
+        store.set_user(
+            "alice",
+            &User {
+                id: 1005,
+                group: 1005,
+                groups: BTreeSet::from([10, 2000]),
+                home: "/home/alice".into(),
+                locked: false,
+                salt: "salt".into(),
+                hash: "hash".into(),
+            },
+        );
+        store.set_session(
+            "old-key",
+            &Session {
+                user: 999,
+                expires: now() + 3600,
+                sudo_until: 0,
+            },
+        );
+
+        let (body, token) = issue(&mut store, Some("old-key"), 1005);
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(body["writable"], json!(true));
+        assert_eq!(body["username"], json!("alice"));
+        assert_eq!(body["uid"], json!(1005));
+        assert_eq!(body["gid"], json!(1005));
+        assert_eq!(body["groups"], json!([10, 1005, 2000]));
+        assert_eq!(body["home"], json!("/home/alice"));
+
+        assert!(store.session("old-key").is_none());
+        let stored = store.session(&token_hash(&token)).expect("new session");
+        assert_eq!(stored.user, 1005);
+        assert_eq!(stored.sudo_until, 0);
+        assert!(stored.expires > now());
+    }
 }

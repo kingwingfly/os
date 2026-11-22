@@ -80,6 +80,16 @@ root ALL=(ALL:ALL) ALL
 const RESERVED_GROUPS: &[&str] = &["root", "wheel", "nogroup"];
 const RESERVED_USERS: &[&str] = &["root", "nobody"];
 
+/// Protected system directories that `userdel -r` MUST NEVER remove even if referenced as a user's
+/// home directory in `/etc/passwd`.
+const PROTECTED_HOME_PATHS: &[&str] = &[
+    "/", "/home", "/root", "/etc", "/usr", "/var", "/tmp", "/run", "/dev", "/proc", "/sys", "/bin",
+    "/sbin", "/lib", "/lib64", "/mnt", "/opt", "/srv", "/boot", "/sysroot",
+];
+
+/// Default aging/expiry fields (fields 3..=9) for newly created `/etc/shadow` entries.
+pub const DEFAULT_SHADOW_EXTRA_FIELDS: &str = "0:0:99999:7:::";
+
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 type Result<T> = std::result::Result<T, Error>;
@@ -94,10 +104,24 @@ pub trait AccountFs {
     fn exists(&self, path: &str) -> bool;
     fn mkdir_p(&mut self, path: &str, mode: u16, uid: u32, gid: u32) -> Result<()>;
     fn remove_dir_all(&mut self, path: &str) -> Result<()>;
+
+    /// Validate that `path` is safe to recursively remove as `expected_uid`'s home directory
+    /// before `/etc/{passwd,group,shadow}` are mutated:
+    /// - must be a real directory (not a symlink or other file type),
+    /// - must be owned by `expected_uid`,
+    /// - must reside on the same filesystem (`st_dev`) as its parent (not a mountpoint).
+    fn validate_removable_home(&self, _path: &str, _expected_uid: u32) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Seed the default local `/etc/{passwd,group,shadow,sudoers}` files and standard home directories
 /// using exact Contract v2 modes (`0644`, `0644`, `0600`, `0440`).
+///
+/// **Provisioning-only invariant:** This function MUST ONLY be called when explicitly provisioning
+/// a brand-new root volume (e.g. fresh `CowFs` formatting or Stage 1 `MemFs` initialization).
+/// `LocalAccountStore` operations NEVER invoke `seed_default_etc` on missing files or transient
+/// read failures; live volumes fail closed instead of overwriting existing account files.
 pub fn seed_default_etc(fs: &mut dyn AccountFs) -> Result<()> {
     fs.mkdir_p("/etc", 0o755, 0, 0)?;
     fs.mkdir_p("/root", 0o700, 0, 0)?;
@@ -239,6 +263,9 @@ pub struct ShadowEntry {
     pub name: String,
     pub password_hash: String,
     pub locked: bool,
+    /// Verbatim remaining colon-delimited aging/expiry fields (`fields[2..].join(":")`),
+    /// preserved across rewrites (`passwd`, `usermod`, `useradd`, `userdel`).
+    pub extra_fields: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -542,28 +569,40 @@ pub fn parse_shadow(text: &str) -> Result<Vec<ShadowEntry>> {
         }
         let password_hash = fields[1].to_owned();
         let locked = is_locked_hash(&password_hash);
+        let extra_fields = if fields.len() > 2 {
+            fields[2..].join(":")
+        } else {
+            DEFAULT_SHADOW_EXTRA_FIELDS.to_owned()
+        };
         entries.push(ShadowEntry {
             name,
             password_hash,
             locked,
+            extra_fields,
         });
     }
     Ok(entries)
 }
 
-/// Format entries as canonical 9-field `/etc/shadow`.
+/// Format entries as `/etc/shadow`, preserving each record's untouched aging/expiry fields.
 pub fn format_shadow(entries: &[ShadowEntry]) -> Result<String> {
     let mut out = String::new();
     for entry in entries {
-        if !valid_etc_field(&entry.name) || !valid_etc_field(&entry.password_hash) {
+        if !valid_etc_field(&entry.name)
+            || !valid_etc_field(&entry.password_hash)
+            || entry
+                .extra_fields
+                .bytes()
+                .any(|b| matches!(b, b'\n' | b'\r' | b'\0'))
+        {
             return Err(Error::because(
                 Errno::EINVAL,
                 "shadow field contains forbidden delimiter or control byte",
             ));
         }
         out.push_str(&format!(
-            "{}:{}:0:0:99999:7:::\n",
-            entry.name, entry.password_hash
+            "{}:{}:{}\n",
+            entry.name, entry.password_hash, entry.extra_fields
         ));
     }
     Ok(out)
@@ -762,6 +801,20 @@ impl LocalAccountStore {
         sid: u32,
         now: u64,
     ) -> Result<SudoCheck> {
+        self.check_sudo_with_timestamps(fs, uid, groups, sid, now, &self.sudo_timestamps)
+    }
+
+    /// Evaluate `/etc/sudoers` against an explicit authoritative `(uid, sid) -> expiry` timestamp
+    /// table (used by `client-kernel` so every caller shares one single sudoers + session cache).
+    pub fn check_sudo_with_timestamps(
+        &self,
+        fs: &dyn AccountFs,
+        uid: u32,
+        groups: &[u32],
+        sid: u32,
+        now: u64,
+        timestamps: &BTreeMap<(u32, u32), u64>,
+    ) -> Result<SudoCheck> {
         if uid == 0 {
             return Ok(SudoCheck::AllowedNoPassword);
         }
@@ -798,8 +851,7 @@ impl LocalAccountStore {
             None => Ok(SudoCheck::Denied),
             Some(true) => Ok(SudoCheck::AllowedNoPassword),
             Some(false) => {
-                if self
-                    .sudo_timestamps
+                if timestamps
                     .get(&(uid, sid))
                     .is_some_and(|&expiry| expiry > now)
                 {
@@ -946,6 +998,7 @@ impl LocalAccountStore {
                 name: target_name.to_owned(),
                 password_hash: new_hash,
                 locked: false,
+                extra_fields: DEFAULT_SHADOW_EXTRA_FIELDS.to_owned(),
             });
         }
         let encoded = format_shadow(&shadows)?;
@@ -1091,6 +1144,7 @@ impl LocalAccountStore {
             name: req.name.clone(),
             locked: is_locked_hash(&password_hash),
             password_hash,
+            extra_fields: DEFAULT_SHADOW_EXTRA_FIELDS.to_owned(),
         });
 
         let group_text = if group_changed {
@@ -1364,6 +1418,34 @@ impl LocalAccountStore {
         let mut shadows = parse_shadow(&read_text(fs, SHADOW_PATH)?)?;
         shadows.retain(|s| s.name != name);
 
+        // Validate removable home BEFORE mutating `/etc/{passwd,group,shadow}` so shared homes,
+        // protected system directories, symlinks, mismatched ownership, or mountpoints fail closed
+        // without altering the account database or unlinking anything.
+        let mut should_remove_home = false;
+        if remove_home {
+            let clean_home = validate_abs_path(&removed.home, "home")?;
+            if PROTECTED_HOME_PATHS.contains(&clean_home.as_str()) {
+                return Err(Error::because(
+                    Errno::EPERM,
+                    format!("refusing to remove protected system path '{clean_home}'"),
+                ));
+            }
+            let home_prefix = format!("{clean_home}/");
+            if users
+                .iter()
+                .any(|u| u.home == clean_home || u.home.starts_with(&home_prefix))
+            {
+                return Err(Error::because(
+                    Errno::EBUSY,
+                    format!("refusing to remove shared home directory '{clean_home}'"),
+                ));
+            }
+            if fs.exists(&clean_home) {
+                fs.validate_removable_home(&clean_home, removed.uid)?;
+                should_remove_home = true;
+            }
+        }
+
         let passwd_text = format_passwd(&users)?;
         let group_text = format_group(&groups)?;
         let shadow_text = format_shadow(&shadows)?;
@@ -1373,12 +1455,7 @@ impl LocalAccountStore {
         atomic_write_etc(fs, GROUP_PATH, group_text.as_bytes(), GROUP_MODE)?;
         self.sudo_revoke_all_for_uid(removed.uid);
 
-        if remove_home
-            && removed.home != "/"
-            && removed.home != "/home"
-            && removed.home != "/root"
-            && fs.exists(&removed.home)
-        {
+        if should_remove_home {
             fs.remove_dir_all(&removed.home)?;
         }
         Ok(())
@@ -1649,5 +1726,489 @@ impl AccountFs for MemoryAccountFs {
         self.dirs
             .retain(|k, _| k != path && !k.starts_with(&prefix));
         Ok(())
+    }
+
+    fn validate_removable_home(&self, path: &str, expected_uid: u32) -> Result<()> {
+        if self.files.contains_key(path) {
+            return Err(Error::because(
+                Errno::ENOTDIR,
+                format!("refusing to remove non-directory home '{path}'"),
+            ));
+        }
+        if let Some(&(_, uid, _)) = self.dirs.get(path)
+            && uid != expected_uid
+        {
+            return Err(Error::because(
+                Errno::EPERM,
+                format!(
+                    "refusing to remove home '{path}' owned by uid {uid} (expected {expected_uid})"
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailingReadFs {
+        inner: MemoryAccountFs,
+        fail_path: String,
+        fail_errno: Errno,
+    }
+
+    impl AccountFs for FailingReadFs {
+        fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+            if path == self.fail_path {
+                return Err(Error::because(self.fail_errno, "injected read error"));
+            }
+            self.inner.read_file(path)
+        }
+
+        fn write_file(
+            &mut self,
+            path: &str,
+            data: &[u8],
+            mode: u16,
+            uid: u32,
+            gid: u32,
+        ) -> Result<()> {
+            self.inner.write_file(path, data, mode, uid, gid)
+        }
+
+        fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+
+        fn remove_file(&mut self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn exists(&self, path: &str) -> bool {
+            self.inner.exists(path)
+        }
+
+        fn mkdir_p(&mut self, path: &str, mode: u16, uid: u32, gid: u32) -> Result<()> {
+            self.inner.mkdir_p(path, mode, uid, gid)
+        }
+
+        fn remove_dir_all(&mut self, path: &str) -> Result<()> {
+            self.inner.remove_dir_all(path)
+        }
+
+        fn validate_removable_home(&self, path: &str, expected_uid: u32) -> Result<()> {
+            self.inner.validate_removable_home(path, expected_uid)
+        }
+    }
+
+    #[test]
+    fn transient_read_errors_propagate_without_seeding_or_overwriting_etc() {
+        let mut inner = MemoryAccountFs::seeded();
+        inner
+            .write_file(
+                GROUP_PATH,
+                b"root:x:0:\nwheel:x:10:user\nuser:x:1000:\ncustom:x:2000:user\n",
+                GROUP_MODE,
+                0,
+                0,
+            )
+            .unwrap();
+        let original_group = inner.read_file(GROUP_PATH).unwrap();
+        let original_shadow = inner.read_file(SHADOW_PATH).unwrap();
+        let original_sudoers = inner.read_file(SUDOERS_PATH).unwrap();
+
+        let mut fs = FailingReadFs {
+            inner,
+            fail_path: PASSWD_PATH.to_owned(),
+            fail_errno: Errno::EIO,
+        };
+        let mut store = LocalAccountStore::new();
+        let root = Identity::root();
+
+        assert_eq!(store.list_users(&fs).unwrap_err().errno, Errno::EIO);
+        assert_eq!(
+            store
+                .useradd(
+                    &mut fs,
+                    &root,
+                    UseraddReq {
+                        name: "alice".into(),
+                        ..Default::default()
+                    },
+                    [1; 16],
+                )
+                .unwrap_err()
+                .errno,
+            Errno::EIO
+        );
+        assert_eq!(
+            store
+                .passwd(
+                    &mut fs,
+                    &root,
+                    Some("user"),
+                    None,
+                    "strong-password-1234",
+                    false,
+                    [2; 16],
+                )
+                .unwrap_err()
+                .errno,
+            Errno::EIO
+        );
+        assert_eq!(
+            store.groupdel(&mut fs, &root, "custom").unwrap_err().errno,
+            Errno::EIO
+        );
+
+        // No file was overwritten or seeded with defaults!
+        assert_eq!(fs.inner.read_file(GROUP_PATH).unwrap(), original_group);
+        assert_eq!(fs.inner.read_file(SHADOW_PATH).unwrap(), original_shadow);
+        assert_eq!(fs.inner.read_file(SUDOERS_PATH).unwrap(), original_sudoers);
+    }
+
+    #[test]
+    fn userdel_remove_home_rejects_shared_system_and_mismatched_owner_before_mutating_etc() {
+        let mut fs = MemoryAccountFs::seeded();
+        let mut store = LocalAccountStore::new();
+        let root = Identity::root();
+
+        // 1. Shared home between two users (`alice` and `bob` share `/srv/shared`).
+        fs.mkdir_p("/srv/shared", 0o755, 1001, 1001).unwrap();
+        let alice = store
+            .useradd(
+                &mut fs,
+                &root,
+                UseraddReq {
+                    name: "alice".into(),
+                    home: Some("/srv/shared".into()),
+                    create_home: false,
+                    ..Default::default()
+                },
+                [1; 16],
+            )
+            .unwrap();
+        let _bob = store
+            .useradd(
+                &mut fs,
+                &root,
+                UseraddReq {
+                    name: "bob".into(),
+                    home: Some("/srv/shared".into()),
+                    create_home: false,
+                    ..Default::default()
+                },
+                [2; 16],
+            )
+            .unwrap();
+        let passwd_before = fs.read_file(PASSWD_PATH).unwrap();
+        assert_eq!(
+            store
+                .userdel(&mut fs, &root, "alice", true)
+                .unwrap_err()
+                .errno,
+            Errno::EBUSY
+        );
+        assert!(fs.exists("/srv/shared"));
+        assert_eq!(fs.read_file(PASSWD_PATH).unwrap(), passwd_before);
+
+        // 2. Nested user home inside deleted user's home (`/home/team` vs `/home/team/sub`).
+        fs.mkdir_p("/home/team/sub", 0o750, 1004, 1004).unwrap();
+        fs.dirs.insert("/home/team".into(), (0o750, 1003, 1003));
+        let _lead = store
+            .useradd(
+                &mut fs,
+                &root,
+                UseraddReq {
+                    name: "lead".into(),
+                    uid: Some(1003),
+                    home: Some("/home/team".into()),
+                    create_home: false,
+                    ..Default::default()
+                },
+                [3; 16],
+            )
+            .unwrap();
+        let _member = store
+            .useradd(
+                &mut fs,
+                &root,
+                UseraddReq {
+                    name: "member".into(),
+                    uid: Some(1004),
+                    home: Some("/home/team/sub".into()),
+                    create_home: false,
+                    ..Default::default()
+                },
+                [4; 16],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .userdel(&mut fs, &root, "lead", true)
+                .unwrap_err()
+                .errno,
+            Errno::EBUSY
+        );
+        assert!(fs.exists("/home/team/sub"));
+
+        // 3. Protected system paths MUST be rejected before mutating `/etc/*`.
+        for sys_path in [
+            "/", "/home", "/root", "/etc", "/usr", "/var", "/tmp", "/run", "/dev", "/proc", "/sys",
+            "/bin", "/sbin", "/lib", "/mnt", "/opt", "/srv",
+        ] {
+            let uname = format!("svc_{}", sys_path.trim_start_matches('/').replace('/', "_"));
+            let uname = if uname == "svc_" {
+                "svc_rootdir".to_string()
+            } else {
+                uname
+            };
+            store
+                .useradd(
+                    &mut fs,
+                    &root,
+                    UseraddReq {
+                        name: uname.clone(),
+                        home: Some(sys_path.into()),
+                        create_home: false,
+                        ..Default::default()
+                    },
+                    [5; 16],
+                )
+                .unwrap();
+            let pw_snap = fs.read_file(PASSWD_PATH).unwrap();
+            assert_eq!(
+                store
+                    .userdel(&mut fs, &root, &uname, true)
+                    .unwrap_err()
+                    .errno,
+                Errno::EPERM,
+                "expected EPERM for protected path {sys_path}"
+            );
+            assert_eq!(
+                fs.read_file(PASSWD_PATH).unwrap(),
+                pw_snap,
+                "passwd mutated on rejected protected path {sys_path}"
+            );
+        }
+
+        // 4. Mismatched directory ownership (`charlie`'s home owned by `alice.uid`).
+        fs.mkdir_p("/home/foreign", 0o750, alice.uid, alice.gid)
+            .unwrap();
+        store
+            .useradd(
+                &mut fs,
+                &root,
+                UseraddReq {
+                    name: "charlie".into(),
+                    home: Some("/home/foreign".into()),
+                    create_home: false,
+                    ..Default::default()
+                },
+                [6; 16],
+            )
+            .unwrap();
+        let pw_snap = fs.read_file(PASSWD_PATH).unwrap();
+        assert_eq!(
+            store
+                .userdel(&mut fs, &root, "charlie", true)
+                .unwrap_err()
+                .errno,
+            Errno::EPERM
+        );
+        assert!(fs.exists("/home/foreign"));
+        assert_eq!(fs.read_file(PASSWD_PATH).unwrap(), pw_snap);
+
+        // 5. Non-directory home (regular file at home path).
+        fs.write_file("/home/afile", b"hello", 0o600, 1050, 1050)
+            .unwrap();
+        store
+            .useradd(
+                &mut fs,
+                &root,
+                UseraddReq {
+                    name: "dave".into(),
+                    uid: Some(1050),
+                    home: Some("/home/afile".into()),
+                    create_home: false,
+                    ..Default::default()
+                },
+                [7; 16],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .userdel(&mut fs, &root, "dave", true)
+                .unwrap_err()
+                .errno,
+            Errno::ENOTDIR
+        );
+        assert!(fs.exists("/home/afile"));
+    }
+
+    #[test]
+    fn check_sudo_with_timestamps_isolates_sessions_per_uid_and_sid() {
+        let mut fs = MemoryAccountFs::seeded();
+        fs.write_file(
+            SUDOERS_PATH,
+            b"root ALL=(ALL:ALL) ALL\n%wheel ALL=(ALL:ALL) ALL\n",
+            SUDOERS_MODE,
+            0,
+            0,
+        )
+        .unwrap();
+        let store = LocalAccountStore::new();
+        let mut ts = BTreeMap::new();
+        ts.insert((1000, 11), 2000);
+
+        assert_eq!(
+            store
+                .check_sudo_with_timestamps(&fs, 1000, &[1000, 10], 11, 1999, &ts)
+                .unwrap(),
+            SudoCheck::AllowedNoPassword
+        );
+        // Different SID must NOT inherit session 11's timestamp.
+        assert_eq!(
+            store
+                .check_sudo_with_timestamps(&fs, 1000, &[1000, 10], 22, 1999, &ts)
+                .unwrap(),
+            SudoCheck::RequiresPassword
+        );
+        // Expired timestamp (now == expiry) requires password again.
+        assert_eq!(
+            store
+                .check_sudo_with_timestamps(&fs, 1000, &[1000, 10], 11, 2000, &ts)
+                .unwrap(),
+            SudoCheck::RequiresPassword
+        );
+    }
+
+    #[test]
+    fn resolve_user_propagates_missing_renamed_default_and_corrupt_files_without_fallback() {
+        let mut fs = MemoryAccountFs::seeded();
+        let mut store = LocalAccountStore::new();
+        let root = Identity::root();
+
+        // Delete default `user` (uid 1000) and create replacement `bob` (allocates uid 1000, non-wheel).
+        store.userdel(&mut fs, &root, "user", false).unwrap();
+        let bob = store
+            .useradd(
+                &mut fs,
+                &root,
+                UseraddReq {
+                    name: "bob".into(),
+                    ..Default::default()
+                },
+                [8; 16],
+            )
+            .unwrap();
+        assert_eq!(bob.uid, 1000);
+        // Looking up missing `user` MUST fail with ENOENT, never synthesize UID 1000 wheel!
+        assert_eq!(
+            store.resolve_user(&fs, "user").unwrap_err().errno,
+            Errno::ENOENT
+        );
+
+        // Corrupt `/etc/passwd` MUST fail with EINVAL.
+        fs.write_file(PASSWD_PATH, b"broken:line\n", PASSWD_MODE, 0, 0)
+            .unwrap();
+        assert_eq!(
+            store.resolve_user(&fs, "bob").unwrap_err().errno,
+            Errno::EINVAL
+        );
+    }
+
+    #[test]
+    fn shadow_aging_and_expiry_fields_preserved_verbatim_across_all_mutations() {
+        let mut fs = MemoryAccountFs::seeded();
+        let custom_shadow = "\
+root:!:19001:0:99999:7:::\n\
+user:!:19123:5:90:14:7:20500:reserved1\n\
+nobody:*:18000:1:365:30:10:25000:\n";
+        fs.write_file(SHADOW_PATH, custom_shadow.as_bytes(), SHADOW_MODE, 0, 0)
+            .unwrap();
+
+        let mut store = LocalAccountStore::new();
+        let root = Identity::root();
+
+        // 1. `passwd` preserves both target's and untouched records' aging/expiry fields.
+        store
+            .passwd(
+                &mut fs,
+                &root,
+                Some("user"),
+                None,
+                "strong-user-password-123",
+                false,
+                [0x44; 16],
+            )
+            .unwrap();
+        let after_passwd = String::from_utf8(fs.read_file(SHADOW_PATH).unwrap()).unwrap();
+        let parsed = parse_shadow(&after_passwd).unwrap();
+        assert_eq!(parsed[0].extra_fields, "19001:0:99999:7:::");
+        assert_eq!(parsed[1].extra_fields, "19123:5:90:14:7:20500:reserved1");
+        assert_eq!(parsed[2].extra_fields, "18000:1:365:30:10:25000:");
+
+        // 2. `usermod --lock` and `--unlock` preserve aging/expiry fields verbatim.
+        store
+            .usermod(
+                &mut fs,
+                &root,
+                UsermodReq {
+                    name: "user".into(),
+                    lock: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .usermod(
+                &mut fs,
+                &root,
+                UsermodReq {
+                    name: "user".into(),
+                    unlock: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let after_lock_unlock =
+            parse_shadow(&String::from_utf8(fs.read_file(SHADOW_PATH).unwrap()).unwrap()).unwrap();
+        assert_eq!(
+            after_lock_unlock[1].extra_fields,
+            "19123:5:90:14:7:20500:reserved1"
+        );
+        assert_eq!(
+            after_lock_unlock[2].extra_fields,
+            "18000:1:365:30:10:25000:"
+        );
+
+        // 3. `useradd` and `userdel` preserve all existing records' aging/expiry fields verbatim.
+        store
+            .useradd(
+                &mut fs,
+                &root,
+                UseraddReq {
+                    name: "alice".into(),
+                    ..Default::default()
+                },
+                [0x55; 16],
+            )
+            .unwrap();
+        let after_add =
+            parse_shadow(&String::from_utf8(fs.read_file(SHADOW_PATH).unwrap()).unwrap()).unwrap();
+        assert_eq!(after_add[1].extra_fields, "19123:5:90:14:7:20500:reserved1");
+        assert_eq!(after_add[3].name, "alice");
+        assert_eq!(after_add[3].extra_fields, DEFAULT_SHADOW_EXTRA_FIELDS);
+
+        store.userdel(&mut fs, &root, "alice", false).unwrap();
+        let after_del =
+            parse_shadow(&String::from_utf8(fs.read_file(SHADOW_PATH).unwrap()).unwrap()).unwrap();
+        assert_eq!(after_del.len(), 3);
+        assert_eq!(after_del[0].extra_fields, "19001:0:99999:7:::");
+        assert_eq!(after_del[1].extra_fields, "19123:5:90:14:7:20500:reserved1");
+        assert_eq!(after_del[2].extra_fields, "18000:1:365:30:10:25000:");
     }
 }
