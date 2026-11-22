@@ -78,6 +78,31 @@ pub(crate) fn now_secs() -> u64 {
     }
 }
 
+/// Wall clock in milliseconds (used for sub-second host-wait grace before PID 1 wildcard reap).
+pub(crate) fn now_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ms = js_sys::Date::now();
+        if ms.is_finite() && ms > 0.0 {
+            ms.floor() as u64
+        } else {
+            0
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(1_700_000_000_000)
+    }
+}
+
+/// Grace window (ms) during which wildcard PID 1 `waitpid(-1, WNOHANG)` yields to an immediate
+/// host `wait(pid)` for processes that exited directly under `ppid == 1`. Already-zombie orphans
+/// reparented when their parent exited are NOT placed in this map and are reaped immediately.
+const INIT_WILDCARD_REAP_GRACE_MS: u64 = 500;
+
 /// Generate a 32-byte (64-hex-char) high-entropy local secret (e.g. `host_proof` or random id).
 pub(crate) fn random_hex(bytes_len: usize) -> String {
     let mut buf = vec![0u8; bytes_len];
@@ -541,6 +566,7 @@ pub(crate) struct State {
     pub(crate) seat_policies: BTreeMap<u32, (String, u64)>,
     pub(crate) boot_seq: u64,
     pub(crate) session_seq: u64,
+    pub(crate) init_wait_grace_until_ms: BTreeMap<u32, u64>,
 }
 
 impl State {
@@ -788,6 +814,7 @@ impl Kernel {
             seat_policies: BTreeMap::new(),
             boot_seq: 1,
             session_seq: 1,
+            init_wait_grace_until_ms: BTreeMap::new(),
         }));
         let connector = cloudfs::Connector::default();
         let vfs_rt = RefCell::new(vfs_engine::VfsRuntime::new_sync(
@@ -1697,6 +1724,11 @@ impl Kernel {
                     startup.observed_exit();
                 }
             }
+            if out.ppid == INIT {
+                state
+                    .init_wait_grace_until_ms
+                    .insert(pid, now_ms().saturating_add(INIT_WILDCARD_REAP_GRACE_MS));
+            }
             out
         };
         self.cloud_exited(pid, token_before).await;
@@ -1712,6 +1744,7 @@ impl Kernel {
     /// Reap an ended direct child of PID 1 (ZERO network RPCs).
     pub async fn wait(&self, pid: u32, host: &str) -> Result<String, JsValue> {
         let mut state = self.state.borrow_mut();
+        state.init_wait_grace_until_ms.remove(&pid);
         let cred = state.account.identity();
         let reaped = state
             .table
@@ -2848,9 +2881,22 @@ impl Kernel {
                 options,
             } => {
                 let mut state = self.state.borrow_mut();
-                match state.table.waitpid(host, pid, selector, options)? {
+                let outcome = if pid == INIT && selector == -1 {
+                    let now_m = now_ms();
+                    let s = &mut *state;
+                    s.init_wait_grace_until_ms.retain(|_, until| *until > now_m);
+                    let grace = &s.init_wait_grace_until_ms;
+                    s.table
+                        .waitpid_excluding(host, pid, selector, options, |cpid| {
+                            grace.contains_key(&cpid)
+                        })?
+                } else {
+                    state.table.waitpid(host, pid, selector, options)?
+                };
+                match outcome {
                     WaitOutcome::Reaped(proc) => {
                         state.proc_account_epoch.remove(&proc.pid);
+                        state.init_wait_grace_until_ms.remove(&proc.pid);
                         if pid == INIT {
                             state.init_state.reaped();
                         }
@@ -3694,6 +3740,7 @@ mod tests {
             seat_policies: std::collections::BTreeMap::new(),
             boot_seq: 1,
             session_seq: 1,
+            init_wait_grace_until_ms: std::collections::BTreeMap::new(),
         };
         let session_guest = os_core::permissions::GUEST_UID_MIN + 42;
         // Must ignore root/non-guest UIDs.

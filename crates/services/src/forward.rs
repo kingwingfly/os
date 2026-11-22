@@ -1,8 +1,22 @@
 //! Best-effort live output must never hold up service management. The separate
 //! journal retains its bounded history even when a viewer stops consuming bytes.
-use std::{collections::VecDeque, io};
+use std::{
+    collections::VecDeque,
+    io,
+    time::{Duration, Instant},
+};
 
 const LIMIT: usize = 65536;
+const FINAL_FLUSH_BUDGET: Duration = Duration::from_millis(500);
+const FINAL_FLUSH_POLL: Duration = Duration::from_millis(5);
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum DrainOutcome {
+    Empty,
+    More,
+    Blocked,
+}
+
 #[derive(Default)]
 struct Queue {
     bytes: VecDeque<u8>,
@@ -19,14 +33,14 @@ impl Queue {
         self.bytes.extend(&bytes[..keep]);
         self.dropped = self.dropped.saturating_add((bytes.len() - keep) as u64);
     }
-    fn drain(&mut self, mut write: impl FnMut(&[u8]) -> io::Result<usize>) {
+    fn drain(&mut self, mut write: impl FnMut(&[u8]) -> io::Result<usize>) -> DrainOutcome {
         for _ in 0..4 {
             let bytes = self.bytes.as_slices().0;
             if bytes.is_empty() {
-                break;
+                return DrainOutcome::Empty;
             }
             match write(&bytes[..bytes.len().min(4096)]) {
-                Ok(0) => break,
+                Ok(0) => return DrainOutcome::Blocked,
                 Ok(n) => {
                     self.bytes.drain(..n);
                 }
@@ -36,19 +50,56 @@ impl Queue {
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                     ) =>
                 {
-                    break;
+                    return DrainOutcome::Blocked;
                 }
                 Err(_) => {
                     self.closed = true;
                     self.discard();
-                    break;
+                    return DrainOutcome::Empty;
                 }
             }
+        }
+        if self.bytes.is_empty() {
+            DrainOutcome::Empty
+        } else {
+            DrainOutcome::More
         }
     }
     fn discard(&mut self) {
         self.dropped = self.dropped.saturating_add(self.bytes.len() as u64);
         self.bytes.clear();
+    }
+}
+
+fn flush_queues(
+    queues: &mut [Queue; 2],
+    budget: Duration,
+    mut write: impl FnMut(usize, &[u8]) -> io::Result<usize>,
+) {
+    let deadline = Instant::now() + budget;
+    loop {
+        let mut any_more = false;
+        let mut any_blocked = false;
+        for (i, queue) in queues.iter_mut().enumerate() {
+            match queue.drain(|bytes| write(i, bytes)) {
+                DrainOutcome::Empty => {}
+                DrainOutcome::More => any_more = true,
+                DrainOutcome::Blocked => any_blocked = true,
+            }
+        }
+        if !any_more && !any_blocked {
+            break;
+        }
+        if any_more {
+            continue;
+        }
+        if Instant::now() >= deadline {
+            for queue in queues.iter_mut() {
+                queue.discard();
+            }
+            break;
+        }
+        std::thread::sleep(FINAL_FLUSH_POLL);
     }
 }
 
@@ -67,12 +118,18 @@ impl Forward {
         self.queues[fd as usize - 1].push(bytes);
     }
     pub fn pump(&mut self, final_pass: bool) {
-        for (i, queue) in self.queues.iter_mut().enumerate() {
-            queue.drain(|bytes| self.outputs[i].write(bytes));
-            if final_pass {
-                queue.discard();
+        if !final_pass {
+            for (i, queue) in self.queues.iter_mut().enumerate() {
+                let _ = queue.drain(|bytes| self.outputs[i].write(bytes));
             }
+            return;
         }
+        // On final exit, allow active viewers a bounded window to drain in-flight output
+        // credits without ever hanging on a permanently stalled pipe.
+        let outputs = &self.outputs;
+        flush_queues(&mut self.queues, FINAL_FLUSH_BUDGET, |i, bytes| {
+            outputs[i].write(bytes)
+        });
     }
     pub fn dropped(&self) -> [u64; 2] {
         self.queues.each_ref().map(|q| q.dropped)
@@ -188,5 +245,35 @@ mod tests {
         queue.push(b"new");
         assert!(queue.bytes.is_empty());
         assert_eq!(queue.dropped, 6);
+    }
+
+    #[test]
+    fn final_flush_recovers_from_transient_wouldblock_and_bounds_stalled_viewers() {
+        let mut queues: [Queue; 2] = Default::default();
+        queues[0].push(b"CHILD_DONE_1\nCHILD_DONE_2\n");
+        queues[1].push(b"supervise: quick-1: exited 0\n");
+        let mut calls = 0usize;
+        let mut received = [Vec::new(), Vec::new()];
+        flush_queues(&mut queues, Duration::from_millis(200), |i, bytes| {
+            calls += 1;
+            if calls <= 3 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let n = bytes.len().min(7);
+            received[i].extend_from_slice(&bytes[..n]);
+            Ok(n)
+        });
+        assert_eq!(received[0], b"CHILD_DONE_1\nCHILD_DONE_2\n");
+        assert_eq!(received[1], b"supervise: quick-1: exited 0\n");
+        assert_eq!(queues[0].dropped, 0);
+        assert_eq!(queues[1].dropped, 0);
+
+        let mut stalled: [Queue; 2] = Default::default();
+        stalled[0].push(b"never-drained");
+        flush_queues(&mut stalled, Duration::from_millis(15), |_, _| {
+            Err(io::ErrorKind::WouldBlock.into())
+        });
+        assert!(stalled[0].bytes.is_empty());
+        assert_eq!(stalled[0].dropped, b"never-drained".len() as u64);
     }
 }

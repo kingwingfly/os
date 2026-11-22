@@ -408,6 +408,7 @@ mod runtime {
         let clock = Instant::now();
         let now_ms = || clock.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let mut notify_buf = vec![0u8; MAX_NOTIFY_DATAGRAM_BYTES];
+        let mut reap_followup_at: Option<u64> = None;
 
         loop {
             let now = now_ms();
@@ -429,9 +430,18 @@ mod runtime {
                 }
             }
 
-            // 2. Reap direct and adopted exited children on `SIGCHLD`, or check our own
-            //    explicitly managed unit PIDs without stealing unrelated host-spawned children.
-            if REAP.swap(false, Ordering::SeqCst) {
+            // 2. Reap direct and adopted exited children on `SIGCHLD` (plus a single delayed
+            //    follow-up pass for un-waited host-spawned children once their host-wait grace
+            //    window expires), or check our own explicitly managed unit PIDs without stealing
+            //    unrelated host-spawned children.
+            let got_sigchld = REAP.swap(false, Ordering::SeqCst);
+            let due_followup = reap_followup_at.is_some_and(|at| now >= at);
+            if got_sigchld {
+                reap_followup_at = Some(now.saturating_add(550));
+            } else if due_followup {
+                reap_followup_at = None;
+            }
+            if got_sigchld || due_followup {
                 loop {
                     let mut status = 0u32;
                     // SAFETY: status points to a live u32; -1/WNOHANG select ended children.

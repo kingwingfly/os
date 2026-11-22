@@ -1082,6 +1082,20 @@ impl LocalProcessTable {
         selector: i32,
         options: u32,
     ) -> Result<WaitOutcome, Error> {
+        self.waitpid_excluding(caller_host, caller_pid, selector, options, |_| false)
+    }
+
+    /// POSIX `waitpid(selector, options)` with an optional filter that defers reaping selected
+    /// zombie PIDs (used so wildcard PID 1 reaping does not steal a host-waited child mid-flight
+    /// between `exit(pid)` and `reap_init_child(pid)`).
+    pub fn waitpid_excluding(
+        &mut self,
+        caller_host: &str,
+        caller_pid: u32,
+        selector: i32,
+        options: u32,
+        mut skip_zombie: impl FnMut(u32) -> bool,
+    ) -> Result<WaitOutcome, Error> {
         if options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
             return Err(Errno::EINVAL.into());
         }
@@ -1104,6 +1118,9 @@ impl LocalProcessTable {
             return Err(Errno::ECHILD.into());
         }
         for cpid in &matching {
+            if skip_zombie(*cpid) {
+                continue;
+            }
             if let Some(child) = self.procs.get(cpid)
                 && child.state == ProcState::Zombie
             {
