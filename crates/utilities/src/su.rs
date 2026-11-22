@@ -6,7 +6,7 @@
 
 use crate::{LocalPasswdRecord, parse_passwd_line};
 use abi::{Call, Creds, Errno};
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
 pub const USAGE: &str = "\
@@ -97,7 +97,7 @@ pub trait SuBackend {
     fn getcreds(&mut self) -> Result<Creds, abi::Error>;
     fn read_passwd(&mut self) -> Result<String, abi::Error>;
     fn prompt_password(&mut self, prompt: &str) -> Result<String, String>;
-    fn login(&mut self, username: &str, password: &str) -> Result<(), abi::Error>;
+    fn login(&mut self, username: &str, password: &str, force: bool) -> Result<(), abi::Error>;
     fn chdir(&mut self, path: &str) -> io::Result<()>;
     fn execvp(&mut self, prog: &str, argv: &[String]) -> Result<(), io::Error>;
 }
@@ -119,26 +119,14 @@ impl SuBackend for OsSuBackend {
     }
 
     fn prompt_password(&mut self, prompt: &str) -> Result<String, String> {
-        eprint!("{prompt}");
-        let _ = io::stderr().flush();
-        let mut line = String::new();
-        let n = io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| format!("failed to read password: {e}"))?;
-        if n == 0 {
-            return Err("authentication aborted (EOF)".into());
-        }
-        while line.ends_with('\n') || line.ends_with('\r') {
-            line.pop();
-        }
-        Ok(line)
+        crate::prompt_password(prompt)
     }
 
-    fn login(&mut self, username: &str, password: &str) -> Result<(), abi::Error> {
+    fn login(&mut self, username: &str, password: &str, force: bool) -> Result<(), abi::Error> {
         let mut reply = os_posix::batch(&[Call::Login {
             username: username.to_owned(),
             password: password.to_owned(),
-            force: false,
+            force,
         }])
         .map_err(|e| abi::Error::because(Errno::EIO, e.to_string()))?;
         reply.results.remove(0).into_result().map(|_| ())
@@ -188,7 +176,8 @@ pub fn run_with(
         );
     };
 
-    let password = if creds.uid == 0 {
+    let force = creds.uid == 0;
+    let password = if force {
         String::new()
     } else {
         match backend.prompt_password("Password: ") {
@@ -197,7 +186,7 @@ pub fn run_with(
         }
     };
 
-    if let Err(err) = backend.login(&target.name, &password) {
+    if let Err(err) = backend.login(&target.name, &password, force) {
         return (None, Some(format!("su: {err}")), 1);
     }
 
@@ -296,8 +285,9 @@ mod tests {
                 .ok_or_else(|| "eof".to_owned())
         }
 
-        fn login(&mut self, username: &str, password: &str) -> Result<(), abi::Error> {
-            self.steps.push(format!("login:{username}:{password}"));
+        fn login(&mut self, username: &str, password: &str, force: bool) -> Result<(), abi::Error> {
+            self.steps
+                .push(format!("login:{username}:{password}:force={force}"));
             if let Some(errno) = self.login_err {
                 return Err(errno.into());
             }
@@ -337,7 +327,7 @@ mod tests {
         assert_eq!(
             root_mock.steps,
             vec![
-                "login:alice:",
+                "login:alice::force=true",
                 "chdir:/home/alice",
                 "exec:/bin/dash:/bin/dash -l",
             ]
@@ -356,7 +346,7 @@ mod tests {
             user_mock.steps,
             vec![
                 "prompt:Password: ",
-                "login:alice:secret123",
+                "login:alice:secret123:force=false",
                 "exec:/bin/dash:/bin/dash -c id",
             ]
         );

@@ -267,3 +267,46 @@ impl NotifyMessage {
         Ok(msg)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorize_control_rejects_external_poweroff_and_reboot_on_user_manager() {
+        let user_cred = PeerCred {
+            pid: 55,
+            uid: 1000,
+            gid: 1000,
+        };
+        assert_eq!(
+            authorize_control(1000, user_cred, &ControlRequest::Poweroff)
+                .unwrap_err()
+                .errno,
+            Errno::EPERM
+        );
+        assert_eq!(
+            authorize_control(1000, user_cred, &ControlRequest::Reboot)
+                .unwrap_err()
+                .errno,
+            Errno::EPERM
+        );
+        // Same user may still manage their own units on their per-user socket.
+        assert!(authorize_control(1000, user_cred, &ControlRequest::List).is_ok());
+
+        // System manager permits Poweroff/Reboot strictly for root (uid 0).
+        let root_cred = PeerCred {
+            pid: 1,
+            uid: 0,
+            gid: 0,
+        };
+        assert!(authorize_control(0, root_cred, &ControlRequest::Poweroff).is_ok());
+        assert!(authorize_control(0, root_cred, &ControlRequest::Reboot).is_ok());
+        assert_eq!(
+            authorize_control(0, user_cred, &ControlRequest::Poweroff)
+                .unwrap_err()
+                .errno,
+            Errno::EPERM
+        );
+    }
+}

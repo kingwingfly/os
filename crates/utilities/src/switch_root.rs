@@ -18,11 +18,18 @@
 
 use abi::Errno;
 use abi::contract::{fs_magic, mount_flags, umount_flags};
-use std::io;
+use std::collections::VecDeque;
+use std::io::{self, Read};
 use std::path::Path;
 
 const USAGE: &str = "Usage: switch_root NEWROOT INIT [ARG]...\n\n\
 Switch from Stage 1 tmpfs initramfs to NEWROOT and exec INIT as PID 1.\n";
+
+const MAX_SYMLINK_DEPTH: usize = 40;
+const MAX_SHEBANG_DEPTH: usize = 4;
+const BINPRM_BUF_SIZE: usize = 256;
+const STAGE1_RESCUE_SRC: &str = "/bin/sh";
+pub(crate) const RETAINED_RESCUE_PATH: &str = "/run/os/.rescue";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NodeInfo {
@@ -39,6 +46,10 @@ impl NodeInfo {
         (self.mode & abi::S_IFMT) == abi::S_IFREG
     }
 
+    pub fn is_symlink(&self) -> bool {
+        (self.mode & abi::S_IFMT) == abi::S_IFLNK
+    }
+
     pub fn is_executable(&self) -> bool {
         (self.mode & 0o111) != 0
     }
@@ -49,6 +60,10 @@ pub(crate) trait SwitchRootBackend {
     fn getuid(&self) -> io::Result<u32>;
     fn statfs_type(&self, path: &str) -> io::Result<u64>;
     fn stat(&self, path: &str, follow: bool) -> io::Result<NodeInfo>;
+    fn readlink(&self, path: &str) -> io::Result<String>;
+    fn read_head(&self, path: &str, max_bytes: usize) -> io::Result<Vec<u8>>;
+    fn stage_rescue(&mut self, src: &str, dst: &str, mode: u32) -> io::Result<()>;
+    fn remove_file(&mut self, path: &str) -> io::Result<()>;
     fn open_dir(&mut self, dirfd: Option<u32>, path: &str, nofollow: bool) -> io::Result<u32>;
     fn fstat_dir(&self, fd: u32) -> io::Result<NodeInfo>;
     fn fstatat(&self, dirfd: u32, name: &str, follow: bool) -> io::Result<NodeInfo>;
@@ -136,6 +151,52 @@ impl SwitchRootBackend for OsSwitchRootBackend {
             dev: st.dev,
             mode: st.mode,
         })
+    }
+
+    fn readlink(&self, path: &str) -> io::Result<String> {
+        os_posix::readlinkat(None, Path::new(path))?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| errno_io(Errno::EINVAL, "non-UTF8 symlink target"))
+    }
+
+    fn read_head(&self, path: &str, max_bytes: usize) -> io::Result<Vec<u8>> {
+        let file = std::fs::File::open(path)?;
+        let mut buf = Vec::new();
+        file.take(max_bytes as u64).read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+
+    fn stage_rescue(&mut self, src: &str, dst: &str, mode: u32) -> io::Result<()> {
+        let bytes = std::fs::read(src)?;
+        if !is_valid_binary_header(&bytes) {
+            return Err(errno_io(
+                Errno::ENOEXEC,
+                "Stage 1 rescue binary is not a valid executable",
+            ));
+        }
+        if let Some(parent) = Path::new(dst).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(dst, &bytes)?;
+        os_posix::chmod(Path::new(dst), mode)?;
+        let st = os_posix::stat(Path::new(dst), false)?;
+        let info = NodeInfo {
+            dev: st.dev,
+            mode: st.mode,
+        };
+        if !info.is_file() || !info.is_executable() {
+            let _ = std::fs::remove_file(dst);
+            return Err(errno_io(
+                Errno::EACCES,
+                "staged rescue binary is not an executable regular file",
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove_file(&mut self, path: &str) -> io::Result<()> {
+        std::fs::remove_file(path)
     }
 
     fn open_dir(&mut self, dirfd: Option<u32>, path: &str, nofollow: bool) -> io::Result<u32> {
@@ -340,6 +401,155 @@ fn join_newroot(newroot: &str, rel: &str) -> String {
     }
 }
 
+fn is_valid_binary_header(header: &[u8]) -> bool {
+    (header.starts_with(b"\0asm") && header.len() >= 8)
+        || (header.starts_with(b"\x7fELF") && header.len() >= 4)
+}
+
+fn parse_shebang_interpreter(header: &[u8]) -> io::Result<String> {
+    if !header.starts_with(b"#!") {
+        return Err(errno_io(Errno::ENOEXEC, "missing shebang prefix"));
+    }
+    let rest = &header[2..];
+    let line_bytes = match rest.iter().position(|&b| b == b'\n') {
+        Some(pos) => &rest[..pos],
+        None if header.len() >= BINPRM_BUF_SIZE => {
+            return Err(errno_io(Errno::ENOEXEC, "unterminated shebang line"));
+        }
+        None => rest,
+    };
+    let line_bytes = line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes);
+    let line = std::str::from_utf8(line_bytes)
+        .map_err(|_| errno_io(Errno::ENOEXEC, "shebang line is not valid UTF-8"))?;
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let interp = trimmed.split([' ', '\t']).next().unwrap_or("");
+    if interp.is_empty() || !interp.starts_with('/') {
+        return Err(errno_io(
+            Errno::ENOEXEC,
+            "shebang interpreter must be an absolute path",
+        ));
+    }
+    Ok(interp.to_string())
+}
+
+/// Resolve `abs_path` strictly inside `newroot`, following relative and absolute symlinks without
+/// ever allowing traversal (`..` or `/...`) to escape `newroot`.
+fn resolve_in_newroot(
+    backend: &impl SwitchRootBackend,
+    newroot: &str,
+    abs_path: &str,
+) -> io::Result<(String, NodeInfo)> {
+    if !abs_path.starts_with('/') {
+        return Err(errno_io(
+            Errno::EINVAL,
+            "path inside newroot must be absolute",
+        ));
+    }
+    let mut resolved: Vec<String> = Vec::new();
+    let mut queue: VecDeque<String> = abs_path
+        .split('/')
+        .filter(|seg| !seg.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let mut symlinks = 0usize;
+
+    while let Some(seg) = queue.pop_front() {
+        match seg.as_str() {
+            "" | "." => continue,
+            ".." => {
+                // Clamp at `newroot` so `..` never escapes into the Stage 1 root.
+                resolved.pop();
+                continue;
+            }
+            _ => {}
+        }
+        resolved.push(seg);
+        let rel = format!("/{}", resolved.join("/"));
+        let host_path = join_newroot(newroot, &rel);
+        let info = backend.stat(&host_path, false)?;
+        if info.is_symlink() {
+            symlinks += 1;
+            if symlinks > MAX_SYMLINK_DEPTH {
+                return Err(errno_io(Errno::ELOOP, "too many levels of symbolic links"));
+            }
+            let target = backend.readlink(&host_path)?;
+            if target.is_empty() {
+                return Err(errno_io(Errno::ENOENT, "empty symlink target"));
+            }
+            resolved.pop();
+            if target.starts_with('/') {
+                resolved.clear();
+            }
+            let target_segs: Vec<String> = target
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            for s in target_segs.into_iter().rev() {
+                queue.push_front(s);
+            }
+        } else if !queue.is_empty() && !info.is_dir() {
+            return Err(errno_io(
+                Errno::ENOTDIR,
+                "non-directory component while resolving executable in newroot",
+            ));
+        }
+    }
+
+    let final_rel = if resolved.is_empty() {
+        String::new()
+    } else {
+        format!("/{}", resolved.join("/"))
+    };
+    let final_host = join_newroot(newroot, &final_rel);
+    let final_info = backend.stat(&final_host, false)?;
+    Ok((final_host, final_info))
+}
+
+/// Pre-flight check `<newroot><init>` and any `#!` interpreter chain strictly inside `newroot`
+/// BEFORE detaching `/usr`, moving mounts, or reclaiming the Stage 1 initramfs.
+fn preflight_validate_init(
+    backend: &impl SwitchRootBackend,
+    newroot: &str,
+    init_path: &str,
+) -> io::Result<()> {
+    let mut cur_path = init_path.to_string();
+    for depth in 0..=MAX_SHEBANG_DEPTH {
+        let (resolved_host, info) = resolve_in_newroot(backend, newroot, &cur_path)?;
+        if !info.is_file() || !info.is_executable() {
+            return Err(errno_io(
+                Errno::EACCES,
+                "target init or interpreter is not an executable regular file",
+            ));
+        }
+        let head = backend.read_head(&resolved_host, BINPRM_BUF_SIZE)?;
+        if head.is_empty() {
+            return Err(errno_io(
+                Errno::ENOEXEC,
+                "target init or interpreter is empty",
+            ));
+        }
+        if head.starts_with(b"#!") {
+            if depth >= MAX_SHEBANG_DEPTH {
+                return Err(errno_io(
+                    Errno::ELOOP,
+                    "too many levels of #! interpreters in target init",
+                ));
+            }
+            cur_path = parse_shebang_interpreter(&head)?;
+            continue;
+        }
+        if is_valid_binary_header(&head) {
+            return Ok(());
+        }
+        return Err(errno_io(
+            Errno::ENOEXEC,
+            "target init or interpreter is not a valid executable binary or #! script",
+        ));
+    }
+    Err(errno_io(Errno::ELOOP, "exceeded #! recursion limit"))
+}
+
 /// Recursively unlink every non-mountpoint entry under `dirfd`, strictly checking `st_dev == root_dev`
 /// so traversal NEVER crosses into `<newroot>` or moved filesystems.
 fn recursive_clean_oldroot(
@@ -428,16 +638,10 @@ pub(crate) fn switch_root_with(
         ));
     }
 
-    // Step 1 (Pre-flight BEFORE moving any mounts!):
-    // Verify `<newroot><init>` exists, is a regular file, and is executable.
-    let target_init = join_newroot(newroot, init_path);
-    let init_info = backend.stat(&target_init, true)?;
-    if !init_info.is_file() || !init_info.is_executable() {
-        return Err(errno_io(
-            Errno::EACCES,
-            "target init is not an executable regular file",
-        ));
-    }
+    // Step 1 (Pre-flight BEFORE moving any mounts or detaching `/usr`!):
+    // Resolve `<newroot><init>` and any `#!` interpreter strictly inside `<newroot>`, verifying
+    // executable permissions and binary/shebang validity.
+    preflight_validate_init(backend, newroot, init_path)?;
 
     // Determine which Stage 1 system mounts (`/proc`, `/dev`, `/run`) are mounted and verify their
     // destination directories under `<newroot>` are real directories (without following symlinks)
@@ -460,16 +664,42 @@ pub(crate) fn switch_root_with(
         }
     }
 
+    // Retain a verified Stage 1 rescue executable across the pivot BEFORE detaching `/usr` or
+    // reclaiming `oldroot_fd`, so a post-pivot `execve` failure can transfer PID 1 cleanly into
+    // recovery instead of exiting PID 1 without a recovery environment.
+    let run_moved = to_move.iter().any(|(src, _)| *src == "/run");
+    let rescue_stage_dst = if run_moved {
+        RETAINED_RESCUE_PATH.to_string()
+    } else {
+        join_newroot(newroot, RETAINED_RESCUE_PATH)
+    };
+    backend.stage_rescue(STAGE1_RESCUE_SRC, &rescue_stage_dst, 0o700)?;
+
     // Step 2: Detach Stage 1 `/usr` (`MNT_DETACH`) if mounted (never move Stage 1 `/usr` or `/tmp`).
     if let Ok(usr_info) = backend.stat("/usr", false)
         && usr_info.dev != root_info.dev
+        && let Err(err) = backend.umount2("/usr", umount_flags::MNT_DETACH)
     {
-        backend.umount2("/usr", umount_flags::MNT_DETACH)?;
+        let _ = backend.remove_file(&rescue_stage_dst);
+        return Err(err);
     }
 
     // Step 3: Open initial root (`/`) as a descriptor so Stage 1 tmpfs can be cleaned post-pivot.
-    let oldroot_fd = backend.open_dir(None, "/", false)?;
-    let oldroot_dev = backend.fstat_dir(oldroot_fd)?.dev;
+    let oldroot_fd = match backend.open_dir(None, "/", false) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = backend.remove_file(&rescue_stage_dst);
+            return Err(err);
+        }
+    };
+    let oldroot_dev = match backend.fstat_dir(oldroot_fd) {
+        Ok(info) => info.dev,
+        Err(err) => {
+            let _ = backend.close_dir(oldroot_fd);
+            let _ = backend.remove_file(&rescue_stage_dst);
+            return Err(err);
+        }
+    };
 
     // Step 4: Move live mounts (`/proc`, `/dev` carrying `/dev/pts`, `/run`) onto `<newroot>`.
     // Roll back completed moves on error BEFORE step 6 pivot.
@@ -480,6 +710,7 @@ pub(crate) fn switch_root_with(
                 let _ = backend.mount(Some(&moved_dst), orig_src, None, mount_flags::MS_MOVE, None);
             }
             let _ = backend.close_dir(oldroot_fd);
+            let _ = backend.remove_file(&rescue_stage_dst);
             return Err(err);
         }
         moved.push((src, dst));
@@ -491,6 +722,7 @@ pub(crate) fn switch_root_with(
             let _ = backend.mount(Some(&moved_dst), orig_src, None, mount_flags::MS_MOVE, None);
         }
         let _ = backend.close_dir(oldroot_fd);
+        let _ = backend.remove_file(&rescue_stage_dst);
         return Err(err);
     }
     if let Err(err) = backend.mount(Some("."), "/", None, mount_flags::MS_MOVE, None) {
@@ -499,6 +731,7 @@ pub(crate) fn switch_root_with(
             let _ = backend.mount(Some(&moved_dst), orig_src, None, mount_flags::MS_MOVE, None);
         }
         let _ = backend.close_dir(oldroot_fd);
+        let _ = backend.remove_file(&rescue_stage_dst);
         return Err(err);
     }
     backend.chroot(".")?;
@@ -510,11 +743,22 @@ pub(crate) fn switch_root_with(
     let _ = backend.close_dir(oldroot_fd);
 
     // Step 10: `execve(<init>, [init, args...], env)` preserving PID 1 and original `start_time`.
+    // If post-pivot `execve` fails after oldroot was reclaimed, transfer PID 1 directly to the
+    // retained Stage 1 rescue executable instead of exiting PID 1.
     let mut argv = Vec::with_capacity(1 + init_args.len());
     argv.push(init_path.to_string());
     argv.extend(init_args.iter().cloned());
     let env = backend.current_env();
-    backend.execve(init_path, &argv, &env)
+    if let Err(init_err) = backend.execve(init_path, &argv, &env) {
+        eprintln!(
+            "switch_root: execve({init_path}) failed after pivot ({init_err}); transferring PID 1 to {RETAINED_RESCUE_PATH}"
+        );
+        let rescue_argv = vec![RETAINED_RESCUE_PATH.to_string(), "-i".to_string()];
+        return backend
+            .execve(RETAINED_RESCUE_PATH, &rescue_argv, &env)
+            .map_err(|_| init_err);
+    }
+    Ok(())
 }
 
 pub(crate) fn run_with(
@@ -558,24 +802,39 @@ pub fn run(args: &[String]) -> i32 {
     if let Some(msg) = err {
         eprintln!("{msg}");
     }
+    // If PID 1 failed pre-pivot after `early_init` already replaced itself with `switch_root`,
+    // transfer PID 1 into the Stage 1 recovery shell instead of terminating PID 1.
+    if code != 0
+        && args.len() >= 2
+        && backend.getpid().ok() == Some(1)
+        && backend.getuid().ok() == Some(0)
+        && backend.statfs_type("/").ok() == Some(fs_magic::TMPFS_MAGIC)
+    {
+        let env = backend.current_env();
+        let rescue_argv = vec![STAGE1_RESCUE_SRC.to_string(), "-i".to_string()];
+        let _ = backend.execve(STAGE1_RESCUE_SRC, &rescue_argv, &env);
+    }
     code
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     struct MockSwitchRoot {
         pid: u32,
         uid: u32,
         root_magic: u64,
         nodes: BTreeMap<String, NodeInfo>,
+        symlinks: BTreeMap<String, String>,
+        files: BTreeMap<String, Vec<u8>>,
         dir_entries: BTreeMap<u32, Vec<(String, NodeInfo)>>,
         dir_dev: BTreeMap<u32, u64>,
         sub_fds: BTreeMap<(u32, String), u32>,
         next_fd: u32,
         fail_move_src: Option<String>,
+        fail_execve_paths: BTreeSet<String>,
         steps: Vec<String>,
         unlinked: Vec<(u32, String, bool)>,
     }
@@ -583,6 +842,7 @@ mod tests {
     impl MockSwitchRoot {
         fn healthy_stage1() -> Self {
             let mut nodes = BTreeMap::new();
+            let mut files = BTreeMap::new();
             nodes.insert(
                 "/".into(),
                 NodeInfo {
@@ -590,6 +850,14 @@ mod tests {
                     mode: abi::S_IFDIR | 0o755,
                 },
             );
+            nodes.insert(
+                "/bin/sh".into(),
+                NodeInfo {
+                    dev: 1,
+                    mode: abi::S_IFREG | 0o755,
+                },
+            );
+            files.insert("/bin/sh".into(), b"\0asm\x01\0\0\0stage1-dash".to_vec());
             nodes.insert(
                 "/proc".into(),
                 NodeInfo {
@@ -647,11 +915,29 @@ mod tests {
                 },
             );
             nodes.insert(
+                "/sysroot/usr".into(),
+                NodeInfo {
+                    dev: 11,
+                    mode: abi::S_IFDIR | 0o755,
+                },
+            );
+            nodes.insert(
+                "/sysroot/usr/bin".into(),
+                NodeInfo {
+                    dev: 11,
+                    mode: abi::S_IFDIR | 0o755,
+                },
+            );
+            nodes.insert(
                 "/sysroot/usr/bin/init".into(),
                 NodeInfo {
                     dev: 11,
                     mode: abi::S_IFREG | 0o755,
                 },
+            );
+            files.insert(
+                "/sysroot/usr/bin/init".into(),
+                b"\0asm\x01\0\0\0stage2-init".to_vec(),
             );
 
             // Old root fd 100 contains: initramfs_marker (dev 1), bin/ (dev 1 -> fd 101), sysroot/ (dev 10 -> MUST NOT BE TRAVERSED!)
@@ -703,11 +989,14 @@ mod tests {
                 uid: 0,
                 root_magic: fs_magic::TMPFS_MAGIC,
                 nodes,
+                symlinks: BTreeMap::new(),
+                files,
                 dir_entries,
                 dir_dev,
                 sub_fds,
                 next_fd: 100,
                 fail_move_src: None,
+                fail_execve_paths: BTreeSet::new(),
                 steps: Vec::new(),
                 unlinked: Vec::new(),
             }
@@ -729,6 +1018,46 @@ mod tests {
                 .get(path)
                 .cloned()
                 .ok_or_else(|| errno_io(Errno::ENOENT, path))
+        }
+        fn readlink(&self, path: &str) -> io::Result<String> {
+            self.symlinks
+                .get(path)
+                .cloned()
+                .ok_or_else(|| errno_io(Errno::EINVAL, path))
+        }
+        fn read_head(&self, path: &str, max_bytes: usize) -> io::Result<Vec<u8>> {
+            let bytes = self
+                .files
+                .get(path)
+                .ok_or_else(|| errno_io(Errno::ENOENT, path))?;
+            Ok(bytes[..bytes.len().min(max_bytes)].to_vec())
+        }
+        fn stage_rescue(&mut self, src: &str, dst: &str, mode: u32) -> io::Result<()> {
+            let bytes = self
+                .files
+                .get(src)
+                .cloned()
+                .ok_or_else(|| errno_io(Errno::ENOENT, src))?;
+            if !is_valid_binary_header(&bytes) {
+                return Err(errno_io(Errno::ENOEXEC, "invalid rescue binary"));
+            }
+            self.files.insert(dst.to_string(), bytes);
+            self.nodes.insert(
+                dst.to_string(),
+                NodeInfo {
+                    dev: 4,
+                    mode: abi::S_IFREG | mode,
+                },
+            );
+            self.steps
+                .push(format!("stage_rescue:{src}->{dst}:0o{mode:o}"));
+            Ok(())
+        }
+        fn remove_file(&mut self, path: &str) -> io::Result<()> {
+            self.files.remove(path);
+            self.nodes.remove(path);
+            self.steps.push(format!("remove_file:{path}"));
+            Ok(())
         }
         fn open_dir(&mut self, dirfd: Option<u32>, path: &str, _nofollow: bool) -> io::Result<u32> {
             if let Some(dfd) = dirfd {
@@ -817,6 +1146,9 @@ mod tests {
             _env: &[String],
         ) -> Result<(), io::Error> {
             self.steps.push(format!("execve:{path}:{}", argv.join(" ")));
+            if self.fail_execve_paths.contains(path) {
+                return Err(errno_io(Errno::ENOEXEC, "simulated execve failure"));
+            }
             Ok(())
         }
         fn current_env(&self) -> Vec<String> {
@@ -832,6 +1164,7 @@ mod tests {
         assert_eq!(
             mock.steps,
             vec![
+                "stage_rescue:/bin/sh->/run/os/.rescue:0o700",
                 "umount2:/usr:2",
                 "open_dir:/->100",
                 "mount:\"/proc\"->/sysroot/proc:0x2000",
@@ -887,7 +1220,7 @@ mod tests {
         assert_eq!(os_posix::errno_of(&err), Some(Errno::EACCES));
         assert!(m4.steps.is_empty());
 
-        // Move failure on `/run` rolls back `/dev` and `/proc` cleanly!
+        // Move failure on `/run` rolls back `/dev` and `/proc` and cleans up staged rescue!
         let mut m5 = MockSwitchRoot::healthy_stage1();
         m5.fail_move_src = Some("/run".into());
         let err = switch_root_with("/sysroot", "/usr/bin/init", &[], &mut m5).unwrap_err();
@@ -899,6 +1232,110 @@ mod tests {
         assert!(
             m5.steps
                 .contains(&"mount:\"/sysroot/proc\"->/proc:0x2000".to_string())
+        );
+        assert!(
+            m5.steps
+                .contains(&"remove_file:/run/os/.rescue".to_string())
+        );
+    }
+
+    #[test]
+    fn switch_root_preflight_validates_shebang_interpreters_strictly_inside_newroot() {
+        // 1. Executable `#!` script whose interpreter is missing inside `/sysroot` MUST fail
+        //    ENOENT in preflight BEFORE detaching `/usr`, moving mounts, or cleaning oldroot!
+        //    Even though `/bin/sh` exists on Stage 1 `/`, `/sysroot/bin/sh` does NOT exist!
+        let mut missing_interp = MockSwitchRoot::healthy_stage1();
+        missing_interp.files.insert(
+            "/sysroot/usr/bin/init".into(),
+            b"#!/bin/sh -e\necho hi\n".to_vec(),
+        );
+        let err =
+            switch_root_with("/sysroot", "/usr/bin/init", &[], &mut missing_interp).unwrap_err();
+        assert_eq!(os_posix::errno_of(&err), Some(Errno::ENOENT));
+        assert!(missing_interp.steps.is_empty());
+        assert!(missing_interp.unlinked.is_empty());
+
+        // 2. Broken non-`#!`, non-Wasm executable file fails ENOEXEC in preflight!
+        let mut broken = MockSwitchRoot::healthy_stage1();
+        broken.files.insert(
+            "/sysroot/usr/bin/init".into(),
+            b"not a valid wasm or shebang script\n".to_vec(),
+        );
+        let err = switch_root_with("/sysroot", "/usr/bin/init", &[], &mut broken).unwrap_err();
+        assert_eq!(os_posix::errno_of(&err), Some(Errno::ENOEXEC));
+        assert!(broken.steps.is_empty());
+
+        // 3. Valid `#!` script resolving through symlinks confined inside `/sysroot`
+        //    (`/sysroot/bin -> usr/bin`, `/sysroot/usr/bin/sh -> /usr/bin/dash`) succeeds!
+        let mut valid_script = MockSwitchRoot::healthy_stage1();
+        valid_script.files.insert(
+            "/sysroot/usr/bin/init".into(),
+            b"#! /bin/sh   -eu \nexec /usr/bin/real-init\n".to_vec(),
+        );
+        valid_script.nodes.insert(
+            "/sysroot/bin".into(),
+            NodeInfo {
+                dev: 10,
+                mode: abi::S_IFLNK | 0o777,
+            },
+        );
+        valid_script
+            .symlinks
+            .insert("/sysroot/bin".into(), "usr/bin".into());
+        valid_script.nodes.insert(
+            "/sysroot/usr/bin/sh".into(),
+            NodeInfo {
+                dev: 11,
+                mode: abi::S_IFLNK | 0o777,
+            },
+        );
+        valid_script
+            .symlinks
+            .insert("/sysroot/usr/bin/sh".into(), "../../usr/bin/dash".into());
+        valid_script.nodes.insert(
+            "/sysroot/usr/bin/dash".into(),
+            NodeInfo {
+                dev: 11,
+                mode: abi::S_IFREG | 0o755,
+            },
+        );
+        valid_script.files.insert(
+            "/sysroot/usr/bin/dash".into(),
+            b"\0asm\x01\0\0\0stage2-dash".to_vec(),
+        );
+        switch_root_with("/sysroot", "/usr/bin/init", &[], &mut valid_script).unwrap();
+        assert_eq!(
+            valid_script.steps.last().map(String::as_str),
+            Some("execve:/usr/bin/init:/usr/bin/init")
+        );
+    }
+
+    #[test]
+    fn switch_root_transfers_pid1_to_retained_rescue_when_post_pivot_execve_fails() {
+        let mut mock = MockSwitchRoot::healthy_stage1();
+        mock.fail_execve_paths.insert("/usr/bin/init".into());
+
+        // Post-pivot `execve("/usr/bin/init")` fails after oldroot cleanup; `switch_root` MUST
+        // hand PID 1 directly to the retained `/run/os/.rescue` executable!
+        switch_root_with("/sysroot", "/usr/bin/init", &["--boot".into()], &mut mock).unwrap();
+
+        let rescue_stage_pos = mock
+            .steps
+            .iter()
+            .position(|s| s == "stage_rescue:/bin/sh->/run/os/.rescue:0o700")
+            .expect("rescue binary must be staged before pivot");
+        let pivot_pos = mock
+            .steps
+            .iter()
+            .position(|s| s == "chroot:.")
+            .expect("chroot step");
+        assert!(rescue_stage_pos < pivot_pos);
+        assert_eq!(
+            &mock.steps[mock.steps.len() - 2..],
+            &[
+                "execve:/usr/bin/init:/usr/bin/init --boot".to_string(),
+                "execve:/run/os/.rescue:/run/os/.rescue -i".to_string(),
+            ]
         );
     }
 }

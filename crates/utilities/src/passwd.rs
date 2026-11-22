@@ -3,7 +3,6 @@
 //! Updates local `/etc/shadow` PBKDF2-HMAC-SHA256 hashes via `abi::Call::Passwd` / `Usermod`.
 
 use abi::{Call, Creds, Errno};
-use std::io::{self, Write};
 
 pub const USAGE: &str = "\
 Usage: passwd [-l | -u | -S] [--force] [USER]
@@ -98,19 +97,7 @@ impl PasswdBackend for OsPasswdBackend {
     }
 
     fn prompt(&mut self, prompt: &str) -> Result<String, String> {
-        eprint!("{prompt}");
-        let _ = io::stderr().flush();
-        let mut line = String::new();
-        let n = io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| format!("failed to read input: {e}"))?;
-        if n == 0 {
-            return Err("aborted (EOF)".into());
-        }
-        while line.ends_with('\n') || line.ends_with('\r') {
-            line.pop();
-        }
-        Ok(line)
+        crate::prompt_password(prompt)
     }
 
     fn set_password(

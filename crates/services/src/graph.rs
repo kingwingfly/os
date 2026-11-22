@@ -47,6 +47,10 @@ pub struct UnitGraph {
     /// Effective activation edges (`unit -> units activated when starting unit`),
     /// combining `requires`, `wants`, and reverse `wanted_by` declarations.
     activates: BTreeMap<String, BTreeSet<String>>,
+    /// Soft child activation edges (`unit -> units pulled via wants or reverse wanted_by`),
+    /// explicitly excluding `requires` prerequisites so stopping an optional target never
+    /// tears down shared required prerequisites like `local-fs.target`.
+    wants_children: BTreeMap<String, BTreeSet<String>>,
     /// Effective ordering edges (`unit -> units that must start before unit`),
     /// combining `after` and `requires` (for concrete units present in the graph).
     ordered_after: BTreeMap<String, BTreeSet<String>>,
@@ -73,6 +77,7 @@ impl UnitGraph {
             units,
             templates,
             activates: BTreeMap::new(),
+            wants_children: BTreeMap::new(),
             ordered_after: BTreeMap::new(),
             start_order: Vec::new(),
         };
@@ -82,9 +87,11 @@ impl UnitGraph {
 
     fn recompute(&mut self) -> Result<(), GraphError> {
         let mut activates: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut wants_children: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut ordered_after: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for name in self.units.keys() {
             activates.insert(name.clone(), BTreeSet::new());
+            wants_children.insert(name.clone(), BTreeSet::new());
             ordered_after.insert(name.clone(), BTreeSet::new());
         }
 
@@ -102,6 +109,9 @@ impl UnitGraph {
             for want in &spec.wants {
                 if self.units.contains_key(want) {
                     activates.get_mut(name).unwrap().insert(want.clone());
+                    if !spec.requires.iter().any(|r| r == want) {
+                        wants_children.get_mut(name).unwrap().insert(want.clone());
+                    }
                 }
             }
             for after in &spec.after {
@@ -111,6 +121,12 @@ impl UnitGraph {
             }
             for target in &spec.wanted_by {
                 if let Some(set) = activates.get_mut(target) {
+                    set.insert(name.clone());
+                }
+                if let Some(target_spec) = self.units.get(target)
+                    && !target_spec.requires.iter().any(|r| r == name)
+                    && let Some(set) = wants_children.get_mut(target)
+                {
                     set.insert(name.clone());
                 }
             }
@@ -155,6 +171,7 @@ impl UnitGraph {
         }
 
         self.activates = activates;
+        self.wants_children = wants_children;
         self.ordered_after = ordered_after;
         self.start_order = order;
         Ok(())
@@ -277,12 +294,22 @@ impl UnitGraph {
             .collect())
     }
 
-    /// Compute the units to stop when stopping `unit`: `unit` itself plus any units that
-    /// transitively `require` it (or `wants` it if it is a `Target`? No, stopping a `Target`
-    /// stops units that `wanted_by` it only when explicitly stopping that target's group —
-    /// specifically for `cloud-online.target`, stopping it also tears down its `wants` children
-    /// if requested via `stop_target_group`). For `stop_plan_for`, we return `unit` plus all
-    /// transitive `requires`-dependents in strict reverse topological order.
+    /// Direct activation edges (`requires` ∪ `wants` ∪ reverse `wanted_by`) for `unit`.
+    pub fn activation_edges(&self, unit: &str) -> impl Iterator<Item = &String> {
+        self.activates.get(unit).into_iter().flat_map(|s| s.iter())
+    }
+
+    /// Direct soft children (`wants` ∪ reverse `wanted_by`, strictly excluding `requires`) of `unit`.
+    pub fn optional_children(&self, unit: &str) -> impl Iterator<Item = &String> {
+        self.wants_children
+            .get(unit)
+            .into_iter()
+            .flat_map(|s| s.iter())
+    }
+
+    /// Compute the units to stop when stopping `unit`: `unit` itself, soft `wants`/`wanted_by`
+    /// children when stopping an optional feature target (NEVER its `requires` prerequisites!),
+    /// plus all transitive `requires`-dependents in strict reverse topological order.
     pub fn stop_plan_for(&self, unit: &str) -> Result<Vec<String>, GraphError> {
         if !self.units.contains_key(unit) {
             return Err(GraphError::UnknownUnit(unit.to_owned()));
@@ -292,12 +319,12 @@ impl UnitGraph {
         to_stop.insert(unit.to_owned());
         queue.push_back(unit.to_owned());
 
-        // If stopping an optional/feature target like `cloud-online.target`, stop the units it
-        // exclusively activates via `wants`/`wanted_by` too (e.g. `cloud.mount`, `devattach@*`).
+        // If stopping an optional/feature target like `cloud-online.target`, include only its
+        // `wants`/`wanted_by` children — NEVER its `requires` prerequisites (e.g. `local-fs.target`).
         if let Some(spec) = self.units.get(unit)
             && spec.kind == UnitKind::Target
             && spec.failure_policy == FailurePolicy::Optional
-            && let Some(children) = self.activates.get(unit)
+            && let Some(children) = self.wants_children.get(unit)
         {
             for child in children {
                 if to_stop.insert(child.clone()) {
@@ -429,7 +456,7 @@ pub fn default_system_units() -> Vec<UnitSpec> {
             name: "user-session@.service".into(),
             kind: UnitKind::Service,
             description: "Per-user service manager and local auto-login session for uid %i".into(),
-            after: vec!["local-fs.target".into(), "multi-user.target".into()],
+            after: vec!["local-fs.target".into()],
             wants: Vec::new(),
             requires: vec!["local-fs.target".into()],
             wanted_by: vec!["multi-user.target".into()],
@@ -556,18 +583,129 @@ pub fn default_system_units() -> Vec<UnitSpec> {
     ]
 }
 
-/// Build the default boot graph with `user-session@<default_uid>.service` and the 4 optional
-/// `devattach@{archive,media,present,snd}.service` instances pre-instantiated.
+/// Build the default boot graph with `user-session@<default_uid>.service` (when `default_uid != 0`)
+/// and the 4 optional `devattach@{archive,media,present,snd}.service` instances pre-instantiated.
+///
+/// When `default_uid != 0`, `multi-user.target` requires and is ordered `after`
+/// `user-session@<default_uid>.service` so boot health (`MarkBootHealthy`) cannot fire until the
+/// default user session has notified `READY=1`.
 pub fn default_boot_graph(default_uid: u32) -> Result<UnitGraph, GraphError> {
-    let user_session = format!("user-session@{default_uid}.service");
     let mut specs = default_system_units();
-    if let Some(cloud_mount) = specs.iter_mut().find(|u| u.name == "cloud.mount") {
-        cloud_mount.after.push(user_session.clone());
+    if default_uid != 0 {
+        let user_session = format!("user-session@{default_uid}.service");
+        if let Some(template) = specs
+            .iter()
+            .find(|u| u.name == "user-session@.service")
+            .cloned()
+        {
+            let concrete = template
+                .instantiate(&default_uid.to_string())
+                .map_err(GraphError::InvalidUnit)?;
+            specs.push(concrete);
+        }
+        if let Some(multi_user) = specs.iter_mut().find(|u| u.name == "multi-user.target") {
+            if !multi_user.after.contains(&user_session) {
+                multi_user.after.push(user_session.clone());
+            }
+            if !multi_user.requires.contains(&user_session) {
+                multi_user.requires.push(user_session.clone());
+            }
+        }
+        if let Some(cloud_mount) = specs.iter_mut().find(|u| u.name == "cloud.mount")
+            && !cloud_mount.after.contains(&user_session)
+        {
+            cloud_mount.after.push(user_session);
+        }
     }
     let mut graph = UnitGraph::build(specs)?;
-    graph.instantiate_template(&user_session)?;
     for device in CLOUD_DEVICE_INSTANCES {
         graph.instantiate_template(&format!("devattach@{device}.service"))?;
     }
     Ok(graph)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_boot_graph_orders_and_requires_user_session_before_multi_user() {
+        let graph = default_boot_graph(1000).unwrap();
+        let order = graph.start_order();
+        let pos = |name: &str| order.iter().position(|u| u == name).unwrap();
+        assert!(pos("local-fs.target") < pos("user-session@1000.service"));
+        assert!(pos("user-session@1000.service") < pos("multi-user.target"));
+        assert!(pos("multi-user.target") < pos("cloud.mount"));
+
+        let multi = graph.unit("multi-user.target").unwrap();
+        assert!(multi.requires.contains(&"user-session@1000.service".into()));
+        assert!(multi.after.contains(&"user-session@1000.service".into()));
+
+        // Root-only boot (`default_uid == 0`) does not require `user-session@0.service`.
+        let root_graph = default_boot_graph(0).unwrap();
+        assert!(root_graph.unit("user-session@0.service").is_none());
+        let root_multi = root_graph.unit("multi-user.target").unwrap();
+        assert!(
+            !root_multi
+                .requires
+                .iter()
+                .any(|r| r.starts_with("user-session@"))
+        );
+    }
+
+    #[test]
+    fn stop_plan_for_optional_target_never_stops_requires_prerequisites() {
+        let mut graph = default_boot_graph(1000).unwrap();
+        let opt_svc = UnitSpec {
+            version: UNIT_MANIFEST_VERSION,
+            name: "opt-worker.service".into(),
+            kind: UnitKind::Service,
+            description: String::new(),
+            after: vec!["local-fs.target".into()],
+            wants: Vec::new(),
+            requires: vec!["local-fs.target".into()],
+            wanted_by: vec!["opt-feature.target".into()],
+            failure_policy: FailurePolicy::Optional,
+            readiness: Readiness::Immediate,
+            ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+            stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+            restart: RestartPolicy::Never,
+            exec_start: Some(vec!["/usr/bin/true".into()]),
+            exec_stop: None,
+            cwd: Some("/".into()),
+            environment: BTreeMap::new(),
+            mount: None,
+            grant: CapabilityGrant::default(),
+            enabled: true,
+        };
+        let opt_target = UnitSpec {
+            version: UNIT_MANIFEST_VERSION,
+            name: "opt-feature.target".into(),
+            kind: UnitKind::Target,
+            description: String::new(),
+            after: vec!["local-fs.target".into(), "opt-worker.service".into()],
+            wants: vec!["opt-worker.service".into()],
+            requires: vec!["local-fs.target".into()],
+            wanted_by: Vec::new(),
+            failure_policy: FailurePolicy::Optional,
+            readiness: Readiness::Immediate,
+            ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+            stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+            restart: RestartPolicy::Never,
+            exec_start: None,
+            exec_stop: None,
+            cwd: None,
+            environment: BTreeMap::new(),
+            mount: None,
+            grant: CapabilityGrant::default(),
+            enabled: true,
+        };
+        graph.register_unit(opt_svc).unwrap();
+        graph.register_unit(opt_target).unwrap();
+
+        let plan = graph.stop_plan_for("opt-feature.target").unwrap();
+        assert_eq!(plan, vec!["opt-feature.target", "opt-worker.service"]);
+        assert!(!plan.contains(&"local-fs.target".to_string()));
+        assert!(!plan.contains(&"multi-user.target".to_string()));
+    }
 }

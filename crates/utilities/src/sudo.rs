@@ -4,7 +4,7 @@
 //! Local `sudo` elevates only local OS authority (`uid 0`) and NEVER synthesizes remote cloud root.
 
 use abi::{Call, Creds, Errno};
-use std::io::{self, Write};
+use std::io;
 
 pub const USAGE: &str = "\
 Usage: sudo [-n] [-u USER] [--] COMMAND [ARG]...
@@ -129,19 +129,7 @@ impl SudoBackend for OsSudoBackend {
     }
 
     fn prompt_password(&mut self, prompt: &str) -> Result<String, String> {
-        eprint!("{prompt}");
-        let _ = io::stderr().flush();
-        let mut line = String::new();
-        let n = io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| format!("failed to read password: {e}"))?;
-        if n == 0 {
-            return Err("no password provided (EOF)".into());
-        }
-        while line.ends_with('\n') || line.ends_with('\r') {
-            line.pop();
-        }
-        Ok(line)
+        crate::prompt_password(prompt)
     }
 
     fn sudo_call(&mut self, password: &str, revoke: bool) -> Result<(), abi::Error> {
@@ -418,5 +406,54 @@ mod tests {
         assert_eq!(code, 1);
         assert!(err.unwrap().contains("missing command"));
         assert!(no_cmd.steps.is_empty());
+    }
+
+    #[test]
+    fn sudo_target_user_switches_only_after_authentication() {
+        let mut wheel = MockSudo {
+            creds: Creds {
+                uid: 1000,
+                user: "user".into(),
+                can_sudo: true,
+                sudo_active: true,
+                ..Creds::default()
+            },
+            password: None,
+            steps: Vec::new(),
+        };
+        let (_, err, code) = run_with(&s(&["-u", "alice", "id"]), &mut wheel);
+        assert_eq!((err, code), (None, 0));
+        assert_eq!(
+            wheel.steps,
+            vec!["sudo:false:", "login:alice", "exec:id:id"]
+        );
+
+        let mut root = MockSudo {
+            creds: Creds {
+                uid: 0,
+                user: "root".into(),
+                ..Creds::default()
+            },
+            password: None,
+            steps: Vec::new(),
+        };
+        let (_, err, code) = run_with(&s(&["-u", "alice", "whoami"]), &mut root);
+        assert_eq!((err, code), (None, 0));
+        assert_eq!(root.steps, vec!["login:alice", "exec:whoami:whoami"]);
+
+        // Failed auth must NEVER call `login_as`.
+        let mut denied = MockSudo {
+            creds: Creds {
+                uid: 1001,
+                user: "bob".into(),
+                can_sudo: false,
+                sudo_active: false,
+                ..Creds::default()
+            },
+            password: None,
+            steps: Vec::new(),
+        };
+        assert_eq!(run_with(&s(&["-u", "alice", "id"]), &mut denied).2, 1);
+        assert!(denied.steps.is_empty());
     }
 }

@@ -20,10 +20,320 @@
 #[allow(dead_code)]
 mod notify;
 
+#[cfg_attr(not(target_os = "wasi"), allow(dead_code))]
+mod helpers {
+    use abi::Errno;
+    use os_services::graph::{CLOUD_DEVICE_INSTANCES, UnitGraph};
+    use os_services::unit::{ResourceLimits, UnitSpec};
+    use std::collections::BTreeMap;
+    use std::io;
+
+    /// Path where Stage 1 `switch_root` retains a verified rescue binary across the pivot.
+    /// Stage 2 PID 1 unlinks it cleanly on startup once PID 1 is alive.
+    pub const RETAINED_RESCUE_PATH: &str = "/run/os/.rescue";
+
+    /// Targets unmounted by PID 1 during `CloseCleanRoot`.
+    pub const SHUTDOWN_UNMOUNT_TARGETS: &[&str] = &["/mnt/cloud", "/tmp", "/usr"];
+
+    /// Build the system unit graph from default + on-disk specs, ensuring that when
+    /// `default_uid != 0`, `user-session@<default_uid>.service` is instantiated and ordered/required
+    /// BEFORE `multi-user.target` so `MarkBootHealthy` cannot fire until the user session is ready.
+    pub fn build_system_graph(
+        default_uid: u32,
+        mut by_name: BTreeMap<String, UnitSpec>,
+    ) -> Result<UnitGraph, String> {
+        let user_session =
+            (default_uid != 0).then(|| format!("user-session@{default_uid}.service"));
+        if let Some(ref us) = user_session {
+            if let Some(tmpl) = by_name.get_mut("user-session@.service") {
+                // Defensively strip legacy `multi-user.target` ordering from older unit files.
+                tmpl.after.retain(|dep| dep != "multi-user.target");
+            }
+            if !by_name.contains_key(us)
+                && let Some(tmpl) = by_name.get("user-session@.service").cloned()
+            {
+                let concrete = tmpl.instantiate(&default_uid.to_string())?;
+                by_name.insert(concrete.name.clone(), concrete);
+            }
+            if let Some(multi_user) = by_name.get_mut("multi-user.target") {
+                if !multi_user.after.contains(us) {
+                    multi_user.after.push(us.clone());
+                }
+                if !multi_user.requires.contains(us) {
+                    multi_user.requires.push(us.clone());
+                }
+            }
+            if let Some(cloud_mount) = by_name.get_mut("cloud.mount")
+                && !cloud_mount.after.contains(us)
+            {
+                cloud_mount.after.push(us.clone());
+            }
+        }
+
+        let mut graph =
+            UnitGraph::build(by_name.into_values().collect()).map_err(|e| e.to_string())?;
+        for dev in CLOUD_DEVICE_INSTANCES {
+            let _ = graph.instantiate_template(&format!("devattach@{dev}.service"));
+        }
+        Ok(graph)
+    }
+
+    /// Unmount every target in `targets`, ignoring `ENOENT`/`EINVAL` (not mounted) and recording
+    /// every real unmount error (`EBUSY`, `EIO`, `EPERM`, etc.).
+    pub fn unmount_shutdown_targets<F>(targets: &[&str], mut umount_fn: F) -> Vec<String>
+    where
+        F: FnMut(&str) -> io::Result<()>,
+    {
+        let mut errors = Vec::new();
+        for &target in targets {
+            if let Err(err) = umount_fn(target) {
+                if matches!(
+                    os_posix::errno_of(&err),
+                    Some(Errno::ENOENT | Errno::EINVAL)
+                ) {
+                    continue;
+                }
+                errors.push(format!("{target}: {err}"));
+            }
+        }
+        errors
+    }
+
+    /// Format `/run/os/shutdown` JSON payload: `"clean":true` ONLY when `errors` is empty.
+    pub fn format_shutdown_record(mode: &str, errors: &[String]) -> String {
+        let mut value = if errors.is_empty() {
+            serde_json::json!({
+                "mode": mode,
+                "clean": true,
+            })
+            .to_string()
+        } else {
+            serde_json::json!({
+                "mode": mode,
+                "clean": false,
+                "errors": errors,
+            })
+            .to_string()
+        };
+        value.push('\n');
+        value
+    }
+
+    /// Resolve `(uid, gid)` for a unit's `grant.user` (numeric UID or username) from `/etc/passwd`.
+    pub fn lookup_passwd_uid_gid(passwd_text: &str, user_spec: &str) -> Result<(u32, u32), String> {
+        let numeric = user_spec.parse::<u32>().ok();
+        for line in passwd_text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<&str> = trimmed.split(':').collect();
+            if fields.len() < 4 {
+                continue;
+            }
+            let Ok(uid) = fields[2].parse::<u32>() else {
+                continue;
+            };
+            let Ok(gid) = fields[3].parse::<u32>() else {
+                continue;
+            };
+            let matched = match numeric {
+                Some(wanted_uid) => uid == wanted_uid,
+                None => fields[0] == user_spec,
+            };
+            if matched {
+                return Ok((uid, gid));
+            }
+        }
+        Err(format!("user '{user_spec}' not found in /etc/passwd"))
+    }
+
+    /// Minimal filesystem status needed to verify `/run/user/<uid>` ownership and mode.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct DirStat {
+        pub is_dir: bool,
+        pub uid: u32,
+        pub gid: u32,
+        pub mode: u32,
+    }
+
+    pub trait UserRuntimeDirOps {
+        fn create_dir_all(&mut self, path: &str) -> Result<(), String>;
+        fn chmod(&mut self, path: &str, mode: u16) -> Result<(), String>;
+        fn chown(&mut self, path: &str, uid: u32, gid: u32) -> Result<(), String>;
+        fn lstat(&self, path: &str) -> Result<DirStat, String>;
+    }
+
+    /// PID 1 preparation of `/run/user` (`0755`) and `/run/user/<uid>` (`uid:gid`, `0700`) with
+    /// explicit post-creation `lstat` verification before spawning `user-session@<uid>.service`.
+    pub fn prepare_user_runtime_dir(
+        ops: &mut impl UserRuntimeDirOps,
+        uid: u32,
+        gid: u32,
+    ) -> Result<String, String> {
+        ops.create_dir_all("/run/user")
+            .map_err(|e| format!("create /run/user: {e}"))?;
+        ops.chmod("/run/user", 0o755)
+            .map_err(|e| format!("chmod /run/user: {e}"))?;
+        let user_dir = format!("/run/user/{uid}");
+        ops.create_dir_all(&user_dir)
+            .map_err(|e| format!("create {user_dir}: {e}"))?;
+        let pre = ops
+            .lstat(&user_dir)
+            .map_err(|e| format!("stat {user_dir}: {e}"))?;
+        if !pre.is_dir {
+            return Err(format!("{user_dir} is not a directory"));
+        }
+        ops.chown(&user_dir, uid, gid)
+            .map_err(|e| format!("chown {user_dir} to {uid}:{gid}: {e}"))?;
+        ops.chmod(&user_dir, 0o700)
+            .map_err(|e| format!("chmod {user_dir} 0700: {e}"))?;
+        let st = ops
+            .lstat(&user_dir)
+            .map_err(|e| format!("verify stat {user_dir}: {e}"))?;
+        if !st.is_dir || st.uid != uid || st.gid != gid || (st.mode & 0o7777) != 0o700 {
+            return Err(format!(
+                "verification failed for {user_dir}: is_dir={} uid={} gid={} mode=0o{:o} (expected dir {uid}:{gid} 0o700)",
+                st.is_dir,
+                st.uid,
+                st.gid,
+                st.mode & 0o7777
+            ));
+        }
+        Ok(user_dir)
+    }
+
+    /// Per-user manager (`--user`) validation/setup of `/run/user/<uid>`: propagates errors
+    /// instead of silently ignoring directory creation or permission failures.
+    pub fn ensure_user_mode_runtime_dir(
+        ops: &mut impl UserRuntimeDirOps,
+        uid: u32,
+    ) -> Result<String, String> {
+        let user_dir = format!("/run/user/{uid}");
+        ops.create_dir_all(&user_dir)
+            .map_err(|e| format!("create {user_dir}: {e}"))?;
+        ops.chmod(&user_dir, 0o700)
+            .map_err(|e| format!("chmod {user_dir} 0700: {e}"))?;
+        let st = ops
+            .lstat(&user_dir)
+            .map_err(|e| format!("stat {user_dir}: {e}"))?;
+        if !st.is_dir || st.uid != uid || (st.mode & 0o7777) != 0o700 {
+            return Err(format!(
+                "invalid runtime dir {user_dir}: is_dir={} uid={} mode=0o{:o}",
+                st.is_dir,
+                st.uid,
+                st.mode & 0o7777
+            ));
+        }
+        Ok(user_dir)
+    }
+
+    /// Sanitize a unit name into a valid cgroup v2 path segment (`[a-zA-Z0-9._-]`, <= 64 chars).
+    pub fn sanitize_cgroup_unit_name(unit: &str) -> String {
+        let mut out: String = unit
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(64)
+            .collect();
+        if out.is_empty() || out == "." || out == ".." {
+            out = "unit".into();
+        }
+        out
+    }
+
+    /// Compute `(parent_cgroup, unit_cgroup)` for system PID 1 (`/services/<unit>`) or per-user
+    /// managers (`/user/services-<uid>/<unit>`).
+    pub fn service_cgroup_paths(is_system: bool, manager_uid: u32, unit: &str) -> (String, String) {
+        let seg = sanitize_cgroup_unit_name(unit);
+        if is_system {
+            ("/services".into(), format!("/services/{seg}"))
+        } else {
+            let parent = format!("/user/services-{manager_uid}");
+            let child = format!("{parent}/{seg}");
+            (parent, child)
+        }
+    }
+
+    /// Translate declared `ResourceLimits` into ordered `(key, value)` cgroup v2 control writes.
+    pub fn resource_limit_controls(limits: &ResourceLimits) -> Vec<(&'static str, String)> {
+        let mut controls = Vec::new();
+        if let Some(ref cpu_max) = limits.cpu_max {
+            controls.push(("cpu.max", cpu_max.clone()));
+        }
+        if let Some(memory_max) = limits.memory_max {
+            controls.push(("memory.max", memory_max.to_string()));
+        }
+        if let Some(pids_max) = limits.pids_max {
+            controls.push(("pids.max", pids_max.to_string()));
+        }
+        if limits.io_read_bps.is_some() || limits.io_write_bps.is_some() {
+            let rate = |v: Option<u64>| v.map_or_else(|| "max".to_string(), |n| n.to_string());
+            controls.push((
+                "io.max",
+                format!(
+                    "rbps={} wbps={}",
+                    rate(limits.io_read_bps),
+                    rate(limits.io_write_bps)
+                ),
+            ));
+        }
+        controls
+    }
+
+    pub trait CgroupOps {
+        fn create(&mut self, path: &str, process_lifetime: bool) -> Result<(), abi::Error>;
+        fn set(&mut self, path: &str, key: &str, value: &str) -> Result<(), abi::Error>;
+        fn remove(&mut self, path: &str) -> Result<(), abi::Error>;
+    }
+
+    /// Create and configure the cgroup for a service with declared `ResourceLimits`.
+    /// Fails closed (cleaning up a freshly created cgroup) if creation or any limit write fails.
+    pub fn setup_service_cgroup(
+        ops: &mut impl CgroupOps,
+        is_system: bool,
+        manager_uid: u32,
+        unit: &str,
+        limits: &ResourceLimits,
+    ) -> Result<String, String> {
+        let (parent, cg_path) = service_cgroup_paths(is_system, manager_uid, unit);
+        if let Err(err) = ops.create(&parent, false)
+            && err.errno != Errno::EEXIST
+        {
+            return Err(format!("cgroup create {parent}: {err}"));
+        }
+        let created_fresh = match ops.create(&cg_path, !is_system) {
+            Ok(()) => true,
+            Err(err) if err.errno == Errno::EEXIST => false,
+            Err(err) => return Err(format!("cgroup create {cg_path}: {err}")),
+        };
+        for (key, value) in resource_limit_controls(limits) {
+            if let Err(err) = ops.set(&cg_path, key, &value) {
+                if created_fresh {
+                    let _ = ops.remove(&cg_path);
+                }
+                return Err(format!("cgroup set {cg_path} {key}={value}: {err}"));
+            }
+        }
+        Ok(cg_path)
+    }
+}
+
 #[cfg(target_os = "wasi")]
 mod runtime {
+    use crate::helpers::{
+        CgroupOps, DirStat, RETAINED_RESCUE_PATH, SHUTDOWN_UNMOUNT_TARGETS, UserRuntimeDirOps,
+        build_system_graph, ensure_user_mode_runtime_dir, format_shutdown_record,
+        lookup_passwd_uid_gid, prepare_user_runtime_dir, setup_service_cgroup,
+        unmount_shutdown_targets,
+    };
     use crate::notify::{Notification, notify_socket_ready};
-    use abi::{Call, Creds, Errno};
+    use abi::{Call, CgroupLifetime, Creds, Errno};
     use os_posix::process::{
         Child, ServiceBindMount, ServiceGrant, SpawnOptions, Stdin, spawn_configured,
     };
@@ -36,7 +346,7 @@ mod runtime {
         SYSTEM_CONTROL_SOCKET, SYSTEM_NOTIFY_SOCKET, decode_request_frame, encode_response_frame,
         user_manager_socket,
     };
-    use os_services::graph::{CLOUD_DEVICE_INSTANCES, UnitGraph, default_system_units};
+    use os_services::graph::{UnitGraph, default_system_units};
     use os_services::manager::{ManagerAction, ServiceManager, ShutdownMode};
     use os_services::unit::UnitSpec;
     use std::collections::BTreeMap;
@@ -158,6 +468,84 @@ mod runtime {
         }
     }
 
+    struct OsRuntimeOps;
+
+    impl UserRuntimeDirOps for OsRuntimeOps {
+        fn create_dir_all(&mut self, path: &str) -> Result<(), String> {
+            fs::create_dir_all(path).map_err(|e| e.to_string())
+        }
+
+        fn chmod(&mut self, path: &str, mode: u16) -> Result<(), String> {
+            let mut reply = os_posix::batch(&[Call::Chmod {
+                path: path.to_owned(),
+                mode,
+            }])
+            .map_err(|e| e.to_string())?;
+            reply
+                .results
+                .remove(0)
+                .into_result()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+
+        fn chown(&mut self, path: &str, uid: u32, gid: u32) -> Result<(), String> {
+            let mut reply = os_posix::batch(&[Call::Chown {
+                path: path.to_owned(),
+                uid: Some(uid),
+                gid: Some(gid),
+                nofollow: true,
+            }])
+            .map_err(|e| e.to_string())?;
+            reply
+                .results
+                .remove(0)
+                .into_result()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+
+        fn lstat(&self, path: &str) -> Result<DirStat, String> {
+            let st = os_posix::stat(Path::new(path), false).map_err(|e| e.to_string())?;
+            Ok(DirStat {
+                is_dir: st.is_dir(),
+                uid: st.uid,
+                gid: st.gid,
+                mode: st.mode,
+            })
+        }
+    }
+
+    impl CgroupOps for OsRuntimeOps {
+        fn create(&mut self, path: &str, process_lifetime: bool) -> Result<(), abi::Error> {
+            let mut reply = os_posix::batch(&[Call::CgroupCreate {
+                path: path.to_owned(),
+                controllers: None,
+                lifetime: process_lifetime.then_some(CgroupLifetime::Process),
+            }])
+            .map_err(|e| abi::Error::because(Errno::EIO, e.to_string()))?;
+            reply.results.remove(0).into_result().map(|_| ())
+        }
+
+        fn set(&mut self, path: &str, key: &str, value: &str) -> Result<(), abi::Error> {
+            let mut reply = os_posix::batch(&[Call::CgroupSet {
+                path: path.to_owned(),
+                key: key.to_owned(),
+                value: value.to_owned(),
+            }])
+            .map_err(|e| abi::Error::because(Errno::EIO, e.to_string()))?;
+            reply.results.remove(0).into_result().map(|_| ())
+        }
+
+        fn remove(&mut self, path: &str) -> Result<(), abi::Error> {
+            let mut reply = os_posix::batch(&[Call::CgroupRemove {
+                path: path.to_owned(),
+            }])
+            .map_err(|e| abi::Error::because(Errno::EIO, e.to_string()))?;
+            reply.results.remove(0).into_result().map(|_| ())
+        }
+    }
+
     fn load_system_graph(default_uid: u32) -> Result<UnitGraph, String> {
         let mut by_name = BTreeMap::new();
         for spec in default_system_units() {
@@ -165,25 +553,7 @@ mod runtime {
         }
         load_units_from_dir("/usr/lib/os/units", &mut by_name);
         load_units_from_dir("/etc/services", &mut by_name);
-
-        let user_session =
-            (default_uid != 0).then(|| format!("user-session@{default_uid}.service"));
-        if let Some(ref us) = user_session
-            && let Some(cloud_mount) = by_name.get_mut("cloud.mount")
-            && !cloud_mount.after.contains(us)
-        {
-            cloud_mount.after.push(us.clone());
-        }
-
-        let mut graph =
-            UnitGraph::build(by_name.into_values().collect()).map_err(|e| e.to_string())?;
-        if let Some(ref us) = user_session {
-            let _ = graph.instantiate_template(us);
-        }
-        for dev in CLOUD_DEVICE_INSTANCES {
-            let _ = graph.instantiate_template(&format!("devattach@{dev}.service"));
-        }
-        Ok(graph)
+        build_system_graph(default_uid, by_name)
     }
 
     fn load_user_graph(home: &str) -> Result<UnitGraph, String> {
@@ -277,6 +647,53 @@ mod runtime {
                     {
                         argv = vec!["/usr/bin/init".into(), "--devattach".into(), dev];
                     }
+                    // Finding #17: Before PID 1 spawns `user-session@<uid>.service`, create and
+                    // verify the UID-owned `0700` `/run/user/<uid>` directory so the per-user
+                    // manager can bind its sockets cleanly after dropping privileges.
+                    if is_system
+                        && unit.starts_with("user-session@")
+                        && let Some(ref user_spec) = spec.grant.user
+                    {
+                        let prep = fs::read_to_string("/etc/passwd")
+                            .map_err(|e| format!("read /etc/passwd: {e}"))
+                            .and_then(|passwd| lookup_passwd_uid_gid(&passwd, user_spec))
+                            .and_then(|(uid, gid)| {
+                                let mut ops = OsRuntimeOps;
+                                prepare_user_runtime_dir(&mut ops, uid, gid)
+                            });
+                        if let Err(err) = prep {
+                            let _ = manager.on_spawn_failed(
+                                &unit,
+                                &format!("prepare user runtime dir: {err}"),
+                                now_ms,
+                            );
+                            continue;
+                        }
+                    }
+
+                    // Finding #19: Enforce declared cgroup v2 resource limits; fail spawn closed
+                    // instead of silently dropping limits if cgroup setup fails.
+                    let cgroup_path = if let Some(ref limits) = spec.grant.limits
+                        && !limits.is_empty()
+                    {
+                        let mut ops = OsRuntimeOps;
+                        match setup_service_cgroup(
+                            &mut ops,
+                            is_system,
+                            manager.manager_uid(),
+                            &unit,
+                            limits,
+                        ) {
+                            Ok(path) => Some(path),
+                            Err(err) => {
+                                let _ = manager.on_spawn_failed(&unit, &err, now_ms);
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     let mut env_map: BTreeMap<String, String> = BTreeMap::new();
                     env_map.insert("PATH".into(), "/usr/bin:/bin:/sbin".into());
                     for (k, v) in &spec.environment {
@@ -316,20 +733,27 @@ mod runtime {
                             read_only: b.read_only,
                         })
                         .collect();
+                    let dev_refs: Vec<&str> =
+                        spec.grant.devices.iter().map(String::as_str).collect();
+                    let cloud_scope =
+                        (!spec.grant.cloud_scope.is_empty()).then_some(&spec.grant.cloud_scope);
                     let needs_grant = spec.grant.user.is_some()
+                        || spec.grant.group.is_some()
                         || !binds.is_empty()
-                        || spec.grant.mount_namespace.as_str() != "system";
+                        || spec.grant.mount_namespace.as_str() != "system"
+                        || !dev_refs.is_empty()
+                        || cloud_scope.is_some();
                     let service_grant = needs_grant.then(|| ServiceGrant {
                         mount_namespace: spec.grant.mount_namespace.as_str(),
                         bind_mounts: &binds,
                         user: spec.grant.user.as_deref(),
                         group: spec.grant.group.as_deref(),
-                        devices: &[],
-                        cloud_scope: None,
+                        devices: &dev_refs,
+                        cloud_scope,
                     });
                     let cwd = spec.cwd.as_deref().unwrap_or("/");
                     let opts = SpawnOptions {
-                        cgroup: None,
+                        cgroup: cgroup_path.as_deref(),
                         dup2: &[],
                         service_grant,
                     };
@@ -380,18 +804,16 @@ mod runtime {
                 }
                 ManagerAction::CloseCleanRoot { reboot } => {
                     if is_system {
-                        for target in ["/mnt/cloud", "/tmp", "/usr"] {
-                            let _ = os_posix::umount2(
+                        let errors = unmount_shutdown_targets(SHUTDOWN_UNMOUNT_TARGETS, |target| {
+                            os_posix::umount2(
                                 std::path::Path::new(target),
                                 abi::umount_flags::MNT_DETACH,
-                            );
-                        }
+                            )
+                        });
                         ensure_dir_mode("/run/os", 0o755);
                         let mode = if reboot { "reboot" } else { "poweroff" };
-                        let _ = fs::write(
-                            "/run/os/shutdown",
-                            format!("{{\"mode\":\"{mode}\",\"clean\":true}}\n"),
-                        );
+                        let record = format_shutdown_record(mode, &errors);
+                        let _ = fs::write("/run/os/shutdown", record);
                     }
                     should_exit = true;
                 }
@@ -416,18 +838,12 @@ mod runtime {
         loop {
             let now = now_ms();
 
-            // 1. Handle termination signals -> clean ordered reverse shutdown.
+            // 1. Handle termination signals -> private manager-local ordered reverse shutdown
+            //    (Finding #28: works for both PID 1 and per-user managers without routing through
+            //    root-only external control-socket `Poweroff`).
             let stop_sig = STOP.load(Ordering::SeqCst);
             if stop_sig != 0 && manager.shutdown_mode() == ShutdownMode::None {
-                let (_, actions) = manager.handle_control(
-                    PeerCred {
-                        pid: 1,
-                        uid: manager.manager_uid(),
-                        gid: manager.manager_uid(),
-                    },
-                    os_services::control::ControlRequest::Poweroff,
-                    now,
-                );
+                let actions = manager.begin_local_shutdown(now);
                 if execute_actions(actions, &mut manager, &mut live, is_system, now) {
                     return Ok(());
                 }
@@ -611,9 +1027,8 @@ mod runtime {
                     creds.uid
                 ));
             }
-            ensure_dir_mode("/run/user", 0o755);
-            let user_dir = format!("/run/user/{}", creds.uid);
-            ensure_dir_mode(&user_dir, 0o700);
+            let mut dir_ops = OsRuntimeOps;
+            let user_dir = ensure_user_mode_runtime_dir(&mut dir_ops, creds.uid)?;
             let notify_path = format!("{user_dir}/notify.sock");
             let control_path = user_manager_socket(creds.uid);
             let _ = fs::remove_file(&notify_path);
@@ -647,6 +1062,8 @@ mod runtime {
         ensure_dir_mode("/run/init", 0o755);
         ensure_dir_mode("/run/os", 0o755);
         ensure_dir_mode("/run/user", 0o755);
+        // Finding #9: Stage 2 PID 1 is alive; unlink retained Stage 1 rescue binary cleanly.
+        let _ = fs::remove_file(RETAINED_RESCUE_PATH);
         let _ = fs::remove_file(SYSTEM_NOTIFY_SOCKET);
         let _ = fs::remove_file(SYSTEM_CONTROL_SOCKET);
 
@@ -678,5 +1095,249 @@ fn main() {
     if let Err(error) = result {
         eprintln!("init: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::helpers::*;
+    use abi::Errno;
+    use os_services::graph::default_system_units;
+    use os_services::unit::ResourceLimits;
+    use std::collections::BTreeMap;
+    use std::io;
+
+    fn os_err(errno: Errno) -> io::Error {
+        io::Error::other(os_posix::OsCallError(abi::Error::new(errno)))
+    }
+
+    #[test]
+    fn build_system_graph_requires_user_session_before_multi_user_even_with_legacy_unit() {
+        let mut by_name = BTreeMap::new();
+        for mut spec in default_system_units() {
+            if spec.name == "user-session@.service" {
+                spec.after.push("multi-user.target".into());
+            }
+            by_name.insert(spec.name.clone(), spec);
+        }
+        let graph = build_system_graph(1000, by_name).unwrap();
+        let order = graph.start_order();
+        let pos = |n: &str| order.iter().position(|u| u == n).unwrap();
+        assert!(pos("local-fs.target") < pos("user-session@1000.service"));
+        assert!(pos("user-session@1000.service") < pos("multi-user.target"));
+        let multi = graph.unit("multi-user.target").unwrap();
+        assert!(multi.requires.contains(&"user-session@1000.service".into()));
+        assert!(multi.after.contains(&"user-session@1000.service".into()));
+    }
+
+    #[test]
+    fn shutdown_unmount_checks_ignore_enoent_einval_and_report_real_failures() {
+        // Optional `/mnt/cloud` unmounted (`EINVAL`), `/tmp` & `/usr` unmount cleanly -> clean:true.
+        let errs = unmount_shutdown_targets(SHUTDOWN_UNMOUNT_TARGETS, |target| match target {
+            "/mnt/cloud" => Err(os_err(Errno::EINVAL)),
+            "/tmp" | "/usr" => Ok(()),
+            _ => Err(os_err(Errno::ENOENT)),
+        });
+        assert!(errs.is_empty());
+        let ok_rec: serde_json::Value =
+            serde_json::from_str(&format_shutdown_record("poweroff", &errs)).unwrap();
+        assert_eq!(ok_rec["mode"], "poweroff");
+        assert_eq!(ok_rec["clean"], true);
+        assert!(ok_rec.get("errors").is_none());
+
+        // Real failure (`EBUSY` on `/usr`, `EIO` on `/mnt/cloud`) -> clean:false + errors list!
+        let errs = unmount_shutdown_targets(SHUTDOWN_UNMOUNT_TARGETS, |target| match target {
+            "/mnt/cloud" => Err(os_err(Errno::EIO)),
+            "/tmp" => Ok(()),
+            "/usr" => Err(os_err(Errno::EBUSY)),
+            _ => Ok(()),
+        });
+        assert_eq!(errs.len(), 2);
+        let bad_rec: serde_json::Value =
+            serde_json::from_str(&format_shutdown_record("reboot", &errs)).unwrap();
+        assert_eq!(bad_rec["mode"], "reboot");
+        assert_eq!(bad_rec["clean"], false);
+        let list = bad_rec["errors"].as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].as_str().unwrap().contains("/mnt/cloud"));
+        assert!(list[1].as_str().unwrap().contains("/usr"));
+    }
+
+    struct MockDirOps {
+        dirs: BTreeMap<String, DirStat>,
+        fail_create: Option<String>,
+        fail_chmod: Option<String>,
+        override_post_stat: Option<DirStat>,
+    }
+
+    impl MockDirOps {
+        fn new() -> Self {
+            Self {
+                dirs: BTreeMap::new(),
+                fail_create: None,
+                fail_chmod: None,
+                override_post_stat: None,
+            }
+        }
+    }
+
+    impl UserRuntimeDirOps for MockDirOps {
+        fn create_dir_all(&mut self, path: &str) -> Result<(), String> {
+            if self.fail_create.as_deref() == Some(path) {
+                return Err("EACCES".into());
+            }
+            self.dirs.entry(path.to_owned()).or_insert(DirStat {
+                is_dir: true,
+                uid: 0,
+                gid: 0,
+                mode: 0o755,
+            });
+            Ok(())
+        }
+        fn chmod(&mut self, path: &str, mode: u16) -> Result<(), String> {
+            if self.fail_chmod.as_deref() == Some(path) {
+                return Err("EPERM".into());
+            }
+            let entry = self.dirs.get_mut(path).ok_or_else(|| "ENOENT".to_owned())?;
+            entry.mode = u32::from(mode);
+            Ok(())
+        }
+        fn chown(&mut self, path: &str, uid: u32, gid: u32) -> Result<(), String> {
+            let entry = self.dirs.get_mut(path).ok_or_else(|| "ENOENT".to_owned())?;
+            entry.uid = uid;
+            entry.gid = gid;
+            Ok(())
+        }
+        fn lstat(&self, path: &str) -> Result<DirStat, String> {
+            if path == "/run/user/1000"
+                && let Some(over) = self.override_post_stat
+            {
+                return Ok(over);
+            }
+            self.dirs
+                .get(path)
+                .copied()
+                .ok_or_else(|| "ENOENT".to_owned())
+        }
+    }
+
+    #[test]
+    fn user_runtime_dir_preparation_and_user_mode_checks_fail_closed() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1005:User:/home/user:/bin/sh\n";
+        assert_eq!(lookup_passwd_uid_gid(passwd, "1000").unwrap(), (1000, 1005));
+        assert_eq!(lookup_passwd_uid_gid(passwd, "user").unwrap(), (1000, 1005));
+        assert!(lookup_passwd_uid_gid(passwd, "ghost").is_err());
+
+        // PID 1 creates `/run/user` (0755) and `/run/user/1000` (1000:1005 0700) and verifies stat.
+        let mut ops = MockDirOps::new();
+        let dir = prepare_user_runtime_dir(&mut ops, 1000, 1005).unwrap();
+        assert_eq!(dir, "/run/user/1000");
+        assert_eq!(
+            ops.dirs["/run/user/1000"],
+            DirStat {
+                is_dir: true,
+                uid: 1000,
+                gid: 1005,
+                mode: 0o700,
+            }
+        );
+
+        // Verification fails closed if stat reports wrong owner/mode or non-directory!
+        let mut bad_ops = MockDirOps::new();
+        bad_ops.override_post_stat = Some(DirStat {
+            is_dir: true,
+            uid: 0,
+            gid: 0,
+            mode: 0o755,
+        });
+        assert!(prepare_user_runtime_dir(&mut bad_ops, 1000, 1005).is_err());
+
+        // `--user` mode propagates `create_dir_all` and `chmod` errors instead of ignoring them!
+        let mut unpriv_create_fail = MockDirOps::new();
+        unpriv_create_fail.fail_create = Some("/run/user/1000".into());
+        assert!(ensure_user_mode_runtime_dir(&mut unpriv_create_fail, 1000).is_err());
+
+        let mut unpriv_chmod_fail = MockDirOps::new();
+        unpriv_chmod_fail.dirs.insert(
+            "/run/user/1000".into(),
+            DirStat {
+                is_dir: true,
+                uid: 1000,
+                gid: 1000,
+                mode: 0o700,
+            },
+        );
+        unpriv_chmod_fail.fail_chmod = Some("/run/user/1000".into());
+        assert!(ensure_user_mode_runtime_dir(&mut unpriv_chmod_fail, 1000).is_err());
+    }
+
+    struct MockCgroupOps {
+        calls: Vec<String>,
+        fail_set_key: Option<String>,
+    }
+
+    impl CgroupOps for MockCgroupOps {
+        fn create(&mut self, path: &str, process_lifetime: bool) -> Result<(), abi::Error> {
+            self.calls
+                .push(format!("create:{path}:proc={process_lifetime}"));
+            Ok(())
+        }
+        fn set(&mut self, path: &str, key: &str, value: &str) -> Result<(), abi::Error> {
+            self.calls.push(format!("set:{path}:{key}={value}"));
+            if self.fail_set_key.as_deref() == Some(key) {
+                return Err(abi::Error::new(Errno::EOPNOTSUPP));
+            }
+            Ok(())
+        }
+        fn remove(&mut self, path: &str) -> Result<(), abi::Error> {
+            self.calls.push(format!("remove:{path}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn service_cgroup_setup_sanitizes_name_applies_limits_and_fails_closed_on_error() {
+        assert_eq!(
+            sanitize_cgroup_unit_name("user-session@1000.service"),
+            "user-session_1000.service"
+        );
+        let limits = ResourceLimits {
+            cpu_max: Some("max 100000".into()),
+            memory_max: Some(64 * 1024 * 1024),
+            pids_max: Some(16),
+            io_read_bps: Some(1_048_576),
+            io_write_bps: None,
+        };
+        let mut ops = MockCgroupOps {
+            calls: Vec::new(),
+            fail_set_key: None,
+        };
+        let cg = setup_service_cgroup(&mut ops, true, 0, "worker@1.service", &limits).unwrap();
+        assert_eq!(cg, "/services/worker_1.service");
+        assert_eq!(
+            ops.calls,
+            vec![
+                "create:/services:proc=false",
+                "create:/services/worker_1.service:proc=false",
+                "set:/services/worker_1.service:cpu.max=max 100000",
+                "set:/services/worker_1.service:memory.max=67108864",
+                "set:/services/worker_1.service:pids.max=16",
+                "set:/services/worker_1.service:io.max=rbps=1048576 wbps=max",
+            ]
+        );
+
+        // If setting any limit fails (e.g. unsupported `cpu.max` quota), fail closed & remove cgroup!
+        let mut fail_ops = MockCgroupOps {
+            calls: Vec::new(),
+            fail_set_key: Some("cpu.max".into()),
+        };
+        let err =
+            setup_service_cgroup(&mut fail_ops, true, 0, "strict.service", &limits).unwrap_err();
+        assert!(err.contains("cpu.max"));
+        assert!(
+            fail_ops
+                .calls
+                .contains(&"remove:/services/strict.service".to_string())
+        );
     }
 }

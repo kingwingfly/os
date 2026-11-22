@@ -117,12 +117,12 @@ fn dag_topological_order_cycle_detection_and_reverse_shutdown_order() {
         Err(GraphError::UnknownDependency { .. })
     ));
 
-    // Built-in default boot graph orders local-fs -> multi-user -> user-session -> cloud.mount -> devattach -> cloud-online.
+    // Built-in default boot graph orders local-fs -> user-session -> multi-user -> cloud.mount -> devattach -> cloud-online.
     let graph = default_boot_graph(1000).unwrap();
     let order = graph.start_order();
     let pos = |name: &str| order.iter().position(|u| u == name).unwrap();
-    assert!(pos("local-fs.target") < pos("multi-user.target"));
-    assert!(pos("multi-user.target") < pos("user-session@1000.service"));
+    assert!(pos("local-fs.target") < pos("user-session@1000.service"));
+    assert!(pos("user-session@1000.service") < pos("multi-user.target"));
     assert!(pos("multi-user.target") < pos("cloud.mount"));
     assert!(pos("cloud.mount") < pos("devattach@snd.service"));
     assert!(pos("devattach@snd.service") < pos("cloud-online.target"));
@@ -140,9 +140,9 @@ fn dag_topological_order_cycle_detection_and_reverse_shutdown_order() {
     let rpos = |name: &str| rev.iter().position(|u| u == name).unwrap();
     assert!(rpos("cloud-online.target") < rpos("devattach@snd.service"));
     assert!(rpos("devattach@snd.service") < rpos("cloud.mount"));
-    assert!(rpos("cloud.mount") < rpos("user-session@1000.service"));
-    assert!(rpos("user-session@1000.service") < rpos("multi-user.target"));
-    assert!(rpos("multi-user.target") < rpos("local-fs.target"));
+    assert!(rpos("cloud.mount") < rpos("multi-user.target"));
+    assert!(rpos("multi-user.target") < rpos("user-session@1000.service"));
+    assert!(rpos("user-session@1000.service") < rpos("local-fs.target"));
 }
 
 #[test]
@@ -235,12 +235,16 @@ fn optional_cloud_mount_failure_never_blocks_boot_health_or_targets() {
     let mut mgr = ServiceManager::new_system(graph).unwrap();
     mgr.boot_target("multi-user.target").unwrap();
 
-    // Offline boot reaches `multi-user.target` and emits `MarkBootHealthy` with zero cloud units.
+    // Offline boot MUST wait for `user-session@1000.service` `READY=1` BEFORE activating
+    // `multi-user.target` or emitting `MarkBootHealthy` (Finding #10), with zero cloud units.
     let actions = mgr.tick(0);
-    assert!(actions.contains(&ManagerAction::MarkBootHealthy));
-    assert!(mgr.is_boot_healthy());
+    assert!(!actions.contains(&ManagerAction::MarkBootHealthy));
+    assert!(!mgr.is_boot_healthy());
     assert_eq!(mgr.unit_state("local-fs.target"), Some(UnitState::Active));
-    assert_eq!(mgr.unit_state("multi-user.target"), Some(UnitState::Active));
+    assert_eq!(
+        mgr.unit_state("multi-user.target"),
+        Some(UnitState::Inactive)
+    );
     assert_eq!(mgr.unit_state("cloud.mount"), Some(UnitState::Inactive));
     mgr.on_spawned("user-session@1000.service", 10, 5).unwrap();
     mgr.on_notify(
@@ -257,6 +261,10 @@ fn optional_cloud_mount_failure_never_blocks_boot_health_or_targets() {
         mgr.unit_state("user-session@1000.service"),
         Some(UnitState::Active)
     );
+    let actions = mgr.tick(15);
+    assert!(actions.contains(&ManagerAction::MarkBootHealthy));
+    assert!(mgr.is_boot_healthy());
+    assert_eq!(mgr.unit_state("multi-user.target"), Some(UnitState::Active));
 
     // User triggers `cloud-online.target` while offline: `cloud.mount` fails ENOTCONN (`Optional`).
     let root = PeerCred {
@@ -486,6 +494,9 @@ fn ordered_reverse_shutdown_unmounts_cloud_escalates_sigkill_and_closes_root() {
         1,
     )
     .unwrap();
+    let actions = mgr.tick(2);
+    assert!(actions.contains(&ManagerAction::MarkBootHealthy));
+    assert_eq!(mgr.unit_state("multi-user.target"), Some(UnitState::Active));
 
     let (_, _) = mgr.handle_control(
         root,

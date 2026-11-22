@@ -282,6 +282,58 @@ fn valid_text(s: &str) -> bool {
     !s.contains('\0') && s.len() <= 4096
 }
 
+fn valid_account_token(s: &str, allow_template: bool) -> bool {
+    if s.is_empty() || s.len() > 64 || s.contains('\0') || s.contains(':') || s.contains('/') {
+        return false;
+    }
+    let check = if allow_template {
+        s.replace("%i", "0")
+    } else {
+        s.to_owned()
+    };
+    !check.is_empty()
+        && check
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn valid_device_token(s: &str, allow_template: bool) -> bool {
+    if s.is_empty() || s.len() > 64 || s == "." || s == ".." || s.contains('\0') || s.contains('/')
+    {
+        return false;
+    }
+    let check = if allow_template {
+        s.replace("%i", "dev")
+    } else {
+        s.to_owned()
+    };
+    !check.is_empty()
+        && check != "."
+        && check != ".."
+        && check
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn valid_cpu_max_spec(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed == "max" {
+        return true;
+    }
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let quota_ok = parts[0] == "max"
+        || (!parts[0].is_empty()
+            && parts[0].bytes().all(|b| b.is_ascii_digit())
+            && parts[0].parse::<u64>().is_ok_and(|v| v > 0));
+    let period_ok = !parts[1].is_empty()
+        && parts[1].bytes().all(|b| b.is_ascii_digit())
+        && parts[1].parse::<u64>().is_ok_and(|v| v > 0);
+    quota_ok && period_ok
+}
+
 /// Split an instantiated unit name like `"devattach@snd.service"` into
 /// `(template_name: "devattach@.service", instance: "snd")`.
 pub fn split_template_instance(name: &str) -> Option<(String, String)> {
@@ -493,6 +545,39 @@ impl UnitSpec {
             return Err(format!("{}: invalid environment", self.name));
         }
 
+        let is_template = self.is_template();
+        if let Some(user) = &self.grant.user
+            && !valid_account_token(user, is_template)
+        {
+            return Err(format!("{}: invalid grant.user '{user}'", self.name));
+        }
+        if let Some(group) = &self.grant.group
+            && !valid_account_token(group, is_template)
+        {
+            return Err(format!("{}: invalid grant.group '{group}'", self.name));
+        }
+        if self.grant.devices.len() > 64
+            || self
+                .grant
+                .devices
+                .iter()
+                .any(|d| !valid_device_token(d, is_template))
+        {
+            return Err(format!("{}: invalid grant.devices allowlist", self.name));
+        }
+        if self.grant.cloud_scope.devices.len() > 64
+            || self
+                .grant
+                .cloud_scope
+                .devices
+                .iter()
+                .any(|d| !valid_device_token(d, is_template))
+        {
+            return Err(format!(
+                "{}: invalid grant.cloud_scope.devices allowlist",
+                self.name
+            ));
+        }
         if self.grant.bind_mounts.len() > 32 {
             return Err(format!("{}: too many bind_mounts (max 32)", self.name));
         }
@@ -511,13 +596,65 @@ impl UnitSpec {
                 ));
             }
         }
-        if let Some(limits) = &self.grant.limits
-            && limits.is_empty()
-        {
-            return Err(format!(
-                "{}: limits block must specify at least one limit",
-                self.name
-            ));
+        if let Some(limits) = &self.grant.limits {
+            if limits.is_empty() {
+                return Err(format!(
+                    "{}: limits block must specify at least one limit",
+                    self.name
+                ));
+            }
+            if let Some(cpu_max) = &limits.cpu_max
+                && !valid_cpu_max_spec(cpu_max)
+            {
+                return Err(format!(
+                    "{}: invalid grant.limits.cpu_max '{cpu_max}'",
+                    self.name
+                ));
+            }
+            if limits.memory_max == Some(0) {
+                return Err(format!(
+                    "{}: grant.limits.memory_max must be greater than 0",
+                    self.name
+                ));
+            }
+            if limits.io_read_bps == Some(0) || limits.io_write_bps == Some(0) {
+                return Err(format!(
+                    "{}: grant.limits io bps limits must be greater than 0",
+                    self.name
+                ));
+            }
+        }
+        match self.kind {
+            UnitKind::Service => {}
+            UnitKind::Mount => {
+                if self.grant.user.is_some()
+                    || self.grant.group.is_some()
+                    || self.grant.mount_namespace != MountNsPolicy::System
+                    || !self.grant.bind_mounts.is_empty()
+                    || !self.grant.devices.is_empty()
+                    || self.grant.limits.is_some()
+                {
+                    return Err(format!(
+                        "{}: mount units cannot enforce process user/group/namespace/device/limit grants",
+                        self.name
+                    ));
+                }
+            }
+            UnitKind::Target => {
+                if self.grant.user.is_some()
+                    || self.grant.group.is_some()
+                    || self.grant.mount_namespace != MountNsPolicy::System
+                    || !self.grant.bind_mounts.is_empty()
+                    || !self.grant.devices.is_empty()
+                    || !self.grant.cloud_scope.is_empty()
+                    || self.grant.limits.is_some()
+                {
+                    return Err(format!(
+                        "{}: target units cannot enforce capability grants",
+                        self.name
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -553,5 +690,89 @@ impl UnitSpec {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_service() -> UnitSpec {
+        UnitSpec {
+            version: UNIT_MANIFEST_VERSION,
+            name: "demo.service".into(),
+            kind: UnitKind::Service,
+            description: String::new(),
+            after: Vec::new(),
+            wants: Vec::new(),
+            requires: Vec::new(),
+            wanted_by: Vec::new(),
+            failure_policy: FailurePolicy::Required,
+            readiness: Readiness::Immediate,
+            ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+            stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+            restart: RestartPolicy::Never,
+            exec_start: Some(vec!["/usr/bin/true".into()]),
+            exec_stop: None,
+            cwd: Some("/".into()),
+            environment: BTreeMap::new(),
+            mount: None,
+            grant: CapabilityGrant::default(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn validate_and_authorize_enforce_service_grants_and_reject_invalid_restrictions() {
+        // Valid service grant with group, devices, limits, and cloud_scope passes system manager.
+        let mut ok = base_service();
+        ok.grant.user = Some("1000".into());
+        ok.grant.group = Some("wheel".into());
+        ok.grant.devices = vec!["null".into(), "zero".into()];
+        ok.grant.limits = Some(ResourceLimits {
+            cpu_max: Some("max 100000".into()),
+            memory_max: Some(16 * 1024 * 1024),
+            pids_max: Some(32),
+            io_read_bps: Some(1024),
+            io_write_bps: None,
+        });
+        assert!(ok.validate().is_ok());
+        assert!(ok.authorize_for_manager(0).is_ok());
+
+        // Per-user manager rejects `grant.group` with EPERM (#19).
+        let mut user_group = base_service();
+        user_group.grant.mount_namespace = MountNsPolicy::Session;
+        user_group.grant.group = Some("wheel".into());
+        assert!(user_group.validate().is_ok());
+        assert_eq!(
+            user_group.authorize_for_manager(1000).unwrap_err().errno,
+            Errno::EPERM
+        );
+
+        // Invalid device path traversal, malformed cpu_max, zero memory_max, and grants on targets fail validation.
+        let mut bad_dev = base_service();
+        bad_dev.grant.devices = vec!["../secret".into()];
+        assert!(bad_dev.validate().is_err());
+
+        let mut bad_cpu = base_service();
+        bad_cpu.grant.limits = Some(ResourceLimits {
+            cpu_max: Some("not-a-quota".into()),
+            ..ResourceLimits::default()
+        });
+        assert!(bad_cpu.validate().is_err());
+
+        let mut zero_mem = base_service();
+        zero_mem.grant.limits = Some(ResourceLimits {
+            memory_max: Some(0),
+            ..ResourceLimits::default()
+        });
+        assert!(zero_mem.validate().is_err());
+
+        let mut bad_target = base_service();
+        bad_target.name = "bad.target".into();
+        bad_target.kind = UnitKind::Target;
+        bad_target.exec_start = None;
+        bad_target.grant.group = Some("wheel".into());
+        assert!(bad_target.validate().is_err());
     }
 }
