@@ -2127,3 +2127,556 @@ fn f1_28_five_second_dirty_commit_deadline() {
 
     run(fs.close_clean()).unwrap();
 }
+
+// =============================================================================
+// Codex Audit #12: COWFS_IOC_FSCK exact-volume verification & rollback fork check
+// =============================================================================
+
+#[test]
+fn codex_12_cowfs_ioc_fsck_verifies_exact_volume_and_rollback_fork() {
+    use abi::contract::cowfs_ioctl;
+    use abi::volume::{CowfsForkReq, CowfsForkResp, CowfsFsckReq, CowfsFsckResp};
+    use os_cowfs::cowfs_ioctl_mounted;
+
+    let clock = ManualClock::new(40_000);
+    let hs = Rc::new(MemoryHeadStore::new());
+    let ps = Rc::new(MemoryPackStore::new());
+    let vol_a = VolumeId("vol-codex-12-a".into());
+    let vol_b = VolumeId("vol-codex-12-b".into());
+    let admin = Cred::root();
+    let user = Cred::new(Identity::guest());
+
+    run(CowFs::format_volume(
+        &*hs,
+        &*ps,
+        vol_a.clone(),
+        0,
+        0,
+        0o755,
+        clock.now(),
+    ))
+    .unwrap();
+    run(CowFs::format_volume(
+        &*hs,
+        &*ps,
+        vol_b.clone(),
+        0,
+        0,
+        0o755,
+        clock.now(),
+    ))
+    .unwrap();
+
+    // Populate `vol_a` with a clean snapshot `good`, then commit another file.
+    let fs_a = Rc::new(
+        run(CowFs::open(
+            hs.clone(),
+            ps.clone(),
+            vol_a.clone(),
+            CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+            CowFsConfig::local_browser(clock.clock()),
+        ))
+        .unwrap(),
+    );
+    let (_, fd_a) = run(fs_a.create(&admin, &fs_a.root(), "a.bin", 0o644, &rw_create())).unwrap();
+    run(fs_a.write_at(&fd_a, &vec![0x11u8; 64 * 1024], WriteAt::Offset(0))).unwrap();
+    run(fs_a.release(&fd_a)).unwrap();
+    run(fs_a.commit_tx_group()).unwrap();
+    let snap = run(fs_a.create_snapshot("good")).unwrap();
+    assert_eq!(snap.name, "good");
+
+    // Populate `vol_b` with its own distinct pack, then corrupt `vol_b`'s pack.
+    let fs_b = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        vol_b.clone(),
+        CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+        CowFsConfig::local_browser(clock.clock()),
+    ))
+    .unwrap();
+    let (_, fd_b) = run(fs_b.create(&admin, &fs_b.root(), "b.bin", 0o644, &rw_create())).unwrap();
+    run(fs_b.write_at(&fd_b, &vec![0x22u8; 64 * 1024], WriteAt::Offset(0))).unwrap();
+    run(fs_b.release(&fd_b)).unwrap();
+    run(fs_b.close_clean()).unwrap();
+
+    let packs_before: std::collections::HashSet<_> =
+        run(ps.list_packs()).unwrap().into_iter().collect();
+    assert_eq!(packs_before.len(), 2);
+
+    // Attach ONLY `vol_a` at `/dev/vd0`.
+    let vblk = VblkRegistry::new();
+    let dev_a = Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&fs_a)));
+    vblk.attach_named("vd0", dev_a).unwrap();
+
+    // 1. Default `COWFS_IOC_FSCK` on `/dev/vd0` (permitted for non-root too) verifies `vol_a`!
+    let raw_a = run(vblk.ioctl_rdev(&user, "vblk:vd0", cowfs_ioctl::COWFS_IOC_FSCK, b"")).unwrap();
+    let resp_a: CowfsFsckResp = serde_json::from_slice(&raw_a).unwrap();
+    assert!(resp_a.ok, "errors={:?}", resp_a.errors);
+    assert_eq!(resp_a.volume, vol_a.0);
+    assert!(resp_a.nodes_verified >= 2);
+    assert!(resp_a.packs_verified >= 1);
+
+    // 2. Requesting a missing `volume` UUID MUST return `ENOENT` (NEVER silently verify `vol_a`!).
+    let missing_req = serde_json::to_vec(&CowfsFsckReq {
+        volume: Some("vol-does-not-exist".into()),
+    })
+    .unwrap();
+    assert_eq!(
+        run(vblk.ioctl_rdev(
+            &admin,
+            "vblk:vd0",
+            cowfs_ioctl::COWFS_IOC_FSCK,
+            &missing_req
+        )),
+        Err(Errno::ENOENT)
+    );
+    assert_eq!(
+        run(cowfs_ioctl_mounted(
+            &fs_a,
+            &admin,
+            cowfs_ioctl::COWFS_IOC_FSCK,
+            &missing_req
+        )),
+        Err(Errno::ENOENT)
+    );
+
+    // 3. Requesting `vol_b` explicitly via `/dev/vd0` verifies `vol_b` (not `vol_a`!).
+    //    Corrupt `vol_b`'s pack and confirm `COWFS_IOC_FSCK { volume: Some(vol_b) }` reports
+    //    `ok == false`, while `vol_a` remains `ok == true`!
+    let b_block_dig = cowtree::sha256(&vec![0x22u8; 64 * 1024]);
+    let b_pack = run(hs.lookup_block(&b_block_dig)).unwrap().unwrap().pack_id;
+    ps.corrupt_pack_byte(&b_pack, 24);
+
+    let req_b = serde_json::to_vec(&CowfsFsckReq {
+        volume: Some(vol_b.0.clone()),
+    })
+    .unwrap();
+    let raw_b =
+        run(vblk.ioctl_rdev(&admin, "vblk:vd0", cowfs_ioctl::COWFS_IOC_FSCK, &req_b)).unwrap();
+    let resp_b: CowfsFsckResp = serde_json::from_slice(&raw_b).unwrap();
+    assert_eq!(resp_b.volume, vol_b.0);
+    assert!(!resp_b.ok, "corrupt vol_b must report ok=false");
+    assert!(
+        resp_b
+            .errors
+            .iter()
+            .any(|e| e.contains("digest mismatch") || e.contains("trailer")),
+        "unexpected errors: {:?}",
+        resp_b.errors
+    );
+
+    // Mounted dispatch `cowfs_ioctl_mounted` agrees identically.
+    let raw_b_mounted = run(cowfs_ioctl_mounted(
+        &fs_a,
+        &admin,
+        cowfs_ioctl::COWFS_IOC_FSCK,
+        &req_b,
+    ))
+    .unwrap();
+    let resp_b_mounted: CowfsFsckResp = serde_json::from_slice(&raw_b_mounted).unwrap();
+    assert_eq!(resp_b_mounted, resp_b);
+
+    // 4. Fork snapshot `good` via `COWFS_IOC_FORK` and verify the newly created rollback fork via
+    //    `COWFS_IOC_FSCK { volume: Some(forked.volume) }`.
+    let fork_req = serde_json::to_vec(&CowfsForkReq {
+        snapshot: Some("good".into()),
+        new_volume: "vol-codex-12-a-rollback-good".into(),
+        ephemeral_if_unmodified: false,
+    })
+    .unwrap();
+    let raw_fork =
+        run(vblk.ioctl_rdev(&admin, "vblk:vd0", cowfs_ioctl::COWFS_IOC_FORK, &fork_req)).unwrap();
+    let forked: CowfsForkResp = serde_json::from_slice(&raw_fork).unwrap();
+    let rb_fsck_req = serde_json::to_vec(&CowfsFsckReq {
+        volume: Some(forked.volume.clone()),
+    })
+    .unwrap();
+    let raw_rb = run(vblk.ioctl_rdev(
+        &admin,
+        "vblk:vd0",
+        cowfs_ioctl::COWFS_IOC_FSCK,
+        &rb_fsck_req,
+    ))
+    .unwrap();
+    let resp_rb: CowfsFsckResp = serde_json::from_slice(&raw_rb).unwrap();
+    assert!(
+        resp_rb.ok,
+        "clean rollback fork must verify ok: {:?}",
+        resp_rb.errors
+    );
+    assert_eq!(resp_rb.volume, forked.volume);
+
+    // Corrupt `vol_a`'s pack (shared by snapshot `good` / rollback fork) -> rollback fork fsck
+    // MUST fail with `ok == false`!
+    let a_block_dig = cowtree::sha256(&vec![0x11u8; 64 * 1024]);
+    let a_pack = run(hs.lookup_block(&a_block_dig)).unwrap().unwrap().pack_id;
+    ps.corrupt_pack_byte(&a_pack, 24);
+    let raw_rb_bad = run(vblk.ioctl_rdev(
+        &admin,
+        "vblk:vd0",
+        cowfs_ioctl::COWFS_IOC_FSCK,
+        &rb_fsck_req,
+    ))
+    .unwrap();
+    let resp_rb_bad: CowfsFsckResp = serde_json::from_slice(&raw_rb_bad).unwrap();
+    assert!(
+        !resp_rb_bad.ok,
+        "corrupt rollback fork must report ok=false"
+    );
+    assert!(!resp_rb_bad.errors.is_empty());
+
+    // Invalid payload / unknown field -> EINVAL.
+    assert_eq!(
+        run(vblk.ioctl_rdev(
+            &admin,
+            "vblk:vd0",
+            cowfs_ioctl::COWFS_IOC_FSCK,
+            br#"{"unknown":true}"#
+        )),
+        Err(Errno::EINVAL)
+    );
+
+    run(fs_a.close_clean()).unwrap();
+}
+
+// =============================================================================
+// Codex Audit #13: verify_head checks exact pinned head & open prunes corrupt fork
+// =============================================================================
+
+#[test]
+fn codex_13_verify_head_checks_exact_head_and_corrupt_fork_open_does_not_leak() {
+    let clock = ManualClock::new(45_000);
+    let hs = Rc::new(MemoryHeadStore::new());
+    let ps = Rc::new(MemoryPackStore::new());
+    let vol = VolumeId("vol-codex-13".into());
+    let admin = Cred::root();
+    run(CowFs::format_volume(
+        &*hs,
+        &*ps,
+        vol.clone(),
+        0,
+        0,
+        0o755,
+        clock.now(),
+    ))
+    .unwrap();
+
+    let fs = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        vol.clone(),
+        CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+        CowFsConfig::local_browser(clock.clock()),
+    ))
+    .unwrap();
+
+    // Commit epoch 1 (clean).
+    let (_, fd1) = run(fs.create(&admin, &fs.root(), "v1.bin", 0o644, &rw_create())).unwrap();
+    run(fs.write_at(&fd1, &vec![0x31u8; 64 * 1024], WriteAt::Offset(0))).unwrap();
+    run(fs.release(&fd1)).unwrap();
+    let head_epoch1 = run(fs.commit_tx_group()).unwrap();
+    assert_eq!(head_epoch1.epoch, 1);
+
+    // Commit epoch 2 (different pack), then corrupt epoch 2's pack while epoch 1 stays intact.
+    let (_, fd2) = run(fs.create(&admin, &fs.root(), "v2.bin", 0o644, &rw_create())).unwrap();
+    run(fs.write_at(&fd2, &vec![0x32u8; 64 * 1024], WriteAt::Offset(0))).unwrap();
+    run(fs.release(&fd2)).unwrap();
+    let head_epoch2 = run(fs.commit_tx_group()).unwrap();
+    assert_eq!(head_epoch2.epoch, 2);
+
+    let v2_pack = run(hs.lookup_block(&cowtree::sha256(&vec![0x32u8; 64 * 1024])))
+        .unwrap()
+        .unwrap()
+        .pack_id;
+    ps.corrupt_pack_byte(&v2_pack, 12);
+
+    // `verify_head` verifies the EXACT head passed in: epoch 1 is clean, epoch 2 is corrupt!
+    let rep1 = run(os_cowfs::fsck::verify_head(&*hs, &*ps, &head_epoch1)).unwrap();
+    assert!(rep1.ok, "epoch 1 head must verify clean: {:?}", rep1.errors);
+    assert_eq!(rep1.epoch, 1);
+
+    let rep2 = run(os_cowfs::fsck::verify_head(&*hs, &*ps, &head_epoch2)).unwrap();
+    assert!(!rep2.ok, "epoch 2 head must detect corruption");
+    assert_eq!(rep2.epoch, 2);
+
+    // Corrupting the root object itself while `fs` holds the writer lease: a second opener using
+    // `ForkOnBusy` MUST fail `CowFs::open` with `EIO` AND prune the unmodified ephemeral fork head!
+    let roots_before = run(hs.list_all_roots()).unwrap().len();
+    hs.corrupt_node_byte(&head_epoch2.root, 10);
+    let fork_res = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        vol.clone(),
+        CowFsOpenMode::ReadWrite(WriterMode::ForkOnBusy),
+        CowFsConfig::local_browser(clock.clock()),
+    ));
+    assert_eq!(fork_res.err(), Some(Errno::EIO));
+    let roots_after = run(hs.list_all_roots()).unwrap().len();
+    assert_eq!(
+        roots_after, roots_before,
+        "failed ForkOnBusy open on corrupt root must prune the unmodified fork"
+    );
+
+    run(fs.close_clean()).unwrap();
+}
+
+// =============================================================================
+// Codex Audit #16: CowFs::flush_for_suspend persists durably without closing
+// =============================================================================
+
+#[test]
+fn codex_16_flush_for_suspend_persists_dirty_writes_and_keeps_mount_writable() {
+    let clock = ManualClock::new(50_000);
+    let hs = Rc::new(MemoryHeadStore::new());
+    let ps = Rc::new(MemoryPackStore::new());
+    let vol = VolumeId("vol-codex-16".into());
+    let admin = Cred::root();
+    run(CowFs::format_volume(
+        &*hs,
+        &*ps,
+        vol.clone(),
+        0,
+        0,
+        0o755,
+        clock.now(),
+    ))
+    .unwrap();
+
+    let fs = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        vol.clone(),
+        CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+        CowFsConfig::local_browser(clock.clock()),
+    ))
+    .unwrap();
+
+    // 1. Clean mount: `flush_for_suspend()` returns current head without advancing epoch.
+    let h0 = run(fs.flush_for_suspend()).unwrap();
+    assert_eq!(h0.epoch, 0);
+    assert!(!fs.is_closed());
+
+    // 2. Dirty write with an open handle held across suspend: `flush_for_suspend()` commits
+    //    durably to epoch 1 WITHOUT closing `fs`, releasing the lease, or invalidating `fd`!
+    let (_, fd) = run(fs.create(&admin, &fs.root(), "bfcache.txt", 0o644, &rw_create())).unwrap();
+    run(fs.write_at(&fd, b"before-suspend-", WriteAt::Offset(0))).unwrap();
+    assert_eq!(run(hs.read_head(&vol)).unwrap().epoch, 0);
+
+    let h1 = run(fs.flush_for_suspend()).unwrap();
+    assert_eq!(h1.epoch, 1);
+    assert!(!fs.is_closed());
+    assert_eq!(run(hs.read_head(&vol)).unwrap().epoch, 1);
+
+    // An independent RO mount immediately sees the durably flushed data.
+    let ro = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        vol.clone(),
+        CowFsOpenMode::ReadOnly,
+        CowFsConfig::local_browser(clock.clock()),
+    ))
+    .unwrap();
+    let ent = run(ro.lookup(&admin, &ro.root(), "bfcache.txt")).unwrap();
+    let mut ro_opts = OpenOptions::new();
+    ro_opts.read(true);
+    let rfd = run(ro.open(&admin, &ent.handle, &ro_opts)).unwrap();
+    let mut buf = [0u8; 32];
+    let n = run(ro.read_at(&rfd, &mut buf, 0)).unwrap();
+    assert_eq!(&buf[..n], b"before-suspend-");
+    run(ro.release(&rfd)).unwrap();
+    run(ro.close_clean()).unwrap();
+
+    // 3. After bfcache resume, subsequent writes on the SAME open `fd` and new files MUST succeed
+    //    without `EBADF`!
+    run(fs.write_at(&fd, b"after-resume", WriteAt::Offset(15))).unwrap();
+    run(fs.release(&fd)).unwrap();
+    let h2 = run(fs.flush_for_suspend()).unwrap();
+    assert_eq!(h2.epoch, 2);
+
+    // 4. Unmodified `ForkOnBusy` fork: `flush_for_suspend()` MUST NOT prune the fork and MUST NOT
+    //    mark it modified, so bfcache restore continues seamlessly AND later clean close prunes it!
+    let fork_fs = run(CowFs::open(
+        hs.clone(),
+        ps.clone(),
+        vol.clone(),
+        CowFsOpenMode::ReadWrite(WriterMode::ForkOnBusy),
+        CowFsConfig::local_browser(clock.clock()),
+    ))
+    .unwrap();
+    let fork_vol = fork_fs.volume_id().clone();
+    assert!(fork_fs.forked_from().is_some());
+    let fh = run(fork_fs.flush_for_suspend()).unwrap();
+    assert_eq!(fh.epoch, 0);
+    assert!(!fork_fs.is_closed());
+    assert!(
+        run(hs.read_head(&fork_vol)).is_ok(),
+        "flush_for_suspend must NOT prune unmodified ForkOnBusy fork"
+    );
+    assert!(
+        !run(hs.read_head(&fork_vol)).unwrap().modified,
+        "flush_for_suspend on clean fork must not flip modified=true"
+    );
+    // Subsequent clean close without modifications still prunes the unmodified fork!
+    run(fork_fs.close_clean()).unwrap();
+    assert_eq!(run(hs.read_head(&fork_vol)), Err(Errno::ENOENT));
+    // And `flush_for_suspend()` on a closed mount returns `EBADF`.
+    assert_eq!(run(fork_fs.flush_for_suspend()), Err(Errno::EBADF));
+
+    run(fs.close_clean()).unwrap();
+}
+
+// =============================================================================
+// Codex Audit #32 coordination: `@` + `@home` shared-lease RW subvolume views
+// =============================================================================
+
+#[test]
+fn codex_32_multi_subvol_views_share_lease_dirty_hook_and_atomic_commit() {
+    let clock = ManualClock::new(60_000);
+    let hs = Rc::new(MemoryHeadStore::new());
+    let ps = Rc::new(MemoryPackStore::new());
+    let vol = VolumeId("vol-codex-32-home".into());
+    let admin = Cred::root();
+    run(CowFs::format_volume(
+        &*hs,
+        &*ps,
+        vol.clone(),
+        0,
+        0,
+        0o755,
+        clock.now(),
+    ))
+    .unwrap();
+
+    let dirty_fires = Rc::new(Cell::new(0u32));
+    let dirty_cb = Rc::clone(&dirty_fires);
+    let fs = Rc::new(
+        run(CowFs::open(
+            hs.clone(),
+            ps.clone(),
+            vol.clone(),
+            CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+            CowFsConfig::local_browser(clock.clock())
+                .with_on_dirty(Rc::new(move || dirty_cb.set(dirty_cb.get() + 1))),
+        ))
+        .unwrap(),
+    );
+
+    assert!(fs.has_subvol("@"));
+    assert!(!fs.has_subvol("@home"));
+    assert_eq!(fs.open_subvol_view("@home").err(), Some(Errno::ENOENT));
+    assert_eq!(fs.open_subvol_view("").err(), Some(Errno::EINVAL));
+    assert_eq!(fs.open_subvol_view("bad/name").err(), Some(Errno::EINVAL));
+
+    // Create `@home` subvolume on the live RW mount (commits atomically).
+    run(fs.create_subvol("@home", 0o755)).unwrap();
+    assert!(fs.has_subvol("@home"));
+    assert_eq!(run(fs.create_subvol("@home", 0o755)), Err(Errno::EEXIST));
+
+    // Open `@home` subvolume view sharing the exact same writer lease (NO `EBUSY`!).
+    let home_view = fs.open_subvol_view("@home").unwrap();
+    assert_ne!(home_view.id(), fs.id());
+
+    // Mount `@` at `/` and `@home` at `/home` inside one `Vfs` and write to BOTH concurrently!
+    let factory = Rc::new(DefaultFilesystemFactory::new(Rc::new(|| (60_000, 0))));
+    let root_backing = Rc::new(MountBacking::new(
+        Rc::clone(&fs) as Rc<dyn Filesystem>,
+        FsType::Cowfs,
+    ));
+    let vfs = run(Vfs::boot("subvol-test", root_backing, "cowfs", factory)).unwrap();
+    run(vfs.mkdirat(1, StartAnchor::Root, "/home", 0o755)).unwrap();
+    // Commit the `/home` mountpoint dir so dirty_fires starts clean before testing `@home` write.
+    run(fs.commit_tx_group()).unwrap();
+    let fires_before_home = dirty_fires.get();
+
+    let sys_ns = vfs.system_namespace();
+    let home_backing = Rc::new(MountBacking::new(home_view, FsType::Cowfs));
+    run(vfs.mount_on_namespace(
+        &sys_ns,
+        &admin,
+        home_backing,
+        None,
+        "cowfs:@home",
+        "/home",
+        MountFlags::default(),
+        0,
+        None,
+    ))
+    .unwrap();
+
+    // Write into `/home/user.txt` (`@home` subvol) -> triggers `on_dirty` on shared `CowFs`!
+    let fd_home = run(vfs.openat(
+        1,
+        StartAnchor::Root,
+        "/home/user.txt",
+        abi::O_CREAT | abi::O_WRONLY,
+        0o644,
+    ))
+    .unwrap();
+    run(vfs.write(1, fd_home, b"stored-in-at-home")).unwrap();
+    run(vfs.close(1, fd_home)).unwrap();
+    assert_eq!(
+        dirty_fires.get(),
+        fires_before_home + 1,
+        "write on @home subvol view must trigger shared CowFs on_dirty hook"
+    );
+
+    // Also write into `/root-file.txt` (`@` subvol) in the same uncommitted transaction group.
+    let fd_root = run(vfs.openat(
+        1,
+        StartAnchor::Root,
+        "/root-file.txt",
+        abi::O_CREAT | abi::O_WRONLY,
+        0o644,
+    ))
+    .unwrap();
+    run(vfs.write(1, fd_root, b"stored-in-at-root")).unwrap();
+    run(vfs.close(1, fd_root)).unwrap();
+
+    // Single `flush_for_suspend()` atomically commits BOTH `@` and `@home` in ONE epoch!
+    let epoch_before = fs.current_head().epoch;
+    let flushed = run(fs.flush_for_suspend()).unwrap();
+    assert_eq!(flushed.epoch, epoch_before + 1);
+    assert!(!fs.is_closed());
+
+    // Confirm `@`'s underlying `/home` directory does NOT contain `user.txt` (it lives in `@home`).
+    let root_home_ent = run(fs.lookup(&admin, &fs.root(), "home")).unwrap();
+    assert_eq!(
+        run(fs.lookup(&admin, &root_home_ent.handle, "user.txt")).err(),
+        Some(Errno::ENOENT)
+    );
+
+    // Close cleanly, run `cowfsck` (must verify BOTH subvols cleanly!), and cold-reopen both!
+    run(fs.close_clean()).unwrap();
+    let report = run(verify_volume(&*hs, &*ps, &vol)).unwrap();
+    assert!(report.ok, "multi-subvol fsck errors: {:?}", report.errors);
+    assert_eq!(report.subvols_checked, 2);
+
+    let reopened = Rc::new(
+        run(CowFs::open(
+            hs.clone(),
+            ps.clone(),
+            vol,
+            CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+            CowFsConfig::local_browser(clock.clock()),
+        ))
+        .unwrap(),
+    );
+    assert!(reopened.has_subvol("@"));
+    assert!(reopened.has_subvol("@home"));
+    let home2 = reopened.open_subvol_view("@home").unwrap();
+    let ent_u = run(home2.lookup(&admin, &home2.root(), "user.txt")).unwrap();
+    let mut ro_opts = OpenOptions::new();
+    ro_opts.read(true);
+    let open_u = run(home2.open(&admin, &ent_u.handle, &ro_opts)).unwrap();
+    let mut buf = [0u8; 32];
+    let n = run(home2.read_at(&open_u, &mut buf, 0)).unwrap();
+    assert_eq!(&buf[..n], b"stored-in-at-home");
+    run(home2.release(&open_u)).unwrap();
+
+    let ent_r = run(reopened.lookup(&admin, &reopened.root(), "root-file.txt")).unwrap();
+    let open_r = run(reopened.open(&admin, &ent_r.handle, &ro_opts)).unwrap();
+    let n2 = run(reopened.read_at(&open_r, &mut buf, 0)).unwrap();
+    assert_eq!(&buf[..n2], b"stored-in-at-root");
+    run(reopened.release(&open_r)).unwrap();
+    run(reopened.close_clean()).unwrap();
+}

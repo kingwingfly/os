@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use vfs::devfs::{DefaultDeviceBackend, DevTmpFs};
 use vfs::vblk::{VblkDeviceBackend, VblkRegistry};
 use vfs::{
@@ -32,9 +32,12 @@ use vfs::{
     StartAnchor, Vfs,
 };
 use wasm_bindgen::JsCast;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+use wasm_bindgen_futures::JsFuture;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::spawn_local;
 
 /// Maximum integer exactly representable as an IEEE-754 `f64` (`2^53 - 1`).
 const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
@@ -1245,13 +1248,25 @@ impl Filesystem for BridgeRootFs {
 // 5-second dirty commit deadline timer (`contract.md` §2.15)
 // -----------------------------------------------------------------------------
 
+#[cfg(target_arch = "wasm32")]
+const DIRTY_RETRY_INITIAL_MS: u64 = 1_000;
+#[cfg(target_arch = "wasm32")]
+const DIRTY_RETRY_MAX_MS: u64 = 30_000;
+
 #[derive(Default)]
 struct DirtyFlushTimer {
+    #[cfg(target_arch = "wasm32")]
     handle: Option<JsValue>,
+    #[cfg(target_arch = "wasm32")]
     closure: Option<Closure<dyn FnMut()>>,
     canceled: bool,
+    #[cfg(target_arch = "wasm32")]
+    consecutive_errors: u32,
+    #[cfg(not(target_arch = "wasm32"))]
+    armed_count: u64,
 }
 
+#[cfg(target_arch = "wasm32")]
 fn clear_js_timeout(handle: &JsValue) {
     let global = js_sys::global();
     if let Ok(func) = js_sys::Reflect::get(&global, &JsValue::from_str("clearTimeout"))
@@ -1261,6 +1276,7 @@ fn clear_js_timeout(handle: &JsValue) {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn schedule_js_timeout(cb: &Closure<dyn FnMut()>, delay_ms: u64) -> Option<JsValue> {
     let global = js_sys::global();
     let func = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
@@ -1279,9 +1295,11 @@ fn schedule_js_timeout(cb: &Closure<dyn FnMut()>, delay_ms: u64) -> Option<JsVal
     Some(handle)
 }
 
-fn arm_dirty_timer(
-    fs: &Rc<CowFs<JsCowfsStore, JsCowfsStore>>,
+#[cfg(target_arch = "wasm32")]
+fn arm_dirty_timer_with_delay<H: HeadStore + 'static, P: PackStore + 'static>(
+    fs: &Rc<CowFs<H, P>>,
     timer: &Rc<RefCell<DirtyFlushTimer>>,
+    min_delay_ms: u64,
 ) {
     let mut t = timer.borrow_mut();
     if t.canceled || t.handle.is_some() {
@@ -1306,26 +1324,152 @@ fn arm_dirty_timer(
             if timer_c.borrow().canceled || fs_c.is_closed() {
                 return;
             }
-            let _ = fs_c.flush_if_dirty_deadline_elapsed().await;
-            // Re-arm if still dirty (e.g., transient commit error or newly arrived writes).
-            if !timer_c.borrow().canceled && !fs_c.is_closed() {
-                arm_dirty_timer(&fs_c, &timer_c);
+            match fs_c.flush_if_dirty_deadline_elapsed().await {
+                Ok(_) => {
+                    timer_c.borrow_mut().consecutive_errors = 0;
+                    // Re-arm if still dirty (e.g., newly arrived writes while committing).
+                    if !timer_c.borrow().canceled && !fs_c.is_closed() {
+                        arm_dirty_timer_with_delay(&fs_c, &timer_c, 10);
+                    }
+                }
+                Err(Errno::ESTALE | Errno::EBADF | Errno::EROFS) => {
+                    // Terminal mount state (fenced/closed/RO) — stop retrying.
+                }
+                Err(_) => {
+                    // Transient flush error (e.g., `ENOSPC`, `EIO`): retry with bounded backoff
+                    // while the filesystem remains open and uncanceled.
+                    let err_count = {
+                        let mut st = timer_c.borrow_mut();
+                        st.consecutive_errors = st.consecutive_errors.saturating_add(1);
+                        st.consecutive_errors
+                    };
+                    let shift = err_count.saturating_sub(1).min(5);
+                    let backoff_ms = DIRTY_RETRY_INITIAL_MS
+                        .saturating_mul(1u64 << shift)
+                        .min(DIRTY_RETRY_MAX_MS);
+                    if !timer_c.borrow().canceled && !fs_c.is_closed() {
+                        arm_dirty_timer_with_delay(&fs_c, &timer_c, backoff_ms);
+                    }
+                }
             }
         });
     });
-    if let Some(handle) = schedule_js_timeout(&cb, delay_ms.max(10)) {
+    if let Some(handle) = schedule_js_timeout(&cb, delay_ms.max(min_delay_ms)) {
         t.handle = Some(handle);
         t.closure = Some(cb);
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn arm_dirty_timer_with_delay<H: HeadStore + 'static, P: PackStore + 'static>(
+    fs: &Rc<CowFs<H, P>>,
+    timer: &Rc<RefCell<DirtyFlushTimer>>,
+    _min_delay_ms: u64,
+) {
+    let mut t = timer.borrow_mut();
+    if t.canceled {
+        return;
+    }
+    if fs.ms_until_dirty_deadline().is_some() {
+        t.armed_count = t.armed_count.saturating_add(1);
+    }
+}
+
+fn arm_dirty_timer<H: HeadStore + 'static, P: PackStore + 'static>(
+    fs: &Rc<CowFs<H, P>>,
+    timer: &Rc<RefCell<DirtyFlushTimer>>,
+) {
+    arm_dirty_timer_with_delay(fs, timer, 10);
+}
+
 fn cancel_dirty_timer(timer: &Rc<RefCell<DirtyFlushTimer>>) {
     let mut t = timer.borrow_mut();
     t.canceled = true;
-    if let Some(h) = t.handle.take() {
-        clear_js_timeout(&h);
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(h) = t.handle.take() {
+            clear_js_timeout(&h);
+        }
+        t.closure = None;
     }
-    t.closure = None;
+}
+
+/// RAII guard for a mounted `CowFs` 5-second dirty commit deadline timer; cancels on `Drop` or
+/// explicit [`Self::cancel`].
+pub(crate) struct DirtyFlushGuard {
+    timer: Rc<RefCell<DirtyFlushTimer>>,
+}
+
+impl DirtyFlushGuard {
+    pub(crate) fn cancel(&self) {
+        cancel_dirty_timer(&self.timer);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn arm<H: HeadStore + 'static, P: PackStore + 'static>(&self, fs: &Rc<CowFs<H, P>>) {
+        arm_dirty_timer(fs, &self.timer);
+    }
+
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn armed_count(&self) -> u64 {
+        self.timer.borrow().armed_count
+    }
+}
+
+impl Drop for DirtyFlushGuard {
+    fn drop(&mut self) {
+        cancel_dirty_timer(&self.timer);
+    }
+}
+
+type WeakCowFsSlot<H, P> = Rc<RefCell<Option<Weak<CowFs<H, P>>>>>;
+
+/// Pre-open timer binder returned by [`bind_dirty_flush_timer`]; call [`Self::attach`] right after
+/// `CowFs::open` succeeds so every clean->dirty transition arms the 5-second flush timer without
+/// creating an `Rc` reference cycle.
+pub(crate) struct DirtyFlushBinder<H: HeadStore + 'static, P: PackStore + 'static> {
+    timer: Rc<RefCell<DirtyFlushTimer>>,
+    fs_slot: WeakCowFsSlot<H, P>,
+}
+
+impl<H: HeadStore + 'static, P: PackStore + 'static> DirtyFlushBinder<H, P> {
+    pub(crate) fn attach(self, fs: &Rc<CowFs<H, P>>) -> DirtyFlushGuard {
+        *self.fs_slot.borrow_mut() = Some(Rc::downgrade(fs));
+        arm_dirty_timer(fs, &self.timer);
+        DirtyFlushGuard { timer: self.timer }
+    }
+}
+
+/// Attach an `on_dirty` callback to `config` that arms the 5-second dirty flush timer on every
+/// clean->dirty transition (and retries transient flush failures with bounded backoff while open).
+/// Call `binder.attach(&fs)` once `CowFs::open` completes to activate it and obtain a
+/// [`DirtyFlushGuard`].
+pub(crate) fn bind_dirty_flush_timer<H: HeadStore + 'static, P: PackStore + 'static>(
+    config: CowFsConfig,
+) -> (CowFsConfig, DirtyFlushBinder<H, P>) {
+    let timer = Rc::new(RefCell::new(DirtyFlushTimer::default()));
+    let fs_slot: WeakCowFsSlot<H, P> = Rc::new(RefCell::new(None));
+    let timer_cb = Rc::clone(&timer);
+    let slot_cb = Rc::clone(&fs_slot);
+    let config = config.with_on_dirty(Rc::new(move || {
+        let fs_opt = slot_cb.borrow().as_ref().and_then(Weak::upgrade);
+        if let Some(fs) = fs_opt {
+            arm_dirty_timer(&fs, &timer_cb);
+        }
+    }));
+    (config, DirtyFlushBinder { timer, fs_slot })
+}
+
+/// Attach a dirty-flush timer directly to an already-open [`CowFs`] (arms immediately if dirty;
+/// prefer [`bind_dirty_flush_timer`] prior to `CowFs::open` so future clean->dirty transitions arm
+/// automatically).
+#[allow(dead_code)]
+pub(crate) fn attach_dirty_flush_timer<H: HeadStore + 'static, P: PackStore + 'static>(
+    fs: &Rc<CowFs<H, P>>,
+) -> DirtyFlushGuard {
+    let timer = Rc::new(RefCell::new(DirtyFlushTimer::default()));
+    arm_dirty_timer(fs, &timer);
+    DirtyFlushGuard { timer }
 }
 
 // -----------------------------------------------------------------------------
@@ -1509,15 +1653,40 @@ pub async fn cowfsck_volume_stores<H: HeadStore, P: PackStore>(
     cowfs::verify_volume(head_store, pack_store, volume).await
 }
 
-/// Open or provision an `os-cowfs` root volume for Stage 1 boot:
+/// Detailed failure returned by [`open_for_boot_stores_detailed`], preserving the exact
+/// [`cowfs::FsckReport`] when post-acquire Merkle verification detects corruption on the mounted
+/// or forked head.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub enum BootOpenError {
+    Corrupt {
+        volume: String,
+        report: Box<cowfs::FsckReport>,
+    },
+    Errno(Errno),
+}
+
+impl BootOpenError {
+    pub fn errno(&self) -> Errno {
+        match self {
+            Self::Corrupt { .. } => Errno::EIO,
+            Self::Errno(e) => *e,
+        }
+    }
+}
+
+/// Open or provision an `os-cowfs` root volume for Stage 1 boot, returning structured corruption
+/// diagnostics (`BootOpenError::Corrupt`) when post-acquire verification fails:
 /// - Always checks `COWFS_FORMAT_VERSION` FIRST (`EPROTONOSUPPORT`, NEVER wipes/formats!).
 /// - On first boot (`volume_uuid == None`): formats a fresh volume, atomically seeds
 ///   `RootTemplate`, and commits epoch 1.
-/// - On subsequent boot (`volume_uuid == Some(uuid)`): runs `cowfsck` first (returning `EIO`
-///   if corrupt, preserving the volume untouched), then opens with `writer_mode` (`ForkOnBusy`
-///   or `Exclusive`).
+/// - On subsequent boot (`volume_uuid == Some(uuid)`): acquires the writer lease / creates the
+///   `ForkOnBusy` fork FIRST (with deferred orphan reaping so zero mutations happen prior to
+///   verification), then runs `cowfs::fsck::verify_head` on THAT EXACT live-leased head while
+///   holding the shared GC lock. If verification fails, cleanly closes `fs` (releasing the writer
+///   lease and pruning any unmodified `ForkOnBusy` fork while preserving the parent untouched).
 #[allow(clippy::too_many_arguments)]
-pub async fn open_for_boot_stores<
+pub async fn open_for_boot_stores_detailed<
     H: HeadStore + 'static,
     P: PackStore + 'static,
     B: vfs::imagefs::BlobStore,
@@ -1530,12 +1699,15 @@ pub async fn open_for_boot_stores<
     blobs: Option<&B>,
     config: CowFsConfig,
     new_volume_uuid: impl FnOnce() -> String,
-) -> vfs::Result<BootOpenResult<H, P>> {
+) -> std::result::Result<BootOpenResult<H, P>, BootOpenError> {
     // 1. Check store-wide format version FIRST — NEVER format or wipe an incompatible store!
-    if let Some(ver) = head_store.format_version().await?
+    if let Some(ver) = head_store
+        .format_version()
+        .await
+        .map_err(BootOpenError::Errno)?
         && ver != cowtree::COWFS_FORMAT_VERSION
     {
-        return Err(Errno::EPROTONOSUPPORT);
+        return Err(BootOpenError::Errno(Errno::EPROTONOSUPPORT));
     }
 
     match volume_uuid {
@@ -1544,7 +1716,8 @@ pub async fn open_for_boot_stores<
             let vol_id = VolumeId(uuid.clone());
             let now = (config.clock)();
             CowFs::format_volume(&*head_store, &*pack_store, vol_id.clone(), 0, 0, 0o755, now)
-                .await?;
+                .await
+                .map_err(BootOpenError::Errno)?;
             let fs = Rc::new(
                 CowFs::open(
                     Rc::clone(&head_store),
@@ -1553,11 +1726,15 @@ pub async fn open_for_boot_stores<
                     CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
                     config,
                 )
-                .await?,
+                .await
+                .map_err(BootOpenError::Errno)?,
             );
             let mut seeded = false;
             if let (Some(tpl), Some(blob_store)) = (template, blobs) {
-                seed_root_template_fs(&fs, tpl, blob_store).await?;
+                if let Err(e) = seed_root_template_fs(&fs, tpl, blob_store).await {
+                    let _ = fs.close_clean().await;
+                    return Err(BootOpenError::Errno(e));
+                }
                 seeded = true;
             }
             let head = fs.current_head();
@@ -1573,23 +1750,48 @@ pub async fn open_for_boot_stores<
         }
         Some(uuid) => {
             let vol_id = VolumeId(uuid);
-            // 2. Pre-mount format & Merkle integrity check BEFORE mounting rw!
-            let report = cowfsck_volume_stores(&*head_store, &*pack_store, &vol_id).await?;
-            if !report.ok {
-                return Err(Errno::EIO);
-            }
-            // 3. Open volume with requested writer mode (`ForkOnBusy` creates an O(1) persistent
-            //    fork with `ephemeral_if_unmodified = true`; `Exclusive` fails `EBUSY`).
+            // 2. Acquire writer lease / create `ForkOnBusy` fork FIRST (without mutating via
+            //    orphan reap yet), so the exact head to be mounted is pinned against both
+            //    concurrent writers and GC before Merkle verification runs.
+            let open_cfg = config.with_defer_orphan_reap(true);
             let fs = Rc::new(
                 CowFs::open(
                     Rc::clone(&head_store),
                     Rc::clone(&pack_store),
                     vol_id,
                     CowFsOpenMode::ReadWrite(writer_mode),
-                    config,
+                    open_cfg,
                 )
-                .await?,
+                .await
+                .map_err(BootOpenError::Errno)?,
             );
+
+            // 3. Verify THAT EXACT acquired/forked head while holding the live writer lease
+            //    (and shared GC lock inside `verify_head`) BEFORE exposing `fs` or reaping.
+            let mounted_head = fs.current_head();
+            let report =
+                match cowfs::fsck::verify_head(&*head_store, &*pack_store, &mounted_head).await {
+                    Ok(rep) => rep,
+                    Err(e) => {
+                        let _ = fs.close_clean().await;
+                        return Err(BootOpenError::Errno(e));
+                    }
+                };
+            if !report.ok {
+                // Releases the writer lease AND prunes an unmodified `ForkOnBusy` fork while
+                // leaving the parent volume completely untouched!
+                let _ = fs.close_clean().await;
+                return Err(BootOpenError::Corrupt {
+                    volume: mounted_head.volume.0,
+                    report: Box::new(report),
+                });
+            }
+
+            // 4. Head verified clean: reap any persisted crash orphans now.
+            if let Err(e) = fs.reap_orphans().await {
+                let _ = fs.close_clean().await;
+                return Err(BootOpenError::Errno(e));
+            }
             let head = fs.current_head();
             Ok(BootOpenResult {
                 volume_uuid: fs.volume_id().0.clone(),
@@ -1602,6 +1804,42 @@ pub async fn open_for_boot_stores<
             })
         }
     }
+}
+
+/// Open or provision an `os-cowfs` root volume for Stage 1 boot:
+/// - Always checks `COWFS_FORMAT_VERSION` FIRST (`EPROTONOSUPPORT`, NEVER wipes/formats!).
+/// - On first boot (`volume_uuid == None`): formats a fresh volume, atomically seeds
+///   `RootTemplate`, and commits epoch 1.
+/// - On subsequent boot (`volume_uuid == Some(uuid)`): acquires the writer lease / `ForkOnBusy`
+///   fork FIRST and verifies THAT EXACT head via `cowfs::fsck::verify_head` before exposing `fs`
+///   (closing cleanly and returning `EIO` if corrupt, or `EPROTONOSUPPORT` on format mismatch).
+#[allow(clippy::too_many_arguments)]
+pub async fn open_for_boot_stores<
+    H: HeadStore + 'static,
+    P: PackStore + 'static,
+    B: vfs::imagefs::BlobStore,
+>(
+    head_store: Rc<H>,
+    pack_store: Rc<P>,
+    volume_uuid: Option<String>,
+    writer_mode: WriterMode,
+    template: Option<&image::Image>,
+    blobs: Option<&B>,
+    config: CowFsConfig,
+    new_volume_uuid: impl FnOnce() -> String,
+) -> vfs::Result<BootOpenResult<H, P>> {
+    open_for_boot_stores_detailed(
+        head_store,
+        pack_store,
+        volume_uuid,
+        writer_mode,
+        template,
+        blobs,
+        config,
+        new_volume_uuid,
+    )
+    .await
+    .map_err(|e| e.errno())
 }
 
 /// Clean shutdown helper: flushes dirty transactions if modified, invokes `CowFs::close_clean()`,
@@ -1706,13 +1944,7 @@ pub struct CowFsVolume {
     vblk: VblkRegistry,
     identity_pids: RefCell<HashMap<IdentityKey, u32>>,
     next_pid: Cell<u32>,
-    dirty_timer: Rc<RefCell<DirtyFlushTimer>>,
-}
-
-impl Drop for CowFsVolume {
-    fn drop(&mut self) {
-        cancel_dirty_timer(&self.dirty_timer);
-    }
+    dirty_guard: DirtyFlushGuard,
 }
 
 #[wasm_bindgen]
@@ -1749,8 +1981,10 @@ impl CowFsVolume {
         mode: CowFsOpenMode,
     ) -> Result<CowFsVolume, JsValue> {
         let adapter = Rc::new(JsCowfsStore { obj: store });
-        let config = CowFsConfig::local_browser(Rc::new(now_timespec))
+        let base_config = CowFsConfig::local_browser(Rc::new(now_timespec))
             .with_arena(ArenaConfig::fixed_32mib());
+        let (config, dirty_binder) =
+            bind_dirty_flush_timer::<JsCowfsStore, JsCowfsStore>(base_config);
         let fs = Rc::new(
             CowFs::open(
                 Rc::clone(&adapter),
@@ -1762,6 +1996,7 @@ impl CowFsVolume {
             .await
             .map_err(map_vfs_err)?,
         );
+        let dirty_guard = dirty_binder.attach(&fs);
 
         let root_wrapper = Rc::new(BridgeRootFs {
             inner: Rc::clone(&fs),
@@ -1815,7 +2050,7 @@ impl CowFsVolume {
             vblk,
             identity_pids: RefCell::new(identity_pids),
             next_pid: Cell::new(2),
-            dirty_timer: Rc::new(RefCell::new(DirtyFlushTimer::default())),
+            dirty_guard,
         })
     }
 
@@ -1842,16 +2077,11 @@ impl CowFsVolume {
     pub async fn mkdir(&self, path: String, mode: u16, identity: JsValue) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
         let pid = self.ensure_pid(&cred)?;
-        let res = self
-            .vfs
+        self.vfs
             .mkdirat(pid, StartAnchor::Root, &path, mode)
             .await
             .map(|_| ())
-            .map_err(map_vfs_err);
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
-        res
+            .map_err(map_vfs_err)
     }
 
     pub async fn write_file(
@@ -1876,9 +2106,6 @@ impl CowFsVolume {
             .map_err(map_vfs_err)?;
         let res = self.vfs.write(pid, fd, bytes).await;
         let _ = self.vfs.close(pid, fd).await;
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
         res.map_err(map_vfs_err)
     }
 
@@ -1906,9 +2133,6 @@ impl CowFsVolume {
             .map_err(map_vfs_err)?;
         let res = self.vfs.pwrite(pid, fd, bytes, off).await;
         let _ = self.vfs.close(pid, fd).await;
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
         res.map_err(map_vfs_err)
     }
 
@@ -1968,8 +2192,7 @@ impl CowFsVolume {
         let sz = validate_js_u64(size).map_err(map_vfs_err)?;
         let cred = self.cred_or_root(&identity)?;
         let pid = self.ensure_pid(&cred)?;
-        let res = self
-            .vfs
+        self.vfs
             .setattrat(
                 pid,
                 StartAnchor::Root,
@@ -1982,11 +2205,7 @@ impl CowFsVolume {
             )
             .await
             .map(|_| ())
-            .map_err(map_vfs_err);
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
-        res
+            .map_err(map_vfs_err)
     }
 
     pub async fn stat(
@@ -2008,8 +2227,7 @@ impl CowFsVolume {
     pub async fn chmod(&self, path: String, mode: u16, identity: JsValue) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
         let pid = self.ensure_pid(&cred)?;
-        let res = self
-            .vfs
+        self.vfs
             .setattrat(
                 pid,
                 StartAnchor::Root,
@@ -2022,11 +2240,7 @@ impl CowFsVolume {
             )
             .await
             .map(|_| ())
-            .map_err(map_vfs_err);
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
-        res
+            .map_err(map_vfs_err)
     }
 
     pub async fn setxattr(
@@ -2040,15 +2254,10 @@ impl CowFsVolume {
         let cred = self.cred_or_root(&identity)?;
         let pid = self.ensure_pid(&cred)?;
         let xf = XattrFlags::from_bits(flags).ok_or_else(|| map_vfs_err(Errno::EINVAL))?;
-        let res = self
-            .vfs
+        self.vfs
             .setxattrat(pid, StartAnchor::Root, &path, &name, value, xf, true)
             .await
-            .map_err(map_vfs_err);
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
-        res
+            .map_err(map_vfs_err)
     }
 
     pub async fn getxattr(
@@ -2073,16 +2282,11 @@ impl CowFsVolume {
     ) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
         let pid = self.ensure_pid(&cred)?;
-        let res = self
-            .vfs
+        self.vfs
             .symlinkat(pid, &target, StartAnchor::Root, &linkpath)
             .await
             .map(|_| ())
-            .map_err(map_vfs_err);
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
-        res
+            .map_err(map_vfs_err)
     }
 
     pub async fn readlink(&self, path: String, identity: JsValue) -> Result<String, JsValue> {
@@ -2102,8 +2306,7 @@ impl CowFsVolume {
     ) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
         let pid = self.ensure_pid(&cred)?;
-        let res = self
-            .vfs
+        self.vfs
             .linkat(
                 pid,
                 StartAnchor::Root,
@@ -2114,39 +2317,25 @@ impl CowFsVolume {
             )
             .await
             .map(|_| ())
-            .map_err(map_vfs_err);
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
-        res
+            .map_err(map_vfs_err)
     }
 
     pub async fn unlink(&self, path: String, identity: JsValue) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
         let pid = self.ensure_pid(&cred)?;
-        let res = self
-            .vfs
+        self.vfs
             .unlinkat(pid, StartAnchor::Root, &path, false)
             .await
-            .map_err(map_vfs_err);
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
-        res
+            .map_err(map_vfs_err)
     }
 
     pub async fn rmdir(&self, path: String, identity: JsValue) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
         let pid = self.ensure_pid(&cred)?;
-        let res = self
-            .vfs
+        self.vfs
             .unlinkat(pid, StartAnchor::Root, &path, true)
             .await
-            .map_err(map_vfs_err);
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
-        res
+            .map_err(map_vfs_err)
     }
 
     pub async fn rename(
@@ -2163,15 +2352,10 @@ impl CowFsVolume {
         } else {
             RenameFlags::empty()
         };
-        let res = self
-            .vfs
+        self.vfs
             .renameat(pid, StartAnchor::Root, &from, StartAnchor::Root, &to, flags)
             .await
-            .map_err(map_vfs_err);
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
-        res
+            .map_err(map_vfs_err)
     }
 
     pub async fn read_dir_page(
@@ -2202,15 +2386,10 @@ impl CowFsVolume {
     ) -> Result<u32, JsValue> {
         let cred = self.cred_or_root(&identity)?;
         let pid = self.ensure_pid(&cred)?;
-        let fd = self
-            .vfs
+        self.vfs
             .openat(pid, StartAnchor::Root, &path, flags, mode)
             .await
-            .map_err(map_vfs_err)?;
-        if (flags & (abi::O_CREAT | abi::O_TRUNC)) != 0 {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
-        Ok(fd)
+            .map_err(map_vfs_err)
     }
 
     pub async fn fd_read_at(
@@ -2243,25 +2422,16 @@ impl CowFsVolume {
         let off = validate_js_u64(offset).map_err(map_vfs_err)?;
         let cred = self.cred_or_root(&identity)?;
         let pid = self.ensure_pid(&cred)?;
-        let res = self
-            .vfs
+        self.vfs
             .pwrite(pid, fd, bytes, off)
             .await
-            .map_err(map_vfs_err);
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
-        res
+            .map_err(map_vfs_err)
     }
 
     pub async fn fd_close(&self, fd: u32, identity: JsValue) -> Result<(), JsValue> {
         let cred = self.cred_or_root(&identity)?;
         let pid = self.ensure_pid(&cred)?;
-        let res = self.vfs.close(pid, fd).await.map_err(map_vfs_err);
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
-        res
+        self.vfs.close(pid, fd).await.map_err(map_vfs_err)
     }
 
     /// Intra-volume `FICLONE` between two paths (creates `dst` if needed).
@@ -2298,9 +2468,6 @@ impl CowFsVolume {
         let res = self.vfs.ficlone(pid, dst_fd, src_fd).await;
         let _ = self.vfs.close(pid, src_fd).await;
         let _ = self.vfs.close(pid, dst_fd).await;
-        if res.is_ok() {
-            arm_dirty_timer(&self.fs, &self.dirty_timer);
-        }
         res.map_err(map_vfs_err)
     }
 
@@ -2424,17 +2591,23 @@ impl CowFsVolume {
         to_js_json(&head)
     }
 
+    pub async fn flush_for_suspend(&self) -> Result<JsValue, JsValue> {
+        let head = self.fs.flush_for_suspend().await.map_err(map_vfs_err)?;
+        to_js_json(&head)
+    }
+
     pub async fn close_clean(&self) -> Result<(), JsValue> {
-        cancel_dirty_timer(&self.dirty_timer);
-        self.fs.close_clean().await.map_err(map_vfs_err)
+        self.fs.close_clean().await.map_err(map_vfs_err)?;
+        self.dirty_guard.cancel();
+        Ok(())
     }
 
     pub async fn close_clean_with_prune(&self, base_epoch: f64) -> Result<JsValue, JsValue> {
         let base = validate_js_u64(base_epoch).map_err(map_vfs_err)?;
-        cancel_dirty_timer(&self.dirty_timer);
         let outcome = close_clean_with_prune_fs(&self.fs, base)
             .await
             .map_err(map_vfs_err)?;
+        self.dirty_guard.cancel();
         to_js_json(&outcome)
     }
 
@@ -2464,5 +2637,731 @@ impl CowFsVolume {
         self.next_pid.set(next);
         self.identity_pids.borrow_mut().insert(key, pid);
         Ok(pid)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use cowtree::COWFS_FORMAT_VERSION;
+    use cowtree::pack::decode_pack_trailer;
+    use std::collections::{HashMap, HashSet};
+    use std::future::Future;
+
+    struct TestWriterGuard {
+        state: Rc<RefCell<TestHeadState>>,
+        volume: VolumeId,
+        token: u64,
+    }
+    impl WriterLockGuard for TestWriterGuard {}
+    impl Drop for TestWriterGuard {
+        fn drop(&mut self) {
+            let mut st = self.state.borrow_mut();
+            if st.active_locks.get(&self.volume) == Some(&self.token) {
+                st.active_locks.remove(&self.volume);
+            }
+        }
+    }
+
+    struct TestGcGuard;
+    impl GcLockGuard for TestGcGuard {}
+
+    struct TestRoPinGuard;
+    impl RoPinGuard for TestRoPinGuard {}
+
+    #[derive(Default)]
+    struct TestHeadState {
+        format_version: Option<u32>,
+        heads: HashMap<VolumeId, VolumeHead>,
+        nodes: HashMap<Digest, Vec<u8>>,
+        packs: HashMap<PackId, PackMeta>,
+        blocks: HashMap<Digest, BlockLoc>,
+        snapshots: HashMap<(VolumeId, String), SnapshotRecord>,
+        active_locks: HashMap<VolumeId, u64>,
+        next_lock_token: u64,
+        next_fork_seq: u64,
+    }
+
+    #[derive(Clone, Default)]
+    struct TestHeadStore {
+        state: Rc<RefCell<TestHeadState>>,
+    }
+
+    impl TestHeadStore {
+        fn new() -> Self {
+            Self::default()
+        }
+    }
+
+    impl HeadStore for TestHeadStore {
+        fn format_version(&self) -> BoxFuture<'_, Option<u32>> {
+            Box::pin(async move { Ok(self.state.borrow().format_version) })
+        }
+
+        fn grace_window_secs(&self) -> u64 {
+            600
+        }
+
+        fn create_volume<'a>(
+            &'a self,
+            head: &'a VolumeHead,
+            initial_nodes: &'a [(Digest, Vec<u8>)],
+        ) -> BoxFuture<'a, VolumeHead> {
+            Box::pin(async move {
+                let mut st = self.state.borrow_mut();
+                if let Some(ver) = st.format_version
+                    && ver != COWFS_FORMAT_VERSION
+                {
+                    return Err(Errno::EPROTONOSUPPORT);
+                }
+                if st.heads.contains_key(&head.volume) {
+                    return Err(Errno::EEXIST);
+                }
+                st.format_version = Some(COWFS_FORMAT_VERSION);
+                for (d, b) in initial_nodes {
+                    st.nodes.insert(*d, b.clone());
+                }
+                st.heads.insert(head.volume.clone(), head.clone());
+                Ok(head.clone())
+            })
+        }
+
+        fn read_head<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, VolumeHead> {
+            Box::pin(async move {
+                self.state
+                    .borrow()
+                    .heads
+                    .get(volume)
+                    .cloned()
+                    .ok_or(Errno::ENOENT)
+            })
+        }
+
+        fn pin_ro_root<'a>(
+            &'a self,
+            volume: &'a VolumeId,
+            snapshot: Option<&'a str>,
+        ) -> BoxFuture<'a, (VolumeHead, Box<dyn RoPinGuard>)> {
+            Box::pin(async move {
+                let st = self.state.borrow();
+                let mut head = st.heads.get(volume).cloned().ok_or(Errno::ENOENT)?;
+                if let Some(snap_name) = snapshot {
+                    let snap = st
+                        .snapshots
+                        .get(&(volume.clone(), snap_name.to_string()))
+                        .ok_or(Errno::ENOENT)?;
+                    head.root = snap.root;
+                    head.epoch = snap.epoch;
+                }
+                Ok((head, Box::new(TestRoPinGuard) as Box<dyn RoPinGuard>))
+            })
+        }
+
+        fn unpin_ro_root<'a>(&'a self, _pin: Box<dyn RoPinGuard>) -> BoxFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn acquire_writer<'a>(
+            &'a self,
+            volume: &'a VolumeId,
+            mode: WriterMode,
+        ) -> BoxFuture<'a, WriterLease> {
+            Box::pin(async move {
+                let mut st = self.state.borrow_mut();
+                if let Some(ver) = st.format_version
+                    && ver != COWFS_FORMAT_VERSION
+                {
+                    return Err(Errno::EPROTONOSUPPORT);
+                }
+                if st.active_locks.contains_key(volume) {
+                    match mode {
+                        WriterMode::Exclusive => return Err(Errno::EBUSY),
+                        WriterMode::ForkOnBusy => {
+                            let parent = st.heads.get(volume).cloned().ok_or(Errno::ENOENT)?;
+                            st.next_fork_seq += 1;
+                            let fork_id =
+                                VolumeId(format!("{}-fork-{}", volume.0, st.next_fork_seq));
+                            let fork_head = VolumeHead {
+                                format_version: COWFS_FORMAT_VERSION,
+                                volume: fork_id.clone(),
+                                incarnation: 1,
+                                fence: 1,
+                                epoch: parent.epoch,
+                                root: parent.root,
+                                parent_volume: Some(volume.clone()),
+                                ephemeral_if_unmodified: true,
+                                modified: false,
+                                updated_at: parent.updated_at,
+                            };
+                            st.heads.insert(fork_id.clone(), fork_head.clone());
+                            st.next_lock_token += 1;
+                            let token = st.next_lock_token;
+                            st.active_locks.insert(fork_id.clone(), token);
+                            return Ok(WriterLease {
+                                volume: fork_id.clone(),
+                                incarnation: fork_head.incarnation,
+                                fence: fork_head.fence,
+                                epoch: fork_head.epoch,
+                                head: fork_head,
+                                forked_from: Some(volume.clone()),
+                                expires_at: None,
+                                guard: Box::new(TestWriterGuard {
+                                    state: Rc::clone(&self.state),
+                                    volume: fork_id,
+                                    token,
+                                }),
+                            });
+                        }
+                        WriterMode::ForceTakeover => {}
+                    }
+                }
+                let head = st.heads.get_mut(volume).ok_or(Errno::ENOENT)?;
+                head.fence += 1;
+                let updated = head.clone();
+                st.next_lock_token += 1;
+                let token = st.next_lock_token;
+                st.active_locks.insert(volume.clone(), token);
+                Ok(WriterLease {
+                    volume: volume.clone(),
+                    incarnation: updated.incarnation,
+                    fence: updated.fence,
+                    epoch: updated.epoch,
+                    head: updated,
+                    forked_from: None,
+                    expires_at: None,
+                    guard: Box::new(TestWriterGuard {
+                        state: Rc::clone(&self.state),
+                        volume: volume.clone(),
+                        token,
+                    }),
+                })
+            })
+        }
+
+        fn renew_writer<'a>(&'a self, _lease: &'a mut WriterLease) -> BoxFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn release_writer<'a>(&'a self, lease: WriterLease) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                drop(lease);
+                Ok(())
+            })
+        }
+
+        fn get_node<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Vec<u8>> {
+            Box::pin(async move {
+                self.state
+                    .borrow()
+                    .nodes
+                    .get(digest)
+                    .cloned()
+                    .ok_or(Errno::ENOENT)
+            })
+        }
+
+        fn lookup_block<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Option<BlockLoc>> {
+            Box::pin(async move { Ok(self.state.borrow().blocks.get(digest).cloned()) })
+        }
+
+        fn commit_head<'a>(&'a self, req: &'a CommitRequest) -> BoxFuture<'a, VolumeHead> {
+            Box::pin(async move {
+                let mut st = self.state.borrow_mut();
+                let cur = st.heads.get(&req.volume).cloned().ok_or(Errno::ENOENT)?;
+                if cur.incarnation != req.expected_incarnation
+                    || cur.fence != req.expected_fence
+                    || cur.epoch != req.expected_epoch
+                {
+                    return Err(Errno::ESTALE);
+                }
+                for (d, b) in &req.put_nodes {
+                    st.nodes.insert(*d, b.clone());
+                }
+                for pm in &req.put_packs {
+                    st.packs.insert(pm.pack_id.clone(), pm.clone());
+                }
+                for (d, loc) in &req.put_blocks {
+                    st.blocks.insert(*d, loc.clone());
+                }
+                let next = VolumeHead {
+                    epoch: cur.epoch + 1,
+                    root: req.new_root,
+                    modified: true,
+                    ephemeral_if_unmodified: false,
+                    updated_at: req.committed_at,
+                    ..cur
+                };
+                st.heads.insert(req.volume.clone(), next.clone());
+                Ok(next)
+            })
+        }
+
+        fn create_snapshot<'a>(
+            &'a self,
+            volume: &'a VolumeId,
+            name: &'a str,
+            head: &'a VolumeHead,
+            now: Timespec,
+        ) -> BoxFuture<'a, SnapshotRecord> {
+            Box::pin(async move {
+                let mut st = self.state.borrow_mut();
+                let key = (volume.clone(), name.to_string());
+                if st.snapshots.contains_key(&key) {
+                    return Err(Errno::EEXIST);
+                }
+                let rec = SnapshotRecord {
+                    volume: volume.clone(),
+                    name: name.to_string(),
+                    root: head.root,
+                    epoch: head.epoch,
+                    created_at: now,
+                };
+                st.snapshots.insert(key, rec.clone());
+                Ok(rec)
+            })
+        }
+
+        fn get_snapshot<'a>(
+            &'a self,
+            volume: &'a VolumeId,
+            name: &'a str,
+        ) -> BoxFuture<'a, SnapshotRecord> {
+            Box::pin(async move {
+                self.state
+                    .borrow()
+                    .snapshots
+                    .get(&(volume.clone(), name.to_string()))
+                    .cloned()
+                    .ok_or(Errno::ENOENT)
+            })
+        }
+
+        fn list_snapshots<'a>(
+            &'a self,
+            volume: &'a VolumeId,
+        ) -> BoxFuture<'a, Vec<SnapshotRecord>> {
+            Box::pin(async move {
+                let st = self.state.borrow();
+                let mut out: Vec<_> = st
+                    .snapshots
+                    .iter()
+                    .filter(|((v, _), _)| v == volume)
+                    .map(|(_, s)| s.clone())
+                    .collect();
+                out.sort_by(|a, b| a.name.cmp(&b.name));
+                Ok(out)
+            })
+        }
+
+        fn delete_snapshot<'a>(&'a self, volume: &'a VolumeId, name: &'a str) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.state
+                    .borrow_mut()
+                    .snapshots
+                    .remove(&(volume.clone(), name.to_string()))
+                    .map(|_| ())
+                    .ok_or(Errno::ENOENT)
+            })
+        }
+
+        fn fork_volume<'a>(&'a self, req: &'a ForkRequest) -> BoxFuture<'a, VolumeHead> {
+            Box::pin(async move {
+                let mut st = self.state.borrow_mut();
+                if st.heads.contains_key(&req.new_volume) {
+                    return Err(Errno::EEXIST);
+                }
+                let epoch = st
+                    .heads
+                    .get(&req.source_volume)
+                    .map(|h| h.epoch)
+                    .ok_or(Errno::ENOENT)?;
+                let head = VolumeHead {
+                    format_version: COWFS_FORMAT_VERSION,
+                    volume: req.new_volume.clone(),
+                    incarnation: 1,
+                    fence: 0,
+                    epoch,
+                    root: req.source_root,
+                    parent_volume: Some(req.source_volume.clone()),
+                    ephemeral_if_unmodified: req.ephemeral_if_unmodified,
+                    modified: false,
+                    updated_at: req.created_at,
+                };
+                st.heads.insert(req.new_volume.clone(), head.clone());
+                Ok(head)
+            })
+        }
+
+        fn delete_volume<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                let mut st = self.state.borrow_mut();
+                if st.active_locks.contains_key(volume) {
+                    return Err(Errno::EBUSY);
+                }
+                st.heads.remove(volume).ok_or(Errno::ENOENT)?;
+                st.snapshots.retain(|(v, _), _| v != volume);
+                Ok(())
+            })
+        }
+
+        fn delete_volume_with_lease<'a>(
+            &'a self,
+            lease: WriterLease,
+            only_if_unmodified_ephemeral: bool,
+        ) -> BoxFuture<'a, bool> {
+            Box::pin(async move {
+                let deleted = {
+                    let mut st = self.state.borrow_mut();
+                    let cur = st.heads.get(&lease.volume).cloned().ok_or(Errno::ENOENT)?;
+                    if cur.incarnation != lease.incarnation
+                        || cur.fence != lease.fence
+                        || cur.epoch != lease.epoch
+                    {
+                        return Err(Errno::ESTALE);
+                    }
+                    if only_if_unmodified_ephemeral
+                        && (!cur.ephemeral_if_unmodified || cur.modified)
+                    {
+                        false
+                    } else {
+                        st.heads.remove(&lease.volume);
+                        st.snapshots.retain(|(v, _), _| v != &lease.volume);
+                        true
+                    }
+                };
+                drop(lease);
+                Ok(deleted)
+            })
+        }
+
+        fn reformat_volume_with_lease<'a>(
+            &'a self,
+            lease: WriterLease,
+            new_head: &'a VolumeHead,
+            initial_nodes: &'a [(Digest, Vec<u8>)],
+        ) -> BoxFuture<'a, VolumeHead> {
+            Box::pin(async move {
+                let next = {
+                    let mut st = self.state.borrow_mut();
+                    let cur = st.heads.get(&lease.volume).cloned().ok_or(Errno::ENOENT)?;
+                    for (d, b) in initial_nodes {
+                        st.nodes.insert(*d, b.clone());
+                    }
+                    let updated = VolumeHead {
+                        incarnation: cur.incarnation + 1,
+                        fence: 1,
+                        epoch: 0,
+                        ..new_head.clone()
+                    };
+                    st.heads.insert(lease.volume.clone(), updated.clone());
+                    st.snapshots.retain(|(v, _), _| v != &lease.volume);
+                    updated
+                };
+                drop(lease);
+                Ok(next)
+            })
+        }
+
+        fn acquire_gc_lock(&self, _exclusive: bool) -> BoxFuture<'_, Box<dyn GcLockGuard>> {
+            Box::pin(async { Ok(Box::new(TestGcGuard) as Box<dyn GcLockGuard>) })
+        }
+
+        fn list_all_roots(&self) -> BoxFuture<'_, Vec<GcRoot>> {
+            Box::pin(async move {
+                Ok(self
+                    .state
+                    .borrow()
+                    .heads
+                    .values()
+                    .map(|h| GcRoot {
+                        volume: h.volume.clone(),
+                        root: h.root,
+                        pinned_until: None,
+                    })
+                    .collect())
+            })
+        }
+
+        fn list_indexed_packs(&self) -> BoxFuture<'_, HashSet<PackId>> {
+            Box::pin(async move { Ok(self.state.borrow().packs.keys().cloned().collect()) })
+        }
+
+        fn prune_abandoned_ephemeral_forks(
+            &self,
+            _now: Timespec,
+            _grace_window_secs: u64,
+        ) -> BoxFuture<'_, usize> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn sweep_metadata<'a>(
+            &'a self,
+            _keep_nodes: &'a HashSet<Digest>,
+            _keep_packs: &'a HashSet<PackId>,
+            _now: Timespec,
+            _grace_window_secs: u64,
+        ) -> BoxFuture<'a, Vec<PackId>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TestPackStore {
+        packs: Rc<RefCell<HashMap<PackId, Vec<u8>>>>,
+    }
+
+    impl TestPackStore {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn corrupt_pack_byte(&self, pack_id: &PackId, offset: usize) {
+            let mut map = self.packs.borrow_mut();
+            let bytes = map.get_mut(pack_id).expect("pack exists");
+            bytes[offset] ^= 0xff;
+        }
+    }
+
+    impl PackStore for TestPackStore {
+        fn write_pack<'a>(
+            &'a self,
+            pack_id: &'a PackId,
+            bytes: &'a [u8],
+        ) -> BoxFuture<'a, PackMeta> {
+            Box::pin(async move {
+                let trailer = decode_pack_trailer(bytes)?;
+                self.packs
+                    .borrow_mut()
+                    .insert(pack_id.clone(), bytes.to_vec());
+                Ok(PackMeta {
+                    pack_id: pack_id.clone(),
+                    size: bytes.len() as u32,
+                    entry_count: trailer.entries.len() as u32,
+                    created_at: Timespec { sec: 0, nsec: 0 },
+                })
+            })
+        }
+
+        fn read_pack_range<'a>(
+            &'a self,
+            pack_id: &'a PackId,
+            offset: u32,
+            len: u32,
+        ) -> BoxFuture<'a, Vec<u8>> {
+            Box::pin(async move {
+                let map = self.packs.borrow();
+                let bytes = map.get(pack_id).ok_or(Errno::ENOENT)?;
+                let start = offset as usize;
+                let end = start.checked_add(len as usize).ok_or(Errno::EINVAL)?;
+                if end > bytes.len() {
+                    return Err(Errno::EIO);
+                }
+                Ok(bytes[start..end].to_vec())
+            })
+        }
+
+        fn read_pack_trailer<'a>(&'a self, pack_id: &'a PackId) -> BoxFuture<'a, PackTrailer> {
+            Box::pin(async move {
+                let map = self.packs.borrow();
+                let bytes = map.get(pack_id).ok_or(Errno::ENOENT)?;
+                decode_pack_trailer(bytes)
+            })
+        }
+
+        fn stat_pack<'a>(&'a self, pack_id: &'a PackId) -> BoxFuture<'a, Option<u64>> {
+            Box::pin(async move { Ok(self.packs.borrow().get(pack_id).map(|b| b.len() as u64)) })
+        }
+
+        fn list_packs(&self) -> BoxFuture<'_, Vec<PackId>> {
+            Box::pin(async move { Ok(self.packs.borrow().keys().cloned().collect()) })
+        }
+
+        fn delete_pack<'a>(&'a self, pack_id: &'a PackId) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.packs.borrow_mut().remove(pack_id);
+                Ok(())
+            })
+        }
+    }
+
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        vfs::now_or_never(fut).expect("memory cowfs_bridge future ready")
+    }
+
+    fn fixed_clock() -> Rc<dyn Fn() -> Timespec> {
+        Rc::new(|| Timespec {
+            sec: 1_700_000_000,
+            nsec: 0,
+        })
+    }
+
+    #[test]
+    fn codex_13_open_for_boot_verifies_exact_head_and_prunes_corrupt_fork_without_leaks() {
+        let hs = Rc::new(TestHeadStore::new());
+        let ps = Rc::new(TestPackStore::new());
+        let vol = VolumeId("vol-codex-13-boot".into());
+        let now = Timespec {
+            sec: 1_700_000_000,
+            nsec: 0,
+        };
+        block_on(CowFs::format_volume(
+            &*hs,
+            &*ps,
+            vol.clone(),
+            0,
+            0,
+            0o755,
+            now,
+        ))
+        .unwrap();
+
+        // Write a 64 KiB out-of-line file so a pack is created in `ps`, then keep `tab1` holding
+        // the exclusive writer lease so a second opener with `ForkOnBusy` creates a fork.
+        let tab1 = block_on(CowFs::open(
+            Rc::clone(&hs),
+            Rc::clone(&ps),
+            vol.clone(),
+            CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+            CowFsConfig::local_browser(fixed_clock()),
+        ))
+        .unwrap();
+        let admin = Cred::root();
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true);
+        let (_, fd) =
+            block_on(tab1.create(&admin, &tab1.root(), "payload.bin", 0o644, &opts)).unwrap();
+        let payload = vec![0x5au8; 64 * 1024];
+        block_on(tab1.write_at(&fd, &payload, WriteAt::Offset(0))).unwrap();
+        block_on(tab1.release(&fd)).unwrap();
+        block_on(tab1.commit_tx_group()).unwrap();
+
+        // Corrupt a byte in the backing pack while `tab1` holds the writer lease.
+        let packs = block_on(ps.list_packs()).unwrap();
+        assert_eq!(packs.len(), 1);
+        ps.corrupt_pack_byte(&packs[0], 16);
+
+        // 1. `ForkOnBusy` boot open MUST verify the exact newly forked head, fail closed with
+        //    `BootOpenError::Corrupt`, and prune the unmodified fork head without leaking it!
+        let roots_before = block_on(hs.list_all_roots()).unwrap();
+        let res = block_on(open_for_boot_stores_detailed(
+            Rc::clone(&hs),
+            Rc::clone(&ps),
+            Some(vol.0.clone()),
+            WriterMode::ForkOnBusy,
+            None,
+            None::<&vfs::imagefs::MemoryBlobStore>,
+            CowFsConfig::local_browser(fixed_clock()),
+            || "unused".into(),
+        ));
+        match res {
+            Err(BootOpenError::Corrupt { volume, report }) => {
+                assert!(
+                    volume.starts_with(&format!("{}-fork-", vol.0)),
+                    "expected verification of exact forked volume, got {volume}"
+                );
+                assert!(!report.ok);
+                assert!(!report.errors.is_empty());
+            }
+            Ok(_) => panic!("corrupt ForkOnBusy volume must fail closed"),
+            Err(BootOpenError::Errno(e)) => panic!("expected Corrupt, got Errno({e:?})"),
+        }
+        // Unmodified fork head MUST have been pruned cleanly!
+        let roots_after = block_on(hs.list_all_roots()).unwrap();
+        assert_eq!(
+            roots_after.len(),
+            roots_before.len(),
+            "failed corrupt ForkOnBusy must not leak fork heads"
+        );
+        assert!(block_on(hs.read_head(&vol)).is_ok());
+
+        // Release `tab1`, then test direct `Exclusive` boot open on the same corrupt volume:
+        // MUST fail closed (`Errno::EIO` via `open_for_boot_stores`) AND release the writer lock!
+        block_on(tab1.close_clean()).unwrap();
+        let err = block_on(open_for_boot_stores(
+            Rc::clone(&hs),
+            Rc::clone(&ps),
+            Some(vol.0.clone()),
+            WriterMode::Exclusive,
+            None,
+            None::<&vfs::imagefs::MemoryBlobStore>,
+            CowFsConfig::local_browser(fixed_clock()),
+            || "unused".into(),
+        ))
+        .err()
+        .expect("corrupt exclusive boot must fail");
+        assert_eq!(err, Errno::EIO);
+
+        // Writer lease MUST NOT be leaked: exclusive lock acquisition succeeds immediately!
+        let lease = block_on(hs.acquire_writer(&vol, WriterMode::Exclusive))
+            .expect("writer lease must be released when boot verification fails");
+        block_on(hs.release_writer(lease)).unwrap();
+    }
+
+    #[test]
+    fn codex_14_bind_dirty_flush_timer_arms_on_first_dirty_transition_of_bare_cowfs() {
+        let hs = Rc::new(TestHeadStore::new());
+        let ps = Rc::new(TestPackStore::new());
+        let vol = VolumeId("vol-codex-14-binder".into());
+        block_on(CowFs::format_volume(
+            &*hs,
+            &*ps,
+            vol.clone(),
+            0,
+            0,
+            0o755,
+            fixed_clock()(),
+        ))
+        .unwrap();
+
+        let (config, binder) = bind_dirty_flush_timer::<TestHeadStore, TestPackStore>(
+            CowFsConfig::local_browser(fixed_clock()),
+        );
+        let fs = Rc::new(
+            block_on(CowFs::open(
+                Rc::clone(&hs),
+                Rc::clone(&ps),
+                vol,
+                CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+                config,
+            ))
+            .unwrap(),
+        );
+        let guard = binder.attach(&fs);
+        // Binder uses `Weak<CowFs>`, so `fs` has no Rc reference cycle!
+        assert_eq!(Rc::strong_count(&fs), 1);
+        assert_eq!(guard.armed_count(), 0);
+
+        let admin = Cred::root();
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true);
+
+        // First write on bare `CowFs` automatically arms the dirty timer.
+        let (_, fd1) = block_on(fs.create(&admin, &fs.root(), "f1.txt", 0o644, &opts)).unwrap();
+        block_on(fs.write_at(&fd1, b"abc", WriteAt::Offset(0))).unwrap();
+        block_on(fs.release(&fd1)).unwrap();
+        assert_eq!(guard.armed_count(), 1);
+
+        // Second write while already dirty does not re-arm redundantly.
+        let (_, fd2) = block_on(fs.create(&admin, &fs.root(), "f2.txt", 0o644, &opts)).unwrap();
+        block_on(fs.write_at(&fd2, b"def", WriteAt::Offset(0))).unwrap();
+        block_on(fs.release(&fd2)).unwrap();
+        assert_eq!(guard.armed_count(), 1);
+
+        // Commit resets dirty state; next write arms again!
+        block_on(fs.commit_tx_group()).unwrap();
+        let (_, fd3) = block_on(fs.create(&admin, &fs.root(), "f3.txt", 0o644, &opts)).unwrap();
+        block_on(fs.write_at(&fd3, b"ghi", WriteAt::Offset(0))).unwrap();
+        block_on(fs.release(&fd3)).unwrap();
+        assert_eq!(guard.armed_count(), 2);
+
+        // Canceling the guard prevents any further arming.
+        guard.cancel();
+        block_on(fs.commit_tx_group()).unwrap();
+        let (_, fd4) = block_on(fs.create(&admin, &fs.root(), "f4.txt", 0o644, &opts)).unwrap();
+        block_on(fs.write_at(&fd4, b"jkl", WriteAt::Offset(0))).unwrap();
+        block_on(fs.release(&fd4)).unwrap();
+        assert_eq!(guard.armed_count(), 2);
+
+        block_on(fs.close_clean()).unwrap();
     }
 }
