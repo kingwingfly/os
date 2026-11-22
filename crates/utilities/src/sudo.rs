@@ -157,6 +157,7 @@ impl SudoBackend for OsSudoBackend {
         let mut reply = os_posix::batch(&[Call::Login {
             username: user.to_owned(),
             password: String::new(),
+            force: true,
         }])
         .map_err(|e| abi::Error::because(Errno::EIO, e.to_string()))?;
         reply.results.remove(0).into_result().map(|_| ())

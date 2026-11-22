@@ -46,7 +46,7 @@ use kernel::startup::{Profile as StartupProfile, Startup};
 use os_core::permissions::Identity;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
@@ -511,6 +511,7 @@ pub(crate) struct CloudSession {
     pub cloud_gid: u32,
     pub cloud_groups: Vec<u32>,
     pub local_uid: u32,
+    pub login_generation: u64,
     pub scope: RemoteScope,
     pub page_token: String,
     pub signed_in_at: u64,
@@ -555,7 +556,7 @@ pub(crate) struct State {
     pub(crate) account_epoch: u64,
     pub(crate) proc_account_epoch: HashMap<u32, u64>,
     pub(crate) cloud_session: Option<CloudSession>,
-    pub(crate) sudo_timestamps: BTreeMap<u32, u64>,
+    pub(crate) sudo_timestamps: BTreeMap<(u32, u32), u64>,
     pub(crate) remote_attached: bool,
     pub(crate) host_epoch: u64,
     pub(crate) pending_revocations: Vec<String>,
@@ -751,6 +752,57 @@ fn validate_local_exec(local: &LocalExecutable) -> std::result::Result<(), Error
     Ok(())
 }
 
+/// Cooperative single-threaded FIFO async lock used to serialize account DB read-validate-commit
+/// operations per `Kernel` instance across `.await` points without any extra dependency.
+pub(crate) struct AccountAsyncLock {
+    locked: Cell<bool>,
+    waiters: RefCell<std::collections::VecDeque<std::task::Waker>>,
+}
+
+pub(crate) struct AccountLockGuard {
+    lock: Rc<AccountAsyncLock>,
+}
+
+impl Drop for AccountLockGuard {
+    fn drop(&mut self) {
+        self.lock.locked.set(false);
+        if let Some(waker) = self.lock.waiters.borrow_mut().pop_front() {
+            waker.wake();
+        }
+    }
+}
+
+impl AccountAsyncLock {
+    pub(crate) fn new() -> Rc<Self> {
+        Rc::new(Self {
+            locked: Cell::new(false),
+            waiters: RefCell::new(std::collections::VecDeque::new()),
+        })
+    }
+
+    pub(crate) fn acquire(self: &Rc<Self>) -> impl std::future::Future<Output = AccountLockGuard> {
+        struct Acquire(Rc<AccountAsyncLock>);
+        impl std::future::Future for Acquire {
+            type Output = AccountLockGuard;
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                if !self.0.locked.get() {
+                    self.0.locked.set(true);
+                    std::task::Poll::Ready(AccountLockGuard {
+                        lock: Rc::clone(&self.0),
+                    })
+                } else {
+                    self.0.waiters.borrow_mut().push_back(cx.waker().clone());
+                    std::task::Poll::Pending
+                }
+            }
+        }
+        Acquire(Rc::clone(self))
+    }
+}
+
 #[wasm_bindgen]
 pub struct Kernel {
     state: Rc<RefCell<State>>,
@@ -760,6 +812,8 @@ pub struct Kernel {
     cloud: cloudfs::Connector,
     /// Unified `os_vfs::Vfs` mount/namespace/descriptor engine (vfs_engine.rs).
     vfs_rt: RefCell<vfs_engine::VfsRuntime>,
+    /// Serializes account DB read-validate-publish-commit across concurrent calls.
+    account_lock: Rc<AccountAsyncLock>,
 }
 
 #[wasm_bindgen]
@@ -828,6 +882,7 @@ impl Kernel {
             cloud: connector,
             state,
             vfs_rt,
+            account_lock: AccountAsyncLock::new(),
         }
     }
 

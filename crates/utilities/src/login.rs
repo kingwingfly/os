@@ -103,6 +103,7 @@ impl LoginBackend for OsLoginBackend {
         let mut reply = os_posix::batch(&[Call::Login {
             username: username.to_owned(),
             password: password.to_owned(),
+            force: false,
         }])
         .map_err(|e| abi::Error::because(Errno::EIO, e.to_string()))?;
         reply.results.remove(0).into_result().map(|_| ())

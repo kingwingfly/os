@@ -323,6 +323,9 @@ mod runtime {
                         mount_namespace: spec.grant.mount_namespace.as_str(),
                         bind_mounts: &binds,
                         user: spec.grant.user.as_deref(),
+                        group: spec.grant.group.as_deref(),
+                        devices: &[],
+                        cloud_scope: None,
                     });
                     let cwd = spec.cwd.as_deref().unwrap_or("/");
                     let opts = SpawnOptions {

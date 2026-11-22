@@ -1268,13 +1268,18 @@ pub enum Call {
         index: u64,
         data: Bytes,
     },
-    /// Sign this session in as `username`, its password said (none needed by root, or under
-    /// sudo): the session is a new one, its cookie the reply's. Rate-limited.
+    /// Authenticate as `username` against local `/etc/shadow`.
+    /// When `force` is `false` (default), password verification and account lock status are
+    /// ALWAYS enforced, even when the caller is UID 0. Setting `force: true` requests a
+    /// passwordless privileged identity switch (for `login -f`, root `su`, or `sudo -u`) and
+    /// is permitted strictly for callers already running as UID 0 (`EPERM` otherwise).
     Login {
         #[serde(default = "root")]
         username: String,
         #[serde(default)]
         password: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
     },
     /// Sign this session out: it is a guest's from then on.
     Logout,

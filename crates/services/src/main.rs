@@ -384,6 +384,9 @@ fn run() -> Result<i32, String> {
                             mount_namespace: unit.mount_namespace.as_str(),
                             bind_mounts: &bind_mounts,
                             user: None,
+                            group: None,
+                            devices: &[],
+                            cloud_scope: None,
                         });
                         spawn_configured(
                             &unit.argv,

@@ -169,7 +169,11 @@ export async function pageRmrf(page, path, options = {}) {
 
 // Switch the page's local OS account (100% local, zero network RPCs) and emit `os:login-changed`.
 export async function switchLocalUser(page, username, { password = '', sudo = true } = {}) {
-  const creds = await pageCall(page, { login: { username, password } }, { sudo });
+  const creds = await pageCall(
+    page,
+    { login: { username, password, ...(sudo && !password ? { force: true } : {}) } },
+    { sudo },
+  );
   await page.evaluate(() => window.dispatchEvent(new Event('os:login-changed')));
   return creds;
 }

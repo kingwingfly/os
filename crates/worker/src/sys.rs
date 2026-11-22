@@ -1480,6 +1480,7 @@ mod tests {
             Call::Login {
                 username: "root".into(),
                 password: "pw".into(),
+                force: false,
             },
             Call::Logout,
             Call::Sudo {

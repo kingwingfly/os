@@ -989,6 +989,7 @@ impl Kernel {
                 cloud_gid: issued.gid,
                 cloud_groups: issued.groups.clone(),
                 local_uid,
+                login_generation: st.account_epoch,
                 scope: issued.scope.clone(),
                 page_token: issued.token.clone(),
                 signed_in_at: now_secs(),

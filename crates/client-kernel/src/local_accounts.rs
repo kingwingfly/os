@@ -819,7 +819,7 @@ impl Kernel {
                     .state
                     .borrow()
                     .sudo_timestamps
-                    .get(&uid)
+                    .get(&(uid, 0))
                     .copied()
                     .unwrap_or(0);
                 Ok(now <= cached_until)
@@ -919,7 +919,7 @@ impl Kernel {
                             .state
                             .borrow()
                             .sudo_timestamps
-                            .get(&caller_identity.id)
+                            .get(&(caller_identity.id, 0))
                             .is_some_and(|&until| now <= until));
                 let creds = build_creds_from_records(
                     caller_identity.id,
@@ -937,7 +937,7 @@ impl Kernel {
                     self.state
                         .borrow_mut()
                         .sudo_timestamps
-                        .remove(&caller_identity.id);
+                        .remove(&(caller_identity.id, 0));
                     return Ok(json!({ "sudo_active": false }));
                 }
                 let gvec: Vec<u32> = caller_identity.groups.iter().copied().collect();
@@ -955,7 +955,7 @@ impl Kernel {
                             .state
                             .borrow()
                             .sudo_timestamps
-                            .get(&caller_identity.id)
+                            .get(&(caller_identity.id, 0))
                             .is_some_and(|&until| now <= until);
                         if !cached {
                             let raw_pw = snap.read_file(PASSWD_PATH)?;
@@ -974,7 +974,7 @@ impl Kernel {
                 self.state
                     .borrow_mut()
                     .sudo_timestamps
-                    .insert(caller_identity.id, now.saturating_add(SUDO_TTL_SECS));
+                    .insert((caller_identity.id, 0), now.saturating_add(SUDO_TTL_SECS));
 
                 // When invoked from a real process (e.g. `sudo` applet), elevate ONLY that
                 // process's local identity to uid 0 while strictly preserving at most its existing
@@ -1007,7 +1007,11 @@ impl Kernel {
                 }
                 Ok(json!({ "sudo_active": true }))
             }
-            Call::Login { username, password } => {
+            Call::Login {
+                username,
+                password,
+                force,
+            } => {
                 let raw_pw = snap.read_file(PASSWD_PATH)?;
                 let raw_gr = snap.read_file(GROUP_PATH)?;
                 let passwd = parse_passwd(
@@ -1021,6 +1025,7 @@ impl Kernel {
                     .find(|u| u.name == username)
                     .ok_or_else(|| Error::because(Errno::EACCES, "invalid username or password"))?;
 
+                let _ = force;
                 // Root (uid 0) may switch to any local user without password (e.g. `su alice`,
                 // `sudo -u alice`, `login -f alice`); non-root must authenticate against /etc/shadow.
                 if caller_identity.id != 0 {
