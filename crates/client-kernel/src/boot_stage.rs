@@ -30,17 +30,22 @@ use crate::release_v2::{
 };
 use abi::contract::{InstanceIdentity, fs_magic, mount_flags, umount_flags};
 use abi::fs::{FsId, OpenOptions, SetAttr, Timespec, WriteAt};
-use abi::{Errno, S_IFDIR, S_IFREG, Stat, StatFs};
+use abi::{Errno, ProcState, S_IFDIR, S_IFREG, Stat, StatFs};
 use cowfs::{CowFs, CowFsConfig, CowFsVolumeDevice};
 use cowtree::{
-    ArenaConfig, COWFS_FORMAT_VERSION, ForkRequest, HeadStore, PackStore, VolumeId, WriterMode,
+    ArenaConfig, COWFS_FORMAT_VERSION, ForkRequest, HeadStore, PackStore, RootObject, VolumeId,
+    WriterMode,
 };
 use image::{Image, Kind, Node};
-use kernel::proc_table::{LocalProcessTable, ReexecSpec};
+use kernel::accounts::{
+    AccountFs, LocalAccountStore, MemoryAccountFs, parse_group, parse_passwd,
+};
+use kernel::proc_table::{LocalCred, LocalProcessTable, ReexecSpec, SpawnSpec};
+use os_core::permissions::Identity;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::{Rc, Weak};
 use vfs::devfs::{DefaultDeviceBackend, DevPtsFs, DevTmpFs};
 use vfs::imagefs::{BlobStore, ImageFs};
@@ -95,6 +100,13 @@ pub enum RootSpec {
         #[serde(default)]
         writer_mode: BootWriterMode,
     },
+    /// Read-only immutable snapshot root (`contract.md` §1, §5; Codex Finding #32).
+    Snapshot {
+        volume_uuid: String,
+        snapshot: String,
+    },
+    /// Ephemeral `tmpfs`-backed root populated from `RootTemplate` (nothing persisted to `os-cowfs`).
+    Ephemeral,
     /// Legacy explicit opt-in cloud root (NOT used by standalone offline boot).
     CloudOptIn {
         #[serde(default)]
@@ -144,13 +156,28 @@ impl BootProfile {
         if self.default_user != "user" && self.default_user != "root" {
             return Err(Errno::EINVAL);
         }
-        if let RootSpec::CowFs {
-            volume_uuid: Some(uuid),
-            ..
-        } = &self.root
-            && (uuid.is_empty() || uuid.len() > 128 || uuid.contains('/') || uuid.contains('\0'))
-        {
-            return Err(Errno::EINVAL);
+        match &self.root {
+            RootSpec::CowFs {
+                volume_uuid: Some(uuid),
+                ..
+            } if uuid.is_empty() || uuid.len() > 128 || uuid.contains('/') || uuid.contains('\0') => {
+                return Err(Errno::EINVAL);
+            }
+            RootSpec::Snapshot {
+                volume_uuid,
+                snapshot,
+            } if volume_uuid.is_empty()
+                || volume_uuid.len() > 128
+                || volume_uuid.contains('/')
+                || volume_uuid.contains('\0')
+                || snapshot.is_empty()
+                || snapshot.len() > 128
+                || snapshot.contains('/')
+                || snapshot.contains('\0') =>
+            {
+                return Err(Errno::EINVAL);
+            }
+            _ => {}
         }
         if let Some(generation) = &self.generation
             && (generation.len() != 64 || !generation.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -200,6 +227,10 @@ pub enum RecoveryReason {
     VolumeBusy {
         volume_uuid: String,
     },
+    AccountResolutionFailed {
+        default_user: String,
+        detail: String,
+    },
     IoError {
         errno: String,
         detail: String,
@@ -229,12 +260,29 @@ pub struct Pid1Snapshot {
     pub cwd: String,
 }
 
+/// Snapshot of the separate Stage 2 non-PID-1 console login process (`Codex Finding #2`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleProcSnapshot {
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: Vec<u32>,
+    pub user: String,
+    pub home: String,
+    pub shell: String,
+    pub cwd: String,
+    pub tty: Option<String>,
+}
+
 /// Complete observable status snapshot of a [`TwoStageBoot`] instance.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BootStatusSnapshot {
     pub stage: BootStage,
     pub instance_id: String,
     pub pid1: Pid1Snapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console_proc: Option<ConsoleProcSnapshot>,
     pub boot_profile: BootProfile,
     pub mounted_root: Option<MountedRootInfo>,
     pub recovery: Option<RecoveryState>,
@@ -276,6 +324,7 @@ pub struct TwoStageBoot<
     blobs: B,
     release: ReleaseImages,
     cowfs: Option<Rc<CowFs<H, P>>>,
+    home_cowfs: Option<Rc<dyn Filesystem>>,
     mounted_root: Option<MountedRootInfo>,
     recovery: Option<RecoveryState>,
     fsck_report: Option<cowfs::FsckReport>,
@@ -283,6 +332,11 @@ pub struct TwoStageBoot<
     clock_fn: Rc<dyn Fn() -> Timespec>,
     stage1_fs_weak: Weak<MemFs>,
     stage1_reclaimed_entries: usize,
+    console_pid: u32,
+    console_pty: Option<u32>,
+    console_user: Option<String>,
+    console_home: Option<String>,
+    console_shell: Option<String>,
     closed: bool,
 }
 
@@ -365,10 +419,187 @@ async fn write_file_on_vfs(vfs: &Vfs, path: &str, bytes: &[u8], mode: u16) -> vf
 }
 
 async fn ensure_dir_on_vfs(vfs: &Vfs, path: &str, mode: u16) -> vfs::Result<()> {
+    if let Ok(st) = vfs.statat(1, StartAnchor::Root, path, false).await {
+        return if st.kind() == S_IFDIR {
+            Ok(())
+        } else {
+            Err(Errno::ENOTDIR)
+        };
+    }
     match vfs.mkdirat(1, StartAnchor::Root, path, mode).await {
         Ok(_) | Err(Errno::EEXIST) => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+async fn read_file_as_pid(vfs: &Vfs, pid: u32, path: &str) -> vfs::Result<Vec<u8>> {
+    let fd = vfs
+        .openat(pid, StartAnchor::Root, path, abi::O_RDONLY, 0)
+        .await?;
+    let mut out = Vec::new();
+    let mut off = 0u64;
+    let mut chunk = vec![0u8; 65_536];
+    loop {
+        let n = match vfs.pread(pid, fd, &mut chunk, off).await {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = vfs.close(pid, fd).await;
+                return Err(e);
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&chunk[..n]);
+        off += n as u64;
+    }
+    vfs.close(pid, fd).await?;
+    Ok(out)
+}
+
+async fn write_file_as_pid(
+    vfs: &Vfs,
+    pid: u32,
+    path: &str,
+    bytes: &[u8],
+    mode: u16,
+) -> vfs::Result<usize> {
+    let fd = vfs
+        .openat(
+            pid,
+            StartAnchor::Root,
+            path,
+            abi::O_CREAT | abi::O_WRONLY | abi::O_TRUNC,
+            mode,
+        )
+        .await?;
+    let mut off = 0u64;
+    while (off as usize) < bytes.len() {
+        let n = match vfs.pwrite(pid, fd, &bytes[off as usize..], off).await {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = vfs.close(pid, fd).await;
+                return Err(e);
+            }
+        };
+        if n == 0 {
+            let _ = vfs.close(pid, fd).await;
+            return Err(Errno::EIO);
+        }
+        off += n as u64;
+    }
+    vfs.close(pid, fd).await?;
+    Ok(bytes.len())
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedConsoleAccount {
+    uid: u32,
+    gid: u32,
+    groups: BTreeSet<u32>,
+    user: String,
+    home: String,
+    shell: String,
+}
+
+async fn resolve_default_account_at_prefix(
+    vfs: &Vfs,
+    prefix: &str,
+    default_user: &str,
+) -> Result<ResolvedConsoleAccount, String> {
+    let passwd_path = if prefix.is_empty() || prefix == "/" {
+        "/etc/passwd".to_string()
+    } else {
+        format!("{prefix}/etc/passwd")
+    };
+    let group_path = if prefix.is_empty() || prefix == "/" {
+        "/etc/group".to_string()
+    } else {
+        format!("{prefix}/etc/group")
+    };
+    let passwd_bytes = read_file_as_pid(vfs, 1, &passwd_path)
+        .await
+        .map_err(|e| format!("failed to read {passwd_path}: {}", e.text()))?;
+    let passwd_text = std::str::from_utf8(&passwd_bytes)
+        .map_err(|_| format!("{passwd_path} is not valid UTF-8"))?;
+    let passwd_entries =
+        parse_passwd(passwd_text).map_err(|e| format!("invalid {passwd_path}: {e}"))?;
+    let entry = passwd_entries
+        .into_iter()
+        .find(|e| e.name == default_user)
+        .ok_or_else(|| format!("configured default_user {default_user:?} not found in {passwd_path}"))?;
+
+    let group_bytes = read_file_as_pid(vfs, 1, &group_path)
+        .await
+        .map_err(|e| format!("failed to read {group_path}: {}", e.text()))?;
+    let group_text = std::str::from_utf8(&group_bytes)
+        .map_err(|_| format!("{group_path} is not valid UTF-8"))?;
+    let group_entries =
+        parse_group(group_text).map_err(|e| format!("invalid {group_path}: {e}"))?;
+    let mut groups = BTreeSet::from([entry.gid]);
+    for g in &group_entries {
+        if g.members.iter().any(|m| m == &entry.name) {
+            groups.insert(g.gid);
+        }
+    }
+    Ok(ResolvedConsoleAccount {
+        uid: entry.uid,
+        gid: entry.gid,
+        groups,
+        user: entry.name,
+        home: if entry.home.is_empty() {
+            "/".to_string()
+        } else {
+            entry.home
+        },
+        shell: if entry.shell.is_empty() {
+            "/bin/sh".to_string()
+        } else {
+            entry.shell
+        },
+    })
+}
+
+async fn validate_init_executable_in_root(
+    vfs: &Vfs,
+    clean_newroot: &str,
+    init_path: &str,
+) -> vfs::Result<()> {
+    let init_candidate = format!("{clean_newroot}{init_path}");
+    let init_st = vfs
+        .statat(1, StartAnchor::Root, &init_candidate, true)
+        .await?;
+    if init_st.kind() != S_IFREG || (init_st.mode & 0o111) == 0 {
+        return Err(Errno::EACCES);
+    }
+    let fd = vfs
+        .openat(1, StartAnchor::Root, &init_candidate, abi::O_RDONLY, 0)
+        .await?;
+    let mut hdr = [0u8; 256];
+    let n = vfs.pread(1, fd, &mut hdr, 0).await;
+    let _ = vfs.close(1, fd).await;
+    let n = n?;
+    let head = &hdr[..n];
+    if head.starts_with(b"\0asm") {
+        return Ok(());
+    }
+    if let Some(rest) = head.strip_prefix(b"#!") {
+        let line_end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+        let line = std::str::from_utf8(&rest[..line_end]).map_err(|_| Errno::ENOEXEC)?;
+        let interp = line.trim().split_whitespace().next().ok_or(Errno::ENOEXEC)?;
+        if !interp.starts_with('/') || interp.contains('\0') {
+            return Err(Errno::ENOEXEC);
+        }
+        let interp_candidate = format!("{clean_newroot}{interp}");
+        let interp_st = vfs
+            .statat(1, StartAnchor::Root, &interp_candidate, true)
+            .await?;
+        if interp_st.kind() != S_IFREG || (interp_st.mode & 0o111) == 0 {
+            return Err(Errno::EACCES);
+        }
+        return Ok(());
+    }
+    Err(Errno::ENOEXEC)
 }
 
 async fn populate_stage1_tmpfs<B: BlobStore>(
@@ -895,6 +1126,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
             blobs,
             release,
             cowfs: None,
+            home_cowfs: None,
             mounted_root: None,
             recovery: None,
             fsck_report: None,
@@ -902,6 +1134,11 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
             clock_fn: clock,
             stage1_fs_weak,
             stage1_reclaimed_entries: 0,
+            console_pid: 1,
+            console_pty: None,
+            console_user: None,
+            console_home: None,
+            console_shell: None,
             closed: false,
         })
     }
@@ -942,7 +1179,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
         if self.boot_profile.recovery {
             let vol = match &self.boot_profile.root {
                 RootSpec::CowFs { volume_uuid, .. } => volume_uuid.clone(),
-                RootSpec::CloudOptIn { .. } => None,
+                RootSpec::Snapshot { volume_uuid, .. } => Some(volume_uuid.clone()),
+                RootSpec::Ephemeral | RootSpec::CloudOptIn { .. } => None,
             };
             let snaps = match &vol {
                 Some(v) => self
@@ -965,11 +1203,16 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
                 .await);
         }
 
-        let (volume_uuid, writer_mode) = match &self.boot_profile.root {
-            RootSpec::CowFs {
+        match self.boot_profile.root.clone() {
+            RootSpec::Ephemeral => {
+                return self.prepare_ephemeral_root().await;
+            }
+            RootSpec::Snapshot {
                 volume_uuid,
-                writer_mode,
-            } => (volume_uuid.clone(), *writer_mode),
+                snapshot,
+            } => {
+                return self.prepare_snapshot_root(&volume_uuid, &snapshot).await;
+            }
             RootSpec::CloudOptIn { .. } => {
                 return Ok(self
                     .enter_recovery(
@@ -980,10 +1223,19 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
                         },
                         None,
                         Vec::new(),
-                        "Standalone offline boot requires a local CowFs root.",
+                        "Standalone offline boot requires a local CowFs, Snapshot, or Ephemeral root.",
                     )
                     .await);
             }
+            RootSpec::CowFs { .. } => {}
+        }
+
+        let (volume_uuid, writer_mode) = match &self.boot_profile.root {
+            RootSpec::CowFs {
+                volume_uuid,
+                writer_mode,
+            } => (volume_uuid.clone(), *writer_mode),
+            _ => unreachable!(),
         };
 
         // 1. Format version check FIRST — NEVER silently wipe or reformat user data!
@@ -1185,6 +1437,442 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
 
         self.mount_opened_cowfs_at_sysroot(opened, writer_mode)
             .await?;
+        // Fail closed BEFORE pivoting if `/sysroot/etc/passwd` is missing/corrupt or the
+        // configured `default_user` cannot be resolved (Codex Finding #24).
+        if let Err(detail) = resolve_default_account_at_prefix(
+            &self.vfs,
+            "/sysroot",
+            &self.boot_profile.default_user,
+        )
+        .await
+        {
+            self.teardown_sysroot_mounts().await;
+            let vol = self
+                .mounted_root
+                .take()
+                .map(|r| r.volume_uuid)
+                .or(volume_uuid);
+            if let Some(fs) = self.cowfs.take() {
+                let _ = fs.close_clean().await;
+            }
+            self.home_cowfs = None;
+            let default_user = self.boot_profile.default_user.clone();
+            return Ok(self
+                .enter_recovery(
+                    RecoveryReason::AccountResolutionFailed {
+                        default_user: default_user.clone(),
+                        detail: detail.clone(),
+                    },
+                    vol,
+                    Vec::new(),
+                    format!("Refusing to auto-login synthetic user for {default_user:?}: {detail}"),
+                )
+                .await);
+        }
+        self.recovery = None;
+        self.stage = BootStage::Stage1;
+        Ok(BootStage::Stage1)
+    }
+
+    async fn teardown_sysroot_mounts(&self) {
+        let _ = self
+            .vfs
+            .umount2(1, "/sysroot/tmp", umount_flags::MNT_DETACH)
+            .await;
+        let _ = self
+            .vfs
+            .umount2(1, "/sysroot/usr", umount_flags::MNT_DETACH)
+            .await;
+        let _ = self
+            .vfs
+            .umount2(1, "/sysroot/home", umount_flags::MNT_DETACH)
+            .await;
+        let _ = self
+            .vfs
+            .umount2(1, "/sysroot", umount_flags::MNT_DETACH)
+            .await;
+    }
+
+    async fn mount_stage2_usr_and_tmp(&self, now: Timespec) -> vfs::Result<()> {
+        let sys_ns = self.vfs.system_namespace();
+        let mut root_cred = Cred::root();
+        root_cred.umask = 0;
+
+        for (sub, mode) in [
+            ("/sysroot/proc", 0o555),
+            ("/sysroot/dev", 0o755),
+            ("/sysroot/run", 0o755),
+            ("/sysroot/usr", 0o755),
+            ("/sysroot/tmp", 0o1777),
+        ] {
+            ensure_dir_on_vfs(&self.vfs, sub, mode).await?;
+        }
+
+        let stage2_usr_entries =
+            compose_system_image_entries(&self.release.base, &self.release.extensions)
+                .map_err(|_| Errno::EINVAL)?;
+        let stage2_usr_fs = ImageFs::new(
+            FsId("image:stage2-usr".to_string()),
+            true,
+            now,
+            stage2_usr_entries,
+            self.blobs.clone(),
+        )?;
+        let usr_subroot = stage2_usr_fs
+            .handle_at("/usr")
+            .map(|h| (h, "/usr".to_string()))
+            .ok_or(Errno::ENOENT)?;
+        let usr_backing = Rc::new(
+            MountBacking::new(Rc::new(stage2_usr_fs), FsType::Image).with_ceilings(true, false),
+        );
+        self.vfs
+            .mount_on_namespace(
+                &sys_ns,
+                &root_cred,
+                usr_backing,
+                Some(usr_subroot),
+                "usr",
+                "/sysroot/usr",
+                MountFlags {
+                    rdonly: true,
+                    nodev: true,
+                    ..MountFlags::default()
+                },
+                mount_flags::MS_RDONLY | mount_flags::MS_NODEV,
+                None,
+            )
+            .await?;
+
+        let tmp_fs = Rc::new(MemFs::new(
+            FsId("tmpfs:stage2-tmp".to_string()),
+            3,
+            0,
+            0,
+            0o1777,
+            timespec_pair(&self.clock_fn),
+        ));
+        let tmp_root = tmp_fs.root();
+        let _ = tmp_fs
+            .setattr(
+                &root_cred,
+                &tmp_root,
+                &SetAttr {
+                    mode: Some(0o1777),
+                    ..SetAttr::default()
+                },
+            )
+            .await;
+        let tmp_backing = Rc::new(MountBacking::new(tmp_fs, FsType::TmpFs));
+        self.vfs
+            .mount_on_namespace(
+                &sys_ns,
+                &root_cred,
+                tmp_backing,
+                None,
+                "tmpfs",
+                "/sysroot/tmp",
+                MountFlags {
+                    nosuid: true,
+                    nodev: true,
+                    ..MountFlags::default()
+                },
+                mount_flags::MS_NOSUID | mount_flags::MS_NODEV,
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn prepare_ephemeral_root(&mut self) -> vfs::Result<BootStage> {
+        let now = (self.clock_fn)();
+        let eph_fs = Rc::new(MemFs::new(
+            FsId("tmpfs:ephemeral-root".to_string()),
+            4,
+            0,
+            0,
+            0o755,
+            timespec_pair(&self.clock_fn),
+        ));
+        populate_stage1_tmpfs(&eph_fs, &self.release.root_template, &self.blobs).await?;
+        let sys_ns = self.vfs.system_namespace();
+        let mut root_cred = Cred::root();
+        root_cred.umask = 0;
+        let backing = Rc::new(MountBacking::new(
+            eph_fs as Rc<dyn Filesystem>,
+            FsType::TmpFs,
+        ));
+        self.vfs
+            .mount_on_namespace(
+                &sys_ns,
+                &root_cred,
+                backing,
+                None,
+                "tmpfs:ephemeral",
+                "/sysroot",
+                MountFlags::default(),
+                0,
+                None,
+            )
+            .await?;
+        self.mount_stage2_usr_and_tmp(now).await?;
+        if let Err(detail) = resolve_default_account_at_prefix(
+            &self.vfs,
+            "/sysroot",
+            &self.boot_profile.default_user,
+        )
+        .await
+        {
+            self.teardown_sysroot_mounts().await;
+            let default_user = self.boot_profile.default_user.clone();
+            return Ok(self
+                .enter_recovery(
+                    RecoveryReason::AccountResolutionFailed {
+                        default_user: default_user.clone(),
+                        detail: detail.clone(),
+                    },
+                    None,
+                    Vec::new(),
+                    format!("Refusing to auto-login synthetic user for {default_user:?}: {detail}"),
+                )
+                .await);
+        }
+        let info = MountedRootInfo {
+            fstype: "tmpfs".to_string(),
+            volume_uuid: "ephemeral".to_string(),
+            forked_from: None,
+            base_epoch: 0,
+            ephemeral_if_unmodified: true,
+            first_boot_seeded: true,
+            writer_mode: BootWriterMode::ForkOnBusy,
+            mounted_at: now.sec,
+        };
+        let info_bytes = serde_json::to_vec_pretty(&info).map_err(|_| Errno::EIO)?;
+        write_file_on_vfs(&self.vfs, MOUNTED_ROOT_INFO_PATH, &info_bytes, 0o444).await?;
+        self.cowfs = None;
+        self.home_cowfs = None;
+        self.mounted_root = Some(info);
+        self.recovery = None;
+        self.stage = BootStage::Stage1;
+        Ok(BootStage::Stage1)
+    }
+
+    async fn prepare_snapshot_root(
+        &mut self,
+        volume_uuid: &str,
+        snapshot_name: &str,
+    ) -> vfs::Result<BootStage> {
+        let now = (self.clock_fn)();
+        match self.head_store.format_version().await {
+            Ok(Some(ver)) if ver != COWFS_FORMAT_VERSION => {
+                return Ok(self
+                    .enter_recovery(
+                        RecoveryReason::IncompatibleFormat {
+                            found_version: Some(ver),
+                            expected_version: COWFS_FORMAT_VERSION,
+                        },
+                        Some(volume_uuid.to_string()),
+                        Vec::new(),
+                        format!(
+                            "Refusing to mount incompatible os-cowfs format version {ver} (expected {COWFS_FORMAT_VERSION}): EPROTONOSUPPORT."
+                        ),
+                    )
+                    .await);
+            }
+            Ok(_) => {}
+            Err(Errno::EPROTONOSUPPORT) => {
+                return Ok(self
+                    .enter_recovery(
+                        RecoveryReason::IncompatibleFormat {
+                            found_version: None,
+                            expected_version: COWFS_FORMAT_VERSION,
+                        },
+                        Some(volume_uuid.to_string()),
+                        Vec::new(),
+                        format!(
+                            "Refusing to mount incompatible os-cowfs store (expected version {COWFS_FORMAT_VERSION}): EPROTONOSUPPORT."
+                        ),
+                    )
+                    .await);
+            }
+            Err(e) => {
+                return Ok(self
+                    .enter_recovery(
+                        RecoveryReason::IoError {
+                            errno: errno_name(e),
+                            detail: format!("format version probe failed: {e:?}"),
+                        },
+                        Some(volume_uuid.to_string()),
+                        Vec::new(),
+                        format!("Failed to probe os-cowfs store format version ({e:?})."),
+                    )
+                    .await);
+            }
+        }
+
+        let vol_id = VolumeId(volume_uuid.to_string());
+        let snap_rec = match self.head_store.get_snapshot(&vol_id, snapshot_name).await {
+            Ok(s) => s,
+            Err(e) => {
+                let snaps = self
+                    .head_store
+                    .list_snapshots(&vol_id)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| s.name)
+                    .collect();
+                return Ok(self
+                    .enter_recovery(
+                        RecoveryReason::IoError {
+                            errno: errno_name(e),
+                            detail: format!("snapshot {snapshot_name:?} on {volume_uuid} unavailable: {e:?}"),
+                        },
+                        Some(volume_uuid.to_string()),
+                        snaps,
+                        format!("Snapshot {snapshot_name:?} on volume {volume_uuid} could not be opened ({e:?})."),
+                    )
+                    .await);
+            }
+        };
+
+        let config = CowFsConfig::local_browser(Rc::clone(&self.clock_fn))
+            .with_arena(ArenaConfig::fixed_32mib());
+        let snap_fs = match CowFs::open(
+            Rc::clone(&self.head_store),
+            Rc::clone(&self.pack_store),
+            vol_id.clone(),
+            cowfs::CowFsOpenMode::Snapshot(snapshot_name.to_string()),
+            config,
+        )
+        .await
+        {
+            Ok(fs) => Rc::new(fs),
+            Err(e) => {
+                return Ok(self
+                    .enter_recovery(
+                        RecoveryReason::CorruptVolume {
+                            detail: format!("failed to open snapshot {snapshot_name}: {e:?}"),
+                            snapshots: vec![snapshot_name.to_string()],
+                        },
+                        Some(volume_uuid.to_string()),
+                        vec![snapshot_name.to_string()],
+                        format!("Snapshot {snapshot_name:?} failed verification/open ({e:?})."),
+                    )
+                    .await);
+            }
+        };
+
+        let sys_ns = self.vfs.system_namespace();
+        let mut root_cred = Cred::root();
+        root_cred.umask = 0;
+        let backing = Rc::new(
+            MountBacking::new(Rc::clone(&snap_fs) as Rc<dyn Filesystem>, FsType::Cowfs)
+                .with_ceilings(true, false),
+        );
+        self.vfs
+            .mount_on_namespace(
+                &sys_ns,
+                &root_cred,
+                backing,
+                None,
+                &format!("snapshot:{volume_uuid}@{snapshot_name}"),
+                "/sysroot",
+                MountFlags {
+                    rdonly: true,
+                    ..MountFlags::default()
+                },
+                mount_flags::MS_RDONLY,
+                None,
+            )
+            .await?;
+
+        // Discover & mount `@home` subvolume if present in the snapshot root object (Codex #32).
+        let mut home_cowfs: Option<Rc<dyn Filesystem>> = None;
+        if let Ok(raw_root) = self.head_store.get_node(&snap_rec.root).await
+            && let Ok(root_obj) = RootObject::decode_verified(&snap_rec.root, &raw_root)
+            && root_obj.subvols.contains_key("@home")
+            && self
+                .vfs
+                .statat(1, StartAnchor::Root, "/sysroot/home", false)
+                .await
+                .is_ok_and(|st| st.kind() == S_IFDIR)
+        {
+            let home_cfg = CowFsConfig::local_browser(Rc::clone(&self.clock_fn))
+                .with_arena(ArenaConfig::fixed_32mib())
+                .with_subvol("@home");
+            if let Ok(home_fs) = CowFs::open(
+                Rc::clone(&self.head_store),
+                Rc::clone(&self.pack_store),
+                vol_id.clone(),
+                cowfs::CowFsOpenMode::Snapshot(snapshot_name.to_string()),
+                home_cfg,
+            )
+            .await
+            {
+                let home_rc: Rc<dyn Filesystem> = Rc::new(home_fs);
+                let home_backing = Rc::new(
+                    MountBacking::new(Rc::clone(&home_rc), FsType::Cowfs)
+                        .with_ceilings(true, false),
+                );
+                self.vfs
+                    .mount_on_namespace(
+                        &sys_ns,
+                        &root_cred,
+                        home_backing,
+                        None,
+                        &format!("snapshot:{volume_uuid}@{snapshot_name}:@home"),
+                        "/sysroot/home",
+                        MountFlags {
+                            rdonly: true,
+                            ..MountFlags::default()
+                        },
+                        mount_flags::MS_RDONLY,
+                        None,
+                    )
+                    .await?;
+                home_cowfs = Some(home_rc);
+            }
+        }
+
+        self.mount_stage2_usr_and_tmp(now).await?;
+        if let Err(detail) = resolve_default_account_at_prefix(
+            &self.vfs,
+            "/sysroot",
+            &self.boot_profile.default_user,
+        )
+        .await
+        {
+            self.teardown_sysroot_mounts().await;
+            let _ = snap_fs.close_clean().await;
+            let default_user = self.boot_profile.default_user.clone();
+            return Ok(self
+                .enter_recovery(
+                    RecoveryReason::AccountResolutionFailed {
+                        default_user: default_user.clone(),
+                        detail: detail.clone(),
+                    },
+                    Some(volume_uuid.to_string()),
+                    Vec::new(),
+                    format!("Refusing to auto-login synthetic user for {default_user:?}: {detail}"),
+                )
+                .await);
+        }
+
+        let info = MountedRootInfo {
+            fstype: "cowfs-snapshot".to_string(),
+            volume_uuid: format!("{volume_uuid}@{snapshot_name}"),
+            forked_from: None,
+            base_epoch: snap_rec.epoch,
+            ephemeral_if_unmodified: false,
+            first_boot_seeded: false,
+            writer_mode: BootWriterMode::Exclusive,
+            mounted_at: now.sec,
+        };
+        let info_bytes = serde_json::to_vec_pretty(&info).map_err(|_| Errno::EIO)?;
+        write_file_on_vfs(&self.vfs, MOUNTED_ROOT_INFO_PATH, &info_bytes, 0o444).await?;
+        self.cowfs = Some(snap_fs);
+        self.home_cowfs = home_cowfs;
+        self.mounted_root = Some(info);
         self.recovery = None;
         self.stage = BootStage::Stage1;
         Ok(BootStage::Stage1)
@@ -1270,94 +1958,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
             )
             .await?;
 
-        // Ensure core mountpoints exist inside `/sysroot` before mounting `/sysroot/usr`, `/sysroot/tmp`,
-        // and moving `/proc`, `/dev`, `/run`.
-        for (sub, mode) in [
-            ("/sysroot/proc", 0o555),
-            ("/sysroot/dev", 0o755),
-            ("/sysroot/run", 0o755),
-            ("/sysroot/usr", 0o755),
-            ("/sysroot/tmp", 0o1777),
-        ] {
-            ensure_dir_on_vfs(&self.vfs, sub, mode).await?;
-        }
-
-        // Mount verified Stage 2 Release v2 system composition (`/usr` subtree) at `/sysroot/usr` (`ro,nodev`).
-        let stage2_usr_entries =
-            compose_system_image_entries(&self.release.base, &self.release.extensions)
-                .map_err(|_| Errno::EINVAL)?;
-        let stage2_usr_fs = ImageFs::new(
-            FsId("image:stage2-usr".to_string()),
-            true,
-            now,
-            stage2_usr_entries,
-            self.blobs.clone(),
-        )?;
-        let usr_subroot = stage2_usr_fs
-            .handle_at("/usr")
-            .map(|h| (h, "/usr".to_string()))
-            .ok_or(Errno::ENOENT)?;
-        let usr_backing = Rc::new(
-            MountBacking::new(Rc::new(stage2_usr_fs), FsType::Image).with_ceilings(true, false),
-        );
-        self.vfs
-            .mount_on_namespace(
-                &sys_ns,
-                &root_cred,
-                usr_backing,
-                Some(usr_subroot),
-                "usr",
-                "/sysroot/usr",
-                MountFlags {
-                    rdonly: true,
-                    nodev: true,
-                    ..MountFlags::default()
-                },
-                mount_flags::MS_RDONLY | mount_flags::MS_NODEV,
-                None,
-            )
-            .await?;
-
-        // Mount fresh `tmpfs` (`01777`, `nosuid,nodev`) at `/sysroot/tmp`.
-        let tmp_fs = Rc::new(MemFs::new(
-            FsId("tmpfs:stage2-tmp".to_string()),
-            3,
-            0,
-            0,
-            0o1777,
-            timespec_pair(&self.clock_fn),
-        ));
-        let tmp_root = tmp_fs.root();
-        let _ = tmp_fs
-            .setattr(
-                &root_cred,
-                &tmp_root,
-                &SetAttr {
-                    mode: Some(0o1777),
-                    ..SetAttr::default()
-                },
-            )
-            .await;
-        let tmp_backing = Rc::new(MountBacking::new(tmp_fs, FsType::TmpFs));
-        self.vfs
-            .mount_on_namespace(
-                &sys_ns,
-                &root_cred,
-                tmp_backing,
-                None,
-                "tmpfs",
-                "/sysroot/tmp",
-                MountFlags {
-                    nosuid: true,
-                    nodev: true,
-                    ..MountFlags::default()
-                },
-                mount_flags::MS_NOSUID | mount_flags::MS_NODEV,
-                None,
-            )
-            .await?;
-
+        self.mount_stage2_usr_and_tmp(now).await?;
         self.cowfs = Some(opened.fs);
+        self.home_cowfs = None;
         self.mounted_root = Some(info);
         Ok(())
     }
@@ -1410,15 +2013,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
             }
         }
 
-        // (c) `<newroot><init>` must exist as an executable regular file BEFORE any mounts move!
-        let init_candidate = format!("{clean_newroot}{init_path}");
-        let init_st = self
-            .vfs
-            .statat(1, StartAnchor::Root, &init_candidate, true)
-            .await?;
-        if init_st.kind() != S_IFREG || (init_st.mode & 0o111) == 0 {
-            return Err(Errno::EACCES);
-        }
+        // (c) `<newroot><init>` must exist as a valid executable regular file (Wasm or `#!` with
+        //     resolvable executable interpreter inside `<newroot>`) BEFORE any mounts move!
+        validate_init_executable_in_root(&self.vfs, clean_newroot, init_path).await?;
 
         // Step 4: Detach Stage 1 `/usr` before pivoting so no Stage 1 `ImageFs` mount remains.
         let _ = self.vfs.umount2(1, "/usr", umount_flags::MNT_DETACH).await;
@@ -1535,6 +2132,61 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
             )
             .map_err(|e| e.errno)?;
 
+        // Spawn a separate non-PID-1 Stage 2 console login process on a local PTY (`/dev/pts/0`)
+        // with the resolved `default_user` identity (Codex Findings #2 & #24).
+        let acct = resolve_default_account_at_prefix(&self.vfs, "", &self.boot_profile.default_user)
+            .await
+            .map_err(|_| Errno::ENOENT)?;
+        self._dev_pts
+            .register_pty(0, acct.uid, acct.gid, 0o620);
+        let identity = Identity {
+            id: acct.uid,
+            group: acct.gid,
+            groups: acct.groups.clone(),
+        };
+        let mut spec = SpawnSpec::new(
+            acct.shell.clone(),
+            LocalCred {
+                identity: identity.clone(),
+                umask: 0o022,
+                cloud_access: false,
+                allowed_remote_scope: None,
+                remote: None,
+            },
+            HOST_LABEL,
+        );
+        spec.argv = vec![acct.shell.clone()];
+        spec.cwd = acct.home.clone();
+        spec.ppid = Some(1);
+        spec.initial_state = ProcState::Running;
+        spec.env = vec![
+            format!("USER={}", acct.user),
+            format!("HOME={}", acct.home),
+            format!("SHELL={}", acct.shell),
+            "PATH=/usr/bin:/bin".to_string(),
+            "TERM=xterm-256color".to_string(),
+        ];
+        let login_pid = {
+            let mut tbl = self.proc_table.borrow_mut();
+            let pid = tbl.spawn(spec, now_sec).map_err(|e| e.errno)?.pid;
+            let _ = tbl.set_tty(HOST_LABEL, pid, 1, vec![0, 1, 2]);
+            pid
+        };
+        let login_cred = Cred {
+            identity,
+            umask: 0o022,
+            token: None,
+        };
+        self.vfs
+            .spawn_process(login_pid, 1, login_cred, None, None, None)?;
+        if self.vfs.chdir(login_pid, &acct.home).await.is_err() {
+            let _ = self.vfs.chdir(login_pid, "/").await;
+        }
+        self.console_pid = login_pid;
+        self.console_pty = Some(0);
+        self.console_user = Some(acct.user);
+        self.console_home = Some(acct.home);
+        self.console_shell = Some(acct.shell);
         self.stage = BootStage::Stage2;
         Ok(())
     }
@@ -1556,7 +2208,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
             .and_then(|r| r.volume_uuid.clone())
             .or_else(|| match &self.boot_profile.root {
                 RootSpec::CowFs { volume_uuid, .. } => volume_uuid.clone(),
-                RootSpec::CloudOptIn { .. } => None,
+                RootSpec::Snapshot { volume_uuid, .. } => Some(volume_uuid.clone()),
+                RootSpec::Ephemeral | RootSpec::CloudOptIn { .. } => None,
             })
             .ok_or(Errno::ENOENT)?;
 
@@ -1627,22 +2280,111 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
 
     /// Clean shutdown: flushes dirty transactions if modified and runs `close_clean_with_prune_fs`,
     /// automatically pruning an unmodified `ForkOnBusy` fork while retaining any modified fork.
+    ///
+    /// Codex Finding #15: retains the `CowFs` handle in a retryable state until durable close
+    /// actually succeeds so a transient `ENOSPC`/`EIO` leaves dirty data retryable rather than
+    /// marking `closed = true` prematurely.
     pub async fn close_clean_with_prune(&mut self) -> vfs::Result<Option<CloseCleanPruneOutcome>> {
         if self.closed {
             return Ok(None);
         }
-        self.closed = true;
         let Some(cowfs) = self.cowfs.clone() else {
+            self.closed = true;
             return Ok(None);
         };
         let base_epoch = self.mounted_root.as_ref().map_or(0, |info| info.base_epoch);
         let outcome = close_clean_with_prune_fs(&cowfs, base_epoch).await?;
+        self.closed = true;
         Ok(Some(outcome))
+    }
+
+    /// Flush dirty writes for bfcache suspension (`pagehide` with `event.persisted === true`,
+    /// Codex Finding #16) WITHOUT closing `CowFs` or releasing its writer lock, and WITHOUT
+    /// forcing an unmodified ephemeral fork to become modified.
+    pub async fn flush_for_suspend(&self) -> vfs::Result<Option<cowtree::VolumeHead>> {
+        if self.closed {
+            return Ok(None);
+        }
+        let Some(cowfs) = self.cowfs.as_ref() else {
+            return Ok(None);
+        };
+        if cowfs.is_read_only() || cowfs.is_closed() {
+            return Ok(None);
+        }
+        if cowfs.ms_until_dirty_deadline().is_none() {
+            return Ok(None);
+        }
+        let head = cowfs.commit_tx_group().await?;
+        Ok(Some(head))
     }
 
     // -------------------------------------------------------------------------
     // Observability & VFS operations
     // -------------------------------------------------------------------------
+
+    pub fn active_console_pid(&self) -> u32 {
+        if self.stage == BootStage::Stage2 {
+            self.console_pid
+        } else {
+            1
+        }
+    }
+
+    pub fn console_proc_snapshot(&self) -> Option<ConsoleProcSnapshot> {
+        if self.stage != BootStage::Stage2 || self.console_pid == 1 {
+            return None;
+        }
+        let tbl = self.proc_table.borrow();
+        let p = tbl.proc(self.console_pid)?;
+        let mut groups: Vec<u32> = p.cred.identity.groups.iter().copied().collect();
+        groups.sort_unstable();
+        Some(ConsoleProcSnapshot {
+            pid: p.pid,
+            ppid: p.ppid,
+            uid: p.cred.identity.id,
+            gid: p.cred.identity.group,
+            groups,
+            user: self
+                .console_user
+                .clone()
+                .unwrap_or_else(|| self.boot_profile.default_user.clone()),
+            home: self.console_home.clone().unwrap_or_else(|| "/".to_string()),
+            shell: self
+                .console_shell
+                .clone()
+                .unwrap_or_else(|| "/bin/sh".to_string()),
+            cwd: p.cwd.clone(),
+            tty: self.console_pty.map(|n| format!("/dev/pts/{n}")),
+        })
+    }
+
+    async fn check_console_sudo_nopasswd(&self) -> vfs::Result<()> {
+        let pid = self.active_console_pid();
+        let identity = {
+            let tbl = self.proc_table.borrow();
+            tbl.proc(pid).ok_or(Errno::ESRCH)?.cred.identity.clone()
+        };
+        if identity.id == 0 {
+            return Ok(());
+        }
+        let mut mem = MemoryAccountFs::default();
+        for (path, mode) in [
+            ("/etc/passwd", 0o644u16),
+            ("/etc/group", 0o644u16),
+            ("/etc/shadow", 0o600u16),
+            ("/etc/sudoers", 0o440u16),
+        ] {
+            if let Ok(bytes) = read_file_as_pid(&self.vfs, 1, path).await {
+                let _ = mem.write_file(path, &bytes, mode, 0, 0);
+            }
+        }
+        let mut store = LocalAccountStore::new();
+        let now = (self.clock_fn)().sec;
+        store
+            .sudo_authenticate(&mem, &identity, pid, None, now)
+            .map_err(|e| e.errno)?;
+        Ok(())
+    }
 
     pub fn stage(&self) -> BootStage {
         self.stage
@@ -1701,6 +2443,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
             stage: self.stage,
             instance_id: self.instance_id.clone(),
             pid1: self.pid1_snapshot(),
+            console_proc: self.console_proc_snapshot(),
             boot_profile: self.boot_profile.clone(),
             mounted_root: self.mounted_root.clone(),
             recovery: self.recovery.clone(),
@@ -1712,62 +2455,32 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
     }
 
     pub async fn read_file(&self, path: &str) -> vfs::Result<Vec<u8>> {
-        let fd = self
-            .vfs
-            .openat(1, StartAnchor::Root, path, abi::O_RDONLY, 0)
-            .await?;
-        let mut out = Vec::new();
-        let mut off = 0u64;
-        let mut chunk = vec![0u8; 65_536];
-        loop {
-            let n = match self.vfs.pread(1, fd, &mut chunk, off).await {
-                Ok(n) => n,
-                Err(e) => {
-                    let _ = self.vfs.close(1, fd).await;
-                    return Err(e);
-                }
-            };
-            if n == 0 {
-                break;
-            }
-            out.extend_from_slice(&chunk[..n]);
-            off += n as u64;
-        }
-        self.vfs.close(1, fd).await?;
-        Ok(out)
+        read_file_as_pid(&self.vfs, self.active_console_pid(), path).await
+    }
+
+    pub async fn read_file_sudo(&self, path: &str) -> vfs::Result<Vec<u8>> {
+        self.check_console_sudo_nopasswd().await?;
+        read_file_as_pid(&self.vfs, 1, path).await
     }
 
     pub async fn write_file(&self, path: &str, bytes: &[u8], mode: u16) -> vfs::Result<usize> {
-        let fd = self
-            .vfs
-            .openat(
-                1,
-                StartAnchor::Root,
-                path,
-                abi::O_CREAT | abi::O_WRONLY | abi::O_TRUNC,
-                mode,
-            )
-            .await?;
-        let mut off = 0u64;
-        while (off as usize) < bytes.len() {
-            let n = match self.vfs.pwrite(1, fd, &bytes[off as usize..], off).await {
-                Ok(n) => n,
-                Err(e) => {
-                    let _ = self.vfs.close(1, fd).await;
-                    return Err(e);
-                }
-            };
-            if n == 0 {
-                let _ = self.vfs.close(1, fd).await;
-                return Err(Errno::EIO);
-            }
-            off += n as u64;
-        }
-        self.vfs.close(1, fd).await?;
-        Ok(bytes.len())
+        write_file_as_pid(&self.vfs, self.active_console_pid(), path, bytes, mode).await
+    }
+
+    pub async fn write_file_sudo(&self, path: &str, bytes: &[u8], mode: u16) -> vfs::Result<usize> {
+        self.check_console_sudo_nopasswd().await?;
+        write_file_as_pid(&self.vfs, 1, path, bytes, mode).await
     }
 
     pub async fn mkdir(&self, path: &str, mode: u16) -> vfs::Result<()> {
+        self.vfs
+            .mkdirat(self.active_console_pid(), StartAnchor::Root, path, mode)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn mkdir_sudo(&self, path: &str, mode: u16) -> vfs::Result<()> {
+        self.check_console_sudo_nopasswd().await?;
         self.vfs
             .mkdirat(1, StartAnchor::Root, path, mode)
             .await
@@ -1775,24 +2488,49 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
     }
 
     pub async fn unlink(&self, path: &str) -> vfs::Result<()> {
+        self.vfs
+            .unlinkat(self.active_console_pid(), StartAnchor::Root, path, false)
+            .await
+    }
+
+    pub async fn unlink_sudo(&self, path: &str) -> vfs::Result<()> {
+        self.check_console_sudo_nopasswd().await?;
         self.vfs.unlinkat(1, StartAnchor::Root, path, false).await
     }
 
     pub async fn stat(&self, path: &str, follow: bool) -> vfs::Result<Stat> {
+        self.vfs
+            .statat(self.active_console_pid(), StartAnchor::Root, path, follow)
+            .await
+    }
+
+    pub async fn stat_sudo(&self, path: &str, follow: bool) -> vfs::Result<Stat> {
+        self.check_console_sudo_nopasswd().await?;
         self.vfs.statat(1, StartAnchor::Root, path, follow).await
     }
 
     pub async fn statfs(&self, path: &str) -> vfs::Result<StatFs> {
-        self.vfs.statfs(1, StartAnchor::Root, path).await
+        self.vfs
+            .statfs(self.active_console_pid(), StartAnchor::Root, path)
+            .await
     }
 
     pub async fn readdir(&self, path: &str) -> vfs::Result<Vec<String>> {
+        self.readdir_as_pid(self.active_console_pid(), path).await
+    }
+
+    pub async fn readdir_sudo(&self, path: &str) -> vfs::Result<Vec<String>> {
+        self.check_console_sudo_nopasswd().await?;
+        self.readdir_as_pid(1, path).await
+    }
+
+    async fn readdir_as_pid(&self, pid: u32, path: &str) -> vfs::Result<Vec<String>> {
         let mut names = Vec::new();
         let mut cookie = 0u64;
         loop {
             let page = self
                 .vfs
-                .read_dir_page(1, StartAnchor::Root, path, cookie, 256)
+                .read_dir_page(pid, StartAnchor::Root, path, cookie, 256)
                 .await?;
             for e in page.entries {
                 names.push(e.name);
@@ -1823,38 +2561,96 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
         cowfsck_volume_stores(&*self.head_store, &*self.pack_store, &VolumeId(uuid)).await
     }
 
-    /// Execute a minimal built-in interactive console command directly against the live VFS
-    /// (`uname`, `id`, `pwd`, `ls`, `cat`, `stat`, `statfs`, `mount`, `ps`, `cowfsck`, `sync`,
-    /// `mkdir`, `rm`, `write`, `help`).
+    /// Execute a minimal built-in interactive console command against the live VFS using the
+    /// active non-PID-1 Stage 2 console login process (or PID 1 only in Stage 1 recovery).
+    /// Supports `sudo <cmd...>` evaluated against real `/etc/sudoers`.
     pub async fn exec_console_command(&self, line: &str) -> (i32, String) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return (0, String::new());
         }
         let mut parts = trimmed.split_whitespace();
-        let cmd = parts.next().unwrap_or("");
+        let mut cmd = parts.next().unwrap_or("");
+        let mut use_sudo = false;
+        if cmd == "sudo" {
+            if let Err(e) = self.check_console_sudo_nopasswd().await {
+                return (1, format!("sudo: {}\n", e.text()));
+            }
+            use_sudo = true;
+            cmd = parts.next().unwrap_or("");
+            if cmd.is_empty() {
+                return (2, "usage: sudo <command> [args...]\n".to_string());
+            }
+        }
         let args: Vec<&str> = parts.collect();
+        let exec_pid = if use_sudo {
+            1
+        } else {
+            self.active_console_pid()
+        };
         match cmd {
             "help" => (
                 0,
-                "Built-in standalone console commands: uname, id, pwd, ls [path], cat <path>, stat <path>, statfs [path], mount, ps, cowfsck, sync, mkdir <path>, rm <path>, write <path> <text>\n"
+                "Built-in standalone console commands: uname, id, pwd, tty, ls [path], cat <path>, stat <path>, statfs [path], mount, ps, cowfsck, sync, mkdir <path>, rm <path>, write <path> <text>, sudo <cmd>\n"
                     .to_string(),
             ),
             "uname" => (0, "OS 2.0 standalone wasm32-browser os-cowfs\n".to_string()),
             "id" => {
-                if self.boot_profile.default_user == "root" {
-                    (0, "uid=0(root) gid=0(root) groups=0(root)\n".to_string())
-                } else {
-                    (
-                        0,
-                        "uid=1000(user) gid=1000(user) groups=1000(user),10(wheel)\n".to_string(),
-                    )
-                }
+                let (uid, gid, groups) = {
+                    let tbl = self.proc_table.borrow();
+                    if let Some(p) = tbl.proc(exec_pid) {
+                        let mut gs: Vec<u32> = p.cred.identity.groups.iter().copied().collect();
+                        gs.sort_unstable();
+                        (p.cred.identity.id, p.cred.identity.group, gs)
+                    } else {
+                        return (1, "id: process not found\n".to_string());
+                    }
+                };
+                let user_map: HashMap<u32, String> = read_file_as_pid(&self.vfs, 1, "/etc/passwd")
+                    .await
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .and_then(|t| parse_passwd(&t).ok())
+                    .map(|es| es.into_iter().map(|e| (e.uid, e.name)).collect())
+                    .unwrap_or_default();
+                let group_map: HashMap<u32, String> = read_file_as_pid(&self.vfs, 1, "/etc/group")
+                    .await
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .and_then(|t| parse_group(&t).ok())
+                    .map(|es| es.into_iter().map(|e| (e.gid, e.name)).collect())
+                    .unwrap_or_default();
+                let uname = user_map
+                    .get(&uid)
+                    .cloned()
+                    .unwrap_or_else(|| uid.to_string());
+                let gname = group_map
+                    .get(&gid)
+                    .cloned()
+                    .unwrap_or_else(|| gid.to_string());
+                let g_list: Vec<String> = groups
+                    .iter()
+                    .map(|g| match group_map.get(g) {
+                        Some(n) => format!("{g}({n})"),
+                        None => g.to_string(),
+                    })
+                    .collect();
+                (
+                    0,
+                    format!("uid={uid}({uname}) gid={gid}({gname}) groups={}\n", g_list.join(",")),
+                )
             }
-            "pwd" => (0, format!("{}\n", self.pid1_snapshot().cwd)),
+            "pwd" => match self.vfs.getcwd(exec_pid).await {
+                Ok(cwd) => (0, format!("{cwd}\n")),
+                Err(e) => (1, format!("pwd: {}\n", e.text())),
+            },
+            "tty" => match self.console_pty {
+                Some(n) if self.stage == BootStage::Stage2 => (0, format!("/dev/pts/{n}\n")),
+                _ => (1, "not a tty\n".to_string()),
+            },
             "ls" => {
                 let target = args.first().copied().unwrap_or("/");
-                match self.readdir(target).await {
+                match self.readdir_as_pid(exec_pid, target).await {
                     Ok(mut entries) => {
                         entries.sort();
                         (0, format!("{}\n", entries.join("  ")))
@@ -1866,7 +2662,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
                 let Some(&target) = args.first() else {
                     return (2, "usage: cat <path>\n".to_string());
                 };
-                match self.read_file(target).await {
+                match read_file_as_pid(&self.vfs, exec_pid, target).await {
                     Ok(bytes) => (0, String::from_utf8_lossy(&bytes).into_owned()),
                     Err(e) => (1, format!("cat: {target}: {}\n", e.text())),
                 }
@@ -1875,7 +2671,11 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
                 let Some(&target) = args.first() else {
                     return (2, "usage: stat <path>\n".to_string());
                 };
-                match self.stat(target, false).await {
+                match self
+                    .vfs
+                    .statat(exec_pid, StartAnchor::Root, target, false)
+                    .await
+                {
                     Ok(st) => (
                         0,
                         format!(
@@ -1894,7 +2694,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
             }
             "statfs" => {
                 let target = args.first().copied().unwrap_or("/");
-                match self.statfs(target).await {
+                match self.vfs.statfs(exec_pid, StartAnchor::Root, target).await {
                     Ok(sf) => (
                         0,
                         format!(
@@ -1905,23 +2705,28 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
                     Err(e) => (1, format!("statfs: {target}: {}\n", e.text())),
                 }
             }
-            "mount" => match self.read_file("/proc/mounts").await {
+            "mount" => match read_file_as_pid(&self.vfs, exec_pid, "/proc/mounts").await {
                 Ok(bytes) => (0, String::from_utf8_lossy(&bytes).into_owned()),
                 Err(e) => (1, format!("mount: {}\n", e.text())),
             },
             "ps" => {
-                let p1 = self.pid1_snapshot();
-                (
-                    0,
-                    format!(
-                        "PID  PPID UID  STARTED CMD\n{:<4} {:<4} {:<4} {:<7} {}\n",
-                        p1.pid,
-                        p1.ppid,
-                        p1.uid,
-                        p1.started,
-                        p1.argv.join(" ")
-                    ),
-                )
+                let tbl = self.proc_table.borrow();
+                let mut pids = tbl.all_pids();
+                pids.sort_unstable();
+                let mut out = String::from("PID  PPID UID  STARTED CMD\n");
+                for pid in pids {
+                    if let Some(p) = tbl.proc(pid) {
+                        out.push_str(&format!(
+                            "{:<4} {:<4} {:<4} {:<7} {}\n",
+                            p.pid,
+                            p.ppid,
+                            p.cred.identity.id,
+                            p.started,
+                            p.argv.join(" ")
+                        ));
+                    }
+                }
+                (0, out)
             }
             "cowfsck" => match self.run_cowfsck(args.first().copied()).await {
                 Ok(rep) => (
@@ -1949,8 +2754,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
                 let Some(&target) = args.first() else {
                     return (2, "usage: mkdir <path>\n".to_string());
                 };
-                match self.mkdir(target, 0o755).await {
-                    Ok(()) => (0, String::new()),
+                match self.vfs.mkdirat(exec_pid, StartAnchor::Root, target, 0o755).await {
+                    Ok(_) => (0, String::new()),
                     Err(e) => (1, format!("mkdir: {target}: {}\n", e.text())),
                 }
             }
@@ -1958,7 +2763,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
                 let Some(&target) = args.first() else {
                     return (2, "usage: rm <path>\n".to_string());
                 };
-                match self.unlink(target).await {
+                match self.vfs.unlinkat(exec_pid, StartAnchor::Root, target, false).await {
                     Ok(()) => (0, String::new()),
                     Err(e) => (1, format!("rm: {target}: {}\n", e.text())),
                 }
@@ -1969,7 +2774,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
                 }
                 let target = args[0];
                 let body = format!("{}\n", args[1..].join(" "));
-                match self.write_file(target, body.as_bytes(), 0o644).await {
+                match write_file_as_pid(&self.vfs, exec_pid, target, body.as_bytes(), 0o644).await {
                     Ok(n) => (0, format!("wrote {n} bytes to {target}\n")),
                     Err(e) => (1, format!("write: {target}: {}\n", e.text())),
                 }
@@ -2058,8 +2863,13 @@ impl OfflineBootRuntime {
         crate::cowfs_bridge::to_js_json(&self.inner.status())
     }
 
-    pub async fn read_file(&self, path: String) -> Result<Vec<u8>, JsValue> {
-        self.inner.read_file(&path).await.map_err(map_vfs_err)
+    pub async fn read_file(&self, path: String, sudo: Option<bool>) -> Result<Vec<u8>, JsValue> {
+        let res = if sudo.unwrap_or(false) {
+            self.inner.read_file_sudo(&path).await
+        } else {
+            self.inner.read_file(&path).await
+        };
+        res.map_err(map_vfs_err)
     }
 
     pub async fn write_file(
@@ -2067,30 +2877,54 @@ impl OfflineBootRuntime {
         path: String,
         bytes: &[u8],
         mode: Option<u16>,
+        sudo: Option<bool>,
     ) -> Result<usize, JsValue> {
-        self.inner
-            .write_file(&path, bytes, mode.unwrap_or(0o644))
-            .await
-            .map_err(map_vfs_err)
+        let m = mode.unwrap_or(0o644);
+        let res = if sudo.unwrap_or(false) {
+            self.inner.write_file_sudo(&path, bytes, m).await
+        } else {
+            self.inner.write_file(&path, bytes, m).await
+        };
+        res.map_err(map_vfs_err)
     }
 
-    pub async fn mkdir(&self, path: String, mode: Option<u16>) -> Result<(), JsValue> {
-        self.inner
-            .mkdir(&path, mode.unwrap_or(0o755))
-            .await
-            .map_err(map_vfs_err)
+    pub async fn mkdir(
+        &self,
+        path: String,
+        mode: Option<u16>,
+        sudo: Option<bool>,
+    ) -> Result<(), JsValue> {
+        let m = mode.unwrap_or(0o755);
+        let res = if sudo.unwrap_or(false) {
+            self.inner.mkdir_sudo(&path, m).await
+        } else {
+            self.inner.mkdir(&path, m).await
+        };
+        res.map_err(map_vfs_err)
     }
 
-    pub async fn unlink(&self, path: String) -> Result<(), JsValue> {
-        self.inner.unlink(&path).await.map_err(map_vfs_err)
+    pub async fn unlink(&self, path: String, sudo: Option<bool>) -> Result<(), JsValue> {
+        let res = if sudo.unwrap_or(false) {
+            self.inner.unlink_sudo(&path).await
+        } else {
+            self.inner.unlink(&path).await
+        };
+        res.map_err(map_vfs_err)
     }
 
-    pub async fn stat(&self, path: String, follow: Option<bool>) -> Result<JsValue, JsValue> {
-        let st = self
-            .inner
-            .stat(&path, follow.unwrap_or(true))
-            .await
-            .map_err(map_vfs_err)?;
+    pub async fn stat(
+        &self,
+        path: String,
+        follow: Option<bool>,
+        sudo: Option<bool>,
+    ) -> Result<JsValue, JsValue> {
+        let f = follow.unwrap_or(true);
+        let st = if sudo.unwrap_or(false) {
+            self.inner.stat_sudo(&path, f).await
+        } else {
+            self.inner.stat(&path, f).await
+        }
+        .map_err(map_vfs_err)?;
         crate::cowfs_bridge::to_js_json(&st)
     }
 
@@ -2099,9 +2933,23 @@ impl OfflineBootRuntime {
         crate::cowfs_bridge::to_js_json(&sf)
     }
 
-    pub async fn readdir(&self, path: String) -> Result<JsValue, JsValue> {
-        let entries = self.inner.readdir(&path).await.map_err(map_vfs_err)?;
+    pub async fn readdir(&self, path: String, sudo: Option<bool>) -> Result<JsValue, JsValue> {
+        let entries = if sudo.unwrap_or(false) {
+            self.inner.readdir_sudo(&path).await
+        } else {
+            self.inner.readdir(&path).await
+        }
+        .map_err(map_vfs_err)?;
         crate::cowfs_bridge::to_js_json(&entries)
+    }
+
+    pub async fn flush_for_suspend(&self) -> Result<JsValue, JsValue> {
+        let head = self
+            .inner
+            .flush_for_suspend()
+            .await
+            .map_err(map_vfs_err)?;
+        crate::cowfs_bridge::to_js_json(&head)
     }
 
     pub async fn sync_fs(&self) -> Result<JsValue, JsValue> {

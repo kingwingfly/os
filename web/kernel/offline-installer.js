@@ -2081,6 +2081,10 @@ export function createOfflineInstaller(options = {}) {
    * Zero-network Stage 0 boot resolver: selects either the BootProfile's pinned `generation`
    * (verified offline against profile-wide monotonic trust) or the active generation via
    * `beginOfflineBoot`. Makes ZERO `fetch()` calls.
+   *
+   * Codex Finding #33: if a pinned `generation` fails offline verification (e.g. corrupt manifest,
+   * bad signature, or revoked signing key), fall back through the same trusted-generation
+   * fallback decision (`previous` / `active`) and report which generation actually booted.
    */
   async function resolveInstalledForBoot({ generation = null, verifyAllBlobs = true, verifyCache = true } = {}) {
     if (generation) {
@@ -2088,17 +2092,59 @@ export function createOfflineInstaller(options = {}) {
         throw new Error(`Invalid BootProfile pinned generation: ${generation}`);
       }
       const state = await stateStore.read();
-      if (!state.generations?.[generation]) {
-        throw new Error(`Pinned Release v2 generation ${generation} is not installed locally.`);
-      }
-      const verified = await verifyInstalledOffline(generation, { verifyAllBlobs, verifyCache });
-      return {
-        ...verified,
-        rolledBack: false,
-        rolledBackFrom: null,
-        pinnedGeneration: true,
-        state,
+      const tryPinned = async () => {
+        if (!state.generations?.[generation]) {
+          throw new Error(`Pinned Release v2 generation ${generation} is not installed locally.`);
+        }
+        const verified = await verifyInstalledOffline(generation, { verifyAllBlobs, verifyCache });
+        return {
+          ...verified,
+          rolledBack: false,
+          rolledBackFrom: null,
+          pinnedGeneration: true,
+          state,
+        };
       };
+      try {
+        return await tryPinned();
+      } catch (pinnedError) {
+        // Fallback candidates: other installed generations (prefer active if distinct, then previous).
+        const candidates = [];
+        if (state.active && state.active !== generation && state.generations?.[state.active]) {
+          candidates.push(state.active);
+        }
+        if (state.previous && state.previous !== generation && !candidates.includes(state.previous) && state.generations?.[state.previous]) {
+          candidates.push(state.previous);
+        }
+        for (const candidateId of candidates) {
+          try {
+            const fallbackVerified = await verifyInstalledOffline(candidateId, { verifyAllBlobs, verifyCache });
+            let nextState = state;
+            if (state.active === generation && state.previous === candidateId) {
+              nextState = await stateStore.updateStrict(cur => {
+                if (cur.active === generation && cur.previous === candidateId) {
+                  cur.active = candidateId;
+                  cur.previous = null;
+                  cur.activeBootVerified = Boolean(cur.generations?.[candidateId]?.healthy);
+                  cur.bootAttempts = 0;
+                }
+                return cur;
+              });
+            }
+            return {
+              ...fallbackVerified,
+              rolledBack: true,
+              rolledBackFrom: generation,
+              rollbackReason: pinnedError.message,
+              pinnedGeneration: false,
+              state: nextState,
+            };
+          } catch {
+            // Try next trusted candidate, or fail closed if none verify.
+          }
+        }
+        throw pinnedError;
+      }
     }
     const booted = await beginOfflineBoot({ verifyAllBlobs, verifyCache });
     return { ...booted, pinnedGeneration: false };

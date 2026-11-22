@@ -46,11 +46,12 @@ export function validateBootProfile(input) {
     throw new Error(`Unsupported boot profile version: ${version}`);
   }
   const rawRoot = input.root;
-  if (!rawRoot || typeof rawRoot !== 'object' || Array.isArray(rawRoot)) {
-    throw new Error('Boot profile missing root specification.');
-  }
   let root;
-  if ('cow_fs' in rawRoot) {
+  if (rawRoot === 'ephemeral') {
+    root = 'ephemeral';
+  } else if (!rawRoot || typeof rawRoot !== 'object' || Array.isArray(rawRoot)) {
+    throw new Error('Boot profile missing root specification.');
+  } else if ('cow_fs' in rawRoot) {
     const spec = rawRoot.cow_fs;
     if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
       throw new Error('Invalid cow_fs root specification.');
@@ -69,6 +70,31 @@ export function validateBootProfile(input) {
         writer_mode: writerMode,
       },
     };
+  } else if ('snapshot' in rawRoot) {
+    const spec = rawRoot.snapshot;
+    if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+      throw new Error('Invalid snapshot root specification.');
+    }
+    const volumeUuid = spec.volume_uuid;
+    const snapshot = spec.snapshot;
+    if (typeof volumeUuid !== 'string' || !volumeUuid.trim() || volumeUuid.length > 128 || volumeUuid.includes('\0') || volumeUuid.includes('/')) {
+      throw new Error('Invalid snapshot root volume_uuid.');
+    }
+    if (typeof snapshot !== 'string' || !snapshot.trim() || snapshot.length > 128 || snapshot.includes('\0') || snapshot.includes('/')) {
+      throw new Error('Invalid snapshot root snapshot name.');
+    }
+    root = {
+      snapshot: {
+        volume_uuid: volumeUuid,
+        snapshot,
+      },
+    };
+  } else if ('ephemeral' in rawRoot) {
+    const spec = rawRoot.ephemeral;
+    if (spec !== null && spec !== true && (typeof spec !== 'object' || Array.isArray(spec))) {
+      throw new Error('Invalid ephemeral root specification.');
+    }
+    root = 'ephemeral';
   } else if ('cloud_opt_in' in rawRoot) {
     const spec = rawRoot.cloud_opt_in;
     if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
@@ -203,13 +229,88 @@ export function createBootProfileStore(options = {}) {
 
   async function setVolumeUuid(volumeUuid) {
     return update(profile => {
-      if (!profile.root.cow_fs) {
+      if (!profile.root || typeof profile.root !== 'object' || !profile.root.cow_fs) {
         profile.root = { cow_fs: { volume_uuid: volumeUuid, writer_mode: 'fork_on_busy' } };
       } else {
         profile.root.cow_fs.volume_uuid = volumeUuid;
       }
       return profile;
     });
+  }
+
+  /**
+   * Atomically claim the initial default `cow_fs.volume_uuid` when unset (compare-and-set
+   * serialized across tabs via Web Locks + strict IDB transaction, Codex Finding #11).
+   * Returns `{ won: true, volumeUuid: candidateUuid, profile }` if this caller installed the
+   * profile UUID, or `{ won: false, volumeUuid: existingUuid, profile }` if another tab won first.
+   */
+  async function claimVolumeUuid(candidateUuid, { locked = false } = {}) {
+    if (typeof candidateUuid !== 'string' || !candidateUuid.trim() || candidateUuid.includes('\0') || candidateUuid.includes('/')) {
+      throw new Error('Invalid candidate volume_uuid.');
+    }
+    const runCas = async () => {
+      const db = await openProfileDb(idbFactory, dbName);
+      try {
+        let won = false;
+        let resolvedUuid = candidateUuid;
+        let resolvedProfile = null;
+        await new Promise((resolve, reject) => {
+          const tx = openStrictWriteTx(db);
+          const store = tx.objectStore(BOOT_PROFILE_STORE);
+          const getReq = store.get(BOOT_PROFILE_KEY);
+          getReq.onsuccess = () => {
+            try {
+              const current = getReq.result ? validateBootProfile(getReq.result) : defaultBootProfile();
+              const existing = current.root?.cow_fs?.volume_uuid ?? null;
+              if (existing) {
+                won = existing === candidateUuid;
+                resolvedUuid = existing;
+                resolvedProfile = current;
+                return;
+              }
+              const next = structuredClone(current);
+              if (!next.root || typeof next.root !== 'object' || !next.root.cow_fs) {
+                next.root = { cow_fs: { volume_uuid: candidateUuid, writer_mode: 'fork_on_busy' } };
+              } else {
+                next.root.cow_fs.volume_uuid = candidateUuid;
+              }
+              resolvedProfile = validateBootProfile(next);
+              resolvedUuid = candidateUuid;
+              won = true;
+              store.put(resolvedProfile, BOOT_PROFILE_KEY);
+            } catch (err) {
+              try { tx.abort(); } catch {}
+              reject(err);
+            }
+          };
+          getReq.onerror = () => reject(getReq.error ?? new Error('Failed to read boot profile for claim.'));
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error ?? new Error('Failed to claim boot profile volume UUID.'));
+          tx.onabort = () => reject(tx.error ?? new Error('Boot profile volume UUID claim aborted.'));
+        });
+        return { won, volumeUuid: resolvedUuid, profile: resolvedProfile };
+      } finally {
+        db.close();
+      }
+    };
+    if (locked) return runCas();
+    const locksApi = options.locks ?? globalThis.navigator?.locks;
+    if (locksApi && typeof locksApi.request === 'function') {
+      return locksApi.request(`os-boot-profile-provision:${dbName}`, { mode: 'exclusive' }, runCas);
+    }
+    return runCas();
+  }
+
+  /**
+   * Run a first-boot provisioning callback serialized across concurrent tabs on this profile
+   * (Codex Finding #11) so only one tab formats & persists the initial default root UUID.
+   */
+  async function withProvisionLock(fn) {
+    const locksApi = options.locks ?? globalThis.navigator?.locks;
+    if (locksApi && typeof locksApi.request === 'function') {
+      return locksApi.request(`os-boot-profile-provision:${dbName}`, { mode: 'exclusive' }, fn);
+    }
+    return fn();
   }
 
   async function setWriterMode(writerMode) {
@@ -254,6 +355,8 @@ export function createBootProfileStore(options = {}) {
     save,
     update,
     setVolumeUuid,
+    claimVolumeUuid,
+    withProvisionLock,
     setWriterMode,
     setDefaultUser,
     setGeneration,

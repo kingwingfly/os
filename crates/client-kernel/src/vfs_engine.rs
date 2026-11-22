@@ -28,6 +28,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use vfs::devfs::{DefaultDeviceBackend, DevPtsFs, DevTmpFs, DeviceBackend};
+use vfs::vblk::{VblkDeviceBackend, VblkRegistry};
 use vfs::imagefs::{
     BlobStore, BuildAssetSizes, ImageEntry, ImageFs, ImageNodeKind, MemoryBlobStore,
 };
@@ -1490,6 +1491,14 @@ pub(crate) struct BootVfsOptions {
     pub(crate) build_asset_sizes: Option<BuildAssetSizes>,
     #[serde(default, alias = "system_composition")]
     pub(crate) system_composition: Option<String>,
+    #[serde(default, alias = "base_image")]
+    pub(crate) base_image: Option<String>,
+    #[serde(default, alias = "extension_images")]
+    pub(crate) extension_images: Vec<String>,
+    #[serde(default, alias = "root_template")]
+    pub(crate) root_template: Option<String>,
+    #[serde(default)]
+    pub(crate) initramfs: Option<String>,
     #[serde(default, alias = "bind_mounts")]
     pub(crate) bind_mounts: Vec<ServiceBindSpec>,
 }
@@ -1504,7 +1513,7 @@ pub(crate) struct ServiceBindSpec {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ServiceGrantSpec {
     #[serde(default, alias = "mount_namespace")]
     mount_namespace: String,
@@ -1512,6 +1521,12 @@ struct ServiceGrantSpec {
     bind_mounts: Vec<ServiceBindSpec>,
     #[serde(default)]
     user: Option<String>,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    devices: Vec<String>,
+    #[serde(default, alias = "cloud_scope")]
+    cloud_scope: Option<abi::auth_v2::RemoteScope>,
 }
 
 #[derive(Deserialize)]
@@ -1720,6 +1735,8 @@ pub(crate) struct ProcessVfsMeta {
     pub(crate) next_server_fd: u32,
     /// Single-fd `CloudFs` open refs received via `SCM_RIGHTS` (`kfd -> (origin_pid, origin_token)`).
     pub(crate) attenuated_kfds: HashMap<u32, (u32, Option<String>)>,
+    /// Optional monotonic `/dev` allowlist from `ServiceGrant.devices` (`None` = unrestricted).
+    pub(crate) allowed_devices: Option<BTreeSet<String>>,
 }
 
 impl ProcessVfsMeta {
@@ -1737,6 +1754,7 @@ impl ProcessVfsMeta {
             server_fds: HashMap::new(),
             next_server_fd: SERVER_DEV_FD_BASE,
             attenuated_kfds: HashMap::new(),
+            allowed_devices: None,
         }
     }
 
@@ -1848,8 +1866,17 @@ pub(crate) struct VfsRuntime {
     pub(crate) recovery: Option<crate::boot_stage::RecoveryState>,
     pub(crate) banners: Vec<String>,
     pub(crate) last_shutdown: Option<Value>,
-    pub(crate) dev_fs: Rc<DevTmpFs<JsDeviceBackend>>,
+    pub(crate) dev_fs: Rc<DevTmpFs<VblkDeviceBackend<JsDeviceBackend>>>,
     pub(crate) dev_pts: Rc<DevPtsFs<JsDeviceBackend>>,
+    pub(crate) vblk: Rc<VblkRegistry>,
+    pub(crate) stage1_fs_weak: std::rc::Weak<MemFs>,
+    pub(crate) stage1_reclaimed_entries: usize,
+    pub(crate) fsck_report: Option<cowfs::FsckReport>,
+    pub(crate) console_pid: Option<u32>,
+    pub(crate) console_pty: Option<u32>,
+    pub(crate) console_user: Option<String>,
+    pub(crate) console_home: Option<String>,
+    pub(crate) console_shell: Option<String>,
     pub(crate) usr_fs_id: FsId,
     pub(crate) usr_blob_paths: HashMap<u64, String>,
     pub(crate) sessions: HashMap<String, SessionVfs>,
@@ -1938,8 +1965,10 @@ async fn construct_vfs(
     opts: Option<BootVfsOptions>,
 ) -> vfs::Result<(
     Vfs,
-    Rc<DevTmpFs<JsDeviceBackend>>,
+    Rc<DevTmpFs<VblkDeviceBackend<JsDeviceBackend>>>,
     Rc<DevPtsFs<JsDeviceBackend>>,
+    Rc<VblkRegistry>,
+    std::rc::Weak<MemFs>,
     FsId,
     HashMap<u64, String>,
 )> {
@@ -1955,6 +1984,7 @@ async fn construct_vfs(
         0o755,
         Box::new(js_now_timespec),
     ));
+    let stage1_fs_weak = Rc::downgrade(&stage1_root);
     seed_local_stage1_memfs(&stage1_root).await?;
     let root_backing = Rc::new(MountBacking::new(
         stage1_root as Rc<dyn Filesystem>,
@@ -2002,23 +2032,42 @@ async fn construct_vfs(
         .and_then(|o| o.build_asset_sizes)
         .unwrap_or_else(default_asset_sizes);
     let blob_store = crate::release_v2::VerifiedAssetBlobStore;
-    let usr_image = if let Some(comp_json) =
-        opts.as_ref().and_then(|o| o.system_composition.as_ref())
-    {
+    let has_composition = opts.as_ref().is_some_and(|o| {
+        o.system_composition.is_some() || o.base_image.is_some()
+    });
+    let usr_image = if let Some(base_json) = opts.as_ref().and_then(|o| o.base_image.as_ref()) {
+        let base_img = image::Image::parse(base_json.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let mut ext_imgs = Vec::new();
+        if let Some(o) = opts.as_ref() {
+            for ext_json in &o.extension_images {
+                ext_imgs.push(
+                    image::Image::parse(ext_json.as_bytes()).map_err(|_| Errno::EINVAL)?,
+                );
+            }
+        }
+        let entries = crate::release_v2::compose_system_image_entries(&base_img, &ext_imgs)
+            .map_err(|_| Errno::EINVAL)?;
+        ImageFs::new(usr_fs_id.clone(), true, mounted_at, entries, blob_store)?
+    } else if let Some(comp_json) = opts.as_ref().and_then(|o| o.system_composition.as_ref()) {
         ImageFs::from_composition_json(usr_fs_id.clone(), true, mounted_at, comp_json, blob_store)?
     } else {
         ImageFs::from_build_assets(usr_fs_id.clone(), sizes, mounted_at, blob_store)
     };
     let mut usr_blob_paths = HashMap::new();
-    for (bin_path, asset_url) in [
-        ("/usr/bin/init", "/usr/bin/init.wasm"),
-        ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),
-        ("/usr/bin/dash", "/usr/bin/dash.wasm"),
-        ("/usr/bin/coreutils", "/usr/bin/coreutils.wasm"),
-        ("/usr/bin/utilities", "/usr/bin/utilities.wasm"),
-    ] {
-        if let Some(h) = usr_image.handle_at(bin_path) {
-            usr_blob_paths.insert(h.node.ino, asset_url.to_string());
+    // Only shortcut to unsigned `/usr/bin/*.wasm` HTTP build assets when NO verified Release v2
+    // system composition is provided (Codex Finding #7). Verified releases read strictly through
+    // `ImageFs` -> `VerifiedAssetBlobStore` -> OPFS with per-chunk SHA-256 verification.
+    if !has_composition {
+        for (bin_path, asset_url) in [
+            ("/usr/bin/init", "/usr/bin/init.wasm"),
+            ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),
+            ("/usr/bin/dash", "/usr/bin/dash.wasm"),
+            ("/usr/bin/coreutils", "/usr/bin/coreutils.wasm"),
+            ("/usr/bin/utilities", "/usr/bin/utilities.wasm"),
+        ] {
+            if let Some(h) = usr_image.handle_at(bin_path) {
+                usr_blob_paths.insert(h.node.ino, asset_url.to_string());
+            }
         }
     }
     let usr_subroot = usr_image.handle_at("/usr").map(|h| (h, "/usr".to_string()));
@@ -2083,14 +2132,15 @@ async fn construct_vfs(
     )
     .await?;
 
-    // 3. `/dev` (`DevTmpFs` with instance-local devices only; remote devices `archive`, `media`,
-    // `present`, `snd` require explicit credentialed `attach_remote` per Contract §2.7) and
-    // `/dev/pts` (`DevPtsFs`).
+    // 3. `/dev` (`DevTmpFs` + `VblkDeviceBackend` with instance-local devices only; remote devices
+    // `archive`, `media`, `present`, `snd` require explicit credentialed `attach_remote` per
+    // Contract §2.7) and `/dev/pts` (`DevPtsFs`).
+    let vblk = Rc::new(VblkRegistry::new());
     let dev_fs = Rc::new(DevTmpFs::new(
         FsId("devtmpfs".to_string()),
         1,
         Box::new(js_now_timespec),
-        JsDeviceBackend::default(),
+        VblkDeviceBackend::new(JsDeviceBackend::default()),
     ));
     {
         let active_pid = Rc::clone(&cloud_mount.active_pid);
@@ -2227,7 +2277,7 @@ async fn construct_vfs(
         }
     }
 
-    Ok((vfs, dev_fs, dev_pts, usr_fs_id, usr_blob_paths))
+    Ok((vfs, dev_fs, dev_pts, vblk, stage1_fs_weak, usr_fs_id, usr_blob_paths))
 }
 
 impl VfsRuntime {
@@ -2252,7 +2302,7 @@ impl VfsRuntime {
             page_sudo,
         ));
         let booted = now_or_never(construct_vfs(id, Rc::clone(&cloud_mount), state, None));
-        let (vfs, dev_fs, dev_pts, usr_fs_id, usr_blob_paths) = booted
+        let (vfs, dev_fs, dev_pts, vblk, stage1_fs_weak, usr_fs_id, usr_blob_paths) = booted
             .expect("initial boot_vfs must resolve synchronously")
             .expect("initial boot_vfs must succeed");
         let mut proc_meta = HashMap::new();
@@ -2271,6 +2321,15 @@ impl VfsRuntime {
             last_shutdown: None,
             dev_fs,
             dev_pts,
+            vblk,
+            stage1_fs_weak,
+            stage1_reclaimed_entries: 0,
+            fsck_report: None,
+            console_pid: None,
+            console_pty: None,
+            console_user: None,
+            console_home: None,
+            console_shell: None,
             usr_fs_id,
             usr_blob_paths,
             sessions: HashMap::new(),
@@ -2399,6 +2458,95 @@ fn clean_mount_name(raw: &str) -> vfs::Result<String> {
 }
 
 impl Kernel {
+    /// Resolve PID 1's executable image (`/usr/bin/init` or Stage 1 `/init`) strictly from the
+    /// mounted VFS. Returns `"asset": "/usr/bin/init.wasm"` only when running unsigned dev build
+    /// assets (`usr_blob_paths` populated); when booted from a verified Release v2 composition or
+    /// Stage 1 initramfs, reads chunk-verified bytes straight from VFS and issues a local exec
+    /// ticket with ZERO HTTP fetches (Codex Findings #2 & #7).
+    pub(crate) async fn resolve_init_exec(&self, init_path: &str) -> vfs::Result<Value> {
+        let (vfs, usr_fs_id, usr_blob_paths) = {
+            let rt = self.vfs_rt.borrow();
+            (
+                rt.vfs.clone(),
+                rt.usr_fs_id.clone(),
+                rt.usr_blob_paths.clone(),
+            )
+        };
+        let resolved = self
+            .with_proc_scope(
+                INIT,
+                vfs.resolve_exec(
+                    INIT,
+                    init_path,
+                    vec![init_path.to_string()],
+                    None,
+                    false,
+                ),
+            )
+            .await?;
+        if resolved.entry.handle.fs == usr_fs_id
+            && let Some(asset_url) = usr_blob_paths.get(&resolved.entry.handle.node.ino).cloned()
+        {
+            let _ = resolved.file.close().await;
+            drain_releases(&vfs);
+            return Ok(json!({
+                "asset": asset_url,
+                "path": resolved.resolved_path,
+            }));
+        }
+        let size = resolved.entry.metadata.size;
+        if size > abi::EXEC_MAX {
+            let _ = resolved.file.close().await;
+            drain_releases(&vfs);
+            return Err(Errno::E2BIG);
+        }
+        let cap = usize::try_from(size).map_err(|_| Errno::E2BIG)?;
+        let mut bytes = vec![0u8; cap];
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let chunk = (bytes.len() - off).min(256 * 1024);
+            match resolved
+                .file
+                .read_at(&mut bytes[off..off + chunk], off as u64)
+                .await
+            {
+                Ok(0) => break,
+                Ok(n) => off += n,
+                Err(err) => {
+                    let _ = resolved.file.close().await;
+                    drain_releases(&vfs);
+                    return Err(err);
+                }
+            }
+        }
+        bytes.truncate(off);
+        let provider = Rc::clone(resolved.pin.provider());
+        let mount_id = resolved.pin.id();
+        let resolved_path = resolved.resolved_path;
+        let _ = resolved.file.close().await;
+        drain_releases(&vfs);
+        let digest = image::digest(&bytes);
+        let actual_size = bytes.len() as u64;
+        let ticket = self.vfs_rt.borrow_mut().alloc_exec_ticket(CachedExecTicket {
+            session_id: None,
+            bytes: Some(bytes),
+            mount_id,
+            provider,
+        })?;
+        let local = json!({
+            "digest": digest,
+            "size": actual_size,
+            "cloud": false,
+        });
+        Ok(json!({
+            "path": resolved_path,
+            "size": actual_size,
+            "local": local,
+            "localExec": local,
+            "execTicket": ticket,
+        }))
+    }
+
     async fn fill_stat_names(&self, vfs: &Vfs, _pid: u32, st: &mut abi::Stat) {
         st.writing = None;
         let missing = {
@@ -2995,7 +3143,7 @@ impl Kernel {
             };
             (id, Rc::clone(&self.vfs_rt.borrow().cloud_mount))
         };
-        let (vfs, dev_fs, dev_pts, usr_fs_id, usr_blob_paths) =
+        let (vfs, dev_fs, dev_pts, vblk, stage1_fs_weak, usr_fs_id, usr_blob_paths) =
             construct_vfs(&inst_id, cloud_mount, Rc::clone(&self.state), opts)
                 .await
                 .map_err(map_errno)?;
@@ -3004,6 +3152,9 @@ impl Kernel {
             let old_vfs = std::mem::replace(&mut rt.vfs, vfs);
             rt.dev_fs = dev_fs;
             rt.dev_pts = dev_pts;
+            rt.vblk = vblk;
+            rt.stage1_fs_weak = stage1_fs_weak;
+            rt.stage1_reclaimed_entries = 0;
             rt.usr_fs_id = usr_fs_id;
             rt.usr_blob_paths = usr_blob_paths;
             rt.active_session_id = None;
@@ -4995,9 +5146,20 @@ impl Kernel {
                 && (child.cred.identity.id != parent.cred.identity.id
                     || child.login_session != parent.login_session
                     || grant.mount_namespace == "system"
-                    || grant.user.is_some())
+                    || grant.user.is_some()
+                    || grant.group.is_some())
             {
                 return Err(map_errno(Errno::EPERM));
+            }
+            for dev in &grant.devices {
+                if dev.is_empty()
+                    || dev == "."
+                    || dev == ".."
+                    || dev.contains('/')
+                    || dev.contains('\0')
+                {
+                    return Err(vfs_js_err(Errno::EINVAL, "invalid device allowlist entry"));
+                }
             }
             let (ns, session) = resolve_service_namespace_locked(
                 &rt.vfs,
@@ -5040,17 +5202,39 @@ impl Kernel {
                 .ok_or_else(|| map_errno(Errno::ESRCH))?
                 .session_id = resolved_sess;
         }
-        // Optional `grant.user` credential drop: ONLY permitted when parent is root (uid 0, e.g.
-        // PID 1 spawning `user-session@1000.service`). Drops child local cred to the resolved
-        // local user and clears any ambient remote credential!
-        if let Some(ref target_user) = grant.user
-            && parent_uid == 0
-        {
-            let acc = self
-                .resolve_local_user_account(&vfs, target_user)
-                .await
-                .map_err(map_errno)?;
-            let target_id = acc.identity();
+        // Optional `grant.user` / `grant.group` credential drop: ONLY permitted when parent is
+        // root (uid 0, e.g. PID 1 spawning `user-session@1000.service` or a group-restricted unit).
+        // Drops child local cred to the resolved local user/group and clears ambient remote cred!
+        if (grant.user.is_some() || grant.group.is_some()) && parent_uid == 0 {
+            let (target_uid, mut target_gid, mut target_groups) =
+                if let Some(ref target_user) = grant.user {
+                    let acc = self
+                        .resolve_local_user_account(&vfs, target_user)
+                        .await
+                        .map_err(map_errno)?;
+                    (acc.uid, acc.gid, acc.groups)
+                } else {
+                    let id = &cred.identity;
+                    (id.id, id.group, id.groups.iter().copied().collect())
+                };
+            if let Some(ref target_group) = grant.group {
+                let resolved_gid = resolve_local_group_gid(&vfs, target_group)
+                    .await
+                    .map_err(map_errno)?;
+                target_gid = resolved_gid;
+                if grant.user.is_none() {
+                    target_groups = vec![resolved_gid];
+                } else if !target_groups.contains(&resolved_gid) {
+                    target_groups.push(resolved_gid);
+                }
+            }
+            let mut gset: BTreeSet<u32> = target_groups.iter().copied().collect();
+            gset.insert(target_gid);
+            let target_id = Identity {
+                id: target_uid,
+                group: target_gid,
+                groups: gset,
+            };
             let revoked = {
                 let mut st = self.state.borrow_mut();
                 let host = st
@@ -5063,11 +5247,45 @@ impl Kernel {
                     .map_err(|e| map_errno(e.errno))?
             };
             crate::revoke_remote_tokens_state(&self.state, revoked).await;
-            let _ = self.proc_set_creds(pid, acc.uid, acc.gid, acc.groups, None, false);
+            let _ = self.proc_set_creds(pid, target_uid, target_gid, target_groups, None, false);
             // Allow `/usr/bin/init --user <uid>` to keep supervisor capability for its own user units.
-            if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+            if grant.user.is_some()
+                && let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid)
+            {
                 meta.supervisor = true;
             }
+        }
+        // Enforce declared device allowlist monotonically (never widens parent allowlist).
+        if !grant.devices.is_empty() {
+            let requested: BTreeSet<String> = grant.devices.iter().cloned().collect();
+            let mut rt = self.vfs_rt.borrow_mut();
+            let parent_allow = rt
+                .proc_meta
+                .get(&parent_pid)
+                .and_then(|m| m.allowed_devices.clone());
+            let effective = match parent_allow {
+                Some(parent_set) => parent_set.intersection(&requested).cloned().collect(),
+                None => requested,
+            };
+            if let Some(meta) = rt.proc_meta.get_mut(&pid) {
+                meta.allowed_devices = Some(effective);
+            }
+        }
+        // Enforce declared `cloud_scope` monotonically (attenuates cloud_access & revokes excess).
+        if let Some(scope) = grant.cloud_scope {
+            let revoked = {
+                let mut st = self.state.borrow_mut();
+                let host = st
+                    .table
+                    .proc(pid)
+                    .map(|p| p.owner_host.clone())
+                    .unwrap_or_else(|| "browser".into());
+                st.table
+                    .set_remote_scope_cap(&host, pid, scope)
+                    .map_err(|e| map_errno(e.errno))?
+            };
+            crate::revoke_remote_tokens_state(&self.state, revoked).await;
+            self.sync_vfs_proc_creds(pid);
         }
         let ns_id = base_ns.borrow().id().0;
         json_to_js(&json!({ "pid": pid, "nsId": ns_id }))
@@ -5095,6 +5313,7 @@ impl Kernel {
                     .collect(),
                 next_server_fd: m.next_server_fd,
                 attenuated_kfds: m.attenuated_kfds.clone(),
+                allowed_devices: m.allowed_devices.clone(),
             });
             (rt.vfs.clone(), Rc::clone(&rt.cloud_mount), meta)
         };
@@ -5315,6 +5534,41 @@ impl Kernel {
         let vfs = self.vfs_rt.borrow().vfs.clone();
         let ns = vfs.process_namespace(pid).map_err(map_errno)?;
         let ns_id = ns.borrow().id();
+        // Stage 1 `early_init` (PID 1, uid 0): when Stage 0/1 already pre-mounted `/sysroot`
+        // (`cowfs`/`tmpfs`), `/sysroot/home` (`cowfs`), `/sysroot/usr` (`image`), or `/sysroot/tmp`
+        // (`tmpfs`) with verified OPFS/IndexedDB handles, treat matching PID 1 mount calls as
+        // idempotent so the real packaged `/init` -> `switch_root` -> `/usr/bin/init` chain runs
+        // end-to-end (Codex Finding #2).
+        if pid == INIT
+            && (raw_flags & (mount_flags::MS_BIND | mount_flags::MS_MOVE | mount_flags::MS_REMOUNT))
+                == 0
+            && self.vfs_rt.borrow().boot_stage == crate::boot_stage::BootStage::Stage1
+        {
+            let expected_fs = match (target.as_str(), fstype.as_deref()) {
+                ("/sysroot", Some("cowfs")) => Some(vfs::FsType::Cowfs),
+                ("/sysroot", Some("tmpfs")) => Some(vfs::FsType::TmpFs),
+                ("/sysroot/home", Some("cowfs")) => Some(vfs::FsType::Cowfs),
+                ("/sysroot/usr", Some("image")) => Some(vfs::FsType::Image),
+                ("/sysroot/tmp", Some("tmpfs")) => Some(vfs::FsType::TmpFs),
+                _ => None,
+            };
+            if let Some(want_type) = expected_fs {
+                let already = self
+                    .with_proc_scope(INIT, vfs.statfs(INIT, StartAnchor::Root, &target))
+                    .await
+                    .ok()
+                    .map(|sf| match want_type {
+                        vfs::FsType::Cowfs => sf.f_type == abi::contract::fs_magic::OS_COWFS_MAGIC,
+                        vfs::FsType::Image => sf.f_type == abi::contract::fs_magic::SQUASHFS_MAGIC,
+                        vfs::FsType::TmpFs => sf.f_type == abi::contract::fs_magic::TMPFS_MAGIC,
+                        _ => false,
+                    })
+                    .unwrap_or(false);
+                if already {
+                    return Ok(());
+                }
+            }
+        }
         // Optional `mount -t cloud` mounts feature-frozen `CloudMountDriver` (`FsType::Cloud`)
         // strictly when signed into Cloud with `scope.cloud_fs == true`; fails `ENOTCONN` offline!
         if fstype.as_deref() == Some("cloud")
@@ -5501,6 +5755,23 @@ impl Kernel {
                         let _ = file_ref.close().await;
                         drain_releases(&vfs);
                         return Err(Errno::ENOTDIR);
+                    }
+                    let allowed_devs = self
+                        .vfs_rt
+                        .borrow()
+                        .proc_meta
+                        .get(&pid)
+                        .and_then(|m| m.allowed_devices.clone());
+                    if (oflags & abi::O_PATH) == 0
+                        && let Err(e) = check_proc_device_allowlist(
+                            allowed_devs.as_ref(),
+                            file_ref.mount_pin().map(|p| p.fstype()),
+                            &entry.metadata,
+                        )
+                    {
+                        let _ = file_ref.close().await;
+                        drain_releases(&vfs);
+                        return Err(e);
                     }
                     let mut st =
                         vfs::stat::stat(&entry.handle.fs, entry.handle.node, &entry.metadata);
@@ -6744,6 +7015,83 @@ impl Kernel {
     }
 }
 
+fn check_proc_device_allowlist(
+    allowed: Option<&BTreeSet<String>>,
+    pin_fstype: Option<vfs::FsType>,
+    meta: &vfs::Metadata,
+) -> vfs::Result<()> {
+    let Some(allow) = allowed else {
+        return Ok(());
+    };
+    if meta.is_dir() {
+        return Ok(());
+    }
+    if pin_fstype == Some(vfs::FsType::DevPts) {
+        if allow.contains("ptmx") || allow.contains("pts") || allow.contains("tty") {
+            return Ok(());
+        }
+        return Err(Errno::EPERM);
+    }
+    let is_dev_node = matches!(
+        meta.file_type,
+        FileType::CharDevice
+    ) || pin_fstype == Some(vfs::FsType::DevTmpFs);
+    if !is_dev_node {
+        return Ok(());
+    }
+    if let Some(rdev) = meta.rdev.as_deref() {
+        let name = rdev.split(':').next_back().unwrap_or(rdev);
+        if allow.contains(name) || allow.contains(rdev) {
+            return Ok(());
+        }
+        // Standard local device rdev prefixes (e.g. `dev:null`, `pty:ptmx`, `vblk:vd0`).
+        if let Some((prefix, rest)) = rdev.split_once(':')
+            && (allow.contains(rest)
+                || (prefix == "remote" && allow.contains(rest))
+                || (prefix == "pty" && allow.contains("ptmx")))
+        {
+            return Ok(());
+        }
+    }
+    Err(Errno::EPERM)
+}
+
+async fn resolve_local_group_gid(vfs: &Vfs, group_spec: &str) -> vfs::Result<u32> {
+    let (file, entry) = vfs
+        .open_file(crate::INIT, StartAnchor::Root, "/etc/group", abi::O_RDONLY, 0)
+        .await?;
+    let cap = usize::try_from(entry.metadata.size.min(4 * 1024 * 1024)).unwrap_or(0);
+    let mut raw = vec![0u8; cap];
+    let mut off = 0usize;
+    while off < raw.len() {
+        match file.read_at(&mut raw[off..], off as u64).await {
+            Ok(0) => break,
+            Ok(n) => off += n,
+            Err(e) => {
+                let _ = file.close().await;
+                return Err(e);
+            }
+        }
+    }
+    raw.truncate(off);
+    let _ = file.close().await;
+    let text = std::str::from_utf8(&raw).map_err(|_| Errno::EIO)?;
+    let groups = kernel::accounts::parse_group(text).map_err(|_| Errno::EIO)?;
+    if let Ok(num_gid) = group_spec.parse::<u32>() {
+        groups
+            .iter()
+            .find(|g| g.gid == num_gid)
+            .map(|g| g.gid)
+            .ok_or(Errno::ENOENT)
+    } else {
+        groups
+            .iter()
+            .find(|g| g.name == group_spec)
+            .map(|g| g.gid)
+            .ok_or(Errno::ENOENT)
+    }
+}
+
 fn resolve_service_namespace_locked(
     vfs: &Vfs,
     sessions: &HashMap<String, SessionVfs>,
@@ -7809,22 +8157,6 @@ impl Kernel {
                         }
                         Err(e) => Err(e.into()),
                     },
-                    Call::Getcreds if page_sid.is_none() && pid < SCOPED_PAGE_PID_BASE => {
-                        let host = self
-                            .state
-                            .borrow()
-                            .table
-                            .proc(pid)
-                            .map(|p| p.owner_host.clone());
-                        match host {
-                            Some(h) => match self.getcreds_proc(pid, &h) {
-                                Ok(raw) => serde_json::from_str::<Value>(&raw)
-                                    .map_err(|_| Errno::EIO.into()),
-                                Err(_) => Err(Errno::ESRCH.into()),
-                            },
-                            None => Err(Errno::ESRCH.into()),
-                        }
-                    }
                     call @ (Call::Getpid
                     | Call::Getpgid { .. }
                     | Call::Getsid { .. }
@@ -8632,6 +8964,23 @@ impl Kernel {
             drain_releases(vfs);
             return Err(Errno::ENOTDIR.into());
         }
+        let allowed_devs = self
+            .vfs_rt
+            .borrow()
+            .proc_meta
+            .get(&pid)
+            .and_then(|m| m.allowed_devices.clone());
+        if (flags & abi::O_PATH) == 0
+            && let Err(e) = check_proc_device_allowlist(
+                allowed_devs.as_ref(),
+                file_ref.mount_pin().map(|p| p.fstype()),
+                &entry.metadata,
+            )
+        {
+            let _ = file_ref.close().await;
+            drain_releases(vfs);
+            return Err(e.into());
+        }
         if (flags & abi::O_PATH) == 0
             && entry.metadata.file_type == FileType::CharDevice
             && let Some(rdev) = &entry.metadata.rdev
@@ -9205,6 +9554,30 @@ impl Kernel {
                 )
                 .await?;
             return Ok(Value::Null);
+        }
+
+        // 1b. Local `/dev/vdN` (`BLK_INFO`, `BLK_LEASE`, `COWFS_IOC_*`) volume device ioctls.
+        if matches!(
+            request,
+            abi::contract::cowfs_ioctl::BLK_INFO
+                | abi::contract::cowfs_ioctl::BLK_LEASE
+                | abi::contract::cowfs_ioctl::COWFS_IOC_INFO
+                | abi::contract::cowfs_ioctl::COWFS_IOC_SNAPSHOT
+                | abi::contract::cowfs_ioctl::COWFS_IOC_FORK
+                | abi::contract::cowfs_ioctl::COWFS_IOC_FSCK
+        ) {
+            let vblk = Rc::clone(&self.vfs_rt.borrow().vblk);
+            let payload = if arg.is_null() {
+                Vec::new()
+            } else {
+                serde_json::to_vec(&arg).map_err(|_| abi::Error::from(Errno::EINVAL))?
+            };
+            let reply_bytes = vblk
+                .ioctl_fd(vfs, pid, raw_fd, request, &payload)
+                .await?;
+            let val: Value =
+                serde_json::from_slice(&reply_bytes).map_err(|_| abi::Error::from(Errno::EIO))?;
+            return Ok(val);
         }
 
         // 2. `/dev/archive` & `/dev/media` (`accelerator::SUBMIT`): translate `PathAt.directory`

@@ -41,14 +41,17 @@ const refused = (name, error) => {
 // zombie the exit cannot reach but the wait reaps. A forked process is its parent's to wait
 // for: only once it is init's (its parent ended first) does its host reap it, as init would.
 const reap = async (pid, { status, signal }, forked = false) => {
-  let parent = null;
-  try { parent = (await kernelCall('exit', { pid, status, signal }))?.ppid ?? null; } catch { /* ended already */ }
+  let exitInfo = null;
+  try { exitInfo = await kernelCall('exit', { pid, status, signal }); } catch { /* ended already */ }
   // Release AF_UNIX sockets AFTER `exit` marks the process dead and revokes its remote credentials,
   // so peers waking on socket EOF observe revoked attenuated descriptors deterministically (U-10).
   if (globalThis.kernel?.sock_release_process) {
     try { await applySockCleanup(await globalThis.kernel.sock_release_process(pid)); } catch { /* kernel torn down */ }
   }
-  if (!forked || parent === 1) {
+  const shouldHostReap = typeof exitInfo?.host_reap === 'boolean'
+    ? exitInfo.host_reap
+    : (!forked || exitInfo?.ppid === 1);
+  if (shouldHostReap) {
     try { await kernelCall('wait', { pid }); } catch { /* reaped already, or still running */ }
   }
   await reconcile();

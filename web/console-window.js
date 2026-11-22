@@ -25,8 +25,274 @@ async function sha256Hex(bytes) {
 // =============================================================================
 if (IS_WORKER) {
   let runtime = null;
+  let kernel = null;
+  let wasmBindgenCached = null;
+  let executorMod = null;
   let store = null;
   let pager = null;
+  let lastBootArgs = null;
+  let pid1Job = null;
+  let pid1Promise = null;
+  let pid1Owner = null;
+  let pid1Ended = false;
+  let pid1Error = '';
+  const kernelId = self.crypto?.randomUUID?.() ?? `standalone-${Date.now()}-${Math.random()}`;
+
+  function randomHex32() {
+    return bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
+  }
+
+  function parseKernelErr(error) {
+    if (typeof error === 'string') {
+      try {
+        const parsed = JSON.parse(error);
+        if (parsed && typeof parsed === 'object' && parsed.errno) {
+          return Object.assign(new Error(parsed.detail ?? parsed.errno), parsed);
+        }
+      } catch { /* plain string */ }
+    }
+    if (error && typeof error === 'object' && error.errno) return error;
+    return Object.assign(new Error(error?.message ?? String(error)), { errno: 'EIO' });
+  }
+
+  async function dispatchStandaloneKernel(type, args = {}) {
+    if (!kernel) throw Object.assign(new Error('standalone kernel not booted'), { errno: 'ENODEV' });
+    const host = kernelId;
+    try {
+      switch (type) {
+        case 'boot_init': return JSON.parse(await kernel.boot_init(JSON.stringify(args.owner), args.token, host));
+        case 'execs': {
+          const stages = (args.stages ?? []).map(stage => ({
+            path: stage.path,
+            local: stage.local,
+            runtime: stage.runtime,
+            parentPid: stage.parentPid,
+            sessionId: stage.sessionId,
+            serviceGrant: stage.serviceGrant,
+            ...(stage.remote !== undefined ? { remote: stage.remote } : {}),
+            argv: stage.argv ?? [],
+            env: stage.env ?? [],
+            cwd: stage.cwd ?? '/',
+            cgroup: stage.cgroup ?? '',
+          }));
+          return JSON.parse(await kernel.execs(JSON.stringify(stages), !!args.sudo, '', host));
+        }
+        case 'exec': {
+          const [res] = await dispatchStandaloneKernel('execs', { stages: [args], sudo: args.sudo });
+          if (res.err) throw res.err;
+          return res.ok;
+        }
+        case 'reexec': return JSON.parse(await kernel.reexec(args.pid, JSON.stringify(args.local ?? null), args.path, JSON.stringify(args.argv ?? []), JSON.stringify(args.env ?? []), args.cwd ?? '/', '', host));
+        case 'fork': return JSON.parse(await kernel.fork(args.pid, host, args.emptyMemory === true));
+        case 'session': return JSON.parse(await kernel.session(JSON.stringify(args.pids), host));
+        case 'process_call': return JSON.parse(await kernel.process_call(args.pid, JSON.stringify(args.call), host));
+        case 'exit': return JSON.parse(await kernel.exit(args.pid, args.status ?? 0, args.signal ?? undefined, host));
+        case 'wait': return JSON.parse(await kernel.wait(args.pid, host));
+        case 'waitchild': return JSON.parse(await kernel.waitchild(args.ppid, args.pid ?? undefined, host));
+        case 'kill': return JSON.parse(await kernel.kill(args.pid, args.signal ?? undefined, args.from ?? undefined, host));
+        case 'poll': return JSON.parse(await kernel.poll(JSON.stringify(args.pids ?? [])));
+        case 'tty_fds': return kernel.terminal(args.pid, args.tty, JSON.stringify(args.fds), host);
+        case 'sync': return JSON.parse(await kernel.sync(host, JSON.stringify(args?.acknowledged ?? {})));
+        case 'getpid': return JSON.parse(await kernel.getpid(args.pid));
+        case 'getcreds_proc': return JSON.parse(await kernel.getcreds_proc(args.pid, host));
+        case 'set_proc_cred': return JSON.parse(await kernel.set_proc_cred(args.pid, args.uid, args.gid ?? args.uid, new Uint32Array(args.groups ?? []), args.remote != null ? JSON.stringify(args.remote) : undefined, host));
+        case 'reserve_memory': kernel.reserve_memory(args.pid, BigInt(args.bytes ?? 0), host); return null;
+        case 'cgroup_create': return JSON.parse(await kernel.cgroup_create(args.path));
+        case 'cgroup_set': return JSON.parse(await kernel.cgroup_set(args.path, args.key, args.value));
+        case 'cgroup_attach': return JSON.parse(await kernel.cgroup_attach(args.pid, args.path));
+        case 'cgroup_remove': return JSON.parse(await kernel.cgroup_remove(args.path));
+        case 'cgroup_stat': return JSON.parse(await kernel.cgroup_stat(args.path));
+        case 'cgroup_list': return JSON.parse(await kernel.cgroup_list(args.path ?? '/'));
+        case 'session_begin': return await kernel.session_begin(args.sessionId, args.uid, args.gid ?? args.uid, new Uint32Array(args.groups ?? []));
+        case 'set_active_session': kernel.set_active_session(args.sessionId ?? undefined); return null;
+        case 'session_end': await kernel.session_end(args.sessionId); return null;
+        case 'proc_spawn_init': return await kernel.proc_spawn_init(typeof args.opts === 'string' ? args.opts : JSON.stringify(args.opts));
+        case 'proc_authorize_service_grant': return kernel.proc_authorize_service_grant(args.pid);
+        case 'proc_apply_service_grant': return await kernel.proc_apply_service_grant(args.pid, args.parentPid, typeof args.grant === 'string' ? args.grant : JSON.stringify(args.grant));
+        case 'proc_fork': return kernel.proc_fork(args.parentPid, args.childPid, args.cloneFlags ?? 0);
+        case 'proc_exec_preserve': await kernel.proc_exec_preserve(args.pid); return null;
+        case 'proc_set_creds': kernel.proc_set_creds(args.pid, args.uid, args.gid, new Uint32Array(args.groups ?? []), args.token ?? undefined, args.cloudAccess !== false); return null;
+        case 'proc_set_umask': return kernel.proc_set_umask(args.pid, args.umask);
+        case 'proc_close_server_fds': await kernel.proc_close_server_fds(args.pid); return null;
+        case 'proc_exit': await kernel.proc_exit(args.pid); return null;
+        case 'sys_chdir': await kernel.sys_chdir(args.pid, args.path); return null;
+        case 'sys_fchdir': await kernel.sys_fchdir(args.pid, args.kfd); return null;
+        case 'sys_chroot': await kernel.sys_chroot(args.pid, args.path); return null;
+        case 'sys_getcwd': return await kernel.sys_getcwd(args.pid);
+        case 'sys_mount': await kernel.sys_mount(args.pid, args.source ?? undefined, args.target, args.fstype ?? undefined, BigInt(args.flags ?? 0), args.data ?? undefined); return null;
+        case 'sys_umount2': await kernel.sys_umount2(args.pid, args.target, args.flags ?? 0); return null;
+        case 'sys_statfs': return await kernel.sys_statfs(args.pid, args.dirfd ?? 0x7ffffffe, args.path);
+        case 'sys_fstatfs': return await kernel.sys_fstatfs(args.pid, args.kfd);
+        case 'sys_unshare': kernel.sys_unshare(args.pid, args.flags ?? 0); return null;
+        case 'sys_setns': kernel.sys_setns(args.pid, args.kfd, args.nstype ?? 0); return null;
+        case 'proc_openat': return await kernel.proc_openat(args.pid, args.dirfd, args.path, args.oflags ?? 0, args.mode ?? 0, !!args.cloexec);
+        case 'proc_statat': return await kernel.proc_statat(args.pid, args.dirfd, args.path, args.follow !== false);
+        case 'proc_accessat': await kernel.proc_accessat(args.pid, args.dirfd, args.path, args.amode ?? 0, args.follow !== false); return null;
+        case 'proc_mkdirat': await kernel.proc_mkdirat(args.pid, args.dirfd, args.path, args.mode ?? 0o777); return null;
+        case 'proc_mknodat': await kernel.proc_mknodat(args.pid, args.dirfd, args.path, args.mode, args.rdev ?? undefined); return null;
+        case 'proc_unlinkat': await kernel.proc_unlinkat(args.pid, args.dirfd, args.path, !!args.removedir); return null;
+        case 'proc_renameat': await kernel.proc_renameat(args.pid, args.olddirfd, args.oldpath, args.newdirfd, args.newpath, args.flags ?? 0); return null;
+        case 'proc_linkat': await kernel.proc_linkat(args.pid, args.olddirfd, args.oldpath, args.newdirfd, args.newpath, !!args.follow); return null;
+        case 'proc_symlinkat': await kernel.proc_symlinkat(args.pid, args.target, args.newdirfd, args.linkpath); return null;
+        case 'proc_readlinkat': return await kernel.proc_readlinkat(args.pid, args.dirfd, args.path);
+        case 'proc_utimensat': {
+          const enc = v => (typeof v === 'string' && (v.startsWith('"') || v.startsWith('{'))) ? v : JSON.stringify(v ?? 'now');
+          await kernel.proc_utimensat(args.pid, args.dirfd, args.path, enc(args.atime), enc(args.mtime), args.follow !== false);
+          return null;
+        }
+        case 'proc_sys': return JSON.parse(await kernel.proc_sys(args.pid, typeof args.batch === 'string' ? args.batch : JSON.stringify(args.batch)));
+        case 'kfd_read': return await kernel.kfd_read(args.pid, args.kfd, args.len);
+        case 'kfd_write': return await kernel.kfd_write(args.pid, args.kfd, args.data instanceof Uint8Array ? args.data : new Uint8Array(args.data));
+        case 'kfd_pread': return await kernel.kfd_pread(args.pid, args.kfd, args.len, BigInt(args.offset ?? 0));
+        case 'kfd_pwrite': return await kernel.kfd_pwrite(args.pid, args.kfd, args.data instanceof Uint8Array ? args.data : new Uint8Array(args.data), BigInt(args.offset ?? 0));
+        case 'kfd_seek': return (await kernel.kfd_seek(args.pid, args.kfd, BigInt(args.offset ?? 0), args.whence ?? 0)).toString();
+        case 'kfd_readdir': return await kernel.kfd_readdir(args.pid, args.kfd);
+        case 'kfd_fstat': return await kernel.kfd_fstat(args.pid, args.kfd);
+        case 'kfd_ftruncate': await kernel.kfd_ftruncate(args.pid, args.kfd, BigInt(args.size ?? 0)); return null;
+        case 'kfd_futimens': {
+          const enc = v => (typeof v === 'string' && (v.startsWith('"') || v.startsWith('{'))) ? v : JSON.stringify(v ?? 'now');
+          await kernel.kfd_futimens(args.pid, args.kfd, enc(args.atime), enc(args.mtime));
+          return null;
+        }
+        case 'kfd_fsync': await kernel.kfd_fsync(args.pid, args.kfd, !!args.dataOnly); return null;
+        case 'kfd_set_append': kernel.kfd_set_append(args.pid, args.kfd, !!args.append); return null;
+        case 'kfd_is_append': return kernel.kfd_is_append(args.pid, args.kfd);
+        case 'kfd_lock': await kernel.kfd_lock(args.pid, args.kfd, args.family, args.kind, BigInt(args.start ?? 0), args.end != null ? BigInt(args.end) : undefined, !!args.wait); return null;
+        case 'kfd_cancel': kernel.kfd_cancel(args.pid, args.kfd); return null;
+        case 'kfd_unlock': await kernel.kfd_unlock(args.pid, args.kfd, args.family, BigInt(args.start ?? 0), args.end != null ? BigInt(args.end) : undefined); return null;
+        case 'kfd_test_lock': return await kernel.kfd_test_lock(args.pid, args.kfd, args.kind, BigInt(args.start ?? 0), args.end != null ? BigInt(args.end) : undefined);
+        case 'kfd_dup': return kernel.kfd_dup(args.pid, args.kfd);
+        case 'kfd_dup2': return await kernel.kfd_dup2(args.pid, args.oldKfd, args.newKfd);
+        case 'kfd_set_cloexec': kernel.kfd_set_cloexec(args.pid, args.kfd, !!args.cloexec); return null;
+        case 'kfd_is_cloexec': return kernel.kfd_is_cloexec(args.pid, args.kfd);
+        case 'kfd_close': await kernel.kfd_close(args.pid, args.kfd); return null;
+        case 'pty_register': kernel.pty_register(args.index, args.uid ?? 0, args.gid ?? 0, args.mode ?? 0o600); return null;
+        case 'pty_close': return kernel.pty_close(args.index);
+        case 'proc_resolve_exec': return await kernel.proc_resolve_exec(args.pid, args.file, typeof args.argv === 'string' ? args.argv : JSON.stringify(args.argv ?? []), args.pathEnv ?? undefined, !!args.searchPath);
+        case 'session_resolve_exec': return await kernel.session_resolve_exec(args.sessionId ?? '', args.file, typeof args.argv === 'string' ? args.argv : JSON.stringify(args.argv ?? []), args.cwd ?? '/', args.pathEnv ?? undefined, !!args.searchPath, !!args.sudo);
+        case 'release_exec_ticket': kernel.release_exec_ticket(args.ticket); return null;
+        case 'take_local_exec_bytes': return kernel.take_local_exec_bytes(args.ticket ?? args.digest, args.checkOnly);
+        default:
+          throw Object.assign(new Error(`unsupported standalone kernel call ${type}`), { errno: 'ENOSYS' });
+      }
+    } catch (err) {
+      throw parseKernelErr(err);
+    }
+  }
+
+  async function stopStandalonePid1() {
+    if (!pid1Promise && !pid1Job) return;
+    if (executorMod && pid1Job && !pid1Ended) {
+      try {
+        await Promise.race([
+          executorMod.exec([['/usr/bin/service', 'poweroff']], { stdin: '', sudo: true }).catch(() => {}),
+          new Promise(r => setTimeout(r, 2500)),
+        ]);
+      } catch { /* fallback to signal */ }
+    }
+    if (pid1Promise) {
+      await Promise.race([pid1Promise.catch(() => {}), new Promise(r => setTimeout(r, 2500))]);
+    }
+    if (pid1Job && !pid1Ended) {
+      try { pid1Job.signal(15); } catch {}
+      if (pid1Promise) {
+        await Promise.race([pid1Promise.catch(() => {}), new Promise(r => setTimeout(r, 1000))]);
+      }
+      if (!pid1Ended) {
+        try { pid1Job.signal(9); } catch {}
+      }
+    }
+    pid1Job = null;
+    pid1Promise = null;
+    if (pid1Owner && kernel) {
+      try {
+        await kernel.machine_init_action(JSON.stringify({ op: 'release', owner: pid1Owner }), kernelId);
+      } catch { /* ignore */ }
+    }
+    pid1Owner = null;
+  }
+
+  async function bootStandaloneOnKernel(bootProfile, bootArgs) {
+    await stopStandalonePid1();
+    if (kernel) {
+      try { await kernel.close_clean_root(); } catch {}
+    }
+    kernel = new wasmBindgenCached.Kernel('', kernelId);
+    self.kernel = kernel;
+    self.wasm_bindgen = wasmBindgenCached;
+    self.kernelRequest = dispatchStandaloneKernel;
+    pid1Job = null;
+    pid1Promise = null;
+    pid1Owner = null;
+    pid1Ended = false;
+    pid1Error = '';
+
+    const stage1Status = JSON.parse(await kernel.boot_stage1_standalone(
+      store,
+      JSON.stringify(bootProfile),
+      bootArgs.initramfsJson,
+      bootArgs.rootTemplateJson,
+      bootArgs.baseJson,
+      bootArgs.extensionsJson ?? [],
+    ));
+    if (stage1Status.stage !== 'stage1') {
+      return { status: stage1Status, bootHealthy: false, pagerStats: pager.stats() };
+    }
+
+    // Codex Findings #2 & #10: execute real packaged Stage 1 `/init` (`early_init.wasm`) ->
+    // `/bin/switch_root` -> Stage 2 `/usr/bin/init` (`init.wasm`) as PID 1 through the executor
+    // preserving PID 1 & start time, and wait for PID 1 to write `/run/os/boot-healthy`!
+    executorMod ??= await import('/executor-host.js');
+    const proof = randomHex32();
+    const inspected = JSON.parse(await kernel.machine_init_action(JSON.stringify({ op: 'inspect' }), kernelId));
+    const claimed = JSON.parse(await kernel.machine_init_action(
+      JSON.stringify({ op: 'claim', owner: { boot: inspected.boot, host: kernelId, proof, generation: inspected.generation } }),
+      kernelId,
+    ));
+    const owner = { boot: claimed.boot, host: kernelId, proof, generation: claimed.generation };
+    pid1Owner = owner;
+    const token = randomHex32();
+    pid1Promise = executorMod.exec([['/init']], {
+      stdin: '',
+      prepare: async () => [{ ok: await self.kernelRequest('boot_init', { owner, token }) }],
+      onJob: job => { pid1Job = job; },
+      onOutput: (fd, text) => {
+        if (fd === 2) pid1Error = (pid1Error + text).slice(-4096);
+      },
+    }).then(res => {
+      pid1Ended = true;
+      return res;
+    }).catch(err => {
+      pid1Ended = true;
+      pid1Error = (pid1Error + `\n${err?.message ?? String(err)}`).slice(-4096);
+      return { status: 1 };
+    });
+
+    const deadline = Date.now() + 30_000;
+    let healthy = false;
+    while (Date.now() < deadline) {
+      if (pid1Ended) {
+        throw new Error(`PID 1 init exited prematurely before boot-healthy: ${pid1Error.trim() || 'exit'}`);
+      }
+      try {
+        await kernel.proc_statat(1, 0x7ffffffe, '/run/os/boot-healthy', true);
+        healthy = true;
+        break;
+      } catch {
+        await new Promise(r => setTimeout(r, 40));
+      }
+    }
+    if (!healthy) {
+      throw new Error(`Timed out waiting for PID 1 /usr/bin/init boot-healthy (${pid1Error.trim() || 'no stderr'})`);
+    }
+
+    const finalStatus = JSON.parse(await kernel.standalone_finalize_stage2(kernelId));
+    return {
+      status: finalStatus,
+      bootHealthy: finalStatus.stage === 'stage2',
+      pagerStats: pager.stats(),
+    };
+  }
 
   async function loadVerifiedWasmBindgen(jsBytes, wasmBytes, expectedWasmSha256) {
     const actualSha = await sha256Hex(wasmBytes);
@@ -63,93 +329,190 @@ if (IS_WORKER) {
           });
           self.imageBlobRead = pager.imageBlobRead;
           store = createCowfsStore({ dbName: args.cowfsDbName ?? 'os-cowfs-v1' });
-          const wasmBindgen = await loadVerifiedWasmBindgen(
+          wasmBindgenCached ??= await loadVerifiedWasmBindgen(
             args.clientKernelJsBytes,
             args.clientKernelWasmBytes,
             args.expectedWasmSha256,
           );
-          runtime = await wasmBindgen.OfflineBootRuntime.boot(
-            store,
-            JSON.stringify(args.bootProfile),
-            args.initramfsJson,
-            args.rootTemplateJson,
-            args.baseJson,
-            args.extensionsJson ?? [],
-          );
-          result = {
-            status: runtime.status(),
-            pagerStats: pager.stats(),
+          lastBootArgs = {
+            bootProfile: structuredClone(args.bootProfile),
+            initramfsJson: args.initramfsJson,
+            rootTemplateJson: args.rootTemplateJson,
+            baseJson: args.baseJson,
+            extensionsJson: args.extensionsJson ?? [],
           };
+          if (globalThis.crossOriginIsolated) {
+            runtime = null;
+            result = await bootStandaloneOnKernel(args.bootProfile, lastBootArgs);
+          } else {
+            kernel = null;
+            runtime = await wasmBindgenCached.OfflineBootRuntime.boot(
+              store,
+              JSON.stringify(args.bootProfile),
+              args.initramfsJson,
+              args.rootTemplateJson,
+              args.baseJson,
+              args.extensionsJson ?? [],
+            );
+            result = {
+              status: runtime.status(),
+              // Never mark a release healthy without real PID 1 readiness (Codex Finding #10).
+              bootHealthy: false,
+              pagerStats: pager.stats(),
+            };
+          }
+          break;
+        }
+        case 'reboot_with_profile': {
+          lastBootArgs.bootProfile = structuredClone(args.bootProfile);
+          if (globalThis.crossOriginIsolated) {
+            result = await bootStandaloneOnKernel(args.bootProfile, lastBootArgs);
+          } else {
+            if (runtime) {
+              try { await runtime.close_clean_with_prune(); } catch {}
+            }
+            runtime = await wasmBindgenCached.OfflineBootRuntime.boot(
+              store,
+              JSON.stringify(args.bootProfile),
+              lastBootArgs.initramfsJson,
+              lastBootArgs.rootTemplateJson,
+              lastBootArgs.baseJson,
+              lastBootArgs.extensionsJson ?? [],
+            );
+            result = {
+              status: runtime.status(),
+              bootHealthy: false,
+              pagerStats: pager.stats(),
+            };
+          }
           break;
         }
         case 'status':
-          result = runtime.status();
+          result = kernel ? JSON.parse(kernel.standalone_status()) : runtime.status();
           break;
-        case 'exec':
-          result = await runtime.exec_command(args.line ?? '');
+        case 'exec': {
+          if (kernel && executorMod) {
+            const st = JSON.parse(kernel.standalone_status());
+            const cp = st.console_proc;
+            let output = '';
+            const res = await executorMod.exec([['/bin/sh', '-c', args.line ?? '']], {
+              stdin: '',
+              sudo: false,
+              cwd: cp?.home ?? '/',
+              home: cp?.home ?? '/',
+              user: cp?.user ?? 'user',
+              tty: true,
+              onOutput: (_fd, text) => { output += text; },
+            });
+            result = { code: res?.status ?? 0, output: output || (res?.stdout ?? '') };
+          } else {
+            result = await runtime.exec_command(args.line ?? '');
+          }
           break;
+        }
         case 'read_file':
-          result = [...(await runtime.read_file(args.path))];
+          result = [...(kernel
+            ? await kernel.standalone_read_file(args.path, Boolean(args.sudo))
+            : await runtime.read_file(args.path, Boolean(args.sudo)))];
           break;
         case 'write_file':
-          result = await runtime.write_file(
-            args.path,
-            new Uint8Array(args.bytes),
-            args.mode ?? 0o644,
-          );
+          result = kernel
+            ? await kernel.standalone_write_file(args.path, new Uint8Array(args.bytes), args.mode ?? 0o644, Boolean(args.sudo))
+            : await runtime.write_file(args.path, new Uint8Array(args.bytes), args.mode ?? 0o644, Boolean(args.sudo));
           break;
         case 'mkdir':
-          await runtime.mkdir(args.path, args.mode ?? 0o755);
+          if (kernel) await kernel.standalone_mkdir(args.path, args.mode ?? 0o755, Boolean(args.sudo));
+          else await runtime.mkdir(args.path, args.mode ?? 0o755, Boolean(args.sudo));
           result = true;
           break;
         case 'unlink':
-          await runtime.unlink(args.path);
+          if (kernel) await kernel.standalone_unlink(args.path, Boolean(args.sudo));
+          else await runtime.unlink(args.path, Boolean(args.sudo));
           result = true;
           break;
         case 'stat':
-          result = await runtime.stat(args.path, args.follow ?? true);
+          result = kernel
+            ? JSON.parse(await kernel.standalone_stat(args.path, args.follow ?? true, Boolean(args.sudo)))
+            : await runtime.stat(args.path, args.follow ?? true, Boolean(args.sudo));
           break;
         case 'statfs':
-          result = await runtime.statfs(args.path);
+          result = kernel
+            ? JSON.parse(await kernel.standalone_statfs(args.path))
+            : await runtime.statfs(args.path);
           break;
         case 'readdir':
-          result = await runtime.readdir(args.path);
+          result = kernel
+            ? JSON.parse(await kernel.standalone_readdir(args.path, Boolean(args.sudo)))
+            : await runtime.readdir(args.path, Boolean(args.sudo));
           break;
         case 'sync_fs':
-          result = await runtime.sync_fs();
+          result = kernel ? JSON.parse(await kernel.standalone_sync_fs()) : await runtime.sync_fs();
           break;
         case 'snapshot':
-          result = await runtime.snapshot(args.name);
+          result = kernel ? JSON.parse(await kernel.standalone_snapshot(args.name)) : await runtime.snapshot(args.name);
           break;
         case 'run_cowfsck':
-          result = await runtime.run_cowfsck(args.volumeUuid ?? null);
+          result = kernel
+            ? JSON.parse(await kernel.standalone_run_cowfsck(store, args.volumeUuid ?? null))
+            : await runtime.run_cowfsck(args.volumeUuid ?? null);
           break;
         case 'rollback_snapshot':
-          result = await runtime.rollback_snapshot(args.snapshotName);
+          if (kernel) {
+            const rolledUuid = await kernel.standalone_rollback_fork(store, args.snapshotName);
+            const nextProfile = structuredClone(lastBootArgs.bootProfile);
+            nextProfile.recovery = false;
+            nextProfile.root = { cow_fs: { volume_uuid: rolledUuid, writer_mode: 'fork_on_busy' } };
+            lastBootArgs.bootProfile = nextProfile;
+            const rb = await bootStandaloneOnKernel(nextProfile, lastBootArgs);
+            result = rb.status;
+          } else {
+            result = await runtime.rollback_snapshot(args.snapshotName);
+          }
           break;
         case 'fork_from_recovery':
-          result = await runtime.fork_from_recovery();
+          if (kernel) {
+            const nextProfile = structuredClone(lastBootArgs.bootProfile);
+            nextProfile.recovery = false;
+            if (nextProfile.root?.cow_fs) nextProfile.root.cow_fs.writer_mode = 'fork_on_busy';
+            lastBootArgs.bootProfile = nextProfile;
+            const fk = await bootStandaloneOnKernel(nextProfile, lastBootArgs);
+            result = fk.status;
+          } else {
+            result = await runtime.fork_from_recovery();
+          }
           break;
         case 'switch_root_attempt':
-          await runtime.switch_root_attempt(args.callerPid, args.newroot, args.initPath);
+          if (kernel) await kernel.standalone_switch_root_attempt(args.callerPid, args.newroot, args.initPath);
+          else await runtime.switch_root_attempt(args.callerPid, args.newroot, args.initPath);
           result = true;
           break;
         case 'list_volumes':
           result = await store.listVolumes({ probeLocks: args.probeLocks ?? true });
           break;
+        case 'flush_for_suspend':
+          result = kernel
+            ? JSON.parse(await kernel.flush_root())
+            : (runtime ? await runtime.flush_for_suspend() : null);
+          break;
         case 'close_clean_with_prune':
-          result = runtime ? await runtime.close_clean_with_prune() : null;
+          if (kernel) {
+            await stopStandalonePid1();
+            result = JSON.parse(await kernel.close_clean_root());
+          } else {
+            result = runtime ? await runtime.close_clean_with_prune() : null;
+          }
           break;
         default:
           throw new Error(`Unknown standalone worker command: ${cmd}`);
       }
       self.postMessage({ id, ok: true, result });
     } catch (err) {
+      const e = parseKernelErr(err);
       self.postMessage({
         id,
         ok: false,
-        errno: err?.errno ?? null,
-        message: err?.message ?? String(err),
+        errno: e?.errno ?? null,
+        message: e?.detail ?? e?.message ?? String(err),
       });
     }
   };
@@ -455,35 +818,61 @@ async function runStandaloneOfflineBoot(params) {
 
     const jsCopy = new Uint8Array(clientKernelJsBytes);
     const wasmCopy = new Uint8Array(clientKernelWasmBytes);
-    const bootRes = await rpc.call(
-      'boot',
-      {
-        cowfsDbName,
-        bootProfile,
-        initramfsJson,
-        rootTemplateJson,
-        baseJson,
-        extensionsJson,
-        clientKernelJsBytes: jsCopy,
-        clientKernelWasmBytes: wasmCopy,
-        expectedWasmSha256: expectedWasmSha,
-      },
-      [jsCopy.buffer, wasmCopy.buffer],
-    );
+    const runBootWorker = async profileToBoot => {
+      const jBuf = new Uint8Array(jsCopy);
+      const wBuf = new Uint8Array(wasmCopy);
+      return rpc.call(
+        'boot',
+        {
+          cowfsDbName,
+          bootProfile: profileToBoot,
+          initramfsJson,
+          rootTemplateJson,
+          baseJson,
+          extensionsJson,
+          clientKernelJsBytes: jBuf,
+          clientKernelWasmBytes: wBuf,
+          expectedWasmSha256: expectedWasmSha,
+        },
+        [jBuf.buffer, wBuf.buffer],
+      );
+    };
+
+    // Codex Finding #11: serialize initial first-boot volume provisioning across concurrent tabs
+    // and compare-and-set the minted UUID before exposing the root; losing tabs reopen winner!
+    let bootRes;
+    const needsInitialUuid = Boolean(bootProfile.root?.cow_fs && !bootProfile.root.cow_fs.volume_uuid);
+    if (needsInitialUuid) {
+      bootRes = await profileStore.withProvisionLock(async () => {
+        const freshProfile = await profileStore.load();
+        if (overrideRecovery) freshProfile.recovery = true;
+        const firstRes = await runBootWorker(freshProfile);
+        const mintedUuid = firstRes.status?.mounted_root?.volume_uuid ?? null;
+        if (
+          firstRes.status?.mounted_root?.first_boot_seeded
+          && freshProfile.root?.cow_fs
+          && !freshProfile.root.cow_fs.volume_uuid
+          && mintedUuid
+        ) {
+          const claim = await profileStore.claimVolumeUuid(mintedUuid, { locked: true });
+          if (!claim.won && claim.volumeUuid && claim.volumeUuid !== mintedUuid) {
+            await rpc.call('close_clean_with_prune').catch(() => {});
+            const winnerProfile = structuredClone(claim.profile);
+            if (overrideRecovery) winnerProfile.recovery = true;
+            return rpc.call('reboot_with_profile', { bootProfile: winnerProfile });
+          }
+        }
+        return firstRes;
+      });
+    } else {
+      bootRes = await runBootWorker(bootProfile);
+    }
 
     currentStatus = bootRes.status;
 
-    // Persist first-boot minted volume UUID into local `os-boot-profile-v1` IDB store.
-    if (
-      currentStatus.mounted_root?.first_boot_seeded
-      && bootProfile.root?.cow_fs
-      && !bootProfile.root.cow_fs.volume_uuid
-    ) {
-      await profileStore.setVolumeUuid(currentStatus.mounted_root.volume_uuid);
-    }
-
-    // Mark installed Release v2 generation healthy once Stage 2 reaches ready state.
-    if (currentStatus.stage === 'stage2' && !boot.pinnedGeneration) {
+    // Codex Finding #10: mark installed Release v2 generation healthy strictly for `boot.releaseId`
+    // AND ONLY after PID 1 `/usr/bin/init` writes `/run/os/boot-healthy` (multi-user + user-session).
+    if (bootRes.bootHealthy === true && currentStatus.stage === 'stage2' && !boot.pinnedGeneration) {
       await installer.markBootHealthy(boot.releaseId).catch(() => {});
     }
 
@@ -513,18 +902,19 @@ async function runStandaloneOfflineBoot(params) {
     registerOfflineServiceWorker,
     status: () => rpc.call('status'),
     exec: line => rpc.call('exec', { line }),
-    readFile: async path => new Uint8Array(await rpc.call('read_file', { path })),
-    readText: async path => new TextDecoder('utf-8').decode(new Uint8Array(await rpc.call('read_file', { path }))),
-    writeFile: (path, bytes, mode = 0o644) => {
+    readFile: async (path, opts = {}) => new Uint8Array(await rpc.call('read_file', { path, sudo: Boolean(opts?.sudo) })),
+    readText: async (path, opts = {}) => new TextDecoder('utf-8').decode(new Uint8Array(await rpc.call('read_file', { path, sudo: Boolean(opts?.sudo) }))),
+    writeFile: (path, bytes, mode = 0o644, opts = {}) => {
       const data = typeof bytes === 'string' ? [...new TextEncoder().encode(bytes)] : [...bytes];
-      return rpc.call('write_file', { path, bytes: data, mode });
+      return rpc.call('write_file', { path, bytes: data, mode, sudo: Boolean(opts?.sudo) });
     },
-    mkdir: (path, mode = 0o755) => rpc.call('mkdir', { path, mode }),
-    unlink: path => rpc.call('unlink', { path }),
-    stat: (path, follow = true) => rpc.call('stat', { path, follow }),
+    mkdir: (path, mode = 0o755, opts = {}) => rpc.call('mkdir', { path, mode, sudo: Boolean(opts?.sudo) }),
+    unlink: (path, opts = {}) => rpc.call('unlink', { path, sudo: Boolean(opts?.sudo) }),
+    stat: (path, follow = true, opts = {}) => rpc.call('stat', { path, follow, sudo: Boolean(opts?.sudo) }),
     statfs: path => rpc.call('statfs', { path }),
-    readdir: path => rpc.call('readdir', { path }),
+    readdir: (path, opts = {}) => rpc.call('readdir', { path, sudo: Boolean(opts?.sudo) }),
     syncFs: () => rpc.call('sync_fs'),
+    flushForSuspend: () => rpc.call('flush_for_suspend'),
     snapshot: name => rpc.call('snapshot', { name }),
     runCowfsck: (volumeUuid = null) => rpc.call('run_cowfsck', { volumeUuid }),
     rollbackSnapshot: async snapshotName => {
@@ -552,9 +942,14 @@ async function runStandaloneOfflineBoot(params) {
     },
   };
 
-  window.addEventListener('pagehide', () => {
+  window.addEventListener('pagehide', event => {
     if (!closed) {
-      void rpc.call('close_clean_with_prune').catch(() => {});
+      // Codex Finding #16: preserve mounted root on bfcache suspension (`event.persisted === true`).
+      if (event.persisted) {
+        void rpc.call('flush_for_suspend').catch(() => {});
+      } else {
+        void rpc.call('close_clean_with_prune').catch(() => {});
+      }
     }
   });
 
@@ -585,9 +980,21 @@ if (!IS_WORKER) {
   } else if (params.get('standalone') === '1') {
     void runStandaloneOfflineBoot(params);
   } else {
-    resolveOfflineInstalledRelease()
-      .then(installed => {
-        if (installed) {
+    // Codex Finding #33: check installed generation state (not only readable active manifest!)
+    // so a corrupt active manifest still enters standalone boot and triggers trusted-generation
+    // fallback inside `resolveInstalledForBoot()` instead of dropping into attached-console mode!
+    const checkInstalled = async () => {
+      try {
+        const st = await createOfflineInstaller().getState();
+        if (st && (st.active || st.previous || Object.keys(st.generations ?? {}).length > 0)) {
+          return true;
+        }
+      } catch { /* fall through to quick OPFS check */ }
+      return Boolean(await resolveOfflineInstalledRelease().catch(() => null));
+    };
+    checkInstalled()
+      .then(hasInstalled => {
+        if (hasInstalled) {
           void runStandaloneOfflineBoot(params);
         } else {
           runAttachedConsole(null);

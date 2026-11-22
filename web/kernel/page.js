@@ -7,8 +7,15 @@ globalThis.loaderStats = { compiled: 0 };
 globalThis.addEventListener('os:signal', ({ detail }) => { void kernelCall('deliver_signal', detail).catch(() => {}); });
 globalThis.addEventListener('os:changed', () => { void kernelCall('reconcile').catch(() => {}); });
 globalThis.addEventListener('os:login-changed', () => { void kernelCall('login_refresh').catch(() => {}); });
-globalThis.addEventListener('pagehide', () => {
-  void kernelCall('close_clean_root').catch(() => {});
+globalThis.addEventListener('pagehide', event => {
+  // Preserve the mounted `os-cowfs` root across bfcache suspension (Codex Finding #16):
+  // flush dirty writes without releasing the writer lock or closing the filesystem when
+  // `event.persisted` is true; only close & prune on non-persisted page teardown.
+  if (event.persisted) {
+    void kernelCall('flush_root').catch(() => {});
+  } else {
+    void kernelCall('close_clean_root').catch(() => {});
+  }
   void kernelCall('login_leave').catch(() => {});
   void changeSeat(false).catch(() => {});
 });
@@ -56,6 +63,9 @@ export function bootStatus() {
 }
 export function closeCleanRoot() {
   return kernelCall('close_clean_root');
+}
+export function flushRoot() {
+  return kernelCall('flush_root');
 }
 export function cloudStatus() {
   return kernelCall('cloud_status');

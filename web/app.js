@@ -1,4 +1,4 @@
-import { verifyRelease } from './release.js';
+import { verifyRelease, refreshOnlineTrustRoot } from './release.js';
 import { installSelectMenus } from './select-menu.js';
 import { inspectFaststart } from './faststart.mjs';
 import { uploadFile, Cancelled } from './upload.mjs';
@@ -38,6 +38,8 @@ export const ready = verifyRelease()
     document.title = configuration.branding.name + configuration.branding.subtitle;
     const desc = document.querySelector('meta[name="description"]');
     if (desc) desc.content = configuration.branding.description;
+    // Ratchet online publisher trust asynchronously AFTER boot (Codex Finding #7: Stage 0 stays 0-network).
+    void refreshOnlineTrustRoot().catch(() => {});
   });
 
 const $ = id => document.getElementById(id);
@@ -77,20 +79,53 @@ async function session(path = directory) {
 // Explicit Cloud / Cluster Sign-In (`#57` L3d): authenticates against `/api/cloud-auth/login`,
 // mints scoped `ServiceAuth v2` credentials, mounts optional `/mnt/cloud` and remote devices,
 // and connects `/api/events` WebSocket. NEVER mutates local `/etc/passwd` or local UID!
+let pendingCloudLogout = false;
+
+async function flushPendingCloudSignOut() {
+  let revStatus = null;
+  try {
+    revStatus = await kernelCall('flush_pending_cloud_revocations');
+  } catch { /* retry later when online */ }
+  if (pendingCloudLogout) {
+    try {
+      const res = await fetch('/api/cloud-auth/logout', { method: 'POST' });
+      if (res.ok) pendingCloudLogout = false;
+    } catch { /* stay pending until acknowledged */ }
+  }
+  return {
+    ...(revStatus ?? {}),
+    remote_signed_out: !pendingCloudLogout && Boolean(revStatus?.remote_revoked ?? true),
+    pending_logout: pendingCloudLogout,
+  };
+}
+
+window.addEventListener('online', () => {
+  if (pendingCloudLogout) void flushPendingCloudSignOut();
+});
+
 async function cloudSignIn(username, password, scope) {
+  if (pendingCloudLogout) {
+    await flushPendingCloudSignOut().catch(() => {});
+  }
   const response = await api('/api/cloud-auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username, password }),
   });
   const payload = await response.json();
+  // Codex Finding #23: require authenticated numeric UID from `/api/cloud-auth/login`
+  // so kernel minting verifies subject identity and rejects mid-flight account changes.
+  if (typeof payload?.uid !== 'number' || !Number.isInteger(payload.uid) || payload.uid < 0) {
+    throw new Error('Cloud login response omitted authenticated numeric uid.');
+  }
   const status = await cloudSignInKernel({
     cloudUser: payload.username ?? payload.user ?? username,
-    cloudUid: payload.uid ?? 0,
-    cloudGid: payload.gid ?? 0,
-    cloudGroups: payload.groups ?? [],
+    cloudUid: payload.uid,
+    cloudGid: typeof payload.gid === 'number' && Number.isInteger(payload.gid) ? payload.gid : payload.uid,
+    cloudGroups: Array.isArray(payload.groups) ? payload.groups : [],
     scope: scope ?? { cloud_fs: true, devices: ['archive', 'media', 'present', 'snd'], containers: true, relay: false },
   });
+  pendingCloudLogout = false;
   cloudSignedIn = !!status?.signed_in;
   if (cloudSignedIn) listen();
   window.dispatchEvent(new CustomEvent('os:cloud-changed', { detail: status }));
@@ -99,13 +134,24 @@ async function cloudSignIn(username, password, scope) {
 }
 
 async function cloudSignOut() {
+  // Codex Finding #27: clear local authority immediately, retain pending remote logout &
+  // revocations until server acknowledges, and report completion honestly.
   cloudSignedIn = false;
   stopListening();
   const status = await cloudSignOutKernel();
-  await fetch('/api/cloud-auth/logout', { method: 'POST' }).catch(() => {});
-  window.dispatchEvent(new CustomEvent('os:cloud-changed', { detail: status }));
+  pendingCloudLogout = true;
+  try {
+    const res = await fetch('/api/cloud-auth/logout', { method: 'POST' });
+    if (res.ok) pendingCloudLogout = false;
+  } catch { /* remain pending until retried online */ }
+  const combined = {
+    ...status,
+    remote_signed_out: !pendingCloudLogout && Boolean(status?.remote_revoked ?? true),
+    pending_logout: pendingCloudLogout,
+  };
+  window.dispatchEvent(new CustomEvent('os:cloud-changed', { detail: combined }));
   changed();
-  return status;
+  return combined;
 }
 // The account calls that change this browser's session. The session one replaces ends as it
 // answers, which this page hears of before its own identityChanged: until then, that is not

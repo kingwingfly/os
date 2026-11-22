@@ -213,10 +213,35 @@ async function readLocalPinned(id) {
   }
 }
 
+/**
+ * Explicitly refresh and ratchet the profile-wide monotonic trust root from `/boot/entries`
+ * AFTER Stage 2 boot when online (Codex Finding #7: Stage 0 verification MUST remain 100%
+ * offline with zero network fetches whenever a locally installed release is present).
+ */
+export async function refreshOnlineTrustRoot() {
+  if (globalThis.navigator?.onLine === false) return null;
+  try {
+    const res = await fetch('/boot/entries', { cache: 'no-store' });
+    if (res.status === 503) {
+      throw new Error('Release publisher is not trusted.');
+    }
+    if (!res.ok) return null;
+    const liveEntries = await res.json();
+    if (liveEntries.format !== 'os.boot' || liveEntries.version !== 2 || liveEntries.protocol !== 2 || liveEntries.schema !== 10) {
+      throw new Error('The authority is incompatible with this release.');
+    }
+    return await ratchetProfileTrust(liveEntries.trust, liveEntries.min_release_seq);
+  } catch (err) {
+    if (err?.message === 'Release publisher is not trusted.' || err?.message === 'The authority is incompatible with this release.' || err?.message === 'Publisher key identifier mismatch.') {
+      throw err;
+    }
+    return null;
+  }
+}
+
 let checking;
 export function verifyRelease(options = {}) {
   if (releaseId === 'legacy') return Promise.resolve();
-  const offlineFirst = Boolean(options?.offlineFirst) || globalThis.navigator?.onLine === false;
   return checking ??= (async () => {
     let entries = null;
     let bytes;
@@ -226,43 +251,20 @@ export function verifyRelease(options = {}) {
 
     if (local) {
       ({ bytes, signature } = local);
-      // Zero outbound fetch when offline-first or browser is offline; otherwise check `/boot/entries`
-      // online so newly published key revocations ratchet into profile-wide `trustRoot`.
-      if (!offlineFirst) {
-        try {
-          const res = await fetch('/boot/entries', { cache: 'no-store' });
-          if (res.status === 503) {
-            throw new Error('Release publisher is not trusted.');
-          }
-          if (res.ok) {
-            const liveEntries = await res.json();
-            if (liveEntries.format !== 'os.boot' || liveEntries.version !== 2 || liveEntries.protocol !== 2 || liveEntries.schema !== 10) {
-              throw new Error('The authority is incompatible with this release.');
-            }
-            const ratcheted = await ratchetProfileTrust(liveEntries.trust, liveEntries.min_release_seq);
-            if (ratcheted) profileRoot = ratcheted;
-            entries = { ...liveEntries, trust: mergeMonotonicTrust(profileRoot, liveEntries.trust) };
-          }
-        } catch (err) {
-          if (err?.message === 'Release publisher is not trusted.' || err?.message === 'The authority is incompatible with this release.' || err?.message === 'Publisher key identifier mismatch.') {
-            throw err;
-          }
-          // Offline fallback: verify strictly against profile-wide monotonic trustRoot (never frozen per-release trust.json).
-        }
+      // Stage 0 verification of a locally installed Release v2 is strictly zero-network
+      // (Codex Finding #7): verify solely against the profile-wide monotonic `trustRoot`.
+      // Online trust refresh runs explicitly post-boot via `refreshOnlineTrustRoot()`.
+      if (!profileRoot) {
+        throw new Error('Release publisher is not trusted.');
       }
-      if (!entries) {
-        if (!profileRoot) {
-          throw new Error('Release publisher is not trusted.');
-        }
-        entries = {
-          format: 'os.boot',
-          version: 2,
-          protocol: 2,
-          schema: 10,
-          default: releaseId,
-          trust: { keys: { ...(profileRoot.keys ?? {}) }, revoked: [...(profileRoot.revoked ?? [])] },
-        };
-      }
+      entries = {
+        format: 'os.boot',
+        version: 2,
+        protocol: 2,
+        schema: 10,
+        default: releaseId,
+        trust: { keys: { ...(profileRoot.keys ?? {}) }, revoked: [...(profileRoot.revoked ?? [])] },
+      };
     } else {
       const get = async path => { const response = await fetch(path, { cache: 'no-store' }); if (!response.ok) throw new Error('The release is unavailable. Open recovery.'); return response; };
       entries = await (await get('/boot/entries')).json();

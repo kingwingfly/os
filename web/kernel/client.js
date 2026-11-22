@@ -35,6 +35,10 @@ let localInitJob = null;
 let localInitAbort = false;
 let localInitRunId = 0;
 let localInitPromise = null;
+let bootedOfflineReleaseId = null;
+let bootedOfflinePinned = false;
+let bootHealthMarked = false;
+let bootOptsCached = null;
 // This instance's unique local identifier (never shared across tabs).
 const kernelId = self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 // Each port's host: an identity of its own, made here, and the tab it first said it was.
@@ -227,15 +231,41 @@ async function releaseLocalInitOwner() {
   } catch { /* already released or rebooted */ }
 }
 
-async function markOfflineReleaseBootHealthyIfPending() {
-  try {
-    const { createOfflineInstaller } = await import(asset('/offline-installer.js'));
-    const installer = createOfflineInstaller();
-    const state = await installer.getState();
-    if (state?.active && !state.activeBootVerified) {
-      await installer.markBootHealthy(state.active);
+async function waitForPid1BootHealthyAndMark(runId) {
+  if (!bootedOfflineReleaseId || bootedOfflinePinned || bootHealthMarked || !kernel) return;
+  const targetReleaseId = bootedOfflineReleaseId;
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    if (runId !== localInitRunId || localInitAbort || !localInitRunning || !kernel) return;
+    try {
+      await kernel.proc_statat(1, 0x7ffffffe, '/run/os/boot-healthy', true);
+      if (runId !== localInitRunId || localInitAbort || !localInitRunning) return;
+      if (bootedOfflineReleaseId !== targetReleaseId || bootHealthMarked) return;
+      const { createOfflineInstaller } = await import(asset('/offline-installer.js'));
+      const installer = createOfflineInstaller();
+      // Codex Finding #10: bind health acknowledgement strictly to the boot attempt's own
+      // release ID, and ONLY after PID 1 writes `/run/os/boot-healthy` (multi-user + user-session active).
+      await installer.markBootHealthy(targetReleaseId);
+      bootHealthMarked = true;
+      return;
+    } catch {
+      await new Promise(r => setTimeout(r, 40));
     }
-  } catch { /* no offline Release v2 pending or IDB unavailable */ }
+  }
+}
+
+async function driveCloudOnlineTarget(action) {
+  if (!globalThis.crossOriginIsolated || localInitState !== 'running' || !kernel) return;
+  try {
+    const { exec } = await import(asset('/executor-host.js'));
+    await Promise.race([
+      exec([['/usr/bin/service', action, 'cloud-online.target']], {
+        stdin: '',
+        sudo: true,
+      }).catch(() => {}),
+      new Promise(r => setTimeout(r, 3000)),
+    ]);
+  } catch { /* fallback to direct kernel mount/detach already applied */ }
 }
 
 async function launchLocalInit() {
@@ -295,9 +325,10 @@ async function launchLocalInit() {
       localInitOwner = owner;
       broadcastInitStatus();
       if (!globalThis.crossOriginIsolated) {
+        // Codex Finding #10: when cross-origin isolation prevents PID 1 from executing,
+        // never mark an offline Release v2 generation healthy!
         localInitState = 'running';
         broadcastInitStatus();
-        void markOfflineReleaseBootHealthyIfPending();
         return;
       }
       const { exec } = await import(asset('/executor-host.js'));
@@ -317,7 +348,7 @@ async function launchLocalInit() {
           if (job.pids.includes(1)) {
             localInitState = 'running';
             broadcastInitStatus();
-            void markOfflineReleaseBootHealthyIfPending();
+            void waitForPid1BootHealthyAndMark(runId);
           }
         },
         onOutput: (fd, text) => {
@@ -337,8 +368,53 @@ async function launchLocalInit() {
         await releaseLocalInitOwner();
         localInitState = 'stopped';
         broadcastInitStatus();
-        // Ordered shutdown completed cleanly: flush & close `os-cowfs` root volume.
-        try { await kernel.close_clean_root(); } catch { /* best-effort */ }
+        // Ordered shutdown completed cleanly: flush & close `os-cowfs` root volume (Codex #15 & #21).
+        let closed = null;
+        try {
+          closed = JSON.parse(await kernel.close_clean_root());
+        } catch (closeErr) {
+          localInitError = `clean root close failed: ${closeErr?.message ?? String(closeErr)}`;
+          localInitState = 'failed';
+          broadcastInitStatus();
+          return;
+        }
+        if (closed?.shutdown?.clean === false) {
+          localInitError = 'PID 1 reported unclean shutdown / unmount failure';
+          localInitState = 'failed';
+          broadcastInitStatus();
+          return;
+        }
+        // Honor `service reboot` cleanly after durable root close (Codex Finding #21).
+        if (closed?.shutdown?.mode === 'reboot') {
+          try {
+            const inspected = JSON.parse(await kernel.machine_init_action(JSON.stringify({ op: 'inspect' }), kernelId));
+            // Remount root fresh and reset boot generation before relaunching PID 1.
+            await kernel.boot_vfs(bootOptsCached ? JSON.stringify(bootOptsCached) : undefined);
+            const prof = bootProfileStore ? await bootProfileStore.load().catch(() => null) : null;
+            if (cowfsStore) {
+              await kernel.boot_cowfs_root(
+                cowfsStore,
+                prof ? JSON.stringify(prof) : undefined,
+                bootOptsCached ? JSON.stringify(bootOptsCached) : undefined,
+              );
+            }
+            const rebooted = JSON.parse(await kernel.machine_init_action(
+              JSON.stringify({ op: 'reboot', boot: inspected.boot }),
+              kernelId,
+            ));
+            localInitView = rebooted;
+            const executor = await import(asset('/executor-host.js'));
+            void executor.reconcile().catch(() => {});
+            await login?.reset?.();
+            localInitFailures = 0;
+            localInitError = '';
+            void launchLocalInit();
+          } catch (rbErr) {
+            localInitError = `reboot after clean close failed: ${rbErr?.message ?? String(rbErr)}`;
+            localInitState = 'failed';
+            broadcastInitStatus();
+          }
+        }
         return;
       }
       await releaseLocalInitOwner();
@@ -379,29 +455,106 @@ function boot() {
   starting ??= wasm_bindgen(asset('/client_kernel_bg.wasm')).then(async () => {
     self.wasm_bindgen = wasm_bindgen;
     kernel = new wasm_bindgen.Kernel('', kernelId);
-    const bootOpts = buildAssetSizesOption();
+    const bootOpts = { ...(buildAssetSizesOption() ?? {}) };
     bootProfileStore = createBootProfileStore();
     cowfsStore = createCowfsStore();
     let bootRes = null;
-    try {
-      const profile = await bootProfileStore.load().catch(() => null);
-      const raw = await kernel.boot_cowfs_root(
-        cowfsStore,
-        profile ? JSON.stringify(profile) : undefined,
-        bootOpts ? JSON.stringify(bootOpts) : undefined,
-      );
-      bootRes = JSON.parse(raw);
-      const nextUuid = bootRes?.boot_profile?.root?.cow_fs?.volume_uuid ?? null;
-      const prevUuid = profile?.root?.cow_fs?.volume_uuid ?? null;
-      if (bootRes?.boot_profile && nextUuid && nextUuid !== prevUuid) {
-        await bootProfileStore.save(bootRes.boot_profile).catch(() => {});
+    const hasIdb = typeof indexedDB !== 'undefined';
+
+    if (!hasIdb) {
+      // Headless Node / non-browser harness without IndexedDB: keep Stage 1 tmpfs + `/usr`.
+      bootOptsCached = Object.keys(bootOpts).length > 0 ? bootOpts : null;
+      if (bootOptsCached) {
+        await kernel.boot_vfs(JSON.stringify(bootOptsCached));
       }
-    } catch (err) {
-      const e = failure(err);
-      if (e?.errno === 'EPROTONOSUPPORT') throw err;
-      // Headless / non-OPFS fallback keeps Stage 1 local tmpfs + Stage 2 `/usr` operational.
-      if (bootOpts) {
-        await kernel.boot_vfs(JSON.stringify(bootOpts));
+    } else {
+      try {
+        // Codex Finding #11: NEVER swallow profile I/O errors as empty profiles; serialize
+        // initial provisioning so concurrent first boots elect one default root UUID.
+        let profile = await bootProfileStore.load();
+
+        // Codex Finding #7: when a verified local Release v2 is installed in this profile,
+        // feed its exact `root_template` and `base + sysext + confext` composition into boot
+        // and bind health acknowledgement strictly to that resolved `releaseId` (Codex #10).
+        bootedOfflineReleaseId = null;
+        bootedOfflinePinned = false;
+        bootHealthMarked = false;
+        try {
+          const { createOfflineInstaller } = await import(asset('/offline-installer.js'));
+          const installer = createOfflineInstaller();
+          const st = await installer.getState();
+          if (st && (st.active || st.previous || (profile?.generation && st.generations?.[profile.generation]))) {
+            const resolved = await installer.resolveInstalledForBoot({
+              generation: profile?.generation ?? null,
+              verifyAllBlobs: false,
+              verifyCache: false,
+            });
+            bootedOfflineReleaseId = resolved.releaseId;
+            bootedOfflinePinned = Boolean(resolved.pinnedGeneration);
+            if (resolved.images?.root_template) {
+              bootOpts.rootTemplate = JSON.stringify(resolved.images.root_template);
+            }
+            if (resolved.images?.base) {
+              bootOpts.baseImage = JSON.stringify(resolved.images.base);
+              bootOpts.extensionImages = [
+                ...(resolved.images.sysext ?? []),
+                ...(resolved.images.confext ?? []),
+              ].map(img => JSON.stringify(img));
+            }
+          }
+        } catch (relErr) {
+          // Only enter recovery if an installed release existed and failed verification;
+          // no installed release simply boots standard dev assets.
+          if (relErr?.message && !relErr.message.includes('No offline Release v2')) {
+            throw relErr;
+          }
+        }
+
+        bootOptsCached = Object.keys(bootOpts).length > 0 ? bootOpts : null;
+        const optsJson = bootOptsCached ? JSON.stringify(bootOptsCached) : undefined;
+
+        const runBoot = async currentProfile => {
+          const raw = await kernel.boot_cowfs_root(
+            cowfsStore,
+            currentProfile ? JSON.stringify(currentProfile) : undefined,
+            optsJson,
+          );
+          return JSON.parse(raw);
+        };
+
+        const needsFirstUuid = Boolean(profile?.root?.cow_fs && !profile.root.cow_fs.volume_uuid);
+        if (needsFirstUuid) {
+          bootRes = await bootProfileStore.withProvisionLock(async () => {
+            const freshProfile = await bootProfileStore.load();
+            const res = await runBoot(freshProfile);
+            const mintedUuid = res?.boot_profile?.root?.cow_fs?.volume_uuid ?? null;
+            if (mintedUuid && !freshProfile?.root?.cow_fs?.volume_uuid && res?.stage !== 'stage1_recovery') {
+              const claim = await bootProfileStore.claimVolumeUuid(mintedUuid, { locked: true });
+              if (!claim.won && claim.volumeUuid && claim.volumeUuid !== mintedUuid) {
+                // Another tab won first-boot provisioning: close our unexposed volume & reopen winner.
+                await kernel.close_clean_root().catch(() => {});
+                await kernel.boot_vfs(optsJson);
+                return runBoot(claim.profile);
+              }
+            }
+            return res;
+          });
+        } else {
+          bootRes = await runBoot(profile);
+        }
+      } catch (err) {
+        const e = failure(err);
+        if (e?.errno === 'EPROTONOSUPPORT') throw err;
+        // Codex Findings #8 & #11: NEVER silently fall back to launching init on tmpfs when
+        // CowFS / profile / release boot fails in a browser with IndexedDB! Stay in recovery.
+        bootRes = {
+          stage: 'stage1_recovery',
+          recovery: {
+            reason: { kind: 'io_error', errno: e?.errno ?? 'EIO', detail: e?.detail ?? String(err) },
+            message: `Boot failed and entered Stage 1 recovery: ${e?.detail ?? err?.message ?? String(err)}`,
+            available_snapshots: [],
+          },
+        };
       }
     }
     await restoreSeatPolicyForAccount();
@@ -530,15 +683,29 @@ async function dispatch(message, host, tab, internal = false) {
       return JSON.parse(raw);
     }
     case 'close_clean_root': return JSON.parse(await kernel.close_clean_root());
+    case 'flush_root': return JSON.parse(await kernel.flush_root());
+    case 'flush_pending_cloud_revocations': return JSON.parse(await kernel.flush_pending_cloud_revocations());
     case 'cloud_status': return JSON.parse(kernel.cloud_status());
-    case 'cloud_sign_in': return JSON.parse(await kernel.cloud_sign_in(
-      String(args.cloudUser ?? ''),
-      Number(args.cloudUid ?? 0),
-      Number(args.cloudGid ?? 0),
-      JSON.stringify(args.cloudGroups ?? []),
-      args.scope != null ? (typeof args.scope === 'string' ? args.scope : JSON.stringify(args.scope)) : undefined,
-    ));
-    case 'cloud_sign_out': return JSON.parse(await kernel.cloud_sign_out());
+    case 'cloud_sign_in': {
+      const res = JSON.parse(await kernel.cloud_sign_in(
+        String(args.cloudUser ?? ''),
+        Number(args.cloudUid ?? 0),
+        Number(args.cloudGid ?? 0),
+        JSON.stringify(args.cloudGroups ?? []),
+        args.scope != null ? (typeof args.scope === 'string' ? args.scope : JSON.stringify(args.scope)) : undefined,
+      ));
+      // Codex Finding #27: drive `cloud-online.target` activation through PID 1 when running.
+      if (res?.signed_in) {
+        await driveCloudOnlineTarget('start');
+      }
+      return res;
+    }
+    case 'cloud_sign_out': {
+      // Codex Finding #27: drive `cloud-online.target` teardown through PID 1, then immediately
+      // clear local kernel authority & queue/flush remote revocations.
+      await driveCloudOnlineTarget('stop');
+      return JSON.parse(await kernel.cloud_sign_out());
+    }
     case 'revoke_cloud_tokens_only': return JSON.parse(await kernel.revoke_cloud_tokens_only());
     case 'machine_init_status': return currentInitStatus();
     case 'machine_init_leave': {
@@ -565,13 +732,25 @@ async function dispatch(message, host, tab, internal = false) {
       return currentInitStatus();
     }
     case 'machine_reboot': {
+      // Codex Finding #21: authorize UID 0 + active boot identity BEFORE mutating abort flags,
+      // advancing run ID, or signalling PID 1 so rejected requests have ZERO side effects!
+      kernel.authorize_machine_reboot(String(args.boot ?? ''));
       localInitAbort = true;
       localInitRunId++;
-      localInitJob?.signal(9);
-      localInitJob = null;
+      // Prefer ordered PID 1 teardown (`SIGTERM`) with short grace before `SIGKILL`.
+      if (localInitJob) {
+        const job = localInitJob;
+        localInitJob = null;
+        job.signal(15);
+        const prevWait = localInitPromise;
+        if (prevWait) {
+          await Promise.race([prevWait.catch(() => {}), new Promise(r => setTimeout(r, 1000))]);
+        }
+        job.signal(9);
+      }
       localInitOwner = null;
       const prev = localInitPromise;
-      if (prev) await Promise.race([prev.catch(() => {}), new Promise(r => setTimeout(r, 2000))]);
+      if (prev) await Promise.race([prev.catch(() => {}), new Promise(r => setTimeout(r, 1500))]);
       const value = JSON.parse(await kernel.machine_init_action(
         JSON.stringify({ op: 'reboot', boot: args.boot }),
         kernelId,
@@ -633,7 +812,7 @@ async function dispatch(message, host, tab, internal = false) {
     }
     case 'login_service_signal': return login.control('signal', { pid: args.pid, signal: args.signal }, args.expected);
     case 'reserve_memory': kernel.reserve_memory(args.pid, BigInt(args.bytes ?? 0), host); return null;
-    case 'getcreds_proc': return JSON.parse(kernel.getcreds_proc(args.pid, host));
+    case 'getcreds_proc': return JSON.parse(await kernel.getcreds_proc(args.pid, host));
     case 'set_proc_cred': return JSON.parse(await kernel.set_proc_cred(args.pid, args.uid, args.gid ?? args.uid, new Uint32Array(args.groups ?? []), args.remote != null ? JSON.stringify(args.remote) : undefined, host));
     case 'attach_remote_device': return JSON.parse(await kernel.attach_remote_device(args.driver, args.pid ?? undefined, host));
     case 'detach_remote_device': kernel.detach_remote_device(args.driver); return null;
@@ -825,7 +1004,8 @@ const isConcurrentCall = type => (
   (type.startsWith('login_') && type !== 'login_service_attach') ||
   type.startsWith('machine_init_') ||
   [
-    'boot_vfs', 'boot_status', 'revoke_cloud_tokens_only',
+    'boot_vfs', 'boot_status', 'flush_root', 'flush_pending_cloud_revocations',
+    'revoke_cloud_tokens_only',
     'set_active_session', 'mount_user', 'unmount_user',
     'revoke_mount_provider', 'lose_mount_provider', 'export_provider',
     'list_mounts', 'take_local_exec_bytes', 'release_exec_ticket',

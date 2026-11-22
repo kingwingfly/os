@@ -78,31 +78,6 @@ pub(crate) fn now_secs() -> u64 {
     }
 }
 
-/// Wall clock in milliseconds (used for sub-second host-wait grace before PID 1 wildcard reap).
-pub(crate) fn now_ms() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let ms = js_sys::Date::now();
-        if ms.is_finite() && ms > 0.0 {
-            ms.floor() as u64
-        } else {
-            0
-        }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
-            .unwrap_or(1_700_000_000_000)
-    }
-}
-
-/// Grace window (ms) during which wildcard PID 1 `waitpid(-1, WNOHANG)` yields to an immediate
-/// host `wait(pid)` for processes that exited directly under `ppid == 1`. Already-zombie orphans
-/// reparented when their parent exited are NOT placed in this map and are reaped immediately.
-const INIT_WILDCARD_REAP_GRACE_MS: u64 = 500;
-
 /// Generate a 32-byte (64-hex-char) high-entropy local secret (e.g. `host_proof` or random id).
 pub(crate) fn random_hex(bytes_len: usize) -> String {
     let mut buf = vec![0u8; bytes_len];
@@ -296,7 +271,7 @@ pub(crate) async fn lazy_mint_remote_cred(
     state: &Rc<RefCell<State>>,
     pid: u32,
 ) -> std::result::Result<RemoteCredRef, Error> {
-    let (existing, cloud_allowed, cgroup, io_at_mint, proc_uid, cloud_session) = {
+    let (existing, cloud_allowed, cgroup, io_at_mint, proc_uid, scope_cap, cloud_session) = {
         let s = state.borrow();
         let proc = s
             .table
@@ -310,6 +285,7 @@ pub(crate) async fn lazy_mint_remote_cred(
             proc.cgroup.clone(),
             io,
             proc.cred.identity.id,
+            proc.cred.allowed_remote_scope.clone(),
             s.cloud_session.clone(),
         )
     };
@@ -334,6 +310,16 @@ pub(crate) async fn lazy_mint_remote_cred(
     if !cloud_allowed {
         return Err(Errno::EACCES.into());
     }
+    let effective_scope = match &scope_cap {
+        Some(cap) => kernel::proc_table::intersect_remote_scope(&cs.scope, cap),
+        None => cs.scope.clone(),
+    };
+    if !effective_scope.cloud_fs {
+        return Err(Error::because(
+            Errno::EACCES,
+            "service cloud_scope does not permit CloudFs access",
+        ));
+    }
     if proc_uid == os_core::permissions::GUEST || proc_uid != cs.local_uid {
         return Err(Error::because(
             Errno::EACCES,
@@ -344,8 +330,8 @@ pub(crate) async fn lazy_mint_remote_cred(
     let resp = service_auth_request(&auth_v2::Request::MintServiceCred(MintServiceCred {
         instance_id: instance_id.clone(),
         host_proof: host_proof.clone(),
-        scope: cs.scope.clone(),
-        cloud_access: cs.scope.cloud_fs,
+        scope: effective_scope.clone(),
+        cloud_access: effective_scope.cloud_fs,
         umask: 0o022,
         cgroup: Some(cgroup.clone()),
         generation: None,
@@ -379,13 +365,15 @@ pub(crate) async fn lazy_mint_remote_cred(
     // Re-check process & cloud session state after awaiting `MintServiceCred` so a concurrent
     // privilege drop, cloud sign-out, or process exit mid-await can never be overwritten.
     let rebind_result = {
-        let mut s = state.borrow_mut();
-        if s.cloud_session
-            .as_ref()
-            .is_none_or(|cur| cur.cloud_uid != cs.cloud_uid)
-        {
-            Err(Errno::ENOTCONN)
-        } else {
+            let mut s = state.borrow_mut();
+            if s.cloud_session.as_ref().is_none_or(|cur| {
+                cur.cloud_uid != cs.cloud_uid
+                    || cur.local_uid != s.account.uid
+                    || cur.login_generation != s.account_epoch
+                    || cur.revoked
+            }) {
+                Err(Errno::ENOTCONN)
+            } else {
             let current_proc = s
                 .table
                 .proc(pid)
@@ -519,6 +507,21 @@ pub(crate) struct CloudSession {
 }
 
 impl LocalAccount {
+    /// Fail-closed unprivileged signed-out account installed whenever local `/etc/passwd`
+    /// resolution fails during boot (Codex Finding #24 — NEVER synthesize UID 1000 `wheel`).
+    pub(crate) fn signed_out_nobody() -> Self {
+        Self {
+            uid: 65534,
+            gid: 65534,
+            groups: vec![65534],
+            user: "nobody".into(),
+            group: "nogroup".into(),
+            home: "/nonexistent".into(),
+            shell: "/sbin/nologin".into(),
+            signed_in: false,
+        }
+    }
+
     pub(crate) fn identity(&self) -> Identity {
         let mut groups: BTreeSet<u32> = self.groups.iter().copied().collect();
         groups.insert(self.gid);
@@ -558,6 +561,7 @@ pub(crate) struct State {
     pub(crate) cloud_session: Option<CloudSession>,
     pub(crate) sudo_timestamps: BTreeMap<(u32, u32), u64>,
     pub(crate) remote_attached: bool,
+    pub(crate) pending_detach: bool,
     pub(crate) host_epoch: u64,
     pub(crate) pending_revocations: Vec<String>,
     pub(crate) attached_devices: BTreeMap<String, String>,
@@ -567,7 +571,6 @@ pub(crate) struct State {
     pub(crate) seat_policies: BTreeMap<u32, (String, u64)>,
     pub(crate) boot_seq: u64,
     pub(crate) session_seq: u64,
-    pub(crate) init_wait_grace_until_ms: BTreeMap<u32, u64>,
 }
 
 impl State {
@@ -859,6 +862,7 @@ impl Kernel {
             cloud_session: None,
             sudo_timestamps: BTreeMap::new(),
             remote_attached: false,
+            pending_detach: false,
             host_epoch: 0,
             pending_revocations: Vec::new(),
             attached_devices: BTreeMap::new(),
@@ -868,7 +872,6 @@ impl Kernel {
             seat_policies: BTreeMap::new(),
             boot_seq: 1,
             session_seq: 1,
-            init_wait_grace_until_ms: BTreeMap::new(),
         }));
         let connector = cloudfs::Connector::default();
         let vfs_rt = RefCell::new(vfs_engine::VfsRuntime::new_sync(
@@ -956,6 +959,25 @@ impl Kernel {
         .to_string())
     }
 
+    /// Authorize a reboot request (UID 0 + active boot ID match) WITHOUT mutating any state or
+    /// tearing down PID 1, so unauthorized or stale reboot attempts have zero side effects.
+    pub fn authorize_machine_reboot(&self, boot: &str) -> Result<(), JsValue> {
+        let state = self.state.borrow();
+        if state.account.uid != 0 {
+            return Err(fail(Error::because(
+                Errno::EPERM,
+                "only root may reboot the instance",
+            )));
+        }
+        if boot.is_empty() || state.init_state.boot != boot {
+            return Err(fail(Error::because(
+                Errno::ESTALE,
+                "machine boot generation has changed",
+            )));
+        }
+        Ok(())
+    }
+
     /// Local `MachineInit` state-machine action (`inspect`, `claim`, `renew`, `release`, `reboot`).
     /// Runs 100% locally (ZERO network RPCs; `reboot` revokes remote tokens if any are live).
     pub async fn machine_init_action(
@@ -997,6 +1019,9 @@ impl Kernel {
                 .init_state
                 .apply(&action, &proof_hash, now)
                 .map_err(fail)?;
+            if matches!(action, InitAction::Release { .. }) {
+                state.table.detach_init_host();
+            }
             if let InitAction::Start { token, .. } = &action {
                 state.init_state.start(&sha256_hex(token)).map_err(fail)?;
             }
@@ -1779,11 +1804,6 @@ impl Kernel {
                     startup.observed_exit();
                 }
             }
-            if out.ppid == INIT {
-                state
-                    .init_wait_grace_until_ms
-                    .insert(pid, now_ms().saturating_add(INIT_WILDCARD_REAP_GRACE_MS));
-            }
             out
         };
         self.cloud_exited(pid, token_before).await;
@@ -1793,13 +1813,12 @@ impl Kernel {
             }
         }
         revoke_remote_tokens_state(&self.state, outcome.revoked_tokens).await;
-        Ok(json!({ "ppid": outcome.ppid }).to_string())
+        Ok(json!({ "ppid": outcome.ppid, "host_reap": outcome.host_reap }).to_string())
     }
 
     /// Reap an ended direct child of PID 1 (ZERO network RPCs).
     pub async fn wait(&self, pid: u32, host: &str) -> Result<String, JsValue> {
         let mut state = self.state.borrow_mut();
-        state.init_wait_grace_until_ms.remove(&pid);
         let cred = state.account.identity();
         let reaped = state
             .table
@@ -2000,15 +2019,39 @@ impl Kernel {
             let _ = state.table.set_tty(host, INIT, 0, Vec::new());
         }
         let _ = self.proc_set_creds(INIT, 0, 0, vec![0], None, false);
-        Ok(json!({
+        let init_path = {
+            let (stage, vfs) = {
+                let rt = self.vfs_rt.borrow();
+                (rt.boot_stage, rt.vfs.clone())
+            };
+            if stage == boot_stage::BootStage::Stage1
+                && vfs
+                    .statat(INIT, vfs::StartAnchor::Root, "/init", true)
+                    .await
+                    .is_ok_and(|st| st.kind() == abi::S_IFREG && (st.mode & 0o111) != 0)
+            {
+                "/init"
+            } else {
+                "/usr/bin/init"
+            }
+        };
+        let init_image = self
+            .resolve_init_exec(init_path)
+            .await
+            .map_err(|e| fail(Error::from(e)))?;
+        let mut reply = json!({
             "pid": INIT,
             "ppid": 0,
             "token": "",
-            "asset": "/usr/bin/init.wasm",
-            "path": "/usr/bin/init",
+            "path": init_path,
             "membership": { "pid": INIT, "ppid": 0, "pgid": INIT, "sid": INIT, "uid": 0, "ctty": 0 }
-        })
-        .to_string())
+        });
+        if let (Some(dst), Some(src)) = (reply.as_object_mut(), init_image.as_object()) {
+            for (k, v) in src {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+        Ok(reply.to_string())
     }
 
     /// Reconcile local processes owned by `host` and acknowledge delivered signals (ZERO network RPCs).
@@ -2047,16 +2090,43 @@ impl Kernel {
     }
 
     /// Return a hosted process's local credential snapshot (ZERO network RPCs).
-    pub fn getcreds_proc(&self, pid: u32, host: &str) -> Result<String, JsValue> {
-        let state = self.state.borrow();
-        let proc = state
-            .table
-            .proc(pid)
-            .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
-            .ok_or_else(|| fail(Errno::ESRCH.into()))?;
+    /// Return a local process's effective credentials using authoritative local `/etc/sudoers`
+    /// and `(uid, sid)` timestamp evaluation (ZERO network RPCs).
+    pub async fn getcreds_proc(&self, pid: u32, host: &str) -> Result<String, JsValue> {
+        let (uid, gid, groups, cloud_access, has_remote, default_home, default_shell, signed_in) = {
+            let state = self.state.borrow();
+            let proc = state
+                .table
+                .proc(pid)
+                .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+                .ok_or_else(|| fail(Errno::ESRCH.into()))?;
+            (
+                proc.cred.identity.id,
+                proc.cred.identity.group,
+                proc.cred.identity.groups.iter().copied().collect::<Vec<u32>>(),
+                proc.cred.cloud_access,
+                proc.cred.remote.is_some(),
+                if proc.cred.identity.id == 0 {
+                    "/root".to_string()
+                } else {
+                    state.account.home.clone()
+                },
+                state.account.shell.clone(),
+                state.account.signed_in,
+            )
+        };
+        let vfs = self.vfs_rt.borrow().vfs.clone();
+        if let Ok(mut val) = self
+            .eval_local_account_call(&vfs, pid, None, false, Call::Getcreds)
+            .await
+            && let Some(obj) = val.as_object_mut()
+        {
+            obj.insert("shell".into(), json!(default_shell));
+            obj.insert("cloud_access".into(), json!(cloud_access));
+            obj.insert("has_remote".into(), json!(has_remote));
+            return Ok(val.to_string());
+        }
         let rt = self.vfs_rt.borrow();
-        let uid = proc.cred.identity.id;
-        let gid = proc.cred.identity.group;
         let user = rt.uid_names.get(&uid).cloned().unwrap_or_else(|| {
             if uid == 0 {
                 "root".into()
@@ -2075,7 +2145,6 @@ impl Kernel {
                 gid.to_string()
             }
         });
-        let groups: Vec<u32> = proc.cred.identity.groups.iter().copied().collect();
         let group_names: Vec<String> = groups
             .iter()
             .map(|&g| {
@@ -2090,7 +2159,6 @@ impl Kernel {
                 })
             })
             .collect();
-        let can_sudo = uid == 0 || groups.contains(&0) || group_names.iter().any(|n| n == "wheel");
         Ok(json!({
             "uid": uid,
             "gid": gid,
@@ -2098,13 +2166,13 @@ impl Kernel {
             "user": user,
             "group": group,
             "group_names": group_names,
-            "home": if uid == 0 { "/root" } else { state.account.home.as_str() },
-            "shell": state.account.shell,
-            "signed_in": state.account.signed_in,
-            "can_sudo": can_sudo,
+            "home": default_home,
+            "shell": default_shell,
+            "signed_in": signed_in,
+            "can_sudo": uid == 0,
             "sudo_active": uid == 0,
-            "cloud_access": proc.cred.cloud_access,
-            "has_remote": proc.cred.remote.is_some(),
+            "cloud_access": cloud_access,
+            "has_remote": has_remote,
         })
         .to_string())
     }
@@ -2354,7 +2422,7 @@ impl Kernel {
             Some(s) if !s.is_empty() && s != "null" => parse(s, "remote scope")?,
             _ => RemoteScope::full(),
         };
-        let (cgroup, io_at_mint, proc_uid, cs) = {
+        let (cgroup, io_at_mint, proc_uid, scope_cap, cs) = {
             let state = self.state.borrow();
             let cs = state.cloud_session.clone().ok_or_else(|| {
                 fail(Error::because(
@@ -2388,18 +2456,25 @@ impl Kernel {
                 )));
             }
             let io = state.table.cgroups().effective_io_limit(&proc.cgroup);
-            (proc.cgroup.clone(), io, proc.cred.identity.id, cs)
+            (
+                proc.cgroup.clone(),
+                io,
+                proc.cred.identity.id,
+                proc.cred.allowed_remote_scope.clone(),
+                cs,
+            )
         };
-        let effective_scope = RemoteScope {
-            cloud_fs: requested_scope.cloud_fs && cs.scope.cloud_fs,
-            devices: requested_scope
-                .devices
-                .into_iter()
-                .filter(|d| cs.scope.allows_device(d))
-                .collect(),
-            containers: requested_scope.containers && cs.scope.containers,
-            relay: requested_scope.relay && cs.scope.relay,
+        let session_capped = kernel::proc_table::intersect_remote_scope(&requested_scope, &cs.scope);
+        let effective_scope = match &scope_cap {
+            Some(cap) => kernel::proc_table::intersect_remote_scope(&session_capped, cap),
+            None => session_capped,
         };
+        if effective_scope.is_empty() {
+            return Err(fail(Error::because(
+                Errno::EACCES,
+                "service cloud_scope forbids requested remote access",
+            )));
+        }
         let (instance_id, host_proof) = ensure_remote_attached_state(&self.state)
             .await
             .map_err(fail)?;
@@ -2522,15 +2597,26 @@ impl Kernel {
             return Err(fail(Errno::ENODEV.into()));
         }
         let scope_label = if let Some(p) = pid {
-            let existing = {
+            let (existing, scope_cap) = {
                 let state = self.state.borrow();
                 let proc = state
                     .table
                     .proc(p)
                     .filter(|pr| pr.state != ProcState::Zombie && pr.owner_host == host)
                     .ok_or_else(|| fail(Errno::ESRCH.into()))?;
-                proc.cred.remote.clone()
+                (
+                    proc.cred.remote.clone(),
+                    proc.cred.allowed_remote_scope.clone(),
+                )
             };
+            if let Some(ref cap) = scope_cap
+                && !cap.allows_device(driver)
+            {
+                return Err(fail(Error::because(
+                    Errno::EACCES,
+                    format!("service cloud_scope does not permit /dev/{driver}"),
+                )));
+            }
             let rem = existing.ok_or_else(|| {
                 fail(Error::because(
                     Errno::EACCES,
@@ -2936,22 +3022,10 @@ impl Kernel {
                 options,
             } => {
                 let mut state = self.state.borrow_mut();
-                let outcome = if pid == INIT && selector == -1 {
-                    let now_m = now_ms();
-                    let s = &mut *state;
-                    s.init_wait_grace_until_ms.retain(|_, until| *until > now_m);
-                    let grace = &s.init_wait_grace_until_ms;
-                    s.table
-                        .waitpid_excluding(host, pid, selector, options, |cpid| {
-                            grace.contains_key(&cpid)
-                        })?
-                } else {
-                    state.table.waitpid(host, pid, selector, options)?
-                };
+                let outcome = state.table.waitpid(host, pid, selector, options)?;
                 match outcome {
                     WaitOutcome::Reaped(proc) => {
                         state.proc_account_epoch.remove(&proc.pid);
-                        state.init_wait_grace_until_ms.remove(&proc.pid);
                         if pid == INIT {
                             state.init_state.reaped();
                         }
@@ -3347,6 +3421,7 @@ impl Kernel {
                         umask: 0o022,
                         remote: None,
                         cloud_access: cloud_allowed,
+                        allowed_remote_scope: None,
                     }),
                     Ok(false) => Err(Error::because(
                         Errno::EPERM,
@@ -3425,6 +3500,7 @@ impl Kernel {
                     umask: 0o022,
                     remote: None,
                     cloud_access: cloud_allowed,
+                    allowed_remote_scope: None,
                 })
             };
 
@@ -3781,6 +3857,7 @@ mod tests {
             cloud_session: None,
             sudo_timestamps: std::collections::BTreeMap::new(),
             remote_attached: false,
+            pending_detach: false,
             host_epoch: 0,
             pending_revocations: Vec::new(),
             attached_devices: std::collections::BTreeMap::new(),
@@ -3795,7 +3872,6 @@ mod tests {
             seat_policies: std::collections::BTreeMap::new(),
             boot_seq: 1,
             session_seq: 1,
-            init_wait_grace_until_ms: std::collections::BTreeMap::new(),
         };
         let session_guest = os_core::permissions::GUEST_UID_MIN + 42;
         // Must ignore root/non-guest UIDs.

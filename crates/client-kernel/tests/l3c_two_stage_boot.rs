@@ -852,13 +852,37 @@ fn b02_first_boot_seeds_root_template_and_persists_across_cold_reboot() {
     assert_eq!(shadow_st.mode & 0o7777, 0o600);
     assert_eq!((shadow_st.uid, shadow_st.gid), (0, 0));
 
+    // Codex Finding #2: Stage 2 console runs as a separate non-PID-1 login process (`uid 1000`)
+    // on a local PTY (`/dev/pts/0`), NOT PID 1! Root-only reads/writes MUST fail `EACCES` without sudo.
+    let console_proc = boot1
+        .console_proc_snapshot()
+        .expect("Stage 2 must spawn separate non-PID-1 console login process");
+    assert_ne!(console_proc.pid, 1);
+    assert_eq!(console_proc.ppid, 1);
+    assert_eq!(console_proc.uid, 1000);
+    assert_eq!(console_proc.gid, 1000);
+    assert_eq!(console_proc.user, "user");
+    assert_eq!(console_proc.tty.as_deref(), Some("/dev/pts/0"));
+    assert_eq!(
+        vfs::now_or_never(boot1.read_file("/etc/shadow")).unwrap(),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        vfs::now_or_never(boot1.read_file("/etc/sudoers")).unwrap(),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        vfs::now_or_never(boot1.write_file("/etc/motd", b"denied\n", 0o644)).unwrap(),
+        Err(Errno::EACCES)
+    );
+
     let sudoers_st = vfs::now_or_never(boot1.stat("/etc/sudoers", false))
         .unwrap()
         .unwrap();
     assert_eq!(sudoers_st.mode & 0o7777, 0o440);
     assert_eq!((sudoers_st.uid, sudoers_st.gid), (0, 0));
     let sudoers_body = String::from_utf8(
-        vfs::now_or_never(boot1.read_file("/etc/sudoers"))
+        vfs::now_or_never(boot1.read_file_sudo("/etc/sudoers"))
             .unwrap()
             .unwrap(),
     )
@@ -905,8 +929,8 @@ fn b02_first_boot_seeds_root_template_and_persists_across_cold_reboot() {
     assert!(dev_entries.iter().any(|e| e == "vd0"));
     assert!(dev_entries.iter().any(|e| e == "null"));
 
-    // Write user & config files, sync, and cleanly shut down.
-    vfs::now_or_never(boot1.write_file("/etc/motd", b"welcome offline\n", 0o644))
+    // Write user & config files (sudo for root-owned `/etc/motd`), sync, and cleanly shut down.
+    vfs::now_or_never(boot1.write_file_sudo("/etc/motd", b"welcome offline\n", 0o644))
         .unwrap()
         .unwrap();
     vfs::now_or_never(boot1.write_file("/home/user/notes.txt", b"persisted note\n", 0o644))
@@ -1575,6 +1599,160 @@ fn b08_switch_root_refuses_misuse_before_moving_mounts_and_respects_st_dev() {
     );
 
     let _ = vfs::now_or_never(boot.close_clean_with_prune())
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn codex_24_and_32_ephemeral_snapshot_roots_and_missing_default_user_fail_closed() {
+    let (release, blobs) = synthetic_release();
+    let head = Rc::new(TestHeadStore::new());
+    let pack = Rc::new(TestPackStore::new());
+    let (_tick, clk) = fixed_clock(1_735_006_000);
+
+    // 1. Codex #32: `RootSpec::Ephemeral` boots tmpfs root populated from `RootTemplate` with 0 CowFS volumes.
+    let mut eph = vfs::now_or_never(TwoStageBoot::new_cowfs_root(
+        "inst-eph",
+        BootProfile {
+            version: BOOT_PROFILE_VERSION,
+            root: RootSpec::Ephemeral,
+            default_user: "user".to_string(),
+            generation: None,
+            recovery: false,
+        },
+        release.clone(),
+        Rc::clone(&head),
+        Rc::clone(&pack),
+        blobs.clone(),
+        Rc::clone(&clk),
+        || panic!("ephemeral root must not allocate a cowfs volume"),
+    ))
+    .unwrap()
+    .unwrap();
+    assert_eq!(eph.stage(), BootStage::Stage2);
+    assert_eq!(eph.mounted_root().unwrap().fstype, "tmpfs");
+    assert_eq!(
+        vfs::now_or_never(eph.statfs("/")).unwrap().unwrap().f_type,
+        fs_magic::TMPFS_MAGIC
+    );
+    assert_eq!(
+        vfs::now_or_never(eph.read_file("/etc/shadow")).unwrap(),
+        Err(Errno::EACCES)
+    );
+    let _ = vfs::now_or_never(eph.close_clean_with_prune())
+        .unwrap()
+        .unwrap();
+
+    // 2. Codex #32 & #16: Seed a volume, flush_for_suspend keeps root open & writable,
+    //    take snapshot `"ro-snap"`, then boot `RootSpec::Snapshot` read-only!
+    let mut base_boot = vfs::now_or_never(TwoStageBoot::new_cowfs_root(
+        "inst-snap-seed",
+        BootProfile::default(),
+        release.clone(),
+        Rc::clone(&head),
+        Rc::clone(&pack),
+        blobs.clone(),
+        Rc::clone(&clk),
+        || "vol-snap-base".to_string(),
+    ))
+    .unwrap()
+    .unwrap();
+    vfs::now_or_never(base_boot.write_file("/home/user/from-snap.txt", b"snap-ok\n", 0o644))
+        .unwrap()
+        .unwrap();
+    // Codex #16: `flush_for_suspend` commits dirty writes WITHOUT closing the root!
+    let flushed = vfs::now_or_never(base_boot.flush_for_suspend())
+        .unwrap()
+        .unwrap()
+        .expect("dirty root must flush on suspend");
+    assert!(flushed.epoch > 1);
+    // Subsequent write MUST still succeed (NOT EBADF)!
+    vfs::now_or_never(base_boot.write_file("/home/user/after-suspend.txt", b"still-open\n", 0o644))
+        .unwrap()
+        .unwrap();
+    vfs::now_or_never(base_boot.sync_fs()).unwrap().unwrap();
+    vfs::now_or_never(base_boot.create_snapshot("ro-snap"))
+        .unwrap()
+        .unwrap();
+
+    // Codex #24: Delete `user` from `/etc/passwd` on the volume, sync, and reboot ->
+    // MUST enter `Stage1Recovery(AccountResolutionFailed)` instead of synthesizing UID 1000 `wheel`!
+    vfs::now_or_never(base_boot.write_file_sudo(
+        "/etc/passwd",
+        b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n",
+        0o644,
+    ))
+    .unwrap()
+    .unwrap();
+    vfs::now_or_never(base_boot.sync_fs()).unwrap().unwrap();
+    let _ = vfs::now_or_never(base_boot.close_clean_with_prune())
+        .unwrap()
+        .unwrap();
+    drop(base_boot);
+
+    let missing_user_boot = vfs::now_or_never(TwoStageBoot::new_cowfs_root(
+        "inst-missing-user",
+        BootProfile {
+            version: BOOT_PROFILE_VERSION,
+            root: RootSpec::CowFs {
+                volume_uuid: Some("vol-snap-base".to_string()),
+                writer_mode: BootWriterMode::ForkOnBusy,
+            },
+            default_user: "user".to_string(),
+            generation: None,
+            recovery: false,
+        },
+        release.clone(),
+        Rc::clone(&head),
+        Rc::clone(&pack),
+        blobs.clone(),
+        Rc::clone(&clk),
+        || panic!("must not format"),
+    ))
+    .unwrap()
+    .unwrap();
+    assert_eq!(missing_user_boot.stage(), BootStage::Stage1Recovery);
+    match &missing_user_boot.recovery().unwrap().reason {
+        RecoveryReason::AccountResolutionFailed { default_user, .. } => {
+            assert_eq!(default_user, "user");
+        }
+        other => panic!("expected AccountResolutionFailed, got {other:?}"),
+    }
+
+    // Booting `"ro-snap"` (taken BEFORE `user` was deleted) via `RootSpec::Snapshot` succeeds RO!
+    let mut snap_boot = vfs::now_or_never(TwoStageBoot::new_cowfs_root(
+        "inst-ro-snap",
+        BootProfile {
+            version: BOOT_PROFILE_VERSION,
+            root: RootSpec::Snapshot {
+                volume_uuid: "vol-snap-base".to_string(),
+                snapshot: "ro-snap".to_string(),
+            },
+            default_user: "user".to_string(),
+            generation: None,
+            recovery: false,
+        },
+        release,
+        Rc::clone(&head),
+        Rc::clone(&pack),
+        blobs,
+        clk,
+        || panic!("snapshot root must not format"),
+    ))
+    .unwrap()
+    .unwrap();
+    assert_eq!(snap_boot.stage(), BootStage::Stage2);
+    assert_eq!(
+        vfs::now_or_never(snap_boot.read_file("/home/user/from-snap.txt"))
+            .unwrap()
+            .unwrap(),
+        b"snap-ok\n"
+    );
+    assert_eq!(
+        vfs::now_or_never(snap_boot.write_file("/home/user/denied.txt", b"x", 0o644)).unwrap(),
+        Err(Errno::EROFS)
+    );
+    let _ = vfs::now_or_never(snap_boot.close_clean_with_prune())
         .unwrap()
         .unwrap();
 }
