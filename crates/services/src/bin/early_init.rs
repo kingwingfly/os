@@ -26,9 +26,10 @@ pub const MOUNTED_ROOT_PATH: &str = "/run/os/root";
 pub const STAGE2_INIT_PATH: &str = "/usr/bin/init";
 pub const RECOVERY_SHELL_PATH: &str = "/bin/sh";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BootWriterMode {
+    #[default]
     ForkOnBusy,
     Exclusive,
 }
@@ -38,9 +39,17 @@ pub enum BootWriterMode {
 pub enum RootSpec {
     CowFs {
         volume_uuid: Option<String>,
+        #[serde(default)]
         writer_mode: BootWriterMode,
     },
+    Snapshot {
+        volume_uuid: String,
+        #[serde(alias = "snapshot_name")]
+        snapshot: String,
+    },
+    Ephemeral,
     CloudOptIn {
+        #[serde(default)]
         subpath: Option<String>,
     },
 }
@@ -205,6 +214,75 @@ impl EarlyInitBackend for OsEarlyInitBackend {
     }
 }
 
+fn probe_mount_home_subvol(
+    backend: &mut impl EarlyInitBackend,
+    source: &str,
+    flags: u64,
+    data: &str,
+) -> io::Result<bool> {
+    match backend.mount(
+        Some(source),
+        "/sysroot/home",
+        Some("cowfs"),
+        flags,
+        Some(data),
+    ) {
+        Ok(()) => Ok(true),
+        Err(err)
+            if matches!(
+                os_posix::errno_of(&err),
+                Some(Errno::ENOENT | Errno::EOPNOTSUPP | Errno::ENOSYS)
+            ) || matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn verify_volume_with_cowfsck(
+    backend: &mut impl EarlyInitBackend,
+    uuid: &str,
+) -> Option<EarlyBootOutcome> {
+    let target = format!("volume:{uuid}");
+    match backend.run_cowfsck(&target) {
+        Ok(0) => None,
+        Ok(4) => {
+            let reason = format!(
+                "cowfsck detected corruption on volume {uuid}; refusing to mount (use cowfsck --rollback <snapshot> or recovery shell)"
+            );
+            backend.log(&format!("os: {reason}"));
+            let _ = backend.enter_recovery(&reason);
+            Some(EarlyBootOutcome::Recovery {
+                reason,
+                errno: Some(Errno::EIO),
+            })
+        }
+        Ok(code) => {
+            let reason = format!(
+                "cowfsck failed on volume {uuid} (exit {code}, possible EPROTONOSUPPORT format mismatch); refusing to format or wipe user data"
+            );
+            backend.log(&format!("os: {reason}"));
+            let _ = backend.enter_recovery(&reason);
+            Some(EarlyBootOutcome::Recovery {
+                reason,
+                errno: Some(Errno::EPROTONOSUPPORT),
+            })
+        }
+        Err(err) => {
+            let errno = os_posix::errno_of(&err);
+            let reason =
+                format!("cowfsck error on volume {uuid}: {err}; preserving user volume untouched");
+            backend.log(&format!("os: {reason}"));
+            let _ = backend.enter_recovery(&reason);
+            Some(EarlyBootOutcome::Recovery { reason, errno })
+        }
+    }
+}
+
 pub fn run_early_init(backend: &mut impl EarlyInitBackend) -> io::Result<EarlyBootOutcome> {
     let pid = backend.getpid()?;
     if pid != 1 {
@@ -239,49 +317,18 @@ pub fn run_early_init(backend: &mut impl EarlyInitBackend) -> io::Result<EarlyBo
         });
     }
 
-    // Step 2: Resolve root spec, check format version & integrity via `cowfsck`, and mount `/sysroot`.
+    // Step 2: Resolve root spec, check format version & integrity via `cowfsck`, and mount `/sysroot`
+    // (plus `@home` at `/sysroot/home` when present on a CowFS root or snapshot).
     let root_info = match &profile.root {
         RootSpec::CowFs {
             volume_uuid,
             writer_mode,
         } => {
             // Existing volume: ALWAYS run pre-mount `cowfsck` before mounting rw!
-            if let Some(uuid) = volume_uuid {
-                let target = format!("volume:{uuid}");
-                match backend.run_cowfsck(&target) {
-                    Ok(0) => {}
-                    Ok(4) => {
-                        let reason = format!(
-                            "cowfsck detected corruption on volume {uuid}; refusing to mount (use cowfsck --rollback <snapshot> or recovery shell)"
-                        );
-                        backend.log(&format!("os: {reason}"));
-                        let _ = backend.enter_recovery(&reason);
-                        return Ok(EarlyBootOutcome::Recovery {
-                            reason,
-                            errno: Some(Errno::EIO),
-                        });
-                    }
-                    Ok(code) => {
-                        let reason = format!(
-                            "cowfsck failed on volume {uuid} (exit {code}, possible EPROTONOSUPPORT format mismatch); refusing to format or wipe user data"
-                        );
-                        backend.log(&format!("os: {reason}"));
-                        let _ = backend.enter_recovery(&reason);
-                        return Ok(EarlyBootOutcome::Recovery {
-                            reason,
-                            errno: Some(Errno::EPROTONOSUPPORT),
-                        });
-                    }
-                    Err(err) => {
-                        let errno = os_posix::errno_of(&err);
-                        let reason = format!(
-                            "cowfsck error on volume {uuid}: {err}; preserving user volume untouched"
-                        );
-                        backend.log(&format!("os: {reason}"));
-                        let _ = backend.enter_recovery(&reason);
-                        return Ok(EarlyBootOutcome::Recovery { reason, errno });
-                    }
-                }
+            if let Some(uuid) = volume_uuid
+                && let Some(recovery) = verify_volume_with_cowfsck(backend, uuid)
+            {
+                return Ok(recovery);
             }
 
             let source = match volume_uuid {
@@ -312,7 +359,7 @@ pub fn run_early_init(backend: &mut impl EarlyInitBackend) -> io::Result<EarlyBo
 
             // If kernel already populated `/run/os/root` (e.g. with ForkOnBusy fork metadata),
             // preserve it and emit the non-blocking fork banner if booted on a fork.
-            if let Ok(existing) = backend.read_file(MOUNTED_ROOT_PATH)
+            let info = if let Ok(existing) = backend.read_file(MOUNTED_ROOT_PATH)
                 && let Ok(parsed) = serde_json::from_str::<MountedRootInfo>(&existing)
             {
                 if let (Some(fork_uuid), Some(_parent)) = (&parsed.volume_uuid, &parsed.forked_from)
@@ -335,6 +382,116 @@ pub fn run_early_init(backend: &mut impl EarlyInitBackend) -> io::Result<EarlyBo
                         BootWriterMode::Exclusive => "exclusive".into(),
                     },
                     first_boot_seeded: volume_uuid.is_none(),
+                    mounted_at: 0,
+                }
+            };
+
+            let home_source = info
+                .volume_uuid
+                .as_deref()
+                .map(|u| format!("volume:{u}"))
+                .unwrap_or(source);
+            if let Err(err) = probe_mount_home_subvol(backend, &home_source, 0, "subvol=@home") {
+                let errno = os_posix::errno_of(&err);
+                let reason = format!("failed to mount @home subvolume at /sysroot/home: {err}");
+                backend.log(&format!("os: {reason}"));
+                let _ = backend.enter_recovery(&reason);
+                return Ok(EarlyBootOutcome::Recovery { reason, errno });
+            }
+            info
+        }
+        RootSpec::Snapshot {
+            volume_uuid,
+            snapshot,
+        } => {
+            if volume_uuid.is_empty()
+                || snapshot.is_empty()
+                || volume_uuid.contains('/')
+                || volume_uuid.contains('\0')
+                || snapshot.contains('/')
+                || snapshot.contains('\0')
+                || snapshot.contains('@')
+            {
+                let reason = "invalid snapshot root specification in boot profile".to_string();
+                backend.log(&format!("os: {reason}"));
+                let _ = backend.enter_recovery(&reason);
+                return Ok(EarlyBootOutcome::Recovery {
+                    reason,
+                    errno: Some(Errno::EINVAL),
+                });
+            }
+            if let Some(recovery) = verify_volume_with_cowfsck(backend, volume_uuid) {
+                return Ok(recovery);
+            }
+            let source = format!("snapshot:{volume_uuid}@{snapshot}");
+            if let Err(err) = backend.mount(
+                Some(&source),
+                "/sysroot",
+                Some("cowfs"),
+                mount_flags::MS_RDONLY,
+                Some("subvol=@,ro"),
+            ) {
+                let errno = os_posix::errno_of(&err);
+                let reason = format!("failed to mount snapshot root {source} at /sysroot: {err}");
+                backend.log(&format!("os: {reason}"));
+                let _ = backend.enter_recovery(&reason);
+                return Ok(EarlyBootOutcome::Recovery { reason, errno });
+            }
+            if let Err(err) =
+                probe_mount_home_subvol(backend, &source, mount_flags::MS_RDONLY, "subvol=@home,ro")
+            {
+                let errno = os_posix::errno_of(&err);
+                let reason = format!(
+                    "failed to mount snapshot @home subvolume {source} at /sysroot/home: {err}"
+                );
+                backend.log(&format!("os: {reason}"));
+                let _ = backend.enter_recovery(&reason);
+                return Ok(EarlyBootOutcome::Recovery { reason, errno });
+            }
+            if let Ok(existing) = backend.read_file(MOUNTED_ROOT_PATH)
+                && let Ok(parsed) = serde_json::from_str::<MountedRootInfo>(&existing)
+            {
+                parsed
+            } else {
+                MountedRootInfo {
+                    fstype: "cowfs".into(),
+                    volume_uuid: Some(volume_uuid.clone()),
+                    forked_from: Some(format!("{volume_uuid}@{snapshot}")),
+                    base_epoch: 0,
+                    ephemeral_if_unmodified: false,
+                    writer_mode: "snapshot_ro".into(),
+                    first_boot_seeded: false,
+                    mounted_at: 0,
+                }
+            }
+        }
+        RootSpec::Ephemeral => {
+            if let Err(err) = backend.mount(
+                Some("ephemeral"),
+                "/sysroot",
+                Some("tmpfs"),
+                0,
+                Some("mode=0755"),
+            ) {
+                let errno = os_posix::errno_of(&err);
+                let reason = format!("failed to mount ephemeral tmpfs root at /sysroot: {err}");
+                backend.log(&format!("os: {reason}"));
+                let _ = backend.enter_recovery(&reason);
+                return Ok(EarlyBootOutcome::Recovery { reason, errno });
+            }
+            if let Ok(existing) = backend.read_file(MOUNTED_ROOT_PATH)
+                && let Ok(parsed) = serde_json::from_str::<MountedRootInfo>(&existing)
+            {
+                parsed
+            } else {
+                MountedRootInfo {
+                    fstype: "tmpfs".into(),
+                    volume_uuid: None,
+                    forked_from: None,
+                    base_epoch: 0,
+                    ephemeral_if_unmodified: true,
+                    writer_mode: "ephemeral".into(),
+                    first_boot_seeded: true,
                     mounted_at: 0,
                 }
             }
@@ -365,20 +522,32 @@ pub fn run_early_init(backend: &mut impl EarlyInitBackend) -> io::Result<EarlyBo
     let root_json = serde_json::to_string_pretty(&root_info).map_err(io::Error::other)?;
     backend.write_file(MOUNTED_ROOT_PATH, &root_json, 0o444)?;
 
-    backend.mount(
+    if let Err(err) = backend.mount(
         Some("release-v2"),
         "/sysroot/usr",
         Some("image"),
         mount_flags::MS_RDONLY | mount_flags::MS_NODEV,
         None,
-    )?;
-    backend.mount(
+    ) {
+        let errno = os_posix::errno_of(&err);
+        let reason = format!("failed to mount Stage 2 /sysroot/usr: {err}");
+        backend.log(&format!("os: {reason}"));
+        let _ = backend.enter_recovery(&reason);
+        return Ok(EarlyBootOutcome::Recovery { reason, errno });
+    }
+    if let Err(err) = backend.mount(
         Some("tmpfs"),
         "/sysroot/tmp",
         Some("tmpfs"),
         mount_flags::MS_NOSUID | mount_flags::MS_NODEV,
         Some("mode=1777"),
-    )?;
+    ) {
+        let errno = os_posix::errno_of(&err);
+        let reason = format!("failed to mount Stage 2 /sysroot/tmp: {err}");
+        backend.log(&format!("os: {reason}"));
+        let _ = backend.enter_recovery(&reason);
+        return Ok(EarlyBootOutcome::Recovery { reason, errno });
+    }
 
     // Step 4: Transfer PID 1 to Stage 2 via `switch_root`.
     if let Err(err) = backend.exec_switch_root("/sysroot", STAGE2_INIT_PATH) {
@@ -411,7 +580,9 @@ mod tests {
         pid: u32,
         files: BTreeMap<String, String>,
         cowfsck_code: i32,
+        cowfsck_targets: Vec<String>,
         mount_fail_errno: Option<Errno>,
+        home_subvol_errno: Option<Errno>,
         mounts: Vec<(String, String, u64, Option<String>)>,
         logs: Vec<String>,
         switched: Option<(String, String)>,
@@ -429,7 +600,9 @@ mod tests {
                 pid: 1,
                 files,
                 cowfsck_code: 0,
+                cowfsck_targets: Vec::new(),
                 mount_fail_errno: None,
+                home_subvol_errno: Some(Errno::ENOENT),
                 mounts: Vec::new(),
                 logs: Vec::new(),
                 switched: None,
@@ -452,7 +625,8 @@ mod tests {
             self.files.insert(path.to_string(), content.to_string());
             Ok(())
         }
-        fn run_cowfsck(&mut self, _target: &str) -> io::Result<i32> {
+        fn run_cowfsck(&mut self, target: &str) -> io::Result<i32> {
+            self.cowfsck_targets.push(target.to_string());
             Ok(self.cowfsck_code)
         }
         fn mount(
@@ -465,6 +639,13 @@ mod tests {
         ) -> io::Result<()> {
             if target == "/sysroot"
                 && let Some(errno) = self.mount_fail_errno
+            {
+                return Err(io::Error::other(os_posix::OsCallError(abi::Error::new(
+                    errno,
+                ))));
+            }
+            if target == "/sysroot/home"
+                && let Some(errno) = self.home_subvol_errno
             {
                 return Err(io::Error::other(os_posix::OsCallError(abi::Error::new(
                     errno,
@@ -636,5 +817,129 @@ mod tests {
             "expected O(1) fork banner in logs: {:?}",
             mock.logs
         );
+    }
+
+    #[test]
+    fn early_init_mounts_at_home_subvolume_when_present_and_recovers_on_home_io_error() {
+        let profile = BootProfile {
+            root: RootSpec::CowFs {
+                volume_uuid: Some("vol-with-home".into()),
+                writer_mode: BootWriterMode::ForkOnBusy,
+            },
+            ..BootProfile::default()
+        };
+        let mut mock = MockEarlyInit::new(&profile);
+        mock.home_subvol_errno = None; // `@home` exists!
+        let outcome = run_early_init(&mut mock).unwrap();
+        assert_eq!(
+            outcome,
+            EarlyBootOutcome::SwitchedToStage2 {
+                init: STAGE2_INIT_PATH.into()
+            }
+        );
+        assert_eq!(mock.mounts.len(), 4);
+        assert_eq!(mock.mounts[0].1, "/sysroot");
+        assert_eq!(mock.mounts[0].3.as_deref(), Some("subvol=@"));
+        assert_eq!(mock.mounts[1].0, "cowfs:volume:vol-with-home");
+        assert_eq!(mock.mounts[1].1, "/sysroot/home");
+        assert_eq!(mock.mounts[1].3.as_deref(), Some("subvol=@home"));
+        assert_eq!(mock.mounts[2].1, "/sysroot/usr");
+        assert_eq!(mock.mounts[3].1, "/sysroot/tmp");
+
+        // EOPNOTSUPP on `@home` is ignored cleanly (volume without `@home`).
+        let mut no_home = MockEarlyInit::new(&profile);
+        no_home.home_subvol_errno = Some(Errno::EOPNOTSUPP);
+        assert_eq!(
+            run_early_init(&mut no_home).unwrap(),
+            EarlyBootOutcome::SwitchedToStage2 {
+                init: STAGE2_INIT_PATH.into()
+            }
+        );
+        assert_eq!(no_home.mounts.len(), 3);
+
+        // Real EIO on `@home` enters Stage 1 recovery instead of exposing underlying `/home`.
+        let mut io_err = MockEarlyInit::new(&profile);
+        io_err.home_subvol_errno = Some(Errno::EIO);
+        assert!(matches!(
+            run_early_init(&mut io_err).unwrap(),
+            EarlyBootOutcome::Recovery {
+                errno: Some(Errno::EIO),
+                ..
+            }
+        ));
+        assert!(io_err.switched.is_none());
+    }
+
+    #[test]
+    fn early_init_supports_snapshot_and_ephemeral_root_specs() {
+        // 1. Snapshot root (deserializes both `snapshot` and `snapshot_name` JSON keys).
+        let snap_json = r#"{
+            "version": 1,
+            "root": { "snapshot": { "volume_uuid": "vol-1", "snapshot": "snap-good" } },
+            "default_user": "user",
+            "generation": null,
+            "recovery": false
+        }"#;
+        let snap_profile: BootProfile = serde_json::from_str(snap_json).unwrap();
+        let snap_alias: BootProfile = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "root": { "snapshot": { "volume_uuid": "vol-1", "snapshot_name": "snap-good" } },
+                "default_user": "user",
+                "generation": null,
+                "recovery": false
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(snap_profile, snap_alias);
+
+        let mut snap_mock = MockEarlyInit::new(&snap_profile);
+        snap_mock.home_subvol_errno = None;
+        let out = run_early_init(&mut snap_mock).unwrap();
+        assert_eq!(
+            out,
+            EarlyBootOutcome::SwitchedToStage2 {
+                init: STAGE2_INIT_PATH.into()
+            }
+        );
+        assert_eq!(snap_mock.cowfsck_targets, vec!["volume:vol-1"]);
+        assert_eq!(snap_mock.mounts[0].0, "cowfs:snapshot:vol-1@snap-good");
+        assert_eq!(snap_mock.mounts[0].1, "/sysroot");
+        assert_eq!(snap_mock.mounts[0].2, mount_flags::MS_RDONLY);
+        assert_eq!(snap_mock.mounts[0].3.as_deref(), Some("subvol=@,ro"));
+        assert_eq!(snap_mock.mounts[1].0, "cowfs:snapshot:vol-1@snap-good");
+        assert_eq!(snap_mock.mounts[1].1, "/sysroot/home");
+        assert_eq!(snap_mock.mounts[1].2, mount_flags::MS_RDONLY);
+        assert_eq!(snap_mock.mounts[1].3.as_deref(), Some("subvol=@home,ro"));
+
+        // 2. Ephemeral root (deserializes `"ephemeral"`, skips cowfsck, mounts tmpfs at `/sysroot`).
+        let eph_profile: BootProfile = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "root": "ephemeral",
+                "default_user": "user",
+                "generation": null,
+                "recovery": false
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(eph_profile.root, RootSpec::Ephemeral);
+        let mut eph_mock = MockEarlyInit::new(&eph_profile);
+        let out = run_early_init(&mut eph_mock).unwrap();
+        assert_eq!(
+            out,
+            EarlyBootOutcome::SwitchedToStage2 {
+                init: STAGE2_INIT_PATH.into()
+            }
+        );
+        assert!(eph_mock.cowfsck_targets.is_empty());
+        assert_eq!(eph_mock.mounts[0].0, "tmpfs:ephemeral");
+        assert_eq!(eph_mock.mounts[0].1, "/sysroot");
+        assert_eq!(eph_mock.mounts[1].1, "/sysroot/usr");
+        assert_eq!(eph_mock.mounts[2].1, "/sysroot/tmp");
+        let root_info: MountedRootInfo =
+            serde_json::from_str(eph_mock.files.get(MOUNTED_ROOT_PATH).unwrap()).unwrap();
+        assert_eq!(root_info.fstype, "tmpfs");
+        assert!(root_info.ephemeral_if_unmodified);
     }
 }

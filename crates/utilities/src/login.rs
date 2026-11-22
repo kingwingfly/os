@@ -62,7 +62,8 @@ pub trait LoginBackend {
     fn getcreds(&mut self) -> Result<Creds, abi::Error>;
     fn read_passwd(&mut self) -> Result<String, abi::Error>;
     fn prompt(&mut self, prompt: &str) -> Result<String, String>;
-    fn login(&mut self, username: &str, password: &str) -> Result<(), abi::Error>;
+    fn prompt_password(&mut self, prompt: &str) -> Result<String, String>;
+    fn login(&mut self, username: &str, password: &str, force: bool) -> Result<(), abi::Error>;
     fn chdir(&mut self, path: &str) -> io::Result<()>;
     fn execvp(&mut self, prog: &str, argv: &[String]) -> Result<(), io::Error>;
 }
@@ -99,11 +100,15 @@ impl LoginBackend for OsLoginBackend {
         Ok(line)
     }
 
-    fn login(&mut self, username: &str, password: &str) -> Result<(), abi::Error> {
+    fn prompt_password(&mut self, prompt: &str) -> Result<String, String> {
+        crate::prompt_password(prompt)
+    }
+
+    fn login(&mut self, username: &str, password: &str, force: bool) -> Result<(), abi::Error> {
         let mut reply = os_posix::batch(&[Call::Login {
             username: username.to_owned(),
             password: password.to_owned(),
-            force: false,
+            force,
         }])
         .map_err(|e| abi::Error::because(Errno::EIO, e.to_string()))?;
         reply.results.remove(0).into_result().map(|_| ())
@@ -157,16 +162,17 @@ pub fn run_with(
         },
     };
 
-    let password = if opts.force_no_auth && creds.uid == 0 {
+    let force = opts.force_no_auth && creds.uid == 0;
+    let password = if force {
         String::new()
     } else {
-        match backend.prompt("Password: ") {
+        match backend.prompt_password("Password: ") {
             Ok(pw) => pw,
             Err(err) => return (None, Some(format!("login: {err}")), 1),
         }
     };
 
-    if let Err(err) = backend.login(&username, &password) {
+    if let Err(err) = backend.login(&username, &password, force) {
         return (None, Some(format!("login: {err}")), 1);
     }
 
@@ -213,6 +219,7 @@ mod tests {
         uid: u32,
         passwd: String,
         answers: VecDeque<String>,
+        login_err: Option<Errno>,
         steps: Vec<String>,
     }
 
@@ -233,8 +240,17 @@ mod tests {
             self.answers.pop_front().ok_or_else(|| "eof".to_owned())
         }
 
-        fn login(&mut self, username: &str, password: &str) -> Result<(), abi::Error> {
-            self.steps.push(format!("login:{username}:{password}"));
+        fn prompt_password(&mut self, prompt: &str) -> Result<String, String> {
+            self.steps.push(format!("prompt_pw:{prompt}"));
+            self.answers.pop_front().ok_or_else(|| "eof".to_owned())
+        }
+
+        fn login(&mut self, username: &str, password: &str, force: bool) -> Result<(), abi::Error> {
+            self.steps
+                .push(format!("login:{username}:{password}:force={force}"));
+            if let Some(errno) = self.login_err {
+                return Err(errno.into());
+            }
             Ok(())
         }
 
@@ -259,6 +275,7 @@ mod tests {
             uid: 1000,
             passwd: "user:x:1000:1000:Local User:/home/user:/bin/sh\n".into(),
             answers: VecDeque::from(["user".into(), "pw".into()]),
+            login_err: None,
             steps: Vec::new(),
         };
         assert_eq!(run_with(&s(&["-f", "root"]), &mut non_root).2, 1);
@@ -269,8 +286,48 @@ mod tests {
             non_root.steps,
             vec![
                 "prompt:login: ",
-                "prompt:Password: ",
-                "login:user:pw",
+                "prompt_pw:Password: ",
+                "login:user:pw:force=false",
+                "chdir:/home/user",
+                "exec:/bin/sh:/bin/sh -l",
+            ]
+        );
+    }
+
+    #[test]
+    fn root_launched_ordinary_login_sets_force_false_and_only_dash_f_sets_force_true() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:User:/home/user:/bin/sh\n";
+
+        // Ordinary `login root` launched by UID 0 MUST prompt and pass `force=false` (Finding #3).
+        let mut root_ordinary = MockLogin {
+            uid: 0,
+            passwd: passwd.into(),
+            answers: VecDeque::from(["wrong-pw".into()]),
+            login_err: Some(Errno::EACCES),
+            steps: Vec::new(),
+        };
+        let (_, err, code) = run_with(&s(&["root"]), &mut root_ordinary);
+        assert_eq!(code, 1);
+        assert!(err.is_some());
+        assert_eq!(
+            root_ordinary.steps,
+            vec!["prompt_pw:Password: ", "login:root:wrong-pw:force=false"]
+        );
+
+        // `login -f user` launched by UID 0 skips password prompt and passes `force=true`.
+        let mut root_forced = MockLogin {
+            uid: 0,
+            passwd: passwd.into(),
+            answers: VecDeque::new(),
+            login_err: None,
+            steps: Vec::new(),
+        };
+        let (_, err, code) = run_with(&s(&["-f", "user"]), &mut root_forced);
+        assert_eq!((err, code), (None, 0));
+        assert_eq!(
+            root_forced.steps,
+            vec![
+                "login:user::force=true",
                 "chdir:/home/user",
                 "exec:/bin/sh:/bin/sh -l",
             ]

@@ -196,32 +196,18 @@ pub fn tree(root: &Path, kind: Kind, name: &str, revision: &str, out: &Path) -> 
 }
 /// Resolve the Stage 1 `early_init` Wasm binary for `Initramfs`'s `/init`.
 ///
-/// Prefers `assets/usr/bin/early_init.wasm` when explicitly bundled, then falls back to the
-/// workspace Cargo `wasm32-wasip1/release/early_init.wasm` artifact produced alongside `init.wasm`
-/// during real `cargo xtask build` runs, and finally falls back to `assets/usr/bin/init.wasm` for
-/// self-contained synthetic packaging fixtures.
+/// Strictly requires `assets/usr/bin/early_init.wasm` in the verified build inputs and fails
+/// closed when it is absent (never reads external Cargo target directories or substitutes
+/// Stage 2 `init.wasm`).
 fn resolve_early_init_wasm(assets: &Path) -> Result<Vec<u8>> {
     let explicit = assets.join("usr/bin/early_init.wasm");
-    if explicit.exists() {
-        return read_regular(&explicit);
-    }
-    let fallback = read_regular(&assets.join("usr/bin/init.wasm"))?;
-    if fallback.len() > 8 {
-        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .map(|root| root.join("target"))
-            });
-        if let Some(dir) = target_dir {
-            let compiled = dir.join("wasm32-wasip1/release/early_init.wasm");
-            if compiled.exists() {
-                return read_regular(&compiled);
-            }
-        }
-    }
-    Ok(fallback)
+    read_regular(&explicit).map_err(|err| {
+        format!(
+            "missing required Stage 1 init binary {}: {err}",
+            explicit.display()
+        )
+        .into()
+    })
 }
 
 /// Stage 1 `Initramfs` image: `/init` (`early_init.wasm`), `/bin/mount`, `/bin/switch_root`,
@@ -884,6 +870,37 @@ mod tests {
         let root_dir = find("/root");
         assert_eq!((root_dir.uid, root_dir.gid, root_dir.mode), (0, 0, 0o700));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn initramfs_fails_closed_when_early_init_wasm_is_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "os-xtask-missing-early-init-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let assets = dir.join("assets");
+        let out = dir.join("out");
+        fs::create_dir_all(assets.join("usr/bin")).unwrap();
+        // Deliberately omit `usr/bin/early_init.wasm` while providing Stage 2 `init.wasm`.
+        fs::write(
+            assets.join("usr/bin/init.wasm"),
+            b"\0asm\x01\0\0\0stage2-init-must-not-be-substituted",
+        )
+        .unwrap();
+        fs::write(
+            assets.join("usr/bin/utilities.wasm"),
+            b"\0asm\x01\0\0\0utils",
+        )
+        .unwrap();
+        fs::write(assets.join("usr/bin/dash.wasm"), b"\0asm\x01\0\0\0dash").unwrap();
+
+        let err = super::initramfs(&assets, &out, "missing-early-init").unwrap_err();
+        assert!(
+            err.to_string().contains("early_init.wasm"),
+            "expected missing early_init.wasm error, got: {err}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

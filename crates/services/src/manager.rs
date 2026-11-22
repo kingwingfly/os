@@ -19,7 +19,7 @@ use crate::control::{
 use crate::graph::{GraphError, UnitGraph};
 use crate::unit::{FailurePolicy, MountUnitSpec, Readiness, RestartPolicy, UnitKind, UnitSpec};
 use abi::{Errno, Error, SIGKILL, SIGTERM};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Lifecycle state of a single unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +61,9 @@ pub struct UnitRuntime {
     pub killed: bool,
     pub enabled: bool,
     pub mounted: bool,
+    pub desired_gen: u64,
+    pub active_gen: u64,
+    launching_gen: u64,
     was_active: bool,
 }
 
@@ -76,6 +79,9 @@ impl UnitRuntime {
             killed: false,
             enabled,
             mounted: false,
+            desired_gen: 0,
+            active_gen: 0,
+            launching_gen: 0,
             was_active: false,
         }
     }
@@ -128,6 +134,7 @@ pub struct ServiceManager {
     notify_socket_path: String,
     graph: UnitGraph,
     units: BTreeMap<String, UnitRuntime>,
+    explicit_roots: BTreeSet<String>,
     desired_active: BTreeSet<String>,
     explicit_stopping: BTreeSet<String>,
     shutdown_mode: ShutdownMode,
@@ -168,6 +175,7 @@ impl ServiceManager {
             notify_socket_path,
             graph,
             units,
+            explicit_roots: BTreeSet::new(),
             desired_active: BTreeSet::new(),
             explicit_stopping: BTreeSet::new(),
             shutdown_mode: ShutdownMode::None,
@@ -236,12 +244,135 @@ impl ServiceManager {
     /// Does NOT activate `cloud-online.target` or optional cloud mounts until requested explicitly.
     pub fn boot_target(&mut self, target: &str) -> Result<Vec<String>, GraphError> {
         let plan = self.graph.start_plan_for(target)?;
+        if self.units.get(target).is_some_and(|u| u.enabled) {
+            self.explicit_roots.insert(target.to_owned());
+        }
         for name in &plan {
-            if self.units.get(name).is_some_and(|u| u.enabled) {
+            if let Some(rt) = self.units.get_mut(name)
+                && rt.enabled
+            {
                 self.desired_active.insert(name.clone());
+                if rt.state != UnitState::Active {
+                    rt.desired_gen = rt.desired_gen.saturating_add(1);
+                }
             }
         }
         Ok(plan)
+    }
+
+    /// Initiate a private, manager-local ordered reverse shutdown (e.g. when PID 1 or a per-user
+    /// service manager receives `SIGTERM`) without routing through external control-socket
+    /// `Poweroff`/`Reboot` authorization.
+    pub fn begin_local_shutdown(&mut self, now_ms: u64) -> Vec<ManagerAction> {
+        if self.shutdown_mode == ShutdownMode::None {
+            self.shutdown_mode = ShutdownMode::Poweroff;
+        }
+        self.tick(now_ms)
+    }
+
+    fn all_desired_required_units_active(&self) -> bool {
+        self.desired_active.iter().all(|name| {
+            let Some(spec) = self.graph.unit(name) else {
+                return true;
+            };
+            if spec.failure_policy != FailurePolicy::Required {
+                return true;
+            }
+            self.units
+                .get(name)
+                .is_some_and(|rt| rt.state == UnitState::Active)
+        })
+    }
+
+    fn compute_stop_set(&mut self, unit: &str) -> Result<Vec<String>, GraphError> {
+        if self.graph.unit(unit).is_none() {
+            return Err(GraphError::UnknownUnit(unit.to_owned()));
+        }
+
+        // 1. Hard-stop set: `unit` itself plus every transitive `requires`-dependent of it.
+        let mut hard_stop = BTreeSet::new();
+        let mut hard_queue = VecDeque::new();
+        hard_stop.insert(unit.to_owned());
+        hard_queue.push_back(unit.to_owned());
+        while let Some(cur) = hard_queue.pop_front() {
+            for (candidate, spec) in self.graph.units() {
+                if spec.requires.iter().any(|r| r == &cur) && hard_stop.insert(candidate.clone()) {
+                    hard_queue.push_back(candidate.clone());
+                }
+            }
+        }
+
+        // Remove explicitly stopped units (and their hard dependents) from active activation roots.
+        for name in &hard_stop {
+            self.explicit_roots.remove(name);
+        }
+
+        // 2. Compute transitive demand from all REMAINING active roots so shared prerequisites
+        //    (e.g. `local-fs.target`, `multi-user.target`, or shared services) stay active!
+        let mut still_demanded = BTreeSet::new();
+        let mut demand_queue = VecDeque::new();
+        for root in &self.explicit_roots {
+            if !hard_stop.contains(root) && still_demanded.insert(root.clone()) {
+                demand_queue.push_back(root.clone());
+            }
+        }
+        while let Some(cur) = demand_queue.pop_front() {
+            for dep in self.graph.activation_edges(&cur) {
+                if !hard_stop.contains(dep)
+                    && (self.desired_active.contains(dep) || self.explicit_roots.contains(dep))
+                    && still_demanded.insert(dep.clone())
+                {
+                    demand_queue.push_back(dep.clone());
+                }
+            }
+        }
+
+        // 3. When stopping an optional feature target (e.g. `cloud-online.target`), tear down
+        //    only its soft `wants`/`wanted_by` children that are NO LONGER demanded by any
+        //    remaining active root (plus any hard `requires`-dependents of those torn-down units).
+        let mut to_stop = hard_stop.clone();
+        let mut soft_queue = VecDeque::new();
+        for name in &hard_stop {
+            if let Some(spec) = self.graph.unit(name)
+                && spec.kind == UnitKind::Target
+                && spec.failure_policy == FailurePolicy::Optional
+            {
+                soft_queue.push_back(name.clone());
+            }
+        }
+        while let Some(cur) = soft_queue.pop_front() {
+            let children: Vec<String> = self.graph.optional_children(&cur).cloned().collect();
+            for child in children {
+                if still_demanded.contains(&child) {
+                    continue;
+                }
+                if to_stop.insert(child.clone()) {
+                    self.explicit_roots.remove(&child);
+                    soft_queue.push_back(child.clone());
+                    let mut req_q = VecDeque::from([child]);
+                    while let Some(stopped) = req_q.pop_front() {
+                        for (candidate, spec) in self.graph.units() {
+                            if spec.requires.iter().any(|r| r == &stopped)
+                                && to_stop.insert(candidate.clone())
+                            {
+                                self.explicit_roots.remove(candidate);
+                                req_q.push_back(candidate.clone());
+                                soft_queue.push_back(candidate.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(self
+            .graph
+            .start_order()
+            .iter()
+            .rev()
+            .filter(|u| to_stop.contains(*u))
+            .cloned()
+            .collect())
     }
 
     /// Advance the state machine at monotonic time `now_ms`, returning ordered host actions.
@@ -256,17 +387,22 @@ impl ServiceManager {
         for name in order.iter().rev() {
             let spec = self.graph.unit(name).unwrap().clone();
             let rt = self.units.get_mut(name).unwrap();
-            if rt.state == UnitState::Stopping
-                && rt.deadline_ms.is_some_and(|d| now_ms >= d)
-                && !rt.killed
-                && let Some(pid) = rt.pid
-            {
-                rt.killed = true;
-                actions.push(ManagerAction::SignalUnit {
-                    unit: name.clone(),
-                    pid,
-                    signal: SIGKILL,
-                });
+            if rt.state == UnitState::Stopping {
+                if rt.deadline_ms.is_none() {
+                    rt.deadline_ms = Some(now_ms.saturating_add(spec.stop_timeout_ms));
+                    rt.killed = false;
+                }
+                if rt.deadline_ms.is_some_and(|d| now_ms >= d)
+                    && !rt.killed
+                    && let Some(pid) = rt.pid
+                {
+                    rt.killed = true;
+                    actions.push(ManagerAction::SignalUnit {
+                        unit: name.clone(),
+                        pid,
+                        signal: SIGKILL,
+                    });
+                }
             }
             if rt.state == UnitState::Starting && rt.deadline_ms.is_some_and(|d| now_ms >= d) {
                 rt.last_error = Some("startup readiness timeout exceeded".into());
@@ -425,10 +561,7 @@ impl ServiceManager {
                     rt.was_active = true;
                     rt.deadline_ms = None;
                     rt.last_error = None;
-                    if name == "multi-user.target" && !self.boot_healthy_marked {
-                        self.boot_healthy_marked = true;
-                        actions.push(ManagerAction::MarkBootHealthy);
-                    }
+                    rt.active_gen = rt.desired_gen;
                 }
                 UnitKind::Mount => {
                     let mount_spec = spec.mount.clone().expect("validated mount spec");
@@ -436,6 +569,7 @@ impl ServiceManager {
                     rt.state = UnitState::Starting;
                     rt.deadline_ms = Some(now_ms.saturating_add(spec.ready_timeout_ms));
                     rt.last_error = None;
+                    rt.launching_gen = rt.desired_gen;
                     actions.push(ManagerAction::MountFs {
                         unit: name.clone(),
                         spec: mount_spec,
@@ -448,6 +582,7 @@ impl ServiceManager {
                     rt.killed = false;
                     rt.was_active = false;
                     rt.last_error = None;
+                    rt.launching_gen = rt.desired_gen;
                     actions.push(ManagerAction::SpawnService {
                         unit: name.clone(),
                         spec: Box::new(spec.clone()),
@@ -457,6 +592,19 @@ impl ServiceManager {
                     });
                 }
             }
+        }
+
+        // Only emit `MarkBootHealthy` once `multi-user.target` AND every desired required unit
+        // (including `user-session@<default_uid>.service`) are `Active`.
+        if !self.boot_healthy_marked
+            && self
+                .units
+                .get("multi-user.target")
+                .is_some_and(|rt| rt.state == UnitState::Active)
+            && self.all_desired_required_units_active()
+        {
+            self.boot_healthy_marked = true;
+            actions.push(ManagerAction::MarkBootHealthy);
         }
 
         actions
@@ -502,6 +650,10 @@ impl ServiceManager {
                     rt.deadline_ms = None;
                 }
                 UnitState::Stopping => {
+                    if rt.deadline_ms.is_none() {
+                        rt.deadline_ms = Some(now_ms.saturating_add(spec.stop_timeout_ms));
+                        rt.killed = false;
+                    }
                     if rt.deadline_ms.is_some_and(|d| now_ms >= d)
                         && !rt.killed
                         && let Some(pid) = rt.pid
@@ -610,6 +762,11 @@ impl ServiceManager {
             ));
         }
         rt.pid = Some(pid);
+        rt.active_gen = if rt.launching_gen != 0 {
+            rt.launching_gen
+        } else {
+            rt.desired_gen
+        };
         if spec.readiness == Readiness::Immediate {
             rt.state = UnitState::Active;
             rt.was_active = true;
@@ -725,6 +882,7 @@ impl ServiceManager {
             ));
         };
         let spec = self.graph.unit(&unit_name).unwrap();
+        let stop_timeout_ms = spec.stop_timeout_ms;
         if spec.readiness != Readiness::NotifySocket && msg.ready {
             self.spoofed_notify_count = self.spoofed_notify_count.saturating_add(1);
             return Err(Error::because(
@@ -745,8 +903,10 @@ impl ServiceManager {
             rt.was_active = true;
             rt.deadline_ms = None;
         }
-        if msg.stopping && rt.state == UnitState::Active {
+        if msg.stopping && matches!(rt.state, UnitState::Starting | UnitState::Active) {
             rt.state = UnitState::Stopping;
+            rt.deadline_ms = Some(now_ms.saturating_add(stop_timeout_ms));
+            rt.killed = false;
         }
         Ok(unit_name)
     }
@@ -766,12 +926,27 @@ impl ServiceManager {
         rt.pid = None;
         let was_stopping = rt.state == UnitState::Stopping;
         let was_active = rt.was_active;
+        let superseded_by_start = rt.active_gen < rt.desired_gen
+            && self.desired_active.contains(&unit_name)
+            && self.shutdown_mode == ShutdownMode::None;
         let explicitly_stopped =
             self.explicit_stopping.remove(&unit_name) || self.shutdown_mode != ShutdownMode::None;
+
+        if superseded_by_start {
+            // A newer `Start`/`Restart` arrived while this older generation was stopping:
+            // preserve `desired_active` so `tick(now_ms)` relaunches cleanly!
+            rt.state = UnitState::Inactive;
+            rt.deadline_ms = None;
+            rt.killed = false;
+            rt.attempts = 0;
+            rt.last_error = None;
+            return actions;
+        }
 
         if explicitly_stopped {
             rt.state = UnitState::Inactive;
             rt.deadline_ms = None;
+            rt.killed = false;
             return actions;
         }
 
@@ -785,7 +960,9 @@ impl ServiceManager {
         if clean_exit && !matches!(spec.restart, RestartPolicy::Always { .. }) {
             rt.state = UnitState::Inactive;
             rt.deadline_ms = None;
+            rt.killed = false;
             self.desired_active.remove(&unit_name);
+            self.explicit_roots.remove(&unit_name);
             return actions;
         }
 
@@ -881,16 +1058,20 @@ impl ServiceManager {
                         );
                     }
                 };
+                self.explicit_roots.insert(unit.clone());
                 for name in &plan {
                     self.explicit_stopping.remove(name);
                     self.desired_active.insert(name.clone());
-                    if let Some(rt) = self.units.get_mut(name)
-                        && rt.state == UnitState::Failed
-                    {
-                        rt.state = UnitState::Inactive;
-                        rt.attempts = 0;
-                        rt.last_error = None;
-                        rt.deadline_ms = None;
+                    if let Some(rt) = self.units.get_mut(name) {
+                        if rt.state != UnitState::Active {
+                            rt.desired_gen = rt.desired_gen.saturating_add(1);
+                        }
+                        if rt.state == UnitState::Failed {
+                            rt.state = UnitState::Inactive;
+                            rt.attempts = 0;
+                            rt.last_error = None;
+                            rt.deadline_ms = None;
+                        }
                     }
                 }
                 let actions = self.tick(now_ms);
@@ -902,7 +1083,7 @@ impl ServiceManager {
                 )
             }
             ControlRequest::Stop { unit } => {
-                let plan = match self.graph.stop_plan_for(&unit) {
+                let plan = match self.compute_stop_set(&unit) {
                     Ok(p) => p,
                     Err(err) => {
                         return (
@@ -915,6 +1096,7 @@ impl ServiceManager {
                     }
                 };
                 for name in &plan {
+                    self.explicit_roots.remove(name);
                     self.desired_active.remove(name);
                     self.explicit_stopping.insert(name.clone());
                 }
@@ -945,9 +1127,11 @@ impl ServiceManager {
                         Vec::new(),
                     );
                 }
+                self.explicit_roots.insert(unit.clone());
                 self.explicit_stopping.insert(unit.clone());
                 self.desired_active.insert(unit.clone());
                 if let Some(rt) = self.units.get_mut(&unit) {
+                    rt.desired_gen = rt.desired_gen.saturating_add(1);
                     rt.attempts = 0;
                     if rt.state == UnitState::Failed {
                         rt.state = UnitState::Inactive;
@@ -1044,5 +1228,495 @@ impl ServiceManager {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::default_boot_graph;
+    use crate::unit::{
+        CapabilityGrant, DEFAULT_READY_TIMEOUT_MS, MountNsPolicy, UNIT_MANIFEST_VERSION,
+    };
+
+    fn root_cred() -> PeerCred {
+        PeerCred {
+            pid: 1,
+            uid: 0,
+            gid: 0,
+        }
+    }
+
+    fn make_service(
+        name: &str,
+        after: Vec<&str>,
+        requires: Vec<&str>,
+        wanted_by: Vec<&str>,
+    ) -> UnitSpec {
+        UnitSpec {
+            version: UNIT_MANIFEST_VERSION,
+            name: name.into(),
+            kind: UnitKind::Service,
+            description: String::new(),
+            after: after.into_iter().map(String::from).collect(),
+            wants: Vec::new(),
+            requires: requires.into_iter().map(String::from).collect(),
+            wanted_by: wanted_by.into_iter().map(String::from).collect(),
+            failure_policy: FailurePolicy::Required,
+            readiness: Readiness::NotifySocket,
+            ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+            stop_timeout_ms: 1_500,
+            restart: RestartPolicy::Never,
+            exec_start: Some(vec![format!("/usr/bin/{name}")]),
+            exec_stop: None,
+            cwd: Some("/".into()),
+            environment: BTreeMap::new(),
+            mount: None,
+            grant: CapabilityGrant::default(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn boot_healthy_waits_for_user_session_and_all_required_units() {
+        let mut graph = default_boot_graph(1000).unwrap();
+        // Extra required service wanted by `multi-user.target` without an explicit `after` edge on
+        // `multi-user.target`: `MarkBootHealthy` must still wait until it reaches `Active`.
+        let extra = make_service(
+            "auditd.service",
+            vec!["local-fs.target"],
+            vec!["local-fs.target"],
+            vec!["multi-user.target"],
+        );
+        graph.register_unit(extra).unwrap();
+
+        let mut mgr = ServiceManager::new_system(graph).unwrap();
+        mgr.boot_target("multi-user.target").unwrap();
+
+        let actions = mgr.tick(0);
+        assert!(!actions.contains(&ManagerAction::MarkBootHealthy));
+        assert!(!mgr.is_boot_healthy());
+        assert_eq!(mgr.unit_state("local-fs.target"), Some(UnitState::Active));
+        assert_eq!(
+            mgr.unit_state("multi-user.target"),
+            Some(UnitState::Inactive)
+        );
+        assert_eq!(
+            mgr.unit_state("user-session@1000.service"),
+            Some(UnitState::Starting)
+        );
+        assert_eq!(mgr.unit_state("auditd.service"), Some(UnitState::Starting));
+
+        mgr.on_spawned("user-session@1000.service", 10, 5).unwrap();
+        mgr.on_spawned("auditd.service", 11, 5).unwrap();
+        mgr.on_notify(
+            PeerCred {
+                pid: 10,
+                uid: 1000,
+                gid: 1000,
+            },
+            b"READY=1\n",
+            10,
+        )
+        .unwrap();
+
+        // `multi-user.target` activates once `user-session@1000.service` is ready,
+        // but `MarkBootHealthy` STILL waits for `auditd.service` (Required)!
+        let actions = mgr.tick(15);
+        assert_eq!(mgr.unit_state("multi-user.target"), Some(UnitState::Active));
+        assert!(!actions.contains(&ManagerAction::MarkBootHealthy));
+        assert!(!mgr.is_boot_healthy());
+
+        mgr.on_notify(
+            PeerCred {
+                pid: 11,
+                uid: 0,
+                gid: 0,
+            },
+            b"READY=1\n",
+            20,
+        )
+        .unwrap();
+        let actions = mgr.tick(25);
+        assert!(actions.contains(&ManagerAction::MarkBootHealthy));
+        assert!(mgr.is_boot_healthy());
+    }
+
+    #[test]
+    fn stalled_stopping_notify_escalates_to_sigkill_in_tick_and_shutdown() {
+        // 1. Stalled `STOPPING=1` during normal runtime (`tick()`).
+        let svc = make_service("staller.service", vec![], vec![], vec![]);
+        let mut mgr =
+            ServiceManager::new_system(UnitGraph::build(vec![svc.clone()]).unwrap()).unwrap();
+        mgr.boot_target("staller.service").unwrap();
+        let _ = mgr.tick(0);
+        mgr.on_spawned("staller.service", 40, 10).unwrap();
+        mgr.on_notify(
+            PeerCred {
+                pid: 40,
+                uid: 0,
+                gid: 0,
+            },
+            b"READY=1\n",
+            20,
+        )
+        .unwrap();
+        assert_eq!(mgr.unit_state("staller.service"), Some(UnitState::Active));
+        assert_eq!(
+            mgr.unit_runtime("staller.service").unwrap().deadline_ms,
+            None
+        );
+
+        // Unit sends `STOPPING=1` at t=100 -> must install stop_timeout_ms (1500ms) deadline!
+        mgr.on_notify(
+            PeerCred {
+                pid: 40,
+                uid: 0,
+                gid: 0,
+            },
+            b"STOPPING=1\n",
+            100,
+        )
+        .unwrap();
+        assert_eq!(mgr.unit_state("staller.service"), Some(UnitState::Stopping));
+        assert_eq!(
+            mgr.unit_runtime("staller.service").unwrap().deadline_ms,
+            Some(1_600)
+        );
+        assert!(mgr.tick(1_599).is_empty());
+        let actions = mgr.tick(1_600);
+        assert!(actions.contains(&ManagerAction::SignalUnit {
+            unit: "staller.service".into(),
+            pid: 40,
+            signal: SIGKILL,
+        }));
+
+        // 2. Stalled `STOPPING=1` followed by `Poweroff` (`tick_shutdown()`).
+        let mut mgr2 = ServiceManager::new_system(UnitGraph::build(vec![svc]).unwrap()).unwrap();
+        mgr2.boot_target("staller.service").unwrap();
+        let _ = mgr2.tick(0);
+        mgr2.on_spawned("staller.service", 41, 10).unwrap();
+        mgr2.on_notify(
+            PeerCred {
+                pid: 41,
+                uid: 0,
+                gid: 0,
+            },
+            b"READY=1\n",
+            20,
+        )
+        .unwrap();
+        mgr2.on_notify(
+            PeerCred {
+                pid: 41,
+                uid: 0,
+                gid: 0,
+            },
+            b"STOPPING=1\n",
+            200,
+        )
+        .unwrap();
+        let (_, actions) = mgr2.handle_control(root_cred(), ControlRequest::Poweroff, 300);
+        assert!(actions.is_empty());
+        let actions = mgr2.tick(1_700);
+        assert!(actions.contains(&ManagerAction::SignalUnit {
+            unit: "staller.service".into(),
+            pid: 41,
+            signal: SIGKILL,
+        }));
+        let _ = mgr2.on_exited(41, 137, 1_710);
+        let actions = mgr2.tick(1_720);
+        assert!(actions.contains(&ManagerAction::CloseCleanRoot { reboot: false }));
+    }
+
+    #[test]
+    fn user_manager_local_shutdown_stops_units_in_reverse_while_control_poweroff_stays_eperm() {
+        let mut a = make_service("a.service", vec![], vec![], vec![]);
+        a.readiness = Readiness::Immediate;
+        a.grant.mount_namespace = MountNsPolicy::Session;
+        let mut b = make_service("b.service", vec!["a.service"], vec!["a.service"], vec![]);
+        b.readiness = Readiness::Immediate;
+        b.grant.mount_namespace = MountNsPolicy::Session;
+        let graph = UnitGraph::build(vec![a, b]).unwrap();
+        let mut user_mgr = ServiceManager::new_user(1000, graph).unwrap();
+        let owner = PeerCred {
+            pid: 50,
+            uid: 1000,
+            gid: 1000,
+        };
+
+        // External control-socket Poweroff / Reboot MUST still fail EPERM!
+        for req in [ControlRequest::Poweroff, ControlRequest::Reboot] {
+            let (resp, actions) = user_mgr.handle_control(owner, req, 0);
+            assert!(matches!(
+                resp,
+                ControlResponse::Error {
+                    errno: Errno::EPERM,
+                    ..
+                }
+            ));
+            assert!(actions.is_empty());
+        }
+
+        // Start b.service (pulls in a.service first).
+        let (resp, actions) = user_mgr.handle_control(
+            owner,
+            ControlRequest::Start {
+                unit: "b.service".into(),
+            },
+            10,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        assert_eq!(actions.len(), 1);
+        user_mgr.on_spawned("a.service", 101, 10).unwrap();
+        let actions = user_mgr.tick(15);
+        assert_eq!(actions.len(), 1);
+        user_mgr.on_spawned("b.service", 102, 15).unwrap();
+        assert_eq!(user_mgr.unit_state("a.service"), Some(UnitState::Active));
+        assert_eq!(user_mgr.unit_state("b.service"), Some(UnitState::Active));
+
+        // Private SIGTERM shutdown stops `b.service` FIRST, then `a.service`, then completes!
+        let actions = user_mgr.begin_local_shutdown(100);
+        assert_eq!(
+            actions,
+            vec![ManagerAction::SignalUnit {
+                unit: "b.service".into(),
+                pid: 102,
+                signal: SIGTERM,
+            }]
+        );
+        let _ = user_mgr.on_exited(102, 0, 120);
+        let actions = user_mgr.tick(130);
+        assert_eq!(
+            actions,
+            vec![ManagerAction::SignalUnit {
+                unit: "a.service".into(),
+                pid: 101,
+                signal: SIGTERM,
+            }]
+        );
+        let _ = user_mgr.on_exited(101, 0, 140);
+        let actions = user_mgr.tick(150);
+        assert!(actions.contains(&ManagerAction::CloseCleanRoot { reboot: false }));
+        assert!(user_mgr.is_shutdown_complete());
+    }
+
+    #[test]
+    fn stopping_optional_target_requiring_local_fs_keeps_shared_prerequisites_and_multi_user_active()
+     {
+        let mut graph = default_boot_graph(1000).unwrap();
+
+        // Shared service wanted by BOTH `multi-user.target` AND `opt-feature.target`.
+        let mut shared = make_service(
+            "shared.service",
+            vec!["local-fs.target"],
+            vec!["local-fs.target"],
+            vec!["multi-user.target", "opt-feature.target"],
+        );
+        shared.readiness = Readiness::Immediate;
+
+        // Exclusive service wanted ONLY by `opt-feature.target`.
+        let mut exclusive = make_service(
+            "opt-only.service",
+            vec!["local-fs.target"],
+            vec!["local-fs.target"],
+            vec!["opt-feature.target"],
+        );
+        exclusive.readiness = Readiness::Immediate;
+        exclusive.failure_policy = FailurePolicy::Optional;
+
+        // Optional target that explicitly `requires: ["local-fs.target"]`!
+        let opt_target = UnitSpec {
+            version: UNIT_MANIFEST_VERSION,
+            name: "opt-feature.target".into(),
+            kind: UnitKind::Target,
+            description: String::new(),
+            after: vec![
+                "local-fs.target".into(),
+                "shared.service".into(),
+                "opt-only.service".into(),
+            ],
+            wants: vec!["shared.service".into(), "opt-only.service".into()],
+            requires: vec!["local-fs.target".into()],
+            wanted_by: Vec::new(),
+            failure_policy: FailurePolicy::Optional,
+            readiness: Readiness::Immediate,
+            ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+            stop_timeout_ms: 1_500,
+            restart: RestartPolicy::Never,
+            exec_start: None,
+            exec_stop: None,
+            cwd: None,
+            environment: BTreeMap::new(),
+            mount: None,
+            grant: CapabilityGrant::default(),
+            enabled: true,
+        };
+
+        graph.register_unit(shared).unwrap();
+        graph.register_unit(exclusive).unwrap();
+        graph.register_unit(opt_target).unwrap();
+
+        let mut mgr = ServiceManager::new_system(graph).unwrap();
+        mgr.boot_target("multi-user.target").unwrap();
+        let _ = mgr.tick(0);
+        mgr.on_spawned("user-session@1000.service", 10, 0).unwrap();
+        mgr.on_spawned("shared.service", 11, 0).unwrap();
+        mgr.on_notify(
+            PeerCred {
+                pid: 10,
+                uid: 1000,
+                gid: 1000,
+            },
+            b"READY=1\n",
+            5,
+        )
+        .unwrap();
+        let _ = mgr.tick(10);
+        assert_eq!(mgr.unit_state("multi-user.target"), Some(UnitState::Active));
+        assert_eq!(mgr.unit_state("shared.service"), Some(UnitState::Active));
+
+        // Start optional feature target.
+        let (resp, _) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Start {
+                unit: "opt-feature.target".into(),
+            },
+            20,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        mgr.on_spawned("opt-only.service", 12, 20).unwrap();
+        let _ = mgr.tick(25);
+        assert_eq!(
+            mgr.unit_state("opt-feature.target"),
+            Some(UnitState::Active)
+        );
+        assert_eq!(mgr.unit_state("opt-only.service"), Some(UnitState::Active));
+
+        // Stop optional feature target -> MUST stop ONLY `opt-feature.target` and `opt-only.service`!
+        let (resp, actions) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Stop {
+                unit: "opt-feature.target".into(),
+            },
+            50,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        assert_eq!(
+            mgr.unit_state("opt-feature.target"),
+            Some(UnitState::Inactive)
+        );
+        assert_eq!(
+            actions,
+            vec![ManagerAction::SignalUnit {
+                unit: "opt-only.service".into(),
+                pid: 12,
+                signal: SIGTERM,
+            }]
+        );
+        let _ = mgr.on_exited(12, 0, 60);
+        let _ = mgr.tick(70);
+
+        assert_eq!(
+            mgr.unit_state("opt-only.service"),
+            Some(UnitState::Inactive)
+        );
+        assert_eq!(mgr.unit_state("local-fs.target"), Some(UnitState::Active));
+        assert_eq!(mgr.unit_state("multi-user.target"), Some(UnitState::Active));
+        assert_eq!(
+            mgr.unit_state("user-session@1000.service"),
+            Some(UnitState::Active)
+        );
+        assert_eq!(mgr.unit_state("shared.service"), Some(UnitState::Active));
+    }
+
+    #[test]
+    fn start_accepted_while_stopping_relaunches_after_old_pid_exits() {
+        let mut svc = make_service("relaunch.service", vec![], vec![], vec![]);
+        svc.readiness = Readiness::Immediate;
+        svc.restart = RestartPolicy::Never;
+        let mut mgr = ServiceManager::new_system(UnitGraph::build(vec![svc]).unwrap()).unwrap();
+
+        // Start generation 1.
+        let (resp, actions) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Start {
+                unit: "relaunch.service".into(),
+            },
+            0,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        assert_eq!(actions.len(), 1);
+        mgr.on_spawned("relaunch.service", 200, 5).unwrap();
+        assert_eq!(mgr.unit_state("relaunch.service"), Some(UnitState::Active));
+        assert_eq!(mgr.unit_runtime("relaunch.service").unwrap().active_gen, 1);
+
+        // Stop -> sends SIGTERM to pid 200, unit enters `Stopping`.
+        let (resp, actions) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Stop {
+                unit: "relaunch.service".into(),
+            },
+            10,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        assert_eq!(
+            actions,
+            vec![ManagerAction::SignalUnit {
+                unit: "relaunch.service".into(),
+                pid: 200,
+                signal: SIGTERM,
+            }]
+        );
+        assert_eq!(
+            mgr.unit_state("relaunch.service"),
+            Some(UnitState::Stopping)
+        );
+
+        // New `Start` arrives while pid 200 is STILL stopping -> bumps `desired_gen` to 2.
+        let (resp, actions) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Start {
+                unit: "relaunch.service".into(),
+            },
+            15,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        assert!(
+            actions.is_empty(),
+            "must wait for old pid to exit before respawning"
+        );
+        let rt = mgr.unit_runtime("relaunch.service").unwrap();
+        assert_eq!(rt.state, UnitState::Stopping);
+        assert_eq!(rt.active_gen, 1);
+        assert_eq!(rt.desired_gen, 2);
+
+        // Old pid 200 exits cleanly with code 0 -> must NOT drop `desired_active`!
+        let _ = mgr.on_exited(200, 0, 20);
+        assert_eq!(
+            mgr.unit_state("relaunch.service"),
+            Some(UnitState::Inactive)
+        );
+
+        // Next `tick()` MUST relaunch generation 2!
+        let actions = mgr.tick(25);
+        assert!(matches!(
+            actions.as_slice(),
+            [ManagerAction::SpawnService { unit, .. }] if unit == "relaunch.service"
+        ));
+        mgr.on_spawned("relaunch.service", 201, 25).unwrap();
+        let rt = mgr.unit_runtime("relaunch.service").unwrap();
+        assert_eq!(rt.state, UnitState::Active);
+        assert_eq!(rt.pid, Some(201));
+        assert_eq!(rt.active_gen, 2);
+        assert_eq!(rt.desired_gen, 2);
+
+        // Once generation 2 exits cleanly on its own (no newer start), it stays Inactive.
+        let _ = mgr.on_exited(201, 0, 50);
+        assert!(mgr.tick(60).is_empty());
+        assert_eq!(
+            mgr.unit_state("relaunch.service"),
+            Some(UnitState::Inactive)
+        );
     }
 }
