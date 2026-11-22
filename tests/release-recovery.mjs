@@ -63,7 +63,7 @@ const marker = '/tmp/release-recovery-' + crypto.randomUUID();
 let provider, providerPolicy, pendingTask, loginView, seatPolicy;
 try {
   await start(trust);
-  const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+  const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
   assert((await api(context, 'login', { headers: { 'CF-Connecting-IP': crypto.randomUUID() }, data: { password } })).ok());
   const identity = await call('getcreds');
   provider = await device(context);

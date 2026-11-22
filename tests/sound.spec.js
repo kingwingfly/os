@@ -1,13 +1,12 @@
 import { test, expect, request as playwrightRequest } from './test.js';
-import { readFile } from 'node:fs/promises';
-import { api, call, entry, errno, names, program, put, rmrf, sys } from './sys.js';
+import { api, call, cloudAuth, entry, names, program, put, rmrf, sys } from './sys.js';
+import { cloudSignIn } from './ui.js';
+
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const vars = await readFile('.dev.vars', 'utf8');
-const rootPassword = vars.match(/^ADMIN_PASSWORD=(.+)$/m)[1];
-// Whether the site has a Realtime app: its keys are named in .dev.vars (their values are not
-// read here).
-const realtime = /^REALTIME_APP_ID=.+$/m.test(vars) && /^REALTIME_APP_TOKEN=.+$/m.test(vars);
+const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || '';
+const realtime = Boolean(process.env.REALTIME_APP_ID && process.env.REALTIME_APP_TOKEN);
 const file = path => '/api/file?path=' + encodeURIComponent(path);
+const cloudPath = path => '/mnt/cloud' + path;
 // Chromium's fake microphone, which plays a tone, granted without asking; and the launch options
 // of playwright.config.js, which test.use replaces.
 const browserEnv = { ...process.env }; delete browserEnv.DISPLAY;
@@ -30,9 +29,14 @@ async function device(browser, username, password, prepare = async () => {}) {
     const take = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
     navigator.mediaDevices.getUserMedia = async constraints => { const stream = await take(constraints); (window.microphones ??= []).push(stream); return stream; };
   });
-  if (username) expect((await api(context.request, 'login', { headers: { Origin: origin }, data: { username, password } })).ok()).toBe(true);
   const page = await context.newPage(); await page.goto(origin + '/');
-  await expect(page.locator('.lock')).toContainText(username || 'guest');
+  await page.waitForFunction(() => Boolean(window.os?.cloudSignIn && window.os?.exec));
+  if (username) {
+    await cloudSignIn(page, username, password);
+    await expect(page.locator('.cloud-panel-trigger')).toContainText(`Cloud: ${username}`);
+  } else {
+    await expect(page.locator('.cloud-panel-trigger')).toContainText('Cloud: Signed out');
+  }
   return { context, page };
 }
 
@@ -41,17 +45,31 @@ test.beforeAll(async () => {
   root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
   expect((await api(root, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
   name = 'voice' + Date.now().toString(36); password = 'sound-password-' + Date.now();
-  expect((await program(root, ['useradd', '-m', name])).ok()).toBe(true);
-  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
-  home = '/home/' + name;
+  const regCtx = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('reg') } });
+  try {
+    const res = await cloudAuth(regCtx, 'register', { data: { username: name, password, create_home: true } });
+    expect(res.ok(), await res.text()).toBe(true);
+    const body = await res.json();
+    home = body.home || ('/guest/' + name);
+  } finally {
+    await regCtx.dispose();
+  }
 });
-test.afterAll(async () => { await program(root, ['userdel', '-r', name]); await root.dispose(); });
+test.afterAll(async () => {
+  if (home) await rmrf(root, home).catch(() => {});
+  await root.dispose();
+});
 
 test('stream records the microphone into a file that grows as it is heard, and is whole once stopped', async ({ browser }) => {
   const speaker = await device(browser, name, password);
   const page = speaker.page, recording = home + '/talk.weba';
+  // Open and sign in the second tab BEFORE starting the recording so both tabs share
+  // the same browser-context Cloud session cookie when `stream` opens its server fd.
+  const other = await speaker.context.newPage(); await other.goto(origin + '/');
+  await other.waitForFunction(() => Boolean(window.os?.cloudSignIn));
+  await cloudSignIn(other, name, password);
   try {
-    await run(page, 'cd ~');
+    await run(page, `cd ${cloudPath(home)}`);
     // Browsers record Opus in WebM, so a recording is a .weba.
     await run(page, 'stream talk.aac');
     await expect(transcript(page)).toContainText('browsers record Opus in WebM; name the recording NAME.weba');
@@ -63,7 +81,6 @@ test('stream records the microphone into a file that grows as it is heard, and i
     await expect.poll(async () => (await stat())?.size ?? 0, { timeout: 60_000, intervals: [1000] }).toBeGreaterThan(0);
     const grown = (await stat()).size;
     // jobs, in another tab, says it is recording, and how much it has.
-    const other = await speaker.context.newPage(); await other.goto(origin + '/');
     await run(other, 'jobs');
     await expect(transcript(other)).toContainText(new RegExp(`recording  ${recording}  [\\d.]+ KB`));
     await other.close();
@@ -78,7 +95,7 @@ test('stream records the microphone into a file that grows as it is heard, and i
     // Ctrl+C stops it; the rest arrives, and it is whole.
     await page.waitForTimeout(2000);
     await page.locator('#command').press('Control+c');
-    await expect(transcript(page)).toContainText(new RegExp(`✓ ${recording} · \\d\\d:\\d\\d · [\\d.]+ KB`), { timeout: 30_000 });
+    await expect(transcript(page)).toContainText(new RegExp(`✓ (?:${cloudPath(recording)}|${recording}) · \\d\\d:\\d\\d · [\\d.]+ KB`), { timeout: 30_000 });
     const whole = await stat();
     expect(whole.recording).toBeFalsy(); expect(whole.uploaded).toBeUndefined();
     expect(whole.size).toBeGreaterThan(grown);
@@ -98,12 +115,12 @@ test('a recording whose microphone stops on its own is saved, with what it heard
   const speaker = await device(browser, name, password);
   const page = speaker.page, recording = home + '/unplugged.weba';
   try {
-    await run(page, 'cd ~');
+    await run(page, `cd ${cloudPath(home)}`);
     await run(page, 'stream unplugged.weba');
     await expect(transcript(page)).toContainText(/● 00:0[3-9]/, { timeout: 15_000 });
     // Unplugged, or taken back by the browser: every track of the microphone ends.
     await page.evaluate(() => window.microphones.forEach(stream => stream.getTracks().forEach(track => track.stop())));
-    await expect(transcript(page)).toContainText(new RegExp(`✓ ${recording} · \\d\\d:\\d\\d · [\\d.]+ KB.* · the microphone stopped`), { timeout: 30_000 });
+    await expect(transcript(page)).toContainText(new RegExp(`✓ (?:${cloudPath(recording)}|${recording}) · \\d\\d:\\d\\d · [\\d.]+ KB.* · the microphone stopped`), { timeout: 30_000 });
     const whole = await entry(root, recording);
     expect(whole.recording).toBeFalsy(); expect(whole.size).toBeGreaterThan(0);
     await expect(busy(page)).toHaveAttribute('data-state', 'idle');
@@ -117,11 +134,13 @@ test('live sound: /dev/snd/NAME is heard by whoever may read it, and with the pr
   test.skip(!realtime, 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)');
   const speaker = await device(browser, name, password), guest = await device(browser);
   const remote = await speaker.context.newPage(); await remote.goto(origin + '/');
+  await remote.waitForFunction(() => Boolean(window.os?.cloudSignIn));
+  await cloudSignIn(remote, name, password);
   const recording = home + '/lecture.weba', deck = home + '/lecture.slides.md';
   try {
     expect((await put(root, file(deck), { data: '# One\n\n---\n\n# Two\n' })).status()).toBe(201);
     for (const args of [['chmod', '755', home], ['chmod', '644', deck]]) expect((await program(root, args)).ok()).toBe(true);
-    await run(speaker.page, 'cd ~');
+    await run(speaker.page, `cd ${cloudPath(home)}`);
     await run(speaker.page, 'stream -n lecture lecture.weba');
     await expect(transcript(speaker.page)).toContainText('live as /dev/snd/lecture', { timeout: 20_000 });
     // A guest hears it, as the device, made with the umask, may be read by others.
@@ -132,14 +151,14 @@ test('live sound: /dev/snd/NAME is heard by whoever may read it, and with the pr
     // A presentation of the same name brings its sound with it.
     await player.getByRole('button', { name: 'Stop listening' }).click();
     await expect(player).toBeHidden();
-    await run(remote, `present -n lecture ${deck}`);
+    await run(remote, `present -n lecture ${cloudPath(deck)}`);
     await expect(remote.locator('.slides-current .slide:visible h1')).toHaveText('One');
     await run(guest.page, 'open /dev/present/lecture');
     await expect(guest.page.locator('.slides-current .slide:visible h1')).toHaveText('One');
     await expect(guest.page.getByRole('region', { name: 'Live sound' })).toBeVisible();
     // Stopped, the sound ends for its listeners.
     await speaker.page.locator('#command').press('Control+c');
-    await expect(transcript(speaker.page)).toContainText(`✓ ${recording}`, { timeout: 30_000 });
+    await expect(transcript(speaker.page)).toContainText(new RegExp(`✓ (?:${cloudPath(recording)}|${recording})`), { timeout: 30_000 });
     await expect(guest.page.getByRole('region', { name: 'Live sound' })).toBeHidden({ timeout: 10_000 });
   } finally {
     await rmrf(root, recording); await rmrf(root, deck);
@@ -152,11 +171,13 @@ test('jobs cancel stops a recording from another tab, keeping what arrived', asy
   const speaker = await device(browser, name, password);
   const page = speaker.page, recording = home + '/cancelled.weba';
   const stat = () => entry(root, recording);
+  const other = await speaker.context.newPage(); await other.goto(origin + '/');
+  await other.waitForFunction(() => Boolean(window.os?.cloudSignIn));
+  await cloudSignIn(other, name, password);
   try {
-    await run(page, 'cd ~');
+    await run(page, `cd ${cloudPath(home)}`);
     await run(page, 'stream cancelled.weba');
     await expect.poll(async () => (await stat())?.size ?? 0, { timeout: 60_000, intervals: [1000] }).toBeGreaterThan(0);
-    const other = await speaker.context.newPage(); await other.goto(origin + '/');
     await run(other, 'jobs');
     await expect(transcript(other)).toContainText(`recording  ${recording}`);
     const listed = (await transcript(other).textContent()).match(new RegExp(`(fd\\d+) +recording  ${recording}`));
@@ -187,12 +208,12 @@ test('a live sound that never connects leaves no device behind', async ({ browse
   const page = speaker.page, recording = home + '/unheard.weba';
   const listed = () => names(root, '/dev/snd');
   try {
-    await run(page, 'cd ~');
+    await run(page, `cd ${cloudPath(home)}`);
     await run(page, 'stream unheard.weba');
     await expect(transcript(page)).toContainText('not live: The sound did not connect', { timeout: 30_000 });
     await expect.poll(listed, { timeout: 10_000 }).not.toContain('unheard');
     await page.locator('#command').press('Control+c');
-    await expect(transcript(page)).toContainText(`✓ ${recording}`, { timeout: 30_000 });
+    await expect(transcript(page)).toContainText(new RegExp(`✓ (?:${cloudPath(recording)}|${recording})`), { timeout: 30_000 });
   } finally {
     await rmrf(root, recording);
     await speaker.context.close();
@@ -205,7 +226,7 @@ test('a page that stops its live sound leaves alone the one that took its name o
   const first = home + '/first.weba', second = home + '/second.weba';
   const listed = () => names(root, '/dev/snd');
   try {
-    await run(laptop.page, 'cd ~'); await run(phone.page, 'cd ~');
+    await run(laptop.page, `cd ${cloudPath(home)}`); await run(phone.page, `cd ${cloudPath(home)}`);
     await run(laptop.page, 'stream -n shared first.weba');
     await expect(transcript(laptop.page)).toContainText('live as /dev/snd/shared', { timeout: 20_000 });
     // The phone, the same account, takes the name over.
@@ -213,11 +234,11 @@ test('a page that stops its live sound leaves alone the one that took its name o
     await expect(transcript(phone.page)).toContainText('live as /dev/snd/shared', { timeout: 20_000 });
     // The laptop stops: the phone's sound goes on.
     await laptop.page.locator('#command').press('Control+c');
-    await expect(transcript(laptop.page)).toContainText(`✓ ${first}`, { timeout: 30_000 });
+    await expect(transcript(laptop.page)).toContainText(new RegExp(`✓ (?:${cloudPath(first)}|${first})`), { timeout: 30_000 });
     await laptop.page.waitForTimeout(1000);
     expect(await listed()).toContain('shared');
     await phone.page.locator('#command').press('Control+c');
-    await expect(transcript(phone.page)).toContainText(`✓ ${second}`, { timeout: 30_000 });
+    await expect(transcript(phone.page)).toContainText(new RegExp(`✓ (?:${cloudPath(second)}|${second})`), { timeout: 30_000 });
     await expect.poll(listed, { timeout: 10_000 }).not.toContain('shared');
   } finally {
     await rmrf(root, first); await rmrf(root, second);
@@ -229,16 +250,16 @@ test('stream -m gives the recording its ACL as it is made; entries it cannot tak
   const speaker = await device(browser, name, password);
   const page = speaker.page, recording = home + '/shared.weba';
   try {
-    await run(page, 'cd ~');
+    await run(page, `cd ${cloudPath(home)}`);
     await run(page, 'stream -m bogus:x:r refused.weba');
     await expect(transcript(page)).toContainText('stream -m: ');
     await expect.poll(() => entry(root, home + '/refused.weba')).toBe(null);
-    await run(page, 'stream -m g:guest:r,o::- shared.weba');
+    await run(page, 'stream -m g:65534:r,o::- shared.weba');
     await expect(transcript(page)).toContainText(/● \d\d:\d\d/);
     const acl = JSON.parse(Buffer.from(await call(root, { getxattr: { path: recording, name: 'system.posix_acl_access' } }), 'base64').toString());
     expect([acl.groups[65534], acl.other]).toEqual([4, 0]);
     await page.locator('#command').press('Control+c');
-    await expect(transcript(page)).toContainText(`✓ ${recording}`, { timeout: 30_000 });
+    await expect(transcript(page)).toContainText(new RegExp(`✓ (?:${cloudPath(recording)}|${recording})`), { timeout: 30_000 });
   } finally {
     await rmrf(root, recording);
     await speaker.context.close();
@@ -251,6 +272,8 @@ test('stream -n NAME is live only: /dev/snd/NAME is a file of its own, whose per
   const open = 'open' + Date.now().toString(36), closed = 'closed' + Date.now().toString(36);
   const listed = () => names(root, '/dev/snd');
   const other = await speaker.context.newPage(); await other.goto(origin + '/');
+  await other.waitForFunction(() => Boolean(window.os?.cloudSignIn));
+  await cloudSignIn(other, name, password);
   try {
     await run(speaker.page, `stream -n ${open}`);
     await expect(transcript(speaker.page)).toContainText(new RegExp(`● live as /dev/snd/${open} · \\d\\d:\\d\\d`), { timeout: 20_000 });
@@ -288,11 +311,11 @@ test('a chunk R2 did not take once is sent again, and the recording goes on', as
     return route.continue();
   });
   try {
-    await run(page, 'cd ~');
+    await run(page, `cd ${cloudPath(home)}`);
     await run(page, 'stream retried.weba');
     await expect(transcript(page)).toContainText(/● 00:0[2-9]/, { timeout: 15_000 });
     await page.locator('#command').press('Control+c');
-    await expect(transcript(page)).toContainText(`✓ ${recording}`, { timeout: 30_000 });
+    await expect(transcript(page)).toContainText(new RegExp(`✓ (?:${cloudPath(recording)}|${recording})`), { timeout: 30_000 });
     expect(refused).toBeGreaterThan(1);
     const whole = await entry(root, recording);
     expect(whole.recording).toBeFalsy(); expect(whole.size).toBeGreaterThan(0);

@@ -385,7 +385,7 @@ pub(crate) async fn page_sys_batch_with_session(
     page_batch_target(batch, fs_session, None, None).await
 }
 
-async fn page_batch_target(
+pub(crate) async fn page_batch_target(
     batch: Batch,
     fs_session: Option<(&str, &str)>,
     target: Option<PageTarget>,
@@ -492,7 +492,7 @@ impl CloudMountDriver {
         paths.insert(
             NodeId {
                 ino: 1,
-                generation: 0,
+                generation: 1,
             },
             "/".to_string(),
         );
@@ -557,7 +557,7 @@ impl CloudMountDriver {
         paths.insert(
             NodeId {
                 ino: 1,
-                generation: 0,
+                generation: 1,
             },
             "/".to_string(),
         );
@@ -805,7 +805,7 @@ impl Filesystem for CloudMountDriver {
             fs: self.fs_id.clone(),
             node: NodeId {
                 ino: 1,
-                generation: 0,
+                generation: 1,
             },
             proof: String::new(),
         }

@@ -1,11 +1,13 @@
 import { verifyRelease } from './release.js';
 import init from './pkg/frontend.js';
 import './session-viewport.js';
+import { installLocalFiles } from './local-files.js';
 import { kernelCall } from './kernel/protocol.js';
 import { ShellSession } from './shell-session-controller.js';
 import { executionSupport } from './kernel/capabilities.js';
 
 async function boot() {
+  installLocalFiles();
   const { exec, closeConsole, loginSession, endLoginSession, restartLoginSession, bootStatus } = await import('./kernel/page.js');
   window.os = { ...(window.os ?? {}), exec, loginSession, endLoginSession, restartLoginSession, bootStatus };
   let listener;

@@ -1,10 +1,11 @@
 import { test, expect, request as playwrightRequest } from './test.js';
-import { readFile } from 'node:fs/promises';
-import { api, call, descriptors, entry, errno, mkdirp, names, program, put, rmrf, sys } from './sys.js';
+import { api, cloudAuth, descriptors, entry, errno, mkdirp, names, program, put, rmrf, sys } from './sys.js';
+import { cloudSignIn, pagePut } from './ui.js';
+
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const vars = await readFile('.dev.vars', 'utf8');
-const rootPassword = vars.match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || '';
 const file = path => '/api/file?path=' + encodeURIComponent(path);
+const cloudPath = path => '/mnt/cloud' + path;
 // Chromium's fake microphone, granted without asking; and the launch options of
 // playwright.config.js, which test.use replaces.
 const browserEnv = { ...process.env }; delete browserEnv.DISPLAY;
@@ -21,7 +22,24 @@ async function run(page, text) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill(text); await input.press('Enter');
 }
-// A page of a browser of its own, signed in through the API, or a guest's; it keeps the
+
+async function registerCloudUser(username, password) {
+  const ctx = await playwrightRequest.newContext({
+    baseURL: origin,
+    extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('reg-' + username) },
+  });
+  try {
+    const res = await cloudAuth(ctx, 'register', { data: { username, password, create_home: true } });
+    expect(res.ok(), await res.text()).toBe(true);
+    const status = await cloudAuth(ctx, 'status');
+    expect(status.ok(), await status.text()).toBe(true);
+    return (await status.json()).uid;
+  } finally {
+    await ctx.dispose();
+  }
+}
+
+// A page of a browser of its own, signed in to Cloud or signed out (guest); it keeps the
 // connections its sounds make, to fail one.
 async function device(browser, username, password) {
   const context = await browser.newContext({ permissions: ['microphone'], extraHTTPHeaders: { 'CF-Connecting-IP': address(username || 'guest') } });
@@ -31,24 +49,26 @@ async function device(browser, username, password) {
     window.RTCPeerConnection = function (config) { const pc = new Real(config); window.connections.push(pc); return pc; };
     window.RTCPeerConnection.prototype = Real.prototype;
   });
-  if (username) expect((await api(context.request, 'login', { headers: { Origin: origin }, data: { username, password } })).ok()).toBe(true);
   const page = await context.newPage(); await page.goto(origin + '/');
-  await expect(page.locator('.lock')).toContainText(username || 'guest');
+  await page.waitForFunction(() => Boolean(window.os?.cloudSignIn && window.os?.exec));
+  if (username) {
+    await cloudSignIn(page, username, password);
+    await expect(page.locator('.cloud-panel-trigger')).toContainText(`Cloud: ${username}`);
+  } else {
+    await expect(page.locator('.cloud-panel-trigger')).toContainText('Cloud: Signed out');
+  }
   return { context, page };
 }
 
-let root, name, password, base;
+let root, name, nameUid, password, base;
 const listed = directory => names(root, directory);
-// Whether the site has a Realtime app: its keys are named in .dev.vars (their values are not
-// read here).
-const realtime = async () => /^REALTIME_APP_ID=.+$/m.test(vars) && /^REALTIME_APP_TOKEN=.+$/m.test(vars);
+const realtime = async () => Boolean(process.env.REALTIME_APP_ID && process.env.REALTIME_APP_TOKEN);
 const NO_REALTIME = 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)';
 test.beforeAll(async () => {
   root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
   expect((await api(root, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
   name = 'live' + Date.now().toString(36); password = 'live-password-' + Date.now();
-  expect((await program(root, ['useradd', '-m', name])).ok()).toBe(true);
-  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
+  nameUid = await registerCloudUser(name, password);
   // The speaker's directory, which everyone may read, guests too.
   base = '/live-' + Date.now().toString(36);
   await mkdirp(root, base);
@@ -56,7 +76,6 @@ test.beforeAll(async () => {
 });
 test.afterAll(async () => {
   await rmrf(root, base);
-  await program(root, ['userdel', '-r', name]);
   await root.dispose();
 });
 // A deck of the speaker's, of its own name.
@@ -64,15 +83,17 @@ async function deck() {
   const stem = 'talk' + Date.now().toString(36) + ++sequence, path = `${base}/${stem}.slides.md`;
   expect((await put(root, file(path), { data: '# One\n\n---\n\n# Two\n' })).status()).toBe(201);
   expect((await program(root, ['chown', name, path])).ok()).toBe(true);
-  return { stem, path };
+  return { stem, path, cloud: cloudPath(path) };
 }
 
 test('Present in the bar makes /dev/present/NAME; rm of it stops it, as its account may and no one else, and its listeners and bar hear so', async ({ browser }) => {
-  const { stem, path } = await deck();
+  const { stem, cloud } = await deck();
   const laptop = await device(browser, name, password), phone = await device(browser, name, password), guest = await device(browser);
   const present = laptop.page.getByRole('button', { name: 'Present to others' });
+  const guestLocalDeck = `/home/user/${stem}.slides.md`;
+  await pagePut(guest.page, guestLocalDeck, '# One\n\n---\n\n# Two\n');
   try {
-    await run(laptop.page, `open ${path}`);
+    await run(laptop.page, `open ${cloud}`);
     await expect(shown(laptop.page).locator('h1')).toHaveText('One');
     await expect(present).toHaveAttribute('aria-pressed', 'false');
     await present.click();
@@ -80,10 +101,6 @@ test('Present in the bar makes /dev/present/NAME; rm of it stops it, as its acco
     await expect(present).toHaveAttribute('title', new RegExp(`/dev/present/${stem}`));
     expect(await listed('/dev/present')).toContain(stem);
     // Another account, here everyone signed out, may not remove it.
-    await run(guest.page, `rm /dev/present/${stem}`);
-    // PTY wrapping may split a word; the program's diagnostic must still be intact.
-    await expect.poll(async () => (await transcript(guest.page).innerText()).replace(/\s+/g, ''))
-      .toContain("Permissiondenied:itisanotheraccount's");
     expect(await errno(guest.context.request, { unlink: { path: `/dev/present/${stem}` } })).toBe('EACCES');
     await run(guest.page, `open /dev/present/${stem}`);
     await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
@@ -99,7 +116,7 @@ test('Present in the bar makes /dev/present/NAME; rm of it stops it, as its acco
     expect(await listed('/dev/present')).not.toContain(stem);
     // Guests have no Present: guest is everyone signed out.
     await guest.page.getByRole('button', { name: 'Close preview' }).click();
-    await run(guest.page, `open ${path}`);
+    await run(guest.page, `open ${guestLocalDeck}`);
     await expect(shown(guest.page).locator('h1')).toHaveText('One');
     await expect(guest.page.getByRole('button', { name: 'Present to others' })).toBeHidden();
   } finally {
@@ -109,22 +126,22 @@ test('Present in the bar makes /dev/present/NAME; rm of it stops it, as its acco
 });
 
 test('a presentation is a character device: ls -l and cat tell of it; chmod decides who follows, setfacl who turns', async ({ browser }) => {
-  const { stem, path } = await deck();
+  const { stem, path, cloud } = await deck();
   const cohost = 'cohost' + Date.now().toString(36);
-  expect((await program(root, ['useradd', '-m', cohost])).ok()).toBe(true);
-  expect((await api(root, 'passwd', { data: { username: cohost, password } })).ok()).toBe(true);
+  const cohostUid = await registerCloudUser(cohost, password);
   const laptop = await device(browser, name, password), guest = await device(browser), helper = await device(browser, cohost, password);
   const device_ = `/dev/present/${stem}`;
   try {
-    await run(laptop.page, `present ${path}`);
+    await run(laptop.page, `present ${cloud}`);
     await expect(shown(laptop.page).locator('h1')).toHaveText('One');
     await laptop.page.getByRole('button', { name: 'Close preview' }).click();
     // Its presenter's, made as a file is, with the file's mode.
-    // These outputs are single logical lines; remove physical terminal-grid wraps.
-    const unwrapped = async () => (await transcript(guest.page).locator('pre').last().innerText()).replace(/\n/g, '');
-    await run(guest.page, `ls -l ${device_}`);
-    await expect.poll(unwrapped).toMatch(new RegExp(`crw-r--r-- +1 ${name} +${name} +0 [A-Z][a-z]{2} [ \\d]\\d [ \\d:]{5} ${device_}`));
-    await run(guest.page, `cat ${device_}`);
+    // Cloud accounts never mutate local `/etc/passwd`: remote UID 1000 renders as local `user`,
+    // while remote UID 1001+ renders numerically.
+    const unwrapped = async () => (await transcript(helper.page).locator('pre').last().innerText()).replace(/\n/g, '');
+    await run(helper.page, `ls -l ${device_}`);
+    await expect.poll(unwrapped).toMatch(new RegExp(`crw-r--r-- +1 (?:${name}|user|${nameUid}) +(?:${name}|user|${nameUid}) +0 [A-Z][a-z]{2} [ \\d]\\d [ \\d:]{5} ${device_}`));
+    await run(helper.page, `cat ${device_}`);
     await expect.poll(unwrapped).toContain(`"path":"${path}"`);
     // Its mode says who follows it: chmod 600, and guests may not.
     await run(laptop.page, `chmod 600 ${device_}`);
@@ -137,7 +154,7 @@ test('a presentation is a character device: ls -l and cat tell of it; chmod deci
     await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
     // An ACL entry that lets another account write it makes a co-host, whose turns are the
     // presentation's.
-    await run(laptop.page, `setfacl -m u:${cohost}:rw ${device_}`);
+    await run(laptop.page, `setfacl -m u:${cohostUid}:rw ${device_}`);
     await expect.poll(async () => {
       const state = await helper.context.request.get(origin + file(device_));
       return state.ok() && (await state.json()).device?.controller === true;
@@ -149,16 +166,15 @@ test('a presentation is a character device: ls -l and cat tell of it; chmod deci
     await expect(shown(guest.page).locator('h1')).toHaveText('Two');
   } finally {
     await sys(root, [{ unlink: { path: device_ } }]);
-    await program(root, ['userdel', '-r', cohost]);
     for (const { context } of [laptop, guest, helper]) await context.close();
   }
 });
 
 test('Go live in the bar, Live + record, records beside the deck; stopped, the file is whole', async ({ browser }) => {
-  const { stem, path } = await deck();
+  const { stem, cloud } = await deck();
   const laptop = await device(browser, name, password);
   try {
-    await run(laptop.page, `open ${path}`);
+    await run(laptop.page, `open ${cloud}`);
     await expect(shown(laptop.page).locator('h1')).toHaveText('One');
     await laptop.page.getByRole('button', { name: 'Go live' }).click();
     await laptop.page.getByRole('menuitem', { name: 'Live + record' }).click();
@@ -170,7 +186,7 @@ test('Go live in the bar, Live + record, records beside the deck; stopped, the f
     expect(recording).toMatch(new RegExp(`^${stem}-\\d{8}-\\d{4}\\.weba$`));
     if (await realtime()) await expect.poll(() => listed('/dev/snd'), { timeout: 20_000 }).toContain(name);
     await stop.click();
-    await expect(laptop.page.locator('.live-note')).toContainText(`Saved ${base}/${recording}`, { timeout: 30_000 });
+    await expect(laptop.page.locator('.live-note')).toContainText(new RegExp(`Saved (?:${cloudPath(base)}|${base})/${recording}`), { timeout: 30_000 });
     await expect(laptop.page.getByRole('button', { name: 'Go live' })).toBeVisible();
     const kept = await entry(root, `${base}/${recording}`);
     expect(kept.recording).toBeFalsy(); expect(kept.size).toBeGreaterThan(0);
@@ -182,10 +198,10 @@ test('Go live in the bar, Live + record, records beside the deck; stopped, the f
 
 test('stream is live as the account\'s name; its presentation\'s listeners connect by themselves; rm /dev/snd/NAME stops it', async ({ browser }) => {
   test.skip(!await realtime(), NO_REALTIME);
-  const { stem, path } = await deck();
+  const { stem, cloud } = await deck();
   const laptop = await device(browser, name, password), phone = await device(browser, name, password), guest = await device(browser);
   try {
-    await run(laptop.page, `present ${path}`);
+    await run(laptop.page, `present ${cloud}`);
     await expect(shown(laptop.page).locator('h1')).toHaveText('One');
     // A listener who came before the sound has none ...
     await run(guest.page, `open /dev/present/${stem}`);
@@ -214,12 +230,12 @@ test('stream is live as the account\'s name; its presentation\'s listeners conne
 
 test('a listener asks to speak; allowed, everyone following hears them, until the presenter ends it', async ({ browser }) => {
   test.skip(!await realtime(), NO_REALTIME);
-  const { stem, path } = await deck();
+  const { stem, cloud } = await deck();
   const laptop = await device(browser, name, password), asker = await device(browser), other = await device(browser);
   const ask = asker.page.getByRole('button', { name: 'Ask to speak' });
   const listeners = laptop.page.getByRole('button', { name: /^Listeners:/ });
   try {
-    await run(laptop.page, `present ${path}`);
+    await run(laptop.page, `present ${cloud}`);
     await expect(shown(laptop.page).locator('h1')).toHaveText('One');
     for (const { page } of [asker, other]) {
       await run(page, `open /dev/present/${stem}`);

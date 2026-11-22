@@ -272,18 +272,10 @@ pub fn markdown(source: &str, path: &str) -> String {
         .clean(&html)
         .to_string();
     // These exact URLs were produced by Within/file_url after sanitization.
-    // Keep private images inert until the viewer reads them through its VFS;
-    // a DOM src would bypass the page's filesystem transport and reach cloud.
-    for prefix in [
-        "%2Fmnt%2Flocal%2F",
-        "%2Fmnt%2Fshared%2F",
-        "%2Fopt%2Fprivate%2F",
-    ] {
-        clean = clean.replace(
-            &format!("src=\"/api/file?path={prefix}"),
-            &format!("data-local-src=\"/api/file?path={prefix}"),
-        );
-    }
+    // Keep ALL internal `/api/file?path=...` images inert until the viewer reads
+    // them through the client-kernel VFS; a raw DOM `src` would bypass `local-files.js`,
+    // leak local `os-cowfs` paths over HTTP, and fail 404 offline.
+    clean = clean.replace("src=\"/api/file?path=", "data-local-src=\"/api/file?path=");
     // require-corp preserves process isolation in Safari too. Remote images use
     // anonymous CORS instead of sending cross-site cookies or weakening isolation.
     for prefix in ["https://", "http://", "//"] {
@@ -779,7 +771,7 @@ mod test {
             "{html}"
         );
         assert!(
-            html.contains(r#"<img src="/api/file?path=%2Fdocs%2Fmissing">"#),
+            html.contains(r#"<img data-local-src="/api/file?path=%2Fdocs%2Fmissing">"#),
             "{html}"
         );
         assert!(
@@ -808,7 +800,7 @@ mod test {
             "{html}"
         );
         assert!(
-            html.contains(r#"src="/api/file?path=%2Fdocs%2Fimg%2Fa.png""#),
+            html.contains(r#"data-local-src="/api/file?path=%2Fdocs%2Fimg%2Fa.png""#),
             "{html}"
         );
         assert!(html.contains("☑ done"), "{html}");
@@ -851,7 +843,13 @@ mod test {
 
     #[test]
     fn private_markdown_images_never_start_a_cloud_request() {
-        for root in ["/mnt/local/dev", "/mnt/shared/dev", "/opt/private/dev"] {
+        for root in [
+            "/mnt/local/dev",
+            "/mnt/shared/dev",
+            "/opt/private/dev",
+            "/home/user",
+            "/mnt/cloud/docs",
+        ] {
             let html = markdown(
                 "![local](pixel.png)\n\n[notes](other.md)",
                 &format!("{root}/notes.md"),
@@ -860,7 +858,6 @@ mod test {
             assert!(!html.contains("<img src="));
             assert!(html.contains("href=\"/api/file?path="));
         }
-        assert!(markdown("![cloud](pixel.png)", "/home/notes.md").contains("<img src="));
     }
 
     #[test]

@@ -43,31 +43,43 @@ function isRemoteServerDevPath(raw, includeDir = false) {
 }
 
 const REMOTE_DEV_PATH_OPS = new Set([
-  'stat', 'lstat', 'getdents', 'mknod', 'unlink', 'getxattr', 'setxattr', 'listxattr', 'removexattr', 'open',
+  'stat', 'lstat', 'access', 'getdents', 'mknod', 'unlink', 'chmod',
+  'getxattr', 'setxattr', 'listxattr', 'removexattr', 'open', 'inotify_add_watch',
 ]);
 const REMOTE_DEV_REF_OPS = new Set(['ioctl', 'close', 'fstat', 'pread', 'pwrite']);
+
+function isAttendingCloudPath(raw) {
+  const scope = globalThis.__osAttendingCloudScope;
+  if (!scope || typeof raw !== 'string') return false;
+  return raw === scope.file || (scope.dir && raw.startsWith(scope.dir));
+}
 
 function isRemoteServerDevBatch(calls) {
   if (!Array.isArray(calls) || calls.length === 0) return false;
   const devOpenIndices = new Set();
+  let hasDevPathOp = false;
   for (let i = 0; i < calls.length; i++) {
     const c = calls[i];
     const name = callName(c);
     const arg = typeof c === 'object' && c !== null ? Object.values(c)[0] : null;
     if (!arg || typeof arg !== 'object') return false;
     if (REMOTE_DEV_PATH_OPS.has(name)) {
-      if (!isRemoteServerDevPath(arg.path, name === 'getdents' || name === 'stat' || name === 'lstat')) {
+      const includeDir = name === 'getdents' || name === 'stat' || name === 'lstat' || name === 'access' || name === 'inotify_add_watch';
+      if (!isRemoteServerDevPath(arg.path, includeDir)) {
         return false;
       }
+      hasDevPathOp = true;
       if (name === 'open') devOpenIndices.add(i);
     } else if (REMOTE_DEV_REF_OPS.has(name)) {
       const ref = arg.fd && typeof arg.fd === 'object' ? arg.fd.ref : null;
       if (typeof ref !== 'number' || !devOpenIndices.has(ref)) return false;
+    } else if (name === 'inotify_rm_watch') {
+      // Allowed when piggybacked by HttpSys onto a remote /dev/{present,snd} batch.
     } else {
       return false;
     }
   }
-  return true;
+  return hasDevPathOp;
 }
 
 function callName(call) {
@@ -238,7 +250,8 @@ export function installLocalFiles() {
         url.searchParams.has('path') &&
         !url.searchParams.has('compile') &&
         !url.searchParams.has('token') &&
-        !isRemoteServerDevPath(url.searchParams.get('path'))
+        !isRemoteServerDevPath(url.searchParams.get('path')) &&
+        !isAttendingCloudPath(url.searchParams.get('path'))
       ) {
         if (!['GET', 'HEAD'].includes(request.method)) return json({ errno: 'EINVAL' }, 400);
         const path = url.searchParams.get('path');

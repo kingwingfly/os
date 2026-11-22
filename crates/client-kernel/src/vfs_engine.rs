@@ -7,8 +7,8 @@
 //! `vfs_sys`, and `proc_resolve_exec`.
 
 use crate::cloudfs::{
-    Actor, AuthorityPageFd, CloudMountDriver, Connector, installed, page_sys_batch_with_session,
-    promised,
+    Actor, AuthorityPageFd, CloudMountDriver, Connector, installed, page_batch_target,
+    page_sys_batch_with_session, promised,
 };
 use crate::local_accounts::seed_local_stage1_memfs;
 use crate::mounts::{Grant, LocalMount, errno_code};
@@ -8514,7 +8514,7 @@ impl Kernel {
         use vfs::walk::WalkResult;
 
         let resolved = vfs.resolve_open(pid, anchor, path, pass_flags).await?;
-        let (pin, _node, creation) = match &resolved {
+        let (pin, node, creation) = match &resolved {
             WalkResult::Found { pin, entry, .. } => (pin, entry.handle.node, None),
             WalkResult::MissingLast {
                 parent_pin,
@@ -8552,6 +8552,60 @@ impl Kernel {
                 if entry.metadata.is_dir() {
                     return Err(Errno::EISDIR.into());
                 }
+            }
+            if pin.fstype() == vfs::FsType::Cloud && cloud_mount.is_cloud_signed_in() {
+                use vfs::cloud_http::PageTarget;
+                let canonical = cloud_mount
+                    .canonical_cloud_path(node)
+                    .ok_or(Errno::ESTALE)?;
+                let (cloud_path, target) = match &creation {
+                    Some((_, leaf)) => (
+                        format!("{}/{leaf}", canonical.trim_end_matches('/')),
+                        PageTarget::MissingIn(node.ino),
+                    ),
+                    None => (canonical, PageTarget::Inode(node.ino)),
+                };
+                let umask = vfs.process_fs_context(pid)?.borrow().umask;
+                let writer = pin.pin_writer(&vfs.process_cred(pid)?)?;
+                let fs_session = cloud_mount.current_fs_session();
+                let mut results = page_batch_target(
+                    Batch {
+                        calls: vec![Call::Open {
+                            path: cloud_path,
+                            flags,
+                            mode,
+                            size,
+                            sha256,
+                            version,
+                        }],
+                        umask: Some(umask),
+                        sudo: false,
+                        pid: None,
+                        process: None,
+                    },
+                    fs_session
+                        .as_ref()
+                        .map(|(sid, secret)| (sid.as_str(), secret.as_str())),
+                    Some(target),
+                    None,
+                )
+                .await?;
+                let value = results.pop().ok_or(Errno::EIO)?.into_result()?;
+                let remote: AuthorityPageFd =
+                    serde_json::from_value(value.clone()).map_err(|_| Errno::EIO)?;
+                let fd = remote.fd;
+                {
+                    let mut rt = self.vfs_rt.borrow_mut();
+                    if let Some(sess) = page_sid
+                        .and_then(|sid| rt.page_session_mut(sid))
+                        .filter(|s| epoch.as_ref().is_some_and(|e| Rc::ptr_eq(e, &s.epoch)))
+                    {
+                        sess.delegated_uploads.insert(fd, (remote, writer));
+                        return Ok((fd, value));
+                    }
+                }
+                let _ = remote.close(false).await;
+                return Err(Errno::ESTALE.into());
             }
             if version.is_some() {
                 return Err(Errno::EOPNOTSUPP.into());

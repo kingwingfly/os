@@ -1,13 +1,14 @@
 import { test, expect } from './test.js';
 import binaryen from 'binaryen';
+
 const batch = (page, calls) => page.evaluate(async calls => (await (await fetch('/api/sys', { method: 'POST', body: JSON.stringify({ calls }) })).json()).results, calls);
 async function client(browser) {
   const context = await browser.newContext(), page = await context.newPage();
-  const guestReady = page.waitForResponse(response => new URL(response.url()).pathname === '/api/sys' && response.request().method() === 'POST' && response.ok());
   await page.goto('/');
-  await Promise.all([guestReady, page.waitForFunction(() => window.os?.shareMount)]);
-  const [creds] = await batch(page, ['getcreds']);
-  return { context, page, uid: creds.ok.uid };
+  await page.waitForFunction(() => Boolean(window.os?.shareMount && window.os?.sharedMounts));
+  const [localCreds] = await batch(page, ['getcreds']);
+  const relay = await page.evaluate(() => window.os.sharedMounts());
+  return { context, page, uid: relay.uid, localUid: localCreds.ok.uid };
 }
 async function dispose(...clients) { for (const client of clients) await client?.context.close(); }
 async function write(page, path, text) {
@@ -41,7 +42,7 @@ test('distinct guest accounts use normal setfacl and explicitly mount a publishe
     await attach(receiver, grant);
     expect(await read(receiver.page)).toEqual({ status: 200, text: 'OWNER_PRIVATE_DATA' });
     await expect(attach(stranger, grant)).rejects.toThrow();
-    const [stat] = await batch(receiver.page, [{ stat: { path: '/mnt/shared/project/text' } }]); expect(stat.ok.uid).toBe(owner.uid);
+    const [stat] = await batch(receiver.page, [{ stat: { path: '/mnt/shared/project/text' } }]); expect(stat.ok.uid).toBe(owner.localUid);
     const acl = await command(receiver.page, ['getfacl', '-n', '/mnt/shared/project/text']); expect(acl.output).toContain(String(receiver.uid));
     const [denied] = await batch(receiver.page, [{ chmod: { path: '/mnt/shared/project/text', mode: 0o777 } }]); expect(['EPERM', 'EROFS']).toContain(denied.err.errno);
     const [readonly] = await batch(receiver.page, [{ open: { path: '/mnt/shared/project/text', flags: 1 } }]); expect(readonly.err.errno).toBe('EROFS');
@@ -128,7 +129,7 @@ test('password bypass is scoped to the export and preserves the receiving accoun
     expect(await read(receiver.page)).toEqual({ status: 200, text: 'PUBLIC' });
     await write(receiver.page, '/mnt/shared/project/text', 'UPDATED');
     expect((await read(receiver.page)).text).toBe('UPDATED');
-    expect((await batch(receiver.page, ['getcreds']))[0].ok.uid).toBe(receiver.uid);
+    expect((await batch(receiver.page, ['getcreds']))[0].ok.uid).toBe(receiver.localUid);
     const [escape] = await batch(receiver.page, [{ pread: { path: '/mnt/shared/project/../text' } }]); expect(['EACCES', 'ENOENT']).toContain(escape.err.errno);
     // Neither a password nor a connection permits access the owner has removed.
     await command(owner.page, ['chmod', '000', '/mnt/local/source/public/text']);

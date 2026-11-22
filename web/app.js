@@ -183,8 +183,18 @@ function stopListening() {
   eventsRetry = 0;
   try { socket?.close(); } catch { /* ignore */ }
 }
-function listen() {
-  if (!cloudSignedIn) return;
+const toCloudPath = path => {
+  if (typeof path !== 'string') return path;
+  if (path === '/mnt/cloud') return '/';
+  if (path.startsWith('/mnt/cloud/')) return path.slice('/mnt/cloud'.length);
+  return path;
+};
+const wantsEvents = () => cloudSignedIn || !!following || !!hearing || voices.size > 0 || !!speaking;
+function ensureListening() {
+  if (!events || events.readyState > WebSocket.OPEN) listen(true);
+}
+function listen(force = false) {
+  if (!force && !wantsEvents()) return;
   clearTimeout(reconnectTimer);
   events?.close();
   const socket = events = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/events`);
@@ -197,8 +207,9 @@ function listen() {
     if (following || hearing) socket.send(JSON.stringify({ follow: followed() }));
     // A deck shown here asks where its account is now, as turns made elsewhere while the line
     // was down were not heard; unless it turned itself meanwhile, which goes out below.
-    const turned = outbox.some(message => message.present?.path === shown?.path);
-    if (reconnected && shown && !following && !turned) outbox.push({ where: shown.path });
+    const shownCloud = toCloudPath(shown?.path);
+    const turned = outbox.some(message => message.present?.path === shownCloud);
+    if (reconnected && shown && !following && !turned) outbox.push({ where: shownCloud });
     for (const message of outbox.splice(0)) socket.send(JSON.stringify(message));
   };
   socket.onmessage = event => {
@@ -241,10 +252,10 @@ function listen() {
     clearTimeout(pendingTimer);
     pendingTimer = setTimeout(() => window.dispatchEvent(new CustomEvent('os-remote')), 250);
   };
-  socket.onclose = () => { clearInterval(ping); if (events === socket && cloudSignedIn) reconnectTimer = setTimeout(listen, Math.min(30000, 1000 * 2 ** eventsRetry++)); };
+  socket.onclose = () => { clearInterval(ping); if (events === socket && wantsEvents()) reconnectTimer = setTimeout(listen, Math.min(30000, 1000 * 2 ** eventsRetry++)); };
 }
 // Boot is 100% offline-first (ZERO network RPCs, ZERO `/api/events` WebSocket while signed out
-// of Cloud). `/api/events` opens only after explicit `cloudSignIn()`.
+// of Cloud). `/api/events` opens lazily on explicit `cloudSignIn()` or `attend()`/`hear()`.
 // Slides and PDFs presented follow each other (owner's request, 2026-10-28): the place a page
 // presents (viewer.rs calls present) shows in this browser's other windows showing that file,
 // and in the account's pages signed in elsewhere, which the authority tells (store.rs relay).
@@ -252,14 +263,24 @@ const presenting = 'BroadcastChannel' in window ? new BroadcastChannel('os-prese
 // The last place this page heard of or showed, by path, which a deck shown later starts at
 // (viewer.rs follow_presenting): one may come while its file is still being read.
 const heard = new Map();
-const presented = detail => { heard.set(detail.path, detail.at); window.dispatchEvent(new CustomEvent('os:present', { detail })); };
+const presented = detail => {
+  const cloudPath = toCloudPath(detail.path);
+  const mountedPath = cloudPath.startsWith('/') ? `/mnt/cloud${cloudPath}` : cloudPath;
+  heard.set(detail.path, detail.at);
+  heard.set(cloudPath, detail.at);
+  heard.set(mountedPath, detail.at);
+  const mapped = (shown?.path && toCloudPath(shown.path) === cloudPath) ? { ...detail, path: shown.path } : detail;
+  window.dispatchEvent(new CustomEvent('os:present', { detail: mapped }));
+};
 if (presenting) presenting.onmessage = event => presented(event.data);
 function present(path, column, row) {
-  const place = { path, at: [column, row] };
+  const cloudPath = toCloudPath(path);
+  const place = { path: cloudPath, at: [column, row] };
   heard.set(path, place.at);
-  presenting?.postMessage(place);
+  heard.set(cloudPath, place.at);
+  presenting?.postMessage({ path, at: [column, row] });
   // While the line is down, only the last place of each file waits for it.
-  const waiting = outbox.findIndex(message => message.present?.path === path);
+  const waiting = outbox.findIndex(message => message.present?.path === cloudPath);
   if (waiting >= 0) outbox.splice(waiting, 1);
   say({ present: place });
 }
@@ -268,7 +289,7 @@ const outbox = [];
 function say(message) { if (events?.readyState === WebSocket.OPEN) events.send(JSON.stringify(message)); else outbox.push(message); }
 // Where the account last showed the file at `path`, on any device, which the authority answers
 // with a present message; a page opens a deck there (viewer.rs).
-function ask(path) { say({ where: path }); }
+function ask(path) { say({ where: toCloudPath(path) }); }
 // The presentation this page follows (devices.rs), as /api/device described it: /dev/present/NAME,
 // the file it shows, whose it is, and whether this page's account turns it.
 let following = null;
@@ -287,17 +308,32 @@ async function attend(device) {
   catch (error) { if (turn === followings) throw error; return; }
   if (turn !== followings) return;
   if (following?.device !== info.device) declined = null;
-  following = info; follows();
+  following = info;
+  ensureListening();
+  follows();
   // Slides and sound together: the presenter's live sound, and the listeners speaking.
   if (info.sound && hearing?.device !== info.sound && declined !== info.device) hear(info.sound).catch(error => console.warn('No live sound', error));
   for (const voice of info.voices ?? []) if (voice.ask !== bar.asking?.id) void hearVoice(voice);
   // Shown as the presenter shows it, from where they are.
-  if (info.kind === 'pdf') setPlace(info.path, { present: true, ...(info.place ? { page: info.place[0] } : {}) });
-  else setPlace(info.path, { slides: true, ...(info.place ? { slide: info.place } : {}) });
-  return open(info.path, info.kind, false, true);
+  const viewPath = cloudSignedIn && !info.path.startsWith('/mnt/cloud/')
+    ? `/mnt/cloud${info.path}`
+    : info.path;
+  if (!cloudSignedIn) {
+    const slash = info.path.lastIndexOf('/');
+    globalThis.__osAttendingCloudScope = {
+      file: info.path,
+      dir: slash > 0 ? info.path.slice(0, slash + 1) : null,
+    };
+  } else {
+    globalThis.__osAttendingCloudScope = null;
+  }
+  if (info.kind === 'pdf') setPlace(viewPath, { present: true, ...(info.place ? { page: info.place[0] } : {}) });
+  else setPlace(viewPath, { slides: true, ...(info.place ? { slide: info.place } : {}) });
+  return open(viewPath, info.kind, false, true);
 }
 function unfollow() {
   followings++;
+  globalThis.__osAttendingCloudScope = null;
   if (!following) return;
   // Leaving the presentation withdraws an ask to speak, and ends the voice sent.
   if (bar.asking) { if (bar.asking.state === 'asking') void dev.ask(bar.asking.presentation, true).catch(() => {}); void stopSpeaking(); }
@@ -561,7 +597,7 @@ async function hear(device, again = 0) {
     stopHearing(); throw error;
   }
   if (turn !== hearings) { heard.stop(); audio.remove(); return; }
-  hearing = { device, stop: heard.stop, version: heard.version }; player.dataset.state = 'live'; follows();
+  hearing = { device, stop: heard.stop, version: heard.version }; player.dataset.state = 'live'; ensureListening(); follows();
   // A browser that wants a tap to play sound shows Listen.
   try { await audio.play(); } catch { if (turn === hearings) player.dataset.state = 'paused'; }
 }
@@ -949,7 +985,7 @@ $('download').addEventListener('click', async event => {
 async function open(path, kind, followed = false, attending = false) {
   if (/^\/dev\/present\/[^/]+$/.test(path)) return attend(path);
   if (/^\/dev\/snd\/[^/]+$/.test(path)) return hear(path);
-  if (!attending && following?.path !== path) unfollow();
+  if (!attending && (!following || toCloudPath(following.path) !== toCloudPath(path))) unfollow();
   if (!followed) trail.length = 0;
   const version = await cleanupViewer();
   if (version !== viewerVersion) return;
@@ -1056,7 +1092,7 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.os = { bootStatus, closeCleanRoot, cloudSignIn, cloudSignOut, cloudStatus, revokeCloudTokensOnly, shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal: args => kernelCall('mount_attach', args), localMountList: () => kernelCall('mount_list'), unmountLocal: path => kernelCall('mount_detach', { path }), activatePrivate: args => kernelCall('mount_activate', args), localMounts, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, config: () => configuration.branding, exec, closeConsole, grantConsole, revokeConsole, attachConsole, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionCursor: () => $('command')?.selectionStart ?? 0, completionFocus: (value, cursor) => {
+window.os = { bootStatus, closeCleanRoot, cloudSignIn, cloudSignOut, cloudStatus, revokeCloudTokensOnly, shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal: args => kernelCall('mount_attach', args), localMountList: () => kernelCall('mount_list'), unmountLocal: path => kernelCall('mount_detach', { path }), activatePrivate: args => kernelCall('mount_activate', args), localMounts, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, config: () => configuration.branding, exec, closeConsole, grantConsole, revokeConsole, attachConsole, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following && toCloudPath(following.path) === toCloudPath(path) ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionCursor: () => $('command')?.selectionStart ?? 0, completionFocus: (value, cursor) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]:modal') || otherWindow()) return;

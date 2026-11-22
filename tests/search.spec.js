@@ -1,25 +1,42 @@
 import { test, expect } from './test.js';
-import { readFile } from 'node:fs/promises';
-import { api, mkdirp, put, rmrf } from './sys.js';
-const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
-const file = path => '/api/file?path=' + encodeURIComponent(path);
-let base, headers;
+import { pageMkdirp, pagePut, pageRmrf } from './ui.js';
 
-test.beforeEach(async ({ request, page }) => {
-  base = '/search-' + Date.now().toString(36);
-  headers = { Origin: origin, 'CF-Connecting-IP': 'search-' + base };
-  await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'search-ui-' + base });
-  expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
-  await mkdirp(request, base);
+function minimalWav() {
+  const samples = 4000;
+  const buf = Buffer.alloc(44 + samples, 0x80);
+  buf.write('RIFF', 0);
+  buf.writeUInt32LE(36 + samples, 4);
+  buf.write('WAVEfmt ', 8);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(8000, 24);
+  buf.writeUInt32LE(8000, 28);
+  buf.writeUInt16LE(1, 32);
+  buf.writeUInt16LE(8, 34);
+  buf.write('data', 36);
+  buf.writeUInt32LE(samples, 40);
+  return buf;
+}
+
+let base;
+
+test.beforeEach(async ({ page }) => {
+  base = '/home/user/search-' + Date.now().toString(36);
+  await page.goto('/');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await pageMkdirp(page, base, 0o755);
   const files = {
     'main.rs': 'fn main() {\n    let spéctrum = "γάμμα";\n    helper(spéctrum);\n}\n\nfn helper(x: &str) {}\nfn Other() {}\n',
     'notes.txt': 'a.b axb A.B\nsecond line\n',
     'guide.md': '# Guide\n\nSearch **this** text, and this `code`.\n',
   };
-  for (const [name, text] of Object.entries(files)) expect((await put(request, file(`${base}/${name}`), { headers, data: text })).status()).toBe(201);
+  for (const [name, text] of Object.entries(files)) await pagePut(page, `${base}/${name}`, text);
+  await pagePut(page, `${base}/signal.wav`, minimalWav());
 });
-test.afterEach(async ({ request }) => { await rmrf(request, base); });
+test.afterEach(async ({ page }) => {
+  if (base) await pageRmrf(page, base).catch(() => {});
+});
 
 async function open(page, name) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
@@ -30,7 +47,6 @@ async function open(page, name) {
 const highlighted = (page, name) => page.evaluate(n => CSS.highlights.get(n)?.size ?? 0, name);
 
 test('a regular expression searches highlighted code, step by step, without changing it', async ({ page }) => {
-  await page.goto('/');
   await open(page, 'main.rs');
   // Wait for syntax highlighting, which replaces the code's markup.
   await expect(page.locator('.text-preview code span').first()).toBeVisible();
@@ -78,7 +94,6 @@ test('a regular expression searches highlighted code, step by step, without chan
 });
 
 test('plain text matches literally without regular expressions; Markdown is searchable; media is not', async ({ page }) => {
-  await page.goto('/');
   await open(page, 'notes.txt');
   await expect(page.locator('#viewer-search')).toBeVisible();
   await page.keyboard.press('Control+f');
@@ -96,7 +111,7 @@ test('plain text matches literally without regular expressions; Markdown is sear
   await page.keyboard.press('Control+f');
   await search.fill('this'); await expect(status).toHaveText('1 of 2');
   await page.getByRole('button', { name: 'Close preview' }).click();
-  await open(page, '../media/signal.wav');
+  await open(page, 'signal.wav');
   await expect(page.locator('audio')).toBeVisible();
   await expect(page.locator('#viewer-search')).toBeHidden();
   await page.keyboard.press('Control+f');

@@ -2,9 +2,9 @@ import { test, expect, request as playwrightRequest } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { api, call, descriptors, errno, listing, mkdirp, rmrf, sys } from './sys.js';
-import { browse } from './ui.js';
+import { browse, cloudSignIn } from './ui.js';
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const CHUNK = 8 * 1024 * 1024;
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -29,12 +29,9 @@ const O_WRONLY = 0o1, O_CREAT = 0o100;
 async function login(page) {
   await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'uploads-ui-' + Date.now() });
   await page.goto('/');
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await input.fill('su root'); await input.press('Enter');
-  await expect(page.locator('#auth')).toBeVisible();
-  await page.getByLabel('Password', { exact: true }).fill(rootPassword); await page.locator('#auth button[type=submit]').click();
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-  return input;
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
+  await cloudSignIn(page, 'root', rootPassword);
+  return page.getByRole('combobox', { name: 'Terminal command' });
 }
 
 test('a file is written in chunks through a descriptor, each checked, readable as it arrives, gone on with elsewhere', async () => {
@@ -119,11 +116,12 @@ test('a file is written in chunks through a descriptor, each checked, readable a
 
 test('the browser resumes an interrupted upload from the chunks already sent, and Cancel removes a partial file', async ({ page }) => {
   const folder = '/browser-uploads-' + Date.now().toString(36);
+  const cloudFolder = '/mnt/cloud' + folder;
   const input = await login(page);
-  for (const command of ['mkdir ' + folder, 'cd ' + folder]) {
+  for (const command of ['mkdir ' + cloudFolder, 'cd ' + cloudFolder]) {
     await input.fill(command); await input.press('Enter'); await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   }
-  await browse(page, folder);
+  await browse(page, cloudFolder);
   const bytes = content();
   const sent = [];
   // Drop the connection on the third chunk, until the client gives up after its retries.

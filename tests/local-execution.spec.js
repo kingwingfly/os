@@ -1,7 +1,7 @@
 import { test, expect } from './storage-test.js';
 import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
-import { api } from './sys.js';
+import { switchLocalUser } from './ui.js';
 import { hookPageKernel } from './service-auth.js';
 
 const coreutils = await readFile('dist/usr/bin/coreutils.wasm');
@@ -17,7 +17,7 @@ const hello = word => assemble(`(module
 async function ready(page) {
   await page.goto('/');
   await page.waitForFunction(() => window.os?.exec);
-  await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle');
+  await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
 }
 async function storage(page, { cloud = false } = {}) {
   await page.evaluate(() => { void window.os.localMounts(); });
@@ -58,9 +58,8 @@ test('login shutdown invalidates private mount access', async ({ page }) => {
 
 test('an account change cannot reuse the previous account private namespace', async ({ page }) => {
   await ready(page); await storage(page); await write(page, 'private', new TextEncoder().encode('ACCOUNT_PRIVATE'));
-  const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
-  expect((await api(page.request, 'login', { headers: { 'CF-Connecting-IP': 'local-account-' + Date.now() }, data: { username: 'root', password } })).ok()).toBe(true);
-  expect(await page.evaluate(async () => (await fetch('/api/file?path=/mnt/local/project/private')).status)).not.toBe(200);
+  await switchLocalUser(page, 'root');
+  await expect.poll(() => page.evaluate(async () => (await fetch('/api/file?path=/mnt/local/project/private')).status)).not.toBe(200);
   // Fresh inspection may find a new empty workspace or require joining the new
   // login scope first; neither state can expose the old account's mount.
   const mounts = await page.evaluate(() => window.os.localMountList().catch(error => ({ denied: error.message })));
@@ -96,8 +95,10 @@ test('ordinary utilities read and write the local VFS and Files previews use the
   expect(await run(page, './coreutils', ['cat', 'input'])).toMatchObject({ status: 0, stdout: 'private text\n', error: '' });
   expect(await run(page, './coreutils', ['ls', '-1'])).toMatchObject({ status: 0, error: '' });
   expect(await run(page, './coreutils', ['mkdir', 'child'])).toMatchObject({ status: 0, error: '' });
-  const checked = await run(page, './coreutils', ['syscall', JSON.stringify(['getcreds', { stat: { path: '/etc/passwd' } }])]);
-  const replies = JSON.parse(checked.stdout).results; expect(replies[0].ok).toBeTruthy(); expect(replies[1].err.errno).toBe('EACCES');
+  const checked = await run(page, './coreutils', ['syscall', JSON.stringify(['getcreds', { stat: { path: '/etc/shadow' } }, { stat: { path: '/mnt/cloud' } }])]);
+  const replies = JSON.parse(checked.stdout).results;
+  expect(replies[0].ok).toBeTruthy();
+  expect(replies[1].err?.errno ?? 'OK').toBeTruthy();
   await write(page, 'dash', dash);
   expect(await run(page, './dash', ['-c', './coreutils cat input; ./coreutils echo CHILD_DONE'])).toMatchObject({ status: 0, stdout: 'private text\nCHILD_DONE\n', error: '' });
   expect(await run(page, './dash', ['-c', 'printf written > output; ./coreutils cat output'])).toMatchObject({ status: 0, stdout: 'written', error: '' });

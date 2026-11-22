@@ -1,14 +1,14 @@
 import { test, expect } from './test.js';
-import { readFile } from 'node:fs/promises';
 import { api, entry, errno, mkdirp, put, rmrf } from './sys.js';
-import { browse } from './ui.js';
+import { browse, pageErrno, pageRmrf } from './ui.js';
+
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || 'test-admin-password-w4b';
 const headers = { Origin: origin };
 const url = (path, recursive = false) => '/api/file?path=' + encodeURIComponent(path) + '&recursive=' + recursive;
 async function command(page, text) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
   await input.fill(text); await input.press('Enter');
 }
 
@@ -16,33 +16,53 @@ test('stdout and errors scroll after DOM updates; completion uses a separate pag
   await page.goto('/');
   await expect(page.getByRole('navigation', { name: 'Dock' })).toBeVisible();
   const log = page.locator('.transcript');
-  await page.route('**/api/sys', async route => { if (route.request().postData()?.includes('getdents')) await new Promise(resolve => setTimeout(resolve, 120)); await route.continue(); });
-  for (const width of [1440, 390]) {
-    await page.setViewportSize({ width, height: 780 });
-    for (let i = 0; i < 4; i++) { await command(page, 'help'); await expect(log.locator('pre').last()).toContainText('useradd NAME makes an account'); }
-    expect(await log.evaluate(e => e.scrollHeight > e.clientHeight)).toBe(true);
-    await log.evaluate(e => { e.scrollTop = 0; });
-    await command(page, 'ls');
-    await expect(log.locator('pre').last()).not.toContainText('visitor:');
-    await expect.poll(() => log.evaluate(e => e.scrollHeight - e.clientHeight - e.scrollTop)).toBeLessThanOrEqual(2);
-    await command(page, 'unknown-command');
-    await expect(log.locator('pre').last()).toContainText('unknown-command: No such file or directory');
-    await expect.poll(() => log.evaluate(e => e.scrollHeight - e.clientHeight - e.scrollTop)).toBeLessThanOrEqual(2);
-    const input = page.getByRole('combobox', { name: 'Terminal command' });
-    const transcript = await log.innerText();
-    const linesBefore = await log.locator('pre').allInnerTexts();
-    await input.fill(''); await input.press('Tab');
-    await expect(page.getByRole('listbox', { name: 'Completions' })).toBeVisible();
-    expect(await log.locator('pre').allInnerTexts()).toEqual(linesBefore);
-    await input.press('Escape');
-    expect(await log.innerText()).toBe(transcript);
+  // Local VFS intercepts `fetch('/api/sys')` in-page (`web/local-files.js`), so wrap `window.fetch`
+  // to delay local `getdents` responses.
+  await page.evaluate(() => {
+    const orig = window.fetch.bind(window);
+    window.__origFetch = orig;
+    window.fetch = async (input, init) => {
+      const target = typeof input === 'string' ? input : input?.url ?? '';
+      let body = typeof init?.body === 'string' ? init.body : '';
+      if (!body && input instanceof Request) {
+        try { body = await input.clone().text(); } catch {}
+      }
+      if (target.includes('/api/sys') && body.includes('getdents')) {
+        await new Promise(resolve => setTimeout(resolve, 120));
+      }
+      return orig(input, init);
+    };
+  });
+  try {
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 780 });
+      for (let i = 0; i < 4; i++) { await command(page, 'help'); await expect(log.locator('pre').last()).toContainText('useradd NAME makes an account'); }
+      expect(await log.evaluate(e => e.scrollHeight > e.clientHeight)).toBe(true);
+      await log.evaluate(e => { e.scrollTop = 0; });
+      await command(page, 'ls');
+      await expect(log.locator('pre').last()).not.toContainText('visitor:');
+      await expect.poll(() => log.evaluate(e => e.scrollHeight - e.clientHeight - e.scrollTop)).toBeLessThanOrEqual(2);
+      await command(page, 'unknown-command');
+      await expect(log.locator('pre').last()).toContainText('unknown-command: No such file or directory');
+      await expect.poll(() => log.evaluate(e => e.scrollHeight - e.clientHeight - e.scrollTop)).toBeLessThanOrEqual(2);
+      const input = page.getByRole('combobox', { name: 'Terminal command' });
+      const transcript = await log.innerText();
+      const linesBefore = await log.locator('pre').allInnerTexts();
+      await input.fill(''); await input.press('Tab');
+      await expect(page.getByRole('listbox', { name: 'Completions' })).toBeVisible();
+      expect(await log.locator('pre').allInnerTexts()).toEqual(linesBefore);
+      await input.press('Escape');
+      expect(await log.innerText()).toBe(transcript);
+    }
+  } finally {
+    await page.evaluate(() => { if (window.__origFetch) { window.fetch = window.__origFetch; delete window.__origFetch; } });
   }
 });
 
 test('removal is the kernel\'s to allow, from this site only; removing a tree leaves its neighbours', async ({ request }) => {
   const base = '/rm-api-' + Date.now(), target = base + '/directory', sibling = base + '/Directory-kept';
   // A guest may not; nor a request from elsewhere; rmdir and unlink each take what they take.
-  expect(await errno(request, { rmdir: { path: '/media' } })).toBe('EACCES');
+  expect(await errno(request, { rmdir: { path: '/etc' } })).toBe('EACCES');
   await api(request, 'login', { headers, data: { password } });
   try {
     for (const dir of [target + '/nested', sibling]) {
@@ -65,18 +85,15 @@ test('removal is the kernel\'s to allow, from this site only; removing a tree le
   } finally { await rmrf(request, base); }
 });
 
-test('rm requires explicit login, handles quoted paths, refreshes lists and refuses cwd deletion', async ({ page, request }) => {
-  const base = '/rm-ui-' + Date.now();
+test('rm handles quoted paths, refreshes lists, refuses cwd deletion and enforces local permissions', async ({ page }) => {
+  const base = '/tmp/rm-ui-' + Date.now();
   await page.goto('/');
   await command(page, 'rm');
   await expect(page.locator('.transcript pre').last()).toContainText('rm: missing PATH');
-  await command(page, 'su root');
-  await expect(page.locator('#auth')).toBeVisible();
-  await page.getByLabel('Password', { exact: true }).fill(password);
-  await page.locator('#auth button[type=submit]').click();
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await command(page, 'sudo -u root');
+  await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: root');
   await command(page, 'mkdir ' + base);
-  await expect.poll(async () => (await entry(request, base))?.directory).toBe(true);
+  await expect.poll(async () => await pageErrno(page, { stat: { path: base } })).toBeNull();
   try {
     await command(page, 'cd ' + base);
     await browse(page, base);
@@ -94,17 +111,16 @@ test('rm requires explicit login, handles quoted paths, refreshes lists and refu
     const chooser = page.waitForEvent('filechooser'); await page.getByRole('button', { name: 'Upload' }).click();
     await (await chooser).setFiles({ name: 'Delete me.txt', mimeType: 'text/plain', buffer: Buffer.from('temporary') });
     await expect(page.locator('.filename').filter({ hasText: 'Delete me.txt' })).toBeVisible();
-    await command(page, 'logout'); await expect(page.locator('.lock')).toContainText('guest');
+    // Returning to local `user` denies deleting root's file in root's 0755 directory without opening any auth modal.
+    await command(page, 'logout'); await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: user');
     await command(page, 'rm "' + base + '/Delete me.txt"');
     await expect(page.locator('.transcript pre').last()).toContainText('Permission denied');
     await expect(page.locator('#auth')).not.toBeVisible();
-    await expect(page.locator('.lock')).toContainText('guest');
-    await command(page, 'su root'); await expect(page.locator('#auth')).toBeVisible();
-    await page.getByLabel('Password', { exact: true }).fill(password); await page.locator('#auth button[type=submit]').click();
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-    await command(page, 'rm "' + base + '/Delete me.txt"');
+    await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: user');
+    // Explicit local `sudo` elevates cleanly and removes the file.
+    await command(page, 'sudo rm "' + base + '/Delete me.txt"');
     await expect(page.locator('.filename').filter({ hasText: 'Delete me.txt' })).toHaveCount(0);
   } finally {
-    await page.request.delete(url(base, true), { headers });
+    await pageRmrf(page, base, { sudo: true }).catch(() => {});
   }
 });

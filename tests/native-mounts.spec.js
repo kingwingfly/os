@@ -1,17 +1,19 @@
 import { test, expect } from './test.js';
+import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, writeFile, readFile, rename, symlink, rm, copyFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import binaryen from 'binaryen';
-const adapter = process.env.OS_LOCAL_HELPER_BINARY || join(JSON.parse(execFileSync('cargo', ['metadata', '--no-deps', '--format-version=1'], { encoding: 'utf8' })).target_directory, 'debug/os-local-helper');
+const localAdapter = resolve('target/debug/os-local-helper');
+const adapter = process.env.OS_LOCAL_HELPER_BINARY || (existsSync(localAdapter) ? localAdapter : join(JSON.parse(execFileSync('cargo', ['metadata', '--no-deps', '--format-version=1'], { encoding: 'utf8' })).target_directory, 'debug/os-local-helper'));
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const program = word => { const module = binaryen.parseText(`(module (import "wasi_snapshot_preview1" "fd_write" (func $w (param i32 i32 i32 i32) (result i32))) (memory (export "memory") 1) (data (i32.const 32) "${word}") (func (export "_start") (i32.store (i32.const 0) (i32.const 32)) (i32.store (i32.const 4) (i32.const ${word.length})) (drop (call $w (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))`); try { return Buffer.from(module.emitBinary()); } finally { module.dispose(); } };
 let base, root, helper, connection;
 test.beforeEach(async ({ page }) => {
   base = await mkdtemp(join(tmpdir(), 'os-native-browser-')); root = base + '/root'; await mkdir(root); await mkdir(base + '/outside'); await writeFile(base + '/outside/secret', 'outside');
-  helper = spawn(adapter, ['--root', root, '--origin', origin, '--write', '--execute'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  helper = spawn(adapter, ['--root', root, '--state-dir', base + '/state', '--origin', origin, '--write', '--execute'], { stdio: ['ignore', 'pipe', 'pipe'] });
   let errors = ''; helper.stderr.on('data', data => { errors += data; });
   connection = await new Promise((resolve, reject) => {
     const lines = createInterface({ input: helper.stdout }); const timer = setTimeout(() => reject(new Error('adapter startup timed out: ' + errors)), 5000);

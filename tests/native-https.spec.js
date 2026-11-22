@@ -1,13 +1,15 @@
 import { test, expect } from './test.js';
 import https from 'node:https';
+import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
 test('an HTTPS execution worker can use the origin-bound loopback filesystem adapter', async ({ browser, browserName }) => {
   const temp = await mkdtemp(join(tmpdir(), 'os-native-https-'));
+  const stateDir = await mkdtemp(join(tmpdir(), 'os-native-https-state-'));
   let server, helper, context;
   try {
     execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', temp + '/key', '-out', temp + '/cert', '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=IP:127.0.0.1'], { stdio: 'ignore' });
@@ -23,9 +25,10 @@ test('an HTTPS execution worker can use the origin-bound loopback filesystem ada
     });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const origin = 'https://127.0.0.1:' + server.address().port;
-    const adapter = process.env.OS_LOCAL_HELPER_BINARY || join(JSON.parse(execFileSync('cargo', ['metadata', '--no-deps', '--format-version=1'], { encoding: 'utf8' })).target_directory, 'debug/os-local-helper');
+    const localAdapter = resolve('target/debug/os-local-helper');
+    const adapter = process.env.OS_LOCAL_HELPER_BINARY || (existsSync(localAdapter) ? localAdapter : join(JSON.parse(execFileSync('cargo', ['metadata', '--no-deps', '--format-version=1'], { encoding: 'utf8' })).target_directory, 'debug/os-local-helper'));
     await writeFile(temp + '/hello', 'before');
-    helper = spawn(adapter, ['--root', temp, '--origin', origin, '--write'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    helper = spawn(adapter, ['--root', temp, '--state-dir', stateDir, '--origin', origin, '--write'], { stdio: ['ignore', 'pipe', 'pipe'] });
     const connection = await new Promise((resolve, reject) => {
       const lines = createInterface({ input: helper.stdout }); const timer = setTimeout(() => reject(new Error('adapter startup timeout')), 5000);
       lines.once('line', line => { clearTimeout(timer); resolve(JSON.parse(line)); }); helper.once('exit', () => { clearTimeout(timer); reject(new Error('adapter exited')); });
@@ -48,5 +51,6 @@ test('an HTTPS execution worker can use the origin-bound loopback filesystem ada
     if (helper?.exitCode === null && helper?.signalCode === null) await new Promise(resolve => helper.once('exit', resolve));
     if (server) await new Promise(resolve => server.close(resolve));
     await rm(temp, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
   }
 });
