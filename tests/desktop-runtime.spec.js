@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { call, put, rmrf } from './sys.js';
+import { pageMkdirp, pagePut, pageRmrf } from './ui.js';
 
 async function ready(page) { await page.goto('/'); await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle'); }
 
@@ -25,9 +25,9 @@ test('isolated processes fork, supervise services and interrupt unbounded termin
   expect(await page.evaluate(() => ({ isolated: crossOriginIsolated, shared: typeof SharedArrayBuffer }))).toEqual({ isolated: true, shared: 'function' });
   const result = await page.evaluate(() => window.os.exec([['/usr/bin/sh', '-c', 'printf fork-ok; /usr/bin/true']], { stdin: '' }));
   expect(result).toMatchObject({ status: 0, stdout: 'fork-ok' });
-  const base = '/guest/desktop-runtime-' + crypto.randomUUID(); await call(page.request, { mkdir: { path: base, mode: 0o700 } });
+  const base = '/tmp/desktop-runtime-' + crypto.randomUUID(); await pageMkdirp(page, base, 0o700);
   try {
-    expect((await put(page.request, '/api/file?path=' + base + '/services.json', { data: JSON.stringify({ version: 1, units: [{ name: 'ticker', argv: ['/usr/bin/sh', '-c', 'while :; do echo SERVICE_TICK; sleep 0.2; done'], stop_timeout_ms: 1000 }] }) })).ok()).toBe(true);
+    await pagePut(page, base + '/services.json', JSON.stringify({ version: 1, units: [{ name: 'ticker', argv: ['/usr/bin/sh', '-c', 'while :; do echo SERVICE_TICK; sleep 0.2; done'], stop_timeout_ms: 1000 }] }));
     const field = page.getByRole('combobox', { name: 'Terminal command' }), state = page.locator('#command').locator('xpath=ancestor::form');
     await field.fill('supervise ' + base + '/services.json'); await field.press('Enter');
     await expect(page.locator('#window-terminal')).toContainText('SERVICE_TICK');
@@ -37,12 +37,12 @@ test('isolated processes fork, supervise services and interrupt unbounded termin
     await expect(page.locator('.terminal-screen[data-live="true"]').filter({ visible: true })).toContainText('y');
     await field.press('Control+c'); await expect(state).toHaveAttribute('data-state', 'idle', { timeout: 10000 });
     await expect(page.locator('#window-terminal')).not.toContainText('output larger than');
-  } finally { await rmrf(page.request, base); }
+  } finally { await pageRmrf(page, base); }
 });
 
 test('interactive shell prompt shows identity and follows cd without an extra start action', async ({ page }) => {
   await page.goto('/shell.html'); const input = page.getByLabel('Shell input', { exact: true }), screen = page.locator('.terminal-screen');
-  await expect(input).toBeEnabled(); await expect(screen).toContainText(/guest-[^\s]+@os:\/[^\n]* \$\s*$/);
+  await expect(input).toBeEnabled(); await expect(screen).toContainText(/user@os:[^\n]* \$\s*$/);
   await expect(page.getByRole('button', { name: 'Start shell', exact: true })).toBeHidden();
   await input.fill('cd /tmp'); await input.press('Enter');
   await expect(screen).toContainText(/@os:\/tmp \$\s*$/);

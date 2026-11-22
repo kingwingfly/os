@@ -159,7 +159,7 @@ export function installLocalFiles() {
     const request = new Request(input, options);
     const url = new URL(request.url);
     if (url.origin !== location.origin || !url.pathname.startsWith('/api/')) return network(request);
-    if (request.headers.has('X-Process-Token')) {
+    if (request.headers.has('X-Process-Token') || request.headers.has('X-Registry')) {
       return network(request);
     }
 

@@ -1001,6 +1001,12 @@ impl LocalAccountStore {
                 format!("user '{}' already exists", req.name),
             ));
         }
+        if req.create_home && (users.iter().any(|u| u.home == home) || fs.exists(&home)) {
+            return Err(Error::because(
+                Errno::EEXIST,
+                format!("home directory '{home}' already exists"),
+            ));
+        }
 
         let used_uids: BTreeSet<u32> = users.iter().map(|u| u.uid).collect();
         let uid = match req.uid {

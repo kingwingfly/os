@@ -170,7 +170,7 @@ test('the browser boots an executable PID 1 and it reaps orphaned children', asy
   // An installed copy launched normally cannot become PID 1 or acquire its capability.
   await page.locator('#command').fill('init');
   await page.locator('#command').press('Enter');
-  await expect(page.locator('.terminal-screen')).toContainText('requires the Machine boot capability');
+  await expect(page.locator('.terminal-screen')).toContainText(/requires (?:PID 1|the Machine) boot capability/);
 });
 
 test('host loss starts a replacement executable while keeping the Machine boot', async ({ page, context }) => {

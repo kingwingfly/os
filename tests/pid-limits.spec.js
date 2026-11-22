@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { call, errno, put, rmrf } from './sys.js';
+import { pageErrno, pageMkdirp, pagePut, pageRmrf } from './ui.js';
 import binaryen from 'binaryen';
 
 const image = { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [] };
@@ -299,17 +299,19 @@ const pageKv = async (page, type, args = {}) => {
   return r.ok;
 };
 
-async function run(page, units) {
-  await call(page.request, 'getcreds');
+async function bootPidPage(page) {
   await hookPageKernel(page);
   await page.goto('/');
   await page.waitForFunction(() => !!window.os?.exec && !!window.__pageKernel);
   await page.evaluate(() => window.os.loginSession());
-  await pageKv(page, 'sync_account_from_server');
-  const base = '/guest/pids-' + crypto.randomUUID();
-  await call(page.request, { mkdir: { path: base, mode: 0o700 } });
+}
+
+async function run(page, units, { boot = true } = {}) {
+  if (boot) await bootPidPage(page);
+  const base = '/tmp/pids-' + crypto.randomUUID();
+  await pageMkdirp(page, base, 0o700);
   const file = base + '/units.json';
-  expect((await put(page.request, '/api/file?path=' + file, { data: JSON.stringify({ version: 1, units }) })).ok()).toBe(true);
+  await pagePut(page, file, JSON.stringify({ version: 1, units }));
   await page.evaluate(file => {
     const r = window.pidRun = { output: '' };
     r.done = window.os.exec([{ path: '/usr/bin/supervise', argv: ['supervise', file] }], {
@@ -324,19 +326,19 @@ async function complete(page, status) {
 }
 async function cleanup(page, base) {
   await page.evaluate(async () => { window.pidRun?.job?.signal(9); await window.pidRun?.done; });
-  await rmrf(page.request, base);
+  await pageRmrf(page, base).catch(() => {});
 }
 
 test('supervisor enforces zero before guest code and allows exec with a single PID slot', async ({ page }) => {
   let base = await run(page, [{ name: 'zero', argv: ['printf', 'UNEXPECTED_GUEST'], limits: { pids: 0 } }]);
   try { expect(await complete(page, 1)).not.toContain('UNEXPECTED_GUEST'); } finally { await cleanup(page, base); }
-  base = await run(page, [{ name: 'one', argv: ['sh', '-c', 'exec printf SINGLE_PID_OK'], limits: { pids: 1 } }]);
+  base = await run(page, [{ name: 'one', argv: ['sh', '-c', 'exec printf SINGLE_PID_OK'], limits: { pids: 1 } }], { boot: false });
   try { expect(await complete(page, 0)).toContain('SINGLE_PID_OK'); } finally { await cleanup(page, base); }
 });
 
 test('real WASIX fork returns EAGAIN before a denied child can execute', async ({ page }) => {
-  await call(page.request, 'getcreds');
-  const path = '/guest/pid-fork-' + crypto.randomUUID();
+  await bootPidPage(page);
+  const path = '/tmp/pid-fork-' + crypto.randomUUID();
   const module = binaryen.parseText(`(module
     (import "wasix_32v1" "proc_fork" (func $fork (param i32 i32) (result i32)))
     (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
@@ -348,19 +350,20 @@ test('real WASIX fork returns EAGAIN before a denied child can execute', async (
         (br_if $again (i32.lt_u (local.get $i) (i32.const 16))))
       (i32.store (i32.const 0) (i32.const 100)) (i32.store (i32.const 4) (i32.const 14))
       (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))`);
-  try { expect((await put(page.request, '/api/file?path=' + path, { data: Buffer.from(module.emitBinary()) })).ok()).toBe(true); } finally { module.dispose(); }
-  await call(page.request, { chmod: { path, mode: 0o755 } });
+  let bin;
+  try { bin = Buffer.from(module.emitBinary()); } finally { module.dispose(); }
+  await pagePut(page, path, bin, { mode: 0o755 });
   const base = await run(page, [
     { name: 'forks', argv: [path], limits: { pids: 1 } },
     { name: 'independent', argv: ['printf', 'OTHER_SERVICE_OK'], limits: { pids: 1 } },
-  ]);
+  ], { boot: false });
   try {
     const output = await complete(page, 0);
     expect(output).toContain('FORK_DENIED_OK');
     expect(output).toContain('OTHER_SERVICE_OK');
   } finally {
     await cleanup(page, base);
-    await call(page.request, { unlink: { path } });
+    await pageRmrf(page, path).catch(() => {});
   }
 });
 
@@ -373,14 +376,9 @@ test('failed service image admission and retries leave no group capacity behind'
 });
 
 test('killing a parent prevents child execution, sends zero /api/sys fork RPCs, and releases all local rows', async ({ page }) => {
-  await call(page.request, 'getcreds');
-  await hookPageKernel(page);
-  await page.goto('/');
-  await page.waitForFunction(() => !!window.os?.exec && !!window.__pageKernel);
-  await page.evaluate(() => window.os.loginSession());
-  await pageKv(page, 'sync_account_from_server');
-  const base = '/guest/late-fork-' + crypto.randomUUID();
-  await call(page.request, { mkdir: { path: base, mode: 0o700 } });
+  await bootPidPage(page);
+  const base = '/tmp/late-fork-' + crypto.randomUUID();
+  await pageMkdirp(page, base, 0o700);
   const marker = base + '/unexpected';
   const forkRpcs = [];
   const watch = req => {
@@ -401,8 +399,8 @@ test('killing a parent prevents child execution, sends zero /api/sys fork RPCs, 
     await expect.poll(() => page.evaluate(() => window.pidRun.output), { timeout: 15000 }).toContain('READY');
     await page.evaluate(() => window.pidRun.job.signal(9));
     await complete(page, 137);
-    await expect.poll(async () => (await pageKv(page, 'poll', { pids: [] })).filter(p => p.pid !== 1).length, { timeout: 15000 }).toBe(0);
-    expect(await errno(page.request, { stat: { path: marker } })).toBe('ENOENT');
+    await expect.poll(async () => (await pageKv(page, 'poll', { pids: [] })).filter(p => p.pid !== 1 && p.ppid !== 1).length, { timeout: 15000 }).toBe(0);
+    expect(await pageErrno(page, { stat: { path: marker } })).toBe('ENOENT');
     expect(forkRpcs).toEqual([]);
   } finally {
     page.off('request', watch);
@@ -411,14 +409,13 @@ test('killing a parent prevents child execution, sends zero /api/sys fork RPCs, 
 });
 
 test('authorized invalid executable loading releases admitted service slots across retries', async ({ page }) => {
-  await call(page.request, 'getcreds');
-  const path = '/guest/invalid-pid-image-' + crypto.randomUUID();
-  expect((await put(page.request, '/api/file?path=' + path, { data: 'not a WebAssembly module' })).ok()).toBe(true);
-  await call(page.request, { chmod: { path, mode: 0o755 } });
+  await bootPidPage(page);
+  const path = '/tmp/invalid-pid-image-' + crypto.randomUUID();
+  await pagePut(page, path, 'not a WebAssembly module', { mode: 0o755 });
   const base = await run(page, [
     { name: 'invalid', argv: [path], limits: { pids: 1 }, restart: 'on-failure', max_restarts: 2, restart_delay_ms: 100 },
     { name: 'healthy', argv: ['printf', 'HEALTHY_PID_SLOT'], limits: { pids: 1 } },
-  ]);
+  ], { boot: false });
   try {
     const output = await complete(page, 1);
     expect(output.match(/start failed:/g)).toHaveLength(3);
@@ -427,6 +424,6 @@ test('authorized invalid executable loading releases admitted service slots acro
     expect((await pageKv(page, 'poll', { pids: [] })).some(p => p.path === path)).toBe(false);
   } finally {
     await cleanup(page, base);
-    await call(page.request, { unlink: { path } });
+    await pageRmrf(page, path).catch(() => {});
   }
 });

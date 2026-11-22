@@ -1,23 +1,30 @@
 import { verifyRelease } from './release.js';
 import init from './pkg/frontend.js';
 import './session-viewport.js';
-import { call } from './http.mjs';
 import { kernelCall } from './kernel/protocol.js';
 import { ShellSession } from './shell-session-controller.js';
 import { executionSupport } from './kernel/capabilities.js';
 
 async function boot() {
-  const { exec, closeConsole } = await import('./kernel/page.js');
+  const { exec, closeConsole, loginSession, endLoginSession, restartLoginSession, bootStatus } = await import('./kernel/page.js');
+  window.os = { ...(window.os ?? {}), exec, loginSession, endLoginSession, restartLoginSession, bootStatus };
   let listener;
   const windows = 'BroadcastChannel' in window ? new BroadcastChannel('os-session') : null;
   if (windows) windows.onmessage = () => dispatchEvent(new Event('os:login-changed'));
   const session = new ShellSession({
     identity: async () => {
-      const who = await call('getcreds');
-      if (who && typeof who.uid === 'number') {
-        await kernelCall('sync_account', who).catch(() => {});
-        await kernelCall('login_refresh', { fromServer: false }).catch(() => {});
-      }
+      const status = await bootStatus();
+      const who = status?.account ?? {
+        uid: 1000,
+        gid: 1000,
+        groups: [1000, 27],
+        user: 'user',
+        group: 'user',
+        home: '/home/user',
+        shell: '/usr/bin/dash',
+        signed_in: true,
+      };
+      await kernelCall('login_refresh', { fromServer: false }).catch(() => {});
       return who;
     },
     execute: exec, close: closeConsole,

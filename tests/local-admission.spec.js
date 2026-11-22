@@ -1,7 +1,8 @@
 import { test, expect } from './test.js';
-import { sys, call } from './sys.js';
+import { api, sys, call } from './sys.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
+const CLOUD_SCOPE = { cloud_fs: true, devices: [], containers: false, relay: false };
 const OS_FD_ROOT = 0x7ffffffd;
 const O_RDONLY = 0;
 
@@ -33,7 +34,22 @@ async function connect(page) {
   });
   const init = await kc(page, 'init');
   expect(init.err, JSON.stringify(init)).toBeUndefined();
-  await kc(page, 'sync_account_from_server');
+}
+async function mountCloudAsNonRoot(page) {
+  const uname = 'locadm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+  const res = await api(page.request, 'register', {
+    headers: { Origin: origin, 'CF-Connecting-IP': 'locadm-' + crypto.randomUUID() },
+    data: { username: uname, password: 'local-adm-pass-1234', create_home: false },
+  });
+  expect(res.ok(), await res.text()).toBe(true);
+  const creds = await call(page.request, 'getcreds');
+  await kv(page, 'cloud_sign_in', {
+    cloudUser: uname,
+    cloudUid: creds.uid,
+    cloudGid: creds.gid,
+    cloudGroups: creds.groups,
+    scope: CLOUD_SCOPE,
+  });
 }
 const kc = (page, type, args = {}) => page.evaluate(([type, args]) => window.localAdmKernel(type, args), [type, args]);
 async function kv(page, type, args = {}) {
@@ -54,8 +70,8 @@ const fsRpc = async (request, credential, session, fsCall, instanceId) =>
   })).json();
 
 test('local admission grants process resources but no implicit cloud filesystem authority', async ({ page }) => {
-  await call(page.request, 'getcreds');
   await connect(page);
+  await mountCloudAsNonRoot(page);
   let proc;
   try {
     proc = await kv(page, 'exec', image);
@@ -72,16 +88,16 @@ test('local admission grants process resources but no implicit cloud filesystem 
     // Local linear-memory reservation succeeds without touching any remote server.
     await kv(page, 'reserve_memory', { pid: proc.pid, bytes: 65536 });
 
-    // Cloud filesystem access & remote credential minting are refused for cloud:false processes.
-    expect((await kc(page, 'proc_statat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: '/etc/passwd', follow: true })).err?.errno).toBe('EACCES');
-    expect((await kc(page, 'proc_openat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: '/etc/passwd', oflags: O_RDONLY, mode: 0, cloexec: false })).err?.errno).toBe('EACCES');
+    // Cloud filesystem access (`/mnt/cloud`) & remote credential minting are refused for cloud:false processes.
+    expect((await kc(page, 'proc_statat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: '/mnt/cloud/etc/passwd', follow: true })).err?.errno).toBe('EACCES');
+    expect((await kc(page, 'proc_openat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: '/mnt/cloud/etc/passwd', oflags: O_RDONLY, mode: 0, cloexec: false })).err?.errno).toBe('EACCES');
     expect((await kc(page, 'mint_remote_cred', { pid: proc.pid })).err?.errno).toBe('EACCES');
 
     // Re-exec cannot escalate cloud:false -> cloud:true.
     proc = await kv(page, 'reexec', { ...image, pid: proc.pid, local: { ...image.local, cloud: true } });
     expect(proc.local.cloud).toBe(false);
     expect(proc.token).toBe('');
-    expect((await kc(page, 'proc_statat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: '/etc/passwd', follow: true })).err?.errno).toBe('EACCES');
+    expect((await kc(page, 'proc_statat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: '/mnt/cloud/etc/passwd', follow: true })).err?.errno).toBe('EACCES');
     expect((await kc(page, 'mint_remote_cred', { pid: proc.pid })).err?.errno).toBe('EACCES');
   } finally {
     await end(page, proc);
@@ -90,15 +106,15 @@ test('local admission grants process resources but no implicit cloud filesystem 
 
 test('local fork and replacement preserve attenuation, while an explicitly delegated launch keeps ordinary ACL checks', async ({ page }) => {
   const request = page.request;
-  await call(request, 'getcreds');
   await connect(page);
+  await mountCloudAsNonRoot(page);
   const instanceId = await kv(page, 'instance_id');
   let parent, child, delegated;
   try {
     parent = await kv(page, 'exec', image);
     child = await kv(page, 'fork', { pid: parent.pid });
     expect(child.token).toBe('');
-    expect((await kc(page, 'proc_statat', { pid: child.pid, dirfd: OS_FD_ROOT, path: '/etc/passwd', follow: true })).err?.errno).toBe('EACCES');
+    expect((await kc(page, 'proc_statat', { pid: child.pid, dirfd: OS_FD_ROOT, path: '/mnt/cloud/etc/passwd', follow: true })).err?.errno).toBe('EACCES');
 
     // Re-exec of forked child preserves attenuation (cloud:false cannot escalate to cloud:true).
     child = await kv(page, 'reexec', { ...image, pid: child.pid, local: { ...image.local, cloud: true } });

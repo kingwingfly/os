@@ -26,9 +26,15 @@ let bootProfileStore;
 let localInitView = null;
 let localInitState = 'starting';
 let localInitFailures = 0;
+let localInitAttempts = 0;
+let localInitError = '';
 let localInitRunning = false;
 let localInitProof = '';
+let localInitOwner = null;
+let localInitJob = null;
 let localInitAbort = false;
+let localInitRunId = 0;
+let localInitPromise = null;
 // This instance's unique local identifier (never shared across tabs).
 const kernelId = self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 // Each port's host: an identity of its own, made here, and the tab it first said it was.
@@ -194,13 +200,31 @@ function currentInitStatus() {
     host: kernelId,
     init: localInitView,
     connected: true,
-    coordinator: true,
-    reaper: { state: localInitState, pid: 1, failures: localInitFailures },
+    coordinator: !localInitAbort && !!localInitOwner,
+    reaper: {
+      state: localInitState,
+      pid: 1,
+      failures: localInitFailures,
+      attempts: localInitAttempts,
+      error: localInitError,
+    },
   };
 }
 
 function broadcastInitStatus() {
   broadcast({ v: VERSION, type: 'event', event: 'machine_init', value: currentInitStatus() });
+}
+
+async function releaseLocalInitOwner() {
+  const owner = localInitOwner;
+  localInitOwner = null;
+  if (!owner || !kernel) return;
+  try {
+    localInitView = JSON.parse(await kernel.machine_init_action(
+      JSON.stringify({ op: 'release', owner }),
+      kernelId,
+    ));
+  } catch { /* already released or rebooted */ }
 }
 
 async function markOfflineReleaseBootHealthyIfPending() {
@@ -216,82 +240,139 @@ async function markOfflineReleaseBootHealthyIfPending() {
 
 async function launchLocalInit() {
   if (!kernel || localInitRunning || localInitAbort) return;
+  const runId = ++localInitRunId;
+  const previous = localInitPromise;
   localInitRunning = true;
   localInitState = 'starting';
-  try {
-    if (!localInitProof) localInitProof = randomHex32();
-    const inspected = JSON.parse(await kernel.machine_init_action(
-      JSON.stringify({ op: 'inspect' }),
-      kernelId,
-    ));
-    const claimed = JSON.parse(await kernel.machine_init_action(
-      JSON.stringify({
-        op: 'claim',
-        owner: {
-          boot: inspected.boot,
-          host: kernelId,
-          proof: localInitProof,
-          generation: inspected.generation,
+  localInitError = '';
+  localInitAttempts++;
+  const runPromise = (async () => {
+    try {
+      if (previous) {
+        await Promise.race([previous.catch(() => {}), new Promise(r => setTimeout(r, 2000))]);
+      }
+      if (runId !== localInitRunId || localInitAbort || !kernel) return;
+      if (!localInitProof) localInitProof = randomHex32();
+      const inspected = JSON.parse(await kernel.machine_init_action(
+        JSON.stringify({ op: 'inspect' }),
+        kernelId,
+      ));
+      if (runId !== localInitRunId || localInitAbort) return;
+      const claimed = JSON.parse(await kernel.machine_init_action(
+        JSON.stringify({
+          op: 'claim',
+          owner: {
+            boot: inspected.boot,
+            host: kernelId,
+            proof: localInitProof,
+            generation: inspected.generation,
+          },
+        }),
+        kernelId,
+      ));
+      if (runId !== localInitRunId || localInitAbort) {
+        await kernel.machine_init_action(
+          JSON.stringify({
+            op: 'release',
+            owner: {
+              boot: claimed.boot,
+              host: kernelId,
+              proof: localInitProof,
+              generation: claimed.generation,
+            },
+          }),
+          kernelId,
+        ).catch(() => {});
+        return;
+      }
+      localInitView = claimed;
+      const owner = {
+        boot: claimed.boot,
+        host: kernelId,
+        proof: localInitProof,
+        generation: claimed.generation,
+      };
+      localInitOwner = owner;
+      broadcastInitStatus();
+      if (!globalThis.crossOriginIsolated) {
+        localInitState = 'running';
+        broadcastInitStatus();
+        void markOfflineReleaseBootHealthyIfPending();
+        return;
+      }
+      const { exec } = await import(asset('/executor-host.js'));
+      if (runId !== localInitRunId || localInitAbort) return;
+      let error = '';
+      const token = randomHex32();
+      const result = await exec([['init']], {
+        stdin: '',
+        cancelled: () => runId !== localInitRunId || localInitAbort,
+        prepare: async () => [{ ok: await self.kernelRequest('boot_init', { owner, token }) }],
+        onJob: job => {
+          if (runId !== localInitRunId || localInitAbort) {
+            job.signal(9);
+            return;
+          }
+          localInitJob = job;
+          if (job.pids.includes(1)) {
+            localInitState = 'running';
+            broadcastInitStatus();
+            void markOfflineReleaseBootHealthyIfPending();
+          }
         },
-      }),
-      kernelId,
-    ));
-    localInitView = claimed;
-    broadcastInitStatus();
-    if (!globalThis.crossOriginIsolated) {
-      localInitState = 'running';
+        onOutput: (fd, text) => {
+          if (fd === 2) error = (error + text).slice(-4096);
+        },
+      });
+      if (runId !== localInitRunId) return;
+      localInitJob = null;
+      localInitRunning = false;
+      if (localInitAbort) {
+        await releaseLocalInitOwner();
+        localInitState = 'stopped';
+        broadcastInitStatus();
+        return;
+      }
+      if (result?.status === 0) {
+        await releaseLocalInitOwner();
+        localInitState = 'stopped';
+        broadcastInitStatus();
+        // Ordered shutdown completed cleanly: flush & close `os-cowfs` root volume.
+        try { await kernel.close_clean_root(); } catch { /* best-effort */ }
+        return;
+      }
+      await releaseLocalInitOwner();
+      localInitFailures++;
+      localInitError = error.trim() || `init exited with status ${result?.status ?? 'unknown'}`;
+      localInitState = 'failed';
       broadcastInitStatus();
-      void markOfflineReleaseBootHealthyIfPending();
-      return;
-    }
-    const { exec } = await import(asset('/executor-host.js'));
-    let error = '';
-    const owner = {
-      boot: claimed.boot,
-      host: kernelId,
-      proof: localInitProof,
-      generation: claimed.generation,
-    };
-    const token = randomHex32();
-    const result = await exec([['init']], {
-      stdin: '',
-      cancelled: () => localInitAbort,
-      prepare: async () => [{ ok: await self.kernelRequest('boot_init', { owner, token }) }],
-      onJob: job => {
-        if (job.pids.includes(1)) {
-          localInitState = 'running';
-          broadcastInitStatus();
-          void markOfflineReleaseBootHealthyIfPending();
-        }
-      },
-      onOutput: (fd, text) => {
-        if (fd === 2) error = (error + text).slice(-4096);
-      },
-    });
-    localInitRunning = false;
-    if (localInitAbort) {
-      localInitState = 'stopped';
+      if (error.trim()) console.warn('local PID 1 init exited:', error.trim());
+      if (runId === localInitRunId && !localInitAbort && localInitFailures <= 3) {
+        setTimeout(() => {
+          if (runId === localInitRunId && !localInitAbort) void launchLocalInit();
+        }, 250);
+      }
+    } catch (err) {
+      if (runId !== localInitRunId) return;
+      localInitJob = null;
+      localInitRunning = false;
+      await releaseLocalInitOwner();
+      localInitFailures++;
+      localInitError = String(err?.message ?? err ?? 'init launch failed');
+      localInitState = 'failed';
       broadcastInitStatus();
-      return;
+      console.warn('local PID 1 init launch failed:', err);
+      if (runId === localInitRunId && !localInitAbort && localInitFailures <= 3) {
+        setTimeout(() => {
+          if (runId === localInitRunId && !localInitAbort) void launchLocalInit();
+        }, 250);
+      }
+    } finally {
+      if (localInitPromise === runPromise) localInitPromise = null;
     }
-    if (result?.status === 0) {
-      localInitState = 'stopped';
-      broadcastInitStatus();
-      // Ordered shutdown completed cleanly: flush & close `os-cowfs` root volume.
-      try { await kernel.close_clean_root(); } catch { /* best-effort */ }
-      return;
-    }
-    localInitFailures++;
-    localInitState = 'failed';
-    broadcastInitStatus();
-    if (error.trim()) console.warn('local PID 1 init exited:', error.trim());
-  } catch (err) {
-    localInitRunning = false;
-    localInitFailures++;
-    localInitState = 'failed';
-    broadcastInitStatus();
-    console.warn('local PID 1 init launch failed:', err);
-  }
+  })();
+  localInitPromise = runPromise;
+  return runPromise;
 }
 
 function boot() {
@@ -462,17 +543,35 @@ async function dispatch(message, host, tab, internal = false) {
     case 'machine_init_status': return currentInitStatus();
     case 'machine_init_leave': {
       localInitAbort = true;
+      localInitRunId++;
+      // Host loss terminates the PID 1 Worker abruptly (SIGKILL), NEVER triggering
+      // clean Poweroff / `umount2("/usr")` teardown of the live OS root.
+      localInitJob?.signal(9);
+      localInitJob = null;
+      const prev = localInitPromise;
+      await releaseLocalInitOwner();
+      if (prev) await Promise.race([prev.catch(() => {}), new Promise(r => setTimeout(r, 2000))]);
+      localInitRunning = false;
       localInitState = 'stopped';
       broadcastInitStatus();
       return null;
     }
     case 'machine_init_resume': {
       localInitAbort = false;
+      localInitRunning = false;
+      localInitFailures = 0;
+      localInitError = '';
       void launchLocalInit();
       return currentInitStatus();
     }
     case 'machine_reboot': {
       localInitAbort = true;
+      localInitRunId++;
+      localInitJob?.signal(9);
+      localInitJob = null;
+      localInitOwner = null;
+      const prev = localInitPromise;
+      if (prev) await Promise.race([prev.catch(() => {}), new Promise(r => setTimeout(r, 2000))]);
       const value = JSON.parse(await kernel.machine_init_action(
         JSON.stringify({ op: 'reboot', boot: args.boot }),
         kernelId,
@@ -484,6 +583,7 @@ async function dispatch(message, host, tab, internal = false) {
       localInitAbort = false;
       localInitRunning = false;
       localInitFailures = 0;
+      localInitError = '';
       void launchLocalInit();
       return value;
     }

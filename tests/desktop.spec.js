@@ -1,4 +1,5 @@
 import { test, expect } from './test.js';
+import { pagePut } from './ui.js';
 
 // The desktop (crates/frontend/src/desktop.rs): windows a pointer moves, resizes and snaps, that
 // minimize to the dock and come back, laid out again as they were after a reload; the preview a
@@ -91,8 +92,9 @@ test('windows move, resize, snap, minimize to the dock, and keep their places', 
 
 test('the preview is a window: it takes the keyboard, sits among the others, and Escape closes it', async ({ page }) => {
   await ready(page);
+  await pagePut(page, '/home/user/welcome.md', '# Welcome\n\nLocal preview fixture.\n');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await input.fill('open welcome.md'); await input.press('Enter');
+  await input.fill('open /home/user/welcome.md'); await input.press('Enter');
   const viewer = page.locator('#viewer');
   await expect(viewer).toBeVisible();
   await expect(viewer).toHaveClass(/window-focused/);
@@ -115,12 +117,12 @@ test('the preview is a window: it takes the keyboard, sits among the others, and
   await expect(viewer).toBeHidden();
   await expect(dock(page, 'Preview')).toHaveCount(0);
   // Its own place, as the others have: moved, it opens there again.
-  await input.fill('open welcome.md'); await input.press('Enter');
+  await input.fill('open /home/user/welcome.md'); await input.press('Enter');
   await expect(viewer).toBeVisible();
   const before = await box(viewer);
   await drag(page, viewer, 40, 30);
   await page.getByRole('button', { name: 'Close preview' }).click();
-  await input.fill('open welcome.md'); await input.press('Enter');
+  await input.fill('open /home/user/welcome.md'); await input.press('Enter');
   await expect(viewer).toBeVisible();
   near(await box(viewer), { x: before.x + 40, y: before.y + 30, w: before.w, h: before.h });
 });

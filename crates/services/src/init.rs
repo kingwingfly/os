@@ -429,8 +429,9 @@ mod runtime {
                 }
             }
 
-            // 2. Reap all direct and adopted exited children.
-            if REAP.swap(false, Ordering::SeqCst) || !live.is_empty() {
+            // 2. Reap direct and adopted exited children on `SIGCHLD`, or check our own
+            //    explicitly managed unit PIDs without stealing unrelated host-spawned children.
+            if REAP.swap(false, Ordering::SeqCst) {
                 loop {
                     let mut status = 0u32;
                     // SAFETY: status points to a live u32; -1/WNOHANG select ended children.
@@ -458,6 +459,26 @@ mod runtime {
                         0 | -12 => break, // No ended child or ECHILD
                         -27 => continue,  // EINTR
                         _ => break,
+                    }
+                }
+            } else if !live.is_empty() {
+                let managed_pids: Vec<u32> = live.values().map(|u| u.child.id()).collect();
+                for target_pid in managed_pids {
+                    let mut status = 0u32;
+                    // SAFETY: status points to a live u32; specific managed PID + WNOHANG.
+                    let pid = unsafe { waitpid2(target_pid as i32, &mut status, 1) };
+                    if pid > 0 {
+                        let reaped_pid = pid as u32;
+                        let exit_code = if status & 0x7f == 0 {
+                            ((status >> 8) & 0xff) as i32
+                        } else {
+                            128 + (status & 0x7f) as i32
+                        };
+                        live.retain(|_, u| u.child.id() != reaped_pid);
+                        let actions = manager.on_exited(reaped_pid, exit_code, now_ms());
+                        if execute_actions(actions, &mut manager, &mut live, is_system, now_ms()) {
+                            return Ok(());
+                        }
                     }
                 }
             }
