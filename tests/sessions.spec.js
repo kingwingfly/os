@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { call, put, rmrf } from './sys.js';
+import { pageCall, pageMkdirp, pagePut, pageRmrf } from './ui.js';
 import { connectKernel, hookPageKernel } from './service-auth.js';
 import binaryen from 'binaryen';
 
@@ -286,9 +286,10 @@ test('stty tostop stops background terminal writes and fg lets them complete', a
 });
 
 test('setsid detaches the controlling terminal without closing inherited descriptors', async ({ page }) => {
-  const base = '/guest/session-' + crypto.randomUUID();
-  await call(page.request, { mkdir: { path: base, mode: 0o755 } });
+  const base = '/tmp/session-' + crypto.randomUUID();
   await page.goto('/');
+  await page.waitForFunction(() => Boolean(window.os?.exec));
+  await pageMkdirp(page, base, 0o755);
   const module = binaryen.parseText(`(module
     (import "os" "getpgid" (func $pgid (param i32) (result i32)))
     (import "os" "getsid" (func $sid (param i32) (result i32)))
@@ -315,13 +316,13 @@ test('setsid detaches the controlling terminal without closing inherited descrip
       (i32.store (i32.const 0) (i32.const 100)) (i32.store (i32.const 4) (i32.const 8))
       (call $assert (i32.eqz (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8))))))`);
   try {
-    expect((await put(page.request, '/api/file?path=' + base + '/probe', { data: Buffer.from(module.emitBinary()) })).ok()).toBe(true);
-    await call(page.request, { chmod: { path: base + '/probe', mode: 0o755 } });
+    await pagePut(page, base + '/probe', Buffer.from(module.emitBinary()), { mode: 0o755 });
+    await pageCall(page, { chmod: { path: base + '/probe', mode: 0o755 } });
     await send(page, `sh -c '${base}/probe; echo :$?'`);
     await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
     await expect(screen(page)).toHaveText('detached:0');
   } finally {
     module.dispose();
-    await rmrf(page.request, base);
+    await pageRmrf(page, base);
   }
 });

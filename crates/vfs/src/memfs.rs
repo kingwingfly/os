@@ -1327,12 +1327,14 @@ impl Filesystem for MemFs {
         mode: u16,
         rdev: &'a str,
     ) -> BoxFuture<'a, Entry> {
-        if cred.identity.id != 0 {
+        if !rdev.is_empty() && cred.identity.id != 0 {
             return ready!(Err(Errno::EPERM));
         }
         ready!(self.make(cred, dir, name, |parent| {
             let mut node = created(&cred.identity, parent, mode, false, cred.umask);
-            node.rdev = Some(rdev.to_string());
+            if !rdev.is_empty() {
+                node.rdev = Some(rdev.to_string());
+            }
             node
         }))
     }

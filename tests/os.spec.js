@@ -1,12 +1,32 @@
 import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, errno, listing, mkdirp, put } from './sys.js';
-import { browse, promptPath } from './ui.js';
+import { browse, pageListing, pageMkdirp, pagePut, promptPath } from './ui.js';
+
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 // A line is typed at the prompt, once the one before has ended, as the shell takes no other.
 const prompt = page => expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
 const run = async (page, command) => { const input = page.getByRole('combobox', { name: 'Terminal command' }); await prompt(page); await input.fill(command); await input.press('Enter'); };
+
+function minimalWav() {
+  // 44-byte PCM WAV header + 8000 bytes (0.5s 8kHz mono 8-bit silence) so <audio> loads cleanly offline.
+  const samples = 4000;
+  const buf = Buffer.alloc(44 + samples, 0x80);
+  buf.write('RIFF', 0);
+  buf.writeUInt32LE(36 + samples, 4);
+  buf.write('WAVEfmt ', 8);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(8000, 24);
+  buf.writeUInt32LE(8000, 28);
+  buf.writeUInt16LE(1, 32);
+  buf.writeUInt16LE(8, 34);
+  buf.write('data', 36);
+  buf.writeUInt32LE(samples, 40);
+  return buf;
+}
 
 test('R2 API enforces auth, same-origin writes, no-overwrite and byte ranges', async ({ request }) => {
   const name = '/test-' + Date.now();
@@ -43,11 +63,20 @@ async function complete(input, text, expected) {
   await expect(input).toHaveValue(expected);
 }
 
-test('terminal, password modal, upload, sanitized Markdown, slides and media', async ({ page }) => {
+test('terminal auto-login, local upload, sanitized Markdown, slides and media', async ({ page }) => {
   const errors = []; page.on('pageerror', e => errors.push(e.message));
   await page.goto('/');
   await expect(page.getByRole('navigation', { name: 'Dock' })).toBeVisible();
   await expect(page.locator('.loading')).toHaveCount(0);
+  await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: user');
+  await expect(page.locator('.cloud-panel-trigger')).toContainText('Cloud: Signed out');
+
+  // Seed local docs and media on local `os-cowfs` (zero server dependency).
+  await pagePut(page, '/welcome.md', '# OS\n\nLocal offline OS.\n', { mode: 0o644, sudo: true });
+  await pagePut(page, '/demo.slides.md', '# Slide 1\n\n---\n\n# One filesystem\n', { mode: 0o644, sudo: true });
+  await pageMkdirp(page, '/media', 0o755, { sudo: true });
+  await pagePut(page, '/media/signal.wav', minimalWav(), { mode: 0o644, sudo: true });
+
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill('hel'); await input.press('Tab'); await expect(input).toHaveValue('help ');
   await run(page, 'open welcome.md'); await expect(page.locator('#viewer .markdown h1')).toContainText('OS');
@@ -59,16 +88,18 @@ test('terminal, password modal, upload, sanitized Markdown, slides and media', a
   await input.press('Enter'); await expect(page.locator('.slides-current .slide:visible')).toBeVisible();
   await page.keyboard.press('ArrowRight'); await expect(page.locator('.slides-current .slide:visible')).toContainText('One filesystem');
   await page.getByRole('button', { name: 'Close preview' }).click();
+
+  // Zero-friction local wheel user can create folders directly in `/home/user` without any login modal.
   const folder = 'browser-test-' + Date.now();
-  await run(page, 'su root'); await expect(page.locator('#auth')).toBeVisible();
-  await page.getByLabel('Password', { exact: true }).fill(password); await page.locator('#auth button[type=submit]').click();
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await run(page, 'cd ~');
+  await expect(promptPath(page)).toHaveText('/home/user');
   await run(page, 'mkdir ' + folder);
-  // Use our unique fixture; previous runs can leave other media-prefixed directories.
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await complete(input, 'unzip -d ' + folder.slice(0, -1), 'unzip -d ' + folder + '/');
-  await complete(input, 'cd ' + folder.slice(0, -1), 'cd ' + folder + '/'); await input.press('Enter'); await expect(promptPath(page)).toHaveText('/' + folder);
+  await complete(input, 'cd ' + folder.slice(0, -1), 'cd ' + folder + '/'); await input.press('Enter');
+  await expect(promptPath(page)).toHaveText('/home/user/' + folder);
   // The Files upload into their own directory.
-  await browse(page, '/' + folder);
+  await browse(page, '/home/user/' + folder);
   const chooserPromise = page.waitForEvent('filechooser'); await page.getByRole('button', { name: 'Upload' }).click();
   await (await chooserPromise).setFiles({ name: 'Safe preview.md', mimeType: 'text/markdown', buffer: Buffer.from('# Rendered safely\n\n<img src="missing" onerror="window.xss=true">\n<script>window.xss=true</script>\n[bad](javascript:alert(1))') });
   await expect(page.locator('.filename').filter({ hasText: 'Safe preview.md' })).toBeVisible();
@@ -83,13 +114,9 @@ test('terminal, password modal, upload, sanitized Markdown, slides and media', a
   await page.screenshot({ path: 'test-results/terminal.png', fullPage: true });
 });
 
-test('drag/drop uploads images and videos, warning of one that is not faststart', async ({ page, request }) => {
-  const folder = '/media-test-' + Date.now();
+test('drag/drop uploads images and videos, warning of one that is not faststart', async ({ page }) => {
+  const folder = '/home/user/media-test-' + Date.now();
   await page.goto('/');
-  await run(page, 'su root');
-  await expect(page.locator('#auth')).toBeVisible();
-  await page.getByLabel('Password', { exact: true }).fill(password);
-  await page.locator('#auth button[type=submit]').click();
   await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await run(page, 'mkdir ' + folder);
   await run(page, 'cd ' + folder); await expect(promptPath(page)).toHaveText(folder);
@@ -111,7 +138,7 @@ test('drag/drop uploads images and videos, warning of one that is not faststart'
     }
     await transfer.dispose();
   }
-  const files = await listing(request, folder);
+  const files = await pageListing(page, folder);
   expect(files.map(e => e.name).sort()).toEqual(['faststart.mp4', 'pixel.png', 'tail-moov.mp4']);
   await run(page, 'open pixel.png');
   await expect.poll(() => page.locator('.media-frame img').evaluate(e => e.naturalWidth)).toBe(1);

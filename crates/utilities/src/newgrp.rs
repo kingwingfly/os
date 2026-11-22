@@ -72,9 +72,13 @@ impl NewgrpBackend for OsNewgrpBackend {
             .map_err(|e| abi::Error::because(Errno::EIO, e.to_string()))
     }
 
-    fn set_primary_gid(&mut self, _gid: u32) -> Result<(), abi::Error> {
-        // Wave 4B wires kernel `setgid(2)` / primary-gid transition over local `LocalProcessTable`.
-        Ok(())
+    fn set_primary_gid(&mut self, gid: u32) -> Result<(), abi::Error> {
+        let mut reply = os_posix::batch(&[Call::Prctl {
+            option: 1001,
+            value: gid,
+        }])
+        .map_err(|e| abi::Error::because(Errno::EIO, e.to_string()))?;
+        reply.results.remove(0).into_result().map(|_| ())
     }
 
     fn execvp(&mut self, prog: &str, argv: &[String]) -> Result<(), io::Error> {

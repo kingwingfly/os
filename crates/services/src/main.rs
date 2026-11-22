@@ -378,10 +378,13 @@ fn run() -> Result<i32, String> {
                             }
                         }
                         let bind_mounts = build_service_bind_mounts(&unit.bind_mounts);
-                        let service_grant = ServiceGrant {
+                        let needs_grant =
+                            !unit.mount_namespace.as_str().is_empty() || !bind_mounts.is_empty();
+                        let service_grant = needs_grant.then_some(ServiceGrant {
                             mount_namespace: unit.mount_namespace.as_str(),
                             bind_mounts: &bind_mounts,
-                        };
+                            user: None,
+                        });
                         spawn_configured(
                             &unit.argv,
                             Stdin::Null,
@@ -391,7 +394,7 @@ fn run() -> Result<i32, String> {
                             &SpawnOptions {
                                 cgroup: Some(&group),
                                 dup2: &actions,
-                                service_grant: Some(service_grant),
+                                service_grant,
                             },
                         )
                     })();

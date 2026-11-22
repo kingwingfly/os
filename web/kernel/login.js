@@ -1,5 +1,4 @@
-export { LoginStartup } from './login-boot.js';
-// Login coordination belongs to a dedicated host. Names are public; its membership
+// Local login coordination belongs to a dedicated host. Names are public; its membership
 // proof stays here and is never returned through the page protocol or a Web Lock.
 export class LoginCoordinator {
   constructor({ call, host, proof, changed = () => {}, now = () => performance.now() }) {

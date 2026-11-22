@@ -958,6 +958,7 @@ test('a credential failure after authority exec ends the replaced image', async 
   const { k } = createHarness(t);
   syncLocalAccount(k, 0);
   mockRemoteAuthAndDevices(t, 0);
+  await k.cloud_sign_in('root', 0, 0, '[0]', JSON.stringify({ cloud_fs: false, devices: ['archive'], containers: false, relay: false }));
   const path = '/usr/bin/true';
   const pid = JSON.parse(await k.execs(JSON.stringify([{ path, argv: ['true'], env: [], remote: true }]), false, '', 'host'))[0].ok.pid;
   await k.attach_remote_device('archive', pid, 'host');
@@ -974,6 +975,7 @@ test('exec closes the final close-on-exec device mapping on the authority', asyn
   const { k } = createHarness(t);
   syncLocalAccount(k, 1000);
   const events = mockRemoteAuthAndDevices(t, 1000);
+  await k.cloud_sign_in('user', 1000, 1000, '[1000]', JSON.stringify({ cloud_fs: false, devices: ['archive'], containers: false, relay: false }));
   const path = '/usr/bin/true';
   const pid = JSON.parse(await k.execs(JSON.stringify([{ path, argv: ['true'], env: [], remote: true }]), false, '', 'host'))[0].ok.pid;
   await k.attach_remote_device('archive', pid, 'host');
@@ -1059,74 +1061,42 @@ test('ordinary page uploads verify mode 0200 files after sequential and out-of-o
   }
 });
 
-test('Cloud page descriptors guard inode updates, sparse growth and delayed closes across login', async t => {
+test('Local root page descriptors enforce permissions, remount EBUSY while open for write, and make zero pageSysPost calls', async t => {
   const MS_DIRSYNC = 128n;
-  const h = createHarness(t), { k } = h, sid = 'cloud-page', path = '/cloud-file';
+  const h = createHarness(t), { k } = h, sid = 'local-root-page', path = '/home/user/local-file';
   await h.beginSession(sid, 1000);
-  let created = false;
-  let epoch = 'first-cookie', inode = 91, mode = 0o600;
   const seen = [];
-  const stat = (ino, bits) => ({ ino, mode: bits, uid: 1000, gid: 1000, user: 'u', group: 'u',
-    nlink: 1, size: 4, mtime: 1, ctime: 1, version: 'v1' });
   const saved = globalThis.pageSysPost;
-  globalThis.pageSysPost = async (raw, headers) => {
-    const { calls } = JSON.parse(raw);
-    const results = calls.map(call => {
-      const name = typeof call === 'string' ? call : Object.keys(call)[0], arg = call[name];
-      const fdEpoch = headers?.['X-Fd-Epoch'];
-      seen.push({ name, fdEpoch, arg });
-      if (fdEpoch && fdEpoch !== epoch) return { err: { errno: 'EBADF' } };
-      switch (name) {
-        case 'getcreds': return { ok: { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root',
-          group_names: ['root'], home: '/', signed_in: true, can_sudo: true, sudo_active: true } };
-        case 'mkdir': created = true; return { ok: null };
-        case 'lstat': case 'stat':
-          if (arg.path === '/') return { ok: stat(1, 0o40777) };
-          if (arg.path === '/dropbox') return { ok: stat(93, 0o40300) };
-          if (arg.path === '/dropbox/child' && created) return { ok: stat(94, 0o40700) };
-          if (arg.path === path) return { ok: stat(inode, 0o100000 | mode) };
-          return { err: { errno: 'ENOENT' } };
-        case 'access': return arg.path === '/dropbox' && (arg.mode & 4) ? { err: { errno: 'EACCES' } } : { ok: null };
-        case 'open': return { ok: { fd: 3, fd_epoch: epoch, stat: stat(inode, 0o100000 | mode) } };
-        case 'fchmod': mode = arg.mode; return { ok: stat(91, 0o100000 | mode) };
-        case 'close': return { ok: null };
-        default: return { err: { errno: 'ENOSYS' } };
-      }
-    });
-    return JSON.stringify({ status: 200, text: JSON.stringify({ results }) });
+  globalThis.pageSysPost = async raw => {
+    seen.push(raw);
+    return JSON.stringify({ status: 500, text: '{}' });
   };
   t.after(() => { if (saved) globalThis.pageSysPost = saved; else delete globalThis.pageSysPost; });
   const sys = async (call, sudo = false) => JSON.parse(await k.vfs_sys(sid, JSON.stringify({ calls: [call], sudo }))).results[0];
   const remount = flags => sys({ mount: { target: '/', flags: Number(MS_REMOUNT | flags) } }, true);
   const dirsync = await remount(MS_DIRSYNC);
   assert.ok('ok' in dirsync, JSON.stringify(dirsync));
-  const child = await sys({ mkdir: { path: '/dropbox/child', mode: 0o700 } });
-  assert.ok('ok' in child, JSON.stringify({ child, seen }));
-  assert.equal(created, true);
-  const opened = await sys({ open: { path, flags: O_RDWR } });
-  assert.ok(opened.ok, JSON.stringify({ opened, seen }));
+  const made = await sys({ mkdir: { path: '/home/user/dropbox', mode: 0o700 } });
+  assert.ok('ok' in made, JSON.stringify(made));
+  const child = await sys({ mkdir: { path: '/home/user/dropbox/child', mode: 0o700 } });
+  assert.ok('ok' in child, JSON.stringify(child));
+  const opened = await sys({ open: { path, flags: O_CREAT | O_RDWR, mode: 0o600 } });
+  assert.ok(opened.ok, JSON.stringify(opened));
   const fd = opened.ok.fd;
-  await expectErrno(() => k.vfs_pwrite_chunk(sid, fd, 2n ** 31n, new Uint8Array([1])), 'EFBIG');
-  await expectErrno(() => k.vfs_ftruncate_fd(sid, fd, 2n ** 31n), 'EFBIG');
-  inode = 92;
+  await k.vfs_pwrite_chunk(sid, fd, 0n, encoder.encode('test'));
   const chmod = await sys({ fchmod: { fd, mode: 0o640 } });
-  assert.ok('ok' in chmod, JSON.stringify({ chmod, seen }));
-  assert.equal(seen.find(event => event.name === 'fchmod')?.fdEpoch, epoch);
-  epoch = 'next-cookie';
-  assert.equal((await sys({ pread: { fd, offset: 0, count: 1 } })).err.errno, 'EBADF');
-  await sys({ close: { fd } });
-  for (const name of ['pread', 'close']) assert.equal(seen.find(event => event.name === name)?.fdEpoch, 'first-cookie');
-
-  const upload = await sys({ open: { path, flags: O_WRONLY | O_TRUNC, size: 5 } });
-  assert.equal(upload.ok?.fd, 3, JSON.stringify(upload));
+  assert.ok('ok' in chmod, JSON.stringify(chmod));
+  const st = await sys({ stat: { path } });
+  assert.equal(st.ok.mode & 0o777, 0o640);
+  const read = await sys({ pread: { fd, offset: 0, count: 4 } });
+  assert.equal(atob(read.ok.data), 'test');
+  // Open write descriptor prevents MS_RDONLY remount with EBUSY until closed.
   assert.equal((await remount(MS_RDONLY)).err?.errno, 'EBUSY');
-  const closeUpload = epoch => k.vfs_sys(sid, JSON.stringify({ calls: [{ close: { fd: 3 } }] }), epoch)
-    .then(raw => JSON.parse(raw).results[0]);
-  assert.equal((await closeUpload('first-cookie')).err?.errno, 'EBADF');
-  assert.equal((await remount(MS_RDONLY)).err?.errno, 'EBUSY');
-  assert.ok('ok' in await closeUpload(upload.ok.fd_epoch));
+  assert.ok('ok' in await sys({ close: { fd } }));
   const mounted = await remount(MS_RDONLY);
   assert.ok('ok' in mounted, JSON.stringify(mounted));
+  // Zero network calls hit pageSysPost across all `/` operations!
+  assert.deepEqual(seen, []);
 });
 
 test('anonymous page directory descriptors survive batches and fdinfo uses the page descriptor', async t => {

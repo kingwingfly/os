@@ -292,6 +292,7 @@ fn root_template(out: &Path, name: &str) -> Result<Image> {
         directory("/home"),
         directory_mode("/home/user", 1000, 1000, 0o750),
         directory("/mnt"),
+        directory("/mnt/cloud"),
         directory("/mnt/local"),
         directory("/mnt/shared"),
         directory("/opt"),
@@ -361,6 +362,8 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
         "/usr/bin",
         "/usr/include",
         "/usr/lib",
+        "/usr/lib/os",
+        "/usr/lib/os/units",
         "/usr/libexec",
         "/usr/local",
         "/usr/share",
@@ -405,6 +408,16 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
             node: Node::Symlink {
                 target: target.into(),
             },
+        });
+    }
+    for spec in os_services::graph::default_system_units() {
+        let raw = serde_json::to_vec_pretty(&spec)?;
+        entries.push(Entry {
+            path: format!("/usr/lib/os/units/{}.json", spec.name),
+            uid: 0,
+            gid: 0,
+            mode: 0o644,
+            node: blob(out, &raw)?,
         });
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));

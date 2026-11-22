@@ -1474,10 +1474,6 @@ impl Db {
             vec![int(uid), text(path), int(col), int(row)],
         );
     }
-    /// Forget where `uid` showed anything: its account is gone, and a new one may take its uid.
-    pub fn delete_places(&mut self, uid: u32) {
-        self.run("DELETE FROM places WHERE uid = ?", vec![int(uid)]);
-    }
     pub fn device(&self, name: &str) -> Option<Device> {
         self.rows::<Device>(
             "SELECT name, owner, path, media FROM devices WHERE name = ?",
@@ -1532,16 +1528,6 @@ impl Db {
     /// which they hear of (`replaced_device`).
     pub fn forget_device(&mut self, name: &str) {
         self.run("DELETE FROM devices WHERE name = ?", vec![text(name)]);
-    }
-    /// The names of `owner`'s devices.
-    pub fn devices_of(&self, owner: u32) -> Vec<String> {
-        self.rows::<Device>(
-            "SELECT name, owner, path, media FROM devices WHERE owner = ?",
-            vec![int(owner)],
-        )
-        .into_iter()
-        .map(|device| device.name)
-        .collect()
     }
     pub fn set_device(&mut self, device: &Device, started: u64) {
         self.run(

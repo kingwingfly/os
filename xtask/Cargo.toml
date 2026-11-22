@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 os-image = { path = "../crates/image" }
 os-core = { path = "../crates/core" }
+os-services = { path = "../crates/services" }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11"

@@ -115,6 +115,24 @@ fn main() {
     if args[0] == "cowfsck" {
         std::process::exit(cowfsck::run(&args[1..]));
     }
+    if args[0] == "su" {
+        std::process::exit(os_utilities::su::run(&args[1..]));
+    }
+    if args[0] == "sudo" {
+        std::process::exit(os_utilities::sudo::run(&args[1..]));
+    }
+    if args[0] == "passwd" {
+        std::process::exit(os_utilities::passwd::run(&args[1..]));
+    }
+    if args[0] == "login" {
+        std::process::exit(os_utilities::login::run(&args[1..]));
+    }
+    if args[0] == "newgrp" {
+        std::process::exit(os_utilities::newgrp::run(&args[1..]));
+    }
+    if args[0] == "service" {
+        std::process::exit(os_utilities::service::run(&args[1..]));
+    }
     if cli::wants_help(&args)
         && let Some(help) = cli::help(&args[0])
     {

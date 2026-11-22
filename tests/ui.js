@@ -10,3 +10,172 @@ export async function browse(page, path) {
 
 // The terminal's working directory, as its prompt shows it.
 export const promptPath = page => page.locator('label[for=command] .prompt-path');
+
+// Explicit Cloud / Cluster Sign-In & Sign-Out helpers (#57 L3d).
+// Local OS accounts are 100% local on `os-cowfs` (auto-login `user` uid 1000 in `wheel`);
+// tests requiring `/mnt/cloud` or remote devices (`/dev/{archive,media,present,snd}`) call this explicitly.
+export async function cloudSignIn(page, username, password, scope) {
+  return page.evaluate(
+    ([u, p, s]) => window.os.cloudSignIn(u, p, s),
+    [username, password, scope ?? null],
+  );
+}
+
+export async function cloudSignOut(page) {
+  return page.evaluate(() => window.os.cloudSignOut());
+}
+
+export async function cloudStatus(page) {
+  return page.evaluate(() => window.os.cloudStatus());
+}
+
+export async function bootStatus(page) {
+  return page.evaluate(() => window.os.bootStatus());
+}
+
+// Page-local VFS helpers (`fetch('/api/sys')` / `/api/pwrite` / `/api/file` inside the browser page,
+// routed by `web/local-files.js` straight to the tab's local `os-cowfs` + `/tmp` with 0 network RPCs).
+export async function pageSys(page, calls, options = {}) {
+  return page.evaluate(async ([calls, options]) => {
+    const res = await fetch('/api/sys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ calls, ...options }),
+    });
+    if (!res.ok) throw new Error(`/api/sys: ${res.status} ${await res.text()}`);
+    return (await res.json()).results;
+  }, [calls, options]);
+}
+
+export async function pageCall(page, call, options = {}) {
+  const [result] = await pageSys(page, [call], options);
+  if ('ok' in result) return result.ok;
+  const err = new Error(`${typeof call === 'string' ? call : Object.keys(call)[0]}: ${result.err.detail || result.err.errno}`);
+  err.errno = result.err.errno;
+  throw err;
+}
+
+export async function pageErrno(page, call, options = {}) {
+  const [result] = await pageSys(page, [call], options);
+  return 'err' in result ? result.err.errno : null;
+}
+
+export async function pageMkdirp(page, path, mode = 0o755, options = {}) {
+  const parts = path.split('/').filter(Boolean);
+  const calls = parts.map((_, i) => ({ mkdir: { path: '/' + parts.slice(0, i + 1).join('/'), mode } }));
+  if (!calls.length) return;
+  const results = await pageSys(page, calls, options);
+  const failed = results.findLast(r => r.err && r.err.errno !== 'EEXIST');
+  if (failed) {
+    const err = new Error(`mkdir -p ${path}: ${failed.err.detail || failed.err.errno}`);
+    err.errno = failed.err.errno;
+    throw err;
+  }
+}
+
+export async function pagePut(page, path, data, { mode = 0o644, overwrite = true, sudo = false } = {}) {
+  const base64 = Buffer.from(data).toString('base64');
+  const res = await page.evaluate(async ({ path, base64, mode, overwrite, sudo }) => {
+    const bin = atob(base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const flags = 0o1 | 0o100 | (overwrite ? 0o1000 : 0o200);
+    const openRes = await fetch('/api/sys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ calls: [{ open: { path, flags, mode, size: bytes.length } }], sudo }),
+    });
+    const [opened] = (await openRes.json()).results;
+    if (opened.err) return { ok: false, errno: opened.err.errno, detail: opened.err.detail };
+    const { fd, chunk_size: chunk = 8 * 1024 * 1024 } = opened.ok;
+    for (let idx = 0; idx * chunk < bytes.length; idx++) {
+      const slice = bytes.subarray(idx * chunk, (idx + 1) * chunk);
+      const pw = await fetch(`/api/pwrite?fd=${fd}&index=${idx}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: slice,
+      });
+      if (!pw.ok) {
+        await fetch('/api/sys', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ calls: [{ close: { fd } }], sudo }),
+        });
+        return { ok: false, status: pw.status, detail: await pw.text() };
+      }
+    }
+    const closeRes = await fetch('/api/sys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ calls: [{ close: { fd } }], sudo }),
+    });
+    const [closed] = (await closeRes.json()).results;
+    if (closed.err) return { ok: false, errno: closed.err.errno, detail: closed.err.detail };
+    return { ok: true, result: closed.ok };
+  }, { path, base64, mode, overwrite, sudo });
+  if (!res.ok) {
+    const err = new Error(`pagePut(${path}): ${res.errno ?? res.status} ${res.detail ?? ''}`);
+    err.errno = res.errno;
+    throw err;
+  }
+  return res.result;
+}
+
+export async function pageGetBytes(page, path) {
+  const res = await page.evaluate(async path => {
+    const r = await fetch('/api/file?path=' + encodeURIComponent(path));
+    if (!r.ok) return { ok: false, status: r.status, text: await r.text() };
+    const buf = new Uint8Array(await r.arrayBuffer());
+    let bin = '';
+    for (let i = 0; i < buf.length; i += 0x8000) {
+      bin += String.fromCharCode(...buf.subarray(i, i + 0x8000));
+    }
+    return { ok: true, status: r.status, base64: btoa(bin) };
+  }, path);
+  if (!res.ok) return null;
+  return Buffer.from(res.base64, 'base64');
+}
+
+export async function pageGetText(page, path) {
+  const bytes = await pageGetBytes(page, path);
+  return bytes ? bytes.toString('utf8') : null;
+}
+
+export async function pageListing(page, path, options = {}) {
+  const entries = (await pageCall(page, { getdents: { path } }, options)).map(({ name, stat }) => ({
+    name,
+    directory: !!stat && (stat.mode & 0o170000) === 0o040000,
+    owner: stat?.user,
+    group: stat?.group,
+    mode: stat ? stat.mode & 0o7777 : 0,
+    size: stat?.size,
+    link: stat?.link,
+  }));
+  return entries.sort((a, b) => (b.directory - a.directory) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+export async function pageRmrf(page, path, options = {}) {
+  const [found] = await pageSys(page, [{ lstat: { path } }], options);
+  if (found.err) return found.err.errno === 'ENOENT' ? null : found.err.errno;
+  if ((found.ok.mode & 0o170000) !== 0o040000) return pageErrno(page, { unlink: { path } }, options);
+  const [listed] = await pageSys(page, [{ getdents: { path } }], options);
+  if (listed.err) return listed.err.errno;
+  let failure = null;
+  for (const e of listed.ok) {
+    failure ??= await pageRmrf(page, path.replace(/\/$/, '') + '/' + e.name, options);
+  }
+  return failure ?? pageErrno(page, { rmdir: { path } }, options);
+}
+
+// Switch the page's local OS account (100% local, zero network RPCs) and emit `os:login-changed`.
+export async function switchLocalUser(page, username, { password = '', sudo = true } = {}) {
+  const creds = await pageCall(page, { login: { username, password } }, { sudo });
+  await page.evaluate(() => window.dispatchEvent(new Event('os:login-changed')));
+  return creds;
+}
+
+export async function logoutLocalUser(page) {
+  const out = await pageCall(page, 'logout');
+  await page.evaluate(() => window.dispatchEvent(new Event('os:login-changed')));
+  return out;
+}

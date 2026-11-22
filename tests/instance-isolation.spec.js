@@ -1,12 +1,14 @@
 import { test, expect } from './test.js';
-import { api, call as syscall, program, put, rmrf } from './sys.js';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { api, call as syscall, put, rmrf } from './sys.js';
+import { cloudSignIn } from './ui.js';
+import { FULL_SCOPE } from './service-auth.js';
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const OS_FD_ROOT = 0x7ffffffd;
-const O_RDONLY = 0;
+const CLOUD_ROOT = { cloudUser: 'root', cloudUid: 0, cloudGid: 0, cloudGroups: [0], scope: FULL_SCOPE };
 
 let seq = 0;
 async function loginAs(request, username, password) {
@@ -66,7 +68,7 @@ async function fsRpc(request, credential, session, fsCall, instanceId) {
   return { status: res.status(), ok: res.ok(), body: await res.json() };
 }
 
-test('Gate 1: two tabs of the same signed-in account have isolated PIDs, /proc, /run, and /tmp while sharing cloud files', async ({ browser }) => {
+test('Gate 1: two tabs with explicit Cloud Sign-In have isolated PIDs, /proc, /run, and /tmp while sharing /mnt/cloud files', async ({ browser }) => {
   const context = await browser.newContext();
   const sharedFile = `/guest/shared-inst-${randomUUID()}.txt`;
   try {
@@ -75,18 +77,20 @@ test('Gate 1: two tabs of the same signed-in account have isolated PIDs, /proc, 
     const tabB = await context.newPage();
     await tabA.goto('/');
     await tabB.goto('/');
-    await expect.poll(async () => (await tabA.evaluate(() => window.os.loginSession()))?.session?.uid).toBe(0);
-    await expect.poll(async () => (await tabB.evaluate(() => window.os.loginSession()))?.session?.uid).toBe(0);
+    await tabA.waitForFunction(() => Boolean(window.os?.cloudSignIn));
+    await tabB.waitForFunction(() => Boolean(window.os?.cloudSignIn));
+    await cloudSignIn(tabA, 'root', rootPassword, FULL_SCOPE);
+    await cloudSignIn(tabB, 'root', rootPassword, FULL_SCOPE);
 
-    // Write instance-local files in Tab A's /tmp and /run, and a cloud file in /guest.
-    await command(tabA, `sh -c "printf tabA-tmp > /tmp/only-a && printf tabA-run > /run/only-a && printf cloud-ok > ${sharedFile}"`);
-    await command(tabA, 'cat /tmp/only-a /run/only-a');
+    // Write instance-local files in Tab A's /tmp and /run/user/1000, and a cloud file in /mnt/cloud/guest.
+    await command(tabA, `sh -c "mkdir -p /run/user/1000 && printf tabA-tmp > /tmp/only-a && printf tabA-run > /run/user/1000/only-a && printf cloud-ok > /mnt/cloud${sharedFile}"`);
+    await command(tabA, 'cat /tmp/only-a /run/user/1000/only-a');
     await expect(last(tabA)).toHaveText('tabA-tmptabA-run');
 
-    // Tab B shares the cloud file but sees NEITHER Tab A's /tmp nor /run.
-    await command(tabB, `cat ${sharedFile}`);
+    // Tab B shares the cloud file under /mnt/cloud but sees NEITHER Tab A's /tmp nor /run.
+    await command(tabB, `cat /mnt/cloud${sharedFile}`);
     await expect(last(tabB)).toHaveText('cloud-ok');
-    await command(tabB, 'sh -c "test -e /tmp/only-a && echo LEAK || echo ISOLATED_TMP; test -e /run/only-a && echo LEAK || echo ISOLATED_RUN"');
+    await command(tabB, 'sh -c "test -e /tmp/only-a && echo LEAK || echo ISOLATED_TMP; test -e /run/user/1000/only-a && echo LEAK || echo ISOLATED_RUN"');
     await expect(last(tabB)).toHaveText('ISOLATED_TMP\nISOLATED_RUN');
 
     // Distinct tabs run independent kernel instances with distinct boot IDs.
@@ -200,11 +204,17 @@ test('Gate 3a: boot /dev omits remote devices until explicit credentialed attach
 
   const proc = await kv(page, 'exec', { path: '/usr/bin/true', argv: ['true'], cwd: '/', env: [] });
   try {
-    // At boot, local /dev has null/zero/full/random/urandom/ptmx, NOT remote devices archive/media/present/snd.
+    // At boot (before Cloud Sign-In), local /dev has null/zero/full/random/urandom/ptmx, NOT remote devices archive/media/present/snd.
     for (const dev of ['archive', 'media', 'present', 'snd']) {
       expect((await kc(page, 'proc_statat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: `/dev/${dev}`, follow: true })).err?.errno).toBe('ENOENT');
     }
     expect((await kc(page, 'proc_statat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: '/dev/null', follow: true })).ok).toBeTruthy();
+
+    // Sign into Cloud with cloud_fs only (no auto-attached devices yet) so we test explicit credentialed attachment!
+    await kv(page, 'cloud_sign_in', { ...CLOUD_ROOT, scope: { cloud_fs: true, devices: [], containers: false, relay: false } });
+    for (const dev of ['archive', 'media', 'present', 'snd']) {
+      expect((await kc(page, 'proc_statat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: `/dev/${dev}`, follow: true })).err?.errno).toBe('ENOENT');
+    }
 
     // Uncredentialed local process cannot attach a remote device (EACCES).
     expect((await kc(page, 'attach_remote_device', { driver: 'archive', pid: proc.pid })).err?.errno).toBe('EACCES');
@@ -251,126 +261,94 @@ test('Gate 3a: boot /dev omits remote devices until explicit credentialed attach
   }
 });
 
-test('Gate 3b: account lock, password change, delete, explicit revoke, and host detach terminate remote access immediately', async ({ browser }) => {
-  const adminCtx = await browser.newContext();
+test('Gate 3b: explicit Cloud Sign-Out, token revocation, and host detach terminate remote access immediately without killing local processes', async ({ browser }) => {
   const userCtx = await browser.newContext();
-  const username = `l3auser${Date.now().toString(36).slice(-5)}`;
-  const pass1 = 'InitialPassword!1234';
-  const pass2 = 'RotatedPassword!5678';
+  const username = `l3dcloud${Date.now().toString(36).slice(-5)}`;
+  const pass1 = 'CloudSecretPass!1234';
   try {
-    await loginAs(adminCtx.request, 'root', rootPassword);
-    expect((await program(adminCtx.request, ['useradd', '-m', '-G', 'wheel', username])).ok()).toBe(true);
-    expect((await api(adminCtx.request, 'passwd', { data: { username, password: pass1 } })).ok()).toBe(true);
+    const reg = await api(userCtx.request, 'register', {
+      headers: { 'CF-Connecting-IP': `inst-iso-reg-${Date.now()}` },
+      data: { username, password: pass1, create_home: true },
+    });
+    expect(reg.ok(), await reg.text()).toBe(true);
+    const creds = await syscall(userCtx.request, 'getcreds');
 
-    // Sign in as the wheel user in userCtx, elevate sudo, and mint BOTH regular and sudo-elevated remote creds.
-    await loginAs(userCtx.request, username, pass1);
-    expect((await api(userCtx.request, 'sudo', { data: { password: pass1 } })).ok()).toBe(true);
     const userPage = await userCtx.newPage();
     await userPage.goto('/login');
     await connectKernel(userPage);
-    await kv(userPage, 'sync_account_from_server');
+    await kv(userPage, 'cloud_sign_in', {
+      cloudUser: username,
+      cloudUid: creds.uid,
+      cloudGid: creds.gid,
+      cloudGroups: creds.groups,
+      scope: FULL_SCOPE,
+    });
     const instanceId = await kv(userPage, 'instance_id');
     const p1 = await kv(userPage, 'exec', { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [], remote: true });
-    const p1Sudo = await kv(userPage, 'exec', { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [], remote: true, sudo: true });
 
-    // Sanity check: both p1 and sudo-elevated p1Sudo connect to /api/fs.
+    // Sanity check: p1 connects to /api/fs with its minted ServiceAuth v2 token.
     const check1 = await fsRpc(userCtx.request, p1.token, null, 'connect', instanceId);
     expect(check1.ok, JSON.stringify(check1)).toBe(true);
     await fsRpc(userCtx.request, p1.token, check1.body.session, 'disconnect', instanceId);
-    const check1Sudo = await fsRpc(userCtx.request, p1Sudo.token, null, 'connect', instanceId);
-    expect(check1Sudo.ok, JSON.stringify(check1Sudo)).toBe(true);
-    await fsRpc(userCtx.request, p1Sudo.token, check1Sudo.body.session, 'disconnect', instanceId);
 
-    // 1. Account lock (usermod -L) immediately fails closed on BOTH p1 and sudo-elevated p1Sudo!
-    expect((await program(adminCtx.request, ['usermod', '-L', username])).ok()).toBe(true);
-    const afterLock = await fsRpc(userCtx.request, p1.token, null, 'connect', instanceId);
-    expect(afterLock.ok).toBe(false);
-    expect(['EACCES', 'EPERM']).toContain(afterLock.body.errno);
-    const afterLockSudo = await fsRpc(userCtx.request, p1Sudo.token, null, 'connect', instanceId);
-    expect(afterLockSudo.ok).toBe(false);
-    expect(['EACCES', 'EPERM']).toContain(afterLockSudo.body.errno);
+    // 1. Explicit cloud_sign_out revokes p1's remote token immediately while keeping local process p1 alive!
+    await kv(userPage, 'cloud_sign_out');
+    const afterSignOut = await fsRpc(userCtx.request, p1.token, null, 'connect', instanceId);
+    expect(afterSignOut.ok).toBe(false);
+    expect(['EACCES', 'EPERM']).toContain(afterSignOut.body.errno);
+    const [p1Alive] = await kv(userPage, 'poll', { pids: [p1.pid] });
+    expect(p1Alive.state).toBe('running');
 
-    // Unlock and re-login to verify password change (passwd) invalidates BOTH regular and sudo remote creds.
-    expect((await program(adminCtx.request, ['usermod', '-U', username])).ok()).toBe(true);
+    // 2. Re-sign into Cloud, mint p2, then detach_instance -> immediately revokes p2 while p2 stays alive locally!
     await loginAs(userCtx.request, username, pass1);
-    expect((await api(userCtx.request, 'sudo', { data: { password: pass1 } })).ok()).toBe(true);
+    await kv(userPage, 'cloud_sign_in', {
+      cloudUser: username,
+      cloudUid: creds.uid,
+      cloudGid: creds.gid,
+      cloudGroups: creds.groups,
+      scope: FULL_SCOPE,
+    });
     const p2 = await kv(userPage, 'exec', { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [], remote: true });
-    const p2Sudo = await kv(userPage, 'exec', { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [], remote: true, sudo: true });
     const check2 = await fsRpc(userCtx.request, p2.token, null, 'connect', instanceId);
     expect(check2.ok, JSON.stringify(check2)).toBe(true);
     await fsRpc(userCtx.request, p2.token, check2.body.session, 'disconnect', instanceId);
-    const check2Sudo = await fsRpc(userCtx.request, p2Sudo.token, null, 'connect', instanceId);
-    expect(check2Sudo.ok, JSON.stringify(check2Sudo)).toBe(true);
-    await fsRpc(userCtx.request, p2Sudo.token, check2Sudo.body.session, 'disconnect', instanceId);
-
-    // 2. Password change terminates existing regular AND sudo remote access immediately.
-    expect((await api(adminCtx.request, 'passwd', { data: { username, password: pass2 } })).ok()).toBe(true);
-    const afterPasswd = await fsRpc(userCtx.request, p2.token, null, 'connect', instanceId);
-    expect(afterPasswd.ok).toBe(false);
-    expect(['EACCES', 'EPERM']).toContain(afterPasswd.body.errno);
-    const afterPasswdSudo = await fsRpc(userCtx.request, p2Sudo.token, null, 'connect', instanceId);
-    expect(afterPasswdSudo.ok).toBe(false);
-    expect(['EACCES', 'EPERM']).toContain(afterPasswdSudo.body.errno);
-
-    // 3. Re-login with new password, mint p3, then detach instance (orderly host teardown).
-    await loginAs(userCtx.request, username, pass2);
-    const p3 = await kv(userPage, 'exec', { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [], remote: true });
-    const check3 = await fsRpc(userCtx.request, p3.token, null, 'connect', instanceId);
-    expect(check3.ok, JSON.stringify(check3)).toBe(true);
-    await fsRpc(userCtx.request, p3.token, check3.body.session, 'disconnect', instanceId);
 
     await kv(userPage, 'detach_instance');
-    const afterDetach = await fsRpc(userCtx.request, p3.token, null, 'connect', instanceId);
+    const afterDetach = await fsRpc(userCtx.request, p2.token, null, 'connect', instanceId);
     expect(afterDetach.ok).toBe(false);
     expect(['EACCES', 'EPERM']).toContain(afterDetach.body.errno);
 
-    // 4. Account deletion (userdel -r) terminates regular AND sudo active remote access immediately.
-    expect((await api(userCtx.request, 'sudo', { data: { password: pass2 } })).ok()).toBe(true);
-    const p4 = await kv(userPage, 'exec', { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [], remote: true });
-    const p4Sudo = await kv(userPage, 'exec', { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [], remote: true, sudo: true });
-    const check4 = await fsRpc(userCtx.request, p4.token, null, 'connect', instanceId);
-    expect(check4.ok, JSON.stringify(check4)).toBe(true);
-    await fsRpc(userCtx.request, p4.token, check4.body.session, 'disconnect', instanceId);
-    const check4Sudo = await fsRpc(userCtx.request, p4Sudo.token, null, 'connect', instanceId);
-    expect(check4Sudo.ok, JSON.stringify(check4Sudo)).toBe(true);
-    await fsRpc(userCtx.request, p4Sudo.token, check4Sudo.body.session, 'disconnect', instanceId);
-
-    expect((await program(adminCtx.request, ['userdel', '-r', username])).ok()).toBe(true);
-    const afterDelete = await fsRpc(userCtx.request, p4.token, null, 'connect', instanceId);
-    expect(afterDelete.ok).toBe(false);
-    expect(['EACCES', 'EPERM']).toContain(afterDelete.body.errno);
-    const afterDeleteSudo = await fsRpc(userCtx.request, p4Sudo.token, null, 'connect', instanceId);
-    expect(afterDeleteSudo.ok).toBe(false);
-    expect(['EACCES', 'EPERM']).toContain(afterDeleteSudo.body.errno);
+    for (const p of [p1, p2]) {
+      await kc(userPage, 'exit', { pid: p.pid, status: 0 });
+      await kc(userPage, 'wait', { pid: p.pid });
+    }
   } finally {
-    await program(adminCtx.request, ['userdel', '-r', username]).catch(() => {});
     await userCtx.close();
-    await adminCtx.close();
   }
 });
 
-test('Gate 4: privilege drop, cloud=false reexec, and pre-login guest processes fail closed on remote access (Contract §2.4)', async ({ page, context }) => {
+test('Gate 4: privilege drop, cloud=false reexec, and unauthenticated processes fail closed on remote access (Contract §2.4)', async ({ page, context }) => {
   await page.goto('/login');
   await connectKernel(page);
 
-  // 1. Pre-login guest process (uid 65534, before sync_account) MUST NOT escalate to root when
-  //    another request signs in as root in the same browser context.
-  const guestProc = await kv(page, 'exec', { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [] });
+  // 1. Pre-cloud-sign-in local user process (uid 1000) MUST NOT mint or escalate to remote root
+  //    even if the browser has a server auth cookie, until explicit cloud_sign_in.
+  const localProc = await kv(page, 'exec', { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [] });
   try {
     await loginAs(context.request, 'root', rootPassword);
-    // Do NOT call sync_account yet: local guest uid 65534 attempts cloud access while cookie is root.
-    const esc = await kc(page, 'proc_statat', { pid: guestProc.pid, dirfd: OS_FD_ROOT, path: '/etc/passwd', follow: true });
-    expect(esc.err?.errno).toBe('EACCES');
-    const guestCreds = await kv(page, 'getcreds_proc', { pid: guestProc.pid });
-    expect(guestCreds.uid).toBe(65534);
-    expect(guestCreds.has_remote).toBe(false);
+    const esc = await kc(page, 'mint_remote_cred', { pid: localProc.pid, sudo: false });
+    expect(['EACCES', 'ENOTCONN', 'EPERM']).toContain(esc.err?.errno);
+    const localCreds = await kv(page, 'getcreds_proc', { pid: localProc.pid });
+    expect(localCreds.uid).toBe(1000);
+    expect(localCreds.has_remote).toBe(false);
   } finally {
-    await kc(page, 'exit', { pid: guestProc.pid, status: 0 });
-    await kc(page, 'wait', { pid: guestProc.pid });
+    await kc(page, 'exit', { pid: localProc.pid, status: 0 });
+    await kc(page, 'wait', { pid: localProc.pid });
   }
 
   // 2. Privilege drop clears ambient remote credential and revokes its token.
   await kv(page, 'sync_account', { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root', home: '/root', shell: '/usr/bin/dash', signed_in: true });
+  await kv(page, 'cloud_sign_in', CLOUD_ROOT);
   const instanceId = await kv(page, 'instance_id');
   const proc = await kv(page, 'exec', { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [], remote: true });
   expect(proc.token).toMatch(/^[0-9a-f]{64}$/);
@@ -406,11 +384,13 @@ test('Gate 4: privilege drop, cloud=false reexec, and pre-login guest processes 
     const dropped = await kv(page, 'set_proc_cred', { pid: proc.pid, uid: 1000, gid: 1000, groups: [1000] });
     expect(dropped).toMatchObject({ uid: 1000, gid: 1000, has_remote: false, cloud_access: false });
 
-    // Ambient remote token was revoked on the server, and local VFS refuses remote cloud paths with EACCES.
+    // Ambient remote token was revoked on the server, and local VFS refuses remote `/mnt/cloud` with EACCES
+    // while local `/etc/passwd` remains readable!
     const afterDrop = await fsRpc(context.request, proc.token, null, 'connect', instanceId);
     expect(afterDrop.ok).toBe(false);
     expect(['EACCES', 'EPERM']).toContain(afterDrop.body.errno);
-    expect((await kc(page, 'proc_statat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: '/etc/passwd', follow: true })).err?.errno).toBe('EACCES');
+    expect((await kc(page, 'proc_statat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: '/mnt/cloud/etc/passwd', follow: true })).err?.errno).toBe('EACCES');
+    expect((await kc(page, 'proc_statat', { pid: proc.pid, dirfd: OS_FD_ROOT, path: '/etc/passwd', follow: true })).ok).toBeTruthy();
   } finally {
     await kc(page, 'exit', { pid: proc.pid, status: 0 });
     await kc(page, 'wait', { pid: proc.pid });
@@ -422,6 +402,7 @@ test('Gate 5: server enforces remote io.max per credential regardless of client 
   await connectKernel(page);
   await loginAs(context.request, 'root', rootPassword);
   await kv(page, 'sync_account', { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root', home: '/root', shell: '/usr/bin/dash', signed_in: true });
+  await kv(page, 'cloud_sign_in', CLOUD_ROOT);
   const instanceId = await kv(page, 'instance_id');
   const cg = `/user/io-max-${randomUUID()}`;
   const path = `/guest/io-max-${randomUUID()}.bin`;
@@ -604,6 +585,7 @@ test('F3-04/F3-05/F3-09: atomic mint io.max, shared-token min-across-holders, an
   await connectKernel(page);
   await loginAs(context.request, 'root', rootPassword);
   await kv(page, 'sync_account', { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root', home: '/root', shell: '/usr/bin/dash', signed_in: true });
+  await kv(page, 'cloud_sign_in', CLOUD_ROOT);
   const instanceId = await kv(page, 'instance_id');
   const cg = `/user/strict-io-${randomUUID().slice(0, 8)}`;
   const path = `/guest/strict-io-${randomUUID()}.bin`;

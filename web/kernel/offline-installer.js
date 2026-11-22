@@ -39,7 +39,7 @@ export const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca49
 const ALLOWED_IMAGE_FEATURES = new Set(['wasi-preview1', 'os-abi-1', 'wasix-fork-v4']);
 const INITRAMFS_DIRS = new Set(['/dev', '/proc', '/run', '/sysroot', '/tmp']);
 const ROOT_TEMPLATE_DIRS = new Set([
-  '/boot', '/dev', '/dev/pts', '/mnt', '/mnt/local', '/mnt/shared',
+  '/boot', '/dev', '/dev/pts', '/mnt', '/mnt/cloud', '/mnt/local', '/mnt/shared',
   '/opt', '/opt/private', '/proc', '/run', '/srv', '/sys', '/tmp', '/usr',
 ]);
 const BASE_TOP_LINKS = new Set(['/bin', '/sbin', '/lib', '/lib64']);

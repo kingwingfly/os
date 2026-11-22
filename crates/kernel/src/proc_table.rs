@@ -1629,6 +1629,30 @@ impl LocalProcessTable {
         identity: Identity,
         explicit_remote: Option<RemoteCredRef>,
     ) -> Result<Vec<String>, Error> {
+        self.set_cred_inner(caller_host, pid, identity, explicit_remote, false)
+    }
+
+    /// Kernel-authenticated credential transition used exclusively AFTER `LocalAccountStore`
+    /// verifies `/etc/shadow` or `/etc/sudoers` (`Call::Login`, `Call::Sudo`). Still strictly
+    /// enforces monotonic `cloud_access` and clears/revokes dropped remote credentials.
+    pub fn set_authenticated_cred(
+        &mut self,
+        caller_host: &str,
+        pid: u32,
+        identity: Identity,
+        explicit_remote: Option<RemoteCredRef>,
+    ) -> Result<Vec<String>, Error> {
+        self.set_cred_inner(caller_host, pid, identity, explicit_remote, true)
+    }
+
+    fn set_cred_inner(
+        &mut self,
+        caller_host: &str,
+        pid: u32,
+        identity: Identity,
+        explicit_remote: Option<RemoteCredRef>,
+        authenticated: bool,
+    ) -> Result<Vec<String>, Error> {
         let dropped_token = {
             let proc = self.procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
             if proc.owner_host != caller_host {
@@ -1646,8 +1670,9 @@ impl LocalProcessTable {
                 || identity.group != prev_gid
                 || identity.groups != prev_groups;
 
-            // Non-root processes can NEVER change local UID, GID, or supplementary groups.
-            if identity_changed && prev_uid != 0 {
+            // Non-root processes can NEVER change local UID, GID, or supplementary groups
+            // without kernel authentication (`Call::Login` / `Call::Sudo`).
+            if !authenticated && identity_changed && prev_uid != 0 {
                 return Err(Errno::EPERM.into());
             }
             // Monotonic cloud_access: explicit_remote can never re-enable cloud_access on a

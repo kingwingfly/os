@@ -2950,9 +2950,14 @@ const osApi = {
       if (req.serviceGrant != null) {
         const g = req.serviceGrant;
         if (typeof g !== 'object' || Array.isArray(g) || typeof g.mountNamespace !== 'string' || g.mountNamespace.includes('\0')) throw new Errno(EINVAL);
+        if (g.user != null && (typeof g.user !== 'string' || !g.user || g.user.includes('\0') || g.user.length > 64)) throw new Errno(EINVAL);
         const binds = g.bindMounts ?? [];
         if (!Array.isArray(binds) || binds.length > 32 || !binds.every(b => b && typeof b === 'object' && typeof b.source === 'string' && !b.source.includes('\0') && typeof b.target === 'string' && !b.target.includes('\0') && typeof b.readOnly === 'boolean')) throw new Errno(EINVAL);
-        serviceGrant = { mountNamespace: g.mountNamespace, bindMounts: binds.map(b => ({ source: b.source, target: b.target, readOnly: b.readOnly })) };
+        serviceGrant = {
+          mountNamespace: g.mountNamespace,
+          bindMounts: binds.map(b => ({ source: b.source, target: b.target, readOnly: b.readOnly })),
+          ...(g.user != null ? { user: g.user } : {}),
+        };
       }
       const totalSize = values => values.reduce((sum, value) => sum + encoder.encode(value).length + 1, 0);
       if (totalSize(req.argv) > 128 * 1024 || totalSize(req.env) > 128 * 1024) throw new Errno(ERRNO.E2BIG);

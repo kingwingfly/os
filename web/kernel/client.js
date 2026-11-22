@@ -1,11 +1,15 @@
 import { asset } from '../release.js';
 import { imageBlobRead } from './image-pager.js';
+import { createBootProfileStore } from './boot-profile.js';
+import { createCowfsStore } from './cowfs-store.js';
 // The client kernel: a classic dedicated Worker (one isolated OS instance per tab), so it can
 // importScripts the no-modules wasm-bindgen build. The Rust kernel (crates/client-kernel) owns
-// this instance's LocalProcessTable, local /proc, instance-local /run and /tmp, local cgroup v2
-// policy, and explicit remote ServiceAuth v2 credentials. Boot, exec, fork, wait, kill, pipe,
-// setsid, and /proc run 100% locally with zero network RPCs; remote cloud filesystem and remote
-// devices attach lazily over ServiceAuth v2 (/api/service-auth) only when needed.
+// this instance's LocalProcessTable, persistent local `os-cowfs` root volume, local accounts
+// (`/etc/{passwd,group,shadow,sudoers}`), local `/proc`, instance-local `/run` and `/tmp`,
+// local cgroup v2 policy, and explicit remote `ServiceAuth v2` credentials. Boot, PID 1 `/usr/bin/init`,
+// exec, fork, wait, kill, pipe, setsid, PTYs, `AF_UNIX`, and `/proc` run 100% locally offline
+// with ZERO network RPCs; optional CloudFs (`/mnt/cloud`) and remote devices attach only after
+// explicit Cloud Sign-In.
 //
 // A process belongs exclusively to its port's host identity (never the public tab label). Only
 // that port forks it, replaces its image, ends it, waits for its children, or signals as it;
@@ -16,7 +20,15 @@ const VERSION = 2;
 const ports = new Set();
 let kernel;
 let starting;
-let login, machineInit;
+let login;
+let cowfsStore;
+let bootProfileStore;
+let localInitView = null;
+let localInitState = 'starting';
+let localInitFailures = 0;
+let localInitRunning = false;
+let localInitProof = '';
+let localInitAbort = false;
 // This instance's unique local identifier (never shared across tabs).
 const kernelId = self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 // Each port's host: an identity of its own, made here, and the tab it first said it was.
@@ -173,18 +185,148 @@ function buildAssetSizesOption() {
   return Object.keys(sizes).length > 0 ? { buildAssetSizes: sizes } : null;
 }
 
+function randomHex32() {
+  return [...crypto.getRandomValues(new Uint8Array(32))].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function currentInitStatus() {
+  return {
+    host: kernelId,
+    init: localInitView,
+    connected: true,
+    coordinator: true,
+    reaper: { state: localInitState, pid: 1, failures: localInitFailures },
+  };
+}
+
+function broadcastInitStatus() {
+  broadcast({ v: VERSION, type: 'event', event: 'machine_init', value: currentInitStatus() });
+}
+
+async function markOfflineReleaseBootHealthyIfPending() {
+  try {
+    const { createOfflineInstaller } = await import(asset('/offline-installer.js'));
+    const installer = createOfflineInstaller();
+    const state = await installer.getState();
+    if (state?.active && !state.activeBootVerified) {
+      await installer.markBootHealthy(state.active);
+    }
+  } catch { /* no offline Release v2 pending or IDB unavailable */ }
+}
+
+async function launchLocalInit() {
+  if (!kernel || localInitRunning || localInitAbort) return;
+  localInitRunning = true;
+  localInitState = 'starting';
+  try {
+    if (!localInitProof) localInitProof = randomHex32();
+    const inspected = JSON.parse(await kernel.machine_init_action(
+      JSON.stringify({ op: 'inspect' }),
+      kernelId,
+    ));
+    const claimed = JSON.parse(await kernel.machine_init_action(
+      JSON.stringify({
+        op: 'claim',
+        owner: {
+          boot: inspected.boot,
+          host: kernelId,
+          proof: localInitProof,
+          generation: inspected.generation,
+        },
+      }),
+      kernelId,
+    ));
+    localInitView = claimed;
+    broadcastInitStatus();
+    if (!globalThis.crossOriginIsolated) {
+      localInitState = 'running';
+      broadcastInitStatus();
+      void markOfflineReleaseBootHealthyIfPending();
+      return;
+    }
+    const { exec } = await import(asset('/executor-host.js'));
+    let error = '';
+    const owner = {
+      boot: claimed.boot,
+      host: kernelId,
+      proof: localInitProof,
+      generation: claimed.generation,
+    };
+    const token = randomHex32();
+    const result = await exec([['init']], {
+      stdin: '',
+      cancelled: () => localInitAbort,
+      prepare: async () => [{ ok: await self.kernelRequest('boot_init', { owner, token }) }],
+      onJob: job => {
+        if (job.pids.includes(1)) {
+          localInitState = 'running';
+          broadcastInitStatus();
+          void markOfflineReleaseBootHealthyIfPending();
+        }
+      },
+      onOutput: (fd, text) => {
+        if (fd === 2) error = (error + text).slice(-4096);
+      },
+    });
+    localInitRunning = false;
+    if (localInitAbort) {
+      localInitState = 'stopped';
+      broadcastInitStatus();
+      return;
+    }
+    if (result?.status === 0) {
+      localInitState = 'stopped';
+      broadcastInitStatus();
+      // Ordered shutdown completed cleanly: flush & close `os-cowfs` root volume.
+      try { await kernel.close_clean_root(); } catch { /* best-effort */ }
+      return;
+    }
+    localInitFailures++;
+    localInitState = 'failed';
+    broadcastInitStatus();
+    if (error.trim()) console.warn('local PID 1 init exited:', error.trim());
+  } catch (err) {
+    localInitRunning = false;
+    localInitFailures++;
+    localInitState = 'failed';
+    broadcastInitStatus();
+    console.warn('local PID 1 init launch failed:', err);
+  }
+}
+
 function boot() {
   starting ??= wasm_bindgen(asset('/client_kernel_bg.wasm')).then(async () => {
     self.wasm_bindgen = wasm_bindgen;
     kernel = new wasm_bindgen.Kernel('', kernelId);
     const bootOpts = buildAssetSizesOption();
-    if (bootOpts) {
-      await kernel.boot_vfs(JSON.stringify(bootOpts));
+    bootProfileStore = createBootProfileStore();
+    cowfsStore = createCowfsStore();
+    let bootRes = null;
+    try {
+      const profile = await bootProfileStore.load().catch(() => null);
+      const raw = await kernel.boot_cowfs_root(
+        cowfsStore,
+        profile ? JSON.stringify(profile) : undefined,
+        bootOpts ? JSON.stringify(bootOpts) : undefined,
+      );
+      bootRes = JSON.parse(raw);
+      const nextUuid = bootRes?.boot_profile?.root?.cow_fs?.volume_uuid ?? null;
+      const prevUuid = profile?.root?.cow_fs?.volume_uuid ?? null;
+      if (bootRes?.boot_profile && nextUuid && nextUuid !== prevUuid) {
+        await bootProfileStore.save(bootRes.boot_profile).catch(() => {});
+      }
+    } catch (err) {
+      const e = failure(err);
+      if (e?.errno === 'EPROTONOSUPPORT') throw err;
+      // Headless / non-OPFS fallback keeps Stage 1 local tmpfs + Stage 2 `/usr` operational.
+      if (bootOpts) {
+        await kernel.boot_vfs(JSON.stringify(bootOpts));
+      }
     }
     await restoreSeatPolicyForAccount();
     const value = JSON.parse(await kernel.init());
-    const [{ LoginCoordinator, LoginStartup }, { InitCoordinator, InitReaper }] = await Promise.all([import(asset('/login-session.js')), import(asset('/init-owner.js'))]);
-    const proof = [...crypto.getRandomValues(new Uint8Array(32))].map(byte => byte.toString(16).padStart(2, '0')).join('');
+    const { LoginCoordinator } = await import(asset('/login-session.js'));
+    const proof = randomHex32();
     let lastLogin;
     login = new LoginCoordinator({ host: kernelId, proof,
       changed: value => {
@@ -196,8 +338,7 @@ function boot() {
             if (lastLogin !== previous) return executor.endWorkspace(previous);
           }).catch(() => {});
         }
-        login.startup?.update(value);
-        broadcast({ v: VERSION, type: 'event', event: 'login', value: { ...value, services: login.startup?.current(value) } });
+        broadcast({ v: VERSION, type: 'event', event: 'login', value: { ...value, services: null } });
       },
       call: async action => {
         try {
@@ -207,78 +348,13 @@ function boot() {
         }
       },
     });
-    login.startup = new LoginStartup({
-      token: () => [...crypto.getRandomValues(new Uint8Array(32))].map(byte => byte.toString(16).padStart(2, '0')).join(''),
-      begin: (expected, launch) => login.control('begin', { launch }, expected),
-      finish: value => login.call({ op: 'finish', ...value }),
-      changed: () => {
-        const value = login.current();
-        broadcast({ v: VERSION, type: 'event', event: 'login', value: { ...value, services: login.startup.current(value) } });
-      },
-      execute: async (run, onOutput) => {
-        const executor = await import(asset('/executor-host.js'));
-        const workspace = await executor.currentWorkspace().catch(() => null);
-        return executor.exec([['supervise', run.file]], { stdin: '', streamOutput: true,
-          sessionId: run.session,
-          serviceGrant: { mountNamespace: 'system', bindMounts: [] },
-          ...(workspace?.id === run.session ? { workspace } : {}),
-          cancelled: () => run.cancelled, onOutput,
-          onJob: job => { run.job = job; },
-          beforeStart: async pid => {
-            await self.kernelRequest('login_service_attach', { pid, expected: run.expected, launch: run.launch });
-            run.stop = async () => {
-              try {
-                await self.kernelRequest('kill', { pid, from: pid, signal: 15 });
-                await self.kernelRequest('kill', { pid, from: pid, signal: 18 });
-              } catch { /* normal exit or expiry can win; the host deadline still bounds cleanup */ }
-            };
-            run.attached = true;
-          },
-        });
-      },
-    });
-    machineInit = new InitCoordinator({ host: kernelId,
-      proof: [...crypto.getRandomValues(new Uint8Array(32))].map(byte => byte.toString(16).padStart(2, '0')).join(''),
-      changed: value => {
-        machineInit.reaper?.update(value, machineInit.ownership);
-        broadcast({ v: VERSION, type: 'event', event: 'machine_init', value: { ...value, reaper: machineInit.reaper?.current() } });
-      },
-      call: async action => {
-        try {
-          return JSON.parse(await kernel.machine_init_action(JSON.stringify(action), kernelId));
-        } catch (error) {
-          throw failure(error);
-        }
-      },
-    });
-    machineInit.reaper = new InitReaper({
-      token: () => [...crypto.getRandomValues(new Uint8Array(32))].map(byte => byte.toString(16).padStart(2, '0')).join(''),
-      release: owner => machineInit.call({ op: 'release', owner }),
-      exhausted: () => { void machineInit.stop(); },
-      changed: () => {
-        if (!machineInit.reaper.run && ['stopped', 'failed'].includes(machineInit.reaper.state)
-          && machineInit.reaper.failures < 3
-          && machineInit.current().coordinator && machineInit.ownership) {
-          queueMicrotask(() => {
-            void machineInit.tick().catch(() => {});
-          });
-        }
-        broadcast({ v: VERSION, type: 'event', event: 'machine_init',
-          value: { ...machineInit.current(), reaper: machineInit.reaper.current() } });
-      },
-      start: async (owner, token, cancelled, running) => {
-        const { exec } = await import(asset('/executor-host.js'));
-        let error = '';
-        const result = await exec([['init']], { stdin: '', cancelled,
-          prepare: async () => [{ ok: await self.kernelRequest('boot_init', { owner, token }) }],
-          onJob: job => { if (job.pids.includes(1)) running(); },
-          onOutput: (fd, text) => { if (fd === 2) error = (error + text).slice(-4096); },
-        });
-        if (!cancelled()) throw new Error(error.trim() || `init exited (${result.status})`);
-      },
-    });
     await login.tick();
-    void machineInit.tick();
+    if (!bootRes || bootRes.stage !== 'stage1_recovery') {
+      void launchLocalInit();
+    } else {
+      localInitState = 'recovery';
+      broadcastInitStatus();
+    }
     broadcast({ v: VERSION, type: 'event', event: 'started', value });
     return value;
   }).catch(error => {
@@ -362,18 +438,56 @@ async function dispatch(message, host, tab, internal = false) {
       }
       return value;
     }
-    case 'machine_init_status': return { ...machineInit.current(), reaper: machineInit.reaper.current() };
-    case 'machine_init_resume': return machineInit.resume();
-    case 'machine_init_leave': await machineInit.stop(); return null;
+    case 'boot_status': return JSON.parse(kernel.boot_status());
+    case 'boot_cowfs_root': {
+      const store = args.store ?? cowfsStore ?? createCowfsStore();
+      const raw = await kernel.boot_cowfs_root(
+        store,
+        args.profile != null ? (typeof args.profile === 'string' ? args.profile : JSON.stringify(args.profile)) : undefined,
+        args.opts != null ? (typeof args.opts === 'string' ? args.opts : JSON.stringify(args.opts)) : undefined,
+      );
+      return JSON.parse(raw);
+    }
+    case 'close_clean_root': return JSON.parse(await kernel.close_clean_root());
+    case 'cloud_status': return JSON.parse(kernel.cloud_status());
+    case 'cloud_sign_in': return JSON.parse(await kernel.cloud_sign_in(
+      String(args.cloudUser ?? ''),
+      Number(args.cloudUid ?? 0),
+      Number(args.cloudGid ?? 0),
+      JSON.stringify(args.cloudGroups ?? []),
+      args.scope != null ? (typeof args.scope === 'string' ? args.scope : JSON.stringify(args.scope)) : undefined,
+    ));
+    case 'cloud_sign_out': return JSON.parse(await kernel.cloud_sign_out());
+    case 'revoke_cloud_tokens_only': return JSON.parse(await kernel.revoke_cloud_tokens_only());
+    case 'machine_init_status': return currentInitStatus();
+    case 'machine_init_leave': {
+      localInitAbort = true;
+      localInitState = 'stopped';
+      broadcastInitStatus();
+      return null;
+    }
+    case 'machine_init_resume': {
+      localInitAbort = false;
+      void launchLocalInit();
+      return currentInitStatus();
+    }
     case 'machine_reboot': {
-      const value = await machineInit.call({ op: 'reboot', boot: args.boot });
+      localInitAbort = true;
+      const value = JSON.parse(await kernel.machine_init_action(
+        JSON.stringify({ op: 'reboot', boot: args.boot }),
+        kernelId,
+      ));
+      localInitView = value;
       const executor = await import(asset('/executor-host.js'));
       void executor.reconcile().catch(() => {});
       await login.reset();
-      await machineInit.resume();
+      localInitAbort = false;
+      localInitRunning = false;
+      localInitFailures = 0;
+      void launchLocalInit();
       return value;
     }
-    case 'machine_inspect': return machineInit.call({ op: 'inspect' });
+    case 'machine_inspect': return JSON.parse(await kernel.machine_init_action(JSON.stringify({ op: 'inspect' }), kernelId));
     case 'login_lifecycle': {
       if (!['end', 'restart', 'inspect'].includes(args.op)) throw { errno: 'EINVAL' };
       const value = await login.call({ op: args.op, ...(args.op === 'inspect' ? {} : { session: args.session }) });
@@ -393,7 +507,7 @@ async function dispatch(message, host, tab, internal = false) {
         } catch { /* keep cached view */ }
       }
       const value = login.current();
-      return { ...value, services: login.startup.current(value) };
+      return { ...value, services: null };
     }
     case 'login_configure': return login.control('configure', { file: args.file }, args.expected);
     case 'login_seat_policy': {
@@ -407,9 +521,6 @@ async function dispatch(message, host, tab, internal = false) {
       return value;
     }
     case 'login_refresh': {
-      if (args?.fromServer !== false) {
-        try { await kernel.sync_account_from_server(); } catch { /* offline or guest */ }
-      }
       await restoreSeatPolicyForAccount();
       return login.reset();
     }
@@ -614,7 +725,8 @@ const isConcurrentCall = type => (
   (type.startsWith('login_') && type !== 'login_service_attach') ||
   type.startsWith('machine_init_') ||
   [
-    'boot_vfs', 'set_active_session', 'mount_user', 'unmount_user',
+    'boot_vfs', 'boot_status', 'revoke_cloud_tokens_only',
+    'set_active_session', 'mount_user', 'unmount_user',
     'revoke_mount_provider', 'lose_mount_provider', 'export_provider',
     'list_mounts', 'take_local_exec_bytes', 'release_exec_ticket',
   ].includes(type)
@@ -685,10 +797,9 @@ async function handle(port, message) {
 
 // Exactly one host owns this dedicated Worker instance.
 self.onmessage = ({ data }) => handle(self, data);
-// Renew local init/login leases (zero network RPCs) and remote ServiceAuth v2 / CloudFs leases
-// only when this instance has attached remotely.
+// Renew local login session leases (zero network RPCs) and remote ServiceAuth v2 / CloudFs leases
+// only when explicitly signed in to Cloud.
 setInterval(() => {
-  if (machineInit) void machineInit.tick().catch(() => {});
   if (login) void login.tick().catch(() => {});
 }, 5000);
 setInterval(() => { if (kernel) void kernel.cloud_renew().catch(() => {}); }, 30000);

@@ -73,12 +73,11 @@ await build({ absWorkingDir: root, entryPoints: { 'local-compiler': 'web/kernel/
 await build({ absWorkingDir: root, entryPoints: { 'console-window': 'web/console-window.js' }, external: ['./pkg/*'], bundle: true, format: 'esm', outdir: out, minify: true });
 for (const name of ['greeter', 'shell-session']) await build({ absWorkingDir: root, entryPoints: { [name]: 'web/' + name + '.js' }, external: ['./pkg/*'], bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'login-session': 'web/kernel/login.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
-await build({ absWorkingDir: root, entryPoints: { 'init-owner': 'web/kernel/init.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'image-pager': 'web/kernel/image-pager.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'offline-installer': 'web/kernel/offline-installer.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'offline-sw': 'web/kernel/offline-installer.js' }, bundle: true, format: 'iife', outdir: out, minify: true });
-// Remove obsolete pre-overhaul compiler artifacts; local-compiler.js is the scoped replacement.
-for (const name of ['wasi-asyncify.js', 'binaryen.js']) await rm(join(out, name), { force: true });
+// Remove obsolete pre-overhaul compiler and server-lease init artifacts.
+for (const name of ['wasi-asyncify.js', 'binaryen.js', 'init-owner.js']) await rm(join(out, name), { force: true });
 // Build /usr/bin/*.wasm binaries first so their exact sizes and pre-transformed `.rv1` sidecars
 // can be embedded into `client-kernel.js`, `executor-host.js`, and `usr/manifest.json`.
 run('cargo', ['build', '--locked', '--release', '--target', 'wasm32-wasip1', '--manifest-path', 'crates/coreutils/Cargo.toml', '--target-dir', join(target, 'coreutils')]);
@@ -89,6 +88,7 @@ await copy(join(target, 'wasm32-wasip1/release/utilities.wasm'), join(out, 'usr/
 run('cargo', ['build', '--locked', '--release', '--target', 'wasm32-wasip1', '-p', 'os-services']);
 await copy(join(target, 'wasm32-wasip1/release/supervise.wasm'), join(out, 'usr/bin/supervise.wasm'));
 await copy(join(target, 'wasm32-wasip1/release/init.wasm'), join(out, 'usr/bin/init.wasm'));
+await copy(join(target, 'wasm32-wasip1/release/early_init.wasm'), join(out, 'usr/bin/early_init.wasm'));
 run(process.execPath, ['scripts/build-shell.mjs', '--out-dir', out]);
 // Emit pre-transformed static `.rv1` sidecars alongside raw `/usr/bin/*.wasm` binaries so cold
 // browser contexts compile system tools directly without running Binaryen in-browser. Raw `.wasm`

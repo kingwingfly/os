@@ -248,12 +248,67 @@ impl ServiceTransport for OsServiceTransport {
     fn send_control(
         &mut self,
         socket_path: &str,
-        _request_frame: &[u8],
+        request_frame: &[u8],
     ) -> Result<Vec<u8>, abi::Error> {
-        Err(abi::Error::because(
-            Errno::ENOSYS,
-            format!("AF_UNIX control socket transport to '{socket_path}' is wired in Wave 4B"),
-        ))
+        use os_posix::socket::{MSG_NOSIGNAL, SHUT_WR, UnixStream};
+
+        let stream = UnixStream::connect(socket_path).map_err(|errno| {
+            abi::Error::because(
+                errno,
+                format!("cannot connect to service manager socket '{socket_path}'"),
+            )
+        })?;
+        let mut written = 0usize;
+        while written < request_frame.len() {
+            match stream.send(&request_frame[written..], MSG_NOSIGNAL) {
+                Ok(0) => {
+                    return Err(abi::Error::because(
+                        Errno::EPIPE,
+                        "control socket closed during send",
+                    ));
+                }
+                Ok(n) => written += n,
+                Err(Errno::EINTR) => continue,
+                Err(errno) => {
+                    return Err(abi::Error::because(errno, "control socket send failed"));
+                }
+            }
+        }
+        let _ = stream.shutdown(SHUT_WR);
+
+        let mut response = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.recv(&mut buf, 0) {
+                Ok(0) => break,
+                Ok(n) => {
+                    response.extend_from_slice(&buf[..n]);
+                    if response.len() > 65_536 {
+                        return Err(abi::Error::because(
+                            Errno::E2BIG,
+                            "service manager reply exceeded 64 KiB",
+                        ));
+                    }
+                    if response.ends_with(b"\n") {
+                        break;
+                    }
+                }
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EAGAIN) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(errno) => {
+                    return Err(abi::Error::because(errno, "control socket receive failed"));
+                }
+            }
+        }
+        if response.is_empty() {
+            return Err(abi::Error::because(
+                Errno::ECONNRESET,
+                "service manager closed control socket without reply",
+            ));
+        }
+        Ok(response)
     }
 }
 

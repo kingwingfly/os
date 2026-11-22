@@ -1,13 +1,10 @@
 import { test, expect } from './test.js';
-import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
-import { api, call, put, rmrf } from './sys.js';
+import { pageCall, pageMkdirp, pagePut, pageRmrf, switchLocalUser } from './ui.js';
 import { hookPageKernel } from './service-auth.js';
 
 const prompt = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const screen = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
-const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const SET = 0x540e, DROP = 0x5422, SID = 0x5429;
 const assert = expression => `(call $assert ${expression})`;
 const eq = (expression, n) => assert(`(i32.eq ${expression} (i32.const ${n}))`);
@@ -27,11 +24,12 @@ async function run(page, text) {
 }
 const results = async page => (await screen(page).textContent()).split('\n').filter(s => s.startsWith('{')).map(s => JSON.parse(s).results[0]);
 test.beforeEach(async ({ page }) => {
-  base = '/guest/ctty-' + crypto.randomUUID();
-  await call(page.request, { mkdir: { path: base, mode: 0o755 } });
+  base = '/home/user/ctty-' + crypto.randomUUID();
   await page.goto('/');
+  await page.waitForFunction(() => Boolean(window.os?.exec));
+  await pageMkdirp(page, base, 0o755);
 });
-test.afterEach(async ({ page }) => { await rmrf(page.request, base); });
+test.afterEach(async ({ page }) => { await pageRmrf(page, base).catch(() => {}); });
 
 // Ordinary programs exercise the local descriptor/ABI boundary; the test cannot edit
 // host terminal state or process tokens. Assertions trap on unexpected WASI results.
@@ -83,9 +81,11 @@ async function upload(page, name, build) {
       (call $say (i32.const 180) (i32.const 1)))
     (func (export "_start") ${body}))`);
   const path = base + '/' + name;
-  try { expect((await put(page.request, '/api/file?path=' + path, { data: Buffer.from(module.emitBinary()) })).ok()).toBe(true); }
+  await page.waitForFunction(() => Boolean(window.os?.exec));
+  await pageMkdirp(page, base, 0o755);
+  try { await pagePut(page, path, Buffer.from(module.emitBinary()), { mode: 0o755, overwrite: true }); }
   finally { module.dispose(); }
-  await call(page.request, { chmod: { path, mode: 0o755 } }); return path;
+  await pageCall(page, { chmod: { path, mode: 0o755 } }); return path;
 }
 
 test('a leader detaches and reacquires its terminal, with descriptor access modes enforced', async ({ page }) => {
@@ -173,8 +173,7 @@ test('an acquired terminal follows fork and is released with HUP when its leader
 });
 
 for (const privileged of [false, true]) test(`terminal stealing uses process credentials after browser ${privileged ? 'logout' : 'root login'}`, async ({ page }) => {
-  const login = async () => expect((await api(page.request, 'login', { headers: { Origin: origin, 'CF-Connecting-IP': 'ctty-' + crypto.randomUUID() }, data: { password } })).ok()).toBe(true);
-  if (privileged) { await login(); await page.reload(); }
+  if (privileged) await switchLocalUser(page, 'root');
   try {
     const child = await upload(page, 'claim', ({ q, say }) => `
       ${assert('(i32.gt_s (call $setsid) (i32.const 1))')} ${noTerminal} ${q(SET)}
@@ -186,8 +185,8 @@ for (const privileged of [false, true]) test(`terminal stealing uses process cre
     const parent = await upload(page, 'check-parent', ({ q, say }) => `${q(SID)} ${say('parent-complete\n')}`);
     await send(page, `sh -c 'USER=root UID=0; export USER UID; ${child}; ${parent}'`);
     await expect(screen(page)).toContainText('claim-ready', { timeout: 60_000 });
-    if (privileged) expect((await api(page.request, 'logout', { headers: { Origin: origin } })).ok()).toBe(true);
-    else await login();
+    if (privileged) await switchLocalUser(page, 'user');
+    else await switchLocalUser(page, 'root');
     await send(page, 'x');
     await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
     const r = await results(page); expect(r).toHaveLength(3);
@@ -195,7 +194,7 @@ for (const privileged of [false, true]) test(`terminal stealing uses process cre
     if (privileged) { expect(r[1]).toEqual({ ok: {} }); expect(r[2].err.errno).toBe('ENOTTY'); }
     else { expect(r[1].err.errno).toBe('EPERM'); expect(r[2].ok.sid).toBeGreaterThan(1); }
     await expect(screen(page)).toContainText('parent-complete');
-  } finally { await login(); }
+  } finally { await switchLocalUser(page, 'user'); }
 });
 
 test('terminal control refuses pipes and guessed foreign PTY paths', async ({ page }) => {
@@ -282,9 +281,11 @@ async function gateImageLoad(page, { needle, onExit } = {}) {
 }
 
 test('a delayed pipeline stage stays detached when the leader reacquires the terminal', async ({ page }) => {
-  expect((await api(page.request, 'login', { headers: { Origin: origin, 'CF-Connecting-IP': 'ctty-delay-' + crypto.randomUUID() }, data: { password } })).ok()).toBe(true);
   const gate = await gateImageLoad(page, { needle: 'delayed-detached' });
   await page.reload();
+  await page.waitForFunction(() => Boolean(window.os?.exec));
+  await switchLocalUser(page, 'root');
+  await pageMkdirp(page, base, 0o755);
   const producer = await upload(page, 'producer', ({ q, text }) => `${ignoreHup}
     ${fork}
     (if (i32.eqz (i32.load (i32.const 48))) (then

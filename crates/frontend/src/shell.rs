@@ -88,9 +88,9 @@ pub struct Account {
     pub home: RwSignal<String>,
 }
 
-/// The programs web/app.js asks for a password for first, in a dialog: a guest's own useradd,
-/// an account's own userdel.
-const DIALOGS: &[&str] = &["useradd", "userdel"];
+/// Programs that use browser modals instead of direct local CLI execution (empty after #57 L3d:
+/// `useradd` and `userdel` execute directly as local WASI utilities against local `/etc/*`).
+const DIALOGS: &[&str] = &[];
 
 #[derive(Clone, Copy)]
 pub struct Shell {

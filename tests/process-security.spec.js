@@ -2,12 +2,15 @@ import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
 import { api, call as syscall, put, rmrf } from './sys.js';
+import { logoutLocalUser, pageCall, pagePut, pageRmrf, switchLocalUser } from './ui.js';
+import { FULL_SCOPE } from './service-auth.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const sleep = { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '60'], env: [], cwd: '/' };
 const ROOT_ACCOUNT = { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root', home: '/root', shell: '/usr/bin/dash', signed_in: true };
 const GUEST_ACCOUNT = { uid: 65534, gid: 65534, groups: [65534], user: 'guest', group: 'guest', home: '/tmp', shell: '/usr/bin/dash', signed_in: false };
+const CLOUD_ROOT = { cloudUser: 'root', cloudUid: 0, cloudGid: 0, cloudGroups: [0], scope: FULL_SCOPE };
 
 let sequence = 0;
 async function login(request) {
@@ -63,6 +66,7 @@ test('signal queues survive missed events, monotonic acks cannot clear newer sig
   await connect(page);
   await login(context.request);
   value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+  value(await kernel(page, 'cloud_sign_in', CLOUD_ROOT));
   const instanceId = value(await kernel(page, 'instance_id'));
   const proc = value(await kernel(page, 'exec', { ...sleep, remote: true }));
   expect(proc.token).toMatch(/^[0-9a-f]{64}$/);
@@ -172,6 +176,7 @@ test('a rejected sudo launch does not block local exit, wait, or remote token re
   await connect(page);
   await login(context.request);
   value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+  value(await kernel(page, 'cloud_sign_in', CLOUD_ROOT));
   const instanceId = value(await kernel(page, 'instance_id'));
   const proc = value(await kernel(page, 'exec', { ...sleep, remote: true }));
   try {
@@ -245,12 +250,11 @@ async function hookPageKernel(page) {
 }
 
 for (const startsRoot of [false, true]) {
-  test(`proc_signal keeps the process's ${startsRoot ? 'root credentials after logout' : 'guest credentials after root login'}`, async ({ page, context }) => {
+  test(`proc_signal keeps the process's ${startsRoot ? 'root credentials after logout' : 'local user credentials after root switch'}`, async ({ page }) => {
     await hookPageKernel(page);
-    await login(context.request);
     await page.goto('/');
     await page.waitForFunction(() => !!window.os?.exec && !!window.__pageKernel);
-    await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+    await switchLocalUser(page, 'root');
     await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(0);
 
     // Start a root target process inside THIS page's kernel instance.
@@ -263,16 +267,15 @@ for (const startsRoot of [false, true]) {
     await page.waitForFunction(() => window.targetJob?.pids?.length === 1);
     const targetPid = await page.evaluate(() => window.targetJob.pids[0]);
 
-    const path = `/guest/proc-signal-${Date.now()}-${++sequence}.wasm`;
+    const path = `/tmp/proc-signal-${Date.now()}-${++sequence}.wasm`;
     try {
-      expect((await put(context.request, `/api/file?path=${path}`, { data: signalProgram(targetPid) })).ok()).toBe(true);
-      await syscall(context.request, { chmod: { path, mode: 0o755 } });
+      await pagePut(page, path, signalProgram(targetPid), { mode: 0o755, sudo: true });
+      await pageCall(page, { chmod: { path, mode: 0o755 } }, { sudo: true });
       if (!startsRoot) {
-        expect((await api(context.request, 'logout')).ok()).toBe(true);
-        await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+        await logoutLocalUser(page);
         await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).not.toBe(0);
       }
-      const before = await syscall(context.request, 'getcreds');
+      const before = await pageCall(page, 'getcreds');
       await page.evaluate(path => {
         window.securityReading = false;
         window.securityRun = window.os.exec([{ path, argv: [path] }], {
@@ -287,12 +290,10 @@ for (const startsRoot of [false, true]) {
       expect(value(polled)[0].uid).toBe(before.uid);
 
       if (startsRoot) {
-        expect((await api(context.request, 'logout')).ok()).toBe(true);
-        await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+        await logoutLocalUser(page);
         await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).not.toBe(0);
       } else {
-        await login(context.request);
-        await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+        await switchLocalUser(page, 'root');
         await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(0);
       }
       await page.evaluate(() => window.securityInput.write('x\n'));
@@ -305,8 +306,7 @@ for (const startsRoot of [false, true]) {
       }
     } finally {
       await page.evaluate(() => { window.securityJob?.signal(9); window.targetJob?.signal(9); });
-      await login(context.request);
-      await rmrf(context.request, path);
+      await pageRmrf(page, path, { sudo: true }).catch(() => {});
     }
   });
 }
@@ -318,6 +318,7 @@ for (const removed of [false, true]) {
     await connect(page);
     await login(context.request);
     value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+    value(await kernel(page, 'cloud_sign_in', CLOUD_ROOT));
     const instanceId = value(await kernel(page, 'instance_id'));
     const parent = value(await kernel(page, 'exec', { ...sleep, remote: true }));
     const child = value(await kernel(page, 'fork', { pid: parent.pid }));
@@ -396,13 +397,14 @@ test('exec replacement rotates remote token while preserving lineage open-refs a
   await connect(page);
   await login(context.request);
   value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+  value(await kernel(page, 'cloud_sign_in', CLOUD_ROOT));
   const instanceId = value(await kernel(page, 'instance_id'));
   const path = `/guest/exec-lineage-${crypto.randomUUID()}.wasm`;
   const output = path + '.txt';
   const image = Buffer.from(binaryen.parseText('(module (memory (export "memory") 1) (func (export "_start")))').emitBinary());
   expect((await put(context.request, '/api/file?path=' + encodeURIComponent(path), { data: image })).ok()).toBe(true);
   await syscall(context.request, { chmod: { path, mode: 0o755 } });
-  const first = value(await kernel(page, 'exec', { ...sleep, path, argv: [path] }));
+  const first = value(await kernel(page, 'exec', { ...sleep, path: `/mnt/cloud${path}`, argv: [`/mnt/cloud${path}`], remote: true }));
   expect(first.token).toMatch(/^[0-9a-f]{64}$/);
   let stranger;
   const fsOrigin = await page.evaluate(() => location.origin);
@@ -514,6 +516,7 @@ test('F3-01: set_proc_cred and mint_remote_cred block privilege escalation and p
   await connect(page);
 
   // Spawn a pre-login guest process (cloud_access: true) BEFORE logging in as root.
+  value(await kernel(page, 'sync_account', GUEST_ACCOUNT));
   const preLoginGuest = value(await kernel(page, 'exec', { ...sleep }));
   expect(value(await kernel(page, 'getcreds_proc', { pid: preLoginGuest.pid }))).toMatchObject({
     uid: 65534,
@@ -522,6 +525,7 @@ test('F3-01: set_proc_cred and mint_remote_cred block privilege escalation and p
 
   await login(context.request);
   value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+  value(await kernel(page, 'cloud_sign_in', CLOUD_ROOT));
 
   // Spawn a root process, then drop it to non-root uid 1001.
   const proc = value(await kernel(page, 'exec', { ...sleep }));
@@ -579,6 +583,7 @@ test('F3-08/F3-10: immediate /api/file revocation bypasses TOKEN_FRESH cache, /d
   await connect(page);
   await login(context.request);
   value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+  value(await kernel(page, 'cloud_sign_in', CLOUD_ROOT));
   const instanceId = value(await kernel(page, 'instance_id'));
   const filePath = `/guest/revoke-immediate-${crypto.randomUUID()}.txt`;
   expect((await put(context.request, '/api/file?path=' + encodeURIComponent(filePath), { data: 'SECRET_TOKEN_DATA' })).ok()).toBe(true);

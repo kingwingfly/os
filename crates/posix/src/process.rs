@@ -61,11 +61,12 @@ pub struct ServiceBindMount<'a> {
     pub read_only: bool,
 }
 
-/// Mount-namespace and bind-mount grant applied before a supervised unit executes.
+/// Mount-namespace, user, and bind-mount grant applied before a supervised unit executes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServiceGrant<'a> {
     pub mount_namespace: &'a str,
     pub bind_mounts: &'a [ServiceBindMount<'a>],
+    pub user: Option<&'a str>,
 }
 
 /// Additional generic child attributes, applied before guest instructions.
@@ -101,6 +102,7 @@ pub(crate) fn encode_spawn_request(
     }
     if let Some(grant) = options.service_grant
         && (grant.mount_namespace.contains('\0')
+            || grant.user.is_some_and(|u| u.contains('\0'))
             || grant
                 .bind_mounts
                 .iter()
@@ -132,10 +134,14 @@ pub(crate) fn encode_spawn_request(
                 })
             })
             .collect();
-        payload["serviceGrant"] = serde_json::json!({
+        let mut grant_json = serde_json::json!({
             "mountNamespace": grant.mount_namespace,
             "bindMounts": bind_mounts,
         });
+        if let Some(user) = grant.user {
+            grant_json["user"] = serde_json::json!(user);
+        }
+        payload["serviceGrant"] = grant_json;
     }
     serde_json::to_vec(&payload).map_err(Into::into)
 }
@@ -349,6 +355,7 @@ mod tests {
             service_grant: Some(ServiceGrant {
                 mount_namespace: "isolated",
                 bind_mounts: &binds,
+                user: None,
             }),
         };
         let raw = encode_spawn_request(&argv, Stdin::Null, "/work", &env, Some(0), &opts).unwrap();
@@ -387,6 +394,7 @@ mod tests {
                 service_grant: Some(ServiceGrant {
                     mount_namespace: "isolated",
                     bind_mounts: &bad_binds,
+                    user: None,
                 }),
             },
         )

@@ -20,14 +20,13 @@ const FS_CALL_NAMES = new Set([
   'ioctl', 'inotify_add_watch', 'inotify_rm_watch',
 ]);
 
-const ACCOUNT_MUTATION_CALLS = new Set([
-  'login', 'logout', 'sudo', 'passwd', 'register', 'useradd', 'userdel', 'usermod',
-  'groupadd', 'groupdel', 'groupmod', 'gpasswd', 'login_session', 'machine_init',
+const LOCAL_ACCOUNT_CALLS = new Set([
+  'getcreds', 'login', 'logout', 'sudo', 'passwd',
+  'useradd', 'usermod', 'userdel', 'groupadd', 'groupmod', 'groupdel',
 ]);
 
-const SERVER_ACCOUNT_MUTATION_CALLS = new Set([
-  'login', 'logout', 'sudo', 'passwd', 'register', 'useradd', 'userdel', 'usermod',
-  'groupadd', 'groupdel', 'groupmod', 'gpasswd',
+const SERVER_ONLY_SYS_CALLS = new Set([
+  'register', 'gpasswd', 'login_session', 'machine_init',
 ]);
 
 function isRemoteServerDevPath(raw, includeDir = false) {
@@ -165,7 +164,8 @@ export function installLocalFiles() {
     }
 
     try {
-      // 1. Page `POST /api/sys` batches containing filesystem calls
+      // 1. Page `POST /api/sys` batches: filesystem + local OS account calls run 100% locally
+      // inside `crates/client-kernel` (`os-cowfs` + `LocalAccountStore`) with ZERO network RPCs!
       if (url.pathname === '/api/sys' && request.method === 'POST') {
         const rawBody = typeof options?.body === 'string' ? options.body : await request.clone().text();
         const body = JSON.parse(rawBody);
@@ -179,8 +179,11 @@ export function installLocalFiles() {
               signal: request.signal,
             });
         if (Array.isArray(body.calls) && body.calls.length > 0) {
-          const hasFs = body.calls.some(c => FS_CALL_NAMES.has(callName(c)));
-          const hasAccountMut = body.calls.some(c => ACCOUNT_MUTATION_CALLS.has(callName(c)));
+          const hasFsOrLocalAccount = body.calls.some(c => {
+            const name = callName(c);
+            return FS_CALL_NAMES.has(name) || LOCAL_ACCOUNT_CALLS.has(name);
+          });
+          const hasServerOnly = body.calls.some(c => SERVER_ONLY_SYS_CALLS.has(callName(c)));
           if (body.proc || body.pid) {
             if (body.calls.some(touchesPrivateCarrier)) {
               return json({ error: 'process credentials are not page filesystem grants', errno: 'EACCES' }, 403);
@@ -195,7 +198,7 @@ export function installLocalFiles() {
             }
             return serializedNetwork(sendSys);
           }
-          if (hasFs && !hasAccountMut) {
+          if (hasFsOrLocalAccount && !hasServerOnly) {
             if (isRemoteServerDevBatch(body.calls)) {
               return serializedNetwork(sendSys);
             }
@@ -208,43 +211,7 @@ export function installLocalFiles() {
             return json({ results });
           }
         }
-        const response = await serializedNetwork(sendSys);
-        if (response.ok && Array.isArray(body?.calls) && !body.proc && !body.pid) {
-          const hasServerAccountMut = body.calls.some(c => SERVER_ACCOUNT_MUTATION_CALLS.has(callName(c)));
-          const getcredsIndex = body.calls.findIndex(c => callName(c) === 'getcreds');
-          if (hasServerAccountMut) {
-            try {
-              const payload = await response.clone().json();
-              const anyOk = Array.isArray(payload?.results) && payload.results.some(r => r && 'ok' in r);
-              if (anyOk) {
-                lastSyncedKey = null;
-                await kernelCall('login_refresh').catch(() => {});
-              }
-            } catch { /* ignore non-JSON */ }
-          } else if (getcredsIndex >= 0) {
-            try {
-              const payload = await response.clone().json();
-              const who = payload?.results?.[getcredsIndex]?.ok;
-              if (who && typeof who.uid === 'number') {
-                const key = `${who.uid}:${who.user ?? ''}:${!!who.signed_in}`;
-                if (key !== lastSyncedKey) {
-                  lastSyncedKey = key;
-                  await kernelCall('sync_account', who).catch(() => {});
-                }
-              }
-            } catch { /* ignore non-JSON */ }
-          }
-        }
-        return response;
-      }
-
-      if ((url.pathname === '/api/login' || url.pathname === '/api/logout') && request.method === 'POST') {
-        const response = await serializedNetwork(() => network(request));
-        if (response.ok) {
-          lastSyncedKey = null;
-          await kernelCall('login_refresh').catch(() => {});
-        }
-        return response;
+        return serializedNetwork(sendSys);
       }
 
       // 2. Client-fd chunked uploads (`PUT /api/pwrite?fd=...&index=...` when `fd >= CLIENT_PAGE_FD_BASE`)

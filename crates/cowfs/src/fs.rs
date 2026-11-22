@@ -3130,7 +3130,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         Box::pin(async move {
             let _op = self.op_lock.lock().await;
             self.check_rw()?;
-            if cred.identity.id != 0 {
+            if !rdev.is_empty() && cred.identity.id != 0 {
                 return Err(Errno::EPERM);
             }
             let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
@@ -3141,7 +3141,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             }
             inode::may_create(&cred.identity, &parent_perm, dir_item.nlink == 0)?;
             let mut node = created(&cred.identity, &parent_perm, mode, false, cred.umask);
-            node.rdev = Some(rdev.to_string());
+            if !rdev.is_empty() {
+                node.rdev = Some(rdev.to_string());
+            }
             let (ino, item) = self
                 .add_node_in_dir(dir_ino, &mut dir_item, name, node)
                 .await?;

@@ -1,5 +1,6 @@
 import { test, expect } from './test.js';
 import { api, call } from './sys.js';
+import { logoutLocalUser, switchLocalUser } from './ui.js';
 import { connectKernel, hookPageKernel } from './service-auth.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -258,22 +259,20 @@ test('a dead kernel loses its coordinator while another tab stays isolated and u
 });
 
 test('identity changes rejoin the actual login and leave running-process credentials intact', async ({ page }) => {
-  const guest = await ready(page);
+  const initial = await ready(page);
   const input = page.locator('#command');
   await input.fill('sh -i');
   await input.press('Enter');
   await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'input');
-  await signIn(page.request);
-  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+  await switchLocalUser(page, 'root');
   await expect.poll(async () => (await status(page)).session?.uid).toBe(0);
   const root = await status(page);
-  expect(root.session.id).not.toBe(guest.session.id);
+  expect(root.session.id).not.toBe(initial.session.id);
   await input.pressSequentially('id -u');
   await input.press('Enter');
-  await expect(page.locator('.terminal-screen')).toContainText(String(guest.session.uid));
-  await api(page.request, 'logout');
-  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
-  await expect.poll(async () => (await status(page)).session?.uid).toBe(guest.session.uid);
+  await expect(page.locator('.terminal-screen')).toContainText(String(initial.session.uid));
+  await logoutLocalUser(page);
+  await expect.poll(async () => (await status(page)).session?.uid).toBe(initial.session.uid);
   await input.pressSequentially('exit');
   await input.press('Enter');
   await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');

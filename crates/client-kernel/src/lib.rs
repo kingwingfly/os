@@ -14,10 +14,12 @@
 //! `(instance_id, host_proof)` and immediately revoking remote credentials on exit, `SIGKILL`,
 //! privilege drop, or login-scope end.
 pub mod boot_stage;
+mod cloud_session;
 mod cloudfs;
 mod cowfs_bridge;
 mod helper;
 mod hostfs;
+mod local_accounts;
 mod mounts;
 mod release_v2;
 mod share_bridge;
@@ -242,6 +244,7 @@ pub(crate) async fn ensure_remote_attached_state(
 /// A local uninitialized guest (`uid == GUEST`, `65534`) may only bind to a per-session guest uid
 /// (`is_guest_id(issued_uid)`) while `!signed_in && !account_changed` — NEVER to `root` (`0`) or
 /// any named account. All other processes require an exact `issued_uid == proc_uid` match.
+#[cfg(test)]
 pub(crate) fn lazy_mint_uid_permitted(
     proc_uid: u32,
     issued_uid: u32,
@@ -258,13 +261,17 @@ pub(crate) fn lazy_mint_uid_permitted(
 }
 
 /// Lazily mint and bind a `ServiceAuth v2` remote credential for an already-running local process
-/// `pid` on its first cloud/remote access. Refuses with `EACCES` (0 network calls) if `pid` was
-/// started with `cloud_access == false` or dropped local privilege via `set_cred`.
+/// `pid` on its first `/mnt/cloud` or remote device access.
+/// - Signed out of Cloud -> `Err(ENOTCONN)` with ZERO network RPCs.
+/// - Process with `cloud_access == false` or after privilege drop -> `Err(EACCES)` with ZERO RPCs.
+/// - Strict local vs remote separation (Contract v2 §2.4): ALWAYS sends `sudo: false` and caps
+///   scope to the signed-in `CloudSession.scope`; local `uid 0` / `sudo` NEVER synthesizes remote
+///   root, and local `proc.cred.identity` is NEVER overwritten by remote UIDs.
 pub(crate) async fn lazy_mint_remote_cred(
     state: &Rc<RefCell<State>>,
     pid: u32,
 ) -> std::result::Result<RemoteCredRef, Error> {
-    let (existing, cloud_allowed, cgroup, io_at_mint, proc_uid, proc_epoch, signed_in, cur_epoch) = {
+    let (existing, cloud_allowed, cgroup, io_at_mint, proc_uid, cloud_session) = {
         let s = state.borrow();
         let proc = s
             .table
@@ -278,9 +285,7 @@ pub(crate) async fn lazy_mint_remote_cred(
             proc.cgroup.clone(),
             io,
             proc.cred.identity.id,
-            s.proc_account_epoch.get(&pid).copied().unwrap_or(0),
-            s.account.signed_in,
-            s.account_epoch,
+            s.cloud_session.clone(),
         )
     };
     if let Some(rem) = existing {
@@ -289,15 +294,33 @@ pub(crate) async fn lazy_mint_remote_cred(
         }
         return Ok(rem);
     }
+    let Some(cs) = cloud_session else {
+        return Err(Error::because(
+            Errno::ENOTCONN,
+            "not signed into Cloud; use Cloud Sign-In first",
+        ));
+    };
+    if cs.revoked {
+        return Err(Error::because(
+            Errno::EACCES,
+            "cloud session tokens were revoked; sign in again",
+        ));
+    }
     if !cloud_allowed {
         return Err(Errno::EACCES.into());
+    }
+    if proc_uid == os_core::permissions::GUEST || proc_uid != cs.local_uid {
+        return Err(Error::because(
+            Errno::EACCES,
+            "process local identity does not match active cloud session owner",
+        ));
     }
     let (instance_id, host_proof) = ensure_remote_attached_state(state).await?;
     let resp = service_auth_request(&auth_v2::Request::MintServiceCred(MintServiceCred {
         instance_id: instance_id.clone(),
         host_proof: host_proof.clone(),
-        scope: RemoteScope::full(),
-        cloud_access: true,
+        scope: cs.scope.clone(),
+        cloud_access: cs.scope.cloud_fs,
         umask: 0o022,
         cgroup: Some(cgroup.clone()),
         generation: None,
@@ -310,13 +333,12 @@ pub(crate) async fn lazy_mint_remote_cred(
         auth_v2::Response::Cred(c) => c,
         _ => return Err(Error::because(Errno::EIO, "unexpected service cred reply")),
     };
-    // Prevent a guest or stale process from hijacking a signed-in/root account cookie!
-    let account_changed = proc_epoch != cur_epoch;
-    if !lazy_mint_uid_permitted(proc_uid, issued.uid, signed_in, account_changed) {
+    // Verify the issued cloud UID matches the active CloudSession (prevents cookie-swap escalation).
+    if issued.uid != cs.cloud_uid {
         revoke_remote_tokens_state(state, vec![issued.token]).await;
         return Err(Error::because(
             Errno::EACCES,
-            "process identity does not match current remote account",
+            "cloud session identity changed during credential mint",
         ));
     }
     let rem = RemoteCredRef {
@@ -326,59 +348,44 @@ pub(crate) async fn lazy_mint_remote_cred(
         groups: issued.groups.clone(),
         instance_id: issued.instance_id.clone(),
         lineage: issued.lineage.clone(),
-        cloud_access: issued.cloud_access,
+        cloud_access: issued.cloud_access && cs.scope.cloud_fs,
         scope: issued.scope.clone(),
     };
-    // Re-check process state after awaiting `MintServiceCred` so a concurrent privilege drop,
-    // `cloud_access=false` attenuation, or process exit mid-await can never be overwritten.
+    // Re-check process & cloud session state after awaiting `MintServiceCred` so a concurrent
+    // privilege drop, cloud sign-out, or process exit mid-await can never be overwritten.
     let rebind_result = {
         let mut s = state.borrow_mut();
-        let current_proc = s
-            .table
-            .proc(pid)
-            .filter(|p| p.state != ProcState::Zombie)
-            .map(|p| {
-                (
-                    p.owner_host.clone(),
-                    p.cred.cloud_access,
-                    p.cred.identity.clone(),
-                    p.cgroup.clone(),
-                )
-            });
-        match current_proc {
-            None => Err(Errno::ESRCH),
-            Some((_, cloud_now, cur_id, _)) if !cloud_now || cur_id.id != proc_uid => {
-                Err(Errno::EACCES)
-            }
-            Some((host, _, cur_id, cur_cg)) => {
-                let hydrate = proc_uid == os_core::permissions::GUEST
-                    && os_core::permissions::is_guest_id(rem.uid);
-                let res = if hydrate {
-                    let hydrated = Identity {
-                        id: rem.uid,
-                        group: rem.gid,
-                        groups: rem.groups.iter().copied().collect(),
-                    };
-                    s.table
-                        .hydrate_guest_identity(&host, pid, hydrated, Some(rem.clone()))
-                } else {
-                    s.table.set_cred(&host, pid, cur_id, Some(rem.clone()))
-                };
-                match res {
-                    Ok(_) => {
-                        if hydrate {
-                            let _ = s.hydrate_guest_account_if_uninitialized(
-                                rem.uid,
-                                rem.gid,
-                                &rem.groups,
-                            );
-                        }
-                        Ok((
+        if s.cloud_session
+            .as_ref()
+            .is_none_or(|cur| cur.cloud_uid != cs.cloud_uid)
+        {
+            Err(Errno::ENOTCONN)
+        } else {
+            let current_proc = s
+                .table
+                .proc(pid)
+                .filter(|p| p.state != ProcState::Zombie)
+                .map(|p| {
+                    (
+                        p.owner_host.clone(),
+                        p.cred.cloud_access,
+                        p.cred.identity.clone(),
+                        p.cgroup.clone(),
+                    )
+                });
+            match current_proc {
+                None => Err(Errno::ESRCH),
+                Some((_, cloud_now, cur_id, _)) if !cloud_now || cur_id.id != proc_uid => {
+                    Err(Errno::EACCES)
+                }
+                Some((host, _, cur_id, cur_cg)) => {
+                    match s.table.set_cred(&host, pid, cur_id, Some(rem.clone())) {
+                        Ok(_) => Ok((
                             cur_cg.clone(),
                             s.table.cgroups().effective_io_limit(&cur_cg),
-                        ))
+                        )),
+                        Err(e) => Err(e.errno),
                     }
-                    Err(e) => Err(e.errno),
                 }
             }
         }
@@ -452,19 +459,37 @@ pub(crate) struct LocalAccount {
     pub signed_in: bool,
 }
 
+/// Default zero-friction local OS account (`uid 1000` in `wheel` with passwordless `sudo`,
+/// Contract v2 §2.1 & §2.15). Zero network RPCs; independent of optional Cloud Sign-In.
 impl Default for LocalAccount {
     fn default() -> Self {
         Self {
-            uid: 65534,
-            gid: 65534,
-            groups: vec![65534],
-            user: "guest".into(),
-            group: "guest".into(),
-            home: "/tmp".into(),
-            shell: "/usr/bin/dash".into(),
-            signed_in: false,
+            uid: 1000,
+            gid: 1000,
+            groups: vec![1000, 10],
+            user: "user".into(),
+            group: "user".into(),
+            home: "/home/user".into(),
+            shell: "/bin/sh".into(),
+            signed_in: true,
         }
     }
+}
+
+/// Optional explicit Cloud / Cluster service credential attached by Cloud Sign-In.
+/// Strictly decoupled from local `/etc/passwd` and local process UIDs (NO OS-level `issuer`,
+/// NO UID federation).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct CloudSession {
+    pub cloud_user: String,
+    pub cloud_uid: u32,
+    pub cloud_gid: u32,
+    pub cloud_groups: Vec<u32>,
+    pub local_uid: u32,
+    pub scope: RemoteScope,
+    pub page_token: String,
+    pub signed_in_at: u64,
+    pub revoked: bool,
 }
 
 impl LocalAccount {
@@ -479,6 +504,7 @@ impl LocalAccount {
     }
 
     pub(crate) fn to_creds_json(&self) -> Value {
+        let wheel_or_root = self.uid == 0 || self.groups.contains(&10);
         json!({
             "uid": self.uid,
             "gid": self.gid,
@@ -488,6 +514,8 @@ impl LocalAccount {
             "home": self.home,
             "shell": self.shell,
             "signed_in": self.signed_in,
+            "can_sudo": wheel_or_root,
+            "sudo_active": wheel_or_root,
         })
     }
 }
@@ -501,6 +529,8 @@ pub(crate) struct State {
     pub(crate) account: LocalAccount,
     pub(crate) account_epoch: u64,
     pub(crate) proc_account_epoch: HashMap<u32, u64>,
+    pub(crate) cloud_session: Option<CloudSession>,
+    pub(crate) sudo_timestamps: BTreeMap<u32, u64>,
     pub(crate) remote_attached: bool,
     pub(crate) host_epoch: u64,
     pub(crate) pending_revocations: Vec<String>,
@@ -590,6 +620,7 @@ impl State {
         hydrated_pids
     }
 
+    #[cfg(test)]
     pub(crate) fn hydrate_guest_account_if_uninitialized(
         &mut self,
         uid: u32,
@@ -661,41 +692,10 @@ impl State {
 fn is_supervisor_image(exec: &Exec) -> bool {
     exec.asset.is_some()
         && exec.local.is_none()
-        && exec.path.as_deref() == Some("/usr/bin/supervise")
-}
-
-/// Paths that live purely inside this local instance (never require cloud attachment).
-fn is_local_only_path(path: &str) -> bool {
-    if path.is_empty() || path == "/" {
-        return true;
-    }
-    matches!(
-        path,
-        "/usr"
-            | "/bin"
-            | "/sbin"
-            | "/lib"
-            | "/lib64"
-            | "/proc"
-            | "/dev"
-            | "/run"
-            | "/tmp"
-            | "/mnt"
-            | "/mnt/local"
-            | "/mnt/shared"
-            | "/opt"
-            | "/opt/private"
-    ) || path.starts_with("/usr/")
-        || path.starts_with("/bin/")
-        || path.starts_with("/sbin/")
-        || path.starts_with("/lib/")
-        || path.starts_with("/lib64/")
-        || path.starts_with("/proc/")
-        || path.starts_with("/dev/")
-        || path.starts_with("/run/")
-        || path.starts_with("/tmp/")
-        || path.starts_with("/mnt/")
-        || path.starts_with("/opt/private/")
+        && matches!(
+            exec.path.as_deref(),
+            Some("/usr/bin/supervise" | "/usr/bin/init")
+        )
 }
 
 fn system_usr_asset(path: &str) -> Option<String> {
@@ -776,6 +776,8 @@ impl Kernel {
             account,
             account_epoch: 1,
             proc_account_epoch: HashMap::new(),
+            cloud_session: None,
+            sudo_timestamps: BTreeMap::new(),
             remote_attached: false,
             host_epoch: 0,
             pending_revocations: Vec::new(),
@@ -788,15 +790,11 @@ impl Kernel {
             session_seq: 1,
         }));
         let connector = cloudfs::Connector::default();
-        let root_cloud = Rc::new(cloudfs::RootCloudDriver::new(
+        let vfs_rt = RefCell::new(vfs_engine::VfsRuntime::new_sync(
+            &instance_id,
             Rc::clone(&state),
             Rc::clone(&current),
             connector.clone(),
-        ));
-        let vfs_rt = RefCell::new(vfs_engine::VfsRuntime::new_sync(
-            &instance_id,
-            root_cloud,
-            Rc::clone(&state),
         ));
         Kernel {
             current,
@@ -849,25 +847,8 @@ impl Kernel {
         Ok(state.login_view().to_string())
     }
 
-    /// Refresh the instance-local account snapshot from the browser's current session cookie
-    /// (called explicitly on `os:login-changed`, NEVER at cold boot).
+    /// Return the local account snapshot (ZERO network RPCs; retired legacy server sync).
     pub async fn sync_account_from_server(&self) -> Result<String, JsValue> {
-        let mut results = cloudfs::page_sys_batch(abi::Batch {
-            calls: vec![Call::Getcreds],
-            umask: None,
-            sudo: false,
-            pid: None,
-            process: None,
-        })
-        .await
-        .map_err(|e| fail(Error::from(e)))?;
-        let val = results
-            .pop()
-            .ok_or_else(|| fail(Errno::EIO.into()))?
-            .into_result()
-            .map_err(fail)?;
-        let account = parse_account_from_value(&val)?;
-        self.apply_account_update(account);
         Ok(self.state.borrow().account.to_creds_json().to_string())
     }
 
@@ -1506,7 +1487,11 @@ impl Kernel {
         // dropped old tokens on success OR the newly derived token on failure).
         let mut derived_remote: Option<RemoteCredRef> = None;
         if let Some(old_rem) = &prev_remote
-            && next_cloud
+            && cloud_req
+            && (next_cloud
+                || !old_rem.scope.devices.is_empty()
+                || old_rem.scope.containers
+                || old_rem.scope.relay)
             && cloudfs::installed("serviceAuthPost").is_ok()
         {
             let (instance_id, host_proof) = ensure_remote_attached_state(&self.state)
@@ -1984,51 +1969,37 @@ impl Kernel {
         let rt = self.vfs_rt.borrow();
         let uid = proc.cred.identity.id;
         let gid = proc.cred.identity.group;
-        let user = rt
-            .uid_names
-            .get(&uid)
-            .cloned()
-            .or_else(|| rt.root_cloud.cached_uid_name(uid))
-            .unwrap_or_else(|| {
-                if uid == 0 {
-                    "root".into()
-                } else if uid == 65534 {
-                    "guest".into()
-                } else {
-                    uid.to_string()
-                }
-            });
-        let group = rt
-            .gid_names
-            .get(&gid)
-            .cloned()
-            .or_else(|| rt.root_cloud.cached_gid_name(gid))
-            .unwrap_or_else(|| {
-                if gid == 0 {
-                    "root".into()
-                } else if gid == 65534 {
-                    "guest".into()
-                } else {
-                    gid.to_string()
-                }
-            });
+        let user = rt.uid_names.get(&uid).cloned().unwrap_or_else(|| {
+            if uid == 0 {
+                "root".into()
+            } else if uid == 65534 {
+                "nobody".into()
+            } else {
+                uid.to_string()
+            }
+        });
+        let group = rt.gid_names.get(&gid).cloned().unwrap_or_else(|| {
+            if gid == 0 {
+                "root".into()
+            } else if gid == 65534 {
+                "nogroup".into()
+            } else {
+                gid.to_string()
+            }
+        });
         let groups: Vec<u32> = proc.cred.identity.groups.iter().copied().collect();
         let group_names: Vec<String> = groups
             .iter()
             .map(|&g| {
-                rt.gid_names
-                    .get(&g)
-                    .cloned()
-                    .or_else(|| rt.root_cloud.cached_gid_name(g))
-                    .unwrap_or_else(|| {
-                        if g == 0 {
-                            "root".into()
-                        } else if g == 65534 {
-                            "guest".into()
-                        } else {
-                            g.to_string()
-                        }
-                    })
+                rt.gid_names.get(&g).cloned().unwrap_or_else(|| {
+                    if g == 0 {
+                        "root".into()
+                    } else if g == 65534 {
+                        "nogroup".into()
+                    } else {
+                        g.to_string()
+                    }
+                })
             })
             .collect();
         let can_sudo = uid == 0 || groups.contains(&0) || group_names.iter().any(|n| n == "wheel");
@@ -2274,6 +2245,10 @@ impl Kernel {
     }
 
     /// Explicitly mint and bind a `ServiceAuth v2` remote credential to local process `pid`.
+    /// Strictly enforces local vs remote authority separation (Contract v2 §2.4):
+    /// - Signed out of Cloud -> `ENOTCONN` (0 network RPCs).
+    /// - Local `sudo` / `uid 0` NEVER elevates remote authority (`sudo` is ALWAYS `false` on
+    ///   `MintServiceCred`, and scope is capped to the active `CloudSession.scope`).
     pub async fn mint_remote_cred(
         &self,
         pid: u32,
@@ -2281,12 +2256,30 @@ impl Kernel {
         sudo: bool,
         host: &str,
     ) -> Result<String, JsValue> {
-        let scope: RemoteScope = match scope_json.as_deref() {
+        if sudo {
+            return Err(fail(Error::because(
+                Errno::EPERM,
+                "local sudo cannot mint elevated remote credentials",
+            )));
+        }
+        let requested_scope: RemoteScope = match scope_json.as_deref() {
             Some(s) if !s.is_empty() && s != "null" => parse(s, "remote scope")?,
             _ => RemoteScope::full(),
         };
-        let (cgroup, io_at_mint, proc_uid, proc_epoch, signed_in, cur_epoch) = {
+        let (cgroup, io_at_mint, proc_uid, cs) = {
             let state = self.state.borrow();
+            let cs = state.cloud_session.clone().ok_or_else(|| {
+                fail(Error::because(
+                    Errno::ENOTCONN,
+                    "not signed into Cloud; remote credentials unavailable",
+                ))
+            })?;
+            if cs.revoked {
+                return Err(fail(Error::because(
+                    Errno::EACCES,
+                    "cloud session tokens were revoked; sign in again",
+                )));
+            }
             let proc = state
                 .table
                 .proc(pid)
@@ -2298,35 +2291,39 @@ impl Kernel {
                     "process has no cloud access",
                 )));
             }
+            if proc.cred.identity.id == os_core::permissions::GUEST
+                || proc.cred.identity.id != cs.local_uid
+            {
+                return Err(fail(Error::because(
+                    Errno::EACCES,
+                    "process local identity does not match active cloud session owner",
+                )));
+            }
             let io = state.table.cgroups().effective_io_limit(&proc.cgroup);
-            (
-                proc.cgroup.clone(),
-                io,
-                proc.cred.identity.id,
-                state.proc_account_epoch.get(&pid).copied().unwrap_or(0),
-                state.account.signed_in,
-                state.account_epoch,
-            )
+            (proc.cgroup.clone(), io, proc.cred.identity.id, cs)
         };
-        let account_changed = proc_epoch != cur_epoch;
-        if sudo && (proc_uid != 0 || account_changed) {
-            return Err(fail(Error::because(
-                Errno::EPERM,
-                "sudo remote mint requires an active root process in the current account epoch",
-            )));
-        }
+        let effective_scope = RemoteScope {
+            cloud_fs: requested_scope.cloud_fs && cs.scope.cloud_fs,
+            devices: requested_scope
+                .devices
+                .into_iter()
+                .filter(|d| cs.scope.allows_device(d))
+                .collect(),
+            containers: requested_scope.containers && cs.scope.containers,
+            relay: requested_scope.relay && cs.scope.relay,
+        };
         let (instance_id, host_proof) = ensure_remote_attached_state(&self.state)
             .await
             .map_err(fail)?;
         let resp = service_auth_request(&auth_v2::Request::MintServiceCred(MintServiceCred {
             instance_id: instance_id.clone(),
             host_proof: host_proof.clone(),
-            scope: scope.clone(),
-            cloud_access: scope.cloud_fs,
+            scope: effective_scope.clone(),
+            cloud_access: effective_scope.cloud_fs,
             umask: 0o022,
             cgroup: Some(cgroup.clone()),
             generation: None,
-            sudo,
+            sudo: false,
             rbps: io_at_mint.read,
             wbps: io_at_mint.write,
         }))
@@ -2336,13 +2333,11 @@ impl Kernel {
             auth_v2::Response::Cred(c) => c,
             _ => return Err(fail(Error::because(Errno::EIO, "unexpected cred reply"))),
         };
-        // F3-01: Prevent a guest or stale process from hijacking a signed-in/root account cookie,
-        // and never let `sudo: true` bind a root remote token onto a non-root or stale process.
-        if !lazy_mint_uid_permitted(proc_uid, issued.uid, signed_in, account_changed) {
+        if issued.uid != cs.cloud_uid {
             revoke_remote_tokens_state(&self.state, vec![issued.token]).await;
             return Err(fail(Error::because(
                 Errno::EACCES,
-                "process identity does not match current remote account",
+                "cloud session identity changed during credential mint",
             )));
         }
         let rem = RemoteCredRef {
@@ -2352,77 +2347,49 @@ impl Kernel {
             groups: issued.groups.clone(),
             instance_id: issued.instance_id.clone(),
             lineage: issued.lineage.clone(),
-            cloud_access: issued.cloud_access,
+            cloud_access: issued.cloud_access && effective_scope.cloud_fs,
             scope: issued.scope.clone(),
         };
-        // Re-check process state after awaiting `MintServiceCred` so a concurrent privilege drop,
-        // `cloud_access=false` attenuation, or process exit mid-await can never be overwritten.
         let bind_res = {
             let mut state = self.state.borrow_mut();
-            let current_proc = state
-                .table
-                .proc(pid)
-                .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
-                .map(|p| {
-                    (
-                        p.cred.cloud_access,
-                        p.cred.identity.clone(),
-                        p.cgroup.clone(),
-                    )
-                });
-            match current_proc {
-                None => Err(Error::from(Errno::ESRCH)),
-                Some((cloud_now, cur_id, _)) if !cloud_now || cur_id.id != proc_uid => {
-                    Err(Error::because(
-                        Errno::EACCES,
-                        "process credentials changed during remote credential mint",
-                    ))
-                }
-                Some((_, cur_id, cur_cg)) => {
-                    let hydrate = !sudo
-                        && proc_uid == os_core::permissions::GUEST
-                        && os_core::permissions::is_guest_id(rem.uid)
-                        && !signed_in
-                        && !account_changed;
-                    let next_local_id = if hydrate {
-                        Identity {
-                            id: rem.uid,
-                            group: rem.gid,
-                            groups: rem.groups.iter().copied().collect(),
-                        }
-                    } else {
-                        cur_id
-                    };
-                    let set_res = if hydrate {
-                        state.table.hydrate_guest_identity(
-                            host,
-                            pid,
-                            next_local_id.clone(),
-                            Some(rem.clone()),
+            if state
+                .cloud_session
+                .as_ref()
+                .is_none_or(|cur| cur.cloud_uid != cs.cloud_uid)
+            {
+                Err(Error::from(Errno::ENOTCONN))
+            } else {
+                let current_proc = state
+                    .table
+                    .proc(pid)
+                    .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+                    .map(|p| {
+                        (
+                            p.cred.cloud_access,
+                            p.cred.identity.clone(),
+                            p.cgroup.clone(),
                         )
-                    } else {
-                        state
-                            .table
-                            .set_cred(host, pid, next_local_id.clone(), Some(rem.clone()))
-                    };
-                    set_res.map(|rev| {
-                        let hydrated_pids = if hydrate {
-                            state.hydrate_guest_account_if_uninitialized(
-                                rem.uid,
-                                rem.gid,
-                                &rem.groups,
-                            )
-                        } else {
-                            Vec::new()
-                        };
-                        let actual_cloud =
-                            state.table.proc(pid).is_some_and(|p| p.cred.cloud_access);
-                        (rev, next_local_id, cur_cg, actual_cloud, hydrated_pids)
-                    })
+                    });
+                match current_proc {
+                    None => Err(Error::from(Errno::ESRCH)),
+                    Some((cloud_now, cur_id, _)) if !cloud_now || cur_id.id != proc_uid => {
+                        Err(Error::because(
+                            Errno::EACCES,
+                            "process credentials changed during remote credential mint",
+                        ))
+                    }
+                    Some((_, cur_id, cur_cg)) => state
+                        .table
+                        .set_cred(host, pid, cur_id.clone(), Some(rem.clone()))
+                        .map(|rev| {
+                            let actual_cloud =
+                                state.table.proc(pid).is_some_and(|p| p.cred.cloud_access);
+                            (rev, cur_id, cur_cg, actual_cloud)
+                        }),
                 }
             }
         };
-        let (revoked, local_id, active_cg, actual_cloud, hydrated_pids) = match bind_res {
+        let (revoked, local_id, active_cg, actual_cloud) = match bind_res {
             Ok(tuple) => tuple,
             Err(err) => {
                 revoke_remote_tokens_state(&self.state, vec![rem.token]).await;
@@ -2437,11 +2404,6 @@ impl Kernel {
             Some(rem.token.clone()),
             actual_cloud,
         );
-        for hpid in hydrated_pids {
-            if hpid != pid {
-                self.sync_vfs_proc_creds(hpid);
-            }
-        }
         revoke_remote_tokens_state(&self.state, revoked).await;
         if active_cg != cgroup {
             self.sync_remote_io_quota_for_token(&rem.token, &active_cg)
@@ -2743,7 +2705,6 @@ impl Kernel {
         let hydrated_pids = self.state.borrow_mut().sync_account(account);
         {
             let mut rt = self.vfs_rt.borrow_mut();
-            rt.root_cloud.clear_cached_account_names();
             if !user.is_empty() {
                 rt.uid_names.insert(uid, user);
             }
@@ -2818,6 +2779,54 @@ impl Kernel {
                     "pgid": p.pgid,
                     "sid": sid,
                 }))
+            }
+            Call::Prctl {
+                option: 1001,
+                value,
+            } => {
+                // Local primary-GID switch (`newgrp`): verify caller belongs to `target_gid`
+                // in local `/etc/{passwd,group}`, update local cred, and drop ambient remote cred.
+                let target_gid = value;
+                let (cur_id, vfs) = {
+                    let st = self.state.borrow();
+                    let proc = st
+                        .table
+                        .proc(pid)
+                        .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
+                        .ok_or(Errno::ESRCH)?;
+                    (proc.cred.identity.clone(), self.vfs_rt.borrow().vfs.clone())
+                };
+                if !self
+                    .verify_local_group_membership(&vfs, cur_id.id, target_gid)
+                    .await?
+                {
+                    return Err(Error::because(
+                        Errno::EPERM,
+                        "not a member of requested local group",
+                    ));
+                }
+                let mut next_groups = cur_id.groups.clone();
+                next_groups.insert(target_gid);
+                let next_id = Identity {
+                    id: cur_id.id,
+                    group: target_gid,
+                    groups: next_groups.clone(),
+                };
+                let revoked = {
+                    let mut st = self.state.borrow_mut();
+                    st.table
+                        .set_authenticated_cred(host, pid, next_id.clone(), None)?
+                };
+                revoke_remote_tokens_state(&self.state, revoked).await;
+                let _ = self.proc_set_creds(
+                    pid,
+                    next_id.id,
+                    next_id.group,
+                    next_groups.into_iter().collect(),
+                    None,
+                    false,
+                );
+                Ok(json!({ "gid": target_gid }))
             }
             Call::Prctl { option, value } => {
                 let res = self
@@ -3181,10 +3190,18 @@ impl Kernel {
                         .filter(|p| p.state != ProcState::Zombie && p.owner_host == host)
                         .map(|p| p.cred.clone())
                 });
+                let parent_login_session = parent_pid.and_then(|pp| {
+                    self.vfs_rt
+                        .borrow()
+                        .proc_meta
+                        .get(&pp)
+                        .and_then(|m| m.login_session.clone())
+                });
                 let sid = stage["sessionId"]
                     .as_str()
                     .filter(|v| !v.is_empty())
                     .map(str::to_string)
+                    .or(parent_login_session)
                     .or_else(|| Some(s.login_session.id.clone()));
                 (pcred, s.account.identity(), sid, s.account_epoch)
             };
@@ -3201,12 +3218,11 @@ impl Kernel {
                 cloud_allowed &= pc.cloud_access;
             }
 
-            let is_cloud_target = (local_exec.as_ref().is_none_or(|l| l.cloud)
-                && !is_local_only_path(&path))
-                || !is_local_only_path(&cwd);
+            let cloud_session = self.state.borrow().cloud_session.clone();
             let should_mint_remote = cloud_allowed
-                && cloudfs::installed("serviceAuthPost").is_ok()
-                && (sudo || explicit_scope.is_some() || is_cloud_target);
+                && explicit_scope.is_some()
+                && cloud_session.is_some()
+                && cloudfs::installed("serviceAuthPost").is_ok();
 
             let cred_result: std::result::Result<LocalCred, Error> = if let Some(pc) = parent_cred {
                 let mut c = pc;
@@ -3217,29 +3233,57 @@ impl Kernel {
                     rem.cloud_access &= cloud_allowed;
                 }
                 Ok(c)
+            } else if sudo {
+                // Local sudo authorization against `/etc/sudoers` (ZERO network RPCs!).
+                // Elevates ONLY local identity to uid 0; NEVER synthesizes a remote root token!
+                let vfs = self.vfs_rt.borrow().vfs.clone();
+                match self
+                    .check_local_sudo_authorized(&vfs, default_identity.id)
+                    .await
+                {
+                    Ok(true) => Ok(LocalCred {
+                        identity: Identity::root(),
+                        umask: 0o022,
+                        remote: None,
+                        cloud_access: cloud_allowed,
+                    }),
+                    Ok(false) => Err(Error::because(
+                        Errno::EPERM,
+                        "sudo requires local sudoers authorization",
+                    )),
+                    Err(e) => Err(Error::from(e)),
+                }
             } else if should_mint_remote {
-                let (signed_in, io_at_mint) = {
+                let cs = cloud_session.unwrap();
+                let req_scope = explicit_scope.unwrap();
+                let effective_scope = RemoteScope {
+                    cloud_fs: req_scope.cloud_fs && cs.scope.cloud_fs,
+                    devices: req_scope
+                        .devices
+                        .into_iter()
+                        .filter(|d| cs.scope.allows_device(d))
+                        .collect(),
+                    containers: req_scope.containers && cs.scope.containers,
+                    relay: req_scope.relay && cs.scope.relay,
+                };
+                let io_at_mint = {
                     let s = self.state.borrow();
                     let target_cg = cgroup.as_deref().unwrap_or("/user");
-                    (
-                        s.account.signed_in,
-                        s.table.cgroups().effective_io_limit(target_cg),
-                    )
+                    s.table.cgroups().effective_io_limit(target_cg)
                 };
                 match ensure_remote_attached_state(&self.state).await {
                     Ok((instance_id, host_proof)) => {
-                        let scope = explicit_scope.unwrap_or_else(RemoteScope::full);
-                        let req_cloud = cloud_allowed && scope.cloud_fs;
+                        let req_cloud = cloud_allowed && effective_scope.cloud_fs;
                         match service_auth_request(&auth_v2::Request::MintServiceCred(
                             MintServiceCred {
                                 instance_id,
                                 host_proof,
-                                scope,
+                                scope: effective_scope,
                                 cloud_access: req_cloud,
                                 umask: 0o022,
                                 cgroup: cgroup.clone(),
                                 generation: None,
-                                sudo,
+                                sudo: false,
                                 rbps: io_at_mint.read,
                                 wbps: io_at_mint.write,
                             },
@@ -3247,53 +3291,14 @@ impl Kernel {
                         .await
                         {
                             Ok(auth_v2::Response::Cred(issued)) => {
-                                // F3-01: On `!sudo`, NEVER overwrite local `Identity` OR attach a
-                                // higher-privilege remote token when remote and local UIDs diverge
-                                // (except initial 65534 -> guest hydration, or signed-out guest ->
-                                // guest cookie rotation). Keep `sudo: true` remote root identity
-                                // for #54 Gate 3b.
-                                let guest_cookie_rotated = !signed_in
-                                    && os_core::permissions::is_guest_id(default_identity.id)
-                                    && os_core::permissions::is_guest_id(issued.uid);
-                                if !sudo
-                                    && !guest_cookie_rotated
-                                    && !lazy_mint_uid_permitted(
-                                        default_identity.id,
-                                        issued.uid,
-                                        signed_in,
-                                        false,
-                                    )
-                                {
+                                if issued.uid != cs.cloud_uid {
                                     revoke_remote_tokens_state(&self.state, vec![issued.token])
                                         .await;
                                     Err(Error::because(
                                         Errno::EACCES,
-                                        "remote account identity does not match local account",
+                                        "cloud session identity changed during exec",
                                     ))
                                 } else {
-                                    let hydrated_pids = if !sudo
-                                        && default_identity.id == os_core::permissions::GUEST
-                                        && !signed_in
-                                        && os_core::permissions::is_guest_id(issued.uid)
-                                    {
-                                        self.state
-                                            .borrow_mut()
-                                            .hydrate_guest_account_if_uninitialized(
-                                                issued.uid,
-                                                issued.gid,
-                                                &issued.groups,
-                                            )
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    for hpid in hydrated_pids {
-                                        self.sync_vfs_proc_creds(hpid);
-                                    }
-                                    let identity = Identity {
-                                        id: issued.uid,
-                                        group: issued.gid,
-                                        groups: issued.groups.iter().copied().collect(),
-                                    };
                                     let rem = RemoteCredRef {
                                         token: issued.token,
                                         uid: issued.uid,
@@ -3304,7 +3309,7 @@ impl Kernel {
                                         cloud_access: issued.cloud_access && req_cloud,
                                         scope: issued.scope,
                                     };
-                                    Ok(LocalCred::with_remote(identity, issued.umask, rem))
+                                    Ok(LocalCred::with_remote(default_identity, 0o022, rem))
                                 }
                             }
                             Ok(_) => Err(Error::because(Errno::EIO, "unexpected cred reply")),
@@ -3313,12 +3318,6 @@ impl Kernel {
                     }
                     Err(e) => Err(e),
                 }
-            } else if sudo && cloudfs::installed("serviceAuthPost").is_ok() {
-                // `sudo: true` when `!cloud_allowed` still cannot synthesize root locally.
-                Err(Error::because(
-                    Errno::EPERM,
-                    "sudo requires authenticated elevation",
-                ))
             } else {
                 Ok(LocalCred {
                     identity: default_identity,
@@ -3647,11 +3646,21 @@ mod tests {
         );
         let host = "host-local";
         let _ = table.boot_init(host, 100);
+        let guest_account = super::LocalAccount {
+            uid: os_core::permissions::GUEST,
+            gid: os_core::permissions::GUEST,
+            groups: vec![os_core::permissions::GUEST],
+            user: "guest".into(),
+            group: "guest".into(),
+            home: "/tmp".into(),
+            shell: "/bin/sh".into(),
+            signed_in: false,
+        };
         let p = table
             .spawn(
                 super::SpawnSpec::new(
                     "/usr/bin/sh",
-                    super::LocalCred::local_only(super::LocalAccount::default().identity(), 0o022),
+                    super::LocalCred::local_only(guest_account.identity(), 0o022),
                     host,
                 ),
                 101,
@@ -3665,9 +3674,11 @@ mod tests {
             host_proof: String::new(),
             boot: "boot-1".into(),
             table,
-            account: super::LocalAccount::default(),
+            account: guest_account,
             account_epoch: 1,
             proc_account_epoch: proc_epochs,
+            cloud_session: None,
+            sudo_timestamps: std::collections::BTreeMap::new(),
             remote_attached: false,
             host_epoch: 0,
             pending_revocations: Vec::new(),

@@ -12,6 +12,7 @@ const password = process.env.OS_TEST_ADMIN_PASSWORD
 
 const ROOT_ACCOUNT = { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root', home: '/root', shell: '/usr/bin/dash', signed_in: true };
 const GUEST_ACCOUNT = { uid: 65534, gid: 65534, groups: [65534], user: 'guest', group: 'guest', home: '/tmp', shell: '/usr/bin/dash', signed_in: false };
+const CLOUD_ROOT = { cloudUser: 'root', cloudUid: 0, cloudGid: 0, cloudGroups: [0], scope: { cloud_fs: true, devices: ['archive', 'media', 'present', 'snd'], containers: false, relay: false } };
 
 const AF_UNIX = 1;
 const SOCK_STREAM = 1, SOCK_DGRAM = 2, SOCK_SEQPACKET = 5;
@@ -75,7 +76,25 @@ async function connectHost(page) {
       },
     };
   });
-  await hostCall(page, 'sync_account_from_server');
+  await hostCall(page, 'machine_init_leave');
+  await expect.poll(async () => (await hostCall(page, 'run_sock_stats')).ok, { timeout: 5_000 })
+    .toEqual({ activeSockets: 0, boundInodes: 0, inflightGlobal: 0, allocatedArenaSlots: 0 });
+  await hostCall(page, 'sync_account', ROOT_ACCOUNT);
+}
+
+async function hostWrite(page, path, data, mode = 0o755) {
+  const bytes = Array.from(Buffer.isBuffer(data) ? data : Buffer.from(data));
+  await page.evaluate(async ({ path, bytes, mode }) => {
+    const req = window.__afUnix.request;
+    const opened = await req('vfs_sys', {
+      batch: { calls: [{ open: { path, flags: 1 | 64 | 512, mode } }] },
+    });
+    const fd = opened.ok.results[0].ok.fd;
+    if (bytes.length > 0) {
+      await req('vfs_pwrite_chunk', { fd, offset: 0, data: new Uint8Array(bytes) });
+    }
+    await req('vfs_sys', { batch: { calls: [{ close: { fd } }, { chmod: { path, mode } }] } });
+  }, { path, bytes, mode });
 }
 
 const hostCall = (page, type, args = {}) => page.evaluate(([t, a]) => window.__afUnix.request(t, a), [type, args]);
@@ -239,22 +258,19 @@ async function uploadWasm(page, base, name, build, { sync = false, withFork = fa
   let bytes;
   try { bytes = mod.emitBinary(); } finally { mod.dispose(); }
   const path = `${base}/${name}.wasm`;
-  const putRes = await put(page.request, `/api/file?path=${path}&overwrite=true`, { data: Buffer.from(bytes) });
-  expect(putRes.ok()).toBe(true);
-  await call(page.request, { chmod: { path, mode: 0o755 } });
+  await hostWrite(page, path, Buffer.from(bytes), 0o755);
   return path;
 }
 
 let base;
 test.beforeEach(async ({ page }) => {
-  base = '/guest/afunix-' + crypto.randomUUID();
-  await call(page.request, { mkdir: { path: base, mode: 0o755 } });
+  base = '/tmp/afunix-' + crypto.randomUUID();
   await page.goto('/');
   await connectHost(page);
+  await hostCall(page, 'vfs_sys', { batch: { calls: [{ mkdir: { path: base, mode: 0o755 } }, { chmod: { path: base, mode: 0o755 } }] } });
 });
 test.afterEach(async ({ page }) => {
   await closeHost(page, base);
-  await rmrf(page.request, base);
 });
 
 test('U-01 & U-07: SOCK_STREAM across unrelated Workers (>1 MiB SockArena), S_IFSOCK, open->ENXIO, unlink+rebind', async ({ page }) => {
@@ -493,8 +509,14 @@ test('U-03: SOCK_DGRAM multi-client bound server & SOCK_SEQPACKET framing, MSG_P
 for (const syncMode of [false, true]) {
   test(`U-04 & U-05 (${syncMode ? 'sync Atomics.wait' : 'JSPI'}): SCM_RIGHTS file+pipe+PTY+unix-sock+CloudFs & ancillary boundary splitting`, async ({ page }) => {
     const sockName = syncMode ? '/tmp/u04-sync.sock' : '/tmp/u04-jspi.sock';
-    const cloudFile = `${base}/cloud-${syncMode ? 'sync' : 'jspi'}.txt`;
-    expect((await put(page.request, `/api/file?path=${cloudFile}&overwrite=true`, { data: 'cloud-payload' })).ok()).toBe(true);
+    const cloudDir = `/guest/afunix-u04-${crypto.randomUUID()}`;
+    const cloudServerFile = `${cloudDir}/cloud-${syncMode ? 'sync' : 'jspi'}.txt`;
+    const cloudFile = `/mnt/cloud${cloudServerFile}`;
+    await loginRoot(page);
+    await call(page.request, { mkdir: { path: cloudDir, mode: 0o755 } });
+    expect((await put(page.request, `/api/file?path=${cloudServerFile}&overwrite=true`, { data: 'cloud-payload' })).ok()).toBe(true);
+    await hostCall(page, 'sync_account', ROOT_ACCOUNT);
+    await hostCall(page, 'cloud_sign_in', CLOUD_ROOT);
 
     // Receiver Worker binds sockName, accepts sender, verifies boundary splitting ("AAA"+[file,pipe] then "BBB"+[pty,subsock,cloud]).
     const rxPath = await uploadWasm(page, base, `u04-rx-${syncMode ? 'sync' : 'jspi'}`, ({ text, say, sysJson, eq }) => `
@@ -869,13 +891,18 @@ test('U-08 & U-09: SO_PEERCRED anti-spoofing + DAC & POSIX ACL W_OK enforcement 
 
 test('U-10: SCM_RIGHTS remote CloudFs open-ref attenuation & revocation on sender SIGKILL', async ({ page }) => {
   await loginRoot(page);
-  const secret1 = `${base}/secret-1.txt`;
-  const secret2 = `${base}/secret-2.txt`;
-  expect((await put(page.request, `/api/file?path=${secret1}&overwrite=true`, { data: 'top-secret-cloud-data' })).ok()).toBe(true);
-  expect((await put(page.request, `/api/file?path=${secret2}&overwrite=true`, { data: 'forbidden-second-file' })).ok()).toBe(true);
-  await call(page.request, { chmod: { path: secret1, mode: 0o600 } });
-  await call(page.request, { chmod: { path: secret2, mode: 0o600 } });
+  const cloudDir = `/guest/afunix-u10-${crypto.randomUUID()}`;
+  await call(page.request, { mkdir: { path: cloudDir, mode: 0o755 } });
+  const secret1Server = `${cloudDir}/secret-1.txt`;
+  const secret2Server = `${cloudDir}/secret-2.txt`;
+  const secret1 = `/mnt/cloud${secret1Server}`;
+  const secret2 = `/mnt/cloud${secret2Server}`;
+  expect((await put(page.request, `/api/file?path=${secret1Server}&overwrite=true`, { data: 'top-secret-cloud-data' })).ok()).toBe(true);
+  expect((await put(page.request, `/api/file?path=${secret2Server}&overwrite=true`, { data: 'forbidden-second-file' })).ok()).toBe(true);
+  await call(page.request, { chmod: { path: secret1Server, mode: 0o600 } });
+  await call(page.request, { chmod: { path: secret2Server, mode: 0o600 } });
   await hostCall(page, 'sync_account', ROOT_ACCOUNT);
+  await hostCall(page, 'cloud_sign_in', CLOUD_ROOT);
 
   // Root sender opens secret1 (CloudFs, 0600 root:root), sends open ref over /run/u10.sock, then stays alive until SIGKILLed.
   const srvPath = await uploadWasm(page, base, 'u10-srv', ({ text, say, sysJson, eq, assertExpr }) => `

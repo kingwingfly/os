@@ -12,11 +12,39 @@ export async function sys(request, calls, options = {}, extra = {}) {
   return (await response.json()).results;
 }
 
-// The account system calls, as a request answered them before they were calls: `name` (login,
-// logout, sudo, passwd, register, unregister, session) with `data`, answered with a status an
-// errno says (401 refused, 403 not permitted, 404, 409, 429 too many) and the call's value.
+// Explicit Cloud / Cluster auth routes (`/api/cloud-auth/{login,logout,status,register}`)
+// paired with retired `/api/sys` account calls (which fail closed with ENOSYS per Contract §2.12).
+export async function cloudAuth(request, name, { headers: extra = {}, data = {} } = {}) {
+  const opts = { headers: { ...headers, ...extra }, data };
+  switch (name) {
+    case 'login':
+      return request.post(origin + '/api/cloud-auth/login', {
+        ...opts,
+        data: { username: data.username ?? 'root', password: data.password ?? '' },
+      });
+    case 'logout':
+      return request.post(origin + '/api/cloud-auth/logout', { headers: { ...headers, ...extra } });
+    case 'register':
+      return request.post(origin + '/api/cloud-auth/register', {
+        ...opts,
+        data: {
+          username: data.username,
+          password: data.password ?? '',
+          short_password: !!data.short_password,
+          create_home: !!data.create_home,
+        },
+      });
+    case 'status':
+      return request.get(origin + '/api/cloud-auth/status', { headers: { Origin: origin, ...extra } });
+  }
+  throw new Error('no such cloudAuth call: ' + name);
+}
+
+// The account calls for server-side tests: `login`, `logout`, `register`, and `session` route
+// through `/api/cloud-auth/*`; retired local OS-account calls (`sudo`, `passwd`, `unregister`)
+// still hit `/api/sys` where the server fails closed with `ENOSYS`.
 export async function api(request, name, { headers: extra = {}, data = {} } = {}) {
-  const status = err => ({ EACCES: 401, EPERM: 403, ENOENT: 404, EEXIST: 409, EAGAIN: 429, ESTALE: 412 })[err.errno] ?? 400;
+  const status = err => ({ EACCES: 401, EPERM: 403, ENOENT: 404, EEXIST: 409, EAGAIN: 429, ESTALE: 412, ENOSYS: 501 })[err.errno] ?? 400;
   const answer = (code, body) => ({ status: () => code, ok: () => code < 300, json: async () => body, text: async () => JSON.stringify(body) });
   const one = async (call, options = {}, made = 200) => {
     // A request refused as a whole (from another site, say) is answered as it is.
@@ -26,11 +54,11 @@ export async function api(request, name, { headers: extra = {}, data = {} } = {}
     return 'ok' in result ? answer(made, result.ok ?? {}) : answer(status(result.err), { error: result.err.detail || result.err.errno, errno: result.err.errno });
   };
   switch (name) {
-    case 'login': return one({ login: { username: data.username ?? 'root', password: data.password ?? '' } }, { sudo: !!data.sudo });
-    case 'logout': return one('logout');
+    case 'login': return cloudAuth(request, 'login', { headers: extra, data });
+    case 'logout': return cloudAuth(request, 'logout', { headers: extra });
+    case 'register': return cloudAuth(request, 'register', { headers: extra, data });
     case 'sudo': return one({ sudo: { password: data.password ?? '', revoke: !!data.revoke } });
     case 'passwd': return one({ passwd: { username: data.username ?? null, password: data.password ?? '', current_password: data.current_password ?? null, force: !!data.force } }, { sudo: !!data.sudo });
-    case 'register': return one({ useradd: { name: data.username, password: data.password ?? '', short_password: !!data.short_password, create_home: !!data.create_home } }, {}, 201);
     case 'unregister': {
       const creds = await call(request, 'getcreds');
       return one({ userdel: { name: creds.user, remove: !!data.remove, password: data.password ?? '' } });

@@ -1,7 +1,7 @@
 import { test, expect } from './test.js';
 import binaryen from 'binaryen';
 import { readFile } from 'node:fs/promises';
-import { errno, put, rmrf } from './sys.js';
+import { pageCall, pageErrno, pagePut, pageRmrf } from './ui.js';
 import { hookPageKernel } from './service-auth.js';
 
 const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
@@ -12,10 +12,10 @@ async function run(page, command) {
   await input(page).fill(command); await input(page).press('Enter');
   await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
 }
-async function upload(request, path, data) {
-  const response = await put(request, '/api/file?path=' + encodeURIComponent(path), { data, headers: { Origin: process.env.OS_TEST_URL || 'http://127.0.0.1:8787' } });
-  expect(response.ok(), await response.text()).toBe(true);
-  expect(await errno(request, { chmod: { path, mode: 0o755 } })).toBe(null);
+async function upload(page, path, data) {
+  await page.waitForFunction(() => Boolean(window.os?.exec));
+  await pagePut(page, path, data, { mode: 0o755, overwrite: true });
+  await pageCall(page, { chmod: { path, mode: 0o755 } });
 }
 const wat = `(module
   (import "wasix_32v1" "tty_get" (func $get (param i32) (result i32)))
@@ -94,7 +94,8 @@ test('closing a terminal pane hangs up its running and stopped jobs while anothe
 
 test('a cancelled console launch never creates a process or changes files', async ({ page }) => {
   await page.goto('/');
-  const path = `/guest/cancelled-console-${crypto.randomUUID()}`;
+  await page.waitForFunction(() => Boolean(window.os?.exec));
+  const path = `/tmp/cancelled-console-${crypto.randomUUID()}`;
   const started = [];
   page.on('request', request => {
     if (new URL(request.url()).pathname === '/api/sys' && request.method() === 'POST')
@@ -105,8 +106,8 @@ test('a cancelled console launch never creates a process or changes files', asyn
       { path: '/usr/bin/coreutils', argv: ['coreutils', 'touch', path] },
     ], { terminalId: 'closed-before-launch', cancelled: () => true }), path);
     expect(result.status).toBe(130); expect(started).toEqual([]);
-    expect(await errno(page.request, { stat: { path } })).toBe('ENOENT');
-  } finally { await rmrf(page.request, path); }
+    expect(await pageErrno(page, { stat: { path } })).toBe('ENOENT');
+  } finally { await pageRmrf(page, path).catch(() => {}); }
 });
 
 test('coreutils cat reads controlling-terminal device paths through ordinary file descriptors', async ({ page }) => {
@@ -124,9 +125,9 @@ test('coreutils cat reads controlling-terminal device paths through ordinary fil
   await run(page, 'stty sane');
 });
 
-test('WASIX raw input and cursor addressing render a full-screen application and restore the transcript', async ({ page, request }) => {
-  const path = `/guest/pty-screen-${crypto.randomUUID()}.wasm`;
-  await page.goto('/'); await upload(request, path, fullscreen);
+test('WASIX raw input and cursor addressing render a full-screen application and restore the transcript', async ({ page }) => {
+  const path = `/tmp/pty-screen-${crypto.randomUUID()}.wasm`;
+  await page.goto('/'); await upload(page, path, fullscreen);
   try {
     await input(page).fill(path); await input(page).press('Enter');
     const screen = page.locator('.terminal-screen[data-alternate="true"]');
@@ -144,7 +145,7 @@ test('WASIX raw input and cursor addressing render a full-screen application and
     await expect(page.locator('.terminal-screen[data-alternate="true"]')).toHaveCount(0);
     await expect(last(page)).toContainText('finished');
     await run(page, 'stty -a'); await expect(last(page)).toContainText('echo icanon');
-  } finally { await rmrf(request, path); }
+  } finally { await pageRmrf(page, path).catch(() => {}); }
 });
 
 test('PTY Ctrl+C and Ctrl+Z reach the foreground job; descriptors name the slave', async ({ page }) => {
@@ -168,11 +169,11 @@ test('PTY Ctrl+C and Ctrl+Z reach the foreground job; descriptors name the slave
   await run(page, 'ps'); await expect(last(page)).not.toContainText('coreutils cat');
 });
 
-test('interactive dash prompts, reads a canonical line, and exits on Ctrl+D', async ({ page, request }) => {
+test('interactive dash prompts, reads a canonical line, and exits on Ctrl+D', async ({ page }) => {
   test.skip(!process.env.WASIX_DASH, 'set WASIX_DASH to the approved fixture');
   test.setTimeout(120_000);
-  const path = `/guest/pty-dash-${crypto.randomUUID()}.wasm`;
-  await page.goto('/'); await upload(request, path, await readFile(process.env.WASIX_DASH));
+  const path = `/tmp/pty-dash-${crypto.randomUUID()}.wasm`;
+  await page.goto('/'); await upload(page, path, await readFile(process.env.WASIX_DASH));
   try {
     await input(page).fill(`${path} -i`); await input(page).press('Enter');
     await expect(busy(page)).toHaveAttribute('data-state', 'input', { timeout: 90_000 });
@@ -199,13 +200,13 @@ test('interactive dash prompts, reads a canonical line, and exits on Ctrl+D', as
     await expect(page.locator('.transcript')).toContainText('icanon isig', { timeout: 30_000 });
     await expect(busy(page)).toHaveAttribute('data-state', 'input'); await input(page).press('Control+d');
     await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-  } finally { await rmrf(request, path); }
+  } finally { await pageRmrf(page, path).catch(() => {}); }
 });
 
 
-test('raw mode without ISIG delivers Ctrl+C and Ctrl+D as input bytes', async ({ page, request }) => {
-  const path = `/guest/pty-raw-${crypto.randomUUID()}.wasm`;
-  await page.goto('/'); await upload(request, path, fullscreen);
+test('raw mode without ISIG delivers Ctrl+C and Ctrl+D as input bytes', async ({ page }) => {
+  const path = `/tmp/pty-raw-${crypto.randomUUID()}.wasm`;
+  await page.goto('/'); await upload(page, path, fullscreen);
   try {
     await run(page, 'stty raw');
     await input(page).fill(path); await input(page).press('Enter');
@@ -216,7 +217,7 @@ test('raw mode without ISIG delivers Ctrl+C and Ctrl+D as input bytes', async ({
     await input(page).press('Control+d'); await expect(busy(page)).toHaveAttribute('data-state', 'input');
     await input(page).press('q'); await expect(busy(page)).toHaveAttribute('data-state', 'idle');
     await run(page, 'stty sane');
-  } finally { await rmrf(request, path); }
+  } finally { await pageRmrf(page, path).catch(() => {}); }
 });
 
 // Exercise a newly opened slave, rather than only the inherited standard descriptors.
@@ -257,8 +258,8 @@ const slaveWat = String.raw`(module
     (drop (call $set (i32.const 256)))
     (call $say (local.get $fd) (i32.const 1150) (i32.const 11))))`;
 const slaveModule = binaryen.parseText(slaveWat); const slave = Buffer.from(slaveModule.emitBinary()); slaveModule.dispose();
-test('an opened PTY slave polls for real input, reads canonical data and keeps no-echo input private', async ({ page, request }) => {
-  const path = `/guest/pty-slave-${crypto.randomUUID()}.wasm`;
+test('an opened PTY slave polls for real input, reads canonical data and keeps no-echo input private', async ({ page }) => {
+  const path = `/tmp/pty-slave-${crypto.randomUUID()}.wasm`;
   let release, blocked = false, producerExited = false;
   const released = new Promise(resolve => { release = resolve; });
   const gatePath = `/__test_pty_gate_${crypto.randomUUID()}`;
@@ -316,7 +317,7 @@ test('an opened PTY slave polls for real input, reads canonical data and keeps n
   await page.route(`**${gatePath}`, gateRoute);
   await page.route(`**${exitPath}**`, exitRoute);
   await page.route('**/client-kernel.js', kernelRoute);
-  await page.goto('/'); await upload(request, path, slave);
+  await page.goto('/'); await upload(page, path, slave);
   try {
     producerExited = false;
     await input(page).fill(`echo pipeline | ${path}`); await input(page).press('Enter');
@@ -336,7 +337,7 @@ test('an opened PTY slave polls for real input, reads canonical data and keeps n
     await page.unroute('**/client-kernel.js', kernelRoute).catch(() => {});
     await page.unroute(`**${gatePath}`, gateRoute).catch(() => {});
     await page.unroute(`**${exitPath}**`, exitRoute).catch(() => {});
-    await rmrf(request, path);
+    await pageRmrf(page, path).catch(() => {});
   }
 });
 
