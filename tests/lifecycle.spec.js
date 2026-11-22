@@ -1,11 +1,13 @@
 import { executableAsset } from './executable-asset.js';
 import { test, expect } from './test.js';
-import { api, call, sys, put, rmrf } from './sys.js';
+import { api, call, put, rmrf } from './sys.js';
+import { pageErrno, pageMkdirp, pageRmrf, switchLocalUser } from './ui.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password = process.env.OS_TEST_ADMIN_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const CLOUD_SCOPE = { cloud_fs: true, devices: [], containers: false, relay: false };
 test.setTimeout(70000);
 
 const ROOT_ACCOUNT = { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root', home: '/root', shell: '/usr/bin/dash', signed_in: true };
@@ -116,8 +118,9 @@ test('ending an exact login is authenticated, idempotent and fences new launches
 
 test('shutdown contains orphaned setsid and exec descendants and revokes their remote credentials immediately', async ({ page }) => {
   const request = page.request;
-  await call(request, 'getcreds');
+  await signIn(request);
   await connect(page);
+  await kv(page, 'cloud_sign_in', { cloudUser: 'root', cloudUid: 0, cloudGid: 0, cloudGroups: [0], scope: CLOUD_SCOPE });
   const instanceId = await kv(page, 'instance_id');
   const parent = await launch(page, { remote: true });
   const child = await kv(page, 'fork', { pid: parent.pid });
@@ -155,6 +158,7 @@ test('root restart is scoped to one instance, preserves data and profiles, revok
 
   await signIn(request);
   await kv(page, 'sync_account', ROOT_ACCOUNT);
+  await kv(page, 'cloud_sign_in', { cloudUser: 'root', cloudUid: 0, cloudGid: 0, cloudGroups: [0], scope: CLOUD_SCOPE });
   const root = await launch(page, { remote: true });
   const host = { host: randomUUID(), proof: randomBytes(32).toString('hex') };
   const joined = await loginAct(page, { op: 'join', ...host });
@@ -206,13 +210,12 @@ async function run(page, key, script) {
   }, { key, script });
 }
 
-test('explicit end-session stops workloads in its own instance without affecting another tab, while ordinary sign-out preserves running workloads', async ({ page, context }) => {
-  await signIn(page.request);
+test('explicit end-session stops workloads in its own instance without affecting another tab, while ordinary account switch preserves running workloads', async ({ page, context }) => {
   await ready(page);
+  await switchLocalUser(page, 'root');
   await run(page, 'older', 'echo OLD-READY; sleep 120');
   await expect.poll(() => page.evaluate(() => window.older.output), { timeout: 15000 }).toContain('OLD-READY');
-  await api(page.request, 'logout');
-  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+  await switchLocalUser(page, 'user');
   await expect.poll(async () => (await state(page)).session?.uid, { timeout: 15000 }).not.toBe(0);
 
   const second = await context.newPage();
@@ -238,20 +241,23 @@ test('explicit end-session stops workloads in its own instance without affecting
   }
 });
 
-test('the greeter can end its session scope and enter a fresh shell scope', async ({ page }) => {
-  await page.goto('/login?target=shell');
-  await page.getByText('Session controls', { exact: true }).click();
-  await page.getByRole('button', { name: 'End session', exact: true }).click();
-  await expect(page.getByRole('status')).toContainText('Session ended', { timeout: 45000 });
-  await page.getByRole('button', { name: 'Continue as guest', exact: true }).click();
-  await expect(page).toHaveURL(/\/shell(?:\.html)?$/);
+test('a standalone shell can end its session scope and enter a fresh shell scope', async ({ page }) => {
+  await page.goto('/shell.html');
+  await expect.poll(async () => (await state(page))?.connected, { timeout: 20000 }).toBe(true);
+  await expect(page.getByRole('textbox', { name: 'Shell input' })).toBeEnabled({ timeout: 30000 });
+  const current = (await state(page)).session;
+  await page.evaluate(expected => window.os.endLoginSession(expected), current);
+  await expect.poll(async () => (await state(page)).session?.shutdown?.complete, { timeout: 20000 }).toBe(true);
+  await page.evaluate(expected => window.os.restartLoginSession(expected), current);
+  await page.getByRole('button', { name: 'Start shell', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'Shell input' })).toBeEnabled({ timeout: 30000 });
   await expect(page.locator('.terminal-screen')).toContainText(/[#$]\s*$/);
 });
 
 test('real Machine restart stops workloads and starts a new reaper and login generation in existing tabs', async ({ page }) => {
-  await signIn(page.request);
   await ready(page);
+  await switchLocalUser(page, 'root');
+  await expect.poll(async () => (await state(page)).session?.uid, { timeout: 15000 }).toBe(0);
   const before = await page.evaluate(() => window.os.machineInit()), session = (await state(page)).session;
   await run(page, 'running', "trap 'echo REBOOT-CLEAN; exit 0' HUP TERM; echo REBOOT-READY; while :; do sleep 1; done");
   await expect.poll(() => page.evaluate(() => window.running.output), { timeout: 15000 }).toContain('REBOOT-READY');
@@ -267,8 +273,8 @@ test('real Machine restart stops workloads and starts a new reaper and login gen
 test('session shutdown while an image loads cannot admit its delayed command into a replacement scope', async ({ page, context }) => {
   await ready(page);
   const original = (await state(page)).session;
-  const base = '/guest/lifecycle-loading-' + randomUUID();
-  await call(page.request, { mkdir: { path: base, mode: 0o700 } });
+  const base = '/tmp/lifecycle-loading-' + randomUUID();
+  await pageMkdirp(page, base, 0o700);
   let release, loading = false;
   const hold = new Promise(resolve => { release = resolve; });
   await context.route(executableAsset('dash'), async route => { loading = true; await hold; await route.continue(); });
@@ -281,12 +287,12 @@ test('session shutdown while an image loads cannot admit its delayed command int
     await page.evaluate(expected => window.os.restartLoginSession(expected), original);
     release();
     await expect.poll(() => page.evaluate(() => !!(window.delayed.result || window.delayed.error)), { timeout: 20000 }).toBe(true);
-    expect((await sys(page.request, [{ stat: { path: base + '/marker' } }]))[0].err?.errno).toBe('ENOENT');
+    expect(await pageErrno(page, { stat: { path: base + '/marker' } })).toBe('ENOENT');
     await context.unroute(executableAsset('dash'));
     await run(page, 'fresh', 'echo FRESH-ADMISSION');
     await expect.poll(() => page.evaluate(() => window.fresh.output), { timeout: 15000 }).toContain('FRESH-ADMISSION');
   } finally {
     release();
-    await rmrf(page.request, base);
+    await pageRmrf(page, base).catch(() => {});
   }
 });

@@ -70,6 +70,8 @@ pub struct LocalCred {
     pub umask: u16,
     pub remote: Option<RemoteCredRef>,
     pub cloud_access: bool,
+    /// Optional monotonic remote-scope cap (e.g. from `UnitSpec.grant.cloud_scope`).
+    pub allowed_remote_scope: Option<RemoteScope>,
 }
 
 impl LocalCred {
@@ -79,6 +81,7 @@ impl LocalCred {
             umask: umask & 0o777,
             remote: None,
             cloud_access: false,
+            allowed_remote_scope: None,
         }
     }
 
@@ -89,8 +92,38 @@ impl LocalCred {
             umask: umask & 0o777,
             remote: Some(remote),
             cloud_access,
+            allowed_remote_scope: None,
         }
     }
+}
+
+/// Monotonic intersection of two `RemoteScope` capability grants.
+pub fn intersect_remote_scope(a: &RemoteScope, b: &RemoteScope) -> RemoteScope {
+    RemoteScope {
+        cloud_fs: a.cloud_fs && b.cloud_fs,
+        devices: a
+            .devices
+            .iter()
+            .filter(|d| b.allows_device(d))
+            .cloned()
+            .collect(),
+        containers: a.containers && b.containers,
+        relay: a.relay && b.relay,
+    }
+}
+
+/// Exclusive wait owner assigned to a process at spawn/fork time so host reaping and PID 1
+/// service supervision never race for the same child's exit status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitOwner {
+    /// Owned by the browser/host executor (`reap_init_child`), with a short host-wait grace window
+    /// before PID 1 adopts abandoned zombies.
+    Host,
+    /// Owned by its non-PID-1 parent process via POSIX `waitpid`.
+    Parent,
+    /// Owned exclusively by PID 1 (forked directly via `fork(1)` as a supervised service, or an
+    /// already-zombified orphan adopted by active PID 1); NEVER reaped by `reap_init_child`.
+    InitService,
 }
 
 /// Unconsumed POSIX `waitpid` state change for a child process.
@@ -132,6 +165,7 @@ pub struct LocalProc {
     pub started_ticks: u64,
     pub ended: u64,
     pub bootstrap_eligible: bool,
+    pub wait_owner: WaitOwner,
     last_stop_seq: u64,
     reported_stop_seq: u64,
     last_cont_seq: u64,
@@ -270,6 +304,9 @@ pub struct ExitOutcome {
     pub pid: u32,
     pub ppid: u32,
     pub reaped: bool,
+    /// True iff this exiting process is owned by the host reaper (`WaitOwner::Host`) rather than
+    /// by its parent process (e.g. PID 1 supervising a forked service child).
+    pub host_reap: bool,
     pub signals: Vec<SignalDelivery>,
     /// Remote service tokens whose last live local holder just exited; host MUST revoke via `ServiceAuth v2`.
     pub revoked_tokens: Vec<String>,
@@ -315,6 +352,7 @@ pub struct LocalProcessTable {
     next_pid: u32,
     next_signal_seq: u64,
     procs: BTreeMap<u32, LocalProc>,
+    host_wait_grace_until_ms: BTreeMap<u32, u64>,
     cgroups: CgroupTable,
     closed_scopes: BTreeSet<String>,
 }
@@ -359,6 +397,7 @@ impl LocalProcessTable {
             next_pid: 2,
             next_signal_seq: 0,
             procs: BTreeMap::new(),
+            host_wait_grace_until_ms: BTreeMap::new(),
             cgroups: CgroupTable::new(),
             closed_scopes: BTreeSet::new(),
         }
@@ -585,6 +624,7 @@ impl LocalProcessTable {
             started_ticks,
             ended: 0,
             bootstrap_eligible: false,
+            wait_owner: WaitOwner::Host,
             last_stop_seq: 0,
             reported_stop_seq: 0,
             last_cont_seq: 0,
@@ -660,6 +700,11 @@ impl LocalProcessTable {
             started_ticks,
             ended: 0,
             bootstrap_eligible: ppid == 1 && spec.pgid.is_none() && spec.sid.is_none(),
+            wait_owner: if ppid == 1 {
+                WaitOwner::Host
+            } else {
+                WaitOwner::Parent
+            },
             last_stop_seq: 0,
             reported_stop_seq: 0,
             last_cont_seq: 0,
@@ -813,6 +858,11 @@ impl LocalProcessTable {
             started_ticks,
             ended: 0,
             bootstrap_eligible: false,
+            wait_owner: if parent_pid == 1 {
+                WaitOwner::InitService
+            } else {
+                WaitOwner::Parent
+            },
             last_stop_seq: 0,
             reported_stop_seq: 0,
             last_cont_seq: 0,
@@ -861,6 +911,7 @@ impl LocalProcessTable {
             if cur.state == ProcState::Zombie {
                 if cur_pid == pid {
                     outcome.ppid = cur.ppid;
+                    outcome.host_reap = cur.wait_owner == WaitOwner::Host;
                 }
                 continue;
             }
@@ -869,6 +920,7 @@ impl LocalProcessTable {
             let cur_sid = cur.sid;
             if cur_pid == pid {
                 outcome.ppid = cur_ppid;
+                outcome.host_reap = cur.wait_owner == WaitOwner::Host;
             } else {
                 outcome.killed_pids.push(cur_pid);
             }
@@ -909,10 +961,25 @@ impl LocalProcessTable {
 
             // 1. Reparent any children of `cur_pid` to the nearest living subreaper ancestor, else PID 1.
             let new_parent = self.nearest_reaper(cur_ppid);
+            let init_is_active = self
+                .procs
+                .get(&1)
+                .is_some_and(|p| p.owner_host != "boot" && p.state != ProcState::Zombie);
             let mut reparented_zombie = false;
             for cpid in child_pids {
                 if let Some(child) = self.procs.get_mut(&cpid) {
                     child.ppid = new_parent;
+                    if new_parent == 1 {
+                        // Already-zombified orphans have no pending host `wait()` and belong
+                        // immediately to active PID 1 (`InitService`); running orphans adopted by
+                        // PID 1 become `Host`-reapable (with grace fallback to PID 1 on exit) so
+                        // both immediate host `wait()` and PID 1 orphan reaping work cleanly.
+                        child.wait_owner = if child.state == ProcState::Zombie && init_is_active {
+                            WaitOwner::InitService
+                        } else {
+                            WaitOwner::Host
+                        };
+                    }
                     if child.state == ProcState::Zombie {
                         reparented_zombie = true;
                     }
@@ -1082,6 +1149,66 @@ impl LocalProcessTable {
         selector: i32,
         options: u32,
     ) -> Result<WaitOutcome, Error> {
+        self.waitpid_excluding(caller_host, caller_pid, selector, options, |_| false)
+    }
+
+    /// Record a host-wait grace deadline (milliseconds) for a newly exited `WaitOwner::Host`
+    /// zombie so PID 1 wildcard `waitpid(-1)` does not steal it mid-flight before `reap_init_child`,
+    /// while still reaping it automatically after the grace window if the host abandons it.
+    pub fn set_host_wait_grace(&mut self, pid: u32, until_ms: u64) {
+        self.host_wait_grace_until_ms.insert(pid, until_ms);
+    }
+
+    /// POSIX `waitpid(selector, options)` with millisecond grace awareness for PID 1 wildcard
+    /// reaping of abandoned `WaitOwner::Host` zombies.
+    pub fn waitpid_at_ms(
+        &mut self,
+        caller_host: &str,
+        caller_pid: u32,
+        selector: i32,
+        options: u32,
+        now_ms: u64,
+    ) -> Result<WaitOutcome, Error> {
+        self.waitpid_inner(
+            caller_host,
+            caller_pid,
+            selector,
+            options,
+            Some(now_ms),
+            |_| false,
+        )
+    }
+
+    /// POSIX `waitpid(selector, options)` with an optional filter that defers reaping selected
+    /// zombie PIDs (used so wildcard PID 1 reaping does not steal a host-waited child mid-flight
+    /// between `exit(pid)` and `reap_init_child(pid)`).
+    pub fn waitpid_excluding(
+        &mut self,
+        caller_host: &str,
+        caller_pid: u32,
+        selector: i32,
+        options: u32,
+        skip_zombie: impl FnMut(u32) -> bool,
+    ) -> Result<WaitOutcome, Error> {
+        self.waitpid_inner(
+            caller_host,
+            caller_pid,
+            selector,
+            options,
+            None,
+            skip_zombie,
+        )
+    }
+
+    fn waitpid_inner(
+        &mut self,
+        caller_host: &str,
+        caller_pid: u32,
+        selector: i32,
+        options: u32,
+        reap_expired_host_at_ms: Option<u64>,
+        mut skip_zombie: impl FnMut(u32) -> bool,
+    ) -> Result<WaitOutcome, Error> {
         if options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
             return Err(Errno::EINVAL.into());
         }
@@ -1090,7 +1217,18 @@ impl LocalProcessTable {
             .procs
             .values()
             .filter(|p| {
+                let host_excluded = caller_pid == 1
+                    && selector == -1
+                    && p.wait_owner == WaitOwner::Host
+                    && !reap_expired_host_at_ms.is_some_and(|now_ms| {
+                        p.state == ProcState::Zombie
+                            && self
+                                .host_wait_grace_until_ms
+                                .get(&p.pid)
+                                .is_none_or(|&until| now_ms >= until)
+                    });
                 p.ppid == caller_pid
+                    && !host_excluded
                     && match selector {
                         s if s > 0 => p.pid == s as u32,
                         0 => p.pgid == caller_pgid,
@@ -1104,10 +1242,14 @@ impl LocalProcessTable {
             return Err(Errno::ECHILD.into());
         }
         for cpid in &matching {
+            if skip_zombie(*cpid) {
+                continue;
+            }
             if let Some(child) = self.procs.get(cpid)
                 && child.state == ProcState::Zombie
             {
                 let reaped = self.procs.remove(cpid).unwrap();
+                self.host_wait_grace_until_ms.remove(cpid);
                 let proc_cgroups: Vec<String> =
                     self.procs.values().map(|p| p.cgroup.clone()).collect();
                 self.cgroups
@@ -1140,7 +1282,8 @@ impl LocalProcessTable {
         Ok(WaitOutcome::Pending)
     }
 
-    /// Host reap for direct PID 1 children (`EPERM` if non-owner, `ECHILD` if `ppid != 1`).
+    /// Host reap for direct PID 1 children (`EPERM` if non-owner, `ECHILD` if `ppid != 1` or
+    /// owned by its parent process rather than the host executor).
     pub fn reap_init_child(
         &mut self,
         caller_host: &str,
@@ -1148,7 +1291,7 @@ impl LocalProcessTable {
         pid: u32,
     ) -> Result<Proc, Error> {
         let target = self.procs.get(&pid).ok_or(Errno::ECHILD)?;
-        if target.ppid != 1 {
+        if target.ppid != 1 || target.wait_owner != WaitOwner::Host {
             return Err(Errno::ECHILD.into());
         }
         if target.owner_host != caller_host
@@ -1160,6 +1303,7 @@ impl LocalProcessTable {
             return Err(Errno::EAGAIN.into());
         }
         let reaped = self.procs.remove(&pid).unwrap();
+        self.host_wait_grace_until_ms.remove(&pid);
         let proc_cgroups: Vec<String> = self.procs.values().map(|p| p.cgroup.clone()).collect();
         self.cgroups
             .prune_retired(|root| proc_cgroups.iter().any(|cg| in_subtree(cg, root)));
@@ -1618,6 +1762,65 @@ impl LocalProcessTable {
         }
     }
 
+    /// Detach PID 1's active host (e.g. `machine_init_leave`), resetting PID 1 to placeholder
+    /// `"boot"` owner so newly orphaned processes fall back to host reaping rather than leaking.
+    pub fn detach_init_host(&mut self) {
+        if let Some(init) = self.procs.get_mut(&1) {
+            init.owner_host = "boot".into();
+        }
+    }
+
+    /// Monotonically cap a process's permitted remote scope (e.g., from `UnitSpec.grant.cloud_scope`).
+    /// Never widens an existing cap; attenuates `cloud_access` and revokes any ambient remote cred
+    /// that exceeds the new cap.
+    pub fn set_remote_scope_cap(
+        &mut self,
+        caller_host: &str,
+        pid: u32,
+        scope: RemoteScope,
+    ) -> Result<Vec<String>, Error> {
+        let dropped_token = {
+            let proc = self.procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
+            if proc.owner_host != caller_host || proc.state == ProcState::Zombie {
+                return Err(Errno::ESRCH.into());
+            }
+            let effective = match &proc.cred.allowed_remote_scope {
+                Some(existing) => intersect_remote_scope(existing, &scope),
+                None => scope,
+            };
+            let old_token = proc.cred.remote.as_ref().map(|r| r.token.clone());
+            proc.cred.cloud_access &= effective.cloud_fs;
+            let clear_remote = match &proc.cred.remote {
+                Some(rem) => {
+                    (rem.cloud_access && !effective.cloud_fs)
+                        || (rem.scope.cloud_fs && !effective.cloud_fs)
+                        || (rem.scope.containers && !effective.containers)
+                        || (rem.scope.relay && !effective.relay)
+                        || rem
+                            .scope
+                            .devices
+                            .iter()
+                            .any(|d| !effective.allows_device(d))
+                }
+                None => false,
+            };
+            if clear_remote || effective.is_empty() {
+                proc.cred.remote = None;
+            }
+            proc.cred.allowed_remote_scope = Some(effective);
+            old_token.filter(|old| {
+                proc.cred.remote.as_ref().map(|r| r.token.as_str()) != Some(old.as_str())
+            })
+        };
+        let mut revoked = Vec::new();
+        if let Some(tok) = dropped_token
+            && !self.token_has_live_holder(&tok)
+        {
+            revoked.push(tok);
+        }
+        Ok(revoked)
+    }
+
     /// Local credential update (Contract §2.4): non-root callers cannot alter local UID/GID/groups;
     /// privilege drop clears ambient `remote` unless `explicit_remote` is passed with
     /// `rem.cloud_access <= prev_cloud_access`. Returns any remote token whose last live local
@@ -1628,6 +1831,30 @@ impl LocalProcessTable {
         pid: u32,
         identity: Identity,
         explicit_remote: Option<RemoteCredRef>,
+    ) -> Result<Vec<String>, Error> {
+        self.set_cred_inner(caller_host, pid, identity, explicit_remote, false)
+    }
+
+    /// Kernel-authenticated credential transition used exclusively AFTER `LocalAccountStore`
+    /// verifies `/etc/shadow` or `/etc/sudoers` (`Call::Login`, `Call::Sudo`). Still strictly
+    /// enforces monotonic `cloud_access` and clears/revokes dropped remote credentials.
+    pub fn set_authenticated_cred(
+        &mut self,
+        caller_host: &str,
+        pid: u32,
+        identity: Identity,
+        explicit_remote: Option<RemoteCredRef>,
+    ) -> Result<Vec<String>, Error> {
+        self.set_cred_inner(caller_host, pid, identity, explicit_remote, true)
+    }
+
+    fn set_cred_inner(
+        &mut self,
+        caller_host: &str,
+        pid: u32,
+        identity: Identity,
+        explicit_remote: Option<RemoteCredRef>,
+        authenticated: bool,
     ) -> Result<Vec<String>, Error> {
         let dropped_token = {
             let proc = self.procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
@@ -1646,8 +1873,9 @@ impl LocalProcessTable {
                 || identity.group != prev_gid
                 || identity.groups != prev_groups;
 
-            // Non-root processes can NEVER change local UID, GID, or supplementary groups.
-            if identity_changed && prev_uid != 0 {
+            // Non-root processes can NEVER change local UID, GID, or supplementary groups
+            // without kernel authentication (`Call::Login` / `Call::Sudo`).
+            if !authenticated && identity_changed && prev_uid != 0 {
                 return Err(Errno::EPERM.into());
             }
             // Monotonic cloud_access: explicit_remote can never re-enable cloud_access on a
@@ -2808,6 +3036,135 @@ mod tests {
         assert_ne!(
             c.pid, old_leader_pid,
             "alloc_pid must not reuse a PID still referenced by a live pgid/sid"
+        );
+    }
+
+    #[test]
+    fn codex_18_single_wait_owner_prevents_host_and_pid1_reap_races() {
+        let mut t = table_with_init();
+        t.boot_init("host-init", 100).unwrap();
+        let ann = id(1000);
+
+        // 1. PID 1 forks a supervised service (then drops its uid to 1000): WaitOwner::InitService!
+        let svc = t.fork("host-init", 1, false, 101).unwrap();
+        assert_eq!(svc.wait_owner, WaitOwner::InitService);
+        t.set_cred("host-init", svc.pid, ann.clone(), None).unwrap();
+
+        // 2. Host spawns an interactive command: WaitOwner::Host!
+        let host_cmd = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/echo",
+                    LocalCred::local_only(ann.clone(), 0o022),
+                    "host-init",
+                ),
+                102,
+            )
+            .unwrap();
+        assert_eq!(host_cmd.wait_owner, WaitOwner::Host);
+
+        // Both exit.
+        let svc_out = t.exit("host-init", svc.pid, 42, None, 103).unwrap();
+        assert!(
+            !svc_out.host_reap,
+            "PID 1 forked service must NOT be host-reaped"
+        );
+        let cmd_out = t.exit("host-init", host_cmd.pid, 0, None, 104).unwrap();
+        assert!(
+            cmd_out.host_reap,
+            "host-spawned command MUST be host-reaped"
+        );
+
+        // Host executor attempting `reap_init_child` on PID 1's service MUST fail ECHILD!
+        assert_eq!(
+            t.reap_init_child("host-init", &ann, svc.pid)
+                .unwrap_err()
+                .errno,
+            Errno::ECHILD
+        );
+
+        // PID 1 wildcard `waitpid(-1)` reaps its service (`svc.pid`) and NEVER steals `host_cmd.pid`!
+        let WaitOutcome::Reaped(reaped_svc) = t.waitpid("host-init", 1, -1, WNOHANG).unwrap()
+        else {
+            panic!("PID 1 must reap its own supervised service");
+        };
+        assert_eq!(reaped_svc.pid, svc.pid);
+        assert_eq!((reaped_svc.status >> 8) & 0xff, 42);
+        // Second wildcard waitpid(-1) sees ECHILD (host_cmd is Host-owned, not stolen by PID 1!).
+        assert_eq!(
+            t.waitpid("host-init", 1, -1, WNOHANG).unwrap_err().errno,
+            Errno::ECHILD
+        );
+
+        // Host reaps `host_cmd` cleanly!
+        let reaped_cmd = t.reap_init_child("host-init", &ann, host_cmd.pid).unwrap();
+        assert_eq!(reaped_cmd.pid, host_cmd.pid);
+
+        // 3. Abandoned host child: protected during grace window, then reaped by PID 1 after grace!
+        let orphan_cmd = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/true",
+                    LocalCred::local_only(ann.clone(), 0o022),
+                    "host-init",
+                ),
+                105,
+            )
+            .unwrap();
+        let o_out = t.exit("host-init", orphan_cmd.pid, 0, None, 106).unwrap();
+        assert!(o_out.host_reap);
+        t.set_host_wait_grace(orphan_cmd.pid, 1350);
+        assert_eq!(
+            t.waitpid_at_ms("host-init", 1, -1, WNOHANG, 1200)
+                .unwrap_err()
+                .errno,
+            Errno::ECHILD
+        );
+        let WaitOutcome::Reaped(reaped_orphan) =
+            t.waitpid_at_ms("host-init", 1, -1, WNOHANG, 1350).unwrap()
+        else {
+            panic!("PID 1 must reap abandoned host zombie once grace expires");
+        };
+        assert_eq!(reaped_orphan.pid, orphan_cmd.pid);
+    }
+
+    #[test]
+    fn codex_19_remote_scope_cap_attenuates_monotonically_and_revokes_excess_cred() {
+        let mut t = table_with_init();
+        t.boot_init("host-a", 100).unwrap();
+        let ann = id(1000);
+        let p = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/svc",
+                    LocalCred::with_remote(ann, 0o022, remote("tok-full", 1000, true)),
+                    "host-a",
+                ),
+                101,
+            )
+            .unwrap();
+        // Restrict to empty cloud scope -> clears cloud_access & revokes token!
+        let revoked = t
+            .set_remote_scope_cap("host-a", p.pid, RemoteScope::default())
+            .unwrap();
+        assert_eq!(revoked, vec!["tok-full".to_string()]);
+        let after = t.proc(p.pid).unwrap();
+        assert!(!after.cred.cloud_access);
+        assert!(after.cred.remote.is_none());
+        assert!(after.cred.allowed_remote_scope.as_ref().unwrap().is_empty());
+
+        // Attempting to widen back to full stays capped at empty!
+        let _ = t
+            .set_remote_scope_cap("host-a", p.pid, RemoteScope::full())
+            .unwrap();
+        assert!(
+            t.proc(p.pid)
+                .unwrap()
+                .cred
+                .allowed_remote_scope
+                .as_ref()
+                .unwrap()
+                .is_empty()
         );
     }
 }

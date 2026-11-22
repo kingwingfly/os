@@ -1,4 +1,9 @@
 //! User-space service policy. Unit metadata conveys no account or resource authority.
+pub mod control;
+pub mod graph;
+pub mod manager;
+pub mod unit;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 

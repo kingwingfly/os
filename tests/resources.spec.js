@@ -1,9 +1,13 @@
 import { test, expect } from './test.js';
-import { call, put, rmrf } from './sys.js';
+import { readFile } from 'node:fs/promises';
+import { api, put, rmrf } from './sys.js';
+import { pagePut, pageRmrf } from './ui.js';
 import { connectKernel, hookPageKernel } from './service-auth.js';
 import binaryen from 'binaryen';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
+const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const CLOUD_SCOPE = { cloud_fs: true, devices: [], containers: false, relay: false };
 const PAGE = 65536;
 const image = { path: '/usr/bin/sleep', argv: ['sleep', '60'], cwd: '/', env: [], runtime: 'resources-v1' };
 
@@ -125,13 +129,10 @@ test('parallel reservations share one budget and legacy hosts cannot claim enfor
 
 test('memoryless spawn does not copy the parent charge and a small service fits its own memory limit', async ({ page }) => {
   test.setTimeout(180000);
-  const r = page.request;
-  await call(r, 'getcreds');
   const kernel = await freshKernel(page);
   const path = await group(kernel);
   let parent, child;
-  const file = await wasm(r, `(module ${output} (memory (export "memory") 1) (data (i32.const 100) "UNIT_OK") (func (export "_start") ${say}))`);
-  const config = file + '.json';
+  let file, config;
   try {
     await set(kernel, path, 'memory.max', PAGE);
     parent = await launch(kernel, path);
@@ -146,29 +147,28 @@ test('memoryless spawn does not copy the parent charge and a small service fits 
     await remove(kernel, path);
     await kernel.terminate();
 
-    expect((await put(r, '/api/file?path=' + config, {
-      data: JSON.stringify({ version: 1, units: [{ name: 'small', argv: [file], limits: { memory: PAGE } }] }),
-    })).ok()).toBe(true);
     const pageKernel = await hookPageKernel(page);
     await page.goto('/?recovery=1');
     await page.waitForFunction(() => !!window.os?.exec);
     await pageKernel.ready();
-    await pageKernel.value('sync_account_from_server');
+    file = await wasm(page, `(module ${output} (memory (export "memory") 1) (data (i32.const 100) "UNIT_OK") (func (export "_start") ${say}))`);
+    config = file + '.json';
+    await pagePut(page, config, JSON.stringify({ version: 1, units: [{ name: 'small', argv: [file], limits: { memory: PAGE } }] }));
     const answer = await page.evaluate(cfg => window.os.exec([{ path: '/usr/bin/supervise', argv: ['supervise', cfg] }], { stdin: '' }), config);
     expect(answer.status, answer.stderr).toBe(0);
     expect(answer.stdout).toContain('UNIT_OK');
   } finally {
-    await rmrf(r, file);
-    await rmrf(r, config);
+    if (file) await pageRmrf(page, file).catch(() => {});
+    if (config) await pageRmrf(page, config).catch(() => {});
   }
 });
 
 test('storage I/O is paced across inline and ranged reads and denied writes never commit', async ({ page }) => {
   test.setTimeout(120000);
   const r = page.request;
-  await call(r, 'getcreds');
+  expect((await api(r, 'login', { headers: { Origin: origin, 'CF-Connecting-IP': 'res-io-' + crypto.randomUUID() }, data: { username: 'root', password: rootPassword } })).ok()).toBe(true);
   const kernel = await freshKernel(page);
-  await kernel.value('sync_account_from_server');
+  await kernel.value('cloud_sign_in', { cloudUser: 'root', cloudUid: 0, cloudGid: 0, cloudGroups: [0], scope: CLOUD_SCOPE });
   const instanceId = await kernel.value('instance_id');
   const path = await group(kernel);
   const file = '/guest/io-' + crypto.randomUUID();
@@ -293,23 +293,22 @@ test('storage I/O is paced across inline and ranged reads and denied writes neve
   }
 });
 
-async function wasm(r, wat) {
-  const path = '/guest/memory-' + crypto.randomUUID(), module = binaryen.parseText(wat);
-  try { expect((await put(r, '/api/file?path=' + path, { data: Buffer.from(module.emitBinary()) })).ok()).toBe(true); }
+async function wasm(page, wat) {
+  const path = '/tmp/memory-' + crypto.randomUUID(), module = binaryen.parseText(wat);
+  let bin;
+  try { bin = Buffer.from(module.emitBinary()); }
   finally { module.dispose(); }
-  await call(r, { chmod: { path, mode: 0o755 } });
+  await pagePut(page, path, bin, { mode: 0o755 });
   return path;
 }
 const output = `(import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))`;
 const say = `(i32.store (i32.const 0) (i32.const 100)) (i32.store (i32.const 4) (i32.const 7)) (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))`;
 
 async function bootRecovery(page) {
-  await call(page.request, 'getcreds');
   const pageKernel = await hookPageKernel(page);
   await page.goto('/?recovery=1');
   await page.waitForFunction(() => !!window.os?.exec);
   await pageKernel.ready();
-  await pageKernel.value('sync_account_from_server');
   return pageKernel;
 }
 
@@ -326,10 +325,9 @@ async function execute(page, path, cgroup) {
 
 test('unchanged WASM memory.grow fails at its cgroup ceiling and initial allocation is admitted first', async ({ page }) => {
   test.setTimeout(180000);
-  const r = page.request;
   const pageKernel = await bootRecovery(page);
   const path = await group(pageKernel);
-  const file = await wasm(r, `(module ${output} (memory (export "memory") 1 10) (data (i32.const 100) "GROW_OK")
+  const file = await wasm(page, `(module ${output} (memory (export "memory") 1 10) (data (i32.const 100) "GROW_OK")
     (func (export "_start")
       (if (i32.ne (memory.grow (i32.const 1)) (i32.const 1)) (then unreachable))
       (if (i32.ne (memory.grow (i32.const 1)) (i32.const -1)) (then unreachable)) ${say}))`);
@@ -347,16 +345,15 @@ test('unchanged WASM memory.grow fails at its cgroup ceiling and initial allocat
     await expect.poll(async () => (await stat(pageKernel, path))['memory.current']).toBe(0);
   } finally {
     await remove(pageKernel, path);
-    await rmrf(r, file);
+    await pageRmrf(page, file).catch(() => {});
   }
 });
 
 test('fork reserves scratch and copied linear memories before starting the child', async ({ page }) => {
   test.setTimeout(180000);
-  const r = page.request;
   const pageKernel = await bootRecovery(page);
   const path = await group(pageKernel);
-  const file = await wasm(r, `(module ${output}
+  const file = await wasm(page, `(module ${output}
     (import "wasix_32v1" "proc_fork" (func $fork (param i32 i32) (result i32)))
     (memory (export "memory") 1) (data (i32.const 100) "FORK_OK")
     (func (export "_start")
@@ -369,15 +366,14 @@ test('fork reserves scratch and copied linear memories before starting the child
     await expect.poll(async () => (await stat(pageKernel, path))['memory.current']).toBe(0);
   } finally {
     await remove(pageKernel, path);
-    await rmrf(r, file);
+    await pageRmrf(page, file).catch(() => {});
   }
 });
 
 test('a child killed during its first memory reservation is reaped without a startup diagnostic', async ({ page }) => {
-  const r = page.request;
   const pageKernel = await bootRecovery(page);
   const path = await group(pageKernel);
-  const file = await wasm(r, `(module ${output}
+  const file = await wasm(page, `(module ${output}
     (import "wasix_32v1" "proc_fork" (func $fork (param i32 i32) (result i32)))
     (import "wasix_32v1" "proc_signal" (func $kill (param i32 i32) (result i32)))
     (import "wasix_32v1" "proc_join" (func $join (param i32 i32 i32) (result i32)))
@@ -414,18 +410,17 @@ test('a child killed during its first memory reservation is reaped without a sta
     await expect.poll(async () => (await stat(pageKernel, path))['memory.current']).toBe(0);
   } finally {
     await remove(pageKernel, path);
-    await rmrf(r, file);
+    await pageRmrf(page, file).catch(() => {});
   }
 });
 
 test('guest syscalls cannot forge runtime accounting or import its private callbacks', async ({ page }) => {
   test.setTimeout(180000);
-  const r = page.request;
   const pageKernel = await bootRecovery(page);
   const path = await group(pageKernel);
   const request = JSON.stringify([{ resource: { memory: 0 } }]);
   const data = Buffer.from(request).toString('hex').match(/../g).map(b => '\\' + b).join('');
-  const file = await wasm(r, `(module ${output}
+  const file = await wasm(page, `(module ${output}
     (import "os" "sys" (func $sys (param i32 i32) (result i32)))
     (import "os" "reply" (func $reply (param i32)))
     (memory (export "memory") 1) (data (i32.const 100) "${data}")
@@ -435,7 +430,7 @@ test('guest syscalls cannot forge runtime accounting or import its private callb
       (if (i32.ne (memory.grow (i32.const 1)) (i32.const -1)) (then unreachable))
       (i32.store (i32.const 0) (i32.const 500)) (i32.store (i32.const 4) (local.get $n))
       (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))`);
-  const forged = await wasm(r, `(module (import "os_runtime" "memory_grow_pre" (func (param i32 i32) (result i32))) (memory (export "memory") 1) (func (export "_start")))`);
+  const forged = await wasm(page, `(module (import "os_runtime" "memory_grow_pre" (func (param i32 i32) (result i32))) (memory (export "memory") 1) (func (export "_start")))`);
   try {
     await set(pageKernel, path, 'memory.max', PAGE);
     const answer = await execute(page, file, path);
@@ -444,7 +439,7 @@ test('guest syscalls cannot forge runtime accounting or import its private callb
     await expect(execute(page, forged, path)).rejects.toThrow(/unknown import/);
   } finally {
     await remove(pageKernel, path);
-    await rmrf(r, file);
-    await rmrf(r, forged);
+    await pageRmrf(page, file).catch(() => {});
+    await pageRmrf(page, forged).catch(() => {});
   }
 });

@@ -148,6 +148,16 @@ impl TerminalCommand for Asking {
                 }
                 return shell.bin(stage, stdin, piped, true).await;
             }
+            // Browser-shell account switch (`sudo -u USER`) and timestamp revoke (`sudo -k`) go
+            // through `manage`; all other `sudo` flags (`sudo -n`, `sudo -l`, `sudo -u USER CMD`)
+            // run the real local `/usr/bin/sudo` WASI applet directly.
+            let is_shell_manage = matches!(
+                args.get(1).map(String::as_str),
+                None | Some("-k") | Some("-u") if args.len() <= 3
+            );
+            if !is_shell_manage {
+                return shell.bin((None, args), stdin, piped, false).await;
+            }
             shell.manage(&args, piped).await
         }
         .boxed_local()

@@ -1,3 +1,4 @@
+pub mod cloud_panel;
 mod console;
 mod desktop;
 mod files;
@@ -71,6 +72,14 @@ extern "C" {
     fn completion_focus(value: &str, cursor: u32);
     #[wasm_bindgen(js_namespace = os, js_name = completionCursor)]
     fn completion_cursor() -> u32;
+    #[wasm_bindgen(js_namespace = os, js_name = bootStatus)]
+    fn boot_status() -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = os, js_name = cloudStatus)]
+    fn cloud_status() -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = os, js_name = cloudSignIn)]
+    fn cloud_sign_in(username: &str, password: &str, scope: &JsValue) -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = os, js_name = cloudSignOut)]
+    fn cloud_sign_out() -> js_sys::Promise;
     /// exec(2) of programs of /usr/bin, a pipeline of processes (web/wasi/exec.mjs), each
     /// stage an argv: the last's exit status, and what it wrote if not to the terminal.
     #[wasm_bindgen(js_namespace = os)]
@@ -340,10 +349,60 @@ fn App() -> impl IntoView {
     let desktop = desktop::Desktop::new();
     let launcher = RwSignal::new(false);
     let account = Account {
-        writable: RwSignal::new(false),
-        username: RwSignal::new("guest".into()),
-        home: RwSignal::new("/".into()),
+        writable: RwSignal::new(true),
+        username: RwSignal::new("user".into()),
+        home: RwSignal::new("/home/user".into()),
     };
+    let local_identity = RwSignal::new(cloud_panel::LocalIdentityInfo::default());
+    let cloud_auth = RwSignal::new(cloud_panel::CloudAuthState::default());
+    Effect::new(move || {
+        let user = account.username.get();
+        let home = account.home.get();
+        local_identity.update(|info| {
+            info.username = user;
+            info.home = home;
+        });
+    });
+    spawn_local(async move {
+        if let Ok(val) = wasm_bindgen_futures::JsFuture::from(boot_status()).await
+            && let Ok(parsed) = serde_wasm_bindgen::from_value::<serde_json::Value>(val)
+        {
+            local_identity.update(|info| {
+                if let Some(acc) = parsed.get("account") {
+                    if let Some(u) = acc.get("user").and_then(|v| v.as_str()) {
+                        info.username = u.to_owned();
+                    }
+                    if let Some(uid) = acc.get("uid").and_then(|v| v.as_u64()) {
+                        info.uid = uid as u32;
+                    }
+                    if let Some(gid) = acc.get("gid").and_then(|v| v.as_u64()) {
+                        info.gid = gid as u32;
+                    }
+                    if let Some(h) = acc.get("home").and_then(|v| v.as_str()) {
+                        info.home = h.to_owned();
+                    }
+                }
+                if let Some(root) = parsed.get("mounted_root") {
+                    if let Some(uuid) = root.get("volume_uuid").and_then(|v| v.as_str()) {
+                        info.root_volume_uuid = Some(uuid.to_owned());
+                    }
+                    info.forked_from = root
+                        .get("forked_from")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
+                    info.ephemeral_if_unmodified = root
+                        .get("ephemeral_if_unmodified")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                }
+            });
+        }
+        if let Ok(val) = wasm_bindgen_futures::JsFuture::from(cloud_status()).await
+            && let Ok(parsed) = serde_wasm_bindgen::from_value::<serde_json::Value>(val)
+        {
+            apply_cloud_status_json(cloud_auth, &parsed, None);
+        }
+    });
     // Tabs opened later are owned by the app, as the first ones are.
     let owner = StoredValue::new(Owner::current().expect("the app's owner"));
     let next_id = StoredValue::new(0u64);
@@ -359,7 +418,7 @@ fn App() -> impl IntoView {
         .into_iter()
         .map(|(cwd, history)| make(cwd, history))
         .collect();
-    first[0].log("Connected as guest. Access follows account and rwx permissions.\nEnter help or open a file.");
+    first[0].log("Local OS ready (user). Cloud: Signed out.\nEnter help or open a file.");
     let active = RwSignal::new(first[saved_active].id);
     let tabs = RwSignal::new(first);
     TABS.with(|t| *t.borrow_mut() = Some((tabs, active)));
@@ -632,14 +691,98 @@ fn App() -> impl IntoView {
         .add_event_listener_with_callback("os-open-directory", browse.as_ref().unchecked_ref())
         .unwrap();
     browse.forget();
+    let cloud_changed =
+        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
+            if let Ok(parsed) = serde_wasm_bindgen::from_value::<serde_json::Value>(e.detail()) {
+                apply_cloud_status_json(cloud_auth, &parsed, None);
+            }
+            sys::forget(false);
+            files.refresh();
+        });
+    window
+        .add_event_listener_with_callback(
+            "os:cloud-changed",
+            cloud_changed.as_ref().unchecked_ref(),
+        )
+        .unwrap();
+    cloud_changed.forget();
+    let on_cloud_sign_in = Callback::new(move |req: cloud_panel::CloudSignInRequest| {
+        cloud_auth.update(|c| {
+            c.busy = true;
+            c.error = None;
+            c.notice = None;
+        });
+        spawn_local(async move {
+            let scope_js = serde_wasm_bindgen::to_value(&req.scope).unwrap_or(JsValue::NULL);
+            match wasm_bindgen_futures::JsFuture::from(cloud_sign_in(
+                &req.username,
+                &req.password,
+                &scope_js,
+            ))
+            .await
+            {
+                Ok(val) => {
+                    let parsed = serde_wasm_bindgen::from_value::<serde_json::Value>(val)
+                        .unwrap_or_default();
+                    apply_cloud_status_json(
+                        cloud_auth,
+                        &parsed,
+                        Some("Cloud credentials active; local OS account unchanged.".into()),
+                    );
+                }
+                Err(err) => {
+                    cloud_auth.update(|c| {
+                        c.busy = false;
+                        c.error = Some(shell::js_message(err));
+                    });
+                }
+            }
+        });
+    });
+    let on_cloud_sign_out = Callback::new(move |()| {
+        cloud_auth.update(|c| {
+            c.busy = true;
+            c.error = None;
+            c.notice = None;
+        });
+        spawn_local(async move {
+            match wasm_bindgen_futures::JsFuture::from(cloud_sign_out()).await {
+                Ok(val) => {
+                    let parsed = serde_wasm_bindgen::from_value::<serde_json::Value>(val)
+                        .unwrap_or_default();
+                    apply_cloud_status_json(
+                        cloud_auth,
+                        &parsed,
+                        Some("Signed out of Cloud; local processes unaffected.".into()),
+                    );
+                }
+                Err(err) => {
+                    cloud_auth.update(|c| {
+                        c.busy = false;
+                        c.error = Some(shell::js_message(err));
+                    });
+                }
+            }
+        });
+    });
+    let on_switch_local_user = Callback::new(move |()| {
+        desktop.show("terminal");
+        current.get_untracked().run("su".into());
+    });
+    let on_open_boot_profile = Callback::new(move |()| {
+        let _ = local_mounts();
+    });
     view! {
         <main class="desktop">
             <header class="topbar"><div class="wordmark"><span class="signal"></span>{title}<span class="subtitle">{subtitle}</span></div>
-                <button class="lock" on:click=move |_| current.get_untracked().run(if account.writable.get_untracked() { "logout".into() } else { "login".into() })>
-                    // Kept to one line: a long name shortens, the action stays.
-                    <span class="lock-name">{move || if account.writable.get() { format!("● {}", account.username.get()) } else { "○ guest".into() }}</span>
-                    <span class="lock-action">{move || if account.writable.get() { " · Sign out" } else { " · Sign in" }}</span>
-                </button>
+                <cloud_panel::CloudSignInPanel
+                    local=local_identity.into()
+                    cloud=cloud_auth.into()
+                    on_sign_in=on_cloud_sign_in
+                    on_sign_out=on_cloud_sign_out
+                    on_switch_local_user=on_switch_local_user
+                    on_open_boot_profile=on_open_boot_profile
+                />
             </header>
             <div class="desktop-area">
             // The wallpaper: what the site says of itself.
@@ -716,6 +859,38 @@ fn App() -> impl IntoView {
         </main>
     }
 }
+fn apply_cloud_status_json(
+    signal: RwSignal<cloud_panel::CloudAuthState>,
+    parsed: &serde_json::Value,
+    notice: Option<String>,
+) {
+    let signed_in = parsed
+        .get("signed_in")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let cloud_user = parsed
+        .get("cloud_user")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let cloud_mount_active = parsed
+        .get("cloud_mounted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let scope = parsed
+        .get("scope")
+        .and_then(|v| serde_json::from_value::<abi::auth_v2::RemoteScope>(v.clone()).ok())
+        .unwrap_or_default();
+    signal.set(cloud_panel::CloudAuthState {
+        signed_in,
+        cloud_user,
+        scope,
+        cloud_mount_active,
+        busy: false,
+        error: None,
+        notice,
+    });
+}
+
 #[wasm_bindgen(start)]
 pub fn start() {
     console_error_panic_hook::set_once();

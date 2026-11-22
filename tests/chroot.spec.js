@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { api, call, mkdirp, program, put, rmrf } from './sys.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const userPassword = 'chroot-spec-password-7391';
 const fileUrl = path => '/api/file?path=' + encodeURIComponent(path);
 
@@ -65,10 +65,6 @@ test.afterAll(async () => {
 
 test('sudo chroot /tmp/jail clamps ../../.. at /, resolves #! interpreters inside the jail, and leaves parent root intact', async ({ browser }) => {
   test.setTimeout(120_000);
-  const username = `chruser${Date.now().toString(36)}`;
-  expect((await program(rootApi, ['useradd', '-m', '-G', 'wheel', username])).ok()).toBe(true);
-  expect((await api(rootApi, 'passwd', { data: { username, password: userPassword } })).ok()).toBe(true);
-
   const base = `/tmp/chroot-suite-${crypto.randomUUID()}`;
   const jail = `${base}/jail`;
   const emptyJail = `${base}/empty`;
@@ -87,12 +83,7 @@ test('sudo chroot /tmp/jail clamps ../../.. at /, resolves #! interpreters insid
     '',
   ].join('\n');
 
-  const ip = nextIp(username);
-  const context = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': ip } });
-  const headers = { Origin: origin, 'CF-Connecting-IP': ip };
-  expect((await api(context.request, 'login', { headers, data: { username, password: userPassword } })).ok()).toBe(true);
-  expect((await api(context.request, 'sudo', { headers, data: { password: userPassword } })).ok()).toBe(true);
-
+  const context = await browser.newContext();
   const page = await context.newPage();
   try {
     await page.goto(origin + '/');
@@ -171,8 +162,5 @@ test('sudo chroot /tmp/jail clamps ../../.. at /, resolves #! interpreters insid
   } finally {
     await execCmd(page, ['/usr/bin/umount', '-l', `${jail}/usr`], { sudo: true }).catch(() => {});
     await context.close();
-    await rmrf(rootApi, base);
-    await program(rootApi, ['userdel', '-r', username]);
-    await program(rootApi, ['groupdel', username]);
   }
 });

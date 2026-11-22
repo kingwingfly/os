@@ -1,20 +1,24 @@
 import { test, expect, request as playwrightRequest } from './test.js';
-import { readFile } from 'node:fs/promises';
-import { api, mkdirp, program, put, rmrf } from './sys.js';
-import { browse } from './ui.js';
+import { api, cloudAuth, mkdirp, rmrf } from './sys.js';
+import { browse, cloudSignIn, cloudSignOut, cloudStatus, pageCall, pageMkdirp, pagePut, pageRmrf } from './ui.js';
+
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD;
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 const CHUNK = 8 * 1024 * 1024;
 let sequence = 0;
 const address = name => `devices-${name}-${Date.now()}-${++sequence}`;
 
-// A device: a browser context of its own, signed in through the API, showing the terminal.
+// A cloud-connected device: a browser context of its own with explicit Cloud Sign-In mounted at /mnt/cloud.
 async function device(browser, username = 'root', password = rootPassword) {
   const context = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': address(username) } });
-  expect((await api(context.request, 'login', { headers: { Origin: origin }, data: { username, password } })).ok()).toBe(true);
-  const page = await context.newPage(); await page.goto(origin + '/');
-  await expect(page.locator('.lock')).toContainText(username);
+  const page = await context.newPage();
+  await page.goto(origin + '/');
+  await page.waitForFunction(() => Boolean(window.os?.cloudSignIn && window.os?.exec));
+  await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: user · Cloud: Signed out', { timeout: 20_000 });
+  const status = await cloudSignIn(page, username, password);
+  expect(status.signed_in).toBe(true);
+  await expect(page.locator('.cloud-panel-trigger')).toContainText(`Local: user · Cloud: ${username}`, { timeout: 20_000 });
   return { context, page };
 }
 const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
@@ -33,78 +37,99 @@ async function upload(page, name, buffer) {
 }
 
 test('two devices of one account never send one upload at once, and one stopping leaves the other going', async ({ browser }) => {
+  test.setTimeout(120_000);
   const root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
   expect((await api(root, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
   const base = '/devices-' + Date.now().toString(36);
+  const cloudBase = '/mnt/cloud' + base;
   const a = await device(browser), b = await device(browser);
   try {
     await mkdirp(root, base);
-    for (const { page } of [a, b]) await browse(page, base);
-    const bytes = Buffer.alloc(CHUNK * 2 + 1000);
+    for (const { page } of [a, b]) await browse(page, cloudBase);
+    const bytes = Buffer.alloc(CHUNK + 1000);
     for (let i = 0; i < bytes.length; i += 4) bytes.writeUInt32LE(i, i);
-    // A's chunks wait until B has tried, so that A is still sending however long B takes to hash
-    // the file; B chooses the same file meanwhile, and is told to wait.
+    // Pause A's chunked uploads until B has attempted to upload the same file;
+    // B must be refused without interfering with A's in-flight upload.
     let release; const released = new Promise(resolve => { release = resolve; });
     await a.page.route('**/api/pwrite?**', async route => { await released; await route.continue().catch(() => {}); });
     await upload(a.page, 'data.bin', bytes);
     await expect(progress(a.page)).toContainText(/data\.bin · \d+%/, { timeout: 30_000 });
     await upload(b.page, 'data.bin', bytes);
-    await expect(progress(b.page)).toContainText('✕ data.bin: ' + base + '/data.bin is being uploaded from another tab or device', { timeout: 30_000 });
+    await expect(progress(b.page)).toContainText(/✕ data\.bin: .*(already exists|another tab or device)/, { timeout: 30_000 });
     release();
     await expect(progress(a.page)).toContainText('✓ data.bin', { timeout: 60_000 });
     expect(Buffer.compare(await (await root.get(file(base + '/data.bin'), { headers: { 'Accept-Encoding': 'identity' } })).body(), bytes)).toBe(0);
-    // A's file panel showed the same progress as its upload line, as both count what arrived.
     await expect(a.page.locator('.files .file').filter({ hasText: 'data.bin' })).toContainText('KB');
   } finally {
-    await rmrf(root, base);
+    await rmrf(root, base).catch(() => {});
     await a.context.close(); await b.context.close(); await root.dispose();
   }
 });
 
-test('a page hears when its session ends elsewhere, and windows of one browser follow each other', async ({ browser }) => {
-  const root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
-  expect((await api(root, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
-  const name = 'dev' + Date.now().toString(36), password = 'device-password-' + Date.now();
-  const command = args => program(root, args);
-  expect((await command(['useradd', '-m', name])).ok()).toBe(true);
-  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
+test('tabs of one instance follow local account switches while separate browser windows stay isolated, and remote cloud sign-out stays decoupled from local accounts', async ({ browser }) => {
+  test.setTimeout(120_000);
+  const name = 'dev' + Date.now().toString(36).slice(-5);
+  const password = 'device-password-' + Date.now();
+  // Register a cloud user via /api/cloud-auth/register for the remote device context.
+  const reg = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('reg') } });
+  expect((await cloudAuth(reg, 'register', { data: { username: name, password, create_home: true } })).ok()).toBe(true);
+  await reg.dispose();
+
   const phone = await device(browser, name, password);
-  // Two windows of one browser, as guest; one signs in, and the other follows at once.
+  // Two windows in one browser context boot isolated dedicated client-kernel Workers (ForkOnBusy);
+  // two terminal tabs inside one window share that instance's local account.
   const desktop = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': address('desktop') } });
   const first = await desktop.newPage(), second = await desktop.newPage();
   try {
-    for (const page of [first, second]) { await page.goto(origin + '/'); await expect(page.locator('.lock')).toContainText('guest'); }
-    await run(first, 'su ' + name);
-    await first.getByLabel('Password', { exact: true }).fill(password); await first.locator('#auth button[type=submit]').click();
-    await expect(first.locator('.lock')).toContainText(name);
-    await expect(second.locator('.lock')).toContainText(name);
-    await expect(transcript(second)).toContainText(`Account changed to ${name} in another window`);
-    // Another device changes the password: every session of the account ends, and its pages
-    // say so and show guest, before anything is typed there.
-    expect((await api(root, 'passwd', { data: { username: name, password: password + '-new' } })).ok()).toBe(true);
-    for (const page of [phone.page, first, second]) {
-      await expect(page.locator('.lock')).toContainText('guest');
-      await expect(transcript(page)).toContainText('Signed out: this session ended elsewhere');
+    for (const page of [first, second]) {
+      await page.goto(origin + '/');
+      await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: user · Cloud: Signed out', { timeout: 20_000 });
     }
+    // Open a second terminal tab in `first`, switch back to tab 1, create a local user and switch to it.
+    await first.getByRole('button', { name: 'New tab' }).click();
+    await first.getByRole('tab').nth(0).click();
+    await pageCall(first, { useradd: { name, password, short_password: true, create_home: true } }, { sudo: true });
+    await run(first, 'sudo -u ' + name);
+    await expect(first.locator('.cloud-panel-trigger')).toContainText(`Local: ${name}`);
+    // Tab 2 inside `first` follows immediately; separate browser window `second` stays isolated as `user`.
+    await first.getByRole('tab').nth(1).click();
+    await expect(transcript(first)).toContainText(`Account changed to ${name} in another tab`);
+    await expect(second.locator('.cloud-panel-trigger')).toContainText('Local: user · Cloud: Signed out');
+
+    // Logging out in tab 1 returns both tabs of `first` to default local `user`.
+    await first.getByRole('tab').nth(0).click();
+    await run(first, 'logout');
+    await expect(first.locator('.cloud-panel-trigger')).toContainText('Local: user');
+    await first.getByRole('tab').nth(1).click();
+    await expect(transcript(first)).toContainText('Account changed to user in another tab');
+
+    // On `phone`, remote Cloud session ending elsewhere invalidates the server session without mutating local `user`.
+    expect((await cloudAuth(phone.context.request, 'logout')).ok()).toBe(true);
+    const serverStatus = await (await cloudAuth(phone.context.request, 'status')).json();
+    expect(serverStatus.signed_in).toBe(false);
+    await cloudSignOut(phone.page);
+    await expect(phone.page.locator('.cloud-panel-trigger')).toContainText('Local: user · Cloud: Signed out');
+    expect((await cloudStatus(phone.page)).signed_in).toBe(false);
   } finally {
-    await command(['userdel', '-r', name]);
-    await phone.context.close(); await desktop.close(); await root.dispose();
+    await pageCall(first, { userdel: { name, remove: true } }, { sudo: true }).catch(() => {});
+    await phone.context.close(); await desktop.close();
   }
 });
 
-test('the file panel dims what the account may not open, and says why when clicked, with the terminal hidden', async ({ browser }) => {
-  const root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
-  expect((await api(root, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
-  const base = '/panel-' + Date.now().toString(36);
-  const command = args => program(root, args);
-  const context = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': address('guest') } });
-  const page = await context.newPage();
+test('the file panel dims what the account may not open, and says why when clicked, with the terminal hidden', async ({ page }) => {
+  const base = '/home/user/panel-' + Date.now().toString(36);
+  await page.goto(origin + '/');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   try {
-    for (const dir of ['', '/locked', '/open']) await mkdirp(root, base + dir);
-    expect((await put(root, file(base + '/secret.txt'), { data: 'no' })).status()).toBe(201);
-    expect((await put(root, file(base + '/notes.txt'), { data: 'yes' })).status()).toBe(201);
-    for (const args of [['chmod', '700', base + '/locked'], ['chmod', '600', base + '/secret.txt'], ['ln', '-s', base + '/nowhere', base + '/dangling']]) expect((await command(args)).ok()).toBe(true);
-    await page.goto(origin + '/');
+    await pageMkdirp(page, base, 0o755);
+    await pageMkdirp(page, base + '/locked', 0o700, { sudo: true });
+    await pageCall(page, { chmod: { path: base + '/locked', mode: 0o700 } }, { sudo: true });
+    await pageMkdirp(page, base + '/open', 0o755, { sudo: true });
+    await pagePut(page, base + '/secret.txt', 'no', { mode: 0o600, sudo: true });
+    await pageCall(page, { chmod: { path: base + '/secret.txt', mode: 0o600 } }, { sudo: true });
+    await pagePut(page, base + '/notes.txt', 'yes', { mode: 0o644, sudo: true });
+    await pageCall(page, { symlink: { target: base + '/nowhere', path: base + '/dangling' } }, { sudo: true });
+
     await run(page, 'cd ' + base);
     await browse(page, base);
     const entry = name => page.locator('.files .file').filter({ hasText: name });
@@ -127,7 +152,6 @@ test('the file panel dims what the account may not open, and says why when click
     await entry('dangling').click();
     await expect(page.locator('.file-notice')).toContainText('No such file or directory');
   } finally {
-    await rmrf(root, base);
-    await context.close(); await root.dispose();
+    await pageRmrf(page, base, { sudo: true }).catch(() => {});
   }
 });

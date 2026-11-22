@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { zipOf, tarOf } from './archive-fixtures.js';
 import { api, call, errno, listing, mkdirp, processes, program, put, rmrf } from './sys.js';
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 const ls = (request, path) => listing(request, path).catch(() => []);
 // Archive jobs start a container; give them time.

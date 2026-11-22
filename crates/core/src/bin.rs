@@ -114,6 +114,15 @@ const WRITING: &[&str] = &[
     "mount",
     "umount",
     "chroot",
+    "switch_root",
+    "passwd",
+    "useradd",
+    "usermod",
+    "userdel",
+    "groupadd",
+    "groupmod",
+    "groupdel",
+    "service",
 ];
 
 /// The utility of coreutils named `name`.
@@ -165,12 +174,22 @@ pub const UTILITIES: &[&str] = &[
     "umount",
     "findmnt",
     "chroot",
+    "switch_root",
+    "cowfsck",
+    "su",
+    "sudo",
+    "passwd",
+    "login",
+    "newgrp",
+    "service",
 ];
 
 /// The installed multicall image that owns a program; UI actions have no executable image.
 pub fn image(name: &str) -> Option<&'static str> {
     if name == "init" {
         Some("init")
+    } else if name == "early_init" {
+        Some("early_init")
     } else if name == "supervise" {
         Some("supervise")
     } else if name == "coreutils" || PROGRAMS.contains(&name) {
@@ -212,5 +231,29 @@ mod tests {
         assert!(super::writes("umount"));
         assert!(super::writes("chroot"));
         assert!(!super::writes("findmnt"));
+    }
+
+    #[test]
+    fn stage1_boot_utilities_are_registered() {
+        for util in ["switch_root", "cowfsck"] {
+            assert!(super::UTILITIES.contains(&util), "missing {util}");
+            assert_eq!(super::image(util), Some("utilities"));
+        }
+        assert!(super::writes("switch_root"));
+        assert!(!super::writes("cowfsck"));
+        assert_eq!(super::image("early_init"), Some("early_init"));
+    }
+
+    #[test]
+    fn local_account_and_service_utilities_are_registered() {
+        for util in ["su", "sudo", "passwd", "login", "newgrp", "service"] {
+            assert!(super::UTILITIES.contains(&util), "missing {util}");
+            assert_eq!(super::image(util), Some("utilities"));
+        }
+        assert!(super::writes("passwd"));
+        assert!(super::writes("service"));
+        assert!(super::writes("useradd"));
+        assert!(!super::writes("su"));
+        assert!(!super::writes("sudo"));
     }
 }

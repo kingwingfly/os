@@ -1,10 +1,10 @@
 import { test, expect, request as requests } from './test.js';
-import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
-import { api, call, mkdirp, put, rmrf } from './sys.js';
+import { api, call, sys } from './sys.js';
+import { pageMkdirp, pagePut, pageRmrf } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || 'test-admin-password-w4b';
 const cookies = async request => (await request.storageState()).cookies;
 const legacy = async (request, name, old) => {
   const cookie = (await cookies(request)).find(c => c.name === name);
@@ -18,9 +18,9 @@ test('OS boots with the renamed browser API and migrates saved preferences', asy
     localStorage.setItem('terminal-slide-theme', 'light');
     localStorage.setItem('terminal-notes-size', '19');
     sessionStorage.setItem('terminal-tabs', JSON.stringify({ active: 0, tabs: [
-      { cwd: '/guest', history: ['echo previous-session'] },
+      { cwd: '/home/user', history: ['echo previous-session'] },
     ] }));
-    sessionStorage.setItem('terminal-files', '/media');
+    sessionStorage.setItem('terminal-files', '/tmp');
   });
   await page.goto('/');
   await expect(page).toHaveTitle('OS');
@@ -29,7 +29,7 @@ test('OS boots with the renamed browser API and migrates saved preferences', asy
   expect(await page.evaluate(() => [localStorage.getItem('os-slide-theme'),
     localStorage.getItem('os-notes-size'), localStorage.getItem('terminal-slide-theme')]))
     .toEqual(['light', '19', null]);
-  await expect(page.getByRole('textbox', { name: 'Location' })).toHaveValue('/media');
+  await expect(page.getByRole('textbox', { name: 'Location' })).toHaveValue('/tmp');
   await page.locator('#command').press('ArrowUp');
   await expect(page.locator('#command')).toHaveValue('echo previous-session');
   expect(await page.evaluate(() => [sessionStorage.getItem('terminal-tabs'),
@@ -72,14 +72,13 @@ test('old guest cookies retain their namespace and an invalid new cookie cannot 
   const token = (await cookies(request)).find(c => c.name === 'os_session').value;
   const bad = await requests.newContext({ baseURL: origin });
   try {
-    expect((await call(bad, 'getcreds', { headers: { Cookie: `os_session=invalid; terminal_session=${token}` } })).signed_in).toBe(false);
+    const [res] = await sys(bad, ['getcreds'], {}, { Cookie: `os_session=invalid; terminal_session=${token}` });
+    expect(res.ok.signed_in).toBe(false);
   } finally { await bad.dispose(); }
 });
 for (const namespace of ['os', 'terminal']) {
-  test(`uploaded programs can use the ${namespace} import namespace`, async ({ page, request }) => {
-    await api(request, 'login', { data: { password } });
-    const base = '/rename-' + namespace + '-' + Date.now().toString(36);
-    await mkdirp(request, base);
+  test(`uploaded programs can use the ${namespace} import namespace`, async ({ page }) => {
+    const base = '/home/user/rename-' + namespace + '-' + Date.now().toString(36);
     const module = binaryen.parseText(`(module
       (import "${namespace}" "umask" (func $umask (param i32) (result i32)))
       (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
@@ -88,14 +87,17 @@ for (const namespace of ['os', 'terminal']) {
         (if (i32.ne (call $umask (i32.const 18)) (i32.const 18)) (then unreachable))
         (i32.store (i32.const 0) (i32.const 100)) (i32.store (i32.const 4) (i32.const 10))
         (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))`);
+    await page.goto('/');
+    await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
     try {
-      expect((await put(request, '/api/file?path=' + encodeURIComponent(base + '/probe.wasm'),
-        { data: Buffer.from(module.emitBinary()) })).ok()).toBe(true);
-      await call(request, { chmod: { path: base + '/probe.wasm', mode: 0o755 } });
-      await page.goto('/');
+      await pageMkdirp(page, base, 0o755);
+      await pagePut(page, base + '/probe.wasm', Buffer.from(module.emitBinary()), { mode: 0o755 });
       await page.locator('#command').fill(base + '/probe.wasm');
       await page.locator('#command').press('Enter');
       await expect(page.locator('.transcript:not([hidden]) pre').last()).toHaveText('import-ok');
-    } finally { module.dispose(); await rmrf(request, base); }
+    } finally {
+      module.dispose();
+      await pageRmrf(page, base).catch(() => {});
+    }
   });
 }

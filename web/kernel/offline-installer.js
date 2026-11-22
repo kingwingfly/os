@@ -39,7 +39,7 @@ export const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca49
 const ALLOWED_IMAGE_FEATURES = new Set(['wasi-preview1', 'os-abi-1', 'wasix-fork-v4']);
 const INITRAMFS_DIRS = new Set(['/dev', '/proc', '/run', '/sysroot', '/tmp']);
 const ROOT_TEMPLATE_DIRS = new Set([
-  '/boot', '/dev', '/dev/pts', '/mnt', '/mnt/local', '/mnt/shared',
+  '/boot', '/dev', '/dev/pts', '/mnt', '/mnt/cloud', '/mnt/local', '/mnt/shared',
   '/opt', '/opt/private', '/proc', '/run', '/srv', '/sys', '/tmp', '/usr',
 ]);
 const BASE_TOP_LINKS = new Set(['/bin', '/sbin', '/lib', '/lib64']);
@@ -2077,10 +2077,126 @@ export function createOfflineInstaller(options = {}) {
     return stateStore.read();
   }
 
+  /**
+   * Zero-network Stage 0 boot resolver: selects either the BootProfile's pinned `generation`
+   * (verified offline against profile-wide monotonic trust) or the active generation via
+   * `beginOfflineBoot`. Makes ZERO `fetch()` calls.
+   *
+   * Codex Finding #33: if a pinned `generation` fails offline verification (e.g. corrupt manifest,
+   * bad signature, or revoked signing key), fall back through the same trusted-generation
+   * fallback decision (`previous` / `active`) and report which generation actually booted.
+   */
+  async function resolveInstalledForBoot({ generation = null, verifyAllBlobs = true, verifyCache = true } = {}) {
+    if (generation) {
+      if (typeof generation !== 'string' || !HEX64.test(generation)) {
+        throw new Error(`Invalid BootProfile pinned generation: ${generation}`);
+      }
+      const state = await stateStore.read();
+      const tryPinned = async () => {
+        if (!state.generations?.[generation]) {
+          throw new Error(`Pinned Release v2 generation ${generation} is not installed locally.`);
+        }
+        const verified = await verifyInstalledOffline(generation, { verifyAllBlobs, verifyCache });
+        return {
+          ...verified,
+          rolledBack: false,
+          rolledBackFrom: null,
+          pinnedGeneration: true,
+          state,
+        };
+      };
+      try {
+        return await tryPinned();
+      } catch (pinnedError) {
+        // Fallback candidates: other installed generations (prefer active if distinct, then previous).
+        const candidates = [];
+        if (state.active && state.active !== generation && state.generations?.[state.active]) {
+          candidates.push(state.active);
+        }
+        if (state.previous && state.previous !== generation && !candidates.includes(state.previous) && state.generations?.[state.previous]) {
+          candidates.push(state.previous);
+        }
+        for (const candidateId of candidates) {
+          try {
+            const fallbackVerified = await verifyInstalledOffline(candidateId, { verifyAllBlobs, verifyCache });
+            let nextState = state;
+            if (state.active === generation && state.previous === candidateId) {
+              nextState = await stateStore.updateStrict(cur => {
+                if (cur.active === generation && cur.previous === candidateId) {
+                  cur.active = candidateId;
+                  cur.previous = null;
+                  cur.activeBootVerified = Boolean(cur.generations?.[candidateId]?.healthy);
+                  cur.bootAttempts = 0;
+                }
+                return cur;
+              });
+            }
+            return {
+              ...fallbackVerified,
+              rolledBack: true,
+              rolledBackFrom: generation,
+              rollbackReason: pinnedError.message,
+              pinnedGeneration: false,
+              state: nextState,
+            };
+          } catch {
+            // Try next trusted candidate, or fail closed if none verify.
+          }
+        }
+        throw pinnedError;
+      }
+    }
+    const booted = await beginOfflineBoot({ verifyAllBlobs, verifyCache });
+    return { ...booted, pinnedGeneration: false };
+  }
+
+  /**
+   * Read a verified boot asset (`client_kernel.js`, `client_kernel_bg.wasm`, etc.) strictly from
+   * local OPFS / Cache Storage with ZERO network requests, checking its exact SHA-256 digest
+   * against the signed `Boot` image manifest before returning bytes.
+   */
+  async function readVerifiedBootAsset(boot, assetPath) {
+    const bootImg = boot?.images?.boot;
+    if (!bootImg || !Array.isArray(bootImg.entries)) {
+      throw new Error('Missing verified Boot image metadata.');
+    }
+    const entry = bootImg.entries.find(e => e.path === assetPath && e.node?.type === 'file');
+    if (!entry) {
+      throw new Error(`Boot image missing asset ${assetPath}`);
+    }
+    const expectedSha = entry.node.sha256;
+    const opfsBytes = await opfs.readFile(`os-releases/blobs/${expectedSha}`);
+    if (opfsBytes && opfsBytes.byteLength === entry.node.size) {
+      if (await sha256Hex(opfsBytes, cryptoApi) !== expectedSha) {
+        throw new Error(`OPFS boot asset SHA-256 mismatch for ${assetPath}`);
+      }
+      return opfsBytes;
+    }
+    if (cacheStore && typeof cacheStore.match === 'function') {
+      const cacheName = `${CACHE_PREFIX}${boot.releaseId}`;
+      for (const candidate of [
+        `/boot/releases/${boot.releaseId}/assets${encodeAssetPath(assetPath)}`,
+        encodeAssetPath(assetPath),
+      ]) {
+        const hit = await cacheStore.match(cacheName, candidate);
+        const bytes = await readCacheHitBytes(hit);
+        if (bytes) {
+          if (await sha256Hex(bytes, cryptoApi) !== expectedSha) {
+            throw new Error(`Cached boot asset SHA-256 mismatch for ${assetPath}`);
+          }
+          return bytes;
+        }
+      }
+    }
+    throw new Error(`Local boot asset unavailable offline: ${assetPath}`);
+  }
+
   return {
     install,
     verifyInstalledOffline,
     beginOfflineBoot,
+    resolveInstalledForBoot,
+    readVerifiedBootAsset,
     abortOfflineBoot,
     markBootHealthy,
     rollback,

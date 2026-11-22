@@ -5,6 +5,7 @@
 //!
 //! It keeps nothing itself: a store (`Fs`) holds the names, inodes and accounts. The Worker's
 //! is SQLite in its Durable Object; tests use `MemStore`.
+pub mod accounts;
 pub mod init;
 pub mod lifecycle;
 pub mod local_cgroups;

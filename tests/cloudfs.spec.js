@@ -2,9 +2,10 @@ import { test, expect, request as contexts } from './test.js';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { api, call, mkdirp, put, rmrf, sys } from './sys.js';
+import { cloudSignIn } from './ui.js';
 import { attachInstance, FULL_SCOPE, NO_CLOUD_SCOPE } from './service-auth.js';
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password = process.env.OS_PASSWORD || readFileSync('.local-password', 'utf8').trim();
+const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || readFileSync('.local-password', 'utf8').trim();
 const options = (access='read-write', extra={}) => ({read:access==='read'||access==='read-write',write:access==='write'||access==='read-write',append:false,append_implies_write:false,truncate:false,create:false,create_new:false,exec:access==='exec',path:access==='path',...extra});
 const attrs = extra => ({mode:null,uid:null,gid:null,size:null,atime:'omit',mtime:'omit',...extra});
 const instances = new WeakMap();
@@ -281,21 +282,36 @@ test('separate service instances share inode locks but cannot exchange handle pr
   await other.call('try_lock',{open:peer,family:'flock',kind:'exclusive',range});expect((await other.read(peer)).toString()).toBe('shared');
   await other.call('release',{open:peer});await other.call('metadata',{handle:theirs},'ESTALE');await other.call('disconnect');
 });
-test('account lock revokes open grants and unlocking never revives them',async({request})=>{
-  const {c:admin}=await setup(request);const name='vfsc'+randomUUID().replaceAll('-','').slice(0,12);const password='account-'+randomUUID();
-  await call(request,{useradd:{name,create_home:true}});
+test('retired /api/sys account calls fail closed with ENOSYS and revoking cloud creds immediately tears down open grants',async({request})=>{
+  const {c:admin}=await setup(request);const name='vfsc'+randomUUID().replaceAll('-','').slice(0,12);const pw='account-'+randomUUID();
+  const retired = await sys(request, [
+    { useradd: { name, create_home: true } },
+    { usermod: { name, lock: true } },
+    { userdel: { name, remove: true } },
+    { passwd: { username: name, password: pw } },
+    { sudo: { password: pw, revoke: false } },
+    { login: { username: 'root', password } },
+    'logout',
+    { groupadd: { name } },
+    { groupmod: { name, new_name: name + '2' } },
+    { groupdel: { name } },
+  ]);
+  for (const r of retired) expect(r.err?.errno).toBe('ENOSYS');
+
   const account=await contexts.newContext({extraHTTPHeaders:{'CF-Connecting-IP':'cloudfs-'+randomUUID()}});
   try{
-    expect((await api(request,'passwd',{data:{username:name,password}})).ok()).toBe(true);
-    await call(account,'getcreds');expect((await api(account,'login',{data:{username:name,password}})).ok()).toBe(true);
+    await call(account,'getcreds');
+    expect((await api(account,'register',{data:{username:name,password:pw,create_home:true}})).ok()).toBe(true);
     const actor=await admit(account);const c=await connection(account,actor);const creds=await call(account,'getcreds');
     const walked=await c.call('walk',{dir:c.root,names:creds.home.split('/').filter(Boolean)});const home=walked.entries.at(-1).handle;
     const [entry,open]=await c.create(home,'retained');await c.write(open,'private');await c.call('unlink',{dir:home,name:'retained'});
-    await call(request,{usermod:{name,lock:true}});await c.data(open,{read:{offset:0,length:7}},undefined,'EACCES');
-    const guest=await admit(account);await rpc(account,guest.token,c.session,{metadata:{handle:entry.handle}},'ESTALE');
-    await call(request,{usermod:{name,unlock:true}});await c.call('renew',undefined,'EACCES');
-    await rpc(account,guest.token,c.session,'disconnect');
-  }finally{await account.dispose();await call(request,{userdel:{name,remove:true}});await admin.call('disconnect');}
+    // Explicit ServiceAuth v2 token revocation immediately invalidates open grants and never revives them.
+    await revokeCred(actor);
+    await c.data(open,{read:{offset:0,length:7}},undefined,'EACCES');
+    const observer=await admit(account);await rpc(account,observer.token,c.session,{metadata:{handle:entry.handle}},'ESTALE');
+    await c.call('renew',undefined,'EACCES');
+    await rpc(account,observer.token,c.session,'disconnect');
+  }finally{await account.dispose();await admin.call('disconnect');}
 });
 test('inline pread reads extents, object offsets and sparse holes through paths and retained descriptors',async({request})=>{
   const {c,dir}=await setup(request);const [entry,open]=await c.create(dir,'inline');
@@ -602,34 +618,33 @@ test('exec and path creation are rejected without adding names or changing exist
     await c.call('disconnect');
   }
 });
-test('registered homes and their containing directories require usermod to move',async({request})=>{
-  const {c,dir}=await setup(request);const baseName=(await c.call('parent',{dir}))[1];const base='/'+baseName;
-  const name='home-'+randomUUID().slice(0,12);const pending=name+'-pending';const path=base+'/homes/account';
-  const accountHome=async user=>Buffer.from((await call(request,{pread:{path:'/etc/passwd',offset:0,count:262144}})).data,'base64').toString().split('\n').find(line=>line.startsWith(user+':')).split(':')[5];
+test('registered cloud homes and /guest reject rename with EBUSY and retired /api/sys useradd fails closed with ENOSYS',async({request})=>{
+  const name='home'+randomUUID().replaceAll('-','').slice(0,10);
+  const acctPassword='cloud-home-'+randomUUID();
+  const {c}=await setup(request);
   try {
-    await call(request,{useradd:{name,home:path,create_home:true}});
-    const homes=(await c.call('lookup',{dir,name:'homes'})).handle;const home=(await c.call('lookup',{dir:homes,name:'account'})).handle;
-    await c.call('mkdir',{dir,name:'reserved',mode:0o755});
-    await call(request,{useradd:{name:pending,home:base+'/reserved/unmade'}});
+    // Retired OS-account mutations over /api/sys fail closed with ENOSYS (Contract v2 §2.12).
+    expect((await sys(request,[{useradd:{name,create_home:true}}]))[0].err.errno).toBe('ENOSYS');
+    expect((await sys(request,[{usermod:{name,home:'/guest/relocated',move_home:true}}]))[0].err.errno).toBe('ENOSYS');
+    // Self-register a cloud account with home `/guest/<name>` via `/api/cloud-auth/register`.
+    await api(request,'logout');
+    const reg=await api(request,'register',{headers:{'CF-Connecting-IP':'home-'+randomUUID()},data:{username:name,password:acctPassword,create_home:true}});
+    expect(reg.ok(),await reg.text()).toBe(true);
+    await api(request,'logout');
+    expect((await api(request,'login',{headers:{'CF-Connecting-IP':'home-relogin-'+randomUUID()},data:{password}})).ok()).toBe(true);
+    const guestDir=(await c.call('lookup',{dir:c.root,name:'guest'})).handle;
+    const home=(await c.call('lookup',{dir:guestDir,name})).handle;
     const [,open]=await c.create(home,'kept');await c.write(open,'home data');
     const before=await c.call('metadata',{handle:home});
-    expect((await sys(request,[{rename:{from:path,to:base+'/homes/moved'}}]))[0].err.errno).toBe('EBUSY');
-    for(const flags of ['','NOREPLACE'])for(const [parent,from] of [[homes,'account'],[dir,'homes'],[dir,'reserved'],[c.root,baseName]]) {
+    expect((await sys(request,[{rename:{from:`/guest/${name}`,to:`/guest/${name}-moved`}}]))[0].err.errno).toBe('EBUSY');
+    for(const flags of ['','NOREPLACE'])for(const [parent,from] of [[guestDir,name],[c.root,'guest']]) {
       await c.call('rename',{from_dir:parent,from,to_dir:parent,to:from+'-moved',flags},'EBUSY');
       await c.call('lookup',{dir:parent,name:from+'-moved'},'ENOENT');
     }
-    expect(await accountHome(name)).toBe(path);expect(await accountHome(pending)).toBe(base+'/reserved/unmade');
     expect(await c.call('metadata',{handle:home})).toEqual(before);
-    await c.call('rename',{from_dir:homes,from:'account',to_dir:homes,to:'account',flags:''});
-    await c.call('mkdir',{dir,name:'home',mode:0o755});
-    await c.call('rename',{from_dir:dir,from:'home',to_dir:dir,to:'home-moved',flags:''});
-    await call(request,{usermod:{name,home:base+'/relocated',move_home:true}});
-    expect(await accountHome(name)).toBe(base+'/relocated');
-    expect((await c.call('lookup',{dir,name:'relocated'})).handle.node).toEqual(home.node);
     expect((await c.read(open)).toString()).toBe('home data');
-    await c.call('rename',{from_dir:dir,from:'relocated',to_dir:dir,to:'again',flags:''},'EBUSY');
   } finally {
-    await c.call('disconnect');await sys(request,[{userdel:{name,remove:true}},{userdel:{name:pending,remove:true}},{groupdel:{name}},{groupdel:{name:pending}}]);await rmrf(request,base);
+    await c.call('disconnect');
   }
 });
 for(const operation of ['write','truncate'])test(`${operation} privilege bits follow the actor independently of the opener`,async({request})=>{
@@ -1055,16 +1070,20 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
     const ENV = ['PWD=/', 'PATH=/usr/bin', 'LANG=C.UTF-8'];
     const sleepCmd = { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '60'], env: ENV, cwd: '/' };
     await k('init');
-    await k('sync_account_from_server');
-    const p1 = await k('exec', sleepCmd);
-    const p2 = await k('exec', sleepCmd);
+    // `/` is local `os-cowfs` (not CloudFs); explicit `cloud_sign_in` mounts feature-frozen `CloudFs` at `/mnt/cloud`!
+    const signed = await k('cloud_sign_in', { cloudUser: 'root', cloudUid: 0, cloudGid: 0, cloudGroups: [0], scope: FULL_SCOPE });
+    expect(signed.signed_in).toBe(true);
+    expect(signed.cloud_mounted).toBe(true);
+    const cloudBase = `/mnt/cloud${base}`;
+    const p1 = await k('exec', { ...sleepCmd, remote: true });
+    const p2 = await k('exec', { ...sleepCmd, remote: true });
 
-    // 1. Open creates regular files with shared CloudFs st_dev and opens /dev/null via DevTmpFs.
+    // 1. Open creates regular files on `/mnt/cloud` with shared CloudFs st_dev and opens /dev/null via DevTmpFs.
     const devNull = await k('proc_openat', { pid: p1.pid, dirfd: ROOT_FD, path: '/dev/null', oflags: 2, mode: 0 });
     expect(devNull).toMatchObject({ device: 'null', fstype: 'devtmpfs' });
     await k('kfd_close', { pid: p1.pid, kfd: devNull.kfd });
-    const f = await k('proc_openat', { pid: p1.pid, dirfd: ROOT_FD, path: `${base}/f.txt`, oflags: 0o2 | 0o100 | 0o200, mode: 0o644 });
-    const g = await k('proc_openat', { pid: p1.pid, dirfd: ROOT_FD, path: `${base}/g.txt`, oflags: 0o2 | 0o100 | 0o200, mode: 0o644 });
+    const f = await k('proc_openat', { pid: p1.pid, dirfd: ROOT_FD, path: `${cloudBase}/f.txt`, oflags: 0o2 | 0o100 | 0o200, mode: 0o644 });
+    const g = await k('proc_openat', { pid: p1.pid, dirfd: ROOT_FD, path: `${cloudBase}/g.txt`, oflags: 0o2 | 0o100 | 0o200, mode: 0o644 });
     expect(f.stat.dev).toBeGreaterThan(0);
     expect(g.stat.dev).toBe(f.stat.dev);
     expect(g.stat.ino).not.toBe(f.stat.ino);
@@ -1098,7 +1117,7 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
     expect(Buffer.from(bytes).toString()).toBe('hello!');
 
     // 4. Blocking lock wait + kfd_cancel unblocks concurrently with EINTR.
-    const g2 = await k('proc_openat', { pid: p2.pid, dirfd: ROOT_FD, path: `${base}/g.txt`, oflags: 0o2, mode: 0 });
+    const g2 = await k('proc_openat', { pid: p2.pid, dirfd: ROOT_FD, path: `${cloudBase}/g.txt`, oflags: 0o2, mode: 0 });
     await k('kfd_lock', { pid: p1.pid, kfd: g.kfd, family: 'posix', kind: 'exclusive', start: '0', wait: false });
     const conflict = await k('kfd_test_lock', { pid: p2.pid, kfd: g2.kfd, kind: 'exclusive', start: '0' });
     expect(conflict).toBeTruthy();
@@ -1123,7 +1142,7 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
     const [afterExit] = await sys(request, [{ stat: { path: `${base}/f.txt` } }], {}, extra);
     expect(afterExit.err?.errno).toBe('ENOENT');
 
-    // 6. Traversal permission checks (..), protected symlinks with Call::Getcreds identity, and non-aliasing reconnect IDs.
+    // 6. Traversal permission checks (..), protected symlinks, and non-aliasing reconnect IDs on `/mnt/cloud`.
     await mkdirp(request, `${base}/blocked`, 0o700);
     await call(request, { chmod: { path: `${base}/blocked`, mode: 0o700 } }, { headers: extra });
     expect((await put(request, '/api/file?path=' + encodeURIComponent(`${base}/ok`), { headers: extra, data: 'ok' })).status()).toBe(201);
@@ -1133,24 +1152,21 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
 
     const aliceName = 'alice' + randomUUID().replaceAll('-', '').slice(0, 8);
     const alicePassword = 'account-' + randomUUID();
-    expect((await api(context.request, 'logout', { headers: extra })).ok()).toBe(true);
-    await k('sync_account_from_server');
-    const pGuest = await k('exec', sleepCmd);
-
+    await api(context.request, 'logout');
     await call(context.request, 'getcreds');
     expect((await api(context.request, 'register', { headers: extra, data: { username: aliceName, password: alicePassword, create_home: false } })).ok()).toBe(true);
-    await k('sync_account_from_server');
-    const pAlice = await k('exec', sleepCmd);
+    const aliceCreds = await call(context.request, 'getcreds');
+    await k('sync_account', { uid: aliceCreds.uid, gid: aliceCreds.gid, groups: aliceCreds.groups, user: aliceName, group: aliceName, home: '/tmp', shell: '/bin/sh', signed_in: true });
+    await k('cloud_sign_in', { cloudUser: aliceName, cloudUid: aliceCreds.uid, cloudGid: aliceCreds.gid, cloudGroups: aliceCreds.groups, scope: FULL_SCOPE });
+    const pAlice = await k('exec', { ...sleepCmd, remote: true });
     expect(await call(context.request, { symlink: { target: 'target', path: `${base}/sticky/link` } }, { headers: extra })).toBeNull();
 
-    expect(await kErr('proc_openat', { pid: pGuest.pid, dirfd: ROOT_FD, path: `${base}/blocked/../ok`, oflags: 0, mode: 0 })).toBe('EACCES');
-    expect(await kErr('proc_openat', { pid: pGuest.pid, dirfd: ROOT_FD, path: `${base}/sticky/link`, oflags: 0, mode: 0 })).toBe('EACCES');
-
-    const aliceOpen = await k('proc_openat', { pid: pAlice.pid, dirfd: ROOT_FD, path: `${base}/sticky/link`, oflags: 0, mode: 0 });
+    expect(await kErr('proc_openat', { pid: pAlice.pid, dirfd: ROOT_FD, path: `${cloudBase}/blocked/../ok`, oflags: 0, mode: 0 })).toBe('EACCES');
+    const aliceOpen = await k('proc_openat', { pid: pAlice.pid, dirfd: ROOT_FD, path: `${cloudBase}/sticky/link`, oflags: 0, mode: 0 });
     expect(Buffer.from(await k('kfd_pread', { pid: pAlice.pid, kfd: aliceOpen.kfd, len: 16, offset: '0' })).toString()).toBe('secret-ok');
     await k('kfd_close', { pid: pAlice.pid, kfd: aliceOpen.kfd });
 
-    const beforeReconnect = await k('proc_openat', { pid: pAlice.pid, dirfd: ROOT_FD, path: `${base}/ok`, oflags: 0, mode: 0 });
+    const beforeReconnect = await k('proc_openat', { pid: pAlice.pid, dirfd: ROOT_FD, path: `${cloudBase}/ok`, oflags: 0, mode: 0 });
     let dropRenew = true;
     let reconnectConnects = 0;
     const dropOnce = async route => {
@@ -1165,7 +1181,7 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
     };
     await context.route('**/api/fs', dropOnce);
     expect(await kErr('cloud_renew')).toBe('ENOTCONN');
-    const afterReconnect = await k('proc_openat', { pid: pAlice.pid, dirfd: ROOT_FD, path: `${base}/ok`, oflags: 0, mode: 0 });
+    const afterReconnect = await k('proc_openat', { pid: pAlice.pid, dirfd: ROOT_FD, path: `${cloudBase}/ok`, oflags: 0, mode: 0 });
     await context.unroute('**/api/fs', dropOnce);
     expect(reconnectConnects).toBe(1);
     expect(afterReconnect.kfd).toBeGreaterThan(beforeReconnect.kfd);
@@ -1173,15 +1189,10 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
     await k('kfd_close', { pid: pAlice.pid, kfd: beforeReconnect.kfd });
     await k('kfd_close', { pid: pAlice.pid, kfd: afterReconnect.kfd });
 
+    // Cloud Sign-Out detaches `/mnt/cloud` cleanly without killing local processes.
+    await k('cloud_sign_out');
     await k('exit', { pid: pAlice.pid, status: 0 });
     await k('wait', { pid: pAlice.pid });
-    await k('exit', { pid: pGuest.pid, status: 0 });
-    // Non-root Alice cannot reap another account's (guest's) zombie process; root (or PID 1) can.
-    expect(await kErr('wait', { pid: pGuest.pid })).toBe('EPERM');
-    expect((await api(context.request, 'login', { headers: extra, data: { password } })).ok()).toBe(true);
-    await k('sync_account_from_server');
-    const rootWait = await page.evaluate(pid => window.__kernel('wait', { pid }), pGuest.pid);
-    expect(rootWait.ok != null || rootWait.err?.errno === 'ECHILD').toBe(true);
   } finally {
     await rmrf(request, base);
   }
@@ -1438,6 +1449,10 @@ test('WASI and WASIX processes use CloudFs for dev/ino/nlink==0, SEEK_END, O_APP
     await upload('fork-probe', FORK_PROBE);
     await upload('shared-io-probe', SHARED_IO_PROBE);
     await page.goto('/');
+    await page.waitForFunction(() => Boolean(window.os?.cloudSignIn));
+    await cloudSignIn(page, 'root', password, FULL_SCOPE);
+    const cloudBase = `/mnt/cloud${base}`;
+    const cloudRel = `mnt/cloud/${rel}`;
     const input = page.getByRole('combobox', { name: 'Terminal command' });
     const busy = page.locator('#command').locator('xpath=ancestor::form');
     const run = async text => {
@@ -1447,15 +1462,15 @@ test('WASI and WASIX processes use CloudFs for dev/ino/nlink==0, SEEK_END, O_APP
       await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
     };
     await expect(busy).toHaveAttribute('data-state', 'idle');
-    await run(`sh -c '${base}/wasi-probe ${rel}/probe.txt; printf probe=%d $?'`);
+    await run(`sh -c '${cloudBase}/wasi-probe ${cloudRel}/probe.txt; printf probe=%d $?'`);
     await expect(page.locator('.transcript pre').last()).toHaveText('hellprobe=0');
     const [afterUnlink] = await sys(request, [{ stat: { path: `${base}/probe.txt` } }], {}, extra);
     expect(afterUnlink.err?.errno).toBe('ENOENT');
 
-    await run(`sh -c '${base}/fork-probe ${rel}/shared.txt ${rel}/clo.txt ${base}/child-writer; printf fork=%d $?'`);
+    await run(`sh -c '${cloudBase}/fork-probe ${cloudRel}/shared.txt ${cloudRel}/clo.txt ${cloudBase}/child-writer; printf fork=%d $?'`);
     await expect(page.locator('.transcript pre').last()).toHaveText('child:execfork=0');
 
-    await run(`sh -c '${base}/shared-io-probe ${rel}/shared-big.bin; printf io=%d $?'`);
+    await run(`sh -c '${cloudBase}/shared-io-probe ${cloudRel}/shared-big.bin; printf io=%d $?'`);
     await expect(page.locator('.transcript pre').last()).toHaveText('io=0');
     const bigRes = await request.get(origin + '/api/file?path=' + encodeURIComponent(`${base}/shared-big.bin`), { headers: extra });
     expect(bigRes.ok()).toBe(true);

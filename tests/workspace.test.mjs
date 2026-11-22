@@ -1054,8 +1054,9 @@ test('an absent login can bypass only the root overlay and never retry dispatche
     };
     await currentWorkspace();
     globalThis.pageSysPost = async () => { calls++; throw new Error('lost response'); };
+    // Under #56/#57, `/` is 100% local (no RootCloudDriver), so missing paths return ENOENT with 0 network RPCs!
     const result = await mountRequest('mount_overlay', { calls: [{ stat: { path: '/nonexistent-cloud-path' } }] });
-    assert.equal(result[0].err.errno, 'EIO'); assert.equal(calls, 1);
+    assert.equal(result[0].err.errno, 'ENOENT'); assert.equal(calls, 0);
   } finally {
     endWorkspace('overlay-test');
     await k.session_end('overlay-test').catch(() => {});
@@ -3067,7 +3068,7 @@ test('PR #74 Track C: WASI process.js kfd FDFLAG_NONBLOCK, /proc/self/fd transla
   }
 });
 
-test('PR #74 Track C: local-files.js routes groupmod to network, streams GET /api/file with abort close, and passes 8 MiB chunkIndex on PUT /api/pwrite', async () => {
+test('PR #74 Track C / #57 L3d: local-files.js routes local account calls locally, server-only calls to network, streams GET /api/file with abort close, and passes 8 MiB chunkIndex on PUT /api/pwrite', async () => {
   const prevLocation = globalThis.location;
   const prevFetch = globalThis.fetch;
   const prevWorker = globalThis.Worker;
@@ -3111,15 +3112,24 @@ test('PR #74 Track C: local-files.js routes groupmod to network, streams GET /ap
     const { installLocalFiles } = await import('../web/local-files.js');
     installLocalFiles();
 
-    // 1. groupmod must hit network, NOT mount_vfs_sys
+    // 1. Local OS-account calls (`groupmod`, `getcreds`, etc.) route 100% locally via `mount_vfs_sys` (0 network calls);
+    //    server-only calls (`register`) still reach network `/api/sys`.
     const gRes = await globalThis.fetch('https://os.example/api/sys', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ calls: [{ groupmod: { name: 'devs' } }] }),
+      body: JSON.stringify({ calls: [{ groupmod: { name: 'devs', new_name: 'eng' } }] }),
     });
     assert.equal(gRes.status, 200);
+    assert.deepEqual(networkCalls, []);
+    assert.equal(kernelCalls.some(c => c.type === 'mount_vfs_sys'), true);
+
+    const sRes = await globalThis.fetch('https://os.example/api/sys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ calls: [{ register: { name: 'x' } }] }),
+    });
+    assert.equal(sRes.status, 200);
     assert.deepEqual(networkCalls, ['/api/sys']);
-    assert.equal(kernelCalls.some(c => c.type === 'mount_vfs_sys'), false);
 
     // 2. PUT /api/pwrite accepts >256 KiB chunks (up to 8 MiB) and passes chunkIndex
     const big = new Uint8Array(300 * 1024);

@@ -564,84 +564,88 @@ export function createCowfsStore(options = {}) {
 
   async function acquireWriter(volume, mode = 'exclusive') {
     await ensureFormatCompatible();
-    await readHead(volume);
-    const lockName = await volLockName(volume);
+    // Hold shared GC lock across head inspection + writer lock / fork creation so concurrent GC
+    // cannot sweep objects reachable from the selected root or prune the head mid-acquisition.
+    const gcLockId = await acquireGcLock(false);
+    try {
+      await readHead(volume);
+      const lockName = await volLockName(volume);
 
-    if (mode === 'force-takeover') {
-      // Fail closed if Web Lock steal cannot be established: NEVER issue a writer lease without
-      // an active exclusion lock (`held == null` would permit split-brain writers once the prior
-      // holder exits).
-      let held;
-      try {
-        held = await requestHeldWebLock(lockName, { mode: 'exclusive', steal: true });
-      } catch (err) {
-        throw err?.errno ? err : errnoError('ENOLCK', 'force-takeover failed to steal writer lock');
-      }
-      if (!held) {
-        throw errnoError('ENOLCK', 'force-takeover did not acquire writer lock');
-      }
-      try {
-        const db = await getDb();
-        const tx = openTx(db, ['heads'], 'readwrite', true);
-        const headsStore = tx.objectStore('heads');
-        const cur = await reqPromise(headsStore.get(volume));
-        if (!cur) {
-          try { tx.abort(); } catch {}
-          throw errnoError('ENOENT', `volume ${volume} not found`);
+      if (mode === 'force-takeover') {
+        // Fail closed if Web Lock steal cannot be established: NEVER issue a writer lease without
+        // an active exclusion lock (`held == null` would permit split-brain writers once the prior
+        // holder exits).
+        let held;
+        try {
+          held = await requestHeldWebLock(lockName, { mode: 'exclusive', steal: true });
+        } catch (err) {
+          throw err?.errno ? err : errnoError('ENOLCK', 'force-takeover failed to steal writer lock');
         }
-        const nextHead = { ...cur, fence: Number(cur.fence) + 1 };
-        headsStore.put(nextHead);
-        await txDone(tx);
+        if (!held) {
+          throw errnoError('ENOLCK', 'force-takeover did not acquire writer lock');
+        }
+        try {
+          const db = await getDb();
+          const tx = openTx(db, ['heads'], 'readwrite', true);
+          const headsStore = tx.objectStore('heads');
+          const cur = await reqPromise(headsStore.get(volume));
+          if (!cur) {
+            try { tx.abort(); } catch {}
+            throw errnoError('ENOENT', `volume ${volume} not found`);
+          }
+          if (cur.format_version !== COWFS_FORMAT_VERSION) {
+            try { tx.abort(); } catch {}
+            throw errnoError('EPROTONOSUPPORT', 'incompatible volume head format_version');
+          }
+          const nextHead = { ...cur, fence: Number(cur.fence) + 1 };
+          headsStore.put(nextHead);
+          await txDone(tx);
 
-        const leaseId = `lease-${nextLeaseSeq++}`;
-        writerReleasers.set(leaseId, held);
-        return {
-          leaseId,
-          volume: nextHead.volume,
-          incarnation: nextHead.incarnation,
-          fence: nextHead.fence,
-          epoch: nextHead.epoch,
-          head: nextHead,
-          forkedFrom: null,
-          expiresAt: null,
-        };
-      } catch (err) {
-        releaseHeldLock(held);
-        throw err;
+          const leaseId = `lease-${nextLeaseSeq++}`;
+          writerReleasers.set(leaseId, held);
+          return {
+            leaseId,
+            volume: nextHead.volume,
+            incarnation: nextHead.incarnation,
+            fence: nextHead.fence,
+            epoch: nextHead.epoch,
+            head: nextHead,
+            forkedFrom: null,
+            expiresAt: null,
+          };
+        } catch (err) {
+          releaseHeldLock(held);
+          throw err;
+        }
       }
-    }
 
-    const held = await requestHeldWebLock(lockName, { mode: 'exclusive', ifAvailable: true });
-    if (held) {
-      try {
-        const latest = await readHead(volume);
-        const leaseId = `lease-${nextLeaseSeq++}`;
-        writerReleasers.set(leaseId, held);
-        return {
-          leaseId,
-          volume: latest.volume,
-          incarnation: latest.incarnation,
-          fence: latest.fence,
-          epoch: latest.epoch,
-          head: latest,
-          forkedFrom: null,
-          expiresAt: null,
-        };
-      } catch (err) {
-        releaseHeldLock(held);
-        throw err;
+      const held = await requestHeldWebLock(lockName, { mode: 'exclusive', ifAvailable: true });
+      if (held) {
+        try {
+          const latest = await readHead(volume);
+          const leaseId = `lease-${nextLeaseSeq++}`;
+          writerReleasers.set(leaseId, held);
+          return {
+            leaseId,
+            volume: latest.volume,
+            incarnation: latest.incarnation,
+            fence: latest.fence,
+            epoch: latest.epoch,
+            head: latest,
+            forkedFrom: null,
+            expiresAt: null,
+          };
+        } catch (err) {
+          releaseHeldLock(held);
+          throw err;
+        }
       }
-    }
 
-    if (mode === 'exclusive') {
-      throw errnoError('EBUSY', `volume ${volume} writer lock is held by another tab`);
-    }
+      if (mode === 'exclusive') {
+        throw errnoError('EBUSY', `volume ${volume} writer lock is held by another tab`);
+      }
 
-    if (mode === 'fork-on-busy') {
-      // Hold shared GC lock across source-root selection and fork head publication so GC cannot
-      // sweep the selected root concurrently.
-      const gcLockId = await acquireGcLock(false);
-      try {
+      if (mode === 'fork-on-busy') {
         const db = await getDb();
         for (let attempt = 0; attempt < 16; attempt++) {
           const forkVol = `${volume}-fork-${randomId()}`;
@@ -659,6 +663,10 @@ export function createCowfsStore(options = {}) {
             if (!latest) {
               try { tx.abort(); } catch {}
               throw errnoError('ENOENT', `volume ${volume} not found`);
+            }
+            if (latest.format_version !== COWFS_FORMAT_VERSION) {
+              try { tx.abort(); } catch {}
+              throw errnoError('EPROTONOSUPPORT', 'incompatible volume head format_version');
             }
             const rootHex = digestArrayToHex(latest.root);
             const rootNode = await reqPromise(nodesStore.get(rootHex));
@@ -701,12 +709,12 @@ export function createCowfsStore(options = {}) {
           }
         }
         throw errnoError('EEXIST', `failed to allocate unique fork name for ${volume}`);
-      } finally {
-        releaseGcLock(gcLockId);
       }
-    }
 
-    throw errnoError('EINVAL', `unknown writer mode: ${mode}`);
+      throw errnoError('EINVAL', `unknown writer mode: ${mode}`);
+    } finally {
+      releaseGcLock(gcLockId);
+    }
   }
 
   async function renewWriter(payloadJson) {
@@ -848,7 +856,8 @@ export function createCowfsStore(options = {}) {
       });
     }
 
-    // 4. Advance head atomically.
+    // 4. Advance head atomically. Once a fork commits a user modification (`modified: true`),
+    // it is retained permanently (`ephemeral_if_unmodified: false`) and surfaced in `listVolumes()`.
     const nextHead = {
       format_version: COWFS_FORMAT_VERSION,
       volume: meta.volume,
@@ -857,7 +866,7 @@ export function createCowfsStore(options = {}) {
       epoch: cur.epoch + 1,
       root: [...hexToBytes(meta.newRoot)],
       parent_volume: cur.parent_volume ?? null,
-      ephemeral_if_unmodified: Boolean(cur.ephemeral_if_unmodified),
+      ephemeral_if_unmodified: false,
       modified: true,
       updated_at: meta.committedAt,
     };
@@ -1526,6 +1535,49 @@ export function createCowfsStore(options = {}) {
     }
   }
 
+  async function listVolumes({ probeLocks = true } = {}) {
+    const db = await getDb();
+    const tx = openTx(db, ['heads'], 'readonly');
+    const heads = [];
+    await forEachCursor(tx.objectStore('heads'), cursor => {
+      if (cursor.value) heads.push(structuredClone(cursor.value));
+    });
+    await txDone(tx);
+
+    const out = [];
+    for (const h of heads) {
+      let busy = false;
+      if (probeLocks && locksApi && typeof locksApi.request === 'function') {
+        try {
+          const lName = await volLockName(h.volume);
+          const probe = await requestHeldWebLock(lName, { mode: 'exclusive', ifAvailable: true });
+          if (!probe) {
+            busy = true;
+          } else {
+            probe.release();
+            await probe.done?.catch(() => {});
+          }
+        } catch {
+          busy = false;
+        }
+      }
+      out.push({
+        volume: h.volume,
+        format_version: h.format_version,
+        incarnation: h.incarnation,
+        fence: h.fence,
+        epoch: h.epoch,
+        root: digestArrayToHex(h.root),
+        parent_volume: h.parent_volume ?? null,
+        ephemeral_if_unmodified: Boolean(h.ephemeral_if_unmodified),
+        modified: Boolean(h.modified),
+        updated_at: h.updated_at ?? null,
+        busy,
+      });
+    }
+    return out.sort((a, b) => a.volume.localeCompare(b.volume));
+  }
+
   // Test helpers (explicitly named for diagnostics / corruption injection in tests).
   async function _setFormatVersionForTest(version) {
     const db = await getDb();
@@ -1578,6 +1630,7 @@ export function createCowfsStore(options = {}) {
       stats.sliceReads = 0;
     },
     formatVersion,
+    listVolumes,
     createVolume,
     readHead,
     pinRoRoot,

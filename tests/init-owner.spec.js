@@ -1,5 +1,6 @@
 import { test, expect } from './test.js';
 import { api, call } from './sys.js';
+import { logoutLocalUser, pageCall, switchLocalUser } from './ui.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
@@ -242,24 +243,23 @@ test('each tab boots its own independent PID 1 with zero MachineInit RPCs and re
   }
 });
 
-test('browser login changes preserve local init ownership and running process credentials', async ({ page }) => {
+test('local account changes preserve local init ownership and running process credentials', async ({ page }) => {
   await ready(page);
   await expect.poll(async () => (await status(page)).coordinator).toBe(true);
   const before = await status(page);
-  const guest = await call(page.request, 'getcreds');
+  const initialCreds = await pageCall(page, 'getcreds');
+  expect(initialCreds.uid).toBe(1000);
   const input = page.locator('#command');
   await input.fill('sh -i');
   await input.press('Enter');
   await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'input', { timeout: 15_000 });
-  await signIn(page.request);
-  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+  await switchLocalUser(page, 'root');
   await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(0);
   await input.pressSequentially('id -u');
   await input.press('Enter');
-  await expect(page.locator('.terminal-screen')).toContainText(String(guest.uid));
-  await api(page.request, 'logout');
-  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
-  await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(guest.uid);
+  await expect(page.locator('.terminal-screen')).toContainText(String(initialCreds.uid));
+  await logoutLocalUser(page);
+  await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(initialCreds.uid);
   const after = await status(page);
   expect(after.coordinator).toBe(true);
   expect(after.init.boot).toBe(before.init.boot);

@@ -6,23 +6,11 @@ const definitions = await Promise.all((await readdir('crates/core/src/cli')).fil
 const commands = definitions.flatMap(source => [...source.matchAll(/#\[command\(\s*name = "([a-z]+)"/g)].map(match => match[1]));
 
 test('every command has side-effect-free help, including privileged and interactive commands', async ({ page }) => {
-  // Wait for the page's asynchronous kernel, guest account, and remote device bootstrap before observing help commands.
+  // Wait for the page's local kernel and default auto-login bootstrap before observing help commands.
   await page.goto('/');
   await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
-  await expect.poll(() => page.evaluate(async () => {
-    const s = await window.os?.loginSession?.();
-    if (!s?.connected || s?.session?.uid == null) return false;
-    const res = await fetch('/api/sys', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        calls: ['/dev/archive', '/dev/media', '/dev/present', '/dev/snd'].map(path => ({ lstat: { path } })),
-      }),
-    });
-    if (!res.ok) return false;
-    const { results } = await res.json();
-    return Array.isArray(results) && results.length === 4 && results.every(r => r && 'ok' in r);
-  }), { timeout: 30_000 }).toBe(true);
+  await page.waitForFunction(() => Boolean(window.os?.bootStatus && window.os?.exec));
+  await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: user · Cloud: Signed out', { timeout: 20_000 });
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   const requests = [];
   // External help has a normal exec/exit lifecycle. It may read files and descriptors, but
@@ -57,7 +45,7 @@ test('every command has side-effect-free help, including privileged and interact
     await expect(page.locator('.transcript pre').last()).toContainText('Usage: ');
   }
   expect(requests).toEqual([]);
-  await expect(page.locator('.lock')).toContainText('guest');
+  await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: user · Cloud: Signed out');
   // Explicit -- keeps -h a path instead of interpreting it as help.
   await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await input.fill('rm -- -h'); await input.press('Enter');

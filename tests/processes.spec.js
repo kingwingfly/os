@@ -1,5 +1,11 @@
 import { test, expect } from './test.js';
+import { readFile } from 'node:fs/promises';
 import { put, rmrf } from './sys.js';
+import { cloudSignIn, cloudSignOut, pageGetBytes, pageRmrf } from './ui.js';
+
+const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD
+  || process.env.OS_PASSWORD
+  || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 
 // Processes of /usr/bin (web/wasi/exec.mjs): a pipeline's run at once, through pipes in memory the
 // page shares with them, which it may only when isolated from other sites (web/_headers); the
@@ -124,30 +130,29 @@ test('a process reads one file after another; cp copies what the kernel makes, r
   await ready(page);
   await run(page, 'coreutils md5sum /etc/passwd /etc/group');
   await expect(last(page)).toHaveText(/^[0-9a-f]{32}  \/etc\/passwd\n[0-9a-f]{32}  \/etc\/group$/);
-  const copy = '/guest/passwd-' + Date.now().toString(36);
+  const copy = '/tmp/passwd-' + Date.now().toString(36);
   try {
     await run(page, `cp /etc/passwd ${copy}`);
-    // Preserved test stores can have more accounts than the transcript retains.
-    // Check all copied bytes independently, then display only the first line.
-    const source = await page.request.get('/api/file?path=/etc/passwd');
-    const target = await page.request.get('/api/file?path=' + copy);
-    expect(source.ok()).toBe(true); expect(target.ok()).toBe(true);
-    expect(Buffer.compare(await target.body(), await source.body())).toBe(0);
+    const source = await pageGetBytes(page, '/etc/passwd');
+    const target = await pageGetBytes(page, copy);
+    expect(source).toBeTruthy(); expect(target).toBeTruthy();
+    expect(Buffer.compare(target, source)).toBe(0);
     await run(page, `cat ${copy} | head -n 1`);
     await expect(last(page)).toContainText('root:x:0:0');
   } finally {
-    await rmrf(page.request, copy);
+    await pageRmrf(page, copy);
   }
 });
 
 test('cp copies generated size-zero files beyond the inline syscall limit', async ({ page }) => {
   await ready(page);
+  await cloudSignIn(page, 'root', rootPassword);
   const source = '/guest/copy-large-' + crypto.randomUUID(), target = source + '-copy';
   const bytes = Buffer.from('large fallback data\n'.repeat(20000));
   expect(bytes.length).toBeGreaterThan(256 * 1024);
   expect((await put(page.request, '/api/file?path=' + source, { data: bytes })).ok()).toBe(true);
   // Intercept both v1 /api/sys and v2 /api/fs to model generated size-zero metadata and EOPNOTSUPP reflink
-  // while all opens, reads, writes and closes still use real authenticated storage.
+  // while all opens, reads, writes and closes still use real authenticated CloudFs storage at `/mnt/cloud`.
   await page.route('**/api/sys', async route => {
     const body = route.request().postDataJSON(), indexes = [], metadata = [];
     body.calls = body.calls.map((call, i) => {
@@ -182,7 +187,7 @@ test('cp copies generated size-zero files beyond the inline syscall limit', asyn
     return route.fulfill({ response });
   });
   try {
-    await run(page, `cp ${source} ${target}`);
+    await run(page, `cp /mnt/cloud${source} /mnt/cloud${target}`);
     const copied = await page.request.get('/api/file?path=' + target);
     expect(copied.ok()).toBe(true);
     const result = await copied.body(); expect(result.length).toBe(bytes.length); expect(Buffer.compare(result, bytes)).toBe(0);
@@ -190,5 +195,6 @@ test('cp copies generated size-zero files beyond the inline syscall limit', asyn
     await page.unroute('**/api/sys');
     await page.unroute('**/api/fs');
     await rmrf(page.request, target); await rmrf(page.request, source);
+    await cloudSignOut(page).catch(() => {});
   }
 });

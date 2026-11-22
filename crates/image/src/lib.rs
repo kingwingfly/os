@@ -370,6 +370,7 @@ impl Image {
                                     | "/dev"
                                     | "/dev/pts"
                                     | "/mnt"
+                                    | "/mnt/cloud"
                                     | "/mnt/local"
                                     | "/mnt/shared"
                                     | "/opt"

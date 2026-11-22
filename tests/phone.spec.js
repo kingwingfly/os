@@ -1,35 +1,31 @@
 import { test, expect, devices } from './test.js';
 import { readFile } from 'node:fs/promises';
-import { api, mkdirp, put, rmrf } from './sys.js';
-import { browse, promptPath } from './ui.js';
-const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+import { browse, pageMkdirp, pagePut, pageRmrf, promptPath } from './ui.js';
+
 const { defaultBrowserType, ...pixel } = devices['Pixel 7'];
 test.use(pixel);
 
 let base;
-test.beforeEach(async ({ context }) => {
-  base = '/phone-' + Date.now().toString(36);
-  await context.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'phone-' + base });
-  const headers = { Origin: origin };
-  expect((await api(context.request, 'login', { headers, data: { password } })).ok()).toBe(true);
-  await mkdirp(context.request, base);
-});
-test.afterEach(async ({ context }) => {
-  await rmrf(context.request, base);
+async function initPhone(page) {
+  base = '/home/user/phone-' + Date.now().toString(36);
+  await page.goto('/');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await pageMkdirp(page, base, 0o755);
+}
+test.afterEach(async ({ page }) => {
+  if (base) await pageRmrf(page, base, { sudo: true }).catch(() => {});
 });
 const dock = (page, name) => page.getByRole('navigation', { name: 'Dock' }).getByRole('button', { name, exact: true });
 
 test('a phone shows the terminal as an app that keeps its command line above the keyboard', async ({ page }) => {
-  await page.goto('/');
+  await initPhone(page);
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   // The wallpaper gives way, and the terminal fills the desktop alone; the account stays on
   // one line.
   await expect(page.locator('.intro')).toBeHidden();
   await expect(page.getByRole('region', { name: 'File manager', exact: true })).toBeHidden();
   await expect(page.getByRole('navigation', { name: 'Dock' })).toBeVisible();
-  expect(await page.locator('.lock').evaluate(e => e.getBoundingClientRect().height)).toBeLessThan(60);
+  expect(await page.locator('.cloud-panel-trigger').evaluate(e => e.getBoundingClientRect().height)).toBeLessThan(60);
   const bottom = async () => { const box = await input.boundingBox(); return box.y + box.height; };
   expect(await bottom()).toBeLessThanOrEqual(page.viewportSize().height);
   // Nothing types capitals or corrections into commands.
@@ -55,9 +51,8 @@ test('a phone shows the terminal as an app that keeps its command line above the
 });
 
 test('keys a phone lacks are buttons, and Upload opens the chooser at once, before any request', async ({ page }) => {
-  await page.goto('/');
+  await initPhone(page);
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await input.fill('cd ' + base); await input.press('Enter');
   await expect(promptPath(page)).toHaveText(base);
   // Tab completes, ↑ recalls, ^C clears.
@@ -82,12 +77,10 @@ test('keys a phone lacks are buttons, and Upload opens the chooser at once, befo
   await expect(page.getByRole('status', { name: 'Upload progress' })).toContainText('✓ photo.png', { timeout: 20_000 });
 });
 
-test('long names keep one line and scroll; titles keep the file name; the dock switches windows; Escape closes only the dialog', async ({ page, context }) => {
-  const headers = { Origin: origin }, long = 'a-very-long-file-name-that-does-not-fit-on-a-phone-screen-at-all.txt';
-  expect((await put(context.request, '/api/file?path=' + encodeURIComponent(base + '/' + long), { headers, data: 'long\n' })).status()).toBe(201);
-  await page.goto('/');
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+test('long names keep one line and scroll; titles keep the file name; the dock switches windows; Escape closes only the dialog', async ({ page }) => {
+  await initPhone(page);
+  const long = 'a-very-long-file-name-that-does-not-fit-on-a-phone-screen-at-all.txt';
+  await pagePut(page, base + '/' + long, 'long\n', { mode: 0o644 });
   await dock(page, 'Files').tap();
   await browse(page, base);
   // One line, sliding to show the rest: a touch screen points at nothing to wait for.
@@ -126,10 +119,9 @@ test('long names keep one line and scroll; titles keep the file name; the dock s
   await expect(terminal).toBeVisible();
 });
 
-test('a tap on the files opens what it means, in the Files, without the terminal or its keyboard', async ({ page, context }) => {
-  await mkdirp(context.request, base + '/docs');
-  await page.goto('/');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+test('a tap on the files opens what it means, in the Files, without the terminal or its keyboard', async ({ page }) => {
+  await initPhone(page);
+  await pageMkdirp(page, base + '/docs', 0o755);
   await dock(page, 'Files').tap();
   await browse(page, base);
   await page.getByRole('textbox', { name: 'Location' }).blur();

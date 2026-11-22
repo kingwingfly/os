@@ -513,6 +513,8 @@ pub mod cowfs_ioctl {
     pub const COWFS_IOC_FORK: u32 = 0x5457_0202;
     /// Query volume UUID, root digest, epoch, writer model, and durability metadata.
     pub const COWFS_IOC_INFO: u32 = 0x5457_0203;
+    /// Run a read-only Merkle integrity check (`os_cowfs::fsck`) against a pinned volume head.
+    pub const COWFS_IOC_FSCK: u32 = 0x5457_0204;
     /// Query `/dev/vdN` managed volume device metadata.
     pub const BLK_INFO: u32 = 0x5457_0210;
     /// Query `/dev/vdN` writer lease state.

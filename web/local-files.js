@@ -20,14 +20,13 @@ const FS_CALL_NAMES = new Set([
   'ioctl', 'inotify_add_watch', 'inotify_rm_watch',
 ]);
 
-const ACCOUNT_MUTATION_CALLS = new Set([
-  'login', 'logout', 'sudo', 'passwd', 'register', 'useradd', 'userdel', 'usermod',
-  'groupadd', 'groupdel', 'groupmod', 'gpasswd', 'login_session', 'machine_init',
+const LOCAL_ACCOUNT_CALLS = new Set([
+  'getcreds', 'login', 'logout', 'sudo', 'passwd',
+  'useradd', 'usermod', 'userdel', 'groupadd', 'groupmod', 'groupdel',
 ]);
 
-const SERVER_ACCOUNT_MUTATION_CALLS = new Set([
-  'login', 'logout', 'sudo', 'passwd', 'register', 'useradd', 'userdel', 'usermod',
-  'groupadd', 'groupdel', 'groupmod', 'gpasswd',
+const SERVER_ONLY_SYS_CALLS = new Set([
+  'register', 'gpasswd', 'login_session', 'machine_init',
 ]);
 
 function isRemoteServerDevPath(raw, includeDir = false) {
@@ -44,31 +43,43 @@ function isRemoteServerDevPath(raw, includeDir = false) {
 }
 
 const REMOTE_DEV_PATH_OPS = new Set([
-  'stat', 'lstat', 'getdents', 'mknod', 'unlink', 'getxattr', 'setxattr', 'listxattr', 'removexattr', 'open',
+  'stat', 'lstat', 'access', 'getdents', 'mknod', 'unlink', 'chmod',
+  'getxattr', 'setxattr', 'listxattr', 'removexattr', 'open', 'inotify_add_watch',
 ]);
 const REMOTE_DEV_REF_OPS = new Set(['ioctl', 'close', 'fstat', 'pread', 'pwrite']);
+
+function isAttendingCloudPath(raw) {
+  const scope = globalThis.__osAttendingCloudScope;
+  if (!scope || typeof raw !== 'string') return false;
+  return raw === scope.file || (scope.dir && raw.startsWith(scope.dir));
+}
 
 function isRemoteServerDevBatch(calls) {
   if (!Array.isArray(calls) || calls.length === 0) return false;
   const devOpenIndices = new Set();
+  let hasDevPathOp = false;
   for (let i = 0; i < calls.length; i++) {
     const c = calls[i];
     const name = callName(c);
     const arg = typeof c === 'object' && c !== null ? Object.values(c)[0] : null;
     if (!arg || typeof arg !== 'object') return false;
     if (REMOTE_DEV_PATH_OPS.has(name)) {
-      if (!isRemoteServerDevPath(arg.path, name === 'getdents' || name === 'stat' || name === 'lstat')) {
+      const includeDir = name === 'getdents' || name === 'stat' || name === 'lstat' || name === 'access' || name === 'inotify_add_watch';
+      if (!isRemoteServerDevPath(arg.path, includeDir)) {
         return false;
       }
+      hasDevPathOp = true;
       if (name === 'open') devOpenIndices.add(i);
     } else if (REMOTE_DEV_REF_OPS.has(name)) {
       const ref = arg.fd && typeof arg.fd === 'object' ? arg.fd.ref : null;
       if (typeof ref !== 'number' || !devOpenIndices.has(ref)) return false;
+    } else if (name === 'inotify_rm_watch') {
+      // Allowed when piggybacked by HttpSys onto a remote /dev/{present,snd} batch.
     } else {
       return false;
     }
   }
-  return true;
+  return hasDevPathOp;
 }
 
 function callName(call) {
@@ -160,12 +171,13 @@ export function installLocalFiles() {
     const request = new Request(input, options);
     const url = new URL(request.url);
     if (url.origin !== location.origin || !url.pathname.startsWith('/api/')) return network(request);
-    if (request.headers.has('X-Process-Token')) {
+    if (request.headers.has('X-Process-Token') || request.headers.has('X-Registry')) {
       return network(request);
     }
 
     try {
-      // 1. Page `POST /api/sys` batches containing filesystem calls
+      // 1. Page `POST /api/sys` batches: filesystem + local OS account calls run 100% locally
+      // inside `crates/client-kernel` (`os-cowfs` + `LocalAccountStore`) with ZERO network RPCs!
       if (url.pathname === '/api/sys' && request.method === 'POST') {
         const rawBody = typeof options?.body === 'string' ? options.body : await request.clone().text();
         const body = JSON.parse(rawBody);
@@ -179,8 +191,11 @@ export function installLocalFiles() {
               signal: request.signal,
             });
         if (Array.isArray(body.calls) && body.calls.length > 0) {
-          const hasFs = body.calls.some(c => FS_CALL_NAMES.has(callName(c)));
-          const hasAccountMut = body.calls.some(c => ACCOUNT_MUTATION_CALLS.has(callName(c)));
+          const hasFsOrLocalAccount = body.calls.some(c => {
+            const name = callName(c);
+            return FS_CALL_NAMES.has(name) || LOCAL_ACCOUNT_CALLS.has(name);
+          });
+          const hasServerOnly = body.calls.some(c => SERVER_ONLY_SYS_CALLS.has(callName(c)));
           if (body.proc || body.pid) {
             if (body.calls.some(touchesPrivateCarrier)) {
               return json({ error: 'process credentials are not page filesystem grants', errno: 'EACCES' }, 403);
@@ -195,7 +210,7 @@ export function installLocalFiles() {
             }
             return serializedNetwork(sendSys);
           }
-          if (hasFs && !hasAccountMut) {
+          if (hasFsOrLocalAccount && !hasServerOnly) {
             if (isRemoteServerDevBatch(body.calls)) {
               return serializedNetwork(sendSys);
             }
@@ -208,43 +223,7 @@ export function installLocalFiles() {
             return json({ results });
           }
         }
-        const response = await serializedNetwork(sendSys);
-        if (response.ok && Array.isArray(body?.calls) && !body.proc && !body.pid) {
-          const hasServerAccountMut = body.calls.some(c => SERVER_ACCOUNT_MUTATION_CALLS.has(callName(c)));
-          const getcredsIndex = body.calls.findIndex(c => callName(c) === 'getcreds');
-          if (hasServerAccountMut) {
-            try {
-              const payload = await response.clone().json();
-              const anyOk = Array.isArray(payload?.results) && payload.results.some(r => r && 'ok' in r);
-              if (anyOk) {
-                lastSyncedKey = null;
-                await kernelCall('login_refresh').catch(() => {});
-              }
-            } catch { /* ignore non-JSON */ }
-          } else if (getcredsIndex >= 0) {
-            try {
-              const payload = await response.clone().json();
-              const who = payload?.results?.[getcredsIndex]?.ok;
-              if (who && typeof who.uid === 'number') {
-                const key = `${who.uid}:${who.user ?? ''}:${!!who.signed_in}`;
-                if (key !== lastSyncedKey) {
-                  lastSyncedKey = key;
-                  await kernelCall('sync_account', who).catch(() => {});
-                }
-              }
-            } catch { /* ignore non-JSON */ }
-          }
-        }
-        return response;
-      }
-
-      if ((url.pathname === '/api/login' || url.pathname === '/api/logout') && request.method === 'POST') {
-        const response = await serializedNetwork(() => network(request));
-        if (response.ok) {
-          lastSyncedKey = null;
-          await kernelCall('login_refresh').catch(() => {});
-        }
-        return response;
+        return serializedNetwork(sendSys);
       }
 
       // 2. Client-fd chunked uploads (`PUT /api/pwrite?fd=...&index=...` when `fd >= CLIENT_PAGE_FD_BASE`)
@@ -271,7 +250,8 @@ export function installLocalFiles() {
         url.searchParams.has('path') &&
         !url.searchParams.has('compile') &&
         !url.searchParams.has('token') &&
-        !isRemoteServerDevPath(url.searchParams.get('path'))
+        !isRemoteServerDevPath(url.searchParams.get('path')) &&
+        !isAttendingCloudPath(url.searchParams.get('path'))
       ) {
         if (!['GET', 'HEAD'].includes(request.method)) return json({ errno: 'EINVAL' }, 400);
         const path = url.searchParams.get('path');

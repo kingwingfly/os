@@ -1,10 +1,10 @@
 import { test, expect } from './storage-test.js';
+import { existsSync } from 'node:fs';
 import { readFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { api } from './sys.js';
 
 const app = page => page.locator('#window-mounts');
 async function ready(page) { await page.goto('/'); await expect(page.locator('.files-mounts')).toBeVisible(); await page.waitForFunction(() => Boolean(window.os?.localMountList)); }
@@ -134,8 +134,10 @@ test('a pending picker is discarded when the login changes', async ({ page }) =>
 
 test('browsers without a picker mount the original folder through the helper', async ({ page }) => {
   const directory = await mkdtemp(join(tmpdir(), 'os-mount-ui-'));
-  const binary = process.env.OS_LOCAL_HELPER_BINARY || join(JSON.parse(execFileSync('cargo', ['metadata', '--no-deps', '--format-version=1'], { encoding: 'utf8' })).target_directory, 'debug/os-local-helper');
-  const helper = spawn(binary, ['--root', directory, '--origin', process.env.OS_TEST_URL || 'http://127.0.0.1:8787', '--write'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const stateDir = await mkdtemp(join(tmpdir(), 'os-mount-ui-state-'));
+  const localBinary = resolve('target/debug/os-local-helper');
+  const binary = process.env.OS_LOCAL_HELPER_BINARY || (existsSync(localBinary) ? localBinary : join(JSON.parse(execFileSync('cargo', ['metadata', '--no-deps', '--format-version=1'], { encoding: 'utf8' })).target_directory, 'debug/os-local-helper'));
+  const helper = spawn(binary, ['--root', directory, '--state-dir', stateDir, '--origin', process.env.OS_TEST_URL || 'http://127.0.0.1:8787', '--write'], { stdio: ['ignore', 'pipe', 'pipe'] });
   try {
     const connection = await new Promise((resolve, reject) => {
       const lines = createInterface({ input: helper.stdout }), timer = setTimeout(() => reject(new Error('helper startup timeout')), 5000);
@@ -159,6 +161,7 @@ test('browsers without a picker mount the original folder through the helper', a
   } finally {
     helper.kill('SIGTERM'); if (helper.exitCode === null && helper.signalCode === null) await new Promise(resolve => helper.once('exit', resolve));
     await rm(directory, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
   }
 });
 

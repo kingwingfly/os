@@ -40,29 +40,31 @@ pub struct FsckReport {
     pub errors: Vec<String>,
 }
 
-/// Verify a `cowfs` volume end-to-end without mutating any data.
+/// Verify an exact pinned `cowfs` [`cowtree::VolumeHead`] end-to-end without mutating any data.
 ///
-/// Returns `Err(Errno::EPROTONOSUPPORT)` on incompatible format version and `Err(Errno::ENOENT)`
-/// if `volume` does not exist. Structural and checksum corruptions are recorded in `report.errors`
-/// (`report.ok == false`).
-pub async fn verify_volume<H: HeadStore, P: PackStore>(
+/// Caller MUST already protect `head` from concurrent garbage collection (e.g., by holding the
+/// shared GC lock `head_store.acquire_gc_lock(false)` or an active RO/writer pin). For callers
+/// without an outer GC lock, use [`verify_head`] or [`verify_volume`].
+///
+/// Returns `Err(Errno::EPROTONOSUPPORT)` on incompatible format version. Structural and checksum
+/// corruptions are recorded in `report.errors` (`report.ok == false`).
+pub async fn verify_head_pinned<H: HeadStore, P: PackStore>(
     head_store: &H,
     pack_store: &P,
-    volume: &cowtree::VolumeId,
+    head: &cowtree::VolumeHead,
 ) -> Result<FsckReport> {
     if let Some(ver) = head_store.format_version().await?
         && ver != COWFS_FORMAT_VERSION
     {
         return Err(Errno::EPROTONOSUPPORT);
     }
-    let head = head_store.read_head(volume).await?;
     if head.format_version != COWFS_FORMAT_VERSION {
         return Err(Errno::EPROTONOSUPPORT);
     }
 
     let mut report = FsckReport {
         ok: true,
-        volume: volume.0.clone(),
+        volume: head.volume.0.clone(),
         epoch: head.epoch,
         ..FsckReport::default()
     };
@@ -112,6 +114,40 @@ pub async fn verify_volume<H: HeadStore, P: PackStore>(
     report.packs_verified = verified_packs.len();
     report.ok = report.errors.is_empty();
     Ok(report)
+}
+
+/// Verify an exact [`cowtree::VolumeHead`] end-to-end while holding the shared GC lock so
+/// concurrent garbage collection cannot sweep objects belonging to `head` during the scan.
+pub async fn verify_head<H: HeadStore, P: PackStore>(
+    head_store: &H,
+    pack_store: &P,
+    head: &cowtree::VolumeHead,
+) -> Result<FsckReport> {
+    let _gc_guard = head_store.acquire_gc_lock(false).await?;
+    verify_head_pinned(head_store, pack_store, head).await
+}
+
+/// Verify a `cowfs` volume end-to-end without mutating any data.
+///
+/// Acquires the shared GC lock BEFORE reading the volume head so concurrent GC cannot sweep
+/// objects reachable from the head being scanned.
+///
+/// Returns `Err(Errno::EPROTONOSUPPORT)` on incompatible format version and `Err(Errno::ENOENT)`
+/// if `volume` does not exist. Structural and checksum corruptions are recorded in `report.errors`
+/// (`report.ok == false`).
+pub async fn verify_volume<H: HeadStore, P: PackStore>(
+    head_store: &H,
+    pack_store: &P,
+    volume: &cowtree::VolumeId,
+) -> Result<FsckReport> {
+    let _gc_guard = head_store.acquire_gc_lock(false).await?;
+    if let Some(ver) = head_store.format_version().await?
+        && ver != COWFS_FORMAT_VERSION
+    {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+    let head = head_store.read_head(volume).await?;
+    verify_head_pinned(head_store, pack_store, &head).await
 }
 
 /// Same as [`verify_volume`], returning `Err(Errno::EIO)` if any integrity error was detected.

@@ -61,3 +61,29 @@ impl Notification {
         Ok(true)
     }
 }
+
+/// Send a systemd-compatible `NOTIFY_SOCKET` datagram (`READY=1`, optional `STATUS=...`) over
+/// `AF_UNIX` `SOCK_DGRAM` (`#57` `L3d`, Contract v2 §2.8). Peer identity is stamped by the kernel
+/// via `SO_PEERCRED`, never forged in the payload.
+#[allow(dead_code)]
+pub fn notify_socket_ready(status: Option<&str>) -> io::Result<bool> {
+    let Ok(path) = std::env::var("NOTIFY_SOCKET") else {
+        return Ok(false);
+    };
+    if path.is_empty() {
+        return Ok(false);
+    }
+    let sock = os_posix::socket::UnixDatagram::unbound()
+        .map_err(|e| io::Error::other(format!("notify socket create failed: {}", e.text())))?;
+    let mut payload = String::from("READY=1\n");
+    if let Some(text) = status
+        && !text.is_empty()
+    {
+        payload.push_str("STATUS=");
+        payload.push_str(&text.replace(['\n', '\r'], " "));
+        payload.push('\n');
+    }
+    sock.send_to(payload.as_bytes(), &path)
+        .map_err(|e| io::Error::other(format!("notify send to {path} failed: {}", e.text())))?;
+    Ok(true)
+}

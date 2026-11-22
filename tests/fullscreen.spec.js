@@ -1,6 +1,17 @@
 import { test, expect } from './test.js';
+import { pagePut } from './ui.js';
+
+const FIXTURES = {
+  'welcome.md': '# OS\n\nLocal offline OS.\n',
+  'demo.slides.md': '# Slide 1\n\nWelcome to fullscreen slides.\n\nNote:\nSpeaker notes.\n\n---\n\n# One filesystem\n\nSecond slide content.\n',
+};
+
 async function open(page, path) {
   await page.goto('/');
+  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  if (FIXTURES[path]) {
+    await pagePut(page, '/' + path, FIXTURES[path], { mode: 0o644, sudo: true });
+  }
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill('open ' + path); await input.press('Enter');
   await expect(page.locator('#viewer')).toBeVisible();
@@ -12,7 +23,7 @@ async function enter(page) {
   await expect(page.locator('#fullscreen-error')).toBeHidden();
   await expect.poll(() => page.locator('#viewer-surface').evaluate(el => {
     const box = el.getBoundingClientRect();
-    return Math.abs(box.width-innerWidth) + Math.abs(box.height-innerHeight) + Math.abs(box.x) + Math.abs(box.y);
+    return Math.abs(box.width - innerWidth) + Math.abs(box.height - innerHeight) + Math.abs(box.x) + Math.abs(box.y);
   })).toBeLessThan(3);
 }
 

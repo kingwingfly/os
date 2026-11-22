@@ -2,7 +2,7 @@ import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, call, errno, rmrf } from './sys.js';
 
-const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const nullPath = '/dev/null';
 const byteHeaders = { Origin: origin, 'Content-Type': 'application/octet-stream' };

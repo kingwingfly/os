@@ -1,16 +1,12 @@
-import { test, expect, request as playwrightRequest } from './test.js';
-import { readFile } from 'node:fs/promises';
+import { test, expect } from './test.js';
 import { createHash } from 'node:crypto';
 import binaryen from 'binaryen';
-import { api, call, mkdirp, program, put, rmrf } from './sys.js';
+import { pageCall, pageMkdirp, pagePut, pageRmrf, switchLocalUser } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const userPassword = 'mount-isolation-pass-9482';
-const fileUrl = path => '/api/file?path=' + encodeURIComponent(path);
 
-let ipSeq = 0;
-const nextIp = label => `mount-iso-${label}-${Date.now()}-${++ipSeq}`;
+let userSeq = 0;
 
 const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
@@ -59,23 +55,16 @@ function flattenFindmnt(nodes, out = []) {
   return out;
 }
 
-async function createWheelUser(rootApi, prefix) {
-  const username = `${prefix}${Date.now().toString(36)}${(++ipSeq).toString(36)}`;
-  expect((await program(rootApi, ['useradd', '-m', '-G', 'wheel', username])).ok()).toBe(true);
-  expect((await api(rootApi, 'passwd', { data: { username, password: userPassword } })).ok()).toBe(true);
+async function createLocalWheelUser(page, prefix) {
+  const username = `${prefix}${Date.now().toString(36)}${(++userSeq).toString(36)}`;
+  const add = await execCmd(page, ['/usr/bin/useradd', '-m', '-G', 'wheel', username], { sudo: true });
+  expect(add.status, add.stderr).toBe(0);
+  await pageCall(page, { passwd: { username, password: userPassword, force: true } }, { sudo: true });
   return username;
 }
 
-async function openUserSession(browser, username, { sudo = false } = {}) {
-  const ip = nextIp(username);
-  const context = await browser.newContext({
-    extraHTTPHeaders: { 'CF-Connecting-IP': ip },
-  });
-  const headers = { Origin: origin, 'CF-Connecting-IP': ip };
-  expect((await api(context.request, 'login', { headers, data: { username, password: userPassword } })).ok()).toBe(true);
-  if (sudo) {
-    expect((await api(context.request, 'sudo', { headers, data: { password: userPassword } })).ok()).toBe(true);
-  }
+async function openLocalSession(browser) {
+  const context = await browser.newContext();
   const page = await context.newPage();
   await page.goto(origin + '/');
   await page.waitForFunction(() => Boolean(window.os?.exec && window.os?.localMounts));
@@ -83,8 +72,17 @@ async function openUserSession(browser, username, { sudo = false } = {}) {
   return { context, page };
 }
 
+async function loginLocalWheelUser(page, username, { sudo = false } = {}) {
+  await switchLocalUser(page, username, { password: userPassword, sudo: false });
+  if (sudo) {
+    await pageCall(page, { sudo: { password: userPassword, revoke: false } });
+  }
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('os:changed')));
+  await expect(page.locator('.cloud-panel-trigger')).toContainText(`Local: ${username}`);
+}
+
 function buildUnshareHelperWasm(scriptPath) {
-  // Calls os.unshare(CLONE_NEWNS = 0x20000); on failure exits with -ret (e.g. EPERM = 1).
+  // Calls os.unshare(CLONE_NEWNS = 0x20000); on failure exits with -ret (e.g. EPERM = 63).
   // On success calls os.execve({"file":"/usr/bin/sh","argv":["sh",scriptPath],"env":[],"search":false}).
   const reqJson = JSON.stringify({
     file: '/usr/bin/sh',
@@ -114,27 +112,15 @@ function buildUnshareHelperWasm(scriptPath) {
   }
 }
 
-let rootApi;
-test.beforeAll(async () => {
-  rootApi = await playwrightRequest.newContext({
-    baseURL: origin,
-    extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': nextIp('root-admin') },
-  });
-  expect((await api(rootApi, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
-});
-
-test.afterAll(async () => {
-  await rootApi?.dispose();
-});
-
 test('CLI sudo mount -t tmpfs syncs across findmnt, mount, df, Files UI, and Mounts UI, and sudo umount removes it everywhere', async ({ browser }) => {
   test.setTimeout(120_000);
-  const alice = await createWheelUser(rootApi, 'mntsync');
   const scratch = `/tmp/scratch-${crypto.randomUUID()}`;
   let session;
   try {
-    session = await openUserSession(browser, alice, { sudo: true });
+    session = await openLocalSession(browser);
     const { page } = session;
+    const alice = await createLocalWheelUser(page, 'mntsync');
+    await loginLocalWheelUser(page, alice, { sudo: true });
 
     await runCli(page, `mkdir -p ${scratch}`);
     await runCli(page, `sudo mount -t tmpfs -o size=4194304,mode=1777 tmpfs ${scratch}`);
@@ -186,44 +172,42 @@ test('CLI sudo mount -t tmpfs syncs across findmnt, mount, df, Files UI, and Mou
   } finally {
     if (session) {
       await execCmd(session.page, ['/usr/bin/umount', '-l', scratch], { sudo: true }).catch(() => {});
+      await pageRmrf(session.page, scratch, { sudo: true }).catch(() => {});
       await session.context.close();
     }
-    await rmrf(rootApi, scratch);
-    await program(rootApi, ['userdel', '-r', alice]);
-    await program(rootApi, ['groupdel', alice]);
   }
 });
 
 test('child unshare(CLONE_NEWNS) requires privilege and keeps child mounts invisible to parent shell and Files UI', async ({ browser }) => {
   test.setTimeout(120_000);
-  const alice = await createWheelUser(rootApi, 'nsiso');
-  const work = `/guest/unshare-${crypto.randomUUID()}`;
-  const mnt = `${work}/mnt`;
-  const script = `${work}/child.sh`;
-  const helperBin = `${work}/unshare-exec.wasm`;
-  const releaseGate = `${work}/release`;
-  await mkdirp(rootApi, mnt, 0o755);
-
-  const scriptText = [
-    '#!/bin/sh',
-    'set -e',
-    `mount -t tmpfs tmpfs "${mnt}"`,
-    `printf "isolated\\n" > "${mnt}/secret.txt"`,
-    `findmnt -M "${mnt}" -n -o FSTYPE`,
-    'echo CHILD_READY',
-    `while [ ! -f "${releaseGate}" ]; do sleep 0.1; done`,
-    `cat "${mnt}/secret.txt"`,
-    '',
-  ].join('\n');
-  expect((await put(rootApi, fileUrl(script), { data: scriptText })).ok()).toBe(true);
-  await call(rootApi, { chmod: { path: script, mode: 0o755 } });
-  expect((await put(rootApi, fileUrl(helperBin), { data: buildUnshareHelperWasm(script) })).ok()).toBe(true);
-  await call(rootApi, { chmod: { path: helperBin, mode: 0o755 } });
-
   let session;
+  let work;
   try {
-    session = await openUserSession(browser, alice, { sudo: true });
+    session = await openLocalSession(browser);
     const { page } = session;
+    const alice = await createLocalWheelUser(page, 'nsiso');
+    await loginLocalWheelUser(page, alice, { sudo: true });
+
+    work = `/home/${alice}/unshare-${crypto.randomUUID()}`;
+    const mnt = `${work}/mnt`;
+    const script = `${work}/child.sh`;
+    const helperBin = `${work}/unshare-exec.wasm`;
+    const releaseGate = `${work}/release`;
+    await pageMkdirp(page, mnt, 0o755);
+
+    const scriptText = [
+      '#!/bin/sh',
+      'set -e',
+      `mount -t tmpfs tmpfs "${mnt}"`,
+      `printf "isolated\\n" > "${mnt}/secret.txt"`,
+      `findmnt -M "${mnt}" -n -o FSTYPE`,
+      'echo CHILD_READY',
+      `while [ ! -f "${releaseGate}" ]; do sleep 0.1; done`,
+      `cat "${mnt}/secret.txt"`,
+      '',
+    ].join('\n');
+    await pagePut(page, script, scriptText, { mode: 0o755 });
+    await pagePut(page, helperBin, buildUnshareHelperWasm(script), { mode: 0o755 });
 
     // Unprivileged unshare(CLONE_NEWNS) must fail with WASI EPERM (63, per crates/posix/src/lib.rs)
     const denied = await execCmd(page, [helperBin], { sudo: false });
@@ -266,21 +250,19 @@ test('child unshare(CLONE_NEWNS) requires privilege and keeps child mounts invis
     await expect(filesWin.locator('.filename-text')).toHaveCount(0);
 
     // Release child and confirm it still read its own isolated mount cleanly
-    expect((await put(rootApi, fileUrl(releaseGate), { data: 'go\n' })).ok()).toBe(true);
+    await pagePut(page, releaseGate, 'go\n');
     await expect.poll(() => page.evaluate(() => window.__unshareRun?.result?.status), { timeout: 30_000 }).toBe(0);
     expect(await page.evaluate(() => window.__unshareRun.output)).toContain('isolated');
   } finally {
-    if (session) await session.context.close();
-    await rmrf(rootApi, work);
-    await program(rootApi, ['userdel', '-r', alice]);
-    await program(rootApi, ['groupdel', alice]);
+    if (session) {
+      if (work) await pageRmrf(session.page, work, { sudo: true }).catch(() => {});
+      await session.context.close();
+    }
   }
 });
 
 test('two accounts cannot see or traverse each other user mounts (/mnt/local/*, /opt/private/*), even via sudo uid 0 (EACCES)', async ({ browser }) => {
   test.setTimeout(120_000);
-  const alice = await createWheelUser(rootApi, 'aliceiso');
-  const bob = await createWheelUser(rootApi, 'bobiso');
 
   const probeMod = binaryen.parseText('(module (memory (export "memory") 1) (func (export "_start")))');
   const probeBytes = Buffer.from(probeMod.emitBinary());
@@ -308,8 +290,14 @@ test('two accounts cannot see or traverse each other user mounts (/mnt/local/*, 
   let aliceSession;
   let bobSession;
   try {
-    aliceSession = await openUserSession(browser, alice, { sudo: true });
-    bobSession = await openUserSession(browser, bob, { sudo: true });
+    aliceSession = await openLocalSession(browser);
+    bobSession = await openLocalSession(browser);
+
+    const alice = await createLocalWheelUser(aliceSession.page, 'aliceiso');
+    const bob = await createLocalWheelUser(aliceSession.page, 'bobiso');
+    const bobOther = await createLocalWheelUser(bobSession.page, 'bobiso');
+    await loginLocalWheelUser(aliceSession.page, alice, { sudo: true });
+    await loginLocalWheelUser(bobSession.page, bobOther, { sudo: true });
 
     // Alice mounts /mnt/local/notes and activates /opt/private/alice-ext
     await aliceSession.page.evaluate(
@@ -349,28 +337,10 @@ test('two accounts cannot see or traverse each other user mounts (/mnt/local/*, 
     expect(sudoStatExt.stderr).toMatch(/Permission denied/i);
 
     // Switch the SAME client-kernel tab/instance session from Alice to Bob (without page reload)
-    const switchIp = nextIp('switch-bob');
-    expect(
-      (
-        await api(aliceSession.context.request, 'login', {
-          headers: { Origin: origin, 'CF-Connecting-IP': switchIp },
-          data: { username: bob, password: userPassword },
-        })
-      ).ok(),
-    ).toBe(true);
-    expect(
-      (
-        await api(aliceSession.context.request, 'sudo', {
-          headers: { Origin: origin, 'CF-Connecting-IP': switchIp },
-          data: { password: userPassword },
-        })
-      ).ok(),
-    ).toBe(true);
+    await loginLocalWheelUser(aliceSession.page, bob, { sudo: true });
     await aliceSession.page.evaluate(() => {
-      window.dispatchEvent(new Event('os:login-changed'));
       window.dispatchEvent(new CustomEvent('os:changed'));
     });
-    await expect(aliceSession.page.locator('.lock')).toContainText(bob);
 
     // Check both the switched-account tab on the same instance AND Bob's separate session
     for (const page of [aliceSession.page, bobSession.page]) {
@@ -394,25 +364,24 @@ test('two accounts cannot see or traverse each other user mounts (/mnt/local/*, 
   } finally {
     await aliceSession?.context.close();
     await bobSession?.context.close();
-    for (const user of [alice, bob]) {
-      await program(rootApi, ['userdel', '-r', user]);
-      await program(rootApi, ['groupdel', user]);
-    }
   }
 });
 
 test('ordinary umount fails with EBUSY while open descriptors or cwd hold a mount, whereas umount -l detaches immediately and preserves open files', async ({ browser }) => {
   test.setTimeout(120_000);
-  const alice = await createWheelUser(rootApi, 'busylazy');
-  const base = `/guest/busy-${crypto.randomUUID()}`;
-  const mnt = `${base}/mnt`;
-  const stopFlag = `${base}/stop`;
-  await mkdirp(rootApi, mnt, 0o755);
-
   let session;
+  let base;
+  let mnt;
   try {
-    session = await openUserSession(browser, alice, { sudo: true });
+    session = await openLocalSession(browser);
     const { page } = session;
+    const alice = await createLocalWheelUser(page, 'busylazy');
+    await loginLocalWheelUser(page, alice, { sudo: true });
+
+    base = `/tmp/busy-${crypto.randomUUID().slice(0, 8)}`;
+    mnt = `${base}/mnt`;
+    const stopFlag = `${base}/stop`;
+    await pageMkdirp(page, mnt, 0o755);
 
     await runCli(page, `sudo mount -t tmpfs -o mode=1777 tmpfs ${mnt}`);
     await runCli(page, `/usr/bin/sh -c 'printf "kept-across-lazy-detach\\n" > ${mnt}/held.txt'`);
@@ -469,16 +438,14 @@ test('ordinary umount fails with EBUSY while open descriptors or cwd hold a moun
     expect(newLookup.status).not.toBe(0);
 
     // Release holder and verify its already-open fd 3 still reads the detached tmpfs file cleanly
-    expect((await put(rootApi, fileUrl(stopFlag), { data: 'done\n' })).ok()).toBe(true);
+    await pagePut(page, stopFlag, 'done\n');
     await expect.poll(() => page.evaluate(() => window.__busyHolder?.result?.status), { timeout: 30_000 }).toBe(0);
     expect(await page.evaluate(() => window.__busyHolder.output)).toContain('kept-across-lazy-detach');
   } finally {
     if (session) {
-      await execCmd(session.page, ['/usr/bin/umount', '-l', mnt], { sudo: true }).catch(() => {});
+      if (mnt) await execCmd(session.page, ['/usr/bin/umount', '-l', mnt], { sudo: true }).catch(() => {});
+      if (base) await pageRmrf(session.page, base, { sudo: true }).catch(() => {});
       await session.context.close();
     }
-    await rmrf(rootApi, base);
-    await program(rootApi, ['userdel', '-r', alice]);
-    await program(rootApi, ['groupdel', alice]);
   }
 });

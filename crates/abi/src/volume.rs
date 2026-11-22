@@ -63,6 +63,33 @@ pub struct CowfsInfoResp {
     pub parent_volume: Option<String>,
 }
 
+/// Payload for `COWFS_IOC_FSCK`: verify a volume's pinned head via full Merkle fsck.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CowfsFsckReq {
+    /// Optional explicit volume UUID in the same store (must match if provided).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
+}
+
+/// Response for `COWFS_IOC_FSCK`: authoritative Merkle verification result.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CowfsFsckResp {
+    pub ok: bool,
+    pub volume: String,
+    pub format_version: u32,
+    pub epoch: u64,
+    pub root: String,
+    pub subvols_checked: usize,
+    pub nodes_verified: usize,
+    pub extents_verified: usize,
+    pub packs_verified: usize,
+    pub orphan_inodes: usize,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
 /// Response for `BLK_INFO` on `/dev/vdN`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

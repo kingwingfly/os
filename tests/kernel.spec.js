@@ -66,9 +66,8 @@ test('two dedicated kernels are isolated per tab, and each tracks its own proces
   expect(first.instance_id).not.toBe(second.instance_id);
   expect(first.boot).not.toBe(second.boot);
   expect(value(await call(one, 'poll', { pids: [1] }))[0]?.pid).toBe(1);
-  // Sync tab one with the browser's account and start a process in its local table.
-  const [creds] = await sys(one, ['getcreds']);
-  value(await call(one, 'sync_account_from_server'));
+  // Default local account (`user`, uid 1000) starts processes 100% locally with zero network RPCs.
+  const boot = value(await call(one, 'boot_status'));
   const running = value(await call(one, 'exec', { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '30'], env: ENV, cwd: '/' }));
   expect(running.pid).toBeGreaterThan(1);
   expect(running.asset).toBe('/usr/bin/coreutils.wasm');
@@ -77,7 +76,7 @@ test('two dedicated kernels are isolated per tab, and each tracks its own proces
   const status = value(await call(one, 'getpid', { pid: running.pid }));
   expect(status).toEqual({ pid: running.pid, ppid: 1 });
   const seen = value(await call(one, 'poll', { pids: [running.pid] }));
-  expect(seen[0].uid).toBe(creds.ok.uid);
+  expect(seen[0].uid).toBe(boot.account.uid);
   // Contract v2 §2.1: another tab's kernel instance cannot see, query, or reap tab one's process.
   expect(value(await call(two, 'poll', { pids: [running.pid] }))).toEqual([]);
   expect((await call(two, 'getpid', { pid: running.pid })).err?.errno).toBe('ESRCH');
@@ -172,35 +171,33 @@ test('the protocol is versioned: another version, an unknown call and a refusal 
   await context.close();
 });
 
-test('a tab signed out is guest-<uuid>:guest, and its process runs as that account', async ({ browser }) => {
+test('a fresh tab auto-logs in as local user:user (uid 1000) signed out of Cloud, and its process runs as that account', async ({ browser }) => {
   const context = await browser.newContext();
   const page = await context.newPage();
   await page.goto('/');
   await connect(page);
   value(await call(page, 'init'));
-  const [creds] = await sys(page, ['getcreds']);
-  expect(creds.ok.user).toMatch(/^guest-[0-9a-f]{16}$/);
-  expect(creds.ok.uid).toBeGreaterThanOrEqual(1_000_000);
-  expect(creds.ok.uid).toBeLessThan(2_000_000);
-  expect([creds.ok.home, creds.ok.signed_in, creds.ok.group]).toEqual(['/guest', false, 'guest']);
-  value(await call(page, 'sync_account_from_server'));
-  value(await call(page, 'session_begin', { sessionId: 'guest-proc', uid: creds.ok.uid, gid: creds.ok.gid, groups: creds.ok.groups }));
+  const boot = value(await call(page, 'boot_status'));
+  const cloud = value(await call(page, 'cloud_status'));
+  expect(boot.account).toMatchObject({ user: 'user', group: 'user', uid: 1000, gid: 1000, home: '/home/user', signed_in: true });
+  expect(cloud.signed_in).toBe(false);
+  value(await call(page, 'session_begin', { sessionId: 'local-proc', uid: boot.account.uid, gid: boot.account.gid, groups: boot.account.groups }));
   const process = value(await call(page, 'exec', { path: '/usr/bin/coreutils', argv: ['coreutils', 'id'], env: ENV, cwd: '/' }));
   const [seen] = value(await call(page, 'poll', { pids: [process.pid] }));
-  expect([seen.uid, seen.path, seen.argv]).toEqual([creds.ok.uid, '/usr/bin/coreutils', ['coreutils', 'id']]);
+  expect([seen.uid, seen.path, seen.argv]).toEqual([boot.account.uid, '/usr/bin/coreutils', ['coreutils', 'id']]);
   // Instance-local /proc names it while it runs.
   const [status] = value(await call(page, 'vfs_sys', {
-    sessionId: 'guest-proc',
+    sessionId: 'local-proc',
     batch: { calls: [{ pread: { path: `/proc/${process.pid}/status`, count: 4096 } }] },
   })).results;
   expect(status.ok).toBeTruthy();
   const text = Buffer.from(status.ok.data, 'base64').toString();
   expect(text).toContain('Name:\tcoreutils');
-  expect(text).toContain(`Uid:\t${creds.ok.uid}`);
+  expect(text).toContain(`Uid:\t${boot.account.uid}`);
   value(await call(page, 'exit', { pid: process.pid, status: 0 }));
   value(await call(page, 'wait', { pid: process.pid }));
   const [gone] = value(await call(page, 'vfs_sys', {
-    sessionId: 'guest-proc',
+    sessionId: 'local-proc',
     batch: { calls: [{ pread: { path: `/proc/${process.pid}/status`, count: 4096 } }] },
   })).results;
   expect(gone.err.errno).toBe('ENOENT');

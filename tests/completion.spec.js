@@ -1,22 +1,21 @@
 import { test, expect } from './test.js';
-import { readFile } from 'node:fs/promises';
-import { api, mkdirp, put, rmrf } from './sys.js';
-import { promptPath } from './ui.js';
-const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787', headers = { Origin: origin };
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+import { pageMkdirp, pagePut, pageRmrf, promptPath } from './ui.js';
+
 const names = ['alpha.txt', 'alphabet.txt', 'z-alpha.txt', 'a_l_p_h_a.txt', 'GammaSpectrum.txt', 'γάμμα-spectrum.md', 'name "quote".txt'];
 let base;
-test.beforeEach(async ({ request, page }) => {
-  base = '/completion-' + Date.now();
-  expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
-  for (const path of [base + '/a-dir', base + '/b-dir', base + '/space dir']) await mkdirp(request, path);
-  for (const name of [...names, 'a-dir/inside.txt']) expect((await put(request, '/api/file?path=' + encodeURIComponent(base + '/' + name), { headers, data: 'fixture' })).status()).toBe(201);
+test.beforeEach(async ({ page }) => {
+  base = '/home/user/completion-' + Date.now();
   await page.goto('/');
+  await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  for (const path of [base + '/a-dir', base + '/b-dir', base + '/space dir']) await pageMkdirp(page, path, 0o755);
+  for (const name of [...names, 'a-dir/inside.txt']) await pagePut(page, base + '/' + name, 'fixture', { mode: 0o644 });
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill('cd ' + base); await input.press('Enter');
   await expect(promptPath(page)).toHaveText(base);
 });
-test.afterEach(async ({ request }) => { await rmrf(request, base); });
+test.afterEach(async ({ page }) => {
+  if (base) await pageRmrf(page, base).catch(() => {});
+});
 
 test('expands the common prefix, cycles the pager, and restores the original token on Escape', async ({ page }) => {
   const input = page.getByRole('combobox', { name: 'Terminal command' }), options = page.getByRole('option');
@@ -69,8 +68,8 @@ test('completes directories without inserting cd and enters them directly', asyn
   await input.fill('spa'); await input.press('Tab'); await expect(input).toHaveValue(String.raw`space\ dir/`);
   await input.press('Enter'); await expect(promptPath(page)).toHaveText(base + '/space dir');
   await input.fill('cd /'); await input.press('Enter'); await expect(promptPath(page)).toHaveText('/');
-  await input.fill('gues'); await input.press('Tab'); await expect(input).toHaveValue('guest/');
-  await input.press('Enter'); await expect(promptPath(page)).toHaveText('/guest');
+  await input.fill('hom'); await input.press('Tab'); await expect(input).toHaveValue('home/');
+  await input.press('Enter'); await expect(promptPath(page)).toHaveText('/home');
 });
 
 test('keeps Unicode and shell escaping, and continues completion inside directories', async ({ page }) => {
@@ -106,39 +105,85 @@ test('completes the token at the cursor and preserves the rest of the command', 
 
 test('queues fast Tab presses and discards late listings after editing or moving the caret', async ({ page }) => {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  let requests = 0;
-  await page.route('**/api/sys', async route => { if (route.request().postData()?.includes('getdents')) { requests++; await new Promise(resolve => setTimeout(resolve, 500)); } await route.continue(); });
-  await input.fill('open alp'); await input.press('Tab'); await input.press('Tab'); await input.press('Tab');
-  await expect(input).toHaveValue('open alphabet.txt '); expect(requests).toBeLessThanOrEqual(1);
-  await input.fill('open a-dir/in');
-  const response = page.waitForResponse(r => r.url().includes('/api/sys') && r.request().postData()?.includes('getdents'));
-  await input.press('Tab'); await input.fill('pwd'); await response;
-  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-  await expect(input).toHaveValue('pwd'); await expect(page.getByRole('option')).toHaveCount(0);
-  await input.fill('open space\\ dir/');
-  const moved = page.waitForResponse(r => r.url().includes('/api/sys') && r.request().postData()?.includes('getdents'));
-  await input.press('Tab'); await input.press('Home'); await moved;
-  await expect(input).toHaveValue('open space\\ dir/'); await expect(page.getByRole('option')).toHaveCount(0);
-  await input.press('End'); await input.press('Tab'); await expect(page.locator('.completion-hint')).toHaveText('No matches');
+  // Local VFS intercepts `fetch('/api/sys')` in-page (`web/local-files.js`), so wrap `window.fetch`
+  // to inject deterministic latency on `getdents` batches without hitting the network.
+  await page.evaluate(() => {
+    const orig = window.fetch.bind(window);
+    window.__origFetch = orig;
+    window.__getdents = { started: 0, completed: 0 };
+    window.fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input?.url ?? '';
+      let body = typeof init?.body === 'string' ? init.body : '';
+      if (!body && input instanceof Request) {
+        try { body = await input.clone().text(); } catch {}
+      }
+      if (url.includes('/api/sys') && body.includes('getdents')) {
+        window.__getdents.started++;
+        await new Promise(resolve => setTimeout(resolve, 400));
+        try { return await orig(input, init); } finally { window.__getdents.completed++; }
+      }
+      return orig(input, init);
+    };
+  });
+  try {
+    await input.fill('open alp'); await input.press('Tab'); await input.press('Tab'); await input.press('Tab');
+    await expect(input).toHaveValue('open alphabet.txt ');
+    expect(await page.evaluate(() => window.__getdents.started)).toBeLessThanOrEqual(1);
+
+    const beforeEdit = await page.evaluate(() => window.__getdents.completed);
+    await input.fill('open a-dir/in');
+    await input.press('Tab'); await input.fill('pwd');
+    await expect.poll(() => page.evaluate(() => window.__getdents.completed)).toBeGreaterThan(beforeEdit);
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    await expect(input).toHaveValue('pwd'); await expect(page.getByRole('option')).toHaveCount(0);
+
+    const beforeMove = await page.evaluate(() => window.__getdents.completed);
+    await input.fill('open space\\ dir/');
+    await input.press('Tab'); await input.press('Home');
+    await expect.poll(() => page.evaluate(() => window.__getdents.completed)).toBeGreaterThan(beforeMove);
+    await expect(input).toHaveValue('open space\\ dir/'); await expect(page.getByRole('option')).toHaveCount(0);
+    await input.press('End'); await input.press('Tab'); await expect(page.locator('.completion-hint')).toHaveText('No matches');
+  } finally {
+    await page.evaluate(() => { if (window.__origFetch) { window.fetch = window.__origFetch; delete window.__origFetch; } });
+  }
 });
 
 test('a delayed completion cannot steal focus from another desktop app', async ({ page }) => {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  let release, pending = false;
-  const gate = new Promise(resolve => { release = resolve; });
-  await page.route('**/api/sys', async route => {
-    if (route.request().postData()?.includes('getdents')) { pending = true; await gate; }
-    await route.continue();
+  await page.evaluate(() => {
+    const orig = window.fetch.bind(window);
+    window.__origFetch = orig;
+    window.__gatePending = false;
+    window.__gatePromise = new Promise(resolve => { window.__releaseGate = resolve; });
+    window.fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input?.url ?? '';
+      let body = typeof init?.body === 'string' ? init.body : '';
+      if (!body && input instanceof Request) {
+        try { body = await input.clone().text(); } catch {}
+      }
+      if (url.includes('/api/sys') && body.includes('getdents')) {
+        window.__gatePending = true;
+        await window.__gatePromise;
+      }
+      return orig(input, init);
+    };
   });
   try {
-    await input.fill('open a-dir/in'); await input.press('Tab'); await expect.poll(() => pending).toBe(true);
+    await input.fill('open a-dir/in'); await input.press('Tab');
+    await expect.poll(() => page.evaluate(() => window.__gatePending)).toBe(true);
     await page.evaluate(() => window.os.localMounts());
     const app = page.locator('#window-mounts'); await app.getByRole('tab', { name: 'Add mount', exact: true }).click();
-    await app.locator('[data-add-form] [name=name]').focus(); release();
+    await app.locator('[data-add-form] [name=name]').focus();
+    await page.evaluate(() => window.__releaseGate());
     await expect(input).toHaveValue('open a-dir/inside.txt ');
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     await expect(app).toHaveClass(/window-focused/); await expect(app.locator('[data-add-form] [name=name]')).toBeFocused();
-  } finally { release(); await page.unrouteAll({ behavior: 'wait' }); }
+  } finally {
+    await page.evaluate(() => {
+      window.__releaseGate?.();
+      if (window.__origFetch) { window.fetch = window.__origFetch; delete window.__origFetch; }
+    });
+  }
 });
 
 test('ls and explicit external programs complete files without a browser command definition', async ({ page }) => {
@@ -152,8 +197,7 @@ test('ls and explicit external programs complete files without a browser command
   }
 });
 
-test('a wrapped guest prompt keeps the input beside its final symbol in narrow windows', async ({ page }) => {
-  await page.goto('/');
+test('a wrapped prompt keeps the input beside its final symbol in narrow windows', async ({ page }) => {
   const input = page.getByRole('combobox', { name: 'Terminal command' }); await expect(input).toBeVisible();
   for (const width of [320, 270, 410]) {
     await page.locator('#window-terminal').evaluate((window, width) => { window.style.minWidth = '0'; window.style.width = width + 'px'; }, width);

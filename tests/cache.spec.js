@@ -1,16 +1,17 @@
 import { test, expect } from './test.js';
-import { readFile } from 'node:fs/promises';
 import { api, mkdirp, put, rmrf } from './sys.js';
-import { browse } from './ui.js';
+import { browse, cloudSignIn } from './ui.js';
+
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || 'test-admin-password-w4b';
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 
 // The page answers what only looks from a cache while the kernel tells it nothing changed in the
-// directory (inotify): listing again asks nothing; what others change, and what it changes itself,
-// it lists anew.
+// watched CloudFs directory (`/mnt/cloud/...`, inotify): listing again asks nothing; what another
+// device changes, and what it changes itself, it lists anew.
 test('Files reuses watched metadata until something in its directory changes', async ({ page, request }) => {
   const base = '/cache-' + Date.now().toString(36);
+  const cloudBase = '/mnt/cloud' + base;
   const headers = { Origin: origin, 'CF-Connecting-IP': 'cache-' + base };
   expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
   await mkdirp(request, base);
@@ -18,17 +19,24 @@ test('Files reuses watched metadata until something in its directory changes', a
   try {
     await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'cache-ui-' + base });
     const asked = [];
-    page.on('request', r => { if (r.url().endsWith('/api/sys')) asked.push(r.postData() || ''); });
+    page.context().on('request', r => {
+      const path = new URL(r.url()).pathname;
+      if (path === '/api/sys' || path === '/api/fs') asked.push(r.postData() || '');
+    });
     await page.goto('/');
     const input = page.getByRole('combobox', { name: 'Terminal command' });
     const busy = page.locator('#command').locator('xpath=ancestor::form');
-    const run = async text => { await expect(busy).toHaveAttribute('data-state', 'idle'); await input.fill(text); await input.press('Enter'); await expect(busy).toHaveAttribute('data-state', 'idle'); };
+    const run = async text => {
+      await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+      await input.fill(text);
+      await input.press('Enter');
+      await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+    };
     const last = page.locator('.transcript pre').last();
-    await expect(busy).toHaveAttribute('data-state', 'idle'); await input.fill('su root'); await input.press('Enter');
-    await page.getByLabel('Password', { exact: true }).fill(password); await page.locator('#auth button[type=submit]').click();
-    await expect(page.locator('#auth')).not.toBeVisible();
-    await run('cd ' + base);
-    await browse(page, base);
+    await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+    await cloudSignIn(page, 'root', password);
+    await run('cd ' + cloudBase);
+    await browse(page, cloudBase);
     const names = page.locator('.files .filename');
     const upload = page.getByRole('button', { name: 'Upload' });
     await expect(names).toHaveText(['one.txt']);
@@ -36,13 +44,15 @@ test('Files reuses watched metadata until something in its directory changes', a
     // Files uses its page metadata cache. External ls has its own process credentials and
     // filesystem calls, and must not rely on the browser reconstructing its output.
     const before = asked.length;
-    await browse(page, base);
+    await browse(page, cloudBase);
     await expect(upload).toBeEnabled();
     await expect(names).toHaveText(['one.txt']);
-    expect(asked.slice(before).filter(body => body.includes('getdents') || body.includes('"stat"'))).toEqual([]);
-    // Another device adds a file: the kernel tells the page, which lists it anew.
+    expect(asked.slice(before).filter(body =>
+      body.includes('getdents') || body.includes('"stat"') || body.includes('"readdir"') || body.includes('"getattr"')
+    )).toEqual([]);
+    // Another device adds a file on CloudFs: the server tells the page via inotify, which lists it anew.
     expect((await put(request, file(base + '/two.txt'), { headers, data: '2' })).status()).toBe(201);
-    await expect(names).toHaveText(['one.txt', 'two.txt']);
+    await expect(names).toHaveText(['one.txt', 'two.txt'], { timeout: 15_000 });
     await run('ls');
     await expect(last).toContainText('two.txt');
     // What the page changes itself, it lists anew too.

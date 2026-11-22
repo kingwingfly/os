@@ -105,7 +105,7 @@ dialog { color:var(--text); background:#101714; border:1px solid #3d5345; border
    the wallpaper, and a dock. The compositor sets each window's place, size and stacking. */
 html,body{height:100%;overflow:hidden}
 .desktop{position:fixed;inset:0 0 auto;height:var(--app-height,100dvh);transform:translateY(var(--app-top,0px));display:flex;flex-direction:column;background:radial-gradient(ellipse at 18% 0%,#15271c 0,transparent 55%),radial-gradient(ellipse at 100% 100%,#121d1a 0,transparent 45%),var(--bg)}
-.topbar{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:7px 16px;border-bottom:1px solid var(--line);background:#0c1210e6;backdrop-filter:blur(8px);flex-shrink:0}
+.topbar{position:relative;z-index:60;display:flex;justify-content:space-between;align-items:center;gap:16px;padding:7px 16px;border-bottom:1px solid var(--line);background:#0c1210e6;backdrop-filter:blur(8px);flex-shrink:0}
 .desktop-area{position:relative;flex:1;min-height:0}
 .wallpaper{position:absolute;left:0;right:0;bottom:0;padding:clamp(18px,4vw,64px);display:block;opacity:.6}
 .wallpaper h1{font-size:clamp(30px,4vw,56px)}.wallpaper p{max-width:60ch}
@@ -314,3 +314,29 @@ select.os-select-native{position:absolute!important;width:1px!important;height:1
 .transcript .command-line label[hidden]+input{margin-left:0}
 
 .transcript .command-line label{word-break:break-all}
+
+/* Local OS Identity + explicit Cloud / Cluster Sign-In top-bar panel (#57 L3d) */
+.cloud-panel{position:relative;flex-shrink:0}
+.cloud-panel-trigger{display:inline-flex;align-items:center;gap:6px}
+.cloud-panel-trigger.cloud-connected .cloud-indicator{color:var(--green)}
+.cloud-panel-popover{position:absolute;top:calc(100% + 8px);right:0;z-index:1000;width:min(360px,calc(100vw - 24px));max-height:calc(100vh - 64px);overflow:auto;padding:14px;background:#0e1712;border:1px solid #354a3d;border-radius:8px;box-shadow:0 16px 40px #000a;color:var(--text);font-size:13px;display:flex;flex-direction:column;gap:14px}
+.cloud-panel-section{display:flex;flex-direction:column;gap:8px}
+.cloud-panel-section+.cloud-panel-section{padding-top:12px;border-top:1px solid var(--line)}
+.cloud-panel-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.cloud-badge{font-size:11px;padding:2px 6px;border-radius:4px;background:#1a2b21;border:1px solid #2f4938;color:var(--muted)}
+.cloud-badge-fork{color:var(--warm);border-color:#665335;background:#282215}
+.cloud-meta-list{margin:0;display:grid;gap:4px}
+.cloud-meta-list>div{display:flex;justify-content:space-between;gap:12px}
+.cloud-meta-list dt{color:var(--muted)}
+.cloud-meta-list dd{margin:0;font-family:monospace;text-align:right;overflow-wrap:anywhere}
+.cloud-panel-note{margin:0;font-size:12px;color:var(--muted);line-height:1.45}
+.cloud-panel-actions{display:flex;flex-wrap:wrap;gap:6px}
+.cloud-signin-form{display:flex;flex-direction:column;gap:8px}
+.cloud-signin-form input:not([type=checkbox]){width:100%;height:34px;padding:6px 8px;font:inherit;background:#0b110e;color:var(--text);border:1px solid #3a4c40;border-radius:5px}
+.cloud-scope-toggles{margin:4px 0;padding:8px 10px;border:1px solid var(--line);border-radius:6px;display:grid;gap:6px}
+.cloud-scope-toggles legend{font-size:12px;color:var(--muted);padding:0 4px}
+.cloud-scope-toggles label{display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer}
+.cloud-connected-summary{display:flex;flex-direction:column;gap:8px}
+.cloud-scope-summary{margin:0;font-family:monospace;font-size:12px;color:#b8d4c1}
+.cloud-panel-error{margin:0;padding:8px 10px;border-radius:5px;background:#2d1515;border:1px solid #6b2e2e;color:#f5b7b7;font-size:12px}
+.cloud-panel-status{margin:0;padding:8px 10px;border-radius:5px;background:#13261a;border:1px solid #2d553a;color:#b8e6c6;font-size:12px}

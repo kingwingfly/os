@@ -2950,9 +2950,32 @@ const osApi = {
       if (req.serviceGrant != null) {
         const g = req.serviceGrant;
         if (typeof g !== 'object' || Array.isArray(g) || typeof g.mountNamespace !== 'string' || g.mountNamespace.includes('\0')) throw new Errno(EINVAL);
+        if (g.user != null && (typeof g.user !== 'string' || !g.user || g.user.includes('\0') || g.user.length > 64)) throw new Errno(EINVAL);
+        if (g.group != null && (typeof g.group !== 'string' || !g.group || g.group.includes('\0') || g.group.length > 64)) throw new Errno(EINVAL);
         const binds = g.bindMounts ?? [];
         if (!Array.isArray(binds) || binds.length > 32 || !binds.every(b => b && typeof b === 'object' && typeof b.source === 'string' && !b.source.includes('\0') && typeof b.target === 'string' && !b.target.includes('\0') && typeof b.readOnly === 'boolean')) throw new Errno(EINVAL);
-        serviceGrant = { mountNamespace: g.mountNamespace, bindMounts: binds.map(b => ({ source: b.source, target: b.target, readOnly: b.readOnly })) };
+        const devs = g.devices ?? [];
+        if (!Array.isArray(devs) || devs.length > 32 || !devs.every(d => typeof d === 'string' && d.length > 0 && d.length <= 64 && !d.includes('/') && !d.includes('\0') && d !== '.' && d !== '..')) throw new Errno(EINVAL);
+        let cloudScope = undefined;
+        if (g.cloudScope != null) {
+          if (typeof g.cloudScope !== 'object' || Array.isArray(g.cloudScope)) throw new Errno(EINVAL);
+          const csDevs = g.cloudScope.devices ?? [];
+          if (!Array.isArray(csDevs) || csDevs.length > 32 || !csDevs.every(d => typeof d === 'string' && d.length > 0 && !d.includes('/') && !d.includes('\0'))) throw new Errno(EINVAL);
+          cloudScope = {
+            cloud_fs: Boolean(g.cloudScope.cloud_fs ?? g.cloudScope.cloudFs),
+            devices: csDevs,
+            containers: Boolean(g.cloudScope.containers),
+            relay: Boolean(g.cloudScope.relay),
+          };
+        }
+        serviceGrant = {
+          mountNamespace: g.mountNamespace,
+          bindMounts: binds.map(b => ({ source: b.source, target: b.target, readOnly: b.readOnly })),
+          ...(g.user != null ? { user: g.user } : {}),
+          ...(g.group != null ? { group: g.group } : {}),
+          ...(devs.length > 0 ? { devices: devs } : {}),
+          ...(cloudScope !== undefined ? { cloudScope } : {}),
+        };
       }
       const totalSize = values => values.reduce((sum, value) => sum + encoder.encode(value).length + 1, 0);
       if (totalSize(req.argv) > 128 * 1024 || totalSize(req.env) > 128 * 1024) throw new Errno(ERRNO.E2BIG);

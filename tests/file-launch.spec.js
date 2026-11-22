@@ -1,11 +1,7 @@
 import { test, expect } from './test.js';
 import binaryen from 'binaryen';
-import { readFile } from 'node:fs/promises';
-import { api, mkdirp, put, rmrf, call as sysCall } from './sys.js';
-import { browse } from './ui.js';
+import { browse, pageCall, pageMkdirp, pagePut, pageRmrf } from './ui.js';
 
-const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787', headers = { Origin: origin };
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const module = binaryen.parseText(`(module
   (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
@@ -30,21 +26,22 @@ const input = page => page.getByRole('combobox', { name: 'Terminal command' });
 const busy = page => input(page).locator('xpath=ancestor::form');
 const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
 let base;
-test.beforeEach(async ({ request, page }) => {
-  base = '/launch-' + crypto.randomUUID();
-  expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
-  await mkdirp(request, base);
-  for (const [name, mode] of [['demo-a.wasm', 0o755], ['demo-b.wasm', 0o755], ['run "me".wasm', 0o755], ['locked.wasm', 0o644], ['execute-only.wasm', 0o111], ['input.wasm', 0o755]]) {
-    const path = `${base}/${name}`;
-    expect((await put(request, '/api/file?path=' + encodeURIComponent(path), { headers, data: name === 'input.wasm' ? interactive : wasm })).status()).toBe(201);
-    expect(await sysCall(request, { chmod: { path, mode } }, { headers })).toBeNull();
-  }
+test.beforeEach(async ({ page }) => {
+  base = '/home/user/launch-' + crypto.randomUUID();
   await page.goto('/');
   await expect(busy(page)).toHaveAttribute('data-state', 'idle');
+  await pageMkdirp(page, base, 0o755);
+  for (const [name, mode] of [['demo-a.wasm', 0o755], ['demo-b.wasm', 0o755], ['run "me".wasm', 0o755], ['locked.wasm', 0o644], ['execute-only.wasm', 0o111], ['input.wasm', 0o755]]) {
+    const path = `${base}/${name}`;
+    await pagePut(page, path, name === 'input.wasm' ? interactive : wasm, { mode: 0o644 });
+    expect(await pageCall(page, { chmod: { path, mode } })).toBeNull();
+  }
   await input(page).fill('cd ' + base); await input(page).press('Enter');
   await expect(busy(page)).toHaveAttribute('data-state', 'idle');
 });
-test.afterEach(async ({ request }) => { await rmrf(request, base); });
+test.afterEach(async ({ page }) => {
+  if (base) await pageRmrf(page, base, { sudo: true }).catch(() => {});
+});
 
 test('choosing a WASM completion inserts an executable path and Enter runs it', async ({ page }) => {
   await input(page).fill('demo'); await input(page).press('Tab');
@@ -57,7 +54,7 @@ test('choosing a WASM completion inserts an executable path and Enter runs it', 
   await expect(busy(page)).toHaveAttribute('data-state', 'idle');
 });
 
-test('Files launches quoted program paths, preserves unfinished input, and honors execute permissions', async ({ page, request }) => {
+test('Files launches quoted program paths, preserves unfinished input, and honors execute permissions', async ({ page }) => {
   await browse(page, base);
   await input(page).fill('echo unfinished');
   await page.locator('#window-files .file').filter({ hasText: 'run "me".wasm' }).click();
@@ -67,12 +64,11 @@ test('Files launches quoted program paths, preserves unfinished input, and honor
   await expect(busy(page)).toHaveAttribute('data-state', 'idle');
   await page.locator('#window-files .file').filter({ hasText: 'locked.wasm' }).click();
   await expect(last(page)).toContainText('Permission denied');
-  expect((await sysCall(request, { stat: { path: base + '/locked.wasm' } }, { headers })).mode & 0o777).toBe(0o644);
+  expect((await pageCall(page, { stat: { path: base + '/locked.wasm' } })).mode & 0o777).toBe(0o644);
   await page.locator('#window-files .file').filter({ hasText: 'execute-only.wasm' }).click();
   await expect(last(page)).toHaveText('CLICKED_WASM');
   await expect(page.locator('#viewer')).not.toBeVisible();
 });
-
 
 test('clicking an interactive program gives it keyboard focus immediately', async ({ page }) => {
   await browse(page, base);

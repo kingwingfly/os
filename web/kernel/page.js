@@ -7,14 +7,20 @@ globalThis.loaderStats = { compiled: 0 };
 globalThis.addEventListener('os:signal', ({ detail }) => { void kernelCall('deliver_signal', detail).catch(() => {}); });
 globalThis.addEventListener('os:changed', () => { void kernelCall('reconcile').catch(() => {}); });
 globalThis.addEventListener('os:login-changed', () => { void kernelCall('login_refresh').catch(() => {}); });
-globalThis.addEventListener('pagehide', () => {
+globalThis.addEventListener('pagehide', event => {
+  // Preserve the mounted `os-cowfs` root across bfcache suspension (Codex Finding #16):
+  // flush dirty writes without releasing the writer lock or closing the filesystem when
+  // `event.persisted` is true; only close & prune on non-persisted page teardown.
+  if (event.persisted) {
+    void kernelCall('flush_root').catch(() => {});
+  } else {
+    void kernelCall('close_clean_root').catch(() => {});
+  }
   void kernelCall('login_leave').catch(() => {});
-  void kernelCall('machine_init_leave').catch(() => {});
   void changeSeat(false).catch(() => {});
 });
 globalThis.addEventListener('pageshow', event => { if (event.persisted) {
   void kernelCall('login_refresh').catch(() => {});
-  void kernelCall('machine_init_resume').catch(() => {});
   void changeSeat(desiredSeatActive).catch(() => {});
 } });
 let localSeat = { active: true }, watchingSeat = false, desiredSeatActive = true;
@@ -51,6 +57,27 @@ export function machineInit() {
     kernelPort().on('machine_init', detail => globalThis.dispatchEvent(new CustomEvent('os:machine-init', { detail })));
   }
   return kernelCall('machine_init_status');
+}
+export function bootStatus() {
+  return kernelCall('boot_status');
+}
+export function closeCleanRoot() {
+  return kernelCall('close_clean_root');
+}
+export function flushRoot() {
+  return kernelCall('flush_root');
+}
+export function cloudStatus() {
+  return kernelCall('cloud_status');
+}
+export function cloudSignInKernel(args) {
+  return kernelCall('cloud_sign_in', args);
+}
+export function cloudSignOutKernel() {
+  return kernelCall('cloud_sign_out');
+}
+export function revokeCloudTokensOnly() {
+  return kernelCall('revoke_cloud_tokens_only');
 }
 // Explicit lifecycle operations preserve ordinary cookie sign-out semantics. They target
 // a retained public expectation; the server authenticates the current account each time.

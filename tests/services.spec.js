@@ -1,28 +1,24 @@
 import { test, expect } from './test.js';
-import { api, call, errno, put, rmrf } from './sys.js';
+import { pageCall, pageErrno, pageMkdirp, pagePut, pageRmrf, switchLocalUser } from './ui.js';
 import { hookPageKernel } from './service-auth.js';
-import { readFile } from 'node:fs/promises';
 
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 let base, sequence, pageKernel;
 const unit = (name, argv, extra = {}) => ({ name, argv, ...extra });
 const text = page => page.evaluate(() => window.serviceRun.output.replace(/\r\n/g, '\n'));
 test.beforeEach(async ({ page }) => {
-  await call(page.request, 'getcreds');
   pageKernel = await hookPageKernel(page);
   await page.goto('/'); await page.waitForFunction(() => !!window.os?.exec);
   await pageKernel.ready();
-  await pageKernel.value('sync_account_from_server');
-  base = '/guest/services-' + crypto.randomUUID(); sequence = 0;
-  await call(page.request, { mkdir: { path: base, mode: 0o700 } });
+  base = '/tmp/services-' + crypto.randomUUID(); sequence = 0;
+  await pageMkdirp(page, base, 0o700);
 });
 test.afterEach(async ({ page }) => {
   await page.evaluate(async () => { window.serviceRun?.group?.signal(9); await window.serviceRun?.done; });
-  await rmrf(page.request, base);
+  await pageRmrf(page, base).catch(() => {});
 });
 async function start(page, units, { check = false, raw, argv, shell = false } = {}) {
   const path = base + '/units-' + sequence++ + '.json';
-  expect((await put(page.request, '/api/file?path=' + encodeURIComponent(path), { data: raw ?? JSON.stringify({ version: 1, units }) })).ok()).toBe(true);
+  await pagePut(page, path, raw ?? JSON.stringify({ version: 1, units }), { mode: 0o644 });
   await page.evaluate(({ path, check, argv, shell }) => {
     const run = window.serviceRun = { output: '', pids: [] };
     run.done = window.os.exec([shell ? { path: '/usr/bin/sh', argv: ['sh', '-c', 'supervise "$1"', 'sh', path] }
@@ -50,12 +46,12 @@ async function terminate(page) {
 }
 
 test('supervise is an immutable ordinary executable with generated help and check-only validation', async ({ page }) => {
-  const image = await call(page.request, { stat: { path: '/usr/bin/supervise' } });
+  const image = await pageCall(page, { stat: { path: '/usr/bin/supervise' } });
   expect(image.mode).toBe(0o100755); expect(image.size).toBeGreaterThan(100000);
-  expect(await errno(page.request, { chmod: { path: '/usr/bin/supervise', mode: 0o777 } })).toBe('EROFS');
+  expect(await pageErrno(page, { chmod: { path: '/usr/bin/supervise', mode: 0o777 } })).toBe('EROFS');
   await start(page, [unit('check', ['touch', base + '/should-not-exist'])], { check: true });
   expect(await done(page)).toBe('');
-  expect(await errno(page.request, { stat: { path: base + '/should-not-exist' } })).toBe('ENOENT');
+  expect(await pageErrno(page, { stat: { path: base + '/should-not-exist' } })).toBe('ENOENT');
   await start(page, [], { argv: ['supervise', '--help'] });
   expect(await done(page)).toContain('supervise');
 });
@@ -73,7 +69,7 @@ test('invalid graphs, identities and unsupported contracts fail before any servi
   ]) {
     await start(page, [first, bad]);
     expect(await done(page, 1)).not.toContain('started pid');
-    expect(await errno(page.request, { stat: { path: base + '/should-not-exist' } })).toBe('ENOENT');
+    expect(await pageErrno(page, { stat: { path: base + '/should-not-exist' } })).toBe('ENOENT');
   }
 });
 
@@ -133,11 +129,11 @@ test('shutdown during restart backoff cannot launch another attempt', async ({ p
   expect((await done(page, 143)).match(/ONE_ATTEMPT/g)).toHaveLength(1);
 });
 
-test('service launches preserve the supervisor credential snapshot across browser login', async ({ page }) => {
-  const creds = await call(page.request, 'getcreds');
+test('service launches preserve the supervisor credential snapshot across local account switch', async ({ page }) => {
+  const creds = await pageCall(page, 'getcreds');
   await start(page, [unit('identity', ['sh', '-c', 'id -u; sleep 0.5; exit 1'], { restart: 'on-failure', max_restarts: 1, restart_delay_ms: 200 })]);
   await waitText(page, String(creds.uid));
-  expect((await api(page.request, 'login', { headers: { 'CF-Connecting-IP': 'services-' + crypto.randomUUID() }, data: { password } })).ok()).toBe(true);
+  await switchLocalUser(page, 'root');
   const output = await done(page, 1);
   expect(output.split('\n').filter(line => line === String(creds.uid))).toHaveLength(2);
   expect(output.split('\n')).not.toContain('0');
@@ -207,7 +203,7 @@ test('notify readiness waits for the complete pipe message while after only orde
   await waitText(page, 'PARTIAL_NOTIFICATION'); await waitText(page, 'ORDER_ONLY_STARTED');
   const partial = await text(page);
   expect(partial).not.toContain('provider: Ready'); expect(partial).not.toContain('REQUIRED_STARTED');
-  expect((await put(page.request, '/api/file?path=' + encodeURIComponent(base + '/release'), { data: 'go' })).ok()).toBe(true);
+  await pagePut(page, base + '/release', 'go', { mode: 0o644 });
   const output = await done(page);
   expect(output).toContain('provider: Ready'); expect(output).toContain('REQUIRED_STARTED');
   expect(output.indexOf('provider: Ready')).toBeLessThan(output.indexOf('REQUIRED_STARTED'));
@@ -262,12 +258,12 @@ test('startup deadlines kill TERM-ignoring groups and use a bounded retry budget
 });
 
 test('a fresh retry can notify after a failed attempt and retains the original credentials', async ({ page }) => {
-  const creds = await call(page.request, 'getcreds');
+  const creds = await pageCall(page, 'getcreds');
   await start(page, [unit('retry-notify', ['sh', '-c', `id -u; if [ ! -f '${base}/attempted' ]; then touch '${base}/attempted'; echo FIRST_ATTEMPT; exit 0; fi; printf 'READY=1\\n' >&"$OS_READY_FD"; echo SECOND_READY`], {
     readiness: 'notify', restart: 'on-failure', max_restarts: 1, restart_delay_ms: 3000,
   }), unit('dependent', ['echo', 'AFTER_RETRY'], { requires: ['retry-notify'] })]);
   await waitText(page, 'FIRST_ATTEMPT');
-  expect((await api(page.request, 'login', { headers: { 'CF-Connecting-IP': 'notify-' + crypto.randomUUID() }, data: { password } })).ok()).toBe(true);
+  await switchLocalUser(page, 'root');
   const output = await done(page);
   expect(output.split('\n').filter(line => line === String(creds.uid))).toHaveLength(2);
   expect(output).toContain('SECOND_READY'); expect(output).toContain('AFTER_RETRY');

@@ -10,7 +10,7 @@ const ACCOUNT_SENSITIVE_MOUNT_TYPES = new Set([
   'mount_export', 'mount_revoke', 'mount_transports', 'mount_write',
 ]);
 const FORBIDDEN_SYS_CALLS = new Set([
-  'login', 'logout', 'sudo', 'passwd', 'useradd', 'userdel', 'usermod', 'login_lifecycle', 'init',
+  'login_lifecycle', 'init',
 ]);
 
 const bad = (errno, detail = errno) => Object.assign(new Error(detail), { errno, detail });
@@ -177,12 +177,8 @@ async function resolveOptionalSessionId() {
 }
 
 async function refreshAccountBeforePrivateAccess() {
-  if (typeof globalThis.kernelRequest !== 'function') return;
-  const before = await globalThis.kernelRequest('workspace_credentials').catch(() => null);
-  const after = await globalThis.kernelRequest('sync_account_from_server').catch(() => null);
-  if (before && after && (before.uid !== after.uid || before.signed_in !== after.signed_in || before.user !== after.user)) {
-    await globalThis.kernelRequest('login_refresh', { fromServer: false }).catch(() => {});
-  }
+  // Wave 4B (#57 L3d): OS accounts are 100% local on `os-cowfs` (ZERO network RPCs).
+  // Cloud credentials never mutate local UIDs or private user mount ownership.
 }
 
 export async function mountRequest(type, args = {}) {

@@ -194,6 +194,76 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         }
         // System calls (sys.rs): what user space, the page, asks of the kernel.
         (Method::Post, "/api/sys") => crate::sys::handle(req, env, state, key).await,
+        // Explicit Cloud / Cluster Sign-In endpoints (`#57` L3d, Contract v2 §2.1 & §2.12).
+        // Local OS accounts live exclusively in browser `os-cowfs` `/etc/*`; these endpoints
+        // authenticate only the optional remote cloud session paired with `ServiceAuth v2`.
+        (Method::Post, "/api/cloud-auth/login") => {
+            let https = url.scheme() == "https";
+            let Ok(body) = req.json::<Value>().await else {
+                return Ok(Reply::error("Invalid cloud login request", 400));
+            };
+            let mut reply = login(req, env, state, key, https, body).await?;
+            if reply.status == 200
+                && let Some(obj) = reply.body.as_object_mut()
+            {
+                let cloud_user = obj
+                    .get("username")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                obj.insert("signed_in".into(), json!(true));
+                if let Some(cu) = cloud_user {
+                    obj.insert("cloud_user".into(), json!(cu));
+                }
+            }
+            Ok(reply)
+        }
+        (Method::Post, "/api/cloud-auth/logout") => {
+            let https = url.scheme() == "https";
+            run(state, move |db| {
+                if let Some(k) = key.as_deref() {
+                    db.delete_session(k);
+                }
+                Reply::ok(json!({ "signed_in": false, "cloud_user": Value::Null }))
+                    .cookie(auth::cookie(https, "", 0))
+            })
+        }
+        (Method::Get, "/api/cloud-auth/status") => run(state, move |db| {
+            let signed_in = auth::signed_in(db, key.as_deref());
+            let who = auth::identity(db, key.as_deref());
+            let cloud_user = signed_in.then(|| db.username(who.id));
+            let home = db
+                .user_by_id(who.id)
+                .map(|(_, u)| u.home)
+                .unwrap_or_else(|| "/".into());
+            Reply::ok(json!({
+                "signed_in": signed_in,
+                "cloud_user": cloud_user,
+                "uid": who.id,
+                "gid": who.group,
+                "groups": who.groups,
+                "home": home,
+            }))
+        }),
+        (Method::Post, "/api/cloud-auth/register") => {
+            let https = url.scheme() == "https";
+            let Ok(body) = req.json::<Value>().await else {
+                return Ok(Reply::error("Invalid cloud registration request", 400));
+            };
+            let mut reply = register(req, env, state, key, https, body).await?;
+            if matches!(reply.status, 200 | 201)
+                && let Some(obj) = reply.body.as_object_mut()
+            {
+                let cloud_user = obj
+                    .get("username")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                obj.insert("signed_in".into(), json!(true));
+                if let Some(cu) = cloud_user {
+                    obj.insert("cloud_user".into(), json!(cu));
+                }
+            }
+            Ok(reply)
+        }
         // What `Machine` DO asks of `OsAuthority` (creds.rs): never routed from a browser.
         (
             Method::Post,
@@ -752,244 +822,10 @@ pub async fn login(
     })
 }
 
-pub async fn sudo(
-    req: &Request,
-    env: &Env,
-    state: &State,
-    key: Option<String>,
-    body: Value,
-) -> Result<Reply> {
-    let (who, can_sudo, account) = read(state, {
-        let key = key.clone();
-        move |db| {
-            let who = auth::identity(db, key.as_deref());
-            let can_sudo = db.can_sudo(&who);
-            let account = db.user_by_id(who.id).map(|(_, u)| u);
-            (who, can_sudo, account)
-        }
-    })?;
-    if is_guest_id(who.id) {
-        return Ok(Reply::error("Sign in first", 401));
-    }
-    if !can_sudo {
-        return Ok(Reply::error(
-            "Current account is not in the wheel group",
-            403,
-        ));
-    }
-    let value = body;
-    let revoke = value["revoke"] == true;
-    if !revoke && who.id != 0 {
-        if auth::limited(req, env, "sudo").await? {
-            return Ok(Reply::error(
-                "Too many attempts; please try again later",
-                429,
-            ));
-        }
-        let Some(account) = &account else {
-            return Ok(Reply::error("Sign in first", 401));
-        };
-        if !auth::verify(value["password"].as_str().unwrap_or(""), account, env).await? {
-            return Ok(Reply::error("Incorrect account password", 401));
-        }
-    }
-    run(state, move |db| {
-        if let Some(key) = &key
-            && let Some(mut session) = db.session(key)
-        {
-            session.sudo_until = if revoke { 0 } else { auth::now() + 300 };
-            db.set_session(key, &session);
-        }
-        Reply::ok(json!({"sudo_active":!revoke}))
-    })
-}
-
-pub async fn passwd(
-    req: &Request,
-    env: &Env,
-    state: &State,
-    key: Option<String>,
-    https: bool,
-    body: Value,
-) -> Result<Reply> {
-    let who = read(state, {
-        let key = key.clone();
-        move |db| auth::identity(db, key.as_deref())
-    })?;
-    if is_guest_id(who.id) {
-        return Ok(Reply::error("Sign in first", 401));
-    }
-    if auth::limited(req, env, "passwd").await? {
-        return Ok(Reply::error(
-            "Too many attempts; please try again later",
-            429,
-        ));
-    }
-    #[derive(Deserialize)]
-    struct Password {
-        #[serde(default)]
-        username: Option<String>,
-        password: String,
-        #[serde(default)]
-        current_password: String,
-        #[serde(default)]
-        sudo: bool,
-        #[serde(default)]
-        force: bool,
-    }
-    let Ok(value) = serde_json::from_value::<Password>(body) else {
-        return Ok(Reply::error("Invalid password request", 400));
-    };
-    let checked = read(state, {
-        let key = key.clone();
-        let name = value.username.clone();
-        let sudo = value.sudo;
-        let who = who.clone();
-        move |db| {
-            let actor = auth::elevated(db, key.as_deref(), sudo)?;
-            let name = name.unwrap_or_else(|| db.username(who.id));
-            let target = db.user(&name).ok_or("User does not exist")?;
-            Ok::<_, String>((actor, name, target))
-        }
-    })?;
-    let (actor, name, target) = match checked {
-        Ok(checked) => checked,
-        Err(message) => return Ok(denied(&message, &who)),
-    };
-    if is_guest_id(target.id) {
-        return Ok(Reply::error(
-            "guest has no password: it is who is signed out",
-            400,
-        ));
-    }
-    if actor.id != 0 && target.id != who.id {
-        return Ok(Reply::error(
-            "Only root can change another account's password",
-            403,
-        ));
-    }
-    if actor.id != 0 && !auth::verify(&value.current_password, &target, env).await? {
-        return Ok(Reply::error("Incorrect current password", 401));
-    }
-    if value.password.is_empty() || value.password.len() > 512 {
-        return Ok(Reply::error(
-            "The new password cannot be empty and must not exceed 512 bytes",
-            400,
-        ));
-    }
-    if !value.force && !auth::password_valid(&value.password) {
-        return Ok(Reply::error(
-            "Use at least 12 characters; explicitly use passwd --force to allow a short password",
-            400,
-        ));
-    }
-    let salt = auth::random_token();
-    let hash = auth::hash(&value.password, &salt, env).await?;
-    let sudo = value.sudo;
-    run(state, move |db| {
-        let Some(mut account) = db.user(&name).filter(|u| u.id == target.id) else {
-            return Reply::error("User does not exist", 404);
-        };
-        // What was checked before hashing must still hold: the same signed-in account, acting as
-        // it did, and, without root, the current password verified still the account's, which
-        // is not locked meanwhile.
-        let now = auth::identity(db, key.as_deref());
-        let still = auth::elevated(db, key.as_deref(), sudo).is_ok_and(|a| a.id == actor.id);
-        if now.id != who.id
-            || !still
-            || actor.id != 0 && (account.hash != target.hash || account.locked)
-        {
-            return Reply::error(
-                "Account changed during the password change; please try again",
-                409,
-            );
-        }
-        account.salt = salt;
-        account.hash = hash;
-        account.locked = false;
-        db.set_user(&name, &account);
-        db.delete_sessions(account.id);
-        if account.id == who.id {
-            let (body, token) = auth::issue(db, key.as_deref(), account.id);
-            return Reply::ok(body).cookie(auth::cookie(https, &token, auth::TTL));
-        }
-        Reply::ok(
-            json!({"output":format!("Password updated for {name}; previous sessions revoked")}),
-        )
-    })
-}
-
-/// The most accounts guests may make, all told.
+/// The most cloud accounts guests may self-register, all told.
 const REGISTERED_MAX: usize = 1000;
 
-/// An account of group guest's deleting itself (userdel NAME, signed in as NAME), as its
-/// password confirms, and with `remove` its home: its sessions end, this one too.
-pub async fn unregister(
-    req: &Request,
-    env: &Env,
-    state: &State,
-    key: Option<String>,
-    https: bool,
-    body: Value,
-) -> Result<Reply> {
-    let who = read(state, {
-        let key = key.clone();
-        move |db| auth::identity(db, key.as_deref())
-    })?;
-    if is_guest_id(who.id) {
-        return Ok(Reply::error("Sign in first", 401));
-    }
-    if who.id == 0 || !who.groups.contains(&GUEST) {
-        return Ok(Reply::error(
-            "Permission denied: an account deletes itself only if it is in group guest; root deletes others with sudo userdel",
-            403,
-        ));
-    }
-    if auth::limited(req, env, "unregister").await? {
-        return Ok(Reply::error(
-            "Too many attempts; please try again later",
-            429,
-        ));
-    }
-    #[derive(Deserialize)]
-    struct Unregister {
-        password: String,
-        #[serde(default)]
-        remove: bool,
-    }
-    let Ok(wanted) = serde_json::from_value::<Unregister>(body) else {
-        return Ok(Reply::error("Invalid account request", 400));
-    };
-    let (name, user) = read(state, {
-        let id = who.id;
-        move |db| {
-            let name = db.username(id);
-            let user = db.user(&name);
-            (name, user)
-        }
-    })?;
-    let Some(user) = user.filter(|user| user.id == who.id) else {
-        return Ok(Reply::error("User does not exist", 404));
-    };
-    if !auth::verify(&wanted.password, &user, env).await? {
-        return Ok(Reply::error("Incorrect password", 401));
-    }
-    run(state, move |db| {
-        if auth::identity(db, key.as_deref()).id != who.id {
-            return Reply::error("Signed out meanwhile; please try again", 409);
-        }
-        let kept = match commands::accounts::delete_account(db, &name, wanted.remove) {
-            Ok(kept) => kept,
-            Err(message) => return denied(&message, &who),
-        };
-        Reply::ok(json!({ "username": "guest", "deleted": name, "home": "/", "kept": kept }))
-            .cookie(auth::cookie(https, "", 0))
-    })
-}
-
-/// useradd NAME, signed out: an account of one's own, in its own group and in guest's, its home
-/// /guest/NAME (made, only it may enter, with -m), and the password given; signed in as it at
-/// once.
+/// Cloud account self-registration (`/api/cloud-auth/register`).
 pub async fn register(
     req: &Request,
     env: &Env,

@@ -1,7 +1,6 @@
 import { test, expect } from './test.js';
-import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
-import { api, call, put, rmrf } from './sys.js';
+import { pageCall, pageMkdirp, pagePut, pageRmrf, switchLocalUser } from './ui.js';
 
 const prompt = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
@@ -17,17 +16,19 @@ async function run(page, command) {
 const shell = (page, script) => run(page, `sh -c '${script}'`);
 let base;
 test.beforeEach(async ({ page }) => {
-  base = '/guest/signals-' + crypto.randomUUID();
-  await call(page.request, { mkdir: { path: base, mode: 0o755 } });
+  base = '/tmp/signals-' + crypto.randomUUID();
   await page.goto('/');
+  await expect(prompt(page)).toHaveAttribute('data-state', 'idle');
+  await pageMkdirp(page, base, 0o755);
   await run(page, 'cd ' + base);
 });
-test.afterEach(async ({ page }) => { await rmrf(page.request, base); });
+test.afterEach(async ({ page }) => { await pageRmrf(page, base).catch(() => {}); });
 async function upload(page, name, wat) {
   const path = base + '/' + name, module = binaryen.parseText(wat);
-  try { expect((await put(page.request, '/api/file?path=' + path, { data: Buffer.from(module.emitBinary()) })).ok()).toBe(true); }
+  let bin;
+  try { bin = Buffer.from(module.emitBinary()); }
   finally { module.dispose(); }
-  await call(page.request, { chmod: { path, mode: 0o755 } });
+  await pagePut(page, path, bin, { mode: 0o755 });
   return path;
 }
 const signalModule = (body, handler = '(global.set $count (i32.add (global.get $count) (i32.const 1)))', extra = '') => `(module
@@ -51,8 +52,8 @@ const signalModule = (body, handler = '(global.set $count (i32.add (global.get $
     (i32.store (i32.const 0) (i32.const 120)) (i32.store (i32.const 4) (i32.const 2))
     (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))`;
 
-test('libc prompt and identity imports use credentials, including a root process after logout and exec', async ({ page }) => {
-  const guest = await call(page.request, 'getcreds');
+test('libc prompt and identity imports use credentials, including a root process after account switch and exec', async ({ page }) => {
+  const localUser = await pageCall(page, 'getcreds');
   await shell(page, 'USER=root UID=0; export USER UID; printf "%s" "$PS1"');
   await expect(last(page)).toHaveText('$ ');
   const identity = uid => `(module
@@ -65,20 +66,17 @@ test('libc prompt and identity imports use credentials, including a root process
       (if (i32.lt_s (call $gid) (i32.const 0)) (then unreachable))
       (if (i32.ne (call $groups (i32.const -1) (i32.const 0)) (i32.const -28)) (then unreachable))
       (if (i32.lt_s (call $groups (i32.const 64) (i32.const 32)) (i32.const 0)) (then unreachable))))`;
-  await upload(page, 'guest-id', identity(guest.uid));
-  await shell(page, 'USER=root UID=0 ./guest-id; echo guest:$?');
-  await expect(last(page)).toHaveText('guest:0');
+  await upload(page, 'user-id', identity(localUser.uid));
+  await shell(page, 'USER=root UID=0 ./user-id; echo user:$?');
+  await expect(last(page)).toHaveText('user:0');
   await upload(page, 'root-id', identity(0));
-  const password = process.env.OS_TEST_ADMIN_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
-  expect((await api(page.request, 'login', { headers: { 'CF-Connecting-IP': crypto.randomUUID() }, data: { username: 'root', password } })).ok()).toBe(true);
-  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+  await switchLocalUser(page, 'root');
   await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(0);
   await send(page, 'sh -i');
   await expect(prompt(page)).toHaveAttribute('data-state', 'input', { timeout: 15_000 });
   await expect(last(page)).toHaveText('# ');
-  expect((await api(page.request, 'logout')).ok()).toBe(true);
-  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
-  await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(guest.uid);
+  await switchLocalUser(page, 'user');
+  await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(localUser.uid);
   await send(page, './root-id; echo root:$?');
   await expect(last(page)).toContainText('\nroot:0\n# ');
   await send(page, 'exit');
@@ -260,7 +258,8 @@ test('kill %job delivers a caught signal once across registry reconciliation', a
     (global $done (mut i32) (i32.const 0)) (data (i32.const 140) "ready\\0a") (data (i32.const 160) "caught\\0a")`));
   await run(page, './job &');
   const transcript = page.locator('.terminal-panel:not([hidden]) .transcript');
-  await expect(transcript).toContainText('ready');
+  // Match the process's own `ready` output line (not the desktop welcome banner `Local OS ready`).
+  await expect(transcript.locator('pre').filter({ hasText: /^ready$/m })).toHaveCount(1, { timeout: 15_000 });
   await run(page, 'kill -USR1 %1');
   await expect(transcript).toContainText('caught');
   // Allow the five-second recovery poll to run before checking the count.
@@ -275,10 +274,10 @@ test('a signal interrupting writev preserves the bytes from completed vectors', 
     (drop (call $pipe (i32.const 500) (i32.const 504)))
     (i32.store (i32.const 0) (i32.const 100)) (i32.store (i32.const 4) (i32.const 6))
     (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))
-    (i32.store (i32.const 32) (i32.const 4096)) (i32.store (i32.const 36) (i32.const 65536))
+    (i32.store (i32.const 32) (i32.const 4096)) (i32.store (i32.const 36) (i32.const 65472))
     (i32.store (i32.const 40) (i32.const 4096)) (i32.store (i32.const 44) (i32.const 1))
     (call $assert (i32.eqz (call $write (i32.load (i32.const 504)) (i32.const 32) (i32.const 2) (i32.const 48))))
-    (call $assert (i32.eq (i32.load (i32.const 48)) (i32.const 65536)))
+    (call $assert (i32.eq (i32.load (i32.const 48)) (i32.const 65472)))
     (call $assert (i32.eq (global.get $count) (i32.const 1)))`, undefined, `
     (import "wasix_32v1" "fd_pipe" (func $pipe (param i32 i32) (result i32)))`).replace('(memory (export "memory") 1)', '(memory (export "memory") 2)'));
   await page.evaluate(path => {

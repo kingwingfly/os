@@ -33,7 +33,8 @@ export async function speak(name, microphone, { acl = null, presentation = null,
     await pc.setLocalDescription(await pc.createOffer());
     // A voice says which ask let it speak, which its presenter's page knows it by.
     const offer = { sdp: pc.localDescription.sdp, mid: transceiver.mid, ...(ask ? { ask } : {}) };
-    sent = await send(offer, { name: name ?? (presentation ? null : (await call('getcreds')).user), acl, presentation, fd });
+    const defaultName = presentation ? null : ((await window.os?.cloudStatus?.().catch(() => null))?.cloud_user ?? (await call('getcreds')).user);
+    sent = await send(offer, { name: name ?? defaultName, acl, presentation, fd });
     await pc.setRemoteDescription({ type: 'answer', sdp: sent.sdp });
     await connected(pc);
     return { device: sent.device, version: sent.version, end };

@@ -2,11 +2,12 @@ import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { api, call, errno, mkdirp, put, rmrf } from './sys.js';
+import { cloudSignIn } from './ui.js';
 import { connectKernel } from './service-auth.js';
 import { device, directory, ACCEL } from './accelerator.js';
 import { zipOf } from './archive-fixtures.js';
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password=(await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const password=process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const ROOT_ACCOUNT={uid:0,gid:0,groups:[0],user:'root',group:'root',home:'/root',shell:'/usr/bin/dash',signed_in:true};
 const GUEST_ACCOUNT={uid:65534,gid:65534,groups:[65534],user:'guest',group:'guest',home:'/tmp',shell:'/usr/bin/dash',signed_in:false};
 async function login(r) { expect((await api(r,'login',{headers:{'CF-Connecting-IP':'policy-'+randomUUID()},data:{password}})).ok()).toBe(true); }
@@ -30,6 +31,7 @@ test('seat policy persists across logins and rejects stale, process, sudo and fo
   const kernel=await freshKernel(page);
   let p;
   try {
+    await kernel.value('sync_account',GUEST_ACCOUNT);
     const session=await join(kernel), initial=session.seat_policy;
     expect(initial.sharing).toBe('control');
     const changed=await configure(kernel,session,'view');expect(changed.err).toBeUndefined();
@@ -98,10 +100,12 @@ test('provider policy is account scoped, revision checked and available through 
     const media=await device(r,'/dev/media');expect(await media.ioctl('policy',{})).toEqual(changed);await call(r,{close:{fd:media.fd}});
     const foreign=await browser.newContext();
     try {await call(foreign.request,'getcreds');const guest=await device(foreign.request);expect((await guest.ioctl('policy',{})).enabled).toBe(true);await call(foreign.request,{close:{fd:guest.fd}});}finally{await foreign.close();}
+    await call(r,{close:{fd:driver.fd}});
     await page.goto('/?recovery=1');await page.waitForFunction(()=>!!window.os?.exec);
+    await cloudSignIn(page, 'root', password);
     const result=await page.evaluate(async()=>{let diagnostic='';const result=await window.os.exec([{path:'/usr/bin/providerctl',argv:['providerctl']}],{stdin:'',onOutput:(_,text)=>{diagnostic+=text;}});return {...result,diagnostic};});
     expect(result.status,result.diagnostic).toBe(0);expect(JSON.parse(result.stdout)).toEqual(changed);
-    await call(r,{close:{fd:driver.fd}});const reopened=await device(r);expect(await reopened.ioctl('policy',{})).toEqual(changed);await call(r,{close:{fd:reopened.fd}});
+    const reopened=await device(r);expect(await reopened.ioctl('policy',{})).toEqual(changed);await call(r,{close:{fd:reopened.fd}});
   }finally{const reset=await device(r),current=await reset.ioctl('policy',{});await reset.ioctl('configure',{...before,revision:current.revision});await call(r,{close:{fd:reset.fd}});}
 });
 

@@ -2,9 +2,10 @@ import { executableAsset } from './executable-asset.js';
 import { test, expect } from './test.js';
 import { api, call, put, rmrf, sys } from './sys.js';
 import { hookPageKernel } from './service-auth.js';
+import { pageCall, pageGetText, pagePut, pageRmrf, switchLocalUser } from './ui.js';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const input = page => page.getByLabel('Shell input', { exact: true });
 const screen = page => page.locator('.terminal-screen');
 const status = page => page.locator('.console-connection');
@@ -33,13 +34,14 @@ test('greeter offers fixed session choices and guest desktop without booting an 
   await expect(page.getByRole('link', { name: 'Start session', exact: true })).toHaveCount(0);
 });
 
-test('sign-in selects a real root shell with its account home and no credentials in the URL', async ({ page }, testInfo) => {
+test('sign-in selects a real local shell with Cloud root authenticated and no credentials in the URL', async ({ page }, testInfo) => {
   await page.goto('/login.html?target=shell'); await expect(page.getByLabel('Shell', { exact: true })).toBeChecked();
   await page.getByLabel('Username', { exact: true }).fill('root');
   await page.getByLabel('Password', { exact: true }).fill(password);
   await page.getByRole('button', { name: 'Sign in and start', exact: true }).click();
   await expect(page).toHaveURL(/\/shell(?:\.html)?$/); await expect(input(page)).toBeEnabled({ timeout: 30_000 });
-  await command(page, 'id -u; pwd', /\n0\n\/root\n/);
+  expect((await call(page.request, 'getcreds')).uid).toBe(0);
+  await command(page, 'id -u; pwd', /\n1000\n\/home\/user\n/);
   await page.screenshot({ path: testInfo.outputPath('shell.png') });
   await end(page).click(); await expect(input(page)).toBeDisabled();
   await expect(status(page)).toContainText('Shell exited', { timeout: 15_000 });
@@ -72,27 +74,27 @@ test('a stale Continue choice cannot silently enter an account selected in anoth
   await expect(page.getByRole('button', { name: 'Continue as root', exact: true })).toBeEnabled();
 });
 
-test('greeter logout starts a guest shell while an existing root shell keeps its credentials', async ({ page, context }) => {
+test('greeter logout signs out Cloud while existing and new local shells keep local user credentials', async ({ page, context }) => {
   await call(page.request, 'getcreds'); await signIn(page.request); await ready(page);
-  await command(page, 'id -u', /\n0\n/);
+  await command(page, 'id -u', /\n1000\n/);
   const other = await context.newPage(); await other.goto('/login.html?target=shell');
   await other.getByRole('button', { name: 'Sign out and continue as guest', exact: true }).click();
   await expect(input(other)).toBeEnabled({ timeout: 30_000 });
-  const guest = await call(other.request, 'getcreds'); expect(guest.uid).toBeGreaterThan(0);
-  await command(other, 'id -u', new RegExp(`\\n${guest.uid}\\n`));
-  await command(page, "printf 'old:'; id -u", /\nold:0\n/);
+  const guest = await call(other.request, 'getcreds'); expect(guest.signed_in).toBe(false);
+  await command(other, 'id -u', /\n1000\n/);
+  await command(page, "printf 'old:'; id -u", /\nold:1000\n/);
   await end(page).click(); await end(other).click();
 });
 
 test('standalone shell executes real pipelines, redirection and PATH commands', async ({ page }) => {
-  await ready(page); const base = '/guest/session-target-' + randomUUID();
-  await call(page.request, { mkdir: { path: base, mode: 0o700 } });
+  await ready(page); const base = '/tmp/session-target-' + randomUUID();
+  await pageCall(page, { mkdir: { path: base, mode: 0o700 } });
   try {
     await command(page, `cd ${base}; printf 'a\\nb\\n' > letters; cat letters | wc -l; ls`, /\n2\nletters\n/);
-    expect(await (await page.request.get('/api/file?path=' + base + '/letters')).text()).toBe('a\nb\n');
+    expect(await pageGetText(page, base + '/letters')).toBe('a\nb\n');
     await command(page, 'echo $$', /\n\d+\n/); await end(page).click();
     await expect(status(page)).toContainText('Shell exited', { timeout: 15_000 });
-  } finally { await rmrf(page.request, base); }
+  } finally { await pageRmrf(page, base); }
 });
 
 test('Ctrl+C interrupts yes and returns to the shell without a busy label', async ({ page }) => {
@@ -123,7 +125,7 @@ test('shell PTY preserves no-echo input, alternate screens and resize', async ({
 test('exit disables input and explicit restart uses the current account with a fresh screen', async ({ page }) => {
   await ready(page); await command(page, "stty -echo; printf 'OLD-SCREEN\\n'; exit 7");
   await expect(status(page)).toHaveText('Shell exited (7)'); await expect(input(page)).toBeDisabled();
-  await signIn(page.request); await page.getByRole('button', { name: 'Start shell', exact: true }).click();
+  await switchLocalUser(page, 'root'); await page.getByRole('button', { name: 'Start shell', exact: true }).click();
   await expect(input(page)).toBeEnabled(); await command(page, 'true'); await expect(input(page)).toHaveAttribute('type', 'text'); await expect(screen(page)).not.toContainText('OLD-SCREEN');
   await command(page, 'id -u', /\n0\n/); await end(page).click();
 });
@@ -148,29 +150,42 @@ test('ending while the shell image loads abandons the candidate and cannot reviv
   } finally { release(); }
 });
 
-test('the selected shell starts automatic login units once; the greeter does not start them', async ({ page }) => {
+test('the selected shell boots PID 1 and user-session once; the greeter does not start them', async ({ page }) => {
   const kernel = await hookPageKernel(page);
-  await call(page.request, 'getcreds'); const base = '/guest/target-units-' + randomUUID();
-  await call(page.request, { mkdir: { path: base, mode: 0o700 } });
-  const file = base + '/units.json';
-  expect((await put(page.request, '/api/file?path=' + file, { data: JSON.stringify({ version: 1, units: [{ name: 'once', argv: ['sh', '-c', `echo once >> ${base}/count`] }] }) })).ok()).toBe(true);
+  const requests = [];
+  page.on('request', req => {
+    if (/client-kernel|usr\/bin\/init/.test(req.url())) requests.push(req.url());
+  });
+  await page.goto('/login.html?target=shell');
+  await expect(page.getByRole('button', { name: 'Continue as guest', exact: true })).toBeEnabled();
+  expect(requests).toEqual([]);
+  await page.getByRole('button', { name: 'Continue as guest', exact: true }).click();
+  await expect(input(page)).toBeEnabled({ timeout: 30_000 });
+  await kernel.ready();
   try {
-    await page.goto('/login.html?target=shell'); await expect(page.getByRole('button', { name: 'Continue as guest', exact: true })).toBeEnabled();
-    expect((await sys(page.request, [{ stat: { path: base + '/count' } }]))[0].err?.errno).toBe('ENOENT');
-    await page.getByRole('button', { name: 'Continue as guest', exact: true }).click(); await expect(input(page)).toBeEnabled({ timeout: 30_000 });
-    await kernel.ready();
-    await expect.poll(async () => (await kernel.value('login_status'))?.coordinator).toBe(true);
+    await expect.poll(async () => (await kernel.value('login_status'))?.coordinator, { timeout: 20_000 }).toBe(true);
+    await expect.poll(async () => (await kernel.value('machine_init_status'))?.reaper?.state, { timeout: 20_000 }).toBe('running');
     const before = await kernel.value('login_status');
-    await kernel.value('login_configure', { file, expected: { session: before.session.id, generation: before.session.generation } });
-    await expect.poll(async () => (await kernel.value('login_status'))?.session?.startup?.status, { timeout: 30_000 }).toBe(0);
-    expect(await (await page.request.get('/api/file?path=' + base + '/count')).text()).toBe('once\n');
-    // Re-evaluating coordinator membership on the same login session must not rerun completed units.
+    // Wait for PID 1's per-user service manager (`user-session@1000.service`) to be active once.
+    await command(page, 'service status user-session@1000.service', /user-session@1000\.service/);
+    const pidBefore = await page.evaluate(async () => {
+      const m = document.querySelector('.transcript')?.textContent?.match(/user-session@1000\.service[^\n]*pid=(\d+)/);
+      return m ? Number(m[1]) : null;
+    });
+    // Re-evaluating coordinator membership on the same login session must not restart PID 1 or user-session.
     await kernel.value('login_refresh', { fromServer: false });
     await expect.poll(async () => (await kernel.value('login_status'))?.coordinator).toBe(true);
-    expect((await kernel.value('login_status')).session.startup.status).toBe(0);
-    expect(await (await page.request.get('/api/file?path=' + base + '/count')).text()).toBe('once\n');
+    expect((await kernel.value('login_status')).session.id).toBe(before.session.id);
+    await command(page, 'service status user-session@1000.service', /user-session@1000\.service/);
+    if (pidBefore) {
+      const pidAfter = await page.evaluate(async () => {
+        const matches = [...(document.querySelector('.transcript')?.textContent?.matchAll(/user-session@1000\.service[^\n]*pid=(\d+)/g) ?? [])];
+        return matches.length ? Number(matches.at(-1)[1]) : null;
+      });
+      expect(pidAfter).toBe(pidBefore);
+    }
     await end(page).click();
-  } finally { await rmrf(page.request, base); }
+  } finally {}
 });
 
 test('short mobile viewports can scroll the greeter and run the selected shell', async ({ page }, testInfo) => {

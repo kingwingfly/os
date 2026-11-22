@@ -1,7 +1,6 @@
 import { test, expect } from './test.js';
-import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
-import { api, call, put, rmrf } from './sys.js';
+import { pageCall, pageGetText, pageMkdirp, pagePut, pageRmrf } from './ui.js';
 import { hookPageKernel } from './service-auth.js';
 
 const prompt = page => page.locator('.terminal-panel:not([hidden]) .command-line');
@@ -13,13 +12,17 @@ const fork = eq('(call $fork (i32.const 1) (i32.const 48))', 0);
 const wait = `${assert('(i32.eq (call $wait (i32.load (i32.const 48)) (i32.const 80) (i32.const 0)) (i32.load (i32.const 48)))')}
   ${eq('(i32.load (i32.const 80))', 0)}`;
 const raw = { iflag: 0, oflag: 0, cflag: 0xb0, lflag: 0, cc: Array(32).fill(0) }; raw.cc[6] = 1;
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
-const login = async page => expect((await api(page.request, 'login', {
-  headers: { 'CF-Connecting-IP': 'host-pty-' + crypto.randomUUID() }, data: { password },
-})).ok()).toBe(true);
+const ROOT_ACCOUNT = { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root', home: '/root', shell: '/usr/bin/dash', signed_in: true };
+const USER_ACCOUNT = { uid: 1000, gid: 1000, groups: [1000, 10], user: 'user', group: 'user', home: '/home/user', shell: '/bin/sh', signed_in: true };
+const GUEST_ACCOUNT = { uid: 65534, gid: 65534, groups: [65534], user: 'guest', group: 'guest', home: '/tmp', shell: '/usr/bin/dash', signed_in: false };
 let base;
-test.beforeEach(async ({ page }) => { base = '/guest/ptmx-' + crypto.randomUUID(); await call(page.request, { mkdir: { path: base, mode: 0o755 } }); await page.goto('/'); });
-test.afterEach(async ({ page }) => { await rmrf(page.request, base); });
+test.beforeEach(async ({ page }) => {
+  base = '/home/user/ptmx-' + crypto.randomUUID();
+  await page.goto('/');
+  await page.waitForFunction(() => Boolean(window.os?.exec));
+  await pageMkdirp(page, base, 0o755);
+});
+test.afterEach(async ({ page }) => { await pageRmrf(page, base).catch(() => {}); });
 async function run(page, path) {
   await expect(prompt(page)).toHaveAttribute('data-state', 'idle');
   await page.locator('#command').fill(path); await page.locator('#command').press('Enter');
@@ -49,7 +52,27 @@ async function connectHost(page) {
         .then(result => { run.result = result; });
     } };
   });
-  await hostCall(page, 'sync_account_from_server');
+  await hostCall(page, 'sync_account', ROOT_ACCOUNT);
+  const hostBase = '/tmp/ptmx-host-' + crypto.randomUUID();
+  await hostCall(page, 'vfs_sys', { batch: { calls: [{ mkdir: { path: hostBase, mode: 0o755 } }, { chmod: { path: hostBase, mode: 0o755 } }] } });
+  await page.evaluate(dir => { window.ptyHost.base = dir; }, hostBase);
+  await hostCall(page, 'sync_account', USER_ACCOUNT);
+}
+async function hostWrite(page, path, data, mode = 0o755) {
+  const bytes = Array.from(Buffer.isBuffer(data) ? data : Buffer.from(data));
+  await page.evaluate(async ({ path, bytes, mode }) => {
+    const req = window.ptyHost.request;
+    const opened = await req('vfs_sys', {
+      batch: { calls: [{ open: { path, flags: 1 | 64 | 512, mode } }] },
+    });
+    const r0 = opened.ok?.results?.[0];
+    if (!r0?.ok) throw new Error(`hostWrite(${path}): ${JSON.stringify(opened)}`);
+    const fd = r0.ok.fd;
+    if (bytes.length > 0) {
+      await req('vfs_pwrite_chunk', { fd, offset: 0, data: new Uint8Array(bytes) });
+    }
+    await req('vfs_sys', { batch: { calls: [{ close: { fd } }, { chmod: { path, mode } }] } });
+  }, { path, bytes, mode });
 }
 const startHost = (page, id, path, options) => page.evaluate(([id, path, options]) => window.ptyHost.start(id, path, options), [id, path, options]);
 const hostOutput = (page, id) => page.evaluate(id => window.ptyHost.runs.get(id).output.replace(/\r\n/g, '\n'), id);
@@ -63,10 +86,11 @@ async function hostResult(page, id, status = 0) {
 async function closeHost(page) {
   await page.evaluate(async base => {
     if (!window.ptyHost) return;
-    const { request, runs } = window.ptyHost;
+    const { request, runs, base: hostBase } = window.ptyHost;
+    const dir = hostBase || base;
     await Promise.all([...runs.keys()].map(run => request('run_signal', { run, signal: 9 })));
     const rows = await request('poll', { pids: [] });
-    await Promise.all((rows.ok ?? []).filter(p => p.path?.startsWith(base + '/')).map(p => request('kill', { pid: p.pid, signal: 9 })));
+    await Promise.all((rows.ok ?? []).filter(p => p.path?.startsWith(dir + '/')).map(p => request('kill', { pid: p.pid, signal: 9 })));
     await request('reconcile');
     await Promise.all([...runs.values()].map(run => run.done));
   }, base);
@@ -132,7 +156,18 @@ async function upload(page, name, build) {
       (call $read (local.get $fd) (i32.const 128) (i32.const 1) (i32.const 136)))
     (func (export "_start") (local $n i32) (local $status i32) ${body}) ${segments.join('\n')})`);
   let bytes; try { bytes = module.emitBinary(); } finally { module.dispose(); }
-  const path = `${base}/${name}.wasm`; expect((await put(page.request, '/api/file?path=' + path, { data: Buffer.from(bytes) })).ok()).toBe(true); await call(page.request, { chmod: { path, mode: 0o755 } }); return path;
+  const hostBase = await page.evaluate(() => window.ptyHost?.base ?? null);
+  if (hostBase) {
+    const path = `${hostBase}/${name}.wasm`;
+    await hostWrite(page, path, Buffer.from(bytes), 0o755);
+    return path;
+  }
+  const path = `${base}/${name}.wasm`;
+  await page.waitForFunction(() => Boolean(window.os?.exec));
+  await pageMkdirp(page, base, 0o755);
+  await pagePut(page, path, Buffer.from(bytes), { mode: 0o755, overwrite: true });
+  await pageCall(page, { chmod: { path, mode: 0o755 } });
+  return path;
 }
 
 test('ptmx locks slaves, enforces modes and transports raw binary data', async ({ page }) => {
@@ -264,7 +299,13 @@ test('another execution host cannot open an allocated slave by learning its name
     ${say('foreign-pty-denied\n')}`);
   const other = await context.newPage();
   try {
-    await other.goto('/'); await run(other, probe); await expect(screen(other)).toContainText('foreign-pty-denied');
+    await other.goto('/');
+    await other.waitForFunction(() => Boolean(window.os?.exec));
+    await pageMkdirp(other, base, 0o755);
+    const otherProbe = await upload(other, 'probe-other', ({ text, say }) => `
+      ${eq(`(call $open ${text(`/dev/pts/${number}`)} (i32.const 2) (i32.const 0))`, -44)}
+      ${say('foreign-pty-denied\n')}`);
+    await run(other, otherProbe); await expect(screen(other)).toContainText('foreign-pty-denied');
   } finally { await other.close(); }
   await page.locator('#command').fill('x'); await page.locator('#command').press('Enter');
   await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
@@ -321,7 +362,7 @@ test('host PTY input signals the controlling foreground group in another run', a
 });
 
 test('host PTY permissions use the process snapshot after a browser root login', async ({ page }) => {
-  await connectHost(page); await login(page); await hostCall(page, 'sync_account_from_server');
+  await connectHost(page); await hostCall(page, 'sync_account', ROOT_ACCOUNT);
   const owner = await upload(page, 'root-owner', ({ setup, say }) => `${setup(2 | 256)} ${say('owner-ready\n')}
     ${eq('(call $receive (i32.const 0) (i32.const 1))', 0)}`);
   try {
@@ -330,17 +371,16 @@ test('host PTY permissions use the process snapshot after a browser root login',
     const probe = await upload(page, 'guest-probe', ({ text, say }) => `${say('guest-ready\n')}
       ${eq('(call $receive (i32.const 0) (i32.const 1))', 0)}
       ${eq(`(call $open ${text(`/dev/pts/${number}`)} (i32.const 2) (i32.const 0))`, -2)} ${say('guest-denied\n')}`);
-    expect((await api(page.request, 'logout')).ok()).toBe(true);
-    await hostCall(page, 'sync_account_from_server');
+    await hostCall(page, 'sync_account', GUEST_ACCOUNT);
     await startHost(page, 'probe', probe, { environment: { UID: '0', USER: 'root' } }); await hostReady(page, 'probe', 'guest-ready');
-    await login(page); await hostCall(page, 'sync_account_from_server');
+    await hostCall(page, 'sync_account', ROOT_ACCOUNT);
     await hostInput(page, 'probe', 'x\n'); await hostResult(page, 'probe');
     expect(await hostOutput(page, 'probe')).toContain('guest-denied');
     const allowed = await upload(page, 'root-peer', ({ text, say }) => `
       ${eq(`(call $open ${text(`/dev/pts/${number}`)} (i32.const 2) (i32.const 0))`, 4)} ${say('root-allowed\n')}`);
     await startHost(page, 'allowed', allowed); await hostResult(page, 'allowed');
     expect(await hostOutput(page, 'allowed')).toContain('root-allowed');
-  } finally { await login(page); await hostCall(page, 'sync_account_from_server'); await closeHost(page); }
+  } finally { await hostCall(page, 'sync_account', USER_ACCOUNT); await closeHost(page); }
 });
 
 test('root retains cross-run terminal reassignment authority after browser logout', async ({ page }) => {
@@ -358,20 +398,19 @@ test('root retains cross-run terminal reassignment authority after browser logou
     await startHost(page, 'denied', denied); await hostResult(page, 'denied');
     const replies = (await hostOutput(page, 'denied')).split('\n').filter(s => s.startsWith('{')).map(s => JSON.parse(s).results[0]);
     expect(replies.at(-1).err.errno).toBe('EPERM');
-    await login(page); await hostCall(page, 'sync_account_from_server');
+    await hostCall(page, 'sync_account', ROOT_ACCOUNT);
     const peer = await upload(page, 'steal-peer', ({ q, text, say }) => `${ignoreHup} ${q(0x5422, 0)} ${say('root-ready\n')}
       ${eq('(call $receive (i32.const 0) (i32.const 1))', 0)}
       ${eq(`(call $open ${text(`/dev/pts/${number}`)} (i32.const 2) (i32.const 0))`, 4)} ${q(0x540e, 4, 1)}
       ${assert('(i32.eq (call $fg (i32.const 4)) (call $pgid (i32.const 0)))')} ${say('root-reassigned\n')}
       ${eq('(call $receive (i32.const 4) (i32.const 1))', 0)} ${eq('(i32.load (i32.const 136))', 0)} ${say('root-hung-up\n')}`);
     await startHost(page, 'peer', peer); await hostReady(page, 'peer', 'root-ready');
-    expect((await api(page.request, 'logout')).ok()).toBe(true);
-    await hostCall(page, 'sync_account_from_server');
+    await hostCall(page, 'sync_account', GUEST_ACCOUNT);
     await hostInput(page, 'peer', 'x\n'); await hostReady(page, 'peer', 'root-reassigned');
     await hostInput(page, 'owner', 'x\n'); await hostResult(page, 'owner'); await hostResult(page, 'peer');
     expect(await hostOutput(page, 'owner')).toContain('old-session-detached');
     expect(await hostOutput(page, 'peer')).toContain('root-hung-up');
-  } finally { await login(page); await hostCall(page, 'sync_account_from_server'); await closeHost(page); }
+  } finally { await hostCall(page, 'sync_account', USER_ACCOUNT); await closeHost(page); }
 });
 
 test('a child keeps the host PTY alive after its launching run completes', async ({ page }) => {
@@ -550,10 +589,12 @@ test('console IDs do not give another execution host control over a live pane', 
   const other = await context.newPage();
   try {
     await other.goto('/'); await connectHost(other);
-    for (const target of [page, other]) {
-      await startHost(target, 'same-run-id', path, { terminalId: 'same-console-id' });
-      await hostReady(target, 'same-run-id', 'private-console-ready');
-    }
+    const otherPath = await upload(other, 'console-private', ({ say }) => `${say('private-console-ready\n')}
+      ${eq('(call $receive (i32.const 0) (i32.const 8))', 0)}`);
+    await startHost(page, 'same-run-id', path, { terminalId: 'same-console-id' });
+    await hostReady(page, 'same-run-id', 'private-console-ready');
+    await startHost(other, 'same-run-id', otherPath, { terminalId: 'same-console-id' });
+    await hostReady(other, 'same-run-id', 'private-console-ready');
     await hostCall(other, 'console_close', { terminalId: 'same-console-id' });
     await hostResult(other, 'same-run-id', 129);
     expect(await page.evaluate(() => window.ptyHost.runs.get('same-run-id').result)).toBeUndefined();
@@ -563,7 +604,7 @@ test('console IDs do not give another execution host control over a live pane', 
 
 test('raw file ioctls keep their descriptor namespace when local PTY numbers overlap', async ({ page }) => {
   const source = `${base}/source`, target = `${base}/clone`;
-  expect((await put(page.request, '/api/file?path=' + source, { data: 'shared file content\n' })).ok()).toBe(true);
+  await pagePut(page, source, 'shared file content\n', { mode: 0o644, overwrite: true });
   const path = await upload(page, 'namespaces', ({ setup, text }) => `${setup(2 | 256)}
     ${eq('(call $dup2 (i32.const 1) (i32.const 100))', 0)}
     (loop $cover
@@ -581,7 +622,7 @@ test('raw file ioctls keep their descriptor namespace when local PTY numbers ove
       (local.set $n (i32.add (local.get $n) (i32.const 1))) (br_if $check (i32.lt_u (local.get $n) (local.get $status))))
     (call $send (i32.const 100) ${text('descriptor-namespaces-ok\n')})`);
   await run(page, path); await expect(screen(page)).toContainText('descriptor-namespaces-ok');
-  expect(await (await page.request.get('/api/file?path=' + target)).text()).toBe('shared file content\n');
+  expect(await pageGetText(page, target)).toBe('shared file content\n');
 });
 
 test('killing an unresponsive session leader closes its last master and resumes a stopped foreground child', async ({ page }) => {

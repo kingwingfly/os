@@ -1,11 +1,11 @@
-import { verifyRelease } from './release.js';
+import { verifyRelease, refreshOnlineTrustRoot } from './release.js';
 import { installSelectMenus } from './select-menu.js';
 import { inspectFaststart } from './faststart.mjs';
 import { uploadFile, Cancelled } from './upload.mjs';
 import { record, clock } from './record.mjs';
 import { speak, listen as hearLive } from './sound.mjs';
 import * as dev from './dev.mjs';
-import { exec, closeConsole, grantConsole, revokeConsole, attachConsole, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive } from './kernel/page.js';
+import { exec, closeConsole, grantConsole, revokeConsole, attachConsole, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, bootStatus, closeCleanRoot, cloudStatus, cloudSignInKernel, cloudSignOutKernel, revokeCloudTokensOnly } from './kernel/page.js';
 import { kernelCall } from './kernel/protocol.js';
 import { answered as resultOf, call, sys } from './http.mjs';
 import { migratePreferences } from './compat.mjs';
@@ -20,13 +20,27 @@ for (const name of ['localStorage', 'sessionStorage']) {
   try { migratePreferences(window[name]); } catch { /* storage can be disabled or full */ }
 }
 
-let configuration;
-export const ready = verifyRelease().then(() => fetch('/os-config.json')).then(async response => {
-  if (!response.ok) throw new Error('Cannot read OS configuration');
-  configuration = await response.json();
-  document.title = configuration.branding.name + configuration.branding.subtitle;
-  document.querySelector('meta[name="description"]').content = configuration.branding.description;
-});
+const DEFAULT_CONFIG = {
+  branding: {
+    name: 'OS',
+    subtitle: '',
+    heading: 'Your OS, in the browser.',
+    description: 'A browser OS with processes, a filesystem, local accounts, and applications.',
+  },
+  games: {},
+};
+let configuration = DEFAULT_CONFIG;
+export const ready = verifyRelease()
+  .catch(() => {})
+  .then(() => fetch('/os-config.json').then(r => (r.ok ? r.json() : DEFAULT_CONFIG)).catch(() => DEFAULT_CONFIG))
+  .then(loaded => {
+    configuration = loaded && loaded.branding ? loaded : DEFAULT_CONFIG;
+    document.title = configuration.branding.name + configuration.branding.subtitle;
+    const desc = document.querySelector('meta[name="description"]');
+    if (desc) desc.content = configuration.branding.description;
+    // Ratchet online publisher trust asynchronously AFTER boot (Codex Finding #7: Stage 0 stays 0-network).
+    void refreshOnlineTrustRoot().catch(() => {});
+  });
 
 const $ = id => document.getElementById(id);
 const fileUrl = path => '/api/file?path=' + encodeURIComponent(path);
@@ -41,32 +55,103 @@ async function api(url, options) {
   if (!response.ok) { let error; try { error = (await response.json()).error; } catch {} const failure = new Error(error || `Request failed (${response.status})`); failure.status = response.status; throw failure; }
   return response;
 }
-// Who this session is (getcreds), and whether it may write in the directory `path` (access).
-let syncedAccount = null;
-let remoteDevicesPromise = null;
-function attachRemoteDevices() {
-  return (remoteDevicesPromise ??= Promise.all(
-    ['archive', 'media', 'present', 'snd'].map(driver =>
-      kernelCall('attach_remote_device', { driver }).catch(() => {}),
-    ),
-  ));
-}
-async function syncAccount(who) {
-  if (!who || typeof who.uid !== 'number') return;
-  if (!syncedAccount || syncedAccount.uid !== who.uid || syncedAccount.signed_in !== who.signed_in || syncedAccount.user !== who.user) {
-    syncedAccount = { uid: who.uid, signed_in: who.signed_in, user: who.user };
-    await kernelCall('sync_account', who).catch(() => {});
-    await kernelCall('login_refresh', { fromServer: false }).catch(() => {});
-  }
-  await attachRemoteDevices();
-}
+// Local OS account identity (100% offline via local `os-cowfs` `/etc/passwd`, ZERO network RPCs)
+// and whether it may write in `path` (local VFS `access`).
+let cloudSignedIn = false;
 async function session(path = directory) {
-  await bootstrapAccount;
   const [creds, writable] = await sys(['getcreds', { access: { path, mode: 3 } }]);
   const who = resultOf(creds);
-  await syncAccount(who);
-  return { authenticated: who.signed_in, writable: who.signed_in, username: who.user, uid: who.uid, group: who.group,
-    groups: who.group_names, home: who.home, can_sudo: who.can_sudo, sudo_active: who.sudo_active, can_write: 'ok' in writable };
+  return {
+    authenticated: who.signed_in,
+    writable: who.signed_in,
+    username: who.user,
+    uid: who.uid,
+    gid: who.gid,
+    group: who.group,
+    groups: who.group_names,
+    home: who.home,
+    can_sudo: who.can_sudo,
+    sudo_active: who.sudo_active,
+    can_write: 'ok' in writable,
+  };
+}
+
+// Explicit Cloud / Cluster Sign-In (`#57` L3d): authenticates against `/api/cloud-auth/login`,
+// mints scoped `ServiceAuth v2` credentials, mounts optional `/mnt/cloud` and remote devices,
+// and connects `/api/events` WebSocket. NEVER mutates local `/etc/passwd` or local UID!
+let pendingCloudLogout = false;
+
+async function flushPendingCloudSignOut() {
+  let revStatus = null;
+  try {
+    revStatus = await kernelCall('flush_pending_cloud_revocations');
+  } catch { /* retry later when online */ }
+  if (pendingCloudLogout) {
+    try {
+      const res = await fetch('/api/cloud-auth/logout', { method: 'POST' });
+      if (res.ok) pendingCloudLogout = false;
+    } catch { /* stay pending until acknowledged */ }
+  }
+  return {
+    ...(revStatus ?? {}),
+    remote_signed_out: !pendingCloudLogout && Boolean(revStatus?.remote_revoked ?? true),
+    pending_logout: pendingCloudLogout,
+  };
+}
+
+window.addEventListener('online', () => {
+  if (pendingCloudLogout) void flushPendingCloudSignOut();
+});
+
+async function cloudSignIn(username, password, scope) {
+  if (pendingCloudLogout) {
+    await flushPendingCloudSignOut().catch(() => {});
+  }
+  const response = await api('/api/cloud-auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const payload = await response.json();
+  // Codex Finding #23: require authenticated numeric UID from `/api/cloud-auth/login`
+  // so kernel minting verifies subject identity and rejects mid-flight account changes.
+  if (typeof payload?.uid !== 'number' || !Number.isInteger(payload.uid) || payload.uid < 0) {
+    throw new Error('Cloud login response omitted authenticated numeric uid.');
+  }
+  const status = await cloudSignInKernel({
+    cloudUser: payload.username ?? payload.user ?? username,
+    cloudUid: payload.uid,
+    cloudGid: typeof payload.gid === 'number' && Number.isInteger(payload.gid) ? payload.gid : payload.uid,
+    cloudGroups: Array.isArray(payload.groups) ? payload.groups : [],
+    scope: scope ?? { cloud_fs: true, devices: ['archive', 'media', 'present', 'snd'], containers: true, relay: false },
+  });
+  pendingCloudLogout = false;
+  cloudSignedIn = !!status?.signed_in;
+  if (cloudSignedIn) listen();
+  window.dispatchEvent(new CustomEvent('os:cloud-changed', { detail: status }));
+  changed();
+  return status;
+}
+
+async function cloudSignOut() {
+  // Codex Finding #27: clear local authority immediately, retain pending remote logout &
+  // revocations until server acknowledges, and report completion honestly.
+  cloudSignedIn = false;
+  stopListening();
+  const status = await cloudSignOutKernel();
+  pendingCloudLogout = true;
+  try {
+    const res = await fetch('/api/cloud-auth/logout', { method: 'POST' });
+    if (res.ok) pendingCloudLogout = false;
+  } catch { /* remain pending until retried online */ }
+  const combined = {
+    ...status,
+    remote_signed_out: !pendingCloudLogout && Boolean(status?.remote_revoked ?? true),
+    pending_logout: pendingCloudLogout,
+  };
+  window.dispatchEvent(new CustomEvent('os:cloud-changed', { detail: combined }));
+  changed();
+  return combined;
 }
 // The account calls that change this browser's session. The session one replaces ends as it
 // answers, which this page hears of before its own identityChanged: until then, that is not
@@ -81,7 +166,7 @@ async function post(endpoint, data) {
 // The account system calls, as the dialogs below ask them (crates/worker/src/sys.rs).
 async function postJson(endpoint, data) {
   switch (endpoint) {
-    case 'login': return call('login', { username: data.username ?? 'root', password: data.password ?? '' }, { sudo: !!data.sudo });
+    case 'login': return call('login', { username: data.username ?? 'root', password: data.password ?? '', force: !!data.force }, { sudo: !!data.sudo });
     case 'logout': return call('logout');
     case 'sudo': return call('sudo', { password: data.password ?? '', revoke: !!data.revoke });
     case 'passwd': return call('passwd', { username: data.username ?? null, password: data.password ?? '', current_password: data.current_password ?? null, force: !!data.force }, { sudo: !!data.sudo });
@@ -135,8 +220,28 @@ function askCredentials({ title, description, username, chooseUser = false, newP
 // sys.rs), which forget what they knew of them at once, and the tabs that show one list it again,
 // a burst of changes as one. Pings keep proxies and tunnels from closing a quiet line; a line that
 // drops opens again, and what was missed meanwhile is listed again.
-let events, eventsRetry = 0, pendingTimer;
-function listen() {
+let events, eventsRetry = 0, pendingTimer, reconnectTimer;
+function stopListening() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  const socket = events;
+  events = null;
+  eventsRetry = 0;
+  try { socket?.close(); } catch { /* ignore */ }
+}
+const toCloudPath = path => {
+  if (typeof path !== 'string') return path;
+  if (path === '/mnt/cloud') return '/';
+  if (path.startsWith('/mnt/cloud/')) return path.slice('/mnt/cloud'.length);
+  return path;
+};
+const wantsEvents = () => cloudSignedIn || !!following || !!hearing || voices.size > 0 || !!speaking;
+function ensureListening() {
+  if (!events || events.readyState > WebSocket.OPEN) listen(true);
+}
+function listen(force = false) {
+  if (!force && !wantsEvents()) return;
+  clearTimeout(reconnectTimer);
   events?.close();
   const socket = events = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/events`);
   let ping;
@@ -148,8 +253,9 @@ function listen() {
     if (following || hearing) socket.send(JSON.stringify({ follow: followed() }));
     // A deck shown here asks where its account is now, as turns made elsewhere while the line
     // was down were not heard; unless it turned itself meanwhile, which goes out below.
-    const turned = outbox.some(message => message.present?.path === shown?.path);
-    if (reconnected && shown && !following && !turned) outbox.push({ where: shown.path });
+    const shownCloud = toCloudPath(shown?.path);
+    const turned = outbox.some(message => message.present?.path === shownCloud);
+    if (reconnected && shown && !following && !turned) outbox.push({ where: shownCloud });
     for (const message of outbox.splice(0)) socket.send(JSON.stringify(message));
   };
   socket.onmessage = event => {
@@ -192,16 +298,10 @@ function listen() {
     clearTimeout(pendingTimer);
     pendingTimer = setTimeout(() => window.dispatchEvent(new CustomEvent('os-remote')), 250);
   };
-  socket.onclose = () => { clearInterval(ping); if (events === socket) setTimeout(listen, Math.min(30000, 1000 * 2 ** eventsRetry++)); };
+  socket.onclose = () => { clearInterval(ping); if (events === socket && wantsEvents()) reconnectTimer = setTimeout(listen, Math.min(30000, 1000 * 2 ** eventsRetry++)); };
 }
-// The line opens once the browser has its session, signed out too (its os_guest cookie,
-// which the first request is given): a driver's news to it is for that session.
-// Coalesced through `bootstrapAccount` so concurrent cold `session()` calls never race on
-// cookie-less `/api/sys` and mint two competing `os_guest` cookies.
-const bootstrapAccount = sys(['getcreds'])
-  .then(([r]) => r?.ok && syncAccount(r.ok))
-  .catch(() => {});
-bootstrapAccount.finally(listen);
+// Boot is 100% offline-first (ZERO network RPCs, ZERO `/api/events` WebSocket while signed out
+// of Cloud). `/api/events` opens lazily on explicit `cloudSignIn()` or `attend()`/`hear()`.
 // Slides and PDFs presented follow each other (owner's request, 2026-10-28): the place a page
 // presents (viewer.rs calls present) shows in this browser's other windows showing that file,
 // and in the account's pages signed in elsewhere, which the authority tells (store.rs relay).
@@ -209,14 +309,24 @@ const presenting = 'BroadcastChannel' in window ? new BroadcastChannel('os-prese
 // The last place this page heard of or showed, by path, which a deck shown later starts at
 // (viewer.rs follow_presenting): one may come while its file is still being read.
 const heard = new Map();
-const presented = detail => { heard.set(detail.path, detail.at); window.dispatchEvent(new CustomEvent('os:present', { detail })); };
+const presented = detail => {
+  const cloudPath = toCloudPath(detail.path);
+  const mountedPath = cloudPath.startsWith('/') ? `/mnt/cloud${cloudPath}` : cloudPath;
+  heard.set(detail.path, detail.at);
+  heard.set(cloudPath, detail.at);
+  heard.set(mountedPath, detail.at);
+  const mapped = (shown?.path && toCloudPath(shown.path) === cloudPath) ? { ...detail, path: shown.path } : detail;
+  window.dispatchEvent(new CustomEvent('os:present', { detail: mapped }));
+};
 if (presenting) presenting.onmessage = event => presented(event.data);
 function present(path, column, row) {
-  const place = { path, at: [column, row] };
+  const cloudPath = toCloudPath(path);
+  const place = { path: cloudPath, at: [column, row] };
   heard.set(path, place.at);
-  presenting?.postMessage(place);
+  heard.set(cloudPath, place.at);
+  presenting?.postMessage({ path, at: [column, row] });
   // While the line is down, only the last place of each file waits for it.
-  const waiting = outbox.findIndex(message => message.present?.path === path);
+  const waiting = outbox.findIndex(message => message.present?.path === cloudPath);
   if (waiting >= 0) outbox.splice(waiting, 1);
   say({ present: place });
 }
@@ -225,7 +335,7 @@ const outbox = [];
 function say(message) { if (events?.readyState === WebSocket.OPEN) events.send(JSON.stringify(message)); else outbox.push(message); }
 // Where the account last showed the file at `path`, on any device, which the authority answers
 // with a present message; a page opens a deck there (viewer.rs).
-function ask(path) { say({ where: path }); }
+function ask(path) { say({ where: toCloudPath(path) }); }
 // The presentation this page follows (devices.rs), as /api/device described it: /dev/present/NAME,
 // the file it shows, whose it is, and whether this page's account turns it.
 let following = null;
@@ -244,17 +354,32 @@ async function attend(device) {
   catch (error) { if (turn === followings) throw error; return; }
   if (turn !== followings) return;
   if (following?.device !== info.device) declined = null;
-  following = info; follows();
+  following = info;
+  ensureListening();
+  follows();
   // Slides and sound together: the presenter's live sound, and the listeners speaking.
   if (info.sound && hearing?.device !== info.sound && declined !== info.device) hear(info.sound).catch(error => console.warn('No live sound', error));
   for (const voice of info.voices ?? []) if (voice.ask !== bar.asking?.id) void hearVoice(voice);
   // Shown as the presenter shows it, from where they are.
-  if (info.kind === 'pdf') setPlace(info.path, { present: true, ...(info.place ? { page: info.place[0] } : {}) });
-  else setPlace(info.path, { slides: true, ...(info.place ? { slide: info.place } : {}) });
-  return open(info.path, info.kind, false, true);
+  const viewPath = cloudSignedIn && !info.path.startsWith('/mnt/cloud/')
+    ? `/mnt/cloud${info.path}`
+    : info.path;
+  if (!cloudSignedIn) {
+    const slash = info.path.lastIndexOf('/');
+    globalThis.__osAttendingCloudScope = {
+      file: info.path,
+      dir: slash > 0 ? info.path.slice(0, slash + 1) : null,
+    };
+  } else {
+    globalThis.__osAttendingCloudScope = null;
+  }
+  if (info.kind === 'pdf') setPlace(viewPath, { present: true, ...(info.place ? { page: info.place[0] } : {}) });
+  else setPlace(viewPath, { slides: true, ...(info.place ? { slide: info.place } : {}) });
+  return open(viewPath, info.kind, false, true);
 }
 function unfollow() {
   followings++;
+  globalThis.__osAttendingCloudScope = null;
   if (!following) return;
   // Leaving the presentation withdraws an ask to speak, and ends the voice sent.
   if (bar.asking) { if (bar.asking.state === 'asking') void dev.ask(bar.asking.presentation, true).catch(() => {}); void stopSpeaking(); }
@@ -297,8 +422,8 @@ if (windows) windows.onmessage = () => void identityChanged('window');
 async function identityChanged(reason = null) {
   window.dispatchEvent(new Event('os:login-changed'));
   if (!reason) changingSession = 0;
-  // A new account hears of what it may list: the line opens again with its session.
-  listen();
+  // Reconnect the event line only if explicitly signed in to Cloud.
+  if (cloudSignedIn) listen();
   if (!reason) windows?.postMessage('changed');
   // A private preview must not survive switching to a less privileged account.
   if ($('viewer').open) await closeViewer();
@@ -306,7 +431,7 @@ async function identityChanged(reason = null) {
 }
 async function signIn(username, switching = false) {
   let result;
-  if (switching && (await session()).uid === 0) result = await post('login', { username, switch: true });
+  if (switching && (await session()).uid === 0) result = await post('login', { username, switch: true, force: true });
   else result = await credentials({ title: switching ? `Switch to ${username}` : 'Sign in', description: 'Access is determined by the file owner, group, and rwx permissions.', username, chooseUser: !switching,
     submit: fields => post('login', { username: switching ? username : fields.username, password: fields.password, switch: switching }) });
   if (result) await identityChanged();
@@ -359,7 +484,7 @@ async function accountCommand(args, cwd) {
     if (args[0] === '-u') {
       if (args.length !== 2 || args[1].startsWith('-')) throw new Error('Usage: sudo -u USER (switch accounts; exit returns to guest)');
       if (!await sudoAuthenticate()) throw new Error('sudo canceled');
-      const result = await post('login', { username: args[1], sudo: true });
+      const result = await post('login', { username: args[1], sudo: true, force: true });
       await identityChanged();
       return { output: `Current account: ${result.username}`, home: result.home };
     }
@@ -377,44 +502,6 @@ async function accountCommand(args, cwd) {
     if (!result) throw new Error('Password change canceled');
     await identityChanged(); return { output: `Password updated for ${username}` };
   }
-  // Signed out, useradd NAME makes an account of one's own, with the password given here: its
-  // home is /guest/NAME, which -m makes, and it is in group guest; other options need sudo. The
-  // shell gives the options as useradd's definition spells them (shell.rs).
-  if (args[0] === 'useradd' && !sudo && !(await session()).authenticated) {
-    let createHome = false, shortPassword = false, username = null, operands = false;
-    for (const arg of args.slice(1)) {
-      if (!operands && arg === '--') operands = true;
-      else if (!operands && arg === '-m') createHome = true;
-      else if (!operands && arg === '-M') createHome = false;
-      else if (!operands && arg === '--short-password') shortPassword = true;
-      else if (!operands && arg.startsWith('-')) throw new Error(`useradd: ${arg} needs sudo; signed out, useradd [-m|-M] [--short-password] NAME makes an account of your own, home /guest/NAME, in group guest`);
-      else if (username === null) username = arg;
-      else throw new Error('Usage: useradd [-m|-M] [--short-password] NAME');
-    }
-    if (!username) throw new Error('Usage: useradd [-m|-M] [--short-password] NAME');
-    const home = `/guest/${username}`;
-    const result = await credentials({ title: `Create account ${username}`, description: (shortPassword ? '--short-password: short passwords are allowed, but cannot be empty. ' : 'Use at least 12 characters, or run useradd --short-password NAME to allow a short password. ') + (createHome ? `Your home will be ${home}, which only you may enter; ` : `Your home, ${home}, will not be made (useradd -m makes it); `) + 'you will be signed in.', newPassword: true, action: 'Create account',
-      submit: fields => post('register', { username, password: fields.password, short_password: shortPassword, create_home: createHome }) });
-    if (!result) throw new Error('Account creation canceled');
-    await identityChanged();
-    return result.created_home
-      ? { output: `Created user ${username} and signed in; home ${result.home}`, home: result.home }
-      : { output: `Created user ${username} and signed in; no home (${result.home} is not made)` };
-  }
-  // An account of group guest's deletes itself (userdel [-r] NAME, signed in as NAME), as its
-  // password confirms; others, and root, go to the server, which takes root.
-  if (args[0] === 'userdel' && !sudo) {
-    const remove = args.slice(1).some(arg => arg === '-r' || arg === '--remove');
-    const named = args.slice(1).filter(arg => !arg.startsWith('-'));
-    const current = await session();
-    if (current.authenticated && current.uid !== 0 && current.groups?.includes('guest') && named.length === 1 && named[0] === current.username) {
-      const result = await credentials({ title: `Delete account ${current.username}`, description: `This deletes your account, ends its sessions and signs you out; ${remove ? `-r removes its home, ${current.home}, and everything in it` : 'its home and files stay'}. It cannot be undone.`, action: 'Delete account',
-        submit: fields => post('unregister', { password: fields.password, remove }) });
-      if (!result) throw new Error('Account deletion canceled');
-      await identityChanged();
-      return { output: `Deleted user ${result.deleted}${result.kept ? `; ${result.kept}` : ''}; signed out as guest`, home: '/' };
-    }
-  }
   if (['su', 'login'].includes(args[0])) {
     if (sudo) throw new Error('Use su root to switch accounts');
     const loginShell = args[0] === 'login' || args[1] === '-';
@@ -422,11 +509,13 @@ async function accountCommand(args, cwd) {
     if (rest.length > 1 || rest[0]?.startsWith('-')) throw new Error('Usage: su [-] [USER] / login [USER]');
     const result = await signIn(rest[0] || 'root', args[0] === 'su');
     if (!result) throw new Error('Sign-in canceled');
-    return { output: `Current account: ${result.username}`, home: loginShell ? result.home : undefined };
+    return { output: `Current account: ${result.user ?? result.username}`, home: loginShell ? result.home : undefined };
   }
   if (['logout', 'exit'].includes(args[0])) {
     if (sudo || args.length !== 1) throw new Error(`Usage: ${args[0]}`);
-    await post('logout', {}); await identityChanged(); return { output: 'Signed out as guest (access depends on directory permissions)', home: '/' };
+    const out = await post('logout', {}); await identityChanged();
+    const user = out?.username ?? 'user';
+    return { output: `Returned to local account: ${user}`, home: out?.home ?? '/home/user' };
   }
   // The rest are user space's programs, which the shell runs (crates/userland).
   return { program: true };
@@ -554,7 +643,7 @@ async function hear(device, again = 0) {
     stopHearing(); throw error;
   }
   if (turn !== hearings) { heard.stop(); audio.remove(); return; }
-  hearing = { device, stop: heard.stop, version: heard.version }; player.dataset.state = 'live'; follows();
+  hearing = { device, stop: heard.stop, version: heard.version }; player.dataset.state = 'live'; ensureListening(); follows();
   // A browser that wants a tap to play sound shows Listen.
   try { await audio.play(); } catch { if (turn === hearings) player.dataset.state = 'paused'; }
 }
@@ -942,7 +1031,7 @@ $('download').addEventListener('click', async event => {
 async function open(path, kind, followed = false, attending = false) {
   if (/^\/dev\/present\/[^/]+$/.test(path)) return attend(path);
   if (/^\/dev\/snd\/[^/]+$/.test(path)) return hear(path);
-  if (!attending && following?.path !== path) unfollow();
+  if (!attending && (!following || toCloudPath(following.path) !== toCloudPath(path))) unfollow();
   if (!followed) trail.length = 0;
   const version = await cleanupViewer();
   if (version !== viewerVersion) return;
@@ -1049,7 +1138,7 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.os = { shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal: args => kernelCall('mount_attach', args), localMountList: () => kernelCall('mount_list'), unmountLocal: path => kernelCall('mount_detach', { path }), activatePrivate: args => kernelCall('mount_activate', args), localMounts, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, config: () => configuration.branding, exec, closeConsole, grantConsole, revokeConsole, attachConsole, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionCursor: () => $('command')?.selectionStart ?? 0, completionFocus: (value, cursor) => {
+window.os = { bootStatus, closeCleanRoot, cloudSignIn, cloudSignOut, cloudStatus, revokeCloudTokensOnly, shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal: args => kernelCall('mount_attach', args), localMountList: () => kernelCall('mount_list'), unmountLocal: path => kernelCall('mount_detach', { path }), activatePrivate: args => kernelCall('mount_activate', args), localMounts, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, config: () => configuration.branding, exec, closeConsole, grantConsole, revokeConsole, attachConsole, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following && toCloudPath(following.path) === toCloudPath(path) ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionCursor: () => $('command')?.selectionStart ?? 0, completionFocus: (value, cursor) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]:modal') || otherWindow()) return;

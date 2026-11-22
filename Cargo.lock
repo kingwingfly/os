@@ -2719,10 +2719,13 @@ dependencies = [
 name = "os-kernel"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
+ "hmac",
  "os-abi",
  "os-core",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -4579,6 +4582,7 @@ dependencies = [
  "ed25519-dalek",
  "os-core",
  "os-image",
+ "os-services",
  "serde",
  "serde_json",
  "sha2 0.11.1",

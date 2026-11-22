@@ -61,11 +61,16 @@ pub struct ServiceBindMount<'a> {
     pub read_only: bool,
 }
 
-/// Mount-namespace and bind-mount grant applied before a supervised unit executes.
+/// Mount-namespace, user/group, device, cloud-scope, and bind-mount grant applied before a
+/// supervised unit executes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServiceGrant<'a> {
     pub mount_namespace: &'a str,
     pub bind_mounts: &'a [ServiceBindMount<'a>],
+    pub user: Option<&'a str>,
+    pub group: Option<&'a str>,
+    pub devices: &'a [&'a str],
+    pub cloud_scope: Option<&'a abi::auth_v2::RemoteScope>,
 }
 
 /// Additional generic child attributes, applied before guest instructions.
@@ -101,6 +106,9 @@ pub(crate) fn encode_spawn_request(
     }
     if let Some(grant) = options.service_grant
         && (grant.mount_namespace.contains('\0')
+            || grant.user.is_some_and(|u| u.contains('\0'))
+            || grant.group.is_some_and(|g| g.contains('\0'))
+            || grant.devices.iter().any(|d| d.contains('\0'))
             || grant
                 .bind_mounts
                 .iter()
@@ -132,10 +140,23 @@ pub(crate) fn encode_spawn_request(
                 })
             })
             .collect();
-        payload["serviceGrant"] = serde_json::json!({
+        let mut grant_json = serde_json::json!({
             "mountNamespace": grant.mount_namespace,
             "bindMounts": bind_mounts,
         });
+        if let Some(user) = grant.user {
+            grant_json["user"] = serde_json::json!(user);
+        }
+        if let Some(group) = grant.group {
+            grant_json["group"] = serde_json::json!(group);
+        }
+        if !grant.devices.is_empty() {
+            grant_json["devices"] = serde_json::json!(grant.devices);
+        }
+        if let Some(scope) = grant.cloud_scope {
+            grant_json["cloudScope"] = serde_json::to_value(scope).map_err(io::Error::other)?;
+        }
+        payload["serviceGrant"] = grant_json;
     }
     serde_json::to_vec(&payload).map_err(Into::into)
 }
@@ -349,6 +370,10 @@ mod tests {
             service_grant: Some(ServiceGrant {
                 mount_namespace: "isolated",
                 bind_mounts: &binds,
+                user: None,
+                group: None,
+                devices: &[],
+                cloud_scope: None,
             }),
         };
         let raw = encode_spawn_request(&argv, Stdin::Null, "/work", &env, Some(0), &opts).unwrap();
@@ -387,6 +412,10 @@ mod tests {
                 service_grant: Some(ServiceGrant {
                     mount_namespace: "isolated",
                     bind_mounts: &bad_binds,
+                    user: None,
+                    group: None,
+                    devices: &[],
+                    cloud_scope: None,
                 }),
             },
         )

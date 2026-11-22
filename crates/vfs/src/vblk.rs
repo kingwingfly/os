@@ -7,8 +7,8 @@ use crate::{Access, BoxFuture, Cred, Fd, FileType, Result, StartAnchor, Vfs, Wri
 use abi::Errno;
 use abi::contract::cowfs_ioctl;
 use abi::volume::{
-    BlkInfoResp, BlkLeaseResp, CowfsForkReq, CowfsForkResp, CowfsInfoResp, CowfsSnapshotReq,
-    CowfsSnapshotResp,
+    BlkInfoResp, BlkLeaseResp, CowfsForkReq, CowfsForkResp, CowfsFsckReq, CowfsFsckResp,
+    CowfsInfoResp, CowfsSnapshotReq, CowfsSnapshotResp,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -95,9 +95,36 @@ pub trait VolumeDevice {
     fn blk_info<'a>(&'a self, dev_name: &'a str) -> BoxFuture<'a, BlkInfoResp>;
     fn blk_lease(&self) -> BoxFuture<'_, BlkLeaseResp>;
     fn cowfs_info(&self) -> BoxFuture<'_, CowfsInfoResp>;
+    fn cowfs_fsck<'a>(&'a self, _req: &'a CowfsFsckReq) -> BoxFuture<'a, CowfsFsckResp> {
+        Box::pin(async { Err(Errno::ENOTTY) })
+    }
     fn cowfs_snapshot<'a>(&'a self, req: &'a CowfsSnapshotReq) -> BoxFuture<'a, CowfsSnapshotResp>;
     fn cowfs_fork<'a>(&'a self, req: &'a CowfsForkReq) -> BoxFuture<'a, CowfsForkResp>;
     fn mkfs(&self, force: bool) -> BoxFuture<'_, CowfsInfoResp>;
+}
+
+fn parse_fsck_req(payload: &[u8]) -> Result<CowfsFsckReq> {
+    let trimmed = payload
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map(|start| {
+            let end = payload
+                .iter()
+                .rposition(|b| !b.is_ascii_whitespace())
+                .map_or(start, |e| e + 1);
+            &payload[start..end]
+        })
+        .unwrap_or(&[]);
+    if trimmed.is_empty() || trimmed == b"null" {
+        return Ok(CowfsFsckReq::default());
+    }
+    let req: CowfsFsckReq = serde_json::from_slice(trimmed).map_err(|_| Errno::EINVAL)?;
+    if let Some(ref v) = req.volume
+        && (v.is_empty() || v.contains(['/', '\0']))
+    {
+        return Err(Errno::EINVAL);
+    }
+    Ok(req)
 }
 
 /// `DeviceBackend` wrapper that refuses raw `read`/`write` on object-native `/dev/vdN` devices
@@ -207,8 +234,8 @@ impl VblkRegistry {
     /// Dispatch a `/dev/vdN` ioctl by `rdev` (`"vblk:vd0"`).
     ///
     /// Authorization (contract §2.16, §5, Blueprint §3.2):
-    /// - `BLK_INFO`, `BLK_LEASE`, `COWFS_IOC_INFO`: permitted for any caller holding a readable
-    ///   descriptor (or root).
+    /// - `BLK_INFO`, `BLK_LEASE`, `COWFS_IOC_INFO`, `COWFS_IOC_FSCK`: permitted for any caller
+    ///   holding a readable descriptor (or root).
     /// - `COWFS_IOC_SNAPSHOT`, `COWFS_IOC_FORK`: instance root (`uid == 0`) only (`EPERM`
     ///   otherwise).
     /// - Unknown ioctl request: `ENOTTY`.
@@ -237,6 +264,11 @@ impl VblkRegistry {
             }
             cowfs_ioctl::COWFS_IOC_INFO => {
                 let resp = dev.cowfs_info().await?;
+                serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+            }
+            cowfs_ioctl::COWFS_IOC_FSCK => {
+                let req = parse_fsck_req(payload)?;
+                let resp = dev.cowfs_fsck(&req).await?;
                 serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
             }
             cowfs_ioctl::COWFS_IOC_SNAPSHOT => {

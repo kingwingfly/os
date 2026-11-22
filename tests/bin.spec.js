@@ -1,42 +1,38 @@
 import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
-import { api, call, mkdirp, put, rmrf } from './sys.js';
-const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+import { pageCall, pageGetBytes, pageGetText, pageMkdirp, pagePut, pageRmrf, switchLocalUser } from './ui.js';
+
 const coreutilsImage = await readFile('dist/usr/bin/coreutils.wasm');
-const file = path => '/api/file?path=' + encodeURIComponent(path);
-let base, headers;
+let base;
 
 // /bin's programs: uutils' coreutils, built for wasm32-wasip1, each run as a process of its own
 // in the page's WASI engine, its calls the kernel's.
-test.beforeEach(async ({ request, page }) => {
+test.beforeEach(async () => {
   base = '/bin-' + Date.now().toString(36);
-  headers = { Origin: origin, 'CF-Connecting-IP': 'bin-' + base };
-  await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'bin-ui-' + base });
-  expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
-  await mkdirp(request, base);
-  expect((await put(request, file(base + '/names.txt'), { headers, data: 'ann:3\nbob:1\ncid:2\n' })).status()).toBe(201);
 });
-test.afterEach(async ({ request }) => { await rmrf(request, base); });
+test.afterEach(async ({ page }) => {
+  if (base) await pageRmrf(page, base, { sudo: true }).catch(() => {});
+});
 
 const transcript = page => page.locator('.transcript');
-// Run `text`, to its end unless it asks something first (su's password).
+// Run `text` to its end.
 async function run(page, text, { wait = true } = {}) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   const busy = page.locator('#command').locator('xpath=ancestor::form');
-  await expect(busy).toHaveAttribute('data-state', 'idle');
+  await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
   await input.fill(text); await input.press('Enter');
   if (wait) await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
 }
 async function terminal(page) {
   await page.goto('/');
-  await run(page, 'su root', { wait: false });
-  await page.getByLabel('Password', { exact: true }).fill(password); await page.locator('#auth button[type=submit]').click();
-  await expect(page.locator('#auth')).not.toBeVisible();
+  await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  await switchLocalUser(page, 'root');
+  await pageMkdirp(page, base, 0o755);
+  await pagePut(page, base + '/names.txt', 'ann:3\nbob:1\ncid:2\n', { mode: 0o644 });
   await run(page, 'cd ' + base);
 }
 
-test('uutils runs as programs of /bin: arguments, the working directory, pipes and exit statuses', async ({ page, request }) => {
+test('uutils runs as programs of /bin: arguments, the working directory, pipes and exit statuses', async ({ page }) => {
   await terminal(page);
   await run(page, 'seq 3');
   await expect(transcript(page)).toContainText('1\n2\n3');
@@ -64,8 +60,7 @@ test('uutils runs as programs of /bin: arguments, the working directory, pipes a
   await expect(transcript(page)).toContainText('/usr/bin/nothing: No such file or directory');
   // An uploaded copy of the same image runs by its path (execve of uploaded wasm, phase 2);
   // /usr/bin/ls is the same coreutils program in every shell.
-  expect((await put(request, file(base + '/coreutils'), { headers, data: coreutilsImage })).status()).toBe(201);
-  await call(request, { chmod: { path: base + '/coreutils', mode: 0o755 } }, { headers });
+  await pagePut(page, base + '/coreutils', coreutilsImage, { mode: 0o755 });
   await run(page, './coreutils seq 3');
   await expect(page.locator('.transcript pre').last()).toHaveText('1\n2\n3');
   await run(page, '/usr/bin/ls');
@@ -89,37 +84,40 @@ test('uutils runs as programs of /bin: arguments, the working directory, pipes a
   await expect(transcript(page)).toContainText("cut is /bin's (uutils): cut --help says how to use it");
 });
 
-test('a program of /bin writes files through the kernel, as its account', async ({ page, request }) => {
+test('a program of /bin writes files through the kernel, as its account', async ({ page }) => {
   await terminal(page);
   // Written anew in order, closed whole.
   await run(page, 'seq 1000 | tee counted.txt | tail -n 1');
   await expect(transcript(page)).toContainText('1000');
-  const counted = await (await request.get(file(base + '/counted.txt'), { headers })).text();
+  const counted = await pageGetText(page, base + '/counted.txt');
   expect(counted.split('\n').length).toBe(1001);
   // Changed in place: what is there is read, changed and written back whole.
   await run(page, 'truncate -s 4 names.txt');
-  expect(await (await request.get(file(base + '/names.txt'), { headers })).text()).toBe('ann:');
+  expect(await pageGetText(page, base + '/names.txt')).toBe('ann:');
   // Appended to: the same.
   await run(page, 'echo more | tee -a names.txt');
-  expect(await (await request.get(file(base + '/names.txt'), { headers })).text()).toBe('ann:more\n');
+  expect(await pageGetText(page, base + '/names.txt')).toBe('ann:more\n');
   await run(page, '/bin/mkdir -p made/deeper');
   await run(page, '/bin/touch made/deeper/x');
-  const made = await call(request, { stat: { path: base + '/made/deeper/x' } }, { headers });
+  const made = await pageCall(page, { stat: { path: base + '/made/deeper/x' } });
   expect([made.user, made.size]).toEqual(['root', 0]);
-  // The kernel decides: what a guest may not do, it may not do through /bin either.
+  // The kernel decides: returning to unprivileged local `user` cannot remove root's file in root's 0755 dir.
   await run(page, 'logout');
   await run(page, 'cd ' + base);
   await run(page, '/bin/rm counted.txt');
   await expect(transcript(page)).toContainText("rm: cannot remove 'counted.txt': Permission denied");
 });
 
-test('/usr is the build\'s, read-only: /usr/bin contains executable images and their applet links', async ({ page, request }) => {
+test('/usr is the build\'s, read-only: /usr/bin contains executable images and their applet links', async ({ page }) => {
   await terminal(page);
   await run(page, 'readlink /bin');
   await expect(page.locator('.transcript pre').last()).toHaveText('usr/bin');
   await run(page, 'ls -l /usr/bin | cat');
   const listed = await page.locator('.transcript pre').last().innerText();
-  expect(listed).not.toMatch(/ (passwd|sudo|open)$/m);
+  // Browser actions like `open` have no fake executable image; local OS utilities (`passwd`, `sudo`, `su`) are real applets.
+  expect(listed).not.toMatch(/ open$/m);
+  expect(listed).toMatch(/^lrwxrwxrwx +1 root root .* passwd -> utilities$/m);
+  expect(listed).toMatch(/^lrwxrwxrwx +1 root root .* sudo -> utilities$/m);
   expect(listed).toMatch(/^lrwxrwxrwx +1 root root .* chmod -> utilities$/m);
   expect(listed).toMatch(/^-rwxr-xr-x +1 root root +\d+ .* utilities$/m);
   expect(listed).toMatch(/^lrwxrwxrwx +1 root root .* ls -> coreutils$/m);
@@ -133,11 +131,11 @@ test('/usr is the build\'s, read-only: /usr/bin contains executable images and t
   await run(page, 'mkdir /usr/new-directory');
   await expect(transcript(page)).toContainText(/mkdir:.*\/usr\/new-directory.*Read-only file system/);
   // Its binaries read as the build has them.
-  const coreutils = await request.get(file('/usr/bin/cut'), { headers });
-  expect(coreutils.status()).toBe(200);
-  expect([...(await coreutils.body()).subarray(0, 4)]).toEqual([0, 0x61, 0x73, 0x6d]);
+  const coreutils = await pageGetBytes(page, '/usr/bin/cut');
+  expect(coreutils).not.toBeNull();
+  expect([...coreutils.subarray(0, 4)]).toEqual([0, 0x61, 0x73, 0x6d]);
   await run(page, 'df /usr');
-  await expect(page.locator('.transcript pre').last()).toContainText(/^usr .* 100% \/usr$/m);
+  await expect(page.locator('.transcript pre').last()).toContainText(/^\S+ +\d+ +\d+ +0 +100% \/usr$/m);
 });
 
 test('what programs write for a terminal shows as they mean it: colours, styles and links', async ({ page }) => {
@@ -162,7 +160,7 @@ test('/ is laid out as Arch\'s', async ({ page }) => {
   await run(page, 'readlink /sbin /lib /lib64 /usr/sbin /usr/lib64');
   await expect(page.locator('.transcript pre').last()).toHaveText('usr/bin\nusr/lib\nusr/lib\nbin\nlib');
   await run(page, "stat -c '%a %U' /tmp /root /sys /usr/local");
-  await expect(page.locator('.transcript pre').last()).toHaveText('1777 root\n750 root\n555 root\n755 root');
+  await expect(page.locator('.transcript pre').last()).toHaveText('1777 root\n700 root\n555 root\n755 root');
   await run(page, 'ls /usr | cat');
   await expect(page.locator('.transcript pre').last()).toHaveText('bin\ninclude\nlib\nlib64\nlibexec\nlocal\nsbin\nshare\nsrc');
   // A program is found through any of them.

@@ -43,9 +43,18 @@ fn assets(root: &Path) {
     // Make one binary larger than CHUNK_SIZE_DEFAULT (256 KiB) to exercise multi-chunk digests!
     let mut large_wasm = vec![0x61u8; os_image::CHUNK_SIZE_DEFAULT as usize + 1024];
     large_wasm[..8].copy_from_slice(b"\0asm\x01\0\0\0");
-    for bin in ["coreutils", "utilities", "dash", "supervise", "init"] {
+    for bin in [
+        "coreutils",
+        "utilities",
+        "dash",
+        "supervise",
+        "init",
+        "early_init",
+    ] {
         let bytes: &[u8] = if bin == "utilities" {
             &large_wasm
+        } else if bin == "early_init" {
+            b"\0asm\x01\0\0\0early-init"
         } else {
             b"\0asm\x01\0\0\0"
         };
@@ -126,6 +135,18 @@ fn assembly_is_deterministic_v2_and_signed_bytes_and_chunks_are_checked() {
     let initramfs_comp = os_image::Composition::standalone(&initramfs).unwrap();
     for bin in os_image::ReleaseV2::REQUIRED_INITRAMFS_BINS {
         assert!(initramfs_comp.resolve(bin).is_ok(), "missing {bin}");
+    }
+    // Verify `/init` in initramfs came from `early_init.wasm` and NOT Stage 2 `init.wasm` (#34).
+    let init_entry = initramfs
+        .entries
+        .iter()
+        .find(|e| e.path == "/init")
+        .unwrap();
+    match &init_entry.node {
+        os_image::Node::File { sha256, .. } => {
+            assert_eq!(sha256, &os_image::digest(b"\0asm\x01\0\0\0early-init"));
+        }
+        other => panic!("unexpected /init node: {other:?}"),
     }
     // Verify multi-chunk digest list on `/bin/utilities` (> 256 KiB -> 2 chunks).
     let util_entry = initramfs
@@ -444,4 +465,43 @@ fn host_modes_are_normalized_deterministically_across_umask_and_sgid() {
     assert_eq!(mode_of("/opt/tool/bin"), 0o755);
     assert_eq!(mode_of("/opt/tool/data.txt"), 0o644);
     assert_eq!(mode_of("/opt/tool/bin/run"), 0o755);
+}
+
+#[test]
+fn boot_packaging_fails_closed_when_early_init_wasm_is_absent() {
+    let temp = Directory::new();
+    let root = &temp.0;
+    fs::create_dir_all(root.join("dist/usr/bin")).unwrap();
+    let mut files = std::collections::BTreeMap::new();
+    for bin in ["coreutils", "utilities", "dash", "supervise", "init"] {
+        let bytes = b"\0asm\x01\0\0\0stage2";
+        fs::write(root.join(format!("dist/usr/bin/{bin}.wasm")), bytes).unwrap();
+        files.insert(format!("usr/bin/{bin}.wasm"), os_image::digest(bytes));
+    }
+    for (name, bytes) in [
+        ("index.html", b"<html>OS</html>".as_slice()),
+        ("client-kernel.js", b"// client-kernel".as_slice()),
+        ("client_kernel_bg.wasm", b"\0asm\x01\0\0\0".as_slice()),
+    ] {
+        fs::write(root.join("dist").join(name), bytes).unwrap();
+        files.insert(name.into(), os_image::digest(bytes));
+    }
+    fs::write(
+        root.join("dist/build-provenance.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "format": "os.build",
+            "version": 1,
+            "inputs": { "fixture": "missing early_init" },
+            "files": files
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    run(
+        root,
+        &["boot", "--assets", "dist", "--out", "bundle"],
+        false,
+    );
+    assert!(!root.join("bundle/release.json").exists());
 }

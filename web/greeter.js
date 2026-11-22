@@ -18,6 +18,22 @@ async function greeterCall(op, args) {
     if ('login_session' in op) return kernelCall('login_session_action', { action: op.login_session.action });
     if ('machine_init' in op) return kernelCall('machine_init_action', { action: op.machine_init.action });
   }
+  if (op === 'login') {
+    const res = await fetch('/api/cloud-auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: args?.username ?? 'root', password: args?.password ?? '' }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `Sign-in failed (${res.status})`);
+    return body;
+  }
+  if (op === 'logout') {
+    const res = await fetch('/api/cloud-auth/logout', { method: 'POST' });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `Sign-out failed (${res.status})`);
+    return body;
+  }
   return call(op, args);
 }
 

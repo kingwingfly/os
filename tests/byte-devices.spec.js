@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
 import { api, call, errno, put, rmrf } from './sys.js';
 import { hookPageKernel } from './service-auth.js';
+import { pageCall, pagePut, pageRmrf } from './ui.js';
 
 const names = ['zero', 'full', 'random', 'urandom'];
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
@@ -56,7 +57,7 @@ test('byte devices preserve metadata and enforce access modes through both write
 });
 
 test('device permissions authorize symlinks and HTTP ranges before any bytes or metadata escape', async ({ request, browser }) => {
-  const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+  const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
   expect((await api(request, 'login', { headers: { 'CF-Connecting-IP': crypto.randomUUID() }, data: { username: 'root', password } })).ok()).toBe(true);
   const guest = await browser.newContext({ baseURL: origin }), foreign = await browser.newContext({ baseURL: origin });
   const link = '/guest/byte-device-' + crypto.randomUUID();
@@ -131,17 +132,18 @@ for (const name of ['zero', 'urandom']) test(`continuous ${name} reads remain in
   await page.goto('/');
   await kernel.ready();
   const poll = () => kernel.value('poll', { pids: [] });
+  const baselinePids = new Set((await poll()).map(p => p.pid));
   await page.locator('#command').fill(`sh -c 'cat /dev/${name} >/dev/null'`); await page.locator('#command').press('Enter');
   await expect.poll(async () => (await poll()).some(p => p.argv?.includes('/dev/' + name)), { timeout: 30_000 }).toBe(true);
   await page.locator('#command').press('Control+c');
   await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-  await expect.poll(async () => (await poll()).filter(p => p.pid !== 1).length).toBe(0);
+  await expect.poll(async () => (await poll()).filter(p => p.pid !== 1 && p.path !== '/usr/bin/init' && !baselinePids.has(p.pid)).length).toBe(0);
   await run(page, 'printf recovered'); await expect(last(page)).toHaveText('recovered');
 });
 
 test('WASI devices report character type, ignore seek offsets and retain I/O errors', async ({ page }) => {
   await page.goto('/');
-  const path = '/guest/device-probe-' + crypto.randomUUID() + '.wasm';
+  const path = '/tmp/device-probe-' + crypto.randomUUID() + '.wasm';
   const module = binaryen.parseText(`(module
     (import "wasi_snapshot_preview1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
     (import "wasi_snapshot_preview1" "fd_read" (func $read (param i32 i32 i32 i32) (result i32)))
@@ -183,8 +185,8 @@ test('WASI devices report character type, ignore seek offsets and retain I/O err
       (i32.store (i32.const 32) (i32.const 1200)) (i32.store (i32.const 36) (i32.const 9))
       (drop (call $write (i32.const 1) (i32.const 32) (i32.const 1) (i32.const 64)))))`);
   try {
-    expect((await put(page.request, file(path), { data: Buffer.from(module.emitBinary()) })).ok()).toBe(true);
-    await call(page.request, { chmod: { path, mode: 0o755 } });
+    await pagePut(page, path, Buffer.from(module.emitBinary()), { mode: 0o755 });
+    await pageCall(page, { chmod: { path, mode: 0o755 } });
     await run(page, path); await expect(last(page)).toHaveText('device-ok');
-  } finally { module.dispose(); await rmrf(page.request, path); }
+  } finally { module.dispose(); await pageRmrf(page, path); }
 });

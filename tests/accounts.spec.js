@@ -1,128 +1,156 @@
-import { test, expect, request as playwrightRequest } from './test.js';
+// Wave 4B Local OS Accounts E2E Suite (migrated for #57 L3d, Contract v2 §2.1 & §2.12).
+// Verifies 100% offline local `/etc/{passwd,group,shadow,sudoers}`, passwordless `wheel` sudo,
+// local `useradd`/`usermod`/`userdel`/`groupadd`/`groupmod`/`groupdel`/`passwd`/`su`/`newgrp`
+// persistence across reload, strict `/etc/shadow` `0600` protection, and `ENOSYS` on retired
+// `/api/sys` OS-account calls.
+import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
-import { api, entry, mkdirp, program, rmrf } from './sys.js';
+
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
-let sequence = 0;
-const address = name => `accounts-${name}-${Date.now()}-${++sequence}`;
+const rootPassword =
+  process.env.OS_TEST_ADMIN_PASSWORD ||
+  process.env.OS_PASSWORD ||
+  (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 
 const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
 const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
+
 async function run(page, text) {
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-  await page.locator('#command').fill(text); await page.locator('#command').press('Enter');
-}
-async function output(page, text) { await run(page, text); await expect(busy(page)).toHaveAttribute('data-state', 'idle'); return (await last(page).textContent()).trim(); }
-async function visitor(browser) {
-  const context = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': address('visitor') } });
-  const page = await context.newPage(); await page.goto(origin + '/');
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-  return { context, page };
-}
-// Fill and send the account dialog: a new password twice, or the account's own once.
-async function answer(page, password, confirm = true) {
-  await page.getByLabel(confirm ? 'New password' : 'Password', { exact: true }).fill(password);
-  if (confirm) await page.getByLabel('Confirm new password').fill(password);
-  await page.locator('#auth button[type=submit]').click();
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  await page.locator('#command').fill(text);
+  await page.locator('#command').press('Enter');
 }
 
-let root;
-test.beforeAll(async () => {
-  root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
-  expect((await api(root, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
-});
-test.afterAll(async () => { await root.dispose(); });
-const stat = path => entry(root, path);
-const command = args => program(root, args);
+async function execLocal(page, argv, { sudo = false, cwd = '/', stdin = '' } = {}) {
+  return page.evaluate(
+    async ({ argv, sudo, cwd, stdin }) => {
+      let stdout = '';
+      let stderr = '';
+      const result = await window.os.exec([{ argv }], {
+        sudo,
+        cwd,
+        stdin,
+        tty: false,
+        onOutput: (fd, text) => {
+          if (fd === 1) stdout += text;
+          else stderr += text;
+        },
+      });
+      return { status: result.status, stdout: stdout || result.stdout || '', stderr };
+    },
+    { argv, sudo, cwd, stdin },
+  );
+}
 
-test('/dev, /dev/present and /dev/snd are there from the start, root\'s', async () => {
-  for (const directory of ['/dev', '/dev/present', '/dev/snd']) {
-    const node = await stat(directory);
-    expect(node, directory).not.toBe(null);
-    expect([node.directory, node.owner, node.mode]).toEqual([true, 'root', 0o755]);
-  }
+test('default local user auto-logs in with wheel NOPASSWD sudo and 0 outbound auth requests', async ({ page }) => {
+  const apiHits = [];
+  page.on('request', req => {
+    if (new URL(req.url()).pathname.startsWith('/api/')) apiHits.push(req.url());
+  });
+  await page.goto(origin + '/');
+  await page.waitForFunction(() => Boolean(window.os?.bootStatus && window.os?.exec));
+  await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: user · Cloud: Signed out', { timeout: 20_000 });
+
+  await run(page, 'whoami');
+  await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 15_000 });
+  await expect(last(page)).toHaveText('user');
+
+  const sudoId = await execLocal(page, ['id'], { sudo: true });
+  expect(sudoId.status).toBe(0);
+  expect(sudoId.stdout).toContain('uid=0(root)');
+
+  // Codex #25: `sudo -n` evaluates real `/etc/sudoers` (`NOPASSWD` for `wheel`) instead of stale false.
+  const sudoDashN = await execLocal(page, ['sudo', '-n', 'id']);
+  expect(sudoDashN.status, sudoDashN.stderr).toBe(0);
+  expect(sudoDashN.stdout).toContain('uid=0(root)');
+
+  // `/etc/shadow` is mode 0600 owned by root: unprivileged uid 1000 cannot read it.
+  const shadowDenied = await execLocal(page, ['cat', '/etc/shadow']);
+  expect(shadowDenied.status).not.toBe(0);
+  expect(shadowDenied.stderr).toMatch(/Permission denied|EACCES/i);
+
+  // Local `/dev` starts with local byte/PTY devices only; remote `/dev/present` and `/dev/snd` stay detached until Cloud Sign-In.
+  const devList = (await execLocal(page, ['ls', '/dev'])).stdout.split(/\s+/);
+  expect(devList).toContain('null');
+  expect(devList).toContain('ptmx');
+  expect(devList).not.toContain('present');
+  expect(devList).not.toContain('snd');
+  expect(apiHits).toEqual([]);
 });
 
-test('signed out, useradd makes an account of one\'s own: a home with -m, other options with sudo only', async ({ browser }) => {
-  const plain = 'plain' + Date.now().toString(36), homed = 'homed' + Date.now().toString(36);
-  const one = await visitor(browser), two = await visitor(browser);
-  try {
-    // --force is no option: what it was is --short-password.
-    await run(one.page, `useradd --force ${plain}`);
-    await expect(last(one.page)).toContainText("unexpected argument '--force'");
-    await run(one.page, `useradd -G wheel ${plain}`);
-    await expect(last(one.page)).toContainText('useradd: -G needs sudo');
-    // Without -m, no home, as useradd makes none.
-    await run(one.page, `useradd ${plain}`);
-    await expect(one.page.locator('#auth-description')).toContainText(`Your home, /guest/${plain}, will not be made (useradd -m makes it)`);
-    await answer(one.page, 'plain-password-' + Date.now());
-    await expect(last(one.page)).toContainText(`Created user ${plain} and signed in; no home (/guest/${plain} is not made)`);
-    expect(await stat('/guest/' + plain)).toBe(null);
-    expect(await output(one.page, 'groups')).toBe(`${plain} guest`);
-    // Its home, not made yet, is its own to make: no one else takes its path in /guest.
-    await run(two.page, `mkdir /guest/${plain}`);
-    await expect(last(two.page)).toContainText(`/guest/${plain} is another account's home`);
-    await output(one.page, `mkdir /guest/${plain}`);
-    expect((await stat('/guest/' + plain)).owner).toBe(plain);
-    // With -m, its home, and --short-password lets the password be short.
-    await run(two.page, `useradd -m --short-password ${homed}`);
-    await expect(two.page.locator('#auth-description')).toContainText(`Your home will be /guest/${homed}, which only you may enter`);
-    await answer(two.page, '1234');
-    await expect(last(two.page)).toContainText(`Created user ${homed} and signed in; home /guest/${homed}`);
-    const home = await stat('/guest/' + homed);
-    expect([home.directory, home.owner, home.mode]).toEqual([true, homed, 0o700]);
-  } finally {
-    for (const name of [plain, homed]) { await command(['userdel', '-r', name]); await command(['groupdel', name]); }
-    await one.context.close(); await two.context.close();
-  }
+test('local useradd, usermod, passwd, su, groupadd, groupmod, groupdel, and userdel enforce root permission and persist across reload', async ({ page }) => {
+  test.setTimeout(120_000);
+  await page.goto(origin + '/');
+  await page.waitForFunction(() => Boolean(window.os?.bootStatus && window.os?.exec));
+
+  const uname = 'loc' + Date.now().toString(36).slice(-5);
+  const gname = 'grp' + Date.now().toString(36).slice(-5);
+  const gname2 = gname + 'r';
+  const pw = 'local-secret-password-' + Date.now();
+
+  // Unprivileged uid 1000 cannot mutate `/etc/{passwd,group,shadow}` directly.
+  const deniedAdd = await execLocal(page, ['useradd', '-m', uname]);
+  expect(deniedAdd.status).not.toBe(0);
+  const deniedGroup = await execLocal(page, ['groupadd', gname]);
+  expect(deniedGroup.status).not.toBe(0);
+
+  // Root (`sudo`) creates group, renames group, adds user with home, sets password, and locks/unlocks.
+  expect((await execLocal(page, ['groupadd', gname], { sudo: true })).status).toBe(0);
+  expect((await execLocal(page, ['groupmod', '-n', gname2, gname], { sudo: true })).status).toBe(0);
+  expect((await execLocal(page, ['useradd', '-m', '-G', gname2, uname], { sudo: true })).status).toBe(0);
+
+  const passwdRes = await execLocal(page, ['sh', '-c', `printf '%s\\n%s\\n' '${pw}' '${pw}' | passwd '${uname}'`], { sudo: true });
+  expect(passwdRes.status, passwdRes.stderr).toBe(0);
+
+  const suOk = await execLocal(page, ['sh', '-c', `printf '%s\\n' '${pw}' | su '${uname}' -c 'id; pwd'`]);
+  expect(suOk.status, suOk.stderr).toBe(0);
+  expect(suOk.stdout).toContain(`(${uname})`);
+  expect(suOk.stdout).toContain(`(${gname2})`);
+
+  // Lock account -> `su` fails with EACCES AND root-invoked `login` without `-f` ALSO fails (Codex #3);
+  // unlock -> `su` succeeds again.
+  expect((await execLocal(page, ['usermod', '-L', uname], { sudo: true })).status).toBe(0);
+  const suLocked = await execLocal(page, ['sh', '-c', `printf '%s\\n' '${pw}' | su '${uname}' -c id`]);
+  expect(suLocked.status).not.toBe(0);
+  const rootLoginLocked = await execLocal(page, ['sh', '-c', `printf '%s\\n' '${pw}' | login '${uname}'`], { sudo: true });
+  expect(rootLoginLocked.status).not.toBe(0);
+  expect((await execLocal(page, ['usermod', '-U', uname], { sudo: true })).status).toBe(0);
+  const rootLoginWrongPw = await execLocal(page, ['sh', '-c', `printf 'wrong-pass\\n' | login '${uname}'`], { sudo: true });
+  expect(rootLoginWrongPw.status).not.toBe(0);
+  const suUnlocked = await execLocal(page, ['sh', '-c', `printf '%s\\n' '${pw}' | su '${uname}' -c id`]);
+  expect(suUnlocked.status, suUnlocked.stderr).toBe(0);
+
+  // Reload page -> local account & home persist on `os-cowfs`!
+  await page.evaluate(() => window.os.closeCleanRoot());
+  await page.reload();
+  await page.waitForFunction(() => Boolean(window.os?.bootStatus && window.os?.exec));
+
+  const checkAfter = await execLocal(page, ['sh', '-c', `grep "^${uname}:" /etc/passwd && test -d "/home/${uname}"`]);
+  expect(checkAfter.status, checkAfter.stderr).toBe(0);
+
+  // Non-root cannot delete another account; root `userdel -r` deletes account & home cleanly.
+  expect((await execLocal(page, ['userdel', '-r', uname])).status).not.toBe(0);
+  expect((await execLocal(page, ['userdel', '-r', uname], { sudo: true })).status).toBe(0);
+  expect((await execLocal(page, ['groupdel', gname2], { sudo: true })).status).toBe(0);
+  const gone = await execLocal(page, ['sh', '-c', `test ! -e "/home/${uname}" && ! grep -q "^${uname}:" /etc/passwd`]);
+  expect(gone.status).toBe(0);
 });
 
-test('an account in group guest deletes itself with its password; others need root', async ({ browser }) => {
-  const self = 'self' + Date.now().toString(36), kept = 'kept' + Date.now().toString(36), password = 'self-password-' + Date.now();
-  const one = await visitor(browser);
-  // An account root made, in no group guest.
-  expect((await command(['useradd', '-m', kept])).ok()).toBe(true);
-  expect((await api(root, 'passwd', { data: { username: kept, password } })).ok()).toBe(true);
-  try {
-    await run(one.page, `useradd -m ${self}`); await answer(one.page, password);
-    await expect(last(one.page)).toContainText(`Created user ${self} and signed in`);
-    await run(one.page, `touch note.txt`);
-    // Another account is root's to delete.
-    await run(one.page, `userdel ${kept}`);
-    await expect(last(one.page)).toContainText('Root permission required');
-    // Its own, it is asked for its password: a wrong one deletes nothing.
-    await run(one.page, `userdel -r ${self}`);
-    await expect(one.page.locator('#auth-title')).toHaveText(`Delete account ${self}`);
-    await expect(one.page.locator('#auth-description')).toContainText(`-r removes its home, /guest/${self}`);
-    await answer(one.page, 'wrong-password', false);
-    await expect(one.page.locator('#auth-error')).toHaveText('Incorrect password');
-    await answer(one.page, password, false);
-    await expect(last(one.page)).toContainText(`Deleted user ${self}; signed out as guest`);
-    await expect(one.page.locator('.lock')).toContainText('guest');
-    expect(await stat('/guest/' + self)).toBe(null);
-    // Its group went with it, as userdel's does: the name may be taken again.
-    await run(one.page, `useradd ${self}`); await answer(one.page, password);
-    await expect(last(one.page)).toContainText(`Created user ${self} and signed in`);
-    // -r keeps a home that is not the account's own: root's directory, here.
-    await mkdirp(root, '/guest/' + self);
-    await run(one.page, `userdel -r ${self}`); await answer(one.page, password, false);
-    await expect(last(one.page)).toContainText(`Deleted user ${self}; /guest/${self} is not ${self}'s, not removed; signed out as guest`);
-    expect(await stat('/guest/' + self)).not.toBe(null);
-    await rmrf(root, '/guest/' + self);
-    const again = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('again') } });
-    expect((await api(again, 'login', { data: { username: self, password } })).ok()).toBe(false);
-    await again.dispose();
-    // An account in no group guest is root's to delete, itself too.
-    const other = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': address('kept') } });
-    expect((await api(other.request, 'login', { headers: { Origin: origin }, data: { username: kept, password } })).ok()).toBe(true);
-    const page = await other.newPage(); await page.goto(origin + '/');
-    await expect(page.locator('.lock')).toContainText(kept);
-    await run(page, `userdel ${kept}`);
-    await expect(last(page)).toContainText('Root permission required');
-    expect((await api(other.request, 'unregister', { headers: { Origin: origin }, data: { password } })).status()).toBe(403);
-    await other.close();
-  } finally {
-    for (const name of [self, kept]) { await command(['userdel', '-r', name]); await command(['groupdel', name]); }
-    await one.context.close();
+test('server /api/sys fails closed with ENOSYS on retired OS account mutations', async ({ request }) => {
+  for (const op of [
+    { login: { username: 'root', password: rootPassword } },
+    'logout',
+    { sudo: { password: rootPassword, revoke: false } },
+    { useradd: { name: 'noserver', create_home: false } },
+    { userdel: { name: 'noserver', remove: false } },
+    { groupadd: { name: 'noserver' } },
+  ]) {
+    const res = await request.post(origin + '/api/sys', {
+      headers: { Origin: origin, 'Content-Type': 'application/json' },
+      data: { calls: [op] },
+    });
+    expect(res.ok()).toBe(true);
+    const body = await res.json();
+    expect(body.results?.[0]?.err?.errno).toBe('ENOSYS');
   }
 });

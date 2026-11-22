@@ -1,9 +1,7 @@
 import { test, expect } from './test.js';
-import { readFile } from 'node:fs/promises';
-import { api, call } from './sys.js';
+import { pageCall, switchLocalUser } from './ui.js';
 import { hookPageKernel } from './service-auth.js';
 
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 test.beforeEach(async ({ page }) => { await page.goto('/'); await page.waitForFunction(() => !!window.os?.attachConsole); });
 test.afterEach(async ({ page }) => {
   if (!page.isClosed()) await page.evaluate(async () => {
@@ -223,14 +221,13 @@ test('a grant identifier or console name in another host does not authorize atta
 });
 
 test('a granted run keeps its original process identity across browser login and cannot expose a later root command', async ({ page }) => {
-  const guest = await call(page.request, 'getcreds');
+  const beforeCreds = await pageCall(page, 'getcreds');
   await start(page, ['sh', '-c', 'id -u; read first; id -u; read second']);
-  await expect.poll(() => output(page)).toContain(String(guest.uid));
+  await expect.poll(() => output(page)).toContain(String(beforeCreds.uid));
   const other = await target(page); await connect(page, other, 'control');
-  expect((await api(page.request, 'login', { headers: { 'CF-Connecting-IP': 'console-attachment-' + crypto.randomUUID() }, data: { password } })).ok()).toBe(true);
-  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+  await switchLocalUser(page, 'root');
   await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(0);
-  await remoteWrite(other, 'continue\n'); await expect.poll(() => remoteOutput(other)).toContain(String(guest.uid));
+  await remoteWrite(other, 'continue\n'); await expect.poll(() => remoteOutput(other)).toContain(String(beforeCreds.uid));
   await remoteWrite(other, 'finish\n'); await ended(page, 0);
   await expect.poll(() => other.evaluate(() => window.receiving.closed?.errno)).toBe('EPIPE');
   const before = await remoteOutput(other);

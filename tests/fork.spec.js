@@ -1,5 +1,6 @@
 import { withoutJspi } from './transport.js';
 import { test, expect } from './test.js';
+import { pageGetText, pageMkdirp, pagePut, pageRmrf } from './ui.js';
 
 // Phase 3 and the owner's change request 1 (2026-11-02): each browser's processes are its own
 // machine's, a Durable Object apart from the filesystem's one authority (crates/worker/src/
@@ -133,6 +134,8 @@ test('each browser tab is an isolated instance of its own, and /api/sys refuses 
     await connect(one); await connect(two);
     const a = value(await call(one, 'init')), b = value(await call(two, 'init'));
     expect(a.namespace).not.toBe(b.namespace);
+    expect((await api(one.request, 'login', { headers: { Origin: origin, 'CF-Connecting-IP': 'fork-iso-' + Date.now() }, data: { username: 'root', password } })).ok()).toBe(true);
+    value(await call(one, 'cloud_sign_in', { cloudUser: 'root', cloudUid: 0, cloudGid: 0, cloudGroups: [0], scope: { cloud_fs: true, devices: [], containers: false, relay: false } }));
     const running = value(await call(one, 'exec', { ...sleep, remote: true }));
     // The other browser's pid 1 is its own init; its table has no process of the first's.
     const theirs = value(await call(two, 'poll', { pids: [] }));
@@ -315,17 +318,12 @@ const FORK_HOLDERS = wasix(`${FORK} ${JOIN}
     (if (i32.eqz (call $close (i32.load (i32.const 2300)))) (then (call $say (i32.const 1056) (i32.const 7))))`,
 `(data (i32.const 1040) "done\\n") (data (i32.const 1056) "closed\\n") (data (i32.const 1100) "${holdersOut}")`);
 
-let base, headers;
-async function uploads(request, files) {
-  base = '/fork-' + Date.now().toString(36);
-  headers = { Origin: origin, 'CF-Connecting-IP': 'fork-' + base };
-  expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
-  // The page is a guest's, which writes there (mkdir's mode is umask's).
-  await mkdirp(request, base, 0o777);
-  expect(await sysCall(request, { chmod: { path: base, mode: 0o777 } }, { headers })).toBeNull();
+let base;
+async function uploads(page, files) {
+  base = '/tmp/fork-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+  await pageMkdirp(page, base, 0o755);
   for (const [name, data] of Object.entries(files)) {
-    expect((await put(request, '/api/file?path=' + encodeURIComponent(`${base}/${name}`), { headers, data })).status()).toBe(201);
-    expect(await sysCall(request, { chmod: { path: `${base}/${name}`, mode: 0o755 } }, { headers })).toBeNull();
+    await pagePut(page, `${base}/${name}`, data, { mode: 0o755 });
   }
 }
 const last = page => page.locator('.transcript pre').last();
@@ -343,17 +341,17 @@ function processCalls(page) {
 const hasJspi = page => page.evaluate(() => typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function');
 
 test.describe('fork in the terminal', () => {
-  test.afterEach(async ({ request }) => { if (base) await rmrf(request, base); });
+  test.afterEach(async ({ page }) => { if (base) await pageRmrf(page, base).catch(() => {}); base = null; });
 
-  for (const exhausted of [false, true]) test(`fork preserves ${exhausted ? 'exhausted' : 'fixed'} memory limits and runs initialization once`, async ({ page, request }) => {
+  for (const exhausted of [false, true]) test(`fork preserves ${exhausted ? 'exhausted' : 'fixed'} memory limits and runs initialization once`, async ({ page }) => {
     const fixture = wasix(`${FORK} ${JOIN}`, `
       ${exhausted ? '(drop (memory.grow (i32.const 1)))' : ''}
       (if (call $fork (i32.const 1) (i32.const 2060)) (then (call $say (i32.const 1040) (i32.const 6))))
       (if (i32.load (i32.const 2060)) (then ${WAIT_CHILD}))
       (if (i32.eq (memory.grow (i32.const 1)) (i32.const -1)) (then (call $say (i32.const 1056) (i32.const 6))))`,
       '(data (i32.const 1024) "init\\n") (data (i32.const 1040) "error\\n") (data (i32.const 1056) "limit\\n") (func $init (call $say (i32.const 1024) (i32.const 5))) (start $init)', exhausted ? '1 2' : '1 1');
-    await uploads(request, { fixed: fixture });
     await page.goto('/');
+    await uploads(page, { fixed: fixture });
     await command(page, `${base}/fixed`);
     const output = await page.locator('.transcript pre').allInnerTexts();
     const text = output.join('\n');
@@ -362,7 +360,7 @@ test.describe('fork in the terminal', () => {
     expect(text).not.toContain('error');
   });
 
-  test('a fork inside the initializer resumes initialization before entering main', async ({ page, request }) => {
+  test('a fork inside the initializer resumes initialization before entering main', async ({ page }) => {
     const fixture = wasix(`${FORK} ${JOIN}`, `
       (if (i32.eqz (i32.load (i32.const 2060)))
         (then (call $say (i32.const 1040) (i32.const 6)) (call $exit (i32.const 7))))
@@ -371,19 +369,19 @@ test.describe('fork in the terminal', () => {
       `(data (i32.const 1024) "init\\n") (data (i32.const 1040) "child\\n") (data (i32.const 1056) "parent\\n")
        (func $init (call $say (i32.const 1024) (i32.const 5))
          (drop (call $fork (i32.const 1) (i32.const 2060)))) (start $init)`, '1 1');
-    await uploads(request, { initializing: fixture });
     await page.goto('/');
+    await uploads(page, { initializing: fixture });
     await command(page, `${base}/initializing`);
     await expect(last(page)).toHaveText('init\nchild\nparent');
   });
 
   // Each way a process makes its calls (request 4): suspended on fetch (JSPI), where the browser
   // has it, and by synchronous XHR, where it does not.
-  for (const jspi of [true, false]) test(`an uploaded module that forks (${jspi ? 'JSPI' : 'synchronous XHR'}): the child runs in a process of its own, and its parent waits for its status`, async ({ page, request }) => {
+  for (const jspi of [true, false]) test(`an uploaded module that forks (${jspi ? 'JSPI' : 'synchronous XHR'}): the child runs in a process of its own, and its parent waits for its status`, async ({ page }) => {
     if (!jspi) await withoutJspi(page);
     const calls = processCalls(page);
-    await uploads(request, { 'fork-wait': FORK_WAIT, 'fork-exec': FORK_EXEC, 'fork-pipe': FORK_PIPE, jump: JUMP });
     await page.goto('/');
+    await uploads(page, { 'fork-wait': FORK_WAIT, 'fork-exec': FORK_EXEC, 'fork-pipe': FORK_PIPE, jump: JUMP });
     test.skip(jspi && !await hasJspi(page), 'this browser has no JSPI');
     await command(page, `cd ${base}`);
     await command(page, './fork-wait');
@@ -407,32 +405,27 @@ test.describe('fork in the terminal', () => {
     expect([...calls]).toEqual([]);
   });
 
-  test('runtime exec diagnostics follow redirected stderr and leave stdout untouched', async ({ page, request }) => {
+  test('runtime exec diagnostics follow redirected stderr and leave stdout untouched', async ({ page }) => {
     test.skip(!process.env.WASIX_DASH, 'set WASIX_DASH to the approved WASIX dash');
-    await uploads(request, { dash: await readFile(process.env.WASIX_DASH), 'fork-exec': FORK_EXEC });
     await page.goto('/');
+    await uploads(page, { dash: await readFile(process.env.WASIX_DASH), 'fork-exec': FORK_EXEC });
     await command(page, `cd ${base}`);
     await command(page, `./dash -c 'cd ${base}; ./fork-exec 2> exec-error.txt'`);
     await expect(last(page)).toHaveText('executed\nparent\nmissing');
-    const error = await request.get('/api/file?path=' + encodeURIComponent(base + '/exec-error.txt'));
-    expect(error.ok()).toBe(true);
-    expect(await error.text()).toBe('no-such-program: No such file or directory\n');
+    expect(await pageGetText(page, base + '/exec-error.txt')).toBe('no-such-program: No such file or directory\n');
   });
 
-  test('loader rejection after exec writes through the inherited stderr descriptor', async ({ page, request }) => {
+  test('loader rejection after exec writes through the inherited stderr descriptor', async ({ page }) => {
     test.skip(!process.env.WASIX_DASH, 'set WASIX_DASH to the approved WASIX dash');
-    await uploads(request, { dash: await readFile(process.env.WASIX_DASH), 'invalid.wasm': Buffer.from('not a wasm executable') });
     await page.goto('/');
+    await uploads(page, { dash: await readFile(process.env.WASIX_DASH), 'invalid.wasm': Buffer.from('not a wasm executable') });
     await command(page, `cd ${base}`);
     await command(page, `./dash -c 'cd ${base}; ./invalid.wasm 2> loader-error.txt; /usr/bin/printf "status %s\\n" "$?"'`);
     await expect(last(page)).toHaveText('status 126');
-    const error = await request.get('/api/file?path=' + encodeURIComponent(base + '/loader-error.txt'));
-    expect(error.ok()).toBe(true);
-    expect(await error.text()).toContain('Exec format error');
+    expect(await pageGetText(page, base + '/loader-error.txt')).toContain('Exec format error');
   });
 
-  test('a forked child is of its parent\'s job: Ctrl+C ends both; an orphan is init\'s, and reaped as it ends', async ({ page, request }) => {
-    await uploads(request, { 'fork-sleep': FORK_SLEEP, 'fork-orphan': FORK_ORPHAN, 'fork-read': FORK_READ });
+  test('a forked child is of its parent\'s job: Ctrl+C ends both; an orphan is init\'s, and reaped as it ends', async ({ page }) => {
     await page.addInitScript(() => {
       const NativeWorker = window.Worker;
       window.Worker = class extends NativeWorker {
@@ -458,6 +451,7 @@ test.describe('fork in the terminal', () => {
       };
     });
     await page.goto('/');
+    await uploads(page, { 'fork-sleep': FORK_SLEEP, 'fork-orphan': FORK_ORPHAN, 'fork-read': FORK_READ });
     await command(page, `cd ${base}`);
     const sleeping = async () => value(await call(page, 'poll', { pids: [] })).filter(process => process.argv.join(' ') === 'coreutils sleep 30');
     // The parent waits for its child, which sleeps: Ctrl+C reaches both, as the foreground's
@@ -485,24 +479,24 @@ test.describe('fork in the terminal', () => {
 
   // A file's holders (web/wasi/shared.js), one after another, and then one killed outright: the
   // last close is still the last, and what was written goes to the file with it.
-  test('a file shared by many children, one after another, then one killed, still closes with its writer', async ({ page, request }) => {
-    await uploads(request, { 'fork-holders': FORK_HOLDERS });
+  test('a file shared by many children, one after another, then one killed, still closes with its writer', async ({ page }) => {
+    await page.goto('/');
+    await uploads(page, { 'fork-holders': FORK_HOLDERS });
     try {
-      await page.goto('/');
       await command(page, `cd ${base}`);
       await command(page, './fork-holders');
       await expect(last(page)).toHaveText('closed', { timeout: 60_000 });
       await command(page, `cat /${holdersOut}`);
       await expect(last(page)).toHaveText('done');
     } finally {
-      await rmrf(request, '/' + holdersOut);
+      await pageRmrf(page, '/' + holdersOut).catch(() => {});
     }
   });
 
-  test('dash forks, pipes, executes and redirects', async ({ page, request }) => {
+  test('dash forks, pipes, executes and redirects', async ({ page }) => {
     test.skip(!process.env.WASIX_DASH, 'set WASIX_DASH to the approved WASIX dash');
-    await uploads(request, { dash: await readFile(process.env.WASIX_DASH) });
     await page.goto('/');
+    await uploads(page, { dash: await readFile(process.env.WASIX_DASH) });
     await command(page, `cd ${base}`);
     await command(page, `./dash -c 'echo one; (echo two); echo three'`);
     await expect(last(page)).toHaveText('one\ntwo\nthree');

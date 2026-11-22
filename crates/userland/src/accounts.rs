@@ -21,14 +21,12 @@ async fn accounts(sys: &impl Sys) -> Vec<Account> {
     String::from_utf8(sys.read("/etc/passwd").await.unwrap_or_default())
         .unwrap_or_default()
         .lines()
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split(':').collect();
-            Some(Account {
-                name: fields.first()?.to_string(),
-                uid: fields.get(2)?.parse().ok()?,
-                gid: fields.get(3)?.parse().ok()?,
-                home: fields.get(5)?.to_string(),
-            })
+        .filter_map(parse_passwd_line)
+        .map(|rec| Account {
+            name: rec.name,
+            uid: rec.uid,
+            gid: rec.gid,
+            home: rec.home,
         })
         .collect()
 }
@@ -38,23 +36,8 @@ async fn groups(sys: &impl Sys) -> Vec<(String, u32, Vec<String>)> {
     String::from_utf8(sys.read("/etc/group").await.unwrap_or_default())
         .unwrap_or_default()
         .lines()
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split(':').collect();
-            let members = fields
-                .get(3)
-                .map(|list| {
-                    list.split(',')
-                        .filter(|m| !m.is_empty())
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default();
-            Some((
-                fields.first()?.to_string(),
-                fields.get(2)?.parse().ok()?,
-                members,
-            ))
-        })
+        .filter_map(parse_group_line)
+        .map(|rec| (rec.name, rec.gid, rec.members))
         .collect()
 }
 
@@ -288,4 +271,141 @@ pub async fn groupdel(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
         },
     )
     .await
+}
+
+/// Parsed record from local `/etc/passwd`.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalPasswdRecord {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub gecos: String,
+    pub home: String,
+    pub shell: String,
+}
+
+/// Parsed record from local `/etc/group`.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalGroupRecord {
+    pub name: String,
+    pub gid: u32,
+    pub members: Vec<String>,
+}
+
+/// Reject colon, newline, carriage-return, and NUL characters in `/etc/{passwd,group,shadow}` fields.
+#[allow(dead_code)]
+pub fn valid_local_etc_field(value: &str) -> bool {
+    !value
+        .bytes()
+        .any(|b| matches!(b, b':' | b'\n' | b'\r' | b'\0'))
+}
+
+/// Parse one non-comment line from `/etc/passwd`.
+pub fn parse_passwd_line(line: &str) -> Option<LocalPasswdRecord> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let fields: Vec<&str> = trimmed.split(':').collect();
+    if fields.len() != 7 || fields[0].is_empty() {
+        return None;
+    }
+    Some(LocalPasswdRecord {
+        name: fields[0].to_owned(),
+        uid: fields[2].parse().ok()?,
+        gid: fields[3].parse().ok()?,
+        gecos: fields[4].to_owned(),
+        home: fields[5].to_owned(),
+        shell: fields[6].to_owned(),
+    })
+}
+
+/// Format a `/etc/passwd` line after validating every field against delimiter injection.
+#[allow(dead_code)]
+pub fn format_passwd_line(record: &LocalPasswdRecord) -> Result<String, &'static str> {
+    if record.name.is_empty()
+        || !valid_local_etc_field(&record.name)
+        || !valid_local_etc_field(&record.gecos)
+        || !valid_local_etc_field(&record.home)
+        || !valid_local_etc_field(&record.shell)
+    {
+        return Err("invalid /etc/passwd field");
+    }
+    Ok(format!(
+        "{}:x:{}:{}:{}:{}:{}",
+        record.name, record.uid, record.gid, record.gecos, record.home, record.shell
+    ))
+}
+
+/// Parse one non-comment line from `/etc/group`.
+pub fn parse_group_line(line: &str) -> Option<LocalGroupRecord> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let fields: Vec<&str> = trimmed.split(':').collect();
+    if fields.len() != 4 || fields[0].is_empty() {
+        return None;
+    }
+    let members = fields[3]
+        .split(',')
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Some(LocalGroupRecord {
+        name: fields[0].to_owned(),
+        gid: fields[2].parse().ok()?,
+        members,
+    })
+}
+
+/// Format a `/etc/group` line after validating every field against delimiter injection.
+#[allow(dead_code)]
+pub fn format_group_line(record: &LocalGroupRecord) -> Result<String, &'static str> {
+    if record.name.is_empty()
+        || !valid_local_etc_field(&record.name)
+        || record
+            .members
+            .iter()
+            .any(|m| m.is_empty() || !valid_local_etc_field(m) || m.contains(','))
+    {
+        return Err("invalid /etc/group field");
+    }
+    Ok(format!(
+        "{}:x:{}:{}",
+        record.name,
+        record.gid,
+        record.members.join(",")
+    ))
+}
+
+#[cfg(test)]
+mod local_etc_tests {
+    use super::*;
+
+    #[test]
+    fn local_passwd_and_group_helpers_round_trip_and_reject_delimiters() {
+        let p = parse_passwd_line("user:x:1000:1000:Local User:/home/user:/bin/sh").unwrap();
+        assert_eq!(p.uid, 1000);
+        assert_eq!(
+            format_passwd_line(&p).unwrap(),
+            "user:x:1000:1000:Local User:/home/user:/bin/sh"
+        );
+        let bad_p = LocalPasswdRecord {
+            gecos: "evil:0:0".into(),
+            ..p
+        };
+        assert!(format_passwd_line(&bad_p).is_err());
+
+        let g = parse_group_line("wheel:x:10:user,alice").unwrap();
+        assert_eq!(g.members, vec!["user", "alice"]);
+        assert_eq!(format_group_line(&g).unwrap(), "wheel:x:10:user,alice");
+        let bad_g = LocalGroupRecord {
+            members: vec!["bad,name".into()],
+            ..g
+        };
+        assert!(format_group_line(&bad_g).is_err());
+    }
 }

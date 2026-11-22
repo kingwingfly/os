@@ -12,6 +12,23 @@ const SND_PUBLISH = 0x5101, SND_LISTEN = 0x5102, SND_ANSWER = 0x5103;
 const O_RDONLY = 0;
 const ACL = 'system.posix_acl_access';
 
+function toCloudPath(path) {
+  if (typeof path !== 'string') return path;
+  if (path === '/mnt/cloud') return '/';
+  if (path.startsWith('/mnt/cloud/')) return path.slice('/mnt/cloud'.length);
+  return path;
+}
+
+async function activeCloudIdentity() {
+  try {
+    const cs = await window.os?.cloudStatus?.();
+    if (cs?.signed_in && cs.cloud_user) {
+      return { signed_in: true, user: cs.cloud_user, uid: cs.cloud_uid };
+    }
+  } catch { /* ignore */ }
+  return { signed_in: false, user: null, uid: null };
+}
+
 /** A presentation's name for the file at `path`, as present names one (core devices::default_name). */
 export function defaultName(path) {
   const file = path.slice(path.lastIndexOf('/') + 1);
@@ -45,7 +62,7 @@ export async function present(path, name = defaultName(path)) {
   const stat = answered(found);
   answered((await sys([{ mknod: { path: device, mode: stat.mode & 0o666, rdev: 'present' } }]))[0]);
   if ('ok' in acl) await sys([{ setxattr: { path: device, name: ACL, value: acl.ok } }]);
-  return { ...await once(device, O_WRONLY, PRESENT_SHOW, { path }), device };
+  return { ...await once(device, O_WRONLY, PRESENT_SHOW, { path: toCloudPath(path) }), device };
 }
 
 /** Stop presenting `device`: removed, it hangs up, and its followers hear so. */
@@ -54,11 +71,12 @@ export async function stop(device) { await call('unlink', { path: device }); }
 /** What the account presents of the file at `path`, for its bar: who it is, its presentations of
  * it, the listeners asking to speak in them and those speaking. */
 export async function presented(path) {
-  const creds = await call('getcreds');
+  const creds = await activeCloudIdentity();
   if (!creds.signed_in) return { user: null, devices: [], asks: [], voices: [] };
+  const target = toCloudPath(path);
   const [listed] = await sys([{ getdents: { path: PRESENT } }]);
   const own = (listed.ok ?? []).filter(entry => entry.stat?.uid === creds.uid).map(entry => `${PRESENT}/${entry.name}`);
-  const states = (await Promise.all(own.map(device => read(device).catch(() => null)))).filter(state => state?.device?.path === path).map(state => state.device);
+  const states = (await Promise.all(own.map(device => read(device).catch(() => null)))).filter(state => state?.device?.path === target).map(state => state.device);
   return { user: creds.user, devices: states.map(state => ({ device: state.device, version: state.version })),
     asks: states.flatMap(state => state.asks ?? []), voices: states.flatMap(state => state.voices ?? []) };
 }

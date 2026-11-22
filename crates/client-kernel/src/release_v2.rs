@@ -376,6 +376,111 @@ pub fn verify_release_v2_bundle(
     js_sys::JSON::parse(&text)
 }
 
+/// Convert a verified `os_image::Image` into `os_vfs::imagefs::ImageEntry` records.
+pub fn image_to_vfs_entries(img: &Image) -> Vec<ImageEntry> {
+    img.entries
+        .iter()
+        .map(|e| ImageEntry {
+            path: e.path.clone(),
+            uid: e.uid,
+            gid: e.gid,
+            mode: e.mode,
+            node: match &e.node {
+                Node::Directory => ImageNodeKind::Directory,
+                Node::File {
+                    sha256,
+                    size,
+                    chunk_size,
+                    chunks,
+                } => ImageNodeKind::File {
+                    blob_id: sha256.clone(),
+                    size: *size,
+                    chunk_size: Some(*chunk_size),
+                    chunks: chunks.clone(),
+                },
+                Node::Symlink { target } => ImageNodeKind::Symlink {
+                    target: target.clone(),
+                },
+            },
+        })
+        .collect()
+}
+
+/// Compose a verified `Kind::Base` image with optional `Kind::Sysext` / `Kind::Confext` layers
+/// and return the merged `ImageEntry` list for mounting `/sysroot/usr` in Stage 2.
+pub fn compose_system_image_entries(
+    base: &Image,
+    extensions: &[Image],
+) -> std::result::Result<Vec<ImageEntry>, image::Error> {
+    let comp = Composition::new(base, extensions)?;
+    Ok(comp
+        .entries
+        .values()
+        .map(|e| ImageEntry {
+            path: e.path.clone(),
+            uid: e.uid,
+            gid: e.gid,
+            mode: e.mode,
+            node: match &e.node {
+                Node::Directory => ImageNodeKind::Directory,
+                Node::File {
+                    sha256,
+                    size,
+                    chunk_size,
+                    chunks,
+                } => ImageNodeKind::File {
+                    blob_id: sha256.clone(),
+                    size: *size,
+                    chunk_size: Some(*chunk_size),
+                    chunks: chunks.clone(),
+                },
+                Node::Symlink { target } => ImageNodeKind::Symlink {
+                    target: target.clone(),
+                },
+            },
+        })
+        .collect())
+}
+
+/// Read an entire verified file from `blobs` using chunk-verified streaming (`<= 1 MiB` per chunk)
+/// and verify its exact total byte length before returning.
+pub async fn read_verified_image_file<B: BlobStore>(
+    blobs: &B,
+    sha256: &str,
+    size: u64,
+    chunk_size: u32,
+    chunks: &[String],
+) -> vfs::Result<Vec<u8>> {
+    let manifest = ChunkManifest {
+        sha256: sha256.to_string(),
+        size,
+        chunk_size,
+        chunks: chunks.to_vec(),
+    };
+    let total = usize::try_from(size).map_err(|_| Errno::EFBIG)?;
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = vec![0u8; total];
+    let mut offset = 0usize;
+    while offset < total {
+        let step = (total - offset).min(chunk_size as usize);
+        let n = blobs
+            .read_verified_at(
+                sha256,
+                Some(&manifest),
+                offset as u64,
+                &mut out[offset..offset + step],
+            )
+            .await?;
+        if n == 0 {
+            return Err(Errno::EIO);
+        }
+        offset += n;
+    }
+    Ok(out)
+}
+
 /// Mounts a verified Stage 1 `Kind::Initramfs` image into `os_vfs::ImageFs<VerifiedAssetBlobStore>`
 /// and verifies reading every required Stage 1 binary (`/init`, `/bin/mount`, `/bin/switch_root`,
 /// `/bin/cowfsck`, `/bin/sh`) through `VerifiedAssetBlobStore::read_verified_at` -> `self.imageBlobRead`.
@@ -388,31 +493,7 @@ pub async fn boot_stage1_initramfs(
         return Err(js_err("expected initramfs image"));
     }
     let comp = Composition::standalone(&img).map_err(|e| js_err(e.to_string()))?;
-    let entries: Vec<ImageEntry> = img
-        .entries
-        .into_iter()
-        .map(|e| ImageEntry {
-            path: e.path,
-            uid: e.uid,
-            gid: e.gid,
-            mode: e.mode,
-            node: match e.node {
-                Node::Directory => ImageNodeKind::Directory,
-                Node::File {
-                    sha256,
-                    size,
-                    chunk_size,
-                    chunks,
-                } => ImageNodeKind::File {
-                    blob_id: sha256,
-                    size,
-                    chunk_size: Some(chunk_size),
-                    chunks,
-                },
-                Node::Symlink { target } => ImageNodeKind::Symlink { target },
-            },
-        })
-        .collect();
+    let entries = image_to_vfs_entries(&img);
     let fs = ImageFs::new(
         FsId("image:initramfs".into()),
         true,

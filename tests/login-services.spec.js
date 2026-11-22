@@ -1,12 +1,11 @@
 import { executableAsset } from './executable-asset.js';
 import { test, expect } from './test.js';
-import { api, call, put, rmrf } from './sys.js';
+import { call } from './sys.js';
+import { pageMkdirp, pagePut, pageRmrf, switchLocalUser } from './ui.js';
 import { connectKernel, hookPageKernel } from './service-auth.js';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const password = process.env.OS_TEST_ADMIN_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const ROOT_ACCOUNT = { uid: 0, gid: 0, groups: [0], user: 'root', group: 'root', home: '/root', shell: '/usr/bin/dash', signed_in: true };
 const GUEST_ACCOUNT = { uid: 65534, gid: 65534, groups: [65534], user: 'guest', group: 'guest', home: '/tmp', shell: '/usr/bin/dash', signed_in: false };
 
@@ -155,21 +154,22 @@ test('login credentials remain authoritative even when a guest knows a root proc
 
 const state = page => page.evaluate(() => window.os.loginSession());
 async function ready(page) {
-  await call(page.request, 'getcreds');
   const pageKernel = await hookPageKernel(page);
   await page.goto('/');
   await pageKernel.ready();
   await expect.poll(async () => (await state(page))?.connected, { timeout: 20_000 }).toBe(true);
-  await pageKernel.value('sync_account_from_server');
   return pageKernel;
 }
 async function units(page, script) {
-  const base = '/guest/login-services-' + randomUUID();
-  await call(page.request, { mkdir: { path: base, mode: 0o700 } });
+  const base = '/tmp/login-services-' + randomUUID();
+  await pageMkdirp(page, base, 0o700);
   const file = base + '/units.json';
-  expect((await put(page.request, '/api/file?path=' + file, {
-    data: JSON.stringify({ version: 1, units: [{ name: 'managed', argv: ['sh', '-c', script] }] }),
-  })).ok()).toBe(true);
+  await pagePut(
+    page,
+    file,
+    JSON.stringify({ version: 1, units: [{ name: 'managed', argv: ['sh', '-c', script] }] }),
+    { mode: 0o644 },
+  );
   return { base, file };
 }
 async function start(page, file, key = 'managed') {
@@ -201,7 +201,7 @@ async function cleanup(page, base) {
       await window[key]?.done;
     }
   }).catch(() => {});
-  await rmrf(page.request, base);
+  await pageRmrf(page, base).catch(() => {});
 }
 const script = 'trap "echo CLEANED; exit 0" TERM; echo READY; while :; do sleep 0.1; done';
 
@@ -296,8 +296,7 @@ test('login replacement leaves running credentials intact and cannot control the
     await start(page, file);
     await output(page, 'READY');
     const before = (await state(page)).session;
-    await signIn(page.request);
-    await page.evaluate(() => window.dispatchEvent(new Event('os:login-changed')));
+    await switchLocalUser(page, 'root');
     await expect.poll(async () => (await state(page)).session?.uid).toBe(0);
     const after = (await state(page)).session;
     expect(after.id).not.toBe(before.id);

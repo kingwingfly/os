@@ -1,8 +1,6 @@
 import { test, expect } from './test.js';
-import { api, call } from './sys.js';
-import { readFile } from 'node:fs/promises';
+import { pageCall, switchLocalUser } from './ui.js';
 
-const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const state = page => page.evaluate(() => window.os.seatStatus());
 const activate = (page, active) => page.evaluate(active => window.os.setSeatActive(active), active);
 const output = page => page.evaluate(() => window.seatRun.output.replace(/\r\n/g, '\n'));
@@ -155,14 +153,13 @@ test('seat activation cannot be replayed against another host or a newer generat
 });
 
 test('pause survives login changes and preserves the running process identity on resume', async ({ page }) => {
-  const guest = await call(page.request, 'getcreds');
+  const before = await pageCall(page, 'getcreds');
   await start(page, ['sh', '-i']); await inputReady(page); await activate(page, false);
-  expect((await api(page.request, 'login', { headers: { 'CF-Connecting-IP': 'seat-' + crypto.randomUUID() }, data: { password } })).ok()).toBe(true);
-  await page.evaluate(() => dispatchEvent(new Event('os:login-changed')));
+  await switchLocalUser(page, 'root');
   expect((await state(page)).active).toBe(false);
   await activate(page, true); await inputReady(page);
   await page.evaluate(() => window.seatRun.input.write('id -u\n'));
-  await expect.poll(() => output(page)).toContain(String(guest.uid));
+  await expect.poll(() => output(page)).toContain(String(before.uid));
 });
 
 test('desktop input is disabled while paused and native keyboard focus returns on resume', async ({ page }) => {

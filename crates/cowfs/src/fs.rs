@@ -70,6 +70,14 @@ pub struct CowFsConfig {
     pub clock: CowFsClock,
     /// Optional logical capacity ceiling (bytes) reported in `statfs` and enforced on write.
     pub capacity_bytes: Option<u64>,
+    /// Optional callback invoked (outside `RefCell` borrows) whenever the mount transitions from
+    /// clean to dirty (`first_dirty_at: None -> Some`) or rolls back a failed commit to dirty,
+    /// allowing hosts to arm the 5-second dirty commit deadline timer (`contract.md` §2.15).
+    pub on_dirty: Option<Rc<dyn Fn()>>,
+    /// When `true`, `CowFs::open` skips automatic orphan reaping so callers (e.g., Stage 1 boot)
+    /// can run `verify_head` on the exact acquired/forked head before any mutation, then call
+    /// [`CowFs::reap_orphans`] once verification succeeds.
+    pub defer_orphan_reap: bool,
 }
 
 impl CowFsConfig {
@@ -80,6 +88,8 @@ impl CowFsConfig {
             arena: ArenaConfig::platform_default(),
             clock,
             capacity_bytes: None,
+            on_dirty: None,
+            defer_orphan_reap: false,
         }
     }
 
@@ -90,6 +100,8 @@ impl CowFsConfig {
             arena: ArenaConfig::fixed_32mib(),
             clock,
             capacity_bytes: None,
+            on_dirty: None,
+            defer_orphan_reap: false,
         }
     }
 
@@ -107,9 +119,29 @@ impl CowFsConfig {
         self.capacity_bytes = Some(bytes);
         self
     }
+
+    pub fn with_on_dirty(mut self, cb: Rc<dyn Fn()>) -> Self {
+        self.on_dirty = Some(cb);
+        self
+    }
+
+    pub fn with_defer_orphan_reap(mut self, defer: bool) -> Self {
+        self.defer_orphan_reap = defer;
+        self
+    }
 }
 
+#[derive(Clone, Copy)]
+struct SubvolCtx<'a> {
+    subvol: &'a str,
+    fs_id: &'a FsId,
+}
+
+type SubvolIno = (String, u64);
+type SubvolOverlayOps = (String, Vec<(TreeKey, Option<Vec<u8>>)>);
+
 struct OpenRecord {
+    subvol: String,
     ino: u64,
     generation: u64,
     access: Access,
@@ -134,6 +166,7 @@ impl Lock {
 }
 
 struct Waiter {
+    subvol: String,
     ino: u64,
     lock: Lock,
     waker: Waker,
@@ -208,12 +241,11 @@ impl AsyncMutex {
 struct PendingCommit {
     commit_req: CommitRequest,
     next_root_obj: RootObject,
-    new_subvol_root: Digest,
 }
 
 struct CommittingGroup {
     first_dirty_at: Option<Timespec>,
-    overlay: TreeOverlay,
+    overlays: BTreeMap<String, TreeOverlay>,
     dirty_blocks: HashMap<Digest, (Rc<Vec<u8>>, usize)>,
     dirty_block_bytes: usize,
     /// Retained across an ambiguous `EIO` from `commit_head` so retry replays the exact same
@@ -224,7 +256,8 @@ struct CommittingGroup {
 struct CowFsState {
     head: VolumeHead,
     root_obj: RootObject,
-    subvol_root: Digest,
+    /// Cached `ROOT_INO` generation per subvolume so `open_subvol_view` works synchronously.
+    subvol_root_generations: BTreeMap<String, u64>,
     lease: Option<WriterLease>,
     ro_pin: Option<Box<dyn RoPinGuard>>,
     forked_from: Option<VolumeId>,
@@ -234,16 +267,17 @@ struct CowFsState {
     user_modified: bool,
     /// Timestamp when the live overlay first became dirty (drives the 5s dirty commit deadline).
     first_dirty_at: Option<Timespec>,
-    overlay: TreeOverlay,
+    /// Live uncommitted B+tree mutations keyed by subvolume name (e.g., `"@"`, `"@home"`).
+    overlays: BTreeMap<String, TreeOverlay>,
     /// Uncommitted data blocks keyed by SHA-256 digest: `(bytes, refcount)`.
     dirty_blocks: HashMap<Digest, (Rc<Vec<u8>>, usize)>,
     dirty_block_bytes: usize,
     /// Frozen transaction group currently committing to storage (or awaiting EIO reconciliation).
     committing: Option<CommittingGroup>,
-    /// Open-file reference tracking (per-mount instance).
+    /// Open-file reference tracking (per-mount instance, isolated per `(subvol, ino)`).
     opens: HashMap<u64, OpenRecord>,
-    open_counts: HashMap<u64, u32>,
-    locks: HashMap<u64, Vec<Lock>>,
+    open_counts: HashMap<SubvolIno, u32>,
+    locks: HashMap<SubvolIno, Vec<Lock>>,
     waiters: HashMap<u64, Waiter>,
     next_waiter: u64,
     /// Persisted allocated out-of-line extent bytes (for `statfs` & optional capacity checks).
@@ -252,9 +286,45 @@ struct CowFsState {
 }
 
 impl CowFsState {
-    fn mark_dirty(&mut self, now: Timespec) {
+    fn subvol_root(&self, subvol: &str) -> Result<Digest> {
+        self.root_obj
+            .subvols
+            .get(subvol)
+            .copied()
+            .ok_or(Errno::ENOENT)
+    }
+
+    fn overlay_mut(&mut self, subvol: &str) -> &mut TreeOverlay {
+        if !self.overlays.contains_key(subvol) {
+            self.overlays.insert(subvol.to_string(), TreeOverlay::new());
+        }
+        self.overlays.get_mut(subvol).unwrap()
+    }
+
+    /// Record the earliest dirty transition timestamp, returning `true` iff `first_dirty_at`
+    /// transitioned from `None` to `Some(now)`.
+    fn mark_dirty(&mut self, now: Timespec) -> bool {
         if self.first_dirty_at.is_none() {
             self.first_dirty_at = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn oldest_dirty_at(&self) -> Option<Timespec> {
+        let committing_at = self.committing.as_ref().and_then(|c| c.first_dirty_at);
+        match (self.first_dirty_at, committing_at) {
+            (Some(a), Some(b)) => {
+                if (a.sec, a.nsec) <= (b.sec, b.nsec) {
+                    Some(a)
+                } else {
+                    Some(b)
+                }
+            }
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
         }
     }
 
@@ -281,25 +351,36 @@ impl CowFsState {
     }
 
     fn total_dirty_bytes(&self) -> usize {
-        let committing_bytes = self
-            .committing
-            .as_ref()
-            .map_or(0, |c| c.overlay.dirty_bytes() + c.dirty_block_bytes);
-        self.overlay.dirty_bytes() + self.dirty_block_bytes + committing_bytes
+        let live_ov: usize = self.overlays.values().map(TreeOverlay::dirty_bytes).sum();
+        let committing_bytes = self.committing.as_ref().map_or(0, |c| {
+            c.overlays
+                .values()
+                .map(TreeOverlay::dirty_bytes)
+                .sum::<usize>()
+                + c.dirty_block_bytes
+        });
+        live_ov + self.dirty_block_bytes + committing_bytes
     }
 
     fn is_live_dirty(&self) -> bool {
-        !self.overlay.is_empty() || !self.dirty_blocks.is_empty()
+        self.overlays.values().any(|o| !o.is_empty()) || !self.dirty_blocks.is_empty()
     }
 
     fn is_dirty(&self) -> bool {
         self.is_live_dirty() || self.committing.is_some()
     }
 
-    fn combined_read_overlay(&self) -> TreeOverlay {
-        match &self.committing {
-            Some(c) => c.overlay.merged_with(&self.overlay),
-            None => self.overlay.clone(),
+    fn combined_read_overlay(&self, subvol: &str) -> TreeOverlay {
+        let live = self.overlays.get(subvol);
+        let committing = self
+            .committing
+            .as_ref()
+            .and_then(|c| c.overlays.get(subvol));
+        match (committing, live) {
+            (Some(c), Some(l)) => c.merged_with(l),
+            (Some(c), None) => c.clone(),
+            (None, Some(l)) => l.clone(),
+            (None, None) => TreeOverlay::new(),
         }
     }
 
@@ -315,11 +396,14 @@ impl CowFsState {
         None
     }
 
-    fn rollback_committing(&mut self) {
+    fn rollback_committing(&mut self) -> bool {
         let Some(c) = self.committing.take() else {
-            return;
+            return false;
         };
-        self.overlay.merge_under(c.overlay);
+        let was_none = self.first_dirty_at.is_none();
+        for (sv, ov) in c.overlays {
+            self.overlays.entry(sv).or_default().merge_under(ov);
+        }
         for (digest, (bytes, count)) in c.dirty_blocks {
             if let Some((_, live_cnt)) = self.dirty_blocks.get_mut(&digest) {
                 *live_cnt = live_cnt.saturating_add(count);
@@ -335,13 +419,14 @@ impl CowFsState {
                 _ => prev,
             });
         }
+        was_none && self.first_dirty_at.is_some()
     }
 
-    fn deadlocks(&self, ino: u64, wanted: Lock) -> bool {
-        let mut pending = vec![(ino, wanted)];
+    fn deadlocks(&self, subvol: &str, ino: u64, wanted: Lock) -> bool {
+        let mut pending = vec![(subvol.to_string(), ino, wanted)];
         let mut visited = HashSet::new();
-        while let Some((ino, wanted_lock)) = pending.pop() {
-            for held in self.locks.get(&ino).into_iter().flatten() {
+        while let Some((sv, ino, wanted_lock)) = pending.pop() {
+            for held in self.locks.get(&(sv, ino)).into_iter().flatten() {
                 if !held.conflicts(wanted_lock) {
                     continue;
                 }
@@ -349,10 +434,15 @@ impl CowFsState {
                     return true;
                 }
                 if visited.insert(held.owner) {
-                    pending.extend(self.waiters.values().filter_map(|waiter| {
-                        (waiter.lock.owner == held.owner && waiter.lock.family == wanted.family)
-                            .then_some((waiter.ino, waiter.lock))
-                    }));
+                    pending.extend(
+                        self.waiters
+                            .values()
+                            .filter(|waiter| {
+                                waiter.lock.owner == held.owner
+                                    && waiter.lock.family == wanted.family
+                            })
+                            .map(|waiter| (waiter.subvol.clone(), waiter.ino, waiter.lock)),
+                    );
                 }
             }
         }
@@ -368,11 +458,14 @@ struct CommitRollbackGuard<'a, H: HeadStore + 'static, P: PackStore + 'static> {
 impl<H: HeadStore + 'static, P: PackStore + 'static> Drop for CommitRollbackGuard<'_, H, P> {
     fn drop(&mut self) {
         if self.armed {
-            {
+            let restored_dirty = {
                 let mut st = self.fs.state.borrow_mut();
-                st.rollback_committing();
-            }
+                st.rollback_committing()
+            };
             self.fs.sync_arena_dirty();
+            if restored_dirty {
+                self.fs.notify_dirty();
+            }
         }
     }
 }
@@ -389,6 +482,7 @@ pub struct CowFs<H: HeadStore + 'static, P: PackStore + 'static> {
     capacity_bytes: Option<u64>,
     root_generation: u64,
     clock: CowFsClock,
+    on_dirty: Option<Rc<dyn Fn()>>,
     head_store: Rc<H>,
     pack_store: Rc<P>,
     arena: RefCell<Arena>,
@@ -503,7 +597,11 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             let _ = head_store.unpin_ro_root(pin).await;
         }
         if let Some(l) = lease {
-            let _ = head_store.release_writer(l).await;
+            if l.head.ephemeral_if_unmodified && !l.head.modified {
+                let _ = head_store.delete_volume_with_lease(l, true).await;
+            } else {
+                let _ = head_store.release_writer(l).await;
+            }
         }
     }
 
@@ -569,7 +667,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             CowFsOpenMode::ReadWrite(writer_mode) => {
                 let lease = head_store.acquire_writer(&volume, writer_mode).await?;
                 if lease.head.format_version != COWFS_FORMAT_VERSION {
-                    let _ = head_store.release_writer(lease).await;
+                    Self::release_open_handles(&*head_store, Some(lease), None).await;
                     return Err(Errno::EPROTONOSUPPORT);
                 }
                 let head = lease.head.clone();
@@ -682,20 +780,42 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             }
         };
 
+        let mut subvol_root_generations = BTreeMap::new();
+        subvol_root_generations.insert(config.subvol.clone(), root_inode.generation);
+        for (sv_name, sv_root) in &root_obj.subvols {
+            if sv_name == &config.subvol {
+                continue;
+            }
+            if let Ok(Some(raw)) = tree.get(sv_root, &TreeKey::inode_item(ROOT_INO)).await
+                && let Ok(item) = InodeItem::decode(&raw)
+            {
+                subvol_root_generations.insert(sv_name.clone(), item.generation);
+            }
+        }
+
         let (allocated_bytes, inode_count) = if (root_obj.features & ROOT_FEATURE_ACCOUNTING) != 0 {
             (root_obj.allocated_bytes, root_obj.inode_count.max(1))
         } else {
-            match Self::scan_subvol_accounting(&tree, &subvol_root).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    Self::release_open_handles(&*head_store, lease, ro_pin).await;
-                    return Err(e);
+            let mut total_alloc = 0u64;
+            let mut total_inodes = 0u64;
+            for sv_root in root_obj.subvols.values() {
+                match Self::scan_subvol_accounting(&tree, sv_root).await {
+                    Ok((a, i)) => {
+                        total_alloc = total_alloc.saturating_add(a);
+                        total_inodes = total_inodes.saturating_add(i);
+                    }
+                    Err(e) => {
+                        Self::release_open_handles(&*head_store, lease, ro_pin).await;
+                        return Err(e);
+                    }
                 }
             }
+            (total_alloc, total_inodes.max(1))
         };
 
         let actual_volume = head.volume.clone();
         let initial_modified = head.modified;
+        let defer_orphan_reap = config.defer_orphan_reap;
         let fs = Self {
             fs_id,
             volume_id: actual_volume,
@@ -706,13 +826,14 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             capacity_bytes: config.capacity_bytes,
             root_generation: root_inode.generation,
             clock: config.clock,
+            on_dirty: config.on_dirty,
             head_store,
             pack_store,
             arena,
             state: RefCell::new(CowFsState {
                 head,
                 root_obj,
-                subvol_root,
+                subvol_root_generations,
                 lease,
                 ro_pin,
                 forked_from,
@@ -720,7 +841,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 closed: false,
                 user_modified: initial_modified,
                 first_dirty_at: None,
-                overlay: TreeOverlay::new(),
+                overlays: BTreeMap::new(),
                 dirty_blocks: HashMap::new(),
                 dirty_block_bytes: 0,
                 committing: None,
@@ -736,9 +857,10 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             commit_lock: AsyncMutex::default(),
         };
 
-        // On RW mount, reap any persisted `ORPHAN_ITEM`s left behind by an earlier crash while
-        // unlinked files were still open (contract §2.15, §3).
-        if !read_only {
+        // On RW mount (unless deferred for post-open `verify_head`), reap any persisted
+        // `ORPHAN_ITEM`s left behind by an earlier crash while unlinked files were still open
+        // (contract §2.15, §3).
+        if !read_only && !defer_orphan_reap {
             let reap_res = async {
                 let reaped = fs.reap_orphans_on_mount().await?;
                 if reaped > 0 {
@@ -760,8 +882,172 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         Ok(fs)
     }
 
+    /// Reap any persisted `ORPHAN_ITEM`s on an open RW mount and commit if any were reclaimed.
+    /// Intended for callers that opened with `CowFsConfig::with_defer_orphan_reap(true)` so they
+    /// could verify the exact mounted head via `fsck::verify_head` before mutating it.
+    pub async fn reap_orphans(&self) -> Result<usize> {
+        let _op = self.op_lock.lock().await;
+        if self.read_only {
+            return Ok(0);
+        }
+        self.check_rw()?;
+        let reaped = self.reap_orphans_on_mount().await?;
+        if reaped > 0 {
+            self.commit_tx_group_with_lock_mode(true).await?;
+        }
+        Ok(reaped)
+    }
+
     pub fn volume_id(&self) -> &VolumeId {
         &self.volume_id
+    }
+
+    /// Returns `true` if `name` (e.g., `"@"`, `"@home"`) exists in this volume's `RootObject`.
+    pub fn has_subvol(&self, name: &str) -> bool {
+        self.state.borrow().root_obj.subvols.contains_key(name)
+    }
+
+    /// Open a secondary [`Filesystem`] view onto subvolume `name` (e.g., `"@home"`) sharing this
+    /// `CowFs` instance's live writer lease, `VolumeHead`, arena, dirty timer callback, and atomic
+    /// `commit_tx_group` without acquiring a second writer lock.
+    pub fn open_subvol_view(self: &Rc<Self>, name: &str) -> Result<Rc<dyn Filesystem>> {
+        if name.is_empty() || name.contains(['/', '\0']) {
+            return Err(Errno::EINVAL);
+        }
+        let st = self.state.borrow();
+        if st.closed {
+            return Err(Errno::EBADF);
+        }
+        if name == self.subvol {
+            return Ok(Rc::clone(self) as Rc<dyn Filesystem>);
+        }
+        if !st.root_obj.subvols.contains_key(name) {
+            return Err(Errno::ENOENT);
+        }
+        let &root_generation = st.subvol_root_generations.get(name).ok_or(Errno::EIO)?;
+        let fs_id = FsId(format!("{}#{name}", self.fs_id.0));
+        Ok(Rc::new(CowFsSubvolView {
+            fs: Rc::clone(self),
+            subvol: name.to_string(),
+            fs_id,
+            root_generation,
+        }) as Rc<dyn Filesystem>)
+    }
+
+    /// Create a brand-new empty subvolume `name` (e.g., `"@home"`) with root directory inode `1`
+    /// inside this open RW volume, committing atomically so [`Self::has_subvol`] and
+    /// [`Self::open_subvol_view`] immediately succeed.
+    pub async fn create_subvol(&self, name: &str, mode: u16) -> Result<()> {
+        if name.is_empty() || name.contains(['/', '\0']) {
+            return Err(Errno::EINVAL);
+        }
+        let _op = self.op_lock.lock().await;
+        self.check_rw()?;
+        if self.state.borrow().root_obj.subvols.contains_key(name) {
+            return Err(Errno::EEXIST);
+        }
+        // Flush any dirty state first so the new subvolume commits cleanly on top of latest head.
+        self.commit_tx_group_with_lock_mode(true).await?;
+        let _commit = self.commit_lock.lock().await;
+        self.check_rw()?;
+
+        let (head_snap, mut next_root_obj, root_gen) = {
+            let st = self.state.borrow();
+            if st.root_obj.subvols.contains_key(name) {
+                return Err(Errno::EEXIST);
+            }
+            let mut ro = st.root_obj.clone();
+            ro.features |= ROOT_FEATURE_ACCOUNTING;
+            ro.allocated_bytes = st.allocated_bytes;
+            ro.inode_count = st.inode_count.saturating_add(1);
+            let next_gen = ro.generation;
+            (st.head.clone(), ro, next_gen)
+        };
+
+        let now = (self.clock)();
+        let root_inode = InodeItem {
+            file_type: FileType::Dir,
+            mode: mode & 0o7777,
+            nlink: 2,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            generation: root_gen,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            rdev: None,
+            symlink_target: None,
+            next_dir_index: 1,
+            acl_present: false,
+            default_acl_present: false,
+        };
+        let leaf = Node::Leaf {
+            entries: vec![cowtree::LeafEntry {
+                key: TreeKey::inode_item(ROOT_INO),
+                value: root_inode.encode(),
+            }],
+        };
+        let (leaf_digest, leaf_bytes) = leaf.encode()?;
+
+        next_root_obj.subvols.insert(name.to_string(), leaf_digest);
+        next_root_obj.parent_root = Some(head_snap.root);
+        let (new_root_digest, root_bytes) = next_root_obj.encode()?;
+
+        let mut op_seed = Vec::with_capacity(16 + self.volume_id.0.len() + 64);
+        op_seed.extend_from_slice(b"os-cowfs-op-v1\0");
+        op_seed.extend_from_slice(&(self.volume_id.0.len() as u32).to_be_bytes());
+        op_seed.extend_from_slice(self.volume_id.0.as_bytes());
+        op_seed.extend_from_slice(&head_snap.incarnation.to_be_bytes());
+        op_seed.extend_from_slice(&head_snap.fence.to_be_bytes());
+        op_seed.extend_from_slice(&head_snap.epoch.to_be_bytes());
+        op_seed.extend_from_slice(&new_root_digest);
+        let op_hash = sha256(&op_seed);
+        let mut op_id = [0u8; 16];
+        op_id.copy_from_slice(&op_hash[..16]);
+
+        let commit_req = CommitRequest {
+            op_id,
+            volume: self.volume_id.clone(),
+            expected_incarnation: head_snap.incarnation,
+            expected_fence: head_snap.fence,
+            expected_epoch: head_snap.epoch,
+            new_root: new_root_digest,
+            put_nodes: vec![(leaf_digest, leaf_bytes), (new_root_digest, root_bytes)],
+            put_packs: Vec::new(),
+            put_blocks: Vec::new(),
+            committed_at: now,
+        };
+
+        let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
+        match self.head_store.commit_head(&commit_req).await {
+            Ok(committed_head) => {
+                let mut st = self.state.borrow_mut();
+                st.head = committed_head.clone();
+                st.root_obj = next_root_obj;
+                st.inode_count = st.root_obj.inode_count;
+                st.user_modified = true;
+                st.subvol_root_generations
+                    .insert(name.to_string(), root_gen);
+                if let Some(lease) = st.lease.as_mut() {
+                    lease.epoch = committed_head.epoch;
+                    lease.head = committed_head;
+                }
+                Ok(())
+            }
+            Err(Errno::ESTALE) => {
+                self.state.borrow_mut().fenced = true;
+                Err(Errno::ESTALE)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn default_ctx(&self) -> SubvolCtx<'_> {
+        SubvolCtx {
+            subvol: &self.subvol,
+            fs_id: &self.fs_id,
+        }
     }
 
     pub fn forked_from(&self) -> Option<VolumeId> {
@@ -795,7 +1081,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if st.committing.as_ref().is_some_and(|c| c.pending.is_some()) {
             return true;
         }
-        let Some(since) = st.first_dirty_at else {
+        let Some(since) = st.oldest_dirty_at() else {
             return false;
         };
         let now = (self.clock)();
@@ -822,7 +1108,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if st.committing.as_ref().is_some_and(|c| c.pending.is_some()) {
             return Some(500);
         }
-        let since = st.first_dirty_at?;
+        let since = st.oldest_dirty_at()?;
         let now = (self.clock)();
         let deadline_ns = i128::from(DIRTY_COMMIT_DEADLINE_SECS) * 1_000_000_000;
         let elapsed_ns = (i128::from(now.sec) - i128::from(since.sec)) * 1_000_000_000
@@ -915,10 +1201,19 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 return Err(e);
             }
         };
-        let Some(&subvol_root) = root_obj.subvols.get(&self.subvol) else {
+        if !root_obj.subvols.contains_key(&self.subvol) {
             let _ = self.head_store.unpin_ro_root(new_pin).await;
             return Err(Errno::ENOENT);
-        };
+        }
+        let tree = CowTree::new(&*self.head_store, &self.arena);
+        let mut refreshed_gens = BTreeMap::new();
+        for (sv_name, sv_root) in &root_obj.subvols {
+            if let Ok(Some(raw)) = tree.get(sv_root, &TreeKey::inode_item(ROOT_INO)).await
+                && let Ok(item) = InodeItem::decode(&raw)
+            {
+                refreshed_gens.insert(sv_name.clone(), item.generation);
+            }
+        }
         let swap_res = {
             let mut st = self.state.borrow_mut();
             if st.closed {
@@ -930,7 +1225,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 }
                 st.head = latest.clone();
                 st.root_obj = root_obj;
-                st.subvol_root = subvol_root;
+                for (sv, sv_gen) in refreshed_gens {
+                    st.subvol_root_generations.entry(sv).or_insert(sv_gen);
+                }
                 Ok(st.ro_pin.replace(new_pin))
             }
         };
@@ -1000,6 +1297,37 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         self.head_store.fork_volume(&req).await
     }
 
+    /// Durably flush any dirty transaction group for bfcache / page suspension WITHOUT closing
+    /// this mount, releasing its writer lease, invalidating open handles, or pruning an unmodified
+    /// `ForkOnBusy` fork.
+    ///
+    /// If clean (or an unmodified ephemeral fork with only internal atime updates), returns
+    /// `Ok(self.current_head())` without advancing the epoch.
+    pub async fn flush_for_suspend(&self) -> Result<VolumeHead> {
+        let _op = self.op_lock.lock().await;
+        let (should_commit, head) = {
+            let st = self.state.borrow();
+            if st.closed {
+                return Err(Errno::EBADF);
+            }
+            if self.read_only {
+                return Ok(st.head.clone());
+            }
+            if st.fenced || st.lease.is_none() {
+                return Err(Errno::ESTALE);
+            }
+            let ephemeral_atime_only =
+                st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
+            let should_commit = st.is_dirty() && !ephemeral_atime_only;
+            (should_commit, st.head.clone())
+        };
+        if should_commit {
+            self.commit_tx_group_with_lock_mode(true).await
+        } else {
+            Ok(head)
+        }
+    }
+
     /// Commit any dirty transaction group, release the writer lease or RO pin, and auto-prune an
     /// unmodified ephemeral tab fork ONLY when this mount is its live, unfenced RW lease holder.
     pub async fn close_clean(&self) -> Result<()> {
@@ -1065,15 +1393,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         self.commit_tx_group_with_lock_mode(false).await
     }
 
-    fn retire_committing_success(
-        &self,
-        committed_head: VolumeHead,
-        next_root_obj: RootObject,
-        new_subvol_root: Digest,
-    ) {
+    fn retire_committing_success(&self, committed_head: VolumeHead, next_root_obj: RootObject) {
         let mut st = self.state.borrow_mut();
         st.head = committed_head.clone();
-        st.subvol_root = new_subvol_root;
         st.root_obj.format_version = next_root_obj.format_version;
         st.root_obj.features = next_root_obj.features;
         st.root_obj.subvols = next_root_obj.subvols;
@@ -1101,10 +1423,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     async fn build_commit_request(
         &self,
         head_snap: &VolumeHead,
-        subvol_root: &Digest,
         mut next_root_obj: RootObject,
         dirty_blocks_snap: &[(Digest, Rc<Vec<u8>>)],
-        sorted_ops: &[(TreeKey, Option<Vec<u8>>)],
+        subvol_ops: &[SubvolOverlayOps],
     ) -> Result<PendingCommit> {
         // 1. Pack & flush any new dirty data blocks (skipping intra-store dedupe hits).
         let mut builder = PackBuilder::new();
@@ -1127,13 +1448,19 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             put_blocks.extend(built.locations.iter().cloned());
         }
 
-        // 2. Apply sorted mutations to CoW B+tree (leaves -> parents -> new subvol root).
+        // 2. Apply sorted mutations per dirty subvolume to their CoW B+trees in one atomic root.
         let tree = CowTree::new(&*self.head_store, &self.arena);
-        let (new_subvol_root, mut put_nodes) = tree.apply_batch(subvol_root, sorted_ops).await?;
+        let mut put_nodes = Vec::new();
+        for (sv_name, sorted_ops) in subvol_ops {
+            if sorted_ops.is_empty() {
+                continue;
+            }
+            let base_root = *next_root_obj.subvols.get(sv_name).ok_or(Errno::ENOENT)?;
+            let (new_sv_root, sv_nodes) = tree.apply_batch(&base_root, sorted_ops).await?;
+            put_nodes.extend(sv_nodes);
+            next_root_obj.subvols.insert(sv_name.clone(), new_sv_root);
+        }
 
-        next_root_obj
-            .subvols
-            .insert(self.subvol.clone(), new_subvol_root);
         next_root_obj.parent_root = Some(head_snap.root);
         let (new_root_digest, root_bytes) = next_root_obj.encode()?;
         put_nodes.push((new_root_digest, root_bytes));
@@ -1167,7 +1494,6 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         Ok(PendingCommit {
             commit_req,
             next_root_obj,
-            new_subvol_root,
         })
     }
 
@@ -1197,25 +1523,17 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             let pending_replay = {
                 let st = self.state.borrow();
                 st.committing.as_ref().and_then(|c| {
-                    c.pending.as_ref().map(|p| {
-                        (
-                            p.commit_req.clone(),
-                            p.next_root_obj.clone(),
-                            p.new_subvol_root,
-                        )
-                    })
+                    c.pending
+                        .as_ref()
+                        .map(|p| (p.commit_req.clone(), p.next_root_obj.clone()))
                 })
             };
-            if let Some((commit_req, next_root_obj, new_subvol_root)) = pending_replay {
+            if let Some((commit_req, next_root_obj)) = pending_replay {
                 drop(op_guard.take());
                 let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
                 match self.head_store.commit_head(&commit_req).await {
                     Ok(committed_head) => {
-                        self.retire_committing_success(
-                            committed_head.clone(),
-                            next_root_obj,
-                            new_subvol_root,
-                        );
+                        self.retire_committing_success(committed_head.clone(), next_root_obj);
                         let still_dirty = {
                             let st = self.state.borrow();
                             let ephemeral_atime_only = st.head.ephemeral_if_unmodified
@@ -1240,8 +1558,11 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                         return Err(Errno::ESTALE);
                     }
                     Err(e @ (Errno::ENOSPC | Errno::EDQUOT)) => {
-                        self.state.borrow_mut().rollback_committing();
+                        let restored = self.state.borrow_mut().rollback_committing();
                         self.sync_arena_dirty();
+                        if restored {
+                            self.notify_dirty();
+                        }
                         return Err(e);
                     }
                     Err(e) => {
@@ -1253,8 +1574,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
             // Phase B: Freeze the live dirty transaction group into `st.committing` while holding
             // `op_lock`, then release `op_lock` BEFORE async storage I/O so concurrent VFS
-            // mutations stage safely into fresh `st.overlay` / `st.dirty_blocks`.
-            let (skip_commit, head_snap, subvol_root, root_obj_snap, dirty_blocks_snap, sorted_ops) = {
+            // mutations stage safely into fresh `st.overlays` / `st.dirty_blocks`.
+            let (skip_commit, head_snap, root_obj_snap, dirty_blocks_snap, subvol_ops) = {
                 let mut st = self.state.borrow_mut();
                 let ephemeral_atime_only =
                     st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
@@ -1262,20 +1583,18 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                     (
                         true,
                         st.head.clone(),
-                        st.subvol_root,
                         st.root_obj.clone(),
                         Vec::new(),
                         Vec::new(),
                     )
                 } else {
                     let head_snap = st.head.clone();
-                    let subvol_root = st.subvol_root;
                     let mut root_obj_snap = st.root_obj.clone();
                     root_obj_snap.features |= ROOT_FEATURE_ACCOUNTING;
                     root_obj_snap.allocated_bytes = st.allocated_bytes;
                     root_obj_snap.inode_count = st.inode_count;
                     let first_dirty_at = st.first_dirty_at.take();
-                    let live_overlay = std::mem::take(&mut st.overlay);
+                    let live_overlays = std::mem::take(&mut st.overlays);
                     let live_blocks = std::mem::take(&mut st.dirty_blocks);
                     let live_block_bytes = std::mem::take(&mut st.dirty_block_bytes);
 
@@ -1283,22 +1602,19 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                         .iter()
                         .map(|(d, (b, _))| (*d, Rc::clone(b)))
                         .collect();
-                    let sorted_ops = live_overlay.clone_sorted_ops();
+                    let subvol_ops: Vec<SubvolOverlayOps> = live_overlays
+                        .iter()
+                        .filter(|(_, ov)| !ov.is_empty())
+                        .map(|(sv, ov)| (sv.clone(), ov.clone_sorted_ops()))
+                        .collect();
                     st.committing = Some(CommittingGroup {
                         first_dirty_at,
-                        overlay: live_overlay,
+                        overlays: live_overlays,
                         dirty_blocks: live_blocks,
                         dirty_block_bytes: live_block_bytes,
                         pending: None,
                     });
-                    (
-                        false,
-                        head_snap,
-                        subvol_root,
-                        root_obj_snap,
-                        blocks_vec,
-                        sorted_ops,
-                    )
+                    (false, head_snap, root_obj_snap, blocks_vec, subvol_ops)
                 }
             };
 
@@ -1322,23 +1638,13 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             // Acquire shared GC lock across pack write + head CAS so GC never sweeps in-flight packs.
             let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
             let pending = self
-                .build_commit_request(
-                    &head_snap,
-                    &subvol_root,
-                    root_obj_snap,
-                    &dirty_blocks_snap,
-                    &sorted_ops,
-                )
+                .build_commit_request(&head_snap, root_obj_snap, &dirty_blocks_snap, &subvol_ops)
                 .await?;
 
             match self.head_store.commit_head(&pending.commit_req).await {
                 Ok(committed_head) => {
                     rollback.armed = false;
-                    self.retire_committing_success(
-                        committed_head.clone(),
-                        pending.next_root_obj,
-                        pending.new_subvol_root,
-                    );
+                    self.retire_committing_success(committed_head.clone(), pending.next_root_obj);
                     return Ok(committed_head);
                 }
                 Err(Errno::ESTALE) => {
@@ -1352,9 +1658,12 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                     // Ambiguous failure (e.g. `EIO`): the commit may have applied on storage.
                     // Retain `pending` inside `st.committing` so retry replays the exact `op_id`.
                     rollback.armed = false;
-                    if let Some(c) = self.state.borrow_mut().committing.as_mut() {
-                        c.pending = Some(pending);
+                    {
+                        if let Some(c) = self.state.borrow_mut().committing.as_mut() {
+                            c.pending = Some(pending);
+                        }
                     }
+                    self.notify_dirty();
                     return Err(e);
                 }
             }
@@ -1364,6 +1673,26 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     fn sync_arena_dirty(&self) {
         let bytes = self.state.borrow().total_dirty_bytes();
         self.arena.borrow_mut().set_dirty_bytes(bytes);
+    }
+
+    /// Invoke the optional `on_dirty` callback strictly outside any `RefCell` borrow so callbacks
+    /// may safely query `ms_until_dirty_deadline()` / `dirty_deadline_elapsed()`.
+    fn notify_dirty(&self) {
+        let Some(cb) = self.on_dirty.as_ref() else {
+            return;
+        };
+        let should_notify = {
+            let st = self.state.borrow();
+            !self.read_only
+                && !st.closed
+                && !st.fenced
+                && st.lease.is_some()
+                && st.is_dirty()
+                && !(st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified)
+        };
+        if should_notify {
+            cb();
+        }
     }
 
     /// Flush when arena dirty budget is approached OR when the 5-second dirty commit deadline has
@@ -1383,46 +1712,69 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     }
 
     async fn reap_orphans_on_mount(&self) -> Result<usize> {
-        let subvol_root = self.state.borrow().subvol_root;
+        let subvols: Vec<(String, Digest)> = self
+            .state
+            .borrow()
+            .root_obj
+            .subvols
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
         let tree = CowTree::new(&*self.head_store, &self.arena);
-        let mut overlay = TreeOverlay::new();
-        let (reaped, freed_bytes) =
-            orphan::reap_all_orphans(&tree, &subvol_root, &mut overlay).await?;
-        if reaped > 0 {
-            let now = (self.clock)();
-            let mut st = self.state.borrow_mut();
-            st.user_modified = true;
-            st.mark_dirty(now);
-            for (k, v) in overlay.take_sorted_ops() {
-                match v {
-                    Some(val) => st.overlay.put(k, val),
-                    None => st.overlay.delete(k),
-                }
+        let mut total_reaped = 0usize;
+        let mut became_dirty = false;
+        for (sv_name, sv_root) in subvols {
+            let mut overlay = TreeOverlay::new();
+            let (reaped, freed_bytes) =
+                orphan::reap_all_orphans(&tree, &sv_root, &mut overlay).await?;
+            if reaped > 0 {
+                let now = (self.clock)();
+                let transitioned = {
+                    let mut st = self.state.borrow_mut();
+                    st.user_modified = true;
+                    let t = st.mark_dirty(now);
+                    let sv_ov = st.overlay_mut(&sv_name);
+                    for (k, v) in overlay.take_sorted_ops() {
+                        match v {
+                            Some(val) => sv_ov.put(k, val),
+                            None => sv_ov.delete(k),
+                        }
+                    }
+                    st.allocated_bytes = st.allocated_bytes.saturating_sub(freed_bytes);
+                    st.inode_count = st.inode_count.saturating_sub(reaped as u64).max(1);
+                    let dirty = st.total_dirty_bytes();
+                    self.arena.borrow_mut().set_dirty_bytes(dirty);
+                    t
+                };
+                total_reaped += reaped;
+                became_dirty |= transitioned;
             }
-            st.allocated_bytes = st.allocated_bytes.saturating_sub(freed_bytes);
-            st.inode_count = st.inode_count.saturating_sub(reaped as u64).max(1);
-            let dirty = st.total_dirty_bytes();
-            self.arena.borrow_mut().set_dirty_bytes(dirty);
         }
-        Ok(reaped)
+        if became_dirty {
+            self.notify_dirty();
+        }
+        Ok(total_reaped)
     }
 
     // -------------------------------------------------------------------------
     // Tree & inode helpers (never hold RefCell borrows across `.await`)
     // -------------------------------------------------------------------------
 
-    async fn tree_get(&self, key: &TreeKey) -> Result<Option<Vec<u8>>> {
+    async fn tree_get(&self, subvol: &str, key: &TreeKey) -> Result<Option<Vec<u8>>> {
         let base_root = {
             let st = self.state.borrow();
-            if let Some(opt) = st.overlay.get(key) {
-                return Ok(opt.map(|v| v.to_vec()));
-            }
-            if let Some(c) = &st.committing
-                && let Some(opt) = c.overlay.get(key)
+            if let Some(ov) = st.overlays.get(subvol)
+                && let Some(opt) = ov.get(key)
             {
                 return Ok(opt.map(|v| v.to_vec()));
             }
-            st.subvol_root
+            if let Some(c) = &st.committing
+                && let Some(ov) = c.overlays.get(subvol)
+                && let Some(opt) = ov.get(key)
+            {
+                return Ok(opt.map(|v| v.to_vec()));
+            }
+            st.subvol_root(subvol)?
         };
         let tree = CowTree::new(&*self.head_store, &self.arena);
         tree.get(&base_root, key).await
@@ -1430,13 +1782,14 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
     async fn tree_scan(
         &self,
+        subvol: &str,
         start: &TreeKey,
         end: &TreeKey,
         limit: usize,
     ) -> Result<Vec<(TreeKey, Vec<u8>)>> {
         let (base_root, overlay_clone) = {
             let st = self.state.borrow();
-            (st.subvol_root, st.combined_read_overlay())
+            (st.subvol_root(subvol)?, st.combined_read_overlay(subvol))
         };
         let tree = CowTree::new(&*self.head_store, &self.arena);
         tree.scan_range_with_overlay(&base_root, &overlay_clone, start, end, limit)
@@ -1445,29 +1798,30 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
     async fn tree_find_le(
         &self,
+        subvol: &str,
         min_key: &TreeKey,
         max_key: &TreeKey,
     ) -> Result<Option<(TreeKey, Vec<u8>)>> {
         let (base_root, overlay_clone) = {
             let st = self.state.borrow();
-            (st.subvol_root, st.combined_read_overlay())
+            (st.subvol_root(subvol)?, st.combined_read_overlay(subvol))
         };
         let tree = CowTree::new(&*self.head_store, &self.arena);
         tree.find_le_with_overlay(&base_root, &overlay_clone, min_key, max_key)
             .await
     }
 
-    async fn load_inode(&self, ino: u64) -> Result<Option<InodeItem>> {
-        let Some(raw) = self.tree_get(&TreeKey::inode_item(ino)).await? else {
+    async fn load_inode(&self, subvol: &str, ino: u64) -> Result<Option<InodeItem>> {
+        let Some(raw) = self.tree_get(subvol, &TreeKey::inode_item(ino)).await? else {
             return Ok(None);
         };
         InodeItem::decode(&raw).map(Some)
     }
 
-    async fn load_perm_node(&self, ino: u64, item: &InodeItem) -> Result<PermNode> {
+    async fn load_perm_node(&self, subvol: &str, ino: u64, item: &InodeItem) -> Result<PermNode> {
         let acl_entries = if item.acl_present {
             match self
-                .tree_get(&TreeKey::xattr_item(ino, abi::ACL_ACCESS))
+                .tree_get(subvol, &TreeKey::xattr_item(ino, abi::ACL_ACCESS))
                 .await?
             {
                 Some(raw) => Some(serde_json::from_slice::<Entries>(&raw).map_err(|_| Errno::EIO)?),
@@ -1478,7 +1832,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         };
         let default_acl = if item.default_acl_present {
             match self
-                .tree_get(&TreeKey::xattr_item(ino, abi::ACL_DEFAULT))
+                .tree_get(subvol, &TreeKey::xattr_item(ino, abi::ACL_DEFAULT))
                 .await?
             {
                 Some(raw) => Some(serde_json::from_slice::<Entries>(&raw).map_err(|_| Errno::EIO)?),
@@ -1513,78 +1867,89 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         Ok(EncodedAcls { access, default })
     }
 
-    fn stage_encoded_acls(&self, ino: u64, acls: EncodedAcls) {
+    fn stage_encoded_acls(&self, subvol: &str, ino: u64, acls: EncodedAcls) {
         let now = (self.clock)();
-        {
+        let became_dirty = {
             let mut st = self.state.borrow_mut();
             st.user_modified = true;
-            st.mark_dirty(now);
+            let transitioned = st.mark_dirty(now);
+            let ov = st.overlay_mut(subvol);
             match acls.access {
-                Some(raw) => st
-                    .overlay
-                    .put(TreeKey::xattr_item(ino, abi::ACL_ACCESS), raw),
-                None => st.overlay.delete(TreeKey::xattr_item(ino, abi::ACL_ACCESS)),
+                Some(raw) => ov.put(TreeKey::xattr_item(ino, abi::ACL_ACCESS), raw),
+                None => ov.delete(TreeKey::xattr_item(ino, abi::ACL_ACCESS)),
             }
             match acls.default {
-                Some(raw) => st
-                    .overlay
-                    .put(TreeKey::xattr_item(ino, abi::ACL_DEFAULT), raw),
-                None => st
-                    .overlay
-                    .delete(TreeKey::xattr_item(ino, abi::ACL_DEFAULT)),
+                Some(raw) => ov.put(TreeKey::xattr_item(ino, abi::ACL_DEFAULT), raw),
+                None => ov.delete(TreeKey::xattr_item(ino, abi::ACL_DEFAULT)),
             }
-        }
+            transitioned
+        };
         self.sync_arena_dirty();
+        if became_dirty {
+            self.notify_dirty();
+        }
     }
 
-    fn stage_inode(&self, ino: u64, item: &InodeItem) {
+    fn stage_inode(&self, subvol: &str, ino: u64, item: &InodeItem) {
         let now = (self.clock)();
-        {
+        let became_dirty = {
             let mut st = self.state.borrow_mut();
             st.user_modified = true;
-            st.mark_dirty(now);
-            st.overlay.put(TreeKey::inode_item(ino), item.encode());
-        }
+            let transitioned = st.mark_dirty(now);
+            st.overlay_mut(subvol)
+                .put(TreeKey::inode_item(ino), item.encode());
+            transitioned
+        };
         self.sync_arena_dirty();
+        if became_dirty {
+            self.notify_dirty();
+        }
     }
 
-    fn stage_inode_atime(&self, ino: u64, item: &InodeItem) {
+    fn stage_inode_atime(&self, subvol: &str, ino: u64, item: &InodeItem) {
         let now = (self.clock)();
-        {
+        let became_dirty = {
             let mut st = self.state.borrow_mut();
             let ephemeral_unmodified =
                 st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
-            if !ephemeral_unmodified {
-                st.mark_dirty(now);
-            }
-            st.overlay.put(TreeKey::inode_item(ino), item.encode());
-        }
+            let transitioned = if !ephemeral_unmodified {
+                st.mark_dirty(now)
+            } else {
+                false
+            };
+            st.overlay_mut(subvol)
+                .put(TreeKey::inode_item(ino), item.encode());
+            transitioned
+        };
         self.sync_arena_dirty();
+        if became_dirty {
+            self.notify_dirty();
+        }
     }
 
-    fn handle_for(&self, ino: u64, generation: u64) -> Handle {
+    fn handle_for(ctx: SubvolCtx<'_>, ino: u64, generation: u64) -> Handle {
         Handle {
-            fs: self.fs_id.clone(),
+            fs: ctx.fs_id.clone(),
             node: NodeId { ino, generation },
             proof: String::new(),
         }
     }
 
-    fn entry_for(&self, ino: u64, item: &InodeItem) -> Entry {
+    fn entry_for(ctx: SubvolCtx<'_>, ino: u64, item: &InodeItem) -> Entry {
         Entry {
-            handle: self.handle_for(ino, item.generation),
+            handle: Self::handle_for(ctx, ino, item.generation),
             metadata: item.to_metadata(),
         }
     }
 
-    async fn check_handle(&self, handle: &Handle) -> Result<(u64, InodeItem)> {
+    async fn check_handle(&self, ctx: SubvolCtx<'_>, handle: &Handle) -> Result<(u64, InodeItem)> {
         if self.state.borrow().closed {
             return Err(Errno::EBADF);
         }
-        if handle.fs != self.fs_id || !handle.proof.is_empty() {
+        if handle.fs != *ctx.fs_id || !handle.proof.is_empty() {
             return Err(Errno::EACCES);
         }
-        let Some(item) = self.load_inode(handle.node.ino).await? else {
+        let Some(item) = self.load_inode(ctx.subvol, handle.node.ino).await? else {
             return Err(Errno::ESTALE);
         };
         if item.generation != handle.node.generation {
@@ -1593,8 +1958,12 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         Ok((handle.node.ino, item))
     }
 
-    fn open_record_clone(&self, open: &OpenRef) -> Result<(u64, u64, Access, Identity)> {
-        if open.fs != self.fs_id {
+    fn open_record_clone(
+        &self,
+        ctx: SubvolCtx<'_>,
+        open: &OpenRef,
+    ) -> Result<(u64, u64, Access, Identity)> {
+        if open.fs != *ctx.fs_id {
             return Err(Errno::EBADF);
         }
         let st = self.state.borrow();
@@ -1602,27 +1971,40 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             return Err(Errno::EBADF);
         }
         let rec = st.opens.get(&open.id).ok_or(Errno::EBADF)?;
-        if rec.ino != open.node.ino || rec.generation != open.node.generation {
+        if rec.subvol != ctx.subvol
+            || rec.ino != open.node.ino
+            || rec.generation != open.node.generation
+        {
             return Err(Errno::EBADF);
         }
         Ok((rec.ino, rec.generation, rec.access, rec.cred.clone()))
     }
 
-    fn new_open(&self, cred: &Cred, ino: u64, generation: u64, access: Access) -> OpenRef {
+    fn new_open(
+        &self,
+        ctx: SubvolCtx<'_>,
+        cred: &Cred,
+        ino: u64,
+        generation: u64,
+        access: Access,
+    ) -> OpenRef {
         let id = NEXT_OPEN_ID.fetch_add(1, Ordering::Relaxed);
         let mut st = self.state.borrow_mut();
         st.opens.insert(
             id,
             OpenRecord {
+                subvol: ctx.subvol.to_string(),
                 ino,
                 generation,
                 access,
                 cred: cred.identity.clone(),
             },
         );
-        *st.open_counts.entry(ino).or_insert(0) += 1;
+        *st.open_counts
+            .entry((ctx.subvol.to_string(), ino))
+            .or_insert(0) += 1;
         OpenRef {
-            fs: self.fs_id.clone(),
+            fs: ctx.fs_id.clone(),
             id,
             node: NodeId { ino, generation },
             access,
@@ -1660,6 +2042,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
     async fn update_atime_if_needed(
         &self,
+        subvol: &str,
         ino: u64,
         expected_gen: u64,
         item: &InodeItem,
@@ -1679,20 +2062,21 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 return;
             }
         }
-        if let Ok(Some(mut cur)) = self.load_inode(ino).await
+        if let Ok(Some(mut cur)) = self.load_inode(subvol, ino).await
             && cur.generation == expected_gen
             && cur.nlink > 0
         {
             let now = (self.clock)();
             if Self::should_update_atime(&cur, is_dir, now) {
                 cur.atime = now;
-                self.stage_inode_atime(ino, &cur);
+                self.stage_inode_atime(subvol, ino, &cur);
             }
         }
     }
 
     async fn searchable(
         &self,
+        subvol: &str,
         cred: &Cred,
         dir_ino: u64,
         dir_item: &InodeItem,
@@ -1700,21 +2084,30 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if dir_item.file_type != FileType::Dir {
             return Err(Errno::ENOTDIR);
         }
-        let perm = self.load_perm_node(dir_ino, dir_item).await?;
+        let perm = self.load_perm_node(subvol, dir_ino, dir_item).await?;
         inode::require(&cred.identity, &perm, EXEC)?;
         Ok(perm)
     }
 
-    async fn lookup_dir_item(&self, dir_ino: u64, name: &str) -> Result<Option<DirItemValue>> {
-        let Some(raw) = self.tree_get(&TreeKey::dir_item(dir_ino, name)).await? else {
+    async fn lookup_dir_item(
+        &self,
+        subvol: &str,
+        dir_ino: u64,
+        name: &str,
+    ) -> Result<Option<DirItemValue>> {
+        let Some(raw) = self
+            .tree_get(subvol, &TreeKey::dir_item(dir_ino, name))
+            .await?
+        else {
             return Ok(None);
         };
         DirItemValue::decode(&raw).map(Some)
     }
 
-    async fn dir_is_empty(&self, dir_ino: u64) -> Result<bool> {
+    async fn dir_is_empty(&self, subvol: &str, dir_ino: u64) -> Result<bool> {
         let items = self
             .tree_scan(
+                subvol,
                 &TreeKey::kind_start(dir_ino, KIND_DIR_ITEM),
                 &TreeKey::kind_end(dir_ino, KIND_DIR_ITEM),
                 1,
@@ -1723,7 +2116,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         Ok(items.is_empty())
     }
 
-    async fn is_ancestor(&self, ancestor: u64, mut ino: u64) -> Result<bool> {
+    async fn is_ancestor(&self, subvol: &str, ancestor: u64, mut ino: u64) -> Result<bool> {
         loop {
             if ino == ancestor {
                 return Ok(true);
@@ -1733,6 +2126,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             }
             let refs = self
                 .tree_scan(
+                    subvol,
                     &TreeKey::kind_start(ino, KIND_INODE_REF),
                     &TreeKey::kind_end(ino, KIND_INODE_REF),
                     1,
@@ -1761,59 +2155,72 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     }
 
     /// Reclaim all items belonging to an unlinked inode when its open count reaches zero.
-    /// Caller MUST hold `op_lock`. Never takes `st.overlay` across `.await`.
-    async fn reclaim_if_dead_locked(&self, ino: u64, item: &InodeItem) -> Result<()> {
+    /// Caller MUST hold `op_lock`. Never takes `st.overlays` across `.await`.
+    async fn reclaim_if_dead_locked(&self, subvol: &str, ino: u64, item: &InodeItem) -> Result<()> {
         if item.nlink != 0 {
             return Ok(());
         }
+        let sv_key = (subvol.to_string(), ino);
         let opens = self
             .state
             .borrow()
             .open_counts
-            .get(&ino)
+            .get(&sv_key)
             .copied()
             .unwrap_or(0);
         if opens == 0 {
             let (base_root, read_overlay) = {
                 let st = self.state.borrow();
-                (st.subvol_root, st.combined_read_overlay())
+                (st.subvol_root(subvol)?, st.combined_read_overlay(subvol))
             };
             let tree = CowTree::new(&*self.head_store, &self.arena);
             let plan =
                 orphan::collect_inode_reclaim_plan(&tree, &base_root, &read_overlay, ino).await?;
             let now = (self.clock)();
-            {
+            let became_dirty = {
                 let mut st = self.state.borrow_mut();
-                if st.open_counts.get(&ino).copied().unwrap_or(0) > 0 {
+                if st.open_counts.get(&sv_key).copied().unwrap_or(0) > 0 {
                     st.user_modified = true;
-                    st.mark_dirty(now);
-                    orphan::stage_orphan(&mut st.overlay, ino);
+                    let transitioned = st.mark_dirty(now);
+                    orphan::stage_orphan(st.overlay_mut(subvol), ino);
+                    transitioned
                 } else {
                     st.user_modified = true;
-                    st.mark_dirty(now);
-                    for k in plan.delete_keys {
-                        st.overlay.delete(k);
+                    let transitioned = st.mark_dirty(now);
+                    {
+                        let ov = st.overlay_mut(subvol);
+                        for k in plan.delete_keys {
+                            ov.delete(k);
+                        }
+                        orphan::clear_orphan(ov, ino);
                     }
-                    orphan::clear_orphan(&mut st.overlay, ino);
                     for d in &plan.dropped_digests {
                         st.unstage_dirty_block(d);
                     }
-                    st.locks.remove(&ino);
+                    st.locks.remove(&sv_key);
                     st.allocated_bytes = st.allocated_bytes.saturating_sub(plan.freed_extent_bytes);
                     st.inode_count = st.inode_count.saturating_sub(1).max(1);
+                    transitioned
                 }
-            }
+            };
             self.sync_arena_dirty();
+            if became_dirty {
+                self.notify_dirty();
+            }
         } else {
             // Still open after last link gone -> persist ORPHAN_ITEM for crash recovery!
             let now = (self.clock)();
-            {
+            let became_dirty = {
                 let mut st = self.state.borrow_mut();
                 st.user_modified = true;
-                st.mark_dirty(now);
-                orphan::stage_orphan(&mut st.overlay, ino);
-            }
+                let transitioned = st.mark_dirty(now);
+                orphan::stage_orphan(st.overlay_mut(subvol), ino);
+                transitioned
+            };
             self.sync_arena_dirty();
+            if became_dirty {
+                self.notify_dirty();
+            }
         }
         Ok(())
     }
@@ -1846,6 +2253,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     /// Read up to `buf.len()` bytes of `ino` starting at `offset` (clamped by `inode.size`).
     async fn read_file_bytes(
         &self,
+        subvol: &str,
         ino: u64,
         file_size: u64,
         offset: u64,
@@ -1862,7 +2270,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         while done < target_len {
             let at = offset + done as u64;
             let max_k = TreeKey::extent_data(ino, at);
-            if let Some((ext_key, ext_raw)) = self.tree_find_le(&min_k, &max_k).await?
+            if let Some((ext_key, ext_raw)) = self.tree_find_le(subvol, &min_k, &max_k).await?
                 && let Some(ext_start) = ext_key.tail_u64()
             {
                 match ExtentDataValue::decode(&ext_raw)? {
@@ -1907,7 +2315,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             // know how many zeros to emit in one step.
             let next_start = TreeKey::extent_data(ino, at.saturating_add(1));
             let next_end = TreeKey::kind_end(ino, KIND_EXTENT_DATA);
-            let next_ext = self.tree_scan(&next_start, &next_end, 1).await?;
+            let next_ext = self.tree_scan(subvol, &next_start, &next_end, 1).await?;
             let hole_end = next_ext
                 .first()
                 .and_then(|(k, _)| k.tail_u64())
@@ -1928,6 +2336,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     /// Caller MUST hold `op_lock`.
     async fn resize_file_extents(
         &self,
+        subvol: &str,
         ino: u64,
         old_size: u64,
         new_size: u64,
@@ -1937,13 +2346,13 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             return Ok(());
         }
 
-        // 1. Collect all extents starting at >= new_size without mutating `st.overlay` yet.
+        // 1. Collect all extents starting at >= new_size without mutating `st.overlays` yet.
         let mut delete_extents: Vec<(TreeKey, Option<Digest>, u64)> = Vec::new();
         let mut start = TreeKey::extent_data(ino, new_size);
         let end = TreeKey::kind_end(ino, KIND_EXTENT_DATA);
         let (base_root, read_overlay) = {
             let st = self.state.borrow();
-            (st.subvol_root, st.combined_read_overlay())
+            (st.subvol_root(subvol)?, st.combined_read_overlay(subvol))
         };
         let tree = CowTree::new(&*self.head_store, &self.arena);
         loop {
@@ -2083,23 +2492,26 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         }
 
         // 3. Apply the verified resize plan atomically in one synchronous borrow.
-        {
+        let became_dirty = {
             let mut st = self.state.borrow_mut();
-            if !delete_extents.is_empty() || !matches!(straddle, StraddlePlan::None) {
-                st.user_modified = true;
-                st.mark_dirty(now);
-            }
+            let transitioned =
+                if !delete_extents.is_empty() || !matches!(straddle, StraddlePlan::None) {
+                    st.user_modified = true;
+                    st.mark_dirty(now)
+                } else {
+                    false
+                };
             for (k, dig, len) in delete_extents {
                 if let Some(d) = dig {
                     st.unstage_dirty_block(&d);
                 }
                 st.allocated_bytes = st.allocated_bytes.saturating_sub(len);
-                st.overlay.delete(k);
+                st.overlay_mut(subvol).delete(k);
             }
             match straddle {
                 StraddlePlan::None => {}
                 StraddlePlan::InlineReplace { key, encoded } => {
-                    st.overlay.put(key, encoded);
+                    st.overlay_mut(subvol).put(key, encoded);
                 }
                 StraddlePlan::ExtentSplit {
                     old_key,
@@ -2111,13 +2523,13 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 } => {
                     let was_dirty = st.dirty_block_bytes(&old_digest).is_some();
                     st.unstage_dirty_block(&old_digest);
-                    st.overlay.delete(old_key);
+                    st.overlay_mut(subvol).delete(old_key);
                     st.allocated_bytes = st.allocated_bytes.saturating_sub(u64::from(old_len));
                     if let Some((pre_key, pre_val, pre_len)) = prefix {
                         if was_dirty {
                             st.stage_dirty_block(old_digest, Rc::clone(&old_bytes));
                         }
-                        st.overlay.put(pre_key, pre_val);
+                        st.overlay_mut(subvol).put(pre_key, pre_val);
                         st.allocated_bytes = st.allocated_bytes.saturating_add(u64::from(pre_len));
                     }
                     if let Some(TailBlockPlan {
@@ -2128,45 +2540,51 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                     }) = tail
                     {
                         st.stage_dirty_block(tail_dig, tail_blk);
-                        st.overlay.put(tail_key, tail_val);
+                        st.overlay_mut(subvol).put(tail_key, tail_val);
                         st.allocated_bytes =
                             st.allocated_bytes.saturating_add(u64::from(BLOCK_SIZE));
                     }
                 }
             }
-        }
+            transitioned
+        };
         self.sync_arena_dirty();
+        if became_dirty {
+            self.notify_dirty();
+        }
         Ok(())
     }
 
     /// Resize regular file `ino` to `new_size`, freeing extents past `new_size`, zeroing any
     /// partial tail block, stripping setuid/setgid privileges, and staging the updated inode.
     /// Caller MUST hold `op_lock`.
+    #[allow(clippy::too_many_arguments)]
     async fn resize_file(
         &self,
+        subvol: &str,
         ino: u64,
         inode_item: &mut InodeItem,
         new_size: u64,
         by: &Identity,
         now: Timespec,
     ) -> Result<()> {
-        let mut perm = self.load_perm_node(ino, inode_item).await?;
-        self.resize_file_extents(ino, inode_item.size, new_size, now)
+        let mut perm = self.load_perm_node(subvol, ino, inode_item).await?;
+        self.resize_file_extents(subvol, ino, inode_item.size, new_size, now)
             .await?;
         inode::remove_privs(by, &mut perm);
         inode_item.apply_perm_node(&perm);
         inode_item.size = new_size;
         inode_item.mtime = now;
         inode_item.ctime = now;
-        self.stage_inode(ino, inode_item);
+        self.stage_inode(subvol, ino, inode_item);
         Ok(())
     }
 
     /// Promote an inline extent at offset 0 (if present) into a 64 KiB block so larger/offset
     /// writes operate uniformly on 64 KiB aligned blocks. Caller MUST hold `op_lock`.
-    async fn promote_inline_if_present(&self, ino: u64, now: Timespec) -> Result<()> {
+    async fn promote_inline_if_present(&self, subvol: &str, ino: u64, now: Timespec) -> Result<()> {
         let key0 = TreeKey::extent_data(ino, 0);
-        let Some(raw) = self.tree_get(&key0).await? else {
+        let Some(raw) = self.tree_get(subvol, &key0).await? else {
             return Ok(());
         };
         let ExtentDataValue::Inline(inline_bytes) = ExtentDataValue::decode(&raw)? else {
@@ -2192,23 +2610,29 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             block_offset: 0,
         }
         .encode()?;
-        {
+        let became_dirty = {
             let mut st = self.state.borrow_mut();
             st.user_modified = true;
-            st.mark_dirty(now);
+            let transitioned = st.mark_dirty(now);
             st.allocated_bytes = st.allocated_bytes.saturating_add(u64::from(BLOCK_SIZE));
             st.stage_dirty_block(digest, Rc::new(blk));
-            st.overlay.put(key0, enc);
-        }
+            st.overlay_mut(subvol).put(key0, enc);
+            transitioned
+        };
         self.sync_arena_dirty();
+        if became_dirty {
+            self.notify_dirty();
+        }
         Ok(())
     }
 
     /// Write `data` to regular file `ino` starting at `offset`, using `<= 2 KiB` inline storage
     /// for tiny files and `64 KiB` CoW aligned blocks with `Arena` dirty backpressure for larger
     /// or sparse files. Caller MUST hold `op_lock`.
+    #[allow(clippy::too_many_arguments)]
     async fn write_file_bytes(
         &self,
+        subvol: &str,
         ino: u64,
         inode_item: &mut InodeItem,
         offset: u64,
@@ -2221,7 +2645,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         // Fast path: keep tiny files (`<= 2 KiB`) inline inside the B+tree leaf!
         if inode_item.size <= INLINE_MAX_BYTES as u64 && end <= INLINE_MAX_BYTES as u64 {
             let key0 = TreeKey::extent_data(ino, 0);
-            let existing = self.tree_get(&key0).await?;
+            let existing = self.tree_get(subvol, &key0).await?;
             let can_inline = match existing.as_deref() {
                 None => true,
                 Some(raw) => matches!(ExtentDataValue::decode(raw)?, ExtentDataValue::Inline(_)),
@@ -2240,20 +2664,24 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 buf[offset as usize..end as usize].copy_from_slice(data);
                 let enc = ExtentDataValue::Inline(buf).encode()?;
                 self.maybe_backpressure_flush(enc.len() + 64).await?;
-                {
+                let became_dirty = {
                     let mut st = self.state.borrow_mut();
                     st.user_modified = true;
-                    st.mark_dirty(now);
-                    st.overlay.put(key0, enc);
-                }
+                    let transitioned = st.mark_dirty(now);
+                    st.overlay_mut(subvol).put(key0, enc);
+                    transitioned
+                };
                 inode_item.size = inode_item.size.max(end);
                 self.sync_arena_dirty();
+                if became_dirty {
+                    self.notify_dirty();
+                }
                 return Ok(data.len());
             }
         }
 
         // Promote any existing inline data into block 0 before 64 KiB block writes.
-        self.promote_inline_if_present(ino, now).await?;
+        self.promote_inline_if_present(subvol, ino, now).await?;
 
         let blk_size = u64::from(BLOCK_SIZE);
         let mut done = 0usize;
@@ -2267,6 +2695,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             // Check optional logical capacity ceiling before allocating a brand-new block.
             let existing_cover = self
                 .tree_find_le(
+                    subvol,
                     &TreeKey::kind_start(ino, KIND_EXTENT_DATA),
                     &TreeKey::extent_data(ino, blk_start),
                 )
@@ -2312,7 +2741,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                     inode_item.mode = stripped_mode;
                     inode_item.mtime = now;
                     inode_item.ctime = now;
-                    self.stage_inode(ino, inode_item);
+                    self.stage_inode(subvol, ino, inode_item);
                 }
                 if let Err(e) = self.commit_tx_group_with_lock_mode(true).await {
                     if done > 0 && matches!(e, Errno::ENOSPC | Errno::EDQUOT) {
@@ -2350,7 +2779,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                     let mut st = self.state.borrow_mut();
                     let was_dirty = st.dirty_block_bytes(&old_digest).is_some();
                     st.unstage_dirty_block(&old_digest);
-                    st.overlay.delete(old_key);
+                    st.overlay_mut(subvol).delete(old_key);
                     let mut retained_len = blk_size;
 
                     if blk_start > ext_start {
@@ -2365,7 +2794,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                         if was_dirty && let Some(ref bytes) = old_bytes {
                             st.stage_dirty_block(old_digest, Rc::clone(bytes));
                         }
-                        st.overlay
+                        st.overlay_mut(subvol)
                             .put(TreeKey::extent_data(ino, ext_start), pre_enc);
                     }
                     if ext_end > blk_end {
@@ -2381,7 +2810,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                         if was_dirty && let Some(ref bytes) = old_bytes {
                             st.stage_dirty_block(old_digest, Rc::clone(bytes));
                         }
-                        st.overlay.put(TreeKey::extent_data(ino, blk_end), suf_enc);
+                        st.overlay_mut(subvol)
+                            .put(TreeKey::extent_data(ino, blk_end), suf_enc);
                     }
                     st.allocated_bytes = st
                         .allocated_bytes
@@ -2401,16 +2831,21 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 block_offset: 0,
             }
             .encode()?;
-            {
+            let became_dirty = {
                 let mut st = self.state.borrow_mut();
                 st.user_modified = true;
-                st.mark_dirty(now);
+                let transitioned = st.mark_dirty(now);
                 st.stage_dirty_block(new_digest, Rc::new(blk));
-                st.overlay.put(TreeKey::extent_data(ino, blk_start), enc);
-            }
+                st.overlay_mut(subvol)
+                    .put(TreeKey::extent_data(ino, blk_start), enc);
+                transitioned
+            };
             done += chunk;
             inode_item.size = inode_item.size.max(offset + done as u64);
             self.sync_arena_dirty();
+            if became_dirty {
+                self.notify_dirty();
+            }
         }
         Ok(done)
     }
@@ -2421,12 +2856,13 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
     fn lockable(
         &self,
+        ctx: SubvolCtx<'_>,
         open: &OpenRef,
         family: LockFamily,
         kind: Option<LockKind>,
         range: LockRange,
     ) -> Result<u64> {
-        let (ino, _gen, access, _) = self.open_record_clone(open)?;
+        let (ino, _gen, access, _) = self.open_record_clone(ctx, open)?;
         let allowed = match (family, kind) {
             _ if access == Access::Path => false,
             (LockFamily::Flock, _) | (LockFamily::Posix, None) => true,
@@ -2449,32 +2885,36 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
     fn conflict(
         st: &CowFsState,
+        subvol: &str,
         ino: u64,
         owner: u64,
         family: LockFamily,
         kind: LockKind,
         range: LockRange,
     ) -> Option<Conflict> {
-        st.locks.get(&ino)?.iter().find_map(|lock| {
-            (lock.owner != owner
-                && lock.family == family
-                && lock.range.overlaps(range)
-                && (kind == LockKind::Exclusive || lock.kind == LockKind::Exclusive))
-                .then_some(Conflict {
-                    kind: lock.kind,
-                    range: lock.range,
-                    owner: lock.owner,
-                })
-        })
+        st.locks
+            .get(&(subvol.to_string(), ino))?
+            .iter()
+            .find_map(|lock| {
+                (lock.owner != owner
+                    && lock.family == family
+                    && lock.range.overlaps(range)
+                    && (kind == LockKind::Exclusive || lock.kind == LockKind::Exclusive))
+                    .then_some(Conflict {
+                        kind: lock.kind,
+                        range: lock.range,
+                        owner: lock.owner,
+                    })
+            })
     }
 
-    fn wake_lock_waiters(&self, ino: u64) {
+    fn wake_lock_waiters(&self, subvol: &str, ino: u64) {
         let wakers: Vec<Waker> = self
             .state
             .borrow()
             .waiters
             .values()
-            .filter(|w| w.ino == ino)
+            .filter(|w| w.subvol == subvol && w.ino == ino)
             .map(|w| w.waker.clone())
             .collect();
         for w in wakers {
@@ -2484,20 +2924,22 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
     fn acquire_lock(
         &self,
+        ctx: SubvolCtx<'_>,
         open: &OpenRef,
         family: LockFamily,
         kind: LockKind,
         range: LockRange,
         waker: Option<&Waker>,
     ) -> Result<Option<u64>> {
-        let ino = self.lockable(open, family, Some(kind), range)?;
+        let ino = self.lockable(ctx, open, family, Some(kind), range)?;
         let owner = open.id;
+        let sv_key = (ctx.subvol.to_string(), ino);
 
         // flock conversion drops the old lock before waiting, matching Linux.
         let need_wake = {
             let mut st = self.state.borrow_mut();
             if family == LockFamily::Flock
-                && let Some(locks) = st.locks.get_mut(&ino)
+                && let Some(locks) = st.locks.get_mut(&sv_key)
                 && locks
                     .iter()
                     .any(|l| l.owner == owner && l.family == family && l.kind != kind)
@@ -2509,8 +2951,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             }
         };
         if need_wake {
-            self.wake_lock_waiters(ino);
-            self.lockable(open, family, Some(kind), range)?;
+            self.wake_lock_waiters(ctx.subvol, ino);
+            self.lockable(ctx, open, family, Some(kind), range)?;
         }
 
         let wanted = Lock {
@@ -2520,11 +2962,11 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             range,
         };
         let mut st = self.state.borrow_mut();
-        if Self::conflict(&st, ino, owner, family, kind, range).is_some() {
+        if Self::conflict(&st, ctx.subvol, ino, owner, family, kind, range).is_some() {
             let Some(waker) = waker else {
                 return Err(Errno::EAGAIN);
             };
-            if family == LockFamily::Posix && st.deadlocks(ino, wanted) {
+            if family == LockFamily::Posix && st.deadlocks(ctx.subvol, ino, wanted) {
                 return Err(Errno::EDEADLK);
             }
             let id = st.next_waiter;
@@ -2532,6 +2974,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             st.waiters.insert(
                 id,
                 Waiter {
+                    subvol: ctx.subvol.to_string(),
                     ino,
                     lock: wanted,
                     waker: waker.clone(),
@@ -2540,7 +2983,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             return Ok(Some(id));
         }
 
-        let locks = st.locks.entry(ino).or_default();
+        let locks = st.locks.entry(sv_key).or_default();
         carve(locks, owner, family, range);
         let mut merged = range;
         locks.retain(|l| {
@@ -2558,12 +3001,13 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             range: merged,
         });
         drop(st);
-        self.wake_lock_waiters(ino);
+        self.wake_lock_waiters(ctx.subvol, ino);
         Ok(None)
     }
 
     async fn add_node_in_dir(
         &self,
+        subvol: &str,
         dir_ino: u64,
         dir_item: &mut InodeItem,
         name: &str,
@@ -2578,12 +3022,14 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         } else {
             FileType::File
         };
-        self.add_node_in_dir_with_type(dir_ino, dir_item, name, node, file_type)
+        self.add_node_in_dir_with_type(subvol, dir_ino, dir_item, name, node, file_type)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn add_node_in_dir_with_type(
         &self,
+        subvol: &str,
         dir_ino: u64,
         dir_item: &mut InodeItem,
         name: &str,
@@ -2634,34 +3080,39 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             name: name.to_string(),
         };
 
-        {
+        let became_dirty = {
             let mut st = self.state.borrow_mut();
             st.user_modified = true;
-            st.mark_dirty(now);
-            st.overlay.put(TreeKey::inode_item(ino), item.encode());
-            st.overlay
-                .put(TreeKey::inode_ref(ino, dir_ino, name), Vec::new());
-            st.overlay
-                .put(TreeKey::dir_item(dir_ino, name), di.encode());
-            st.overlay
-                .put(TreeKey::dir_index(dir_ino, dir_index), didx.encode());
-            st.overlay
-                .put(TreeKey::inode_item(dir_ino), dir_item.encode());
-        }
+            let transitioned = st.mark_dirty(now);
+            let ov = st.overlay_mut(subvol);
+            ov.put(TreeKey::inode_item(ino), item.encode());
+            ov.put(TreeKey::inode_ref(ino, dir_ino, name), Vec::new());
+            ov.put(TreeKey::dir_item(dir_ino, name), di.encode());
+            ov.put(TreeKey::dir_index(dir_ino, dir_index), didx.encode());
+            ov.put(TreeKey::inode_item(dir_ino), dir_item.encode());
+            transitioned
+        };
         if acls.access.is_some() || acls.default.is_some() {
-            self.stage_encoded_acls(ino, acls);
+            self.stage_encoded_acls(subvol, ino, acls);
         } else {
             self.sync_arena_dirty();
+        }
+        if became_dirty {
+            self.notify_dirty();
         }
         Ok((ino, item))
     }
 
-    async fn load_user_trusted_xattrs(&self, ino: u64) -> Result<BTreeMap<String, Vec<u8>>> {
+    async fn load_user_trusted_xattrs(
+        &self,
+        subvol: &str,
+        ino: u64,
+    ) -> Result<BTreeMap<String, Vec<u8>>> {
         let mut out = BTreeMap::new();
         let mut start = TreeKey::kind_start(ino, KIND_XATTR_ITEM);
         let end = TreeKey::kind_end(ino, KIND_XATTR_ITEM);
         loop {
-            let batch = self.tree_scan(&start, &end, 128).await?;
+            let batch = self.tree_scan(subvol, &start, &end, 128).await?;
             if batch.is_empty() {
                 break;
             }
@@ -2685,6 +3136,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
     async fn openable(
         &self,
+        subvol: &str,
         cred: &Cred,
         ino: u64,
         item: &InodeItem,
@@ -2701,7 +3153,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if options.is_truncate() {
             mask |= WRITE;
         }
-        let perm = self.load_perm_node(ino, item).await?;
+        let perm = self.load_perm_node(subvol, ino, item).await?;
         inode::may_open(&cred.identity, &perm, mask)?;
         Ok(access)
     }
@@ -2709,6 +3161,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
 struct CowLockWait<'a, H: HeadStore + 'static, P: PackStore + 'static> {
     fs: &'a CowFs<H, P>,
+    ctx: SubvolCtx<'a>,
     open: &'a OpenRef,
     family: LockFamily,
     kind: LockKind,
@@ -2725,7 +3178,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Future for CowLockWait<'_, 
         let (family, kind, range) = (self.family, self.kind, self.range);
         match self
             .fs
-            .acquire_lock(self.open, family, kind, range, Some(cx.waker()))
+            .acquire_lock(self.ctx, self.open, family, kind, range, Some(cx.waker()))
         {
             Ok(Some(id)) => {
                 self.waiting = Some(id);
@@ -2745,46 +3198,40 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Drop for CowLockWait<'_, H,
     }
 }
 
-impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> {
-    fn id(&self) -> &FsId {
-        &self.fs_id
-    }
-
-    fn capabilities(&self) -> FsCapabilities {
-        self.capabilities
-    }
-
-    fn root(&self) -> Handle {
-        self.handle_for(ROOT_INO, self.root_generation)
-    }
-
-    fn lookup<'a>(
+impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
+    fn fs_lookup<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         dir: &'a Handle,
         name: &'a str,
     ) -> BoxFuture<'a, Entry> {
         Box::pin(async move {
-            let (dir_ino, dir_item) = self.check_handle(dir).await?;
+            let (dir_ino, dir_item) = self.check_handle(ctx, dir).await?;
             check_component(name)?;
-            self.searchable(cred, dir_ino, &dir_item).await?;
+            self.searchable(ctx.subvol, cred, dir_ino, &dir_item)
+                .await?;
             let di = self
-                .lookup_dir_item(dir_ino, name)
+                .lookup_dir_item(ctx.subvol, dir_ino, name)
                 .await?
                 .ok_or(Errno::ENOENT)?;
-            let child = self.load_inode(di.child_ino).await?.ok_or(Errno::ESTALE)?;
-            Ok(self.entry_for(di.child_ino, &child))
+            let child = self
+                .load_inode(ctx.subvol, di.child_ino)
+                .await?
+                .ok_or(Errno::ESTALE)?;
+            Ok(Self::entry_for(ctx, di.child_ino, &child))
         })
     }
 
-    fn walk<'a>(
+    fn fs_walk<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         dir: &'a Handle,
         names: &'a [String],
     ) -> BoxFuture<'a, Walked> {
         Box::pin(async move {
-            let (mut cur_ino, mut cur_item) = self.check_handle(dir).await?;
+            let (mut cur_ino, mut cur_item) = self.check_handle(ctx, dir).await?;
             for name in names {
                 check_component(name)?;
             }
@@ -2800,11 +3247,15 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                         return Ok(Walked { entries, stop });
                     }
                 }
-                self.searchable(cred, cur_ino, &cur_item).await?;
-                match self.lookup_dir_item(cur_ino, name).await? {
+                self.searchable(ctx.subvol, cred, cur_ino, &cur_item)
+                    .await?;
+                match self.lookup_dir_item(ctx.subvol, cur_ino, name).await? {
                     Some(di) => {
-                        let child = self.load_inode(di.child_ino).await?.ok_or(Errno::ESTALE)?;
-                        entries.push(self.entry_for(di.child_ino, &child));
+                        let child = self
+                            .load_inode(ctx.subvol, di.child_ino)
+                            .await?
+                            .ok_or(Errno::ESTALE)?;
+                        entries.push(Self::entry_for(ctx, di.child_ino, &child));
                         cur_ino = di.child_ino;
                         cur_item = child;
                     }
@@ -2823,13 +3274,14 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         })
     }
 
-    fn parent<'a>(
+    fn fs_parent<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         _cred: &'a Cred,
         dir: &'a Handle,
     ) -> BoxFuture<'a, Option<(Entry, String)>> {
         Box::pin(async move {
-            let (dir_ino, dir_item) = self.check_handle(dir).await?;
+            let (dir_ino, dir_item) = self.check_handle(ctx, dir).await?;
             if dir_item.file_type != FileType::Dir {
                 return Err(Errno::ENOTDIR);
             }
@@ -2841,6 +3293,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             }
             let refs = self
                 .tree_scan(
+                    ctx.subvol,
                     &TreeKey::kind_start(dir_ino, KIND_INODE_REF),
                     &TreeKey::kind_end(dir_ino, KIND_INODE_REF),
                     1,
@@ -2852,25 +3305,31 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             let Some((parent_ino, name)) = key.tail_inode_ref() else {
                 return Err(Errno::EIO);
             };
-            let Some(parent_item) = self.load_inode(parent_ino).await? else {
+            let Some(parent_item) = self.load_inode(ctx.subvol, parent_ino).await? else {
                 return Err(Errno::ENOENT);
             };
             Ok(Some((
-                self.entry_for(parent_ino, &parent_item),
+                Self::entry_for(ctx, parent_ino, &parent_item),
                 name.to_string(),
             )))
         })
     }
 
-    fn metadata<'a>(&'a self, _cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, Metadata> {
+    fn fs_metadata<'a>(
+        &'a self,
+        ctx: SubvolCtx<'a>,
+        _cred: &'a Cred,
+        handle: &'a Handle,
+    ) -> BoxFuture<'a, Metadata> {
         Box::pin(async move {
-            let (_, item) = self.check_handle(handle).await?;
+            let (_, item) = self.check_handle(ctx, handle).await?;
             Ok(item.to_metadata())
         })
     }
 
-    fn setattr<'a>(
+    fn fs_setattr<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         handle: &'a Handle,
         attr: &'a SetAttr,
@@ -2878,12 +3337,12 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         Box::pin(async move {
             let _op = self.op_lock.lock().await;
             self.check_rw()?;
-            let (ino, mut item) = self.check_handle(handle).await?;
+            let (ino, mut item) = self.check_handle(ctx, handle).await?;
             if *attr == SetAttr::default() {
                 return Ok(item.to_metadata());
             }
             let who = &cred.identity;
-            let orig_perm = self.load_perm_node(ino, &item).await?;
+            let orig_perm = self.load_perm_node(ctx.subvol, ino, &item).await?;
             let mut perm = orig_perm.clone();
             if let Some(mode) = attr.mode {
                 inode::chmod(who, &mut perm, mode)?;
@@ -2906,12 +3365,13 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             let acls = Self::encode_perm_acls(&perm)?;
             let now = (self.clock)();
             if let Some(size) = attr.size {
-                self.resize_file_extents(ino, item.size, size, now).await?;
+                self.resize_file_extents(ctx.subvol, ino, item.size, size, now)
+                    .await?;
                 item.size = size;
                 item.mtime = now;
             }
             item.apply_perm_node(&perm);
-            self.stage_encoded_acls(ino, acls);
+            self.stage_encoded_acls(ctx.subvol, ino, acls);
             if let Some((sec, nsec)) = inode::time(attr.atime, (now.sec, now.nsec)) {
                 item.atime = Timespec { sec, nsec };
             }
@@ -2919,18 +3379,23 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 item.mtime = Timespec { sec, nsec };
             }
             item.ctime = now;
-            self.stage_inode(ino, &item);
+            self.stage_inode(ctx.subvol, ino, &item);
             Ok(item.to_metadata())
         })
     }
 
-    fn read_dir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle) -> BoxFuture<'a, Vec<DirEntry>> {
+    fn fs_read_dir<'a>(
+        &'a self,
+        ctx: SubvolCtx<'a>,
+        cred: &'a Cred,
+        dir: &'a Handle,
+    ) -> BoxFuture<'a, Vec<DirEntry>> {
         Box::pin(async move {
-            let (dir_ino, dir_item) = self.check_handle(dir).await?;
+            let (dir_ino, dir_item) = self.check_handle(ctx, dir).await?;
             if dir_item.file_type != FileType::Dir {
                 return Err(Errno::ENOTDIR);
             }
-            let perm = self.load_perm_node(dir_ino, &dir_item).await?;
+            let perm = self.load_perm_node(ctx.subvol, dir_ino, &dir_item).await?;
             inode::require(&cred.identity, &perm, READ)?;
             if dir_item.nlink == 0 {
                 return Err(Errno::ENOENT);
@@ -2939,7 +3404,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             let mut start = TreeKey::kind_start(dir_ino, KIND_DIR_ITEM);
             let end = TreeKey::kind_end(dir_ino, KIND_DIR_ITEM);
             loop {
-                let batch = self.tree_scan(&start, &end, 512).await?;
+                let batch = self.tree_scan(ctx.subvol, &start, &end, 512).await?;
                 if batch.is_empty() {
                     break;
                 }
@@ -2964,7 +3429,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 tail.push(0);
                 start = TreeKey::new(last.ino, last.kind, tail);
             }
-            self.update_atime_if_needed(dir_ino, dir_item.generation, &dir_item, true)
+            self.update_atime_if_needed(ctx.subvol, dir_ino, dir_item.generation, &dir_item, true)
                 .await;
             Ok(out)
         })
@@ -2973,19 +3438,20 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
     /// Native O(log N + page) paged enumeration directly over `0x21` `DIR_INDEX` keys!
     /// Never loads the full directory into memory — enumerates 100k+ entries cleanly inside the
     /// `32 MiB` wasm32 slab arena.
-    fn read_dir_page<'a>(
+    fn fs_read_dir_page<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         dir: &'a Handle,
         cookie: u64,
         max_entries: usize,
     ) -> BoxFuture<'a, DirPage> {
         Box::pin(async move {
-            let (dir_ino, dir_item) = self.check_handle(dir).await?;
+            let (dir_ino, dir_item) = self.check_handle(ctx, dir).await?;
             if dir_item.file_type != FileType::Dir {
                 return Err(Errno::ENOTDIR);
             }
-            let perm = self.load_perm_node(dir_ino, &dir_item).await?;
+            let perm = self.load_perm_node(ctx.subvol, dir_ino, &dir_item).await?;
             inode::require(&cred.identity, &perm, READ)?;
             if dir_item.nlink == 0 {
                 return Err(Errno::ENOENT);
@@ -2995,10 +3461,16 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             let end = TreeKey::kind_end(dir_ino, KIND_DIR_INDEX);
 
             if max_entries == 0 {
-                let peek = self.tree_scan(&start, &end, 1).await?;
+                let peek = self.tree_scan(ctx.subvol, &start, &end, 1).await?;
                 let next_cookie = peek.first().and_then(|(k, _)| k.tail_u64());
-                self.update_atime_if_needed(dir_ino, dir_item.generation, &dir_item, true)
-                    .await;
+                self.update_atime_if_needed(
+                    ctx.subvol,
+                    dir_ino,
+                    dir_item.generation,
+                    &dir_item,
+                    true,
+                )
+                .await;
                 return Ok(DirPage {
                     entries: Vec::new(),
                     next_cookie,
@@ -3006,7 +3478,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             }
 
             let limit = max_entries.min(DIR_PAGE_MAX);
-            let batch = self.tree_scan(&start, &end, limit + 1).await?;
+            let batch = self.tree_scan(ctx.subvol, &start, &end, limit + 1).await?;
             let has_more = batch.len() > limit;
             let next_cookie = if has_more {
                 batch[limit].0.tail_u64()
@@ -3025,7 +3497,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                     file_type: dv.file_type,
                 });
             }
-            self.update_atime_if_needed(dir_ino, dir_item.generation, &dir_item, true)
+            self.update_atime_if_needed(ctx.subvol, dir_ino, dir_item.generation, &dir_item, true)
                 .await;
             Ok(DirPage {
                 entries,
@@ -3034,18 +3506,25 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         })
     }
 
-    fn read_link<'a>(&'a self, _cred: &'a Cred, link: &'a Handle) -> BoxFuture<'a, String> {
+    fn fs_read_link<'a>(
+        &'a self,
+        ctx: SubvolCtx<'a>,
+        _cred: &'a Cred,
+        link: &'a Handle,
+    ) -> BoxFuture<'a, String> {
         Box::pin(async move {
-            let (ino, item) = self.check_handle(link).await?;
+            let (ino, item) = self.check_handle(ctx, link).await?;
             let target = item.symlink_target.clone().ok_or(Errno::EINVAL)?;
-            self.update_atime_if_needed(ino, item.generation, &item, false)
+            self.update_atime_if_needed(ctx.subvol, ino, item.generation, &item, false)
                 .await;
             Ok(target)
         })
     }
 
-    fn create<'a>(
+    #[allow(clippy::too_many_arguments)]
+    fn fs_create<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         dir: &'a Handle,
         name: &'a str,
@@ -3059,43 +3538,56 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             if matches!(access, Access::Exec | Access::Path) {
                 return Err(Errno::EINVAL);
             }
-            let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
+            let (dir_ino, mut dir_item) = self.check_handle(ctx, dir).await?;
             check_component(name)?;
-            let parent_perm = self.searchable(cred, dir_ino, &dir_item).await?;
-            if let Some(di) = self.lookup_dir_item(dir_ino, name).await? {
+            let parent_perm = self
+                .searchable(ctx.subvol, cred, dir_ino, &dir_item)
+                .await?;
+            if let Some(di) = self.lookup_dir_item(ctx.subvol, dir_ino, name).await? {
                 if options.is_create_new() {
                     return Err(Errno::EEXIST);
                 }
-                let mut existing = self.load_inode(di.child_ino).await?.ok_or(Errno::ESTALE)?;
+                let mut existing = self
+                    .load_inode(ctx.subvol, di.child_ino)
+                    .await?
+                    .ok_or(Errno::ESTALE)?;
                 if existing.file_type == FileType::Dir {
                     return Err(Errno::EISDIR);
                 }
                 if existing.file_type == FileType::Socket {
                     return Err(Errno::ENXIO);
                 }
-                self.openable(cred, di.child_ino, &existing, options)
+                self.openable(ctx.subvol, cred, di.child_ino, &existing, options)
                     .await?;
                 if options.is_truncate() && existing.file_type == FileType::File {
                     let now = (self.clock)();
-                    self.resize_file(di.child_ino, &mut existing, 0, &cred.identity, now)
-                        .await?;
+                    self.resize_file(
+                        ctx.subvol,
+                        di.child_ino,
+                        &mut existing,
+                        0,
+                        &cred.identity,
+                        now,
+                    )
+                    .await?;
                 }
-                let open = self.new_open(cred, di.child_ino, existing.generation, access);
-                return Ok((self.entry_for(di.child_ino, &existing), open));
+                let open = self.new_open(ctx, cred, di.child_ino, existing.generation, access);
+                return Ok((Self::entry_for(ctx, di.child_ino, &existing), open));
             }
 
             inode::may_create(&cred.identity, &parent_perm, dir_item.nlink == 0)?;
             let node = created(&cred.identity, &parent_perm, mode, false, cred.umask);
             let (ino, item) = self
-                .add_node_in_dir(dir_ino, &mut dir_item, name, node)
+                .add_node_in_dir(ctx.subvol, dir_ino, &mut dir_item, name, node)
                 .await?;
-            let open = self.new_open(cred, ino, item.generation, access);
-            Ok((self.entry_for(ino, &item), open))
+            let open = self.new_open(ctx, cred, ino, item.generation, access);
+            Ok((Self::entry_for(ctx, ino, &item), open))
         })
     }
 
-    fn mkdir<'a>(
+    fn fs_mkdir<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         dir: &'a Handle,
         name: &'a str,
@@ -3104,23 +3596,31 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         Box::pin(async move {
             let _op = self.op_lock.lock().await;
             self.check_rw()?;
-            let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
+            let (dir_ino, mut dir_item) = self.check_handle(ctx, dir).await?;
             check_component(name)?;
-            let parent_perm = self.searchable(cred, dir_ino, &dir_item).await?;
-            if self.lookup_dir_item(dir_ino, name).await?.is_some() {
+            let parent_perm = self
+                .searchable(ctx.subvol, cred, dir_ino, &dir_item)
+                .await?;
+            if self
+                .lookup_dir_item(ctx.subvol, dir_ino, name)
+                .await?
+                .is_some()
+            {
                 return Err(Errno::EEXIST);
             }
             inode::may_create(&cred.identity, &parent_perm, dir_item.nlink == 0)?;
             let node = created(&cred.identity, &parent_perm, mode, true, cred.umask);
             let (ino, item) = self
-                .add_node_in_dir(dir_ino, &mut dir_item, name, node)
+                .add_node_in_dir(ctx.subvol, dir_ino, &mut dir_item, name, node)
                 .await?;
-            Ok(self.entry_for(ino, &item))
+            Ok(Self::entry_for(ctx, ino, &item))
         })
     }
 
-    fn mknod<'a>(
+    #[allow(clippy::too_many_arguments)]
+    fn fs_mknod<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         dir: &'a Handle,
         name: &'a str,
@@ -3130,27 +3630,36 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         Box::pin(async move {
             let _op = self.op_lock.lock().await;
             self.check_rw()?;
-            if cred.identity.id != 0 {
+            if !rdev.is_empty() && cred.identity.id != 0 {
                 return Err(Errno::EPERM);
             }
-            let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
+            let (dir_ino, mut dir_item) = self.check_handle(ctx, dir).await?;
             check_component(name)?;
-            let parent_perm = self.searchable(cred, dir_ino, &dir_item).await?;
-            if self.lookup_dir_item(dir_ino, name).await?.is_some() {
+            let parent_perm = self
+                .searchable(ctx.subvol, cred, dir_ino, &dir_item)
+                .await?;
+            if self
+                .lookup_dir_item(ctx.subvol, dir_ino, name)
+                .await?
+                .is_some()
+            {
                 return Err(Errno::EEXIST);
             }
             inode::may_create(&cred.identity, &parent_perm, dir_item.nlink == 0)?;
             let mut node = created(&cred.identity, &parent_perm, mode, false, cred.umask);
-            node.rdev = Some(rdev.to_string());
+            if !rdev.is_empty() {
+                node.rdev = Some(rdev.to_string());
+            }
             let (ino, item) = self
-                .add_node_in_dir(dir_ino, &mut dir_item, name, node)
+                .add_node_in_dir(ctx.subvol, dir_ino, &mut dir_item, name, node)
                 .await?;
-            Ok(self.entry_for(ino, &item))
+            Ok(Self::entry_for(ctx, ino, &item))
         })
     }
 
-    fn mksock<'a>(
+    fn fs_mksock<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         dir: &'a Handle,
         name: &'a str,
@@ -3159,23 +3668,37 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         Box::pin(async move {
             let _op = self.op_lock.lock().await;
             self.check_rw()?;
-            let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
+            let (dir_ino, mut dir_item) = self.check_handle(ctx, dir).await?;
             check_component(name)?;
-            let parent_perm = self.searchable(cred, dir_ino, &dir_item).await?;
-            if self.lookup_dir_item(dir_ino, name).await?.is_some() {
+            let parent_perm = self
+                .searchable(ctx.subvol, cred, dir_ino, &dir_item)
+                .await?;
+            if self
+                .lookup_dir_item(ctx.subvol, dir_ino, name)
+                .await?
+                .is_some()
+            {
                 return Err(Errno::EEXIST);
             }
             inode::may_create(&cred.identity, &parent_perm, dir_item.nlink == 0)?;
             let node = created(&cred.identity, &parent_perm, mode, false, cred.umask);
             let (ino, item) = self
-                .add_node_in_dir_with_type(dir_ino, &mut dir_item, name, node, FileType::Socket)
+                .add_node_in_dir_with_type(
+                    ctx.subvol,
+                    dir_ino,
+                    &mut dir_item,
+                    name,
+                    node,
+                    FileType::Socket,
+                )
                 .await?;
-            Ok(self.entry_for(ino, &item))
+            Ok(Self::entry_for(ctx, ino, &item))
         })
     }
 
-    fn symlink<'a>(
+    fn fs_symlink<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         dir: &'a Handle,
         name: &'a str,
@@ -3185,23 +3708,30 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             let _op = self.op_lock.lock().await;
             self.check_rw()?;
             inode::check_link_target(target)?;
-            let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
+            let (dir_ino, mut dir_item) = self.check_handle(ctx, dir).await?;
             check_component(name)?;
-            let parent_perm = self.searchable(cred, dir_ino, &dir_item).await?;
-            if self.lookup_dir_item(dir_ino, name).await?.is_some() {
+            let parent_perm = self
+                .searchable(ctx.subvol, cred, dir_ino, &dir_item)
+                .await?;
+            if self
+                .lookup_dir_item(ctx.subvol, dir_ino, name)
+                .await?
+                .is_some()
+            {
                 return Err(Errno::EEXIST);
             }
             inode::may_create(&cred.identity, &parent_perm, dir_item.nlink == 0)?;
             let node = inode::new_symlink(&cred.identity, &parent_perm, target);
             let (ino, item) = self
-                .add_node_in_dir(dir_ino, &mut dir_item, name, node)
+                .add_node_in_dir(ctx.subvol, dir_ino, &mut dir_item, name, node)
                 .await?;
-            Ok(self.entry_for(ino, &item))
+            Ok(Self::entry_for(ctx, ino, &item))
         })
     }
 
-    fn link<'a>(
+    fn fs_link<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         target: &'a Handle,
         dir: &'a Handle,
@@ -3210,14 +3740,22 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         Box::pin(async move {
             let _op = self.op_lock.lock().await;
             self.check_rw()?;
-            let (target_ino, mut target_item) = self.check_handle(target).await?;
-            let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
+            let (target_ino, mut target_item) = self.check_handle(ctx, target).await?;
+            let (dir_ino, mut dir_item) = self.check_handle(ctx, dir).await?;
             check_component(name)?;
-            let parent_perm = self.searchable(cred, dir_ino, &dir_item).await?;
-            if self.lookup_dir_item(dir_ino, name).await?.is_some() {
+            let parent_perm = self
+                .searchable(ctx.subvol, cred, dir_ino, &dir_item)
+                .await?;
+            if self
+                .lookup_dir_item(ctx.subvol, dir_ino, name)
+                .await?
+                .is_some()
+            {
                 return Err(Errno::EEXIST);
             }
-            let target_perm = self.load_perm_node(target_ino, &target_item).await?;
+            let target_perm = self
+                .load_perm_node(ctx.subvol, target_ino, &target_item)
+                .await?;
             inode::may_link(&cred.identity, &target_perm)?;
             inode::may_create(&cred.identity, &parent_perm, dir_item.nlink == 0)?;
             if target_item.nlink == 0 {
@@ -3244,46 +3782,64 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 file_type: target_item.file_type,
                 name: name.to_string(),
             };
-            {
+            let became_dirty = {
                 let mut st = self.state.borrow_mut();
                 st.user_modified = true;
-                st.mark_dirty(now);
-                st.overlay
-                    .put(TreeKey::dir_item(dir_ino, name), di.encode());
-                st.overlay
-                    .put(TreeKey::dir_index(dir_ino, dir_index), didx.encode());
-                st.overlay
-                    .put(TreeKey::inode_ref(target_ino, dir_ino, name), Vec::new());
-                st.overlay
-                    .put(TreeKey::inode_item(dir_ino), dir_item.encode());
-                st.overlay
-                    .put(TreeKey::inode_item(target_ino), target_item.encode());
-            }
+                let transitioned = st.mark_dirty(now);
+                let ov = st.overlay_mut(ctx.subvol);
+                ov.put(TreeKey::dir_item(dir_ino, name), di.encode());
+                ov.put(TreeKey::dir_index(dir_ino, dir_index), didx.encode());
+                ov.put(TreeKey::inode_ref(target_ino, dir_ino, name), Vec::new());
+                ov.put(TreeKey::inode_item(dir_ino), dir_item.encode());
+                ov.put(TreeKey::inode_item(target_ino), target_item.encode());
+                transitioned
+            };
             self.sync_arena_dirty();
-            Ok(self.entry_for(target_ino, &target_item))
+            if became_dirty {
+                self.notify_dirty();
+            }
+            Ok(Self::entry_for(ctx, target_ino, &target_item))
         })
     }
 
-    fn unlink<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
-        Box::pin(async move { self.do_remove(cred, dir, name, false, None).await })
+    fn fs_unlink<'a>(
+        &'a self,
+        ctx: SubvolCtx<'a>,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move { self.do_remove(ctx, cred, dir, name, false, None).await })
     }
 
-    fn unlink_if<'a>(
+    fn fs_unlink_if<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         dir: &'a Handle,
         name: &'a str,
         node: NodeId,
     ) -> BoxFuture<'a, ()> {
-        Box::pin(async move { self.do_remove(cred, dir, name, false, Some(node)).await })
+        Box::pin(async move {
+            self.do_remove(ctx, cred, dir, name, false, Some(node))
+                .await
+        })
     }
 
-    fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
-        Box::pin(async move { self.do_remove(cred, dir, name, true, None).await })
-    }
-
-    fn rename<'a>(
+    fn fs_rmdir<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move { self.do_remove(ctx, cred, dir, name, true, None).await })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fs_rename<'a>(
+        &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         from_dir: &'a Handle,
         from: &'a str,
@@ -3295,18 +3851,22 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             let _op = self.op_lock.lock().await;
             self.check_rw()?;
             let who = &cred.identity;
-            let (from_dir_ino, mut from_dir_item) = self.check_handle(from_dir).await?;
-            let (to_dir_ino, mut to_dir_item) = self.check_handle(to_dir).await?;
+            let (from_dir_ino, mut from_dir_item) = self.check_handle(ctx, from_dir).await?;
+            let (to_dir_ino, mut to_dir_item) = self.check_handle(ctx, to_dir).await?;
             check_component(from)?;
             check_component(to)?;
-            let from_perm = self.searchable(cred, from_dir_ino, &from_dir_item).await?;
-            let to_perm = self.searchable(cred, to_dir_ino, &to_dir_item).await?;
+            let from_perm = self
+                .searchable(ctx.subvol, cred, from_dir_ino, &from_dir_item)
+                .await?;
+            let to_perm = self
+                .searchable(ctx.subvol, cred, to_dir_ino, &to_dir_item)
+                .await?;
 
             let src_di = self
-                .lookup_dir_item(from_dir_ino, from)
+                .lookup_dir_item(ctx.subvol, from_dir_ino, from)
                 .await?
                 .ok_or(Errno::ENOENT)?;
-            let dst_di = self.lookup_dir_item(to_dir_ino, to).await?;
+            let dst_di = self.lookup_dir_item(ctx.subvol, to_dir_ino, to).await?;
             if dst_di.is_some() && flags.contains(RenameFlags::NOREPLACE) {
                 return Err(Errno::EEXIST);
             }
@@ -3315,21 +3875,32 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             }
 
             let mut src_item = self
-                .load_inode(src_di.child_ino)
+                .load_inode(ctx.subvol, src_di.child_ino)
                 .await?
                 .ok_or(Errno::ESTALE)?;
             let moving_dir = src_item.file_type == FileType::Dir;
-            if moving_dir && self.is_ancestor(src_di.child_ino, to_dir_ino).await? {
+            if moving_dir
+                && self
+                    .is_ancestor(ctx.subvol, src_di.child_ino, to_dir_ino)
+                    .await?
+            {
                 return Err(Errno::EINVAL);
             }
-            let src_perm = self.load_perm_node(src_di.child_ino, &src_item).await?;
+            let src_perm = self
+                .load_perm_node(ctx.subvol, src_di.child_ino, &src_item)
+                .await?;
             inode::may_delete(who, &from_perm, &src_perm)?;
 
             let mut target_opt = None;
             match dst_di {
                 Some(tdi) => {
-                    let target_item = self.load_inode(tdi.child_ino).await?.ok_or(Errno::ESTALE)?;
-                    let target_perm = self.load_perm_node(tdi.child_ino, &target_item).await?;
+                    let target_item = self
+                        .load_inode(ctx.subvol, tdi.child_ino)
+                        .await?
+                        .ok_or(Errno::ESTALE)?;
+                    let target_perm = self
+                        .load_perm_node(ctx.subvol, tdi.child_ino, &target_item)
+                        .await?;
                     inode::may_delete(who, &to_perm, &target_perm)?;
                     match (moving_dir, target_item.file_type == FileType::Dir) {
                         (true, false) => return Err(Errno::ENOTDIR),
@@ -3337,7 +3908,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                         _ => {}
                     }
                     if target_item.file_type == FileType::Dir
-                        && !self.dir_is_empty(tdi.child_ino).await?
+                        && !self.dir_is_empty(ctx.subvol, tdi.child_ino).await?
                     {
                         return Err(Errno::ENOTEMPTY);
                     }
@@ -3356,15 +3927,18 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
 
             // Handle replaced target (if any).
             if let Some((tdi, mut target_item)) = target_opt {
-                {
+                let became_dirty = {
                     let mut st = self.state.borrow_mut();
                     st.user_modified = true;
-                    st.mark_dirty(now);
-                    st.overlay.delete(TreeKey::dir_item(to_dir_ino, to));
-                    st.overlay
-                        .delete(TreeKey::dir_index(to_dir_ino, tdi.dir_index));
-                    st.overlay
-                        .delete(TreeKey::inode_ref(tdi.child_ino, to_dir_ino, to));
+                    let transitioned = st.mark_dirty(now);
+                    let ov = st.overlay_mut(ctx.subvol);
+                    ov.delete(TreeKey::dir_item(to_dir_ino, to));
+                    ov.delete(TreeKey::dir_index(to_dir_ino, tdi.dir_index));
+                    ov.delete(TreeKey::inode_ref(tdi.child_ino, to_dir_ino, to));
+                    transitioned
+                };
+                if became_dirty {
+                    self.notify_dirty();
                 }
                 if moving_dir {
                     to_dir_item.nlink = to_dir_item.nlink.saturating_sub(1);
@@ -3373,8 +3947,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                     target_item.nlink = target_item.nlink.saturating_sub(1);
                 }
                 target_item.ctime = now;
-                self.stage_inode(tdi.child_ino, &target_item);
-                self.reclaim_if_dead_locked(tdi.child_ino, &target_item)
+                self.stage_inode(ctx.subvol, tdi.child_ino, &target_item);
+                self.reclaim_if_dead_locked(ctx.subvol, tdi.child_ino, &target_item)
                     .await?;
             }
 
@@ -3415,51 +3989,51 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 file_type: src_item.file_type,
                 name: to.to_string(),
             };
-            {
+            let became_dirty = {
                 let mut st = self.state.borrow_mut();
                 st.user_modified = true;
-                st.mark_dirty(now);
-                st.overlay.delete(TreeKey::dir_item(from_dir_ino, from));
-                st.overlay
-                    .delete(TreeKey::dir_index(from_dir_ino, src_di.dir_index));
-                st.overlay
-                    .delete(TreeKey::inode_ref(src_di.child_ino, from_dir_ino, from));
+                let transitioned = st.mark_dirty(now);
+                let ov = st.overlay_mut(ctx.subvol);
+                ov.delete(TreeKey::dir_item(from_dir_ino, from));
+                ov.delete(TreeKey::dir_index(from_dir_ino, src_di.dir_index));
+                ov.delete(TreeKey::inode_ref(src_di.child_ino, from_dir_ino, from));
 
-                st.overlay
-                    .put(TreeKey::dir_item(to_dir_ino, to), new_di.encode());
-                st.overlay.put(
+                ov.put(TreeKey::dir_item(to_dir_ino, to), new_di.encode());
+                ov.put(
                     TreeKey::dir_index(to_dir_ino, new_dir_index),
                     new_didx.encode(),
                 );
-                st.overlay.put(
+                ov.put(
                     TreeKey::inode_ref(src_di.child_ino, to_dir_ino, to),
                     Vec::new(),
                 );
 
-                st.overlay
-                    .put(TreeKey::inode_item(from_dir_ino), from_dir_item.encode());
+                ov.put(TreeKey::inode_item(from_dir_ino), from_dir_item.encode());
                 if !same_dir {
-                    st.overlay
-                        .put(TreeKey::inode_item(to_dir_ino), to_dir_item.encode());
+                    ov.put(TreeKey::inode_item(to_dir_ino), to_dir_item.encode());
                 }
-                st.overlay
-                    .put(TreeKey::inode_item(src_di.child_ino), src_item.encode());
-            }
+                ov.put(TreeKey::inode_item(src_di.child_ino), src_item.encode());
+                transitioned
+            };
             self.sync_arena_dirty();
+            if became_dirty {
+                self.notify_dirty();
+            }
             Ok(())
         })
     }
 
-    fn getxattr<'a>(
+    fn fs_getxattr<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         handle: &'a Handle,
         name: &'a str,
     ) -> BoxFuture<'a, Vec<u8>> {
         Box::pin(async move {
             let space = xattr::space(name)?;
-            let (ino, item) = self.check_handle(handle).await?;
-            let perm = self.load_perm_node(ino, &item).await?;
+            let (ino, item) = self.check_handle(ctx, handle).await?;
+            let perm = self.load_perm_node(ctx.subvol, ino, &item).await?;
             xattr::readable(&cred.identity, &perm, space)?;
             match space {
                 Space::Access | Space::Default => {
@@ -3467,15 +4041,17 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                     Ok(serde_json::to_vec(&entries).unwrap_or_default())
                 }
                 Space::User | Space::Trusted => self
-                    .tree_get(&TreeKey::xattr_item(ino, name))
+                    .tree_get(ctx.subvol, &TreeKey::xattr_item(ino, name))
                     .await?
                     .ok_or(Errno::ENODATA),
             }
         })
     }
 
-    fn setxattr<'a>(
+    #[allow(clippy::too_many_arguments)]
+    fn fs_setxattr<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         handle: &'a Handle,
         name: &'a str,
@@ -3486,8 +4062,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             let _op = self.op_lock.lock().await;
             self.check_rw()?;
             let space = xattr::space(name)?;
-            let (ino, mut item) = self.check_handle(handle).await?;
-            let mut perm = self.load_perm_node(ino, &item).await?;
+            let (ino, mut item) = self.check_handle(ctx, handle).await?;
+            let mut perm = self.load_perm_node(ctx.subvol, ino, &item).await?;
             xattr::settable(&cred.identity, &perm, space)?;
             match space {
                 Space::Access | Space::Default => {
@@ -3498,48 +4074,58 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                     let entries: Entries =
                         serde_json::from_slice(value).map_err(|_| Errno::EINVAL)?;
                     xattr::set_acl(&cred.identity, &mut perm, space, entries)?;
-                    // Enforce `xattr::VALUE_MAX` BEFORE mutating `item` or `st.overlay`!
+                    // Enforce `xattr::VALUE_MAX` BEFORE mutating `item` or `st.overlays`!
                     let acls = Self::encode_perm_acls(&perm)?;
                     let est = acls.access.as_ref().map_or(0, Vec::len)
                         + acls.default.as_ref().map_or(0, Vec::len)
                         + 128;
                     self.maybe_backpressure_flush(est).await?;
                     item.apply_perm_node(&perm);
-                    self.stage_encoded_acls(ino, acls);
+                    self.stage_encoded_acls(ctx.subvol, ino, acls);
                 }
                 Space::User | Space::Trusted => {
-                    let mut attrs = self.load_user_trusted_xattrs(ino).await?;
+                    let mut attrs = self.load_user_trusted_xattrs(ctx.subvol, ino).await?;
                     xattr::check_flags(flags.bits(), attrs.contains_key(name))?;
                     xattr::store(&mut attrs, name, value)?;
                     self.maybe_backpressure_flush(name.len() + value.len() + 64)
                         .await?;
                     let now = (self.clock)();
-                    {
+                    let became_dirty = {
                         let mut st = self.state.borrow_mut();
                         st.user_modified = true;
-                        st.mark_dirty(now);
-                        st.overlay
+                        let transitioned = st.mark_dirty(now);
+                        st.overlay_mut(ctx.subvol)
                             .put(TreeKey::xattr_item(ino, name), value.to_vec());
+                        transitioned
+                    };
+                    if became_dirty {
+                        self.notify_dirty();
                     }
                 }
             }
             item.ctime = (self.clock)();
-            self.stage_inode(ino, &item);
+            self.stage_inode(ctx.subvol, ino, &item);
             Ok(())
         })
     }
 
-    fn listxattr<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, Vec<String>> {
+    fn fs_listxattr<'a>(
+        &'a self,
+        ctx: SubvolCtx<'a>,
+        cred: &'a Cred,
+        handle: &'a Handle,
+    ) -> BoxFuture<'a, Vec<String>> {
         Box::pin(async move {
-            let (ino, item) = self.check_handle(handle).await?;
-            let perm = self.load_perm_node(ino, &item).await?;
-            let attrs = self.load_user_trusted_xattrs(ino).await?;
+            let (ino, item) = self.check_handle(ctx, handle).await?;
+            let perm = self.load_perm_node(ctx.subvol, ino, &item).await?;
+            let attrs = self.load_user_trusted_xattrs(ctx.subvol, ino).await?;
             Ok(xattr::listed(&cred.identity, &perm, attrs.keys()))
         })
     }
 
-    fn removexattr<'a>(
+    fn fs_removexattr<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         handle: &'a Handle,
         name: &'a str,
@@ -3548,40 +4134,45 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             let _op = self.op_lock.lock().await;
             self.check_rw()?;
             let space = xattr::space(name)?;
-            let (ino, mut item) = self.check_handle(handle).await?;
-            let mut perm = self.load_perm_node(ino, &item).await?;
+            let (ino, mut item) = self.check_handle(ctx, handle).await?;
+            let mut perm = self.load_perm_node(ctx.subvol, ino, &item).await?;
             xattr::settable(&cred.identity, &perm, space)?;
             match space {
                 Space::Access | Space::Default => {
                     xattr::remove_acl(&mut perm, space)?;
                     let acls = Self::encode_perm_acls(&perm)?;
                     item.apply_perm_node(&perm);
-                    self.stage_encoded_acls(ino, acls);
+                    self.stage_encoded_acls(ctx.subvol, ino, acls);
                 }
                 Space::User | Space::Trusted => {
                     if self
-                        .tree_get(&TreeKey::xattr_item(ino, name))
+                        .tree_get(ctx.subvol, &TreeKey::xattr_item(ino, name))
                         .await?
                         .is_none()
                     {
                         return Err(Errno::ENODATA);
                     }
                     let now = (self.clock)();
-                    {
+                    let became_dirty = {
                         let mut st = self.state.borrow_mut();
                         st.user_modified = true;
-                        st.mark_dirty(now);
-                        st.overlay.delete(TreeKey::xattr_item(ino, name));
+                        let transitioned = st.mark_dirty(now);
+                        st.overlay_mut(ctx.subvol)
+                            .delete(TreeKey::xattr_item(ino, name));
+                        transitioned
+                    };
+                    if became_dirty {
+                        self.notify_dirty();
                     }
                 }
             }
             item.ctime = (self.clock)();
-            self.stage_inode(ino, &item);
+            self.stage_inode(ctx.subvol, ino, &item);
             Ok(())
         })
     }
 
-    fn statfs<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, StatFs> {
+    fn fs_statfs<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, StatFs> {
         Box::pin(async move {
             let st = self.state.borrow();
             if st.closed {
@@ -3602,8 +4193,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         })
     }
 
-    fn open<'a>(
+    fn fs_open<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         cred: &'a Cred,
         handle: &'a Handle,
         options: &'a OpenOptions,
@@ -3614,24 +4206,31 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             } else {
                 None
             };
-            let (ino, mut item) = self.check_handle(handle).await?;
-            let access = self.openable(cred, ino, &item, options).await?;
+            let (ino, mut item) = self.check_handle(ctx, handle).await?;
+            let access = self.openable(ctx.subvol, cred, ino, &item, options).await?;
             if access != Access::Path && item.file_type == FileType::Socket {
                 return Err(Errno::ENXIO);
             }
             if access != Access::Path && options.is_truncate() && item.file_type == FileType::File {
                 let now = (self.clock)();
-                self.resize_file(ino, &mut item, 0, &cred.identity, now)
+                self.resize_file(ctx.subvol, ino, &mut item, 0, &cred.identity, now)
                     .await?;
             }
-            Ok(self.new_open(cred, ino, item.generation, access))
+            Ok(self.new_open(ctx, cred, ino, item.generation, access))
         })
     }
 
-    fn open_metadata<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, Metadata> {
+    fn fs_open_metadata<'a>(
+        &'a self,
+        ctx: SubvolCtx<'a>,
+        open: &'a OpenRef,
+    ) -> BoxFuture<'a, Metadata> {
         Box::pin(async move {
-            let (ino, generation, _, _) = self.open_record_clone(open)?;
-            let item = self.load_inode(ino).await?.ok_or(Errno::ESTALE)?;
+            let (ino, generation, _, _) = self.open_record_clone(ctx, open)?;
+            let item = self
+                .load_inode(ctx.subvol, ino)
+                .await?
+                .ok_or(Errno::ESTALE)?;
             if item.generation != generation {
                 return Err(Errno::ESTALE);
             }
@@ -3639,18 +4238,22 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         })
     }
 
-    fn read_at<'a>(
+    fn fs_read_at<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         open: &'a OpenRef,
         buf: &'a mut [u8],
         offset: u64,
     ) -> BoxFuture<'a, usize> {
         Box::pin(async move {
-            let (ino, generation, access, _) = self.open_record_clone(open)?;
+            let (ino, generation, access, _) = self.open_record_clone(ctx, open)?;
             if !access.reads() {
                 return Err(Errno::EBADF);
             }
-            let item = self.load_inode(ino).await?.ok_or(Errno::ESTALE)?;
+            let item = self
+                .load_inode(ctx.subvol, ino)
+                .await?
+                .ok_or(Errno::ESTALE)?;
             if item.generation != generation {
                 return Err(Errno::ESTALE);
             }
@@ -3664,16 +4267,17 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             }
             let len = buf.len().min(RW_MAX);
             let n = self
-                .read_file_bytes(ino, item.size, offset, &mut buf[..len])
+                .read_file_bytes(ctx.subvol, ino, item.size, offset, &mut buf[..len])
                 .await?;
-            self.update_atime_if_needed(ino, generation, &item, false)
+            self.update_atime_if_needed(ctx.subvol, ino, generation, &item, false)
                 .await;
             Ok(n)
         })
     }
 
-    fn write_at<'a>(
+    fn fs_write_at<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         open: &'a OpenRef,
         buf: &'a [u8],
         at: WriteAt,
@@ -3681,11 +4285,14 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         Box::pin(async move {
             let _op = self.op_lock.lock().await;
             self.check_rw()?;
-            let (ino, generation, access, writer) = self.open_record_clone(open)?;
+            let (ino, generation, access, writer) = self.open_record_clone(ctx, open)?;
             if !access.writes() {
                 return Err(Errno::EBADF);
             }
-            let mut item = self.load_inode(ino).await?.ok_or(Errno::ESTALE)?;
+            let mut item = self
+                .load_inode(ctx.subvol, ino)
+                .await?
+                .ok_or(Errno::ESTALE)?;
             if item.generation != generation {
                 return Err(Errno::ESTALE);
             }
@@ -3709,7 +4316,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
 
             // Compute privilege-stripped mode BEFORE `write_file_bytes` so any intermediate
             // backpressure commit strips `S_ISUID`/`S_ISGID` before persisting modified blocks.
-            let mut perm = self.load_perm_node(ino, &item).await?;
+            let mut perm = self.load_perm_node(ctx.subvol, ino, &item).await?;
             inode::remove_privs(&writer, &mut perm);
             let mut stripped_item = item.clone();
             stripped_item.apply_perm_node(&perm);
@@ -3717,14 +4324,22 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             let now = (self.clock)();
 
             let written = self
-                .write_file_bytes(ino, &mut item, offset, &buf[..len], stripped_mode, now)
+                .write_file_bytes(
+                    ctx.subvol,
+                    ino,
+                    &mut item,
+                    offset,
+                    &buf[..len],
+                    stripped_mode,
+                    now,
+                )
                 .await?;
             if written > 0 {
                 item.mode = stripped_mode;
                 let finish_now = (self.clock)();
                 item.mtime = finish_now;
                 item.ctime = finish_now;
-                self.stage_inode(ino, &item);
+                self.stage_inode(ctx.subvol, ino, &item);
             }
             Ok(Written {
                 offset,
@@ -3733,15 +4348,23 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         })
     }
 
-    fn set_len<'a>(&'a self, open: &'a OpenRef, size: u64) -> BoxFuture<'a, ()> {
+    fn fs_set_len<'a>(
+        &'a self,
+        ctx: SubvolCtx<'a>,
+        open: &'a OpenRef,
+        size: u64,
+    ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let _op = self.op_lock.lock().await;
-            let (ino, generation, access, writer) = self.open_record_clone(open)?;
+            let (ino, generation, access, writer) = self.open_record_clone(ctx, open)?;
             if access == Access::Path {
                 return Err(Errno::EBADF);
             }
             self.check_rw()?;
-            let mut item = self.load_inode(ino).await?.ok_or(Errno::ESTALE)?;
+            let mut item = self
+                .load_inode(ctx.subvol, ino)
+                .await?
+                .ok_or(Errno::ESTALE)?;
             if item.generation != generation {
                 return Err(Errno::ESTALE);
             }
@@ -3752,13 +4375,14 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 return Err(Errno::EFBIG);
             }
             let now = (self.clock)();
-            self.resize_file(ino, &mut item, size, &writer, now).await
+            self.resize_file(ctx.subvol, ino, &mut item, size, &writer, now)
+                .await
         })
     }
 
-    fn sync_all<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
+    fn fs_sync_all<'a>(&'a self, ctx: SubvolCtx<'a>, open: &'a OpenRef) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let (_, _, access, _) = self.open_record_clone(open)?;
+            let (_, _, access, _) = self.open_record_clone(ctx, open)?;
             if access == Access::Path {
                 return Err(Errno::EBADF);
             }
@@ -3769,7 +4393,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         })
     }
 
-    fn sync_fs<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, ()> {
+    fn fs_sync_fs<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             if self.read_only {
                 if self.state.borrow().closed {
@@ -3785,25 +4409,32 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
     /// `EXTENT_DATA` B+tree references with ZERO data bytes written to `PackStore`.
     /// Read-verifies all `src` and `dst` extents BEFORE mutating `dst`, using a single overlay
     /// snapshot (no O(N²) overlay cloning) and arena backpressure for very large files.
-    fn reflink<'a>(
+    fn fs_reflink<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         _cred: &'a Cred,
         src_open: &'a OpenRef,
         dst_open: &'a OpenRef,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            if src_open.fs != self.fs_id || dst_open.fs != self.fs_id {
+            if src_open.fs != *ctx.fs_id || dst_open.fs != *ctx.fs_id {
                 return Err(Errno::EXDEV);
             }
             let _op = self.op_lock.lock().await;
             self.check_rw()?;
-            let (src_ino, src_gen, src_acc, _) = self.open_record_clone(src_open)?;
-            let (dst_ino, dst_gen, dst_acc, writer) = self.open_record_clone(dst_open)?;
+            let (src_ino, src_gen, src_acc, _) = self.open_record_clone(ctx, src_open)?;
+            let (dst_ino, dst_gen, dst_acc, writer) = self.open_record_clone(ctx, dst_open)?;
             if !src_acc.reads() || !dst_acc.writes() {
                 return Err(Errno::EBADF);
             }
-            let src_item = self.load_inode(src_ino).await?.ok_or(Errno::ESTALE)?;
-            let mut dst_item = self.load_inode(dst_ino).await?.ok_or(Errno::ESTALE)?;
+            let src_item = self
+                .load_inode(ctx.subvol, src_ino)
+                .await?
+                .ok_or(Errno::ESTALE)?;
+            let mut dst_item = self
+                .load_inode(ctx.subvol, dst_ino)
+                .await?
+                .ok_or(Errno::ESTALE)?;
             if src_item.generation != src_gen || dst_item.generation != dst_gen {
                 return Err(Errno::ESTALE);
             }
@@ -3817,13 +4448,16 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 return Ok(());
             }
 
-            let mut dst_perm = self.load_perm_node(dst_ino, &dst_item).await?;
+            let mut dst_perm = self.load_perm_node(ctx.subvol, dst_ino, &dst_item).await?;
             inode::remove_privs(&writer, &mut dst_perm);
 
             // Take ONE read-only `(base_root, read_overlay)` snapshot for the verification pass.
             let (base_root, read_overlay) = {
                 let st = self.state.borrow();
-                (st.subvol_root, st.combined_read_overlay())
+                (
+                    st.subvol_root(ctx.subvol)?,
+                    st.combined_read_overlay(ctx.subvol),
+                )
             };
             let tree = CowTree::new(&*self.head_store, &self.arena);
 
@@ -3942,15 +4576,15 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 dst_item.size = src_item.size;
                 dst_item.mtime = now;
                 dst_item.ctime = now;
-                {
+                let became_dirty = {
                     let mut st = self.state.borrow_mut();
                     st.user_modified = true;
-                    st.mark_dirty(now);
+                    let transitioned = st.mark_dirty(now);
                     for (k, dig) in dst_deletes {
                         if let Some(d) = dig {
                             st.unstage_dirty_block(&d);
                         }
-                        st.overlay.delete(k);
+                        st.overlay_mut(ctx.subvol).delete(k);
                     }
                     for (k, raw, dig) in src_entries {
                         if let Some(d) = dig
@@ -3959,27 +4593,31 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                             st.stage_dirty_block(d, bytes);
                         }
                         let dst_key = TreeKey::new(dst_ino, KIND_EXTENT_DATA, k.tail);
-                        st.overlay.put(dst_key, raw);
+                        st.overlay_mut(ctx.subvol).put(dst_key, raw);
                     }
                     st.allocated_bytes = st
                         .allocated_bytes
                         .saturating_sub(dst_extent_bytes)
                         .saturating_add(src_extent_bytes);
-                    st.overlay
+                    st.overlay_mut(ctx.subvol)
                         .put(TreeKey::inode_item(dst_ino), dst_item.encode());
-                }
+                    transitioned
+                };
                 self.sync_arena_dirty();
+                if became_dirty {
+                    self.notify_dirty();
+                }
                 return Ok(());
             }
 
             // Streaming path for huge files whose extent metadata exceeds half the dirty slab
             // budget: commit any pre-existing dirty state so both `src` and `dst` live cleanly
-            // in `st.subvol_root` (zero overlay cloning!), then stream deletes & clones with
-            // arena backpressure flushes.
+            // in the committed subvol root (zero overlay cloning!), then stream deletes & clones
+            // with arena backpressure flushes.
             self.commit_tx_group_with_lock_mode(true).await?;
 
             // Delete existing `dst` extents in bounded batches directly from committed root.
-            let mut cur_root = self.state.borrow().subvol_root;
+            let mut cur_root = self.state.borrow().subvol_root(ctx.subvol)?;
             let mut d_start = TreeKey::kind_start(dst_ino, KIND_EXTENT_DATA);
             loop {
                 let batch = tree.scan_range(&cur_root, &d_start, &d_end, 256).await?;
@@ -3990,10 +4628,10 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                 let full = batch.len() == 256;
                 let batch_bytes: usize = batch.iter().map(|(k, _)| k.tail.len() + 11 + 32).sum();
                 self.maybe_backpressure_flush(batch_bytes).await?;
-                {
+                let became_dirty = {
                     let mut st = self.state.borrow_mut();
                     st.user_modified = true;
-                    st.mark_dirty(now);
+                    let transitioned = st.mark_dirty(now);
                     for (k, raw) in batch {
                         if let Ok(ExtentDataValue::Extent { len, digest, .. }) =
                             ExtentDataValue::decode(&raw)
@@ -4001,22 +4639,26 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                             st.unstage_dirty_block(&digest);
                             st.allocated_bytes = st.allocated_bytes.saturating_sub(u64::from(len));
                         }
-                        st.overlay.delete(k);
+                        st.overlay_mut(ctx.subvol).delete(k);
                     }
-                }
+                    transitioned
+                };
                 self.sync_arena_dirty();
+                if became_dirty {
+                    self.notify_dirty();
+                }
                 if !full {
                     break;
                 }
                 let mut tail = last.tail;
                 tail.push(0);
                 d_start = TreeKey::new(last.ino, last.kind, tail);
-                cur_root = self.state.borrow().subvol_root;
+                cur_root = self.state.borrow().subvol_root(ctx.subvol)?;
             }
 
-            // Clone `src` extents in bounded batches directly from `st.subvol_root` (`src_ino` is
-            // untouched, so every committed `cur_root` contains identical `src` extents).
-            cur_root = self.state.borrow().subvol_root;
+            // Clone `src` extents in bounded batches directly from committed subvol root
+            // (`src_ino` is untouched, so every committed `cur_root` contains identical `src` extents).
+            cur_root = self.state.borrow().subvol_root(ctx.subvol)?;
             let mut s_start = TreeKey::kind_start(src_ino, KIND_EXTENT_DATA);
             loop {
                 let batch = tree.scan_range(&cur_root, &s_start, &s_end, 256).await?;
@@ -4030,10 +4672,10 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                     .map(|(k, v)| k.tail.len() + 11 + v.len() + 32)
                     .sum();
                 self.maybe_backpressure_flush(batch_bytes).await?;
-                {
+                let became_dirty = {
                     let mut st = self.state.borrow_mut();
                     st.user_modified = true;
-                    st.mark_dirty(now);
+                    let transitioned = st.mark_dirty(now);
                     for (k, raw) in batch {
                         if let Ok(ExtentDataValue::Extent { len, .. }) =
                             ExtentDataValue::decode(&raw)
@@ -4041,17 +4683,21 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                             st.allocated_bytes = st.allocated_bytes.saturating_add(u64::from(len));
                         }
                         let dst_key = TreeKey::new(dst_ino, KIND_EXTENT_DATA, k.tail);
-                        st.overlay.put(dst_key, raw);
+                        st.overlay_mut(ctx.subvol).put(dst_key, raw);
                     }
-                }
+                    transitioned
+                };
                 self.sync_arena_dirty();
+                if became_dirty {
+                    self.notify_dirty();
+                }
                 if !full {
                     break;
                 }
                 let mut tail = last.tail;
                 tail.push(0);
                 s_start = TreeKey::new(last.ino, last.kind, tail);
-                cur_root = self.state.borrow().subvol_root;
+                cur_root = self.state.borrow().subvol_root(ctx.subvol)?;
             }
 
             dst_item.apply_perm_node(&dst_perm);
@@ -4059,13 +4705,14 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
             let finish_now = (self.clock)();
             dst_item.mtime = finish_now;
             dst_item.ctime = finish_now;
-            self.stage_inode(dst_ino, &dst_item);
+            self.stage_inode(ctx.subvol, dst_ino, &dst_item);
             Ok(())
         })
     }
 
-    fn lock<'a>(
+    fn fs_lock<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         open: &'a OpenRef,
         family: LockFamily,
         kind: LockKind,
@@ -4073,6 +4720,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
     ) -> BoxFuture<'a, ()> {
         Box::pin(CowLockWait {
             fs: self,
+            ctx,
             open,
             family,
             kind,
@@ -4081,49 +4729,54 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         })
     }
 
-    fn try_lock<'a>(
+    fn fs_try_lock<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         open: &'a OpenRef,
         family: LockFamily,
         kind: LockKind,
         range: LockRange,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            self.acquire_lock(open, family, kind, range, None)
+            self.acquire_lock(ctx, open, family, kind, range, None)
                 .map(|_| ())
         })
     }
 
-    fn unlock<'a>(
+    fn fs_unlock<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         open: &'a OpenRef,
         family: LockFamily,
         range: LockRange,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let ino = self.lockable(open, family, None, range)?;
+            let ino = self.lockable(ctx, open, family, None, range)?;
+            let sv_key = (ctx.subvol.to_string(), ino);
             {
                 let mut st = self.state.borrow_mut();
-                if let Some(locks) = st.locks.get_mut(&ino) {
+                if let Some(locks) = st.locks.get_mut(&sv_key) {
                     carve(locks, open.id, family, range);
                 }
             }
-            self.wake_lock_waiters(ino);
+            self.wake_lock_waiters(ctx.subvol, ino);
             Ok(())
         })
     }
 
-    fn test_lock<'a>(
+    fn fs_test_lock<'a>(
         &'a self,
+        ctx: SubvolCtx<'a>,
         open: &'a OpenRef,
         kind: LockKind,
         range: LockRange,
     ) -> BoxFuture<'a, Option<Conflict>> {
         Box::pin(async move {
-            let ino = self.lockable(open, LockFamily::Posix, None, range)?;
+            let ino = self.lockable(ctx, open, LockFamily::Posix, None, range)?;
             let st = self.state.borrow();
             Ok(Self::conflict(
                 &st,
+                ctx.subvol,
                 ino,
                 open.id,
                 LockFamily::Posix,
@@ -4133,33 +4786,37 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         })
     }
 
-    fn release<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
+    fn fs_release<'a>(&'a self, ctx: SubvolCtx<'a>, open: &'a OpenRef) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let _op = if !self.read_only {
                 Some(self.op_lock.lock().await)
             } else {
                 None
             };
-            if open.fs != self.fs_id {
+            if open.fs != *ctx.fs_id {
                 return Err(Errno::EBADF);
             }
             let (ino, should_reclaim) = {
                 let mut st = self.state.borrow_mut();
                 let rec = st.opens.get(&open.id).ok_or(Errno::EBADF)?;
-                if rec.ino != open.node.ino || rec.generation != open.node.generation {
+                if rec.subvol != ctx.subvol
+                    || rec.ino != open.node.ino
+                    || rec.generation != open.node.generation
+                {
                     return Err(Errno::EBADF);
                 }
                 let ino = rec.ino;
+                let sv_key = (ctx.subvol.to_string(), ino);
                 st.opens.remove(&open.id);
-                if let Some(locks) = st.locks.get_mut(&ino) {
+                if let Some(locks) = st.locks.get_mut(&sv_key) {
                     locks.retain(|l| l.owner != open.id);
                 }
                 let mut remaining = 0u32;
-                if let Some(cnt) = st.open_counts.get_mut(&ino) {
+                if let Some(cnt) = st.open_counts.get_mut(&sv_key) {
                     *cnt = cnt.saturating_sub(1);
                     remaining = *cnt;
                     if *cnt == 0 {
-                        st.open_counts.remove(&ino);
+                        st.open_counts.remove(&sv_key);
                     }
                 }
                 let can_reclaim = !self.read_only
@@ -4169,18 +4826,17 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
                     && remaining == 0;
                 (ino, can_reclaim)
             };
-            if should_reclaim && let Some(item) = self.load_inode(ino).await? {
-                self.reclaim_if_dead_locked(ino, &item).await?;
+            if should_reclaim && let Some(item) = self.load_inode(ctx.subvol, ino).await? {
+                self.reclaim_if_dead_locked(ctx.subvol, ino, &item).await?;
             }
-            self.wake_lock_waiters(ino);
+            self.wake_lock_waiters(ctx.subvol, ino);
             Ok(())
         })
     }
-}
 
-impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     async fn do_remove(
         &self,
+        ctx: SubvolCtx<'_>,
         cred: &Cred,
         dir: &Handle,
         name: &str,
@@ -4189,25 +4845,32 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     ) -> Result<()> {
         let _op = self.op_lock.lock().await;
         self.check_rw()?;
-        let (dir_ino, mut dir_item) = self.check_handle(dir).await?;
+        let (dir_ino, mut dir_item) = self.check_handle(ctx, dir).await?;
         check_component(name)?;
-        let dir_perm = self.searchable(cred, dir_ino, &dir_item).await?;
+        let dir_perm = self
+            .searchable(ctx.subvol, cred, dir_ino, &dir_item)
+            .await?;
         let di = self
-            .lookup_dir_item(dir_ino, name)
+            .lookup_dir_item(ctx.subvol, dir_ino, name)
             .await?
             .ok_or(Errno::ENOENT)?;
         if expected.is_some_and(|node| node.ino != di.child_ino || node.generation != di.child_gen)
         {
             return Err(Errno::ESTALE);
         }
-        let mut victim = self.load_inode(di.child_ino).await?.ok_or(Errno::ESTALE)?;
-        let victim_perm = self.load_perm_node(di.child_ino, &victim).await?;
+        let mut victim = self
+            .load_inode(ctx.subvol, di.child_ino)
+            .await?
+            .ok_or(Errno::ESTALE)?;
+        let victim_perm = self
+            .load_perm_node(ctx.subvol, di.child_ino, &victim)
+            .await?;
         inode::may_delete(&cred.identity, &dir_perm, &victim_perm)?;
 
         match (directory, victim.file_type == FileType::Dir) {
             (false, true) => return Err(Errno::EISDIR),
             (true, false) => return Err(Errno::ENOTDIR),
-            (true, true) if !self.dir_is_empty(di.child_ino).await? => {
+            (true, true) if !self.dir_is_empty(ctx.subvol, di.child_ino).await? => {
                 return Err(Errno::ENOTEMPTY);
             }
             _ => {}
@@ -4225,22 +4888,635 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         dir_item.ctime = now;
         victim.ctime = now;
 
-        {
+        let became_dirty = {
             let mut st = self.state.borrow_mut();
             st.user_modified = true;
-            st.mark_dirty(now);
-            st.overlay.delete(TreeKey::dir_item(dir_ino, name));
-            st.overlay.delete(TreeKey::dir_index(dir_ino, di.dir_index));
-            st.overlay
-                .delete(TreeKey::inode_ref(di.child_ino, dir_ino, name));
-            st.overlay
-                .put(TreeKey::inode_item(dir_ino), dir_item.encode());
-            st.overlay
-                .put(TreeKey::inode_item(di.child_ino), victim.encode());
-        }
+            let transitioned = st.mark_dirty(now);
+            let ov = st.overlay_mut(ctx.subvol);
+            ov.delete(TreeKey::dir_item(dir_ino, name));
+            ov.delete(TreeKey::dir_index(dir_ino, di.dir_index));
+            ov.delete(TreeKey::inode_ref(di.child_ino, dir_ino, name));
+            ov.put(TreeKey::inode_item(dir_ino), dir_item.encode());
+            ov.put(TreeKey::inode_item(di.child_ino), victim.encode());
+            transitioned
+        };
         self.sync_arena_dirty();
-        self.reclaim_if_dead_locked(di.child_ino, &victim).await?;
+        if became_dirty {
+            self.notify_dirty();
+        }
+        self.reclaim_if_dead_locked(ctx.subvol, di.child_ino, &victim)
+            .await?;
         Ok(())
+    }
+}
+
+impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> {
+    fn id(&self) -> &FsId {
+        &self.fs_id
+    }
+
+    fn capabilities(&self) -> FsCapabilities {
+        self.capabilities
+    }
+
+    fn root(&self) -> Handle {
+        Self::handle_for(self.default_ctx(), ROOT_INO, self.root_generation)
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, Entry> {
+        self.fs_lookup(self.default_ctx(), cred, dir, name)
+    }
+
+    fn walk<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        names: &'a [String],
+    ) -> BoxFuture<'a, Walked> {
+        self.fs_walk(self.default_ctx(), cred, dir, names)
+    }
+
+    fn parent<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+    ) -> BoxFuture<'a, Option<(Entry, String)>> {
+        self.fs_parent(self.default_ctx(), cred, dir)
+    }
+
+    fn metadata<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, Metadata> {
+        self.fs_metadata(self.default_ctx(), cred, handle)
+    }
+
+    fn setattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        attr: &'a SetAttr,
+    ) -> BoxFuture<'a, Metadata> {
+        self.fs_setattr(self.default_ctx(), cred, handle, attr)
+    }
+
+    fn read_dir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle) -> BoxFuture<'a, Vec<DirEntry>> {
+        self.fs_read_dir(self.default_ctx(), cred, dir)
+    }
+
+    fn read_dir_page<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        cookie: u64,
+        max_entries: usize,
+    ) -> BoxFuture<'a, DirPage> {
+        self.fs_read_dir_page(self.default_ctx(), cred, dir, cookie, max_entries)
+    }
+
+    fn read_link<'a>(&'a self, cred: &'a Cred, link: &'a Handle) -> BoxFuture<'a, String> {
+        self.fs_read_link(self.default_ctx(), cred, link)
+    }
+
+    fn create<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+        options: &'a OpenOptions,
+    ) -> BoxFuture<'a, (Entry, OpenRef)> {
+        self.fs_create(self.default_ctx(), cred, dir, name, mode, options)
+    }
+
+    fn mkdir<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+    ) -> BoxFuture<'a, Entry> {
+        self.fs_mkdir(self.default_ctx(), cred, dir, name, mode)
+    }
+
+    fn mknod<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+        rdev: &'a str,
+    ) -> BoxFuture<'a, Entry> {
+        self.fs_mknod(self.default_ctx(), cred, dir, name, mode, rdev)
+    }
+
+    fn mksock<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+    ) -> BoxFuture<'a, Entry> {
+        self.fs_mksock(self.default_ctx(), cred, dir, name, mode)
+    }
+
+    fn symlink<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        target: &'a str,
+    ) -> BoxFuture<'a, Entry> {
+        self.fs_symlink(self.default_ctx(), cred, dir, name, target)
+    }
+
+    fn link<'a>(
+        &'a self,
+        cred: &'a Cred,
+        target: &'a Handle,
+        dir: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, Entry> {
+        self.fs_link(self.default_ctx(), cred, target, dir, name)
+    }
+
+    fn unlink<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
+        self.fs_unlink(self.default_ctx(), cred, dir, name)
+    }
+
+    fn unlink_if<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        node: NodeId,
+    ) -> BoxFuture<'a, ()> {
+        self.fs_unlink_if(self.default_ctx(), cred, dir, name, node)
+    }
+
+    fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
+        self.fs_rmdir(self.default_ctx(), cred, dir, name)
+    }
+
+    fn rename<'a>(
+        &'a self,
+        cred: &'a Cred,
+        from_dir: &'a Handle,
+        from: &'a str,
+        to_dir: &'a Handle,
+        to: &'a str,
+        flags: RenameFlags,
+    ) -> BoxFuture<'a, ()> {
+        self.fs_rename(self.default_ctx(), cred, from_dir, from, to_dir, to, flags)
+    }
+
+    fn getxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, Vec<u8>> {
+        self.fs_getxattr(self.default_ctx(), cred, handle, name)
+    }
+
+    fn setxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+        value: &'a [u8],
+        flags: XattrFlags,
+    ) -> BoxFuture<'a, ()> {
+        self.fs_setxattr(self.default_ctx(), cred, handle, name, value, flags)
+    }
+
+    fn listxattr<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, Vec<String>> {
+        self.fs_listxattr(self.default_ctx(), cred, handle)
+    }
+
+    fn removexattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        self.fs_removexattr(self.default_ctx(), cred, handle, name)
+    }
+
+    fn statfs<'a>(&'a self, cred: &'a Cred) -> BoxFuture<'a, StatFs> {
+        self.fs_statfs(cred)
+    }
+
+    fn open<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        options: &'a OpenOptions,
+    ) -> BoxFuture<'a, OpenRef> {
+        self.fs_open(self.default_ctx(), cred, handle, options)
+    }
+
+    fn open_metadata<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, Metadata> {
+        self.fs_open_metadata(self.default_ctx(), open)
+    }
+
+    fn read_at<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> BoxFuture<'a, usize> {
+        self.fs_read_at(self.default_ctx(), open, buf, offset)
+    }
+
+    fn write_at<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        buf: &'a [u8],
+        at: WriteAt,
+    ) -> BoxFuture<'a, Written> {
+        self.fs_write_at(self.default_ctx(), open, buf, at)
+    }
+
+    fn set_len<'a>(&'a self, open: &'a OpenRef, size: u64) -> BoxFuture<'a, ()> {
+        self.fs_set_len(self.default_ctx(), open, size)
+    }
+
+    fn sync_all<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
+        self.fs_sync_all(self.default_ctx(), open)
+    }
+
+    fn sync_fs<'a>(&'a self, cred: &'a Cred) -> BoxFuture<'a, ()> {
+        self.fs_sync_fs(cred)
+    }
+
+    fn reflink<'a>(
+        &'a self,
+        cred: &'a Cred,
+        src_open: &'a OpenRef,
+        dst_open: &'a OpenRef,
+    ) -> BoxFuture<'a, ()> {
+        self.fs_reflink(self.default_ctx(), cred, src_open, dst_open)
+    }
+
+    fn lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
+    ) -> BoxFuture<'a, ()> {
+        self.fs_lock(self.default_ctx(), open, family, kind, range)
+    }
+
+    fn try_lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
+    ) -> BoxFuture<'a, ()> {
+        self.fs_try_lock(self.default_ctx(), open, family, kind, range)
+    }
+
+    fn unlock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        range: LockRange,
+    ) -> BoxFuture<'a, ()> {
+        self.fs_unlock(self.default_ctx(), open, family, range)
+    }
+
+    fn test_lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        kind: LockKind,
+        range: LockRange,
+    ) -> BoxFuture<'a, Option<Conflict>> {
+        self.fs_test_lock(self.default_ctx(), open, kind, range)
+    }
+
+    fn release<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
+        self.fs_release(self.default_ctx(), open)
+    }
+}
+
+/// Secondary [`Filesystem`] view onto another subvolume (e.g., `"@home"`) backed by the same open
+/// [`CowFs`] writer lease, `VolumeHead`, arena, dirty callback, and atomic `commit_tx_group`.
+struct CowFsSubvolView<H: HeadStore + 'static, P: PackStore + 'static> {
+    fs: Rc<CowFs<H, P>>,
+    subvol: String,
+    fs_id: FsId,
+    root_generation: u64,
+}
+
+impl<H: HeadStore + 'static, P: PackStore + 'static> CowFsSubvolView<H, P> {
+    fn ctx(&self) -> SubvolCtx<'_> {
+        SubvolCtx {
+            subvol: &self.subvol,
+            fs_id: &self.fs_id,
+        }
+    }
+}
+
+impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFsSubvolView<H, P> {
+    fn id(&self) -> &FsId {
+        &self.fs_id
+    }
+
+    fn capabilities(&self) -> FsCapabilities {
+        self.fs.capabilities
+    }
+
+    fn root(&self) -> Handle {
+        CowFs::<H, P>::handle_for(self.ctx(), ROOT_INO, self.root_generation)
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, Entry> {
+        self.fs.fs_lookup(self.ctx(), cred, dir, name)
+    }
+
+    fn walk<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        names: &'a [String],
+    ) -> BoxFuture<'a, Walked> {
+        self.fs.fs_walk(self.ctx(), cred, dir, names)
+    }
+
+    fn parent<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+    ) -> BoxFuture<'a, Option<(Entry, String)>> {
+        self.fs.fs_parent(self.ctx(), cred, dir)
+    }
+
+    fn metadata<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, Metadata> {
+        self.fs.fs_metadata(self.ctx(), cred, handle)
+    }
+
+    fn setattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        attr: &'a SetAttr,
+    ) -> BoxFuture<'a, Metadata> {
+        self.fs.fs_setattr(self.ctx(), cred, handle, attr)
+    }
+
+    fn read_dir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle) -> BoxFuture<'a, Vec<DirEntry>> {
+        self.fs.fs_read_dir(self.ctx(), cred, dir)
+    }
+
+    fn read_dir_page<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        cookie: u64,
+        max_entries: usize,
+    ) -> BoxFuture<'a, DirPage> {
+        self.fs
+            .fs_read_dir_page(self.ctx(), cred, dir, cookie, max_entries)
+    }
+
+    fn read_link<'a>(&'a self, cred: &'a Cred, link: &'a Handle) -> BoxFuture<'a, String> {
+        self.fs.fs_read_link(self.ctx(), cred, link)
+    }
+
+    fn create<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+        options: &'a OpenOptions,
+    ) -> BoxFuture<'a, (Entry, OpenRef)> {
+        self.fs
+            .fs_create(self.ctx(), cred, dir, name, mode, options)
+    }
+
+    fn mkdir<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+    ) -> BoxFuture<'a, Entry> {
+        self.fs.fs_mkdir(self.ctx(), cred, dir, name, mode)
+    }
+
+    fn mknod<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+        rdev: &'a str,
+    ) -> BoxFuture<'a, Entry> {
+        self.fs.fs_mknod(self.ctx(), cred, dir, name, mode, rdev)
+    }
+
+    fn mksock<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        mode: u16,
+    ) -> BoxFuture<'a, Entry> {
+        self.fs.fs_mksock(self.ctx(), cred, dir, name, mode)
+    }
+
+    fn symlink<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        target: &'a str,
+    ) -> BoxFuture<'a, Entry> {
+        self.fs.fs_symlink(self.ctx(), cred, dir, name, target)
+    }
+
+    fn link<'a>(
+        &'a self,
+        cred: &'a Cred,
+        target: &'a Handle,
+        dir: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, Entry> {
+        self.fs.fs_link(self.ctx(), cred, target, dir, name)
+    }
+
+    fn unlink<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
+        self.fs.fs_unlink(self.ctx(), cred, dir, name)
+    }
+
+    fn unlink_if<'a>(
+        &'a self,
+        cred: &'a Cred,
+        dir: &'a Handle,
+        name: &'a str,
+        node: NodeId,
+    ) -> BoxFuture<'a, ()> {
+        self.fs.fs_unlink_if(self.ctx(), cred, dir, name, node)
+    }
+
+    fn rmdir<'a>(&'a self, cred: &'a Cred, dir: &'a Handle, name: &'a str) -> BoxFuture<'a, ()> {
+        self.fs.fs_rmdir(self.ctx(), cred, dir, name)
+    }
+
+    fn rename<'a>(
+        &'a self,
+        cred: &'a Cred,
+        from_dir: &'a Handle,
+        from: &'a str,
+        to_dir: &'a Handle,
+        to: &'a str,
+        flags: RenameFlags,
+    ) -> BoxFuture<'a, ()> {
+        self.fs
+            .fs_rename(self.ctx(), cred, from_dir, from, to_dir, to, flags)
+    }
+
+    fn getxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, Vec<u8>> {
+        self.fs.fs_getxattr(self.ctx(), cred, handle, name)
+    }
+
+    fn setxattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+        value: &'a [u8],
+        flags: XattrFlags,
+    ) -> BoxFuture<'a, ()> {
+        self.fs
+            .fs_setxattr(self.ctx(), cred, handle, name, value, flags)
+    }
+
+    fn listxattr<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, Vec<String>> {
+        self.fs.fs_listxattr(self.ctx(), cred, handle)
+    }
+
+    fn removexattr<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        self.fs.fs_removexattr(self.ctx(), cred, handle, name)
+    }
+
+    fn statfs<'a>(&'a self, cred: &'a Cred) -> BoxFuture<'a, StatFs> {
+        self.fs.fs_statfs(cred)
+    }
+
+    fn open<'a>(
+        &'a self,
+        cred: &'a Cred,
+        handle: &'a Handle,
+        options: &'a OpenOptions,
+    ) -> BoxFuture<'a, OpenRef> {
+        self.fs.fs_open(self.ctx(), cred, handle, options)
+    }
+
+    fn open_metadata<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, Metadata> {
+        self.fs.fs_open_metadata(self.ctx(), open)
+    }
+
+    fn read_at<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> BoxFuture<'a, usize> {
+        self.fs.fs_read_at(self.ctx(), open, buf, offset)
+    }
+
+    fn write_at<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        buf: &'a [u8],
+        at: WriteAt,
+    ) -> BoxFuture<'a, Written> {
+        self.fs.fs_write_at(self.ctx(), open, buf, at)
+    }
+
+    fn set_len<'a>(&'a self, open: &'a OpenRef, size: u64) -> BoxFuture<'a, ()> {
+        self.fs.fs_set_len(self.ctx(), open, size)
+    }
+
+    fn sync_all<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
+        self.fs.fs_sync_all(self.ctx(), open)
+    }
+
+    fn sync_fs<'a>(&'a self, cred: &'a Cred) -> BoxFuture<'a, ()> {
+        self.fs.fs_sync_fs(cred)
+    }
+
+    fn reflink<'a>(
+        &'a self,
+        cred: &'a Cred,
+        src_open: &'a OpenRef,
+        dst_open: &'a OpenRef,
+    ) -> BoxFuture<'a, ()> {
+        self.fs.fs_reflink(self.ctx(), cred, src_open, dst_open)
+    }
+
+    fn lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
+    ) -> BoxFuture<'a, ()> {
+        self.fs.fs_lock(self.ctx(), open, family, kind, range)
+    }
+
+    fn try_lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        kind: LockKind,
+        range: LockRange,
+    ) -> BoxFuture<'a, ()> {
+        self.fs.fs_try_lock(self.ctx(), open, family, kind, range)
+    }
+
+    fn unlock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        family: LockFamily,
+        range: LockRange,
+    ) -> BoxFuture<'a, ()> {
+        self.fs.fs_unlock(self.ctx(), open, family, range)
+    }
+
+    fn test_lock<'a>(
+        &'a self,
+        open: &'a OpenRef,
+        kind: LockKind,
+        range: LockRange,
+    ) -> BoxFuture<'a, Option<Conflict>> {
+        self.fs.fs_test_lock(self.ctx(), open, kind, range)
+    }
+
+    fn release<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
+        self.fs.fs_release(self.ctx(), open)
     }
 }
 
@@ -4301,12 +5577,16 @@ mod tests {
         .encode()
         .unwrap();
         {
-            let mut item = block_on(fs.load_inode(ino_w)).unwrap().unwrap();
+            let mut item = block_on(fs.load_inode(DEFAULT_SUBVOL, ino_w))
+                .unwrap()
+                .unwrap();
             item.size = (3 * BLOCK_SIZE) as u64;
             let mut st = fs.state.borrow_mut();
             st.stage_dirty_block(dig_w, Rc::new(multi_w));
-            st.overlay.put(TreeKey::extent_data(ino_w, 0), ext_w);
-            st.overlay.put(TreeKey::inode_item(ino_w), item.encode());
+            st.overlay_mut(DEFAULT_SUBVOL)
+                .put(TreeKey::extent_data(ino_w, 0), ext_w);
+            st.overlay_mut(DEFAULT_SUBVOL)
+                .put(TreeKey::inode_item(ino_w), item.encode());
             st.user_modified = true;
         }
         // Overwrite 4 bytes inside the middle 64 KiB block [64K, 128K).
@@ -4335,12 +5615,16 @@ mod tests {
         .encode()
         .unwrap();
         {
-            let mut item = block_on(fs.load_inode(ino_t)).unwrap().unwrap();
+            let mut item = block_on(fs.load_inode(DEFAULT_SUBVOL, ino_t))
+                .unwrap()
+                .unwrap();
             item.size = (3 * BLOCK_SIZE) as u64;
             let mut st = fs.state.borrow_mut();
             st.stage_dirty_block(dig_t, Rc::new(multi_t));
-            st.overlay.put(TreeKey::extent_data(ino_t, 0), ext_t);
-            st.overlay.put(TreeKey::inode_item(ino_t), item.encode());
+            st.overlay_mut(DEFAULT_SUBVOL)
+                .put(TreeKey::extent_data(ino_t, 0), ext_t);
+            st.overlay_mut(DEFAULT_SUBVOL)
+                .put(TreeKey::inode_item(ino_t), item.encode());
             st.user_modified = true;
         }
         let trunc_len = 2 * u64::from(BLOCK_SIZE) + 17;
@@ -4402,5 +5686,327 @@ mod tests {
         );
         assert!(tbuf[2 * BLOCK_SIZE as usize..].iter().all(|&b| b == 0x66));
         block_on(ro.release(&t_fd)).unwrap();
+    }
+
+    #[test]
+    fn codex_14_on_dirty_fires_on_first_dirty_transition_and_after_commit() {
+        let hs = Rc::new(MemoryHeadStore::new());
+        let ps = Rc::new(MemoryPackStore::new());
+        let vol = VolumeId("vol-codex-14-cb".into());
+        let clock_sec = Rc::new(Cell::new(10_000u64));
+        let clock_ref = Rc::clone(&clock_sec);
+        let clock: CowFsClock = Rc::new(move || Timespec {
+            sec: clock_ref.get(),
+            nsec: 0,
+        });
+
+        block_on(CowFs::format_volume(
+            &*hs,
+            &*ps,
+            vol.clone(),
+            0,
+            0,
+            0o755,
+            clock(),
+        ))
+        .unwrap();
+
+        type WeakMemCowFs = std::rc::Weak<CowFs<MemoryHeadStore, MemoryPackStore>>;
+        let fires = Rc::new(Cell::new(0u32));
+        let observed_ms: Rc<RefCell<Vec<Option<u64>>>> = Rc::new(RefCell::new(Vec::new()));
+        let fs_slot: Rc<RefCell<Option<WeakMemCowFs>>> = Rc::new(RefCell::new(None));
+
+        let fires_cb = Rc::clone(&fires);
+        let observed_cb = Rc::clone(&observed_ms);
+        let slot_cb = Rc::clone(&fs_slot);
+        let config = CowFsConfig::local_browser(clock).with_on_dirty(Rc::new(move || {
+            fires_cb.set(fires_cb.get() + 1);
+            // Re-entrantly query `ms_until_dirty_deadline()` to prove `RefCell` borrow was dropped!
+            let ms = slot_cb
+                .borrow()
+                .as_ref()
+                .and_then(std::rc::Weak::upgrade)
+                .and_then(|fs| fs.ms_until_dirty_deadline());
+            observed_cb.borrow_mut().push(ms);
+        }));
+
+        let fs = Rc::new(
+            block_on(CowFs::open(
+                hs.clone(),
+                ps.clone(),
+                vol,
+                CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+                config,
+            ))
+            .unwrap(),
+        );
+        *fs_slot.borrow_mut() = Some(Rc::downgrade(&fs));
+        assert_eq!(fires.get(), 0);
+
+        let admin = Cred::root();
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true);
+
+        // First write transitions clean -> dirty: callback fires exactly once and observes ~5000ms.
+        let (_, fd1) = block_on(fs.create(&admin, &fs.root(), "a.txt", 0o644, &opts)).unwrap();
+        block_on(fs.write_at(&fd1, b"hello", WriteAt::Offset(0))).unwrap();
+        block_on(fs.release(&fd1)).unwrap();
+        assert_eq!(fires.get(), 1);
+        assert_eq!(*observed_ms.borrow(), vec![Some(5_000)]);
+
+        // Additional writes while already dirty MUST NOT re-fire `on_dirty`.
+        clock_sec.set(10_002);
+        let (_, fd2) = block_on(fs.create(&admin, &fs.root(), "b.txt", 0o644, &opts)).unwrap();
+        block_on(fs.write_at(&fd2, b"world", WriteAt::Offset(0))).unwrap();
+        block_on(fs.release(&fd2)).unwrap();
+        assert_eq!(fires.get(), 1);
+
+        // Commit resets dirty state; next write MUST fire `on_dirty` again!
+        block_on(fs.commit_tx_group()).unwrap();
+        assert_eq!(fs.ms_until_dirty_deadline(), None);
+
+        clock_sec.set(10_010);
+        let (_, fd3) = block_on(fs.create(&admin, &fs.root(), "c.txt", 0o644, &opts)).unwrap();
+        block_on(fs.write_at(&fd3, b"again", WriteAt::Offset(0))).unwrap();
+        block_on(fs.release(&fd3)).unwrap();
+        assert_eq!(fires.get(), 2);
+        assert_eq!(*observed_ms.borrow(), vec![Some(5_000), Some(5_000)]);
+
+        block_on(fs.close_clean()).unwrap();
+    }
+
+    struct FaultyCommitHeadStore {
+        inner: Rc<MemoryHeadStore>,
+        fail_next_commit: Cell<Option<Errno>>,
+    }
+
+    impl HeadStore for FaultyCommitHeadStore {
+        fn format_version(&self) -> BoxFuture<'_, Option<u32>> {
+            self.inner.format_version()
+        }
+        fn create_volume<'a>(
+            &'a self,
+            head: &'a VolumeHead,
+            initial_nodes: &'a [(Digest, Vec<u8>)],
+        ) -> BoxFuture<'a, VolumeHead> {
+            self.inner.create_volume(head, initial_nodes)
+        }
+        fn grace_window_secs(&self) -> u64 {
+            self.inner.grace_window_secs()
+        }
+        fn read_head<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, VolumeHead> {
+            self.inner.read_head(volume)
+        }
+        fn pin_ro_root<'a>(
+            &'a self,
+            volume: &'a VolumeId,
+            snapshot: Option<&'a str>,
+        ) -> BoxFuture<'a, (VolumeHead, Box<dyn RoPinGuard>)> {
+            self.inner.pin_ro_root(volume, snapshot)
+        }
+        fn unpin_ro_root<'a>(&'a self, pin: Box<dyn RoPinGuard>) -> BoxFuture<'a, ()> {
+            self.inner.unpin_ro_root(pin)
+        }
+        fn acquire_writer<'a>(
+            &'a self,
+            volume: &'a VolumeId,
+            mode: WriterMode,
+        ) -> BoxFuture<'a, WriterLease> {
+            self.inner.acquire_writer(volume, mode)
+        }
+        fn renew_writer<'a>(&'a self, lease: &'a mut WriterLease) -> BoxFuture<'a, ()> {
+            self.inner.renew_writer(lease)
+        }
+        fn release_writer<'a>(&'a self, lease: WriterLease) -> BoxFuture<'a, ()> {
+            self.inner.release_writer(lease)
+        }
+        fn get_node<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Vec<u8>> {
+            self.inner.get_node(digest)
+        }
+        fn lookup_block<'a>(
+            &'a self,
+            digest: &'a Digest,
+        ) -> BoxFuture<'a, Option<cowtree::BlockLoc>> {
+            self.inner.lookup_block(digest)
+        }
+        fn commit_head<'a>(&'a self, req: &'a CommitRequest) -> BoxFuture<'a, VolumeHead> {
+            if let Some(err) = self.fail_next_commit.take() {
+                return Box::pin(async move { Err(err) });
+            }
+            self.inner.commit_head(req)
+        }
+        fn create_snapshot<'a>(
+            &'a self,
+            volume: &'a VolumeId,
+            name: &'a str,
+            head: &'a VolumeHead,
+            now: Timespec,
+        ) -> BoxFuture<'a, SnapshotRecord> {
+            self.inner.create_snapshot(volume, name, head, now)
+        }
+        fn get_snapshot<'a>(
+            &'a self,
+            volume: &'a VolumeId,
+            name: &'a str,
+        ) -> BoxFuture<'a, SnapshotRecord> {
+            self.inner.get_snapshot(volume, name)
+        }
+        fn list_snapshots<'a>(
+            &'a self,
+            volume: &'a VolumeId,
+        ) -> BoxFuture<'a, Vec<SnapshotRecord>> {
+            self.inner.list_snapshots(volume)
+        }
+        fn delete_snapshot<'a>(&'a self, volume: &'a VolumeId, name: &'a str) -> BoxFuture<'a, ()> {
+            self.inner.delete_snapshot(volume, name)
+        }
+        fn fork_volume<'a>(&'a self, req: &'a ForkRequest) -> BoxFuture<'a, VolumeHead> {
+            self.inner.fork_volume(req)
+        }
+        fn delete_volume<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, ()> {
+            self.inner.delete_volume(volume)
+        }
+        fn delete_volume_with_lease<'a>(
+            &'a self,
+            lease: WriterLease,
+            only_if_unmodified_ephemeral: bool,
+        ) -> BoxFuture<'a, bool> {
+            self.inner
+                .delete_volume_with_lease(lease, only_if_unmodified_ephemeral)
+        }
+        fn reformat_volume_with_lease<'a>(
+            &'a self,
+            lease: WriterLease,
+            new_head: &'a VolumeHead,
+            initial_nodes: &'a [(Digest, Vec<u8>)],
+        ) -> BoxFuture<'a, VolumeHead> {
+            self.inner
+                .reformat_volume_with_lease(lease, new_head, initial_nodes)
+        }
+        fn acquire_gc_lock(&self, exclusive: bool) -> BoxFuture<'_, Box<dyn cowtree::GcLockGuard>> {
+            self.inner.acquire_gc_lock(exclusive)
+        }
+        fn list_all_roots(&self) -> BoxFuture<'_, Vec<cowtree::GcRoot>> {
+            self.inner.list_all_roots()
+        }
+        fn list_indexed_packs(&self) -> BoxFuture<'_, HashSet<cowtree::PackId>> {
+            self.inner.list_indexed_packs()
+        }
+        fn prune_abandoned_ephemeral_forks(
+            &self,
+            now: Timespec,
+            grace_window_secs: u64,
+        ) -> BoxFuture<'_, usize> {
+            self.inner
+                .prune_abandoned_ephemeral_forks(now, grace_window_secs)
+        }
+        fn sweep_metadata<'a>(
+            &'a self,
+            keep_nodes: &'a HashSet<Digest>,
+            keep_packs: &'a HashSet<cowtree::PackId>,
+            now: Timespec,
+            grace_window_secs: u64,
+        ) -> BoxFuture<'a, Vec<cowtree::PackId>> {
+            self.inner
+                .sweep_metadata(keep_nodes, keep_packs, now, grace_window_secs)
+        }
+    }
+
+    #[test]
+    fn codex_14_failed_commit_preserves_dirty_deadline_for_retry() {
+        let mem = Rc::new(MemoryHeadStore::new());
+        let hs = Rc::new(FaultyCommitHeadStore {
+            inner: Rc::clone(&mem),
+            fail_next_commit: Cell::new(None),
+        });
+        let ps = Rc::new(MemoryPackStore::new());
+        let vol = VolumeId("vol-codex-14-retry".into());
+        let clock_sec = Rc::new(Cell::new(30_000u64));
+        let clock_ref = Rc::clone(&clock_sec);
+        let clock: CowFsClock = Rc::new(move || Timespec {
+            sec: clock_ref.get(),
+            nsec: 0,
+        });
+        block_on(CowFs::format_volume(
+            &*hs,
+            &*ps,
+            vol.clone(),
+            0,
+            0,
+            0o755,
+            clock(),
+        ))
+        .unwrap();
+
+        let fires = Rc::new(Cell::new(0u32));
+        let fires_cb = Rc::clone(&fires);
+        let fs = block_on(CowFs::open(
+            hs.clone(),
+            ps.clone(),
+            vol.clone(),
+            CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+            CowFsConfig::local_browser(clock)
+                .with_on_dirty(Rc::new(move || fires_cb.set(fires_cb.get() + 1))),
+        ))
+        .unwrap();
+
+        let admin = Cred::root();
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true);
+
+        // 1. Transient `ENOSPC` during `flush_if_dirty_deadline_elapsed()` MUST preserve
+        //    `first_dirty_at` and re-notify `on_dirty` so retry succeeds!
+        let (_, fd1) = block_on(fs.create(&admin, &fs.root(), "retry1.txt", 0o644, &opts)).unwrap();
+        block_on(fs.write_at(&fd1, b"first", WriteAt::Offset(0))).unwrap();
+        block_on(fs.release(&fd1)).unwrap();
+        assert_eq!(fires.get(), 1);
+
+        clock_sec.set(30_005);
+        hs.fail_next_commit.set(Some(Errno::ENOSPC));
+        assert_eq!(
+            block_on(fs.flush_if_dirty_deadline_elapsed()),
+            Err(Errno::ENOSPC)
+        );
+        assert!(
+            fs.dirty_deadline_elapsed(),
+            "ENOSPC must preserve dirty deadline"
+        );
+        assert_eq!(fs.ms_until_dirty_deadline(), Some(0));
+        assert!(fires.get() >= 2, "rollback should re-notify on_dirty");
+        assert_eq!(block_on(mem.read_head(&vol)).unwrap().epoch, 0);
+
+        // Subsequent retry succeeds cleanly and advances epoch to 1.
+        assert_eq!(block_on(fs.flush_if_dirty_deadline_elapsed()), Ok(true));
+        assert_eq!(block_on(mem.read_head(&vol)).unwrap().epoch, 1);
+        assert!(!fs.dirty_deadline_elapsed());
+        assert_eq!(fs.ms_until_dirty_deadline(), None);
+
+        // 2. Ambiguous `EIO` during `flush_if_dirty_deadline_elapsed()` MUST retain pending commit
+        //    and keep `dirty_deadline_elapsed() == true` for idempotent retry!
+        clock_sec.set(30_010);
+        let fires_before_eio = fires.get();
+        let (_, fd2) = block_on(fs.create(&admin, &fs.root(), "retry2.txt", 0o644, &opts)).unwrap();
+        block_on(fs.write_at(&fd2, b"second", WriteAt::Offset(0))).unwrap();
+        block_on(fs.release(&fd2)).unwrap();
+        assert_eq!(fires.get(), fires_before_eio + 1);
+
+        clock_sec.set(30_015);
+        hs.fail_next_commit.set(Some(Errno::EIO));
+        assert_eq!(
+            block_on(fs.flush_if_dirty_deadline_elapsed()),
+            Err(Errno::EIO)
+        );
+        assert!(
+            fs.dirty_deadline_elapsed(),
+            "EIO must keep dirty deadline active"
+        );
+        assert_eq!(fs.ms_until_dirty_deadline(), Some(500));
+        assert!(fires.get() >= fires_before_eio + 2);
+
+        assert_eq!(block_on(fs.flush_if_dirty_deadline_elapsed()), Ok(true));
+        assert_eq!(block_on(mem.read_head(&vol)).unwrap().epoch, 2);
+        assert_eq!(fs.ms_until_dirty_deadline(), None);
+
+        block_on(fs.close_clean()).unwrap();
     }
 }

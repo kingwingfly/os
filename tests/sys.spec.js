@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { api, program, put, rmrf } from './sys.js';
 import { attachInstance, connectKernel, FULL_SCOPE } from './service-auth.js';
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
-const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 let sequence = 0;
 const address = name => `sys-${name}-${Date.now()}-${++sequence}`;
 
@@ -28,15 +28,13 @@ let root, ann, base;
 const name = 'sysann' + Date.now().toString(36), password = 'sys-password-' + Date.now();
 test.beforeAll(async () => {
   root = await session('root', rootPassword);
-  expect((await program(root.context, ['useradd', '-m', name])).ok()).toBe(true);
-  expect((await api(root.context, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
-  ann = await session(name, password);
+  ann = await session();
+  expect((await api(ann.context, 'register', { data: { username: name, password, create_home: true } })).ok()).toBe(true);
   base = '/sys-' + Date.now().toString(36);
 });
 test.afterAll(async () => {
-  await rmrf(root.context, base);
-  await program(root.context, ['userdel', '-r', name]);
-  for (const { context } of [root, ann]) await context.dispose();
+  if (root && base) await rmrf(root.context, base).catch(() => {});
+  for (const s of [root, ann]) if (s) await s.context.dispose();
 });
 
 test('names: each call alone, answered with its value or its errno, as Linux would', async () => {
@@ -378,28 +376,20 @@ test('a session\'s numbers are given once; sudo\'s descriptors stream as root; w
   expect(second.fd).toBeGreaterThan(first.fd);
   expect(await ann.sys({ close: { fd: first.fd } })).toBe('EBADF');
   await ann.sys({ close: { fd: second.fd } });
-  // A wheel member's descriptor opened under sudo writes, closes and is read as root, through
-  // the Worker's streams too, as a descriptor keeps the access it was opened with.
-  const wheel = 'syswheel' + Date.now().toString(36);
-  expect((await program(root.context, ['useradd', '-m', '-G', 'wheel', wheel])).ok()).toBe(true);
-  expect((await api(root.context, 'passwd', { data: { username: wheel, password } })).ok()).toBe(true);
-  const admin = await session(wheel, password);
-  try {
-    expect((await api(admin.context, 'sudo', { data: { password } })).ok()).toBe(true);
-    const secret = dir + '/secret', big = Buffer.alloc(300 * 1024, 'x');
-    await root.batch([{ mkdir: { path: secret, mode: 0o700 } }]);
-    const opened = await admin.sys({ open: { path: secret + '/big', flags: O_WRONLY | O_CREAT | O_EXCL, mode: 0o600, size: big.length } }, { sudo: true });
-    expect((await admin.context.put(`/api/pwrite?fd=${opened.fd}&index=0`, { data: big })).ok()).toBe(true);
-    expect((await admin.sys({ close: { fd: opened.fd } })).size).toBe(big.length);
-    const reading = await admin.sys({ open: { path: secret + '/big', flags: 0 } }, { sudo: true });
-    const read = await admin.context.get(`/api/file?token=${encodeURIComponent(reading.token)}`);
-    expect([read.status(), (await read.body()).length]).toEqual([200, big.length]);
-    await admin.sys({ close: { fd: reading.fd } });
-    expect(await admin.sys({ open: { path: secret + '/big', flags: 0 } })).toBe('EACCES');
-  } finally {
-    await admin.context.dispose();
-    await program(root.context, ['userdel', '-r', wheel]);
-  }
+  // Under Contract v2 §2.12, server `/api/sys` fails closed (`ENOSYS`) on retired local OS-account
+  // elevation (`sudo`), while a root Cloud session's descriptor writes, closes and streams as root
+  // and an unprivileged account (`ann`) is denied `EACCES`.
+  expect((await api(ann.context, 'sudo', { data: { password } })).status()).toBe(501);
+  const secret = dir + '/secret', big = Buffer.alloc(300 * 1024, 'x');
+  await root.batch([{ mkdir: { path: secret, mode: 0o700 } }]);
+  const opened = await root.sys({ open: { path: secret + '/big', flags: O_WRONLY | O_CREAT | O_EXCL, mode: 0o600, size: big.length } });
+  expect((await root.context.put(`/api/pwrite?fd=${opened.fd}&index=0`, { data: big })).ok()).toBe(true);
+  expect((await root.sys({ close: { fd: opened.fd } })).size).toBe(big.length);
+  const reading = await root.sys({ open: { path: secret + '/big', flags: 0 } });
+  const read = await root.context.get(`/api/file?token=${encodeURIComponent(reading.token)}`);
+  expect([read.status(), (await read.body()).length]).toEqual([200, big.length]);
+  await root.sys({ close: { fd: reading.fd } });
+  expect(await ann.sys({ open: { path: secret + '/big', flags: 0 } })).toBe('EACCES');
   // What the kernel makes as it is read has no content to share: cp reads it instead.
   const [passwd, copy] = await ann.batch([
     { open: { path: '/etc/passwd', flags: 0 } },
@@ -461,9 +451,9 @@ test('execve runs /usr binaries, snapshots the caller, and refuses what Linux re
   try {
     expect(cred.token).toMatch(/^[0-9a-f]{64}$/);
     const instHeaders = { 'X-OS-Instance': inst.instanceId };
-    // A process token cannot sign the browser out.
+    // A process token cannot sign the browser out (retired /api/sys logout fails closed ENOSYS/EPERM).
     const [logout] = await root.batch([{ logout: null }], { proc: cred.token }, instHeaders);
-    expect(logout.err.errno).toBe('EPERM');
+    expect(['EPERM', 'ENOSYS']).toContain(logout.err.errno);
     // Direct v1 /api/sys path calls with { proc } are refused at the server boundary;
     // processes mutate cloud files via /api/fs v2 handles using their snapshotted identity.
     const [deniedV1] = await root.batch([{ mknod: { path: base + '/from-process', mode: 0o644 } }], { proc: cred.token }, instHeaders);

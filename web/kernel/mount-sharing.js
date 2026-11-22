@@ -19,7 +19,25 @@ export async function mountApi(workspace, action, args = {}) {
   const response = await fetch('/api/mounts/' + action, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
   const value = await response.json();
   if (!response.ok) throw bad(value.errno ?? 'EIO', value.error);
-  if (value.uid !== undefined && value.uid !== workspace.identity.uid) throw bad('EACCES', 'account changed during mount authorization');
+  if (value.uid !== undefined) {
+    // Under Wave 4B, MountRelay authenticates the server/cloud cookie UID (guest >= 1_000_000
+    // when Cloud is signed out, or `cloud_uid` when signed in), which is separate from the local
+    // `os-cowfs` UID (`workspace.identity.uid`). Pin the expected server relay UID per workspace
+    // (or active `cloud_status().cloud_uid`) so mid-request account changes still fail EACCES.
+    let expectedRelayUid = workspace.relayUid;
+    try {
+      const cloud = globalThis.kernel?.cloud_status ? JSON.parse(globalThis.kernel.cloud_status()) : null;
+      if (cloud?.signed_in && typeof cloud.cloud_uid === 'number') {
+        expectedRelayUid = cloud.cloud_uid;
+        workspace.relayUid = cloud.cloud_uid;
+      }
+    } catch { /* fallback to pinned relayUid */ }
+    if (expectedRelayUid === undefined) {
+      workspace.relayUid = value.uid;
+    } else if (value.uid !== expectedRelayUid) {
+      throw bad('EACCES', 'account changed during mount authorization');
+    }
+  }
   workspace.check(); return value;
 }
 
@@ -109,7 +127,13 @@ export async function exportMount(workspace, args) {
     else if (data.type === 'client') void (async () => {
       // The authenticated listener supplies this identity; request frames from
       // the receiver never supply or replace it. Password auth is scoped here.
-      const identity = data.password ? provider.owner : data.identity;
+      // Same-account tabs share the publisher's relay UID (`grant.uid`) and act as the
+      // local mount owner (`provider.owner`) while distinct relay accounts remain gated by
+      // POSIX permissions/ACLs against their own relay UID.
+      const ownerRelayId = grant.owner?.id ?? grant.uid;
+      const clientRelayId = data.identity?.id ?? data.identity?.uid;
+      const isPublisherAccount = typeof ownerRelayId === 'number' && clientRelayId === ownerRelayId;
+      const identity = (data.password || isPublisherAccount) ? provider.owner : data.identity;
       const service = provider.forIdentity(identity, found.relative);
       await service.access(source, found.relative, 1);
       workspace.check(); if (!active) throw bad('ENODEV');
