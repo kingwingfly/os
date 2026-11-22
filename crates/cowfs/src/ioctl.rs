@@ -5,8 +5,8 @@ use crate::fs::{CowFs, CowFsClock};
 use abi::Errno;
 use abi::contract::{Durability, WriterModel, cowfs_ioctl};
 use abi::volume::{
-    BlkInfoResp, BlkLeaseResp, CowfsForkReq, CowfsForkResp, CowfsInfoResp, CowfsSnapshotReq,
-    CowfsSnapshotResp,
+    BlkInfoResp, BlkLeaseResp, CowfsForkReq, CowfsForkResp, CowfsFsckReq, CowfsFsckResp,
+    CowfsInfoResp, CowfsSnapshotReq, CowfsSnapshotResp,
 };
 use cowtree::{
     BLOCK_SIZE, COWFS_FORMAT_VERSION, HeadStore, PackStore, VolumeId, WriterMode, digest_to_hex,
@@ -15,7 +15,90 @@ use std::rc::Rc;
 use vfs::vblk::VolumeDevice;
 use vfs::{BoxFuture, Cred, Filesystem, Result};
 
-/// Dispatch `COWFS_IOC_{INFO,SNAPSHOT,FORK}` directly against a mounted [`CowFs`] instance.
+fn parse_fsck_req(payload: &[u8]) -> Result<CowfsFsckReq> {
+    let trimmed = payload
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map(|start| {
+            let end = payload
+                .iter()
+                .rposition(|b| !b.is_ascii_whitespace())
+                .map_or(start, |e| e + 1);
+            &payload[start..end]
+        })
+        .unwrap_or(&[]);
+    if trimmed.is_empty() || trimmed == b"null" {
+        return Ok(CowfsFsckReq::default());
+    }
+    let req: CowfsFsckReq = serde_json::from_slice(trimmed).map_err(|_| Errno::EINVAL)?;
+    if let Some(ref v) = req.volume
+        && (v.is_empty() || v.contains(['/', '\0']))
+    {
+        return Err(Errno::EINVAL);
+    }
+    Ok(req)
+}
+
+async fn run_cowfs_fsck<H: HeadStore + 'static, P: PackStore + 'static>(
+    head_store: &H,
+    pack_store: &P,
+    default_volume: &VolumeId,
+    mounted: Option<&CowFs<H, P>>,
+    req: &CowfsFsckReq,
+) -> Result<CowfsFsckResp> {
+    if let Some(ref v) = req.volume
+        && (v.is_empty() || v.contains(['/', '\0']))
+    {
+        return Err(Errno::EINVAL);
+    }
+    if let Some(ver) = head_store.format_version().await?
+        && ver != COWFS_FORMAT_VERSION
+    {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+
+    // Hold shared GC lock across head selection & verification so GC cannot sweep any
+    // node or pack reachable from the exact head being checked.
+    let _gc_guard = head_store.acquire_gc_lock(false).await?;
+
+    let head = match &req.volume {
+        Some(explicit) => {
+            let target = VolumeId(explicit.clone());
+            // Always look up the EXACT requested volume in `head_store` (returning `ENOENT` if
+            // missing — NEVER silently verifying `default_volume`!).
+            let h = head_store.read_head(&target).await?;
+            if h.volume.0 != *explicit {
+                return Err(Errno::ENOENT);
+            }
+            h
+        }
+        None => match mounted {
+            Some(fs) if fs.is_read_only() => fs.current_head(),
+            _ => head_store.read_head(default_volume).await?,
+        },
+    };
+
+    if head.format_version != COWFS_FORMAT_VERSION {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+
+    let report = crate::fsck::verify_head_pinned(head_store, pack_store, &head).await?;
+    Ok(CowfsFsckResp {
+        ok: report.ok,
+        volume: head.volume.0,
+        format_version: head.format_version,
+        epoch: head.epoch,
+        root: digest_to_hex(&head.root),
+        subvols_checked: report.subvols_checked,
+        nodes_verified: report.nodes_verified,
+        extents_verified: report.extents_verified,
+        packs_verified: report.packs_verified,
+        orphan_inodes: report.orphan_inodes,
+        errors: report.errors,
+    })
+}
+
+/// Dispatch `COWFS_IOC_{INFO,FSCK,SNAPSHOT,FORK}` directly against a mounted [`CowFs`] instance.
 pub async fn cowfs_ioctl_mounted<H: HeadStore + 'static, P: PackStore + 'static>(
     fs: &CowFs<H, P>,
     cred: &Cred,
@@ -26,6 +109,14 @@ pub async fn cowfs_ioctl_mounted<H: HeadStore + 'static, P: PackStore + 'static>
         cowfs_ioctl::COWFS_IOC_INFO => {
             let info = fs.volume_info();
             serde_json::to_vec(&info).map_err(|_| Errno::EIO)
+        }
+        cowfs_ioctl::COWFS_IOC_FSCK => {
+            let req = parse_fsck_req(payload)?;
+            let head_store = fs.head_store_rc();
+            let pack_store = fs.pack_store_rc();
+            let resp =
+                run_cowfs_fsck(&*head_store, &*pack_store, fs.volume_id(), Some(fs), &req).await?;
+            serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
         }
         cowfs_ioctl::COWFS_IOC_SNAPSHOT => {
             if cred.identity.id != 0 {
@@ -193,6 +284,19 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
                 read_only: self.read_only,
                 parent_volume: head.parent_volume.map(|v| v.0),
             })
+        })
+    }
+
+    fn cowfs_fsck<'a>(&'a self, req: &'a CowfsFsckReq) -> BoxFuture<'a, CowfsFsckResp> {
+        Box::pin(async move {
+            run_cowfs_fsck(
+                &*self.head_store,
+                &*self.pack_store,
+                &self.volume,
+                self.mounted.as_deref(),
+                req,
+            )
+            .await
         })
     }
 

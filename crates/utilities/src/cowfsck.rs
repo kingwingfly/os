@@ -9,7 +9,7 @@
 
 use abi::Errno;
 use abi::contract::{COWFS_FORMAT_VERSION, cowfs_ioctl};
-use abi::volume::{CowfsForkReq, CowfsForkResp, CowfsInfoResp};
+use abi::volume::{CowfsForkReq, CowfsForkResp, CowfsFsckReq, CowfsFsckResp, CowfsInfoResp};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
@@ -18,7 +18,11 @@ const USAGE: &str = "Usage: cowfsck [--json] [-q|--quiet] [--rollback SNAPSHOT] 
 Verify os-cowfs volume format version and integrity without mutating user data.\n\
 TARGET may be /dev/vdN or volume:<uuid>.\n";
 
+#[allow(dead_code)]
 pub const COWFSCK_REPORT_PATH: &str = "/run/os/cowfsck.json";
+
+/// Maximum number of `/dev/vdN` device slots scanned when resolving `volume:<uuid>`.
+const MAX_VBLK_SCAN: u32 = 16;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsckSummary {
@@ -42,28 +46,10 @@ pub struct FsckSummary {
     pub rolled_back_to: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
-struct StoredFsckReport {
-    ok: bool,
-    volume: String,
-    epoch: u64,
-    #[serde(default)]
-    subvols_checked: usize,
-    #[serde(default)]
-    nodes_verified: usize,
-    #[serde(default)]
-    extents_verified: usize,
-    #[serde(default)]
-    packs_verified: usize,
-    #[serde(default)]
-    orphan_inodes: usize,
-    #[serde(default)]
-    errors: Vec<String>,
-}
-
 pub(crate) trait CowfsckBackend {
-    fn query_info(&self, target: &str) -> io::Result<CowfsInfoResp>;
-    fn read_stored_report(&self) -> Option<String>;
+    /// Run authoritative Merkle verification (`COWFS_IOC_FSCK`) against `target`
+    /// (`/dev/vdN` or `volume:<uuid>`).
+    fn verify_merkle(&self, target: &str) -> io::Result<CowfsFsckResp>;
     fn fork_snapshot(&mut self, target: &str, req: &CowfsForkReq) -> io::Result<CowfsForkResp>;
 }
 
@@ -83,30 +69,6 @@ fn errno_io(errno: Errno, detail: &str) -> io::Error {
 struct OsCowfsckBackend;
 
 impl OsCowfsckBackend {
-    fn open_target_fd(target: &str) -> io::Result<u32> {
-        if let Some(vol) = target.strip_prefix("volume:") {
-            if vol.is_empty() || vol.contains(['/', '\0']) {
-                return Err(errno_io(Errno::EINVAL, "invalid volume identifier"));
-            }
-            // Fall back to `/dev/vd0` when addressing the primary boot volume by `volume:<uuid>`.
-            return Self::open_device_fd("/dev/vd0");
-        }
-        if (target.contains(':') && !target.starts_with('/')) || target.ends_with('/') {
-            return Err(errno_io(
-                Errno::ENOTBLK,
-                "target is not a cowfs volume or block device",
-            ));
-        }
-        let st = os_posix::stat(Path::new(target), false)?;
-        if !st.is_device() || !st.rdev.as_deref().is_some_and(|r| r.starts_with("vblk:")) {
-            return Err(errno_io(
-                Errno::ENOTBLK,
-                "target is not a managed /dev/vdN volume device",
-            ));
-        }
-        Self::open_device_fd(target)
-    }
-
     fn open_device_fd(path: &str) -> io::Result<u32> {
         let mut reply = os_posix::batch(&[abi::Call::Open {
             path: path.to_string(),
@@ -130,11 +92,26 @@ impl OsCowfsckBackend {
     fn close_fd(fd: u32) {
         let _ = os_posix::batch(&[abi::Call::Close { fd: fd.into() }]);
     }
-}
 
-impl CowfsckBackend for OsCowfsckBackend {
-    fn query_info(&self, target: &str) -> io::Result<CowfsInfoResp> {
-        let fd = Self::open_target_fd(target)?;
+    fn validate_vblk_path(path: &str) -> io::Result<()> {
+        if (path.contains(':') && !path.starts_with('/')) || path.ends_with('/') {
+            return Err(errno_io(
+                Errno::ENOTBLK,
+                "target is not a cowfs volume or block device",
+            ));
+        }
+        let st = os_posix::stat(Path::new(path), false)?;
+        if !st.is_device() || !st.rdev.as_deref().is_some_and(|r| r.starts_with("vblk:")) {
+            return Err(errno_io(
+                Errno::ENOTBLK,
+                "target is not a managed /dev/vdN volume device",
+            ));
+        }
+        Ok(())
+    }
+
+    fn query_device_info(path: &str) -> io::Result<CowfsInfoResp> {
+        let fd = Self::open_device_fd(path)?;
         let res = os_posix::batch(&[abi::Call::Ioctl {
             fd: fd.into(),
             request: cowfs_ioctl::COWFS_IOC_INFO,
@@ -150,12 +127,104 @@ impl CowfsckBackend for OsCowfsckBackend {
         serde_json::from_value(val).map_err(|e| errno_io(Errno::EIO, &e.to_string()))
     }
 
-    fn read_stored_report(&self) -> Option<String> {
-        std::fs::read_to_string(COWFSCK_REPORT_PATH).ok()
+    fn send_fsck_ioctl(path: &str, req: &CowfsFsckReq) -> io::Result<CowfsFsckResp> {
+        let fd = Self::open_device_fd(path)?;
+        let arg = serde_json::to_value(req).map_err(|e| errno_io(Errno::EINVAL, &e.to_string()))?;
+        let res = os_posix::batch(&[abi::Call::Ioctl {
+            fd: fd.into(),
+            request: cowfs_ioctl::COWFS_IOC_FSCK,
+            arg,
+        }]);
+        Self::close_fd(fd);
+        let mut reply = res?;
+        let val = reply
+            .results
+            .remove(0)
+            .into_result()
+            .map_err(|e| errno_io(e.errno, e.detail.as_deref().unwrap_or("")))?;
+        serde_json::from_value(val).map_err(|e| errno_io(Errno::EIO, &e.to_string()))
+    }
+
+    /// Scan `/dev/vd0`..`/dev/vd15` via `COWFS_IOC_INFO` to locate a device attached to `uuid`,
+    /// also remembering the first accessible `/dev/vdN` device so unmounted volumes in the same
+    /// store can still be verified via `COWFS_IOC_FSCK { volume: Some(uuid) }`.
+    fn find_vblk_for_volume(uuid: &str) -> io::Result<(Option<String>, Option<String>)> {
+        let mut first_dev: Option<String> = None;
+        for idx in 0..MAX_VBLK_SCAN {
+            let path = format!("/dev/vd{idx}");
+            let Ok(st) = os_posix::stat(Path::new(&path), false) else {
+                continue;
+            };
+            if !st.is_device() || !st.rdev.as_deref().is_some_and(|r| r.starts_with("vblk:")) {
+                continue;
+            }
+            if first_dev.is_none() {
+                first_dev = Some(path.clone());
+            }
+            match Self::query_device_info(&path) {
+                Ok(info) => {
+                    if info.volume == uuid {
+                        return Ok((Some(path), first_dev));
+                    }
+                }
+                Err(err) if os_posix::errno_of(&err) == Some(Errno::EPROTONOSUPPORT) => {
+                    return Err(err);
+                }
+                Err(_) => continue,
+            }
+        }
+        Ok((None, first_dev))
+    }
+}
+
+impl CowfsckBackend for OsCowfsckBackend {
+    fn verify_merkle(&self, target: &str) -> io::Result<CowfsFsckResp> {
+        if let Some(vol) = target.strip_prefix("volume:") {
+            if vol.is_empty() || vol.contains(['/', '\0']) {
+                return Err(errno_io(Errno::EINVAL, "invalid volume identifier"));
+            }
+            let (matched, first_dev) = Self::find_vblk_for_volume(vol)?;
+            let dev_path = matched.or(first_dev).ok_or_else(|| {
+                errno_io(Errno::ENOENT, "no /dev/vdN device available for volume")
+            })?;
+            let req = CowfsFsckReq {
+                volume: Some(vol.to_string()),
+            };
+            let resp = Self::send_fsck_ioctl(&dev_path, &req)?;
+            if resp.volume != vol {
+                return Err(errno_io(
+                    Errno::ENOENT,
+                    &format!(
+                        "volume mismatch: requested '{vol}', device reported '{}'",
+                        resp.volume
+                    ),
+                ));
+            }
+            return Ok(resp);
+        }
+
+        Self::validate_vblk_path(target)?;
+        Self::send_fsck_ioctl(target, &CowfsFsckReq { volume: None })
     }
 
     fn fork_snapshot(&mut self, target: &str, req: &CowfsForkReq) -> io::Result<CowfsForkResp> {
-        let fd = Self::open_target_fd(target)?;
+        let dev_path = if let Some(vol) = target.strip_prefix("volume:") {
+            if vol.is_empty() || vol.contains(['/', '\0']) {
+                return Err(errno_io(Errno::EINVAL, "invalid volume identifier"));
+            }
+            let (matched, _) = Self::find_vblk_for_volume(vol)?;
+            matched.ok_or_else(|| {
+                errno_io(
+                    Errno::ENODEV,
+                    &format!("volume '{vol}' is not attached to any /dev/vdN device"),
+                )
+            })?
+        } else {
+            Self::validate_vblk_path(target)?;
+            target.to_string()
+        };
+
+        let fd = Self::open_device_fd(&dev_path)?;
         let arg = serde_json::to_value(req).map_err(|e| errno_io(Errno::EINVAL, &e.to_string()))?;
         let res = os_posix::batch(&[abi::Call::Ioctl {
             fd: fd.into(),
@@ -232,6 +301,32 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
     Ok(parsed)
 }
 
+fn summary_from_resp(resp: CowfsFsckResp, rolled_back_to: Option<String>) -> FsckSummary {
+    let mut errors = resp.errors;
+    let mut ok = resp.ok && errors.is_empty();
+    if !is_valid_hex64(&resp.root) {
+        ok = false;
+        errors.push(format!("invalid root digest encoding: {}", resp.root));
+    }
+    if ok && resp.nodes_verified == 0 {
+        ok = false;
+        errors.push("no Merkle nodes verified for volume".to_string());
+    }
+    FsckSummary {
+        ok,
+        volume: resp.volume,
+        format_version: resp.format_version,
+        epoch: resp.epoch,
+        subvols_checked: resp.subvols_checked,
+        nodes_verified: resp.nodes_verified,
+        extents_verified: resp.extents_verified,
+        packs_verified: resp.packs_verified,
+        orphan_inodes: resp.orphan_inodes,
+        errors,
+        rolled_back_to,
+    }
+}
+
 pub(crate) fn run_with(
     args: &[String],
     backend: &mut impl CowfsckBackend,
@@ -244,10 +339,21 @@ pub(crate) fn run_with(
         return (USAGE.to_string(), Vec::new(), 0);
     }
     let target = parsed.target.unwrap();
+    let expected_volume = target.strip_prefix("volume:");
+    if let Some(vol) = expected_volume
+        && (vol.is_empty() || vol.contains(['/', '\0']))
+    {
+        return (
+            String::new(),
+            vec![format!("cowfsck: {target}: invalid volume identifier")],
+            8,
+        );
+    }
 
-    // Step 1: Query volume info & verify COWFS_FORMAT_VERSION BEFORE any mount or repair!
-    let info = match backend.query_info(&target) {
-        Ok(info) => info,
+    // Step 1: Run authoritative Merkle verification via `COWFS_IOC_FSCK`.
+    // NEVER infer health from `info.root` formatting or a missing/stale stored report file!
+    let resp = match backend.verify_merkle(&target) {
+        Ok(resp) => resp,
         Err(err) => {
             if os_posix::errno_of(&err) == Some(Errno::EPROTONOSUPPORT) {
                 return (
@@ -262,64 +368,52 @@ pub(crate) fn run_with(
         }
     };
 
-    if info.format_version != COWFS_FORMAT_VERSION {
+    if resp.format_version != COWFS_FORMAT_VERSION {
         return (
             String::new(),
             vec![format!(
                 "cowfsck: {target}: EPROTONOSUPPORT: format version {} != expected {} (volume preserved untouched; refusing to format)",
-                info.format_version, COWFS_FORMAT_VERSION
+                resp.format_version, COWFS_FORMAT_VERSION
             )],
             8,
         );
     }
 
-    let mut summary = FsckSummary {
-        ok: true,
-        volume: info.volume.clone(),
-        format_version: info.format_version,
-        epoch: info.epoch,
-        ..FsckSummary::default()
-    };
-
-    if !is_valid_hex64(&info.root) {
-        summary.ok = false;
-        summary
-            .errors
-            .push(format!("invalid root digest encoding: {}", info.root));
+    if resp.volume.is_empty() {
+        return (
+            String::new(),
+            vec![format!(
+                "cowfsck: {target}: kernel returned empty volume identifier"
+            )],
+            8,
+        );
     }
-
-    // Merge pre-computed Merkle fsck report from Stage 0/1 kernel verification when present for
-    // this exact volume.
-    if let Some(raw) = backend.read_stored_report()
-        && let Ok(stored) = serde_json::from_str::<StoredFsckReport>(&raw)
-        && (stored.volume == info.volume || stored.volume.is_empty())
-        && (stored.epoch == info.epoch || stored.epoch == 0)
+    if let Some(expected_vol) = expected_volume
+        && resp.volume != expected_vol
     {
-        summary.subvols_checked = stored.subvols_checked;
-        summary.nodes_verified = stored.nodes_verified;
-        summary.extents_verified = stored.extents_verified;
-        summary.packs_verified = stored.packs_verified;
-        summary.orphan_inodes = stored.orphan_inodes;
-        if !stored.ok {
-            summary.ok = false;
-            summary.errors.extend(stored.errors);
-        }
+        return (
+            String::new(),
+            vec![format!(
+                "cowfsck: {target}: volume mismatch: expected '{expected_vol}', got '{}'",
+                resp.volume
+            )],
+            8,
+        );
     }
 
-    // Optional snapshot rollback (creates a clean fork from verified snapshot without destroying
-    // the original damaged head).
+    let mut summary = summary_from_resp(resp, None);
+
+    // Optional snapshot rollback (creates a fork from `snap` without destroying the original head,
+    // then ALWAYS runs real Merkle verification on the newly created rollback fork before reporting
+    // clean).
     if let Some(snap) = parsed.rollback {
         let req = CowfsForkReq {
             snapshot: Some(snap.clone()),
-            new_volume: format!("{}-rollback-{snap}", info.volume),
+            new_volume: format!("{}-rollback-{snap}", summary.volume),
             ephemeral_if_unmodified: false,
         };
-        match backend.fork_snapshot(&target, &req) {
-            Ok(forked) => {
-                summary.rolled_back_to = Some(forked.volume.clone());
-                summary.ok = true;
-                summary.errors.clear();
-            }
+        let forked = match backend.fork_snapshot(&target, &req) {
+            Ok(forked) => forked,
             Err(err) => {
                 return (
                     String::new(),
@@ -329,7 +423,52 @@ pub(crate) fn run_with(
                     8,
                 );
             }
+        };
+        let rollback_target = format!("volume:{}", forked.volume);
+        let rb_resp = match backend.verify_merkle(&rollback_target) {
+            Ok(r) => r,
+            Err(err) => {
+                if os_posix::errno_of(&err) == Some(Errno::EPROTONOSUPPORT) {
+                    return (
+                        String::new(),
+                        vec![format!(
+                            "cowfsck: rollback volume {}: EPROTONOSUPPORT: incompatible os-cowfs format version",
+                            forked.volume
+                        )],
+                        8,
+                    );
+                }
+                return (
+                    String::new(),
+                    vec![format!(
+                        "cowfsck: rollback verification failed for volume {}: {err}",
+                        forked.volume
+                    )],
+                    8,
+                );
+            }
+        };
+        if rb_resp.format_version != COWFS_FORMAT_VERSION {
+            return (
+                String::new(),
+                vec![format!(
+                    "cowfsck: rollback volume {}: EPROTONOSUPPORT: format version {} != expected {}",
+                    forked.volume, rb_resp.format_version, COWFS_FORMAT_VERSION
+                )],
+                8,
+            );
         }
+        if rb_resp.volume != forked.volume {
+            return (
+                String::new(),
+                vec![format!(
+                    "cowfsck: rollback verification volume mismatch: expected '{}', got '{}'",
+                    forked.volume, rb_resp.volume
+                )],
+                8,
+            );
+        }
+        summary = summary_from_resp(rb_resp, Some(forked.volume));
     }
 
     let exit_code = if summary.ok { 0 } else { 4 };
@@ -386,44 +525,54 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use abi::contract::{Durability, WriterModel};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    fn clone_io_err(e: &io::Error) -> io::Error {
+        io::Error::new(
+            e.kind(),
+            os_posix::OsCallError(abi::Error::new(os_posix::errno_of(e).unwrap_or(Errno::EIO))),
+        )
+    }
+
+    fn clean_resp(volume: &str, epoch: u64) -> CowfsFsckResp {
+        CowfsFsckResp {
+            ok: true,
+            volume: volume.to_string(),
+            format_version: COWFS_FORMAT_VERSION,
+            epoch,
+            root: "a".repeat(64),
+            subvols_checked: 1,
+            nodes_verified: 12,
+            extents_verified: 4,
+            packs_verified: 1,
+            orphan_inodes: 0,
+            errors: Vec::new(),
+        }
+    }
 
     struct MockCowfsck {
-        info: io::Result<CowfsInfoResp>,
-        stored_report: Option<String>,
+        responses: HashMap<String, io::Result<CowfsFsckResp>>,
+        verified_targets: RefCell<Vec<String>>,
         fork_resp: Option<CowfsForkResp>,
         fork_requests: Vec<CowfsForkReq>,
     }
 
     impl MockCowfsck {
         fn clean() -> Self {
+            let mut responses = HashMap::new();
+            responses.insert("/dev/vd0".to_string(), Ok(clean_resp("vol-root-1", 3)));
+            responses.insert(
+                "volume:vol-root-1".to_string(),
+                Ok(clean_resp("vol-root-1", 3)),
+            );
+            responses.insert(
+                "volume:vol-root-1-rollback-good".to_string(),
+                Ok(clean_resp("vol-root-1-rollback-good", 0)),
+            );
             Self {
-                info: Ok(CowfsInfoResp {
-                    format_version: COWFS_FORMAT_VERSION,
-                    volume: "vol-root-1".into(),
-                    root: "a".repeat(64),
-                    incarnation: 1,
-                    fence: 1,
-                    epoch: 3,
-                    writer_model: WriterModel::Local,
-                    durability: Durability::TreeCommit,
-                    read_only: false,
-                    parent_volume: None,
-                }),
-                stored_report: Some(
-                    serde_json::json!({
-                        "ok": true,
-                        "volume": "vol-root-1",
-                        "epoch": 3,
-                        "subvols_checked": 1,
-                        "nodes_verified": 12,
-                        "extents_verified": 4,
-                        "packs_verified": 1,
-                        "orphan_inodes": 0,
-                        "errors": []
-                    })
-                    .to_string(),
-                ),
+                responses,
+                verified_targets: RefCell::new(Vec::new()),
                 fork_resp: Some(CowfsForkResp {
                     volume: "vol-root-1-rollback-good".into(),
                     parent_volume: "vol-root-1".into(),
@@ -436,20 +585,15 @@ mod tests {
     }
 
     impl CowfsckBackend for MockCowfsck {
-        fn query_info(&self, _target: &str) -> io::Result<CowfsInfoResp> {
-            match &self.info {
-                Ok(i) => Ok(i.clone()),
-                Err(e) => Err(io::Error::new(
-                    e.kind(),
-                    os_posix::OsCallError(abi::Error::new(
-                        os_posix::errno_of(e).unwrap_or(Errno::EIO),
-                    )),
-                )),
+        fn verify_merkle(&self, target: &str) -> io::Result<CowfsFsckResp> {
+            self.verified_targets.borrow_mut().push(target.to_string());
+            match self.responses.get(target) {
+                Some(Ok(resp)) => Ok(resp.clone()),
+                Some(Err(e)) => Err(clone_io_err(e)),
+                None => Err(errno_io(Errno::ENOENT, "volume not found")),
             }
         }
-        fn read_stored_report(&self) -> Option<String> {
-            self.stored_report.clone()
-        }
+
         fn fork_snapshot(
             &mut self,
             _target: &str,
@@ -480,39 +624,116 @@ mod tests {
     #[test]
     fn cowfsck_refuses_incompatible_format_version_with_eprotonosupport() {
         let mut mock = MockCowfsck::clean();
-        mock.info.as_mut().unwrap().format_version = 99;
+        mock.responses
+            .get_mut("/dev/vd0")
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .format_version = 99;
         let (_, errs, code) = run_with(&s(&["/dev/vd0"]), &mut mock);
         assert_eq!(code, 8);
         assert!(errs[0].contains("EPROTONOSUPPORT"));
         assert!(errs[0].contains("refusing to format"));
 
-        mock.info = Err(errno_io(Errno::EPROTONOSUPPORT, "incompatible"));
+        mock.responses.insert(
+            "/dev/vd0".to_string(),
+            Err(errno_io(Errno::EPROTONOSUPPORT, "incompatible")),
+        );
         let (_, errs2, code2) = run_with(&s(&["/dev/vd0"]), &mut mock);
         assert_eq!(code2, 8);
         assert!(errs2[0].contains("EPROTONOSUPPORT"));
     }
 
     #[test]
-    fn cowfsck_reports_corruption_and_supports_snapshot_rollback() {
+    fn cowfsck_rejects_missing_or_mismatched_volume_uuid() {
         let mut mock = MockCowfsck::clean();
-        mock.stored_report = Some(
-            serde_json::json!({
-                "ok": false,
-                "volume": "vol-root-1",
-                "epoch": 3,
-                "errors": ["subvol @: block digest mismatch in pack p1"]
-            })
-            .to_string(),
+        // Missing UUID must fail with exit 8 (never fall back to /dev/vd0).
+        let (_, errs, code) = run_with(&s(&["volume:does-not-exist"]), &mut mock);
+        assert_eq!(code, 8);
+        assert!(errs[0].contains("does-not-exist"));
+
+        // Backend returning a different volume UUID must fail with exit 8!
+        mock.responses.insert(
+            "volume:vol-other".to_string(),
+            Ok(clean_resp("vol-root-1", 3)),
         );
+        let (_, errs2, code2) = run_with(&s(&["volume:vol-other"]), &mut mock);
+        assert_eq!(code2, 8);
+        assert!(
+            errs2[0].contains("volume mismatch"),
+            "expected mismatch error, got {errs2:?}"
+        );
+    }
+
+    #[test]
+    fn cowfsck_fails_exit_4_on_corrupt_volume_without_stored_report() {
+        // Even with valid 64-hex root digest and NO stored `/run/os/cowfsck.json` report,
+        // Merkle verification errors MUST fail with exit 4 (and 0-node fake ok also fails exit 4).
+        let mut mock = MockCowfsck::clean();
+        let mut corrupt = clean_resp("vol-root-1", 3);
+        corrupt.ok = false;
+        corrupt.errors = vec!["subvol @: block digest mismatch in pack p1".to_string()];
+        mock.responses.insert("/dev/vd0".to_string(), Ok(corrupt));
+
         let (_, errs, code) = run_with(&s(&["/dev/vd0"]), &mut mock);
         assert_eq!(code, 4);
         assert!(errs.iter().any(|l| l.contains("CORRUPTION DETECTED")));
         assert!(errs.iter().any(|l| l.contains("block digest mismatch")));
 
+        // Zero verified nodes with ok=true must NEVER exit 0.
+        let mut unverified = clean_resp("vol-root-1", 3);
+        unverified.nodes_verified = 0;
+        mock.responses
+            .insert("/dev/vd0".to_string(), Ok(unverified));
+        let (_, errs_zero, code_zero) = run_with(&s(&["/dev/vd0"]), &mut mock);
+        assert_eq!(code_zero, 4);
+        assert!(errs_zero.iter().any(|l| l.contains("no Merkle nodes")));
+    }
+
+    #[test]
+    fn cowfsck_reports_corruption_and_verifies_rollback_fork() {
+        let mut mock = MockCowfsck::clean();
+        let mut corrupt = clean_resp("vol-root-1", 3);
+        corrupt.ok = false;
+        corrupt.errors = vec!["subvol @: block digest mismatch in pack p1".to_string()];
+        mock.responses.insert("/dev/vd0".to_string(), Ok(corrupt));
+
+        let (_, errs, code) = run_with(&s(&["/dev/vd0"]), &mut mock);
+        assert_eq!(code, 4);
+        assert!(errs.iter().any(|l| l.contains("CORRUPTION DETECTED")));
+        assert!(errs.iter().any(|l| l.contains("block digest mismatch")));
+
+        // Clean rollback fork: verifies `volume:<forked.volume>` and exits 0.
+        mock.verified_targets.borrow_mut().clear();
         let (out, errs, rb_code) = run_with(&s(&["--rollback", "good", "/dev/vd0"]), &mut mock);
         assert_eq!(rb_code, 0, "errs={errs:?}");
         assert!(out.contains("vol-root-1-rollback-good"));
         assert_eq!(mock.fork_requests.len(), 1);
         assert_eq!(mock.fork_requests[0].snapshot.as_deref(), Some("good"));
+        assert_eq!(
+            *mock.verified_targets.borrow(),
+            vec![
+                "/dev/vd0".to_string(),
+                "volume:vol-root-1-rollback-good".to_string()
+            ]
+        );
+
+        // Corrupt rollback fork: MUST fail with exit 4 and report its errors (never exit 0)!
+        let mut corrupt_fork = clean_resp("vol-root-1-rollback-good", 0);
+        corrupt_fork.ok = false;
+        corrupt_fork.errors = vec!["subvol @: pack trailer verification failed".to_string()];
+        mock.responses.insert(
+            "volume:vol-root-1-rollback-good".to_string(),
+            Ok(corrupt_fork),
+        );
+        let (_, rb_errs, rb_bad_code) =
+            run_with(&s(&["--rollback", "good", "/dev/vd0"]), &mut mock);
+        assert_eq!(rb_bad_code, 4, "corrupt rollback fork must fail exit 4");
+        assert!(rb_errs.iter().any(|l| l.contains("CORRUPTION DETECTED")));
+        assert!(
+            rb_errs
+                .iter()
+                .any(|l| l.contains("pack trailer verification failed"))
+        );
     }
 }
