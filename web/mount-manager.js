@@ -144,7 +144,7 @@ function createManager(root) {
       actions.append(button(path.startsWith('/opt/private/') ? 'Deactivate' : 'Unmount', detach(false)));
       if (current.busy_pids?.length) actions.append(button('Lazy unmount', detach(true)));
     }
-    if (current.source_id && current.user_mount && !path.startsWith('/opt/private/') && !current.noexec) {
+    if (current.source_id && current.user_mount && !path.startsWith('/opt/private/') && (!current.noexec || current.source_label?.startsWith('snapshot:'))) {
       const label = document.createElement('label'); label.textContent = 'Extension name';
       const name = document.createElement('input'); name.value = 'tools'; name.maxLength = 80; name.setAttribute('aria-label', 'Extension name'); label.append(name);
       actions.append(label, button('Activate package', action(async () => {
@@ -172,7 +172,7 @@ function createManager(root) {
     if (!current()) return;
     mounts = values.attachments; exportRows = values.exports;
     const body = query('[data-mounts]'); body.replaceChildren();
-    query('[data-empty]').hidden = mounts.length > 0;
+    query('[data-empty]').hidden = mounts.some(m => m.user_mount);
     query('.mount-table-scroll').hidden = mounts.length === 0;
     for (const mount of mounts) {
       const row = body.insertRow(); row.dataset.path = mount.target;

@@ -172,7 +172,7 @@ fn run() -> Result<(), Error> {
                 Ok((socket, peer)) => clients.push(Client {
                     socket,
                     peer,
-                    deadline: Instant::now() + Duration::from_secs(10),
+                    deadline: Instant::now() + Duration::from_secs(45),
                     input: vec![],
                     output: None,
                     sent: 0,

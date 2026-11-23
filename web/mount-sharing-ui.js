@@ -11,7 +11,9 @@ async function rpc(local, service, request, extra = {}, transfer = []) {
   if (reply.status === 'error') {
     const message = reply.errno === 'EPROTONOSUPPORT' ? 'Update os-local-helper before sharing this folder.'
       : reply.errno === 'EACCES' ? 'Permission denied. Check the export permissions or password.' : reply.message;
-    throw failure(reply.errno, message);
+    const detail = request.op === 'activate_private' && request.additional_sources?.length && reply.errno === 'EINVAL'
+      ? 'Cannot compose these images. Check for a path collision or incompatible metadata.' : message;
+    throw failure(reply.errno, [reply.errno, detail].filter(Boolean).join(' '));
   }
   return reply;
 }
@@ -19,11 +21,11 @@ const summary = e => ({ ...e, address: 'osfs:' + e.id, expires: e.expires_at, wr
 
 export async function shareMount(args, options = {}) {
   const local = await session();
-  const ipc = args.ipcOnly || args.transport === 'ipc';
+  const ipc = args.ipcOnly || args.transport === 'ipc' || (!args.transport && globalThis.navigator?.onLine === false);
   const listener = ipc ? null : mountListener(options);
   try {
     const reply = await rpc(local, 'export', {
-      op: 'publish', source_path: args.path, name: args.name, writable: args.writable ?? true, execute: args.execute ?? true,
+      op: 'publish', source_path: args.path, name: args.name ?? args.path?.split('/').filter(Boolean).at(-1) ?? 'share', writable: args.writable ?? true, execute: args.execute ?? true,
       seconds: args.seconds ?? 300, password: args.password || null,
       transports: ipc ? ['ipc'] : options.p2p === false ? ['ipc', 'relay'] : ['ipc', 'p2p', 'relay'],
     }, { open: { path: args.path, flags: 0o200000 | 0o400000 }, ...(listener && { port: listener.port }) }, listener ? [listener.port] : []);
@@ -74,4 +76,42 @@ export async function mountTransports() {
 export async function sharingDialog() {
   const { openMountManager } = await import('./mount-manager.js');
   openMountManager('sharing');
+}
+
+function userAttachment(row) {
+  const kind = { opfs: 'browser-storage', helperfs: 'native-directory', hostfs: 'directory', sharefs: 'shared', image: 'private-extension' };
+  return { ...row, path: row.target, name: row.target.split('/').at(-1), kind: kind[row.fstype] ?? row.fstype,
+    writable: !row.read_only, execute: !row.noexec, userMount: row.user_mount, uncertainWrites: row.uncertain_writes };
+}
+
+export async function localMountList(local = null) {
+  const { attachments } = await rpc(local ?? await session(), 'mount', { op: 'list_attachments' });
+  return attachments.filter(row => row.user_mount).map(userAttachment);
+}
+
+export async function mountLocal(args) {
+  const local = await session();
+  if (args.login !== undefined && args.login !== local.id) throw failure('EACCES', 'Session changed. Choose the folder again.');
+  const fstype = args.url ? 'helperfs' : args.storage || args.originPrivate ? 'opfs' : 'hostfs';
+  const operation = { hostfs: 'source_register_host', helperfs: 'source_register_helper', opfs: 'source_register_opfs' }[fstype];
+  const { source_id } = await kernelCall(operation, { ...args, loginEpoch: local.loginEpoch });
+  const target = '/mnt/local/' + (args.name ?? args.handle?.name ?? 'files');
+  await rpc(local, 'mount', { op: 'attach', source_id, source: source_id, fstype, target,
+    flags: (args.writable ? 0 : 1) | (args.execute ? 0 : 8) });
+  return (await localMountList(local)).find(m => m.path === target);
+}
+
+export async function unmountLocal(path) {
+  return rpc(await session(), 'mount', { op: 'detach', target: path });
+}
+
+export async function activatePrivate({ name, source, sources, execute = true }) {
+  const local = await session(), rows = await localMountList(local);
+  const ids = (sources ?? [source]).map(path => {
+    const row = rows.find(r => r.path === path);
+    if (!row?.source_id) throw failure('ENOENT');
+    return row.source_id;
+  });
+  await rpc(local, 'mount', { op: 'activate_private', name, source_id: ids[0], additional_sources: ids.slice(1), execute });
+  return (await localMountList(local)).find(m => m.path === '/opt/private/' + name);
 }

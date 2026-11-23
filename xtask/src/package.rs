@@ -300,17 +300,17 @@ fn root_template(out: &Path, name: &str) -> Result<Image> {
         (
             "/etc/passwd",
             0o644,
-            b"root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:Local User:/home/user:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n",
+            b"root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:Local User:/home/user:/bin/sh\nexportd:x:998:998:Export service:/nonexistent:/sbin/nologin\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n",
         ),
         (
             "/etc/group",
             0o644,
-            b"root:x:0:\nwheel:x:10:root,user\nuser:x:1000:\nnogroup:x:65534:\n",
+            b"root:x:0:\nwheel:x:10:root,user\nuser:x:1000:\nexportd:x:998:\nnogroup:x:65534:\n",
         ),
         (
             "/etc/shadow",
             0o600,
-            b"root:!:0:0:99999:7:::\nuser:!:0:0:99999:7:::\nnobody:!:0:0:99999:7:::\n",
+            b"root:!:0:0:99999:7:::\nuser:!:0:0:99999:7:::\nexportd:*:0:0:99999:7:::\nnobody:!:0:0:99999:7:::\n",
         ),
         (
             "/etc/sudoers",
@@ -358,7 +358,15 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
     .into_iter()
     .map(directory)
     .collect();
-    for bin in ["coreutils", "utilities", "dash", "supervise", "init"] {
+    for bin in [
+        "coreutils",
+        "utilities",
+        "dash",
+        "supervise",
+        "init",
+        "mountd",
+        "exportd",
+    ] {
         entries.push(Entry {
             path: format!("/usr/bin/{bin}"),
             uid: 0,

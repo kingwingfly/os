@@ -60,12 +60,11 @@ protocolTest('E-02 application uses the userspace export service', async () => {
   const ui = await readFile(new URL('../web/mount-sharing-ui.js', import.meta.url), 'utf8');
   expect(ui).toContain("kernelCall('unix_rpc'");
   expect(ui).not.toMatch(/kernelCall\(['"]mount_(export|revoke|shared|exports)/);
-  // Wave 5B removes the reserved old entry points from the shipping image.
-  const provider = new URL('../web/kernel/mount-sharing.js', import.meta.url);
-  const old = await readFile(provider, 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; });
+  await expect(readFile(new URL('../web/kernel/mount-sharing.js', import.meta.url))).rejects.toMatchObject({ code: 'ENOENT' });
+  const workspace = await readFile(new URL('../web/kernel/workspaces.js', import.meta.url), 'utf8');
+  expect(workspace).not.toMatch(/['"]mount_(list|attach|detach|activate|export|revoke|exports|shared|transports)['"]/);
   const kernel = await readFile(new URL('../crates/client-kernel/src/vfs_engine.rs', import.meta.url), 'utf8');
-  const dispatchers = [...old.matchAll(/function\s+(exportMount|serve)\s*\(/g), ...kernel.matchAll(/fn\s+(export_provider)\s*\(/g)];
-  expect(dispatchers.map(match => match[1])).toEqual([]);
+  expect(kernel).not.toMatch(/fn\s+export_provider\s*\(/);
 });
 
 for (const transport of ['ipc', 'p2p', 'relay']) {

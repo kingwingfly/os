@@ -73,6 +73,7 @@ struct StreamState {
     pending: BTreeMap<u64, Pending>,
     output: VecDeque<Outgoing>,
     reader: FrameReader,
+    write_closed: bool,
     last: u64,
     closed: Option<Errno>,
     notified: bool,
@@ -167,7 +168,14 @@ impl<S: ByteStream> Connection<S> {
         Ok(())
     }
     fn pump(&self, state: &mut StreamState, cx: &mut Context<'_>, id: u64) -> Result<()> {
-        self.flush(state, cx)?;
+        // A peer may have sent CLOSED and already shut down its read half. Drain its
+        // final reply before classifying a broken write as a transport loss.
+        if !state.write_closed {
+            match self.flush(state, cx) {
+                Err(Errno::ENOTCONN) => state.write_closed = true,
+                other => other?,
+            }
+        }
         let mut buf = [0; 8192];
         while state.pending.get(&id).is_some_and(|p| p.answer.is_none()) {
             match self.stream.poll_read(cx, &mut buf) {
@@ -318,6 +326,7 @@ impl<S: ByteStream> Drop for CancelOnDrop<'_, S> {
 pub struct IpcShareTransport<S> {
     connection: Connection<S>,
     root: Handle,
+    rule: ExportRule,
 }
 
 impl<S: ByteStream> IpcShareTransport<S> {
@@ -345,7 +354,12 @@ impl<S: ByteStream> IpcShareTransport<S> {
         else {
             return Err(Errno::EIO);
         };
-        if !entry.metadata.is_dir() || !entry.handle.proof.is_empty() {
+        if !entry.metadata.is_dir()
+            || !entry.handle.proof.is_empty()
+            || entry.handle.fs.0.is_empty()
+            || !(1..=abi::fs::JS_SAFE).contains(&entry.handle.node.ino)
+            || entry.metadata.mode & !0o7777 != 0
+        {
             return Err(Errno::EIO);
         }
         let rule = admitted.intersect(rule);
@@ -353,11 +367,46 @@ impl<S: ByteStream> IpcShareTransport<S> {
             Self {
                 connection,
                 root: entry.handle,
+                rule,
             },
             provider,
             !rule.writable,
             !rule.execute,
         ))
+    }
+    fn check_response(&self, reply: &mut OsfsResponse) -> Result<()> {
+        let metadata = |meta: &mut Metadata| {
+            if meta.mode & !0o7777 != 0 {
+                return Err(Errno::EIO);
+            }
+            self.rule.mask(meta);
+            Ok(())
+        };
+        let entry = |e: &mut Entry| {
+            if e.handle.fs != self.root.fs || !(1..=abi::fs::JS_SAFE).contains(&e.handle.node.ino) {
+                return Err(Errno::EIO);
+            }
+            metadata(&mut e.metadata)
+        };
+        match reply {
+            OsfsResponse::Opened { entry: e, open } => {
+                if open.fs != e.handle.fs || open.node != e.handle.node {
+                    return Err(Errno::EIO);
+                }
+                entry(e)
+            }
+            OsfsResponse::Entry(e) | OsfsResponse::Parent(Some((e, _))) => entry(e),
+            OsfsResponse::Walked(w) => w.entries.iter_mut().try_for_each(entry),
+            OsfsResponse::Metadata(meta) => metadata(meta),
+            OsfsResponse::Directory(rows)
+                if rows
+                    .iter()
+                    .any(|e| !(1..=abi::fs::JS_SAFE).contains(&e.node.ino)) =>
+            {
+                Err(Errno::EIO)
+            }
+            _ => Ok(()),
+        }
     }
     fn at<'a, T: 'a>(
         &'a self,
@@ -392,9 +441,14 @@ impl<S: ByteStream> IpcShareTransport<S> {
         req: OsfsRequest,
         decode: fn(OsfsResponse) -> Result<T>,
     ) -> ShareFuture<'a, T> {
-        Box::pin(
-            async move { decode(self.connection.call(req).await?).map_err(ShareError::Remote) },
-        )
+        Box::pin(async move {
+            let mut response = self.connection.call(req).await?;
+            // A receiver can impose a stricter read-only/noexec ceiling on an admitted export.
+            // Apply it to every metadata-bearing result, including a retained file description.
+            self.check_response(&mut response)
+                .map_err(ShareError::Remote)?;
+            decode(response).map_err(ShareError::Remote)
+        })
     }
 }
 
@@ -816,7 +870,14 @@ pub struct ScopedDir {
     cred: Cred,
     rule: ExportRule,
     live: Cell<bool>,
-    opens: RefCell<BTreeMap<u64, (Handle, OpenRef)>>,
+    opens: RefCell<BTreeMap<u64, RetainedOpen>>,
+}
+#[derive(Clone)]
+struct RetainedOpen {
+    named: Handle,
+    driver: Handle,
+    parent: Option<Handle>,
+    open: OpenRef,
 }
 impl ScopedDir {
     pub fn new(root: FileRef, cred: Cred, rule: ExportRule) -> Result<Self> {
@@ -918,10 +979,32 @@ impl ScopedDir {
             self.active()?;
             return Err(Errno::EMFILE);
         }
+        let parent = if entry.metadata.is_file() && !path.is_empty() {
+            let prefix = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            match self.walk_from_pin(prefix).await {
+                Ok(parent) => Some(Handle {
+                    proof: prefix.into(),
+                    ..parent.handle
+                }),
+                Err(errno) => {
+                    self.fs().release(&open).await?;
+                    return Err(errno);
+                }
+            }
+        } else {
+            None
+        };
+        let driver = entry.handle.clone();
         let entry = self.wire_entry(entry, path);
-        self.opens
-            .borrow_mut()
-            .insert(open.id, (entry.handle.clone(), open.clone()));
+        self.opens.borrow_mut().insert(
+            open.id,
+            RetainedOpen {
+                named: entry.handle.clone(),
+                driver,
+                parent,
+                open: open.clone(),
+            },
+        );
         Ok(OsfsResponse::Opened { entry, open })
     }
     /// Relative equivalents of the POSIX *at operations. Creation passes the
@@ -1129,7 +1212,25 @@ impl ScopedDir {
                 component(&name)?;
                 component(&to)?;
                 let dest = self.resolve_beneath(&to_dir).await?;
+                let old = child(&name)?;
+                let next = if to_dir.proof.is_empty() {
+                    to.clone()
+                } else {
+                    format!("{}/{to}", to_dir.proof)
+                };
+                relative_path(&next)?;
                 fs.rename(cred, h, &name, &dest.handle, &to, flags).await?;
+                for held in self
+                    .opens
+                    .borrow_mut()
+                    .values_mut()
+                    .filter(|o| o.named.proof == old)
+                {
+                    held.named.proof.clone_from(&next);
+                    if held.parent.is_some() {
+                        held.parent = Some(to_dir.clone());
+                    }
+                }
                 Ok(OsfsResponse::Unit)
             }
             AtOp::Unlink { name } => {
@@ -1175,14 +1276,33 @@ impl ScopedDir {
             Ok(())
         }
     }
+    async fn held_entry(&self, held: &RetainedOpen) -> Result<Entry> {
+        match self.resolve_beneath(&held.named).await {
+            Err(Errno::ESTALE) => {
+                let parent = held.parent.as_ref().ok_or(Errno::ESTALE)?;
+                // A nameless regular file has no links outside the pinned subtree.
+                // Preserve its open description while the original parent remains in scope.
+                let metadata = self.fs().open_metadata(&held.open).await?;
+                if !metadata.is_file() || metadata.nlink != 0 {
+                    return Err(Errno::ESTALE);
+                }
+                self.resolve_beneath(parent).await?;
+                Ok(Entry {
+                    handle: held.driver.clone(),
+                    metadata,
+                })
+            }
+            result => result,
+        }
+    }
     pub async fn on_open(&self, open: &OpenRef, call: FdOp) -> Result<OsfsResponse> {
-        let (named, original) = self
+        let held = self
             .opens
             .borrow()
             .get(&open.id)
             .cloned()
             .ok_or(Errno::EBADF)?;
-        if open != &original {
+        if open != &held.open {
             return Err(Errno::EBADF);
         }
         let fs = self.fs();
@@ -1191,7 +1311,7 @@ impl ScopedDir {
             fs.release(open).await?;
             return Ok(OsfsResponse::Unit);
         }
-        let entry = self.resolve_beneath(&named).await?;
+        let entry = self.held_entry(&held).await?;
         let mask = match &call {
             FdOp::Write { .. } | FdOp::Ftruncate { .. } => {
                 if !self.ceiling().writable {
@@ -1275,7 +1395,7 @@ impl ScopedDir {
         if reads_inode {
             // A host driver may have yielded while reading. Do not return
             // those bytes if the inode moved or access changed in that time.
-            let current = self.resolve_beneath(&named).await?;
+            let current = self.held_entry(&held).await?;
             self.access(&current, mask).await?;
         }
         Ok(result)
@@ -1283,8 +1403,8 @@ impl ScopedDir {
     pub async fn close(&self) {
         self.live.set(false);
         let opens = std::mem::take(&mut *self.opens.borrow_mut());
-        for (_, open) in opens.into_values() {
-            let _ = self.fs().release(&open).await;
+        for held in opens.into_values() {
+            let _ = self.fs().release(&held.open).await;
         }
     }
 }

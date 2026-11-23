@@ -21,6 +21,7 @@ pub fn user_mount_sock(uid: u32) -> String {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceKind {
     Hostfs,
+    SelectedFiles,
     Opfs,
     Helperfs,
     Sharefs,
@@ -189,6 +190,8 @@ pub enum MountRequest {
         options: Option<String>,
     },
     ActivatePrivate {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        additional_sources: Vec<String>,
         source_id: String,
         name: String,
         #[serde(default)]
@@ -481,6 +484,8 @@ pub enum MountBackendOp {
         options: Option<String>,
     },
     Activate {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        additional_sources: Vec<String>,
         source_id: String,
         name: String,
         execute: bool,
@@ -493,7 +498,7 @@ pub enum MountBackendOp {
 impl SourceKind {
     pub fn fstype(&self) -> &'static str {
         match self {
-            Self::Hostfs => "hostfs",
+            Self::Hostfs | Self::SelectedFiles => "hostfs",
             Self::Opfs => "opfs",
             Self::Helperfs => "helperfs",
             Self::Sharefs => "sharefs",

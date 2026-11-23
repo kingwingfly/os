@@ -11,8 +11,8 @@ use crate::cloudfs::{
     page_sys_batch_with_session, promised,
 };
 use crate::local_accounts::seed_local_stage1_memfs;
-use crate::mounts::{Grant, LocalMount, errno_code};
-use crate::share_bridge::build_share_backing;
+use crate::mounts::{Grant, errno_code};
+
 use crate::{INIT, Kernel};
 use abi::accelerator::{self, Operation, PathAt, Submit};
 use abi::contract::{cowfs_ioctl, loop_ioctl, mount_flags, umount_flags, unshare_flags};
@@ -1514,6 +1514,8 @@ pub(crate) struct ServiceBindSpec {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ServiceGrantSpec {
+    #[serde(default)]
+    export_impersonate: bool,
     #[serde(default, alias = "mount_namespace")]
     mount_namespace: String,
     #[serde(default, alias = "bind_mounts")]
@@ -1586,7 +1588,7 @@ struct MountUserSpec {
     #[serde(default)]
     writable: bool,
     #[serde(default)]
-    execute: bool,
+    execute: Option<bool>,
     #[serde(default)]
     cloud: bool,
     #[serde(default)]
@@ -1650,10 +1652,10 @@ pub(crate) struct AttachedUserMount {
     pub(crate) name: String,
     pub(crate) cloud: bool,
     pub(crate) provider: Rc<ProviderState>,
-    pub(crate) local_mount: Option<LocalMount>,
 }
 
 pub(crate) struct SessionVfs {
+    pub(crate) page_proxy: Option<u32>,
     epoch: Rc<()>,
     pub(crate) session_id: String,
     pub(crate) uid: u32,
@@ -1726,6 +1728,9 @@ pub(crate) struct ServerFdEntry {
 
 pub(crate) struct ProcessVfsMeta {
     pub(crate) supervisor: bool,
+    // A manager-spawned child may consume its grant on its next verified exec only.
+    pub(crate) pending_unit: Option<bool>,
+    pub(crate) unit_image: Option<&'static str>,
     pub(crate) login_session: Option<String>,
     pub(crate) session_id: Option<String>,
     pub(crate) cloud_access: bool,
@@ -1746,6 +1751,8 @@ impl ProcessVfsMeta {
     pub(crate) fn with_cred(session_id: Option<String>, cloud_access: bool, cred: Cred) -> Self {
         Self {
             supervisor: false,
+            pending_unit: None,
+            unit_image: None,
             login_session: session_id.clone(),
             session_id,
             cloud_access,
@@ -1976,7 +1983,7 @@ pub(crate) struct VfsRuntime {
     /// Verified SHA-256 digests of trusted supervisor binaries (`/usr/bin/init`, `/usr/bin/supervise`)
     /// from the active verified Release v2 `Kind::Base` system image (used when `/usr` executes via
     /// local verified OPFS bytes instead of HTTP build-asset URLs).
-    pub(crate) trusted_supervisor_digests: HashMap<String, String>,
+    pub(crate) trusted_service_digests: HashMap<String, String>,
     pub(crate) sessions: HashMap<String, SessionVfs>,
     pub(crate) guest_page: Option<SessionVfs>,
     pub(crate) active_session_id: Option<String>,
@@ -2053,6 +2060,8 @@ fn default_asset_sizes() -> BuildAssetSizes {
         dash: 64 * 1024,
         supervise: 64 * 1024,
         init: 64 * 1024,
+        mountd: 64 * 1024,
+        exportd: 64 * 1024,
     }
 }
 
@@ -2406,6 +2415,8 @@ async fn construct_vfs(
     if !has_composition {
         for (bin_path, asset_url) in [
             ("/usr/bin/init", "/usr/bin/init.wasm"),
+            ("/usr/bin/mountd", "/usr/bin/mountd.wasm"),
+            ("/usr/bin/exportd", "/usr/bin/exportd.wasm"),
             ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),
             ("/usr/bin/dash", "/usr/bin/dash.wasm"),
             ("/usr/bin/coreutils", "/usr/bin/coreutils.wasm"),
@@ -2705,7 +2716,7 @@ impl VfsRuntime {
             console_shell: None,
             usr_fs_id,
             usr_blob_paths,
-            trusted_supervisor_digests: HashMap::new(),
+            trusted_service_digests: HashMap::new(),
             sessions: HashMap::new(),
             guest_page: None,
             active_session_id: None,
@@ -3215,6 +3226,7 @@ impl Kernel {
     }
 
     pub(crate) async fn vfs_process_exit_cleanup(&self, pid: u32, _token: Option<String>) {
+        self.exports.release_process(pid).await;
         self.close_process_server_fds(pid).await;
         let (vfs, cloud_mount, waits, unix_sock) = {
             let mut rt = self.vfs_rt.borrow_mut();
@@ -3597,7 +3609,7 @@ impl Kernel {
             rt.stage1_reclaimed_entries = 0;
             rt.usr_fs_id = usr_fs_id;
             rt.usr_blob_paths = usr_blob_paths;
-            rt.trusted_supervisor_digests.clear();
+            rt.trusted_service_digests.clear();
             rt.active_session_id = None;
             rt.exec_tickets.clear();
             rt.proc_meta.clear();
@@ -3615,6 +3627,14 @@ impl Kernel {
             let _ = stream.file.close().await;
         }
         for (sid, mut sess) in old_sessions {
+            if let Some(pid) = sess.page_proxy {
+                let _ = self.exit(pid, 0, None, "mount-page").await;
+                let _ = self.state.borrow_mut().table.reap_init_child(
+                    "mount-page",
+                    &sess.identity(),
+                    pid,
+                );
+            }
             for (_, (remote, _pin)) in sess.delegated_uploads.drain() {
                 let _ = remote.close(false).await;
             }
@@ -3730,6 +3750,7 @@ impl Kernel {
                 session_id.clone(),
                 SessionVfs {
                     epoch: Rc::new(()),
+                    page_proxy: None,
                     session_id: session_id.clone(),
                     uid,
                     gid,
@@ -3783,6 +3804,14 @@ impl Kernel {
         let Some(mut sess) = removed.0 else {
             return Ok(());
         };
+        if let Some(pid) = sess.page_proxy {
+            let _ = self.exit(pid, 0, None, "mount-page").await;
+            let _ =
+                self.state
+                    .borrow_mut()
+                    .table
+                    .reap_init_child("mount-page", &sess.identity(), pid);
+        }
         for (_, (remote, _pin)) in sess.delegated_uploads.drain() {
             let _ = remote.close(false).await;
         }
@@ -3915,11 +3944,7 @@ impl Kernel {
             },
             name: clean_name.clone(),
             read_only: !spec.writable || matches!(normalized_kind, "snapshot" | "image"),
-            execute: if normalized_kind == "image" {
-                true
-            } else {
-                spec.execute
-            },
+            execute: spec.execute.unwrap_or(normalized_kind == "image"),
             owner: sess_cred.identity.clone(),
         };
         let grant_json =
@@ -3933,7 +3958,6 @@ impl Kernel {
             bool,
             bool,
             Rc<ProviderState>,
-            Option<LocalMount>,
         );
         let (
             backing,
@@ -3943,7 +3967,7 @@ impl Kernel {
             execute,
             nosymfollow,
             provider,
-            local_mount,
+
         ): PreparedMount = match normalized_kind {
             "opfs" => {
                 let lm = crate::hostfs::mount_opfs(host_obj, &grant_json).await?;
@@ -3951,7 +3975,7 @@ impl Kernel {
                 let ex = lm.grant_info().execute;
                 let b = lm.mount_backing(vfs::FsType::Opfs);
                 let p = lm.provider_state();
-                (b, None, format!("opfs:{clean_name}"), ro, ex, false, p, Some(lm))
+                (b, None, format!("opfs:{clean_name}"), ro, ex, false, p)
             }
             "hostfs" => {
                 let lm = crate::hostfs::mount_directory(host_obj, &grant_json).await?;
@@ -3967,7 +3991,7 @@ impl Kernel {
                     ex,
                     false,
                     p,
-                    Some(lm),
+
                 )
             }
             "snapshot" => {
@@ -3983,7 +4007,7 @@ impl Kernel {
                     ex,
                     false,
                     p,
-                    Some(lm),
+
                 )
             }
             "helperfs" => {
@@ -4000,24 +4024,14 @@ impl Kernel {
                     ex,
                     true,
                     p,
-                    Some(lm),
+
                 )
             }
             "sharefs" => {
-                let (b, root_h, p, ro, ex, nosymfollow) =
-                    build_share_backing(host_obj, &format!("{session_id}:{tmp_seq}"))
-                        .await
-                        .map_err(map_errno)?;
-                (
-                    b,
-                    Some((root_h, "/".to_string())),
-                    format!("sharefs:{clean_name}"),
-                    ro,
-                    ex,
-                    nosymfollow,
-                    p,
-                    None,
-                )
+                let (backing, root, mode) = self.share_backing(host_obj).await?;
+                let provider = backing.provider.clone();
+                let (ro, ex) = (backing.ceiling_rdonly, !backing.ceiling_noexec);
+                (backing, Some((root, "/".into())), format!("sharefs:{mode}:{clean_name}"), ro, ex, false, provider)
             }
             "image" => {
                 let (b, label, p) = self
@@ -4038,10 +4052,9 @@ impl Kernel {
                     None,
                     format!("image:{label}"),
                     true,
-                    true,
+                    grant.execute,
                     false,
                     p,
-                    None,
                 )
             }
             _ => unreachable!(),
@@ -4179,7 +4192,6 @@ impl Kernel {
                     name: clean_name.clone(),
                     cloud: spec.cloud,
                     provider,
-                    local_mount,
                 },
             );
             (
@@ -4417,7 +4429,7 @@ impl Kernel {
         let backing = Rc::new(
             MountBacking::new(Rc::new(img_fs), vfs::FsType::Image)
                 .with_provider(Rc::clone(&provider))
-                .with_ceilings(true, false),
+                .with_ceilings(true, !spec.execute.unwrap_or(true)),
         );
         Ok((backing, label, provider))
     }
@@ -4559,46 +4571,6 @@ impl Kernel {
         Ok(())
     }
 
-    /// Look up the underlying `LocalMount` provider for `exportMount` (`mount-sharing.js`).
-    pub fn export_provider(&self, session_id: String, path: String) -> Result<JsValue, JsValue> {
-        let rt = self.vfs_rt.borrow();
-        let sess = rt
-            .sessions
-            .get(&session_id)
-            .ok_or_else(|| vfs_js_err(Errno::ENOENT, "no active login session"))?;
-        let clean = if path.len() > 1 {
-            path.trim_end_matches('/')
-        } else {
-            path.as_str()
-        };
-        let mut best: Option<(&String, &AttachedUserMount)> = None;
-        for (mp, um) in &sess.user_mounts {
-            if (clean == mp || clean.strip_prefix(mp).is_some_and(|r| r.starts_with('/')))
-                && best.is_none_or(|(b, _)| mp.len() > b.len())
-            {
-                best = Some((mp, um));
-            }
-        }
-        let Some((mp, um)) = best else {
-            return Err(vfs_js_err(Errno::EACCES, "publish a local filesystem"));
-        };
-        let Some(lm) = &um.local_mount else {
-            return Err(vfs_js_err(Errno::EACCES, "publish a local filesystem"));
-        };
-        let rel = clean
-            .strip_prefix(mp.as_str())
-            .unwrap_or("")
-            .trim_start_matches('/');
-        let owner_view = lm.clone_owner();
-        let grant_js = owner_view.grant_js();
-        let out = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(&out, &"mountPath".into(), &JsValue::from_str(mp));
-        let _ = js_sys::Reflect::set(&out, &"relative".into(), &JsValue::from_str(rel));
-        let _ = js_sys::Reflect::set(&out, &"grant".into(), &grant_js);
-        let _ = js_sys::Reflect::set(&out, &"provider".into(), &owner_view.into());
-        Ok(out.into())
-    }
-
     /// Return structured mount table entries (both system/CLI mounts and user mounts) for
     /// `session_id` (or `system_mnt_ns` when `session_id` is empty).
     pub async fn list_mounts(&self, session_id: String) -> Result<JsValue, JsValue> {
@@ -4729,6 +4701,7 @@ impl Kernel {
             let mut rt = self.vfs_rt.borrow_mut();
             rt.guest_page.get_or_insert_with(|| SessionVfs {
                 epoch: Rc::new(()),
+                page_proxy: None,
                 session_id: String::new(),
                 uid: guest.id,
                 gid: guest.group,
@@ -5580,6 +5553,36 @@ impl Kernel {
     ) -> Result<JsValue, JsValue> {
         let grant: ServiceGrantSpec = serde_json::from_str(&grant_json)
             .map_err(|e| vfs_js_err(Errno::EINVAL, e.to_string()))?;
+        if grant.mount_namespace == "session" && self.is_service_image(parent_pid, "init") {
+            let peer = self.kernel_peer_cred(parent_pid).map_err(map_errno)?;
+            let session = {
+                let state = self.state.borrow();
+                (state.login_session.uid == peer.uid && state.login_session.shutdown.is_none())
+                    .then(|| state.login_session.id.clone())
+            };
+            if let Some(sid) = session {
+                if !self.vfs_rt.borrow().sessions.contains_key(&sid) {
+                    let groups = self
+                        .vfs_rt
+                        .borrow()
+                        .vfs
+                        .process_cred(parent_pid)
+                        .map_err(map_errno)?
+                        .identity
+                        .groups;
+                    self.session_begin(
+                        sid.clone(),
+                        peer.uid,
+                        peer.gid,
+                        groups.into_iter().collect(),
+                    )
+                    .await?;
+                }
+                if let Some(parent) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&parent_pid) {
+                    parent.login_session = Some(sid);
+                }
+            }
+        }
         let (vfs, cred, base_ns, resolved_sess, parent_uid) = {
             let rt = self.vfs_rt.borrow();
             let parent = rt
@@ -5587,6 +5590,9 @@ impl Kernel {
                 .get(&parent_pid)
                 .ok_or_else(|| map_errno(Errno::EPERM))?;
             self.proc_authorize_service_grant(parent_pid)?;
+            if grant.export_impersonate && parent_pid != INIT && parent.unit_image != Some("init") {
+                return Err(map_errno(Errno::EPERM));
+            }
             rt.vfs
                 .check_service_child(parent_pid, pid)
                 .map_err(map_errno)?;
@@ -5700,11 +5706,19 @@ impl Kernel {
             };
             crate::revoke_remote_tokens_state(&self.state, revoked).await;
             let _ = self.proc_set_creds(pid, target_uid, target_gid, target_groups, None, false);
-            // Allow `/usr/bin/init --user <uid>` to keep supervisor capability for its own user units.
-            if grant.user.is_some()
-                && let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid)
+        }
+        {
+            let mut rt = self.vfs_rt.borrow_mut();
+            if parent_pid == INIT
+                || rt
+                    .proc_meta
+                    .get(&parent_pid)
+                    .is_some_and(|m| m.unit_image == Some("init"))
             {
-                meta.supervisor = true;
+                rt.proc_meta
+                    .get_mut(&pid)
+                    .ok_or_else(|| map_errno(Errno::ESRCH))?
+                    .pending_unit = Some(grant.export_impersonate);
             }
         }
         // Enforce declared device allowlist monotonically (never widens parent allowlist).
@@ -5753,6 +5767,8 @@ impl Kernel {
             let rt = self.vfs_rt.borrow();
             let meta = rt.proc_meta.get(&parent_pid).map(|m| ProcessVfsMeta {
                 supervisor: false,
+                pending_unit: None,
+                unit_image: None,
                 login_session: m.login_session.clone(),
                 session_id: m.session_id.clone(),
                 cloud_access: m.cloud_access,
@@ -5862,6 +5878,7 @@ impl Kernel {
             if let Some(meta) = rt.proc_meta.get_mut(&pid) {
                 if meta.cred.identity.id != uid {
                     meta.supervisor = false;
+                    meta.unit_image = None;
                 }
                 meta.cloud_access = cloud_access;
             }
@@ -5899,6 +5916,7 @@ impl Kernel {
     }
 
     pub async fn proc_exit(&self, pid: u32) -> Result<(), JsValue> {
+        self.exports.release_process(pid).await;
         self.close_process_server_fds(pid).await;
         let (vfs, cloud_mount, waits, unix_sock) = {
             let mut rt = self.vfs_rt.borrow_mut();
@@ -10032,6 +10050,19 @@ impl Kernel {
         mut arg: Value,
         fd_refs: &[Option<u32>],
     ) -> std::result::Result<Value, abi::Error> {
+        if request == abi::export_ctl::EXPORT_DIR_IOCTL {
+            let unit = crate::export_bridge::ServiceGrant {
+                peer: self.kernel_peer_cred(pid)?,
+                export_impersonate: self.is_service_image(pid, "exportd"),
+            };
+            let call = serde_json::from_value(arg).map_err(|_| Errno::EINVAL)?;
+            let relay = crate::cloudfs::installed("exportRelayCall")
+                .ok()
+                .map(|(_, f)| f);
+            return Ok(self
+                .export_dir_ioctl(&self.exports, &unit, raw_fd, call, relay.as_ref())
+                .await?);
+        }
         // Cowfs range cloning also accepts bind aliases of the same volume.
         if request == FICLONE || request == cowfs_ioctl::FICLONERANGE {
             let (src_fd, range) = if request == FICLONE {

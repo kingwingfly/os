@@ -9,6 +9,7 @@ const publicInfo = ({ id, kind, label, location, state, writable, execute, saved
 export function savedSourceStore(idb = globalThis.indexedDB) {
   let opened;
   const database = () => opened ??= new Promise((resolve, reject) => {
+    if (!idb) { reject(fail('ENOTSUP', 'Saved folders require IndexedDB.')); return; }
     const req = idb.open('os-mount-sources-v1', 1);
     req.onupgradeneeded = () => req.result.createObjectStore('sources', { keyPath: ['uid', 'id'] });
     req.onerror = () => { opened = undefined; reject(req.error); };
@@ -28,7 +29,7 @@ export function savedSourceStore(idb = globalThis.indexedDB) {
     });
   }
   return {
-    list: (uid, signal) => operation('readonly', s => s.getAll(IDBKeyRange.bound([uid, ''], [uid, []])), signal),
+    list: (uid, signal) => !idb ? Promise.resolve([]) : operation('readonly', s => s.getAll(IDBKeyRange.bound([uid, ''], [uid, []])), signal),
     get: (uid, id) => operation('readonly', s => s.get([uid, id])),
     put: (record, signal) => operation('readwrite', s => s.put(record), signal),
     remove: (uid, id, signal) => operation('readwrite', s => s.delete([uid, id]), signal),
@@ -54,7 +55,7 @@ export class SourceRegistry {
     this.#abort?.abort();
     this.#abort = new AbortController();
     this.#entries.clear();
-    if (this.#session) this.#table?.change_session(uid, loginEpoch);
+    this.#table?.change_session(uid, loginEpoch);
     this.#session = Object.freeze({ uid, gid, id, loginEpoch });
     this.#queue = Promise.resolve();
     return this.#serial(loginEpoch, async session => {
@@ -103,7 +104,10 @@ export class SourceRegistry {
       if (![writable, execute, save, cloud].every(v => typeof v === 'boolean')) throw fail('EINVAL', 'Invalid grant options.');
       const id = 'src:' + this.#uuid();
       let provider, label, location;
-      if (kind === 'hostfs') {
+      if (kind === 'hostfs' && Array.isArray(args.files)) {
+        if (!args.files.length || save || writable) throw fail('EINVAL', 'Selected files must be read-only.');
+        provider = { files: args.files }; label = location = 'Selected files';
+      } else if (kind === 'hostfs') {
         const handle = args.handle;
         if (handle?.kind !== 'directory' || typeof handle.isSameEntry !== 'function' || typeof handle.resolve !== 'function') throw fail('EINVAL', 'Choose a directory.');
         const root = await this.#opfs();
@@ -122,14 +126,14 @@ export class SourceRegistry {
       } else if (kind === 'helperfs') {
         const url = new URL(args.url);
         if (!['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname) ||
-            url.username || url.password || url.search || url.hash || !args.token) throw fail('EINVAL', 'A local helper URL and token are required.');
+            url.username || url.password || url.search || url.hash || !args.token) throw fail('EINVAL', 'A loopback helper URL and token are required.');
         // The visible location must not include a bearer token or a URL path.
         provider = { url: url.href, token: args.token }; label = 'Local helper'; location = url.origin;
       } else if (kind === 'sharefs' && /^osfs:[A-Za-z0-9._-]+$/.test(args.address)) {
         provider = { address: args.address, password: args.password }; label = 'Shared directory'; location = args.address;
       } else throw fail('ENODEV', 'Unknown source kind.');
       this.#check(session);
-      const info = { id, kind, label, location, state: 'granted', writable, execute, saved: save, owner_uid: session.uid };
+      const info = { id, kind: provider.files ? 'selected_files' : kind, label, location, state: 'granted', writable, execute, saved: save, owner_uid: session.uid };
       if (save && kind !== 'hostfs') throw fail('EINVAL', 'Only browser folder handles can be saved.');
       if (save) {
         await this.#store.put({ uid: session.uid, id, info, handle: provider.handle, cloud }, this.#abort.signal);
@@ -143,7 +147,7 @@ export class SourceRegistry {
     return this.#serial(loginEpoch, async session => {
       const sources = [];
       for (const entry of this.#entries.values()) {
-        if (entry.info.kind === 'hostfs') {
+        if (entry.provider.handle) {
           const state = await this.#permissionState(entry.provider.handle, entry.info.writable);
           this.#check(session); this.#setState(entry, state);
         }
@@ -176,8 +180,8 @@ export class SourceRegistry {
     const shared = operation.fstype === 'sharefs';
     const implicit = !entry && ((shared && operation.source_id.startsWith('osfs:')) ||
       (operation.fstype === 'opfs' && !operation.source_id.startsWith('src:')));
-    if (!implicit && (!entry || entry.info.kind !== operation.fstype)) throw fail('EACCES', 'Source unavailable.');
-    if (entry?.info.kind === 'hostfs') {
+    if (!implicit && (!entry || (entry.info.kind === 'selected_files' ? 'hostfs' : entry.info.kind) !== operation.fstype)) throw fail('EACCES', 'Source unavailable.');
+    if (entry?.provider.handle) {
       const state = await this.#permissionState(entry.provider.handle, entry.info.writable);
       this.#check(session); this.#setState(entry, state);
     }
@@ -255,6 +259,7 @@ export function mountPageRequest(type, args, { registry, kernel, proxyPid, socke
     case 'source_register_share': return registry.register('sharefs', args);
     case 'source_renew': return registry.renew(args.source_id, args.loginEpoch);
     case 'unix_rpc':
+      if (args.fd != null) throw fail('EBADF');
       return kernel.page_unix_rpc(session.id, proxyPid, args.socket, JSON.stringify(args.request), args.fd, socketOp);
     default: throw fail('EINVAL', 'Unknown mount adapter operation.');
   }
@@ -265,20 +270,20 @@ export function mountPageRequest(type, args, { registry, kernel, proxyPid, socke
 export async function serveMountBackend({ kernel, table, registry, pid, sockId, socketOp, exportsFor, isMountService, signal }) {
   const sock = args => socketOp({ pid, args: { sockId, ...args } });
   const encoder = new TextEncoder(), decoder = new TextDecoder('utf-8', { fatal: true });
-  const deadline = performance.now() + 10000;
+  const deadline = performance.now() + 45000;
   const wait = async () => {
     if (signal?.aborted) throw cancelled();
     if (performance.now() >= deadline) throw fail('ETIMEDOUT', 'Mount backend timed out.');
     await new Promise(resolve => setTimeout(resolve, 5));
   };
-  const adapter = ({ uid, sessionId, loginEpoch, operation }) => {
+  const adapter = ({ pid: caller, uid, sessionId, loginEpoch, operation }) => {
     if (operation.op === 'exports') return exportsFor ? exportsFor(uid) : [];
     if (!sessionId || uid !== registry.session?.uid || sessionId !== registry.session.id ||
         loginEpoch !== registry.session.loginEpoch) throw cancelled();
     switch (operation.op) {
       case 'refresh_sources': return registry.list(loginEpoch).then(() => null);
-      case 'attach': return registry.attach(operation, loginEpoch, kernel);
-      case 'image_source': return registry.openImageSource(operation, loginEpoch);
+      case 'attach': return registry.attach({ ...operation, pid: caller }, loginEpoch, kernel);
+      case 'image_source': return registry.openImageSource({ ...operation, pid: caller }, loginEpoch);
       case 'forget': return registry.forget(operation.source_id, loginEpoch);
       default: throw fail('EINVAL', 'Unknown host operation.');
     }

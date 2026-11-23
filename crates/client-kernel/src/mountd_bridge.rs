@@ -304,6 +304,7 @@ async fn private_image(
 /// Read an unattached grant in a scratch mount namespace. The source and its
 /// temporary mountpoint are never installed in a session or exposed to another process.
 async fn image_from_grant(
+    kernel: &Kernel,
     source: &SourceInfo,
     prepared: JsValue,
     cred: &vfs::Cred,
@@ -314,6 +315,7 @@ async fn image_from_grant(
     let result = async {
         let kind = match source.kind {
             SourceKind::Hostfs => "directory",
+            SourceKind::SelectedFiles => "snapshot",
             SourceKind::Opfs => "browser-storage",
             SourceKind::Helperfs => "native-directory",
             SourceKind::Sharefs => "shared",
@@ -327,14 +329,13 @@ async fn image_from_grant(
             owner: cred.identity.clone(),
         };
         let (backing, subroot, executable) = if source.kind == SourceKind::Sharefs {
-            let (backing, root, _, _, executable, _) =
-                crate::share_bridge::build_share_backing(store, &source.id)
-                    .await
-                    .map_err(map_errno)?;
+            let (backing, root, _) = kernel.share_backing(store).await?;
+            let executable = !backing.ceiling_noexec;
             (backing, Some((root, "/".into())), executable)
         } else {
             let spec = serde_json::to_string(&grant).map_err(|_| map_errno(Errno::EINVAL))?;
             let mount = match source.kind {
+                SourceKind::SelectedFiles => crate::hostfs::mount_snapshot(store, &spec).await?,
                 SourceKind::Hostfs => crate::hostfs::mount_directory(store, &spec).await?,
                 SourceKind::Opfs => crate::hostfs::mount_opfs(store, &spec).await?,
                 SourceKind::Helperfs => crate::helper::connect_helper_mount(store, &spec).await?,
@@ -419,7 +420,7 @@ impl Kernel {
         let state = self.state.borrow();
         let proc = state.table.proc(peer.pid).ok_or(Errno::ESRCH)?;
         if proc.state == abi::ProcState::Zombie
-            || proc.path != "/usr/bin/mountd"
+            || !self.is_service_image(peer.pid, "mountd")
             || self.kernel_peer_cred(peer.pid)? != peer
         {
             return Err(Errno::EACCES);
@@ -443,6 +444,7 @@ impl Kernel {
                 .and_then(|p| p.login_scope.as_deref())
                 != Some(session_id)
             || (peer.uid, peer.gid) != (session.uid, session.gid)
+            || session.page_proxy != Some(proxy)
             || !Rc::ptr_eq(&rt.vfs.process_namespace(proxy)?, &session.mnt_ns)
         {
             return Err(Errno::EACCES);
@@ -453,6 +455,86 @@ impl Kernel {
 
 #[wasm_bindgen]
 impl Kernel {
+    pub fn is_service_image(&self, pid: u32, name: &str) -> bool {
+        self.is_proc_live(pid)
+            && self
+                .vfs_rt
+                .borrow()
+                .proc_meta
+                .get(&pid)
+                .is_some_and(|m| m.unit_image == Some(name))
+    }
+
+    /// A host-owned process in this exact login namespace supplies SO_PEERCRED and owns SCM_RIGHTS.
+    pub fn mount_page_proxy(&self, session_id: &str) -> Result<u32, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let mut rt = self.vfs_rt.borrow_mut();
+        if state.login_session.shutdown.is_some()
+            || state.login_session.id != session_id
+            || rt.active_session_id.as_deref() != Some(session_id)
+        {
+            return Err(map_errno(Errno::EACCES));
+        }
+        let vfs = rt.vfs.clone();
+        let sess = rt
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| map_errno(Errno::EACCES))?;
+        let identity = state.account.identity();
+        if sess.uid != identity.id
+            || sess.gid != identity.group
+            || state.login_session.uid != sess.uid
+        {
+            return Err(map_errno(Errno::EACCES));
+        }
+        if let Some(pid) = sess.page_proxy
+            && state
+                .table
+                .proc(pid)
+                .is_some_and(|p| p.state != abi::ProcState::Zombie)
+        {
+            return Ok(pid);
+        }
+        let mut spec = kernel::proc_table::SpawnSpec::new(
+            "mount-page",
+            kernel::proc_table::LocalCred {
+                identity: identity.clone(),
+                umask: 0o022,
+                remote: None,
+                cloud_access: false,
+                allowed_remote_scope: None,
+            },
+            "mount-page",
+        );
+        spec.login_scope = Some(session_id.into());
+        spec.initial_state = abi::ProcState::Running;
+        let pid = state
+            .table
+            .spawn(spec, crate::now_secs())
+            .map_err(|e| map_errno(e.errno))?
+            .pid;
+        let cred = vfs::Cred::new(identity);
+        if let Err(e) = vfs.spawn_process(
+            pid,
+            crate::INIT,
+            cred.clone(),
+            Some(sess.mnt_ns.clone()),
+            None,
+            None,
+        ) {
+            let _ = state
+                .table
+                .exit("mount-page", pid, 1, None, crate::now_secs());
+            return Err(map_errno(e));
+        }
+        sess.page_proxy = Some(pid);
+        rt.proc_meta.insert(
+            pid,
+            crate::vfs_engine::ProcessVfsMeta::with_cred(Some(session_id.into()), false, cred),
+        );
+        Ok(pid)
+    }
+
     /// `proxy` and `socket_op` are supplied ONLY by the worker dispatcher. socket_op calls
     /// the same sockRequest used by guest workers, including SAB initialization and wakeups.
     pub async fn page_unix_rpc(
@@ -466,6 +548,12 @@ impl Kernel {
     ) -> Result<JsValue, JsValue> {
         let peer = self.page_peer(&session_id, proxy).map_err(map_errno)?;
         abi::socket::validate_unix_path(&socket).map_err(map_errno)?;
+        let mount = socket == SYSTEM_MOUNT_SOCK || socket == user_mount_sock(peer.uid);
+        let export = socket == abi::export_ctl::SYSTEM_EXPORT_SOCK
+            || socket == abi::export_ctl::user_export_sock(peer.uid);
+        if !mount && !export {
+            return Err(map_errno(Errno::EACCES));
+        }
         if payload.len() >= MAX_FRAME_BYTES {
             return Err(map_errno(Errno::E2BIG));
         }
@@ -477,7 +565,9 @@ impl Kernel {
             .as_u64()
             .ok_or_else(|| map_errno(Errno::EIO))?;
         let result = async {
-            let deadline = crate::now_ms() + 10_000;
+            // A negotiated remote mount may try WebRTC before falling back to relay.
+            let remote = value["fstype"] == "sharefs" || value["op"] == "publish";
+            let deadline = crate::now_ms() + if remote { 45_000 } else { 10_000 };
             let check = || {
                 self.page_peer(&session_id, proxy).map_err(map_errno)?;
                 if crate::now_ms() >= deadline {
@@ -487,15 +577,12 @@ impl Kernel {
             };
             check()?;
             let connection = call(json!({"op":"connect","sockId":id,"path":socket})).await?;
-            let expected_uid = if socket == user_mount_sock(peer.uid) {
-                Some(peer.uid)
-            } else if socket == SYSTEM_MOUNT_SOCK {
-                Some(0)
-            } else {
-                None
-            };
-            if expected_uid
-                .is_some_and(|uid| connection["peerCred"]["uid"].as_u64() != Some(uid.into()))
+            let server: PeerCred = serde_json::from_value(connection["peerCred"].clone())
+                .map_err(|_| map_errno(Errno::EACCES))?;
+            if !(mount && self.is_service_image(server.pid, "mountd")
+                || export && self.is_service_image(server.pid, "exportd"))
+                || socket.starts_with("/run/user/") && server.uid != peer.uid
+                || socket == SYSTEM_MOUNT_SOCK && server.uid != 0
             {
                 return Err(map_errno(Errno::EACCES));
             }
@@ -504,7 +591,7 @@ impl Kernel {
                 check()?;
                 let fds: Vec<_> = optional_fd
                     .filter(|_| sent == 0)
-                    .map(|fd| json!({"kind":"kfd","kfd":fd,"isDir":true,"pathOnly":true}))
+                    .map(|fd| json!({"kind":"kfd","kfd":fd,"isDir":true,"pathOnly":false}))
                     .into_iter()
                     .collect();
                 let chunk = &frame[sent..frame.len().min(sent + 4096)];
@@ -671,7 +758,7 @@ impl Kernel {
         let host = |op: Value| {
             host_call(
                 &adapter,
-                json!({"uid":uid,"sessionId":session_id,"loginEpoch":epoch,"operation":op}),
+                json!({"pid":pid,"uid":uid,"sessionId":session_id,"loginEpoch":epoch,"operation":op}),
             )
         };
         let value = match req.op {
@@ -783,6 +870,15 @@ impl Kernel {
                     .await
                     .map_err(map_errno)?;
                 for a in &mut rows {
+                    if a.fstype == "sharefs"
+                        && let Some(mode) = a
+                            .source_label
+                            .strip_prefix("sharefs:")
+                            .and_then(|s| s.split_once(':'))
+                            .map(|(mode, _)| mode)
+                    {
+                        a.options.push(format!("transport={mode}"));
+                    }
                     if let Some(id) = table.attached.borrow().get(&a.mount_id) {
                         a.source_id = Some(id.clone());
                     }
@@ -855,6 +951,7 @@ impl Kernel {
                 Value::Null
             }
             MountBackendOp::Activate {
+                additional_sources,
                 source_id,
                 name,
                 execute,
@@ -863,7 +960,9 @@ impl Kernel {
                     return Err(map_errno(Errno::EACCES));
                 }
                 let s = table.get(&source_id, uid).map_err(map_errno)?;
-                if s.state != SourceState::Granted || execute && !s.execute {
+                if s.state != SourceState::Granted
+                    || execute && !s.execute && s.kind != SourceKind::SelectedFiles
+                {
                     return Err(map_errno(Errno::EACCES));
                 }
                 let sid = session_id
@@ -888,6 +987,41 @@ impl Kernel {
                         && a.owner_uid == Some(uid)
                         && table.attached.borrow().get(&a.mount_id) == Some(&source_id)
                 });
+                // Selected files are immutable installation media. Activation verifies their
+                // manifests and blobs before installing the composed executable image.
+                if !additional_sources.is_empty() || s.kind == SourceKind::SelectedFiles {
+                    let mut paths = Vec::new();
+                    for id in std::iter::once(&source_id).chain(&additional_sources) {
+                        let grant = table.get(id, uid).map_err(map_errno)?;
+                        let r = rows
+                            .iter()
+                            .find(|r| {
+                                r.owner_uid == Some(uid)
+                                    && r.fstype != "image"
+                                    && table.attached.borrow().get(&r.mount_id) == Some(id)
+                            })
+                            .ok_or_else(|| map_errno(Errno::ENOENT))?;
+                        if grant.state != SourceState::Granted
+                            || execute && r.noexec && grant.kind != SourceKind::SelectedFiles
+                        {
+                            return Err(map_errno(Errno::EACCES));
+                        }
+                        paths.push(r.target.clone());
+                    }
+                    let result = self
+                        .mount_user(
+                            sid.to_owned(),
+                            json!({"kind":"image","name":name,"sources":paths,"execute":execute})
+                                .to_string(),
+                            JsValue::NULL,
+                        )
+                        .await?;
+                    let mid = Reflect::get(&result, &"mountId".into())?
+                        .as_f64()
+                        .ok_or_else(|| map_errno(Errno::EIO))? as u64;
+                    table.attached.borrow_mut().insert(mid, source_id);
+                    return Ok(JsValue::NULL);
+                }
                 let backing = if let Some(row) = row {
                     if execute && row.noexec {
                         return Err(map_errno(Errno::EACCES));
@@ -907,9 +1041,9 @@ impl Kernel {
                         .await
                         .map_err(map_errno)?
                 } else {
-                    let prepared = host_value(&adapter, json!({"uid":uid,"sessionId":sid,"loginEpoch":epoch,
+                    let prepared = host_value(&adapter, json!({"pid":pid,"uid":uid,"sessionId":sid,"loginEpoch":epoch,
                         "operation":{"op":"image_source","source_id":source_id,"target":target,"fstype":s.kind.fstype(),"flags":mount_flags::MS_RDONLY}})).await?;
-                    image_from_grant(&s, prepared, &cred, &target, execute).await?
+                    image_from_grant(self, &s, prepared, &cred, &target, execute).await?
                 };
                 let provider = Rc::clone(&backing.provider);
                 let check = || {
@@ -1005,7 +1139,6 @@ impl Kernel {
                         name,
                         cloud: false,
                         provider,
-                        local_mount: None,
                     },
                 );
                 session.generation = session.generation.wrapping_add(1);

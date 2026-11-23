@@ -177,6 +177,7 @@ fn parse(args: &[String]) -> Result<MountRequest, String> {
             source_id: source.to_string(),
             name: name.to_string(),
             execute: exec,
+            additional_sources: Vec::new(),
         }),
         ("forget", [id]) => Ok(MountRequest::ForgetSource {
             source_id: id.to_string(),

@@ -494,6 +494,7 @@ pub enum ExportDirCall {
     Publish {
         id: String,
         name: String,
+        publisher_pid: u32,
         manager_uid: Option<u32>,
         expires_at: u64,
         rule: ExportRule,

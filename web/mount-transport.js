@@ -151,7 +151,7 @@ export function mountListener(options) {
 }
 
 const MAX_FRAME = 384 * 1024;
-const frameError = errno => Object.assign(new Error(errno), { errno });
+const frameError = errno => Object.assign(new Error(errno === 'ENOTCONN' ? 'The shared folder is disconnected.' : errno), { errno });
 const textEncoder = new TextEncoder(), textDecoder = new TextDecoder('utf-8', { fatal: true });
 
 function encodeFrame(frame) {
@@ -291,9 +291,11 @@ export function exportRelayAdapter(listenerFor, attachClient) {
       try { return await exportRelayRpc(args); }
       finally { port?.postMessage({ type: 'close' }); port?.close(); }
     }
-    const grant = await exportRelayRpc(args);
+    const { publisher_pid, owner_uid, ...registration } = args;
+    const grant = await exportRelayRpc(registration);
     if (args.op !== 'publish') return grant;
-    const port = await listenerFor(args.id);
+    const listener = await listenerFor({ id: args.id, publisher_pid, owner_uid });
+    const port = listener?.port;
     if (!port) {
       await exportRelayRpc({ op: 'revoke', id: args.id });
       throw frameError('ENOTCONN');
@@ -310,7 +312,7 @@ export function exportRelayAdapter(listenerFor, attachClient) {
             // Only the authenticated claim endpoint can mint the kernel grant.
             // The port forwards bytes and the one-time admission ticket.
             const kind = data.transport ?? 'relay';
-            void attachClient({ export_id: args.id, session: data.session, ticket: data.admission, transport: kind, port: channel }).then(() => {
+            void attachClient({ publisherSession: listener.session, export_id: args.id, session: data.session, ticket: data.admission, transport: kind, port: channel }).then(() => {
               channel.postMessage({ type: 'connect', role: 'owner', transport: kind, expires: grant.expires,
                 url: `/api/mounts/channel/${args.id}/${data.session}?ticket=${data.ticket}` });
             }).catch(error => {

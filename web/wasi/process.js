@@ -47,6 +47,7 @@ const OFLAG_CREAT = 1, OFLAG_DIRECTORY = 2, OFLAG_EXCL = 4, OFLAG_TRUNC = 8, FDF
 const RIGHT_READ = 1n << 1n, RIGHT_SEEK = 1n << 2n, RIGHT_TELL = 1n << 5n, RIGHT_WRITE = 1n << 6n;
 const ALL_RIGHTS = (1n << 30n) - 1n;
 const INLINE = 256 * 1024, VFS_CHUNK = 512 * 1024;
+const EXPORT_DIR_IOCTL = 0x45580001;
 const FICLONE = 0x40049409, FICLONERANGE = 0x4020940d, ACCEL_SUBMIT = 0x54570101;
 const COWFS_IOC_SEND = 0x54570209, COWFS_IOC_RECEIVE = 0x5457020a, LOOP_SET_FD = 0x4c00;
 
@@ -2583,7 +2584,9 @@ function translateCallFds(call) {
     }
   }
   if (name === 'ioctl') {
-    if ((args.request === FICLONE || args.request === LOOP_SET_FD) && Number.isInteger(args.arg)) {
+    if (args.request === EXPORT_DIR_IOCTL && args.arg?.op === 'admit_local') {
+      args.arg.socket_fd = sockDescriptor(args.arg.socket_fd).sockId;
+    } else if ((args.request === FICLONE || args.request === LOOP_SET_FD) && Number.isInteger(args.arg)) {
       args.arg = translateGuestFd(args.arg);
     } else if (args.request === FICLONERANGE && args.arg && typeof args.arg === 'object' && Number.isInteger(args.arg.src_fd)) {
       args.arg.src_fd = translateGuestFd(args.arg.src_fd);
@@ -3029,6 +3032,7 @@ const osApi = {
         }
         serviceGrant = {
           mountNamespace: g.mountNamespace,
+          ...(g.exportImpersonate === true ? { exportImpersonate: true } : {}),
           bindMounts: binds.map(b => ({ source: b.source, target: b.target, readOnly: b.readOnly })),
           ...(g.user != null ? { user: g.user } : {}),
           ...(g.group != null ? { group: g.group } : {}),

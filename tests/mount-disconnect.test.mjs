@@ -1,37 +1,51 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { attachMount } from '../web/kernel/mount-sharing.js';
+import { attachPortTransport } from '../web/mount-transport.js';
 
-async function remote(t, receive) {
-  const channel = new MessageChannel(), workspace = { check() {}, identity: { uid: 1 } };
-  t.mock.method(globalThis, 'fetch', async () => Response.json({ id: crypto.randomUUID(), session: crypto.randomUUID(), ticket: 'test', expires: Date.now() + 60000, uid: 1, write: true }));
-  channel.port1.onmessage = ({ data }) => {
-    if (data.type === 'connect') channel.port1.postMessage({ type: 'ready' });
-    else if (data.type === 'send') receive(data.message, channel.port1);
+function remote(t, receive) {
+  const { port1, port2 } = new MessageChannel();
+  const transport = attachPortTransport(port2, 'relay');
+  port1.onmessage = ({ data }) => {
+    if (data.type !== 'frame') return;
+    const length = new DataView(data.bytes).getUint32(0);
+    assert.equal(length, data.bytes.byteLength - 4);
+    receive(JSON.parse(new TextDecoder().decode(new Uint8Array(data.bytes, 4))), port1);
   };
-  const mount = await attachMount(workspace, { address: 'osfs:' + crypto.randomUUID(), port: channel.port2, writable: true });
-  t.after(() => { mount.unmount(mount.grant); channel.port1.close(); });
-  return mount;
+  t.after(() => { transport.close(); port1.close(); });
+  return transport;
+}
+
+const read = { op: 'read', handle: 1, offset: 0, len: 4 };
+const write = { op: 'write', handle: 1, offset: 0, data: 'AQ==' };
+function disconnected(error) {
+  assert.equal(error.errno, 'ENOTCONN');
+  assert.equal(error.uncertain_writes, false);
+  assert.match(error.message, /shared folder is disconnected/);
+  assert.doesNotMatch(error.message, /saved|file change|write/);
+  return true;
 }
 
 test('a lost connection warns only requests with an unconfirmed file change', async t => {
   let received = 0;
-  const mount = await remote(t, (_message, port) => { if (++received === 2) port.postMessage({ type: 'closed', errno: 'ENODEV' }); });
-  const [read, write] = await Promise.allSettled([
-    mount.read(mount.grant, 'file', 0, 4),
-    mount.write(mount.grant, 'file', new Uint8Array([1])),
+  const mount = remote(t, (_frame, port) => { if (++received === 2) port.postMessage({ type: 'closed', errno: 'ENODEV' }); });
+  await Promise.all([
+    assert.rejects(mount.request(read), disconnected),
+    assert.rejects(mount.request(write), error => {
+      assert.equal(error.errno, 'EIO');
+      assert.equal(error.uncertain_writes, true);
+      assert.match(error.message, /may already have been saved/);
+      return true;
+    }),
   ]);
-  assert.equal(read.status, 'rejected'); assert.equal(write.status, 'rejected');
-  assert.match(read.reason.message, /shared folder is disconnected/);
-  assert.doesNotMatch(read.reason.message, /saved|file change|write/);
-  assert.match(write.reason.message, /may already have been saved/);
+  assert.equal(mount.uncertain_writes, true);
 });
 
 test('an acknowledged change is not reported uncertain by a later disconnected read', async t => {
-  const mount = await remote(t, (message, port) => {
-    if (message.op === 'write') port.postMessage({ type: 'message', message: { type: 'reply', id: message.id, value: { written: 1 } } });
+  const mount = remote(t, ({ request, request_id }, port) => {
+    if (request.op === 'write') port.postMessage({ type: 'message', message: { type: 'reply', request_id, result: { Ok: { written: 1 } } } });
     else port.postMessage({ type: 'closed', errno: 'ENODEV' });
   });
-  assert.equal((await mount.write(mount.grant, 'file', new Uint8Array([1]))).written, 1);
-  await assert.rejects(mount.read(mount.grant, 'file', 0, 4), error => /disconnected/.test(error.message) && !/saved/.test(error.message));
+  assert.equal((await mount.request(write)).written, 1);
+  await assert.rejects(mount.request(read), disconnected);
+  assert.equal(mount.uncertain_writes, false);
 });

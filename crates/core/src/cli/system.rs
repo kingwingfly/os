@@ -64,7 +64,8 @@ impl Manual for ProviderCtl {
 ///
 /// With no operands (or with `-t` only), lists visible mounts from `/proc/self/mountinfo`.
 /// Otherwise attaches a new filesystem (`-t`), bind-mounts (`-B`/`-R`), moves (`-M`), remounts
-/// (`-o remount,...`), or changes mount propagation (`--make-*`).
+/// (`-o remount,...`), or changes mount propagation (`--make-*`). Browser grants and osfs shares
+/// use mountd, which authorizes the calling process.
 #[derive(Parser, Debug)]
 #[command(
     name = "mount",

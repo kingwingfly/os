@@ -9,6 +9,7 @@ use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(target_os = "wasi")]
 use std::os::wasi::io::{AsRawFd, FromRawFd};
+use std::time::{Duration, Instant};
 
 const USAGE:&str="Usage: exportctl publish [--name NAME] [--rw] [--exec] [--seconds N] [--password PASS] [--ipc-only] [--json] PATH
        exportctl list [--json]
@@ -93,12 +94,58 @@ fn sys<T: DeserializeOwned>(call: Call) -> Result<T, Errno> {
 }
 fn rpc(req: &ExportRequest) -> Result<ExportResponse, Errno> {
     let uid = sys::<abi::Creds>(Call::Getcreds)?.uid;
-    let stream = match UnixStream::connect(&user_export_sock(uid)) {
-        Ok(s) if s.peer_cred()?.uid == uid && uid != 0 => s,
-        Ok(_) => return Err(Errno::EACCES),
-        Err(Errno::ENOENT | Errno::ECONNREFUSED) => UnixStream::connect(SYSTEM_EXPORT_SOCK)?,
+    let startup = Instant::now() + Duration::from_secs(1);
+    let user = loop {
+        if uid == 0 {
+            break None;
+        }
+        match UnixStream::connect(&user_export_sock(uid)) {
+            Ok(stream) if stream.peer_cred()?.uid == uid => break Some(stream),
+            Ok(_) => return Err(Errno::EACCES),
+            Err(Errno::ENOENT | Errno::ECONNREFUSED) => {
+                if !matches!(req, ExportRequest::Publish { .. }) || Instant::now() >= startup {
+                    break None;
+                }
+                // The session manager binds its socket asynchronously during login.
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let Some(stream) = user else {
+        return exchange(UnixStream::connect(SYSTEM_EXPORT_SOCK)?, req);
+    };
+    let first = exchange(stream, req)?;
+    let needs_lookup = matches!(
+        req,
+        ExportRequest::Status { .. }
+            | ExportRequest::ListClients { .. }
+            | ExportRequest::Revoke { .. }
+    ) && matches!(
+        first,
+        ExportResponse::Error {
+            errno: Errno::EACCES
+        }
+    );
+    if !needs_lookup && !matches!(first, ExportResponse::Exports { .. }) {
+        return Ok(first);
+    }
+    // A grant published through the system socket remains there when the user service starts.
+    let system = match UnixStream::connect(SYSTEM_EXPORT_SOCK) {
+        Ok(stream) => exchange(stream, req)?,
+        Err(Errno::ENOENT | Errno::ECONNREFUSED) => return Ok(first),
         Err(e) => return Err(e),
     };
+    match (first, system) {
+        (ExportResponse::Exports { mut exports }, ExportResponse::Exports { exports: others }) => {
+            exports.extend(others);
+            Ok(ExportResponse::Exports { exports })
+        }
+        (_, reply) => Ok(reply),
+    }
+}
+
+fn exchange(stream: UnixStream, req: &ExportRequest) -> Result<ExportResponse, Errno> {
     let root = if let ExportRequest::Publish { source_path, .. } = req {
         let opened: abi::Opened = sys(Call::OpenAt {
             dirfd: (abi::OS_FD_CWD as u32).into(),

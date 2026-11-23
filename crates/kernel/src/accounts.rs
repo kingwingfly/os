@@ -52,6 +52,7 @@ pub const WHEEL_GID: u32 = 10;
 pub const DEFAULT_PASSWD: &str = "\
 root:x:0:0:root:/root:/bin/sh
 user:x:1000:1000:Local User:/home/user:/bin/sh
+exportd:x:998:998:Export service:/nonexistent:/sbin/nologin
 nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin
 ";
 
@@ -60,6 +61,7 @@ pub const DEFAULT_GROUP: &str = "\
 root:x:0:
 wheel:x:10:user
 user:x:1000:
+exportd:x:998:
 nogroup:x:65534:
 ";
 
@@ -68,6 +70,7 @@ nogroup:x:65534:
 pub const DEFAULT_SHADOW: &str = "\
 root:!:0:0:99999:7:::
 user:!:0:0:99999:7:::
+exportd:*:0:0:99999:7:::
 nobody:*:0:0:99999:7:::
 ";
 
@@ -77,8 +80,8 @@ root ALL=(ALL:ALL) ALL
 %wheel ALL=(ALL:ALL) NOPASSWD: ALL
 ";
 
-const RESERVED_GROUPS: &[&str] = &["root", "wheel", "nogroup"];
-const RESERVED_USERS: &[&str] = &["root", "nobody"];
+const RESERVED_GROUPS: &[&str] = &["root", "wheel", "nogroup", "exportd"];
+const RESERVED_USERS: &[&str] = &["root", "nobody", "exportd"];
 
 /// Protected system directories that `userdel -r` MUST NEVER remove even if referenced as a user's
 /// home directory in `/etc/passwd`.

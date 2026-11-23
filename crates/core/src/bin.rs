@@ -195,6 +195,10 @@ pub const UTILITIES: &[&str] = &[
 pub fn image(name: &str) -> Option<&'static str> {
     if name == "init" {
         Some("init")
+    } else if name == "mountd" {
+        Some("mountd")
+    } else if name == "exportd" {
+        Some("exportd")
     } else if name == "early_init" {
         Some("early_init")
     } else if name == "supervise" {

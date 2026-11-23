@@ -444,6 +444,7 @@ impl ExportDaemon {
                     ExportDirCall::Publish {
                         id: id.clone(),
                         name: name.clone(),
+                        publisher_pid: peer.pid,
                         manager_uid: self.manager_uid,
                         expires_at,
                         rule,

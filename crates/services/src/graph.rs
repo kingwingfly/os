@@ -394,6 +394,67 @@ fn find_cycle(ordered_after: &BTreeMap<String, BTreeSet<String>>) -> Vec<String>
     Vec::new()
 }
 
+fn filesystem_service(name: &str, user: bool) -> UnitSpec {
+    let export = name == "exportd";
+    let mut after = Vec::new();
+    if !user {
+        after.push("local-fs.target".into());
+    }
+    if export {
+        after.push("mountd.service".into());
+    }
+    let mut argv = vec![format!("/usr/bin/{name}")];
+    if user {
+        argv.push("--user".into());
+    }
+    UnitSpec {
+        version: UNIT_MANIFEST_VERSION,
+        name: format!("{name}.service"),
+        kind: UnitKind::Service,
+        description: format!("{name} filesystem service"),
+        after,
+        wants: vec![],
+        requires: vec![],
+        wanted_by: if user {
+            vec![]
+        } else {
+            vec!["multi-user.target".into()]
+        },
+        failure_policy: FailurePolicy::Required,
+        readiness: Readiness::NotifySocket,
+        ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+        stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+        restart: RestartPolicy::OnFailure {
+            max_attempts: 5,
+            backoff_ms: 250,
+        },
+        exec_start: Some(argv),
+        exec_stop: None,
+        cwd: Some("/".into()),
+        environment: BTreeMap::new(),
+        mount: None,
+        enabled: true,
+        grant: CapabilityGrant {
+            user: (export && !user).then(|| "exportd".into()),
+            mount_namespace: if user {
+                MountNsPolicy::Session
+            } else {
+                MountNsPolicy::System
+            },
+            export_impersonate: export,
+            builtin_exportd: export,
+            ..Default::default()
+        },
+    }
+}
+
+pub fn default_user_units() -> Vec<UnitSpec> {
+    vec![
+        filesystem_service("mountd", true),
+        filesystem_service("exportd", true),
+    ]
+}
+
 /// Built-in Contract v2 default system unit catalog (`local-fs.target`, `multi-user.target`,
 /// `user-session@.service`, `cloud-online.target`, `cloud.mount`, `devattach@.service`).
 pub fn default_system_units() -> Vec<UnitSpec> {
@@ -407,6 +468,8 @@ pub fn default_system_units() -> Vec<UnitSpec> {
     cloud_online_wants.extend(cloud_dev_units);
 
     vec![
+        filesystem_service("mountd", false),
+        filesystem_service("exportd", false),
         UnitSpec {
             version: UNIT_MANIFEST_VERSION,
             name: "local-fs.target".into(),
@@ -474,6 +537,8 @@ pub fn default_system_units() -> Vec<UnitSpec> {
             environment: BTreeMap::new(),
             mount: None,
             grant: CapabilityGrant {
+                export_impersonate: false,
+                builtin_exportd: false,
                 user: Some("%i".into()),
                 group: None,
                 mount_namespace: MountNsPolicy::System,
@@ -627,6 +692,21 @@ pub fn default_boot_graph(default_uid: u32) -> Result<UnitGraph, GraphError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_builtin_exportd_manifests_can_request_impersonation() {
+        for (user, manager_uid) in [(false, 0), (true, 1000)] {
+            let unit = filesystem_service("exportd", user);
+            assert!(unit.authorize_for_manager(manager_uid).is_ok());
+            let manifest = serde_json::to_string(&unit).unwrap();
+            let custom: UnitSpec = serde_json::from_str(&manifest).unwrap();
+            assert_eq!(
+                custom.authorize_for_manager(manager_uid).unwrap_err().errno,
+                abi::Errno::EPERM
+            );
+            assert!(!filesystem_service("mountd", user).grant.export_impersonate);
+        }
+    }
 
     #[test]
     fn default_boot_graph_orders_and_requires_user_session_before_multi_user() {

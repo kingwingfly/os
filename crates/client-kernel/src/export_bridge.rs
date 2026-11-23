@@ -479,6 +479,7 @@ impl Kernel {
                 rule,
                 password,
                 mut transports,
+                publisher_pid,
             } => {
                 let now = crate::now_ms();
                 if !valid_id(&id)
@@ -508,7 +509,7 @@ impl Kernel {
                 let mut account = None;
                 if transports.iter().any(|t| *t != TransportKind::Ipc) {
                     let registration = json!({
-                        "op": "publish", "id": id, "name": name, "expires_at": expires_at,
+                        "op": "publish", "publisher_pid": publisher_pid, "owner_uid": root.cred().identity.id, "id": id, "name": name, "expires_at": expires_at,
                         "transports": transports, "write": rule.writable, "execute": rule.execute,
                         "password": password.unwrap_or_default(),
                     });
@@ -1102,6 +1103,13 @@ impl Drop for GuestStream {
 }
 
 impl ExportBridge {
+    pub(crate) fn has_ipc_export(&self, id: &str) -> bool {
+        self.exports
+            .borrow()
+            .get(id)
+            .is_some_and(|entry| entry.transports.contains(&TransportKind::Ipc))
+    }
+
     /// Mountd tries this local registry and socket first when selecting a transport.
     pub async fn connect_share_ipc(
         &self,

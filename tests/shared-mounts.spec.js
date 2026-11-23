@@ -7,7 +7,12 @@ async function client(browser) {
   await page.goto('/');
   await page.waitForFunction(() => Boolean(window.os?.shareMount && window.os?.sharedMounts));
   const [localCreds] = await batch(page, ['getcreds']);
-  const relay = await page.evaluate(() => window.os.sharedMounts());
+  // Remote ACL entries name the authenticated relay account. Local login UIDs can match across tabs.
+  const relay = await page.evaluate(async () => {
+    const res = await fetch('/api/mounts/list', { method: 'POST', body: '{}' });
+    if (!res.ok) throw new Error('Could not inspect relay account: ' + res.status);
+    return res.json();
+  });
   return { context, page, uid: relay.uid, localUid: localCreds.ok.uid };
 }
 async function dispose(...clients) { for (const client of clients) await client?.context.close(); }

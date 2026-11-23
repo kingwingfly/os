@@ -2245,6 +2245,7 @@ fn unshare_setns_clone_sharing_mountinfo_escaping_and_all_drivers() {
             dash: WASM_BIN.len() as u64,
             supervise: WASM_BIN.len() as u64,
             init: WASM_BIN.len() as u64,
+            ..Default::default()
         },
         Timespec {
             sec: 1_700_000_000,

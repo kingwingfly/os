@@ -335,6 +335,10 @@ pub struct BuildAssetSizes {
     pub dash: u64,
     pub supervise: u64,
     pub init: u64,
+    #[serde(default)]
+    pub mountd: u64,
+    #[serde(default)]
+    pub exportd: u64,
 }
 
 struct ImageNode {
@@ -762,30 +766,6 @@ impl<B: BlobStore> ImageFs<B> {
                 node: ImageNodeKind::Directory,
             },
             ImageEntry {
-                path: "/usr/bin/init".into(),
-                uid: 0,
-                gid: 0,
-                mode: 0o755,
-                node: ImageNodeKind::File {
-                    blob_id: "/usr/bin/init.wasm".into(),
-                    size: sizes.init,
-                    chunk_size: None,
-                    chunks: Vec::new(),
-                },
-            },
-            ImageEntry {
-                path: "/usr/bin/supervise".into(),
-                uid: 0,
-                gid: 0,
-                mode: 0o755,
-                node: ImageNodeKind::File {
-                    blob_id: "/usr/bin/supervise.wasm".into(),
-                    size: sizes.supervise,
-                    chunk_size: None,
-                    chunks: Vec::new(),
-                },
-            },
-            ImageEntry {
                 path: "/usr/bin/dash".into(),
                 uid: 0,
                 gid: 0,
@@ -831,6 +811,26 @@ impl<B: BlobStore> ImageFs<B> {
                 },
             },
         ];
+
+        for (name, size) in [
+            ("init", sizes.init),
+            ("supervise", sizes.supervise),
+            ("mountd", sizes.mountd),
+            ("exportd", sizes.exportd),
+        ] {
+            entries.push(ImageEntry {
+                path: format!("/usr/bin/{name}"),
+                uid: 0,
+                gid: 0,
+                mode: 0o755,
+                node: ImageNodeKind::File {
+                    blob_id: format!("/usr/bin/{name}.wasm"),
+                    size,
+                    chunk_size: None,
+                    chunks: vec![],
+                },
+            });
+        }
 
         for (names, target) in [
             (os_core::bin::PROGRAMS, "coreutils"),

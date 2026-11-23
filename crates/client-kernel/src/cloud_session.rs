@@ -298,11 +298,13 @@ fn unlink_oldroot_bounded<'a>(
     })
 }
 
-fn extract_supervisor_digests_from_image(img: &Image) -> HashMap<String, String> {
+fn extract_service_digests_from_image(img: &Image) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for entry in &img.entries {
-        if matches!(entry.path.as_str(), "/usr/bin/init" | "/usr/bin/supervise")
-            && let Node::File { sha256, .. } = &entry.node
+        if matches!(
+            entry.path.as_str(),
+            "/usr/bin/init" | "/usr/bin/supervise" | "/usr/bin/mountd" | "/usr/bin/exportd"
+        ) && let Node::File { sha256, .. } = &entry.node
         {
             out.insert(entry.path.clone(), sha256.clone());
         }
@@ -310,7 +312,7 @@ fn extract_supervisor_digests_from_image(img: &Image) -> HashMap<String, String>
     out
 }
 
-fn extract_supervisor_digests_from_composition(json_text: &str) -> HashMap<String, String> {
+fn extract_service_digests_from_composition(json_text: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let Ok(val) = serde_json::from_str::<Value>(json_text) else {
         return out;
@@ -320,7 +322,10 @@ fn extract_supervisor_digests_from_composition(json_text: &str) -> HashMap<Strin
         let Some(path) = entry.get("path").and_then(|v| v.as_str()) else {
             return;
         };
-        if !matches!(path, "/usr/bin/init" | "/usr/bin/supervise") {
+        if !matches!(
+            path,
+            "/usr/bin/init" | "/usr/bin/supervise" | "/usr/bin/mountd" | "/usr/bin/exportd"
+        ) {
             return;
         }
         let sha = entry.get("sha256").and_then(|v| v.as_str()).or_else(|| {
@@ -352,6 +357,8 @@ fn default_asset_sizes() -> BuildAssetSizes {
         dash: 64 * 1024,
         supervise: 64 * 1024,
         init: 64 * 1024,
+        mountd: 64 * 1024,
+        exportd: 64 * 1024,
     }
 }
 
@@ -1546,7 +1553,7 @@ impl Kernel {
             let has_composition = opts
                 .as_ref()
                 .is_some_and(|o| o.system_composition.is_some() || o.base_image.is_some());
-            let mut trusted_supervisor_digests = HashMap::new();
+            let mut trusted_service_digests = HashMap::new();
             let usr_image = if let Some(base_json) =
                 opts.as_ref().and_then(|o| o.base_image.as_ref())
             {
@@ -1555,7 +1562,7 @@ impl Kernel {
                     HashMap<String, String>,
                 )> = (|| {
                     let base_img = Image::parse(base_json.as_bytes()).map_err(|_| Errno::EINVAL)?;
-                    let sup_digests = extract_supervisor_digests_from_image(&base_img);
+                    let sup_digests = extract_service_digests_from_image(&base_img);
                     let mut ext_imgs = Vec::new();
                     if let Some(o) = opts.as_ref() {
                         for ext_json in &o.extension_images {
@@ -1574,7 +1581,7 @@ impl Kernel {
                 })();
                 match build_res {
                     Ok((img, sup)) => {
-                        trusted_supervisor_digests = sup;
+                        trusted_service_digests = sup;
                         img
                     }
                     Err(e) => {
@@ -1604,8 +1611,8 @@ impl Kernel {
                     blob_store,
                 ) {
                     Ok(img) => {
-                        trusted_supervisor_digests =
-                            extract_supervisor_digests_from_composition(comp_json);
+                        trusted_service_digests =
+                            extract_service_digests_from_composition(comp_json);
                         img
                     }
                     Err(e) => {
@@ -1631,6 +1638,8 @@ impl Kernel {
             if !has_composition {
                 for (bin_path, asset_url) in [
                     ("/usr/bin/init", "/usr/bin/init.wasm"),
+                    ("/usr/bin/mountd", "/usr/bin/mountd.wasm"),
+                    ("/usr/bin/exportd", "/usr/bin/exportd.wasm"),
                     ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),
                     ("/usr/bin/dash", "/usr/bin/dash.wasm"),
                     ("/usr/bin/coreutils", "/usr/bin/coreutils.wasm"),
@@ -1897,7 +1906,7 @@ impl Kernel {
             let mut rt = self.vfs_rt.borrow_mut();
             rt.usr_fs_id = usr_fs_id;
             rt.usr_blob_paths = usr_blob_paths;
-            rt.trusted_supervisor_digests = trusted_supervisor_digests;
+            rt.trusted_service_digests = trusted_service_digests;
             rt.stage1_reclaimed_entries = reclaimed;
         }
 
@@ -3421,7 +3430,7 @@ impl Kernel {
             rt.fsck_report = fsck_report;
             rt.usr_fs_id = FsId("image:stage2-usr".to_string());
             rt.usr_blob_paths.clear();
-            rt.trusted_supervisor_digests = extract_supervisor_digests_from_image(&base);
+            rt.trusted_service_digests = extract_service_digests_from_image(&base);
         }
         Ok(self.standalone_status_json().to_string())
     }

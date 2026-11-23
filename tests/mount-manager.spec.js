@@ -79,7 +79,7 @@ test('picker cancellation and permission denial never downgrade to the helper', 
   await page.evaluate(() => { window.pickerError = 'AbortError'; window.showDirectoryPicker = async () => { throw new DOMException('Folder access denied', window.pickerError); }; });
   await open(page, 'add');
   const choose = app(page).getByRole('button', { name: 'Choose folder…', exact: true });
-  await choose.click(); await expect(choose).toBeEnabled(); await expect(app(page).locator('.mount-notice')).toHaveText('');
+  await choose.click(); await expect(choose).toBeEnabled(); await expect(app(page).locator('.mount-notice')).toHaveText('Cancelled.');
   await page.evaluate(() => { window.pickerError = 'NotAllowedError'; }); await choose.click();
   await expect(app(page).locator('.mount-notice')).toContainText('Folder access denied');
   await expect(app(page).locator('[data-helper]')).toBeHidden();

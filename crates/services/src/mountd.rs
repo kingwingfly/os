@@ -273,6 +273,7 @@ fn dispatch(
                         b,
                         target_pid,
                         MountBackendOp::Activate {
+                            additional_sources: vec![],
                             source_id: s.id,
                             name: name.into(),
                             execute,
@@ -383,6 +384,7 @@ fn dispatch(
             )
         }
         MountRequest::ActivatePrivate {
+            additional_sources,
             source_id,
             name,
             execute,
@@ -392,13 +394,24 @@ fn dispatch(
             }
             let s = source(b, uid, None, &source_id)?;
             granted(&s)?;
-            if execute && !s.execute {
+            if execute && !s.execute && s.kind != SourceKind::SelectedFiles {
                 return Err(Errno::EACCES.into());
+            }
+            if additional_sources.len() >= 16 {
+                return Err(Errno::E2BIG.into());
+            }
+            for id in &additional_sources {
+                let grant = source(b, uid, None, id)?;
+                granted(&grant)?;
+                if execute && !grant.execute && grant.kind != SourceKind::SelectedFiles {
+                    return Err(Errno::EACCES.into());
+                }
             }
             apply(
                 b,
                 None,
                 MountBackendOp::Activate {
+                    additional_sources,
                     source_id,
                     name,
                     execute,

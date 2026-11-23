@@ -750,24 +750,6 @@ impl LocalMount {
         &self.state.grant
     }
 
-    pub(crate) fn grant_js(&self) -> JsValue {
-        self.state.grant_js.clone()
-    }
-
-    pub(crate) fn clone_owner(&self) -> Self {
-        let opens = Rc::new(RefCell::new(HashMap::new()));
-        self.state.register_view(&opens);
-        Self {
-            state: Rc::clone(&self.state),
-            identity: self.state.grant.owner.clone(),
-            boundary: Vec::new(),
-            remote: false,
-            next_local_open: Rc::new(Cell::new(1)),
-            path_checks: HashMap::new(),
-            opens,
-        }
-    }
-
     fn check_grant(&self, grant: &JsValue) -> std::result::Result<(), Errno> {
         if !js_sys::Object::is(grant, &self.state.grant_js) {
             return Err(Errno::EACCES);
