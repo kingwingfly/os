@@ -349,7 +349,7 @@ impl BrowserProcProvider {
                 && installed("cloudFsPost").is_ok()
                 && installed("serviceAuthPost").is_ok();
         }
-        installed("pageSysPost").is_ok()
+        self.cloud_mount.page_cloud_token().is_some() && installed("cloudFsPost").is_ok()
     }
 
     async fn proc_call(&self, cred: &Cred, call: Call) -> vfs::Result<Value> {
@@ -380,7 +380,7 @@ impl BrowserProcProvider {
                 Some(rem.token)
             }
         } else {
-            None
+            self.cloud_mount.page_cloud_token()
         };
         if let Some(token) = token {
             let Ok((global, post)) = installed("cloudFsPost") else {
@@ -425,9 +425,6 @@ impl BrowserProcProvider {
                 .ok_or(Errno::EIO)?
                 .into_result()
                 .map_err(|e| e.errno);
-        }
-        if proc_pid.is_some() {
-            return Err(Errno::ENOENT);
         }
         Err(Errno::ENOENT)
     }
