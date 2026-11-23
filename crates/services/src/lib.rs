@@ -1,5 +1,7 @@
 //! User-space service policy. Unit metadata conveys no account or resource authority.
 pub mod control;
+pub mod export_proto;
+pub mod exportd;
 pub mod graph;
 pub mod manager;
 pub mod mountd;

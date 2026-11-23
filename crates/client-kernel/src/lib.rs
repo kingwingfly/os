@@ -17,6 +17,7 @@ pub mod boot_stage;
 mod cloud_session;
 mod cloudfs;
 mod cowfs_bridge;
+pub mod export_bridge;
 mod helper;
 mod hostfs;
 mod local_accounts;

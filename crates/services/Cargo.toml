@@ -20,6 +20,10 @@ path = "src/bin/early_init.rs"
 name = "mountd"
 path = "src/bin/mountd.rs"
 
+[[bin]]
+name = "exportd"
+path = "src/bin/exportd.rs"
+
 [dependencies]
 abi = { package = "os-abi", path = "../abi" }
 os-core = { path = "../core" }

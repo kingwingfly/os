@@ -172,6 +172,7 @@ pub const UTILITIES: &[&str] = &[
     "faststart",
     "imagectl",
     "providerctl",
+    "exportctl",
     "mount",
     "umount",
     "findmnt",
