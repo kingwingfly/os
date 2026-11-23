@@ -25,9 +25,11 @@ Commands:\n\
   snapshot list [--json] [TARGET]                          List named snapshots\n\
   snapshot create [--json] [TARGET] <NAME>                 Create O(1) snapshot\n\
   snapshot delete [TARGET] <NAME>                          Delete named snapshot\n\
-  fork [--snapshot SNAP] [--json] [TARGET] <NEW_VOLUME>    Create O(1) volume fork\n\
-  send [--parent SNAP] [--archive] [-o FILE] [TARGET] [SNAP] Emit OSCOWS1 stream or .cowpack archive\n\
-  receive [--snapshot NAME] [--volume VOL] [-i FILE] [--json] [TARGET]\n\
+  fork [--snapshot SNAP] [--ephemeral] [--json] [TARGET] <NEW_VOLUME>\n\
+                                                           Create O(1) volume fork\n\
+  send [--parent SNAP] [--archive] [-o FILE] [-v] [TARGET] [SNAP]\n\
+                                                           Emit OSCOWS1 stream or .cowpack archive\n\
+  receive [--snapshot|--name NAME] [--volume VOL] [-i FILE] [--json] [TARGET]\n\
                                                            Verify and atomically receive OSCOWS1 stream\n\
   gc [--grace SECS] [--json] [TARGET]                      Run reachability mark-and-sweep GC\n";
 
@@ -136,7 +138,12 @@ fn find_any_vblk() -> Option<String> {
 
 /// Resolve a `TARGET` (`None` -> `/` falling back to `/dev/vd0`, `/dev/vdN`, mounted cowfs dir,
 /// or `volume:<uuid>`) and open an `O_RDONLY` fd on it. Returns `(fd, explicit_volume_override)`.
-fn open_target(target: Option<&str>) -> io::Result<(u32, Option<String>)> {
+///
+/// When `allow_unattached` is `false`, an unattached `volume:<uuid>` fails closed with `ENODEV`
+/// instead of silently targeting `/dev/vd0`. Only `cowfs receive` passes `allow_unattached = true`
+/// because `COWFS_IOC_RECEIVE` explicitly carries `target_volume` to create/update volumes in the
+/// store.
+fn open_target(target: Option<&str>, allow_unattached: bool) -> io::Result<(u32, Option<String>)> {
     match target {
         None => {
             if let Ok(fd) = open_fd("/", abi::O_RDONLY | abi::O_DIRECTORY, 0) {
@@ -158,6 +165,12 @@ fn open_target(target: Option<&str>) -> io::Result<(u32, Option<String>)> {
                 }
                 if let Some(dev) = find_vblk_for_volume(vol)? {
                     return Ok((open_fd(&dev, abi::O_RDONLY, 0)?, None));
+                }
+                if !allow_unattached {
+                    return Err(errno_io(
+                        Errno::ENODEV,
+                        &format!("volume:{vol} is not attached to any /dev/vdN device"),
+                    ));
                 }
                 let dev = find_any_vblk().ok_or_else(|| {
                     errno_io(Errno::ENODEV, "no /dev/vdN device available for volume")
@@ -291,7 +304,7 @@ fn run_info(args: &[String]) -> i32 {
             }
         }
     }
-    let (fd, _) = match open_target(target.as_deref()) {
+    let (fd, _) = match open_target(target.as_deref(), false) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("{}", format_err("info", &e));
@@ -409,7 +422,7 @@ fn run_subvol(args: &[String]) -> i32 {
         return 1;
     }
 
-    let (fd, _) = match open_target(target.as_deref()) {
+    let (fd, _) = match open_target(target.as_deref(), false) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("{}", format_err("subvol", &e));
@@ -471,7 +484,7 @@ fn run_snapshot(args: &[String]) -> i32 {
                 return 2;
             }
             let target = pos.into_iter().next();
-            let (fd, _) = match open_target(target.as_deref()) {
+            let (fd, _) = match open_target(target.as_deref(), false) {
                 Ok(pair) => pair,
                 Err(e) => {
                     eprintln!("{}", format_err("snapshot", &e));
@@ -530,7 +543,7 @@ fn run_snapshot(args: &[String]) -> i32 {
                 );
                 return 1;
             }
-            let (fd, _) = match open_target(target.as_deref()) {
+            let (fd, _) = match open_target(target.as_deref(), false) {
                 Ok(pair) => pair,
                 Err(e) => {
                     eprintln!("{}", format_err("snapshot", &e));
@@ -586,7 +599,7 @@ fn run_snapshot(args: &[String]) -> i32 {
                 );
                 return 1;
             }
-            let (fd, _) = match open_target(target.as_deref()) {
+            let (fd, _) = match open_target(target.as_deref(), false) {
                 Ok(pair) => pair,
                 Err(e) => {
                     eprintln!("{}", format_err("snapshot", &e));
@@ -602,7 +615,7 @@ fn run_snapshot(args: &[String]) -> i32 {
                 return 1;
             }
             if json_out {
-                println!("{{\"deleted\":\"{name}\"}}");
+                println!("{}", serde_json::json!({ "deleted": name }));
             }
             0
         }
@@ -619,6 +632,7 @@ fn run_snapshot(args: &[String]) -> i32 {
 
 fn run_fork(args: &[String]) -> i32 {
     let mut json_out = false;
+    let mut ephemeral = false;
     let mut snapshot: Option<String> = None;
     let mut pos: Vec<String> = Vec::new();
     let mut iter = args.iter();
@@ -629,6 +643,7 @@ fn run_fork(args: &[String]) -> i32 {
                 return 0;
             }
             "--json" => json_out = true,
+            "--ephemeral" => ephemeral = true,
             "--snapshot" | "-s" => {
                 let Some(v) = iter.next() else {
                     eprintln!("cowfs fork: --snapshot requires an argument");
@@ -662,7 +677,7 @@ fn run_fork(args: &[String]) -> i32 {
         );
         return 1;
     }
-    let (fd, _) = match open_target(target.as_deref()) {
+    let (fd, _) = match open_target(target.as_deref(), false) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("{}", format_err("fork", &e));
@@ -672,7 +687,7 @@ fn run_fork(args: &[String]) -> i32 {
     let req = CowfsForkReq {
         snapshot,
         new_volume,
-        ephemeral_if_unmodified: false,
+        ephemeral_if_unmodified: ephemeral,
     };
     let arg = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
     let res = send_ioctl_on_fd(fd, cowfs_ioctl::COWFS_IOC_FORK, arg);
@@ -707,6 +722,7 @@ fn run_send(args: &[String]) -> i32 {
     let mut archive = false;
     let mut output: Option<String> = None;
     let mut json_stderr = false;
+    let mut verbose = false;
     let mut pos: Vec<String> = Vec::new();
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
@@ -717,6 +733,7 @@ fn run_send(args: &[String]) -> i32 {
             }
             "--archive" => archive = true,
             "--json" => json_stderr = true,
+            "-v" | "--verbose" => verbose = true,
             "-p" | "--parent" => {
                 let Some(v) = iter.next() else {
                     eprintln!("cowfs send: --parent requires a snapshot name");
@@ -769,7 +786,7 @@ fn run_send(args: &[String]) -> i32 {
         }
     };
 
-    let (dev_fd, _) = match open_target(target.as_deref()) {
+    let (dev_fd, _) = match open_target(target.as_deref(), false) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("{}", format_err("send", &e));
@@ -853,6 +870,16 @@ fn run_send(args: &[String]) -> i32 {
                         serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into())
                     );
                 }
+            } else if verbose {
+                eprintln!(
+                    "sent {}@{}: {} bytes ({} nodes, {} blocks, {} subtrees skipped)",
+                    resp.volume,
+                    resp.snapshot,
+                    resp.bytes_written,
+                    resp.nodes_sent,
+                    resp.blocks_sent,
+                    resp.subtrees_skipped
+                );
             }
             0
         }
@@ -877,15 +904,18 @@ fn run_receive(args: &[String]) -> i32 {
                 return 0;
             }
             "--json" => json_out = true,
-            "-s" | "--snapshot" => {
+            "-s" | "--snapshot" | "--name" => {
                 let Some(v) = iter.next() else {
-                    eprintln!("cowfs receive: --snapshot requires a name");
+                    eprintln!("cowfs receive: {a} requires a name");
                     return 2;
                 };
                 snapshot_name = Some(v.clone());
             }
             s if s.starts_with("--snapshot=") => {
                 snapshot_name = Some(s["--snapshot=".len()..].to_string());
+            }
+            s if s.starts_with("--name=") => {
+                snapshot_name = Some(s["--name=".len()..].to_string());
             }
             "--volume" => {
                 let Some(v) = iter.next() else {
@@ -934,7 +964,7 @@ fn run_receive(args: &[String]) -> i32 {
         return 1;
     }
 
-    let (dev_fd, vol_from_target) = match open_target(target.as_deref()) {
+    let (dev_fd, vol_from_target) = match open_target(target.as_deref(), true) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("{}", format_err("receive", &e));
@@ -1086,7 +1116,7 @@ fn run_gc(args: &[String]) -> i32 {
         );
         return 1;
     }
-    let (fd, _) = match open_target(target.as_deref()) {
+    let (fd, _) = match open_target(target.as_deref(), false) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("{}", format_err("gc", &e));
@@ -1171,5 +1201,28 @@ mod tests {
             (Some("/dev/vd1".to_string()), "@data".to_string())
         );
         assert!(parse_target_and_name(&s(&[])).is_err());
+    }
+
+    #[test]
+    fn usage_documents_ephemeral_name_and_verbose_flags() {
+        assert!(USAGE.contains("--ephemeral"));
+        assert!(USAGE.contains("--name"));
+        assert!(USAGE.contains("-v"));
+    }
+
+    #[test]
+    fn cli_help_exits_zero_for_all_subcommands() {
+        for cmd in [
+            vec!["--help"],
+            vec!["info", "--help"],
+            vec!["subvol", "--help"],
+            vec!["snapshot", "--help"],
+            vec!["fork", "--ephemeral", "--help"],
+            vec!["send", "-v", "--help"],
+            vec!["receive", "--name", "s1", "--help"],
+            vec!["gc", "--help"],
+        ] {
+            assert_eq!(run(&s(&cmd)), 0, "failed help for {cmd:?}");
+        }
     }
 }

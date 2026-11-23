@@ -1215,3 +1215,257 @@ fn c07_c08_c09_cowpack_loop_device_mount_lifecycle_and_corruption_detection() {
     run(vfs.close(1, root_dir_fd)).unwrap();
     run(root_fs.close_clean()).unwrap();
 }
+
+#[test]
+fn audit_regressions_subvol_busy_ro_mkfs_empty_root_epoch_parity_and_c04_fork_gc() {
+    let hs = Rc::new(MemoryHeadStore::new());
+    let ps = Rc::new(MemoryPackStore::new());
+    let clock = ticking_clock();
+
+    // 1. Subvolume deletion while a secondary `open_subvol_view` mount is live MUST fail EBUSY!
+    let vol_id = VolumeId("vol-audit".into());
+    run(CowFs::format_volume(
+        &*hs,
+        &*ps,
+        vol_id.clone(),
+        0,
+        0,
+        0o755,
+        clock(),
+    ))
+    .unwrap();
+    let fs = Rc::new(
+        run(CowFs::open(
+            Rc::clone(&hs),
+            Rc::clone(&ps),
+            vol_id.clone(),
+            CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+            CowFsConfig::local_native(Rc::clone(&clock)),
+        ))
+        .unwrap(),
+    );
+    run(fs.create_subvol("sub1", 0o755)).unwrap();
+    let view = fs.open_subvol_view("sub1").unwrap();
+    assert_eq!(run(fs.delete_subvol("sub1")).unwrap_err(), Errno::EBUSY);
+    drop(view);
+    run(fs.delete_subvol("sub1")).unwrap();
+
+    // 2. C-04: Populate multi-block file, snapshot, fork + write isolation, snapshot delete + GC!
+    let payload: Vec<u8> = (0u32..(128 * 1024))
+        .map(|i| ((i.wrapping_mul(29) ^ (i >> 8) ^ (i >> 16)) & 0xff) as u8)
+        .collect();
+    let (h_file, open_file) = run(fs.create(
+        &Cred::root(),
+        &fs.root(),
+        "data.bin",
+        0o644,
+        vfs::OpenOptions::new().read(true).write(true),
+    ))
+    .unwrap();
+    run(fs.write_at(&open_file, &payload, vfs::WriteAt::Offset(0))).unwrap();
+    run(fs.release(&open_file)).unwrap();
+    let _ = h_file;
+    run(fs.commit_tx_group()).unwrap();
+
+    run(fs.create_snapshot("snap-base")).unwrap();
+    let fork_head =
+        run(fs.fork_volume(Some("snap-base"), VolumeId("vol-audit-fork".into()), false)).unwrap();
+    assert_eq!(fork_head.volume.0, "vol-audit-fork");
+
+    // Mutate forked volume and verify parent volume is completely isolated!
+    let fork_fs = Rc::new(
+        run(CowFs::open(
+            Rc::clone(&hs),
+            Rc::clone(&ps),
+            VolumeId("vol-audit-fork".into()),
+            CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+            CowFsConfig::local_native(Rc::clone(&clock)),
+        ))
+        .unwrap(),
+    );
+    let (_, f_open) = run(fork_fs.create(
+        &Cred::root(),
+        &fork_fs.root(),
+        "fork-only.txt",
+        0o644,
+        vfs::OpenOptions::new().read(true).write(true),
+    ))
+    .unwrap();
+    run(fork_fs.write_at(&f_open, b"isolated-in-fork\n", vfs::WriteAt::Offset(0))).unwrap();
+    run(fork_fs.release(&f_open)).unwrap();
+    run(fork_fs.close_clean()).unwrap();
+    assert_eq!(
+        run(fs.lookup(&Cred::root(), &fs.root(), "fork-only.txt")).unwrap_err(),
+        Errno::ENOENT
+    );
+
+    // Delete `data.bin` in parent, delete `snap-base`, delete fork, and run GC -> sweeps pack!
+    let packs_before_gc = run(cowtree::PackStore::list_packs(&*ps)).unwrap().len();
+    assert!(packs_before_gc >= 1);
+    run(fs.unlink(&Cred::root(), &fs.root(), "data.bin")).unwrap();
+    run(fs.commit_tx_group()).unwrap();
+    run(fs.delete_snapshot("snap-base")).unwrap();
+    run(hs.delete_volume(&VolumeId("vol-audit-fork".into()))).unwrap();
+    let gc = run(os_cowfs::collect_garbage(
+        &*hs,
+        &*ps,
+        Timespec {
+            sec: clock().sec + 86_400,
+            nsec: 0,
+        },
+    ))
+    .unwrap();
+    assert!(
+        !gc.swept_packs.is_empty(),
+        "expected GC to sweep unreferenced pack after unlink+snap-delete"
+    );
+    run(fs.close_clean()).unwrap();
+
+    // 3. `mkfs --force` (`reformat_volume_with_lease`) MUST refuse `EBUSY` while an RO mount is
+    //    active on the volume in BOTH `MemoryHeadStore` and `NativeSqliteHeadStore`!
+    let ro_fs = Rc::new(
+        run(CowFs::open(
+            Rc::clone(&hs),
+            Rc::clone(&ps),
+            vol_id.clone(),
+            CowFsOpenMode::ReadOnly,
+            CowFsConfig::local_native(Rc::clone(&clock)),
+        ))
+        .unwrap(),
+    );
+    let unmounted_dev = CowFsVolumeDevice::unmounted(
+        vol_id.clone(),
+        Rc::clone(&hs),
+        Rc::clone(&ps),
+        WriterModel::Local,
+        Durability::TreeCommit,
+        Rc::clone(&clock),
+    );
+    let force_req = CowfsMkfsReq {
+        force: true,
+        label: Some("reformat-while-ro".into()),
+        volume: None,
+    };
+    assert_eq!(
+        run(vfs::vblk::VolumeDevice::cowfs_mkfs(
+            &unmounted_dev,
+            &force_req
+        ))
+        .unwrap_err(),
+        Errno::EBUSY
+    );
+    run(ro_fs.close_clean()).unwrap();
+    let reformatted = run(vfs::vblk::VolumeDevice::cowfs_mkfs(
+        &unmounted_dev,
+        &force_req,
+    ))
+    .unwrap();
+    assert_eq!(reformatted.incarnation, 2);
+
+    // Same RO-pin `EBUSY` check on `NativeSqliteHeadStore`!
+    let tmp_dir = TempDir::new("ro-mkfs-sqlite");
+    let sql_hs = Rc::new(NativeSqliteHeadStore::open(&tmp_dir.0).unwrap());
+    let sql_ps = Rc::new(NativePackStore::open(tmp_dir.0.join("packs")).unwrap());
+    let sql_vol = VolumeId("vol-sql-ro".into());
+    run(CowFs::format_volume(
+        &*sql_hs,
+        &*sql_ps,
+        sql_vol.clone(),
+        0,
+        0,
+        0o755,
+        clock(),
+    ))
+    .unwrap();
+    let sql_ro = Rc::new(
+        run(CowFs::open(
+            Rc::clone(&sql_hs),
+            Rc::clone(&sql_ps),
+            sql_vol.clone(),
+            CowFsOpenMode::ReadOnly,
+            CowFsConfig::local_native(Rc::clone(&clock)),
+        ))
+        .unwrap(),
+    );
+    let sql_dev = CowFsVolumeDevice::unmounted(
+        sql_vol.clone(),
+        Rc::clone(&sql_hs),
+        Rc::clone(&sql_ps),
+        WriterModel::Local,
+        Durability::TreeCommit,
+        Rc::clone(&clock),
+    );
+    assert_eq!(
+        run(vfs::vblk::VolumeDevice::cowfs_mkfs(&sql_dev, &force_req)).unwrap_err(),
+        Errno::EBUSY
+    );
+    run(sql_ro.close_clean()).unwrap();
+    let sql_reformatted = run(vfs::vblk::VolumeDevice::cowfs_mkfs(&sql_dev, &force_req)).unwrap();
+    assert_eq!(sql_reformatted.incarnation, 2);
+
+    // 4. `verify_root_reachable` & `receive_snapshot` MUST reject a crafted `RootObject` with
+    //    empty `subvols` / missing default `"@"` subvolume!
+    let empty_root = cowtree::RootObject {
+        format_version: cowtree::COWFS_FORMAT_VERSION,
+        features: 0,
+        volume_uuid: "evil".into(),
+        subvols: std::collections::BTreeMap::new(),
+        next_ino: 2,
+        generation: 1,
+        parent_root: None,
+        allocated_bytes: 0,
+        inode_count: 1,
+    };
+    let (empty_digest, empty_bytes) = empty_root.encode().unwrap();
+    let mut bad_enc = cowtree::stream::StreamEncoder::new();
+    let mut bad_stream = Vec::new();
+    bad_stream.extend_from_slice(
+        &bad_enc
+            .encode_header(&cowtree::stream::StreamHeader::full("evil", empty_digest))
+            .unwrap(),
+    );
+    bad_stream.extend_from_slice(&bad_enc.encode_node(&empty_digest, &empty_bytes).unwrap());
+    bad_stream.extend_from_slice(&bad_enc.encode_end().unwrap());
+    assert_eq!(
+        run(receive_snapshot(
+            &*hs,
+            &*ps,
+            ReceiveTarget::UnmountedVolume(&VolumeId("vol-empty-subvols".into())),
+            None,
+            clock(),
+            &mut SliceSource::new(&bad_stream),
+        ))
+        .unwrap_err(),
+        Errno::EIO
+    );
+    assert_eq!(
+        run(hs.read_head(&VolumeId("vol-empty-subvols".into()))).unwrap_err(),
+        Errno::ENOENT
+    );
+
+    // 5. `MemoryHeadStore::commit_received_root` initializes a new volume at `epoch: 0` (matching
+    //    `NativeSqliteHeadStore` and `web/kernel/cowfs-store.js`)!
+    let mut good_sink = VecSink::default();
+    run(send_snapshot(
+        &*hs,
+        &*ps,
+        &vol_id,
+        None,
+        "@",
+        None,
+        false,
+        &mut good_sink,
+    ))
+    .unwrap();
+    let (rx_head, rx_resp) = run(receive_snapshot(
+        &*hs,
+        &*ps,
+        ReceiveTarget::UnmountedVolume(&VolumeId("vol-epoch-zero".into())),
+        Some("init"),
+        clock(),
+        &mut SliceSource::new(&good_sink.0),
+    ))
+    .unwrap();
+    assert_eq!(rx_head.epoch, 0);
+    assert_eq!(rx_resp.epoch, 0);
+}

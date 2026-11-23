@@ -1654,6 +1654,31 @@ impl HeadStore for NativeSqliteHeadStore {
                 {
                     return Err(Errno::ESTALE);
                 }
+                let mut stale_pins = Vec::new();
+                {
+                    let s_pin = self
+                        .db
+                        .prepare("SELECT pin_id FROM ro_pins WHERE volume = ?1")?;
+                    s_pin.bind_str(1, &lease.volume.0)?;
+                    while s_pin.step_row()? {
+                        let pin_id = s_pin.col_str(0)?;
+                        let lpath = self.ro_pin_lock_path(&pin_id);
+                        match try_flock_exclusive(&lpath) {
+                            Err(Errno::EBUSY) => return Err(Errno::EBUSY),
+                            Ok(f) => {
+                                drop(f);
+                                let _ = fs::remove_file(&lpath);
+                                stale_pins.push(pin_id);
+                            }
+                            Err(_) => return Err(Errno::EBUSY),
+                        }
+                    }
+                }
+                for pin_id in stale_pins {
+                    let d_pin = self.db.prepare("DELETE FROM ro_pins WHERE pin_id = ?1")?;
+                    d_pin.bind_str(1, &pin_id)?;
+                    d_pin.step_done()?;
+                }
                 let d_snap = self.db.prepare("DELETE FROM snapshots WHERE volume = ?1")?;
                 d_snap.bind_str(1, &lease.volume.0)?;
                 d_snap.step_done()?;

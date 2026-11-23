@@ -1861,6 +1861,7 @@ pub(crate) struct CowfsMountTrack {
     pub(crate) vd_name: Option<String>,
     pub(crate) fs:
         Rc<cowfs::CowFs<crate::cowfs_bridge::JsCowfsStore, crate::cowfs_bridge::JsCowfsStore>>,
+    pub(crate) mount_count: usize,
     pub(crate) _dirty_guard: Option<crate::cowfs_bridge::DirtyFlushGuard>,
 }
 
@@ -1871,7 +1872,75 @@ pub(crate) struct CowfsMountContext {
         String,
         Rc<cowfs::CowFs<crate::cowfs_bridge::JsCowfsStore, crate::cowfs_bridge::JsCowfsStore>>,
     >,
-    pub(crate) mounted_secondary: HashMap<FsId, CowfsMountTrack>,
+    /// Keyed by `Rc::as_ptr(&fs) as usize` so every distinct `CowFs` instance (RW or multiple RO
+    /// mounts) is ref-counted independently across primary and `-o subvol=` views.
+    pub(crate) mounted_secondary: HashMap<usize, CowfsMountTrack>,
+    /// Secondary `CowFs` instances whose last mount dropped and are awaiting `close_clean()`.
+    pub(crate) pending_close:
+        Vec<Rc<cowfs::CowFs<crate::cowfs_bridge::JsCowfsStore, crate::cowfs_bridge::JsCowfsStore>>>,
+}
+
+impl CowfsMountContext {
+    pub(crate) fn has_mounted_volume(&self, volume_id: &str) -> bool {
+        self.active_volumes
+            .get(volume_id)
+            .is_some_and(|fs| !fs.is_closed())
+            || self
+                .mounted_secondary
+                .values()
+                .any(|t| t.volume_id == volume_id && t.mount_count > 0 && !t.fs.is_closed())
+    }
+}
+
+fn release_secondary_cowfs_mount(
+    ctx_rel: &Rc<RefCell<CowfsMountContext>>,
+    vblk_rel: &Rc<VblkRegistry>,
+    fs_key: usize,
+    fs_rel: &Rc<cowfs::CowFs<crate::cowfs_bridge::JsCowfsStore, crate::cowfs_bridge::JsCowfsStore>>,
+) {
+    let mut should_close = false;
+    if let Ok(mut ctx) = ctx_rel.try_borrow_mut()
+        && let Some(track) = ctx.mounted_secondary.get_mut(&fs_key)
+    {
+        track.mount_count = track.mount_count.saturating_sub(1);
+        if track.mount_count == 0
+            && let Some(removed) = ctx.mounted_secondary.remove(&fs_key)
+        {
+            if ctx
+                .active_volumes
+                .get(&removed.volume_id)
+                .is_some_and(|cur| Rc::ptr_eq(cur, &removed.fs))
+            {
+                ctx.active_volumes.remove(&removed.volume_id);
+            }
+            if let (Some(vd), Some(st)) = (removed.vd_name, ctx.store.clone()) {
+                let unmounted_dev = Rc::new(cowfs::CowFsVolumeDevice::unmounted(
+                    cowtree::VolumeId(removed.volume_id),
+                    Rc::clone(&st),
+                    st,
+                    abi::contract::WriterModel::Local,
+                    abi::contract::Durability::TreeCommit,
+                    Rc::new(crate::cowfs_bridge::now_timespec),
+                ));
+                let _ = vblk_rel.replace_named(&vd, unmounted_dev);
+            }
+            if !removed.fs.is_closed() {
+                ctx.pending_close.push(Rc::clone(&removed.fs));
+                should_close = true;
+            }
+        }
+    }
+    if should_close && !fs_rel.is_closed() {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let fs_bg = Rc::clone(fs_rel);
+            wasm_bindgen_futures::spawn_local(async move {
+                if !fs_bg.is_closed() {
+                    let _ = fs_bg.close_clean().await;
+                }
+            });
+        }
+    }
 }
 
 pub(crate) struct VfsRuntime {
@@ -2135,6 +2204,26 @@ fn register_cowfs_mounter(
                 if ro || existing_fs.is_read_only() {
                     backing = backing.with_ceilings(true, false);
                 }
+                // Increment secondary mount ref-count so unmounting `@` before `-o subvol=`
+                // never closes the shared `CowFs` prematurely.
+                let fs_key = Rc::as_ptr(&existing_fs) as usize;
+                let tracked_secondary = {
+                    let mut ctx = cowfs_ctx.borrow_mut();
+                    if let Some(track) = ctx.mounted_secondary.get_mut(&fs_key) {
+                        track.mount_count = track.mount_count.saturating_add(1);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if tracked_secondary {
+                    let ctx_rel = Rc::clone(&cowfs_ctx);
+                    let vblk_rel = Rc::clone(&vblk);
+                    let fs_rel = Rc::clone(&existing_fs);
+                    backing = backing.with_on_release(move || {
+                        release_secondary_cowfs_mount(&ctx_rel, &vblk_rel, fs_key, &fs_rel);
+                    });
+                }
                 return Ok(vfs::MountedFs {
                     backing: Rc::new(backing),
                     root,
@@ -2171,7 +2260,7 @@ fn register_cowfs_mounter(
             } else {
                 Some(dirty_binder.attach(&fs))
             };
-            let fs_id = fs.id().clone();
+            let fs_key = Rc::as_ptr(&fs) as usize;
             let root = fs.root();
             let dev: Rc<dyn vfs::vblk::VolumeDevice> =
                 Rc::new(cowfs::CowFsVolumeDevice::from_mounted(Rc::clone(&fs)));
@@ -2185,11 +2274,12 @@ fn register_cowfs_mounter(
                     }
                 }
                 ctx.mounted_secondary.insert(
-                    fs_id.clone(),
+                    fs_key,
                     CowfsMountTrack {
                         volume_id: volume_id.clone(),
                         vd_name: if ro { None } else { vd_name.clone() },
                         fs: Rc::clone(&fs),
+                        mount_count: 1,
                         _dirty_guard: dirty_guard,
                     },
                 );
@@ -2198,38 +2288,10 @@ fn register_cowfs_mounter(
             let ctx_rel = Rc::clone(&cowfs_ctx);
             let vblk_rel = Rc::clone(&vblk);
             let fs_rel = Rc::clone(&fs);
-            let vol_rel = volume_id;
-            let vd_rel = if ro { None } else { vd_name };
             let mut backing = MountBacking::new(fs as Rc<dyn Filesystem>, vfs::FsType::Cowfs)
                 .with_volume_device(dev)
                 .with_on_release(move || {
-                    if let Ok(mut ctx) = ctx_rel.try_borrow_mut() {
-                        ctx.mounted_secondary.remove(&fs_id);
-                        if ctx
-                            .active_volumes
-                            .get(&vol_rel)
-                            .is_some_and(|cur| Rc::ptr_eq(cur, &fs_rel))
-                        {
-                            ctx.active_volumes.remove(&vol_rel);
-                        }
-                        if let (Some(vd), Some(st)) = (vd_rel, ctx.store.clone()) {
-                            let unmounted_dev = Rc::new(cowfs::CowFsVolumeDevice::unmounted(
-                                cowtree::VolumeId(vol_rel),
-                                Rc::clone(&st),
-                                st,
-                                abi::contract::WriterModel::Local,
-                                abi::contract::Durability::TreeCommit,
-                                Rc::new(crate::cowfs_bridge::now_timespec),
-                            ));
-                            let _ = vblk_rel.replace_named(&vd, unmounted_dev);
-                        }
-                    }
-                    if !fs_rel.is_closed() {
-                        #[cfg(target_arch = "wasm32")]
-                        wasm_bindgen_futures::spawn_local(async move {
-                            let _ = fs_rel.close_clean().await;
-                        });
-                    }
+                    release_secondary_cowfs_mount(&ctx_rel, &vblk_rel, fs_key, &fs_rel);
                 });
             if ro {
                 backing = backing.with_ceilings(true, false);
@@ -2767,6 +2829,36 @@ fn clean_mount_name(raw: &str) -> vfs::Result<String> {
         return Err(Errno::EINVAL);
     }
     Ok(trimmed.to_string())
+}
+
+fn parse_bounded_ioctl_payload(arg: &Value) -> std::result::Result<Vec<u8>, abi::Error> {
+    let raw = if arg.is_null() {
+        Vec::new()
+    } else {
+        serde_json::to_vec(arg).map_err(|_| abi::Error::from(Errno::EINVAL))?
+    };
+    if raw.len() > vfs::vblk::VBLK_IOCTL_PAYLOAD_MAX {
+        return Err(Errno::E2BIG.into());
+    }
+    Ok(raw)
+}
+
+fn parse_fsck_req_for_archive_or_loop(
+    raw_payload: &[u8],
+    is_loop: bool,
+) -> std::result::Result<abi::volume::CowfsFsckReq, abi::Error> {
+    if raw_payload.len() > vfs::vblk::VBLK_IOCTL_PAYLOAD_MAX {
+        return Err(Errno::E2BIG.into());
+    }
+    let req: abi::volume::CowfsFsckReq = if raw_payload.is_empty() {
+        abi::volume::CowfsFsckReq::default()
+    } else {
+        serde_json::from_slice(raw_payload).map_err(|_| abi::Error::from(Errno::EINVAL))?
+    };
+    if (is_loop || req.archive) && (req.snapshot.is_some() || req.volume.is_some()) {
+        return Err(Errno::EINVAL.into());
+    }
+    Ok(req)
 }
 
 impl Kernel {
@@ -9900,22 +9992,37 @@ impl Kernel {
             let rt = self.vfs_rt.borrow();
             (Rc::clone(&rt.vblk), Rc::clone(&rt.cowfs_ctx))
         };
-        let to_close: Vec<CowfsMountTrack> = {
+        let (pending_close, to_close): (
+            Vec<
+                Rc<
+                    cowfs::CowFs<
+                        crate::cowfs_bridge::JsCowfsStore,
+                        crate::cowfs_bridge::JsCowfsStore,
+                    >,
+                >,
+            >,
+            Vec<CowfsMountTrack>,
+        ) = {
             let mut ctx = cowfs_ctx.borrow_mut();
-            let dead_ids: Vec<FsId> = ctx
+            let pending = std::mem::take(&mut ctx.pending_close);
+            let dead_keys: Vec<usize> = ctx
                 .mounted_secondary
-                .keys()
-                .filter(|fs_id| {
-                    let prefix = format!("{}#", fs_id.0);
+                .iter()
+                .filter(|(_, track)| {
+                    if track.mount_count == 0 {
+                        return true;
+                    }
+                    let base = track.fs.id().0.as_str();
+                    let prefix = format!("{base}#");
                     !live_fs_ids
                         .iter()
-                        .any(|live| live == &fs_id.0 || live.starts_with(&prefix))
+                        .any(|live| live == base || live.starts_with(&prefix))
                 })
-                .cloned()
+                .map(|(k, _)| *k)
                 .collect();
-            let mut out = Vec::with_capacity(dead_ids.len());
-            for id in dead_ids {
-                if let Some(track) = ctx.mounted_secondary.remove(&id) {
+            let mut out = Vec::with_capacity(dead_keys.len());
+            for key in dead_keys {
+                if let Some(track) = ctx.mounted_secondary.remove(&key) {
                     if ctx
                         .active_volumes
                         .get(&track.volume_id)
@@ -9926,9 +10033,14 @@ impl Kernel {
                     out.push(track);
                 }
             }
-            out
+            (pending, out)
         };
 
+        for fs in pending_close {
+            if !fs.is_closed() {
+                let _ = fs.close_clean().await;
+            }
+        }
         let store = cowfs_ctx.borrow().store.clone();
         for track in to_close {
             if !track.fs.is_closed() {
@@ -10041,13 +10153,15 @@ impl Kernel {
         //     `cowfsck --archive` regular-file verification (`BLK_*`, `COWFS_IOC_*`).
         if is_cowfs_or_blk_ioctl(request) {
             // Check `/dev/loopN` (refuse `COWFS_IOC_MKFS` with `EROFS`/`ENOTBLK`; support
-            // `COWFS_IOC_FSCK` on bound archive) and `--archive` regular file `COWFS_IOC_FSCK`.
+            // `COWFS_IOC_FSCK` on bound archive), `--archive` regular file `COWFS_IOC_FSCK`,
+            // and active-mount `EBUSY` guard for `COWFS_IOC_MKFS` (including RO-mounted volumes).
             if request == cowfs_ioctl::COWFS_IOC_MKFS || request == cowfs_ioctl::COWFS_IOC_FSCK {
                 let cred = vfs.process_cred(pid)?;
                 let file = vfs.process_fds(pid)?.borrow().get(raw_fd)?;
                 if file.access() == vfs::Access::Path {
                     return Err(Errno::EBADF.into());
                 }
+                let raw_payload = parse_bounded_ioctl_payload(&arg)?;
                 if !file.is_virtual() {
                     let meta = file.metadata_as(&cred).await?;
                     if meta.file_type == FileType::CharDevice
@@ -10067,6 +10181,7 @@ impl Kernel {
                         if !file.access().reads() && cred.identity.id != 0 {
                             return Err(Errno::EBADF.into());
                         }
+                        let _fsck_req = parse_fsck_req_for_archive_or_loop(&raw_payload, true)?;
                         let (backing_file, _ro, _fmt, file_name) =
                             loop_reg.backing_file(loop_idx)?;
                         let resp = cowfs::verify_archive_file(
@@ -10077,24 +10192,59 @@ impl Kernel {
                         return serde_json::to_value(&resp)
                             .map_err(|_| abi::Error::from(Errno::EIO));
                     }
-                    if request == cowfs_ioctl::COWFS_IOC_FSCK
-                        && meta.file_type == FileType::File
-                        && arg.get("archive").and_then(Value::as_bool) == Some(true)
-                    {
-                        if !file.access().reads() {
-                            return Err(Errno::EBADF.into());
+                    if request == cowfs_ioctl::COWFS_IOC_FSCK && meta.file_type == FileType::File {
+                        let fsck_req = parse_fsck_req_for_archive_or_loop(&raw_payload, false)?;
+                        if fsck_req.archive {
+                            if !file.access().reads() {
+                                return Err(Errno::EBADF.into());
+                            }
+                            let label = vfs
+                                .readlinkat(
+                                    pid,
+                                    StartAnchor::Root,
+                                    &format!("/proc/self/fd/{raw_fd}"),
+                                )
+                                .await
+                                .unwrap_or_else(|_| format!("fd:{raw_fd}"));
+                            let resp = cowfs::verify_archive_file(
+                                Rc::new(cowfs::FileRefArchiveReader(file)),
+                                &label,
+                            )
+                            .await?;
+                            return serde_json::to_value(&resp)
+                                .map_err(|_| abi::Error::from(Errno::EIO));
                         }
-                        let label = vfs
-                            .readlinkat(pid, StartAnchor::Root, &format!("/proc/self/fd/{raw_fd}"))
-                            .await
-                            .unwrap_or_else(|_| format!("fd:{raw_fd}"));
-                        let resp = cowfs::verify_archive_file(
-                            Rc::new(cowfs::FileRefArchiveReader(file)),
-                            &label,
-                        )
-                        .await?;
-                        return serde_json::to_value(&resp)
-                            .map_err(|_| abi::Error::from(Errno::EIO));
+                    }
+                    if request == cowfs_ioctl::COWFS_IOC_MKFS
+                        && meta.file_type == FileType::CharDevice
+                        && let Some(rdev) = meta.rdev.as_deref()
+                        && let Some(vd_name) = vfs::vblk::parse_vblk_rdev(rdev)
+                    {
+                        if cred.identity.id != 0 {
+                            return Err(Errno::EPERM.into());
+                        }
+                        let mkfs_req: abi::volume::CowfsMkfsReq = if raw_payload.is_empty() {
+                            abi::volume::CowfsMkfsReq::default()
+                        } else {
+                            serde_json::from_slice(&raw_payload)
+                                .map_err(|_| abi::Error::from(Errno::EINVAL))?
+                        };
+                        let vblk_chk = Rc::clone(&self.vfs_rt.borrow().vblk);
+                        let target_vol = mkfs_req
+                            .volume
+                            .clone()
+                            .or_else(|| vblk_chk.get(vd_name).map(|d| d.volume_id().to_string()));
+                        if let Some(ref target_vol) = target_vol {
+                            let rt = self.vfs_rt.borrow();
+                            let root_mounted = rt
+                                .root_cowfs
+                                .as_ref()
+                                .is_some_and(|r| !r.is_closed() && r.volume_id().0 == *target_vol);
+                            let sec_mounted = rt.cowfs_ctx.borrow().has_mounted_volume(target_vol);
+                            if root_mounted || sec_mounted {
+                                return Err(Errno::EBUSY.into());
+                            }
+                        }
                     }
                 }
             }
@@ -10531,5 +10681,68 @@ impl Kernel {
             return res.pop().ok_or(Errno::EIO)?.into_result();
         }
         Err(Errno::ENOSYS.into())
+    }
+}
+
+#[cfg(test)]
+mod l25c_ioctl_validation_tests {
+    use super::*;
+
+    #[test]
+    fn archive_and_loop_fsck_enforce_deny_unknown_fields_and_size_bounds() {
+        // Valid empty/default and archive payloads pass.
+        assert!(parse_fsck_req_for_archive_or_loop(b"", true).is_ok());
+        assert!(
+            parse_fsck_req_for_archive_or_loop(br#"{"archive":true}"#, false)
+                .unwrap()
+                .archive
+        );
+
+        // Unknown fields fail EINVAL on both `/dev/loopN` and `--archive` regular files!
+        assert_eq!(
+            parse_fsck_req_for_archive_or_loop(br#"{"archive":true,"bogus":1}"#, false)
+                .unwrap_err()
+                .errno,
+            Errno::EINVAL
+        );
+        assert_eq!(
+            parse_fsck_req_for_archive_or_loop(br#"{"bogus":1}"#, true)
+                .unwrap_err()
+                .errno,
+            Errno::EINVAL
+        );
+
+        // Conflicting `snapshot` or `volume` alongside `archive: true` or `/dev/loopN` fails EINVAL!
+        assert_eq!(
+            parse_fsck_req_for_archive_or_loop(br#"{"archive":true,"snapshot":"snapA"}"#, false)
+                .unwrap_err()
+                .errno,
+            Errno::EINVAL
+        );
+        assert_eq!(
+            parse_fsck_req_for_archive_or_loop(br#"{"archive":true,"volume":"v1"}"#, false)
+                .unwrap_err()
+                .errno,
+            Errno::EINVAL
+        );
+        assert_eq!(
+            parse_fsck_req_for_archive_or_loop(br#"{"snapshot":"snapA"}"#, true)
+                .unwrap_err()
+                .errno,
+            Errno::EINVAL
+        );
+        assert_eq!(
+            parse_fsck_req_for_archive_or_loop(br#"{"volume":"v1"}"#, true)
+                .unwrap_err()
+                .errno,
+            Errno::EINVAL
+        );
+
+        // Oversized payload > VBLK_IOCTL_PAYLOAD_MAX fails E2BIG!
+        let huge = json!({ "volume": "a".repeat(vfs::vblk::VBLK_IOCTL_PAYLOAD_MAX + 16) });
+        assert_eq!(
+            parse_bounded_ioctl_payload(&huge).unwrap_err().errno,
+            Errno::E2BIG
+        );
     }
 }

@@ -1983,12 +1983,20 @@ impl Kernel {
             }
             return Ok(json!({ "closed": false, "pruned": false }).to_string());
         };
-        let secondary_tracks: Vec<crate::vfs_engine::CowfsMountTrack> = {
+        let (secondary_tracks, pending_close) = {
             let cowfs_ctx = Rc::clone(&self.vfs_rt.borrow().cowfs_ctx);
             let mut ctx = cowfs_ctx.borrow_mut();
             ctx.active_volumes.clear();
-            ctx.mounted_secondary.drain().map(|(_, t)| t).collect()
+            let tracks: Vec<crate::vfs_engine::CowfsMountTrack> =
+                ctx.mounted_secondary.drain().map(|(_, t)| t).collect();
+            let pending = std::mem::take(&mut ctx.pending_close);
+            (tracks, pending)
         };
+        for fs in pending_close {
+            if !fs.is_closed() {
+                let _ = fs.close_clean().await;
+            }
+        }
         for track in secondary_tracks {
             if !track.fs.is_closed() {
                 let _ = track.fs.close_clean().await;

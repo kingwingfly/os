@@ -1242,9 +1242,36 @@ export function createCowfsStore(options = {}) {
       await ensureFormatCompatible();
       const newHead = typeof newHeadJson === 'string' ? JSON.parse(newHeadJson) : newHeadJson;
       const db = await getDb();
-      const tx = openTx(db, ['heads', 'nodes', 'snapshots', 'receipts'], 'readwrite', true);
+
+      // Refuse reformatting while any live RO/snapshot mount holds a Web Lock pin on `volume`.
+      const pinReadTx = openTx(db, ['roPins'], 'readonly');
+      const volPins = [];
+      await forEachCursor(pinReadTx.objectStore('roPins'), cursor => {
+        if (cursor.value?.volume === volume) volPins.push(cursor.value.pinId);
+      });
+      await txDone(pinReadTx);
+      const stalePinIds = [];
+      for (const pinId of volPins) {
+        const lName = await roPinLockName(pinId);
+        let probe = null;
+        try {
+          probe = await requestHeldWebLock(lName, { mode: 'exclusive', ifAvailable: true });
+        } catch {
+          throw errnoError('EBUSY', `volume ${volume} has an active read-only pin`);
+        }
+        if (!probe) {
+          throw errnoError('EBUSY', `volume ${volume} has an active read-only mount`);
+        }
+        probe.release();
+        await probe.done?.catch(() => {});
+        stalePinIds.push(pinId);
+      }
+
+      const tx = openTx(db, ['heads', 'nodes', 'snapshots', 'receipts', 'roPins'], 'readwrite', true);
       const headsStore = tx.objectStore('heads');
       const nodesStore = tx.objectStore('nodes');
+      const pinsStore = tx.objectStore('roPins');
+      for (const id of stalePinIds) pinsStore.delete(id);
       const cur = await reqPromise(headsStore.get(volume));
       if (!cur) {
         try { tx.abort(); } catch {}

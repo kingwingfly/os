@@ -98,6 +98,13 @@ pub async fn verify_root_reachable<H: HeadStore, P: PackStore>(
     let mut verified_blocks: HashMap<Digest, Option<u32>> = HashMap::new();
     let mut verified_packs: HashSet<PackId> = HashSet::new();
 
+    if !root_obj.subvols.contains_key(crate::DEFAULT_SUBVOL) {
+        report.errors.push(format!(
+            "root object missing required default subvolume '{}'",
+            crate::DEFAULT_SUBVOL
+        ));
+    }
+
     for (subvol_name, subvol_root) in &root_obj.subvols {
         report.subvols_checked += 1;
         verify_subvol(

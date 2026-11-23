@@ -258,6 +258,8 @@ struct CowFsState {
     root_obj: RootObject,
     /// Cached `ROOT_INO` generation per subvolume so `open_subvol_view` works synchronously.
     subvol_root_generations: BTreeMap<String, u64>,
+    /// Live mounted secondary subvolume views (`open_subvol_view` increments, `Drop` decrements).
+    active_subvol_views: HashMap<String, usize>,
     lease: Option<WriterLease>,
     ro_pin: Option<Box<dyn RoPinGuard>>,
     forked_from: Option<VolumeId>,
@@ -881,6 +883,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 head,
                 root_obj,
                 subvol_root_generations,
+                active_subvol_views: HashMap::new(),
                 lease,
                 ro_pin,
                 forked_from,
@@ -982,7 +985,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             if !st.root_obj.subvols.contains_key(name) {
                 return Err(Errno::ENOENT);
             }
-            if st.opens.values().any(|o| o.subvol == name) {
+            if st.opens.values().any(|o| o.subvol == name)
+                || st.active_subvol_views.get(name).copied().unwrap_or(0) > 0
+            {
                 return Err(Errno::EBUSY);
             }
         }
@@ -992,7 +997,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
         let (head_snap, mut next_root_obj, removed_root) = {
             let st = self.state.borrow();
-            if st.opens.values().any(|o| o.subvol == name) {
+            if st.opens.values().any(|o| o.subvol == name)
+                || st.active_subvol_views.get(name).copied().unwrap_or(0) > 0
+            {
                 return Err(Errno::EBUSY);
             }
             let Some(&rem_root) = st.root_obj.subvols.get(name) else {
@@ -1178,7 +1185,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if name.is_empty() || name.contains(['/', '\0']) {
             return Err(Errno::EINVAL);
         }
-        let st = self.state.borrow();
+        let mut st = self.state.borrow_mut();
         if st.closed {
             return Err(Errno::EBADF);
         }
@@ -1189,6 +1196,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             return Err(Errno::ENOENT);
         }
         let &root_generation = st.subvol_root_generations.get(name).ok_or(Errno::EIO)?;
+        *st.active_subvol_views.entry(name.to_string()).or_insert(0) += 1;
+        drop(st);
         let fs_id = FsId(format!("{}#{name}", self.fs_id.0));
         Ok(Rc::new(CowFsSubvolView {
             fs: Rc::clone(self),
@@ -5475,6 +5484,19 @@ struct CowFsSubvolView<H: HeadStore + 'static, P: PackStore + 'static> {
     subvol: String,
     fs_id: FsId,
     root_generation: u64,
+}
+
+impl<H: HeadStore + 'static, P: PackStore + 'static> Drop for CowFsSubvolView<H, P> {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.fs.state.try_borrow_mut()
+            && let Some(cnt) = st.active_subvol_views.get_mut(&self.subvol)
+        {
+            *cnt = cnt.saturating_sub(1);
+            if *cnt == 0 {
+                st.active_subvol_views.remove(&self.subvol);
+            }
+        }
+    }
 }
 
 impl<H: HeadStore + 'static, P: PackStore + 'static> CowFsSubvolView<H, P> {

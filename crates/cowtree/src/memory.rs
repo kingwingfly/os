@@ -336,7 +336,7 @@ impl HeadStore for MemoryHeadStore {
                         volume: req.volume.clone(),
                         incarnation: 1,
                         fence: 1,
-                        epoch: 1,
+                        epoch: 0,
                         root: req.new_root,
                         parent_volume: None,
                         ephemeral_if_unmodified: false,
@@ -815,6 +815,8 @@ impl HeadStore for MemoryHeadStore {
                         || cur.epoch != lease.epoch
                     {
                         Err(Errno::ESTALE)
+                    } else if st.ro_pins.values().any(|(v, _)| v == &lease.volume) {
+                        Err(Errno::EBUSY)
                     } else {
                         st.snapshots.retain(|(v, _), _| v != &lease.volume);
                         st.receipts.retain(|_, r| r.volume != lease.volume);

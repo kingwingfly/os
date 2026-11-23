@@ -958,4 +958,35 @@ test('L2.5c: listVolumeHeads and atomic commitReceivedRoot (new volume, incremen
     heads.map(h => h.volume),
     ['vol-rx', 'vol-src'],
   );
+
+  // Finding #4: reformatVolumeWithLease MUST refuse EBUSY while an active RO pin exists!
+  const roVol = await wasm.CowFsVolume.open_ro(env.store, 'vol-src');
+  const lease = await env.store.acquireWriter('vol-src', 'exclusive');
+  await expectErrno(
+    () =>
+      env.store.reformatVolumeWithLease(
+        lease.leaseId,
+        'vol-src',
+        lease.incarnation,
+        lease.fence,
+        lease.epoch,
+        JSON.stringify(srcHead),
+        [{ digest: rootHex, bytes: rootBytes }],
+      ),
+    'EBUSY',
+  );
+  await roVol.close_clean();
+
+  // After RO mount closes, reformat succeeds and bumps incarnation!
+  const lease2 = await env.store.acquireWriter('vol-src', 'exclusive');
+  const reformatted = await env.store.reformatVolumeWithLease(
+    lease2.leaseId,
+    'vol-src',
+    lease2.incarnation,
+    lease2.fence,
+    lease2.epoch,
+    JSON.stringify(srcHead),
+    [{ digest: rootHex, bytes: rootBytes }],
+  );
+  assert.equal(reformatted.incarnation, 2);
 });

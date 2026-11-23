@@ -14,6 +14,7 @@ import { accessSync, constants as fsConstants, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import binaryen from 'binaryen';
 
 const repoRoot = fileURLToPath(new URL('..', import.meta.url));
 const MIME = {
@@ -222,8 +223,9 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
     const mkExist = await run('sudo mkfs.cowfs /dev/vd1');
     const mkForce = await run('sudo mkfs.cowfs -f --label data-v2 --json /dev/vd1');
 
-    // C-03: mount /dev/vd1, create/list/delete subvols, refuse @, mount subvol=sub1 concurrently!
-    const mntPrep = await run('sudo mkdir -p /mnt/data /mnt/subdata /mnt/replica /mnt/pkg');
+    // C-03 + Fixes #2/#3: mount /dev/vd1, create/list/delete subvols, refuse @, refuse deleting
+    // mounted sub1 (EBUSY), unmount @ BEFORE -o subvol=sub1 keeping sub1 live, then clean delete!
+    const mntPrep = await run('sudo mkdir -p /mnt/data /mnt/subdata /mnt/replica /mnt/pkg /mnt/fork1');
     const mntVd1 = await run('sudo mount -t cowfs /dev/vd1 /mnt/data');
     const svCreate = await run('sudo cowfs subvol create /mnt/data sub1');
     const svList = await run('cowfs subvol list --json /mnt/data');
@@ -231,8 +233,21 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
     const mntSub1 = await run('sudo mount -t cowfs -o subvol=sub1 /dev/vd1 /mnt/subdata');
     const subWrite = await run('sudo sh -c "echo in-root > /mnt/data/root.txt && echo in-sub1 > /mnt/subdata/sub.txt"');
     const subCheck = await run('cat /mnt/data/root.txt && cat /mnt/subdata/sub.txt && test ! -e /mnt/data/sub.txt');
+    // Fix #3: deleting sub1 while mounted at /mnt/subdata MUST fail EBUSY!
+    const svDelSub1Busy = await run('sudo cowfs subvol delete /mnt/data sub1');
+    // Fix #2: unmounting /mnt/data (@) FIRST MUST keep shared CowFs & /mnt/subdata live!
+    const umntDataFirst = await run('sudo umount /mnt/data');
+    const subStillAlive = await run(
+      'sudo sh -c "echo alive-after-root-umount > /mnt/subdata/alive.txt" && cat /mnt/subdata/sub.txt && cat /mnt/subdata/alive.txt',
+    );
     const umntSub1 = await run('sudo umount /mnt/subdata');
+    const remntVd1 = await run('sudo mount -t cowfs /dev/vd1 /mnt/data');
     const svDelSub1 = await run('sudo cowfs subvol delete /mnt/data sub1');
+
+    // Fix #1: unattached `volume:<id>` MUST fail closed with ENODEV (never touch `/dev/vd0`)!
+    const unattachedInfo = await run('cowfs info volume:nonexistent-vol');
+    const unattachedSnapDel = await run('sudo cowfs snapshot delete volume:nonexistent-vol snapA');
+    const unattachedSend = await run('sudo cowfs send volume:nonexistent-vol snapA');
 
     // Populate multi-file dataset (including > 70 KiB multi-block payload) & snapshots A, B (C-04).
     const bigPayload = new Uint8Array(72 * 1024);
@@ -246,15 +261,23 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
     const snapList = await run('cowfs snapshot list --json /mnt/data');
     const fsckSnapA = await run('cowfsck --snapshot snapA --json /mnt/data');
 
+    // Complete C-04: `cowfs fork` (+ `--ephemeral`) & post-fork write isolation!
+    const forkMain = await run('sudo cowfs fork --snapshot snapA --json /mnt/data vol-fork1');
+    const forkEph = await run('sudo cowfs fork --ephemeral --snapshot snapA --json /mnt/data vol-fork-eph');
+    const mntFork1 = await run('sudo mount -t cowfs volume:vol-fork1 /mnt/fork1');
+    const forkWrite = await run('sudo sh -c "echo only-in-fork > /mnt/fork1/fork-only.txt"');
+    const forkIsolated = await run('cat /mnt/fork1/fork-only.txt && test ! -e /mnt/data/fork-only.txt');
+    const umntFork1 = await run('sudo umount /mnt/fork1');
+
     // Modify one small file -> snapshot B.
     const modB = await run('sudo sh -c "echo updated-in-B > /mnt/data/f05.txt"');
     const snapB = await run('sudo cowfs snapshot create --json /mnt/data snapB');
 
-    // C-05 & C-06: Pipe full send|receive AND redirected incremental send/receive + negative tests!
+    // C-05 & C-06: Pipe full send|receive, `-v` verbose send, `--name` receive alias, & negative tests!
     const pipeFull = await run(
       'sudo cowfs send /mnt/data snapA | sudo cowfs receive --volume vol-replica --snapshot snapA --json /dev/vd1',
     );
-    const sendFullB = await run('sudo cowfs send /mnt/data snapB > /tmp/full-b.stream');
+    const sendFullB = await run('sudo cowfs send -v /mnt/data snapB > /tmp/full-b.stream');
     const sendIncAB = await run('sudo cowfs send --parent snapA /mnt/data snapB > /tmp/inc-ab.stream');
     const fullBStat = await must('stat full-b.stream', () => c.stat('/tmp/full-b.stream', false));
     const incABStat = await must('stat inc-ab.stream', () => c.stat('/tmp/inc-ab.stream', false));
@@ -274,11 +297,13 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
     );
     const fsckCorruptVol = await run('sudo cowfsck volume:vol-corrupt');
 
-    // Valid incremental receive into `vol-replica` -> mount & verify byte-for-byte!
+    // Valid incremental receive into `vol-replica` using `--name` alias -> mount RO & verify!
     const recvIncOk = await run(
-      'sudo cowfs receive --volume vol-replica --snapshot snapB --json /dev/vd1 < /tmp/inc-ab.stream',
+      'sudo cowfs receive --volume vol-replica --name snapB --json /dev/vd1 < /tmp/inc-ab.stream',
     );
     const mntReplica = await run('sudo mount -t cowfs -o ro volume:vol-replica /mnt/replica');
+    // Fix #4: `mkfs.cowfs --force` on a mounted read-only volume MUST fail EBUSY!
+    const mkForceRoVol = await run('sudo mkfs.cowfs --force volume:vol-replica');
     const replicaCopy = await run('cp /mnt/replica/f05.txt /tmp/replica-f05.txt && cp /mnt/replica/big.bin /tmp/replica-big.bin');
     const replicaText = await must('readText replica-f05.txt', () => c.readText('/tmp/replica-f05.txt'));
     const replicaBig = await must('readFile replica-big.bin', () => c.readFile('/tmp/replica-big.bin'));
@@ -323,7 +348,18 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
     const fsckLoop = await run('sudo cowfsck --json /dev/loop0');
     const umntPkg = await run('sudo umount /mnt/pkg');
     const loDetachOk = await run('sudo losetup -d /dev/loop0');
+
+    // Complete C-04: `cowfs snapshot delete` & `cowfs gc`!
+    const snapDelA = await run('sudo cowfs snapshot delete --json /mnt/data snapA');
+    const snapListAfterDel = await run('cowfs snapshot list --json /mnt/data');
+    const gcRun = await run('sudo cowfs gc --grace 0 --json /mnt/data');
     const umntData = await run('sudo umount /mnt/data');
+
+    // Fix #4: mount `/dev/vd1` `-o ro` -> `mkfs.cowfs --force /dev/vd1` MUST fail EBUSY, then succeed after umount!
+    const mntVd1Ro = await run('sudo mount -t cowfs -o ro /dev/vd1 /mnt/data');
+    const mkForceRoDev = await run('sudo mkfs.cowfs --force /dev/vd1');
+    const umntVd1Ro = await run('sudo umount /mnt/data');
+    const mkForceAfterRoUmnt = await run('sudo mkfs.cowfs --force --json /dev/vd1');
 
     // C-09: Flip a byte in `.cowpack` archive -> `cowfsck --archive` MUST exit 4!
     const archBytes = await must('readFile release.cowpack', () => c.readFile('/tmp/release.cowpack'));
@@ -348,13 +384,26 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
       mntSub1,
       subWrite,
       subCheck,
+      svDelSub1Busy,
+      umntDataFirst,
+      subStillAlive,
       umntSub1,
+      remntVd1,
       svDelSub1,
+      unattachedInfo,
+      unattachedSnapDel,
+      unattachedSend,
       cpBig,
       seedA,
       snapA,
       snapList,
       fsckSnapA,
+      forkMain,
+      forkEph,
+      mntFork1,
+      forkWrite,
+      forkIsolated,
+      umntFork1,
       modB,
       snapB,
       pipeFull,
@@ -367,6 +416,7 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
       fsckCorruptVol,
       recvIncOk,
       mntReplica,
+      mkForceRoVol,
       replicaCopy,
       replicaText,
       replicaBigMatch,
@@ -388,7 +438,14 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
       fsckLoop,
       umntPkg,
       loDetachOk,
+      snapDelA,
+      snapListAfterDel,
+      gcRun,
       umntData,
+      mntVd1Ro,
+      mkForceRoDev,
+      umntVd1Ro,
+      mkForceAfterRoUmnt,
       fsckArchiveBad,
     };
   });
@@ -413,7 +470,7 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
   expect(results.mkForce.code, JSON.stringify(results.mkForce)).toBe(0);
   expect(JSON.parse(results.mkForce.output).incarnation).toBe(2);
 
-  // C-03 assertions.
+  // C-03 + Fixes #1/#2/#3 assertions.
   expect(results.mntPrep.code).toBe(0);
   expect(results.mntVd1.code, JSON.stringify(results.mntVd1)).toBe(0);
   expect(results.svCreate.code, JSON.stringify(results.svCreate)).toBe(0);
@@ -425,16 +482,35 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
   expect(results.mntSub1.code, JSON.stringify(results.mntSub1)).toBe(0);
   expect(results.subWrite.code, JSON.stringify(results.subWrite)).toBe(0);
   expect(results.subCheck.code, JSON.stringify(results.subCheck)).toBe(0);
+  expect(results.svDelSub1Busy.code, JSON.stringify(results.svDelSub1Busy)).not.toBe(0);
+  expect(results.svDelSub1Busy.output).toContain('EBUSY');
+  expect(results.umntDataFirst.code, JSON.stringify(results.umntDataFirst)).toBe(0);
+  expect(results.subStillAlive.code, JSON.stringify(results.subStillAlive)).toBe(0);
+  expect(results.subStillAlive.output).toContain('alive-after-root-umount');
   expect(results.umntSub1.code).toBe(0);
+  expect(results.remntVd1.code, JSON.stringify(results.remntVd1)).toBe(0);
   expect(results.svDelSub1.code, JSON.stringify(results.svDelSub1)).toBe(0);
+  expect(results.unattachedInfo.code).not.toBe(0);
+  expect(results.unattachedInfo.output).toContain('ENODEV');
+  expect(results.unattachedSnapDel.code).not.toBe(0);
+  expect(results.unattachedSnapDel.output).toContain('ENODEV');
+  expect(results.unattachedSend.code).not.toBe(0);
+  expect(results.unattachedSend.output).toContain('ENODEV');
 
-  // C-04 assertions.
+  // C-04 assertions (snapshots, fork, post-fork isolation, snapshot delete, GC).
   expect(results.cpBig.code, JSON.stringify(results.cpBig)).toBe(0);
   expect(results.seedA.code).toBe(0);
   expect(results.snapA.code, JSON.stringify(results.snapA)).toBe(0);
   expect(JSON.parse(results.snapList.output).snapshots.map(s => s.name)).toContain('snapA');
   expect(results.fsckSnapA.code, JSON.stringify(results.fsckSnapA)).toBe(0);
   expect(JSON.parse(results.fsckSnapA.output).ok).toBe(true);
+  expect(results.forkMain.code, JSON.stringify(results.forkMain)).toBe(0);
+  expect(JSON.parse(results.forkMain.output).volume).toBe('vol-fork1');
+  expect(results.forkEph.code, JSON.stringify(results.forkEph)).toBe(0);
+  expect(results.mntFork1.code, JSON.stringify(results.mntFork1)).toBe(0);
+  expect(results.forkWrite.code, JSON.stringify(results.forkWrite)).toBe(0);
+  expect(results.forkIsolated.code, JSON.stringify(results.forkIsolated)).toBe(0);
+  expect(results.umntFork1.code).toBe(0);
   expect(results.modB.code).toBe(0);
   expect(results.snapB.code).toBe(0);
 
@@ -442,6 +518,7 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
   expect(results.pipeFull.code, JSON.stringify(results.pipeFull)).toBe(0);
   expect(JSON.parse(results.pipeFull.output).blocks_received).toBeGreaterThanOrEqual(2);
   expect(results.sendFullB.code, JSON.stringify(results.sendFullB)).toBe(0);
+  expect(results.sendFullB.output).toContain('sent ');
   expect(results.sendIncAB.code, JSON.stringify(results.sendIncAB)).toBe(0);
   expect(results.incABSize).toBeLessThan(results.fullBSize);
   expect(results.recvMissingParent.code).not.toBe(0);
@@ -451,13 +528,16 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
   expect(results.fsckCorruptVol.code).toBe(8);
   expect(results.recvIncOk.code, JSON.stringify(results.recvIncOk)).toBe(0);
   expect(JSON.parse(results.recvIncOk.output).blocks_received).toBe(0);
+  expect(JSON.parse(results.recvIncOk.output).snapshot).toBe('snapB');
   expect(results.mntReplica.code, JSON.stringify(results.mntReplica)).toBe(0);
+  expect(results.mkForceRoVol.code, JSON.stringify(results.mkForceRoVol)).not.toBe(0);
+  expect(results.mkForceRoVol.output).toContain('EBUSY');
   expect(results.replicaCopy.code, JSON.stringify(results.replicaCopy)).toBe(0);
   expect(results.replicaText).toBe('updated-in-B\n');
   expect(results.replicaBigMatch).toBe(true);
   expect(results.umntReplica.code).toBe(0);
 
-  // C-07, C-08, C-09 assertions.
+  // C-07, C-08, C-09 assertions + RO-dev mkfs EBUSY + snapshot delete + GC.
   expect(results.sendArchive.code, JSON.stringify(results.sendArchive)).toBe(0);
   expect(results.fsckArchiveOk.code, JSON.stringify(results.fsckArchiveOk)).toBe(0);
   expect(JSON.parse(results.fsckArchiveOk.output).ok).toBe(true);
@@ -483,11 +563,236 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
   expect(JSON.parse(results.fsckLoop.output).ok).toBe(true);
   expect(results.umntPkg.code).toBe(0);
   expect(results.loDetachOk.code, JSON.stringify(results.loDetachOk)).toBe(0);
+  expect(results.snapDelA.code, JSON.stringify(results.snapDelA)).toBe(0);
+  expect(JSON.parse(results.snapDelA.output).deleted).toBe('snapA');
+  expect(JSON.parse(results.snapListAfterDel.output).snapshots.map(s => s.name)).not.toContain('snapA');
+  expect(results.gcRun.code, JSON.stringify(results.gcRun)).toBe(0);
+  expect(JSON.parse(results.gcRun.output).live_roots).toBeGreaterThanOrEqual(1);
   expect(results.umntData.code).toBe(0);
+  expect(results.mntVd1Ro.code, JSON.stringify(results.mntVd1Ro)).toBe(0);
+  expect(results.mkForceRoDev.code, JSON.stringify(results.mkForceRoDev)).not.toBe(0);
+  expect(results.mkForceRoDev.output).toContain('EBUSY');
+  expect(results.umntVd1Ro.code).toBe(0);
+  expect(results.mkForceAfterRoUmnt.code, JSON.stringify(results.mkForceAfterRoUmnt)).toBe(0);
+  expect(JSON.parse(results.mkForceAfterRoUmnt.output).incarnation).toBe(3);
   expect(results.fsckArchiveBad.code, JSON.stringify(results.fsckArchiveBad)).toBe(4);
 
   await page.evaluate(() => window.osStandaloneConsole.closeClean());
   expect(outboundRequests).toEqual([]);
   expect(serverHits).toEqual([]);
   expect(pageErrors).toEqual([]);
+});
+
+test('web/wasi/process.js guest-fd translation for LOOP_SET_FD, FICLONERANGE, COWFS_IOC_SEND, COWFS_IOC_RECEIVE (valid + invalid/closed -> EBADF)', async ({
+  page,
+}) => {
+  const srcDist = join(repoRoot, 'dist');
+  const workerBytes = await readFile(join(srcDist, 'wasi-process.js'));
+  const probeSrv = http.createServer((req, res) => {
+    const headers = {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+      'Cross-Origin-Resource-Policy': 'same-origin',
+      'Cache-Control': 'no-store',
+    };
+    if (req.url === '/') {
+      res.writeHead(200, { ...headers, 'Content-Type': 'text/html; charset=utf-8' });
+      res.end('<!doctype html><meta charset="utf-8"><title>wasi-fd-probe</title>');
+      return;
+    }
+    if (req.url === '/wasi-process.js') {
+      res.writeHead(200, { ...headers, 'Content-Type': 'text/javascript; charset=utf-8' });
+      res.end(workerBytes);
+      return;
+    }
+    res.writeHead(404, headers);
+    res.end('not found');
+  });
+  await new Promise(r => probeSrv.listen(0, '127.0.0.1', r));
+  const probeOrigin = `http://127.0.0.1:${probeSrv.address().port}`;
+
+  try {
+    const LOOP_SET_FD = 0x4c00;
+    const FICLONERANGE = 0x4020940d;
+    const COWFS_IOC_SEND = 0x54570209;
+    const COWFS_IOC_RECEIVE = 0x5457020a;
+
+    const calls = [
+      // 0: open target device -> guest fd 4, kfd 400
+      { open: { path: '/dev/loop0', flags: 0, mode: 0 } },
+      // 1: open backing/stream file -> guest fd 5, kfd 500
+      { open: { path: '/tmp/backing.bin', flags: 2, mode: 0o644 } },
+      // 2..5: valid `{ ref: 1 }` batch refs -> MUST translate to kfd 500!
+      { ioctl: { fd: { ref: 0 }, request: LOOP_SET_FD, arg: { ref: 1 } } },
+      { ioctl: { fd: { ref: 0 }, request: FICLONERANGE, arg: { src_fd: { ref: 1 }, src_offset: 0, src_length: 0, dest_offset: 0 } } },
+      { ioctl: { fd: { ref: 0 }, request: COWFS_IOC_SEND, arg: { snapshot: 's', stream_fd: { ref: 1 }, archive: false } } },
+      { ioctl: { fd: { ref: 0 }, request: COWFS_IOC_RECEIVE, arg: { stream_fd: { ref: 1 } } } },
+      // 6..9: valid explicit guest fd 5 -> MUST translate to kfd 500!
+      { ioctl: { fd: 4, request: LOOP_SET_FD, arg: 5 } },
+      { ioctl: { fd: 4, request: FICLONERANGE, arg: { src_fd: 5, src_offset: 0, src_length: 0, dest_offset: 0 } } },
+      { ioctl: { fd: 4, request: COWFS_IOC_SEND, arg: { snapshot: 's', stream_fd: 5, archive: false } } },
+      { ioctl: { fd: 4, request: COWFS_IOC_RECEIVE, arg: { stream_fd: 5 } } },
+      // 10..13: invalid guest fd 999 -> MUST translate to 0xffffffff -> EBADF!
+      { ioctl: { fd: 4, request: LOOP_SET_FD, arg: 999 } },
+      { ioctl: { fd: 4, request: FICLONERANGE, arg: { src_fd: 999, src_offset: 0, src_length: 0, dest_offset: 0 } } },
+      { ioctl: { fd: 4, request: COWFS_IOC_SEND, arg: { snapshot: 's', stream_fd: 999, archive: false } } },
+      { ioctl: { fd: 4, request: COWFS_IOC_RECEIVE, arg: { stream_fd: 999 } } },
+      // 14: close guest fd 5
+      { close: { fd: 5 } },
+      // 15..18: closed guest fd 5 -> MUST translate to 0xffffffff -> EBADF!
+      { ioctl: { fd: 4, request: LOOP_SET_FD, arg: 5 } },
+      { ioctl: { fd: 4, request: FICLONERANGE, arg: { src_fd: 5, src_offset: 0, src_length: 0, dest_offset: 0 } } },
+      { ioctl: { fd: 4, request: COWFS_IOC_SEND, arg: { snapshot: 's', stream_fd: 5, archive: false } } },
+      { ioctl: { fd: 4, request: COWFS_IOC_RECEIVE, arg: { stream_fd: 5 } } },
+    ];
+    const jsonBytes = Buffer.from(JSON.stringify(calls), 'utf8');
+    const escaped = [...jsonBytes].map(b => '\\' + b.toString(16).padStart(2, '0')).join('');
+    const wat = `(module
+      (import "os" "sys" (func $sys (param i32 i32) (result i32)))
+      (import "os" "reply" (func $reply (param i32)))
+      (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 2)
+      (data (i32.const 1024) "${escaped}")
+      (func (export "_start")
+        (local $rlen i32)
+        (local.set $rlen (call $sys (i32.const 1024) (i32.const ${jsonBytes.length})))
+        (call $reply (i32.const 16384))
+        (i32.store (i32.const 0) (i32.const 16384))
+        (i32.store (i32.const 4) (local.get $rlen))
+        (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))`;
+    const mod = binaryen.parseText(wat);
+    let wasmBytes;
+    try {
+      wasmBytes = [...mod.emitBinary()];
+    } finally {
+      mod.dispose();
+    }
+
+    await page.goto(`${probeOrigin}/`);
+    const outcome = await page.evaluate(async wasmArr => {
+      const compiled = await WebAssembly.compile(new Uint8Array(wasmArr));
+      const sab = new SharedArrayBuffer(128 * 1024);
+      const state = new Int32Array(sab, 0, 2);
+      const payload = new Uint8Array(sab, 8);
+      const control = new SharedArrayBuffer(1024);
+      const worker = new Worker('/wasi-process.js');
+      const seenIoctls = [];
+      const events = [];
+      let stdout = '';
+      let stderr = '';
+      let nextKfd = 400;
+
+      const replyHost = obj => {
+        const enc = new TextEncoder().encode(JSON.stringify(obj));
+        payload.set(enc, 0);
+        Atomics.store(state, 1, enc.length);
+        Atomics.store(state, 0, 1);
+        Atomics.notify(state, 0);
+      };
+
+      const done = await new Promise((resolveDone, rejectDone) => {
+        const timer = setTimeout(() => {
+          rejectDone(new Error(`worker timed out; stderr=${stderr}; stdout=${stdout}; events=${JSON.stringify(events)}`));
+        }, 15_000);
+        const finish = fn => val => { clearTimeout(timer); fn(val); };
+        worker.onerror = err => finish(rejectDone)(new Error(`worker error: ${err.message}; stderr=${stderr}; events=${JSON.stringify(events)}`));
+        worker.onmessage = ({ data }) => {
+          if (data.out) {
+            const text = new TextDecoder().decode(data.out);
+            if (data.fd === 2) stderr += text;
+            else stdout += text;
+            return;
+          }
+          if (data.exit !== undefined) {
+            finish(resolveDone)({ code: data.exit, signal: data.signal ?? null });
+            return;
+          }
+          if (data.host) {
+            const { type, args } = data.host;
+            events.push({ type, op: args?.op ?? null });
+            if (type !== 'vfs') {
+              replyHost({});
+              return;
+            }
+            if (args.op === 'openat') {
+              const kfd = nextKfd;
+              nextKfd += 100;
+              replyHost({ kfd, stat: { mode: 0o100644, size: 64 }, size: 64 });
+              return;
+            }
+            if (args.op === 'close') {
+              replyHost({});
+              return;
+            }
+            if (args.op === 'sys') {
+              const results = (args.batch?.calls ?? []).map(call => {
+                if (call.open || call.open_at) {
+                  const kfd = nextKfd;
+                  nextKfd += 100;
+                  return { ok: { fd: kfd, stat: { mode: 0o100644, size: 64 }, size: 64 } };
+                }
+                if (call.close) return { ok: null };
+                if (call.ioctl) {
+                  const { fd, request, arg } = call.ioctl;
+                  const innerFd =
+                    request === 0x4c00
+                      ? arg
+                      : request === 0x4020940d
+                        ? arg?.src_fd
+                        : arg?.stream_fd;
+                  seenIoctls.push({ fd, request, innerFd });
+                  if (innerFd === 500) return { ok: { translated: innerFd } };
+                  if (innerFd === 0xffffffff) return { err: { errno: 'EBADF' } };
+                  return { err: { errno: 'EINVAL' } };
+                }
+                return { ok: null };
+              });
+              replyHost({ results });
+              return;
+            }
+            replyHost({});
+          } else {
+            events.push({ other: Object.keys(data) });
+          }
+        };
+        worker.postMessage({
+          pid: 77,
+          ppid: 1,
+          cwd: '/',
+          umask: 0o022,
+          argv: ['probe'],
+          env: [],
+          module: compiled,
+          channel: sab,
+          control,
+          stdin: { data: new Uint8Array(0) },
+          stdout: {},
+          stderr: {},
+        });
+      });
+      worker.terminate();
+      return { done, seenIoctls, stdout, stderr };
+    }, wasmBytes);
+
+    expect(outcome.done.code, outcome.stdout).toBe(0);
+    const parsed = JSON.parse(outcome.stdout);
+    // 16 ioctls total: 8 valid (4 via {ref}, 4 explicit guest fd 5) -> kfd 500;
+    // 8 invalid/closed (4 with fd 999, 4 with closed fd 5) -> 0xffffffff -> EBADF!
+    expect(outcome.seenIoctls.length).toBe(16);
+    for (let i = 0; i < 8; i++) {
+      expect(outcome.seenIoctls[i].fd).toBe(400);
+      expect(outcome.seenIoctls[i].innerFd).toBe(500);
+      expect(parsed.results[2 + i]).toEqual({ ok: { translated: 500 } });
+    }
+    for (let i = 0; i < 4; i++) {
+      expect(outcome.seenIoctls[8 + i].innerFd).toBe(0xffffffff);
+      expect(parsed.results[10 + i]).toEqual({ err: { errno: 'EBADF' } });
+    }
+    for (let i = 0; i < 4; i++) {
+      expect(outcome.seenIoctls[12 + i].innerFd).toBe(0xffffffff);
+      expect(parsed.results[15 + i]).toEqual({ err: { errno: 'EBADF' } });
+    }
+  } finally {
+    await new Promise(r => probeSrv.close(r));
+  }
 });
