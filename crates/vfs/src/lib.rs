@@ -40,6 +40,7 @@ pub mod namespace;
 pub mod procfs;
 pub mod profiles;
 pub mod sharefs;
+pub mod sharefs_ipc;
 pub mod stat;
 pub mod unix_sock;
 pub mod vblk;
