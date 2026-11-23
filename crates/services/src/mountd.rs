@@ -145,12 +145,6 @@ fn clean_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-fn user_target(path: &str) -> bool {
-    ["/mnt/local/", "/mnt/shared/", "/opt/private/"]
-        .iter()
-        .any(|prefix| path.strip_prefix(prefix).is_some_and(clean_name))
-}
-
 fn target_uid(b: &mut impl MountBackend, peer: PeerCred, pid: Option<u32>) -> Result<u32> {
     match pid {
         Some(pid) if pid != peer.pid => {
@@ -238,7 +232,7 @@ fn dispatch(
                 return Err(Errno::EINVAL.into());
             }
             let topology = flags & (MS_BIND | MS_MOVE | MS_PRIVATE) != 0;
-            if acting != 0 && (topology || !user_target(&target)) {
+            if acting != 0 && topology {
                 return Err(Errno::EPERM.into());
             }
             let id = source_id
@@ -305,6 +299,13 @@ fn dispatch(
                 raw
             };
             if owner_uid.is_some() {
+                let path = target.strip_prefix('/').ok_or(Errno::EPERM)?;
+                if path
+                    .split('/')
+                    .any(|name| abi::fs::check_component(name).is_err())
+                {
+                    return Err(Errno::EPERM.into());
+                }
                 flags |= USER_LOCK;
             }
             apply(
@@ -614,12 +615,12 @@ mod tests {
         for uid in [0, 1001] {
             assert_errno(request(&mut b, uid, attach("src:1000")), Errno::EACCES);
         }
-        for target in [
-            "/tmp/a",
-            "/mnt/local/..",
-            "/mnt/local/a/b",
-            "/mnt/local/a/../b",
-        ] {
+        for target in ["/tmp/a", "/mnt/local/a/b"] {
+            let mut v = attach("src:1000");
+            v["target"] = json!(target);
+            assert!(matches!(request(&mut b, 1000, v), MountResponse::Ok {}));
+        }
+        for target in ["/", "/mnt/local/..", "/mnt/local/a/../b"] {
             let mut v = attach("src:1000");
             v["target"] = json!(target);
             assert_errno(request(&mut b, 1000, v), Errno::EPERM);

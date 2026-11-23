@@ -1023,10 +1023,10 @@ another device unless the owner explicitly shares/transfers it.
 
 **Shared mounts.** Publishing defines a filesystem service; mounting is a separate receiver
 action. There is no device enrollment, recipient grant or incoming-share inbox. Every OS
-account, including each distinct guest ID, can publish and mount. For example:
+account can share locally over IPC. Remote peers explicitly sign in with relay access.
 
 1. A mounts a host folder or browser storage at `/mnt/local/project`.
-2. B runs `id -u` to obtain its OS UID. A runs
+2. For a remote connection, B reads its relay ACL UID from `(await os.sharedMounts()).uid`. For local IPC, B uses `id -u`. A runs
    `setfacl -R -m u:B_UID:rx /mnt/local/project` to allow B to traverse/read existing files.
    `setfacl -m d:u:B_UID:rx /mnt/local/project` sets the rule for newly created entries.
    A can instead use group/other mode bits or ACLs. Directory traversal and file access
@@ -1046,9 +1046,12 @@ Without a password, normal OS identity and ACLs determine access. The publisher 
 permission changes; files created through a share use its ownership and directory default
 ACL, so set a default ACL when peers need continuing access to new files.
 
-The relay verifies the current account from its session cookie, including supplementary
-groups, and passes that identity to the owner's filesystem server. Claimed client identity
-headers and process-token requests cannot authorize a connection. The owner applies the
+Remote publication and connection require Cloud Sign-In with relay access for the current local
+login. The worker authenticates each control request with its instance-bound service credential.
+WebSocket endpoints accept short-lived, single-use tickets for one connection and role.
+For a peer ACL, use the numeric UID returned by `os.sharedMounts()` on the signed-in receiver.
+Relay users occupy the upper half of the UID space, with one private group per user. Local IPC
+uses Unix peer credentials and can also redeem the export password offline. The owner applies the
 shared Rust VFS checks on each request, including retained descriptors and executable
 images. ACL changes affect existing mounts. Publishing does not copy the directory or
 make a durable replica. The owner must stay online; stop publishing, unmount, lease expiry

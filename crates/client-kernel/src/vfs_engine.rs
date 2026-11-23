@@ -53,7 +53,6 @@ const CLIENT_PAGE_FD_BASE: u32 = 0x4000_0000;
 const CLIENT_PAGE_FD_LIMIT: u32 = 0x7000_0000;
 pub(crate) const SCOPED_PAGE_PID_BASE: u32 = 0x7fff_0000;
 const READ_STREAM_MAX: usize = 64;
-const MANIFEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const PRIVATE_EXT_MAX_BYTES: u64 = 128 * 1024 * 1024;
 #[allow(dead_code)]
 const WASM_HEADER_STUB: [u8; 8] = [0x00, b'a', b's', b'm', 0x01, 0x00, 0x00, 0x00];
@@ -1581,6 +1580,8 @@ fn default_true() -> bool {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MountUserSpec {
+    #[serde(default)]
+    flags: u64,
     kind: String,
     name: String,
     #[serde(default)]
@@ -1647,6 +1648,7 @@ impl PageOpenFd {
 }
 
 pub(crate) struct AttachedUserMount {
+    pub(crate) created_dir: Option<vfs::NodeId>,
     pub(crate) mount_id: MountId,
     pub(crate) kind: String,
     pub(crate) name: String,
@@ -2652,6 +2654,24 @@ async fn construct_vfs(
 }
 
 impl VfsRuntime {
+    pub(crate) fn page_mount_pins(&self, sid: &str) -> BTreeSet<MountId> {
+        let Some(session) = self.sessions.get(sid) else {
+            return BTreeSet::new();
+        };
+        session
+            .page_fds
+            .values()
+            .map(|fd| &fd.file)
+            .chain(
+                self.read_streams
+                    .values()
+                    .filter(|r| r.session_id == sid)
+                    .map(|r| &r.file),
+            )
+            .filter_map(|file| file.mount_pin().map(|pin| pin.id()))
+            .chain(session.delegated_uploads.values().map(|(_, pin)| pin.id()))
+            .collect()
+    }
     pub(crate) fn new_sync(
         instance_id: &str,
         state: Rc<RefCell<crate::State>>,
@@ -3503,61 +3523,6 @@ impl Kernel {
     }
 }
 
-async fn read_vfs_file_bounded(
-    vfs: &Vfs,
-    pid: u32,
-    path: &str,
-    max_bytes: u64,
-    err_on_too_big: Errno,
-) -> Result<Vec<u8>, JsValue> {
-    let (file_ref, entry) = vfs
-        .open_file(
-            pid,
-            StartAnchor::Root,
-            path,
-            abi::O_RDONLY | abi::O_NOFOLLOW,
-            0,
-        )
-        .await
-        .map_err(map_errno)?;
-    if !entry.metadata.is_file() {
-        let _ = file_ref.close().await;
-        return Err(vfs_js_err(Errno::EISDIR, "expected a regular file"));
-    }
-    if entry.metadata.size > max_bytes {
-        let _ = file_ref.close().await;
-        return Err(vfs_js_err(
-            err_on_too_big,
-            "private package exceeds its size limit",
-        ));
-    }
-    let expected = entry.metadata.size as usize;
-    let mut out = vec![0u8; expected];
-    let mut off = 0usize;
-    while off < expected {
-        let chunk = (expected - off).min(256 * 1024);
-        match file_ref
-            .read_at(&mut out[off..off + chunk], off as u64)
-            .await
-        {
-            Ok(0) => {
-                let _ = file_ref.close().await;
-                return Err(vfs_js_err(
-                    Errno::ESTALE,
-                    "package changed during activation",
-                ));
-            }
-            Ok(n) => off += n,
-            Err(e) => {
-                let _ = file_ref.close().await;
-                return Err(map_errno(e));
-            }
-        }
-    }
-    let _ = file_ref.close().await;
-    Ok(out)
-}
-
 #[wasm_bindgen]
 impl Kernel {
     // =========================================================================
@@ -3847,7 +3812,11 @@ impl Kernel {
     ) -> Result<JsValue, JsValue> {
         let spec: MountUserSpec = serde_json::from_str(&spec_json)
             .map_err(|e| vfs_js_err(Errno::EINVAL, e.to_string()))?;
-        let clean_name = clean_mount_name(&spec.name).map_err(map_errno)?;
+        let clean_name = if let Some(target) = spec.target.as_deref().filter(|t| !t.is_empty()) {
+            target.rsplit('/').next().unwrap_or_default().to_owned()
+        } else {
+            clean_mount_name(&spec.name).map_err(map_errno)?
+        };
 
         let normalized_kind = match spec.kind.as_str() {
             "browser-storage" | "opfs" => "opfs",
@@ -3866,16 +3835,16 @@ impl Kernel {
         };
         let target_path = match &spec.target {
             Some(t) if !t.is_empty() => {
-                let expected_prefix = format!("{default_base}/");
-                if !t.starts_with(&expected_prefix) {
-                    return Err(vfs_js_err(
-                        Errno::EPERM,
-                        "user mount target is outside its allowed directory",
-                    ));
+                let relative = t
+                    .strip_prefix('/')
+                    .ok_or_else(|| map_errno(Errno::EINVAL))?;
+                if relative.is_empty() {
+                    return Err(map_errno(Errno::EPERM));
                 }
-                let suffix = &t[expected_prefix.len()..];
-                let validated = clean_mount_name(suffix).map_err(map_errno)?;
-                format!("{default_base}/{validated}")
+                for component in relative.split('/') {
+                    abi::fs::check_component(component).map_err(map_errno)?;
+                }
+                t.clone()
             }
             _ => format!("{default_base}/{clean_name}"),
         };
@@ -3991,7 +3960,6 @@ impl Kernel {
                     ex,
                     false,
                     p,
-
                 )
             }
             "snapshot" => {
@@ -4007,7 +3975,6 @@ impl Kernel {
                     ex,
                     false,
                     p,
-
                 )
             }
             "helperfs" => {
@@ -4024,7 +3991,6 @@ impl Kernel {
                     ex,
                     true,
                     p,
-
                 )
             }
             "sharefs" => {
@@ -4092,10 +4058,14 @@ impl Kernel {
             None,
         )
         .map_err(map_errno)?;
-        let mkdir_res = vfs
-            .mkdirat(scoped_pid, StartAnchor::Root, &target_path, 0o700)
-            .await;
-        let created_dir = mkdir_res.is_ok();
+        let mkdir_res = if target_path == format!("{default_base}/{clean_name}") {
+            vfs.mkdirat(scoped_pid, StartAnchor::Root, &target_path, 0o700)
+                .await
+        } else {
+            // Only create conventional mountpoints. Explicit targets must already exist.
+            Err(Errno::EEXIST)
+        };
+        let created_dir = mkdir_res.as_ref().ok().map(|e| e.handle.node);
         if let Err(err) = mkdir_res {
             if err != Errno::EEXIST {
                 let _ = vfs.exit_process(scoped_pid).await;
@@ -4119,21 +4089,21 @@ impl Kernel {
 
         let is_snapshot = normalized_kind == "snapshot";
         let mflags = MountFlags {
-            rdonly: read_only && !is_snapshot,
+            rdonly: (read_only && !is_snapshot) || spec.flags & mount_flags::MS_RDONLY != 0,
             nosuid: true,
             nodev: true,
             noexec: !execute,
-            nosymfollow,
-            ..MountFlags::default()
+            nosymfollow: nosymfollow || spec.flags & mount_flags::MS_NOSYMFOLLOW != 0,
+            ..MountFlags::from_accepted(spec.flags)
         };
         let mut locked = mount_flags::MS_NOSUID | mount_flags::MS_NODEV;
-        if read_only && !is_snapshot {
+        if mflags.rdonly {
             locked |= mount_flags::MS_RDONLY;
         }
         if !execute {
             locked |= mount_flags::MS_NOEXEC;
         }
-        if nosymfollow {
+        if mflags.nosymfollow {
             locked |= mount_flags::MS_NOSYMFOLLOW;
         }
 
@@ -4157,7 +4127,7 @@ impl Kernel {
                 id
             }
             Err(err) => {
-                if created_dir {
+                if created_dir.is_some() {
                     let _ = vfs
                         .unlinkat(scoped_pid, StartAnchor::Root, &target_path, true)
                         .await;
@@ -4188,6 +4158,7 @@ impl Kernel {
                 target_path.clone(),
                 AttachedUserMount {
                     mount_id,
+                    created_dir,
                     kind: kind_out.clone(),
                     name: clean_name.clone(),
                     cloud: spec.cloud,
@@ -4236,7 +4207,7 @@ impl Kernel {
             sources.push(single.clone());
         }
 
-        let mut manifest_texts: Vec<String> = Vec::new();
+        let manifest_texts: Vec<String>;
         let mut blob_store = MemoryBlobStore::new();
         let mut total_bytes: u64 = 0;
 
@@ -4295,68 +4266,78 @@ impl Kernel {
             )
             .map_err(map_errno)?;
 
-            let load_res: Result<(), JsValue> = async {
-                let mut parsed_imgs = Vec::new();
-                for src_dir in &sources {
-                    let clean_src = src_dir.trim_end_matches('/');
-                    let mpath = format!("{clean_src}/manifest.json");
-                    let raw = read_vfs_file_bounded(
-                        vfs,
-                        scoped_pid,
-                        &mpath,
-                        MANIFEST_MAX_BYTES,
-                        Errno::EFBIG,
-                    )
-                    .await?;
-                    let text = std::str::from_utf8(&raw)
-                        .map_err(|_| vfs_js_err(Errno::EINVAL, "manifest is not valid UTF-8"))?
-                        .to_string();
-                    let img = image::Image::parse(text.as_bytes())
-                        .map_err(|e| vfs_js_err(Errno::EINVAL, e.to_string()))?;
-                    manifest_texts.push(text);
-                    parsed_imgs.push((clean_src.to_string(), img));
-                }
-                let _ = image::Composition::private(
-                    &parsed_imgs
-                        .iter()
-                        .map(|(_, img)| img.clone())
-                        .collect::<Vec<_>>(),
-                )
-                .map_err(|e| vfs_js_err(Errno::EINVAL, e.to_string()))?;
-
-                let mut seen_blobs = BTreeSet::new();
-                for (src_dir, img) in &parsed_imgs {
-                    for entry in &img.entries {
-                        if let image::Node::File { sha256, size, .. } = &entry.node {
-                            if !seen_blobs.insert(sha256.clone()) {
-                                continue;
-                            }
-                            total_bytes = total_bytes.saturating_add(*size);
-                            if total_bytes > PRIVATE_EXT_MAX_BYTES {
-                                return Err(vfs_js_err(
-                                    Errno::EFBIG,
-                                    "private package exceeds 128 MiB",
-                                ));
-                            }
-                            let bpath = format!("{src_dir}/blobs/{sha256}");
-                            let bytes =
-                                read_vfs_file_bounded(vfs, scoped_pid, &bpath, *size, Errno::EFBIG)
-                                    .await?;
-                            if bytes.len() as u64 != *size || image::digest(&bytes) != *sha256 {
-                                return Err(vfs_js_err(
-                                    Errno::EIO,
-                                    "private package content digest mismatch",
-                                ));
-                            }
-                            blob_store.insert(sha256.clone(), bytes);
+            let loaded = async {
+                let mut pins = Vec::new();
+                for path in &sources {
+                    let (mut dir, rest) = {
+                        let rt = self.vfs_rt.borrow();
+                        let sess = rt
+                            .sessions
+                            .values()
+                            .find(|s| Rc::ptr_eq(&s.mnt_ns, sess_ns))
+                            .ok_or(Errno::ESTALE)?;
+                        let (prefix, source) = sess
+                            .user_mounts
+                            .iter()
+                            .filter(|(prefix, _)| {
+                                path == *prefix
+                                    || path
+                                        .strip_prefix(prefix.as_str())
+                                        .is_some_and(|p| p.starts_with('/'))
+                            })
+                            .max_by_key(|(prefix, _)| prefix.len())
+                            .ok_or(Errno::ENOENT)?;
+                        let ns = sess_ns.borrow();
+                        let row = ns.entry(source.mount_id).ok_or(Errno::ESTALE)?;
+                        if row.slot.owner_uid != Some(uid) {
+                            return Err(Errno::EACCES);
+                        }
+                        if spec.execute.unwrap_or(true)
+                            && row.slot.pin().effective_noexec()
+                            && source.kind != "snapshot"
+                        {
+                            return Err(Errno::EACCES);
+                        }
+                        (
+                            vfs::PathAnchor {
+                                pin: row.slot.pin(),
+                                handle: row.root.clone(),
+                                open: row.root_open.clone(),
+                            },
+                            &path[prefix.len()..],
+                        )
+                    };
+                    if let Some(rest) = rest.strip_prefix('/') {
+                        for name in rest.split('/') {
+                            dir = crate::mountd_bridge::package_dir(vfs, scoped_pid, &dir, name)
+                                .await?;
                         }
                     }
+                    pins.push(dir);
                 }
-                Ok(())
+                let backing = crate::mountd_bridge::private_image(
+                    vfs,
+                    scoped_pid,
+                    &pins,
+                    target_path,
+                    spec.execute.unwrap_or(true),
+                )
+                .await?;
+                if pins
+                    .iter()
+                    .any(|p| !sess_ns.borrow().contains_mount(p.pin.id()))
+                {
+                    return Err(Errno::ESTALE);
+                }
+                Ok((
+                    backing.clone(),
+                    sources.join(", "),
+                    backing.provider.clone(),
+                ))
             }
             .await;
             let _ = vfs.exit_process(scoped_pid).await;
-            load_res?;
+            return loaded.map_err(map_errno);
         }
 
         let images: Vec<image::Image> = manifest_texts
@@ -4505,7 +4486,7 @@ impl Kernel {
                 sess.generation = sess.generation.wrapping_add(1);
                 (
                     sess.generation,
-                    Some((spid2, scred2, sns2)),
+                    um.created_dir.map(|node| (spid2, scred2, sns2, node)),
                     Some(um.mount_id),
                 )
             } else {
@@ -4516,12 +4497,18 @@ impl Kernel {
         if let Some(mid) = removed_mid {
             self.vfs_rt.borrow_mut().evict_mount_execs(mid);
         }
-        if let Some((spid2, scred2, sns2)) = cleanup_dir
+        if let Some((spid2, scred2, sns2, node)) = cleanup_dir
             && vfs
                 .spawn_process(spid2, INIT, scred2, Some(sns2), None, None)
                 .is_ok()
         {
-            let _ = vfs.unlinkat(spid2, StartAnchor::Root, &target, true).await;
+            if vfs
+                .statat(spid2, StartAnchor::Root, &target, false)
+                .await
+                .is_ok_and(|s| s.ino == node.ino)
+            {
+                let _ = vfs.unlinkat(spid2, StartAnchor::Root, &target, true).await;
+            }
             let _ = vfs.exit_process(spid2).await;
         }
         drain_releases(&vfs);
@@ -4646,6 +4633,7 @@ impl Kernel {
                 .map(|e| match e.slot.backing.provider.health() {
                     ProviderHealth::Connected => "connected",
                     ProviderHealth::Revoked => "revoked",
+                    ProviderHealth::Expired => "expired",
                     ProviderHealth::Lost => "lost",
                 })
                 .unwrap_or("connected");
@@ -5578,9 +5566,26 @@ impl Kernel {
                     )
                     .await?;
                 }
-                if let Some(parent) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&parent_pid) {
-                    parent.login_session = Some(sid);
+                let mut rt = self.vfs_rt.borrow_mut();
+                rt.vfs
+                    .check_service_child(parent_pid, pid)
+                    .map_err(map_errno)?;
+                let previous = rt
+                    .proc_meta
+                    .get(&parent_pid)
+                    .and_then(|p| p.login_session.clone());
+                let child = rt
+                    .proc_meta
+                    .get_mut(&pid)
+                    .ok_or_else(|| map_errno(Errno::ESRCH))?;
+                if child.login_session != previous {
+                    return Err(map_errno(Errno::EPERM));
                 }
+                child.login_session = Some(sid.clone());
+                rt.proc_meta
+                    .get_mut(&parent_pid)
+                    .ok_or_else(|| map_errno(Errno::ESRCH))?
+                    .login_session = Some(sid);
             }
         }
         let (vfs, cred, base_ns, resolved_sess, parent_uid) = {

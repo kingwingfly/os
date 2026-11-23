@@ -18,6 +18,8 @@ struct ShareSource {
     rule: ExportRule,
     #[serde(default)]
     expires_at: u64,
+    #[serde(default)]
+    password: String,
 }
 
 impl Kernel {
@@ -43,12 +45,25 @@ impl Kernel {
         let port = Reflect::get(&source, &"port".into())?;
         let (backing, root) = if spec.transport == TransportKind::Ipc && port.is_undefined() {
             self.exports
-                .connect_share_ipc(proxy, &spec.id, spec.rule, socket)
+                .connect_share_ipc(proxy, &spec.id, spec.rule, &spec.password, socket)
                 .await
         } else {
-            export_bridge::connect_share_port(proxy, port, spec.expires_at, spec.rule, socket).await
+            export_bridge::connect_share_port(
+                if spec.transport == TransportKind::Ipc {
+                    Default::default()
+                } else {
+                    self.exports.relay_revocation()
+                },
+                proxy,
+                port,
+                spec.expires_at,
+                spec.rule,
+                socket,
+            )
+            .await
         }
         .map_err(map_errno)?;
+        self.exports.record_share(&spec.id, &backing);
         let mode = match spec.transport {
             TransportKind::Ipc => "ipc",
             TransportKind::P2p => "p2p",

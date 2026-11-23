@@ -395,6 +395,7 @@ function followAgain(name, presentation, sound) {
 // A speaker view, which a deck's S opened (viewer.rs): it shows the deck its address names once
 // the terminal runs.
 export function started() {
+  window.dispatchEvent(new Event('os:desktop-ready'));
   installSelectMenus();
   installConsoleSharing();
   const support = executionSupport();

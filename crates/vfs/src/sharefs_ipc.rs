@@ -19,6 +19,9 @@ pub trait ByteStream {
     fn poll_read(&self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<Result<usize>>;
     /// Event-loop streams schedule this notification after the current mount
     /// guard returns. The completed wire reply determines its precise errno.
+    fn schedule_drain(&self, drain: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>) {
+        let _ = crate::now_or_never(drain);
+    }
     fn notify_loss(&self, provider: &Rc<ProviderState>) {
         provider.lose();
     }
@@ -79,11 +82,13 @@ struct StreamState {
     notified: bool,
 }
 struct Connection<S> {
+    draining: Cell<bool>,
+    drain_waker: RefCell<Option<Waker>>,
     stream: S,
     state: RefCell<StreamState>,
     provider: Rc<ProviderState>,
 }
-impl<S: ByteStream> Connection<S> {
+impl<S: ByteStream + 'static> Connection<S> {
     fn enqueue(state: &mut StreamState, req: OsfsRequest, abandoned: bool) -> Result<u64> {
         let id = state.last.checked_add(1).ok_or(Errno::EIO)?;
         let mutation = req.is_mutation();
@@ -124,6 +129,8 @@ impl<S: ByteStream> Connection<S> {
         state.output.clear();
         if errno == Errno::EACCES {
             self.provider.revoke();
+        } else if errno == Errno::ESTALE {
+            self.provider.expire();
         }
         for p in state.pending.values_mut().filter(|p| p.answer.is_none()) {
             let err = if lost && p.sent && p.mutation {
@@ -150,13 +157,13 @@ impl<S: ByteStream> Connection<S> {
     fn flush(&self, state: &mut StreamState, cx: &mut Context<'_>) -> Result<()> {
         while let Some(out) = state.output.front_mut() {
             out.started = true;
-            if let Some(p) = state.pending.get_mut(&out.id) {
-                p.sent = true;
-            }
             match self.stream.poll_write(cx, &out.bytes[out.offset..]) {
                 Poll::Pending => break,
                 Poll::Ready(Ok(0) | Err(_)) => return Err(Errno::ENOTCONN),
                 Poll::Ready(Ok(n)) if n <= out.bytes.len() - out.offset => {
+                    if let Some(p) = state.pending.get_mut(&out.id) {
+                        p.sent = true;
+                    }
                     out.offset += n;
                     if out.offset == out.bytes.len() {
                         state.output.pop_front();
@@ -167,7 +174,7 @@ impl<S: ByteStream> Connection<S> {
         }
         Ok(())
     }
-    fn pump(&self, state: &mut StreamState, cx: &mut Context<'_>, id: u64) -> Result<()> {
+    fn pump(&self, state: &mut StreamState, cx: &mut Context<'_>, id: Option<u64>) -> Result<()> {
         // A peer may have sent CLOSED and already shut down its read half. Drain its
         // final reply before classifying a broken write as a transport loss.
         if !state.write_closed {
@@ -177,7 +184,10 @@ impl<S: ByteStream> Connection<S> {
             }
         }
         let mut buf = [0; 8192];
-        while state.pending.get(&id).is_some_and(|p| p.answer.is_none()) {
+        while match id {
+            Some(id) => state.pending.get(&id).is_some_and(|p| p.answer.is_none()),
+            None => state.pending.values().any(|p| p.abandoned),
+        } {
             match self.stream.poll_read(cx, &mut buf) {
                 Poll::Pending => break,
                 Poll::Ready(Ok(0) | Err(_)) => return Err(Errno::ENOTCONN),
@@ -198,6 +208,9 @@ impl<S: ByteStream> Connection<S> {
                                             releases.push(open.id);
                                         }
                                         state.pending.remove(&request_id);
+                                        if let Some(w) = self.drain_waker.borrow_mut().take() {
+                                            w.wake();
+                                        }
                                     } else {
                                         p.answer = Some(result.map_err(ShareError::Remote));
                                         if let Some(w) = p.waker.take() {
@@ -225,9 +238,19 @@ impl<S: ByteStream> Connection<S> {
         }
         Ok(())
     }
-    async fn call(&self, req: OsfsRequest) -> std::result::Result<OsfsResponse, ShareError> {
+    async fn call(
+        self: &Rc<Self>,
+        req: OsfsRequest,
+    ) -> std::result::Result<OsfsResponse, ShareError> {
         let id = {
             let mut state = self.state.borrow_mut();
+            if !self.draining.get()
+                && state.closed.is_none()
+                && state.pending.values().any(|p| p.abandoned)
+                && let Err(e) = self.pump(&mut state, &mut Context::from_waker(Waker::noop()), None)
+            {
+                self.finish(&mut state, e);
+            }
             if let Some(e) = state.closed {
                 return Err(ShareError::Remote(e));
             }
@@ -251,7 +274,7 @@ impl<S: ByteStream> Connection<S> {
         let result = poll_fn(|cx| {
             let mut state = self.state.borrow_mut();
             if state.closed.is_none()
-                && let Err(e) = self.pump(&mut state, cx, id)
+                && let Err(e) = self.pump(&mut state, cx, Some(id))
             {
                 self.finish(&mut state, e);
             }
@@ -276,12 +299,12 @@ impl<S: ByteStream> Connection<S> {
     }
 }
 
-struct CancelOnDrop<'a, S: ByteStream> {
-    connection: &'a Connection<S>,
+struct CancelOnDrop<'a, S: ByteStream + 'static> {
+    connection: &'a Rc<Connection<S>>,
     id: u64,
     done: Cell<bool>,
 }
-impl<S: ByteStream> Drop for CancelOnDrop<'_, S> {
+impl<S: ByteStream + 'static> Drop for CancelOnDrop<'_, S> {
     fn drop(&mut self) {
         if self.done.get() {
             return;
@@ -314,31 +337,65 @@ impl<S: ByteStream> Drop for CancelOnDrop<'_, S> {
             let _ =
                 Connection::<S>::enqueue(&mut s, OsfsRequest::Cancel { target_id: self.id }, true);
         }
-        if let Err(e) = self
-            .connection
-            .flush(&mut s, &mut Context::from_waker(Waker::noop()))
-        {
-            self.connection.finish(&mut s, e);
+        drop(s);
+        if let Some(w) = self.connection.drain_waker.borrow_mut().take() {
+            w.wake();
+        }
+        if !self.connection.draining.replace(true) {
+            let connection = self.connection.clone();
+            struct DrainGuard<'a>(&'a Cell<bool>);
+            impl Drop for DrainGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.set(false);
+                }
+            }
+            self.connection.stream.schedule_drain(Box::pin(async move {
+                let _guard = DrainGuard(&connection.draining);
+                poll_fn(|cx| {
+                    let mut s = connection.state.borrow_mut();
+                    if s.closed.is_none()
+                        && let Err(e) = connection.pump(&mut s, cx, None)
+                    {
+                        connection.finish(&mut s, e);
+                    }
+                    if s.closed.is_some() || !s.pending.values().any(|p| p.abandoned) {
+                        connection.report_loss(&mut s);
+                        connection.drain_waker.borrow_mut().take();
+                        for p in s.pending.values_mut() {
+                            if let Some(w) = p.waker.take() {
+                                w.wake();
+                            }
+                        }
+                        Poll::Ready(())
+                    } else {
+                        *connection.drain_waker.borrow_mut() = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }));
         }
     }
 }
 
 pub struct IpcShareTransport<S> {
-    connection: Connection<S>,
+    connection: Rc<Connection<S>>,
     root: Handle,
     rule: ExportRule,
 }
 
-impl<S: ByteStream> IpcShareTransport<S> {
+impl<S: ByteStream + 'static> IpcShareTransport<S> {
     /// The root and its filesystem identity come from the publisher, after
     /// the peer's root directory access check has succeeded.
     pub async fn connect(stream: S, rule: ExportRule) -> Result<ShareFs<Self>> {
         let provider = ProviderState::new();
-        let connection = Connection {
+        let connection = Rc::new(Connection {
+            draining: Cell::new(false),
+            drain_waker: RefCell::default(),
             stream,
             state: RefCell::default(),
             provider: provider.clone(),
-        };
+        });
         let answer = connection
             .call(OsfsRequest::Root {})
             .await
@@ -481,7 +538,7 @@ fn opened(r: OsfsResponse) -> Result<(Entry, OpenRef)> {
     }
 }
 
-impl<S: ByteStream> ShareTransport for IpcShareTransport<S> {
+impl<S: ByteStream + 'static> ShareTransport for IpcShareTransport<S> {
     fn id(&self) -> &FsId {
         &self.root.fs
     }
@@ -545,7 +602,13 @@ impl<S: ByteStream> ShareTransport for IpcShareTransport<S> {
     }
     fn read_link<'a>(&'a self, _cred: &'a Cred, link: &'a Handle) -> ShareFuture<'a, String> {
         self.at(link, AtOp::ReadLink {}, |r| match r {
-            OsfsResponse::Link(v) => Ok(v),
+            OsfsResponse::Link(v) => {
+                relative_path(&v).map_err(|_| Errno::ELOOP)?;
+                if v.is_empty() {
+                    return Err(Errno::ELOOP);
+                }
+                Ok(v)
+            }
             _ => Err(Errno::EIO),
         })
     }
@@ -1276,17 +1339,92 @@ impl ScopedDir {
             Ok(())
         }
     }
+    async fn find_link(&self, named: &Handle) -> Result<(Entry, String)> {
+        let mut dirs = vec![(self.root.handle().clone(), String::new())];
+        let mut visited = std::collections::HashSet::new();
+        while let Some((dir, prefix)) = dirs.pop() {
+            self.active()?;
+            if !visited.insert(dir.node) {
+                continue;
+            }
+            let mut cookie = 0;
+            loop {
+                let page = match self
+                    .fs()
+                    .read_dir_page(self.root.cred(), &dir, cookie, DIR_PAGE_MAX)
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(Errno::EACCES | Errno::ENOENT | Errno::ESTALE) => break,
+                    Err(e) => return Err(e),
+                };
+                for item in page.entries {
+                    if component(&item.name).is_err() {
+                        continue;
+                    }
+                    let path = if prefix.is_empty() {
+                        item.name.clone()
+                    } else {
+                        format!("{prefix}/{}", item.name)
+                    };
+                    if relative_path(&path).is_err() {
+                        continue;
+                    }
+                    if item.node == named.node {
+                        let candidate = Handle {
+                            proof: path.clone(),
+                            ..named.clone()
+                        };
+                        if let Ok(entry) = self.resolve_beneath(&candidate).await {
+                            return Ok((entry, path));
+                        }
+                    }
+                    if item.file_type.is_dir()
+                        && let Ok(child) =
+                            self.fs().lookup(self.root.cred(), &dir, &item.name).await
+                        && child.metadata.is_dir()
+                        && child.handle.node == item.node
+                    {
+                        dirs.push((child.handle, path));
+                    }
+                }
+                match page.next_cookie {
+                    Some(next) if next > cookie => cookie = next,
+                    Some(_) => return Err(Errno::EIO),
+                    None => break,
+                }
+            }
+        }
+        Err(Errno::ESTALE)
+    }
     async fn held_entry(&self, held: &RetainedOpen) -> Result<Entry> {
         match self.resolve_beneath(&held.named).await {
-            Err(Errno::ESTALE) => {
-                let parent = held.parent.as_ref().ok_or(Errno::ESTALE)?;
-                // A nameless regular file has no links outside the pinned subtree.
-                // Preserve its open description while the original parent remains in scope.
+            Err(Errno::ESTALE | Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP) => {
                 let metadata = self.fs().open_metadata(&held.open).await?;
-                if !metadata.is_file() || metadata.nlink != 0 {
-                    return Err(Errno::ESTALE);
+                if metadata.nlink != 0 {
+                    let (entry, path) = self.find_link(&held.named).await?;
+                    let parent_path = path.rsplit_once('/').map_or("", |(p, _)| p);
+                    let parent = self.walk_from_pin(parent_path).await?;
+                    if let Some(open) = self.opens.borrow_mut().get_mut(&held.open.id) {
+                        open.parent = Some(Handle {
+                            proof: parent_path.to_owned(),
+                            ..parent.handle
+                        });
+                        open.named.proof = path;
+                    }
+                    return Ok(entry);
                 }
-                self.resolve_beneath(parent).await?;
+                let parent = held
+                    .parent
+                    .as_ref()
+                    .filter(|_| metadata.is_file())
+                    .ok_or(Errno::ESTALE)?;
+                if let Err(e) = self.resolve_beneath(parent).await {
+                    if e != Errno::ESTALE {
+                        return Err(e);
+                    }
+                    self.find_link(parent).await?;
+                }
                 Ok(Entry {
                     handle: held.driver.clone(),
                     metadata,
@@ -1505,6 +1643,7 @@ mod tests {
                 now: Cell::new(10),
                 reader: RefCell::default(),
                 replies: RefCell::default(),
+                reject_writes: Cell::default(),
                 drop_reply: Cell::default(),
                 hold_replies: Cell::default(),
             });
@@ -1520,11 +1659,15 @@ mod tests {
         now: Cell<u64>,
         reader: RefCell<FrameReader>,
         replies: RefCell<VecDeque<u8>>,
+        reject_writes: Cell<bool>,
         drop_reply: Cell<bool>,
         hold_replies: Cell<bool>,
     }
     impl ByteStream for LoopStream {
         fn poll_write(&self, _: &mut Context<'_>, bytes: &[u8]) -> Poll<Result<usize>> {
+            if self.0.reject_writes.get() {
+                return Poll::Ready(Err(Errno::ENOTCONN));
+            }
             let n = bytes.len().min(31);
             let mut core = self.0.core.borrow_mut();
             let now = self.0.now.get();
@@ -1671,6 +1814,16 @@ mod tests {
             &s.owner,
             s.root.handle(),
             "kept",
+            s.root.handle(),
+            "renamed",
+            RenameFlags::empty(),
+        ))
+        .unwrap();
+        assert!(run(fs.open_metadata(&open)).is_ok());
+        run(s.fs.rename(
+            &s.owner,
+            s.root.handle(),
+            "renamed",
             base,
             "outside",
             RenameFlags::empty(),
@@ -1722,6 +1875,7 @@ mod tests {
         assert_eq!(run(fs.open(&cred(2002), &h, &opt)), Err(Errno::EMFILE));
         link.now.set(100);
         assert_eq!(run(fs.open_metadata(&open)), Err(Errno::ESTALE));
+        assert_eq!(fs.provider().health(), crate::ProviderHealth::Expired);
         assert_eq!(run(fs.open_metadata(&open)), Err(Errno::ESTALE));
         run(second.try_lock(
             &competitor,
@@ -1777,6 +1931,19 @@ mod tests {
         }
     }
     #[test]
+    fn rejected_write_does_not_increment_uncertain_writes() {
+        let s = Source::new();
+        let (fs, link) = s.session(RW);
+        let (_, open) = create(&fs, "f");
+        link.reject_writes.set(true);
+        link.drop_reply.set(true);
+        assert_eq!(
+            run(fs.write_at(&open, b"unsent", WriteAt::End)),
+            Err(Errno::ENOTCONN)
+        );
+        assert_eq!(fs.provider().uncertain_writes(), 0);
+    }
+    #[test]
     fn cancelling_after_the_server_opened_releases_the_unclaimed_description() {
         let s = Source::new();
         let (fs, link) = s.session(RW);
@@ -1785,7 +1952,9 @@ mod tests {
         let opts = *OpenOptions::new().read(true);
         let cred = cred(2002);
         link.hold_replies.set(true);
-        assert!(now_or_never(fs.open(&cred, &entry.handle, &opts)).is_none());
+        for _ in 0..3 * OSFS_MAX_INFLIGHT / 2 {
+            assert!(now_or_never(fs.open(&cred, &entry.handle, &opts)).is_none());
+        }
         link.hold_replies.set(false);
         for _ in 0..OSFS_MAX_HANDLES {
             run(fs.open(&cred, &entry.handle, &opts)).unwrap();

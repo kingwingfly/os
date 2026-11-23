@@ -39,14 +39,6 @@ function resolveTargetDir() {
 
 function runXtask(args) {
   const targetDir = resolveTargetDir();
-  const xtaskBin = targetDir ? join(targetDir, 'release', 'xtask') : null;
-  if (xtaskBin && existsSync(xtaskBin)) {
-    return execFileSync(xtaskBin, args, {
-      cwd: repoRoot,
-      encoding: 'utf8',
-      maxBuffer: 4 * 1024 * 1024,
-    }).trim();
-  }
   const env = { ...process.env, CARGO_NET_OFFLINE: 'true' };
   if (targetDir) env.CARGO_TARGET_DIR = targetDir;
   return execFileSync(

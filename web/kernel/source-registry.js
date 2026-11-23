@@ -10,8 +10,8 @@ export function savedSourceStore(idb = globalThis.indexedDB) {
   let opened;
   const database = () => opened ??= new Promise((resolve, reject) => {
     if (!idb) { reject(fail('ENOTSUP', 'Saved folders require IndexedDB.')); return; }
-    const req = idb.open('os-mount-sources-v1', 1);
-    req.onupgradeneeded = () => req.result.createObjectStore('sources', { keyPath: ['uid', 'id'] });
+    const req = idb.open('os-mount-sources-v2', 1);
+    req.onupgradeneeded = () => req.result.createObjectStore('sources', { keyPath: ['volume', 'uid', 'id'] });
     req.onerror = () => { opened = undefined; reject(req.error); };
     req.onsuccess = () => resolve(req.result);
   });
@@ -29,10 +29,10 @@ export function savedSourceStore(idb = globalThis.indexedDB) {
     });
   }
   return {
-    list: (uid, signal) => !idb ? Promise.resolve([]) : operation('readonly', s => s.getAll(IDBKeyRange.bound([uid, ''], [uid, []])), signal),
-    get: (uid, id) => operation('readonly', s => s.get([uid, id])),
+    list: (volume, uid, signal) => !idb ? Promise.resolve([]) : operation('readonly', s => s.getAll(IDBKeyRange.bound([volume, uid, ''], [volume, uid, []])), signal),
+    get: (volume, uid, id) => operation('readonly', s => s.get([volume, uid, id])),
     put: (record, signal) => operation('readwrite', s => s.put(record), signal),
-    remove: (uid, id, signal) => operation('readwrite', s => s.delete([uid, id]), signal),
+    remove: (volume, uid, id, signal) => operation('readwrite', s => s.delete([volume, uid, id]), signal),
   };
 }
 
@@ -49,20 +49,21 @@ export class SourceRegistry {
   constructor({ store = savedSourceStore(), opfs = () => navigator.storage.getDirectory(), uuid = () => crypto.randomUUID(), table, connectShare } = {}) {
     this.#store = store; this.#opfs = opfs; this.#uuid = uuid; this.#table = table; this.#connectShare = connectShare;
   }
-  beginSession({ uid, gid = uid, id, loginEpoch }) {
+  beginSession({ uid, gid = uid, id, volume, loginEpoch }) {
     if (!Number.isSafeInteger(uid) || uid < 0 || !id || !Number.isSafeInteger(loginEpoch) ||
         (this.#session && loginEpoch <= this.#session.loginEpoch)) throw cancelled();
     this.#abort?.abort();
     this.#abort = new AbortController();
     this.#entries.clear();
     this.#table?.change_session(uid, loginEpoch);
-    this.#session = Object.freeze({ uid, gid, id, loginEpoch });
+    this.#session = Object.freeze({ uid, gid, id, volume, loginEpoch });
     this.#queue = Promise.resolve();
     return this.#serial(loginEpoch, async session => {
-      for (const record of await this.#store.list(uid, this.#abort.signal)) {
+      if (!volume) return;
+      for (const record of await this.#store.list(volume, uid, this.#abort.signal)) {
         this.#check(session);
         const info = publicInfo(record.info);
-        if (info.owner_uid !== uid || record.id !== info.id || info.kind !== 'hostfs') continue;
+        if (record.volume !== volume || record.uid !== uid || info.owner_uid !== uid || record.id !== info.id || info.kind !== 'hostfs') continue;
         info.state = await this.#permissionState(record.handle, info.writable);
         this.#check(session);
         this.#record(info, { handle: record.handle }, record.cloud === true);
@@ -118,11 +119,19 @@ export class SourceRegistry {
             throw fail('EEXIST', 'This folder overlaps an existing source.');
           }
         }
-        if (await this.#permissionState(handle, writable) !== 'granted') throw fail('EACCES', 'Folder access denied.');
+        if (await this.#permissionState(handle, writable) !== 'granted') throw fail('EACCES', 'The requested local directory permission was not granted.');
         provider = { handle }; label = location = handle.name;
       } else if (kind === 'opfs') {
-        await this.#opfs();
+        const root = await this.#opfs();
         provider = { storage: true }; label = 'Browser storage'; location = 'opfs:root';
+        if (args.handle) {
+          const path = await root.resolve(args.handle);
+          if (args.handle.kind !== 'directory' || path?.length !== 1 || path[0] === 'os-orphans') {
+            throw fail('EACCES', 'Choose a top-level browser storage directory.');
+          }
+          provider = { originPrivate: true, handle: args.handle };
+          location = 'opfs:' + path[0];
+        }
       } else if (kind === 'helperfs') {
         const url = new URL(args.url);
         if (!['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname) ||
@@ -136,7 +145,8 @@ export class SourceRegistry {
       const info = { id, kind: provider.files ? 'selected_files' : kind, label, location, state: 'granted', writable, execute, saved: save, owner_uid: session.uid };
       if (save && kind !== 'hostfs') throw fail('EINVAL', 'Only browser folder handles can be saved.');
       if (save) {
-        await this.#store.put({ uid: session.uid, id, info, handle: provider.handle, cloud }, this.#abort.signal);
+        if (!session.volume) throw fail('ENOTSUP', 'Saving a folder requires a persistent root volume.');
+        await this.#store.put({ volume: session.volume, uid: session.uid, id, info, handle: provider.handle, cloud }, this.#abort.signal);
         this.#check(session);
       }
       this.#record(info, provider, cloud);
@@ -147,7 +157,7 @@ export class SourceRegistry {
     return this.#serial(loginEpoch, async session => {
       const sources = [];
       for (const entry of this.#entries.values()) {
-        if (entry.provider.handle) {
+        if (entry.info.kind === 'hostfs' && entry.provider.handle) {
           const state = await this.#permissionState(entry.provider.handle, entry.info.writable);
           this.#check(session); this.#setState(entry, state);
         }
@@ -170,7 +180,7 @@ export class SourceRegistry {
     return this.#serial(loginEpoch, async session => {
       const entry = this.#entries.get(source_id);
       if (!entry) throw fail('ENOENT', 'Unknown source.');
-      if (entry.info.saved) await this.#store.remove(session.uid, source_id, this.#abort.signal);
+      if (entry.info.saved) await this.#store.remove(session.volume, session.uid, source_id, this.#abort.signal);
       this.#check(session); this.#entries.delete(source_id);
     });
   }
@@ -181,7 +191,7 @@ export class SourceRegistry {
     const implicit = !entry && ((shared && operation.source_id.startsWith('osfs:')) ||
       (operation.fstype === 'opfs' && !operation.source_id.startsWith('src:')));
     if (!implicit && (!entry || (entry.info.kind === 'selected_files' ? 'hostfs' : entry.info.kind) !== operation.fstype)) throw fail('EACCES', 'Source unavailable.');
-    if (entry?.provider.handle) {
+    if (entry?.info.kind === 'hostfs' && entry.provider.handle) {
       const state = await this.#permissionState(entry.provider.handle, entry.info.writable);
       this.#check(session); this.#setState(entry, state);
     }
@@ -195,7 +205,7 @@ export class SourceRegistry {
       { spec: { kind: 'sharefs', name, ...access }, hostObj: await this.#connectShare({
         ...operation, address: entry?.provider.address ?? operation.source_id, password: entry?.provider.password
       }, session) } :
-      await prepareUserMount({ ...(entry?.provider ?? { storage: true }), name, ...access }, session);
+      await prepareUserMount({ ...(entry?.provider ?? { storage: true }), name, target: operation.target, ...access }, session);
     try { this.#check(session); return prepared; }
     catch (e) { prepared.cleanup?.(); throw e; }
   }
@@ -207,7 +217,7 @@ export class SourceRegistry {
       const prepared = await this.#prepare(operation, session);
       try {
         this.#check(session);
-        const reply = await kernel.mount_user(session.id, JSON.stringify({ ...prepared.spec, target: operation.target }), prepared.hostObj);
+        const reply = await kernel.mount_user(session.id, JSON.stringify({ ...prepared.spec, flags: operation.flags, target: operation.target }), prepared.hostObj);
         this.#check(session);
         return reply;
       } catch (e) { prepared.cleanup?.(); throw e; }
@@ -218,8 +228,8 @@ export class SourceRegistry {
 // Window-side capability handling. Preload only the renewal closure so requestPermission
 // runs in the click's user activation even though IndexedDB reads are asynchronous.
 export async function prepareRenewal(session, source, current, call, store = savedSourceStore()) {
-  const record = await store.get(session.uid, source.id);
-  if (!record || record.uid !== session.uid) throw fail('ENOENT', 'Saved folder unavailable.');
+  const record = await store.get(session.volume, session.uid, source.id);
+  if (!record || record.volume !== session.volume || record.uid !== session.uid) throw fail('ENOENT', 'Saved folder unavailable.');
   return () => {
     if (!current()) throw cancelled();
     return record.handle.requestPermission(permission(source.writable)).then(async result => {

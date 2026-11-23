@@ -211,22 +211,76 @@ async fn package_file(
     Ok(bytes)
 }
 
-async fn private_image(
+/// Descend one component from a pinned directory without following links or crossing mounts.
+pub(crate) async fn package_dir(
     vfs: &vfs::Vfs,
     pid: u32,
     dir: &vfs::PathAnchor,
+    name: &str,
+) -> Result<vfs::PathAnchor, Errno> {
+    abi::fs::check_component(name)?;
+    let flags = abi::O_PATH | abi::O_DIRECTORY | abi::O_NOFOLLOW;
+    let (open, entry) = vfs
+        .open_file(pid, vfs::StartAnchor::Anchor(dir.clone()), name, flags, 0)
+        .await?;
+    let pin = open.mount_pin().ok_or(Errno::ESTALE)?;
+    if pin.id() != dir.pin.id() {
+        return Err(Errno::EXDEV);
+    }
+    if !entry.metadata.is_dir() {
+        return Err(Errno::ENOTDIR);
+    }
+    Ok(vfs::PathAnchor {
+        pin: pin.clone(),
+        handle: entry.handle,
+        open,
+    })
+}
+
+pub(crate) async fn private_image(
+    vfs: &vfs::Vfs,
+    pid: u32,
+    dirs: &[vfs::PathAnchor],
     target: &str,
     allow_execute: bool,
 ) -> Result<Rc<vfs::MountBacking>, Errno> {
     use vfs::imagefs::{ImageEntry, ImageFs, ImageNodeKind, MemoryBlobStore};
-    let manifest = package_file(vfs, pid, dir, "manifest.json", image::MANIFEST_MAX as u64).await?;
-    let img = image::Image::parse(&manifest).map_err(|_| Errno::EINVAL)?;
-    let tree = image::Composition::private(&[img]).map_err(|_| Errno::EINVAL)?;
-    let cred = vfs.process_cred(pid)?;
+    if dirs.is_empty() || dirs.len() > 16 {
+        return Err(Errno::EINVAL);
+    }
+    let mut images = Vec::new();
     let mut blobs = MemoryBlobStore::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut blob_dir = None;
     let mut total = 0u64;
+    for dir in dirs {
+        let manifest =
+            package_file(vfs, pid, dir, "manifest.json", image::MANIFEST_MAX as u64).await?;
+        let img = image::Image::parse(&manifest).map_err(|_| Errno::EINVAL)?;
+        let mut blob_dir = None;
+        let mut seen = BTreeSet::new();
+        for file in &img.entries {
+            let image::Node::File { sha256, size, .. } = &file.node else {
+                continue;
+            };
+            if !seen.insert(sha256) {
+                continue;
+            }
+            total = total.checked_add(*size).ok_or(Errno::EFBIG)?;
+            if total > 128 * 1024 * 1024 {
+                return Err(Errno::EFBIG);
+            }
+            if blob_dir.is_none() {
+                blob_dir = Some(package_dir(vfs, pid, dir, "blobs").await?);
+            }
+            let bytes = package_file(vfs, pid, blob_dir.as_ref().unwrap(), sha256, *size).await?;
+            if bytes.len() as u64 != *size || image::digest(&bytes) != *sha256 {
+                return Err(Errno::EIO);
+            }
+            blobs.insert(sha256.clone(), bytes);
+        }
+        images.push(img);
+    }
+    let tree = image::Composition::private(&images).map_err(|_| Errno::EINVAL)?;
+    let cred = vfs.process_cred(pid)?;
     let mut entries = vec![];
     for entry in tree.entries.into_values() {
         let node = match entry.node {
@@ -243,47 +297,12 @@ async fn private_image(
                 size,
                 chunk_size,
                 chunks,
-            } => {
-                if seen.insert(sha256.clone()) {
-                    total = total.checked_add(size).ok_or(Errno::EFBIG)?;
-                    if total > 128 * 1024 * 1024 {
-                        return Err(Errno::EFBIG);
-                    }
-                    if blob_dir.is_none() {
-                        let flags = abi::O_PATH | abi::O_DIRECTORY | abi::O_NOFOLLOW;
-                        let (open, entry) = vfs
-                            .open_file(
-                                pid,
-                                vfs::StartAnchor::Anchor(dir.clone()),
-                                "blobs",
-                                flags,
-                                0,
-                            )
-                            .await?;
-                        let pin = open.mount_pin().ok_or(Errno::ESTALE)?;
-                        if !entry.metadata.is_dir() || pin.id() != dir.pin.id() {
-                            return Err(Errno::EXDEV);
-                        }
-                        blob_dir = Some(vfs::PathAnchor {
-                            pin: pin.clone(),
-                            handle: entry.handle,
-                            open,
-                        });
-                    }
-                    let bytes =
-                        package_file(vfs, pid, blob_dir.as_ref().unwrap(), &sha256, size).await?;
-                    if bytes.len() as u64 != size || image::digest(&bytes) != sha256 {
-                        return Err(Errno::EIO);
-                    }
-                    blobs.insert(sha256.clone(), bytes);
-                }
-                ImageNodeKind::File {
-                    blob_id: sha256,
-                    size,
-                    chunk_size: Some(chunk_size),
-                    chunks,
-                }
-            }
+            } => ImageNodeKind::File {
+                blob_id: sha256,
+                size,
+                chunk_size: Some(chunk_size),
+                chunks,
+            },
         };
         entries.push(ImageEntry {
             path: entry.path,
@@ -348,7 +367,7 @@ async fn image_from_grant(
                 mount.grant_info().execute,
             )
         };
-        if execute && !executable {
+        if execute && !executable && source.kind != SourceKind::SelectedFiles {
             return Err(map_errno(Errno::EACCES));
         }
         let uid = cred.identity.id;
@@ -402,7 +421,7 @@ async fn image_from_grant(
             .borrow()
             .cwd
             .clone();
-        private_image(&scratch, reader, &dir, target, executable && source.execute)
+        private_image(&scratch, reader, &[dir], target, execute)
             .await
             .map_err(map_errno)
     }
@@ -466,6 +485,47 @@ impl Kernel {
     }
 
     /// A host-owned process in this exact login namespace supplies SO_PEERCRED and owns SCM_RIGHTS.
+    pub async fn open_export_root(&self, sid: &str, path: &str) -> Result<u32, JsValue> {
+        let pid = self.mount_page_proxy(sid)?;
+        let vfs = self.vfs_rt.borrow().vfs.clone();
+        // Some older helpers cannot even open their root with a stable filesystem ID.
+        if self
+            .vfs_rt
+            .borrow()
+            .sessions
+            .get(sid)
+            .is_some_and(|session| {
+                let ns = session.mnt_ns.borrow();
+                session
+                    .user_mounts
+                    .get(path)
+                    .and_then(|m| ns.entry(m.mount_id))
+                    .is_some_and(|m| {
+                        m.slot.backing.fstype == vfs::FsType::HelperFs && m.root.fs.0.is_empty()
+                    })
+            })
+        {
+            return Err(map_errno(Errno::EPROTONOSUPPORT));
+        }
+        let flags = abi::O_RDONLY | abi::O_DIRECTORY | abi::O_NOFOLLOW;
+        self.with_proc_scope(pid, async {
+            let target = vfs
+                .resolve_open(pid, vfs::StartAnchor::Root, path, flags)
+                .await?;
+            if let vfs::WalkResult::Found { pin, entry, .. } = &target
+                && (pin.backing().fs.id().0.is_empty()
+                    || entry.handle.fs.0.is_empty()
+                    || entry.handle.node.ino == 0)
+            {
+                return Err(Errno::EPROTONOSUPPORT);
+            }
+            let (file, _) = vfs.open_resolved(pid, target, flags, 0).await?;
+            vfs.insert_file(pid, file, true)
+        })
+        .await
+        .map_err(map_errno)
+    }
+
     pub fn mount_page_proxy(&self, session_id: &str) -> Result<u32, JsValue> {
         let mut state = self.state.borrow_mut();
         let mut rt = self.vfs_rt.borrow_mut();
@@ -839,7 +899,7 @@ impl Kernel {
                         _ => (a.source_label.clone(), a.source_label.clone()),
                     };
                     let state = match a.health.as_str() {
-                        "lost" => SourceState::Offline,
+                        "lost" | "expired" => SourceState::Offline,
                         "revoked" => SourceState::Revoked,
                         _ => SourceState::Granted,
                     };
@@ -869,6 +929,28 @@ impl Kernel {
                     .inspect_attachments_from(ns_id, &cred, &root, include_busy)
                     .await
                     .map_err(map_errno)?;
+                if include_busy && let Some(sid) = &session_id {
+                    let pins = self.vfs_rt.borrow().page_mount_pins(sid);
+                    if !pins.is_empty() {
+                        let proxy = self.mount_page_proxy(sid)?;
+                        for row in &mut rows {
+                            if pins.contains(&vfs::MountId(row.mount_id)) {
+                                if let Some(holder) =
+                                    row.busy_pids.iter_mut().find(|p| p.pid == proxy)
+                                {
+                                    holder.reasons.push("page fd".into());
+                                } else {
+                                    row.busy_pids.push(BusyProcess {
+                                        pid: proxy,
+                                        uid,
+                                        comm: "mount-page".into(),
+                                        reasons: vec!["page fd".into()],
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 for a in &mut rows {
                     if a.fstype == "sharefs"
                         && let Some(mode) = a
@@ -982,62 +1064,39 @@ impl Kernel {
                 if rows.iter().any(|a| a.target == target) {
                     return Err(map_errno(Errno::EBUSY));
                 }
-                let row = rows.iter().find(|a| {
-                    a.fstype != "image"
-                        && a.owner_uid == Some(uid)
-                        && table.attached.borrow().get(&a.mount_id) == Some(&source_id)
-                });
-                // Selected files are immutable installation media. Activation verifies their
-                // manifests and blobs before installing the composed executable image.
-                if !additional_sources.is_empty() || s.kind == SourceKind::SelectedFiles {
-                    let mut paths = Vec::new();
-                    for id in std::iter::once(&source_id).chain(&additional_sources) {
-                        let grant = table.get(id, uid).map_err(map_errno)?;
-                        let r = rows
-                            .iter()
-                            .find(|r| {
-                                r.owner_uid == Some(uid)
-                                    && r.fstype != "image"
-                                    && table.attached.borrow().get(&r.mount_id) == Some(id)
-                            })
-                            .ok_or_else(|| map_errno(Errno::ENOENT))?;
-                        if grant.state != SourceState::Granted
-                            || execute && r.noexec && grant.kind != SourceKind::SelectedFiles
-                        {
-                            return Err(map_errno(Errno::EACCES));
-                        }
-                        paths.push(r.target.clone());
-                    }
-                    let result = self
-                        .mount_user(
-                            sid.to_owned(),
-                            json!({"kind":"image","name":name,"sources":paths,"execute":execute})
-                                .to_string(),
-                            JsValue::NULL,
-                        )
-                        .await?;
-                    let mid = Reflect::get(&result, &"mountId".into())?
-                        .as_f64()
-                        .ok_or_else(|| map_errno(Errno::EIO))? as u64;
-                    table.attached.borrow_mut().insert(mid, source_id);
-                    return Ok(JsValue::NULL);
-                }
-                let backing = if let Some(row) = row {
-                    if execute && row.noexec {
+                let mut pins = Vec::new();
+                for id in std::iter::once(&source_id).chain(&additional_sources) {
+                    let grant = table.get(id, uid).map_err(map_errno)?;
+                    if grant.state != SourceState::Granted
+                        || execute && !grant.execute && grant.kind != SourceKind::SelectedFiles
+                    {
                         return Err(map_errno(Errno::EACCES));
                     }
-                    let dir = {
-                        let ns = ns.borrow();
-                        let entry = ns
-                            .entry(vfs::MountId(row.mount_id))
-                            .ok_or_else(|| map_errno(Errno::ESTALE))?;
-                        vfs::PathAnchor {
-                            pin: entry.slot.pin(),
-                            handle: entry.root.clone(),
-                            open: entry.root_open.clone(),
+                    let Some(row) = rows.iter().find(|a| {
+                        a.owner_uid == Some(uid)
+                            && a.fstype != "image"
+                            && table.attached.borrow().get(&a.mount_id) == Some(id)
+                    }) else {
+                        if additional_sources.is_empty() {
+                            break;
                         }
+                        return Err(map_errno(Errno::ENOENT));
                     };
-                    private_image(&vfs, pid, &dir, &target, s.execute && !row.noexec)
+                    if execute && row.noexec && grant.kind != SourceKind::SelectedFiles {
+                        return Err(map_errno(Errno::EACCES));
+                    }
+                    let ns = ns.borrow();
+                    let entry = ns
+                        .entry(vfs::MountId(row.mount_id))
+                        .ok_or_else(|| map_errno(Errno::ESTALE))?;
+                    pins.push(vfs::PathAnchor {
+                        pin: entry.slot.pin(),
+                        handle: entry.root.clone(),
+                        open: entry.root_open.clone(),
+                    });
+                }
+                let backing = if !pins.is_empty() {
+                    private_image(&vfs, pid, &pins, &target, execute)
                         .await
                         .map_err(map_errno)?
                 } else {
@@ -1063,10 +1122,28 @@ impl Kernel {
                             .sessions
                             .get(sid)
                             .is_none_or(|s| !Rc::ptr_eq(&s.mnt_ns, &ns))
-                        || row
-                            .is_some_and(|r| !ns.borrow().contains_mount(vfs::MountId(r.mount_id)))
+                        || pins
+                            .iter()
+                            .any(|dir| !ns.borrow().contains_mount(dir.pin.id()))
+                        || additional_sources.iter().any(|id| {
+                            !table
+                                .get(id, uid)
+                                .is_ok_and(|g| g.state == SourceState::Granted)
+                        })
                     {
                         return Err(Errno::ESTALE);
+                    }
+                    if execute {
+                        for (dir, id) in pins
+                            .iter()
+                            .zip(std::iter::once(&source_id).chain(&additional_sources))
+                        {
+                            if dir.pin.effective_noexec()
+                                && table.get(id, uid)?.kind != SourceKind::SelectedFiles
+                            {
+                                return Err(Errno::EACCES);
+                            }
+                        }
                     }
                     if self.vfs_rt.borrow().sessions[sid].user_mounts.len() >= 16 {
                         return Err(Errno::ENOSPC);
@@ -1089,7 +1166,7 @@ impl Kernel {
                     noexec: !execute,
                     ..Default::default()
                 };
-                let lock = mount_flags::MS_NOSUID | mount_flags::MS_NODEV | mount_flags::MS_RDONLY;
+                let lock = flags.to_bits();
                 let mounted = async {
                     check()?;
                     vfs.mount_on_namespace(
@@ -1135,6 +1212,7 @@ impl Kernel {
                     target,
                     crate::vfs_engine::AttachedUserMount {
                         mount_id: mid,
+                        created_dir: created,
                         kind: "image".into(),
                         name,
                         cloud: false,
@@ -1243,8 +1321,16 @@ mod tests {
         write("/manifest.json", &serde_json::to_vec(&manifest).unwrap());
         let path = format!("/blobs/{hash}");
         write(&path, b"hello");
-        let load =
-            || now_or_never(private_image(&vfs, 1, &root, "/opt/private/tools", false)).unwrap();
+        let load = || {
+            now_or_never(private_image(
+                &vfs,
+                1,
+                std::slice::from_ref(&root),
+                "/opt/private/tools",
+                false,
+            ))
+            .unwrap()
+        };
         let backing = load().unwrap();
         assert!(backing.ceiling_noexec && backing.ceiling_rdonly);
         write(&path, b"HELLO");

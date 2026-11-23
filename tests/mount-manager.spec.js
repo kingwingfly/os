@@ -1,3 +1,4 @@
+import { signInForRelay } from './ui.js';
 import { test, expect } from './storage-test.js';
 import { existsSync } from 'node:fs';
 import { readFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -223,7 +224,13 @@ test('a selected package activates into a separate immutable private mount', asy
 test('Publish and Connect are separate panes and mounting is explicit', async ({ page, context }) => {
   test.setTimeout(120000); const other = await context.newPage();
   try {
-    await ready(page); await ready(other); await storage(page);
+    await ready(page); await ready(other);
+    const account = await signInForRelay(page);
+    await signInForRelay(other, account);
+    await storage(page);
+    const { uid } = await other.evaluate(() => window.os.sharedMounts());
+    const allowed = await page.evaluate(uid => window.os.exec([['setfacl', '-m', `u:${uid}:rx`, '/mnt/local/project']], { cwd: '/', stdin: '' }), uid);
+    expect(allowed.status).toBe(0);
     await open(page, 'publish');
     await expect(app(page).locator('[data-shared-form]')).toBeHidden();
     await expect(app(page).getByText('Enroll device', { exact: true })).toHaveCount(0);

@@ -2061,6 +2061,24 @@ impl Kernel {
         self.cloud_status_json().to_string()
     }
 
+    /// Worker-private credential for the authenticated local login's relay calls.
+    pub fn relay_credential(&self, uid: u32) -> Result<String, JsValue> {
+        let st = self.state.borrow();
+        let cs = st
+            .cloud_session
+            .as_ref()
+            .filter(|cs| {
+                st.account.signed_in
+                    && st.account.uid == uid
+                    && cs.local_uid == uid
+                    && cs.login_generation == st.account_epoch
+                    && cs.scope.relay
+                    && !cs.revoked
+            })
+            .ok_or_else(|| crate::vfs_engine::map_errno(abi::Errno::EACCES))?;
+        Ok(json!({"X-Process-Token": cs.page_token, "X-OS-Instance": st.instance_id}).to_string())
+    }
+
     /// Explicitly attach a Cloud / Cluster service session AFTER `/api/cloud-auth/login` has set
     /// the browser's cloud session cookie.
     /// - NEVER alters local `/etc/passwd`, local `state.account`, or local process UIDs!
@@ -2184,6 +2202,7 @@ impl Kernel {
             old
         };
         if let Some((old_uid, old_tok)) = prev_session {
+            self.exports.close_relay();
             if old_uid != issued.uid {
                 self.cloud.clear();
                 self.vfs_rt.borrow().cloud_mount.clear_cached_state();
@@ -2256,6 +2275,7 @@ impl Kernel {
     ///   server (Codex Finding #27 — never drops pending revocations before network ack!).
     /// - NEVER kills, signals, or logs out any local process or local account!
     pub async fn cloud_sign_out(&self) -> Result<String, JsValue> {
+        self.exports.close_relay();
         self.unmount_cloud_fs_internal();
         self.detach_all_remote_devices();
 
@@ -2360,6 +2380,7 @@ impl Kernel {
     /// Revoke active `ServiceAuth v2` remote tokens on the server while keeping `/mnt/cloud`
     /// mounted and all local processes alive (verifies non-fatal remote revocation -> `EACCES`).
     pub async fn revoke_cloud_tokens_only(&self) -> Result<String, JsValue> {
+        self.exports.close_relay();
         let (attached, instance_id, host_proof, tokens) = {
             let mut st = self.state.borrow_mut();
             let mut toks = st.table.active_remote_tokens();
@@ -3433,6 +3454,20 @@ impl Kernel {
             rt.trusted_service_digests = extract_service_digests_from_image(&base);
         }
         Ok(self.standalone_status_json().to_string())
+    }
+
+    /// Resolve the actual Stage 2 login before PID 1 launches its user manager.
+    pub async fn standalone_prepare_login(&self) -> Result<(), JsValue> {
+        let (vfs, user) = {
+            let rt = self.vfs_rt.borrow();
+            (rt.vfs.clone(), rt.boot_profile.default_user.clone())
+        };
+        let account = self
+            .resolve_local_user_account(&vfs, &user)
+            .await
+            .map_err(crate::vfs_engine::map_errno)?;
+        self.apply_account_update(account);
+        Ok(())
     }
 
     /// Finalize standalone Stage 2 AFTER PID 1 (`/init` -> `switch_root` -> `/usr/bin/init`) has

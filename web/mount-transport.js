@@ -267,13 +267,13 @@ export function attachPortTransport(port, initialMode) {
 }
 
 // Host I/O for the kernel's relay adapter. An admission is redeemed using
-// the publisher's authenticated cookie and a one-use listener ticket.
-export async function exportRelayRpc({ op, id, session, ticket, expires_at, ...args }) {
+// the local login's relay credential and a one-use listener ticket.
+export async function exportRelayRpc({ op, id, session, ticket, expires_at, ...args }, headers) {
   const action = op === 'publish' ? 'publish' : op === 'admit' ? `admit/${encodeURIComponent(id)}/${encodeURIComponent(session)}` : op === 'revoke' ? `revoke/${encodeURIComponent(id)}` : null;
   if (!action) throw frameError('EINVAL');
   const body = op === 'publish' ? { ...args, id, seconds: Math.max(1, Math.ceil((expires_at - Date.now()) / 1000)) } : op === 'admit' ? { ticket } : { reason: args.reason };
   let response;
-  try { response = await fetch('/api/mounts/' + action, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15000) }); }
+  try { response = await fetch('/api/mounts/' + action, { method: 'POST', credentials: 'omit', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15000) }); }
   catch { throw frameError('ENOTCONN'); }
   const value = await response.json();
   if (!response.ok) throw Object.assign(new Error(value.error ?? value.errno), { errno: value.errno });
@@ -284,23 +284,22 @@ export async function exportRelayRpc({ op, id, session, ticket, expires_at, ...a
 // publisher. CLI publications use a window listener supplied by the same host.
 export function exportRelayAdapter(listenerFor, attachClient) {
   const listeners = new Map();
-  return async args => {
-    if (args.op === 'revoke') {
-      const port = listeners.get(args.id);
-      listeners.delete(args.id);
-      try { return await exportRelayRpc(args); }
-      finally { port?.postMessage({ type: 'close' }); port?.close(); }
-    }
+  const rpc = async args => {
     const { publisher_pid, owner_uid, ...registration } = args;
-    const grant = await exportRelayRpc(registration);
-    if (args.op !== 'publish') return grant;
-    const listener = await listenerFor({ id: args.id, publisher_pid, owner_uid });
-    const port = listener?.port;
-    if (!port) {
-      await exportRelayRpc({ op: 'revoke', id: args.id });
-      throw frameError('ENOTCONN');
+    const listener = args.op === 'publish' ? await listenerFor({ publisher_pid, owner_uid }) : listeners.get(args.id);
+    if (!listener) throw frameError('EACCES');
+    const { port, credential } = listener;
+    if (args.op === 'revoke') {
+      listeners.delete(args.id);
+      try { return await exportRelayRpc(args, credential()); }
+      finally { port.postMessage({ type: 'close' }); port.close(); }
     }
-    listeners.set(args.id, port);
+    if (args.op !== 'publish') return exportRelayRpc(args, credential());
+    let grant;
+    try { grant = await exportRelayRpc(registration, credential()); }
+    catch (e) { port.postMessage({ type: 'close' }); port.close(); throw e; }
+    try { credential(); } catch (e) { port.postMessage({ type: 'close' }); port.close(); throw e; }
+    listeners.set(args.id, listener);
     try {
       await new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(frameError('ETIMEDOUT')), 15000);
@@ -327,10 +326,19 @@ export function exportRelayAdapter(listenerFor, attachClient) {
       return { id: grant.id, uid: grant.uid };
     } catch (e) {
       listeners.delete(args.id); port.postMessage({ type: 'close' }); port.close();
-      await exportRelayRpc({ op: 'revoke', id: args.id });
+      await exportRelayRpc({ op: 'revoke', id: args.id }, credential());
       throw e;
     }
   };
+  rpc.endSession = session => {
+    for (const [id, listener] of listeners) {
+      if (listener.session !== session) continue;
+      listeners.delete(id);
+      listener.port.postMessage({ type: 'close' });
+      listener.port.close();
+    }
+  };
+  return rpc;
 }
 
 // One window-side broker can allocate a fresh connection if ICE fails before
@@ -351,7 +359,7 @@ export function mountConnector(options = {}) {
   return { port: port2, close };
 }
 
-export async function connectExportTransport(broker, { id, password = '', writable = false, execute = false, transport }) {
+export async function connectExportTransport(broker, { id, password = '', writable = false, execute = false, transport }, credential) {
   // A connected cross-tab port is supplied only by the authenticated host.
   // Same-instance IPC uses connect_share_ipc directly in the kernel.
   if (transport === 'ipc') return attachPortTransport(broker, 'ipc');
@@ -359,7 +367,7 @@ export async function connectExportTransport(broker, { id, password = '', writab
   try {
     for (const kind of candidates) {
       const reply = await fetch('/api/mounts/connect/' + encodeURIComponent(id), {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        method: 'POST', credentials: 'omit', headers: { ...credential(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ password, write: writable, execute, transport: kind }),
       });
       const grant = await reply.json();

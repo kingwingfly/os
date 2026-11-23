@@ -717,6 +717,15 @@ impl Kernel {
                     path_only,
                 } => {
                     let file = vfs.get_file(pid, kfd).map_err(map_errno)?;
+                    // recvmsg populates descriptor metadata. Sending an exportd its own
+                    // share would block that daemon before it could read the control request.
+                    if unix_sock
+                        .borrow()
+                        .peer_cred(pid, sock_id)
+                        .is_ok_and(|peer| self.exports.served_by(&file, peer.pid))
+                    {
+                        return Err(map_errno(Errno::ELOOP));
+                    }
                     let (origin_pid, origin_token) = {
                         let rt = self.vfs_rt.borrow();
                         rt.proc_meta
@@ -935,7 +944,11 @@ impl Kernel {
                             }
                             let scope_pid = if needs_attenuation { origin_pid } else { pid };
                             let idx = installed_fds.len();
-                            stat_targets.push((idx, new_kfd, scope_pid));
+                            // A connected socket itself can be passed on via SCM_RIGHTS.
+                            // The actual reader may differ from the original socket peer.
+                            if !self.exports.served_by(&file, pid) {
+                                stat_targets.push((idx, new_kfd, scope_pid));
+                            }
                             installed_kfds.push((new_kfd, scope_pid));
                             installed_fds.push(json!({
                                 "kind": "kfd",

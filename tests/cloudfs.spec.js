@@ -1040,29 +1040,31 @@ test('client-kernel CloudFs manages descriptions, SEEK_END, O_APPEND, fsync, loc
   const page = await context.newPage();
   try {
     await page.goto('/');
+    // Exercise the private executor interface in the test worker's own realm.
+    // The page's public port remains restricted to session-authorized operations.
+    const launched = page.waitForEvent('worker', w => w.url().endsWith('?cloudfs-test'));
     await page.evaluate(() => {
-      const port = new Worker('/client-kernel.js');
-      const pending = new Map();
-      let next = 0;
-      port.onmessage = ({ data }) => {
-        if (data?.id != null && pending.has(data.id)) {
-          pending.get(data.id)(data);
-          pending.delete(data.id);
-        }
-      };
-      window.__kernel = (type, args = {}) => new Promise(resolve => {
-        const id = ++next;
-        pending.set(id, resolve);
-        port.postMessage({ v: 2, id, type, args });
+      window.__cloudWorker = new Worker('/client-kernel.js?cloudfs-test');
+      return new Promise((resolve, reject) => {
+        window.__cloudWorker.onerror = e => reject(new Error(e.message));
+        window.__cloudWorker.onmessage = ({ data }) => {
+          if (data.id === 1) { if (data.err) reject(new Error(data.err.detail ?? data.err.errno)); else resolve(); }
+        };
+        window.__cloudWorker.postMessage({ v: 2, id: 1, type: 'init' });
       });
     });
+    const worker = await launched;
+    const requestKernel = (type, args) => worker.evaluate(async ([type, args]) => {
+      try { return { ok: await self.kernelRequest(type, args) }; }
+      catch (error) { return { err: { errno: error.errno, detail: error.message } }; }
+    }, [type, args]);
     const k = async (type, args = {}) => {
-      const reply = await page.evaluate(([t, a]) => window.__kernel(t, a), [type, args]);
-      if (reply.err) throw Object.assign(new Error(reply.err.detail ?? reply.err.errno), reply.err);
+      const reply = await requestKernel(type, args);
+      if (reply.err) throw Object.assign(new Error(reply.err.detail), reply.err);
       return reply.ok;
     };
     const kErr = async (type, args = {}) => {
-      const reply = await page.evaluate(([t, a]) => window.__kernel(t, a), [type, args]);
+      const reply = await requestKernel(type, args);
       expect(reply.err, `expected error for ${type}`).toBeTruthy();
       return reply.err.errno;
     };

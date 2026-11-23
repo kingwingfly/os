@@ -10,7 +10,8 @@ async function rpc(local, service, request, extra = {}, transfer = []) {
   const reply = await kernelCall('unix_rpc', { ...args, fallbackSocket: `/run/${service}/control.sock` }, transfer);
   if (reply.status === 'error') {
     const message = reply.errno === 'EPROTONOSUPPORT' ? 'Update os-local-helper before sharing this folder.'
-      : reply.errno === 'EACCES' ? 'Permission denied. Check the export permissions or password.' : reply.message;
+      : reply.errno === 'EACCES' ? 'Permission denied. Check the export credentials or ACL.'
+      : reply.errno === 'EAGAIN' ? 'Too many password attempts. Try again in a minute.' : reply.message;
     const detail = request.op === 'activate_private' && request.additional_sources?.length && reply.errno === 'EINVAL'
       ? 'Cannot compose these images. Check for a path collision or incompatible metadata.' : message;
     throw failure(reply.errno, [reply.errno, detail].filter(Boolean).join(' '));
@@ -21,7 +22,7 @@ const summary = e => ({ ...e, address: 'osfs:' + e.id, expires: e.expires_at, wr
 
 export async function shareMount(args, options = {}) {
   const local = await session();
-  const ipc = args.ipcOnly || args.transport === 'ipc' || (!args.transport && globalThis.navigator?.onLine === false);
+  const ipc = args.ipcOnly || args.transport === 'ipc' || (!args.transport && options.p2p == null && (local.relayUid == null || globalThis.navigator?.onLine === false));
   const listener = ipc ? null : mountListener(options);
   try {
     const reply = await rpc(local, 'export', {
@@ -31,7 +32,11 @@ export async function shareMount(args, options = {}) {
     }, { open: { path: args.path, flags: 0o200000 | 0o400000 }, ...(listener && { port: listener.port }) }, listener ? [listener.port] : []);
     if (reply.export.transports.every(t => t === 'ipc')) listener?.close();
     return summary(reply.export);
-  } catch (e) { listener?.close(); throw e; }
+  } catch (e) {
+    listener?.close();
+    if (e.errno === 'EPROTONOSUPPORT') throw failure(e.errno, 'Update os-local-helper before sharing this folder.');
+    throw e;
+  }
 }
 
 export async function attachShared(args, options = {}) {
@@ -69,7 +74,7 @@ export async function mountTransports() {
     id, active: true, mode: 'listening', clients: clients.map(c => ({ ...c, active: true, mode: c.transport })),
   }));
   const mounts = attachments.filter(m => m.fstype === 'sharefs').map(m => ({
-    path: m.target, active: m.health === 'connected', mode: m.options.find(o => o.startsWith('transport='))?.slice(10),
+    path: m.target, health: m.health, active: m.health === 'connected', mode: m.options.find(o => o.startsWith('transport='))?.slice(10),
   }));
   return { exports: rows, mounts };
 }

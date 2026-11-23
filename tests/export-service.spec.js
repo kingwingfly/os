@@ -2,7 +2,8 @@ import { test, expect } from './test.js';
 import { test as protocolTest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { attachPortTransport, connectExportTransport } from '../web/mount-transport.js';
-import { MountRelay } from '../crates/worker/mount-relay.js';
+import { signInForRelay, waitForUserServices } from './ui.js';
+import { MountRelay, mountRoute } from '../crates/worker/mount-relay.js';
 
 const batch = (page, calls) => page.evaluate(async calls =>
   (await (await fetch('/api/sys', { method: 'POST', body: JSON.stringify({ calls }) })).json()).results, calls);
@@ -15,6 +16,7 @@ async function ok(page, ...argv) {
 async function start(page) {
   await page.goto('/');
   await page.waitForFunction(() => window.os?.exec && window.os?.shareMount);
+  await waitForUserServices(page);
   const [who] = await batch(page, ['getcreds']);
   expect(who.ok.uid).toBeGreaterThan(0);
   return who.ok;
@@ -32,6 +34,7 @@ test('E-01 E-04 E-10 offline cowfs publication, service identity and clean shutd
   const target = '/mnt/shared/offline';
   const relayRequests = [];
   context.on('request', req => { if (new URL(req.url()).pathname.startsWith('/api/mounts/')) relayRequests.push(req.url()); });
+  for (const command of ['service', 'ps', 'cat', 'exportctl', 'mount', 'umount']) await exec(page, command, '--help');
   await context.setOffline(true);
   try {
     const unit = JSON.parse(await ok(page, 'service', '--user', '--json', 'status', 'exportd.service')).unit;
@@ -74,7 +77,7 @@ for (const transport of ['ipc', 'p2p', 'relay']) {
     const receiver = second ? await second.newPage() : page;
     const target = '/mnt/shared/acceptance', password = 'only-this-directory';
     try {
-      if (second) await start(receiver);
+      if (second) { await start(receiver); await signInForRelay(page); await signInForRelay(receiver); }
       await ok(page, 'chmod', '2770', path);
       await ok(page, 'setfacl', '-m', 'd:u::rwx,d:g::r-x,d:o::---', path);
       await ok(page, 'ln', '-s', '../private', path + '/outside');
@@ -129,15 +132,19 @@ for (const transport of ['ipc', 'p2p', 'relay']) {
       return { file: '/mnt/shared/' + name + '/file', id: grant.id };
     };
     try {
-      if (other) await start(receiver);
+      if (other) { await start(receiver); await signInForRelay(page); await signInForRelay(receiver); }
       const { file, id } = await share('limits', 180);
       const [write, meta] = await batch(receiver, [{ open: { path: file, flags: 1 } }, { stat: { path: file } }]);
       expect(write.err.errno).toBe('EROFS');
       expect(meta.ok.mode & 0o222).toBe(0);
       const fds = [];
-      for (let i = 0; i < 16; i++) {
-        const opened = await batch(receiver, Array.from({ length: 8 }, () => ({ open: { path: file } })));
-        fds.push(...opened.map(r => r.ok.fd));
+      // The mounted root owns one of the 128 server handles.
+      while (fds.length < 127) {
+        const opened = await batch(receiver, Array.from({ length: Math.min(8, 127 - fds.length) }, () => ({ open: { path: file } })));
+        for (const reply of opened) {
+          expect(reply).toMatchObject({ ok: { fd: expect.any(Number) } });
+          fds.push(reply.ok.fd);
+        }
       }
       expect((await batch(receiver, [{ open: { path: file } }]))[0].err.errno).toBe('EMFILE');
       for (let i = 0; i < fds.length; i += 8) await batch(receiver, fds.slice(i, i + 8).map(fd => ({ close: { fd } })));
@@ -174,6 +181,29 @@ protocolTest('E-09 framed MessagePort loss classifies each pending operation sep
   } finally { client.close(); port2.close(); }
 });
 
+protocolTest('relay routing requires an explicit scoped credential for the requesting instance', async () => {
+  const origin = 'https://mount.test';
+  const env = {
+    AUTHORITY: { idFromName: n => n, get: () => ({ fetch: async req => {
+      expect(new URL(req.url).pathname).toBe('/internal/relay-identity');
+      const valid = req.headers.get('X-Process-Token') === 'local-relay-grant' && req.headers.get('X-OS-Instance') === 'a';
+      return valid ? Response.json({ uid: 42 }) : new Response(null, { status: 403 });
+    } }) },
+    MOUNTS: { idFromName: n => n, get: name => ({ fetch: async req => {
+      expect(name).toBe('account:42');
+      expect(req.headers.has('Cookie')).toBe(false);
+      expect(req.headers.has('X-Process-Token')).toBe(false);
+      return Response.json(JSON.parse(req.headers.get('X-OS-Mount-Identity')));
+    } }) },
+  };
+  const list = headers => mountRoute(new Request(origin + '/api/mounts/list', {
+    method: 'POST', headers: { Origin: origin, Cookie: 'session=ambient', ...headers }, body: '{}',
+  }), env);
+  expect((await list({})).status).toBe(403);
+  expect((await list({ 'X-Process-Token': 'local-relay-grant', 'X-OS-Instance': 'b' })).status).toBe(403);
+  expect(await (await list({ 'X-Process-Token': 'local-relay-grant', 'X-OS-Instance': 'a' })).json()).toEqual({ id: 42 });
+});
+
 protocolTest('E-08 authenticated relay claims are publisher-only, single use, scoped to the negotiated transport and lease', async () => {
   const rows = new Map();
   const storage = { get: async key => rows.get(key), put: async (key, value) => rows.set(key, value), setAlarm: async () => {} };
@@ -205,7 +235,7 @@ protocolTest('E-08 authenticated relay claims are publisher-only, single use, sc
       expect((await post(relay, path, peer, ticket)).errno).toBe('EACCES');
       expect(await post(relay, path, owner, ticket)).toEqual({
         export_id: id, session: session.session, transport: 'relay', publisher_account: owner.id,
-        peer_identity: { uid: peer.id, gid: peer.group, groups: peer.groups },
+        peer_identity: { uid: peer.id, gid: peer.id, groups: [] },
         password_auth: !!password, expires_at: grant.expires, rule: { writable: false, execute: false },
       });
       expect((await post(relay, path, owner, ticket)).errno).toBe('EACCES');

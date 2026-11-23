@@ -2931,7 +2931,11 @@ impl Kernel {
         let gid = account.gid;
         let user = account.user.clone();
         let group = account.group.clone();
+        let epoch = self.state.borrow().account_epoch;
         let hydrated_pids = self.state.borrow_mut().sync_account(account);
+        if self.state.borrow().account_epoch != epoch {
+            self.exports.close_relay();
+        }
         {
             let mut rt = self.vfs_rt.borrow_mut();
             if !user.is_empty() {

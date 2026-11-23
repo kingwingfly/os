@@ -152,18 +152,15 @@ impl Credential {
     }
 
     /// Enforce `RemoteScope.relay` for shared-mount relay operations.
-    #[allow(dead_code)]
     pub fn check_relay(&self) -> std::result::Result<(), Error> {
-        if let Some(scope) = self.scope() {
-            if !scope.relay {
-                return Err(Error::because(
-                    Errno::EACCES,
-                    "shared-mount relay access is not granted to this service credential",
-                ));
-            }
-            return Ok(());
+        if self.instance_id().is_some() && self.scope().is_some_and(|s| s.relay) {
+            Ok(())
+        } else {
+            Err(Error::because(
+                Errno::EACCES,
+                "credential has no relay grant",
+            ))
         }
-        self.cloud()
     }
 
     /// Absolute hard expiration ceiling for this credential lineage (`started + 24h`).
@@ -398,6 +395,36 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
     let key = auth::token_key(req);
     let guest = auth::guest_key(req);
     Ok(Some(match endpoint {
+        "/internal/relay-identity" => {
+            #[derive(Deserialize)]
+            struct Namespace {
+                ns: String,
+            }
+            let token = req.headers().get("X-Process-Token")?.unwrap_or_default();
+            let instance = req.headers().get("X-OS-Instance")?;
+            crate::api::run(state, move |db| {
+                let hash = auth::token_hash(&token);
+                let cred = db
+                    .rows::<Namespace>(
+                        "SELECT ns FROM credentials WHERE token = ?",
+                        vec![text(&hash)],
+                    )
+                    .first()
+                    .and_then(|row| db.credential_of(&hash, &row.ns));
+                match cred {
+                    Some(c)
+                        if c.check_relay().is_ok()
+                            && c.check_instance(instance.as_deref()).is_ok() =>
+                    {
+                        Reply::ok(json!({"uid": c.uid}))
+                    }
+                    _ => crate::api::errno_reply(&Error::because(
+                        Errno::EACCES,
+                        "relay credential required",
+                    )),
+                }
+            })?
+        }
         "/internal/service-auth/mint" => {
             #[derive(Deserialize)]
             struct MintAsked {

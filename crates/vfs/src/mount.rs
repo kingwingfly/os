@@ -241,6 +241,7 @@ impl MountFlags {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderHealth {
     Connected,
+    Expired,
     /// Export withdrawn or receiver permission revoked: mount stays attached; all ops -> `EACCES`.
     Revoked,
     /// Helper died, host folder permission lost, or peer tab offline: mount stays attached;
@@ -251,6 +252,7 @@ pub enum ProviderHealth {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AbortCause {
     None,
+    Expired,
     Force,
     Revoked,
     Lost,
@@ -332,6 +334,7 @@ impl ProviderState {
         match self.health.get() {
             ProviderHealth::Connected => Ok(()),
             ProviderHealth::Revoked => Err(Errno::EACCES),
+            ProviderHealth::Expired => Err(Errno::ESTALE),
             ProviderHealth::Lost => Err(Errno::ENOTCONN),
         }
     }
@@ -345,6 +348,15 @@ impl ProviderState {
         }
     }
 
+    pub fn expire(&self) {
+        if self.health.get() == ProviderHealth::Connected {
+            self.health.set(ProviderHealth::Expired);
+            self.last_abort.set(AbortCause::Expired);
+            self.abort_epoch.set(self.abort_epoch.get().wrapping_add(1));
+            self.wake_all();
+        }
+    }
+
     /// Publisher revoked export or receiver ACL withdrawn (`EACCES`).
     pub fn revoke(&self) {
         self.health.set(ProviderHealth::Revoked);
@@ -355,7 +367,10 @@ impl ProviderState {
 
     /// Provider lost (`ENOTCONN`, and `EIO` + uncertain write for in-flight mutations).
     pub fn lose(&self) {
-        if self.health.get() == ProviderHealth::Revoked {
+        if matches!(
+            self.health.get(),
+            ProviderHealth::Expired | ProviderHealth::Revoked
+        ) {
             return;
         }
         self.health.set(ProviderHealth::Lost);
@@ -374,7 +389,10 @@ impl ProviderState {
 
     /// Restore `Connected` health when a provider reconnects.
     pub fn reconnect(&self) {
-        if self.health.get() == ProviderHealth::Revoked {
+        if matches!(
+            self.health.get(),
+            ProviderHealth::Expired | ProviderHealth::Revoked
+        ) {
             return;
         }
         self.health.set(ProviderHealth::Connected);
@@ -384,6 +402,7 @@ impl ProviderState {
         match self.last_abort.get() {
             AbortCause::Force => Errno::EIO,
             AbortCause::Revoked => Errno::EACCES,
+            AbortCause::Expired => Errno::ESTALE,
             AbortCause::Lost => {
                 if is_mutating {
                     self.record_uncertain_write();
@@ -394,6 +413,7 @@ impl ProviderState {
             }
             AbortCause::None => match self.health.get() {
                 ProviderHealth::Revoked => Errno::EACCES,
+                ProviderHealth::Expired => Errno::ESTALE,
                 ProviderHealth::Lost => {
                     if is_mutating {
                         self.record_uncertain_write();
@@ -862,6 +882,12 @@ pub struct MountPin(Rc<MountSlot>);
 
 /// A delegated writer keeps the mount busy just like a writable open description.
 pub struct WritableMountPin(MountPin);
+
+impl WritableMountPin {
+    pub fn id(&self) -> MountId {
+        self.0.id()
+    }
+}
 
 impl Drop for WritableMountPin {
     fn drop(&mut self) {

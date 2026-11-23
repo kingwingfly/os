@@ -41,6 +41,9 @@ pub const PBKDF2_DK_LEN: usize = 32;
 /// Minimum character length for ordinary passwords unless `force` / `short_password` is set.
 pub const MIN_PASSWORD_CHARS: usize = 12;
 /// Maximum password length in bytes.
+/// The upper half of the ID space names remote accounts in export ACLs.
+pub const RELAY_ID_BASE: u32 = 1 << 31;
+
 pub const MAX_PASSWORD_BYTES: usize = 512;
 
 /// First dynamically allocated local user/group ID.
@@ -416,6 +419,9 @@ pub fn parse_passwd(text: &str) -> Result<Vec<PasswdEntry>> {
                 format!("/etc/passwd line {}: invalid gid", idx + 1),
             )
         })?;
+        if uid >= RELAY_ID_BASE || gid >= RELAY_ID_BASE {
+            return Err(Error::because(Errno::EINVAL, "reserved relay account ID"));
+        }
         if !seen_names.insert(name.clone()) {
             return Err(Error::because(
                 Errno::EINVAL,
@@ -492,6 +498,9 @@ pub fn parse_group(text: &str) -> Result<Vec<GroupEntry>> {
                 format!("/etc/group line {}: invalid gid", idx + 1),
             )
         })?;
+        if gid >= RELAY_ID_BASE {
+            return Err(Error::because(Errno::EINVAL, "reserved relay account ID"));
+        }
         if !seen_names.insert(name.clone()) {
             return Err(Error::because(
                 Errno::EINVAL,
@@ -1066,6 +1075,7 @@ impl LocalAccountStore {
 
         let used_uids: BTreeSet<u32> = users.iter().map(|u| u.uid).collect();
         let uid = match req.uid {
+            Some(explicit) if explicit >= RELAY_ID_BASE => return Err(Error::new(Errno::EINVAL)),
             Some(explicit) => {
                 if used_uids.contains(&explicit) {
                     return Err(Error::because(
@@ -1500,6 +1510,7 @@ impl LocalAccountStore {
         }
         let used_gids: BTreeSet<u32> = groups.iter().map(|g| g.gid).collect();
         let gid = match explicit_gid {
+            Some(g) if g >= RELAY_ID_BASE => return Err(Error::new(Errno::EINVAL)),
             Some(g) => {
                 if used_gids.contains(&g) {
                     return Err(Error::because(

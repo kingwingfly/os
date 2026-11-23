@@ -35,6 +35,10 @@ struct Published {
     transports: Vec<TransportKind>,
     publisher_account: Option<u32>,
     relay: Option<Function>,
+    password_hash: Option<String>,
+    password_attempts: RefCell<VecDeque<u64>>,
+    // One-use password verdict bound to the connecting kernel socket.
+    password_sockets: RefCell<BTreeMap<u32, u32>>, // socket -> authenticated PID
 }
 struct Session {
     header: TransportSessionHeader,
@@ -66,11 +70,13 @@ impl ListenerPin {
 pub struct ExportBridge {
     exports: RefCell<BTreeMap<String, Rc<Published>>>,
     caps: RefCell<BTreeMap<String, Rc<Session>>>,
+    relay_revoked: RefCell<Rc<Cell<bool>>>,
+    dependencies: RefCell<Vec<(std::rc::Weak<vfs::ProviderState>, Vec<u32>)>>,
     listeners: RefCell<BTreeMap<(u32, u64, u64), ListenerPin>>,
 }
 
-fn token() -> Result<String> {
-    let mut bytes = [0u8; 32];
+fn random_bytes<const N: usize>() -> Result<[u8; N]> {
+    let mut bytes = [0u8; N];
     #[cfg(target_arch = "wasm32")]
     {
         let crypto = Reflect::get(&js_sys::global(), &"crypto".into()).map_err(|_| Errno::EIO)?;
@@ -78,7 +84,7 @@ fn token() -> Result<String> {
             .map_err(|_| Errno::EIO)?
             .dyn_into()
             .map_err(|_| Errno::EIO)?;
-        let out = Uint8Array::new_with_length(32);
+        let out = Uint8Array::new_with_length(N as u32);
         get.call1(&crypto, &out).map_err(|_| Errno::EIO)?;
         out.copy_to(&mut bytes);
     }
@@ -89,7 +95,14 @@ fn token() -> Result<String> {
             .and_then(|mut f| f.read_exact(&mut bytes))
             .map_err(|_| Errno::EIO)?;
     }
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    Ok(bytes)
+}
+
+fn token() -> Result<String> {
+    Ok(random_bytes::<32>()?
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 fn peer_cred(peer: PeerIdentity) -> Cred {
     let mut groups = peer
@@ -112,6 +125,45 @@ fn authorize(unit: &ServiceGrant) -> Result<()> {
 }
 
 impl ExportBridge {
+    pub(crate) fn close_relay(&self) {
+        self.relay_revoked.take().set(true);
+        #[cfg(target_arch = "wasm32")]
+        if let Ok((global, close)) = crate::cloudfs::installed("closeRelayListeners") {
+            let _ = close.call0(&global);
+        }
+    }
+    pub(crate) fn relay_revocation(&self) -> Rc<Cell<bool>> {
+        self.relay_revoked.borrow().clone()
+    }
+
+    pub(crate) fn record_share(&self, id: &str, backing: &vfs::MountBacking) {
+        if let Some(export) = self.exports.borrow().get(id) {
+            let mut chain = self.servers(&export.root);
+            chain.push(export.daemon);
+            self.dependencies
+                .borrow_mut()
+                .push((Rc::downgrade(&backing.provider), chain));
+        }
+    }
+
+    pub(crate) fn served_by(&self, file: &FileRef, pid: u32) -> bool {
+        file.mount_pin()
+            .is_some_and(|pin| pin.fstype() == vfs::FsType::ShareFs)
+            && self.servers(file).contains(&pid)
+    }
+
+    fn servers(&self, file: &FileRef) -> Vec<u32> {
+        let mut deps = self.dependencies.borrow_mut();
+        deps.retain(|(p, _)| p.strong_count() > 0);
+        file.mount_pin()
+            .and_then(|pin| {
+                deps.iter()
+                    .find(|(p, _)| p.as_ptr() == Rc::as_ptr(pin.provider()))
+            })
+            .map(|(_, chain)| chain.clone())
+            .unwrap_or_default()
+    }
+
     async fn track_listener(
         &self,
         unit: &ServiceGrant,
@@ -248,8 +300,19 @@ impl ExportBridge {
         }
         let peer_uid = peer.identity.uid;
         let publisher = export.root.cred();
-        let cred = if peer.password_auth || peer.same_account {
+        let cred = if peer.password_auth
+            || (transport == TransportKind::Ipc && peer_uid == publisher.identity.id)
+        {
             publisher.clone()
+        } else if transport != TransportKind::Ipc {
+            let id = peer_uid
+                .checked_add(kernel::accounts::RELAY_ID_BASE)
+                .ok_or(Errno::EACCES)?;
+            peer_cred(PeerIdentity {
+                uid: id,
+                gid: id,
+                groups: vec![],
+            })
         } else {
             peer_cred(peer.identity)
         };
@@ -371,7 +434,6 @@ impl ExportBridge {
 struct VerifiedPeer {
     identity: PeerIdentity,
     password_auth: bool,
-    same_account: bool,
     expires_at: u64,
     rule: ExportRule,
 }
@@ -431,6 +493,13 @@ impl Kernel {
         let root = vfs.get_file(unit.peer.pid, fd)?;
         if root.open_ref().access != Access::Read {
             return Err(Errno::EBADF);
+        }
+        if matches!(
+            call,
+            ExportDirCall::Inspect {} | ExportDirCall::Publish { .. }
+        ) && bridge.served_by(&root, unit.peer.pid)
+        {
+            return Err(Errno::ELOOP);
         }
         match call {
             ExportDirCall::TrackListener { name, dev, ino } => {
@@ -503,15 +572,25 @@ impl Kernel {
                 if bridge.exports.borrow().contains_key(&id) {
                     return Err(Errno::EEXIST);
                 }
-                if transports.is_empty() {
+                let default_routes = transports.is_empty();
+                if default_routes {
                     transports = vec![TransportKind::Ipc, TransportKind::P2p, TransportKind::Relay];
                 }
+                let password = password.as_deref().unwrap_or_default();
+                if password.len() > 256 {
+                    return Err(Errno::EINVAL);
+                }
+                let password_hash = if password.is_empty() {
+                    None
+                } else {
+                    Some(kernel::accounts::hash_password(password, random_bytes()?))
+                };
                 let mut account = None;
                 if transports.iter().any(|t| *t != TransportKind::Ipc) {
                     let registration = json!({
                         "op": "publish", "publisher_pid": publisher_pid, "owner_uid": root.cred().identity.id, "id": id, "name": name, "expires_at": expires_at,
                         "transports": transports, "write": rule.writable, "execute": rule.execute,
-                        "password": password.unwrap_or_default(),
+                        "password": password,
                     });
                     let registered = match relay {
                         Some(r) => js_call(r, registration).await,
@@ -519,8 +598,8 @@ impl Kernel {
                     };
                     match registered {
                         Ok(r) if r["id"] == id => account = Some(from_value(r["uid"].clone())?),
-                        Err(Errno::ENOTCONN | Errno::ENODEV | Errno::ETIMEDOUT)
-                            if transports.contains(&TransportKind::Ipc) =>
+                        Err(Errno::EACCES | Errno::ENOTCONN | Errno::ENODEV | Errno::ETIMEDOUT)
+                            if default_routes =>
                         {
                             transports = vec![TransportKind::Ipc]
                         }
@@ -556,6 +635,9 @@ impl Kernel {
                         transports: transports.clone(),
                         publisher_account: account,
                         relay: account.and_then(|_| relay.cloned()),
+                        password_hash,
+                        password_attempts: RefCell::default(),
+                        password_sockets: RefCell::default(),
                     }),
                 );
                 value(transports)
@@ -567,6 +649,9 @@ impl Kernel {
                     return Err(Errno::EACCES);
                 }
                 let peer = socket.borrow().peer_cred(unit.peer.pid, socket_fd)?;
+                let endpoint = socket.borrow().peer_socket(unit.peer.pid, socket_fd)?;
+                let password_auth =
+                    e.password_sockets.borrow_mut().remove(&endpoint) == Some(peer.pid);
                 let cred = vfs.process_cred(peer.pid)?;
                 if cred.identity.id != peer.uid || cred.identity.group != peer.gid {
                     return Err(Errno::EACCES);
@@ -581,8 +666,7 @@ impl Kernel {
                     &e,
                     VerifiedPeer {
                         identity,
-                        password_auth: false,
-                        same_account: peer.uid == root.cred().identity.id,
+                        password_auth,
                         expires_at: e.expires_at,
                         rule: e.rule,
                     },
@@ -668,25 +752,26 @@ impl ExportBridge {
             .get(&remote.export_id)
             .cloned()
             .ok_or(Errno::ESTALE)?;
+        let revoked = self.relay_revocation();
         let admission = json!({
             "op": "admit", "id": remote.export_id, "session": remote.session, "ticket": remote.ticket,
         });
         let claim: RelayClaim = from_value(js_call(relay, admission).await?)?;
-        if claim.export_id != remote.export_id
+        if revoked.get()
+            || claim.export_id != remote.export_id
             || claim.session != remote.session
             || claim.transport != remote.transport
             || e.publisher_account != Some(claim.publisher_account)
         {
             return Err(Errno::EACCES);
         }
-        let same_account = claim.peer_identity.uid == claim.publisher_account;
+
         let header = self.mint(
             &remote.export_id,
             &e,
             VerifiedPeer {
                 identity: claim.peer_identity,
                 password_auth: claim.password_auth,
-                same_account,
                 expires_at: claim.expires_at,
                 rule: claim.rule,
             },
@@ -707,7 +792,7 @@ impl ExportBridge {
             let bridge = self.clone();
             let cap = header.cap.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let _ = pump_port(&sock, a, &remote.port, header.expires_at).await;
+                let _ = pump_port(&sock, a, &remote.port, header.expires_at, &revoked).await;
                 sock.close(a).await;
                 bridge.remove_cap(&cap).await;
             });
@@ -745,13 +830,31 @@ impl SocketOps {
     async fn write(&self, id: u32, data: &[u8], rights: &[u32], deadline: u64) -> Result<()> {
         let mut offset = 0;
         while offset < data.len() {
+            offset += self
+                .write_some(
+                    id,
+                    &data[offset..],
+                    if offset == 0 { rights } else { &[] },
+                    deadline,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+    async fn write_some(
+        &self,
+        id: u32,
+        data: &[u8],
+        rights: &[u32],
+        deadline: u64,
+    ) -> Result<usize> {
+        loop {
             if crate::now_ms() >= deadline {
                 return Err(Errno::ETIMEDOUT);
             }
-            let chunk = &data[offset..data.len().min(offset + 16 * 1024)];
+            let chunk = &data[..data.len().min(16 * 1024)];
             let fds: Vec<_> = rights
                 .iter()
-                .filter(|_| offset == 0)
                 .map(|sock| json!({"kind":"unix_sock","sockId":sock}))
                 .collect();
             match self
@@ -765,18 +868,23 @@ impl SocketOps {
                     if n == 0 || n > chunk.len() {
                         return Err(Errno::EPIPE);
                     }
-                    offset += n;
+                    return Ok(n);
                 }
                 Err(e) => return Err(e),
             }
         }
-        Ok(())
     }
-    async fn connect(&self, path: &str) -> Result<(u32, PeerCred)> {
+    async fn create(&self) -> Result<u32> {
         let v = self
             .call(json!({"op":"create","sockType":abi::socket::SOCK_STREAM}))
             .await?;
-        let id = from_value(v["sockId"].clone())?;
+        from_value(v["sockId"].clone())
+    }
+    async fn connect(&self, path: &str) -> Result<(u32, PeerCred)> {
+        let id = self.create().await?;
+        self.connect_to(id, path).await
+    }
+    async fn connect_to(&self, id: u32, path: &str) -> Result<(u32, PeerCred)> {
         let connected = async {
             let reply = self
                 .call(json!({"op":"connect","sockId":id,"path":path}))
@@ -876,7 +984,13 @@ fn port_method(port: &JsValue, method: &str) -> Result<Function> {
         .dyn_into()
         .map_err(js_errno)
 }
-async fn pump_port(sock: &SocketOps, id: u32, port: &JsValue, expires: u64) -> Result<()> {
+async fn pump_port(
+    sock: &SocketOps,
+    id: u32,
+    port: &JsValue,
+    expires: u64,
+    revoked: &Cell<bool>,
+) -> Result<()> {
     const QUEUE_LIMIT: usize = (OSFS_MAX_FRAME_BYTES + 4) * OSFS_MAX_INFLIGHT;
     let queue = Rc::new(RefCell::new(VecDeque::<u8>::new()));
     let terminal = Rc::new(Cell::new(None::<Errno>));
@@ -952,10 +1066,13 @@ async fn pump_port(sock: &SocketOps, id: u32, port: &JsValue, expires: u64) -> R
             Ok(())
         };
         loop {
-            if crate::now_ms() >= expires {
-                let end = encode_frame(&OsfsFrame::Closed {
-                    errno: Errno::ESTALE,
-                })?;
+            if revoked.get() || crate::now_ms() >= expires {
+                let errno = if revoked.get() {
+                    Errno::EACCES
+                } else {
+                    Errno::ESTALE
+                };
+                let end = encode_frame(&OsfsFrame::Closed { errno })?;
                 let _ = sock.write(id, &end, &[], crate::now_ms() + 1000).await;
                 send(&end)?;
                 break;
@@ -1033,6 +1150,9 @@ struct GuestStream {
     writing: RefCell<Option<vfs::BoxFuture<'static, usize>>>,
 }
 impl vfs::sharefs_ipc::ByteStream for GuestStream {
+    fn schedule_drain(&self, drain: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>) {
+        wasm_bindgen_futures::spawn_local(drain);
+    }
     fn notify_loss(&self, provider: &Rc<vfs::ProviderState>) {
         let provider = provider.clone();
         wasm_bindgen_futures::spawn_local(async move { provider.lose() });
@@ -1048,8 +1168,8 @@ impl vfs::sharefs_ipc::ByteStream for GuestStream {
             let id = self.id;
             let part = bytes[..bytes.len().min(16 * 1024)].to_vec();
             Box::pin(async move {
-                sock.write(id, &part, &[], crate::now_ms() + 15000).await?;
-                Ok(part.len())
+                sock.write_some(id, &part, &[], crate::now_ms() + 15000)
+                    .await
             })
         });
         let result = f.as_mut().poll(cx);
@@ -1116,6 +1236,7 @@ impl ExportBridge {
         proxy: u32,
         id: &str,
         rule: ExportRule,
+        password: &str,
         socket_op: Function,
     ) -> Result<(Rc<vfs::MountBacking>, Handle)> {
         if !valid_id(id) {
@@ -1137,18 +1258,46 @@ impl ExportBridge {
             pid: proxy,
             op: socket_op,
         };
-        let (fd, peer) = socket.connect(&export_ipc_sock(id)).await?;
+        if !password.is_empty() {
+            let now = crate::now_ms();
+            let mut attempts = export.password_attempts.borrow_mut();
+            attempts.retain(|t| now.saturating_sub(*t) < 60_000);
+            if attempts.len() >= 5 {
+                return Err(Errno::EAGAIN);
+            }
+            if !export
+                .password_hash
+                .as_deref()
+                .is_some_and(|h| kernel::accounts::verify_password(password, h))
+            {
+                attempts.push_back(now);
+                return Err(Errno::EACCES);
+            }
+        }
+        let fd = socket.create().await?;
+        struct Receipt<'a>(&'a Published, u32);
+        impl Drop for Receipt<'_> {
+            fn drop(&mut self) {
+                self.0.password_sockets.borrow_mut().remove(&self.1);
+            }
+        }
+        let _receipt = Receipt(&export, fd);
+        if !password.is_empty() {
+            export.password_sockets.borrow_mut().insert(fd, proxy);
+        }
+        let (_, peer) = socket.connect_to(fd, &export_ipc_sock(id)).await?;
         if peer.uid == 0 || peer.pid != export.daemon {
             socket.close(fd).await;
             return Err(Errno::EACCES);
         }
-        mount_stream(socket, fd, rule.intersect(export.rule)).await
+        mount_stream(socket, fd, rule.intersect(export.rule), export.expires_at).await
     }
 }
 
 /// Receiver for a negotiated WebRTC, relay or cross-tab stream. The host
 /// transfers the port from connectExportTransport().takePort() before any RPC.
 pub async fn connect_share_port(
+    revoked: Rc<Cell<bool>>,
     proxy: u32,
     port: JsValue,
     expires_at: u64,
@@ -1165,16 +1314,17 @@ pub async fn connect_share_port(
     let (a, b) = socket.pair().await?;
     let pump = socket.clone();
     wasm_bindgen_futures::spawn_local(async move {
-        let _ = pump_port(&pump, a, &port, expires_at).await;
+        let _ = pump_port(&pump, a, &port, expires_at, &revoked).await;
         pump.close(a).await;
     });
-    mount_stream(socket, b, rule).await
+    mount_stream(socket, b, rule, expires_at).await
 }
 
 async fn mount_stream(
     socket: SocketOps,
     fd: u32,
     rule: ExportRule,
+    expires_at: u64,
 ) -> Result<(Rc<vfs::MountBacking>, Handle)> {
     let stream = GuestStream {
         socket,
@@ -1182,9 +1332,19 @@ async fn mount_stream(
         reading: RefCell::default(),
         writing: RefCell::default(),
     };
-    Ok(vfs::sharefs_ipc::IpcShareTransport::connect(stream, rule)
+    let (backing, root) = vfs::sharefs_ipc::IpcShareTransport::connect(stream, rule)
         .await?
-        .into_backing())
+        .into_backing();
+    let provider = Rc::downgrade(&backing.provider);
+    wasm_bindgen_futures::spawn_local(async move {
+        let delay = expires_at.saturating_sub(crate::now_ms()).min(3_600_000) as u32;
+        if crate::helper::sleep_ms(delay).await.is_ok()
+            && let Some(provider) = provider.upgrade()
+        {
+            provider.expire();
+        }
+    });
+    Ok((backing, root))
 }
 
 #[cfg(test)]
@@ -1282,16 +1442,22 @@ mod tests {
             root: root.clone(),
             expires_at: crate::now_ms() + 60_000,
             rule,
-            transports: vec![TransportKind::Relay],
+            transports: vec![TransportKind::Ipc, TransportKind::Relay],
             publisher_account: Some(9988),
             relay: None,
+            password_hash: None,
+            password_attempts: RefCell::default(),
+            password_sockets: RefCell::default(),
         });
         let bridge = ExportBridge::default();
         bridge.exports.borrow_mut().insert("one".into(), ex.clone());
-        for (password_auth, same_account, uid) in [
-            (true, false, 1001),
-            (false, true, 1001),
-            (false, false, 2002),
+        for (transport, peer_uid, password_auth, may_write) in [
+            (TransportKind::Ipc, 1001, false, true),
+            (TransportKind::Ipc, 2002, false, false),
+            (TransportKind::Ipc, 2002, true, true),
+            (TransportKind::Relay, 1001, false, false),
+            (TransportKind::Relay, 2002, false, false),
+            (TransportKind::Relay, 2002, true, true),
         ] {
             let header = bridge
                 .mint(
@@ -1299,16 +1465,19 @@ mod tests {
                     &ex,
                     VerifiedPeer {
                         identity: PeerIdentity {
-                            uid: 2002,
+                            uid: peer_uid,
                             gid: 400,
-                            groups: vec![42],
+                            groups: if transport == TransportKind::Relay {
+                                vec![42]
+                            } else {
+                                vec![]
+                            },
                         },
                         password_auth,
-                        same_account,
                         expires_at: ex.expires_at,
                         rule,
                     },
-                    TransportKind::Relay,
+                    transport,
                 )
                 .unwrap();
             let mut altered = header.clone();
@@ -1337,19 +1506,24 @@ mod tests {
                 .unwrap()
                 .dir
                 .clone();
-            let OsfsResponse::Entry(created) = now_or_never(dir.at(
+            let created = now_or_never(dir.at(
                 &dir.root(),
                 AtOp::Mkdir {
-                    name: format!("dir-{uid}-{password_auth}"),
+                    name: format!("dir-{transport:?}-{peer_uid}-{password_auth}"),
                     mode: 0o777,
                     umask: 0o077,
                 },
             ))
-            .unwrap()
-            .unwrap() else {
+            .unwrap();
+            if !may_write {
+                assert_eq!(created.unwrap_err(), Errno::EACCES);
+                now_or_never(bridge.remove_cap(&header.cap)).unwrap();
+                continue;
+            }
+            let OsfsResponse::Entry(created) = created.unwrap() else {
                 panic!("expected directory")
             };
-            assert_eq!((created.metadata.uid, created.metadata.mode), (uid, 0o700));
+            assert_eq!((created.metadata.uid, created.metadata.mode), (1001, 0o700));
             assert!(bridge.check_session(&unit, 10, &root, &header.cap).is_err());
             let untrusted = ServiceGrant {
                 peer: unit.peer,

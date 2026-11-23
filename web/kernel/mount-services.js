@@ -7,6 +7,7 @@ import { currentWorkspace } from './workspaces.js';
 const fail = (errno, message = errno) => Object.assign(new Error(message), { errno });
 const missing = e => ['ENOENT', 'ECONNREFUSED'].includes(e?.errno);
 let table, registry, starting, joining, epoch = 0;
+const incarnation = crypto.randomUUID();
 const publishers = new Map(), connectors = new Map();
 const reached = new Set();
 
@@ -75,18 +76,24 @@ async function connectShare(op, s) {
   const supplied = connectors.get(op.pid)?.get(op.target);
   const rule = { writable: !(op.flags & 1), execute: !(op.flags & 8) };
   const selected = options.get('transport');
+  const password = op.password || options.get('password') || '';
   const description = { id, session: s.id, caller: op.pid, rule };
   if ((!selected || selected === 'ipc') && globalThis.kernel.local_export_available(id)) {
-    return { description: JSON.stringify({ ...description, transport: 'ipc' }) };
+    return { description: JSON.stringify({ ...description, password, transport: 'ipc' }) };
   }
   if (selected === 'ipc' && !supplied) throw fail('ENOENT');
   const broker = supplied ?? mountConnector().port;
   const client = await connectExportTransport(broker, { id, ...rule,
-    password: op.password || options.get('password') || '', transport: selected });
+    password, transport: selected }, () => relayCredential(s));
   checkedSession(s.id);
   connectors.get(op.pid)?.delete(op.target);
   return { description: JSON.stringify({ ...description, transport: client.mode,
     expires_at: client.expires_at ?? Date.now() + 3600000 }), port: client.takePort() };
+}
+
+function relayCredential(s) {
+  checkedSession(s.id);
+  return JSON.parse(globalThis.kernel.relay_credential(s.uid));
 }
 
 function ensureRegistry() {
@@ -94,10 +101,12 @@ function ensureRegistry() {
     table = new globalThis.wasm_bindgen.HostSourceTable(0, 0);
     registry = new SourceRegistry({ table, connectShare });
     globalThis.mountSocketOp = mountSocketOp;
+    globalThis.closeRelayListeners = () => globalThis.exportRelayCall?.endSession?.(registry.session?.id);
     globalThis.exportRelayCall = exportRelayAdapter(({ publisher_pid, owner_uid }) => {
       const s = registry.session;
       if (!s || s.uid !== owner_uid) throw fail('EACCES');
-      return { port: publishers.get(publisher_pid) ?? mountListener().port, session: s.id };
+      relayCredential(s);
+      return { port: publishers.get(publisher_pid) ?? mountListener().port, session: s.id, credential: () => relayCredential(s) };
     }, ({ port, publisherSession, ...header }) => {
       checkedSession(publisherSession);
       return globalThis.kernel.accept_export_port(publisherSession, JSON.stringify(header), port);
@@ -116,7 +125,7 @@ export async function resetMountHost() {
   const stop = await starting;
   if (stop) await stop();
   starting = null;
-  registry?.endSession();
+  if (registry?.session) endMountSession(registry.session.id);
   joining = undefined;
   reached.clear();
   publishers.clear();
@@ -124,6 +133,7 @@ export async function resetMountHost() {
 }
 
 export function endMountSession(id) {
+  globalThis.exportRelayCall?.endSession?.(id);
   if (registry?.session?.id === id) registry.endSession();
 }
 
@@ -132,7 +142,10 @@ export async function syncMountSession(workspace) {
   ensureRegistry();
   if (joining?.workspace !== workspace || !registry.session) {
     reached.clear();
-    const ready = registry.beginSession({ ...workspace.identity, loginEpoch: ++epoch });
+    if (registry.session) endMountSession(registry.session.id);
+    const root = JSON.parse(globalThis.kernel.boot_status()).mounted_root;
+    const volume = root?.volume_uuid && root.volume_uuid !== 'ephemeral' ? root.volume_uuid : null;
+    const ready = registry.beginSession({ ...workspace.identity, volume, loginEpoch: ++epoch });
     joining = { workspace, ready };
     ready.catch(() => { if (joining?.ready === ready) joining = null; });
   }
@@ -143,8 +156,17 @@ export async function syncMountSession(workspace) {
 export async function mountServiceRequest(type, args) {
   const s = await syncMountSession(), k = globalThis.kernel;
   const proxyPid = k.mount_page_proxy(s.id);
-  if (type !== 'unix_rpc') return mountPageRequest(type, args, { registry, kernel: k, proxyPid, socketOp: mountSocketOp });
-  if (s.loginEpoch !== args.loginEpoch) throw fail('ECANCELED', 'Session changed. Choose the folder again.');
+  const stamp = JSON.stringify([incarnation, s.id, s.loginEpoch]);
+  if (type === 'source_session') {
+    const cloud = JSON.parse(k.cloud_status());
+    let relayUid = null;
+    if (cloud.signed_in && cloud.scope?.relay) {
+      try { relayCredential(s); relayUid = 0x80000000 + cloud.cloud_uid; } catch { /* local login has no active relay grant */ }
+    }
+    return { ...s, relayUid, loginEpoch: stamp };
+  }
+  if (stamp !== args.loginEpoch) throw fail('ECANCELED', 'Session changed. Choose the folder again.');
+  if (type !== 'unix_rpc') return mountPageRequest(type, { ...args, loginEpoch: s.loginEpoch }, { registry, kernel: k, proxyPid, socketOp: mountSocketOp });
   const { request, socket, port } = args;
   let fd, tracked;
   try {
@@ -154,8 +176,7 @@ export async function mountServiceRequest(type, args) {
       if (publishers.has(proxyPid)) throw fail('EBUSY');
       publishers.set(proxyPid, port ?? null);
       tracked = 'publish';
-      const opened = await k.proc_openat(proxyPid, -100, request.source_path, 0o200000 | 0o400000, 0, true);
-      fd = opened.kfd;
+      fd = await k.open_export_root(s.id, request.source_path);
     } else if (args.open) throw fail('EINVAL');
     if (port && request.op === 'attach' && request.fstype === 'sharefs') {
       let byTarget = connectors.get(proxyPid);

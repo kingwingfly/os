@@ -138,6 +138,7 @@ impl Vfs {
                 health: match slot.backing.provider.health() {
                     ProviderHealth::Connected => "connected",
                     ProviderHealth::Revoked => "revoked",
+                    ProviderHealth::Expired => "expired",
                     ProviderHealth::Lost => "lost",
                 }
                 .into(),
@@ -216,12 +217,20 @@ impl Vfs {
                 fstype: backing.fstype.as_str().into(),
                 label: fs.id().0.clone(),
                 source,
-                blocks: stat.as_ref().map_or(0, |s| s.blocks),
-                bfree: stat.as_ref().map_or(0, |s| s.blocks_free),
-                bavail: stat.as_ref().map_or(0, |s| s.blocks_free),
-                bsize: stat.as_ref().map_or(0, |s| s.block_size as u32),
-                files: stat.as_ref().map_or(0, |s| s.files),
-                ffree: stat.as_ref().map_or(0, |s| s.files_free),
+                blocks: stat.as_ref().map_or(0, |s| s.blocks.min(abi::fs::JS_SAFE)),
+                bfree: stat
+                    .as_ref()
+                    .map_or(0, |s| s.blocks_free.min(abi::fs::JS_SAFE)),
+                bavail: stat
+                    .as_ref()
+                    .map_or(0, |s| s.blocks_free.min(abi::fs::JS_SAFE)),
+                bsize: stat
+                    .as_ref()
+                    .map_or(0, |s| s.block_size.min(u64::from(u32::MAX)) as u32),
+                files: stat.as_ref().map_or(0, |s| s.files.min(abi::fs::JS_SAFE)),
+                ffree: stat
+                    .as_ref()
+                    .map_or(0, |s| s.files_free.min(abi::fs::JS_SAFE)),
                 capabilities,
                 cowfs,
             });

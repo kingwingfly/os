@@ -21,6 +21,40 @@ export async function cloudSignIn(page, username, password, scope) {
   );
 }
 
+export async function signInForRelay(page, existing) {
+  const account = existing ?? { username: 'share' + crypto.randomUUID().slice(0, 8), password: crypto.randomUUID() };
+  if (!existing) {
+    const url = new URL('/api/cloud-auth/register', page.url());
+    const registered = await page.request.post(url.href, {
+      headers: { Origin: url.origin, 'CF-Connecting-IP': 'share-' + account.username },
+      data: { ...account, create_home: false },
+    });
+    expect(registered.ok(), await registered.text()).toBe(true);
+  }
+  await cloudSignIn(page, account.username, account.password, { cloud_fs: false, devices: [], containers: false, relay: true });
+  return account;
+}
+
+// Exercise the raw control route from the credential-holding worker, just as the transport does.
+export async function relayRequest(page, path, body, headers = {}) {
+  const worker = page.workers().find(w => new URL(w.url()).pathname.endsWith('/client-kernel.js'));
+  return worker.evaluate(async ({ path, body, headers }) => {
+    const uid = JSON.parse(self.kernel.workspace_credentials()).uid;
+    const response = await fetch('/api/mounts/' + path, { method: 'POST', credentials: 'omit',
+      headers: { 'Content-Type': 'application/json', ...JSON.parse(self.kernel.relay_credential(uid)), ...headers },
+      body: JSON.stringify(body) });
+    return { status: response.status, value: await response.json() };
+  }, { path, body, headers });
+}
+
+export async function waitForUserServices(page) {
+  const { uid } = await pageCall(page, 'getcreds');
+  await expect.poll(async () => {
+    const rows = await pageSys(page, ['mount', 'export'].map(name => ({ stat: { path: `/run/user/${uid}/${name}.sock` } })));
+    return rows.every(r => (r.ok?.mode & 0o170000) === 0o140000);
+  }, { timeout: 30000 }).toBe(true);
+}
+
 export async function cloudSignOut(page) {
   return page.evaluate(() => window.os.cloudSignOut());
 }

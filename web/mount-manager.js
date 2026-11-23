@@ -1,3 +1,4 @@
+import { call } from './http.mjs';
 import { kernelCall } from './kernel/protocol.js';
 import { registerPickedFolder, registerHelperFolder, registerSharedFolder, prepareRenewal } from './kernel/source-registry.js';
 import { shareMount, revokeMount } from './mount-sharing-ui.js';
@@ -48,7 +49,7 @@ function createManager(root) {
     </nav><div class="mount-content"><p class="mount-notice" role="status"></p>
     <section role="tabpanel" id="mount-pane-mounted" aria-labelledby="mount-tab-mounted" data-view="mounted">
       <div class="mount-pane-heading"><div><h2>Attachments</h2></div><button type="button" data-action="refresh">Refresh</button></div>
-      <div class="mount-table-scroll"><table class="mount-table"><thead><tr><th>Mount point</th><th>Source</th><th>Mount options</th><th>Busy processes</th></tr></thead><tbody data-mounts></tbody></table></div>
+      <div class="mount-table-scroll"><table class="mount-table"><thead><tr><th>Mount point</th><th>Source</th><th>Mount options</th><th>Permissions</th><th>Busy processes</th></tr></thead><tbody data-mounts></tbody></table></div>
       <div class="mount-empty" data-empty><span aria-hidden="true">▱</span><p>No filesystems mounted.</p><button type="button" data-action="add">Add mount</button></div>
       <section class="mount-details" data-details hidden aria-label="Selected mount"><div><h3 data-selected></h3><p data-description></p></div><div class="mount-actions" data-mount-actions></div></section>
       <section><h2>Sources</h2><ul data-sources></ul></section>
@@ -106,7 +107,7 @@ function createManager(root) {
   async function identify() {
     const before = epoch;
     const local = await kernelCall('source_session');
-    if (before !== epoch || !Number.isSafeInteger(local?.uid) || !Number.isSafeInteger(local.loginEpoch)) throw new Error('Session changed.');
+    if (before !== epoch || !Number.isSafeInteger(local?.uid) || typeof local.loginEpoch !== 'string') throw new Error('Session changed.');
     session = local;
     query('[data-connect]').disabled = submitting;
     return local;
@@ -142,7 +143,7 @@ function createManager(root) {
     if (current.owner_uid === session.uid || session.uid === 0) {
       const detach = lazy => action(async () => { await rpc({ op: 'detach', target: path, lazy }); await refresh(); });
       actions.append(button(path.startsWith('/opt/private/') ? 'Deactivate' : 'Unmount', detach(false)));
-      if (current.busy_pids?.length) actions.append(button('Lazy unmount', detach(true)));
+      actions.append(button('Lazy unmount', detach(true)));
     }
     if (current.source_id && current.user_mount && !path.startsWith('/opt/private/') && (!current.noexec || current.source_label?.startsWith('snapshot:'))) {
       const label = document.createElement('label'); label.textContent = 'Extension name';
@@ -179,6 +180,13 @@ function createManager(root) {
       row.insertCell().append(button(mount.target, () => select(mount.target)));
       row.insertCell().textContent = kinds[mount.fstype] ?? mount.fstype;
       row.insertCell().textContent = mount.options.join(',');
+      const mode = row.insertCell();
+      mode.textContent = '—';
+      if (mount.health === 'connected') {
+        void call('stat', { path: mount.target }).then(stat => {
+          if (current()) mode.textContent = 'rwxrwxrwx'.split('').map((bit, i) => stat.mode & (0o400 >> i) ? bit : '-').join('');
+        }).catch(() => {});
+      }
       row.insertCell().textContent = status(mount.busy_pids ?? []);
     }
     select(mounts.some(m => m.target === selected) ? selected : mounts.find(m => m.user_mount)?.target);
@@ -264,7 +272,7 @@ function createManager(root) {
     for (const grant of exportRows) {
       const row = document.createElement('li'), information = document.createElement('div'), name = document.createElement('strong'), detail = document.createElement('small'), address = document.createElement('input');
       name.textContent = grant.name;
-      detail.textContent = `OS permissions${grant.password_protected ? ' or password' : ''} · until ${new Date(grant.expires_at * 1000).toLocaleTimeString()}`;
+      detail.textContent = `OS permissions${grant.password_protected ? ' or password' : ''} · until ${new Date(grant.expires_at).toLocaleTimeString()}`;
       address.value = grant.address; address.readOnly = true; address.setAttribute('aria-label', 'Export address'); address.onclick = () => address.select();
       const actions = document.createElement('div'); actions.className = 'mount-actions';
       actions.append(button('Copy address', action(async () => { await navigator.clipboard.writeText(address.value); notice.textContent = 'Address copied.'; })),
@@ -321,6 +329,7 @@ function createManager(root) {
     query('[data-details]').hidden = true;
     query('[data-share]').disabled = true;
     notice.textContent = 'Session changed. Refresh to view its mounts.';
+    void identify().catch(() => {});
   };
   addEventListener('os:login-changed', reset);
   addEventListener('os:mounts-changed', () => {

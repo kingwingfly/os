@@ -1465,6 +1465,12 @@ test('packaged mountd and exportd serve offline files, retained descriptors, con
   };
   const sys = (...calls) => call('mount_sys', { calls });
   const one = async c => { const [r] = await sys(c); assert.ok('ok' in r, JSON.stringify(r)); return r.ok; };
+  for (const op of ['sys_mount', 'sys_umount2']) {
+    await assert.rejects(call(op, { pid: 0 }), { errno: 'EPERM' });
+  }
+  const inventory = await rpc('mount', { op: 'list_all' });
+  const tmpfs = inventory.filesystems.find(fs => fs.fstype === 'tmpfs');
+  assert.ok(tmpfs && Number.isSafeInteger(tmpfs.ffree));
   const { source_id } = await call('source_register_host', {
     loginEpoch: s.loginEpoch, files: [new File(['private'], 'note')], cloud: false,
   });
@@ -1480,6 +1486,18 @@ test('packaged mountd and exportd serve offline files, retained descriptors, con
     assert.notEqual(denied.status, 0);
     assert.match(denied.stderr, /EPERM|permitted/);
   }
+  const custom = '/tmp/owned mountpoint';
+  await one({ mkdir: { path: custom, mode: 0o700 } });
+  await rpc('mount', { op: 'attach', source: source_id, source_id, target: custom, fstype: 'hostfs', flags: 9 | 16 | 256 });
+  const opened = await one({ open: { path: custom + '/note', flags: 0 } });
+  const mounted = (await rpc('mount', { op: 'list_attachments' })).attachments.find(row => row.target === custom);
+  assert.ok(mounted.options.includes('sync') && mounted.options.includes('nosymfollow'));
+  const busy = await socket('mount', { op: 'detach', target: custom });
+  assert.equal(busy.errno, 'EBUSY', JSON.stringify(busy));
+  assert.ok(busy.error.processes.some(p => p.uid === s.uid && p.reasons.includes('page fd')));
+  await one({ close: { fd: opened.fd } });
+  await rpc('mount', { op: 'detach', target: custom });
+  assert.equal((await one({ stat: { path: custom } })).mode & 0o777, 0o700);
   const path = '/tmp/export-integration';
   await one({ mkdir: { path, mode: 0o755 } });
   const publish = { op: 'publish', source_path: path, name: 'test', writable: true, execute: false, seconds: 180, transports: ['ipc'] };
@@ -1489,6 +1507,7 @@ test('packaged mountd and exportd serve offline files, retained descriptors, con
   for (const [target, flags] of [[dst, 8], [ro, 9]]) {
     await rpc('mount', { op: 'attach', source: 'osfs:' + grant.id, target, fstype: 'sharefs', flags, options: 'transport=ipc' });
   }
+  await assert.rejects(socket('export', { ...publish, source_path: dst }, { open: { path: dst } }), { errno: 'ELOOP' });
   const cli = await host.exec(['mountctl', '--json', 'attachments']);
   assert.equal(cli.status, 0, cli.stderr);
   assert.ok(JSON.parse(cli.stdout).attachments.some(row => row.target === dst && row.fstype === 'sharefs'));

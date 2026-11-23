@@ -649,7 +649,7 @@ async function dispatch(message, host, tab, internal = false) {
     return dispatch({ type, args: { ...args, sessionId: id } }, host, tab, true);
   }
   if (!internal && (type.startsWith('proc_') || type.startsWith('kfd_') ||
-      ['session_begin', 'session_end', 'set_active_session'].includes(type))) throw { errno: 'EPERM' };
+      ['sys_mount', 'sys_umount2', 'session_begin', 'session_end', 'set_active_session'].includes(type))) throw { errno: 'EPERM' };
   switch (type) {
     case 'init': return boot();
     case 'version': return kernel.version();

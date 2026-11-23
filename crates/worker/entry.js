@@ -6,7 +6,7 @@ export { MountRelay } from './mount-relay.js';
 export default class OsWorker extends worker {
   fetch(request) {
     return new URL(request.url).pathname.startsWith('/api/mounts/')
-      ? mountRoute(request, this.env, this.ctx, { fetch: request => super.fetch(request) })
+      ? mountRoute(request, this.env)
       : super.fetch(request);
   }
 }

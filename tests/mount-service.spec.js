@@ -4,7 +4,7 @@ import { test as component } from '@playwright/test';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { pageCall, switchLocalUser } from './ui.js';
+import { pageCall, switchLocalUser, waitForUserServices } from './ui.js';
 import { SourceRegistry, mountPageRequest, prepareRenewal, registerPickedFolder, serveMountBackend } from '../web/kernel/source-registry.js';
 
 const target = '/mnt/local/project';
@@ -12,6 +12,7 @@ const app = page => page.locator('#mount-manager');
 async function boot(page) {
   await page.goto('/');
   await page.waitForFunction(() => typeof window.os?.exec === 'function' && !!window.os.localMounts);
+  await waitForUserServices(page);
 }
 function exec(page, argv, options = {}) {
   return page.evaluate(async ({ argv, options }) => {
@@ -43,7 +44,7 @@ async function storage(page) {
 
 test('M-01 supervised system and user daemons bind sockets with local ownership', async ({ page }) => {
   await boot(page);
-  expect(await ok(page, ['ps'])).toContain('mountd');
+  await expect.poll(() => ok(page, ['ps'])).toContain('mountd');
   const service = await ok(page, ['service', 'status', 'mountd.service']);
   expect(service).toMatch(/active|ready|running/i);
   const { uid } = await pageCall(page, 'getcreds');
@@ -271,8 +272,8 @@ test('M-10 local mount lifecycle works offline without a cloud credential or out
 function fixture() {
   const saved = new Map(); let permission = 'granted', seq = 0;
   const store = {
-    list: async uid => [...saved.values()].filter(r => r.uid === uid), get: async (uid,id) => saved.get(uid+id),
-    put: async r => saved.set(r.uid+r.id,r), remove: async (uid,id) => saved.delete(uid+id),
+    list: async (volume,uid) => [...saved.values()].filter(r => r.volume === volume && r.uid === uid), get: async (volume,uid,id) => saved.get([volume,uid,id].join('/')),
+    put: async r => saved.set([r.volume,r.uid,r.id].join('/'),r), remove: async (volume,uid,id) => saved.delete([volume,uid,id].join('/')),
   };
   const dir = path => ({ kind:'directory', name:path.split('/').at(-1), path,
     isSameEntry: async other => other.path === path,
@@ -283,7 +284,7 @@ function fixture() {
 }
 
 component('M-08 saved grant reload, synchronous renewal, per-user keys and forget', async () => {
-  const f=fixture(), a={id:'a',uid:1000,loginEpoch:1};
+  const f=fixture(), a={id:'a',uid:1000,volume:'volume-a',loginEpoch:1};
   await f.registry.beginSession(a);
   const {source_id} = await f.registry.register('hostfs',{loginEpoch:1,handle:f.dir('host/folder'),writable:true,save:true});
   f.revoke();
@@ -296,11 +297,13 @@ component('M-08 saved grant reload, synchronous renewal, per-user keys and forge
   const result=renew();
   expect(f.permission()).toBe('granted');
   expect((await result).state).toBe('granted');
-  await f.registry.beginSession({id:'b',uid:1001,loginEpoch:3});
+  await f.registry.beginSession({...a,id:'b',uid:1001,loginEpoch:3});
   expect(await f.registry.list(3)).toEqual([]);
-  await f.registry.beginSession({...a,loginEpoch:4});
-  await f.registry.forget(source_id,4);
-  expect(await f.store.list(1000)).toEqual([]);
+  await f.registry.beginSession({...a,volume:'volume-b',loginEpoch:4});
+  expect(await f.registry.list(4)).toEqual([]);
+  await f.registry.beginSession({...a,loginEpoch:5});
+  await f.registry.forget(source_id,5);
+  expect(await f.store.list('volume-a',1000)).toEqual([]);
 });
 
 component('M-07 registry serializes overlapping grants and fences pending picker results', async () => {
