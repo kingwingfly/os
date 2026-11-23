@@ -5,6 +5,7 @@ use abi::{Call, Creds, Errno, Error};
 use os_posix::socket::UnixStream;
 use std::io;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const USAGE: &str = "mountctl [--json] sources|filesystems|attachments|all|busy [TARGET]\nmountctl [--json] attach [-t TYPE] [-o OPTIONS] SOURCE TARGET\nmountctl [--json] detach [-l] [-f] TARGET | remount -o OPTIONS TARGET\nmountctl [--json] activate SOURCE_ID NAME [--exec] | forget SOURCE_ID";
 
@@ -26,10 +27,23 @@ pub fn current_uid() -> Result<u32, Error> {
 pub fn request(uid: u32, req: &MountRequest) -> Result<MountResponse, Error> {
     let frame = encode_frame(req)?;
     // Only retry connection establishment. A lost reply can follow a committed mutation.
-    let (stream, server_uid) = match UnixStream::connect(&user_mount_sock(uid)) {
-        Ok(s) => (s, uid),
-        Err(Errno::ENOENT | Errno::ECONNREFUSED) => (UnixStream::connect(SYSTEM_MOUNT_SOCK)?, 0),
-        Err(e) => return Err(e.into()),
+    let start = Instant::now();
+    let user_socket = user_mount_sock(uid);
+    let (stream, server_uid) = loop {
+        match UnixStream::connect(&user_socket) {
+            Ok(s) => break (s, uid),
+            Err(Errno::ENOENT | Errno::ECONNREFUSED) => (),
+            Err(e) => return Err(e.into()),
+        }
+        match UnixStream::connect(SYSTEM_MOUNT_SOCK) {
+            Ok(s) => break (s, 0),
+            Err(Errno::ENOENT | Errno::ECONNREFUSED)
+                if start.elapsed() < Duration::from_secs(5) =>
+            {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => return Err(e.into()),
+        }
     };
     if stream.peer_cred()?.uid != server_uid {
         return Err(Errno::EACCES.into());

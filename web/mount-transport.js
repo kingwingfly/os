@@ -28,13 +28,15 @@ export function mountTransport({ p2p = true, ipcPort } = {}) {
     data = dc;
     dc.binaryType = 'arraybuffer';
     dc.onopen = () => {
+      if (dc.everOpened) return;
+      dc.everOpened = true;
       if (requiredRoute === 'p2p') { clearTimeout(readyTimer); frameRoute = 'p2p'; tell({ type: 'ready', mode: 'p2p' }); }
       tell({ type: 'transport', mode: 'p2p' });
     };
     dc.onmessage = event => received(event.data, 'p2p');
     dc.onerror = () => close('ENOTCONN');
     dc.onclose = () => { if (dc.everOpened) close('ENODEV'); };
-    dc.addEventListener('open', () => { dc.everOpened = true; });
+    if (dc.readyState === 'open') dc.onopen();
   };
   const connection = () => {
     if (peer || !p2p || requiredRoute === 'relay' || typeof RTCPeerConnection !== 'function') return peer;
@@ -67,6 +69,7 @@ export function mountTransport({ p2p = true, ipcPort } = {}) {
       if (url.origin !== location.origin || !url.pathname.startsWith('/api/mounts/channel/')) { close('EACCES'); return; }
       role = command.role; expires = command.expires; requiredRoute = command.transport;
       if (!Number.isFinite(expires) || expires <= Date.now() || expires > Date.now() + 3600000) { close('ESTALE'); return; }
+      if (requiredRoute === 'p2p' && (!p2p || typeof RTCPeerConnection !== 'function')) { close('EPROTONOSUPPORT'); return; }
       url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'; socket = new WebSocket(url); socket.binaryType = 'arraybuffer';
       readyTimer = setTimeout(() => close('ETIMEDOUT'), 15000);
       leaseTimer = setTimeout(() => close('ESTALE'), expires - Date.now());

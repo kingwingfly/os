@@ -73,7 +73,7 @@ let closing = [];
 const forget = () => {};
 
 function* request(method, url, body, headers = {}, binary = false) {
-  return yield { method, url, body, headers, binary };
+  return yield { method, url: new URL(url, self.location.origin).href, body, headers, binary };
 }
 function sendSync({ method, url, body, headers, binary }) {
   const xhr = new XMLHttpRequest();

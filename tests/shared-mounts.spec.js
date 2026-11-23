@@ -191,6 +191,9 @@ test('remote executable transfer requires an explicit execute mount and source a
     await expect(command(receiver.page, ['/mnt/shared/project/tool'])).rejects.toThrow(/Permission|EACCES/);
     await attach(receiver, grant, { name: 'tools', execute: true });
     const allowed = await command(receiver.page, ['/mnt/shared/tools/tool']); expect(allowed.result.status).toBe(0);
+    // exportd holds the source directory open until the publisher revokes the grant.
+    await expect(owner.page.evaluate(() => window.os.unmountLocal('/mnt/local/source'))).rejects.toThrow(/EBUSY/);
+    await owner.page.evaluate(id => window.os.revokeMount(id), grant.id);
     await owner.page.evaluate(() => window.os.unmountLocal('/mnt/local/source'));
     await expect.poll(async () => (await read(receiver.page)).status).not.toBe(200);
   } finally { await dispose(owner, receiver); }

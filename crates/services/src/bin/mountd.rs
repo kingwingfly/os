@@ -153,12 +153,9 @@ fn run() -> Result<(), Error> {
             _ => return Err(Errno::EADDRINUSE.into()),
         }
     }
-    let listener = UnixListener::bind(&path)?;
-    os_posix::chmod(
-        Path::new(&path),
-        if scope.is_some() { 0o600 } else { 0o666 },
-    )
-    .map_err(io_errno)?;
+    let mode = if scope.is_some() { 0o600 } else { 0o666 };
+    let listener = UnixListener::bind_with_mode(&path, mode)?;
+    os_posix::chmod(Path::new(&path), mode).map_err(io_errno)?;
     listener.set_nonblocking(true)?;
     if let Ok(notify) = std::env::var("NOTIFY_SOCKET")
         && !notify.is_empty()

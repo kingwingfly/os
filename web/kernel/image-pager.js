@@ -389,6 +389,14 @@ export function createImagePager(options = {}) {
       throw errnoError('EINVAL', 'chunk manifest is required for content-addressed sha256 blob reads');
     }
 
+    // Legacy /usr images have no chunk manifest. Keep their small exec probes in
+    // the same bounded cache so resolving an already-warmed program works offline.
+    const probeKey = start === 0 && count <= 256 && /^\/usr\/bin\/[^/]+\.wasm$/.test(blobId)
+      ? `exec:${url}:${count}` : null;
+    if (probeKey) {
+      const cached = cacheGet(probeKey);
+      if (cached) { cacheHits++; return cached.slice(); }
+    }
     const out = new Uint8Array(count);
     let filled = 0;
     while (filled < count) {
@@ -515,7 +523,9 @@ export function createImagePager(options = {}) {
         releaseSlot();
       }
     }
-    return filled === count ? out : out.subarray(0, filled);
+    const result = filled === count ? out : out.subarray(0, filled);
+    if (probeKey && filled) cachePut(probeKey, result.slice());
+    return result;
   }
 
   async function imageBlobRead(blobId, offset, len, chunkManifest) {

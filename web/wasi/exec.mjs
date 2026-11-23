@@ -1,4 +1,4 @@
-import { asset } from '../release.js';
+import { asset, releaseId } from '../release.js';
 import { Signals, CONTROL_WORDS, bit, valid, ignoredByDefault, stoppedByDefault } from './signals.mjs';
 // exec(2), as the page does it: programs of /usr/bin, built for wasm32-wasip1, each run as a
 // process of its own (web/wasi/process.js, a Worker), with their arguments, environment, standard
@@ -21,6 +21,18 @@ const kernelCall = (type, args) => globalThis.kernelRequest(type, args);
 import { load, loadLocalBytes } from '../kernel/loader.js';
 import { STRERROR } from '../http.mjs';
 import { requireExecutionSupport } from '../kernel/capabilities.js';
+
+// A signed generation serves its worker from the installed release. The legacy
+// image has no offline asset server, so retain the script for this executor's lifetime.
+let legacyProcessScript;
+function processScript() {
+  const path = asset('/wasi-process.js');
+  if (releaseId !== 'legacy') return path;
+  return legacyProcessScript ??= fetch(path, { mode: 'same-origin' }).then(async response => {
+    if (!response.ok) throw new Error(`Loading ${path} failed (${response.status})`);
+    return URL.createObjectURL(await response.blob());
+  }).catch(error => { legacyProcessScript = undefined; throw error; });
+}
 
 // Executables are the build's own /usr/bin images by default; a stage may name its own path
 // (an uploaded wasm the shell resolved against the working directory). Each process is a
@@ -232,7 +244,7 @@ async function closeHeld(of, pid, token, as) {
     return description.kfd != null;
   });
   if (!last.length) return;
-  const closer = new Worker(asset('/wasi-process.js'));
+  const closer = new Worker(await processScript(), { name: 'wasi-process' });
   await new Promise(resolve => {
     closer.onmessage = ({ data }) => { if ('exit' in data) resolve(); };
     closer.onerror = () => resolve();
@@ -731,6 +743,7 @@ async function sockRequest(process, args) {
 
 export async function exec(stages, options = {}) {
   requireExecutionSupport();
+  const workerScript = await processScript();
   const workspace = options.workspace;
   const sessionId = options.sessionId ?? workspace?.identity?.id ?? '';
   const tickets = new Set();
@@ -958,7 +971,7 @@ export async function exec(stages, options = {}) {
   // (`forked`, its start the parent's snapshot). `write` is where its output goes, as its
   // stage's does.
   const host = ({ pid, token, ppid, module, memory, memoryBytes, startSection = false, argv, write, forked, start, transfer = [], files = null, membership }) => {
-    const worker = new Worker(asset('/wasi-process.js'));
+    const worker = new Worker(workerScript, { name: 'wasi-process' });
     const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
     // Each writer has two small compositor credits. A killed worker cannot leak credits
     // needed by another writer, and fork children get their own bounded output channel.

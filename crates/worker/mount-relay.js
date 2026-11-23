@@ -162,7 +162,9 @@ export class MountRelay {
     }
     const state = this.sessions.get(session); if (!state || !['owner', 'target'].includes(role)) throw bad('ESTALE');
     if (state.sockets.has(role)) throw bad('EBUSY');
-    const [client, server] = Object.values(new WebSocketPair()); server.accept(); state.sockets.set(role, server);
+    const [client, server] = Object.values(new WebSocketPair());
+    server.binaryType = 'arraybuffer';
+    server.accept(); state.sockets.set(role, server);
     let signals = 0, window = Date.now();
     server.addEventListener('message', event => {
       try {

@@ -1449,6 +1449,22 @@ test('multi-tab flock and fcntl byte-range locks enforce EAGAIN, blocking wakeup
   tab2.close();
 });
 
+test('warmed service and mountctl run after all network access stops', { timeout: 30000 }, async t => {
+  const host = serviceHost();
+  t.after(() => host.close());
+  const s = await host.call('source_session');
+  await host.call('unix_rpc', { socket: `/run/user/${s.uid}/export.sock`, loginEpoch: s.loginEpoch, request: { op: 'list' } });
+  for (const name of ['service', 'mountctl']) assert.equal((await host.exec([name, '--help'])).status, 0);
+  await host.call('test_offline', { enabled: true });
+  const mounts = await host.exec(['mountctl', '--json', 'filesystems']);
+  assert.equal(mounts.status, 0, mounts.stderr);
+  assert.ok(JSON.parse(mounts.stdout).filesystems.some(fs => fs.fstype === 'tmpfs'));
+  const status = await host.exec(['service', '--user', '--json', 'status', 'exportd.service']);
+  assert.equal(status.status, 0, status.stderr);
+  assert.ok(JSON.parse(status.stdout).unit.pid > 0);
+  assert.deepEqual(await host.call('test_offline', { enabled: false }), []);
+});
+
 test('packaged mountd and exportd serve offline files, retained descriptors, confinement and revocation', { timeout: 90000 }, async t => {
   const host = serviceHost();
   t.after(() => host.close());

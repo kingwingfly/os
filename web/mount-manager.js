@@ -2,6 +2,7 @@ import { call } from './http.mjs';
 import { kernelCall } from './kernel/protocol.js';
 import { registerPickedFolder, registerHelperFolder, registerSharedFolder, prepareRenewal } from './kernel/source-registry.js';
 import { shareMount, revokeMount } from './mount-sharing-ui.js';
+import { mountConnector } from './mount-transport.js';
 
 let manager;
 const kinds = {
@@ -112,16 +113,12 @@ function createManager(root) {
     query('[data-connect]').disabled = submitting;
     return local;
   }
-  async function rpc(request, local = session) {
+  async function rpc(request, local = session, port) {
     if (!local) local = await identify();
     const before = epoch;
-    const args = { socket: `/run/user/${local.uid}/mount.sock`, request, loginEpoch: local.loginEpoch };
-    let reply;
-    try { reply = await kernelCall('unix_rpc', args); }
-    catch (e) {
-      if (before !== epoch || !['ENOENT','ECONNREFUSED'].includes(e.errno)) throw e;
-      reply = await kernelCall('unix_rpc', { ...args, socket: '/run/mount/control.sock' });
-    }
+    const args = { socket: `/run/user/${local.uid}/mount.sock`, fallbackSocket: '/run/mount/control.sock',
+      request, loginEpoch: local.loginEpoch, port };
+    const reply = await kernelCall('unix_rpc', args, port ? [port] : []);
     if (before !== epoch) throw new Error('Session changed.');
     if (reply.status === 'error') {
       const details = reply.error.kind === 'busy' ? status(reply.error.processes) : '';
@@ -129,7 +126,7 @@ function createManager(root) {
     }
     return reply;
   }
-  function select(path) {
+  async function select(path) {
     selected = path;
     const current = mounts.find(m => m.target === path);
     query('[data-details]').hidden = !current;
@@ -139,13 +136,17 @@ function createManager(root) {
     if (!current) return;
     query('[data-description]').textContent = [current.source_label, current.health, ...current.options,
       current.uncertain_writes ? 'Some writes may not have completed' : ''].filter(Boolean).join(' · ');
-    actions.append(button('Open in Files', () => browse(path)));
+    const open = button('Open in Files', () => browse(path));
+    actions.append(open);
     if (current.owner_uid === session.uid || session.uid === 0) {
       const detach = lazy => action(async () => { await rpc({ op: 'detach', target: path, lazy }); await refresh(); });
       actions.append(button(path.startsWith('/opt/private/') ? 'Deactivate' : 'Unmount', detach(false)));
       actions.append(button('Lazy unmount', detach(true)));
     }
     if (current.source_id && current.user_mount && !path.startsWith('/opt/private/') && (!current.noexec || current.source_label?.startsWith('snapshot:'))) {
+      // An executable folder grant alone says nothing about its contents.
+      const manifest = await call('lstat', { path: path + '/manifest.json' }).catch(() => null);
+      if ((manifest?.mode & 0o170000) !== 0o100000 || open.parentNode !== actions) return;
       const label = document.createElement('label'); label.textContent = 'Extension name';
       const name = document.createElement('input'); name.value = 'tools'; name.maxLength = 80; name.setAttribute('aria-label', 'Extension name'); label.append(name);
       actions.append(label, button('Activate package', action(async () => {
@@ -163,7 +164,10 @@ function createManager(root) {
   }
   async function mountSource(local, id, fstype, name, writable, execute) {
     const target = (fstype === 'sharefs' ? '/mnt/shared/' : '/mnt/local/') + name;
-    await rpc({ op: 'attach', source_id: id, source: id, target, fstype, flags: (writable ? 0 : 1) | (execute ? 0 : 8) }, local);
+    const connector = fstype === 'sharefs' ? mountConnector() : null;
+    try {
+      await rpc({ op: 'attach', source_id: id, source: id, target, fstype, flags: (writable ? 0 : 1) | (execute ? 0 : 8) }, local, connector?.port);
+    } catch (e) { connector?.close(); throw e; }
     selected = target; show('mounted');
   }
   async function refresh() {

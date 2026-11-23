@@ -8,7 +8,8 @@ export default defineConfig({
     screenshot: 'only-on-failure', trace: 'retain-on-failure' },
   projects: [
     { name: 'chromium', use: { browserName: 'chromium',
-      launchOptions: { env: browserEnv, args: ['--ozone-platform=headless', '--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'] } } },
+      // The two real WebRTC peers also need a host candidate on loopback-only test machines.
+      launchOptions: { env: browserEnv, args: ['--ozone-platform=headless', '--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--allow-loopback-in-peer-connection'] } } },
     // The process engine in a second browser: its calls by JSPI and by synchronous XHR, fork,
     // exec, pipes and process authorization.
     { name: 'firefox', testMatch: ['select-menu.spec.js', 'desktop-runtime.spec.js', 'mount-manager.spec.js', 'native-https.spec.js', 'native-mounts.spec.js', 'local-admission.spec.js', 'local-execution.spec.js', 'private-extensions.spec.js', 'shared-mounts.spec.js', 'local-mounts.spec.js', 'policies.spec.js', 'resources.spec.js', 'releases.spec.js', 'pid-limits.spec.js', 'service-containment.spec.js', 'lifecycle-scope.spec.js', 'lifecycle.spec.js', 'session-targets.spec.js', 'cloud-signin.spec.js', 'init-executable.spec.js', 'login-services.spec.js', 'services.spec.js', 'seat-devices.spec.js', 'init-owner.spec.js', 'login-session.spec.js', 'console-sharing.spec.js', 'console-attachment.spec.js', 'ptmx.spec.js', 'controlling-tty.spec.js', 'byte-devices.spec.js', 'sessions.spec.js', 'identity-signals.spec.js', 'system-shell.spec.js', 'null.spec.js', 'rename.spec.js', 'archive.spec.js', 'accelerator.spec.js', 'files.spec.js', 'exec.spec.js', 'fork.spec.js', 'process-security.spec.js', 'pty.spec.js', 'completion.spec.js', 'file-launch.spec.js', 'executable-resolution.spec.js', 'shell.spec.js'], use: { browserName: 'firefox', launchOptions: { env: browserEnv } } },

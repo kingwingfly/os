@@ -5,12 +5,12 @@ function fallbackProcessWorkers() {
   self.Worker = class extends NativeWorker {
     constructor(url, options) {
       const original = new URL(url, self.location.href);
-      if (!original.pathname.endsWith('/wasi-process.js')) { super(url, options); return; }
+      if (options?.name !== 'wasi-process' && !original.pathname.endsWith('/wasi-process.js')) { super(url, options); return; }
       const source = `
         delete WebAssembly.Suspending; delete WebAssembly.promising;
         const open = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function(method, url, ...args) {
-          return open.call(this, method, new URL(url, ${JSON.stringify(original.href)}).href, ...args);
+          return open.call(this, method, new URL(url, ${JSON.stringify(self.location.origin)}).href, ...args);
         };
         importScripts(${JSON.stringify(original.href)});
       `;

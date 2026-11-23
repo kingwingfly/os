@@ -22,13 +22,18 @@ const summary = e => ({ ...e, address: 'osfs:' + e.id, expires: e.expires_at, wr
 
 export async function shareMount(args, options = {}) {
   const local = await session();
-  const ipc = args.ipcOnly || args.transport === 'ipc' || (!args.transport && options.p2p == null && (local.relayUid == null || globalThis.navigator?.onLine === false));
+  const automatic = !args.transport && options.p2p == null;
+  const ipc = args.ipcOnly || args.transport === 'ipc' || (automatic && local.relayUid == null);
+  let transports = [];
+  if (ipc) transports = ['ipc'];
+  else if (options.p2p === false || args.transport === 'relay') transports = ['ipc', 'relay'];
+  else if (!automatic) transports = ['ipc', 'p2p', 'relay'];
   const listener = ipc ? null : mountListener(options);
   try {
     const reply = await rpc(local, 'export', {
       op: 'publish', source_path: args.path, name: args.name ?? args.path?.split('/').filter(Boolean).at(-1) ?? 'share', writable: args.writable ?? true, execute: args.execute ?? true,
       seconds: args.seconds ?? 300, password: args.password || null,
-      transports: ipc ? ['ipc'] : options.p2p === false ? ['ipc', 'relay'] : ['ipc', 'p2p', 'relay'],
+      transports,
     }, { open: { path: args.path, flags: 0o200000 | 0o400000 }, ...(listener && { port: listener.port }) }, listener ? [listener.port] : []);
     if (reply.export.transports.every(t => t === 'ipc')) listener?.close();
     return summary(reply.export);

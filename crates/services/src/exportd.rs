@@ -118,7 +118,7 @@ impl Listener {
         })?;
         // SAFETY: OpenAt installed a new owned directory descriptor.
         let parent = unsafe { File::from_raw_fd(opened.fd as _) };
-        let socket = UnixListener::bind(&path)?;
+        let socket = UnixListener::bind_with_mode(&path, mode)?;
         let st = os_posix::stat(Path::new(&path), false).map_err(io_errno)?;
         let mut bound = Self {
             socket,
