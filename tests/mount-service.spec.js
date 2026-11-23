@@ -182,7 +182,9 @@ test('M-08 CLI requires a grant and saved host-folder consent can be renewed aft
     // IndexedDB, CLI and sockets; control only the browser's permission decision.
     await dropFolder();
     async function promptWorkers(enabled) {
-      await Promise.all(page.workers().map(w => w.evaluate(({ name, enabled }) => {
+      // Only target JS kernel/executor workers (WASI daemon workers block inside Atomics.wait).
+      const targets = page.workers().filter(w => /client-kernel|executor/.test(w.url()) && !w.url().includes('wasi-process'));
+      await Promise.all(targets.map(w => w.evaluate(({ name, enabled }) => {
         const proto = globalThis.FileSystemHandle?.prototype;
         if (!proto) return;
         const original = globalThis.originalMountQuery ??= proto.queryPermission;

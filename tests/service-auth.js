@@ -214,10 +214,36 @@ export async function attachInstance(
   };
 }
 
+const isInternalKernelCall = type =>
+  typeof type === 'string' &&
+  (type.startsWith('proc_') ||
+    type.startsWith('kfd_') ||
+    ['sys_mount', 'sys_umount2', 'session_begin', 'session_end', 'set_active_session'].includes(type));
+
+const callInWorker = (worker, type, args = {}) =>
+  worker.evaluate(
+    async ([t, a]) => {
+      try {
+        return { v: 2, ok: await self.kernelRequest(t, a) };
+      } catch (error) {
+        return {
+          v: 2,
+          err: {
+            errno: error?.errno ?? 'EIO',
+            detail: error?.detail ?? error?.message ?? String(error),
+          },
+        };
+      }
+    },
+    [type, args],
+  );
+
 // Dedicated HostAdapter v2 client-kernel Worker connection inside a Playwright page.
 export async function connectKernel(page, { name = '__testKernel', tab, hold = false, init = true } = {}) {
+  const tag = `tk-${randomUUID()}`;
+  const launched = page.waitForEvent('worker', w => w.url().includes(tag));
   await page.evaluate(
-    async ({ name, tab, hold }) => {
+    async ({ name, tab, hold, tag }) => {
       if (hold && tab) {
         await new Promise(resolve => {
           void navigator.locks.request(`tw-tab-${tab}`, () => {
@@ -226,7 +252,7 @@ export async function connectKernel(page, { name = '__testKernel', tab, hold = f
           });
         });
       }
-      const worker = new Worker('/client-kernel.js');
+      const worker = new Worker(`/client-kernel.js?${tag}`);
       const pending = new Map();
       const events = [];
       let next = 0;
@@ -255,14 +281,18 @@ export async function connectKernel(page, { name = '__testKernel', tab, hold = f
         terminate: () => worker.terminate(),
       };
     },
-    { name, tab, hold },
+    { name, tab, hold, tag },
   );
+  const worker = await launched;
 
   const client = {
     raw: msg => page.evaluate(([n, m]) => window[n].raw(m), [name, msg]),
     hello: (versions = [2], boundary = 'host-adapter') =>
       page.evaluate(([n, v, b]) => window[n].hello(v, b), [name, versions, boundary]),
-    call: (type, args = {}) => page.evaluate(([n, t, a]) => window[n].call(t, a), [name, type, args]),
+    call: (type, args = {}) =>
+      isInternalKernelCall(type)
+        ? callInWorker(worker, type, args)
+        : page.evaluate(([n, t, a]) => window[n].call(t, a), [name, type, args]),
     async value(type, args = {}) {
       const reply = await client.call(type, args);
       if (reply?.err) {
@@ -318,7 +348,15 @@ export async function hookPageKernel(page, { name = '__pageKernel' } = {}) {
   const client = {
     ready: () => page.waitForFunction(n => Boolean(window[n]), name),
     raw: msg => page.evaluate(([n, m]) => window[n].raw(m), [name, msg]),
-    call: (type, args = {}) => page.evaluate(([n, t, a]) => window[n].call(t, a), [name, type, args]),
+    call: (type, args = {}) => {
+      if (isInternalKernelCall(type)) {
+        const worker = page.workers().find(w => {
+          try { return new URL(w.url()).pathname.endsWith('/client-kernel.js'); } catch { return false; }
+        });
+        if (worker) return callInWorker(worker, type, args);
+      }
+      return page.evaluate(([n, t, a]) => window[n].call(t, a), [name, type, args]);
+    },
     async value(type, args = {}) {
       const reply = await client.call(type, args);
       if (reply?.err) {

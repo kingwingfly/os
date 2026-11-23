@@ -97,6 +97,9 @@ function createManager(root) {
   const query = selector => root.querySelector(selector), add = query('[data-add-form]'), exports = query('[data-export-form]');
   const shared = query('[data-shared-form]');
   const notice = query('.mount-notice'); let selected, mounts = [], pane, refreshRevision = 0, epoch = 0;
+  let refreshInFlight = Promise.resolve();
+  const probes = new Set();
+  const trackProbe = promise => { probes.add(promise); promise.finally(() => probes.delete(promise)); return promise; };
   let helper = typeof window.showDirectoryPicker !== 'function';
   const browser = /Firefox|FxiOS/.test(navigator.userAgent) ? 'Firefox' : /Safari/.test(navigator.userAgent) && !/Chrome|Chromium|CriOS|Edg|OPR/.test(navigator.userAgent) ? 'Safari' : 'This browser';
   let helperReason = `${browser} does not expose the directory picker API that OS uses for direct host-folder mounts.`;
@@ -139,13 +142,21 @@ function createManager(root) {
     const open = button('Open in Files', () => browse(path));
     actions.append(open);
     if (current.owner_uid === session.uid || session.uid === 0) {
-      const detach = lazy => action(async () => { await rpc({ op: 'detach', target: path, lazy }); await refresh(); });
+      const detach = lazy => action(async () => {
+        if (!lazy) {
+          ++refreshRevision;
+          await refreshInFlight.catch(() => {});
+          if (probes.size) await Promise.allSettled([...probes]);
+        }
+        await rpc({ op: 'detach', target: path, lazy });
+        await refresh();
+      });
       actions.append(button(path.startsWith('/opt/private/') ? 'Deactivate' : 'Unmount', detach(false)));
       actions.append(button('Lazy unmount', detach(true)));
     }
     if (current.source_id && current.user_mount && !path.startsWith('/opt/private/') && (!current.noexec || current.source_label?.startsWith('snapshot:'))) {
       // An executable folder grant alone says nothing about its contents.
-      const manifest = await call('lstat', { path: path + '/manifest.json' }).catch(() => null);
+      const manifest = await trackProbe(call('lstat', { path: path + '/manifest.json' }).catch(() => null));
       if ((manifest?.mode & 0o170000) !== 0o100000 || open.parentNode !== actions) return;
       const label = document.createElement('label'); label.textContent = 'Extension name';
       const name = document.createElement('input'); name.value = 'tools'; name.maxLength = 80; name.setAttribute('aria-label', 'Extension name'); label.append(name);
@@ -170,48 +181,52 @@ function createManager(root) {
     } catch (e) { connector?.close(); throw e; }
     selected = target; show('mounted');
   }
-  async function refresh() {
-    const before = epoch, serial = ++refreshRevision, local = await identify();
-    const values = await rpc({ op: 'list_all', include_busy: true }, local);
-    const current = () => before === epoch && serial === refreshRevision;
-    if (!current()) return;
-    mounts = values.attachments; exportRows = values.exports;
-    const body = query('[data-mounts]'); body.replaceChildren();
-    query('[data-empty]').hidden = mounts.some(m => m.user_mount);
-    query('.mount-table-scroll').hidden = mounts.length === 0;
-    for (const mount of mounts) {
-      const row = body.insertRow(); row.dataset.path = mount.target;
-      row.insertCell().append(button(mount.target, () => select(mount.target)));
-      row.insertCell().textContent = kinds[mount.fstype] ?? mount.fstype;
-      row.insertCell().textContent = mount.options.join(',');
-      const mode = row.insertCell();
-      mode.textContent = '—';
-      if (mount.health === 'connected') {
-        void call('stat', { path: mount.target }).then(stat => {
-          if (current()) mode.textContent = 'rwxrwxrwx'.split('').map((bit, i) => stat.mode & (0o400 >> i) ? bit : '-').join('');
-        }).catch(() => {});
-      }
-      row.insertCell().textContent = status(mount.busy_pids ?? []);
-    }
-    select(mounts.some(m => m.target === selected) ? selected : mounts.find(m => m.user_mount)?.target);
-    list('[data-filesystems]', values.filesystems, f => `${f.label} · ${f.fstype} · ${f.bfree} of ${f.blocks} blocks free`);
-    list('[data-exports]', values.exports, e => `${e.name} · ${e.address} · ${e.active_clients} clients`);
-    const rows = list('[data-sources]', values.sources, s => `${s.label} · ${s.id} · ${s.state}`);
-    await Promise.all(values.sources.map(async (s, i) => {
-      if (s.owner_uid !== local.uid) return;
-      rows[i].append(button('Forget', action(async () => { await rpc({ op: 'forget_source', source_id: s.id }, local); await refresh(); })));
-      if (s.state === 'granted' && !mounts.some(m => m.source_id === s.id)) {
-        rows[i].append(button('Mount', action(() => mountSource(local, s.id, s.kind, add.elements.name.value, s.writable, s.execute))));
-      }
-      if (s.state !== 'needs_renewal') return;
-      const renew = await prepareRenewal(local, s, current, kernelCall);
+  function refresh() {
+    const run = (async () => {
+      const before = epoch, serial = ++refreshRevision, local = await identify();
+      const values = await rpc({ op: 'list_all', include_busy: true }, local);
+      const current = () => before === epoch && serial === refreshRevision;
       if (!current()) return;
-      rows[i].append(button('Renew & Mount', action(async () => {
-        await renew();
-        if (before !== epoch) return;
-        await mountSource(local, s.id, s.kind, add.elements.name.value, s.writable, s.execute);
-      })));
-    }));
+      mounts = values.attachments; exportRows = values.exports;
+      const body = query('[data-mounts]'); body.replaceChildren();
+      query('[data-empty]').hidden = mounts.some(m => m.user_mount);
+      query('.mount-table-scroll').hidden = mounts.length === 0;
+      for (const mount of mounts) {
+        const row = body.insertRow(); row.dataset.path = mount.target;
+        row.insertCell().append(button(mount.target, () => select(mount.target)));
+        row.insertCell().textContent = kinds[mount.fstype] ?? mount.fstype;
+        row.insertCell().textContent = mount.options.join(',');
+        const mode = row.insertCell();
+        mode.textContent = '—';
+        if (mount.health === 'connected') {
+          void trackProbe(call('stat', { path: mount.target }).then(stat => {
+            if (current()) mode.textContent = 'rwxrwxrwx'.split('').map((bit, i) => stat.mode & (0o400 >> i) ? bit : '-').join('');
+          }).catch(() => {}));
+        }
+        row.insertCell().textContent = status(mount.busy_pids ?? []);
+      }
+      select(mounts.some(m => m.target === selected) ? selected : mounts.find(m => m.user_mount)?.target);
+      list('[data-filesystems]', values.filesystems, f => `${f.label} · ${f.fstype} · ${f.bfree} of ${f.blocks} blocks free`);
+      list('[data-exports]', values.exports, e => `${e.name} · ${e.address} · ${e.active_clients} clients`);
+      const rows = list('[data-sources]', values.sources, s => `${s.label} · ${s.id} · ${s.state}`);
+      await Promise.all(values.sources.map(async (s, i) => {
+        if (s.owner_uid !== local.uid) return;
+        rows[i].append(button('Forget', action(async () => { await rpc({ op: 'forget_source', source_id: s.id }, local); await refresh(); })));
+        if (s.state === 'granted' && !mounts.some(m => m.source_id === s.id)) {
+          rows[i].append(button('Mount', action(() => mountSource(local, s.id, s.kind, add.elements.name.value, s.writable, s.execute))));
+        }
+        if (s.state !== 'needs_renewal') return;
+        const renew = await prepareRenewal(local, s, current, kernelCall);
+        if (!current()) return;
+        rows[i].append(button('Renew & Mount', action(async () => {
+          await renew();
+          if (before !== epoch) return;
+          await mountSource(local, s.id, s.kind, add.elements.name.value, s.writable, s.execute);
+        })));
+      }));
+    })();
+    refreshInFlight = run;
+    return run;
   }
   function source() {
     const kind = add.elements.kind.value;

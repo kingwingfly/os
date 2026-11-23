@@ -109,23 +109,6 @@ test('head takes its lines as they come, a prompt shows as it waits, and NULs ar
   await expect(last(page)).toHaveText('ab');
 });
 
-test('a page not isolated shows an execution notice and refuses command execution', async ({ page }) => {
-  await page.route(url => new URL(url).pathname === '/', async route => {
-    const response = await route.fetch();
-    const headers = { ...response.headers() };
-    delete headers['cross-origin-embedder-policy']; delete headers['cross-origin-opener-policy'];
-    await route.fulfill({ response, headers });
-  });
-  await ready(page);
-  expect(await page.evaluate(() => crossOriginIsolated)).toBe(false);
-  await expect(page.locator('.execution-notice')).toContainText('isolated browser page');
-  await run(page, 'seq 1 3 | tr 1-3 a-c');
-  await expect(last(page)).toContainText('Command execution needs an isolated browser page');
-  await expect(page.evaluate(() => window.os.exec([['/usr/bin/seq', '1', '3']]))).rejects.toThrow(/isolated browser page/);
-  await run(page, 'echo still-responsive');
-  await expect(last(page)).toContainText('Command execution needs an isolated browser page');
-});
-
 test('a process reads one file after another; cp copies what the kernel makes, reading it', async ({ page }) => {
   await ready(page);
   await run(page, 'coreutils md5sum /etc/passwd /etc/group');

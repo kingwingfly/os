@@ -40,7 +40,8 @@ test('distinct relay accounts use normal setfacl and explicitly mount a publishe
     await mount(owner.page); const grant = await publish(owner);
     expect(await receiver.page.evaluate(() => window.os.localMountList())).toEqual([]);
     expect(await receiver.page.evaluate(() => window.os.sharedMounts())).toMatchObject({ exports: [] });
-    await expect(attach(receiver, grant)).rejects.toThrow();
+    await expect(attach(receiver, grant)).rejects.toThrow(/Permission denied/);
+    expect(await receiver.page.evaluate(() => window.os.localMountList())).toEqual([]);
     await allow(owner, receiver);
     await attach(receiver, grant);
     expect(await read(receiver.page)).toEqual({ status: 200, text: 'OWNER_PRIVATE_DATA' });
@@ -50,15 +51,6 @@ test('distinct relay accounts use normal setfacl and explicitly mount a publishe
     const [denied] = await batch(receiver.page, [{ chmod: { path: '/mnt/shared/project/text', mode: 0o777 } }]); expect(['EPERM', 'EROFS']).toContain(denied.err.errno);
     const [readonly] = await batch(receiver.page, [{ open: { path: '/mnt/shared/project/text', flags: 1 } }]); expect(readonly.err.errno).toBe('EROFS');
   } finally { await dispose(owner, receiver, stranger); }
-});
-
-test('a refused mount reports permission denied without a write warning', async ({ browser }) => {
-  const owner = await client(browser), receiver = await client(browser);
-  try {
-    await mount(owner.page); const grant = await publish(owner);
-    await expect(attach(receiver, grant)).rejects.toThrow(/Permission denied/);
-    expect(await receiver.page.evaluate(() => window.os.localMountList())).toEqual([]);
-  } finally { await dispose(owner, receiver); }
 });
 
 test('an ACL refusal is retained when it arrives before the receiver socket', async ({ browser }) => {

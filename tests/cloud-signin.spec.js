@@ -92,6 +92,11 @@ test('S-04 & S-05: zero-friction auto-login boots offline with local user, zero 
   expect(idRes.stdout).toContain('uid=1000(user)');
   expect(idRes.stdout).toContain('wheel');
 
+  // `sudo -n` evaluates real `/etc/sudoers` (`NOPASSWD` for `wheel`).
+  const sudoDashN = await execLocal(page, ['sudo', '-n', 'id']);
+  expect(sudoDashN.status, sudoDashN.stderr).toBe(0);
+  expect(sudoDashN.stdout).toContain('uid=0(root)');
+
   const devRes = await execSh(page, 'ls /dev');
   expect(devRes.status).toBe(0);
   expect(devRes.stdout).toContain('null');
@@ -147,6 +152,13 @@ test('S-03: 100% offline local account lifecycle (sudo, useradd, passwd, su, use
   expect(goodSu.status, goodSu.stderr).toBe(0);
   expect(goodSu.stdout).toContain('alice');
   expect(goodSu.stdout).toContain('devs');
+
+  // Locked account refuses both `su` and root-invoked `login` without `-f`; wrong password also fails.
+  expect((await execLocal(page, ['usermod', '-L', 'alice'], { sudo: true })).status).toBe(0);
+  expect((await execSh(page, "printf 'alice-secret-pass-1234\\n' | su alice -c id")).status).not.toBe(0);
+  expect((await execSh(page, "printf 'alice-secret-pass-1234\\n' | login alice", { sudo: true })).status).not.toBe(0);
+  expect((await execLocal(page, ['usermod', '-U', 'alice'], { sudo: true })).status).toBe(0);
+  expect((await execSh(page, "printf 'wrong-password\\n' | login alice", { sudo: true })).status).not.toBe(0);
 
   // Verify `newgrp devs` switches primary GID locally (POSIX `newgrp` spawns a shell reading stdin).
   const ngRes = await execSh(page, "printf 'alice-secret-pass-1234\\n' | su alice -c \"printf 'id\\n' | newgrp devs\"");
