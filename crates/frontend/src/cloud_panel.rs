@@ -119,6 +119,7 @@ pub fn build_requested_scope(
         devices,
         containers,
         relay,
+        ..RemoteScope::default()
     }
 }
 
